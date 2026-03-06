@@ -35,6 +35,13 @@ class ContainsAnyDict(dict):
     def __contains__(self, key):
         return True
 
+    def __getitem__(self, key):
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            # Dynamic inputs (e.g. @A, @B) — return wildcard type
+            return (ANY_TYPE,)
+
 
 def _unwrap_latent(value: dict) -> tuple[torch.Tensor, dict]:
     """
