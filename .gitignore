@@ -1,0 +1,15 @@
+# TEX cache (auto-generated at runtime)
+.tex_cache/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Build/dist artifacts
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/

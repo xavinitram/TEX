@@ -1,0 +1,8 @@
+// Generate a horizontal gradient (no input image needed)
+// Output: IMAGE
+// Note: connect any small image to @A to set the output resolution
+
+float r = u;
+float g = v;
+float b = 1.0 - u;
+@OUT = vec3(r, g, b);

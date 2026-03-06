@@ -1,0 +1,16 @@
+// Brightness and contrast adjustment
+// Inputs: @A (IMAGE), @B (FLOAT: brightness, -1 to 1), @C (FLOAT: contrast, 0 to 2)
+
+float brightness = @B;
+float contrast = @C;
+
+vec3 color = @A.rgb;
+
+// Apply brightness
+color = color + vec3(brightness);
+
+// Apply contrast around midpoint
+color = (color - vec3(0.5)) * vec3(contrast) + vec3(0.5);
+
+// Clamp to valid range
+@OUT = vec3(clamp(color.r, 0.0, 1.0), clamp(color.g, 0.0, 1.0), clamp(color.b, 0.0, 1.0));

@@ -1,0 +1,5 @@
+// Mix two images based on a mask or blend factor
+// Inputs: @A (IMAGE), @B (IMAGE), @C (FLOAT or MASK: blend factor 0-1)
+// Output: IMAGE
+
+@OUT = lerp(@A, @B, @C);

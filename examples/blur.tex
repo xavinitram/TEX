@@ -1,0 +1,15 @@
+// Simple box blur using for loops and fetch()
+// Input: @A (IMAGE)
+// Output: IMAGE
+//
+// 5x5 kernel (radius 2). Adjust the loop bounds for
+// different blur sizes: radius 1 = 3x3, radius 3 = 7x7.
+// fetch() clamps to image bounds automatically.
+
+vec4 sum = vec4(0.0, 0.0, 0.0, 0.0);
+for (int dy = -2; dy <= 2; dy++) {
+    for (int dx = -2; dx <= 2; dx++) {
+        sum += fetch(@A, ix + dx, iy + dy);
+    }
+}
+@OUT = sum / 25.0;

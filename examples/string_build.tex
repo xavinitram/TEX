@@ -1,0 +1,6 @@
+// Build a filename from parts
+// Connect STRING inputs to @A (prefix) and @B (suffix)
+// Set output_type to STRING
+
+string name = @A + "_processed_" + @B;
+@OUT = sanitize_filename(name);

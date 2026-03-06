@@ -1,0 +1,29 @@
+// 3x3 median filter using arrays
+// Input: @A (IMAGE)
+// Output: IMAGE
+//
+// Collects the 9 neighbor pixels per channel into arrays,
+// sorts them, and picks the middle value (index 4).
+// Effective at removing salt-and-pepper noise while
+// preserving edges better than a box blur.
+
+float r[9];
+float g[9];
+float b[9];
+int idx = 0;
+
+for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+        vec4 s = fetch(@A, ix + dx, iy + dy);
+        r[idx] = s.r;
+        g[idx] = s.g;
+        b[idx] = s.b;
+        idx++;
+    }
+}
+
+r = sort(r);
+g = sort(g);
+b = sort(b);
+
+@OUT = vec4(r[4], g[4], b[4], 1.0);

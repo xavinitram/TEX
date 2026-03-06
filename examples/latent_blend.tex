@@ -1,0 +1,5 @@
+// Latent Blend — mix two latents
+// Set output_type to LATENT. Connect latents to @A and @B.
+// Connect a FLOAT to @C for blend factor (0.0 = all A, 1.0 = all B)
+
+@OUT = lerp(@A, @B, @C);

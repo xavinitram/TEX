@@ -1,0 +1,10 @@
+// Radial vignette effect
+// Input: @A (IMAGE), @B (FLOAT: strength 0-2, default 1.0)
+// Output: IMAGE
+
+float cx = u - 0.5;
+float cy = v - 0.5;
+float dist = sqrt(cx * cx + cy * cy);
+float vignette = 1.0 - smoothstep(0.3, 0.7, dist * @B);
+
+@OUT = @A * vec4(vignette, vignette, vignette, 1.0);

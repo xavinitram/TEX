@@ -1,0 +1,8 @@
+// Hue shift effect
+// Input: @A (IMAGE), @B (FLOAT: hue shift amount, 0-1)
+// Output: IMAGE
+
+vec3 hsv = rgb2hsv(@A);
+float h = fract(hsv.r + @B);
+vec3 shifted = vec3(h, hsv.g, hsv.b);
+@OUT = hsv2rgb(shifted);

@@ -1,0 +1,19 @@
+// Swirl distortion using sample_cubic()
+// Input: @A (IMAGE), @B (FLOAT: swirl strength, try 0-10)
+// Output: IMAGE
+//
+// Rotates pixels around the center with angle decreasing
+// toward the edges via smoothstep falloff.
+// Uses bicubic interpolation for smooth results.
+
+float cx = u - 0.5;
+float cy = v - 0.5;
+float dist = sqrt(cx * cx + cy * cy);
+float angle = @B * (1.0 - smoothstep(0.0, 0.5, dist));
+
+float cosA = cos(angle);
+float sinA = sin(angle);
+float su = (cx * cosA - cy * sinA) + 0.5;
+float sv = (cx * sinA + cy * cosA) + 0.5;
+
+@OUT = sample_cubic(@A, su, sv);

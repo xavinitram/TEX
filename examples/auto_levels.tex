@@ -1,0 +1,6 @@
+// Auto-levels: normalize image to full [0,1] range per channel
+// Connect any image to @A
+
+vec4 lo = img_min(@A);
+vec4 hi = img_max(@A);
+@OUT = (@A - lo) / max(hi - lo, 0.001);

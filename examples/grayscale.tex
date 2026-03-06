@@ -1,0 +1,6 @@
+// Grayscale conversion using luminance
+// Input: @A (IMAGE)
+// Output: IMAGE (grayscale)
+
+float gray = luma(@A);
+@OUT = vec3(gray, gray, gray);

@@ -1,0 +1,28 @@
+// Terrain-style coloring using simplex noise
+// Generates a procedural terrain with water, grass, rock, and snow
+
+float freq = 4.0;
+float height = simplex(u * freq, v * freq) * 0.5 + 0.5;
+
+// Add detail with a second octave
+height += simplex(u * freq * 2.0, v * freq * 2.0) * 0.25;
+height = clamp(height, 0.0, 1.0);
+
+// Color by elevation
+vec3 water = vec3(0.1, 0.3, 0.7);
+vec3 grass = vec3(0.2, 0.6, 0.15);
+vec3 rock  = vec3(0.5, 0.45, 0.4);
+vec3 snow  = vec3(0.95, 0.95, 1.0);
+
+vec3 color = water;
+if (height > 0.35) {
+    color = lerp(water, grass, smoothstep(0.35, 0.45, height));
+}
+if (height > 0.55) {
+    color = lerp(grass, rock, smoothstep(0.55, 0.7, height));
+}
+if (height > 0.8) {
+    color = lerp(rock, snow, smoothstep(0.8, 0.9, height));
+}
+
+@OUT = vec4(color, 1.0);

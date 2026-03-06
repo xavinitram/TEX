@@ -1,0 +1,13 @@
+// Cross-frame motion detection — highlights pixels that changed between frames
+// Connect a multi-frame image batch to @A
+// Output: bright pixels = motion, dark = static
+
+vec4 curr = fetch_frame(@A, fi, ix, iy);
+vec4 prev = fetch_frame(@A, max(fi - 1, 0), ix, iy);
+vec4 diff = abs(curr - prev);
+
+// Convert to grayscale motion magnitude
+float motion = luma(diff.rgb) * 4.0;  // amplify for visibility
+motion = clamp(motion, 0.0, 1.0);
+
+@OUT = vec3(motion, motion, motion);
