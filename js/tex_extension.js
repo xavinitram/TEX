@@ -63,8 +63,12 @@ const TEX_KEYWORDS = new Set([
 ]);
 const TEX_BUILTINS = new Set([
     "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-    "pow", "sqrt", "exp", "log", "log2", "abs", "sign",
+    "sinh", "cosh", "tanh",
+    "pow", "sqrt", "exp", "log", "log2", "log10", "abs", "sign",
+    "pow2", "pow10", "hypot",
     "floor", "ceil", "round", "fract", "mod",
+    "isnan", "isinf", "degrees", "radians",
+    "spow", "sdiv",
     "min", "max", "clamp", "lerp", "mix", "step", "smoothstep",
     "length", "normalize", "dot", "cross", "reflect",
     "luma", "rgb2hsv", "hsv2rgb", "fit", "rand",
@@ -113,8 +117,16 @@ Compound: <code>+= -= *= /= ++ --</code></p>
 <code>for (int i = 0; i < n; i++) { ... }</code> — bounded loops</p>
 
 <p><b>Math:</b> <code>sin cos tan asin acos atan atan2</code>
-<code>pow sqrt exp log abs sign</code>
-<code>floor ceil round fract mod</code></p>
+<code>sinh cosh tanh</code>
+<code>pow sqrt exp log log2 log10 abs sign</code>
+<code>pow2 pow10 hypot</code>
+<code>floor ceil round fract mod</code>
+<code>degrees radians</code></p>
+
+<p><b>Safe Ops:</b> <code>spow(x,y)</code> — sign-safe power
+<code>sdiv(a,b)</code> — divide-by-zero safe</p>
+
+<p><b>Classification:</b> <code>isnan(x)</code> <code>isinf(x)</code> → 0.0/1.0</p>
 
 <p><b>Interpolation:</b> <code>min max clamp lerp mix fit step smoothstep</code></p>
 

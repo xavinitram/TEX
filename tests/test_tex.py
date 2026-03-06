@@ -1931,6 +1931,47 @@ def test_stdlib_coverage(r: TestResult):
     check_val("cross", "vec3 c = cross(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0));\n@OUT = vec3(c.z, c.z, c.z);", 1.0)
 
 
+# ── Extended Stdlib Tests (CTL/ACES) ──────────────────────────────────
+
+def test_stdlib_extended(r: TestResult):
+    print("\n--- Extended Stdlib Tests (CTL/ACES) ---")
+
+    B, H, W = 1, 2, 2
+    test_img = torch.rand(B, H, W, 3)
+
+    def check_val(name, code, expected, atol=1e-3):
+        try:
+            result = compile_and_run(code, {"A": test_img})
+            val = result[0, 0, 0, 0].item()
+            assert abs(val - expected) < atol, f"Got {val}, expected {expected}"
+            r.ok(f"stdlib: {name}")
+        except Exception as e:
+            r.fail(f"stdlib: {name}", f"{e}\n{traceback.format_exc()}")
+
+    import math
+
+    check_val("log2", "float x = log2(8.0);\n@OUT = vec3(x, x, x);", 3.0)
+    check_val("log10", "float x = log10(1000.0);\n@OUT = vec3(x, x, x);", 3.0)
+    check_val("pow2", "float x = pow2(3.0);\n@OUT = vec3(x, x, x);", 8.0)
+    check_val("pow10", "float x = pow10(2.0);\n@OUT = vec3(x, x, x);", 100.0)
+    check_val("sinh", "float x = sinh(0.0);\n@OUT = vec3(x, x, x);", 0.0)
+    check_val("cosh", "float x = cosh(0.0);\n@OUT = vec3(x, x, x);", 1.0)
+    check_val("tanh", "float x = tanh(0.0);\n@OUT = vec3(x, x, x);", 0.0)
+    check_val("hypot", "float x = hypot(3.0, 4.0);\n@OUT = vec3(x, x, x);", 5.0)
+    check_val("degrees", "float x = degrees(PI);\n@OUT = vec3(x, x, x);", 180.0)
+    check_val("radians", "float x = radians(180.0);\n@OUT = vec3(x, x, x);", math.pi)
+
+    # isnan / isinf return 0.0 or 1.0
+    check_val("isnan", "float x = isnan(sqrt(-1.0));\n@OUT = vec3(x, x, x);", 1.0)
+    check_val("isinf", "float x = isinf(log(0.0));\n@OUT = vec3(x, x, x);", 1.0)
+
+    # spow: safe power — sign(x) * pow(abs(x), y)
+    check_val("spow", "float x = spow(-2.0, 3.0);\n@OUT = vec3(x, x, x);", -8.0)
+
+    # sdiv: safe division — 0 when b ≈ 0
+    check_val("sdiv", "float x = sdiv(5.0, 0.0);\n@OUT = vec3(x, x, x);", 0.0)
+
+
 # ── Numerical Edge Case Tests ─────────────────────────────────────────
 
 def test_numerical_edge_cases(r: TestResult):
@@ -3955,6 +3996,7 @@ def main():
     test_error_paths(r)
     test_if_without_else(r)
     test_stdlib_coverage(r)
+    test_stdlib_extended(r)
     test_numerical_edge_cases(r)
     test_swizzle_patterns(r)
     test_performance(r)

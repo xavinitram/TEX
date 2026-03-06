@@ -61,6 +61,21 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "fract":     {"args": (1, 1), "return": _passthrough_type},
     "mod":       {"args": (2, 2), "return": _passthrough_type},
 
+    "log2":      {"args": (1, 1), "return": _passthrough_type},
+    "log10":     {"args": (1, 1), "return": _passthrough_type},
+    "pow2":      {"args": (1, 1), "return": _passthrough_type},
+    "pow10":     {"args": (1, 1), "return": _passthrough_type},
+    "sinh":      {"args": (1, 1), "return": _passthrough_type},
+    "cosh":      {"args": (1, 1), "return": _passthrough_type},
+    "tanh":      {"args": (1, 1), "return": _passthrough_type},
+    "hypot":     {"args": (2, 2), "return": _passthrough_type},
+    "isnan":     {"args": (1, 1), "return": lambda _: TEXType.FLOAT},  # always returns float (0.0/1.0)
+    "isinf":     {"args": (1, 1), "return": lambda _: TEXType.FLOAT},  # always returns float (0.0/1.0)
+    "degrees":   {"args": (1, 1), "return": _passthrough_type},
+    "radians":   {"args": (1, 1), "return": _passthrough_type},
+    "spow":      {"args": (2, 2), "return": _passthrough_type},        # safe power — sign(x)*pow(abs(x),y)
+    "sdiv":      {"args": (2, 2), "return": _passthrough_type},        # safe division — 0 when b≈0
+
     # Clamping and interpolation
     "min":       {"args": (2, 2), "return": _promote_args},
     "max":       {"args": (2, 2), "return": _promote_args},

@@ -36,6 +36,21 @@ class TEXStdlib:
             "fract": TEXStdlib.fn_fract,
             "mod": TEXStdlib.fn_mod,
 
+            "log2": TEXStdlib.fn_log2,
+            "log10": TEXStdlib.fn_log10,
+            "pow2": TEXStdlib.fn_pow2,
+            "pow10": TEXStdlib.fn_pow10,
+            "sinh": TEXStdlib.fn_sinh,
+            "cosh": TEXStdlib.fn_cosh,
+            "tanh": TEXStdlib.fn_tanh,
+            "hypot": TEXStdlib.fn_hypot,
+            "isnan": TEXStdlib.fn_isnan,
+            "isinf": TEXStdlib.fn_isinf,
+            "degrees": TEXStdlib.fn_degrees,
+            "radians": TEXStdlib.fn_radians,
+            "spow": TEXStdlib.fn_spow,
+            "sdiv": TEXStdlib.fn_sdiv,
+
             # Clamping and interpolation
             "min": TEXStdlib.fn_min,
             "max": TEXStdlib.fn_max,
@@ -180,6 +195,66 @@ class TEXStdlib:
     @staticmethod
     def fn_mod(a, b):
         return torch.fmod(_to_tensor(a), _to_tensor(b))
+
+    @staticmethod
+    def fn_log2(x):
+        return torch.log2(_to_tensor(x))
+
+    @staticmethod
+    def fn_log10(x):
+        return torch.log10(_to_tensor(x))
+
+    @staticmethod
+    def fn_pow2(x):
+        return torch.pow(2.0, _to_tensor(x))
+
+    @staticmethod
+    def fn_pow10(x):
+        return torch.pow(10.0, _to_tensor(x))
+
+    @staticmethod
+    def fn_sinh(x):
+        return torch.sinh(_to_tensor(x))
+
+    @staticmethod
+    def fn_cosh(x):
+        return torch.cosh(_to_tensor(x))
+
+    @staticmethod
+    def fn_tanh(x):
+        return torch.tanh(_to_tensor(x))
+
+    @staticmethod
+    def fn_hypot(x, y):
+        return torch.hypot(_to_tensor(x), _to_tensor(y))
+
+    @staticmethod
+    def fn_isnan(x):
+        return torch.isnan(_to_tensor(x)).float()
+
+    @staticmethod
+    def fn_isinf(x):
+        return torch.isinf(_to_tensor(x)).float()
+
+    @staticmethod
+    def fn_degrees(x):
+        return torch.rad2deg(_to_tensor(x))
+
+    @staticmethod
+    def fn_radians(x):
+        return torch.deg2rad(_to_tensor(x))
+
+    @staticmethod
+    def fn_spow(x, y):
+        """Safe power — sign(x) * pow(abs(x), y). Avoids NaN on negative bases."""
+        t = _to_tensor(x)
+        return torch.sign(t) * torch.pow(torch.abs(t), _to_tensor(y))
+
+    @staticmethod
+    def fn_sdiv(a, b):
+        """Safe division — returns 0.0 where abs(b) < 1e-10."""
+        a_t, b_t = _to_tensor(a), _to_tensor(b)
+        return torch.where(torch.abs(b_t) < 1e-10, torch.zeros_like(a_t), a_t / b_t)
 
     # -- Clamping / interpolation ---------------------------------------
 

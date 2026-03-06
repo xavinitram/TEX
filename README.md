@@ -13,7 +13,7 @@ TEX sits between simple math-expression nodes and full Python scripting nodes. I
 - **GPU acceleration** — execute on CPU or GPU with automatic device detection
 - **`torch.compile` support** — optional JIT compilation for faster repeated execution
 - **Two-tier caching** — in-memory LRU + disk persistence for instant re-execution
-- **75+ stdlib functions** — math, interpolation, vector ops, color conversion, image sampling, cross-frame sampling, string manipulation, array operations, image reductions
+- **76 stdlib functions** — math, interpolation, vector ops, color conversion, image sampling, cross-frame sampling, string manipulation, array operations, image reductions
 - **Good error messages** — line/column-mapped errors from the compiler
 
 ## Quick Start
@@ -146,7 +146,11 @@ Loops must have integer loop variables with compile-time-deterministic bounds. I
 
 ### Standard Library
 
-**Math:** `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sqrt`, `pow`, `exp`, `log`, `abs`, `sign`, `floor`, `ceil`, `round`, `fract`, `mod`
+**Math:** `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `sqrt`, `pow`, `pow2`, `pow10`, `exp`, `log`, `log2`, `log10`, `abs`, `sign`, `floor`, `ceil`, `round`, `fract`, `mod`, `hypot`, `degrees`, `radians`
+
+**Safe Ops:** `spow(x, y)` — sign-safe power (avoids NaN on negative bases), `sdiv(a, b)` — safe division (returns 0 when b ≈ 0)
+
+**Classification:** `isnan(x)`, `isinf(x)` — returns 0.0 or 1.0
 
 **Interpolation:** `min`, `max`, `clamp`, `lerp`/`mix`, `fit`, `smoothstep`, `step`
 
@@ -469,12 +473,12 @@ TEX_Wrangle/
     stdlib_signatures.py   # Function signatures for type checking
   tex_runtime/
     interpreter.py         # Tree-walking tensor evaluator
-    stdlib.py              # Built-in function implementations (75+)
+    stdlib.py              # Built-in function implementations (76)
     compiled.py            # torch.compile wrapper with backend cascade
   js/
     tex_extension.js       # Frontend: auto-socket, syntax highlighting, help popup
   tests/
-    test_tex.py            # 292-test suite
+    test_tex.py            # 307-test suite
   examples/                # Example TEX snippets (24 files)
   .tex_cache/              # Disk cache directory (auto-created, gitignored)
 ```
