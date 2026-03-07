@@ -530,8 +530,8 @@ def test_interpreter(r: TestResult):
         @OUT = vec3(x, x, x);
         """
         result = compile_and_run(code, {"A": test_img})
-        # sin(0) = 0, sin(pi/2) ≈ 1, sin(pi) ≈ 0
-        assert abs(result[0, 0, 0, 0].item()) < 0.1  # sin(0) ≈ 0
+        # sin(0) = 0, sin(pi/2) ~= 1, sin(pi) ~= 0
+        assert abs(result[0, 0, 0, 0].item()) < 0.1  # sin(0) ~= 0
         r.ok("math functions (sin, PI)")
     except Exception as e:
         r.fail("math functions (sin, PI)", f"{e}\n{traceback.format_exc()}")
@@ -1184,7 +1184,7 @@ def test_device_selection(r: TestResult):
     except Exception as e:
         r.fail("device: explicit cpu", f"{e}\n{traceback.format_exc()}")
 
-    # Auto mode with CPU tensor → should stay on CPU
+    # Auto mode with CPU tensor -> should stay on CPU
     try:
         result = compile_and_run("@OUT = @A * 0.5;", {"A": test_img}, device="cpu")
         expected = test_img * 0.5
@@ -1968,7 +1968,7 @@ def test_stdlib_extended(r: TestResult):
     # spow: safe power — sign(x) * pow(abs(x), y)
     check_val("spow", "float x = spow(-2.0, 3.0);\n@OUT = vec3(x, x, x);", -8.0)
 
-    # sdiv: safe division — 0 when b ≈ 0
+    # sdiv: safe division — 0 when b ~= 0
     check_val("sdiv", "float x = sdiv(5.0, 0.0);\n@OUT = vec3(x, x, x);", 0.0)
 
 
@@ -2042,7 +2042,7 @@ def test_numerical_edge_cases(r: TestResult):
         val = result[0, 0, 0, 0].item()
         assert not torch.isnan(result[0, 0, 0, 0]), "exp(10) should not be NaN"
         assert not torch.isinf(result[0, 0, 0, 0]), "exp(10) should not be Inf"
-        assert abs(val - 22026.4658) < 1.0, f"exp(10) ≈ 22026, got {val}"
+        assert abs(val - 22026.4658) < 1.0, f"exp(10) ~= 22026, got {val}"
         r.ok("edge: large exp")
     except Exception as e:
         r.fail("edge: large exp", f"{e}\n{traceback.format_exc()}")
@@ -3968,6 +3968,409 @@ vec4 hi = img_max(@A);
         r.fail("img_mean rejects ARRAY", f"{e}\n{traceback.format_exc()}")
 
 
+# ── Matrix Tests ──────────────────────────────────────────────────────
+
+def test_matrix_types(r: TestResult):
+    print("\n--- Matrix Type Tests ---")
+    H, W = 4, 4
+    img = torch.rand(1, H, W, 4)
+
+    # 1. mat3 constructor (9 args)
+    try:
+        code = """
+mat3 m = mat3(1.0, 0.0, 0.0,
+              0.0, 1.0, 0.0,
+              0.0, 0.0, 1.0);
+@OUT = m * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = img[..., :3]
+        assert torch.allclose(result, expected, atol=1e-4), f"Identity mat3*vec3 failed"
+        r.ok("mat3 constructor (9 args)")
+    except Exception as e:
+        r.fail("mat3 constructor (9 args)", f"{e}\n{traceback.format_exc()}")
+
+    # 2. mat3 broadcast constructor (1 arg -> scaled identity)
+    try:
+        code = """
+mat3 m = mat3(2.0);
+@OUT = m * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = img[..., :3] * 2.0
+        assert torch.allclose(result, expected, atol=1e-4), f"Scaled identity mat3 failed"
+        r.ok("mat3 broadcast constructor (scaled identity)")
+    except Exception as e:
+        r.fail("mat3 broadcast constructor (scaled identity)", f"{e}\n{traceback.format_exc()}")
+
+    # 3. mat4 constructor (16 args)
+    try:
+        code = """
+mat4 m = mat4(1.0, 0.0, 0.0, 0.0,
+              0.0, 1.0, 0.0, 0.0,
+              0.0, 0.0, 1.0, 0.0,
+              0.0, 0.0, 0.0, 1.0);
+@OUT = m * @A;
+"""
+        result = compile_and_run(code, {"A": img})
+        assert torch.allclose(result, img, atol=1e-4), f"Identity mat4*vec4 failed"
+        r.ok("mat4 constructor (16 args)")
+    except Exception as e:
+        r.fail("mat4 constructor (16 args)", f"{e}\n{traceback.format_exc()}")
+
+    # 4. mat4 broadcast constructor
+    try:
+        code = """
+mat4 m = mat4(0.5);
+@OUT = m * @A;
+"""
+        result = compile_and_run(code, {"A": img})
+        expected = img * 0.5
+        assert torch.allclose(result, expected, atol=1e-4), f"Scaled identity mat4 failed"
+        r.ok("mat4 broadcast constructor (scaled identity)")
+    except Exception as e:
+        r.fail("mat4 broadcast constructor (scaled identity)", f"{e}\n{traceback.format_exc()}")
+
+    # 5. mat3 * vec3 (color transform)
+    try:
+        code = """
+mat3 m = mat3(0.0, 1.0, 0.0,
+              0.0, 0.0, 1.0,
+              1.0, 0.0, 0.0);
+@OUT = m * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        # This matrix cycles channels: r->b, g->r, b->g
+        expected = torch.stack([img[..., 1], img[..., 2], img[..., 0]], dim=-1)
+        assert torch.allclose(result, expected, atol=1e-4), f"Channel cycle mat3*vec3 failed"
+        r.ok("mat3 * vec3 (color transform)")
+    except Exception as e:
+        r.fail("mat3 * vec3 (color transform)", f"{e}\n{traceback.format_exc()}")
+
+    # 6. mat4 * vec4 (homogeneous transform)
+    try:
+        code = """
+mat4 m = mat4(1.0, 0.0, 0.0, 0.1,
+              0.0, 1.0, 0.0, 0.2,
+              0.0, 0.0, 1.0, 0.3,
+              0.0, 0.0, 0.0, 1.0);
+@OUT = m * @A;
+"""
+        result = compile_and_run(code, {"A": img})
+        # Translation: r += 0.1*a, g += 0.2*a, b += 0.3*a
+        expected = img.clone()
+        expected[..., 0] += 0.1 * img[..., 3]
+        expected[..., 1] += 0.2 * img[..., 3]
+        expected[..., 2] += 0.3 * img[..., 3]
+        assert torch.allclose(result, expected, atol=1e-4), f"Translation mat4*vec4 failed"
+        r.ok("mat4 * vec4 (homogeneous transform)")
+    except Exception as e:
+        r.fail("mat4 * vec4 (homogeneous transform)", f"{e}\n{traceback.format_exc()}")
+
+    # 7. mat3 * mat3 (chain two transforms)
+    try:
+        code = """
+mat3 a = mat3(2.0);
+mat3 b = mat3(3.0);
+mat3 c = a * b;
+@OUT = c * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = img[..., :3] * 6.0  # 2*I * 3*I = 6*I
+        assert torch.allclose(result, expected, atol=1e-4), f"mat3*mat3 chain failed"
+        r.ok("mat3 * mat3 (chain transforms)")
+    except Exception as e:
+        r.fail("mat3 * mat3 (chain transforms)", f"{e}\n{traceback.format_exc()}")
+
+    # 8. mat4 * mat4
+    try:
+        code = """
+mat4 a = mat4(2.0);
+mat4 b = mat4(0.5);
+mat4 c = a * b;
+@OUT = c * @A;
+"""
+        result = compile_and_run(code, {"A": img})
+        expected = img.clone()  # 2*I * 0.5*I = I
+        assert torch.allclose(result, expected, atol=1e-4), f"mat4*mat4 failed"
+        r.ok("mat4 * mat4")
+    except Exception as e:
+        r.fail("mat4 * mat4", f"{e}\n{traceback.format_exc()}")
+
+    # 9. scalar * mat3 (element-wise scale)
+    try:
+        code = """
+mat3 m = mat3(1.0, 2.0, 3.0,
+              4.0, 5.0, 6.0,
+              7.0, 8.0, 9.0);
+mat3 s = 0.5 * m;
+@OUT = s * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        # s = 0.5 * m, then s * vec3
+        m = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float32) * 0.5
+        rgb = img[..., :3]
+        expected = torch.matmul(rgb.unsqueeze(-2), m.T).squeeze(-2)
+        # Actually mat * vec = matmul(m, v), so expected = matmul(m, v.unsqueeze(-1)).squeeze(-1)
+        expected = torch.matmul(m, rgb.unsqueeze(-1)).squeeze(-1)
+        assert torch.allclose(result, expected, atol=1e-4), f"scalar*mat3 failed"
+        r.ok("scalar * mat3 (element-wise scale)")
+    except Exception as e:
+        r.fail("scalar * mat3 (element-wise scale)", f"{e}\n{traceback.format_exc()}")
+
+    # 10. mat3 * scalar
+    try:
+        code = """
+mat3 m = mat3(1.0);
+mat3 s = m * 3.0;
+@OUT = s * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = img[..., :3] * 3.0
+        assert torch.allclose(result, expected, atol=1e-4)
+        r.ok("mat3 * scalar")
+    except Exception as e:
+        r.fail("mat3 * scalar", f"{e}\n{traceback.format_exc()}")
+
+    # 11. mat3 + mat3 (element-wise add)
+    try:
+        code = """
+mat3 a = mat3(1.0);
+mat3 b = mat3(2.0);
+mat3 c = a + b;
+@OUT = c * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = img[..., :3] * 3.0  # I + 2I = 3I
+        assert torch.allclose(result, expected, atol=1e-4)
+        r.ok("mat3 + mat3 (element-wise add)")
+    except Exception as e:
+        r.fail("mat3 + mat3 (element-wise add)", f"{e}\n{traceback.format_exc()}")
+
+    # 12. mat3 - mat3
+    try:
+        code = """
+mat3 a = mat3(3.0);
+mat3 b = mat3(1.0);
+mat3 c = a - b;
+@OUT = c * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = img[..., :3] * 2.0  # 3I - I = 2I
+        assert torch.allclose(result, expected, atol=1e-4)
+        r.ok("mat3 - mat3 (element-wise subtract)")
+    except Exception as e:
+        r.fail("mat3 - mat3 (element-wise subtract)", f"{e}\n{traceback.format_exc()}")
+
+    # 13. transpose(mat3)
+    try:
+        code = """
+mat3 m = mat3(1.0, 2.0, 3.0,
+              4.0, 5.0, 6.0,
+              7.0, 8.0, 9.0);
+mat3 t = transpose(m);
+@OUT = t * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        m_T = torch.tensor([[1, 4, 7], [2, 5, 8], [3, 6, 9]], dtype=torch.float32)
+        rgb = img[..., :3]
+        expected = torch.matmul(m_T, rgb.unsqueeze(-1)).squeeze(-1)
+        assert torch.allclose(result, expected, atol=1e-4)
+        r.ok("transpose(mat3)")
+    except Exception as e:
+        r.fail("transpose(mat3)", f"{e}\n{traceback.format_exc()}")
+
+    # 14. determinant(mat3) — identity -> 1.0
+    try:
+        code = """
+float d = determinant(mat3(1.0));
+@OUT = vec4(d, d, d, 1.0);
+"""
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0, 0, 0, 0].item() - 1.0) < 1e-4, f"det(I) should be 1.0"
+        r.ok("determinant(mat3) = 1.0 for identity")
+    except Exception as e:
+        r.fail("determinant(mat3) = 1.0 for identity", f"{e}\n{traceback.format_exc()}")
+
+    # 15. inverse(mat3) — identity -> identity
+    try:
+        code = """
+mat3 m = mat3(1.0);
+mat3 inv = inverse(m);
+@OUT = inv * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = img[..., :3]
+        assert torch.allclose(result, expected, atol=1e-4)
+        r.ok("inverse(mat3) identity -> identity")
+    except Exception as e:
+        r.fail("inverse(mat3) identity -> identity", f"{e}\n{traceback.format_exc()}")
+
+    # 16. inverse: m * inverse(m) ~= identity
+    try:
+        code = """
+mat3 m = mat3(2.0, 1.0, 0.0,
+              0.0, 3.0, 1.0,
+              1.0, 0.0, 2.0);
+mat3 inv = inverse(m);
+mat3 prod = m * inv;
+@OUT = prod * @A.rgb;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = img[..., :3]
+        assert torch.allclose(result, expected, atol=1e-3), "m * inverse(m) should ~= identity"
+        r.ok("m * inverse(m) ~= identity")
+    except Exception as e:
+        r.fail("m * inverse(m) ~= identity", f"{e}\n{traceback.format_exc()}")
+
+    # 17. vec3 * mat3 -> type error
+    try:
+        code = "@OUT = @A.rgb * mat3(1.0);"
+        tokens = Lexer(code).tokenize()
+        program = Parser(tokens).parse()
+        tc = TypeChecker(binding_types={"A": TEXType.VEC4, "OUT": TEXType.VEC3})
+        tc.check(program)
+        r.fail("vec * mat type error", "Expected TypeCheckError")
+    except TypeCheckError as e:
+        assert "transpose" in str(e).lower() or "cannot" in str(e).lower(), f"Unexpected error: {e}"
+        r.ok("vec * mat -> type error")
+    except Exception as e:
+        r.fail("vec * mat type error", f"{e}\n{traceback.format_exc()}")
+
+    # 18. mat3 channel access -> type error
+    try:
+        code = "mat3 m = mat3(1.0); float x = m.r; @OUT = vec4(x);"
+        tokens = Lexer(code).tokenize()
+        program = Parser(tokens).parse()
+        tc = TypeChecker(binding_types={"OUT": TEXType.VEC4})
+        tc.check(program)
+        r.fail("mat3 channel access error", "Expected TypeCheckError")
+    except TypeCheckError:
+        r.ok("mat3 channel access -> type error")
+    except Exception as e:
+        r.fail("mat3 channel access error", f"{e}\n{traceback.format_exc()}")
+
+    # 19. mat3 as @OUT -> type error
+    try:
+        code = "mat3 m = mat3(1.0); @OUT = m;"
+        tokens = Lexer(code).tokenize()
+        program = Parser(tokens).parse()
+        tc = TypeChecker(binding_types={"A": TEXType.VEC4, "OUT": TEXType.VEC4})
+        tc.check(program)
+        r.fail("mat3 as @OUT error", "Expected TypeCheckError")
+    except TypeCheckError:
+        r.ok("mat3 as @OUT -> type error")
+    except Exception as e:
+        r.fail("mat3 as @OUT error", f"{e}\n{traceback.format_exc()}")
+
+    # 20. ACES color transform roundtrip (sRGB -> XYZ -> sRGB)
+    try:
+        code = """
+// sRGB to XYZ (D65)
+mat3 srgb_to_xyz = mat3(
+    0.4124564, 0.3575761, 0.1804375,
+    0.2126729, 0.7151522, 0.0721750,
+    0.0193339, 0.1191920, 0.9503041
+);
+// XYZ to sRGB (D65) — inverse of above
+mat3 xyz_to_srgb = inverse(srgb_to_xyz);
+// Roundtrip
+vec3 xyz = srgb_to_xyz * @A.rgb;
+@OUT = xyz_to_srgb * xyz;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = img[..., :3]
+        assert torch.allclose(result, expected, atol=1e-3), "sRGB->XYZ->sRGB roundtrip failed"
+        r.ok("ACES: sRGB -> XYZ -> sRGB roundtrip")
+    except Exception as e:
+        r.fail("ACES: sRGB -> XYZ -> sRGB roundtrip", f"{e}\n{traceback.format_exc()}")
+
+
+def test_matrix_benchmarks(r: TestResult):
+    print("\n--- Matrix Benchmark Tests ---")
+    H, W = 512, 512
+    img3 = torch.rand(1, H, W, 3)
+    img4 = torch.rand(1, H, W, 4)
+
+    # 1. mat3 * vec3 at 512×512
+    try:
+        code = """
+mat3 m = mat3(0.4124564, 0.3575761, 0.1804375,
+              0.2126729, 0.7151522, 0.0721750,
+              0.0193339, 0.1191920, 0.9503041);
+@OUT = m * @A.rgb;
+"""
+        # Warmup
+        compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        # Benchmark
+        t0 = time.perf_counter()
+        N = 10
+        for _ in range(N):
+            compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        elapsed = (time.perf_counter() - t0) / N * 1000
+        r.ok(f"mat3 * vec3 @ 512x512: {elapsed:.1f}ms")
+    except Exception as e:
+        r.fail("mat3 * vec3 benchmark", f"{e}\n{traceback.format_exc()}")
+
+    # 2. mat4 * vec4 at 512×512
+    try:
+        code = """
+mat4 m = mat4(1.0, 0.0, 0.0, 0.1,
+              0.0, 1.0, 0.0, 0.2,
+              0.0, 0.0, 1.0, 0.3,
+              0.0, 0.0, 0.0, 1.0);
+@OUT = m * @A;
+"""
+        compile_and_run(code, {"A": img4})
+        t0 = time.perf_counter()
+        N = 10
+        for _ in range(N):
+            compile_and_run(code, {"A": img4})
+        elapsed = (time.perf_counter() - t0) / N * 1000
+        r.ok(f"mat4 * vec4 @ 512x512: {elapsed:.1f}ms")
+    except Exception as e:
+        r.fail("mat4 * vec4 benchmark", f"{e}\n{traceback.format_exc()}")
+
+    # 3. chained mat3 * mat3 * vec3 at 512×512
+    try:
+        code = """
+mat3 a = mat3(0.4124564, 0.3575761, 0.1804375,
+              0.2126729, 0.7151522, 0.0721750,
+              0.0193339, 0.1191920, 0.9503041);
+mat3 b = inverse(a);
+mat3 c = a * b;
+@OUT = c * @A.rgb;
+"""
+        compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        t0 = time.perf_counter()
+        N = 10
+        for _ in range(N):
+            compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        elapsed = (time.perf_counter() - t0) / N * 1000
+        r.ok(f"chained mat3*mat3*vec3 @ 512x512: {elapsed:.1f}ms")
+    except Exception as e:
+        r.fail("chained mat3*mat3*vec3 benchmark", f"{e}\n{traceback.format_exc()}")
+
+    # 4. inverse(mat3) at 512×512
+    try:
+        code = """
+mat3 m = mat3(2.0, 1.0, 0.0,
+              0.0, 3.0, 1.0,
+              1.0, 0.0, 2.0);
+mat3 inv = inverse(m);
+@OUT = inv * @A.rgb;
+"""
+        compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        t0 = time.perf_counter()
+        N = 10
+        for _ in range(N):
+            compile_and_run(code, {"A": img3}, out_type=TEXType.VEC3)
+        elapsed = (time.perf_counter() - t0) / N * 1000
+        r.ok(f"inverse(mat3) @ 512x512: {elapsed:.1f}ms")
+    except Exception as e:
+        r.fail("inverse(mat3) benchmark", f"{e}\n{traceback.format_exc()}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main():
@@ -4010,6 +4413,8 @@ def main():
     test_vec_arrays(r)
     test_string_arrays(r)
     test_image_reductions(r)
+    test_matrix_types(r)
+    test_matrix_benchmarks(r)
 
     success = r.summary()
     return 0 if success else 1

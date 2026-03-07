@@ -27,8 +27,8 @@ from dataclasses import dataclass, field
 from .ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, ExprStatement,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
-    ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, SourceLoc,
-    ArrayDecl, ArrayIndexAccess, ArrayLiteral,
+    ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, MatConstructor,
+    CastExpr, SourceLoc, ArrayDecl, ArrayIndexAccess, ArrayLiteral,
 )
 
 
@@ -37,6 +37,8 @@ class TEXType(Enum):
     FLOAT = "float"
     VEC3 = "vec3"
     VEC4 = "vec4"
+    MAT3 = "mat3"
+    MAT4 = "mat4"
     STRING = "string"
     ARRAY = "array"  # fixed-size array; metadata in TEXArrayType
     VOID = "void"    # for statements
@@ -50,6 +52,10 @@ class TEXType(Enum):
         return self in (TEXType.VEC3, TEXType.VEC4)
 
     @property
+    def is_matrix(self) -> bool:
+        return self in (TEXType.MAT3, TEXType.MAT4)
+
+    @property
     def is_string(self) -> bool:
         return self == TEXType.STRING
 
@@ -59,7 +65,8 @@ class TEXType(Enum):
 
     @property
     def is_numeric(self) -> bool:
-        return self in (TEXType.INT, TEXType.FLOAT, TEXType.VEC3, TEXType.VEC4)
+        return self in (TEXType.INT, TEXType.FLOAT, TEXType.VEC3, TEXType.VEC4,
+                        TEXType.MAT3, TEXType.MAT4)
 
     @property
     def channels(self) -> int:
@@ -67,7 +74,20 @@ class TEXType(Enum):
             return 3
         elif self == TEXType.VEC4:
             return 4
+        elif self == TEXType.MAT3:
+            return 9
+        elif self == TEXType.MAT4:
+            return 16
         return 1
+
+    @property
+    def mat_size(self) -> int:
+        """Matrix dimension (3 for mat3, 4 for mat4). 0 for non-matrix types."""
+        if self == TEXType.MAT3:
+            return 3
+        elif self == TEXType.MAT4:
+            return 4
+        return 0
 
 
 @dataclass
@@ -82,6 +102,8 @@ TYPE_NAME_MAP = {
     "int": TEXType.INT,
     "vec3": TEXType.VEC3,
     "vec4": TEXType.VEC4,
+    "mat3": TEXType.MAT3,
+    "mat4": TEXType.MAT4,
     "string": TEXType.STRING,
 }
 
@@ -457,6 +479,9 @@ class TypeChecker:
         if isinstance(node, VecConstructor):
             return self._check_vec_constructor(node)
 
+        if isinstance(node, MatConstructor):
+            return self._check_mat_constructor(node)
+
         if isinstance(node, CastExpr):
             return self._check_cast(node)
 
@@ -507,6 +532,11 @@ class TypeChecker:
 
         if obj_type.is_string:
             self._error("Channel access is not valid on string type", node.loc)
+            self._set_type(node, TEXType.FLOAT)
+            return TEXType.FLOAT
+
+        if obj_type.is_matrix:
+            self._error("Channel access is not valid on matrix type", node.loc)
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
 
@@ -564,6 +594,12 @@ class TypeChecker:
             )
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
+
+        # Matrix-specific rules
+        if lt.is_matrix or rt.is_matrix:
+            result = self._check_matrix_binop(lt, rt, node.op, node.loc)
+            self._set_type(node, result)
+            return result
 
         if node.op in ("&&", "||"):
             # Logical ops: result is always float (boolean-like)
@@ -623,6 +659,71 @@ class TypeChecker:
         t = TEXType.VEC3 if node.size == 3 else TEXType.VEC4
         self._set_type(node, t)
         return t
+
+    def _check_mat_constructor(self, node: MatConstructor) -> TEXType:
+        for arg in node.args:
+            arg_type = self._check_expr(arg)
+            if arg_type.is_string:
+                self._error("Matrix constructor arguments cannot be strings", node.loc)
+            elif arg_type.is_vector or arg_type.is_matrix:
+                self._error("Matrix constructor arguments must be scalar", node.loc)
+
+        n = node.size * node.size  # 9 for mat3, 16 for mat4
+        if len(node.args) == 1:
+            pass  # Broadcast: mat3(1.0) → scaled identity
+        elif len(node.args) != n:
+            self._error(
+                f"mat{node.size} expects {n} arguments (or 1 for scaled identity), got {len(node.args)}",
+                node.loc,
+            )
+
+        t = TEXType.MAT3 if node.size == 3 else TEXType.MAT4
+        self._set_type(node, t)
+        return t
+
+    def _check_matrix_binop(self, lt: TEXType, rt: TEXType, op: str, loc: SourceLoc) -> TEXType:
+        """Type-check binary operations involving matrices."""
+        if op == "*":
+            # mat * mat → mat (matmul)
+            if lt.is_matrix and rt.is_matrix:
+                if lt != rt:
+                    self._error(f"Cannot multiply {lt.value} by {rt.value}", loc)
+                return lt
+            # mat * vec → vec (matrix-vector product)
+            if lt.is_matrix and rt.is_vector:
+                if lt == TEXType.MAT3 and rt not in (TEXType.VEC3, TEXType.VEC4):
+                    self._error(f"mat3 * requires vec3 or vec4 operand, got {rt.value}", loc)
+                if lt == TEXType.MAT4 and rt != TEXType.VEC4:
+                    self._error(f"mat4 * requires vec4 operand, got {rt.value}", loc)
+                return rt
+            # vec * mat → error
+            if lt.is_vector and rt.is_matrix:
+                self._error(
+                    f"Cannot multiply {lt.value} * {rt.value} — use transpose({rt.value}) * {lt.value} instead",
+                    loc,
+                )
+                return lt
+            # scalar * mat → mat (element-wise scale)
+            if lt.is_scalar and rt.is_matrix:
+                return rt
+            if lt.is_matrix and rt.is_scalar:
+                return lt
+        elif op in ("+", "-"):
+            # mat +/- mat → mat (element-wise)
+            if lt.is_matrix and rt.is_matrix:
+                if lt != rt:
+                    self._error(f"Cannot {op} {lt.value} and {rt.value}", loc)
+                return lt
+            # scalar +/- mat or mat +/- scalar → mat (element-wise)
+            if lt.is_scalar and rt.is_matrix:
+                return rt
+            if lt.is_matrix and rt.is_scalar:
+                return lt
+            self._error(f"Cannot use '{op}' between {lt.value} and {rt.value}", loc)
+            return lt
+        else:
+            self._error(f"Operator '{op}' is not supported for matrix types", loc)
+            return lt if lt.is_matrix else rt
 
     def _check_cast(self, node: CastExpr) -> TEXType:
         expr_type = self._check_expr(node.expr)
@@ -732,6 +833,9 @@ class TypeChecker:
         # String is only assignable to/from string
         if target.is_string or value.is_string:
             return False
+        # Matrix is only assignable to same matrix type
+        if target.is_matrix or value.is_matrix:
+            return target == value
         # int -> float
         if target == TEXType.FLOAT and value == TEXType.INT:
             return True

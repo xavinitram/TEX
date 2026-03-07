@@ -20,7 +20,7 @@ from ..tex_compiler.ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, ExprStatement,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, SourceLoc,
-    ArrayDecl, ArrayIndexAccess, ArrayLiteral,
+    ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor,
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP
 from .stdlib import TEXStdlib
@@ -547,6 +547,9 @@ class Interpreter:
         if isinstance(node, VecConstructor):
             return self._eval_vec_constructor(node)
 
+        if isinstance(node, MatConstructor):
+            return self._eval_mat_constructor(node)
+
         if isinstance(node, CastExpr):
             return self._eval_cast(node)
 
@@ -659,6 +662,15 @@ class Interpreter:
                 f"Cannot use operator '{node.op}' between string and numeric types", node.loc
             )
 
+        # Matrix operations: use type info to dispatch matmul vs element-wise
+        lt = self.type_map.get(id(node.left))
+        rt = self.type_map.get(id(node.right))
+        if node.op == "*" and lt is not None and rt is not None:
+            if lt.is_matrix and rt.is_matrix:
+                return torch.matmul(left, right)
+            if lt.is_matrix and rt.is_vector:
+                return torch.matmul(left, right.unsqueeze(-1)).squeeze(-1)
+
         # Ensure compatible shapes
         left, right = _broadcast_pair(left, right)
 
@@ -760,6 +772,27 @@ class Interpreter:
 
         return torch.stack(expanded, dim=-1)
 
+    def _eval_mat_constructor(self, node: MatConstructor) -> torch.Tensor:
+        n = node.size  # 3 or 4
+        args = [self._eval(arg) for arg in node.args]
+
+        if len(args) == 1:
+            # Scaled identity: mat3(1.0) → identity * scalar
+            val = args[0]
+            eye = torch.eye(n, dtype=torch.float32, device=self.device)
+            return eye * val
+        elif len(args) == n * n:
+            # Full specification: mat3(a,b,c,d,e,f,g,h,i) → 3×3 row-major
+            max_shape = self._get_max_spatial_shape(args)
+            expanded = [_ensure_spatial(a, max_shape) for a in args]
+            flat = torch.stack(expanded, dim=-1)  # [..., n*n]
+            return flat.reshape(flat.shape[:-1] + (n, n))
+        else:
+            raise InterpreterError(
+                f"mat{n} expects {n * n} arguments or 1 (scaled identity), got {len(args)}",
+                node.loc,
+            )
+
     def _eval_cast(self, node: CastExpr) -> torch.Tensor | str:
         value = self._eval(node.expr)
         if node.target_type == "string":
@@ -789,6 +822,9 @@ class Interpreter:
                 B, H, W = self.spatial_shape
                 return torch.zeros(B, H, W, 4, dtype=torch.float32, device=self.device)
             return torch.zeros(4, dtype=torch.float32, device=self.device)
+        elif t.is_matrix:
+            n = t.mat_size
+            return torch.zeros(n, n, dtype=torch.float32, device=self.device)
         else:
             return torch.tensor(0.0, dtype=torch.float32, device=self.device)
 

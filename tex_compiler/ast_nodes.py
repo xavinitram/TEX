@@ -157,6 +157,13 @@ class VecConstructor(ASTNode):
 
 
 @dataclass
+class MatConstructor(ASTNode):
+    """Matrix constructor: `mat3(...)` or `mat4(...)`"""
+    size: int = 3                # 3 or 4 (→ 3×3 or 4×4)
+    args: list[ASTNode] = field(default_factory=list)
+
+
+@dataclass
 class CastExpr(ASTNode):
     """Type cast: `float(x)`, `int(y)`, `string(z)`"""
     target_type: str = ""        # "float", "int", "string"

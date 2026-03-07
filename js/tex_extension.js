@@ -59,7 +59,7 @@ function debounce(fn, ms) {
 // ─── Syntax Highlighting ─────────────────────────────────────────────
 
 const TEX_KEYWORDS = new Set([
-    "float", "int", "vec3", "vec4", "string", "if", "else", "for",
+    "float", "int", "vec3", "vec4", "mat3", "mat4", "string", "if", "else", "for",
 ]);
 const TEX_BUILTINS = new Set([
     "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
@@ -82,6 +82,7 @@ const TEX_BUILTINS = new Set([
     "sort", "reverse", "arr_sum", "arr_min", "arr_max", "median", "arr_avg",
     "join",
     "img_sum", "img_mean", "img_min", "img_max", "img_median",
+    "transpose", "determinant", "inverse",
 ]);
 const TEX_CONSTANTS = new Set(["PI", "E"]);
 const TEX_COORD_VARS = new Set(["u", "v", "ix", "iy", "iw", "ih", "ic", "fi", "fn"]);
@@ -91,7 +92,7 @@ const TEX_COORD_VARS = new Set(["u", "v", "ix", "iy", "iw", "ih", "ic", "fi", "f
 const TEX_HELP_HTML = `
 <h3>TEX Quick Reference</h3>
 
-<p><b>Types:</b> <code>float</code> <code>int</code> <code>vec3</code> <code>vec4</code> <code>string</code></p>
+<p><b>Types:</b> <code>float</code> <code>int</code> <code>vec3</code> <code>vec4</code> <code>mat3</code> <code>mat4</code> <code>string</code></p>
 
 <p><b>Bindings:</b> <code>@name</code> inputs (e.g. <code>@A</code>, <code>@base_image</code>), <code>@OUT</code> output</p>
 
@@ -176,6 +177,13 @@ Literals: <code>"hello"</code>. Concat: <code>"a" + "b"</code>. String output au
 <code>img_mean(@A)</code> <code>img_sum(@A)</code> <code>img_median(@A)</code> — per-channel stats<br>
 Results broadcast with per-pixel expressions.<br>
 Auto-levels: <code>@OUT = (@A - img_min(@A)) / max(img_max(@A) - img_min(@A), 0.001);</code></p>
+
+<p><b>Matrix:</b><br>
+<code>mat3</code> (3×3) / <code>mat4</code> (4×4) — internal computation only (cannot assign to @OUT)<br>
+<code>mat3(1.0)</code> — scaled identity &nbsp; <code>mat3(a,b,...,i)</code> — 9 values row-major<br>
+<code>mat * vec</code> — matrix-vector multiply &nbsp; <code>mat * mat</code> — matrix multiply<br>
+<code>scalar * mat</code> — element-wise scale &nbsp; <code>mat + mat</code> / <code>mat - mat</code><br>
+<code>transpose(m)</code> &nbsp; <code>determinant(m)</code> &nbsp; <code>inverse(m)</code></p>
 
 <p><b>Batch / Temporal:</b><br>
 <code>fi</code> = frame index (0 to B-1), <code>fn</code> = total frame count<br>

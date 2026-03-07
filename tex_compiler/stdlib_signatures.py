@@ -96,6 +96,11 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "cross":     {"args": (2, 2), "return": lambda _: TEXType.VEC3},
     "reflect":   {"args": (2, 2), "return": _passthrough_type},
 
+    # Matrix operations
+    "transpose":   {"args": (1, 1), "return": _passthrough_type},                  # transpose(mat) — transpose matrix
+    "determinant": {"args": (1, 1), "return": lambda _: TEXType.FLOAT},            # determinant(mat) — scalar
+    "inverse":     {"args": (1, 1), "return": _passthrough_type},                  # inverse(mat) — matrix inverse
+
     # Color operations
     "luma":      {"args": (1, 1), "return": lambda _: TEXType.FLOAT},  # luminance of vec3/vec4
     "hsv2rgb":   {"args": (1, 1), "return": _passthrough_type},

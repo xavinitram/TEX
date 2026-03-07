@@ -30,6 +30,8 @@ class TokenType(Enum):
     KW_VEC3 = auto()
     KW_VEC4 = auto()
     KW_STRING = auto()
+    KW_MAT3 = auto()
+    KW_MAT4 = auto()
 
     # Control flow keywords
     KW_IF = auto()
@@ -83,6 +85,8 @@ KEYWORDS = {
     "vec3": TokenType.KW_VEC3,
     "vec4": TokenType.KW_VEC4,
     "string": TokenType.KW_STRING,
+    "mat3": TokenType.KW_MAT3,
+    "mat4": TokenType.KW_MAT4,
     "if": TokenType.KW_IF,
     "else": TokenType.KW_ELSE,
     "for": TokenType.KW_FOR,

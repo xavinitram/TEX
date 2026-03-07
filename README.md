@@ -7,13 +7,13 @@ TEX Wrangle is a compact per-pixel DSL for ComfyUI, inspired by Houdini VEX, VDB
 TEX sits between simple math-expression nodes and full Python scripting nodes. It provides:
 
 - **Per-pixel processing** — write code that runs on every pixel, automatically vectorized via PyTorch
-- **Static typing** — `float`, `int`, `vec3`, `vec4`, `string`, arrays with compile-time checking
+- **Static typing** — `float`, `int`, `vec3`, `vec4`, `mat3`, `mat4`, `string`, arrays with compile-time checking
 - **`@` bindings** — reference node inputs with any name (`@A`, `@base_image`, `@strength`); write output to `@OUT`
 - **Control flow** — `if/else` (vectorized via `torch.where`) and bounded `for` loops
 - **GPU acceleration** — execute on CPU or GPU with automatic device detection
 - **`torch.compile` support** — optional JIT compilation for faster repeated execution
 - **Two-tier caching** — in-memory LRU + disk persistence for instant re-execution
-- **76 stdlib functions** — math, interpolation, vector ops, color conversion, image sampling, cross-frame sampling, string manipulation, array operations, image reductions
+- **79 stdlib functions** — math, interpolation, vector ops, matrix ops, color conversion, image sampling, cross-frame sampling, string manipulation, array operations, image reductions
 - **Good error messages** — line/column-mapped errors from the compiler
 
 ## Quick Start
@@ -63,6 +63,8 @@ After installation, restart ComfyUI. The **TEX Wrangle** node appears under the 
 | `int` | Integer value | `int n = 42;` |
 | `vec3` | 3-component vector (RGB) | `vec3 color = vec3(1.0, 0.0, 0.0);` |
 | `vec4` | 4-component vector (RGBA) | `vec4 pixel = vec4(r, g, b, 1.0);` |
+| `mat3` | 3×3 matrix (internal only) | `mat3 m = mat3(1.0);` |
+| `mat4` | 4×4 matrix (internal only) | `mat4 m = mat4(1.0);` |
 | `string` | Text value (scalar-only) | `string name = "hello";` |
 | `T[]` | Fixed-size array (T = float/int/vec3/vec4/string) | `float arr[5];` `vec4 colors[9];` |
 
@@ -155,6 +157,8 @@ Loops must have integer loop variables with compile-time-deterministic bounds. I
 **Interpolation:** `min`, `max`, `clamp`, `lerp`/`mix`, `fit`, `smoothstep`, `step`
 
 **Vector:** `dot`, `length`, `distance`, `normalize`, `cross`, `reflect`
+
+**Matrix:** `transpose`, `determinant`, `inverse`
 
 **Color:** `luma`, `hsv2rgb`, `rgb2hsv`
 
@@ -412,6 +416,52 @@ float avg = luma(img_mean(@A));
 @OUT = step(avg, luma(@A));
 ```
 
+### Matrix Types
+
+TEX supports `mat3` (3×3) and `mat4` (4×4) matrix types for color transforms, coordinate transforms, and linear algebra. Matrices are **internal computation only** — they cannot be assigned to `@OUT` or used as node inputs/outputs.
+
+**Constructors:**
+
+```c
+mat3 identity = mat3(1.0);           // scaled identity (1 arg)
+mat3 m = mat3(a, b, c, d, e, f,      // full specification (9 args, row-major)
+              g, h, i);
+mat4 transform = mat4(1.0);          // 4×4 scaled identity
+mat4 m4 = mat4(a, b, c, d, ...);     // 16 args, row-major
+```
+
+**Operators:**
+
+| Expression | Result | Description |
+|------------|--------|-------------|
+| `mat * vec` | vec | Matrix-vector multiply (transform) |
+| `mat * mat` | mat | Matrix-matrix multiply (chain transforms) |
+| `scalar * mat` | mat | Element-wise scale |
+| `mat * scalar` | mat | Element-wise scale |
+| `mat + mat` | mat | Element-wise addition |
+| `mat - mat` | mat | Element-wise subtraction |
+| `vec * mat` | error | Use `transpose(mat) * vec` instead |
+
+**Functions:**
+
+| Function | Return | Description |
+|----------|--------|-------------|
+| `transpose(m)` | mat | Transpose matrix |
+| `determinant(m)` | float | Matrix determinant |
+| `inverse(m)` | mat | Matrix inverse |
+
+**Example — ACES color transform (sRGB to XYZ):**
+
+```c
+mat3 srgb_to_xyz = mat3(
+    0.4124564, 0.3575761, 0.1804375,
+    0.2126729, 0.7151522, 0.0721750,
+    0.0193339, 0.1191920, 0.9503041
+);
+vec3 xyz = srgb_to_xyz * @A.rgb;
+@OUT = inverse(srgb_to_xyz) * xyz;  // roundtrip back to sRGB
+```
+
 ### Type Promotion
 
 - `int` promotes to `float` automatically
@@ -473,12 +523,12 @@ TEX_Wrangle/
     stdlib_signatures.py   # Function signatures for type checking
   tex_runtime/
     interpreter.py         # Tree-walking tensor evaluator
-    stdlib.py              # Built-in function implementations (76)
+    stdlib.py              # Built-in function implementations (79)
     compiled.py            # torch.compile wrapper with backend cascade
   js/
     tex_extension.js       # Frontend: auto-socket, syntax highlighting, help popup
   tests/
-    test_tex.py            # 307-test suite
+    test_tex.py            # 331-test suite
   examples/                # Example TEX snippets (24 files)
   .tex_cache/              # Disk cache directory (auto-created, gitignored)
 ```
@@ -683,6 +733,8 @@ TEX uses **channel-last** layout throughout, matching ComfyUI's convention:
 | Mask | `[B, H, W]` | Single-channel spatial data |
 | Scalar array | `[B, H, W, N]` | N elements per pixel |
 | Vector array | `[B, H, W, N, C]` | N elements × C channels per pixel |
+| Matrix (mat3) | `[B, H, W, 3, 3]` | 3×3 matrix per pixel (or `[3, 3]` for constants) |
+| Matrix (mat4) | `[B, H, W, 4, 4]` | 4×4 matrix per pixel (or `[4, 4]` for constants) |
 | String array | Python `list[str]` | Not a tensor — handled separately |
 | Latent (input) | `[B, C, H, W]` | Channel-first (ComfyUI convention) |
 | Latent (internal) | `[B, H, W, C]` | Permuted to channel-last for processing |
@@ -757,6 +809,7 @@ The `TEXType` enum defines all types:
 
 ```
 VOID → INT → FLOAT → VEC3 → VEC4
+                      MAT3    MAT4 (internal only, no @OUT)
                              STRING (no numeric promotion)
                              ARRAY (container type)
 ```
@@ -831,7 +884,7 @@ cd custom_nodes/TEX_Wrangle
 python tests/test_tex.py
 ```
 
-Expected: 293/293 passed.
+Expected: 331/331 passed.
 
 ## License
 

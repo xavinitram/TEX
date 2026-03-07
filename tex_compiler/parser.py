@@ -34,10 +34,10 @@ from .ast_nodes import (
     SourceLoc, Program, VarDecl, Assignment, IfElse, ForLoop, ExprStatement,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, ASTNode,
-    ArrayDecl, ArrayIndexAccess, ArrayLiteral,
+    ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor,
 )
 
-TYPE_KEYWORDS = {TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_VEC3, TokenType.KW_VEC4, TokenType.KW_STRING}
+TYPE_KEYWORDS = {TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_VEC3, TokenType.KW_VEC4, TokenType.KW_STRING, TokenType.KW_MAT3, TokenType.KW_MAT4}
 
 COMPOUND_ASSIGN_OPS = {
     TokenType.PLUS_ASSIGN: "+",
@@ -472,6 +472,10 @@ class Parser:
         if tok.type in (TokenType.KW_VEC3, TokenType.KW_VEC4):
             return self._parse_vec_constructor()
 
+        # Matrix constructors: mat3(...) / mat4(...)
+        if tok.type in (TokenType.KW_MAT3, TokenType.KW_MAT4):
+            return self._parse_mat_constructor()
+
         # Cast expressions: float(...) / int(...) / string(...)
         if tok.type in (TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_STRING):
             if self.peek_ahead() == TokenType.LPAREN:
@@ -499,6 +503,18 @@ class Parser:
                 args.append(self.parse_expr())
         self.expect(TokenType.RPAREN, f"Expected ')' after {tok.value} arguments")
         return VecConstructor(loc=tok.loc, size=size, args=args)
+
+    def _parse_mat_constructor(self) -> MatConstructor:
+        tok = self.advance()  # mat3 or mat4
+        size = 3 if tok.type == TokenType.KW_MAT3 else 4
+        self.expect(TokenType.LPAREN, f"Expected '(' after {tok.value}")
+        args: list[ASTNode] = []
+        if self.peek() != TokenType.RPAREN:
+            args.append(self.parse_expr())
+            while self.match(TokenType.COMMA):
+                args.append(self.parse_expr())
+        self.expect(TokenType.RPAREN, f"Expected ')' after {tok.value} arguments")
+        return MatConstructor(loc=tok.loc, size=size, args=args)
 
     def _parse_cast(self) -> CastExpr:
         tok = self.advance()  # float or int

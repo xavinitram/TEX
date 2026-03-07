@@ -113,6 +113,11 @@ class TEXStdlib:
             "arr_avg": TEXStdlib.fn_arr_avg,
             "join": TEXStdlib.fn_join,
 
+            # Matrix operations
+            "transpose": TEXStdlib.fn_transpose,
+            "determinant": TEXStdlib.fn_determinant,
+            "inverse": TEXStdlib.fn_inverse,
+
             # Image reductions
             "img_sum": TEXStdlib.fn_img_sum,
             "img_mean": TEXStdlib.fn_img_mean,
@@ -255,6 +260,20 @@ class TEXStdlib:
         """Safe division — returns 0.0 where abs(b) < 1e-10."""
         a_t, b_t = _to_tensor(a), _to_tensor(b)
         return torch.where(torch.abs(b_t) < 1e-10, torch.zeros_like(a_t), a_t / b_t)
+
+    # -- Matrix operations ----------------------------------------------
+
+    @staticmethod
+    def fn_transpose(m):
+        return m.transpose(-1, -2)
+
+    @staticmethod
+    def fn_determinant(m):
+        return torch.linalg.det(m)
+
+    @staticmethod
+    def fn_inverse(m):
+        return torch.linalg.inv(m)
 
     # -- Clamping / interpolation ---------------------------------------
 
