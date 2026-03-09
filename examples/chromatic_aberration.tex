@@ -1,0 +1,16 @@
+// Chromatic aberration — RGB channel split effect
+// Input: @A (IMAGE)
+// Output: IMAGE
+//
+// Offsets the red channel left and the blue channel right
+// while keeping green centered, simulating lens fringing.
+// Adjust 'offset' to control the strength of the effect.
+
+float offset = 0.003;
+
+// Sample each channel at a different horizontal position
+float r = sample(@A, u - offset, v).r;
+float g = sample(@A, u, v).g;
+float b = sample(@A, u + offset, v).b;
+
+@OUT = vec3(r, g, b);

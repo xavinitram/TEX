@@ -1,0 +1,18 @@
+// Radial gradient — circular falloff from center
+// Input: @A (IMAGE — used only for resolution)
+// Output: IMAGE
+//
+// Generates a white-to-black gradient radiating outward
+// from the image center using smoothstep for a soft edge.
+// Useful as a mask, vignette layer, or compositing element.
+
+// Distance from center of image
+float cx = u - 0.5;
+float cy = v - 0.5;
+float dist = hypot(cx, cy);
+
+// Smooth falloff: white at center, black at edges
+// Inner radius 0.0 (fully white), outer radius 0.5 (fully black)
+float grad = 1.0 - smoothstep(0.0, 0.5, dist);
+
+@OUT = vec3(grad, grad, grad);

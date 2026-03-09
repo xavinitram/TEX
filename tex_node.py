@@ -7,10 +7,13 @@ images, masks, and scalar values using per-pixel tensor operations.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 import torch
 import traceback
 from typing import Any
+
+logger = logging.getLogger("TEX")
 
 from .tex_compiler.lexer import LexerError
 from .tex_compiler.parser import ParseError
@@ -58,6 +61,11 @@ def _unwrap_latent(value: dict) -> tuple[torch.Tensor, dict]:
 
 def _infer_binding_type(value: Any) -> TEXType:
     """Infer the TEX type of a ComfyUI input value."""
+    # Image/latent lists — use first element for type inference
+    if isinstance(value, list):
+        if len(value) > 0:
+            return _infer_binding_type(value[0])
+        return TEXType.FLOAT
     if isinstance(value, dict) and "samples" in value:
         # LATENT dict — infer from channel count (dim 1 = C before permute)
         c = value["samples"].shape[1]
@@ -223,11 +231,11 @@ class TEXWrangleNode:
                 "code": ("STRING", {
                     "multiline": True,
                     "dynamicPrompts": False,
-                    "default": "// TEX Wrangle — write your expression here\n"
-                               "// Reference inputs with @A, @B, etc.\n"
+                    "default": "// TEX Wrangle\n"
+                               "// Read inputs with @A, @B, etc.\n"
                                "// Write output to @OUT\n\n"
-                               "float gray = luma(@A);\n"
-                               "@OUT = vec3(gray, gray, gray);\n",
+                               "float gray = luma(@IN);\n"
+                               "@OUT = vec3(gray);\n",
                     "placeholder": "// TEX code here...",
                     "tooltip": "TEX source code. Use @name to reference inputs, @OUT for output. Types: float, int, vec3, vec4, string.",
                 }),
@@ -240,8 +248,8 @@ class TEXWrangleNode:
         }
 
     RETURN_TYPES = (ANY_TYPE,)
-    RETURN_NAMES = ("result",)
-    OUTPUT_TOOLTIPS = ("TEX result. Format depends on output_type: IMAGE [B,H,W,3], MASK [B,H,W], LATENT [B,C,H,W], FLOAT, or INT.",)
+    RETURN_NAMES = ("OUT",)
+    OUTPUT_TOOLTIPS = ("TEX output. Format depends on output_type: IMAGE [B,H,W,3], MASK [B,H,W], LATENT [B,C,H,W], FLOAT, or INT.",)
 
     @classmethod
     def IS_CHANGED(cls, code, output_type, **kwargs):
@@ -256,7 +264,9 @@ class TEXWrangleNode:
                 continue
             val = kwargs[name]
             if val is not None:
-                if isinstance(val, dict) and "samples" in val:
+                if isinstance(val, list):
+                    parts.append(f"{name}:LIST:{len(val)}")
+                elif isinstance(val, dict) and "samples" in val:
                     s = val["samples"]
                     parts.append(f"{name}:LATENT:{s.shape}:{s.dtype}:{s.device}")
                 elif isinstance(val, torch.Tensor):
@@ -277,6 +287,14 @@ class TEXWrangleNode:
         bindings: dict[str, Any] = {
             name: val for name, val in kwargs.items() if val is not None
         }
+
+        # Unwrap lists — use first element (TEX doesn't support per-image indexing)
+        for name, val in list(bindings.items()):
+            if isinstance(val, list):
+                if len(val) > 0:
+                    bindings[name] = val[0]
+                else:
+                    bindings[name] = torch.tensor(0.0)
 
         # Unwrap LATENT dicts into channel-last tensors, preserving metadata
         latent_meta: dict[str, Any] = {}
@@ -347,9 +365,11 @@ class TEXWrangleNode:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             compile_tag = " [compiled]" if compile_mode == "torch_compile" else ""
             auto_tag = f" (auto->{effective_output_type})" if output_type == "auto" else ""
-            print(f"[TEX] Executed in {elapsed_ms:.1f}ms{compile_tag} | "
-                  f"device: {device} | output: {effective_output_type}{auto_tag} | "
-                  f"bindings: {list(bindings.keys())}")
+            logger.info(
+                f"Executed in {elapsed_ms:.1f}ms{compile_tag} | "
+                f"device: {device} | output: {effective_output_type}{auto_tag} | "
+                f"bindings: {list(bindings.keys())}"
+            )
 
             return (result,)
 

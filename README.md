@@ -507,6 +507,11 @@ See the `examples/` directory for complete snippets:
 - `edge_detect.tex` — Sobel edge detection using neighbor sampling
 - `simplex_terrain.tex` — terrain-style coloring with simplex noise
 - `motion_detect.tex` — cross-frame motion detection
+- `sharpen.tex` — unsharp mask sharpening via neighbor sampling
+- `chromatic_aberration.tex` — per-channel UV offset for RGB split
+- `radial_gradient.tex` — distance-from-center gradient with smoothstep
+- `mask_from_color.tex` — extract mask by color distance (green screen keying)
+- `pixelate.tex` — mosaic/pixelation effect via floor UV
 
 ## Architecture
 
@@ -526,10 +531,10 @@ TEX_Wrangle/
     stdlib.py              # Built-in function implementations (79)
     compiled.py            # torch.compile wrapper with backend cascade
   js/
-    tex_extension.js       # Frontend: auto-socket, syntax highlighting, help popup
+    tex_extension.js       # Frontend: auto-socket, CodeMirror 6 editor, help popup
   tests/
     test_tex.py            # 331-test suite
-  examples/                # Example TEX snippets (24 files)
+  examples/                # Example TEX snippets (29 files)
   .tex_cache/              # Disk cache directory (auto-created, gitignored)
 ```
 
@@ -549,9 +554,17 @@ With `torch_compile` enabled, first execution has a one-time tracing overhead (~
 
 - **No scatter writes** — cannot write to arbitrary coordinates (`@A(x,y) = val`)
 - **No histogram operations** — no per-image histogram computation
-- **No CodeMirror editor** — uses standard ComfyUI textarea with syntax highlighting overlay
 
 ## Troubleshooting
+
+**No-input resolution (1x1 output):**
+Code without image inputs (e.g. procedural noise with no `@A` connected) produces a 1x1 image because the output resolution is derived from connected inputs. Connect an image to set the output resolution.
+
+**FLOAT vs MASK output:**
+With `output_type=auto`, TEX infers the output type from the code. If `@OUT` is assigned a spatial float value (per-pixel), the output is `MASK`. If `output_type` is explicitly set to `FLOAT`, the result is reduced to a single scalar via `mean().item()`.
+
+**Image lists:**
+Some ComfyUI nodes output lists of images (e.g. Load Image Batch). TEX handles these gracefully by using the first image in the list. To process images independently, use separate TEX nodes.
 
 **Variable `v` conflict:**
 The built-in variable `v` (normalized y-coordinate, 0–1) is always defined. Declaring `float v = ...;` will cause a "Variable 'v' already declared" error. Use a different name instead (e.g. `val`, `value`). Same applies to other built-in variables: `u`, `ix`, `iy`, `iw`, `ih`, `fi`, `fn`, `ic`, `PI`, `E`.
@@ -575,8 +588,9 @@ TEX uses the ComfyUI V1 API (classic node pattern). Tested with ComfyUI desktop 
 
 ## Roadmap
 
-**v1.5:** CodeMirror 6 editor, Triton kernel ops, histogram operations
-**v2.0:** Direct Triton codegen, atomic scatter writes
+**v0.3:** Multiple outputs (`#output TYPE name;`), promoted parameters (`#param type name = default;`), if/else selective cloning optimization
+**v1.0:** Triton kernel ops, histogram operations, scatter writes
+**v2.0:** Direct Triton codegen
 
 ## Developer Guide
 
@@ -863,7 +877,7 @@ The JavaScript frontend (`js/tex_extension.js`) provides three features:
 
 **Auto-socket creation**: A regex parser (`/@([A-Za-z_][A-Za-z0-9_]*)/g`) scans TEX code for `@name` references (excluding `@OUT` and system parameter names). For each unique name, a LiteGraph input slot of type `"*"` (any) is created. Sockets are updated on a 400ms debounce to avoid excessive DOM changes while typing.
 
-**Syntax highlighting**: Uses the "sibling overlay" pattern — a `<div>` is positioned behind the `<textarea>` with identical font metrics and positioning. The textarea has transparent background and text; the overlay renders syntax-highlighted HTML. Scroll position is synchronized via event listeners. A `MutationObserver` discovers TEX textareas (tagged with `data-tex-node="true"`) and a `ResizeObserver` keeps the overlay sized correctly.
+**CodeMirror 6 editor**: TEX uses a bundled CodeMirror 6 editor (`js/tex_cm6_bundle.js`) providing syntax highlighting, autocompletion, error squiggle underlines, and bracket matching. The editor replaces ComfyUI's default textarea when the TEX node is created. A custom TEX language mode handles function highlighting (blue), `@` binding highlighting (orange), and keyword highlighting (purple). Autocompletion provides all stdlib functions, built-in variables, and `@` bindings with type annotations.
 
 **Error display**: Listens for ComfyUI's WebSocket `execution_error` events. Errors for TEX nodes are cached by node ID and rendered above the node title bar in `onDrawForeground`. Errors clear on the next successful execution.
 

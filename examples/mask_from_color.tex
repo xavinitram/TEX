@@ -1,0 +1,21 @@
+// Mask from color — extract a mask by color similarity
+// Input: @A (IMAGE)
+// Output: MASK (float — auto-inferred from scalar @OUT)
+//
+// Compares each pixel to a target color and outputs a
+// soft mask: white where the color matches, black elsewhere.
+// Great for green screen keying or isolating colored regions.
+// Adjust 'target' and 'tolerance' to tune the selection.
+
+// Target color to match (green screen default)
+vec3 target = vec3(0.2, 0.8, 0.2);
+
+// How far a pixel color can be from the target (0 = exact, 1 = loose)
+float tolerance = 0.3;
+
+// Color distance between this pixel and the target
+vec3 diff = @A.rgb - target;
+float dist = length(diff);
+
+// Smooth threshold: 1.0 when close, 0.0 when far
+@OUT = 1.0 - smoothstep(tolerance * 0.5, tolerance, dist);

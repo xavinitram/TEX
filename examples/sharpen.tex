@@ -1,0 +1,19 @@
+// Unsharp mask sharpening using a 3x3 kernel
+// Input: @A (IMAGE)
+// Output: IMAGE
+//
+// Approximates a Laplacian sharpen filter:
+//   center pixel * 5 minus its four direct neighbors.
+// fetch() clamps to image bounds automatically.
+
+vec4 center = fetch(@A, ix, iy);
+vec4 top    = fetch(@A, ix, iy - 1);
+vec4 bottom = fetch(@A, ix, iy + 1);
+vec4 left   = fetch(@A, ix - 1, iy);
+vec4 right  = fetch(@A, ix + 1, iy);
+
+// Laplacian sharpen: emphasize center, subtract neighbors
+vec4 sharp = center * 5.0 - top - bottom - left - right;
+
+// Clamp to valid color range
+@OUT = clamp(sharp, 0.0, 1.0);

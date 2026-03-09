@@ -13,3 +13,6 @@ build/
 
 # Testing
 .pytest_cache/
+
+# Editor build (node_modules only — source and bundle are tracked)
+editor_build/node_modules/

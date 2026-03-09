@@ -53,6 +53,7 @@ class Interpreter:
         self.device: torch.device = torch.device("cpu")
         self.spatial_shape: tuple[int, int, int] | None = None  # (B, H, W)
         self._array_meta: dict[str, int] = {}  # var_name -> array size
+        self._literal_cache: dict[tuple[float, str], torch.Tensor] = {}  # (value, device) -> tensor
 
     def execute(
         self,
@@ -399,6 +400,8 @@ class Interpreter:
         cond = self._eval(node.condition)
 
         # Snapshot the environment before branches
+        # PERF: clones ALL tensors; selective cloning (only vars assigned in branches)
+        # would reduce allocations but requires a liveness analysis pass — deferred to v0.3.
         env_snapshot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in self.env.items()}
         bindings_snapshot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in self.bindings.items()}
         meta_snapshot = dict(self._array_meta)
@@ -478,34 +481,59 @@ class Interpreter:
         Each iteration runs the loop body as vectorized tensor operations.
         The loop variable is a scalar that gets updated each iteration.
         Hard limit of MAX_LOOP_ITERATIONS to prevent infinite loops.
+
+        Optimization: for simple scalar loops like `for (int i = 0; i < N; i++)`,
+        the loop bounds are extracted as Python ints to avoid GPU→CPU sync via
+        .item() on every iteration.
         """
         # Execute initializer
         self._exec_stmt(node.init)
 
-        iteration = 0
-        while iteration < MAX_LOOP_ITERATIONS:
-            # Evaluate condition
-            cond = self._eval(node.condition)
+        # Try to extract static loop bounds to avoid .item() on every iteration.
+        # Pattern: condition is BinOp(Identifier, "<" or "<=", NumberLiteral)
+        static_bound = self._try_extract_loop_bound(node)
 
-            # Check if loop should continue
-            # For scalar conditions, check the value directly
-            if cond.dim() == 0:
-                if cond.item() <= 0.5:
-                    break
-            else:
-                # For spatial conditions, continue if ANY pixel still needs iteration
-                # This is a simplification — the loop runs for the maximum count
-                if (cond > 0.5).float().sum().item() == 0:
-                    break
+        if static_bound is not None:
+            loop_var, bound, is_le = static_bound
+            iteration = 0
+            while iteration < MAX_LOOP_ITERATIONS:
+                # Check condition using Python int — no GPU sync
+                counter_val = self.env[loop_var]
+                counter_int = int(counter_val.item()) if counter_val.dim() == 0 else None
+                if counter_int is not None:
+                    if is_le:
+                        if counter_int > bound:
+                            break
+                    else:
+                        if counter_int >= bound:
+                            break
+                else:
+                    # Fell through to spatial — use tensor check
+                    cond = self._eval(node.condition)
+                    if (cond > 0.5).float().sum().item() == 0:
+                        break
 
-            # Execute body
-            for stmt in node.body:
-                self._exec_stmt(stmt)
+                for stmt in node.body:
+                    self._exec_stmt(stmt)
+                self._exec_stmt(node.update)
+                iteration += 1
+        else:
+            # General case — evaluate condition each iteration
+            iteration = 0
+            while iteration < MAX_LOOP_ITERATIONS:
+                cond = self._eval(node.condition)
 
-            # Execute update
-            self._exec_stmt(node.update)
+                if cond.dim() == 0:
+                    if cond.item() <= 0.5:
+                        break
+                else:
+                    if (cond > 0.5).float().sum().item() == 0:
+                        break
 
-            iteration += 1
+                for stmt in node.body:
+                    self._exec_stmt(stmt)
+                self._exec_stmt(node.update)
+                iteration += 1
 
         if iteration >= MAX_LOOP_ITERATIONS:
             raise InterpreterError(
@@ -514,11 +542,35 @@ class Interpreter:
                 node.loc,
             )
 
+    def _try_extract_loop_bound(self, node: ForLoop) -> tuple[str, int, bool] | None:
+        """
+        Try to extract static loop bounds for optimization.
+
+        Returns (loop_var_name, bound_value, is_less_equal) or None.
+        Only matches: Identifier < NumberLiteral or Identifier <= NumberLiteral
+        """
+        cond = node.condition
+        if not isinstance(cond, BinOp):
+            return None
+        if cond.op not in ("<", "<="):
+            return None
+        if not isinstance(cond.left, Identifier):
+            return None
+        if not isinstance(cond.right, NumberLiteral):
+            return None
+        return (cond.left.name, int(cond.right.value), cond.op == "<=")
+
     # -- Expression evaluation ------------------------------------------
 
     def _eval(self, node: ASTNode) -> torch.Tensor | str:
         if isinstance(node, NumberLiteral):
-            return torch.tensor(node.value, dtype=torch.float32, device=self.device)
+            key = (node.value, str(self.device))
+            cached = self._literal_cache.get(key)
+            if cached is not None:
+                return cached
+            t = torch.tensor(node.value, dtype=torch.float32, device=self.device)
+            self._literal_cache[key] = t
+            return t
 
         if isinstance(node, StringLiteral):
             return node.value
