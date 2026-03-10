@@ -1,8 +1,8 @@
 // Hue shift effect
-// Input: @A (IMAGE), @B (FLOAT: hue shift amount, 0-1)
-// Output: IMAGE
 
-vec3 hsv = rgb2hsv(@A);
-float h = fract(hsv.r + @B);
+f$shift = 0.0;   // hue rotation amount (0.0 to 1.0)
+
+vec3 hsv = rgb2hsv(@image);
+float h = fract(hsv.r + $shift);
 vec3 shifted = vec3(h, hsv.g, hsv.b);
 @OUT = hsv2rgb(shifted);

@@ -8,7 +8,9 @@ TEX sits between simple math-expression nodes and full Python scripting nodes. I
 
 - **Per-pixel processing** — write code that runs on every pixel, automatically vectorized via PyTorch
 - **Static typing** — `float`, `int`, `vec3`, `vec4`, `mat3`, `mat4`, `string`, arrays with compile-time checking
-- **`@` bindings** — reference node inputs with any name (`@A`, `@base_image`, `@strength`); write output to `@OUT`
+- **`@` bindings** — reference node inputs with any name (`@image`, `@base`, `@overlay`); write to `@name` for outputs
+- **`$` parameters** — `f$strength = 0.5;` creates adjustable FLOAT/INT/STRING widgets on the node
+- **Multiple outputs** — write to `@result`, `@mask`, etc. to create multiple output sockets
 - **Control flow** — `if/else` (vectorized via `torch.where`) and bounded `for` loops
 - **GPU acceleration** — execute on CPU or GPU with automatic device detection
 - **`torch.compile` support** — optional JIT compilation for faster repeated execution
@@ -21,16 +23,26 @@ TEX sits between simple math-expression nodes and full Python scripting nodes. I
 Add a **TEX Wrangle** node (category: TEX). Write code using `@name` to reference inputs — sockets are created automatically:
 
 ```c
-// Grayscale conversion — connect any image to the "A" socket
-float gray = luma(@A);
+// Grayscale conversion — connect any image to the "image" socket
+float gray = luma(@image);
 @OUT = vec3(gray, gray, gray);
 ```
 
-Use descriptive names for clarity:
+Use descriptive names and parameters:
 
 ```c
-// Blend two images — sockets "base" and "overlay" appear on the node
-@OUT = lerp(@base, @overlay, 0.5);
+// Blend two images with an adjustable parameter
+f$blend = 0.5;
+@OUT = lerp(@base, @overlay, $blend);
+```
+
+Create multiple outputs:
+
+```c
+// Both "result" and "mask" appear as output sockets
+f$strength = 1.0;
+@result = @image * $strength;
+@mask = luma(@image);
 ```
 
 Click the **?** icon on the node for a quick reference card.
@@ -70,23 +82,68 @@ After installation, restart ComfyUI. The **TEX Wrangle** node appears under the 
 
 ### @ Bindings
 
-Reference node inputs with `@name` — any valid identifier. Write output to `@OUT`. Input slots are created automatically when you reference them in code.
+Reference node inputs with `@name` — any valid identifier. Write to `@name` to create output sockets. Input and output slots are created automatically from code.
 
 ```c
-// Classic single-letter bindings still work
-float r = @A.r;           // red channel of input A
-@OUT = lerp(@A, @B, @C);  // mix two images with parameter C
-
-// Arbitrary descriptive names
-@OUT = lerp(@base_image, @overlay, @strength);
+// Descriptive names — sockets appear on the node
+@OUT = lerp(@base, @overlay, 0.5);
 
 // Any valid identifier: lowercase, uppercase, underscores, digits
 vec4 result = @layer1 + @layer2;
 float g = luma(@high_res_input);
 string tag = @prefix + "_output";
+
+// Multiple outputs — each @name written to becomes an output socket
+@result = @image * 0.5;
+@mask = luma(@image);
 ```
 
-Names can be any combination of letters, digits, and underscores (must start with a letter or underscore). Reserved names: `OUT`, `code`, `output_type`, `device`, `compile_mode`.
+Names can be any combination of letters, digits, and underscores (must start with a letter or underscore). Reserved names: `code`, `device`, `compile_mode`.
+
+### $ Parameters
+
+Declare parameters with `$name` to create adjustable widgets directly on the node. Use a type prefix to control the widget type:
+
+```c
+f$strength = 0.5;    // FLOAT widget with default 0.5
+i$radius = 2;        // INT widget with default 2
+s$label = "hello";   // STRING widget with default "hello"
+$blend = 0.75;       // FLOAT widget (default prefix is f)
+```
+
+Use `$name` in expressions — the widget value is substituted at runtime:
+
+```c
+f$strength = 0.5;
+@OUT = @image * $strength;
+```
+
+Parameter widgets appear directly on the node. Adjust them to change values at runtime without editing code.
+
+| Prefix | Widget Type | Default | Example |
+|--------|------------|---------|---------|
+| `f` | FLOAT (0.01 step) | 0.0 | `f$strength = 0.5;` |
+| `i` | INT (step 1) | 0 | `i$radius = 2;` |
+| `s` | STRING | "" | `s$label = "hello";` |
+| *(none)* | FLOAT | 0.0 | `$blend = 0.5;` |
+
+### Multiple Outputs
+
+Write to any `@name` to create an output socket. Each assigned name becomes a separate output:
+
+```c
+// Two outputs: "darkened" and "vignette_mask"
+f$strength = 1.0;
+float cx = u - 0.5;
+float cy = v - 0.5;
+float dist = sqrt(cx * cx + cy * cy);
+float falloff = 1.0 - smoothstep(0.3, 0.7, dist * $strength);
+
+@darkened = @image * vec3(falloff);
+@vignette_mask = falloff;
+```
+
+Output types are auto-inferred: `vec3`/`vec4` → IMAGE, `float` → MASK, `string` → STRING. Maximum 8 outputs per node.
 
 ### Channel Access
 
@@ -199,7 +256,7 @@ float cloud = fbm(u * 6.0, v * 6.0, 6);  // 6 octaves of detail
 
 ### Latent Support
 
-TEX can process latent tensors directly. Connect latent data to any input slot — with `output_type=auto` (default), LATENT output is detected automatically when any input is a latent tensor.
+TEX can process latent tensors directly. Connect latent data to any input slot — LATENT output is detected automatically when any input is a latent tensor.
 
 Latents are automatically converted from channel-first `[B,C,H,W]` to channel-last for processing, then converted back on output. Values are **not clamped** — latent space typically ranges from -4 to 4. All LATENT metadata (noise_mask, batch_index) is preserved through execution.
 
@@ -266,7 +323,7 @@ string label = "frame_" + str(42);  // "frame_42"
 | `to_float(s)` | string | float | Parse float from string |
 | `sanitize_filename(s)` | string | string | Remove illegal filename chars |
 
-With `output_type=auto` (default), string output is detected automatically when `@OUT` is assigned a string:
+String output is detected automatically when an output binding is assigned a string:
 
 ```c
 // Build a dynamic filename
@@ -474,10 +531,11 @@ vec3 xyz = srgb_to_xyz * @A.rgb;
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `code` | STRING | grayscale example | TEX source code |
-| `output_type` | COMBO | auto | Output format. `auto` infers from code (vec3/vec4→IMAGE, float→MASK, string→STRING, latent inputs→LATENT). Manual: IMAGE, MASK, LATENT, FLOAT, INT, STRING |
 | `device` | COMBO | auto | Execution device. `auto` follows input tensors, `cpu`/`cuda` forces a device |
 | `compile_mode` | COMBO | none | `none`: standard interpreter. `torch_compile`: JIT-compile for speed |
-| *(dynamic)* | ANY | — | Input slots auto-created from `@name` references in code (e.g. `@A`, `@base_image`) |
+| *(dynamic inputs)* | ANY | — | Input slots auto-created from `@name` references in code (e.g. `@image`, `@base`) |
+| *(parameter widgets)* | FLOAT/INT/STRING | from code | Adjustable widgets created from `$name` declarations (e.g. `f$strength = 0.5;`) |
+| *(dynamic outputs)* | ANY | — | Output slots auto-created from `@name = expr` assignments. Types auto-inferred from code. |
 
 ## Examples
 
@@ -508,7 +566,7 @@ See the `examples/` directory for complete snippets:
 - `simplex_terrain.tex` — terrain-style coloring with simplex noise
 - `motion_detect.tex` — cross-frame motion detection
 - `sharpen.tex` — unsharp mask sharpening via neighbor sampling
-- `chromatic_aberration.tex` — per-channel UV offset for RGB split
+- `chromatic_aberration.tex` — radial RGB fringing simulating lens chromatic aberration
 - `radial_gradient.tex` — distance-from-center gradient with smoothstep
 - `mask_from_color.tex` — extract mask by color distance (green screen keying)
 - `pixelate.tex` — mosaic/pixelation effect via floor UV
@@ -533,7 +591,7 @@ TEX_Wrangle/
   js/
     tex_extension.js       # Frontend: auto-socket, CodeMirror 6 editor, help popup
   tests/
-    test_tex.py            # 331-test suite
+    test_tex.py            # 355-test suite
   examples/                # Example TEX snippets (29 files)
   .tex_cache/              # Disk cache directory (auto-created, gitignored)
 ```
@@ -561,7 +619,7 @@ With `torch_compile` enabled, first execution has a one-time tracing overhead (~
 Code without image inputs (e.g. procedural noise with no `@A` connected) produces a 1x1 image because the output resolution is derived from connected inputs. Connect an image to set the output resolution.
 
 **FLOAT vs MASK output:**
-With `output_type=auto`, TEX infers the output type from the code. If `@OUT` is assigned a spatial float value (per-pixel), the output is `MASK`. If `output_type` is explicitly set to `FLOAT`, the result is reduced to a single scalar via `mean().item()`.
+TEX auto-infers the output type from the code. If an output is assigned a spatial float value (per-pixel), the output is `MASK`. Scalar float results are output as `FLOAT`.
 
 **Image lists:**
 Some ComfyUI nodes output lists of images (e.g. Load Image Batch). TEX handles these gracefully by using the first image in the list. To process images independently, use separate TEX nodes.
@@ -581,15 +639,15 @@ For full `inductor` backend support, install Visual Studio Build Tools with the 
 | `Vector constructor arguments must be scalar` | Passing vec3/vec4 to vec4() constructor | Use channel access or restructure expression |
 | `Unknown function 'foo'` | Calling a function not in stdlib | Check spelling in the ? help popup |
 | `Array size exceeds maximum (1024)` | Array declaration too large | Reduce array size or restructure algorithm |
-| `Missing @OUT assignment` | No output written | Add `@OUT = ...;` to your code |
+| `TEX program must assign to at least one output` | No output written | Add `@OUT = ...;` or `@name = ...;` to your code |
 
 **Compatibility:**
 TEX uses the ComfyUI V1 API (classic node pattern). Tested with ComfyUI desktop and portable versions. Requires Python 3.10+ and PyTorch (both included with ComfyUI).
 
 ## Roadmap
 
-**v0.3:** Multiple outputs (`#output TYPE name;`), promoted parameters (`#param type name = default;`), if/else selective cloning optimization
-**v1.0:** Triton kernel ops, histogram operations, scatter writes
+**v0.3 (current):** Multiple outputs (`@name = expr`), parameter widgets (`f$strength = 0.5;`), auto-inferred output types
+**v1.0:** Triton kernel ops, histogram operations, scatter writes, if/else selective cloning optimization
 **v2.0:** Direct Triton codegen
 
 ## Developer Guide
@@ -615,7 +673,7 @@ Source Code
 
 **TypeChecker** (`tex_compiler/type_checker.py`): Walks the AST and assigns a `TEXType` to every expression node. Enforces type compatibility rules, validates function signatures, and manages variable scopes. Produces a `type_map` dict mapping AST node `id()` → `TEXType`.
 
-**Interpreter** (`tex_runtime/interpreter.py`): Tree-walking evaluator that executes the AST using PyTorch tensor operations. Reads types from `type_map` to guide evaluation (e.g. choosing `torch.where` for if/else). Produces the `@OUT` tensor or string result.
+**Interpreter** (`tex_runtime/interpreter.py`): Tree-walking evaluator that executes the AST using PyTorch tensor operations. Reads types from `type_map` to guide evaluation (e.g. choosing `torch.where` for if/else). Produces output tensors/strings for all assigned `@name` bindings.
 
 **tex_node.py**: ComfyUI integration layer. Receives ComfyUI inputs (IMAGE, MASK, LATENT, FLOAT, INT, STRING), maps them to TEX types, runs the compiler pipeline, and formats the result back into ComfyUI output.
 
@@ -834,7 +892,7 @@ VOID → INT → FLOAT → VEC3 → VEC4
 - `VEC3` + `VEC4` → `VEC4` (alpha = 1.0)
 - `STRING` does NOT coerce to/from numeric types
 
-**Auto-inference** for `@OUT`: When `@OUT` is not declared in `binding_types`, the type checker tracks all assignments to `@OUT` and infers the output type from the last assignment. This is stored in `checker.inferred_out_type`.
+**Auto-inference** for outputs: The type checker tracks all assignments to `@name` bindings and infers output types. Results are stored in `checker.assigned_bindings` (dict mapping name → TEXType). Multiple outputs are supported — each `@name = expr` creates an output socket with auto-inferred type.
 
 **Array type tracking**: `TEXArrayType` stores element type and size. The `_array_meta` dict in the interpreter tracks array sizes at runtime for bounds clamping. Array element types are: `FLOAT`, `INT`, `VEC3`, `VEC4`, `STRING`.
 
@@ -873,11 +931,11 @@ compile_and_run(code, bindings)
 
 ### Frontend Extension
 
-The JavaScript frontend (`js/tex_extension.js`) provides three features:
+The JavaScript frontend (`js/tex_extension.js`) provides these features:
 
-**Auto-socket creation**: A regex parser (`/@([A-Za-z_][A-Za-z0-9_]*)/g`) scans TEX code for `@name` references (excluding `@OUT` and system parameter names). For each unique name, a LiteGraph input slot of type `"*"` (any) is created. Sockets are updated on a 400ms debounce to avoid excessive DOM changes while typing.
+**Auto-socket creation**: A regex parser scans TEX code for `@name` references and `$name` parameter declarations. For each `@name`, a LiteGraph input/output slot is created dynamically. For each `$name`, a typed widget (FLOAT/INT/STRING) is created on the node. Sockets are updated on a 400ms debounce to avoid excessive DOM changes while typing.
 
-**CodeMirror 6 editor**: TEX uses a bundled CodeMirror 6 editor (`js/tex_cm6_bundle.js`) providing syntax highlighting, autocompletion, error squiggle underlines, and bracket matching. The editor replaces ComfyUI's default textarea when the TEX node is created. A custom TEX language mode handles function highlighting (blue), `@` binding highlighting (orange), and keyword highlighting (purple). Autocompletion provides all stdlib functions, built-in variables, and `@` bindings with type annotations.
+**CodeMirror 6 editor**: TEX uses a bundled CodeMirror 6 editor (`js/tex_cm6_bundle.js`) providing syntax highlighting, autocompletion, error squiggle underlines, and bracket matching. The editor replaces ComfyUI's default textarea when the TEX node is created. A custom TEX language mode handles function highlighting (blue), `@`/`$` binding highlighting (orange), and keyword highlighting (purple). Autocompletion provides all stdlib functions, built-in variables, and `@`/`$` bindings with type annotations. The editor uses the Monaspace Neon font with ligatures.
 
 **Error display**: Listens for ComfyUI's WebSocket `execution_error` events. Errors for TEX nodes are cached by node ID and rendered above the node title bar in `onDrawForeground`. Errors clear on the next successful execution.
 
@@ -898,7 +956,7 @@ cd custom_nodes/TEX_Wrangle
 python tests/test_tex.py
 ```
 
-Expected: 331/331 passed.
+Expected: 355/355 passed.
 
 ## License
 

@@ -1,15 +1,16 @@
 /**
- * TEX Wrangle — ComfyUI frontend extension (v2.1 — CodeMirror 6)
+ * TEX Wrangle — ComfyUI frontend extension (v3.0 — Multi-output & Parameters)
  *
  * Features:
- *   1. True auto-socket creation: dynamically adds/removes LiteGraph input
- *      slots based on @ bindings found in the TEX code.
- *   2. CodeMirror 6 editor with syntax highlighting, autocomplete, and
+ *   1. Dynamic input sockets: auto-created from @name reads in TEX code.
+ *   2. Dynamic output sockets: auto-created from @name = assignments.
+ *   3. Parameter widgets ($): f$strength = 0.5 creates a FLOAT widget.
+ *   4. CodeMirror 6 editor with syntax highlighting, autocomplete, and
  *      bracket matching (replaces the old overlay-based textarea).
- *   3. Inline error diagnostics: red squiggly underlines at the exact
+ *   5. Inline error diagnostics: red squiggly underlines at the exact
  *      line/column where errors occur, plus gutter markers.
- *   4. Error overlay above the node title bar (kept as visual backup).
- *   5. "?" help popup and "TEX" badge in the title bar.
+ *   6. Error overlay above the node title bar (kept as visual backup).
+ *   7. "?" help popup and "TEX" badge in the title bar.
  *
  * Implementation notes:
  *   - The CM6 bundle is pre-built by Rollup into tex_cm6_bundle.js and
@@ -18,6 +19,10 @@
  *     is mounted in a container div added via node.addDOMWidget().
  *   - Code changes in the editor are synced back to codeWidget.value so
  *     ComfyUI's serialization/deserialization works unchanged.
+ *   - Output slots are sorted alphabetically to match the backend's index
+ *     ordering (backend fills slots 0..N-1, pads rest with None).
+ *   - The deprecated output_type widget is hidden but still accepted by
+ *     the backend for old workflow compatibility.
  */
 
 import { app } from "../../scripts/app.js";
@@ -32,9 +37,8 @@ const TEX_FONT_URL = (() => {
         return "/extensions/TEX_Wrangle/MonaspaceNeon.woff2";
     }
 })();
-const BINDING_REGEX = /@([A-Za-z_][A-Za-z0-9_]*)/g;
-// Names reserved by the system — NOT treated as TEX bindings
-const RESERVED_NAMES = new Set(["OUT", "code", "output_type", "device", "compile_mode"]);
+// Names reserved by the system — NOT treated as TEX wire or output bindings
+const RESERVED_NAMES = new Set(["code", "device", "compile_mode"]);
 const DEBOUNCE_MS = 400;
 
 // ─── CM6 API (lazy resolution from pre-built bundle) ─────────────────
@@ -55,22 +59,87 @@ function getCM6() {
 
 const texEditors = new WeakMap();  // node → EditorView
 
-// ─── Binding Parser ──────────────────────────────────────────────────
+// ─── Code Parser (inputs, outputs, params) ──────────────────────────
 
-function parseBindings(code) {
+function parseCode(code) {
     const stripped = code
         .replace(/\/\/[^\n]*/g, "")
-        .replace(/\/\*[\s\S]*?\*\//g, "");
-    const bindings = new Set();
-    let match;
-    BINDING_REGEX.lastIndex = 0;
-    while ((match = BINDING_REGEX.exec(stripped)) !== null) {
-        const name = match[1];
-        if (!RESERVED_NAMES.has(name)) {
-            bindings.add(name);
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/"(?:[^"\\]|\\.)*"/g, '""');
+
+    // 1) Count ALL @name occurrences (including typed prefixes like f@name)
+    const refCounts = new Map();
+    const AT_RE = /(?:[a-z]\d{0,2})?@([A-Za-z_]\w*)/g;
+    let m;
+    while ((m = AT_RE.exec(stripped)) !== null) {
+        if (!RESERVED_NAMES.has(m[1])) {
+            refCounts.set(m[1], (refCounts.get(m[1]) || 0) + 1);
         }
     }
-    return bindings;
+
+    // 2) Count simple assignment targets (@name = ..., not ==)
+    const simpleAssignCounts = new Map();
+    const SIMPLE_RE = /(?:[a-z]\d{0,2})?@([A-Za-z_]\w*)(?:\.[a-zA-Z]+)?\s*=(?!=)/g;
+    while ((m = SIMPLE_RE.exec(stripped)) !== null) {
+        if (!RESERVED_NAMES.has(m[1])) {
+            simpleAssignCounts.set(m[1], (simpleAssignCounts.get(m[1]) || 0) + 1);
+        }
+    }
+
+    // 3) Find compound assignment targets (+=, -=, *=, /=) — always both read+write
+    const compoundTargets = new Set();
+    const COMPOUND_RE = /(?:[a-z]\d{0,2})?@([A-Za-z_]\w*)(?:\.[a-zA-Z]+)?\s*[+\-*/]=/g;
+    while ((m = COMPOUND_RE.exec(stripped)) !== null) {
+        if (!RESERVED_NAMES.has(m[1])) {
+            compoundTargets.add(m[1]);
+        }
+    }
+
+    // 4) Detect parameter bindings ($name with optional type prefix)
+    const params = new Map(); // name → { typeHint, defaultValue }
+    // Explicit declarations: f$strength = 0.5; or i$count; (supports all type prefixes)
+    // Lookbehind requires statement boundary (^, ;, {, }) to avoid matching
+    // $name inside expressions like for-loop headers: for (int dy = -$radius; ...)
+    const PARAM_DECL_RE = /(?<=(?:^|[;{}])\s*)(?:(img|v4|[fismvl]))?\$([A-Za-z_]\w*)\s*(?:=\s*([^;]+))?\s*;/gm;
+    while ((m = PARAM_DECL_RE.exec(stripped)) !== null) {
+        params.set(m[2], {
+            typeHint: m[1] || "f",
+            defaultValue: m[3]?.trim() || null,
+        });
+    }
+    // Also find $name references not yet captured
+    const PARAM_REF_RE = /(?:[a-z]\d{0,2})?\$([A-Za-z_]\w*)/g;
+    while ((m = PARAM_REF_RE.exec(stripped)) !== null) {
+        if (!params.has(m[1]) && !RESERVED_NAMES.has(m[1])) {
+            params.set(m[1], { typeHint: "f", defaultValue: null });
+        }
+    }
+
+    // 5) Build input and output sets
+    const outputs = new Set();
+    const inputs = new Set();
+
+    for (const [name, total] of refCounts) {
+        if (params.has(name)) continue;
+
+        const simpleAssigns = simpleAssignCounts.get(name) || 0;
+        const isCompound = compoundTargets.has(name);
+        const isAssigned = simpleAssigns > 0 || isCompound;
+
+        if (isAssigned) outputs.add(name);
+
+        // It's an input if compound (read-modify-write) or has reads beyond assignments
+        if (isCompound || total > simpleAssigns) {
+            inputs.add(name);
+        }
+    }
+
+    // Remove param names from outputs (defensive)
+    for (const name of params.keys()) {
+        outputs.delete(name);
+    }
+
+    return { inputs, outputs, params };
 }
 
 // ─── Debounce ────────────────────────────────────────────────────────
@@ -85,11 +154,11 @@ function debounce(fn, ms) {
 
 // ─── Auto-Socket Management ─────────────────────────────────────────
 
-function syncInputs(node, usedBindings) {
+function syncInputs(node, usedBindings, paramNames) {
     if (!node.graph) return;
     const ANY_TYPE = "*";
 
-    // Build map of current TEX binding inputs (all inputs are bindings)
+    // Build map of current TEX binding inputs
     const currentInputs = new Map();
     if (node.inputs) {
         for (let i = 0; i < node.inputs.length; i++) {
@@ -101,9 +170,13 @@ function syncInputs(node, usedBindings) {
     const desired = [...usedBindings].sort();
 
     // Remove unneeded inputs (reverse order for index stability)
+    // Keep inputs whose names match param widgets — ComfyUI may create
+    // implicit inputs for widgets, and we must not remove them.
     const toRemove = [];
     for (const [name, idx] of currentInputs) {
-        if (!usedBindings.has(name)) toRemove.push(idx);
+        if (!usedBindings.has(name) && !paramNames.has(name)) {
+            toRemove.push(idx);
+        }
     }
     toRemove.sort((a, b) => b - a);
     for (const idx of toRemove) node.removeInput(idx);
@@ -114,6 +187,157 @@ function syncInputs(node, usedBindings) {
     // Add missing inputs
     for (const name of desired) {
         if (!afterRemove.has(name)) node.addInput(name, ANY_TYPE);
+    }
+
+    node.setDirtyCanvas(true, true);
+}
+
+// ─── Dynamic Output Sockets ─────────────────────────────────────────
+
+function syncOutputs(node, outputNames) {
+    if (!node.graph) return;
+    const ANY_TYPE = "*";
+
+    // Desired: sorted alphabetically (must match backend index order)
+    const desired = [...outputNames].sort();
+
+    // Quick check: already matching?
+    const currentNames = node.outputs ? node.outputs.map(o => o.name) : [];
+    if (currentNames.length === desired.length &&
+        currentNames.every((n, i) => n === desired[i])) {
+        return;
+    }
+
+    // Save existing connections by output name: name → [{targetNodeId, targetSlot}]
+    const savedConnections = new Map();
+    if (node.outputs) {
+        for (const out of node.outputs) {
+            if (out.links && out.links.length > 0) {
+                const conns = [];
+                for (const linkId of out.links) {
+                    const link = node.graph.links?.[linkId];
+                    if (link) {
+                        conns.push({
+                            targetNodeId: link.target_id,
+                            targetSlot: link.target_slot,
+                        });
+                    }
+                }
+                if (conns.length > 0) {
+                    savedConnections.set(out.name, conns);
+                }
+            }
+        }
+    }
+
+    // Remove all existing outputs (reverse order)
+    if (node.outputs) {
+        for (let i = node.outputs.length - 1; i >= 0; i--) {
+            node.removeOutput(i);
+        }
+    }
+
+    // Re-add in sorted order (indices must match backend's sorted output slots)
+    for (const name of desired) {
+        node.addOutput(name, ANY_TYPE);
+    }
+
+    // Restore connections for outputs that still exist (at their new indices)
+    for (const [name, conns] of savedConnections) {
+        const newIdx = desired.indexOf(name);
+        if (newIdx < 0) continue; // output was removed
+
+        for (const conn of conns) {
+            try {
+                const targetNode = node.graph.getNodeById(conn.targetNodeId);
+                if (targetNode) {
+                    node.connect(newIdx, targetNode, conn.targetSlot);
+                }
+            } catch (_) {
+                // Connection failed — target may have been removed
+            }
+        }
+    }
+
+    node.setDirtyCanvas(true, true);
+}
+
+// ─── Parameter Widgets ($) ──────────────────────────────────────────
+
+function syncParams(node, params) {
+    // params: Map of name → { typeHint, defaultValue }
+    // Creates/removes parameter widgets.  Widget values are injected
+    // into the prompt via the graphToPrompt hook (see setup()).
+    // The backend uses code-defined defaults as a safety fallback.
+    if (!node.widgets) node.widgets = [];
+
+    // Build map of current param widgets: name → { widget, index, typeHint }
+    const currentParams = new Map();
+    for (let i = 0; i < node.widgets.length; i++) {
+        const w = node.widgets[i];
+        if (w._texParam) {
+            currentParams.set(w.name, { widget: w, index: i, typeHint: w._texTypeHint || "f" });
+        }
+    }
+
+    // Desired param names
+    const desiredNames = new Set(params.keys());
+
+    // Identify widgets to remove: stale names OR type changed
+    const toRemove = new Set();
+    for (const [name, cur] of currentParams) {
+        if (!desiredNames.has(name)) {
+            toRemove.add(name);
+        } else {
+            // Check if type hint changed (e.g. f$x → i$x)
+            const desired = params.get(name);
+            if (desired && (desired.typeHint || "f") !== cur.typeHint) {
+                toRemove.add(name);
+            }
+        }
+    }
+
+    // Remove stale/changed widgets (reverse order for index stability)
+    for (let i = node.widgets.length - 1; i >= 0; i--) {
+        if (node.widgets[i]._texParam && toRemove.has(node.widgets[i].name)) {
+            node.widgets.splice(i, 1);
+        }
+    }
+
+    // Rebuild current set after removals
+    const remaining = new Set();
+    for (const w of node.widgets) {
+        if (w._texParam) remaining.add(w.name);
+    }
+
+    // Add new / recreated param widgets
+    for (const [name, info] of params) {
+        if (remaining.has(name)) continue;
+
+        const typeHint = info.typeHint || "f";
+        const typeName = typeHint === "i" ? "INT" : typeHint === "s" ? "STRING" : "FLOAT";
+        let widget;
+        if (typeHint === "i") {
+            const def = info.defaultValue != null ? parseInt(info.defaultValue) : 0;
+            widget = node.addWidget("number", name, def, () => {}, {
+                min: -9999, max: 9999, step: 1, precision: 0,
+            });
+        } else if (typeHint === "s") {
+            const raw = info.defaultValue || "";
+            const def = raw.replace(/^["']|["']$/g, "");
+            widget = node.addWidget("text", name, def, () => {});
+        } else {
+            // float (default)
+            const def = info.defaultValue != null ? parseFloat(info.defaultValue) : 0.0;
+            widget = node.addWidget("number", name, def, () => {}, {
+                min: -9999, max: 9999, step: 0.01, precision: 3,
+            });
+        }
+        if (widget) {
+            widget._texParam = true;
+            widget._texTypeHint = typeHint;
+            widget.tooltip = `TEX parameter $${name} (${typeName})`;
+        }
     }
 
     node.setDirtyCanvas(true, true);
@@ -189,15 +413,19 @@ function createTexEditor(node, codeWidget) {
     const container = document.createElement("div");
     container.className = "tex-cm-container";
 
-    // Auto-socket updater
+    // Auto-socket updater (inputs, outputs, and parameter widgets)
     const updateSockets = debounce(() => {
         const code = codeWidget.value || "";
-        const usedBindings = parseBindings(code);
-        node._texBindings = usedBindings;
-        syncInputs(node, usedBindings);
+        const { inputs, outputs, params } = parseCode(code);
+        node._texBindings = inputs;
+        node._texOutputs = outputs;
+        node._texParams = params;
+        syncInputs(node, inputs, new Set(params.keys()));
+        syncOutputs(node, outputs);
+        syncParams(node, params);
     }, DEBOUNCE_MS);
 
-    // Dynamic @ binding completions — reads from node's current input sockets
+    // Dynamic @ binding completions — reads from node's current sockets
     function getBindings() {
         const names = [];
         if (node.inputs) {
@@ -207,10 +435,37 @@ function createTexEditor(node, codeWidget) {
                 }
             }
         }
-        // Also parse code for potential bindings not yet synced
+        if (node.outputs) {
+            for (const out of node.outputs) {
+                if (out.name && !RESERVED_NAMES.has(out.name)) {
+                    if (!names.includes(out.name)) names.push(out.name);
+                }
+            }
+        }
+        // Also parse code for bindings not yet synced
         const code = codeWidget.value || "";
-        const parsed = parseBindings(code);
-        for (const name of parsed) {
+        const { inputs, outputs } = parseCode(code);
+        for (const name of inputs) {
+            if (!names.includes(name)) names.push(name);
+        }
+        for (const name of outputs) {
+            if (!names.includes(name)) names.push(name);
+        }
+        return names;
+    }
+
+    // Dynamic $ parameter completions
+    function getParams() {
+        const names = [];
+        if (node._texParams && node._texParams instanceof Map) {
+            for (const name of node._texParams.keys()) {
+                names.push(name);
+            }
+        }
+        // Also parse code for params not yet synced
+        const code = codeWidget.value || "";
+        const { params } = parseCode(code);
+        for (const name of params.keys()) {
             if (!names.includes(name)) names.push(name);
         }
         return names;
@@ -218,7 +473,7 @@ function createTexEditor(node, codeWidget) {
 
     // Build the editor
     try {
-        const completionSource = CM6.createTexCompletions(getBindings);
+        const completionSource = CM6.createTexCompletions(getBindings, getParams);
 
         const editor = new CM6.EditorView({
             state: CM6.EditorState.create({
@@ -267,7 +522,7 @@ function createTexEditor(node, codeWidget) {
                                     const col = pos - line.from;
                                     if (col > 0) {
                                         const charBefore = line.text.charAt(col - 1);
-                                        if (/[@\w]/.test(charBefore)) {
+                                        if (/[@$\w]/.test(charBefore)) {
                                             // Short delay so the state settles before querying
                                             setTimeout(() => {
                                                 try {
@@ -425,10 +680,15 @@ function showTexContextMenu(x, y, editorView) {
 
 const TEX_HELP_HTML = `
 <h3>TEX Quick Reference</h3>
+<p style="margin:0 0 8px 0; font-size:11px;"><a href="https://github.com/xavinitram/TEX/issues" target="_blank" style="color:#4FC3F7; text-decoration:none;">Report a bug or request a feature</a></p>
 
 <p><b>Types:</b> <code>float</code> <code>int</code> <code>vec3</code> <code>vec4</code> <code>mat3</code> <code>mat4</code> <code>string</code></p>
 
-<p><b>Bindings:</b> <code>@name</code> inputs (e.g. <code>@A</code>, <code>@base_image</code>), <code>@OUT</code> output</p>
+<p><b>Wire Bindings (@):</b> Read <code>@name</code> → input socket. Write <code>@name = expr</code> → output socket.<br>
+Type prefixes: <code>f@</code> float <code>i@</code> int <code>v@</code> vec3 <code>v4@</code> vec4 <code>img@</code> IMAGE <code>m@</code> MASK <code>l@</code> LATENT <code>s@</code> string</p>
+
+<p><b>Parameters ($):</b> <code>f$strength = 0.5;</code> → FLOAT widget. <code>i$count = 10;</code> → INT widget. <code>s$label = "hi";</code> → STRING widget.<br>
+Use <code>$name</code> in expressions. Widgets appear on the node as adjustable controls.</p>
 
 <p><b>Built-in Vars:</b>
 <code>ix</code> <code>iy</code> pixel coords &nbsp;
@@ -483,7 +743,7 @@ Compound: <code>+= -= *= /= ++ --</code></p>
 <code>fbm(x, y, octaves)</code> — FBM (multi-octave Perlin)</p>
 
 <p><b>Latent Support:</b><br>
-Connect latent data to @A. Output auto-detects as LATENT when inputs are latent.<br>
+Connect latent data to any input. Output auto-detects as LATENT when inputs are latent.<br>
 Values are NOT clamped — latent range is typically [-4, 4].<br>
 <code>ic</code> = channel count (4 for SD1.5/SDXL, 16 for SD3).</p>
 
@@ -526,12 +786,16 @@ Auto-levels: <code>@OUT = (@A - img_min(@A)) / max(img_max(@A) - img_min(@A), 0.
 Fade: <code>@OUT = @A * (fi / max(fn-1, 1))</code><br>
 Blend: <code>@OUT = lerp(fetch_frame(@A, fi-1, ix, iy), fetch_frame(@A, fi+1, ix, iy), 0.5)</code></p>
 
-<p style="margin-top:10px; padding-top:8px; border-top:1px solid #333;"><b>Example:</b></p>
-<pre style="background:#2a2a3e; padding:8px; border-radius:4px; margin:4px 0; font-size:11px; line-height:1.4;">float gray = luma(@A);
-@OUT = vec3(gray, gray, gray);</pre>
+<p style="margin-top:10px; padding-top:8px; border-top:1px solid #333;"><b>Examples:</b></p>
+<pre style="background:#2a2a2a; padding:8px; border-radius:4px; margin:4px 0; font-size:11px; line-height:1.4;">// Single output
+float gray = luma(@image);
+@OUT = vec3(gray, gray, gray);
 
-<p style="margin-top:10px; padding-top:8px; border-top:1px solid #333; text-align:center; font-size:11px;">
-<a href="https://github.com/xavinitram/TEX/issues" target="_blank" style="color:#4FC3F7; text-decoration:none;">Report a bug or request a feature</a></p>
+// Multi-output with parameter
+f$strength = 0.75;
+@result = lerp(@base, @overlay, $strength);
+@mask = luma(@base);</pre>
+
 `;
 
 // ─── Help Popup Show/Hide ────────────────────────────────────────────
@@ -600,6 +864,32 @@ function hideHelpPopup() {
 app.registerExtension({
     name: "TEX.Wrangle",
 
+    // ── Prompt hook: inject $param widget values into the execution prompt ──
+    // ComfyUI only serializes widget values for inputs defined in INPUT_TYPES.
+    // Since TEX params are dynamic (parsed from code), they aren't in INPUT_TYPES.
+    // This hook adds their widget values to the prompt so they reach execute().
+    setup() {
+        const origGraphToPrompt = app.graphToPrompt;
+        app.graphToPrompt = async function (...args) {
+            const result = await origGraphToPrompt.apply(this, args);
+            if (result?.output) {
+                for (const [nodeId, nodeData] of Object.entries(result.output)) {
+                    if (nodeData.class_type === TEX_NODE_TYPE) {
+                        const node = app.graph.getNodeById(parseInt(nodeId));
+                        if (node?.widgets) {
+                            for (const w of node.widgets) {
+                                if (w._texParam && !(w.name in nodeData.inputs)) {
+                                    nodeData.inputs[w.name] = w.value;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return result;
+        };
+    },
+
     async beforeRegisterNodeDef(nodeType, nodeData, appRef) {
         if (nodeData.name !== TEX_NODE_TYPE) return;
 
@@ -612,20 +902,29 @@ app.registerExtension({
             const codeWidget = node.widgets?.find(w => w.name === "code");
             if (!codeWidget) return;
 
-            // Remove any initial inputs from the backend schema.
+            // Remove any initial inputs/outputs from the backend schema.
             // We manage sockets dynamically based on code content.
             if (node.inputs) {
                 for (let i = node.inputs.length - 1; i >= 0; i--) {
                     node.removeInput(i);
                 }
             }
+            if (node.outputs) {
+                for (let i = node.outputs.length - 1; i >= 0; i--) {
+                    node.removeOutput(i);
+                }
+            }
 
             // Auto-socket updater (shared by both CM6 and fallback paths)
             const updateSockets = debounce(() => {
                 const code = codeWidget.value || "";
-                const usedBindings = parseBindings(code);
-                node._texBindings = usedBindings;
-                syncInputs(node, usedBindings);
+                const { inputs, outputs, params } = parseCode(code);
+                node._texBindings = inputs;
+                node._texOutputs = outputs;
+                node._texParams = params;
+                syncInputs(node, inputs, new Set(params.keys()));
+                syncOutputs(node, outputs);
+                syncParams(node, params);
             }, DEBOUNCE_MS);
 
             // ── Try CM6 Editor Integration ──
@@ -714,9 +1013,14 @@ app.registerExtension({
                 const codeWidget = node.widgets?.find(w => w.name === "code");
                 if (codeWidget) {
                     const code = codeWidget.value || "";
-                    const usedBindings = parseBindings(code);
-                    node._texBindings = usedBindings;
-                    syncInputs(node, usedBindings);
+                    const { inputs, outputs, params } = parseCode(code);
+                    node._texBindings = inputs;
+                    node._texOutputs = outputs;
+                    node._texParams = params;
+
+                    syncInputs(node, inputs, new Set(params.keys()));
+                    syncOutputs(node, outputs);
+                    syncParams(node, params);
 
                     // Sync CM6 editor content if it exists
                     const editor = texEditors.get(node);
@@ -903,7 +1207,7 @@ app.registerExtension({
         .tex-context-menu {
             position: fixed;
             z-index: 10001;
-            background: #1e1e2e;
+            background: #1e1e1e;
             border: 1px solid #444;
             border-radius: 6px;
             padding: 4px 0;
@@ -933,9 +1237,13 @@ app.registerExtension({
         .tex-help-popup {
             position: fixed;
             z-index: 10000;
-            background: #1e1e2e;
+            background: #1e1e1e;
             color: #cdd6f4;
-            font: 12px/1.5 monospace;
+            font: 12px/1.5 'Monaspace Neon', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+            font-feature-settings: "calt" 1, "liga" 1, "ss01" 1, "ss02" 1, "ss03" 1, "ss06" 1, "cv01" 2;
+            font-variation-settings: "wght" 380;
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
             border: 2px solid #4FC3F7;
             border-radius: 8px;
             padding: 16px 18px;
@@ -955,11 +1263,15 @@ app.registerExtension({
             line-height: 1.6;
         }
         .tex-help-popup code {
-            background: #2a2a3e;
+            background: #2a2a2a;
             color: #f78c6c;
             padding: 1px 4px;
             border-radius: 3px;
             font-size: 11px;
+            font-family: inherit;
+        }
+        .tex-help-popup pre {
+            font-family: inherit;
         }
         .tex-help-popup b {
             color: #c792ea;
@@ -980,7 +1292,7 @@ app.registerExtension({
             color: #fff;
         }
         .tex-help-popup::-webkit-scrollbar { width: 6px; }
-        .tex-help-popup::-webkit-scrollbar-track { background: #1e1e2e; }
+        .tex-help-popup::-webkit-scrollbar-track { background: #1e1e1e; }
         .tex-help-popup::-webkit-scrollbar-thumb {
             background: #4FC3F7;
             border-radius: 3px;

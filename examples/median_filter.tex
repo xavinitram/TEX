@@ -1,6 +1,4 @@
-// 3x3 median filter using arrays
-// Input: @A (IMAGE)
-// Output: IMAGE
+// 3x3 median filter using per-channel arrays
 //
 // Collects the 9 neighbor pixels per channel into arrays,
 // sorts them, and picks the middle value (index 4).
@@ -14,7 +12,7 @@ int idx = 0;
 
 for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
-        vec4 s = fetch(@A, ix + dx, iy + dy);
+        vec4 s = fetch(@image, ix + dx, iy + dy);
         r[idx] = s.r;
         g[idx] = s.g;
         b[idx] = s.b;

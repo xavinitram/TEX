@@ -1,5 +1,4 @@
-// Normalize tag casing
-// Connect STRING to @A
-// Set output_type to STRING
+// Normalize tag casing — strips whitespace and lowercases
+// Connect any STRING to @text
 
-@OUT = lower(strip(@A));
+@OUT = lower(strip(@text));

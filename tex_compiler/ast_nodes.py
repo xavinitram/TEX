@@ -84,6 +84,19 @@ class ExprStatement(ASTNode):
     expr: ASTNode = None
 
 
+@dataclass
+class ParamDecl(ASTNode):
+    """Parameter declaration: `f$strength = 0.5;` or `i$count;`
+
+    Declares a UI widget parameter with an optional default value.
+    At runtime, the actual value comes from the ComfyUI widget.
+    The default_expr (if present) must be a literal.
+    """
+    name: str = ""
+    type_hint: str = ""                    # "f", "i", "s", "" (auto → float)
+    default_expr: Optional[ASTNode] = None # Literal for default value
+
+
 # ---------------------------------------------------------------------------
 # Expressions
 # ---------------------------------------------------------------------------
@@ -125,8 +138,10 @@ class Identifier(ASTNode):
 
 @dataclass
 class BindingRef(ASTNode):
-    """@ binding reference: `@A`, `@OUT`, `@p1`"""
-    name: str = ""               # The part after @
+    """@ or $ binding reference: `@A`, `@OUT`, `$strength`, `f@threshold`"""
+    name: str = ""               # The part after @ or $
+    kind: str = "wire"           # "wire" (@) or "param" ($)
+    type_hint: str = ""          # Explicit type prefix: "f", "i", "v", "v4", "img", "m", "l", "s"
 
 
 @dataclass

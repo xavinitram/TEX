@@ -3,7 +3,8 @@ TEX Lexer — tokenizes TEX source code into a stream of tokens.
 
 Supports:
   - C-style identifiers, numbers (int and float), operators
-  - @ bindings (@A, @OUT, @p1)
+  - @ bindings (@A, @OUT, @p1) and typed bindings (f@threshold, img@result)
+  - $ parameter bindings ($strength, f$blend)
   - Keywords: float, int, vec3, vec4, if, else
   - Single-line (//) and multi-line (/* */) comments
   - Dot-access for channel swizzling
@@ -22,7 +23,10 @@ class TokenType(Enum):
 
     # Identifiers and keywords
     IDENT = auto()
-    AT_BINDING = auto()       # @name
+    AT_BINDING = auto()           # @name
+    DOLLAR_BINDING = auto()       # $name
+    TYPED_AT_BINDING = auto()     # prefix@name (e.g. f@threshold)
+    TYPED_DOLLAR_BINDING = auto() # prefix$name (e.g. f$strength)
 
     # Type keywords
     KW_FLOAT = auto()
@@ -111,14 +115,22 @@ SINGLE_CHAR_TOKENS = {
     ":": TokenType.COLON,
 }
 
+# Type prefixes that can appear immediately before @ or $ to form typed bindings.
+# e.g. f@threshold → TYPED_AT_BINDING with prefix="f"
+# e.g. img@result → TYPED_AT_BINDING with prefix="img"
+BINDING_TYPE_PREFIXES = {"f", "i", "v", "v4", "s", "img", "m", "l"}
+
 
 @dataclass
 class Token:
     type: TokenType
     value: str
     loc: SourceLoc
+    prefix: str = ""             # Type prefix for typed bindings (e.g. "f", "img")
 
     def __repr__(self):
+        if self.prefix:
+            return f"Token({self.type.name}, {self.value!r}, {self.loc}, prefix={self.prefix!r})"
         return f"Token({self.type.name}, {self.value!r}, {self.loc})"
 
 
@@ -226,6 +238,17 @@ class Lexer:
         while self.pos < len(self.source) and (self.source[self.pos].isalnum() or self.source[self.pos] == "_"):
             self.advance()
         text = self.source[start_pos:self.pos]
+
+        # Check for typed binding: prefix immediately followed by @ or $
+        # e.g. f@threshold, img@result, i$count
+        if self.pos < len(self.source) and self.source[self.pos] in ("@", "$"):
+            if text in BINDING_TYPE_PREFIXES:
+                sigil = self.advance()  # consume @ or $
+                name = self._read_binding_name(text, sigil, start_loc)
+                tok_type = (TokenType.TYPED_AT_BINDING if sigil == "@"
+                            else TokenType.TYPED_DOLLAR_BINDING)
+                return Token(tok_type, name, start_loc, prefix=text)
+
         tok_type = KEYWORDS.get(text, TokenType.IDENT)
         return Token(tok_type, text, start_loc)
 
@@ -259,16 +282,34 @@ class Lexer:
             self.advance()
         raise LexerError("Unterminated string literal", start_loc)
 
+    def _read_binding_name(self, prefix_or_sigil: str, sigil: str,
+                            start_loc: SourceLoc) -> str:
+        """Read the identifier part after a binding sigil (@ or $).
+
+        Used by both read_at_binding/read_dollar_binding and typed binding
+        detection in read_identifier.
+        """
+        name_start = self.pos
+        if (self.pos >= len(self.source) or
+                not (self.source[self.pos].isalpha() or self.source[self.pos] == "_")):
+            raise LexerError(
+                f"Expected identifier after '{prefix_or_sigil}{sigil}'", start_loc
+            )
+        while self.pos < len(self.source) and (self.source[self.pos].isalnum() or self.source[self.pos] == "_"):
+            self.advance()
+        return self.source[name_start:self.pos]
+
     def read_at_binding(self) -> Token:
         start_loc = self.loc()
         self.advance()  # skip @
-        start_pos = self.pos
-        if self.pos >= len(self.source) or not (self.source[self.pos].isalpha() or self.source[self.pos] == "_"):
-            raise LexerError("Expected identifier after '@'", start_loc)
-        while self.pos < len(self.source) and (self.source[self.pos].isalnum() or self.source[self.pos] == "_"):
-            self.advance()
-        name = self.source[start_pos:self.pos]
+        name = self._read_binding_name("", "@", start_loc)
         return Token(TokenType.AT_BINDING, name, start_loc)
+
+    def read_dollar_binding(self) -> Token:
+        start_loc = self.loc()
+        self.advance()  # skip $
+        name = self._read_binding_name("", "$", start_loc)
+        return Token(TokenType.DOLLAR_BINDING, name, start_loc)
 
     def tokenize(self) -> list[Token]:
         """Tokenize the entire source, returning a list of tokens ending with EOF."""
@@ -320,6 +361,11 @@ class Lexer:
             # @ bindings
             if ch == "@":
                 self.tokens.append(self.read_at_binding())
+                continue
+
+            # $ parameter bindings
+            if ch == "$":
+                self.tokens.append(self.read_dollar_binding())
                 continue
 
             # Multi-character operators (check longest match first)

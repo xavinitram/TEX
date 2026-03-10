@@ -1,12 +1,11 @@
 // Procedural cloud pattern using FBM noise
-// Input: @A (IMAGE — only used for resolution)
-// Output: IMAGE
 //
 // Uses fbm() with 6 octaves to create organic cloud shapes.
-// Multiply u/v by larger values for more detailed noise.
 
-float freq = 6.0;
-float n = fbm(u * freq, v * freq, 6);
+f$frequency = 6.0;   // detail scale (higher = more features)
+
+vec4 _ref = @ref;
+float n = fbm(u * $frequency, v * $frequency, 6);
 
 // Remap from [-1, 1] to [0, 1]
 float cloud = n * 0.5 + 0.5;

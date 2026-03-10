@@ -2,7 +2,7 @@
 TEX Cache — two-tier compilation cache for TEX programs.
 
 Tier 1 (memory): OrderedDict with LRU eviction. Stores ready-to-execute
-(program, type_map, referenced_bindings) tuples.
+(program, type_map, referenced_bindings, assigned_bindings, param_declarations) tuples.
 
 Tier 2 (disk): Pickle files in .tex_cache/. Stores (program_ast,
 binding_types, version). On load, re-runs type checker to regenerate
@@ -28,7 +28,7 @@ logger = logging.getLogger("TEX")
 # Disk cache format version — tracks AST/type-checker compatibility, NOT the
 # release version. Bump this when AST node structure or type checker changes
 # would make existing .pkl cache files invalid (causes graceful cache miss).
-_CACHE_VERSION = "1.5.0"
+_CACHE_VERSION = "2.0.0"  # v0.3: multi-output, ParamDecl, typed bindings
 
 # Limits
 _MEMORY_MAX_ENTRIES = 128
@@ -48,7 +48,7 @@ class TEXCache:
 
     Usage:
         cache = get_cache()
-        program, type_map, refs, inferred_out = cache.compile_tex(code, binding_types)
+        program, type_map, refs, assigned_bindings, param_info = cache.compile_tex(code, binding_types)
     """
 
     def __init__(self, cache_dir: Path | None = None):
@@ -104,11 +104,13 @@ class TEXCache:
         program: Any,
         type_map: dict,
         referenced_bindings: set[str],
-        inferred_out_type: TEXType | None = None,
+        assigned_bindings: dict[str, TEXType] | None = None,
+        param_declarations: dict[str, dict] | None = None,
     ):
         """Store a compilation result in both memory and disk caches."""
         fp = self.fingerprint(code, binding_types)
-        result = (program, type_map, referenced_bindings, inferred_out_type)
+        result = (program, type_map, referenced_bindings,
+                  assigned_bindings or {}, param_declarations or {})
         self._memory_put(fp, result)
         self._save_to_disk(fp, program, binding_types)
 
@@ -118,8 +120,11 @@ class TEXCache:
         """
         Compile TEX source: lex -> parse -> type-check, with caching.
 
-        Returns (program_ast, type_map, referenced_bindings, inferred_out_type).
-        inferred_out_type is None when OUT was in binding_types (explicit mode).
+        Returns (program_ast, type_map, referenced_bindings,
+                 assigned_bindings, param_declarations).
+
+        assigned_bindings: dict mapping output binding names to their inferred TEXType.
+        param_declarations: dict mapping parameter names to {type, type_hint}.
         Raises LexerError, ParseError, or TypeCheckError on invalid code.
         """
         cached = self.get(code, binding_types)
@@ -133,8 +138,10 @@ class TEXCache:
         type_map = checker.check(program)
 
         self.put(code, binding_types, program, type_map,
-                 checker.referenced_bindings, checker.inferred_out_type)
-        return (program, type_map, checker.referenced_bindings, checker.inferred_out_type)
+                 checker.referenced_bindings, checker.assigned_bindings,
+                 checker.param_declarations)
+        return (program, type_map, checker.referenced_bindings,
+                checker.assigned_bindings, checker.param_declarations)
 
     def clear_memory(self):
         """Clear in-memory cache only (disk entries remain)."""
@@ -205,7 +212,8 @@ class TEXCache:
             # Touch file to update access time for LRU eviction
             os.utime(path, None)
 
-            return (program, type_map, checker.referenced_bindings, checker.inferred_out_type)
+            return (program, type_map, checker.referenced_bindings,
+                    checker.assigned_bindings, checker.param_declarations)
         except Exception as e:
             logger.warning("[TEX] Disk cache load failed for %s…: %s", fp[:12], e)
             try:

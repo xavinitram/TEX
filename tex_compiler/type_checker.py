@@ -28,7 +28,7 @@ from .ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, ExprStatement,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, MatConstructor,
-    CastExpr, SourceLoc, ArrayDecl, ArrayIndexAccess, ArrayLiteral,
+    CastExpr, SourceLoc, ArrayDecl, ArrayIndexAccess, ArrayLiteral, ParamDecl,
 )
 
 
@@ -125,6 +125,19 @@ VALID_SWIZZLES = {
 }
 
 
+# Maps typed-binding prefixes to their TEXType
+BINDING_HINT_TYPES = {
+    "f": TEXType.FLOAT,
+    "i": TEXType.INT,
+    "v": TEXType.VEC3,
+    "v4": TEXType.VEC4,
+    "s": TEXType.STRING,
+    "img": TEXType.VEC3,   # IMAGE → vec3 at the tensor level
+    "m": TEXType.FLOAT,    # MASK → float at the tensor level
+    "l": TEXType.VEC4,     # LATENT → vec4 at the tensor level
+}
+
+
 class TypeCheckError(Exception):
     def __init__(self, message: str, loc: SourceLoc):
         self.loc = loc
@@ -163,9 +176,19 @@ class TypeChecker:
     # Errors collected (non-fatal where possible)
     errors: list[TypeCheckError] = field(default_factory=list)
 
-    # Auto-inference for @OUT type (enabled when "OUT" not in binding_types)
+    # Multi-output: tracks all @bindings assigned to and their inferred types
+    assigned_bindings: dict[str, TEXType] = field(default_factory=dict)
+
+    # Parameter declarations: name → {type: TEXType, type_hint: str}
+    param_declarations: dict[str, dict] = field(default_factory=dict)
+
+    # Legacy compat: whether the old "OUT"-only inference mode was active
     _infer_out: bool = False
-    inferred_out_type: TEXType | None = None
+
+    @property
+    def inferred_out_type(self) -> TEXType | None:
+        """Legacy compat: inferred type for @OUT binding."""
+        return self.assigned_bindings.get("OUT")
 
     def check(self, program: Program) -> dict[int, TEXType]:
         """Run type checking on a program. Returns a map from AST node id to TEXType."""
@@ -174,8 +197,9 @@ class TypeChecker:
         self._types = {}
         self.referenced_bindings = set()
         self.errors = []
+        self.assigned_bindings = {}
+        self.param_declarations = {}
         self._infer_out = "OUT" not in self.binding_types
-        self.inferred_out_type = None
 
         # Pre-populate built-in variables
         builtins = {
@@ -269,6 +293,8 @@ class TypeChecker:
             self._check_for_loop(node)
         elif isinstance(node, ExprStatement):
             self._check_expr(node.expr)
+        elif isinstance(node, ParamDecl):
+            self._check_param_decl(node)
         else:
             self._error(f"Unknown statement type: {type(node).__name__}", node.loc)
 
@@ -359,22 +385,100 @@ class TypeChecker:
         self._array_scopes[-1][node.name] = arr_type
         self._set_type(node, TEXType.ARRAY)
 
+    def _check_param_decl(self, node: ParamDecl):
+        """Type-check a parameter declaration: f$strength = 0.5;"""
+        # Resolve type from hint (default: FLOAT)
+        tex_type = BINDING_HINT_TYPES.get(node.type_hint, TEXType.FLOAT)
+
+        # Check for @wire / $param name conflict
+        if node.name in self.referenced_bindings:
+            self._error(
+                f"'{node.name}' is used as both @wire and $parameter", node.loc
+            )
+
+        # Check default literal type (if present)
+        if node.default_expr is not None:
+            default_type = self._check_expr(node.default_expr)
+            if not self._is_assignable(tex_type, default_type):
+                self._error(
+                    f"Default value type mismatch for ${node.name}: "
+                    f"expected '{tex_type.value}', got '{default_type.value}'",
+                    node.loc,
+                )
+
+        # Extract default literal value (for backend fallback)
+        default_value = None
+        if node.default_expr is not None:
+            if isinstance(node.default_expr, NumberLiteral):
+                default_value = (
+                    int(node.default_expr.value)
+                    if node.default_expr.is_int
+                    else node.default_expr.value
+                )
+            elif isinstance(node.default_expr, StringLiteral):
+                default_value = node.default_expr.value
+
+        # Register parameter
+        self.param_declarations[node.name] = {
+            "type": tex_type,
+            "type_hint": node.type_hint,
+            "default_value": default_value,
+        }
+        self._set_type(node, TEXType.VOID)
+
     def _check_assignment(self, node: Assignment):
         target_type = self._check_expr(node.target)
         value_type = self._check_expr(node.value)
 
-        # Auto-inference for @OUT assignments
-        if self._infer_out and self._is_out_target(node.target):
-            if isinstance(node.target, ChannelAccess):
-                effective = self._infer_out_from_channel(node.target)
-            else:
-                effective = value_type
-            if self.inferred_out_type is None:
-                self.inferred_out_type = effective
-            else:
-                self.inferred_out_type = self._promote_out(
-                    self.inferred_out_type, effective, node.loc
+        # Track @binding assignments as outputs (multi-output inference)
+        binding_target = self._get_binding_target(node.target)
+        if binding_target is not None:
+            name = binding_target.name
+
+            # Don't allow assigning to $param bindings
+            if binding_target.kind == "param":
+                self._error(
+                    f"Cannot assign to parameter ${name} (parameters are read-only widgets)",
+                    node.loc,
                 )
+            # Don't allow @wire assignment if name was already declared as $param
+            elif name in self.param_declarations:
+                self._error(
+                    f"'{name}' is already declared as a $parameter — "
+                    f"cannot also assign to @{name}",
+                    node.loc,
+                )
+            else:
+                # Reject matrix/array types as output values (not representable in ComfyUI)
+                if value_type.is_matrix:
+                    self._error(
+                        f"Cannot assign {value_type.value} to @{name} "
+                        f"(matrix types cannot be output)",
+                        node.loc,
+                    )
+                    self._set_type(node, TEXType.VOID)
+                    return
+                if value_type.is_array:
+                    self._error(
+                        f"Cannot assign array to @{name} "
+                        f"(array types cannot be output)",
+                        node.loc,
+                    )
+                    self._set_type(node, TEXType.VOID)
+                    return
+
+                # Infer output type from assignment
+                if isinstance(node.target, ChannelAccess):
+                    effective = self._infer_binding_from_channel(node.target)
+                else:
+                    effective = value_type
+
+                if name not in self.assigned_bindings:
+                    self.assigned_bindings[name] = effective
+                else:
+                    self.assigned_bindings[name] = self._promote_out(
+                        self.assigned_bindings[name], effective, node.loc
+                    )
             self._set_type(node, TEXType.VOID)
             return
 
@@ -509,20 +613,39 @@ class TypeChecker:
     def _check_binding_ref(self, node: BindingRef) -> TEXType:
         self.referenced_bindings.add(node.name)
 
-        if node.name == "OUT":
-            if self._infer_out:
-                # Auto mode: use inferred type if available, else VEC4 (permissive default)
-                t = self.inferred_out_type if self.inferred_out_type is not None else TEXType.VEC4
+        # $ parameter bindings — type from declaration or type hint
+        if node.kind == "param":
+            param_info = self.param_declarations.get(node.name)
+            if param_info:
+                t = param_info["type"]
+            elif node.type_hint:
+                t = BINDING_HINT_TYPES.get(node.type_hint, TEXType.FLOAT)
             else:
-                # Explicit mode: type is pre-set by output_type parameter
-                t = self.binding_types.get("OUT", TEXType.VEC4)
+                t = TEXType.FLOAT  # undeclared param defaults to float
             self._set_type(node, t)
             return t
 
+        # @ wire bindings — check binding_types (inputs), then type hint, then fallback
+        # 1. Pre-set input type (from connected wire)
         t = self.binding_types.get(node.name)
-        if t is None:
-            # Unknown binding — assume vec4 (image), will be resolved at runtime
-            t = TEXType.VEC4
+        if t is not None:
+            self._set_type(node, t)
+            return t
+
+        # 2. Already inferred from a previous assignment (output)
+        t = self.assigned_bindings.get(node.name)
+        if t is not None:
+            self._set_type(node, t)
+            return t
+
+        # 3. Type hint from code (e.g. f@threshold → FLOAT)
+        if node.type_hint:
+            t = BINDING_HINT_TYPES.get(node.type_hint, TEXType.VEC4)
+            self._set_type(node, t)
+            return t
+
+        # 4. Fallback: assume vec4 (image), will be resolved at runtime
+        t = TEXType.VEC4
         self._set_type(node, t)
         return t
 
@@ -850,22 +973,25 @@ class TypeChecker:
             return True
         return False
 
-    # -- @OUT auto-inference helpers ------------------------------------
+    # -- Binding output inference helpers ---------------------------------
 
     @staticmethod
-    def _is_out_target(target: ASTNode) -> bool:
-        """Check if assignment target is @OUT or @OUT.channel."""
-        if isinstance(target, BindingRef) and target.name == "OUT":
-            return True
+    def _get_binding_target(target: ASTNode) -> BindingRef | None:
+        """If target is a @binding or @binding.channel, return the BindingRef. Else None."""
+        if isinstance(target, BindingRef):
+            return target
         if isinstance(target, ChannelAccess):
             obj = target.object
-            if isinstance(obj, BindingRef) and obj.name == "OUT":
-                return True
-        return False
+            if isinstance(obj, BindingRef):
+                return obj
+        return None
 
-    def _infer_out_from_channel(self, target: ChannelAccess) -> TEXType:
-        """Infer @OUT type from channel assignment like @OUT.r = x."""
+    def _infer_binding_from_channel(self, target: ChannelAccess) -> TEXType:
+        """Infer binding type from channel assignment like @X.r = expr."""
+        binding = target.object
+        name = binding.name if isinstance(binding, BindingRef) else "OUT"
         channels = target.channels
+
         # .a or .w implies vec4 (alpha/w channel)
         if len(channels) == 1 and channels in ("a", "w"):
             return TEXType.VEC4
@@ -873,18 +999,18 @@ class TypeChecker:
         if len(channels) >= 4:
             return TEXType.VEC4
         # If already inferred as VEC4, keep it
-        if self.inferred_out_type == TEXType.VEC4:
+        if self.assigned_bindings.get(name) == TEXType.VEC4:
             return TEXType.VEC4
         # Default to VEC3 for .r, .g, .b, .x, .y, .z and 3-component swizzles
         return TEXType.VEC3
 
     def _promote_out(self, current: TEXType, new: TEXType, loc: SourceLoc) -> TEXType:
-        """Promote inferred @OUT type, erroring on string/numeric conflict."""
+        """Promote inferred output type, erroring on string/numeric conflict."""
         if current == new:
             return current
         if current.is_string != new.is_string:
             self._error(
-                "@OUT assigned both string and numeric types in different branches",
+                "Output binding assigned both string and numeric types in different branches",
                 loc,
             )
             return current

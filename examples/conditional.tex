@@ -1,23 +1,21 @@
 // Conditional processing — make dark pixels warmer, bright pixels cooler
-// Input: @A (IMAGE)
-// Output: IMAGE
 
-float brightness = luma(@A);
+float brightness = luma(@image);
 
 if (brightness < 0.5) {
     // Dark regions: warm shift (add red, reduce blue)
     float warmth = (0.5 - brightness) * 0.2;
     @OUT = vec3(
-        clamp(@A.r + warmth, 0.0, 1.0),
-        @A.g,
-        clamp(@A.b - warmth, 0.0, 1.0)
+        clamp(@image.r + warmth, 0.0, 1.0),
+        @image.g,
+        clamp(@image.b - warmth, 0.0, 1.0)
     );
 } else {
     // Bright regions: cool shift (add blue, reduce red)
     float coolness = (brightness - 0.5) * 0.2;
     @OUT = vec3(
-        clamp(@A.r - coolness, 0.0, 1.0),
-        @A.g,
-        clamp(@A.b + coolness, 0.0, 1.0)
+        clamp(@image.r - coolness, 0.0, 1.0),
+        @image.g,
+        clamp(@image.b + coolness, 0.0, 1.0)
     );
 }

@@ -3,8 +3,9 @@ TEX Parser — recursive-descent parser producing an AST from tokens.
 
 Grammar (simplified):
   program     = statement*
-  statement   = var_decl | assignment | if_else | for_loop | expr_stmt
+  statement   = var_decl | param_decl | assignment | if_else | for_loop | expr_stmt
   var_decl    = type_kw IDENT ('=' expr)? ';'
+  param_decl  = ('$'|typed_'$') IDENT ('=' expr)? ';'
   assignment  = lvalue '=' expr ';'
                | lvalue '+=' expr ';'   (desugars to lvalue = lvalue + expr)
                | lvalue '-=' expr ';'
@@ -25,8 +26,9 @@ Grammar (simplified):
   multiply    = unary (('*' | '/' | '%') unary)*
   unary       = ('-' | '!') unary | postfix
   postfix     = primary ('.' IDENT | '(' args ')')*
-  primary     = NUMBER | IDENT | AT_BINDING | '(' expr ')'
-               | vec_constructor | cast_expr
+  primary     = NUMBER | IDENT | AT_BINDING | DOLLAR_BINDING
+               | TYPED_AT_BINDING | TYPED_DOLLAR_BINDING
+               | '(' expr ')' | vec_constructor | cast_expr
 """
 from __future__ import annotations
 from .lexer import Token, TokenType, LexerError
@@ -34,7 +36,7 @@ from .ast_nodes import (
     SourceLoc, Program, VarDecl, Assignment, IfElse, ForLoop, ExprStatement,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, ASTNode,
-    ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor,
+    ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
 )
 
 TYPE_KEYWORDS = {TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_VEC3, TokenType.KW_VEC4, TokenType.KW_STRING, TokenType.KW_MAT3, TokenType.KW_MAT4}
@@ -117,6 +119,13 @@ class Parser:
                     return self.parse_array_decl()
                 return self.parse_var_decl()
 
+        # Parameter declaration: f$name = 0.5; or $name; or i$count = 10;
+        if self.peek() == TokenType.TYPED_DOLLAR_BINDING:
+            return self.parse_param_decl()
+        if self.peek() == TokenType.DOLLAR_BINDING:
+            if self.peek_ahead() in (TokenType.ASSIGN, TokenType.SEMI):
+                return self.parse_param_decl()
+
         # if/else
         if self.peek() == TokenType.KW_IF:
             return self.parse_if_else()
@@ -140,6 +149,21 @@ class Parser:
 
         self.expect(TokenType.SEMI, "Expected ';' after variable declaration")
         return VarDecl(loc=loc, type_name=type_name, name=name_tok.value, initializer=initializer)
+
+    def parse_param_decl(self) -> ParamDecl:
+        """Parse: ($name | prefix$name) ('=' expr)? ';'"""
+        loc = self.loc()
+        tok = self.advance()  # TYPED_DOLLAR_BINDING or DOLLAR_BINDING
+        default_expr = None
+        if self.match(TokenType.ASSIGN):
+            default_expr = self.parse_expr()
+        self.expect(TokenType.SEMI, "Expected ';' after parameter declaration")
+        return ParamDecl(
+            loc=loc,
+            name=tok.value,
+            type_hint=tok.prefix,
+            default_expr=default_expr,
+        )
 
     def parse_array_decl(self) -> ArrayDecl:
         """Parse: type IDENT '[' INT? ']' ('=' ('{' expr_list '}' | IDENT))? ';'"""
@@ -463,10 +487,25 @@ class Parser:
             self.advance()
             return Identifier(loc=tok.loc, name=tok.value)
 
-        # @ bindings
+        # @ bindings (untyped)
         if tok.type == TokenType.AT_BINDING:
             self.advance()
             return BindingRef(loc=tok.loc, name=tok.value)
+
+        # Typed @ bindings (e.g. f@threshold, img@result)
+        if tok.type == TokenType.TYPED_AT_BINDING:
+            self.advance()
+            return BindingRef(loc=tok.loc, name=tok.value, kind="wire", type_hint=tok.prefix)
+
+        # $ parameter bindings (untyped)
+        if tok.type == TokenType.DOLLAR_BINDING:
+            self.advance()
+            return BindingRef(loc=tok.loc, name=tok.value, kind="param")
+
+        # Typed $ parameter bindings (e.g. f$strength, i$count)
+        if tok.type == TokenType.TYPED_DOLLAR_BINDING:
+            self.advance()
+            return BindingRef(loc=tok.loc, name=tok.value, kind="param", type_hint=tok.prefix)
 
         # Vector constructors: vec3(...) / vec4(...)
         if tok.type in (TokenType.KW_VEC3, TokenType.KW_VEC4):

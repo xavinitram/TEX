@@ -1,5 +1,7 @@
-// Latent Blend — mix two latents
-// Set output_type to LATENT. Connect latents to @A and @B.
-// Connect a FLOAT to @C for blend factor (0.0 = all A, 1.0 = all B)
+// Latent blend — mix two latent tensors
+// Connect latent data to @latent_a and @latent_b
+// Output type is auto-inferred as LATENT
 
-@OUT = lerp(@A, @B, @C);
+f$blend = 0.5;   // 0.0 = all A, 1.0 = all B
+
+@OUT = lerp(@latent_a, @latent_b, $blend);

@@ -1,10 +1,11 @@
 /**
  * TEX Autocomplete Provider for CodeMirror 6
  *
- * Three completion sources:
+ * Four completion sources:
  *   A. Stdlib functions — with signatures and descriptions
  *   B. Built-in variables — with type and description
  *   C. @ binding completions — triggered by "@" character
+ *   D. $ parameter completions — triggered by "$" character
  */
 
 // ─── Stdlib function completions ─────────────────────────────────────
@@ -152,18 +153,38 @@ const ALL_COMPLETIONS = [...STDLIB_COMPLETIONS, ...TYPE_COMPLETIONS, ...VARIABLE
 
 /**
  * Create a completion source for a specific TEX node.
- * The getBindings callback returns current @ binding names.
+ * @param {Function} getBindings — returns current @ binding names (inputs + outputs)
+ * @param {Function} [getParams] — returns current $ parameter names
  */
-export function createTexCompletions(getBindings) {
+export function createTexCompletions(getBindings, getParams) {
     return function texCompletionSource(context) {
+        // ── $ parameter trigger ──
+        const dollarMatch = context.matchBefore(/\$\w*/);
+        if (dollarMatch) {
+            const paramOptions = [];
+            try {
+                const params = getParams ? getParams() : [];
+                for (const name of params) {
+                    paramOptions.push({
+                        label: "$" + name,
+                        type: "variable",
+                        info: `Parameter "${name}"`,
+                    });
+                }
+            } catch (_) {}
+            return {
+                from: dollarMatch.from,
+                options: paramOptions,
+                validFor: /^\$\w*$/,
+            };
+        }
+
         // ── @ binding trigger ──
         // If the user just typed "@", show all available bindings
         const atMatch = context.matchBefore(/@\w*/);
         if (atMatch) {
-            const bindingOptions = [
-                { label: "@OUT", type: "variable", info: "Output binding", boost: 10 },
-            ];
-            // Add dynamic bindings from connected sockets
+            const bindingOptions = [];
+            // Add dynamic bindings from connected sockets (inputs + outputs)
             try {
                 const bindings = getBindings();
                 if (bindings && bindings.length) {
@@ -171,7 +192,7 @@ export function createTexCompletions(getBindings) {
                         bindingOptions.push({
                             label: "@" + name,
                             type: "variable",
-                            info: `Input binding "${name}"`,
+                            info: `Binding "${name}"`,
                         });
                     }
                 }

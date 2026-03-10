@@ -1,8 +1,6 @@
-// Generate a horizontal gradient (no input image needed)
-// Output: IMAGE
-// Note: connect any small image to @A to set the output resolution
+// Procedural color gradient
+// Uses built-in u/v coordinates (0..1)
+// Note: connect any image to @ref to set output resolution
 
-float r = u;
-float g = v;
-float b = 1.0 - u;
-@OUT = vec3(r, g, b);
+vec4 _ref = @ref;
+@OUT = vec3(u, v, 1.0 - u);

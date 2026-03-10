@@ -1,5 +1,5 @@
 // Mix two images based on a mask or blend factor
-// Inputs: @A (IMAGE), @B (IMAGE), @C (FLOAT or MASK: blend factor 0-1)
-// Output: IMAGE
+// Connect images to @base and @overlay
+// Connect a FLOAT or MASK to @blend (0 = all base, 1 = all overlay)
 
-@OUT = lerp(@A, @B, @C);
+@OUT = lerp(@base, @overlay, @blend);

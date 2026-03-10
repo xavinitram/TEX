@@ -1,25 +1,26 @@
-// Sobel edge detection — highlights edges in the image
-// Connect any image to @A
-// Uses 3x3 Sobel kernels for horizontal and vertical gradients
+// Sobel edge detection — outputs both an edge image and edge mask
 
 float gx = 0.0;
 float gy = 0.0;
 
 // Sobel X kernel: [-1 0 1; -2 0 2; -1 0 1]
-gx += luma(fetch(@A, ix - 1, iy - 1)) * -1.0;
-gx += luma(fetch(@A, ix + 1, iy - 1)) *  1.0;
-gx += luma(fetch(@A, ix - 1, iy    )) * -2.0;
-gx += luma(fetch(@A, ix + 1, iy    )) *  2.0;
-gx += luma(fetch(@A, ix - 1, iy + 1)) * -1.0;
-gx += luma(fetch(@A, ix + 1, iy + 1)) *  1.0;
+gx += luma(fetch(@image, ix - 1, iy - 1)) * -1.0;
+gx += luma(fetch(@image, ix + 1, iy - 1)) *  1.0;
+gx += luma(fetch(@image, ix - 1, iy    )) * -2.0;
+gx += luma(fetch(@image, ix + 1, iy    )) *  2.0;
+gx += luma(fetch(@image, ix - 1, iy + 1)) * -1.0;
+gx += luma(fetch(@image, ix + 1, iy + 1)) *  1.0;
 
 // Sobel Y kernel: [-1 -2 -1; 0 0 0; 1 2 1]
-gy += luma(fetch(@A, ix - 1, iy - 1)) * -1.0;
-gy += luma(fetch(@A, ix,     iy - 1)) * -2.0;
-gy += luma(fetch(@A, ix + 1, iy - 1)) * -1.0;
-gy += luma(fetch(@A, ix - 1, iy + 1)) *  1.0;
-gy += luma(fetch(@A, ix,     iy + 1)) *  2.0;
-gy += luma(fetch(@A, ix + 1, iy + 1)) *  1.0;
+gy += luma(fetch(@image, ix - 1, iy - 1)) * -1.0;
+gy += luma(fetch(@image, ix,     iy - 1)) * -2.0;
+gy += luma(fetch(@image, ix + 1, iy - 1)) * -1.0;
+gy += luma(fetch(@image, ix - 1, iy + 1)) *  1.0;
+gy += luma(fetch(@image, ix,     iy + 1)) *  2.0;
+gy += luma(fetch(@image, ix + 1, iy + 1)) *  1.0;
 
 float edge = clamp(sqrt(gx * gx + gy * gy), 0.0, 1.0);
-@OUT = vec3(edge, edge, edge);
+
+// Multi-output: IMAGE + MASK
+@edges = vec3(edge, edge, edge);
+@edge_mask = edge;

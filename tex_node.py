@@ -112,8 +112,8 @@ def _prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
     # For non-STRING outputs, if raw is a string, error
     if isinstance(raw, str):
         raise RuntimeError(
-            f"TEX Error: @OUT is a string but output_type is '{output_type}'. "
-            f"Set output_type to 'STRING' when using string output."
+            f"TEX Error: Output is a string but inferred type is '{output_type}'. "
+            f"Use s@name prefix for string outputs."
         )
 
     if output_type == "IMAGE":
@@ -195,13 +195,18 @@ class TEXWrangleNode:
     FUNCTION = "execute"
     DESCRIPTION = (
         "TEX Wrangle: per-pixel tensor expressions for images, masks, and scalars.\n"
-        "Reference inputs with @name (e.g. @A, @base_image), write to @OUT.\n"
+        "Reference inputs with @name (e.g. @A, @base_image).\n"
+        "Write outputs with @name = expr (e.g. @OUT, @mask, @result).\n"
+        "Add parameter widgets with $name (e.g. f$strength = 0.5).\n"
         "Supports float, int, vec3, vec4, string types with if/else, for loops, and 60+ stdlib functions.\n"
         "Click the ? icon for a quick reference."
     )
 
+    # Maximum number of output slots (pre-allocated for dynamic outputs)
+    MAX_OUTPUTS = 8
+
     # System kwargs that are NOT TEX bindings
-    _SYSTEM_KWARGS = {"device", "compile_mode"}
+    _SYSTEM_KWARGS = {"device", "compile_mode", "output_type"}
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -225,6 +230,9 @@ class TEXWrangleNode:
                 "tooltip": "none: standard interpreter. torch_compile: JIT-compile via torch.compile (falls back on failure).",
             },
         )
+        # NOTE: output_type was removed in v0.3. Old workflows that pass it
+        # will still work — ContainsAnyDict accepts any key, and execute()
+        # pops it from kwargs before processing bindings.
 
         return {
             "required": {
@@ -237,24 +245,20 @@ class TEXWrangleNode:
                                "float gray = luma(@IN);\n"
                                "@OUT = vec3(gray);\n",
                     "placeholder": "// TEX code here...",
-                    "tooltip": "TEX source code. Use @name to reference inputs, @OUT for output. Types: float, int, vec3, vec4, string.",
-                }),
-                "output_type": (["auto", "IMAGE", "MASK", "LATENT", "FLOAT", "INT", "STRING"], {
-                    "default": "auto",
-                    "tooltip": "Output format. auto: inferred from code. IMAGE: [B,H,W,3]. MASK: [B,H,W]. LATENT: [B,C,H,W]. FLOAT/INT: scalar. STRING: text.",
+                    "tooltip": "TEX source code. Use @name for inputs, @name = expr for outputs. Use $name for parameter widgets.",
                 }),
             },
             "optional": optional,
         }
 
-    RETURN_TYPES = (ANY_TYPE,)
-    RETURN_NAMES = ("OUT",)
-    OUTPUT_TOOLTIPS = ("TEX output. Format depends on output_type: IMAGE [B,H,W,3], MASK [B,H,W], LATENT [B,C,H,W], FLOAT, or INT.",)
+    RETURN_TYPES = tuple([ANY_TYPE] * 8)
+    RETURN_NAMES = tuple([f"out_{i}" for i in range(8)])
+    OUTPUT_TOOLTIPS = tuple(["TEX output. Type auto-inferred from code."] * 8)
 
     @classmethod
-    def IS_CHANGED(cls, code, output_type, **kwargs):
+    def IS_CHANGED(cls, code, **kwargs):
         """Cache-busting: re-execute if code, inputs, device, or compile_mode change."""
-        parts = [code, output_type]
+        parts = [code]
         # Include device and compile_mode in the hash
         parts.append(kwargs.get("device", "auto"))
         parts.append(kwargs.get("compile_mode", "none"))
@@ -275,15 +279,16 @@ class TEXWrangleNode:
                     parts.append(f"{name}:{val}")
         return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()
 
-    def execute(self, code: str, output_type: str, **kwargs) -> tuple:
+    def execute(self, code: str, **kwargs) -> tuple:
         """Execute TEX code with the provided inputs."""
         start_time = time.perf_counter()
 
         # Pop system parameters so they don't get treated as bindings
         device_mode = kwargs.pop("device", "auto")
         compile_mode = kwargs.pop("compile_mode", "none")
+        output_type_compat = kwargs.pop("output_type", "auto")  # deprecated, ignored
 
-        # Everything remaining in kwargs is a TEX binding
+        # Everything remaining in kwargs is a TEX binding (inputs + params)
         bindings: dict[str, Any] = {
             name: val for name, val in kwargs.items() if val is not None
         }
@@ -298,6 +303,7 @@ class TEXWrangleNode:
 
         # Unwrap LATENT dicts into channel-last tensors, preserving metadata
         latent_meta: dict[str, Any] = {}
+        has_latent_input = False
         latent_channel_count = 0
         for name, val in list(bindings.items()):
             if isinstance(val, str):
@@ -305,44 +311,49 @@ class TEXWrangleNode:
             if isinstance(val, dict) and "samples" in val:
                 tensor_cl, meta = _unwrap_latent(val)
                 bindings[name] = tensor_cl
-                if not latent_meta:
+                has_latent_input = True
+                if not latent_meta and meta:
                     latent_meta = meta
+                if not latent_channel_count:
                     latent_channel_count = tensor_cl.shape[-1]
 
         # Resolve target device
         device = self._resolve_device(device_mode, bindings)
 
         try:
-            # Infer binding types
+            # Infer binding types for inputs
             binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
-
-            # Set output type: auto mode omits OUT from binding_types (triggers inference)
-            if output_type != "auto":
-                out_type_map = {
-                    "IMAGE": TEXType.VEC4,
-                    "MASK": TEXType.FLOAT,
-                    "LATENT": TEXType.VEC4,
-                    "FLOAT": TEXType.FLOAT,
-                    "INT": TEXType.INT,
-                    "STRING": TEXType.STRING,
-                }
-                binding_types["OUT"] = out_type_map.get(output_type, TEXType.VEC4)
 
             # Compile (uses two-tier Mega-Cache: memory LRU + disk persistence)
             cache = get_cache()
-            program, type_map, referenced, inferred_out = cache.compile_tex(code, binding_types)
+            program, type_map, referenced, assigned_bindings, param_info = cache.compile_tex(code, binding_types)
 
-            # Resolve effective output type
-            if output_type == "auto":
-                effective_output_type = _map_inferred_type(inferred_out, bool(latent_meta))
-            else:
-                effective_output_type = output_type
+            # Determine output names (sorted alphabetically for stable ordering)
+            output_names = sorted(assigned_bindings.keys())
+            if not output_names:
+                raise InterpreterError(
+                    "TEX program has no outputs. Assign to @OUT or another @name."
+                )
+            if len(output_names) > self.MAX_OUTPUTS:
+                raise InterpreterError(
+                    f"TEX program has {len(output_names)} outputs, "
+                    f"exceeding the maximum ({self.MAX_OUTPUTS})."
+                )
 
-            # Check that referenced bindings are available
+            # Check that referenced input bindings are available.
+            # For $params with code-defined defaults, inject the default as a
+            # fallback when no widget value or wire connection is provided.
             for ref_name in referenced:
-                if ref_name != "OUT" and ref_name not in bindings:
+                if ref_name not in assigned_bindings and ref_name not in bindings:
+                    # Try param default before erroring
+                    if ref_name in param_info:
+                        default_val = param_info[ref_name].get("default_value")
+                        if default_val is not None:
+                            bindings[ref_name] = default_val
+                            continue
+                    sigil = "$" if ref_name in param_info else "@"
                     raise InterpreterError(
-                        f"TEX code references @{ref_name} but no input is connected to slot '{ref_name}'."
+                        f"TEX code references {sigil}{ref_name} but no input is connected to slot '{ref_name}'."
                     )
 
             # Execute — optionally with torch.compile acceleration
@@ -350,28 +361,41 @@ class TEXWrangleNode:
                 fp = cache.fingerprint(code, binding_types)
                 raw_output = execute_compiled(program, bindings, type_map, device, fp,
                                               latent_channel_count=latent_channel_count)
+                # torch_compile returns single value — wrap for compat
+                if not isinstance(raw_output, dict):
+                    raw_output = {output_names[0]: raw_output}
             else:
                 interp = Interpreter()
                 raw_output = interp.execute(program, bindings, type_map, device=device,
-                                            latent_channel_count=latent_channel_count)
+                                            latent_channel_count=latent_channel_count,
+                                            output_names=output_names)
 
-            # Format output
-            result = _prepare_output(raw_output, effective_output_type)
+            # Format each output based on inferred type
+            results = []
+            output_types_log = []
+            for name in output_names:
+                raw = raw_output[name]
+                inferred_type = assigned_bindings[name]
+                effective_type = _map_inferred_type(inferred_type, has_latent_input)
+                result = _prepare_output(raw, effective_type)
+                if effective_type == "LATENT":
+                    result = {"samples": result, **latent_meta}
+                results.append(result)
+                output_types_log.append(f"{name}:{effective_type}")
 
-            # Wrap LATENT output in dict with preserved metadata
-            if effective_output_type == "LATENT":
-                result = {"samples": result, **latent_meta}
+            # Pad with None for unused output slots
+            while len(results) < self.MAX_OUTPUTS:
+                results.append(None)
 
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             compile_tag = " [compiled]" if compile_mode == "torch_compile" else ""
-            auto_tag = f" (auto->{effective_output_type})" if output_type == "auto" else ""
             logger.info(
                 f"Executed in {elapsed_ms:.1f}ms{compile_tag} | "
-                f"device: {device} | output: {effective_output_type}{auto_tag} | "
+                f"device: {device} | outputs: [{', '.join(output_types_log)}] | "
                 f"bindings: {list(bindings.keys())}"
             )
 
-            return (result,)
+            return tuple(results)
 
         except (LexerError, ParseError, TypeCheckError, InterpreterError) as e:
             # Clean user-facing error

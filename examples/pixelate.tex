@@ -1,21 +1,18 @@
 // Pixelate — mosaic / block effect
-// Input: @A (IMAGE)
-// Output: IMAGE
 //
 // Quantizes UV coordinates to a grid, then samples the
 // image at each block's top-left corner. Every pixel in
 // the same block gets the same color, creating a mosaic.
-// Adjust 'block_size' (in pixels) to control coarseness.
 
-float block_size = 16.0;
+f$block_size = 16.0;   // block size in pixels
 
 // Convert block size from pixels to UV space
-float bx = block_size / iw;
-float by = block_size / ih;
+float bx = $block_size / iw;
+float by = $block_size / ih;
 
 // Snap UV to the nearest block corner
 float su = floor(u / bx) * bx;
 float sv = floor(v / by) * by;
 
 // Sample the image at the snapped position
-@OUT = sample(@A, su, sv);
+@OUT = sample(@image, su, sv);

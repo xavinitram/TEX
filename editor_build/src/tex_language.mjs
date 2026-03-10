@@ -42,6 +42,9 @@ const TEX_COORD_VARS = new Set([
     "u", "v", "ix", "iy", "iw", "ih", "ic", "fi", "fn",
 ]);
 
+// Type prefixes for typed bindings: f@threshold, i$count, etc.
+const BINDING_TYPE_PREFIXES = new Set(["f", "i", "v", "v4", "s", "img", "m", "l"]);
+
 // ─── Token name strategy ─────────────────────────────────────────────
 // StreamLanguage.define() accepts ONE argument (the spec); there is NO
 // second options argument. Token names returned by token() are resolved
@@ -127,6 +130,12 @@ const texStreamParser = {
             return "variable-2";   // → default table → tags.special(tags.variableName)
         }
 
+        // ── $ parameter bindings: $strength, $count ──
+        if (stream.eat("$")) {
+            stream.eatWhile(/[A-Za-z0-9_]/);
+            return "variable-2";   // same highlight as @ bindings
+        }
+
         // ── Numbers: hex, float, int, scientific ──
         // Hex: 0xFF
         if (stream.match(/^0[xX][0-9a-fA-F]+/)) return "number";
@@ -137,6 +146,17 @@ const texStreamParser = {
         // ── Identifiers: keywords, builtins, constants, coord vars ──
         if (stream.match(/^[A-Za-z_]\w*/)) {
             const word = stream.current();
+
+            // Typed binding prefix: f@threshold, i$count, img@result, etc.
+            if (BINDING_TYPE_PREFIXES.has(word) && !stream.eol()) {
+                const next = stream.peek();
+                if (next === "@" || next === "$") {
+                    stream.next();                // consume @ or $
+                    stream.eatWhile(/[A-Za-z0-9_]/);
+                    return "variable-2";          // highlight entire typed binding
+                }
+            }
+
             if (TEX_KEYWORDS.has(word)) return "keyword";
             if (TEX_BUILTINS.has(word)) return "builtin";    // → default table → blue
             if (TEX_CONSTANTS.has(word)) return "atom";

@@ -1,5 +1,7 @@
-// Latent Scale — adjust latent intensity
-// Set output_type to LATENT. Connect latent data to @A.
-// Connect a FLOAT to @B for the scale factor (e.g. 1.1)
+// Latent scale — adjust latent intensity
+// Connect latent data to @latent
+// Output type is auto-inferred as LATENT
 
-@OUT = @A * @B;
+f$scale = 1.1;   // scale factor (e.g. 1.1 for slight boost)
+
+@OUT = @latent * $scale;

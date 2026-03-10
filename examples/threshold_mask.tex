@@ -1,6 +1,6 @@
 // Threshold mask — convert image to binary mask
-// Input: @A (IMAGE), @B (FLOAT: threshold 0-1)
-// Output: MASK
 
-float gray = luma(@A);
-@OUT = step(@B, gray);
+f$threshold = 0.5;   // cutoff value (0.0 to 1.0)
+
+float gray = luma(@image);
+@OUT = step($threshold, gray);

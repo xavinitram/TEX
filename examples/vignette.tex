@@ -1,10 +1,14 @@
-// Radial vignette effect
-// Input: @A (IMAGE), @B (FLOAT: strength 0-2, default 1.0)
-// Output: IMAGE
+// Radial vignette — darkens image edges with soft circular falloff
+// Outputs both the darkened image and the vignette mask
+
+//Optional, Set a Default
+f$strength = 1.0;   // vignette intensity (0 = none, 2 = heavy)
 
 float cx = u - 0.5;
 float cy = v - 0.5;
 float dist = sqrt(cx * cx + cy * cy);
-float vignette = 1.0 - smoothstep(0.3, 0.7, dist * @B);
+float falloff = 1.0 - smoothstep(0.3, 0.7, dist * $strength);
 
-@OUT = @A * vec4(vignette, vignette, vignette, 1.0);
+// Multi-output: IMAGE + MASK
+@darkened = @image * vec3(falloff, falloff, falloff);
+@vignette_mask = falloff;

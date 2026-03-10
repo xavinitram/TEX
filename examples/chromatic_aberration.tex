@@ -1,16 +1,17 @@
-// Chromatic aberration — RGB channel split effect
-// Input: @A (IMAGE)
-// Output: IMAGE
+// Radial chromatic aberration — lens-style RGB fringing
 //
-// Offsets the red channel left and the blue channel right
-// while keeping green centered, simulating lens fringing.
-// Adjust 'offset' to control the strength of the effect.
+// Shifts red outward and blue inward from the center,
+// simulating the way real camera lenses separate colors.
 
-float offset = 0.003;
+f$strength = 0.005;   // radial offset per channel
 
-// Sample each channel at a different horizontal position
-float r = sample(@A, u - offset, v).r;
-float g = sample(@A, u, v).g;
-float b = sample(@A, u + offset, v).b;
+// Direction from center
+float cx = u - 0.5;
+float cy = v - 0.5;
+
+// Sample each channel at a different radial distance
+float r = sample(@image, 0.5 + cx * (1.0 + $strength), 0.5 + cy * (1.0 + $strength)).r;
+float g = sample(@image, u, v).g;
+float b = sample(@image, 0.5 + cx * (1.0 - $strength), 0.5 + cy * (1.0 - $strength)).b;
 
 @OUT = vec3(r, g, b);

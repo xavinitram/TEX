@@ -1,6 +1,7 @@
-// Grayscale conversion using luminance
-// Input: @A (IMAGE)
-// Output: IMAGE (grayscale)
+// Grayscale conversion — outputs both a gray image and luminance mask
 
-float gray = luma(@A);
-@OUT = vec3(gray, gray, gray);
+float gray = luma(@image);
+
+// Multi-output: IMAGE + MASK
+@gray_image = vec3(gray, gray, gray);
+@luminance = gray;

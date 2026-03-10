@@ -1,11 +1,13 @@
-// Terrain-style coloring using simplex noise
-// Generates a procedural terrain with water, grass, rock, and snow
+// Procedural terrain with simplex noise
+// Outputs a colored terrain image and a heightmap mask
 
-float freq = 4.0;
-float height = simplex(u * freq, v * freq) * 0.5 + 0.5;
+f$frequency = 4.0;   // terrain scale (higher = more features)
+
+vec4 _ref = @ref;
+float height = simplex(u * $frequency, v * $frequency) * 0.5 + 0.5;
 
 // Add detail with a second octave
-height += simplex(u * freq * 2.0, v * freq * 2.0) * 0.25;
+height += simplex(u * $frequency * 2.0, v * $frequency * 2.0) * 0.25;
 height = clamp(height, 0.0, 1.0);
 
 // Color by elevation
@@ -25,4 +27,6 @@ if (height > 0.8) {
     color = lerp(rock, snow, smoothstep(0.8, 0.9, height));
 }
 
-@OUT = vec4(color, 1.0);
+// Multi-output: IMAGE + MASK
+@terrain = vec4(color, 1.0);
+@heightmap = height;

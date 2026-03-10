@@ -20,7 +20,7 @@ from ..tex_compiler.ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, ExprStatement,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, SourceLoc,
-    ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor,
+    ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP
 from .stdlib import TEXStdlib
@@ -62,7 +62,8 @@ class Interpreter:
         type_map: dict[int, TEXType],
         device: torch.device | str = "cpu",
         latent_channel_count: int = 0,
-    ) -> torch.Tensor:
+        output_names: list[str] | None = None,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Execute a TEX program.
 
@@ -71,9 +72,12 @@ class Interpreter:
             bindings: @ binding values (name -> tensor or scalar)
             type_map: AST node id -> TEXType from type checker
             device: Target device
+            latent_channel_count: Channel count for latent inputs
+            output_names: If provided, return dict of named outputs instead of single @OUT
 
         Returns:
-            The value of @OUT after execution
+            If output_names is None: the value of @OUT (backward compat)
+            If output_names is provided: dict mapping name -> value for each output
         """
         self.device = torch.device(device)
         self.type_map = type_map
@@ -101,9 +105,24 @@ class Interpreter:
         for stmt in program.statements:
             self._exec_stmt(stmt)
 
-        # Return @OUT
+        # Multi-output mode
+        if output_names is not None:
+            results = {}
+            for name in output_names:
+                if name in self.bindings:
+                    results[name] = self.bindings[name]
+                else:
+                    raise InterpreterError(
+                        f"Output @{name} was not assigned by the TEX program"
+                    )
+            return results
+
+        # Single-output backward compat
         if "OUT" not in self.bindings:
-            raise InterpreterError("TEX program must assign to @OUT")
+            raise InterpreterError(
+                "TEX program must assign to at least one output "
+                "(e.g. @OUT, or named outputs like @result)"
+            )
 
         return self.bindings["OUT"]
 
@@ -179,6 +198,8 @@ class Interpreter:
             self._exec_for_loop(node)
         elif isinstance(node, ExprStatement):
             self._eval(node.expr)
+        elif isinstance(node, ParamDecl):
+            pass  # Declarations are compile-time only; values come from widget kwargs
         else:
             raise InterpreterError(f"Unknown statement: {type(node).__name__}", node.loc)
 

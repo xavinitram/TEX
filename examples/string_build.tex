@@ -1,6 +1,8 @@
-// Build a filename from parts
-// Connect STRING inputs to @A (prefix) and @B (suffix)
-// Set output_type to STRING
+// Build a sanitized filename from parts
+// Uses string parameters with defaults
 
-string name = @A + "_processed_" + @B;
+s$prefix = "image";
+s$suffix = ".png";
+
+string name = $prefix + "_processed_" + $suffix;
 @OUT = sanitize_filename(name);

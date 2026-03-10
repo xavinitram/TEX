@@ -1,12 +1,11 @@
 // 3x3 median filter using vec4 arrays
 // Reduces salt-and-pepper noise while preserving edges
-// Connect an image to @A
 
 vec4 samples[9];
 int idx = 0;
 for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
-        samples[idx] = fetch(@A, ix + dx, iy + dy);
+        samples[idx] = fetch(@image, ix + dx, iy + dy);
         idx++;
     }
 }

@@ -11,9 +11,8 @@ import { tags } from "@lezer/highlight";
 // ─── Editor theme (layout, chrome, colors) ───────────────────────────
 
 export const texEditorTheme = EditorView.theme({
-    // Root editor — desaturated dark grey to match ComfyUI's neutral aesthetic
     "&": {
-        backgroundColor: "#1a1a1f",
+        backgroundColor: "#1a1a1a",
         color: "#d4d4d4",
         fontSize: "13px",
         fontFamily: "'Monaspace Neon', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace",
@@ -94,7 +93,7 @@ export const texEditorTheme = EditorView.theme({
 
     // ── Autocomplete popup ──
     ".cm-tooltip": {
-        backgroundColor: "#1e1e2e",
+        backgroundColor: "#1e1e1e",
         border: "1px solid #4FC3F7",
         borderRadius: "6px",
         boxShadow: "0 4px 16px rgba(0, 0, 0, 0.5)",
@@ -166,7 +165,7 @@ export const texEditorTheme = EditorView.theme({
 
     // Lint tooltip
     ".cm-tooltip-lint": {
-        backgroundColor: "#1e1e2e",
+        backgroundColor: "#1e1e1e",
         border: "1px solid #f44336",
     },
 
@@ -176,7 +175,7 @@ export const texEditorTheme = EditorView.theme({
         height: "6px",
     },
     "&::-webkit-scrollbar-track, & *::-webkit-scrollbar-track": {
-        backgroundColor: "#1a1a1f",
+        backgroundColor: "#1a1a1a",
     },
     "&::-webkit-scrollbar-thumb, & *::-webkit-scrollbar-thumb": {
         backgroundColor: "#4FC3F7",
@@ -185,7 +184,7 @@ export const texEditorTheme = EditorView.theme({
 
     // ── Search panel ──
     ".cm-panels": {
-        backgroundColor: "#1e1e2e",
+        backgroundColor: "#1e1e1e",
         borderTop: "1px solid #333",
         color: "#d4d4d4",
     },

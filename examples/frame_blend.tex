@@ -1,8 +1,8 @@
 // 3-frame temporal average (reduces flickering / noise)
-// Connect an image batch or animation to @A
+// Connect an image batch or animation to @frames
 
-vec4 prev = fetch_frame(@A, fi - 1, ix, iy);
-vec4 curr = fetch_frame(@A, fi, ix, iy);
-vec4 next = fetch_frame(@A, fi + 1, ix, iy);
+vec4 prev = fetch_frame(@frames, fi - 1, ix, iy);
+vec4 curr = fetch_frame(@frames, fi, ix, iy);
+vec4 next = fetch_frame(@frames, fi + 1, ix, iy);
 
 @OUT = (prev + curr + next) / 3.0;

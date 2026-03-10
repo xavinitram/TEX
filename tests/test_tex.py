@@ -61,8 +61,13 @@ class TestResult:
 
 def compile_and_run(code: str, bindings: dict, device: str = "cpu",
                     latent_channel_count: int = 0,
-                    out_type: TEXType = TEXType.VEC4) -> torch.Tensor | str:
-    """Helper: compile and execute TEX code, returning the @OUT value."""
+                    out_type: TEXType = TEXType.VEC4) -> torch.Tensor | str | dict:
+    """Helper: compile and execute TEX code.
+
+    Returns the @OUT value for single-output programs, or a dict of
+    {name: tensor} for multi-output programs (when code assigns to
+    names other than @OUT).
+    """
     lexer = Lexer(code)
     tokens = lexer.tokenize()
     parser = Parser(tokens)
@@ -82,14 +87,25 @@ def compile_and_run(code: str, bindings: dict, device: str = "cpu",
                 binding_types[name] = TEXType.FLOAT
         else:
             binding_types[name] = TEXType.FLOAT
-    binding_types["OUT"] = out_type
 
     checker = TypeChecker(binding_types=binding_types)
     type_map = checker.check(program)
 
-    interp = Interpreter()
-    return interp.execute(program, bindings, type_map, device=device,
-                          latent_channel_count=latent_channel_count)
+    # Use multi-output path when code assigns to named outputs
+    output_names = sorted(checker.assigned_bindings.keys()) if checker.assigned_bindings else None
+    if output_names is None or output_names == ["OUT"]:
+        # Single-output backward compat
+        binding_types["OUT"] = out_type
+        checker2 = TypeChecker(binding_types=binding_types)
+        type_map = checker2.check(program)
+        interp = Interpreter()
+        return interp.execute(program, bindings, type_map, device=device,
+                              latent_channel_count=latent_channel_count)
+    else:
+        interp = Interpreter()
+        return interp.execute(program, bindings, type_map, device=device,
+                              latent_channel_count=latent_channel_count,
+                              output_names=output_names)
 
 
 # ── Lexer Tests ────────────────────────────────────────────────────────
@@ -1096,7 +1112,7 @@ def test_cache(r: TestResult):
         cache.clear_memory()
         result = cache.compile_tex(code, bt)
         assert result is not None
-        assert len(result) == 4
+        assert len(result) == 5
         r.ok("cache: disk hit after memory clear")
         shutil.rmtree(tmp, ignore_errors=True)
     except Exception as e:
@@ -1221,7 +1237,7 @@ def test_torch_compile(r: TestResult):
     bt = {"A": TEXType.VEC4, "OUT": TEXType.VEC4}
 
     cache = TEXCache()
-    program, type_map, refs, _ = cache.compile_tex(code, bt)
+    program, type_map, refs, *_ = cache.compile_tex(code, bt)
     fp = cache.fingerprint(code, bt)
 
     # Ensure fresh state
@@ -1271,7 +1287,7 @@ def test_torch_compile(r: TestResult):
         """
         loop_bt = {"A": TEXType.VEC4, "OUT": TEXType.VEC4}
         loop_cache = TEXCache()
-        loop_prog, loop_tm, loop_refs, _ = loop_cache.compile_tex(loop_code, loop_bt)
+        loop_prog, loop_tm, loop_refs, *_ = loop_cache.compile_tex(loop_code, loop_bt)
         loop_fp = loop_cache.fingerprint(loop_code, loop_bt)
 
         result_loop = execute_compiled(
@@ -2408,7 +2424,7 @@ def test_latent(r: TestResult):
         lat = _make_latent(1, 4, 4, 4)
         from TEX_Wrangle.tex_node import TEXWrangleNode
         # Should not crash with LATENT dict
-        h = TEXWrangleNode.IS_CHANGED("@OUT = @A;", "LATENT", A=lat)
+        h = TEXWrangleNode.IS_CHANGED("@OUT = @A;", A=lat)
         assert isinstance(h, str), f"Expected hash string, got {type(h)}"
         r.ok("latent: IS_CHANGED")
     except Exception as e:
@@ -4371,6 +4387,354 @@ mat3 inv = inverse(m);
         r.fail("inverse(mat3) benchmark", f"{e}\n{traceback.format_exc()}")
 
 
+# ── v0.3 Multi-Output, Parameters, Typed Bindings Tests ──────────────
+
+def test_v03_features(r: TestResult):
+    """Tests for v0.3: multi-output, $ parameters, typed bindings."""
+    print("\n--- v0.3 Feature Tests ---")
+
+    from TEX_Wrangle.tex_compiler.ast_nodes import BindingRef, ParamDecl
+
+    # ── Lexer: $ binding ──
+    try:
+        tokens = Lexer("$strength").tokenize()
+        tok = tokens[0]
+        assert tok.type == TokenType.DOLLAR_BINDING, f"Expected DOLLAR_BINDING, got {tok.type}"
+        assert tok.value == "strength"
+        r.ok("lexer: $ binding")
+    except Exception as e:
+        r.fail("lexer: $ binding", f"{e}\n{traceback.format_exc()}")
+
+    # ── Lexer: typed @ binding ──
+    try:
+        tokens = Lexer("f@threshold").tokenize()
+        tok = tokens[0]
+        assert tok.type == TokenType.TYPED_AT_BINDING, f"Expected TYPED_AT_BINDING, got {tok.type}"
+        assert tok.value == "threshold"
+        assert tok.prefix == "f"
+        r.ok("lexer: typed @ binding (f@threshold)")
+    except Exception as e:
+        r.fail("lexer: typed @ binding", f"{e}\n{traceback.format_exc()}")
+
+    # ── Lexer: typed $ binding ──
+    try:
+        tokens = Lexer("i$count").tokenize()
+        tok = tokens[0]
+        assert tok.type == TokenType.TYPED_DOLLAR_BINDING, f"Expected TYPED_DOLLAR_BINDING, got {tok.type}"
+        assert tok.value == "count"
+        assert tok.prefix == "i"
+        r.ok("lexer: typed $ binding (i$count)")
+    except Exception as e:
+        r.fail("lexer: typed $ binding", f"{e}\n{traceback.format_exc()}")
+
+    # ── Lexer: prefix vs identifier (f = 5 is NOT a typed binding) ──
+    try:
+        tokens = Lexer("f = 5;").tokenize()
+        tok = tokens[0]
+        assert tok.type == TokenType.IDENT, f"Expected IDENT, got {tok.type}"
+        assert tok.value == "f"
+        r.ok("lexer: prefix vs identifier")
+    except Exception as e:
+        r.fail("lexer: prefix vs identifier", f"{e}\n{traceback.format_exc()}")
+
+    # ── Lexer: all type prefixes ──
+    try:
+        for prefix in ["f", "i", "v", "v4", "s", "img", "m", "l"]:
+            tokens = Lexer(f"{prefix}@test").tokenize()
+            tok = tokens[0]
+            assert tok.type == TokenType.TYPED_AT_BINDING, f"prefix '{prefix}': Expected TYPED_AT_BINDING, got {tok.type}"
+            assert tok.prefix == prefix, f"prefix '{prefix}': got prefix {tok.prefix!r}"
+            assert tok.value == "test"
+        r.ok("lexer: all type prefixes")
+    except Exception as e:
+        r.fail("lexer: all type prefixes", f"{e}\n{traceback.format_exc()}")
+
+    # ── Parser: ParamDecl with default ──
+    try:
+        tokens = Lexer("f$strength = 0.5;").tokenize()
+        program = Parser(tokens).parse()
+        stmt = program.statements[0]
+        assert isinstance(stmt, ParamDecl), f"Expected ParamDecl, got {type(stmt)}"
+        assert stmt.name == "strength"
+        assert stmt.type_hint == "f"
+        assert stmt.default_expr is not None
+        r.ok("parser: ParamDecl with default")
+    except Exception as e:
+        r.fail("parser: ParamDecl with default", f"{e}\n{traceback.format_exc()}")
+
+    # ── Parser: ParamDecl no default ──
+    try:
+        tokens = Lexer("i$count;").tokenize()
+        program = Parser(tokens).parse()
+        stmt = program.statements[0]
+        assert isinstance(stmt, ParamDecl), f"Expected ParamDecl, got {type(stmt)}"
+        assert stmt.name == "count"
+        assert stmt.type_hint == "i"
+        assert stmt.default_expr is None
+        r.ok("parser: ParamDecl no default")
+    except Exception as e:
+        r.fail("parser: ParamDecl no default", f"{e}\n{traceback.format_exc()}")
+
+    # ── Parser: $ in expression ──
+    try:
+        tokens = Lexer("@OUT = @A * $strength;").tokenize()
+        program = Parser(tokens).parse()
+        # Should parse without error; the assignment RHS contains a $ binding ref
+        r.ok("parser: $ in expression")
+    except Exception as e:
+        r.fail("parser: $ in expression", f"{e}\n{traceback.format_exc()}")
+
+    # ── Parser: typed @ in expression ──
+    try:
+        tokens = Lexer("img@result = @A * 0.5;").tokenize()
+        program = Parser(tokens).parse()
+        r.ok("parser: typed @ assignment")
+    except Exception as e:
+        r.fail("parser: typed @ assignment", f"{e}\n{traceback.format_exc()}")
+
+    # ── Type checker: multi-output ──
+    try:
+        code = "@result = @A * 0.5;\n@mask = luma(@A);"
+        tokens = Lexer(code).tokenize()
+        program = Parser(tokens).parse()
+        img = torch.rand(1, 4, 4, 3)
+        checker = TypeChecker(binding_types={"A": TEXType.VEC3})
+        checker.check(program)
+        assert "result" in checker.assigned_bindings, "Missing 'result' in assigned_bindings"
+        assert "mask" in checker.assigned_bindings, "Missing 'mask' in assigned_bindings"
+        assert checker.assigned_bindings["result"] == TEXType.VEC3
+        assert checker.assigned_bindings["mask"] == TEXType.FLOAT
+        r.ok("type checker: multi-output")
+    except Exception as e:
+        r.fail("type checker: multi-output", f"{e}\n{traceback.format_exc()}")
+
+    # ── Type checker: output type inference ──
+    try:
+        code = "@OUT = luma(@A);"
+        tokens = Lexer(code).tokenize()
+        program = Parser(tokens).parse()
+        checker = TypeChecker(binding_types={"A": TEXType.VEC3})
+        checker.check(program)
+        assert checker.assigned_bindings["OUT"] == TEXType.FLOAT
+        # Backward compat property
+        assert checker.inferred_out_type == TEXType.FLOAT
+        r.ok("type checker: output type inference")
+    except Exception as e:
+        r.fail("type checker: output type inference", f"{e}\n{traceback.format_exc()}")
+
+    # ── Type checker: param declaration ──
+    try:
+        code = "f$strength = 0.5;\n@OUT = @A * $strength;"
+        tokens = Lexer(code).tokenize()
+        program = Parser(tokens).parse()
+        checker = TypeChecker(binding_types={"A": TEXType.VEC3, "strength": TEXType.FLOAT})
+        checker.check(program)
+        assert "strength" in checker.param_declarations
+        assert checker.param_declarations["strength"]["type"] == TEXType.FLOAT
+        r.ok("type checker: param declaration")
+    except Exception as e:
+        r.fail("type checker: param declaration", f"{e}\n{traceback.format_exc()}")
+
+    # ── Type checker: param type mismatch ──
+    try:
+        code = 'f$x = "hello";'
+        tokens = Lexer(code).tokenize()
+        program = Parser(tokens).parse()
+        checker = TypeChecker(binding_types={})
+        try:
+            checker.check(program)
+            r.fail("type checker: param type mismatch", "Expected TypeCheckError")
+        except TypeCheckError:
+            r.ok("type checker: param type mismatch")
+    except Exception as e:
+        r.fail("type checker: param type mismatch", f"{e}\n{traceback.format_exc()}")
+
+    # ── Interpreter: multi-output ──
+    try:
+        code = "@result = @A * 0.5;\n@mask = luma(@A);"
+        tokens = Lexer(code).tokenize()
+        program = Parser(tokens).parse()
+        img = torch.rand(1, 4, 4, 3)
+        checker = TypeChecker(binding_types={"A": TEXType.VEC3})
+        type_map = checker.check(program)
+        interp = Interpreter()
+        out = interp.execute(program, {"A": img}, type_map, device="cpu",
+                             output_names=["mask", "result"])
+        assert isinstance(out, dict), f"Expected dict, got {type(out)}"
+        assert "result" in out, "Missing 'result'"
+        assert "mask" in out, "Missing 'mask'"
+        assert out["result"].shape[-1] == 3, f"result should be vec3, got shape {out['result'].shape}"
+        assert out["mask"].dim() == 3, f"mask should be 3D (float), got dim {out['mask'].dim()}"
+        r.ok("interpreter: multi-output")
+    except Exception as e:
+        r.fail("interpreter: multi-output", f"{e}\n{traceback.format_exc()}")
+
+    # ── Interpreter: param as binding ──
+    try:
+        code = "f$strength = 0.5;\n@OUT = @A * $strength;"
+        tokens = Lexer(code).tokenize()
+        program = Parser(tokens).parse()
+        img = torch.ones(1, 2, 2, 3)
+        checker = TypeChecker(binding_types={"A": TEXType.VEC3, "strength": TEXType.FLOAT})
+        type_map = checker.check(program)
+        interp = Interpreter()
+        out = interp.execute(program, {"A": img, "strength": torch.tensor(0.5)}, type_map,
+                             device="cpu")
+        assert torch.allclose(out, torch.full_like(img, 0.5), atol=1e-5), f"Expected 0.5, got {out.mean().item()}"
+        r.ok("interpreter: param as binding")
+    except Exception as e:
+        r.fail("interpreter: param as binding", f"{e}\n{traceback.format_exc()}")
+
+    # ── tex_node: multi-output tuple ──
+    try:
+        from TEX_Wrangle.tex_node import TEXWrangleNode
+        node = TEXWrangleNode()
+        img = torch.rand(1, 4, 4, 3)
+        result = node.execute(
+            "@result = @A * 0.5;\n@mask = luma(@A);",
+            A=img, device="cpu", compile_mode="none"
+        )
+        assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
+        assert len(result) == 8, f"Expected 8 slots, got {len(result)}"
+        # Alphabetical order: "mask" at 0, "result" at 1
+        assert result[0] is not None, "slot 0 (mask) should not be None"
+        assert result[1] is not None, "slot 1 (result) should not be None"
+        assert result[2] is None, "slot 2 should be None (unused)"
+        r.ok("tex_node: multi-output tuple")
+    except Exception as e:
+        r.fail("tex_node: multi-output tuple", f"{e}\n{traceback.format_exc()}")
+
+    # ── tex_node: backward compat (single @OUT) ──
+    try:
+        from TEX_Wrangle.tex_node import TEXWrangleNode
+        node = TEXWrangleNode()
+        img = torch.rand(1, 4, 4, 3)
+        result = node.execute("@OUT = @A * 0.5;", A=img, device="cpu", compile_mode="none")
+        assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
+        assert result[0] is not None, "slot 0 (OUT) should not be None"
+        assert result[1] is None, "slot 1 should be None"
+        r.ok("tex_node: backward compat (@OUT)")
+    except Exception as e:
+        r.fail("tex_node: backward compat (@OUT)", f"{e}\n{traceback.format_exc()}")
+
+    # ── tex_node: old output_type ignored ──
+    try:
+        from TEX_Wrangle.tex_node import TEXWrangleNode
+        node = TEXWrangleNode()
+        img = torch.rand(1, 4, 4, 3)
+        # Passing output_type="IMAGE" — should be silently ignored
+        result = node.execute("@OUT = @A * 0.5;", A=img, device="cpu",
+                              compile_mode="none", output_type="IMAGE")
+        assert result[0] is not None
+        r.ok("tex_node: old output_type ignored")
+    except Exception as e:
+        r.fail("tex_node: old output_type ignored", f"{e}\n{traceback.format_exc()}")
+
+    # ── tex_node: param widgets flow through kwargs ──
+    try:
+        from TEX_Wrangle.tex_node import TEXWrangleNode
+        node = TEXWrangleNode()
+        img = torch.ones(1, 2, 2, 3)
+        # $strength value comes as a kwarg (simulating widget value from ComfyUI)
+        result = node.execute(
+            "f$strength = 0.5;\n@OUT = @A * $strength;",
+            A=img, strength=torch.tensor(0.75), device="cpu", compile_mode="none"
+        )
+        out = result[0]  # OUT is at slot 0 (only output)
+        assert out is not None, "OUT should not be None"
+        # $strength = 0.75 (widget overrides declaration default)
+        assert abs(out.mean().item() - 0.75) < 0.01, f"Expected ~0.75, got {out.mean().item()}"
+        r.ok("tex_node: param kwargs")
+    except Exception as e:
+        r.fail("tex_node: param kwargs", f"{e}\n{traceback.format_exc()}")
+
+    # ── tex_node: param default fallback ──
+    try:
+        from TEX_Wrangle.tex_node import TEXWrangleNode
+        node = TEXWrangleNode()
+        img = torch.ones(1, 2, 2, 3)
+        # No strength kwarg — should use default from code (0.5)
+        result = node.execute(
+            "f$strength = 0.5;\n@OUT = @A * $strength;",
+            A=img, device="cpu", compile_mode="none"
+        )
+        out = result[0]
+        assert out is not None, "OUT should not be None"
+        assert abs(out.mean().item() - 0.5) < 0.01, f"Expected ~0.5, got {out.mean().item()}"
+        r.ok("tex_node: param default fallback")
+    except Exception as e:
+        r.fail("tex_node: param default fallback", f"{e}\n{traceback.format_exc()}")
+
+    # ── tex_node: param widget value as kwarg ──
+    try:
+        from TEX_Wrangle.tex_node import TEXWrangleNode
+        node = TEXWrangleNode()
+        img = torch.ones(1, 2, 2, 3)
+        # Widget value injected as kwarg by graphToPrompt hook (overrides code default)
+        result = node.execute(
+            "f$strength = 0.5;\n@OUT = @A * $strength;",
+            A=img, strength=0.3,
+            device="cpu", compile_mode="none"
+        )
+        out = result[0]
+        assert out is not None, "OUT should not be None"
+        assert abs(out.mean().item() - 0.3) < 0.01, f"Expected ~0.3, got {out.mean().item()}"
+        r.ok("tex_node: param widget value as kwarg")
+    except Exception as e:
+        r.fail("tex_node: param widget value as kwarg", f"{e}\n{traceback.format_exc()}")
+
+    # ── tex_node: param widget overrides code default ──
+    try:
+        from TEX_Wrangle.tex_node import TEXWrangleNode
+        node = TEXWrangleNode()
+        img = torch.ones(1, 2, 2, 3)
+        # Widget value (scalar kwarg) overrides code default of 0.5
+        result = node.execute(
+            "f$strength = 0.5;\n@OUT = @A * $strength;",
+            A=img, strength=0.8,
+            device="cpu", compile_mode="none"
+        )
+        out = result[0]
+        assert out is not None, "OUT should not be None"
+        assert abs(out.mean().item() - 0.8) < 0.01, f"Expected ~0.8 (widget), got {out.mean().item()}"
+        r.ok("tex_node: param widget overrides code default")
+    except Exception as e:
+        r.fail("tex_node: param widget overrides code default", f"{e}\n{traceback.format_exc()}")
+
+    # ── type checker: param default_value extraction ──
+    try:
+        cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
+        code = "f$strength = 0.005;\ni$count = 3;\ns$label = \"hello\";\n@OUT = @A * $strength;"
+        bt = {"A": TEXType.VEC3}
+        program, type_map, refs, assigned, params = cache.compile_tex(code, bt)
+        assert "strength" in params, "Missing 'strength' in params"
+        assert params["strength"]["default_value"] == 0.005, f"Expected 0.005, got {params['strength']['default_value']}"
+        assert params["strength"]["type"] == TEXType.FLOAT
+        assert "count" in params, "Missing 'count' in params"
+        assert params["count"]["default_value"] == 3, f"Expected 3, got {params['count']['default_value']}"
+        assert params["count"]["type"] == TEXType.INT
+        assert "label" in params, "Missing 'label' in params"
+        assert params["label"]["default_value"] == "hello", f"Expected 'hello', got {params['label']['default_value']}"
+        assert params["label"]["type"] == TEXType.STRING
+        r.ok("type checker: param default_value extraction")
+    except Exception as e:
+        r.fail("type checker: param default_value extraction", f"{e}\n{traceback.format_exc()}")
+
+    # ── cache: multi-output compile_tex ──
+    try:
+        cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
+        code = "@result = @A * 0.5;\n@mask = luma(@A);"
+        bt = {"A": TEXType.VEC3}
+        program, type_map, refs, assigned, params = cache.compile_tex(code, bt)
+        assert "result" in assigned, "Missing 'result' in assigned_bindings"
+        assert "mask" in assigned, "Missing 'mask' in assigned_bindings"
+        assert assigned["result"] == TEXType.VEC3
+        assert assigned["mask"] == TEXType.FLOAT
+        r.ok("cache: multi-output compile_tex")
+    except Exception as e:
+        r.fail("cache: multi-output compile_tex", f"{e}\n{traceback.format_exc()}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main():
@@ -4415,6 +4779,7 @@ def main():
     test_image_reductions(r)
     test_matrix_types(r)
     test_matrix_benchmarks(r)
+    test_v03_features(r)
 
     success = r.summary()
     return 0 if success else 1

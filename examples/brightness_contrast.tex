@@ -1,16 +1,29 @@
-// Brightness and contrast adjustment
-// Inputs: @A (IMAGE), @B (FLOAT: brightness, -1 to 1), @C (FLOAT: contrast, 0 to 2)
+// Filmic Adjustments
 
-float brightness = @B;
-float contrast = @C;
+f$exposure = 0.0;   // Exposure in f-stops (-3.0 to 3.0)
+f$contrast = 1.0;     // Power contrast (0.0 to 2.0)
 
-vec3 color = @A.rgb;
+vec3 color = @image.rgb;
 
-// Apply brightness
-color = color + vec3(brightness);
+// 1. Remove sRGB Gamma to get display-referred linear
+vec3 dispLinear = pow(color, 2.2);
 
-// Apply contrast around midpoint
-color = (color - vec3(0.5)) * vec3(contrast) + vec3(0.5);
+// 2. Invert Reinhard Tonemapping to get infinite scene linear
+vec3 safeDispLinear = min(dispLinear, 0.9999);
+vec3 trueLinear = safeDispLinear / (vec3(1.0) - safeDispLinear);
 
-// Clamp to valid range
-@OUT = vec3(clamp(color.r, 0.0, 1.0), clamp(color.g, 0.0, 1.0), clamp(color.b, 0.0, 1.0));
+// 3. Apply Brightness (Stops Multiplier)
+trueLinear = trueLinear * pow2(f$exposure);
+
+// 4. Apply Contrast
+float pivot = 0.22;
+trueLinear = pivot * pow(max(trueLinear / pivot, 0.0), f$contrast);
+
+// 5. Apply Forward Reinhard Tonemapping
+dispLinear = trueLinear / (trueLinear + 1.0);
+
+// 6. Re-apply sRGB Gamma
+color = pow(dispLinear, 1.0 / 2.2);
+
+// Final safety clamp for valid output range
+@OUT = clamp(color, 0.0, 1.0);

@@ -1,15 +1,18 @@
-// Simple box blur using for loops and fetch()
-// Input: @A (IMAGE)
-// Output: IMAGE
+// Box blur with adjustable radius
 //
-// 5x5 kernel (radius 2). Adjust the loop bounds for
-// different blur sizes: radius 1 = 3x3, radius 3 = 7x7.
+// Uses nested for loops and fetch() to average a square kernel.
 // fetch() clamps to image bounds automatically.
+// Adjust $radius: 1 = 3x3, 2 = 5x5, 3 = 7x7.
 
-vec4 sum = vec4(0.0, 0.0, 0.0, 0.0);
-for (int dy = -2; dy <= 2; dy++) {
-    for (int dx = -2; dx <= 2; dx++) {
-        sum += fetch(@A, ix + dx, iy + dy);
+i$radius = 2;
+
+vec3 sum = vec3(0.0, 0.0, 0.0);
+float count = 0.0;
+
+for (int dy = -$radius; dy <= $radius; dy++) {
+    for (int dx = -$radius; dx <= $radius; dx++) {
+        sum += fetch(@image, ix + dx, iy + dy);
+        count += 1.0;
     }
 }
-@OUT = sum / 25.0;
+@OUT = sum / count;
