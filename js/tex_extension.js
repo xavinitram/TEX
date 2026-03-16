@@ -57,7 +57,8 @@ function getCM6() {
 
 // ─── Editor Tracking ─────────────────────────────────────────────────
 
-const texEditors = new WeakMap();  // node → EditorView
+const texEditors    = new WeakMap();  // node → EditorView
+const texEditorMeta = new WeakMap();  // node → { autocompleteCompartment, completionSource }
 
 // ─── Code Parser (inputs, outputs, params) ──────────────────────────
 
@@ -107,11 +108,11 @@ function parseCode(code) {
             defaultValue: m[3]?.trim() || null,
         });
     }
-    // Also find $name references not yet captured
-    const PARAM_REF_RE = /(?:[a-z]\d{0,2})?\$([A-Za-z_]\w*)/g;
+    // Also find $name references not yet captured (preserve type prefix from reference)
+    const PARAM_REF_RE = /([a-z]\d{0,2})?\$([A-Za-z_]\w*)/g;
     while ((m = PARAM_REF_RE.exec(stripped)) !== null) {
-        if (!params.has(m[1]) && !RESERVED_NAMES.has(m[1])) {
-            params.set(m[1], { typeHint: "f", defaultValue: null });
+        if (!params.has(m[2]) && !RESERVED_NAMES.has(m[2])) {
+            params.set(m[2], { typeHint: m[1] || "f", defaultValue: null });
         }
     }
 
@@ -318,7 +319,8 @@ function syncParams(node, params) {
         const typeName = typeHint === "i" ? "INT" : typeHint === "s" ? "STRING" : "FLOAT";
         let widget;
         if (typeHint === "i") {
-            const def = info.defaultValue != null ? parseInt(info.defaultValue) : 0;
+            const parsed = info.defaultValue != null ? parseInt(info.defaultValue) : NaN;
+            const def = Number.isFinite(parsed) ? parsed : 0;
             widget = node.addWidget("number", name, def, () => {}, {
                 min: -9999, max: 9999, step: 1, precision: 0,
             });
@@ -328,7 +330,8 @@ function syncParams(node, params) {
             widget = node.addWidget("text", name, def, () => {});
         } else {
             // float (default)
-            const def = info.defaultValue != null ? parseFloat(info.defaultValue) : 0.0;
+            const parsed = info.defaultValue != null ? parseFloat(info.defaultValue) : NaN;
+            const def = Number.isFinite(parsed) ? parsed : 0.0;
             widget = node.addWidget("number", name, def, () => {}, {
                 min: -9999, max: 9999, step: 0.01, precision: 3,
             });
@@ -473,6 +476,7 @@ function createTexEditor(node, codeWidget) {
 
     // Build the editor
     try {
+        const autocompleteCompartment = new CM6.Compartment();
         const completionSource = CM6.createTexCompletions(getBindings, getParams);
 
         const editor = new CM6.EditorView({
@@ -486,11 +490,12 @@ function createTexEditor(node, codeWidget) {
                     // Theme
                     CM6.texEditorTheme,
                     CM6.texHighlightStyle,
-                    // Autocomplete
-                    CM6.autocompletion({
-                        override: [completionSource],
-                        activateOnTyping: true,
-                    }),
+                    // Autocomplete (wrapped in Compartment for live toggling)
+                    autocompleteCompartment.of(
+                        app.ui.settings.getSettingValue("TEX.Editor.autocomplete", true)
+                            ? CM6.autocompletion({ override: [completionSource], activateOnTyping: true })
+                            : []
+                    ),
                     // Tooltip positioning: use absolute to avoid the
                     // position:fixed-inside-transform:scale() bug in
                     // ComfyUI Desktop's widget containers.
@@ -571,6 +576,7 @@ function createTexEditor(node, codeWidget) {
         });
 
         texEditors.set(node, editor);
+        texEditorMeta.set(node, { autocompleteCompartment, completionSource });
 
         // Store container and editor references on node for external access
         node._texEditorContainer = container;
@@ -888,6 +894,89 @@ app.registerExtension({
             }
             return result;
         };
+
+        // ── Dynamic styles: font size + line numbers ──────────────────────
+        const dynStyle = document.createElement("style");
+        dynStyle.id = "tex-dynamic-styles";
+        document.head.appendChild(dynStyle);
+
+        let _texFontSize    = 14;
+        let _texLineNumbers = true;
+
+        function _updateDynStyles() {
+            let css = `
+        .tex-cm-container .cm-editor,
+        .tex-cm-container .cm-editor .cm-content,
+        .tex-cm-container .cm-editor .cm-line,
+        .tex-cm-container .cm-editor .cm-content * {
+            font-size: ${_texFontSize}px !important;
+        }`;
+            if (!_texLineNumbers) {
+                css += `
+        .tex-cm-container .cm-lineNumbers,
+        .tex-cm-container .cm-gutter.cm-lineNumbers {
+            display: none !important;
+        }`;
+            }
+            dynStyle.textContent = css;
+        }
+
+        // Apply saved values immediately on load
+        _texFontSize    = app.ui.settings.getSettingValue("TEX.Editor.fontSize",    14);
+        _texLineNumbers = app.ui.settings.getSettingValue("TEX.Editor.lineNumbers", true);
+        _updateDynStyles();
+
+        // Font size slider (8 – 24 px)
+        app.ui.settings.addSetting({
+            id:           "TEX.Editor.fontSize",
+            name:         "TEX Editor: Font Size",
+            type:         "slider",
+            defaultValue: 14,
+            min:  8,
+            max:  24,
+            step: 1,
+            onChange(val) {
+                _texFontSize = val;
+                _updateDynStyles();
+            },
+        });
+
+        // Line-number gutter toggle
+        app.ui.settings.addSetting({
+            id:           "TEX.Editor.lineNumbers",
+            name:         "TEX Editor: Show Line Numbers",
+            type:         "boolean",
+            defaultValue: true,
+            onChange(val) {
+                _texLineNumbers = val;
+                _updateDynStyles();
+            },
+        });
+
+        // Autocomplete toggle — reconfigures every open editor live
+        app.ui.settings.addSetting({
+            id:           "TEX.Editor.autocomplete",
+            name:         "TEX Editor: Autocomplete",
+            type:         "boolean",
+            defaultValue: true,
+            onChange(val) {
+                loadCM6().then(CM6 => {
+                    if (!app.graph?._nodes) return;
+                    for (const n of app.graph._nodes) {
+                        const meta   = texEditorMeta.get(n);
+                        const editor = texEditors.get(n);
+                        if (!meta || !editor) continue;
+                        editor.dispatch({
+                            effects: meta.autocompleteCompartment.reconfigure(
+                                val
+                                    ? CM6.autocompletion({ override: [meta.completionSource], activateOnTyping: true })
+                                    : []
+                            ),
+                        });
+                    }
+                });
+            },
+        });
     },
 
     async beforeRegisterNodeDef(nodeType, nodeData, appRef) {
