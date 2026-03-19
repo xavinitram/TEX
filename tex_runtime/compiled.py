@@ -158,21 +158,23 @@ def execute_compiled(
     device: str | torch.device,
     fingerprint: str,
     latent_channel_count: int = 0,
-) -> torch.Tensor:
+    output_names: list[str] | None = None,
+) -> torch.Tensor | dict:
     """
     Execute a TEX program with optional torch.compile acceleration.
 
     Falls back to the plain interpreter on any failure.
 
     Args:
-        program:     Parsed AST (Program node).
-        bindings:    Mapping of @ binding names to tensor / scalar values.
-        type_map:    AST node id -> TEXType (from type checker).
-        device:      Target device ("cpu", "cuda", "cuda:0", …).
-        fingerprint: Cache key produced by TEXCache.fingerprint().
+        program:      Parsed AST (Program node).
+        bindings:     Mapping of @ binding names to tensor / scalar values.
+        type_map:     AST node id -> TEXType (from type checker).
+        device:       Target device ("cpu", "cuda", "cuda:0", …).
+        fingerprint:  Cache key produced by TEXCache.fingerprint().
+        output_names: List of named outputs for multi-output programs.
 
     Returns:
-        The @OUT tensor result.
+        The @OUT tensor result, or a dict of {name: tensor} for multi-output.
     """
     device_obj = torch.device(device)
     device_type = device_obj.type  # "cpu" or "cuda"
@@ -183,13 +185,15 @@ def execute_compiled(
         compiled_fn = _try_compile(cache_key, device_type)
         if compiled_fn is None:
             # torch.compile not available / all backends failed
-            return _plain_execute(program, bindings, type_map, device, latent_channel_count)
+            return _plain_execute(program, bindings, type_map, device,
+                                  latent_channel_count, output_names)
         _compiled_cache[cache_key] = compiled_fn
 
     compiled_fn = _compiled_cache[cache_key]
 
     try:
-        return compiled_fn(program, bindings, type_map, device, latent_channel_count)
+        return compiled_fn(program, bindings, type_map, device,
+                           latent_channel_count, output_names)
     except Exception as e:
         _show_once(
             f"compile_exec_fail_{fingerprint[:12]}",
@@ -198,7 +202,8 @@ def execute_compiled(
         )
         # Remove the broken entry so next call retries or falls back
         _compiled_cache.pop(cache_key, None)
-        return _plain_execute(program, bindings, type_map, device, latent_channel_count)
+        return _plain_execute(program, bindings, type_map, device,
+                              latent_channel_count, output_names)
 
 
 def _plain_execute(
@@ -207,11 +212,13 @@ def _plain_execute(
     type_map: dict,
     device: str | torch.device,
     latent_channel_count: int = 0,
-) -> torch.Tensor:
+    output_names: list[str] | None = None,
+) -> torch.Tensor | dict:
     """Execute without torch.compile (standard tree-walking interpreter)."""
     interp = Interpreter()
     return interp.execute(program, bindings, type_map, device=device,
-                          latent_channel_count=latent_channel_count)
+                          latent_channel_count=latent_channel_count,
+                          output_names=output_names)
 
 
 def _try_compile(
@@ -234,10 +241,11 @@ def _try_compile(
         )
         return None
 
-    def _interp_fn(program, bindings, type_map, device, latent_channel_count=0):
+    def _interp_fn(program, bindings, type_map, device, latent_channel_count=0, output_names=None):
         interp = Interpreter()
         return interp.execute(program, bindings, type_map, device=device,
-                              latent_channel_count=latent_channel_count)
+                              latent_channel_count=latent_channel_count,
+                              output_names=output_names)
 
     try:
         # Configure torch.compile cache directory if the cache is available

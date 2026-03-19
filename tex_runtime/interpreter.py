@@ -23,7 +23,7 @@ from ..tex_compiler.ast_nodes import (
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP
-from .stdlib import TEXStdlib
+from .stdlib import TEXStdlib, SAFE_EPSILON
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
@@ -755,9 +755,9 @@ class Interpreter:
         elif op == "*":
             return left * right
         elif op == "/":
-            return left / (right + 1e-10 * (right == 0).float())
+            return left / (right + SAFE_EPSILON * (right == 0).float())
         elif op == "%":
-            return torch.fmod(left, right + 1e-10 * (right == 0).float())
+            return torch.fmod(left, right + SAFE_EPSILON * (right == 0).float())
         elif op == "==":
             return (left == right).float()
         elif op == "!=":

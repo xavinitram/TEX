@@ -1301,6 +1301,64 @@ def test_torch_compile(r: TestResult):
     except Exception as e:
         r.fail("torch_compile: for-loop graph breaks", f"{e}\n{traceback.format_exc()}")
 
+    # Multi-output program via execute_compiled
+    try:
+        mo_code = "@mask = vec4(1.0, 1.0, 1.0, 1.0);\n@result = @A * 0.5;"
+        mo_bt = {"A": TEXType.VEC4, "mask": TEXType.VEC4, "result": TEXType.VEC4}
+        mo_cache = TEXCache()
+        mo_prog, mo_tm, mo_refs, *_ = mo_cache.compile_tex(mo_code, mo_bt)
+        mo_fp = mo_cache.fingerprint(mo_code, mo_bt)
+
+        mo_result = execute_compiled(
+            mo_prog, {"A": test_img}, mo_tm, "cpu", mo_fp,
+            output_names=["mask", "result"]
+        )
+        assert isinstance(mo_result, dict), f"Expected dict, got {type(mo_result)}"
+        assert "mask" in mo_result, "Missing 'mask' in multi-output result"
+        assert "result" in mo_result, "Missing 'result' in multi-output result"
+        assert torch.allclose(mo_result["result"], test_img * 0.5, atol=1e-5)
+        r.ok("torch_compile: multi-output")
+    except Exception as e:
+        r.fail("torch_compile: multi-output", f"{e}\n{traceback.format_exc()}")
+
+
+# ── IS_CHANGED Hash Tests ─────────────────────────────────────────────
+
+def test_is_changed_hash(r: TestResult):
+    print("\n--- IS_CHANGED Hash Tests ---")
+
+    from TEX_Wrangle.tex_node import _tensor_fingerprint
+
+    # Same-shape tensors with different content → different fingerprints
+    try:
+        t1 = torch.zeros(1, 4, 4, 3)
+        t2 = torch.ones(1, 4, 4, 3)
+        fp1 = _tensor_fingerprint(t1)
+        fp2 = _tensor_fingerprint(t2)
+        assert fp1 != fp2, "Different tensors should produce different fingerprints"
+        r.ok("is_changed: different tensors produce different fingerprints")
+    except Exception as e:
+        r.fail("is_changed: different tensors produce different fingerprints", f"{e}\n{traceback.format_exc()}")
+
+    # Same tensor → same fingerprint (stability)
+    try:
+        t = torch.rand(1, 8, 8, 3)
+        fp_a = _tensor_fingerprint(t)
+        fp_b = _tensor_fingerprint(t)
+        assert fp_a == fp_b, "Same tensor should produce same fingerprint"
+        r.ok("is_changed: same tensor produces stable fingerprint")
+    except Exception as e:
+        r.fail("is_changed: same tensor produces stable fingerprint", f"{e}\n{traceback.format_exc()}")
+
+    # Large tensor still works (stride sampling)
+    try:
+        t_large = torch.rand(2, 512, 512, 4)
+        fp = _tensor_fingerprint(t_large)
+        assert "512" in fp, "Fingerprint should contain shape info"
+        r.ok("is_changed: large tensor fingerprint")
+    except Exception as e:
+        r.fail("is_changed: large tensor fingerprint", f"{e}\n{traceback.format_exc()}")
+
 
 # ── Sampling Function Tests ────────────────────────────────────────────
 
@@ -1978,8 +2036,9 @@ def test_stdlib_extended(r: TestResult):
     check_val("radians", "float x = radians(180.0);\n@OUT = vec3(x, x, x);", math.pi)
 
     # isnan / isinf return 0.0 or 1.0
-    check_val("isnan", "float x = isnan(sqrt(-1.0));\n@OUT = vec3(x, x, x);", 1.0)
-    check_val("isinf", "float x = isinf(log(0.0));\n@OUT = vec3(x, x, x);", 1.0)
+    # Use pow(-1,0.5) to produce NaN, and pow(0,-1) to produce Inf (raw pow is unclamped)
+    check_val("isnan", "float x = isnan(pow(-1.0, 0.5));\n@OUT = vec3(x, x, x);", 1.0)
+    check_val("isinf", "float x = isinf(pow(0.0, -1.0));\n@OUT = vec3(x, x, x);", 1.0)
 
     # spow: safe power — sign(x) * pow(abs(x), y)
     check_val("spow", "float x = spow(-2.0, 3.0);\n@OUT = vec3(x, x, x);", -8.0)
@@ -1996,34 +2055,51 @@ def test_numerical_edge_cases(r: TestResult):
     B, H, W = 1, 2, 2
     test_img = torch.rand(B, H, W, 3)
 
-    # sqrt(-1) is NaN
+    # sqrt(-1) clamped to 0
     try:
         code = "float x = sqrt(-1.0);\n@OUT = vec3(x, x, x);"
         result = compile_and_run(code, {"A": test_img})
-        assert torch.isnan(result[0, 0, 0, 0]), "sqrt(-1) should be NaN"
-        r.ok("edge: sqrt(-1) is NaN")
+        val = result[0, 0, 0, 0].item()
+        assert abs(val) < 1e-5, f"sqrt(-1) should be clamped to 0, got {val}"
+        r.ok("edge: sqrt(-1) clamped to 0")
     except Exception as e:
-        r.fail("edge: sqrt(-1) is NaN", f"{e}\n{traceback.format_exc()}")
+        r.fail("edge: sqrt(-1) clamped to 0", f"{e}\n{traceback.format_exc()}")
 
-    # log(0) is -Inf
+    # log(0) clamped to log(SAFE_EPSILON)
     try:
+        import math
         code = "float x = log(0.0);\n@OUT = vec3(x, x, x);"
         result = compile_and_run(code, {"A": test_img})
-        assert torch.isinf(result[0, 0, 0, 0]), "log(0) should be -Inf"
-        r.ok("edge: log(0) is -Inf")
+        val = result[0, 0, 0, 0].item()
+        expected_val = math.log(1e-8)  # ~-18.42
+        assert not torch.isinf(result[0, 0, 0, 0]), f"log(0) should not be -Inf, got {val}"
+        assert abs(val - expected_val) < 0.1, f"log(0) should be ~{expected_val:.2f}, got {val}"
+        r.ok("edge: log(0) clamped to finite")
     except Exception as e:
-        r.fail("edge: log(0) is -Inf", f"{e}\n{traceback.format_exc()}")
+        r.fail("edge: log(0) clamped to finite", f"{e}\n{traceback.format_exc()}")
 
-    # asin(2) is NaN
+    # asin(2) clamped to asin(1) = pi/2
     try:
+        import math
         code = "float x = asin(2.0);\n@OUT = vec3(x, x, x);"
         result = compile_and_run(code, {"A": test_img})
-        assert torch.isnan(result[0, 0, 0, 0]), "asin(2) should be NaN"
-        r.ok("edge: asin(2) is NaN")
+        val = result[0, 0, 0, 0].item()
+        assert abs(val - math.pi / 2) < 1e-4, f"asin(2) should be ~pi/2, got {val}"
+        r.ok("edge: asin(2) clamped to pi/2")
     except Exception as e:
-        r.fail("edge: asin(2) is NaN", f"{e}\n{traceback.format_exc()}")
+        r.fail("edge: asin(2) clamped to pi/2", f"{e}\n{traceback.format_exc()}")
 
-    # pow(0, -1) is Inf
+    # acos(2) clamped to acos(1) = 0
+    try:
+        code = "float x = acos(2.0);\n@OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": test_img})
+        val = result[0, 0, 0, 0].item()
+        assert abs(val) < 1e-4, f"acos(2) should be ~0.0, got {val}"
+        r.ok("edge: acos(2) clamped to 0")
+    except Exception as e:
+        r.fail("edge: acos(2) clamped to 0", f"{e}\n{traceback.format_exc()}")
+
+    # pow(0, -1) is Inf — standard pow is unchanged
     try:
         code = "float x = pow(0.0, -1.0);\n@OUT = vec3(x, x, x);"
         result = compile_and_run(code, {"A": test_img})
@@ -2031,6 +2107,58 @@ def test_numerical_edge_cases(r: TestResult):
         r.ok("edge: pow(0,-1) is Inf")
     except Exception as e:
         r.fail("edge: pow(0,-1) is Inf", f"{e}\n{traceback.format_exc()}")
+
+    # spow(0, -1) returns 0 (safe power)
+    try:
+        code = "float x = spow(0.0, -1.0);\n@OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": test_img})
+        val = result[0, 0, 0, 0].item()
+        assert abs(val) < 1e-4, f"spow(0,-1) should be 0, got {val}"
+        r.ok("edge: spow(0,-1) is 0")
+    except Exception as e:
+        r.fail("edge: spow(0,-1) is 0", f"{e}\n{traceback.format_exc()}")
+
+    # sdiv(1, 0) returns 0 (safe division)
+    try:
+        code = "float x = sdiv(1.0, 0.0);\n@OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": test_img})
+        val = result[0, 0, 0, 0].item()
+        assert abs(val) < 1e-4, f"sdiv(1,0) should be 0, got {val}"
+        r.ok("edge: sdiv(1,0) is 0")
+    except Exception as e:
+        r.fail("edge: sdiv(1,0) is 0", f"{e}\n{traceback.format_exc()}")
+
+    # mod(5, 0) returns finite (not NaN)
+    try:
+        code = "float x = mod(5.0, 0.0);\n@OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": test_img})
+        val = result[0, 0, 0, 0].item()
+        assert not torch.isnan(result[0, 0, 0, 0]), f"mod(5,0) should not be NaN, got {val}"
+        r.ok("edge: mod(5,0) is finite")
+    except Exception as e:
+        r.fail("edge: mod(5,0) is finite", f"{e}\n{traceback.format_exc()}")
+
+    # log2(0) clamped to finite
+    try:
+        import math
+        code = "float x = log2(0.0);\n@OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": test_img})
+        val = result[0, 0, 0, 0].item()
+        assert not torch.isinf(result[0, 0, 0, 0]), f"log2(0) should not be -Inf, got {val}"
+        r.ok("edge: log2(0) clamped to finite")
+    except Exception as e:
+        r.fail("edge: log2(0) clamped to finite", f"{e}\n{traceback.format_exc()}")
+
+    # log10(0) clamped to finite
+    try:
+        import math
+        code = "float x = log10(0.0);\n@OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": test_img})
+        val = result[0, 0, 0, 0].item()
+        assert not torch.isinf(result[0, 0, 0, 0]), f"log10(0) should not be -Inf, got {val}"
+        r.ok("edge: log10(0) clamped to finite")
+    except Exception as e:
+        r.fail("edge: log10(0) clamped to finite", f"{e}\n{traceback.format_exc()}")
 
     # Modulo operator
     try:
@@ -4765,6 +4893,7 @@ def main():
     test_stdlib_coverage(r)
     test_stdlib_extended(r)
     test_numerical_edge_cases(r)
+    test_is_changed_hash(r)
     test_swizzle_patterns(r)
     test_performance(r)
     test_cache_eviction(r)

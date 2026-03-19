@@ -46,6 +46,14 @@ class ContainsAnyDict(dict):
             return (ANY_TYPE,)
 
 
+def _tensor_fingerprint(t: torch.Tensor) -> str:
+    """Sample 256 evenly-spaced values from a tensor for fast hashing."""
+    flat = t.flatten()
+    stride = max(1, len(flat) // 256)
+    samples = flat[::stride][:256]
+    return f"{t.shape}:{t.dtype}:{samples.cpu().tolist()}"
+
+
 def _unwrap_latent(value: dict) -> tuple[torch.Tensor, dict]:
     """
     Unwrap a ComfyUI LATENT dict into a channel-last tensor + metadata.
@@ -269,12 +277,17 @@ class TEXWrangleNode:
             val = kwargs[name]
             if val is not None:
                 if isinstance(val, list):
-                    parts.append(f"{name}:LIST:{len(val)}")
+                    list_parts = []
+                    for item in val:
+                        if isinstance(item, torch.Tensor):
+                            list_parts.append(_tensor_fingerprint(item))
+                        else:
+                            list_parts.append(str(item))
+                    parts.append(f"{name}:LIST:{','.join(list_parts)}")
                 elif isinstance(val, dict) and "samples" in val:
-                    s = val["samples"]
-                    parts.append(f"{name}:LATENT:{s.shape}:{s.dtype}:{s.device}")
+                    parts.append(f"{name}:LATENT:{_tensor_fingerprint(val['samples'])}")
                 elif isinstance(val, torch.Tensor):
-                    parts.append(f"{name}:{val.shape}:{val.dtype}:{val.device}")
+                    parts.append(f"{name}:{_tensor_fingerprint(val)}")
                 else:
                     parts.append(f"{name}:{val}")
         return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()
@@ -360,7 +373,8 @@ class TEXWrangleNode:
             if compile_mode == "torch_compile":
                 fp = cache.fingerprint(code, binding_types)
                 raw_output = execute_compiled(program, bindings, type_map, device, fp,
-                                              latent_channel_count=latent_channel_count)
+                                              latent_channel_count=latent_channel_count,
+                                              output_names=output_names)
                 # torch_compile returns single value — wrap for compat
                 if not isinstance(raw_output, dict):
                     raw_output = {output_names[0]: raw_output}

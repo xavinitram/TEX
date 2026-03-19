@@ -9,6 +9,11 @@ import math
 import re
 import torch
 
+# Unified safety epsilon for division guards, domain clamping, and near-zero checks.
+# Chosen to be well above float32 machine epsilon (~1.2e-7) while small enough
+# to be invisible in image-processing contexts.
+SAFE_EPSILON = 1e-8
+
 
 class TEXStdlib:
     """Registry of built-in TEX functions."""
@@ -142,11 +147,11 @@ class TEXStdlib:
 
     @staticmethod
     def fn_asin(x):
-        return torch.asin(_to_tensor(x))
+        return torch.asin(torch.clamp(_to_tensor(x), -1.0, 1.0))
 
     @staticmethod
     def fn_acos(x):
-        return torch.acos(_to_tensor(x))
+        return torch.acos(torch.clamp(_to_tensor(x), -1.0, 1.0))
 
     @staticmethod
     def fn_atan(x):
@@ -158,7 +163,7 @@ class TEXStdlib:
 
     @staticmethod
     def fn_sqrt(x):
-        return torch.sqrt(_to_tensor(x))
+        return torch.sqrt(torch.clamp(_to_tensor(x), min=0.0))
 
     @staticmethod
     def fn_pow(base, exp):
@@ -170,7 +175,7 @@ class TEXStdlib:
 
     @staticmethod
     def fn_log(x):
-        return torch.log(_to_tensor(x))
+        return torch.log(torch.clamp(_to_tensor(x), min=SAFE_EPSILON))
 
     @staticmethod
     def fn_abs(x):
@@ -199,15 +204,17 @@ class TEXStdlib:
 
     @staticmethod
     def fn_mod(a, b):
-        return torch.fmod(_to_tensor(a), _to_tensor(b))
+        a_t, b_t = _to_tensor(a), _to_tensor(b)
+        safe_b = b_t + SAFE_EPSILON * (b_t == 0).float()
+        return torch.fmod(a_t, safe_b)
 
     @staticmethod
     def fn_log2(x):
-        return torch.log2(_to_tensor(x))
+        return torch.log2(torch.clamp(_to_tensor(x), min=SAFE_EPSILON))
 
     @staticmethod
     def fn_log10(x):
-        return torch.log10(_to_tensor(x))
+        return torch.log10(torch.clamp(_to_tensor(x), min=SAFE_EPSILON))
 
     @staticmethod
     def fn_pow2(x):
@@ -253,13 +260,19 @@ class TEXStdlib:
     def fn_spow(x, y):
         """Safe power — sign(x) * pow(abs(x), y). Avoids NaN on negative bases."""
         t = _to_tensor(x)
-        return torch.sign(t) * torch.pow(torch.abs(t), _to_tensor(y))
+        yt = _to_tensor(y)
+        abs_t = torch.abs(t)
+        mask = abs_t < SAFE_EPSILON
+        safe_abs = torch.where(mask, torch.full_like(abs_t, SAFE_EPSILON), abs_t)
+        return torch.where(mask, torch.zeros_like(t), torch.sign(t) * torch.pow(safe_abs, yt))
 
     @staticmethod
     def fn_sdiv(a, b):
-        """Safe division — returns 0.0 where abs(b) < 1e-10."""
+        """Safe division — returns 0.0 where abs(b) < SAFE_EPSILON."""
         a_t, b_t = _to_tensor(a), _to_tensor(b)
-        return torch.where(torch.abs(b_t) < 1e-10, torch.zeros_like(a_t), a_t / b_t)
+        mask = torch.abs(b_t) < SAFE_EPSILON
+        safe_b = torch.where(mask, torch.ones_like(b_t), b_t)
+        return torch.where(mask, torch.zeros_like(a_t), a_t / safe_b)
 
     # -- Matrix operations ----------------------------------------------
 
@@ -302,13 +315,13 @@ class TEXStdlib:
         v = _to_tensor(val)
         o_min, o_max = _to_tensor(old_min), _to_tensor(old_max)
         n_min, n_max = _to_tensor(new_min), _to_tensor(new_max)
-        t = (v - o_min) / (o_max - o_min + 1e-8)
+        t = (v - o_min) / (o_max - o_min + SAFE_EPSILON)
         return n_min + t * (n_max - n_min)
 
     @staticmethod
     def fn_smoothstep(edge0, edge1, x):
         e0, e1, xv = _to_tensor(edge0), _to_tensor(edge1), _to_tensor(x)
-        t = torch.clamp((xv - e0) / (e1 - e0 + 1e-8), 0.0, 1.0)
+        t = torch.clamp((xv - e0) / (e1 - e0 + SAFE_EPSILON), 0.0, 1.0)
         return t * t * (3.0 - 2.0 * t)
 
     @staticmethod
@@ -343,7 +356,7 @@ class TEXStdlib:
         t = _to_tensor(v)
         if t.dim() >= 1 and t.shape[-1] in (3, 4):
             norm = torch.sqrt((t * t).sum(dim=-1, keepdim=True))
-            return t / (norm + 1e-8)
+            return t / (norm + SAFE_EPSILON)
         return torch.sign(t)
 
     @staticmethod
@@ -411,7 +424,7 @@ class TEXStdlib:
 
         cmax = torch.maximum(torch.maximum(r, g), b)
         cmin = torch.minimum(torch.minimum(r, g), b)
-        diff = cmax - cmin + 1e-8
+        diff = cmax - cmin + SAFE_EPSILON
 
         # Hue
         h = torch.where(cmax == r, torch.fmod((g - b) / diff, 6.0),
@@ -421,7 +434,7 @@ class TEXStdlib:
         h = torch.fmod(h + 1.0, 1.0)  # ensure positive
 
         # Saturation
-        s = torch.where(cmax > 1e-8, diff / cmax, torch.zeros_like(cmax))
+        s = torch.where(cmax > SAFE_EPSILON, diff / cmax, torch.zeros_like(cmax))
 
         # Value
         v = cmax
@@ -739,7 +752,7 @@ class TEXStdlib:
                 weight_sum = weight_sum + w
 
         # Normalize (avoids edge darkening from clamped kernels)
-        return result / (weight_sum + 1e-8)
+        return result / (weight_sum + SAFE_EPSILON)
 
     # -- Noise functions ------------------------------------------------
 
@@ -1018,8 +1031,8 @@ def _lanczos3(x: torch.Tensor) -> torch.Tensor:
     # sinc(x) = sin(pi*x) / (pi*x), with sinc(0) = 1
     pix = math.pi * x
     pix3 = pix / 3.0
-    sinc_x = torch.where(ax < 1e-7, torch.ones_like(x), torch.sin(pix) / (pix + 1e-8))
-    sinc_x3 = torch.where(ax < 1e-7, torch.ones_like(x), torch.sin(pix3) / (pix3 + 1e-8))
+    sinc_x = torch.where(ax < SAFE_EPSILON, torch.ones_like(x), torch.sin(pix) / (pix + SAFE_EPSILON))
+    sinc_x3 = torch.where(ax < SAFE_EPSILON, torch.ones_like(x), torch.sin(pix3) / (pix3 + SAFE_EPSILON))
     kernel = sinc_x * sinc_x3
     # Zero out beyond support radius of 3
     return torch.where(ax < 3.0, kernel, torch.zeros_like(kernel))
