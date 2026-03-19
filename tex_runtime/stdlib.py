@@ -5,6 +5,7 @@ All functions operate on PyTorch tensors. Scalars are represented as
 0-dim tensors or Python floats and get broadcast automatically by PyTorch.
 """
 from __future__ import annotations
+import hashlib
 import math
 import re
 import torch
@@ -107,6 +108,20 @@ class TEXStdlib:
             "to_int": TEXStdlib.fn_to_int,
             "to_float": TEXStdlib.fn_to_float,
             "sanitize_filename": TEXStdlib.fn_sanitize_filename,
+            "split": TEXStdlib.fn_split,
+            "lstrip": TEXStdlib.fn_lstrip,
+            "rstrip": TEXStdlib.fn_rstrip,
+            "pad_left": TEXStdlib.fn_pad_left,
+            "pad_right": TEXStdlib.fn_pad_right,
+            "format": TEXStdlib.fn_format,
+            "repeat": TEXStdlib.fn_repeat,
+            "str_reverse": TEXStdlib.fn_str_reverse,
+            "count": TEXStdlib.fn_count,
+            "matches": TEXStdlib.fn_matches,
+            "hash": TEXStdlib.fn_hash,
+            "hash_float": TEXStdlib.fn_hash_float,
+            "hash_int": TEXStdlib.fn_hash_int,
+            "char_at": TEXStdlib.fn_char_at,
 
             # Array operations
             "sort": TEXStdlib.fn_sort,
@@ -695,12 +710,16 @@ class TEXStdlib:
 
         Lanczos-3 uses a 6x6 pixel neighborhood with sinc-based weights
         for the sharpest reconstruction with minimal ringing.
+
+        Fully vectorized: all 36 taps are gathered and weighted in batched
+        tensor ops with no Python loops.
         """
         img = _to_tensor(image)
         u = _to_tensor(u_coord)
         v = _to_tensor(v_coord)
 
         B, H, W, C = img.shape
+        dev = img.device
 
         # Convert from [0, 1] to pixel coordinates
         x = u * (W - 1)
@@ -726,30 +745,34 @@ class TEXStdlib:
             x_center = x_center.unsqueeze(0).expand(B, H, W)
             y_center = y_center.unsqueeze(0).expand(B, H, W)
 
-        b_idx = torch.arange(B, device=img.device).view(B, 1, 1).expand(B, H, W)
+        # Tap offsets: -2, -1, 0, 1, 2, 3 (6 taps for Lanczos-3)
+        taps = torch.arange(-2, 4, device=dev, dtype=torch.float32)  # [6]
 
-        # Lanczos-3: 6 taps centered around the sample point (-2..+3)
-        # Separable: compute x-weights and y-weights independently, then combine
-        result = torch.zeros(B, H, W, C, device=img.device)
-        weight_sum = torch.zeros(B, H, W, 1, device=img.device)
+        # Compute 1-D Lanczos weights for x and y (separable)
+        # fx/fy: [B, H, W] → [B, H, W, 1] - taps: [6] → weights: [B, H, W, 6]
+        wx = _lanczos3(fx.unsqueeze(-1) - taps)  # [B, H, W, 6]
+        wy = _lanczos3(fy.unsqueeze(-1) - taps)  # [B, H, W, 6]
 
-        for j in range(-2, 4):  # 6 vertical taps
-            wy = _lanczos3(fy - j)  # [B, H, W]
+        # 2-D weights via outer product: [B, H, W, 6, 6]
+        weights_2d = wy.unsqueeze(-1) * wx.unsqueeze(-2)  # [B,H,W,6(y),6(x)]
 
-            for i in range(-2, 4):  # 6 horizontal taps
-                wx = _lanczos3(fx - i)  # [B, H, W]
+        # Pixel coordinates for all 36 taps, clamped to image bounds
+        # x_center: [B,H,W] → [B,H,W,1] + taps → [B,H,W,6]
+        px_all = torch.clamp((x_center.unsqueeze(-1) + taps).long(), 0, W - 1)  # [B,H,W,6]
+        py_all = torch.clamp((y_center.unsqueeze(-1) + taps).long(), 0, H - 1)  # [B,H,W,6]
 
-                # Pixel coordinates, clamped to bounds
-                px = torch.clamp((x_center + i).long(), 0, W - 1)
-                py = torch.clamp((y_center + j).long(), 0, H - 1)
+        # Gather all 36 neighbor pixels in one advanced-indexing op
+        # Build full index grids: [B,H,W,6(y),6(x)]
+        b_idx = torch.arange(B, device=dev).view(B, 1, 1, 1, 1).expand(B, H, W, 6, 6)
+        py_grid = py_all.unsqueeze(-1).expand(B, H, W, 6, 6)  # y taps along dim 3
+        px_grid = px_all.unsqueeze(-2).expand(B, H, W, 6, 6)  # x taps along dim 4
 
-                # Fetch pixel
-                pixel = img[b_idx, py, px]  # [B, H, W, C]
+        pixels = img[b_idx, py_grid, px_grid]  # [B, H, W, 6, 6, C]
 
-                # Combined weight
-                w = (wx * wy).unsqueeze(-1)  # [B, H, W, 1]
-                result = result + pixel * w
-                weight_sum = weight_sum + w
+        # Apply weights and sum: [B,H,W,6,6,1] * [B,H,W,6,6,C] → sum → [B,H,W,C]
+        w = weights_2d.unsqueeze(-1)  # [B, H, W, 6, 6, 1]
+        result = (pixels * w).sum(dim=(3, 4))  # [B, H, W, C]
+        weight_sum = w.sum(dim=(3, 4))  # [B, H, W, 1]
 
         # Normalize (avoids edge darkening from clamped kernels)
         return result / (weight_sum + SAFE_EPSILON)
@@ -799,10 +822,13 @@ class TEXStdlib:
         raise ValueError("len() expects a string or array argument")
 
     @staticmethod
-    def fn_replace(s, old, new):
-        """Replace all occurrences of old with new."""
+    def fn_replace(s, old, new, max_count=None):
+        """Replace occurrences of old with new. Optional max_count limits replacements."""
         if not all(isinstance(x, str) for x in (s, old, new)):
-            raise ValueError("replace() expects three string arguments")
+            raise ValueError("replace() expects string arguments for s, old, new")
+        if max_count is not None:
+            n = int(max_count.item() if isinstance(max_count, torch.Tensor) else max_count)
+            return s.replace(old, new, n)
         return s.replace(old, new)
 
     @staticmethod
@@ -893,6 +919,161 @@ class TEXStdlib:
         cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', s)
         cleaned = cleaned.strip('. ')
         return cleaned if cleaned else "unnamed"
+
+    @staticmethod
+    def fn_split(s, delimiter, max_splits=None):
+        """Split string by delimiter. Returns a list of strings."""
+        if not isinstance(s, str):
+            raise ValueError("split() expects a string first argument")
+        if not isinstance(delimiter, str):
+            raise ValueError("split() delimiter must be a string")
+        if max_splits is not None:
+            n = int(max_splits.item() if isinstance(max_splits, torch.Tensor) else max_splits)
+            return s.split(delimiter, n)
+        return s.split(delimiter)
+
+    @staticmethod
+    def fn_lstrip(s):
+        """Trim leading whitespace."""
+        if not isinstance(s, str):
+            raise ValueError("lstrip() expects a string argument")
+        return s.lstrip()
+
+    @staticmethod
+    def fn_rstrip(s):
+        """Trim trailing whitespace."""
+        if not isinstance(s, str):
+            raise ValueError("rstrip() expects a string argument")
+        return s.rstrip()
+
+    @staticmethod
+    def fn_pad_left(s, width, char=None):
+        """Pad string on the left to reach target width. Default pad char is space."""
+        if not isinstance(s, str):
+            raise ValueError("pad_left() expects a string first argument")
+        w = int(width.item() if isinstance(width, torch.Tensor) else width)
+        fill = " "
+        if char is not None:
+            if not isinstance(char, str) or len(char) != 1:
+                raise ValueError("pad_left() fill character must be a single character string")
+            fill = char
+        return s.rjust(w, fill)
+
+    @staticmethod
+    def fn_pad_right(s, width, char=None):
+        """Pad string on the right to reach target width. Default pad char is space."""
+        if not isinstance(s, str):
+            raise ValueError("pad_right() expects a string first argument")
+        w = int(width.item() if isinstance(width, torch.Tensor) else width)
+        fill = " "
+        if char is not None:
+            if not isinstance(char, str) or len(char) != 1:
+                raise ValueError("pad_right() fill character must be a single character string")
+            fill = char
+        return s.ljust(w, fill)
+
+    @staticmethod
+    def fn_format(template, *args):
+        """String interpolation. Replaces {} placeholders with arguments.
+        format("frame_{}_v{}", 42, 3) produces "frame_42_v3".
+        """
+        if not isinstance(template, str):
+            raise ValueError("format() expects a string template as first argument")
+        # Convert tensor args to Python values for formatting
+        converted = []
+        for a in args:
+            if isinstance(a, torch.Tensor):
+                v = a.item() if a.dim() == 0 else a.float().mean().item()
+                # Round to 6 significant digits to counteract float32 noise
+                if v == int(v):
+                    converted.append(int(v))
+                else:
+                    converted.append(float(f"{v:.6g}"))
+            else:
+                converted.append(a)
+        try:
+            return template.format(*converted)
+        except (IndexError, KeyError) as e:
+            raise ValueError(f"format() error: {e}")
+
+    @staticmethod
+    def fn_repeat(s, count):
+        """Repeat a string N times."""
+        if not isinstance(s, str):
+            raise ValueError("repeat() expects a string first argument")
+        n = int(count.item() if isinstance(count, torch.Tensor) else count)
+        if n < 0:
+            n = 0
+        return s * n
+
+    @staticmethod
+    def fn_str_reverse(s):
+        """Reverse a string."""
+        if not isinstance(s, str):
+            raise ValueError("str_reverse() expects a string argument")
+        return s[::-1]
+
+    @staticmethod
+    def fn_count(s, sub):
+        """Count non-overlapping occurrences of sub in s."""
+        if not (isinstance(s, str) and isinstance(sub, str)):
+            raise ValueError("count() expects two string arguments")
+        return torch.tensor(float(s.count(sub)), dtype=torch.float32)
+
+    @staticmethod
+    def fn_matches(s, pattern):
+        """Test if string matches a regex pattern. Returns 1.0 if the full string matches, 0.0 otherwise."""
+        if not (isinstance(s, str) and isinstance(pattern, str)):
+            raise ValueError("matches() expects two string arguments")
+        try:
+            return torch.tensor(1.0 if re.fullmatch(pattern, s) else 0.0, dtype=torch.float32)
+        except re.error as e:
+            raise ValueError(f"matches() invalid regex: {e}")
+
+    @staticmethod
+    def fn_hash(s):
+        """Deterministic hash of a string. Returns a stable string hash (SHA-256 hex, first 16 chars)."""
+        if not isinstance(s, str):
+            raise ValueError("hash() expects a string argument")
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def fn_hash_float(s):
+        """Deterministic hash of a string to a float in [0, 1).
+        Useful for procedural seeding and per-pixel variation."""
+        if not isinstance(s, str):
+            raise ValueError("hash_float() expects a string argument")
+        h = hashlib.sha256(s.encode("utf-8")).digest()
+        # Use first 8 bytes as unsigned 64-bit integer, normalize to [0, 1)
+        value = int.from_bytes(h[:8], "big") / (2**64)
+        return torch.tensor(value, dtype=torch.float32)
+
+    @staticmethod
+    def fn_hash_int(s, max_val=None):
+        """Deterministic hash of a string to a non-negative integer.
+        If max_val is provided, result is in [0, max_val).
+        Otherwise returns a large positive integer."""
+        if not isinstance(s, str):
+            raise ValueError("hash_int() expects a string first argument")
+        h = hashlib.sha256(s.encode("utf-8")).digest()
+        value = int.from_bytes(h[:8], "big")
+        if max_val is not None:
+            m = int(max_val.item() if isinstance(max_val, torch.Tensor) else max_val)
+            if m > 0:
+                value = value % m
+        # Clamp to float32 safe integer range
+        value = min(value, 2**24 - 1)
+        return torch.tensor(float(value), dtype=torch.float32)
+
+    @staticmethod
+    def fn_char_at(s, index):
+        """Get character at index. Returns empty string if out of bounds."""
+        if not isinstance(s, str):
+            raise ValueError("char_at() expects a string first argument")
+        i = int(index.item() if isinstance(index, torch.Tensor) else index)
+        if 0 <= i < len(s):
+            return s[i]
+        return ""
 
     # -- Array functions ------------------------------------------------
 

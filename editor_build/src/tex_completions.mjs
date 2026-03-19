@@ -85,7 +85,7 @@ const STDLIB_COMPLETIONS = [
     // String
     { label: "str", detail: "(x)", info: "Number to string" },
     { label: "len", detail: "(s)", info: "String/array length" },
-    { label: "replace", detail: "(s, old, new)", info: "Replace all occurrences" },
+    { label: "replace", detail: "(s, old, new, max?)", info: "Replace occurrences (optional max count)" },
     { label: "strip", detail: "(s)", info: "Trim whitespace" },
     { label: "lower", detail: "(s)", info: "To lowercase" },
     { label: "upper", detail: "(s)", info: "To uppercase" },
@@ -97,6 +97,20 @@ const STDLIB_COMPLETIONS = [
     { label: "to_int", detail: "(s)", info: "Parse integer from string" },
     { label: "to_float", detail: "(s)", info: "Parse float from string" },
     { label: "sanitize_filename", detail: "(s)", info: "Clean illegal filename chars" },
+    { label: "split", detail: "(s, delim, max?)", info: "Split string into array" },
+    { label: "lstrip", detail: "(s)", info: "Trim leading whitespace" },
+    { label: "rstrip", detail: "(s)", info: "Trim trailing whitespace" },
+    { label: "pad_left", detail: "(s, width, char?)", info: "Left-pad to width" },
+    { label: "pad_right", detail: "(s, width, char?)", info: "Right-pad to width" },
+    { label: "format", detail: "(template, ...args)", info: "String interpolation with {} placeholders" },
+    { label: "repeat", detail: "(s, count)", info: "Repeat string N times" },
+    { label: "str_reverse", detail: "(s)", info: "Reverse a string" },
+    { label: "count", detail: "(s, sub)", info: "Count substring occurrences" },
+    { label: "matches", detail: "(s, pattern)", info: "Regex full match (1.0/0.0)" },
+    { label: "hash", detail: "(s)", info: "Deterministic SHA-256 hex prefix" },
+    { label: "hash_float", detail: "(s)", info: "Deterministic hash to float [0,1)" },
+    { label: "hash_int", detail: "(s, max?)", info: "Deterministic hash to integer" },
+    { label: "char_at", detail: "(s, i)", info: "Character at index" },
     // Array
     { label: "sort", detail: "(arr)", info: "Sort ascending" },
     { label: "reverse", detail: "(arr)", info: "Reverse order" },
@@ -127,6 +141,9 @@ const TYPE_COMPLETIONS = [
     { label: "if", type: "keyword", info: "Conditional (vectorized via torch.where)" },
     { label: "else", type: "keyword", info: "Else branch" },
     { label: "for", type: "keyword", detail: "(int i = 0; i < n; i++)", info: "Bounded loop" },
+    { label: "while", type: "keyword", detail: "(condition)", info: "Conditional loop" },
+    { label: "break", type: "keyword", info: "Exit innermost loop" },
+    { label: "continue", type: "keyword", info: "Skip to next iteration" },
 ];
 
 // ─── Built-in variable completions ───────────────────────────────────

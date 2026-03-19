@@ -25,7 +25,8 @@ from __future__ import annotations
 from enum import Enum
 from dataclasses import dataclass, field
 from .ast_nodes import (
-    ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, ExprStatement,
+    ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
+    BreakStmt, ContinueStmt,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, MatConstructor,
     CastExpr, SourceLoc, ArrayDecl, ArrayIndexAccess, ArrayLiteral, ParamDecl,
@@ -185,6 +186,9 @@ class TypeChecker:
     # Legacy compat: whether the old "OUT"-only inference mode was active
     _infer_out: bool = False
 
+    # Track loop nesting depth for break/continue validation
+    _loop_depth: int = 0
+
     @property
     def inferred_out_type(self) -> TEXType | None:
         """Legacy compat: inferred type for @OUT binding."""
@@ -291,10 +295,16 @@ class TypeChecker:
             self._check_if_else(node)
         elif isinstance(node, ForLoop):
             self._check_for_loop(node)
+        elif isinstance(node, WhileLoop):
+            self._check_while_loop(node)
         elif isinstance(node, ExprStatement):
             self._check_expr(node.expr)
         elif isinstance(node, ParamDecl):
             self._check_param_decl(node)
+        elif isinstance(node, (BreakStmt, ContinueStmt)):
+            kind = "break" if isinstance(node, BreakStmt) else "continue"
+            if self._loop_depth <= 0:
+                self._error(f"'{kind}' statement outside of a loop", node.loc)
         else:
             self._error(f"Unknown statement type: {type(node).__name__}", node.loc)
 
@@ -374,10 +384,14 @@ class TypeChecker:
                                 size = src_info.size
 
         if size is None:
-            self._error("Array must have a known size", node.loc)
-            size = 1  # fallback
+            # Allow dynamic-size arrays from function calls (e.g. split())
+            if node.initializer and isinstance(node.initializer, FunctionCall):
+                size = 0  # dynamic — resolved at runtime
+            else:
+                self._error("Array must have a known size", node.loc)
+                size = 1  # fallback
 
-        if size > 1024:
+        if size > 1024:  # 0 = dynamic, skip check
             self._error(f"Array size {size} exceeds maximum (1024)", node.loc)
 
         arr_type = TEXArrayType(element_type=elem_type, size=size)
@@ -540,9 +554,26 @@ class TypeChecker:
         # Check update
         self._check_stmt(node.update)
 
-        # Check body
+        # Check body (with loop depth tracking for break/continue)
+        self._loop_depth += 1
         for stmt in node.body:
             self._check_stmt(stmt)
+        self._loop_depth -= 1
+
+        self._pop_scope()
+        self._set_type(node, TEXType.VOID)
+
+    def _check_while_loop(self, node: WhileLoop):
+        self._push_scope()
+
+        cond_type = self._check_expr(node.condition)
+        if cond_type.is_vector:
+            self._error("While-loop condition must be a scalar expression, not a vector", node.loc)
+
+        self._loop_depth += 1
+        for stmt in node.body:
+            self._check_stmt(stmt)
+        self._loop_depth -= 1
 
         self._pop_scope()
         self._set_type(node, TEXType.VOID)
@@ -918,6 +949,11 @@ class TypeChecker:
         if node.name == "join":
             if arg_types and arg_types[0] != TEXType.ARRAY:
                 self._error("join() expects a string array as first argument", node.loc)
+
+        # split() validation — first arg must be string
+        if node.name == "split":
+            if arg_types and arg_types[0] != TEXType.STRING:
+                self._error("split() expects a string as first argument", node.loc)
 
         result_type = self._resolve_function_type(node.name, arg_types, node.loc)
         self._set_type(node, result_type)

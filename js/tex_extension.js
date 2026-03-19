@@ -1066,7 +1066,22 @@ app.registerExtension({
                             }
                         },
                     });
-                    if (domWidget) domWidget.serialize = false;
+                    if (domWidget) {
+                        domWidget.serialize = false;
+                        // Constrain editor height so param widgets below
+                        // remain visible and interactive.
+                        domWidget.computeSize = function (width) {
+                            const paramCount = node.widgets
+                                ? node.widgets.filter(w => w._texParam).length
+                                : 0;
+                            const reservedHeight = paramCount * 40 + 20;
+                            const maxEditorHeight = Math.max(
+                                100,
+                                node.size[1] - reservedHeight - 80,
+                            );
+                            return [width, maxEditorHeight];
+                        };
+                    }
 
                     // Size the default node for a better editor experience
                     if (node.size[0] < 400) {

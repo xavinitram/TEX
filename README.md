@@ -167,17 +167,19 @@ vec4 bgra = @A.bgra;  // reorder channels -> vec4
 
 ### Control Flow
 
-#### if/else
+#### if / else if / else
 
 ```c
-if (luma(@A) > 0.5) {
+if (luma(@A) > 0.8) {
     @OUT = vec3(1.0, 0.0, 0.0);  // bright pixels -> red
+} else if (luma(@A) > 0.4) {
+    @OUT = vec3(0.0, 1.0, 0.0);  // mid pixels -> green
 } else {
     @OUT = vec3(0.0, 0.0, 1.0);  // dark pixels -> blue
 }
 ```
 
-`if/else` is vectorized via `torch.where` — both branches execute and results are selected per-pixel by the condition.
+`if/else` is vectorized via `torch.where` — both branches execute and results are selected per-pixel by the condition. `else if` chains are supported and avoid deep nesting.
 
 #### for loops
 
@@ -189,7 +191,19 @@ for (int i = -2; i <= 2; i++) {
 @OUT = sum / 5.0;
 ```
 
-Loops must have integer loop variables with compile-time-deterministic bounds. Iteration is capped at 1000 to prevent hangs. Loop bodies run sequentially, with each iteration's operations vectorized across all pixels.
+Loops must have integer loop variables with compile-time-deterministic bounds. Loop bodies run sequentially, with each iteration's operations vectorized across all pixels.
+
+#### while loops
+
+```c
+float val = 1.0;
+while (val < 100.0) {
+    val = val * 2.0;
+}
+@OUT = vec4(val / 255.0);
+```
+
+`while` loops evaluate their condition each iteration. Useful when the number of iterations isn't known upfront. Both `for` and `while` loops support `break` and `continue`, and are capped at 1024 iterations to prevent hangs.
 
 ### Built-in Variables
 
@@ -248,7 +262,7 @@ float n = perlin(u * 8.0, v * 8.0);  // 8x frequency
 float cloud = fbm(u * 6.0, v * 6.0, 6);  // 6 octaves of detail
 ```
 
-**String:** `str`, `len`, `replace`, `strip`, `lower`, `upper`, `contains`, `startswith`, `endswith`, `find`, `substr`, `to_int`, `to_float`, `sanitize_filename`
+**String:** `str`, `len`, `replace`, `strip`, `lstrip`, `rstrip`, `lower`, `upper`, `contains`, `startswith`, `endswith`, `find`, `substr`, `to_int`, `to_float`, `sanitize_filename`, `split`, `pad_left`, `pad_right`, `format`, `repeat`, `str_reverse`, `count`, `matches`, `hash`, `hash_float`, `hash_int`, `char_at`
 
 **Array:** `sort`, `reverse`, `arr_sum`, `arr_min`, `arr_max`, `median`, `arr_avg`, `len`, `join`
 
@@ -863,17 +877,22 @@ if (luma(@A) > 0.5) {
 
 This means both branches must be valid for all pixels. Side effects in branches (array assignments, etc.) are merged using the same `torch.where` pattern.
 
-### For Loops
+### Loops
 
-For loops execute sequentially — each iteration runs the body as vectorized tensor operations:
+For and while loops execute sequentially — each iteration runs the body as vectorized tensor operations:
 
 ```c
 for (int i = 0; i < 5; i++) {
     sum += fetch(@A, ix + i - 2, iy);
 }
+
+float val = 1.0;
+while (val < threshold) {
+    val = val * 2.0;
+}
 ```
 
-The loop variable `i` is a scalar (not a per-pixel tensor). Each iteration computes the body across all pixels simultaneously. The iteration limit is 1024 (`MAX_LOOP_ITERATIONS`) to prevent hangs.
+The loop variable `i` is a scalar (not a per-pixel tensor). Each iteration computes the body across all pixels simultaneously. The iteration limit is 1024 (`MAX_LOOP_ITERATIONS`) to prevent hangs. Both `break` and `continue` work in both loop types.
 
 ### Type System
 
@@ -956,7 +975,7 @@ cd custom_nodes/TEX_Wrangle
 python tests/test_tex.py
 ```
 
-Expected: 355/355 passed.
+Expected: 418/418 passed (1 CUDA test skipped without GPU).
 
 ## License
 

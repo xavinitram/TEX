@@ -124,7 +124,7 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     # String operations
     "str":               {"args": (1, 1), "return": TEXType.STRING},              # str(number) — number to string
     "len":               {"args": (1, 1), "return": TEXType.FLOAT},               # len(s) — string length
-    "replace":           {"args": (3, 3), "return": TEXType.STRING},              # replace(s, old, new) — replace all
+    "replace":           {"args": (3, 4), "return": TEXType.STRING},              # replace(s, old, new, max_count?) — replace
     "strip":             {"args": (1, 1), "return": TEXType.STRING},              # strip(s) — trim whitespace
     "lower":             {"args": (1, 1), "return": TEXType.STRING},              # lower(s) — to lowercase
     "upper":             {"args": (1, 1), "return": TEXType.STRING},              # upper(s) — to uppercase
@@ -136,6 +136,20 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "to_int":            {"args": (1, 1), "return": TEXType.INT},                 # to_int(s) — parse integer
     "to_float":          {"args": (1, 1), "return": TEXType.FLOAT},               # to_float(s) — parse float
     "sanitize_filename": {"args": (1, 1), "return": TEXType.STRING},              # sanitize_filename(s) — clean path
+    "split":             {"args": (2, 3), "return": lambda _: TEXType.ARRAY},    # split(s, delim, max?) — split string
+    "lstrip":            {"args": (1, 1), "return": TEXType.STRING},             # lstrip(s) — trim leading whitespace
+    "rstrip":            {"args": (1, 1), "return": TEXType.STRING},             # rstrip(s) — trim trailing whitespace
+    "pad_left":          {"args": (2, 3), "return": TEXType.STRING},             # pad_left(s, width, char?) — left-pad
+    "pad_right":         {"args": (2, 3), "return": TEXType.STRING},             # pad_right(s, width, char?) — right-pad
+    "format":            {"args": (1, 16), "return": TEXType.STRING},            # format(template, ...args) — interpolation
+    "repeat":            {"args": (2, 2), "return": TEXType.STRING},             # repeat(s, count) — repeat N times
+    "str_reverse":       {"args": (1, 1), "return": TEXType.STRING},             # str_reverse(s) — reverse string
+    "count":             {"args": (2, 2), "return": TEXType.FLOAT},              # count(s, sub) — count occurrences
+    "matches":           {"args": (2, 2), "return": TEXType.FLOAT},              # matches(s, pattern) — regex match
+    "hash":              {"args": (1, 1), "return": TEXType.STRING},             # hash(s) — deterministic SHA-256 prefix
+    "hash_float":        {"args": (1, 1), "return": TEXType.FLOAT},             # hash_float(s) — deterministic float [0,1)
+    "hash_int":          {"args": (1, 2), "return": TEXType.INT},               # hash_int(s, max?) — deterministic integer
+    "char_at":           {"args": (2, 2), "return": TEXType.STRING},            # char_at(s, i) — character at index
 
     # Array operations
     "sort":      {"args": (1, 1), "return": lambda _: TEXType.ARRAY},             # sort(arr) — ascending sort, returns new array

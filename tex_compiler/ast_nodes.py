@@ -79,6 +79,28 @@ class ForLoop(ASTNode):
 
 
 @dataclass
+class WhileLoop(ASTNode):
+    """While loop: `while (condition) { body }`
+
+    Executes sequentially (like ForLoop). Hard limit on iterations.
+    """
+    condition: ASTNode = None
+    body: list[ASTNode] = field(default_factory=list)
+
+
+@dataclass
+class BreakStmt(ASTNode):
+    """Break statement: exits the innermost for/while loop."""
+    pass
+
+
+@dataclass
+class ContinueStmt(ASTNode):
+    """Continue statement: skips to the next iteration of the innermost for loop."""
+    pass
+
+
+@dataclass
 class ExprStatement(ASTNode):
     """A bare expression used as a statement (e.g. function call)."""
     expr: ASTNode = None

@@ -3,7 +3,7 @@ TEX Parser — recursive-descent parser producing an AST from tokens.
 
 Grammar (simplified):
   program     = statement*
-  statement   = var_decl | param_decl | assignment | if_else | for_loop | expr_stmt
+  statement   = var_decl | param_decl | assignment | if_else | for_loop | while_loop | expr_stmt
   var_decl    = type_kw IDENT ('=' expr)? ';'
   param_decl  = ('$'|typed_'$') IDENT ('=' expr)? ';'
   assignment  = lvalue '=' expr ';'
@@ -33,7 +33,8 @@ Grammar (simplified):
 from __future__ import annotations
 from .lexer import Token, TokenType, LexerError
 from .ast_nodes import (
-    SourceLoc, Program, VarDecl, Assignment, IfElse, ForLoop, ExprStatement,
+    SourceLoc, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
+    BreakStmt, ContinueStmt,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, ASTNode,
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
@@ -133,6 +134,22 @@ class Parser:
         # for loop
         if self.peek() == TokenType.KW_FOR:
             return self.parse_for_loop()
+
+        # while loop
+        if self.peek() == TokenType.KW_WHILE:
+            return self.parse_while_loop()
+
+        # break / continue
+        if self.peek() == TokenType.KW_BREAK:
+            loc = self.loc()
+            self.advance()
+            self.expect(TokenType.SEMI, "Expected ';' after 'break'")
+            return BreakStmt(loc=loc)
+        if self.peek() == TokenType.KW_CONTINUE:
+            loc = self.loc()
+            self.advance()
+            self.expect(TokenType.SEMI, "Expected ';' after 'continue'")
+            return ContinueStmt(loc=loc)
 
         # Assignment or expression statement
         return self.parse_assignment_or_expr()
@@ -255,6 +272,16 @@ class Parser:
         body = self.parse_block()
 
         return ForLoop(loc=loc, init=init, condition=condition, update=update, body=body)
+
+    def parse_while_loop(self) -> WhileLoop:
+        """Parse: while (condition) { body }"""
+        loc = self.loc()
+        self.expect(TokenType.KW_WHILE)
+        self.expect(TokenType.LPAREN, "Expected '(' after 'while'")
+        condition = self.parse_expr()
+        self.expect(TokenType.RPAREN, "Expected ')' after while condition")
+        body = self.parse_block()
+        return WhileLoop(loc=loc, condition=condition, body=body)
 
     def _parse_for_init(self) -> ASTNode:
         """Parse the initializer part of a for loop (no trailing semicolon)."""

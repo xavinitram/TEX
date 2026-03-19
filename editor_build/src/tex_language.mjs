@@ -9,7 +9,8 @@ import { StreamLanguage } from "@codemirror/language";
 // ─── Token sets (must match tex_extension.js exactly) ────────────────
 
 const TEX_KEYWORDS = new Set([
-    "float", "int", "vec3", "vec4", "mat3", "mat4", "string", "if", "else", "for",
+    "float", "int", "vec3", "vec4", "mat3", "mat4", "string",
+    "if", "else", "for", "while", "break", "continue",
 ]);
 
 const TEX_BUILTINS = new Set([
@@ -27,9 +28,11 @@ const TEX_BUILTINS = new Set([
     "fetch_frame", "sample_frame",
     "distance",
     "perlin", "simplex", "fbm",
-    "str", "len", "replace", "strip", "lower", "upper",
+    "str", "len", "replace", "strip", "lstrip", "rstrip", "lower", "upper",
     "contains", "startswith", "endswith", "find", "substr",
     "to_int", "to_float", "sanitize_filename",
+    "split", "pad_left", "pad_right", "format", "repeat", "str_reverse",
+    "count", "matches", "hash", "hash_float", "hash_int", "char_at",
     "sort", "reverse", "arr_sum", "arr_min", "arr_max", "median", "arr_avg",
     "join",
     "img_sum", "img_mean", "img_min", "img_max", "img_median",

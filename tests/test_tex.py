@@ -788,6 +788,130 @@ def test_for_loops(r: TestResult):
         r.fail("for loop: vector accumulation", f"{e}\n{traceback.format_exc()}")
 
 
+# ── Break/Continue Tests ──────────────────────────────────────────────
+
+def test_break_continue(r: TestResult):
+    print("\n--- Break/Continue Tests ---")
+
+    B, H, W = 1, 4, 4
+    test_img = torch.rand(B, H, W, 3)
+
+    # break: exit loop early
+    try:
+        code = """
+        float sum = 0.0;
+        for (int i = 0; i < 10; i++) {
+            if (i >= 3) { break; }
+            sum += 1.0;
+        }
+        @OUT = vec3(sum, sum, sum);
+        """
+        result = compile_and_run(code, {"A": test_img})
+        val = result[0, 0, 0, 0].item()
+        assert abs(val - 3.0) < 1e-4, f"Expected 3.0, got {val}"
+        r.ok("break: exit loop early")
+    except Exception as e:
+        r.fail("break: exit loop early", f"{e}\n{traceback.format_exc()}")
+
+    # continue: skip iteration
+    try:
+        code = """
+        float sum = 0.0;
+        for (int i = 0; i < 5; i++) {
+            if (i == 2) { continue; }
+            sum += 1.0;
+        }
+        @OUT = vec3(sum, sum, sum);
+        """
+        result = compile_and_run(code, {"A": test_img})
+        val = result[0, 0, 0, 0].item()
+        # Skips i=2, so sum = 4 (i=0,1,3,4)
+        assert abs(val - 4.0) < 1e-4, f"Expected 4.0, got {val}"
+        r.ok("continue: skip iteration")
+    except Exception as e:
+        r.fail("continue: skip iteration", f"{e}\n{traceback.format_exc()}")
+
+    # break in nested loop: only breaks inner
+    try:
+        code = """
+        float outer_count = 0.0;
+        float inner_total = 0.0;
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 10; j++) {
+                if (j >= 2) { break; }
+                inner_total += 1.0;
+            }
+            outer_count += 1.0;
+        }
+        @OUT = vec3(outer_count, inner_total, 0.0);
+        """
+        result = compile_and_run(code, {"A": test_img})
+        outer = result[0, 0, 0, 0].item()
+        inner = result[0, 0, 0, 1].item()
+        assert abs(outer - 3.0) < 1e-4, f"Expected outer=3.0, got {outer}"
+        assert abs(inner - 6.0) < 1e-4, f"Expected inner=6.0, got {inner}"
+        r.ok("break: nested loops (inner only)")
+    except Exception as e:
+        r.fail("break: nested loops (inner only)", f"{e}\n{traceback.format_exc()}")
+
+    # continue with accumulation: sum only even indices
+    try:
+        code = """
+        float sum = 0.0;
+        for (int i = 0; i < 6; i++) {
+            if (i % 2 != 0) { continue; }
+            sum += float(i);
+        }
+        @OUT = vec3(sum, sum, sum);
+        """
+        result = compile_and_run(code, {"A": test_img})
+        val = result[0, 0, 0, 0].item()
+        # Even indices: 0 + 2 + 4 = 6
+        assert abs(val - 6.0) < 1e-4, f"Expected 6.0, got {val}"
+        r.ok("continue: sum even indices")
+    except Exception as e:
+        r.fail("continue: sum even indices", f"{e}\n{traceback.format_exc()}")
+
+    # break outside loop: should be a type check error
+    try:
+        code = "break;\n@OUT = vec3(0.0);"
+        compile_and_run(code, {"A": test_img})
+        r.fail("break: outside loop error", "Should have raised TypeCheckError")
+    except TypeCheckError as e:
+        assert "outside" in str(e).lower() or "loop" in str(e).lower()
+        r.ok("break: outside loop error")
+    except Exception as e:
+        r.fail("break: outside loop error", f"{e}\n{traceback.format_exc()}")
+
+    # continue outside loop: should be a type check error
+    try:
+        code = "continue;\n@OUT = vec3(0.0);"
+        compile_and_run(code, {"A": test_img})
+        r.fail("continue: outside loop error", "Should have raised TypeCheckError")
+    except TypeCheckError as e:
+        assert "outside" in str(e).lower() or "loop" in str(e).lower()
+        r.ok("continue: outside loop error")
+    except Exception as e:
+        r.fail("continue: outside loop error", f"{e}\n{traceback.format_exc()}")
+
+    # break immediately: zero iterations
+    try:
+        code = """
+        float sum = 0.0;
+        for (int i = 0; i < 10; i++) {
+            break;
+            sum += 1.0;
+        }
+        @OUT = vec3(sum, sum, sum);
+        """
+        result = compile_and_run(code, {"A": test_img})
+        val = result[0, 0, 0, 0].item()
+        assert abs(val) < 1e-4, f"Expected 0.0, got {val}"
+        r.ok("break: immediate exit")
+    except Exception as e:
+        r.fail("break: immediate exit", f"{e}\n{traceback.format_exc()}")
+
+
 # ── Compound Assignment Tests ─────────────────────────────────────────
 
 def test_compound_assignments(r: TestResult):
@@ -4863,6 +4987,645 @@ def test_v03_features(r: TestResult):
         r.fail("cache: multi-output compile_tex", f"{e}\n{traceback.format_exc()}")
 
 
+# ── Wireable Parameter Tests ───────────────────────────────────────────
+
+def test_wireable_params(r: TestResult):
+    """Tests that param ($) values work when passed as different types (simulating wired inputs)."""
+    print("\n--- Wireable Parameter Tests ---")
+
+    B, H, W = 1, 4, 4
+    test_img = torch.rand(B, H, W, 3)
+
+    # Float param passed as Python float (widget path)
+    try:
+        code = "f$strength = 1.0;\n@OUT = @A * $strength;"
+        result = compile_and_run(code, {"A": test_img, "strength": 0.5})
+        expected = test_img * 0.5
+        assert torch.allclose(result[..., :3], expected, atol=1e-5), \
+            f"Max diff: {(result[..., :3] - expected).abs().max().item()}"
+        r.ok("wireable: float param from widget")
+    except Exception as e:
+        r.fail("wireable: float param from widget", f"{e}\n{traceback.format_exc()}")
+
+    # Float param passed as scalar tensor (simulating wire from FLOAT output)
+    try:
+        code = "f$strength = 1.0;\n@OUT = @A * $strength;"
+        result = compile_and_run(code, {"A": test_img, "strength": torch.tensor(0.25)})
+        expected = test_img * 0.25
+        assert torch.allclose(result[..., :3], expected, atol=1e-5), \
+            f"Max diff: {(result[..., :3] - expected).abs().max().item()}"
+        r.ok("wireable: float param from wire (scalar tensor)")
+    except Exception as e:
+        r.fail("wireable: float param from wire (scalar tensor)", f"{e}\n{traceback.format_exc()}")
+
+    # Int param passed as Python int
+    try:
+        code = "i$count = 1;\nfloat c = float($count);\n@OUT = @A * c;"
+        result = compile_and_run(code, {"A": test_img, "count": 2})
+        expected = test_img * 2.0
+        assert torch.allclose(result[..., :3], expected, atol=1e-5)
+        r.ok("wireable: int param from widget")
+    except Exception as e:
+        r.fail("wireable: int param from widget", f"{e}\n{traceback.format_exc()}")
+
+    # Param uses code default when not provided (via tex_node's param_info injection)
+    try:
+        from TEX_Wrangle.tex_cache import TEXCache
+        cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
+        code = "f$strength = 0.5;\n@OUT = @A * $strength;"
+        bt = {"A": TEXType.VEC3}
+        program, type_map, refs, assigned, param_info = cache.compile_tex(code, bt)
+        # Simulate tex_node.py's default injection: inject param default into bindings
+        bindings = {"A": test_img}
+        for ref_name in refs:
+            if ref_name not in bindings and ref_name in param_info:
+                default_val = param_info[ref_name].get("default_value")
+                if default_val is not None:
+                    bindings[ref_name] = default_val
+        interp = Interpreter()
+        result = interp.execute(program, bindings, type_map, device="cpu")
+        expected = test_img * 0.5
+        assert torch.allclose(result[..., :3], expected, atol=1e-5)
+        r.ok("wireable: param falls back to code default")
+    except Exception as e:
+        r.fail("wireable: param falls back to code default", f"{e}\n{traceback.format_exc()}")
+
+    # Non-scalar param: mask ($m) passed as tensor
+    try:
+        mask = torch.ones(B, H, W)
+        code = "m$mymask;\n@OUT = @A * $mymask;"
+        result = compile_and_run(code, {"A": test_img, "mymask": mask})
+        assert torch.allclose(result[..., :3], test_img, atol=1e-5)
+        r.ok("wireable: mask param from wire")
+    except Exception as e:
+        r.fail("wireable: mask param from wire", f"{e}\n{traceback.format_exc()}")
+
+
+def test_string_functions_v04(r: TestResult):
+    """Tests for new string functions added in v0.4."""
+    print("\n--- String Functions v0.4 Tests ---")
+    B, H, W = 1, 2, 2
+    img = torch.rand(B, H, W, 4)
+
+    # -- split --
+    try:
+        code = '''
+string s = "a,b,c,d";
+string arr[] = split(s, ",");
+@OUT = arr[2];
+'''
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.STRING)
+        assert result == "c", f"Expected 'c', got {result!r}"
+        r.ok("split: basic delimiter")
+    except Exception as e:
+        r.fail("split: basic delimiter", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        code = '''
+string s = "a.b.c.d";
+string arr[] = split(s, ".", 2);
+@OUT = arr[2];
+'''
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.STRING)
+        assert result == "c.d", f"Expected 'c.d', got {result!r}"
+        r.ok("split: max_splits")
+    except Exception as e:
+        r.fail("split: max_splits", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        code = '''
+string s = "hello world foo";
+string arr[] = split(s, " ");
+@OUT = join(arr, "-");
+'''
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.STRING)
+        assert result == "hello-world-foo", f"Expected 'hello-world-foo', got {result!r}"
+        r.ok("split: round-trip with join")
+    except Exception as e:
+        r.fail("split: round-trip with join", f"{e}\n{traceback.format_exc()}")
+
+    # -- lstrip / rstrip --
+    try:
+        result = compile_and_run(
+            'string s = "  hello  "; @OUT = lstrip(s);',
+            {}, out_type=TEXType.STRING)
+        assert result == "hello  ", f"Expected 'hello  ', got {result!r}"
+        r.ok("lstrip: trim leading")
+    except Exception as e:
+        r.fail("lstrip: trim leading", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            'string s = "  hello  "; @OUT = rstrip(s);',
+            {}, out_type=TEXType.STRING)
+        assert result == "  hello", f"Expected '  hello', got {result!r}"
+        r.ok("rstrip: trim trailing")
+    except Exception as e:
+        r.fail("rstrip: trim trailing", f"{e}\n{traceback.format_exc()}")
+
+    # -- pad_left / pad_right --
+    try:
+        result = compile_and_run(
+            '@OUT = pad_left("42", 5, "0");',
+            {}, out_type=TEXType.STRING)
+        assert result == "00042", f"Expected '00042', got {result!r}"
+        r.ok("pad_left: zero-pad number")
+    except Exception as e:
+        r.fail("pad_left: zero-pad number", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            '@OUT = pad_right("hi", 6);',
+            {}, out_type=TEXType.STRING)
+        assert result == "hi    ", f"Expected 'hi    ', got {result!r}"
+        r.ok("pad_right: space-pad default")
+    except Exception as e:
+        r.fail("pad_right: space-pad default", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            '@OUT = pad_left("long_string", 5, "x");',
+            {}, out_type=TEXType.STRING)
+        assert result == "long_string", f"Expected no-op for string longer than width, got {result!r}"
+        r.ok("pad_left: no-op when already wider")
+    except Exception as e:
+        r.fail("pad_left: no-op when already wider", f"{e}\n{traceback.format_exc()}")
+
+    # -- format --
+    try:
+        result = compile_and_run(
+            '@OUT = format("frame_{}_v{}", 42, 3);',
+            {}, out_type=TEXType.STRING)
+        assert result == "frame_42_v3", f"Expected 'frame_42_v3', got {result!r}"
+        r.ok("format: integer placeholders")
+    except Exception as e:
+        r.fail("format: integer placeholders", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            '@OUT = format("value={}", 3.14);',
+            {}, out_type=TEXType.STRING)
+        assert result == "value=3.14", f"Expected 'value=3.14', got {result!r}"
+        r.ok("format: float placeholder")
+    except Exception as e:
+        r.fail("format: float placeholder", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            '@OUT = format("{}-{}", "hello", "world");',
+            {}, out_type=TEXType.STRING)
+        assert result == "hello-world", f"Expected 'hello-world', got {result!r}"
+        r.ok("format: string placeholders")
+    except Exception as e:
+        r.fail("format: string placeholders", f"{e}\n{traceback.format_exc()}")
+
+    # -- repeat --
+    try:
+        result = compile_and_run(
+            '@OUT = repeat("ab", 3);',
+            {}, out_type=TEXType.STRING)
+        assert result == "ababab", f"Expected 'ababab', got {result!r}"
+        r.ok("repeat: basic repeat")
+    except Exception as e:
+        r.fail("repeat: basic repeat", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            '@OUT = repeat("x", 0);',
+            {}, out_type=TEXType.STRING)
+        assert result == "", f"Expected '', got {result!r}"
+        r.ok("repeat: zero count")
+    except Exception as e:
+        r.fail("repeat: zero count", f"{e}\n{traceback.format_exc()}")
+
+    # -- str_reverse --
+    try:
+        result = compile_and_run(
+            '@OUT = str_reverse("hello");',
+            {}, out_type=TEXType.STRING)
+        assert result == "olleh", f"Expected 'olleh', got {result!r}"
+        r.ok("str_reverse: basic reverse")
+    except Exception as e:
+        r.fail("str_reverse: basic reverse", f"{e}\n{traceback.format_exc()}")
+
+    # -- count --
+    try:
+        result = compile_and_run(
+            'float n = count("banana", "an"); @OUT = vec4(n);',
+            {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 2.0, f"Expected 2.0, got {v}"
+        r.ok("count: substring occurrences")
+    except Exception as e:
+        r.fail("count: substring occurrences", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            'float n = count("hello", "xyz"); @OUT = vec4(n);',
+            {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 0.0, f"Expected 0.0, got {v}"
+        r.ok("count: no matches")
+    except Exception as e:
+        r.fail("count: no matches", f"{e}\n{traceback.format_exc()}")
+
+    # -- replace with max_count --
+    try:
+        result = compile_and_run(
+            '@OUT = replace("aaa", "a", "b", 2);',
+            {}, out_type=TEXType.STRING)
+        assert result == "bba", f"Expected 'bba', got {result!r}"
+        r.ok("replace: max_count limits replacements")
+    except Exception as e:
+        r.fail("replace: max_count limits replacements", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            '@OUT = replace("aaa", "a", "b");',
+            {}, out_type=TEXType.STRING)
+        assert result == "bbb", f"Expected 'bbb', got {result!r}"
+        r.ok("replace: all occurrences (no max)")
+    except Exception as e:
+        r.fail("replace: all occurrences (no max)", f"{e}\n{traceback.format_exc()}")
+
+    # -- matches --
+    try:
+        result = compile_and_run(
+            'float m = matches("frame_042", "frame_\\\\d+"); @OUT = vec4(m);',
+            {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 1.0, f"Expected 1.0, got {v}"
+        r.ok("matches: regex match")
+    except Exception as e:
+        r.fail("matches: regex match", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            'float m = matches("frame_abc", "frame_\\\\d+"); @OUT = vec4(m);',
+            {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 0.0, f"Expected 0.0, got {v}"
+        r.ok("matches: regex no match")
+    except Exception as e:
+        r.fail("matches: regex no match", f"{e}\n{traceback.format_exc()}")
+
+    # -- hash --
+    try:
+        result = compile_and_run(
+            '@OUT = hash("hello");',
+            {}, out_type=TEXType.STRING)
+        assert len(result) == 16, f"Expected 16-char hash, got len={len(result)}"
+        assert all(c in "0123456789abcdef" for c in result), f"Expected hex string, got {result!r}"
+        r.ok("hash: returns hex string")
+    except Exception as e:
+        r.fail("hash: returns hex string", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        r1 = compile_and_run('@OUT = hash("hello");', {}, out_type=TEXType.STRING)
+        r2 = compile_and_run('@OUT = hash("hello");', {}, out_type=TEXType.STRING)
+        r3 = compile_and_run('@OUT = hash("world");', {}, out_type=TEXType.STRING)
+        assert r1 == r2, f"Same input should produce same hash"
+        assert r1 != r3, f"Different input should produce different hash"
+        r.ok("hash: deterministic and distinct")
+    except Exception as e:
+        r.fail("hash: deterministic and distinct", f"{e}\n{traceback.format_exc()}")
+
+
+def test_while_loops(r: TestResult):
+    """Tests for while loop support."""
+    print("\n--- While Loop Tests ---")
+    B, H, W = 1, 2, 2
+    img = torch.rand(B, H, W, 4)
+
+    # 1. Basic while loop: count to 5
+    try:
+        code = """
+float x = 0.0;
+float i = 0.0;
+while (i < 5) {
+    x = x + 1.0;
+    i = i + 1.0;
+}
+@OUT = vec4(x);
+"""
+        result = compile_and_run(code, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 5.0, f"Expected 5.0, got {v}"
+        r.ok("while: basic counting")
+    except Exception as e:
+        r.fail("while: basic counting", f"{e}\n{traceback.format_exc()}")
+
+    # 2. While loop with break
+    try:
+        code = """
+float x = 0.0;
+float i = 0.0;
+while (i < 100) {
+    if (i >= 3) {
+        break;
+    }
+    x = x + 1.0;
+    i = i + 1.0;
+}
+@OUT = vec4(x);
+"""
+        result = compile_and_run(code, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 3.0, f"Expected 3.0, got {v}"
+        r.ok("while: break exits loop")
+    except Exception as e:
+        r.fail("while: break exits loop", f"{e}\n{traceback.format_exc()}")
+
+    # 3. While loop with continue
+    try:
+        code = """
+float total = 0.0;
+float i = 0.0;
+while (i < 6) {
+    i = i + 1.0;
+    if (mod(i, 2.0) > 0.5) {
+        continue;
+    }
+    total = total + i;
+}
+@OUT = vec4(total);
+"""
+        result = compile_and_run(code, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        # Even numbers 2+4+6 = 12
+        assert v == 12.0, f"Expected 12.0, got {v}"
+        r.ok("while: continue skips iteration")
+    except Exception as e:
+        r.fail("while: continue skips iteration", f"{e}\n{traceback.format_exc()}")
+
+    # 4. While loop terminates on false condition (zero iterations)
+    try:
+        code = """
+float x = 42.0;
+while (0) {
+    x = 0.0;
+}
+@OUT = vec4(x);
+"""
+        result = compile_and_run(code, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 42.0, f"Expected 42.0 (body never runs), got {v}"
+        r.ok("while: false condition skips body")
+    except Exception as e:
+        r.fail("while: false condition skips body", f"{e}\n{traceback.format_exc()}")
+
+    # 5. While loop iteration limit
+    try:
+        code = """
+float x = 0.0;
+while (1) {
+    x = x + 1.0;
+}
+@OUT = vec4(x);
+"""
+        compile_and_run(code, {"A": img})
+        r.fail("while: iteration limit", "Should have raised InterpreterError")
+    except Exception as e:
+        assert "maximum iteration limit" in str(e).lower() or "exceeded" in str(e).lower()
+        r.ok("while: iteration limit")
+
+    # 6. Nested while loops
+    try:
+        code = """
+float total = 0.0;
+float i = 0.0;
+while (i < 3) {
+    float j = 0.0;
+    while (j < 3) {
+        total = total + 1.0;
+        j = j + 1.0;
+    }
+    i = i + 1.0;
+}
+@OUT = vec4(total);
+"""
+        result = compile_and_run(code, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 9.0, f"Expected 9.0, got {v}"
+        r.ok("while: nested loops")
+    except Exception as e:
+        r.fail("while: nested loops", f"{e}\n{traceback.format_exc()}")
+
+    # 7. While with string building
+    try:
+        code = """
+string s = "";
+float i = 0.0;
+while (i < 3) {
+    s = s + "x";
+    i = i + 1.0;
+}
+@OUT = s;
+"""
+        result = compile_and_run(code, {}, out_type=TEXType.STRING)
+        assert result == "xxx", f"Expected 'xxx', got {result!r}"
+        r.ok("while: string building")
+    except Exception as e:
+        r.fail("while: string building", f"{e}\n{traceback.format_exc()}")
+
+
+def test_new_stdlib_functions(r: TestResult):
+    """Tests for hash_float, hash_int, char_at, and string array sort."""
+    print("\n--- New Stdlib Function Tests ---")
+    B, H, W = 1, 2, 2
+    img = torch.rand(B, H, W, 4)
+
+    # -- hash_float --
+    try:
+        result = compile_and_run(
+            'float h = hash_float("seed_42"); @OUT = vec4(h);',
+            {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert 0.0 <= v < 1.0, f"Expected [0,1), got {v}"
+        r.ok("hash_float: returns value in [0,1)")
+    except Exception as e:
+        r.fail("hash_float: returns value in [0,1)", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        r1 = compile_and_run('float h = hash_float("abc"); @OUT = vec4(h);', {"A": img})
+        r2 = compile_and_run('float h = hash_float("abc"); @OUT = vec4(h);', {"A": img})
+        r3 = compile_and_run('float h = hash_float("xyz"); @OUT = vec4(h);', {"A": img})
+        v1 = r1[0, 0, 0, 0].item()
+        v2 = r2[0, 0, 0, 0].item()
+        v3 = r3[0, 0, 0, 0].item()
+        assert v1 == v2, "Same input should produce same hash_float"
+        assert v1 != v3, "Different input should produce different hash_float"
+        r.ok("hash_float: deterministic and distinct")
+    except Exception as e:
+        r.fail("hash_float: deterministic and distinct", f"{e}\n{traceback.format_exc()}")
+
+    # -- hash_int --
+    try:
+        result = compile_and_run(
+            'float h = hash_int("seed", 100); @OUT = vec4(h);',
+            {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert 0.0 <= v < 100.0, f"Expected [0,100), got {v}"
+        assert v == int(v), f"Expected integer, got {v}"
+        r.ok("hash_int: returns int in [0, max)")
+    except Exception as e:
+        r.fail("hash_int: returns int in [0, max)", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            'float h = hash_int("test_key"); @OUT = vec4(h);',
+            {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v >= 0 and v == int(v), f"Expected non-negative integer, got {v}"
+        r.ok("hash_int: no max returns large int")
+    except Exception as e:
+        r.fail("hash_int: no max returns large int", f"{e}\n{traceback.format_exc()}")
+
+    # -- char_at --
+    try:
+        result = compile_and_run(
+            '@OUT = char_at("hello", 1);',
+            {}, out_type=TEXType.STRING)
+        assert result == "e", f"Expected 'e', got {result!r}"
+        r.ok("char_at: basic index")
+    except Exception as e:
+        r.fail("char_at: basic index", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            '@OUT = char_at("hello", 0);',
+            {}, out_type=TEXType.STRING)
+        assert result == "h", f"Expected 'h', got {result!r}"
+        r.ok("char_at: first character")
+    except Exception as e:
+        r.fail("char_at: first character", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        result = compile_and_run(
+            '@OUT = char_at("hello", 99);',
+            {}, out_type=TEXType.STRING)
+        assert result == "", f"Expected '' for out-of-bounds, got {result!r}"
+        r.ok("char_at: out of bounds returns empty")
+    except Exception as e:
+        r.fail("char_at: out of bounds returns empty", f"{e}\n{traceback.format_exc()}")
+
+    # -- string array sort (already implemented, verifying) --
+    try:
+        code = """
+string arr[] = {"cherry", "apple", "banana"};
+string sorted_arr[] = sort(arr);
+@OUT = sorted_arr[0];
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.STRING)
+        assert result == "apple", f"Expected 'apple', got {result!r}"
+        r.ok("sort: string array lexicographic")
+    except Exception as e:
+        r.fail("sort: string array lexicographic", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        code = """
+string arr[] = {"cherry", "apple", "banana"};
+string sorted_arr[] = sort(arr);
+@OUT = sorted_arr[2];
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.STRING)
+        assert result == "cherry", f"Expected 'cherry', got {result!r}"
+        r.ok("sort: string array last element")
+    except Exception as e:
+        r.fail("sort: string array last element", f"{e}\n{traceback.format_exc()}")
+
+
+def test_else_if_chains(r: TestResult):
+    """Verify else-if chains work correctly."""
+    print("\n--- Else-If Chain Tests ---")
+    B, H, W = 1, 2, 2
+    img = torch.rand(B, H, W, 4)
+
+    # 1. else if chain
+    try:
+        code = """
+float x = 2.0;
+float result = 0.0;
+if (x < 1.0) {
+    result = 10.0;
+} else if (x < 3.0) {
+    result = 20.0;
+} else {
+    result = 30.0;
+}
+@OUT = vec4(result);
+"""
+        result = compile_and_run(code, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 20.0, f"Expected 20.0, got {v}"
+        r.ok("else if: middle branch")
+    except Exception as e:
+        r.fail("else if: middle branch", f"{e}\n{traceback.format_exc()}")
+
+    # 2. else if chain - first branch
+    try:
+        code = """
+float x = 0.5;
+float result = 0.0;
+if (x < 1.0) {
+    result = 10.0;
+} else if (x < 3.0) {
+    result = 20.0;
+} else if (x < 5.0) {
+    result = 30.0;
+} else {
+    result = 40.0;
+}
+@OUT = vec4(result);
+"""
+        result = compile_and_run(code, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 10.0, f"Expected 10.0, got {v}"
+        r.ok("else if: first branch of 4")
+    except Exception as e:
+        r.fail("else if: first branch of 4", f"{e}\n{traceback.format_exc()}")
+
+    # 3. else if chain - last (else) branch
+    try:
+        code = """
+float x = 99.0;
+float result = 0.0;
+if (x < 1.0) {
+    result = 10.0;
+} else if (x < 3.0) {
+    result = 20.0;
+} else {
+    result = 30.0;
+}
+@OUT = vec4(result);
+"""
+        result = compile_and_run(code, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 30.0, f"Expected 30.0, got {v}"
+        r.ok("else if: falls through to else")
+    except Exception as e:
+        r.fail("else if: falls through to else", f"{e}\n{traceback.format_exc()}")
+
+    # 4. else if without final else
+    try:
+        code = """
+float x = 99.0;
+float result = 0.0;
+if (x < 1.0) {
+    result = 10.0;
+} else if (x < 3.0) {
+    result = 20.0;
+}
+@OUT = vec4(result);
+"""
+        result = compile_and_run(code, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert v == 0.0, f"Expected 0.0 (no branch taken), got {v}"
+        r.ok("else if: no matching branch, no final else")
+    except Exception as e:
+        r.fail("else if: no matching branch, no final else", f"{e}\n{traceback.format_exc()}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main():
@@ -4879,6 +5642,7 @@ def main():
     test_type_checker(r)
     test_interpreter(r)
     test_for_loops(r)
+    test_break_continue(r)
     test_compound_assignments(r)
     test_examples(r)
     test_cache(r)
@@ -4909,6 +5673,11 @@ def main():
     test_matrix_types(r)
     test_matrix_benchmarks(r)
     test_v03_features(r)
+    test_wireable_params(r)
+    test_string_functions_v04(r)
+    test_while_loops(r)
+    test_new_stdlib_functions(r)
+    test_else_if_chains(r)
 
     success = r.summary()
     return 0 if success else 1

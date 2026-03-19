@@ -41,6 +41,9 @@ class TokenType(Enum):
     KW_IF = auto()
     KW_ELSE = auto()
     KW_FOR = auto()
+    KW_WHILE = auto()
+    KW_BREAK = auto()
+    KW_CONTINUE = auto()
 
     # Operators
     PLUS = auto()
@@ -94,6 +97,9 @@ KEYWORDS = {
     "if": TokenType.KW_IF,
     "else": TokenType.KW_ELSE,
     "for": TokenType.KW_FOR,
+    "while": TokenType.KW_WHILE,
+    "break": TokenType.KW_BREAK,
+    "continue": TokenType.KW_CONTINUE,
 }
 
 SINGLE_CHAR_TOKENS = {

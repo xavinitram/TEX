@@ -5,6 +5,31 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-19
+
+### Added
+- **`while` loops** — `while (condition) { body }` with break/continue support, 1024 iteration cap
+- **`else if` chains** — `if (...) {} else if (...) {} else {}` (already parsed, now documented and tested)
+- **15 new string functions:**
+  - `split(s, delim, max?)` — split string into array
+  - `lstrip(s)`, `rstrip(s)` — directional whitespace trimming
+  - `pad_left(s, width, char?)`, `pad_right(s, width, char?)` — padding with optional fill character
+  - `format(template, ...args)` — `{}` placeholder interpolation (up to 15 args)
+  - `repeat(s, count)` — repeat string N times
+  - `str_reverse(s)` — reverse a string
+  - `count(s, sub)` — count non-overlapping substring occurrences
+  - `matches(s, pattern)` — full regex match (returns 1.0/0.0)
+  - `hash(s)` — deterministic SHA-256 hex prefix (16 chars)
+  - `hash_float(s)` — deterministic hash to float in [0, 1)
+  - `hash_int(s, max?)` — deterministic hash to non-negative integer
+  - `char_at(s, i)` — character at index (empty string if out of bounds)
+- **`replace()` now accepts optional 4th argument** `max_count` to limit replacements
+- Dynamic-size string arrays from `split()` — `string arr[] = split(s, ",");`
+
+### Changed
+- break/continue now work in both `for` and `while` loops
+- `format()` rounds float32 values to 6 significant digits to avoid precision noise
+
 ## [0.3.1] - 2026-03-19
 
 ### Added

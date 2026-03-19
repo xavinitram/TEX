@@ -17,7 +17,8 @@ from __future__ import annotations
 import torch
 import math
 from ..tex_compiler.ast_nodes import (
-    ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, ExprStatement,
+    ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
+    BreakStmt, ContinueStmt,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, SourceLoc,
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
@@ -34,6 +35,16 @@ class InterpreterError(Exception):
         self.loc = loc
         prefix = f"[{loc}] " if loc else ""
         super().__init__(f"{prefix}{message}")
+
+
+class _Break(Exception):
+    """Internal signal for break statements inside for loops."""
+    pass
+
+
+class _Continue(Exception):
+    """Internal signal for continue statements inside for loops."""
+    pass
 
 
 class Interpreter:
@@ -196,10 +207,16 @@ class Interpreter:
             self._exec_if_else(node)
         elif isinstance(node, ForLoop):
             self._exec_for_loop(node)
+        elif isinstance(node, WhileLoop):
+            self._exec_while_loop(node)
         elif isinstance(node, ExprStatement):
             self._eval(node.expr)
         elif isinstance(node, ParamDecl):
             pass  # Declarations are compile-time only; values come from widget kwargs
+        elif isinstance(node, BreakStmt):
+            raise _Break()
+        elif isinstance(node, ContinueStmt):
+            raise _Continue()
         else:
             raise InterpreterError(f"Unknown statement: {type(node).__name__}", node.loc)
 
@@ -413,13 +430,28 @@ class Interpreter:
 
     def _exec_if_else(self, node: IfElse):
         """
-        Execute if/else by evaluating both branches and using torch.where.
+        Execute if/else.
 
-        This is the vectorized approach: both branches execute, and the result
-        is selected per-element by the condition mask.
+        Scalar conditions (0-dim tensors, e.g. loop counters): use short-circuit
+        evaluation — only execute the true branch. This is required for
+        break/continue to work correctly inside if blocks.
+
+        Spatial conditions (B, H, W tensors): use vectorized both-branch
+        evaluation with torch.where merging.
         """
         cond = self._eval(node.condition)
 
+        # Scalar condition: short-circuit (supports break/continue)
+        if cond.dim() == 0:
+            if cond.item() > 0.5:
+                for stmt in node.then_body:
+                    self._exec_stmt(stmt)
+            elif node.else_body:
+                for stmt in node.else_body:
+                    self._exec_stmt(stmt)
+            return
+
+        # Spatial condition: vectorized both-branch evaluation
         # Snapshot the environment before branches
         # PERF: clones ALL tensors; selective cloning (only vars assigned in branches)
         # would reduce allocations but requires a liveness analysis pass — deferred to v0.3.
@@ -534,8 +566,13 @@ class Interpreter:
                     if (cond > 0.5).float().sum().item() == 0:
                         break
 
-                for stmt in node.body:
-                    self._exec_stmt(stmt)
+                try:
+                    for stmt in node.body:
+                        self._exec_stmt(stmt)
+                except _Break:
+                    break
+                except _Continue:
+                    pass  # Skip rest of body, proceed to update
                 self._exec_stmt(node.update)
                 iteration += 1
         else:
@@ -551,8 +588,13 @@ class Interpreter:
                     if (cond > 0.5).float().sum().item() == 0:
                         break
 
-                for stmt in node.body:
-                    self._exec_stmt(stmt)
+                try:
+                    for stmt in node.body:
+                        self._exec_stmt(stmt)
+                except _Break:
+                    break
+                except _Continue:
+                    pass  # Skip rest of body, proceed to update
                 self._exec_stmt(node.update)
                 iteration += 1
 
@@ -580,6 +622,39 @@ class Interpreter:
         if not isinstance(cond.right, NumberLiteral):
             return None
         return (cond.left.name, int(cond.right.value), cond.op == "<=")
+
+    def _exec_while_loop(self, node: WhileLoop):
+        """
+        Execute a bounded while loop.
+
+        Same safety guarantees as for loops: hard limit of MAX_LOOP_ITERATIONS.
+        """
+        iteration = 0
+        while iteration < MAX_LOOP_ITERATIONS:
+            cond = self._eval(node.condition)
+
+            if cond.dim() == 0:
+                if cond.item() <= 0.5:
+                    break
+            else:
+                if (cond > 0.5).float().sum().item() == 0:
+                    break
+
+            try:
+                for stmt in node.body:
+                    self._exec_stmt(stmt)
+            except _Break:
+                break
+            except _Continue:
+                pass  # Skip rest of body, re-evaluate condition
+            iteration += 1
+
+        if iteration >= MAX_LOOP_ITERATIONS:
+            raise InterpreterError(
+                f"While loop exceeded maximum iteration limit ({MAX_LOOP_ITERATIONS}). "
+                f"Check your loop condition.",
+                node.loc,
+            )
 
     # -- Expression evaluation ------------------------------------------
 
