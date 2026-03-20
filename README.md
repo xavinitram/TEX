@@ -584,6 +584,13 @@ See the `examples/` directory for complete snippets:
 - `radial_gradient.tex` — distance-from-center gradient with smoothstep
 - `mask_from_color.tex` — extract mask by color distance (green screen keying)
 - `pixelate.tex` — mosaic/pixelation effect via floor UV
+- `bilateral_approx.tex` — approximate bilateral filter (edge-preserving blur)
+- `color_grade.tex` — lift-gamma-gain with saturation control
+- `lens_distortion.tex` — barrel/pincushion lens distortion
+- `levels.tex` — Photoshop-style input/output level mapping
+- `normal_map.tex` — normal map generation from height map
+- `tone_map.tex` — ACES filmic tone mapping
+- `unsharp_mask.tex` — classic unsharp mask sharpening
 
 ## Architecture
 
@@ -595,32 +602,50 @@ TEX_Wrangle/
   tex_compiler/
     lexer.py               # Tokenizer
     parser.py              # Recursive-descent parser -> AST
-    ast_nodes.py           # AST node definitions
+    ast_nodes.py           # AST node definitions (with __slots__)
     type_checker.py        # Static type analysis
+    optimizer.py           # Constant folding + algebraic simplification
     stdlib_signatures.py   # Function signatures for type checking
   tex_runtime/
     interpreter.py         # Tree-walking tensor evaluator
-    stdlib.py              # Built-in function implementations (79)
+    stdlib.py              # Built-in function implementations (101)
     compiled.py            # torch.compile wrapper with backend cascade
+    codegen.py             # AST -> Python function compiler
   js/
     tex_extension.js       # Frontend: auto-socket, CodeMirror 6 editor, help popup
   tests/
-    test_tex.py            # 355-test suite
-  examples/                # Example TEX snippets (29 files)
+    test_tex.py            # Comprehensive test suite
+  benchmarks/
+    run_benchmarks.py      # Reproducible performance benchmarks
+    README.md              # Benchmark usage and result format docs
+  examples/                # Example TEX snippets (36 files)
   .tex_cache/              # Disk cache directory (auto-created, gitignored)
 ```
 
 ## Performance
 
-On CPU at 512×512 (grayscale conversion):
-- First execution: ~3ms (includes compilation)
-- Cached execution: ~0.7ms
+Typical CPU times at 512×512, batch=1, warm cache:
 
-Compilation results are stored in a two-tier Mega-Cache:
+| Program | Time | Description |
+|---------|------|-------------|
+| grayscale | 3.9 ms | Single `luma()` call |
+| edge_detect | 66 ms | Sobel kernel with neighbor sampling |
+| blur (5×5) | 104 ms | Nested for loops + `fetch()` |
+| perlin_clouds | 287 ms | 6-octave fBm noise |
+
+v0.5.0 is **1.4×–2.0× faster** than v0.4.0 across the benchmark suite
+(geometric mean speedup at 256/512/1024px). Branching-heavy programs see
+the largest gains (up to 34× on `branch_nested` at 1024px).
+
+Run `python benchmarks/run_benchmarks.py` for full results on your system,
+or `--compare benchmarks/results/v0.4.0.json` to measure against the
+v0.4.0 baseline.
+
+**Compilation pipeline:** source → lexer → parser → type checker → optimizer → interpreter. Compilation results are stored in a two-tier cache:
 - **Memory:** LRU cache (128 entries) for instant re-execution
 - **Disk:** Pickle-based persistence (512 entries) in `.tex_cache/`, survives ComfyUI restarts
 
-With `torch_compile` enabled, first execution has a one-time tracing overhead (~1-5s), but subsequent runs benefit from fused tensor operations.
+With `torch_compile` enabled, first execution has a one-time tracing overhead (~1–5s), but subsequent runs benefit from fused tensor operations.
 
 ## Limitations
 

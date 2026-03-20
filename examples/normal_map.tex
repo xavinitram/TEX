@@ -1,0 +1,35 @@
+// Generate normal map from height/displacement map
+// Essential for 3D rendering and texture generation workflows
+// Uses Sobel-like gradient estimation
+
+float px = 1.0 / iw;
+float py = 1.0 / ih;
+float strength = 2.0;
+
+// Sample grayscale heights in a cross pattern
+float tl = luma(sample(@image, u - px, v - py));
+float tc = luma(sample(@image, u,      v - py));
+float tr = luma(sample(@image, u + px, v - py));
+float ml = luma(sample(@image, u - px, v));
+float mr = luma(sample(@image, u + px, v));
+float bl = luma(sample(@image, u - px, v + py));
+float bc = luma(sample(@image, u,      v + py));
+float br = luma(sample(@image, u + px, v + py));
+
+// Sobel gradients
+float dx = (tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl);
+float dy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
+
+// Normal vector
+float nx = -dx * strength;
+float ny = -dy * strength;
+float nz = 1.0;
+
+// Normalize
+float len = sqrt(nx * nx + ny * ny + nz * nz);
+nx = nx / len;
+ny = ny / len;
+nz = nz / len;
+
+// Map from [-1,1] to [0,1] for storage
+@OUT = vec3(nx * 0.5 + 0.5, ny * 0.5 + 0.5, nz * 0.5 + 0.5);

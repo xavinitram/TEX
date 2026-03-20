@@ -1,0 +1,40 @@
+// Color grading: lift-gamma-gain with saturation control
+// Realistic color correction workflow used in compositing
+
+// Extract channels
+float r = @image.r;
+float g = @image.g;
+float b = @image.b;
+
+// Lift (shadows) — adds to dark values
+float lift_r = 0.02;
+float lift_g = 0.0;
+float lift_b = 0.05;
+r = r + lift_r * (1.0 - r);
+g = g + lift_g * (1.0 - g);
+b = b + lift_b * (1.0 - b);
+
+// Gamma (midtones) — power curve
+float gamma_r = 1.1;
+float gamma_g = 1.0;
+float gamma_b = 0.95;
+r = pow(clamp(r, 0.0, 1.0), 1.0 / gamma_r);
+g = pow(clamp(g, 0.0, 1.0), 1.0 / gamma_g);
+b = pow(clamp(b, 0.0, 1.0), 1.0 / gamma_b);
+
+// Gain (highlights) — multiplies bright values
+float gain_r = 1.05;
+float gain_g = 1.0;
+float gain_b = 0.98;
+r = r * gain_r;
+g = g * gain_g;
+b = b * gain_b;
+
+// Saturation adjustment
+float lum = r * 0.2126 + g * 0.7152 + b * 0.0722;
+float sat = 1.2;
+r = lerp(lum, r, sat);
+g = lerp(lum, g, sat);
+b = lerp(lum, b, sat);
+
+@OUT = vec3(clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0));

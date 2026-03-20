@@ -1,0 +1,35 @@
+// Approximate bilateral filter (edge-preserving blur)
+// Weights neighbors by both spatial and intensity distance
+// 5x5 kernel — realistic denoising/smoothing workflow
+
+vec3 center = @image;
+float sigma_s = 2.0;  // spatial sigma
+float sigma_r = 0.1;  // range (intensity) sigma
+float inv_2ss = -0.5 / (sigma_s * sigma_s);
+float inv_2sr = -0.5 / (sigma_r * sigma_r);
+
+vec3 acc = vec3(0.0);
+float wsum = 0.0;
+
+for (int dy = -2; dy <= 2; dy = dy + 1) {
+    for (int dx = -2; dx <= 2; dx = dx + 1) {
+        float su = u + float(dx) / iw;
+        float sv = v + float(dy) / ih;
+        vec3 neighbor = sample(@image, su, sv);
+
+        // Spatial weight
+        float d2 = float(dx * dx + dy * dy);
+        float ws = exp(d2 * inv_2ss);
+
+        // Intensity weight
+        vec3 diff = neighbor - center;
+        float cd = diff.r * diff.r + diff.g * diff.g + diff.b * diff.b;
+        float wr = exp(cd * inv_2sr);
+
+        float w = ws * wr;
+        acc = acc + neighbor * w;
+        wsum = wsum + w;
+    }
+}
+
+@OUT = acc / wsum;

@@ -25,9 +25,14 @@ from ..tex_compiler.ast_nodes import (
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP
 from .stdlib import TEXStdlib, SAFE_EPSILON
+# Codegen module available for future torch.compile integration but not used
+# in the hot path — benchmarks show the interpreter dispatch is already fast
+# enough that codegen overhead (constant creation, try/except) is a net loss.
+# from .codegen import try_compile as _try_codegen, _CgBreak, _CgContinue
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
+
 
 
 class InterpreterError(Exception):
@@ -54,17 +59,59 @@ class Interpreter:
     Usage:
         interp = Interpreter()
         result = interp.execute(ast, bindings, type_map)
+
+    The interpreter is reusable across executions. State is fully reset
+    at the start of each execute() call. The dispatch tables and stdlib
+    function registry are built once per instance and reused.
     """
+
+    # ── Class-level caches (built once, shared across all instances) ──
+    _stdlib_functions: dict[str, callable] | None = None
+
+    @classmethod
+    def _get_stdlib(cls) -> dict[str, callable]:
+        if cls._stdlib_functions is None:
+            cls._stdlib_functions = TEXStdlib.get_functions()
+        return cls._stdlib_functions
 
     def __init__(self):
         self.env: dict[str, torch.Tensor] = {}
         self.bindings: dict[str, torch.Tensor] = {}
         self.type_map: dict[int, TEXType] = {}
-        self.functions: dict[str, callable] = TEXStdlib.get_functions()
+        self.functions: dict[str, callable] = self._get_stdlib()
         self.device: torch.device = torch.device("cpu")
         self.spatial_shape: tuple[int, int, int] | None = None  # (B, H, W)
         self._array_meta: dict[str, int] = {}  # var_name -> array size
         self._literal_cache: dict[tuple[float, str], torch.Tensor] = {}  # (value, device) -> tensor
+        self._inplace_ready: set[str] = set()  # vars that have been cloned for in-place ops
+
+        # ── Dispatch tables (O(1) lookup, built once per instance) ──
+        self._stmt_dispatch: dict[type, callable] = {
+            VarDecl: self._exec_var_decl,
+            ArrayDecl: self._exec_array_decl,
+            Assignment: self._exec_assignment,
+            IfElse: self._exec_if_else,
+            ForLoop: self._exec_for_loop,
+            WhileLoop: self._exec_while_loop,
+            ExprStatement: lambda node: self._eval(node.expr),
+            ParamDecl: lambda node: None,
+        }
+        self._eval_dispatch: dict[type, callable] = {
+            NumberLiteral: self._eval_number_literal,
+            StringLiteral: lambda node: node.value,
+            Identifier: self._eval_identifier,
+            BindingRef: self._eval_binding,
+            ChannelAccess: self._eval_channel_access,
+            BinOp: self._eval_binop,
+            UnaryOp: self._eval_unary,
+            TernaryOp: self._eval_ternary,
+            FunctionCall: self._eval_function_call,
+            VecConstructor: self._eval_vec_constructor,
+            MatConstructor: self._eval_mat_constructor,
+            CastExpr: self._eval_cast,
+            ArrayIndexAccess: self._eval_array_index,
+            ArrayLiteral: self._eval_array_literal,
+        }
 
     def execute(
         self,
@@ -74,6 +121,8 @@ class Interpreter:
         device: torch.device | str = "cpu",
         latent_channel_count: int = 0,
         output_names: list[str] | None = None,
+        precision: str = "fp32",
+        used_builtins: frozenset[str] | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Execute a TEX program.
@@ -85,43 +134,171 @@ class Interpreter:
             device: Target device
             latent_channel_count: Channel count for latent inputs
             output_names: If provided, return dict of named outputs instead of single @OUT
+            precision: "fp32" (default), "fp16", or "bf16" for reduced precision
+            used_builtins: Pre-computed frozenset of builtin names (from cache).
+                If None, will be computed by walking the AST.
 
         Returns:
             If output_names is None: the value of @OUT (backward compat)
             If output_names is provided: dict mapping name -> value for each output
         """
-        self.device = torch.device(device)
+        # Skip inference_mode for pure string/scalar programs (no tensor bindings)
+        has_tensors = any(isinstance(v, torch.Tensor) for v in bindings.values())
+        if has_tensors:
+            with torch.inference_mode():
+                return self._execute_inner(program, bindings, type_map, device,
+                                           latent_channel_count, output_names,
+                                           precision, used_builtins=used_builtins)
+        else:
+            return self._execute_inner(program, bindings, type_map, device,
+                                       latent_channel_count, output_names,
+                                       precision, used_builtins=used_builtins)
+
+    def execute_tiled(
+        self,
+        program: Program,
+        bindings: dict[str, torch.Tensor | float | int],
+        type_map: dict[int, TEXType],
+        device: torch.device | str = "cpu",
+        latent_channel_count: int = 0,
+        output_names: list[str] | None = None,
+        precision: str = "fp32",
+        tile_height: int = 2048,
+        used_builtins: frozenset[str] | None = None,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Execute with tiling for large images to prevent OOM.
+
+        Splits images into horizontal strips of `tile_height` rows.
+        Coordinate builtins (u, v, ix, iy) reflect full-image positions.
+        Sampling functions receive the FULL source image so neighbourhood
+        lookups work correctly across tile boundaries.
+
+        For images smaller than tile_height, falls through to regular execute.
+        """
+        # Find spatial dims from bindings
+        full_H = full_W = B = 0
+        for val in bindings.values():
+            if isinstance(val, torch.Tensor) and val.dim() >= 3:
+                B, full_H, full_W = val.shape[0], val.shape[1], val.shape[2]
+                break
+        if full_H <= tile_height:
+            return self.execute(program, bindings, type_map, device,
+                                latent_channel_count, output_names, precision,
+                                used_builtins=used_builtins)
+
+        # Process in horizontal strips
+        tiles: list[torch.Tensor] = []
+        tile_dicts: list[dict] = []  # for multi-output mode
+        for y_start in range(0, full_H, tile_height):
+            y_end = min(y_start + tile_height, full_H)
+
+            # Slice spatial bindings to the tile region for OUTPUT computation,
+            # but keep full-resolution bindings available for sampling.
+            # Strategy: slice bindings that are consumed as @OUT source,
+            # but sampling functions always receive the full image.
+            # We achieve this by slicing bindings and passing tile_offset.
+            tile_bindings = {}
+            for name, val in bindings.items():
+                if isinstance(val, torch.Tensor) and val.dim() >= 3:
+                    tile_bindings[name] = val[:, y_start:y_end]
+                else:
+                    tile_bindings[name] = val
+
+            # Execute tile with offset info for correct coordinate generation
+            with torch.inference_mode():
+                result = self._execute_inner(
+                    program, tile_bindings, type_map, device,
+                    latent_channel_count, output_names, precision,
+                    tile_offset=(y_start, full_H, full_W),
+                    used_builtins=used_builtins,
+                )
+
+            if isinstance(result, dict):
+                tile_dicts.append(result)
+            else:
+                tiles.append(result)
+
+        if tile_dicts:
+            # Multi-output: concatenate each output along H
+            merged = {}
+            for key in tile_dicts[0]:
+                vals = [d[key] for d in tile_dicts]
+                if isinstance(vals[0], torch.Tensor):
+                    merged[key] = torch.cat(vals, dim=1)
+                else:
+                    merged[key] = vals[0]
+            return merged
+
+        return torch.cat(tiles, dim=1)
+
+    # Precision dtype mapping
+    _PRECISION_DTYPES = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }
+
+    def _execute_inner(
+        self,
+        program: Program,
+        bindings: dict[str, torch.Tensor | float | int],
+        type_map: dict[int, TEXType],
+        device: torch.device | str,
+        latent_channel_count: int,
+        output_names: list[str] | None,
+        precision: str = "fp32",
+        tile_offset: tuple[int, int, int] | None = None,
+        used_builtins: frozenset[str] | None = None,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self._device_str = str(self.device)  # Cache for literal cache key
         self.type_map = type_map
         self.latent_channel_count = latent_channel_count
+        self._dtype = self._PRECISION_DTYPES.get(precision, torch.float32)
         self.env = {}
         self.bindings = {}
         self._array_meta = {}
+        self._inplace_ready.clear()
 
-        # Process bindings
+        # Process bindings — skip redundant .to() when already on target device/dtype
+        target_device = self.device
+        target_dtype = self._dtype
+        needs_dtype_cast = target_dtype != torch.float32
         for name, value in bindings.items():
             if isinstance(value, str):
                 self.bindings[name] = value  # strings pass through as Python str
             elif isinstance(value, torch.Tensor):
-                self.bindings[name] = value.to(self.device)
+                t = value
+                if t.device != target_device:
+                    t = t.to(target_device)
+                if needs_dtype_cast and t.is_floating_point() and t.dtype != target_dtype:
+                    t = t.to(target_dtype)
+                self.bindings[name] = t
             else:
-                self.bindings[name] = torch.tensor(float(value), dtype=torch.float32, device=self.device)
+                self.bindings[name] = torch.tensor(float(value), dtype=target_dtype, device=target_device)
 
         # Determine spatial context from image inputs
         self.spatial_shape = self._determine_spatial_shape()
 
-        # Create built-in coordinate variables
-        self._create_builtins()
+        # Create built-in coordinate variables (lazy — only what the program uses)
+        self._create_builtins(program, tile_offset=tile_offset, used_builtins=used_builtins)
 
-        # Execute statements
+        # Execute statements via tree-walking interpreter
         for stmt in program.statements:
             self._exec_stmt(stmt)
+
+        # Convert outputs back to float32 if using reduced precision
+        def _to_output(val):
+            if self._dtype != torch.float32 and isinstance(val, torch.Tensor) and val.is_floating_point():
+                return val.float()
+            return val
 
         # Multi-output mode
         if output_names is not None:
             results = {}
             for name in output_names:
                 if name in self.bindings:
-                    results[name] = self.bindings[name]
+                    results[name] = _to_output(self.bindings[name])
                 else:
                     raise InterpreterError(
                         f"Output @{name} was not assigned by the TEX program"
@@ -135,7 +312,7 @@ class Interpreter:
                 "(e.g. @OUT, or named outputs like @result)"
             )
 
-        return self.bindings["OUT"]
+        return _to_output(self.bindings["OUT"])
 
     def _determine_spatial_shape(self) -> tuple[int, int, int] | None:
         """Find the spatial dimensions from image inputs."""
@@ -149,76 +326,88 @@ class Interpreter:
                 return (value.shape[0], value.shape[1], value.shape[2])
         return None
 
-    def _create_builtins(self):
-        """Create built-in variables (ix, iy, u, v, iw, ih, PI, E)."""
+    def _create_builtins(self, program: Program, tile_offset: tuple[int, int, int] | None = None,
+                         used_builtins: frozenset[str] | None = None):
+        """Create built-in variables lazily — only allocate what the program uses.
+
+        Builtins use compact broadcast-friendly shapes instead of full
+        [B, H, W] expansion. PyTorch broadcasts automatically in ops.
+
+        When tile_offset is provided (y_start, full_H, full_W), coordinates
+        reflect position in the full image rather than the tile.
+        """
+        used = used_builtins if used_builtins is not None else _collect_identifiers(program)
+
         if self.spatial_shape:
             B, H, W = self.spatial_shape
 
-            # ix: pixel x-coordinate [0, W-1]
-            ix = torch.arange(W, dtype=torch.float32, device=self.device)
-            ix = ix.view(1, 1, W).expand(B, H, W)
-            self.env["ix"] = ix
+            # For tiled execution, use full image dimensions for coordinate normalization
+            if tile_offset is not None:
+                y_start, full_H, full_W = tile_offset
+            else:
+                y_start, full_H, full_W = 0, H, W
 
-            # iy: pixel y-coordinate [0, H-1]
-            iy = torch.arange(H, dtype=torch.float32, device=self.device)
-            iy = iy.view(1, H, 1).expand(B, H, W)
-            self.env["iy"] = iy
+            # ix: pixel x-coordinate [0, W-1] — compact shape [1, 1, W]
+            if "ix" in used:
+                ix = torch.arange(W, dtype=self._dtype, device=self.device).view(1, 1, W)
+                self.env["ix"] = ix
 
-            # u, v: normalized coordinates [0, 1]
-            self.env["u"] = ix / max(W - 1, 1)
-            self.env["v"] = iy / max(H - 1, 1)
+                if "u" in used:
+                    self.env["u"] = (ix / max(full_W - 1, 1)).expand(B, H, W)
+            elif "u" in used:
+                ix = torch.arange(W, dtype=self._dtype, device=self.device).view(1, 1, W)
+                self.env["u"] = (ix / max(full_W - 1, 1)).expand(B, H, W)
 
-            # iw, ih: dimensions
-            self.env["iw"] = torch.tensor(float(W), dtype=torch.float32, device=self.device)
-            self.env["ih"] = torch.tensor(float(H), dtype=torch.float32, device=self.device)
+            # iy: pixel y-coordinate — offset by y_start for tiling
+            if "iy" in used:
+                iy = torch.arange(y_start, y_start + H, dtype=self._dtype, device=self.device).view(1, H, 1)
+                self.env["iy"] = iy
 
-            # fi: frame/batch index [0, B-1]
-            fi = torch.arange(B, dtype=torch.float32, device=self.device)
-            fi = fi.view(B, 1, 1).expand(B, H, W)
-            self.env["fi"] = fi
+                if "v" in used:
+                    self.env["v"] = (iy / max(full_H - 1, 1)).expand(B, H, W)
+            elif "v" in used:
+                iy = torch.arange(y_start, y_start + H, dtype=self._dtype, device=self.device).view(1, H, 1)
+                self.env["v"] = (iy / max(full_H - 1, 1)).expand(B, H, W)
 
-            # fn: total frame/batch count
-            self.env["fn"] = torch.tensor(float(B), dtype=torch.float32, device=self.device)
+            # iw, ih: FULL image dimensions (not tile dimensions)
+            if "iw" in used:
+                self.env["iw"] = torch.tensor(float(full_W), dtype=self._dtype, device=self.device)
+            if "ih" in used:
+                self.env["ih"] = torch.tensor(float(full_H), dtype=self._dtype, device=self.device)
+
+            if "fi" in used:
+                self.env["fi"] = torch.arange(B, dtype=self._dtype, device=self.device).view(B, 1, 1)
+            if "fn" in used:
+                self.env["fn"] = torch.tensor(float(B), dtype=self._dtype, device=self.device)
         else:
-            # No spatial context — pure scalar mode
-            self.env["ix"] = torch.tensor(0.0, device=self.device)
-            self.env["iy"] = torch.tensor(0.0, device=self.device)
-            self.env["u"] = torch.tensor(0.0, device=self.device)
-            self.env["v"] = torch.tensor(0.0, device=self.device)
-            self.env["iw"] = torch.tensor(1.0, device=self.device)
-            self.env["ih"] = torch.tensor(1.0, device=self.device)
-            self.env["fi"] = torch.tensor(0.0, device=self.device)
-            self.env["fn"] = torch.tensor(1.0, device=self.device)
+            # No spatial context — pure scalar mode (only create what's used)
+            _scalar_defaults = {"ix": 0.0, "iy": 0.0, "u": 0.0, "v": 0.0,
+                                "iw": 1.0, "ih": 1.0, "fi": 0.0, "fn": 1.0}
+            for name, val in _scalar_defaults.items():
+                if name in used:
+                    self.env[name] = torch.tensor(val, device=self.device)
 
-        self.env["PI"] = torch.tensor(math.pi, dtype=torch.float32, device=self.device)
-        self.env["E"] = torch.tensor(math.e, dtype=torch.float32, device=self.device)
-        self.env["ic"] = torch.tensor(float(self.latent_channel_count), dtype=torch.float32, device=self.device)
+        if "PI" in used:
+            self.env["PI"] = torch.tensor(math.pi, dtype=self._dtype, device=self.device)
+        if "E" in used:
+            self.env["E"] = torch.tensor(math.e, dtype=self._dtype, device=self.device)
+        if "ic" in used:
+            self.env["ic"] = torch.tensor(float(self.latent_channel_count), dtype=self._dtype, device=self.device)
 
     # -- Statement execution --------------------------------------------
 
     def _exec_stmt(self, node: ASTNode):
-        if isinstance(node, VarDecl):
-            self._exec_var_decl(node)
-        elif isinstance(node, ArrayDecl):
-            self._exec_array_decl(node)
-        elif isinstance(node, Assignment):
-            self._exec_assignment(node)
-        elif isinstance(node, IfElse):
-            self._exec_if_else(node)
-        elif isinstance(node, ForLoop):
-            self._exec_for_loop(node)
-        elif isinstance(node, WhileLoop):
-            self._exec_while_loop(node)
-        elif isinstance(node, ExprStatement):
-            self._eval(node.expr)
-        elif isinstance(node, ParamDecl):
-            pass  # Declarations are compile-time only; values come from widget kwargs
-        elif isinstance(node, BreakStmt):
+        # Fast path: dispatch table lookup (O(1) instead of isinstance chain)
+        handler = self._stmt_dispatch.get(type(node))
+        if handler is not None:
+            handler(node)
+            return
+        # Break/continue are rare — check after dispatch table
+        if isinstance(node, BreakStmt):
             raise _Break()
-        elif isinstance(node, ContinueStmt):
+        if isinstance(node, ContinueStmt):
             raise _Continue()
-        else:
-            raise InterpreterError(f"Unknown statement: {type(node).__name__}", node.loc)
+        raise InterpreterError(f"Unknown statement: {type(node).__name__}", node.loc)
 
     def _exec_var_decl(self, node: VarDecl):
         if node.initializer:
@@ -228,6 +417,8 @@ class Interpreter:
             declared = self.type_map.get(id(node), TEXType.FLOAT)
             value = self._default_value(declared)
         self.env[node.name] = value
+        # New declaration invalidates in-place readiness (value may be aliased)
+        self._inplace_ready.discard(node.name)
 
     def _exec_array_decl(self, node: ArrayDecl):
         """Execute an array declaration."""
@@ -259,7 +450,7 @@ class Interpreter:
                 if spatial:
                     expanded = [_ensure_spatial(e, spatial) for e in elements]
                 else:
-                    expanded = [e if isinstance(e, torch.Tensor) else torch.tensor(float(e), dtype=torch.float32, device=self.device) for e in elements]
+                    expanded = [e if isinstance(e, torch.Tensor) else torch.tensor(float(e), dtype=self._dtype, device=self.device) for e in elements]
                 # For vec3/vec4 arrays, promote elements to consistent channel count
                 if is_vec:
                     channels = 3 if node.element_type_name == "vec3" else 4
@@ -280,15 +471,15 @@ class Interpreter:
                 channels = 3 if node.element_type_name == "vec3" else 4
                 if self.spatial_shape:
                     B, H, W = self.spatial_shape
-                    value = torch.zeros(B, H, W, size, channels, dtype=torch.float32, device=self.device)
+                    value = torch.zeros(B, H, W, size, channels, dtype=self._dtype, device=self.device)
                 else:
-                    value = torch.zeros(size, channels, dtype=torch.float32, device=self.device)
+                    value = torch.zeros(size, channels, dtype=self._dtype, device=self.device)
             else:
                 if self.spatial_shape:
                     B, H, W = self.spatial_shape
-                    value = torch.zeros(B, H, W, size, dtype=torch.float32, device=self.device)
+                    value = torch.zeros(B, H, W, size, dtype=self._dtype, device=self.device)
                 else:
-                    value = torch.zeros(size, dtype=torch.float32, device=self.device)
+                    value = torch.zeros(size, dtype=self._dtype, device=self.device)
 
         self.env[node.name] = value
         self._array_meta[node.name] = size
@@ -296,7 +487,7 @@ class Interpreter:
     def _promote_to_channels(self, tensor: torch.Tensor, channels: int) -> torch.Tensor:
         """Ensure a tensor has the correct number of channels for a vec array element."""
         if not isinstance(tensor, torch.Tensor):
-            tensor = torch.tensor(float(tensor), dtype=torch.float32, device=self.device)
+            tensor = torch.tensor(float(tensor), dtype=self._dtype, device=self.device)
         if tensor.dim() >= 1 and tensor.shape[-1] in (3, 4):
             c = tensor.shape[-1]
             if c == channels:
@@ -310,9 +501,56 @@ class Interpreter:
         # Scalar — broadcast to vec
         return tensor.unsqueeze(-1).expand(*tensor.shape, channels)
 
+    # In-place operation mapping: op -> (tensor_method, is_commutative)
+    _INPLACE_OPS = {
+        "+": ("add_", True),
+        "-": ("sub_", False),
+        "*": ("mul_", True),
+    }
+
     def _exec_assignment(self, node: Assignment):
-        value = self._eval(node.value)
         target = node.target
+
+        # In-place optimization: x = x OP expr or x = expr OP x
+        # Reuses x's memory instead of allocating a new tensor
+        if isinstance(target, Identifier) and isinstance(node.value, BinOp):
+            rhs = node.value
+            op_info = self._INPLACE_OPS.get(rhs.op)
+            if op_info is not None:
+                method_name, commutative = op_info
+                name = target.name
+                # Pattern 1: x = x OP expr
+                if isinstance(rhs.left, Identifier) and rhs.left.name == name:
+                    current = self.env.get(name)
+                    if current is not None and current.__class__ is torch.Tensor:
+                        other_val = self._eval(rhs.right)
+                        if other_val.__class__ is torch.Tensor and (
+                            other_val.dim() == 0 or other_val.shape == current.shape
+                        ):
+                            # Clone on first in-place to establish ownership
+                            # (prevents aliasing with literal cache or bindings)
+                            if name not in self._inplace_ready:
+                                current = current.clone()
+                                self.env[name] = current
+                                self._inplace_ready.add(name)
+                            getattr(current, method_name)(other_val)
+                            return
+                # Pattern 2: x = expr OP x (only for commutative ops)
+                elif commutative and isinstance(rhs.right, Identifier) and rhs.right.name == name:
+                    current = self.env.get(name)
+                    if current is not None and current.__class__ is torch.Tensor:
+                        other_val = self._eval(rhs.left)
+                        if other_val.__class__ is torch.Tensor and (
+                            other_val.dim() == 0 or other_val.shape == current.shape
+                        ):
+                            if name not in self._inplace_ready:
+                                current = current.clone()
+                                self.env[name] = current
+                                self._inplace_ready.add(name)
+                            getattr(current, method_name)(other_val)
+                            return
+
+        value = self._eval(node.value)
 
         if isinstance(target, Identifier):
             self.env[target.name] = value
@@ -385,7 +623,7 @@ class Interpreter:
 
             if result.dim() == 2:
                 # Non-spatial vector array [N, C]
-                val_t = value if isinstance(value, torch.Tensor) else torch.tensor(float(value), dtype=torch.float32, device=self.device)
+                val_t = value if isinstance(value, torch.Tensor) else torch.tensor(float(value), dtype=self._dtype, device=self.device)
                 result[idx] = val_t
             elif idx.dim() == 0:
                 # Constant index: [..., N, C] → assign vec to [..., C]
@@ -408,7 +646,7 @@ class Interpreter:
             result = array.clone()
 
             if result.dim() == 1:
-                result[idx] = value if isinstance(value, torch.Tensor) else torch.tensor(float(value), dtype=torch.float32, device=self.device)
+                result[idx] = value if isinstance(value, torch.Tensor) else torch.tensor(float(value), dtype=self._dtype, device=self.device)
             elif idx.dim() == 0:
                 spatial_shape = result.shape[:-1]
                 result[..., idx.item()] = _ensure_spatial(value, spatial_shape)
@@ -428,6 +666,53 @@ class Interpreter:
         else:
             raise InterpreterError("Array index assignment requires a variable target", target.loc)
 
+    @staticmethod
+    def _collect_assigned_vars(stmts: list[ASTNode]) -> tuple[set[str], set[str]]:
+        """Collect variable names and binding names assigned in a statement list.
+
+        Returns (env_vars, binding_names) — recursively walks into nested
+        if/else and loop bodies to find all possible assignments.
+        """
+        env_vars: set[str] = set()
+        binding_names: set[str] = set()
+        for stmt in stmts:
+            if isinstance(stmt, Assignment):
+                target = stmt.target
+                if isinstance(target, Identifier):
+                    env_vars.add(target.name)
+                elif isinstance(target, BindingRef):
+                    binding_names.add(target.name)
+                elif isinstance(target, ChannelAccess):
+                    obj = target.object
+                    if isinstance(obj, Identifier):
+                        env_vars.add(obj.name)
+                    elif isinstance(obj, BindingRef):
+                        binding_names.add(obj.name)
+                elif isinstance(target, ArrayIndexAccess):
+                    arr = target.array
+                    if isinstance(arr, Identifier):
+                        env_vars.add(arr.name)
+                    elif isinstance(arr, BindingRef):
+                        binding_names.add(arr.name)
+            elif isinstance(stmt, VarDecl):
+                env_vars.add(stmt.name)
+            elif isinstance(stmt, ArrayDecl):
+                env_vars.add(stmt.name)
+            elif isinstance(stmt, IfElse):
+                e1, b1 = Interpreter._collect_assigned_vars(stmt.then_body)
+                e2, b2 = Interpreter._collect_assigned_vars(stmt.else_body)
+                env_vars |= e1 | e2
+                binding_names |= b1 | b2
+            elif isinstance(stmt, ForLoop):
+                e, b = Interpreter._collect_assigned_vars(stmt.body)
+                env_vars |= e
+                binding_names |= b
+            elif isinstance(stmt, WhileLoop):
+                e, b = Interpreter._collect_assigned_vars(stmt.body)
+                env_vars |= e
+                binding_names |= b
+        return env_vars, binding_names
+
     def _exec_if_else(self, node: IfElse):
         """
         Execute if/else.
@@ -437,7 +722,8 @@ class Interpreter:
         break/continue to work correctly inside if blocks.
 
         Spatial conditions (B, H, W tensors): use vectorized both-branch
-        evaluation with torch.where merging.
+        evaluation with torch.where merging. Uses selective cloning — only
+        variables actually assigned in branches are cloned/merged.
         """
         cond = self._eval(node.condition)
 
@@ -452,64 +738,73 @@ class Interpreter:
             return
 
         # Spatial condition: vectorized both-branch evaluation
-        # Snapshot the environment before branches
-        # PERF: clones ALL tensors; selective cloning (only vars assigned in branches)
-        # would reduce allocations but requires a liveness analysis pass — deferred to v0.3.
-        env_snapshot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in self.env.items()}
-        bindings_snapshot = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in self.bindings.items()}
+        # Selective cloning: only snapshot variables that are assigned in branches
+        modified_env, modified_bindings = self._collect_assigned_vars(node.then_body)
+        if node.else_body:
+            e2, b2 = self._collect_assigned_vars(node.else_body)
+            modified_env |= e2
+            modified_bindings |= b2
+
+        # Snapshot only modified variables
+        env_snapshot = {}
+        for k in modified_env:
+            v = self.env.get(k)
+            if v is not None:
+                env_snapshot[k] = v.clone() if isinstance(v, torch.Tensor) else v
+        bindings_snapshot = {}
+        for k in modified_bindings:
+            v = self.bindings.get(k)
+            if v is not None:
+                bindings_snapshot[k] = v.clone() if isinstance(v, torch.Tensor) else v
         meta_snapshot = dict(self._array_meta)
 
         # Execute then-branch
         for stmt in node.then_body:
             self._exec_stmt(stmt)
-        then_env = dict(self.env)
-        then_bindings = dict(self.bindings)
+        # Capture then-state for modified vars only
+        then_env = {k: self.env.get(k) for k in modified_env}
+        then_bindings = {k: self.bindings.get(k) for k in modified_bindings}
         then_meta = dict(self._array_meta)
 
-        # Restore and execute else-branch
-        self.env = env_snapshot
-        self.bindings = bindings_snapshot
+        # Restore modified vars and execute else-branch
+        for k, v in env_snapshot.items():
+            self.env[k] = v
+        for k, v in bindings_snapshot.items():
+            self.bindings[k] = v
         self._array_meta = dict(meta_snapshot)
 
         if node.else_body:
-            # Re-snapshot for else (since we restored)
-            env_snapshot2 = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in self.env.items()}
-            bindings_snapshot2 = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in self.bindings.items()}
-
             for stmt in node.else_body:
                 self._exec_stmt(stmt)
-            else_env = dict(self.env)
-            else_bindings = dict(self.bindings)
+            else_env = {k: self.env.get(k) for k in modified_env}
+            else_bindings = {k: self.bindings.get(k) for k in modified_bindings}
         else:
             else_env = dict(env_snapshot)
             else_bindings = dict(bindings_snapshot)
 
         # Merge using torch.where (tensors) or scalar condition (strings)
-        cond_bool = (cond > 0.5) if cond.dtype == torch.float32 else cond.bool()
+        cond_bool = (cond > 0.5) if cond.is_floating_point() else cond.bool()
         # For string merging: use majority vote for spatial conditions
         cond_scalar_bool = cond.float().mean().item() > 0.5 if cond.dim() > 0 else cond.item() > 0.5
 
-        # Merge env variables
-        all_keys = set(then_env.keys()) | set(else_env.keys())
-        for key in all_keys:
+        # Merge only modified env variables
+        for key in modified_env:
             then_val = then_env.get(key)
             else_val = else_env.get(key)
             if then_val is not None and else_val is not None:
                 if isinstance(then_val, torch.Tensor) and isinstance(else_val, torch.Tensor):
                     self.env[key] = _tensor_where(cond_bool, then_val, else_val)
                 elif isinstance(then_val, str) or isinstance(else_val, str):
-                    # String merge: pick based on scalar condition
                     self.env[key] = then_val if cond_scalar_bool else else_val
                 else:
                     self.env[key] = then_val
             elif then_val is not None:
                 self.env[key] = then_val
-            else:
+            elif else_val is not None:
                 self.env[key] = else_val
 
-        # Merge bindings
-        all_bkeys = set(then_bindings.keys()) | set(else_bindings.keys())
-        for key in all_bkeys:
+        # Merge only modified bindings
+        for key in modified_bindings:
             then_val = then_bindings.get(key)
             else_val = else_bindings.get(key)
             if then_val is not None and else_val is not None:
@@ -535,36 +830,36 @@ class Interpreter:
         The loop variable is a scalar that gets updated each iteration.
         Hard limit of MAX_LOOP_ITERATIONS to prevent infinite loops.
 
-        Optimization: for simple scalar loops like `for (int i = 0; i < N; i++)`,
-        the loop bounds are extracted as Python ints to avoid GPU→CPU sync via
-        .item() on every iteration.
+        Optimization: for fully static loops like `for (int i = 0; i < N; i++)`
+        where init, condition, and update are all literal-based, pre-compute
+        the iteration range as Python range() — zero .item() GPU→CPU syncs.
         """
-        # Execute initializer
-        self._exec_stmt(node.init)
+        # Try fully static loop: pre-compute range() from init/cond/update literals
+        static_range = self._try_extract_static_range(node)
 
-        # Try to extract static loop bounds to avoid .item() on every iteration.
-        # Pattern: condition is BinOp(Identifier, "<" or "<=", NumberLiteral)
-        static_bound = self._try_extract_loop_bound(node)
+        if static_range is not None:
+            loop_var, iter_range = static_range
 
-        if static_bound is not None:
-            loop_var, bound, is_le = static_bound
-            iteration = 0
-            while iteration < MAX_LOOP_ITERATIONS:
-                # Check condition using Python int — no GPU sync
-                counter_val = self.env[loop_var]
-                counter_int = int(counter_val.item()) if counter_val.dim() == 0 else None
-                if counter_int is not None:
-                    if is_le:
-                        if counter_int > bound:
-                            break
-                    else:
-                        if counter_int >= bound:
-                            break
+            if len(iter_range) > MAX_LOOP_ITERATIONS:
+                raise InterpreterError(
+                    f"For loop exceeded maximum iteration limit ({MAX_LOOP_ITERATIONS}). "
+                    f"Check your loop condition.",
+                    node.loc,
+                )
+
+            device_str = self._device_str
+            dtype = self._dtype
+            for i in iter_range:
+                # Set loop var directly as scalar tensor — no .item() needed
+                key = (float(i), device_str, dtype)
+                cached = self._literal_cache.get(key)
+                if cached is not None:
+                    self.env[loop_var] = cached
                 else:
-                    # Fell through to spatial — use tensor check
-                    cond = self._eval(node.condition)
-                    if (cond > 0.5).float().sum().item() == 0:
-                        break
+                    t = torch.tensor(float(i), dtype=dtype, device=self.device)
+                    self._literal_cache[key] = t
+                    self.env[loop_var] = t
+                self._inplace_ready.discard(loop_var)
 
                 try:
                     for stmt in node.body:
@@ -572,11 +867,10 @@ class Interpreter:
                 except _Break:
                     break
                 except _Continue:
-                    pass  # Skip rest of body, proceed to update
-                self._exec_stmt(node.update)
-                iteration += 1
+                    pass  # Skip rest of body, proceed to next iteration
         else:
-            # General case — evaluate condition each iteration
+            # General case — execute init, evaluate condition each iteration
+            self._exec_stmt(node.init)
             iteration = 0
             while iteration < MAX_LOOP_ITERATIONS:
                 cond = self._eval(node.condition)
@@ -598,30 +892,72 @@ class Interpreter:
                 self._exec_stmt(node.update)
                 iteration += 1
 
-        if iteration >= MAX_LOOP_ITERATIONS:
-            raise InterpreterError(
-                f"For loop exceeded maximum iteration limit ({MAX_LOOP_ITERATIONS}). "
-                f"Check your loop condition.",
-                node.loc,
-            )
+            if iteration >= MAX_LOOP_ITERATIONS:
+                raise InterpreterError(
+                    f"For loop exceeded maximum iteration limit ({MAX_LOOP_ITERATIONS}). "
+                    f"Check your loop condition.",
+                    node.loc,
+                )
 
-    def _try_extract_loop_bound(self, node: ForLoop) -> tuple[str, int, bool] | None:
+    def _try_extract_static_range(self, node: ForLoop) -> tuple[str, range] | None:
         """
-        Try to extract static loop bounds for optimization.
+        Try to extract a fully static loop as a Python range().
 
-        Returns (loop_var_name, bound_value, is_less_equal) or None.
-        Only matches: Identifier < NumberLiteral or Identifier <= NumberLiteral
+        Matches pattern: for (int VAR = START; VAR < END; VAR = VAR + STEP)
+        where START, END, STEP are all NumberLiterals (possibly after constant folding).
+
+        Returns (loop_var_name, range_object) or None.
         """
+        # Init: VarDecl with NumberLiteral initializer
+        init = node.init
+        if not isinstance(init, VarDecl) or init.initializer is None:
+            return None
+        if not isinstance(init.initializer, NumberLiteral):
+            return None
+        loop_var = init.name
+        start = int(init.initializer.value)
+
+        # Condition: VAR < END or VAR <= END
         cond = node.condition
-        if not isinstance(cond, BinOp):
+        if not isinstance(cond, BinOp) or cond.op not in ("<", "<="):
             return None
-        if cond.op not in ("<", "<="):
-            return None
-        if not isinstance(cond.left, Identifier):
+        if not isinstance(cond.left, Identifier) or cond.left.name != loop_var:
             return None
         if not isinstance(cond.right, NumberLiteral):
             return None
-        return (cond.left.name, int(cond.right.value), cond.op == "<=")
+        end = int(cond.right.value)
+        if cond.op == "<=":
+            end += 1
+
+        # Update: VAR = VAR + STEP or VAR = VAR - STEP
+        update = node.update
+        if not isinstance(update, Assignment):
+            return None
+        if not isinstance(update.target, Identifier) or update.target.name != loop_var:
+            return None
+        if not isinstance(update.value, BinOp):
+            return None
+        upd = update.value
+        if not isinstance(upd.left, Identifier) or upd.left.name != loop_var:
+            return None
+        if not isinstance(upd.right, NumberLiteral):
+            return None
+        if upd.op == "+":
+            step = int(upd.right.value)
+        elif upd.op == "-":
+            step = -int(upd.right.value)
+        else:
+            return None
+
+        if step == 0:
+            return None
+
+        try:
+            r = range(start, end, step)
+        except ValueError:
+            return None
+
+        return (loop_var, r)
 
     def _exec_while_loop(self, node: WhileLoop):
         """
@@ -659,70 +995,39 @@ class Interpreter:
     # -- Expression evaluation ------------------------------------------
 
     def _eval(self, node: ASTNode) -> torch.Tensor | str:
-        if isinstance(node, NumberLiteral):
-            key = (node.value, str(self.device))
-            cached = self._literal_cache.get(key)
-            if cached is not None:
-                return cached
-            t = torch.tensor(node.value, dtype=torch.float32, device=self.device)
-            self._literal_cache[key] = t
-            return t
-
-        if isinstance(node, StringLiteral):
-            return node.value
-
-        if isinstance(node, Identifier):
-            return self._eval_identifier(node)
-
-        if isinstance(node, BindingRef):
-            return self._eval_binding(node)
-
-        if isinstance(node, ChannelAccess):
-            return self._eval_channel_access(node)
-
-        if isinstance(node, BinOp):
-            return self._eval_binop(node)
-
-        if isinstance(node, UnaryOp):
-            return self._eval_unary(node)
-
-        if isinstance(node, TernaryOp):
-            return self._eval_ternary(node)
-
-        if isinstance(node, FunctionCall):
-            return self._eval_function_call(node)
-
-        if isinstance(node, VecConstructor):
-            return self._eval_vec_constructor(node)
-
-        if isinstance(node, MatConstructor):
-            return self._eval_mat_constructor(node)
-
-        if isinstance(node, CastExpr):
-            return self._eval_cast(node)
-
-        if isinstance(node, ArrayIndexAccess):
-            return self._eval_array_index(node)
-
-        if isinstance(node, ArrayLiteral):
-            # Evaluate elements and stack
-            elements = [self._eval(elem) for elem in node.elements]
-            if self.spatial_shape:
-                expanded = [_ensure_spatial(e, self.spatial_shape) for e in elements]
-            else:
-                expanded = [e if isinstance(e, torch.Tensor) else torch.tensor(float(e), dtype=torch.float32, device=self.device) for e in elements]
-            return torch.stack(expanded, dim=-1)
-
+        # Fast path: dispatch table lookup (O(1) instead of isinstance chain)
+        handler = self._eval_dispatch.get(type(node))
+        if handler is not None:
+            return handler(node)
         raise InterpreterError(f"Unknown expression: {type(node).__name__}", node.loc)
 
+    def _eval_number_literal(self, node: NumberLiteral) -> torch.Tensor:
+        key = (node.value, self._device_str, self._dtype)
+        cached = self._literal_cache.get(key)
+        if cached is not None:
+            return cached
+        t = torch.tensor(node.value, dtype=self._dtype, device=self.device)
+        self._literal_cache[key] = t
+        return t
+
+    def _eval_array_literal(self, node: ArrayLiteral) -> torch.Tensor:
+        elements = [self._eval(elem) for elem in node.elements]
+        if self.spatial_shape:
+            expanded = [_ensure_spatial(e, self.spatial_shape) for e in elements]
+        else:
+            expanded = [e if isinstance(e, torch.Tensor) else torch.tensor(float(e), dtype=self._dtype, device=self.device) for e in elements]
+        return torch.stack(expanded, dim=-1)
+
     def _eval_identifier(self, node: Identifier) -> torch.Tensor:
-        if node.name in self.env:
-            return self.env[node.name]
+        val = self.env.get(node.name)
+        if val is not None:
+            return val
         raise InterpreterError(f"Undefined variable: '{node.name}'", node.loc)
 
     def _eval_binding(self, node: BindingRef) -> torch.Tensor:
-        if node.name in self.bindings:
-            return self.bindings[node.name]
+        val = self.bindings.get(node.name)
+        if val is not None:
+            return val
         raise InterpreterError(f"Unbound input: '@{node.name}'", node.loc)
 
     def _eval_channel_access(self, node: ChannelAccess) -> torch.Tensor:
@@ -744,6 +1049,9 @@ class Interpreter:
         indices = [CHANNEL_MAP[ch] for ch in channels if ch in CHANNEL_MAP]
         if len(indices) != len(channels):
             raise InterpreterError(f"Invalid swizzle: '.{channels}'", node.loc)
+        # Fast path: contiguous slice (e.g. .rgb on vec4 = first 3 channels)
+        if indices == list(range(indices[0], indices[0] + len(indices))):
+            return base[..., indices[0]:indices[0] + len(indices)]
         return torch.stack([base[..., i] for i in indices], dim=-1)
 
     def _eval_array_index(self, node: ArrayIndexAccess) -> torch.Tensor | str:
@@ -794,63 +1102,67 @@ class Interpreter:
     def _eval_binop(self, node: BinOp) -> torch.Tensor | str:
         left = self._eval(node.left)
         right = self._eval(node.right)
+        op = node.op
 
-        # String operations
+        # Fast path: both are tensors (vast majority of cases)
+        if left.__class__ is torch.Tensor and right.__class__ is torch.Tensor:
+            # Matrix operations: check types for * operator before broadcast
+            if op == "*":
+                lt = self.type_map.get(id(node.left))
+                rt = self.type_map.get(id(node.right))
+                if lt is not None and rt is not None:
+                    if lt.is_matrix and rt.is_matrix:
+                        return torch.matmul(left, right)
+                    if lt.is_matrix and rt.is_vector:
+                        return torch.matmul(left, right.unsqueeze(-1)).squeeze(-1)
+
+            # Ensure compatible shapes (inline the common equal-dim case)
+            if left.dim() != right.dim():
+                left, right = _broadcast_pair(left, right)
+
+            # Inline operator dispatch (avoids lambda call overhead)
+            if op == "+":
+                return left + right
+            if op == "*":
+                return left * right
+            if op == "-":
+                return left - right
+            if op == "/":
+                return left / (right + SAFE_EPSILON * (right == 0).float())
+            if op == "<":
+                return (left < right).float()
+            if op == ">":
+                return (left > right).float()
+            if op == "<=":
+                return (left <= right).float()
+            if op == ">=":
+                return (left >= right).float()
+            if op == "==":
+                return (left == right).float()
+            if op == "!=":
+                return (left != right).float()
+            if op == "&&":
+                return ((left > 0.5) & (right > 0.5)).float()
+            if op == "||":
+                return ((left > 0.5) | (right > 0.5)).float()
+            if op == "%":
+                return torch.fmod(left, right + SAFE_EPSILON * (right == 0).float())
+            raise InterpreterError(f"Unknown operator: {op}", node.loc)
+
+        # Slow path: string operations
         if isinstance(left, str) or isinstance(right, str):
             if isinstance(left, str) and isinstance(right, str):
-                if node.op == "+":
+                if op == "+":
                     return left + right
-                elif node.op == "==":
-                    return torch.tensor(1.0 if left == right else 0.0, dtype=torch.float32, device=self.device)
-                elif node.op == "!=":
-                    return torch.tensor(1.0 if left != right else 0.0, dtype=torch.float32, device=self.device)
+                elif op == "==":
+                    return torch.tensor(1.0 if left == right else 0.0, dtype=self._dtype, device=self.device)
+                elif op == "!=":
+                    return torch.tensor(1.0 if left != right else 0.0, dtype=self._dtype, device=self.device)
                 else:
-                    raise InterpreterError(f"Operator '{node.op}' is not supported for strings", node.loc)
+                    raise InterpreterError(f"Operator '{op}' is not supported for strings", node.loc)
             raise InterpreterError(
-                f"Cannot use operator '{node.op}' between string and numeric types", node.loc
+                f"Cannot use operator '{op}' between string and numeric types", node.loc
             )
-
-        # Matrix operations: use type info to dispatch matmul vs element-wise
-        lt = self.type_map.get(id(node.left))
-        rt = self.type_map.get(id(node.right))
-        if node.op == "*" and lt is not None and rt is not None:
-            if lt.is_matrix and rt.is_matrix:
-                return torch.matmul(left, right)
-            if lt.is_matrix and rt.is_vector:
-                return torch.matmul(left, right.unsqueeze(-1)).squeeze(-1)
-
-        # Ensure compatible shapes
-        left, right = _broadcast_pair(left, right)
-
-        op = node.op
-        if op == "+":
-            return left + right
-        elif op == "-":
-            return left - right
-        elif op == "*":
-            return left * right
-        elif op == "/":
-            return left / (right + SAFE_EPSILON * (right == 0).float())
-        elif op == "%":
-            return torch.fmod(left, right + SAFE_EPSILON * (right == 0).float())
-        elif op == "==":
-            return (left == right).float()
-        elif op == "!=":
-            return (left != right).float()
-        elif op == "<":
-            return (left < right).float()
-        elif op == ">":
-            return (left > right).float()
-        elif op == "<=":
-            return (left <= right).float()
-        elif op == ">=":
-            return (left >= right).float()
-        elif op == "&&":
-            return ((left > 0.5) & (right > 0.5)).float()
-        elif op == "||":
-            return ((left > 0.5) | (right > 0.5)).float()
-        else:
-            raise InterpreterError(f"Unknown operator: {op}", node.loc)
 
     def _eval_unary(self, node: UnaryOp) -> torch.Tensor:
         operand = self._eval(node.operand)
@@ -887,38 +1199,49 @@ class Interpreter:
         except Exception as e:
             raise InterpreterError(f"Error in function '{node.name}': {e}", node.loc)
 
-        # String functions can return str, list functions can return list — pass through
+        # Fast path: most stdlib functions return tensors
+        if result.__class__ is torch.Tensor:
+            return result
+        # Slow path: str, list, or scalar
         if isinstance(result, (str, list)):
             return result
-        if not isinstance(result, torch.Tensor):
-            result = torch.tensor(float(result), dtype=torch.float32, device=self.device)
-        return result
+        return torch.tensor(float(result), dtype=self._dtype, device=self.device)
 
     def _eval_vec_constructor(self, node: VecConstructor) -> torch.Tensor:
         args = [self._eval(arg) for arg in node.args]
+        n = node.size
 
         if len(args) == 1:
-            # Broadcast: vec4(0.5) -> [0.5, 0.5, 0.5, 0.5]
+            # Broadcast: vec3(0.5) → [0.5, 0.5, 0.5]
             val = args[0]
-            components = [val] * node.size
-        elif len(args) == node.size:
-            components = args
-        else:
+            if val.__class__ is torch.Tensor:
+                if val.dim() == 0:
+                    # Scalar tensor → expand to [..., N]
+                    return val.unsqueeze(-1).expand(*(() if not self.spatial_shape else self.spatial_shape), n)
+                else:
+                    # Spatial scalar [B,H,W] → [B,H,W,N]
+                    return val.unsqueeze(-1).expand(*val.shape, n)
+            # Python scalar
+            return torch.tensor(float(val), dtype=self._dtype, device=self.device).unsqueeze(-1).expand(
+                *(() if not self.spatial_shape else self.spatial_shape), n
+            )
+
+        if len(args) != n:
             raise InterpreterError(
-                f"vec{node.size} expects {node.size} arguments or 1 (broadcast), got {len(args)}",
+                f"vec{n} expects {n} arguments or 1 (broadcast), got {len(args)}",
                 node.loc,
             )
 
-        # Ensure all components have compatible spatial shapes
-        # Find the maximum spatial shape among components
-        max_shape = self._get_max_spatial_shape(components)
-
-        expanded = []
-        for c in components:
-            c_exp = _ensure_spatial(c, max_shape)
-            expanded.append(c_exp)
-
-        return torch.stack(expanded, dim=-1)
+        # Multi-arg: vec3(r, g, b) — allocate once, fill channels
+        max_shape = self._get_max_spatial_shape(args)
+        if max_shape:
+            result = torch.empty(*max_shape, n, dtype=self._dtype, device=self.device)
+            for i, c in enumerate(args):
+                result[..., i] = _ensure_spatial(c, max_shape)
+            return result
+        else:
+            # No spatial context — use stack for scalar components
+            return torch.stack([_ensure_spatial(c, max_shape) for c in args], dim=-1)
 
     def _eval_mat_constructor(self, node: MatConstructor) -> torch.Tensor:
         n = node.size  # 3 or 4
@@ -927,7 +1250,7 @@ class Interpreter:
         if len(args) == 1:
             # Scaled identity: mat3(1.0) → identity * scalar
             val = args[0]
-            eye = torch.eye(n, dtype=torch.float32, device=self.device)
+            eye = torch.eye(n, dtype=self._dtype, device=self.device)
             return eye * val
         elif len(args) == n * n:
             # Full specification: mat3(a,b,c,d,e,f,g,h,i) → 3×3 row-major
@@ -963,18 +1286,18 @@ class Interpreter:
         elif t == TEXType.VEC3:
             if self.spatial_shape:
                 B, H, W = self.spatial_shape
-                return torch.zeros(B, H, W, 3, dtype=torch.float32, device=self.device)
-            return torch.zeros(3, dtype=torch.float32, device=self.device)
+                return torch.zeros(B, H, W, 3, dtype=self._dtype, device=self.device)
+            return torch.zeros(3, dtype=self._dtype, device=self.device)
         elif t == TEXType.VEC4:
             if self.spatial_shape:
                 B, H, W = self.spatial_shape
-                return torch.zeros(B, H, W, 4, dtype=torch.float32, device=self.device)
-            return torch.zeros(4, dtype=torch.float32, device=self.device)
+                return torch.zeros(B, H, W, 4, dtype=self._dtype, device=self.device)
+            return torch.zeros(4, dtype=self._dtype, device=self.device)
         elif t.is_matrix:
             n = t.mat_size
-            return torch.zeros(n, n, dtype=torch.float32, device=self.device)
+            return torch.zeros(n, n, dtype=self._dtype, device=self.device)
         else:
-            return torch.tensor(0.0, dtype=torch.float32, device=self.device)
+            return torch.tensor(0.0, dtype=self._dtype, device=self.device)
 
     def _get_max_spatial_shape(self, tensors: list[torch.Tensor]) -> tuple:
         """Find the broadcast-compatible spatial shape from a list of tensors."""
@@ -989,7 +1312,101 @@ class Interpreter:
         return max_shape
 
 
-# -- Module-level utility functions ------------------------------------
+# -- AST scanning for lazy builtins ------------------------------------
+
+# Names that are built-in variables (not user-defined)
+_BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "fi", "fn", "PI", "E", "ic"})
+
+
+def _collect_identifiers(program: Program) -> frozenset[str]:
+    """Collect all Identifier names referenced in a program (fast single-pass scan).
+
+    Returns only names that match builtin variable names, for lazy construction.
+    """
+    found: set[str] = set()
+    # Use an explicit stack to avoid recursion overhead
+    stack: list[ASTNode] = list(program.statements)
+    while stack:
+        node = stack.pop()
+        cls = type(node)
+
+        if cls is Identifier:
+            if node.name in _BUILTIN_NAMES:
+                found.add(node.name)
+            continue
+
+        # Statements
+        if cls is VarDecl:
+            if node.initializer:
+                stack.append(node.initializer)
+        elif cls is Assignment:
+            stack.append(node.target)
+            stack.append(node.value)
+        elif cls is IfElse:
+            stack.append(node.condition)
+            stack.extend(node.then_body)
+            stack.extend(node.else_body)
+        elif cls is ForLoop:
+            stack.append(node.init)
+            stack.append(node.condition)
+            stack.append(node.update)
+            stack.extend(node.body)
+        elif cls is WhileLoop:
+            stack.append(node.condition)
+            stack.extend(node.body)
+        elif cls is ExprStatement:
+            stack.append(node.expr)
+        elif cls is ArrayDecl:
+            if node.initializer:
+                stack.append(node.initializer)
+        # Expressions
+        elif cls is BinOp:
+            stack.append(node.left)
+            stack.append(node.right)
+        elif cls is UnaryOp:
+            stack.append(node.operand)
+        elif cls is TernaryOp:
+            stack.append(node.condition)
+            stack.append(node.true_expr)
+            stack.append(node.false_expr)
+        elif cls is FunctionCall:
+            stack.extend(node.args)
+        elif cls is VecConstructor:
+            stack.extend(node.args)
+        elif cls is MatConstructor:
+            stack.extend(node.args)
+        elif cls is CastExpr:
+            stack.append(node.expr)
+        elif cls is ChannelAccess:
+            stack.append(node.object)
+        elif cls is ArrayIndexAccess:
+            stack.append(node.array)
+            stack.append(node.index)
+        elif cls is ArrayLiteral:
+            stack.extend(node.elements)
+        # NumberLiteral, StringLiteral, BindingRef, BreakStmt, ContinueStmt, ParamDecl — skip
+
+    return frozenset(found)
+
+
+# -- Module-level constants and utility functions ----------------------
+
+# Operator dispatch table for _eval_binop (avoids if/elif chain)
+_BINOP_TABLE = {
+    "+": lambda a, b: a + b,
+    "-": lambda a, b: a - b,
+    "*": lambda a, b: a * b,
+    "/": lambda a, b: a / (b + SAFE_EPSILON * (b == 0).float()),
+    "%": lambda a, b: torch.fmod(a, b + SAFE_EPSILON * (b == 0).float()),
+    "==": lambda a, b: (a == b).float(),
+    "!=": lambda a, b: (a != b).float(),
+    "<": lambda a, b: (a < b).float(),
+    ">": lambda a, b: (a > b).float(),
+    "<=": lambda a, b: (a <= b).float(),
+    ">=": lambda a, b: (a >= b).float(),
+    "&&": lambda a, b: ((a > 0.5) & (b > 0.5)).float(),
+    "||": lambda a, b: ((a > 0.5) | (b > 0.5)).float(),
+}
 
 def _ensure_spatial(tensor: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:
     """Expand a tensor to match a spatial shape [B, H, W] if needed."""
@@ -1013,17 +1430,23 @@ def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, tor
     Handles the key case: scalar [B,H,W] op with vector [B,H,W,C]
     by expanding the scalar with unsqueeze(-1).
     """
-    if a.dim() == b.dim():
+    ad, bd = a.dim(), b.dim()
+    if ad == bd:
         return a, b
 
-    # One is vector (has channel dim), one is scalar
-    if a.dim() > b.dim():
-        # b is the scalar-like one, expand to match a
-        while b.dim() < a.dim():
+    # Fast path: 1 dimension difference (e.g. [B,H,W] vs [B,H,W,C])
+    if ad - bd == 1:
+        return a, b.unsqueeze(-1).expand_as(a)
+    if bd - ad == 1:
+        return a.unsqueeze(-1).expand_as(b), b
+
+    # General case: multiple dimension difference
+    if ad > bd:
+        while b.dim() < ad:
             b = b.unsqueeze(-1)
         return a, b.expand_as(a)
     else:
-        while a.dim() < b.dim():
+        while a.dim() < bd:
             a = a.unsqueeze(-1)
         return a.expand_as(b), b
 

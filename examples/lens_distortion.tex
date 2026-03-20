@@ -1,0 +1,21 @@
+// Barrel/pincushion lens distortion
+// Common in VFX for matching real camera lens characteristics
+
+float cx = 0.5;
+float cy = 0.5;
+float k1 = -0.3;  // negative = barrel, positive = pincushion
+float k2 = 0.1;
+
+// Normalized coords centered at (cx, cy)
+float dx = u - cx;
+float dy = v - cy;
+float r2 = dx * dx + dy * dy;
+float r4 = r2 * r2;
+
+// Radial distortion model
+float distort = 1.0 + k1 * r2 + k2 * r4;
+float su = cx + dx * distort;
+float sv = cy + dy * distort;
+
+// Sample with distorted coordinates
+@OUT = sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0));

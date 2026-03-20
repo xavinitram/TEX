@@ -23,6 +23,18 @@ from .tex_cache import get_cache
 from .tex_runtime.compiled import execute_compiled
 
 
+# ── Cached interpreter (reused across executions to avoid rebuild overhead) ──
+_interpreter: Interpreter | None = None
+
+
+def _get_interpreter() -> Interpreter:
+    """Get or create the cached Interpreter singleton."""
+    global _interpreter
+    if _interpreter is None:
+        _interpreter = Interpreter()
+    return _interpreter
+
+
 # Wildcard type that matches any ComfyUI type
 ANY_TYPE = "*"
 
@@ -339,7 +351,7 @@ class TEXWrangleNode:
 
             # Compile (uses two-tier Mega-Cache: memory LRU + disk persistence)
             cache = get_cache()
-            program, type_map, referenced, assigned_bindings, param_info = cache.compile_tex(code, binding_types)
+            program, type_map, referenced, assigned_bindings, param_info, used_builtins = cache.compile_tex(code, binding_types)
 
             # Determine output names (sorted alphabetically for stable ordering)
             output_names = sorted(assigned_bindings.keys())
@@ -379,10 +391,11 @@ class TEXWrangleNode:
                 if not isinstance(raw_output, dict):
                     raw_output = {output_names[0]: raw_output}
             else:
-                interp = Interpreter()
+                interp = _get_interpreter()
                 raw_output = interp.execute(program, bindings, type_map, device=device,
                                             latent_channel_count=latent_channel_count,
-                                            output_names=output_names)
+                                            output_names=output_names,
+                                            used_builtins=used_builtins)
 
             # Format each output based on inferred type
             results = []

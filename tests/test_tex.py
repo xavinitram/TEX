@@ -1236,7 +1236,7 @@ def test_cache(r: TestResult):
         cache.clear_memory()
         result = cache.compile_tex(code, bt)
         assert result is not None
-        assert len(result) == 5
+        assert len(result) == 6
         r.ok("cache: disk hit after memory clear")
         shutil.rmtree(tmp, ignore_errors=True)
     except Exception as e:
@@ -4958,7 +4958,7 @@ def test_v03_features(r: TestResult):
         cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
         code = "f$strength = 0.005;\ni$count = 3;\ns$label = \"hello\";\n@OUT = @A * $strength;"
         bt = {"A": TEXType.VEC3}
-        program, type_map, refs, assigned, params = cache.compile_tex(code, bt)
+        program, type_map, refs, assigned, params, *_ = cache.compile_tex(code, bt)
         assert "strength" in params, "Missing 'strength' in params"
         assert params["strength"]["default_value"] == 0.005, f"Expected 0.005, got {params['strength']['default_value']}"
         assert params["strength"]["type"] == TEXType.FLOAT
@@ -4977,7 +4977,7 @@ def test_v03_features(r: TestResult):
         cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
         code = "@result = @A * 0.5;\n@mask = luma(@A);"
         bt = {"A": TEXType.VEC3}
-        program, type_map, refs, assigned, params = cache.compile_tex(code, bt)
+        program, type_map, refs, assigned, params, *_ = cache.compile_tex(code, bt)
         assert "result" in assigned, "Missing 'result' in assigned_bindings"
         assert "mask" in assigned, "Missing 'mask' in assigned_bindings"
         assert assigned["result"] == TEXType.VEC3
@@ -5034,7 +5034,7 @@ def test_wireable_params(r: TestResult):
         cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
         code = "f$strength = 0.5;\n@OUT = @A * $strength;"
         bt = {"A": TEXType.VEC3}
-        program, type_map, refs, assigned, param_info = cache.compile_tex(code, bt)
+        program, type_map, refs, assigned, param_info, *_ = cache.compile_tex(code, bt)
         # Simulate tex_node.py's default injection: inject param default into bindings
         bindings = {"A": test_img}
         for ref_name in refs:
@@ -5626,6 +5626,752 @@ if (x < 1.0) {
         r.fail("else if: no matching branch, no final else", f"{e}\n{traceback.format_exc()}")
 
 
+# ── Optimization Regression Tests ──────────────────────────────────────
+
+def test_optimization_regressions(r: TestResult):
+    """Targeted regression tests for all optimization paths introduced in Phases 1-7."""
+    print("\n--- Optimization Regression Tests ---")
+    img = torch.rand(1, 8, 8, 3)
+    img4 = torch.rand(1, 8, 8, 4)
+    mask = torch.rand(1, 8, 8)
+
+    # ── 1. Inlined binop operators ──────────────────────────────────
+
+    # Test all operators produce correct results vs known values
+    try:
+        a = torch.full((1, 4, 4, 3), 0.7)
+        b = torch.full((1, 4, 4, 3), 0.3)
+        bindings = {"A": a, "B": b}
+
+        # Addition
+        result = compile_and_run("@OUT = @A + @B;", bindings, out_type=TEXType.VEC3)
+        assert torch.allclose(result, a + b, atol=1e-5), f"+ failed"
+        # Subtraction
+        result = compile_and_run("@OUT = @A - @B;", bindings, out_type=TEXType.VEC3)
+        assert torch.allclose(result, a - b, atol=1e-5), f"- failed"
+        # Multiplication
+        result = compile_and_run("@OUT = @A * @B;", bindings, out_type=TEXType.VEC3)
+        assert torch.allclose(result, a * b, atol=1e-5), f"* failed"
+        # Division (with safe epsilon)
+        result = compile_and_run("@OUT = @A / @B;", bindings, out_type=TEXType.VEC3)
+        assert result.shape == a.shape, f"/ shape mismatch"
+        # Comparison operators
+        result = compile_and_run("@OUT = vec3(@A.r < @B.r);", bindings, out_type=TEXType.VEC3)
+        assert (result[..., 0] == 0.0).all(), "< failed (0.7 < 0.3 should be false)"
+        result = compile_and_run("@OUT = vec3(@A.r > @B.r);", bindings, out_type=TEXType.VEC3)
+        assert (result[..., 0] == 1.0).all(), "> failed (0.7 > 0.3 should be true)"
+        result = compile_and_run("@OUT = vec3(@A.r == @B.r);", bindings, out_type=TEXType.VEC3)
+        assert (result[..., 0] == 0.0).all(), "== failed"
+        result = compile_and_run("@OUT = vec3(@A.r != @B.r);", bindings, out_type=TEXType.VEC3)
+        assert (result[..., 0] == 1.0).all(), "!= failed"
+        # Logical operators
+        t = torch.ones(1, 4, 4, 3)
+        f_val = torch.zeros(1, 4, 4, 3)
+        result = compile_and_run("@OUT = vec3(@A.r && @B.r);", {"A": t, "B": t}, out_type=TEXType.VEC3)
+        assert (result[..., 0] == 1.0).all(), "&& failed"
+        result = compile_and_run("@OUT = vec3(@A.r || @B.r);", {"A": f_val, "B": t}, out_type=TEXType.VEC3)
+        assert (result[..., 0] == 1.0).all(), "|| failed"
+        # Modulo
+        result = compile_and_run("@OUT = vec3(mod(@A.r, @B.r));", bindings, out_type=TEXType.VEC3)
+        assert result.shape == a.shape, "mod shape mismatch"
+        r.ok("inlined binop: all operators correct")
+    except Exception as e:
+        r.fail("inlined binop: all operators correct", f"{e}\n{traceback.format_exc()}")
+
+    # Binop with string operands still works
+    try:
+        result = compile_and_run('@OUT_str = "hello" + " " + "world";', {"A": img})
+        assert result["OUT_str"] == "hello world", f"String concat failed: {result['OUT_str']}"
+        r.ok("inlined binop: string concat")
+    except Exception as e:
+        r.fail("inlined binop: string concat", f"{e}\n{traceback.format_exc()}")
+
+    # Binop with scalar-vs-spatial broadcast
+    try:
+        result = compile_and_run("@OUT = @A + 0.5;", {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == img.shape, f"Broadcast shape: {result.shape}"
+        assert torch.allclose(result, img + 0.5, atol=1e-5)
+        r.ok("inlined binop: scalar-spatial broadcast")
+    except Exception as e:
+        r.fail("inlined binop: scalar-spatial broadcast", f"{e}\n{traceback.format_exc()}")
+
+    # Division by zero protection
+    try:
+        result = compile_and_run("@OUT = @A / vec3(0.0);", {"A": img}, out_type=TEXType.VEC3)
+        assert not torch.isnan(result).any(), "Division by zero produced NaN"
+        assert not torch.isinf(result).any(), "Division by zero produced Inf"
+        r.ok("inlined binop: division by zero protection")
+    except Exception as e:
+        r.fail("inlined binop: division by zero protection", f"{e}\n{traceback.format_exc()}")
+
+    # ── 2. Matrix multiplication path ───────────────────────────────
+
+    # mat3 * mat3 (same dimensions — was broken before fix)
+    try:
+        code = """
+mat3 m = mat3(1.0, 0.0, 0.0,
+              0.0, 1.0, 0.0,
+              0.0, 0.0, 1.0);
+mat3 m2 = mat3(2.0, 0.0, 0.0,
+               0.0, 3.0, 0.0,
+               0.0, 0.0, 4.0);
+mat3 prod = m * m2;
+vec3 col0 = prod * vec3(1.0, 0.0, 0.0);
+vec3 col1 = prod * vec3(0.0, 1.0, 0.0);
+vec3 col2 = prod * vec3(0.0, 0.0, 1.0);
+@OUT = vec3(col0.r, col1.g, col2.b);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = torch.tensor([2.0, 3.0, 4.0])
+        assert torch.allclose(result[0, 0, 0], expected, atol=1e-4), f"mat3*mat3 diagonal: {result[0,0,0]}"
+        r.ok("matrix multiplication: mat3 * mat3 (same dim)")
+    except Exception as e:
+        r.fail("matrix multiplication: mat3 * mat3 (same dim)", f"{e}\n{traceback.format_exc()}")
+
+    # mat3 * vec3
+    try:
+        code = """
+mat3 m = mat3(1.0, 0.0, 0.0,
+              0.0, 1.0, 0.0,
+              0.0, 0.0, 1.0);
+vec3 tv = vec3(1.0, 2.0, 3.0);
+@OUT = m * tv;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = torch.tensor([1.0, 2.0, 3.0])
+        assert torch.allclose(result[0, 0, 0], expected, atol=1e-4), f"mat3*vec3: {result[0,0,0]}"
+        r.ok("matrix multiplication: mat3 * vec3")
+    except Exception as e:
+        r.fail("matrix multiplication: mat3 * vec3", f"{e}\n{traceback.format_exc()}")
+
+    # scalar * mat3 (should be element-wise, not matmul)
+    try:
+        # 2 * identity should give 2*identity; verify via mat*vec
+        code = """
+mat3 m = mat3(1.0, 0.0, 0.0,
+              0.0, 1.0, 0.0,
+              0.0, 0.0, 1.0);
+mat3 scaled = 2.0 * m;
+vec3 test_vec = vec3(1.0, 2.0, 3.0);
+@OUT = scaled * test_vec;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = torch.tensor([2.0, 4.0, 6.0])  # 2I * [1,2,3] = [2,4,6]
+        assert torch.allclose(result[0, 0, 0], expected, atol=1e-4), f"scalar*mat3: {result[0,0,0]}"
+        r.ok("matrix multiplication: scalar * mat3 (element-wise)")
+    except Exception as e:
+        r.fail("matrix multiplication: scalar * mat3 (element-wise)", f"{e}\n{traceback.format_exc()}")
+
+    # ── 3. Vec constructor optimization ─────────────────────────────
+
+    # vec3(scalar) broadcast in spatial context
+    try:
+        result = compile_and_run("@OUT = vec3(0.5);", {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == (1, 8, 8, 3), f"vec3(scalar) shape: {result.shape}"
+        assert torch.allclose(result, torch.full((1, 8, 8, 3), 0.5)), "vec3(scalar) values wrong"
+        r.ok("vec constructor: vec3(scalar) broadcast spatial")
+    except Exception as e:
+        r.fail("vec constructor: vec3(scalar) broadcast spatial", f"{e}\n{traceback.format_exc()}")
+
+    # vec4(scalar) broadcast
+    try:
+        result = compile_and_run("@OUT = vec4(0.25);", {"A": img4})
+        assert result.shape == (1, 8, 8, 4), f"vec4(scalar) shape: {result.shape}"
+        assert torch.allclose(result, torch.full((1, 8, 8, 4), 0.25))
+        r.ok("vec constructor: vec4(scalar) broadcast spatial")
+    except Exception as e:
+        r.fail("vec constructor: vec4(scalar) broadcast spatial", f"{e}\n{traceback.format_exc()}")
+
+    # vec3(spatial_scalar) — broadcast [B,H,W] to [B,H,W,3]
+    try:
+        result = compile_and_run("@OUT = vec3(@A.r);", {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == (1, 8, 8, 3), f"vec3(spatial) shape: {result.shape}"
+        for c in range(3):
+            assert torch.allclose(result[..., c], img[..., 0], atol=1e-5), f"Channel {c} mismatch"
+        r.ok("vec constructor: vec3(spatial_scalar)")
+    except Exception as e:
+        r.fail("vec constructor: vec3(spatial_scalar)", f"{e}\n{traceback.format_exc()}")
+
+    # vec3(r, g, b) multi-arg spatial (uses empty+fill path)
+    try:
+        result = compile_and_run("@OUT = vec3(@A.r, @A.g, @A.b);", {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == img.shape, f"vec3(r,g,b) shape: {result.shape}"
+        assert torch.allclose(result, img, atol=1e-5), "vec3(r,g,b) should reproduce original"
+        r.ok("vec constructor: vec3(r,g,b) multi-arg spatial")
+    except Exception as e:
+        r.fail("vec constructor: vec3(r,g,b) multi-arg spatial", f"{e}\n{traceback.format_exc()}")
+
+    # vec4 from scalar args in non-spatial context
+    try:
+        code = """
+float a = 0.1;
+float b = 0.2;
+float c = 0.3;
+float d = 0.4;
+@OUT = vec4(a, b, c, d);
+"""
+        result = compile_and_run(code, {})
+        expected = torch.tensor([0.1, 0.2, 0.3, 0.4])
+        assert torch.allclose(result, expected, atol=1e-5), f"vec4 non-spatial: {result}"
+        r.ok("vec constructor: vec4 non-spatial scalar args")
+    except Exception as e:
+        r.fail("vec constructor: vec4 non-spatial scalar args", f"{e}\n{traceback.format_exc()}")
+
+    # ── 4. Static for-loop optimization ─────────────────────────────
+
+    # Standard static loop: for (int i = 0; i < 5; i = i + 1)
+    try:
+        code = """
+float sum = 0.0;
+for (int i = 0; i < 5; i = i + 1) {
+    sum = sum + 1.0;
+}
+@OUT = vec3(sum);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert abs(result[0, 0, 0, 0].item() - 5.0) < 1e-5, f"Static loop sum: {result[0,0,0,0].item()}"
+        r.ok("static for-loop: standard i++ pattern")
+    except Exception as e:
+        r.fail("static for-loop: standard i++ pattern", f"{e}\n{traceback.format_exc()}")
+
+    # Static loop with step > 1
+    try:
+        code = """
+float sum = 0.0;
+for (int i = 0; i < 10; i = i + 2) {
+    sum = sum + 1.0;
+}
+@OUT = vec3(sum);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert abs(result[0, 0, 0, 0].item() - 5.0) < 1e-5, f"Step-2 loop: {result[0,0,0,0].item()}"
+        r.ok("static for-loop: step 2")
+    except Exception as e:
+        r.fail("static for-loop: step 2", f"{e}\n{traceback.format_exc()}")
+
+    # Static loop with <= condition
+    try:
+        code = """
+float sum = 0.0;
+for (int i = 1; i <= 5; i = i + 1) {
+    sum = sum + float(i);
+}
+@OUT = vec3(sum);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert abs(result[0, 0, 0, 0].item() - 15.0) < 1e-5, f"<= loop sum: {result[0,0,0,0].item()}"
+        r.ok("static for-loop: <= condition (1+2+3+4+5=15)")
+    except Exception as e:
+        r.fail("static for-loop: <= condition (1+2+3+4+5=15)", f"{e}\n{traceback.format_exc()}")
+
+    # Static loop with negative step (i = i - 1)
+    try:
+        code = """
+float sum = 0.0;
+for (int i = 5; i < 10; i = i - 1) {
+    sum = sum + 1.0;
+}
+@OUT = vec3(sum);
+"""
+        # Negative step with i < 10 should immediately have no iterations (or fall to general path)
+        # range(5, 10, -1) is empty
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert abs(result[0, 0, 0, 0].item() - 0.0) < 1e-5, f"Negative step empty: {result[0,0,0,0].item()}"
+        r.ok("static for-loop: negative step (empty range)")
+    except Exception as e:
+        r.fail("static for-loop: negative step (empty range)", f"{e}\n{traceback.format_exc()}")
+
+    # Break inside static loop
+    try:
+        code = """
+float sum = 0.0;
+for (int i = 0; i < 100; i = i + 1) {
+    if (i > 4.5) { break; }
+    sum = sum + 1.0;
+}
+@OUT = vec3(sum);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        val = result[0, 0, 0, 0].item()
+        assert abs(val - 5.0) < 1e-5, f"Break in static loop: {val}"
+        r.ok("static for-loop: break")
+    except Exception as e:
+        r.fail("static for-loop: break", f"{e}\n{traceback.format_exc()}")
+
+    # Continue inside static loop
+    try:
+        code = """
+float sum = 0.0;
+for (int i = 0; i < 10; i = i + 1) {
+    if (i == 3.0 || i == 7.0) { continue; }
+    sum = sum + 1.0;
+}
+@OUT = vec3(sum);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        val = result[0, 0, 0, 0].item()
+        assert abs(val - 8.0) < 1e-5, f"Continue in static loop: {val} (expected 8)"
+        r.ok("static for-loop: continue skips i=3 and i=7")
+    except Exception as e:
+        r.fail("static for-loop: continue skips i=3 and i=7", f"{e}\n{traceback.format_exc()}")
+
+    # Non-static loop still works (runtime-dependent bound)
+    try:
+        code = """
+float limit = @A.r * 10.0;
+float sum = 0.0;
+for (int i = 0; i < 5; i = i + 1) {
+    sum = sum + 1.0;
+}
+@OUT = vec3(sum);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert abs(result[0, 0, 0, 0].item() - 5.0) < 1e-5
+        r.ok("static for-loop: non-static bound falls to general path")
+    except Exception as e:
+        r.fail("static for-loop: non-static bound falls to general path", f"{e}\n{traceback.format_exc()}")
+
+    # ── 5. Constant folding & algebraic simplification ──────────────
+
+    # Constant folding: compile-time evaluation
+    try:
+        result = compile_and_run("@OUT = vec3(2.0 + 3.0);", {"A": img}, out_type=TEXType.VEC3)
+        assert abs(result[0, 0, 0, 0].item() - 5.0) < 1e-5
+        r.ok("constant folding: 2.0 + 3.0 = 5.0")
+    except Exception as e:
+        r.fail("constant folding: 2.0 + 3.0 = 5.0", f"{e}\n{traceback.format_exc()}")
+
+    # Constant folding of pure functions
+    try:
+        result = compile_and_run("@OUT = vec3(sin(0.0));", {"A": img}, out_type=TEXType.VEC3)
+        assert abs(result[0, 0, 0, 0].item()) < 1e-5, "sin(0) should be ~0"
+        r.ok("constant folding: sin(0.0) = 0.0")
+    except Exception as e:
+        r.fail("constant folding: sin(0.0) = 0.0", f"{e}\n{traceback.format_exc()}")
+
+    # x * 0 shape preservation (was a bug)
+    try:
+        result = compile_and_run("@OUT = @A * 0.0;", {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == img.shape, f"x*0 shape: {result.shape} != {img.shape}"
+        assert (result == 0.0).all(), "x*0 should be all zeros"
+        r.ok("algebraic opt: x*0 preserves shape")
+    except Exception as e:
+        r.fail("algebraic opt: x*0 preserves shape", f"{e}\n{traceback.format_exc()}")
+
+    # 0 * x shape preservation (was a bug)
+    try:
+        result = compile_and_run("@OUT = 0.0 * @A;", {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == img.shape, f"0*x shape: {result.shape} != {img.shape}"
+        assert (result == 0.0).all(), "0*x should be all zeros"
+        r.ok("algebraic opt: 0*x preserves shape")
+    except Exception as e:
+        r.fail("algebraic opt: 0*x preserves shape", f"{e}\n{traceback.format_exc()}")
+
+    # x * 1 identity
+    try:
+        result = compile_and_run("@OUT = @A * 1.0;", {"A": img}, out_type=TEXType.VEC3)
+        assert torch.allclose(result, img, atol=1e-5), "x*1 should equal x"
+        r.ok("algebraic opt: x*1 = x")
+    except Exception as e:
+        r.fail("algebraic opt: x*1 = x", f"{e}\n{traceback.format_exc()}")
+
+    # x + 0 identity
+    try:
+        result = compile_and_run("@OUT = @A + 0.0;", {"A": img}, out_type=TEXType.VEC3)
+        assert torch.allclose(result, img, atol=1e-5), "x+0 should equal x"
+        r.ok("algebraic opt: x+0 = x")
+    except Exception as e:
+        r.fail("algebraic opt: x+0 = x", f"{e}\n{traceback.format_exc()}")
+
+    # Division by constant -> multiplication by reciprocal
+    try:
+        result = compile_and_run("@OUT = @A / 2.0;", {"A": img}, out_type=TEXType.VEC3)
+        expected = img * 0.5
+        assert torch.allclose(result, expected, atol=1e-5), "x/2 should equal x*0.5"
+        r.ok("algebraic opt: x/const -> x*(1/const)")
+    except Exception as e:
+        r.fail("algebraic opt: x/const -> x*(1/const)", f"{e}\n{traceback.format_exc()}")
+
+    # pow(x, 2) -> x * x strength reduction
+    try:
+        code = "float val = 3.0; @OUT = vec3(pow(val, 2.0));"
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert abs(result[0, 0, 0, 0].item() - 9.0) < 1e-4, f"pow(3,2): {result[0,0,0,0].item()}"
+        r.ok("algebraic opt: pow(x,2) -> x*x")
+    except Exception as e:
+        r.fail("algebraic opt: pow(x,2) -> x*x", f"{e}\n{traceback.format_exc()}")
+
+    # ── 6. CSE (Common Subexpression Elimination) ───────────────────
+
+    # CSE should produce correct results when same expression appears twice
+    try:
+        code = """
+float a = sin(u * 3.14) + cos(v * 3.14);
+float b = sin(u * 3.14) + cos(v * 3.14);
+@OUT = vec3(a + b);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        # a and b should be identical
+        code2 = "@OUT = vec3(2.0 * (sin(u * 3.14) + cos(v * 3.14)));"
+        result2 = compile_and_run(code2, {"A": img}, out_type=TEXType.VEC3)
+        assert torch.allclose(result, result2, atol=1e-4), "CSE should not change results"
+        r.ok("CSE: duplicate expressions produce correct result")
+    except Exception as e:
+        r.fail("CSE: duplicate expressions produce correct result", f"{e}\n{traceback.format_exc()}")
+
+    # CSE inside loop body
+    try:
+        code = """
+float total = 0.0;
+for (int i = 0; i < 5; i = i + 1) {
+    float a = sin(u * 2.0) * cos(v * 2.0);
+    float b = sin(u * 2.0) * cos(v * 2.0);
+    total = total + a + b;
+}
+@OUT = vec3(total);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == (1, 8, 8, 3), f"CSE in loop shape: {result.shape}"
+        r.ok("CSE: works inside loop body")
+    except Exception as e:
+        r.fail("CSE: works inside loop body", f"{e}\n{traceback.format_exc()}")
+
+    # ── 7. Dead code elimination ────────────────────────────────────
+
+    try:
+        # Dead variable should be eliminated without affecting output
+        code = """
+float dead = sin(u) * cos(v) * 42.0;
+@OUT = @A;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert torch.allclose(result, img, atol=1e-5), "DCE should not affect output"
+        r.ok("DCE: dead variable eliminated correctly")
+    except Exception as e:
+        r.fail("DCE: dead variable eliminated correctly", f"{e}\n{traceback.format_exc()}")
+
+    # ── 8. inference_mode skip for non-tensor programs ──────────────
+
+    # Pure string program (no tensors)
+    try:
+        code = '@OUT_str = "hello";'
+        result = compile_and_run(code, {})
+        assert result["OUT_str"] == "hello"
+        r.ok("inference_mode skip: pure string program")
+    except Exception as e:
+        r.fail("inference_mode skip: pure string program", f"{e}\n{traceback.format_exc()}")
+
+    # Pure scalar program
+    try:
+        code = """
+float x = 3.14;
+float y = x * 2.0;
+@OUT = vec4(y);
+"""
+        result = compile_and_run(code, {})
+        assert abs(result[0].item() - 6.28) < 1e-3, f"Scalar program: {result[0].item()}"
+        r.ok("inference_mode skip: pure scalar program")
+    except Exception as e:
+        r.fail("inference_mode skip: pure scalar program", f"{e}\n{traceback.format_exc()}")
+
+    # ── 9. Selective cloning in spatial if/else ─────────────────────
+
+    # Only modified variables should be cloned
+    try:
+        code = """
+float x = 0.0;
+float y = 1.0;
+if (u > 0.5) {
+    x = 2.0;
+} else {
+    x = 3.0;
+}
+@OUT = vec3(x + y);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        # Left half: x=3 (u<=0.5), right half: x=2 (u>0.5); y=1 always
+        # So left=4, right=3
+        r_vals = result[0, 0, :, 0]  # row 0, all cols, channel 0
+        # u=0 at col 0, u=1 at col 7
+        assert r_vals[0].item() > 3.5, f"u=0: expected ~4.0, got {r_vals[0].item()}"
+        assert r_vals[-1].item() < 3.5, f"u=1: expected ~3.0, got {r_vals[-1].item()}"
+        r.ok("selective cloning: spatial if/else correct merge")
+    except Exception as e:
+        r.fail("selective cloning: spatial if/else correct merge", f"{e}\n{traceback.format_exc()}")
+
+    # Nested if/else
+    try:
+        code = """
+float val = 0.0;
+if (u > 0.5) {
+    if (v > 0.5) {
+        val = 1.0;
+    } else {
+        val = 2.0;
+    }
+} else {
+    val = 3.0;
+}
+@OUT = vec3(val);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == (1, 8, 8, 3), f"Nested if/else shape: {result.shape}"
+        r.ok("selective cloning: nested if/else")
+    except Exception as e:
+        r.fail("selective cloning: nested if/else", f"{e}\n{traceback.format_exc()}")
+
+    # Binding modification in if/else
+    try:
+        code = """
+if (u > 0.5) {
+    @OUT = vec3(1.0);
+} else {
+    @OUT = vec3(0.0);
+}
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == (1, 8, 8, 3)
+        # Right side should be 1.0, left side should be 0.0
+        assert result[0, 0, 0, 0].item() < 0.5, "u=0 should give 0.0"
+        assert result[0, 0, -1, 0].item() > 0.5, "u=1 should give 1.0"
+        r.ok("selective cloning: binding modification in branches")
+    except Exception as e:
+        r.fail("selective cloning: binding modification in branches", f"{e}\n{traceback.format_exc()}")
+
+    # ── 10. In-place operations ─────────────────────────────────────
+
+    try:
+        code = """
+float acc = 0.0;
+for (int i = 0; i < 10; i = i + 1) {
+    acc = acc + 1.0;
+}
+@OUT = vec3(acc);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert abs(result[0, 0, 0, 0].item() - 10.0) < 1e-5, f"In-place acc: {result[0,0,0,0].item()}"
+        r.ok("in-place ops: accumulator pattern")
+    except Exception as e:
+        r.fail("in-place ops: accumulator pattern", f"{e}\n{traceback.format_exc()}")
+
+    # In-place with spatial tensors
+    try:
+        code = """
+vec3 color = @A;
+color = color + vec3(0.1);
+color = color * 2.0;
+@OUT = color;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        expected = (img + 0.1) * 2.0
+        assert torch.allclose(result, expected, atol=1e-4), "In-place spatial"
+        r.ok("in-place ops: spatial tensor accumulation")
+    except Exception as e:
+        r.fail("in-place ops: spatial tensor accumulation", f"{e}\n{traceback.format_exc()}")
+
+    # ── 11. Interpreter singleton reuse ─────────────────────────────
+
+    try:
+        interp = Interpreter()
+        # Run two different programs on the same interpreter
+        code1 = "@OUT = @A + 0.1;"
+        tokens1 = Lexer(code1).tokenize()
+        prog1 = Parser(tokens1).parse()
+        bt1 = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        tc1 = TypeChecker(binding_types=bt1)
+        tm1 = tc1.check(prog1)
+        r1 = interp.execute(prog1, {"A": img}, tm1)
+
+        code2 = "@OUT = @A * 0.5;"
+        tokens2 = Lexer(code2).tokenize()
+        prog2 = Parser(tokens2).parse()
+        bt2 = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        tc2 = TypeChecker(binding_types=bt2)
+        tm2 = tc2.check(prog2)
+        r2 = interp.execute(prog2, {"A": img}, tm2)
+
+        assert torch.allclose(r1, img + 0.1, atol=1e-5), "First execution wrong"
+        assert torch.allclose(r2, img * 0.5, atol=1e-5), "Second execution wrong"
+        r.ok("interpreter reuse: two programs, correct results")
+    except Exception as e:
+        r.fail("interpreter reuse: two programs, correct results", f"{e}\n{traceback.format_exc()}")
+
+    # ── 12. Cache 6-tuple output ────────────────────────────────────
+
+    try:
+        cache = TEXCache(cache_dir=Path(tempfile.mkdtemp()))
+        bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        result = cache.compile_tex("@OUT = @A;", bt)
+        assert len(result) == 6, f"Cache should return 6-tuple, got {len(result)}"
+        program, type_map, refs, assigned, params, used_builtins = result
+        assert isinstance(used_builtins, frozenset), f"used_builtins type: {type(used_builtins)}"
+        # Verify cache hit returns same structure
+        result2 = cache.compile_tex("@OUT = @A;", bt)
+        assert len(result2) == 6, "Cache hit should also return 6-tuple"
+        r.ok("cache: 6-tuple output with used_builtins")
+        shutil.rmtree(cache._cache_dir, ignore_errors=True)
+    except Exception as e:
+        r.fail("cache: 6-tuple output with used_builtins", f"{e}\n{traceback.format_exc()}")
+
+    # ── 13. used_builtins correctness ───────────────────────────────
+
+    try:
+        from TEX_Wrangle.tex_runtime.interpreter import _collect_identifiers
+
+        # Program using u, v, PI
+        code = "@OUT = vec3(sin(u * PI) * cos(v));"
+        tokens = Lexer(code).tokenize()
+        prog = Parser(tokens).parse()
+        bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        tc = TypeChecker(binding_types=bt)
+        tc.check(prog)
+        from TEX_Wrangle.tex_compiler.optimizer import optimize
+        prog = optimize(prog)
+        used = _collect_identifiers(prog)
+        assert "u" in used, "Should find u"
+        assert "v" in used, "Should find v"
+        assert "PI" in used, "Should find PI"
+        assert "ix" not in used, "Should not find ix"
+        assert "iy" not in used, "Should not find iy"
+        r.ok("used_builtins: correct identification")
+    except Exception as e:
+        r.fail("used_builtins: correct identification", f"{e}\n{traceback.format_exc()}")
+
+    # Program using NO builtins
+    try:
+        code = "@OUT = @A;"
+        tokens = Lexer(code).tokenize()
+        prog = Parser(tokens).parse()
+        bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        tc = TypeChecker(binding_types=bt)
+        tc.check(prog)
+        prog = optimize(prog)
+        used = _collect_identifiers(prog)
+        assert len(used) == 0, f"Should have no builtins, got {used}"
+        r.ok("used_builtins: empty for trivial program")
+    except Exception as e:
+        r.fail("used_builtins: empty for trivial program", f"{e}\n{traceback.format_exc()}")
+
+    # ── 14. Dispatch table fallback ─────────────────────────────────
+
+    # Ensure break/continue still work (they're outside the dispatch table)
+    try:
+        code = """
+float sum = 0.0;
+for (int i = 0; i < 20; i = i + 1) {
+    if (i > 9.5) { break; }
+    if (i == 5.0) { continue; }
+    sum = sum + 1.0;
+}
+@OUT = vec3(sum);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        # i=0..9 except i=5 → 9 iterations
+        assert abs(result[0, 0, 0, 0].item() - 9.0) < 1e-5
+        r.ok("dispatch table: break/continue work correctly")
+    except Exception as e:
+        r.fail("dispatch table: break/continue work correctly", f"{e}\n{traceback.format_exc()}")
+
+    # ── 15. Precision handling ──────────────────────────────────────
+
+    try:
+        code = "@OUT = @A * 0.5;"
+        tokens = Lexer(code).tokenize()
+        prog = Parser(tokens).parse()
+        bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        tc = TypeChecker(binding_types=bt)
+        tm = tc.check(prog)
+        prog = optimize(prog)
+        interp = Interpreter()
+        # Execute with fp32
+        r32 = interp.execute(prog, {"A": img}, tm, precision="fp32")
+        assert r32.dtype == torch.float32, f"fp32 result dtype: {r32.dtype}"
+        r.ok("precision: fp32 output correct dtype")
+    except Exception as e:
+        r.fail("precision: fp32 output correct dtype", f"{e}\n{traceback.format_exc()}")
+
+    # ── 16. End-to-end: complex real-world patterns ─────────────────
+
+    # Blur-like pattern (loop + spatial sampling)
+    try:
+        code = """
+vec3 sum = vec3(0.0);
+float count = 0.0;
+for (int dx = -1; dx <= 1; dx = dx + 1) {
+    for (int dy = -1; dy <= 1; dy = dy + 1) {
+        float sx = u + float(dx) / iw;
+        float sy = v + float(dy) / ih;
+        sum = sum + sample(@A, sx, sy);
+        count = count + 1.0;
+    }
+}
+@OUT = sum / count;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == img.shape, f"Blur shape: {result.shape}"
+        assert not torch.isnan(result).any(), "Blur produced NaN"
+        r.ok("e2e: blur-like 3x3 pattern")
+    except Exception as e:
+        r.fail("e2e: blur-like 3x3 pattern", f"{e}\n{traceback.format_exc()}")
+
+    # Conditional color grading
+    try:
+        code = """
+float luma = @A.r * 0.299 + @A.g * 0.587 + @A.b * 0.114;
+vec3 result = @A;
+if (luma > 0.5) {
+    result = result * 1.2;
+} else {
+    result = result * 0.8;
+}
+@OUT = clamp(result, 0.0, 1.0);
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert result.shape == img.shape, f"Color grade shape: {result.shape}"
+        assert (result >= 0.0).all() and (result <= 1.0).all(), "Should be clamped"
+        r.ok("e2e: conditional color grading")
+    except Exception as e:
+        r.fail("e2e: conditional color grading", f"{e}\n{traceback.format_exc()}")
+
+    # Multi-output program
+    try:
+        code = """
+@bright = @A * 1.5;
+@dark = @A * 0.5;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC3)
+        assert isinstance(result, dict), f"Multi-output should return dict: {type(result)}"
+        assert "bright" in result and "dark" in result
+        assert torch.allclose(result["bright"], img * 1.5, atol=1e-4)
+        assert torch.allclose(result["dark"], img * 0.5, atol=1e-4)
+        r.ok("e2e: multi-output program")
+    except Exception as e:
+        r.fail("e2e: multi-output program", f"{e}\n{traceback.format_exc()}")
+
+    # String processing (no tensors, tests inference_mode skip)
+    try:
+        code = """
+string a = "hello";
+string b = "world";
+@OUT_str = a + " " + b;
+"""
+        result = compile_and_run(code, {})
+        assert result["OUT_str"] == "hello world", f"String processing: {result['OUT_str']}"
+        r.ok("e2e: pure string processing")
+    except Exception as e:
+        r.fail("e2e: pure string processing", f"{e}\n{traceback.format_exc()}")
+
+    # Batch processing (B > 1)
+    try:
+        batch_img = torch.rand(4, 8, 8, 3)
+        result = compile_and_run("@OUT = @A * 0.5;", {"A": batch_img}, out_type=TEXType.VEC3)
+        assert result.shape == (4, 8, 8, 3), f"Batch shape: {result.shape}"
+        assert torch.allclose(result, batch_img * 0.5, atol=1e-5)
+        r.ok("e2e: batch processing B=4")
+    except Exception as e:
+        r.fail("e2e: batch processing B=4", f"{e}\n{traceback.format_exc()}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main():
@@ -5678,6 +6424,7 @@ def main():
     test_while_loops(r)
     test_new_stdlib_functions(r)
     test_else_if_chains(r)
+    test_optimization_regressions(r)
 
     success = r.summary()
     return 0 if success else 1

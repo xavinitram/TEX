@@ -16,3 +16,12 @@ build/
 
 # Editor build (node_modules only — source and bundle are tracked)
 editor_build/node_modules/
+
+# Benchmark results (machine-specific; not committed)
+benchmarks/results/
+
+# Internal optimization reports (not shipped)
+optimization_reports/
+
+# Intermediate benchmark JSON files from development
+tests/*.json

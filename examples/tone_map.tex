@@ -1,0 +1,26 @@
+// Tone mapping: ACES filmic curve
+// Essential for HDR to SDR conversion in image processing
+
+float r = @image.r;
+float g = @image.g;
+float b = @image.b;
+
+// Exposure adjustment
+float exposure = 1.5;
+r = r * exposure;
+g = g * exposure;
+b = b * exposure;
+
+// ACES filmic tone mapping curve
+// f(x) = (x * (2.51x + 0.03)) / (x * (2.43x + 0.59) + 0.14)
+float a_coeff = 2.51;
+float b_coeff = 0.03;
+float c_coeff = 2.43;
+float d_coeff = 0.59;
+float e_coeff = 0.14;
+
+r = clamp((r * (a_coeff * r + b_coeff)) / (r * (c_coeff * r + d_coeff) + e_coeff), 0.0, 1.0);
+g = clamp((g * (a_coeff * g + b_coeff)) / (g * (c_coeff * g + d_coeff) + e_coeff), 0.0, 1.0);
+b = clamp((b * (a_coeff * b + b_coeff)) / (b * (c_coeff * b + d_coeff) + e_coeff), 0.0, 1.0);
+
+@OUT = vec3(r, g, b);

@@ -22,13 +22,15 @@ from typing import Any
 from .tex_compiler.lexer import Lexer
 from .tex_compiler.parser import Parser
 from .tex_compiler.type_checker import TypeChecker, TEXType
+from .tex_compiler.optimizer import optimize
+from .tex_runtime.interpreter import _collect_identifiers
 
 logger = logging.getLogger("TEX")
 
 # Disk cache format version — tracks AST/type-checker compatibility, NOT the
 # release version. Bump this when AST node structure or type checker changes
 # would make existing .pkl cache files invalid (causes graceful cache miss).
-_CACHE_VERSION = "2.0.0"  # v0.3: multi-output, ParamDecl, typed bindings
+_CACHE_VERSION = "2.4.0"  # v0.7: CSE pass, static for-loop range, reusable interpreter
 
 # Limits
 _MEMORY_MAX_ENTRIES = 128
@@ -106,11 +108,13 @@ class TEXCache:
         referenced_bindings: set[str],
         assigned_bindings: dict[str, TEXType] | None = None,
         param_declarations: dict[str, dict] | None = None,
+        used_builtins: frozenset[str] | None = None,
     ):
         """Store a compilation result in both memory and disk caches."""
         fp = self.fingerprint(code, binding_types)
         result = (program, type_map, referenced_bindings,
-                  assigned_bindings or {}, param_declarations or {})
+                  assigned_bindings or {}, param_declarations or {},
+                  used_builtins or frozenset())
         self._memory_put(fp, result)
         self._save_to_disk(fp, program, binding_types)
 
@@ -121,10 +125,11 @@ class TEXCache:
         Compile TEX source: lex -> parse -> type-check, with caching.
 
         Returns (program_ast, type_map, referenced_bindings,
-                 assigned_bindings, param_declarations).
+                 assigned_bindings, param_declarations, used_builtins).
 
         assigned_bindings: dict mapping output binding names to their inferred TEXType.
         param_declarations: dict mapping parameter names to {type, type_hint}.
+        used_builtins: frozenset of builtin names referenced by the program.
         Raises LexerError, ParseError, or TypeCheckError on invalid code.
         """
         cached = self.get(code, binding_types)
@@ -136,12 +141,17 @@ class TEXCache:
         program = Parser(tokens).parse()
         checker = TypeChecker(binding_types=binding_types)
         type_map = checker.check(program)
+        program = optimize(program)
+
+        # Pre-compute builtin identifiers (avoids AST walk on every execution)
+        used_builtins = _collect_identifiers(program)
 
         self.put(code, binding_types, program, type_map,
                  checker.referenced_bindings, checker.assigned_bindings,
-                 checker.param_declarations)
+                 checker.param_declarations, used_builtins)
         return (program, type_map, checker.referenced_bindings,
-                checker.assigned_bindings, checker.param_declarations)
+                checker.assigned_bindings, checker.param_declarations,
+                used_builtins)
 
     def clear_memory(self):
         """Clear in-memory cache only (disk entries remain)."""
@@ -213,7 +223,8 @@ class TEXCache:
             os.utime(path, None)
 
             return (program, type_map, checker.referenced_bindings,
-                    checker.assigned_bindings, checker.param_declarations)
+                    checker.assigned_bindings, checker.param_declarations,
+                    _collect_identifiers(program))
         except Exception as e:
             logger.warning("[TEX] Disk cache load failed for %s…: %s", fp[:12], e)
             try:

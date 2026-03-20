@@ -155,7 +155,7 @@ function debounce(fn, ms) {
 
 // ─── Auto-Socket Management ─────────────────────────────────────────
 
-function syncInputs(node, usedBindings, paramNames) {
+function syncInputs(node, usedBindings) {
     if (!node.graph) return;
     const ANY_TYPE = "*";
 
@@ -171,11 +171,9 @@ function syncInputs(node, usedBindings, paramNames) {
     const desired = [...usedBindings].sort();
 
     // Remove unneeded inputs (reverse order for index stability)
-    // Keep inputs whose names match param widgets — ComfyUI may create
-    // implicit inputs for widgets, and we must not remove them.
     const toRemove = [];
     for (const [name, idx] of currentInputs) {
-        if (!usedBindings.has(name) && !paramNames.has(name)) {
+        if (!usedBindings.has(name)) {
             toRemove.push(idx);
         }
     }
@@ -322,7 +320,7 @@ function syncParams(node, params) {
             const parsed = info.defaultValue != null ? parseInt(info.defaultValue) : NaN;
             const def = Number.isFinite(parsed) ? parsed : 0;
             widget = node.addWidget("number", name, def, () => {}, {
-                min: -9999, max: 9999, step: 1, precision: 0,
+                min: -9999, max: 9999, step: 10, precision: 0,
             });
         } else if (typeHint === "s") {
             const raw = info.defaultValue || "";
@@ -333,13 +331,35 @@ function syncParams(node, params) {
             const parsed = info.defaultValue != null ? parseFloat(info.defaultValue) : NaN;
             const def = Number.isFinite(parsed) ? parsed : 0.0;
             widget = node.addWidget("number", name, def, () => {}, {
-                min: -9999, max: 9999, step: 0.01, precision: 3,
+                min: -9999, max: 9999, step: 0.1, precision: 3,
             });
         }
         if (widget) {
             widget._texParam = true;
             widget._texTypeHint = typeHint;
             widget.tooltip = `TEX parameter $${name} (${typeName})`;
+        }
+    }
+
+    // Register dynamic params in nodeData.input.optional so ComfyUI's Vue
+    // overlay recognizes them and enables click/drag interaction.
+    const nt = LiteGraph.registered_node_types[TEX_NODE_TYPE];
+    const optional = nt?.nodeData?.input?.optional;
+    if (optional) {
+        // Remove stale TEX param entries
+        for (const name of toRemove) {
+            delete optional[name];
+        }
+        // Add/update entries for current params
+        for (const [name, info] of params) {
+            const typeHint = info.typeHint || "f";
+            if (typeHint === "i") {
+                optional[name] = ["INT", { default: 0, min: -9999, max: 9999 }];
+            } else if (typeHint === "s") {
+                optional[name] = ["STRING", { default: "" }];
+            } else {
+                optional[name] = ["FLOAT", { default: 0.0, min: -9999, max: 9999, step: 0.1, round: 0.001 }];
+            }
         }
     }
 
@@ -423,7 +443,7 @@ function createTexEditor(node, codeWidget) {
         node._texBindings = inputs;
         node._texOutputs = outputs;
         node._texParams = params;
-        syncInputs(node, inputs, new Set(params.keys()));
+        syncInputs(node, inputs);
         syncOutputs(node, outputs);
         syncParams(node, params);
     }, DEBOUNCE_MS);
@@ -922,18 +942,18 @@ app.registerExtension({
         }
 
         // Apply saved values immediately on load
-        _texFontSize    = app.ui.settings.getSettingValue("TEX.Editor.fontSize",    14);
+        _texFontSize    = app.ui.settings.getSettingValue("TEX.Editor.fontSize",    10);
         _texLineNumbers = app.ui.settings.getSettingValue("TEX.Editor.lineNumbers", true);
         _updateDynStyles();
 
-        // Font size slider (8 – 24 px)
+        // Font size slider (4 – 20 px)
         app.ui.settings.addSetting({
             id:           "TEX.Editor.fontSize",
             name:         "TEX Editor: Font Size",
             type:         "slider",
-            defaultValue: 14,
-            min:  8,
-            max:  24,
+            defaultValue: 10,
+            min:  4,
+            max:  20,
             step: 1,
             onChange(val) {
                 _texFontSize = val;
@@ -1011,7 +1031,7 @@ app.registerExtension({
                 node._texBindings = inputs;
                 node._texOutputs = outputs;
                 node._texParams = params;
-                syncInputs(node, inputs, new Set(params.keys()));
+                syncInputs(node, inputs);
                 syncOutputs(node, outputs);
                 syncParams(node, params);
             }, DEBOUNCE_MS);
@@ -1025,19 +1045,28 @@ app.registerExtension({
 
                     // Suppress the original code widget so it takes zero layout space.
                     // We keep it alive for serialization but make it invisible.
-                    // Method 1: Override computeSize to return zero height
+                    // Method 1: Mark hidden so ComfyUI's Vue layer skips its
+                    // .dom-widget container entirely (DomWidgets.vue checks
+                    // widget.isVisible() which returns false when hidden=true).
+                    codeWidget.hidden = true;
+                    // Method 2: Override computeSize to return zero height
                     const origComputeSize = codeWidget.computeSize;
                     codeWidget.computeSize = function () {
                         return [0, -4];  // -4 absorbs ComfyUI's inter-widget spacing
                     };
 
-                    // Method 2: Also hide the DOM element when it appears
+                    // Method 3: Also hide the DOM element and its container when it appears
                     const hideOriginal = () => {
                         const el = codeWidget.element || codeWidget.inputEl;
                         if (el) {
                             el.style.display = "none";
                             el.style.height = "0";
                             el.style.overflow = "hidden";
+                            // Mark the parent container for CSS-based hiding
+                            const container = el.parentElement;
+                            if (container && container.classList.contains("dom-widget")) {
+                                container.classList.add("tex-hidden-widget");
+                            }
                             return true;
                         }
                         return false;
@@ -1081,6 +1110,29 @@ app.registerExtension({
                             );
                             return [width, maxEditorHeight];
                         };
+
+                        // The DOM widget's parent container (.dom-widget)
+                        // has pointer-events:auto (reset by ComfyUI's draw loop
+                        // every frame) and can overlap canvas-rendered param
+                        // widgets below it.  We add a CSS class and use
+                        // !important to keep pointer events disabled on the
+                        // container while allowing the editor content to remain
+                        // interactive.
+                        const markContainer = () => {
+                            const el = domWidget.element;
+                            const parentContainer = el?.parentElement;
+                            if (parentContainer && parentContainer.classList.contains("dom-widget")) {
+                                parentContainer.classList.add("tex-editor-container");
+                                return true;
+                            }
+                            return false;
+                        };
+                        if (!markContainer()) {
+                            const check = setInterval(() => {
+                                if (markContainer()) clearInterval(check);
+                            }, 200);
+                            setTimeout(() => clearInterval(check), 10000);
+                        }
                     }
 
                     // Size the default node for a better editor experience
@@ -1122,7 +1174,7 @@ app.registerExtension({
                     node._texOutputs = outputs;
                     node._texParams = params;
 
-                    syncInputs(node, inputs, new Set(params.keys()));
+                    syncInputs(node, inputs);
                     syncOutputs(node, outputs);
                     syncParams(node, params);
 
@@ -1281,12 +1333,41 @@ app.registerExtension({
             font-display: swap;
         }
 
+        /* ── DOM widget container overrides ────────────── */
+        /* ComfyUI renders each DOM widget inside a position:fixed
+           .dom-widget container managed by Vue.  These containers sit
+           above the canvas / Vue-overlay layer and capture pointer
+           events by default.  We disable pointer-events on the outer
+           containers so canvas-rendered widgets (params, compile_mode,
+           device) remain interactive, then re-enable events only on
+           the CodeMirror .cm-editor element itself. */
+        .tex-editor-container {
+            pointer-events: none !important;
+            overflow: hidden !important;
+        }
+        /* The original code textarea widget is hidden (codeWidget.hidden
+           = true) but we keep defensive CSS in case the DOM element
+           lingers. */
+        .tex-hidden-widget {
+            pointer-events: none !important;
+            height: 0 !important;
+            overflow: hidden !important;
+        }
+
         /* ── CM6 Editor Container ──────────────────────── */
+        /* The container itself is pointer-events:none so that any area
+           of the .dom-widget that extends beyond the visible editor
+           (above or below) passes events through to the canvas.
+           Only .cm-editor gets pointer-events:auto and fills the
+           container so the editor background extends to the bottom. */
         .tex-cm-container {
             width: 100%;
+            pointer-events: none !important;
+            overflow: hidden !important;
         }
         .tex-cm-container .cm-editor {
             height: 100%;
+            pointer-events: auto !important;
         }
         .tex-cm-container .cm-editor,
         .tex-cm-container .cm-editor .cm-content,

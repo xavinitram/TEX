@@ -5,6 +5,33 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-03-20
+
+### Added
+- **AST optimizer** — constant folding and algebraic simplification passes run before interpretation, reducing runtime work
+- **Codegen backend** — compiles TEX AST to Python functions for zero-dispatch-overhead execution (automatic fallback to tree-walking for unsupported patterns)
+- **Benchmark suite** (`benchmarks/run_benchmarks.py`) — reproducible cross-system performance measurement with adaptive run counts, multi-resolution sweeps, and JSON comparison workflow
+- **7 new example programs:** `bilateral_approx`, `color_grade`, `lens_distortion`, `levels`, `normal_map`, `tone_map`, `unsharp_mask`
+- Interpreter support for `precision` parameter (`fp32`/`fp16`/`bf16`) and `used_builtins` pre-scan for faster stdlib dispatch
+- `inference_mode()` wrapper for pure tensor programs (no gradient tracking overhead)
+
+### Changed
+- **Interpreter rewrite** — 1.4x–2.0x faster across all benchmarks vs v0.4.0 (geometric mean):
+  - Statement/expression dispatch via type-keyed tables instead of if/elif chains
+  - Literal tensor cache eliminates repeated constant allocation
+  - Branching rewired to fused `torch.where` fast-path (branch_nested: **34x** faster at 1024px)
+  - Loop bodies pre-compiled, break/continue via lightweight exceptions
+  - Spatial context (`u`, `v`, `ix`, `iy`) lazily allocated only when referenced
+- **stdlib improvements** — sampler cache for batch indices and Lanczos taps; tighter safety epsilon handling
+- **AST nodes** now use `__slots__` throughout for lower memory and faster attribute access
+- **Cache version** bumped to `2.4.0` (existing disk caches auto-invalidate)
+
+### Fixed
+- **Parameter widget interaction** — promoted `$param` widgets now register in `nodeData.input.optional` so ComfyUI's Vue overlay enables click/drag/arrow interaction
+- **DOM overlay blocking** — editor container and hidden textarea marked `pointer-events: none` so canvas-rendered widgets (params, compile_mode, device) remain interactive
+- INT widget step corrected to 10 (was 1, causing 0.1 increments); FLOAT step corrected to 0.1 (was 0.01)
+- Default font size changed to 10px; settings slider range narrowed to 4–20
+
 ## [0.4.0] - 2026-03-19
 
 ### Added

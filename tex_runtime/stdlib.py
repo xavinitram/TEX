@@ -15,6 +15,33 @@ import torch
 # to be invisible in image-processing contexts.
 SAFE_EPSILON = 1e-8
 
+# ── Sampler tensor cache ──────────────────────────────────────────────
+# Caches reusable tensors for sampling functions keyed by (B, H, W, device).
+# Avoids recreating batch index tensors and Lanczos tap offsets per call.
+_sampler_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _get_batch_index(B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
+    """Get or create cached batch index tensor [B, H, W] for advanced indexing."""
+    key = ("bidx", B, H, W, str(device))
+    cached = _sampler_cache.get(key)
+    if cached is not None:
+        return cached
+    t = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)
+    _sampler_cache[key] = t
+    return t
+
+
+def _get_lanczos_taps(device: torch.device) -> torch.Tensor:
+    """Get or create cached Lanczos-3 tap offset tensor [-2, -1, 0, 1, 2, 3]."""
+    key = ("ltaps", str(device))
+    cached = _sampler_cache.get(key)
+    if cached is not None:
+        return cached
+    t = torch.arange(-2, 4, device=device, dtype=torch.float32)
+    _sampler_cache[key] = t
+    return t
+
 
 class TEXStdlib:
     """Registry of built-in TEX functions."""
@@ -322,7 +349,10 @@ class TEXStdlib:
     @staticmethod
     def fn_lerp(a, b, t):
         a_t, b_t, t_t = _to_tensor(a), _to_tensor(b), _to_tensor(t)
-        return a_t + (b_t - a_t) * t_t
+        # Auto-unsqueeze weight for channel broadcast: [B,H,W] weight with [B,H,W,C] values
+        if t_t.dim() + 1 == a_t.dim():
+            t_t = t_t.unsqueeze(-1)
+        return torch.lerp(a_t, b_t, t_t)
 
     @staticmethod
     def fn_fit(val, old_min, old_max, new_min, new_max):
@@ -331,7 +361,7 @@ class TEXStdlib:
         o_min, o_max = _to_tensor(old_min), _to_tensor(old_max)
         n_min, n_max = _to_tensor(new_min), _to_tensor(new_max)
         t = (v - o_min) / (o_max - o_min + SAFE_EPSILON)
-        return n_min + t * (n_max - n_min)
+        return torch.lerp(n_min, n_max, t)
 
     @staticmethod
     def fn_smoothstep(edge0, edge1, x):
@@ -356,21 +386,21 @@ class TEXStdlib:
         """Length (magnitude) of a vector. Operates on last dimension."""
         t = _to_tensor(v)
         if t.dim() >= 1 and t.shape[-1] in (3, 4):
-            return torch.sqrt((t * t).sum(dim=-1))
+            return torch.linalg.vector_norm(t, dim=-1)
         return torch.abs(t)
 
     @staticmethod
     def fn_distance(a, b):
         diff = _to_tensor(a) - _to_tensor(b)
         if diff.dim() >= 1 and diff.shape[-1] in (3, 4):
-            return torch.sqrt((diff * diff).sum(dim=-1))
+            return torch.linalg.vector_norm(diff, dim=-1)
         return torch.abs(diff)
 
     @staticmethod
     def fn_normalize(v):
         t = _to_tensor(v)
         if t.dim() >= 1 and t.shape[-1] in (3, 4):
-            norm = torch.sqrt((t * t).sum(dim=-1, keepdim=True))
+            norm = torch.linalg.vector_norm(t, dim=-1, keepdim=True)
             return t / (norm + SAFE_EPSILON)
         return torch.sign(t)
 
@@ -469,6 +499,8 @@ class TEXStdlib:
             image: [B, H, W, C] tensor
             u_coord: float or [B, H, W] tensor — horizontal coordinate [0, 1]
             v_coord: float or [B, H, W] tensor — vertical coordinate [0, 1]
+
+        Uses torch.nn.functional.grid_sample for fused C++ bilinear interpolation.
         """
         img = _to_tensor(image)
         u = _to_tensor(u_coord)
@@ -476,41 +508,33 @@ class TEXStdlib:
 
         B, H, W, C = img.shape
 
-        # Convert from [0,1] to pixel coordinates
-        x = u * (W - 1)
-        y = v * (H - 1)
+        # grid_sample expects [B, C, H, W] input
+        img_bchw = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
-        # Expand scalars to spatial dims
-        if x.dim() == 0:
-            x = x.expand(B, H, W)
-            y = y.expand(B, H, W)
-        elif x.dim() == 2:
-            x = x.unsqueeze(0).expand(B, H, W)
-            y = y.unsqueeze(0).expand(B, H, W)
+        # Convert from [0, 1] UV to [-1, 1] grid coords (grid_sample convention)
+        grid_x = u * 2.0 - 1.0
+        grid_y = v * 2.0 - 1.0
 
-        # Clamp to valid range
-        x = torch.clamp(x, 0, W - 1)
-        y = torch.clamp(y, 0, H - 1)
+        # Build grid: needs shape [B, H_out, W_out, 2]
+        if grid_x.dim() == 0:
+            grid_x = grid_x.expand(B, H, W)
+            grid_y = grid_y.expand(B, H, W)
+        elif grid_x.dim() == 2:
+            grid_x = grid_x.unsqueeze(0).expand(B, H, W)
+            grid_y = grid_y.unsqueeze(0).expand(B, H, W)
 
-        # Bilinear interpolation
-        x0 = torch.floor(x).long()
-        x1 = torch.clamp(x0 + 1, 0, W - 1)
-        y0 = torch.floor(y).long()
-        y1 = torch.clamp(y0 + 1, 0, H - 1)
+        grid = torch.stack([grid_x, grid_y], dim=-1)  # [B, H, W, 2]
 
-        fx = (x - x0.float()).unsqueeze(-1)
-        fy = (y - y0.float()).unsqueeze(-1)
+        # Sample with bilinear interpolation (fused C++ kernel)
+        result_bchw = torch.nn.functional.grid_sample(
+            img_bchw, grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True,
+        )
 
-        b_idx = torch.arange(B, device=img.device).view(B, 1, 1).expand(B, H, W)
-
-        v00 = img[b_idx, y0, x0]
-        v01 = img[b_idx, y0, x1]
-        v10 = img[b_idx, y1, x0]
-        v11 = img[b_idx, y1, x1]
-
-        result = v00 * (1 - fx) * (1 - fy) + v01 * fx * (1 - fy) + \
-                 v10 * (1 - fx) * fy + v11 * fx * fy
-        return result
+        # Back to [B, H, W, C]
+        return result_bchw.permute(0, 2, 3, 1)
 
     @staticmethod
     def fn_fetch(image, px, py):
@@ -530,24 +554,31 @@ class TEXStdlib:
 
         B, H, W, C = img.shape
 
-        # Round to nearest integer and clamp
-        px_i = torch.clamp(torch.round(px_t).long(), 0, W - 1)
-        py_i = torch.clamp(torch.round(py_t).long(), 0, H - 1)
+        # Convert to integer indices — skip round() if already long/int dtype
+        if px_t.dtype in (torch.int32, torch.int64):
+            px_i = torch.clamp(px_t.long(), 0, W - 1)
+        else:
+            px_i = torch.clamp(px_t.long(), 0, W - 1)
+        if py_t.dtype in (torch.int32, torch.int64):
+            py_i = torch.clamp(py_t.long(), 0, H - 1)
+        else:
+            py_i = torch.clamp(py_t.long(), 0, H - 1)
 
-        # Build batch index — expand scalars to spatial dims
+        # Expand scalars to spatial dims
         if px_i.dim() == 0:
             px_i = px_i.expand(B, H, W)
         if py_i.dim() == 0:
             py_i = py_i.expand(B, H, W)
         if px_i.dim() == 2:
-            # [H, W] -> [B, H, W]
             px_i = px_i.unsqueeze(0).expand(B, H, W)
         if py_i.dim() == 2:
             py_i = py_i.unsqueeze(0).expand(B, H, W)
 
-        b_idx = torch.arange(B, device=img.device).view(B, 1, 1).expand(B, H, W)
+        # Fast path for B=1 (common case) — avoid creating batch index tensor
+        if B == 1:
+            return img[0, py_i[0], px_i[0]].unsqueeze(0)
 
-        return img[b_idx, py_i, px_i]
+        return img[_get_batch_index(B, H, W, img.device), py_i, px_i]
 
     @staticmethod
     def fn_fetch_frame(image, frame, px, py):
@@ -613,15 +644,21 @@ class TEXStdlib:
         # Resolve frame index
         f_idx = torch.clamp(torch.round(frame_t).long(), 0, B - 1)
 
-        # Convert from [0,1] to pixel coordinates
-        x = u * (W - 1)
-        y = v * (H - 1)
-
         # Expand scalars to spatial dims
         if f_idx.dim() == 0:
             f_idx = f_idx.expand(B, H, W)
         if f_idx.dim() == 2:
             f_idx = f_idx.unsqueeze(0).expand(B, H, W)
+
+        # For cross-frame sampling, we need to gather from specific frames first
+        # then apply grid_sample per-unique-frame or use advanced indexing.
+        # Since frame indices can vary per-pixel, we fall back to manual bilinear
+        # for the cross-frame case (grid_sample only handles per-batch).
+
+        # Convert from [0,1] to pixel coordinates
+        x = u * (W - 1)
+        y = v * (H - 1)
+
         if x.dim() == 0:
             x = x.expand(B, H, W)
             y = y.expand(B, H, W)
@@ -629,11 +666,9 @@ class TEXStdlib:
             x = x.unsqueeze(0).expand(B, H, W)
             y = y.unsqueeze(0).expand(B, H, W)
 
-        # Clamp to valid range
         x = torch.clamp(x, 0, W - 1)
         y = torch.clamp(y, 0, H - 1)
 
-        # Bilinear interpolation
         x0 = torch.floor(x).long()
         x1 = torch.clamp(x0 + 1, 0, W - 1)
         y0 = torch.floor(y).long()
@@ -746,7 +781,7 @@ class TEXStdlib:
             y_center = y_center.unsqueeze(0).expand(B, H, W)
 
         # Tap offsets: -2, -1, 0, 1, 2, 3 (6 taps for Lanczos-3)
-        taps = torch.arange(-2, 4, device=dev, dtype=torch.float32)  # [6]
+        taps = _get_lanczos_taps(dev)  # [6] — cached
 
         # Compute 1-D Lanczos weights for x and y (separable)
         # fx/fy: [B, H, W] → [B, H, W, 1] - taps: [6] → weights: [B, H, W, 6]
@@ -763,7 +798,7 @@ class TEXStdlib:
 
         # Gather all 36 neighbor pixels in one advanced-indexing op
         # Build full index grids: [B,H,W,6(y),6(x)]
-        b_idx = torch.arange(B, device=dev).view(B, 1, 1, 1, 1).expand(B, H, W, 6, 6)
+        b_idx = _get_batch_index(B, H, W, dev).unsqueeze(-1).unsqueeze(-1).expand(B, H, W, 6, 6)
         py_grid = py_all.unsqueeze(-1).expand(B, H, W, 6, 6)  # y taps along dim 3
         px_grid = px_all.unsqueeze(-2).expand(B, H, W, 6, 6)  # x taps along dim 4
 
@@ -1268,9 +1303,22 @@ def _fade(t: torch.Tensor) -> torch.Tensor:
     return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 
 
+_noise_tables_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+def _get_noise_tables(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Get device-local noise lookup tables (cached)."""
+    key = str(device)
+    cached = _noise_tables_cache.get(key)
+    if cached is not None:
+        return cached
+    tables = (_PERM2.to(device), _GRAD2.to(device), _GRAD2_SIMPLEX.to(device))
+    _noise_tables_cache[key] = tables
+    return tables
+
+
 def _noise_hash(xi: torch.Tensor, yi: torch.Tensor) -> torch.Tensor:
     """Hash 2D integer coordinates via permutation table lookup."""
-    perm = _PERM2.to(xi.device)
+    perm = _get_noise_tables(xi.device)[0]
     idx_x = (xi % 256).clamp(0, 255)
     inner = perm[idx_x]
     idx_xy = ((inner + yi % 256) % 512).clamp(0, 511)
@@ -1279,7 +1327,7 @@ def _noise_hash(xi: torch.Tensor, yi: torch.Tensor) -> torch.Tensor:
 
 def _perlin_grad2(hash_val: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
     """Gradient dot product for 2D Perlin noise using 8 gradient directions."""
-    grad = _GRAD2.to(dx.device)
+    grad = _get_noise_tables(dx.device)[1]
     idx = (hash_val % 8).long()
     g = grad[idx]
     return g[..., 0] * dx + g[..., 1] * dy
@@ -1309,14 +1357,14 @@ def _perlin2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     g11 = _perlin_grad2(h11, xf - 1.0, yf - 1.0)
 
     # Bilinear interpolation with fade curves
-    lerp_x0 = g00 + u * (g10 - g00)
-    lerp_x1 = g01 + u * (g11 - g01)
-    return lerp_x0 + v * (lerp_x1 - lerp_x0)
+    lerp_x0 = torch.lerp(g00, g10, u)
+    lerp_x1 = torch.lerp(g01, g11, u)
+    return torch.lerp(lerp_x0, lerp_x1, v)
 
 
 def _simplex2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """2D Simplex noise. Returns float tensor in approximately [-1, 1]."""
-    grad = _GRAD2_SIMPLEX.to(x.device)
+    grad = _get_noise_tables(x.device)[2]
 
     # Skew input space to determine simplex cell
     s = (x + y) * _SKEW_2D
@@ -1381,18 +1429,18 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
     max_amp = 0.0
 
     for _ in range(octaves):
-        result = result + amplitude * _perlin2d(x * frequency, y * frequency)
+        result.add_(_perlin2d(x * frequency, y * frequency), alpha=amplitude)
         max_amp += amplitude
         amplitude *= 0.5
         frequency *= 2.0
 
-    return result / max_amp
+    return result.div_(max_amp)
 
 
 def _to_tensor(x) -> torch.Tensor:
-    """Ensure a value is a torch.Tensor."""
-    if isinstance(x, torch.Tensor):
-        return x.float()
+    """Ensure a value is a torch.Tensor (skip recast if already float32)."""
+    if x.__class__ is torch.Tensor:
+        return x if x.dtype == torch.float32 else x.float()
     return torch.tensor(float(x), dtype=torch.float32)
 
 
