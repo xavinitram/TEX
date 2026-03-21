@@ -487,6 +487,18 @@ class TypeChecker:
                 else:
                     effective = value_type
 
+                # Honor explicit type prefix on the binding (e.g. m@mask, img@out).
+                # This lets the user force the ComfyUI output type regardless of
+                # the inferred value type:
+                #   m@mask  = color_vec3  → MASK  (luminance of the vec3)
+                #   img@out = float_val   → IMAGE (grayscale image from float)
+                # Channel-access targets (e.g. @out.r = ...) are excluded because
+                # they specify a component, not the whole output type.
+                if not isinstance(node.target, ChannelAccess):
+                    hint = binding_target.type_hint
+                    if hint and hint in BINDING_HINT_TYPES:
+                        effective = BINDING_HINT_TYPES[hint]
+
                 if name not in self.assigned_bindings:
                     self.assigned_bindings[name] = effective
                 else:
@@ -793,22 +805,31 @@ class TypeChecker:
         return result
 
     def _check_vec_constructor(self, node: VecConstructor) -> TEXType:
+        arg_types: list[TEXType] = []
         for arg in node.args:
             arg_type = self._check_expr(arg)
             if arg_type.is_string:
                 self._error("Vector constructor arguments cannot be strings", node.loc)
-            elif arg_type.is_vector:
-                self._error("Vector constructor arguments must be scalar", node.loc)
+            elif arg_type.is_matrix:
+                self._error("Vector constructor arguments cannot be matrices", node.loc)
+            arg_types.append(arg_type)
 
-        expected_args = node.size
         if len(node.args) == 1:
             # Broadcast single value: vec4(0.5) = vec4(0.5, 0.5, 0.5, 0.5)
-            pass
-        elif len(node.args) != expected_args:
-            self._error(
-                f"vec{node.size} expects {expected_args} arguments (or 1 for broadcast), got {len(node.args)}",
-                node.loc,
-            )
+            # Also allows vec4(vec4_val) — identity / type cast
+            if arg_types[0].is_vector and arg_types[0].channels != node.size:
+                self._error(
+                    f"vec{node.size} broadcast requires a scalar or vec{node.size}, got {arg_types[0].value}",
+                    node.loc,
+                )
+        else:
+            # Count total components: scalars contribute 1, vec3 → 3, vec4 → 4
+            total = sum(t.channels for t in arg_types)
+            if total != node.size:
+                self._error(
+                    f"vec{node.size} requires {node.size} total components, got {total}",
+                    node.loc,
+                )
 
         t = TEXType.VEC3 if node.size == 3 else TEXType.VEC4
         self._set_type(node, t)

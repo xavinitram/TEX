@@ -1110,21 +1110,21 @@ app.registerExtension({
                                 });
                             }
                         },
+                        // Tell the layout engine this widget is "growable":
+                        // it has a small minimum and will expand to fill
+                        // remaining vertical space.  DOM widgets with
+                        // getMinHeight (fed to computeLayoutSize) participate
+                        // in LiteGraph's distributeSpace() allocation instead
+                        // of being treated as fixed-height.  This avoids the
+                        // old computeSize-based approach which either caused
+                        // infinite growth or prevented downward resizing.
+                        getMinHeight() { return 100; },
                     });
                     if (domWidget) {
-                        // Constrain editor height so param widgets below
-                        // remain visible and interactive.
-                        domWidget.computeSize = function (width) {
-                            const paramCount = node.widgets
-                                ? node.widgets.filter(w => w._texParam).length
-                                : 0;
-                            const reservedHeight = paramCount * 40 + 20;
-                            const maxEditorHeight = Math.max(
-                                100,
-                                node.size[1] - reservedHeight - 80,
-                            );
-                            return [width, maxEditorHeight];
-                        };
+                        // Remove any inherited computeSize so the layout
+                        // engine treats this widget as growable (via
+                        // computeLayoutSize) rather than fixed-height.
+                        domWidget.computeSize = null;
 
                         // The DOM widget's parent container (.dom-widget)
                         // has pointer-events:auto (reset by ComfyUI's draw loop

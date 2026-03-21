@@ -1212,11 +1212,14 @@ class Interpreter:
         n = node.size
 
         if len(args) == 1:
-            # Broadcast: vec3(0.5) → [0.5, 0.5, 0.5]
             val = args[0]
             if val.__class__ is torch.Tensor:
+                # vec4(vec4_val) — identity / type cast
+                arg_type = self.type_map.get(id(node.args[0]))
+                if arg_type is not None and arg_type.is_vector and arg_type.channels == n:
+                    return val
                 if val.dim() == 0:
-                    # Scalar tensor → expand to [..., N]
+                    # Scalar tensor → broadcast to [..., N]
                     return val.unsqueeze(-1).expand(*(() if not self.spatial_shape else self.spatial_shape), n)
                 else:
                     # Spatial scalar [B,H,W] → [B,H,W,N]
@@ -1226,22 +1229,35 @@ class Interpreter:
                 *(() if not self.spatial_shape else self.spatial_shape), n
             )
 
-        if len(args) != n:
+        # Flatten composite args: vec4(vec3, float) → [ch0, ch1, ch2, scalar]
+        # Use the type_map from the type checker to distinguish vectors
+        # from scalars (tensor shape alone is ambiguous — a spatial scalar
+        # [B,H,W] where H or W is 3/4 would be misidentified).
+        components: list[torch.Tensor] = []
+        for i, arg in enumerate(args):
+            arg_type = self.type_map.get(id(node.args[i]))
+            if arg_type is not None and arg_type.is_vector:
+                # Vector arg — split into per-channel components
+                for ch in range(arg_type.channels):
+                    components.append(arg[..., ch])
+            else:
+                components.append(arg)
+
+        if len(components) != n:
             raise InterpreterError(
-                f"vec{n} expects {n} arguments or 1 (broadcast), got {len(args)}",
+                f"vec{n} expects {n} total components, got {len(components)}",
                 node.loc,
             )
 
-        # Multi-arg: vec3(r, g, b) — allocate once, fill channels
-        max_shape = self._get_max_spatial_shape(args)
+        # Allocate and fill channels
+        max_shape = self._get_max_spatial_shape(components)
         if max_shape:
             result = torch.empty(*max_shape, n, dtype=self._dtype, device=self.device)
-            for i, c in enumerate(args):
+            for i, c in enumerate(components):
                 result[..., i] = _ensure_spatial(c, max_shape)
             return result
         else:
-            # No spatial context — use stack for scalar components
-            return torch.stack([_ensure_spatial(c, max_shape) for c in args], dim=-1)
+            return torch.stack([_ensure_spatial(c, max_shape) for c in components], dim=-1)
 
     def _eval_mat_constructor(self, node: MatConstructor) -> torch.Tensor:
         n = node.size  # 3 or 4

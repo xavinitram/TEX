@@ -665,16 +665,33 @@ class _CodeGen:
     def _emit_vec_constructor(self, node: VecConstructor) -> str:
         args = [self._emit_expr(a) for a in node.args]
         tmp = self._tmp()
+        n = node.size
 
         if len(args) == 1:
-            # Broadcast: vec4(0.5) -> [0.5, 0.5, 0.5, 0.5]
-            components = ", ".join([f"_es({args[0]}, _sp)"] * node.size)
-        elif len(args) == node.size:
-            components = ", ".join(f"_es({a}, _sp)" for a in args)
+            # Check compile-time type for identity case
+            arg_type = self.type_map.get(id(node.args[0]))
+            if arg_type is not None and arg_type.is_vector and arg_type.channels == n:
+                # vec4(vec4_val) — identity / type cast
+                self._emit(f"{tmp} = {args[0]}")
+            else:
+                # Broadcast: vec4(0.5) -> [0.5, 0.5, 0.5, 0.5]
+                components = ", ".join([f"_es({args[0]}, _sp)"] * n)
+                self._emit(f"{tmp} = _torch.stack([{components}], dim=-1)")
         else:
-            raise _Unsupported(f"vec{node.size} wrong arg count")
+            # Flatten composite args using compile-time types:
+            # e.g. vec4(vec3_val, float_val) → [v[...,0], v[...,1], v[...,2], f]
+            component_exprs: list[str] = []
+            for i, a in enumerate(args):
+                arg_type = self.type_map.get(id(node.args[i]))
+                if arg_type is not None and arg_type.is_vector:
+                    for ch in range(arg_type.channels):
+                        component_exprs.append(f"_es({a}[..., {ch}], _sp)")
+                else:
+                    component_exprs.append(f"_es({a}, _sp)")
 
-        self._emit(f"{tmp} = _torch.stack([{components}], dim=-1)")
+            components = ", ".join(component_exprs)
+            self._emit(f"{tmp} = _torch.stack([{components}], dim=-1)")
+
         return tmp
 
     def _emit_mat_constructor(self, node: MatConstructor) -> str:

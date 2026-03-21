@@ -11,4 +11,4 @@ float falloff = 1.0 - smoothstep(0.3, 0.7, dist * $strength);
 
 // Multi-output: IMAGE + MASK
 @darkened = @image * vec3(falloff, falloff, falloff);
-@vignette_mask = falloff;
+m@vignette_mask = falloff;

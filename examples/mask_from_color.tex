@@ -14,4 +14,4 @@ vec3 diff = @image.rgb - target;
 float dist = length(diff);
 
 // Smooth threshold: 1.0 when close, 0.0 when far
-@OUT = 1.0 - smoothstep($tolerance * 0.5, $tolerance, dist);
+m@OUT = 1.0 - smoothstep($tolerance * 0.5, $tolerance, dist);

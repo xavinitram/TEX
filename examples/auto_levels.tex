@@ -1,5 +1,5 @@
-// Auto-levels: normalize image to full [0,1] range per channel
+// Auto-levels: normalize image to [0,1] range
 
 vec4 lo = img_min(@image);
 vec4 hi = img_max(@image);
-@OUT = (@image - lo) / max(hi - lo, 0.001);
+@OUT = sdiv(@image - lo, hi - lo);

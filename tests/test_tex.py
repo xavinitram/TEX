@@ -1941,6 +1941,84 @@ def test_output_types(r: TestResult):
     except Exception as e:
         r.fail("output: MASK from scalar", f"{e}\n{traceback.format_exc()}")
 
+    # MASK from vec3 (luma-weighted — m@mask = vec3 use-case)
+    try:
+        raw = torch.zeros(1, 4, 4, 3)
+        raw[..., 1] = 1.0  # green only
+        result = _prepare_output(raw, "MASK")
+        assert result.shape == (1, 4, 4), f"Shape: {result.shape}"
+        # Luma(0, 1, 0) = 0.7152
+        assert abs(result[0, 0, 0].item() - 0.7152) < 1e-3
+        r.ok("output: MASK from vec3 (luminance)")
+    except Exception as e:
+        r.fail("output: MASK from vec3 (luminance)", f"{e}\n{traceback.format_exc()}")
+
+    # MASK from [H, W] unbatched (adds batch dim)
+    try:
+        raw = torch.full((4, 4), 0.5)
+        result = _prepare_output(raw, "MASK")
+        assert result.shape == (1, 4, 4), f"Shape: {result.shape}"
+        assert abs(result[0, 0, 0].item() - 0.5) < 1e-5
+        r.ok("output: MASK from [H,W] (adds batch dim)")
+    except Exception as e:
+        r.fail("output: MASK from [H,W] (adds batch dim)", f"{e}\n{traceback.format_exc()}")
+
+    # m@ prefix forces MASK output type even when value is vec3
+    try:
+        code = """
+vec3 color = vec3(0.0, 1.0, 0.0);  // green
+m@my_mask = color;
+"""
+        lexer = Lexer(code)
+        tokens = lexer.tokenize()
+        program = Parser(tokens).parse()
+        checker = TypeChecker({})
+        checker.check(program)
+        assert checker.assigned_bindings.get("my_mask") == TEXType.FLOAT, \
+            f"Expected FLOAT (MASK), got {checker.assigned_bindings.get('my_mask')}"
+        r.ok("m@ output prefix forces MASK type in assigned_bindings")
+    except Exception as e:
+        r.fail("m@ output prefix forces MASK type in assigned_bindings", f"{e}\n{traceback.format_exc()}")
+
+    # img@ prefix forces IMAGE output type even when value is float
+    try:
+        code = "img@out = 0.5;"
+        lexer = Lexer(code)
+        tokens = lexer.tokenize()
+        program = Parser(tokens).parse()
+        checker = TypeChecker({})
+        checker.check(program)
+        assert checker.assigned_bindings.get("out") == TEXType.VEC3, \
+            f"Expected VEC3 (IMAGE), got {checker.assigned_bindings.get('out')}"
+        r.ok("img@ output prefix forces IMAGE type in assigned_bindings")
+    except Exception as e:
+        r.fail("img@ output prefix forces IMAGE type in assigned_bindings", f"{e}\n{traceback.format_exc()}")
+
+    # Full pipeline: m@mask = vec3 → prepared as [B,H,W] MASK
+    try:
+        code = """
+vec3 color = vec3(0.0, 1.0, 0.0);
+m@my_mask = color;
+"""
+        B, H, W = 1, 4, 4
+        img = torch.rand(B, H, W, 3)
+        lexer = Lexer(code)
+        tokens = lexer.tokenize()
+        program = Parser(tokens).parse()
+        checker = TypeChecker({"A": TEXType.VEC3})
+        type_map = checker.check(program)
+        interp = Interpreter()
+        raw_out = interp.execute(program, {"A": img}, type_map, output_names=["my_mask"])
+        raw = raw_out["my_mask"]
+        eff = _map_inferred_type(checker.assigned_bindings["my_mask"], False)
+        prepared = _prepare_output(raw, eff)
+        assert prepared.shape == (B, H, W), f"Shape: {prepared.shape}"
+        # green channel luma: 0.7152
+        assert abs(prepared[0, 0, 0].item() - 0.7152) < 1e-3
+        r.ok("m@ pipeline: vec3 to MASK (luma conversion)")
+    except Exception as e:
+        r.fail("m@ pipeline: vec3 to MASK (luma conversion)", f"{e}\n{traceback.format_exc()}")
+
     # FLOAT from spatial
     try:
         raw = torch.full((1, 4, 4, 3), 0.3)
@@ -5816,6 +5894,71 @@ float d = 0.4;
         r.ok("vec constructor: vec4 non-spatial scalar args")
     except Exception as e:
         r.fail("vec constructor: vec4 non-spatial scalar args", f"{e}\n{traceback.format_exc()}")
+
+    # vec4(vec3, float) — composite constructor (GLSL-style)
+    try:
+        code = """
+vec3 color = vec3(0.1, 0.2, 0.3);
+@OUT = vec4(color, 1.0);
+"""
+        result = compile_and_run(code, {})
+        expected = torch.tensor([0.1, 0.2, 0.3, 1.0])
+        assert torch.allclose(result, expected, atol=1e-5), f"vec4(vec3,float): {result}"
+        r.ok("vec constructor: vec4(vec3, float) composite")
+    except Exception as e:
+        r.fail("vec constructor: vec4(vec3, float) composite", f"{e}\n{traceback.format_exc()}")
+
+    # vec4(float, vec3) — float first, then vec3
+    try:
+        code = """
+vec3 color = vec3(0.2, 0.3, 0.4);
+@OUT = vec4(1.0, color);
+"""
+        result = compile_and_run(code, {})
+        expected = torch.tensor([1.0, 0.2, 0.3, 0.4])
+        assert torch.allclose(result, expected, atol=1e-5), f"vec4(float,vec3): {result}"
+        r.ok("vec constructor: vec4(float, vec3) composite")
+    except Exception as e:
+        r.fail("vec constructor: vec4(float, vec3) composite", f"{e}\n{traceback.format_exc()}")
+
+    # vec4(vec3, float) — spatial context (image inputs)
+    try:
+        code = """
+vec3 color = @A.rgb;
+@OUT = vec4(color, 0.5);
+"""
+        result = compile_and_run(code, {"A": img})
+        assert result.shape == (1, 8, 8, 4), f"Shape: {result.shape}"
+        assert torch.allclose(result[..., :3], img, atol=1e-5), "RGB channels should match input"
+        assert torch.allclose(result[..., 3], torch.full((1, 8, 8), 0.5), atol=1e-5), "Alpha should be 0.5"
+        r.ok("vec constructor: vec4(vec3, float) spatial")
+    except Exception as e:
+        r.fail("vec constructor: vec4(vec3, float) spatial", f"{e}\n{traceback.format_exc()}")
+
+    # vec3(float, float, float) still works (regression check)
+    try:
+        code = "@OUT = vec3(0.1, 0.2, 0.3);"
+        result = compile_and_run(code, {})
+        expected = torch.tensor([0.1, 0.2, 0.3])
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("vec constructor: vec3(f, f, f) regression")
+    except Exception as e:
+        r.fail("vec constructor: vec3(f, f, f) regression", f"{e}\n{traceback.format_exc()}")
+
+    # simplex_terrain pattern: vec4(vec3_var, 1.0) with spatial inputs
+    try:
+        code = """
+vec3 water = vec3(0.1, 0.3, 0.7);
+vec3 color = water;
+@OUT = vec4(color, 1.0);
+"""
+        result = compile_and_run(code, {"A": img})
+        assert result.shape == (1, 8, 8, 4), f"Shape: {result.shape}"
+        assert abs(result[0, 0, 0, 0].item() - 0.1) < 1e-5
+        assert abs(result[0, 0, 0, 3].item() - 1.0) < 1e-5
+        r.ok("vec constructor: simplex_terrain pattern")
+    except Exception as e:
+        r.fail("vec constructor: simplex_terrain pattern", f"{e}\n{traceback.format_exc()}")
 
     # ── 4. Static for-loop optimization ─────────────────────────────
 

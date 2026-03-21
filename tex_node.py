@@ -154,10 +154,14 @@ def _prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
     elif output_type == "MASK":
         # MASK expects [B, H, W] float32 in [0, 1]
         if raw.dim() == 4:
-            # Vec -> luminance
+            # Vec3/Vec4 image → luminance scalar
             raw = 0.2126 * raw[..., 0] + 0.7152 * raw[..., 1] + 0.0722 * raw[..., 2]
+        elif raw.dim() == 2:
+            # [H, W] without batch dim — add it
+            raw = raw.unsqueeze(0)
         elif raw.dim() == 0:
             raw = raw.view(1, 1, 1)
+        # dim == 3 ([B, H, W]) is the correct format — pass through
         return raw.clamp(0, 1).cpu()
 
     elif output_type == "FLOAT":
