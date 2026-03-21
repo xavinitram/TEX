@@ -1,5 +1,5 @@
 /**
- * TEX Wrangle — ComfyUI frontend extension (v3.0 — Multi-output & Parameters)
+ * TEX Wrangle — ComfyUI frontend extension (v4.0 — Nodes 2.0 compatible)
  *
  * Features:
  *   1. Dynamic input sockets: auto-created from @name reads in TEX code.
@@ -15,10 +15,14 @@
  * Implementation notes:
  *   - The CM6 bundle is pre-built by Rollup into tex_cm6_bundle.js and
  *     exposed as globalThis.TEX_CM6. This file accesses that API lazily.
- *   - The original code widget is suppressed (zero height). A CM6 EditorView
- *     is mounted in a container div added via node.addDOMWidget().
- *   - Code changes in the editor are synced back to codeWidget.value so
- *     ComfyUI's serialization/deserialization works unchanged.
+ *   - The original code textarea widget is spliced out of the widgets
+ *     array and replaced by a DOM widget named "code" hosting the CM6
+ *     EditorView.  This ensures neither the legacy canvas renderer nor
+ *     Nodes 2.0's Vue layer draw a phantom textarea alongside the editor.
+ *   - Code changes in the editor are synced back to the original widget
+ *     object (kept alive in the updateListener closure) for the debounced
+ *     socket scanner, while ComfyUI serialization reads from the DOM
+ *     widget's getValue().
  *   - Output slots are sorted alphabetically to match the backend's index
  *     ordering (backend fills slots 0..N-1, pads rest with None).
  *   - The deprecated output_type widget is hidden but still accepted by
@@ -38,7 +42,7 @@ const TEX_FONT_URL = (() => {
     }
 })();
 // Names reserved by the system — NOT treated as TEX wire or output bindings
-const RESERVED_NAMES = new Set(["code", "device", "compile_mode"]);
+const RESERVED_NAMES = new Set(["code", "device", "compile_mode", "_tex_any"]);
 const DEBOUNCE_MS = 400;
 
 // ─── CM6 API (lazy resolution from pre-built bundle) ─────────────────
@@ -1043,45 +1047,57 @@ app.registerExtension({
                 try {
                     const { container, editor } = result;
 
-                    // Suppress the original code widget so it takes zero layout space.
-                    // We keep it alive for serialization but make it invisible.
-                    // Method 1: Mark hidden so ComfyUI's Vue layer skips its
-                    // .dom-widget container entirely (DomWidgets.vue checks
-                    // widget.isVisible() which returns false when hidden=true).
+                    // ── Suppress the original code textarea widget ──
+                    // Two independent mechanisms ensure the textarea is
+                    // invisible in every rendering mode:
+                    //
+                    // 1. Splice from widgets array — prevents Nodes 2.0's
+                    //    Vue layer from creating a ComponentWidget for it.
+                    // 2. Mark hidden + poll to hide/remove the DOM element
+                    //    — catches the textarea that ComfyUI's legacy
+                    //    renderer may have already inserted before
+                    //    onNodeCreated fires.
+                    //
+                    // The original JS object stays alive (referenced by the
+                    // CM6 updateListener closure) so value sync still works.
+                    const codeIdx = node.widgets.indexOf(codeWidget);
+                    if (codeIdx >= 0) node.widgets.splice(codeIdx, 1);
+
                     codeWidget.hidden = true;
-                    // Method 2: Override computeSize to return zero height
-                    const origComputeSize = codeWidget.computeSize;
                     codeWidget.computeSize = function () {
-                        return [0, -4];  // -4 absorbs ComfyUI's inter-widget spacing
+                        return [0, -4]; // -4 absorbs inter-widget spacing
                     };
 
-                    // Method 3: Also hide the DOM element and its container when it appears
+                    // Poll for the textarea DOM element and hide it + its
+                    // .dom-widget container.  The element may not exist yet
+                    // at this point (created lazily by the draw loop).
                     const hideOriginal = () => {
                         const el = codeWidget.element || codeWidget.inputEl;
                         if (el) {
                             el.style.display = "none";
                             el.style.height = "0";
                             el.style.overflow = "hidden";
-                            // Mark the parent container for CSS-based hiding
-                            const container = el.parentElement;
-                            if (container && container.classList.contains("dom-widget")) {
-                                container.classList.add("tex-hidden-widget");
+                            const parentEl = el.parentElement;
+                            if (parentEl) {
+                                parentEl.style.display = "none";
+                                parentEl.style.height = "0";
+                                parentEl.style.overflow = "hidden";
                             }
                             return true;
                         }
                         return false;
                     };
-
                     if (!hideOriginal()) {
-                        const checkInterval = setInterval(() => {
-                            if (hideOriginal()) clearInterval(checkInterval);
+                        const poll = setInterval(() => {
+                            if (hideOriginal()) clearInterval(poll);
                         }, 200);
-                        setTimeout(() => clearInterval(checkInterval), 10000);
+                        setTimeout(() => clearInterval(poll), 10000);
                     }
 
-                    // Add the CM6 editor as a DOM widget.
-                    // serialize: false — the original "code" widget handles save/load.
-                    const domWidget = node.addDOMWidget("tex_editor", "customwidget", container, {
+                    // Add the CM6 editor as a DOM widget named "code".
+                    // Re-using the input name lets ComfyUI's serialization
+                    // find this widget for the "code" INPUT_TYPES entry.
+                    const domWidget = node.addDOMWidget("code", "customwidget", container, {
                         getValue() {
                             return editor.state.doc.toString();
                         },
@@ -1096,7 +1112,6 @@ app.registerExtension({
                         },
                     });
                     if (domWidget) {
-                        domWidget.serialize = false;
                         // Constrain editor height so param widgets below
                         // remain visible and interactive.
                         domWidget.computeSize = function (width) {
@@ -1334,23 +1349,13 @@ app.registerExtension({
         }
 
         /* ── DOM widget container overrides ────────────── */
-        /* ComfyUI renders each DOM widget inside a position:fixed
-           .dom-widget container managed by Vue.  These containers sit
-           above the canvas / Vue-overlay layer and capture pointer
-           events by default.  We disable pointer-events on the outer
-           containers so canvas-rendered widgets (params, compile_mode,
-           device) remain interactive, then re-enable events only on
-           the CodeMirror .cm-editor element itself. */
+        /* In both the legacy renderer and Nodes 2.0, DOM widget
+           containers capture pointer events by default.  We disable
+           pointer-events on the outer containers so canvas-rendered
+           widgets (params, compile_mode, device) remain interactive,
+           then re-enable events only on the .cm-editor element. */
         .tex-editor-container {
             pointer-events: none !important;
-            overflow: hidden !important;
-        }
-        /* The original code textarea widget is hidden (codeWidget.hidden
-           = true) but we keep defensive CSS in case the DOM element
-           lingers. */
-        .tex-hidden-widget {
-            pointer-events: none !important;
-            height: 0 !important;
             overflow: hidden !important;
         }
 

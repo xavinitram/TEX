@@ -226,7 +226,7 @@ class TEXWrangleNode:
     MAX_OUTPUTS = 8
 
     # System kwargs that are NOT TEX bindings
-    _SYSTEM_KWARGS = {"device", "compile_mode", "output_type"}
+    _SYSTEM_KWARGS = {"device", "compile_mode", "output_type", "_tex_any"}
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -253,6 +253,14 @@ class TEXWrangleNode:
         # NOTE: output_type was removed in v0.3. Old workflows that pass it
         # will still work — ContainsAnyDict accepts any key, and execute()
         # pops it from kwargs before processing bindings.
+
+        # Register a wildcard-type input so the node appears in the
+        # search panel when dragging a wire of any type.  The frontend
+        # extension removes all initial input slots in onNodeCreated and
+        # manages them dynamically, so this slot never actually renders.
+        optional["_tex_any"] = (ANY_TYPE, {
+            "tooltip": "TEX accepts any input type. Use @name in code to reference it.",
+        })
 
         return {
             "required": {
@@ -312,6 +320,7 @@ class TEXWrangleNode:
         device_mode = kwargs.pop("device", "auto")
         compile_mode = kwargs.pop("compile_mode", "none")
         output_type_compat = kwargs.pop("output_type", "auto")  # deprecated, ignored
+        kwargs.pop("_tex_any", None)  # search-panel wildcard slot, unused
 
         # Everything remaining in kwargs is a TEX binding (inputs + params)
         bindings: dict[str, Any] = {
