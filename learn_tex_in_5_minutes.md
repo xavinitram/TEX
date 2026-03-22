@@ -93,7 +93,7 @@ Write to any `@name` to create an output. Here, `darkened` and `brightness_mask`
 
 ## What's Next?
 
-- Click the **?** icon on any TEX node for the full function reference (79 functions).
+- Click the **?** icon on any TEX node for the full function reference (80+ functions).
 - Browse the `examples/` folder for more patterns: blur, vignette, edge detection, noise, and more.
 - Types: `float`, `int`, `vec3` (RGB), `vec4` (RGBA) — TEX infers types automatically.
 - Use `@name` for any descriptive input name (e.g., `@base`, `@mask`, `@frames`).

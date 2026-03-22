@@ -13,7 +13,7 @@ Thanks for your interest in contributing to TEX Wrangle. This guide covers the e
 3. Run tests from the project root:
    ```
    cd TEX_Wrangle
-   python tests/test_tex.py
+   python -m pytest tests/test_tex.py -v
    ```
 
 No additional packages or build steps are needed for the core compiler and runtime.
@@ -44,7 +44,7 @@ For all other contributions, the editor build is not required.
 
 ## Pull Request Expectations
 
-- All existing tests must pass (`python tests/test_tex.py`).
+- All existing tests must pass (`python -m pytest tests/test_tex.py -v`).
 - Remove any debug output (`print()` statements, `console.log()` calls) before submitting.
 - Describe what your PR changes and why. Reference related issues where applicable.
 - If your change affects user-facing behavior, update the README accordingly.

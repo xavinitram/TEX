@@ -50,7 +50,7 @@ class TEXCache:
 
     Usage:
         cache = get_cache()
-        program, type_map, refs, assigned_bindings, param_info = cache.compile_tex(code, binding_types)
+        program, type_map, refs, assigned, params, builtins = cache.compile_tex(code, binding_types)
     """
 
     def __init__(self, cache_dir: Path | None = None):
@@ -81,7 +81,8 @@ class TEXCache:
         """
         Look up a cached compilation result.
 
-        Returns (program, type_map, referenced_bindings) or None.
+        Returns (program, type_map, referenced_bindings,
+                 assigned_bindings, param_declarations, used_builtins) or None.
         Checks memory first, then disk.
         """
         fp = self.fingerprint(code, binding_types)

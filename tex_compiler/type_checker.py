@@ -183,15 +183,12 @@ class TypeChecker:
     # Parameter declarations: name → {type: TEXType, type_hint: str}
     param_declarations: dict[str, dict] = field(default_factory=dict)
 
-    # Legacy compat: whether the old "OUT"-only inference mode was active
-    _infer_out: bool = False
-
     # Track loop nesting depth for break/continue validation
     _loop_depth: int = 0
 
     @property
     def inferred_out_type(self) -> TEXType | None:
-        """Legacy compat: inferred type for @OUT binding."""
+        """Convenience: inferred type for @OUT binding."""
         return self.assigned_bindings.get("OUT")
 
     def check(self, program: Program) -> dict[int, TEXType]:
@@ -203,7 +200,6 @@ class TypeChecker:
         self.errors = []
         self.assigned_bindings = {}
         self.param_declarations = {}
-        self._infer_out = "OUT" not in self.binding_types
 
         # Pre-populate built-in variables
         builtins = {

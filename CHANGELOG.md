@@ -5,6 +5,26 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-03-22
+
+### Changed
+- **Nodes v3 API migration** — `TEXWrangleNode` now inherits from `IO.ComfyNode` (via `comfy_api.latest`); `define_schema()` replaces `INPUT_TYPES` / `RETURN_TYPES` / `CATEGORY` / `FUNCTION` / `DESCRIPTION` / `OUTPUT_TOOLTIPS`; `fingerprint_inputs()` replaces `IS_CHANGED()`; `execute()` is now a classmethod returning `IO.NodeOutput`
+- **Wireable parameters** — `$param` widgets now support drag-to-wire connections via ComfyUI's widget-input duality (`input.widget = { name }` linking), eliminating the v1 `convertToInput` workaround
+- **`accept_all_inputs=True`** replaces `ContainsAnyDict` for dynamic input passthrough
+- **Test helper cleanup** — `compile_and_run()` and `compile_and_infer()` simplified to single-pass type checking using `_infer_binding_type()`; removed redundant double type-check
+
+### Removed
+- `ANY_TYPE = "*"` module constant (replaced by `IO.AnyType`)
+- `ContainsAnyDict` class (replaced by `accept_all_inputs=True`)
+- All v1 class attributes: `CATEGORY`, `FUNCTION`, `RETURN_TYPES`, `RETURN_NAMES`, `OUTPUT_TOOLTIPS`, `DESCRIPTION`, `INPUT_TYPES()`, `IS_CHANGED()`
+- `output_type` backward-compat code (`_SYSTEM_KWARGS` entry and `kwargs.pop`)
+- `_infer_out` dead field from type checker
+- Dead latent-dict check in `_resolve_device()` (latents already unwrapped before device resolution)
+
+### Fixed
+- **`loadCM6()` runtime error** — autocomplete toggle setting called non-existent `loadCM6()` function; replaced with synchronous `getCM6()` used everywhere else
+- Stale cache docstrings (claimed 3-tuple return, actually 6-tuple)
+
 ## [0.6.0] - 2026-03-21
 
 ### Added

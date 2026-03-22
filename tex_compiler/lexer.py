@@ -208,8 +208,11 @@ class Lexer:
         if self.peek() == "0" and self.peek_ahead() in ("x", "X"):
             self.advance()  # 0
             self.advance()  # x
+            hex_start = self.pos
             while self.pos < len(self.source) and self.source[self.pos] in "0123456789abcdefABCDEF":
                 self.advance()
+            if self.pos == hex_start:
+                raise LexerError("Hex literal '0x' has no digits", start_loc)
             text = self.source[start_pos:self.pos]
             return Token(TokenType.INT_LIT, text, start_loc)
 
@@ -227,12 +230,22 @@ class Lexer:
 
         # Scientific notation
         if self.pos < len(self.source) and self.source[self.pos] in ("e", "E"):
-            is_float = True
-            self.advance()
+            save_pos = self.pos
+            save_line = self.line
+            save_col = self.col
+            self.advance()  # e/E
             if self.pos < len(self.source) and self.source[self.pos] in ("+", "-"):
                 self.advance()
+            exp_start = self.pos
             while self.pos < len(self.source) and self.source[self.pos].isdigit():
                 self.advance()
+            if self.pos == exp_start:
+                # No digits after 'e' — backtrack (treat 'e' as separate identifier)
+                self.pos = save_pos
+                self.line = save_line
+                self.col = save_col
+            else:
+                is_float = True
 
         text = self.source[start_pos:self.pos]
         tok_type = TokenType.FLOAT_LIT if is_float else TokenType.INT_LIT

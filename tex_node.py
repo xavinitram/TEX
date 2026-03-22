@@ -3,6 +3,8 @@ TEX Wrangle Node — ComfyUI custom node for the TEX (Tensor Expression Language
 
 Provides a single node where users write compact TEX scripts to process
 images, masks, and scalar values using per-pixel tensor operations.
+
+Requires ComfyUI with Nodes v3 API support (comfy_api.latest).
 """
 from __future__ import annotations
 
@@ -22,6 +24,15 @@ from .tex_runtime.interpreter import Interpreter, InterpreterError
 from .tex_cache import get_cache
 from .tex_runtime.compiled import execute_compiled
 
+# ── v3 API import ──
+# Falls back to a stub base class when running outside ComfyUI (e.g. standalone tests).
+try:
+    from comfy_api.latest import IO
+    _V3_AVAILABLE = True
+except ImportError:
+    IO = None
+    _V3_AVAILABLE = False
+
 
 # ── Cached interpreter (reused across executions to avoid rebuild overhead) ──
 _interpreter: Interpreter | None = None
@@ -33,29 +44,6 @@ def _get_interpreter() -> Interpreter:
     if _interpreter is None:
         _interpreter = Interpreter()
     return _interpreter
-
-
-# Wildcard type that matches any ComfyUI type
-ANY_TYPE = "*"
-
-
-class ContainsAnyDict(dict):
-    """Dict subclass that claims to contain any key.
-
-    Used to let ComfyUI accept dynamically-named inputs created by the
-    frontend JS extension.  Official pattern from ComfyUI docs:
-    https://docs.comfy.org/custom-nodes/backend/more_on_inputs
-    """
-
-    def __contains__(self, key):
-        return True
-
-    def __getitem__(self, key):
-        try:
-            return super().__getitem__(key)
-        except KeyError:
-            # Dynamic inputs (e.g. @A, @B) — return wildcard type
-            return (ANY_TYPE,)
 
 
 def _tensor_fingerprint(t: torch.Tensor) -> str:
@@ -202,7 +190,13 @@ def _map_inferred_type(inferred: TEXType | None, has_latent_input: bool) -> str:
     }.get(inferred, "IMAGE")
 
 
-class TEXWrangleNode:
+# ── Node class ──
+# When running inside ComfyUI, inherit from IO.ComfyNode (v3 API).
+# When running standalone (tests), fall back to plain object.
+_BaseClass = IO.ComfyNode if _V3_AVAILABLE else object
+
+
+class TEXWrangleNode(_BaseClass):
     """
     TEX Wrangle — per-pixel tensor expression processor.
 
@@ -215,81 +209,80 @@ class TEXWrangleNode:
         @OUT = vec4(gray, gray, gray, 1.0);
     """
 
-    CATEGORY = "TEX"
-    FUNCTION = "execute"
-    DESCRIPTION = (
-        "TEX Wrangle: per-pixel tensor expressions for images, masks, and scalars.\n"
-        "Reference inputs with @name (e.g. @A, @base_image).\n"
-        "Write outputs with @name = expr (e.g. @OUT, @mask, @result).\n"
-        "Add parameter widgets with $name (e.g. f$strength = 0.5).\n"
-        "Supports float, int, vec3, vec4, string types with if/else, for loops, and 60+ stdlib functions.\n"
-        "Click the ? icon for a quick reference."
-    )
-
     # Maximum number of output slots (pre-allocated for dynamic outputs)
     MAX_OUTPUTS = 8
 
     # System kwargs that are NOT TEX bindings
-    _SYSTEM_KWARGS = {"device", "compile_mode", "output_type", "_tex_any"}
+    _SYSTEM_KWARGS = {"device", "compile_mode", "_tex_any"}
 
     @classmethod
-    def INPUT_TYPES(cls):
-        # ContainsAnyDict lets the backend accept dynamically-named inputs
-        # created by the frontend JS extension.  The frontend parses TEX code
-        # for @name references and creates matching sockets on the fly.
-        optional = ContainsAnyDict()
-
-        # System parameters (always present as combo widgets)
-        optional["device"] = (
-            ["auto", "cpu", "cuda"],
-            {
-                "default": "auto",
-                "tooltip": "Execution device. auto: follows input tensors. cpu/cuda: force a specific device.",
-            },
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="TEX_Wrangle",
+            display_name="TEX Wrangle",
+            category="TEX",
+            description=(
+                "TEX Wrangle: per-pixel tensor expressions for images, masks, and scalars.\n"
+                "Reference inputs with @name (e.g. @A, @base_image).\n"
+                "Write outputs with @name = expr (e.g. @OUT, @mask, @result).\n"
+                "Add parameter widgets with $name (e.g. f$strength = 0.5).\n"
+                "Supports float, int, vec3, vec4, string types with if/else, for loops, and 60+ stdlib functions.\n"
+                "Click the ? icon for a quick reference."
+            ),
+            inputs=[
+                IO.String.Input(
+                    "code",
+                    multiline=True,
+                    dynamic_prompts=False,
+                    default=(
+                        "// TEX Wrangle\n"
+                        "// Read inputs with @A, @B, etc.\n"
+                        "// Write output to @OUT\n\n"
+                        "float gray = luma(@IN);\n"
+                        "@OUT = vec3(gray);\n"
+                    ),
+                    placeholder="// TEX code here...",
+                    tooltip="TEX source code. Use @name for inputs, @name = expr for outputs. Use $name for parameter widgets.",
+                ),
+                IO.Combo.Input(
+                    "device",
+                    options=["auto", "cpu", "cuda"],
+                    default="auto",
+                    tooltip="Execution device. auto: follows input tensors. cpu/cuda: force a specific device.",
+                    optional=True,
+                ),
+                IO.Combo.Input(
+                    "compile_mode",
+                    options=["none", "torch_compile"],
+                    default="none",
+                    tooltip="none: standard interpreter. torch_compile: JIT-compile via torch.compile (falls back on failure).",
+                    optional=True,
+                ),
+                # Wildcard input so the node appears in the search panel
+                # when dragging a wire of any type. The frontend extension
+                # removes all initial input slots in onNodeCreated and
+                # manages them dynamically, so this slot never renders.
+                IO.AnyType.Input(
+                    "_tex_any",
+                    optional=True,
+                    tooltip="TEX accepts any input type. Use @name in code to reference it.",
+                ),
+            ],
+            outputs=[
+                IO.AnyType.Output(
+                    id=f"out_{i}",
+                    display_name=f"out_{i}",
+                    tooltip="TEX output. Type auto-inferred from code.",
+                )
+                for i in range(8)
+            ],
+            accept_all_inputs=True,
         )
-        optional["compile_mode"] = (
-            ["none", "torch_compile"],
-            {
-                "default": "none",
-                "tooltip": "none: standard interpreter. torch_compile: JIT-compile via torch.compile (falls back on failure).",
-            },
-        )
-        # NOTE: output_type was removed in v0.3. Old workflows that pass it
-        # will still work — ContainsAnyDict accepts any key, and execute()
-        # pops it from kwargs before processing bindings.
-
-        # Register a wildcard-type input so the node appears in the
-        # search panel when dragging a wire of any type.  The frontend
-        # extension removes all initial input slots in onNodeCreated and
-        # manages them dynamically, so this slot never actually renders.
-        optional["_tex_any"] = (ANY_TYPE, {
-            "tooltip": "TEX accepts any input type. Use @name in code to reference it.",
-        })
-
-        return {
-            "required": {
-                "code": ("STRING", {
-                    "multiline": True,
-                    "dynamicPrompts": False,
-                    "default": "// TEX Wrangle\n"
-                               "// Read inputs with @A, @B, etc.\n"
-                               "// Write output to @OUT\n\n"
-                               "float gray = luma(@IN);\n"
-                               "@OUT = vec3(gray);\n",
-                    "placeholder": "// TEX code here...",
-                    "tooltip": "TEX source code. Use @name for inputs, @name = expr for outputs. Use $name for parameter widgets.",
-                }),
-            },
-            "optional": optional,
-        }
-
-    RETURN_TYPES = tuple([ANY_TYPE] * 8)
-    RETURN_NAMES = tuple([f"out_{i}" for i in range(8)])
-    OUTPUT_TOOLTIPS = tuple(["TEX output. Type auto-inferred from code."] * 8)
 
     @classmethod
-    def IS_CHANGED(cls, code, **kwargs):
+    def fingerprint_inputs(cls, **kwargs):
         """Cache-busting: re-execute if code, inputs, device, or compile_mode change."""
+        code = kwargs.get("code", "")
         parts = [code]
         # Include device and compile_mode in the hash
         parts.append(kwargs.get("device", "auto"))
@@ -316,14 +309,15 @@ class TEXWrangleNode:
                     parts.append(f"{name}:{val}")
         return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()
 
-    def execute(self, code: str, **kwargs) -> tuple:
+    @classmethod
+    def execute(cls, **kwargs):
         """Execute TEX code with the provided inputs."""
         start_time = time.perf_counter()
 
         # Pop system parameters so they don't get treated as bindings
+        code = kwargs.pop("code", "")
         device_mode = kwargs.pop("device", "auto")
         compile_mode = kwargs.pop("compile_mode", "none")
-        output_type_compat = kwargs.pop("output_type", "auto")  # deprecated, ignored
         kwargs.pop("_tex_any", None)  # search-panel wildcard slot, unused
 
         # Everything remaining in kwargs is a TEX binding (inputs + params)
@@ -356,7 +350,7 @@ class TEXWrangleNode:
                     latent_channel_count = tensor_cl.shape[-1]
 
         # Resolve target device
-        device = self._resolve_device(device_mode, bindings)
+        device = cls._resolve_device(device_mode, bindings)
 
         try:
             # Infer binding types for inputs
@@ -372,10 +366,10 @@ class TEXWrangleNode:
                 raise InterpreterError(
                     "TEX program has no outputs. Assign to @OUT or another @name."
                 )
-            if len(output_names) > self.MAX_OUTPUTS:
+            if len(output_names) > cls.MAX_OUTPUTS:
                 raise InterpreterError(
                     f"TEX program has {len(output_names)} outputs, "
-                    f"exceeding the maximum ({self.MAX_OUTPUTS})."
+                    f"exceeding the maximum ({cls.MAX_OUTPUTS})."
                 )
 
             # Check that referenced input bindings are available.
@@ -424,7 +418,7 @@ class TEXWrangleNode:
                 output_types_log.append(f"{name}:{effective_type}")
 
             # Pad with None for unused output slots
-            while len(results) < self.MAX_OUTPUTS:
+            while len(results) < cls.MAX_OUTPUTS:
                 results.append(None)
 
             elapsed_ms = (time.perf_counter() - start_time) * 1000
@@ -435,6 +429,9 @@ class TEXWrangleNode:
                 f"bindings: {list(bindings.keys())}"
             )
 
+            # Return NodeOutput for v3, or tuple for standalone/test usage
+            if _V3_AVAILABLE:
+                return IO.NodeOutput(*results)
             return tuple(results)
 
         except (LexerError, ParseError, TypeCheckError, InterpreterError) as e:
@@ -466,12 +463,8 @@ class TEXWrangleNode:
             return "cuda"
 
         # "auto" mode: prefer GPU if any input tensor is on GPU
+        # (latent dicts are already unwrapped to tensors before this is called)
         for val in bindings.values():
-            if isinstance(val, str):
-                continue
-            if isinstance(val, dict) and "samples" in val:
-                if val["samples"].is_cuda:
-                    return str(val["samples"].device)
-            elif isinstance(val, torch.Tensor) and val.is_cuda:
+            if isinstance(val, torch.Tensor) and val.is_cuda:
                 return str(val.device)
         return "cpu"

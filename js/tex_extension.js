@@ -1,5 +1,5 @@
 /**
- * TEX Wrangle — ComfyUI frontend extension (v4.0 — Nodes 2.0 compatible)
+ * TEX Wrangle — ComfyUI frontend extension (v5.0 — Nodes v3)
  *
  * Features:
  *   1. Dynamic input sockets: auto-created from @name reads in TEX code.
@@ -17,16 +17,14 @@
  *     exposed as globalThis.TEX_CM6. This file accesses that API lazily.
  *   - The original code textarea widget is spliced out of the widgets
  *     array and replaced by a DOM widget named "code" hosting the CM6
- *     EditorView.  This ensures neither the legacy canvas renderer nor
- *     Nodes 2.0's Vue layer draw a phantom textarea alongside the editor.
+ *     EditorView.  This ensures neither the canvas renderer nor the
+ *     Vue layer draw a phantom textarea alongside the editor.
  *   - Code changes in the editor are synced back to the original widget
  *     object (kept alive in the updateListener closure) for the debounced
  *     socket scanner, while ComfyUI serialization reads from the DOM
  *     widget's getValue().
  *   - Output slots are sorted alphabetically to match the backend's index
  *     ordering (backend fills slots 0..N-1, pads rest with None).
- *   - The deprecated output_type widget is hidden but still accepted by
- *     the backend for old workflow compatibility.
  */
 
 import { app } from "../../scripts/app.js";
@@ -159,9 +157,12 @@ function debounce(fn, ms) {
 
 // ─── Auto-Socket Management ─────────────────────────────────────────
 
-function syncInputs(node, usedBindings) {
+function syncInputs(node, usedBindings, paramNames) {
     if (!node.graph) return;
     const ANY_TYPE = "*";
+    // paramNames: Set of $param names that have their own input sockets
+    // managed by syncParams — don't touch them here.
+    const paramSet = paramNames || new Set();
 
     // Build map of current TEX binding inputs
     const currentInputs = new Map();
@@ -175,9 +176,10 @@ function syncInputs(node, usedBindings) {
     const desired = [...usedBindings].sort();
 
     // Remove unneeded inputs (reverse order for index stability)
+    // Skip param-owned sockets — those are managed by syncParams
     const toRemove = [];
     for (const [name, idx] of currentInputs) {
-        if (!usedBindings.has(name)) {
+        if (!usedBindings.has(name) && !paramSet.has(name)) {
             toRemove.push(idx);
         }
     }
@@ -269,9 +271,11 @@ function syncOutputs(node, outputNames) {
 
 function syncParams(node, params) {
     // params: Map of name → { typeHint, defaultValue }
-    // Creates/removes parameter widgets.  Widget values are injected
-    // into the prompt via the graphToPrompt hook (see setup()).
-    // The backend uses code-defined defaults as a safety fallback.
+    // Creates/removes parameter widgets with linked input sockets.
+    // In modern ComfyUI, widgets and input sockets co-exist: the widget
+    // provides manual value entry, and the linked socket accepts wires.
+    // When a wire connects, the wired value overrides the widget value.
+    // The graphToPrompt hook injects widget values for unconnected params.
     if (!node.widgets) node.widgets = [];
 
     // Build map of current param widgets: name → { widget, index, typeHint }
@@ -307,18 +311,34 @@ function syncParams(node, params) {
         }
     }
 
+    // Remove stale param input sockets (reverse order for index stability)
+    if (node.inputs) {
+        for (let i = node.inputs.length - 1; i >= 0; i--) {
+            if (node.inputs[i]._texParam && toRemove.has(node.inputs[i].name)) {
+                node.removeInput(i);
+            }
+        }
+    }
+
     // Rebuild current set after removals
     const remaining = new Set();
     for (const w of node.widgets) {
         if (w._texParam) remaining.add(w.name);
     }
 
-    // Add new / recreated param widgets
+    // Map type hints to ComfyUI type strings
+    function paramComfyType(typeHint) {
+        if (typeHint === "i") return "INT";
+        if (typeHint === "s") return "STRING";
+        return "FLOAT";
+    }
+
+    // Add new / recreated param widgets with linked input sockets
     for (const [name, info] of params) {
         if (remaining.has(name)) continue;
 
         const typeHint = info.typeHint || "f";
-        const typeName = typeHint === "i" ? "INT" : typeHint === "s" ? "STRING" : "FLOAT";
+        const typeName = paramComfyType(typeHint);
         let widget;
         if (typeHint === "i") {
             const parsed = info.defaultValue != null ? parseInt(info.defaultValue) : NaN;
@@ -341,7 +361,20 @@ function syncParams(node, params) {
         if (widget) {
             widget._texParam = true;
             widget._texTypeHint = typeHint;
-            widget.tooltip = `TEX parameter $${name} (${typeName})`;
+            widget.tooltip = `TEX parameter $${name} (${typeName}) — wire or widget`;
+        }
+
+        // Create a linked input socket for the widget.
+        // Setting input.widget = { name } tells ComfyUI's modern frontend
+        // that this socket is the wired counterpart of the widget above.
+        // They co-exist as a single unified control — no double rendering.
+        const existingInput = node.inputs?.find(inp => inp.name === name);
+        if (!existingInput) {
+            node.addInput(name, typeName);
+            const newInput = node.inputs[node.inputs.length - 1];
+            newInput._texParam = true;
+            // Link input socket → widget (modern ComfyUI widget-input duality)
+            newInput.widget = { name: name };
         }
     }
 
@@ -447,7 +480,8 @@ function createTexEditor(node, codeWidget) {
         node._texBindings = inputs;
         node._texOutputs = outputs;
         node._texParams = params;
-        syncInputs(node, inputs);
+        const paramNames = new Set(params.keys());
+        syncInputs(node, inputs, paramNames);
         syncOutputs(node, outputs);
         syncParams(node, params);
     }, DEBOUNCE_MS);
@@ -895,9 +929,9 @@ app.registerExtension({
     name: "TEX.Wrangle",
 
     // ── Prompt hook: inject $param widget values into the execution prompt ──
-    // ComfyUI only serializes widget values for inputs defined in INPUT_TYPES.
-    // Since TEX params are dynamic (parsed from code), they aren't in INPUT_TYPES.
-    // This hook adds their widget values to the prompt so they reach execute().
+    // ComfyUI only serializes widget values for inputs defined in the schema.
+    // Since TEX params are dynamic (parsed from code), they aren't in the schema.
+    // This hook adds their widget values so accept_all_inputs passes them to execute().
     setup() {
         const origGraphToPrompt = app.graphToPrompt;
         app.graphToPrompt = async function (...args) {
@@ -984,21 +1018,20 @@ app.registerExtension({
             type:         "boolean",
             defaultValue: true,
             onChange(val) {
-                loadCM6().then(CM6 => {
-                    if (!app.graph?._nodes) return;
-                    for (const n of app.graph._nodes) {
-                        const meta   = texEditorMeta.get(n);
-                        const editor = texEditors.get(n);
-                        if (!meta || !editor) continue;
-                        editor.dispatch({
-                            effects: meta.autocompleteCompartment.reconfigure(
-                                val
-                                    ? CM6.autocompletion({ override: [meta.completionSource], activateOnTyping: true })
-                                    : []
-                            ),
-                        });
-                    }
-                });
+                const CM6 = getCM6();
+                if (!CM6 || !app.graph?._nodes) return;
+                for (const n of app.graph._nodes) {
+                    const meta   = texEditorMeta.get(n);
+                    const editor = texEditors.get(n);
+                    if (!meta || !editor) continue;
+                    editor.dispatch({
+                        effects: meta.autocompleteCompartment.reconfigure(
+                            val
+                                ? CM6.autocompletion({ override: [meta.completionSource], activateOnTyping: true })
+                                : []
+                        ),
+                    });
+                }
             },
         });
     },
@@ -1035,7 +1068,8 @@ app.registerExtension({
                 node._texBindings = inputs;
                 node._texOutputs = outputs;
                 node._texParams = params;
-                syncInputs(node, inputs);
+                const paramNames = new Set(params.keys());
+                syncInputs(node, inputs, paramNames);
                 syncOutputs(node, outputs);
                 syncParams(node, params);
             }, DEBOUNCE_MS);
@@ -1051,12 +1085,11 @@ app.registerExtension({
                     // Two independent mechanisms ensure the textarea is
                     // invisible in every rendering mode:
                     //
-                    // 1. Splice from widgets array — prevents Nodes 2.0's
-                    //    Vue layer from creating a ComponentWidget for it.
+                    // 1. Splice from widgets array — prevents the Vue layer
+                    //    from creating a ComponentWidget for it.
                     // 2. Mark hidden + poll to hide/remove the DOM element
-                    //    — catches the textarea that ComfyUI's legacy
-                    //    renderer may have already inserted before
-                    //    onNodeCreated fires.
+                    //    — catches the textarea that ComfyUI's canvas
+                    //    renderer may have already inserted before onNodeCreated fires.
                     //
                     // The original JS object stays alive (referenced by the
                     // CM6 updateListener closure) so value sync still works.
@@ -1096,7 +1129,7 @@ app.registerExtension({
 
                     // Add the CM6 editor as a DOM widget named "code".
                     // Re-using the input name lets ComfyUI's serialization
-                    // find this widget for the "code" INPUT_TYPES entry.
+                    // find this widget for the "code" schema input.
                     const domWidget = node.addDOMWidget("code", "customwidget", container, {
                         getValue() {
                             return editor.state.doc.toString();
@@ -1189,7 +1222,8 @@ app.registerExtension({
                     node._texOutputs = outputs;
                     node._texParams = params;
 
-                    syncInputs(node, inputs);
+                    const paramNames = new Set(params.keys());
+                    syncInputs(node, inputs, paramNames);
                     syncOutputs(node, outputs);
                     syncParams(node, params);
 
@@ -1349,7 +1383,7 @@ app.registerExtension({
         }
 
         /* ── DOM widget container overrides ────────────── */
-        /* In both the legacy renderer and Nodes 2.0, DOM widget
+        /* In both the canvas renderer and the Vue layer, DOM widget
            containers capture pointer events by default.  We disable
            pointer-events on the outer containers so canvas-rendered
            widgets (params, compile_mode, device) remain interactive,

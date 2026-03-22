@@ -25,7 +25,7 @@ TEX_Wrangle/
     tex_extension.js       # Frontend: auto-socket, CodeMirror 6 editor, help popup
     tex_cm6_bundle.js      # Pre-built CodeMirror 6 bundle (Rollup)
   tests/
-    test_tex.py            # Comprehensive test suite (418 tests)
+    test_tex.py            # Comprehensive test suite (521 sub-tests)
   benchmarks/
     run_benchmarks.py      # Reproducible performance benchmarks
     README.md              # Benchmark usage and result format docs
@@ -297,10 +297,10 @@ Adding a new TEX type requires changes across the entire pipeline:
 
 ```bash
 cd custom_nodes/TEX_Wrangle
-python tests/test_tex.py
+python -m pytest tests/test_tex.py -v
 ```
 
-Expected: 418/418 passed (1 CUDA test skipped without GPU).
+Expected: 44 test functions (521 sub-tests) passed.
 
 ## Benchmarks
 

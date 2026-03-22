@@ -73,39 +73,26 @@ def compile_and_run(code: str, bindings: dict, device: str = "cpu",
     parser = Parser(tokens)
     program = parser.parse()
 
-    binding_types = {}
-    for name, val in bindings.items():
-        if isinstance(val, str):
-            binding_types[name] = TEXType.STRING
-        elif isinstance(val, torch.Tensor):
-            if val.dim() == 4:
-                c = val.shape[-1]
-                binding_types[name] = TEXType.VEC4 if c == 4 else TEXType.VEC3
-            elif val.dim() == 3:
-                binding_types[name] = TEXType.FLOAT
-            else:
-                binding_types[name] = TEXType.FLOAT
-        else:
-            binding_types[name] = TEXType.FLOAT
+    binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
 
     checker = TypeChecker(binding_types=binding_types)
     type_map = checker.check(program)
+    output_names = sorted(checker.assigned_bindings.keys())
 
-    # Use multi-output path when code assigns to named outputs
-    output_names = sorted(checker.assigned_bindings.keys()) if checker.assigned_bindings else None
-    if output_names is None or output_names == ["OUT"]:
-        # Single-output backward compat
-        binding_types["OUT"] = out_type
-        checker2 = TypeChecker(binding_types=binding_types)
-        type_map = checker2.check(program)
-        interp = Interpreter()
-        return interp.execute(program, bindings, type_map, device=device,
-                              latent_channel_count=latent_channel_count)
-    else:
-        interp = Interpreter()
-        return interp.execute(program, bindings, type_map, device=device,
-                              latent_channel_count=latent_channel_count,
-                              output_names=output_names)
+    if not output_names:
+        raise InterpreterError(
+            "TEX program has no outputs. Assign to @OUT or another @name."
+        )
+
+    interp = Interpreter()
+    result = interp.execute(program, bindings, type_map, device=device,
+                            latent_channel_count=latent_channel_count,
+                            output_names=output_names)
+
+    # Unwrap single-output for backward compat with existing tests
+    if output_names == ["OUT"]:
+        return result["OUT"]
+    return result
 
 
 # ── Lexer Tests ────────────────────────────────────────────────────────
@@ -2749,16 +2736,16 @@ def test_latent(r: TestResult):
     except Exception as e:
         r.fail("latent: prepare output", f"{e}\n{traceback.format_exc()}")
 
-    # latent: IS_CHANGED
+    # latent: fingerprint_inputs
     try:
         lat = _make_latent(1, 4, 4, 4)
         from TEX_Wrangle.tex_node import TEXWrangleNode
         # Should not crash with LATENT dict
-        h = TEXWrangleNode.IS_CHANGED("@OUT = @A;", A=lat)
+        h = TEXWrangleNode.fingerprint_inputs(code="@OUT = @A;", A=lat)
         assert isinstance(h, str), f"Expected hash string, got {type(h)}"
-        r.ok("latent: IS_CHANGED")
+        r.ok("latent: fingerprint_inputs")
     except Exception as e:
-        r.fail("latent: IS_CHANGED", f"{e}\n{traceback.format_exc()}")
+        r.fail("latent: fingerprint_inputs", f"{e}\n{traceback.format_exc()}")
 
 
 # ── String Tests ───────────────────────────────────────────────────────
@@ -3431,30 +3418,18 @@ def compile_and_infer(code: str, bindings: dict, device: str = "cpu",
     parser = Parser(tokens)
     program = parser.parse()
 
-    binding_types = {}
-    for name, val in bindings.items():
-        if isinstance(val, str):
-            binding_types[name] = TEXType.STRING
-        elif isinstance(val, torch.Tensor):
-            if val.dim() == 4:
-                c = val.shape[-1]
-                binding_types[name] = TEXType.VEC4 if c == 4 else TEXType.VEC3
-            elif val.dim() == 3:
-                binding_types[name] = TEXType.FLOAT
-            else:
-                binding_types[name] = TEXType.FLOAT
-        else:
-            binding_types[name] = TEXType.FLOAT
-    # OUT is NOT in binding_types -> triggers auto-inference
+    binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
 
     checker = TypeChecker(binding_types=binding_types)
     type_map = checker.check(program)
     inferred = checker.inferred_out_type
+    output_names = sorted(checker.assigned_bindings.keys())
 
     interp = Interpreter()
     result = interp.execute(program, bindings, type_map, device=device,
-                            latent_channel_count=latent_channel_count)
-    return result, inferred
+                            latent_channel_count=latent_channel_count,
+                            output_names=output_names)
+    return result["OUT"], inferred
 
 
 def test_auto_inference(r: TestResult):
@@ -4918,10 +4893,9 @@ def test_v03_features(r: TestResult):
     # ── tex_node: multi-output tuple ──
     try:
         from TEX_Wrangle.tex_node import TEXWrangleNode
-        node = TEXWrangleNode()
         img = torch.rand(1, 4, 4, 3)
-        result = node.execute(
-            "@result = @A * 0.5;\n@mask = luma(@A);",
+        result = TEXWrangleNode.execute(
+            code="@result = @A * 0.5;\n@mask = luma(@A);",
             A=img, device="cpu", compile_mode="none"
         )
         assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
@@ -4937,9 +4911,8 @@ def test_v03_features(r: TestResult):
     # ── tex_node: backward compat (single @OUT) ──
     try:
         from TEX_Wrangle.tex_node import TEXWrangleNode
-        node = TEXWrangleNode()
         img = torch.rand(1, 4, 4, 3)
-        result = node.execute("@OUT = @A * 0.5;", A=img, device="cpu", compile_mode="none")
+        result = TEXWrangleNode.execute(code="@OUT = @A * 0.5;", A=img, device="cpu", compile_mode="none")
         assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
         assert result[0] is not None, "slot 0 (OUT) should not be None"
         assert result[1] is None, "slot 1 should be None"
@@ -4950,11 +4923,10 @@ def test_v03_features(r: TestResult):
     # ── tex_node: old output_type ignored ──
     try:
         from TEX_Wrangle.tex_node import TEXWrangleNode
-        node = TEXWrangleNode()
         img = torch.rand(1, 4, 4, 3)
         # Passing output_type="IMAGE" — should be silently ignored
-        result = node.execute("@OUT = @A * 0.5;", A=img, device="cpu",
-                              compile_mode="none", output_type="IMAGE")
+        result = TEXWrangleNode.execute(code="@OUT = @A * 0.5;", A=img, device="cpu",
+                                        compile_mode="none", output_type="IMAGE")
         assert result[0] is not None
         r.ok("tex_node: old output_type ignored")
     except Exception as e:
@@ -4963,11 +4935,10 @@ def test_v03_features(r: TestResult):
     # ── tex_node: param widgets flow through kwargs ──
     try:
         from TEX_Wrangle.tex_node import TEXWrangleNode
-        node = TEXWrangleNode()
         img = torch.ones(1, 2, 2, 3)
         # $strength value comes as a kwarg (simulating widget value from ComfyUI)
-        result = node.execute(
-            "f$strength = 0.5;\n@OUT = @A * $strength;",
+        result = TEXWrangleNode.execute(
+            code="f$strength = 0.5;\n@OUT = @A * $strength;",
             A=img, strength=torch.tensor(0.75), device="cpu", compile_mode="none"
         )
         out = result[0]  # OUT is at slot 0 (only output)
@@ -4981,11 +4952,10 @@ def test_v03_features(r: TestResult):
     # ── tex_node: param default fallback ──
     try:
         from TEX_Wrangle.tex_node import TEXWrangleNode
-        node = TEXWrangleNode()
         img = torch.ones(1, 2, 2, 3)
         # No strength kwarg — should use default from code (0.5)
-        result = node.execute(
-            "f$strength = 0.5;\n@OUT = @A * $strength;",
+        result = TEXWrangleNode.execute(
+            code="f$strength = 0.5;\n@OUT = @A * $strength;",
             A=img, device="cpu", compile_mode="none"
         )
         out = result[0]
@@ -4998,11 +4968,10 @@ def test_v03_features(r: TestResult):
     # ── tex_node: param widget value as kwarg ──
     try:
         from TEX_Wrangle.tex_node import TEXWrangleNode
-        node = TEXWrangleNode()
         img = torch.ones(1, 2, 2, 3)
         # Widget value injected as kwarg by graphToPrompt hook (overrides code default)
-        result = node.execute(
-            "f$strength = 0.5;\n@OUT = @A * $strength;",
+        result = TEXWrangleNode.execute(
+            code="f$strength = 0.5;\n@OUT = @A * $strength;",
             A=img, strength=0.3,
             device="cpu", compile_mode="none"
         )
@@ -5016,11 +4985,10 @@ def test_v03_features(r: TestResult):
     # ── tex_node: param widget overrides code default ──
     try:
         from TEX_Wrangle.tex_node import TEXWrangleNode
-        node = TEXWrangleNode()
         img = torch.ones(1, 2, 2, 3)
         # Widget value (scalar kwarg) overrides code default of 0.5
-        result = node.execute(
-            "f$strength = 0.5;\n@OUT = @A * $strength;",
+        result = TEXWrangleNode.execute(
+            code="f$strength = 0.5;\n@OUT = @A * $strength;",
             A=img, strength=0.8,
             device="cpu", compile_mode="none"
         )
