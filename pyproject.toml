@@ -16,4 +16,5 @@ Documentation = "https://github.com/xavinitram/TEX#readme"
 [tool.comfy]
 PublisherId = "tex"
 DisplayName = "TEX Wrangle"
-Icon = "default"
+Icon = "https://raw.githubusercontent.com/xavinitram/TEX/main/assets/TEX_Logo.jpg"
+Banner = "https://raw.githubusercontent.com/xavinitram/TEX/main/assets/TEX_Banner.jpg"
