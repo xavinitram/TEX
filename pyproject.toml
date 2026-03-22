@@ -1,20 +1,20 @@
 [project]
 name = "comfyui-tex-wrangle"
-description = "TEX (Tensor Expression Language) — per-pixel kernel DSL for ComfyUI"
+description = "TEX (Tensor Expression Language). Per-pixel DSL for ComfyUI"
 version = "0.7.0"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [{ name = "xavinitram" }]
-keywords = ["comfyui", "tensor", "expression", "dsl", "image-processing", "vex", "shader"]
+keywords = ["comfyui", "image-processing", "shader", "vex", "blinkscript", "pixel", "mask", "latent", "batch", "noise", "custom-node", "expression", "scripting", "wrangle"]
 dependencies = []
 
 [project.urls]
 Repository = "https://github.com/xavinitram/TEX"
-Documentation = "https://github.com/xavinitram/TEX#readme"
+Documentation = "https://github.com/xavinitram/TEX/wiki"
 "Bug Tracker" = "https://github.com/xavinitram/TEX/issues"
 
 [tool.comfy]
-PublisherId = "tex"
+PublisherId = "xavinitram"
 DisplayName = "TEX Wrangle"
 Icon = "https://raw.githubusercontent.com/xavinitram/TEX/main/assets/TEX_Logo.jpg"
 Banner = "https://raw.githubusercontent.com/xavinitram/TEX/main/assets/TEX_Banner.jpg"
