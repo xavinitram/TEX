@@ -305,7 +305,7 @@ class TEXStdlib:
         yt = _to_tensor(y)
         abs_t = torch.abs(t)
         mask = abs_t < SAFE_EPSILON
-        safe_abs = torch.where(mask, torch.full_like(abs_t, SAFE_EPSILON), abs_t)
+        safe_abs = torch.clamp(abs_t, min=SAFE_EPSILON)
         return torch.where(mask, torch.zeros_like(t), torch.sign(t) * torch.pow(safe_abs, yt))
 
     @staticmethod
@@ -447,13 +447,21 @@ class TEXStdlib:
 
         i_mod = torch.fmod(i, 6.0)
 
-        # Use torch.where for branchless selection
-        r = torch.where(i_mod == 0, v, torch.where(i_mod == 1, q, torch.where(
-            i_mod == 2, p, torch.where(i_mod == 3, p, torch.where(i_mod == 4, t, v)))))
-        g = torch.where(i_mod == 0, t, torch.where(i_mod == 1, v, torch.where(
-            i_mod == 2, v, torch.where(i_mod == 3, q, torch.where(i_mod == 4, p, p)))))
-        b = torch.where(i_mod == 0, p, torch.where(i_mod == 1, p, torch.where(
-            i_mod == 2, t, torch.where(i_mod == 3, v, torch.where(i_mod == 4, v, q)))))
+        # Compute masks once (shared across all 3 channels)
+        # instead of 5-deep nested torch.where (which repeats comparisons 3×)
+        m1 = (i_mod == 1.0)
+        m2 = (i_mod == 2.0)
+        m3 = (i_mod == 3.0)
+        m4 = (i_mod == 4.0)
+
+        # r: 0->v, 1->q, 2->p, 3->p, 4->t, 5->v  (default v)
+        r = torch.where(m1, q, torch.where(m2 | m3, p, torch.where(m4, t, v)))
+        # g: 0->t, 1->v, 2->v, 3->q, 4->p, 5->p  (default p)
+        g = torch.where(m1 | m2, v, torch.where(m3, q, torch.where(m4, p,
+            torch.where(i_mod == 0.0, t, p))))
+        # b: 0->p, 1->p, 2->t, 3->v, 4->v, 5->q  (default q)
+        b = torch.where(m1, p, torch.where(m2, t, torch.where(m3 | m4, v,
+            torch.where(i_mod == 0.0, p, q))))
 
         result = torch.cat([r, g, b], dim=-1)
         # If input was vec4, preserve alpha
@@ -479,7 +487,7 @@ class TEXStdlib:
         h = torch.fmod(h + 1.0, 1.0)  # ensure positive
 
         # Saturation
-        s = torch.where(cmax > SAFE_EPSILON, diff / cmax, torch.zeros_like(cmax))
+        s = torch.where(cmax > SAFE_EPSILON, diff / cmax, cmax.new_zeros(()))
 
         # Value
         v = cmax
@@ -554,15 +562,9 @@ class TEXStdlib:
 
         B, H, W, C = img.shape
 
-        # Convert to integer indices — skip round() if already long/int dtype
-        if px_t.dtype in (torch.int32, torch.int64):
-            px_i = torch.clamp(px_t.long(), 0, W - 1)
-        else:
-            px_i = torch.clamp(px_t.long(), 0, W - 1)
-        if py_t.dtype in (torch.int32, torch.int64):
-            py_i = torch.clamp(py_t.long(), 0, H - 1)
-        else:
-            py_i = torch.clamp(py_t.long(), 0, H - 1)
+        # Convert to integer indices and clamp to valid range
+        px_i = torch.clamp(px_t.long(), 0, W - 1)
+        py_i = torch.clamp(py_t.long(), 0, H - 1)
 
         # Expand scalars to spatial dims
         if px_i.dim() == 0:
@@ -743,11 +745,9 @@ class TEXStdlib:
             u_coord: float or [B, H, W] tensor — horizontal coordinate [0, 1]
             v_coord: float or [B, H, W] tensor — vertical coordinate [0, 1]
 
-        Lanczos-3 uses a 6x6 pixel neighborhood with sinc-based weights
-        for the sharpest reconstruction with minimal ringing.
-
-        Fully vectorized: all 36 taps are gathered and weighted in batched
-        tensor ops with no Python loops.
+        Lanczos-3 uses a 6×6 pixel neighborhood with sinc-based weights.
+        Uses flat gather on a [B, H*W, C] view to avoid expanding 5-D index
+        grids, then reshapes for weight application.
         """
         img = _to_tensor(image)
         u = _to_tensor(u_coord)
@@ -761,56 +761,61 @@ class TEXStdlib:
         y = v * (H - 1)
 
         # Center pixel (integer part)
-        x_center = torch.floor(x)
-        y_center = torch.floor(y)
+        x_floor = torch.floor(x)
+        y_floor = torch.floor(y)
 
         # Fractional part
-        fx = x - x_center
-        fy = y - y_center
+        fx = x - x_floor
+        fy = y - y_floor
 
         # Expand scalars to spatial dims
         if fx.dim() == 0:
             fx = fx.expand(B, H, W)
             fy = fy.expand(B, H, W)
-            x_center = x_center.expand(B, H, W)
-            y_center = y_center.expand(B, H, W)
+            x_floor = x_floor.expand(B, H, W)
+            y_floor = y_floor.expand(B, H, W)
         elif fx.dim() == 2:
             fx = fx.unsqueeze(0).expand(B, H, W)
             fy = fy.unsqueeze(0).expand(B, H, W)
-            x_center = x_center.unsqueeze(0).expand(B, H, W)
-            y_center = y_center.unsqueeze(0).expand(B, H, W)
+            x_floor = x_floor.unsqueeze(0).expand(B, H, W)
+            y_floor = y_floor.unsqueeze(0).expand(B, H, W)
 
         # Tap offsets: -2, -1, 0, 1, 2, 3 (6 taps for Lanczos-3)
         taps = _get_lanczos_taps(dev)  # [6] — cached
 
         # Compute 1-D Lanczos weights for x and y (separable)
-        # fx/fy: [B, H, W] → [B, H, W, 1] - taps: [6] → weights: [B, H, W, 6]
         wx = _lanczos3(fx.unsqueeze(-1) - taps)  # [B, H, W, 6]
         wy = _lanczos3(fy.unsqueeze(-1) - taps)  # [B, H, W, 6]
 
         # 2-D weights via outer product: [B, H, W, 6, 6]
-        weights_2d = wy.unsqueeze(-1) * wx.unsqueeze(-2)  # [B,H,W,6(y),6(x)]
+        weights_2d = torch.einsum('...i,...j->...ij', wy, wx)
+
+        # Normalize
+        w_sum = weights_2d.sum(dim=(-2, -1), keepdim=True).clamp(min=SAFE_EPSILON)
+        weights_2d = weights_2d / w_sum  # [B,H,W,6,6]
 
         # Pixel coordinates for all 36 taps, clamped to image bounds
-        # x_center: [B,H,W] → [B,H,W,1] + taps → [B,H,W,6]
-        px_all = torch.clamp((x_center.unsqueeze(-1) + taps).long(), 0, W - 1)  # [B,H,W,6]
-        py_all = torch.clamp((y_center.unsqueeze(-1) + taps).long(), 0, H - 1)  # [B,H,W,6]
+        px_all = torch.clamp((x_floor.unsqueeze(-1) + taps).long(), 0, W - 1)  # [B,H,W,6]
+        py_all = torch.clamp((y_floor.unsqueeze(-1) + taps).long(), 0, H - 1)  # [B,H,W,6]
 
-        # Gather all 36 neighbor pixels in one advanced-indexing op
-        # Build full index grids: [B,H,W,6(y),6(x)]
-        b_idx = _get_batch_index(B, H, W, dev).unsqueeze(-1).unsqueeze(-1).expand(B, H, W, 6, 6)
-        py_grid = py_all.unsqueeze(-1).expand(B, H, W, 6, 6)  # y taps along dim 3
-        px_grid = px_all.unsqueeze(-2).expand(B, H, W, 6, 6)  # x taps along dim 4
+        # Compute flat pixel indices: py * W + px → [B,H,W,6,6]
+        # Use views to broadcast: py[...,6,1] * W + px[...,1,6] → [B,H,W,6,6]
+        flat_idx = py_all.unsqueeze(-1) * W + px_all.unsqueeze(-2)  # [B,H,W,6y,6x]
+        flat_idx = flat_idx.reshape(B, H * W * 36)  # [B, N]
 
-        pixels = img[b_idx, py_grid, px_grid]  # [B, H, W, 6, 6, C]
+        # Gather from flattened image: [B, H*W, C]
+        img_flat = img.reshape(B, H * W, C)
+        # Expand flat_idx for channel dim: [B, N, C]
+        idx_exp = flat_idx.unsqueeze(-1).expand(-1, -1, C)
+        pixels_flat = torch.gather(img_flat, 1, idx_exp)  # [B, N, C]
 
-        # Apply weights and sum: [B,H,W,6,6,1] * [B,H,W,6,6,C] → sum → [B,H,W,C]
-        w = weights_2d.unsqueeze(-1)  # [B, H, W, 6, 6, 1]
-        result = (pixels * w).sum(dim=(3, 4))  # [B, H, W, C]
-        weight_sum = w.sum(dim=(3, 4))  # [B, H, W, 1]
+        # Reshape back: [B, H, W, 6, 6, C]
+        pixels = pixels_flat.reshape(B, H, W, 6, 6, C)
 
-        # Normalize (avoids edge darkening from clamped kernels)
-        return result / (weight_sum + SAFE_EPSILON)
+        # Apply weights: [B,H,W,6,6,1] * [B,H,W,6,6,C] → sum → [B,H,W,C]
+        result = (pixels * weights_2d.unsqueeze(-1)).sum(dim=(3, 4))
+
+        return result
 
     # -- Noise functions ------------------------------------------------
 
@@ -1187,40 +1192,32 @@ class TEXStdlib:
     def fn_img_sum(image):
         """Sum of all pixels per channel per frame. Returns broadcast-friendly shape."""
         img = _to_tensor(image)
-        if img.dim() == 4:  # [B, H, W, C]
-            return img.sum(dim=(1, 2)).unsqueeze(1).unsqueeze(1)
-        if img.dim() == 3:  # [B, H, W] mask
-            return img.sum(dim=(1, 2)).unsqueeze(1).unsqueeze(1)
+        if img.dim() >= 3:
+            return img.sum(dim=(1, 2), keepdim=True)
         return img
 
     @staticmethod
     def fn_img_mean(image):
         """Mean of all pixels per channel per frame."""
         img = _to_tensor(image)
-        if img.dim() == 4:
-            return img.mean(dim=(1, 2)).unsqueeze(1).unsqueeze(1)
-        if img.dim() == 3:
-            return img.mean(dim=(1, 2)).unsqueeze(1).unsqueeze(1)
+        if img.dim() >= 3:
+            return img.mean(dim=(1, 2), keepdim=True)
         return img
 
     @staticmethod
     def fn_img_min(image):
         """Min pixel value per channel per frame."""
         img = _to_tensor(image)
-        if img.dim() == 4:
-            return img.amin(dim=(1, 2)).unsqueeze(1).unsqueeze(1)
-        if img.dim() == 3:
-            return img.amin(dim=(1, 2)).unsqueeze(1).unsqueeze(1)
+        if img.dim() >= 3:
+            return img.amin(dim=(1, 2), keepdim=True)
         return img
 
     @staticmethod
     def fn_img_max(image):
         """Max pixel value per channel per frame."""
         img = _to_tensor(image)
-        if img.dim() == 4:
-            return img.amax(dim=(1, 2)).unsqueeze(1).unsqueeze(1)
-        if img.dim() == 3:
-            return img.amax(dim=(1, 2)).unsqueeze(1).unsqueeze(1)
+        if img.dim() >= 3:
+            return img.amax(dim=(1, 2), keepdim=True)
         return img
 
     @staticmethod
@@ -1241,17 +1238,17 @@ class TEXStdlib:
 # -- Utility helpers (module-level) ------------------------------------
 
 def _lanczos3(x: torch.Tensor) -> torch.Tensor:
-    """Lanczos-3 kernel: sinc(x) * sinc(x/3) for |x| < 3, else 0."""
+    """Lanczos-3 kernel: sinc(x) * sinc(x/3) for |x| < 3, else 0.
+
+    Uses torch.sinc (normalized: sinc(x) = sin(pi*x)/(pi*x)) which handles
+    the x=0 singularity internally, reducing intermediate tensor allocations.
+    """
     x = x.float()
-    ax = torch.abs(x)
-    # sinc(x) = sin(pi*x) / (pi*x), with sinc(0) = 1
-    pix = math.pi * x
-    pix3 = pix / 3.0
-    sinc_x = torch.where(ax < SAFE_EPSILON, torch.ones_like(x), torch.sin(pix) / (pix + SAFE_EPSILON))
-    sinc_x3 = torch.where(ax < SAFE_EPSILON, torch.ones_like(x), torch.sin(pix3) / (pix3 + SAFE_EPSILON))
-    kernel = sinc_x * sinc_x3
-    # Zero out beyond support radius of 3
-    return torch.where(ax < 3.0, kernel, torch.zeros_like(kernel))
+    # torch.sinc uses the normalized definition: sinc(x) = sin(pi*x)/(pi*x)
+    kernel = torch.sinc(x) * torch.sinc(x / 3.0)
+    # Zero out beyond support radius of 3 (mask multiply avoids zeros_like alloc)
+    kernel.mul_(torch.abs(x) < 3.0)
+    return kernel
 
 
 # -- Noise helpers (module-level) --------------------------------------
@@ -1319,27 +1316,30 @@ def _get_noise_tables(device: torch.device) -> tuple[torch.Tensor, torch.Tensor,
 def _noise_hash(xi: torch.Tensor, yi: torch.Tensor) -> torch.Tensor:
     """Hash 2D integer coordinates via permutation table lookup."""
     perm = _get_noise_tables(xi.device)[0]
-    idx_x = (xi % 256).clamp(0, 255)
+    # Bitwise AND is faster than modulo for power-of-2 divisors
+    idx_x = xi & 255
     inner = perm[idx_x]
-    idx_xy = ((inner + yi % 256) % 512).clamp(0, 511)
+    idx_xy = (inner + (yi & 255)) & 511
     return perm[idx_xy]
 
 
 def _perlin_grad2(hash_val: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
     """Gradient dot product for 2D Perlin noise using 8 gradient directions."""
     grad = _get_noise_tables(dx.device)[1]
-    idx = (hash_val % 8).long()
+    idx = (hash_val & 7).long()
     g = grad[idx]
     return g[..., 0] * dx + g[..., 1] * dy
 
 
 def _perlin2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """2D Perlin noise. Returns float tensor in approximately [-1, 1]."""
-    xi = torch.floor(x).long()
-    yi = torch.floor(y).long()
+    x_floor = torch.floor(x)
+    y_floor = torch.floor(y)
+    xi = x_floor.long()
+    yi = y_floor.long()
 
-    xf = x - torch.floor(x)
-    yf = y - torch.floor(y)
+    xf = x - x_floor
+    yf = y - y_floor
 
     u = _fade(xf)
     v = _fade(yf)
@@ -1401,17 +1401,17 @@ def _simplex2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
     # Corner contributions: radial falloff (0.5 - d²)⁴ × dot(gradient, offset)
     t0 = torch.clamp(0.5 - x0 * x0 - y0 * y0, min=0.0)
-    t0 = t0 * t0 * t0 * t0
+    t0 = t0 * t0; t0 = t0 * t0  # t⁴ in 2 muls instead of 3
     g0 = grad[gi0]
     n0 = t0 * (g0[..., 0] * x0 + g0[..., 1] * y0)
 
     t1 = torch.clamp(0.5 - x1 * x1 - y1 * y1, min=0.0)
-    t1 = t1 * t1 * t1 * t1
+    t1 = t1 * t1; t1 = t1 * t1
     g1 = grad[gi1]
     n1 = t1 * (g1[..., 0] * x1 + g1[..., 1] * y1)
 
     t2 = torch.clamp(0.5 - x2 * x2 - y2 * y2, min=0.0)
-    t2 = t2 * t2 * t2 * t2
+    t2 = t2 * t2; t2 = t2 * t2
     g2 = grad[gi2]
     n2 = t2 * (g2[..., 0] * x2 + g2[..., 1] * y2)
 

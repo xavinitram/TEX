@@ -25,7 +25,7 @@ TEX_Wrangle/
     tex_extension.js       # Frontend: auto-socket, CodeMirror 6 editor, help popup
     tex_cm6_bundle.js      # Pre-built CodeMirror 6 bundle (Rollup)
   tests/
-    test_tex.py            # Comprehensive test suite (521 sub-tests)
+    test_tex.py            # Comprehensive test suite (468 sub-tests)
   benchmarks/
     run_benchmarks.py      # Reproducible performance benchmarks
     README.md              # Benchmark usage and result format docs
@@ -300,7 +300,7 @@ cd custom_nodes/TEX_Wrangle
 python -m pytest tests/test_tex.py -v
 ```
 
-Expected: 44 test functions (521 sub-tests) passed.
+Expected: 45 test functions (468 sub-tests) passed.
 
 ## Benchmarks
 
@@ -313,3 +313,169 @@ python benchmarks/run_benchmarks.py
 # Compare against v0.4.0 baseline
 python benchmarks/run_benchmarks.py --compare benchmarks/results/v0.4.0.json
 ```
+
+## Error Reporting Guidelines
+
+TEX uses structured diagnostics (`tex_compiler/diagnostics.py`) to produce clear, helpful error messages. Every error carries an error code, source snippet, optional fuzzy-match suggestions, and a contextual hint.
+
+### Error Code Ranges
+
+| Range | Phase | Examples |
+|-------|-------|----------|
+| `E1xxx` | Lexer | Unterminated strings, invalid characters, malformed numbers |
+| `E2xxx` | Parser | Unexpected tokens, missing semicolons, foreign keywords |
+| `E3xxx` | Type checker — names & scope | Undefined variables, undefined functions, duplicate declarations |
+| `E4xxx` | Type checker — types & coercions | Type mismatches, incompatible operands, failed promotions |
+| `E5xxx` | Type checker — function signatures | Wrong argument count, argument type errors |
+| `E6xxx` | Runtime (interpreter) | Loop iteration limit, division by zero, out-of-bounds access |
+| `W7xxx` | Warnings | Unused variables, redundant casts, shadowed names |
+
+### Voice and Tone
+
+TEX errors are written in an empathetic, first-person voice. The compiler speaks as a helpful assistant, never as an authority scolding the user.
+
+**Do:**
+- Use active voice, present tense: *"I can't find a function named `clampp`."*
+- Explain what went wrong, then what to do: *"I expected `;` after this expression. Add a semicolon to end the statement."*
+- Use: `"I found..."`, `"I expected..."`, `"This ... isn't supported"`
+
+**Don't:**
+- Use blame-laden words: ~~`fatal`~~, ~~`illegal`~~, ~~`invalid`~~, ~~`user error`~~
+- Use passive/impersonal phrasing: ~~`"Unknown identifier"`~~ (use `"I can't find a variable named ..."`)
+- Omit actionable guidance — always tell the user what to try next
+
+### Adding a New Error
+
+1. **Pick a code** from the appropriate range (e.g. `E3012` for a new scope error). Check existing codes in the codebase to avoid collisions.
+
+2. **Write the message** in empathetic voice:
+   ```python
+   # Good
+   "I can't find a variable named `{name}`."
+   # Bad
+   "Unknown identifier: {name}"
+   ```
+
+3. **Call `make_diagnostic()`** with `code=` and `hint=`:
+   ```python
+   from .diagnostics import make_diagnostic, suggest_similar
+
+   diag = make_diagnostic(
+       code="E3012",
+       message=f"I can't find a variable named `{name}`.",
+       loc=node.loc,
+       source=self.source,
+       hint="Check your spelling, or make sure the variable is declared before this line.",
+       phase="type_checker",
+   )
+   ```
+
+4. **Add fuzzy suggestions** when the error involves a name the user may have mistyped:
+   ```python
+   from .diagnostics import suggest_similar
+
+   candidates = list(self.env.keys())
+   diag.suggestions = suggest_similar(name, candidates)
+   ```
+
+5. **Thread `source=`** so the diagnostic can render a source snippet with a caret underline. The source string is the full program text; `make_diagnostic` extracts the relevant line automatically via `get_source_line()`.
+
+### Foreign Hint Maps
+
+Three dictionaries in `diagnostics.py` provide contextual hints when users try syntax from other languages:
+
+| Dict | Purpose | Example |
+|------|---------|---------|
+| `_FOREIGN_FUNCTION_HINTS` | GLSL/HLSL/JS/VEX function names | `"texture2D"` -> tells user to use `sample()` |
+| `_FOREIGN_VARIABLE_HINTS` | Shader/JS built-in variable names | `"iResolution"` -> tells user to use `iw`, `ih` |
+| `_FOREIGN_KEYWORD_HINTS` | Keywords from other languages | `"let"` -> tells user to use explicit types |
+
+To add a new entry, add a key-value pair to the appropriate dict. The key is the foreign name (as the user would type it), and the value is a short, helpful string explaining the TEX equivalent. Set the value to `None` if the keyword is actually valid in TEX (no hint needed).
+
+```python
+# Example: adding a Unity ShaderLab hint
+_FOREIGN_FUNCTION_HINTS["UnpackNormal"] = (
+    "TEX doesn't have UnpackNormal. Use x * 2.0 - 1.0 to unpack normal maps."
+)
+```
+
+### Testing Errors
+
+When testing that the compiler produces the right error for bad input:
+
+1. **Catch the right exception type** — `TEXMultiError` for compile-time errors, standard exceptions for runtime errors:
+   ```python
+   from tex_compiler.diagnostics import TEXMultiError
+
+   try:
+       compile_and_run("@OUT = unknownfunc(1.0);", {"A": img})
+       r.fail("expected error for unknown function")
+   except TEXMultiError as e:
+       assert "I can't find" in str(e)
+       assert len(e.diagnostics) >= 1
+       assert e.diagnostics[0].code.startswith("E")
+       r.ok("unknown function error")
+   ```
+
+2. **Assert on key phrases, not exact strings.** Error messages may be refined over time. Check for stable fragments like `"I can't find"` or `"I expected"`, not the full sentence.
+
+3. **Verify the error code prefix** matches the expected phase (e.g. `E3` for type checker name errors, `E5` for signature errors).
+
+4. **Check suggestions** when testing fuzzy matching:
+   ```python
+   assert "clamp" in e.diagnostics[0].suggestions  # typo "clampp" -> "clamp"
+   ```
+
+### Bug Reports
+
+If you encounter an error message that is confusing, unhelpful, or missing a hint, please file an issue: https://github.com/xavinitram/TEX/issues
+
+---
+
+## Snippet System
+
+The snippet system lets users browse, insert, save, and manage TEX code snippets via the right-click context menu.
+
+### Architecture
+
+```
+Backend (Python)                          Frontend (JavaScript)
+────────────────                          ────────────────────
+__init__.py                               tex_extension.js
+  _EXAMPLE_CATEGORIES dict                  _fetchBuiltinSnippets()
+  _load_example_snippets()                    ↓ fetches once, caches
+  /tex_wrangle/snippets route               _buildSnippetTree()
+        ↓ reads                               ↓ merges with user snippets
+  examples/*.tex files                      _createCascadeSubmenu()
+                                              ↓ renders nested menus
+                                            Save / Manage dialogs
+                                              ↓ persists to localStorage
+```
+
+### Backend: Snippet API
+
+- **Route**: `GET /tex_wrangle/snippets` (registered in `__init__.py`)
+- **Source**: reads all `.tex` files from the `examples/` directory
+- **Category mapping**: the `_EXAMPLE_CATEGORIES` dict maps filename stems (e.g. `"auto_levels"`) to display paths (e.g. `"Color/Auto Levels"`). Files not in the dict get auto-categorized under `"Uncategorized/"`.
+- **Caching**: `_snippets_cache` is built once on first request and never invalidated (examples are static assets)
+- **Response**: JSON object where keys are paths like `"Examples/Color/Auto Levels"` and values are the full `.tex` source code
+
+### Frontend: Cascade Menu
+
+- **Fetch**: `_fetchBuiltinSnippets()` calls the API once and caches in `_builtinSnippetsCache`. On failure, returns `{}` without caching so the next hover retries.
+- **Tree building**: `_buildSnippetTree()` splits `/`-separated paths into a nested object tree, then merges built-in and user snippets.
+- **Cascade rendering**: `_createCascadeSubmenu()` recursively builds nested DOM menus. A shared per-level `pendingTimeout` prevents hover races when the mouse moves quickly between categories.
+- **Cleanup**: `_closeAllSubmenus()` tears down all open cascade levels; the dismiss handler checks both the main menu and all submenus.
+
+### User Snippets
+
+- **Storage**: localStorage key `tex_wrangle_snippets`, JSON object of `{"path/name": "code", ...}`
+- **Paths**: use `/` as folder separator (e.g. `"My Snippets/Color/warm tint"`)
+- **Save dialog** (`_showSaveSnippetDialog`): modal with name input (with `/` folder hint), 3-line code preview, Enter/Escape/click-outside dismissal
+- **Manage dialog** (`_showManageSnippetsDialog`): scrollable list of user snippets with Rename and Delete buttons; live re-renders on changes
+
+### Adding a New Built-in Example
+
+1. Create a `.tex` file in the `examples/` directory
+2. Add the filename stem to `_EXAMPLE_CATEGORIES` in `__init__.py` with a `"Category/Display Name"` value
+3. The snippet will appear automatically in the cascade menu under `Examples/Category/Display Name`

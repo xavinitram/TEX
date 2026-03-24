@@ -139,8 +139,8 @@ class TEXCache:
 
         # Full compilation pipeline
         tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
-        checker = TypeChecker(binding_types=binding_types)
+        program = Parser(tokens, source=code).parse()
+        checker = TypeChecker(binding_types=binding_types, source=code)
         type_map = checker.check(program)
         program = optimize(program)
 
@@ -217,7 +217,7 @@ class TEXCache:
             program = data["program"]
 
             # Re-run type checker to regenerate type_map with valid id() keys
-            checker = TypeChecker(binding_types=binding_types)
+            checker = TypeChecker(binding_types=binding_types, source="")
             type_map = checker.check(program)
 
             # Touch file to update access time for LRU eviction

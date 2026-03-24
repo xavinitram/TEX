@@ -9,6 +9,7 @@ Requires ComfyUI with Nodes v3 API support (comfy_api.latest).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 import torch
@@ -20,6 +21,8 @@ logger = logging.getLogger("TEX")
 from .tex_compiler.lexer import LexerError
 from .tex_compiler.parser import ParseError
 from .tex_compiler.type_checker import TypeCheckError, TEXType
+from .tex_compiler.diagnostics import TEXMultiError
+from .tex_compiler.ast_nodes import SourceLoc
 from .tex_runtime.interpreter import Interpreter, InterpreterError
 from .tex_cache import get_cache
 from .tex_runtime.compiled import execute_compiled
@@ -364,12 +367,14 @@ class TEXWrangleNode(_BaseClass):
             output_names = sorted(assigned_bindings.keys())
             if not output_names:
                 raise InterpreterError(
-                    "TEX program has no outputs. Assign to @OUT or another @name."
+                    "TEX program has no outputs. Assign to @OUT or another @name.",
+                    loc=SourceLoc(1, 1), source=code, code="E6001",
                 )
             if len(output_names) > cls.MAX_OUTPUTS:
                 raise InterpreterError(
                     f"TEX program has {len(output_names)} outputs, "
-                    f"exceeding the maximum ({cls.MAX_OUTPUTS})."
+                    f"exceeding the maximum ({cls.MAX_OUTPUTS}).",
+                    loc=SourceLoc(1, 1), source=code, code="E6002",
                 )
 
             # Check that referenced input bindings are available.
@@ -385,7 +390,8 @@ class TEXWrangleNode(_BaseClass):
                             continue
                     sigil = "$" if ref_name in param_info else "@"
                     raise InterpreterError(
-                        f"TEX code references {sigil}{ref_name} but no input is connected to slot '{ref_name}'."
+                        f"TEX code references {sigil}{ref_name} but no input is connected to slot '{ref_name}'.",
+                        loc=SourceLoc(1, 1), source=code, code="E6003",
                     )
 
             # Execute — optionally with torch.compile acceleration
@@ -434,8 +440,20 @@ class TEXWrangleNode(_BaseClass):
                 return IO.NodeOutput(*results)
             return tuple(results)
 
+        except TEXMultiError as e:
+            # Multiple errors — human-readable first, JSON at end for frontend
+            readable = "\n\n".join(d.render() for d in e.diagnostics)
+            payload = json.dumps([d.to_dict() for d in e.diagnostics])
+            raise RuntimeError(f"{readable}\nTEX_DIAG:{payload}") from e
         except (LexerError, ParseError, TypeCheckError, InterpreterError) as e:
-            # Clean user-facing error
+            # Single error — human-readable first, JSON at end for frontend
+            if hasattr(e, '_build_diagnostic'):
+                e._build_diagnostic()
+            if hasattr(e, 'diagnostic') and e.diagnostic:
+                readable = e.diagnostic.render()
+                payload = json.dumps([e.diagnostic.to_dict()])
+                raise RuntimeError(f"{readable}\nTEX_DIAG:{payload}") from e
+            # Fallback for errors without diagnostic (shouldn't happen)
             raise RuntimeError(f"TEX Error: {e}") from e
         except Exception as e:
             # Unexpected error — include traceback for debugging

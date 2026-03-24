@@ -141,9 +141,31 @@ class Token:
 
 
 class LexerError(Exception):
-    def __init__(self, message: str, loc: SourceLoc):
+    def __init__(self, message: str, loc: SourceLoc, *, source: str = "",
+                 code: str = "E1000", hint: str = "", end_col: int | None = None):
         self.loc = loc
+        self.diagnostic = None  # Set below after import-safe construction
+        self._raw_message = message
+        self._source = source
+        self._code = code
+        self._hint = hint
+        self._end_col = end_col
         super().__init__(f"[{loc}] {message}")
+
+    def _build_diagnostic(self):
+        """Lazily build the diagnostic (avoids circular import at class load time)."""
+        if self.diagnostic is not None:
+            return
+        from .diagnostics import make_diagnostic
+        self.diagnostic = make_diagnostic(
+            code=self._code,
+            message=self._raw_message,
+            loc=self.loc,
+            source=self._source,
+            end_col=self._end_col,
+            hint=self._hint,
+            phase="lexer",
+        )
 
 
 class Lexer:
@@ -155,6 +177,12 @@ class Lexer:
         self.line = 1
         self.col = 1
         self.tokens: list[Token] = []
+
+    def _error(self, message: str, loc: SourceLoc, *,
+               code: str = "E1000", hint: str = "", end_col: int | None = None) -> LexerError:
+        """Create a LexerError with source context for rich diagnostics."""
+        return LexerError(message, loc, source=self.source,
+                          code=code, hint=hint, end_col=end_col)
 
     def loc(self) -> SourceLoc:
         return SourceLoc(self.line, self.col)
@@ -197,7 +225,8 @@ class Lexer:
                 self.advance()  # /
                 return
             self.advance()
-        raise LexerError("Unterminated block comment", start_loc)
+        raise self._error("Unterminated block comment. Did you forget a closing `*/`?",
+                          start_loc, code="E1001")
 
     def read_number(self) -> Token:
         start_loc = self.loc()
@@ -212,7 +241,8 @@ class Lexer:
             while self.pos < len(self.source) and self.source[self.pos] in "0123456789abcdefABCDEF":
                 self.advance()
             if self.pos == hex_start:
-                raise LexerError("Hex literal '0x' has no digits", start_loc)
+                raise self._error("Hex literal '0x' has no digits. Try something like 0xFF.",
+                                  start_loc, code="E1002")
             text = self.source[start_pos:self.pos]
             return Token(TokenType.INT_LIT, text, start_loc)
 
@@ -286,20 +316,24 @@ class Lexer:
                 esc_loc = self.loc()
                 self.advance()  # skip backslash
                 if self.pos >= len(self.source):
-                    raise LexerError("Unterminated string escape", esc_loc)
+                    raise self._error("Unterminated string escape at end of input.",
+                                      esc_loc, code="E1003")
                 esc_ch = self.source[self.pos]
                 if esc_ch not in ESCAPE_MAP:
-                    raise LexerError(
-                        f"Invalid escape sequence: \\{esc_ch}", esc_loc
+                    raise self._error(
+                        f"Invalid escape sequence: \\{esc_ch}. Valid escapes are: \\\\, \\\", \\n, \\t, \\r.",
+                        esc_loc, code="E1004"
                     )
                 chars.append(ESCAPE_MAP[esc_ch])
                 self.advance()
                 continue
             if ch == '\n':
-                raise LexerError("Unterminated string (newline in string)", start_loc)
+                raise self._error("Unterminated string — strings can't span multiple lines. Close it with a `\"` before the line break.",
+                                  start_loc, code="E1005")
             chars.append(ch)
             self.advance()
-        raise LexerError("Unterminated string literal", start_loc)
+        raise self._error("Unterminated string literal. Did you forget a closing `\"`?",
+                          start_loc, code="E1006")
 
     def _read_binding_name(self, prefix_or_sigil: str, sigil: str,
                             start_loc: SourceLoc) -> str:
@@ -311,8 +345,9 @@ class Lexer:
         name_start = self.pos
         if (self.pos >= len(self.source) or
                 not (self.source[self.pos].isalpha() or self.source[self.pos] == "_")):
-            raise LexerError(
-                f"Expected identifier after '{prefix_or_sigil}{sigil}'", start_loc
+            raise self._error(
+                f"Expected a name after '{prefix_or_sigil}{sigil}'. For example: {sigil}myInput",
+                start_loc, code="E1007"
             )
         while self.pos < len(self.source) and (self.source[self.pos].isalnum() or self.source[self.pos] == "_"):
             self.advance()
@@ -468,7 +503,8 @@ class Lexer:
                 self.tokens.append(Token(TokenType.NOT, "!", start_loc))
                 continue
 
-            raise LexerError(f"Unexpected character: {ch!r}", start_loc)
+            raise self._error(f"Unexpected character: {ch!r}. TEX doesn't recognize this symbol.",
+                              start_loc, code="E1008")
 
         self.tokens.append(Token(TokenType.EOF, "", self.loc()))
         return self.tokens

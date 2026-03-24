@@ -25,10 +25,6 @@ from ..tex_compiler.ast_nodes import (
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP
 from .stdlib import TEXStdlib, SAFE_EPSILON
-# Codegen module available for future torch.compile integration but not used
-# in the hot path — benchmarks show the interpreter dispatch is already fast
-# enough that codegen overhead (constant creation, try/except) is a net loss.
-# from .codegen import try_compile as _try_codegen, _CgBreak, _CgContinue
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
@@ -36,10 +32,29 @@ MAX_LOOP_ITERATIONS = 1024
 
 
 class InterpreterError(Exception):
-    def __init__(self, message: str, loc: SourceLoc = None):
+    def __init__(self, message: str, loc: SourceLoc = None, *, source: str = "",
+                 code: str = "E6000", hint: str = ""):
         self.loc = loc
+        self.diagnostic = None
+        self._raw_message = message
+        self._source = source
+        self._code = code
+        self._hint = hint
         prefix = f"[{loc}] " if loc else ""
         super().__init__(f"{prefix}{message}")
+
+    def _build_diagnostic(self):
+        if self.diagnostic is not None:
+            return
+        from ..tex_compiler.diagnostics import make_diagnostic
+        self.diagnostic = make_diagnostic(
+            code=self._code,
+            message=self._raw_message,
+            loc=self.loc,
+            source=self._source,
+            hint=self._hint,
+            phase="runtime",
+        )
 
 
 class _Break(Exception):
@@ -82,6 +97,7 @@ class Interpreter:
         self.device: torch.device = torch.device("cpu")
         self.spatial_shape: tuple[int, int, int] | None = None  # (B, H, W)
         self._array_meta: dict[str, int] = {}  # var_name -> array size
+        self._source: str = ""  # Original source code for diagnostics
         self._literal_cache: dict[tuple[float, str], torch.Tensor] = {}  # (value, device) -> tensor
         self._inplace_ready: set[str] = set()  # vars that have been cloned for in-place ops
 
@@ -123,6 +139,7 @@ class Interpreter:
         output_names: list[str] | None = None,
         precision: str = "fp32",
         used_builtins: frozenset[str] | None = None,
+        source: str = "",
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Execute a TEX program.
@@ -142,14 +159,10 @@ class Interpreter:
             If output_names is None: the value of @OUT (backward compat)
             If output_names is provided: dict mapping name -> value for each output
         """
-        # Skip inference_mode for pure string/scalar programs (no tensor bindings)
-        has_tensors = any(isinstance(v, torch.Tensor) for v in bindings.values())
-        if has_tensors:
-            with torch.inference_mode():
-                return self._execute_inner(program, bindings, type_map, device,
-                                           latent_channel_count, output_names,
-                                           precision, used_builtins=used_builtins)
-        else:
+        self._source = source
+        # Always use inference_mode — eliminates gradient tracking overhead
+        # even for internal tensor ops (coordinate builtins, constants, etc.)
+        with torch.inference_mode():
             return self._execute_inner(program, bindings, type_map, device,
                                        latent_channel_count, output_names,
                                        precision, used_builtins=used_builtins)
@@ -301,15 +314,18 @@ class Interpreter:
                     results[name] = _to_output(self.bindings[name])
                 else:
                     raise InterpreterError(
-                        f"Output @{name} was not assigned by the TEX program"
+                        f"Output @{name} was not assigned by the TEX program",
+                        source=self._source, code="E6001",
+                        hint=f"Add an assignment like '@{name} = <expr>;' to your program.",
                     )
             return results
 
         # Single-output backward compat
         if "OUT" not in self.bindings:
             raise InterpreterError(
-                "TEX program must assign to at least one output "
-                "(e.g. @OUT, or named outputs like @result)"
+                "This program needs at least one output assignment",
+                source=self._source, code="E6001",
+                hint="Add '@OUT = <expr>;' or use named outputs like '@result = <expr>;'.",
             )
 
         return _to_output(self.bindings["OUT"])
@@ -348,26 +364,22 @@ class Interpreter:
                 y_start, full_H, full_W = 0, H, W
 
             # ix: pixel x-coordinate [0, W-1] — compact shape [1, 1, W]
-            if "ix" in used:
+            # u/v use expand() which creates a view (no memory copy) at [B,H,W]
+            # for compatibility with torch.stack in sampling functions.
+            if "ix" in used or "u" in used:
                 ix = torch.arange(W, dtype=self._dtype, device=self.device).view(1, 1, W)
-                self.env["ix"] = ix
-
+                if "ix" in used:
+                    self.env["ix"] = ix
                 if "u" in used:
                     self.env["u"] = (ix / max(full_W - 1, 1)).expand(B, H, W)
-            elif "u" in used:
-                ix = torch.arange(W, dtype=self._dtype, device=self.device).view(1, 1, W)
-                self.env["u"] = (ix / max(full_W - 1, 1)).expand(B, H, W)
 
             # iy: pixel y-coordinate — offset by y_start for tiling
-            if "iy" in used:
+            if "iy" in used or "v" in used:
                 iy = torch.arange(y_start, y_start + H, dtype=self._dtype, device=self.device).view(1, H, 1)
-                self.env["iy"] = iy
-
+                if "iy" in used:
+                    self.env["iy"] = iy
                 if "v" in used:
                     self.env["v"] = (iy / max(full_H - 1, 1)).expand(B, H, W)
-            elif "v" in used:
-                iy = torch.arange(y_start, y_start + H, dtype=self._dtype, device=self.device).view(1, H, 1)
-                self.env["v"] = (iy / max(full_H - 1, 1)).expand(B, H, W)
 
             # iw, ih: FULL image dimensions (not tile dimensions)
             if "iw" in used:
@@ -407,7 +419,11 @@ class Interpreter:
             raise _Break()
         if isinstance(node, ContinueStmt):
             raise _Continue()
-        raise InterpreterError(f"Unknown statement: {type(node).__name__}", node.loc)
+        raise InterpreterError(
+            f"Expected a recognized statement, but found '{type(node).__name__}'",
+            node.loc, source=self._source, code="E6002",
+            hint="This node type is not supported as a statement.",
+        )
 
     def _exec_var_decl(self, node: VarDecl):
         if node.initializer:
@@ -506,7 +522,17 @@ class Interpreter:
         "+": ("add_", True),
         "-": ("sub_", False),
         "*": ("mul_", True),
+        "/": ("div_", False),
     }
+
+    def _ensure_inplace_ready(self, name: str) -> torch.Tensor:
+        """Ensure a variable is safe for in-place mutation (clone-on-first-write)."""
+        current = self.env[name]
+        if name not in self._inplace_ready:
+            current = current.clone()
+            self.env[name] = current
+            self._inplace_ready.add(name)
+        return current
 
     def _exec_assignment(self, node: Assignment):
         target = node.target
@@ -519,6 +545,7 @@ class Interpreter:
             if op_info is not None:
                 method_name, commutative = op_info
                 name = target.name
+                is_div = rhs.op == "/"
                 # Pattern 1: x = x OP expr
                 if isinstance(rhs.left, Identifier) and rhs.left.name == name:
                     current = self.env.get(name)
@@ -527,13 +554,12 @@ class Interpreter:
                         if other_val.__class__ is torch.Tensor and (
                             other_val.dim() == 0 or other_val.shape == current.shape
                         ):
-                            # Clone on first in-place to establish ownership
-                            # (prevents aliasing with literal cache or bindings)
-                            if name not in self._inplace_ready:
-                                current = current.clone()
-                                self.env[name] = current
-                                self._inplace_ready.add(name)
-                            getattr(current, method_name)(other_val)
+                            current = self._ensure_inplace_ready(name)
+                            if is_div:
+                                # Safe in-place division: x /= where(rhs==0, eps, rhs)
+                                current.div_(torch.where(other_val == 0, SAFE_EPSILON, other_val))
+                            else:
+                                getattr(current, method_name)(other_val)
                             return
                 # Pattern 2: x = expr OP x (only for commutative ops)
                 elif commutative and isinstance(rhs.right, Identifier) and rhs.right.name == name:
@@ -543,10 +569,7 @@ class Interpreter:
                         if other_val.__class__ is torch.Tensor and (
                             other_val.dim() == 0 or other_val.shape == current.shape
                         ):
-                            if name not in self._inplace_ready:
-                                current = current.clone()
-                                self.env[name] = current
-                                self._inplace_ready.add(name)
+                            current = self._ensure_inplace_ready(name)
                             getattr(current, method_name)(other_val)
                             return
 
@@ -565,7 +588,11 @@ class Interpreter:
             self._exec_array_index_assign(target, value)
 
         else:
-            raise InterpreterError("Invalid assignment target", node.loc)
+            raise InterpreterError(
+                "This assignment target is not supported",
+                node.loc, source=self._source, code="E6003",
+                hint="Assignments work with variables, @bindings, channels (.r), and array indices ([i]).",
+            )
 
     def _exec_channel_assign(self, target: ChannelAccess, value: torch.Tensor):
         """Handle assignment to a channel: `@A.r = expr;` or `color.r = expr;`"""
@@ -575,13 +602,18 @@ class Interpreter:
 
         if len(channels) != 1:
             raise InterpreterError(
-                f"Can only assign to single channels, not swizzle '.{channels}'",
-                target.loc,
+                f"This channel assignment needs a single channel, but found swizzle '.{channels}'",
+                target.loc, source=self._source, code="E6004",
+                hint="Assign to one channel at a time, e.g. '.r', '.g', '.b', or '.a'.",
             )
 
         idx = CHANNEL_MAP.get(channels)
         if idx is None:
-            raise InterpreterError(f"Invalid channel: '.{channels}'", target.loc)
+            raise InterpreterError(
+                f"Expected a known channel name, but found '.{channels}'",
+                target.loc, source=self._source, code="E6004",
+                hint="Use one of: .r, .g, .b, .a (or .x, .y, .z, .w).",
+            )
 
         # Clone to avoid modifying the original in-place (breaks autograd)
         result = base.clone()
@@ -589,8 +621,9 @@ class Interpreter:
             result[..., idx] = _ensure_spatial(value, result.shape[:-1])
         else:
             raise InterpreterError(
-                f"Cannot assign to channel {idx} of tensor with shape {result.shape}",
-                target.loc,
+                f"This tensor (shape {result.shape}) does not have a channel at index {idx}",
+                target.loc, source=self._source, code="E6004",
+                hint="The target needs enough channels for this assignment. Check if the variable is a vec3 or vec4.",
             )
 
         # Write back to the correct location
@@ -599,7 +632,11 @@ class Interpreter:
         elif isinstance(target.object, BindingRef):
             self.bindings[target.object.name] = result
         else:
-            raise InterpreterError("Channel assignment requires a variable or binding target", target.loc)
+            raise InterpreterError(
+                "This channel assignment needs a variable or @binding as its target",
+                target.loc, source=self._source, code="E6004",
+                hint="Assign to a named variable's channel, e.g. 'color.r = 1.0;' or '@OUT.r = 1.0;'.",
+            )
 
     def _exec_array_index_assign(self, target: ArrayIndexAccess, value):
         """Handle: arr[i] = expr;"""
@@ -664,7 +701,11 @@ class Interpreter:
         elif isinstance(target.array, BindingRef):
             self.bindings[target.array.name] = result
         else:
-            raise InterpreterError("Array index assignment requires a variable target", target.loc)
+            raise InterpreterError(
+                "This array index assignment needs a variable or @binding as its target",
+                target.loc, source=self._source, code="E6005",
+                hint="Assign to a named array element, e.g. 'arr[i] = value;'.",
+            )
 
     @staticmethod
     def _collect_assigned_vars(stmts: list[ASTNode]) -> tuple[set[str], set[str]]:
@@ -745,7 +786,8 @@ class Interpreter:
             modified_env |= e2
             modified_bindings |= b2
 
-        # Snapshot only modified variables
+        # Snapshot only modified variables that already exist
+        # (new declarations inside branches don't need snapshots)
         env_snapshot = {}
         for k in modified_env:
             v = self.env.get(k)
@@ -756,7 +798,10 @@ class Interpreter:
             v = self.bindings.get(k)
             if v is not None:
                 bindings_snapshot[k] = v.clone() if isinstance(v, torch.Tensor) else v
-        meta_snapshot = dict(self._array_meta)
+        # Only snapshot array metadata if arrays are actually used
+        has_arrays = bool(self._array_meta)
+        if has_arrays:
+            meta_snapshot = dict(self._array_meta)
 
         # Execute then-branch
         for stmt in node.then_body:
@@ -764,14 +809,16 @@ class Interpreter:
         # Capture then-state for modified vars only
         then_env = {k: self.env.get(k) for k in modified_env}
         then_bindings = {k: self.bindings.get(k) for k in modified_bindings}
-        then_meta = dict(self._array_meta)
+        if has_arrays:
+            then_meta = dict(self._array_meta)
 
         # Restore modified vars and execute else-branch
         for k, v in env_snapshot.items():
             self.env[k] = v
         for k, v in bindings_snapshot.items():
             self.bindings[k] = v
-        self._array_meta = dict(meta_snapshot)
+        if has_arrays:
+            self._array_meta = dict(meta_snapshot)
 
         if node.else_body:
             for stmt in node.else_body:
@@ -779,15 +826,14 @@ class Interpreter:
             else_env = {k: self.env.get(k) for k in modified_env}
             else_bindings = {k: self.bindings.get(k) for k in modified_bindings}
         else:
-            else_env = dict(env_snapshot)
-            else_bindings = dict(bindings_snapshot)
+            else_env = env_snapshot
+            else_bindings = bindings_snapshot
 
         # Merge using torch.where (tensors) or scalar condition (strings)
         cond_bool = (cond > 0.5) if cond.is_floating_point() else cond.bool()
-        # For string merging: use majority vote for spatial conditions
-        cond_scalar_bool = cond.float().mean().item() > 0.5 if cond.dim() > 0 else cond.item() > 0.5
 
         # Merge only modified env variables
+        _has_strings = False
         for key in modified_env:
             then_val = then_env.get(key)
             else_val = else_env.get(key)
@@ -795,7 +841,11 @@ class Interpreter:
                 if isinstance(then_val, torch.Tensor) and isinstance(else_val, torch.Tensor):
                     self.env[key] = _tensor_where(cond_bool, then_val, else_val)
                 elif isinstance(then_val, str) or isinstance(else_val, str):
-                    self.env[key] = then_val if cond_scalar_bool else else_val
+                    # Defer string majority-vote computation until actually needed
+                    if not _has_strings:
+                        _cond_scalar = cond.float().mean().item() > 0.5
+                        _has_strings = True
+                    self.env[key] = then_val if _cond_scalar else else_val
                 else:
                     self.env[key] = then_val
             elif then_val is not None:
@@ -811,7 +861,10 @@ class Interpreter:
                 if isinstance(then_val, torch.Tensor) and isinstance(else_val, torch.Tensor):
                     self.bindings[key] = _tensor_where(cond_bool, then_val, else_val)
                 elif isinstance(then_val, str) or isinstance(else_val, str):
-                    self.bindings[key] = then_val if cond_scalar_bool else else_val
+                    if not _has_strings:
+                        _cond_scalar = cond.float().mean().item() > 0.5
+                        _has_strings = True
+                    self.bindings[key] = then_val if _cond_scalar else else_val
                 else:
                     self.bindings[key] = then_val
             elif then_val is not None:
@@ -820,7 +873,8 @@ class Interpreter:
                 self.bindings[key] = else_val
 
         # Merge array metadata from then-branch (else-branch meta is already in self)
-        self._array_meta.update(then_meta)
+        if has_arrays:
+            self._array_meta.update(then_meta)
 
     def _exec_for_loop(self, node: ForLoop):
         """
@@ -842,9 +896,10 @@ class Interpreter:
 
             if len(iter_range) > MAX_LOOP_ITERATIONS:
                 raise InterpreterError(
-                    f"For loop exceeded maximum iteration limit ({MAX_LOOP_ITERATIONS}). "
-                    f"Check your loop condition.",
-                    node.loc,
+                    f"This for loop would run {len(iter_range)} iterations, which exceeds the limit of {MAX_LOOP_ITERATIONS}",
+                    node.loc, source=self._source, code="E6010",
+                    hint=f"Loops are capped at {MAX_LOOP_ITERATIONS} iterations to prevent hangs. "
+                         "Consider reducing your range or processing in smaller batches.",
                 )
 
             device_str = self._device_str
@@ -879,7 +934,7 @@ class Interpreter:
                     if cond.item() <= 0.5:
                         break
                 else:
-                    if (cond > 0.5).float().sum().item() == 0:
+                    if not (cond > 0.5).any():
                         break
 
                 try:
@@ -894,9 +949,11 @@ class Interpreter:
 
             if iteration >= MAX_LOOP_ITERATIONS:
                 raise InterpreterError(
-                    f"For loop exceeded maximum iteration limit ({MAX_LOOP_ITERATIONS}). "
-                    f"Check your loop condition.",
-                    node.loc,
+                    f"This for loop ran {MAX_LOOP_ITERATIONS} iterations without finishing",
+                    node.loc, source=self._source, code="E6010",
+                    hint=f"Loops are capped at {MAX_LOOP_ITERATIONS} iterations to prevent hangs. "
+                         "Make sure your loop condition will eventually become false, "
+                         "and that the loop variable is updated correctly.",
                 )
 
     def _try_extract_static_range(self, node: ForLoop) -> tuple[str, range] | None:
@@ -973,7 +1030,7 @@ class Interpreter:
                 if cond.item() <= 0.5:
                     break
             else:
-                if (cond > 0.5).float().sum().item() == 0:
+                if not (cond > 0.5).any():
                     break
 
             try:
@@ -987,9 +1044,10 @@ class Interpreter:
 
         if iteration >= MAX_LOOP_ITERATIONS:
             raise InterpreterError(
-                f"While loop exceeded maximum iteration limit ({MAX_LOOP_ITERATIONS}). "
-                f"Check your loop condition.",
-                node.loc,
+                f"This while loop ran {MAX_LOOP_ITERATIONS} iterations without finishing",
+                node.loc, source=self._source, code="E6010",
+                hint=f"Loops are capped at {MAX_LOOP_ITERATIONS} iterations to prevent hangs. "
+                     "Make sure your loop condition will eventually become false.",
             )
 
     # -- Expression evaluation ------------------------------------------
@@ -999,7 +1057,11 @@ class Interpreter:
         handler = self._eval_dispatch.get(type(node))
         if handler is not None:
             return handler(node)
-        raise InterpreterError(f"Unknown expression: {type(node).__name__}", node.loc)
+        raise InterpreterError(
+            f"Expected a recognized expression, but found '{type(node).__name__}'",
+            node.loc, source=self._source, code="E6002",
+            hint="This node type is not supported as an expression.",
+        )
 
     def _eval_number_literal(self, node: NumberLiteral) -> torch.Tensor:
         key = (node.value, self._device_str, self._dtype)
@@ -1022,13 +1084,21 @@ class Interpreter:
         val = self.env.get(node.name)
         if val is not None:
             return val
-        raise InterpreterError(f"Undefined variable: '{node.name}'", node.loc)
+        raise InterpreterError(
+            f"Variable '{node.name}' is not defined",
+            node.loc, source=self._source, code="E6020",
+            hint=f"Make sure '{node.name}' is declared before it is used. Check for typos in the variable name.",
+        )
 
     def _eval_binding(self, node: BindingRef) -> torch.Tensor:
         val = self.bindings.get(node.name)
         if val is not None:
             return val
-        raise InterpreterError(f"Unbound input: '@{node.name}'", node.loc)
+        raise InterpreterError(
+            f"Input '@{node.name}' is not connected",
+            node.loc, source=self._source, code="E6021",
+            hint=f"Make sure a node output is wired to the '@{node.name}' input, or check for typos in the binding name.",
+        )
 
     def _eval_channel_access(self, node: ChannelAccess) -> torch.Tensor:
         base = self._eval(node.object)
@@ -1037,18 +1107,28 @@ class Interpreter:
         if len(channels) == 1:
             idx = CHANNEL_MAP.get(channels)
             if idx is None:
-                raise InterpreterError(f"Invalid channel: '.{channels}'", node.loc)
+                raise InterpreterError(
+                    f"Expected a known channel name, but found '.{channels}'",
+                    node.loc, source=self._source, code="E6030",
+                    hint="Use one of: .r, .g, .b, .a (or .x, .y, .z, .w).",
+                )
             if base.dim() >= 1 and base.shape[-1] > idx:
                 return base[..., idx]
             raise InterpreterError(
-                f"Cannot access channel '.{channels}' (index {idx}) on tensor with shape {base.shape}",
-                node.loc,
+                f"This value (shape {base.shape}) does not have a channel at '.{channels}' (index {idx})",
+                node.loc, source=self._source, code="E6030",
+                hint="The value may be a scalar or have fewer channels than expected. "
+                     "Check if you need a vec3 or vec4 here.",
             )
 
         # Multi-channel swizzle
         indices = [CHANNEL_MAP[ch] for ch in channels if ch in CHANNEL_MAP]
         if len(indices) != len(channels):
-            raise InterpreterError(f"Invalid swizzle: '.{channels}'", node.loc)
+            raise InterpreterError(
+                f"Expected valid channel names in swizzle, but '.{channels}' contains unrecognized letters",
+                node.loc, source=self._source, code="E6030",
+                hint="Swizzle channels must be from: r, g, b, a (or x, y, z, w).",
+            )
         # Fast path: contiguous slice (e.g. .rgb on vec4 = first 3 channels)
         if indices == list(range(indices[0], indices[0] + len(indices))):
             return base[..., indices[0]:indices[0] + len(indices)]
@@ -1128,7 +1208,8 @@ class Interpreter:
             if op == "-":
                 return left - right
             if op == "/":
-                return left / (right + SAFE_EPSILON * (right == 0).float())
+                # Avoid division by zero: replace 0 with SAFE_EPSILON (fewer temporaries than multiply+add)
+                return left / torch.where(right == 0, SAFE_EPSILON, right)
             if op == "<":
                 return (left < right).float()
             if op == ">":
@@ -1146,8 +1227,12 @@ class Interpreter:
             if op == "||":
                 return ((left > 0.5) | (right > 0.5)).float()
             if op == "%":
-                return torch.fmod(left, right + SAFE_EPSILON * (right == 0).float())
-            raise InterpreterError(f"Unknown operator: {op}", node.loc)
+                return torch.fmod(left, torch.where(right == 0, SAFE_EPSILON, right))
+            raise InterpreterError(
+                f"Operator '{op}' is not supported",
+                node.loc, source=self._source, code="E6040",
+                hint="Supported operators: +, -, *, /, %, ==, !=, <, >, <=, >=, &&, ||.",
+            )
 
         # Slow path: string operations
         if isinstance(left, str) or isinstance(right, str):
@@ -1159,9 +1244,16 @@ class Interpreter:
                 elif op == "!=":
                     return torch.tensor(1.0 if left != right else 0.0, dtype=self._dtype, device=self.device)
                 else:
-                    raise InterpreterError(f"Operator '{op}' is not supported for strings", node.loc)
+                    raise InterpreterError(
+                        f"Operator '{op}' is not supported for strings",
+                        node.loc, source=self._source, code="E6040",
+                        hint="Strings support '+' (concatenation), '==' and '!=' (comparison).",
+                    )
             raise InterpreterError(
-                f"Cannot use operator '{op}' between string and numeric types", node.loc
+                f"Expected matching types for '{op}', but found a mix of string and numeric",
+                node.loc, source=self._source, code="E6040",
+                hint="Both sides of the operator must be the same type. "
+                     "Use string() or float() to convert.",
             )
 
     def _eval_unary(self, node: UnaryOp) -> torch.Tensor:
@@ -1170,7 +1262,11 @@ class Interpreter:
             return -operand
         elif node.op == "!":
             return (operand <= 0.5).float()
-        raise InterpreterError(f"Unknown unary operator: {node.op}", node.loc)
+        raise InterpreterError(
+            f"Unary operator '{node.op}' is not supported",
+            node.loc, source=self._source, code="E6040",
+            hint="Supported unary operators: '-' (negate) and '!' (logical not).",
+        )
 
     def _eval_ternary(self, node: TernaryOp) -> torch.Tensor | str:
         cond = self._eval(node.condition)
@@ -1191,13 +1287,21 @@ class Interpreter:
     def _eval_function_call(self, node: FunctionCall) -> torch.Tensor | str:
         fn = self.functions.get(node.name)
         if fn is None:
-            raise InterpreterError(f"Unknown function: '{node.name}'", node.loc)
+            raise InterpreterError(
+                f"Function '{node.name}' is not recognized",
+                node.loc, source=self._source, code="E6050",
+                hint=f"Check the spelling of '{node.name}'. See the TEX reference for available functions.",
+            )
 
         args = [self._eval(arg) for arg in node.args]
         try:
             result = fn(*args)
         except Exception as e:
-            raise InterpreterError(f"Error in function '{node.name}': {e}", node.loc)
+            raise InterpreterError(
+                f"Function '{node.name}' encountered a problem: {e}",
+                node.loc, source=self._source, code="E6050",
+                hint="Check the number and types of arguments passed to this function.",
+            )
 
         # Fast path: most stdlib functions return tensors
         if result.__class__ is torch.Tensor:
@@ -1245,8 +1349,9 @@ class Interpreter:
 
         if len(components) != n:
             raise InterpreterError(
-                f"vec{n} expects {n} total components, got {len(components)}",
-                node.loc,
+                f"vec{n}() needs {n} total components, but found {len(components)}",
+                node.loc, source=self._source, code="E6060",
+                hint=f"Provide exactly {n} scalar values, or combine vectors and scalars that add up to {n} components.",
             )
 
         # Allocate and fill channels
@@ -1276,8 +1381,9 @@ class Interpreter:
             return flat.reshape(flat.shape[:-1] + (n, n))
         else:
             raise InterpreterError(
-                f"mat{n} expects {n * n} arguments or 1 (scaled identity), got {len(args)}",
-                node.loc,
+                f"mat{n}() needs {n * n} arguments (full matrix) or 1 (scaled identity), but found {len(args)}",
+                node.loc, source=self._source, code="E6060",
+                hint=f"Use mat{n}(1.0) for an identity matrix, or provide all {n * n} elements.",
             )
 
     def _eval_cast(self, node: CastExpr) -> torch.Tensor | str:
@@ -1450,34 +1556,26 @@ def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, tor
     if ad == bd:
         return a, b
 
-    # Fast path: 1 dimension difference (e.g. [B,H,W] vs [B,H,W,C])
-    if ad - bd == 1:
-        return a, b.unsqueeze(-1).expand_as(a)
-    if bd - ad == 1:
-        return a.unsqueeze(-1).expand_as(b), b
-
-    # General case: multiple dimension difference
+    # Pad trailing dims with single view+expand (no while loop)
     if ad > bd:
-        while b.dim() < ad:
-            b = b.unsqueeze(-1)
-        return a, b.expand_as(a)
+        b = b.view(*b.shape, *((1,) * (ad - bd))).expand_as(a)
+        return a, b
     else:
-        while a.dim() < bd:
-            a = a.unsqueeze(-1)
-        return a.expand_as(b), b
+        a = a.view(*a.shape, *((1,) * (bd - ad))).expand_as(b)
+        return a, b
 
 
 def _tensor_where(cond: torch.Tensor, then_val: torch.Tensor, else_val: torch.Tensor) -> torch.Tensor:
     """torch.where with broadcasting support for mixed scalar/vector cases."""
     then_val, else_val = _broadcast_pair(then_val, else_val)
 
-    # Expand condition to match value shapes
-    while cond.dim() < then_val.dim():
-        cond = cond.unsqueeze(-1)
-
-    try:
-        cond = cond.expand_as(then_val)
-    except RuntimeError:
-        pass
+    # Expand condition to match value shapes (single view instead of while loop)
+    cd, td = cond.dim(), then_val.dim()
+    if cd < td:
+        cond = cond.view(*cond.shape, *((1,) * (td - cd)))
+        try:
+            cond = cond.expand_as(then_val)
+        except RuntimeError:
+            pass
 
     return torch.where(cond, then_val, else_val)

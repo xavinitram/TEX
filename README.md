@@ -69,6 +69,7 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **80+ stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |
+| **Snippets** | Right-click → Snippets for 36 built-in examples; save your own with folder organization |
 | **Nodes v3** | Built on ComfyUI's Nodes v3 API (`comfy_api.latest`) |
 
 ## Language Reference
@@ -236,7 +237,7 @@ See **[DEVELOPMENT.md](DEVELOPMENT.md)** for architecture, compilation pipeline 
 ```bash
 # Run tests
 cd custom_nodes/TEX_Wrangle
-python -m pytest tests/test_tex.py -v    # 521 sub-tests expected
+python -m pytest tests/test_tex.py -v    # 468 sub-tests expected
 ```
 
 ## License

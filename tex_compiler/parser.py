@@ -51,17 +51,40 @@ COMPOUND_ASSIGN_OPS = {
 
 
 class ParseError(Exception):
-    def __init__(self, message: str, loc: SourceLoc):
+    def __init__(self, message: str, loc: SourceLoc, *, source: str = "",
+                 code: str = "E2000", hint: str = "", end_col: int | None = None):
         self.loc = loc
+        self.diagnostic = None  # Built lazily
+        self._raw_message = message
+        self._source = source
+        self._code = code
+        self._hint = hint
+        self._end_col = end_col
         super().__init__(f"[{loc}] {message}")
+
+    def _build_diagnostic(self):
+        if self.diagnostic is not None:
+            return
+        from .diagnostics import make_diagnostic
+        self.diagnostic = make_diagnostic(
+            code=self._code,
+            message=self._raw_message,
+            loc=self.loc,
+            source=self._source,
+            end_col=self._end_col,
+            hint=self._hint,
+            phase="parser",
+        )
 
 
 class Parser:
     """Recursive-descent parser for TEX."""
 
-    def __init__(self, tokens: list[Token]):
+    def __init__(self, tokens: list[Token], source: str = ""):
         self.tokens = tokens
         self.pos = 0
+        self._source = source
+        self._errors: list[ParseError] = []
 
     # -- Helpers --------------------------------------------------------
 
@@ -86,11 +109,23 @@ class Parser:
             self.pos += 1
         return tok
 
-    def expect(self, tt: TokenType, msg: str = "") -> Token:
+    def expect(self, tt: TokenType, msg: str = "", *,
+               code: str = "E2000", hint: str = "") -> Token:
         if self.peek() != tt:
             tok = self.current()
-            what = msg or f"Expected {tt.name}"
-            raise ParseError(f"{what}, got {tok.type.name} ({tok.value!r})", tok.loc)
+            if msg:
+                what = msg
+            elif tt == TokenType.SEMI:
+                what = "I expected a semicolon here"
+            else:
+                what = f"I expected {tt.name} here"
+            # Describe what we got in plain language
+            if tok.type == TokenType.EOF:
+                got_desc = "but the program ends here"
+            else:
+                got_desc = f"but found `{tok.value}` instead"
+            raise self._make_error(f"{what}, {got_desc}.", tok.loc,
+                                   code=code, hint=hint)
         return self.advance()
 
     def match(self, *types: TokenType) -> Token | None:
@@ -98,14 +133,52 @@ class Parser:
             return self.advance()
         return None
 
+    def _make_error(self, message: str, loc: SourceLoc, *,
+                    code: str = "E2000", hint: str = "") -> ParseError:
+        """Create a ParseError with source context."""
+        return ParseError(message, loc, source=self._source, code=code, hint=hint)
+
+    def _synchronize(self):
+        """Panic-mode recovery: skip tokens until a synchronization point."""
+        while self.peek() != TokenType.EOF:
+            # Stop AFTER consuming a semicolon
+            if self.peek() == TokenType.SEMI:
+                self.advance()
+                return
+            # Stop BEFORE a statement-starting token (don't consume it)
+            if self.peek() in (TokenType.RBRACE, TokenType.KW_IF,
+                               TokenType.KW_FOR, TokenType.KW_WHILE,
+                               TokenType.KW_BREAK, TokenType.KW_CONTINUE,
+                               *TYPE_KEYWORDS):
+                return
+            self.advance()
+
     # -- Program --------------------------------------------------------
 
     def parse(self) -> Program:
-        """Parse a complete TEX program."""
+        """Parse a complete TEX program with error recovery."""
+        from .ast_nodes import ErrorNode
+        from .diagnostics import TEXMultiError
         loc = self.loc()
         stmts: list[ASTNode] = []
         while self.peek() != TokenType.EOF:
-            stmts.append(self.parse_statement())
+            try:
+                stmts.append(self.parse_statement())
+            except ParseError as e:
+                self._errors.append(e)
+                stmts.append(ErrorNode(loc=e.loc, error_message=str(e)))
+                self._synchronize()
+
+        if self._errors:
+            # Build diagnostics for all collected errors
+            for e in self._errors:
+                e._build_diagnostic()
+            if len(self._errors) == 1:
+                raise self._errors[0]
+            from .diagnostics import TEXMultiError, TEXDiagnostic
+            diagnostics = [e.diagnostic for e in self._errors if e.diagnostic]
+            raise TEXMultiError(diagnostics)
+
         return Program(loc=loc, statements=stmts)
 
     # -- Statements -----------------------------------------------------
@@ -143,13 +216,26 @@ class Parser:
         if self.peek() == TokenType.KW_BREAK:
             loc = self.loc()
             self.advance()
-            self.expect(TokenType.SEMI, "Expected ';' after 'break'")
+            self.expect(TokenType.SEMI, "I need a semicolon after `break`",
+                       code="E2010", hint="Add `;` after break.")
             return BreakStmt(loc=loc)
         if self.peek() == TokenType.KW_CONTINUE:
             loc = self.loc()
             self.advance()
-            self.expect(TokenType.SEMI, "Expected ';' after 'continue'")
+            self.expect(TokenType.SEMI, "I need a semicolon after `continue`",
+                       code="E2010", hint="Add `;` after continue.")
             return ContinueStmt(loc=loc)
+
+        # Check for foreign keywords (return, const, let, var, etc.)
+        if self.peek() == TokenType.IDENT:
+            from .diagnostics import get_keyword_hint
+            kw_hint = get_keyword_hint(self.current().value)
+            if kw_hint is not None:
+                tok = self.current()
+                raise self._make_error(
+                    f"Unexpected keyword '{tok.value}'.",
+                    tok.loc, code="E2001", hint=kw_hint
+                )
 
         # Assignment or expression statement
         return self.parse_assignment_or_expr()
@@ -158,13 +244,14 @@ class Parser:
         loc = self.loc()
         type_tok = self.advance()  # consume type keyword
         type_name = type_tok.value
-        name_tok = self.expect(TokenType.IDENT, "Expected variable name after type")
+        name_tok = self.expect(TokenType.IDENT, "I expected a variable name after the type")
 
         initializer = None
         if self.match(TokenType.ASSIGN):
             initializer = self.parse_expr()
 
-        self.expect(TokenType.SEMI, "Expected ';' after variable declaration")
+        self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this variable declaration",
+                   code="E2010", hint="Every statement in TEX ends with `;`.")
         return VarDecl(loc=loc, type_name=type_name, name=name_tok.value, initializer=initializer)
 
     def parse_param_decl(self) -> ParamDecl:
@@ -174,7 +261,8 @@ class Parser:
         default_expr = None
         if self.match(TokenType.ASSIGN):
             default_expr = self.parse_expr()
-        self.expect(TokenType.SEMI, "Expected ';' after parameter declaration")
+        self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this parameter declaration",
+                   code="E2010", hint="Every statement in TEX ends with `;`.")
         return ParamDecl(
             loc=loc,
             name=tok.value,
@@ -186,17 +274,18 @@ class Parser:
         """Parse: type IDENT '[' INT? ']' ('=' ('{' expr_list '}' | IDENT))? ';'"""
         loc = self.loc()
         type_tok = self.advance()  # consume type keyword
-        name_tok = self.expect(TokenType.IDENT, "Expected array name after type")
-        self.expect(TokenType.LBRACKET, "Expected '[' after array name")
+        name_tok = self.expect(TokenType.IDENT, "I expected an array name after the type")
+        self.expect(TokenType.LBRACKET, "I expected `[` after the array name")
 
         size = None
         if self.peek() == TokenType.INT_LIT:
             size_tok = self.advance()
             size = int(size_tok.value)
             if size <= 0:
-                raise ParseError(f"Array size must be positive, got {size}", size_tok.loc)
+                raise self._make_error(f"Array size must be positive, got {size}.",
+                                      size_tok.loc, code="E2004")
 
-        self.expect(TokenType.RBRACKET, "Expected ']' after array size")
+        self.expect(TokenType.RBRACKET, "I expected `]` to close the array size")
 
         initializer = None
         if self.match(TokenType.ASSIGN):
@@ -206,10 +295,12 @@ class Parser:
                 # Array copy: float b[3] = a;
                 initializer = self.parse_expr()
 
-        self.expect(TokenType.SEMI, "Expected ';' after array declaration")
+        self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this array declaration",
+                   code="E2010", hint="Every statement in TEX ends with `;`.")
 
         if size is None and initializer is None:
-            raise ParseError("Array must have explicit size or initializer", loc)
+            raise self._make_error("Array must have explicit size or initializer. For example: float arr[3]; or float arr[] = {1.0, 2.0};",
+                                  loc, code="E2005")
 
         return ArrayDecl(
             loc=loc,
@@ -222,21 +313,21 @@ class Parser:
     def parse_array_literal(self) -> ArrayLiteral:
         """Parse: '{' expr (',' expr)* '}'"""
         loc = self.loc()
-        self.expect(TokenType.LBRACE, "Expected '{' for array literal")
+        self.expect(TokenType.LBRACE, "I expected `{` to start the array literal")
         elements: list[ASTNode] = []
         if self.peek() != TokenType.RBRACE:
             elements.append(self.parse_expr())
             while self.match(TokenType.COMMA):
                 elements.append(self.parse_expr())
-        self.expect(TokenType.RBRACE, "Expected '}' after array literal")
+        self.expect(TokenType.RBRACE, "I expected `}` to close the array literal")
         return ArrayLiteral(loc=loc, elements=elements)
 
     def parse_if_else(self) -> IfElse:
         loc = self.loc()
         self.expect(TokenType.KW_IF)
-        self.expect(TokenType.LPAREN, "Expected '(' after 'if'")
+        self.expect(TokenType.LPAREN, "I expected `(` after `if`")
         condition = self.parse_expr()
-        self.expect(TokenType.RPAREN, "Expected ')' after if condition")
+        self.expect(TokenType.RPAREN, "I expected `)` after the if condition")
 
         then_body = self.parse_block()
 
@@ -254,19 +345,21 @@ class Parser:
         """Parse: for (init; condition; update) { body }"""
         loc = self.loc()
         self.expect(TokenType.KW_FOR)
-        self.expect(TokenType.LPAREN, "Expected '(' after 'for'")
+        self.expect(TokenType.LPAREN, "I expected `(` after `for`")
 
         # Init clause: var_decl or assignment (without trailing semicolon — we handle it)
         init = self._parse_for_init()
-        self.expect(TokenType.SEMI, "Expected ';' after for-loop initializer")
+        self.expect(TokenType.SEMI, "I need a semicolon after the for-loop initializer",
+                   code="E2010", hint="for-loops use the pattern: for (init; condition; update) { ... }")
 
         # Condition
         condition = self.parse_expr()
-        self.expect(TokenType.SEMI, "Expected ';' after for-loop condition")
+        self.expect(TokenType.SEMI, "I need a semicolon after the for-loop condition",
+                   code="E2010", hint="for-loops use the pattern: for (init; condition; update) { ... }")
 
         # Update clause: assignment, ++, --, compound assign (no semicolon)
         update = self._parse_for_update()
-        self.expect(TokenType.RPAREN, "Expected ')' after for-loop update")
+        self.expect(TokenType.RPAREN, "I expected `)` to close the for-loop header")
 
         # Body
         body = self.parse_block()
@@ -277,9 +370,9 @@ class Parser:
         """Parse: while (condition) { body }"""
         loc = self.loc()
         self.expect(TokenType.KW_WHILE)
-        self.expect(TokenType.LPAREN, "Expected '(' after 'while'")
+        self.expect(TokenType.LPAREN, "I expected `(` after `while`")
         condition = self.parse_expr()
-        self.expect(TokenType.RPAREN, "Expected ')' after while condition")
+        self.expect(TokenType.RPAREN, "I expected `)` after the while condition")
         body = self.parse_block()
         return WhileLoop(loc=loc, condition=condition, body=body)
 
@@ -288,7 +381,7 @@ class Parser:
         if self.peek() in TYPE_KEYWORDS and self.peek_ahead() == TokenType.IDENT:
             loc = self.loc()
             type_tok = self.advance()
-            name_tok = self.expect(TokenType.IDENT, "Expected variable name")
+            name_tok = self.expect(TokenType.IDENT, "I expected a variable name here")
             initializer = None
             if self.match(TokenType.ASSIGN):
                 initializer = self.parse_expr()
@@ -343,11 +436,11 @@ class Parser:
         )
 
     def parse_block(self) -> list[ASTNode]:
-        self.expect(TokenType.LBRACE, "Expected '{'")
+        self.expect(TokenType.LBRACE, "I expected `{` to start a block")
         stmts: list[ASTNode] = []
         while self.peek() != TokenType.RBRACE and self.peek() != TokenType.EOF:
             stmts.append(self.parse_statement())
-        self.expect(TokenType.RBRACE, "Expected '}'")
+        self.expect(TokenType.RBRACE, "I expected `}` to close this block")
         return stmts
 
     def parse_assignment_or_expr(self) -> ASTNode:
@@ -358,18 +451,21 @@ class Parser:
         # Postfix ++ / --
         if self.match(TokenType.PLUS_PLUS):
             stmt = self._desugar_increment(expr, "+", loc)
-            self.expect(TokenType.SEMI, "Expected ';' after '++'")
+            self.expect(TokenType.SEMI, "I need a semicolon after `++`",
+                       code="E2010", hint="Add `;` to end this statement.")
             return stmt
         if self.match(TokenType.MINUS_MINUS):
             stmt = self._desugar_increment(expr, "-", loc)
-            self.expect(TokenType.SEMI, "Expected ';' after '--'")
+            self.expect(TokenType.SEMI, "I need a semicolon after `--`",
+                       code="E2010", hint="Add `;` to end this statement.")
             return stmt
 
         # Compound assignment operators (+=, -=, *=, /=)
         for tok_type, op in COMPOUND_ASSIGN_OPS.items():
             if self.match(tok_type):
                 value = self.parse_expr()
-                self.expect(TokenType.SEMI, f"Expected ';' after '{op}=' assignment")
+                self.expect(TokenType.SEMI, f"It looks like there's a missing semicolon after this `{op}=` assignment",
+                           code="E2010", hint="Every statement in TEX ends with `;`.")
                 return Assignment(
                     loc=loc,
                     target=expr,
@@ -379,10 +475,12 @@ class Parser:
         # Plain assignment
         if self.match(TokenType.ASSIGN):
             value = self.parse_expr()
-            self.expect(TokenType.SEMI, "Expected ';' after assignment")
+            self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this assignment",
+                       code="E2010", hint="Every statement in TEX ends with `;`.")
             return Assignment(loc=loc, target=expr, value=value)
 
-        self.expect(TokenType.SEMI, "Expected ';' after expression")
+        self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this expression",
+                   code="E2010", hint="Every statement in TEX ends with `;`.")
         return ExprStatement(loc=loc, expr=expr)
 
     # -- Expressions (precedence climbing) ------------------------------
@@ -395,7 +493,7 @@ class Parser:
         if self.match(TokenType.QUESTION):
             loc = self.current().loc
             true_expr = self.parse_expr()
-            self.expect(TokenType.COLON, "Expected ':' in ternary expression")
+            self.expect(TokenType.COLON, "I expected `:` in this ternary expression (condition ? then : else)")
             false_expr = self.parse_ternary()
             return TernaryOp(loc=loc, condition=expr, true_expr=true_expr, false_expr=false_expr)
         return expr
@@ -461,14 +559,14 @@ class Parser:
             if self.peek() == TokenType.DOT:
                 self.advance()  # consume .
                 # Read channel/swizzle name
-                name_tok = self.expect(TokenType.IDENT, "Expected channel name after '.'")
+                name_tok = self.expect(TokenType.IDENT, "I expected a channel name after `.`")
                 expr = ChannelAccess(loc=name_tok.loc, object=expr, channels=name_tok.value)
             elif self.peek() == TokenType.LBRACKET:
                 # Array indexing: expr[index]
                 loc = self.loc()
                 self.advance()  # consume [
                 index = self.parse_expr()
-                self.expect(TokenType.RBRACKET, "Expected ']' after array index")
+                self.expect(TokenType.RBRACKET, "I expected `]` to close the array index")
                 expr = ArrayIndexAccess(loc=loc, array=expr, index=index)
             elif self.peek() == TokenType.LPAREN and isinstance(expr, Identifier):
                 # Function call: name(args)
@@ -485,7 +583,7 @@ class Parser:
             args.append(self.parse_expr())
             while self.match(TokenType.COMMA):
                 args.append(self.parse_expr())
-        self.expect(TokenType.RPAREN, "Expected ')' after function arguments")
+        self.expect(TokenType.RPAREN, "I expected `)` to close the function call")
         return FunctionCall(loc=loc, name=callee.name, args=args)
 
     def parse_primary(self) -> ASTNode:
@@ -547,16 +645,20 @@ class Parser:
             if self.peek_ahead() == TokenType.LPAREN:
                 return self._parse_cast()
             # Otherwise it's a type keyword used where an expression is expected
-            raise ParseError(f"Unexpected type keyword '{tok.value}' in expression", tok.loc)
+            raise self._make_error(
+                f"Unexpected type keyword '{tok.value}' in expression.",
+                tok.loc, code="E2002",
+                hint=f"To cast a value, use {tok.value}(expr). To declare a variable, write: {tok.value} name = expr;")
 
         # Parenthesized expression
         if tok.type == TokenType.LPAREN:
             self.advance()
             expr = self.parse_expr()
-            self.expect(TokenType.RPAREN, "Expected ')'")
+            self.expect(TokenType.RPAREN, "I expected `)` here")
             return expr
 
-        raise ParseError(f"Unexpected token: {tok.type.name} ({tok.value!r})", tok.loc)
+        raise self._make_error(f"Unexpected token: {tok.type.name} ({tok.value!r}).",
+                               tok.loc, code="E2003")
 
     def _parse_vec_constructor(self) -> VecConstructor:
         tok = self.advance()  # vec3 or vec4

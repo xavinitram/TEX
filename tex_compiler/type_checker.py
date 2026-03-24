@@ -140,9 +140,33 @@ BINDING_HINT_TYPES = {
 
 
 class TypeCheckError(Exception):
-    def __init__(self, message: str, loc: SourceLoc):
+    def __init__(self, message: str, loc: SourceLoc, *, source: str = "",
+                 code: str = "E3000", hint: str = "", suggestions: list[str] | None = None,
+                 end_col: int | None = None):
         self.loc = loc
+        self.diagnostic = None  # Built lazily
+        self._raw_message = message
+        self._source = source
+        self._code = code
+        self._hint = hint
+        self._suggestions = suggestions or []
+        self._end_col = end_col
         super().__init__(f"[{loc}] {message}")
+
+    def _build_diagnostic(self):
+        if self.diagnostic is not None:
+            return
+        from .diagnostics import make_diagnostic
+        self.diagnostic = make_diagnostic(
+            code=self._code,
+            message=self._raw_message,
+            loc=self.loc,
+            source=self._source,
+            end_col=self._end_col,
+            suggestions=self._suggestions,
+            hint=self._hint,
+            phase="type_checker",
+        )
 
 
 @dataclass
@@ -161,6 +185,9 @@ class TypeChecker:
     """
     # Mapping of @ binding names -> their types (set before checking)
     binding_types: dict[str, TEXType] = field(default_factory=dict)
+
+    # Source code for diagnostic snippets
+    source: str = ""
 
     # Populated during checking: all @ bindings referenced in the code
     referenced_bindings: set[str] = field(default_factory=set)
@@ -216,7 +243,13 @@ class TypeChecker:
             self._check_stmt(stmt)
 
         if self.errors:
-            raise self.errors[0]
+            for e in self.errors:
+                e._build_diagnostic()
+            if len(self.errors) == 1:
+                raise self.errors[0]
+            from .diagnostics import TEXMultiError
+            diagnostics = [e.diagnostic for e in self.errors if e.diagnostic]
+            raise TEXMultiError(diagnostics)
 
         return self._types
 
@@ -234,7 +267,9 @@ class TypeChecker:
 
     def _declare_var(self, name: str, t: TEXType, loc: SourceLoc):
         if name in self._scopes[-1]:
-            self.errors.append(TypeCheckError(f"Variable '{name}' already declared in this scope", loc))
+            self._error(f"Variable '{name}' is already declared in this scope.",
+                       loc, code="E3001",
+                       hint="Each variable can only be declared once per scope. Choose a different name, or assign to the existing one.")
             return
         self._scopes[-1][name] = t
 
@@ -252,8 +287,12 @@ class TypeChecker:
                 return scope[name]
         return None
 
-    def _error(self, msg: str, loc: SourceLoc):
-        self.errors.append(TypeCheckError(msg, loc))
+    def _error(self, msg: str, loc: SourceLoc, *, code: str = "E3000",
+               hint: str = "", suggestions: list[str] | None = None):
+        self.errors.append(TypeCheckError(
+            msg, loc, source=self.source, code=code,
+            hint=hint, suggestions=suggestions,
+        ))
 
     # -- Promotion rules ------------------------------------------------
 
@@ -281,7 +320,10 @@ class TypeChecker:
     # -- Statement checking ---------------------------------------------
 
     def _check_stmt(self, node: ASTNode):
-        if isinstance(node, VarDecl):
+        from .ast_nodes import ErrorNode
+        if isinstance(node, ErrorNode):
+            return  # Skip — already reported by parser
+        elif isinstance(node, VarDecl):
             self._check_var_decl(node)
         elif isinstance(node, ArrayDecl):
             self._check_array_decl(node)
@@ -300,14 +342,18 @@ class TypeChecker:
         elif isinstance(node, (BreakStmt, ContinueStmt)):
             kind = "break" if isinstance(node, BreakStmt) else "continue"
             if self._loop_depth <= 0:
-                self._error(f"'{kind}' statement outside of a loop", node.loc)
+                self._error(f"'{kind}' statement outside of a loop.", node.loc, code="E3002",
+                            hint=f"'{kind}' can only be used inside for or while loops.")
         else:
-            self._error(f"Unknown statement type: {type(node).__name__}", node.loc)
+            self._error(f"This statement type isn't recognized: {type(node).__name__}.", node.loc,
+                        code="E4000", hint="This may be a syntax that TEX doesn't support yet.")
 
     def _check_var_decl(self, node: VarDecl):
         declared_type = TYPE_NAME_MAP.get(node.type_name)
         if declared_type is None:
-            self._error(f"Unknown type: {node.type_name}", node.loc)
+            self._error(f"Unknown type name '{node.type_name}'.", node.loc,
+                        code="E3100",
+                        hint="Try: float, int, vec3, vec4, mat3, mat4, or string.")
             return
 
         if node.initializer:
@@ -315,8 +361,10 @@ class TypeChecker:
             # Check compatibility
             if not self._is_assignable(declared_type, init_type):
                 self._error(
-                    f"Cannot initialize '{node.type_name} {node.name}' with expression of type '{init_type.value}'",
+                    f"Expected '{node.type_name}' for variable '{node.name}', but the initializer is '{init_type.value}'.",
                     node.loc,
+                    code="E3200",
+                    hint=f"The right-hand side produces a {init_type.value}, which doesn't fit into {node.type_name}.",
                 )
 
         self._declare_var(node.name, declared_type, node.loc)
@@ -326,12 +374,16 @@ class TypeChecker:
         """Type-check an array declaration."""
         elem_type = TYPE_NAME_MAP.get(node.element_type_name)
         if elem_type is None:
-            self._error(f"Unknown type: {node.element_type_name}", node.loc)
+            self._error(f"Unknown type name '{node.element_type_name}'.", node.loc,
+                        code="E3100",
+                        hint="Try: float, int, vec3, vec4, mat3, mat4, or string.")
             return
         if elem_type in (TEXType.VOID, TEXType.ARRAY):
             self._error(
-                f"Cannot create array of '{node.element_type_name}'",
+                f"Arrays of '{node.element_type_name}' are not supported.",
                 node.loc,
+                code="E3101",
+                hint="Array elements must be float, int, vec3, vec4, or string.",
             )
             return
 
@@ -341,8 +393,10 @@ class TypeChecker:
                 init_size = len(node.initializer.elements)
                 if size is not None and size != init_size:
                     self._error(
-                        f"Array size mismatch: declared [{size}] but initializer has {init_size} elements",
+                        f"Array size mismatch: declared [{size}] but the initializer has {init_size} elements.",
                         node.loc,
+                        code="E3102",
+                        hint=f"Either change the size to [{init_size}], or adjust the initializer to have {size} elements.",
                     )
                 if size is None:
                     size = init_size
@@ -351,15 +405,19 @@ class TypeChecker:
                     et = self._check_expr(elem)
                     if not self._is_assignable(elem_type, et):
                         self._error(
-                            f"Cannot initialize {node.element_type_name} array with {et.value} element",
+                            f"Expected {node.element_type_name} element, but found {et.value}.",
                             elem.loc,
+                            code="E3102",
+                            hint=f"Each element in a {node.element_type_name}[] array must be compatible with {node.element_type_name}.",
                         )
                 self._set_type(node.initializer, TEXType.ARRAY)
             else:
                 # Array copy from another variable
                 init_type = self._check_expr(node.initializer)
                 if init_type != TEXType.ARRAY:
-                    self._error("Array initializer must be an array", node.loc)
+                    self._error("This array initializer needs to be an array value.",
+                                node.loc, code="E3102",
+                                hint="Try assigning from another array variable or an array literal {1, 2, 3}.")
                 else:
                     # Check element type + size compatibility
                     if isinstance(node.initializer, Identifier):
@@ -367,14 +425,16 @@ class TypeChecker:
                         if src_info:
                             if src_info.element_type != elem_type:
                                 self._error(
-                                    f"Cannot copy {src_info.element_type.value} array "
-                                    f"to {elem_type.value} array",
+                                    f"Expected {elem_type.value} array, but the source is a {src_info.element_type.value} array.",
                                     node.loc,
+                                    code="E3101",
+                                    hint="Both arrays need to have the same element type for copying.",
                                 )
                             if size is not None and size != src_info.size:
                                 self._error(
-                                    f"Array size mismatch: [{size}] vs [{src_info.size}]",
+                                    f"Array size mismatch: expected [{size}] but the source has [{src_info.size}] elements.",
                                     node.loc,
+                                    code="E3102",
                                 )
                             if size is None:
                                 size = src_info.size
@@ -384,11 +444,15 @@ class TypeChecker:
             if node.initializer and isinstance(node.initializer, FunctionCall):
                 size = 0  # dynamic — resolved at runtime
             else:
-                self._error("Array must have a known size", node.loc)
+                self._error("This array needs a known size.",
+                            node.loc, code="E3101",
+                            hint="Try: float[10] arr; or float[] arr = {1, 2, 3};")
                 size = 1  # fallback
 
         if size > 1024:  # 0 = dynamic, skip check
-            self._error(f"Array size {size} exceeds maximum (1024)", node.loc)
+            self._error(f"Array size {size} exceeds the maximum of 1024.",
+                        node.loc, code="E3103",
+                        hint="Keep array sizes at 1024 or below.")
 
         arr_type = TEXArrayType(element_type=elem_type, size=size)
         self._declare_var(node.name, TEXType.ARRAY, node.loc)
@@ -403,7 +467,9 @@ class TypeChecker:
         # Check for @wire / $param name conflict
         if node.name in self.referenced_bindings:
             self._error(
-                f"'{node.name}' is used as both @wire and $parameter", node.loc
+                f"'{node.name}' is used as both @wire and $parameter.",
+                node.loc, code="E3202",
+                hint="A name must be either @wire or $param, not both. Try renaming one of them.",
             )
 
         # Check default literal type (if present)
@@ -412,8 +478,10 @@ class TypeChecker:
             if not self._is_assignable(tex_type, default_type):
                 self._error(
                     f"Default value type mismatch for ${node.name}: "
-                    f"expected '{tex_type.value}', got '{default_type.value}'",
+                    f"expected '{tex_type.value}', but found '{default_type.value}'.",
                     node.loc,
+                    code="E3200",
+                    hint=f"The default value should match the parameter type ({tex_type.value}).",
                 )
 
         # Extract default literal value (for backend fallback)
@@ -448,31 +516,38 @@ class TypeChecker:
             # Don't allow assigning to $param bindings
             if binding_target.kind == "param":
                 self._error(
-                    f"Cannot assign to parameter ${name} (parameters are read-only widgets)",
+                    f"Parameter ${name} is read-only and doesn't support assignment.",
                     node.loc,
+                    code="E3201",
+                    hint=f"Parameters are widget inputs. Use a local variable instead, e.g.: float my_{name} = ${name};",
                 )
             # Don't allow @wire assignment if name was already declared as $param
             elif name in self.param_declarations:
                 self._error(
-                    f"'{name}' is already declared as a $parameter — "
-                    f"cannot also assign to @{name}",
+                    f"'{name}' is already declared as a $parameter, so assigning to @{name} isn't allowed.",
                     node.loc,
+                    code="E3202",
+                    hint="A name must be either @wire or $param, not both. Try renaming one of them.",
                 )
             else:
                 # Reject matrix/array types as output values (not representable in ComfyUI)
                 if value_type.is_matrix:
                     self._error(
-                        f"Cannot assign {value_type.value} to @{name} "
-                        f"(matrix types cannot be output)",
+                        f"Assigning {value_type.value} to @{name} isn't supported "
+                        f"(matrix types are not valid as outputs).",
                         node.loc,
+                        code="E3203",
+                        hint="Try converting to vec3/vec4 first, or output individual components.",
                     )
                     self._set_type(node, TEXType.VOID)
                     return
                 if value_type.is_array:
                     self._error(
-                        f"Cannot assign array to @{name} "
-                        f"(array types cannot be output)",
+                        f"Assigning an array to @{name} isn't supported "
+                        f"(array types are not valid as outputs).",
                         node.loc,
+                        code="E3203",
+                        hint="Try outputting individual elements, or use join() to convert to a string.",
                     )
                     self._set_type(node, TEXType.VOID)
                     return
@@ -511,21 +586,29 @@ class TypeChecker:
                 pass  # compatible — sizes checked at runtime
             elif target_type.is_array and not value_type.is_array:
                 self._error(
-                    f"Cannot assign '{value_type.value}' to array variable",
+                    f"Expected an array value, but found '{value_type.value}'.",
                     node.loc,
+                    code="E3200",
+                    hint="The left side is an array, so the right side needs to be an array too.",
                 )
             elif not target_type.is_array and value_type.is_array:
                 self._error(
-                    f"Cannot assign array to '{target_type.value}' variable",
+                    f"Expected '{target_type.value}', but found an array.",
                     node.loc,
+                    code="E3200",
+                    hint="Try indexing into the array (e.g. arr[0]) to get a single value.",
                 )
             elif not self._is_assignable(target_type, value_type):
                 self._error(
-                    f"Cannot assign '{value_type.value}' to target of type '{target_type.value}'",
+                    f"Expected '{target_type.value}', but found '{value_type.value}'.",
                     node.loc,
+                    code="E3200",
+                    hint=f"The target is {target_type.value}, which isn't compatible with {value_type.value}.",
                 )
         else:
-            self._error("Invalid assignment target", node.loc)
+            self._error("This expression doesn't work as an assignment target.",
+                        node.loc, code="E4000",
+                        hint="The left side of '=' must be a variable, @binding, or array element.")
 
         self._set_type(node, TEXType.VOID)
 
@@ -533,7 +616,9 @@ class TypeChecker:
         cond_type = self._check_expr(node.condition)
         # Condition should be scalar (float or int used as boolean)
         if cond_type.is_vector:
-            self._error("If condition must be a scalar expression, not a vector", node.loc)
+            self._error("This 'if' condition needs a scalar expression (int or float), but found a vector.",
+                        node.loc, code="E3500",
+                        hint="Try using a single component like .r or .x, or compare with length().")
 
         self._push_scope()
         for stmt in node.then_body:
@@ -557,7 +642,9 @@ class TypeChecker:
         # Check condition (must be scalar)
         cond_type = self._check_expr(node.condition)
         if cond_type.is_vector:
-            self._error("For-loop condition must be a scalar expression, not a vector", node.loc)
+            self._error("This 'for' loop condition needs a scalar expression (int or float), but found a vector.",
+                        node.loc, code="E3500",
+                        hint="Try using a single component like .r or .x, or compare with length().")
 
         # Check update
         self._check_stmt(node.update)
@@ -576,7 +663,9 @@ class TypeChecker:
 
         cond_type = self._check_expr(node.condition)
         if cond_type.is_vector:
-            self._error("While-loop condition must be a scalar expression, not a vector", node.loc)
+            self._error("This 'while' loop condition needs a scalar expression (int or float), but found a vector.",
+                        node.loc, code="E3500",
+                        hint="Try using a single component like .r or .x, or compare with length().")
 
         self._loop_depth += 1
         for stmt in node.body:
@@ -633,18 +722,32 @@ class TypeChecker:
 
         if isinstance(node, ArrayLiteral):
             # Standalone array literals only appear in declarations (handled there)
-            self._error("Array literal '{...}' can only appear in array declarations", node.loc)
+            self._error("Array literal '{...}' can only appear in array declarations.",
+                        node.loc, code="E3900",
+                        hint="Try: float[] arr = {1, 2, 3}; — array literals need a declaration.")
             self._set_type(node, TEXType.ARRAY)
             return TEXType.ARRAY
 
-        self._error(f"Unknown expression type: {type(node).__name__}", node.loc)
+        self._error(f"This expression type isn't recognized: {type(node).__name__}.",
+                    node.loc, code="E4000",
+                    hint="This may be a syntax that TEX doesn't support yet.")
         self._set_type(node, TEXType.FLOAT)
         return TEXType.FLOAT
 
     def _check_identifier(self, node: Identifier) -> TEXType:
         t = self._lookup_var(node.name)
         if t is None:
-            self._error(f"Undefined variable: '{node.name}'", node.loc)
+            from .diagnostics import suggest_similar, get_variable_hint
+            # Collect all variables in scope for suggestions
+            all_vars = set()
+            for scope in self._scopes:
+                all_vars.update(scope.keys())
+            suggestions = suggest_similar(node.name, all_vars)
+            hint = get_variable_hint(node.name)
+            if not hint and not suggestions:
+                hint = f"Check the spelling, or declare it first with a type: float {node.name} = ...;"
+            self._error(f"I can't find a variable named '{node.name}'.",
+                        node.loc, code="E3003", suggestions=suggestions, hint=hint)
             t = TEXType.FLOAT
         self._set_type(node, t)
         return t
@@ -693,32 +796,44 @@ class TypeChecker:
         channels = node.channels
 
         if obj_type.is_string:
-            self._error("Channel access is not valid on string type", node.loc)
+            self._error("Channel access (.rgb, .x, etc.) doesn't work on strings.",
+                        node.loc, code="E3300",
+                        hint="Strings don't have channels. Try len() or substr() instead.")
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
 
         if obj_type.is_matrix:
-            self._error("Channel access is not valid on matrix type", node.loc)
+            self._error("Channel access (.rgb, .x, etc.) doesn't work on matrix types.",
+                        node.loc, code="E3300",
+                        hint="Use matrix indexing or multiply by a vector instead.")
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
 
         if len(channels) == 1:
             # Single channel -> float
             if channels not in SINGLE_CHANNELS:
-                self._error(f"Invalid channel: '.{channels}'", node.loc)
+                self._error(f"'.{channels}' isn't a recognized channel name.",
+                            node.loc, code="E3301",
+                            hint="Try: .r, .g, .b, .a (color) or .x, .y, .z, .w (position).")
             if obj_type == TEXType.VEC3 and channels in ("a", "w"):
-                self._error(f"vec3 has no '.{channels}' channel", node.loc)
+                self._error(f"vec3 doesn't have a '.{channels}' channel (only 3 components: rgb/xyz).",
+                            node.loc, code="E3301",
+                            hint="Use vec4 if you need a 4th channel, or access .r, .g, .b instead.")
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
 
         # Multi-channel swizzle
         if channels not in VALID_SWIZZLES:
-            self._error(f"Invalid swizzle: '.{channels}'", node.loc)
+            self._error(f"'.{channels}' isn't a recognized swizzle pattern.",
+                        node.loc, code="E3302",
+                        hint="Try common swizzles like .rgb, .xyz, .rgba, or .xyzw.")
 
         n = len(channels)
         if n == 2:
             # We don't have a vec2 type; treat as vec3 for now? No — error.
-            self._error(f"2-component swizzle '.{channels}' not supported (use vec3 or vec4 swizzles)", node.loc)
+            self._error(f"2-component swizzle '.{channels}' is not supported (TEX has no vec2 type).",
+                        node.loc, code="E3303",
+                        hint="Use a 3- or 4-component swizzle like .rgb or .rgba instead.")
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
         elif n == 3:
@@ -728,7 +843,9 @@ class TypeChecker:
             self._set_type(node, TEXType.VEC4)
             return TEXType.VEC4
         else:
-            self._error(f"Invalid swizzle length: '.{channels}'", node.loc)
+            self._error(f"Swizzle '.{channels}' has too many components ({len(channels)}).",
+                        node.loc, code="E3303",
+                        hint="Swizzles must be 1, 3, or 4 components (e.g. .r, .rgb, .rgba).")
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
 
@@ -745,14 +862,17 @@ class TypeChecker:
                 if node.op in ("==", "!="):
                     self._set_type(node, TEXType.FLOAT)
                     return TEXType.FLOAT
-                self._error(f"Operator '{node.op}' is not supported for strings", node.loc)
+                self._error(f"Operator '{node.op}' is not supported for strings.",
+                            node.loc, code="E3401",
+                            hint="Strings only support + (concatenation) and == / != (comparison).")
                 self._set_type(node, TEXType.STRING)
                 return TEXType.STRING
             # Mixed string + numeric
             self._error(
-                f"Cannot use operator '{node.op}' between string and {(rt if lt.is_string else lt).value} "
-                f"(use str() to convert)",
+                f"Operator '{node.op}' doesn't work between string and {(rt if lt.is_string else lt).value}.",
                 node.loc,
+                code="E3401",
+                hint="Try: str() to convert the numeric side, e.g. str(x) + myString.",
             )
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
@@ -781,7 +901,9 @@ class TypeChecker:
     def _check_unary(self, node: UnaryOp) -> TEXType:
         t = self._check_expr(node.operand)
         if t.is_string:
-            self._error(f"Unary operator '{node.op}' is not supported for strings", node.loc)
+            self._error(f"Unary operator '{node.op}' is not supported for strings.",
+                        node.loc, code="E3401",
+                        hint="Unary operators only work on numeric types (int, float, vec, mat).")
         if node.op == "!":
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
@@ -795,7 +917,9 @@ class TypeChecker:
         ft = self._check_expr(node.false_expr)
         # Both branches must agree for string
         if tt.is_string != ft.is_string:
-            self._error("Ternary branches must both be strings or both be numeric", node.loc)
+            self._error("Both branches of a ternary (? :) need to be the same kind: both strings or both numeric.",
+                        node.loc, code="E3400",
+                        hint="Make sure the true and false branches return the same general type.")
         result = self._promote(tt, ft)
         self._set_type(node, result)
         return result
@@ -805,9 +929,13 @@ class TypeChecker:
         for arg in node.args:
             arg_type = self._check_expr(arg)
             if arg_type.is_string:
-                self._error("Vector constructor arguments cannot be strings", node.loc)
+                self._error("Vector constructors don't accept string arguments.",
+                            node.loc, code="E3600",
+                            hint="Use numeric values (int, float, vec) for vector construction.")
             elif arg_type.is_matrix:
-                self._error("Vector constructor arguments cannot be matrices", node.loc)
+                self._error("Vector constructors don't accept matrix arguments.",
+                            node.loc, code="E3600",
+                            hint="Use numeric values (int, float, vec) for vector construction.")
             arg_types.append(arg_type)
 
         if len(node.args) == 1:
@@ -815,16 +943,20 @@ class TypeChecker:
             # Also allows vec4(vec4_val) — identity / type cast
             if arg_types[0].is_vector and arg_types[0].channels != node.size:
                 self._error(
-                    f"vec{node.size} broadcast requires a scalar or vec{node.size}, got {arg_types[0].value}",
+                    f"vec{node.size}() with one argument needs a scalar or vec{node.size}, but found {arg_types[0].value}.",
                     node.loc,
+                    code="E3600",
+                    hint=f"Try: vec{node.size}(scalar_value) to broadcast, or pass {node.size} separate components.",
                 )
         else:
             # Count total components: scalars contribute 1, vec3 → 3, vec4 → 4
             total = sum(t.channels for t in arg_types)
             if total != node.size:
                 self._error(
-                    f"vec{node.size} requires {node.size} total components, got {total}",
+                    f"vec{node.size}() needs exactly {node.size} components, but got {total}.",
                     node.loc,
+                    code="E3601",
+                    hint=f"Each scalar counts as 1, vec3 as 3, vec4 as 4. Adjust to total {node.size}.",
                 )
 
         t = TEXType.VEC3 if node.size == 3 else TEXType.VEC4
@@ -835,17 +967,23 @@ class TypeChecker:
         for arg in node.args:
             arg_type = self._check_expr(arg)
             if arg_type.is_string:
-                self._error("Matrix constructor arguments cannot be strings", node.loc)
+                self._error("Matrix constructors don't accept string arguments.",
+                            node.loc, code="E3600",
+                            hint="Use numeric scalar values for matrix construction.")
             elif arg_type.is_vector or arg_type.is_matrix:
-                self._error("Matrix constructor arguments must be scalar", node.loc)
+                self._error("Matrix constructor arguments need to be scalar values.",
+                            node.loc, code="E3600",
+                            hint="Pass individual float/int values, not vectors or matrices.")
 
         n = node.size * node.size  # 9 for mat3, 16 for mat4
         if len(node.args) == 1:
             pass  # Broadcast: mat3(1.0) → scaled identity
         elif len(node.args) != n:
             self._error(
-                f"mat{node.size} expects {n} arguments (or 1 for scaled identity), got {len(node.args)}",
+                f"mat{node.size}() needs {n} arguments (or 1 for scaled identity), but got {len(node.args)}.",
                 node.loc,
+                code="E3601",
+                hint=f"A mat{node.size} is {node.size}x{node.size}, so it takes {n} values or 1 for a diagonal matrix.",
             )
 
         t = TEXType.MAT3 if node.size == 3 else TEXType.MAT4
@@ -858,20 +996,27 @@ class TypeChecker:
             # mat * mat → mat (matmul)
             if lt.is_matrix and rt.is_matrix:
                 if lt != rt:
-                    self._error(f"Cannot multiply {lt.value} by {rt.value}", loc)
+                    self._error(f"Multiplying {lt.value} by {rt.value} isn't supported (matrix sizes must match).",
+                                loc, code="E3402")
                 return lt
             # mat * vec → vec (matrix-vector product)
             if lt.is_matrix and rt.is_vector:
                 if lt == TEXType.MAT3 and rt not in (TEXType.VEC3, TEXType.VEC4):
-                    self._error(f"mat3 * requires vec3 or vec4 operand, got {rt.value}", loc)
+                    self._error(f"mat3 * needs a vec3 or vec4 operand, but found {rt.value}.",
+                                loc, code="E3402",
+                                hint="Try converting the right side to vec3 or vec4 first.")
                 if lt == TEXType.MAT4 and rt != TEXType.VEC4:
-                    self._error(f"mat4 * requires vec4 operand, got {rt.value}", loc)
+                    self._error(f"mat4 * needs a vec4 operand, but found {rt.value}.",
+                                loc, code="E3402",
+                                hint="Try converting the right side to vec4 first.")
                 return rt
             # vec * mat → error
             if lt.is_vector and rt.is_matrix:
                 self._error(
-                    f"Cannot multiply {lt.value} * {rt.value} — use transpose({rt.value}) * {lt.value} instead",
+                    f"Multiplying {lt.value} * {rt.value} isn't supported in this order.",
                     loc,
+                    code="E3402",
+                    hint=f"Try: {rt.value} * {lt.value} (matrix on the left), or transpose() the matrix first.",
                 )
                 return lt
             # scalar * mat → mat (element-wise scale)
@@ -883,17 +1028,22 @@ class TypeChecker:
             # mat +/- mat → mat (element-wise)
             if lt.is_matrix and rt.is_matrix:
                 if lt != rt:
-                    self._error(f"Cannot {op} {lt.value} and {rt.value}", loc)
+                    self._error(f"'{op}' between {lt.value} and {rt.value} isn't supported (matrix sizes must match).",
+                                loc, code="E3402")
                 return lt
             # scalar +/- mat or mat +/- scalar → mat (element-wise)
             if lt.is_scalar and rt.is_matrix:
                 return rt
             if lt.is_matrix and rt.is_scalar:
                 return lt
-            self._error(f"Cannot use '{op}' between {lt.value} and {rt.value}", loc)
+            self._error(f"'{op}' between {lt.value} and {rt.value} isn't supported.",
+                        loc, code="E3402",
+                        hint="Matrix +/- only works with same-size matrices or scalars.")
             return lt
         else:
-            self._error(f"Operator '{op}' is not supported for matrix types", loc)
+            self._error(f"Operator '{op}' is not supported for matrix types.",
+                        loc, code="E3402",
+                        hint="Matrices support *, +, and - operators.")
             return lt if lt.is_matrix else rt
 
     def _check_cast(self, node: CastExpr) -> TEXType:
@@ -901,11 +1051,15 @@ class TypeChecker:
         t = TYPE_NAME_MAP.get(node.target_type, TEXType.FLOAT)
         # string(vec3/vec4) is not allowed
         if t.is_string and expr_type.is_vector:
-            self._error(f"Cannot cast {expr_type.value} to string", node.loc)
+            self._error(f"Casting {expr_type.value} to string isn't supported.",
+                        node.loc, code="E3700",
+                        hint="Try: str() to convert scalars, or access individual channels first.")
         # numeric casts from string are not allowed (use to_int/to_float)
         if t.is_numeric and expr_type.is_string:
             self._error(
-                f"Cannot cast string to {t.value} (use to_int() or to_float())", node.loc
+                f"Casting string to {t.value} isn't supported directly.",
+                node.loc, code="E3700",
+                hint="Try: to_int() or to_float() to parse a string as a number.",
             )
         self._set_type(node, t)
         return t
@@ -916,12 +1070,16 @@ class TypeChecker:
         index_type = self._check_expr(node.index)
 
         if array_type != TEXType.ARRAY:
-            self._error(f"Cannot index non-array type '{array_type.value}'", node.loc)
+            self._error(f"Indexing with [] doesn't work on '{array_type.value}' (only arrays support indexing).",
+                        node.loc, code="E3800",
+                        hint="Make sure the variable is declared as an array, e.g. float[] arr = ...;")
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
 
         if not index_type.is_scalar:
-            self._error(f"Array index must be int or float, got '{index_type.value}'", node.loc)
+            self._error(f"Array index needs to be int or float, but found '{index_type.value}'.",
+                        node.loc, code="E3800",
+                        hint="Use a numeric expression for the index, e.g. arr[0] or arr[i].")
 
         # Resolve element type from array info
         elem_type = TEXType.FLOAT  # default
@@ -940,8 +1098,10 @@ class TypeChecker:
         if node.name == "len" and arg_types:
             if arg_types[0].is_vector:
                 self._error(
-                    f"len() does not accept {arg_types[0].value} arguments (use on string or array)",
+                    f"len() doesn't work on {arg_types[0].value} (it only accepts string or array).",
                     node.loc,
+                    code="E5003",
+                    hint="For vectors, the component count is fixed (3 for vec3, 4 for vec4).",
                 )
 
         # Array aggregate functions: return element type for vector arrays
@@ -951,7 +1111,9 @@ class TypeChecker:
                     arr_info = self._lookup_array_info(node.args[0].name)
                     if arr_info:
                         if arr_info.element_type == TEXType.STRING:
-                            self._error(f"'{node.name}' does not work on string arrays", node.loc)
+                            self._error(f"'{node.name}' doesn't work on string arrays.",
+                                        node.loc, code="E5003",
+                                        hint="This function only works on numeric arrays (int, float, vec).")
                         elif arr_info.element_type.is_vector:
                             result_type = arr_info.element_type
                             self._set_type(node, result_type)
@@ -960,17 +1122,23 @@ class TypeChecker:
         # Image reduction validation
         if node.name in ("img_sum", "img_mean", "img_min", "img_max", "img_median"):
             if arg_types and not arg_types[0].is_numeric:
-                self._error(f"'{node.name}' expects an image/mask, not {arg_types[0].value}", node.loc)
+                self._error(f"'{node.name}' expects an image or mask input, but found {arg_types[0].value}.",
+                            node.loc, code="E5003",
+                            hint="Pass an @binding that contains image data (vec3/vec4) or a mask (float).")
 
         # join() validation
         if node.name == "join":
             if arg_types and arg_types[0] != TEXType.ARRAY:
-                self._error("join() expects a string array as first argument", node.loc)
+                self._error("join() expects a string array as its first argument.",
+                            node.loc, code="E5003",
+                            hint="Try: join(string_array, separator).")
 
         # split() validation — first arg must be string
         if node.name == "split":
             if arg_types and arg_types[0] != TEXType.STRING:
-                self._error("split() expects a string as first argument", node.loc)
+                self._error("split() expects a string as its first argument.",
+                            node.loc, code="E5003",
+                            hint="Try: split(myString, delimiter).")
 
         result_type = self._resolve_function_type(node.name, arg_types, node.loc)
         self._set_type(node, result_type)
@@ -981,15 +1149,23 @@ class TypeChecker:
         from .stdlib_signatures import FUNCTION_SIGNATURES
         sig = FUNCTION_SIGNATURES.get(name)
         if sig is None:
-            self._error(f"Unknown function: '{name}'", loc)
+            from .diagnostics import suggest_similar, get_function_hint
+            suggestions = suggest_similar(name, FUNCTION_SIGNATURES.keys())
+            hint = get_function_hint(name)
+            if not hint:
+                hint = "Check the spelling, or see the ? help panel for the full function list."
+            self._error(f"I can't find a function named '{name}'.",
+                        loc, code="E5001", suggestions=suggestions, hint=hint)
             return TEXType.FLOAT
 
         # Check argument count
         min_args, max_args = sig["args"]
         if not (min_args <= len(arg_types) <= max_args):
             self._error(
-                f"Function '{name}' expects {min_args}-{max_args} arguments, got {len(arg_types)}",
+                f"'{name}()' expects {min_args}-{max_args} arguments, but got {len(arg_types)}.",
                 loc,
+                code="E5002",
+                hint=f"Check the function signature: {name}() takes {min_args} to {max_args} arguments.",
             )
             return sig["return"](arg_types) if callable(sig["return"]) else sig["return"]
 
@@ -1063,8 +1239,10 @@ class TypeChecker:
             return current
         if current.is_string != new.is_string:
             self._error(
-                "Output binding assigned both string and numeric types in different branches",
+                "This output binding is assigned both string and numeric types in different branches.",
                 loc,
+                code="E3200",
+                hint="Make sure all branches assign the same kind of value (all string or all numeric).",
             )
             return current
         return self._promote(current, new)

@@ -82,8 +82,6 @@ class _CodeGen:
         self._tmp_counter = 0
         self._lines: list[str] = []
         self._indent = 1  # Start at 1 (inside function body)
-        self._constants: dict[float, str] = {}  # value -> const var name
-        self._const_lines: list[str] = []  # constant initialization lines
 
     def _tmp(self) -> str:
         """Generate a unique temporary variable name."""
@@ -95,14 +93,14 @@ class _CodeGen:
         self._lines.append("    " * self._indent + line)
 
     def _get_const(self, value: float) -> str:
-        """Get or create a constant tensor variable for a number literal."""
-        if value not in self._constants:
-            name = f"_c{len(self._constants)}"
-            self._constants[value] = name
-            self._const_lines.append(
-                f"    {name} = _torch.tensor({value!r}, dtype=_torch.float32, device=_dev)"
-            )
-        return self._constants[value]
+        """Return an inline expression for a numeric constant tensor.
+
+        We inline the _torch.tensor() call rather than hoisting to a local
+        variable because torch.compile/dynamo may split the generated function
+        into multiple subgraphs — local variables assigned in one subgraph
+        are not visible in resume functions of subsequent subgraphs.
+        """
+        return f"_torch.tensor({value!r}, dtype=_torch.float32, device=_dev)"
 
     def emit_program(self, program: Program):
         """Emit code for the entire program."""
@@ -111,7 +109,7 @@ class _CodeGen:
 
     def build(self) -> Any:
         """Compile the generated source to a callable function."""
-        body = "\n".join(self._const_lines + self._lines)
+        body = "\n".join(self._lines)
         func_src = (
             "def _tex_fn(_env, _bind, _fns, _dev, _sp, "
             "_torch, _bp, _es, _tw, _math, _SAFE_EPS, _CMAP, _MAX_ITER, "
@@ -358,7 +356,10 @@ class _CodeGen:
                 env_vars.add(stmt.name)
             elif isinstance(stmt, IfElse):
                 e1, b1 = self._collect_modified_vars(stmt.then_body)
-                e2, b2 = self._collect_modified_vars(stmt.else_body)
+                if stmt.else_body:
+                    e2, b2 = self._collect_modified_vars(stmt.else_body)
+                else:
+                    e2, b2 = set(), set()
                 env_vars |= e1 | e2
                 bind_names |= b1 | b2
             elif isinstance(stmt, (ForLoop, WhileLoop)):
@@ -608,9 +609,9 @@ class _CodeGen:
         if op in _INFIX_OPS:
             self._emit(f"{tmp} = ({left} {op} {right})")
         elif op == "/":
-            self._emit(f"{tmp} = ({left} / ({right} + _SAFE_EPS * ({right} == 0).float()))")
+            self._emit(f"{tmp} = ({left} / _tw({right} == 0, _SAFE_EPS, {right}))")
         elif op == "%":
-            self._emit(f"{tmp} = _torch.fmod({left}, {right} + _SAFE_EPS * ({right} == 0).float())")
+            self._emit(f"{tmp} = _torch.fmod({left}, _tw({right} == 0, _SAFE_EPS, {right}))")
         elif op in _CMP_OPS:
             py_op = _CMP_OPS[op]
             self._emit(f"{tmp} = ({left} {py_op} {right}).float()")

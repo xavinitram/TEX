@@ -230,3 +230,13 @@ class ArrayIndexAccess(ASTNode):
 class ArrayLiteral(ASTNode):
     """Array initializer list: `{1.0, 2.0, 3.0}`"""
     elements: list[ASTNode] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ErrorNode(ASTNode):
+    """Placeholder for a statement that failed to parse.
+
+    Inserted during parser error recovery so downstream passes
+    (type checker, interpreter) can skip it without cascade errors.
+    """
+    error_message: str = ""

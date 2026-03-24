@@ -1,18 +1,22 @@
 """
 TEX Compiled Execution — optional torch.compile wrapper around the interpreter.
 
-Wraps Interpreter.execute() in a torch.compile-d callable with automatic
-backend selection and graceful fallback.  If compilation fails for any
-reason the plain tree-walking interpreter is used instead — execution
-never fails because of torch.compile.
+When codegen can compile a TEX program to a flat Python function (no dispatch
+overhead), that function is wrapped with torch.compile for kernel fusion.
+Otherwise, falls back to wrapping the tree-walking interpreter.
+
+If compilation fails for any reason the plain interpreter is used instead —
+execution never fails because of torch.compile.
 
 Cache key: (code_fingerprint, device_type).
 torch.compile handles shape-based recompilation internally via guards.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import glob
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -20,9 +24,16 @@ from typing import Any, Callable
 
 import torch
 
-from .interpreter import Interpreter
+from .interpreter import Interpreter, _ensure_spatial, _broadcast_pair, _collect_identifiers
+from .codegen import try_compile as _try_codegen, _CgBreak, _CgContinue
+from .stdlib import TEXStdlib, SAFE_EPSILON
+from ..tex_compiler.type_checker import CHANNEL_MAP
 
 logger = logging.getLogger("TEX")
+
+# Hard limit on for-loop iterations (must match interpreter.MAX_LOOP_ITERATIONS)
+_MAX_LOOP_ITERATIONS = 1024
+
 
 # ── MSVC environment setup (Windows) ─────────────────────────────────
 
@@ -107,6 +118,9 @@ def _setup_msvc_env():
 # Compiled executors: (fingerprint, device_type) -> compiled callable
 _compiled_cache: dict[tuple[str, str], Callable] = {}
 
+# Fingerprints that crashed torch.compile — skip on subsequent calls
+_compile_blacklist: set[str] = set()
+
 # Track which backends have been tested and whether they work.
 # None = untested, True = works, False = failed
 _backend_status: dict[str, bool | None] = {
@@ -117,6 +131,10 @@ _backend_status: dict[str, bool | None] = {
 # One-time log messages (avoid spamming the console)
 _warnings_shown: set[str] = set()
 
+# Minimum tensor-op count for torch.compile to be worthwhile.
+# Below this threshold the fusion benefit cannot overcome tracing overhead.
+_COMPILE_OP_THRESHOLD = 8
+
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -125,6 +143,79 @@ def _show_once(key: str, msg: str, level: str = "info"):
     if key not in _warnings_shown:
         _warnings_shown.add(key)
         getattr(logger, level)(msg)
+
+
+def _count_tensor_ops(program: Any) -> int:
+    """Count tensor operations in an AST to estimate torch.compile benefit.
+
+    Uses the same traversal pattern as interpreter._collect_identifiers.
+    Counts BinOps, FunctionCalls, VecConstructors, TernaryOps, UnaryOps,
+    and CastExprs — the operations that produce tensor work.
+    """
+    from ..tex_compiler.ast_nodes import (
+        BinOp, UnaryOp, TernaryOp, FunctionCall, VecConstructor,
+        CastExpr, MatConstructor, VarDecl, Assignment, IfElse, ForLoop,
+        WhileLoop, ExprStatement, ArrayDecl, ChannelAccess,
+        ArrayIndexAccess, ArrayLiteral,
+    )
+    _OP_TYPES = (BinOp, UnaryOp, TernaryOp, FunctionCall,
+                 VecConstructor, MatConstructor, CastExpr)
+    count = 0
+    stack = list(program.statements)
+    while stack:
+        node = stack.pop()
+        cls = type(node)
+        if isinstance(node, _OP_TYPES):
+            count += 1
+        # Traverse children (same pattern as _collect_identifiers)
+        if cls is VarDecl:
+            if node.initializer:
+                stack.append(node.initializer)
+        elif cls is Assignment:
+            stack.append(node.target)
+            stack.append(node.value)
+        elif cls is IfElse:
+            stack.append(node.condition)
+            stack.extend(node.then_body)
+            stack.extend(node.else_body)
+        elif cls is ForLoop:
+            stack.append(node.init)
+            stack.append(node.condition)
+            stack.append(node.update)
+            stack.extend(node.body)
+        elif cls is WhileLoop:
+            stack.append(node.condition)
+            stack.extend(node.body)
+        elif cls is ExprStatement:
+            stack.append(node.expr)
+        elif cls is ArrayDecl:
+            if node.initializer:
+                stack.append(node.initializer)
+        elif cls is BinOp:
+            stack.append(node.left)
+            stack.append(node.right)
+        elif cls is UnaryOp:
+            stack.append(node.operand)
+        elif cls is TernaryOp:
+            stack.append(node.condition)
+            stack.append(node.true_expr)
+            stack.append(node.false_expr)
+        elif cls is FunctionCall:
+            stack.extend(node.args)
+        elif cls is VecConstructor:
+            stack.extend(node.args)
+        elif cls is MatConstructor:
+            stack.extend(node.args)
+        elif cls is CastExpr:
+            stack.append(node.expr)
+        elif cls is ChannelAccess:
+            stack.append(node.object)
+        elif cls is ArrayIndexAccess:
+            stack.append(node.array)
+            stack.append(node.index)
+        elif cls is ArrayLiteral:
+            stack.extend(node.elements)
+    return count
 
 
 def _select_backend(device_type: str) -> str | None:
@@ -165,6 +256,13 @@ def execute_compiled(
 
     Falls back to the plain interpreter on any failure.
 
+    The ENTIRE torch.compile lifecycle (wrapping via torch.compile() AND
+    execution of the compiled callable) runs in a disposable thread.
+    This is critical because torch.compile/dynamo can corrupt the C++
+    PythonDispatcherTLS when tracing fails — and that corruption is
+    thread-local and unrecoverable.  By keeping the main thread clean,
+    ComfyUI and subsequent TEX runs stay healthy even after failures.
+
     Args:
         program:      Parsed AST (Program node).
         bindings:     Mapping of @ binding names to tensor / scalar values.
@@ -180,30 +278,85 @@ def execute_compiled(
     device_type = device_obj.type  # "cpu" or "cuda"
     cache_key = (fingerprint, device_type)
 
-    # Get or create the compiled callable
-    if cache_key not in _compiled_cache:
-        compiled_fn = _try_compile(cache_key, device_type)
-        if compiled_fn is None:
-            # torch.compile not available / all backends failed
-            return _plain_execute(program, bindings, type_map, device,
-                                  latent_channel_count, output_names)
-        _compiled_cache[cache_key] = compiled_fn
-
-    compiled_fn = _compiled_cache[cache_key]
-
-    try:
-        return compiled_fn(program, bindings, type_map, device,
-                           latent_channel_count, output_names)
-    except Exception as e:
-        _show_once(
-            f"compile_exec_fail_{fingerprint[:12]}",
-            f"[TEX] torch.compile execution failed, falling back to interpreter: {e}",
-            level="warning",
-        )
-        # Remove the broken entry so next call retries or falls back
-        _compiled_cache.pop(cache_key, None)
+    # ── Blacklist: skip programs that previously crashed torch.compile
+    if fingerprint in _compile_blacklist:
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names)
+
+    # ── Complexity gate: skip torch.compile for trivial programs
+    #    where tracing overhead exceeds any possible fusion benefit.
+    if cache_key not in _compiled_cache:
+        op_count = _count_tensor_ops(program)
+        if op_count < _COMPILE_OP_THRESHOLD:
+            return _plain_execute(program, bindings, type_map, device,
+                                  latent_channel_count, output_names)
+
+    # Ensure tensor bindings are contiguous — Inductor's codegen can
+    # fail on non-contiguous strides (e.g. BHWC images loaded with
+    # stride patterns like [1090020, 2220, 3, 1]).
+    contiguous_bindings = {}
+    for k, v in bindings.items():
+        if isinstance(v, torch.Tensor) and not v.is_contiguous():
+            contiguous_bindings[k] = v.contiguous()
+        else:
+            contiguous_bindings[k] = v
+
+    # Run the ENTIRE torch.compile lifecycle in an ISOLATED THREAD.
+    #
+    # Both torch.compile() wrapping and compiled function execution
+    # touch dynamo's C++ TLS state.  If either phase fails mid-trace,
+    # the TLS on that thread is permanently corrupted — all tensor ops
+    # fail with INTERNAL ASSERT FAILED.
+    #
+    # By running everything in a disposable thread, any TLS corruption
+    # stays contained.  The main thread never touches dynamo at all.
+    compile_error = None
+
+    def _compile_and_run():
+        """Compile (if needed) and execute — all on this worker thread."""
+        nonlocal compile_error
+        try:
+            with torch.inference_mode():
+                # Get or create the compiled callable (on THIS thread)
+                if cache_key not in _compiled_cache:
+                    compiled_fn = _try_compile(cache_key, device_type, program, type_map)
+                    if compiled_fn is None:
+                        # No backend available — run plain interpreter here
+                        return _plain_execute(program, contiguous_bindings, type_map,
+                                              device, latent_channel_count, output_names)
+                    _compiled_cache[cache_key] = compiled_fn
+
+                compiled_fn = _compiled_cache[cache_key]
+                return compiled_fn(program, contiguous_bindings, type_map, device,
+                                   latent_channel_count, output_names)
+        except Exception as e:
+            compile_error = e
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_compile_and_run)
+        result = future.result()
+
+    if compile_error is not None:
+        _show_once(
+            f"compile_exec_fail_{fingerprint[:12]}",
+            f"[TEX] torch.compile execution failed, falling back to interpreter: {compile_error}",
+            level="warning",
+        )
+        _compiled_cache.pop(cache_key, None)
+        _compile_blacklist.add(fingerprint)
+        # dynamo.reset() also runs in a clean thread to avoid tainting main
+        def _reset_dynamo():
+            try:
+                torch._dynamo.reset()
+            except Exception:
+                pass
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_reset_dynamo).result()
+        return _plain_execute(program, bindings, type_map, device,
+                              latent_channel_count, output_names)
+
+    return result
 
 
 def _plain_execute(
@@ -222,10 +375,17 @@ def _plain_execute(
 
 
 def _try_compile(
-    cache_key: tuple[str, str], device_type: str
+    cache_key: tuple[str, str], device_type: str,
+    program: Any = None, type_map: dict | None = None,
 ) -> Callable | None:
     """
-    Attempt to create a torch.compile-d interpreter wrapper.
+    Attempt to create a torch.compile-d callable for a TEX program.
+
+    Strategy:
+      1. Try codegen first — compiles TEX AST to a flat Python function that
+         torch.compile can actually fuse (no dispatch overhead).
+      2. Fall back to wrapping the tree-walking interpreter (limited benefit
+         but still catches some fusion opportunities).
 
     Cascades through backends until one works or all fail.
     Returns None if torch.compile is entirely unavailable.
@@ -241,11 +401,97 @@ def _try_compile(
         )
         return None
 
-    def _interp_fn(program, bindings, type_map, device, latent_channel_count=0, output_names=None):
-        interp = Interpreter()
-        return interp.execute(program, bindings, type_map, device=device,
-                              latent_channel_count=latent_channel_count,
-                              output_names=output_names)
+    # ── Try codegen path first (flat function → much better for torch.compile)
+    cg_fn = None
+    if program is not None and type_map is not None:
+        try:
+            cg_fn = _try_codegen(program, type_map)
+        except Exception:
+            cg_fn = None
+
+    if cg_fn is not None:
+        # Build an adapter that matches the execute_compiled calling convention
+        # but delegates to the codegen-generated flat function.
+        stdlib_fns = TEXStdlib.get_functions()
+
+        def _codegen_exec(program, bindings, type_map, device,
+                          latent_channel_count=0, output_names=None):
+            dev = torch.device(device) if not isinstance(device, torch.device) else device
+            env = {}
+
+            # Determine spatial shape from image bindings
+            sp = None
+            for v in bindings.values():
+                if isinstance(v, torch.Tensor) and v.dim() >= 3:
+                    sp = (v.shape[0], v.shape[1], v.shape[2])
+                    break
+
+            # Create builtins (same logic as Interpreter._create_builtins)
+            # u/v use expand() (view, no copy) for torch.stack compat in sampling
+            used = _collect_identifiers(program)
+            if sp:
+                B, H, W = sp
+                dtype = torch.float32
+                if "ix" in used or "u" in used:
+                    ix = torch.arange(W, dtype=dtype, device=dev).view(1, 1, W)
+                    if "ix" in used:
+                        env["ix"] = ix
+                    if "u" in used:
+                        env["u"] = (ix / max(W - 1, 1)).expand(B, H, W)
+                if "iy" in used or "v" in used:
+                    iy = torch.arange(H, dtype=dtype, device=dev).view(1, H, 1)
+                    if "iy" in used:
+                        env["iy"] = iy
+                    if "v" in used:
+                        env["v"] = (iy / max(H - 1, 1)).expand(B, H, W)
+                if "iw" in used:
+                    env["iw"] = torch.tensor(float(W), dtype=dtype, device=dev)
+                if "ih" in used:
+                    env["ih"] = torch.tensor(float(H), dtype=dtype, device=dev)
+                if "fi" in used:
+                    env["fi"] = torch.arange(B, dtype=dtype, device=dev).view(B, 1, 1)
+                if "fn" in used:
+                    env["fn"] = torch.tensor(float(B), dtype=dtype, device=dev)
+            else:
+                _scalar_defaults = {"ix": 0.0, "iy": 0.0, "u": 0.0, "v": 0.0,
+                                    "iw": 1.0, "ih": 1.0, "fi": 0.0, "fn": 1.0}
+                for name, val in _scalar_defaults.items():
+                    if name in used:
+                        env[name] = torch.tensor(val, device=dev)
+
+            if "PI" in used:
+                env["PI"] = torch.tensor(math.pi, dtype=torch.float32, device=dev)
+            if "E" in used:
+                env["E"] = torch.tensor(math.e, dtype=torch.float32, device=dev)
+            if "ic" in used:
+                env["ic"] = torch.tensor(float(latent_channel_count), dtype=torch.float32, device=dev)
+
+            # Call the codegen-generated function
+            cg_fn(env, bindings, stdlib_fns, dev, sp,
+                   torch, _broadcast_pair, _ensure_spatial, torch.where,
+                   math, SAFE_EPSILON, CHANNEL_MAP, _MAX_LOOP_ITERATIONS,
+                   _CgBreak, _CgContinue)
+
+            # Extract outputs
+            if output_names is not None:
+                return {name: bindings[name] for name in output_names}
+            return bindings.get("OUT")
+
+        target_fn = _codegen_exec
+        _show_once("codegen_active", "[TEX] Using codegen path for torch.compile (flat function)")
+    else:
+        # Fall back to wrapping the interpreter directly
+        def _interp_fn(program, bindings, type_map, device,
+                       latent_channel_count=0, output_names=None):
+            interp = Interpreter()
+            return interp.execute(program, bindings, type_map, device=device,
+                                  latent_channel_count=latent_channel_count,
+                                  output_names=output_names)
+
+        target_fn = _interp_fn
+        if cg_fn is None and program is not None:
+            _show_once("codegen_fallback",
+                       "[TEX] Codegen unsupported for this program, wrapping interpreter")
 
     try:
         # Configure torch.compile cache directory if the cache is available
@@ -260,7 +506,7 @@ def _try_compile(
             pass  # Not critical — torch uses its default cache location
 
         compiled = torch.compile(
-            _interp_fn,
+            target_fn,
             backend=backend,
             mode="reduce-overhead" if device_type == "cuda" else "default",
             fullgraph=False,  # Allow graph breaks at for-loop .item() calls
@@ -292,12 +538,13 @@ def _try_compile(
             )
 
         # Recurse to try the next backend in the cascade
-        return _try_compile(cache_key, device_type)
+        return _try_compile(cache_key, device_type, program, type_map)
 
 
 def clear_compiled_cache():
     """Clear all cached compiled functions (useful for testing)."""
     _compiled_cache.clear()
+    _compile_blacklist.clear()
     # Reset backend status so they are re-probed
     for k in _backend_status:
         _backend_status[k] = None
@@ -307,3 +554,5 @@ def clear_compiled_cache():
 def get_compiled_cache_size() -> int:
     """Return the number of cached compiled functions."""
     return len(_compiled_cache)
+
+
