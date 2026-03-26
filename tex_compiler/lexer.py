@@ -81,9 +81,10 @@ class TokenType(Enum):
     SEMI = auto()
     DOT = auto()
 
+    KW_RETURN = auto()
+
     # Special
     EOF = auto()
-    ERROR = auto()
 
 
 KEYWORDS = {
@@ -100,6 +101,7 @@ KEYWORDS = {
     "while": TokenType.KW_WHILE,
     "break": TokenType.KW_BREAK,
     "continue": TokenType.KW_CONTINUE,
+    "return": TokenType.KW_RETURN,
 }
 
 SINGLE_CHAR_TOKENS = {

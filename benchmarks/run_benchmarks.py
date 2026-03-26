@@ -238,6 +238,125 @@ float n = fbm(u * 6.0, v * 6.0, 6);
     BenchmarkProgram("sample_lanczos",
         "@OUT = sample_lanczos(@A, u + sin(v * 6.28) * 0.01, v);",
         "synthetic", needs_image=True),
+
+    # -- User functions --
+    BenchmarkProgram("user_func_simple", """\
+float square(float x) { return x * x; }
+float a = square(u);
+float b = square(v);
+float c = square(a + b);
+@OUT = vec4(c);""",
+        "synthetic", needs_ref=True),
+
+    BenchmarkProgram("user_func_heavy", """\
+float remap(float val, float lo, float hi) {
+    return clamp((val - lo) / max(hi - lo, 0.001), 0.0, 1.0);
+}
+vec3 color_ramp(float t) {
+    float r = smoothstep(0.0, 0.5, t);
+    float g = smoothstep(0.25, 0.75, t);
+    float b = smoothstep(0.5, 1.0, t);
+    return vec3(r, g, b);
+}
+float pattern(float x, float y) {
+    return sin(x * 6.28) * cos(y * 6.28) * 0.5 + 0.5;
+}
+float p = pattern(u * 3.0, v * 3.0);
+float r = remap(p, 0.2, 0.8);
+@OUT = vec4(color_ramp(r), 1.0);""",
+        "synthetic", needs_ref=True),
+
+    BenchmarkProgram("user_func_loop", """\
+float gaussian_weight(int dx, int dy, float sigma) {
+    float d2 = float(dx * dx + dy * dy);
+    return exp(-d2 / (2.0 * sigma * sigma));
+}
+vec3 weighted_blur(float sigma) {
+    vec3 total = vec3(0.0);
+    float wsum = 0.0;
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            float w = gaussian_weight(dx, dy, sigma);
+            total += fetch(@A, ix + dx, iy + dy).rgb * w;
+            wsum += w;
+        }
+    }
+    return total / wsum;
+}
+@OUT = weighted_blur(1.5);""",
+        "synthetic", needs_image=True),
+
+    # -- Binding access --
+    BenchmarkProgram("binding_fetch", """\
+vec4 tl = @A[ix - 1, iy - 1];
+vec4 tr = @A[ix + 1, iy - 1];
+vec4 bl = @A[ix - 1, iy + 1];
+vec4 br = @A[ix + 1, iy + 1];
+@OUT = (tl + tr + bl + br) * 0.25;""",
+        "synthetic", needs_image=True),
+
+    BenchmarkProgram("binding_sample", """\
+float ofs = 0.005;
+vec4 c  = @A(u, v);
+vec4 l  = @A(u - ofs, v);
+vec4 r2 = @A(u + ofs, v);
+vec4 t  = @A(u, v - ofs);
+vec4 b  = @A(u, v + ofs);
+@OUT = (c * 4.0 + l + r2 + t + b) / 8.0;""",
+        "synthetic", needs_image=True),
+
+    BenchmarkProgram("binding_frame_access", """\
+vec4 prev = @frames[ix, iy, fi - 1];
+vec4 curr = @frames[ix, iy, fi];
+vec4 next = @frames[ix, iy, fi + 1];
+@OUT = prev * 0.25 + curr * 0.5 + next * 0.25;""",
+        "synthetic", needs_frames=True),
+
+    # -- Combined: user functions + binding access --
+    BenchmarkProgram("func_and_binding", """\
+float edge_strength(float px, float py) {
+    float c = luma(@A[int(px), int(py)]);
+    float l = luma(@A[int(px) - 1, int(py)]);
+    float r = luma(@A[int(px) + 1, int(py)]);
+    float t = luma(@A[int(px), int(py) - 1]);
+    float b = luma(@A[int(px), int(py) + 1]);
+    return abs(l - r) + abs(t - b);
+}
+float e = edge_strength(ix, iy);
+vec3 color = @A(u, v).rgb;
+@OUT = lerp(color, vec3(e), clamp(e * 2.0, 0.0, 1.0));""",
+        "synthetic", needs_image=True),
+
+    # -- Matrix --
+    BenchmarkProgram("matrix_heavy", """\
+mat3 rot = mat3(
+    cos(u * 3.14), -sin(u * 3.14), 0.0,
+    sin(u * 3.14),  cos(u * 3.14), 0.0,
+    0.0,            0.0,            1.0
+);
+vec3 p = vec3(u - 0.5, v - 0.5, 0.0);
+vec3 rp = rot * p;
+float d = length(rp);
+@OUT = vec4(smoothstep(0.3, 0.0, d));""",
+        "synthetic", needs_ref=True),
+
+    # -- Ternary --
+    BenchmarkProgram("ternary_chain", """\
+float t = u * 4.0;
+float r = t < 1.0 ? t : t < 2.0 ? 2.0 - t : t < 3.0 ? t - 2.0 : 4.0 - t;
+float g = v * 4.0;
+float gv = g < 1.0 ? g : g < 2.0 ? 2.0 - g : g < 3.0 ? g - 2.0 : 4.0 - g;
+@OUT = vec4(r, gv, (r + gv) * 0.5, 1.0);""",
+        "synthetic", needs_ref=True),
+
+    # -- Multi-output --
+    BenchmarkProgram("multi_output", """\
+float lum = luma(@A);
+vec3 color = @A.rgb;
+@color_graded = pow(color, vec3(1.0 / 2.2));
+m@luminance_mask = lum;
+f@avg_brightness = lum;""",
+        "synthetic", needs_image=True, multi_output=True),
 ]
 
 

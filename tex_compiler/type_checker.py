@@ -26,10 +26,11 @@ from enum import Enum
 from dataclasses import dataclass, field
 from .ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
-    BreakStmt, ContinueStmt,
+    BreakStmt, ContinueStmt, FunctionDef, ReturnStmt,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, MatConstructor,
     CastExpr, SourceLoc, ArrayDecl, ArrayIndexAccess, ArrayLiteral, ParamDecl,
+    BindingIndexAccess, BindingSampleAccess,
 )
 
 
@@ -114,9 +115,6 @@ CHANNEL_MAP = {
     "x": 0, "y": 1, "z": 2, "w": 3,
 }
 
-# Valid single-channel accesses
-SINGLE_CHANNELS = {"r", "g", "b", "a", "x", "y", "z", "w"}
-
 # Valid multi-channel swizzles
 VALID_SWIZZLES = {
     "rg", "rb", "ra", "gr", "gb", "ga", "br", "bg", "ba", "ar", "ag", "ab",
@@ -170,14 +168,6 @@ class TypeCheckError(Exception):
 
 
 @dataclass
-class BindingInfo:
-    """Metadata about an @ binding's type at the ComfyUI level."""
-    name: str
-    tex_type: TEXType
-    is_output: bool = False
-
-
-@dataclass
 class TypeChecker:
     """
     Walks the AST and annotates each expression node with its resolved TEXType.
@@ -213,6 +203,12 @@ class TypeChecker:
     # Track loop nesting depth for break/continue validation
     _loop_depth: int = 0
 
+    # User-defined function signatures: name -> {return_type, params, node}
+    _user_functions: dict[str, dict] = field(default_factory=dict)
+
+    # Return type of the function currently being checked (None if not in a function)
+    _current_function_return_type: TEXType | None = None
+
     @property
     def inferred_out_type(self) -> TEXType | None:
         """Convenience: inferred type for @OUT binding."""
@@ -227,6 +223,8 @@ class TypeChecker:
         self.errors = []
         self.assigned_bindings = {}
         self.param_declarations = {}
+        self._user_functions = {}
+        self._current_function_return_type = None
 
         # Pre-populate built-in variables
         builtins = {
@@ -344,6 +342,10 @@ class TypeChecker:
             if self._loop_depth <= 0:
                 self._error(f"'{kind}' statement outside of a loop.", node.loc, code="E3002",
                             hint=f"'{kind}' can only be used inside for or while loops.")
+        elif isinstance(node, FunctionDef):
+            self._check_function_def(node)
+        elif isinstance(node, ReturnStmt):
+            self._check_return_stmt(node)
         else:
             self._error(f"This statement type isn't recognized: {type(node).__name__}.", node.loc,
                         code="E4000", hint="This may be a syntax that TEX doesn't support yet.")
@@ -612,13 +614,15 @@ class TypeChecker:
 
         self._set_type(node, TEXType.VOID)
 
+    def _check_scalar_condition(self, cond_type: TEXType, keyword: str, loc):
+        if cond_type.is_vector:
+            self._error(f"This '{keyword}' condition needs a scalar expression (int or float), but found a vector.",
+                        loc, code="E3500",
+                        hint="Try using a single component like .r or .x, or compare with length().")
+
     def _check_if_else(self, node: IfElse):
         cond_type = self._check_expr(node.condition)
-        # Condition should be scalar (float or int used as boolean)
-        if cond_type.is_vector:
-            self._error("This 'if' condition needs a scalar expression (int or float), but found a vector.",
-                        node.loc, code="E3500",
-                        hint="Try using a single component like .r or .x, or compare with length().")
+        self._check_scalar_condition(cond_type, "if", node.loc)
 
         self._push_scope()
         for stmt in node.then_body:
@@ -641,10 +645,7 @@ class TypeChecker:
 
         # Check condition (must be scalar)
         cond_type = self._check_expr(node.condition)
-        if cond_type.is_vector:
-            self._error("This 'for' loop condition needs a scalar expression (int or float), but found a vector.",
-                        node.loc, code="E3500",
-                        hint="Try using a single component like .r or .x, or compare with length().")
+        self._check_scalar_condition(cond_type, "for", node.loc)
 
         # Check update
         self._check_stmt(node.update)
@@ -662,10 +663,7 @@ class TypeChecker:
         self._push_scope()
 
         cond_type = self._check_expr(node.condition)
-        if cond_type.is_vector:
-            self._error("This 'while' loop condition needs a scalar expression (int or float), but found a vector.",
-                        node.loc, code="E3500",
-                        hint="Try using a single component like .r or .x, or compare with length().")
+        self._check_scalar_condition(cond_type, "while", node.loc)
 
         self._loop_depth += 1
         for stmt in node.body:
@@ -673,6 +671,75 @@ class TypeChecker:
         self._loop_depth -= 1
 
         self._pop_scope()
+        self._set_type(node, TEXType.VOID)
+
+    def _check_function_def(self, node: FunctionDef):
+        if self._current_function_return_type is not None:
+            self._error("Functions cannot be defined inside other functions.",
+                        node.loc, code="E3014",
+                        hint="Move this function definition to the top level.")
+            return
+
+        name = node.name
+        if name in self._user_functions:
+            self._error(f"Function '{name}' is already defined.", node.loc, code="E3010")
+            return
+
+        from .stdlib_signatures import FUNCTION_SIGNATURES
+        if name in FUNCTION_SIGNATURES:
+            self._error(f"'{name}' is a built-in function and cannot be redefined.",
+                        node.loc, code="E3011",
+                        hint="Choose a different name for your function.")
+            return
+
+        return_type = TYPE_NAME_MAP.get(node.return_type)
+        if return_type is None:
+            self._error(f"Unknown return type '{node.return_type}'.", node.loc, code="E3100",
+                        hint="Try: float, int, vec3, vec4, or string.")
+            return
+
+        param_types: list[tuple[TEXType, str]] = []
+        for pt, pn in node.params:
+            ptype = TYPE_NAME_MAP.get(pt)
+            if ptype is None:
+                self._error(f"Unknown parameter type '{pt}'.", node.loc, code="E3100",
+                            hint="Try: float, int, vec3, vec4, or string.")
+                return
+            param_types.append((ptype, pn))
+
+        self._user_functions[name] = {
+            "return_type": return_type,
+            "params": param_types,
+        }
+
+        self._push_scope()
+        saved_return_type = self._current_function_return_type
+        self._current_function_return_type = return_type
+        for ptype, pname in param_types:
+            self._declare_var(pname, ptype, node.loc)
+        for stmt in node.body:
+            self._check_stmt(stmt)
+        self._current_function_return_type = saved_return_type
+        self._pop_scope()
+
+        self._set_type(node, TEXType.VOID)
+
+    def _check_return_stmt(self, node: ReturnStmt):
+        if self._current_function_return_type is None:
+            self._error("'return' can only appear inside a function body.",
+                        node.loc, code="E3012",
+                        hint="Assign to @OUT or another @binding instead.")
+            self._set_type(node, TEXType.VOID)
+            return
+
+        value_type = self._check_expr(node.value)
+        expected = self._current_function_return_type
+        if not self._is_assignable(expected, value_type):
+            self._error(
+                f"Function expects to return '{expected.value}', but this returns '{value_type.value}'.",
+                node.loc, code="E3013",
+                hint=f"The declared return type is {expected.value}.",
+            )
         self._set_type(node, TEXType.VOID)
 
     # -- Expression checking --------------------------------------------
@@ -727,6 +794,12 @@ class TypeChecker:
                         hint="Try: float[] arr = {1, 2, 3}; — array literals need a declaration.")
             self._set_type(node, TEXType.ARRAY)
             return TEXType.ARRAY
+
+        if isinstance(node, BindingIndexAccess):
+            return self._check_binding_index_access(node)
+
+        if isinstance(node, BindingSampleAccess):
+            return self._check_binding_sample_access(node)
 
         self._error(f"This expression type isn't recognized: {type(node).__name__}.",
                     node.loc, code="E4000",
@@ -791,6 +864,32 @@ class TypeChecker:
         self._set_type(node, t)
         return t
 
+    def _check_binding_index_access(self, node: BindingIndexAccess) -> TEXType:
+        """Type-check @Image[ix, iy] or @Image[ix, iy, frame]."""
+        self._check_expr(node.binding)
+        arg_types = [self._check_expr(a) for a in node.args]
+        if len(arg_types) < 2 or len(arg_types) > 3:
+            self._error(
+                f"@binding[...] expects 2 or 3 arguments (x, y [, frame]), got {len(arg_types)}.",
+                node.loc, code="E5002",
+                hint="Use @Image[ix, iy] or @Image[ix, iy, frame].",
+            )
+        self._set_type(node, TEXType.VEC4)
+        return TEXType.VEC4
+
+    def _check_binding_sample_access(self, node: BindingSampleAccess) -> TEXType:
+        """Type-check @Image(u, v) or @Image(u, v, frame)."""
+        self._check_expr(node.binding)
+        arg_types = [self._check_expr(a) for a in node.args]
+        if len(arg_types) < 2 or len(arg_types) > 3:
+            self._error(
+                f"@binding(...) expects 2 or 3 arguments (u, v [, frame]), got {len(arg_types)}.",
+                node.loc, code="E5002",
+                hint="Use @Image(u, v) or @Image(u, v, frame).",
+            )
+        self._set_type(node, TEXType.VEC4)
+        return TEXType.VEC4
+
     def _check_channel_access(self, node: ChannelAccess) -> TEXType:
         obj_type = self._check_expr(node.object)
         channels = node.channels
@@ -811,7 +910,7 @@ class TypeChecker:
 
         if len(channels) == 1:
             # Single channel -> float
-            if channels not in SINGLE_CHANNELS:
+            if channels not in CHANNEL_MAP:
                 self._error(f"'.{channels}' isn't a recognized channel name.",
                             node.loc, code="E3301",
                             hint="Try: .r, .g, .b, .a (color) or .x, .y, .z, .w (position).")
@@ -1149,8 +1248,28 @@ class TypeChecker:
         from .stdlib_signatures import FUNCTION_SIGNATURES
         sig = FUNCTION_SIGNATURES.get(name)
         if sig is None:
+            # Check user-defined functions
+            user_fn = self._user_functions.get(name)
+            if user_fn is not None:
+                expected_count = len(user_fn["params"])
+                if len(arg_types) != expected_count:
+                    self._error(
+                        f"'{name}()' expects {expected_count} argument{'s' if expected_count != 1 else ''}, but got {len(arg_types)}.",
+                        loc, code="E5002",
+                        hint=f"Check the function definition: {name}() takes {expected_count} argument{'s' if expected_count != 1 else ''}.",
+                    )
+                else:
+                    for i, ((ptype, pname), atype) in enumerate(zip(user_fn["params"], arg_types)):
+                        if not self._is_assignable(ptype, atype):
+                            self._error(
+                                f"Argument {i + 1} of '{name}()' expects '{ptype.value}', but got '{atype.value}'.",
+                                loc, code="E5003",
+                            )
+                return user_fn["return_type"]
+
             from .diagnostics import suggest_similar, get_function_hint
-            suggestions = suggest_similar(name, FUNCTION_SIGNATURES.keys())
+            all_names = set(FUNCTION_SIGNATURES.keys()) | set(self._user_functions.keys())
+            suggestions = suggest_similar(name, all_names)
             hint = get_function_hint(name)
             if not hint:
                 hint = "Check the spelling, or see the ? help panel for the full function list."
@@ -1185,9 +1304,9 @@ class TypeChecker:
         # String is only assignable to/from string
         if target.is_string or value.is_string:
             return False
-        # Matrix is only assignable to same matrix type
+        # Matrix is only assignable to same matrix type (already checked target == value above)
         if target.is_matrix or value.is_matrix:
-            return target == value
+            return False
         # int -> float
         if target == TEXType.FLOAT and value == TEXType.INT:
             return True

@@ -481,14 +481,7 @@ def _try_compile(
         _show_once("codegen_active", "[TEX] Using codegen path for torch.compile (flat function)")
     else:
         # Fall back to wrapping the interpreter directly
-        def _interp_fn(program, bindings, type_map, device,
-                       latent_channel_count=0, output_names=None):
-            interp = Interpreter()
-            return interp.execute(program, bindings, type_map, device=device,
-                                  latent_channel_count=latent_channel_count,
-                                  output_names=output_names)
-
-        target_fn = _interp_fn
+        target_fn = _plain_execute
         if cg_fn is None and program is not None:
             _show_once("codegen_fallback",
                        "[TEX] Codegen unsupported for this program, wrapping interpreter")
@@ -550,9 +543,5 @@ def clear_compiled_cache():
         _backend_status[k] = None
     _warnings_shown.clear()
 
-
-def get_compiled_cache_size() -> int:
-    """Return the number of cached compiled functions."""
-    return len(_compiled_cache)
 
 

@@ -1,0 +1,32 @@
+// Custom blend modes using user-defined functions
+// Demonstrates defining reusable functions for image compositing
+
+float overlay(float a, float b) {
+    if (a < 0.5) {
+        return 2.0 * a * b;
+    }
+    return 1.0 - 2.0 * (1.0 - a) * (1.0 - b);
+}
+
+float soft_light(float a, float b) {
+    if (b < 0.5) {
+        return a - (1.0 - 2.0 * b) * a * (1.0 - a);
+    }
+    float d = a;
+    if (a < 0.25) { d = ((16.0 * a - 12.0) * a + 4.0) * a; }
+    else { d = sqrt(a); }
+    return a + (2.0 * b - 1.0) * (d - a);
+}
+
+f$blend_amount = 0.5;
+
+vec3 base = @base.rgb;
+vec3 over = @overlay.rgb;
+
+vec3 result = vec3(
+    overlay(base.r, over.r),
+    overlay(base.g, over.g),
+    overlay(base.b, over.b)
+);
+
+@OUT = lerp(@base, result, $blend_amount);

@@ -6,7 +6,7 @@
   <img src="TEX_node.webp" alt="TEX Wrangle node" width="500">
 </p>
 
-A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 80+ stdlib functions.
+A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 100+ stdlib functions.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://python.org)
@@ -66,7 +66,7 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **GPU acceleration** | CPU or GPU with auto device detection |
 | **`torch.compile`** | Optional JIT compilation for faster repeated execution |
 | **Two-tier caching** | In-memory LRU + disk persistence for instant re-execution |
-| **80+ stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions |
+| **100+ stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |
 | **Snippets** | Right-click → Snippets for 36 built-in examples; save your own with folder organization |
@@ -153,7 +153,7 @@ while (val < 100.0) { val = val * 2.0; }
 | `ic` | Latent channel count (0 for images) |
 | `PI`, `E` | Math constants |
 
-### Standard Library (80+ functions)
+### Standard Library (100+ functions)
 
 **Math:** `sin` `cos` `tan` `asin` `acos` `atan` `atan2` `sinh` `cosh` `tanh` `sqrt` `pow` `pow2` `pow10` `exp` `log` `log2` `log10` `abs` `sign` `floor` `ceil` `round` `fract` `mod` `hypot` `degrees` `radians` `spow` `sdiv` `isnan` `isinf`
 
@@ -219,16 +219,16 @@ The `examples/` directory contains 36 ready-to-use snippets:
 
 ## Performance
 
-v0.5.0 is **1.4×–2.0× faster** than v0.4.0 (geometric mean across 256/512/1024px). Typical CPU times at 512×512:
+v0.9.0 is **3.4× faster** overall than v0.6.0 across all benchmark scenarios. Typical CPU times at 512×512 (compile on, warm start):
 
-| Program | Time |
-|---------|------|
-| grayscale | 3.9 ms |
-| edge_detect | 66 ms |
-| blur (5×5) | 104 ms |
-| perlin_clouds | 287 ms |
+| Program | v0.8.0 | v0.9.0 | Speedup |
+|---------|--------|--------|---------|
+| passthrough | 0.03 ms | 0.03 ms | 1.0x |
+| color_grade | 13.4 ms | 8.5 ms | 1.6x |
+| noise_fbm | 178 ms | 22 ms | **9.0x** |
+| fetch_kernel | 42 ms | 25 ms | 1.7x |
 
-Run `python benchmarks/run_benchmarks.py` for results on your system.
+Run `python benchmarks/four_scenario_bench.py` for results on your system.
 
 ## Development
 
@@ -237,7 +237,7 @@ See **[DEVELOPMENT.md](DEVELOPMENT.md)** for architecture, compilation pipeline 
 ```bash
 # Run tests
 cd custom_nodes/TEX_Wrangle
-python -m pytest tests/test_tex.py -v    # 468 sub-tests expected
+python -m pytest tests/test_tex.py -v    # 61 tests expected
 ```
 
 ## License

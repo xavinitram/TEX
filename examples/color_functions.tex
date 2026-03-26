@@ -1,0 +1,30 @@
+// Reusable color grading functions
+// Shows how to build a mini function library for color work
+
+vec3 gain(vec3 color, float g) {
+    return pow(color, vec3(1.0 / max(g, 0.001)));
+}
+
+vec3 gamma(vec3 color, float g) {
+    return pow(color, vec3(g));
+}
+
+float luminance(float r, float g, float b) {
+    return r * 0.2126 + g * 0.7152 + b * 0.0722;
+}
+
+vec3 saturate_color(vec3 color, float amount) {
+    float lum = luminance(color.r, color.g, color.b);
+    return lerp(vec3(lum), color, amount);
+}
+
+f$gain_val = 1.0;
+f$gamma_val = 1.0;
+f$saturation = 1.0;
+
+vec3 c = @image.rgb;
+c = gain(c, $gain_val);
+c = gamma(c, $gamma_val);
+c = saturate_color(c, $saturation);
+
+@OUT = c;

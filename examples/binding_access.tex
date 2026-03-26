@@ -1,0 +1,25 @@
+// Binding access syntax: brackets for fetch, parens for sample
+// @image[ix, iy] = fetch at pixel coords (nearest neighbor)
+// @image(u, v)   = sample at UV coords (bilinear interpolation)
+//
+// This example creates a magnifying glass effect by mixing
+// nearest-neighbor and bilinear sampling
+
+f$zoom = 2.0;
+f$cx = 0.5;
+f$cy = 0.5;
+
+// Distance from center
+float dx = u - $cx;
+float dy = v - $cy;
+float dist = sqrt(dx * dx + dy * dy);
+
+// Inside the lens: zoom in with bilinear sampling
+// Outside: sharp pixel fetch
+if (dist < 0.2) {
+    float zoom_u = $cx + dx / $zoom;
+    float zoom_v = $cy + dy / $zoom;
+    @OUT = @image(zoom_u, zoom_v);
+} else {
+    @OUT = @image[ix, iy];
+}

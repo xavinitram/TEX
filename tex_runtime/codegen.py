@@ -18,15 +18,17 @@ code and caught by the generated loop wrapper.
 """
 from __future__ import annotations
 
-import math
 from typing import Any
 
 from ..tex_compiler.ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop,
     ExprStatement, BreakStmt, ContinueStmt, ParamDecl, ArrayDecl,
+    FunctionDef, ReturnStmt,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor,
     MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral,
+    BindingIndexAccess, BindingSampleAccess,
+    try_extract_static_range,
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP
 
@@ -74,6 +76,40 @@ def try_compile(program: Program, type_map: dict[int, TEXType]) -> Any | None:
         return None
 
 
+# Stdlib functions that are simple torch.XXX(arg) wrappers.
+# In codegen, arguments are always tensors so _to_tensor is a no-op.
+# We emit _torch.XXX(arg) directly, avoiding dict lookup + function call + _to_tensor.
+_INLINE_TORCH_1ARG: dict[str, str] = {
+    "sin": "sin", "cos": "cos", "tan": "tan",
+    "asin": "asin", "acos": "acos", "atan": "atan",
+    "sinh": "sinh", "cosh": "cosh", "tanh": "tanh",
+    "exp": "exp", "abs": "abs",
+    "floor": "floor", "ceil": "ceil", "round": "round",
+    "sign": "sign",
+    "degrees": "rad2deg", "radians": "deg2rad",
+}
+
+# 2-arg torch functions: fn(a, b) -> torch.XXX(a, b)
+_INLINE_TORCH_2ARG: dict[str, str] = {
+    "max": "maximum", "min": "minimum",
+    "atan2": "atan2", "hypot": "hypot",
+}
+
+
+def _body_has_break_continue(stmts: list[ASTNode]) -> bool:
+    """Check if a list of statements contains break or continue (not in nested loops)."""
+    for stmt in stmts:
+        if isinstance(stmt, (BreakStmt, ContinueStmt)):
+            return True
+        if isinstance(stmt, IfElse):
+            if _body_has_break_continue(stmt.then_body):
+                return True
+            if stmt.else_body and _body_has_break_continue(stmt.else_body):
+                return True
+        # Don't recurse into nested loops — their break/continue is local to them
+    return False
+
+
 class _CodeGen:
     """Generates Python source code from a TEX AST."""
 
@@ -81,7 +117,14 @@ class _CodeGen:
         self.type_map = type_map
         self._tmp_counter = 0
         self._lines: list[str] = []
+        self._preamble: list[str] = []  # hoisted constant assignments
         self._indent = 1  # Start at 1 (inside function body)
+        self._const_cache: dict[float, str] = {}  # value → variable name
+        self._vec_const_cache: dict[tuple, str] = {}  # (v1, v2, ...) → variable name
+        self._range_cache: dict[tuple, str] = {}  # (start, stop, step) → variable name
+        # Local variable mapping: TEX var name → Python local var name.
+        # When set, Identifier emission uses locals instead of _env[name].
+        self._local_vars: dict[str, str] = {}
 
     def _tmp(self) -> str:
         """Generate a unique temporary variable name."""
@@ -93,28 +136,59 @@ class _CodeGen:
         self._lines.append("    " * self._indent + line)
 
     def _get_const(self, value: float) -> str:
-        """Return an inline expression for a numeric constant tensor.
+        """Return a variable name for a numeric constant tensor.
 
-        We inline the _torch.tensor() call rather than hoisting to a local
-        variable because torch.compile/dynamo may split the generated function
-        into multiple subgraphs — local variables assigned in one subgraph
-        are not visible in resume functions of subsequent subgraphs.
+        Constants are hoisted to the function preamble (before any loops),
+        so each unique value is created once per execution regardless of
+        how many times or where it appears in the source.
         """
-        return f"_torch.tensor({value!r}, dtype=_torch.float32, device=_dev)"
+        cached = self._const_cache.get(value)
+        if cached is not None:
+            return cached
+        var = self._tmp()
+        self._preamble.append(f"    {var} = _torch.scalar_tensor({value!r}, dtype=_torch.float32, device=_dev)")
+        self._const_cache[value] = var
+        return var
 
     def emit_program(self, program: Program):
-        """Emit code for the entire program."""
+        """Emit code for the entire program.
+
+        All env variables are pre-registered as Python locals to avoid
+        _env dict lookups on every read/write. This produces cleaner code
+        for TorchInductor (no dict guard overhead) and is faster in eager
+        mode too (local variable access is faster than dict access).
+        """
+        # Register all program-level env vars as locals
+        all_env_vars, _ = self._collect_modified_vars(program.statements)
+        for vname in sorted(all_env_vars):
+            self._local_vars[vname] = f"_lv_{vname}"
+
+        # Initialize locals from _env (for builtins like u, v, ix, iy that
+        # the caller pre-populates in the env dict)
+        for vname in sorted(all_env_vars):
+            local = self._local_vars[vname]
+            self._preamble.append(f"    {local} = _env.get({vname!r})")
+
         for stmt in program.statements:
             self._emit_stmt(stmt)
 
+        # Write back all locals to _env so the caller can read results
+        for vname in sorted(all_env_vars):
+            local = self._local_vars[vname]
+            self._emit(f"_env[{vname!r}] = {local}")
+
     def build(self) -> Any:
         """Compile the generated source to a callable function."""
+        preamble = "\n".join(self._preamble)
         body = "\n".join(self._lines)
+        # Hoisted constants go before the main body so they're available
+        # inside loops without per-iteration tensor creation.
+        func_body = f"{preamble}\n{body}" if preamble else body
         func_src = (
             "def _tex_fn(_env, _bind, _fns, _dev, _sp, "
             "_torch, _bp, _es, _tw, _math, _SAFE_EPS, _CMAP, _MAX_ITER, "
             "_CgBreak, _CgContinue):\n"
-            f"{body}\n"
+            f"{func_body}\n"
         )
         namespace: dict[str, Any] = {}
         code_obj = compile(func_src, "<tex_codegen>", "exec")
@@ -149,47 +223,47 @@ class _CodeGen:
                 self._emit("raise _CgContinue()")
         elif isinstance(stmt, ArrayDecl):
             raise _Unsupported("ArrayDecl")
+        elif isinstance(stmt, (FunctionDef, ReturnStmt)):
+            raise _Unsupported("UserFunction")
         else:
             raise _Unsupported(f"Unknown statement: {type(stmt).__name__}")
+
+    def _var_target(self, name: str) -> str:
+        """Return the Python expression for writing to a TEX variable."""
+        local = self._local_vars.get(name)
+        return local if local is not None else f"_env[{name!r}]"
 
     def _emit_var_decl(self, stmt: VarDecl):
         if stmt.initializer:
             expr = self._emit_expr(stmt.initializer)
-            self._emit(f"_env[{stmt.name!r}] = {expr}")
+            self._emit(f"{self._var_target(stmt.name)} = {expr}")
         else:
             # Default initialization based on type
+            tgt = self._var_target(stmt.name)
             declared = self.type_map.get(id(stmt), TEXType.FLOAT)
             if declared == TEXType.STRING:
-                self._emit(f"_env[{stmt.name!r}] = ''")
-            elif declared == TEXType.VEC3:
+                self._emit(f"{tgt} = ''")
+            elif declared.is_vector:
+                ch = declared.channels
                 self._emit(f"if _sp:")
                 self._indent += 1
-                self._emit(f"_env[{stmt.name!r}] = _torch.zeros(*_sp, 3, dtype=_torch.float32, device=_dev)")
+                self._emit(f"{tgt} = _torch.zeros(*_sp, {ch}, dtype=_torch.float32, device=_dev)")
                 self._indent -= 1
                 self._emit(f"else:")
                 self._indent += 1
-                self._emit(f"_env[{stmt.name!r}] = _torch.zeros(3, dtype=_torch.float32, device=_dev)")
-                self._indent -= 1
-            elif declared == TEXType.VEC4:
-                self._emit(f"if _sp:")
-                self._indent += 1
-                self._emit(f"_env[{stmt.name!r}] = _torch.zeros(*_sp, 4, dtype=_torch.float32, device=_dev)")
-                self._indent -= 1
-                self._emit(f"else:")
-                self._indent += 1
-                self._emit(f"_env[{stmt.name!r}] = _torch.zeros(4, dtype=_torch.float32, device=_dev)")
+                self._emit(f"{tgt} = _torch.zeros({ch}, dtype=_torch.float32, device=_dev)")
                 self._indent -= 1
             elif declared.is_matrix:
                 n = declared.mat_size
-                self._emit(f"_env[{stmt.name!r}] = _torch.zeros({n}, {n}, dtype=_torch.float32, device=_dev)")
+                self._emit(f"{tgt} = _torch.zeros({n}, {n}, dtype=_torch.float32, device=_dev)")
             else:
-                self._emit(f"_env[{stmt.name!r}] = _torch.tensor(0.0, dtype=_torch.float32, device=_dev)")
+                self._emit(f"{tgt} = _torch.scalar_tensor(0.0, dtype=_torch.float32, device=_dev)")
 
     def _emit_assignment(self, stmt: Assignment):
-        value_expr = self._emit_expr(stmt.value)
         target = stmt.target
+        value_expr = self._emit_expr(stmt.value)
         if isinstance(target, Identifier):
-            self._emit(f"_env[{target.name!r}] = {value_expr}")
+            self._emit(f"{self._var_target(target.name)} = {value_expr}")
         elif isinstance(target, BindingRef):
             self._emit(f"_bind[{target.name!r}] = {value_expr}")
         elif isinstance(target, ChannelAccess):
@@ -213,7 +287,7 @@ class _CodeGen:
         self._emit(f"{tmp}[..., {idx}] = _es({value_expr}, {tmp}.shape[:-1])")
 
         if isinstance(target.object, Identifier):
-            self._emit(f"_env[{target.object.name!r}] = {tmp}")
+            self._emit(f"{self._var_target(target.object.name)} = {tmp}")
         elif isinstance(target.object, BindingRef):
             self._emit(f"_bind[{target.object.name!r}] = {tmp}")
         else:
@@ -260,7 +334,11 @@ class _CodeGen:
         self._indent -= 1
 
     def _emit_spatial_if_else(self, stmt: IfElse, cond_var: str):
-        """Emit spatial if/else with selective cloning and torch.where merge."""
+        """Emit spatial if/else with selective cloning and torch.where merge.
+
+        Uses local variables for env vars when available (program-level locals),
+        falls back to _env dict for any vars not in _local_vars.
+        """
         # Collect modified variables (same analysis as interpreter)
         then_mods = self._collect_modified_vars(stmt.then_body)
         else_mods = self._collect_modified_vars(stmt.else_body) if stmt.else_body else (set(), set())
@@ -276,15 +354,17 @@ class _CodeGen:
                     self._emit_stmt(s)
             return
 
-        snap_env = self._tmp()
-        snap_bind = self._tmp()
-        then_env = self._tmp()
-        then_bind = self._tmp()
+        # Snapshot modified env vars (using locals where available)
+        # Some vars may be None if only declared inside one branch (not yet assigned)
+        snap_vars: dict[str, str] = {}  # env_var_name -> snapshot_tmp_name
+        for k in all_env_mods:
+            snap = self._tmp()
+            snap_vars[k] = snap
+            src = self._var_target(k)
+            self._emit(f"{snap} = {src}.clone() if ({src} is not None and _torch.is_tensor({src})) else {src}")
 
-        # Snapshot modified variables
-        env_mod_repr = repr(all_env_mods)
+        snap_bind = self._tmp()
         bind_mod_repr = repr(all_bind_mods)
-        self._emit(f"{snap_env} = {{k: _env[k].clone() if _torch.is_tensor(_env[k]) else _env[k] for k in {env_mod_repr} if k in _env}}")
         self._emit(f"{snap_bind} = {{k: _bind[k].clone() if _torch.is_tensor(_bind[k]) else _bind[k] for k in {bind_mod_repr} if k in _bind}}")
 
         # Execute then-branch
@@ -292,11 +372,20 @@ class _CodeGen:
             self._emit_stmt(s)
 
         # Capture then-state
-        self._emit(f"{then_env} = {{k: _env.get(k) for k in {env_mod_repr}}}")
+        then_vars: dict[str, str] = {}
+        for k in all_env_mods:
+            then_tmp = self._tmp()
+            then_vars[k] = then_tmp
+            src = self._var_target(k)
+            self._emit(f"{then_tmp} = {src}")
+
+        then_bind = self._tmp()
         self._emit(f"{then_bind} = {{k: _bind.get(k) for k in {bind_mod_repr}}}")
 
         # Restore snapshot
-        self._emit(f"_env.update({snap_env})")
+        for k in all_env_mods:
+            tgt = self._var_target(k)
+            self._emit(f"{tgt} = {snap_vars[k]}")
         self._emit(f"_bind.update({snap_bind})")
 
         if stmt.else_body:
@@ -308,17 +397,17 @@ class _CodeGen:
         self._emit(f"{cond_bool} = ({cond_var} > 0.5)")
 
         for k in all_env_mods:
-            tv = self._tmp()
+            tv = then_vars[k]
+            tgt = self._var_target(k)
             ev = self._tmp()
-            self._emit(f"{tv} = {then_env}.get({k!r})")
-            self._emit(f"{ev} = _env.get({k!r})")
+            self._emit(f"{ev} = {tgt}")
             self._emit(f"if {tv} is not None and {ev} is not None and _torch.is_tensor({tv}) and _torch.is_tensor({ev}):")
             self._indent += 1
-            self._emit(f"_env[{k!r}] = _tw({cond_bool}, {tv}, {ev})")
+            self._emit(f"{tgt} = _tw({cond_bool}, {tv}, {ev})")
             self._indent -= 1
             self._emit(f"elif {tv} is not None:")
             self._indent += 1
-            self._emit(f"_env[{k!r}] = {tv}")
+            self._emit(f"{tgt} = {tv}")
             self._indent -= 1
 
         for k in all_bind_mods:
@@ -369,12 +458,180 @@ class _CodeGen:
                 bind_names |= b
         return env_vars, bind_names
 
+    def _collect_read_vars(self, stmts: list[ASTNode]) -> set[str]:
+        """Collect all Identifier names read in a list of statements."""
+        names: set[str] = set()
+        for stmt in stmts:
+            self._collect_reads_node(stmt, names)
+        return names
+
+    def _collect_reads_node(self, node: ASTNode, names: set[str]):
+        """Recursively collect Identifier names read in an AST node."""
+        if isinstance(node, Identifier):
+            names.add(node.name)
+        elif isinstance(node, BinOp):
+            self._collect_reads_node(node.left, names)
+            self._collect_reads_node(node.right, names)
+        elif isinstance(node, UnaryOp):
+            self._collect_reads_node(node.operand, names)
+        elif isinstance(node, TernaryOp):
+            self._collect_reads_node(node.condition, names)
+            self._collect_reads_node(node.true_expr, names)
+            self._collect_reads_node(node.false_expr, names)
+        elif isinstance(node, FunctionCall):
+            for a in node.args:
+                self._collect_reads_node(a, names)
+        elif isinstance(node, VecConstructor):
+            for a in node.args:
+                self._collect_reads_node(a, names)
+        elif isinstance(node, CastExpr):
+            self._collect_reads_node(node.expr, names)
+        elif isinstance(node, ChannelAccess):
+            self._collect_reads_node(node.object, names)
+        elif isinstance(node, Assignment):
+            self._collect_reads_node(node.value, names)
+            # Also collect reads from target (e.g., channel access on identifier)
+            if isinstance(node.target, ChannelAccess):
+                self._collect_reads_node(node.target.object, names)
+        elif isinstance(node, VarDecl):
+            if node.initializer:
+                self._collect_reads_node(node.initializer, names)
+        elif isinstance(node, IfElse):
+            self._collect_reads_node(node.condition, names)
+            for s in node.then_body:
+                self._collect_reads_node(s, names)
+            if node.else_body:
+                for s in node.else_body:
+                    self._collect_reads_node(s, names)
+        elif isinstance(node, ExprStatement):
+            self._collect_reads_node(node.expr, names)
+        elif isinstance(node, ForLoop):
+            # Recurse into nested loops so outer scope can localize all vars
+            for s in node.body:
+                self._collect_reads_node(s, names)
+        elif isinstance(node, WhileLoop):
+            self._collect_reads_node(node.condition, names)
+            for s in node.body:
+                self._collect_reads_node(s, names)
+
+    def _emit_body_with_flow(self, body: list[ASTNode]):
+        """Emit loop body wrapped in try/except for break/continue signals."""
+        self._emit("try:")
+        self._indent += 1
+        for s in body:
+            self._emit_stmt(s)
+        self._indent -= 1
+        self._emit("except _CgBreak:")
+        self._indent += 1
+        self._emit("break")
+        self._indent -= 1
+        self._emit("except _CgContinue:")
+        self._indent += 1
+        self._emit("pass")
+        self._indent -= 1
+
+    def _emit_cond_break(self, cond_node: ASTNode):
+        """Emit scalar/spatial condition check that breaks if false."""
+        cond_expr = self._emit_expr(cond_node)
+        cc = self._tmp()
+        self._emit(f"{cc} = {cond_expr}")
+        self._emit(f"if {cc}.dim() == 0:")
+        self._indent += 1
+        self._emit(f"if {cc}.item() <= 0.5: break")
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        self._emit(f"if ({cc} > 0.5).float().sum().item() == 0: break")
+        self._indent -= 1
+
+    def _emit_iter_limit(self, iter_var: str, label: str):
+        """Emit post-loop iteration limit check."""
+        self._emit(f"if {iter_var} >= _MAX_ITER:")
+        self._indent += 1
+        self._emit(f"raise RuntimeError('{label} loop exceeded maximum iteration limit (' + str(_MAX_ITER) + '). Check your loop condition.')")
+        self._indent -= 1
+
     def _emit_for_loop(self, stmt: ForLoop):
-        """Emit a for loop with exception-based break/continue."""
-        # Emit initializer
+        """Emit a for loop, optimized for static ranges."""
+        # Try fully static loop: pre-compute Python range() — zero per-iteration overhead
+        static_range = try_extract_static_range(stmt)
+        if static_range is not None:
+            loop_var, start, stop, step = static_range
+            n = abs(stop - start) // max(abs(step), 1)
+            if n > 1024:
+                self._emit(f"raise RuntimeError('For loop would exceed {1024} iterations')")
+                return
+
+            has_flow_control = _body_has_break_continue(stmt.body)
+
+            # Collect vars modified AND read in the loop body so we can use
+            # local Python variables instead of _env[name] dict lookups.
+            modified_vars, _ = self._collect_modified_vars(stmt.body)
+            read_vars = self._collect_read_vars(stmt.body)
+            # All vars touched in the loop (modified + read-only + loop var)
+            all_vars = modified_vars | read_vars
+            all_vars.add(loop_var)
+            # Vars that need writeback after the loop
+            writeback_vars = modified_vars | {loop_var}
+
+            # Register local variables for all vars used in this loop.
+            # If a var is already a local (from an outer loop), reuse its name.
+            saved_locals = {}
+            for vname in all_vars:
+                prev = self._local_vars.get(vname)
+                saved_locals[vname] = prev
+                if prev is None:
+                    self._local_vars[vname] = f"_lv_{vname}"
+                # else: keep the outer loop's local — already a Python local
+
+            # Initialize local vars from _env ONLY for vars not already locals
+            loop_var_local = self._local_vars[loop_var]
+            for vname in all_vars:
+                if vname != loop_var and saved_locals[vname] is None:
+                    local = self._local_vars[vname]
+                    self._emit(f"{local} = _env.get({vname!r})")
+
+            # Pre-allocate loop variable tensors via arange + unbind.
+            # Hoisted to preamble so nested loops don't re-create each outer iteration.
+            range_key = (start, stop, step)
+            vals_tmp = self._range_cache.get(range_key)
+            if vals_tmp is None:
+                vals_tmp = self._tmp()
+                self._preamble.append(
+                    f"    {vals_tmp} = _torch.arange({start}, {stop}, {step}, dtype=_torch.float32, device=_dev).unbind(0)"
+                )
+                self._range_cache[range_key] = vals_tmp
+            self._emit(f"for _i_idx in range({n}):")
+            self._indent += 1
+            self._emit(f"{loop_var_local} = {vals_tmp}[_i_idx]")
+
+            if has_flow_control:
+                self._emit_body_with_flow(stmt.body)
+            else:
+                for s in stmt.body:
+                    self._emit_stmt(s)
+
+            self._indent -= 1
+
+            # Write back modified vars to _env ONLY if they weren't already locals
+            # from an outer scope (outer locals are still accessible directly).
+            for vname in writeback_vars:
+                if saved_locals[vname] is None:
+                    local = self._local_vars[vname]
+                    self._emit(f"_env[{vname!r}] = {local}")
+
+            # Restore previous local var mappings
+            for vname, prev in saved_locals.items():
+                if prev is None:
+                    if vname in self._local_vars:
+                        del self._local_vars[vname]
+                else:
+                    self._local_vars[vname] = prev
+            return
+
+        # General case: emit initializer + while loop
         self._emit_stmt(stmt.init)
 
-        # Try static bound extraction (same as interpreter)
         static = self._try_static_bound(stmt)
         iter_var = self._tmp()
 
@@ -386,7 +643,7 @@ class _CodeGen:
         if static is not None:
             loop_var, bound, is_le = static
             cv = self._tmp()
-            self._emit(f"{cv} = _env[{loop_var!r}]")
+            self._emit(f"{cv} = {self._var_target(loop_var)}")
             self._emit(f"if {cv}.dim() == 0:")
             self._indent += 1
             ci = self._tmp()
@@ -402,43 +659,16 @@ class _CodeGen:
             self._emit(f"if ({cond_expr} > 0.5).float().sum().item() == 0: break")
             self._indent -= 1
         else:
-            cond_expr = self._emit_expr(stmt.condition)
-            cc = self._tmp()
-            self._emit(f"{cc} = {cond_expr}")
-            self._emit(f"if {cc}.dim() == 0:")
-            self._indent += 1
-            self._emit(f"if {cc}.item() <= 0.5: break")
-            self._indent -= 1
-            self._emit(f"else:")
-            self._indent += 1
-            self._emit(f"if ({cc} > 0.5).float().sum().item() == 0: break")
-            self._indent -= 1
+            self._emit_cond_break(stmt.condition)
 
-        # Body wrapped in try/except for break/continue
-        self._emit(f"try:")
-        self._indent += 1
-        for s in stmt.body:
-            self._emit_stmt(s)
-        self._indent -= 1
-        self._emit(f"except _CgBreak:")
-        self._indent += 1
-        self._emit(f"break")
-        self._indent -= 1
-        self._emit(f"except _CgContinue:")
-        self._indent += 1
-        self._emit(f"pass")
-        self._indent -= 1
+        self._emit_body_with_flow(stmt.body)
 
         # Update always executes (even after continue)
         self._emit_stmt(stmt.update)
         self._emit(f"{iter_var} += 1")
         self._indent -= 1
 
-        # Check iteration limit after loop
-        self._emit(f"if {iter_var} >= _MAX_ITER:")
-        self._indent += 1
-        self._emit(f"raise RuntimeError('For loop exceeded maximum iteration limit (' + str(_MAX_ITER) + '). Check your loop condition.')")
-        self._indent -= 1
+        self._emit_iter_limit(iter_var, "For")
 
     def _try_static_bound(self, stmt: ForLoop) -> tuple[str, int, bool] | None:
         """Try to extract static loop bounds."""
@@ -460,40 +690,13 @@ class _CodeGen:
         self._emit(f"while {iter_var} < _MAX_ITER:")
         self._indent += 1
 
-        cond_expr = self._emit_expr(stmt.condition)
-        cc = self._tmp()
-        self._emit(f"{cc} = {cond_expr}")
-        self._emit(f"if {cc}.dim() == 0:")
-        self._indent += 1
-        self._emit(f"if {cc}.item() <= 0.5: break")
-        self._indent -= 1
-        self._emit(f"else:")
-        self._indent += 1
-        self._emit(f"if ({cc} > 0.5).float().sum().item() == 0: break")
-        self._indent -= 1
-
-        # Body wrapped in try/except for break/continue
-        self._emit(f"try:")
-        self._indent += 1
-        for s in stmt.body:
-            self._emit_stmt(s)
-        self._indent -= 1
-        self._emit(f"except _CgBreak:")
-        self._indent += 1
-        self._emit(f"break")
-        self._indent -= 1
-        self._emit(f"except _CgContinue:")
-        self._indent += 1
-        self._emit(f"pass")
-        self._indent -= 1
+        self._emit_cond_break(stmt.condition)
+        self._emit_body_with_flow(stmt.body)
 
         self._emit(f"{iter_var} += 1")
         self._indent -= 1
 
-        # Check iteration limit after loop
-        self._emit(f"if {iter_var} >= _MAX_ITER:")
-        self._indent += 1
-        self._emit(f"raise RuntimeError('While loop exceeded maximum iteration limit (' + str(_MAX_ITER) + '). Check your loop condition.')")
+        self._emit_iter_limit(iter_var, "While")
         self._indent -= 1
 
     # ── Expression emission ─────────────────────────────────────────────
@@ -511,6 +714,9 @@ class _CodeGen:
             return repr(node.value)
 
         if isinstance(node, Identifier):
+            local = self._local_vars.get(node.name)
+            if local is not None:
+                return local
             return f"_env[{node.name!r}]"
 
         if isinstance(node, BindingRef):
@@ -546,6 +752,26 @@ class _CodeGen:
         if isinstance(node, ArrayLiteral):
             raise _Unsupported("ArrayLiteral")
 
+        if isinstance(node, BindingIndexAccess):
+            binding = self._emit_expr(node.binding)
+            args = [self._emit_expr(a) for a in node.args]
+            tmp = self._tmp()
+            if len(args) == 3:
+                self._emit(f"{tmp} = _fns['fetch_frame']({binding}, {args[2]}, {args[0]}, {args[1]})")
+            else:
+                self._emit(f"{tmp} = _fns['fetch']({binding}, {args[0]}, {args[1]})")
+            return tmp
+
+        if isinstance(node, BindingSampleAccess):
+            binding = self._emit_expr(node.binding)
+            args = [self._emit_expr(a) for a in node.args]
+            tmp = self._tmp()
+            if len(args) == 3:
+                self._emit(f"{tmp} = _fns['sample_frame']({binding}, {args[2]}, {args[0]}, {args[1]})")
+            else:
+                self._emit(f"{tmp} = _fns['sample']({binding}, {args[0]}, {args[1]})")
+            return tmp
+
         raise _Unsupported(f"Unknown expression: {type(node).__name__}")
 
     def _emit_channel_access(self, node: ChannelAccess) -> str:
@@ -562,6 +788,17 @@ class _CodeGen:
         indices = [CHANNEL_MAP.get(ch) for ch in channels]
         if any(i is None for i in indices):
             raise _Unsupported(f"Invalid swizzle: {channels}")
+
+        # Contiguous slice optimization: .rgb (0,1,2) or .rg (0,1) → [..., :N]
+        # This is a zero-copy view instead of 3 index ops + torch.stack.
+        if indices == list(range(indices[0], indices[0] + len(indices))):
+            start = indices[0]
+            end = start + len(indices)
+            if start == 0:
+                return f"{base}[..., :{end}]"
+            else:
+                return f"{base}[..., {start}:{end}]"
+
         parts = ", ".join(f"{base}[..., {i}]" for i in indices)
         tmp = self._tmp()
         self._emit(f"{tmp} = _torch.stack([{parts}], dim=-1)")
@@ -590,8 +827,8 @@ class _CodeGen:
         # Check if broadcasting is needed (scalar vs vector mixed)
         needs_broadcast = False
         if lt is not None and rt is not None:
-            l_vec = lt.is_vector or lt == TEXType.VEC3 or lt == TEXType.VEC4
-            r_vec = rt.is_vector or rt == TEXType.VEC3 or rt == TEXType.VEC4
+            l_vec = lt.is_vector
+            r_vec = rt.is_vector
             l_scalar = not l_vec and not lt.is_matrix
             r_scalar = not r_vec and not rt.is_matrix
             if (l_vec and r_scalar) or (l_scalar and r_vec):
@@ -655,18 +892,88 @@ class _CodeGen:
         return tmp
 
     def _emit_function_call(self, node: FunctionCall) -> str:
+        name = node.name
         args = [self._emit_expr(a) for a in node.args]
-        args_str = ", ".join(args)
         tmp = self._tmp()
-        self._emit(f"{tmp} = _fns[{node.name!r}]({args_str})")
-        # Ensure result is tensor if not string/list
-        self._emit(f"if not isinstance({tmp}, (str, list, _torch.Tensor)): {tmp} = _torch.tensor(float({tmp}), dtype=_torch.float32, device=_dev)")
+
+        # Try to inline simple torch functions directly (avoids dict lookup +
+        # wrapper function call + _to_tensor overhead per call).
+        if len(args) == 1:
+            torch_fn = _INLINE_TORCH_1ARG.get(name)
+            if torch_fn is not None:
+                self._emit(f"{tmp} = _torch.{torch_fn}({args[0]})")
+                return tmp
+        elif len(args) == 2:
+            # pow(base, exp): use exp-log trick (~3x faster on spatial tensors)
+            if name == "pow":
+                self._emit(f"{tmp} = _torch.exp(_torch.log({args[0]}.clamp(min=_SAFE_EPS)) * {args[1]})")
+                return tmp
+            torch_fn = _INLINE_TORCH_2ARG.get(name)
+            if torch_fn is not None:
+                self._emit(f"{tmp} = _torch.{torch_fn}({args[0]}, {args[1]})")
+                return tmp
+
+        # Inline lerp: torch.lerp(a, b, t) — very common in TEX
+        if name == "lerp" and len(args) == 3:
+            self._emit(f"{tmp} = _torch.lerp({args[0]}, {args[1]}, {args[2]})")
+            return tmp
+
+        # Inline clamp: torch.clamp(x, min, max)
+        if name == "clamp" and len(args) == 3:
+            self._emit(f"{tmp} = _torch.clamp({args[0]}, {args[1]}, {args[2]})")
+            return tmp
+
+        # Inline dot: einsum is 4× faster than mul+sum on CPU
+        if name == "dot" and len(args) == 2:
+            self._emit(f"{tmp} = _torch.einsum('...c,...c->...', {args[0]}, {args[1]})")
+            return tmp
+
+        # Inline distance: linalg.vector_norm(a - b, dim=-1)
+        if name == "distance" and len(args) == 2:
+            self._emit(f"{tmp} = _torch.linalg.vector_norm({args[0]} - {args[1]}, dim=-1)")
+            return tmp
+
+        # Inline normalize: a / (norm(a) + eps)
+        if name == "normalize" and len(args) == 1:
+            self._emit(f"{tmp} = {args[0]} / (_torch.linalg.vector_norm({args[0]}, dim=-1, keepdim=True) + _SAFE_EPS)")
+            return tmp
+
+        # Inline length: linalg.vector_norm(a, dim=-1)
+        if name == "length" and len(args) == 1:
+            self._emit(f"{tmp} = _torch.linalg.vector_norm({args[0]}, dim=-1)")
+            return tmp
+
+        # General case: call through stdlib dict
+        args_str = ", ".join(args)
+        self._emit(f"{tmp} = _fns[{name!r}]({args_str})")
+        # Skip isinstance guard when the return type is known to be numeric
+        # (all numeric stdlib functions return tensors directly).
+        ret_type = self.type_map.get(id(node))
+        if ret_type is None or ret_type == TEXType.STRING:
+            self._emit(f"if not isinstance({tmp}, (str, list, _torch.Tensor)): {tmp} = _torch.scalar_tensor(float({tmp}), dtype=_torch.float32, device=_dev)")
         return tmp
 
     def _emit_vec_constructor(self, node: VecConstructor) -> str:
+        n = node.size
+
+        # Optimization: hoist all-literal vec constructors to preamble.
+        # vec3(0.2126, 0.7152, 0.0722) → single pre-computed tensor reused on every call.
+        if len(node.args) > 1 and all(isinstance(a, NumberLiteral) for a in node.args) and len(node.args) == n:
+            values = tuple(a.value for a in node.args)
+            cached = self._vec_const_cache.get(values)
+            if cached is not None:
+                return cached
+            var = self._tmp()
+            vals_repr = ", ".join(repr(v) for v in values)
+            self._preamble.append(
+                f"    {var} = _torch.tensor([{vals_repr}], dtype=_torch.float32, device=_dev)"
+                f".reshape(" + ", ".join(["1"] * 3) + f", {n}).expand(*_sp, {n})"
+            )
+            self._vec_const_cache[values] = var
+            return var
+
         args = [self._emit_expr(a) for a in node.args]
         tmp = self._tmp()
-        n = node.size
 
         if len(args) == 1:
             # Check compile-time type for identity case
@@ -675,8 +982,10 @@ class _CodeGen:
                 # vec4(vec4_val) — identity / type cast
                 self._emit(f"{tmp} = {args[0]}")
             else:
-                # Broadcast: vec4(0.5) -> [0.5, 0.5, 0.5, 0.5]
-                components = ", ".join([f"_es({args[0]}, _sp)"] * n)
+                # Broadcast: vec3(scalar) → call _es once, then expand
+                es_tmp = self._tmp()
+                self._emit(f"{es_tmp} = _es({args[0]}, _sp)")
+                components = ", ".join([es_tmp] * n)
                 self._emit(f"{tmp} = _torch.stack([{components}], dim=-1)")
         else:
             # Flatten composite args using compile-time types:
@@ -714,6 +1023,13 @@ class _CodeGen:
 
     def _emit_cast(self, node: CastExpr) -> str:
         value = self._emit_expr(node.expr)
+
+        # Fast path: float cast on already-float/int source is a no-op
+        if node.target_type == "float":
+            src_type = self.type_map.get(id(node.expr))
+            if src_type is not None and src_type in (TEXType.FLOAT, TEXType.INT):
+                return value
+
         tmp = self._tmp()
 
         if node.target_type == "string":

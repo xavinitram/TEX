@@ -101,6 +101,21 @@ class ContinueStmt(ASTNode):
 
 
 @dataclass(slots=True)
+class FunctionDef(ASTNode):
+    """User-defined function: `float blend(float a, float b, float t) { ... }`"""
+    return_type: str = ""                # "float", "int", "vec3", "vec4", "string"
+    name: str = ""
+    params: list[tuple[str, str]] = field(default_factory=list)  # [(type, name), ...]
+    body: list[ASTNode] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ReturnStmt(ASTNode):
+    """Return statement inside a user-defined function."""
+    value: ASTNode = None
+
+
+@dataclass(slots=True)
 class ExprStatement(ASTNode):
     """A bare expression used as a statement (e.g. function call)."""
     expr: ASTNode = None
@@ -233,6 +248,20 @@ class ArrayLiteral(ASTNode):
 
 
 @dataclass(slots=True)
+class BindingIndexAccess(ASTNode):
+    """Binding fetch access: `@Image[ix, iy]` or `@Image[ix, iy, frame]`"""
+    binding: ASTNode = None              # BindingRef
+    args: list[ASTNode] = field(default_factory=list)  # 2 args (x, y) or 3 args (x, y, frame)
+
+
+@dataclass(slots=True)
+class BindingSampleAccess(ASTNode):
+    """Binding sample access: `@Image(u, v)` or `@Image(u, v, frame)`"""
+    binding: ASTNode = None              # BindingRef
+    args: list[ASTNode] = field(default_factory=list)  # 2 args (u, v) or 3 args (u, v, frame)
+
+
+@dataclass(slots=True)
 class ErrorNode(ASTNode):
     """Placeholder for a statement that failed to parse.
 
@@ -240,3 +269,55 @@ class ErrorNode(ASTNode):
     (type checker, interpreter) can skip it without cascade errors.
     """
     error_message: str = ""
+
+
+def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
+    """Extract a fully static for-loop as (var_name, start, stop, step).
+
+    Matches: for (int VAR = START; VAR < END; VAR = VAR + STEP)
+    where START, END, STEP are all NumberLiterals (possibly after constant folding).
+    Returns None if the pattern doesn't match.
+
+    Shared by both the interpreter and codegen to avoid duplication.
+    """
+    init = node.init
+    if not isinstance(init, VarDecl) or init.initializer is None:
+        return None
+    if not isinstance(init.initializer, NumberLiteral):
+        return None
+    loop_var = init.name
+    start = int(init.initializer.value)
+
+    cond = node.condition
+    if not isinstance(cond, BinOp) or cond.op not in ("<", "<="):
+        return None
+    if not isinstance(cond.left, Identifier) or cond.left.name != loop_var:
+        return None
+    if not isinstance(cond.right, NumberLiteral):
+        return None
+    end = int(cond.right.value)
+    if cond.op == "<=":
+        end += 1
+
+    update = node.update
+    if not isinstance(update, Assignment):
+        return None
+    if not isinstance(update.target, Identifier) or update.target.name != loop_var:
+        return None
+    if not isinstance(update.value, BinOp):
+        return None
+    upd = update.value
+    if not isinstance(upd.left, Identifier) or upd.left.name != loop_var:
+        return None
+    if not isinstance(upd.right, NumberLiteral):
+        return None
+    if upd.op == "+":
+        step = int(upd.right.value)
+    elif upd.op == "-":
+        step = -int(upd.right.value)
+    else:
+        return None
+
+    if step == 0:
+        return None
+    return (loop_var, start, end, step)

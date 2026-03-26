@@ -18,18 +18,18 @@ TEX_Wrangle/
     stdlib_signatures.py   # Function signatures for type checking
   tex_runtime/
     interpreter.py         # Tree-walking tensor evaluator
-    stdlib.py              # Built-in function implementations (101)
+    stdlib.py              # Built-in function implementations (102)
     compiled.py            # torch.compile wrapper with backend cascade
     codegen.py             # AST -> Python function compiler
   js/
     tex_extension.js       # Frontend: auto-socket, CodeMirror 6 editor, help popup
     tex_cm6_bundle.js      # Pre-built CodeMirror 6 bundle (Rollup)
   tests/
-    test_tex.py            # Comprehensive test suite (468 sub-tests)
+    test_tex.py            # Comprehensive test suite (61 tests)
   benchmarks/
     run_benchmarks.py      # Reproducible performance benchmarks
     README.md              # Benchmark usage and result format docs
-  examples/                # Example TEX snippets (36 files)
+  examples/                # Example TEX snippets (42 files)
   .tex_cache/              # Disk cache directory (auto-created, gitignored)
 ```
 
@@ -39,11 +39,21 @@ TEX_Wrangle/
 Source Code
     |
     v
-+---------+     +--------+     +-------------+     +-----------+     +-------------+
-|  Lexer  |---->| Parser |---->| TypeChecker |---->| Optimizer |---->| Interpreter |
-| lexer.py|     |parser.py|    |type_checker |     |optimizer  |     |interpreter  |
-+---------+     +--------+     +-------------+     +-----------+     +-------------+
-  tokens          AST            type_map           optimized AST     tensor result
++---------+     +--------+     +-------------+     +-----------+
+|  Lexer  |---->| Parser |---->| TypeChecker |---->| Optimizer |
+| lexer.py|     |parser.py|    |type_checker |     |optimizer  |
++---------+     +--------+     +-------------+     +-----------+
+  tokens          AST            type_map           optimized AST
+                                                         |
+                                            +------------+------------+
+                                            |                         |
+                                            v                         v
+                                    +-------------+           +-----------+
+                                    | Interpreter |           |  Codegen  |
+                                    |interpreter.py|          |codegen.py |
+                                    +-------------+           +-----------+
+                                     tensor result             Python fn
+                                    (tree-walking)          (exec'd callable)
 ```
 
 **Lexer** (`tex_compiler/lexer.py`): Converts source text into a token stream. Each token has a type (e.g. `NUMBER`, `IDENTIFIER`, `PLUS`), a value, and a source location `(line, column)`.
@@ -54,7 +64,9 @@ Source Code
 
 **Optimizer** (`tex_compiler/optimizer.py`): Constant folding and algebraic simplification pass. Reduces expressions like `x * 1.0` -> `x` and pre-evaluates constant sub-expressions.
 
-**Interpreter** (`tex_runtime/interpreter.py`): Tree-walking evaluator that executes the AST using PyTorch tensor operations. Reads types from `type_map` to guide evaluation (e.g. choosing `torch.where` for if/else). Produces output tensors/strings for all assigned `@name` bindings.
+**Interpreter** (`tex_runtime/interpreter.py`): Tree-walking evaluator that executes the AST using PyTorch tensor operations. Reads types from `type_map` to guide evaluation (e.g. choosing `torch.where` for if/else). Produces output tensors/strings for all assigned `@name` bindings. Used as the default execution path.
+
+**Codegen** (`tex_runtime/codegen.py`): Compiles the AST into a Python function string, then `exec()`s it into a callable. Eliminates per-node dispatch overhead. All env variables are pre-registered as Python locals (`_lv_{name}`) to avoid dict lookups and produce cleaner FX graphs for TorchInductor. Falls back to the interpreter for unsupported patterns (arrays, string operations).
 
 **tex_node.py**: ComfyUI integration layer. Receives ComfyUI inputs (IMAGE, MASK, LATENT, FLOAT, INT, STRING), maps them to TEX types, runs the compiler pipeline, and formats the result back into ComfyUI output.
 
@@ -300,18 +312,18 @@ cd custom_nodes/TEX_Wrangle
 python -m pytest tests/test_tex.py -v
 ```
 
-Expected: 45 test functions (468 sub-tests) passed.
+Expected: 61 test functions passed.
 
 ## Benchmarks
 
 See `benchmarks/README.md` for full documentation. Quick start:
 
 ```bash
-# Run benchmarks on your system
-python benchmarks/run_benchmarks.py
+# 4-scenario benchmark (compile off/on × cold/warm)
+python benchmarks/four_scenario_bench.py
 
-# Compare against v0.4.0 baseline
-python benchmarks/run_benchmarks.py --compare benchmarks/results/v0.4.0.json
+# Legacy synthetic benchmarks
+python benchmarks/run_benchmarks.py
 ```
 
 ## Error Reporting Guidelines

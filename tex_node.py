@@ -229,7 +229,7 @@ class TEXWrangleNode(_BaseClass):
                 "Reference inputs with @name (e.g. @A, @base_image).\n"
                 "Write outputs with @name = expr (e.g. @OUT, @mask, @result).\n"
                 "Add parameter widgets with $name (e.g. f$strength = 0.5).\n"
-                "Supports float, int, vec3, vec4, string types with if/else, for loops, and 60+ stdlib functions.\n"
+                "Supports float, int, vec3, vec4, string types with if/else, for loops, and 100+ stdlib functions.\n"
                 "Click the ? icon for a quick reference."
             ),
             inputs=[

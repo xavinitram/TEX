@@ -3,7 +3,9 @@ TEX Parser — recursive-descent parser producing an AST from tokens.
 
 Grammar (simplified):
   program     = statement*
-  statement   = var_decl | param_decl | assignment | if_else | for_loop | while_loop | expr_stmt
+  statement   = func_def | var_decl | param_decl | assignment | if_else | for_loop | while_loop | return_stmt | expr_stmt
+  func_def    = type_kw IDENT '(' param_list ')' block
+  param_list  = (type_kw IDENT (',' type_kw IDENT)*)?
   var_decl    = type_kw IDENT ('=' expr)? ';'
   param_decl  = ('$'|typed_'$') IDENT ('=' expr)? ';'
   assignment  = lvalue '=' expr ';'
@@ -15,6 +17,7 @@ Grammar (simplified):
                | lvalue '--'  ';'
   if_else     = 'if' '(' expr ')' block ('else' (if_else | block))?
   for_loop    = 'for' '(' for_init ';' expr ';' for_update ')' block
+  return_stmt = 'return' expr ';'
   block       = '{' statement* '}'
   expr        = ternary
   ternary     = logic_or ('?' expr ':' ternary)?
@@ -25,19 +28,20 @@ Grammar (simplified):
   addition    = multiply (('+' | '-') multiply)*
   multiply    = unary (('*' | '/' | '%') unary)*
   unary       = ('-' | '!') unary | postfix
-  postfix     = primary ('.' IDENT | '(' args ')')*
+  postfix     = primary ('.' IDENT | '[' args ']' | '(' args ')')*
   primary     = NUMBER | IDENT | AT_BINDING | DOLLAR_BINDING
                | TYPED_AT_BINDING | TYPED_DOLLAR_BINDING
                | '(' expr ')' | vec_constructor | cast_expr
 """
 from __future__ import annotations
-from .lexer import Token, TokenType, LexerError
+from .lexer import Token, TokenType
 from .ast_nodes import (
     SourceLoc, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
-    BreakStmt, ContinueStmt,
+    BreakStmt, ContinueStmt, FunctionDef, ReturnStmt,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, ASTNode,
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
+    BindingIndexAccess, BindingSampleAccess,
 )
 
 TYPE_KEYWORDS = {TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_VEC3, TokenType.KW_VEC4, TokenType.KW_STRING, TokenType.KW_MAT3, TokenType.KW_MAT4}
@@ -149,6 +153,7 @@ class Parser:
             if self.peek() in (TokenType.RBRACE, TokenType.KW_IF,
                                TokenType.KW_FOR, TokenType.KW_WHILE,
                                TokenType.KW_BREAK, TokenType.KW_CONTINUE,
+                               TokenType.KW_RETURN,
                                *TYPE_KEYWORDS):
                 return
             self.advance()
@@ -175,7 +180,6 @@ class Parser:
                 e._build_diagnostic()
             if len(self._errors) == 1:
                 raise self._errors[0]
-            from .diagnostics import TEXMultiError, TEXDiagnostic
             diagnostics = [e.diagnostic for e in self._errors if e.diagnostic]
             raise TEXMultiError(diagnostics)
 
@@ -191,6 +195,9 @@ class Parser:
                 # Array declaration: type IDENT '[' ...
                 if self.peek_ahead(2) == TokenType.LBRACKET:
                     return self.parse_array_decl()
+                # Function definition: type IDENT '(' ...
+                if self.peek_ahead(2) == TokenType.LPAREN:
+                    return self.parse_function_def()
                 return self.parse_var_decl()
 
         # Parameter declaration: f$name = 0.5; or $name; or i$count = 10;
@@ -226,7 +233,16 @@ class Parser:
                        code="E2010", hint="Add `;` after continue.")
             return ContinueStmt(loc=loc)
 
-        # Check for foreign keywords (return, const, let, var, etc.)
+        # return statement
+        if self.peek() == TokenType.KW_RETURN:
+            loc = self.loc()
+            self.advance()
+            value = self.parse_expr()
+            self.expect(TokenType.SEMI, "I need a semicolon after `return`",
+                       code="E2010", hint="Add `;` after the return value.")
+            return ReturnStmt(loc=loc, value=value)
+
+        # Check for foreign keywords (const, let, var, etc.)
         if self.peek() == TokenType.IDENT:
             from .diagnostics import get_keyword_hint
             kw_hint = get_keyword_hint(self.current().value)
@@ -253,6 +269,34 @@ class Parser:
         self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this variable declaration",
                    code="E2010", hint="Every statement in TEX ends with `;`.")
         return VarDecl(loc=loc, type_name=type_name, name=name_tok.value, initializer=initializer)
+
+    def parse_function_def(self) -> FunctionDef:
+        loc = self.loc()
+        return_type = self.advance().value  # consume type keyword
+
+        name_tok = self.expect(TokenType.IDENT, "I expected a function name")
+        self.expect(TokenType.LPAREN, "I expected '(' after function name")
+
+        params: list[tuple[str, str]] = []
+        if self.peek() in TYPE_KEYWORDS:
+            type_tok = self.advance()
+            p_name = self.expect(TokenType.IDENT, "I expected a parameter name")
+            params.append((type_tok.value, p_name.value))
+            while self.match(TokenType.COMMA):
+                if self.peek() not in TYPE_KEYWORDS:
+                    raise self._make_error(
+                        "I expected a type for this parameter.",
+                        self.loc(), code="E2020",
+                        hint="Each parameter needs a type: float x, vec3 color, etc.",
+                    )
+                type_tok = self.advance()
+                p_name = self.expect(TokenType.IDENT, "I expected a parameter name")
+                params.append((type_tok.value, p_name.value))
+
+        self.expect(TokenType.RPAREN, "I expected ')' to close the parameter list")
+        body = self.parse_block()
+        return FunctionDef(loc=loc, return_type=return_type, name=name_tok.value,
+                           params=params, body=body)
 
     def parse_param_decl(self) -> ParamDecl:
         """Parse: ($name | prefix$name) ('=' expr)? ';'"""
@@ -561,6 +605,24 @@ class Parser:
                 # Read channel/swizzle name
                 name_tok = self.expect(TokenType.IDENT, "I expected a channel name after `.`")
                 expr = ChannelAccess(loc=name_tok.loc, object=expr, channels=name_tok.value)
+            elif self.peek() == TokenType.LBRACKET and isinstance(expr, BindingRef):
+                # Binding fetch: @Image[ix, iy] or @Image[ix, iy, frame]
+                loc = self.loc()
+                self.advance()  # consume [
+                args = [self.parse_expr()]
+                while self.match(TokenType.COMMA):
+                    args.append(self.parse_expr())
+                self.expect(TokenType.RBRACKET, "I expected `]` to close the binding index access")
+                expr = BindingIndexAccess(loc=loc, binding=expr, args=args)
+            elif self.peek() == TokenType.LPAREN and isinstance(expr, BindingRef):
+                # Binding sample: @Image(u, v) or @Image(u, v, frame)
+                loc = self.loc()
+                self.advance()  # consume (
+                args = [self.parse_expr()]
+                while self.match(TokenType.COMMA):
+                    args.append(self.parse_expr())
+                self.expect(TokenType.RPAREN, "I expected `)` to close the binding sample access")
+                expr = BindingSampleAccess(loc=loc, binding=expr, args=args)
             elif self.peek() == TokenType.LBRACKET:
                 # Array indexing: expr[index]
                 loc = self.loc()

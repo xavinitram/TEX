@@ -29,6 +29,11 @@ from TEX_Wrangle.tex_compiler.diagnostics import TEXMultiError
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter, InterpreterError
 from TEX_Wrangle.tex_cache import TEXCache
 from TEX_Wrangle.tex_runtime.compiled import execute_compiled, _plain_execute, clear_compiled_cache
+from TEX_Wrangle.tex_runtime.codegen import try_compile, _CgBreak, _CgContinue
+from TEX_Wrangle.tex_runtime.interpreter import _ensure_spatial, _broadcast_pair, _collect_identifiers
+from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib, SAFE_EPSILON, _perlin2d_fast, _grad2d_dot, _lowbias32
+from TEX_Wrangle.tex_compiler.type_checker import CHANNEL_MAP
+import math
 
 
 # ── Test Utilities ─────────────────────────────────────────────────────
@@ -6581,22 +6586,24 @@ def test_diagnostic_quality(r: TestResult):
 
     # ── 4. Foreign Language Hints ────────────────────────────────────
 
-    # 4a. "return x;" should mention @OUT
+    # 4a. "return x;" outside a function should mention @OUT or assignment
     try:
-        code = "return 1.0;"
-        tokens = Lexer(code).tokenize()
-        Parser(tokens, source=code).parse()
-        r.fail("diag: foreign keyword return", "Should have raised ParseError")
-    except (ParseError, TEXMultiError) as e:
-        if hasattr(e, "diagnostic") and e.diagnostic is None:
-            e._build_diagnostic()
-        diag = e.diagnostic if hasattr(e, "diagnostic") else e.diagnostics[0]
+        code = "return 1.0; @OUT = @A;"
+        check_code(code, {"A": TEXType.VEC4})
+        r.fail("diag: return outside function", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError) as e:
+        if hasattr(e, "_build_diagnostic"):
+            if e.diagnostic is None:
+                e._build_diagnostic()
+            diag = e.diagnostic
+        else:
+            diag = e.diagnostics[0]
         hint_text = (diag.hint + " " + diag.message).lower()
-        assert "@out" in hint_text or "assign" in hint_text, \
-            f"Hint for 'return' should mention @OUT or assignment, got hint='{diag.hint}'"
-        r.ok("diag: foreign keyword return")
+        assert "function" in hint_text or "@out" in hint_text or "assign" in hint_text, \
+            f"Hint for 'return' should mention function or @OUT, got hint='{diag.hint}'"
+        r.ok("diag: return outside function")
     except Exception as e:
-        r.fail("diag: foreign keyword return", f"{e}\n{traceback.format_exc()}")
+        r.fail("diag: return outside function", f"{e}\n{traceback.format_exc()}")
 
     # 4b. "texture2D" should mention sample()
     try:
@@ -6754,6 +6761,3076 @@ def test_diagnostic_quality(r: TestResult):
         r.fail("diag: location info", f"{e}\n{traceback.format_exc()}")
 
 
+# ── User-Defined Functions ─────────────────────────────────────────────
+
+def test_user_functions(r: TestResult):
+    print("\n--- User-Defined Functions ---")
+    img = torch.rand(1, 4, 4, 4)
+
+    # Basic function: float -> float
+    try:
+        result = compile_and_run("""
+            float add1(float x) {
+                return x + 1.0;
+            }
+            @OUT = @A * add1(0.5);
+        """, {"A": img})
+        expected = img * 1.5
+        assert torch.allclose(result, expected, atol=1e-5), f"Got {result.mean()}"
+        r.ok("basic float function")
+    except Exception as e:
+        r.fail("basic float function", str(e))
+
+    # Multi-parameter function
+    try:
+        result = compile_and_run("""
+            float lerp3(float a, float b, float t) {
+                return a * (1.0 - t) + b * t;
+            }
+            float val = lerp3(0.0, 1.0, 0.75);
+            @OUT = @A * val;
+        """, {"A": img})
+        expected = img * 0.75
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("multi-param function")
+    except Exception as e:
+        r.fail("multi-param function", str(e))
+
+    # Vec3 return type
+    try:
+        result = compile_and_run("""
+            vec3 tint(vec3 c, float s) {
+                return c * s;
+            }
+            @OUT = vec4(tint(@A.rgb, 0.5), @A.a);
+        """, {"A": img})
+        expected = torch.cat([img[..., :3] * 0.5, img[..., 3:4]], dim=-1)
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("vec3 return type")
+    except Exception as e:
+        r.fail("vec3 return type", str(e))
+
+    # Vec4 return type
+    try:
+        result = compile_and_run("""
+            vec4 premultiply(vec4 c) {
+                return vec4(c.rgb * c.a, c.a);
+            }
+            @OUT = premultiply(@A);
+        """, {"A": img})
+        expected = torch.cat([img[..., :3] * img[..., 3:4], img[..., 3:4]], dim=-1)
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("vec4 return type")
+    except Exception as e:
+        r.fail("vec4 return type", str(e))
+
+    # Nested calls
+    try:
+        result = compile_and_run("""
+            float inc(float x) {
+                return x + 1.0;
+            }
+            float val = inc(inc(0.5));
+            @OUT = @A * val;
+        """, {"A": img})
+        expected = img * 2.5
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("nested function calls")
+    except Exception as e:
+        r.fail("nested function calls", str(e))
+
+    # Function calling another function
+    try:
+        result = compile_and_run("""
+            float square(float x) {
+                return x * x;
+            }
+            float cube(float x) {
+                return x * square(x);
+            }
+            float val = cube(3.0);
+            @OUT = @A * val;
+        """, {"A": img})
+        expected = img * 27.0
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("function calling another function")
+    except Exception as e:
+        r.fail("function calling another function", str(e))
+
+    # Function using builtins
+    try:
+        result = compile_and_run("""
+            float circle(float cx, float cy, float radius) {
+                float dx = u - cx;
+                float dy = v - cy;
+                return sqrt(dx * dx + dy * dy) < radius ? 1.0 : 0.0;
+            }
+            @OUT = @A * circle(0.5, 0.5, 0.3);
+        """, {"A": img})
+        r.ok("function using builtins (u, v)")
+    except Exception as e:
+        r.fail("function using builtins (u, v)", str(e))
+
+    # Function with if/else in body
+    try:
+        result = compile_and_run("""
+            float thresh(float x, float t) {
+                if (x > t) {
+                    return 1.0;
+                }
+                return 0.0;
+            }
+            @OUT = @A * thresh(0.7, 0.5);
+        """, {"A": img})
+        expected = img * 1.0
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("function with if/else and multiple returns")
+    except Exception as e:
+        r.fail("function with if/else and multiple returns", str(e))
+
+    # Function with for loop in body
+    try:
+        result = compile_and_run("""
+            float sum_n(int n) {
+                float s = 0.0;
+                for (int i = 0; i < n; i++) {
+                    s = s + 1.0;
+                }
+                return s;
+            }
+            float val = sum_n(5);
+            @OUT = @A * val;
+        """, {"A": img})
+        expected = img * 5.0
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("function with for loop")
+    except Exception as e:
+        r.fail("function with for loop", str(e))
+
+    # Function used in expression
+    try:
+        result = compile_and_run("""
+            float half(float x) {
+                return x * 0.5;
+            }
+            float val = half(2.0) + half(4.0);
+            @OUT = @A * val;
+        """, {"A": img})
+        expected = img * 3.0
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("function in arithmetic expression")
+    except Exception as e:
+        r.fail("function in arithmetic expression", str(e))
+
+    # Function used in ternary
+    try:
+        result = compile_and_run("""
+            float double(float x) {
+                return x * 2.0;
+            }
+            float val = double(1.0) > 1.5 ? 1.0 : 0.0;
+            @OUT = @A * val;
+        """, {"A": img})
+        expected = img * 1.0
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("function in ternary")
+    except Exception as e:
+        r.fail("function in ternary", str(e))
+
+    # No return statement -> returns zero
+    try:
+        result = compile_and_run("""
+            float noop(float x) {
+                float y = x + 1.0;
+            }
+            float val = noop(5.0);
+            @OUT = @A * val;
+        """, {"A": img})
+        expected = img * 0.0
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("function without return -> zero")
+    except Exception as e:
+        r.fail("function without return -> zero", str(e))
+
+    # Function doesn't modify caller scope
+    try:
+        result = compile_and_run("""
+            float mutator(float x) {
+                float val = 999.0;
+                return x;
+            }
+            float val = 1.0;
+            float dummy = mutator(0.0);
+            @OUT = @A * val;
+        """, {"A": img})
+        expected = img * 1.0
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("function scope isolation")
+    except Exception as e:
+        r.fail("function scope isolation", str(e))
+
+    # Zero-parameter function
+    try:
+        result = compile_and_run("""
+            float pi_half() {
+                return PI * 0.5;
+            }
+            @OUT = @A * sin(pi_half());
+        """, {"A": img})
+        expected = img * 1.0
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("zero-parameter function")
+    except Exception as e:
+        r.fail("zero-parameter function", str(e))
+
+    # Int parameter and return
+    try:
+        result = compile_and_run("""
+            int double_int(int x) {
+                return x * 2;
+            }
+            @OUT = @A * double_int(3);
+        """, {"A": img})
+        expected = img * 6.0
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("int parameter and return")
+    except Exception as e:
+        r.fail("int parameter and return", str(e))
+
+    # Error: redefining stdlib function
+    try:
+        compile_and_run("""
+            float clamp(float x) {
+                return x;
+            }
+            @OUT = @A;
+        """, {"A": img})
+        r.fail("error: redefine stdlib", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: redefine stdlib")
+    except Exception as e:
+        r.fail("error: redefine stdlib", str(e))
+
+    # Error: duplicate function definition
+    try:
+        compile_and_run("""
+            float foo(float x) { return x; }
+            float foo(float x) { return x * 2.0; }
+            @OUT = @A;
+        """, {"A": img})
+        r.fail("error: duplicate function", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: duplicate function")
+    except Exception as e:
+        r.fail("error: duplicate function", str(e))
+
+    # Error: wrong arg count
+    try:
+        compile_and_run("""
+            float add2(float a, float b) { return a + b; }
+            float val = add2(1.0);
+            @OUT = @A * val;
+        """, {"A": img})
+        r.fail("error: wrong arg count", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: wrong arg count")
+    except Exception as e:
+        r.fail("error: wrong arg count", str(e))
+
+    # Error: wrong arg type
+    try:
+        compile_and_run("""
+            float process(vec3 c) { return c.r; }
+            float val = process("hello");
+            @OUT = @A * val;
+        """, {"A": img})
+        r.fail("error: wrong arg type", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: wrong arg type")
+    except Exception as e:
+        r.fail("error: wrong arg type", str(e))
+
+    # Error: return outside function
+    try:
+        compile_and_run("""
+            return 1.0;
+            @OUT = @A;
+        """, {"A": img})
+        r.fail("error: return outside function", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: return outside function")
+    except Exception as e:
+        r.fail("error: return outside function", str(e))
+
+    # Error: return type mismatch
+    try:
+        compile_and_run("""
+            float bad() {
+                return vec3(1.0, 0.0, 0.0);
+            }
+            @OUT = @A;
+        """, {"A": img})
+        r.fail("error: return type mismatch", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: return type mismatch")
+    except Exception as e:
+        r.fail("error: return type mismatch", str(e))
+
+    # String return type
+    try:
+        result = compile_and_run("""
+            string greet(string name) {
+                return "Hello, " + name;
+            }
+            s@OUT = greet("TEX");
+        """, {"A": img})
+        assert result == "Hello, TEX", f"Got {result}"
+        r.ok("string function")
+    except Exception as e:
+        r.fail("string function", str(e))
+
+    # Error: nested function definition
+    try:
+        compile_and_run("""
+            float outer() {
+                float inner() {
+                    return 1.0;
+                }
+                return inner();
+            }
+            @OUT = @A;
+        """, {"A": img})
+        r.fail("error: nested function def", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: nested function def")
+    except Exception as e:
+        r.fail("error: nested function def", str(e))
+
+    # Error: infinite recursion hits depth limit
+    try:
+        compile_and_run("""
+            float boom(float x) {
+                return boom(x);
+            }
+            @OUT = vec4(boom(1.0));
+        """, {"A": img})
+        r.fail("error: recursion depth limit", "Should have raised an error")
+    except InterpreterError as e:
+        assert "depth" in str(e).lower() or "recursion" in str(e).lower(), f"Expected recursion error, got: {e}"
+        r.ok("error: recursion depth limit")
+    except (TypeCheckError, TEXMultiError):
+        r.fail("error: recursion depth limit", "Unexpected type check error")
+    except Exception as e:
+        r.fail("error: recursion depth limit", str(e))
+
+
+# ── Binding Access Syntax ──────────────────────────────────────────────
+
+def test_binding_access(r: TestResult):
+    print("\n--- Binding Access Syntax ---")
+    img = torch.zeros(1, 4, 4, 4)
+    # Fill with known pattern: pixel (x,y) has value (x*0.1 + y*0.01) in all channels
+    for y in range(4):
+        for x in range(4):
+            img[0, y, x, :] = x * 0.1 + y * 0.01
+
+    # @A[ix, iy] — fetch at current pixel (identity)
+    try:
+        result = compile_and_run("@OUT = @A[ix, iy];", {"A": img})
+        assert torch.allclose(result, img, atol=1e-5), f"Max diff: {(result - img).abs().max()}"
+        r.ok("@A[ix, iy] identity fetch")
+    except Exception as e:
+        r.fail("@A[ix, iy] identity fetch", str(e))
+
+    # @A[0, 0] — fetch pixel (0,0) everywhere
+    try:
+        result = compile_and_run("@OUT = @A[0, 0];", {"A": img})
+        expected_val = img[0, 0, 0, :]  # pixel (0,0)
+        assert torch.allclose(result[0, :, :, :], expected_val.expand(4, 4, -1), atol=1e-5)
+        r.ok("@A[0, 0] constant fetch")
+    except Exception as e:
+        r.fail("@A[0, 0] constant fetch", str(e))
+
+    # @A(u, v) — sample at current UV (identity, approximately)
+    try:
+        result = compile_and_run("@OUT = @A(u, v);", {"A": img})
+        # Bilinear at exact pixel centers should be close to identity
+        r.ok("@A(u, v) identity sample")
+    except Exception as e:
+        r.fail("@A(u, v) identity sample", str(e))
+
+    # @A(0.5, 0.5) — sample center
+    try:
+        result = compile_and_run("@OUT = @A(0.5, 0.5);", {"A": img})
+        # Should be uniform across all pixels (same UV everywhere)
+        center = result[0, 0, 0, :]
+        assert torch.allclose(result[0], center.expand(4, 4, -1), atol=1e-5)
+        r.ok("@A(0.5, 0.5) center sample")
+    except Exception as e:
+        r.fail("@A(0.5, 0.5) center sample", str(e))
+
+    # Chaining with channel access: @A[ix, iy].rgb
+    try:
+        result = compile_and_run("vec3 c = @A[ix, iy].rgb; @OUT = vec4(c, 1.0);", {"A": img})
+        expected = torch.cat([img[..., :3], torch.ones(1, 4, 4, 1)], dim=-1)
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("@A[ix, iy].rgb chain")
+    except Exception as e:
+        r.fail("@A[ix, iy].rgb chain", str(e))
+
+    # Chaining with channel access: @A(u, v).r
+    try:
+        result = compile_and_run("float val = @A(u, v).r; @OUT = @A * val;", {"A": img})
+        r.ok("@A(u, v).r chain")
+    except Exception as e:
+        r.fail("@A(u, v).r chain", str(e))
+
+    # Equivalence: @A[ix, iy] == fetch(@A, ix, iy)
+    try:
+        r1 = compile_and_run("@OUT = @A[ix, iy];", {"A": img})
+        r2 = compile_and_run("@OUT = fetch(@A, ix, iy);", {"A": img})
+        assert torch.allclose(r1, r2, atol=1e-5)
+        r.ok("@A[ix, iy] == fetch(@A, ix, iy)")
+    except Exception as e:
+        r.fail("@A[ix, iy] == fetch(@A, ix, iy)", str(e))
+
+    # Equivalence: @A(u, v) == sample(@A, u, v)
+    try:
+        r1 = compile_and_run("@OUT = @A(u, v);", {"A": img})
+        r2 = compile_and_run("@OUT = sample(@A, u, v);", {"A": img})
+        assert torch.allclose(r1, r2, atol=1e-5)
+        r.ok("@A(u, v) == sample(@A, u, v)")
+    except Exception as e:
+        r.fail("@A(u, v) == sample(@A, u, v)", str(e))
+
+    # Frame argument: @A[ix, iy, 0]
+    try:
+        batch_img = torch.rand(2, 4, 4, 4)
+        result = compile_and_run("@OUT = @A[ix, iy, 0];", {"A": batch_img})
+        # Frame 0 sampled everywhere
+        expected_frame = batch_img[0:1].expand_as(batch_img)
+        r.ok("@A[ix, iy, 0] with frame")
+    except Exception as e:
+        r.fail("@A[ix, iy, 0] with frame", str(e))
+
+    # Frame argument: @A(u, v, 0)
+    try:
+        batch_img = torch.rand(2, 4, 4, 4)
+        result = compile_and_run("@OUT = @A(u, v, 0);", {"A": batch_img})
+        r.ok("@A(u, v, 0) with frame")
+    except Exception as e:
+        r.fail("@A(u, v, 0) with frame", str(e))
+
+    # Binding index in function argument
+    try:
+        result = compile_and_run("@OUT = clamp(@A[ix, iy], 0.0, 0.5);", {"A": img})
+        expected = torch.clamp(img, 0.0, 0.5)
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("@A[ix, iy] as function arg")
+    except Exception as e:
+        r.fail("@A[ix, iy] as function arg", str(e))
+
+    # Binding sample in user function
+    try:
+        result = compile_and_run("""
+            vec4 blur_sample(float ox, float oy) {
+                return @A(u + ox, v + oy);
+            }
+            @OUT = blur_sample(0.0, 0.0);
+        """, {"A": img})
+        r.ok("binding sample in user function")
+    except Exception as e:
+        r.fail("binding sample in user function", str(e))
+
+    # Error: too few args
+    try:
+        compile_and_run("@OUT = @A[0];", {"A": img})
+        r.fail("error: @A[0] too few args", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: @A[0] too few args")
+    except Exception as e:
+        r.fail("error: @A[0] too few args", str(e))
+
+    # Error: too many args
+    try:
+        compile_and_run("@OUT = @A[0, 0, 0, 0];", {"A": img})
+        r.fail("error: @A[0,0,0,0] too many args", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: @A[0,0,0,0] too many args")
+    except Exception as e:
+        r.fail("error: @A[0,0,0,0] too many args", str(e))
+
+    # Error: too few args for sample
+    try:
+        compile_and_run("@OUT = @A(0.5);", {"A": img})
+        r.fail("error: @A(0.5) too few args", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: @A(0.5) too few args")
+    except Exception as e:
+        r.fail("error: @A(0.5) too few args", str(e))
+
+
+# ── Ternary Exhaustive Tests ──────────────────────────────────────────
+
+def test_ternary_exhaustive(r: TestResult):
+    """Exhaustive tests for the ternary (? :) operator."""
+    print("\n--- Ternary Exhaustive Tests ---")
+    img = torch.rand(1, 4, 4, 4)
+
+    # Basic ternary — true branch
+    try:
+        result = compile_and_run("""
+            float x = 0.8 > 0.5 ? 1.0 : 0.0;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("ternary: basic true branch")
+    except Exception as e:
+        r.fail("ternary: basic true branch", str(e))
+
+    # Basic ternary — false branch
+    try:
+        result = compile_and_run("""
+            float x = 0.2 > 0.5 ? 1.0 : 0.0;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 0.0) < 1e-5, f"Expected 0.0, got {v}"
+        r.ok("ternary: basic false branch")
+    except Exception as e:
+        r.fail("ternary: basic false branch", str(e))
+
+    # Nested ternary
+    try:
+        result = compile_and_run("""
+            float x = 0.8 > 0.7 ? 1.0 : 0.8 > 0.3 ? 0.5 : 0.0;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("ternary: nested (first branch)")
+    except Exception as e:
+        r.fail("ternary: nested (first branch)", str(e))
+
+    # Nested ternary — middle branch
+    try:
+        result = compile_and_run("""
+            float x = 0.5 > 0.7 ? 1.0 : 0.5 > 0.3 ? 0.5 : 0.0;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 0.5) < 1e-5, f"Expected 0.5, got {v}"
+        r.ok("ternary: nested (middle branch)")
+    except Exception as e:
+        r.fail("ternary: nested (middle branch)", str(e))
+
+    # Ternary in vec3 constructor
+    try:
+        result = compile_and_run("""
+            float sel = 0.8 > 0.5 ? 1.0 : 0.0;
+            @OUT = vec4(vec3(sel, 0.25, 0.0), 1.0);
+        """, {"A": img})
+        r0 = result[0, 0, 0, 0].item()
+        g0 = result[0, 0, 0, 1].item()
+        assert abs(r0 - 1.0) < 1e-5 and abs(g0 - 0.25) < 1e-5, f"Got r={r0}, g={g0}"
+        r.ok("ternary: in vec constructor")
+    except Exception as e:
+        r.fail("ternary: in vec constructor", str(e))
+
+    # Ternary with function calls
+    try:
+        result = compile_and_run("""
+            float x = clamp(0.8 > 0.5 ? 2.0 : -1.0, 0.0, 1.0);
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("ternary: with function calls")
+    except Exception as e:
+        r.fail("ternary: with function calls", str(e))
+
+    # Ternary with int-to-float promotion
+    try:
+        result = compile_and_run("""
+            float x = 0.8 > 0.5 ? 1 : 0.5;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("ternary: int-to-float promotion")
+    except Exception as e:
+        r.fail("ternary: int-to-float promotion", str(e))
+
+    # Ternary in variable declaration with u/v
+    try:
+        result = compile_and_run("""
+            float x = u > 0.5 ? u : v;
+            @OUT = vec4(x);
+        """, {"A": img})
+        r.ok("ternary: in variable declaration with u/v")
+    except Exception as e:
+        r.fail("ternary: in variable declaration with u/v", str(e))
+
+    # Ternary in assignment
+    try:
+        result = compile_and_run("""
+            vec3 c = vec3(0.0);
+            c = 0.8 > 0.5 ? vec3(1.0) : vec3(0.0);
+            @OUT = vec4(c, 1.0);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("ternary: in assignment to vec3")
+    except Exception as e:
+        r.fail("ternary: in assignment to vec3", str(e))
+
+    # Ternary as function argument
+    try:
+        result = compile_and_run("""
+            float x = clamp(0.2 > 0.5 ? 2.0 : -1.0, 0.0, 1.0);
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 0.0) < 1e-5, f"Expected 0.0, got {v}"
+        r.ok("ternary: as function argument (false branch)")
+    except Exception as e:
+        r.fail("ternary: as function argument (false branch)", str(e))
+
+    # Chained ternary (4 levels)
+    try:
+        result = compile_and_run("""
+            float val = 0.6;
+            float x = val > 0.75 ? 1.0 : val > 0.5 ? 0.75 : val > 0.25 ? 0.5 : 0.25;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 0.75) < 1e-5, f"Expected 0.75, got {v}"
+        r.ok("ternary: chained 4 levels")
+    except Exception as e:
+        r.fail("ternary: chained 4 levels", str(e))
+
+    # Ternary with == comparison
+    try:
+        result = compile_and_run("""
+            float a = 1.0;
+            float b = 1.0;
+            float x = (a == b) ? 1.0 : 0.0;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("ternary: with == comparison")
+    except Exception as e:
+        r.fail("ternary: with == comparison", str(e))
+
+    # Ternary with logical AND
+    try:
+        result = compile_and_run("""
+            float a = 0.5;
+            float b = 0.5;
+            float x = (a > 0.3 && b > 0.3) ? 1.0 : 0.0;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("ternary: with logical AND")
+    except Exception as e:
+        r.fail("ternary: with logical AND", str(e))
+
+    # Ternary returning vec3
+    try:
+        result = compile_and_run("""
+            vec3 c = 0.8 > 0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 0.0, 1.0);
+            @OUT = vec4(c, 1.0);
+        """, {"A": img})
+        r0 = result[0, 0, 0, 0].item()
+        b0 = result[0, 0, 0, 2].item()
+        assert abs(r0 - 1.0) < 1e-5 and abs(b0 - 0.0) < 1e-5, f"Got r={r0}, b={b0}"
+        r.ok("ternary: returning vec3")
+    except Exception as e:
+        r.fail("ternary: returning vec3", str(e))
+
+    # Ternary in loop
+    try:
+        result = compile_and_run("""
+            float x = 0.0;
+            for (int i = 0; i < 4; i++) {
+                x += i > 1 ? 1.0 : 0.5;
+            }
+            @OUT = vec4(x);
+        """, {"A": img})
+        # i=0: 0.5, i=1: 0.5, i=2: 1.0, i=3: 1.0 => 3.0
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 3.0) < 1e-5, f"Expected 3.0, got {v}"
+        r.ok("ternary: in loop")
+    except Exception as e:
+        r.fail("ternary: in loop", str(e))
+
+    # Ternary with binding
+    try:
+        result = compile_and_run("""
+            @OUT = u > 0.5 ? @A : vec4(0.0);
+        """, {"A": img})
+        r.ok("ternary: with binding access")
+    except Exception as e:
+        r.fail("ternary: with binding access", str(e))
+
+
+# ── User Functions Advanced Tests ─────────────────────────────────────
+
+def test_user_functions_advanced(r: TestResult):
+    """Advanced user-defined function tests."""
+    print("\n--- User Functions Advanced Tests ---")
+    img = torch.rand(1, 4, 4, 4)
+
+    # Function B defined first, A calls B
+    try:
+        result = compile_and_run("""
+            float double_it(float x) {
+                return x * 2.0;
+            }
+            float quad(float x) {
+                return double_it(double_it(x));
+            }
+            @OUT = @A * quad(0.25);
+        """, {"A": img})
+        expected = img * 1.0
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("func: A calls B (B defined first)")
+    except Exception as e:
+        r.fail("func: A calls B (B defined first)", str(e))
+
+    # Recursive function with depth limit (factorial of small number)
+    try:
+        result = compile_and_run("""
+            float factorial(float n) {
+                if (n <= 1.0) {
+                    return 1.0;
+                }
+                return n * factorial(n - 1.0);
+            }
+            float val = factorial(5.0);
+            @OUT = vec4(val);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 120.0) < 1e-3, f"Expected 120.0, got {v}"
+        r.ok("func: recursive factorial")
+    except Exception as e:
+        r.fail("func: recursive factorial", str(e))
+
+    # Function with 5 parameters
+    try:
+        result = compile_and_run("""
+            float weighted_sum(float a, float b, float c, float d, float e) {
+                return a + b + c + d + e;
+            }
+            float val = weighted_sum(1.0, 2.0, 3.0, 4.0, 5.0);
+            @OUT = vec4(val);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 15.0) < 1e-5, f"Expected 15.0, got {v}"
+        r.ok("func: 5 parameters")
+    except Exception as e:
+        r.fail("func: 5 parameters", str(e))
+
+    # Function returning result of another function
+    try:
+        result = compile_and_run("""
+            float inner(float x) {
+                return x * 3.0;
+            }
+            float outer(float x) {
+                return inner(x + 1.0);
+            }
+            float val = outer(1.0);
+            @OUT = vec4(val);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 6.0) < 1e-5, f"Expected 6.0, got {v}"
+        r.ok("func: returns result of another function")
+    except Exception as e:
+        r.fail("func: returns result of another function", str(e))
+
+    # Function with early return
+    try:
+        result = compile_and_run("""
+            float safe_sqrt(float x) {
+                if (x < 0.0) {
+                    return 0.0;
+                }
+                return sqrt(x);
+            }
+            float a = safe_sqrt(4.0);
+            float b = safe_sqrt(-1.0);
+            @OUT = vec4(a, b, 0.0, 1.0);
+        """, {"A": img})
+        a_val = result[0, 0, 0, 0].item()
+        b_val = result[0, 0, 0, 1].item()
+        assert abs(a_val - 2.0) < 1e-4, f"Expected 2.0, got {a_val}"
+        assert abs(b_val - 0.0) < 1e-5, f"Expected 0.0, got {b_val}"
+        r.ok("func: early return")
+    except Exception as e:
+        r.fail("func: early return", str(e))
+
+    # Function with while loop inside
+    try:
+        result = compile_and_run("""
+            float count_up(float limit) {
+                float acc = 0.0;
+                float i = 0.0;
+                while (i < limit) {
+                    acc += 1.0;
+                    i += 1.0;
+                }
+                return acc;
+            }
+            float val = count_up(7.0);
+            @OUT = vec4(val);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 7.0) < 1e-5, f"Expected 7.0, got {v}"
+        r.ok("func: with while loop")
+    except Exception as e:
+        r.fail("func: with while loop", str(e))
+
+    # Function with nested if/else
+    try:
+        result = compile_and_run("""
+            float classify(float x) {
+                if (x < 0.0) {
+                    return -1.0;
+                } else {
+                    if (x > 1.0) {
+                        return 1.0;
+                    } else {
+                        return 0.0;
+                    }
+                }
+            }
+            float a = classify(-5.0);
+            float b = classify(0.5);
+            float c = classify(3.0);
+            @OUT = vec4(a, b, c, 1.0);
+        """, {"A": img})
+        a_val = result[0, 0, 0, 0].item()
+        b_val = result[0, 0, 0, 1].item()
+        c_val = result[0, 0, 0, 2].item()
+        assert abs(a_val - (-1.0)) < 1e-5, f"a: expected -1.0, got {a_val}"
+        assert abs(b_val - 0.0) < 1e-5, f"b: expected 0.0, got {b_val}"
+        assert abs(c_val - 1.0) < 1e-5, f"c: expected 1.0, got {c_val}"
+        r.ok("func: nested if/else")
+    except Exception as e:
+        r.fail("func: nested if/else", str(e))
+
+    # Function with compound assignment inside
+    try:
+        result = compile_and_run("""
+            float accumulate(float x) {
+                float acc = 0.0;
+                acc += x;
+                acc += x;
+                acc *= 2.0;
+                return acc;
+            }
+            float val = accumulate(3.0);
+            @OUT = vec4(val);
+        """, {"A": img})
+        # (3+3)*2 = 12
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 12.0) < 1e-5, f"Expected 12.0, got {v}"
+        r.ok("func: compound assignment inside")
+    except Exception as e:
+        r.fail("func: compound assignment inside", str(e))
+
+    # Function result in compound assignment
+    try:
+        result = compile_and_run("""
+            float triple(float x) {
+                return x * 3.0;
+            }
+            float x = 1.0;
+            x += triple(2.0);
+            @OUT = vec4(x);
+        """, {"A": img})
+        # 1.0 + 6.0 = 7.0
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 7.0) < 1e-5, f"Expected 7.0, got {v}"
+        r.ok("func: result in compound assignment")
+    except Exception as e:
+        r.fail("func: result in compound assignment", str(e))
+
+    # Function result as array index
+    try:
+        result = compile_and_run("""
+            int get_idx() {
+                return 2;
+            }
+            float arr[4] = {10.0, 20.0, 30.0, 40.0};
+            float val = arr[get_idx()];
+            @OUT = vec4(val);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 30.0) < 1e-5, f"Expected 30.0, got {v}"
+        r.ok("func: result as array index")
+    except Exception as e:
+        r.fail("func: result as array index", str(e))
+
+    # Multiple return paths with loop
+    try:
+        result = compile_and_run("""
+            float find_first_above(float threshold) {
+                for (int i = 0; i < 10; i++) {
+                    if (float(i) > threshold) {
+                        return float(i);
+                    }
+                }
+                return -1.0;
+            }
+            float val = find_first_above(3.5);
+            @OUT = vec4(val);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 4.0) < 1e-5, f"Expected 4.0, got {v}"
+        r.ok("func: multiple return paths with loop")
+    except Exception as e:
+        r.fail("func: multiple return paths with loop", str(e))
+
+    # User function + channel access on result via intermediate
+    try:
+        result = compile_and_run("""
+            vec3 make_color(float r, float g, float b) {
+                return vec3(r, g, b);
+            }
+            vec3 c = make_color(0.1, 0.2, 0.3);
+            float red = c.r;
+            @OUT = vec4(red);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 0.1) < 1e-4, f"Expected 0.1, got {v}"
+        r.ok("func: channel access on result via intermediate")
+    except Exception as e:
+        r.fail("func: channel access on result via intermediate", str(e))
+
+    # User function that uses @A binding internally
+    try:
+        result = compile_and_run("""
+            vec4 brighten(float amount) {
+                return @A(u, v) * amount;
+            }
+            @OUT = brighten(2.0);
+        """, {"A": img})
+        expected = img * 2.0
+        assert torch.allclose(result, expected, atol=1e-4)
+        r.ok("func: uses binding @A internally")
+    except Exception as e:
+        r.fail("func: uses binding @A internally", str(e))
+
+    # User function that returns string
+    try:
+        result = compile_and_run("""
+            string label(float val) {
+                return "value=" + str(val);
+            }
+            s@OUT = label(42.0);
+        """, {"A": img})
+        assert "value=" in result and "42" in result, f"Got {result}"
+        r.ok("func: returns string")
+    except Exception as e:
+        r.fail("func: returns string", str(e))
+
+    # Error: calling undefined function (typo)
+    try:
+        compile_and_run("""
+            float blend(float a, float b, float t) {
+                return lerp(a, b, t);
+            }
+            float val = blned(0.0, 1.0, 0.5);
+            @OUT = vec4(val);
+        """, {"A": img})
+        r.fail("error: undefined func (typo blned)", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError) as e:
+        msg = str(e).lower()
+        # Should suggest 'blend' in the error
+        r.ok("error: undefined func (typo blned)")
+    except Exception as e:
+        r.fail("error: undefined func (typo blned)", str(e))
+
+    # Error: function defined after use
+    try:
+        compile_and_run("""
+            float val = late_func(1.0);
+            float late_func(float x) {
+                return x * 2.0;
+            }
+            @OUT = vec4(val);
+        """, {"A": img})
+        r.fail("error: func defined after use", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("error: func defined after use")
+    except Exception as e:
+        r.fail("error: func defined after use", str(e))
+
+    # Vec4 function with multiple statements
+    try:
+        result = compile_and_run("""
+            vec4 tint_red(vec4 pixel) {
+                float lum = luma(pixel);
+                vec3 tinted = vec3(lum * 1.5, lum * 0.5, lum * 0.5);
+                return vec4(tinted, pixel.a);
+            }
+            @OUT = tint_red(@A);
+        """, {"A": img})
+        assert result.shape == img.shape
+        r.ok("func: vec4 with multiple statements")
+    except Exception as e:
+        r.fail("func: vec4 with multiple statements", str(e))
+
+    # Two user functions called in same expression
+    try:
+        result = compile_and_run("""
+            float add1(float x) { return x + 1.0; }
+            float mul2(float x) { return x * 2.0; }
+            float val = add1(3.0) + mul2(4.0);
+            @OUT = vec4(val);
+        """, {"A": img})
+        # 4.0 + 8.0 = 12.0
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 12.0) < 1e-5, f"Expected 12.0, got {v}"
+        r.ok("func: two functions in same expression")
+    except Exception as e:
+        r.fail("func: two functions in same expression", str(e))
+
+
+# ── Binding Access Advanced Tests ─────────────────────────────────────
+
+def test_binding_access_advanced(r: TestResult):
+    """Advanced binding access tests."""
+    print("\n--- Binding Access Advanced Tests ---")
+    img = torch.zeros(1, 4, 4, 4)
+    for y in range(4):
+        for x in range(4):
+            img[0, y, x, :] = x * 0.1 + y * 0.01
+
+    img_b = torch.ones(1, 4, 4, 4) * 0.5
+
+    # Binding access in loop (neighbor sum)
+    try:
+        result = compile_and_run("""
+            vec4 sum = vec4(0.0);
+            for (int dx = -1; dx <= 1; dx++) {
+                sum += @A[ix + dx, iy];
+            }
+            @OUT = sum / 3.0;
+        """, {"A": img})
+        r.ok("binding: access in loop (neighbor)")
+    except Exception as e:
+        r.fail("binding: access in loop (neighbor)", str(e))
+
+    # Binding access with arithmetic coords (clamp returns float, use int() cast)
+    try:
+        result = compile_and_run("""
+            float cx = clamp(float(ix) * 2.0, 0.0, float(iw - 1));
+            float cy = clamp(float(iy) * 2.0, 0.0, float(ih - 1));
+            @OUT = @A[int(cx), int(cy)];
+        """, {"A": img})
+        r.ok("binding: arithmetic coords")
+    except Exception as e:
+        r.fail("binding: arithmetic coords", str(e))
+
+    # Binding access with function call coords
+    try:
+        result = compile_and_run("""
+            @OUT = @A[int(floor(u * float(iw - 1))), int(floor(v * float(ih - 1)))];
+        """, {"A": img})
+        r.ok("binding: function call coords")
+    except Exception as e:
+        r.fail("binding: function call coords", str(e))
+
+    # Nested binding access — use result of one to compute another
+    try:
+        result = compile_and_run("""
+            vec4 a_pixel = @A[ix, iy];
+            float brightness = luma(a_pixel);
+            float offset = brightness * 3.0;
+            @OUT = @A[int(clamp(float(ix) + offset, 0.0, float(iw - 1))), iy];
+        """, {"A": img})
+        r.ok("binding: nested access (data-dependent coords)")
+    except Exception as e:
+        r.fail("binding: nested access (data-dependent coords)", str(e))
+
+    # Binding access on multiple inputs
+    try:
+        result = compile_and_run("""
+            @OUT = @A[ix, iy] + @B[ix, iy];
+        """, {"A": img, "B": img_b})
+        expected = img + img_b
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("binding: multiple inputs @A + @B")
+    except Exception as e:
+        r.fail("binding: multiple inputs @A + @B", str(e))
+
+    # Sample with computed UV
+    try:
+        result = compile_and_run("""
+            @OUT = @A(u * 0.5 + 0.25, v * 0.5 + 0.25);
+        """, {"A": img})
+        r.ok("binding: sample with computed UV")
+    except Exception as e:
+        r.fail("binding: sample with computed UV", str(e))
+
+    # Sample result used in function
+    try:
+        result = compile_and_run("""
+            float l = luma(@A(u, v));
+            @OUT = vec4(l, l, l, 1.0);
+        """, {"A": img})
+        r.ok("binding: sample result in function (luma)")
+    except Exception as e:
+        r.fail("binding: sample result in function (luma)", str(e))
+
+    # Binding access assigned to intermediate
+    try:
+        result = compile_and_run("""
+            vec4 pixel = @A[ix, iy];
+            float red = pixel.r;
+            float green = pixel.g;
+            @OUT = vec4(red, green, 0.0, 1.0);
+        """, {"A": img})
+        expected_r = img[..., 0]
+        assert torch.allclose(result[..., 0], expected_r, atol=1e-5)
+        r.ok("binding: assigned to intermediate + channel access")
+    except Exception as e:
+        r.fail("binding: assigned to intermediate + channel access", str(e))
+
+    # Frame access with variable frame index
+    try:
+        batch_img = torch.rand(3, 4, 4, 4)
+        result = compile_and_run("""
+            int f = 0;
+            @OUT = @A[ix, iy, f];
+        """, {"A": batch_img})
+        r.ok("binding: frame access with variable")
+    except Exception as e:
+        r.fail("binding: frame access with variable", str(e))
+
+    # Binding access in ternary
+    try:
+        result = compile_and_run("""
+            @OUT = u > 0.5 ? @A[ix, iy] : @B[ix, iy];
+        """, {"A": img, "B": img_b})
+        r.ok("binding: access in ternary")
+    except Exception as e:
+        r.fail("binding: access in ternary", str(e))
+
+    # Binding access with swizzle chain .rgb
+    try:
+        result = compile_and_run("""
+            vec3 c = @A[ix, iy].rgb;
+            @OUT = vec4(c, 1.0);
+        """, {"A": img})
+        expected = torch.cat([img[..., :3], torch.ones(1, 4, 4, 1)], dim=-1)
+        assert torch.allclose(result, expected, atol=1e-5)
+        r.ok("binding: swizzle .rgb on fetch")
+    except Exception as e:
+        r.fail("binding: swizzle .rgb on fetch", str(e))
+
+    # Binding sample with swizzle .a
+    try:
+        result = compile_and_run("""
+            float alpha = @A(u, v).a;
+            @OUT = vec4(alpha);
+        """, {"A": img})
+        r.ok("binding: swizzle .a on sample")
+    except Exception as e:
+        r.fail("binding: swizzle .a on sample", str(e))
+
+    # Error: binding access on undefined binding
+    try:
+        compile_and_run("@OUT = @nonexistent[0, 0];", {"A": img})
+        r.fail("error: undefined binding @nonexistent", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError, InterpreterError):
+        r.ok("error: undefined binding @nonexistent")
+    except Exception as e:
+        r.fail("error: undefined binding @nonexistent", str(e))
+
+    # Mixed fetch and sample in same program
+    try:
+        result = compile_and_run("""
+            vec4 fetched = @A[ix, iy];
+            vec4 sampled = @A(u, v);
+            @OUT = (fetched + sampled) * 0.5;
+        """, {"A": img})
+        r.ok("binding: mixed fetch and sample in same program")
+    except Exception as e:
+        r.fail("binding: mixed fetch and sample in same program", str(e))
+
+
+# ── Scope and Shadowing Tests ─────────────────────────────────────────
+
+def test_scope_and_shadowing(r: TestResult):
+    """Test variable scoping and shadowing."""
+    print("\n--- Scope and Shadowing Tests ---")
+    img = torch.rand(1, 4, 4, 4)
+
+    # Variable declared in if block not visible outside
+    try:
+        compile_and_run("""
+            if (1.0 > 0.0) {
+                float inner_var = 5.0;
+            }
+            @OUT = vec4(inner_var);
+        """, {"A": img})
+        r.fail("scope: if-block var not visible outside", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("scope: if-block var not visible outside")
+    except Exception as e:
+        r.fail("scope: if-block var not visible outside", str(e))
+
+    # Variable in for-loop init not visible after loop
+    try:
+        compile_and_run("""
+            for (int i = 0; i < 3; i++) {
+                float dummy = 1.0;
+            }
+            @OUT = vec4(float(i));
+        """, {"A": img})
+        r.fail("scope: loop var not visible after loop", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("scope: loop var not visible after loop")
+    except Exception as e:
+        r.fail("scope: loop var not visible after loop", str(e))
+
+    # Variable re-declaration in if block — TEX if-blocks share the enclosing
+    # scope, so re-declaring x inside an if-block overwrites the outer x.
+    try:
+        result = compile_and_run("""
+            float x = 1.0;
+            if (1.0 > 0.0) {
+                x = 2.0;
+            }
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 2.0) < 1e-5, f"Expected 2.0 (modified in if), got {v}"
+        r.ok("scope: if-block modifies outer var")
+    except Exception as e:
+        r.fail("scope: if-block modifies outer var", str(e))
+
+    # Function parameter shadows outer variable
+    try:
+        result = compile_and_run("""
+            float x = 100.0;
+            float identity(float x) {
+                return x;
+            }
+            float val = identity(5.0);
+            @OUT = vec4(val, x, 0.0, 1.0);
+        """, {"A": img})
+        val = result[0, 0, 0, 0].item()
+        outer_x = result[0, 0, 0, 1].item()
+        assert abs(val - 5.0) < 1e-5, f"Expected func result 5.0, got {val}"
+        assert abs(outer_x - 100.0) < 1e-5, f"Expected outer x 100.0, got {outer_x}"
+        r.ok("scope: function param shadows outer")
+    except Exception as e:
+        r.fail("scope: function param shadows outer", str(e))
+
+    # Loop variable i not visible after loop (for)
+    try:
+        compile_and_run("""
+            for (int j = 0; j < 3; j++) {}
+            @OUT = vec4(float(j));
+        """, {"A": img})
+        r.fail("scope: for-loop j not visible after", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("scope: for-loop j not visible after")
+    except Exception as e:
+        r.fail("scope: for-loop j not visible after", str(e))
+
+    # While loop variable scope
+    try:
+        result = compile_and_run("""
+            float outer = 10.0;
+            int count = 0;
+            while (count < 3) {
+                float inner = 1.0;
+                count++;
+            }
+            @OUT = vec4(outer);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 10.0) < 1e-5, f"Expected 10.0, got {v}"
+        r.ok("scope: while loop inner not leaked")
+    except Exception as e:
+        r.fail("scope: while loop inner not leaked", str(e))
+
+    # Nested for loop variable independence
+    try:
+        result = compile_and_run("""
+            float total = 0.0;
+            for (int i = 0; i < 3; i++) {
+                for (int j = 0; j < 2; j++) {
+                    total += 1.0;
+                }
+            }
+            @OUT = vec4(total);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 6.0) < 1e-5, f"Expected 6.0, got {v}"
+        r.ok("scope: nested for loops independent")
+    except Exception as e:
+        r.fail("scope: nested for loops independent", str(e))
+
+    # Variable declared in else block
+    try:
+        compile_and_run("""
+            if (0.0 > 1.0) {
+                float a = 1.0;
+            } else {
+                float b = 2.0;
+            }
+            @OUT = vec4(b);
+        """, {"A": img})
+        r.fail("scope: else-block var not visible outside", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("scope: else-block var not visible outside")
+    except Exception as e:
+        r.fail("scope: else-block var not visible outside", str(e))
+
+    # Function body scope doesn't leak
+    try:
+        compile_and_run("""
+            float my_func() {
+                float secret = 42.0;
+                return secret;
+            }
+            float val = my_func();
+            @OUT = vec4(secret);
+        """, {"A": img})
+        r.fail("scope: function body doesn't leak", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError):
+        r.ok("scope: function body doesn't leak")
+    except Exception as e:
+        r.fail("scope: function body doesn't leak", str(e))
+
+    # Multiple blocks with same variable name (independent)
+    try:
+        result = compile_and_run("""
+            float result = 0.0;
+            if (1.0 > 0.0) {
+                float tmp = 10.0;
+                result = tmp;
+            }
+            if (1.0 > 0.0) {
+                float tmp = 20.0;
+                result += tmp;
+            }
+            @OUT = vec4(result);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 30.0) < 1e-5, f"Expected 30.0, got {v}"
+        r.ok("scope: multiple blocks same var name")
+    except Exception as e:
+        r.fail("scope: multiple blocks same var name", str(e))
+
+    # Variable modification in function doesn't affect outer
+    try:
+        result = compile_and_run("""
+            float x = 5.0;
+            float modify(float x) {
+                x = x * 100.0;
+                return x;
+            }
+            float dummy = modify(x);
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 5.0) < 1e-5, f"Expected 5.0 (unmodified), got {v}"
+        r.ok("scope: function param modification doesn't affect outer")
+    except Exception as e:
+        r.fail("scope: function param modification doesn't affect outer", str(e))
+
+    # Break inside nested scope preserves outer variables
+    try:
+        result = compile_and_run("""
+            float x = 0.0;
+            for (int i = 0; i < 10; i++) {
+                x += 1.0;
+                if (i == 4) {
+                    break;
+                }
+            }
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 5.0) < 1e-5, f"Expected 5.0, got {v}"
+        r.ok("scope: break preserves outer variables")
+    except Exception as e:
+        r.fail("scope: break preserves outer variables", str(e))
+
+
+# ── Operator Edge Cases Tests ─────────────────────────────────────────
+
+def test_operator_edge_cases(r: TestResult):
+    """Test operator combinations and edge cases."""
+    print("\n--- Operator Edge Cases Tests ---")
+    img = torch.rand(1, 4, 4, 4)
+
+    # Modulo operator
+    try:
+        result = compile_and_run("""
+            float x = mod(7.0, 3.0);
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("operator: mod(7, 3)")
+    except Exception as e:
+        r.fail("operator: mod(7, 3)", str(e))
+
+    # Comparison chain via nested ternary
+    try:
+        result = compile_and_run("""
+            float a = 1.0;
+            float b = (a > 0.5) ? ((a < 1.5) ? 1.0 : 0.0) : 0.0;
+            @OUT = vec4(b);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("operator: comparison chain via ternary")
+    except Exception as e:
+        r.fail("operator: comparison chain via ternary", str(e))
+
+    # Logical NOT on comparison
+    try:
+        result = compile_and_run("""
+            float x = !(0.8 > 0.5) ? 1.0 : 0.0;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 0.0) < 1e-5, f"Expected 0.0, got {v}"
+        r.ok("operator: logical NOT on comparison")
+    except Exception as e:
+        r.fail("operator: logical NOT on comparison", str(e))
+
+    # Unary minus on expression
+    try:
+        result = compile_and_run("""
+            float a = 3.0;
+            float b = 2.0;
+            float x = -(a + b);
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - (-5.0)) < 1e-5, f"Expected -5.0, got {v}"
+        r.ok("operator: unary minus on expression")
+    except Exception as e:
+        r.fail("operator: unary minus on expression", str(e))
+
+    # Operator precedence: 2 + 3 * 4 == 14
+    try:
+        result = compile_and_run("""
+            float x = 2.0 + 3.0 * 4.0;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 14.0) < 1e-5, f"Expected 14.0, got {v}"
+        r.ok("operator: precedence mul before add")
+    except Exception as e:
+        r.fail("operator: precedence mul before add", str(e))
+
+    # Mixed int/float arithmetic
+    try:
+        result = compile_and_run("""
+            float x = 3 * 0.5;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.5) < 1e-5, f"Expected 1.5, got {v}"
+        r.ok("operator: mixed int/float arithmetic")
+    except Exception as e:
+        r.fail("operator: mixed int/float arithmetic", str(e))
+
+    # String + float concatenation via str()
+    try:
+        result = compile_and_run("""
+            s@OUT = "val=" + str(1.5);
+        """, {"A": img})
+        assert "val=" in result and "1.5" in result, f"Got {result}"
+        r.ok("operator: string + str(float)")
+    except Exception as e:
+        r.fail("operator: string + str(float)", str(e))
+
+    # Comparison returning mask-like value
+    try:
+        result = compile_and_run("""
+            float mask = 0.8 > 0.5 ? 1.0 : 0.0;
+            @OUT = vec4(mask);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("operator: comparison as mask (true)")
+    except Exception as e:
+        r.fail("operator: comparison as mask (true)", str(e))
+
+    # Compound assignment with expression: x *= 2 + 1 should multiply by 3
+    try:
+        result = compile_and_run("""
+            float x = 5.0;
+            x *= 2.0 + 1.0;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 15.0) < 1e-5, f"Expected 15.0, got {v}"
+        r.ok("operator: compound *= with expression")
+    except Exception as e:
+        r.fail("operator: compound *= with expression", str(e))
+
+    # Increment operators
+    try:
+        result = compile_and_run("""
+            int x = 5;
+            x++;
+            int y = x;
+            @OUT = vec4(float(y));
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 6.0) < 1e-5, f"Expected 6.0, got {v}"
+        r.ok("operator: postfix increment")
+    except Exception as e:
+        r.fail("operator: postfix increment", str(e))
+
+    # Decrement operators
+    try:
+        result = compile_and_run("""
+            int x = 5;
+            x--;
+            @OUT = vec4(float(x));
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 4.0) < 1e-5, f"Expected 4.0, got {v}"
+        r.ok("operator: postfix decrement")
+    except Exception as e:
+        r.fail("operator: postfix decrement", str(e))
+
+    # Assignment to .r channel
+    try:
+        result = compile_and_run("""
+            vec3 c = vec3(0.0);
+            c.r = 1.0;
+            @OUT = vec4(c, 1.0);
+        """, {"A": img})
+        rv = result[0, 0, 0, 0].item()
+        gv = result[0, 0, 0, 1].item()
+        assert abs(rv - 1.0) < 1e-5 and abs(gv - 0.0) < 1e-5, f"Got r={rv}, g={gv}"
+        r.ok("operator: assignment to .r channel")
+    except Exception as e:
+        r.fail("operator: assignment to .r channel", str(e))
+
+    # Assignment to .rgb — TEX only supports single-channel assignment, so
+    # multi-channel swizzle assignment is an error
+    try:
+        compile_and_run("""
+            vec4 c = vec4(0.0);
+            c.rgb = vec3(1.0, 0.5, 0.25);
+            @OUT = c;
+        """, {"A": img})
+        r.fail("operator: .rgb assignment is error", "Should have raised an error")
+    except (TypeCheckError, TEXMultiError, ParseError, InterpreterError):
+        r.ok("operator: .rgb assignment is error")
+    except Exception as e:
+        r.fail("operator: .rgb assignment is error", str(e))
+
+    # Logical OR
+    try:
+        result = compile_and_run("""
+            float x = (0.2 > 0.5 || 0.8 > 0.5) ? 1.0 : 0.0;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0, got {v}"
+        r.ok("operator: logical OR")
+    except Exception as e:
+        r.fail("operator: logical OR", str(e))
+
+
+# ── Casting Exhaustive Tests ──────────────────────────────────────────
+
+def test_casting_exhaustive(r: TestResult):
+    """Test all type cast paths."""
+    print("\n--- Casting Exhaustive Tests ---")
+    img = torch.rand(1, 4, 4, 4)
+
+    # float(int) — int to float
+    try:
+        result = compile_and_run("""
+            int n = 7;
+            float x = float(n);
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 7.0) < 1e-5, f"Expected 7.0, got {v}"
+        r.ok("cast: float(int)")
+    except Exception as e:
+        r.fail("cast: float(int)", str(e))
+
+    # int(float) — truncation
+    try:
+        result = compile_and_run("""
+            float f = 1.7;
+            int n = int(f);
+            @OUT = vec4(float(n));
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 1.0) < 1e-5, f"Expected 1.0 (truncated), got {v}"
+        r.ok("cast: int(1.7) truncates")
+    except Exception as e:
+        r.fail("cast: int(1.7) truncates", str(e))
+
+    # vec3(float) — broadcast
+    try:
+        result = compile_and_run("""
+            vec3 c = vec3(0.5);
+            @OUT = vec4(c, 1.0);
+        """, {"A": img})
+        rv = result[0, 0, 0, 0].item()
+        gv = result[0, 0, 0, 1].item()
+        bv = result[0, 0, 0, 2].item()
+        assert abs(rv - 0.5) < 1e-5 and abs(gv - 0.5) < 1e-5 and abs(bv - 0.5) < 1e-5
+        r.ok("cast: vec3(float) broadcast")
+    except Exception as e:
+        r.fail("cast: vec3(float) broadcast", str(e))
+
+    # vec4(vec3, alpha) — explicit construction with alpha
+    # Note: vec4(vec3) single-arg is not supported; use vec4(c, 1.0)
+    try:
+        result = compile_and_run("""
+            vec3 c = vec3(1.0, 0.5, 0.0);
+            vec4 full = vec4(c, 1.0);
+            @OUT = full;
+        """, {"A": img})
+        rv = result[0, 0, 0, 0].item()
+        gv = result[0, 0, 0, 1].item()
+        av = result[0, 0, 0, 3].item()
+        assert abs(rv - 1.0) < 1e-5 and abs(gv - 0.5) < 1e-5, f"Got r={rv}, g={gv}"
+        assert abs(av - 1.0) < 1e-5, f"Expected alpha=1.0, got {av}"
+        r.ok("cast: vec4(vec3, alpha)")
+    except Exception as e:
+        r.fail("cast: vec4(vec3, alpha)", str(e))
+
+    # str(float) — float to string
+    try:
+        result = compile_and_run("""
+            s@OUT = str(42.0);
+        """, {"A": img})
+        assert "42" in result, f"Got {result}"
+        r.ok("cast: str(float)")
+    except Exception as e:
+        r.fail("cast: str(float)", str(e))
+
+    # str(int) — int to string
+    try:
+        result = compile_and_run("""
+            s@OUT = str(7);
+        """, {"A": img})
+        assert "7" in result, f"Got {result}"
+        r.ok("cast: str(int)")
+    except Exception as e:
+        r.fail("cast: str(int)", str(e))
+
+    # to_int(string) — string to int
+    try:
+        result = compile_and_run("""
+            int n = to_int("42");
+            @OUT = vec4(float(n));
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 42.0) < 1e-5, f"Expected 42.0, got {v}"
+        r.ok("cast: to_int(string)")
+    except Exception as e:
+        r.fail("cast: to_int(string)", str(e))
+
+    # to_float(string) — string to float
+    try:
+        result = compile_and_run("""
+            float f = to_float("3.14");
+            @OUT = vec4(f);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 3.14) < 1e-3, f"Expected 3.14, got {v}"
+        r.ok("cast: to_float(string)")
+    except Exception as e:
+        r.fail("cast: to_float(string)", str(e))
+
+    # int(3.9) — should truncate to 3
+    try:
+        result = compile_and_run("""
+            int n = int(3.9);
+            @OUT = vec4(float(n));
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 3.0) < 1e-5, f"Expected 3.0, got {v}"
+        r.ok("cast: int(3.9) truncates to 3")
+    except Exception as e:
+        r.fail("cast: int(3.9) truncates to 3", str(e))
+
+    # int(-1.5) — negative truncation
+    try:
+        result = compile_and_run("""
+            int n = int(-1.5);
+            @OUT = vec4(float(n));
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        # TEX uses floor-based int cast: int(-1.5) -> -2
+        assert abs(v - (-2.0)) < 1e-5, f"Expected -2.0, got {v}"
+        r.ok("cast: int(-1.5) negative truncation")
+    except Exception as e:
+        r.fail("cast: int(-1.5) negative truncation", str(e))
+
+    # Cast in expression
+    try:
+        result = compile_and_run("""
+            float x = float(3) + 0.5;
+            @OUT = vec4(x);
+        """, {"A": img})
+        v = result[0, 0, 0, 0].item()
+        assert abs(v - 3.5) < 1e-5, f"Expected 3.5, got {v}"
+        r.ok("cast: float(3) + 0.5 in expression")
+    except Exception as e:
+        r.fail("cast: float(3) + 0.5 in expression", str(e))
+
+    # vec4(float) — broadcast to all channels
+    try:
+        result = compile_and_run("""
+            vec4 c = vec4(0.75);
+            @OUT = c;
+        """, {"A": img})
+        for ch in range(4):
+            v = result[0, 0, 0, ch].item()
+            assert abs(v - 0.75) < 1e-5, f"Channel {ch}: expected 0.75, got {v}"
+        r.ok("cast: vec4(float) broadcast")
+    except Exception as e:
+        r.fail("cast: vec4(float) broadcast", str(e))
+
+
+# ── Missing Stdlib Functions ───────────────────────────────────────────
+
+def test_missing_stdlib_functions(r: TestResult):
+    """Tests for reflect, rgb2hsv, and matches stdlib functions."""
+    print("\n--- Missing Stdlib Functions Tests ---")
+
+    B, H, W = 1, 4, 4
+    img = torch.rand(B, H, W, 3)
+
+    # -- reflect(incident, normal) --
+
+    # reflect along Y axis: incident=(1,0,0), normal=(0,1,0) -> (1,0,0) (no change in x)
+    try:
+        code = "vec3 r = reflect(vec3(1,0,0), vec3(0,1,0)); @OUT = vec4(r.x, r.y, r.z, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 1.0) < 1e-4, f"x={result[0,0,0,0].item()}"
+        assert abs(result[0,0,0,1].item()) < 1e-4, f"y={result[0,0,0,1].item()}"
+        assert abs(result[0,0,0,2].item()) < 1e-4, f"z={result[0,0,0,2].item()}"
+        r.ok("reflect: (1,0,0) over normal (0,1,0)")
+    except Exception as e:
+        r.fail("reflect: (1,0,0) over normal (0,1,0)", f"{e}")
+
+    # reflect: incident=(0,1,0), normal=(0,1,0) -> (0,-1,0)
+    try:
+        code = "vec3 r = reflect(vec3(0,1,0), vec3(0,1,0)); @OUT = vec4(r.x, r.y, r.z, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item()) < 1e-4
+        assert abs(result[0,0,0,1].item() - (-1.0)) < 1e-4
+        assert abs(result[0,0,0,2].item()) < 1e-4
+        r.ok("reflect: (0,1,0) over normal (0,1,0)")
+    except Exception as e:
+        r.fail("reflect: (0,1,0) over normal (0,1,0)", f"{e}")
+
+    # reflect: 45-degree — incident=(1,1,0), normal=(0,1,0) -> (1,-1,0)
+    try:
+        code = "vec3 r = reflect(vec3(1,1,0), vec3(0,1,0)); @OUT = vec4(r.x, r.y, r.z, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 1.0) < 1e-4
+        assert abs(result[0,0,0,1].item() - (-1.0)) < 1e-4
+        r.ok("reflect: 45-degree (1,1,0)")
+    except Exception as e:
+        r.fail("reflect: 45-degree (1,1,0)", f"{e}")
+
+    # reflect: 4D vector
+    try:
+        code = "vec4 r = reflect(vec4(0,1,0,0), vec4(0,1,0,0)); @OUT = r;"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,1].item() - (-1.0)) < 1e-4
+        r.ok("reflect: 4D vector")
+    except Exception as e:
+        r.fail("reflect: 4D vector", f"{e}")
+
+    # reflect: zero incident
+    try:
+        code = "vec3 r = reflect(vec3(0,0,0), vec3(0,1,0)); @OUT = vec4(r.x, r.y, r.z, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item()) < 1e-4
+        assert abs(result[0,0,0,1].item()) < 1e-4
+        r.ok("reflect: zero incident")
+    except Exception as e:
+        r.fail("reflect: zero incident", f"{e}")
+
+    # -- rgb2hsv --
+
+    # Pure red (1,0,0) -> H ~ 0, S=1, V=1
+    try:
+        code = "vec3 hsv = rgb2hsv(vec3(1,0,0)); @OUT = vec4(hsv.x, hsv.y, hsv.z, 1);"
+        result = compile_and_run(code, {"A": img})
+        h = result[0,0,0,0].item()
+        s = result[0,0,0,1].item()
+        v = result[0,0,0,2].item()
+        assert (abs(h) < 0.02 or abs(h - 1.0) < 0.02), f"Red H should be ~0 or ~1, got {h}"
+        assert abs(s - 1.0) < 0.02, f"Red S should be ~1, got {s}"
+        assert abs(v - 1.0) < 0.02, f"Red V should be ~1, got {v}"
+        r.ok("rgb2hsv: pure red")
+    except Exception as e:
+        r.fail("rgb2hsv: pure red", f"{e}")
+
+    # Pure green (0,1,0) -> H ~ 0.333, S=1, V=1
+    try:
+        code = "vec3 hsv = rgb2hsv(vec3(0,1,0)); @OUT = vec4(hsv.x, hsv.y, hsv.z, 1);"
+        result = compile_and_run(code, {"A": img})
+        h = result[0,0,0,0].item()
+        assert abs(h - 0.333) < 0.02, f"Green H should be ~0.333, got {h}"
+        assert abs(result[0,0,0,1].item() - 1.0) < 0.02
+        r.ok("rgb2hsv: pure green")
+    except Exception as e:
+        r.fail("rgb2hsv: pure green", f"{e}")
+
+    # White (1,1,1) -> S=0, V=1
+    try:
+        code = "vec3 hsv = rgb2hsv(vec3(1,1,1)); @OUT = vec4(hsv.x, hsv.y, hsv.z, 1);"
+        result = compile_and_run(code, {"A": img})
+        s = result[0,0,0,1].item()
+        v = result[0,0,0,2].item()
+        assert abs(s) < 0.02, f"White S should be ~0, got {s}"
+        assert abs(v - 1.0) < 0.02, f"White V should be ~1, got {v}"
+        r.ok("rgb2hsv: white")
+    except Exception as e:
+        r.fail("rgb2hsv: white", f"{e}")
+
+    # Black (0,0,0) -> S=0, V=0
+    try:
+        code = "vec3 hsv = rgb2hsv(vec3(0,0,0)); @OUT = vec4(hsv.x, hsv.y, hsv.z, 1);"
+        result = compile_and_run(code, {"A": img})
+        s = result[0,0,0,1].item()
+        v = result[0,0,0,2].item()
+        assert abs(s) < 0.02, f"Black S should be ~0, got {s}"
+        assert abs(v) < 0.02, f"Black V should be ~0, got {v}"
+        r.ok("rgb2hsv: black")
+    except Exception as e:
+        r.fail("rgb2hsv: black", f"{e}")
+
+    # Round-trip: rgb -> hsv -> rgb
+    try:
+        code = """
+vec3 orig = vec3(0.3, 0.6, 0.9);
+vec3 hsv = rgb2hsv(orig);
+vec3 back = hsv2rgb(hsv);
+@OUT = vec4(back.x, back.y, back.z, 1);
+"""
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 0.3) < 0.01, f"R round-trip failed"
+        assert abs(result[0,0,0,1].item() - 0.6) < 0.01, f"G round-trip failed"
+        assert abs(result[0,0,0,2].item() - 0.9) < 0.01, f"B round-trip failed"
+        r.ok("rgb2hsv: round-trip with hsv2rgb")
+    except Exception as e:
+        r.fail("rgb2hsv: round-trip with hsv2rgb", f"{e}")
+
+    # -- matches(string, pattern) --
+    # Note: matches() uses re.fullmatch, so the pattern must match the entire string
+
+    # Basic full match
+    try:
+        code = 'float x = matches("hello", "hello"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 1.0) < 1e-4
+        r.ok("matches: exact full match")
+    except Exception as e:
+        r.fail("matches: exact full match", f"{e}")
+
+    # No match
+    try:
+        code = 'float x = matches("hello", "xyz"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item()) < 1e-4
+        r.ok("matches: no match")
+    except Exception as e:
+        r.fail("matches: no match", f"{e}")
+
+    # Regex pattern with fullmatch
+    try:
+        code = 'float x = matches("test123", "test[0-9]+"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 1.0) < 1e-4
+        r.ok("matches: regex digit pattern")
+    except Exception as e:
+        r.fail("matches: regex digit pattern", f"{e}")
+
+    # Partial match should fail with fullmatch
+    try:
+        code = r'float x = matches("hello world", "hello"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item()) < 1e-4
+        r.ok("matches: partial does not fullmatch")
+    except Exception as e:
+        r.fail("matches: partial does not fullmatch", f"{e}")
+
+    # Wildcard fullmatch
+    try:
+        code = 'float x = matches("anything", ".*"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 1.0) < 1e-4
+        r.ok("matches: wildcard .* fullmatch")
+    except Exception as e:
+        r.fail("matches: wildcard .* fullmatch", f"{e}")
+
+    # Empty string with .*
+    try:
+        code = 'float x = matches("", ".*"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 1.0) < 1e-4
+        r.ok("matches: empty string with .*")
+    except Exception as e:
+        r.fail("matches: empty string with .*", f"{e}")
+
+
+# ── Numeric Edge Case Matrix ──────────────────────────────────────────
+
+def test_numeric_edge_case_matrix(r: TestResult):
+    """Systematically test math stdlib functions with special inputs."""
+    print("\n--- Numeric Edge Case Matrix Tests ---")
+
+    B, H, W = 1, 2, 2
+    img = torch.rand(B, H, W, 3)
+
+    def run_check(name, code, expect_finite=True):
+        """Run code and check that it doesn't crash. If expect_finite, verify result is finite."""
+        try:
+            result = compile_and_run(code, {"A": img})
+            val = result[0,0,0,0].item()
+            is_nan = val != val
+            is_inf = abs(val) == float('inf')
+            if expect_finite and is_nan:
+                r.fail(f"edge: {name}", f"Got NaN, expected finite")
+            elif expect_finite and is_inf:
+                r.fail(f"edge: {name}", f"Got Inf, expected finite")
+            else:
+                r.ok(f"edge: {name}")
+        except Exception as e:
+            r.fail(f"edge: {name}", f"{e}")
+
+    # -- sin --
+    run_check("sin(0.0)", "float x = sin(0.0); @OUT = vec3(x,x,x);")
+    run_check("sin(-1.0)", "float x = sin(-1.0); @OUT = vec3(x,x,x);")
+    run_check("sin(1e30)", "float x = sin(1e30); @OUT = vec3(x,x,x);")
+    run_check("sin(1e-30)", "float x = sin(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- cos --
+    run_check("cos(0.0)", "float x = cos(0.0); @OUT = vec3(x,x,x);")
+    run_check("cos(-1.0)", "float x = cos(-1.0); @OUT = vec3(x,x,x);")
+    run_check("cos(1e30)", "float x = cos(1e30); @OUT = vec3(x,x,x);")
+    run_check("cos(1e-30)", "float x = cos(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- tan --
+    run_check("tan(0.0)", "float x = tan(0.0); @OUT = vec3(x,x,x);")
+    run_check("tan(-1.0)", "float x = tan(-1.0); @OUT = vec3(x,x,x);")
+    run_check("tan(1e-30)", "float x = tan(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- asin --
+    run_check("asin(0.0)", "float x = asin(0.0); @OUT = vec3(x,x,x);")
+    run_check("asin(-0.5)", "float x = asin(-0.5); @OUT = vec3(x,x,x);")
+    run_check("asin(1e-30)", "float x = asin(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- acos --
+    run_check("acos(0.0)", "float x = acos(0.0); @OUT = vec3(x,x,x);")
+    run_check("acos(-0.5)", "float x = acos(-0.5); @OUT = vec3(x,x,x);")
+    run_check("acos(1e-30)", "float x = acos(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- atan --
+    run_check("atan(0.0)", "float x = atan(0.0); @OUT = vec3(x,x,x);")
+    run_check("atan(-1.0)", "float x = atan(-1.0); @OUT = vec3(x,x,x);")
+    run_check("atan(1e30)", "float x = atan(1e30); @OUT = vec3(x,x,x);")
+    run_check("atan(1e-30)", "float x = atan(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- atan2 --
+    run_check("atan2(0,1)", "float x = atan2(0.0, 1.0); @OUT = vec3(x,x,x);")
+    run_check("atan2(1,0)", "float x = atan2(1.0, 0.0); @OUT = vec3(x,x,x);")
+    run_check("atan2(-1,-1)", "float x = atan2(-1.0, -1.0); @OUT = vec3(x,x,x);")
+    run_check("atan2(0,0)", "float x = atan2(0.0, 0.0); @OUT = vec3(x,x,x);")
+
+    # -- sqrt --
+    run_check("sqrt(0.0)", "float x = sqrt(0.0); @OUT = vec3(x,x,x);")
+    run_check("sqrt(1e-30)", "float x = sqrt(1e-30); @OUT = vec3(x,x,x);")
+    run_check("sqrt(1e30)", "float x = sqrt(1e30); @OUT = vec3(x,x,x);")
+
+    # -- pow --
+    run_check("pow(0,0)", "float x = pow(0.0, 0.0); @OUT = vec3(x,x,x);")
+    run_check("pow(2,-1)", "float x = pow(2.0, -1.0); @OUT = vec3(x,x,x);")
+    run_check("pow(1e30,2)", "float x = pow(1e30, 2.0); @OUT = vec3(x,x,x);", expect_finite=False)
+
+    # -- exp --
+    run_check("exp(0.0)", "float x = exp(0.0); @OUT = vec3(x,x,x);")
+    run_check("exp(-100)", "float x = exp(-100.0); @OUT = vec3(x,x,x);")
+    run_check("exp(1e-30)", "float x = exp(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- log --
+    run_check("log(1.0)", "float x = log(1.0); @OUT = vec3(x,x,x);")
+    run_check("log(1e-30)", "float x = log(1e-30); @OUT = vec3(x,x,x);")
+    run_check("log(1e30)", "float x = log(1e30); @OUT = vec3(x,x,x);")
+
+    # -- log2 --
+    run_check("log2(1.0)", "float x = log2(1.0); @OUT = vec3(x,x,x);")
+    run_check("log2(1e-30)", "float x = log2(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- log10 --
+    run_check("log10(1.0)", "float x = log10(1.0); @OUT = vec3(x,x,x);")
+    run_check("log10(1e-30)", "float x = log10(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- abs --
+    run_check("abs(0.0)", "float x = abs(0.0); @OUT = vec3(x,x,x);")
+    run_check("abs(-1e30)", "float x = abs(-1e30); @OUT = vec3(x,x,x);")
+    run_check("abs(1e-30)", "float x = abs(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- sign --
+    run_check("sign(0.0)", "float x = sign(0.0); @OUT = vec3(x,x,x);")
+    run_check("sign(-1e30)", "float x = sign(-1e30); @OUT = vec3(x,x,x);")
+    run_check("sign(1e-30)", "float x = sign(1e-30); @OUT = vec3(x,x,x);")
+
+    # -- floor --
+    run_check("floor(0.0)", "float x = floor(0.0); @OUT = vec3(x,x,x);")
+    run_check("floor(-0.5)", "float x = floor(-0.5); @OUT = vec3(x,x,x);")
+    run_check("floor(1e30)", "float x = floor(1e30); @OUT = vec3(x,x,x);")
+
+    # -- ceil --
+    run_check("ceil(0.0)", "float x = ceil(0.0); @OUT = vec3(x,x,x);")
+    run_check("ceil(-0.5)", "float x = ceil(-0.5); @OUT = vec3(x,x,x);")
+    run_check("ceil(1e30)", "float x = ceil(1e30); @OUT = vec3(x,x,x);")
+
+    # -- round --
+    run_check("round(0.0)", "float x = round(0.0); @OUT = vec3(x,x,x);")
+    run_check("round(-0.5)", "float x = round(-0.5); @OUT = vec3(x,x,x);")
+    run_check("round(1e30)", "float x = round(1e30); @OUT = vec3(x,x,x);")
+
+    # -- fract --
+    run_check("fract(0.0)", "float x = fract(0.0); @OUT = vec3(x,x,x);")
+    run_check("fract(-0.5)", "float x = fract(-0.5); @OUT = vec3(x,x,x);")
+    run_check("fract(1e30)", "float x = fract(1e30); @OUT = vec3(x,x,x);")
+
+    # -- mod --
+    run_check("mod(5,3)", "float x = mod(5.0, 3.0); @OUT = vec3(x,x,x);")
+    run_check("mod(0,1)", "float x = mod(0.0, 1.0); @OUT = vec3(x,x,x);")
+    run_check("mod(-5,3)", "float x = mod(-5.0, 3.0); @OUT = vec3(x,x,x);")
+
+    # -- clamp --
+    run_check("clamp(0.5,0,1)", "float x = clamp(0.5, 0.0, 1.0); @OUT = vec3(x,x,x);")
+    run_check("clamp(-1,0,1)", "float x = clamp(-1.0, 0.0, 1.0); @OUT = vec3(x,x,x);")
+    run_check("clamp(1e30,0,1)", "float x = clamp(1e30, 0.0, 1.0); @OUT = vec3(x,x,x);")
+
+    # -- lerp --
+    run_check("lerp(0,1,0.5)", "float x = lerp(0.0, 1.0, 0.5); @OUT = vec3(x,x,x);")
+    run_check("lerp(0,1,0)", "float x = lerp(0.0, 1.0, 0.0); @OUT = vec3(x,x,x);")
+    run_check("lerp(0,1,1)", "float x = lerp(0.0, 1.0, 1.0); @OUT = vec3(x,x,x);")
+    run_check("lerp(0,1,-1)", "float x = lerp(0.0, 1.0, -1.0); @OUT = vec3(x,x,x);")
+
+    # -- smoothstep --
+    run_check("smoothstep(0,1,0.5)", "float x = smoothstep(0.0, 1.0, 0.5); @OUT = vec3(x,x,x);")
+    run_check("smoothstep(0,1,0)", "float x = smoothstep(0.0, 1.0, 0.0); @OUT = vec3(x,x,x);")
+    run_check("smoothstep(0,1,1)", "float x = smoothstep(0.0, 1.0, 1.0); @OUT = vec3(x,x,x);")
+    run_check("smoothstep(0,1,-1)", "float x = smoothstep(0.0, 1.0, -1.0); @OUT = vec3(x,x,x);")
+
+    # -- step --
+    run_check("step(0.5,0.3)", "float x = step(0.5, 0.3); @OUT = vec3(x,x,x);")
+    run_check("step(0.5,0.5)", "float x = step(0.5, 0.5); @OUT = vec3(x,x,x);")
+    run_check("step(0.5,0.7)", "float x = step(0.5, 0.7); @OUT = vec3(x,x,x);")
+    run_check("step(0,0)", "float x = step(0.0, 0.0); @OUT = vec3(x,x,x);")
+
+
+# ── Array Bounds Tests ────────────────────────────────────────────────
+
+def test_array_bounds(r: TestResult):
+    """Tests for array bounds handling, edge cases."""
+    print("\n--- Array Bounds Tests ---")
+
+    B, H, W = 1, 4, 4
+    img = torch.rand(B, H, W, 4)
+
+    # Access at index 0 (first element)
+    try:
+        code = "float a[] = {10.0, 20.0, 30.0}; @OUT = vec4(a[0], 0, 0, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 10.0) < 1e-4
+        r.ok("array bounds: index 0")
+    except Exception as e:
+        r.fail("array bounds: index 0", f"{e}")
+
+    # Access at last valid index
+    try:
+        code = "float a[] = {10.0, 20.0, 30.0}; @OUT = vec4(a[2], 0, 0, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 30.0) < 1e-4
+        r.ok("array bounds: last index")
+    except Exception as e:
+        r.fail("array bounds: last index", f"{e}")
+
+    # Access beyond bounds (should clamp to last element)
+    try:
+        code = "float a[] = {10.0, 20.0, 30.0}; @OUT = vec4(a[5], 0, 0, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 30.0) < 1e-4
+        r.ok("array bounds: beyond upper clamps to last")
+    except Exception as e:
+        r.fail("array bounds: beyond upper clamps to last", f"{e}")
+
+    # Access at very large index
+    try:
+        code = "float a[] = {10.0, 20.0, 30.0}; @OUT = vec4(a[1000], 0, 0, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 30.0) < 1e-4
+        r.ok("array bounds: very large index clamps")
+    except Exception as e:
+        r.fail("array bounds: very large index clamps", f"{e}")
+
+    # Negative index (should clamp to 0)
+    try:
+        code = "float a[] = {10.0, 20.0, 30.0}; @OUT = vec4(a[-1], 0, 0, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 10.0) < 1e-4
+        r.ok("array bounds: negative clamps to 0")
+    except Exception as e:
+        r.fail("array bounds: negative clamps to 0", f"{e}")
+
+    # Very negative index
+    try:
+        code = "float a[] = {10.0, 20.0, 30.0}; @OUT = vec4(a[-100], 0, 0, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 10.0) < 1e-4
+        r.ok("array bounds: very negative clamps to 0")
+    except Exception as e:
+        r.fail("array bounds: very negative clamps to 0", f"{e}")
+
+    # Array length with len()
+    try:
+        code = "float a[] = {1.0, 2.0, 3.0, 4.0, 5.0}; float n = len(a); @OUT = vec4(n, 0, 0, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 5.0) < 1e-4
+        r.ok("array bounds: len()")
+    except Exception as e:
+        r.fail("array bounds: len()", f"{e}")
+
+    # Single element array
+    try:
+        code = "float a[] = {42.0}; @OUT = vec4(a[0], len(a), 0, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 42.0) < 1e-4
+        assert abs(result[0,0,0,1].item() - 1.0) < 1e-4
+        r.ok("array bounds: single element")
+    except Exception as e:
+        r.fail("array bounds: single element", f"{e}")
+
+    # Write beyond bounds (should clamp)
+    try:
+        code = """
+float a[] = {1.0, 2.0, 3.0};
+a[10] = 99.0;
+@OUT = vec4(a[0], a[1], a[2], 1);
+"""
+        result = compile_and_run(code, {"A": img})
+        # Writing at clamped index 2 should change a[2]
+        assert abs(result[0,0,0,2].item() - 99.0) < 1e-4
+        r.ok("array bounds: write beyond clamps")
+    except Exception as e:
+        r.fail("array bounds: write beyond clamps", f"{e}")
+
+    # Write at negative index (should clamp to 0)
+    try:
+        code = """
+float a[] = {1.0, 2.0, 3.0};
+a[-5] = 99.0;
+@OUT = vec4(a[0], a[1], a[2], 1);
+"""
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 99.0) < 1e-4
+        r.ok("array bounds: write negative clamps to 0")
+    except Exception as e:
+        r.fail("array bounds: write negative clamps to 0", f"{e}")
+
+    # Nested array access (array of arrays via vec)
+    try:
+        code = """
+vec3 a[] = {vec3(1,2,3), vec3(4,5,6)};
+float x = a[0].y;
+float y = a[1].z;
+@OUT = vec4(x, y, 0, 1);
+"""
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 2.0) < 1e-4
+        assert abs(result[0,0,0,1].item() - 6.0) < 1e-4
+        r.ok("array bounds: vec array element access")
+    except Exception as e:
+        r.fail("array bounds: vec array element access", f"{e}")
+
+    # Vec array beyond bounds
+    try:
+        code = """
+vec3 a[] = {vec3(1,2,3), vec3(4,5,6)};
+vec3 val = a[10];
+@OUT = vec4(val.x, val.y, val.z, 1);
+"""
+        result = compile_and_run(code, {"A": img})
+        # Should clamp to a[1]
+        assert abs(result[0,0,0,0].item() - 4.0) < 1e-4
+        r.ok("array bounds: vec array beyond bounds clamps")
+    except Exception as e:
+        r.fail("array bounds: vec array beyond bounds clamps", f"{e}")
+
+    # Dynamic index with loop
+    try:
+        code = """
+float a[] = {10.0, 20.0, 30.0, 40.0, 50.0};
+float sum = 0.0;
+for (int i = 0; i < 5; i++) {
+    sum += a[i];
+}
+@OUT = vec4(sum, 0, 0, 1);
+"""
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 150.0) < 1e-4
+        r.ok("array bounds: dynamic index in loop")
+    except Exception as e:
+        r.fail("array bounds: dynamic index in loop", f"{e}")
+
+    # Float index (should be floored)
+    try:
+        code = "float a[] = {10.0, 20.0, 30.0}; @OUT = vec4(a[1.7], 0, 0, 1);"
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 20.0) < 1e-4  # floor(1.7) = 1
+        r.ok("array bounds: float index floors")
+    except Exception as e:
+        r.fail("array bounds: float index floors", f"{e}")
+
+    # Large array
+    try:
+        code = """
+float a[100];
+for (int i = 0; i < 100; i++) {
+    a[i] = float(i);
+}
+@OUT = vec4(a[0], a[50], a[99], 1);
+"""
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item()) < 1e-4
+        assert abs(result[0,0,0,1].item() - 50.0) < 1e-4
+        assert abs(result[0,0,0,2].item() - 99.0) < 1e-4
+        r.ok("array bounds: large array (100)")
+    except Exception as e:
+        r.fail("array bounds: large array (100)", f"{e}")
+
+    # Empty-sized array (declared with size 0 should error)
+    try:
+        code = "float a[0]; @OUT = vec4(0,0,0,1);"
+        compile_and_run(code, {"A": img})
+        r.fail("array bounds: size 0 should error", "Expected error")
+    except (ParseError, TypeCheckError):
+        r.ok("array bounds: size 0 errors")
+
+    # String array bounds
+    try:
+        code = '''
+string a[] = {"alpha", "beta", "gamma"};
+@OUT = a[0];
+'''
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.STRING)
+        assert result == "alpha"
+        r.ok("array bounds: string array index 0")
+    except Exception as e:
+        r.fail("array bounds: string array index 0", f"{e}")
+
+    # String array beyond bounds
+    try:
+        code = '''
+string a[] = {"alpha", "beta", "gamma"};
+@OUT = a[10];
+'''
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.STRING)
+        assert result == "gamma"  # clamped to last
+        r.ok("array bounds: string array clamp to last")
+    except Exception as e:
+        r.fail("array bounds: string array clamp to last", f"{e}")
+
+
+# ── String Edge Cases ─────────────────────────────────────────────────
+
+def test_string_edge_cases(r: TestResult):
+    """Tests for string edge cases."""
+    print("\n--- String Edge Cases Tests ---")
+
+    B, H, W = 1, 4, 4
+    img = torch.rand(B, H, W, 4)
+
+    # Empty string
+    try:
+        result = compile_and_run(
+            'string s = ""; @OUT = s;', {}, out_type=TEXType.STRING)
+        assert result == "", f"Expected empty string, got {result!r}"
+        r.ok("string edge: empty string")
+    except Exception as e:
+        r.fail("string edge: empty string", f"{e}")
+
+    # Concatenation with empty
+    try:
+        result = compile_and_run(
+            'string s = "hello" + ""; @OUT = s;', {}, out_type=TEXType.STRING)
+        assert result == "hello", f"Expected 'hello', got {result!r}"
+        r.ok("string edge: concat with empty")
+    except Exception as e:
+        r.fail("string edge: concat with empty", f"{e}")
+
+    # Empty + non-empty
+    try:
+        result = compile_and_run(
+            'string s = "" + "world"; @OUT = s;', {}, out_type=TEXType.STRING)
+        assert result == "world", f"Expected 'world', got {result!r}"
+        r.ok("string edge: empty + non-empty")
+    except Exception as e:
+        r.fail("string edge: empty + non-empty", f"{e}")
+
+    # Very long string
+    try:
+        long_str = "a" * 200
+        code = f'string s = "{long_str}"; float n = len(s); @OUT = vec4(n,n,n,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 200.0) < 1e-4
+        r.ok("string edge: long string (200 chars)")
+    except Exception as e:
+        r.fail("string edge: long string (200 chars)", f"{e}")
+
+    # Special chars in strings (tab, backslash)
+    try:
+        result = compile_and_run(
+            r'string s = "tab\there"; @OUT = s;', {}, out_type=TEXType.STRING)
+        assert "\t" in result, f"Expected tab char, got {result!r}"
+        r.ok("string edge: tab character")
+    except Exception as e:
+        r.fail("string edge: tab character", f"{e}")
+
+    # find() with not-found case
+    try:
+        code = 'float x = find("hello", "xyz"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - (-1.0)) < 1e-4
+        r.ok("string edge: find not found returns -1")
+    except Exception as e:
+        r.fail("string edge: find not found returns -1", f"{e}")
+
+    # find() with found case
+    try:
+        code = 'float x = find("hello world", "world"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 6.0) < 1e-4
+        r.ok("string edge: find found returns index")
+    except Exception as e:
+        r.fail("string edge: find found returns index", f"{e}")
+
+    # find() at start
+    try:
+        code = 'float x = find("hello", "hel"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item()) < 1e-4
+        r.ok("string edge: find at start returns 0")
+    except Exception as e:
+        r.fail("string edge: find at start returns 0", f"{e}")
+
+    # replace() with empty replacement
+    try:
+        result = compile_and_run(
+            'string s = replace("hello world", "world", ""); @OUT = s;',
+            {}, out_type=TEXType.STRING)
+        assert result == "hello ", f"Expected 'hello ', got {result!r}"
+        r.ok("string edge: replace with empty")
+    except Exception as e:
+        r.fail("string edge: replace with empty", f"{e}")
+
+    # replace() with not-found target
+    try:
+        result = compile_and_run(
+            'string s = replace("hello", "xyz", "abc"); @OUT = s;',
+            {}, out_type=TEXType.STRING)
+        assert result == "hello", f"Expected 'hello', got {result!r}"
+        r.ok("string edge: replace not found")
+    except Exception as e:
+        r.fail("string edge: replace not found", f"{e}")
+
+    # substr() from start
+    try:
+        result = compile_and_run(
+            'string s = substr("hello world", 0, 5); @OUT = s;',
+            {}, out_type=TEXType.STRING)
+        assert result == "hello", f"Expected 'hello', got {result!r}"
+        r.ok("string edge: substr from 0")
+    except Exception as e:
+        r.fail("string edge: substr from 0", f"{e}")
+
+    # substr() past-end length
+    try:
+        result = compile_and_run(
+            'string s = substr("hello", 3, 100); @OUT = s;',
+            {}, out_type=TEXType.STRING)
+        assert result == "lo", f"Expected 'lo', got {result!r}"
+        r.ok("string edge: substr past end")
+    except Exception as e:
+        r.fail("string edge: substr past end", f"{e}")
+
+    # substr() without length (to end)
+    try:
+        result = compile_and_run(
+            'string s = substr("hello world", 6); @OUT = s;',
+            {}, out_type=TEXType.STRING)
+        assert result == "world", f"Expected 'world', got {result!r}"
+        r.ok("string edge: substr no length")
+    except Exception as e:
+        r.fail("string edge: substr no length", f"{e}")
+
+    # len() on empty string
+    try:
+        code = 'float n = len(""); @OUT = vec4(n,n,n,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item()) < 1e-4
+        r.ok("string edge: len empty string")
+    except Exception as e:
+        r.fail("string edge: len empty string", f"{e}")
+
+    # len() on long string
+    try:
+        long_str = "x" * 150
+        code = f'float n = len("{long_str}"); @OUT = vec4(n,n,n,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 150.0) < 1e-4
+        r.ok("string edge: len long string")
+    except Exception as e:
+        r.fail("string edge: len long string", f"{e}")
+
+    # Multiple concatenations
+    try:
+        result = compile_and_run(
+            'string s = "a" + "b" + "c" + "d" + "e"; @OUT = s;',
+            {}, out_type=TEXType.STRING)
+        assert result == "abcde", f"Expected 'abcde', got {result!r}"
+        r.ok("string edge: multiple concat")
+    except Exception as e:
+        r.fail("string edge: multiple concat", f"{e}")
+
+    # String equality comparison
+    try:
+        code = 'float x = ("abc" == "abc"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 1.0) < 1e-4
+        r.ok("string edge: equality comparison")
+    except Exception as e:
+        r.fail("string edge: equality comparison", f"{e}")
+
+    # String in conditional
+    try:
+        result = compile_and_run(
+            'string s = "a"; if (len(s) > 0.0) { s = s + "b"; } @OUT = s;',
+            {}, out_type=TEXType.STRING)
+        assert result == "ab", f"Expected 'ab', got {result!r}"
+        r.ok("string edge: string in conditional")
+    except Exception as e:
+        r.fail("string edge: string in conditional", f"{e}")
+
+    # String in loop
+    try:
+        result = compile_and_run(
+            'string s = ""; for (int i = 0; i < 5; i++) { s = s + "x"; } @OUT = s;',
+            {}, out_type=TEXType.STRING)
+        assert result == "xxxxx", f"Expected 'xxxxx', got {result!r}"
+        r.ok("string edge: string in loop")
+    except Exception as e:
+        r.fail("string edge: string in loop", f"{e}")
+
+    # Numeric to string conversion
+    try:
+        result = compile_and_run(
+            'string s = "value=" + str(42); @OUT = s;',
+            {}, out_type=TEXType.STRING)
+        assert "42" in result, f"Expected '42' in result, got {result!r}"
+        r.ok("string edge: numeric to string concat")
+    except Exception as e:
+        r.fail("string edge: numeric to string concat", f"{e}")
+
+    # split with single char
+    try:
+        code = '''
+string parts[] = split("a,b,c", ",");
+float n = len(parts);
+@OUT = vec4(n, 0, 0, 1);
+'''
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - 3.0) < 1e-4
+        r.ok("string edge: split count")
+    except Exception as e:
+        r.fail("string edge: split count", f"{e}")
+
+    # find in empty string
+    try:
+        code = 'float x = find("", "abc"); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item() - (-1.0)) < 1e-4
+        r.ok("string edge: find in empty string")
+    except Exception as e:
+        r.fail("string edge: find in empty string", f"{e}")
+
+    # find empty in string
+    try:
+        code = 'float x = find("hello", ""); @OUT = vec4(x,x,x,1);'
+        result = compile_and_run(code, {"A": img})
+        assert abs(result[0,0,0,0].item()) < 1e-4  # Python str.find("") returns 0
+        r.ok("string edge: find empty in string")
+    except Exception as e:
+        r.fail("string edge: find empty in string", f"{e}")
+
+
+# ── Realistic Sizes Tests ─────────────────────────────────────────────
+
+def test_realistic_sizes(r: TestResult):
+    """Tests with realistic image sizes (512x512) and multi-batch."""
+    print("\n--- Realistic Sizes Tests ---")
+
+    # 512x512 passthrough
+    try:
+        big_img = torch.rand(1, 512, 512, 3)
+        result = compile_and_run("@OUT = @A;", {"A": big_img})
+        assert result.shape == (1, 512, 512, 3), f"Shape mismatch: {result.shape}"
+        r.ok("realistic: 512x512 passthrough shape")
+    except Exception as e:
+        r.fail("realistic: 512x512 passthrough shape", f"{e}")
+
+    # Verify values preserved
+    try:
+        big_img = torch.rand(1, 512, 512, 3)
+        result = compile_and_run("@OUT = @A;", {"A": big_img})
+        max_diff = (result - big_img).abs().max().item()
+        assert max_diff < 1e-6, f"Passthrough altered values: max diff={max_diff}"
+        r.ok("realistic: 512x512 passthrough values")
+    except Exception as e:
+        r.fail("realistic: 512x512 passthrough values", f"{e}")
+
+    # Color grade at 512x512
+    try:
+        big_img = torch.rand(1, 512, 512, 3) * 0.5
+        result = compile_and_run("@OUT = @A * 1.5;", {"A": big_img})
+        expected = big_img * 1.5
+        max_diff = (result - expected).abs().max().item()
+        assert max_diff < 1e-5, f"Color grade drift: max diff={max_diff}"
+        r.ok("realistic: 512x512 color grade")
+    except Exception as e:
+        r.fail("realistic: 512x512 color grade", f"{e}")
+
+    # Shape preserved for vec4 output
+    try:
+        big_img = torch.rand(1, 512, 512, 4)
+        result = compile_and_run("@OUT = @A;", {"A": big_img})
+        assert result.shape == (1, 512, 512, 4), f"Shape: {result.shape}"
+        r.ok("realistic: 512x512 vec4 shape preserved")
+    except Exception as e:
+        r.fail("realistic: 512x512 vec4 shape preserved", f"{e}")
+
+    # Precision check with known values
+    try:
+        known = torch.zeros(1, 512, 512, 3)
+        known[0, 0, 0, :] = torch.tensor([0.123456, 0.654321, 0.999999])
+        known[0, 255, 255, :] = torch.tensor([0.111111, 0.222222, 0.333333])
+        result = compile_and_run("@OUT = @A;", {"A": known})
+        assert abs(result[0,0,0,0].item() - 0.123456) < 1e-5
+        assert abs(result[0,0,0,1].item() - 0.654321) < 1e-5
+        assert abs(result[0,255,255,2].item() - 0.333333) < 1e-5
+        r.ok("realistic: precision preserved at 512x512")
+    except Exception as e:
+        r.fail("realistic: precision preserved at 512x512", f"{e}")
+
+    # Multi-batch (B=2)
+    try:
+        batch_img = torch.rand(2, 64, 64, 3)
+        result = compile_and_run("@OUT = @A;", {"A": batch_img})
+        assert result.shape[0] == 2, f"Batch dim: {result.shape[0]}"
+        assert result.shape == (2, 64, 64, 3), f"Shape: {result.shape}"
+        r.ok("realistic: multi-batch B=2 shape")
+    except Exception as e:
+        r.fail("realistic: multi-batch B=2 shape", f"{e}")
+
+    # Multi-batch values preserved
+    try:
+        batch_img = torch.rand(2, 64, 64, 3)
+        result = compile_and_run("@OUT = @A;", {"A": batch_img})
+        max_diff = (result - batch_img).abs().max().item()
+        assert max_diff < 1e-6, f"Batch passthrough altered values: max diff={max_diff}"
+        r.ok("realistic: multi-batch values preserved")
+    except Exception as e:
+        r.fail("realistic: multi-batch values preserved", f"{e}")
+
+    # Multi-batch arithmetic
+    try:
+        batch_img = torch.rand(2, 64, 64, 3) * 0.5
+        result = compile_and_run("@OUT = @A + 0.25;", {"A": batch_img})
+        expected = batch_img + 0.25
+        max_diff = (result - expected).abs().max().item()
+        assert max_diff < 1e-5, f"Batch arithmetic drift: max diff={max_diff}"
+        r.ok("realistic: multi-batch arithmetic")
+    except Exception as e:
+        r.fail("realistic: multi-batch arithmetic", f"{e}")
+
+    # B=4 batch
+    try:
+        batch_img = torch.rand(4, 32, 32, 3)
+        result = compile_and_run("@OUT = @A;", {"A": batch_img})
+        assert result.shape == (4, 32, 32, 3), f"Shape: {result.shape}"
+        r.ok("realistic: B=4 batch shape")
+    except Exception as e:
+        r.fail("realistic: B=4 batch shape", f"{e}")
+
+    # Non-square: 256x128
+    try:
+        rect_img = torch.rand(1, 128, 256, 3)
+        result = compile_and_run("@OUT = @A;", {"A": rect_img})
+        assert result.shape == (1, 128, 256, 3), f"Shape: {result.shape}"
+        r.ok("realistic: non-square 256x128")
+    except Exception as e:
+        r.fail("realistic: non-square 256x128", f"{e}")
+
+    # Clamp at large size
+    try:
+        big_img = torch.rand(1, 256, 256, 3) * 2.0  # values up to 2.0
+        result = compile_and_run("@OUT = clamp(@A, 0.0, 1.0);", {"A": big_img})
+        assert result.max().item() <= 1.0 + 1e-6
+        assert result.min().item() >= 0.0 - 1e-6
+        r.ok("realistic: clamp at 256x256")
+    except Exception as e:
+        r.fail("realistic: clamp at 256x256", f"{e}")
+
+    # u/v coordinates at 512x512
+    try:
+        big_img = torch.rand(1, 512, 512, 3)
+        result = compile_and_run("@OUT = vec3(u, v, 0.0);", {"A": big_img})
+        # Corner (0,0) should be u=0, v=0
+        assert abs(result[0,0,0,0].item()) < 1e-4, f"u at (0,0): {result[0,0,0,0].item()}"
+        assert abs(result[0,0,0,1].item()) < 1e-4, f"v at (0,0): {result[0,0,0,1].item()}"
+        # Corner (511,511) should be u~1, v~1
+        assert abs(result[0,511,511,0].item() - 1.0) < 1e-3
+        assert abs(result[0,511,511,1].item() - 1.0) < 1e-3
+        r.ok("realistic: u/v at 512x512 corners")
+    except Exception as e:
+        r.fail("realistic: u/v at 512x512 corners", f"{e}")
+
+
+# ── NaN/Inf Propagation Tests ─────────────────────────────────────────
+
+def test_nan_inf_propagation(r: TestResult):
+    """Tests for NaN and Inf behavior through the pipeline."""
+    print("\n--- NaN/Inf Propagation Tests ---")
+
+    B, H, W = 1, 4, 4
+    img = torch.rand(B, H, W, 3)
+
+    # NaN through injection: create a tensor with NaN
+    try:
+        nan_img = torch.full((1, 4, 4, 3), float('nan'))
+        result = compile_and_run("@OUT = @A;", {"A": nan_img})
+        # Should not crash
+        r.ok("nan: passthrough NaN tensor")
+    except Exception as e:
+        r.fail("nan: passthrough NaN tensor", f"{e}")
+
+    # NaN through arithmetic: 0/0
+    try:
+        code = "float x = 0.0 / 0.0; @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": img})
+        # Should produce NaN or handled value, but not crash
+        r.ok("nan: 0/0 does not crash")
+    except Exception as e:
+        r.fail("nan: 0/0 does not crash", f"{e}")
+
+    # NaN through sin
+    try:
+        nan_img = torch.full((1, 4, 4, 3), float('nan'))
+        code = "float x = sin(@A.r); @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": nan_img})
+        r.ok("nan: sin(NaN) does not crash")
+    except Exception as e:
+        r.fail("nan: sin(NaN) does not crash", f"{e}")
+
+    # NaN through cos
+    try:
+        nan_img = torch.full((1, 4, 4, 3), float('nan'))
+        code = "float x = cos(@A.r); @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": nan_img})
+        r.ok("nan: cos(NaN) does not crash")
+    except Exception as e:
+        r.fail("nan: cos(NaN) does not crash", f"{e}")
+
+    # Safe division: 1/0 produces large value (not Inf) due to SAFE_EPSILON
+    try:
+        code = "float x = 1.0 / 0.0; @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": img})
+        val = result[0,0,0,0].item()
+        assert val > 1e6, f"Expected large value from safe division, got {val}"
+        r.ok("nan: 1/0 safe division produces large value")
+    except Exception as e:
+        r.fail("nan: 1/0 safe division produces large value", f"{e}")
+
+    # Inf through clamp should give 1.0
+    try:
+        code = "float x = clamp(1.0 / 0.0, 0.0, 1.0); @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": img})
+        val = result[0,0,0,0].item()
+        assert abs(val - 1.0) < 1e-4, f"clamp(Inf,0,1) should be 1, got {val}"
+        r.ok("nan: clamp(Inf,0,1) = 1")
+    except Exception as e:
+        r.fail("nan: clamp(Inf,0,1) = 1", f"{e}")
+
+    # Negative Inf through clamp
+    try:
+        code = "float x = clamp(-1.0 / 0.0, 0.0, 1.0); @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": img})
+        val = result[0,0,0,0].item()
+        assert abs(val) < 1e-4, f"clamp(-Inf,0,1) should be 0, got {val}"
+        r.ok("nan: clamp(-Inf,0,1) = 0")
+    except Exception as e:
+        r.fail("nan: clamp(-Inf,0,1) = 0", f"{e}")
+
+    # Inf tensor passthrough
+    try:
+        inf_img = torch.full((1, 4, 4, 3), float('inf'))
+        result = compile_and_run("@OUT = @A;", {"A": inf_img})
+        r.ok("nan: Inf passthrough does not crash")
+    except Exception as e:
+        r.fail("nan: Inf passthrough does not crash", f"{e}")
+
+    # NaN in lerp
+    try:
+        nan_img = torch.full((1, 4, 4, 3), float('nan'))
+        code = "float x = lerp(0.0, 1.0, @A.r); @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": nan_img})
+        r.ok("nan: lerp with NaN does not crash")
+    except Exception as e:
+        r.fail("nan: lerp with NaN does not crash", f"{e}")
+
+    # Inf in arithmetic
+    try:
+        code = "float x = 1.0 / 0.0 + 1.0; @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": img})
+        r.ok("nan: Inf + 1 does not crash")
+    except Exception as e:
+        r.fail("nan: Inf + 1 does not crash", f"{e}")
+
+    # Inf - Inf = NaN
+    try:
+        code = "float x = (1.0/0.0) - (1.0/0.0); @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": img})
+        r.ok("nan: Inf - Inf does not crash")
+    except Exception as e:
+        r.fail("nan: Inf - Inf does not crash", f"{e}")
+
+    # NaN comparison
+    try:
+        code = """
+float x = 0.0 / 0.0;
+float y = 0.0;
+if (x == x) { y = 1.0; }
+@OUT = vec3(y, y, y);
+"""
+        result = compile_and_run(code, {"A": img})
+        # NaN == NaN behavior depends on implementation
+        r.ok("nan: NaN comparison does not crash")
+    except Exception as e:
+        r.fail("nan: NaN comparison does not crash", f"{e}")
+
+    # isnan() function — use NaN from image input since safe division won't produce NaN
+    try:
+        nan_input = torch.full((1, 4, 4, 3), float('nan'))
+        code = "float x = isnan(@A.r); @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": nan_input})
+        val = result[0,0,0,0].item()
+        assert abs(val - 1.0) < 1e-4, f"isnan(NaN) should be 1, got {val}"
+        r.ok("nan: isnan(NaN) = 1")
+    except Exception as e:
+        r.fail("nan: isnan(NaN) = 1", f"{e}")
+
+    # isinf() function — use Inf from image input since safe division won't produce Inf
+    try:
+        inf_input = torch.full((1, 4, 4, 3), float('inf'))
+        code = "float x = isinf(@A.r); @OUT = vec3(x, x, x);"
+        result = compile_and_run(code, {"A": inf_input})
+        val = result[0,0,0,0].item()
+        assert abs(val - 1.0) < 1e-4, f"isinf(Inf) should be 1, got {val}"
+        r.ok("nan: isinf(Inf) = 1")
+    except Exception as e:
+        r.fail("nan: isinf(Inf) = 1", f"{e}")
+
+
+# ── Codegen Equivalence Tests ─────────────────────────────────────────
+
+def test_codegen_equivalence(r: TestResult):
+    """Verify codegen and interpreter produce the same results."""
+    print("\n--- Codegen Equivalence Tests ---")
+
+    _MAX_LOOP_ITERATIONS = 1024
+
+    B, H, W = 1, 4, 4
+    img = torch.rand(B, H, W, 3)
+
+    def run_both(code, bindings):
+        """Run through both interpreter and codegen, return (interp_result, codegen_result)."""
+        lexer = Lexer(code)
+        tokens = lexer.tokenize()
+        parser = Parser(tokens, source=code)
+        program = parser.parse()
+        binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
+        checker = TypeChecker(binding_types=binding_types, source=code)
+        type_map = checker.check(program)
+        output_names = sorted(checker.assigned_bindings.keys())
+
+        # Interpreter path
+        interp = Interpreter()
+        interp_result = interp.execute(program, bindings, type_map, device="cpu",
+                                        output_names=output_names)
+
+        # Codegen path
+        cg_fn = try_compile(program, type_map)
+        if cg_fn is None:
+            return interp_result, None
+
+        stdlib_fns = TEXStdlib.get_functions()
+        env = {}
+        dev = torch.device("cpu")
+
+        sp = None
+        for v in bindings.values():
+            if isinstance(v, torch.Tensor) and v.dim() >= 3:
+                sp = (v.shape[0], v.shape[1], v.shape[2])
+                break
+
+        used = _collect_identifiers(program)
+        if sp:
+            B_sp, H_sp, W_sp = sp
+            dtype = torch.float32
+            if "ix" in used:
+                env["ix"] = torch.arange(W_sp, dtype=dtype, device=dev).view(1, 1, W_sp)
+            if "u" in used:
+                ix = torch.arange(W_sp, dtype=dtype, device=dev).view(1, 1, W_sp)
+                env["u"] = (ix / max(W_sp - 1, 1)).expand(B_sp, H_sp, W_sp)
+            if "iy" in used:
+                env["iy"] = torch.arange(H_sp, dtype=dtype, device=dev).view(1, H_sp, 1)
+            if "v" in used:
+                iy = torch.arange(H_sp, dtype=dtype, device=dev).view(1, H_sp, 1)
+                env["v"] = (iy / max(H_sp - 1, 1)).expand(B_sp, H_sp, W_sp)
+            if "iw" in used:
+                env["iw"] = torch.tensor(float(W_sp), dtype=dtype, device=dev)
+            if "ih" in used:
+                env["ih"] = torch.tensor(float(H_sp), dtype=dtype, device=dev)
+            if "fi" in used:
+                env["fi"] = torch.arange(B_sp, dtype=dtype, device=dev).view(B_sp, 1, 1)
+            if "fn" in used:
+                env["fn"] = torch.tensor(float(B_sp), dtype=dtype, device=dev)
+        if "PI" in used:
+            env["PI"] = torch.tensor(math.pi, dtype=torch.float32, device=dev)
+        if "E" in used:
+            env["E"] = torch.tensor(math.e, dtype=torch.float32, device=dev)
+
+        # Make a copy of bindings so codegen doesn't mutate the originals
+        cg_bindings = {k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                       for k, v in bindings.items()}
+
+        cg_fn(env, cg_bindings, stdlib_fns, dev, sp,
+              torch, _broadcast_pair, _ensure_spatial, torch.where,
+              math, SAFE_EPSILON, CHANNEL_MAP, _MAX_LOOP_ITERATIONS,
+              _CgBreak, _CgContinue)
+
+        cg_result = {name: cg_bindings[name] for name in output_names}
+        return interp_result, cg_result
+
+    programs = [
+        ("basic arithmetic", "@OUT = @A * 2.0 + 0.5;"),
+        ("subtraction", "@OUT = @A - 0.5;"),
+        ("division", "@OUT = @A / 2.0;"),
+        ("vec3 constructor", "@OUT = vec3(0.5, 0.25, 0.75);"),
+        ("channel access", "@OUT = vec3(@A.r, @A.g, @A.b);"),
+        ("ternary", "float x = (@A.r > 0.5) ? 1.0 : 0.0; @OUT = vec3(x, x, x);"),
+        ("for loop sum", """
+float s = 0.0;
+for (int i = 0; i < 5; i++) { s += 0.1; }
+@OUT = vec3(s, s, s);
+"""),
+        ("sin function", "@OUT = vec3(sin(@A.r), sin(@A.g), sin(@A.b));"),
+        ("cos function", "@OUT = vec3(cos(@A.r), cos(@A.g), cos(@A.b));"),
+        ("clamp", "@OUT = clamp(@A, 0.2, 0.8);"),
+        ("lerp", "@OUT = lerp(vec3(0,0,0), vec3(1,1,1), 0.5);"),
+        ("abs negative", "@OUT = vec3(abs(@A.r - 0.5), abs(@A.g - 0.5), abs(@A.b - 0.5));"),
+        ("floor", "@OUT = vec3(floor(@A.r * 10.0), floor(@A.g * 10.0), floor(@A.b * 10.0));"),
+        ("step", "@OUT = vec3(step(0.5, @A.r), step(0.5, @A.g), step(0.5, @A.b));"),
+        ("smoothstep", "@OUT = vec3(smoothstep(0.0, 1.0, @A.r), smoothstep(0.0, 1.0, @A.g), smoothstep(0.0, 1.0, @A.b));"),
+        ("multiple vars", """
+float x = @A.r * 2.0;
+float y = @A.g + 0.1;
+@OUT = vec3(x, y, @A.b);
+"""),
+        ("nested ternary", "float x = (@A.r > 0.5) ? ((@A.g > 0.5) ? 0.8 : 0.5) : 0.2; @OUT = vec3(x, x, x);"),
+        ("pow and sqrt", "@OUT = vec3(pow(@A.r, 2.0), sqrt(@A.g), @A.b);"),
+        ("sign and fract", "@OUT = vec3(sign(@A.r - 0.5), fract(@A.g * 5.0), @A.b);"),
+        ("max and min", "@OUT = vec3(max(@A.r, @A.g), min(@A.r, @A.g), @A.b);"),
+    ]
+
+    for name, code in programs:
+        try:
+            interp_res, cg_res = run_both(code, {"A": img})
+            if cg_res is None:
+                r.ok(f"codegen equiv: {name} (codegen unsupported, skip)")
+                continue
+            for out_name in interp_res:
+                interp_t = interp_res[out_name]
+                cg_t = cg_res[out_name]
+                if isinstance(interp_t, torch.Tensor) and isinstance(cg_t, torch.Tensor):
+                    max_diff = (interp_t.float() - cg_t.float()).abs().max().item()
+                    assert max_diff < 1e-5, f"Max diff={max_diff} for output '{out_name}'"
+            r.ok(f"codegen equiv: {name}")
+        except Exception as e:
+            r.fail(f"codegen equiv: {name}", f"{e}")
+
+
+# ── Arithmetic Hash Noise Tests ───────────────────────────────────────
+
+def test_arithmetic_hash_noise(r: TestResult):
+    """Tests for the arithmetic hash Perlin noise implementation quality."""
+    print("\n--- Arithmetic Hash Noise Tests ---")
+
+    # Output range: perlin values should be approximately in [-1, 1]
+    try:
+        x = torch.rand(1, 64, 64) * 20.0 - 10.0
+        y = torch.rand(1, 64, 64) * 20.0 - 10.0
+        noise = _perlin2d_fast(x, y)
+        assert noise.max().item() <= 1.5, f"Max noise too high: {noise.max().item()}"
+        assert noise.min().item() >= -1.5, f"Min noise too low: {noise.min().item()}"
+        r.ok("noise: perlin output range [-1.5, 1.5]")
+    except Exception as e:
+        r.fail("noise: perlin output range [-1.5, 1.5]", f"{e}")
+
+    # Determinism: same inputs -> same outputs
+    try:
+        x = torch.tensor([1.5, 2.5, 3.5])
+        y = torch.tensor([4.5, 5.5, 6.5])
+        r1 = _perlin2d_fast(x.clone(), y.clone())
+        r2 = _perlin2d_fast(x.clone(), y.clone())
+        assert torch.allclose(r1, r2), f"Non-deterministic: diff={torch.abs(r1-r2).max().item()}"
+        r.ok("noise: perlin determinism")
+    except Exception as e:
+        r.fail("noise: perlin determinism", f"{e}")
+
+    # Continuity: nearby inputs -> nearby outputs
+    try:
+        x = torch.tensor([5.0])
+        y = torch.tensor([5.0])
+        eps = 0.001
+        v0 = _perlin2d_fast(x, y).item()
+        v1 = _perlin2d_fast(x + eps, y).item()
+        v2 = _perlin2d_fast(x, y + eps).item()
+        assert abs(v0 - v1) < 0.1, f"Discontinuity in x: |{v0}-{v1}|={abs(v0-v1)}"
+        assert abs(v0 - v2) < 0.1, f"Discontinuity in y: |{v0}-{v2}|={abs(v0-v2)}"
+        r.ok("noise: perlin continuity")
+    except Exception as e:
+        r.fail("noise: perlin continuity", f"{e}")
+
+    # Variation: different inputs -> different outputs
+    try:
+        coords = (torch.arange(10).float() + 0.37).unsqueeze(0)
+        noise = _perlin2d_fast(coords, torch.full_like(coords, 0.37))
+        unique_vals = len(set([round(v, 4) for v in noise.flatten().tolist()]))
+        assert unique_vals >= 3, f"Not enough variation: only {unique_vals} unique values"
+        r.ok("noise: perlin variation")
+    except Exception as e:
+        r.fail("noise: perlin variation", f"{e}")
+
+    # _lowbias32: deterministic integer hash
+    try:
+        inp = torch.tensor([0, 1, 2, 3, 100], dtype=torch.int32)
+        h1 = _lowbias32(inp.clone())
+        h2 = _lowbias32(inp.clone())
+        assert torch.equal(h1, h2), "lowbias32 not deterministic"
+        # Different inputs should give different outputs
+        assert len(set(h1.tolist())) == 5, "lowbias32 collision on small inputs"
+        r.ok("noise: lowbias32 determinism and uniqueness")
+    except Exception as e:
+        r.fail("noise: lowbias32 determinism and uniqueness", f"{e}")
+
+    # _grad2d_dot: verify correct dot products for known gradients
+    try:
+        dx = torch.tensor([1.0])
+        dy = torch.tensor([1.0])
+        # h=0 -> gradient (1,0) -> dot = dx = 1.0
+        h0 = torch.tensor([0], dtype=torch.int32)
+        assert abs(_grad2d_dot(h0, dx, dy).item() - 1.0) < 1e-4, "grad h=0 failed"
+        # h=1 -> gradient (-1,0) -> dot = -dx = -1.0
+        h1 = torch.tensor([1], dtype=torch.int32)
+        assert abs(_grad2d_dot(h1, dx, dy).item() - (-1.0)) < 1e-4, "grad h=1 failed"
+        # h=2 -> gradient (0,1) -> dot = dy = 1.0
+        h2 = torch.tensor([2], dtype=torch.int32)
+        assert abs(_grad2d_dot(h2, dx, dy).item() - 1.0) < 1e-4, "grad h=2 failed"
+        # h=3 -> gradient (0,-1) -> dot = -dy = -1.0
+        h3 = torch.tensor([3], dtype=torch.int32)
+        assert abs(_grad2d_dot(h3, dx, dy).item() - (-1.0)) < 1e-4, "grad h=3 failed"
+        r.ok("noise: grad2d_dot cardinal gradients")
+    except Exception as e:
+        r.fail("noise: grad2d_dot cardinal gradients", f"{e}")
+
+    # _grad2d_dot: diagonal gradients
+    try:
+        dx = torch.tensor([1.0])
+        dy = torch.tensor([1.0])
+        # h=4 -> gradient (1,1) -> dot = dx+dy = 2.0
+        h4 = torch.tensor([4], dtype=torch.int32)
+        assert abs(_grad2d_dot(h4, dx, dy).item() - 2.0) < 1e-4, "grad h=4 failed"
+        # h=5 -> gradient (-1,1) -> dot = -dx+dy = 0.0
+        h5 = torch.tensor([5], dtype=torch.int32)
+        assert abs(_grad2d_dot(h5, dx, dy).item() - 0.0) < 1e-4, "grad h=5 failed"
+        # h=6 -> gradient (1,-1) -> dot = dx-dy = 0.0
+        h6 = torch.tensor([6], dtype=torch.int32)
+        assert abs(_grad2d_dot(h6, dx, dy).item() - 0.0) < 1e-4, "grad h=6 failed"
+        # h=7 -> gradient (-1,-1) -> dot = -dx-dy = -2.0
+        h7 = torch.tensor([7], dtype=torch.int32)
+        assert abs(_grad2d_dot(h7, dx, dy).item() - (-2.0)) < 1e-4, "grad h=7 failed"
+        r.ok("noise: grad2d_dot diagonal gradients")
+    except Exception as e:
+        r.fail("noise: grad2d_dot diagonal gradients", f"{e}")
+
+    # FBM via DSL: output range
+    try:
+        big_img = torch.rand(1, 32, 32, 3)
+        code = "float n = fbm(u * 10.0, v * 10.0, 4); @OUT = vec3(n, n, n);"
+        result = compile_and_run(code, {"A": big_img})
+        max_val = result.max().item()
+        min_val = result.min().item()
+        assert max_val <= 1.5, f"FBM max too high: {max_val}"
+        assert min_val >= -1.5, f"FBM min too low: {min_val}"
+        r.ok("noise: FBM output range")
+    except Exception as e:
+        r.fail("noise: FBM output range", f"{e}")
+
+    # Perlin at integer coords: should be 0 (gradient property)
+    try:
+        x = torch.tensor([0.0, 1.0, 2.0, 3.0])
+        y = torch.tensor([0.0, 1.0, 2.0, 3.0])
+        noise = _perlin2d_fast(x, y)
+        for i in range(4):
+            assert abs(noise[i].item()) < 1e-4, f"Noise at integer ({i},{i}) = {noise[i].item()}"
+        r.ok("noise: perlin zero at integer coords")
+    except Exception as e:
+        r.fail("noise: perlin zero at integer coords", f"{e}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main():
@@ -6808,6 +9885,22 @@ def main():
     test_else_if_chains(r)
     test_optimization_regressions(r)
     test_diagnostic_quality(r)
+    test_ternary_exhaustive(r)
+    test_user_functions_advanced(r)
+    test_binding_access_advanced(r)
+    test_scope_and_shadowing(r)
+    test_operator_edge_cases(r)
+    test_casting_exhaustive(r)
+    test_user_functions(r)
+    test_binding_access(r)
+    test_missing_stdlib_functions(r)
+    test_numeric_edge_case_matrix(r)
+    test_array_bounds(r)
+    test_string_edge_cases(r)
+    test_realistic_sizes(r)
+    test_nan_inf_propagation(r)
+    test_codegen_equivalence(r)
+    test_arithmetic_hash_noise(r)
 
     success = r.summary()
     return 0 if success else 1

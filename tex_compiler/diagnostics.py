@@ -207,15 +207,14 @@ _FOREIGN_VARIABLE_HINTS: dict[str, str] = {
 }
 
 _FOREIGN_KEYWORD_HINTS: dict[str, str] = {
-    "return":  "TEX doesn't use return. Assign to @OUT or @name instead.",
     "const":   "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
     "let":     "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
     "var":     "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
     "auto":    "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
-    "def":     "TEX doesn't have user-defined functions. Write expressions directly.",
-    "fn":      "fn is a built-in variable (normalized frame). TEX doesn't support user-defined functions.",
-    "func":    "TEX doesn't have user-defined functions. Write expressions directly.",
-    "function":"TEX doesn't have user-defined functions. Write expressions directly.",
+    "def":     "TEX uses C-style function syntax: float myFunc(float x) { return x * 2.0; }",
+    "fn":      "fn is a built-in variable (normalized frame). Define functions with: float myFunc(float x) { return x; }",
+    "func":    "TEX uses C-style function syntax: float myFunc(float x) { return x * 2.0; }",
+    "function":"TEX uses C-style function syntax: float myFunc(float x) { return x * 2.0; }",
     "class":   "TEX is expression-based — there are no classes or structs.",
     "struct":  "TEX is expression-based — there are no structs. Use vec3/vec4 for compound values.",
     "import":  "TEX is self-contained — there is no import system.",

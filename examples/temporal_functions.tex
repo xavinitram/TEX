@@ -1,0 +1,29 @@
+// Temporal processing with user functions and binding access
+// Connect an image batch or animation to @frames
+
+vec4 frame_at(int offset) {
+    return @frames[ix, iy, fi + offset];
+}
+
+float temporal_diff(int offset) {
+    vec4 curr = frame_at(0);
+    vec4 other = frame_at(offset);
+    vec3 diff = curr.rgb - other.rgb;
+    return length(diff);
+}
+
+// 5-frame weighted temporal average
+vec4 center = frame_at(0);
+vec4 avg = frame_at(-2) * 0.1
+         + frame_at(-1) * 0.2
+         + center * 0.4
+         + frame_at(1) * 0.2
+         + frame_at(2) * 0.1;
+
+// Motion detection mask
+float motion = temporal_diff(-1) + temporal_diff(1);
+m@motion_mask = clamp(motion * 3.0, 0.0, 1.0);
+
+// Blend: static areas get smoothed, moving areas keep sharp
+float blend = smoothstep(0.05, 0.2, motion);
+@stabilized = lerp(avg, center, blend);

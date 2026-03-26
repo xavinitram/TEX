@@ -1,0 +1,9 @@
+// Composite multiple inputs using binding access syntax
+// Connect different images to @A, @B, and a mask to @mask
+
+vec3 sample_a = @A(u, v).rgb;
+vec3 sample_b = @B(u, v).rgb;
+float mask_val = @mask[ix, iy].r;
+
+// Feathered blend using the mask
+@OUT = lerp(sample_a, sample_b, smoothstep(0.0, 1.0, mask_val));

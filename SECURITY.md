@@ -2,9 +2,9 @@
 
 ## TEX Sandboxing
 
-TEX Wrangle executes user-written TEX code through a **sandboxed interpreter**. The security model is designed to prevent arbitrary code execution:
+TEX Wrangle executes user-written TEX code through a **sandboxed pipeline**. The security model is designed to prevent arbitrary code execution:
 
-- **No `eval()` or `exec()`** — TEX code is parsed into an AST and evaluated by a tree-walking interpreter. No Python code is ever dynamically executed.
+- **No user-supplied Python** — TEX code is parsed into an AST and executed either by a tree-walking interpreter or by a codegen backend that emits Python from the AST. The codegen uses `exec()` internally but only on code it generates itself from the validated AST — user strings are never interpolated into the generated source.
 - **No file I/O** — TEX cannot read or write files, access the filesystem, or interact with the network.
 - **No imports** — TEX has no import mechanism. All available functions are hardcoded in `stdlib_signatures.py`.
 - **No reflection** — No access to `__import__`, `globals()`, `getattr()`, or any Python introspection.

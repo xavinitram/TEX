@@ -13,7 +13,8 @@ import math
 
 from .ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop,
-    ExprStatement, BreakStmt, ContinueStmt, ParamDecl, ArrayDecl,
+    ExprStatement, BreakStmt, ContinueStmt, ArrayDecl,
+    FunctionDef, ReturnStmt, BindingIndexAccess, BindingSampleAccess,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor,
     MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral,
@@ -37,6 +38,7 @@ _PURE_FUNCTIONS: dict[str, callable] = {
     "min": min, "max": max,
     "clamp": lambda x, lo, hi: max(lo, min(x, hi)),
     "lerp": lambda a, b, t: a + (b - a) * t,
+    "mix": lambda a, b, t: a + (b - a) * t,  # Alias for lerp
     "smoothstep": lambda e0, e1, x: (
         0.0 if x <= e0 else 1.0 if x >= e1 else
         (lambda t: t * t * (3 - 2 * t))((x - e0) / max(e1 - e0, 1e-8))
@@ -108,6 +110,15 @@ def _opt_stmt(stmt: ASTNode) -> ASTNode:
             stmt.initializer.elements = [_opt_expr(e) for e in stmt.initializer.elements]
         return stmt
 
+    if isinstance(stmt, FunctionDef):
+        stmt.body = [_opt_stmt(s) for s in stmt.body]
+        return stmt
+
+    if isinstance(stmt, ReturnStmt):
+        if stmt.value:
+            stmt.value = _opt_expr(stmt.value)
+        return stmt
+
     # ParamDecl, BreakStmt, ContinueStmt — no change
     return stmt
 
@@ -148,6 +159,14 @@ def _opt_expr(expr: ASTNode) -> ASTNode:
 
     if isinstance(expr, ArrayIndexAccess):
         expr.index = _opt_expr(expr.index)
+        return expr
+
+    if isinstance(expr, BindingIndexAccess):
+        expr.args = [_opt_expr(a) for a in expr.args]
+        return expr
+
+    if isinstance(expr, BindingSampleAccess):
+        expr.args = [_opt_expr(a) for a in expr.args]
         return expr
 
     # NumberLiteral, StringLiteral, Identifier, BindingRef, ChannelAccess — leaf nodes
@@ -337,6 +356,8 @@ def _eliminate_dead_code(stmts: list[ASTNode]) -> list[ASTNode]:
             stmt.body = _eliminate_dead_code(stmt.body)
         elif isinstance(stmt, WhileLoop):
             stmt.body = _eliminate_dead_code(stmt.body)
+        elif isinstance(stmt, FunctionDef):
+            stmt.body = _eliminate_dead_code(stmt.body)
 
         result.append(stmt)
 
@@ -398,6 +419,14 @@ def _collect_used_in_stmt(stmt: ASTNode, used: set[str]):
             else:
                 _collect_used_in_expr(stmt.initializer, used)
 
+    elif isinstance(stmt, FunctionDef):
+        for s in stmt.body:
+            _collect_used_in_stmt(s, used)
+
+    elif isinstance(stmt, ReturnStmt):
+        if stmt.value:
+            _collect_used_in_expr(stmt.value, used)
+
 
 def _collect_used_in_expr(expr: ASTNode, used: set[str]):
     """Recursively collect variable names read in an expression."""
@@ -442,6 +471,16 @@ def _collect_used_in_expr(expr: ASTNode, used: set[str]):
         for elem in expr.elements:
             _collect_used_in_expr(elem, used)
 
+    elif isinstance(expr, BindingIndexAccess):
+        _collect_used_in_expr(expr.binding, used)
+        for arg in expr.args:
+            _collect_used_in_expr(arg, used)
+
+    elif isinstance(expr, BindingSampleAccess):
+        _collect_used_in_expr(expr.binding, used)
+        for arg in expr.args:
+            _collect_used_in_expr(arg, used)
+
     # NumberLiteral, StringLiteral, BindingRef — no local vars to collect
 
 
@@ -459,6 +498,8 @@ def _has_side_effects(expr: ASTNode) -> bool:
                 _has_side_effects(expr.false_expr))
     if isinstance(expr, VecConstructor):
         return any(_has_side_effects(a) for a in expr.args)
+    if isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
+        return True  # Reads from bindings — preserve
     return False
 
 
@@ -562,10 +603,10 @@ def _expr_depth(expr: ASTNode) -> int:
     return 0
 
 
-def _collect_subexprs(expr: ASTNode, seen: dict[str, list], depth_threshold: int = _CSE_MIN_DEPTH):
-    """Walk an expression and record all sub-expressions by hash.
+def _collect_subexprs(expr: ASTNode, seen: dict[str, int], depth_threshold: int = _CSE_MIN_DEPTH):
+    """Walk an expression and count sub-expressions by hash.
 
-    seen: maps hash -> [(expr_ref, parent_setter)] for occurrence tracking.
+    seen: maps hash -> occurrence count.
     Only records expressions with depth >= depth_threshold.
     """
     h = _expr_hash(expr)
@@ -595,6 +636,9 @@ def _collect_subexprs(expr: ASTNode, seen: dict[str, list], depth_threshold: int
         _collect_subexprs(expr.condition, seen, depth_threshold)
         _collect_subexprs(expr.true_expr, seen, depth_threshold)
         _collect_subexprs(expr.false_expr, seen, depth_threshold)
+    elif isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
+        for a in expr.args:
+            _collect_subexprs(a, seen, depth_threshold)
 
 
 def _collect_subexprs_in_stmt(stmt: ASTNode, seen: dict[str, int]):
@@ -631,6 +675,8 @@ def _replace_expr(expr: ASTNode, replacements: dict[str, str]) -> ASTNode:
         expr.condition = _replace_expr(expr.condition, replacements)
         expr.true_expr = _replace_expr(expr.true_expr, replacements)
         expr.false_expr = _replace_expr(expr.false_expr, replacements)
+    elif isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
+        expr.args = [_replace_expr(a, replacements) for a in expr.args]
     return expr
 
 
@@ -665,6 +711,8 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode]) -> list[ASTNode]:
         elif isinstance(stmt, ForLoop):
             stmt.body = _eliminate_common_subexpressions(stmt.body)
         elif isinstance(stmt, WhileLoop):
+            stmt.body = _eliminate_common_subexpressions(stmt.body)
+        elif isinstance(stmt, FunctionDef):
             stmt.body = _eliminate_common_subexpressions(stmt.body)
 
     # Collect all sub-expression hashes across the block
