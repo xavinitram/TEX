@@ -1,0 +1,19 @@
+// Luma Keyer — extract a mask from image brightness
+// Outputs a clean matte based on the luminance of the input.
+// Uses smoothstep for soft edges between the key range.
+// Useful for isolating highlights, shadows, or midtones.
+
+f$low = 0.2;       // luminance below this is black (fully transparent)
+f$high = 0.8;      // luminance above this is white (fully opaque)
+f$softness = 0.1;  // edge softness (0 = hard key, higher = softer)
+
+float lum = luma(@image);
+
+// Soft threshold using smoothstep
+float lo = max($low - $softness, 0.0);
+float hi = min($high + $softness, 1.0);
+
+float mask = smoothstep(lo, $low + $softness, lum)
+           * (1.0 - smoothstep($high - $softness, hi, lum));
+
+m@OUT = mask;

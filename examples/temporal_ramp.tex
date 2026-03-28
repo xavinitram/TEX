@@ -1,0 +1,31 @@
+// Temporal Ramp — fade in/out over a frame sequence
+//
+// Demonstrates the temporal builtins fi (current frame index) and fn
+// (total frame count). Lerps between the source image and a target
+// color based on the frame's normalized position in the sequence.
+//
+// The first fade_in fraction of frames ramps from the color to the
+// image; the last fade_out fraction ramps back to the color.
+
+f$fade_in = 0.2;      // fraction of sequence for fade-in  (0..1)
+f$fade_out = 0.2;     // fraction of sequence for fade-out (0..1)
+f$color_r = 0.0;      // fade color red
+f$color_g = 0.0;      // fade color green
+f$color_b = 0.0;      // fade color blue
+
+vec3 src = @image;
+vec3 fade_color = vec3($color_r, $color_g, $color_b);
+
+// Normalized position in the sequence (0..1)
+float t = (fn > 1) ? float(fi) / float(fn - 1) : 1.0;
+
+// Compute opacity: ramp up during fade_in, ramp down during fade_out
+float opacity = 1.0;
+if ($fade_in > 0.0) {
+    opacity = min(opacity, smoothstep(0.0, $fade_in, t));
+}
+if ($fade_out > 0.0) {
+    opacity = min(opacity, smoothstep(0.0, $fade_out, 1.0 - t));
+}
+
+@OUT = lerp(fade_color, src, opacity);

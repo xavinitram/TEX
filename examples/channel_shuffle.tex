@@ -1,0 +1,21 @@
+// Channel Shuffle — remap channels between two inputs
+//
+// Routes any channel from @A or @B to any output channel. Useful for:
+//   - Extracting a single channel as grayscale
+//   - Swapping R/B channels
+//   - Copying channels between images
+//   - Creating constant (black/white) channels
+//
+// Source codes:  0=A.r  1=A.g  2=A.b  3=B.r  4=B.g  5=B.b  6=zero  7=one
+
+i$out_r = 0;    // output red source   (default: A.r)
+i$out_g = 1;    // output green source (default: A.g)
+i$out_b = 2;    // output blue source  (default: A.b)
+
+vec3 a = @A;
+vec3 b = @B;
+
+// Build a lookup: 0-2 = A channels, 3-5 = B channels, 6 = black, 7 = white
+float channels[] = {a.r, a.g, a.b, b.r, b.g, b.b, 0.0, 1.0};
+
+@OUT = vec3(channels[$out_r], channels[$out_g], channels[$out_b]);

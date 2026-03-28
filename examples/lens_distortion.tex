@@ -1,21 +1,26 @@
-// Barrel/pincushion lens distortion
-// Common in VFX for matching real camera lens characteristics
+// Lens Distortion — barrel/pincushion radial distortion
+//
+// Applies a two-coefficient radial distortion model commonly used in VFX
+// to match real camera lens characteristics. Negative k1 produces barrel
+// distortion (wide-angle look), positive produces pincushion distortion.
+//
+// Connect @image to any RGB input.
 
-float cx = 0.5;
-float cy = 0.5;
-float k1 = -0.3;  // negative = barrel, positive = pincushion
-float k2 = 0.1;
+f$k1 = -0.3;      // primary distortion (negative = barrel, positive = pincushion)
+f$k2 = 0.1;       // secondary distortion (fine-tunes the curve)
+f$center_x = 0.5; // distortion center X
+f$center_y = 0.5; // distortion center Y
 
-// Normalized coords centered at (cx, cy)
-float dx = u - cx;
-float dy = v - cy;
+// Normalized coords centered at (center_x, center_y)
+float dx = u - $center_x;
+float dy = v - $center_y;
 float r2 = dx * dx + dy * dy;
 float r4 = r2 * r2;
 
 // Radial distortion model
-float distort = 1.0 + k1 * r2 + k2 * r4;
-float su = cx + dx * distort;
-float sv = cy + dy * distort;
+float distort = 1.0 + $k1 * r2 + $k2 * r4;
+float su = $center_x + dx * distort;
+float sv = $center_y + dy * distort;
 
 // Sample with distorted coordinates
 @OUT = sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0));

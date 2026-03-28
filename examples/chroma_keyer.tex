@@ -1,0 +1,155 @@
+// Chroma Keyer — color-difference keyer with spill suppression
+//
+// Implements the Vlahos/Ultimatte color-difference method with a
+// dual-band core/edge matte strategy and hue-preserving despill.
+//
+// The keyer works on any backing color but is optimized for green and
+// blue screens. The algorithm:
+//
+//   1. Color-difference alpha: measures how much the screen's dominant
+//      channel exceeds the other channels, normalized against the
+//      clean screen color. This naturally handles semi-transparent
+//      elements (hair, motion blur, smoke).
+//
+//   2. Dual-band matte: a hard "core" matte (solid interior) is fused
+//      with a soft "edge" matte (fine detail) via max(), preventing
+//      the classic "holes vs halos" trade-off.
+//
+//   3. Hue-preserving despill: removes screen contamination from the
+//      foreground while redistributing the lost luminance across the
+//      remaining channels, preserving the pixel's original hue ratio.
+//      This avoids the dead gray/magenta edges of naive channel clamping.
+//
+// Outputs: @OUT = premultiplied RGBA (despilled foreground + alpha).
+// Connect @image with the green/blue screen plate.
+
+f$screen_r = 0.05;       // screen color R (eyedropper the backing)
+f$screen_g = 0.85;       // screen color G
+f$screen_b = 0.05;       // screen color B
+f$screen_balance = 0.5;  // secondary channel weight (0-1)
+f$clip_black = 0.0;      // crush blacks in matte (expand transparent zone)
+f$clip_white = 1.0;      // crush whites in matte (expand opaque zone)
+f$core_erode = 1.0;      // core matte shrink in pixels (tighten solid area)
+f$despill_strength = 1.0; // spill removal intensity (0 = no despill)
+f$edge_tolerance = 1.0;  // fine detail sensitivity (lower = more detail)
+
+// ── Detect screen channel ────────────────────────────────────────
+// Determine if this is a green or blue screen from the screen color.
+// The dominant channel drives the color-difference equation.
+float is_green = step($screen_b, $screen_g);  // 1 if green screen, 0 if blue
+
+vec4 fg = @image;
+
+// ── Color-difference alpha ───────────────────────────────────────
+// For green screen: alpha = 1 - (G - balance * max(R, B)) / screen_energy
+// For blue screen:  alpha = 1 - (B - balance * max(R, G)) / screen_energy
+float screen_energy;
+float fg_diff;
+
+if (is_green > 0.5) {
+    // Green screen
+    screen_energy = $screen_g - $screen_balance * max($screen_r, $screen_b);
+    fg_diff = fg.g - $screen_balance * max(fg.r, fg.b);
+} else {
+    // Blue screen
+    screen_energy = $screen_b - $screen_balance * max($screen_r, $screen_g);
+    fg_diff = fg.b - $screen_balance * max(fg.r, fg.g);
+}
+
+// Normalize by screen energy to handle non-uniform screens
+float raw_alpha = 1.0 - sdiv(fg_diff, max(screen_energy, 0.001));
+raw_alpha = clamp(raw_alpha, 0.0, 1.0);
+
+// ── Edge matte (soft, preserves fine detail) ─────────────────────
+float alpha_edge = pow(raw_alpha, $edge_tolerance);
+
+// ── Core matte (hard, solid interior) ────────────────────────────
+// Eroded version using a distance-from-edge approximation.
+// Sample alpha at neighboring pixels and take the minimum to
+// effectively shrink the solid region by core_erode pixels.
+float alpha_core = raw_alpha;
+float erode_px = $core_erode;
+
+if (erode_px > 0.0) {
+    // Sample cardinal neighbors at erode distance
+    float e = erode_px;
+    vec4 n1 = sample(@image, u + e * px, v);
+    vec4 n2 = sample(@image, u - e * px, v);
+    vec4 n3 = sample(@image, u, v + e * py);
+    vec4 n4 = sample(@image, u, v - e * py);
+
+    // Compute alpha at each neighbor
+    float a1; float a2; float a3; float a4;
+    if (is_green > 0.5) {
+        a1 = 1.0 - sdiv(n1.g - $screen_balance * max(n1.r, n1.b), max(screen_energy, 0.001));
+        a2 = 1.0 - sdiv(n2.g - $screen_balance * max(n2.r, n2.b), max(screen_energy, 0.001));
+        a3 = 1.0 - sdiv(n3.g - $screen_balance * max(n3.r, n3.b), max(screen_energy, 0.001));
+        a4 = 1.0 - sdiv(n4.g - $screen_balance * max(n4.r, n4.b), max(screen_energy, 0.001));
+    } else {
+        a1 = 1.0 - sdiv(n1.b - $screen_balance * max(n1.r, n1.g), max(screen_energy, 0.001));
+        a2 = 1.0 - sdiv(n2.b - $screen_balance * max(n2.r, n2.g), max(screen_energy, 0.001));
+        a3 = 1.0 - sdiv(n3.b - $screen_balance * max(n3.r, n3.g), max(screen_energy, 0.001));
+        a4 = 1.0 - sdiv(n4.b - $screen_balance * max(n4.r, n4.g), max(screen_energy, 0.001));
+    }
+    alpha_core = min(min(clamp(a1, 0.0, 1.0), clamp(a2, 0.0, 1.0)),
+                     min(clamp(a3, 0.0, 1.0), clamp(a4, 0.0, 1.0)));
+}
+
+// Hard threshold on the core
+alpha_core = step(0.95, alpha_core);
+
+// ── Fuse core and edge ───────────────────────────────────────────
+float alpha = max(alpha_core, alpha_edge);
+
+// ── Clip black/white (matte crush) ───────────────────────────────
+alpha = clamp(sdiv(alpha - $clip_black, $clip_white - $clip_black), 0.0, 1.0);
+
+// ── Hue-preserving despill ───────────────────────────────────────
+// Remove screen contamination while preserving luminance and hue.
+// 1. Compute the maximum allowable screen channel value
+// 2. Redistribute the luminance deficit across the remaining channels
+//    proportional to their existing ratio (preserving hue).
+vec3 despilled = fg.rgb;
+
+if ($despill_strength > 0.0) {
+    float spill_limit;
+    float spill_amount;
+
+    if (is_green > 0.5) {
+        spill_limit = max(fg.r, fg.b);
+        spill_amount = max(fg.g - spill_limit, 0.0) * $despill_strength;
+        despilled.g = fg.g - spill_amount;
+    } else {
+        spill_limit = max(fg.r, fg.g);
+        spill_amount = max(fg.b - spill_limit, 0.0) * $despill_strength;
+        despilled.b = fg.b - spill_amount;
+    }
+
+    // Luminance-preserving redistribution:
+    // The removed spill had luminance contribution. Redistribute it
+    // to R and B (for green screen) proportional to their ratio.
+    if (spill_amount > 0.0) {
+        // BT.709 luminance weights
+        float lost_Y;
+        if (is_green > 0.5) {
+            lost_Y = spill_amount * 0.7152;
+        } else {
+            lost_Y = spill_amount * 0.0722;
+        }
+
+        // Distribute by channel ratio (preserves original hue)
+        float rb_sum;
+        if (is_green > 0.5) {
+            rb_sum = max(fg.r + fg.b, 0.001);
+            despilled.r = despilled.r + lost_Y * sdiv(fg.r, rb_sum);
+            despilled.b = despilled.b + lost_Y * sdiv(fg.b, rb_sum);
+        } else {
+            rb_sum = max(fg.r + fg.g, 0.001);
+            despilled.r = despilled.r + lost_Y * sdiv(fg.r, rb_sum);
+            despilled.g = despilled.g + lost_Y * sdiv(fg.g, rb_sum);
+        }
+    }
+}
+
+// ── Output premultiplied RGBA ────────────────────────────────────
+@OUT = vec4(despilled.r * alpha, despilled.g * alpha, despilled.b * alpha, alpha);

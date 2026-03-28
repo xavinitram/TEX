@@ -3,8 +3,7 @@
 // Generates a white-to-black gradient radiating outward
 // from the image center using smoothstep for a soft edge.
 // Useful as a mask, vignette layer, or compositing element.
-
-vec4 _ref = @ref;
+// Purely procedural — no inputs required.
 
 // Distance from center of image
 float cx = u - 0.5;
@@ -14,4 +13,4 @@ float dist = hypot(cx, cy);
 // Smooth falloff: white at center, black at edges
 float grad = 1.0 - smoothstep(0.0, 0.5, dist);
 
-@OUT = vec3(grad, grad, grad);
+@OUT = vec3(grad);

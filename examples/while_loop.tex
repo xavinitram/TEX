@@ -1,0 +1,41 @@
+// While Loop — Newton's method for square root
+//
+// Educational example demonstrating while loops and break.
+// Uses Newton-Raphson iteration to compute the square root of the
+// pixel luminance: guess = (guess + x / guess) / 2
+// Iterates until the error is below a tolerance, then compares the
+// result with the built-in sqrt() function.
+//
+// Output: left half shows Newton's result, right half shows the
+// difference (error) magnified 100x. Should be near-black.
+
+f$tolerance = 0.0001;  // convergence threshold
+i$max_iter = 20;        // maximum iterations to prevent infinite loops
+
+vec3 src = @image;
+float x = luma(src);
+
+// Newton's method for sqrt(x)
+float guess = max(x, 0.001);   // initial guess (avoid zero)
+int iter = 0;
+
+while (iter < $max_iter) {
+    float next = (guess + x / max(guess, 0.0001)) * 0.5;
+    float err = abs(next - guess);
+    guess = next;
+    iter = iter + 1;
+    if (err < $tolerance) {
+        break;
+    }
+}
+
+float newton_sqrt = guess;
+float builtin_sqrt = sqrt(x);
+
+// Visualize: left = Newton result, right = error * 100
+if (u < 0.5) {
+    @OUT = vec3(newton_sqrt);
+} else {
+    float diff = abs(newton_sqrt - builtin_sqrt) * 100.0;
+    @OUT = vec3(diff, 0.0, 0.0);
+}

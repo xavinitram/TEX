@@ -18,18 +18,35 @@ TEX_Wrangle/
     stdlib_signatures.py   # Function signatures for type checking
   tex_runtime/
     interpreter.py         # Tree-walking tensor evaluator
-    stdlib.py              # Built-in function implementations (102)
+    stdlib.py              # Built-in function implementations (math, color, sampling, SDF, string, array)
+    noise.py               # Procedural noise library (Perlin, Worley, FBM, curl, etc.)
     compiled.py            # torch.compile wrapper with backend cascade
     codegen.py             # AST -> Python function compiler
   js/
     tex_extension.js       # Frontend: auto-socket, CodeMirror 6 editor, help popup
     tex_cm6_bundle.js      # Pre-built CodeMirror 6 bundle (Rollup)
   tests/
-    test_tex.py            # Comprehensive test suite (61 tests)
+    README.md              # Test suite structure and how to add tests
+    helpers.py             # Shared test utilities (SubTestResult, compile helpers, fixtures)
+    conftest.py            # pytest fixture wiring
+    run_all.py             # Standalone runner (no pytest dependency)
+    test_lexer.py          # Lexer token tests
+    test_parser.py         # Parser AST tests
+    test_type_checker.py   # Type checker tests
+    test_interpreter.py    # Interpreter execution tests
+    test_language.py       # Language feature tests (if/else, loops, ternary, scoping)
+    test_stdlib.py         # Stdlib function tests (math, color, SDF, edge cases)
+    test_strings_arrays.py # String and array operation tests
+    test_noise_sampling.py # Noise generation and sampling tests
+    test_bindings_params.py # Binding access, params, user functions
+    test_codegen_optimizer.py # Codegen equivalence and optimizer pass tests
+    test_integration.py    # End-to-end: cache, device, torch.compile, node helpers
+    test_diagnostics.py    # Error message and diagnostic quality tests
+    test_performance.py    # Timing benchmarks (@pytest.mark.slow)
   benchmarks/
     run_benchmarks.py      # Reproducible performance benchmarks
     README.md              # Benchmark usage and result format docs
-  examples/                # Example TEX snippets (42 files)
+  examples/                # Example TEX snippets (114 files)
   .tex_cache/              # Disk cache directory (auto-created, gitignored)
 ```
 
@@ -66,7 +83,9 @@ Source Code
 
 **Interpreter** (`tex_runtime/interpreter.py`): Tree-walking evaluator that executes the AST using PyTorch tensor operations. Reads types from `type_map` to guide evaluation (e.g. choosing `torch.where` for if/else). Produces output tensors/strings for all assigned `@name` bindings. Used as the default execution path.
 
-**Codegen** (`tex_runtime/codegen.py`): Compiles the AST into a Python function string, then `exec()`s it into a callable. Eliminates per-node dispatch overhead. All env variables are pre-registered as Python locals (`_lv_{name}`) to avoid dict lookups and produce cleaner FX graphs for TorchInductor. Falls back to the interpreter for unsupported patterns (arrays, string operations).
+**Codegen** (`tex_runtime/codegen.py`): Compiles the AST into a Python function string, then `exec()`s it into a callable. Eliminates per-node dispatch overhead. All env variables are pre-registered as Python locals (`_lv_{name}`) to avoid dict lookups and produce cleaner FX graphs for TorchInductor. Falls back to the interpreter for unsupported patterns (string operations).
+
+**Noise** (`tex_runtime/noise.py`): Procedural noise library with 2D/3D implementations. Contains Perlin gradient noise (arithmetic hash for TorchInductor compatibility), simplex noise, FBM with tiered compilation (eager → jit.trace → torch.compile), Worley/Voronoi cell noise, curl (divergence-free flow fields), and FBM variants (ridged, billow, turbulence, flow, alligator). All functions accept optional `z` parameter for 3D evaluation.
 
 **tex_node.py**: ComfyUI integration layer. Receives ComfyUI inputs (IMAGE, MASK, LATENT, FLOAT, INT, STRING), maps them to TEX types, runs the compiler pipeline, and formats the result back into ComfyUI output.
 
@@ -138,7 +157,7 @@ For and while loops execute sequentially -- each iteration runs the body as vect
 ## Type System
 
 ```
-VOID -> INT -> FLOAT -> VEC3 -> VEC4
+VOID -> INT -> FLOAT -> VEC2 -> VEC3 -> VEC4
                         MAT3    MAT4 (internal only, no @OUT)
                                STRING (no numeric promotion)
                                ARRAY (container type)
@@ -146,7 +165,8 @@ VOID -> INT -> FLOAT -> VEC3 -> VEC4
 
 **Promotion rules** (automatic):
 - `INT` + `FLOAT` -> `FLOAT`
-- `FLOAT` + `VEC3` -> `VEC3` (broadcast scalar to all channels)
+- `FLOAT` + `VEC2` -> `VEC2` (broadcast scalar to all channels)
+- `VEC2` + `VEC3` -> `VEC3` (zero-pad missing channels)
 - `VEC3` + `VEC4` -> `VEC4` (alpha = 1.0)
 - `STRING` does NOT coerce to/from numeric types
 
@@ -214,7 +234,7 @@ The JavaScript frontend (`js/tex_extension.js`) provides:
 
 **Example: adding `saturate(x)` that clamps to [0, 1].**
 
-1. **`tex_runtime/stdlib.py`** -- implement the function:
+1. **`tex_runtime/stdlib.py`** -- implement the function (or `tex_runtime/noise.py` for noise functions):
 ```python
 @staticmethod
 def fn_saturate(x):
@@ -247,7 +267,7 @@ if node.name == "saturate":
 ```
 Update `TEX_HELP_HTML` to document it in the help popup.
 
-5. **`tests/test_tex.py`** -- add a test:
+5. **`tests/test_stdlib.py`** -- add a test (see `tests/README.md` for the full pattern):
 ```python
 try:
     result = compile_and_run("@OUT = vec4(saturate(1.5), saturate(-0.5), saturate(0.5), 1.0);", {"A": img})
@@ -309,10 +329,21 @@ Adding a new TEX type requires changes across the entire pipeline:
 
 ```bash
 cd custom_nodes/TEX_Wrangle
-python -m pytest tests/test_tex.py -v
+
+# Full suite via pytest (77 test functions, ~1215 sub-tests)
+python -m pytest tests/ -v
+
+# Skip slow timing tests
+python -m pytest tests/ -v -m 'not slow'
+
+# Single domain
+python -m pytest tests/test_stdlib.py -v
+
+# Standalone runner (no pytest dependency)
+python tests/run_all.py
 ```
 
-Expected: 61 test functions passed.
+See `tests/README.md` for the test suite structure, sub-test pattern, and how to add new tests.
 
 ## Benchmarks
 

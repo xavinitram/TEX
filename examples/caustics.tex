@@ -1,0 +1,47 @@
+// Caustics — scatter-write underwater light simulation
+//
+// Uses scatter writes (@OUT[x, y] += value) to simulate underwater
+// caustics. A noise-based displacement field bends "light rays" and
+// scatters energy to displaced positions. Where rays converge, energy
+// accumulates into bright caustic patterns.
+//
+// This is a scatter operation: each pixel computes WHERE its energy
+// lands, not what lands ON it. The += accumulation creates the
+// characteristic bright convergence lines of real caustics.
+//
+// No input image required — generates a procedural caustic pattern.
+
+f$frequency = 3.0;      // noise frequency (higher = finer pattern)
+f$amplitude = 12.0;     // displacement strength in pixels
+f$energy = 0.08;        // base light energy per pixel
+f$time = 0.0;           // animation offset (connect frame index)
+f$warmth = 0.3;         // warm tint amount (0 = white, 1 = aqua-gold)
+
+// ── Initialize output to black ──────────────────────────────────────
+@OUT[ix, iy] = vec3(0.0);
+
+// ── Compute noise-based displacement ────────────────────────────────
+// Two layers of simplex noise create a 2D vector field that bends
+// the light rays. The offset between noise samples creates curl-like
+// swirling patterns typical of water caustics.
+float nx = u * $frequency + $time * 0.1;
+float ny = v * $frequency + $time * 0.07;
+
+float dx = simplex(nx, ny) * $amplitude;
+float dy = simplex(nx + 5.3, ny + 7.1) * $amplitude;
+
+// Second octave for fine detail
+dx += simplex(nx * 2.0, ny * 2.0) * $amplitude * 0.5;
+dy += simplex(nx * 2.0 + 5.3, ny * 2.0 + 7.1) * $amplitude * 0.5;
+
+// ── Scatter energy to displaced position ────────────────────────────
+// The convergence of displaced rays creates bright caustic lines.
+int tx = int(ix + dx);
+int ty = int(iy + dy);
+
+// Tint: blend between white and a warm aqua-gold
+vec3 warm = vec3(0.9, 1.0, 0.8);
+vec3 cool = vec3(0.8, 0.95, 1.0);
+vec3 tint = lerp(vec3(1.0), lerp(cool, warm, luma(vec3(u))), $warmth);
+
+@OUT[tx, ty] += tint * $energy;

@@ -1,6 +1,10 @@
-// Cross-frame motion detection — highlights pixels that changed between frames
-// Connect a multi-frame image batch to @frames
-// Output: bright pixels = motion, dark = static
+// Motion Detect — cross-frame difference for motion highlighting
+//
+// Compares the current frame to the previous frame in a batch and outputs
+// a brightness map: white pixels indicate motion, black indicates static
+// areas. The difference is amplified 4x for visibility.
+//
+// Connect a multi-frame image batch to @frames.
 
 vec4 curr = fetch_frame(@frames, fi, ix, iy);
 vec4 prev = fetch_frame(@frames, max(fi - 1, 0), ix, iy);
@@ -10,4 +14,4 @@ vec4 diff = abs(curr - prev);
 float motion = luma(diff.rgb) * 4.0;  // amplify for visibility
 motion = clamp(motion, 0.0, 1.0);
 
-@OUT = vec3(motion, motion, motion);
+@OUT = vec3(motion);

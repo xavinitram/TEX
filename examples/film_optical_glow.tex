@@ -1,0 +1,49 @@
+// Film Optical Glow — exponential-kernel bloom with highlight isolation
+//
+// Simulates the optical scattering of light through lens elements and film
+// base. Bright areas bleed outward with an exponential falloff — sharp core,
+// long soft tails — that preserves the original image detail while adding a
+// luminous halo. This is the characteristic "glow" of anamorphic lenses and
+// high-speed film stocks.
+//
+// The glow is computed by sampling the Gaussian-prefiltered mip pyramid with
+// pre-optimized exponential kernel weights (6 taps, ~57 dB PSNR). A brightness
+// threshold isolates highlights so only bright areas contribute to the bloom,
+// preventing the flat wash that uniform glow produces.
+//
+// Performance: 6 sample_mip_gauss calls + 1 original read per pixel.
+
+f$radius = 48.0;       // glow spread in pixels
+f$intensity = 0.5;     // glow brightness (0 = off, 1 = full)
+f$threshold = 0.5;     // brightness threshold (only glow above this)
+f$falloff = 2.0;       // threshold knee softness (higher = harder cutoff)
+
+// ── Optimized 6-tap exponential kernel weights (Gaussian pyramid) ────
+float offsets[] = {-3.5416, -2.1090, -1.0466, -0.1620, 0.6150, 1.3337};
+float weights[] = {0.00063, 0.00802, 0.05349, 0.21820, 0.45467, 0.26499};
+
+float base = log2(max($radius, 1.0) / 0.825);
+
+// ── Accumulate glow from mip pyramid ───────────────────────────────
+// At each mip level, extract only the bright component above threshold.
+// The mip pre-filtering naturally blurs the bright regions, creating the
+// characteristic soft halo without a separate blur pass.
+vec3 glow = vec3(0.0);
+float inv_range = 1.0 / max(1.0 - $threshold, 0.001);
+float inv_falloff = 1.0 / max($falloff, 0.01);
+
+for (int i = 0; i < 6; i++) {
+    float lod = max(base + offsets[i], 0.0);
+    vec3 s = sample_mip_gauss(@image, u, v, lod);
+
+    // Soft highlight extraction: smooth ramp above threshold
+    float lum = luma(s);
+    float bright = pow(clamp((lum - $threshold) * inv_range, 0.0, 1.0), inv_falloff);
+
+    glow += s * bright * weights[i];
+}
+
+// ── Additive composite ─────────────────────────────────────────────
+// Add the glow on top of the original image. This preserves all original
+// detail while adding the soft bloom from bright areas.
+@OUT = @image + glow * $intensity;

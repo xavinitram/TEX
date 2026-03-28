@@ -1,0 +1,21 @@
+// Multi Output — extract R, G, B channels as separate images
+//
+// Demonstrates the multi-output feature: any @OUT_name binding creates
+// a named output socket on the node. Here we produce four outputs:
+//   @OUT       — the original image (pass-through)
+//   @OUT_red   — red channel as grayscale
+//   @OUT_green — green channel as grayscale
+//   @OUT_blue  — blue channel as grayscale
+//
+// This is useful for routing individual channels to different
+// downstream nodes without needing a separate channel shuffle.
+
+vec3 src = @image;
+
+// Pass through the original
+@OUT = src;
+
+// Each channel as a grayscale vec3
+@OUT_red   = vec3(src.r);
+@OUT_green = vec3(src.g);
+@OUT_blue  = vec3(src.b);

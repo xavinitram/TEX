@@ -1,0 +1,53 @@
+// Fix Pixels — sanitize NaN and Inf values in images
+//
+// Educational example: detect and replace corrupted pixels (NaN, Inf,
+// -Inf) with safe values. Common after division-by-zero in shader chains,
+// HDR processing, or importing EXR files with bad data.
+//
+// Strategy:
+//   1. Check each channel for isnan() and isinf()
+//   2. If any channel is bad, replace with average of valid neighbors
+//   3. If all neighbors are also bad, fall back to black
+//
+// Connect @image to a potentially corrupted RGB input.
+
+f$fallback_r = 0.0;     // fallback red if neighborhood is all bad
+f$fallback_g = 0.0;     // fallback green
+f$fallback_b = 0.0;     // fallback blue
+
+vec3 col = @image;
+
+// ── Check if current pixel is bad ───────────────────────────────────
+// A pixel is "bad" if any channel is NaN or infinite.
+float is_bad(vec3 c) {
+    if (isnan(c.r) || isnan(c.g) || isnan(c.b)) { return 1.0; }
+    if (isinf(c.r) || isinf(c.g) || isinf(c.b)) { return 1.0; }
+    return 0.0;
+}
+
+if (is_bad(col) > 0.5) {
+    // ── Gather valid neighbors ──────────────────────────────────────
+    vec3 acc = vec3(0.0);
+    float count = 0.0;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+            vec3 neighbor = fetch(@image, ix + dx, iy + dy);
+            if (is_bad(neighbor) < 0.5) {
+                acc += neighbor;
+                count += 1.0;
+            }
+        }
+    }
+
+    if (count > 0.0) {
+        // Replace with average of valid neighbors
+        col = acc / count;
+    } else {
+        // All neighbors bad too — use fallback color
+        col = vec3($fallback_r, $fallback_g, $fallback_b);
+    }
+}
+
+@OUT = col;

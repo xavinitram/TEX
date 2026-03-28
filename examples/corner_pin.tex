@@ -1,0 +1,33 @@
+// Corner Pin — bilinear warp using four corner positions
+// Maps the unit square to an arbitrary quadrilateral defined by
+// four corners. Uses bilinear interpolation in UV space to find
+// the inverse mapping (output pixel -> source UV).
+//
+// Note: this is a bilinear warp, not a projective (homography) transform.
+// Straight lines may appear slightly curved for strongly non-rectangular quads.
+// For most practical corner pin uses the difference is negligible.
+//
+// Corners are in UV space (0,0 = top-left, 1,1 = bottom-right).
+// Default values = identity (no distortion).
+
+f$tl_x = 0.0;   f$tl_y = 0.0;    // top-left corner
+f$tr_x = 1.0;   f$tr_y = 0.0;    // top-right corner
+f$bl_x = 0.0;   f$bl_y = 1.0;    // bottom-left corner
+f$br_x = 1.0;   f$br_y = 1.0;    // bottom-right corner
+
+// Bilinear interpolation of the four corners to find the
+// source UV for each output pixel position (u, v).
+// This is the inverse of the corner pin mapping.
+//
+// For output position (u,v), the source position is:
+//   P = (1-u)*(1-v)*TL + u*(1-v)*TR + (1-u)*v*BL + u*v*BR
+
+float one_u = 1.0 - u;
+float one_v = 1.0 - v;
+
+float su = one_u * one_v * $tl_x + u * one_v * $tr_x
+         + one_u * v * $bl_x + u * v * $br_x;
+float sv = one_u * one_v * $tl_y + u * one_v * $tr_y
+         + one_u * v * $bl_y + u * v * $br_y;
+
+@OUT = sample(@image, su, sv).rgb;

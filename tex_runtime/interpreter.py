@@ -25,8 +25,8 @@ from ..tex_compiler.ast_nodes import (
     BindingIndexAccess, BindingSampleAccess,
     try_extract_static_range,
 )
-from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP
-from .stdlib import TEXStdlib, SAFE_EPSILON
+from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
+from .stdlib import TEXStdlib, SAFE_EPSILON, VEC_CHANNELS
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
@@ -36,7 +36,10 @@ MAX_CALL_DEPTH = 64
 
 # Default builtin values for scalar (no-spatial-context) mode
 _SCALAR_BUILTIN_DEFAULTS = {"ix": 0.0, "iy": 0.0, "u": 0.0, "v": 0.0,
-                            "iw": 1.0, "ih": 1.0, "fi": 0.0, "fn": 1.0}
+                            "iw": 1.0, "ih": 1.0, "px": 1.0, "py": 1.0,
+                            "fi": 0.0, "fn": 1.0}
+
+_VEC_CHANNELS = VEC_CHANNELS  # alias for local use
 
 
 
@@ -315,6 +318,13 @@ class Interpreter:
                 if needs_dtype_cast and t.is_floating_point() and t.dtype != target_dtype:
                     t = t.to(target_dtype)
                 self.bindings[name] = t
+            elif isinstance(value, (list, tuple)):
+                # Vec param defaults / converted widget values (e.g. [0.5, 0.3, 0.1])
+                # Shape as [1, 1, 1, C] (channel-last spatial) for correct broadcasting
+                t = torch.tensor(value, dtype=target_dtype, device=target_device)
+                if t.dim() == 1 and t.shape[0] in (2, 3, 4):
+                    t = t.view(1, 1, 1, -1)
+                self.bindings[name] = t
             else:
                 self.bindings[name] = torch.scalar_tensor(float(value), dtype=target_dtype, device=target_device)
 
@@ -424,6 +434,12 @@ class Interpreter:
             if "ih" in used:
                 self.env["ih"] = torch.scalar_tensor(float(full_H), dtype=self._dtype, device=self.device)
 
+            # px, py: pixel step in UV space (1/width, 1/height)
+            if "px" in used:
+                self.env["px"] = torch.scalar_tensor(1.0 / max(full_W, 1), dtype=self._dtype, device=self.device)
+            if "py" in used:
+                self.env["py"] = torch.scalar_tensor(1.0 / max(full_H, 1), dtype=self._dtype, device=self.device)
+
             if "fi" in used:
                 self.env["fi"] = torch.arange(B, dtype=self._dtype, device=self.device).view(B, 1, 1)
             if "fn" in used:
@@ -436,6 +452,8 @@ class Interpreter:
 
         if "PI" in used:
             self.env["PI"] = torch.scalar_tensor(math.pi, dtype=self._dtype, device=self.device)
+        if "TAU" in used:
+            self.env["TAU"] = torch.scalar_tensor(math.tau, dtype=self._dtype, device=self.device)
         if "E" in used:
             self.env["E"] = torch.scalar_tensor(math.e, dtype=self._dtype, device=self.device)
         if "ic" in used:
@@ -477,7 +495,7 @@ class Interpreter:
 
     def _exec_array_decl(self, node: ArrayDecl):
         """Execute an array declaration."""
-        is_vec = node.element_type_name in ("vec3", "vec4")
+        is_vec = TYPE_NAME_MAP.get(node.element_type_name, TEXType.FLOAT).is_vector
         is_string = node.element_type_name == "string"
 
         # -- String arrays: Python list, not tensor -----------------------
@@ -508,7 +526,7 @@ class Interpreter:
                     expanded = [e if isinstance(e, torch.Tensor) else torch.scalar_tensor(float(e), dtype=self._dtype, device=self.device) for e in elements]
                 # For vec3/vec4 arrays, promote elements to consistent channel count
                 if is_vec:
-                    channels = 3 if node.element_type_name == "vec3" else 4
+                    channels = TYPE_NAME_MAP[node.element_type_name].channels
                     expanded = [self._promote_to_channels(e, channels) for e in expanded]
                 value = torch.stack(expanded, dim=-1)
                 # For vec arrays, stacking puts channels before N: [..., C, N]
@@ -523,7 +541,7 @@ class Interpreter:
             # Zero-initialized array
             size = node.size
             if is_vec:
-                channels = 3 if node.element_type_name == "vec3" else 4
+                channels = TYPE_NAME_MAP[node.element_type_name].channels
                 if self.spatial_shape:
                     B, H, W = self.spatial_shape
                     value = torch.zeros(B, H, W, size, channels, dtype=self._dtype, device=self.device)
@@ -543,7 +561,7 @@ class Interpreter:
         """Ensure a tensor has the correct number of channels for a vec array element."""
         if not isinstance(tensor, torch.Tensor):
             tensor = torch.scalar_tensor(float(tensor), dtype=self._dtype, device=self.device)
-        if tensor.dim() >= 1 and tensor.shape[-1] in (3, 4):
+        if tensor.dim() >= 1 and tensor.shape[-1] in _VEC_CHANNELS:
             c = tensor.shape[-1]
             if c == channels:
                 return tensor
@@ -626,44 +644,47 @@ class Interpreter:
         elif isinstance(target, ArrayIndexAccess):
             self._exec_array_index_assign(target, value)
 
+        elif isinstance(target, BindingIndexAccess):
+            self._exec_scatter_write(target, value, op=node.op)
+
         else:
             raise InterpreterError(
                 "This assignment target is not supported",
                 node.loc, source=self._source, code="E6003",
-                hint="Assignments work with variables, @bindings, channels (.r), and array indices ([i]).",
+                hint="Assignments work with variables, @bindings, channels (.r), array indices ([i]), and scatter writes (@OUT[x,y]).",
             )
 
     def _exec_channel_assign(self, target: ChannelAccess, value: torch.Tensor):
-        """Handle assignment to a channel: `@A.r = expr;` or `color.r = expr;`"""
-        # Get the base tensor
+        """Handle assignment to a channel: `@A.r = expr;` or `color.rgb = expr;`"""
         base = self._eval(target.object)
         channels = target.channels
 
-        if len(channels) != 1:
-            raise InterpreterError(
-                f"This channel assignment needs a single channel, but found swizzle '.{channels}'",
-                target.loc, source=self._source, code="E6004",
-                hint="Assign to one channel at a time, e.g. '.r', '.g', '.b', or '.a'.",
-            )
-
-        idx = CHANNEL_MAP.get(channels)
-        if idx is None:
-            raise InterpreterError(
-                f"Expected a known channel name, but found '.{channels}'",
-                target.loc, source=self._source, code="E6004",
-                hint="Use one of: .r, .g, .b, .a (or .x, .y, .z, .w).",
-            )
-
-        # Clone to avoid modifying the original in-place (breaks autograd)
-        result = base.clone()
-        if result.dim() >= 1 and result.shape[-1] > idx:
-            result[..., idx] = _ensure_spatial(value, result.shape[:-1])
+        if len(channels) == 1:
+            idx = CHANNEL_MAP.get(channels)
+            if idx is None:
+                raise InterpreterError(
+                    f"Expected a known channel name, but found '.{channels}'",
+                    target.loc, source=self._source, code="E6004",
+                    hint="Use one of: .r, .g, .b, .a (or .x, .y, .z, .w).",
+                )
+            result = base.clone()
+            if result.dim() >= 1 and result.shape[-1] > idx:
+                result[..., idx] = _ensure_spatial(value, result.shape[:-1])
+            else:
+                raise InterpreterError(
+                    f"This tensor (shape {result.shape}) does not have a channel at index {idx}",
+                    target.loc, source=self._source, code="E6004",
+                    hint="The target needs enough channels for this assignment. Check if the variable is a vec3 or vec4.",
+                )
         else:
-            raise InterpreterError(
-                f"This tensor (shape {result.shape}) does not have a channel at index {idx}",
-                target.loc, source=self._source, code="E6004",
-                hint="The target needs enough channels for this assignment. Check if the variable is a vec3 or vec4.",
-            )
+            # Multi-channel assignment: .rgb, .xy, .rgba, etc.
+            indices = [CHANNEL_MAP[ch] for ch in channels]
+            result = base.clone()
+            val = _ensure_spatial(value, result.shape[:-1]) if self.spatial_shape else value
+            val_is_multi = isinstance(val, torch.Tensor) and val.dim() >= 1 and val.shape[-1] > 1
+            for i, idx in enumerate(indices):
+                if result.dim() >= 1 and result.shape[-1] > idx:
+                    result[..., idx] = val[..., i] if val_is_multi else val
 
         # Write back to the correct location
         if isinstance(target.object, Identifier):
@@ -745,6 +766,77 @@ class Interpreter:
                 target.loc, source=self._source, code="E6005",
                 hint="Assign to a named array element, e.g. 'arr[i] = value;'.",
             )
+
+    def _exec_scatter_write(self, target: BindingIndexAccess, value, op=None):
+        """Handle @OUT[px, py] = value or @OUT[px, py] += value (scatter write)."""
+        name = target.binding.name
+        args = [self._eval(a) for a in target.args]
+        px, py = args[0], args[1]
+        frame = args[2] if len(args) == 3 else None
+
+        # Determine channel count from value
+        if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[-1] in _VEC_CHANNELS:
+            C = value.shape[-1]
+        else:
+            C = 1
+
+        # Get or create output buffer — must be at least [B, H, W] for scatter indexing
+        buf = self.bindings.get(name)
+        if self.spatial_shape:
+            B, H, W = self.spatial_shape
+        else:
+            B, H, W = 1, 1, 1
+
+        needs_new_buf = (buf is None or not isinstance(buf, torch.Tensor) or buf.dim() < 3)
+        if needs_new_buf:
+            # Existing buffer too small — create spatial buffer, preserving old value if possible
+            if C > 1:
+                new_buf = torch.zeros(B, H, W, C, dtype=self._dtype, device=self.device)
+            else:
+                new_buf = torch.zeros(B, H, W, dtype=self._dtype, device=self.device)
+            if isinstance(buf, torch.Tensor):
+                new_buf[...] = buf
+            buf = new_buf
+            self.bindings[name] = buf
+        elif not buf.is_contiguous():
+            # Clone expanded tensors (e.g. from vec3(1.0) broadcast) so index_put_ works
+            buf = buf.clone()
+            self.bindings[name] = buf
+
+        # Clamp coordinates
+        ix_t = torch.clamp(torch.floor(_ensure_spatial(px, (B, H, W)) if self.spatial_shape else px).long(), 0, W - 1)
+        iy_t = torch.clamp(torch.floor(_ensure_spatial(py, (B, H, W)) if self.spatial_shape else py).long(), 0, H - 1)
+        val = _ensure_spatial(value, (B, H, W)) if self.spatial_shape else value
+
+        # Build flat indices
+        if frame is not None:
+            batch_idx = torch.clamp(
+                (_ensure_spatial(frame, (B, H, W)) if self.spatial_shape else frame).long(),
+                0, B - 1
+            )
+        else:
+            batch_idx = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, H, W)
+
+        flat_b = batch_idx.contiguous().reshape(-1)
+        flat_y = iy_t.contiguous().reshape(-1)
+        flat_x = ix_t.contiguous().reshape(-1)
+
+        if C > 1 and buf.dim() == 4:
+            flat_v = val.contiguous().reshape(-1, C)
+        else:
+            flat_v = val.reshape(-1) if isinstance(val, torch.Tensor) and val.dim() > 0 else val
+
+        idx = (flat_b, flat_y, flat_x)
+        if op is None:
+            buf[idx] = flat_v
+        elif op == "+":
+            buf.index_put_(idx, flat_v, accumulate=True)
+        elif op == "-":
+            buf.index_put_(idx, -flat_v, accumulate=True)
+        elif op == "*":
+            buf[idx] *= flat_v
+        elif op == "/":
+            buf[idx] /= torch.where(flat_v == 0, SAFE_EPSILON, flat_v)
 
     @staticmethod
     def _collect_assigned_vars(stmts: list[ASTNode]) -> tuple[set[str], set[str]]:
@@ -1182,6 +1274,10 @@ class Interpreter:
                     right = right.unsqueeze(-1)
                 else:
                     left, right = _broadcast_pair(left, right)
+            elif left.dim() == right.dim() and left.dim() >= 1:
+                # Both same rank — delegate channel padding to _broadcast_pair
+                if left.shape[-1] != right.shape[-1]:
+                    left, right = _broadcast_pair(left, right)
 
             # Inline operator dispatch (avoids lambda call overhead)
             if op == "+":
@@ -1545,7 +1641,7 @@ class Interpreter:
 # -- AST scanning for lazy builtins ------------------------------------
 
 # Names that are built-in variables (not user-defined)
-_BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "fi", "fn", "PI", "E", "ic"})
+_BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", "fn", "PI", "TAU", "E", "ic"})
 
 
 def _collect_identifiers(program: Program) -> frozenset[str]:
@@ -1651,9 +1747,19 @@ def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, tor
 
     Handles the key case: scalar [B,H,W] op with vector [B,H,W,C]
     by expanding the scalar with unsqueeze(-1).
+    Also pads channel dimensions when both are vectors with different channel counts.
     """
     ad, bd = a.dim(), b.dim()
     if ad == bd:
+        # Same rank — pad channel dim when both are vectors (e.g. vec2 [B,H,W,2] + vec3 [B,H,W,3])
+        if ad >= 1 and a.shape[-1] != b.shape[-1]:
+            ac, bc = a.shape[-1], b.shape[-1]
+            if not (ac in _VEC_CHANNELS and bc in _VEC_CHANNELS):
+                return a, b
+            if ac < bc:
+                a = torch.nn.functional.pad(a, (0, bc - ac))
+            else:
+                b = torch.nn.functional.pad(b, (0, ac - bc))
         return a, b
 
     # Pad trailing dims with single view+expand (no while loop)

@@ -27,10 +27,33 @@ from .tex_runtime.interpreter import _collect_identifiers
 
 logger = logging.getLogger("TEX")
 
-# Disk cache format version — tracks AST/type-checker compatibility, NOT the
-# release version. Bump this when AST node structure or type checker changes
-# would make existing .pkl cache files invalid (causes graceful cache miss).
-_CACHE_VERSION = "2.4.0"  # v0.7: CSE pass, static for-loop range, reusable interpreter
+
+def _compute_compiler_hash() -> str:
+    """Hash all compiler/runtime source files to auto-invalidate disk cache on code changes."""
+    pkg_dir = Path(__file__).parent
+    source_files = sorted([
+        pkg_dir / "tex_compiler" / "ast_nodes.py",
+        pkg_dir / "tex_compiler" / "lexer.py",
+        pkg_dir / "tex_compiler" / "parser.py",
+        pkg_dir / "tex_compiler" / "type_checker.py",
+        pkg_dir / "tex_compiler" / "optimizer.py",
+        pkg_dir / "tex_compiler" / "stdlib_signatures.py",
+        pkg_dir / "tex_runtime" / "interpreter.py",
+        pkg_dir / "tex_runtime" / "codegen.py",
+        pkg_dir / "tex_runtime" / "stdlib.py",
+        pkg_dir / "tex_runtime" / "noise.py",
+    ])
+    h = hashlib.sha256()
+    for p in source_files:
+        try:
+            h.update(p.read_bytes())
+        except FileNotFoundError:
+            h.update(p.name.encode())
+    return h.hexdigest()[:16]
+
+
+# Auto-computed from compiler/runtime source files — any code change invalidates disk cache.
+_CACHE_VERSION = _compute_compiler_hash()
 
 # Limits
 _MEMORY_MAX_ENTRIES = 128

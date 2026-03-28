@@ -1,0 +1,62 @@
+// String Format — demonstrate string functions and image statistics
+//
+// Educational example: compute basic image statistics (mean luminance,
+// min/max channel values) across sampled points, then use format() to
+// build a human-readable summary string.
+//
+// Output is a string, not an image. Use this with a string output node
+// or for diagnostic/logging purposes.
+//
+// Connect @image to any RGB input.
+
+s$label = "Image Stats";
+
+// ── Sample image statistics from a grid ─────────────────────────────
+// Sample a 5x5 grid to approximate global stats
+float total_lum = 0.0;
+float min_val = 1.0;
+float max_val = 0.0;
+float min_r = 1.0;
+float max_r = 0.0;
+float min_g = 1.0;
+float max_g = 0.0;
+float min_b = 1.0;
+float max_b = 0.0;
+int count = 0;
+
+for (int sy = 0; sy < 5; sy++) {
+    for (int sx = 0; sx < 5; sx++) {
+        float su = (float(sx) + 0.5) / 5.0;
+        float sv = (float(sy) + 0.5) / 5.0;
+        vec3 s = sample(@image, su, sv);
+
+        float lum = luma(s);
+        total_lum += lum;
+
+        min_val = min(min_val, min(s.r, min(s.g, s.b)));
+        max_val = max(max_val, max(s.r, max(s.g, s.b)));
+        min_r = min(min_r, s.r);
+        max_r = max(max_r, s.r);
+        min_g = min(min_g, s.g);
+        max_g = max(max_g, s.g);
+        min_b = min(min_b, s.b);
+        max_b = max(max_b, s.b);
+        count++;
+    }
+}
+
+float mean_lum = total_lum / float(count);
+
+// ── Build formatted output string ───────────────────────────────────
+string header = format("[%s]", $label);
+string lum_info = format("Mean Luma: %f", mean_lum);
+string range_info = format("Range: [%f, %f]", min_val, max_val);
+string r_info = format("R: [%f, %f]", min_r, max_r);
+string g_info = format("G: [%f, %f]", min_g, max_g);
+string b_info = format("B: [%f, %f]", min_b, max_b);
+
+// Build the report by concatenating lines
+string nl = "\n";
+string result = header + nl + lum_info + nl + range_info + nl + r_info + nl + g_info + nl + b_info;
+
+@OUT = result;

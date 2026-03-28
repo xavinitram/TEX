@@ -1,0 +1,53 @@
+// Halftone — rotated dot-pattern halftone effect
+//
+// Converts the image to a dot-pattern halftone by overlaying a rotated
+// sinusoidal grid. Darker areas produce larger dots (more black), lighter
+// areas produce smaller dots (more white). The grid is rotated by the
+// angle parameter using sin/cos coordinate transform.
+//
+// Connect @image to any RGB input.
+
+f$dot_size = 8.0;       // dot pitch in pixels (smaller = finer pattern)
+f$angle = 45.0;         // grid rotation in degrees (45 = classic halftone)
+f$hardness = 2.0;       // dot edge sharpness (1 = soft, 5 = crisp)
+f$ink = 1.0;            // ink darkness (0 = faint, 1 = full black)
+
+vec3 col = @image;
+float lum = luma(col);
+
+// ── Rotate UV coordinates for angled grid ───────────────────────────
+float rad = $angle * PI / 180.0;
+float ca = cos(rad);
+float sa = sin(rad);
+
+// Work in pixel space for consistent dot sizing
+float px_x = u * iw;
+float px_y = v * ih;
+
+// Rotate around image center
+float cx = iw * 0.5;
+float cy = ih * 0.5;
+float rx = (px_x - cx) * ca - (px_y - cy) * sa;
+float ry = (px_x - cx) * sa + (px_y - cy) * ca;
+
+// ── Generate dot pattern ────────────────────────────────────────────
+// Two perpendicular sine waves create a 2D dot grid.
+// Their product forms circular-ish dots at intersections.
+float freq = TAU / $dot_size;
+float gx = sin(rx * freq) * 0.5 + 0.5;
+float gy = sin(ry * freq) * 0.5 + 0.5;
+
+// Combine into radial dot shape (multiply creates round dots)
+float dot = gx * gy;
+
+// ── Threshold against luminance ─────────────────────────────────────
+// Dark pixels need more ink = lower threshold for black
+// The smoothstep controls dot edge softness
+float threshold = lum;
+float edge = 0.5 / $hardness;
+float halftone = smoothstep(threshold - edge, threshold + edge, dot);
+
+// ── Output ──────────────────────────────────────────────────────────
+// Blend between ink color (black) and paper (white)
+vec3 ink_color = vec3(1.0 - $ink);
+@OUT = lerp(ink_color, vec3(1.0), halftone);

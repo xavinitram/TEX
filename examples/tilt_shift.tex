@@ -1,0 +1,19 @@
+// Tilt-Shift — simulate miniature/diorama effect using mipmap blur
+//
+// Uses sample_mip() with per-pixel LOD to create a depth-of-field
+// effect where the center band stays sharp and the top/bottom blur out.
+// Much faster than a variable-radius convolution because the blur is
+// done by sampling pre-built mipmap levels (no per-pixel loops).
+
+f$focus = 0.5;     // vertical focus position (0 = top, 1 = bottom)
+f$band = 0.15;     // width of the sharp band (in UV space)
+f$strength = 4.0;  // maximum blur (mip levels at the edges)
+
+// Distance from the focus band
+float dist = abs(v - $focus);
+float falloff = smoothstep(0.0, $band, dist - $band * 0.5);
+
+// LOD: 0 in the sharp band, ramps up to $strength at the edges
+float lod = falloff * $strength;
+
+@OUT = sample_mip(@image, u, v, lod).rgb;

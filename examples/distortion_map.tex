@@ -1,0 +1,18 @@
+// Distortion Map — offset-based displacement
+// Similar to STMap, but the map values are used as pixel OFFSETS
+// rather than absolute UV positions. R = X offset, G = Y offset.
+// Map values of 0.5 = no displacement, 0 = shift left/up, 1 = shift right/down.
+// This is the standard convention for displacement/normal maps.
+
+f$strength = 0.1;   // displacement strength in UV space (try 0.01-0.5)
+
+vec3 offset_map = @map;
+
+// Map values are centered at 0.5 (neutral = no displacement)
+float dx = (offset_map.r - 0.5) * 2.0 * $strength;
+float dy = (offset_map.g - 0.5) * 2.0 * $strength;
+
+float su = u + dx;
+float sv = v + dy;
+
+@OUT = sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0));

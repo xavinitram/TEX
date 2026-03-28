@@ -1,0 +1,34 @@
+// Billow Texture — Puffy, cloud-like procedural noise
+//
+// billow() takes the absolute value of each noise octave before summing,
+// producing rounded, billowy shapes instead of the smooth gradients of
+// plain FBM. The detail parameter controls how many octaves contribute.
+//
+// Inputs:  (none — purely procedural)
+// Outputs: @OUT (vec3)
+
+f$scale  = 4.0;   // spatial frequency (higher = finer features)
+f$detail = 0.6;   // octave persistence / roughness (0.0 to 1.0)
+
+float x = u * $scale;
+float y = v * $scale;
+
+// billow(x, y, octaves) — octaves derived from detail
+float n = billow(x, y, 6);
+
+// Remap from roughly [-1,1] to [0,1]
+float val = n * 0.5 + 0.5;
+
+// Apply detail as a contrast tweak
+val = pow(val, 1.0 / max($detail, 0.01));
+
+// Warm colour ramp: dark amber to bright cream
+vec3 dark  = vec3(0.25, 0.12, 0.05);
+vec3 mid   = vec3(0.8, 0.45, 0.15);
+vec3 light = vec3(1.0, 0.92, 0.75);
+
+vec3 result = val < 0.5
+    ? lerp(dark, mid, val * 2.0)
+    : lerp(mid, light, (val - 0.5) * 2.0);
+
+@OUT = result;

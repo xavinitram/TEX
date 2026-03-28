@@ -69,7 +69,7 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **100+ stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |
-| **Snippets** | Right-click → Snippets for 36 built-in examples; save your own with folder organization |
+| **Snippets** | Right-click → Snippets for 114 built-in examples; save your own with folder organization |
 | **Nodes v3** | Built on ComfyUI's Nodes v3 API (`comfy_api.latest`) |
 
 ## Language Reference
@@ -184,18 +184,21 @@ while (val < 100.0) { val = val * 2.0; }
 
 ## Examples
 
-The `examples/` directory contains 36 ready-to-use snippets:
+The `examples/` directory contains 114 ready-to-use snippets:
 
 | Category | Examples |
 |----------|---------|
-| **Basics** | `grayscale` `invert` `brightness_contrast` `channel_swap` `color_mix` `threshold_mask` |
-| **Effects** | `vignette` `blur` `sharpen` `unsharp_mask` `swirl` `pixelate` `chromatic_aberration` |
-| **Color** | `hue_shift` `color_grade` `levels` `tone_map` `auto_levels` `conditional` |
-| **Filters** | `median_filter` `vec4_median` `edge_detect` `bilateral_approx` `mask_from_color` `normal_map` |
-| **Procedural** | `gradient` `radial_gradient` `perlin_clouds` `simplex_terrain` `lens_distortion` |
-| **Latent** | `latent_scale` `latent_blend` |
-| **String** | `string_build` `string_case` |
-| **Temporal** | `frame_blend` `motion_detect` |
+| **Color** | `auto_levels` `brightness_contrast` `channel_shuffle` `color_grade` `grade` `grayscale` `hue_shift` `invert` `levels` `posterize` `tone_map` `white_balance` |
+| **Compositing** | `alpha_over` `composite` `custom_blend` `merge` `premultiply` `soft_clamp` |
+| **Effects** | `barrel_distortion` `chromatic_aberration` `emboss` `film_chromatic_aberration` `godrays` `halftone` `kaleidoscope` `lens_distortion` `pixelate` `swirl` `vignette` |
+| **Filter** | `bilateral_approx` `blur` `box_blur` `denoise` `edge_detect` `erode_dilate` `fast_gaussian` `film_grain` `gaussian_blur` `grain` `median_filter` `sharpen` `tilt_shift` `unsharp_mask` `zdefocus` |
+| **Generate** | `billow_texture` `caustics` `curl_distortion` `flow_noise` `gradient` `marble` `normal_map` `perlin_clouds` `sdf_shapes` `simplex_terrain` `voronoi_cells` `wood_grain` |
+| **Mask** | `chroma_keyer` `conditional` `difference_key` `fix_pixels` `luma_keyer` `luminance_key` `mask_from_color` `normalize_mask` `threshold_mask` |
+| **Distortion** | `distortion_map` `optical_flow` `turbulent_displace` `vector_blur` |
+| **Latent** | `latent_blend` `latent_scale` |
+| **String** | `string_build` `string_case` `string_format` |
+| **Video** | `frame_blend` `frame_blend_weighted` `motion_detect` `temporal_median` `time_echo` |
+| **Educational** | `array_reduce` `binding_access` `break_search` `const_values` `matrix_transform` `multi_output` `sample_comparison` `ternary_chain` `user_function_lib` `while_loop` |
 
 ## Troubleshooting
 
@@ -234,11 +237,7 @@ Run `python benchmarks/four_scenario_bench.py` for results on your system.
 
 See **[DEVELOPMENT.md](DEVELOPMENT.md)** for architecture, compilation pipeline internals, and guides for adding functions, types, and operators.
 
-```bash
-# Run tests
-cd custom_nodes/TEX_Wrangle
-python -m pytest tests/test_tex.py -v    # 61 tests expected
-```
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev setup, testing, and pull request guidelines.
 
 ## License
 

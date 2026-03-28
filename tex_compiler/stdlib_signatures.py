@@ -19,6 +19,11 @@ def _passthrough_type(arg_types: list[TEXType]) -> TEXType:
     return arg_types[0]
 
 
+def _curl_return_type(arg_types: list[TEXType]) -> TEXType:
+    """Curl returns vec3 in 3D (3 args), vec2 in 2D (2 args)."""
+    return TEXType.VEC3 if len(arg_types) == 3 else TEXType.VEC2
+
+
 def _promote_args(arg_types: list[TEXType]) -> TEXType:
     """Return the promoted type across all args."""
     if not arg_types:
@@ -49,6 +54,7 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "acos":      {"args": (1, 1), "return": _passthrough_type},
     "atan":      {"args": (1, 1), "return": _passthrough_type},
     "atan2":     {"args": (2, 2), "return": _passthrough_type},
+    "sincos":    {"args": (1, 1), "return": lambda _: TEXType.VEC2},   # sincos(x) → vec2(sin, cos)
     "sqrt":      {"args": (1, 1), "return": _passthrough_type},
     "pow":       {"args": (2, 2), "return": _passthrough_type},
     "exp":       {"args": (1, 1), "return": _passthrough_type},
@@ -58,6 +64,7 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "floor":     {"args": (1, 1), "return": _passthrough_type},
     "ceil":      {"args": (1, 1), "return": _passthrough_type},
     "round":     {"args": (1, 1), "return": _passthrough_type},
+    "trunc":     {"args": (1, 1), "return": _passthrough_type},
     "fract":     {"args": (1, 1), "return": _passthrough_type},
     "mod":       {"args": (2, 2), "return": _passthrough_type},
 
@@ -111,15 +118,40 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "fetch":          {"args": (3, 3), "return": lambda _: TEXType.VEC4},  # fetch(@A, px, py) — nearest neighbor
     "sample_cubic":   {"args": (3, 3), "return": lambda _: TEXType.VEC4},  # sample_cubic(@A, u, v) — Catmull-Rom
     "sample_lanczos": {"args": (3, 3), "return": lambda _: TEXType.VEC4},  # sample_lanczos(@A, u, v) — Lanczos-3
+    "sample_mip":     {"args": (4, 4), "return": lambda _: TEXType.VEC4},  # sample_mip(@A, u, v, lod) — mipmap trilinear
+    "sample_mip_gauss": {"args": (4, 4), "return": lambda _: TEXType.VEC4},  # sample_mip_gauss(@A, u, v, lod) — Gaussian mipmap trilinear
+    "gauss_blur":     {"args": (2, 2), "return": lambda _: TEXType.VEC4},  # gauss_blur(@A, sigma) — separable Gaussian blur
 
     # Cross-frame sampling (temporal)
     "fetch_frame":    {"args": (4, 4), "return": lambda _: TEXType.VEC4},  # fetch_frame(@A, frame, px, py) — nearest from specific frame
     "sample_frame":   {"args": (4, 4), "return": lambda _: TEXType.VEC4},  # sample_frame(@A, frame, u, v) — bilinear from specific frame
 
-    # Noise
-    "perlin":    {"args": (2, 2), "return": lambda _: TEXType.FLOAT},  # perlin(x, y) — 2D Perlin noise
-    "simplex":   {"args": (2, 2), "return": lambda _: TEXType.FLOAT},  # simplex(x, y) — 2D Simplex noise
-    "fbm":       {"args": (3, 3), "return": lambda _: TEXType.FLOAT},  # fbm(x, y, octaves) — Fractional Brownian Motion
+    # Noise (all support optional z for 3D: 2 args = 2D, 3 args = 3D)
+    "perlin":      {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # perlin(x, y, z?) — Perlin noise
+    "simplex":     {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # simplex(x, y, z?) — Simplex noise
+    "fbm":         {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # fbm(x, y, octaves) or fbm(x, y, z, octaves)
+    "worley_f1":   {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # worley_f1(x, y, z?) — Worley F1
+    "worley_f2":   {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # worley_f2(x, y, z?) — Worley F2
+    "voronoi":     {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # voronoi(x, y, z?) — alias for worley_f1
+    "curl":        {"args": (2, 3), "return": _curl_return_type},         # curl(x, y) → vec2; curl(x, y, z) → vec3
+    "ridged":      {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # ridged(x, y, octaves) or ridged(x, y, z, octaves)
+    "billow":      {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # billow(x, y, octaves) or billow(x, y, z, octaves)
+    "turbulence":  {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # turbulence(x, y, octaves) or turbulence(x, y, z, octaves)
+    "flow":        {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # flow(x, y, time) or flow(x, y, z, time)
+    "alligator":   {"args": (2, 4), "return": lambda _: TEXType.FLOAT},  # alligator(x, y, z?, octaves?)
+
+    # SDF primitives — signed distance fields (negative inside, positive outside)
+    "sdf_circle":  {"args": (3, 3), "return": lambda _: TEXType.FLOAT},  # sdf_circle(px, py, radius)
+    "sdf_box":     {"args": (4, 4), "return": lambda _: TEXType.FLOAT},  # sdf_box(px, py, half_w, half_h)
+    "sdf_line":    {"args": (6, 6), "return": lambda _: TEXType.FLOAT},  # sdf_line(px, py, ax, ay, bx, by)
+    "sdf_polygon": {"args": (4, 4), "return": lambda _: TEXType.FLOAT},  # sdf_polygon(px, py, radius, sides)
+
+    # Smooth blending
+    "smin":        {"args": (3, 3), "return": _promote_args},             # smin(a, b, k) — polynomial smooth min
+    "smax":        {"args": (3, 3), "return": _promote_args},             # smax(a, b, k) — polynomial smooth max
+
+    # Gradient sampling
+    "sample_grad": {"args": (3, 3), "return": lambda _: TEXType.VEC2},   # sample_grad(@A, u, v) — luminance gradient
 
     # String operations
     "str":               {"args": (1, 1), "return": TEXType.STRING},              # str(number) — number to string

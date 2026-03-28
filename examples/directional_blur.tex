@@ -1,0 +1,27 @@
+// Directional Blur — motion blur along a specific angle
+// Simulates linear motion blur by averaging samples along a direction.
+// Useful for adding motion blur to static renders or creating
+// speed-line effects.
+
+f$angle = 0.0;       // blur direction in degrees (0 = horizontal right)
+f$distance = 10.0;   // blur length in pixels
+i$samples = 16;      // number of samples (higher = smoother, slower)
+
+float rad = radians($angle);
+vec2 dir = sincos(rad);
+float dir_x = dir.y;
+float dir_y = dir.x;
+
+// Step size in UV space per sample (half-distance in each direction)
+float step_x = dir_x * $distance / iw / float($samples * 2);
+float step_y = dir_y * $distance / ih / float($samples * 2);
+
+vec3 sum = vec3(0.0);
+for (int i = -$samples; i <= $samples; i++) {
+    float t = float(i);
+    float su = u + step_x * t;
+    float sv = v + step_y * t;
+    sum += sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0));
+}
+
+@OUT = sum / float($samples * 2 + 1);

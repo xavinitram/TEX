@@ -1,0 +1,21 @@
+// Image Gradient — visualize the luminance gradient of an image
+// Uses sample_grad() to compute horizontal and vertical derivatives
+// via central finite differences. Useful for edge detection,
+// flow visualization, and normal map generation.
+
+vec2 grad = sample_grad(@image, u, v);
+
+// Gradient magnitude (edge strength)
+float mag = hypot(grad.x, grad.y);
+
+// Gradient direction as angle (0 to 2*PI)
+float angle = atan2(grad.y, grad.x);
+
+// Visualize: magnitude as brightness, direction as hue
+float hue = angle / TAU + 0.5;
+vec3 edge_color = hsv2rgb(vec3(hue, 0.8, clamp(mag * 10.0, 0.0, 1.0)));
+
+// Output: gradient visualization
+// Also output raw gradient as a separate binding
+@OUT = edge_color;
+@gradient_mag = mag;

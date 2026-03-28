@@ -1,0 +1,63 @@
+// Film Vignette — physically-based photographic vignetting
+//
+// Three independent falloff mechanisms, matching real lens behavior:
+//   1. Natural vignetting: cos^4(theta) illumination falloff from oblique rays
+//   2. Optical vignetting: pupil clipping (cat-eye) from barrel obstruction
+//   3. Mechanical vignetting: hard clip from hood/filter with soft feathering
+//
+// The final attenuation is the product of all three, applied in scene-linear
+// light. This preserves correct saturation rolloff into the corners — unlike
+// gamma-space vignettes which produce muddy, desaturated edges.
+//
+// Connect @image in scene-linear color space for physically correct results.
+
+f$focal_length = 35.0;   // lens focal length in mm
+f$sensor_size = 36.0;    // sensor diagonal in mm (36 = full frame)
+f$aperture = 2.8;        // f-stop — controls optical vignette severity
+f$natural_gain = 1.0;    // artistic multiplier on cos^4 falloff
+f$mech_radius = 1.2;     // mechanical clip radius (>1.0 = off-screen)
+f$mech_softness = 0.15;  // mechanical feathering width
+f$center_x = 0.5;        // optical center X (0.5 = image center)
+f$center_y = 0.5;        // optical center Y
+
+// ── Centered coordinates ──────────────────────────────────────────
+float aspect = iw / ih;
+float cx = (u - $center_x) * aspect;
+float cy = v - $center_y;
+float r = hypot(cx, cy);
+
+// Normalize radius: corner of a 36mm sensor at the given focal length
+// maps to atan(sensor_diag / (2 * focal_length)).
+float half_diag = $sensor_size * 0.5;
+float max_theta = atan(half_diag / $focal_length);
+
+// ── 1. Natural vignetting (cos^4 law) ────────────────────────────
+// theta = angle of the ray from the optical axis
+float theta = r * max_theta / hypot(aspect * 0.5, 0.5);
+float cos_t = cos(theta);
+float v_natural = pow(cos_t, 4.0) * $natural_gain + (1.0 - $natural_gain);
+
+// ── 2. Optical vignetting (cat-eye pupil clipping) ───────────────
+// Models the intersection area of two offset circles (front and rear
+// lens elements). The offset grows with radial distance and decreases
+// as the aperture stops down. At f/8+ this effect nearly vanishes.
+float pupil_offset = r * (8.0 / max($aperture, 1.0));
+float clamped_d = clamp(pupil_offset, 0.0, 1.999);
+// Normalized intersection area of two unit circles offset by d:
+//   A = 2*acos(d/2) - d*sqrt(4-d^2)/2, divided by pi
+float half_d = clamped_d * 0.5;
+float v_optical = 1.0;
+if (pupil_offset < 2.0) {
+    float area = 2.0 * acos(half_d) - half_d * sqrt(4.0 - clamped_d * clamped_d);
+    v_optical = area / PI;
+}
+
+// ── 3. Mechanical vignetting (hood/filter clip) ──────────────────
+float v_mech = smoothstep($mech_radius - $mech_softness, $mech_radius + $mech_softness, r);
+v_mech = 1.0 - v_mech;
+
+// ── Combined ─────────────────────────────────────────────────────
+// Multiply all three: stopping down removes cat-eye but leaves cos^4.
+float falloff = clamp(v_natural * v_optical * v_mech, 0.0, 1.0);
+
+@OUT = @image * falloff;

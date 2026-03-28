@@ -1,0 +1,66 @@
+// Film Soften — mipmap-accelerated bilateral filter
+//
+// Edge-preserving softening that smooths texture while keeping boundaries
+// sharp. Combines mipmap pre-filtering with bilateral weighting:
+//
+//   w(p) = G_spatial(||p||) * G_range(||I(p) - I(center)||)
+//
+// The mip level handles the macro blur scale (so 25 samples cover a huge
+// radius), while the bilateral weights prevent blurring across edges.
+// Luma-only mode softens luminance detail while preserving all color.
+
+f$radius = 12.0;       // softening radius in pixels
+f$edge_preserve = 0.5; // edge preservation (0 = box blur, 1.0 = strong bilateral)
+i$luma_only = 1;        // 1 = soften luminance only, preserving color
+
+vec3 center = @image;
+float eps = 1e-6;
+
+// ── Mip level and kernel setup ─────────────────────────────────────
+// 5x5 kernel at the target mip level. Spacing is 0.4x the radius
+// per step, so the full kernel spans roughly 1.6x the blur radius.
+float lod = log2(max($radius, 1.0));
+float sx = $radius * px * 0.4;
+float sy = $radius * py * 0.4;
+
+// Scale edge_preserve into a bilateral range weight.
+// Higher values make the filter more selective about which pixels blend.
+float range_scale = $edge_preserve * 200.0;
+
+// ── 5x5 bilateral accumulation ─────────────────────────────────────
+vec3 acc = vec3(0.0);
+float total_w = 0.0;
+
+for (int j = -2; j <= 2; j++) {
+    for (int i = -2; i <= 2; i++) {
+        float du = float(i) * sx;
+        float dv = float(j) * sy;
+        vec3 s = sample_mip(@image, u + du, v + dv, lod);
+
+        // Spatial weight: Gaussian falloff from kernel center
+        float d2 = float(i * i + j * j);
+        float w_spatial = exp(-d2 * 0.2);
+
+        // Range weight: suppress blending across dissimilar pixels
+        float diff = length(s - center);
+        float w_range = 1.0 / (range_scale * diff * diff + 1.0);
+
+        float w = w_spatial * w_range;
+        acc += s * w;
+        total_w += w;
+    }
+}
+
+vec3 soft = acc / max(total_w, eps);
+
+// ── Luma-only mode ─────────────────────────────────────────────────
+// Apply the softened luminance to the original color.
+// Preserves hue and saturation while smoothing brightness detail.
+if ($luma_only > 0) {
+    float orig_lum = luma(center);
+    float soft_lum = luma(soft);
+    float scale = (orig_lum > eps) ? soft_lum / orig_lum : 1.0;
+    @OUT = center * scale;
+} else {
+    @OUT = soft;
+}

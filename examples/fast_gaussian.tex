@@ -1,0 +1,40 @@
+// Fast Gaussian Blur — mipmap-accelerated Gaussian approximation
+//
+// Uses the Gaussian-prefiltered mip pyramid (sample_mip_gauss) which applies
+// a sigma=1.13 Gaussian blur before each 2x downsample, producing smoother
+// level transitions than the standard area-downsample pyramid.
+//
+// A 3x3 Gaussian-weighted kernel at the target mip level further refines
+// the profile into a clean bell curve.
+//
+// Total cost: 9 sample_mip_gauss calls per pixel — orders of magnitude
+// faster than a full convolution kernel at large radii.
+
+f$radius = 10.0;    // blur radius in pixels
+
+// ── Mip level and kernel step ──────────────────────────────────────
+// The mip level provides the macro blur scale; the 3x3 kernel smooths
+// out the box-filter profile. Steps are half the radius so the kernel
+// spans approximately the target blur footprint.
+float lod = log2(max($radius, 1.0));
+float sx = $radius * px * 0.5;
+float sy = $radius * py * 0.5;
+
+// ── 3x3 Gaussian kernel ───────────────────────────────────────────
+// Weights: center=4, cardinal=2, diagonal=1  (sum=16)
+// This is the standard 3x3 discrete Gaussian with sigma ~= 0.85.
+vec3 sum = sample_mip_gauss(@image, u, v, lod) * 4.0;
+
+// Cardinal neighbors
+sum += sample_mip_gauss(@image, u - sx, v,      lod) * 2.0;
+sum += sample_mip_gauss(@image, u + sx, v,      lod) * 2.0;
+sum += sample_mip_gauss(@image, u,      v - sy, lod) * 2.0;
+sum += sample_mip_gauss(@image, u,      v + sy, lod) * 2.0;
+
+// Diagonal neighbors
+sum += sample_mip_gauss(@image, u - sx, v - sy, lod);
+sum += sample_mip_gauss(@image, u + sx, v - sy, lod);
+sum += sample_mip_gauss(@image, u - sx, v + sy, lod);
+sum += sample_mip_gauss(@image, u + sx, v + sy, lod);
+
+@OUT = sum * 0.0625;   // 1/16

@@ -1,0 +1,47 @@
+// Luminance Key — matte extraction from brightness with zone targeting
+//
+// Generates a clean matte by keying on image luminance. Supports targeting
+// a specific brightness range (shadows, midtones, or highlights) with
+// independent low/high softness controls for asymmetric falloff.
+//
+// Differs from the simpler luma_keyer example by adding gain, independent
+// edge controls, and preview mode for visualizing the key over the source.
+
+f$low = 0.0;           // key range low bound
+f$high = 1.0;          // key range high bound
+f$low_soft = 0.1;      // softness at the low edge
+f$high_soft = 0.1;     // softness at the high edge
+f$gain = 1.0;          // matte contrast gain (1.0 = linear)
+i$invert = 0;           // 1 = invert the matte
+i$preview = 0;          // 1 = output key over source (red = keyed out)
+
+vec3 src = @image;
+float lum = luma(src);
+
+// ── Dual-edge keying ───────────────────────────────────────────────
+// Independent smoothstep at each boundary allows asymmetric falloff:
+// e.g. sharp cutoff at shadows, soft rolloff at highlights.
+float lo_edge = smoothstep($low - $low_soft, $low + $low_soft, lum);
+float hi_edge = 1.0 - smoothstep($high - $high_soft, $high + $high_soft, lum);
+float matte = lo_edge * hi_edge;
+
+// ── Gain ───────────────────────────────────────────────────────────
+// Power curve for contrast control: gain > 1 tightens the key,
+// gain < 1 expands it.
+if ($gain != 1.0) {
+    matte = pow(matte, $gain);
+}
+
+// ── Invert ─────────────────────────────────────────────────────────
+if ($invert > 0) {
+    matte = 1.0 - matte;
+}
+
+// ── Output ─────────────────────────────────────────────────────────
+if ($preview > 0) {
+    // Preview: source tinted red where keyed out
+    float inv = 1.0 - matte;
+    @OUT = vec3(src.r + inv * 0.5, src.g * matte, src.b * matte);
+} else {
+    m@OUT = matte;
+}

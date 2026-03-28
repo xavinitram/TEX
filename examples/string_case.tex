@@ -1,4 +1,9 @@
-// Normalize tag casing — strips whitespace and lowercases
-// Connect any STRING to @text
+// String Case — normalize text by stripping whitespace and lowercasing
+//
+// Useful for cleaning up tags, labels, or user input before comparison.
+// Connect any STRING to @text.
+//
+// Inputs:  @text (string)
+// Outputs: @OUT  (string)
 
 @OUT = lower(strip(@text));

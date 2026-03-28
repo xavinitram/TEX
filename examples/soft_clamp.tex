@@ -1,0 +1,14 @@
+// Soft Clamp — clamp pixel values with smooth rolloff
+// Unlike a hard clamp, uses smin/smax for a gradual polynomial
+// transition, avoiding harsh banding at the clip boundaries.
+// Useful for gentle highlight/shadow containment in compositing.
+
+f$min = 0.0;       // output minimum (values below are lifted)
+f$max = 1.0;       // output maximum (values above are compressed)
+f$softness = 0.1;  // transition width (0 = hard clamp, higher = softer)
+
+vec3 src = @image;
+
+// smax with $min: smoothly lifts values near the floor
+// smin with $max: smoothly compresses values near the ceiling
+@OUT = smin(smax(src, $min, $softness), $max, $softness);

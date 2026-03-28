@@ -1,14 +1,18 @@
-// Radial vignette — darkens image edges with soft circular falloff
-// Outputs both the darkened image and the vignette mask
+// Vignette — darken image edges with soft circular falloff
+//
+// Applies a radial vignette centered on the image. Outputs both
+// the darkened image and the raw vignette mask for further use.
+//
+// Inputs:  @image (vec3)
+// Outputs: @darkened (vec3), m@vignette_mask (float)
 
-//Optional, Set a Default
 f$strength = 1.0;   // vignette intensity (0 = none, 2 = heavy)
 
 float cx = u - 0.5;
 float cy = v - 0.5;
-float dist = sqrt(cx * cx + cy * cy);
+float dist = hypot(cx, cy);
 float falloff = 1.0 - smoothstep(0.3, 0.7, dist * $strength);
 
 // Multi-output: IMAGE + MASK
-@darkened = @image * vec3(falloff, falloff, falloff);
+@darkened = @image * falloff;
 m@vignette_mask = falloff;

@@ -1,0 +1,43 @@
+// Vector Blur — directional per-pixel motion blur driven by a vector map
+//
+// Blurs @image along the direction encoded in @vectors (R = X, G = Y).
+// Map convention: 0.5 = no motion, 0 = full negative, 1 = full positive.
+// Designed for motion vectors, optical flow, or hand-painted direction maps.
+//
+// Uses uniform weighting (box filter along the vector) to match real
+// motion blur, where all positions in the shutter interval contribute
+// equally. Adaptive sample count scales with displacement length.
+// Bilinear sampling (appropriate for the continuous line of a motion streak).
+//
+// For best results, connect 32-bit float motion vectors from an
+// optical flow node or render pass.
+
+f$strength = 20.0;    // displacement scale in pixels
+i$max_samples = 32;   // maximum samples per pixel (quality vs speed)
+
+vec3 mv = @vectors;
+
+// Decode motion vector from [0,1] to signed pixel displacement
+float dx = (mv.r - 0.5) * 2.0 * $strength;
+float dy = (mv.g - 0.5) * 2.0 * $strength;
+
+// Adaptive sample count: more samples for longer vectors, minimum 3
+float motion_len = hypot(dx, dy);
+int num_samples = clamp(int(motion_len * 0.5 + 1.0), 3, $max_samples);
+
+// Step size in UV space
+float steps = float(num_samples - 1);
+float step_u = sdiv(dx / iw, steps);
+float step_v = sdiv(dy / ih, steps);
+float half_steps = steps * 0.5;
+
+vec3 sum = vec3(0.0);
+for (int i = 0; i < num_samples; i++) {
+    // Sample position along the motion vector, centered on current pixel
+    float t = float(i) - half_steps;
+    float su = u + step_u * t;
+    float sv = v + step_v * t;
+    sum += sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0)).rgb;
+}
+
+@OUT = sum / float(num_samples);

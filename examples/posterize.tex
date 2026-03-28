@@ -1,0 +1,19 @@
+// Posterize — Quantise pixel values to a limited number of discrete levels
+//
+// Reduces the colour palette by snapping each channel to the nearest
+// of N evenly-spaced intensity steps: floor(x * levels) / (levels - 1).
+//
+// Inputs:  @image (vec3)
+// Outputs: @OUT   (vec3)
+
+i$levels = 4;   // number of output levels per channel (2 = threshold, 256 = identity)
+
+vec3 src = @image;
+float n = float($levels);
+
+// Quantise each channel
+float r = floor(src.r * n) / (n - 1.0);
+float g = floor(src.g * n) / (n - 1.0);
+float b = floor(src.b * n) / (n - 1.0);
+
+@OUT = clamp(vec3(r, g, b), 0.0, 1.0);

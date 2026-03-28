@@ -1,0 +1,39 @@
+// Composite — alpha-over compositing with mask
+//
+// Standard alpha-over operation: layers @fg (foreground) over @bg
+// (background) using m@mask as the alpha channel. This is the
+// fundamental compositing operation used in all layer-based workflows.
+//
+// Formula: result = fg * alpha + bg * (1 - alpha)
+// where alpha = mask * opacity
+//
+// The mask input (m@mask) is a single-channel float [0,1]:
+//   0 = fully transparent (show background)
+//   1 = fully opaque (show foreground)
+//
+// Connect @fg and @bg to RGB images, m@mask to a grayscale mask.
+
+f$opacity = 1.0;         // global opacity multiplier (0 = invisible, 1 = full)
+f$premultiplied = 0.0;   // set to 1.0 if @fg is already premultiplied
+
+vec3 fg = @fg;
+vec3 bg = @bg;
+float alpha = m@mask * $opacity;
+
+// Clamp alpha to valid range
+alpha = clamp(alpha, 0.0, 1.0);
+
+// ── Compositing ─────────────────────────────────────────────────────
+vec3 result = vec3(0.0);
+
+if ($premultiplied > 0.5) {
+    // Premultiplied alpha: fg is already multiplied by its alpha.
+    // Formula: result = fg + bg * (1 - alpha)
+    result = fg + bg * (1.0 - alpha);
+} else {
+    // Straight (unpremultiplied) alpha: standard over operation.
+    // Formula: result = fg * alpha + bg * (1 - alpha)
+    result = fg * alpha + bg * (1.0 - alpha);
+}
+
+@OUT = result;

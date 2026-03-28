@@ -1,0 +1,124 @@
+// Denoise — Non-Local Means (NLM) denoiser
+//
+// Industry-standard denoising algorithm that compares patches rather than
+// individual pixels. Each output pixel is a weighted average of all pixels
+// in a search window, where the weight depends on the similarity of their
+// surrounding neighborhoods (patches).
+//
+// This is fundamentally superior to bilateral filtering because it uses
+// structural similarity (patch matching) rather than pointwise intensity
+// difference, making it robust to actual noise rather than confusing
+// texture detail for noise.
+//
+// Operates in YCoCg color space internally: luminance gets conservative
+// denoising (preserving detail), chrominance gets aggressive smoothing
+// (exploiting the human visual system's reduced sensitivity to color noise).
+//
+// Algorithm: Buades, Coll & Morel, "A Non-Local Algorithm for Image Denoising"
+//
+// Performance: each for-loop is individually capped at 1024 iterations.
+// search_radius=4: 9x9 = 81 search positions, each with 3x3 = 9 patch comparisons.
+// search_radius=5: 11x11 = 121 search positions (still under 1024 per loop).
+// Larger search windows find better matches but cost more.
+
+f$strength = 10.0;       // filter strength h (higher = more smoothing)
+i$search_radius = 4;     // search window half-size in pixels
+i$patch_radius = 1;      // comparison patch half-size (1 = 3x3 patch)
+f$luma_weight = 1.0;     // luminance denoising strength (lower = preserve detail)
+f$chroma_weight = 3.0;   // chrominance denoising strength (higher = aggressive)
+
+// ── Color space conversion (RGB → YCoCg) ─────────────────────────
+// YCoCg decorrelates luminance from chrominance, allowing separate
+// denoising strengths. More efficient than YCbCr (integer-exact).
+vec3 center_px = @image;
+float Y_c  = 0.25 * center_px.r + 0.5 * center_px.g + 0.25 * center_px.b;
+float Co_c = 0.5 * center_px.r - 0.5 * center_px.b;
+float Cg_c = -0.25 * center_px.r + 0.5 * center_px.g - 0.25 * center_px.b;
+
+// Precompute filter decay: h^2. Separate for luma and chroma.
+float h2_luma = max($strength * $luma_weight, 0.01);
+h2_luma = h2_luma * h2_luma;
+float h2_chroma = max($strength * $chroma_weight, 0.01);
+h2_chroma = h2_chroma * h2_chroma;
+
+int patch_size = (2 * $patch_radius + 1);
+float inv_patch_area = 1.0 / float(patch_size * patch_size);
+
+// ── NLM accumulation ─────────────────────────────────────────────
+float acc_Y = 0.0;
+float acc_Co = 0.0;
+float acc_Cg = 0.0;
+float wsum_Y = 0.0;
+float wsum_C = 0.0;
+
+for (int sy = -$search_radius; sy <= $search_radius; sy++) {
+    for (int sx = -$search_radius; sx <= $search_radius; sx++) {
+        // Candidate pixel position
+        float cu = u + float(sx) * px;
+        float cv = v + float(sy) * py;
+
+        // ── Compute patch distance ───────────────────────────
+        // Sum of squared differences over the comparison patch,
+        // split into luminance and chrominance components.
+        float dist_Y = 0.0;
+        float dist_C = 0.0;
+
+        for (int py2 = -$patch_radius; py2 <= $patch_radius; py2++) {
+            for (int px2 = -$patch_radius; px2 <= $patch_radius; px2++) {
+                float off_u = float(px2) * px;
+                float off_v = float(py2) * py;
+
+                // Center patch pixel
+                vec3 p1 = sample(@image, u + off_u, v + off_v);
+                // Candidate patch pixel
+                vec3 p2 = sample(@image, cu + off_u, cv + off_v);
+
+                // YCoCg of both
+                float y1 = 0.25 * p1.r + 0.5 * p1.g + 0.25 * p1.b;
+                float y2 = 0.25 * p2.r + 0.5 * p2.g + 0.25 * p2.b;
+                float dy = y1 - y2;
+                dist_Y = dist_Y + dy * dy;
+
+                float co1 = 0.5 * p1.r - 0.5 * p1.b;
+                float co2 = 0.5 * p2.r - 0.5 * p2.b;
+                float cg1 = -0.25 * p1.r + 0.5 * p1.g - 0.25 * p1.b;
+                float cg2 = -0.25 * p2.r + 0.5 * p2.g - 0.25 * p2.b;
+                float dco = co1 - co2;
+                float dcg = cg1 - cg2;
+                dist_C = dist_C + dco * dco + dcg * dcg;
+            }
+        }
+
+        // Normalize by patch area
+        dist_Y = dist_Y * inv_patch_area;
+        dist_C = dist_C * inv_patch_area;
+
+        // NLM weights: exp(-dist / h^2)
+        float w_Y = exp(-dist_Y / h2_luma);
+        float w_C = exp(-dist_C / h2_chroma);
+
+        // Candidate pixel in YCoCg
+        vec3 cand = sample(@image, cu, cv);
+        float cY  = 0.25 * cand.r + 0.5 * cand.g + 0.25 * cand.b;
+        float cCo = 0.5 * cand.r - 0.5 * cand.b;
+        float cCg = -0.25 * cand.r + 0.5 * cand.g - 0.25 * cand.b;
+
+        acc_Y  = acc_Y  + cY  * w_Y;
+        acc_Co = acc_Co + cCo * w_C;
+        acc_Cg = acc_Cg + cCg * w_C;
+        wsum_Y = wsum_Y + w_Y;
+        wsum_C = wsum_C + w_C;
+    }
+}
+
+// ── Normalize and convert YCoCg → RGB ────────────────────────────
+float out_Y  = sdiv(acc_Y,  wsum_Y);
+float out_Co = sdiv(acc_Co, wsum_C);
+float out_Cg = sdiv(acc_Cg, wsum_C);
+
+// YCoCg → RGB inverse transform
+float r_out = out_Y + out_Co - out_Cg;
+float g_out = out_Y + out_Cg;
+float b_out = out_Y - out_Co - out_Cg;
+
+@OUT = vec3(r_out, g_out, b_out);

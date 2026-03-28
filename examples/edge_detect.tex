@@ -1,4 +1,11 @@
-// Sobel edge detection — outputs both an edge image and edge mask
+// Edge Detect — Sobel gradient magnitude
+//
+// Classic Sobel operator for edge detection. Computes horizontal and
+// vertical luminance gradients with 3x3 convolution kernels, then
+// combines them into a single edge magnitude via Pythagorean sum.
+//
+// Outputs both an edge image (@edges) and a scalar mask (m@edge_mask)
+// for downstream compositing or matte work.
 
 float gx = 0.0;
 float gy = 0.0;
@@ -22,5 +29,5 @@ gy += luma(fetch(@image, ix + 1, iy + 1)) *  1.0;
 float edge = clamp(sqrt(gx * gx + gy * gy), 0.0, 1.0);
 
 // Multi-output: IMAGE + MASK
-@edges = vec3(edge, edge, edge);
+@edges = vec3(edge);
 m@edge_mask = edge;

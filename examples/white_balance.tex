@@ -1,0 +1,31 @@
+// White Balance — Temperature and Tint adjustment
+//
+// Shifts the colour temperature by scaling R and B channels relative to G,
+// and adjusts tint by scaling G relative to R and B. A luminance-preserving
+// renormalisation keeps overall brightness stable.
+//
+// Inputs:  @image (vec3)
+// Outputs: @OUT   (vec3)
+
+f$temperature = 0.0;   // -1.0 (cool/blue) to +1.0 (warm/amber)
+f$tint        = 0.0;   // -1.0 (green) to +1.0 (magenta)
+
+vec3 src = @image;
+
+// Original luminance (Rec.709)
+float lum_in = dot(src, vec3(0.2126, 0.7152, 0.0722));
+
+// Apply temperature: warm pushes red up / blue down
+float r = src.r * (1.0 + $temperature * 0.3);
+float b = src.b * (1.0 - $temperature * 0.3);
+
+// Apply tint: positive pushes magenta (reduce green), negative pushes green
+float g = src.g * (1.0 - $tint * 0.15);
+
+vec3 shifted = vec3(r, g, b);
+
+// Renormalise to preserve original luminance
+float lum_out = dot(shifted, vec3(0.2126, 0.7152, 0.0722));
+vec3 result = shifted * sdiv(lum_in, lum_out);
+
+@OUT = clamp(result, 0.0, 1.0);

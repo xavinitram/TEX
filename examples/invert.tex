@@ -1,3 +1,8 @@
-// Invert image colors
+// Invert — flip all color channels
+//
+// Subtracts each channel from 1.0, turning darks to lights and
+// vice versa. Equivalent to Photoshop's Ctrl+I / Invert adjustment.
+//
+// Connect @image to any RGB input.
 
-@OUT = vec3(1.0 - @image.r, 1.0 - @image.g, 1.0 - @image.b);
+@OUT = vec3(1.0) - @image;

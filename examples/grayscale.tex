@@ -1,7 +1,11 @@
-// Grayscale conversion — outputs both a gray image and luminance mask
+// Grayscale — luminance-based desaturation with dual output
+//
+// Converts an RGB image to grayscale using perceptual luminance weights
+// (Rec.709). Outputs both a grayscale image (@gray_image) and a scalar
+// luminance mask (m@luminance) for use as a matte or blend factor.
 
 float gray = luma(@image);
 
 // Multi-output: IMAGE + MASK
-@gray_image = vec3(gray, gray, gray);
+@gray_image = vec3(gray);
 m@luminance = gray;

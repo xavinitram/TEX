@@ -12,7 +12,7 @@ int idx = 0;
 
 for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
-        vec4 s = fetch(@image, ix + dx, iy + dy);
+        vec3 s = fetch(@image, ix + dx, iy + dy);
         r[idx] = s.r;
         g[idx] = s.g;
         b[idx] = s.b;
@@ -24,4 +24,4 @@ r = sort(r);
 g = sort(g);
 b = sort(b);
 
-@OUT = vec4(r[4], g[4], b[4], 1.0);
+@OUT = vec3(r[4], g[4], b[4]);

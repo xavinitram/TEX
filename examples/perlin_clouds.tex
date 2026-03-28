@@ -4,7 +4,6 @@
 
 f$frequency = 6.0;   // detail scale (higher = more features)
 
-vec4 _ref = @ref;
 float n = fbm(u * $frequency, v * $frequency, 6);
 
 // Remap from [-1, 1] to [0, 1]
@@ -15,5 +14,5 @@ cloud = smoothstep(0.3, 0.7, cloud);
 
 // Sky blue to white
 vec3 sky = vec3(0.4, 0.6, 0.9);
-vec3 white = vec3(1.0, 1.0, 1.0);
+vec3 white = vec3(1.0);
 @OUT = lerp(sky, white, cloud);

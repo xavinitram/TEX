@@ -1,0 +1,36 @@
+// Curl Distortion — Divergence-free UV warping with curl noise
+//
+// Computes the curl of a potential field to get a divergence-free 2D
+// vector, then uses it to offset UV coordinates before sampling noise.
+// The result is a swirling, fluid-like distortion pattern.
+//
+// Inputs:  (none — purely procedural)
+// Outputs: @OUT (vec3)
+
+f$curl_scale    = 3.0;   // frequency of the curl field
+f$curl_strength = 0.1;   // displacement magnitude in UV space
+f$noise_scale   = 5.0;   // frequency of the final noise layer
+
+// Compute curl vector at this position
+vec2 c = curl(u * $curl_scale, v * $curl_scale);
+
+// Displace UV by the curl vector
+float du = u + c.x * $curl_strength;
+float dv = v + c.y * $curl_strength;
+
+// Sample FBM noise at the distorted position
+float n = fbm(du * $noise_scale, dv * $noise_scale, 5);
+
+// Remap to [0, 1]
+float val = n * 0.5 + 0.5;
+
+// Cool-to-warm colour ramp
+vec3 cool = vec3(0.1, 0.2, 0.5);
+vec3 warm = vec3(0.9, 0.5, 0.15);
+vec3 hot  = vec3(1.0, 0.9, 0.7);
+
+vec3 result = val < 0.5
+    ? lerp(cool, warm, val * 2.0)
+    : lerp(warm, hot, (val - 0.5) * 2.0);
+
+@OUT = result;

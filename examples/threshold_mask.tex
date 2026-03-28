@@ -1,4 +1,11 @@
-// Threshold mask — convert image to binary mask
+// Threshold Mask — convert image luminance to a binary mask
+//
+// Pixels brighter than the threshold become 1.0, darker become 0.0.
+// Uses step() for a hard cutoff. Useful for generating selection masks
+// from luminance, depth maps, or other grayscale data.
+//
+// Inputs:  @image (vec3)
+// Outputs: m@OUT  (float)
 
 f$threshold = 0.5;   // cutoff value (0.0 to 1.0)
 

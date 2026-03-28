@@ -1,4 +1,10 @@
-// Conditional processing — make dark pixels warmer, bright pixels cooler
+// Conditional — warm shadows, cool highlights
+//
+// Demonstrates if/else branching based on pixel luminance. Dark pixels
+// get a warm shift (more red, less blue) and bright pixels get a cool
+// shift (more blue, less red).
+//
+// Connect @image to any RGB input.
 
 float brightness = luma(@image);
 

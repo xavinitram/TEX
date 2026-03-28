@@ -1,0 +1,45 @@
+// Nuke-style Grade node
+// Matches Nuke's Grade math: blackpoint/whitepoint remap,
+// black/white (lift/gain), multiply, offset, gamma, clamping.
+// Formula: pow(((x - bp) / (wp - bp)) * (w - b) * mult + b + offs, 1/gamma)
+// Gamma uses linear extrapolation outside [0,1] to avoid artifacts.
+
+f$blackpoint = 0.0;   // input black level
+f$whitepoint = 1.0;   // input white level
+f$black = 0.0;        // output black (lift)
+f$white = 1.0;        // output white (gain)
+f$multiply = 1.0;     // overall multiplier
+f$offset = 0.0;       // additive offset
+f$gamma = 1.0;        // midtone gamma (>1 brightens, <1 darkens)
+f$saturation = 1.0;   // color saturation (1.0 = unchanged, 0 = mono)
+f$mix = 1.0;          // blend with original (0 = bypass, 1 = full)
+
+vec3 src = @image;
+float A = $multiply * ($white - $black) / max($whitepoint - $blackpoint, 0.0001);
+float B = $offset + $black - A * $blackpoint;
+
+vec3 linear = src * A + B;
+float exp = 1.0 / max($gamma, 0.0001);
+
+// Gamma with linear extrapolation outside [0,1]
+// Avoids pow of negative numbers and harsh inflections above 1
+float r = linear.r;
+float g = linear.g;
+float b = linear.b;
+
+r = r < 0.0 ? r : (r > 1.0 ? (r - 1.0) * exp + 1.0 : spow(r, exp));
+g = g < 0.0 ? g : (g > 1.0 ? (g - 1.0) * exp + 1.0 : spow(g, exp));
+b = b < 0.0 ? b : (b > 1.0 ? (b - 1.0) * exp + 1.0 : spow(b, exp));
+
+// Clamp black (default on), white (optional)
+r = max(r, 0.0);
+g = max(g, 0.0);
+b = max(b, 0.0);
+
+// Saturation (Rec.709 luminance)
+vec3 graded = vec3(r, g, b);
+float lum = luma(graded);
+vec3 result = lerp(vec3(lum), graded, $saturation);
+
+// Mix with original
+@OUT = lerp(src, result, $mix);

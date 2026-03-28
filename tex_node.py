@@ -26,6 +26,7 @@ from .tex_compiler.ast_nodes import SourceLoc
 from .tex_runtime.interpreter import Interpreter, InterpreterError
 from .tex_cache import get_cache
 from .tex_runtime.compiled import execute_compiled
+from .tex_runtime.stdlib import LUMA_R, LUMA_G, LUMA_B
 
 # ── v3 API import ──
 # Falls back to a stub base class when running outside ComfyUI (e.g. standalone tests).
@@ -70,6 +71,51 @@ def _unwrap_latent(value: dict) -> tuple[torch.Tensor, dict]:
     return tensor_cl, metadata
 
 
+def _hex_to_rgb(hex_str: str) -> list[float]:
+    """Convert a hex color string like '#FF8800' to [R, G, B] floats in [0, 1]."""
+    h = hex_str.lstrip("#")
+    if len(h) == 3:
+        h = h[0]*2 + h[1]*2 + h[2]*2
+    if len(h) < 6:
+        h = h.ljust(6, "0")
+    # Only read first 6 hex chars (ignore alpha if present)
+    return [int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4)]
+
+
+def _convert_param_value(value: Any, param_info: dict) -> Any:
+    """Convert a param widget value to the appropriate Python type for the interpreter.
+
+    Boolean toggles → float 0/1, color hex → [R,G,B] list,
+    vec2/vec3 comma strings → list of floats. Other values pass through.
+    """
+    hint = param_info.get("type_hint", "f")
+    if hint in ("f", "i", "s"):
+        return value  # common cases need no conversion
+    if hint == "b":
+        if isinstance(value, (bool, int, float)):
+            # bool() clamps any truthy number to 1.0 (e.g. 2 → True → 1.0)
+            return float(bool(value))
+    elif hint == "c" and isinstance(value, str):
+        if value.startswith("#"):
+            try:
+                return _hex_to_rgb(value)
+            except ValueError:
+                pass  # invalid hex — fall through to return raw value
+    elif hint in ("v2", "v3", "v4") and isinstance(value, str):
+        expected = {"v2": 2, "v3": 3, "v4": 4}[hint]
+        try:
+            parts = [float(x.strip()) for x in value.split(",")]
+            # Pad or truncate to expected component count
+            if len(parts) < expected:
+                parts.extend([0.0] * (expected - len(parts)))
+            elif len(parts) > expected:
+                parts = parts[:expected]
+            return parts
+        except ValueError:
+            pass
+    return value
+
+
 def _infer_binding_type(value: Any) -> TEXType:
     """Infer the TEX type of a ComfyUI input value."""
     # Image/latent lists — use first element for type inference
@@ -93,6 +139,8 @@ def _infer_binding_type(value: Any) -> TEXType:
                 return TEXType.VEC4
             elif c == 3:
                 return TEXType.VEC3
+            elif c == 2:
+                return TEXType.VEC2
             else:
                 return TEXType.FLOAT
         elif value.dim() == 3:
@@ -132,6 +180,9 @@ def _prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
         if raw.dim() == 3:
             # [B, H, W] -> [B, H, W, 3] (grayscale to RGB)
             raw = raw.unsqueeze(-1).expand(-1, -1, -1, 3)
+        elif raw.dim() == 4 and raw.shape[-1] == 2:
+            # [B, H, W, 2] -> [B, H, W, 3] (pad with zeros)
+            raw = torch.nn.functional.pad(raw, (0, 1))
         elif raw.dim() == 4 and raw.shape[-1] == 3:
             pass  # already [B, H, W, 3]
         elif raw.dim() == 4 and raw.shape[-1] == 4:
@@ -146,7 +197,7 @@ def _prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
         # MASK expects [B, H, W] float32 in [0, 1]
         if raw.dim() == 4:
             # Vec3/Vec4 image → luminance scalar
-            raw = 0.2126 * raw[..., 0] + 0.7152 * raw[..., 1] + 0.0722 * raw[..., 2]
+            raw = LUMA_R * raw[..., 0] + LUMA_G * raw[..., 1] + LUMA_B * raw[..., 2]
         elif raw.dim() == 2:
             # [H, W] without batch dim — add it
             raw = raw.unsqueeze(0)
@@ -187,6 +238,7 @@ def _map_inferred_type(inferred: TEXType | None, has_latent_input: bool) -> str:
     return {
         TEXType.VEC4: "LATENT" if has_latent_input else "IMAGE",
         TEXType.VEC3: "IMAGE",
+        TEXType.VEC2: "IMAGE",
         TEXType.FLOAT: "MASK",
         TEXType.INT: "INT",
         TEXType.STRING: "STRING",
@@ -216,7 +268,7 @@ class TEXWrangleNode(_BaseClass):
     MAX_OUTPUTS = 8
 
     # System kwargs that are NOT TEX bindings
-    _SYSTEM_KWARGS = {"device", "compile_mode", "_tex_any"}
+    _SYSTEM_KWARGS = {"code", "device", "compile_mode", "_tex_any"}
 
     @classmethod
     def define_schema(cls):
@@ -393,6 +445,12 @@ class TEXWrangleNode(_BaseClass):
                         f"TEX code references {sigil}{ref_name} but no input is connected to slot '{ref_name}'.",
                         loc=SourceLoc(1, 1), source=code, code="E6003",
                     )
+
+            # Convert param widget values to appropriate types for the interpreter
+            # (e.g. hex color strings → RGB lists, comma vec strings → float lists)
+            for pname, pinfo in param_info.items():
+                if pname in bindings:
+                    bindings[pname] = _convert_param_value(bindings[pname], pinfo)
 
             # Execute — optionally with torch.compile acceleration
             if compile_mode == "torch_compile":

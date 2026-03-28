@@ -1,0 +1,13 @@
+// Normalize Mask — remap mask values to fill the full 0-1 range
+// Finds the actual min and max of the input and rescales so
+// the darkest pixel becomes 0 and the brightest becomes 1.
+// Useful after operations that compress the value range.
+// Works with both MASK inputs and IMAGE inputs (converts to luma).
+
+float val = luma(@mask);
+float lo = luma(img_min(@mask));
+float hi = luma(img_max(@mask));
+float range = hi - lo;
+
+// Remap: (value - min) / (max - min)
+m@OUT = sdiv(val - lo, range);

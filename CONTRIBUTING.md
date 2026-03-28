@@ -13,7 +13,7 @@ Thanks for your interest in contributing to TEX Wrangle. This guide covers the e
 3. Run tests from the project root:
    ```
    cd TEX_Wrangle
-   python -m pytest tests/test_tex.py -v
+   python -m pytest tests/ -v
    ```
 
 No additional packages or build steps are needed for the core compiler and runtime.
@@ -28,7 +28,7 @@ No additional packages or build steps are needed for the core compiler and runti
 
 1. **Declare the signature** in `tex_compiler/stdlib_signatures.py` -- specify the function name, parameter types, and return type.
 2. **Implement the function** in `tex_runtime/stdlib.py` using PyTorch tensor operations.
-3. **Add tests** in `tests/test_tex.py` covering typical usage and edge cases.
+3. **Add tests** in the appropriate file under `tests/` (see `tests/README.md` for where each type of test belongs).
 
 ## Editor Build
 
@@ -44,7 +44,7 @@ For all other contributions, the editor build is not required.
 
 ## Pull Request Expectations
 
-- All existing tests must pass (`python -m pytest tests/test_tex.py -v`).
+- All existing tests must pass (`python -m pytest tests/ -v`).
 - Remove any debug output (`print()` statements, `console.log()` calls) before submitting.
 - Describe what your PR changes and why. Reference related issues where applicable.
 - If your change affects user-facing behavior, update the README accordingly.

@@ -1,0 +1,12 @@
+// Gaussian Blur — Built-in stdlib convenience wrapper
+//
+// Demonstrates the gauss_blur() built-in which performs a full separable
+// Gaussian convolution on the input image. Just specify the sigma (standard
+// deviation in pixels) and the engine handles the rest.
+//
+// Inputs:  @image (vec3)
+// Outputs: @OUT   (vec3)
+
+f$sigma = 2.0;   // blur radius in standard deviations (pixels)
+
+@OUT = gauss_blur(@image, $sigma);

@@ -1,0 +1,27 @@
+// Grain — simple procedural film grain (training example)
+//
+// A minimal grain implementation to demonstrate the core concepts:
+//   - Noise generation with per-frame temporal independence
+//   - Luminance-dependent amplitude (grain is strongest in midtones)
+//   - Additive blending in linear light
+//
+// This is a simplified version of film_grain.tex. For production work,
+// use that example instead — it operates in density space and models
+// cross-channel correlation for physically accurate results.
+
+f$strength = 0.1;  // grain intensity
+f$size = 1.0;     // grain size (higher = coarser)
+
+// Noise coordinates: scale by size, offset by frame for temporal variation
+float scale = 500.0 / max($size, 0.1);
+float seed = fi * 97.13;
+float noise = simplex(u * scale + seed, v * scale + seed * 0.7);
+
+// Luminance-dependent amplitude: peak in midtones, taper at extremes.
+// This mimics how grain visibility depends on underlying exposure.
+float lum = luma(@image);
+float response = 4.0 * lum * (1.0 - lum);   // parabola: 0 at black/white, 1 at mid-gray
+
+// Apply grain additively in linear light
+vec3 grain = vec3(noise * $strength * response);
+@OUT = @image + grain;

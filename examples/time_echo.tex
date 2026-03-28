@@ -1,0 +1,49 @@
+// Time Echo — Nuke-style temporal echo effect
+// Samples multiple past frames with exponential decay.
+// Supports four blend modes: average, add, max, min.
+// Connect an image batch or animation to @frames.
+
+i$echoes = 5;       // number of echo frames to sample
+i$offset = 1;       // frame step between echoes (1 = every frame)
+f$decay = 0.5;      // decay factor per echo (0.5 = halves each step)
+i$mode = 0;         // 0 = average, 1 = add, 2 = max, 3 = min
+
+vec3 result = vec3(0.0);
+float weight_sum = 0.0;
+float w = 1.0;
+
+for (int i = 0; i <= $echoes; i++) {
+    vec3 f = @frames[ix, iy, fi - i * $offset].rgb;
+    vec3 weighted = f * w;
+
+    if (i == 0) {
+        result = weighted;
+    } else {
+        if ($mode == 0) {
+            // Average: accumulate weighted sum
+            result = result + weighted;
+        }
+        if ($mode == 1) {
+            // Add: accumulate weighted sum (no normalization)
+            result = result + weighted;
+        }
+        if ($mode == 2) {
+            // Max: per-pixel maximum of weighted samples
+            result = max(result, weighted);
+        }
+        if ($mode == 3) {
+            // Min: per-pixel minimum of weighted samples
+            result = min(result, weighted);
+        }
+    }
+
+    weight_sum += w;
+    w = w * $decay;
+}
+
+// Normalize for average mode only
+if ($mode == 0) {
+    result = result / weight_sum;
+}
+
+@OUT = result;

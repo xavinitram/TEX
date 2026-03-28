@@ -1,23 +1,27 @@
-// Tone mapping: ACES filmic curve
-// Essential for HDR to SDR conversion in image processing
+// Tone Map — ACES filmic curve
+//
+// Maps HDR (scene-linear) values into displayable SDR range using
+// the ACES filmic approximation by Krzysztof Narkowicz.
+// An exposure parameter scales the input before the curve.
+//
+// Inputs:  @image (vec3) — scene-linear HDR
+// Outputs: @OUT   (vec3) — tone-mapped SDR
 
-float r = @image.r;
-float g = @image.g;
-float b = @image.b;
+f$exposure = 1.5;   // exposure multiplier (1.0 = neutral)
 
-// Exposure adjustment
-float exposure = 1.5;
-r = r * exposure;
-g = g * exposure;
-b = b * exposure;
+vec3 src = @image * $exposure;
 
-// ACES filmic tone mapping curve
+// ACES filmic tone mapping curve (per channel)
 // f(x) = (x * (2.51x + 0.03)) / (x * (2.43x + 0.59) + 0.14)
 float a_coeff = 2.51;
 float b_coeff = 0.03;
 float c_coeff = 2.43;
 float d_coeff = 0.59;
 float e_coeff = 0.14;
+
+float r = src.r;
+float g = src.g;
+float b = src.b;
 
 r = clamp((r * (a_coeff * r + b_coeff)) / (r * (c_coeff * r + d_coeff) + e_coeff), 0.0, 1.0);
 g = clamp((g * (a_coeff * g + b_coeff)) / (g * (c_coeff * g + d_coeff) + e_coeff), 0.0, 1.0);

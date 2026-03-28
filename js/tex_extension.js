@@ -439,7 +439,7 @@ function parseCode(code) {
     // Explicit declarations: f$strength = 0.5; or i$count; (supports all type prefixes)
     // Lookbehind requires statement boundary (^, ;, {, }) to avoid matching
     // $name inside expressions like for-loop headers: for (int dy = -$radius; ...)
-    const PARAM_DECL_RE = /(?<=(?:^|[;{}])\s*)(?:(img|v4|[fismvl]))?\$([A-Za-z_]\w*)\s*(?:=\s*([^;]+))?\s*;/gm;
+    const PARAM_DECL_RE = /(?<=(?:^|[;{}])\s*)(?:(img|v[234]|[fismvlcb]))?\$([A-Za-z_]\w*)\s*(?:=\s*([^;]+))?\s*;/gm;
     while ((m = PARAM_DECL_RE.exec(stripped)) !== null) {
         params.set(m[2], {
             typeHint: m[1] || "f",
@@ -668,10 +668,14 @@ function syncParams(node, params) {
         if (w._texParam) remaining.add(w.name);
     }
 
-    // Map type hints to ComfyUI type strings
+    // Map type hints to ComfyUI type strings for input sockets
     function paramComfyType(typeHint) {
         if (typeHint === "i") return "INT";
+        if (typeHint === "b") return "BOOLEAN";
         if (typeHint === "s") return "STRING";
+        if (typeHint === "c") return "STRING";   // hex color stored as string
+        if (typeHint === "v2") return "STRING";   // "x, y" stored as string
+        if (typeHint === "v3") return "STRING";   // "x, y, z" stored as string
         return "FLOAT";
     }
 
@@ -682,7 +686,34 @@ function syncParams(node, params) {
         const typeHint = info.typeHint || "f";
         const typeName = paramComfyType(typeHint);
         let widget;
-        if (typeHint === "i") {
+        if (typeHint === "b") {
+            // Boolean → toggle checkbox
+            const raw = info.defaultValue != null ? String(info.defaultValue).trim() : "0";
+            const def = raw === "1" || raw === "true";
+            widget = node.addWidget("toggle", name, def, () => {});
+        } else if (typeHint === "c") {
+            // Color → text input with hex default
+            let def = "#000000";
+            if (info.defaultValue != null) {
+                const raw = String(info.defaultValue).trim().replace(/^["']|["']$/g, "");
+                if (raw.startsWith("#")) def = raw;
+            }
+            widget = node.addWidget("text", name, def, () => {});
+        } else if (typeHint === "v2" || typeHint === "v3") {
+            // Vec2/Vec3 → text input with comma-separated component default
+            const n = typeHint === "v2" ? 2 : 3;
+            let def = Array(n).fill("0.0").join(", ");
+            if (info.defaultValue != null) {
+                const raw = String(info.defaultValue).trim();
+                const vecMatch = raw.match(new RegExp(`vec${n}\\s*\\(\\s*([^)]+)\\)`));
+                if (vecMatch) def = vecMatch[1].trim();
+                else {
+                    const cleaned = raw.replace(/^["']|["']$/g, "");
+                    if (cleaned) def = cleaned;
+                }
+            }
+            widget = node.addWidget("text", name, def, () => {});
+        } else if (typeHint === "i") {
             const parsed = info.defaultValue != null ? parseInt(info.defaultValue) : NaN;
             const def = Number.isFinite(parsed) ? parsed : 0;
             widget = node.addWidget("number", name, def, () => {}, {
@@ -703,8 +734,9 @@ function syncParams(node, params) {
         if (widget) {
             widget._texParam = true;
             widget._texTypeHint = typeHint;
-            const prefixChar = typeHint === "i" ? "i" : typeHint === "s" ? "s" : "f";
-            const defaultStr = info.defaultValue != null ? String(info.defaultValue) : (typeHint === "s" ? '""' : "0");
+            const prefixMap = { i: "i", s: "s", b: "b", c: "c", v2: "v2", v3: "v3" };
+            const prefixChar = prefixMap[typeHint] || "f";
+            const defaultStr = info.defaultValue != null ? String(info.defaultValue) : (typeHint === "s" ? '""' : typeHint === "b" ? "0" : typeHint === "c" ? '"#000000"' : "0");
             widget.tooltip = `TEX parameter: $${name} (${typeName})\nDeclare in code: ${prefixChar}$${name} = ${defaultStr};\nUse in expressions: $${name}\nConnect a wire or adjust the widget value.`;
         }
 
@@ -714,7 +746,9 @@ function syncParams(node, params) {
         // They co-exist as a single unified control — no double rendering.
         const existingInput = node.inputs?.find(inp => inp.name === name);
         if (!existingInput) {
-            node.addInput(name, typeName);
+            // Vec/color params accept any wire type (IMAGE, MASK, etc.) to override widget
+            const socketType = (typeHint === "c" || typeHint === "v2" || typeHint === "v3") ? "*" : typeName;
+            node.addInput(name, socketType);
             const newInput = node.inputs[node.inputs.length - 1];
             newInput._texParam = true;
             newInput.widget = { name: name };
@@ -736,8 +770,16 @@ function syncParams(node, params) {
             const typeHint = info.typeHint || "f";
             if (typeHint === "i") {
                 optional[name] = ["INT", { default: 0, min: -9999, max: 9999 }];
+            } else if (typeHint === "b") {
+                optional[name] = ["BOOLEAN", { default: false }];
             } else if (typeHint === "s") {
                 optional[name] = ["STRING", { default: "" }];
+            } else if (typeHint === "c") {
+                optional[name] = ["STRING", { default: "#000000" }];
+            } else if (typeHint === "v2") {
+                optional[name] = ["STRING", { default: "0.0, 0.0" }];
+            } else if (typeHint === "v3") {
+                optional[name] = ["STRING", { default: "0.0, 0.0, 0.0" }];
             } else {
                 optional[name] = ["FLOAT", { default: 0.0, min: -9999, max: 9999, step: 0.1, round: 0.001 }];
             }
@@ -1471,7 +1513,7 @@ const TEX_HELP_DATA = [
             { name: "Type Prefixes", sig: "f@ i@ v@ v4@ img@ m@ l@ s@", desc: "Prefix a binding to set its type: f@ float, i@ int, v@ vec3, v4@ vec4, img@ IMAGE, m@ MASK, l@ LATENT, s@ string.", example: "img@photo = ...;" },
             { name: "Parameters ($)", sig: "f$name = val;  i$name = val;  s$name = val;", desc: "Declare adjustable widgets on the node. f$ = FLOAT, i$ = INT, s$ = STRING. Use $name in expressions.", example: "f$strength = 0.75;\n@OUT = @A * $strength;" },
             { name: "Output", sig: "@OUT = expr;  @name = expr;", desc: "Assign to @OUT for a single output, or use named outputs for multiple results.", example: "@result = lerp(@base, @overlay, 0.5);\n@mask = luma(@base);" },
-            { name: "Built-in Variables", sig: "ix iy u v iw ih fi fn ic PI E", desc: "ix/iy = pixel coords. u/v = normalized [0,1]. iw/ih = image dimensions. fi = frame index. fn = frame count. ic = latent channels. PI and E constants.", example: "float cx = u - 0.5;\nfloat cy = v - 0.5;" },
+            { name: "Built-in Variables", sig: "ix iy u v iw ih px py fi fn ic PI TAU E", desc: "ix/iy = pixel coords. u/v = normalized [0,1]. iw/ih = image dimensions. px/py = pixel step (1/iw, 1/ih). fi = frame index. fn = frame count. ic = latent channels. PI, TAU, E constants.", example: "float cx = u - 0.5;\nfloat cy = v - 0.5;" },
         ]
     },
     {
@@ -1480,7 +1522,8 @@ const TEX_HELP_DATA = [
         entries: [
             { name: "float", sig: "float x = 1.0;", desc: "Floating-point number. The default numeric type.", example: "float brightness = 0.5;" },
             { name: "int", sig: "int n = 5;", desc: "Integer number.", example: "int count = 10;" },
-            { name: "vec3", sig: "vec3 c = vec3(r, g, b);", desc: "3-component vector. Used for RGB colors and 3D coordinates.", example: "vec3 color = vec3(1.0, 0.0, 0.0);" },
+            { name: "vec2", sig: "vec2 p = vec2(x, y);", desc: "2-component vector. Used for 2D coordinates and UV pairs.", example: "vec2 uv = vec2(u, v);" },
+            { name: "vec3", sig: "vec3 c = vec3(r, g, b);", desc: "3-component vector. Used for RGB colors and 3D coordinates. Standard image type in ComfyUI.", example: "vec3 color = vec3(1.0, 0.0, 0.0);" },
             { name: "vec4", sig: "vec4 c = vec4(r, g, b, a);", desc: "4-component vector. Used for RGBA colors.", example: "vec4 pixel = vec4(1.0, 1.0, 1.0, 0.5);" },
             { name: "mat3", sig: "mat3 m = mat3(1.0);", desc: "3x3 matrix for internal computation (cannot assign to @OUT).", example: "mat3 identity = mat3(1.0);" },
             { name: "mat4", sig: "mat4 m = mat4(1.0);", desc: "4x4 matrix for internal computation (cannot assign to @OUT).", example: "mat4 transform = mat4(1.0);" },
@@ -1488,7 +1531,8 @@ const TEX_HELP_DATA = [
             { name: "Pixel Coords", sig: "ix, iy", desc: "Current pixel coordinates (integers).", example: "float val = ix + iy;" },
             { name: "Normalized Coords", sig: "u, v", desc: "Normalized coordinates in [0, 1] range.", example: "float gradient = u;" },
             { name: "Dimensions", sig: "iw, ih", desc: "Image width and height in pixels.", example: "float aspect = iw / ih;" },
-            { name: "Constants", sig: "PI, E", desc: "Mathematical constants: PI = 3.14159..., E = 2.71828...", example: "float circle = sin(u * PI * 2.0);" },
+            { name: "Pixel Step", sig: "px, py", desc: "Pixel step in UV space: px = 1/iw, py = 1/ih. Use for neighbor sampling.", example: "vec4 right = sample(@A, u + px, v);" },
+            { name: "Constants", sig: "PI, TAU, E", desc: "Mathematical constants: PI = 3.14159..., TAU = 2*PI = 6.28318..., E = 2.71828...", example: "float circle = sin(u * TAU);" },
         ]
     },
     {
@@ -1502,6 +1546,7 @@ const TEX_HELP_DATA = [
             { name: "acos", sig: "acos(x) \u2192 float", desc: "Arccosine. Returns radians.", example: "float angle = acos(0.5);" },
             { name: "atan", sig: "atan(x) \u2192 float", desc: "Arctangent. Returns radians.", example: "float angle = atan(1.0);" },
             { name: "atan2", sig: "atan2(y, x) \u2192 float", desc: "Two-argument arctangent. Returns radians.", example: "float angle = atan2(v - 0.5, u - 0.5);" },
+            { name: "sincos", sig: "sincos(x) \u2192 vec2", desc: "Returns vec2(sin(x), cos(x)). More efficient than separate sin/cos calls.", example: "vec2 sc = sincos(angle);\nfloat s = sc.x;\nfloat c = sc.y;" },
             { name: "sinh", sig: "sinh(x) \u2192 float", desc: "Hyperbolic sine.", example: "float s = sinh(u);" },
             { name: "cosh", sig: "cosh(x) \u2192 float", desc: "Hyperbolic cosine.", example: "float c = cosh(u);" },
             { name: "tanh", sig: "tanh(x) \u2192 float", desc: "Hyperbolic tangent.", example: "float t = tanh(u * 2.0);" },
@@ -1519,6 +1564,7 @@ const TEX_HELP_DATA = [
             { name: "floor", sig: "floor(x) \u2192 float", desc: "Round down to nearest integer.", example: "float f = floor(u * 10.0);" },
             { name: "ceil", sig: "ceil(x) \u2192 float", desc: "Round up to nearest integer.", example: "float c = ceil(u * 10.0);" },
             { name: "round", sig: "round(x) \u2192 float", desc: "Round to nearest integer.", example: "float r = round(u * 10.0) / 10.0;" },
+            { name: "trunc", sig: "trunc(x) \u2192 float", desc: "Truncate toward zero (drop fractional part).", example: "float t = trunc(u * 10.0);" },
             { name: "fract", sig: "fract(x) \u2192 float", desc: "Fractional part: x - floor(x).", example: "float f = fract(u * 5.0);" },
             { name: "mod", sig: "mod(x, y) \u2192 float", desc: "Modulo (remainder).", example: "float m = mod(u * 10.0, 1.0);" },
             { name: "degrees", sig: "degrees(x) \u2192 float", desc: "Convert radians to degrees.", example: "float d = degrees(PI);" },
@@ -1572,8 +1618,12 @@ const TEX_HELP_DATA = [
             { name: "fetch", sig: "fetch(img, px, py) \u2192 vec", desc: "Nearest-neighbor fetch at pixel coordinates.", example: "@OUT = fetch(@A, ix, iy);" },
             { name: "sample_cubic", sig: "sample_cubic(img, u, v) \u2192 vec", desc: "Bicubic (Catmull-Rom) sampling.", example: "@OUT = sample_cubic(@A, u, v);" },
             { name: "sample_lanczos", sig: "sample_lanczos(img, u, v) \u2192 vec", desc: "Lanczos-3 high-quality sampling.", example: "@OUT = sample_lanczos(@A, u * 0.5, v * 0.5);" },
+            { name: "sample_mip", sig: "sample_mip(img, u, v, lod) \u2192 vec", desc: "Mipmap sampling with LOD. 0 = full res, 1 = half, etc. Trilinear between levels.", example: "@OUT = sample_mip(@A, u, v, 2.5);" },
+            { name: "sample_mip_gauss", sig: "sample_mip_gauss(img, u, v, lod) \u2192 vec", desc: "Gaussian-prefiltered mipmap sampling. Smoother pyramid (sigma=1.13) gives ~5 dB better exponential blur accuracy vs sample_mip.", example: "@OUT = sample_mip_gauss(@A, u, v, 2.5);" },
+            { name: "gauss_blur", sig: "gauss_blur(img, sigma) \u2192 vec", desc: "Separable Gaussian blur. Kernel radius \u2248 3\u00d7sigma pixels. Replicate border padding.", example: "@OUT = gauss_blur(@A, 2.0);" },
             { name: "fetch_frame", sig: "fetch_frame(img, frame, px, py) \u2192 vec", desc: "Nearest-neighbor fetch from a specific batch frame.", example: "@OUT = fetch_frame(@A, 0, ix, iy);" },
             { name: "sample_frame", sig: "sample_frame(img, frame, u, v) \u2192 vec", desc: "Bilinear sample from a specific batch frame.", example: "@OUT = sample_frame(@A, fi-1, u, v);" },
+            { name: "sample_grad", sig: "sample_grad(img, u, v) \u2192 vec2", desc: "Image gradient (Sobel) at UV. Returns vec2(dI/dx, dI/dy) of luminance.", example: "vec2 grad = sample_grad(@A, u, v);" },
         ]
     },
     {
@@ -1583,6 +1633,27 @@ const TEX_HELP_DATA = [
             { name: "perlin", sig: "perlin(x, y) \u2192 float", desc: "2D Perlin noise. Returns value in [-1, 1].", example: "float n = perlin(u * 10.0, v * 10.0);" },
             { name: "simplex", sig: "simplex(x, y) \u2192 float", desc: "2D Simplex noise. Returns value in [-1, 1].", example: "float n = simplex(u * 8.0, v * 8.0);" },
             { name: "fbm", sig: "fbm(x, y, octaves) \u2192 float", desc: "Fractal Brownian Motion (multi-octave Perlin).", example: "float n = fbm(u * 4.0, v * 4.0, 6);" },
+            { name: "worley_f1", sig: "worley_f1(x, y) \u2192 float", desc: "Worley (cellular) noise — distance to nearest cell center.", example: "float n = worley_f1(u * 5.0, v * 5.0);" },
+            { name: "worley_f2", sig: "worley_f2(x, y) \u2192 float", desc: "Worley noise — distance to second-nearest cell center.", example: "float n = worley_f2(u * 5.0, v * 5.0);" },
+            { name: "voronoi", sig: "voronoi(x, y) \u2192 float", desc: "Voronoi cell ID noise. Returns a unique value per cell.", example: "float cell = voronoi(u * 8.0, v * 8.0);" },
+            { name: "billow", sig: "billow(x, y, octaves) \u2192 float", desc: "Billowy noise — abs(fbm). Puffy cloud shapes.", example: "float n = billow(u * 4.0, v * 4.0, 6);" },
+            { name: "turbulence", sig: "turbulence(x, y, octaves) \u2192 float", desc: "Turbulence — sum of abs(noise) per octave. Veiny patterns.", example: "float n = turbulence(u * 4.0, v * 4.0, 6);" },
+            { name: "ridged", sig: "ridged(x, y, octaves) \u2192 float", desc: "Ridged multifractal — sharp ridges, good for mountains.", example: "float n = ridged(u * 4.0, v * 4.0, 6);" },
+            { name: "flow", sig: "flow(x, y, angle) \u2192 float", desc: "Flow noise — Perlin rotated by angle per octave. Avoids static patterns.", example: "float n = flow(u * 6.0, v * 6.0, fi * 0.1);" },
+            { name: "curl", sig: "curl(x, y) \u2192 vec2", desc: "Curl of 2D noise field. Returns a divergence-free vector.", example: "vec2 c = curl(u * 5.0, v * 5.0);" },
+            { name: "alligator", sig: "alligator(x, y) \u2192 float", desc: "Alligator noise — cellular crack patterns.", example: "float n = alligator(u * 5.0, v * 5.0);" },
+        ]
+    },
+    {
+        title: "SDF & Smooth",
+        icon: "\u{1F7E2}",
+        entries: [
+            { name: "sdf_circle", sig: "sdf_circle(x, y, cx, cy, r) \u2192 float", desc: "Signed distance to circle. Negative inside, positive outside.", example: "float d = sdf_circle(u, v, 0.5, 0.5, 0.3);" },
+            { name: "sdf_box", sig: "sdf_box(x, y, cx, cy, hw, hh) \u2192 float", desc: "Signed distance to axis-aligned box.", example: "float d = sdf_box(u, v, 0.5, 0.5, 0.2, 0.15);" },
+            { name: "sdf_line", sig: "sdf_line(x, y, x1, y1, x2, y2) \u2192 float", desc: "Distance to line segment.", example: "float d = sdf_line(u, v, 0.2, 0.2, 0.8, 0.8);" },
+            { name: "sdf_polygon", sig: "sdf_polygon(x, y, cx, cy, r, n) \u2192 float", desc: "Signed distance to regular polygon with n sides.", example: "float d = sdf_polygon(u, v, 0.5, 0.5, 0.3, 6);" },
+            { name: "smin", sig: "smin(a, b, k) \u2192 float|vec", desc: "Smooth minimum. Polynomial blending with radius k. Works on scalars and vectors.", example: "float d = smin(d1, d2, 0.1);" },
+            { name: "smax", sig: "smax(a, b, k) \u2192 float|vec", desc: "Smooth maximum. Polynomial blending with radius k. Works on scalars and vectors.", example: "float d = smax(d1, d2, 0.1);" },
         ]
     },
     {
@@ -1615,6 +1686,14 @@ const TEX_HELP_DATA = [
             { name: "to_int", sig: "to_int(s) \u2192 int", desc: "Parse a string as an integer.", example: "int n = to_int(\"42\");" },
             { name: "to_float", sig: "to_float(s) \u2192 float", desc: "Parse a string as a float.", example: "float f = to_float(\"3.14\");" },
             { name: "sanitize_filename", sig: "sanitize_filename(s) \u2192 string", desc: "Remove unsafe characters for use in file paths.", example: "string safe = sanitize_filename(s);" },
+            { name: "format", sig: "format(fmt, ...) \u2192 string", desc: "Printf-style formatting. %d = int, %f = float, %s = string.", example: "string s = format(\"Frame %d of %d\", fi, fn);" },
+            { name: "split", sig: "split(s, sep) \u2192 string[]", desc: "Split string into array by separator.", example: "string parts[4] = split(s, \",\");" },
+            { name: "lstrip", sig: "lstrip(s) \u2192 string", desc: "Remove leading whitespace.", example: "string clean = lstrip(s);" },
+            { name: "rstrip", sig: "rstrip(s) \u2192 string", desc: "Remove trailing whitespace.", example: "string clean = rstrip(s);" },
+            { name: "pad_left", sig: "pad_left(s, width, fill) \u2192 string", desc: "Pad string on the left to reach width.", example: "string n = pad_left(str(fi), 4, \"0\");" },
+            { name: "pad_right", sig: "pad_right(s, width, fill) \u2192 string", desc: "Pad string on the right to reach width.", example: "string n = pad_right(s, 20, \" \");" },
+            { name: "count", sig: "count(s, sub) \u2192 float", desc: "Count non-overlapping occurrences of sub in s.", example: "float n = count(s, \"the\");" },
+            { name: "char_at", sig: "char_at(s, idx) \u2192 string", desc: "Character at index (0-based).", example: "string c = char_at(s, 0);" },
             { name: "String Concat", sig: "\"a\" + \"b\"", desc: "Concatenate strings with the + operator.", example: "string full = \"frame_\" + str(fi) + \".png\";" },
         ]
     },
@@ -1658,6 +1737,8 @@ const TEX_HELP_DATA = [
             { name: "while loop", sig: "while (cond) { ... }", desc: "Loop while condition is true.", example: "int i = 0;\nwhile (i < 10) {\n  i++;\n}" },
             { name: "break", sig: "break;", desc: "Exit the current loop early.", example: "for (int i=0; i<100; i++) {\n  if (arr[i] < 0) break;\n}" },
             { name: "continue", sig: "continue;", desc: "Skip to the next loop iteration.", example: "for (int i=0; i<10; i++) {\n  if (i == 5) continue;\n}" },
+            { name: "User Functions", sig: "type name(args) { return expr; }", desc: "Define reusable functions. Must be declared before use.", example: "float remap(float x, float lo, float hi) {\n  return (x - lo) / (hi - lo);\n}" },
+            { name: "const", sig: "const type name = value;", desc: "Compile-time constant. Must be initialized with a literal.", example: "const float GOLDEN = 1.618034;" },
         ]
     },
     {

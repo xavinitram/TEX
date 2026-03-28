@@ -1,0 +1,41 @@
+// Wood Grain — Concentric rings with FBM perturbation
+//
+// Generates realistic wood-like rings by computing distance from a
+// centre point, multiplying by a ring frequency, then perturbing the
+// result with FBM noise. A colour ramp maps from light to dark wood.
+//
+// Inputs:  (none — purely procedural)
+// Outputs: @OUT (vec3)
+
+f$ring_freq   = 20.0;    // number of rings across the surface
+f$noise_scale = 4.0;     // scale of the FBM perturbation
+f$noise_amp   = 2.5;     // strength of the FBM perturbation
+f$center_x    = 0.5;     // ring centre X (0-1 UV space)
+f$center_y    = 0.5;     // ring centre Y (0-1 UV space)
+
+float x = u * $noise_scale;
+float y = v * $noise_scale;
+
+// Distance from ring centre
+float dist = distance(vec2(u, v), vec2($center_x, $center_y));
+
+// Perturb with FBM for organic variation
+float perturbation = fbm(x, y, 4) * $noise_amp;
+
+// Concentric rings
+float ring = sin(dist * $ring_freq + perturbation);
+
+// Remap sin output from [-1,1] to [0,1]
+float t = ring * 0.5 + 0.5;
+
+// Wood colour palette: light sapwood to dark heartwood
+vec3 light_wood = vec3(0.85, 0.65, 0.35);
+vec3 mid_wood   = vec3(0.55, 0.35, 0.15);
+vec3 dark_wood  = vec3(0.30, 0.18, 0.08);
+
+// Two-segment ramp
+vec3 result = t < 0.5
+    ? lerp(dark_wood, mid_wood, t * 2.0)
+    : lerp(mid_wood, light_wood, (t - 0.5) * 2.0);
+
+@OUT = result;

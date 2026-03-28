@@ -1,0 +1,33 @@
+// 2D Transform — translate, rotate, scale with pivot point
+// Standard 2D affine transformation using matrix math.
+// Order: scale around pivot, rotate around pivot, then translate.
+
+f$translate_x = 0.0;   // horizontal shift in UV space (-1 to 1)
+f$translate_y = 0.0;   // vertical shift in UV space (-1 to 1)
+f$rotate = 0.0;        // rotation in degrees
+f$scale_x = 1.0;       // horizontal scale (1.0 = no change)
+f$scale_y = 1.0;       // vertical scale (1.0 = no change)
+f$pivot_x = 0.5;       // pivot point X (0.5 = center)
+f$pivot_y = 0.5;       // pivot point Y (0.5 = center)
+
+// Center on pivot
+float pv_x = u - $pivot_x;
+float pv_y = v - $pivot_y;
+
+// Inverse scale (we're mapping output -> input)
+float sx = sdiv(1.0, $scale_x);
+float sy = sdiv(1.0, $scale_y);
+pv_x = pv_x * sx;
+pv_y = pv_y * sy;
+
+// Inverse rotation
+float angle = radians(-$rotate);
+vec2 sc = sincos(angle);
+float rx = pv_x * sc.y - pv_y * sc.x;
+float ry = pv_x * sc.x + pv_y * sc.y;
+
+// Inverse translate and restore pivot
+float su = rx + $pivot_x - $translate_x;
+float sv = ry + $pivot_y - $translate_y;
+
+@OUT = sample_cubic(@image, su, sv).rgb;

@@ -1,0 +1,51 @@
+// Array Reduce — demonstrate array aggregation functions
+//
+// Educational example: sample a 3x3 neighborhood of luminance values
+// into an array, then use sort(), median(), arr_sum(), arr_min(),
+// arr_max(), and arr_avg() to compute various statistics.
+//
+// Outputs a side-by-side comparison:
+//   Left third:   original luminance
+//   Middle third:  median-filtered (noise reduction)
+//   Right third:   normalized range map (local contrast indicator)
+//
+// Connect @image to any RGB input.
+
+// ── Gather luminance samples into a 3x3 neighborhood ────────────────
+float samples[9];
+int idx = 0;
+for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+        vec3 s = fetch(@image, ix + dx, iy + dy);
+        samples[idx] = luma(s);
+        idx++;
+    }
+}
+
+// ── Array functions ─────────────────────────────────────────────────
+float med   = median(samples);       // median value (robust center)
+float total = arr_sum(samples);      // sum of all values
+float lo    = arr_min(samples);      // darkest neighbor
+float hi    = arr_max(samples);      // brightest neighbor
+float avg   = arr_avg(samples);      // arithmetic mean
+float sorted[9] = sort(samples);     // sorted copy (ascending)
+
+// Local contrast: range normalized to [0,1]
+float range = hi - lo;
+
+// ── Build comparison output ─────────────────────────────────────────
+float lum = luma(@image);
+
+vec3 result = vec3(0.0);
+if (u < 0.333) {
+    // Left: original luminance
+    result = vec3(lum);
+} else if (u < 0.666) {
+    // Middle: median-filtered (denoised)
+    result = vec3(med);
+} else {
+    // Right: local range (contrast map)
+    result = vec3(range);
+}
+
+@OUT = result;

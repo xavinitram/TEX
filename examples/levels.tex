@@ -1,31 +1,37 @@
-// Levels adjustment — Photoshop-style input/output level mapping
-// Common in photo editing and compositing workflows
+// Levels — Photoshop-style input/output level mapping
+//
+// Remaps pixel brightness through three stages:
+//   1. Input levels: crushes the black/white points inward
+//   2. Gamma correction: adjusts midtone brightness
+//   3. Output levels: compresses the result into a narrower range
+//
+// Connect @image to any RGB input.
 
-float in_black = 0.05;
-float in_white = 0.95;
-float gamma = 1.2;
-float out_black = 0.0;
-float out_white = 1.0;
+f$in_black = 0.05;    // input black point (values below this become 0)
+f$in_white = 0.95;    // input white point (values above this become 1)
+f$gamma = 1.2;        // midtone gamma (>1 brightens, <1 darkens)
+f$out_black = 0.0;    // output black level
+f$out_white = 1.0;    // output white level
 
 float r = @image.r;
 float g = @image.g;
 float b = @image.b;
 
 // Input levels: remap [in_black, in_white] to [0, 1]
-float inv_range = 1.0 / (in_white - in_black + 0.0001);
-r = clamp((r - in_black) * inv_range, 0.0, 1.0);
-g = clamp((g - in_black) * inv_range, 0.0, 1.0);
-b = clamp((b - in_black) * inv_range, 0.0, 1.0);
+float inv_range = 1.0 / ($in_white - $in_black + 0.0001);
+r = clamp((r - $in_black) * inv_range, 0.0, 1.0);
+g = clamp((g - $in_black) * inv_range, 0.0, 1.0);
+b = clamp((b - $in_black) * inv_range, 0.0, 1.0);
 
 // Gamma correction
-float inv_gamma = 1.0 / gamma;
+float inv_gamma = 1.0 / $gamma;
 r = pow(r, inv_gamma);
 g = pow(g, inv_gamma);
 b = pow(b, inv_gamma);
 
 // Output levels: remap [0, 1] to [out_black, out_white]
-r = lerp(out_black, out_white, r);
-g = lerp(out_black, out_white, g);
-b = lerp(out_black, out_white, b);
+r = lerp($out_black, $out_white, r);
+g = lerp($out_black, $out_white, g);
+b = lerp($out_black, $out_white, b);
 
 @OUT = vec3(r, g, b);

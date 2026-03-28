@@ -1,0 +1,66 @@
+// Merge — combine two images with standard compositing operations
+//
+// Applies @A (foreground) over @B (background) using the selected blend
+// mode. The mix parameter controls the effect strength — at 0 the output
+// is pure @B, at 1 it's the full merge result.
+//
+// Operations:
+//   0 = Add         A + B
+//   1 = Subtract    A - B
+//   2 = Multiply    A * B
+//   3 = Screen      A + B - A*B
+//   4 = Overlay     2*A*B (darks) / 1-2*(1-A)*(1-B) (lights)
+//   5 = Soft Light  (1-2*A)*B^2 + 2*A*B
+//   6 = Min         min(A, B) per channel
+//   7 = Max         max(A, B) per channel
+//   8 = Difference  abs(A - B)
+//   9 = Divide      A / B (safe)
+
+i$operation = 0;    // blend mode (see list above)
+f$mix = 1.0;        // effect strength (0 = B only, 1 = full merge)
+
+vec3 a = @A;
+vec3 b = @B;
+vec3 result = b;
+float eps = 1e-6;
+
+if ($operation == 0) {
+    // Add
+    result = a + b;
+} else if ($operation == 1) {
+    // Subtract
+    result = a - b;
+} else if ($operation == 2) {
+    // Multiply
+    result = a * b;
+} else if ($operation == 3) {
+    // Screen: 1 - (1-A)(1-B) = A + B - AB
+    result = a + b - a * b;
+} else if ($operation == 4) {
+    // Overlay: conditional multiply/screen per channel
+    float rr = (b.r < 0.5) ? 2.0 * a.r * b.r : 1.0 - 2.0 * (1.0 - a.r) * (1.0 - b.r);
+    float rg = (b.g < 0.5) ? 2.0 * a.g * b.g : 1.0 - 2.0 * (1.0 - a.g) * (1.0 - b.g);
+    float rb = (b.b < 0.5) ? 2.0 * a.b * b.b : 1.0 - 2.0 * (1.0 - a.b) * (1.0 - b.b);
+    result = vec3(rr, rg, rb);
+} else if ($operation == 5) {
+    // Soft Light (Pegtop formula): (1-2A)*B^2 + 2*A*B
+    float sr = (1.0 - 2.0 * a.r) * b.r * b.r + 2.0 * a.r * b.r;
+    float sg = (1.0 - 2.0 * a.g) * b.g * b.g + 2.0 * a.g * b.g;
+    float sb = (1.0 - 2.0 * a.b) * b.b * b.b + 2.0 * a.b * b.b;
+    result = vec3(sr, sg, sb);
+} else if ($operation == 6) {
+    // Min
+    result = vec3(min(a.r, b.r), min(a.g, b.g), min(a.b, b.b));
+} else if ($operation == 7) {
+    // Max
+    result = vec3(max(a.r, b.r), max(a.g, b.g), max(a.b, b.b));
+} else if ($operation == 8) {
+    // Difference
+    result = vec3(abs(a.r - b.r), abs(a.g - b.g), abs(a.b - b.b));
+} else if ($operation == 9) {
+    // Divide (safe)
+    result = vec3(a.r / max(b.r, eps), a.g / max(b.g, eps), a.b / max(b.b, eps));
+}
+
+// Mix: blend between B (background) and the merge result
+@OUT = b + (result - b) * $mix;

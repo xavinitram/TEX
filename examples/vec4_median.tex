@@ -1,5 +1,12 @@
-// 3x3 median filter using vec4 arrays
-// Reduces salt-and-pepper noise while preserving edges
+// Vec4 Median — 3x3 spatial median filter using vec4 arrays
+//
+// Reduces salt-and-pepper noise while preserving edges.
+// Gathers a 3x3 neighborhood into a vec4 array and computes
+// the per-channel median. Demonstrates vec4 array usage with
+// fetch() (which returns vec4).
+//
+// Inputs:  @image (vec3)
+// Outputs: @OUT   (vec3)
 
 vec4 samples[9];
 int idx = 0;

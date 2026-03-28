@@ -1,5 +1,12 @@
-// Custom blend modes using user-defined functions
-// Demonstrates defining reusable functions for image compositing
+// Custom Blend — overlay blend mode using user-defined functions
+//
+// Demonstrates defining reusable functions for image compositing.
+// Implements the Photoshop Overlay blend mode per-channel, then
+// mixes the result with the original base using $blend_amount.
+//
+// Also includes a soft_light function for reference (unused by default).
+//
+// Connect @base and @overlay to RGB images.
 
 float overlay(float a, float b) {
     if (a < 0.5) {
@@ -18,7 +25,7 @@ float soft_light(float a, float b) {
     return a + (2.0 * b - 1.0) * (d - a);
 }
 
-f$blend_amount = 0.5;
+f$blend_amount = 0.5;   // mix strength (0 = base only, 1 = full overlay blend)
 
 vec3 base = @base.rgb;
 vec3 over = @overlay.rgb;
@@ -29,4 +36,4 @@ vec3 result = vec3(
     overlay(base.b, over.b)
 );
 
-@OUT = lerp(@base, result, $blend_amount);
+@OUT = lerp(base, result, $blend_amount);

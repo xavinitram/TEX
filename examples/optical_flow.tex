@@ -1,0 +1,92 @@
+// Optical Flow — Lucas-Kanade motion estimation
+//
+// Computes per-pixel motion vectors between two consecutive frames using
+// the Lucas-Kanade method: a local least-squares solve of the optical
+// flow constraint equation (Ix*u + Iy*v + It = 0) over a window.
+//
+// For each pixel, the algorithm:
+//   1. Computes spatial gradients (Ix, Iy) from the current frame
+//   2. Computes the temporal gradient (It) between current and previous frame
+//   3. Accumulates the 2x2 structure tensor A^T*A and vector A^T*b
+//      over a local window
+//   4. Solves the 2x2 linear system for (u, v) displacement
+//
+// The structure tensor's eigenvalues indicate estimation quality:
+// corners give strong flow, edges give ambiguous flow (aperture problem),
+// flat regions give no flow. A confidence threshold suppresses noise
+// in textureless areas.
+//
+// Output: vec4 where R = horizontal motion, G = vertical motion (in pixels),
+//         B = confidence (0-1), A = 1.
+// Motion is encoded as signed pixel displacement (not 0.5-centered).
+// Connect @current and @previous as consecutive frames.
+
+i$window_radius = 4;    // window half-size (4 = 9x9 window, 81 equations)
+f$confidence_threshold = 0.001;  // minimum eigenvalue to trust the estimate
+
+// ── Accumulate structure tensor over the local window ────────────
+// A^T A = [[sum(Ix^2), sum(Ix*Iy)],
+//          [sum(Ix*Iy), sum(Iy^2)]]
+// A^T b = [-sum(Ix*It), -sum(Iy*It)]
+float sIx2 = 0.0;   // sum of Ix^2
+float sIy2 = 0.0;   // sum of Iy^2
+float sIxIy = 0.0;  // sum of Ix*Iy
+float sIxIt = 0.0;  // sum of Ix*It
+float sIyIt = 0.0;  // sum of Iy*It
+
+for (int wy = -$window_radius; wy <= $window_radius; wy++) {
+    for (int wx = -$window_radius; wx <= $window_radius; wx++) {
+        float su = u + float(wx) * px;
+        float sv = v + float(wy) * py;
+
+        // Spatial gradients via central differences on current frame luminance
+        float l_c = luma(sample(@current, su, sv));
+        float l_r = luma(sample(@current, su + px, sv));
+        float l_l = luma(sample(@current, su - px, sv));
+        float l_u = luma(sample(@current, su, sv - py));
+        float l_d = luma(sample(@current, su, sv + py));
+
+        float gx = (l_r - l_l) * 0.5;
+        float gy = (l_d - l_u) * 0.5;
+
+        // Temporal gradient: difference between current and previous frame
+        float l_prev = luma(sample(@previous, su, sv));
+        float gt = l_c - l_prev;
+
+        // Accumulate structure tensor
+        sIx2  = sIx2  + gx * gx;
+        sIy2  = sIy2  + gy * gy;
+        sIxIy = sIxIy + gx * gy;
+        sIxIt = sIxIt + gx * gt;
+        sIyIt = sIyIt + gy * gt;
+    }
+}
+
+// ── Solve 2x2 linear system ─────────────────────────────────────
+// [sIx2   sIxIy] [vx]   [-sIxIt]
+// [sIxIy  sIy2 ] [vy] = [-sIyIt]
+//
+// Cramer's rule: det = sIx2*sIy2 - sIxIy^2
+float det = sIx2 * sIy2 - sIxIy * sIxIy;
+
+// Corner response: det/trace ≈ harmonic mean of eigenvalues.
+// High values indicate well-constrained flow (textured regions);
+// low values indicate the aperture problem (edges) or flat regions.
+float trace = sIx2 + sIy2;
+float corner_response = sdiv(det, max(trace, 0.00001));
+float confidence = smoothstep(0.0, $confidence_threshold, corner_response);
+
+// Solve only if well-conditioned (det >> 0)
+float inv_det = sdiv(1.0, det);
+float vx = -(sIy2  * sIxIt - sIxIy * sIyIt) * inv_det;
+float vy = -(sIx2  * sIyIt - sIxIy * sIxIt) * inv_det;
+
+// Suppress flow in low-confidence regions
+vx = vx * confidence;
+vy = vy * confidence;
+
+// Convert from UV displacement to pixel displacement
+vx = vx * iw;
+vy = vy * ih;
+
+@OUT = vec4(vx, vy, confidence, 1.0);

@@ -1,0 +1,36 @@
+// Film Exponential Blur — Gaussian-pyramid approximation of exponential decay kernel
+//
+// The exponential kernel K(r) = exp(-r/s) / (2*pi*s^2) has a sharp cusp at
+// center and heavy tails — it preserves high-frequency detail while spreading
+// light over a wide area. This makes it the basis of optical glow, film halation,
+// and light diffusion effects in professional compositing.
+//
+// Direct convolution of this kernel is impractical (the tails require thousands
+// of taps). Instead, this example decomposes the kernel into a weighted sum of
+// Gaussian-prefiltered mipmap levels, using 6 pre-optimized taps that achieve
+// ~57 dB PSNR against the true exponential kernel — visually indistinguishable.
+//
+// Uses sample_mip_gauss() which builds the pyramid with sigma=1.13 Gaussian
+// pre-blur before each 2x downsample, giving SIGMA_C ≈ 0.825 (vs 0.707 for
+// box filtering). This is worth ~5 dB improvement in reconstruction accuracy.
+//
+// Performance: 6 sample_mip_gauss calls per pixel, constant regardless of radius.
+
+f$radius = 32.0;    // blur radius in pixels (1 = subtle, 256 = extreme)
+
+// ── Optimized 6-tap weight table (tuned for Gaussian pyramid) ────────
+// Base level: L = log2(radius / 0.825)
+// Weights sum to ~1.0, optimized to minimize reconstruction error.
+float offsets[] = {-3.5416, -2.1090, -1.0466, -0.1620, 0.6150, 1.3337};
+float weights[] = {0.00063, 0.00802, 0.05349, 0.21820, 0.45467, 0.26499};
+
+float base = log2(max($radius, 1.0) / 0.825);
+
+// ── Weighted mip accumulation ──────────────────────────────────────
+vec3 acc = vec3(0.0);
+for (int i = 0; i < 6; i++) {
+    float lod = max(base + offsets[i], 0.0);
+    acc += sample_mip_gauss(@image, u, v, lod) * weights[i];
+}
+
+@OUT = acc;

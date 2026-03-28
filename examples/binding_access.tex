@@ -19,7 +19,7 @@ float dist = sqrt(dx * dx + dy * dy);
 if (dist < 0.2) {
     float zoom_u = $cx + dx / $zoom;
     float zoom_v = $cy + dy / $zoom;
-    @OUT = @image(zoom_u, zoom_v);
+    @OUT = @image(zoom_u, zoom_v).rgb;
 } else {
-    @OUT = @image[ix, iy];
+    @OUT = @image[ix, iy].rgb;
 }

@@ -1,9 +1,14 @@
 // Procedural terrain with simplex noise
-// Outputs a colored terrain image and a heightmap mask
+//
+// Generates a colored terrain map using layered simplex noise with
+// elevation-based coloring (water, grass, rock, snow). Also outputs
+// the raw heightmap as a mask for downstream compositing.
+//
+// Inputs:  (none — purely procedural)
+// Outputs: @terrain (vec3), m@heightmap (float)
 
 f$frequency = 4.0;   // terrain scale (higher = more features)
 
-vec4 _ref = @ref;
 float height = simplex(u * $frequency, v * $frequency) * 0.5 + 0.5;
 
 // Add detail with a second octave
@@ -28,5 +33,5 @@ if (height > 0.8) {
 }
 
 // Multi-output: IMAGE + MASK
-@terrain = vec4(color, 1.0);
+@terrain = color;
 m@heightmap = height;

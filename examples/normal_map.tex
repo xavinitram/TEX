@@ -1,10 +1,13 @@
-// Generate normal map from height/displacement map
-// Essential for 3D rendering and texture generation workflows
-// Uses Sobel-like gradient estimation
+// Normal Map — generate a tangent-space normal map from a height map
+//
+// Uses Sobel-filtered gradients to estimate surface orientation from
+// a grayscale height/displacement map. Essential for 3D rendering and
+// texture generation workflows. The strength parameter controls how
+// pronounced the surface detail appears.
+//
+// Connect @image to a grayscale height map.
 
-float px = 1.0 / iw;
-float py = 1.0 / ih;
-float strength = 2.0;
+f$strength = 2.0;   // normal intensity (higher = more pronounced bumps)
 
 // Sample grayscale heights in a cross pattern
 float tl = luma(sample(@image, u - px, v - py));
@@ -21,8 +24,8 @@ float dx = (tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl);
 float dy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
 
 // Normal vector
-float nx = -dx * strength;
-float ny = -dy * strength;
+float nx = -dx * $strength;
+float ny = -dy * $strength;
 float nz = 1.0;
 
 // Normalize

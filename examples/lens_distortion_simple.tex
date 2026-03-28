@@ -1,0 +1,26 @@
+// Simple Lens Distortion (AE Optics Compensation style)
+// Single FOV parameter controls barrel/pincushion distortion.
+// Uses the Devernay-Faugeras arctangent model.
+// Positive FOV = barrel (wide-angle), negative = pincushion.
+
+f$fov = 60.0;   // field of view in degrees (try -90 to 120)
+
+float cx = u - 0.5;
+float cy = v - 0.5;
+float rd = hypot(cx, cy);
+
+float omega = radians($fov);
+float half_tan = tan(omega * 0.5);
+
+// Devernay-Faugeras FOV model: rd_new = atan(2 * rd * tan(w/2)) / w
+float rd_new = rd;
+if (abs(omega) > 0.001) {
+    rd_new = atan(2.0 * rd * half_tan) / omega;
+}
+
+// Scale factor preserves direction, remaps radial distance
+float scale = rd > 0.001 ? rd_new / rd : 1.0;
+float su = 0.5 + cx * scale;
+float sv = 0.5 + cy * scale;
+
+@OUT = sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0));

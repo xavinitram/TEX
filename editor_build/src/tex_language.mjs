@@ -14,7 +14,7 @@ const TEX_KEYWORDS = new Set([
 ]);
 
 const TEX_BUILTINS = new Set([
-    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sincos",
     "sinh", "cosh", "tanh",
     "pow", "sqrt", "exp", "log", "log2", "log10", "abs", "sign",
     "pow2", "pow10", "hypot",
@@ -39,14 +39,14 @@ const TEX_BUILTINS = new Set([
     "transpose", "determinant", "inverse",
 ]);
 
-const TEX_CONSTANTS = new Set(["PI", "E"]);
+const TEX_CONSTANTS = new Set(["PI", "TAU", "E"]);
 
 const TEX_COORD_VARS = new Set([
-    "u", "v", "ix", "iy", "iw", "ih", "ic", "fi", "fn",
+    "u", "v", "ix", "iy", "iw", "ih", "px", "py", "ic", "fi", "fn",
 ]);
 
 // Type prefixes for typed bindings: f@threshold, i$count, etc.
-const BINDING_TYPE_PREFIXES = new Set(["f", "i", "v", "v4", "s", "img", "m", "l"]);
+const BINDING_TYPE_PREFIXES = new Set(["f", "i", "v", "v2", "v3", "v4", "s", "img", "m", "l", "c", "b"]);
 
 // ─── Token name strategy ─────────────────────────────────────────────
 // StreamLanguage.define() accepts ONE argument (the spec); there is NO

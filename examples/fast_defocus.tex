@@ -1,0 +1,77 @@
+// Fast Defocus — mipmap-accelerated disc bokeh blur
+//
+// Simulates optical defocus by sampling a golden-angle spiral disc at
+// the target mip level. The mip pre-filter eliminates aliasing between
+// samples, allowing high-quality bokeh with far fewer taps than a brute-
+// force kernel. Optional polygonal aperture and highlight boost for
+// photographic character.
+//
+// Performance: 64 samples with mip pre-filtering matches the quality
+// of a 500+ tap brute-force disc convolution.
+
+f$radius = 15.0;       // defocus radius in pixels
+i$samples = 64;        // disc samples (32 = fast, 128 = smooth)
+i$blades = 0;          // aperture blades (0 = circular, 5-8 = polygonal)
+f$rotation = 0.0;      // blade rotation in degrees
+f$highlight = 1.0;     // highlight boost (1.0 = off, 2.0+ = glowing bokeh)
+
+int N = clamp($samples, 8, 512);
+float r_px = max($radius, 0.0);
+
+// ── Mip LOD for anti-aliasing ──────────────────────────────────────
+// With N samples across the disc, each covers ~(radius / sqrt(N)) pixels
+// linearly. The mip level pre-filters to that scale, preventing gaps.
+float lod = log2(max(r_px / sqrt(float(N)), 1.0));
+
+// ── Polygon setup ──────────────────────────────────────────────────
+int blades = $blades;
+float blade_angle = (blades >= 3) ? TAU / float(blades) : 0.0;
+float half_blade = blade_angle * 0.5;
+float rot_rad = radians($rotation);
+
+// ── Golden-angle spiral sampling ───────────────────────────────────
+float golden_angle = 2.3998632;    // 2pi / phi^2
+
+vec3 acc = vec3(0.0);
+float total_w = 0.0;
+
+for (int i = 0; i < N; i++) {
+    float t = float(i) / float(N);
+    float angle = float(i) * golden_angle;
+
+    // sqrt(t) maps uniform index to uniform disc area distribution
+    float norm_r = sqrt(t);
+
+    // ── Polygonal aperture rejection ───────────────────────────
+    // For a regular N-gon, the boundary radius at angle theta is:
+    //   R(theta) = cos(pi/N) / cos(mod(theta, 2pi/N) - pi/N)
+    if (blades >= 3) {
+        float sa = mod(angle + rot_rad + half_blade, blade_angle) - half_blade;
+        float poly_r = cos(half_blade) / max(cos(sa), 0.01);
+        if (norm_r > poly_r) {
+            continue;
+        }
+    }
+
+    // ── Sample position ────────────────────────────────────────
+    float dist = norm_r * r_px;
+    vec2 sc = sincos(angle);
+    float du = sc.x * dist * px;
+    float dv = sc.y * dist * py;
+
+    vec3 s = sample_mip(@image, u + du, v + dv, lod);
+
+    // ── Highlight boost ────────────────────────────────────────
+    // Real lenses concentrate bright points into visible bokeh discs.
+    // Boosting highlights before averaging simulates this optical effect.
+    float w = 1.0;
+    if ($highlight > 1.0) {
+        float lum = luma(s);
+        w = 1.0 + max(lum - 0.8, 0.0) * ($highlight - 1.0) * 5.0;
+    }
+
+    acc += s * w;
+    total_w += w;
+}
+
+@OUT = acc / max(total_w, 1.0);

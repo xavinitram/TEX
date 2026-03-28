@@ -1,4 +1,10 @@
-// Hue shift effect
+// Hue Shift — rotate the hue of an image
+//
+// Converts RGB to HSV, offsets the hue channel by the shift amount,
+// then converts back to RGB. A shift of 0.5 inverts warm/cool tones;
+// 1.0 wraps back to the original color.
+//
+// Connect @image to any RGB input.
 
 f$shift = 0.0;   // hue rotation amount (0.0 to 1.0)
 

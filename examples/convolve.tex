@@ -1,0 +1,35 @@
+// Convolve — blur an image using a second image as the kernel
+// The @kernel image defines the blur shape (stencil).
+// Useful for custom bokeh effects: use a bokeh shape image as kernel.
+// Normalizes by the kernel sum so brightness is preserved.
+//
+// Performance note: kernel radius is limited by the loop.
+// A 21x21 kernel (radius 10) is reasonable; larger gets slow.
+// Maximum: radius 15 (961 iterations). Radius 16+ exceeds the 1024 iteration limit.
+
+i$radius = 5;   // kernel half-size in pixels (5 = 11x11 stencil)
+
+vec3 sum = vec3(0.0);
+float weight_sum = 0.0;
+int size = $radius * 2 + 1;
+float inv_size = 1.0 / float(size - 1);
+float r_offset = float($radius);
+
+for (int ky = -$radius; ky <= $radius; ky++) {
+    for (int kx = -$radius; kx <= $radius; kx++) {
+        // Sample the kernel at this offset (use UV-space mapping)
+        float ku = (float(kx) + r_offset) * inv_size;
+        float kv = (float(ky) + r_offset) * inv_size;
+        vec3 k = sample(@kernel, ku, kv).rgb;
+
+        // Kernel weight is the luminance of the kernel pixel
+        float w = luma(k);
+
+        // Sample the source image at this offset
+        vec3 s = fetch(@image, ix + kx, iy + ky).rgb;
+        sum = sum + s * w;
+        weight_sum = weight_sum + w;
+    }
+}
+
+@OUT = sum / max(weight_sum, 0.0001);

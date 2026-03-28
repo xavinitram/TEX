@@ -1,0 +1,17 @@
+// Fast Blur — mipmap-accelerated constant-time blur
+//
+// A single sample_mip call replaces thousands of convolution taps.
+// The pre-built mipmap pyramid provides area-preserving downsampling:
+//   LOD 0 = sharp, LOD 1 ~ 2px, LOD 2 ~ 4px, LOD 3 ~ 8px, etc.
+//
+// Cost is O(1) per pixel regardless of blur radius — a 200px blur is
+// as fast as a 2px blur. For a smoother Gaussian-like profile, see
+// fast_gaussian.tex. For bokeh disc blur, see fast_defocus.tex.
+
+f$radius = 10.0;    // blur radius in pixels (1 = subtle, 200 = heavy)
+
+// Convert pixel radius to continuous LOD.
+// Trilinear interpolation blends adjacent mip levels for smooth results.
+float lod = log2(max($radius, 1.0));
+
+@OUT = sample_mip(@image, u, v, lod);

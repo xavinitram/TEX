@@ -1,0 +1,32 @@
+// Sample Comparison — Bilinear vs Cubic vs Lanczos resampling
+//
+// Generates a procedural checkerboard, writes it to @OUT_checker, then
+// resamples it at a non-integer scale using three different interpolation
+// methods. A mode selector picks which result to output so you can A/B
+// the quality differences (especially visible near hard edges).
+//
+// Inputs:  @image (vec3) — used as the texture to resample
+// Outputs: @OUT   (vec3)
+
+i$mode  = 0;       // 0 = bilinear, 1 = cubic, 2 = lanczos, 3 = average of all three
+f$scale = 3.7;     // non-integer scale to show aliasing differences
+
+// Scale UVs around centre
+float su = (u - 0.5) * $scale + 0.5;
+float sv = (v - 0.5) * $scale + 0.5;
+
+// Three sampling methods on the input image
+vec3 bilinear = sample(@image, su, sv);
+vec3 cubic    = sample_cubic(@image, su, sv);
+vec3 lanczos  = sample_lanczos(@image, su, sv);
+
+vec3 result = bilinear;
+if ($mode == 1) {
+    result = cubic;
+} else if ($mode == 2) {
+    result = lanczos;
+} else if ($mode == 3) {
+    result = (bilinear + cubic + lanczos) / 3.0;
+}
+
+@OUT = result;

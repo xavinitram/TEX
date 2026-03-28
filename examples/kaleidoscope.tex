@@ -1,0 +1,33 @@
+// Kaleidoscope — mirror and rotate UVs for a kaleidoscope effect
+//
+// Converts UVs to polar coordinates, quantizes the angle to create
+// mirrored segments, then samples the input image at the transformed
+// coordinates. Increasing segments produces more symmetry.
+
+i$segments = 6;        // number of mirror segments (minimum 2)
+f$rotation = 0.0;      // rotation offset in radians
+
+vec3 src = @image;
+
+// Center UVs around (0.5, 0.5)
+float cx = u - 0.5;
+float cy = v - 0.5;
+
+// Polar coordinates
+float angle = atan2(cy, cx) + $rotation;
+float radius = length(vec2(cx, cy));
+
+// Segment angular width
+float seg_angle = TAU / float(max($segments, 2));
+
+// Fold the angle into one segment, then mirror it
+angle = mod(angle, seg_angle);
+if (angle > seg_angle * 0.5) {
+    angle = seg_angle - angle;
+}
+
+// Convert back to cartesian and shift to UV space
+float su = cos(angle) * radius + 0.5;
+float sv = sin(angle) * radius + 0.5;
+
+@OUT = sample(@image, su, sv);

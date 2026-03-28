@@ -1,0 +1,24 @@
+// Box Blur — Simple NxN averaging kernel
+//
+// Sums all pixels in a (2*radius+1) x (2*radius+1) neighbourhood and
+// divides by the sample count. This is the simplest spatial blur and a
+// good demonstration of nested for-loops with pixel-stepping.
+//
+// Inputs:  @image (vec3)
+// Outputs: @OUT   (vec3)
+
+i$radius = 2;   // kernel half-size in pixels (total width = 2*radius + 1)
+
+vec3 sum = vec3(0.0);
+int count = 0;
+
+for (int dy = -$radius; dy <= $radius; dy = dy + 1) {
+    for (int dx = -$radius; dx <= $radius; dx = dx + 1) {
+        float su = u + float(dx) * px;
+        float sv = v + float(dy) * py;
+        sum = sum + sample(@image, su, sv).rgb;
+        count = count + 1;
+    }
+}
+
+@OUT = sum / float(count);

@@ -1,0 +1,24 @@
+// Premultiply / Unpremultiply
+// Converts between straight (unassociated) and premultiplied (associated) alpha.
+//
+// Premultiplied: RGB channels are multiplied by alpha. Standard in compositing
+// pipelines (Nuke, After Effects). Prevents bright fringing on transparent edges.
+//
+// Unpremultiplied: RGB channels store the full color regardless of alpha.
+// Used for texture painting and some image formats (PNG).
+//
+// Connect @image (RGB) and m@alpha (alpha channel as mask input).
+// Set $mode: 1 = premultiply, 0 = unpremultiply
+
+i$mode = 1;   // 1 = premultiply (straight -> premult), 0 = unpremultiply
+
+vec3 src = @image;
+float a = m@alpha;
+
+if ($mode > 0) {
+    // Premultiply: RGB * alpha
+    @OUT = src * a;
+} else {
+    // Unpremultiply: RGB / alpha (safe division to avoid divide-by-zero)
+    @OUT = vec3(sdiv(src.r, a), sdiv(src.g, a), sdiv(src.b, a));
+}

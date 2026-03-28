@@ -1,0 +1,51 @@
+// User Function Library — composable function definitions
+//
+// Educational example: define multiple user functions that build on each
+// other to form a reusable grading pipeline.
+//
+//   remap()        — rescale a value from [0,1] to [lo,hi]
+//   apply_contrast() — S-curve contrast using remap + power
+//   color_grade()  — full grade combining contrast and saturation
+//
+// Connect @image to any RGB input.
+
+f$contrast = 1.5;       // contrast strength (1.0 = neutral, 2.0 = strong)
+f$saturation = 1.2;     // saturation multiplier (1.0 = neutral)
+f$pivot = 0.5;          // contrast pivot point
+
+// ── Function: remap ─────────────────────────────────────────────────
+// Linearly maps val from [0, 1] into [lo, hi].
+float remap(float val, float lo, float hi) {
+    return lo + val * (hi - lo);
+}
+
+// ── Function: apply_contrast ────────────────────────────────────────
+// Applies an S-curve contrast centered on a pivot. Uses remap to shift
+// the working range so the pivot stays neutral, then applies a power
+// curve, then remaps back.
+vec3 apply_contrast(vec3 col, float contrast, float pivot) {
+    // Normalize around pivot, apply power, restore
+    float r = pow(clamp(col.r / pivot, 0.0, 2.0), contrast) * pivot;
+    float g = pow(clamp(col.g / pivot, 0.0, 2.0), contrast) * pivot;
+    float b = pow(clamp(col.b / pivot, 0.0, 2.0), contrast) * pivot;
+
+    // Remap result to keep values in a usable range
+    r = remap(clamp(r, 0.0, 1.0), 0.0, 1.0);
+    g = remap(clamp(g, 0.0, 1.0), 0.0, 1.0);
+    b = remap(clamp(b, 0.0, 1.0), 0.0, 1.0);
+
+    return vec3(r, g, b);
+}
+
+// ── Function: color_grade ───────────────────────────────────────────
+// Full color grade: first applies contrast, then adjusts saturation
+// by lerping between luminance and the contrasted color.
+vec3 color_grade(vec3 col, float contrast, float saturation, float pivot) {
+    vec3 contrasted = apply_contrast(col, contrast, pivot);
+    float lum = luma(contrasted);
+    return lerp(vec3(lum), contrasted, saturation);
+}
+
+// ── Apply ───────────────────────────────────────────────────────────
+vec3 src = @image;
+@OUT = clamp(color_grade(src, $contrast, $saturation, $pivot), 0.0, 1.0);

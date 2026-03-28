@@ -1,0 +1,38 @@
+// Marble — Classic turbulence-driven veined stone
+//
+// Produces a marble texture by feeding turbulence noise into a sine
+// function, creating the characteristic wavy veins. The amplitude
+// parameter controls how much the veins meander.
+//
+// Inputs:  (none — purely procedural)
+// Outputs: @OUT (vec3)
+
+f$frequency = 5.0;    // base stripe frequency along X
+f$amplitude = 5.0;    // how much turbulence displaces the veins
+f$scale     = 4.0;    // spatial scale of the turbulence field
+
+float x = u * $scale;
+float y = v * $scale;
+
+// Turbulence adds multi-octave absolute-value noise
+float turb = turbulence(x, y, 6);
+
+// Classic marble formula: sin sweeping across X, perturbed by turbulence
+float vein = sin(u * $frequency * PI + turb * $amplitude);
+
+// Remap from [-1,1] to [0,1]
+float t = vein * 0.5 + 0.5;
+
+// Sharpen veins with a power curve
+t = pow(t, 0.8);
+
+// Colour ramp: white stone with dark grey-blue veins
+vec3 white_stone = vec3(0.95, 0.93, 0.90);
+vec3 mid_grey    = vec3(0.55, 0.55, 0.58);
+vec3 dark_vein   = vec3(0.18, 0.18, 0.22);
+
+vec3 result = t < 0.4
+    ? lerp(dark_vein, mid_grey, t / 0.4)
+    : lerp(mid_grey, white_stone, (t - 0.4) / 0.6);
+
+@OUT = result;

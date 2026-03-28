@@ -1,6 +1,10 @@
-// Approximate bilateral filter (edge-preserving blur)
-// Weights neighbors by both spatial and intensity distance
-// 5x5 kernel — realistic denoising/smoothing workflow
+// Bilateral Approx — edge-preserving blur (approximate bilateral filter)
+//
+// Weights neighbours by both spatial distance and intensity similarity,
+// so edges stay sharp while flat regions get smoothed. Uses a 5x5 kernel
+// with Gaussian weighting in both domains.
+//
+// Connect @image to any RGB input.
 
 vec3 center = @image;
 float sigma_s = 2.0;  // spatial sigma

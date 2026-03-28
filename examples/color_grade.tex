@@ -1,5 +1,10 @@
-// Color grading: lift-gamma-gain with saturation control
-// Realistic color correction workflow used in compositing
+// Color Grade — lift / gamma / gain with saturation
+//
+// Classic 3-way color correction used in compositing and DI.
+// Lift adjusts shadows, gamma adjusts midtones, gain adjusts highlights.
+// Per-channel values allow color shifts in each tonal range.
+//
+// Connect @image to any RGB input.
 
 // Extract channels
 float r = @image.r;

@@ -1,20 +1,26 @@
-// Unsharp mask — classic image sharpening technique
-// Subtracts a blurred version to enhance edges
-// Uses a 3x3 Gaussian blur kernel
+// Unsharp Mask — classic image sharpening technique
+//
+// Subtracts a 3x3 Gaussian-blurred version from the original to
+// enhance edges. A threshold prevents sharpening of flat areas
+// (noise). This is the standard unsharp-mask algorithm used in
+// Photoshop and most image editors.
+//
+// Inputs:  @image (vec3)
+// Outputs: @OUT   (vec3)
 
-// 3x3 Gaussian blur
-float px = 1.0 / iw;
-float py = 1.0 / ih;
+f$amount = 1.5;       // sharpening strength (1.0 = normal, 2.0 = strong)
+f$threshold = 0.01;   // edge threshold (ignore edges weaker than this)
 
-vec3 s00 = sample(@image, u - px, v - py);
-vec3 s10 = sample(@image, u,      v - py);
-vec3 s20 = sample(@image, u + px, v - py);
-vec3 s01 = sample(@image, u - px, v);
+// 3x3 Gaussian blur kernel
+vec3 s00 = sample(@image, u - px, v - py).rgb;
+vec3 s10 = sample(@image, u,      v - py).rgb;
+vec3 s20 = sample(@image, u + px, v - py).rgb;
+vec3 s01 = sample(@image, u - px, v).rgb;
 vec3 s11 = @image;
-vec3 s21 = sample(@image, u + px, v);
-vec3 s02 = sample(@image, u - px, v + py);
-vec3 s12 = sample(@image, u,      v + py);
-vec3 s22 = sample(@image, u + px, v + py);
+vec3 s21 = sample(@image, u + px, v).rgb;
+vec3 s02 = sample(@image, u - px, v + py).rgb;
+vec3 s12 = sample(@image, u,      v + py).rgb;
+vec3 s22 = sample(@image, u + px, v + py).rgb;
 
 // Gaussian weights: 1/16 * [[1,2,1],[2,4,2],[1,2,1]]
 vec3 blurred = (s00 + s20 + s02 + s22) * 0.0625
@@ -22,13 +28,10 @@ vec3 blurred = (s00 + s20 + s02 + s22) * 0.0625
              + s11 * 0.25;
 
 // Unsharp mask: original + amount * (original - blurred)
-float amount = 1.5;
-float threshold = 0.01;
-
 vec3 diff = s11 - blurred;
 float edge_strength = length(diff);
 
 // Only sharpen where edge is above threshold
-vec3 result = s11 + diff * amount * step(threshold, edge_strength);
+vec3 result = s11 + diff * $amount * step($threshold, edge_strength);
 
-@OUT = vec3(clamp(result.r, 0.0, 1.0), clamp(result.g, 0.0, 1.0), clamp(result.b, 0.0, 1.0));
+@OUT = clamp(result, 0.0, 1.0);

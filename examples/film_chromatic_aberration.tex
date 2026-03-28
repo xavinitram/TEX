@@ -1,0 +1,80 @@
+// Film Chromatic Aberration — multi-band spectral lateral CA
+//
+// Simulates real lateral chromatic aberration by decomposing the image
+// into N spectral bands, applying wavelength-dependent radial displacement
+// to each, and reintegrating via spectral-to-RGB color matching weights.
+//
+// This produces the smooth rainbow fringing of real glass — unlike the
+// crude "shift R and B channels" trick which creates harsh cyan/red banding.
+//
+// Model: each spectral band lambda_i receives a radial scale:
+//   r'(lambda) = r * (1 + alpha * lambda_i * r^p)
+// where lambda_i ranges from -1 (blue) to +1 (red), alpha is the global
+// CA strength, and p is the radial falloff exponent (2 = quadratic).
+// Green (lambda=0) is held fixed as the reference channel.
+//
+// The spectral bands are weighted by approximate CIE color matching
+// functions to reconstruct physically plausible RGB.
+//
+// Connect @image in scene-linear color space.
+
+f$strength = 0.003;     // lateral CA intensity (start small: 0.001-0.01)
+f$falloff = 2.0;        // radial exponent (2 = quadratic, 3 = cubic)
+i$bands = 8;            // spectral samples (8-16 for smooth fringing)
+f$center_x = 0.5;       // optical center X
+f$center_y = 0.5;       // optical center Y
+
+// ── Setup ────────────────────────────────────────────────────────
+float aspect = iw / ih;
+float cx = (u - $center_x) * aspect;
+float cy = v - $center_y;
+float r = hypot(cx, cy);
+float r_pow = pow(max(r, 0.0001), $falloff);
+
+// Direction from center (unit vector for radial displacement)
+float inv_r = sdiv(1.0, r);
+float dir_x = cx * inv_r;
+float dir_y = cy * inv_r;
+
+// Clamp bands: minimum 3 for smooth spectrum, maximum 64 (well within loop limit)
+int num_bands = clamp($bands, 3, 64);
+float inv_bands = 1.0 / float(num_bands - 1);
+
+// ── Accumulate spectral bands ────────────────────────────────────
+// Each band gets a wavelength parameter lambda in [-1, +1].
+// Approximate CIE color matching: R peaks at lambda=+0.7, G at 0,
+// B at lambda=-0.7, with overlapping Gaussian response curves.
+vec3 accum = vec3(0.0);
+vec3 weight_sum = vec3(0.0);
+
+for (int i = 0; i < num_bands; i++) {
+    // Normalized wavelength: -1 (blue end) to +1 (red end)
+    float lambda = float(i) * inv_bands * 2.0 - 1.0;
+
+    // Radial scale for this wavelength
+    float displacement = $strength * lambda * r_pow;
+    float su = (cx + dir_x * displacement) / aspect + $center_x;
+    float sv = (cy + dir_y * displacement) + $center_y;
+
+    vec3 s = sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0));
+
+    // Spectral-to-RGB weights (Gaussian approximation of CIE curves)
+    // Red:   peak at lambda = +0.65, sigma = 0.45
+    // Green: peak at lambda =  0.00, sigma = 0.40
+    // Blue:  peak at lambda = -0.65, sigma = 0.40
+    float wr = exp(-0.5 * pow((lambda - 0.65) / 0.45, 2.0));
+    float wg = exp(-0.5 * pow(lambda / 0.40, 2.0));
+    float wb = exp(-0.5 * pow((lambda + 0.65) / 0.40, 2.0));
+
+    accum = accum + vec3(s.r * wr, s.g * wg, s.b * wb);
+    weight_sum = weight_sum + vec3(wr, wg, wb);
+}
+
+// Energy-preserving normalization
+vec3 result = vec3(
+    sdiv(accum.r, weight_sum.r),
+    sdiv(accum.g, weight_sum.g),
+    sdiv(accum.b, weight_sum.b)
+);
+
+@OUT = result;

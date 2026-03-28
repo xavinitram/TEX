@@ -1,0 +1,99 @@
+// Film Grain — density-domain photographic grain synthesis
+//
+// Models real film grain through optical density space, matching the
+// physical process of silver halide exposure and dye-cloud formation.
+//
+// Pipeline:
+//   1. Convert linear RGB to optical density: D = -log10(I)
+//   2. Generate spatially-shaped noise (FBM for dye-cloud clumping)
+//   3. Apply luminance-dependent amplitude (grain peaks in midtones,
+//      tapers in highlights and deep shadows)
+//   4. Cross-channel correlation (blue channel gets heavier grain,
+//      matching real film where blue-sensitive emulsion has larger halides)
+//   5. Add grain in density space, convert back to linear
+//
+// This produces grain that naturally "bites" into shadows and rolls off
+// in highlights — the hallmark of real film stock, impossible to achieve
+// with simple additive noise in gamma space.
+//
+// Connect @image in scene-linear color space.
+
+f$strength = 0.35;       // grain intensity (0.0-1.0)
+f$size = 1.0;            // grain size (1.0 = 35mm, larger = coarser)
+f$roughness = 0.6;       // 0 = smooth dye clouds, 1 = sharp/gritty
+f$color_variance = 0.5;  // 0 = monochrome grain, 1 = full RGB variation
+f$shadow_response = 0.8; // grain amplitude in deep shadows
+f$mid_response = 1.0;    // grain amplitude in midtones
+f$highlight_response = 0.2; // grain amplitude in highlights
+
+// ── Convert to optical density ───────────────────────────────────
+vec3 img = @image;
+float lum = luma(img);
+
+// Density = -log10(linear). Clamp to avoid log(0).
+float density = -log10(max(lum, 0.0001));
+// Normalize density to roughly [0, 1] for the amplitude curve.
+// Typical scene density range is 0 (white) to ~3 (deep shadow).
+float d_norm = clamp(density / 3.0, 0.0, 1.0);
+
+// ── Luminance-dependent amplitude (cubic spline approximation) ───
+// Three control points: shadow (d=0.8), midtone (d=0.4), highlight (d=0.1)
+// Blended via smoothstep transitions.
+float amp_shadow = $shadow_response * smoothstep(0.5, 0.9, d_norm);
+float amp_mid = $mid_response * (1.0 - abs(d_norm - 0.4) * 2.5);
+amp_mid = max(amp_mid, 0.0);
+float amp_highlight = $highlight_response * smoothstep(0.3, 0.0, d_norm);
+float amplitude = max(amp_shadow + amp_mid + amp_highlight, 0.05) * $strength;
+
+// ── Spatially-shaped noise (dye-cloud clumping) ──────────────────
+// Use FBM at multiple scales to simulate halide cluster structure.
+// The 'roughness' parameter blends between smooth low-octave clouds
+// and sharp high-frequency grain.
+float scale = 800.0 / max($size, 0.1);
+float sx = u * scale;
+float sy = v * scale;
+// Frame-dependent seed for temporal independence (each frame = new grain)
+float seed = fi * 137.31;
+
+// Fine grain (high frequency, sharp particles)
+float g_fine = simplex(sx + seed, sy + seed * 0.73);
+// Medium grain (dye-cloud clumps)
+float g_med = simplex(sx * 0.4 + seed * 1.1, sy * 0.4 + seed * 0.51);
+// Coarse structure
+float g_coarse = simplex(sx * 0.15 + seed * 0.87, sy * 0.15 + seed * 1.3);
+
+// Blend scales based on roughness: high roughness = more fine grain
+float grain_luma = lerp(g_med, g_fine, $roughness) * 0.7
+                 + g_coarse * 0.3;
+
+// ── Cross-channel correlation ────────────────────────────────────
+// Real film: CMY dye layers are physically overlapping, creating
+// correlated but not identical grain. Blue-sensitive layer has the
+// largest halides (most grain). Fully monochrome at color_variance=0.
+float g_r = simplex(sx + seed + 41.7, sy + seed + 17.3);
+float g_g = simplex(sx + seed + 83.1, sy + seed + 59.7);
+float g_b = simplex(sx + seed + 127.9, sy + seed + 91.1);
+
+// Blend: correlated (mono) ←→ independent (color)
+float gr_r = lerp(grain_luma, g_r, $color_variance);
+float gr_g = lerp(grain_luma, g_g, $color_variance);
+float gr_b = lerp(grain_luma, g_b, $color_variance * 0.7);
+
+// Blue channel gets ~30% more grain (larger halides)
+gr_b = gr_b * 1.3;
+
+// ── Apply grain in density space ─────────────────────────────────
+// Add noise to each channel's density, then convert back to linear.
+float eps = 0.0001;
+float dr = -log10(max(img.r, eps)) + gr_r * amplitude;
+float dg = -log10(max(img.g, eps)) + gr_g * amplitude;
+float db = -log10(max(img.b, eps)) + gr_b * amplitude;
+
+// Convert back to linear light: I = 10^(-D)
+vec3 result = vec3(
+    pow10(-dr),
+    pow10(-dg),
+    pow10(-db)
+);
+
+@OUT = vec3(max(result.r, 0.0), max(result.g, 0.0), max(result.b, 0.0));

@@ -1,17 +1,22 @@
-// Unsharp mask sharpening using a 3x3 kernel
+// Sharpen — Laplacian 3x3 kernel
 //
 // Approximates a Laplacian sharpen filter:
 //   center pixel * 5 minus its four direct neighbors.
-// fetch() clamps to image bounds automatically.
+// fetch() returns vec4 and clamps to image bounds automatically.
+//
+// Inputs:  @image (vec3)
+// Outputs: @OUT   (vec3)
 
-vec4 center = fetch(@image, ix, iy);
-vec4 top    = fetch(@image, ix, iy - 1);
-vec4 bottom = fetch(@image, ix, iy + 1);
-vec4 left   = fetch(@image, ix - 1, iy);
-vec4 right  = fetch(@image, ix + 1, iy);
+f$amount = 1.0;   // sharpening strength (0 = none, 1 = full, >1 = aggressive)
+
+vec3 center = fetch(@image, ix, iy).rgb;
+vec3 top    = fetch(@image, ix, iy - 1).rgb;
+vec3 bottom = fetch(@image, ix, iy + 1).rgb;
+vec3 left   = fetch(@image, ix - 1, iy).rgb;
+vec3 right  = fetch(@image, ix + 1, iy).rgb;
 
 // Laplacian sharpen: emphasize center, subtract neighbors
-vec4 sharp = center * 5.0 - top - bottom - left - right;
+vec3 sharp = center * 5.0 - top - bottom - left - right;
 
-// Clamp to valid color range
-@OUT = clamp(sharp, 0.0, 1.0);
+// Blend between original and sharpened by amount
+@OUT = clamp(lerp(center, sharp, $amount), 0.0, 1.0);

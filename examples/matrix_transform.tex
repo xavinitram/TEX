@@ -1,0 +1,53 @@
+// Matrix Transform — mat3 for 2D affine UV transforms
+//
+// Educational example: build a rotation + scale matrix using mat3,
+// apply it to UV coordinates, then sample the image at the transformed
+// position. Also demonstrates transpose().
+//
+// The 3x3 matrix encodes 2D affine transforms in homogeneous coords:
+//   | sx*cos  -sy*sin  tx |
+//   | sx*sin   sy*cos  ty |
+//   |   0        0      1 |
+//
+// Connect @image to any RGB input.
+
+f$angle = 15.0;        // rotation in degrees
+f$scale = 1.0;         // uniform scale factor
+f$center_x = 0.5;      // rotation center X (0.5 = image center)
+f$center_y = 0.5;      // rotation center Y
+
+// ── Build rotation + scale matrix ───────────────────────────────────
+float rad = $angle * PI / 180.0;
+float c = cos(rad) * $scale;
+float s = sin(rad) * $scale;
+
+// Rotation-scale matrix (rows: x-axis, y-axis, translation)
+mat3 rot = mat3(
+     c, -s, 0.0,
+     s,  c, 0.0,
+    0.0, 0.0, 1.0
+);
+
+// Demonstrate transpose — for a pure rotation matrix, transpose = inverse
+mat3 rot_inv = transpose(rot);
+
+// ── Apply transform to UV ───────────────────────────────────────────
+// Shift to center, apply inverse transform, shift back.
+// We use the inverse so we're mapping output -> input (backward mapping).
+float cu = u - $center_x;
+float cv = v - $center_y;
+
+// Multiply [cu, cv, 1] by the inverse rotation matrix
+vec3 uv_hom = vec3(cu, cv, 1.0);
+vec3 transformed = rot_inv * uv_hom;
+
+float su = transformed.x + $center_x;
+float sv = transformed.y + $center_y;
+
+// ── Sample with boundary check ──────────────────────────────────────
+vec3 result = vec3(0.0);
+if (su >= 0.0 && su <= 1.0 && sv >= 0.0 && sv <= 1.0) {
+    result = sample(@image, su, sv);
+}
+
+@OUT = result;

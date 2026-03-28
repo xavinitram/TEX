@@ -1,5 +1,9 @@
-// Reusable color grading functions
-// Shows how to build a mini function library for color work
+// Color Functions — reusable function library for color grading
+//
+// Demonstrates defining user functions for gain, gamma, luminance,
+// and saturation. Apply them in sequence for a simple grade pipeline.
+//
+// Connect @image to any RGB input.
 
 vec3 gain(vec3 color, float g) {
     return pow(color, vec3(1.0 / max(g, 0.001)));

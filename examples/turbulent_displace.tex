@@ -1,0 +1,25 @@
+// Turbulent Displacement — noise-driven image distortion
+// Inspired by After Effects' Turbulent Displace effect.
+// Uses FBM noise to warp UV coordinates, creating organic distortion.
+// The evolution parameter animates the noise over time via 3D noise.
+
+f$amount = 0.05;       // displacement strength in UV space (try 0.01-0.2)
+f$size = 4.0;          // noise spatial scale (lower = finer detail)
+i$complexity = 3;      // FBM octaves (1 = smooth, 6 = detailed)
+f$evolution = 0.0;     // animate this for time-varying distortion
+
+// Scale pixel coords into noise space
+float nx = u * $size;
+float ny = v * $size;
+float nz = $evolution;
+
+// Two decorrelated FBM noise fields for X and Y displacement
+// Offset the second sample by a large constant to decorrelate
+float dx = fbm(nx, ny, nz, $complexity);
+float dy = fbm(nx + 100.0, ny + 100.0, nz, $complexity);
+
+// Displace UV coordinates
+float su = u + dx * $amount;
+float sv = v + dy * $amount;
+
+@OUT = sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0)).rgb;

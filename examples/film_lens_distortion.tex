@@ -1,0 +1,40 @@
+// Film Lens Distortion — Nuke-style division model
+// Professional VFX-grade radial distortion using the division model:
+//   xu = xd / (1 + k1*r^2 + k2*r^4)
+// Handles barrel, pincushion, mustache distortion, and anamorphic squeeze.
+// Suitable for matchmove and lens calibration workflows.
+
+f$k1 = 0.0;          // first radial coefficient (barrel > 0, pincushion < 0)
+f$k2 = 0.0;          // second radial coefficient (higher-order correction)
+f$center_x = 0.0;    // distortion center X offset from image center
+f$center_y = 0.0;    // distortion center Y offset from image center
+f$squeeze = 1.0;     // anamorphic squeeze (1.0 = spherical, 2.0 = 2x anamorphic)
+f$scale = 1.0;       // output scale (compensate for lens breathing)
+
+// Centered and aspect-corrected coordinates
+float aspect = iw / ih;
+float cx = (u - 0.5) * aspect - $center_x;
+float cy = (v - 0.5) - $center_y;
+
+// Apply anamorphic squeeze to X axis
+cx = cx / max($squeeze, 0.001);
+
+// Radial distance squared in distorted space
+float r2 = cx * cx + cy * cy;
+float r4 = r2 * r2;
+
+// Division model: undistorted = distorted / (1 + k1*r^2 + k2*r^4)
+float denom = 1.0 + $k1 * r2 + $k2 * r4;
+float inv_denom = sdiv(1.0, denom);
+
+float ux = cx * inv_denom;
+float uy = cy * inv_denom;
+
+// Undo anamorphic squeeze
+ux = ux * $squeeze;
+
+// Back to UV space with scale
+float su = (ux / aspect + 0.5) * $scale + 0.5 * (1.0 - $scale);
+float sv = (uy + 0.5) * $scale + 0.5 * (1.0 - $scale);
+
+@OUT = sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0));

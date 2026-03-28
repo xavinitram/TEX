@@ -1,0 +1,35 @@
+// Const Values — demonstrate const declarations for color grading
+//
+// The const keyword declares a compile-time constant. Once declared,
+// the value cannot be reassigned — attempting to write to a const
+// variable will produce an error. This is useful for defining fixed
+// reference values that should never change during evaluation.
+//
+// This example performs a 3-way color grade: shadows, midtones, and
+// highlights each receive a different color tint.
+
+f$shadow_thresh = 0.3;    // luminance below this is shadows
+f$high_thresh = 0.7;      // luminance above this is highlights
+
+// ── Const color definitions (cannot be reassigned) ──────────────
+const vec3 shadow_tint = vec3(0.15, 0.18, 0.35);    // cool blue shadows
+const vec3 mid_tint    = vec3(0.30, 0.28, 0.20);     // warm amber mids
+const vec3 high_tint   = vec3(1.0, 0.95, 0.85);      // warm white highlights
+const float tint_strength = 0.4;                      // how much tint to apply
+
+// NOTE: the following would cause an error because const prevents reassignment:
+//   shadow_tint = vec3(1.0, 0.0, 0.0);   // ERROR — cannot reassign const
+
+vec3 src = @image;
+float lum = luma(src);
+
+// Determine which zone this pixel falls into
+float s_weight = 1.0 - smoothstep($shadow_thresh - 0.05, $shadow_thresh + 0.05, lum);
+float h_weight = smoothstep($high_thresh - 0.05, $high_thresh + 0.05, lum);
+float m_weight = 1.0 - s_weight - h_weight;
+
+// Blend the zone tints
+vec3 tint = shadow_tint * s_weight + mid_tint * m_weight + high_tint * h_weight;
+
+// Apply: lerp between the source and the tinted version
+@OUT = lerp(src, src * tint / max(luma(tint), 0.01), tint_strength);

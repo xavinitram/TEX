@@ -44,7 +44,7 @@ from .ast_nodes import (
     BindingIndexAccess, BindingSampleAccess,
 )
 
-TYPE_KEYWORDS = {TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_VEC3, TokenType.KW_VEC4, TokenType.KW_STRING, TokenType.KW_MAT3, TokenType.KW_MAT4}
+TYPE_KEYWORDS = {TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_VEC2, TokenType.KW_VEC3, TokenType.KW_VEC4, TokenType.KW_STRING, TokenType.KW_MAT3, TokenType.KW_MAT4}
 
 COMPOUND_ASSIGN_OPS = {
     TokenType.PLUS_ASSIGN: "+",
@@ -188,6 +188,10 @@ class Parser:
     # -- Statements -----------------------------------------------------
 
     def parse_statement(self) -> ASTNode:
+        # const qualifier: const type_kw IDENT = expr;
+        if self.peek() == TokenType.KW_CONST:
+            return self._parse_const_decl()
+
         # Variable or array declaration: type_kw IDENT ...
         if self.peek() in TYPE_KEYWORDS:
             # But not if it's a cast like float(x) used as expression
@@ -269,6 +273,29 @@ class Parser:
         self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this variable declaration",
                    code="E2010", hint="Every statement in TEX ends with `;`.")
         return VarDecl(loc=loc, type_name=type_name, name=name_tok.value, initializer=initializer)
+
+    def _parse_const_decl(self) -> VarDecl:
+        loc = self.loc()
+        self.advance()  # consume 'const'
+        if self.peek() not in TYPE_KEYWORDS:
+            raise self._make_error(
+                "Expected a type after 'const'.",
+                self.current().loc, code="E2001",
+                hint="Use: const float x = 1.0; or const vec3 color = vec3(1.0);",
+            )
+        type_tok = self.advance()
+        name_tok = self.expect(TokenType.IDENT, "Expected a variable name after the type")
+        if not self.match(TokenType.ASSIGN):
+            raise self._make_error(
+                "A 'const' variable must be initialized.",
+                name_tok.loc, code="E2010",
+                hint="Add an initializer: const float x = 1.0;",
+            )
+        initializer = self.parse_expr()
+        self.expect(TokenType.SEMI, "Missing semicolon after const declaration",
+                   code="E2010", hint="Every statement in TEX ends with `;`.")
+        return VarDecl(loc=loc, type_name=type_tok.value, name=name_tok.value,
+                       initializer=initializer, is_const=True)
 
     def parse_function_def(self) -> FunctionDef:
         loc = self.loc()
@@ -510,6 +537,9 @@ class Parser:
                 value = self.parse_expr()
                 self.expect(TokenType.SEMI, f"It looks like there's a missing semicolon after this `{op}=` assignment",
                            code="E2010", hint="Every statement in TEX ends with `;`.")
+                # For scatter targets (@OUT[x,y] += val), preserve op for scatter_add_
+                if isinstance(expr, BindingIndexAccess):
+                    return Assignment(loc=loc, target=expr, value=value, op=op)
                 return Assignment(
                     loc=loc,
                     target=expr,
@@ -535,7 +565,7 @@ class Parser:
     def parse_ternary(self) -> ASTNode:
         expr = self.parse_logic_or()
         if self.match(TokenType.QUESTION):
-            loc = self.current().loc
+            loc = expr.loc
             true_expr = self.parse_expr()
             self.expect(TokenType.COLON, "I expected `:` in this ternary expression (condition ? then : else)")
             false_expr = self.parse_ternary()
@@ -695,7 +725,7 @@ class Parser:
             return BindingRef(loc=tok.loc, name=tok.value, kind="param", type_hint=tok.prefix)
 
         # Vector constructors: vec3(...) / vec4(...)
-        if tok.type in (TokenType.KW_VEC3, TokenType.KW_VEC4):
+        if tok.type in (TokenType.KW_VEC2, TokenType.KW_VEC3, TokenType.KW_VEC4):
             return self._parse_vec_constructor()
 
         # Matrix constructors: mat3(...) / mat4(...)
@@ -724,7 +754,7 @@ class Parser:
 
     def _parse_vec_constructor(self) -> VecConstructor:
         tok = self.advance()  # vec3 or vec4
-        size = 3 if tok.type == TokenType.KW_VEC3 else 4
+        size = 2 if tok.type == TokenType.KW_VEC2 else 3 if tok.type == TokenType.KW_VEC3 else 4
         self.expect(TokenType.LPAREN, f"Expected '(' after {tok.value}")
         args: list[ASTNode] = []
         if self.peek() != TokenType.RPAREN:

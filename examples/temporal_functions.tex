@@ -1,14 +1,20 @@
-// Temporal processing with user functions and binding access
-// Connect an image batch or animation to @frames
+// Temporal processing — motion-adaptive temporal smoothing
+//
+// Demonstrates user-defined functions, temporal frame access, and
+// multi-output bindings. Computes a 5-frame weighted average and a
+// motion mask, then blends: static areas get smoothed, moving areas
+// stay sharp.
+//
+// Connect an image batch or animation to @frames.
+//
+// Outputs: @stabilized (vec3), m@motion_mask (float)
 
 vec4 frame_at(int offset) {
     return @frames[ix, iy, fi + offset];
 }
 
 float temporal_diff(int offset) {
-    vec4 curr = frame_at(0);
-    vec4 other = frame_at(offset);
-    vec3 diff = curr.rgb - other.rgb;
+    vec3 diff = frame_at(0).rgb - frame_at(offset).rgb;
     return length(diff);
 }
 
@@ -26,4 +32,4 @@ m@motion_mask = clamp(motion * 3.0, 0.0, 1.0);
 
 // Blend: static areas get smoothed, moving areas keep sharp
 float blend = smoothstep(0.05, 0.2, motion);
-@stabilized = lerp(avg, center, blend);
+@stabilized = lerp(avg, center, blend).rgb;

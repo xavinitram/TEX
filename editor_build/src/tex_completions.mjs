@@ -19,6 +19,7 @@ const STDLIB_COMPLETIONS = [
     { label: "acos", detail: "(x)", info: "Arccosine" },
     { label: "atan", detail: "(x)", info: "Arctangent" },
     { label: "atan2", detail: "(y, x)", info: "Two-argument arctangent" },
+    { label: "sincos", detail: "(x)", info: "Returns vec2(sin(x), cos(x))" },
     { label: "sinh", detail: "(x)", info: "Hyperbolic sine" },
     { label: "cosh", detail: "(x)", info: "Hyperbolic cosine" },
     { label: "tanh", detail: "(x)", info: "Hyperbolic tangent" },
@@ -158,7 +159,10 @@ const VARIABLE_COMPLETIONS = [
     { label: "ic", type: "variable", info: "Latent channel count (0 for images)" },
     { label: "fi", type: "variable", info: "Frame/batch index (0 to B-1)" },
     { label: "fn", type: "variable", info: "Total frame/batch count" },
+    { label: "px", type: "variable", info: "Pixel step in x: 1.0 / iw" },
+    { label: "py", type: "variable", info: "Pixel step in y: 1.0 / ih" },
     { label: "PI", type: "constant", info: "3.14159..." },
+    { label: "TAU", type: "constant", info: "6.28318... (2 * PI)" },
     { label: "E", type: "constant", info: "2.71828..." },
 ];
 

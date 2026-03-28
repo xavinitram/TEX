@@ -1,0 +1,21 @@
+// Alpha Over — composite foreground over background using a mask
+//
+// Standard over compositing:
+//   result = fg * alpha + bg * (1 - alpha)
+//
+// The mask input uses the m@ prefix type hint, which tells TEX Wrangle
+// the binding expects a single-channel mask (MASK socket type).
+
+f$mix = 1.0;    // overall blend strength (0 = bg only, 1 = full comp)
+
+vec3 fg = @fg;
+vec3 bg = @bg;
+float alpha = m@mask;
+
+// Scale the mask by the mix parameter
+alpha = alpha * $mix;
+
+// Standard over operation
+vec3 result = fg * alpha + bg * (1.0 - alpha);
+
+@OUT = result;

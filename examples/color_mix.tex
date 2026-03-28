@@ -1,5 +1,8 @@
-// Mix two images based on a mask or blend factor
-// Connect images to @base and @overlay
-// Connect a FLOAT or MASK to @blend (0 = all base, 1 = all overlay)
+// Color Mix — blend two images using a mask
+//
+// Linearly interpolates between @base and @overlay using m@blend as
+// the mix factor (0 = all base, 1 = all overlay).
+//
+// Connect @base and @overlay to RGB images, m@blend to a mask or float.
 
-@OUT = lerp(@base, @overlay, @blend);
+@OUT = lerp(@base.rgb, @overlay.rgb, m@blend);

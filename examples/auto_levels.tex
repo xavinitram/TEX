@@ -1,5 +1,12 @@
-// Auto-levels: normalize image to [0,1] range
+// Auto Levels — normalize image channels to the full [0,1] range
+//
+// Computes the per-channel min and max across the entire image, then
+// remaps so that the darkest value maps to 0 and the brightest to 1.
+// Uses sdiv() (safe division) to avoid divide-by-zero on flat channels.
+//
+// Connect @image to any RGB input.
 
-vec4 lo = img_min(@image);
-vec4 hi = img_max(@image);
-@OUT = sdiv(@image - lo, hi - lo);
+vec3 lo = img_min(@image).rgb;
+vec3 hi = img_max(@image).rgb;
+vec3 src = @image.rgb;
+@OUT = sdiv(src - lo, hi - lo);

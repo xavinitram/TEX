@@ -1,0 +1,10 @@
+// Mipmap Blur — progressive vertical blur using mipmap levels
+//
+// The bottom of the image is sharp (LOD 0) and blur increases
+// toward the top, simulating a ground-plane depth-of-field look.
+
+f$strength = 5.0;  // maximum blur (mip levels at the top edge)
+
+float lod = (1.0 - v) * $strength;
+
+@OUT = sample_mip(@image, u, v, lod);

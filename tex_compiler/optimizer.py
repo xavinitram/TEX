@@ -4,6 +4,9 @@ TEX Optimizer — AST transformation passes for compile-time optimization.
 Passes:
   1. Constant folding: evaluate expressions with all-literal operands at compile time
   2. Algebraic simplification: x*0 -> 0, x*1 -> x, pow(x,2) -> x*x, etc.
+  3. Dead code elimination
+  4. Common Subexpression Elimination (CSE)
+  5. Loop-Invariant Code Motion (LICM): hoist pure expressions out of loops
 
 All passes preserve semantic equivalence. Applied after type checking, before
 interpretation. Operates on the AST in-place (mutates nodes).
@@ -18,6 +21,7 @@ from .ast_nodes import (
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor,
     MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral,
+    try_extract_static_range,
 )
 
 # Pure math functions safe for constant folding (no side effects, deterministic)
@@ -67,6 +71,12 @@ def optimize(program: Program) -> Program:
     # Pass 3: common subexpression elimination
     program.statements = _eliminate_common_subexpressions(program.statements)
 
+    # Pass 4: loop-invariant code motion
+    program.statements = _hoist_loop_invariants(program.statements)
+
+    # Pass 5: small loop unrolling (after LICM so hoisted vars are already out)
+    program.statements = _unroll_small_loops(program.statements)
+
     return program
 
 
@@ -80,6 +90,7 @@ def _opt_stmt(stmt: ASTNode) -> ASTNode:
         return stmt
 
     if isinstance(stmt, Assignment):
+        stmt.target = _opt_expr(stmt.target)
         stmt.value = _opt_expr(stmt.value)
         return stmt
 
@@ -106,8 +117,11 @@ def _opt_stmt(stmt: ASTNode) -> ASTNode:
         return stmt
 
     if isinstance(stmt, ArrayDecl):
-        if stmt.initializer and isinstance(stmt.initializer, ArrayLiteral):
-            stmt.initializer.elements = [_opt_expr(e) for e in stmt.initializer.elements]
+        if stmt.initializer:
+            if isinstance(stmt.initializer, ArrayLiteral):
+                stmt.initializer.elements = [_opt_expr(e) for e in stmt.initializer.elements]
+            else:
+                stmt.initializer = _opt_expr(stmt.initializer)
         return stmt
 
     if isinstance(stmt, FunctionDef):
@@ -153,11 +167,20 @@ def _opt_expr(expr: ASTNode) -> ASTNode:
         expr.args = [_opt_expr(a) for a in expr.args]
         return expr
 
+    if isinstance(expr, MatConstructor):
+        expr.args = [_opt_expr(a) for a in expr.args]
+        return expr
+
     if isinstance(expr, CastExpr):
         expr.expr = _opt_expr(expr.expr)
         return expr
 
+    if isinstance(expr, ChannelAccess):
+        expr.object = _opt_expr(expr.object)
+        return expr
+
     if isinstance(expr, ArrayIndexAccess):
+        expr.array = _opt_expr(expr.array)
         expr.index = _opt_expr(expr.index)
         return expr
 
@@ -169,7 +192,7 @@ def _opt_expr(expr: ASTNode) -> ASTNode:
         expr.args = [_opt_expr(a) for a in expr.args]
         return expr
 
-    # NumberLiteral, StringLiteral, Identifier, BindingRef, ChannelAccess — leaf nodes
+    # NumberLiteral, StringLiteral, Identifier, BindingRef — leaf nodes
     return expr
 
 
@@ -294,6 +317,13 @@ def _fold_function(node: FunctionCall) -> ASTNode:
         if exp == 3.0:
             x_sq = BinOp(loc=node.loc, op="*", left=args[0], right=args[0])
             return BinOp(loc=node.loc, op="*", left=x_sq, right=args[0])
+        # pow(x, 0.5) -> sqrt(x)
+        if exp == 0.5:
+            return FunctionCall(loc=node.loc, name="sqrt", args=[args[0]])
+        # pow(x, -1) -> 1 / x
+        if exp == -1.0:
+            return BinOp(loc=node.loc, op="/",
+                         left=_make_num(1.0, node.loc), right=args[0])
 
     # lerp(a, b, 0) -> a, lerp(a, b, 1) -> b
     if name in ("lerp", "mix") and len(args) == 3 and _is_num_lit(args[2]):
@@ -302,6 +332,18 @@ def _fold_function(node: FunctionCall) -> ASTNode:
             return args[0]
         if t == 1.0:
             return args[1]
+
+    # clamp(x, 0, 1) -> saturate-style (still clamp, but note for future vectorization)
+    # abs(x) where x is already abs(y) -> abs(y) (idempotent, handled by constant fold)
+
+    # sqrt(x*x) -> abs(x) — only when the argument is exactly x*x
+    if name == "sqrt" and len(args) == 1:
+        arg = args[0]
+        if isinstance(arg, BinOp) and arg.op == "*":
+            # Check if both sides are the same identifier
+            if (isinstance(arg.left, Identifier) and isinstance(arg.right, Identifier)
+                    and arg.left.name == arg.right.name):
+                return FunctionCall(loc=node.loc, name="abs", args=[arg.left])
 
     # Full constant fold: all args are literals, function is pure
     if all(_is_num_lit(a) for a in args):
@@ -380,13 +422,17 @@ def _collect_used_in_stmt(stmt: ASTNode, used: set[str]):
 
     elif isinstance(stmt, Assignment):
         # The target Identifier is a WRITE, not a read
-        # But ChannelAccess reads the base, and ArrayIndexAccess reads the index
+        # But ChannelAccess reads the base, ArrayIndexAccess reads the index,
+        # and BindingIndexAccess reads its coordinate arguments
         target = stmt.target
         if isinstance(target, ChannelAccess):
             _collect_used_in_expr(target.object, used)
         elif isinstance(target, ArrayIndexAccess):
             _collect_used_in_expr(target.array, used)
             _collect_used_in_expr(target.index, used)
+        elif isinstance(target, BindingIndexAccess):
+            for arg in target.args:
+                _collect_used_in_expr(arg, used)
         _collect_used_in_expr(stmt.value, used)
 
     elif isinstance(stmt, IfElse):
@@ -727,63 +773,463 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode]) -> list[ASTNode]:
 
     # Build replacement map and generate temp VarDecls
     # We need to find the actual expression node for each duplicate hash
-    # Walk the statements again to find first occurrence of each duplicate
-    first_occurrence: dict[str, ASTNode] = {}  # hash -> first expr node
+    # Walk the statements again to find first occurrence of each duplicate,
+    # tracking which statement index it was found in so we can insert the
+    # temp decl just before that statement (not at the top of the block).
+    first_occurrence: dict[str, tuple[ASTNode, int]] = {}  # hash -> (expr, stmt_index)
 
-    def _find_first(expr: ASTNode):
+    def _find_first(expr: ASTNode, stmt_idx: int):
         h = _expr_hash(expr)
         if h is not None and h in duplicates and h not in first_occurrence:
-            first_occurrence[h] = expr
+            first_occurrence[h] = (expr, stmt_idx)
             # Don't recurse into children of a found duplicate —
             # we want the outermost match
             return
         if isinstance(expr, BinOp):
-            _find_first(expr.left)
-            _find_first(expr.right)
+            _find_first(expr.left, stmt_idx)
+            _find_first(expr.right, stmt_idx)
         elif isinstance(expr, UnaryOp):
-            _find_first(expr.operand)
+            _find_first(expr.operand, stmt_idx)
         elif isinstance(expr, FunctionCall):
             for a in expr.args:
-                _find_first(a)
+                _find_first(a, stmt_idx)
         elif isinstance(expr, VecConstructor):
             for a in expr.args:
-                _find_first(a)
+                _find_first(a, stmt_idx)
         elif isinstance(expr, ChannelAccess):
-            _find_first(expr.object)
+            _find_first(expr.object, stmt_idx)
         elif isinstance(expr, CastExpr):
-            _find_first(expr.expr)
+            _find_first(expr.expr, stmt_idx)
         elif isinstance(expr, TernaryOp):
-            _find_first(expr.condition)
-            _find_first(expr.true_expr)
-            _find_first(expr.false_expr)
+            _find_first(expr.condition, stmt_idx)
+            _find_first(expr.true_expr, stmt_idx)
+            _find_first(expr.false_expr, stmt_idx)
 
-    for stmt in stmts:
+    for idx, stmt in enumerate(stmts):
         if isinstance(stmt, VarDecl) and stmt.initializer:
-            _find_first(stmt.initializer)
+            _find_first(stmt.initializer, idx)
         elif isinstance(stmt, Assignment):
-            _find_first(stmt.value)
+            _find_first(stmt.value, idx)
         elif isinstance(stmt, ExprStatement):
-            _find_first(stmt.expr)
+            _find_first(stmt.expr, idx)
 
     if not first_occurrence:
         return stmts
 
     # Assign temp variable names and build replacements
     replacements: dict[str, str] = {}  # hash -> temp var name
-    temp_decls: list[VarDecl] = []
-    for i, (h, expr_node) in enumerate(first_occurrence.items()):
+    # Group CSE decls by the statement index they should be inserted before
+    insert_before: dict[int, list[VarDecl]] = {}  # stmt_index -> [VarDecl, ...]
+    for i, (h, (expr_node, stmt_idx)) in enumerate(first_occurrence.items()):
         temp_name = f"_cse{i}"
         replacements[h] = temp_name
-        temp_decls.append(VarDecl(
+        decl = VarDecl(
             loc=expr_node.loc,
             type_name="float",  # Type doesn't matter at this stage — type checker already ran
             name=temp_name,
             initializer=expr_node,
-        ))
+        )
+        insert_before.setdefault(stmt_idx, []).append(decl)
 
     # Replace all occurrences in all statements
     for stmt in stmts:
         _replace_in_stmt(stmt, replacements)
 
-    # Insert temp decls at the beginning of the block
-    return temp_decls + stmts
+    # Insert temp decls just before the statement that first uses them
+    result: list[ASTNode] = []
+    for idx, stmt in enumerate(stmts):
+        if idx in insert_before:
+            result.extend(insert_before[idx])
+        result.append(stmt)
+    return result
+
+
+# ── Loop-Invariant Code Motion (LICM) ────────────────────────────────
+
+# Minimum expression depth to consider hoisting (avoid trivial hoists)
+_LICM_MIN_DEPTH = 2
+
+
+def _collect_written_vars(stmts: list[ASTNode]) -> set[str]:
+    """Collect all variable names written (assigned/declared) in a statement list."""
+    written: set[str] = set()
+    for stmt in stmts:
+        _collect_written_in_stmt(stmt, written)
+    return written
+
+
+def _collect_written_in_stmt(stmt: ASTNode, written: set[str]):
+    """Recursively collect written variable names."""
+    if isinstance(stmt, VarDecl):
+        written.add(stmt.name)
+    elif isinstance(stmt, Assignment):
+        target = stmt.target
+        if isinstance(target, Identifier):
+            written.add(target.name)
+        elif isinstance(target, BindingRef):
+            written.add(target.name)
+        elif isinstance(target, ChannelAccess):
+            obj = target.object
+            if isinstance(obj, Identifier):
+                written.add(obj.name)
+            elif isinstance(obj, BindingRef):
+                written.add(obj.name)
+        elif isinstance(target, ArrayIndexAccess) and isinstance(target.array, Identifier):
+            written.add(target.array.name)
+        elif isinstance(target, BindingIndexAccess) and isinstance(target.binding, BindingRef):
+            written.add(target.binding.name)
+    elif isinstance(stmt, ArrayDecl):
+        written.add(stmt.name)
+    elif isinstance(stmt, IfElse):
+        for s in stmt.then_body:
+            _collect_written_in_stmt(s, written)
+        for s in stmt.else_body:
+            _collect_written_in_stmt(s, written)
+    elif isinstance(stmt, ForLoop):
+        _collect_written_in_stmt(stmt.init, written)
+        _collect_written_in_stmt(stmt.update, written)
+        for s in stmt.body:
+            _collect_written_in_stmt(s, written)
+    elif isinstance(stmt, WhileLoop):
+        for s in stmt.body:
+            _collect_written_in_stmt(s, written)
+    elif isinstance(stmt, FunctionDef):
+        for s in stmt.body:
+            _collect_written_in_stmt(s, written)
+
+
+def _expr_reads_vars(expr: ASTNode) -> set[str]:
+    """Collect all variable names read by an expression."""
+    names: set[str] = set()
+    _collect_used_in_expr(expr, names)
+    return names
+
+
+def _is_pure_for_licm(expr: ASTNode) -> bool:
+    """Check if an expression is pure enough for LICM hoisting.
+
+    More permissive than _has_side_effects: allows known-pure stdlib functions
+    (sin, cos, sqrt, etc.) but rejects sampling, binding access, and user functions.
+    """
+    if isinstance(expr, FunctionCall):
+        if expr.name not in _CSE_PURE_FUNCTIONS:
+            return False
+        return all(_is_pure_for_licm(a) for a in expr.args)
+    if isinstance(expr, BinOp):
+        return _is_pure_for_licm(expr.left) and _is_pure_for_licm(expr.right)
+    if isinstance(expr, UnaryOp):
+        return _is_pure_for_licm(expr.operand)
+    if isinstance(expr, TernaryOp):
+        return (_is_pure_for_licm(expr.condition) and
+                _is_pure_for_licm(expr.true_expr) and
+                _is_pure_for_licm(expr.false_expr))
+    if isinstance(expr, VecConstructor):
+        return all(_is_pure_for_licm(a) for a in expr.args)
+    if isinstance(expr, CastExpr):
+        return _is_pure_for_licm(expr.expr)
+    if isinstance(expr, ChannelAccess):
+        return _is_pure_for_licm(expr.object)
+    if isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
+        return False  # Sampling is not pure for LICM
+    if isinstance(expr, (NumberLiteral, StringLiteral, Identifier, BindingRef)):
+        return True
+    return False
+
+
+def _is_loop_invariant(expr: ASTNode, modified: set[str]) -> bool:
+    """Check if an expression is loop-invariant (doesn't depend on modified vars).
+
+    An expression is loop-invariant if:
+    - It is pure (no side effects, no sampling)
+    - None of its referenced variables are in the modified set
+    - It has sufficient depth to be worth hoisting
+    """
+    if not _is_pure_for_licm(expr):
+        return False
+    if _expr_depth(expr) < _LICM_MIN_DEPTH:
+        return False
+    reads = _expr_reads_vars(expr)
+    return reads.isdisjoint(modified)
+
+
+def _extract_invariant_subexpr(expr: ASTNode, modified: set[str],
+                                hoisted: list[tuple[str, ASTNode]],
+                                counter: list[int]) -> ASTNode:
+    """Walk an expression tree and replace loop-invariant subtrees with temp vars.
+
+    Replaces the largest (outermost) invariant subtrees first. If the entire
+    expression is invariant, replaces the whole thing. Otherwise recurses into
+    children to find smaller invariant sub-expressions.
+    """
+    # Check if the entire expression is invariant
+    if _is_loop_invariant(expr, modified):
+        temp_name = f"_licm{counter[0]}"
+        counter[0] += 1
+        hoisted.append((temp_name, expr))
+        return Identifier(loc=expr.loc, name=temp_name)
+
+    # Otherwise recurse into children to find invariant sub-expressions
+    if isinstance(expr, BinOp):
+        expr.left = _extract_invariant_subexpr(expr.left, modified, hoisted, counter)
+        expr.right = _extract_invariant_subexpr(expr.right, modified, hoisted, counter)
+    elif isinstance(expr, UnaryOp):
+        expr.operand = _extract_invariant_subexpr(expr.operand, modified, hoisted, counter)
+    elif isinstance(expr, FunctionCall):
+        expr.args = [_extract_invariant_subexpr(a, modified, hoisted, counter) for a in expr.args]
+    elif isinstance(expr, VecConstructor):
+        expr.args = [_extract_invariant_subexpr(a, modified, hoisted, counter) for a in expr.args]
+    elif isinstance(expr, TernaryOp):
+        expr.condition = _extract_invariant_subexpr(expr.condition, modified, hoisted, counter)
+        expr.true_expr = _extract_invariant_subexpr(expr.true_expr, modified, hoisted, counter)
+        expr.false_expr = _extract_invariant_subexpr(expr.false_expr, modified, hoisted, counter)
+    elif isinstance(expr, CastExpr):
+        expr.expr = _extract_invariant_subexpr(expr.expr, modified, hoisted, counter)
+    elif isinstance(expr, ChannelAccess):
+        expr.object = _extract_invariant_subexpr(expr.object, modified, hoisted, counter)
+
+    return expr
+
+
+def _licm_stmt(stmt: ASTNode, modified: set[str],
+               hoisted: list[tuple[str, ASTNode]], counter: list[int]):
+    """Extract loop-invariant expressions from a single statement in a loop body."""
+    if isinstance(stmt, VarDecl):
+        if stmt.initializer:
+            stmt.initializer = _extract_invariant_subexpr(
+                stmt.initializer, modified, hoisted, counter)
+    elif isinstance(stmt, Assignment):
+        stmt.value = _extract_invariant_subexpr(stmt.value, modified, hoisted, counter)
+    elif isinstance(stmt, ExprStatement):
+        stmt.expr = _extract_invariant_subexpr(stmt.expr, modified, hoisted, counter)
+    elif isinstance(stmt, ReturnStmt):
+        if stmt.value:
+            stmt.value = _extract_invariant_subexpr(stmt.value, modified, hoisted, counter)
+    elif isinstance(stmt, IfElse):
+        stmt.condition = _extract_invariant_subexpr(stmt.condition, modified, hoisted, counter)
+        for s in stmt.then_body:
+            _licm_stmt(s, modified, hoisted, counter)
+        for s in stmt.else_body:
+            _licm_stmt(s, modified, hoisted, counter)
+
+
+def _licm_loop(loop: ForLoop | WhileLoop, counter: list[int]) -> list[ASTNode]:
+    """Apply LICM to a single loop. Returns [hoisted_decls..., loop]."""
+    # Collect all variables written inside the loop body
+    modified = _collect_written_vars(loop.body)
+
+    # For for-loops, the loop variable and update target are also modified
+    if isinstance(loop, ForLoop):
+        if isinstance(loop.init, VarDecl):
+            modified.add(loop.init.name)
+        if isinstance(loop.update, Assignment) and isinstance(loop.update.target, Identifier):
+            modified.add(loop.update.target.name)
+
+    # Extract invariant sub-expressions from body statements
+    hoisted: list[tuple[str, ASTNode]] = []
+    for stmt in loop.body:
+        _licm_stmt(stmt, modified, hoisted, counter)
+
+    if not hoisted:
+        return [loop]
+
+    # Create VarDecl nodes for hoisted expressions
+    pre_loop: list[ASTNode] = []
+    for temp_name, expr_node in hoisted:
+        pre_loop.append(VarDecl(
+            loc=expr_node.loc,
+            type_name="float",  # Type doesn't matter — type checker already ran
+            name=temp_name,
+            initializer=expr_node,
+        ))
+
+    return pre_loop + [loop]
+
+
+def _hoist_loop_invariants(stmts: list[ASTNode], counter: list[int] | None = None) -> list[ASTNode]:
+    """LICM pass: hoist loop-invariant expressions out of for/while loops.
+
+    Scans statement lists for loops, identifies pure expressions that don't
+    depend on variables modified in the loop, and hoists them to temp variables
+    before the loop.
+    """
+    if counter is None:
+        counter = [0]  # top-level call creates the counter
+    result: list[ASTNode] = []
+
+    for stmt in stmts:
+        # Recurse into compound statement bodies first
+        if isinstance(stmt, IfElse):
+            stmt.then_body = _hoist_loop_invariants(stmt.then_body, counter)
+            stmt.else_body = _hoist_loop_invariants(stmt.else_body, counter)
+            result.append(stmt)
+        elif isinstance(stmt, FunctionDef):
+            stmt.body = _hoist_loop_invariants(stmt.body, counter)
+            result.append(stmt)
+        elif isinstance(stmt, ForLoop):
+            # Recurse into nested loops first
+            stmt.body = _hoist_loop_invariants(stmt.body, counter)
+            # Then hoist invariants from this loop
+            result.extend(_licm_loop(stmt, counter))
+        elif isinstance(stmt, WhileLoop):
+            stmt.body = _hoist_loop_invariants(stmt.body, counter)
+            result.extend(_licm_loop(stmt, counter))
+        else:
+            result.append(stmt)
+
+    return result
+
+
+# ── Small Loop Unrolling ──────────────────────────────────────────────
+
+_UNROLL_MAX_ITERS = 8
+_UNROLL_MAX_BODY_STMTS = 6  # Don't unroll large loop bodies
+
+
+def _contains_break_continue(stmts: list[ASTNode]) -> bool:
+    """Check if any statement contains break or continue."""
+    for stmt in stmts:
+        if isinstance(stmt, (BreakStmt, ContinueStmt)):
+            return True
+        if isinstance(stmt, IfElse):
+            if _contains_break_continue(stmt.then_body):
+                return True
+            if _contains_break_continue(stmt.else_body):
+                return True
+        # break/continue in nested loops don't affect the outer loop
+    return False
+
+
+def _subst_expr(expr: ASTNode, var_name: str, value: float) -> ASTNode:
+    """Substitute all occurrences of var_name with a NumberLiteral in an expression.
+
+    Returns a new expression (does not mutate the original).
+    """
+    if isinstance(expr, Identifier) and expr.name == var_name:
+        return NumberLiteral(loc=expr.loc, value=value)
+    if isinstance(expr, BinOp):
+        return BinOp(loc=expr.loc, op=expr.op,
+                     left=_subst_expr(expr.left, var_name, value),
+                     right=_subst_expr(expr.right, var_name, value))
+    if isinstance(expr, UnaryOp):
+        return UnaryOp(loc=expr.loc, op=expr.op,
+                       operand=_subst_expr(expr.operand, var_name, value))
+    if isinstance(expr, FunctionCall):
+        return FunctionCall(loc=expr.loc, name=expr.name,
+                            args=[_subst_expr(a, var_name, value) for a in expr.args])
+    if isinstance(expr, TernaryOp):
+        return TernaryOp(loc=expr.loc,
+                         condition=_subst_expr(expr.condition, var_name, value),
+                         true_expr=_subst_expr(expr.true_expr, var_name, value),
+                         false_expr=_subst_expr(expr.false_expr, var_name, value))
+    if isinstance(expr, VecConstructor):
+        return VecConstructor(loc=expr.loc, size=expr.size,
+                              args=[_subst_expr(a, var_name, value) for a in expr.args])
+    if isinstance(expr, MatConstructor):
+        return MatConstructor(loc=expr.loc, size=expr.size,
+                              args=[_subst_expr(a, var_name, value) for a in expr.args])
+    if isinstance(expr, ArrayLiteral):
+        return ArrayLiteral(loc=expr.loc,
+                            elements=[_subst_expr(e, var_name, value) for e in expr.elements])
+    if isinstance(expr, CastExpr):
+        return CastExpr(loc=expr.loc, target_type=expr.target_type,
+                        expr=_subst_expr(expr.expr, var_name, value))
+    if isinstance(expr, ChannelAccess):
+        return ChannelAccess(loc=expr.loc, channels=expr.channels,
+                             object=_subst_expr(expr.object, var_name, value))
+    if isinstance(expr, ArrayIndexAccess):
+        return ArrayIndexAccess(loc=expr.loc,
+                                array=_subst_expr(expr.array, var_name, value),
+                                index=_subst_expr(expr.index, var_name, value))
+    if isinstance(expr, BindingIndexAccess):
+        return BindingIndexAccess(loc=expr.loc,
+                                  binding=_subst_expr(expr.binding, var_name, value),
+                                  args=[_subst_expr(a, var_name, value) for a in expr.args])
+    if isinstance(expr, BindingSampleAccess):
+        return BindingSampleAccess(loc=expr.loc,
+                                   binding=_subst_expr(expr.binding, var_name, value),
+                                   args=[_subst_expr(a, var_name, value) for a in expr.args])
+    # NumberLiteral, StringLiteral, BindingRef — no substitution needed
+    return expr
+
+
+def _subst_stmt(stmt: ASTNode, var_name: str, value: float) -> ASTNode:
+    """Substitute loop variable in a statement. Returns new statement."""
+    if isinstance(stmt, VarDecl):
+        init = _subst_expr(stmt.initializer, var_name, value) if stmt.initializer else None
+        return VarDecl(loc=stmt.loc, type_name=stmt.type_name, name=stmt.name,
+                       initializer=init, is_const=stmt.is_const)
+    if isinstance(stmt, Assignment):
+        new_target = _subst_expr(stmt.target, var_name, value)
+        new_value = _subst_expr(stmt.value, var_name, value)
+        return Assignment(loc=stmt.loc, target=new_target, value=new_value, op=stmt.op)
+    if isinstance(stmt, ExprStatement):
+        return ExprStatement(loc=stmt.loc, expr=_subst_expr(stmt.expr, var_name, value))
+    if isinstance(stmt, IfElse):
+        return IfElse(loc=stmt.loc,
+                      condition=_subst_expr(stmt.condition, var_name, value),
+                      then_body=[_subst_stmt(s, var_name, value) for s in stmt.then_body],
+                      else_body=[_subst_stmt(s, var_name, value) for s in stmt.else_body])
+    if isinstance(stmt, ReturnStmt):
+        val = _subst_expr(stmt.value, var_name, value) if stmt.value else None
+        return ReturnStmt(loc=stmt.loc, value=val)
+    if isinstance(stmt, ForLoop):
+        new_init = _subst_stmt(stmt.init, var_name, value)
+        new_cond = _subst_expr(stmt.condition, var_name, value)
+        new_update = _subst_stmt(stmt.update, var_name, value)
+        new_body = [_subst_stmt(s, var_name, value) for s in stmt.body]
+        return ForLoop(loc=stmt.loc, init=new_init, condition=new_cond,
+                       update=new_update, body=new_body)
+    if isinstance(stmt, WhileLoop):
+        new_cond = _subst_expr(stmt.condition, var_name, value)
+        new_body = [_subst_stmt(s, var_name, value) for s in stmt.body]
+        return WhileLoop(loc=stmt.loc, condition=new_cond, body=new_body)
+    if isinstance(stmt, ArrayDecl):
+        init = _subst_expr(stmt.initializer, var_name, value) if stmt.initializer else None
+        return ArrayDecl(loc=stmt.loc, element_type_name=stmt.element_type_name,
+                         name=stmt.name, size=stmt.size, initializer=init)
+    return stmt
+
+
+def _unroll_small_loops(stmts: list[ASTNode]) -> list[ASTNode]:
+    """Unroll for-loops with a small static iteration count.
+
+    Replaces `for (int i = 0; i < N; i++) { body }` with N copies of `body`
+    where the loop variable is substituted with the iteration value.
+    Only applies when N <= _UNROLL_MAX_ITERS and body has no break/continue.
+    """
+    result: list[ASTNode] = []
+    for stmt in stmts:
+        # Recurse into compound statements
+        if isinstance(stmt, IfElse):
+            stmt.then_body = _unroll_small_loops(stmt.then_body)
+            stmt.else_body = _unroll_small_loops(stmt.else_body)
+            result.append(stmt)
+        elif isinstance(stmt, FunctionDef):
+            stmt.body = _unroll_small_loops(stmt.body)
+            result.append(stmt)
+        elif isinstance(stmt, ForLoop):
+            # Recurse into nested loops first
+            stmt.body = _unroll_small_loops(stmt.body)
+            # Try to unroll this loop
+            static = try_extract_static_range(stmt)
+            if (static is not None
+                    and len(stmt.body) <= _UNROLL_MAX_BODY_STMTS
+                    and not _contains_break_continue(stmt.body)):
+                var_name, start, stop, step = static
+                n_iters = len(range(start, stop, step))
+                if 0 < n_iters <= _UNROLL_MAX_ITERS:
+                    # Unroll: emit body N times with loop var substituted
+                    for i in range(start, stop, step):
+                        for body_stmt in stmt.body:
+                            unrolled = _subst_stmt(body_stmt, var_name, float(i))
+                            # Run constant folding on the substituted statement
+                            unrolled = _opt_stmt(unrolled)
+                            result.append(unrolled)
+                    continue
+            result.append(stmt)
+        elif isinstance(stmt, WhileLoop):
+            stmt.body = _unroll_small_loops(stmt.body)
+            result.append(stmt)
+        else:
+            result.append(stmt)
+    return result

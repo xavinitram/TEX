@@ -10,8 +10,10 @@ Resolves:
 
 Type promotion rules:
   int -> float (implicit)
+  float -> vec2 (broadcast)
   float -> vec3 (broadcast)
   float -> vec4 (broadcast)
+  vec2 -> vec3 (pads with 0)
   vec3 -> vec4 (adds alpha=1.0)
   vec4 -> vec3 (drops alpha) — only via explicit .rgb/.xyz swizzle
 
@@ -37,6 +39,7 @@ from .ast_nodes import (
 class TEXType(Enum):
     INT = "int"
     FLOAT = "float"
+    VEC2 = "vec2"
     VEC3 = "vec3"
     VEC4 = "vec4"
     MAT3 = "mat3"
@@ -51,7 +54,7 @@ class TEXType(Enum):
 
     @property
     def is_vector(self) -> bool:
-        return self in (TEXType.VEC3, TEXType.VEC4)
+        return self in (TEXType.VEC2, TEXType.VEC3, TEXType.VEC4)
 
     @property
     def is_matrix(self) -> bool:
@@ -67,12 +70,14 @@ class TEXType(Enum):
 
     @property
     def is_numeric(self) -> bool:
-        return self in (TEXType.INT, TEXType.FLOAT, TEXType.VEC3, TEXType.VEC4,
-                        TEXType.MAT3, TEXType.MAT4)
+        return self in (TEXType.INT, TEXType.FLOAT, TEXType.VEC2, TEXType.VEC3,
+                        TEXType.VEC4, TEXType.MAT3, TEXType.MAT4)
 
     @property
     def channels(self) -> int:
-        if self == TEXType.VEC3:
+        if self == TEXType.VEC2:
+            return 2
+        elif self == TEXType.VEC3:
             return 3
         elif self == TEXType.VEC4:
             return 4
@@ -102,12 +107,16 @@ class TEXArrayType:
 TYPE_NAME_MAP = {
     "float": TEXType.FLOAT,
     "int": TEXType.INT,
+    "vec2": TEXType.VEC2,
     "vec3": TEXType.VEC3,
     "vec4": TEXType.VEC4,
     "mat3": TEXType.MAT3,
     "mat4": TEXType.MAT4,
     "string": TEXType.STRING,
 }
+
+_VEC_RANK = {TEXType.VEC2: 0, TEXType.VEC3: 1, TEXType.VEC4: 2}
+_VEC_SIZE_TYPE = {2: TEXType.VEC2, 3: TEXType.VEC3, 4: TEXType.VEC4}
 
 # Valid swizzle characters and their meanings
 CHANNEL_MAP = {
@@ -129,11 +138,15 @@ BINDING_HINT_TYPES = {
     "f": TEXType.FLOAT,
     "i": TEXType.INT,
     "v": TEXType.VEC3,
+    "v2": TEXType.VEC2,
+    "v3": TEXType.VEC3,
     "v4": TEXType.VEC4,
     "s": TEXType.STRING,
     "img": TEXType.VEC3,   # IMAGE → vec3 at the tensor level
     "m": TEXType.FLOAT,    # MASK → float at the tensor level
     "l": TEXType.VEC4,     # LATENT → vec4 at the tensor level
+    "c": TEXType.VEC3,     # Color → RGB vec3 (hex string in widget)
+    "b": TEXType.INT,      # Boolean → 0/1 checkbox
 }
 
 
@@ -209,6 +222,10 @@ class TypeChecker:
     # Return type of the function currently being checked (None if not in a function)
     _current_function_return_type: TEXType | None = None
 
+    # Const variable scopes (parallel to _scopes) — tracks variables declared
+    # with 'const' qualifier so reassignment is rejected per-scope.
+    _const_scopes: list[set[str]] = field(default_factory=list)
+
     @property
     def inferred_out_type(self) -> TEXType | None:
         """Convenience: inferred type for @OUT binding."""
@@ -225,14 +242,17 @@ class TypeChecker:
         self.param_declarations = {}
         self._user_functions = {}
         self._current_function_return_type = None
+        self._const_scopes = [set()]
 
         # Pre-populate built-in variables
         builtins = {
             "ix": TEXType.FLOAT, "iy": TEXType.FLOAT,
             "iw": TEXType.FLOAT, "ih": TEXType.FLOAT,
             "u": TEXType.FLOAT, "v": TEXType.FLOAT,
+            "px": TEXType.FLOAT, "py": TEXType.FLOAT,
             "fi": TEXType.FLOAT, "fn": TEXType.FLOAT,
-            "PI": TEXType.FLOAT, "E": TEXType.FLOAT,
+            "PI": TEXType.FLOAT, "TAU": TEXType.FLOAT,
+            "E": TEXType.FLOAT,
             "ic": TEXType.FLOAT,
         }
         self._scopes[0].update(builtins)
@@ -274,10 +294,25 @@ class TypeChecker:
     def _push_scope(self):
         self._scopes.append({})
         self._array_scopes.append({})
+        self._const_scopes.append(set())
 
     def _pop_scope(self):
         self._scopes.pop()
         self._array_scopes.pop()
+        self._const_scopes.pop()
+
+    def _is_const(self, name: str) -> bool:
+        """Check if a variable is declared const, respecting shadowing.
+
+        Searches innermost scope first (matching _lookup_var).  If the
+        innermost scope that *declares* the variable also marks it const,
+        returns True.  A non-const redeclaration in an inner scope shadows
+        an outer const.
+        """
+        for scope, const_set in zip(reversed(self._scopes), reversed(self._const_scopes)):
+            if name in scope:
+                return name in const_set
+        return False
 
     def _lookup_array_info(self, name: str) -> TEXArrayType | None:
         for scope in reversed(self._array_scopes):
@@ -303,16 +338,16 @@ class TypeChecker:
         if a.is_string or b.is_string:
             return TEXType.STRING  # caller must validate context
         # int + float -> float
-        if {a, b} == {TEXType.INT, TEXType.FLOAT}:
+        if (a == TEXType.INT and b == TEXType.FLOAT) or (a == TEXType.FLOAT and b == TEXType.INT):
             return TEXType.FLOAT
         # scalar + vec -> vec (broadcast)
         if a.is_scalar and b.is_vector:
             return b
         if b.is_scalar and a.is_vector:
             return a
-        # vec3 + vec4 -> vec4 (promote vec3 to vec4 with alpha=1)
-        if {a, b} == {TEXType.VEC3, TEXType.VEC4}:
-            return TEXType.VEC4
+        # vec2 + vec3 -> vec3, vec2 + vec4 -> vec4, vec3 + vec4 -> vec4
+        if a in _VEC_RANK and b in _VEC_RANK:
+            return a if _VEC_RANK[a] >= _VEC_RANK[b] else b
         return TEXType.FLOAT  # fallback
 
     # -- Statement checking ---------------------------------------------
@@ -355,7 +390,7 @@ class TypeChecker:
         if declared_type is None:
             self._error(f"Unknown type name '{node.type_name}'.", node.loc,
                         code="E3100",
-                        hint="Try: float, int, vec3, vec4, mat3, mat4, or string.")
+                        hint="Try: float, int, vec2, vec3, vec4, mat3, mat4, or string.")
             return
 
         if node.initializer:
@@ -371,6 +406,8 @@ class TypeChecker:
 
         self._declare_var(node.name, declared_type, node.loc)
         self._set_type(node, declared_type)
+        if node.is_const:
+            self._const_scopes[-1].add(node.name)
 
     def _check_array_decl(self, node: ArrayDecl):
         """Type-check an array declaration."""
@@ -378,14 +415,14 @@ class TypeChecker:
         if elem_type is None:
             self._error(f"Unknown type name '{node.element_type_name}'.", node.loc,
                         code="E3100",
-                        hint="Try: float, int, vec3, vec4, mat3, mat4, or string.")
+                        hint="Try: float, int, vec2, vec3, vec4, mat3, mat4, or string.")
             return
         if elem_type in (TEXType.VOID, TEXType.ARRAY):
             self._error(
                 f"Arrays of '{node.element_type_name}' are not supported.",
                 node.loc,
                 code="E3101",
-                hint="Array elements must be float, int, vec3, vec4, or string.",
+                hint="Array elements must be float, int, vec2, vec3, vec4, or string.",
             )
             return
 
@@ -497,6 +534,16 @@ class TypeChecker:
                 )
             elif isinstance(node.default_expr, StringLiteral):
                 default_value = node.default_expr.value
+            elif isinstance(node.default_expr, VecConstructor):
+                # Extract component literals for vec/color param defaults
+                components = []
+                for arg in node.default_expr.args:
+                    if isinstance(arg, NumberLiteral):
+                        components.append(float(arg.value))
+                    else:
+                        break
+                if len(components) == len(node.default_expr.args):
+                    default_value = components
 
         # Register parameter
         self.param_declarations[node.name] = {
@@ -509,6 +556,21 @@ class TypeChecker:
     def _check_assignment(self, node: Assignment):
         target_type = self._check_expr(node.target)
         value_type = self._check_expr(node.value)
+
+        # Reject assignment to const variables
+        if isinstance(node.target, Identifier) and self._is_const(node.target.name):
+            self._error(
+                f"Variable '{node.target.name}' is declared as const and cannot be reassigned.",
+                node.loc, code="E3204",
+                hint="Remove the 'const' qualifier if you need to modify this variable.",
+            )
+        elif isinstance(node.target, ChannelAccess) and isinstance(node.target.object, Identifier):
+            if self._is_const(node.target.object.name):
+                self._error(
+                    f"Variable '{node.target.object.name}' is declared as const and cannot be modified.",
+                    node.loc, code="E3204",
+                    hint="Remove the 'const' qualifier if you need to modify this variable.",
+                )
 
         # Track @binding assignments as outputs (multi-output inference)
         binding_target = self._get_binding_target(node.target)
@@ -695,7 +757,7 @@ class TypeChecker:
         return_type = TYPE_NAME_MAP.get(node.return_type)
         if return_type is None:
             self._error(f"Unknown return type '{node.return_type}'.", node.loc, code="E3100",
-                        hint="Try: float, int, vec3, vec4, or string.")
+                        hint="Try: float, int, vec2, vec3, vec4, or string.")
             return
 
         param_types: list[tuple[TEXType, str]] = []
@@ -703,7 +765,7 @@ class TypeChecker:
             ptype = TYPE_NAME_MAP.get(pt)
             if ptype is None:
                 self._error(f"Unknown parameter type '{pt}'.", node.loc, code="E3100",
-                            hint="Try: float, int, vec3, vec4, or string.")
+                            hint="Try: float, int, vec2, vec3, vec4, or string.")
                 return
             param_types.append((ptype, pn))
 
@@ -929,12 +991,8 @@ class TypeChecker:
 
         n = len(channels)
         if n == 2:
-            # We don't have a vec2 type; treat as vec3 for now? No — error.
-            self._error(f"2-component swizzle '.{channels}' is not supported (TEX has no vec2 type).",
-                        node.loc, code="E3303",
-                        hint="Use a 3- or 4-component swizzle like .rgb or .rgba instead.")
-            self._set_type(node, TEXType.FLOAT)
-            return TEXType.FLOAT
+            self._set_type(node, TEXType.VEC2)
+            return TEXType.VEC2
         elif n == 3:
             self._set_type(node, TEXType.VEC3)
             return TEXType.VEC3
@@ -944,7 +1002,7 @@ class TypeChecker:
         else:
             self._error(f"Swizzle '.{channels}' has too many components ({len(channels)}).",
                         node.loc, code="E3303",
-                        hint="Swizzles must be 1, 3, or 4 components (e.g. .r, .rgb, .rgba).")
+                        hint="Swizzles must be 1–4 components (e.g. .r, .xy, .rgb, .rgba).")
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
 
@@ -1055,10 +1113,10 @@ class TypeChecker:
                     f"vec{node.size}() needs exactly {node.size} components, but got {total}.",
                     node.loc,
                     code="E3601",
-                    hint=f"Each scalar counts as 1, vec3 as 3, vec4 as 4. Adjust to total {node.size}.",
+                    hint=f"Each scalar counts as 1, vec2 as 2, vec3 as 3, vec4 as 4. Adjust to total {node.size}.",
                 )
 
-        t = TEXType.VEC3 if node.size == 3 else TEXType.VEC4
+        t = _VEC_SIZE_TYPE[node.size]
         self._set_type(node, t)
         return t
 
@@ -1313,11 +1371,8 @@ class TypeChecker:
         # scalar -> vec (broadcast)
         if target.is_vector and value.is_scalar:
             return True
-        # vec3 -> vec4 (add alpha)
-        if target == TEXType.VEC4 and value == TEXType.VEC3:
-            return True
-        # vec4 -> vec3 (drop alpha)
-        if target == TEXType.VEC3 and value == TEXType.VEC4:
+        # Any vector -> any vector (promotion or truncation via swizzle)
+        if target.is_vector and value.is_vector:
             return True
         return False
 
@@ -1332,16 +1387,19 @@ class TypeChecker:
             obj = target.object
             if isinstance(obj, BindingRef):
                 return obj
+        if isinstance(target, BindingIndexAccess):
+            if isinstance(target.binding, BindingRef):
+                return target.binding
         return None
 
     def _infer_binding_from_channel(self, target: ChannelAccess) -> TEXType:
-        """Infer binding type from channel assignment like @X.r = expr."""
+        """Infer binding type from channel assignment like @X.r = expr or @X.rgb = expr."""
         binding = target.object
         name = binding.name if isinstance(binding, BindingRef) else "OUT"
         channels = target.channels
 
         # .a or .w implies vec4 (alpha/w channel)
-        if len(channels) == 1 and channels in ("a", "w"):
+        if any(ch in ("a", "w") for ch in channels):
             return TEXType.VEC4
         # 4-component swizzle implies vec4
         if len(channels) >= 4:
@@ -1349,7 +1407,12 @@ class TypeChecker:
         # If already inferred as VEC4, keep it
         if self.assigned_bindings.get(name) == TEXType.VEC4:
             return TEXType.VEC4
-        # Default to VEC3 for .r, .g, .b, .x, .y, .z and 3-component swizzles
+        # 3-component → vec3, 2-component → vec3 (at minimum, since we need a displayable output)
+        if self.assigned_bindings.get(name) == TEXType.VEC3:
+            return TEXType.VEC3
+        if len(channels) >= 3:
+            return TEXType.VEC3
+        # Default to VEC3 for single/2-component channel assigns (.r, .xy, etc.)
         return TEXType.VEC3
 
     def _promote_out(self, current: TEXType, new: TEXType, loc: SourceLoc) -> TEXType:

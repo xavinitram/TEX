@@ -1,0 +1,24 @@
+// Temporal Median — median filter across frames
+// Extremely effective at removing flickering, random noise, and
+// transient artifacts from image sequences while preserving edges.
+// Connect an image batch or animation to @frames.
+//
+// Uses a 5-frame window centered on the current frame.
+// Each channel is sorted independently and the middle value is taken.
+
+float r[5];
+float g[5];
+float b[5];
+
+for (int i = 0; i < 5; i++) {
+    vec4 f = @frames[ix, iy, fi + i - 2];
+    r[i] = f.r;
+    g[i] = f.g;
+    b[i] = f.b;
+}
+
+r = sort(r);
+g = sort(g);
+b = sort(b);
+
+@OUT = vec3(r[2], g[2], b[2]);

@@ -1,0 +1,30 @@
+// Barrel Distortion — polynomial radial lens distortion
+//
+// Applies the standard Brown-Conrady distortion model:
+//   r' = r * (1 + k1*r^2 + k2*r^4)
+// Negative k1 creates barrel distortion (fish-eye), positive creates
+// pincushion. k2 adds a higher-order correction term.
+
+f$k1 = -0.3;    // 2nd-order radial coefficient (negative = barrel)
+f$k2 = 0.1;     // 4th-order radial coefficient
+
+// Center UVs so distortion radiates from the middle
+float cx = u - 0.5;
+float cy = v - 0.5;
+
+float r2 = cx * cx + cy * cy;
+float r4 = r2 * r2;
+
+// Distortion factor
+float distort = 1.0 + $k1 * r2 + $k2 * r4;
+
+// Apply distortion and shift back to UV space
+float du = cx * distort + 0.5;
+float dv = cy * distort + 0.5;
+
+// Clamp to bounds — pixels outside get black
+if (du < 0.0 || du > 1.0 || dv < 0.0 || dv > 1.0) {
+    @OUT = vec3(0.0);
+} else {
+    @OUT = sample(@image, du, dv).rgb;
+}

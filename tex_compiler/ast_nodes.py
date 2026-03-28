@@ -43,17 +43,24 @@ class Program(ASTNode):
 # ---------------------------------------------------------------------------
 @dataclass(slots=True)
 class VarDecl(ASTNode):
-    """Variable declaration: `float x = expr;` or `vec4 color;`"""
+    """Variable declaration: `float x = expr;` or `const vec4 color = expr;`"""
     type_name: str = ""          # "float", "int", "vec3", "vec4"
     name: str = ""
     initializer: Optional[ASTNode] = None
+    is_const: bool = False
 
 
 @dataclass(slots=True)
 class Assignment(ASTNode):
-    """Assignment: `x = expr;` or `@OUT = expr;` or `@A.r = expr;`"""
-    target: ASTNode = None       # Identifier, BindingRef, or ChannelAccess
+    """Assignment: `x = expr;` or `@OUT = expr;` or `@A.r = expr;`
+
+    For scatter compound assignments (@OUT[x,y] += val), op is set to the
+    operator ("+", "-", "*", "/") instead of desugaring, so the interpreter
+    can use scatter_add_ / index_put_ with accumulate=True.
+    """
+    target: ASTNode = None       # Identifier, BindingRef, ChannelAccess, or BindingIndexAccess
     value: ASTNode = None
+    op: Optional[str] = None     # None for =, "+" for +=, "-" for -=, "*" for *=, "/" for /=
 
 
 @dataclass(slots=True)

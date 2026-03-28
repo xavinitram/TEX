@@ -448,19 +448,26 @@ def _try_compile(
                     env["iw"] = torch.tensor(float(W), dtype=dtype, device=dev)
                 if "ih" in used:
                     env["ih"] = torch.tensor(float(H), dtype=dtype, device=dev)
+                if "px" in used:
+                    env["px"] = torch.tensor(1.0 / max(W, 1), dtype=dtype, device=dev)
+                if "py" in used:
+                    env["py"] = torch.tensor(1.0 / max(H, 1), dtype=dtype, device=dev)
                 if "fi" in used:
                     env["fi"] = torch.arange(B, dtype=dtype, device=dev).view(B, 1, 1)
                 if "fn" in used:
                     env["fn"] = torch.tensor(float(B), dtype=dtype, device=dev)
             else:
                 _scalar_defaults = {"ix": 0.0, "iy": 0.0, "u": 0.0, "v": 0.0,
-                                    "iw": 1.0, "ih": 1.0, "fi": 0.0, "fn": 1.0}
+                                    "iw": 1.0, "ih": 1.0, "px": 1.0, "py": 1.0,
+                                    "fi": 0.0, "fn": 1.0}
                 for name, val in _scalar_defaults.items():
                     if name in used:
                         env[name] = torch.tensor(val, device=dev)
 
             if "PI" in used:
                 env["PI"] = torch.tensor(math.pi, dtype=torch.float32, device=dev)
+            if "TAU" in used:
+                env["TAU"] = torch.tensor(math.tau, dtype=torch.float32, device=dev)
             if "E" in used:
                 env["E"] = torch.tensor(math.e, dtype=torch.float32, device=dev)
             if "ic" in used:

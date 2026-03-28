@@ -1,0 +1,66 @@
+// Film Sharpen — ratio-based sharpening with edge protection
+//
+// Inspired by professional film sharpening pipelines. Uses a multiplicative
+// ratio formula instead of the standard additive unsharp mask:
+//
+//   output = (original / blurred)^amount * blurred
+//
+// This is equivalent to working in log (density) space and naturally avoids
+// the negative values, dark halos, and hue inversions that plague linear
+// unsharp masks. Mipmap sampling provides the blur reference in O(1).
+//
+// Edge protection uses a bilateral-inspired weight that reduces sharpening
+// where local contrast is already high, preventing overshoot at boundaries.
+
+f$amount = 1.5;         // sharpen strength (0.5 = subtle, 3.0 = aggressive)
+f$radius = 8.0;         // blur radius for the reference image (pixels)
+f$edge_protect = 0.3;   // edge protection (0 = none, 1.0 = strong)
+i$luma_only = 1;         // 1 = sharpen luminance only, preserving color
+
+vec3 orig = @image;
+float eps = 1e-6;
+
+// ── Reference blur via 3x3 Gaussian at mip level ──────────────────
+// Uses the Gaussian-prefiltered pyramid for a smoother blur reference.
+// The 3x3 kernel further refines the profile.
+float lod = log2(max($radius, 1.0));
+float sx = $radius * px * 0.5;
+float sy = $radius * py * 0.5;
+
+vec3 blur = sample_mip_gauss(@image, u, v, lod) * 4.0;
+blur += sample_mip_gauss(@image, u - sx, v,      lod) * 2.0;
+blur += sample_mip_gauss(@image, u + sx, v,      lod) * 2.0;
+blur += sample_mip_gauss(@image, u,      v - sy, lod) * 2.0;
+blur += sample_mip_gauss(@image, u,      v + sy, lod) * 2.0;
+blur += sample_mip_gauss(@image, u - sx, v - sy, lod);
+blur += sample_mip_gauss(@image, u + sx, v - sy, lod);
+blur += sample_mip_gauss(@image, u - sx, v + sy, lod);
+blur += sample_mip_gauss(@image, u + sx, v + sy, lod);
+blur = blur * 0.0625;
+
+// ── Edge protection ───────────────────────────────────────────────
+// Bilateral-inspired attenuation: large orig-vs-blur difference means
+// we're at an edge — reduce sharpening to prevent halos.
+float diff = length(orig - blur);
+float edge_att = 1.0 / ($edge_protect * diff * diff * 100.0 + 1.0);
+float eff_amount = $amount * edge_att;
+
+// ── Ratio sharpening ─────────────────────────────────────────────
+// (orig/blur)^amount * blur  — multiplicative, always non-negative.
+// In smooth regions (orig ~ blur), ratio ~ 1 → minimal change.
+// In detail regions, ratio deviates → contrast enhancement.
+if ($luma_only > 0) {
+    // Sharpen luminance only, preserving original chrominance.
+    // This prevents color fringing from per-channel sharpening.
+    float orig_lum = luma(orig);
+    float blur_lum = luma(blur);
+    float sharp_lum = pow(max(orig_lum, eps) / max(blur_lum, eps), eff_amount) * blur_lum;
+    float scale = (orig_lum > eps) ? sharp_lum / orig_lum : 1.0;
+    @OUT = orig * scale;
+} else {
+    // Per-channel sharpening — stronger but may shift hue slightly
+    float rr = pow(max(orig.r, eps) / max(blur.r, eps), eff_amount) * blur.r;
+    float rg = pow(max(orig.g, eps) / max(blur.g, eps), eff_amount) * blur.g;
+    float rb = pow(max(orig.b, eps) / max(blur.b, eps), eff_amount) * blur.b;
+    @OUT = vec3(rr, rg, rb);
+}

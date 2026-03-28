@@ -9,7 +9,7 @@ executions call the function directly, eliminating:
   - Redundant dict lookups for env/bindings
 
 Falls back to None (caller uses tree-walking interpreter) for unsupported
-patterns: arrays, string operations, spatial if/else with complex merging.
+patterns: string operations, spatial if/else with complex merging.
 
 Break/continue handling: the codegen uses exception-based control flow
 (matching the interpreter) because Python's native 'continue' would skip
@@ -30,7 +30,8 @@ from ..tex_compiler.ast_nodes import (
     BindingIndexAccess, BindingSampleAccess,
     try_extract_static_range,
 )
-from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP
+from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
+from .interpreter import MAX_CALL_DEPTH
 
 
 class _Unsupported(Exception):
@@ -84,7 +85,7 @@ _INLINE_TORCH_1ARG: dict[str, str] = {
     "asin": "asin", "acos": "acos", "atan": "atan",
     "sinh": "sinh", "cosh": "cosh", "tanh": "tanh",
     "exp": "exp", "abs": "abs",
-    "floor": "floor", "ceil": "ceil", "round": "round",
+    "floor": "floor", "ceil": "ceil", "round": "round", "trunc": "trunc",
     "sign": "sign",
     "degrees": "rad2deg", "radians": "deg2rad",
 }
@@ -125,6 +126,10 @@ class _CodeGen:
         # Local variable mapping: TEX var name → Python local var name.
         # When set, Identifier emission uses locals instead of _env[name].
         self._local_vars: dict[str, str] = {}
+        # User-defined function names (populated during FunctionDef emission)
+        self._user_functions: set[str] = set()
+        # Track if we're inside a user function body (for return statements)
+        self._in_user_function: bool = False
 
     def _tmp(self) -> str:
         """Generate a unique temporary variable name."""
@@ -134,6 +139,17 @@ class _CodeGen:
     def _emit(self, line: str):
         """Emit a line of code at the current indentation level."""
         self._lines.append("    " * self._indent + line)
+
+    def _emit_spatial_branch(self, spatial_code: str, non_spatial_code: str):
+        """Emit an if _sp: / else: block with the given code for each branch."""
+        self._emit("if _sp:")
+        self._indent += 1
+        self._emit(spatial_code)
+        self._indent -= 1
+        self._emit("else:")
+        self._indent += 1
+        self._emit(non_spatial_code)
+        self._indent -= 1
 
     def _get_const(self, value: float) -> str:
         """Return a variable name for a numeric constant tensor.
@@ -222,9 +238,11 @@ class _CodeGen:
             else:
                 self._emit("raise _CgContinue()")
         elif isinstance(stmt, ArrayDecl):
-            raise _Unsupported("ArrayDecl")
-        elif isinstance(stmt, (FunctionDef, ReturnStmt)):
-            raise _Unsupported("UserFunction")
+            self._emit_array_decl(stmt)
+        elif isinstance(stmt, FunctionDef):
+            self._emit_function_def(stmt)
+        elif isinstance(stmt, ReturnStmt):
+            self._emit_return_stmt(stmt)
         else:
             raise _Unsupported(f"Unknown statement: {type(stmt).__name__}")
 
@@ -245,19 +263,283 @@ class _CodeGen:
                 self._emit(f"{tgt} = ''")
             elif declared.is_vector:
                 ch = declared.channels
-                self._emit(f"if _sp:")
-                self._indent += 1
-                self._emit(f"{tgt} = _torch.zeros(*_sp, {ch}, dtype=_torch.float32, device=_dev)")
-                self._indent -= 1
-                self._emit(f"else:")
-                self._indent += 1
-                self._emit(f"{tgt} = _torch.zeros({ch}, dtype=_torch.float32, device=_dev)")
-                self._indent -= 1
+                self._emit_spatial_branch(
+                    f"{tgt} = _torch.zeros(*_sp, {ch}, dtype=_torch.float32, device=_dev)",
+                    f"{tgt} = _torch.zeros({ch}, dtype=_torch.float32, device=_dev)",
+                )
             elif declared.is_matrix:
                 n = declared.mat_size
                 self._emit(f"{tgt} = _torch.zeros({n}, {n}, dtype=_torch.float32, device=_dev)")
             else:
                 self._emit(f"{tgt} = _torch.scalar_tensor(0.0, dtype=_torch.float32, device=_dev)")
+
+    def _emit_array_decl(self, stmt: ArrayDecl):
+        """Emit array declaration matching interpreter's tensor layout."""
+        tgt = self._var_target(stmt.name)
+        elem_type = stmt.element_type_name
+        tex_type = TYPE_NAME_MAP.get(elem_type)
+        is_vec = tex_type is not None and tex_type.is_vector
+        is_string = elem_type == "string"
+
+        if is_string:
+            if stmt.initializer and isinstance(stmt.initializer, ArrayLiteral):
+                elems = [self._emit_expr(e) for e in stmt.initializer.elements]
+                self._emit(f"{tgt} = [{', '.join(elems)}]")
+            elif stmt.initializer:
+                src = self._emit_expr(stmt.initializer)
+                self._emit(f"{tgt} = list({src}) if isinstance({src}, list) else [str({src})]")
+            else:
+                self._emit(f"{tgt} = [''] * {stmt.size}")
+            return
+
+        if stmt.initializer and isinstance(stmt.initializer, ArrayLiteral):
+            elems = [self._emit_expr(e) for e in stmt.initializer.elements]
+            es_list = ", ".join(f"_es({e}, _sp)" for e in elems)
+            ns_list = ", ".join(elems)
+            suffix = ".transpose(-2, -1)" if is_vec else ""
+            self._emit_spatial_branch(
+                f"{tgt} = _torch.stack([{es_list}], dim=-1){suffix}",
+                f"{tgt} = _torch.stack([{ns_list}], dim=-1){suffix}",
+            )
+        elif stmt.initializer:
+            src = self._emit_expr(stmt.initializer)
+            self._emit(f"{tgt} = {src}.clone()")
+        else:
+            size = stmt.size
+            if is_vec:
+                channels = TYPE_NAME_MAP[elem_type].channels
+                self._emit_spatial_branch(
+                    f"{tgt} = _torch.zeros(*_sp, {size}, {channels}, dtype=_torch.float32, device=_dev)",
+                    f"{tgt} = _torch.zeros({size}, {channels}, dtype=_torch.float32, device=_dev)",
+                )
+            else:
+                self._emit_spatial_branch(
+                    f"{tgt} = _torch.zeros(*_sp, {size}, dtype=_torch.float32, device=_dev)",
+                    f"{tgt} = _torch.zeros({size}, dtype=_torch.float32, device=_dev)",
+                )
+
+    def _emit_array_index_read(self, node: ArrayIndexAccess) -> str:
+        """Emit array[index] read with clamped bounds."""
+        arr = self._emit_expr(node.array)
+        idx = self._emit_expr(node.index)
+        tmp = self._tmp()
+
+        # String arrays are Python lists
+        self._emit(f"if isinstance({arr}, list):")
+        self._indent += 1
+        self._emit(f"{tmp} = {arr}[max(0, min(int(round({idx}.item() if _torch.is_tensor({idx}) else float({idx}))), len({arr}) - 1))]")
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        # Tensor arrays — check dim for vec (dim 2 or 5) vs scalar (dim 1 or 4)
+        self._emit(f"if {arr}.dim() in (2, 5):")
+        self._indent += 1
+        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {arr}.shape[-2] - 1)")
+        self._emit(f"if _ai.dim() == 0:")
+        self._indent += 1
+        self._emit(f"{tmp} = {arr}[..., _ai.item(), :]")
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        self._emit(f"_C = {arr}.shape[-1]")
+        self._emit(f"_idx_exp = _ai.unsqueeze(-1).unsqueeze(-1).expand(*_ai.shape, 1, _C)")
+        self._emit(f"if _idx_exp.shape[:3] != {arr}.shape[:3]:")
+        self._indent += 1
+        self._emit(f"_idx_exp = _idx_exp.expand({arr}.shape[:3] + (1, _C))")
+        self._indent -= 1
+        self._emit(f"{tmp} = _torch.gather({arr}, dim=-2, index=_idx_exp).squeeze(-2)")
+        self._indent -= 1
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {arr}.shape[-1] - 1)")
+        self._emit(f"if _ai.dim() == 0:")
+        self._indent += 1
+        self._emit(f"{tmp} = {arr}[..., _ai.item()]")
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        self._emit(f"_idx_exp = _ai.unsqueeze(-1)")
+        self._emit(f"if _idx_exp.shape[:3] != {arr}.shape[:3]:")
+        self._indent += 1
+        self._emit(f"_idx_exp = _idx_exp.expand({arr}.shape[:3] + (1,))")
+        self._indent -= 1
+        self._emit(f"{tmp} = _torch.gather({arr}, dim=-1, index=_idx_exp).squeeze(-1)")
+        self._indent -= 1
+        self._indent -= 1
+        self._indent -= 1
+
+        return tmp
+
+    def _emit_array_index_assign(self, target: ArrayIndexAccess, value_expr: str):
+        """Emit array[index] = value with clamped bounds."""
+        arr = self._emit_expr(target.array)
+        idx = self._emit_expr(target.index)
+
+        # String arrays
+        self._emit(f"if isinstance({arr}, list):")
+        self._indent += 1
+        self._emit(f"_al = list({arr})")
+        self._emit(f"_al[max(0, min(int(round({idx}.item() if _torch.is_tensor({idx}) else float({idx}))), len(_al) - 1))] = {value_expr} if isinstance({value_expr}, str) else str({value_expr})")
+        if isinstance(target.array, Identifier):
+            self._emit(f"{self._var_target(target.array.name)} = _al")
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        # Clone for copy-on-write semantics
+        self._emit(f"_arr_c = {arr}.clone()")
+        self._emit(f"if _arr_c.dim() in (2, 5):")
+        self._indent += 1
+        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, _arr_c.shape[-2] - 1)")
+        self._emit(f"if _ai.dim() == 0:")
+        self._indent += 1
+        self._emit(f"_arr_c[..., _ai.item(), :] = _es({value_expr}, _arr_c.shape[:-2]) if _arr_c.dim() > 2 else {value_expr}")
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        self._emit(f"_C = _arr_c.shape[-1]")
+        self._emit(f"_idx_exp = _ai.unsqueeze(-1).unsqueeze(-1).expand(*_ai.shape, 1, _C)")
+        self._emit(f"if _idx_exp.shape[:3] != _arr_c.shape[:3]:")
+        self._indent += 1
+        self._emit(f"_idx_exp = _idx_exp.expand(_arr_c.shape[:3] + (1, _C))")
+        self._indent -= 1
+        self._emit(f"_val_exp = _es({value_expr}, _arr_c.shape[:-2]).unsqueeze(-2)")
+        self._emit(f"_arr_c.scatter_(-2, _idx_exp, _val_exp)")
+        self._indent -= 1
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, _arr_c.shape[-1] - 1)")
+        self._emit(f"if _ai.dim() == 0:")
+        self._indent += 1
+        self._emit(f"_arr_c[..., _ai.item()] = _es({value_expr}, _arr_c.shape[:-1]) if _arr_c.dim() > 1 else {value_expr}")
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        self._emit(f"_idx_exp = _ai.unsqueeze(-1)")
+        self._emit(f"if _idx_exp.shape[:3] != _arr_c.shape[:3]:")
+        self._indent += 1
+        self._emit(f"_idx_exp = _idx_exp.expand(_arr_c.shape[:3] + (1,))")
+        self._indent -= 1
+        self._emit(f"_val_exp = _es({value_expr}, _arr_c.shape[:-1]).unsqueeze(-1)")
+        self._emit(f"_arr_c.scatter_(-1, _idx_exp, _val_exp)")
+        self._indent -= 1
+        self._indent -= 1
+        if isinstance(target.array, Identifier):
+            self._emit(f"{self._var_target(target.array.name)} = _arr_c")
+        self._indent -= 1
+
+    def _emit_array_literal(self, node: ArrayLiteral) -> str:
+        """Emit array literal {a, b, c} as a tensor stack."""
+        elems = [self._emit_expr(e) for e in node.elements]
+        tmp = self._tmp()
+        es_list = ", ".join(f"_es({e}, _sp) if _sp else {e}" for e in elems)
+        self._emit(f"{tmp} = _torch.stack([{es_list}], dim=-1)")
+        return tmp
+
+    def _emit_scatter_write(self, target: BindingIndexAccess, value_expr: str, op=None):
+        """Emit @OUT[px, py] = value scatter write."""
+        name = target.binding.name
+        arg_exprs = [self._emit_expr(a) for a in target.args]
+        px, py = arg_exprs[0], arg_exprs[1]
+        has_frame = len(arg_exprs) == 3
+
+        # Get or create output buffer
+        self._emit(f"if {name!r} not in _bind or not _torch.is_tensor(_bind[{name!r}]):")
+        self._indent += 1
+        self._emit(f"_sv = {value_expr}")
+        self._emit(f"_sc = _sv.shape[-1] if _torch.is_tensor(_sv) and _sv.dim() >= 1 and _sv.shape[-1] in (2,3,4) else 1")
+        self._emit(f"if _sp:")
+        self._indent += 1
+        self._emit(f"_bind[{name!r}] = _torch.zeros(*_sp, _sc, dtype=_torch.float32, device=_dev) if _sc > 1 else _torch.zeros(*_sp, dtype=_torch.float32, device=_dev)")
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        self._emit(f"_bind[{name!r}] = _torch.zeros(1, 1, 1, _sc, dtype=_torch.float32, device=_dev) if _sc > 1 else _torch.zeros(1, 1, 1, dtype=_torch.float32, device=_dev)")
+        self._indent -= 1
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        self._emit(f"_sv = {value_expr}")
+        self._indent -= 1
+
+        self._emit(f"_sb = _bind[{name!r}]")
+        self._emit(f"_sB, _sH, _sW = _sb.shape[0], _sb.shape[1], _sb.shape[2]")
+
+        # Clamp coordinates
+        self._emit(f"_six = _torch.clamp(_torch.floor(_es({px}, (_sB,_sH,_sW)) if _sp else {px}).long(), 0, _sW - 1)")
+        self._emit(f"_siy = _torch.clamp(_torch.floor(_es({py}, (_sB,_sH,_sW)) if _sp else {py}).long(), 0, _sH - 1)")
+        self._emit(f"_sval = _es(_sv, (_sB,_sH,_sW)) if _sp else _sv")
+
+        if has_frame:
+            self._emit(f"_sbi = _torch.clamp((_es({arg_exprs[2]}, (_sB,_sH,_sW)) if _sp else {arg_exprs[2]}).long(), 0, _sB - 1)")
+        else:
+            self._emit(f"_sbi = _torch.arange(_sB, device=_dev).view(_sB, 1, 1).expand(_sB, _sH, _sW)")
+
+        self._emit(f"_fb = _sbi.reshape(-1)")
+        self._emit(f"_fy = _siy.reshape(-1)")
+        self._emit(f"_fx = _six.reshape(-1)")
+
+        # Reshape value to match buffer layout
+        self._emit(f"if _sb.dim() == 4:")
+        self._indent += 1
+        self._emit(f"_fv = _sval.reshape(-1, _sb.shape[-1])")
+        self._indent -= 1
+        self._emit(f"else:")
+        self._indent += 1
+        self._emit(f"_fv = _sval.reshape(-1) if _torch.is_tensor(_sval) and _sval.dim() > 0 else _sval")
+        self._indent -= 1
+
+        # Apply scatter operation
+        if op is None:
+            self._emit(f"_sb[_fb, _fy, _fx] = _fv")
+        elif op == "+":
+            self._emit(f"_sb.index_put_((_fb, _fy, _fx), _fv, accumulate=True)")
+        elif op == "-":
+            self._emit(f"_sb.index_put_((_fb, _fy, _fx), -_fv, accumulate=True)")
+        elif op == "*":
+            self._emit(f"_sb[_fb, _fy, _fx] = _sb[_fb, _fy, _fx] * _fv")
+        elif op == "/":
+            self._emit(f"_sb[_fb, _fy, _fx] = _sb[_fb, _fy, _fx] / _tw(_fv == 0, _SAFE_EPS, _fv)")
+
+    def _emit_function_def(self, stmt: FunctionDef):
+        """Emit a user-defined function as a nested Python def."""
+        self._user_functions.add(stmt.name)
+        params = [f"_p_{pname}" for _, pname in stmt.params]
+        params_str = ", ".join(params + ["_depth=0"])
+        self._emit(f"def _uf_{stmt.name}({params_str}):")
+        self._indent += 1
+        self._emit(f"if _depth > {MAX_CALL_DEPTH}: raise RuntimeError('Maximum function call depth exceeded in {stmt.name}()')")
+
+        # Save and swap local vars context for function body
+        saved_locals = self._local_vars
+        self._local_vars = {}
+        # Register params as locals
+        for _, pname in stmt.params:
+            self._local_vars[pname] = f"_p_{pname}"
+
+        # Collect all vars declared anywhere in function body (including nested blocks)
+        body_vars, _ = self._collect_modified_vars(stmt.body)
+        for vname in body_vars:
+            if vname not in self._local_vars:  # don't overwrite params
+                self._local_vars[vname] = f"_uf_lv_{vname}"
+
+        saved_in_fn = self._in_user_function
+        self._in_user_function = True
+
+        for s in stmt.body:
+            self._emit_stmt(s)
+
+        # Default return if no explicit return
+        self._emit(f"return _torch.scalar_tensor(0.0, dtype=_torch.float32, device=_dev)")
+        self._in_user_function = saved_in_fn
+        self._local_vars = saved_locals
+        self._indent -= 1
+
+    def _emit_return_stmt(self, stmt: ReturnStmt):
+        """Emit a return statement inside a user function."""
+        value = self._emit_expr(stmt.value)
+        self._emit(f"return {value}")
 
     def _emit_assignment(self, stmt: Assignment):
         target = stmt.target
@@ -269,22 +551,34 @@ class _CodeGen:
         elif isinstance(target, ChannelAccess):
             self._emit_channel_assign(target, value_expr)
         elif isinstance(target, ArrayIndexAccess):
-            raise _Unsupported("ArrayIndexAccess assignment")
+            self._emit_array_index_assign(target, value_expr)
+        elif isinstance(target, BindingIndexAccess):
+            self._emit_scatter_write(target, value_expr, op=stmt.op)
         else:
             raise _Unsupported(f"Unsupported assignment target: {type(target).__name__}")
 
     def _emit_channel_assign(self, target: ChannelAccess, value_expr: str):
         channels = target.channels
-        if len(channels) != 1:
-            raise _Unsupported("Multi-channel assignment")
-        idx = CHANNEL_MAP.get(channels)
-        if idx is None:
-            raise _Unsupported(f"Invalid channel: {channels}")
-
         base_expr = self._emit_expr(target.object)
         tmp = self._tmp()
         self._emit(f"{tmp} = {base_expr}.clone()")
-        self._emit(f"{tmp}[..., {idx}] = _es({value_expr}, {tmp}.shape[:-1])")
+
+        if len(channels) == 1:
+            idx = CHANNEL_MAP.get(channels)
+            if idx is None:
+                raise _Unsupported(f"Invalid channel: {channels}")
+            self._emit(f"{tmp}[..., {idx}] = _es({value_expr}, {tmp}.shape[:-1])")
+        else:
+            # Multi-channel assignment: .rgb, .xy, .rgba, etc.
+            indices = [CHANNEL_MAP.get(ch) for ch in channels]
+            if any(i is None for i in indices):
+                raise _Unsupported(f"Invalid swizzle: {channels}")
+            val_tmp = self._tmp()
+            self._emit(f"{val_tmp} = _es({value_expr}, {tmp}.shape[:-1])")
+            multi_flag = self._tmp()
+            self._emit(f"{multi_flag} = {val_tmp}.dim() >= 1 and {val_tmp}.shape[-1] > 1")
+            for i, idx in enumerate(indices):
+                self._emit(f"{tmp}[..., {idx}] = {val_tmp}[..., {i}] if {multi_flag} else {val_tmp}")
 
         if isinstance(target.object, Identifier):
             self._emit(f"{self._var_target(target.object.name)} = {tmp}")
@@ -441,7 +735,15 @@ class _CodeGen:
                         env_vars.add(o.name)
                     elif isinstance(o, BindingRef):
                         bind_names.add(o.name)
+                elif isinstance(t, ArrayIndexAccess):
+                    if isinstance(t.array, Identifier):
+                        env_vars.add(t.array.name)
+                elif isinstance(t, BindingIndexAccess):
+                    if isinstance(t.binding, BindingRef):
+                        bind_names.add(t.binding.name)
             elif isinstance(stmt, VarDecl):
+                env_vars.add(stmt.name)
+            elif isinstance(stmt, ArrayDecl):
                 env_vars.add(stmt.name)
             elif isinstance(stmt, IfElse):
                 e1, b1 = self._collect_modified_vars(stmt.then_body)
@@ -697,7 +999,6 @@ class _CodeGen:
         self._indent -= 1
 
         self._emit_iter_limit(iter_var, "While")
-        self._indent -= 1
 
     # ── Expression emission ─────────────────────────────────────────────
 
@@ -747,10 +1048,10 @@ class _CodeGen:
             return self._emit_cast(node)
 
         if isinstance(node, ArrayIndexAccess):
-            raise _Unsupported("ArrayIndexAccess")
+            return self._emit_array_index_read(node)
 
         if isinstance(node, ArrayLiteral):
-            raise _Unsupported("ArrayLiteral")
+            return self._emit_array_literal(node)
 
         if isinstance(node, BindingIndexAccess):
             binding = self._emit_expr(node.binding)
@@ -826,6 +1127,7 @@ class _CodeGen:
 
         # Check if broadcasting is needed (scalar vs vector mixed)
         needs_broadcast = False
+        needs_channel_pad = False
         if lt is not None and rt is not None:
             l_vec = lt.is_vector
             r_vec = rt.is_vector
@@ -833,12 +1135,24 @@ class _CodeGen:
             r_scalar = not r_vec and not rt.is_matrix
             if (l_vec and r_scalar) or (l_scalar and r_vec):
                 needs_broadcast = True
+            elif l_vec and r_vec and lt.channels != rt.channels:
+                needs_channel_pad = True
 
         if needs_broadcast:
             tl = self._tmp()
             tr = self._tmp()
             self._emit(f"{tl}, {tr} = _bp({left}, {right})")
             left, right = tl, tr
+        elif needs_channel_pad:
+            lc, rc = lt.channels, rt.channels
+            if lc < rc:
+                tl = self._tmp()
+                self._emit(f"{tl} = _torch.nn.functional.pad({left}, (0, {rc - lc}))")
+                left = tl
+            else:
+                tr = self._tmp()
+                self._emit(f"{tr} = _torch.nn.functional.pad({right}, (0, {lc - rc}))")
+                right = tr
 
         op = node.op
         tmp = self._tmp()
@@ -896,6 +1210,13 @@ class _CodeGen:
         args = [self._emit_expr(a) for a in node.args]
         tmp = self._tmp()
 
+        # User-defined function call
+        if name in self._user_functions:
+            args_str = ", ".join(args)
+            depth_arg = ", _depth=_depth+1" if self._in_user_function else ""
+            self._emit(f"{tmp} = _uf_{name}({args_str}{depth_arg})")
+            return tmp
+
         # Try to inline simple torch functions directly (avoids dict lookup +
         # wrapper function call + _to_tensor overhead per call).
         if len(args) == 1:
@@ -943,6 +1264,107 @@ class _CodeGen:
             self._emit(f"{tmp} = _torch.linalg.vector_norm({args[0]}, dim=-1)")
             return tmp
 
+        # Inline sincos: stack [sin, cos] into vec2
+        if name == "sincos" and len(args) == 1:
+            self._emit(f"{tmp} = _torch.stack([_torch.sin({args[0]}), _torch.cos({args[0]})], dim=-1)")
+            return tmp
+
+        # Inline sqrt: clamp to avoid NaN on negative input
+        if name == "sqrt" and len(args) == 1:
+            self._emit(f"{tmp} = _torch.sqrt(_torch.clamp({args[0]}, min=0.0))")
+            return tmp
+
+        # Inline log variants: clamp to SAFE_EPSILON to avoid -inf
+        if name == "log" and len(args) == 1:
+            self._emit(f"{tmp} = _torch.log(_torch.clamp({args[0]}, min=_SAFE_EPS))")
+            return tmp
+        if name == "log2" and len(args) == 1:
+            self._emit(f"{tmp} = _torch.log2(_torch.clamp({args[0]}, min=_SAFE_EPS))")
+            return tmp
+        if name == "log10" and len(args) == 1:
+            self._emit(f"{tmp} = _torch.log10(_torch.clamp({args[0]}, min=_SAFE_EPS))")
+            return tmp
+
+        # Inline fract: x - floor(x)
+        if name == "fract" and len(args) == 1:
+            self._emit(f"{tmp} = {args[0]} - _torch.floor({args[0]})")
+            return tmp
+
+        # Inline isnan/isinf: return float mask
+        if name == "isnan" and len(args) == 1:
+            self._emit(f"{tmp} = _torch.isnan({args[0]}).float()")
+            return tmp
+        if name == "isinf" and len(args) == 1:
+            self._emit(f"{tmp} = _torch.isinf({args[0]}).float()")
+            return tmp
+
+        # Inline pow2/pow10: 2^x, 10^x
+        if name == "pow2" and len(args) == 1:
+            self._emit(f"{tmp} = _torch.pow(2.0, {args[0]})")
+            return tmp
+        if name == "pow10" and len(args) == 1:
+            self._emit(f"{tmp} = _torch.pow(10.0, {args[0]})")
+            return tmp
+
+        # Inline luma: weighted sum of RGB channels (guard for non-vector input)
+        if name == "luma" and len(args) == 1:
+            ret_type = self.type_map.get(id(node.args[0]))
+            if ret_type is not None and ret_type.is_vector and ret_type.channels >= 3:
+                self._emit(f"{tmp} = 0.2126 * {args[0]}[..., 0] + 0.7152 * {args[0]}[..., 1] + 0.0722 * {args[0]}[..., 2]")
+                return tmp
+
+        # Inline smoothstep: t*t*(3-2t) with clamped t
+        if name == "smoothstep" and len(args) == 3:
+            tt = self._tmp()
+            self._emit(f"{tt} = _torch.clamp(({args[2]} - {args[0]}) / ({args[1]} - {args[0]} + _SAFE_EPS), 0.0, 1.0)")
+            self._emit(f"{tmp} = {tt} * {tt} * (3.0 - 2.0 * {tt})")
+            return tmp
+
+        # Inline step: (x >= edge).float()
+        if name == "step" and len(args) == 2:
+            self._emit(f"{tmp} = ({args[1]} >= {args[0]}).float()")
+            return tmp
+
+        # Inline fit: remap from [old_min, old_max] to [new_min, new_max]
+        if name == "fit" and len(args) == 5:
+            tt = self._tmp()
+            self._emit(f"{tt} = ({args[0]} - {args[1]}) / ({args[2]} - {args[1]} + _SAFE_EPS)")
+            self._emit(f"{tmp} = _torch.lerp({args[3]}, {args[4]}, {tt})")
+            return tmp
+
+        # Inline mod: safe fmod
+        if name == "mod" and len(args) == 2:
+            self._emit(f"{tmp} = _torch.fmod({args[0]}, _tw({args[1]} == 0, _SAFE_EPS, {args[1]}))")
+            return tmp
+
+        # Inline cross: cross product (truncate vec4 to vec3)
+        if name == "cross" and len(args) == 2:
+            self._emit(f"{tmp} = _torch.cross({args[0]}[..., :3], {args[1]}[..., :3], dim=-1)")
+            return tmp
+
+        # Inline reflect: i - 2 * dot(i, n) * n
+        if name == "reflect" and len(args) == 2:
+            dt = self._tmp()
+            self._emit(f"{dt} = ({args[0]} * {args[1]}).sum(dim=-1, keepdim=True)")
+            self._emit(f"{tmp} = {args[0]} - 2.0 * {dt} * {args[1]}")
+            return tmp
+
+        # Inline spow: sign(x) * pow(abs(x), y) — safe power for negative bases
+        if name == "spow" and len(args) == 2:
+            at = self._tmp()
+            self._emit(f"{at} = _torch.abs({args[0]})")
+            mask = self._tmp()
+            self._emit(f"{mask} = {at} < _SAFE_EPS")
+            self._emit(f"{tmp} = _tw({mask}, _torch.zeros_like({args[0]}), _torch.sign({args[0]}) * _torch.pow(_torch.clamp({at}, min=_SAFE_EPS), {args[1]}))")
+            return tmp
+
+        # Inline sdiv: safe division — returns 0 where |b| < eps
+        if name == "sdiv" and len(args) == 2:
+            mask = self._tmp()
+            self._emit(f"{mask} = _torch.abs({args[1]}) < _SAFE_EPS")
+            self._emit(f"{tmp} = _tw({mask}, _torch.zeros_like({args[0]}), {args[0]} / _tw({mask}, _torch.ones_like({args[1]}), {args[1]}))")
+            return tmp
+
         # General case: call through stdlib dict
         args_str = ", ".join(args)
         self._emit(f"{tmp} = _fns[{name!r}]({args_str})")
@@ -968,6 +1390,7 @@ class _CodeGen:
             self._preamble.append(
                 f"    {var} = _torch.tensor([{vals_repr}], dtype=_torch.float32, device=_dev)"
                 f".reshape(" + ", ".join(["1"] * 3) + f", {n}).expand(*_sp, {n})"
+                f" if _sp else _torch.tensor([{vals_repr}], dtype=_torch.float32, device=_dev)"
             )
             self._vec_const_cache[values] = var
             return var

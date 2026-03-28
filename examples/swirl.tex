@@ -7,12 +7,11 @@ f$strength = 3.0;   // swirl intensity (try 0 to 10)
 
 float cx = u - 0.5;
 float cy = v - 0.5;
-float dist = sqrt(cx * cx + cy * cy);
+float dist = hypot(cx, cy);
 float angle = $strength * (1.0 - smoothstep(0.0, 0.5, dist));
 
-float cosA = cos(angle);
-float sinA = sin(angle);
-float su = (cx * cosA - cy * sinA) + 0.5;
-float sv = (cx * sinA + cy * cosA) + 0.5;
+vec2 sc = sincos(angle);
+float su = (cx * sc.y - cy * sc.x) + 0.5;
+float sv = (cx * sc.x + cy * sc.y) + 0.5;
 
-@OUT = sample_cubic(@image, su, sv);
+@OUT = sample_cubic(@image, su, sv).rgb;

@@ -1,0 +1,40 @@
+// Break Search — scan for the first bright pixel using for + break
+//
+// Educational example demonstrating for loops, break, and fetch().
+// For each row (iy), scans horizontally from the left edge to find the
+// first pixel whose luminance exceeds the threshold. Outputs a
+// visualization: pixels left of the found position are tinted red,
+// and the found column is drawn as a bright green line.
+
+f$threshold = 0.5;    // luminance threshold to search for
+i$scan_width = 0;     // pixels to scan (0 = full width)
+
+vec3 src = @image;
+
+// Determine how far to scan
+int width = ($scan_width > 0) ? $scan_width : int(iw);
+
+// Scan this row from the left to find the first bright pixel
+int found_x = -1;
+for (int sx = 0; sx < width; sx = sx + 1) {
+    vec3 s = fetch(@image, sx, iy);
+    float lum = luma(s);
+    if (lum > $threshold) {
+        found_x = sx;
+        break;
+    }
+}
+
+// Visualize the result
+vec3 result = src;
+if (found_x >= 0) {
+    if (ix < found_x) {
+        // Tint pixels before the found position red
+        result = vec3(src.r * 0.5 + 0.3, src.g * 0.3, src.b * 0.3);
+    } else if (ix == found_x) {
+        // Draw a bright green line at the found position
+        result = vec3(0.0, 1.0, 0.0);
+    }
+}
+
+@OUT = result;

@@ -11,7 +11,7 @@ float cy = v - 0.5;
 
 // Sample each channel at a different radial distance
 float r = sample(@image, 0.5 + cx * (1.0 + $strength), 0.5 + cy * (1.0 + $strength)).r;
-float g = sample(@image, u, v).g;
+float g = @image.g;
 float b = sample(@image, 0.5 + cx * (1.0 - $strength), 0.5 + cy * (1.0 - $strength)).b;
 
 @OUT = vec3(r, g, b);

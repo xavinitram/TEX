@@ -31,6 +31,7 @@ class TokenType(Enum):
     # Type keywords
     KW_FLOAT = auto()
     KW_INT = auto()
+    KW_VEC2 = auto()
     KW_VEC3 = auto()
     KW_VEC4 = auto()
     KW_STRING = auto()
@@ -44,6 +45,7 @@ class TokenType(Enum):
     KW_WHILE = auto()
     KW_BREAK = auto()
     KW_CONTINUE = auto()
+    KW_CONST = auto()
 
     # Operators
     PLUS = auto()
@@ -90,6 +92,7 @@ class TokenType(Enum):
 KEYWORDS = {
     "float": TokenType.KW_FLOAT,
     "int": TokenType.KW_INT,
+    "vec2": TokenType.KW_VEC2,
     "vec3": TokenType.KW_VEC3,
     "vec4": TokenType.KW_VEC4,
     "string": TokenType.KW_STRING,
@@ -102,6 +105,7 @@ KEYWORDS = {
     "break": TokenType.KW_BREAK,
     "continue": TokenType.KW_CONTINUE,
     "return": TokenType.KW_RETURN,
+    "const": TokenType.KW_CONST,
 }
 
 SINGLE_CHAR_TOKENS = {
@@ -126,7 +130,7 @@ SINGLE_CHAR_TOKENS = {
 # Type prefixes that can appear immediately before @ or $ to form typed bindings.
 # e.g. f@threshold → TYPED_AT_BINDING with prefix="f"
 # e.g. img@result → TYPED_AT_BINDING with prefix="img"
-BINDING_TYPE_PREFIXES = {"f", "i", "v", "v4", "s", "img", "m", "l"}
+BINDING_TYPE_PREFIXES = {"f", "i", "v", "v2", "v3", "v4", "s", "img", "m", "l", "c", "b"}
 
 
 @dataclass

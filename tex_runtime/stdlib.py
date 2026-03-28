@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-import threading
+from collections import OrderedDict as _OrderedDict
 import torch
 
 # Unified safety epsilon for division guards, domain clamping, and near-zero checks.
@@ -16,10 +16,28 @@ import torch
 # to be invisible in image-processing contexts.
 SAFE_EPSILON = 1e-8
 
+# Rec.709 luma coefficients for RGB → luminance conversion
+LUMA_R, LUMA_G, LUMA_B = 0.2126, 0.7152, 0.0722
+
+# Valid channel counts for vector types (vec2, vec3, vec4)
+VEC_CHANNELS = frozenset((2, 3, 4))
+
 # ── Sampler tensor cache ──────────────────────────────────────────────
 # Caches reusable tensors for sampling functions keyed by (B, H, W, device).
 # Avoids recreating batch index tensors and Lanczos tap offsets per call.
 _sampler_cache: dict[tuple, torch.Tensor] = {}
+
+# ── Mipmap pyramid cache ─────────────────────────────────────────────
+# Caches mipmap pyramids keyed by tensor data_ptr + shape.  We store a
+# reference to the source tensor so it won't be garbage-collected (which
+# would let PyTorch reuse the data_ptr for a different tensor, causing
+# stale cache hits).  OrderedDict gives LRU eviction to bound memory.
+_mip_cache: _OrderedDict[int, tuple[tuple, torch.Tensor, list[torch.Tensor]]] = _OrderedDict()
+_gauss_mip_cache: _OrderedDict[tuple, tuple[tuple, torch.Tensor, list[torch.Tensor]]] = _OrderedDict()
+_gauss_kernel_cache: _OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = _OrderedDict()
+_GAUSS_KERNEL_MAX_ENTRIES = 64  # max cached kernel pairs (tiny GPU tensors)
+_MIP_MAX_ENTRIES = 8   # max cached pyramids (each holds multiple GPU tensors)
+_MIP_MAX_LEVELS = 12   # cap: 4096 → 1px in 12 halvings
 
 
 def _get_batch_index(B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
@@ -67,6 +85,7 @@ class TEXStdlib:
             "floor": TEXStdlib.fn_floor,
             "ceil": TEXStdlib.fn_ceil,
             "round": TEXStdlib.fn_round,
+            "trunc": TEXStdlib.fn_trunc,
             "fract": TEXStdlib.fn_fract,
             "mod": TEXStdlib.fn_mod,
 
@@ -77,6 +96,7 @@ class TEXStdlib:
             "sinh": TEXStdlib.fn_sinh,
             "cosh": TEXStdlib.fn_cosh,
             "tanh": TEXStdlib.fn_tanh,
+            "sincos": TEXStdlib.fn_sincos,
             "hypot": TEXStdlib.fn_hypot,
             "isnan": TEXStdlib.fn_isnan,
             "isinf": TEXStdlib.fn_isinf,
@@ -113,6 +133,9 @@ class TEXStdlib:
             "fetch": TEXStdlib.fn_fetch,
             "sample_cubic": TEXStdlib.fn_sample_cubic,
             "sample_lanczos": TEXStdlib.fn_sample_lanczos,
+            "sample_mip": TEXStdlib.fn_sample_mip,
+            "sample_mip_gauss": TEXStdlib.fn_sample_mip_gauss,
+            "gauss_blur": TEXStdlib.fn_gauss_blur,
             "fetch_frame": TEXStdlib.fn_fetch_frame,
             "sample_frame": TEXStdlib.fn_sample_frame,
 
@@ -120,6 +143,28 @@ class TEXStdlib:
             "perlin": TEXStdlib.fn_perlin,
             "simplex": TEXStdlib.fn_simplex,
             "fbm": TEXStdlib.fn_fbm,
+            "worley_f1": TEXStdlib.fn_worley_f1,
+            "worley_f2": TEXStdlib.fn_worley_f2,
+            "voronoi": TEXStdlib.fn_voronoi,
+            "curl": TEXStdlib.fn_curl,
+            "ridged": TEXStdlib.fn_ridged,
+            "billow": TEXStdlib.fn_billow,
+            "turbulence": TEXStdlib.fn_turbulence,
+            "flow": TEXStdlib.fn_flow,
+            "alligator": TEXStdlib.fn_alligator,
+
+            # SDF primitives
+            "sdf_circle": TEXStdlib.fn_sdf_circle,
+            "sdf_box": TEXStdlib.fn_sdf_box,
+            "sdf_line": TEXStdlib.fn_sdf_line,
+            "sdf_polygon": TEXStdlib.fn_sdf_polygon,
+
+            # Smooth blending
+            "smin": TEXStdlib.fn_smin,
+            "smax": TEXStdlib.fn_smax,
+
+            # Gradient sampling
+            "sample_grad": TEXStdlib.fn_sample_grad,
 
             # String operations
             "str": TEXStdlib.fn_str,
@@ -205,6 +250,12 @@ class TEXStdlib:
         return torch.atan2(_to_tensor(y), _to_tensor(x))
 
     @staticmethod
+    def fn_sincos(x):
+        """Returns vec2(sin(x), cos(x)) — computes both in a single pass."""
+        t = _to_tensor(x)
+        return torch.stack([torch.sin(t), torch.cos(t)], dim=-1)
+
+    @staticmethod
     def fn_sqrt(x):
         return torch.sqrt(torch.clamp(_to_tensor(x), min=0.0))
 
@@ -244,6 +295,10 @@ class TEXStdlib:
     @staticmethod
     def fn_round(x):
         return torch.round(_to_tensor(x))
+
+    @staticmethod
+    def fn_trunc(x):
+        return torch.trunc(_to_tensor(x))
 
     @staticmethod
     def fn_fract(x):
@@ -391,21 +446,21 @@ class TEXStdlib:
     def fn_length(v):
         """Length (magnitude) of a vector. Operates on last dimension."""
         t = _to_tensor(v)
-        if t.dim() >= 1 and t.shape[-1] in (3, 4):
+        if t.dim() >= 1 and t.shape[-1] in VEC_CHANNELS:
             return torch.linalg.vector_norm(t, dim=-1)
         return torch.abs(t)
 
     @staticmethod
     def fn_distance(a, b):
         diff = _to_tensor(a) - _to_tensor(b)
-        if diff.dim() >= 1 and diff.shape[-1] in (3, 4):
+        if diff.dim() >= 1 and diff.shape[-1] in VEC_CHANNELS:
             return torch.linalg.vector_norm(diff, dim=-1)
         return torch.abs(diff)
 
     @staticmethod
     def fn_normalize(v):
         t = _to_tensor(v)
-        if t.dim() >= 1 and t.shape[-1] in (3, 4):
+        if t.dim() >= 1 and t.shape[-1] in VEC_CHANNELS:
             norm = torch.linalg.vector_norm(t, dim=-1, keepdim=True)
             return t / (norm + SAFE_EPSILON)
         return torch.sign(t)
@@ -434,7 +489,7 @@ class TEXStdlib:
         """Compute luminance from RGB(A). Returns scalar per pixel."""
         c = _to_tensor(color)
         if c.dim() >= 1 and c.shape[-1] >= 3:
-            return 0.2126 * c[..., 0] + 0.7152 * c[..., 1] + 0.0722 * c[..., 2]
+            return LUMA_R * c[..., 0] + LUMA_G * c[..., 1] + LUMA_B * c[..., 2]
         return c
 
     @staticmethod
@@ -840,23 +895,237 @@ class TEXStdlib:
 
         return result
 
-    # -- Noise functions ------------------------------------------------
+    @staticmethod
+    def fn_sample_mip(image, u_coord, v_coord, lod):
+        """Sample an image with mipmap filtering at an explicit level of detail.
+
+        Args:
+            image: [B, H, W, C] tensor
+            u_coord: float or [B, H, W] tensor — horizontal coordinate [0, 1]
+            v_coord: float or [B, H, W] tensor — vertical coordinate [0, 1]
+            lod: float or [B, H, W] tensor — mip level (0 = full res, 1 = half, ...)
+
+        Builds a mipmap pyramid on first call (cached per input tensor).
+        Uses bilinear sampling within each level and linear interpolation
+        between levels (trilinear). Fast path when LOD is a uniform integer:
+        samples a single level with no interpolation.
+        """
+        return _sample_mip_trilinear(image, u_coord, v_coord, lod, _get_mip_pyramid)
 
     @staticmethod
-    def fn_perlin(x, y):
-        """2D Perlin noise. Returns float in [-1, 1]."""
+    def fn_gauss_blur(image, sigma):
+        """Separable Gaussian blur.
+
+        Args:
+            image: [B, H, W, C] tensor
+            sigma: float — standard deviation in pixels (kernel radius ≈ 3*sigma)
+
+        Returns blurred [B, H, W, C] tensor with replicate border handling.
+        """
+        img = image if image.__class__ is torch.Tensor else _to_tensor(image)
+        sigma_t = sigma if sigma.__class__ is torch.Tensor else _to_tensor(sigma)
+        sigma_val = max(sigma_t.item(), 0.0)
+        if sigma_val < 0.3 or img.dim() < 4:
+            return img
+        bchw = img.permute(0, 3, 1, 2)
+        result = _gauss_blur_bchw(bchw, sigma_val)
+        return result.permute(0, 2, 3, 1)
+
+    @staticmethod
+    def fn_sample_mip_gauss(image, u_coord, v_coord, lod):
+        """Sample with Gaussian-prefiltered mipmap (sigma=1.13 pyramid).
+
+        Same interface as sample_mip but uses a Gaussian pre-blur before each
+        2x downsample, producing SIGMA_C ≈ 0.825. This gives ~5 dB better
+        accuracy for exponential blur reconstruction vs the area-downsample pyramid.
+        """
+        return _sample_mip_trilinear(image, u_coord, v_coord, lod, _get_mip_pyramid_gauss)
+
+    # -- Noise functions ------------------------------------------------
+    # All noise functions support optional z for 3D:
+    #   2 args = 2D, 3 args = 3D (for base noise)
+    #   3 args = 2D with octaves, 4 args = 3D with octaves (for FBM family)
+
+    @staticmethod
+    def fn_perlin(x, y, z=None):
+        """Perlin noise. 2D when z omitted, 3D when z provided. Returns float in ~[-1, 1]."""
+        if z is not None:
+            return _perlin3d_fast(_to_tensor(x), _to_tensor(y), _to_tensor(z))
         return _perlin2d_fast(_to_tensor(x), _to_tensor(y))
 
     @staticmethod
-    def fn_simplex(x, y):
-        """2D Simplex noise. Returns float in [-1, 1]."""
+    def fn_simplex(x, y, z=None):
+        """Simplex noise. 2D when z omitted, 3D falls back to Perlin. Returns float in ~[-1, 1]."""
+        if z is not None:
+            return _perlin3d_fast(_to_tensor(x), _to_tensor(y), _to_tensor(z))
         return _simplex2d(_to_tensor(x), _to_tensor(y))
 
     @staticmethod
-    def fn_fbm(x, y, octaves):
-        """Fractional Brownian Motion using Perlin noise."""
-        oct_int = int(_to_float(octaves))
-        return _fbm2d(_to_tensor(x), _to_tensor(y), oct_int)
+    def fn_fbm(x, y, z_or_oct, octaves=None):
+        """FBM noise. fbm(x,y,octaves) for 2D, fbm(x,y,z,octaves) for 3D."""
+        if octaves is not None:
+            return _fbm3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_oct),
+                          int(_to_float(octaves)))
+        return _fbm2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
+
+    @staticmethod
+    def fn_worley_f1(x, y, z=None):
+        """Worley F1 noise (nearest cell distance). Returns float in ~[0, 1]."""
+        if z is not None:
+            return _worley3d(_to_tensor(x), _to_tensor(y), _to_tensor(z), return_f2=False)
+        return _worley2d(_to_tensor(x), _to_tensor(y), return_f2=False)
+
+    @staticmethod
+    def fn_worley_f2(x, y, z=None):
+        """Worley F2 noise (2nd nearest cell distance). Returns float in ~[0, 1]."""
+        if z is not None:
+            return _worley3d(_to_tensor(x), _to_tensor(y), _to_tensor(z), return_f2=True)
+        return _worley2d(_to_tensor(x), _to_tensor(y), return_f2=True)
+
+    @staticmethod
+    def fn_voronoi(x, y, z=None):
+        """Voronoi noise (alias for worley_f1)."""
+        return TEXStdlib.fn_worley_f1(x, y, z)
+
+    @staticmethod
+    def fn_curl(x, y, z=None):
+        """Curl noise. 2D → vec2 (divergence-free), 3D → vec3."""
+        if z is not None:
+            return _curl3d(_to_tensor(x), _to_tensor(y), _to_tensor(z))
+        return _curl2d(_to_tensor(x), _to_tensor(y))
+
+    @staticmethod
+    def fn_ridged(x, y, z_or_oct, octaves=None):
+        """Ridged FBM. ridged(x,y,octaves) for 2D, ridged(x,y,z,octaves) for 3D."""
+        if octaves is not None:
+            return _ridged3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_oct),
+                             int(_to_float(octaves)))
+        return _ridged2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
+
+    @staticmethod
+    def fn_billow(x, y, z_or_oct, octaves=None):
+        """Billow FBM. billow(x,y,octaves) for 2D, billow(x,y,z,octaves) for 3D."""
+        if octaves is not None:
+            return _billow3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_oct),
+                             int(_to_float(octaves)))
+        return _billow2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
+
+    @staticmethod
+    def fn_turbulence(x, y, z_or_oct, octaves=None):
+        """Turbulence. turbulence(x,y,octaves) for 2D, turbulence(x,y,z,octaves) for 3D."""
+        if octaves is not None:
+            return _turbulence3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_oct),
+                                 int(_to_float(octaves)))
+        return _turbulence2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
+
+    @staticmethod
+    def fn_flow(x, y, z_or_time, time=None):
+        """Flow noise. flow(x,y,time) for 2D, flow(x,y,z,time) for 3D."""
+        if time is not None:
+            return _flow3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_time),
+                           _to_float(time))
+        return _flow2d(_to_tensor(x), _to_tensor(y), _to_float(z_or_time))
+
+    @staticmethod
+    def fn_alligator(x, y, z_or_oct=None, octaves=None):
+        """Alligator noise. 2 args: 2D default octaves; 3 args: 2D custom octaves; 4 args: 3D."""
+        if octaves is not None:
+            return _alligator3d(_to_tensor(x), _to_tensor(y), _to_tensor(z_or_oct),
+                                int(_to_float(octaves)))
+        if z_or_oct is not None:
+            return _alligator2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
+        return _alligator2d(_to_tensor(x), _to_tensor(y), 4)
+
+    # -- SDF primitives -------------------------------------------------
+
+    @staticmethod
+    def fn_sdf_circle(px, py, radius):
+        """Signed distance to a circle centered at origin."""
+        return torch.hypot(_to_tensor(px), _to_tensor(py)) - _to_tensor(radius)
+
+    @staticmethod
+    def fn_sdf_box(px, py, half_w, half_h):
+        """Signed distance to an axis-aligned box centered at origin."""
+        dx = torch.abs(_to_tensor(px)) - _to_tensor(half_w)
+        dy = torch.abs(_to_tensor(py)) - _to_tensor(half_h)
+        dx_c = torch.clamp(dx, min=0.0)
+        dy_c = torch.clamp(dy, min=0.0)
+        outside = torch.sqrt(dx_c * dx_c + dy_c * dy_c)
+        inside = torch.clamp(torch.max(dx, dy), max=0.0)
+        return outside + inside
+
+    @staticmethod
+    def fn_sdf_line(px, py, ax, ay, bx, by):
+        """Unsigned distance to a line segment from (ax,ay) to (bx,by). Always >= 0."""
+        px_t, py_t = _to_tensor(px), _to_tensor(py)
+        ax_t, ay_t = _to_tensor(ax), _to_tensor(ay)
+        bx_t, by_t = _to_tensor(bx), _to_tensor(by)
+        pa_x = px_t - ax_t
+        pa_y = py_t - ay_t
+        ba_x = bx_t - ax_t
+        ba_y = by_t - ay_t
+        h = torch.clamp((pa_x * ba_x + pa_y * ba_y) / (ba_x * ba_x + ba_y * ba_y + SAFE_EPSILON), 0.0, 1.0)
+        return torch.hypot(pa_x - ba_x * h, pa_y - ba_y * h)
+
+    @staticmethod
+    def fn_sdf_polygon(px, py, radius, sides):
+        """Signed distance to a regular polygon centered at origin."""
+        px_t = _to_tensor(px)
+        py_t = _to_tensor(py)
+        r = _to_float(radius)
+        n = max(int(_to_float(sides)), 3)
+        an = math.pi / n  # half-angle of one segment
+        cos_an = math.cos(an)
+        full_an = 2.0 * an
+        angle = torch.atan2(py_t, px_t)
+        # Fold angle into one segment: [-an, an]
+        sector = angle - full_an * torch.floor((angle + an) / full_an)
+        dist = torch.sqrt(px_t * px_t + py_t * py_t) * torch.cos(sector) - r * cos_an
+        return dist
+
+    # -- Smooth min/max -------------------------------------------------
+
+    @staticmethod
+    def fn_smin(a, b, k):
+        """Polynomial smooth minimum with smoothing radius k."""
+        a_t = _to_tensor(a)
+        b_t = _to_tensor(b)
+        k_t = _to_tensor(k)
+        h = torch.clamp(0.5 + 0.5 * (b_t - a_t) / (k_t + SAFE_EPSILON), 0.0, 1.0)
+        return torch.lerp(b_t, a_t, h) - k_t * h * (1.0 - h)
+
+    @staticmethod
+    def fn_smax(a, b, k):
+        """Polynomial smooth maximum with smoothing radius k."""
+        a_t = _to_tensor(a)
+        b_t = _to_tensor(b)
+        k_t = _to_tensor(k)
+        h = torch.clamp(0.5 - 0.5 * (b_t - a_t) / (k_t + SAFE_EPSILON), 0.0, 1.0)
+        return torch.lerp(b_t, a_t, h) + k_t * h * (1.0 - h)
+
+    # -- Gradient sampling -----------------------------------------------
+
+    @staticmethod
+    def fn_sample_grad(image, u_coord, v_coord):
+        """Sample the luminance gradient of an image at (u, v). Returns vec2 (dx, dy)."""
+        img = _to_tensor(image)
+        u = _to_tensor(u_coord)
+        v = _to_tensor(v_coord)
+        B, H, W, C = img.shape
+        du = 1.0 / max(W - 1, 1)
+        dv = 1.0 / max(H - 1, 1)
+        s_right = TEXStdlib.fn_sample(img, u + du, v)
+        s_left = TEXStdlib.fn_sample(img, u - du, v)
+        s_down = TEXStdlib.fn_sample(img, u, v + dv)
+        s_up = TEXStdlib.fn_sample(img, u, v - dv)
+        # Luminance via Rec.709
+        luma_r = TEXStdlib.fn_luma(s_right)
+        luma_l = TEXStdlib.fn_luma(s_left)
+        luma_d = TEXStdlib.fn_luma(s_down)
+        luma_u = TEXStdlib.fn_luma(s_up)
+        grad_x = (luma_r - luma_l) * 0.5
+        grad_y = (luma_d - luma_u) * 0.5
+        return torch.stack([grad_x, grad_y], dim=-1)
 
     # -- String functions -----------------------------------------------
 
@@ -1274,448 +1543,225 @@ def _lanczos3(x: torch.Tensor) -> torch.Tensor:
     return kernel
 
 
-# -- Noise helpers (module-level) --------------------------------------
+# -- Gaussian blur helpers (module-level) -----------------------------------
 
-# Classic 256-entry Perlin permutation table
-_PERM = torch.tensor([
-    151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,
-    140,36,103,30,69,142,8,99,37,240,21,10,23,190,6,148,
-    247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,
-    57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,
-    74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,
-    60,211,133,230,220,105,92,41,55,46,245,40,244,102,143,54,
-    65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,
-    200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,
-    52,217,226,250,124,123,5,202,38,147,118,126,255,82,85,212,
-    207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,
-    119,248,152,2,44,154,163,70,221,153,101,155,167,43,172,9,
-    129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,
-    218,246,97,228,251,34,242,193,238,210,144,12,191,179,162,241,
-    81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,157,
-    184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,
-    222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180,
-], dtype=torch.int64)
+def _get_gauss_kernels(sigma: float, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Get or create cached horizontal and vertical 1D Gaussian kernels.
 
-# Doubled for overflow-free indexing
-_PERM2 = torch.cat([_PERM, _PERM])
-
-# 8 gradient directions for 2D Perlin noise (unit circle at 45-degree intervals)
-_GRAD2 = torch.tensor([
-    [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
-    [0.7071, 0.7071], [-0.7071, 0.7071],
-    [0.7071, -0.7071], [-0.7071, -0.7071],
-], dtype=torch.float32)
-
-# Pre-split gradient components — avoids 3D view creation during gather+slice.
-# grad[h][..., 0] creates a view into a 3D result; grad_x[h] returns flat 2D directly.
-_GRAD2_X = _GRAD2[:, 0].contiguous()  # shape [8]
-_GRAD2_Y = _GRAD2[:, 1].contiguous()  # shape [8]
-
-# 12 gradient directions for 2D Simplex noise
-_GRAD2_SIMPLEX = torch.tensor([
-    [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
-    [1.0, 1.0], [-1.0, 1.0], [1.0, -1.0], [-1.0, -1.0],
-    [1.0, 0.5], [-1.0, 0.5], [1.0, -0.5], [-1.0, -0.5],
-], dtype=torch.float32)
-
-# Simplex skew/unskew constants
-_SKEW_2D = 0.5 * (math.sqrt(3.0) - 1.0)      # ~0.3660254
-_UNSKEW_2D = (3.0 - math.sqrt(3.0)) / 6.0     # ~0.2113249
-
-
-_noise_tables_cache: dict[str, tuple[torch.Tensor, ...]] = {}
-
-def _get_noise_tables(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Get device-local noise lookup tables (cached).
-
-    Returns (perm, grad, grad_simplex, grad_x, grad_y).
+    Returns (kernel_h, kernel_v) as contiguous [1, 1, 1, K] and [1, 1, K, 1] tensors,
+    ready for depthwise conv2d (expand to [C, 1, ...] before use).
     """
-    key = str(device)
-    cached = _noise_tables_cache.get(key)
+    key = (round(sigma, 3), str(device))
+    cached = _gauss_kernel_cache.get(key)
     if cached is not None:
+        _gauss_kernel_cache.move_to_end(key)
         return cached
-    tables = (
-        _PERM2.to(device), _GRAD2.to(device), _GRAD2_SIMPLEX.to(device),
-        _GRAD2_X.to(device), _GRAD2_Y.to(device),
-    )
-    _noise_tables_cache[key] = tables
-    return tables
+    radius = int(math.ceil(3.0 * sigma))
+    size = 2 * radius + 1
+    x = torch.arange(size, dtype=torch.float32, device=device) - radius
+    kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+    kernel = kernel / kernel.sum()
+    kernel_h = kernel.view(1, 1, 1, size)
+    kernel_v = kernel.view(1, 1, size, 1).contiguous()
+    pair = (kernel_h, kernel_v)
+    _gauss_kernel_cache[key] = pair
+    if len(_gauss_kernel_cache) > _GAUSS_KERNEL_MAX_ENTRIES:
+        _gauss_kernel_cache.popitem(last=False)
+    return pair
 
 
-# ── Arithmetic hash Perlin noise (table-free, TorchInductor-friendly) ────────
-#
-# Replaces permutation table lookups with pure integer arithmetic (lowbias32
-# hash by Chris Wellons). Gradient selection uses branch-free bit arithmetic
-# instead of table gathers. This enables full kernel fusion under torch.compile.
-#
-# The 8-gradient set matches the classic Perlin 2D set:
-#   h&7: 0→(1,0) 1→(-1,0) 2→(0,1) 3→(0,-1)
-#        4→(1,1) 5→(-1,1) 6→(1,-1) 7→(-1,-1)
-# (diagonal components are NOT normalized to 1/√2 — this matches the original
-#  _GRAD2 table which uses 0.7071, but the arithmetic version uses ±1 for
-#  diagonals. The visual difference is negligible and the output range is similar.)
+def _gauss_blur_bchw(img: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Apply separable Gaussian blur to a [B, C, H, W] tensor.
 
-
-def _lowbias32(x: torch.Tensor) -> torch.Tensor:
-    """lowbias32 hash (Chris Wellons). Maps int32 → int32 with good avalanche.
-
-    CRITICAL: PyTorch >> on signed int is arithmetic shift (sign-extends).
-    We mask after every shift to emulate logical (unsigned) shift right.
+    Uses replicate padding at borders and depthwise convolution (groups=C)
+    for channel-independent filtering. Two 1D passes: horizontal then vertical.
     """
-    x = x ^ (torch.bitwise_and(x >> 16, 0x0000FFFF))
-    x = x * 0x21f0aaad
-    x = x ^ (torch.bitwise_and(x >> 15, 0x0001FFFF))
-    x = x * 0x735a2d97
-    x = x ^ (torch.bitwise_and(x >> 15, 0x0001FFFF))
-    return x
-
-
-def _grad2d_dot(h: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
-    """Branch-free gradient dot product for the 8-gradient Perlin set.
-
-    Given hash h (int32) and fractional offsets dx, dy, computes dot(grad, (dx, dy))
-    using only arithmetic — no table lookups or torch.where.
-
-    Gradient mapping (h & 7):
-      0: ( 1, 0) → dx       1: (-1, 0) → -dx
-      2: ( 0, 1) → dy       3: ( 0,-1) → -dy
-      4: ( 1, 1) → dx+dy    5: (-1, 1) → -dx+dy
-      6: ( 1,-1) → dx-dy    7: (-1,-1) → -dx-dy
-
-    Bit decomposition:
-      b0 = h & 1  → sign bit (used by both cardinal and diagonal)
-      b1 = (h>>1) & 1 → axis select for cardinal / y-sign for diagonal
-      b2 = (h>>2) & 1 → diagonal flag (0=cardinal, 1=diagonal)
-
-    Cardinal (b2=0): b0 controls sign, b1 selects axis (0=x, 1=y)
-    Diagonal (b2=1): b0 controls x-sign, b1 controls y-sign
-    """
-    h7 = h & 7
-    b0 = (h7 & 1).float()
-    b1 = ((h7 >> 1) & 1).float()
-    b2 = ((h7 >> 2) & 1).float()
-
-    sign_b0 = 1.0 - 2.0 * b0  # +1 or -1
-    sign_b1 = 1.0 - 2.0 * b1  # +1 or -1
-
-    # Cardinal: gx = sign_b0 * (1-b1), gy = sign_b0 * b1
-    # Diagonal: gx = sign_b0,          gy = sign_b1
-    # Combined via b2 blend:
-    gx = sign_b0 * (1.0 - b1 + b2 * b1)
-    gy = (1.0 - b2) * sign_b0 * b1 + b2 * sign_b1
-
-    return gx * dx + gy * dy
-
-
-def _perlin2d_fast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Arithmetic hash Perlin noise (no table lookups).
-
-    Pure point-wise arithmetic: no external state access.
-    Fully fusible by TorchInductor (torch.compile) and traceable by torch.jit.trace.
-    """
-    x_floor = torch.floor(x)
-    y_floor = torch.floor(y)
-    xi = x_floor.to(torch.int32)
-    yi = y_floor.to(torch.int32)
-
-    xf = x - x_floor
-    yf = y - y_floor
-
-    u = xf * xf * xf * (xf * (xf * 6.0 - 15.0) + 10.0)
-    v = yf * yf * yf * (yf * (yf * 6.0 - 15.0) + 10.0)
-
-    # Arithmetic hash for 4 corners (pre-compute yi products to avoid redundant muls)
-    yi_hash = yi * 0x1B873593
-    yi1_hash = (yi + 1) * 0x1B873593
-    h00 = _lowbias32(xi ^ yi_hash)
-    h10 = _lowbias32((xi + 1) ^ yi_hash)
-    h01 = _lowbias32(xi ^ yi1_hash)
-    h11 = _lowbias32((xi + 1) ^ yi1_hash)
-
-    xf1 = xf - 1.0
-    yf1 = yf - 1.0
-
-    # Gradient dot products — fully inlined for clean tracing
-    g00 = _grad2d_dot(h00, xf, yf)
-    g10 = _grad2d_dot(h10, xf1, yf)
-    g01 = _grad2d_dot(h01, xf, yf1)
-    g11 = _grad2d_dot(h11, xf1, yf1)
-
-    return torch.lerp(torch.lerp(g00, g10, u), torch.lerp(g01, g11, u), v)
-
-
-def _simplex2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """2D Simplex noise. Returns float tensor in approximately [-1, 1].
-
-    Hash calls inlined to eliminate Python function-call overhead.
-    """
-    perm, _, grad, _, _ = _get_noise_tables(x.device)
-
-    # Skew input space to determine simplex cell
-    s = (x + y) * _SKEW_2D
-    i = torch.floor(x + s).long()
-    j = torch.floor(y + s).long()
-
-    # Unskew back to (x, y) space
-    t = (i + j).float() * _UNSKEW_2D
-    X0 = i.float() - t
-    Y0 = j.float() - t
-
-    # Distances from cell origin
-    x0 = x - X0
-    y0 = y - Y0
-
-    # Determine which simplex triangle we're in
-    i1 = (x0 > y0).long()
-    j1 = 1 - i1
-
-    # Offsets for middle and last corners
-    x1 = x0 - i1.float() + _UNSKEW_2D
-    y1 = y0 - j1.float() + _UNSKEW_2D
-    x2 = x0 - 1.0 + 2.0 * _UNSKEW_2D
-    y2 = y0 - 1.0 + 2.0 * _UNSKEW_2D
-
-    # Inline _noise_hash for 3 corners
-    i_mask = i & 255
-    j_mask = j & 255
-    perm_i = perm[i_mask]
-
-    h0 = perm[(perm_i + j_mask) & 511]
-    h1 = perm[(perm[(i_mask + i1) & 255] + ((j + j1) & 255)) & 511]
-    h2 = perm[(perm[(i_mask + 1) & 255] + ((j_mask + 1) & 255)) & 511]
-
-    # h values are already int64 from perm table, so % 12 stays int64
-    gi0 = h0 % 12
-    gi1 = h1 % 12
-    gi2 = h2 % 12
-
-    # Corner contributions: radial falloff (0.5 - d²)⁴ × dot(gradient, offset)
-    t0 = torch.clamp(0.5 - x0 * x0 - y0 * y0, min=0.0)
-    t0 = t0 * t0; t0 = t0 * t0  # t⁴ in 2 muls instead of 3
-    g0 = grad[gi0]
-    n0 = t0 * (g0[..., 0] * x0 + g0[..., 1] * y0)
-
-    t1 = torch.clamp(0.5 - x1 * x1 - y1 * y1, min=0.0)
-    t1 = t1 * t1; t1 = t1 * t1
-    g1 = grad[gi1]
-    n1 = t1 * (g1[..., 0] * x1 + g1[..., 1] * y1)
-
-    t2 = torch.clamp(0.5 - x2 * x2 - y2 * y2, min=0.0)
-    t2 = t2 * t2; t2 = t2 * t2
-    g2 = grad[gi2]
-    n2 = t2 * (g2[..., 0] * x2 + g2[..., 1] * y2)
-
-    # Scale to ~[-1, 1]
-    return 70.0 * (n0 + n1 + n2)
-
-
-def _perlin2d_core(x: torch.Tensor, y: torch.Tensor,
-                    perm: torch.Tensor, gx: torch.Tensor, gy: torch.Tensor) -> torch.Tensor:
-    """Perlin noise core for use in traced FBM. All tables passed as args (no graph breaks)."""
-    x_floor = torch.floor(x)
-    y_floor = torch.floor(y)
-    xi = x_floor.long()
-    yi = y_floor.long()
-    xf = x - x_floor
-    yf = y - y_floor
-    u = xf * 6.0
-    u.sub_(15.0).mul_(xf).add_(10.0).mul_(xf).mul_(xf).mul_(xf)
-    v = yf * 6.0
-    v.sub_(15.0).mul_(yf).add_(10.0).mul_(yf).mul_(yf).mul_(yf)
-    xi_mask = xi & 255
-    yi_mask = yi & 255
-    xi1_mask = (xi_mask + 1) & 255
-    yi1_mask = (yi + 1) & 255
-    perm_xi = perm[xi_mask]
-    perm_xi1 = perm[xi1_mask]
-    h00 = perm[(perm_xi + yi_mask) & 511] & 7
-    h10 = perm[(perm_xi1 + yi_mask) & 511] & 7
-    h01 = perm[(perm_xi + yi1_mask) & 511] & 7
-    h11 = perm[(perm_xi1 + yi1_mask) & 511] & 7
-    xf1 = xf - 1.0
-    yf1 = yf - 1.0
-    g00 = gx[h00] * xf
-    g00.add_(gy[h00] * yf)
-    g10 = gx[h10] * xf1
-    g10.add_(gy[h10] * yf)
-    g01 = gx[h01] * xf
-    g01.add_(gy[h01] * yf1)
-    g11 = gx[h11] * xf1
-    g11.add_(gy[h11] * yf1)
-    return torch.lerp(torch.lerp(g00, g10, u), torch.lerp(g01, g11, u), v)
-
-
-def _make_fbm_fn(octaves: int):
-    """Build a traceable FBM function for a specific octave count.
-    The loop is unrolled by torch.jit.trace into a single straight-line graph.
-    """
-    # Pre-compute amplitude normalization
-    max_amp = sum(0.5 ** i for i in range(octaves))
-    inv_max = 1.0 / max_amp
-
-    def fbm_fn(x, y, perm, gx, gy):
-        result = _perlin2d_core(x, y, perm, gx, gy)
-        freq = 2.0
-        amp = 0.5
-        for _ in range(octaves - 1):
-            result = result + _perlin2d_core(x * freq, y * freq, perm, gx, gy) * amp
-            amp = amp * 0.5
-            freq = freq * 2.0
-        return result * inv_max
-    return fbm_fn
-
-
-def _make_fbm_fast_fn(octaves: int):
-    """Build a traceable FBM function using arithmetic hash noise.
-    No table arguments needed — all hashing is pure arithmetic.
-
-    NOTE: Intentionally duplicates _make_fbm_fn's loop structure.
-    Cannot unify because torch.jit.trace requires fixed argument counts —
-    the table-based version takes (x, y, perm, gx, gy) while this takes (x, y).
-    """
-    max_amp = sum(0.5 ** i for i in range(octaves))
-    inv_max = 1.0 / max_amp
-
-    def fbm_fn(x, y):
-        result = _perlin2d_fast(x, y)
-        freq = 2.0
-        amp = 0.5
-        for _ in range(octaves - 1):
-            result = result + _perlin2d_fast(x * freq, y * freq) * amp
-            amp = amp * 0.5
-            freq = freq * 2.0
-        return result * inv_max
-    return fbm_fn
-
-
-# Cache: (octaves, device) → compiled/traced function or False
-_fbm_fast_traced_cache: dict = {}
-# Track which keys have a torch.compile attempt pending or completed
-_fbm_compile_attempted: set = set()
-
-
-_inductor_available: bool | None = None
-
-def _can_inductor_compile() -> bool:
-    """Check if TorchInductor compilation is available (MSVC on Windows)."""
-    global _inductor_available
-    if _inductor_available is None:
-        import shutil
-        import sys
-        if sys.platform != 'win32':
-            _inductor_available = True  # Linux/macOS have gcc/clang by default
-        else:
-            # Try the robust MSVC setup from compiled.py
-            try:
-                from .compiled import _setup_msvc_env as _setup_compiled_msvc
-                _setup_compiled_msvc()
-            except Exception:
-                pass
-            _inductor_available = shutil.which('cl') is not None
-    return _inductor_available
-
-
-_fbm_compile_lock = threading.Lock()
-
-
-def _try_compile_fbm_fast(octaves: int, key: tuple):
-    """Attempt torch.compile on arithmetic hash FBM, updating cache on success.
-
-    Called synchronously on the Nth call to amortize the ~20-30s compile cost.
-    The compiled version runs ~6x faster than jit.trace, so the compile cost
-    is recovered after ~5 FBM calls at 512x512.
-    """
-    with _fbm_compile_lock:
-        # Double-check under lock (another thread may have compiled already)
-        if key in _fbm_compile_attempted:
-            return
-        _fbm_compile_attempted.add(key)
-    try:
-        # MSVC setup already done by _can_inductor_compile() call
-        fn = _make_fbm_fast_fn(octaves)
-        compiled = torch.compile(fn, backend='inductor', fullgraph=True)
-        # Warm compile with dummy tensors (triggers actual C++ compilation)
-        compiled(torch.rand(1, 64, 64), torch.rand(1, 64, 64))
-        # Success — swap into cache (replaces jit.trace version)
-        _fbm_fast_traced_cache[key] = compiled
-    except Exception:
-        pass  # Keep existing jit.trace version in cache
-
-
-# Counter for FBM calls per key — used to decide when to trigger torch.compile
-_fbm_call_count: dict = {}
-# Number of calls before attempting torch.compile (allows jit.trace to warm up first)
-_COMPILE_AFTER_CALLS = 3
-
-
-def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
-    """Fractional Brownian Motion using Perlin noise.
-    Persistence=0.5, lacunarity=2.0. Octaves clamped to 1-10.
-
-    Uses arithmetic hash (table-free) noise for TorchInductor-friendly execution.
-    Execution tiers:
-      1. First call: eager arithmetic hash (~100ms at 512x512)
-      2. Second call: torch.jit.trace (~94ms — modest improvement)
-      3. After 3 calls: torch.compile/Inductor (~16ms — 6x speedup, ~28s one-time compile)
-    Falls back gracefully if MSVC is unavailable (stays on jit.trace tier).
-    """
-    octaves = max(1, min(octaves, 10))
-    key = (octaves, x.device)
-
-    # Fast path: compiled or traced arithmetic hash FBM
-    fast_cached = _fbm_fast_traced_cache.get(key)
-    if fast_cached is not None and fast_cached is not False:
-        # Check if we should upgrade from jit.trace to torch.compile
-        if key not in _fbm_compile_attempted and _can_inductor_compile():
-            count = _fbm_call_count.get(key, 0) + 1
-            _fbm_call_count[key] = count
-            if count == _COMPILE_AFTER_CALLS:
-                _try_compile_fbm_fast(octaves, key)
-                # Re-read cache (may have been updated)
-                fast_cached = _fbm_fast_traced_cache.get(key, fast_cached)
-        return fast_cached(x, y)
-
-    # Eager execution using arithmetic hash (first call)
-    result = _perlin2d_fast(x, y)
-    max_amp = 1.0
-    amplitude = 0.5
-
-    if octaves > 1:
-        x_sc = x * 2.0
-        y_sc = y * 2.0
-        for _ in range(octaves - 1):
-            result.add_(_perlin2d_fast(x_sc, y_sc), alpha=amplitude)
-            max_amp += amplitude
-            amplitude *= 0.5
-            x_sc.mul_(2.0)
-            y_sc.mul_(2.0)
-        result.div_(max_amp)
-
-    # Cache a traced/compiled version for future calls.
-    # With MSVC available: trace arithmetic hash now, torch.compile later (6x faster).
-    # Without MSVC: trace table-based version (slightly faster than arith hash in jit.trace).
-    if key not in _fbm_fast_traced_cache:
-        if _can_inductor_compile():
-            # Arithmetic hash version — will be upgraded to torch.compile on call 3
-            try:
-                fn = _make_fbm_fast_fn(octaves)
-                _fbm_fast_traced_cache[key] = torch.jit.trace(fn, (x, y))
-            except Exception:
-                _fbm_fast_traced_cache[key] = False
-        else:
-            # No MSVC: use table-based version (faster under jit.trace alone)
-            perm, _, _, gx, gy = _get_noise_tables(x.device)
-            try:
-                fn = _make_fbm_fn(octaves)
-                traced = torch.jit.trace(fn, (x, y, perm, gx, gy))
-                # Wrap to match (x, y) calling convention
-                def _table_wrapper(x, y, _t=traced, _p=perm, _gx=gx, _gy=gy):
-                    return _t(x, y, _p, _gx, _gy)
-                _fbm_fast_traced_cache[key] = _table_wrapper
-            except Exception:
-                _fbm_fast_traced_cache[key] = False
-
+    if sigma < 0.3:
+        return img
+    C = img.shape[1]
+    kernel_h, kernel_v = _get_gauss_kernels(sigma, img.device)
+    radius = kernel_h.shape[-1] // 2
+    # Expand kernels for depthwise conv: [C, 1, 1, K] / [C, 1, K, 1] (no copy)
+    kh = kernel_h.expand(C, 1, 1, -1)
+    kv = kernel_v.expand(C, 1, -1, 1)
+    # Horizontal pass
+    padded = torch.nn.functional.pad(img, (radius, radius, 0, 0), mode='replicate')
+    result = torch.nn.functional.conv2d(padded, kh, groups=C)
+    # Vertical pass
+    padded = torch.nn.functional.pad(result, (0, 0, radius, radius), mode='replicate')
+    result = torch.nn.functional.conv2d(padded, kv, groups=C)
     return result
+
+
+# -- Mipmap helpers (module-level) -----------------------------------------
+
+def _build_mip_pyramid(
+    img: torch.Tensor,
+    cache: _OrderedDict,
+    key,
+    pre_blur_fn=None,
+) -> list[torch.Tensor]:
+    """Build or retrieve a cached mipmap pyramid for a [B, H, W, C] tensor.
+
+    Returns a list of [B, C, H, W] tensors (channel-first for grid_sample).
+    Level 0 is full resolution, each subsequent level is half the size.
+
+    Args:
+        cache: LRU OrderedDict to store the pyramid in.
+        key: cache lookup key.
+        pre_blur_fn: optional callable(bchw_tensor) → blurred bchw_tensor,
+            applied before each downsample (e.g. Gaussian pre-blur).
+    """
+    cached = cache.get(key)
+    if cached is not None and cached[0] == img.shape:
+        cache.move_to_end(key)  # LRU touch
+        return cached[2]
+
+    B, H, W, C = img.shape
+    level0 = img.permute(0, 3, 1, 2)  # [B, H, W, C] → [B, C, H, W]
+    pyramid = [level0]
+
+    current = level0
+    max_levels = min(_MIP_MAX_LEVELS, int(math.log2(max(min(H, W), 1))))
+    for _ in range(max_levels):
+        _, _, ch, cw = current.shape
+        if ch <= 1 or cw <= 1:
+            break
+        src = pre_blur_fn(current) if pre_blur_fn is not None else current
+        nh, nw = max(ch // 2, 1), max(cw // 2, 1)
+        current = torch.nn.functional.interpolate(
+            src, size=(nh, nw), mode='area',
+        )
+        pyramid.append(current)
+
+    # Store tensor ref to prevent GC (keeps data_ptr stable); evict LRU
+    cache[key] = (img.shape, img, pyramid)
+    if len(cache) > _MIP_MAX_ENTRIES:
+        cache.popitem(last=False)
+    return pyramid
+
+
+def _get_mip_pyramid(img: torch.Tensor) -> list[torch.Tensor]:
+    """Area-downsample mipmap pyramid (cached)."""
+    return _build_mip_pyramid(img, _mip_cache, img.data_ptr())
+
+
+def _get_mip_pyramid_gauss(img: torch.Tensor, sigma: float = 1.13) -> list[torch.Tensor]:
+    """Gaussian-prefiltered mipmap pyramid (sigma=1.13, SIGMA_C ≈ 0.825, cached)."""
+    sigma_q = round(sigma, 3)
+    key = (img.data_ptr(), sigma_q)
+    return _build_mip_pyramid(
+        img, _gauss_mip_cache, key,
+        pre_blur_fn=lambda bchw: _gauss_blur_bchw(bchw, sigma),
+    )
+
+
+def _sample_mip_level(
+    level_bchw: torch.Tensor,
+    grid_x: torch.Tensor,
+    grid_y: torch.Tensor,
+) -> torch.Tensor:
+    """Bilinear sample a single mip level. Returns [B, H_out, W_out, C].
+
+    level_bchw: [B, C, Hl, Wl] — the mip level in channel-first layout.
+    grid_x, grid_y: [-1, 1] coords, scalar or [B, H, W].
+    """
+    B_l = level_bchw.shape[0]
+    # Determine output spatial size from grid coords
+    if grid_x.dim() == 0:
+        # Scalar coords → single pixel output
+        gx = grid_x.reshape(1, 1, 1)
+        gy = grid_y.reshape(1, 1, 1)
+        gx = gx.expand(B_l, 1, 1)
+        gy = gy.expand(B_l, 1, 1)
+    elif grid_x.dim() == 3:
+        gx, gy = grid_x, grid_y
+    else:
+        gx = grid_x.unsqueeze(0).expand(B_l, -1, -1)
+        gy = grid_y.unsqueeze(0).expand(B_l, -1, -1)
+
+    grid = torch.stack([gx, gy], dim=-1)  # [B, H_out, W_out, 2]
+
+    result_bchw = torch.nn.functional.grid_sample(
+        level_bchw, grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True,
+    )
+    return result_bchw.permute(0, 2, 3, 1)  # [B, H_out, W_out, C]
+
+
+def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
+    """Trilinear mip sampling shared by sample_mip and sample_mip_gauss.
+
+    pyramid_fn: callable(img) → list of [B, C, H, W] mip levels.
+    """
+    img = image if image.__class__ is torch.Tensor else _to_tensor(image)
+    u = u_coord if u_coord.__class__ is torch.Tensor else _to_tensor(u_coord)
+    v = v_coord if v_coord.__class__ is torch.Tensor else _to_tensor(v_coord)
+    lod_t = lod if lod.__class__ is torch.Tensor else _to_tensor(lod)
+
+    pyramid = pyramid_fn(img)
+    max_level = len(pyramid) - 1
+    lod_t = lod_t.clamp(0.0, float(max_level))
+
+    grid_x = u * 2.0 - 1.0
+    grid_y = v * 2.0 - 1.0
+
+    # Fast path: scalar integer LOD → sample single level, no interpolation
+    if lod_t.dim() == 0:
+        lod_val = lod_t.item()
+        lod_floor = int(lod_val)
+        frac = lod_val - lod_floor
+        if frac < 1e-6:
+            level = min(lod_floor, max_level)
+            return _sample_mip_level(pyramid[level], grid_x, grid_y)
+
+    # General path: trilinear (bilinear per level + lerp between levels)
+    lod_floor = torch.floor(lod_t)
+    lod_frac = lod_t - lod_floor
+    lo = lod_floor.long().clamp(0, max_level)
+    hi = (lo + 1).clamp(0, max_level)
+
+    if lo.dim() == 0:
+        lo_i = lo.item()
+        hi_i = hi.item()
+        s_lo = _sample_mip_level(pyramid[lo_i], grid_x, grid_y)
+        if lo_i == hi_i:
+            return s_lo
+        s_hi = _sample_mip_level(pyramid[hi_i], grid_x, grid_y)
+        return torch.lerp(s_lo, s_hi, lod_frac)
+
+    # Per-pixel LOD: sample all needed levels and blend per-pixel
+    lo_min = lo.min().item()
+    hi_max = hi.max().item()
+    level_samples = {}
+    for lvl in range(lo_min, hi_max + 1):
+        level_samples[lvl] = _sample_mip_level(pyramid[lvl], grid_x, grid_y)
+
+    B, H, W, C = img.shape
+    result = torch.zeros(B, H, W, C, dtype=img.dtype, device=img.device)
+    frac_expanded = lod_frac.unsqueeze(-1) if lod_frac.dim() == 3 else lod_frac
+    for lvl in range(lo_min, hi_max + 1):
+        lo_mask = (lo == lvl).unsqueeze(-1).float()
+        result = result + level_samples[lvl] * lo_mask * (1.0 - frac_expanded)
+        hi_mask = (hi == lvl).unsqueeze(-1).float()
+        result = result + level_samples[lvl] * hi_mask * frac_expanded
+    return result
+
+
+# -- Noise functions (extracted to noise.py) --------------------------------
+from .noise import (
+    _perlin2d_fast, _perlin3d_fast, _simplex2d,
+    _fbm2d, _fbm3d,
+    _worley2d, _worley3d,
+    _curl2d, _curl3d,
+    _ridged2d, _ridged3d,
+    _billow2d, _billow3d,
+    _turbulence2d, _turbulence3d,
+    _flow2d, _flow3d,
+    _alligator2d, _alligator3d,
+)
 
 
 def _to_tensor(x) -> torch.Tensor:

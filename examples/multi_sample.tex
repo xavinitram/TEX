@@ -1,5 +1,12 @@
-// Composite multiple inputs using binding access syntax
-// Connect different images to @A, @B, and a mask to @mask
+// Multi Sample — composite multiple inputs using binding access syntax
+//
+// Demonstrates the three ways to read bindings:
+//   @A        — bare reference (samples at current u,v)
+//   @A(u, v)  — explicit bilinear sample at custom UV coords
+//   @A[ix,iy] — nearest-neighbor fetch at pixel coords
+//
+// Blends @A and @B using a mask with smoothstep feathering.
+// Connect different images to @A, @B, and a mask to @mask.
 
 vec3 sample_a = @A(u, v).rgb;
 vec3 sample_b = @B(u, v).rgb;

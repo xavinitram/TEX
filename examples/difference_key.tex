@@ -1,0 +1,35 @@
+// Difference Key — extract a matte from the difference between two images
+//
+// Compares @A (foreground plate) against @B (clean plate / background) and
+// produces a matte where they differ. Commonly used for quick extraction
+// when a clean plate is available, or for detecting motion between frames.
+//
+// The perceptual distance is computed in luminance-weighted space to match
+// human sensitivity. Smoothstep provides clean edges without harsh aliasing.
+
+f$gain = 5.0;         // difference amplification (higher = more sensitive)
+f$threshold = 0.05;   // minimum difference to register (noise floor)
+f$softness = 0.1;     // edge feathering width
+i$invert = 0;          // 1 = invert the matte
+
+vec3 fg = @A;
+vec3 bg = @B;
+
+// ── Perceptual difference ──────────────────────────────────────────
+// Per-channel absolute difference, then luminance-weighted magnitude.
+// This gives more natural results than raw Euclidean distance because
+// it weights green (highest perceptual sensitivity) appropriately.
+vec3 diff = vec3(abs(fg.r - bg.r), abs(fg.g - bg.g), abs(fg.b - bg.b));
+float d = luma(diff) * $gain;
+
+// ── Soft threshold ─────────────────────────────────────────────────
+float lo = max($threshold - $softness * 0.5, 0.0);
+float hi = $threshold + $softness * 0.5;
+float matte = smoothstep(lo, hi, d);
+
+// ── Optional invert ────────────────────────────────────────────────
+if ($invert > 0) {
+    matte = 1.0 - matte;
+}
+
+m@OUT = matte;

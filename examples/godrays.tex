@@ -1,0 +1,54 @@
+// Godrays — radial light rays with progressive mipmap softening
+//
+// Simulates volumetric light shafts (crepuscular rays) by iteratively
+// sampling along radial lines from a light source toward each pixel.
+// The key innovation over naive radial blur: progressive mip levels.
+//
+// Near the source, samples are sharp (low LOD). As rays travel outward,
+// the mip level increases — samples become pre-filtered and softer. This
+// mimics the physical behavior of light scattering through atmosphere
+// (rays diffuse as they travel) and eliminates the banding artifacts
+// that plague standard radial blur with limited iteration counts.
+//
+// Connect @image with a high-contrast source (threshold or luminance key)
+// for best results. Composite over the original with Add or Screen.
+
+f$center_x = 0.5;     // ray emission point X (0.5 = image center)
+f$center_y = 0.5;     // ray emission point Y
+f$length = 0.5;       // ray extent (0.1 = short, 1.0 = full zoom)
+f$decay = 2.0;        // intensity falloff (1 = linear, 3+ = rapid)
+f$softness = 4.0;     // max mip blur at ray endpoints (0 = sharp rays)
+i$samples = 64;       // ray steps (32 = fast, 128 = smooth)
+f$brightness = 1.0;   // output intensity multiplier
+
+int N = clamp($samples, 8, 256);
+
+// ── Radial ray accumulation ────────────────────────────────────────
+vec3 acc = vec3(0.0);
+float norm = 0.0;
+
+for (int i = 0; i < N; i++) {
+    float t = float(i) / float(N);
+
+    // Quadratic zoom: rays accelerate as they travel, concentrating
+    // samples near the source where detail matters most.
+    float scale = 1.0 + $length * t * t;
+
+    // Zoom toward the light center
+    float su = (u - $center_x) / scale + $center_x;
+    float sv = (v - $center_y) / scale + $center_y;
+
+    // Progressive mip softening: far iterations use higher LOD.
+    // Continuous trilinear mip interpolation replaces discrete pyramid
+    // levels — smoother transitions with no visible banding.
+    float lod = t * $softness;
+
+    // Decay weight: energy falls off with distance from source
+    float w = pow(1.0 - t, $decay);
+
+    acc += sample_mip(@image, su, sv, lod) * w;
+    norm += w;
+}
+
+// Normalize for brightness invariance across sample count and decay.
+@OUT = acc * ($brightness / max(norm, 1.0));

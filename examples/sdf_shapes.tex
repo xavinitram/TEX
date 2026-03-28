@@ -1,0 +1,44 @@
+// SDF Shapes — all four signed-distance-field primitives
+//
+// Renders a circle, box, line, and polygon in the four quadrants of the
+// image. Each SDF returns a signed distance (negative = inside) which
+// is passed through smoothstep for antialiased rendering.
+//
+// Quadrant layout:
+//   top-left  = circle       top-right  = box
+//   bot-left  = line segment  bot-right = polygon (hexagon)
+
+f$edge_soft = 0.005;   // antialiasing width (in UV space)
+
+// Pixel position in UV space (0..1)
+float cx = px;
+float cy = py;
+
+// ── Circle (top-left quadrant, centered at 0.25, 0.25) ─────────
+float d_circle = sdf_circle(cx - 0.25, cy - 0.25, 0.15);
+
+// ── Box (top-right quadrant, centered at 0.75, 0.25) ───────────
+float d_box = sdf_box(cx - 0.75, cy - 0.25, 0.14, 0.10);
+
+// ── Line segment (bottom-left quadrant) ─────────────────────────
+float d_line = sdf_line(cx, cy, 0.10, 0.60, 0.40, 0.85);
+
+// ── Polygon — hexagon (bottom-right quadrant, centered 0.75, 0.75)
+float d_poly = sdf_polygon(cx - 0.75, cy - 0.75, 0.14, 6);
+
+// ── Composite all four shapes ───────────────────────────────────
+// smoothstep maps the signed distance to a soft mask (1 inside, 0 outside)
+float s = $edge_soft;
+float m_circle = 1.0 - smoothstep(-s, s, d_circle);
+float m_box    = 1.0 - smoothstep(-s, s, d_box);
+float m_line   = 1.0 - smoothstep(-s, s, d_line);
+float m_poly   = 1.0 - smoothstep(-s, s, d_poly);
+
+// Give each shape a distinct color
+vec3 col = vec3(0.05);  // dark background
+col = lerp(col, vec3(0.9, 0.2, 0.2), m_circle);   // red circle
+col = lerp(col, vec3(0.2, 0.8, 0.3), m_box);       // green box
+col = lerp(col, vec3(0.3, 0.5, 1.0), m_line);       // blue line
+col = lerp(col, vec3(1.0, 0.8, 0.1), m_poly);       // yellow hexagon
+
+@OUT = col;

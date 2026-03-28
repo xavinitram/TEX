@@ -1,0 +1,118 @@
+// ZDefocus — depth-aware variable-radius defocus blur
+//
+// Simulates camera depth of field by blurring each pixel according to
+// its circle of confusion (CoC), derived from a depth map and camera
+// parameters. This is the same principle used by Nuke's ZDefocus node.
+//
+// The algorithm uses a scatter-as-gather approach with depth-aware
+// rejection weights:
+//   - Far field (background): gathers from neighbors, rejecting any
+//     foreground pixel that should occlude rather than bleed
+//   - Near field (foreground): gathers from neighbors whose own blur
+//     radius is large enough to reach this pixel
+//
+// The two layers are composited (near over far) to produce correct
+// occlusion — sharp foreground objects are not contaminated by
+// background blur, and defocused foreground bleeds over the background.
+//
+// A golden-angle spiral sampling pattern gives smooth, alias-free
+// results with fewer samples than a grid.
+//
+// Connect @image (scene-linear) and @depth (single-channel depth map,
+// 0 = near, 1 = far, or use physical depth units with focal parameters).
+
+f$focus_depth = 0.5;     // depth value of the focal plane (in @depth units)
+f$max_blur = 20.0;       // maximum blur radius in pixels
+f$fstop = 2.8;           // f-stop (lower = shallower DOF, more blur)
+f$focal_length = 50.0;   // focal length in mm (for physical CoC)
+f$highlight_boost = 2.0; // specular emphasis (>1 brightens bokeh highlights)
+f$highlight_threshold = 0.9; // luminance threshold for highlight boost
+i$samples = 48;          // disc samples per pixel (more = smoother)
+
+// ── Circle of Confusion ──────────────────────────────────────────
+// CoC = |depth - focus| * (focal_length^2 / (fstop * focus * (focus - focal_length)))
+// Simplified for normalized depth maps: CoC ∝ |depth - focus| * scale
+float depth = luma(@depth);
+float focus = $focus_depth;
+float coc_scale = $focal_length / max($fstop, 0.5) * 0.01;
+float signed_coc = (depth - focus) * coc_scale;
+float coc = min(abs(signed_coc) * $max_blur, $max_blur);
+float is_foreground = step(signed_coc, 0.0);  // 1 if in front of focus
+
+// Skip blur for in-focus pixels (CoC < 0.5 pixel)
+if (coc < 0.5) {
+    @OUT = @image;
+} else {
+
+    // Precompute constants
+    float highlight_scale = ($highlight_boost - 1.0) * 4.0;
+    float golden_angle = 2.3998632;  // golden angle ≈ 2π / φ²
+    int num_samples = clamp($samples, 8, 512);
+
+    // ── Highlight boost (pre-blur) ───────────────────────────
+    // Real lenses concentrate highlight energy during defocus.
+    // Boost bright pixels before convolution for the optical effect.
+    vec3 center = @image;
+    float center_luma = luma(center);
+    float boost = 1.0 + max(center_luma - $highlight_threshold, 0.0) * highlight_scale;
+
+    vec3 acc_far = vec3(0.0);
+    float wsum_far = 0.0;
+    vec3 acc_near = vec3(0.0);
+    float wsum_near = 0.0;
+
+    for (int i = 0; i < num_samples; i++) {
+        // Spiral coordinates
+        float t = float(i) / float(num_samples);
+        float r = sqrt(t) * coc;  // sqrt for uniform disc distribution
+        float angle = float(i) * golden_angle;
+        float ox = cos(angle) * r * px;
+        float oy = sin(angle) * r * py;
+
+        float su = clamp(u + ox, 0.0, 1.0);
+        float sv = clamp(v + oy, 0.0, 1.0);
+
+        vec3 s = sample(@image, su, sv);
+        float s_depth = luma(sample(@depth, su, sv));
+        float s_coc = min(abs((s_depth - focus) * coc_scale) * $max_blur, $max_blur);
+        float s_foreground = step((s_depth - focus) * coc_scale, 0.0);
+
+        // Highlight emphasis on the sampled pixel
+        float s_luma = luma(s);
+        float s_boost = 1.0 + max(s_luma - $highlight_threshold, 0.0) * highlight_scale;
+        vec3 s_rgb = s * s_boost;
+
+        // ── Far field: gather from same-depth or farther pixels ──
+        // Reject foreground pixels bleeding into background
+        float w_far = step(depth - 0.001, s_depth);  // only same or farther
+        acc_far = acc_far + s_rgb * w_far;
+        wsum_far = wsum_far + w_far;
+
+        // ── Near field: pixel contributes if its blur reaches us ─
+        // A foreground pixel with CoC >= distance-to-us can reach us
+        float dist = r;  // sample distance in pixels
+        float w_near = step(dist, s_coc) * s_foreground;
+        acc_near = acc_near + s_rgb * w_near;
+        wsum_near = wsum_near + w_near;
+    }
+
+    // ── Normalize both layers ────────────────────────────────
+    vec3 far_color = vec3(0.0);
+    if (wsum_far > 0.0) {
+        far_color = acc_far / wsum_far;
+    } else {
+        far_color = center * boost;
+    }
+
+    vec3 near_color = vec3(0.0);
+    float near_alpha = 0.0;
+    if (wsum_near > 0.0) {
+        near_color = acc_near / wsum_near;
+        near_alpha = clamp(wsum_near / float(num_samples) * 4.0, 0.0, 1.0);
+    }
+
+    // ── Composite: near field over far field ─────────────────
+    vec3 result = near_color * near_alpha + far_color * (1.0 - near_alpha);
+
+    @OUT = result;
+}

@@ -1,0 +1,28 @@
+// Erode / Dilate — shrink or grow mask channels
+// Negative radius erodes (shrinks white areas), positive dilates (grows).
+// Uses a circular kernel for clean, round results.
+// Works on any image: applies per-channel min (erode) or max (dilate).
+
+i$radius = 2;   // positive = dilate, negative = erode (try -5 to 5)
+
+int abs_r = abs($radius);
+float r_thresh_sq = (float(abs_r) + 0.5) * (float(abs_r) + 0.5);
+vec3 result = @image.rgb;
+
+for (int dy = -abs_r; dy <= abs_r; dy++) {
+    for (int dx = -abs_r; dx <= abs_r; dx++) {
+        // Circular kernel: skip corners outside the radius
+        if (float(dx * dx + dy * dy) <= r_thresh_sq) {
+            vec3 s = fetch(@image, ix + dx, iy + dy);
+            if ($radius > 0) {
+                // Dilate: take the maximum
+                result = max(result, s);
+            } else {
+                // Erode: take the minimum
+                result = min(result, s);
+            }
+        }
+    }
+}
+
+@OUT = result;

@@ -1,0 +1,12 @@
+// STMap — distort an image using a UV map
+//
+// @map is a color image where R = target U, G = target V.
+// Each pixel in the output samples @image at the UV position
+// encoded in the map. Standard in VFX for baking complex warps.
+// The map should be a 32-bit float image for best precision.
+
+vec3 uv_map = @map;
+float su = uv_map.r;
+float sv = uv_map.g;
+
+@OUT = sample(@image, su, sv).rgb;

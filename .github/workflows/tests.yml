@@ -33,4 +33,4 @@ jobs:
 
       - name: Run tests
         working-directory: TEX_Wrangle
-        run: python -m pytest tests/test_tex.py -v
+        run: python -m pytest tests/ -v -m 'not slow'

@@ -1,5 +1,12 @@
-// Recursive value computation with user-defined functions
-// Creates a mandelbrot-like escape-time fractal
+// Mandelbrot Fractal — escape-time fractal with cosine palette
+//
+// Demonstrates user-defined functions for iterative computation.
+// Maps each pixel to a point in the complex plane, iterates the
+// Mandelbrot recurrence z = z^2 + c, and colors by escape time
+// using a smooth cosine palette.
+//
+// Inputs:  (none — purely procedural)
+// Outputs: @OUT (vec3)
 
 float iterate(float zr, float zi, float cr, float ci, int max_iter) {
     float r = zr;
@@ -19,9 +26,9 @@ float iterate(float zr, float zi, float cr, float ci, int max_iter) {
 }
 
 vec3 palette(float t) {
-    float r = 0.5 + 0.5 * cos(6.28318 * (t + 0.0));
-    float g = 0.5 + 0.5 * cos(6.28318 * (t + 0.33));
-    float b = 0.5 + 0.5 * cos(6.28318 * (t + 0.67));
+    float r = 0.5 + 0.5 * cos(TAU * (t + 0.0));
+    float g = 0.5 + 0.5 * cos(TAU * (t + 0.33));
+    float b = 0.5 + 0.5 * cos(TAU * (t + 0.67));
     return vec3(r, g, b);
 }
 

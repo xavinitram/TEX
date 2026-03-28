@@ -1,0 +1,30 @@
+// Flow & Alligator noise — compare two exotic noise functions
+//
+// Demonstrates flow() and alligator() noise side by side.
+// flow() produces a smoothly advected noise field; alligator()
+// creates a cellular, cracked pattern reminiscent of alligator skin.
+//
+// Modes:
+//   0 = flow noise
+//   1 = alligator noise
+
+f$scale = 5.0;    // spatial frequency of the noise
+i$mode = 0;        // 0 = flow, 1 = alligator
+
+float n = 0.0;
+
+if ($mode == 0) {
+    // Flow noise: smoothly rotating noise field
+    n = flow(u * $scale, v * $scale, 0.0);
+} else {
+    // Alligator noise: cellular fracture pattern
+    n = alligator(u * $scale, v * $scale, 0.0);
+}
+
+// Remap from [-1, 1] to [0, 1]
+n = n * 0.5 + 0.5;
+
+// Color the noise: dark blue in valleys, warm orange on peaks
+vec3 lo = vec3(0.05, 0.1, 0.3);
+vec3 hi = vec3(1.0, 0.6, 0.15);
+@OUT = lerp(lo, hi, n);

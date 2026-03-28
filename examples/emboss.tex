@@ -1,0 +1,43 @@
+// Emboss — directional emboss via offset sampling
+//
+// Creates a raised/carved appearance by computing the luminance difference
+// between the current pixel and an offset pixel. The difference is added
+// to mid-gray (0.5), so raised edges appear bright and recessed edges
+// appear dark — like light hitting a textured surface from one direction.
+//
+// Connect @image to any RGB input.
+
+f$angle = 45.0;         // light direction in degrees (0 = right, 90 = down)
+f$strength = 1.0;       // emboss intensity multiplier
+f$distance = 1.0;       // offset distance in pixels
+f$blend = 0.0;          // blend with original (0 = pure emboss, 1 = overlay)
+
+vec3 col = @image;
+
+// ── Compute offset direction ────────────────────────────────────────
+float rad = $angle * PI / 180.0;
+float dx = cos(rad) * $distance;
+float dy = sin(rad) * $distance;
+
+// Convert pixel offset to UV offset
+float du = dx / iw;
+float dv = dy / ih;
+
+// ── Sample at offset position ───────────────────────────────────────
+vec3 offset_col = sample(@image, u + du, v + dv);
+
+// ── Compute luminance difference ────────────────────────────────────
+float lum_center = luma(col);
+float lum_offset = luma(offset_col);
+float diff = (lum_center - lum_offset) * $strength;
+
+// ── Build emboss result on mid-gray base ────────────────────────────
+// Mid-gray (0.5) is neutral; positive diff = highlight, negative = shadow
+vec3 emboss = vec3(0.5 + diff);
+
+// ── Optional blend with original color ──────────────────────────────
+// When blend > 0, the emboss effect is mixed over the original image,
+// adding a textured/relief look while preserving color.
+vec3 result = lerp(emboss, col + vec3(diff), $blend);
+
+@OUT = clamp(result, 0.0, 1.0);
