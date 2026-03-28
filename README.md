@@ -1,5 +1,9 @@
 # TEX Wrangle
 
+<p align="center">
+  <img src="assets/TEX_Banner.jpg" alt="TEX Wrangle banner">
+</p>
+
 ### Tensor Expression Language for ComfyUI
 
 <p align="center">
