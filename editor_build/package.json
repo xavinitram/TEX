@@ -19,6 +19,7 @@
     "rollup": "^4.0.0"
   },
   "overrides": {
-    "picomatch": ">=4.0.4"
+    "picomatch": ">=4.0.4",
+    "serialize-javascript": ">=7.0.5"
   }
 }
