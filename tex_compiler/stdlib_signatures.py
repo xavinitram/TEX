@@ -113,18 +113,18 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "hsv2rgb":   {"args": (1, 1), "return": _passthrough_type},
     "rgb2hsv":   {"args": (1, 1), "return": _passthrough_type},
 
-    # Sampling
-    "sample":         {"args": (3, 3), "return": lambda _: TEXType.VEC4},  # sample(@A, u, v) — bilinear
-    "fetch":          {"args": (3, 3), "return": lambda _: TEXType.VEC4},  # fetch(@A, px, py) — nearest neighbor
-    "sample_cubic":   {"args": (3, 3), "return": lambda _: TEXType.VEC4},  # sample_cubic(@A, u, v) — Catmull-Rom
-    "sample_lanczos": {"args": (3, 3), "return": lambda _: TEXType.VEC4},  # sample_lanczos(@A, u, v) — Lanczos-3
-    "sample_mip":     {"args": (4, 4), "return": lambda _: TEXType.VEC4},  # sample_mip(@A, u, v, lod) — mipmap trilinear
-    "sample_mip_gauss": {"args": (4, 4), "return": lambda _: TEXType.VEC4},  # sample_mip_gauss(@A, u, v, lod) — Gaussian mipmap trilinear
-    "gauss_blur":     {"args": (2, 2), "return": lambda _: TEXType.VEC4},  # gauss_blur(@A, sigma) — separable Gaussian blur
+    # Sampling — return type matches the binding's type (VEC3 for IMAGE, FLOAT for MASK, etc.)
+    "sample":         {"args": (3, 3), "return": _passthrough_type},
+    "fetch":          {"args": (3, 3), "return": _passthrough_type},
+    "sample_cubic":   {"args": (3, 3), "return": _passthrough_type},
+    "sample_lanczos": {"args": (3, 3), "return": _passthrough_type},
+    "sample_mip":     {"args": (4, 4), "return": _passthrough_type},
+    "sample_mip_gauss": {"args": (4, 4), "return": _passthrough_type},
+    "gauss_blur":     {"args": (2, 2), "return": _passthrough_type},
 
-    # Cross-frame sampling (temporal)
-    "fetch_frame":    {"args": (4, 4), "return": lambda _: TEXType.VEC4},  # fetch_frame(@A, frame, px, py) — nearest from specific frame
-    "sample_frame":   {"args": (4, 4), "return": lambda _: TEXType.VEC4},  # sample_frame(@A, frame, u, v) — bilinear from specific frame
+    # Cross-frame sampling — first arg is still the binding
+    "fetch_frame":    {"args": (4, 4), "return": _passthrough_type},
+    "sample_frame":   {"args": (4, 4), "return": _passthrough_type},
 
     # Noise (all support optional z for 3D: 2 args = 2D, 3 args = 3D)
     "perlin":      {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # perlin(x, y, z?) — Perlin noise

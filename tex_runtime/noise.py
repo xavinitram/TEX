@@ -48,24 +48,12 @@ _PERM = torch.tensor([
 # Doubled for overflow-free indexing
 _PERM2 = torch.cat([_PERM, _PERM])
 
-# 8 gradient directions for 2D Perlin noise (unit circle at 45-degree intervals)
-_GRAD2 = torch.tensor([
-    [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
-    [0.7071, 0.7071], [-0.7071, 0.7071],
-    [0.7071, -0.7071], [-0.7071, -0.7071],
-], dtype=torch.float32)
-
-# Pre-split gradient components — avoids 3D view creation during gather+slice.
-# grad[h][..., 0] creates a view into a 3D result; grad_x[h] returns flat 2D directly.
-_GRAD2_X = _GRAD2[:, 0].contiguous()  # shape [8]
-_GRAD2_Y = _GRAD2[:, 1].contiguous()  # shape [8]
-
-# 12 gradient directions for 2D Simplex noise
-_GRAD2_SIMPLEX = torch.tensor([
-    [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
-    [1.0, 1.0], [-1.0, 1.0], [1.0, -1.0], [-1.0, -1.0],
-    [1.0, 0.5], [-1.0, 0.5], [1.0, -0.5], [-1.0, -0.5],
-], dtype=torch.float32)
+# 8 gradient directions for 2D Perlin noise (unit circle at 45-degree intervals).
+# Pre-split into separate X/Y component tensors — avoids 3D view creation during
+# gather+slice.  grad[h][..., 0] would create a view into a 3D result; flat 1D
+# tensors return flat 2D directly.
+_GRAD2_X = torch.tensor([1.0, -1.0, 0.0, 0.0, 0.7071, -0.7071, 0.7071, -0.7071], dtype=torch.float32)
+_GRAD2_Y = torch.tensor([0.0, 0.0, 1.0, -1.0, 0.7071, 0.7071, -0.7071, -0.7071], dtype=torch.float32)
 
 # Simplex skew/unskew constants
 _SKEW_2D = 0.5 * (math.sqrt(3.0) - 1.0)      # ~0.3660254
@@ -74,18 +62,38 @@ _UNSKEW_2D = (3.0 - math.sqrt(3.0)) / 6.0     # ~0.2113249
 
 _noise_tables_cache: dict[str, tuple[torch.Tensor, ...]] = {}
 
-def _get_noise_tables(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+# Worley/Voronoi 9-neighbor offsets, cached per device to avoid per-call allocation
+_worley_offsets_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+def _get_worley_offsets(device: torch.device, ndim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return cached (dx_off, dy_off) tensors for Worley 9-neighbor lookup."""
+    key = (str(device), ndim)
+    cached = _worley_offsets_cache.get(key)
+    if cached is not None:
+        return cached
+    offsets = torch.tensor([[-1, -1], [-1, 0], [-1, 1],
+                            [0, -1],  [0, 0],  [0, 1],
+                            [1, -1],  [1, 0],  [1, 1]],
+                           dtype=torch.int32, device=device)
+    extra_dims = (1,) * ndim
+    dx_off = offsets[:, 0].view(9, *extra_dims)
+    dy_off = offsets[:, 1].view(9, *extra_dims)
+    _worley_offsets_cache[key] = (dx_off, dy_off)
+    return dx_off, dy_off
+
+
+def _get_noise_tables(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Get device-local noise lookup tables (cached).
 
-    Returns (perm, grad, grad_simplex, grad_x, grad_y).
+    Returns (perm, grad_x, grad_y).
+    Used only by the table-based FBM fallback when MSVC/Inductor is unavailable.
     """
     key = str(device)
     cached = _noise_tables_cache.get(key)
     if cached is not None:
         return cached
     tables = (
-        _PERM2.to(device), _GRAD2.to(device), _GRAD2_SIMPLEX.to(device),
-        _GRAD2_X.to(device), _GRAD2_Y.to(device),
+        _PERM2.to(device), _GRAD2_X.to(device), _GRAD2_Y.to(device),
     )
     _noise_tables_cache[key] = tables
     return tables
@@ -193,17 +201,42 @@ def _perlin2d_fast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.lerp(torch.lerp(g00, g10, u), torch.lerp(g01, g11, u), v)
 
 
-def _simplex2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """2D Simplex noise. Returns float tensor in approximately [-1, 1].
+def _simplex_grad_dot(h: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+    """Arithmetic 12-gradient dot product for 2D simplex noise.
 
-    Hash calls inlined to eliminate Python function-call overhead.
+    Uses 4 bits of the hash to select from 12 gradient directions via
+    branch-free arithmetic. The 12 gradients are:
+      (1,0), (-1,0), (0,1), (0,-1), (1,1), (-1,1), (1,-1), (-1,-1),
+      (1,0.5), (-1,0.5), (1,-0.5), (-1,-0.5)
     """
-    perm, _, grad, _, _ = _get_noise_tables(x.device)
+    # Use bits 0-3 of hash, mod 12
+    gi = (h & 0xF) % 12
 
+    # Compute gradient components arithmetically:
+    # gx: 0 for gi in {2,3}, else +1 or -1 based on gi&1
+    # gy: 0 for gi in {0,1}, else +1 or -1, halved for gi >= 8
+    gx_mask = ((gi != 2) & (gi != 3)).float()
+    gx_sign = 1.0 - 2.0 * (gi & 1).float()
+    gx = gx_mask * gx_sign
+
+    gy_mask = ((gi != 0) & (gi != 1)).float()
+    gy_sign_bit = ((gi >> 1) & 1).float()
+    gy_sign = 1.0 - 2.0 * gy_sign_bit
+    gy_mag = torch.where(gi >= 8, 0.5, 1.0)
+    gy = gy_mask * gy_sign * gy_mag
+
+    return gx * dx + gy * dy
+
+
+def _simplex2d_fast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """2D Simplex noise using arithmetic hash (table-free, Inductor-friendly).
+
+    Uses _lowbias32 hash instead of permutation table for TorchInductor fusion.
+    """
     # Skew input space to determine simplex cell
     s = (x + y) * _SKEW_2D
-    i = torch.floor(x + s).long()
-    j = torch.floor(y + s).long()
+    i = torch.floor(x + s).to(torch.int32)
+    j = torch.floor(y + s).to(torch.int32)
 
     # Unskew back to (x, y) space
     t = (i + j).float() * _UNSKEW_2D
@@ -215,7 +248,8 @@ def _simplex2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     y0 = y - Y0
 
     # Determine which simplex triangle we're in
-    i1 = (x0 > y0).long()
+    gt = (x0 > y0)
+    i1 = gt.to(torch.int32)
     j1 = 1 - i1
 
     # Offsets for middle and last corners
@@ -224,38 +258,117 @@ def _simplex2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     x2 = x0 - 1.0 + 2.0 * _UNSKEW_2D
     y2 = y0 - 1.0 + 2.0 * _UNSKEW_2D
 
-    # Inline _noise_hash for 3 corners
-    i_mask = i & 255
-    j_mask = j & 255
-    perm_i = perm[i_mask]
-
-    h0 = perm[(perm_i + j_mask) & 511]
-    h1 = perm[(perm[(i_mask + i1) & 255] + ((j + j1) & 255)) & 511]
-    h2 = perm[(perm[(i_mask + 1) & 255] + ((j_mask + 1) & 255)) & 511]
-
-    # h values are already int64 from perm table, so % 12 stays int64
-    gi0 = h0 % 12
-    gi1 = h1 % 12
-    gi2 = h2 % 12
+    # Arithmetic hash for 3 corners (no permutation table)
+    h0 = _lowbias32(i * 0x1B873593 ^ j * 0x27D4EB2D)
+    h1 = _lowbias32((i + i1) * 0x1B873593 ^ (j + j1) * 0x27D4EB2D)
+    h2 = _lowbias32((i + 1) * 0x1B873593 ^ (j + 1) * 0x27D4EB2D)
 
     # Corner contributions: radial falloff (0.5 - d²)⁴ × dot(gradient, offset)
     t0 = torch.clamp(0.5 - x0 * x0 - y0 * y0, min=0.0)
-    t0 = t0 * t0; t0 = t0 * t0  # t⁴ in 2 muls instead of 3
-    g0 = grad[gi0]
-    n0 = t0 * (g0[..., 0] * x0 + g0[..., 1] * y0)
+    t0 = t0 * t0; t0 = t0 * t0
+    n0 = t0 * _simplex_grad_dot(h0, x0, y0)
 
     t1 = torch.clamp(0.5 - x1 * x1 - y1 * y1, min=0.0)
     t1 = t1 * t1; t1 = t1 * t1
-    g1 = grad[gi1]
-    n1 = t1 * (g1[..., 0] * x1 + g1[..., 1] * y1)
+    n1 = t1 * _simplex_grad_dot(h1, x1, y1)
 
     t2 = torch.clamp(0.5 - x2 * x2 - y2 * y2, min=0.0)
     t2 = t2 * t2; t2 = t2 * t2
-    g2 = grad[gi2]
-    n2 = t2 * (g2[..., 0] * x2 + g2[..., 1] * y2)
+    n2 = t2 * _simplex_grad_dot(h2, x2, y2)
 
     # Scale to ~[-1, 1]
     return 70.0 * (n0 + n1 + n2)
+
+
+# Number of calls before attempting torch.compile (allows jit.trace to warm up first)
+_COMPILE_AFTER_CALLS = 3
+
+
+# ── 3-tier compilation cache helper ─────────────────────────────────────────
+#
+# Encapsulates the eager → jit.trace → torch.compile upgrade pattern used by
+# simplex, FBM, and Worley noise. Each noise type gets its own _TieredCache
+# instance, eliminating the per-type cache dict / lock / counter boilerplate.
+
+class _TieredCache:
+    """3-tier compilation cache: eager → jit.trace → torch.compile.
+
+    Usage:
+        cache = _TieredCache()
+        # In the noise function:
+        cached = cache.get(key)
+        if cached is not None:
+            cache.try_upgrade(key, compile_fn)
+            return cache.get(key)(*args)
+        result = eager_fn(*args)
+        cache.store(key, lambda: torch.jit.trace(eager_fn, args))
+        return result
+    """
+
+    def __init__(self):
+        self.cache: dict = {}
+        self._compile_attempted: set = set()
+        self._call_count: dict = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        """Return cached callable, or None. False (trace failed) returns None."""
+        val = self.cache.get(key)
+        return val if val is not None and val is not False else None
+
+    def try_upgrade(self, key, compile_fn):
+        """Attempt torch.compile upgrade after _COMPILE_AFTER_CALLS calls.
+
+        compile_fn() should return the compiled callable, or raise on failure.
+        """
+        if key in self._compile_attempted or not _can_inductor_compile():
+            return
+        with self._lock:
+            if key in self._compile_attempted:
+                return
+            count = self._call_count.get(key, 0) + 1
+            self._call_count[key] = count
+            if count < _COMPILE_AFTER_CALLS:
+                return
+            self._compile_attempted.add(key)
+        try:
+            self.cache[key] = compile_fn()
+        except Exception:
+            pass
+        self._call_count.pop(key, None)
+
+    def store(self, key, trace_fn):
+        """Store a traced version on first call. trace_fn() → traced callable or raise."""
+        if key in self.cache:
+            return
+        try:
+            self.cache[key] = trace_fn()
+        except Exception:
+            self.cache[key] = False
+
+
+_simplex_cache = _TieredCache()
+
+
+def _compile_simplex():
+    """Compile simplex with Inductor and warmup."""
+    compiled = torch.compile(_simplex2d_fast, backend='inductor', fullgraph=True)
+    dummy = torch.rand(1, 64, 64)
+    compiled(dummy, dummy)
+    return compiled
+
+
+def _simplex2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """2D Simplex noise with 3-tier compilation (eager → jit.trace → torch.compile)."""
+    key = x.device
+    cached = _simplex_cache.get(key)
+    if cached is not None:
+        _simplex_cache.try_upgrade(key, _compile_simplex)
+        return _simplex_cache.get(key)(x, y)
+
+    result = _simplex2d_fast(x, y)
+    _simplex_cache.store(key, lambda: torch.jit.trace(_simplex2d_fast, (x, y)))
+    return result
 
 
 def _perlin2d_core(x: torch.Tensor, y: torch.Tensor,
@@ -337,16 +450,13 @@ def _make_fbm_fast_fn(octaves: int):
     return fbm_fn
 
 
-# Cache: (octaves, device) → compiled/traced function or False
-_fbm_fast_traced_cache: dict = {}
-# Track which keys have a torch.compile attempt pending or completed
-_fbm_compile_attempted: set = set()
+_fbm_cache = _TieredCache()
 
 
 _inductor_available: bool | None = None
 
 def _can_inductor_compile() -> bool:
-    """Check if TorchInductor compilation is available (MSVC on Windows)."""
+    """Check if TorchInductor is available, enabling FxGraph cache on first call."""
     global _inductor_available
     if _inductor_available is None:
         import shutil
@@ -361,40 +471,15 @@ def _can_inductor_compile() -> bool:
             except Exception:
                 pass
             _inductor_available = shutil.which('cl') is not None
+        if _inductor_available:
+            # Enable persistent FxGraph cache so compiled C++ kernels survive
+            # process restarts — eliminates the ~28s MSVC compile on cold start.
+            try:
+                import torch._inductor.config as _ind_cfg
+                _ind_cfg.fx_graph_cache = True
+            except Exception:
+                pass
     return _inductor_available
-
-
-_fbm_compile_lock = threading.Lock()
-
-
-def _try_compile_fbm_fast(octaves: int, key: tuple):
-    """Attempt torch.compile on arithmetic hash FBM, updating cache on success.
-
-    Called synchronously on the Nth call to amortize the ~20-30s compile cost.
-    The compiled version runs ~6x faster than jit.trace, so the compile cost
-    is recovered after ~5 FBM calls at 512x512.
-    """
-    with _fbm_compile_lock:
-        # Double-check under lock (another thread may have compiled already)
-        if key in _fbm_compile_attempted:
-            return
-        _fbm_compile_attempted.add(key)
-    try:
-        # MSVC setup already done by _can_inductor_compile() call
-        fn = _make_fbm_fast_fn(octaves)
-        compiled = torch.compile(fn, backend='inductor', fullgraph=True)
-        # Warm compile with dummy tensors (triggers actual C++ compilation)
-        compiled(torch.rand(1, 64, 64), torch.rand(1, 64, 64))
-        # Success — swap into cache (replaces jit.trace version)
-        _fbm_fast_traced_cache[key] = compiled
-    except Exception:
-        pass  # Keep existing jit.trace version in cache
-
-
-# Counter for FBM calls per key — used to decide when to trigger torch.compile
-_fbm_call_count: dict = {}
-# Number of calls before attempting torch.compile (allows jit.trace to warm up first)
-_COMPILE_AFTER_CALLS = 3
 
 
 def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
@@ -412,17 +497,15 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
     key = (octaves, x.device)
 
     # Fast path: compiled or traced arithmetic hash FBM
-    fast_cached = _fbm_fast_traced_cache.get(key)
-    if fast_cached is not None and fast_cached is not False:
-        # Check if we should upgrade from jit.trace to torch.compile
-        if key not in _fbm_compile_attempted and _can_inductor_compile():
-            count = _fbm_call_count.get(key, 0) + 1
-            _fbm_call_count[key] = count
-            if count == _COMPILE_AFTER_CALLS:
-                _try_compile_fbm_fast(octaves, key)
-                # Re-read cache (may have been updated)
-                fast_cached = _fbm_fast_traced_cache.get(key, fast_cached)
-        return fast_cached(x, y)
+    cached = _fbm_cache.get(key)
+    if cached is not None:
+        def _compile_fbm():
+            fn = _make_fbm_fast_fn(octaves)
+            compiled = torch.compile(fn, backend='inductor', fullgraph=True)
+            compiled(torch.rand(1, 64, 64), torch.rand(1, 64, 64))
+            return compiled
+        _fbm_cache.try_upgrade(key, _compile_fbm)
+        return _fbm_cache.get(key)(x, y)
 
     # Eager execution using arithmetic hash (first call)
     result = _perlin2d_fast(x, y)
@@ -441,28 +524,19 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
         result.div_(max_amp)
 
     # Cache a traced/compiled version for future calls.
-    # With MSVC available: trace arithmetic hash now, torch.compile later (6x faster).
-    # Without MSVC: trace table-based version (slightly faster than arith hash in jit.trace).
-    if key not in _fbm_fast_traced_cache:
-        if _can_inductor_compile():
-            # Arithmetic hash version — will be upgraded to torch.compile on call 3
-            try:
-                fn = _make_fbm_fast_fn(octaves)
-                _fbm_fast_traced_cache[key] = torch.jit.trace(fn, (x, y))
-            except Exception:
-                _fbm_fast_traced_cache[key] = False
-        else:
-            # No MSVC: use table-based version (faster under jit.trace alone)
-            perm, _, _, gx, gy = _get_noise_tables(x.device)
-            try:
-                fn = _make_fbm_fn(octaves)
-                traced = torch.jit.trace(fn, (x, y, perm, gx, gy))
-                # Wrap to match (x, y) calling convention
-                def _table_wrapper(x, y, _t=traced, _p=perm, _gx=gx, _gy=gy):
-                    return _t(x, y, _p, _gx, _gy)
-                _fbm_fast_traced_cache[key] = _table_wrapper
-            except Exception:
-                _fbm_fast_traced_cache[key] = False
+    # With MSVC: trace arithmetic hash now, torch.compile later (6x faster).
+    # Without MSVC: trace table-based version (slightly faster under jit.trace).
+    if _can_inductor_compile():
+        _fbm_cache.store(key, lambda: torch.jit.trace(_make_fbm_fast_fn(octaves), (x, y)))
+    else:
+        def _trace_table_fbm():
+            perm, gx, gy = _get_noise_tables(x.device)
+            fn = _make_fbm_fn(octaves)
+            traced = torch.jit.trace(fn, (x, y, perm, gx, gy))
+            def _table_wrapper(x, y, _t=traced, _p=perm, _gx=gx, _gy=gy):
+                return _t(x, y, _p, _gx, _gy)
+            return _table_wrapper
+        _fbm_cache.store(key, _trace_table_fbm)
 
     return result
 
@@ -472,49 +546,79 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
 # Evaluates distance to the nearest (F1) and 2nd-nearest (F2) feature points.
 # Each grid cell gets a pseudo-random point via _lowbias32 hash.
 # Checks the 3x3 cell neighborhood (9 cells) for closest points.
+#
+# Uses 3-tier compilation: eager → jit.trace → torch.compile (same as FBM).
 
-def _worley2d(x: torch.Tensor, y: torch.Tensor, return_f2: bool = False) -> torch.Tensor:
-    """2D Worley noise. Returns F1 (nearest) or F2 (2nd nearest) distance.
-
-    Vectorized: computes all 9 neighbor distances in a single batched pass
-    using an extra leading dimension, then reduces with min.
-    """
+def _worley2d_core(x: torch.Tensor, y: torch.Tensor,
+                   dx_off: torch.Tensor, dy_off: torch.Tensor) -> torch.Tensor:
+    """Core Worley distance computation returning all 9 squared distances."""
     x_floor = torch.floor(x)
     y_floor = torch.floor(y)
     xi = x_floor.to(torch.int32)
     yi = y_floor.to(torch.int32)
 
-    # Build 9 neighbor offsets: [-1,0,1] x [-1,0,1]
-    # Shape: [9, 1, 1, ...] broadcast over spatial dims
-    offsets = torch.tensor([[-1, -1], [-1, 0], [-1, 1],
-                            [0, -1],  [0, 0],  [0, 1],
-                            [1, -1],  [1, 0],  [1, 1]],
-                           dtype=torch.int32, device=x.device)
-    # Expand offsets to broadcast: [9] + [1]*ndim
-    extra_dims = (1,) * xi.dim()
-    dx_off = offsets[:, 0].view(9, *extra_dims)
-    dy_off = offsets[:, 1].view(9, *extra_dims)
-
-    # Cell coords for all 9 neighbors: [9, *spatial]
     cx = xi.unsqueeze(0) + dx_off
     cy = yi.unsqueeze(0) + dy_off
 
-    # Hash and random point positions for all 9 cells at once
     base_hash = cx * 0x1B873593 ^ cy * 0x27D4EB2D
     px = cx.float() + (_lowbias32(base_hash) & 0x7FFFFF).float() / 8388607.0
     py = cy.float() + (_lowbias32(base_hash + 0x165667B1) & 0x7FFFFF).float() / 8388607.0
 
-    # Squared distances: [9, *spatial]
     x_exp = x.unsqueeze(0)
     y_exp = y.unsqueeze(0)
-    dist = (x_exp - px).square() + (y_exp - py).square()
+    return (x_exp - px).square() + (y_exp - py).square()
 
+
+def _worley2d_f1(x: torch.Tensor, y: torch.Tensor,
+                 dx_off: torch.Tensor, dy_off: torch.Tensor) -> torch.Tensor:
+    """Worley F1 (nearest) — traceable function for jit.trace/torch.compile."""
+    dist = _worley2d_core(x, y, dx_off, dy_off)
+    return torch.sqrt(dist.min(dim=0).values)
+
+
+def _worley2d_f2(x: torch.Tensor, y: torch.Tensor,
+                 dx_off: torch.Tensor, dy_off: torch.Tensor) -> torch.Tensor:
+    """Worley F2 (2nd nearest) — traceable function for jit.trace/torch.compile."""
+    dist = _worley2d_core(x, y, dx_off, dy_off)
+    sorted_dist, _ = torch.sort(dist, dim=0)
+    return torch.sqrt(sorted_dist[1])
+
+
+_worley_cache = _TieredCache()
+
+
+def _worley2d(x: torch.Tensor, y: torch.Tensor, return_f2: bool = False) -> torch.Tensor:
+    """2D Worley noise with 3-tier compilation.
+
+    Tiers: eager → jit.trace → torch.compile/Inductor.
+    """
+    key = (return_f2, x.device)
+    dx_off, dy_off = _get_worley_offsets(x.device, x.dim())
+
+    # Fast path: cached compiled or traced version
+    cached = _worley_cache.get(key)
+    if cached is not None:
+        def _compile_worley():
+            fn = _worley2d_f2 if return_f2 else _worley2d_f1
+            compiled = torch.compile(fn, backend='inductor', fullgraph=True)
+            dummy = torch.rand(1, 64, 64)
+            warmup_dx, warmup_dy = _get_worley_offsets(dummy.device, dummy.dim())
+            compiled(dummy, dummy, warmup_dx, warmup_dy)
+            return compiled
+        _worley_cache.try_upgrade(key, _compile_worley)
+        return _worley_cache.get(key)(x, y, dx_off, dy_off)
+
+    # Eager execution (first call)
+    dist = _worley2d_core(x, y, dx_off, dy_off)
     if return_f2:
-        # Sort along neighbor dim, take 2nd smallest
         sorted_dist, _ = torch.sort(dist, dim=0)
-        return torch.sqrt(sorted_dist[1])
+        result = torch.sqrt(sorted_dist[1])
     else:
-        return torch.sqrt(dist.min(dim=0).values)
+        result = torch.sqrt(dist.min(dim=0).values)
+
+    fn = _worley2d_f2 if return_f2 else _worley2d_f1
+    _worley_cache.store(key, lambda: torch.jit.trace(fn, (x, y, dx_off, dy_off)))
+    return result
 
 
 # ── Curl noise ───────────────────────────────────────────────────────────────

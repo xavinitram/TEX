@@ -17,7 +17,7 @@ python benchmarks/run_benchmarks.py --quick
 python benchmarks/run_benchmarks.py --full --cold
 
 # Compare against a baseline
-python benchmarks/run_benchmarks.py --compare benchmarks/results/v0.4.0.json
+python benchmarks/run_benchmarks.py --compare benchmarks/results/v0.10.0.json
 ```
 
 ## What It Measures
@@ -93,7 +93,7 @@ Results are saved as JSON in `benchmarks/results/`:
     "cpu_name": "...",
     "cpu_cores": 8,
     "gpu_name": "...",
-    "tex_version": "0.4.0",
+    "tex_version": "0.11.0",
     "git_commit": "ffaff43",
     "git_dirty": true
   },
@@ -135,7 +135,7 @@ python benchmarks/run_benchmarks.py --save benchmarks/results/my_system.json
 4. To compare against a reference:
 
 ```bash
-python benchmarks/run_benchmarks.py --compare benchmarks/results/v0.4.0.json
+python benchmarks/run_benchmarks.py --compare benchmarks/results/v0.10.0.json
 ```
 
 ## Interpreting Comparison Output

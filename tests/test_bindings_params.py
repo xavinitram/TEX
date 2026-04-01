@@ -624,7 +624,7 @@ def test_new_param_types(r: SubTestResult):
 
     # Color param — hex string conversion (test _hex_to_rgb via tex_node)
     try:
-        from TEX_Wrangle.tex_node import _hex_to_rgb
+        from TEX_Wrangle.tex_marshalling import hex_to_rgb as _hex_to_rgb
         rgb = _hex_to_rgb("#FF8000")
         assert abs(rgb[0] - 1.0) < 1e-3, f"R={rgb[0]}"
         assert abs(rgb[1] - 0.502) < 1e-2, f"G={rgb[1]}"
@@ -635,7 +635,7 @@ def test_new_param_types(r: SubTestResult):
 
     # Color param — hex short form
     try:
-        from TEX_Wrangle.tex_node import _hex_to_rgb
+        from TEX_Wrangle.tex_marshalling import hex_to_rgb as _hex_to_rgb
         rgb = _hex_to_rgb("#FFF")
         assert abs(rgb[0] - 1.0) < 1e-3 and abs(rgb[1] - 1.0) < 1e-3 and abs(rgb[2] - 1.0) < 1e-3
         r.ok("param: _hex_to_rgb short form #FFF")
@@ -682,7 +682,7 @@ def test_new_param_types(r: SubTestResult):
 
     # _convert_param_value tests
     try:
-        from TEX_Wrangle.tex_node import _convert_param_value
+        from TEX_Wrangle.tex_marshalling import convert_param_value as _convert_param_value
         # Bool conversion
         assert _convert_param_value(True, {"type_hint": "b"}) == 1.0
         assert _convert_param_value(False, {"type_hint": "b"}) == 0.0

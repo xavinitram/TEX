@@ -137,8 +137,17 @@ class ParamDecl(ASTNode):
     The default_expr (if present) must be a literal.
     """
     name: str = ""
-    type_hint: str = ""                    # "f", "i", "s", "" (auto -> float)
-    default_expr: Optional[ASTNode] = None # Literal for default value
+    # type_hint controls the ComfyUI widget type and value conversion:
+    #   "f"  — float slider (default when omitted)
+    #   "i"  — integer slider
+    #   "s"  — string input
+    #   "b"  — boolean toggle (converted to 0.0/1.0 float)
+    #   "c"  — hex color picker (e.g. "#FF8800" → [R, G, B] float list)
+    #   "v2" — vec2 comma string ("x, y" → [float, float])
+    #   "v3" — vec3 comma string ("x, y, z" → [float, float, float])
+    #   "v4" — vec4 comma string ("x, y, z, w" → [float, float, float, float])
+    type_hint: str = ""
+    default_expr: Optional[ASTNode] = None  # Literal for default value
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +194,19 @@ class BindingRef(ASTNode):
     """@ or $ binding reference: `@A`, `@OUT`, `$strength`, `f@threshold`"""
     name: str = ""               # The part after @ or $
     kind: str = "wire"           # "wire" (@) or "param" ($)
-    type_hint: str = ""          # Explicit type prefix: "f", "i", "v", "v4", "img", "m", "l", "s"
+    # type_hint for wire bindings (@) controls type inference:
+    #   "f"   — float/mask (scalar per pixel)
+    #   "i"   — integer
+    #   "v"   — vec3 image (alias for "v3")
+    #   "v2"  — vec2 image
+    #   "v3"  — vec3 image
+    #   "v4"  — vec4 image (RGBA)
+    #   "img" — image (alias for "v3")
+    #   "m"   — mask (alias for "f")
+    #   "l"   — latent (vec4 with latent metadata passthrough)
+    #   "s"   — string
+    #   ""    — auto-infer from connected input tensor shape
+    type_hint: str = ""
 
 
 @dataclass(slots=True)

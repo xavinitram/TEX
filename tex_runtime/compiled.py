@@ -20,6 +20,7 @@ import math
 import os
 import subprocess
 import sys
+from collections import OrderedDict as _OrderedDict
 from typing import Any, Callable
 
 import torch
@@ -116,7 +117,13 @@ def _setup_msvc_env():
 # ── Caches & state ───────────────────────────────────────────────────
 
 # Compiled executors: (fingerprint, device_type) -> compiled callable
-_compiled_cache: dict[tuple[str, str], Callable] = {}
+# Bounded to prevent memory leaks in long sessions (each entry holds a compiled
+# function with captured closure state, ~100 KB+ per entry).
+_compiled_cache: _OrderedDict[tuple[str, str], Callable] = _OrderedDict()
+# Cap compiled-function cache to limit process memory growth.
+# Each torch.compile'd program adds ~30-60 MB of Inductor-compiled
+# C++ kernels to process RSS. 16 entries ≈ 0.5-1 GB ceiling.
+_COMPILED_CACHE_MAX = 16
 
 # Fingerprints that crashed torch.compile — skip on subsequent calls
 _compile_blacklist: set[str] = set()
@@ -135,13 +142,21 @@ _warnings_shown: set[str] = set()
 # Below this threshold the fusion benefit cannot overcome tracing overhead.
 _COMPILE_OP_THRESHOLD = 8
 
+# Maximum nested loop depth for torch.compile to be beneficial.
+# Deep nesting causes graph breaks and recompilation overhead that
+# exceeds any fusion benefit. Programs above this use codegen-only.
+_COMPILE_MAX_LOOP_DEPTH = 2
+
 
 # ── Helpers ───────────────────────────────────────────────────────────
+
+_WARNINGS_SHOWN_CAP = 256
 
 def _show_once(key: str, msg: str, level: str = "info"):
     """Log a message at most once per session."""
     if key not in _warnings_shown:
-        _warnings_shown.add(key)
+        if len(_warnings_shown) < _WARNINGS_SHOWN_CAP:
+            _warnings_shown.add(key)
         getattr(logger, level)(msg)
 
 
@@ -218,6 +233,22 @@ def _count_tensor_ops(program: Any) -> int:
     return count
 
 
+def _max_loop_depth(program: Any) -> int:
+    """Return the maximum nesting depth of for/while loops in the AST."""
+    from ..tex_compiler.ast_nodes import ForLoop, WhileLoop, IfElse
+    def _depth(stmts: list, current: int) -> int:
+        mx = current
+        for s in stmts:
+            if isinstance(s, (ForLoop, WhileLoop)):
+                mx = max(mx, _depth(s.body, current + 1))
+            elif isinstance(s, IfElse):
+                mx = max(mx, _depth(s.then_body, current))
+                if s.else_body:
+                    mx = max(mx, _depth(s.else_body, current))
+        return mx
+    return _depth(program.statements, 0)
+
+
 def _select_backend(device_type: str) -> str | None:
     """
     Pick the best available torch.compile backend.
@@ -283,11 +314,25 @@ def execute_compiled(
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names)
 
-    # ── Complexity gate: skip torch.compile for trivial programs
-    #    where tracing overhead exceeds any possible fusion benefit.
+    # ── Program analysis gates (only on first compile, not cached reruns)
     if cache_key not in _compiled_cache:
         op_count = _count_tensor_ops(program)
+        # Skip torch.compile for trivial programs (tracing overhead > benefit)
         if op_count < _COMPILE_OP_THRESHOLD:
+            return _plain_execute(program, bindings, type_map, device,
+                                  latent_channel_count, output_names)
+        # Use codegen WITHOUT torch.compile for deeply nested loops
+        # (graph breaks and recompilation make torch.compile slower)
+        loop_depth = _max_loop_depth(program)
+        if loop_depth > _COMPILE_MAX_LOOP_DEPTH:
+            return _codegen_only_execute(program, bindings, type_map, device,
+                                         latent_channel_count, output_names)
+        # Use plain interpreter for programs without spatial tensor context
+        # (procedural noise, etc.) — codegen env setup overhead exceeds
+        # benefit when all operations are on scalar tensors
+        has_spatial = any(isinstance(v, torch.Tensor) and v.dim() >= 3
+                         for v in bindings.values())
+        if not has_spatial:
             return _plain_execute(program, bindings, type_map, device,
                                   latent_channel_count, output_names)
 
@@ -325,8 +370,16 @@ def execute_compiled(
                         return _plain_execute(program, contiguous_bindings, type_map,
                                               device, latent_channel_count, output_names)
                     _compiled_cache[cache_key] = compiled_fn
+                    if len(_compiled_cache) > _COMPILED_CACHE_MAX:
+                        _compiled_cache.popitem(last=False)
+                        # Reclaim Inductor kernel memory from evicted entries
+                        try:
+                            torch._dynamo.reset()
+                        except Exception:
+                            pass
 
                 compiled_fn = _compiled_cache[cache_key]
+                _compiled_cache.move_to_end(cache_key)
                 return compiled_fn(program, contiguous_bindings, type_map, device,
                                    latent_channel_count, output_names)
         except Exception as e:
@@ -374,6 +427,127 @@ def _plain_execute(
                           output_names=output_names)
 
 
+def _build_codegen_env(
+    program: Any, bindings: dict[str, Any],
+    device: torch.device, latent_channel_count: int,
+) -> tuple[dict, tuple | None, set[str]]:
+    """Build the environment dict and spatial shape for codegen execution.
+
+    Returns (env, spatial_shape, used_identifiers).
+    Shared by _codegen_exec and _codegen_only_execute.
+    """
+    env: dict[str, Any] = {}
+    sp = None
+    for v in bindings.values():
+        if isinstance(v, torch.Tensor) and v.dim() >= 3:
+            sp = (v.shape[0], v.shape[1], v.shape[2])
+            break
+
+    used = _collect_identifiers(program)
+    dtype = torch.float32
+
+    if sp:
+        B, H, W = sp
+        if "ix" in used or "u" in used:
+            ix = torch.arange(W, dtype=dtype, device=device).view(1, 1, W)
+            if "ix" in used:
+                env["ix"] = ix
+            if "u" in used:
+                env["u"] = (ix / max(W - 1, 1)).expand(B, H, W)
+        if "iy" in used or "v" in used:
+            iy = torch.arange(H, dtype=dtype, device=device).view(1, H, 1)
+            if "iy" in used:
+                env["iy"] = iy
+            if "v" in used:
+                env["v"] = (iy / max(H - 1, 1)).expand(B, H, W)
+        if "iw" in used:
+            env["iw"] = torch.tensor(float(W), dtype=dtype, device=device)
+        if "ih" in used:
+            env["ih"] = torch.tensor(float(H), dtype=dtype, device=device)
+        if "px" in used:
+            env["px"] = torch.tensor(1.0 / max(W, 1), dtype=dtype, device=device)
+        if "py" in used:
+            env["py"] = torch.tensor(1.0 / max(H, 1), dtype=dtype, device=device)
+        if "fi" in used:
+            env["fi"] = torch.arange(B, dtype=dtype, device=device).view(B, 1, 1)
+        if "fn" in used:
+            env["fn"] = torch.tensor(float(B), dtype=dtype, device=device)
+    else:
+        _scalar_defaults = {"ix": 0.0, "iy": 0.0, "u": 0.0, "v": 0.0,
+                            "iw": 1.0, "ih": 1.0, "px": 1.0, "py": 1.0,
+                            "fi": 0.0, "fn": 1.0}
+        for name, val in _scalar_defaults.items():
+            if name in used:
+                env[name] = torch.tensor(val, device=device)
+
+    if "PI" in used:
+        env["PI"] = torch.tensor(math.pi, dtype=dtype, device=device)
+    if "TAU" in used:
+        env["TAU"] = torch.tensor(math.tau, dtype=dtype, device=device)
+    if "E" in used:
+        env["E"] = torch.tensor(math.e, dtype=dtype, device=device)
+    if "ic" in used:
+        env["ic"] = torch.tensor(float(latent_channel_count), dtype=dtype, device=device)
+
+    return env, sp, used
+
+
+def _codegen_only_execute(
+    program: Any,
+    bindings: dict[str, Any],
+    type_map: dict,
+    device: str | torch.device,
+    latent_channel_count: int = 0,
+    output_names: list[str] | None = None,
+) -> torch.Tensor | dict:
+    """Execute via codegen flat function WITHOUT torch.compile.
+
+    For loop-heavy programs where torch.compile overhead exceeds benefit.
+    Still faster than the tree-walking interpreter (no per-node dispatch).
+    Falls back to plain interpreter if codegen fails.
+    """
+    try:
+        cg_fn = _try_codegen(program, type_map)
+    except Exception:
+        cg_fn = None
+
+    if cg_fn is None:
+        return _plain_execute(program, bindings, type_map, device,
+                              latent_channel_count, output_names)
+
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+
+    # Ensure tensor bindings are contiguous (same as torch.compile path)
+    contiguous_bindings = {}
+    for k, v in bindings.items():
+        if isinstance(v, torch.Tensor) and not v.is_contiguous():
+            contiguous_bindings[k] = v.contiguous()
+        else:
+            contiguous_bindings[k] = v
+
+    env, sp, _ = _build_codegen_env(program, contiguous_bindings, dev, latent_channel_count)
+    stdlib_fns = TEXStdlib.get_functions()
+
+    try:
+        with torch.inference_mode():
+            cg_fn(env, contiguous_bindings, stdlib_fns, dev, sp,
+                   torch, _broadcast_pair, _ensure_spatial, torch.where,
+                   math, SAFE_EPSILON, CHANNEL_MAP, _MAX_LOOP_ITERATIONS,
+                   _CgBreak, _CgContinue)
+    except Exception as e:
+        _show_once(
+            "codegen_only_fallback",
+            f"[TEX] Codegen-only execution failed, falling back to interpreter: {e}",
+            level="warning",
+        )
+        return _plain_execute(program, bindings, type_map, device,
+                              latent_channel_count, output_names)
+
+    if output_names is not None:
+        return {name: contiguous_bindings[name] for name in output_names}
+    return contiguous_bindings.get("OUT")
+
+
 def _try_compile(
     cache_key: tuple[str, str], device_type: str,
     program: Any = None, type_map: dict | None = None,
@@ -417,69 +591,13 @@ def _try_compile(
         def _codegen_exec(program, bindings, type_map, device,
                           latent_channel_count=0, output_names=None):
             dev = torch.device(device) if not isinstance(device, torch.device) else device
-            env = {}
+            env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count)
 
-            # Determine spatial shape from image bindings
-            sp = None
-            for v in bindings.values():
-                if isinstance(v, torch.Tensor) and v.dim() >= 3:
-                    sp = (v.shape[0], v.shape[1], v.shape[2])
-                    break
-
-            # Create builtins (same logic as Interpreter._create_builtins)
-            # u/v use expand() (view, no copy) for torch.stack compat in sampling
-            used = _collect_identifiers(program)
-            if sp:
-                B, H, W = sp
-                dtype = torch.float32
-                if "ix" in used or "u" in used:
-                    ix = torch.arange(W, dtype=dtype, device=dev).view(1, 1, W)
-                    if "ix" in used:
-                        env["ix"] = ix
-                    if "u" in used:
-                        env["u"] = (ix / max(W - 1, 1)).expand(B, H, W)
-                if "iy" in used or "v" in used:
-                    iy = torch.arange(H, dtype=dtype, device=dev).view(1, H, 1)
-                    if "iy" in used:
-                        env["iy"] = iy
-                    if "v" in used:
-                        env["v"] = (iy / max(H - 1, 1)).expand(B, H, W)
-                if "iw" in used:
-                    env["iw"] = torch.tensor(float(W), dtype=dtype, device=dev)
-                if "ih" in used:
-                    env["ih"] = torch.tensor(float(H), dtype=dtype, device=dev)
-                if "px" in used:
-                    env["px"] = torch.tensor(1.0 / max(W, 1), dtype=dtype, device=dev)
-                if "py" in used:
-                    env["py"] = torch.tensor(1.0 / max(H, 1), dtype=dtype, device=dev)
-                if "fi" in used:
-                    env["fi"] = torch.arange(B, dtype=dtype, device=dev).view(B, 1, 1)
-                if "fn" in used:
-                    env["fn"] = torch.tensor(float(B), dtype=dtype, device=dev)
-            else:
-                _scalar_defaults = {"ix": 0.0, "iy": 0.0, "u": 0.0, "v": 0.0,
-                                    "iw": 1.0, "ih": 1.0, "px": 1.0, "py": 1.0,
-                                    "fi": 0.0, "fn": 1.0}
-                for name, val in _scalar_defaults.items():
-                    if name in used:
-                        env[name] = torch.tensor(val, device=dev)
-
-            if "PI" in used:
-                env["PI"] = torch.tensor(math.pi, dtype=torch.float32, device=dev)
-            if "TAU" in used:
-                env["TAU"] = torch.tensor(math.tau, dtype=torch.float32, device=dev)
-            if "E" in used:
-                env["E"] = torch.tensor(math.e, dtype=torch.float32, device=dev)
-            if "ic" in used:
-                env["ic"] = torch.tensor(float(latent_channel_count), dtype=torch.float32, device=dev)
-
-            # Call the codegen-generated function
             cg_fn(env, bindings, stdlib_fns, dev, sp,
                    torch, _broadcast_pair, _ensure_spatial, torch.where,
                    math, SAFE_EPSILON, CHANNEL_MAP, _MAX_LOOP_ITERATIONS,
                    _CgBreak, _CgContinue)
 
-            # Extract outputs
             if output_names is not None:
                 return {name: bindings[name] for name in output_names}
             return bindings.get("OUT")
@@ -500,8 +618,10 @@ def _try_compile(
 
             tc_dir = str(get_cache().torch_compile_cache_dir)
             os.makedirs(tc_dir, exist_ok=True)
-            # Point inductor's disk cache here
+            # Point inductor's disk cache here and enable FxGraph caching
+            # to persist compiled kernels across process restarts
             torch._inductor.config.cache_dir = tc_dir  # type: ignore[attr-defined]
+            torch._inductor.config.fx_graph_cache = True  # type: ignore[attr-defined]
         except Exception:
             pass  # Not critical — torch uses its default cache location
 

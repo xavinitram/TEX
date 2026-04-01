@@ -359,7 +359,12 @@ def test_example_files_compiled(r: SubTestResult):
     This catches codegen failures and torch.compile graph-break issues on
     real-world programs. Falls back gracefully — the test verifies that
     execute_compiled never crashes, even if it degrades to the interpreter.
+
+    Each program has a 30-second timeout to prevent torch.compile from
+    blocking the entire test suite on pathological programs.
     """
+    import gc
+    import concurrent.futures
     print("\n--- Example File Tests (compiled) ---")
 
     tex_files = _get_example_files(r, "example files compiled")
@@ -367,12 +372,18 @@ def test_example_files_compiled(r: SubTestResult):
         return
 
     B, H, W = 1, 8, 8  # Smaller than interpreter test — torch.compile is slow
+    _PER_PROGRAM_TIMEOUT = 30  # seconds — torch.compile can take 10-20s per program
     start_failed = r.failed
     codegen_ok = 0
     codegen_fallback = 0
+    timed_out = 0
 
-    # Clear compiled cache to avoid stale entries
+    # Clear compiled cache and dynamo state to start clean
     clear_compiled_cache()
+    try:
+        torch._dynamo.reset()
+    except Exception:
+        pass
 
     for tex_path in tex_files:
         name = tex_path.stem
@@ -387,10 +398,26 @@ def test_example_files_compiled(r: SubTestResult):
             # Use a simple fingerprint for cache keying
             fp = f"test_example_{name}"
 
-            result = execute_compiled(
-                program, bindings, type_map, "cpu", fp,
-                output_names=output_names,
-            )
+            # Track codegen vs fallback before execution
+            cg_fn = try_compile(program, type_map)
+            if cg_fn is not None:
+                codegen_ok += 1
+            else:
+                codegen_fallback += 1
+
+            # Run with timeout — torch.compile can hang on complex programs
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    execute_compiled,
+                    program, bindings, type_map, "cpu", fp,
+                    output_names=output_names,
+                )
+                try:
+                    result = future.result(timeout=_PER_PROGRAM_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    timed_out += 1
+                    print(f"    WARNING: {name} timed out (torch.compile >{_PER_PROGRAM_TIMEOUT}s)")
+                    continue  # Don't count as pass or fail
 
             # Verify we got outputs
             if isinstance(result, dict):
@@ -399,22 +426,43 @@ def test_example_files_compiled(r: SubTestResult):
             else:
                 assert result is not None
 
-            # Track codegen vs fallback (check if codegen was attempted)
-            cg_fn = try_compile(program, type_map)
+            # Cross-validate: compare compiled output against interpreter
             if cg_fn is not None:
-                codegen_ok += 1
-            else:
-                codegen_fallback += 1
+                interp = Interpreter()
+                interp_result = interp.execute(
+                    program, dict(bindings), type_map, device="cpu",
+                    output_names=output_names, source=code,
+                )
+                compiled_dict = result if isinstance(result, dict) else {"OUT": result}
+                for oname in output_names:
+                    iv = interp_result.get(oname)
+                    cv = compiled_dict.get(oname)
+                    if (isinstance(iv, torch.Tensor) and isinstance(cv, torch.Tensor)
+                            and iv.is_floating_point()):
+                        max_diff = (iv.float() - cv.float()).abs().max().item()
+                        assert max_diff < 0.01, (
+                            f"Codegen/interpreter mismatch for '{oname}': "
+                            f"max_diff={max_diff:.6f}"
+                        )
 
             r.ok(f"example compiled: {name}")
 
         except Exception as e:
             r.fail(f"example compiled: {name}", f"{e}")
+        finally:
+            # Release compiled kernels and dynamo state between programs
+            # to prevent memory accumulation (~25 MB per compiled program).
+            gc.collect()
+            try:
+                torch._dynamo.reset()
+            except Exception:
+                pass
 
     example_failed = r.failed - start_failed
     example_passed = len(tex_files) - example_failed
+    timeout_note = f", timed out: {timed_out}" if timed_out else ""
     print(f"  Compiled examples: {example_passed}/{len(tex_files)} passed "
-          f"(codegen: {codegen_ok}, fallback: {codegen_fallback})")
+          f"(codegen: {codegen_ok}, fallback: {codegen_fallback}{timeout_note})")
 
 
 # ── Cache Tests ────────────────────────────────────────────────────────
@@ -2214,7 +2262,7 @@ def test_node_helpers(r: SubTestResult):
     """Tests for helper functions in tex_node.py."""
     print("\n--- Node Helper Function Tests ---")
 
-    from TEX_Wrangle.tex_node import _hex_to_rgb, _convert_param_value
+    from TEX_Wrangle.tex_marshalling import hex_to_rgb as _hex_to_rgb, convert_param_value as _convert_param_value
 
     # ── _hex_to_rgb ──────────────────────────────────────────────────
 

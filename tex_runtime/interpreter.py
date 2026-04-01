@@ -715,7 +715,7 @@ class Interpreter:
         # Vector array: dim 5 (spatial) or 2 (non-spatial) → [..., N, C]
         if array.dim() in (2, 5):
             arr_size = array.shape[-2]
-            idx = torch.clamp(torch.floor(index).long(), 0, arr_size - 1)
+            idx = _safe_array_index(index, arr_size)
             result = array.clone()
 
             if result.dim() == 2:
@@ -739,7 +739,7 @@ class Interpreter:
         else:
             # Scalar array: dim 4 (spatial) or 1 (non-spatial) → [..., N]
             arr_size = array.shape[-1]
-            idx = torch.clamp(torch.floor(index).long(), 0, arr_size - 1)
+            idx = _safe_array_index(index, arr_size)
             result = array.clone()
 
             if result.dim() == 1:
@@ -910,7 +910,52 @@ class Interpreter:
             return
 
         # Spatial condition: vectorized both-branch evaluation
-        # Selective cloning: only snapshot variables that are assigned in branches
+        self._exec_spatial_if(node, cond)
+
+    def _snapshot_vars(
+        self, keys: set[str], source: dict,
+    ) -> dict[str, Any]:
+        """Clone tensor values (or copy non-tensors) for the given keys."""
+        snap = {}
+        for k in keys:
+            v = source.get(k)
+            if v is not None:
+                snap[k] = v.clone() if isinstance(v, torch.Tensor) else v
+        return snap
+
+    @staticmethod
+    def _merge_branch_vars(
+        cond_bool: torch.Tensor, cond_scalar_box: list,
+        target: dict, keys: set[str],
+        then_vals: dict, else_vals: dict,
+    ) -> None:
+        """Merge then/else branch values into *target* using torch.where.
+
+        *cond_scalar_box* is a single-element list used as a lazy cache for
+        the majority-vote scalar (needed for string merges).
+        """
+        for key in keys:
+            then_val = then_vals.get(key)
+            else_val = else_vals.get(key)
+            if then_val is not None and else_val is not None:
+                if isinstance(then_val, torch.Tensor) and isinstance(else_val, torch.Tensor):
+                    target[key] = _tensor_where(cond_bool, then_val, else_val)
+                elif isinstance(then_val, str) or isinstance(else_val, str):
+                    if not cond_scalar_box:
+                        cond_scalar_box.append(
+                            cond_bool.float().mean().item() > 0.5
+                        )
+                    target[key] = then_val if cond_scalar_box[0] else else_val
+                else:
+                    target[key] = then_val
+            elif then_val is not None:
+                target[key] = then_val
+            elif else_val is not None:
+                target[key] = else_val
+
+    def _exec_spatial_if(self, node: IfElse, cond: torch.Tensor):
+        """Execute a spatial (vectorized) if/else with torch.where merging."""
+        # Selective cloning: only snapshot variables that are assigned in branches.
         # Cache by node id — AST is immutable, so results never change.
         node_id = id(node)
         cached = self._assigned_vars_cache.get(node_id)
@@ -925,36 +970,23 @@ class Interpreter:
             self._assigned_vars_cache[node_id] = (modified_env, modified_bindings)
 
         # Snapshot only modified variables that already exist
-        # (new declarations inside branches don't need snapshots)
-        env_snapshot = {}
-        for k in modified_env:
-            v = self.env.get(k)
-            if v is not None:
-                env_snapshot[k] = v.clone() if isinstance(v, torch.Tensor) else v
-        bindings_snapshot = {}
-        for k in modified_bindings:
-            v = self.bindings.get(k)
-            if v is not None:
-                bindings_snapshot[k] = v.clone() if isinstance(v, torch.Tensor) else v
-        # Only snapshot array metadata if arrays are actually used
+        env_snapshot = self._snapshot_vars(modified_env, self.env)
+        bindings_snapshot = self._snapshot_vars(modified_bindings, self.bindings)
         has_arrays = bool(self._array_meta)
         if has_arrays:
             meta_snapshot = dict(self._array_meta)
 
-        # Execute then-branch
+        # Execute then-branch and capture modified state
         for stmt in node.then_body:
             self._exec_stmt(stmt)
-        # Capture then-state for modified vars only
         then_env = {k: self.env.get(k) for k in modified_env}
         then_bindings = {k: self.bindings.get(k) for k in modified_bindings}
         if has_arrays:
             then_meta = dict(self._array_meta)
 
-        # Restore modified vars and execute else-branch
-        for k, v in env_snapshot.items():
-            self.env[k] = v
-        for k, v in bindings_snapshot.items():
-            self.bindings[k] = v
+        # Restore snapshot and execute else-branch
+        self.env.update(env_snapshot)
+        self.bindings.update(bindings_snapshot)
         if has_arrays:
             self._array_meta = dict(meta_snapshot)
 
@@ -967,34 +999,19 @@ class Interpreter:
             else_env = env_snapshot
             else_bindings = bindings_snapshot
 
-        # Merge using torch.where (tensors) or scalar condition (strings)
+        # Merge using torch.where (tensors) or scalar majority-vote (strings)
         cond_bool = (cond > 0.5) if cond.is_floating_point() else cond.bool()
-        # Lazy string majority-vote (computed once if any string merge is needed)
-        _cond_scalar = None
+        cond_scalar_box: list = []  # lazy cache for string merge
+        self._merge_branch_vars(
+            cond_bool, cond_scalar_box,
+            self.env, modified_env, then_env, else_env,
+        )
+        self._merge_branch_vars(
+            cond_bool, cond_scalar_box,
+            self.bindings, modified_bindings, then_bindings, else_bindings,
+        )
 
-        def _merge_into(target, keys, then_vals, else_vals):
-            nonlocal _cond_scalar
-            for key in keys:
-                then_val = then_vals.get(key)
-                else_val = else_vals.get(key)
-                if then_val is not None and else_val is not None:
-                    if isinstance(then_val, torch.Tensor) and isinstance(else_val, torch.Tensor):
-                        target[key] = _tensor_where(cond_bool, then_val, else_val)
-                    elif isinstance(then_val, str) or isinstance(else_val, str):
-                        if _cond_scalar is None:
-                            _cond_scalar = cond.float().mean().item() > 0.5
-                        target[key] = then_val if _cond_scalar else else_val
-                    else:
-                        target[key] = then_val
-                elif then_val is not None:
-                    target[key] = then_val
-                elif else_val is not None:
-                    target[key] = else_val
-
-        _merge_into(self.env, modified_env, then_env, else_env)
-        _merge_into(self.bindings, modified_bindings, then_bindings, else_bindings)
-
-        # Merge array metadata from then-branch (else-branch meta is already in self)
+        # Merge array metadata from then-branch
         if has_arrays:
             self._array_meta.update(then_meta)
 
@@ -1209,7 +1226,7 @@ class Interpreter:
         # Vector array: dim 5 (spatial) or 2 (non-spatial) → [..., N, C]
         if array.dim() in (2, 5):
             arr_size = array.shape[-2]
-            idx = torch.clamp(torch.floor(index).long(), 0, arr_size - 1)
+            idx = _safe_array_index(index, arr_size)
 
             if array.dim() == 2:
                 # Non-spatial: [N, C]
@@ -1228,7 +1245,7 @@ class Interpreter:
 
         # Scalar array: dim 4 (spatial) or 1 (non-spatial) → [..., N]
         arr_size = array.shape[-1]
-        idx = torch.clamp(torch.floor(index).long(), 0, arr_size - 1)
+        idx = _safe_array_index(index, arr_size)
 
         if array.dim() == 1:
             return array[idx]
@@ -1263,21 +1280,21 @@ class Interpreter:
                             if rt.is_vector:
                                 return torch.matmul(left, right.unsqueeze(-1)).squeeze(-1)
 
-            # Ensure compatible shapes (inline the common equal-dim case)
-            if left.dim() != right.dim():
-                ld, rd = left.dim(), right.dim()
+            # Ensure compatible shapes.
+            # Fast path: same shape — skip all checks (most common case in loops)
+            ld = left.dim()
+            rd = right.dim()
+            if ld != rd:
                 if ld == 0 or rd == 0:
-                    pass  # PyTorch broadcasts 0-d scalars natively — no intervention needed
+                    pass  # PyTorch broadcasts 0-d scalars natively
                 elif ld == 3 and rd == 4:
                     left = left.unsqueeze(-1)
                 elif ld == 4 and rd == 3:
                     right = right.unsqueeze(-1)
                 else:
                     left, right = _broadcast_pair(left, right)
-            elif left.dim() == right.dim() and left.dim() >= 1:
-                # Both same rank — delegate channel padding to _broadcast_pair
-                if left.shape[-1] != right.shape[-1]:
-                    left, right = _broadcast_pair(left, right)
+            elif ld >= 1 and left.shape[-1] != right.shape[-1]:
+                left, right = _broadcast_pair(left, right)
 
             # Inline operator dispatch (avoids lambda call overhead)
             if op == "+":
@@ -1516,10 +1533,14 @@ class Interpreter:
                         all_scalar = False
                         break
                 if all_scalar:
-                    result = torch.empty(*spatial, n, dtype=self._dtype, device=self.device)
-                    for i, c in enumerate(args):
-                        result[..., i] = _ensure_spatial(c, spatial)
-                    return result
+                    # Expand scalars to spatial shape, then stack.
+                    # expand() is a zero-copy view — cheaper than
+                    # torch.empty() + per-channel indexed assignment.
+                    return torch.stack(
+                        [c.expand(spatial) if c.shape != spatial else c
+                         for c in args],
+                        dim=-1,
+                    )
             else:
                 args = [self._eval(arg) for arg in node_args]
                 all_scalar = True
@@ -1725,6 +1746,14 @@ def _collect_identifiers(program: Program) -> frozenset[str]:
 
 
 # -- Module-level utility functions ------------------------------------
+
+def _safe_array_index(idx: torch.Tensor, size: int) -> torch.Tensor:
+    """Clamp a float index tensor to valid array bounds and convert to int64.
+
+    Equivalent to ``torch.clamp(torch.floor(idx).long(), 0, size - 1)``.
+    """
+    return torch.clamp(torch.floor(idx).long(), 0, size - 1)
+
 
 def _ensure_spatial(tensor: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:
     """Expand a tensor to match a spatial shape [B, H, W] if needed."""

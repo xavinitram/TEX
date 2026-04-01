@@ -362,19 +362,21 @@ def _fold_function(node: FunctionCall) -> ASTNode:
 
 # ── Dead Code Elimination ─────────────────────────────────────────────
 
-def _eliminate_dead_code(stmts: list[ASTNode]) -> list[ASTNode]:
+def _eliminate_dead_code(stmts: list[ASTNode],
+                         outer_used: set[str] | None = None) -> list[ASTNode]:
     """Remove dead variable declarations/assignments.
 
     A local variable is "dead" if it is assigned but never read by any
     subsequent statement, binding assignment, or nested scope. Binding
     references (@name) and params ($name) are never eliminated.
 
-    This is a conservative single-pass analysis — it only removes
-    obviously dead assignments, not assignments made dead by later
-    reassignments (which would require a more complex analysis).
+    outer_used: names referenced in enclosing scopes. Variables assigned
+    inside a branch but read in the outer scope must not be eliminated.
     """
     # Step 1: collect all referenced variable names across the entire block
     used = _collect_used_names(stmts)
+    if outer_used:
+        used |= outer_used
 
     # Step 2: filter out dead VarDecls (local vars that are never read)
     result = []
@@ -390,16 +392,16 @@ def _eliminate_dead_code(stmts: list[ASTNode]) -> list[ASTNode]:
                 if not _has_side_effects(stmt.value):
                     continue
 
-        # Recurse into compound statements
+        # Recurse into compound statements, propagating outer liveness
         if isinstance(stmt, IfElse):
-            stmt.then_body = _eliminate_dead_code(stmt.then_body)
-            stmt.else_body = _eliminate_dead_code(stmt.else_body)
+            stmt.then_body = _eliminate_dead_code(stmt.then_body, used)
+            stmt.else_body = _eliminate_dead_code(stmt.else_body, used)
         elif isinstance(stmt, ForLoop):
-            stmt.body = _eliminate_dead_code(stmt.body)
+            stmt.body = _eliminate_dead_code(stmt.body, used)
         elif isinstance(stmt, WhileLoop):
-            stmt.body = _eliminate_dead_code(stmt.body)
+            stmt.body = _eliminate_dead_code(stmt.body, used)
         elif isinstance(stmt, FunctionDef):
-            stmt.body = _eliminate_dead_code(stmt.body)
+            stmt.body = _eliminate_dead_code(stmt.body, used)
 
         result.append(stmt)
 
@@ -1208,6 +1210,18 @@ def _unroll_small_loops(stmts: list[ASTNode]) -> list[ASTNode]:
             stmt.body = _unroll_small_loops(stmt.body)
             result.append(stmt)
         elif isinstance(stmt, ForLoop):
+            # Skip unrolling if this loop contains a nested ForLoop — these
+            # are stencil candidates (box blur, min/max pool, median) that the
+            # codegen specialises into bulk tensor ops (avg_pool2d, max_pool2d,
+            # conv2d). Unrolling would destroy the nested structure.
+            has_nested_for = any(isinstance(s, ForLoop) for s in stmt.body)
+            if has_nested_for:
+                # Still recurse into the INNER loop's body (but not the outer)
+                for s in stmt.body:
+                    if isinstance(s, ForLoop):
+                        s.body = _unroll_small_loops(s.body)
+                result.append(stmt)
+                continue
             # Recurse into nested loops first
             stmt.body = _unroll_small_loops(stmt.body)
             # Try to unroll this loop

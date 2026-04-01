@@ -23,7 +23,7 @@ if _custom_nodes_dir not in sys.path:
     sys.path.insert(0, _custom_nodes_dir)
 
 import torch
-from TEX_Wrangle.tex_node import _prepare_output, _unwrap_latent, _infer_binding_type, _map_inferred_type
+from TEX_Wrangle.tex_marshalling import prepare_output as _prepare_output, unwrap_latent as _unwrap_latent, infer_binding_type as _infer_binding_type, map_inferred_type as _map_inferred_type
 from TEX_Wrangle.tex_compiler.lexer import Lexer, LexerError, TokenType
 from TEX_Wrangle.tex_compiler.parser import Parser, ParseError
 from TEX_Wrangle.tex_compiler.type_checker import TypeChecker, TypeCheckError, TEXType, CHANNEL_MAP
@@ -259,7 +259,7 @@ def assert_equiv(r, name, code, bindings, B=1, H=4, W=4):
     try:
         interp_res, cg_res = run_both(code, bindings, B, H, W)
         if cg_res is None:
-            r.ok(f"codegen equiv: {name} (codegen unsupported, skip)")
+            r.ok(f"codegen equiv: {name} (codegen unsupported, SKIPPED)")
             return
         for out_name in interp_res:
             interp_t = interp_res[out_name]

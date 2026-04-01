@@ -25,13 +25,44 @@ VEC_CHANNELS = frozenset((2, 3, 4))
 # ── Sampler tensor cache ──────────────────────────────────────────────
 # Caches reusable tensors for sampling functions keyed by (B, H, W, device).
 # Avoids recreating batch index tensors and Lanczos tap offsets per call.
-_sampler_cache: dict[tuple, torch.Tensor] = {}
+# Bounded via LRU eviction to prevent memory leaks in long sessions.
+_sampler_cache: _OrderedDict[tuple, torch.Tensor] = _OrderedDict()
+_SAMPLER_CACHE_MAX = 32
+
+# ── BCHW permute helper ──────────────────────────────────────────────
+
+
+def _get_bchw(img: torch.Tensor) -> torch.Tensor:
+    """Return a non-contiguous BCHW view of a BHWC image tensor."""
+    return img.permute(0, 3, 1, 2)
+
+
+# Pre-allocated grid buffer for sample() — avoids torch.stack allocation per call.
+# Keyed by (B, H, W, device) → [B, H, W, 2] tensor.
+# Bounded via LRU eviction (each entry is ~16 MB at 1080p).
+_grid_buf: _OrderedDict[tuple, torch.Tensor] = _OrderedDict()
+_GRID_BUF_MAX = 16
+
+
+def _get_grid_buf(B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
+    """Get or allocate a reusable [B, H, W, 2] grid buffer."""
+    key = (B, H, W, device)
+    buf = _grid_buf.get(key)
+    # Recreate if cached buffer was created under inference_mode
+    # (inference tensors can't be written to outside inference_mode)
+    if buf is not None and not buf.is_inference():
+        return buf
+    buf = torch.empty(B, H, W, 2, dtype=torch.float32, device=device)
+    _grid_buf[key] = buf
+    if len(_grid_buf) > _GRID_BUF_MAX:
+        _grid_buf.popitem(last=False)
+    return buf
 
 # ── Mipmap pyramid cache ─────────────────────────────────────────────
-# Caches mipmap pyramids keyed by tensor data_ptr + shape.  We store a
-# reference to the source tensor so it won't be garbage-collected (which
-# would let PyTorch reuse the data_ptr for a different tensor, causing
-# stale cache hits).  OrderedDict gives LRU eviction to bound memory.
+# Caches mipmap pyramids keyed by (id, _version).  We store a reference
+# to the source tensor so it won't be garbage-collected (which would let
+# Python reuse the id for a new tensor, causing stale cache hits).
+# OrderedDict gives LRU eviction to bound memory.
 _mip_cache: _OrderedDict[int, tuple[tuple, torch.Tensor, list[torch.Tensor]]] = _OrderedDict()
 _gauss_mip_cache: _OrderedDict[tuple, tuple[tuple, torch.Tensor, list[torch.Tensor]]] = _OrderedDict()
 _gauss_kernel_cache: _OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = _OrderedDict()
@@ -48,6 +79,8 @@ def _get_batch_index(B: int, H: int, W: int, device: torch.device) -> torch.Tens
         return cached
     t = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)
     _sampler_cache[key] = t
+    if len(_sampler_cache) > _SAMPLER_CACHE_MAX:
+        _sampler_cache.popitem(last=False)
     return t
 
 
@@ -59,7 +92,44 @@ def _get_lanczos_taps(device: torch.device) -> torch.Tensor:
         return cached
     t = torch.arange(-2, 4, device=device, dtype=torch.float32)
     _sampler_cache[key] = t
+    if len(_sampler_cache) > _SAMPLER_CACHE_MAX:
+        _sampler_cache.popitem(last=False)
     return t
+
+
+def _build_sample_grid(u: torch.Tensor, v: torch.Tensor,
+                       B: int, H: int, W: int) -> torch.Tensor:
+    """Convert [0,1] UV coords to a [-1,1] grid for ``grid_sample``.
+
+    Handles scalar (0-dim), 2-dim [H,W], and 3-dim [B,H,W] inputs.
+    For scalar inputs the grid is expanded to (B, H, W); pass H=1, W=1
+    to get a single-point grid (useful for mip sampling).
+    Returns a ``[B, H_out, W_out, 2]`` tensor suitable for ``grid_sample``.
+    """
+    grid_x = u * 2.0 - 1.0
+    grid_y = v * 2.0 - 1.0
+
+    gd = grid_x.dim()
+    if gd == 0:
+        grid_x = grid_x.reshape(1, 1, 1).expand(B, H, W)
+        grid_y = grid_y.reshape(1, 1, 1).expand(B, H, W)
+    elif gd == 2:
+        grid_x = grid_x.unsqueeze(0).expand(B, -1, -1)
+        grid_y = grid_y.unsqueeze(0).expand(B, -1, -1)
+
+    return torch.stack([grid_x, grid_y], dim=-1)  # [B, H_out, W_out, 2]
+
+
+def _reduce_channels(t: torch.Tensor, op):
+    """Reduce an array tensor along its element dimension.
+
+    For vec arrays (dim 2 or 5, layout [..., N, C]) reduces along dim=-2.
+    For scalar arrays (dim 1 or 4, layout [..., N]) reduces along dim=-1.
+    *op* is called as ``op(tensor, dim)`` and must return the reduced tensor.
+    """
+    if t.dim() in (2, 5):
+        return op(t, -2)
+    return op(t, -1)
 
 
 class TEXStdlib:
@@ -579,7 +649,7 @@ class TEXStdlib:
         B, H, W, C = img.shape
 
         # grid_sample expects [B, C, H, W] input
-        img_bchw = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        img_bchw = _get_bchw(img)
 
         # Convert from [0, 1] UV to [-1, 1] grid coords (grid_sample convention)
         grid_x = u * 2.0 - 1.0
@@ -594,7 +664,10 @@ class TEXStdlib:
             grid_x = grid_x.unsqueeze(0).expand(B, H, W)
             grid_y = grid_y.unsqueeze(0).expand(B, H, W)
 
-        grid = torch.stack([grid_x, grid_y], dim=-1)  # [B, H, W, 2]
+        # Reuse pre-allocated grid buffer to avoid torch.stack allocation
+        grid = _get_grid_buf(B, H, W, img.device)
+        grid[..., 0] = grid_x
+        grid[..., 1] = grid_y
 
         # Sample with bilinear interpolation (fused C++ kernel)
         result_bchw = torch.nn.functional.grid_sample(
@@ -785,23 +858,9 @@ class TEXStdlib:
         B, H, W, C = img.shape
 
         # grid_sample expects [B, C, H, W] input
-        img_bchw = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        img_bchw = _get_bchw(img)
 
-        # Convert from [0, 1] UV to [-1, 1] grid coords (grid_sample convention)
-        grid_x = u * 2.0 - 1.0
-        grid_y = v * 2.0 - 1.0
-
-        # Build grid: needs shape [B, H_out, W_out, 2]
-        if grid_x.dim() == 0:
-            # Scalar coords -> sample single point, expand to spatial grid
-            grid_x = grid_x.expand(B, H, W)
-            grid_y = grid_y.expand(B, H, W)
-        elif grid_x.dim() == 2:
-            # [H, W] -> [B, H, W]
-            grid_x = grid_x.unsqueeze(0).expand(B, H, W)
-            grid_y = grid_y.unsqueeze(0).expand(B, H, W)
-
-        grid = torch.stack([grid_x, grid_y], dim=-1)  # [B, H, W, 2]
+        grid = _build_sample_grid(u, v, B, H, W)
 
         # Sample with bicubic interpolation
         result_bchw = torch.nn.functional.grid_sample(
@@ -927,7 +986,7 @@ class TEXStdlib:
         sigma_val = max(sigma_t.item(), 0.0)
         if sigma_val < 0.3 or img.dim() < 4:
             return img
-        bchw = img.permute(0, 3, 1, 2)
+        bchw = _get_bchw(img)
         result = _gauss_blur_bchw(bchw, sigma_val)
         return result.permute(0, 2, 3, 1)
 
@@ -1432,42 +1491,27 @@ class TEXStdlib:
     @staticmethod
     def fn_arr_sum(arr):
         """Sum all elements of an array. Returns scalar (or vec) per pixel."""
-        t = _to_tensor(arr)
-        if t.dim() in (2, 5):  # vec array → sum along element dim, keep channels
-            return t.sum(dim=-2)
-        return t.sum(dim=-1)
+        return _reduce_channels(_to_tensor(arr), lambda t, d: t.sum(dim=d))
 
     @staticmethod
     def fn_arr_min(arr):
         """Minimum element of an array per channel. Returns scalar (or vec) per pixel."""
-        t = _to_tensor(arr)
-        if t.dim() in (2, 5):
-            return t.min(dim=-2).values
-        return t.min(dim=-1).values
+        return _reduce_channels(_to_tensor(arr), lambda t, d: t.min(dim=d).values)
 
     @staticmethod
     def fn_arr_max(arr):
         """Maximum element of an array per channel. Returns scalar (or vec) per pixel."""
-        t = _to_tensor(arr)
-        if t.dim() in (2, 5):
-            return t.max(dim=-2).values
-        return t.max(dim=-1).values
+        return _reduce_channels(_to_tensor(arr), lambda t, d: t.max(dim=d).values)
 
     @staticmethod
     def fn_median(arr):
         """Median element of an array per channel. Returns scalar (or vec) per pixel."""
-        t = _to_tensor(arr)
-        if t.dim() in (2, 5):
-            return torch.median(t, dim=-2).values
-        return torch.median(t, dim=-1).values
+        return _reduce_channels(_to_tensor(arr), lambda t, d: torch.median(t, dim=d).values)
 
     @staticmethod
     def fn_arr_avg(arr):
         """Average of array elements per channel. Returns scalar (or vec) per pixel."""
-        t = _to_tensor(arr)
-        if t.dim() in (2, 5):
-            return t.mean(dim=-2)
-        return t.mean(dim=-1)
+        return _reduce_channels(_to_tensor(arr), lambda t, d: t.mean(dim=d))
 
     @staticmethod
     def fn_join(arr, sep):
@@ -1570,26 +1614,30 @@ def _get_gauss_kernels(sigma: float, device: torch.device) -> tuple[torch.Tensor
     return pair
 
 
-def _gauss_blur_bchw(img: torch.Tensor, sigma: float) -> torch.Tensor:
+def _gauss_blur_bchw(
+    img: torch.Tensor, sigma: float, downsample_2x: bool = False,
+) -> torch.Tensor:
     """Apply separable Gaussian blur to a [B, C, H, W] tensor.
 
-    Uses replicate padding at borders and depthwise convolution (groups=C)
-    for channel-independent filtering. Two 1D passes: horizontal then vertical.
+    Uses replicate padding and depthwise convolution (groups=C).
+    When downsample_2x=True, uses strided convolution to fuse blur + 2× downsample
+    into two passes instead of three (blur_h + blur_v + pool).
     """
     if sigma < 0.3:
+        if downsample_2x:
+            return torch.nn.functional.avg_pool2d(img, kernel_size=2, stride=2)
         return img
     C = img.shape[1]
     kernel_h, kernel_v = _get_gauss_kernels(sigma, img.device)
     radius = kernel_h.shape[-1] // 2
-    # Expand kernels for depthwise conv: [C, 1, 1, K] / [C, 1, K, 1] (no copy)
     kh = kernel_h.expand(C, 1, 1, -1)
     kv = kernel_v.expand(C, 1, -1, 1)
-    # Horizontal pass
+    stride_w = 2 if downsample_2x else 1
+    stride_h = 2 if downsample_2x else 1
     padded = torch.nn.functional.pad(img, (radius, radius, 0, 0), mode='replicate')
-    result = torch.nn.functional.conv2d(padded, kh, groups=C)
-    # Vertical pass
+    result = torch.nn.functional.conv2d(padded, kh, stride=(1, stride_w), groups=C)
     padded = torch.nn.functional.pad(result, (0, 0, radius, radius), mode='replicate')
-    result = torch.nn.functional.conv2d(padded, kv, groups=C)
+    result = torch.nn.functional.conv2d(padded, kv, stride=(stride_h, 1), groups=C)
     return result
 
 
@@ -1600,6 +1648,7 @@ def _build_mip_pyramid(
     cache: _OrderedDict,
     key,
     pre_blur_fn=None,
+    fused_blur_downsample_fn=None,
 ) -> list[torch.Tensor]:
     """Build or retrieve a cached mipmap pyramid for a [B, H, W, C] tensor.
 
@@ -1611,6 +1660,9 @@ def _build_mip_pyramid(
         key: cache lookup key.
         pre_blur_fn: optional callable(bchw_tensor) → blurred bchw_tensor,
             applied before each downsample (e.g. Gaussian pre-blur).
+        fused_blur_downsample_fn: optional callable(bchw_tensor) → blurred + 2× downsampled tensor.
+            When provided and exact 2× downsample is possible, uses this instead of
+            pre_blur_fn + avg_pool2d (saves one kernel launch per level).
     """
     cached = cache.get(key)
     if cached is not None and cached[0] == img.shape:
@@ -1618,7 +1670,7 @@ def _build_mip_pyramid(
         return cached[2]
 
     B, H, W, C = img.shape
-    level0 = img.permute(0, 3, 1, 2)  # [B, H, W, C] → [B, C, H, W]
+    level0 = _get_bchw(img)
     pyramid = [level0]
 
     current = level0
@@ -1627,14 +1679,22 @@ def _build_mip_pyramid(
         _, _, ch, cw = current.shape
         if ch <= 1 or cw <= 1:
             break
-        src = pre_blur_fn(current) if pre_blur_fn is not None else current
         nh, nw = max(ch // 2, 1), max(cw // 2, 1)
-        current = torch.nn.functional.interpolate(
-            src, size=(nh, nw), mode='area',
-        )
+        exact_2x = (ch == nh * 2 and cw == nw * 2)
+        # Fused path: strided conv = blur + downsample in 2 ops instead of 3
+        if exact_2x and fused_blur_downsample_fn is not None:
+            current = fused_blur_downsample_fn(current)
+        else:
+            src = pre_blur_fn(current) if pre_blur_fn is not None else current
+            if exact_2x:
+                current = torch.nn.functional.avg_pool2d(src, kernel_size=2, stride=2)
+            else:
+                current = torch.nn.functional.interpolate(
+                    src, size=(nh, nw), mode='area',
+                )
         pyramid.append(current)
 
-    # Store tensor ref to prevent GC (keeps data_ptr stable); evict LRU
+    # Store tensor ref to prevent GC (keeps id() stable); evict LRU
     cache[key] = (img.shape, img, pyramid)
     if len(cache) > _MIP_MAX_ENTRIES:
         cache.popitem(last=False)
@@ -1643,45 +1703,40 @@ def _build_mip_pyramid(
 
 def _get_mip_pyramid(img: torch.Tensor) -> list[torch.Tensor]:
     """Area-downsample mipmap pyramid (cached)."""
-    return _build_mip_pyramid(img, _mip_cache, img.data_ptr())
+    # Version-safe key: id() + _version detects in-place mutations.
+    return _build_mip_pyramid(img, _mip_cache, (id(img), img._version))
 
 
 def _get_mip_pyramid_gauss(img: torch.Tensor, sigma: float = 1.13) -> list[torch.Tensor]:
     """Gaussian-prefiltered mipmap pyramid (sigma=1.13, SIGMA_C ≈ 0.825, cached)."""
     sigma_q = round(sigma, 3)
-    key = (img.data_ptr(), sigma_q)
+    key = (id(img), img._version, sigma_q)
     return _build_mip_pyramid(
         img, _gauss_mip_cache, key,
         pre_blur_fn=lambda bchw: _gauss_blur_bchw(bchw, sigma),
+        fused_blur_downsample_fn=lambda bchw: _gauss_blur_bchw(bchw, sigma, downsample_2x=True),
     )
 
 
 def _sample_mip_level(
     level_bchw: torch.Tensor,
-    grid_x: torch.Tensor,
-    grid_y: torch.Tensor,
+    grid: torch.Tensor,
+    out_size: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Bilinear sample a single mip level. Returns [B, H_out, W_out, C].
 
     level_bchw: [B, C, Hl, Wl] — the mip level in channel-first layout.
-    grid_x, grid_y: [-1, 1] coords, scalar or [B, H, W].
+    grid: [B, H_out, W_out, 2] — pre-stacked sampling grid in [-1, 1].
+    out_size: if set and grid is identity UV, use F.interpolate (faster, no grid read).
     """
-    B_l = level_bchw.shape[0]
-    # Determine output spatial size from grid coords
-    if grid_x.dim() == 0:
-        # Scalar coords → single pixel output
-        gx = grid_x.reshape(1, 1, 1)
-        gy = grid_y.reshape(1, 1, 1)
-        gx = gx.expand(B_l, 1, 1)
-        gy = gy.expand(B_l, 1, 1)
-    elif grid_x.dim() == 3:
-        gx, gy = grid_x, grid_y
-    else:
-        gx = grid_x.unsqueeze(0).expand(B_l, -1, -1)
-        gy = grid_y.unsqueeze(0).expand(B_l, -1, -1)
-
-    grid = torch.stack([gx, gy], dim=-1)  # [B, H_out, W_out, 2]
-
+    if out_size is not None:
+        Hl, Wl = level_bchw.shape[2], level_bchw.shape[3]
+        if (Hl, Wl) == out_size:
+            return level_bchw.permute(0, 2, 3, 1)
+        result_bchw = torch.nn.functional.interpolate(
+            level_bchw, size=out_size, mode='bilinear', align_corners=True,
+        )
+        return result_bchw.permute(0, 2, 3, 1)
     result_bchw = torch.nn.functional.grid_sample(
         level_bchw, grid,
         mode='bilinear',
@@ -1705,8 +1760,23 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
     max_level = len(pyramid) - 1
     lod_t = lod_t.clamp(0.0, float(max_level))
 
-    grid_x = u * 2.0 - 1.0
-    grid_y = v * 2.0 - 1.0
+    B, H, W, C = img.shape
+
+    # Detect identity UV (standard pixel grid) by checking corner values.
+    # When identity, use F.interpolate instead of grid_sample (avoids grid read).
+    identity_uv = False
+    if u.dim() == 3 and u.shape == (B, H, W) and H > 1 and W > 1:
+        # Identity UV: u[0,0,0]=0, u[0,0,W-1]=1, v[0,0,0]=0, v[0,H-1,0]=1
+        if (abs(u[0, 0, 0].item()) < 1e-5 and abs(u[0, 0, -1].item() - 1.0) < 1e-5
+                and abs(v[0, 0, 0].item()) < 1e-5 and abs(v[0, -1, 0].item() - 1.0) < 1e-5):
+            identity_uv = True
+
+    if identity_uv:
+        out_size = (H, W)
+        grid = None  # not needed
+    else:
+        grid = _build_sample_grid(u, v, B, 1, 1)
+        out_size = None
 
     # Fast path: scalar integer LOD → sample single level, no interpolation
     if lod_t.dim() == 0:
@@ -1715,7 +1785,7 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
         frac = lod_val - lod_floor
         if frac < 1e-6:
             level = min(lod_floor, max_level)
-            return _sample_mip_level(pyramid[level], grid_x, grid_y)
+            return _sample_mip_level(pyramid[level], grid, out_size)
 
     # General path: trilinear (bilinear per level + lerp between levels)
     lod_floor = torch.floor(lod_t)
@@ -1726,28 +1796,33 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
     if lo.dim() == 0:
         lo_i = lo.item()
         hi_i = hi.item()
-        s_lo = _sample_mip_level(pyramid[lo_i], grid_x, grid_y)
+        s_lo = _sample_mip_level(pyramid[lo_i], grid, out_size)
         if lo_i == hi_i:
             return s_lo
-        s_hi = _sample_mip_level(pyramid[hi_i], grid_x, grid_y)
+        s_hi = _sample_mip_level(pyramid[hi_i], grid, out_size)
         return torch.lerp(s_lo, s_hi, lod_frac)
 
-    # Per-pixel LOD: sample all needed levels and blend per-pixel
+    # Per-pixel LOD: gather-based blending (avoids N boolean mask allocations)
     lo_min = lo.min().item()
     hi_max = hi.max().item()
-    level_samples = {}
-    for lvl in range(lo_min, hi_max + 1):
-        level_samples[lvl] = _sample_mip_level(pyramid[lvl], grid_x, grid_y)
+    n_levels = hi_max - lo_min + 1
 
-    B, H, W, C = img.shape
-    result = torch.zeros(B, H, W, C, dtype=img.dtype, device=img.device)
+    level_list = [_sample_mip_level(pyramid[lvl], grid, out_size)
+                  for lvl in range(lo_min, hi_max + 1)]
+
+    if n_levels == 1:
+        return level_list[0]
+
+    # Stack into [B, n_levels, H, W, C] and gather lo/hi samples
+    stacked = torch.stack(level_list, dim=1)
+    lo_local = (lo - lo_min).unsqueeze(1).unsqueeze(-1)  # [B, 1, H, W, 1]
+    hi_local = (hi - lo_min).unsqueeze(1).unsqueeze(-1)
+    expand_shape = list(stacked.shape)
+    expand_shape[1] = 1
+    s_lo = torch.gather(stacked, 1, lo_local.expand(expand_shape)).squeeze(1)
+    s_hi = torch.gather(stacked, 1, hi_local.expand(expand_shape)).squeeze(1)
     frac_expanded = lod_frac.unsqueeze(-1) if lod_frac.dim() == 3 else lod_frac
-    for lvl in range(lo_min, hi_max + 1):
-        lo_mask = (lo == lvl).unsqueeze(-1).float()
-        result = result + level_samples[lvl] * lo_mask * (1.0 - frac_expanded)
-        hi_mask = (hi == lvl).unsqueeze(-1).float()
-        result = result + level_samples[lvl] * hi_mask * frac_expanded
-    return result
+    return torch.lerp(s_lo, s_hi, frac_expanded)
 
 
 # -- Noise functions (extracted to noise.py) --------------------------------

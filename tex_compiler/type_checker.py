@@ -428,65 +428,10 @@ class TypeChecker:
 
         size = node.size
         if node.initializer:
-            if isinstance(node.initializer, ArrayLiteral):
-                init_size = len(node.initializer.elements)
-                if size is not None and size != init_size:
-                    self._error(
-                        f"Array size mismatch: declared [{size}] but the initializer has {init_size} elements.",
-                        node.loc,
-                        code="E3102",
-                        hint=f"Either change the size to [{init_size}], or adjust the initializer to have {size} elements.",
-                    )
-                if size is None:
-                    size = init_size
-                # Type-check each element
-                for elem in node.initializer.elements:
-                    et = self._check_expr(elem)
-                    if not self._is_assignable(elem_type, et):
-                        self._error(
-                            f"Expected {node.element_type_name} element, but found {et.value}.",
-                            elem.loc,
-                            code="E3102",
-                            hint=f"Each element in a {node.element_type_name}[] array must be compatible with {node.element_type_name}.",
-                        )
-                self._set_type(node.initializer, TEXType.ARRAY)
-            else:
-                # Array copy from another variable
-                init_type = self._check_expr(node.initializer)
-                if init_type != TEXType.ARRAY:
-                    self._error("This array initializer needs to be an array value.",
-                                node.loc, code="E3102",
-                                hint="Try assigning from another array variable or an array literal {1, 2, 3}.")
-                else:
-                    # Check element type + size compatibility
-                    if isinstance(node.initializer, Identifier):
-                        src_info = self._lookup_array_info(node.initializer.name)
-                        if src_info:
-                            if src_info.element_type != elem_type:
-                                self._error(
-                                    f"Expected {elem_type.value} array, but the source is a {src_info.element_type.value} array.",
-                                    node.loc,
-                                    code="E3101",
-                                    hint="Both arrays need to have the same element type for copying.",
-                                )
-                            if size is not None and size != src_info.size:
-                                self._error(
-                                    f"Array size mismatch: expected [{size}] but the source has [{src_info.size}] elements.",
-                                    node.loc,
-                                    code="E3102",
-                                )
-                            if size is None:
-                                size = src_info.size
+            size = self._check_array_initializer(node, elem_type, size)
 
         if size is None:
-            # Allow dynamic-size arrays from function calls (e.g. split())
-            if node.initializer and isinstance(node.initializer, FunctionCall):
-                size = 0  # dynamic — resolved at runtime
-            else:
-                self._error("This array needs a known size.",
-                            node.loc, code="E3101",
-                            hint="Try: float[10] arr; or float[] arr = {1, 2, 3};")
-                size = 1  # fallback
+            size = self._resolve_array_size(node)
 
         if size > 1024:  # 0 = dynamic, skip check
             self._error(f"Array size {size} exceeds the maximum of 1024.",
@@ -497,6 +442,81 @@ class TypeChecker:
         self._declare_var(node.name, TEXType.ARRAY, node.loc)
         self._array_scopes[-1][node.name] = arr_type
         self._set_type(node, TEXType.ARRAY)
+
+    def _check_array_initializer(
+        self, node: ArrayDecl, elem_type: TEXType, size: int | None,
+    ) -> int | None:
+        """Validate an array initializer (literal or copy). Returns resolved size."""
+        if isinstance(node.initializer, ArrayLiteral):
+            return self._check_array_literal(node, elem_type, size)
+        return self._check_array_copy(node, elem_type, size)
+
+    def _check_array_literal(
+        self, node: ArrayDecl, elem_type: TEXType, size: int | None,
+    ) -> int | None:
+        """Validate an array literal initializer {1, 2, 3}."""
+        init_size = len(node.initializer.elements)
+        if size is not None and size != init_size:
+            self._error(
+                f"Array size mismatch: declared [{size}] but the initializer has {init_size} elements.",
+                node.loc,
+                code="E3102",
+                hint=f"Either change the size to [{init_size}], or adjust the initializer to have {size} elements.",
+            )
+        if size is None:
+            size = init_size
+        for elem in node.initializer.elements:
+            et = self._check_expr(elem)
+            if not self._is_assignable(elem_type, et):
+                self._error(
+                    f"Expected {node.element_type_name} element, but found {et.value}.",
+                    elem.loc,
+                    code="E3102",
+                    hint=f"Each element in a {node.element_type_name}[] array must be compatible with {node.element_type_name}.",
+                )
+        self._set_type(node.initializer, TEXType.ARRAY)
+        return size
+
+    def _check_array_copy(
+        self, node: ArrayDecl, elem_type: TEXType, size: int | None,
+    ) -> int | None:
+        """Validate an array copy initializer (from another variable)."""
+        init_type = self._check_expr(node.initializer)
+        if init_type != TEXType.ARRAY:
+            self._error("This array initializer needs to be an array value.",
+                        node.loc, code="E3102",
+                        hint="Try assigning from another array variable or an array literal {1, 2, 3}.")
+            return size
+        if not isinstance(node.initializer, Identifier):
+            return size
+        src_info = self._lookup_array_info(node.initializer.name)
+        if src_info is None:
+            return size
+        if src_info.element_type != elem_type:
+            self._error(
+                f"Expected {elem_type.value} array, but the source is a {src_info.element_type.value} array.",
+                node.loc,
+                code="E3101",
+                hint="Both arrays need to have the same element type for copying.",
+            )
+        if size is not None and size != src_info.size:
+            self._error(
+                f"Array size mismatch: expected [{size}] but the source has [{src_info.size}] elements.",
+                node.loc,
+                code="E3102",
+            )
+        if size is None:
+            size = src_info.size
+        return size
+
+    def _resolve_array_size(self, node: ArrayDecl) -> int:
+        """Resolve size for an array without explicit size from initializer."""
+        if node.initializer and isinstance(node.initializer, FunctionCall):
+            return 0  # dynamic — resolved at runtime
+        self._error("This array needs a known size.",
+                    node.loc, code="E3101",
+                    hint="Try: float[10] arr; or float[] arr = {1, 2, 3};")
+        return 1  # fallback
 
     def _check_param_decl(self, node: ParamDecl):
         """Type-check a parameter declaration: f$strength = 0.5;"""
@@ -928,7 +948,7 @@ class TypeChecker:
 
     def _check_binding_index_access(self, node: BindingIndexAccess) -> TEXType:
         """Type-check @Image[ix, iy] or @Image[ix, iy, frame]."""
-        self._check_expr(node.binding)
+        binding_type = self._check_expr(node.binding)
         arg_types = [self._check_expr(a) for a in node.args]
         if len(arg_types) < 2 or len(arg_types) > 3:
             self._error(
@@ -936,12 +956,14 @@ class TypeChecker:
                 node.loc, code="E5002",
                 hint="Use @Image[ix, iy] or @Image[ix, iy, frame].",
             )
-        self._set_type(node, TEXType.VEC4)
-        return TEXType.VEC4
+        # Return the binding's actual type (VEC3 for IMAGE, FLOAT for MASK, etc.)
+        ret = binding_type if binding_type != TEXType.STRING else TEXType.VEC4
+        self._set_type(node, ret)
+        return ret
 
     def _check_binding_sample_access(self, node: BindingSampleAccess) -> TEXType:
         """Type-check @Image(u, v) or @Image(u, v, frame)."""
-        self._check_expr(node.binding)
+        binding_type = self._check_expr(node.binding)
         arg_types = [self._check_expr(a) for a in node.args]
         if len(arg_types) < 2 or len(arg_types) > 3:
             self._error(
@@ -949,8 +971,9 @@ class TypeChecker:
                 node.loc, code="E5002",
                 hint="Use @Image(u, v) or @Image(u, v, frame).",
             )
-        self._set_type(node, TEXType.VEC4)
-        return TEXType.VEC4
+        ret = binding_type if binding_type != TEXType.STRING else TEXType.VEC4
+        self._set_type(node, ret)
+        return ret
 
     def _check_channel_access(self, node: ChannelAccess) -> TEXType:
         obj_type = self._check_expr(node.object)
@@ -1061,6 +1084,8 @@ class TypeChecker:
             self._error(f"Unary operator '{node.op}' is not supported for strings.",
                         node.loc, code="E3401",
                         hint="Unary operators only work on numeric types (int, float, vec, mat).")
+            self._set_type(node, TEXType.FLOAT)
+            return TEXType.FLOAT
         if node.op == "!":
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT

@@ -7,7 +7,8 @@ This document covers the internals of TEX Wrangle for developers who want to und
 ```
 TEX_Wrangle/
   __init__.py              # ComfyUI entry point, version
-  tex_node.py              # Node class with device/compile_mode params
+  tex_node.py              # ComfyUI node class (device/compile_mode params, UI integration)
+  tex_marshalling.py       # Input marshalling, type inference, output preparation
   tex_cache.py             # Two-tier compilation cache (memory LRU + disk pickle)
   tex_compiler/
     lexer.py               # Tokenizer
@@ -77,17 +78,19 @@ Source Code
 
 **Parser** (`tex_compiler/parser.py`): Consumes tokens and builds an AST (Abstract Syntax Tree). Uses recursive descent with explicit operator precedence levels. AST nodes are defined as dataclasses in `ast_nodes.py`.
 
-**TypeChecker** (`tex_compiler/type_checker.py`): Walks the AST and assigns a `TEXType` to every expression node. Enforces type compatibility rules, validates function signatures, and manages variable scopes. Produces a `type_map` dict mapping AST node `id()` -> `TEXType`.
+**TypeChecker** (`tex_compiler/type_checker.py`): Walks the AST and assigns a `TEXType` to every expression node. Enforces type compatibility rules, validates function signatures, and manages variable scopes. Produces a `type_map` dict mapping AST node `id()` -> `TEXType`. Fetch/sample calls return the binding's actual type (VEC3 for IMAGE, FLOAT for MASK) rather than a hardcoded VEC4.
 
 **Optimizer** (`tex_compiler/optimizer.py`): Constant folding and algebraic simplification pass. Reduces expressions like `x * 1.0` -> `x` and pre-evaluates constant sub-expressions.
 
 **Interpreter** (`tex_runtime/interpreter.py`): Tree-walking evaluator that executes the AST using PyTorch tensor operations. Reads types from `type_map` to guide evaluation (e.g. choosing `torch.where` for if/else). Produces output tensors/strings for all assigned `@name` bindings. Used as the default execution path.
 
-**Codegen** (`tex_runtime/codegen.py`): Compiles the AST into a Python function string, then `exec()`s it into a callable. Eliminates per-node dispatch overhead. All env variables are pre-registered as Python locals (`_lv_{name}`) to avoid dict lookups and produce cleaner FX graphs for TorchInductor. Falls back to the interpreter for unsupported patterns (string operations).
+**Codegen** (`tex_runtime/codegen.py`): Compiles the AST into a Python function string, then `exec()`s it into a callable. Eliminates per-node dispatch overhead. All env variables are pre-registered as Python locals (`_lv_{name}`) to avoid dict lookups and produce cleaner FX graphs for TorchInductor. Falls back to the interpreter for unsupported patterns (string operations). Includes **stencil specialization**: nested for-loops matching spatial filter patterns are detected and replaced with bulk PyTorch ops (`avg_pool2d` for box blur, `max_pool2d` for min/max reduction, `Tensor.unfold` for median/rank filters, depthwise `conv2d` for weighted stencils). Also detects inline (non-loop) stencil patterns from hand-unrolled fetch sequences.
+
+**Compiled** (`tex_runtime/compiled.py`): Execution routing and optional `torch.compile` wrapper. Routes programs to the fastest path: plain interpreter (trivial programs or no spatial tensors), codegen-only (deep loop nesting where torch.compile overhead exceeds benefit), or codegen + torch.compile (spatial tensor chains that benefit from kernel fusion). Manages a bounded LRU cache of compiled callables with `dynamo.reset()` on eviction to reclaim Inductor kernel memory.
 
 **Noise** (`tex_runtime/noise.py`): Procedural noise library with 2D/3D implementations. Contains Perlin gradient noise (arithmetic hash for TorchInductor compatibility), simplex noise, FBM with tiered compilation (eager → jit.trace → torch.compile), Worley/Voronoi cell noise, curl (divergence-free flow fields), and FBM variants (ridged, billow, turbulence, flow, alligator). All functions accept optional `z` parameter for 3D evaluation.
 
-**tex_node.py**: ComfyUI integration layer. Receives ComfyUI inputs (IMAGE, MASK, LATENT, FLOAT, INT, STRING), maps them to TEX types, runs the compiler pipeline, and formats the result back into ComfyUI output.
+**tex_node.py** + **tex_marshalling.py**: ComfyUI integration layer. `tex_node.py` defines the node class with device/compile_mode parameters and orchestrates execution. `tex_marshalling.py` handles input marshalling (converting ComfyUI types to TEX tensors), type inference for bindings, and output preparation (converting results back to ComfyUI IMAGE/MASK/LATENT/STRING).
 
 **Caching** (`tex_cache.py`): Sits between source input and type checking. Caches `(AST, type_map)` tuples keyed by `SHA256(code + binding_types)`. Two tiers: in-memory LRU (128 entries) and on-disk pickle (512 entries, versioned).
 
@@ -309,7 +312,7 @@ Adding a new TEX type requires changes across the entire pipeline:
 1. **`tex_compiler/type_checker.py`** -- add to `TEXType` enum. Add promotion rules in `_promote()` and compatibility in `_is_compatible()`.
 2. **`tex_compiler/parser.py`** -- add to `TYPE_NAME_MAP` dict if it can be used in declarations.
 3. **`tex_runtime/interpreter.py`** -- handle the new type in `_eval()`, `_exec_assignment()`, and any type-specific evaluation paths.
-4. **`tex_node.py`** -- add input/output handling in `_infer_binding_type()`, `_prepare_output()`, and `_map_inferred_type()`.
+4. **`tex_marshalling.py`** -- add input/output handling in `infer_binding_type()`, `prepare_output()`, and `map_inferred_type()`.
 
 ### Adding a New AST Node
 
