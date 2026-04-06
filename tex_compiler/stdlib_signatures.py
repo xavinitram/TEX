@@ -121,6 +121,7 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "sample_mip":     {"args": (4, 4), "return": _passthrough_type},
     "sample_mip_gauss": {"args": (4, 4), "return": _passthrough_type},
     "gauss_blur":     {"args": (2, 2), "return": _passthrough_type},
+    "bilateral_filter": {"args": (3, 3), "return": _passthrough_type},
 
     # Cross-frame sampling — first arg is still the binding
     "fetch_frame":    {"args": (4, 4), "return": _passthrough_type},

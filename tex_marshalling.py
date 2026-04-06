@@ -84,7 +84,15 @@ def convert_param_value(value: Any, param_info: dict) -> Any:
             try:
                 return hex_to_rgb(value)
             except ValueError:
-                pass  # invalid hex — fall through to return raw value
+                pass
+        else:
+            # Comma-separated RGB floats (0-1): "0.5, 0.3, 0.1"
+            try:
+                parts = [float(x.strip()) for x in value.split(",")]
+                if len(parts) >= 3:
+                    return parts[:3]
+            except ValueError:
+                pass
     elif hint in ("v2", "v3", "v4") and isinstance(value, str):
         expected = {"v2": 2, "v3": 3, "v4": 4}[hint]
         try:

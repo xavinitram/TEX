@@ -69,13 +69,16 @@ f$strength = 0.5;
 @OUT = @image * $strength;
 ```
 
-Declare parameters with `$name` to create adjustable widgets on the node. Prefix with `f` for float, `i` for integer, `s` for string:
+Declare parameters with `$name` to create adjustable widgets on the node:
 
 - `f$strength = 0.5;` → FLOAT slider (default 0.5)
 - `i$radius = 2;` → INT spinner (default 2)
 - `s$label = "hello";` → STRING text field
+- `b$enabled = 1;` → BOOLEAN toggle
+- `c$tint = "#FF8800";` → COLOR picker
+- `v3$offset = vec3(1.0, 0.5, 0.0);` → VEC3 (X/Y/Z float inputs)
 
-Parameter widgets appear directly on the node for easy adjustment at runtime.
+Parameter widgets appear directly on the node for easy adjustment at runtime. Color and vector parameters can also accept wire connections (IMAGE, MASK, etc.) to override the widget value.
 
 ---
 

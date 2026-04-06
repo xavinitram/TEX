@@ -99,9 +99,12 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 @OUT = lerp(@base, @overlay, 0.5);
 
 // $ parameters — create adjustable widgets
-f$strength = 0.5;    // FLOAT widget
-i$radius = 2;        // INT widget
-s$label = "hello";   // STRING widget
+f$strength = 0.5;    // FLOAT slider
+i$radius = 2;        // INT slider
+s$label = "hello";   // STRING text input
+b$enabled = 1;       // BOOLEAN toggle
+c$tint = "#FF8800";  // COLOR picker
+v3$offset = vec3(1.0, 0.5, 0.0);  // VEC3 (X/Y/Z float inputs)
 
 @OUT = @image * $strength;
 ```
@@ -179,6 +182,10 @@ while (val < 100.0) { val = val * 2.0; }
 | `sample_lanczos(@A, u, v)` | Lanczos-3 | UV [0,1] |
 | `fetch_frame(@A, f, px, py)` | Nearest | Pixel ints |
 | `sample_frame(@A, f, u, v)` | Bilinear | UV [0,1] |
+
+**Filtering:** `gauss_blur(@A, sigma)` `bilateral_filter(@A, sigma_s, sigma_r)`
+
+**Mipmap:** `sample_mip(@A, u, v, lod)` `sample_mip_gauss(@A, u, v, lod)`
 
 **Image Reductions:** `img_sum` `img_mean` `img_min` `img_max` `img_median`
 

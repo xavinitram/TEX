@@ -249,6 +249,7 @@ def _max_loop_depth(program: Any) -> int:
     return _depth(program.statements, 0)
 
 
+
 def _select_backend(device_type: str) -> str | None:
     """
     Pick the best available torch.compile backend.
@@ -601,6 +602,13 @@ def _try_compile(
             if output_names is not None:
                 return {name: bindings[name] for name in output_names}
             return bindings.get("OUT")
+
+        # If codegen has stdlib function calls (graph breaks), skip torch.compile
+        # and return the codegen adapter directly — torch.compile overhead exceeds benefit
+        if getattr(cg_fn, '_has_fn_calls', False):
+            _show_once("codegen_only_fn_calls",
+                       "[TEX] Codegen has stdlib calls — using codegen-only (no torch.compile)")
+            return _codegen_exec
 
         target_fn = _codegen_exec
         _show_once("codegen_active", "[TEX] Using codegen path for torch.compile (flat function)")

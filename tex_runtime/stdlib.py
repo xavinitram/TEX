@@ -991,6 +991,66 @@ class TEXStdlib:
         return result.permute(0, 2, 3, 1)
 
     @staticmethod
+    def fn_bilateral_filter(image, sigma_s, sigma_r):
+        """Edge-preserving bilateral filter using Tensor.unfold.
+
+        Weights each neighbor by spatial Gaussian x range (color similarity)
+        Gaussian. Radius is derived from sigma_s (3x sigma, capped at 5).
+        Best for small kernels (3x3); for larger kernels, the loop-based
+        approach in bilateral_approx.tex may be faster due to memory traffic.
+
+        Args:
+            image: [B, H, W, C] tensor
+            sigma_s: float -- spatial sigma in pixels
+            sigma_r: float -- range sigma (color similarity, 0.01-0.5 typical)
+        """
+        img = image if image.__class__ is torch.Tensor else _to_tensor(image)
+        ss = sigma_s.item() if torch.is_tensor(sigma_s) else float(sigma_s)
+        sr = sigma_r.item() if torch.is_tensor(sigma_r) else float(sigma_r)
+
+        if img.dim() < 4 or ss < 0.3:
+            return img
+
+        B, H, W, C = img.shape
+        radius = min(int(math.ceil(3.0 * ss)), 5)
+        ksize = 2 * radius + 1
+
+        # Convert to BCHW and pad
+        bchw = img.permute(0, 3, 1, 2)  # [B, C, H, W]
+        padded = torch.nn.functional.pad(bchw, (radius, radius, radius, radius), mode='replicate')
+
+        # Extract all ksize×ksize patches: [B, C, H, W, kH, kW]
+        patches = padded.unfold(2, ksize, 1).unfold(3, ksize, 1)
+
+        # Center pixel: [B, C, H, W, 1, 1]
+        center = bchw.unsqueeze(-1).unsqueeze(-1)
+
+        # Spatial weights: precomputed [1, 1, 1, 1, kH, kW]
+        inv_2ss = -0.5 / max(ss * ss, 1e-10)
+        dy = torch.arange(ksize, device=img.device, dtype=torch.float32) - radius
+        dx = dy.clone()
+        d2 = dy.view(-1, 1) ** 2 + dx.view(1, -1) ** 2  # [kH, kW]
+        w_spatial = torch.exp(d2 * inv_2ss).view(1, 1, 1, 1, ksize, ksize)
+
+        # Range weights: per-pixel, based on color distance
+        # diff: [B, C, H, W, kH, kW]
+        diff = patches - center
+        # Color distance squared, summed over channels: [B, 1, H, W, kH, kW]
+        inv_2sr = -0.5 / max(sr * sr, 1e-10)
+        cd2 = (diff * diff).sum(dim=1, keepdim=True)
+        w_range = torch.exp(cd2 * inv_2sr)
+
+        # Combined weight: [B, 1, H, W, kH, kW]
+        w = w_spatial * w_range
+
+        # Weighted sum: [B, C, H, W]
+        numerator = (patches * w).sum(dim=(-2, -1))
+        denominator = w.sum(dim=(-2, -1))
+        result = numerator / denominator.clamp(min=1e-10)
+
+        return result.permute(0, 2, 3, 1)  # back to BHWC
+
+    @staticmethod
     def fn_sample_mip_gauss(image, u_coord, v_coord, lod):
         """Sample with Gaussian-prefiltered mipmap (sigma=1.13 pyramid).
 

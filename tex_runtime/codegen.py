@@ -71,7 +71,11 @@ def try_compile(program: Program, type_map: dict[int, TEXType]) -> Any | None:
     try:
         gen = _CodeGen(type_map)
         gen.emit_program(program)
-        return gen.build()
+        fn = gen.build()
+        # Attach metadata: whether the generated code has stdlib function calls.
+        # Programs with fn calls have graph breaks that make torch.compile slower.
+        fn._has_fn_calls = bool(gen._fn_locals)
+        return fn
     except _Unsupported:
         return None
     except Exception:
@@ -133,6 +137,41 @@ _SPATIAL_STDLIB: frozenset[str] = frozenset((
 # Reuse the interpreter's canonical list to avoid drift.
 _ENV_BUILTINS: frozenset[str] = _BUILTIN_NAMES
 
+
+
+def _collect_sample_bindings(stmts: list[ASTNode]) -> set[str]:
+    """Collect binding names used in sample()/fetch() calls within statements."""
+    names: set[str] = set()
+    stack = list(stmts)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (BindingSampleAccess, BindingIndexAccess)):
+            if isinstance(node.binding, BindingRef):
+                names.add(node.binding.name)
+        if isinstance(node, FunctionCall) and node.name in (
+            "sample", "fetch", "sample_cubic", "sample_lanczos",
+            "sample_mip", "sample_mip_gauss",
+        ):
+            if node.args and isinstance(node.args[0], BindingRef):
+                names.add(node.args[0].name)
+        # Recurse into children
+        for attr in ("body", "then_body", "else_body"):
+            children = getattr(node, attr, None)
+            if children:
+                stack.extend(children)
+        for attr in ("init", "condition", "update", "value", "initializer",
+                     "left", "right", "operand", "true_expr", "false_expr",
+                     "object", "expr", "target", "binding", "array", "index"):
+            child = getattr(node, attr, None)
+            if child is not None and isinstance(child, ASTNode):
+                stack.append(child)
+        if isinstance(node, (FunctionCall, VecConstructor, MatConstructor)):
+            stack.extend(node.args)
+        if isinstance(node, ArrayLiteral):
+            stack.extend(node.elements)
+        if isinstance(node, (BindingIndexAccess, BindingSampleAccess)):
+            stack.extend(node.args)
+    return names
 
 
 def _body_has_break_continue(stmts: list[ASTNode]) -> bool:
@@ -853,6 +892,75 @@ def _extract_uv_offset(expr: ASTNode, base: str) -> int | None:
     return None
 
 
+def _resolve_through_locals(expr: ASTNode, local_defs: dict[str, ASTNode]) -> ASTNode:
+    """Resolve an expression by substituting known local variable definitions.
+
+    For `u + off_u` where off_u is defined as `float(px2) * px`,
+    returns `u + float(px2) * px`.
+    """
+    if isinstance(expr, Identifier) and expr.name in local_defs:
+        return local_defs[expr.name]
+    if isinstance(expr, BinOp):
+        left = _resolve_through_locals(expr.left, local_defs)
+        right = _resolve_through_locals(expr.right, local_defs)
+        if left is expr.left and right is expr.right:
+            return expr
+        return BinOp(op=expr.op, left=left, right=right, loc=expr.loc)
+    return expr
+
+
+def _extract_uv_offset_expr(expr: ASTNode, base: str) -> ASTNode | bool | None:
+    """Extract the pixel-offset expression from `base + expr * px` or `base + expr / iw`.
+
+    Returns:
+      True if expr is just `base` (zero offset)
+      ASTNode for the offset expression (to be emitted as code)
+      None if pattern doesn't match
+    """
+    if _is_ident(expr, base):
+        return True  # zero offset
+    if not isinstance(expr, BinOp) or expr.op not in ("+", "-"):
+        return None
+    if not _is_ident(expr.left, base):
+        return None
+    rhs = expr.right
+    px_var = "px" if base == "u" else "py"
+    dim_var = "iw" if base == "u" else "ih"
+
+    # u + expr * px  or  u + px * expr
+    if isinstance(rhs, BinOp) and rhs.op == "*":
+        if _is_ident(rhs.right, px_var):
+            offset = rhs.left
+        elif _is_ident(rhs.left, px_var):
+            offset = rhs.right
+        else:
+            return None
+        # Handle float(expr) cast
+        if isinstance(offset, CastExpr) and offset.target_type == "float":
+            offset = offset.expr
+        if expr.op == "-":
+            return UnaryOp(op="-", operand=offset, loc=expr.loc)
+        return offset
+
+    # u + expr / iw
+    if isinstance(rhs, BinOp) and rhs.op == "/":
+        if _is_ident(rhs.right, dim_var):
+            offset = rhs.left
+            if isinstance(offset, CastExpr) and offset.target_type == "float":
+                offset = offset.expr
+            if expr.op == "-":
+                return UnaryOp(op="-", operand=offset, loc=expr.loc)
+            return offset
+
+    # u + px (offset = 1) or u - px (offset = -1)
+    if _is_ident(rhs, px_var):
+        if expr.op == "-":
+            return NumberLiteral(value=-1.0, loc=expr.loc)
+        return NumberLiteral(value=1.0, loc=expr.loc)
+
+    return None
+
+
 def _extract_linear_weights(expr: ASTNode, tap_vars: dict[str, tuple[int, int]]
                             ) -> dict[tuple[int, int], float] | None:
     """Extract linear combination weights from an expression.
@@ -1120,6 +1228,12 @@ class _CodeGen:
         # Set by _emit_for_loop, consumed by _emit_assignment.
         # Declared vector types per variable name (for channel coercion)
         self._var_vec_type: dict[str, TEXType] = {}
+        # Hoisted BCHW images for inline sample(): binding_name → (bchw_var, grid_var).
+        # Cross-loop reuse is safe: bindings are immutable within a TEX program
+        # (read from _bind dict, never reassigned), so the BCHW permute stays valid.
+        self._hoisted_bchw: dict[str, tuple[str, str]] = {}
+        # VarDecl initializer AST nodes for sample→fetch pattern resolution
+        self._var_initializers: dict[str, ASTNode] = {}
         # Pre-resolved stdlib function locals: name → preamble variable.
         # Avoids _fns['name'] dict lookup on every call.
         self._fn_locals: dict[str, str] = {}
@@ -1165,6 +1279,8 @@ class _CodeGen:
             # Matrix operations
             "transpose": self._emit_fn_matrix, "determinant": self._emit_fn_matrix,
             "inverse": self._emit_fn_matrix,
+            # Sampling — inline when binding is hoisted, else fallthrough to _fns[]
+            "sample": self._emit_fn_sample, "fetch": self._emit_fn_fetch,
         }
 
     def _tmp(self) -> str:
@@ -1181,6 +1297,70 @@ class _CodeGen:
         self._preamble.append(f"    {local} = _fns[{name!r}]")
         self._fn_locals[name] = local
         return local
+
+    def _emit_direct_fetch(self, binding_name: str,
+                           dx_expr: ASTNode | bool, dy_expr: ASTNode | bool) -> str:
+        """Emit direct tensor indexing for sample-with-integer-offset patterns.
+
+        Shared by BindingSampleAccess and FunctionCall("sample") paths.
+        """
+        img_var = f"_bind[{binding_name!r}]"
+        dx_code = self._emit_expr(dx_expr) if dx_expr is not True else "0"
+        dy_code = self._emit_expr(dy_expr) if dy_expr is not True else "0"
+        px_tmp = self._tmp()
+        py_tmp = self._tmp()
+        if dx_code == "0":
+            self._emit(f"{px_tmp} = _lv_ix.clamp(0, {img_var}.shape[2] - 1).long()")
+        else:
+            self._emit(f"{px_tmp} = (_lv_ix + {dx_code}).clamp(0, {img_var}.shape[2] - 1).long()")
+        if dy_code == "0":
+            self._emit(f"{py_tmp} = _lv_iy.clamp(0, {img_var}.shape[1] - 1).long()")
+        else:
+            self._emit(f"{py_tmp} = (_lv_iy + {dy_code}).clamp(0, {img_var}.shape[1] - 1).long()")
+        tmp = self._tmp()
+        self._emit(f"{tmp} = {img_var}[:, {py_tmp}, {px_tmp}, :]"
+                   f" if {px_tmp}.dim() < 3"
+                   f" else {img_var}[_torch.arange({img_var}.shape[0]).view(-1,1,1), {py_tmp}, {px_tmp}, :]")
+        return tmp
+
+    def _emit_inline_grid_sample(self, binding_name: str,
+                                  u_expr: str, v_expr: str) -> str:
+        """Emit inline grid_sample using hoisted BCHW + pre-allocated grid buffer."""
+        bchw_var, grid_var = self._hoisted_bchw[binding_name]
+        gx = self._tmp()
+        gy = self._tmp()
+        self._emit(f"{gx} = {u_expr} * 2.0 - 1.0")
+        self._emit(f"{gy} = {v_expr} * 2.0 - 1.0")
+        self._emit(f"if {gx}.dim() < 3: {gx} = {gx}.expand({bchw_var}.shape[0], {bchw_var}.shape[2], {bchw_var}.shape[3])")
+        self._emit(f"if {gy}.dim() < 3: {gy} = {gy}.expand({bchw_var}.shape[0], {bchw_var}.shape[2], {bchw_var}.shape[3])")
+        self._emit(f"{grid_var}[..., 0] = {gx}")
+        self._emit(f"{grid_var}[..., 1] = {gy}")
+        result_bchw = self._tmp()
+        self._emit(f"{result_bchw} = _torch.nn.functional.grid_sample("
+                   f"{bchw_var}, {grid_var}, mode='bilinear', "
+                   f"padding_mode='border', align_corners=True)")
+        tmp = self._tmp()
+        self._emit(f"{tmp} = {result_bchw}.permute(0, 2, 3, 1)")
+        return tmp
+
+    def _hoist_sample_setup(self, stmts: list[ASTNode]):
+        """Emit BCHW conversion + grid buffer for bindings sampled in a loop.
+
+        Hoisting outside the loop avoids per-call overhead from the stdlib
+        fn_sample() wrapper (type checks, shape extraction, permute) and
+        saves a torch.stack allocation per sample call (~0.1ms each).
+        """
+        bindings = _collect_sample_bindings(stmts)
+        for bname in sorted(bindings):
+            if bname in self._hoisted_bchw:
+                continue  # Already hoisted by an outer loop
+            bchw_var = self._tmp()
+            grid_var = self._tmp()
+            self._emit(f"{bchw_var} = _bind[{bname!r}].permute(0, 3, 1, 2)")
+            self._emit(f"{grid_var} = _torch.empty("
+                       f"{bchw_var}.shape[0], {bchw_var}.shape[2], {bchw_var}.shape[3], 2, "
+                       f"dtype=_torch.float32, device=_dev)")
+            self._hoisted_bchw[bname] = (bchw_var, grid_var)
 
     def _emit(self, line: str):
         """Emit a line of code at the current indentation level."""
@@ -1360,6 +1540,8 @@ class _CodeGen:
 
     def _emit_var_decl(self, stmt: VarDecl):
         if stmt.initializer:
+            # Track local definitions for sample→fetch pattern resolution
+            self._var_initializers[stmt.name] = stmt.initializer
             expr = self._emit_expr(stmt.initializer)
             # Coerce channel count when declared type is a smaller vector
             declared = TYPE_NAME_MAP.get(stmt.type_name)
@@ -2459,6 +2641,8 @@ class _CodeGen:
 
     def _emit_general_for_loop(self, stmt: ForLoop):
         """Emit a general for loop as init + while (dynamic bounds)."""
+        # Hoist sample/fetch BCHW setup outside loop to avoid per-call overhead
+        self._hoist_sample_setup(stmt.body)
         self._emit_stmt(stmt.init)
 
         static = self._try_static_bound(stmt)
@@ -2519,6 +2703,8 @@ class _CodeGen:
         increment, but this is acceptable since _MAX_ITER is generous
         and the condition check still runs.
         """
+        # Hoist sample/fetch BCHW setup outside loop
+        self._hoist_sample_setup(stmt.body)
         iter_var = self._tmp()
         self._emit(f"{iter_var} = 0")
         self._emit(f"while {iter_var} < _MAX_ITER:")
@@ -2561,10 +2747,15 @@ class _CodeGen:
         if isinstance(node, BindingRef):
             if node.kind == "param":
                 # $params may be Python float/int from defaults — ensure tensor
-                # Runtime guard: skip strings which can't be converted
                 tmp = self._tmp()
                 self._emit(f"{tmp} = _bind[{node.name!r}]")
-                self._emit(f"if not isinstance({tmp}, (str, list)): {tmp} = _torch.as_tensor({tmp})")
+                param_type = self.type_map.get(id(node))
+                if param_type is None or param_type == TEXType.STRING:
+                    # Unknown or string type — guard needed
+                    self._emit(f"if not isinstance({tmp}, (str, list)): {tmp} = _torch.as_tensor({tmp})")
+                else:
+                    # Known numeric type — convert directly (no isinstance guard)
+                    self._emit(f"{tmp} = _torch.as_tensor({tmp})")
                 return tmp
             return f"_bind[{node.name!r}]"
 
@@ -2603,19 +2794,40 @@ class _CodeGen:
             args = [self._emit_expr(a) for a in node.args]
             tmp = self._tmp()
             if len(args) == 3:
-                self._emit(f"{tmp} = _fns['fetch_frame']({binding}, {args[2]}, {args[0]}, {args[1]})")
+                fn = self._get_fn_local('fetch_frame')
+                self._emit(f"{tmp} = {fn}({binding}, {args[2]}, {args[0]}, {args[1]})")
             else:
-                self._emit(f"{tmp} = _fns['fetch']({binding}, {args[0]}, {args[1]})")
+                fn = self._get_fn_local('fetch')
+                self._emit(f"{tmp} = {fn}({binding}, {args[0]}, {args[1]})")
             return tmp
 
         if isinstance(node, BindingSampleAccess):
-            binding = self._emit_expr(node.binding)
+            binding_name = node.binding.name if isinstance(node.binding, BindingRef) else None
+
+            # Fast path: sample with integer pixel offsets → direct tensor indexing
+            if (binding_name and len(node.args) == 2
+                    and binding_name in self._hoisted_bchw):
+                dx_expr = _extract_uv_offset_expr(node.args[0], "u")
+                dy_expr = _extract_uv_offset_expr(node.args[1], "v")
+                if dx_expr is not None and dy_expr is not None:
+                    return self._emit_direct_fetch(binding_name, dx_expr, dy_expr)
+
             args = [self._emit_expr(a) for a in node.args]
+
+            # Medium path: inline grid_sample with hoisted BCHW + pre-allocated grid
+            if (binding_name and binding_name in self._hoisted_bchw
+                    and len(args) == 2):
+                return self._emit_inline_grid_sample(binding_name, args[0], args[1])
+
+            # Fallback: standard _fn_sample call
+            binding = self._emit_expr(node.binding)
             tmp = self._tmp()
             if len(args) == 3:
-                self._emit(f"{tmp} = _fns['sample_frame']({binding}, {args[2]}, {args[0]}, {args[1]})")
+                fn = self._get_fn_local('sample_frame')
+                self._emit(f"{tmp} = {fn}({binding}, {args[2]}, {args[0]}, {args[1]})")
             else:
-                self._emit(f"{tmp} = _fns['sample']({binding}, {args[0]}, {args[1]})")
+                fn = self._get_fn_local('sample')
+                self._emit(f"{tmp} = {fn}({binding}, {args[0]}, {args[1]})")
             return tmp
 
         raise _Unsupported(f"Unknown expression: {type(node).__name__}")
@@ -2803,13 +3015,23 @@ class _CodeGen:
             self._emit(f"{tmp} = {true_val} if float({cond}) > 0.5 else {false_val}")
             return tmp
 
-        # Handle string ternary
-        self._emit(f"if isinstance({true_val}, str) or isinstance({false_val}, str):")
-        self._indent += 1
-        self._emit(f"_cs = {cond}.float().mean().item() if _torch.is_tensor({cond}) and {cond}.dim() > 0 else (float({cond}.item()) if _torch.is_tensor({cond}) else float({cond}))")
-        self._emit(f"{tmp} = {true_val} if _cs > 0.5 else {false_val}")
-        self._indent -= 1
-        self._emit(f"elif not _torch.is_tensor({cond}) or {cond}.dim() == 0:")
+        # Check if string handling is needed via type_map
+        true_type = self.type_map.get(id(node.true_expr))
+        false_type = self.type_map.get(id(node.false_expr))
+        both_numeric = (true_type is not None and true_type != TEXType.STRING
+                        and false_type is not None and false_type != TEXType.STRING)
+
+        if not both_numeric:
+            # String ternary guard (causes graph break)
+            self._emit(f"if isinstance({true_val}, str) or isinstance({false_val}, str):")
+            self._indent += 1
+            self._emit(f"_cs = {cond}.float().mean().item() if _torch.is_tensor({cond}) and {cond}.dim() > 0 else (float({cond}.item()) if _torch.is_tensor({cond}) else float({cond}))")
+            self._emit(f"{tmp} = {true_val} if _cs > 0.5 else {false_val}")
+            self._indent -= 1
+            self._emit(f"elif not _torch.is_tensor({cond}) or {cond}.dim() == 0:")
+        else:
+            # Both arms are numeric — skip string guard (no graph break)
+            self._emit(f"if not _torch.is_tensor({cond}) or {cond}.dim() == 0:")
         self._indent += 1
         self._emit(f"{tmp} = {true_val} if float({cond}) > 0.5 else {false_val}")
         self._indent -= 1
@@ -2828,6 +3050,20 @@ class _CodeGen:
 
     def _emit_function_call(self, node: FunctionCall) -> str:
         name = node.name
+
+        # Fast path: convert sample(@img, u+expr*px, v+expr*py) → direct fetch
+        # Resolves through local variable definitions (e.g. off_u = float(px2) * px)
+        if (name == "sample" and len(node.args) == 3
+                and isinstance(node.args[0], BindingRef)):
+            bname = node.args[0].name
+            if bname in self._hoisted_bchw:
+                u_arg = _resolve_through_locals(node.args[1], self._var_initializers)
+                v_arg = _resolve_through_locals(node.args[2], self._var_initializers)
+                dx_expr = _extract_uv_offset_expr(u_arg, "u")
+                dy_expr = _extract_uv_offset_expr(v_arg, "v")
+                if dx_expr is not None and dy_expr is not None:
+                    return self._emit_direct_fetch(bname, dx_expr, dy_expr)
+
         args = [self._emit_expr(a) for a in node.args]
         tmp = self._tmp()
 
@@ -3253,6 +3489,47 @@ class _CodeGen:
         else:
             return None
         return tmp
+
+    def _emit_fn_sample(
+        self, node: FunctionCall, args: list[str], tmp: str,
+    ) -> str | None:
+        """Emit sample(@img, u, v) with inline grid_sample when binding is hoisted."""
+        if len(args) != 3:
+            return None  # sample_frame has 4 args — fall through
+        # args[0] is the binding (already emitted), args[1]=u, args[2]=v
+        binding_node = node.args[0]
+        bname = binding_node.name if isinstance(binding_node, BindingRef) else None
+        if bname and bname in self._hoisted_bchw:
+            return self._emit_inline_grid_sample(bname, args[1], args[2])
+        return None  # fall through to _fns[] path
+
+    def _emit_fn_fetch(
+        self, node: FunctionCall, args: list[str], tmp: str,
+    ) -> str | None:
+        """Emit fetch(@img, px, py) with direct tensor indexing when binding is hoisted."""
+        if len(args) != 3:
+            return None
+        binding_node = node.args[0]
+        bname = binding_node.name if isinstance(binding_node, BindingRef) else None
+        if bname and bname in self._hoisted_bchw:
+            img_var = f"_bind[{bname!r}]"
+            px = self._tmp()
+            py = self._tmp()
+            self._emit(f"{px} = {args[1]}.clamp(0, {img_var}.shape[2] - 1).long()")
+            self._emit(f"{py} = {args[2]}.clamp(0, {img_var}.shape[1] - 1).long()")
+            # B=1 fast path: direct indexing without batch dim
+            self._emit(f"if {img_var}.shape[0] == 1:")
+            self._indent += 1
+            self._emit(f"{tmp} = {img_var}[0, {py}, {px}]"
+                       f" if {px}.dim() < 3"
+                       f" else {img_var}[0, {py}[0], {px}[0]]")
+            self._indent -= 1
+            self._emit(f"else:")
+            self._indent += 1
+            self._emit(f"{tmp} = {img_var}[_torch.arange({img_var}.shape[0]).view(-1,1,1), {py}, {px}]")
+            self._indent -= 1
+            return tmp
+        return None
 
     def _emit_vec_constructor(self, node: VecConstructor) -> str:
         n = node.size

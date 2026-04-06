@@ -673,9 +673,9 @@ function syncParams(node, params) {
         if (typeHint === "i") return "INT";
         if (typeHint === "b") return "BOOLEAN";
         if (typeHint === "s") return "STRING";
-        if (typeHint === "c") return "STRING";   // hex color stored as string
-        if (typeHint === "v2") return "STRING";   // "x, y" stored as string
-        if (typeHint === "v3") return "STRING";   // "x, y, z" stored as string
+        if (typeHint === "c") return "STRING";   // hex color string
+        if (typeHint === "v2") return "STRING";   // comma-separated floats
+        if (typeHint === "v3") return "STRING";   // comma-separated floats
         return "FLOAT";
     }
 
@@ -700,7 +700,7 @@ function syncParams(node, params) {
             }
             widget = node.addWidget("text", name, def, () => {});
         } else if (typeHint === "v2" || typeHint === "v3") {
-            // Vec2/Vec3 → text input with comma-separated component default
+            // Vec2/Vec3 → text input with comma-separated defaults
             const n = typeHint === "v2" ? 2 : 3;
             let def = Array(n).fill("0.0").join(", ");
             if (info.defaultValue != null) {

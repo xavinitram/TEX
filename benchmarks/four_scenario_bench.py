@@ -151,48 +151,83 @@ def _uses_spatial_builtins(code: str) -> bool:
 
 def generate_bindings(code: str, B: int, H: int, W: int,
                       device: str = "cpu") -> dict:
-    """Create synthetic input tensors for a program."""
+    """Create synthetic input tensors for a program.
+
+    Uses 2-pass type checking (same as test harness) to discover all referenced
+    bindings and their types, then creates appropriate dummy tensors.
+    """
+    from TEX_Wrangle.tex_compiler.type_checker import BINDING_HINT_TYPES
+
     b = {}
-    det = _detect_bindings(code)
-    C = 4  # RGBA — matches ComfyUI's standard image format
-    if det["needs_image"]:
-        t = torch.rand(B, H, W, C, dtype=torch.float32, device=device)
-        # Only add binding names that are actually referenced in the code
-        if re.search(r"@A\b", code):
-            b["A"] = t
-        if re.search(r"@image\b", code):
-            b["image"] = t
-        # If neither specific name found, default to A
-        if "A" not in b and "image" not in b:
-            b["A"] = t
-    if det["needs_ref"]:
-        b["ref"] = torch.rand(B, H, W, 4, dtype=torch.float32, device=device)
-    if det["needs_frames"]:
-        b["frames"] = torch.rand(max(B, 4), H, W, 4, dtype=torch.float32, device=device)
-    if det["needs_latent_ab"]:
-        lH, lW = max(1, H // 8), max(1, W // 8)
-        b["latent_a"] = torch.rand(B, lH, lW, 4, dtype=torch.float32, device=device)
-        b["latent_b"] = torch.rand(B, lH, lW, 4, dtype=torch.float32, device=device)
-    if det["needs_latent"]:
-        lH, lW = max(1, H // 8), max(1, W // 8)
-        b["latent"] = torch.rand(B, lH, lW, 4, dtype=torch.float32, device=device)
-    if det["needs_base_overlay_blend"]:
-        b["base"] = torch.rand(B, H, W, 3, dtype=torch.float32, device=device)
-        b["overlay"] = torch.rand(B, H, W, 3, dtype=torch.float32, device=device)
-        b["blend"] = torch.rand(B, H, W, dtype=torch.float32, device=device) * 0.5 + 0.25
-    if det["needs_text"]:
-        b["text"] = "  Hello World  "
-    if det["needs_mask"]:
-        b["mask"] = torch.rand(B, H, W, dtype=torch.float32, device=device)
+
+    # Pass 1: Parse and type-check to discover all referenced bindings
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    checker = TypeChecker(binding_types={}, source=code)
+    checker.check(program)
+    output_names = set(checker.assigned_bindings.keys())
+    param_names = set(checker.param_declarations.keys())
+    input_names = checker.referenced_bindings - output_names - param_names
+
+    # Detect type hints and vec4 context from AST
+    has_vec4 = "vec4" in code
+    default_type = TEXType.VEC4 if has_vec4 else TEXType.VEC3
+    C = 4 if has_vec4 else 3
+
+    # Collect type hints from binding refs in the AST
+    from TEX_Wrangle.tex_compiler.ast_nodes import BindingRef
+    hints = {}
+    stack = list(program.statements)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, BindingRef) and node.type_hint and node.kind == "wire":
+            hints[node.name] = BINDING_HINT_TYPES.get(node.type_hint, default_type)
+        for attr in dir(node):
+            if attr.startswith("_"):
+                continue
+            val = getattr(node, attr, None)
+            if isinstance(val, list):
+                stack.extend(v for v in val if hasattr(v, "loc"))
+            elif hasattr(val, "loc"):
+                stack.append(val)
+
+    # Create dummy bindings for each referenced input
+    for bname in input_names:
+        bt = hints.get(bname, default_type)
+        if bt == TEXType.STRING:
+            b[bname] = "hello"
+        elif bt == TEXType.FLOAT:
+            b[bname] = torch.rand(B, H, W, dtype=torch.float32, device=device)
+        elif bt == TEXType.INT:
+            b[bname] = torch.randint(0, 10, (B, H, W), device=device).float()
+        elif bt == TEXType.VEC2:
+            b[bname] = torch.rand(B, H, W, 2, dtype=torch.float32, device=device)
+        elif bt == TEXType.VEC3:
+            b[bname] = torch.rand(B, H, W, 3, dtype=torch.float32, device=device)
+        else:
+            b[bname] = torch.rand(B, H, W, C, dtype=torch.float32, device=device)
+
+    # Add param defaults
     for pname, pval in _extract_param_defaults(code).items():
         b[pname] = pval
-    # Ensure spatial context: if the program uses spatial builtins (u, v, ix, iy)
-    # but no image/ref/frames/mask binding was created, add a dummy ref tensor
-    # so the interpreter can determine spatial shape.
+
+    # Also add param defaults from type checker
+    for pname, pinfo in checker.param_declarations.items():
+        if pname not in b:
+            hint = pinfo.get("type", TEXType.FLOAT)
+            if hint == TEXType.STRING:
+                b[pname] = ""
+            elif hint == TEXType.INT:
+                b[pname] = 0
+            elif hint == TEXType.FLOAT:
+                b[pname] = 0.5
+            else:
+                b[pname] = 0.5
+
+    # Ensure spatial context for procedural programs
     has_spatial = any(isinstance(v, torch.Tensor) and v.dim() >= 3
                       for v in b.values())
     if not has_spatial and _uses_spatial_builtins(code):
-        b["ref"] = torch.rand(B, H, W, 4, dtype=torch.float32, device=device)
+        b["ref"] = torch.rand(B, H, W, C, dtype=torch.float32, device=device)
     return b
 
 
