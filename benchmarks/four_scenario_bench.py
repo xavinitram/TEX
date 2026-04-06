@@ -116,7 +116,7 @@ def _detect_bindings(code: str) -> dict:
 def _extract_param_defaults(code: str) -> dict:
     """Extract $param declarations and their default values."""
     defaults = {}
-    for m in re.finditer(r"([fis])\$(\w+)\s*=\s*([^;]+);", code):
+    for m in re.finditer(r"([fisbc]|v[234])\$(\w+)\s*=\s*([^;]+);", code):
         hint, name, raw = m.groups()
         raw = raw.strip().strip("\"'")
         try:
@@ -124,10 +124,18 @@ def _extract_param_defaults(code: str) -> dict:
                 defaults[name] = float(raw)
             elif hint == "i":
                 defaults[name] = int(raw)
+            elif hint == "b":
+                defaults[name] = 1 if raw in ("1", "true") else 0
+            elif hint == "c":
+                defaults[name] = raw  # hex string like "#FF8800"
+            elif hint.startswith("v"):
+                # vec2/vec3/vec4 — extract comma values from vec3(1,2,3) or "1,2,3"
+                vm = re.match(r"vec\d\s*\(([^)]+)\)", raw)
+                defaults[name] = vm.group(1).strip() if vm else raw
             else:
                 defaults[name] = raw
-        except ValueError:
-            defaults[name] = 0.5 if hint == "f" else 1 if hint == "i" else raw
+        except (ValueError, AttributeError):
+            defaults[name] = 0.5
     return defaults
 
 

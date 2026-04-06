@@ -37,6 +37,16 @@ def _get_bchw(img: torch.Tensor) -> torch.Tensor:
     return img.permute(0, 3, 1, 2)
 
 
+def _expand_to_bhw(t: torch.Tensor, B: int, H: int, W: int) -> torch.Tensor:
+    """Expand a scalar (dim 0) or 2D [H, W] tensor to [B, H, W]."""
+    d = t.dim()
+    if d == 0:
+        return t.expand(B, H, W)
+    if d == 2:
+        return t.unsqueeze(0).expand(B, H, W)
+    return t  # already [B, H, W] or higher
+
+
 # Pre-allocated grid buffer for sample() — avoids torch.stack allocation per call.
 # Keyed by (B, H, W, device) → [B, H, W, 2] tensor.
 # Bounded via LRU eviction (each entry is ~16 MB at 1080p).
@@ -206,6 +216,7 @@ class TEXStdlib:
             "sample_mip": TEXStdlib.fn_sample_mip,
             "sample_mip_gauss": TEXStdlib.fn_sample_mip_gauss,
             "gauss_blur": TEXStdlib.fn_gauss_blur,
+            "bilateral_filter": TEXStdlib.fn_bilateral_filter,
             "fetch_frame": TEXStdlib.fn_fetch_frame,
             "sample_frame": TEXStdlib.fn_sample_frame,
 
@@ -722,14 +733,8 @@ class TEXStdlib:
             return img[0, py_i[0], px_i[0]].unsqueeze(0)
 
         # Multi-batch: expand coordinates to [B, H, W]
-        if px_i.dim() == 0:
-            px_i = px_i.expand(B, H, W)
-        elif px_i.dim() == 2:
-            px_i = px_i.unsqueeze(0).expand(B, H, W)
-        if py_i.dim() == 0:
-            py_i = py_i.expand(B, H, W)
-        elif py_i.dim() == 2:
-            py_i = py_i.unsqueeze(0).expand(B, H, W)
+        px_i = _expand_to_bhw(px_i, B, H, W)
+        py_i = _expand_to_bhw(py_i, B, H, W)
 
         return img[_get_batch_index(B, H, W, img.device), py_i, px_i]
 
@@ -759,18 +764,9 @@ class TEXStdlib:
         py_i = torch.clamp(torch.round(py_t).long(), 0, H - 1)
 
         # Expand scalars/2D to [B, H, W]
-        if f_idx.dim() == 0:
-            f_idx = f_idx.expand(B, H, W)
-        if f_idx.dim() == 2:
-            f_idx = f_idx.unsqueeze(0).expand(B, H, W)
-        if px_i.dim() == 0:
-            px_i = px_i.expand(B, H, W)
-        if px_i.dim() == 2:
-            px_i = px_i.unsqueeze(0).expand(B, H, W)
-        if py_i.dim() == 0:
-            py_i = py_i.expand(B, H, W)
-        if py_i.dim() == 2:
-            py_i = py_i.unsqueeze(0).expand(B, H, W)
+        f_idx = _expand_to_bhw(f_idx, B, H, W)
+        px_i = _expand_to_bhw(px_i, B, H, W)
+        py_i = _expand_to_bhw(py_i, B, H, W)
 
         return img[f_idx, py_i, px_i]
 
@@ -797,27 +793,11 @@ class TEXStdlib:
         # Resolve frame index
         f_idx = torch.clamp(torch.round(frame_t).long(), 0, B - 1)
 
-        # Expand scalars to spatial dims
-        if f_idx.dim() == 0:
-            f_idx = f_idx.expand(B, H, W)
-        if f_idx.dim() == 2:
-            f_idx = f_idx.unsqueeze(0).expand(B, H, W)
-
-        # For cross-frame sampling, we need to gather from specific frames first
-        # then apply grid_sample per-unique-frame or use advanced indexing.
-        # Since frame indices can vary per-pixel, we fall back to manual bilinear
-        # for the cross-frame case (grid_sample only handles per-batch).
+        f_idx = _expand_to_bhw(torch.clamp(torch.round(frame_t).long(), 0, B - 1), B, H, W)
 
         # Convert from [0,1] to pixel coordinates
-        x = u * (W - 1)
-        y = v * (H - 1)
-
-        if x.dim() == 0:
-            x = x.expand(B, H, W)
-            y = y.expand(B, H, W)
-        elif x.dim() == 2:
-            x = x.unsqueeze(0).expand(B, H, W)
-            y = y.unsqueeze(0).expand(B, H, W)
+        x = _expand_to_bhw(u * (W - 1), B, H, W)
+        y = _expand_to_bhw(v * (H - 1), B, H, W)
 
         x = torch.clamp(x, 0, W - 1)
         y = torch.clamp(y, 0, H - 1)
@@ -1012,11 +992,11 @@ class TEXStdlib:
             return img
 
         B, H, W, C = img.shape
-        radius = min(int(math.ceil(3.0 * ss)), 5)
+        radius = min(int(math.ceil(3.0 * ss)), 3)  # cap at 7x7 to limit memory (~500MB at 1080p)
         ksize = 2 * radius + 1
 
         # Convert to BCHW and pad
-        bchw = img.permute(0, 3, 1, 2)  # [B, C, H, W]
+        bchw = _get_bchw(img)
         padded = torch.nn.functional.pad(bchw, (radius, radius, radius, radius), mode='replicate')
 
         # Extract all ksize×ksize patches: [B, C, H, W, kH, kW]

@@ -24,6 +24,7 @@ from ..tex_compiler.ast_nodes import (
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
     BindingIndexAccess, BindingSampleAccess,
     try_extract_static_range,
+    collect_assigned_vars,
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
 from .stdlib import TEXStdlib, SAFE_EPSILON, VEC_CHANNELS
@@ -39,7 +40,6 @@ _SCALAR_BUILTIN_DEFAULTS = {"ix": 0.0, "iy": 0.0, "u": 0.0, "v": 0.0,
                             "iw": 1.0, "ih": 1.0, "px": 1.0, "py": 1.0,
                             "fi": 0.0, "fn": 1.0}
 
-_VEC_CHANNELS = VEC_CHANNELS  # alias for local use
 
 
 
@@ -117,7 +117,7 @@ class Interpreter:
         self.spatial_shape: tuple[int, int, int] | None = None  # (B, H, W)
         self._array_meta: dict[str, int] = {}  # var_name -> array size
         self._source: str = ""  # Original source code for diagnostics
-        self._literal_cache: dict[tuple[float, str], torch.Tensor] = {}  # (value, device) -> tensor
+        self._literal_cache: dict[tuple, torch.Tensor] = {}  # (value, device_str, dtype) -> tensor
         self._inplace_ready: set[str] = set()  # vars that have been cloned for in-place ops
         self._user_functions: dict[str, FunctionDef] = {}
         self._call_depth: int = 0
@@ -195,82 +195,7 @@ class Interpreter:
                                        latent_channel_count, output_names,
                                        precision, used_builtins=used_builtins)
 
-    def execute_tiled(
-        self,
-        program: Program,
-        bindings: dict[str, torch.Tensor | float | int],
-        type_map: dict[int, TEXType],
-        device: torch.device | str = "cpu",
-        latent_channel_count: int = 0,
-        output_names: list[str] | None = None,
-        precision: str = "fp32",
-        tile_height: int = 2048,
-        used_builtins: frozenset[str] | None = None,
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
-        """Execute with tiling for large images to prevent OOM.
 
-        Splits images into horizontal strips of `tile_height` rows.
-        Coordinate builtins (u, v, ix, iy) reflect full-image positions.
-        Sampling functions receive the FULL source image so neighbourhood
-        lookups work correctly across tile boundaries.
-
-        For images smaller than tile_height, falls through to regular execute.
-        """
-        # Find spatial dims from bindings
-        full_H = full_W = B = 0
-        for val in bindings.values():
-            if isinstance(val, torch.Tensor) and val.dim() >= 3:
-                B, full_H, full_W = val.shape[0], val.shape[1], val.shape[2]
-                break
-        if full_H <= tile_height:
-            return self.execute(program, bindings, type_map, device,
-                                latent_channel_count, output_names, precision,
-                                used_builtins=used_builtins)
-
-        # Process in horizontal strips
-        tiles: list[torch.Tensor] = []
-        tile_dicts: list[dict] = []  # for multi-output mode
-        for y_start in range(0, full_H, tile_height):
-            y_end = min(y_start + tile_height, full_H)
-
-            # Slice spatial bindings to the tile region for OUTPUT computation,
-            # but keep full-resolution bindings available for sampling.
-            # Strategy: slice bindings that are consumed as @OUT source,
-            # but sampling functions always receive the full image.
-            # We achieve this by slicing bindings and passing tile_offset.
-            tile_bindings = {}
-            for name, val in bindings.items():
-                if isinstance(val, torch.Tensor) and val.dim() >= 3:
-                    tile_bindings[name] = val[:, y_start:y_end]
-                else:
-                    tile_bindings[name] = val
-
-            # Execute tile with offset info for correct coordinate generation
-            with torch.inference_mode():
-                result = self._execute_inner(
-                    program, tile_bindings, type_map, device,
-                    latent_channel_count, output_names, precision,
-                    tile_offset=(y_start, full_H, full_W),
-                    used_builtins=used_builtins,
-                )
-
-            if isinstance(result, dict):
-                tile_dicts.append(result)
-            else:
-                tiles.append(result)
-
-        if tile_dicts:
-            # Multi-output: concatenate each output along H
-            merged = {}
-            for key in tile_dicts[0]:
-                vals = [d[key] for d in tile_dicts]
-                if isinstance(vals[0], torch.Tensor):
-                    merged[key] = torch.cat(vals, dim=1)
-                else:
-                    merged[key] = vals[0]
-            return merged
-
-        return torch.cat(tiles, dim=1)
 
     # Precision dtype mapping
     _PRECISION_DTYPES = {
@@ -561,7 +486,7 @@ class Interpreter:
         """Ensure a tensor has the correct number of channels for a vec array element."""
         if not isinstance(tensor, torch.Tensor):
             tensor = torch.scalar_tensor(float(tensor), dtype=self._dtype, device=self.device)
-        if tensor.dim() >= 1 and tensor.shape[-1] in _VEC_CHANNELS:
+        if tensor.dim() >= 1 and tensor.shape[-1] in VEC_CHANNELS:
             c = tensor.shape[-1]
             if c == channels:
                 return tensor
@@ -775,7 +700,7 @@ class Interpreter:
         frame = args[2] if len(args) == 3 else None
 
         # Determine channel count from value
-        if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[-1] in _VEC_CHANNELS:
+        if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[-1] in VEC_CHANNELS:
             C = value.shape[-1]
         else:
             C = 1
@@ -838,52 +763,7 @@ class Interpreter:
         elif op == "/":
             buf[idx] /= torch.where(flat_v == 0, SAFE_EPSILON, flat_v)
 
-    @staticmethod
-    def _collect_assigned_vars(stmts: list[ASTNode]) -> tuple[set[str], set[str]]:
-        """Collect variable names and binding names assigned in a statement list.
-
-        Returns (env_vars, binding_names) — recursively walks into nested
-        if/else and loop bodies to find all possible assignments.
-        """
-        env_vars: set[str] = set()
-        binding_names: set[str] = set()
-        for stmt in stmts:
-            if isinstance(stmt, Assignment):
-                target = stmt.target
-                if isinstance(target, Identifier):
-                    env_vars.add(target.name)
-                elif isinstance(target, BindingRef):
-                    binding_names.add(target.name)
-                elif isinstance(target, ChannelAccess):
-                    obj = target.object
-                    if isinstance(obj, Identifier):
-                        env_vars.add(obj.name)
-                    elif isinstance(obj, BindingRef):
-                        binding_names.add(obj.name)
-                elif isinstance(target, ArrayIndexAccess):
-                    arr = target.array
-                    if isinstance(arr, Identifier):
-                        env_vars.add(arr.name)
-                    elif isinstance(arr, BindingRef):
-                        binding_names.add(arr.name)
-            elif isinstance(stmt, VarDecl):
-                env_vars.add(stmt.name)
-            elif isinstance(stmt, ArrayDecl):
-                env_vars.add(stmt.name)
-            elif isinstance(stmt, IfElse):
-                e1, b1 = Interpreter._collect_assigned_vars(stmt.then_body)
-                e2, b2 = Interpreter._collect_assigned_vars(stmt.else_body)
-                env_vars |= e1 | e2
-                binding_names |= b1 | b2
-            elif isinstance(stmt, ForLoop):
-                e, b = Interpreter._collect_assigned_vars(stmt.body)
-                env_vars |= e
-                binding_names |= b
-            elif isinstance(stmt, WhileLoop):
-                e, b = Interpreter._collect_assigned_vars(stmt.body)
-                env_vars |= e
-                binding_names |= b
-        return env_vars, binding_names
+    _collect_assigned_vars = staticmethod(collect_assigned_vars)
 
     def _exec_if_else(self, node: IfElse):
         """
@@ -1630,16 +1510,12 @@ class Interpreter:
     def _default_value(self, t: TEXType) -> torch.Tensor | str:
         if t == TEXType.STRING:
             return ""
-        elif t == TEXType.VEC3:
+        elif t.is_vector:
+            c = t.channels
             if self.spatial_shape:
                 B, H, W = self.spatial_shape
-                return torch.zeros(B, H, W, 3, dtype=self._dtype, device=self.device)
-            return torch.zeros(3, dtype=self._dtype, device=self.device)
-        elif t == TEXType.VEC4:
-            if self.spatial_shape:
-                B, H, W = self.spatial_shape
-                return torch.zeros(B, H, W, 4, dtype=self._dtype, device=self.device)
-            return torch.zeros(4, dtype=self._dtype, device=self.device)
+                return torch.zeros(B, H, W, c, dtype=self._dtype, device=self.device)
+            return torch.zeros(c, dtype=self._dtype, device=self.device)
         elif t.is_matrix:
             n = t.mat_size
             return torch.zeros(n, n, dtype=self._dtype, device=self.device)
@@ -1783,7 +1659,7 @@ def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, tor
         # Same rank — pad channel dim when both are vectors (e.g. vec2 [B,H,W,2] + vec3 [B,H,W,3])
         if ad >= 1 and a.shape[-1] != b.shape[-1]:
             ac, bc = a.shape[-1], b.shape[-1]
-            if not (ac in _VEC_CHANNELS and bc in _VEC_CHANNELS):
+            if not (ac in VEC_CHANNELS and bc in VEC_CHANNELS):
                 return a, b
             if ac < bc:
                 a = torch.nn.functional.pad(a, (0, bc - ac))

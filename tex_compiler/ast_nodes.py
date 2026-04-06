@@ -349,3 +349,47 @@ def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     if step == 0:
         return None
     return (loop_var, start, end, step)
+
+
+def collect_assigned_vars(stmts: list[ASTNode]) -> tuple[set[str], set[str]]:
+    """Collect variable names and binding names assigned in a statement list.
+
+    Returns (env_vars, binding_names). Recursively walks into nested
+    if/else and loop bodies to find all possible assignments.
+    Shared by both the interpreter and codegen.
+    """
+    env_vars: set[str] = set()
+    binding_names: set[str] = set()
+    for stmt in stmts:
+        if isinstance(stmt, Assignment):
+            t = stmt.target
+            if isinstance(t, Identifier):
+                env_vars.add(t.name)
+            elif isinstance(t, BindingRef):
+                binding_names.add(t.name)
+            elif isinstance(t, ChannelAccess):
+                o = t.object
+                if isinstance(o, Identifier):
+                    env_vars.add(o.name)
+                elif isinstance(o, BindingRef):
+                    binding_names.add(o.name)
+            elif isinstance(t, ArrayIndexAccess):
+                if isinstance(t.array, Identifier):
+                    env_vars.add(t.array.name)
+            elif isinstance(t, BindingIndexAccess):
+                if isinstance(t.binding, BindingRef):
+                    binding_names.add(t.binding.name)
+        elif isinstance(stmt, VarDecl):
+            env_vars.add(stmt.name)
+        elif isinstance(stmt, ArrayDecl):
+            env_vars.add(stmt.name)
+        elif isinstance(stmt, IfElse):
+            e1, b1 = collect_assigned_vars(stmt.then_body)
+            e2, b2 = collect_assigned_vars(stmt.else_body)
+            env_vars |= e1 | e2
+            binding_names |= b1 | b2
+        elif isinstance(stmt, (ForLoop, WhileLoop)):
+            e, b = collect_assigned_vars(stmt.body)
+            env_vars |= e
+            binding_names |= b
+    return env_vars, binding_names

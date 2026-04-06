@@ -25,7 +25,8 @@ from typing import Any, Callable
 
 import torch
 
-from .interpreter import Interpreter, _ensure_spatial, _broadcast_pair, _collect_identifiers
+from .interpreter import (Interpreter, _ensure_spatial, _broadcast_pair,
+                          _collect_identifiers, _SCALAR_BUILTIN_DEFAULTS)
 from .codegen import try_compile as _try_codegen, _CgBreak, _CgContinue
 from .stdlib import TEXStdlib, SAFE_EPSILON
 from ..tex_compiler.type_checker import CHANNEL_MAP
@@ -474,10 +475,7 @@ def _build_codegen_env(
         if "fn" in used:
             env["fn"] = torch.tensor(float(B), dtype=dtype, device=device)
     else:
-        _scalar_defaults = {"ix": 0.0, "iy": 0.0, "u": 0.0, "v": 0.0,
-                            "iw": 1.0, "ih": 1.0, "px": 1.0, "py": 1.0,
-                            "fi": 0.0, "fn": 1.0}
-        for name, val in _scalar_defaults.items():
+        for name, val in _SCALAR_BUILTIN_DEFAULTS.items():
             if name in used:
                 env[name] = torch.tensor(val, device=device)
 

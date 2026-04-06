@@ -60,6 +60,8 @@ def optimize(program: Program) -> Program:
       1. Constant folding + algebraic simplification (per-expression)
       2. Dead code elimination (remove unused variable assignments)
       3. Common Subexpression Elimination (CSE) within basic blocks
+      4. Loop-Invariant Code Motion (LICM) — hoist invariant expressions
+      5. Small loop unrolling (preserving nested loops for stencil detection)
     """
     # Pass 1: constant folding + algebraic simplification
     for i, stmt in enumerate(program.statements):

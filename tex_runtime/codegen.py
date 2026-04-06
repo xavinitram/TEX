@@ -9,12 +9,9 @@ executions call the function directly, eliminating:
   - Redundant dict lookups for env/bindings
 
 Falls back to None (caller uses tree-walking interpreter) for unsupported
-patterns: string operations, spatial if/else with complex merging.
-
-Break/continue handling: the codegen uses exception-based control flow
-(matching the interpreter) because Python's native 'continue' would skip
-the for-loop update statement. _CgBreak/_CgContinue are raised in generated
-code and caught by the generated loop wrapper.
+patterns. Includes stencil specialization (avg_pool2d, max_pool2d, conv2d,
+unfold), sample/fetch inlining with hoisted BCHW + grid buffers, and
+function specializations (pow, luma, clamp, etc.).
 """
 from __future__ import annotations
 
@@ -30,6 +27,7 @@ from ..tex_compiler.ast_nodes import (
     MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral,
     BindingIndexAccess, BindingSampleAccess,
     try_extract_static_range,
+    collect_assigned_vars,
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
 from .interpreter import MAX_CALL_DEPTH, _BUILTIN_NAMES
@@ -56,6 +54,11 @@ _INFIX_OPS = {"+", "-", "*"}
 # Comparison operators
 _CMP_OPS = {
     "==": "==", "!=": "!=", "<": "<", ">": ">", "<=": "<=", ">=": ">=",
+}
+
+_IMG_REDUCE_OPS = {
+    "img_sum": "sum", "img_mean": "mean",
+    "img_min": "amin", "img_max": "amax",
 }
 
 
@@ -130,12 +133,9 @@ _SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy"))
 _SPATIAL_STDLIB: frozenset[str] = frozenset((
     "sample", "fetch", "sample_cubic", "sample_mip", "sample_grad",
     "sample_frame", "fetch_frame", "gauss_blur", "sample_lanczos",
+    "sample_mip_gauss", "bilateral_filter",
 ))
 
-# All environment variable names pre-populated by the caller.
-# These need _env.get() at program start; user-defined vars don't.
-# Reuse the interpreter's canonical list to avoid drift.
-_ENV_BUILTINS: frozenset[str] = _BUILTIN_NAMES
 
 
 
@@ -214,7 +214,6 @@ class _StencilInfo:
     result_var: str | None = None
     # Conv2d (inline stencil with fixed kernel weights)
     kernel_weights: dict | None = None  # {(dy, dx): float_weight}
-    result_var: str | None = None
     consumed_stmts: set | None = None   # indices of statements consumed by the stencil
     # Median (array collect pattern)
     array_vars: list | None = None      # [(arr_name, ch_idx|None)] per array
@@ -316,13 +315,6 @@ def _find_fetch_call(expr: ASTNode) -> FunctionCall | BindingIndexAccess | None:
         if found:
             return found
         return _find_fetch_call(expr.right)
-    return None
-
-
-def _get_channels_from_expr(expr: ASTNode) -> str | None:
-    """Extract channel swizzle from expression wrapping a fetch/sample call."""
-    if isinstance(expr, ChannelAccess):
-        return expr.channels
     return None
 
 
@@ -970,10 +962,6 @@ def _extract_linear_weights(expr: ASTNode, tap_vars: dict[str, tuple[int, int]]
     """
     weights: dict[tuple[int, int], float] = {}
 
-    def _add(w: dict[tuple[int, int], float], scale: float = 1.0):
-        for k, v in w.items():
-            weights[k] = weights.get(k, 0.0) + v * scale
-
     def _extract(node: ASTNode, scale: float) -> bool:
         """Recursively extract weights. Returns True on success."""
         if isinstance(node, Identifier) and node.name in tap_vars:
@@ -1040,9 +1028,9 @@ def _collect_ident_refs(node: ASTNode, refs: set[str]) -> None:
         _collect_ident_refs(node.value, refs)
     elif isinstance(node, IfElse):
         _collect_ident_refs(node.condition, refs)
-        for s in node.true_body:
+        for s in node.then_body:
             _collect_ident_refs(s, refs)
-        for s in (node.false_body or []):
+        for s in (node.else_body or []):
             _collect_ident_refs(s, refs)
     elif isinstance(node, ForLoop):
         _collect_ident_refs(node.init, refs)
@@ -1414,7 +1402,7 @@ class _CodeGen:
         # written before read and can start as None (avoids dict lookups).
         for vname in sorted(all_env_vars):
             local = self._local_vars[vname]
-            if vname in _ENV_BUILTINS:
+            if vname in _BUILTIN_NAMES:
                 self._preamble.append(f"    {local} = _env.get({vname!r})")
             else:
                 self._preamble.append(f"    {local} = None")
@@ -2114,45 +2102,7 @@ class _CodeGen:
 
     def _collect_modified_vars(self, stmts: list[ASTNode]) -> tuple[set[str], set[str]]:
         """Collect env var names and binding names assigned in a statement list."""
-        env_vars: set[str] = set()
-        bind_names: set[str] = set()
-        for stmt in stmts:
-            if isinstance(stmt, Assignment):
-                t = stmt.target
-                if isinstance(t, Identifier):
-                    env_vars.add(t.name)
-                elif isinstance(t, BindingRef):
-                    bind_names.add(t.name)
-                elif isinstance(t, ChannelAccess):
-                    o = t.object
-                    if isinstance(o, Identifier):
-                        env_vars.add(o.name)
-                    elif isinstance(o, BindingRef):
-                        bind_names.add(o.name)
-                elif isinstance(t, ArrayIndexAccess):
-                    if isinstance(t.array, Identifier):
-                        env_vars.add(t.array.name)
-                elif isinstance(t, BindingIndexAccess):
-                    if isinstance(t.binding, BindingRef):
-                        bind_names.add(t.binding.name)
-            elif isinstance(stmt, VarDecl):
-                env_vars.add(stmt.name)
-            elif isinstance(stmt, ArrayDecl):
-                env_vars.add(stmt.name)
-            elif isinstance(stmt, IfElse):
-                e1, b1 = self._collect_modified_vars(stmt.then_body)
-                if stmt.else_body:
-                    e2, b2 = self._collect_modified_vars(stmt.else_body)
-                else:
-                    e2, b2 = set(), set()
-                env_vars |= e1 | e2
-                bind_names |= b1 | b2
-            elif isinstance(stmt, (ForLoop, WhileLoop)):
-                body = stmt.body
-                e, b = self._collect_modified_vars(body)
-                env_vars |= e
-                bind_names |= b
-        return env_vars, bind_names
+        return collect_assigned_vars(stmts)
 
     def _collect_read_vars(self, stmts: list[ASTNode]) -> set[str]:
         """Collect all Identifier names read in a list of statements."""
@@ -2546,10 +2496,7 @@ class _CodeGen:
         if use_scalar:
             self._setup_scalar_loop(all_vars, loop_var)
         else:
-            self._setup_tensor_loop(
-                start, stop, step, n, stmt.body,
-                all_vars, has_flow_control,
-            )
+            self._setup_tensor_loop(start, stop, step)
 
         saved_scalar = self._scalar_loop
         self._scalar_loop = use_scalar
@@ -2601,30 +2548,22 @@ class _CodeGen:
 
     def _setup_scalar_loop(
         self, all_vars: set[str], loop_var: str,
-    ) -> dict[str, str]:
+    ):
         """Prepare variables for a scalar-mode for loop.
 
-        Converts tensor locals to Python floats. Returns an empty
-        in-place candidates dict (scalar loops don't use in-place ops).
+        Converts tensor locals to Python floats before the loop body.
         """
         for vname in all_vars:
             if vname != loop_var:
                 local = self._local_vars[vname]
                 if local is not None:
                     self._emit(f"if _torch.is_tensor({local}): {local} = {local}.item()")
-        return {}
 
-    def _setup_tensor_loop(
-        self, start: int, stop: int, step: int, n: int,
-        body: list, all_vars: set[str], has_flow_control: bool,
-    ) -> dict[str, str]:
+    def _setup_tensor_loop(self, start: int, stop: int, step: int):
         """Prepare variables for a tensor-mode for loop.
 
-        Hoists arange/unbind to preamble, detects in-place accumulation
-        candidates, and expands scalars for in-place mutation. Returns
-        the in-place candidates dict.
+        Hoists arange/unbind to preamble for zero-overhead iteration.
         """
-        # Pre-allocate loop variable tensors via arange + unbind
         range_key = (start, stop, step)
         vals_tmp = self._range_cache.get(range_key)
         if vals_tmp is None:
@@ -2633,11 +2572,6 @@ class _CodeGen:
                 f"    {vals_tmp} = _torch.arange({start}, {stop}, {step}, dtype=_torch.float32, device=_dev).unbind(0)"
             )
             self._range_cache[range_key] = vals_tmp
-
-        # In-place accumulation (add_, mul_) is disabled because
-        # execute_compiled runs under inference_mode() for performance,
-        # and inference tensors cannot be mutated in-place.
-        return {}
 
     def _emit_general_for_loop(self, stmt: ForLoop):
         """Emit a general for loop as init + while (dynamic bounds)."""
@@ -3136,9 +3070,6 @@ class _CodeGen:
             if name == "fract":
                 self._emit(f"{tmp} = float({args[0]}) % 1.0")
                 return tmp
-            if name == "saturate":
-                self._emit(f"{tmp} = max(0.0, min(1.0, float({args[0]})))")
-                return tmp
             if name == "round":
                 self._emit(f"{tmp} = round(float({args[0]}))")
                 return tmp
@@ -3463,11 +3394,7 @@ class _CodeGen:
         """Emit image reductions: img_sum, img_mean, img_min, img_max."""
         if len(args) != 1:
             return None
-        _REDUCE_OPS = {
-            "img_sum": "sum", "img_mean": "mean",
-            "img_min": "amin", "img_max": "amax",
-        }
-        op = _REDUCE_OPS.get(node.name)
+        op = _IMG_REDUCE_OPS.get(node.name)
         if op is None:
             return None
         self._emit(f"{tmp} = {args[0]}.{op}(dim=(1, 2), keepdim=True)")

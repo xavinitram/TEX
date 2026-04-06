@@ -5,7 +5,7 @@ Supports:
   - C-style identifiers, numbers (int and float), operators
   - @ bindings (@A, @OUT, @p1) and typed bindings (f@threshold, img@result)
   - $ parameter bindings ($strength, f$blend)
-  - Keywords: float, int, vec3, vec4, if, else
+  - Keywords: float, int, vec2, vec3, vec4, string, mat3, mat4, if, else, for, while, break, continue, return, const
   - Single-line (//) and multi-line (/* */) comments
   - Dot-access for channel swizzling
 """
