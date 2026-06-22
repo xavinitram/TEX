@@ -49,6 +49,17 @@ def test_type_checker(r: SubTestResult):
     except Exception as e:
         r.fail("undefined variable error", str(e))
 
+    # H1 regression: `mat * array` must error cleanly, not crash. It used to
+    # return None, then crash with AttributeError on .is_string in _is_assignable.
+    try:
+        check_code("mat3 m = mat3(1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0);"
+                   " float arr[2] = {1.0, 2.0}; mat3 z = m * arr; @OUT = vec4(0.0);")
+        r.fail("mat * array errors cleanly", "Should have raised a type error")
+    except TypeCheckError:
+        r.ok("mat * array errors cleanly")
+    except Exception as e:
+        r.fail("mat * array errors cleanly", f"crashed with {type(e).__name__}: {e}")
+
     # Swizzle type: .rgb returns vec3
     try:
         type_map, checker = check_code(

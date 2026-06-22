@@ -245,7 +245,7 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
     elif output_type == "FLOAT":
         if raw.dim() == 0:
             return raw.item()
-        return raw.mean().item()
+        return raw.float().mean().item()  # .float(): mean() rejects integer dtypes
 
     elif output_type == "LATENT":
         # LATENT expects [B, C, H, W] — permute back from channel-last
@@ -262,6 +262,6 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
     elif output_type == "INT":
         if raw.dim() == 0:
             return int(raw.item())
-        return int(raw.mean().item())
+        return int(raw.float().mean().item())  # .float(): mean() rejects integer dtypes
 
     return raw.cpu()

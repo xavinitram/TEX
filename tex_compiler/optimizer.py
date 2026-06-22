@@ -813,6 +813,13 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
     if not duplicates:
         return stmts
 
+    # Variables REASSIGNED anywhere in this block. A subexpression that reads one
+    # of them is NOT safe to hoist — its value can change between occurrences
+    # (e.g. `a = s*s; s = v; b = s*s;` — the two `s*s` differ). `_expr_hash` keys
+    # identifiers by name only, so without this guard CSE would share one temp
+    # across the write and silently corrupt the result.
+    reassigned = _collect_reassigned_vars(stmts)
+
     # Build replacement map and generate temp VarDecls
     # We need to find the actual expression node for each duplicate hash
     # Walk the statements again to find first occurrence of each duplicate,
@@ -822,7 +829,8 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
 
     def _find_first(expr: ASTNode, stmt_idx: int):
         h = _expr_hash(expr)
-        if h is not None and h in duplicates and h not in first_occurrence:
+        if (h is not None and h in duplicates and h not in first_occurrence
+                and not (_expr_reads_vars(expr) & reassigned)):
             first_occurrence[h] = (expr, stmt_idx)
             # Don't recurse into children of a found duplicate —
             # we want the outermost match
@@ -956,6 +964,40 @@ def _collect_written_in_stmt(stmt: ASTNode, written: set[str]):
     elif isinstance(stmt, FunctionDef):
         for s in stmt.body:
             _collect_written_in_stmt(s, written)
+
+
+def _collect_reassigned_vars(stmts: list[ASTNode]) -> set[str]:
+    """Names REASSIGNED (Assignment target) in a block — not merely declared once.
+    A subexpression reading a reassigned variable cannot be CSE-hoisted, since its
+    value can change between occurrences (declarations alone are stable)."""
+    out: set[str] = set()
+    for stmt in stmts:
+        _collect_reassigned_in_stmt(stmt, out)
+    return out
+
+
+def _collect_reassigned_in_stmt(stmt: ASTNode, out: set[str]):
+    if isinstance(stmt, Assignment):
+        t = stmt.target
+        if isinstance(t, (Identifier, BindingRef)):
+            out.add(t.name)
+        elif isinstance(t, ChannelAccess) and isinstance(t.object, (Identifier, BindingRef)):
+            out.add(t.object.name)
+        elif isinstance(t, ArrayIndexAccess) and isinstance(t.array, Identifier):
+            out.add(t.array.name)
+        elif isinstance(t, BindingIndexAccess) and isinstance(t.binding, BindingRef):
+            out.add(t.binding.name)
+    elif isinstance(stmt, IfElse):
+        for s in stmt.then_body:
+            _collect_reassigned_in_stmt(s, out)
+        for s in stmt.else_body:
+            _collect_reassigned_in_stmt(s, out)
+    elif isinstance(stmt, (ForLoop, WhileLoop)):
+        for s in stmt.body:
+            _collect_reassigned_in_stmt(s, out)
+    elif isinstance(stmt, FunctionDef):
+        for s in stmt.body:
+            _collect_reassigned_in_stmt(s, out)
 
 
 def _expr_reads_vars(expr: ASTNode) -> set[str]:

@@ -2855,7 +2855,9 @@ class _CodeGen:
             elif op == "/":
                 self._emit(f"{tmp} = ({left} / ({right} if {right} != 0 else 1e-10))")
             elif op == "%":
-                self._emit(f"{tmp} = _math.fmod(float({left}), float({right}) if {right} != 0 else 1.0)")
+                # Guard a zero divisor with a tiny epsilon (matching the '/' case
+                # and the interpreter), NOT 1.0 — which gave 0.5 % 0 -> 0.5.
+                self._emit(f"{tmp} = _math.fmod(float({left}), float({right}) if {right} != 0 else 1e-10)")
             elif op in _CMP_OPS:
                 py_op = _CMP_OPS[op]
                 self._emit(f"{tmp} = (1.0 if {left} {py_op} {right} else 0.0)")
@@ -3132,7 +3134,15 @@ class _CodeGen:
                     if v == 2.0:
                         self._emit(f"{tmp} = float({args[0]}) * float({args[0]})")
                         return tmp
-                self._emit(f"{tmp} = _math.pow(max(float({args[0]}), 1e-10), float({args[1]}))")
+                    if v == 3.0:
+                        self._emit(f"{tmp} = float({args[0]}) * float({args[0]}) * float({args[0]})")
+                        return tmp
+                # No clamp: clamping the base to 1e-10 destroyed negative bases
+                # (pow(-2,3) -> ~0, diverging from the interpreter/tensor path).
+                # math.pow is sign-correct for integer exponents; a negative base
+                # with a fractional exponent raises, which execute_compiled catches
+                # and falls back to the interpreter (NaN) — matching its semantics.
+                self._emit(f"{tmp} = _math.pow(float({args[0]}), float({args[1]}))")
                 return tmp
             math_fn = _SCALAR_MATH_2ARG.get(name)
             if math_fn is not None:

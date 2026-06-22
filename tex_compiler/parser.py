@@ -342,6 +342,12 @@ class Parser:
             )
         type_tok = self.advance()
         name_tok = self.expect(TokenType.IDENT, "Expected a variable name after the type")
+        if self.peek() == TokenType.LBRACKET:
+            raise self._make_error(
+                "`const` arrays are not supported.",
+                name_tok.loc, code="E2010",
+                hint="Declare the array without `const`: e.g. vec3 colors[3] = {...};",
+            )
         if not self.match(TokenType.ASSIGN):
             raise self._make_error(
                 "A 'const' variable must be initialized.",

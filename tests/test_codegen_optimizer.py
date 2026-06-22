@@ -291,6 +291,23 @@ def test_optimization_regressions(r: SubTestResult):
     img4 = torch.rand(1, 8, 8, 4)
     mask = torch.rand(1, 8, 8)
 
+    # CSE regression (C1): a subexpression must NOT be hoisted across a write to
+    # a variable it reads — `s*s` before and after `s = ...` are different values.
+    try:
+        a_in = torch.rand(1, 4, 4, 4)
+        result = compile_and_run(
+            "float s = @A.r; float a = s*s + s*s; s = @A.g; float b = s*s + s*s;"
+            " @OUT = vec4(a, b, 0.0, 1.0);",
+            {"A": a_in}, out_type=TEXType.VEC4)
+        exp_a = 2.0 * a_in[..., 0] ** 2
+        exp_b = 2.0 * a_in[..., 1] ** 2
+        assert torch.allclose(result[..., 0], exp_a, atol=1e-5), "a channel wrong"
+        assert torch.allclose(result[..., 1], exp_b, atol=1e-5), \
+            "CSE reused a stale value across the reassignment of 's'"
+        r.ok("CSE: no stale reuse across reassignment")
+    except Exception as e:
+        r.fail("CSE: no stale reuse across reassignment", f"{e}")
+
     # ── 1. Inlined binop operators ──────────────────────────────────
 
     # Test all operators produce correct results vs known values

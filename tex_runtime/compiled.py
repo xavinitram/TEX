@@ -390,12 +390,12 @@ def execute_compiled(
                                               used_builtins=used_builtins)
                     _compiled_cache[cache_key] = compiled_fn
                     if len(_compiled_cache) > _COMPILED_CACHE_MAX:
+                        # Evict the oldest. Do NOT torch._dynamo.reset() here:
+                        # this runs on the disposable worker thread, and dynamo
+                        # state is PROCESS-GLOBAL — resetting it would corrupt the
+                        # very thread that invokes compiled_fn just below (and the
+                        # calling thread). The bounded cache already caps growth.
                         _compiled_cache.popitem(last=False)
-                        # Reclaim Inductor kernel memory from evicted entries
-                        try:
-                            torch._dynamo.reset()
-                        except Exception:
-                            pass
 
                 compiled_fn = _compiled_cache[cache_key]
                 _compiled_cache.move_to_end(cache_key)
@@ -428,8 +428,11 @@ def execute_compiled(
             torch._dynamo.reset()
         except Exception:
             pass
-        # Use contiguous_bindings for consistency with the compiled attempt.
-        return _plain_execute(program, contiguous_bindings, type_map, device,
+        # Fall back on the PRISTINE bindings, not contiguous_bindings: the
+        # compiled fn may have partially mutated the latter (added 'OUT', in-place
+        # scatter) before raising mid-execution, which would corrupt the
+        # interpreter recompute. Matches _codegen_only_execute's fallback.
+        return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins)
 

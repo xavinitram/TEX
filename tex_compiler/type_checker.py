@@ -1216,6 +1216,16 @@ class TypeChecker:
                 return rt
             if lt.is_matrix and rt.is_scalar:
                 return lt
+            # Any other matrix operand combination (e.g. mat * array) is
+            # unsupported — report it cleanly instead of falling through to an
+            # implicit None return, which later crashes with AttributeError
+            # ('NoneType' has no attribute 'is_string') in _is_assignable.
+            self._error(
+                f"'*' between {lt.value} and {rt.value} isn't supported.",
+                loc, code="E3402",
+                hint="Matrix '*' needs a matrix, vector, or scalar operand.",
+            )
+            return lt if lt.is_matrix else rt
         elif op in ("+", "-"):
             # mat +/- mat → mat (element-wise)
             if lt.is_matrix and rt.is_matrix:
@@ -1288,12 +1298,12 @@ class TypeChecker:
 
         # Validate len() argument type: only STRING and ARRAY allowed
         if node.name == "len" and arg_types:
-            if arg_types[0].is_vector:
+            if not (arg_types[0].is_string or arg_types[0] == TEXType.ARRAY):
                 self._error(
                     f"len() doesn't work on {arg_types[0].value} (it only accepts string or array).",
                     node.loc,
                     code="E5003",
-                    hint="For vectors, the component count is fixed (3 for vec3, 4 for vec4).",
+                    hint="Vectors have a fixed component count (3 for vec3, 4 for vec4); scalars have no length.",
                 )
 
         # Array aggregate functions: return element type for vector arrays

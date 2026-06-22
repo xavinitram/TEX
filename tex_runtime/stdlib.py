@@ -1511,7 +1511,12 @@ class TEXStdlib:
             m = int(max_val.item() if isinstance(max_val, torch.Tensor) else max_val)
             if m > 0:
                 value = value % m
-        # Clamp to float32 safe integer range
+                if m <= 2**24:
+                    # Modulo already bounds the value within float32's exact-int
+                    # range — don't clamp it down and break the [0, max_val) contract.
+                    return torch.scalar_tensor(float(value), dtype=torch.float32)
+        # No max_val (or a range beyond float32's exact-int range): clamp so the
+        # value stays exactly representable as float32.
         value = min(value, 2**24 - 1)
         return torch.scalar_tensor(float(value), dtype=torch.float32)
 
