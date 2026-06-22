@@ -171,7 +171,17 @@ class TEXWrangleNode(_BaseClass):
                             list_parts.append(str(item))
                     parts.append(f"{name}:LIST:{','.join(list_parts)}")
                 elif isinstance(val, dict) and "samples" in val:
-                    parts.append(f"{name}:LATENT:{_tensor_fingerprint(val['samples'])}")
+                    lat = f"{name}:LATENT:{_tensor_fingerprint(val['samples'])}"
+                    # Include noise_mask + scalar metadata so a SetLatentNoiseMask
+                    # change (same samples, new mask) still busts the cache.
+                    mask = val.get("noise_mask")
+                    if isinstance(mask, torch.Tensor):
+                        lat += f":mask:{_tensor_fingerprint(mask)}"
+                    for mk in sorted(k for k in val if k not in ("samples", "noise_mask")):
+                        mv = val[mk]
+                        if isinstance(mv, (int, float, str, bool)):
+                            lat += f":{mk}={mv}"
+                    parts.append(lat)
                 elif isinstance(val, torch.Tensor):
                     parts.append(f"{name}:{_tensor_fingerprint(val)}")
                 else:
@@ -264,14 +274,34 @@ class TEXWrangleNode(_BaseClass):
             # (e.g. hex color strings → RGB lists, comma vec strings → float lists)
             for pname, pinfo in param_info.items():
                 if pname in bindings:
-                    bindings[pname] = _convert_param_value(bindings[pname], pinfo)
+                    bindings[pname] = _convert_param_value(bindings[pname], pinfo, pname)
 
             # Execute — optionally with torch.compile acceleration
             if compile_mode == "torch_compile":
                 fp = cache.fingerprint(code, binding_types)
-                raw_output = execute_compiled(program, bindings, type_map, device, fp,
-                                              latent_channel_count=latent_channel_count,
-                                              output_names=output_names)
+                try:
+                    raw_output = execute_compiled(program, bindings, type_map, device, fp,
+                                                  latent_channel_count=latent_channel_count,
+                                                  output_names=output_names,
+                                                  used_builtins=used_builtins)
+                except Exception as compile_exc:
+                    # Defense in depth: selecting torch_compile must NEVER hard-fail
+                    # the node. If execute_compiled's own fallback still raised,
+                    # reset dynamo on THIS thread and run the plain interpreter
+                    # (dynamo state is process-global — see compiled.py).
+                    logger.warning(
+                        "[TEX] torch_compile path failed (%s); using interpreter.",
+                        compile_exc,
+                    )
+                    try:
+                        torch._dynamo.reset()
+                    except Exception:
+                        pass
+                    interp = _get_interpreter()
+                    raw_output = interp.execute(program, bindings, type_map, device=device,
+                                                latent_channel_count=latent_channel_count,
+                                                output_names=output_names,
+                                                used_builtins=used_builtins)
                 # torch_compile returns single value — wrap for compat
                 if not isinstance(raw_output, dict):
                     raw_output = {output_names[0]: raw_output}

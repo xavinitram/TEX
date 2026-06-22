@@ -2411,13 +2411,17 @@ def test_node_helpers(r: SubTestResult):
     except Exception as e:
         r.fail("convert_param: color hex #FF0000", str(e))
 
-    # hint "c" with non-hex string — passthrough
+    # hint "c" with malformed string — raises a clear, param-named error
+    # (previously passed the bad string through, causing a confusing downstream
+    # failure with no mention of the offending parameter).
     try:
-        result = _convert_param_value("not-a-color", {"type_hint": "c"})
-        assert result == "not-a-color", f"Got {result}"
-        r.ok("convert_param: color non-hex passthrough")
+        _convert_param_value("not-a-color", {"type_hint": "c"}, "mycol")
+        r.fail("convert_param: color malformed raises", "expected ValueError")
+    except ValueError as e:
+        assert "mycol" in str(e), f"Got {e}"
+        r.ok("convert_param: color malformed raises")
     except Exception as e:
-        r.fail("convert_param: color non-hex passthrough", str(e))
+        r.fail("convert_param: color malformed raises", str(e))
 
     # hint "c" with non-string value — passthrough
     try:
@@ -2467,13 +2471,15 @@ def test_node_helpers(r: SubTestResult):
     except Exception as e:
         r.fail("convert_param: v2 truncate long input", str(e))
 
-    # vec with invalid string — passthrough
+    # vec with malformed string — raises a clear, param-named error
     try:
-        result = _convert_param_value("abc, def", {"type_hint": "v3"})
-        assert result == "abc, def", f"Got {result}"
-        r.ok("convert_param: vec invalid string passthrough")
+        _convert_param_value("abc, def", {"type_hint": "v3"}, "myvec")
+        r.fail("convert_param: vec malformed raises", "expected ValueError")
+    except ValueError as e:
+        assert "myvec" in str(e), f"Got {e}"
+        r.ok("convert_param: vec malformed raises")
     except Exception as e:
-        r.fail("convert_param: vec invalid string passthrough", str(e))
+        r.fail("convert_param: vec malformed raises", str(e))
 
     # vec with non-string value — passthrough
     try:

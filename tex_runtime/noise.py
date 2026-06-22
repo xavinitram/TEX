@@ -23,44 +23,10 @@ import threading
 import torch
 
 
-# ── Lookup tables ─────────────────────────────────────────────────────────────
-
-# Classic 256-entry Perlin permutation table
-_PERM = torch.tensor([
-    151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,
-    140,36,103,30,69,142,8,99,37,240,21,10,23,190,6,148,
-    247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,
-    57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,
-    74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,
-    60,211,133,230,220,105,92,41,55,46,245,40,244,102,143,54,
-    65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,
-    200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,
-    52,217,226,250,124,123,5,202,38,147,118,126,255,82,85,212,
-    207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,
-    119,248,152,2,44,154,163,70,221,153,101,155,167,43,172,9,
-    129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,
-    218,246,97,228,251,34,242,193,238,210,144,12,191,179,162,241,
-    81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,157,
-    184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,
-    222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180,
-], dtype=torch.int64)
-
-# Doubled for overflow-free indexing
-_PERM2 = torch.cat([_PERM, _PERM])
-
-# 8 gradient directions for 2D Perlin noise (unit circle at 45-degree intervals).
-# Pre-split into separate X/Y component tensors — avoids 3D view creation during
-# gather+slice.  grad[h][..., 0] would create a view into a 3D result; flat 1D
-# tensors return flat 2D directly.
-_GRAD2_X = torch.tensor([1.0, -1.0, 0.0, 0.0, 0.7071, -0.7071, 0.7071, -0.7071], dtype=torch.float32)
-_GRAD2_Y = torch.tensor([0.0, 0.0, 1.0, -1.0, 0.7071, 0.7071, -0.7071, -0.7071], dtype=torch.float32)
-
 # Simplex skew/unskew constants
 _SKEW_2D = 0.5 * (math.sqrt(3.0) - 1.0)      # ~0.3660254
 _UNSKEW_2D = (3.0 - math.sqrt(3.0)) / 6.0     # ~0.2113249
 
-
-_noise_tables_cache: dict[str, tuple[torch.Tensor, ...]] = {}
 
 # Worley/Voronoi 9-neighbor offsets, cached per device to avoid per-call allocation
 _worley_offsets_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -80,23 +46,6 @@ def _get_worley_offsets(device: torch.device, ndim: int) -> tuple[torch.Tensor, 
     dy_off = offsets[:, 1].view(9, *extra_dims)
     _worley_offsets_cache[key] = (dx_off, dy_off)
     return dx_off, dy_off
-
-
-def _get_noise_tables(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Get device-local noise lookup tables (cached).
-
-    Returns (perm, grad_x, grad_y).
-    Used only by the table-based FBM fallback when MSVC/Inductor is unavailable.
-    """
-    key = str(device)
-    cached = _noise_tables_cache.get(key)
-    if cached is not None:
-        return cached
-    tables = (
-        _PERM2.to(device), _GRAD2_X.to(device), _GRAD2_Y.to(device),
-    )
-    _noise_tables_cache[key] = tables
-    return tables
 
 
 # ── Arithmetic hash Perlin noise (table-free, TorchInductor-friendly) ────────
@@ -371,69 +320,9 @@ def _simplex2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return result
 
 
-def _perlin2d_core(x: torch.Tensor, y: torch.Tensor,
-                    perm: torch.Tensor, gx: torch.Tensor, gy: torch.Tensor) -> torch.Tensor:
-    """Perlin noise core for use in traced FBM. All tables passed as args (no graph breaks)."""
-    x_floor = torch.floor(x)
-    y_floor = torch.floor(y)
-    xi = x_floor.long()
-    yi = y_floor.long()
-    xf = x - x_floor
-    yf = y - y_floor
-    u = xf * 6.0
-    u.sub_(15.0).mul_(xf).add_(10.0).mul_(xf).mul_(xf).mul_(xf)
-    v = yf * 6.0
-    v.sub_(15.0).mul_(yf).add_(10.0).mul_(yf).mul_(yf).mul_(yf)
-    xi_mask = xi & 255
-    yi_mask = yi & 255
-    xi1_mask = (xi_mask + 1) & 255
-    yi1_mask = (yi + 1) & 255
-    perm_xi = perm[xi_mask]
-    perm_xi1 = perm[xi1_mask]
-    h00 = perm[(perm_xi + yi_mask) & 511] & 7
-    h10 = perm[(perm_xi1 + yi_mask) & 511] & 7
-    h01 = perm[(perm_xi + yi1_mask) & 511] & 7
-    h11 = perm[(perm_xi1 + yi1_mask) & 511] & 7
-    xf1 = xf - 1.0
-    yf1 = yf - 1.0
-    g00 = gx[h00] * xf
-    g00.add_(gy[h00] * yf)
-    g10 = gx[h10] * xf1
-    g10.add_(gy[h10] * yf)
-    g01 = gx[h01] * xf
-    g01.add_(gy[h01] * yf1)
-    g11 = gx[h11] * xf1
-    g11.add_(gy[h11] * yf1)
-    return torch.lerp(torch.lerp(g00, g10, u), torch.lerp(g01, g11, u), v)
-
-
-def _make_fbm_fn(octaves: int):
-    """Build a traceable FBM function for a specific octave count.
-    The loop is unrolled by torch.jit.trace into a single straight-line graph.
-    """
-    # Pre-compute amplitude normalization
-    max_amp = sum(0.5 ** i for i in range(octaves))
-    inv_max = 1.0 / max_amp
-
-    def fbm_fn(x, y, perm, gx, gy):
-        result = _perlin2d_core(x, y, perm, gx, gy)
-        freq = 2.0
-        amp = 0.5
-        for _ in range(octaves - 1):
-            result = result + _perlin2d_core(x * freq, y * freq, perm, gx, gy) * amp
-            amp = amp * 0.5
-            freq = freq * 2.0
-        return result * inv_max
-    return fbm_fn
-
-
 def _make_fbm_fast_fn(octaves: int):
     """Build a traceable FBM function using arithmetic hash noise.
     No table arguments needed — all hashing is pure arithmetic.
-
-    NOTE: Intentionally duplicates _make_fbm_fn's loop structure.
-    Cannot unify because torch.jit.trace requires fixed argument counts —
-    the table-based version takes (x, y, perm, gx, gy) while this takes (x, y).
     """
     max_amp = sum(0.5 ** i for i in range(octaves))
     inv_max = 1.0 / max_amp
@@ -523,20 +412,13 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
             y_sc.mul_(2.0)
         result.div_(max_amp)
 
-    # Cache a traced/compiled version for future calls.
-    # With MSVC: trace arithmetic hash now, torch.compile later (6x faster).
-    # Without MSVC: trace table-based version (slightly faster under jit.trace).
-    if _can_inductor_compile():
-        _fbm_cache.store(key, lambda: torch.jit.trace(_make_fbm_fast_fn(octaves), (x, y)))
-    else:
-        def _trace_table_fbm():
-            perm, gx, gy = _get_noise_tables(x.device)
-            fn = _make_fbm_fn(octaves)
-            traced = torch.jit.trace(fn, (x, y, perm, gx, gy))
-            def _table_wrapper(x, y, _t=traced, _p=perm, _gx=gx, _gy=gy):
-                return _t(x, y, _p, _gx, _gy)
-            return _table_wrapper
-        _fbm_cache.store(key, _trace_table_fbm)
+    # Always cache a trace of the ARITHMETIC-hash FBM — the same noise field as
+    # the eager first call above. Previously the no-MSVC branch traced a
+    # DIFFERENT, table-based FBM, so the first rendered frame and every cached
+    # frame produced visibly different noise with no input change.
+    # _can_inductor_compile() only governs whether the trace is later upgraded
+    # via torch.compile (in the cached-hit path), not which field is computed.
+    _fbm_cache.store(key, lambda: torch.jit.trace(_make_fbm_fast_fn(octaves), (x, y)))
 
     return result
 

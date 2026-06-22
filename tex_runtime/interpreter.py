@@ -411,8 +411,12 @@ class Interpreter:
         if node.initializer:
             value = self._eval(node.initializer)
         else:
-            # Default initialize based on type
-            declared = self.type_map.get(id(node), TEXType.FLOAT)
+            # Default initialize based on the DECLARED type name first. type_map
+            # is keyed by id(node), so it misses for VarDecls cloned by the
+            # optimizer's loop-unroller — which would fall back to FLOAT and turn
+            # `vec4 tmp;` into a scalar 0.0 (then crash on a later swizzle write).
+            # node.type_name survives cloning, so resolve from it first.
+            declared = TYPE_NAME_MAP.get(node.type_name) or self.type_map.get(id(node), TEXType.FLOAT)
             value = self._default_value(declared)
         self.env[node.name] = value
         # New declaration invalidates in-place readiness (value may be aliased)

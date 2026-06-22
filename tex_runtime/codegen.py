@@ -2013,6 +2013,45 @@ class _CodeGen:
             self._emit(f"_bind[{k!r}] = {tv}")
             self._indent -= 1
 
+    def _init_is_spatial(self, expr: ASTNode, _seen: set | None = None) -> bool:
+        """True if an expression draws from a per-pixel/spatial source — a binding,
+        spatial builtin (u/v/ix/iy), or spatial stdlib (sample/fetch/...). A
+        scalar-TYPED variable bound to such an expression is actually a per-pixel
+        tensor at runtime, so a loop reading it is NOT scalar-eligible.
+        """
+        if _seen is None:
+            _seen = set()
+        if expr is None or id(expr) in _seen:
+            return False
+        _seen.add(id(expr))
+        if isinstance(expr, (BindingRef, BindingSampleAccess, BindingIndexAccess)):
+            return True
+        if isinstance(expr, Identifier):
+            if expr.name in _SPATIAL_BUILTINS:
+                return True
+            nxt = self._var_initializers.get(expr.name)
+            return self._init_is_spatial(nxt, _seen) if nxt is not None else False
+        if isinstance(expr, FunctionCall):
+            if expr.name in _SPATIAL_STDLIB:
+                return True
+            return any(self._init_is_spatial(a, _seen) for a in expr.args)
+        if isinstance(expr, BinOp):
+            return (self._init_is_spatial(expr.left, _seen)
+                    or self._init_is_spatial(expr.right, _seen))
+        if isinstance(expr, UnaryOp):
+            return self._init_is_spatial(expr.operand, _seen)
+        if isinstance(expr, TernaryOp):
+            return (self._init_is_spatial(expr.condition, _seen)
+                    or self._init_is_spatial(expr.true_expr, _seen)
+                    or self._init_is_spatial(expr.false_expr, _seen))
+        if isinstance(expr, ChannelAccess):
+            return self._init_is_spatial(expr.object, _seen)
+        if isinstance(expr, CastExpr):
+            return self._init_is_spatial(expr.expr, _seen)
+        if isinstance(expr, VecConstructor):
+            return any(self._init_is_spatial(a, _seen) for a in expr.args)
+        return False
+
     def _is_scalar_body(self, stmts: list[ASTNode], loop_var: str) -> bool:
         """Check if a loop body operates only on scalar types (no spatial tensors).
 
@@ -2072,6 +2111,13 @@ class _CodeGen:
             # Spatial builtins are per-pixel tensors at runtime even though
             # the type checker marks them as FLOAT.
             if node.name in _SPATIAL_BUILTINS:
+                return False
+            # A scalar-typed var initialized from a spatial source (e.g.
+            # `float s = @A.r;` declared before the loop) is a per-pixel tensor at
+            # runtime. The scalar fast path emits `.item()` on it -> crash, so the
+            # loop must not be treated as scalar.
+            init = self._var_initializers.get(node.name)
+            if init is not None and self._init_is_spatial(init):
                 return False
             return True
         if isinstance(node, BinOp):
@@ -3157,8 +3203,10 @@ class _CodeGen:
                 self._emit(f"{sq} = {args[0]} * {args[0]}")
                 self._emit(f"{tmp} = _torch.reciprocal({sq} + _SAFE_EPS)")
                 return tmp
-        # General case: exp-log trick (safe for non-negative base)
-        self._emit(f"{tmp} = _torch.exp(_torch.log(_torch.clamp({args[0]}, min=_SAFE_EPS)) * {args[1]})")
+        # General case: mirror the interpreter (torch.pow) so codegen and the
+        # interpreter agree on negative bases. The exp-log trick clamps negative
+        # bases to ~0 and silently diverges from fn_pow (see stdlib.fn_pow).
+        self._emit(f"{tmp} = _torch.pow({args[0]}, {args[1]})")
         return tmp
 
     def _emit_fn_minmax(

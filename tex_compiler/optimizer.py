@@ -12,6 +12,7 @@ All passes preserve semantic equivalence. Applied after type checking, before
 interpretation. Operates on the AST in-place (mutates nodes).
 """
 from __future__ import annotations
+import copy
 import math
 
 from .ast_nodes import (
@@ -23,6 +24,22 @@ from .ast_nodes import (
     MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral,
     try_extract_static_range,
 )
+from .type_checker import TEXType
+
+# Reverse of TYPE_NAME_MAP: TEXType -> declaration keyword. Used so temp
+# VarDecls synthesized by CSE/LICM declare the type they actually hold (vec/mat,
+# not a hardcoded "float") and the optimized AST stays type-consistent.
+_TYPE_TO_NAME = {
+    TEXType.FLOAT: "float", TEXType.INT: "int",
+    TEXType.VEC2: "vec2", TEXType.VEC3: "vec3", TEXType.VEC4: "vec4",
+    TEXType.MAT3: "mat3", TEXType.MAT4: "mat4",
+}
+
+
+def _clone_expr(expr: ASTNode) -> ASTNode:
+    """Deep-copy an expression subtree so it is not aliased into multiple tree
+    positions. Passes that mutate the AST in place assume no shared subtrees."""
+    return copy.deepcopy(expr)
 
 # Pure math functions safe for constant folding (no side effects, deterministic)
 _PURE_FUNCTIONS: dict[str, callable] = {
@@ -53,7 +70,7 @@ _PURE_FUNCTIONS: dict[str, callable] = {
 }
 
 
-def optimize(program: Program) -> Program:
+def optimize(program: Program, type_map: dict | None = None) -> Program:
     """Run all optimization passes on a program AST (in-place).
 
     Passes (in order):
@@ -62,6 +79,10 @@ def optimize(program: Program) -> Program:
       3. Common Subexpression Elimination (CSE) within basic blocks
       4. Loop-Invariant Code Motion (LICM) — hoist invariant expressions
       5. Small loop unrolling (preserving nested loops for stencil detection)
+
+    If type_map (id(node) -> TEXType, from the type checker) is supplied, nodes
+    synthesized by CSE/LICM are registered in it so the post-optimization AST and
+    type_map stay consistent — otherwise id()-keyed lookups miss those nodes.
     """
     # Pass 1: constant folding + algebraic simplification
     for i, stmt in enumerate(program.statements):
@@ -71,10 +92,10 @@ def optimize(program: Program) -> Program:
     program.statements = _eliminate_dead_code(program.statements)
 
     # Pass 3: common subexpression elimination
-    program.statements = _eliminate_common_subexpressions(program.statements)
+    program.statements = _eliminate_common_subexpressions(program.statements, type_map)
 
     # Pass 4: loop-invariant code motion
-    program.statements = _hoist_loop_invariants(program.statements)
+    program.statements = _hoist_loop_invariants(program.statements, type_map=type_map)
 
     # Pass 5: small loop unrolling (after LICM so hoisted vars are already out)
     program.statements = _unroll_small_loops(program.statements)
@@ -312,13 +333,15 @@ def _fold_function(node: FunctionCall) -> ASTNode:
             return _make_num(1.0, node.loc)
         if exp == 1.0:
             return args[0]
-        # pow(x, 2) -> x * x (strength reduction)
+        # pow(x, 2) -> x * x (strength reduction). Deep-copy the repeated uses so
+        # the same subtree is not aliased into multiple positions (later passes
+        # mutate in place and assume no shared subtrees).
         if exp == 2.0:
-            return BinOp(loc=node.loc, op="*", left=args[0], right=args[0])
+            return BinOp(loc=node.loc, op="*", left=args[0], right=_clone_expr(args[0]))
         # pow(x, 3) -> x * x * x
         if exp == 3.0:
-            x_sq = BinOp(loc=node.loc, op="*", left=args[0], right=args[0])
-            return BinOp(loc=node.loc, op="*", left=x_sq, right=args[0])
+            x_sq = BinOp(loc=node.loc, op="*", left=args[0], right=_clone_expr(args[0]))
+            return BinOp(loc=node.loc, op="*", left=x_sq, right=_clone_expr(args[0]))
         # pow(x, 0.5) -> sqrt(x)
         if exp == 0.5:
             return FunctionCall(loc=node.loc, name="sqrt", args=[args[0]])
@@ -702,46 +725,61 @@ def _collect_subexprs_in_stmt(stmt: ASTNode, seen: dict[str, int]):
         _collect_subexprs(stmt.expr, seen)
 
 
-def _replace_expr(expr: ASTNode, replacements: dict[str, str]) -> ASTNode:
-    """Replace sub-expressions whose hash matches a CSE temp variable."""
+def _replace_expr(expr: ASTNode, replacements: dict[str, str],
+                  type_map: dict | None = None,
+                  hash_to_type: dict | None = None) -> ASTNode:
+    """Replace sub-expressions whose hash matches a CSE temp variable.
+
+    When type_map/hash_to_type are supplied, each synthesized Identifier is
+    registered in type_map with the hoisted expression's type, keeping id()-keyed
+    type lookups valid for the optimizer-created references.
+    """
     h = _expr_hash(expr)
     if h is not None and h in replacements:
-        return Identifier(loc=expr.loc, name=replacements[h])
+        ident = Identifier(loc=expr.loc, name=replacements[h])
+        # hash_to_type is only populated when type_map is not None, so a truthy
+        # hash_to_type already implies type_map is available.
+        if hash_to_type and h in hash_to_type:
+            type_map[id(ident)] = hash_to_type[h]
+        return ident
 
     if isinstance(expr, BinOp):
-        expr.left = _replace_expr(expr.left, replacements)
-        expr.right = _replace_expr(expr.right, replacements)
+        expr.left = _replace_expr(expr.left, replacements, type_map, hash_to_type)
+        expr.right = _replace_expr(expr.right, replacements, type_map, hash_to_type)
     elif isinstance(expr, UnaryOp):
-        expr.operand = _replace_expr(expr.operand, replacements)
+        expr.operand = _replace_expr(expr.operand, replacements, type_map, hash_to_type)
     elif isinstance(expr, FunctionCall):
-        expr.args = [_replace_expr(a, replacements) for a in expr.args]
+        expr.args = [_replace_expr(a, replacements, type_map, hash_to_type) for a in expr.args]
     elif isinstance(expr, VecConstructor):
-        expr.args = [_replace_expr(a, replacements) for a in expr.args]
+        expr.args = [_replace_expr(a, replacements, type_map, hash_to_type) for a in expr.args]
     elif isinstance(expr, ChannelAccess):
-        expr.object = _replace_expr(expr.object, replacements)
+        expr.object = _replace_expr(expr.object, replacements, type_map, hash_to_type)
     elif isinstance(expr, CastExpr):
-        expr.expr = _replace_expr(expr.expr, replacements)
+        expr.expr = _replace_expr(expr.expr, replacements, type_map, hash_to_type)
     elif isinstance(expr, TernaryOp):
-        expr.condition = _replace_expr(expr.condition, replacements)
-        expr.true_expr = _replace_expr(expr.true_expr, replacements)
-        expr.false_expr = _replace_expr(expr.false_expr, replacements)
+        expr.condition = _replace_expr(expr.condition, replacements, type_map, hash_to_type)
+        expr.true_expr = _replace_expr(expr.true_expr, replacements, type_map, hash_to_type)
+        expr.false_expr = _replace_expr(expr.false_expr, replacements, type_map, hash_to_type)
     elif isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
-        expr.args = [_replace_expr(a, replacements) for a in expr.args]
+        expr.args = [_replace_expr(a, replacements, type_map, hash_to_type) for a in expr.args]
     return expr
 
 
-def _replace_in_stmt(stmt: ASTNode, replacements: dict[str, str]):
+def _replace_in_stmt(stmt: ASTNode, replacements: dict[str, str],
+                     type_map: dict | None = None,
+                     hash_to_type: dict | None = None):
     """Replace CSE sub-expressions within a statement."""
     if isinstance(stmt, VarDecl):
         if stmt.initializer:
-            stmt.initializer = _replace_expr(stmt.initializer, replacements)
+            stmt.initializer = _replace_expr(stmt.initializer, replacements, type_map, hash_to_type)
     elif isinstance(stmt, Assignment):
-        stmt.value = _replace_expr(stmt.value, replacements)
+        stmt.value = _replace_expr(stmt.value, replacements, type_map, hash_to_type)
     elif isinstance(stmt, ExprStatement):
-        stmt.expr = _replace_expr(stmt.expr, replacements)
+        stmt.expr = _replace_expr(stmt.expr, replacements, type_map, hash_to_type)
 
 
-def _eliminate_common_subexpressions(stmts: list[ASTNode]) -> list[ASTNode]:
+def _eliminate_common_subexpressions(stmts: list[ASTNode],
+                                     type_map: dict | None = None) -> list[ASTNode]:
     """CSE within a basic block (list of sequential statements).
 
     Scans for sub-expressions that appear 2+ times, hoists the first
@@ -756,14 +794,14 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode]) -> list[ASTNode]:
     # First recurse into compound statement bodies
     for stmt in stmts:
         if isinstance(stmt, IfElse):
-            stmt.then_body = _eliminate_common_subexpressions(stmt.then_body)
-            stmt.else_body = _eliminate_common_subexpressions(stmt.else_body)
+            stmt.then_body = _eliminate_common_subexpressions(stmt.then_body, type_map)
+            stmt.else_body = _eliminate_common_subexpressions(stmt.else_body, type_map)
         elif isinstance(stmt, ForLoop):
-            stmt.body = _eliminate_common_subexpressions(stmt.body)
+            stmt.body = _eliminate_common_subexpressions(stmt.body, type_map)
         elif isinstance(stmt, WhileLoop):
-            stmt.body = _eliminate_common_subexpressions(stmt.body)
+            stmt.body = _eliminate_common_subexpressions(stmt.body, type_map)
         elif isinstance(stmt, FunctionDef):
-            stmt.body = _eliminate_common_subexpressions(stmt.body)
+            stmt.body = _eliminate_common_subexpressions(stmt.body, type_map)
 
     # Collect all sub-expression hashes across the block
     seen: dict[str, int] = {}  # hash -> occurrence count
@@ -822,22 +860,40 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode]) -> list[ASTNode]:
 
     # Assign temp variable names and build replacements
     replacements: dict[str, str] = {}  # hash -> temp var name
+    hash_to_type: dict[str, TEXType] = {}  # hash -> hoisted expr's type (if known)
     # Group CSE decls by the statement index they should be inserted before
     insert_before: dict[int, list[VarDecl]] = {}  # stmt_index -> [VarDecl, ...]
     for i, (h, (expr_node, stmt_idx)) in enumerate(first_occurrence.items()):
+        # The hoisted node is usually an original AST node, so its type is in
+        # type_map. Carry it onto the temp (declared type + register the
+        # synthesized refs) so the post-optimization AST stays type-consistent —
+        # id()-keyed lookups would otherwise miss these new nodes (vec-component
+        # miscounts, etc.).
+        t = type_map.get(id(expr_node)) if type_map is not None else None
+        # If a type_map was supplied but this node's type is unknown, it was
+        # synthesized by an earlier pass (e.g. const-folded vec*vec) and is not
+        # in type_map. Declaring a temp of a guessed type would mistype it, so
+        # skip hoisting it — left inline, the post-optimization re-type-check
+        # assigns it the correct type. (When no type_map is supplied at all the
+        # caller has opted out of type tracking; preserve the old float default.)
+        if type_map is not None and t is None:
+            continue
         temp_name = f"_cse{i}"
         replacements[h] = temp_name
         decl = VarDecl(
             loc=expr_node.loc,
-            type_name="float",  # Type doesn't matter at this stage — type checker already ran
+            type_name=_TYPE_TO_NAME.get(t, "float"),
             name=temp_name,
             initializer=expr_node,
         )
+        if type_map is not None and t is not None:
+            type_map[id(decl)] = t
+            hash_to_type[h] = t
         insert_before.setdefault(stmt_idx, []).append(decl)
 
     # Replace all occurrences in all statements
     for stmt in stmts:
-        _replace_in_stmt(stmt, replacements)
+        _replace_in_stmt(stmt, replacements, type_map, hash_to_type)
 
     # Insert temp decls just before the statement that first uses them
     result: list[ASTNode] = []
@@ -957,66 +1013,86 @@ def _is_loop_invariant(expr: ASTNode, modified: set[str]) -> bool:
 
 
 def _extract_invariant_subexpr(expr: ASTNode, modified: set[str],
-                                hoisted: list[tuple[str, ASTNode]],
-                                counter: list[int]) -> ASTNode:
+                                hoisted: list[tuple[str, ASTNode, TEXType | None]],
+                                counter: list[int],
+                                type_map: dict | None = None) -> ASTNode:
     """Walk an expression tree and replace loop-invariant subtrees with temp vars.
 
     Replaces the largest (outermost) invariant subtrees first. If the entire
     expression is invariant, replaces the whole thing. Otherwise recurses into
     children to find smaller invariant sub-expressions.
+
+    When type_map is supplied, the hoisted subtree's type is looked up so the
+    synthesized temp declares the type it actually holds (vec/mat, not a
+    hardcoded float) and the new Identifier reference is registered — keeping
+    id()-keyed type lookups valid for the optimizer-created nodes.
     """
     # Check if the entire expression is invariant
     if _is_loop_invariant(expr, modified):
-        temp_name = f"_licm{counter[0]}"
-        counter[0] += 1
-        hoisted.append((temp_name, expr))
-        return Identifier(loc=expr.loc, name=temp_name)
+        t = type_map.get(id(expr)) if type_map is not None else None
+        # If a type_map is supplied but this subtree's type is unknown, it was
+        # synthesized by an earlier pass (e.g. const-folded vec*vec) and isn't
+        # tracked. Hoisting it into a temp of a guessed type would mistype it,
+        # so don't hoist this node — recurse into its children instead (a
+        # smaller, typed invariant subtree may still be hoistable). The
+        # post-optimization re-type-check assigns the correct type to whatever
+        # stays inline.
+        if type_map is None or t is not None:
+            temp_name = f"_licm{counter[0]}"
+            counter[0] += 1
+            ident = Identifier(loc=expr.loc, name=temp_name)
+            if t is not None:
+                type_map[id(ident)] = t
+            hoisted.append((temp_name, expr, t))
+            return ident
 
     # Otherwise recurse into children to find invariant sub-expressions
     if isinstance(expr, BinOp):
-        expr.left = _extract_invariant_subexpr(expr.left, modified, hoisted, counter)
-        expr.right = _extract_invariant_subexpr(expr.right, modified, hoisted, counter)
+        expr.left = _extract_invariant_subexpr(expr.left, modified, hoisted, counter, type_map)
+        expr.right = _extract_invariant_subexpr(expr.right, modified, hoisted, counter, type_map)
     elif isinstance(expr, UnaryOp):
-        expr.operand = _extract_invariant_subexpr(expr.operand, modified, hoisted, counter)
+        expr.operand = _extract_invariant_subexpr(expr.operand, modified, hoisted, counter, type_map)
     elif isinstance(expr, FunctionCall):
-        expr.args = [_extract_invariant_subexpr(a, modified, hoisted, counter) for a in expr.args]
+        expr.args = [_extract_invariant_subexpr(a, modified, hoisted, counter, type_map) for a in expr.args]
     elif isinstance(expr, VecConstructor):
-        expr.args = [_extract_invariant_subexpr(a, modified, hoisted, counter) for a in expr.args]
+        expr.args = [_extract_invariant_subexpr(a, modified, hoisted, counter, type_map) for a in expr.args]
     elif isinstance(expr, TernaryOp):
-        expr.condition = _extract_invariant_subexpr(expr.condition, modified, hoisted, counter)
-        expr.true_expr = _extract_invariant_subexpr(expr.true_expr, modified, hoisted, counter)
-        expr.false_expr = _extract_invariant_subexpr(expr.false_expr, modified, hoisted, counter)
+        expr.condition = _extract_invariant_subexpr(expr.condition, modified, hoisted, counter, type_map)
+        expr.true_expr = _extract_invariant_subexpr(expr.true_expr, modified, hoisted, counter, type_map)
+        expr.false_expr = _extract_invariant_subexpr(expr.false_expr, modified, hoisted, counter, type_map)
     elif isinstance(expr, CastExpr):
-        expr.expr = _extract_invariant_subexpr(expr.expr, modified, hoisted, counter)
+        expr.expr = _extract_invariant_subexpr(expr.expr, modified, hoisted, counter, type_map)
     elif isinstance(expr, ChannelAccess):
-        expr.object = _extract_invariant_subexpr(expr.object, modified, hoisted, counter)
+        expr.object = _extract_invariant_subexpr(expr.object, modified, hoisted, counter, type_map)
 
     return expr
 
 
 def _licm_stmt(stmt: ASTNode, modified: set[str],
-               hoisted: list[tuple[str, ASTNode]], counter: list[int]):
+               hoisted: list[tuple[str, ASTNode, TEXType | None]], counter: list[int],
+               type_map: dict | None = None):
     """Extract loop-invariant expressions from a single statement in a loop body."""
     if isinstance(stmt, VarDecl):
         if stmt.initializer:
             stmt.initializer = _extract_invariant_subexpr(
-                stmt.initializer, modified, hoisted, counter)
+                stmt.initializer, modified, hoisted, counter, type_map)
     elif isinstance(stmt, Assignment):
-        stmt.value = _extract_invariant_subexpr(stmt.value, modified, hoisted, counter)
+        stmt.value = _extract_invariant_subexpr(stmt.value, modified, hoisted, counter, type_map)
     elif isinstance(stmt, ExprStatement):
-        stmt.expr = _extract_invariant_subexpr(stmt.expr, modified, hoisted, counter)
+        stmt.expr = _extract_invariant_subexpr(stmt.expr, modified, hoisted, counter, type_map)
     elif isinstance(stmt, ReturnStmt):
         if stmt.value:
-            stmt.value = _extract_invariant_subexpr(stmt.value, modified, hoisted, counter)
+            stmt.value = _extract_invariant_subexpr(stmt.value, modified, hoisted, counter, type_map)
     elif isinstance(stmt, IfElse):
-        stmt.condition = _extract_invariant_subexpr(stmt.condition, modified, hoisted, counter)
+        stmt.condition = _extract_invariant_subexpr(stmt.condition, modified, hoisted, counter, type_map)
         for s in stmt.then_body:
-            _licm_stmt(s, modified, hoisted, counter)
+            _licm_stmt(s, modified, hoisted, counter, type_map)
         for s in stmt.else_body:
-            _licm_stmt(s, modified, hoisted, counter)
+            _licm_stmt(s, modified, hoisted, counter, type_map)
 
 
-def _licm_loop(loop: ForLoop | WhileLoop, counter: list[int]) -> list[ASTNode]:
+def _licm_loop(loop: ForLoop | WhileLoop, counter: list[int],
+               type_map: dict | None = None) -> list[ASTNode]:
     """Apply LICM to a single loop. Returns [hoisted_decls..., loop]."""
     # Collect all variables written inside the loop body
     modified = _collect_written_vars(loop.body)
@@ -1029,27 +1105,34 @@ def _licm_loop(loop: ForLoop | WhileLoop, counter: list[int]) -> list[ASTNode]:
             modified.add(loop.update.target.name)
 
     # Extract invariant sub-expressions from body statements
-    hoisted: list[tuple[str, ASTNode]] = []
+    hoisted: list[tuple[str, ASTNode, TEXType | None]] = []
     for stmt in loop.body:
-        _licm_stmt(stmt, modified, hoisted, counter)
+        _licm_stmt(stmt, modified, hoisted, counter, type_map)
 
     if not hoisted:
         return [loop]
 
-    # Create VarDecl nodes for hoisted expressions
+    # Create VarDecl nodes for hoisted expressions. Declare each with the type
+    # it actually holds (from the pre-optimization type_map) so the optimized
+    # AST stays type-consistent and re-type-checks cleanly — a hardcoded "float"
+    # would misdeclare hoisted vec/mat values and corrupt id()-keyed lookups.
     pre_loop: list[ASTNode] = []
-    for temp_name, expr_node in hoisted:
-        pre_loop.append(VarDecl(
+    for temp_name, expr_node, t in hoisted:
+        decl = VarDecl(
             loc=expr_node.loc,
-            type_name="float",  # Type doesn't matter — type checker already ran
+            type_name=_TYPE_TO_NAME.get(t, "float"),
             name=temp_name,
             initializer=expr_node,
-        ))
+        )
+        if type_map is not None and t is not None:
+            type_map[id(decl)] = t
+        pre_loop.append(decl)
 
     return pre_loop + [loop]
 
 
-def _hoist_loop_invariants(stmts: list[ASTNode], counter: list[int] | None = None) -> list[ASTNode]:
+def _hoist_loop_invariants(stmts: list[ASTNode], counter: list[int] | None = None,
+                           type_map: dict | None = None) -> list[ASTNode]:
     """LICM pass: hoist loop-invariant expressions out of for/while loops.
 
     Scans statement lists for loops, identifies pure expressions that don't
@@ -1063,20 +1146,20 @@ def _hoist_loop_invariants(stmts: list[ASTNode], counter: list[int] | None = Non
     for stmt in stmts:
         # Recurse into compound statement bodies first
         if isinstance(stmt, IfElse):
-            stmt.then_body = _hoist_loop_invariants(stmt.then_body, counter)
-            stmt.else_body = _hoist_loop_invariants(stmt.else_body, counter)
+            stmt.then_body = _hoist_loop_invariants(stmt.then_body, counter, type_map)
+            stmt.else_body = _hoist_loop_invariants(stmt.else_body, counter, type_map)
             result.append(stmt)
         elif isinstance(stmt, FunctionDef):
-            stmt.body = _hoist_loop_invariants(stmt.body, counter)
+            stmt.body = _hoist_loop_invariants(stmt.body, counter, type_map)
             result.append(stmt)
         elif isinstance(stmt, ForLoop):
             # Recurse into nested loops first
-            stmt.body = _hoist_loop_invariants(stmt.body, counter)
+            stmt.body = _hoist_loop_invariants(stmt.body, counter, type_map)
             # Then hoist invariants from this loop
-            result.extend(_licm_loop(stmt, counter))
+            result.extend(_licm_loop(stmt, counter, type_map))
         elif isinstance(stmt, WhileLoop):
-            stmt.body = _hoist_loop_invariants(stmt.body, counter)
-            result.extend(_licm_loop(stmt, counter))
+            stmt.body = _hoist_loop_invariants(stmt.body, counter, type_map)
+            result.extend(_licm_loop(stmt, counter, type_map))
         else:
             result.append(stmt)
 

@@ -165,7 +165,22 @@ class TEXCache:
         program = Parser(tokens, source=code).parse()
         checker = TypeChecker(binding_types=binding_types, source=code)
         type_map = checker.check(program)
-        program = optimize(program)
+        # Pass type_map so optimizer-created nodes (CSE/LICM temps + their
+        # references) are registered, keeping the AST type-consistent during
+        # optimization (id()-keyed lookups would otherwise miss them).
+        program = optimize(program, type_map)
+        # Re-run the type checker on the OPTIMIZED AST to rebuild a complete,
+        # correct type_map. Optimization passes synthesize brand-new nodes
+        # (const-folded BinOps, CSE/LICM temps, unrolled-loop bodies) that the
+        # original id()-keyed type_map can never cover; a stale lookup would
+        # mistype them (e.g. a vec arg counted as one scalar component, crashing
+        # vec constructors). This mirrors what the disk-cache reload path
+        # already does — both paths now share identical, correct semantics.
+        # strict_redeclare=False: unrolling flattens N copies of a local-declaring
+        # loop body into one scope; the strict check above already validated the
+        # user's original code, so tolerate those benign redeclarations here.
+        type_map = TypeChecker(binding_types=binding_types, source=code,
+                               strict_redeclare=False).check(program)
 
         # Pre-compute builtin identifiers (avoids AST walk on every execution)
         used_builtins = _collect_identifiers(program)
@@ -239,8 +254,12 @@ class TEXCache:
 
             program = data["program"]
 
-            # Re-run type checker to regenerate type_map with valid id() keys
-            checker = TypeChecker(binding_types=binding_types, source="")
+            # Re-run type checker to regenerate type_map with valid id() keys.
+            # The stored program is already optimized, so use lenient redeclare
+            # (unrolled loop bodies legitimately redeclare locals) — matching the
+            # in-memory compile path's post-optimization re-check.
+            checker = TypeChecker(binding_types=binding_types, source="",
+                                  strict_redeclare=False)
             type_map = checker.check(program)
 
             # Touch file to update access time for LRU eviction

@@ -1450,3 +1450,114 @@ for(int i=0; i<4; i++) {
         r.ok("pass: LICM (cos(base*3.14) hoisted before loop)")
     except Exception as e:
         r.fail("pass: LICM (cos(base*3.14) hoisted before loop)", f"{e}\n{traceback.format_exc()}")
+
+
+def test_optimizer_type_consistency(r: SubTestResult):
+    """Regression: optimizer passes that synthesize new AST nodes must keep the
+    type_map consistent so VECTOR / MATRIX values are not mis-typed as scalars.
+
+    Constant folding, CSE, LICM and loop unrolling all create brand-new AST nodes
+    that are absent from the type checker's original id()-keyed type_map. A stale
+    lookup mis-identified a hoisted/folded vec or mat as a single scalar
+    component, so a vec constructor consuming it raised
+    'vecN() needs N total components, but found M'. Each program below is run
+    through the FULL optimizing cache pipeline (cache.compile_tex runs optimize()
+    then re-type-checks the optimized AST) and compared against the unoptimized
+    interpreter baseline; they must agree.
+
+    The pre-existing CSE tests only covered scalar (float) subexpressions, which
+    is why the vector/matrix miscount went uncaught.
+    """
+    print("\n--- Optimizer Vector/Matrix Type-Consistency Tests ---")
+    torch.manual_seed(7)
+    img3 = torch.rand(1, 8, 8, 3)
+
+    def _run_optimized(code, bindings):
+        # Mirror the real ComfyUI node path. Fresh temp cache dir per call so the
+        # disk tier never collides with other tests.
+        binding_types = {n: _infer_binding_type(v) for n, v in bindings.items()}
+        tmp = tempfile.mkdtemp()
+        try:
+            cache = TEXCache(cache_dir=Path(tmp))
+            program, type_map, _refs, assigned, _params, _bi = cache.compile_tex(
+                code, binding_types)
+            interp = Interpreter()
+            result = interp.execute(program, bindings, type_map, device="cpu",
+                                    output_names=sorted(assigned.keys()))
+            return result["OUT"]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _check(name, code):
+        try:
+            baseline = compile_and_run(code, {"A": img3})      # no optimization
+            optimized = _run_optimized(code, {"A": img3})      # full optimizer + re-check
+            max_diff = (baseline - optimized).abs().max().item()
+            assert max_diff < 1e-5, f"optimized vs unoptimized max_diff={max_diff}"
+            r.ok(f"type-consistency: {name}")
+        except Exception as e:
+            r.fail(f"type-consistency: {name}", f"{e}\n{traceback.format_exc()}")
+
+    # ── CSE of VECTOR subexpressions ────────────────────────────────────
+    # The exact program from the original bug report: normalize(vec+vec) is
+    # CSE'd and consumed as a vec4 constructor argument. Before the fix this
+    # raised "vec4() needs 4 total components, but found 2".
+    _check("CSE vec3 as vec4-constructor arg", """
+vec4 r = vec4(normalize(@A.rgb + vec3(0.1, 0.2, 0.3)), 1.0);
+vec4 q = vec4(normalize(@A.rgb + vec3(0.1, 0.2, 0.3)), 0.0);
+@OUT = r + q;
+""")
+    _check("CSE vec3 in arithmetic", """
+vec3 a = (@A.rgb + vec3(0.1, 0.2, 0.3)) * 2.0;
+vec3 b = (@A.rgb + vec3(0.1, 0.2, 0.3)) * 3.0;
+@OUT = vec4(a + b, 1.0);
+""")
+
+    # ── CSE of MATRIX-multiply subexpressions ───────────────────────────
+    # mat3 * vec3 produces a vec3 temp used as a vec4 arg and in arithmetic.
+    _check("CSE mat3*vec3 result as vec4-constructor arg", """
+mat3 m = mat3(0.6,0.2,0.2, 0.2,0.6,0.2, 0.2,0.2,0.6);
+vec4 a = vec4(m * @A.rgb, 1.0);
+vec4 b = vec4(m * @A.rgb, 0.0);
+@OUT = a + b;
+""")
+    _check("CSE mat3*vec3 result in arithmetic", """
+mat3 m = mat3(0.6,0.2,0.2, 0.2,0.6,0.2, 0.2,0.2,0.6);
+vec3 a = (m * @A.rgb) * 2.0;
+vec3 b = (m * @A.rgb) * 3.0;
+@OUT = vec4(a + b, 1.0);
+""")
+    # A genuinely mat3-typed CSE temp: (m*n*o) is depth-2 and shared, so it is
+    # hoisted into a `mat3 _cse0` temp and reused for two different vectors.
+    _check("CSE mat3-typed temp reused for two vectors", """
+mat3 m = mat3(0.6,0.2,0.2, 0.2,0.6,0.2, 0.2,0.2,0.6);
+mat3 n = mat3(1.0,0.0,0.0, 0.0,2.0,0.0, 0.0,0.0,3.0);
+mat3 o = mat3(0.5,0.0,0.0, 0.0,0.5,0.0, 0.0,0.0,0.5);
+vec3 a = (m * n * o) * @A.rgb;
+vec3 b = (m * n * o) * @A.bgr;
+@OUT = vec4(a + b, 1.0);
+""")
+
+    # ── LICM hoisting a VECTOR invariant as a vec4 constructor arg ───────
+    # The hoisted normalize(...) is loop-invariant; its synthesized _licm temp
+    # must declare vec3 (not float) and register its reference.
+    _check("LICM vec3 invariant hoisted as vec4 arg", """
+vec3 acc = vec3(0.0);
+for (int i = 0; i < 3; i = i + 1) {
+    acc = acc + vec4(normalize(@A.rgb + vec3(0.1, 0.2, 0.3)), float(i)).rgb;
+}
+@OUT = vec4(acc, 1.0);
+""")
+
+    # ── Constant folding producing a VECTOR node (pow(vec,2) -> vec*vec) ─
+    _check("const-fold pow(vec3, 2) as vec4 arg",
+           "@OUT = vec4(pow(@A.rgb, 2.0), 1.0);")
+
+    # ── Loop unrolling producing a VECTOR vec-constructor arg ───────────
+    _check("unroll vec3 arg containing loop var", """
+vec3 acc = vec3(0.0);
+for (int i = 0; i < 3; i = i + 1) {
+    acc = acc + vec4(@A.rgb * float(i), 1.0).rgb;
+}
+@OUT = vec4(acc, 1.0);
+""")

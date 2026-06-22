@@ -19,11 +19,25 @@ from .tex_runtime.stdlib import LUMA_R, LUMA_G, LUMA_B
 # ── Tensor fingerprinting ──
 
 def tensor_fingerprint(t: torch.Tensor) -> str:
-    """Sample 256 evenly-spaced values from a tensor for fast hashing."""
+    """Hash a tensor cheaply: 256 strided samples PLUS whole-tensor reductions.
+
+    The strided sample alone collides on localized edits (a single off-stride
+    pixel, a painted mask band, a small moved object) — distinct inputs would
+    then reuse a stale cached result. numel + sum + mean over all elements catch
+    those changes. (sum/mean add one batched GPU sync, ~0.07ms at 512x512.)
+    """
     flat = t.flatten()
-    stride = max(1, len(flat) // 256)
-    samples = flat[::stride][:256]
-    return f"{t.shape}:{t.dtype}:{samples.cpu().tolist()}"
+    n = flat.numel()
+    stride = max(1, n // 256)
+    samples = flat[::stride][:256].float()
+    # sum(dtype=float32) reduces without copying the whole tensor; fold it into
+    # the SAME host transfer as the samples (one GPU->CPU sync), then derive the
+    # mean host-side.
+    s = t.sum(dtype=torch.float32)
+    vals = torch.cat([samples, s.reshape(1)]).cpu().tolist()
+    total = vals[-1]
+    mean = total / max(n, 1)
+    return f"{t.shape}:{t.dtype}:{n}:{total:.6g}:{mean:.6g}:{vals[:-1]}"
 
 
 # ── Latent dict handling ──
@@ -66,11 +80,14 @@ def hex_to_rgb(hex_str: str) -> list[float]:
 #   "v3" — vec3 comma string (e.g. "1, 2, 3" → [1.0, 2.0, 3.0])
 #   "v4" — vec4 comma string (e.g. "1, 2, 3, 4" → [1.0, 2.0, 3.0, 4.0])
 
-def convert_param_value(value: Any, param_info: dict) -> Any:
+def convert_param_value(value: Any, param_info: dict, param_name: str = "") -> Any:
     """Convert a param widget value to the appropriate Python type for the interpreter.
 
     Boolean toggles → float 0/1, color hex → [R,G,B] list,
-    vec2/vec3 comma strings → list of floats. Other values pass through.
+    vec2/vec3 comma strings → list of floats. Non-string values (already in the
+    target form) pass through. A malformed STRING for a c/v* hint raises a clear,
+    param-named error instead of silently passing through (which previously
+    surfaced as a confusing downstream error with no mention of the parameter).
     """
     hint = param_info.get("type_hint", "f")
     if hint in ("f", "i", "s"):
@@ -79,32 +96,41 @@ def convert_param_value(value: Any, param_info: dict) -> Any:
         if isinstance(value, (bool, int, float)):
             # bool() clamps any truthy number to 1.0 (e.g. 2 → True → 1.0)
             return float(bool(value))
-    elif hint == "c" and isinstance(value, str):
+        return value  # already-typed boolean value — leave as-is
+    label = f"${param_name}" if param_name else "parameter"
+    if hint == "c" and isinstance(value, str):
         if value.startswith("#"):
             try:
                 return hex_to_rgb(value)
             except ValueError:
-                pass
-        else:
-            # Comma-separated RGB floats (0-1): "0.5, 0.3, 0.1"
-            try:
-                parts = [float(x.strip()) for x in value.split(",")]
-                if len(parts) >= 3:
-                    return parts[:3]
-            except ValueError:
-                pass
+                raise ValueError(
+                    f"Parameter {label}: '{value}' is not a valid hex color "
+                    f"(expected like #FF8800).")
+        # Comma-separated RGB floats (0-1): "0.5, 0.3, 0.1"
+        try:
+            parts = [float(x.strip()) for x in value.split(",")]
+        except ValueError:
+            raise ValueError(
+                f"Parameter {label}: color '{value}' must be a hex string "
+                f"(#RRGGBB) or comma-separated RGB floats.")
+        if len(parts) >= 3:
+            return parts[:3]
+        raise ValueError(
+            f"Parameter {label}: color '{value}' needs at least 3 values (R, G, B).")
     elif hint in ("v2", "v3", "v4") and isinstance(value, str):
         expected = {"v2": 2, "v3": 3, "v4": 4}[hint]
         try:
             parts = [float(x.strip()) for x in value.split(",")]
-            # Pad or truncate to expected component count
-            if len(parts) < expected:
-                parts.extend([0.0] * (expected - len(parts)))
-            elif len(parts) > expected:
-                parts = parts[:expected]
-            return parts
         except ValueError:
-            pass
+            raise ValueError(
+                f"Parameter {label}: {hint} value '{value}' must be "
+                f"comma-separated numbers (e.g. \"1.0, 2.0\").")
+        # Pad or truncate to expected component count
+        if len(parts) < expected:
+            parts.extend([0.0] * (expected - len(parts)))
+        elif len(parts) > expected:
+            parts = parts[:expected]
+        return parts
     return value
 
 

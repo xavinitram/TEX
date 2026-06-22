@@ -22,6 +22,14 @@ LUMA_R, LUMA_G, LUMA_B = 0.2126, 0.7152, 0.0722
 # Valid channel counts for vector types (vec2, vec3, vec4)
 VEC_CHANNELS = frozenset((2, 3, 4))
 
+
+def _has_channel_axis(t) -> bool:
+    """True when length/distance/normalize should reduce over the last (channel)
+    dim: a standard vec (last dim in {2,3,4}), or any 4D [B,H,W,C] tensor with
+    C>1 (channels are always last for 4D) — but never a lower-rank scalar field /
+    mask whose last dim is a spatial axis."""
+    return (t.dim() >= 1 and t.shape[-1] in VEC_CHANNELS) or (t.dim() >= 4 and t.shape[-1] > 1)
+
 # ── Sampler tensor cache ──────────────────────────────────────────────
 # Caches reusable tensors for sampling functions keyed by (B, H, W, device).
 # Avoids recreating batch index tensors and Lanczos tap offsets per call.
@@ -344,9 +352,11 @@ class TEXStdlib:
     def fn_pow(base, exp):
         b = _to_tensor(base)
         e = _to_tensor(exp)
-        # exp-log is ~3x faster than torch.pow for spatial tensors (common in image processing)
-        if b.dim() >= 2:
-            return torch.exp(torch.log(b.clamp(min=SAFE_EPSILON)) * e)
+        # An exp-log fast path (exp(log(b)*e)) is faster for spatial tensors but
+        # silently destroys the sign of negative bases: pow(x, 2) on a signed /
+        # centered coordinate (vignettes, radial gradients, SDFs) would return
+        # ~0 instead of x*x. torch.pow is correct for negative bases with whole
+        # exponents and matches the scalar path, so results are path-independent.
         return torch.pow(b, e)
 
     @staticmethod
@@ -525,23 +535,29 @@ class TEXStdlib:
 
     @staticmethod
     def fn_length(v):
-        """Length (magnitude) of a vector. Operates on last dimension."""
+        """Length (magnitude) of a vector, reduced over the channel (last) dim.
+
+        A standard vec (last dim in {2,3,4}) reduces; additionally any 4D
+        [B,H,W,C] tensor carries channels last, so C>1 reduces too (covers
+        exotic channel counts). Lower-rank tensors (scalar fields / masks) have
+        no channel dim and return abs — never reducing a mask's width axis.
+        """
         t = _to_tensor(v)
-        if t.dim() >= 1 and t.shape[-1] in VEC_CHANNELS:
+        if _has_channel_axis(t):
             return torch.linalg.vector_norm(t, dim=-1)
         return torch.abs(t)
 
     @staticmethod
     def fn_distance(a, b):
         diff = _to_tensor(a) - _to_tensor(b)
-        if diff.dim() >= 1 and diff.shape[-1] in VEC_CHANNELS:
+        if _has_channel_axis(diff):
             return torch.linalg.vector_norm(diff, dim=-1)
         return torch.abs(diff)
 
     @staticmethod
     def fn_normalize(v):
         t = _to_tensor(v)
-        if t.dim() >= 1 and t.shape[-1] in VEC_CHANNELS:
+        if _has_channel_axis(t):
             norm = torch.linalg.vector_norm(t, dim=-1, keepdim=True)
             return t / (norm + SAFE_EPSILON)
         return torch.sign(t)
@@ -963,6 +979,9 @@ class TEXStdlib:
         """
         img = image if image.__class__ is torch.Tensor else _to_tensor(image)
         sigma_t = sigma if sigma.__class__ is torch.Tensor else _to_tensor(sigma)
+        # .item() forces a GPU->CPU sync, but the Gaussian kernel radius is a
+        # host-side Python int (radius ~= 3*sigma), so a scalar is unavoidable.
+        # Prefer a constant sigma so this fires once rather than per element.
         sigma_val = max(sigma_t.item(), 0.0)
         if sigma_val < 0.3 or img.dim() < 4:
             return img
@@ -1806,9 +1825,14 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
     # When identity, use F.interpolate instead of grid_sample (avoids grid read).
     identity_uv = False
     if u.dim() == 3 and u.shape == (B, H, W) and H > 1 and W > 1:
-        # Identity UV: u[0,0,0]=0, u[0,0,W-1]=1, v[0,0,0]=0, v[0,H-1,0]=1
-        if (abs(u[0, 0, 0].item()) < 1e-5 and abs(u[0, 0, -1].item() - 1.0) < 1e-5
-                and abs(v[0, 0, 0].item()) < 1e-5 and abs(v[0, -1, 0].item() - 1.0) < 1e-5):
+        # Identity UV: u[0,0,0]=0, u[0,0,W-1]=1, v[0,0,0]=0, v[0,H-1,0]=1.
+        # Batch the four corner probes into ONE GPU->CPU sync instead of four
+        # (each .item() forces a sync; this runs inside sampling loops).
+        c0u, c1u, c0v, c1v = torch.stack(
+            [u[0, 0, 0], u[0, 0, -1], v[0, 0, 0], v[0, -1, 0]]
+        ).tolist()
+        if (abs(c0u) < 1e-5 and abs(c1u - 1.0) < 1e-5
+                and abs(c0v) < 1e-5 and abs(c1v - 1.0) < 1e-5):
             identity_uv = True
 
     if identity_uv:

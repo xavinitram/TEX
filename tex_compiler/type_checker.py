@@ -192,6 +192,13 @@ class TypeChecker:
     # Source code for diagnostic snippets
     source: str = ""
 
+    # When False, re-declaring a variable in the same scope overwrites the prior
+    # type instead of raising E3001. Used ONLY for the internal re-type-check of
+    # an already-optimized AST: loop unrolling flattens N copies of a body that
+    # declares locals into one scope (benign same-type redeclarations). The
+    # original (strict) check already rejected any genuine user redeclaration.
+    strict_redeclare: bool = True
+
     # Populated during checking: all @ bindings referenced in the code
     referenced_bindings: set[str] = field(default_factory=set)
 
@@ -285,10 +292,13 @@ class TypeChecker:
 
     def _declare_var(self, name: str, t: TEXType, loc: SourceLoc):
         if name in self._scopes[-1]:
-            self._error(f"Variable '{name}' is already declared in this scope.",
-                       loc, code="E3001",
-                       hint="Each variable can only be declared once per scope. Choose a different name, or assign to the existing one.")
-            return
+            if self.strict_redeclare:
+                self._error(f"Variable '{name}' is already declared in this scope.",
+                           loc, code="E3001",
+                           hint="Each variable can only be declared once per scope. Choose a different name, or assign to the existing one.")
+                return
+            # Lenient (post-optimization re-check): overwrite with the new type.
+            # Unrolled loop bodies legitimately redeclare the same local.
         self._scopes[-1][name] = t
 
     def _push_scope(self):
@@ -515,7 +525,7 @@ class TypeChecker:
             return 0  # dynamic — resolved at runtime
         self._error("This array needs a known size.",
                     node.loc, code="E3101",
-                    hint="Try: float[10] arr; or float[] arr = {1, 2, 3};")
+                    hint="Try: float arr[10]; or float arr[] = {1, 2, 3};")
         return 1  # fallback
 
     def _check_param_decl(self, node: ParamDecl):
@@ -873,7 +883,7 @@ class TypeChecker:
             # Standalone array literals only appear in declarations (handled there)
             self._error("Array literal '{...}' can only appear in array declarations.",
                         node.loc, code="E3900",
-                        hint="Try: float[] arr = {1, 2, 3}; — array literals need a declaration.")
+                        hint="Try: float arr[] = {1, 2, 3}; — array literals need a declaration.")
             self._set_type(node, TEXType.ARRAY)
             return TEXType.ARRAY
 
@@ -1254,7 +1264,7 @@ class TypeChecker:
         if array_type != TEXType.ARRAY:
             self._error(f"Indexing with [] doesn't work on '{array_type.value}' (only arrays support indexing).",
                         node.loc, code="E3800",
-                        hint="Make sure the variable is declared as an array, e.g. float[] arr = ...;")
+                        hint="Make sure the variable is declared as an array, e.g. float arr[] = ...;")
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
 
@@ -1321,6 +1331,18 @@ class TypeChecker:
                 self._error("split() expects a string as its first argument.",
                             node.loc, code="E5003",
                             hint="Try: split(myString, delimiter).")
+
+        # cross() requires 3-component vectors (vec3, or vec4 which is trimmed
+        # to xyz). vec2 / scalar args crash torch.cross at runtime, so fail fast
+        # at compile time — this covers both the interpreter and codegen paths.
+        if node.name == "cross":
+            for i, at in enumerate(arg_types):
+                if at not in (TEXType.VEC3, TEXType.VEC4):
+                    self._error(
+                        f"cross() argument {i + 1} must be a vec3 (or vec4), but got {at.value}.",
+                        node.loc, code="E5003",
+                        hint="The cross product is only defined for 3-component vectors.")
+                    break
 
         result_type = self._resolve_function_type(node.name, arg_types, node.loc)
         self._set_type(node, result_type)

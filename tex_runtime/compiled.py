@@ -126,8 +126,19 @@ _compiled_cache: _OrderedDict[tuple[str, str], Callable] = _OrderedDict()
 # C++ kernels to process RSS. 16 entries ≈ 0.5-1 GB ceiling.
 _COMPILED_CACHE_MAX = 16
 
-# Fingerprints that crashed torch.compile — skip on subsequent calls
-_compile_blacklist: set[str] = set()
+# Fingerprints that crashed torch.compile — skip on subsequent calls.
+# Bounded LRU (OrderedDict used as an ordered set) so a long session that hits
+# many distinct failing programs does not grow this set without limit.
+_compile_blacklist: "_OrderedDict[str, None]" = _OrderedDict()
+_BLACKLIST_MAX = 256
+
+
+def _blacklist_add(fp: str) -> None:
+    """Record a fingerprint that crashed torch.compile, bounding total size."""
+    _compile_blacklist[fp] = None
+    _compile_blacklist.move_to_end(fp)
+    while len(_compile_blacklist) > _BLACKLIST_MAX:
+        _compile_blacklist.popitem(last=False)
 
 # Track which backends have been tested and whether they work.
 # None = untested, True = works, False = failed
@@ -283,6 +294,7 @@ def execute_compiled(
     fingerprint: str,
     latent_channel_count: int = 0,
     output_names: list[str] | None = None,
+    used_builtins: set[str] | None = None,
 ) -> torch.Tensor | dict:
     """
     Execute a TEX program with optional torch.compile acceleration.
@@ -314,7 +326,8 @@ def execute_compiled(
     # ── Blacklist: skip programs that previously crashed torch.compile
     if fingerprint in _compile_blacklist:
         return _plain_execute(program, bindings, type_map, device,
-                              latent_channel_count, output_names)
+                              latent_channel_count, output_names,
+                              used_builtins=used_builtins)
 
     # ── Program analysis gates (only on first compile, not cached reruns)
     if cache_key not in _compiled_cache:
@@ -322,13 +335,15 @@ def execute_compiled(
         # Skip torch.compile for trivial programs (tracing overhead > benefit)
         if op_count < _COMPILE_OP_THRESHOLD:
             return _plain_execute(program, bindings, type_map, device,
-                                  latent_channel_count, output_names)
+                                  latent_channel_count, output_names,
+                                  used_builtins=used_builtins)
         # Use codegen WITHOUT torch.compile for deeply nested loops
         # (graph breaks and recompilation make torch.compile slower)
         loop_depth = _max_loop_depth(program)
         if loop_depth > _COMPILE_MAX_LOOP_DEPTH:
             return _codegen_only_execute(program, bindings, type_map, device,
-                                         latent_channel_count, output_names)
+                                         latent_channel_count, output_names,
+                                         used_builtins=used_builtins)
         # Use plain interpreter for programs without spatial tensor context
         # (procedural noise, etc.) — codegen env setup overhead exceeds
         # benefit when all operations are on scalar tensors
@@ -336,7 +351,8 @@ def execute_compiled(
                          for v in bindings.values())
         if not has_spatial:
             return _plain_execute(program, bindings, type_map, device,
-                                  latent_channel_count, output_names)
+                                  latent_channel_count, output_names,
+                                  used_builtins=used_builtins)
 
     # Ensure tensor bindings are contiguous — Inductor's codegen can
     # fail on non-contiguous strides (e.g. BHWC images loaded with
@@ -370,7 +386,8 @@ def execute_compiled(
                     if compiled_fn is None:
                         # No backend available — run plain interpreter here
                         return _plain_execute(program, contiguous_bindings, type_map,
-                                              device, latent_channel_count, output_names)
+                                              device, latent_channel_count, output_names,
+                                              used_builtins=used_builtins)
                     _compiled_cache[cache_key] = compiled_fn
                     if len(_compiled_cache) > _COMPILED_CACHE_MAX:
                         _compiled_cache.popitem(last=False)
@@ -399,17 +416,22 @@ def execute_compiled(
             level="warning",
         )
         _compiled_cache.pop(cache_key, None)
-        _compile_blacklist.add(fingerprint)
-        # dynamo.reset() also runs in a clean thread to avoid tainting main
-        def _reset_dynamo():
-            try:
-                torch._dynamo.reset()
-            except Exception:
-                pass
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            pool.submit(_reset_dynamo).result()
-        return _plain_execute(program, bindings, type_map, device,
-                              latent_channel_count, output_names)
+        _blacklist_add(fingerprint)
+        # IMPORTANT: torch.compile / dynamo state is PROCESS-GLOBAL, not
+        # thread-local.  Resetting it on a *disposable worker thread* corrupts
+        # the calling thread's dynamo / code-cache state and garbles the
+        # interpreter fallback that runs immediately after — surfacing as bogus
+        # "Variable not defined" / "dictionary changed size during iteration"
+        # errors (or a segfault) on perfectly valid TEX code.  Reset on THIS
+        # (the calling) thread instead.
+        try:
+            torch._dynamo.reset()
+        except Exception:
+            pass
+        # Use contiguous_bindings for consistency with the compiled attempt.
+        return _plain_execute(program, contiguous_bindings, type_map, device,
+                              latent_channel_count, output_names,
+                              used_builtins=used_builtins)
 
     return result
 
@@ -421,12 +443,14 @@ def _plain_execute(
     device: str | torch.device,
     latent_channel_count: int = 0,
     output_names: list[str] | None = None,
+    used_builtins: set[str] | None = None,
 ) -> torch.Tensor | dict:
     """Execute without torch.compile (standard tree-walking interpreter)."""
     interp = Interpreter()
     return interp.execute(program, bindings, type_map, device=device,
                           latent_channel_count=latent_channel_count,
-                          output_names=output_names)
+                          output_names=output_names,
+                          used_builtins=used_builtins)
 
 
 def _build_codegen_env(
@@ -498,6 +522,7 @@ def _codegen_only_execute(
     device: str | torch.device,
     latent_channel_count: int = 0,
     output_names: list[str] | None = None,
+    used_builtins: set[str] | None = None,
 ) -> torch.Tensor | dict:
     """Execute via codegen flat function WITHOUT torch.compile.
 
@@ -512,7 +537,8 @@ def _codegen_only_execute(
 
     if cg_fn is None:
         return _plain_execute(program, bindings, type_map, device,
-                              latent_channel_count, output_names)
+                              latent_channel_count, output_names,
+                              used_builtins=used_builtins)
 
     dev = torch.device(device) if not isinstance(device, torch.device) else device
 
@@ -540,7 +566,8 @@ def _codegen_only_execute(
             level="warning",
         )
         return _plain_execute(program, bindings, type_map, device,
-                              latent_channel_count, output_names)
+                              latent_channel_count, output_names,
+                              used_builtins=used_builtins)
 
     if output_names is not None:
         return {name: contiguous_bindings[name] for name in output_names}

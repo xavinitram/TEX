@@ -3,7 +3,7 @@
 from helpers import SubTestResult
 
 from test_lexer import test_lexer, test_lexer_v11
-from test_parser import test_parser, test_parser_v11
+from test_parser import test_parser, test_parser_v11, test_array_decl_no_hang
 from test_type_checker import test_type_checker
 from test_interpreter import (
     test_interpreter, test_for_loops, test_break_continue,
@@ -48,7 +48,7 @@ from test_integration import (
 )
 from test_codegen_optimizer import (
     test_codegen_equivalence, test_optimization_regressions, test_licm,
-    test_optimizer_passes,
+    test_optimizer_passes, test_optimizer_type_consistency,
 )
 
 
@@ -63,6 +63,7 @@ def main():
     test_lexer_v11(r)
     test_parser(r)
     test_parser_v11(r)
+    test_array_decl_no_hang(r)
     test_type_checker(r)
     test_interpreter(r)
     test_for_loops(r)
@@ -135,6 +136,7 @@ def main():
     test_stdlib_edge_cases(r)
     test_stdlib_nan_inf(r)
     test_optimizer_passes(r)
+    test_optimizer_type_consistency(r)
     test_node_helpers(r)
 
     success = r.summary()

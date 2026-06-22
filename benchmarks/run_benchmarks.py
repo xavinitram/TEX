@@ -491,6 +491,19 @@ def _infer_types(bindings: dict) -> dict[str, TEXType]:
     return types
 
 
+def _fingerprint(code: str, btypes: dict) -> str:
+    """Bench-only fingerprint: SHA256 over code + sorted binding types, truncated.
+
+    Distinct from the production TEXCache.fingerprint (full hex); shared by the
+    bench scripts so they agree on the torch.compile cache/blacklist keys.
+    """
+    h = hashlib.sha256(code.encode())
+    for k in sorted(btypes):
+        v = btypes[k]
+        h.update(f"{k}:{v.value if hasattr(v, 'value') else v}".encode())
+    return h.hexdigest()[:16]
+
+
 def compile_program(code: str, binding_types: dict):
     tokens = Lexer(code).tokenize()
     program = Parser(tokens).parse()

@@ -158,6 +158,49 @@ class Parser:
                 return
             self.advance()
 
+    def _skip_statement(self):
+        """Skip the rest of a malformed statement, consuming its trailing `;`.
+
+        Used by targeted recovery routines that have already recorded a
+        diagnostic and want to resume cleanly at the next statement (avoiding a
+        cascade of follow-on errors). `{ ... }` groups are balanced so an array
+        literal's closing `}` is not mistaken for a block end. Always advances
+        at least one token, so the caller cannot spin in place.
+        """
+        depth = 0
+        while self.peek() != TokenType.EOF:
+            tt = self.peek()
+            if tt == TokenType.LBRACE:
+                depth += 1
+            elif tt == TokenType.RBRACE:
+                if depth == 0:
+                    return  # block close — leave it for the enclosing parser
+                depth -= 1
+            elif tt == TokenType.SEMI and depth == 0:
+                self.advance()  # consume the terminating `;`
+                return
+            self.advance()
+
+    def _recover_misplaced_array_brackets(self) -> ASTNode:
+        """Recover from `float[5] arr` (size before the name).
+
+        TEX declares arrays as `float arr[5]` / `float arr[] = {...}`, with the
+        size after the name. The C#/Java-style form is a common mistake; on the
+        compiler frontend it previously fed an expression-parse path that looped
+        forever. Record one clear diagnostic and skip the bad statement.
+        """
+        from .ast_nodes import ErrorNode
+        loc = self.loc()
+        type_name = self.current().value
+        err = self._make_error(
+            f"In TEX the array size goes after the name, not after the type. "
+            f"Write `{type_name} name[size]` instead of `{type_name}[size] name`.",
+            loc, code="E2006",
+            hint=f"Try: {type_name} arr[5]; or {type_name} arr[] = {{1.0, 2.0}};")
+        self._errors.append(err)
+        self._skip_statement()
+        return ErrorNode(loc=loc, error_message=str(err))
+
     # -- Program --------------------------------------------------------
 
     def parse(self) -> Program:
@@ -167,12 +210,20 @@ class Parser:
         loc = self.loc()
         stmts: list[ASTNode] = []
         while self.peek() != TokenType.EOF:
+            start_pos = self.pos
             try:
                 stmts.append(self.parse_statement())
             except ParseError as e:
                 self._errors.append(e)
                 stmts.append(ErrorNode(loc=e.loc, error_message=str(e)))
                 self._synchronize()
+                # Guarantee forward progress. _synchronize() returns WITHOUT
+                # consuming a statement-starting sync token (e.g. a stray `}`),
+                # and parse_statement re-raises on that same token — an infinite
+                # loop that hangs the ComfyUI worker and grows _errors without
+                # bound. advance() is bounded by EOF, so this always terminates.
+                if self.pos == start_pos:
+                    self.advance()
 
         if self._errors:
             # Build diagnostics for all collected errors
@@ -203,6 +254,12 @@ class Parser:
                 if self.peek_ahead(2) == TokenType.LPAREN:
                     return self.parse_function_def()
                 return self.parse_var_decl()
+            # Misplaced array brackets: `float[5] arr` (C#/Java style). TEX puts
+            # the size after the name (`float arr[5]`). Without this branch the
+            # token sequence falls through to expression parsing, where it used
+            # to trigger an unrecoverable parser loop. Emit one clear diagnostic.
+            if self.peek_ahead() == TokenType.LBRACKET:
+                return self._recover_misplaced_array_brackets()
 
         # Parameter declaration: f$name = 0.5; or $name; or i$count = 10;
         if self.peek() == TokenType.TYPED_DOLLAR_BINDING:
@@ -564,8 +621,8 @@ class Parser:
 
     def parse_ternary(self) -> ASTNode:
         expr = self.parse_logic_or()
-        if self.match(TokenType.QUESTION):
-            loc = expr.loc
+        if self.peek() == TokenType.QUESTION:
+            loc = self.advance().loc  # point diagnostics at the `?` operator
             true_expr = self.parse_expr()
             self.expect(TokenType.COLON, "I expected `:` in this ternary expression (condition ? then : else)")
             false_expr = self.parse_ternary()
@@ -663,6 +720,14 @@ class Parser:
             elif self.peek() == TokenType.LPAREN and isinstance(expr, Identifier):
                 # Function call: name(args)
                 expr = self._parse_call(expr)
+            elif self.peek() == TokenType.LPAREN:
+                # A '(' after a non-callable value (e.g. chained call `a()()`
+                # or `float(x)(y)`). Report it clearly instead of letting the
+                # leftover '(' surface downstream as a confusing "missing `;`".
+                raise self._make_error(
+                    "This value can't be called like a function.",
+                    self.loc(), code="E2002",
+                    hint="Only function names and @bindings can be followed by `(...)`.")
             else:
                 break
         return expr

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import hashlib
 import json
 import statistics
 import subprocess
@@ -52,6 +51,7 @@ from run_benchmarks import (
     run_interpreter,
     BenchmarkProgram,
     _infer_types,
+    _fingerprint,
 )
 from TEX_Wrangle.tex_runtime.compiled import (
     execute_compiled, clear_compiled_cache,
@@ -61,14 +61,6 @@ from TEX_Wrangle.tex_runtime.compiled import (
 
 WARMUP = 3
 RUNS = 5
-
-
-def _fingerprint(code: str, btypes: dict) -> str:
-    h = hashlib.sha256(code.encode())
-    for k in sorted(btypes.keys()):
-        v = btypes[k]
-        h.update(f"{k}:{v.value if hasattr(v, 'value') else v}".encode())
-    return h.hexdigest()[:16]
 
 
 # -- Measurement (in-process) -----------------------------------------
