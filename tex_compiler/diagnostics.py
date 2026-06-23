@@ -14,11 +14,14 @@ ALL problems at once, not just the first.
 Error code ranges:
   E1xxx  Lexer (syntax / tokenization)
   E2xxx  Parser (grammar / structure)
-  E3xxx  Type checker — names and scope
-  E4xxx  Type checker — types and coercions
+  E3xxx  Type checker — names, scope, types, and coercions
+  E4xxx  Type checker — unrecognized construct (catch-all)
   E5xxx  Type checker — function signatures
   E6xxx  Runtime (interpreter)
   W7xxx  Warnings
+
+Codes are stable once shipped (they are linkable wiki anchors) — add new ones
+rather than renumbering existing ones.
 """
 from __future__ import annotations
 
@@ -152,8 +155,17 @@ def suggest_similar(
     Returns up to `max_results` matches above the `cutoff` threshold.
     Handles transpositions well (e.g. 'clampp' → 'clamp').
     """
-    matches = difflib.get_close_matches(name, list(candidates), n=max_results, cutoff=cutoff)
-    return matches
+    cands = list(candidates)
+    # Shorter names need a more lenient cutoff — one transposed char in a
+    # 4-letter name already drops below 0.6, so e.g. 'sine' -> 'sin' would miss.
+    effective = 0.5 if len(name) <= 4 else cutoff
+    matches = difflib.get_close_matches(name, cands, n=max_results, cutoff=effective)
+    if matches:
+        return matches
+    # Fallback: substring/prefix containment (e.g. 'sample2' -> sample, sample_mip).
+    lower = name.lower()
+    contains = [c for c in cands if len(c) > 1 and (lower in c.lower() or c.lower() in lower)]
+    return contains[:max_results]
 
 
 # ── GLSL / JS / Houdini alias hints ──────────────────────────────────
@@ -192,6 +204,25 @@ _FOREIGN_FUNCTION_HINTS: dict[str, str] = {
     "setattrib":     "TEX uses @name syntax for outputs. Write @OUT = value; to set output.",
     "chramp":        "TEX doesn't have chramp yet. Use smoothstep() or fit() for remapping.",
     "pcopen":        "TEX doesn't support point clouds. Use sample() for spatial lookups.",
+
+    # GLSL / Shadertoy (the names a pasted Shadertoy snippet tends to contain)
+    "inversesqrt":   "TEX has no inversesqrt(). Use 1.0 / sqrt(x), or pow(x, -0.5).",
+    "rsqrt":         "TEX has no rsqrt(). Use 1.0 / sqrt(x), or pow(x, -0.5).",
+    "fma":           "TEX has no fma(). Just write a * b + c.",
+    "mad":           "TEX has no mad(). Just write a * b + c.",
+    "dFdx":          "TEX runs per-pixel without screen-space derivatives. Use sample_grad(@img, u, v) for an image gradient.",
+    "dFdy":          "TEX runs per-pixel without screen-space derivatives. Use sample_grad(@img, u, v) for an image gradient.",
+    "fwidth":        "TEX has no fwidth() (no screen-space derivatives). Use sample_grad(@img, u, v) for an image gradient.",
+    "ddx":           "TEX has no ddx() (no screen-space derivatives). Use sample_grad(@img, u, v).",
+    "ddy":           "TEX has no ddy() (no screen-space derivatives). Use sample_grad(@img, u, v).",
+    "textureLod":    "In TEX, use sample_mip(@img, u, v, lod) to sample a specific mip level.",
+    "textureGrad":   "In TEX, use sample_mip(@img, u, v, lod). TEX has no explicit-gradient sampling.",
+    "noise":         "In TEX, use perlin(x, y) or simplex(x, y) for noise.",
+    "snoise":        "In TEX, use simplex(x, y) for signed noise.",
+    "cnoise":        "In TEX, use perlin(x, y) for classic noise.",
+    "rand":          "In TEX, use hash_float(str(seed)) for a deterministic [0,1) value, or perlin(x, y) for smooth noise.",
+    "hash21":        "In TEX, use hash_float(str(x) + str(y)) for a deterministic [0,1) value.",
+    "hash12":        "In TEX, use hash_float(str(seed)) for a deterministic [0,1) value.",
 }
 
 _FOREIGN_VARIABLE_HINTS: dict[str, str] = {
@@ -203,11 +234,18 @@ _FOREIGN_VARIABLE_HINTS: dict[str, str] = {
     "iResolution":   "TEX provides iw (width) and ih (height) as separate floats.",
     "iTime":         "TEX provides fi (frame index) and fn (normalized frame 0–1).",
     "time":          "TEX provides fi (frame index) and fn (normalized frame 0–1).",
+    "iFrame":        "TEX provides fi (frame index) and fn (normalized frame 0–1).",
+    "iMouse":        "TEX has no mouse input. Expose interactive values as $param widgets instead.",
+    "iChannel0":     "TEX inputs are @A through @H. Read the first one with @A(u, v).",
+    "iChannel1":     "TEX inputs are @A through @H. The second input is @B.",
+    "iChannel2":     "TEX inputs are @A through @H. The third input is @C.",
+    "iChannel3":     "TEX inputs are @A through @H. The fourth input is @D.",
+    "iDate":         "TEX has no date input. Pass a value in through a $param widget instead.",
+    "gl_VertexID":   "TEX is per-pixel, not per-vertex. Use ix, iy (pixel coordinates) or fi (frame index).",
     "PI":            "PI is a built-in constant — make sure the capitalization is correct.",
 }
 
 _FOREIGN_KEYWORD_HINTS: dict[str, str] = {
-    "const":   "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
     "let":     "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
     "var":     "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
     "auto":    "Use float x = ..., int x = ..., or vec3 x = ... — TEX uses explicit types.",
@@ -229,13 +267,32 @@ _FOREIGN_KEYWORD_HINTS: dict[str, str] = {
     "else if": None,  # valid — no hint needed
     "switch":  "TEX doesn't have switch/case. Use if/else if chains instead.",
     "case":    "TEX doesn't have switch/case. Use if/else if chains instead.",
-    "true":    "TEX uses 1.0 for true and 0.0 for false — there are no boolean literals.",
-    "false":   "TEX uses 1.0 for true and 0.0 for false — there are no boolean literals.",
+    "true":    "TEX uses 1.0 for true and 0.0 for false. Comparisons like (x > 0.5) already give 1.0/0.0, so use them directly in if-conditions, or multiply by them to mask.",
+    "false":   "TEX uses 1.0 for true and 0.0 for false. Comparisons like (x > 0.5) already give 1.0/0.0, so use them directly in if-conditions, or multiply by them to mask.",
     "null":    "TEX has no null. Use 0.0 or vec3(0.0) for default values.",
     "None":    "TEX has no None. Use 0.0 or vec3(0.0) for default values.",
     "bool":    "TEX has no bool type. Use float (0.0 = false, non-zero = true).",
-    "vec2":    "TEX doesn't have vec2. Use float for single values, vec3 for RGB, vec4 for RGBA.",
     "double":  "TEX uses float for all decimal numbers — there is no double type.",
+}
+
+
+# Foreign TYPE names in declaration position (e.g. `float3 p = ...`). These need
+# their own table because the parser rejects them as types before the
+# function/variable hint paths ever run.
+_FOREIGN_TYPE_HINTS: dict[str, str] = {
+    "float2": "TEX has no float2. Use vec2 for a 2-component value.",
+    "float3": "TEX uses vec3 instead of float3.",
+    "float4": "TEX uses vec4 instead of float4.",
+    "half":   "TEX uses float for all decimal numbers — there is no half type.",
+    "half2":  "TEX uses vec2 instead of half2.",
+    "half3":  "TEX uses vec3 instead of half3.",
+    "half4":  "TEX uses vec4 instead of half4.",
+    "double": "TEX uses float for all decimal numbers — there is no double type.",
+    "bool":   "TEX has no bool type. Use float — 0.0 is false, non-zero is true.",
+    "mat2":   "TEX has mat3 and mat4, but no mat2.",
+    "ivec2":  "TEX vectors are always float-valued. Use vec2 (and to_int() per component if you need integers).",
+    "ivec3":  "TEX vectors are always float-valued. Use vec3 (and to_int() per component if you need integers).",
+    "ivec4":  "TEX vectors are always float-valued. Use vec4 (and to_int() per component if you need integers).",
 }
 
 
@@ -249,6 +306,11 @@ def get_function_hint(name: str) -> str:
 def get_variable_hint(name: str) -> str:
     """Return a contextual hint for a foreign/unknown variable name, or ''."""
     return _FOREIGN_VARIABLE_HINTS.get(name, "")
+
+
+def get_type_hint(name: str) -> str:
+    """Return a contextual hint for a foreign/unknown TYPE name, or ''."""
+    return _FOREIGN_TYPE_HINTS.get(name, "")
 
 
 def get_keyword_hint(keyword: str) -> str | None:

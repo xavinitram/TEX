@@ -410,13 +410,21 @@ def execute_compiled(
         result = future.result()
 
     if compile_error is not None:
+        # A loop-iteration / recursion-depth limit is a USER bug, not a compile
+        # failure: don't blacklist the program from compiling forever (it would
+        # stay blacklisted even after the user fixes the loop). The interpreter
+        # fallback below raises the clean E6010/E6060 diagnostic.
+        _emsg = str(compile_error)
+        is_user_limit = ("iteration" in _emsg or "iterations" in _emsg
+                         or "call depth" in _emsg)
         _show_once(
             f"compile_exec_fail_{fingerprint[:12]}",
             f"[TEX] torch.compile execution failed, falling back to interpreter: {compile_error}",
             level="warning",
         )
         _compiled_cache.pop(cache_key, None)
-        _blacklist_add(fingerprint)
+        if not is_user_limit:
+            _blacklist_add(fingerprint)
         # IMPORTANT: torch.compile / dynamo state is PROCESS-GLOBAL, not
         # thread-local.  Resetting it on a *disposable worker thread* corrupts
         # the calling thread's dynamo / code-cache state and garbles the

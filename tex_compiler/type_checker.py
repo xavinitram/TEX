@@ -398,9 +398,11 @@ class TypeChecker:
     def _check_var_decl(self, node: VarDecl):
         declared_type = TYPE_NAME_MAP.get(node.type_name)
         if declared_type is None:
+            from .diagnostics import get_type_hint
+            hint = (get_type_hint(node.type_name)
+                    or "Try: float, int, vec2, vec3, vec4, mat3, mat4, or string.")
             self._error(f"Unknown type name '{node.type_name}'.", node.loc,
-                        code="E3100",
-                        hint="Try: float, int, vec2, vec3, vec4, mat3, mat4, or string.")
+                        code="E3100", hint=hint)
             return
 
         if node.initializer:
@@ -902,13 +904,18 @@ class TypeChecker:
     def _check_identifier(self, node: Identifier) -> TEXType:
         t = self._lookup_var(node.name)
         if t is None:
-            from .diagnostics import suggest_similar, get_variable_hint
+            from .diagnostics import (suggest_similar, get_variable_hint,
+                                      get_keyword_hint, get_type_hint)
             # Collect all variables in scope for suggestions
             all_vars = set()
             for scope in self._scopes:
                 all_vars.update(scope.keys())
             suggestions = suggest_similar(node.name, all_vars)
-            hint = get_variable_hint(node.name)
+            # Prefer a foreign-language hint (e.g. `true`/`let`/`float3` written
+            # where a value was expected) over the generic spelling tip.
+            hint = (get_variable_hint(node.name)
+                    or get_keyword_hint(node.name)
+                    or get_type_hint(node.name))
             if not hint and not suggestions:
                 hint = f"Check the spelling, or declare it first with a type: float {node.name} = ...;"
             self._error(f"I can't find a variable named '{node.name}'.",
@@ -1191,17 +1198,23 @@ class TypeChecker:
                     self._error(f"Multiplying {lt.value} by {rt.value} isn't supported (matrix sizes must match).",
                                 loc, code="E3402")
                 return lt
-            # mat * vec → vec (matrix-vector product)
+            # mat * vec → vec (matrix-vector product).
+            #   mat3 * vec3 -> vec3;  mat3 * vec4 -> vec4 (transforms xyz, keeps w)
+            #   mat4 * vec4 -> vec4;  mat4 * vec3 -> vec4 (vec3 treated as a point, w=1)
             if lt.is_matrix and rt.is_vector:
-                if lt == TEXType.MAT3 and rt not in (TEXType.VEC3, TEXType.VEC4):
-                    self._error(f"mat3 * needs a vec3 or vec4 operand, but found {rt.value}.",
+                if lt == TEXType.MAT3:
+                    if rt not in (TEXType.VEC3, TEXType.VEC4):
+                        self._error(f"mat3 * needs a vec3 or vec4 operand, but found {rt.value}.",
+                                    loc, code="E3402",
+                                    hint="A mat3 transforms vec3 values; with a vec4 it transforms xyz and keeps w.")
+                        return TEXType.VEC3
+                    return rt  # vec3 -> vec3, vec4 -> vec4 (xyz transformed, w preserved)
+                # mat4
+                if rt not in (TEXType.VEC3, TEXType.VEC4):
+                    self._error(f"mat4 * needs a vec3 or vec4 operand, but found {rt.value}.",
                                 loc, code="E3402",
-                                hint="Try converting the right side to vec3 or vec4 first.")
-                if lt == TEXType.MAT4 and rt != TEXType.VEC4:
-                    self._error(f"mat4 * needs a vec4 operand, but found {rt.value}.",
-                                loc, code="E3402",
-                                hint="Try converting the right side to vec4 first.")
-                return rt
+                                hint="A mat4 transforms vec4 values; a vec3 is treated as a point (w = 1).")
+                return TEXType.VEC4  # vec3 promoted to a point, vec4 transformed
             # vec * mat → error
             if lt.is_vector and rt.is_matrix:
                 self._error(
@@ -1354,6 +1367,29 @@ class TypeChecker:
                         hint="The cross product is only defined for 3-component vectors.")
                     break
 
+        # Matrix/color built-ins crash on the wrong operand types at runtime
+        # (raw torch internals). Validate at compile time, in cross()'s voice.
+        if node.name in ("determinant", "inverse", "transpose") and arg_types:
+            if not arg_types[0].is_matrix:
+                self._error(
+                    f"{node.name}() needs a matrix (mat3 or mat4), but got {arg_types[0].value}.",
+                    node.loc, code="E5003",
+                    hint="Build a matrix first with mat3(...) or mat4(...).")
+        elif node.name in ("hsv2rgb", "rgb2hsv") and arg_types:
+            if not arg_types[0].is_vector:
+                self._error(
+                    f"{node.name}() needs a color vector (vec3 or vec4), but got {arg_types[0].value}.",
+                    node.loc, code="E5003",
+                    hint="Pass an RGB/HSV color, e.g. vec3(r, g, b).")
+        elif node.name == "dot":
+            for i, at in enumerate(arg_types):
+                if not at.is_vector:
+                    self._error(
+                        f"dot() needs vectors, but argument {i + 1} is {at.value}.",
+                        node.loc, code="E5003",
+                        hint="Both arguments should be vec2, vec3, or vec4.")
+                    break
+
         result_type = self._resolve_function_type(node.name, arg_types, node.loc)
         self._set_type(node, result_type)
         return result_type
@@ -1379,6 +1415,8 @@ class TypeChecker:
                             self._error(
                                 f"Argument {i + 1} of '{name}()' expects '{ptype.value}', but got '{atype.value}'.",
                                 loc, code="E5003",
+                                hint=f"Parameter '{pname}' is declared as {ptype.value}. "
+                                     f"Convert with to_float()/to_int()/str(), or a vec constructor.",
                             )
                 return user_fn["return_type"]
 

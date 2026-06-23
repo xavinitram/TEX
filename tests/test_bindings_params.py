@@ -483,6 +483,30 @@ def test_scatter_writes(r: SubTestResult):
     except Exception as e:
         r.fail("scatter: scalar value", f"{e}\n{traceback.format_exc()}")
 
+    # G1: sampling a non-image binding errors cleanly (not a raw torch/Python crash)
+    try:
+        from TEX_Wrangle.tex_runtime.interpreter import InterpreterError
+        try:
+            compile_and_run("@OUT = @x(0.5, 0.5);", {"x": torch.tensor(0.5)})
+            r.fail("sample: non-image binding errors cleanly", "expected an error")
+        except InterpreterError as e:
+            assert "isn't an image" in str(e), str(e)
+            r.ok("sample: non-image binding errors cleanly")
+    except Exception as e:
+        r.fail("sample: non-image binding errors cleanly", f"{type(e).__name__}: {e}")
+
+    # G4: scattering a color into a mask errors cleanly (channel-count mismatch)
+    try:
+        from TEX_Wrangle.tex_runtime.interpreter import InterpreterError
+        try:
+            compile_and_run("@M = u; @M[ix, iy] = vec3(1.0);", {"A": img})
+            r.fail("scatter: color into mask errors cleanly", "expected an error")
+        except InterpreterError as e:
+            assert "mask" in str(e) and "color" in str(e), str(e)
+            r.ok("scatter: color into mask errors cleanly")
+    except Exception as e:
+        r.fail("scatter: color into mask errors cleanly", f"{type(e).__name__}: {e}")
+
 
 def test_wireable_params(r: SubTestResult):
     """Tests that param ($) values work when passed as different types (simulating wired inputs)."""

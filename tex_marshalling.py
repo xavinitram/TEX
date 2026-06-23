@@ -50,6 +50,13 @@ def unwrap_latent(value: dict) -> tuple[torch.Tensor, dict]:
     Output: (tensor [B,H,W,C], {"noise_mask": ..., ...})
     """
     samples = value["samples"]  # [B, C, H, W]
+    if not isinstance(samples, torch.Tensor) or samples.dim() != 4:
+        got = (f"a {samples.dim()}D tensor" if isinstance(samples, torch.Tensor)
+               else type(samples).__name__)
+        raise ValueError(
+            f"This LATENT input's 'samples' isn't the expected [batch, channels, height, "
+            f"width] shape (got {got}). This usually means an upstream node produced an "
+            f"empty or malformed latent — try re-running it.")
     tensor_cl = samples.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
     metadata = {k: v for k, v in value.items() if k != "samples"}
     return tensor_cl, metadata

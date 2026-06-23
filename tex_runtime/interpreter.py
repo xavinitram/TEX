@@ -600,10 +600,12 @@ class Interpreter:
             if result.dim() >= 1 and result.shape[-1] > idx:
                 result[..., idx] = _ensure_spatial(value, result.shape[:-1])
             else:
+                nchan = result.shape[-1] if result.dim() >= 1 else 1
                 raise InterpreterError(
-                    f"This tensor (shape {result.shape}) does not have a channel at index {idx}",
+                    f"This value has {nchan} channel{'s' if nchan != 1 else ''}, so it has no "
+                    f"channel #{idx + 1} to write to.",
                     target.loc, source=self._source, code="E6004",
-                    hint="The target needs enough channels for this assignment. Check if the variable is a vec3 or vec4.",
+                    hint="A vec3 has 3 channels (r, g, b); build a vec4 (e.g. vec4(color, 1.0)) if you need a 4th (alpha).",
                 )
         else:
             # Multi-channel assignment: .rgb, .xy, .rgba, etc.
@@ -754,6 +756,22 @@ class Interpreter:
             flat_v = val.contiguous().reshape(-1, C)
         else:
             flat_v = val.reshape(-1) if isinstance(val, torch.Tensor) and val.dim() > 0 else val
+
+        # Channel-count check: a clear message beats a raw torch shape error.
+        buf_c = buf.shape[-1] if buf.dim() == 4 else 1
+        if C != buf_c:
+            if buf_c == 1:
+                raise InterpreterError(
+                    f"You're writing a {C}-channel color into '@{name}', but '@{name}' is a "
+                    f"mask — it holds one value per pixel, not a color.",
+                    target.loc, source=self._source, code="E6006",
+                    hint="Write a single number into a mask (e.g. @M[x,y] = 0.5), or send "
+                         "colors to an image output instead.")
+            raise InterpreterError(
+                f"You're writing a {C}-channel value into '@{name}', but '@{name}' holds "
+                f"{buf_c} channels per pixel.",
+                target.loc, source=self._source, code="E6006",
+                hint=f"Match the channel count — use a vec{buf_c} value, or .rgb / .r to convert.")
 
         idx = (flat_b, flat_y, flat_x)
         if op is None:
@@ -1077,11 +1095,12 @@ class Interpreter:
                 )
             if base.dim() >= 1 and base.shape[-1] > idx:
                 return base[..., idx]
+            nchan = base.shape[-1] if base.dim() >= 1 else 1
             raise InterpreterError(
-                f"This value (shape {base.shape}) does not have a channel at '.{channels}' (index {idx})",
+                f"This value has {nchan} channel{'s' if nchan != 1 else ''}, so it has no "
+                f"'.{channels}' channel.",
                 node.loc, source=self._source, code="E6030",
-                hint="The value may be a scalar or have fewer channels than expected. "
-                     "Check if you need a vec3 or vec4 here.",
+                hint="A vec3 has .r/.g/.b (or .x/.y/.z); build a vec4 (e.g. vec4(color, 1.0)) if you need '.a' / '.w'.",
             )
 
         # Multi-channel swizzle
@@ -1162,6 +1181,18 @@ class Interpreter:
                             if rt.is_matrix:
                                 return torch.matmul(left, right)
                             if rt.is_vector:
+                                m = left.shape[-1]     # matrix dim: 3 or 4
+                                vc = right.shape[-1]   # vector channels
+                                if vc == m:
+                                    return torch.matmul(left, right.unsqueeze(-1)).squeeze(-1)
+                                if m == 3 and vc == 4:
+                                    # mat3 * vec4: transform xyz, preserve w/alpha
+                                    xyz = torch.matmul(left, right[..., :3].unsqueeze(-1)).squeeze(-1)
+                                    return torch.cat([xyz, right[..., 3:4]], dim=-1)
+                                if m == 4 and vc == 3:
+                                    # mat4 * vec3: promote vec3 to a point (w = 1)
+                                    v4 = torch.cat([right, torch.ones_like(right[..., :1])], dim=-1)
+                                    return torch.matmul(left, v4.unsqueeze(-1)).squeeze(-1)
                                 return torch.matmul(left, right.unsqueeze(-1)).squeeze(-1)
 
             # Ensure compatible shapes.
@@ -1312,9 +1343,21 @@ class Interpreter:
 
         return result
 
+    def _require_image(self, binding_node, value, syntax: str):
+        """Reject sampling/indexing a non-image binding with a clear message,
+        instead of letting fetch/sample crash on a scalar's or string's shape."""
+        if not (value.__class__ is torch.Tensor and value.dim() >= 3):
+            name = getattr(binding_node, "name", "input")
+            raise InterpreterError(
+                f"@{name} isn't an image, so it can't be sampled with {syntax}.",
+                binding_node.loc, source=self._source, code="E6020",
+                hint=f"The ( ) and [ ] forms read from IMAGE / MASK / LATENT inputs. Wire an "
+                     f"image into '{name}', or read a scalar/text input plainly as @{name}.")
+
     def _eval_binding_index(self, node: BindingIndexAccess):
         """@Image[ix, iy] → fetch, @Image[ix, iy, frame] → fetch_frame"""
         image = self._eval(node.binding)
+        self._require_image(node.binding, image, "[ ]")
         args = [self._eval(a) for a in node.args]
         if len(args) == 3:
             return self.functions["fetch_frame"](image, args[2], args[0], args[1])
@@ -1323,6 +1366,7 @@ class Interpreter:
     def _eval_binding_sample(self, node: BindingSampleAccess):
         """@Image(u, v) → sample, @Image(u, v, frame) → sample_frame"""
         image = self._eval(node.binding)
+        self._require_image(node.binding, image, "( )")
         args = [self._eval(a) for a in node.args]
         if len(args) == 3:
             return self.functions["sample_frame"](image, args[2], args[0], args[1])

@@ -10,6 +10,14 @@ import math
 import re
 from collections import OrderedDict as _OrderedDict
 import torch
+import logging
+
+_texlog = logging.getLogger("TEX")
+
+# pow() NaN detector state. A negative base with a fractional exponent has no
+# real value (NaN). We check only a bounded number of pow evaluations
+# process-wide, so steady-state execution never pays a per-call GPU sync.
+_POW_NAN_STATE = {"checked": 0, "warned": False}
 
 # Unified safety epsilon for division guards, domain clamping, and near-zero checks.
 # Chosen to be well above float32 machine epsilon (~1.2e-7) while small enough
@@ -357,7 +365,20 @@ class TEXStdlib:
         # centered coordinate (vignettes, radial gradients, SDFs) would return
         # ~0 instead of x*x. torch.pow is correct for negative bases with whole
         # exponents and matches the scalar path, so results are path-independent.
-        return torch.pow(b, e)
+        out = torch.pow(b, e)
+        # Make silent NaN visible: pow(-2, 0.5) and similar have no real answer.
+        # Bounded so this never adds a per-call sync to steady-state execution.
+        _st = _POW_NAN_STATE
+        if not _st["warned"] and _st["checked"] < 32:
+            _st["checked"] += 1
+            if torch.isnan(out).any() and not torch.isnan(b).any():
+                _st["warned"] = True
+                _texlog.warning(
+                    "[TEX] pow() produced NaN: a negative base with a fractional exponent "
+                    "(e.g. pow(-2, 0.5)) has no real answer, so those pixels are NaN. Use "
+                    "spow(x, y) for a sign-preserving power, or pow(abs(x), y) for magnitude."
+                )
+        return out
 
     @staticmethod
     def fn_exp(x):
@@ -480,7 +501,14 @@ class TEXStdlib:
 
     @staticmethod
     def fn_inverse(m):
-        return torch.linalg.inv(m)
+        try:
+            return torch.linalg.inv(m)
+        except Exception as e:
+            raise ValueError(
+                "inverse() can't invert this matrix because it's singular "
+                "(its determinant is zero) — usually two rows/columns are identical, "
+                "or one is all zeros. Check determinant(m) first, or rebuild the matrix."
+            ) from e
 
     # -- Clamping / interpolation ---------------------------------------
 
@@ -1443,8 +1471,17 @@ class TEXStdlib:
                 converted.append(a)
         try:
             return template.format(*converted)
-        except (IndexError, KeyError) as e:
-            raise ValueError(f"format() error: {e}")
+        except KeyError as e:
+            raise ValueError(
+                f"format() only understands plain {{}} placeholders, but the template uses "
+                f"a named one ({{{e.args[0]}}}). Replace it with {{}} and pass values in "
+                f"order, e.g. format(\"hi {{}}\", x).") from e
+        except IndexError as e:
+            n_ph = template.count("{}")
+            raise ValueError(
+                f"format() template has {n_ph} {{}} placeholder{'s' if n_ph != 1 else ''}, "
+                f"but {len(converted)} value{'s' if len(converted) != 1 else ''} "
+                f"{'were' if len(converted) != 1 else 'was'} given.") from e
 
     @staticmethod
     def fn_repeat(s, count):

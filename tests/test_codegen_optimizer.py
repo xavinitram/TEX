@@ -417,6 +417,34 @@ vec3 tv = vec3(1.0, 2.0, 3.0);
     except Exception as e:
         r.fail("matrix multiplication: mat3 * vec3", f"{e}\n{traceback.format_exc()}")
 
+    # mat3 * vec4 — transforms xyz, preserves w (e.g. a color matrix on RGBA)
+    try:
+        code = """
+mat3 m = mat3(2.0, 0.0, 0.0,  0.0, 2.0, 0.0,  0.0, 0.0, 2.0);
+vec4 c = vec4(1.0, 2.0, 3.0, 0.5);
+@OUT = m * c;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC4)
+        expected = torch.tensor([2.0, 4.0, 6.0, 0.5])  # xyz doubled, w preserved
+        assert torch.allclose(result[0, 0, 0], expected, atol=1e-4), f"mat3*vec4: {result[0,0,0]}"
+        r.ok("matrix multiplication: mat3 * vec4 (transforms xyz, keeps w)")
+    except Exception as e:
+        r.fail("matrix multiplication: mat3 * vec4 (transforms xyz, keeps w)", f"{e}\n{traceback.format_exc()}")
+
+    # mat4 * vec3 — promotes the vec3 to a point (w = 1)
+    try:
+        code = """
+mat4 m = mat4(2.0, 0.0, 0.0, 0.0,  0.0, 2.0, 0.0, 0.0,  0.0, 0.0, 2.0, 0.0,  0.0, 0.0, 0.0, 1.0);
+vec3 p = vec3(1.0, 2.0, 3.0);
+@OUT = m * p;
+"""
+        result = compile_and_run(code, {"A": img}, out_type=TEXType.VEC4)
+        expected = torch.tensor([2.0, 4.0, 6.0, 1.0])  # xyz scaled, promoted point w=1
+        assert torch.allclose(result[0, 0, 0], expected, atol=1e-4), f"mat4*vec3: {result[0,0,0]}"
+        r.ok("matrix multiplication: mat4 * vec3 (point promotion, w=1)")
+    except Exception as e:
+        r.fail("matrix multiplication: mat4 * vec3 (point promotion, w=1)", f"{e}\n{traceback.format_exc()}")
+
     # scalar * mat3 (should be element-wise, not matmul)
     try:
         # 2 * identity should give 2*identity; verify via mat*vec

@@ -820,8 +820,15 @@ class Parser:
             self.expect(TokenType.RPAREN, "I expected `)` here")
             return expr
 
-        raise self._make_error(f"Unexpected token: {tok.type.name} ({tok.value!r}).",
-                               tok.loc, code="E2003")
+        if tok.type == TokenType.EOF:
+            raise self._make_error(
+                "The program ended in the middle of an expression.",
+                tok.loc, code="E2003",
+                hint="An operator or open bracket may be missing the value that follows it.")
+        raise self._make_error(
+            f"I didn't expect `{tok.value}` here.",
+            tok.loc, code="E2003",
+            hint="A value was expected at this point — a number, variable, @input, or vec(...).")
 
     def _parse_vec_constructor(self) -> VecConstructor:
         tok = self.advance()  # vec3 or vec4

@@ -2882,7 +2882,18 @@ class _CodeGen:
                 return tmp
             if lt.is_matrix and rt.is_vector:
                 tmp = self._tmp()
-                self._emit(f"{tmp} = _torch.matmul({left}, {right}.unsqueeze(-1)).squeeze(-1)")
+                m = lt.mat_size      # matrix dim: 3 or 4
+                vc = rt.channels     # vector channels: 2, 3, or 4
+                if vc == m:
+                    self._emit(f"{tmp} = _torch.matmul({left}, {right}.unsqueeze(-1)).squeeze(-1)")
+                elif m == 3 and vc == 4:
+                    # mat3 * vec4: transform xyz, preserve w/alpha
+                    self._emit(f"{tmp} = _torch.cat([_torch.matmul({left}, {right}[..., :3].unsqueeze(-1)).squeeze(-1), {right}[..., 3:4]], dim=-1)")
+                elif m == 4 and vc == 3:
+                    # mat4 * vec3: promote vec3 to a point (w = 1)
+                    self._emit(f"{tmp} = _torch.matmul({left}, _torch.cat([{right}, _torch.ones_like({right}[..., :1])], dim=-1).unsqueeze(-1)).squeeze(-1)")
+                else:
+                    self._emit(f"{tmp} = _torch.matmul({left}, {right}.unsqueeze(-1)).squeeze(-1)")
                 return tmp
 
         # Check if broadcasting is needed (scalar vs vector mixed)

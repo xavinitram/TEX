@@ -21,7 +21,7 @@ logger = logging.getLogger("TEX")
 from .tex_compiler.lexer import LexerError
 from .tex_compiler.parser import ParseError
 from .tex_compiler.type_checker import TypeCheckError
-from .tex_compiler.diagnostics import TEXMultiError
+from .tex_compiler.diagnostics import TEXMultiError, TEX_BUG_REPORT_URL
 from .tex_compiler.ast_nodes import SourceLoc
 from .tex_runtime.interpreter import Interpreter, InterpreterError
 from .tex_cache import get_cache
@@ -357,10 +357,23 @@ class TEXWrangleNode(_BaseClass):
                 raise RuntimeError(f"{readable}\nTEX_DIAG:{payload}") from e
             # Fallback for errors without diagnostic (shouldn't happen)
             raise RuntimeError(f"TEX Error: {e}") from e
+        except (ValueError, KeyError, TypeError, IndexError) as e:
+            # Usually a value or type a built-in didn't expect — a user-side
+            # problem, not a TEX bug. Show it cleanly, without a traceback.
+            raise RuntimeError(
+                f"TEX couldn't finish running your program:\n  {e}\n\n"
+                f"This usually points to an input or parameter value that a built-in "
+                f"didn't expect — check the inputs feeding this node."
+            ) from e
         except Exception as e:
-            # Unexpected error — include traceback for debugging
+            # Genuinely unexpected — this may be a TEX bug. Include the traceback
+            # and a report link so it can be diagnosed.
             tb = traceback.format_exc()
-            raise RuntimeError(f"TEX Internal Error: {e}\n{tb}") from e
+            raise RuntimeError(
+                f"TEX hit an unexpected problem while running your code:\n  {e}\n\n"
+                f"If your code looks correct, this may be a TEX bug worth reporting:\n  "
+                f"{TEX_BUG_REPORT_URL}\n{tb}"
+            ) from e
 
     @staticmethod
     def _resolve_device(device_mode: str, bindings: dict[str, Any]) -> str:
