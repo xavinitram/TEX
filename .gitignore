@@ -26,3 +26,5 @@ error_reports/
 
 # Intermediate benchmark JSON files from development
 tests/*.json
+
+wiki/
