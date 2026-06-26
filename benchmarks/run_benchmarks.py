@@ -504,6 +504,21 @@ def _fingerprint(code: str, btypes: dict) -> str:
     return h.hexdigest()[:16]
 
 
+def gpu_time_ms(fn, runs: int = 40, warmup: int = 8) -> float:
+    """Warm + synchronize-bracketed GPU timing in ms/run. Shared by the GPU
+    bench tools (gpu_profile.py, gpu_cudagraph_test.py) so they measure the same
+    way — always sync around the timed region (older scripts that didn't only
+    measured kernel-launch overhead)."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(runs):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / runs * 1000
+
+
 def compile_program(code: str, binding_types: dict):
     tokens = Lexer(code).tokenize()
     program = Parser(tokens).parse()

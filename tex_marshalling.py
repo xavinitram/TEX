@@ -234,7 +234,10 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
         elif raw.dim() == 0:
             # Scalar -> 1x1 image
             raw = raw.view(1, 1, 1, 1).expand(1, 1, 1, 3)
-        return raw.clamp(0, 1).cpu()
+        # Keep on the compute device (GPU stays GPU): forcing .cpu() here makes
+        # chained TEX nodes round-trip over PCIe per link and collapses the next
+        # node's auto-device to CPU. Terminal nodes (Save/Preview) .cpu() themselves.
+        return raw.clamp(0, 1)
 
     elif output_type == "MASK":
         # MASK expects [B, H, W] float32 in [0, 1]
@@ -246,8 +249,9 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
             raw = raw.unsqueeze(0)
         elif raw.dim() == 0:
             raw = raw.view(1, 1, 1)
-        # dim == 3 ([B, H, W]) is the correct format — pass through
-        return raw.clamp(0, 1).cpu()
+        # dim == 3 ([B, H, W]) is the correct format — pass through.
+        # Keep on the compute device (see IMAGE above).
+        return raw.clamp(0, 1)
 
     elif output_type == "FLOAT":
         if raw.dim() == 0:

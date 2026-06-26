@@ -48,6 +48,25 @@ def _get_worley_offsets(device: torch.device, ndim: int) -> tuple[torch.Tensor, 
     return dx_off, dy_off
 
 
+_worley3d_offsets_cache: dict[tuple, tuple] = {}
+
+
+def _get_worley3d_offsets(device: torch.device, ndim: int) -> tuple:
+    """Cached (dx, dy, dz) offsets for the Worley 27-neighbor 3D lookup —
+    mirrors _get_worley_offsets so the meshgrid isn't rebuilt (and re-uploaded)
+    on every call."""
+    key = (str(device), ndim)
+    cached = _worley3d_offsets_cache.get(key)
+    if cached is not None:
+        return cached
+    r = torch.tensor([-1, 0, 1], dtype=torch.int32, device=device)
+    gz, gy, gx = torch.meshgrid(r, r, r, indexing="ij")
+    shape = (27,) + (1,) * ndim
+    offs = (gx.reshape(shape), gy.reshape(shape), gz.reshape(shape))
+    _worley3d_offsets_cache[key] = offs
+    return offs
+
+
 # ── Arithmetic hash Perlin noise (table-free, TorchInductor-friendly) ────────
 #
 # Replaces permutation table lookups with pure integer arithmetic (lowbias32
@@ -765,12 +784,8 @@ def _worley3d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
     yi = y_floor.to(torch.int32)
     zi = z_floor.to(torch.int32)
 
-    # Build 27 neighbor offsets: [-1,0,1]^3
-    r = torch.tensor([-1, 0, 1], dtype=torch.int32, device=x.device)
-    gz, gy, gx = torch.meshgrid(r, r, r, indexing="ij")
-    dx_off = gx.reshape(27, *((1,) * xi.dim()))
-    dy_off = gy.reshape(27, *((1,) * xi.dim()))
-    dz_off = gz.reshape(27, *((1,) * xi.dim()))
+    # 27 neighbor offsets [-1,0,1]^3, cached per (device, rank) — see the 2D path.
+    dx_off, dy_off, dz_off = _get_worley3d_offsets(x.device, xi.dim())
 
     # Cell coords for all 27 neighbors: [27, *spatial]
     cx = xi.unsqueeze(0) + dx_off
