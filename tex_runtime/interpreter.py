@@ -1385,25 +1385,37 @@ class Interpreter:
                 hint=f"Check the spelling of '{node.name}'. See the TEX reference for available functions.",
             )
 
-        # Fast paths for common arities (avoid list comprehension overhead)
+        # Evaluate arguments OUTSIDE the try (fast paths for common arities) so a
+        # nested InterpreterError raised while evaluating an argument keeps its own
+        # code / source caret / hint instead of being re-wrapped here at the wrong
+        # location and blamed on this function.
         node_args = node.args
         nargs = len(node_args)
+        if nargs == 1:
+            a0 = self._eval(node_args[0])
+        elif nargs == 2:
+            a0 = self._eval(node_args[0]); a1 = self._eval(node_args[1])
+        elif nargs == 3:
+            a0 = self._eval(node_args[0]); a1 = self._eval(node_args[1]); a2 = self._eval(node_args[2])
+        else:
+            arglist = [self._eval(arg) for arg in node_args]
         try:
             if nargs == 1:
-                result = fn(self._eval(node_args[0]))
+                result = fn(a0)
             elif nargs == 2:
-                result = fn(self._eval(node_args[0]), self._eval(node_args[1]))
+                result = fn(a0, a1)
             elif nargs == 3:
-                result = fn(self._eval(node_args[0]), self._eval(node_args[1]),
-                            self._eval(node_args[2]))
+                result = fn(a0, a1, a2)
             else:
-                result = fn(*[self._eval(arg) for arg in node_args])
+                result = fn(*arglist)
+        except InterpreterError:
+            raise  # a nested TEX error (e.g. from a stdlib helper) — keep it intact
         except Exception as e:
             raise InterpreterError(
                 f"Function '{node.name}' encountered a problem: {e}",
-                node.loc, source=self._source, code="E6050",
+                node.loc, source=self._source, code="E6051",
                 hint="Check the number and types of arguments passed to this function.",
-            )
+            ) from e
 
         # Fast path: most stdlib functions return tensors
         if result.__class__ is torch.Tensor:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 import torch
 import traceback
@@ -26,6 +27,7 @@ from .tex_compiler.ast_nodes import SourceLoc
 from .tex_runtime.interpreter import Interpreter, InterpreterError
 from .tex_cache import get_cache
 from .tex_runtime.compiled import execute_compiled
+from .tex_fusion import prepare_fused as _prepare_fused, FusionError
 
 # Marshalling and type inference utilities (extracted to tex_marshalling.py)
 from .tex_marshalling import (
@@ -198,6 +200,10 @@ class TEXWrangleNode(_BaseClass):
         device_mode = kwargs.pop("device", "auto")
         compile_mode = kwargs.pop("compile_mode", "none")
         kwargs.pop("_tex_any", None)  # search-panel wildcard slot, unused
+        # Cross-node fusion: when the frontend collapses a linked TEX chain into
+        # this (terminal) node, it passes the upstream stages here. Absent → the
+        # node behaves exactly as a single program (no behaviour change).
+        chain_payload = kwargs.pop("_tex_chain", None)
 
         # Everything remaining in kwargs is a TEX binding (inputs + params)
         bindings: dict[str, Any] = {
@@ -228,16 +234,27 @@ class TEXWrangleNode(_BaseClass):
                 if not latent_channel_count:
                     latent_channel_count = tensor_cl.shape[-1]
 
-        # Resolve target device
-        device = cls._resolve_device(device_mode, bindings)
-
         try:
-            # Infer binding types for inputs
-            binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
+            fused_chain = False
+            if chain_payload:
+                # Fused path: splice the whole linked chain into one program.
+                # Per-stage validation already happened in compile_fused, so a
+                # failure here raises (we must NOT silently run the terminal
+                # alone — the upstream nodes were collapsed away in the prompt).
+                spec = json.loads(chain_payload) if isinstance(chain_payload, str) else chain_payload
+                (program, type_map, referenced, assigned_bindings, param_info,
+                 used_builtins, bindings) = _prepare_fused(spec, code, bindings, _infer_binding_type)
+                fused_chain = True
+            else:
+                # Infer binding types for inputs
+                binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
 
-            # Compile (uses two-tier Mega-Cache: memory LRU + disk persistence)
-            cache = get_cache()
-            program, type_map, referenced, assigned_bindings, param_info, used_builtins = cache.compile_tex(code, binding_types)
+                # Compile (uses two-tier Mega-Cache: memory LRU + disk persistence)
+                cache = get_cache()
+                program, type_map, referenced, assigned_bindings, param_info, used_builtins = cache.compile_tex(code, binding_types)
+
+            # Resolve target device (from the effective bindings — merged for a chain)
+            device = cls._resolve_device(device_mode, bindings)
 
             # Determine output names (sorted alphabetically for stable ordering)
             output_names = sorted(assigned_bindings.keys())
@@ -265,8 +282,11 @@ class TEXWrangleNode(_BaseClass):
                             bindings[ref_name] = default_val
                             continue
                     sigil = "$" if ref_name in param_info else "@"
+                    # On the fused path bindings are stage-prefixed (_s0_amt); show
+                    # the user's original name, not the synthetic one.
+                    disp = re.sub(r"^_s\d+_", "", ref_name) if fused_chain else ref_name
                     raise InterpreterError(
-                        f"TEX code references {sigil}{ref_name} but no input is connected to slot '{ref_name}'.",
+                        f"TEX code references {sigil}{disp} but no input is connected to slot '{disp}'.",
                         loc=SourceLoc(1, 1), source=code, code="E6003",
                     )
 
@@ -276,8 +296,10 @@ class TEXWrangleNode(_BaseClass):
                 if pname in bindings:
                     bindings[pname] = _convert_param_value(bindings[pname], pinfo, pname)
 
-            # Execute — optionally with torch.compile acceleration
-            if compile_mode == "torch_compile":
+            # Execute — optionally with torch.compile acceleration.
+            # Fused chains always use the interpreter (the spliced program isn't
+            # keyed in the torch_compile fingerprint cache).
+            if compile_mode == "torch_compile" and not fused_chain:
                 fp = cache.fingerprint(code, binding_types)
                 try:
                     raw_output = execute_compiled(program, bindings, type_map, device, fp,
@@ -299,6 +321,7 @@ class TEXWrangleNode(_BaseClass):
                         pass
                     interp = _get_interpreter()
                     raw_output = interp.execute(program, bindings, type_map, device=device,
+                                                source=code,
                                                 latent_channel_count=latent_channel_count,
                                                 output_names=output_names,
                                                 used_builtins=used_builtins)
@@ -307,7 +330,11 @@ class TEXWrangleNode(_BaseClass):
                     raw_output = {output_names[0]: raw_output}
             else:
                 interp = _get_interpreter()
+                # Pass source so runtime (E6xxx) errors render a source-line caret.
+                # Fused chains splice many sources, so their line numbers wouldn't
+                # map to `code` — leave source empty there (errors stay message-only).
                 raw_output = interp.execute(program, bindings, type_map, device=device,
+                                            source=("" if fused_chain else code),
                                             latent_channel_count=latent_channel_count,
                                             output_names=output_names,
                                             used_builtins=used_builtins)
@@ -357,6 +384,17 @@ class TEXWrangleNode(_BaseClass):
                 raise RuntimeError(f"{readable}\nTEX_DIAG:{payload}") from e
             # Fallback for errors without diagnostic (shouldn't happen)
             raise RuntimeError(f"TEX Error: {e}") from e
+        except FusionError as e:
+            # A chain couldn't be fused (e.g. an upstream node scatter-writes @OUT,
+            # or has multiple outputs). A structural/config condition — show it
+            # cleanly, no traceback or bug-report link. We must still raise: the
+            # upstream nodes were collapsed out of the prompt, so running this
+            # terminal alone would be wrong.
+            raise RuntimeError(
+                f"TEX couldn't fuse this chain of nodes:\n  {e}\n\n"
+                f"Turn off 'TEX Fusion: Compile linked TEX nodes together' in "
+                f"settings, or break the chain at the node mentioned above."
+            ) from e
         except (ValueError, KeyError, TypeError, IndexError) as e:
             # Usually a value or type a built-in didn't expect — a user-side
             # problem, not a TEX bug. Show it cleanly, without a traceback.
@@ -364,6 +402,23 @@ class TEXWrangleNode(_BaseClass):
                 f"TEX couldn't finish running your program:\n  {e}\n\n"
                 f"This usually points to an input or parameter value that a built-in "
                 f"didn't expect — check the inputs feeding this node."
+            ) from e
+        except RuntimeError as e:
+            msg = str(e)
+            # Ordinary user/config RuntimeErrors — a device selection issue, a
+            # string output without the s@ prefix, or inputs of mismatched
+            # resolution — are NOT TEX bugs. Show them cleanly (no traceback / URL).
+            if "TEX Error:" in msg or "size of tensor" in msg or "must match" in msg:
+                raise RuntimeError(
+                    f"TEX couldn't run your program:\n  {msg}\n\n"
+                    f"This is usually a device, output-type, or input-size mismatch "
+                    f"— check the inputs and settings feeding this node."
+                ) from e
+            tb = traceback.format_exc()
+            raise RuntimeError(
+                f"TEX hit an unexpected problem while running your code:\n  {e}\n\n"
+                f"If your code looks correct, this may be a TEX bug worth reporting:\n  "
+                f"{TEX_BUG_REPORT_URL}\n{tb}"
             ) from e
         except Exception as e:
             # Genuinely unexpected — this may be a TEX bug. Include the traceback

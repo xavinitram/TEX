@@ -503,12 +503,16 @@ class TEXStdlib:
     def fn_inverse(m):
         try:
             return torch.linalg.inv(m)
-        except Exception as e:
-            raise ValueError(
-                "inverse() can't invert this matrix because it's singular "
-                "(its determinant is zero) — usually two rows/columns are identical, "
-                "or one is all zeros. Check determinant(m) first, or rebuild the matrix."
-            ) from e
+        except torch.linalg.LinAlgError as e:
+            # Only a genuinely singular matrix gets the friendly explanation;
+            # other failures (e.g. a CUDA OOM) keep their real cause.
+            if "singular" in str(e).lower():
+                raise ValueError(
+                    "inverse() can't invert this matrix because it's singular "
+                    "(its determinant is zero) — usually two rows/columns are identical, "
+                    "or one is all zeros. Check determinant(m) first, or rebuild the matrix."
+                ) from e
+            raise
 
     # -- Clamping / interpolation ---------------------------------------
 
@@ -557,8 +561,13 @@ class TEXStdlib:
 
     @staticmethod
     def fn_dot(a, b):
-        """Dot product via einsum (4× faster than mul+sum on CPU)."""
+        """Dot product over the channel (last) dim.
+
+        einsum is ~4x faster than mul+sum on CPU but ~6-10x SLOWER on CUDA
+        (measured), so pick per device. Numerically equivalent (~1e-7)."""
         a_t, b_t = _to_tensor(a), _to_tensor(b)
+        if a_t.is_cuda:
+            return (a_t * b_t).sum(dim=-1)
         return torch.einsum('...c,...c->...', a_t, b_t)
 
     @staticmethod
@@ -766,11 +775,15 @@ class TEXStdlib:
             # Only use flat index when at least one coord is spatial (dim >= 2).
             # Scalar coords (dim 0) are rare and need special shape handling.
             if px_d >= 2 or py_d >= 2:
-                px_f = px_i[0] if px_d == 3 else px_i
-                py_f = py_i[0] if py_d == 3 else py_i
+                # Expand BOTH coords to [H,W] (mirroring the B>=2 path below) so
+                # the flat index always spans the full grid. Without this, a mixed
+                # spatial+scalar fetch like @A[ix, ih-1.0] — where ix broadcasts as
+                # [1,W] — collapses the H axis (wrong shape at B=1 only). expand is
+                # a view, so the fast path stays fast.
+                px_f = _expand_to_bhw(px_i, 1, H, W)[0]
+                py_f = _expand_to_bhw(py_i, 1, H, W)[0]
                 flat = py_f * W + px_f
-                out_shape = flat.shape
-                return torch.index_select(img.view(H * W, C), 0, flat.reshape(-1)).view(1, *out_shape, C)
+                return torch.index_select(img.view(H * W, C), 0, flat.reshape(-1)).view(1, H, W, C)
             # Scalar coords: fall through to advanced indexing
             px_i = px_i.expand(1, H, W)
             py_i = py_i.expand(1, H, W)

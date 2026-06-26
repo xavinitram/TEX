@@ -2046,6 +2046,222 @@ function hideHelpPopup() {
     }
 }
 
+// ─── Cross-node fusion: detect TEX-only chains, draw a compile-block bubble,
+//     and collapse the chain into its terminal at submit time (only the
+//     terminal cooks). All gated behind the TEX.Fusion.* settings. ───────────
+
+let _texFusionEnabled = false;   // TEX.Fusion.enabled  (master toggle, default off)
+let _texShowBubble    = true;    // TEX.Fusion.showBubble
+
+// Litegraph's app.graph.links is a Map — ALWAYS use .get(), never bracket-index
+// (bracket-index silently returns undefined → empty adjacency → silent no-fuse).
+function _texGetLink(id) {
+    const links = app.graph?.links;
+    if (!links) return null;
+    return (typeof links.get === "function") ? links.get(id) : links[id];
+}
+
+// {name: value} for this node's $param widgets (used for both fusion payload + injection).
+function _texParamWidgets(node) {
+    const params = {};
+    for (const w of (node.widgets || [])) if (w._texParam) params[w.name] = w.value;
+    return params;
+}
+
+// All out-links of a node, to any node type: [{targetNode, fromSlotIndex}].
+// fromSlotIndex matters: @OUT is always output slot 0 (output_names = sorted
+// assigned bindings, "OUT" sorts first), so a chain handoff must come from slot 0.
+function _texOutLinks(node) {
+    const out = [];
+    const outputs = node.outputs || [];
+    for (let oi = 0; oi < outputs.length; oi++) {
+        for (const linkId of (outputs[oi].links || [])) {
+            const link = _texGetLink(linkId);
+            if (!link) continue;
+            const tn = app.graph.getNodeById(link.target_id);
+            if (tn) out.push({ targetNode: tn, fromSlotIndex: oi });
+        }
+    }
+    return out;
+}
+
+// The node's single wired IMAGE input (a $param wire is not the chain link), or
+// null if it has 0 or >1. Returns {bindingName, origin: [originIdString, originSlot]}.
+function _texSingleWiredInput(node) {
+    const wired = [];
+    const inputs = node.inputs || [];
+    for (let s = 0; s < inputs.length; s++) {
+        const inp = inputs[s];
+        if (inp.link == null) continue;
+        if (inp._texParam) continue;   // a wire into a $param socket is not the image chain
+        const link = _texGetLink(inp.link);
+        if (!link) continue;
+        wired.push({ bindingName: inp.name,
+                     origin: [String(link.origin_id), link.origin_slot] });
+    }
+    return wired.length === 1 ? wired[0] : null;
+}
+
+// The single upstream TEX node feeding this node (via its sole wired image input), or null.
+function _texImageUpstream(node) {
+    const w = _texSingleWiredInput(node);
+    if (!w) return null;
+    const src = app.graph.getNodeById(parseInt(w.origin[0]));
+    if (!src || src.type !== TEX_NODE_TYPE) return null;
+    return { node: src, bindingName: w.bindingName };
+}
+
+// Maximal linear TEX-only chains. A node is an internal link only when its
+// output goes to EXACTLY ONE consumer and that consumer is a TEX node reached
+// through that node's sole wired input (no fan-out, no external/Preview tap,
+// no multi-input). Each chain is [head, ..., terminal] with length >= 2.
+function _texDetectChains() {
+    // Exclude muted (mode 2) / bypassed (mode 4) nodes: ComfyUI omits them from
+    // the prompt, so they can't be fused and shouldn't be boxed.
+    const texNodes = (app.graph?._nodes || []).filter(
+        n => n.type === TEX_NODE_TYPE && n.mode !== 2 && n.mode !== 4);
+    const soleTexConsumer = new Map();   // nodeId -> the single downstream TEX node, or null
+    for (const n of texNodes) {
+        const outs = _texOutLinks(n);
+        soleTexConsumer.set(n.id,
+            (outs.length === 1 && outs[0].targetNode.type === TEX_NODE_TYPE
+                && outs[0].fromSlotIndex === 0)   // handoff must be the @OUT slot
+                ? outs[0].targetNode : null);
+    }
+    const chains = [];
+    for (const term of texNodes) {
+        if (soleTexConsumer.get(term.id)) continue;   // internal to some chain — skip
+        const chain = [term];
+        let current = term;
+        const seen = new Set([term.id]);
+        while (true) {
+            const up = _texImageUpstream(current);
+            if (!up) break;
+            // up must collapse specifically into `current` (its sole consumer)
+            if (soleTexConsumer.get(up.node.id) !== current) break;
+            if (seen.has(up.node.id)) break;           // cycle guard
+            chain.unshift(up.node);
+            seen.add(up.node.id);
+            current = up.node;
+        }
+        if (chain.length >= 2) chains.push(chain);
+    }
+    return chains;
+}
+
+// Collapse one chain in the prompt dict. CHECK-then-MUTATE: nothing is written
+// unless the whole rewrite is provably safe (no dangling [deletedId, slot] ref
+// can survive — that would KeyError validate_inputs and reject the prompt).
+function _texCollapseOne(out, chain) {
+    const terminal = chain[chain.length - 1];
+    const upstream = chain.slice(0, -1);
+    const chainIds = new Set(chain.map(n => String(n.id)));
+    const termId = String(terminal.id);
+
+    for (const n of chain) if (!out[String(n.id)]) return false;   // all must be in the prompt
+
+    // The terminal's chain-link input (the binding that reads the chain).
+    const termUp = _texImageUpstream(terminal);
+    if (!termUp || termUp.node.id !== upstream[upstream.length - 1].id) return false;
+    const terminalImageInput = termUp.bindingName;
+
+    // Defense in depth: every upstream node's ONLY consumer must be inside the
+    // chain, reached from its @OUT slot (slot 0).
+    for (const n of upstream) {
+        const outs = _texOutLinks(n);
+        if (outs.length !== 1 || outs[0].fromSlotIndex !== 0
+            || !chainIds.has(String(outs[0].targetNode.id))) return false;
+    }
+
+    // Build the upstream payload (source-first) + find the chain source origin.
+    const stages = [];
+    for (const n of upstream) {
+        const nid = String(n.id);
+        const code = out[nid].inputs?.code;
+        if (typeof code !== "string") return false;     // a wired `code` input — can't fuse
+        const wi = _texSingleWiredInput(n);
+        if (!wi) return false;                          // must have exactly one image input
+        stages.push({ code, image_input: wi.bindingName, params: _texParamWidgets(n) });
+    }
+    const headSource = _texSingleWiredInput(upstream[0]);   // [originId, slot] feeding the chain head
+    if (!headSource) return false;
+
+    const delSet = new Set(upstream.map(n => String(n.id)));
+    // Up-front integrity scan: no SURVIVING node may reference a to-be-deleted node.
+    for (const [id, data] of Object.entries(out)) {
+        if (delSet.has(id) || id === termId) continue;
+        for (const v of Object.values(data.inputs || {})) {
+            if (Array.isArray(v) && v.length === 2 && delSet.has(String(v[0]))) return false;
+        }
+    }
+
+    // All safe → mutate: rewire terminal input to the source, attach payload, delete upstream.
+    // The terminal's chain socket carries the source AND is read as the chain — one key.
+    out[termId].inputs[terminalImageInput] = headSource.origin;
+    out[termId].inputs["_tex_chain"] = JSON.stringify({
+        stages,
+        terminal_image_input: terminalImageInput,
+    });
+    for (const id of delSet) delete out[id];
+    return true;
+}
+
+function _texCollapseChains(result) {
+    if (!_texFusionEnabled || !result?.output) return;
+    let chains;
+    try { chains = _texDetectChains(); } catch (e) { console.warn("[TEX] chain detect failed", e); return; }
+    for (const chain of chains) {
+        try {
+            if (!_texCollapseOne(result.output, chain)) {
+                console.info("[TEX] a linked chain was left unfused (an intermediate " +
+                             "result is used elsewhere, or a node has a wired code input) " +
+                             "— running those nodes separately.");
+            }
+        } catch (e) { console.warn("[TEX] fuse skipped (left unfused)", e); }
+    }
+}
+
+function _texRoundRect(ctx, x, y, w, h, r) {
+    if (typeof ctx.roundRect === "function") { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); return; }
+    ctx.beginPath();
+    ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+// Draw the faint compile-block bubble behind each detected chain (canvas space).
+function _texDrawBubbles(ctx) {
+    if (!_texFusionEnabled || !_texShowBubble) return;
+    // Skip detection entirely when zoomed out — the label isn't legible anyway,
+    // so don't pay for chain detection on every zoomed-out pan repaint.
+    if ((app.canvas?.ds?.scale ?? 1) < 0.4) return;
+    let chains;
+    try { chains = _texDetectChains(); } catch (e) { return; }
+    const TH = (typeof LiteGraph !== "undefined" && LiteGraph.NODE_TITLE_HEIGHT) || 24;
+    const alpha = app.canvas?.editor_alpha ?? 1;
+    for (const chain of chains) {
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const n of chain) {
+            const px = n.pos[0], py = n.pos[1], w = n.size[0], h = n.size[1];
+            x0 = Math.min(x0, px); y0 = Math.min(y0, py - TH);
+            x1 = Math.max(x1, px + w); y1 = Math.max(y1, py + h);
+        }
+        const pad = 14;
+        const bx = x0 - pad, by = y0 - pad, bw = (x1 - x0) + 2 * pad, bh = (y1 - y0) + 2 * pad;
+        ctx.save();
+        ctx.globalAlpha = 0.12 * alpha; ctx.fillStyle = "#4FC3F7";
+        _texRoundRect(ctx, bx, by, bw, bh, 12); ctx.fill();
+        ctx.globalAlpha = 0.55 * alpha; ctx.strokeStyle = "#4FC3F7";
+        ctx.lineWidth = 1.5; ctx.setLineDash([7, 5]);
+        _texRoundRect(ctx, bx, by, bw, bh, 12); ctx.stroke();
+        ctx.setLineDash([]); ctx.globalAlpha = 0.85 * alpha;
+        ctx.fillStyle = "#4FC3F7"; ctx.textAlign = "left";
+        ctx.font = "12px 'Cascadia Code', monospace";
+        ctx.fillText(`TEX fused · ${chain.length} stages · 1 cook`, bx + 8, by - 6);
+        ctx.restore();
+    }
+}
+
 // ─── Extension Registration ──────────────────────────────────────────
 
 app.registerExtension({
@@ -2072,6 +2288,11 @@ app.registerExtension({
                         }
                     }
                 }
+                // Cross-node fusion: collapse linked TEX chains into their
+                // terminal (gated by TEX.Fusion.enabled; fail-safe — never
+                // produces a prompt with a dangling reference).
+                try { _texCollapseChains(result); }
+                catch (e) { console.warn("[TEX] fusion collapse skipped", e); }
             }
             return result;
         };
@@ -2157,6 +2378,50 @@ app.registerExtension({
                 }
             },
         });
+
+        // ── Cross-node fusion settings ────────────────────────────────────
+        _texFusionEnabled = app.ui.settings.getSettingValue("TEX.Fusion.enabled", false);
+        _texShowBubble    = app.ui.settings.getSettingValue("TEX.Fusion.showBubble", true);
+
+        app.ui.settings.addSetting({
+            id:           "TEX.Fusion.enabled",
+            name:         "TEX Fusion: Compile linked TEX nodes together",
+            tooltip:      "At queue time, collapse a chain of linked TEX nodes into one " +
+                          "compiled program so only the last node cooks (no intermediate " +
+                          "images are materialized or cached). A chain splits wherever an " +
+                          "intermediate output is previewed or used elsewhere.",
+            type:         "boolean",
+            defaultValue: false,
+            onChange(val) { _texFusionEnabled = val; app.canvas?.setDirty(true, true); },
+        });
+
+        app.ui.settings.addSetting({
+            id:           "TEX.Fusion.showBubble",
+            name:         "TEX Fusion: Show grouping bubble",
+            tooltip:      "Draw a faint box around TEX nodes that will be compiled together.",
+            type:         "boolean",
+            defaultValue: true,
+            onChange(val) { _texShowBubble = val; app.canvas?.setDirty(true, true); },
+        });
+
+        // ── Compile-block bubble: draw behind nodes at the canvas level ───
+        // Wrap onDrawBackground so the box sits under nodes + wires (Houdini look).
+        const _installBubble = () => {
+            const canvas = app.canvas;
+            if (!canvas || canvas._texBubbleHooked) return false;
+            const orig = canvas.onDrawBackground;
+            canvas.onDrawBackground = function (ctx, ...rest) {
+                if (orig) orig.call(this, ctx, ...rest);
+                try { _texDrawBubbles(ctx); } catch (e) { /* never break canvas paint */ }
+            };
+            canvas._texBubbleHooked = true;
+            return true;
+        };
+        if (!_installBubble()) {
+            // Canvas not ready yet — retry on the next frames until it exists.
+            const iv = setInterval(() => { if (_installBubble()) clearInterval(iv); }, 200);
+            setTimeout(() => clearInterval(iv), 5000);
+        }
     },
 
     async beforeRegisterNodeDef(nodeType, nodeData, appRef) {

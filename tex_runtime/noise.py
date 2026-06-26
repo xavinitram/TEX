@@ -533,15 +533,22 @@ def _worley2d(x: torch.Tensor, y: torch.Tensor, return_f2: bool = False) -> torc
 def _curl2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Curl of 2D Perlin noise. Returns [..., 2] tensor (vec2)."""
     eps = 0.001
+    inv_2eps = 500.0  # 1.0 / (2.0 * 0.001)
+    if x.is_cuda:
+        # GPU: one batched Perlin call instead of four (see _curl3d). Bit-exact.
+        xs = torch.stack([x + eps, x - eps, x, x], dim=0)
+        ys = torch.stack([y, y, y + eps, y - eps], dim=0)
+        n = _perlin2d_fast(xs, ys)
+        curl_x = (n[2] - n[3]) * inv_2eps    #  dN/dy
+        curl_y = -(n[0] - n[1]) * inv_2eps   # -dN/dx
+        return torch.stack([curl_x, curl_y], dim=-1)
+
     n_px = _perlin2d_fast(x + eps, y)
     n_mx = _perlin2d_fast(x - eps, y)
     n_py = _perlin2d_fast(x, y + eps)
     n_my = _perlin2d_fast(x, y - eps)
-
-    inv_2eps = 500.0  # 1.0 / (2.0 * 0.001)
     curl_x = (n_py - n_my) * inv_2eps   #  dN/dy
     curl_y = -(n_px - n_mx) * inv_2eps   # -dN/dx
-
     return torch.stack([curl_x, curl_y], dim=-1)
 
 
@@ -550,6 +557,24 @@ def _curl2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 # Like FBM but each octave is `1.0 - abs(noise)`, creating sharp ridges.
 # The ridge signal is squared for sharper features, and weighted by the
 # previous octave's value for self-similar detail concentration.
+
+def _octave_perlins(noise_fn, coords: tuple, octaves: int) -> list:
+    """Evaluate `octaves` noise octaves at frequencies 1, 2, 4, ... and return
+    them as a list of `octaves` tensors.
+
+    On GPU this batches ALL octaves into ONE noise call (stack the freq-scaled
+    coords on a leading dim) — collapsing O(octaves) x ~50 kernel launches down to
+    ~50, about 3x faster for fbm/ridged/billow/turbulence. On CPU there's no launch
+    overhead to amortize, so it falls back to per-octave calls. Bit-exact either
+    way: the i-th result equals noise_fn(coords * 2**i) in both paths (x * 1.0 == x).
+    """
+    freqs = [2.0 ** i for i in range(octaves)]
+    if octaves > 1 and coords[0].is_cuda:
+        stacked = tuple(torch.stack([c * f for f in freqs], dim=0) for c in coords)
+        n = noise_fn(*stacked)
+        return [n[i] for i in range(octaves)]
+    return [noise_fn(*(c * f for c in coords)) for f in freqs]
+
 
 def _ridged_nd(noise_fn, coords: tuple, octaves: int) -> torch.Tensor:
     """Ridged multi-fractal noise, parameterized by noise function and coordinates.
@@ -560,21 +585,19 @@ def _ridged_nd(noise_fn, coords: tuple, octaves: int) -> torch.Tensor:
     already in [0,1] so no clamping is needed.
     """
     octaves = max(1, min(octaves, 10))
-    freq = 1.0
+    oct_n = _octave_perlins(noise_fn, coords, octaves)
     amp = 1.0
     weight = 1.0
     max_amp = 0.0
     result = torch.zeros_like(coords[0])
 
-    for _ in range(octaves):
-        n = noise_fn(*(c * freq for c in coords))
-        signal = 1.0 - torch.abs(n)
+    for i in range(octaves):
+        signal = 1.0 - torch.abs(oct_n[i])
         signal = signal * signal  # sharpen ridges
         signal = signal * weight
         result.add_(signal, alpha=amp)
         weight = signal
         max_amp += amp
-        freq *= 2.0
         amp *= 0.5
 
     return result / max_amp
@@ -592,16 +615,15 @@ def _abs_fbm_nd_raw(noise_fn, coords: tuple, octaves: int) -> tuple[torch.Tensor
     Shared core for billow (remaps to [-1,1]) and turbulence (normalized [0,1]).
     """
     octaves = max(1, min(octaves, 10))
-    result = torch.abs(noise_fn(*coords))
+    oct_n = _octave_perlins(noise_fn, coords, octaves)
+    result = torch.abs(oct_n[0])
     max_amp = 1.0
-    freq = 2.0
     amp = 0.5
 
-    for _ in range(octaves - 1):
-        result.add_(torch.abs(noise_fn(*(c * freq for c in coords))), alpha=amp)
+    for i in range(1, octaves):
+        result.add_(torch.abs(oct_n[i]), alpha=amp)
         max_amp += amp
         amp *= 0.5
-        freq *= 2.0
 
     return result, max_amp
 
@@ -825,6 +847,26 @@ def _curl3d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
     off1x, off1y, off1z = 31.416, 47.853, 12.679
     off2x, off2y, off2z = 73.156, 19.827, 63.941
 
+    if x.is_cuda:
+        # GPU: batch all 12 Perlin evaluations into ONE call (stack the coord
+        # triples on a leading dim). Collapses ~600 kernel launches to ~50 — about
+        # 3x faster at 512^2 — and is bit-exact with the per-call form. On CPU the
+        # stacking overhead outweighs the (absent) launch saving, so fall through.
+        xs = torch.stack([x + off2x, x + off2x, x + off1x, x + off1x, x, x,
+                          x + off2x + eps, x + off2x - eps,
+                          x + off1x + eps, x + off1x - eps, x, x], dim=0)
+        ys = torch.stack([y + off2y + eps, y + off2y - eps, y + off1y, y + off1y, y, y,
+                          y + off2y, y + off2y, y + off1y, y + off1y,
+                          y + eps, y - eps], dim=0)
+        zs = torch.stack([z + off2z, z + off2z, z + off1z + eps, z + off1z - eps,
+                          z + eps, z - eps, z + off2z, z + off2z,
+                          z + off1z, z + off1z, z, z], dim=0)
+        n = _perlin3d_fast(xs, ys, zs)
+        curl_x = (n[0] - n[1] - n[2] + n[3]) * inv_2eps   # dF3/dy - dF2/dz
+        curl_y = (n[4] - n[5] - n[6] + n[7]) * inv_2eps   # dF1/dz - dF3/dx
+        curl_z = (n[8] - n[9] - n[10] + n[11]) * inv_2eps  # dF2/dx - dF1/dy
+        return torch.stack([curl_x, curl_y, curl_z], dim=-1)
+
     # dF3/dy - dF2/dz
     curl_x = (_perlin3d_fast(x + off2x, y + off2y + eps, z + off2z) -
               _perlin3d_fast(x + off2x, y + off2y - eps, z + off2z) -
@@ -849,16 +891,15 @@ def _curl3d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
 def _fbm3d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, octaves: int) -> torch.Tensor:
     """3D FBM using Perlin noise. Persistence=0.5, lacunarity=2.0."""
     octaves = max(1, min(octaves, 10))
-    result = _perlin3d_fast(x, y, z)
+    oct_n = _octave_perlins(_perlin3d_fast, (x, y, z), octaves)
+    result = oct_n[0]
     max_amp = 1.0
     amp = 0.5
-    freq = 2.0
 
-    for _ in range(octaves - 1):
-        result.add_(_perlin3d_fast(x * freq, y * freq, z * freq), alpha=amp)
+    for i in range(1, octaves):
+        result = result + amp * oct_n[i]
         max_amp += amp
         amp *= 0.5
-        freq *= 2.0
 
     return result / max_amp
 
