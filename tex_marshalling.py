@@ -10,6 +10,7 @@ conversion (hex colors, comma-separated vectors, booleans).
 from __future__ import annotations
 
 import hashlib
+import struct
 import torch
 from typing import Any
 
@@ -36,12 +37,13 @@ def tensor_fingerprint(t: torch.Tensor) -> str:
     # mean host-side.
     s = t.sum(dtype=torch.float32)
     host = torch.cat([samples, s.reshape(1)]).cpu()
+    sample_vals = host[:-1].tolist()
     total = host[-1].item()
     mean = total / max(n, 1)
-    # Hash the raw sample bytes rather than formatting 256 floats into the string
-    # (the old .tolist() + f-string was ~25x the cost of the hash on the host side,
-    # and ran for every input every frame). Full-precision → more discriminating.
-    digest = hashlib.sha256(host[:-1].contiguous().numpy().tobytes()).hexdigest()[:16]
+    # Hash the packed sample bytes instead of formatting 256 floats into the key
+    # (the old f-string over the full list was ~25x the cost). struct.pack is
+    # C-level and numpy-free — TEX is torch-only and CI runs PyTorch without numpy.
+    digest = hashlib.sha256(struct.pack(f"{len(sample_vals)}f", *sample_vals)).hexdigest()[:16]
     return f"{t.shape}:{t.dtype}:{n}:{total:.6g}:{mean:.6g}:{digest}"
 
 
