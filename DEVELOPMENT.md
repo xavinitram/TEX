@@ -10,12 +10,14 @@ TEX_Wrangle/
   tex_node.py              # ComfyUI node class (device/compile_mode params, UI integration)
   tex_marshalling.py       # Input marshalling, type inference, output preparation
   tex_cache.py             # Two-tier compilation cache (memory LRU + disk pickle)
+  tex_fusion.py            # Cross-node fusion: splice a linked TEX chain into one program
   tex_compiler/
     lexer.py               # Tokenizer
     parser.py              # Recursive-descent parser -> AST
     ast_nodes.py           # AST node definitions (with __slots__)
     type_checker.py        # Static type analysis
-    optimizer.py           # Constant folding + algebraic simplification
+    optimizer.py           # Const-fold, algebraic simplify, DCE, CSE, LICM, small-loop unroll
+    diagnostics.py         # Structured error diagnostics (codes, carets, suggestions, hints)
     stdlib_signatures.py   # Function signatures for type checking
   tex_runtime/
     interpreter.py         # Tree-walking tensor evaluator
@@ -80,7 +82,7 @@ Source Code
 
 **TypeChecker** (`tex_compiler/type_checker.py`): Walks the AST and assigns a `TEXType` to every expression node. Enforces type compatibility rules, validates function signatures, and manages variable scopes. Produces a `type_map` dict mapping AST node `id()` -> `TEXType`. Fetch/sample calls return the binding's actual type (VEC3 for IMAGE, FLOAT for MASK) rather than a hardcoded VEC4.
 
-**Optimizer** (`tex_compiler/optimizer.py`): Constant folding and algebraic simplification pass. Reduces expressions like `x * 1.0` -> `x` and pre-evaluates constant sub-expressions.
+**Optimizer** (`tex_compiler/optimizer.py`): Constant folding and algebraic simplification (`x * 1.0` -> `x`, strength reduction like `x / c` -> `x * (1/c)`, pre-evaluating constant sub-expressions), plus dead-code elimination (DCE), common-subexpression elimination (CSE), loop-invariant code motion (LICM), and small-loop unrolling. Optimizer-synthesized nodes are re-type-checked from scratch so the type map stays complete.
 
 **Interpreter** (`tex_runtime/interpreter.py`): Tree-walking evaluator that executes the AST using PyTorch tensor operations. Reads types from `type_map` to guide evaluation (e.g. choosing `torch.where` for if/else). Produces output tensors/strings for all assigned `@name` bindings. Used as the default execution path.
 
@@ -231,6 +233,16 @@ The JavaScript frontend (`js/tex_extension.js`) provides:
 
 ---
 
+## Cross-Node Fusion
+
+`tex_fusion.py` lets a linear chain of linked TEX nodes compile and run as **one** program, so only the terminal node executes — intermediate nodes never materialize or cache an image. It is opt-in via the `TEX Fusion` ComfyUI settings.
+
+- **Frontend** (`js/tex_extension.js`): at `graphToPrompt` time, a maximal TEX-only chain is detected and collapsed into its terminal node. The upstream nodes are **deleted from the submitted prompt** (so the executor never schedules them), their `{code, params}` are serialized into the terminal's `_tex_chain` input, and a faint Houdini-style bubble is drawn behind the fused region. An integrity scan guarantees the rewritten prompt never contains a dangling link.
+- **Backend** (`tex_fusion.py`): `prepare_fused` / `compile_fused` splice the stages — each non-terminal `@OUT` becomes a typed local, the next stage's chain input reads that local, and every user identifier (locals, `@`-inputs, `$`-params, user functions) is namespaced per stage (`_s{i}_`) so independently-authored stages never collide. The merged program is re-type-checked and re-optimized through the normal pipeline, making it **bit-equivalent** to running the stages sequentially.
+- **Chain breaks** raise `FusionError` (caught in `tex_node.execute` and shown cleanly, never as a bug): a scatter write to `@OUT`, more than one output, `@OUT` used inside a loop, or a non-image/mask handoff type. The frontend additionally stops a chain at a Preview/Save tap, a fan-out, or a multi-input node, leaving those nodes to run normally.
+
+Validated by `benchmarks/fusion_splice_test.py` and `benchmarks/fusion_regression_test.py` (fused output == sequential, including cross-stage name collisions and every chain-break case).
+
 ## How-To Guides
 
 ### Adding a New Stdlib Function
@@ -333,7 +345,7 @@ Adding a new TEX type requires changes across the entire pipeline:
 ```bash
 cd custom_nodes/TEX_Wrangle
 
-# Full suite via pytest (77 test functions, ~1215 sub-tests)
+# Full suite (~79 test functions, ~1358 sub-tests)
 python -m pytest tests/ -v
 
 # Skip slow timing tests
@@ -353,10 +365,16 @@ See `tests/README.md` for the test suite structure, sub-test pattern, and how to
 See `benchmarks/README.md` for full documentation. Quick start:
 
 ```bash
+# Device x cache x compile matrix (CUDA-synchronized) — the canonical perf harness
+python benchmarks/eight_config_bench.py
+
+# GPU resolution-scaling + kernel-launch profile (launch-bound vs compute-bound)
+python benchmarks/gpu_profile.py
+
 # 4-scenario benchmark (compile off/on × cold/warm)
 python benchmarks/four_scenario_bench.py
 
-# Legacy synthetic benchmarks
+# Synthetic + example program benchmarks
 python benchmarks/run_benchmarks.py
 ```
 
@@ -370,11 +388,11 @@ TEX uses structured diagnostics (`tex_compiler/diagnostics.py`) to produce clear
 |-------|-------|----------|
 | `E1xxx` | Lexer | Unterminated strings, invalid characters, malformed numbers |
 | `E2xxx` | Parser | Unexpected tokens, missing semicolons, foreign keywords |
-| `E3xxx` | Type checker — names & scope | Undefined variables, undefined functions, duplicate declarations |
-| `E4xxx` | Type checker — types & coercions | Type mismatches, incompatible operands, failed promotions |
+| `E3xxx` | Type checker — names, scope, types & coercions | Undefined variables, duplicate declarations, type mismatches, failed promotions |
+| `E4xxx` | Type checker — unrecognized construct (catch-all) | A construct the type checker doesn't recognize |
 | `E5xxx` | Type checker — function signatures | Wrong argument count, argument type errors |
-| `E6xxx` | Runtime (interpreter) | Loop iteration limit, division by zero, out-of-bounds access |
-| `W7xxx` | Warnings | Unused variables, redundant casts, shadowed names |
+| `E6xxx` | Runtime (interpreter) | Loop limit, division by zero, out-of-bounds; `E6050` unknown function, `E6051` a function's runtime failure |
+| `W7xxx` | Warnings (reserved range) | Non-fatal advisories |
 
 ### Voice and Tone
 

@@ -45,6 +45,8 @@ f$blend = 0.5;
 
 `u` and `v` are normalized coordinates that range from 0 to 1 across the image. `vec3(r, g, b)` creates a color. This produces a gradient that goes from red at the top-left to yellow-green at the bottom-right, with a constant blue channel of 0.5. You still need an input connected (e.g. `@ref`) so TEX knows what resolution to use.
 
+Besides `u`/`v`, you can use `ix`/`iy` (pixel coords), `iw`/`ih` (image size), `px`/`py` (`1/iw`, `1/ih`), `fi`/`fn` (frame index/count), `ic` (latent channels), and the constants `PI`, `TAU`, `E`.
+
 ---
 
 ## 5. Conditional Color
@@ -96,8 +98,9 @@ Write to any `@name` to create an output. Here, `darkened` and `brightness_mask`
 
 ## What's Next?
 
-- Click the **?** icon on any TEX node for the full function reference (80+ functions).
+- Click the **?** icon on any TEX node for the full function reference (124 functions).
 - Browse the `examples/` folder for more patterns: blur, vignette, edge detection, noise, and more.
 - Types: `float`, `int`, `vec3` (RGB), `vec4` (RGBA) — TEX infers types automatically.
 - Use `@name` for any descriptive input name (e.g., `@base`, `@mask`, `@frames`).
 - Output types (IMAGE, MASK, FLOAT, STRING, LATENT) are auto-inferred from your code.
+- Chaining several TEX nodes? Turn on **Settings → TEX Fusion** to compile the whole chain into one program so only the last node runs.

@@ -10,11 +10,12 @@ Thanks for your interest in contributing to TEX Wrangle. This guide covers the e
    git clone https://github.com/xavinitram/TEX.git TEX_Wrangle
    ```
 2. Python 3.10+ is required. The only dependency beyond the standard library is PyTorch (provided by ComfyUI).
-3. Run tests from the project root:
+3. Run the full test suite:
    ```
-   cd TEX_Wrangle
-   python -m pytest tests/ -v
+   cd TEX_Wrangle/tests
+   python run_all.py
    ```
+   `run_all.py` is the canonical runner (~1358 sub-tests, no extra dependencies). `python -m pytest tests/ -v` also works if you have pytest installed.
 
 No additional packages or build steps are needed for the core compiler and runtime.
 
@@ -27,8 +28,25 @@ No additional packages or build steps are needed for the core compiler and runti
 ## Adding a Standard Library Function
 
 1. **Declare the signature** in `tex_compiler/stdlib_signatures.py` -- specify the function name, parameter types, and return type.
-2. **Implement the function** in `tex_runtime/stdlib.py` using PyTorch tensor operations.
-3. **Add tests** in the appropriate file under `tests/` (see `tests/README.md` for where each type of test belongs).
+2. **Implement the function** as `fn_<name>` in `tex_runtime/stdlib.py` using PyTorch tensor operations.
+3. **Register it** in the `get_functions()` dispatch dict in `tex_runtime/stdlib.py` (maps the TEX name to your `fn_<name>`), so the interpreter and codegen can resolve it.
+4. **Add tests** in the appropriate file under `tests/` (see `tests/README.md` for where each type of test belongs).
+
+## Error Codes & Diagnostics
+
+User-facing errors flow through `tex_compiler/diagnostics.py` and render as: message → source-line caret → a `Try:` suggestion → a `Help:` hint → a trailing `Error Code: Exxxx`. Codes are grouped by stage:
+
+| Range | Stage |
+|-------|-------|
+| `E1xxx` | Lexer |
+| `E2xxx` | Parser |
+| `E3xxx` | Type checker (names, scope, types & coercions) |
+| `E4xxx` | Unrecognized construct (catch-all) |
+| `E5xxx` | Stdlib signatures |
+| `E6xxx` | Runtime / interpreter (e.g. `E6050` unknown function, `E6051` a function's runtime failure) |
+| `W7xxx` | Warnings |
+
+Assign a **new** code for a new condition rather than reusing one — codes are stable anchors that map to documentation, so never renumber an existing one.
 
 ## Editor Build
 

@@ -10,7 +10,7 @@
   <img src="TEX_node.webp" alt="TEX Wrangle node" width="500">
 </p>
 
-A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 100+ stdlib functions.
+A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 124 stdlib functions.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://python.org)
@@ -70,7 +70,8 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **GPU acceleration** | CPU or GPU with auto device detection |
 | **`torch.compile`** | Optional JIT compilation for faster repeated execution |
 | **Two-tier caching** | In-memory LRU + disk persistence for instant re-execution |
-| **100+ stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions |
+| **Cross-node fusion** | Compile a chain of linked TEX nodes into one program — only the last node cooks (opt-in via Settings → TEX Fusion) |
+| **124 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |
 | **Snippets** | Right-click → Snippets for 114 built-in examples; save your own with folder organization |
@@ -156,11 +157,12 @@ while (val < 100.0) { val = val * 2.0; }
 | `ix`, `iy` | Pixel coordinates (integers) |
 | `u`, `v` | Normalized coordinates (0.0 – 1.0) |
 | `iw`, `ih` | Image dimensions |
+| `px`, `py` | Pixel size in UV space (`1/iw`, `1/ih`) |
 | `fi`, `fn` | Frame index / frame count |
 | `ic` | Latent channel count (0 for images) |
-| `PI`, `E` | Math constants |
+| `PI`, `TAU`, `E` | Math constants (`TAU` = 2·PI) |
 
-### Standard Library (100+ functions)
+### Standard Library (124 functions)
 
 **Math:** `sin` `cos` `tan` `asin` `acos` `atan` `atan2` `sinh` `cosh` `tanh` `sqrt` `pow` `pow2` `pow10` `exp` `log` `log2` `log10` `abs` `sign` `floor` `ceil` `round` `fract` `mod` `hypot` `degrees` `radians` `spow` `sdiv` `isnan` `isinf`
 
@@ -170,7 +172,9 @@ while (val < 100.0) { val = val * 2.0; }
 
 **Color:** `luma` `hsv2rgb` `rgb2hsv`
 
-**Noise:** `perlin` `simplex` `fbm`
+**Noise:** `perlin` `simplex` `fbm` `ridged` `billow` `turbulence` `flow` `curl` `worley_f1` `worley_f2` `voronoi` `alligator`
+
+**SDF:** `sdf_circle` `sdf_box` `sdf_line` `sdf_polygon` `smin` `smax`
 
 **Sampling:**
 
@@ -218,7 +222,7 @@ The `examples/` directory contains 114 ready-to-use snippets:
 
 **1×1 output with no inputs:** Procedural code without image inputs produces 1×1 because output resolution comes from connected inputs. Connect an image to set the size.
 
-**Variable `v` conflict:** The built-in `v` (normalized y-coordinate) is always defined. Use `val` or `value` instead. Same for `u`, `ix`, `iy`, `iw`, `ih`, `fi`, `fn`, `ic`, `PI`, `E`.
+**Variable `v` conflict:** The built-in `v` (normalized y-coordinate) is always defined. Use `val` or `value` instead. Same for `u`, `ix`, `iy`, `iw`, `ih`, `px`, `py`, `fi`, `fn`, `ic`, `PI`, `TAU`, `E`.
 
 **torch.compile on Windows:** Install Visual Studio Build Tools with "Desktop development with C++" for full `inductor` support. The default `none` mode works everywhere.
 
@@ -233,16 +237,16 @@ The `examples/` directory contains 114 ready-to-use snippets:
 
 ## Performance
 
-v0.9.0 is **3.4× faster** overall than v0.6.0 across all benchmark scenarios. Typical CPU times at 512×512 (compile on, warm start):
+Each program is compiled to PyTorch and cached (in-memory LRU + disk), so a warm run at 512×512 is **~0.7 ms on CPU**. Recent work focuses on GPU throughput (all bit-exact or numerically equivalent):
 
-| Program | v0.8.0 | v0.9.0 | Speedup |
-|---------|--------|--------|---------|
-| passthrough | 0.03 ms | 0.03 ms | 1.0x |
-| color_grade | 13.4 ms | 8.5 ms | 1.6x |
-| noise_fbm | 178 ms | 22 ms | **9.0x** |
-| fetch_kernel | 42 ms | 25 ms | 1.7x |
+| Area | Win |
+|------|-----|
+| Noise (`curl`, `fbm`, `ridged`, `billow`, `turbulence`) | Octaves batched into one Perlin call on CUDA — **~3.2×** |
+| `dot()` / `luma` / `normalize` | `mul + sum` instead of `einsum` on CUDA — **~9.8×** (vec3) |
+| Input fingerprinting | Sample-byte hashing — **~2×** per input per frame |
+| Chained nodes | Image/mask outputs stay on the compute device (no CPU↔GPU round-trip); linked chains can be compiled together — see **Settings → TEX Fusion** |
 
-Run `python benchmarks/four_scenario_bench.py` for results on your system.
+Benchmark harnesses live in `benchmarks/` — `eight_config_bench.py` (device × cache × compile matrix) and `gpu_profile.py` (resolution-scaling), both `torch.cuda.synchronize()`-bracketed.
 
 ## Development
 
