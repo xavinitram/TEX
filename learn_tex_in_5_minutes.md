@@ -103,4 +103,4 @@ Write to any `@name` to create an output. Here, `darkened` and `brightness_mask`
 - Types: `float`, `int`, `vec3` (RGB), `vec4` (RGBA) — TEX infers types automatically.
 - Use `@name` for any descriptive input name (e.g., `@base`, `@mask`, `@frames`).
 - Output types (IMAGE, MASK, FLOAT, STRING, LATENT) are auto-inferred from your code.
-- Chaining several TEX nodes? Turn on **Settings → TEX Fusion** to compile the whole chain into one program so only the last node runs.
+- Chaining several TEX nodes? **TEX Fusion** (on by default — see Settings) compiles the whole chain into one program so only the last node runs.

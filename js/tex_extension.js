@@ -975,9 +975,12 @@ function _texEnsureHelpBtn(node) {
     return btn;
 }
 
-function _texPositionOverlaysFromRect(node, rect, scale) {
+function _texPositionOverlaysFromRect(node, rect, scale, titleInside) {
     // rect: { left, top, width } in screen (client) coordinates
     // scale: zoom level — overlays scale proportionally with the node
+    // titleInside: true when rect.top is the node's OUTER top (title bar included,
+    //   as getBoundingClientRect returns in Nodes 2.0); false when rect.top is the
+    //   node BODY top with the title bar above it (the Nodes 1.0 canvas convention).
     const tooSmall = scale < 0.3;
 
     // ── Error banner ──
@@ -1007,9 +1010,13 @@ function _texPositionOverlaysFromRect(node, rect, scale) {
         btn.style.width = btnSize + "px";
         btn.style.height = btnSize + "px";
         btn.style.fontSize = (12 * scale) + "px";
-        // Position to the left of the "TEX" badge (badge ~30px from right in canvas coords)
-        btn.style.left = (rect.left + rect.width - btnSize - 36 * scale) + "px";
-        btn.style.top = (rect.top - btnSize - 2) + "px";
+        // Nodes 1.0 draws a "TEX" badge at the far right, so the ? goes to its left
+        // (36px in). Nodes 2.0 has no badge, so the ? can sit nearer the edge.
+        btn.style.left = (rect.left + rect.width - btnSize - (titleInside ? 14 : 36) * scale) + "px";
+        // Nodes 1.0: rect.top is the body top, so the button sits just above it (in
+        // the title bar). Nodes 2.0: rect.top already includes the title bar, so
+        // place the button down inside that top edge — otherwise it floats above.
+        btn.style.top = (titleInside ? rect.top + 6 * scale : rect.top - btnSize - 2) + "px";
     }
 }
 
@@ -1083,7 +1090,7 @@ function _texOverlayRafLoop() {
             left: rect.left,
             top: rect.top,
             width: rect.width,
-        }, scale);
+        }, scale, true);   // Nodes 2.0: rect.top includes the title bar
     }
     requestAnimationFrame(_texOverlayRafLoop);
 }
@@ -2050,8 +2057,9 @@ function hideHelpPopup() {
 //     and collapse the chain into its terminal at submit time (only the
 //     terminal cooks). All gated behind the TEX.Fusion.* settings. ───────────
 
-let _texFusionEnabled = false;   // TEX.Fusion.enabled  (master toggle, default off)
+let _texFusionEnabled = true;    // TEX.Fusion.enabled  (master toggle, default on)
 let _texShowBubble    = true;    // TEX.Fusion.showBubble
+let _texHullShape     = true;    // TEX.Fusion.bubbleHull (convex hull vs rectangle)
 
 // Litegraph's app.graph.links is a Map — ALWAYS use .get(), never bracket-index
 // (bracket-index silently returns undefined → empty adjacency → silent no-fuse).
@@ -2229,37 +2237,129 @@ function _texRoundRect(ctx, x, y, w, h, r) {
     ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
 }
 
+// Convex hull (Andrew's monotone chain) of a set of {x, y} points.
+function _texConvexHull(points) {
+    const pts = points.slice().sort((a, b) => a.x - b.x || a.y - b.y);
+    if (pts.length < 3) return pts;
+    const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    const lower = [];
+    for (const p of pts) {
+        while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+        lower.push(p);
+    }
+    const upper = [];
+    for (let i = pts.length - 1; i >= 0; i--) {
+        const p = pts[i];
+        while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+        upper.push(p);
+    }
+    lower.pop(); upper.pop();
+    return lower.concat(upper);
+}
+
+// Trace a rounded polygon (smooth corners) through the given points.
+function _texRoundedPolyPath(ctx, pts, radius) {
+    const n = pts.length;
+    if (n < 3) return;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+        const prev = pts[(i - 1 + n) % n], curr = pts[i], next = pts[(i + 1) % n];
+        const v1x = curr.x - prev.x, v1y = curr.y - prev.y;
+        const v2x = next.x - curr.x, v2y = next.y - curr.y;
+        const len1 = Math.hypot(v1x, v1y) || 1, len2 = Math.hypot(v2x, v2y) || 1;
+        const r = Math.min(radius, len1 / 2, len2 / 2);
+        const p1x = curr.x - v1x / len1 * r, p1y = curr.y - v1y / len1 * r;
+        const p2x = curr.x + v2x / len2 * r, p2y = curr.y + v2y / len2 * r;
+        if (i === 0) ctx.moveTo(p1x, p1y); else ctx.lineTo(p1x, p1y);
+        ctx.quadraticCurveTo(curr.x, curr.y, p2x, p2y);
+    }
+    ctx.closePath();
+}
+
+// Is the point (x, y) inside the convex polygon `pts`?
+function _texPointInConvex(pts, x, y) {
+    if (pts.length < 3) return false;   // empty / degenerate hull contains nothing
+    let sign = 0;
+    for (let i = 0; i < pts.length; i++) {
+        const a = pts[i], b = pts[(i + 1) % pts.length];
+        const cr = (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x);
+        if (cr !== 0) {
+            const s = cr > 0 ? 1 : -1;
+            if (sign === 0) sign = s; else if (s !== sign) return false;
+        }
+    }
+    return true;
+}
+
+// Compile-block accent colour, shared by the fill, stroke, and hover label.
+const BUBBLE_COLOR = "#4FC3F7";
+
+// Per-frame cache of the visible bubbles (shape + label), populated by
+// _texDrawBubbles on the background pass and read by the hover-label foreground
+// pass. Each entry: { hull: [{x,y}], text, lx, ly }.
+let _texBubbleCache = [];
+// Index of the bubble the mouse is currently inside (-1 = none) — drives the
+// foreground repaint throttle so we only repaint when the hovered bubble changes.
+let _texBubbleHover = -1;
+
 // Draw the faint compile-block bubble behind each detected chain (canvas space).
+// A rounded convex hull (Houdini-style) when TEX.Fusion.bubbleHull is on, else a
+// rounded rectangle — both with a faint fill and a fine continuous outline. The
+// label is NOT drawn here; it's drawn on hover by _texDrawBubbleLabels.
 function _texDrawBubbles(ctx) {
+    _texBubbleCache = [];
     if (!_texFusionEnabled || !_texShowBubble) return;
-    // Skip detection entirely when zoomed out — the label isn't legible anyway,
-    // so don't pay for chain detection on every zoomed-out pan repaint.
+    // Skip detection when zoomed out — the label isn't legible and detection on
+    // every zoomed-out pan repaint isn't worth it.
     if ((app.canvas?.ds?.scale ?? 1) < 0.4) return;
     let chains;
     try { chains = _texDetectChains(); } catch (e) { return; }
     const TH = (typeof LiteGraph !== "undefined" && LiteGraph.NODE_TITLE_HEIGHT) || 24;
     const alpha = app.canvas?.editor_alpha ?? 1;
+    const pad = 16;
     for (const chain of chains) {
+        // Padded corner points of every node (title bar included) + the group's
+        // bounding box (used for the rectangle fallback and label placement).
+        const pts = [];
         let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
         for (const n of chain) {
-            const px = n.pos[0], py = n.pos[1], w = n.size[0], h = n.size[1];
-            x0 = Math.min(x0, px); y0 = Math.min(y0, py - TH);
-            x1 = Math.max(x1, px + w); y1 = Math.max(y1, py + h);
+            const ax = n.pos[0] - pad, ay = n.pos[1] - TH - pad;
+            const bx = n.pos[0] + n.size[0] + pad, by = n.pos[1] + n.size[1] + pad;
+            pts.push({ x: ax, y: ay }, { x: bx, y: ay }, { x: bx, y: by }, { x: ax, y: by });
+            x0 = Math.min(x0, ax); y0 = Math.min(y0, ay);
+            x1 = Math.max(x1, bx); y1 = Math.max(y1, by);
         }
-        const pad = 14;
-        const bx = x0 - pad, by = y0 - pad, bw = (x1 - x0) + 2 * pad, bh = (y1 - y0) + 2 * pad;
+        const useHull = _texHullShape && pts.length >= 3;
+        const poly = useHull ? _texConvexHull(pts)
+            : [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }];
         ctx.save();
-        ctx.globalAlpha = 0.12 * alpha; ctx.fillStyle = "#4FC3F7";
-        _texRoundRect(ctx, bx, by, bw, bh, 12); ctx.fill();
-        ctx.globalAlpha = 0.55 * alpha; ctx.strokeStyle = "#4FC3F7";
-        ctx.lineWidth = 1.5; ctx.setLineDash([7, 5]);
-        _texRoundRect(ctx, bx, by, bw, bh, 12); ctx.stroke();
-        ctx.setLineDash([]); ctx.globalAlpha = 0.85 * alpha;
-        ctx.fillStyle = "#4FC3F7"; ctx.textAlign = "left";
-        ctx.font = "12px 'Cascadia Code', monospace";
-        ctx.fillText(`TEX fused · ${chain.length} stages · 1 cook`, bx + 8, by - 6);
+        if (useHull) _texRoundedPolyPath(ctx, poly, 18);
+        else _texRoundRect(ctx, x0, y0, x1 - x0, y1 - y0, 12);
+        ctx.globalAlpha = 0.10 * alpha; ctx.fillStyle = BUBBLE_COLOR; ctx.fill();
+        ctx.globalAlpha = 0.6 * alpha; ctx.strokeStyle = BUBBLE_COLOR;
+        ctx.lineWidth = 1; ctx.setLineDash([]);   // fine, continuous line
+        ctx.stroke();
         ctx.restore();
+        if (poly.length >= 3) {
+            _texBubbleCache.push({ hull: poly, text: `TEX fused · ${chain.length} stages · 1 cook`,
+                                   lx: x0 + 10, ly: y0 - 6 });
+        }
     }
+}
+
+// Foreground pass: draw a bubble's label only while the mouse hovers its area.
+function _texDrawBubbleLabels(ctx) {
+    if (!_texFusionEnabled || !_texShowBubble || _texBubbleCache.length === 0) return;
+    const m = app.canvas?.graph_mouse;
+    if (!m) return;
+    const alpha = app.canvas?.editor_alpha ?? 1;
+    ctx.save();
+    ctx.globalAlpha = 0.9 * alpha; ctx.fillStyle = BUBBLE_COLOR;
+    ctx.textAlign = "left"; ctx.font = "12px 'Cascadia Code', monospace";
+    for (const b of _texBubbleCache) {
+        if (_texPointInConvex(b.hull, m[0], m[1])) ctx.fillText(b.text, b.lx, b.ly);
+    }
+    ctx.restore();
 }
 
 // ─── Extension Registration ──────────────────────────────────────────
@@ -2380,8 +2480,9 @@ app.registerExtension({
         });
 
         // ── Cross-node fusion settings ────────────────────────────────────
-        _texFusionEnabled = app.ui.settings.getSettingValue("TEX.Fusion.enabled", false);
+        _texFusionEnabled = app.ui.settings.getSettingValue("TEX.Fusion.enabled", true);
         _texShowBubble    = app.ui.settings.getSettingValue("TEX.Fusion.showBubble", true);
+        _texHullShape     = app.ui.settings.getSettingValue("TEX.Fusion.bubbleHull", true);
 
         app.ui.settings.addSetting({
             id:           "TEX.Fusion.enabled",
@@ -2391,29 +2492,52 @@ app.registerExtension({
                           "images are materialized or cached). A chain splits wherever an " +
                           "intermediate output is previewed or used elsewhere.",
             type:         "boolean",
-            defaultValue: false,
+            defaultValue: true,
             onChange(val) { _texFusionEnabled = val; app.canvas?.setDirty(true, true); },
         });
 
         app.ui.settings.addSetting({
             id:           "TEX.Fusion.showBubble",
             name:         "TEX Fusion: Show grouping bubble",
-            tooltip:      "Draw a faint box around TEX nodes that will be compiled together.",
+            tooltip:      "Draw a faint outline around TEX nodes that will be compiled together.",
             type:         "boolean",
             defaultValue: true,
             onChange(val) { _texShowBubble = val; app.canvas?.setDirty(true, true); },
         });
 
-        // ── Compile-block bubble: draw behind nodes at the canvas level ───
-        // Wrap onDrawBackground so the box sits under nodes + wires (Houdini look).
+        app.ui.settings.addSetting({
+            id:           "TEX.Fusion.bubbleHull",
+            name:         "TEX Fusion: Bubble as convex hull",
+            tooltip:      "Wrap the fused nodes in a Houdini-style rounded convex hull. " +
+                          "Turn off for a plain rounded rectangle.",
+            type:         "boolean",
+            defaultValue: true,
+            onChange(val) { _texHullShape = val; app.canvas?.setDirty(true, true); },
+        });
+
+        // ── Compile-block bubble: shape behind nodes (onDrawBackground), label
+        //    on hover above nodes (onDrawForeground). ───
         const _installBubble = () => {
             const canvas = app.canvas;
             if (!canvas || canvas._texBubbleHooked) return false;
-            const orig = canvas.onDrawBackground;
-            canvas.onDrawBackground = function (ctx, ...rest) {
-                if (orig) orig.call(this, ctx, ...rest);
-                try { _texDrawBubbles(ctx); } catch (e) { /* never break canvas paint */ }
+            // Wrap a canvas draw hook, preserving any handler already installed.
+            const wrap = (name, draw) => {
+                const orig = canvas[name];
+                canvas[name] = function (ctx, ...rest) {
+                    if (orig) orig.call(this, ctx, ...rest);
+                    try { draw(ctx); } catch (e) { /* never break canvas paint */ }
+                };
             };
+            wrap("onDrawBackground", _texDrawBubbles);       // shape, behind nodes
+            wrap("onDrawForeground", _texDrawBubbleLabels);  // hover label, above nodes
+            // Repaint the foreground only when the mouse crosses a bubble boundary,
+            // so the hover label appears/clears without a repaint on every move.
+            canvas.canvas?.addEventListener("mousemove", () => {
+                if (!_texFusionEnabled || !_texShowBubble || !_texBubbleCache.length) return;
+                const m = canvas.graph_mouse;
+                const idx = m ? _texBubbleCache.findIndex(b => _texPointInConvex(b.hull, m[0], m[1])) : -1;
+                if (idx !== _texBubbleHover) { _texBubbleHover = idx; canvas.setDirty(true); }
+            });
             canvas._texBubbleHooked = true;
             return true;
         };
