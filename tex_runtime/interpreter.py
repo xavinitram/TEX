@@ -27,7 +27,7 @@ from ..tex_compiler.ast_nodes import (
     collect_assigned_vars,
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
-from .stdlib import TEXStdlib, SAFE_EPSILON, VEC_CHANNELS
+from .stdlib import TEXStdlib, SAFE_EPSILON, VEC_CHANNELS, _scalar_from_tensor
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
@@ -421,6 +421,11 @@ class Interpreter:
         self.env[node.name] = value
         # New declaration invalidates in-place readiness (value may be aliased)
         self._inplace_ready.discard(node.name)
+        # A bare-Identifier initializer (e.g. `vec4 y = x;`) aliases the source's
+        # buffer; invalidate the source too so a later in-place op on it clones
+        # first instead of mutating this declaration's shared buffer.
+        if isinstance(node.initializer, Identifier):
+            self._inplace_ready.discard(node.initializer.name)
 
     def _exec_array_decl(self, node: ArrayDecl):
         """Execute an array declaration."""
@@ -496,7 +501,7 @@ class Interpreter:
                 return tensor
             if c < channels:
                 # Pad with 1.0 (alpha) to reach target channels
-                pad = torch.ones(*tensor.shape[:-1], channels - c, device=tensor.device)
+                pad = torch.ones(*tensor.shape[:-1], channels - c, dtype=tensor.dtype, device=tensor.device)
                 return torch.cat([tensor, pad], dim=-1)
             # Truncate extra channels
             return tensor[..., :channels]
@@ -563,6 +568,13 @@ class Interpreter:
 
         if isinstance(target, Identifier):
             self.env[target.name] = value
+            # The new value may alias another variable's buffer (e.g. `y = x`).
+            # Invalidate in-place readiness for the target so a fresh clone
+            # happens before its next in-place op, and for a bare-Identifier
+            # source so a later in-place op on it does not corrupt this alias.
+            self._inplace_ready.discard(target.name)
+            if isinstance(node.value, Identifier):
+                self._inplace_ready.discard(node.value.name)
 
         elif isinstance(target, BindingRef):
             self.bindings[target.name] = value
@@ -1558,9 +1570,11 @@ class Interpreter:
         if target == "int":
             return torch.floor(value)
         if target == "string":
-            # Convert number to string
+            # Convert to string via the shared helper, so cast(x, string) behaves
+            # exactly like str()/format(): one value for scalar/uniform tensors,
+            # mean + one-time warning for a genuinely multi-valued field.
             if isinstance(value, torch.Tensor):
-                v = value.item() if value.dim() == 0 else value.float().mean().item()
+                v = _scalar_from_tensor(value, "string")
                 return str(int(v)) if v == int(v) else str(v)
             return str(value)
         return value

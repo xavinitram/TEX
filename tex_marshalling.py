@@ -230,6 +230,9 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
         if raw.dim() == 3:
             # [B, H, W] -> [B, H, W, 3] (grayscale to RGB)
             raw = raw.unsqueeze(-1).expand(-1, -1, -1, 3)
+        elif raw.dim() == 4 and raw.shape[-1] == 1:
+            # [B, H, W, 1] -> [B, H, W, 3] (grayscale to RGB)
+            raw = raw.expand(-1, -1, -1, 3)
         elif raw.dim() == 4 and raw.shape[-1] == 2:
             # [B, H, W, 2] -> [B, H, W, 3] (pad with zeros)
             raw = torch.nn.functional.pad(raw, (0, 1))

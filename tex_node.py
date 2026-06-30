@@ -183,6 +183,10 @@ class TEXWrangleNode(_BaseClass):
                         mv = val[mk]
                         if isinstance(mv, (int, float, str, bool)):
                             lat += f":{mk}={mv}"
+                        elif isinstance(mv, torch.Tensor):
+                            lat += f":{mk}:{_tensor_fingerprint(mv)}"
+                        else:
+                            lat += f":{mk}={mv!r}"
                     parts.append(lat)
                 elif isinstance(val, torch.Tensor):
                     parts.append(f"{name}:{_tensor_fingerprint(val)}")

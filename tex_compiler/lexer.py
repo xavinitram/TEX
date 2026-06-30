@@ -133,6 +133,26 @@ SINGLE_CHAR_TOKENS = {
 BINDING_TYPE_PREFIXES = {"f", "i", "v", "v2", "v3", "v4", "s", "img", "m", "l", "c", "b"}
 
 
+def _is_ascii_digit(c: str) -> bool:
+    """True only for ASCII digits 0-9 (str.isdigit() accepts Unicode digits)."""
+    return "0" <= c <= "9"
+
+
+def _is_ascii_alpha(c: str) -> bool:
+    """True only for ASCII letters a-z/A-Z (str.isalpha() accepts Unicode letters)."""
+    return ("a" <= c <= "z") or ("A" <= c <= "Z")
+
+
+def _is_ident_start(c: str) -> bool:
+    """ASCII-only identifier start: letter or underscore."""
+    return _is_ascii_alpha(c) or c == "_"
+
+
+def _is_ident_continue(c: str) -> bool:
+    """ASCII-only identifier continuation: letter, digit, or underscore."""
+    return _is_ascii_alpha(c) or _is_ascii_digit(c) or c == "_"
+
+
 @dataclass
 class Token:
     type: TokenType
@@ -252,16 +272,16 @@ class Lexer:
             text = self.source[start_pos:self.pos]
             return Token(TokenType.INT_LIT, text, start_loc)
 
-        while self.pos < len(self.source) and self.source[self.pos].isdigit():
+        while self.pos < len(self.source) and _is_ascii_digit(self.source[self.pos]):
             self.advance()
 
         if self.pos < len(self.source) and self.source[self.pos] == ".":
             next_ch = self.peek_ahead()
             # Only treat as float if followed by digit (not field access like 1.rgb)
-            if next_ch.isdigit():
+            if _is_ascii_digit(next_ch):
                 is_float = True
                 self.advance()  # .
-                while self.pos < len(self.source) and self.source[self.pos].isdigit():
+                while self.pos < len(self.source) and _is_ascii_digit(self.source[self.pos]):
                     self.advance()
 
         # Scientific notation
@@ -273,7 +293,7 @@ class Lexer:
             if self.pos < len(self.source) and self.source[self.pos] in ("+", "-"):
                 self.advance()
             exp_start = self.pos
-            while self.pos < len(self.source) and self.source[self.pos].isdigit():
+            while self.pos < len(self.source) and _is_ascii_digit(self.source[self.pos]):
                 self.advance()
             if self.pos == exp_start:
                 # No digits after 'e' — backtrack (treat 'e' as separate identifier)
@@ -290,7 +310,7 @@ class Lexer:
     def read_identifier(self) -> Token:
         start_loc = self.loc()
         start_pos = self.pos
-        while self.pos < len(self.source) and (self.source[self.pos].isalnum() or self.source[self.pos] == "_"):
+        while self.pos < len(self.source) and _is_ident_continue(self.source[self.pos]):
             self.advance()
         text = self.source[start_pos:self.pos]
 
@@ -350,12 +370,12 @@ class Lexer:
         """
         name_start = self.pos
         if (self.pos >= len(self.source) or
-                not (self.source[self.pos].isalpha() or self.source[self.pos] == "_")):
+                not _is_ident_start(self.source[self.pos])):
             raise self._error(
                 f"Expected a name after '{prefix_or_sigil}{sigil}'. For example: {sigil}myInput",
                 start_loc, code="E1007"
             )
-        while self.pos < len(self.source) and (self.source[self.pos].isalnum() or self.source[self.pos] == "_"):
+        while self.pos < len(self.source) and _is_ident_continue(self.source[self.pos]):
             self.advance()
         return self.source[name_start:self.pos]
 
@@ -393,16 +413,16 @@ class Lexer:
                 continue
 
             # Numbers
-            if ch.isdigit():
+            if _is_ascii_digit(ch):
                 self.tokens.append(self.read_number())
                 continue
 
             # Float literal starting with dot (e.g., .5)
-            if ch == "." and self.peek_ahead().isdigit():
+            if ch == "." and _is_ascii_digit(self.peek_ahead()):
                 start_loc = self.loc()
                 start_pos = self.pos
                 self.advance()  # .
-                while self.pos < len(self.source) and self.source[self.pos].isdigit():
+                while self.pos < len(self.source) and _is_ascii_digit(self.source[self.pos]):
                     self.advance()
                 text = self.source[start_pos:self.pos]
                 self.tokens.append(Token(TokenType.FLOAT_LIT, text, start_loc))
@@ -414,7 +434,7 @@ class Lexer:
                 continue
 
             # Identifiers and keywords
-            if ch.isalpha() or ch == "_":
+            if _is_ident_start(ch):
                 self.tokens.append(self.read_identifier())
                 continue
 

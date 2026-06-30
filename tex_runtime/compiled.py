@@ -150,6 +150,12 @@ _backend_status: dict[str, bool | None] = {
 # One-time log messages (avoid spamming the console)
 _warnings_shown: set[str] = set()
 
+# Persistent single-thread worker for the torch.compile lifecycle.
+# A long-lived worker provides the same dynamo-TLS isolation as a fresh pool
+# per call (the entire compile+run stays off the main thread) without paying
+# OS thread create/destroy on every frame of a batch/video workload.
+_COMPILE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
 # Minimum tensor-op count for torch.compile to be worthwhile.
 # Below this threshold the fusion benefit cannot overcome tracing overhead.
 _COMPILE_OP_THRESHOLD = 8
@@ -166,9 +172,8 @@ _WARNINGS_SHOWN_CAP = 256
 
 def _show_once(key: str, msg: str, level: str = "info"):
     """Log a message at most once per session."""
-    if key not in _warnings_shown:
-        if len(_warnings_shown) < _WARNINGS_SHOWN_CAP:
-            _warnings_shown.add(key)
+    if key not in _warnings_shown and len(_warnings_shown) < _WARNINGS_SHOWN_CAP:
+        _warnings_shown.add(key)
         getattr(logger, level)(msg)
 
 
@@ -295,6 +300,7 @@ def execute_compiled(
     latent_channel_count: int = 0,
     output_names: list[str] | None = None,
     used_builtins: set[str] | None = None,
+    precision: str = "fp32",
 ) -> torch.Tensor | dict:
     """
     Execute a TEX program with optional torch.compile acceleration.
@@ -327,7 +333,7 @@ def execute_compiled(
     if fingerprint in _compile_blacklist:
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
-                              used_builtins=used_builtins)
+                              used_builtins=used_builtins, precision=precision)
 
     # ── Program analysis gates (only on first compile, not cached reruns)
     if cache_key not in _compiled_cache:
@@ -336,14 +342,14 @@ def execute_compiled(
         if op_count < _COMPILE_OP_THRESHOLD:
             return _plain_execute(program, bindings, type_map, device,
                                   latent_channel_count, output_names,
-                                  used_builtins=used_builtins)
+                                  used_builtins=used_builtins, precision=precision)
         # Use codegen WITHOUT torch.compile for deeply nested loops
         # (graph breaks and recompilation make torch.compile slower)
         loop_depth = _max_loop_depth(program)
         if loop_depth > _COMPILE_MAX_LOOP_DEPTH:
             return _codegen_only_execute(program, bindings, type_map, device,
                                          latent_channel_count, output_names,
-                                         used_builtins=used_builtins)
+                                         used_builtins=used_builtins, precision=precision)
         # Use plain interpreter for programs without spatial tensor context
         # (procedural noise, etc.) — codegen env setup overhead exceeds
         # benefit when all operations are on scalar tensors
@@ -352,7 +358,7 @@ def execute_compiled(
         if not has_spatial:
             return _plain_execute(program, bindings, type_map, device,
                                   latent_channel_count, output_names,
-                                  used_builtins=used_builtins)
+                                  used_builtins=used_builtins, precision=precision)
 
     # Ensure tensor bindings are contiguous — Inductor's codegen can
     # fail on non-contiguous strides (e.g. BHWC images loaded with
@@ -382,12 +388,13 @@ def execute_compiled(
             with torch.inference_mode():
                 # Get or create the compiled callable (on THIS thread)
                 if cache_key not in _compiled_cache:
-                    compiled_fn = _try_compile(cache_key, device_type, program, type_map)
+                    compiled_fn = _try_compile(cache_key, device_type, program, type_map,
+                                               used_builtins=used_builtins, precision=precision)
                     if compiled_fn is None:
                         # No backend available — run plain interpreter here
                         return _plain_execute(program, contiguous_bindings, type_map,
                                               device, latent_channel_count, output_names,
-                                              used_builtins=used_builtins)
+                                              used_builtins=used_builtins, precision=precision)
                     _compiled_cache[cache_key] = compiled_fn
                     if len(_compiled_cache) > _COMPILED_CACHE_MAX:
                         # Evict the oldest. Do NOT torch._dynamo.reset() here:
@@ -405,9 +412,11 @@ def execute_compiled(
             compile_error = e
             return None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_compile_and_run)
-        result = future.result()
+    # Submit to the persistent single-thread worker. Same TLS isolation as a
+    # fresh pool (compile+run never touches the main thread) without per-call
+    # thread create/destroy.
+    future = _COMPILE_POOL.submit(_compile_and_run)
+    result = future.result()
 
     if compile_error is not None:
         # A loop-iteration / recursion-depth limit is a USER bug, not a compile
@@ -442,7 +451,7 @@ def execute_compiled(
         # interpreter recompute. Matches _codegen_only_execute's fallback.
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
-                              used_builtins=used_builtins)
+                              used_builtins=used_builtins, precision=precision)
 
     return result
 
@@ -455,23 +464,30 @@ def _plain_execute(
     latent_channel_count: int = 0,
     output_names: list[str] | None = None,
     used_builtins: set[str] | None = None,
+    precision: str = "fp32",
 ) -> torch.Tensor | dict:
     """Execute without torch.compile (standard tree-walking interpreter)."""
     interp = Interpreter()
     return interp.execute(program, bindings, type_map, device=device,
                           latent_channel_count=latent_channel_count,
                           output_names=output_names,
+                          precision=precision,
                           used_builtins=used_builtins)
 
 
 def _build_codegen_env(
     program: Any, bindings: dict[str, Any],
     device: torch.device, latent_channel_count: int,
+    used_builtins: set[str] | None = None,
+    precision: str = "fp32",
 ) -> tuple[dict, tuple | None, set[str]]:
     """Build the environment dict and spatial shape for codegen execution.
 
     Returns (env, spatial_shape, used_identifiers).
     Shared by _codegen_exec and _codegen_only_execute.
+
+    used_builtins (when provided) is the precomputed identifier set; passing it
+    avoids a full per-frame AST walk via _collect_identifiers.
     """
     env: dict[str, Any] = {}
     sp = None
@@ -480,8 +496,9 @@ def _build_codegen_env(
             sp = (v.shape[0], v.shape[1], v.shape[2])
             break
 
-    used = _collect_identifiers(program)
-    dtype = torch.float32
+    used = used_builtins if used_builtins is not None else _collect_identifiers(program)
+    # Single owner: the interpreter's precision->dtype map (both backends agree).
+    dtype = Interpreter._PRECISION_DTYPES.get(precision, torch.float32)
 
     if sp:
         B, H, W = sp
@@ -534,6 +551,7 @@ def _codegen_only_execute(
     latent_channel_count: int = 0,
     output_names: list[str] | None = None,
     used_builtins: set[str] | None = None,
+    precision: str = "fp32",
 ) -> torch.Tensor | dict:
     """Execute via codegen flat function WITHOUT torch.compile.
 
@@ -549,7 +567,7 @@ def _codegen_only_execute(
     if cg_fn is None:
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
-                              used_builtins=used_builtins)
+                              used_builtins=used_builtins, precision=precision)
 
     dev = torch.device(device) if not isinstance(device, torch.device) else device
 
@@ -561,7 +579,8 @@ def _codegen_only_execute(
         else:
             contiguous_bindings[k] = v
 
-    env, sp, _ = _build_codegen_env(program, contiguous_bindings, dev, latent_channel_count)
+    env, sp, _ = _build_codegen_env(program, contiguous_bindings, dev, latent_channel_count,
+                                    used_builtins=used_builtins, precision=precision)
     stdlib_fns = TEXStdlib.get_functions()
 
     try:
@@ -578,7 +597,7 @@ def _codegen_only_execute(
         )
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
-                              used_builtins=used_builtins)
+                              used_builtins=used_builtins, precision=precision)
 
     if output_names is not None:
         return {name: contiguous_bindings[name] for name in output_names}
@@ -588,6 +607,8 @@ def _codegen_only_execute(
 def _try_compile(
     cache_key: tuple[str, str], device_type: str,
     program: Any = None, type_map: dict | None = None,
+    used_builtins: set[str] | None = None,
+    precision: str = "fp32",
 ) -> Callable | None:
     """
     Attempt to create a torch.compile-d callable for a TEX program.
@@ -628,7 +649,8 @@ def _try_compile(
         def _codegen_exec(program, bindings, type_map, device,
                           latent_channel_count=0, output_names=None):
             dev = torch.device(device) if not isinstance(device, torch.device) else device
-            env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count)
+            env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
+                                            used_builtins=used_builtins, precision=precision)
 
             cg_fn(env, bindings, stdlib_fns, dev, sp,
                    torch, _broadcast_pair, _ensure_spatial, torch.where,
@@ -702,7 +724,8 @@ def _try_compile(
             )
 
         # Recurse to try the next backend in the cascade
-        return _try_compile(cache_key, device_type, program, type_map)
+        return _try_compile(cache_key, device_type, program, type_map,
+                            used_builtins=used_builtins, precision=precision)
 
 
 def clear_compiled_cache():

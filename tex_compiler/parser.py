@@ -263,7 +263,8 @@ class Parser:
 
         # Parameter declaration: f$name = 0.5; or $name; or i$count = 10;
         if self.peek() == TokenType.TYPED_DOLLAR_BINDING:
-            return self.parse_param_decl()
+            if self.peek_ahead() in (TokenType.ASSIGN, TokenType.SEMI):
+                return self.parse_param_decl()
         if self.peek() == TokenType.DOLLAR_BINDING:
             if self.peek_ahead() in (TokenType.ASSIGN, TokenType.SEMI):
                 return self.parse_param_decl()
@@ -759,6 +760,15 @@ class Parser:
                 val = int(tok.value, 16)
             else:
                 val = int(tok.value)
+            # NumberLiteral stores value as a Python float; ints above 2**53
+            # cannot be represented exactly as IEEE-754 doubles and would be
+            # silently rounded despite is_int=True. Fail loudly instead.
+            if abs(val) > (1 << 53):
+                raise self._make_error(
+                    f"Integer literal `{tok.value}` is too large to represent "
+                    f"exactly (exceeds 2**53).",
+                    tok.loc, code="E2000",
+                    hint="Use a value at or below 2**53 for exact integers.")
             return NumberLiteral(loc=tok.loc, value=float(val), is_int=True)
 
         if tok.type == TokenType.FLOAT_LIT:

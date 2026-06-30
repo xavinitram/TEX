@@ -38,6 +38,37 @@ def _has_channel_axis(t) -> bool:
     mask whose last dim is a spatial axis."""
     return (t.dim() >= 1 and t.shape[-1] in VEC_CHANNELS) or (t.dim() >= 4 and t.shape[-1] > 1)
 
+
+_scalar_avg_warned = False
+
+
+def _scalar_from_tensor(t: torch.Tensor, fn_name: str) -> float:
+    """Extract a single scalar value from a tensor for string conversion.
+
+    A 0-dim / single-element / all-equal (uniform) tensor has one well-defined
+    value and yields it exactly. A genuinely multi-valued per-pixel field has no
+    single value: rather than fail (which would break existing programs that
+    summarise a field into a label, e.g. the string_format example), we fall
+    back to the mean — but warn ONCE, because that averaged number corresponds
+    to no actual element. The old behaviour did this silently; reduce the field
+    explicitly (avg/min/max) or index one element to get a defined value.
+    """
+    if t.numel() == 1:
+        return t.reshape(()).item()
+    flat = t.reshape(-1)
+    if bool(torch.all(flat == flat[0])):
+        return flat[0].item()
+    global _scalar_avg_warned
+    if not _scalar_avg_warned:
+        _scalar_avg_warned = True
+        _texlog.warning(
+            "%s() received a multi-valued %s tensor; averaging it to one number for the "
+            "string. That value matches no single element — reduce the field first "
+            "(e.g. an average/min/max) or index one element to make it explicit.",
+            fn_name, tuple(t.shape),
+        )
+    return flat.float().mean().item()
+
 # ── Sampler tensor cache ──────────────────────────────────────────────
 # Caches reusable tensors for sampling functions keyed by (B, H, W, device).
 # Avoids recreating batch index tensors and Lanczos tap offsets per call.
@@ -593,6 +624,12 @@ class TEXStdlib:
 
     @staticmethod
     def fn_normalize(v):
+        # Pinned convention (the single oracle both backends use): a vector
+        # (channel axis present) normalizes to unit length; a scalar / 1-channel
+        # field normalizes to sign() — so sign(0)=0, and NOT x/abs(x) which is
+        # NaN at 0. The type checker rejects normalize() on a non-vector
+        # (E5003), and codegen routes scalar args here too, so interpreter and
+        # codegen never diverge.
         t = _to_tensor(v)
         if _has_channel_axis(t):
             norm = torch.linalg.vector_norm(t, dim=-1, keepdim=True)
@@ -849,8 +886,7 @@ class TEXStdlib:
 
         # Resolve frame index
         f_idx = torch.clamp(torch.round(frame_t).long(), 0, B - 1)
-
-        f_idx = _expand_to_bhw(torch.clamp(torch.round(frame_t).long(), 0, B - 1), B, H, W)
+        f_idx = _expand_to_bhw(f_idx, B, H, W)
 
         # Convert from [0,1] to pixel coordinates
         x = _expand_to_bhw(u * (W - 1), B, H, W)
@@ -1294,7 +1330,7 @@ class TEXStdlib:
         if isinstance(x, str):
             return x
         if isinstance(x, torch.Tensor):
-            v = x.item() if x.dim() == 0 else x.float().mean().item()
+            v = _scalar_from_tensor(x, "str")
             return str(int(v)) if v == int(v) else str(v)
         return str(x)
 
@@ -1474,7 +1510,7 @@ class TEXStdlib:
         converted = []
         for a in args:
             if isinstance(a, torch.Tensor):
-                v = a.item() if a.dim() == 0 else a.float().mean().item()
+                v = _scalar_from_tensor(a, "format")
                 # Round to 6 significant digits to counteract float32 noise
                 if v == int(v):
                     converted.append(int(v))

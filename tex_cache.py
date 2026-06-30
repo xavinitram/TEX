@@ -11,6 +11,7 @@ type_map with valid id() keys (~0.1ms, negligible).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import pickle
@@ -63,6 +64,11 @@ _DISK_MAX_ENTRIES = 512
 _CACHE_DIR_NAME = ".tex_cache"
 _TORCH_COMPILE_CACHE_SUBDIR = "torch_compile"
 
+# Memoizes computed fingerprints per (code, sorted binding-types tuple) so the
+# SHA256 over the full source runs once per unique program, not on every probe.
+_FINGERPRINT_MEMO: dict[tuple, str] = {}
+_FINGERPRINT_MEMO_MAX = 256
+
 
 class TEXCache:
     """
@@ -94,11 +100,32 @@ class TEXCache:
 
     @staticmethod
     def fingerprint(code: str, binding_types: dict[str, TEXType]) -> str:
-        """Compute cache key from code + binding types (SHA256)."""
-        key_parts = [code] + [
-            f"{k}:{v.value}" for k, v in sorted(binding_types.items())
-        ]
-        return hashlib.sha256("|".join(key_parts).encode()).hexdigest()
+        """Compute cache key from code + binding types (SHA256).
+
+        Uses a length-prefixed/structured encoding so arbitrary user code
+        (which may contain '|' or ':') can never collide with the binding-type
+        descriptors. Memoized per (code, sorted binding-types) so the SHA256
+        over the full source is computed once per unique program rather than on
+        every cache probe.
+        """
+        binding_key = tuple(sorted((k, v.value) for k, v in binding_types.items()))
+        memo = _FINGERPRINT_MEMO
+        cache_key = (code, binding_key)
+        cached = memo.get(cache_key)
+        if cached is not None:
+            return cached
+
+        h = hashlib.sha256()
+        code_bytes = code.encode()
+        h.update(len(code_bytes).to_bytes(8, "little"))
+        h.update(code_bytes)
+        h.update(json.dumps(binding_key).encode())
+        fp = h.hexdigest()
+
+        if len(memo) >= _FINGERPRINT_MEMO_MAX:
+            memo.clear()
+        memo[cache_key] = fp
+        return fp
 
     def get(self, code: str, binding_types: dict[str, TEXType]) -> tuple | None:
         """

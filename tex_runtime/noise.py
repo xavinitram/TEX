@@ -188,7 +188,9 @@ def _simplex_grad_dot(h: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> to
     gx = gx_mask * gx_sign
 
     gy_mask = ((gi != 0) & (gi != 1)).float()
-    gy_sign_bit = ((gi >> 1) & 1).float()
+    # Cardinal-y (gi in {2,3}): sign from bit 0 so gi=2→(0,+1), gi=3→(0,-1).
+    # Diagonal/half (gi>=4): sign from bit 1, matching the documented set.
+    gy_sign_bit = torch.where(gi >= 4, (gi >> 1) & 1, gi & 1).float()
     gy_sign = 1.0 - 2.0 * gy_sign_bit
     gy_mag = torch.where(gi >= 8, 0.5, 1.0)
     gy = gy_mask * gy_sign * gy_mag
@@ -277,6 +279,7 @@ class _TieredCache:
         self.cache: dict = {}
         self._compile_attempted: set = set()
         self._call_count: dict = {}
+        self._seen_once: set = set()
         self._lock = threading.Lock()
 
     def get(self, key):
@@ -306,9 +309,21 @@ class _TieredCache:
         self._call_count.pop(key, None)
 
     def store(self, key, trace_fn):
-        """Store a traced version on first call. trace_fn() → traced callable or raise."""
+        """Store a traced version once the key recurs.
+
+        Building the trace runs trace_fn() which internally executes the eager
+        function once more, so deferring the build to the SECOND call avoids
+        evaluating the noise field twice on the very first frame. The first call
+        only records the key as seen (cache stays empty, so the eager path runs
+        again next time); the trace is built on the second call.
+        trace_fn() → traced callable or raise.
+        """
         if key in self.cache:
             return
+        with self._lock:
+            if key not in self._seen_once:
+                self._seen_once.add(key)
+                return
         try:
             self.cache[key] = trace_fn()
         except Exception:

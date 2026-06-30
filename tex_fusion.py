@@ -58,27 +58,46 @@ def _seed_initializer(out_type):
         f"(float) stages can be fused. Break the chain at that node.")
 
 
-def _out_used_in_loop(node, in_loop=False):
-    """True if a wire `@OUT` appears anywhere inside a for/while loop. Reading
-    `@OUT` inside a loop has special binding semantics (it returns the pre-loop
-    value, not the running one) that a plain handoff local would NOT reproduce —
-    so such a stage can't be fused as a non-terminal."""
-    if not isinstance(node, A.ASTNode):
-        return False
-    if (node.__class__ is A.BindingRef and node.kind == "wire"
-            and node.name == "OUT" and in_loop):
-        return True
-    nxt = in_loop or node.__class__ in (A.ForLoop, A.WhileLoop)
+def _is_out_ref(node) -> bool:
+    """True if `node` is a wire `@OUT` BindingRef."""
+    return (node.__class__ is A.BindingRef and node.kind == "wire"
+            and node.name == "OUT")
+
+
+def _child_nodes(node):
+    """Yield the direct AST children of `node` (descending into list fields)."""
     for f in dataclasses.fields(node):
         val = getattr(node, f.name)
         if isinstance(val, A.ASTNode):
-            if _out_used_in_loop(val, nxt):
-                return True
+            yield val
         elif isinstance(val, list):
             for x in val:
-                if isinstance(x, A.ASTNode) and _out_used_in_loop(x, nxt):
-                    return True
-    return False
+                if isinstance(x, A.ASTNode):
+                    yield x
+
+
+def _out_used_inside(node, enclosing, _inside=False) -> bool:
+    """True if a wire `@OUT` appears anywhere inside a node whose type is in
+    `enclosing`. Drives both fusion guards:
+      - loops (`ForLoop`/`WhileLoop`): reading `@OUT` inside a loop returns the
+        pre-loop value, which a plain handoff local wouldn't reproduce;
+      - function defs (`FunctionDef`): a non-terminal `@OUT` write is rewritten
+        to a top-level handoff local that isn't in scope inside a spliced fn.
+    Either way such a stage can't be fused as a non-terminal."""
+    if not isinstance(node, A.ASTNode):
+        return False
+    if _inside and _is_out_ref(node):
+        return True
+    nxt = _inside or node.__class__ in enclosing
+    return any(_out_used_inside(c, enclosing, nxt) for c in _child_nodes(node))
+
+
+def _out_used_in_loop(node) -> bool:
+    return _out_used_inside(node, (A.ForLoop, A.WhileLoop))
+
+
+def _out_used_in_function(node) -> bool:
+    return _out_used_inside(node, (A.FunctionDef,))
 
 
 def _out_target_binding(target):
@@ -94,6 +113,42 @@ def _out_target_binding(target):
     return None
 
 
+def _references_out(node) -> bool:
+    """True if a wire `@OUT` BindingRef appears anywhere in this subtree."""
+    if not isinstance(node, A.ASTNode):
+        return False
+    if _is_out_ref(node):
+        return True
+    return any(_references_out(c) for c in _child_nodes(node))
+
+
+def _seedless_out_index(statements):
+    """Index of the first top-level statement that touches `@OUT`, IFF that touch
+    is a plain unconditional `@OUT = expr` (bare BindingRef target, op `=`) whose
+    RHS does not itself read `@OUT`. In that case the handoff local can be born
+    directly from that write (a VarDecl) and the typed-zero seed is a dead store.
+    Returns the index, or None if a seed is required."""
+    for idx, s in enumerate(statements):
+        if not _references_out(s):
+            continue
+        # First @OUT touch found — eligible only if it's a clean bare write.
+        if (s.__class__ is A.Assignment and s.op is None
+                and s.target.__class__ is A.BindingRef
+                and s.target.kind == "wire" and s.target.name == "OUT"
+                and not _references_out(s.value)):
+            return idx
+        return None
+    return None
+
+
+def _user_prefix(prefix: str) -> str:
+    """The sub-namespace for user-authored names within a stage. Kept distinct
+    from the bare `prefix` (reserved for compiler-generated handoff locals like
+    out_local) so user names and synthetic names can never collide. The one and
+    only place the `u_` convention is spelled."""
+    return prefix + "u_"
+
+
 def _transform(node, prefix, user_fns, chain_input, prev_out, out_local, is_terminal):
     """Recursively namespace one stage's AST and wire its boundaries in place.
 
@@ -105,6 +160,7 @@ def _transform(node, prefix, user_fns, chain_input, prev_out, out_local, is_term
     if node is None:
         return None
     cls = node.__class__
+    up = _user_prefix(prefix)
 
     if cls is A.BindingRef:
         if node.kind == "wire" and node.name == "OUT":
@@ -113,12 +169,12 @@ def _transform(node, prefix, user_fns, chain_input, prev_out, out_local, is_term
             return node if is_terminal else A.Identifier(loc=node.loc, name=out_local)
         if chain_input is not None and node.kind == "wire" and node.name == chain_input:
             return A.Identifier(loc=node.loc, name=prev_out)  # chain handoff
-        node.name = prefix + node.name
+        node.name = up + node.name
         return node
 
     if cls is A.Identifier:
         if node.name not in _BUILTINS:
-            node.name = prefix + node.name
+            node.name = up + node.name
         return node
 
     if cls is A.Assignment:
@@ -157,12 +213,12 @@ def _transform(node, prefix, user_fns, chain_input, prev_out, out_local, is_term
 
     # Prefix declared names AFTER recursing into initializers/bodies.
     if cls in (A.VarDecl, A.ArrayDecl, A.ParamDecl):
-        node.name = prefix + node.name
+        node.name = up + node.name
     elif cls is A.FunctionDef:
-        node.name = prefix + node.name
-        node.params = [(t, prefix + n) for (t, n) in node.params]
+        node.name = up + node.name
+        node.params = [(t, up + n) for (t, n) in node.params]
     elif cls is A.FunctionCall and node.name in user_fns:
-        node.name = prefix + node.name
+        node.name = up + node.name
     return node
 
 
@@ -230,19 +286,39 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
                     f"Upstream stage {i} uses @OUT inside a loop; @OUT has special "
                     f"binding semantics there that fusion can't preserve. Break the "
                     f"chain at that node.")
-            # Declare the handoff local once, at the stage's top level, seeded — so
-            # conditional / channel writes to @OUT are always defined.
-            seed = A.VarDecl(type_name=ot.value, name=out_local,
-                             initializer=_seed_initializer(ot.value), is_const=False)
+            if _out_used_in_function(prog):
+                raise FusionError(
+                    f"Upstream stage {i} uses @OUT inside a user-defined function; "
+                    f"the handoff local fusion redirects @OUT to isn't in scope there, "
+                    f"so fusion can't preserve it. Break the chain at that node.")
+            # If the first top-level @OUT touch is a plain unconditional `@OUT =`,
+            # the handoff local is born from that write (lowered to a VarDecl below)
+            # and the typed-zero seed would be a dead full-frame allocation. Only
+            # the conditional / channel / compound case needs the seed.
+            seedless_idx = _seedless_out_index(prog.statements)
+            if seedless_idx is None:
+                # Declare the handoff local once, at the stage's top level, seeded — so
+                # conditional / channel writes to @OUT are always defined.
+                seed = A.VarDecl(type_name=ot.value, name=out_local,
+                                 initializer=_seed_initializer(ot.value), is_const=False)
+        else:
+            seedless_idx = None
 
         user_fns = {s.name for s in prog.statements if isinstance(s, A.FunctionDef)}
         _transform(prog, prefix, user_fns, chain_in, prev_out, out_local, is_terminal)
+        if seedless_idx is not None:
+            # _transform rewrote `@OUT = expr` to `Assignment(Identifier(out_local) = expr)`;
+            # promote that first write to the declaration of the handoff local.
+            written = prog.statements[seedless_idx]
+            prog.statements[seedless_idx] = A.VarDecl(
+                loc=written.loc, type_name=ot.value, name=out_local,
+                initializer=written.value, is_const=False)
         if seed is not None:
             fused_stmts.append(seed)
         fused_stmts.extend(prog.statements)
 
         for name, val in ext.items():
-            merged_bindings[prefix + name] = val
+            merged_bindings[_user_prefix(prefix) + name] = val
         prev_out = out_local
         prev_out_type = None if is_terminal else checker.assigned_bindings.get("OUT")
 

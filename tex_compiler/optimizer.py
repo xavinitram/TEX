@@ -60,9 +60,13 @@ _PURE_FUNCTIONS: dict[str, callable] = {
     "clamp": lambda x, lo, hi: max(lo, min(x, hi)),
     "lerp": lambda a, b, t: a + (b - a) * t,
     "mix": lambda a, b, t: a + (b - a) * t,  # Alias for lerp
+    # Mirror fn_smoothstep exactly: clamp((x-e0)/(e1-e0+SAFE_EPSILON), 0, 1)
+    # then t*t*(3-2*t), with no separate early-out branches. The previous
+    # early-out + max(e1-e0, 1e-8) form diverged from the runtime when e0 > e1.
     "smoothstep": lambda e0, e1, x: (
-        0.0 if x <= e0 else 1.0 if x >= e1 else
-        (lambda t: t * t * (3 - 2 * t))((x - e0) / max(e1 - e0, 1e-8))
+        (lambda t: t * t * (3 - 2 * t))(
+            min(1.0, max(0.0, (x - e0) / (e1 - e0 + 1e-8)))
+        )
     ),
     "step": lambda edge, x: 0.0 if x < edge else 1.0,
     "mod": lambda a, b: math.fmod(a, b) if b != 0 else 0.0,
@@ -229,9 +233,15 @@ def _num_val(node: NumberLiteral) -> float:
     return node.value
 
 
-def _make_num(value: float, loc=None) -> NumberLiteral:
-    """Create a NumberLiteral from a computed value."""
-    return NumberLiteral(loc=loc or NumberLiteral().loc, value=float(value))
+def _make_num(value: float, loc=None, is_int: bool = False) -> NumberLiteral:
+    """Create a NumberLiteral from a computed value.
+
+    is_int propagates integer-ness so a folded integer subexpression stays
+    INT-typed after the post-optimization re-type-check (the type checker maps
+    is_int -> INT/FLOAT, which affects array indexing, %, and INT dispatch).
+    """
+    return NumberLiteral(loc=loc or NumberLiteral().loc, value=float(value),
+                         is_int=is_int)
 
 
 def _fold_binop(node: BinOp) -> ASTNode:
@@ -243,7 +253,12 @@ def _fold_binop(node: BinOp) -> ASTNode:
         a, b = _num_val(left), _num_val(right)
         result = _eval_binop_const(node.op, a, b)
         if result is not None:
-            return _make_num(result, node.loc)
+            # Preserve integer-ness: folding two INT operands under an
+            # integer-closed op (+,-,*,%) yields an INT literal, so the
+            # re-type-check keeps it INT instead of demoting to FLOAT.
+            fold_int = (left.is_int and right.is_int
+                        and node.op in ("+", "-", "*", "%"))
+            return _make_num(result, node.loc, is_int=fold_int)
 
     # Algebraic simplification
     op = node.op
@@ -279,8 +294,12 @@ def _fold_binop(node: BinOp) -> ASTNode:
             if rv == 1.0:
                 return left
             # Division by constant → multiplication by reciprocal
-            # (multiplication is faster than division on most hardware)
-            if rv != 0.0:
+            # (multiplication is faster than division on most hardware).
+            # Restrict to power-of-two divisors, where 1/c is exactly
+            # representable in IEEE-754 so x*(1/c) is bit-identical to x/c.
+            # For other divisors (e.g. 3.0 -> 0.3333333432) the reciprocal is
+            # inexact and the rewrite would shift per-pixel results by 1 ULP.
+            if rv != 0.0 and math.log2(abs(rv)).is_integer():
                 recip = 1.0 / rv
                 return BinOp(loc=node.loc, op="*", left=left,
                              right=_make_num(recip, right.loc))
@@ -342,9 +361,10 @@ def _fold_function(node: FunctionCall) -> ASTNode:
         if exp == 3.0:
             x_sq = BinOp(loc=node.loc, op="*", left=args[0], right=_clone_expr(args[0]))
             return BinOp(loc=node.loc, op="*", left=x_sq, right=_clone_expr(args[0]))
-        # pow(x, 0.5) -> sqrt(x)
-        if exp == 0.5:
-            return FunctionCall(loc=node.loc, name="sqrt", args=[args[0]])
+        # pow(x, 0.5) -> sqrt(x) is NOT applied: fn_sqrt clamps its arg to min 0
+        # while fn_pow preserves NaN for negative bases with fractional exponents
+        # (pow(-2, 0.5) is NaN). Rewriting to sqrt would silently turn NaN into 0
+        # for signed inputs — not semantics-preserving — so leave pow(x, 0.5) as is.
         # pow(x, -1) -> 1 / x
         if exp == -1.0:
             return BinOp(loc=node.loc, op="/",
@@ -504,6 +524,13 @@ def _collect_used_in_stmt(stmt: ASTNode, used: set[str]):
 def _collect_used_in_expr(expr: ASTNode, used: set[str]):
     """Recursively collect variable names read in an expression."""
     if isinstance(expr, Identifier):
+        used.add(expr.name)
+
+    elif isinstance(expr, BindingRef):
+        # Record binding reads (@name/$name) in the same namespace as
+        # _collect_reassigned_in_stmt's binding write targets, so the CSE
+        # reassignment guard correctly blocks hoisting an expression across a
+        # binding reassignment (bindings are reassignable at runtime).
         used.add(expr.name)
 
     elif isinstance(expr, BinOp):
@@ -1228,92 +1255,98 @@ def _contains_break_continue(stmts: list[ASTNode]) -> bool:
     return False
 
 
-def _subst_expr(expr: ASTNode, var_name: str, value: float) -> ASTNode:
+def _subst_expr(expr: ASTNode, var_name: str, value: float,
+                is_int: bool = False) -> ASTNode:
     """Substitute all occurrences of var_name with a NumberLiteral in an expression.
 
     Returns a new expression (does not mutate the original).
+
+    is_int marks the substituted literal as INT (set when the loop variable is
+    INT-typed) so unrolled bodies keep integer-context behavior — array indexing,
+    %, and INT-typed dispatch — instead of silently becoming FLOAT.
     """
     if isinstance(expr, Identifier) and expr.name == var_name:
-        return NumberLiteral(loc=expr.loc, value=value)
+        return NumberLiteral(loc=expr.loc, value=value, is_int=is_int)
     if isinstance(expr, BinOp):
         return BinOp(loc=expr.loc, op=expr.op,
-                     left=_subst_expr(expr.left, var_name, value),
-                     right=_subst_expr(expr.right, var_name, value))
+                     left=_subst_expr(expr.left, var_name, value, is_int),
+                     right=_subst_expr(expr.right, var_name, value, is_int))
     if isinstance(expr, UnaryOp):
         return UnaryOp(loc=expr.loc, op=expr.op,
-                       operand=_subst_expr(expr.operand, var_name, value))
+                       operand=_subst_expr(expr.operand, var_name, value, is_int))
     if isinstance(expr, FunctionCall):
         return FunctionCall(loc=expr.loc, name=expr.name,
-                            args=[_subst_expr(a, var_name, value) for a in expr.args])
+                            args=[_subst_expr(a, var_name, value, is_int) for a in expr.args])
     if isinstance(expr, TernaryOp):
         return TernaryOp(loc=expr.loc,
-                         condition=_subst_expr(expr.condition, var_name, value),
-                         true_expr=_subst_expr(expr.true_expr, var_name, value),
-                         false_expr=_subst_expr(expr.false_expr, var_name, value))
+                         condition=_subst_expr(expr.condition, var_name, value, is_int),
+                         true_expr=_subst_expr(expr.true_expr, var_name, value, is_int),
+                         false_expr=_subst_expr(expr.false_expr, var_name, value, is_int))
     if isinstance(expr, VecConstructor):
         return VecConstructor(loc=expr.loc, size=expr.size,
-                              args=[_subst_expr(a, var_name, value) for a in expr.args])
+                              args=[_subst_expr(a, var_name, value, is_int) for a in expr.args])
     if isinstance(expr, MatConstructor):
         return MatConstructor(loc=expr.loc, size=expr.size,
-                              args=[_subst_expr(a, var_name, value) for a in expr.args])
+                              args=[_subst_expr(a, var_name, value, is_int) for a in expr.args])
     if isinstance(expr, ArrayLiteral):
         return ArrayLiteral(loc=expr.loc,
-                            elements=[_subst_expr(e, var_name, value) for e in expr.elements])
+                            elements=[_subst_expr(e, var_name, value, is_int) for e in expr.elements])
     if isinstance(expr, CastExpr):
         return CastExpr(loc=expr.loc, target_type=expr.target_type,
-                        expr=_subst_expr(expr.expr, var_name, value))
+                        expr=_subst_expr(expr.expr, var_name, value, is_int))
     if isinstance(expr, ChannelAccess):
         return ChannelAccess(loc=expr.loc, channels=expr.channels,
-                             object=_subst_expr(expr.object, var_name, value))
+                             object=_subst_expr(expr.object, var_name, value, is_int))
     if isinstance(expr, ArrayIndexAccess):
         return ArrayIndexAccess(loc=expr.loc,
-                                array=_subst_expr(expr.array, var_name, value),
-                                index=_subst_expr(expr.index, var_name, value))
+                                array=_subst_expr(expr.array, var_name, value, is_int),
+                                index=_subst_expr(expr.index, var_name, value, is_int))
     if isinstance(expr, BindingIndexAccess):
         return BindingIndexAccess(loc=expr.loc,
-                                  binding=_subst_expr(expr.binding, var_name, value),
-                                  args=[_subst_expr(a, var_name, value) for a in expr.args])
+                                  binding=_subst_expr(expr.binding, var_name, value, is_int),
+                                  args=[_subst_expr(a, var_name, value, is_int) for a in expr.args])
     if isinstance(expr, BindingSampleAccess):
         return BindingSampleAccess(loc=expr.loc,
-                                   binding=_subst_expr(expr.binding, var_name, value),
-                                   args=[_subst_expr(a, var_name, value) for a in expr.args])
+                                   binding=_subst_expr(expr.binding, var_name, value, is_int),
+                                   args=[_subst_expr(a, var_name, value, is_int) for a in expr.args])
     # NumberLiteral, StringLiteral, BindingRef — no substitution needed
     return expr
 
 
-def _subst_stmt(stmt: ASTNode, var_name: str, value: float) -> ASTNode:
+def _subst_stmt(stmt: ASTNode, var_name: str, value: float,
+                is_int: bool = False) -> ASTNode:
     """Substitute loop variable in a statement. Returns new statement."""
     if isinstance(stmt, VarDecl):
-        init = _subst_expr(stmt.initializer, var_name, value) if stmt.initializer else None
+        init = _subst_expr(stmt.initializer, var_name, value, is_int) if stmt.initializer else None
         return VarDecl(loc=stmt.loc, type_name=stmt.type_name, name=stmt.name,
                        initializer=init, is_const=stmt.is_const)
     if isinstance(stmt, Assignment):
-        new_target = _subst_expr(stmt.target, var_name, value)
-        new_value = _subst_expr(stmt.value, var_name, value)
+        new_target = _subst_expr(stmt.target, var_name, value, is_int)
+        new_value = _subst_expr(stmt.value, var_name, value, is_int)
         return Assignment(loc=stmt.loc, target=new_target, value=new_value, op=stmt.op)
     if isinstance(stmt, ExprStatement):
-        return ExprStatement(loc=stmt.loc, expr=_subst_expr(stmt.expr, var_name, value))
+        return ExprStatement(loc=stmt.loc, expr=_subst_expr(stmt.expr, var_name, value, is_int))
     if isinstance(stmt, IfElse):
         return IfElse(loc=stmt.loc,
-                      condition=_subst_expr(stmt.condition, var_name, value),
-                      then_body=[_subst_stmt(s, var_name, value) for s in stmt.then_body],
-                      else_body=[_subst_stmt(s, var_name, value) for s in stmt.else_body])
+                      condition=_subst_expr(stmt.condition, var_name, value, is_int),
+                      then_body=[_subst_stmt(s, var_name, value, is_int) for s in stmt.then_body],
+                      else_body=[_subst_stmt(s, var_name, value, is_int) for s in stmt.else_body])
     if isinstance(stmt, ReturnStmt):
-        val = _subst_expr(stmt.value, var_name, value) if stmt.value else None
+        val = _subst_expr(stmt.value, var_name, value, is_int) if stmt.value else None
         return ReturnStmt(loc=stmt.loc, value=val)
     if isinstance(stmt, ForLoop):
-        new_init = _subst_stmt(stmt.init, var_name, value)
-        new_cond = _subst_expr(stmt.condition, var_name, value)
-        new_update = _subst_stmt(stmt.update, var_name, value)
-        new_body = [_subst_stmt(s, var_name, value) for s in stmt.body]
+        new_init = _subst_stmt(stmt.init, var_name, value, is_int)
+        new_cond = _subst_expr(stmt.condition, var_name, value, is_int)
+        new_update = _subst_stmt(stmt.update, var_name, value, is_int)
+        new_body = [_subst_stmt(s, var_name, value, is_int) for s in stmt.body]
         return ForLoop(loc=stmt.loc, init=new_init, condition=new_cond,
                        update=new_update, body=new_body)
     if isinstance(stmt, WhileLoop):
-        new_cond = _subst_expr(stmt.condition, var_name, value)
-        new_body = [_subst_stmt(s, var_name, value) for s in stmt.body]
+        new_cond = _subst_expr(stmt.condition, var_name, value, is_int)
+        new_body = [_subst_stmt(s, var_name, value, is_int) for s in stmt.body]
         return WhileLoop(loc=stmt.loc, condition=new_cond, body=new_body)
     if isinstance(stmt, ArrayDecl):
-        init = _subst_expr(stmt.initializer, var_name, value) if stmt.initializer else None
+        init = _subst_expr(stmt.initializer, var_name, value, is_int) if stmt.initializer else None
         return ArrayDecl(loc=stmt.loc, element_type_name=stmt.element_type_name,
                          name=stmt.name, size=stmt.size, initializer=init)
     return stmt
@@ -1359,10 +1392,13 @@ def _unroll_small_loops(stmts: list[ASTNode]) -> list[ASTNode]:
                 var_name, start, stop, step = static
                 n_iters = len(range(start, stop, step))
                 if 0 < n_iters <= _UNROLL_MAX_ITERS:
-                    # Unroll: emit body N times with loop var substituted
+                    # Unroll: emit body N times with loop var substituted.
+                    # The static range yields an integer loop variable, so mark
+                    # the substituted literal INT to preserve integer-context
+                    # behavior (indexing, %, INT dispatch) after re-type-check.
                     for i in range(start, stop, step):
                         for body_stmt in stmt.body:
-                            unrolled = _subst_stmt(body_stmt, var_name, float(i))
+                            unrolled = _subst_stmt(body_stmt, var_name, float(i), is_int=True)
                             # Run constant folding on the substituted statement
                             unrolled = _opt_stmt(unrolled)
                             result.append(unrolled)

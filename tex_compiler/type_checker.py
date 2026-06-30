@@ -1016,10 +1016,12 @@ class TypeChecker:
                 self._error(f"'.{channels}' isn't a recognized channel name.",
                             node.loc, code="E3301",
                             hint="Try: .r, .g, .b, .a (color) or .x, .y, .z, .w (position).")
-            if obj_type == TEXType.VEC3 and channels in ("a", "w"):
-                self._error(f"vec3 doesn't have a '.{channels}' channel (only 3 components: rgb/xyz).",
-                            node.loc, code="E3301",
-                            hint="Use vec4 if you need a 4th channel, or access .r, .g, .b instead.")
+            elif obj_type.is_vector and CHANNEL_MAP[channels] >= obj_type.channels:
+                self._error(
+                    f"{obj_type.value} doesn't have a '.{channels}' channel "
+                    f"(only {obj_type.channels} components).",
+                    node.loc, code="E3301",
+                    hint="Access a channel within range, or use a wider vector type.")
             self._set_type(node, TEXType.FLOAT)
             return TEXType.FLOAT
 
@@ -1028,6 +1030,14 @@ class TypeChecker:
             self._error(f"'.{channels}' isn't a recognized swizzle pattern.",
                         node.loc, code="E3302",
                         hint="Try common swizzles like .rgb, .xyz, .rgba, or .xyzw.")
+        elif obj_type.is_vector and any(
+            CHANNEL_MAP[ch] >= obj_type.channels for ch in channels if ch in CHANNEL_MAP
+        ):
+            self._error(
+                f"Swizzle '.{channels}' references channels {obj_type.value} doesn't have "
+                f"(only {obj_type.channels} components).",
+                node.loc, code="E3301",
+                hint="Only swizzle channels that exist on the source vector type.")
 
         n = len(channels)
         if n == 2:
@@ -1081,14 +1091,19 @@ class TypeChecker:
             return result
 
         if node.op in ("&&", "||"):
-            # Logical ops: result is always float (boolean-like)
-            self._set_type(node, TEXType.FLOAT)
-            return TEXType.FLOAT
+            # Logical ops evaluate element-wise on both backends, so a vector
+            # operand yields a per-component vector (boolean-like 0/1), not a
+            # scalar. Mirror that here so the checker agrees with runtime shape.
+            result = self._promote(lt, rt) if (lt.is_vector or rt.is_vector) else TEXType.FLOAT
+            self._set_type(node, result)
+            return result
 
         if node.op in ("==", "!=", "<", ">", "<=", ">="):
-            # Comparison ops: result is float (0.0 or 1.0)
-            self._set_type(node, TEXType.FLOAT)
-            return TEXType.FLOAT
+            # Comparison ops evaluate element-wise on both backends, so a vector
+            # operand yields a per-component vector (0.0/1.0), not a scalar.
+            result = self._promote(lt, rt) if (lt.is_vector or rt.is_vector) else TEXType.FLOAT
+            self._set_type(node, result)
+            return result
 
         # Arithmetic: promote
         result = self._promote(lt, rt)
@@ -1264,8 +1279,9 @@ class TypeChecker:
     def _check_cast(self, node: CastExpr) -> TEXType:
         expr_type = self._check_expr(node.expr)
         t = TYPE_NAME_MAP.get(node.target_type, TEXType.FLOAT)
-        # string(vec3/vec4) is not allowed
-        if t.is_string and expr_type.is_vector:
+        # string(vec3/vec4/mat3/mat4) is not allowed — the str conversion code
+        # is written for scalars only.
+        if t.is_string and (expr_type.is_vector or expr_type.is_matrix):
             self._error(f"Casting {expr_type.value} to string isn't supported.",
                         node.loc, code="E3700",
                         hint="Try: str() to convert scalars, or access individual channels first.")
@@ -1388,6 +1404,17 @@ class TypeChecker:
                         f"dot() needs vectors, but argument {i + 1} is {at.value}.",
                         node.loc, code="E5003",
                         hint="Both arguments should be vec2, vec3, or vec4.")
+                    break
+        elif node.name in ("length", "normalize", "distance", "reflect"):
+            # These reduce/operate over the channel axis, so a scalar argument
+            # would reduce over a non-existent dimension at runtime. Fail fast
+            # at compile time, matching the dot()/cross() pattern.
+            for i, at in enumerate(arg_types):
+                if not at.is_vector:
+                    self._error(
+                        f"{node.name}() needs a vector, but argument {i + 1} is {at.value}.",
+                        node.loc, code="E5003",
+                        hint="Pass a vec2, vec3, or vec4.")
                     break
 
         result_type = self._resolve_function_type(node.name, arg_types, node.loc)

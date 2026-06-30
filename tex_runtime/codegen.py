@@ -1204,6 +1204,12 @@ class _CodeGen:
         self._const_cache: dict[float, str] = {}  # value → variable name
         self._vec_const_cache: dict[tuple, str] = {}  # (v1, v2, ...) → variable name
         self._range_cache: dict[tuple, str] = {}  # (start, stop, step) → variable name
+        self._kernel_const_cache: dict[tuple, str] = {}  # (kvals, kH, kW) → base kernel var
+        # TEX local vars whose current tensor is exclusively owned (no live alias)
+        # at this straight-line emission point — lets index/channel writes skip the
+        # copy-on-write clone. Conservatively invalidated on ANY read (a read may
+        # produce a view that shares storage) and never carried across control flow.
+        self._owned: set[str] = set()
         # Local variable mapping: TEX var name → Python local var name.
         # When set, Identifier emission uses locals instead of _env[name].
         self._local_vars: dict[str, str] = {}
@@ -1308,7 +1314,7 @@ class _CodeGen:
         tmp = self._tmp()
         self._emit(f"{tmp} = {img_var}[:, {py_tmp}, {px_tmp}, :]"
                    f" if {px_tmp}.dim() < 3"
-                   f" else {img_var}[_torch.arange({img_var}.shape[0]).view(-1,1,1), {py_tmp}, {px_tmp}, :]")
+                   f" else {img_var}[_torch.arange({img_var}.shape[0], device=_dev).view(-1,1,1), {py_tmp}, {px_tmp}, :]")
         return tmp
 
     def _emit_inline_grid_sample(self, binding_name: str,
@@ -1480,11 +1486,20 @@ class _CodeGen:
         elif isinstance(stmt, ParamDecl):
             pass  # no-op at runtime
         elif isinstance(stmt, IfElse):
+            # Ownership established on one path may not hold on another, and
+            # pre-branch ownership may not survive the merge — clear on both
+            # sides so in-place writes are only elided within a straight-line run.
+            self._owned.clear()
             self._emit_if_else(stmt)
+            self._owned.clear()
         elif isinstance(stmt, ForLoop):
+            self._owned.clear()
             self._emit_for_loop(stmt)
+            self._owned.clear()
         elif isinstance(stmt, WhileLoop):
+            self._owned.clear()
             self._emit_while_loop(stmt)
+            self._owned.clear()
         elif isinstance(stmt, (BreakStmt, ContinueStmt)):
             # Static range for-loops use native Python break/continue (no update
             # to skip). Non-static for-loops and while-loops use exception-based
@@ -1498,7 +1513,9 @@ class _CodeGen:
         elif isinstance(stmt, ArrayDecl):
             self._emit_array_decl(stmt)
         elif isinstance(stmt, FunctionDef):
+            self._owned.clear()
             self._emit_function_def(stmt)
+            self._owned.clear()
         elif isinstance(stmt, ReturnStmt):
             self._emit_return_stmt(stmt)
         else:
@@ -1527,6 +1544,10 @@ class _CodeGen:
         return tmp
 
     def _emit_var_decl(self, stmt: VarDecl):
+        # Conservative: a vec/scalar initializer may be a view/alias (e.g. a
+        # channel slice), so don't treat the new var as owned. The first
+        # index/channel write to it will clone once; subsequent writes elide.
+        self._owned.discard(stmt.name)
         if stmt.initializer:
             # Track local definitions for sample→fetch pattern resolution
             self._var_initializers[stmt.name] = stmt.initializer
@@ -1575,6 +1596,7 @@ class _CodeGen:
                 self._emit(f"{tgt} = list({src}) if isinstance({src}, list) else [str({src})]")
             else:
                 self._emit(f"{tgt} = [''] * {stmt.size}")
+            self._owned.discard(stmt.name)  # string arrays are Python lists, not COW tensors
             return
 
         if stmt.initializer and isinstance(stmt.initializer, ArrayLiteral):
@@ -1602,6 +1624,8 @@ class _CodeGen:
                     f"{tgt} = _torch.zeros(*_sp, {size}, dtype=_torch.float32, device=_dev)",
                     f"{tgt} = _torch.zeros({size}, dtype=_torch.float32, device=_dev)",
                 )
+        # zeros()/stack()/clone() all produce a brand-new, unaliased tensor.
+        self._owned.add(stmt.name)
 
     def _emit_array_index_read(self, node: ArrayIndexAccess) -> str:
         """Emit array[index] read with clamped bounds."""
@@ -1657,7 +1681,15 @@ class _CodeGen:
         return tmp
 
     def _emit_array_index_assign(self, target: ArrayIndexAccess, value_expr: str):
-        """Emit array[index] = value with clamped bounds."""
+        """Emit array[index] = value with clamped bounds.
+
+        Copy-on-write normally clones the array before writing. When the target
+        is an Identifier whose local is exclusively owned here (freshly built /
+        no live alias — self._owned), the clone is skipped and the element is
+        written in place, turning an O(N) fill from O(N^2) tensor copies into
+        O(N). Ownership is captured BEFORE the base read (which disowns it).
+        """
+        owned = isinstance(target.array, Identifier) and target.array.name in self._owned
         arr = self._emit_expr(target.array)
         idx = self._emit_expr(target.index)
 
@@ -1671,47 +1703,54 @@ class _CodeGen:
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
-        # Clone for copy-on-write semantics
-        self._emit(f"_arr_c = {arr}.clone()")
-        self._emit(f"if _arr_c.dim() in (2, 5):")
+        # Clone for copy-on-write semantics — unless the local is exclusively owned.
+        if owned:
+            c = arr
+        else:
+            c = "_arr_c"
+            self._emit(f"{c} = {arr}.clone()")
+        self._emit(f"if {c}.dim() in (2, 5):")
         self._indent += 1
-        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, _arr_c.shape[-2] - 1)")
+        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {c}.shape[-2] - 1)")
         self._emit(f"if _ai.dim() == 0:")
         self._indent += 1
-        self._emit(f"_arr_c[..., _ai.item(), :] = _es({value_expr}, _arr_c.shape[:-2]) if _arr_c.dim() > 2 else {value_expr}")
+        self._emit(f"{c}[..., _ai.item(), :] = _es({value_expr}, {c}.shape[:-2]) if {c}.dim() > 2 else {value_expr}")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
-        self._emit(f"_C = _arr_c.shape[-1]")
+        self._emit(f"_C = {c}.shape[-1]")
         self._emit(f"_idx_exp = _ai.unsqueeze(-1).unsqueeze(-1).expand(*_ai.shape, 1, _C)")
-        self._emit(f"if _idx_exp.shape[:3] != _arr_c.shape[:3]:")
+        self._emit(f"if _idx_exp.shape[:3] != {c}.shape[:3]:")
         self._indent += 1
-        self._emit(f"_idx_exp = _idx_exp.expand(_arr_c.shape[:3] + (1, _C))")
+        self._emit(f"_idx_exp = _idx_exp.expand({c}.shape[:3] + (1, _C))")
         self._indent -= 1
-        self._emit(f"_val_exp = _es({value_expr}, _arr_c.shape[:-2]).unsqueeze(-2)")
-        self._emit(f"_arr_c.scatter_(-2, _idx_exp, _val_exp)")
+        self._emit(f"_val_exp = _es({value_expr}, {c}.shape[:-2]).unsqueeze(-2)")
+        self._emit(f"{c}.scatter_(-2, _idx_exp, _val_exp)")
         self._indent -= 1
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
-        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, _arr_c.shape[-1] - 1)")
+        self._emit(f"_ai = _torch.clamp(_torch.floor({idx}).long(), 0, {c}.shape[-1] - 1)")
         self._emit(f"if _ai.dim() == 0:")
         self._indent += 1
-        self._emit(f"_arr_c[..., _ai.item()] = _es({value_expr}, _arr_c.shape[:-1]) if _arr_c.dim() > 1 else {value_expr}")
+        self._emit(f"{c}[..., _ai.item()] = _es({value_expr}, {c}.shape[:-1]) if {c}.dim() > 1 else {value_expr}")
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
         self._emit(f"_idx_exp = _ai.unsqueeze(-1)")
-        self._emit(f"if _idx_exp.shape[:3] != _arr_c.shape[:3]:")
+        self._emit(f"if _idx_exp.shape[:3] != {c}.shape[:3]:")
         self._indent += 1
-        self._emit(f"_idx_exp = _idx_exp.expand(_arr_c.shape[:3] + (1,))")
+        self._emit(f"_idx_exp = _idx_exp.expand({c}.shape[:3] + (1,))")
         self._indent -= 1
-        self._emit(f"_val_exp = _es({value_expr}, _arr_c.shape[:-1]).unsqueeze(-1)")
-        self._emit(f"_arr_c.scatter_(-1, _idx_exp, _val_exp)")
+        self._emit(f"_val_exp = _es({value_expr}, {c}.shape[:-1]).unsqueeze(-1)")
+        self._emit(f"{c}.scatter_(-1, _idx_exp, _val_exp)")
         self._indent -= 1
         self._indent -= 1
+        if not owned and isinstance(target.array, Identifier):
+            self._emit(f"{self._var_target(target.array.name)} = {c}")
         if isinstance(target.array, Identifier):
-            self._emit(f"{self._var_target(target.array.name)} = _arr_c")
+            # The local now holds a freshly-cloned (or already-owned) buffer.
+            self._owned.add(target.array.name)
         self._indent -= 1
 
     def _emit_array_literal(self, node: ArrayLiteral) -> str:
@@ -1835,6 +1874,8 @@ class _CodeGen:
             if vec_type and vec_type.channels < 4:
                 value_expr = self._emit_vec_coerce(value_expr, vec_type)
             self._emit(f"{self._var_target(target.name)} = {value_expr}")
+            # Rebound to an arbitrary (possibly aliasing) value — no longer owned.
+            self._owned.discard(target.name)
         elif isinstance(target, BindingRef):
             self._emit(f"_bind[{target.name!r}] = {value_expr}")
         elif isinstance(target, ChannelAccess):
@@ -1848,9 +1889,16 @@ class _CodeGen:
 
     def _emit_channel_assign(self, target: ChannelAccess, value_expr: str):
         channels = target.channels
+        # Clone for copy-on-write — unless the base is an exclusively-owned local,
+        # in which case write the channel slice in place. Capture ownership before
+        # the base read (which disowns it).
+        owned = isinstance(target.object, Identifier) and target.object.name in self._owned
         base_expr = self._emit_expr(target.object)
-        tmp = self._tmp()
-        self._emit(f"{tmp} = {base_expr}.clone()")
+        if owned:
+            tmp = base_expr
+        else:
+            tmp = self._tmp()
+            self._emit(f"{tmp} = {base_expr}.clone()")
 
         if len(channels) == 1:
             idx = CHANNEL_MAP.get(channels)
@@ -1869,8 +1917,12 @@ class _CodeGen:
             for i, idx in enumerate(indices):
                 self._emit(f"{tmp}[..., {idx}] = {val_tmp}[..., {i}] if {multi_flag} else {val_tmp}")
 
-        if isinstance(target.object, Identifier):
+        if owned:
+            # tmp IS the owned local; written in place, so no rebind needed.
+            self._owned.add(target.object.name)
+        elif isinstance(target.object, Identifier):
             self._emit(f"{self._var_target(target.object.name)} = {tmp}")
+            self._owned.add(target.object.name)
         elif isinstance(target.object, BindingRef):
             self._emit(f"_bind[{target.object.name!r}] = {tmp}")
         else:
@@ -2401,15 +2453,26 @@ class _CodeGen:
         sel_tmp, _ = self._stencil_to_bchw(stencil)
         pad_tmp, _, _, _ = self._stencil_pad_and_kernel_size(stencil, sel_tmp)
 
-        # Depthwise conv kernel: [C, 1, kH, kW] — same kernel per channel
-        kern_tmp = self._tmp()
-        kern_list = ", ".join(f"{v:.10g}" for v in kernel_vals)
+        # Depthwise conv kernel: [C, 1, kH, kW] — same kernel per channel.
+        # The constant base kernel [1, 1, kH, kW] is a compile-time constant, so
+        # hoist its host->device build to the preamble (cached by kernel shape +
+        # values). Only the channel-count expand+contiguous is runtime-dependent.
+        kern_key = (tuple(kernel_vals), kH, kW)
+        base_kern = self._kernel_const_cache.get(kern_key)
+        if base_kern is None:
+            base_kern = self._tmp()
+            kern_list = ", ".join(f"{v:.10g}" for v in kernel_vals)
+            self._preamble.append(
+                f"    {base_kern} = _torch.tensor([{kern_list}], dtype=_torch.float32, device=_dev).view(1, 1, {kH}, {kW})"
+            )
+            self._kernel_const_cache[kern_key] = base_kern
         chan_tmp = self._tmp()
         self._emit(f"{chan_tmp} = {pad_tmp}.shape[1]")
-        self._emit(f"{kern_tmp} = _torch.tensor([{kern_list}], dtype=_torch.float32, device=_dev).view(1, 1, {kH}, {kW}).expand({chan_tmp}, 1, {kH}, {kW})")
+        kern_tmp = self._tmp()
+        self._emit(f"{kern_tmp} = {base_kern}.expand({chan_tmp}, 1, {kH}, {kW}).contiguous()")
 
         conv_tmp = self._tmp()
-        self._emit(f"{conv_tmp} = _torch.nn.functional.conv2d({pad_tmp}, {kern_tmp}.contiguous(), padding=0, groups={chan_tmp})")
+        self._emit(f"{conv_tmp} = _torch.nn.functional.conv2d({pad_tmp}, {kern_tmp}, padding=0, groups={chan_tmp})")
 
         result_tmp = self._tmp()
         self._emit(f"{result_tmp} = {conv_tmp}.permute(0, 2, 3, 1)")
@@ -2679,9 +2742,10 @@ class _CodeGen:
         """Emit a while loop with native break/continue.
 
         While loops have no user-defined update statement, so native
-        continue is safe. Note: continue skips the safety counter
-        increment, but this is acceptable since _MAX_ITER is generous
-        and the condition check still runs.
+        continue is safe. The safety counter is incremented at the TOP of
+        the loop body so a native `continue` (emitted by a TEX continue)
+        cannot skip it — otherwise a body that unconditionally hits continue
+        would loop forever, whereas the interpreter caps at MAX_LOOP_ITERATIONS.
         """
         # Hoist sample/fetch BCHW setup outside loop
         self._hoist_sample_setup(stmt.body)
@@ -2689,6 +2753,10 @@ class _CodeGen:
         self._emit(f"{iter_var} = 0")
         self._emit(f"while {iter_var} < _MAX_ITER:")
         self._indent += 1
+        # Increment first: immune to a native `continue` skipping it. With the
+        # bound at `< _MAX_ITER` this runs exactly _MAX_ITER bodies before the
+        # post-loop limit check fires — matching the interpreter's cap.
+        self._emit(f"{iter_var} += 1")
 
         self._emit_cond_break(stmt.condition)
 
@@ -2699,7 +2767,6 @@ class _CodeGen:
             self._emit_stmt(s)
         self._use_native_flow_control = saved_flow
 
-        self._emit(f"{iter_var} += 1")
         self._indent -= 1
 
         self._emit_iter_limit(iter_var, "While")
@@ -2719,6 +2786,11 @@ class _CodeGen:
             return repr(node.value)
 
         if isinstance(node, Identifier):
+            # Reading a var may alias/view its buffer (tensor slices share
+            # storage), so it is no longer provably exclusively-owned. Callers
+            # that write in place (index/channel assign) capture ownership
+            # BEFORE emitting their base read, then re-assert it after.
+            self._owned.discard(node.name)
             local = self._local_vars.get(node.name)
             if local is not None:
                 return local
@@ -2789,7 +2861,12 @@ class _CodeGen:
                     and binding_name in self._hoisted_bchw):
                 dx_expr = _extract_uv_offset_expr(node.args[0], "u")
                 dy_expr = _extract_uv_offset_expr(node.args[1], "v")
-                if dx_expr is not None and dy_expr is not None:
+                # Only direct-fetch the zero-offset case. A nonzero integer offset
+                # (dx_expr/dy_expr an ASTNode) lands sub-pixel under the interpreter's
+                # bilinear grid_sample (UV step is 1/(W-1), align_corners=True), so a
+                # nearest-neighbour pixel fetch would diverge — fall through to the
+                # inline grid_sample path to preserve bilinear semantics.
+                if dx_expr is True and dy_expr is True:
                     return self._emit_direct_fetch(binding_name, dx_expr, dy_expr)
 
             args = [self._emit_expr(a) for a in node.args]
@@ -2853,11 +2930,11 @@ class _CodeGen:
             if op in _INFIX_OPS:
                 self._emit(f"{tmp} = ({left} {op} {right})")
             elif op == "/":
-                self._emit(f"{tmp} = ({left} / ({right} if {right} != 0 else 1e-10))")
+                self._emit(f"{tmp} = ({left} / ({right} if {right} != 0 else _SAFE_EPS))")
             elif op == "%":
                 # Guard a zero divisor with a tiny epsilon (matching the '/' case
                 # and the interpreter), NOT 1.0 — which gave 0.5 % 0 -> 0.5.
-                self._emit(f"{tmp} = _math.fmod(float({left}), float({right}) if {right} != 0 else 1e-10)")
+                self._emit(f"{tmp} = _math.fmod(float({left}), float({right}) if {right} != 0 else _SAFE_EPS)")
             elif op in _CMP_OPS:
                 py_op = _CMP_OPS[op]
                 self._emit(f"{tmp} = (1.0 if {left} {py_op} {right} else 0.0)")
@@ -2972,6 +3049,11 @@ class _CodeGen:
                 sd = self._emit_safe_divisor(right)
                 self._emit(f"{tmp} = _torch.fmod({left}, {sd})")
         elif op in _CMP_OPS:
+            # String operands compare as Python str (e.g. "a"=="b" -> bool), which
+            # has no .float(). The interpreter returns a scalar 1.0/0.0; rather than
+            # emit a crashing function, fall back cleanly to the interpreter.
+            if lt == TEXType.STRING or rt == TEXType.STRING:
+                raise _Unsupported("String comparison not supported in codegen")
             py_op = _CMP_OPS[op]
             self._emit(f"{tmp} = ({left} {py_op} {right}).float()")
         elif op == "&&":
@@ -3054,7 +3136,11 @@ class _CodeGen:
                 v_arg = _resolve_through_locals(node.args[2], self._var_initializers)
                 dx_expr = _extract_uv_offset_expr(u_arg, "u")
                 dy_expr = _extract_uv_offset_expr(v_arg, "v")
-                if dx_expr is not None and dy_expr is not None:
+                # Only the zero-offset case is bit-equivalent to a direct pixel fetch.
+                # A nonzero integer offset lands sub-pixel under the interpreter's
+                # bilinear sample (align_corners=True), so fall through to the
+                # _fns['sample'] call to preserve bilinear semantics.
+                if dx_expr is True and dy_expr is True:
                     return self._emit_direct_fetch(bname, dx_expr, dy_expr)
 
         args = [self._emit_expr(a) for a in node.args]
@@ -3172,12 +3258,15 @@ class _CodeGen:
                 self._emit(f"{tmp} = float({args[0]}) + (float({args[1]}) - float({args[0]})) * float({args[2]})")
                 return tmp
             if name == "clamp":
-                self._emit(f"{tmp} = max(float({args[1]}), min(float({args[2]}), float({args[0]})))")
+                # Match torch.clamp's "max wins" behaviour when lo>hi:
+                # min(hi, max(lo, x)) returns hi, like torch.clamp, whereas
+                # max(lo, min(hi, x)) would return lo and diverge.
+                self._emit(f"{tmp} = min(float({args[2]}), max(float({args[1]}), float({args[0]})))")
                 return tmp
             if name == "smoothstep":
                 edge0, edge1, x = args
                 t = self._tmp()
-                self._emit(f"{t} = max(0.0, min(1.0, (float({x}) - float({edge0})) / (float({edge1}) - float({edge0}) + 1e-10)))")
+                self._emit(f"{t} = max(0.0, min(1.0, (float({x}) - float({edge0})) / (float({edge1}) - float({edge0}) + _SAFE_EPS)))")
                 self._emit(f"{tmp} = {t} * {t} * (3.0 - 2.0 * {t})")
                 return tmp
         # Fall through to tensor path for unhandled scalar functions
@@ -3250,13 +3339,19 @@ class _CodeGen:
                 for inner_const_idx in (0, 1):
                     if isinstance(inner_node.args[inner_const_idx], NumberLiteral):
                         inner_val_idx = 1 - inner_const_idx
-                        inner_arg = self._emit_expr(inner_node.args[inner_val_idx])
                         if name == "min":
                             lo = inner_node.args[inner_const_idx].value
                             hi = node.args[outer_const_idx].value
                         else:
                             hi = inner_node.args[inner_const_idx].value
                             lo = node.args[outer_const_idx].value
+                        # torch.clamp(x, lo, hi) only equals the nested
+                        # max(min(x,hi),lo) when lo<=hi. With inverted bounds
+                        # clamp returns hi while the nested form returns lo, so
+                        # fall through to the plain maximum/minimum composition.
+                        if lo > hi:
+                            continue
+                        inner_arg = self._emit_expr(inner_node.args[inner_val_idx])
                         self._emit(f"{tmp} = _torch.clamp({inner_arg}, {lo}, {hi})")
                         return tmp
         # Single constant arg → clamp_min/clamp_max
@@ -3345,8 +3440,25 @@ class _CodeGen:
     ) -> str | None:
         """Emit vector geometry: dot, distance, normalize, length, cross, reflect."""
         name = node.name
+        # length/distance/normalize only reduce over the channel axis for true
+        # vectors. The interpreter guards with _has_channel_axis: a scalar field
+        # whose last dim is a spatial/width axis is NOT reduced (returns abs/sign).
+        # When the static arg type is not a known vector, fall through to the
+        # _fns[] stdlib path so the runtime _has_channel_axis guard decides,
+        # preserving codegen↔interpreter equivalence.
+        if name in ("length", "normalize") and len(args) == 1:
+            at = self.type_map.get(id(node.args[0]))
+            if at is None or not at.is_vector:
+                return None
+        if name == "distance" and len(args) == 2:
+            at0 = self.type_map.get(id(node.args[0]))
+            at1 = self.type_map.get(id(node.args[1]))
+            if (at0 is None or not at0.is_vector) and (at1 is None or not at1.is_vector):
+                return None
         if name == "dot" and len(args) == 2:
-            self._emit(f"{tmp} = _torch.einsum('...c,...c->...', {args[0]}, {args[1]})")
+            # Mirror stdlib fn_dot's device split: (a*b).sum(-1) is ~6-10x faster
+            # than einsum on CUDA; einsum is kept for CPU. Numerically equivalent.
+            self._emit(f"{tmp} = ({args[0]} * {args[1]}).sum(dim=-1) if {args[0]}.is_cuda else _torch.einsum('...c,...c->...', {args[0]}, {args[1]})")
         elif name == "distance" and len(args) == 2:
             self._emit(f"{tmp} = _torch.linalg.vector_norm({args[0]} - {args[1]}, dim=-1)")
         elif name == "normalize" and len(args) == 1:
@@ -3522,7 +3634,7 @@ class _CodeGen:
             self._indent -= 1
             self._emit(f"else:")
             self._indent += 1
-            self._emit(f"{tmp} = {img_var}[_torch.arange({img_var}.shape[0]).view(-1,1,1), {py}, {px}]")
+            self._emit(f"{tmp} = {img_var}[_torch.arange({img_var}.shape[0], device=_dev).view(-1,1,1), {py}, {px}]")
             self._indent -= 1
             return tmp
         return None
