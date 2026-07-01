@@ -681,6 +681,7 @@ class TEXStdlib:
 
         # Compute masks once (shared across all 3 channels)
         # instead of 5-deep nested torch.where (which repeats comparisons 3×)
+        m0 = (i_mod == 0.0)
         m1 = (i_mod == 1.0)
         m2 = (i_mod == 2.0)
         m3 = (i_mod == 3.0)
@@ -690,10 +691,10 @@ class TEXStdlib:
         r = torch.where(m1, q, torch.where(m2 | m3, p, torch.where(m4, t, v)))
         # g: 0->t, 1->v, 2->v, 3->q, 4->p, 5->p  (default p)
         g = torch.where(m1 | m2, v, torch.where(m3, q, torch.where(m4, p,
-            torch.where(i_mod == 0.0, t, p))))
+            torch.where(m0, t, p))))
         # b: 0->p, 1->p, 2->t, 3->v, 4->v, 5->q  (default q)
         b = torch.where(m1, p, torch.where(m2, t, torch.where(m3 | m4, v,
-            torch.where(i_mod == 0.0, p, q))))
+            torch.where(m0, p, q))))
 
         result = torch.cat([r, g, b], dim=-1)
         # If input was vec4, preserve alpha

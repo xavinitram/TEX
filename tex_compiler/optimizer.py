@@ -44,7 +44,12 @@ def _clone_expr(expr: ASTNode) -> ASTNode:
 # Pure math functions safe for constant folding (no side effects, deterministic)
 _PURE_FUNCTIONS: dict[str, callable] = {
     "sin": math.sin, "cos": math.cos, "tan": math.tan,
-    "asin": math.asin, "acos": math.acos, "atan": math.atan,
+    # asin/acos clamp their arg to [-1,1] to mirror the runtime domain guard
+    # (fn_asin/fn_acos), matching how sqrt/log are clamped below. Without this
+    # a constant out-of-domain fold (e.g. asin(2.0)) would raise ValueError.
+    "asin": lambda x: math.asin(max(-1.0, min(1.0, x))),
+    "acos": lambda x: math.acos(max(-1.0, min(1.0, x))),
+    "atan": math.atan,
     "atan2": math.atan2,
     "sqrt": lambda x: math.sqrt(max(0.0, x)),
     "abs": abs, "sign": lambda x: (1.0 if x > 0 else -1.0 if x < 0 else 0.0),

@@ -23,7 +23,7 @@ from typing import Any, Callable
 
 from .tex_compiler.lexer import Lexer
 from .tex_compiler.parser import Parser
-from .tex_compiler.type_checker import TypeChecker
+from .tex_compiler.type_checker import TypeChecker, TypeCheckError
 from .tex_compiler.optimizer import optimize
 from .tex_compiler import ast_nodes as A
 from .tex_runtime.stdlib import TEXStdlib
@@ -326,12 +326,22 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     binding_types = {name: infer_binding_type(val) for name, val in merged_bindings.items()}
 
     checker = TypeChecker(binding_types=binding_types, source="<fused chain>")
-    type_map = checker.check(fused)
-    fused = optimize(fused, type_map)
-    # Re-type-check the optimized AST from scratch (mirrors TEXCache.compile_tex):
-    # rebuilds a complete id()-keyed type_map covering optimizer-synthesized nodes.
-    type_map = TypeChecker(binding_types=binding_types, source="<fused chain>",
-                           strict_redeclare=False).check(fused)
+    try:
+        type_map = checker.check(fused)
+        fused = optimize(fused, type_map)
+        # Re-type-check the optimized AST from scratch (mirrors TEXCache.compile_tex):
+        # rebuilds a complete id()-keyed type_map covering optimizer-synthesized nodes.
+        type_map = TypeChecker(binding_types=binding_types, source="<fused chain>",
+                               strict_redeclare=False).check(fused)
+    except TypeCheckError as e:
+        # A fused chain that doesn't type-check as one program is unfusable —
+        # surface it as a clean FusionError (the node's contract) instead of an
+        # uncaught crash. The common trigger is an @OUT type hint (m@/img@/s@ )
+        # on a non-terminal stage that fusion can't reproduce.
+        raise FusionError(
+            "This chain can't be fused into a single valid program (often an @OUT "
+            "type hint like m@OUT/img@OUT on an upstream node, or mismatched channel "
+            f"types across stages). Break the chain at that node. [{e}]") from e
     used_builtins = _collect_identifiers(fused)
     return (fused, type_map, checker.referenced_bindings, checker.assigned_bindings,
             checker.param_declarations, used_builtins, merged_bindings)

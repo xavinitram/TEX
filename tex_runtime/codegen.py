@@ -94,7 +94,7 @@ def try_compile(program: Program, type_map: dict[int, TEXType]) -> Any | None:
 # We emit _torch.XXX(arg) directly, avoiding dict lookup + function call + _to_tensor.
 _INLINE_TORCH_1ARG: dict[str, str] = {
     "sin": "sin", "cos": "cos", "tan": "tan",
-    "asin": "asin", "acos": "acos", "atan": "atan",
+    "atan": "atan",
     "sinh": "sinh", "cosh": "cosh", "tanh": "tanh",
     "exp": "exp", "abs": "abs",
     "floor": "floor", "ceil": "ceil", "round": "round", "trunc": "trunc",
@@ -111,7 +111,7 @@ _INLINE_TORCH_2ARG: dict[str, str] = {
 # math module equivalents for scalar-mode emission (Python float path).
 _SCALAR_MATH_1ARG: dict[str, str] = {
     "sin": "sin", "cos": "cos", "tan": "tan",
-    "asin": "asin", "acos": "acos", "atan": "atan",
+    "atan": "atan",
     "sinh": "sinh", "cosh": "cosh", "tanh": "tanh",
     "exp": "exp", "abs": "fabs",
     "floor": "floor", "ceil": "ceil", "trunc": "trunc",
@@ -1228,6 +1228,11 @@ class _CodeGen:
         self._hoisted_bchw: dict[str, tuple[str, str]] = {}
         # VarDecl initializer AST nodes for sample→fetch pattern resolution
         self._var_initializers: dict[str, ASTNode] = {}
+        # Vars currently holding a per-pixel/spatial value. Unlike _var_initializers
+        # (only the VarDecl initializer, popped on reassignment) this tracks spatial
+        # -ness across reassignments, so the scalar-loop fast path never misclassifies
+        # a reassigned-spatial var and emits .item() on a tensor (a runtime crash).
+        self._spatial_vars: set[str] = set()
         # Pre-resolved stdlib function locals: name → preamble variable.
         # Avoids _fns['name'] dict lookup on every call.
         self._fn_locals: dict[str, str] = {}
@@ -1292,25 +1297,42 @@ class _CodeGen:
         self._fn_locals[name] = local
         return local
 
+    def _direct_fetch_coords_available(self) -> bool:
+        """True only when integer pixel coords ix/iy are materialized as locals.
+
+        The direct-fetch fast path references the loop integer coordinates.
+        ix/iy are read-only builtins that only exist as Python locals
+        (_lv_ix/_lv_iy, initialized in the preamble from _env) when they were
+        registered by _collect_modified_vars / builtin usage. If a program
+        samples with u/v and never mentions ix/iy, those locals don't exist and
+        the fast path would emit an undefined-name reference (NameError). Callers
+        must gate on this and fall through to inline grid_sample otherwise.
+        """
+        return "ix" in self._local_vars and "iy" in self._local_vars
+
     def _emit_direct_fetch(self, binding_name: str,
                            dx_expr: ASTNode | bool, dy_expr: ASTNode | bool) -> str:
         """Emit direct tensor indexing for sample-with-integer-offset patterns.
 
         Shared by BindingSampleAccess and FunctionCall("sample") paths.
+        Callers MUST first check _direct_fetch_coords_available(); this emitter
+        references ix/iy via _var_target and assumes they are materialized.
         """
         img_var = f"_bind[{binding_name!r}]"
+        ix_ref = self._var_target("ix")
+        iy_ref = self._var_target("iy")
         dx_code = self._emit_expr(dx_expr) if dx_expr is not True else "0"
         dy_code = self._emit_expr(dy_expr) if dy_expr is not True else "0"
         px_tmp = self._tmp()
         py_tmp = self._tmp()
         if dx_code == "0":
-            self._emit(f"{px_tmp} = _lv_ix.clamp(0, {img_var}.shape[2] - 1).long()")
+            self._emit(f"{px_tmp} = {ix_ref}.clamp(0, {img_var}.shape[2] - 1).long()")
         else:
-            self._emit(f"{px_tmp} = (_lv_ix + {dx_code}).clamp(0, {img_var}.shape[2] - 1).long()")
+            self._emit(f"{px_tmp} = ({ix_ref} + {dx_code}).clamp(0, {img_var}.shape[2] - 1).long()")
         if dy_code == "0":
-            self._emit(f"{py_tmp} = _lv_iy.clamp(0, {img_var}.shape[1] - 1).long()")
+            self._emit(f"{py_tmp} = {iy_ref}.clamp(0, {img_var}.shape[1] - 1).long()")
         else:
-            self._emit(f"{py_tmp} = (_lv_iy + {dy_code}).clamp(0, {img_var}.shape[1] - 1).long()")
+            self._emit(f"{py_tmp} = ({iy_ref} + {dy_code}).clamp(0, {img_var}.shape[1] - 1).long()")
         tmp = self._tmp()
         self._emit(f"{tmp} = {img_var}[:, {py_tmp}, {px_tmp}, :]"
                    f" if {px_tmp}.dim() < 3"
@@ -1551,6 +1573,11 @@ class _CodeGen:
         if stmt.initializer:
             # Track local definitions for sample→fetch pattern resolution
             self._var_initializers[stmt.name] = stmt.initializer
+            # Record whether this var now holds a spatial value (transitively).
+            if self._init_is_spatial(stmt.initializer):
+                self._spatial_vars.add(stmt.name)
+            else:
+                self._spatial_vars.discard(stmt.name)
             expr = self._emit_expr(stmt.initializer)
             # Coerce channel count when declared type is a smaller vector
             declared = TYPE_NAME_MAP.get(stmt.type_name)
@@ -1876,6 +1903,18 @@ class _CodeGen:
             self._emit(f"{self._var_target(target.name)} = {value_expr}")
             # Rebound to an arbitrary (possibly aliasing) value — no longer owned.
             self._owned.discard(target.name)
+            # Invalidate the stale VarDecl initializer: _resolve_through_locals must
+            # NOT keep resolving this name to its original initializer after it has
+            # been reassigned (otherwise sample()->direct-fetch misclassifies a
+            # sub-pixel-shifted UV as a zero-offset nearest fetch).
+            self._var_initializers.pop(target.name, None)
+            # Track spatial-ness across the reassignment (transitively, via
+            # _spatial_vars) so a later scalar-loop analysis isn't fooled into
+            # emitting .item() on a now-per-pixel tensor.
+            if self._init_is_spatial(stmt.value):
+                self._spatial_vars.add(target.name)
+            else:
+                self._spatial_vars.discard(target.name)
         elif isinstance(target, BindingRef):
             self._emit(f"_bind[{target.name!r}] = {value_expr}")
         elif isinstance(target, ChannelAccess):
@@ -2079,7 +2118,7 @@ class _CodeGen:
         if isinstance(expr, (BindingRef, BindingSampleAccess, BindingIndexAccess)):
             return True
         if isinstance(expr, Identifier):
-            if expr.name in _SPATIAL_BUILTINS:
+            if expr.name in _SPATIAL_BUILTINS or expr.name in self._spatial_vars:
                 return True
             nxt = self._var_initializers.get(expr.name)
             return self._init_is_spatial(nxt, _seen) if nxt is not None else False
@@ -2164,10 +2203,13 @@ class _CodeGen:
             # the type checker marks them as FLOAT.
             if node.name in _SPATIAL_BUILTINS:
                 return False
-            # A scalar-typed var initialized from a spatial source (e.g.
-            # `float s = @A.r;` declared before the loop) is a per-pixel tensor at
-            # runtime. The scalar fast path emits `.item()` on it -> crash, so the
-            # loop must not be treated as scalar.
+            # A scalar-typed var holding a spatial value (e.g. `float s = @A.r;`, or
+            # made spatial by a pre-loop reassignment `s = @A.r*3.0;`) is a per-pixel
+            # tensor at runtime. The scalar fast path emits `.item()` on it -> crash,
+            # so the loop must not be treated as scalar. _spatial_vars tracks this
+            # across reassignments (which pop _var_initializers).
+            if node.name in self._spatial_vars:
+                return False
             init = self._var_initializers.get(node.name)
             if init is not None and self._init_is_spatial(init):
                 return False
@@ -2278,9 +2320,17 @@ class _CodeGen:
         self._indent -= 1
 
     def _emit_safe_divisor(self, divisor_expr: str) -> str:
-        """Emit a zero-safe divisor guard. Returns the temp var name."""
+        """Emit a zero-safe divisor guard. Returns the temp var name.
+
+        In tensor-codegen mode every operand is a torch tensor, so the
+        `not _torch.is_tensor(...)` branch was dead code. Bind the divisor to a
+        temp once (avoids re-evaluating/re-slicing the expression 4x) and emit a
+        single _tw guard.
+        """
+        d = self._tmp()
         sd = self._tmp()
-        self._emit(f"{sd} = (_SAFE_EPS if {divisor_expr} == 0 else {divisor_expr}) if not _torch.is_tensor({divisor_expr}) else _tw({divisor_expr} == 0, _SAFE_EPS, {divisor_expr})")
+        self._emit(f"{d} = {divisor_expr}")
+        self._emit(f"{sd} = _tw({d} == 0, _SAFE_EPS, {d})")
         return sd
 
     def _emit_bp(self, expr_a: str, expr_b: str) -> tuple[str, str]:
@@ -2866,7 +2916,10 @@ class _CodeGen:
                 # bilinear grid_sample (UV step is 1/(W-1), align_corners=True), so a
                 # nearest-neighbour pixel fetch would diverge — fall through to the
                 # inline grid_sample path to preserve bilinear semantics.
-                if dx_expr is True and dy_expr is True:
+                # Also require ix/iy to be materialized as locals; without them the
+                # direct-fetch emitter would reference undefined names (NameError).
+                if (dx_expr is True and dy_expr is True
+                        and self._direct_fetch_coords_available()):
                     return self._emit_direct_fetch(binding_name, dx_expr, dy_expr)
 
             args = [self._emit_expr(a) for a in node.args]
@@ -2983,6 +3036,11 @@ class _CodeGen:
             l_scalar = not l_vec and not lt.is_matrix
             r_scalar = not r_vec and not rt.is_matrix
             if (l_vec and r_scalar) or (l_scalar and r_vec):
+                needs_broadcast = True
+            elif (lt.is_matrix and r_scalar) or (l_scalar and rt.is_matrix):
+                # matrix ⊗ scalar-field: route through _bp so the scalar gets
+                # trailing singleton dims ([B,H,W]→[B,H,W,1,1]) and right-aligns
+                # against the matrix's [...,N,N] axes, mirroring the interpreter.
                 needs_broadcast = True
             elif l_vec and r_vec and lt.channels != rt.channels:
                 needs_channel_pad = True
@@ -3140,7 +3198,11 @@ class _CodeGen:
                 # A nonzero integer offset lands sub-pixel under the interpreter's
                 # bilinear sample (align_corners=True), so fall through to the
                 # _fns['sample'] call to preserve bilinear semantics.
-                if dx_expr is True and dy_expr is True:
+                # Also require ix/iy to be materialized as locals; otherwise the
+                # direct-fetch emitter references undefined names (NameError) and we
+                # fall through to the inline grid_sample path (verified equivalent).
+                if (dx_expr is True and dy_expr is True
+                        and self._direct_fetch_coords_available()):
                     return self._emit_direct_fetch(bname, dx_expr, dy_expr)
 
         args = [self._emit_expr(a) for a in node.args]
@@ -3168,6 +3230,10 @@ class _CodeGen:
 
         # Table-driven inline torch functions (simple 1:1 mappings)
         if len(args) == 1:
+            # asin/acos: mirror interpreter's [-1,1] domain clamp (avoids NaN)
+            if name in ("asin", "acos"):
+                self._emit(f"{tmp} = _torch.{name}(_torch.clamp({args[0]}, -1.0, 1.0))")
+                return tmp
             torch_fn = _INLINE_TORCH_1ARG.get(name)
             if torch_fn is not None:
                 self._emit(f"{tmp} = _torch.{torch_fn}({args[0]})")
@@ -3201,6 +3267,10 @@ class _CodeGen:
         to the tensor path.
         """
         if len(args) == 1:
+            # asin/acos: mirror interpreter's [-1,1] domain clamp (avoids ValueError)
+            if name in ("asin", "acos"):
+                self._emit(f"{tmp} = _math.{name}(max(-1.0, min(1.0, float({args[0]}))))")
+                return tmp
             math_fn = _SCALAR_MATH_1ARG.get(name)
             if math_fn is not None:
                 if math_fn == "copysign":
@@ -3251,7 +3321,7 @@ class _CodeGen:
                 self._emit(f"{tmp} = 1.0 if float({args[1]}) >= float({args[0]}) else 0.0")
                 return tmp
             if name == "mod":
-                self._emit(f"{tmp} = _math.fmod(float({args[0]}), float({args[1]}))")
+                self._emit(f"{tmp} = _math.fmod(float({args[0]}), float({args[1]}) if float({args[1]}) != 0 else _SAFE_EPS)")
                 return tmp
         elif len(args) == 3:
             if name == "lerp":
@@ -3294,9 +3364,10 @@ class _CodeGen:
                 self._emit(f"{sq} = {args[0]} * {args[0]}")
                 self._emit(f"{tmp} = {sq} * {args[0]}")
                 return tmp
-            if v == 0.5:
-                self._emit(f"{tmp} = _torch.sqrt(_torch.clamp({args[0]}, min=0.0))")
-                return tmp
+            # NOTE: pow(x, 0.5) is deliberately NOT specialized to sqrt(clamp):
+            # sqrt(clamp(x,min=0)) returns 0 for negative bases whereas the
+            # interpreter's fn_pow returns NaN. Fall through to _torch.pow to
+            # preserve codegen<->interpreter equivalence (matches optimizer.py:364).
             if v == -1.0:
                 self._emit(f"{tmp} = _torch.reciprocal({args[0]} + _SAFE_EPS)")
                 return tmp
@@ -3698,7 +3769,13 @@ class _CodeGen:
         tmp = self._tmp()
 
         if len(args) == 1:
-            self._emit(f"{tmp} = _torch.eye({n}, dtype=_torch.float32, device=_dev) * {args[0]}")
+            # Scaled identity. A per-pixel scalar field [B,H,W] must become a
+            # per-pixel diagonal [B,H,W,n,n]; append two singleton axes at runtime
+            # so it broadcasts against eye's trailing [n,n] (matches interpreter).
+            v = self._tmp()
+            self._emit(f"{v} = {args[0]}")
+            self._emit(f"if _torch.is_tensor({v}) and {v}.dim() >= 3: {v} = {v}.reshape(*{v}.shape, 1, 1)")
+            self._emit(f"{tmp} = _torch.eye({n}, dtype=_torch.float32, device=_dev) * {v}")
         elif len(args) == n * n:
             components = ", ".join(f"_es({a}, _sp)" for a in args)
             flat = self._tmp()

@@ -279,7 +279,6 @@ class _TieredCache:
         self.cache: dict = {}
         self._compile_attempted: set = set()
         self._call_count: dict = {}
-        self._seen_once: set = set()
         self._lock = threading.Lock()
 
     def get(self, key):
@@ -309,21 +308,17 @@ class _TieredCache:
         self._call_count.pop(key, None)
 
     def store(self, key, trace_fn):
-        """Store a traced version once the key recurs.
+        """Store a traced version on first call. trace_fn() → traced callable or raise.
 
-        Building the trace runs trace_fn() which internally executes the eager
-        function once more, so deferring the build to the SECOND call avoids
-        evaluating the noise field twice on the very first frame. The first call
-        only records the key as seen (cache stays empty, so the eager path runs
-        again next time); the trace is built on the second call.
-        trace_fn() → traced callable or raise.
+        The trace is built eagerly on the first call: building it runs the eager
+        function once more (a one-time double-eval on the very first frame), but
+        it makes the traced fast path available from the *second* call onward.
+        Deferring the build to the second call instead measurably regressed warm
+        CPU throughput (more eager-path runs in steady state), which is the case
+        that matters for repeated cooking — so we build on first touch.
         """
         if key in self.cache:
             return
-        with self._lock:
-            if key not in self._seen_once:
-                self._seen_once.add(key)
-                return
         try:
             self.cache[key] = trace_fn()
         except Exception:
@@ -430,21 +425,24 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
         _fbm_cache.try_upgrade(key, _compile_fbm)
         return _fbm_cache.get(key)(x, y)
 
-    # Eager execution using arithmetic hash (first call)
+    # Eager execution using arithmetic hash (first call).
+    # This MUST be bit-identical to _make_fbm_fast_fn's fbm_fn so the cold
+    # (eager) frame matches every subsequent traced/compiled frame exactly:
+    #   - out-of-place accumulation: result = result + noise * amp
+    #   - final scale by inv_max = 1.0 / max_amp (not div_ by max_amp)
+    # so codegen (which mirrors the traced formulation) stays bit-identical.
     result = _perlin2d_fast(x, y)
-    max_amp = 1.0
-    amplitude = 0.5
+    max_amp = sum(0.5 ** i for i in range(octaves))
+    inv_max = 1.0 / max_amp
 
     if octaves > 1:
-        x_sc = x * 2.0
-        y_sc = y * 2.0
+        freq = 2.0
+        amplitude = 0.5
         for _ in range(octaves - 1):
-            result.add_(_perlin2d_fast(x_sc, y_sc), alpha=amplitude)
-            max_amp += amplitude
-            amplitude *= 0.5
-            x_sc.mul_(2.0)
-            y_sc.mul_(2.0)
-        result.div_(max_amp)
+            result = result + _perlin2d_fast(x * freq, y * freq) * amplitude
+            amplitude = amplitude * 0.5
+            freq = freq * 2.0
+        result = result * inv_max
 
     # Always cache a trace of the ARITHMETIC-hash FBM — the same noise field as
     # the eager first call above. Previously the no-MSVC branch traced a

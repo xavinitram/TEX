@@ -224,6 +224,10 @@ class Interpreter:
         self.env = {}
         self.bindings = {}
         self._array_meta = {}
+        # Declared channel width of vec2/vec3 variables (N<4), so reassignment to a
+        # wider value (e.g. `vec3 sum; sum += sample()` where sample()->vec4) is
+        # truncated to the declared width, matching codegen's _emit_vec_coerce.
+        self._var_widths: dict[str, int] = {}
         self._inplace_ready.clear()
         self._literal_cache.clear()
         self._user_functions.clear()
@@ -407,6 +411,33 @@ class Interpreter:
             hint="This node type is not supported as a statement.",
         )
 
+    def _aliased_vars(self, expr) -> set:
+        """Variable names whose tensor buffer `expr` may return as a VIEW (shared
+        storage). Fresh-allocating expressions — arithmetic, unary, function calls,
+        constructors, casts, literals — never alias an existing variable, so they
+        return the empty set (which keeps the in-place fast path for `x = x OP c`).
+        View-producing forms do alias: a bare `x`, a channel/swizzle read `x.rgb`/
+        `x.r` (a contiguous slice shares storage), a ternary that passes a branch
+        through, and an array-index read. Used to invalidate in-place readiness so
+        a later in-place mutation of the source can't corrupt an alias of it."""
+        cls = expr.__class__
+        if cls is Identifier:
+            return {expr.name}
+        if cls is ChannelAccess:
+            return self._aliased_vars(expr.object)
+        if cls is TernaryOp:
+            return self._aliased_vars(expr.true_expr) | self._aliased_vars(expr.false_expr)
+        if cls is ArrayIndexAccess:
+            return self._aliased_vars(expr.array)
+        return set()
+
+    def _coerce_vec_width(self, value, n: int):
+        """Truncate a tensor to n channels if it has more — enforces a declared
+        vec2/vec3 width so a variable never silently widens (matches codegen)."""
+        if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[-1] > n:
+            return value[..., :n]
+        return value
+
     def _exec_var_decl(self, node: VarDecl):
         if node.initializer:
             value = self._eval(node.initializer)
@@ -418,14 +449,24 @@ class Interpreter:
             # node.type_name survives cloning, so resolve from it first.
             declared = TYPE_NAME_MAP.get(node.type_name) or self.type_map.get(id(node), TEXType.FLOAT)
             value = self._default_value(declared)
+        # Record the declared vec2/vec3 width and coerce the value to it, so later
+        # reassignment with a wider value is truncated to the declared channels.
+        declared_t = TYPE_NAME_MAP.get(node.type_name)
+        if declared_t is not None and declared_t.is_vector and declared_t.channels < 4:
+            self._var_widths[node.name] = declared_t.channels
+            value = self._coerce_vec_width(value, declared_t.channels)
+        else:
+            self._var_widths.pop(node.name, None)
         self.env[node.name] = value
         # New declaration invalidates in-place readiness (value may be aliased)
         self._inplace_ready.discard(node.name)
-        # A bare-Identifier initializer (e.g. `vec4 y = x;`) aliases the source's
-        # buffer; invalidate the source too so a later in-place op on it clones
-        # first instead of mutating this declaration's shared buffer.
-        if isinstance(node.initializer, Identifier):
-            self._inplace_ready.discard(node.initializer.name)
+        # Any variable the initializer may alias by VIEW (bare `y=x`, swizzle/
+        # channel read `y=x.rgb`/`y=x.r`, ternary passthrough, array-index) must
+        # lose in-place readiness, so a later in-place op on it clones first
+        # instead of mutating this declaration's shared buffer.
+        if node.initializer is not None:
+            for _name in self._aliased_vars(node.initializer):
+                self._inplace_ready.discard(_name)
 
     def _exec_array_decl(self, node: ArrayDecl):
         """Execute an array declaration."""
@@ -567,14 +608,21 @@ class Interpreter:
         value = self._eval(node.value)
 
         if isinstance(target, Identifier):
+            # Enforce the declared vec2/vec3 width on reassignment so the variable
+            # doesn't silently widen (e.g. `vec3 sum; sum += sample()`), matching
+            # codegen's _emit_vec_coerce.
+            _w = self._var_widths.get(target.name)
+            if _w is not None:
+                value = self._coerce_vec_width(value, _w)
             self.env[target.name] = value
-            # The new value may alias another variable's buffer (e.g. `y = x`).
-            # Invalidate in-place readiness for the target so a fresh clone
-            # happens before its next in-place op, and for a bare-Identifier
-            # source so a later in-place op on it does not corrupt this alias.
+            # Invalidate in-place readiness for the target (rebound to a possibly
+            # aliasing value) and for every variable the value may alias by view
+            # (bare `y=x`, `y=x.rgb`/`y=x.r`, ternary passthrough, array-index),
+            # so a later in-place op on the source clones instead of corrupting
+            # this alias.
             self._inplace_ready.discard(target.name)
-            if isinstance(node.value, Identifier):
-                self._inplace_ready.discard(node.value.name)
+            for _name in self._aliased_vars(node.value):
+                self._inplace_ready.discard(_name)
 
         elif isinstance(target, BindingRef):
             self.bindings[target.name] = value
@@ -1231,6 +1279,12 @@ class Interpreter:
             if op == "-":
                 return left - right
             if op == "/":
+                # A compile-time nonzero constant divisor needs no zero-guard —
+                # skip the two extra full-size tensors (mask + where), matching the
+                # codegen backend's existing fast path. This matters here because
+                # the interpreter is the hot path on compiler-less boxes.
+                if isinstance(node.right, NumberLiteral) and node.right.value != 0:
+                    return left / right
                 # Avoid division by zero: replace 0 with SAFE_EPSILON (fewer temporaries than multiply+add)
                 return left / torch.where(right == 0, SAFE_EPSILON, right)
             if op == "<":
@@ -1250,6 +1304,8 @@ class Interpreter:
             if op == "||":
                 return ((left > 0.5) | (right > 0.5)).float()
             if op == "%":
+                if isinstance(node.right, NumberLiteral) and node.right.value != 0:
+                    return torch.fmod(left, right)
                 return torch.fmod(left, torch.where(right == 0, SAFE_EPSILON, right))
             raise InterpreterError(
                 f"Operator '{op}' is not supported",
@@ -1545,6 +1601,11 @@ class Interpreter:
             # Scaled identity: mat3(1.0) → identity * scalar
             val = args[0]
             eye = torch.eye(n, dtype=self._dtype, device=self.device)
+            if isinstance(val, torch.Tensor) and val.dim() >= 3:
+                # A per-pixel scalar field [B,H,W] must become a per-pixel diagonal
+                # matrix [B,H,W,n,n]; append two singleton axes so it broadcasts
+                # against eye's trailing [n,n] instead of mis-aligning against W.
+                val = val.reshape(*val.shape, 1, 1)
             return eye * val
         elif len(args) == n * n:
             # Full specification: mat3(a,b,c,d,e,f,g,h,i) → 3×3 row-major
@@ -1741,7 +1802,32 @@ def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, tor
                 b = torch.nn.functional.pad(b, (0, ac - bc))
         return a, b
 
-    # Pad trailing dims with single view+expand (no while loop)
+    # A bare [N,N] matrix's axes are TRAILING (right-aligned), unlike a scalar
+    # field whose spatial axes are LEADING. Handle every bare-matrix pairing
+    # explicitly, building a common [<spatial>, N, N] — appending trailing
+    # singletons to the matrix (as we do for a scalar) would mis-align it.
+    _MAT = (3, 4)
+
+    def _is_bare_mat(t: torch.Tensor) -> bool:
+        return t.dim() == 2 and t.shape[-1] in _MAT and t.shape[-1] == t.shape[-2]
+
+    if _is_bare_mat(a) or _is_bare_mat(b):
+        mat, other, mat_is_a = (a, b, True) if _is_bare_mat(a) else (b, a, False)
+        n = mat.shape[-1]
+        if (other.dim() >= 4 and other.shape[-1] in _MAT
+                and other.shape[-1] == other.shape[-2]):
+            # bare matrix vs spatial matrix [...,N,N]: leading singletons on the bare one
+            mat_e = mat.view(*((1,) * (other.dim() - 2)), n, n).expand_as(other)
+            return (mat_e, other) if mat_is_a else (other, mat_e)
+        # bare matrix vs scalar field [B,H,W]: matrix -> [1..,N,N], field -> [<sp>,1,1]
+        sp = tuple(other.shape)
+        mat_e = mat.view(*((1,) * len(sp)), n, n).expand(*sp, n, n)
+        field_e = other.reshape(*sp, 1, 1).expand(*sp, n, n)
+        return (mat_e, field_e) if mat_is_a else (field_e, mat_e)
+
+    # Otherwise pad the lower-rank operand with TRAILING singletons and expand:
+    # a scalar field [B,H,W] -> [B,H,W,1] against a vector [B,H,W,C], and a spatial
+    # matrix [B,H,W,N,N] vs a scalar field [B,H,W] both land here correctly.
     if ad > bd:
         b = b.view(*b.shape, *((1,) * (ad - bd))).expand_as(a)
         return a, b
