@@ -15,7 +15,8 @@ Type promotion rules:
   float -> vec4 (broadcast)
   vec2 -> vec3 (pads with 0)
   vec3 -> vec4 (adds alpha=1.0)
-  vec4 -> vec3 (drops alpha) — only via explicit .rgb/.xyz swizzle
+  vec4 -> vec3 (drops extra channels) — implicit on assignment/declaration,
+                or explicit via .rgb/.xyz swizzle
 
 Output types:
   float: scalar per-pixel value
@@ -32,7 +33,11 @@ from .ast_nodes import (
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, MatConstructor,
     CastExpr, SourceLoc, ArrayDecl, ArrayIndexAccess, ArrayLiteral, ParamDecl,
-    BindingIndexAccess, BindingSampleAccess,
+    BindingIndexAccess, BindingSampleAccess, ErrorNode,
+)
+from .diagnostics import (
+    TEXMultiError, get_function_hint, get_keyword_hint, get_type_hint,
+    get_variable_hint, make_diagnostic, suggest_similar,
 )
 
 
@@ -133,6 +138,20 @@ VALID_SWIZZLES = {
 }
 
 
+# stdlib_signatures imports TEXType from this module at load time, so a plain
+# module-level import of FUNCTION_SIGNATURES here would be circular (it would
+# break whenever stdlib_signatures is imported first). Bind the table lazily.
+_FUNCTION_SIGNATURES: dict | None = None
+
+
+def _function_signatures() -> dict:
+    global _FUNCTION_SIGNATURES
+    if _FUNCTION_SIGNATURES is None:
+        from .stdlib_signatures import FUNCTION_SIGNATURES
+        _FUNCTION_SIGNATURES = FUNCTION_SIGNATURES
+    return _FUNCTION_SIGNATURES
+
+
 # Maps typed-binding prefixes to their TEXType
 BINDING_HINT_TYPES = {
     "f": TEXType.FLOAT,
@@ -167,7 +186,6 @@ class TypeCheckError(Exception):
     def _build_diagnostic(self):
         if self.diagnostic is not None:
             return
-        from .diagnostics import make_diagnostic
         self.diagnostic = make_diagnostic(
             code=self._code,
             message=self._raw_message,
@@ -272,14 +290,10 @@ class TypeChecker:
                 e._build_diagnostic()
             if len(self.errors) == 1:
                 raise self.errors[0]
-            from .diagnostics import TEXMultiError
             diagnostics = [e.diagnostic for e in self.errors if e.diagnostic]
             raise TEXMultiError(diagnostics)
 
         return self._types
-
-    def get_type(self, node: ASTNode) -> TEXType:
-        return self._types.get(id(node), TEXType.VOID)
 
     def _set_type(self, node: ASTNode, t: TEXType):
         self._types[id(node)] = t
@@ -363,42 +377,28 @@ class TypeChecker:
     # -- Statement checking ---------------------------------------------
 
     def _check_stmt(self, node: ASTNode):
-        from .ast_nodes import ErrorNode
-        if isinstance(node, ErrorNode):
-            return  # Skip — already reported by parser
-        elif isinstance(node, VarDecl):
-            self._check_var_decl(node)
-        elif isinstance(node, ArrayDecl):
-            self._check_array_decl(node)
-        elif isinstance(node, Assignment):
-            self._check_assignment(node)
-        elif isinstance(node, IfElse):
-            self._check_if_else(node)
-        elif isinstance(node, ForLoop):
-            self._check_for_loop(node)
-        elif isinstance(node, WhileLoop):
-            self._check_while_loop(node)
-        elif isinstance(node, ExprStatement):
-            self._check_expr(node.expr)
-        elif isinstance(node, ParamDecl):
-            self._check_param_decl(node)
-        elif isinstance(node, (BreakStmt, ContinueStmt)):
-            kind = "break" if isinstance(node, BreakStmt) else "continue"
-            if self._loop_depth <= 0:
-                self._error(f"'{kind}' statement outside of a loop.", node.loc, code="E3002",
-                            hint=f"'{kind}' can only be used inside for or while loops.")
-        elif isinstance(node, FunctionDef):
-            self._check_function_def(node)
-        elif isinstance(node, ReturnStmt):
-            self._check_return_stmt(node)
-        else:
+        handler = _STMT_HANDLERS.get(node.__class__)
+        if handler is None:
             self._error(f"This statement type isn't recognized: {type(node).__name__}.", node.loc,
                         code="E4000", hint="This may be a syntax that TEX doesn't support yet.")
+            return
+        handler(self, node)
+
+    def _check_error_node(self, node: ErrorNode):
+        return  # Skip — already reported by parser
+
+    def _check_expr_statement(self, node: ExprStatement):
+        self._check_expr(node.expr)
+
+    def _check_break_continue(self, node: ASTNode):
+        kind = "break" if node.__class__ is BreakStmt else "continue"
+        if self._loop_depth <= 0:
+            self._error(f"'{kind}' statement outside of a loop.", node.loc, code="E3002",
+                        hint=f"'{kind}' can only be used inside for or while loops.")
 
     def _check_var_decl(self, node: VarDecl):
         declared_type = TYPE_NAME_MAP.get(node.type_name)
         if declared_type is None:
-            from .diagnostics import get_type_hint
             hint = (get_type_hint(node.type_name)
                     or "Try: float, int, vec2, vec3, vec4, mat3, mat4, or string.")
             self._error(f"Unknown type name '{node.type_name}'.", node.loc,
@@ -779,8 +779,7 @@ class TypeChecker:
             self._error(f"Function '{name}' is already defined.", node.loc, code="E3010")
             return
 
-        from .stdlib_signatures import FUNCTION_SIGNATURES
-        if name in FUNCTION_SIGNATURES:
+        if name in _function_signatures():
             self._error(f"'{name}' is a built-in function and cannot be redefined.",
                         node.loc, code="E3011",
                         hint="Choose a different name for your function.")
@@ -839,73 +838,35 @@ class TypeChecker:
     # -- Expression checking --------------------------------------------
 
     def _check_expr(self, node: ASTNode) -> TEXType:
-        if isinstance(node, NumberLiteral):
-            t = TEXType.INT if node.is_int else TEXType.FLOAT
-            self._set_type(node, t)
-            return t
+        handler = _EXPR_HANDLERS.get(node.__class__)
+        if handler is None:
+            self._error(f"This expression type isn't recognized: {type(node).__name__}.",
+                        node.loc, code="E4000",
+                        hint="This may be a syntax that TEX doesn't support yet.")
+            self._set_type(node, TEXType.FLOAT)
+            return TEXType.FLOAT
+        return handler(self, node)
 
-        if isinstance(node, StringLiteral):
-            self._set_type(node, TEXType.STRING)
-            return TEXType.STRING
+    def _check_number_literal(self, node: NumberLiteral) -> TEXType:
+        t = TEXType.INT if node.is_int else TEXType.FLOAT
+        self._set_type(node, t)
+        return t
 
-        if isinstance(node, Identifier):
-            return self._check_identifier(node)
+    def _check_string_literal(self, node: StringLiteral) -> TEXType:
+        self._set_type(node, TEXType.STRING)
+        return TEXType.STRING
 
-        if isinstance(node, BindingRef):
-            return self._check_binding_ref(node)
-
-        if isinstance(node, ChannelAccess):
-            return self._check_channel_access(node)
-
-        if isinstance(node, BinOp):
-            return self._check_binop(node)
-
-        if isinstance(node, UnaryOp):
-            return self._check_unary(node)
-
-        if isinstance(node, TernaryOp):
-            return self._check_ternary(node)
-
-        if isinstance(node, FunctionCall):
-            return self._check_function_call(node)
-
-        if isinstance(node, VecConstructor):
-            return self._check_vec_constructor(node)
-
-        if isinstance(node, MatConstructor):
-            return self._check_mat_constructor(node)
-
-        if isinstance(node, CastExpr):
-            return self._check_cast(node)
-
-        if isinstance(node, ArrayIndexAccess):
-            return self._check_array_index(node)
-
-        if isinstance(node, ArrayLiteral):
-            # Standalone array literals only appear in declarations (handled there)
-            self._error("Array literal '{...}' can only appear in array declarations.",
-                        node.loc, code="E3900",
-                        hint="Try: float arr[] = {1, 2, 3}; — array literals need a declaration.")
-            self._set_type(node, TEXType.ARRAY)
-            return TEXType.ARRAY
-
-        if isinstance(node, BindingIndexAccess):
-            return self._check_binding_index_access(node)
-
-        if isinstance(node, BindingSampleAccess):
-            return self._check_binding_sample_access(node)
-
-        self._error(f"This expression type isn't recognized: {type(node).__name__}.",
-                    node.loc, code="E4000",
-                    hint="This may be a syntax that TEX doesn't support yet.")
-        self._set_type(node, TEXType.FLOAT)
-        return TEXType.FLOAT
+    def _check_array_literal_expr(self, node: ArrayLiteral) -> TEXType:
+        # Standalone array literals only appear in declarations (handled there)
+        self._error("Array literal '{...}' can only appear in array declarations.",
+                    node.loc, code="E3900",
+                    hint="Try: float arr[] = {1, 2, 3}; — array literals need a declaration.")
+        self._set_type(node, TEXType.ARRAY)
+        return TEXType.ARRAY
 
     def _check_identifier(self, node: Identifier) -> TEXType:
         t = self._lookup_var(node.name)
         if t is None:
-            from .diagnostics import (suggest_similar, get_variable_hint,
-                                      get_keyword_hint, get_type_hint)
             # Collect all variables in scope for suggestions
             all_vars = set()
             for scope in self._scopes:
@@ -1090,17 +1051,11 @@ class TypeChecker:
             self._set_type(node, result)
             return result
 
-        if node.op in ("&&", "||"):
-            # Logical ops evaluate element-wise on both backends, so a vector
-            # operand yields a per-component vector (boolean-like 0/1), not a
-            # scalar. Mirror that here so the checker agrees with runtime shape.
-            result = self._promote(lt, rt) if (lt.is_vector or rt.is_vector) else TEXType.FLOAT
-            self._set_type(node, result)
-            return result
-
-        if node.op in ("==", "!=", "<", ">", "<=", ">="):
-            # Comparison ops evaluate element-wise on both backends, so a vector
-            # operand yields a per-component vector (0.0/1.0), not a scalar.
+        if node.op in ("&&", "||", "==", "!=", "<", ">", "<=", ">="):
+            # Logical and comparison ops evaluate element-wise on both
+            # backends, so a vector operand yields a per-component vector
+            # (0.0/1.0 values), not a scalar. Mirror that here so the checker
+            # agrees with runtime shape.
             result = self._promote(lt, rt) if (lt.is_vector or rt.is_vector) else TEXType.FLOAT
             self._set_type(node, result)
             return result
@@ -1423,7 +1378,7 @@ class TypeChecker:
 
     def _resolve_function_type(self, name: str, arg_types: list[TEXType], loc: SourceLoc) -> TEXType:
         """Resolve the return type of a built-in function call."""
-        from .stdlib_signatures import FUNCTION_SIGNATURES
+        FUNCTION_SIGNATURES = _function_signatures()
         sig = FUNCTION_SIGNATURES.get(name)
         if sig is None:
             # Check user-defined functions
@@ -1447,7 +1402,6 @@ class TypeChecker:
                             )
                 return user_fn["return_type"]
 
-            from .diagnostics import suggest_similar, get_function_hint
             all_names = set(FUNCTION_SIGNATURES.keys()) | set(self._user_functions.keys())
             suggestions = suggest_similar(name, all_names)
             hint = get_function_hint(name)
@@ -1550,3 +1504,46 @@ class TypeChecker:
             )
             return current
         return self._promote(current, new)
+
+
+# Dispatch tables for _check_stmt/_check_expr, built once at import (the
+# checker is instantiated several times per compile, so per-instance tables
+# would be rebuilt each time). Keyed on the exact node class — every AST node
+# subclasses ASTNode directly, and a future subclass needs its own entry here
+# (the interpreter's dispatch dicts impose the same constraint). Handlers are
+# unbound methods, called as handler(self, node); classes missing from a table
+# fall through to the E4000 diagnostic.
+_STMT_HANDLERS: dict[type, object] = {
+    ErrorNode: TypeChecker._check_error_node,
+    VarDecl: TypeChecker._check_var_decl,
+    ArrayDecl: TypeChecker._check_array_decl,
+    Assignment: TypeChecker._check_assignment,
+    IfElse: TypeChecker._check_if_else,
+    ForLoop: TypeChecker._check_for_loop,
+    WhileLoop: TypeChecker._check_while_loop,
+    ExprStatement: TypeChecker._check_expr_statement,
+    ParamDecl: TypeChecker._check_param_decl,
+    BreakStmt: TypeChecker._check_break_continue,
+    ContinueStmt: TypeChecker._check_break_continue,
+    FunctionDef: TypeChecker._check_function_def,
+    ReturnStmt: TypeChecker._check_return_stmt,
+}
+
+_EXPR_HANDLERS: dict[type, object] = {
+    NumberLiteral: TypeChecker._check_number_literal,
+    StringLiteral: TypeChecker._check_string_literal,
+    Identifier: TypeChecker._check_identifier,
+    BindingRef: TypeChecker._check_binding_ref,
+    ChannelAccess: TypeChecker._check_channel_access,
+    BinOp: TypeChecker._check_binop,
+    UnaryOp: TypeChecker._check_unary,
+    TernaryOp: TypeChecker._check_ternary,
+    FunctionCall: TypeChecker._check_function_call,
+    VecConstructor: TypeChecker._check_vec_constructor,
+    MatConstructor: TypeChecker._check_mat_constructor,
+    CastExpr: TypeChecker._check_cast,
+    ArrayIndexAccess: TypeChecker._check_array_index,
+    ArrayLiteral: TypeChecker._check_array_literal_expr,
+    BindingIndexAccess: TypeChecker._check_binding_index_access,
+    BindingSampleAccess: TypeChecker._check_binding_sample_access,
+}

@@ -609,6 +609,68 @@ function syncOutputs(node, outputNames) {
     node.setDirtyCanvas(true, true);
 }
 
+// ─── Dynamic Param Schema Registry ──────────────────────────────────
+// nodeData.input.optional is TYPE-GLOBAL: every TEX node shares the one
+// schema object, so dynamic $param entries are refcounted per node here
+// and only dropped once no node declares the name anymore.
+
+const _texParamRegistry = new Map();        // paramName → Map(nodeId → typeHint)
+const _texParamConflictWarned = new Set();  // param names already warned about
+
+function _texParamSchemaEntry(typeHint) {
+    if (typeHint === "i") return ["INT", { default: 0, min: -9999, max: 9999 }];
+    if (typeHint === "b") return ["BOOLEAN", { default: false }];
+    if (typeHint === "s") return ["STRING", { default: "" }];
+    if (typeHint === "c") return ["STRING", { default: "#000000" }];
+    if (typeHint === "v2") return ["STRING", { default: "0.0, 0.0" }];
+    if (typeHint === "v3") return ["STRING", { default: "0.0, 0.0, 0.0" }];
+    return ["FLOAT", { default: 0.0, min: -9999, max: 9999, step: 0.1, round: 0.001 }];
+}
+
+/**
+ * Replace `node`'s declarations in the registry (params = null drops them
+ * all, e.g. on node removal) and rebuild the shared schema from the union.
+ * Only names the registry itself added are ever deleted from the schema.
+ */
+function _texSyncParamSchema(node, params) {
+    if (typeof LiteGraph === "undefined") return;
+    const optional = LiteGraph.registered_node_types?.[TEX_NODE_TYPE]?.nodeData?.input?.optional;
+    if (!optional) return;
+
+    for (const [name, owners] of _texParamRegistry) {
+        owners.delete(node.id);
+        if (owners.size === 0) {
+            _texParamRegistry.delete(name);
+            delete optional[name];
+        }
+    }
+    if (params) {
+        for (const [name, info] of params) {
+            let owners = _texParamRegistry.get(name);
+            if (!owners) {
+                owners = new Map();
+                _texParamRegistry.set(name, owners);
+            }
+            owners.set(node.id, info.typeHint || "f");
+        }
+    }
+
+    for (const [name, owners] of _texParamRegistry) {
+        // Same name on several nodes: the schema is type-global, so pick a
+        // deterministic winner (lowest node id) and warn once on conflict.
+        let winId = null;
+        for (const id of owners.keys()) {
+            if (winId === null || String(id) < String(winId)) winId = id;
+        }
+        const typeHint = owners.get(winId);
+        if (!_texParamConflictWarned.has(name) && new Set(owners.values()).size > 1) {
+            _texParamConflictWarned.add(name);
+            console.warn(`[TEX] $${name} is declared with different types on multiple nodes; the shared schema uses "${typeHint}" (node ${winId}).`);
+        }
+        optional[name] = _texParamSchemaEntry(typeHint);
+    }
+}
+
 // ─── Parameter Widgets ($) ──────────────────────────────────────────
 
 function syncParams(node, params) {
@@ -758,35 +820,23 @@ function syncParams(node, params) {
 
     // Register dynamic params in nodeData.input.optional so ComfyUI's Vue
     // overlay recognizes them and enables click/drag interaction.
-    const nt = LiteGraph.registered_node_types[TEX_NODE_TYPE];
-    const optional = nt?.nodeData?.input?.optional;
-    if (optional) {
-        // Remove stale TEX param entries
-        for (const name of toRemove) {
-            delete optional[name];
-        }
-        // Add/update entries for current params
-        for (const [name, info] of params) {
-            const typeHint = info.typeHint || "f";
-            if (typeHint === "i") {
-                optional[name] = ["INT", { default: 0, min: -9999, max: 9999 }];
-            } else if (typeHint === "b") {
-                optional[name] = ["BOOLEAN", { default: false }];
-            } else if (typeHint === "s") {
-                optional[name] = ["STRING", { default: "" }];
-            } else if (typeHint === "c") {
-                optional[name] = ["STRING", { default: "#000000" }];
-            } else if (typeHint === "v2") {
-                optional[name] = ["STRING", { default: "0.0, 0.0" }];
-            } else if (typeHint === "v3") {
-                optional[name] = ["STRING", { default: "0.0, 0.0, 0.0" }];
-            } else {
-                optional[name] = ["FLOAT", { default: 0.0, min: -9999, max: 9999, step: 0.1, round: 0.001 }];
-            }
-        }
-    }
+    _texSyncParamSchema(node, params);
 
     node.setDirtyCanvas(true, true);
+}
+
+// ─── Code → Sockets ─────────────────────────────────────────────────
+// Parse the code and bring inputs, outputs and param widgets in sync.
+// Shared by the debounced editor updater and onConfigure.
+
+function applyCodeToSockets(node, code) {
+    const { inputs, outputs, params } = parseCode(code);
+    node._texBindings = inputs;
+    node._texOutputs = outputs;
+    node._texParams = params;
+    syncInputs(node, inputs, new Set(params.keys()));
+    syncOutputs(node, outputs);
+    syncParams(node, params);
 }
 
 // ─── Error Cache (per-node, from WebSocket events) ───────────────────
@@ -808,6 +858,7 @@ function showDOMErrorBanner(node, errMsg) {
         const banner = _createBannerElement(errMsg);
         document.body.appendChild(banner);
         node._texErrorBanner = banner;
+        node._texOverlaySig = null; // force the RAF loop to position it
         return;
     }
 
@@ -932,6 +983,7 @@ function showDOMErrorBanner(node, errMsg) {
 
     document.body.appendChild(banner);
     node._texErrorBanner = banner;
+    node._texOverlaySig = null; // force the RAF loop to position it
 }
 
 function _createBannerElement(text) {
@@ -950,6 +1002,7 @@ function clearDOMErrorBanner(node) {
     if (node._texErrorBanner) {
         node._texErrorBanner.remove();
         node._texErrorBanner = null;
+        node._texOverlaySig = null;
     }
 }
 
@@ -1061,23 +1114,38 @@ function _texOverlayRafLoop() {
         _texRafRunning = false;
         return;
     }
+    // Nodes 1.0 vs 2.0 is a global, live-togglable setting. false means the
+    // Vue node layer is off ([data-node-id] elements don't exist), so the DOM
+    // lookup below can never match; undefined (older frontend / renamed id)
+    // falls through to the lookup so behavior there is unchanged.
+    let vueMode;
+    try { vueMode = app.ui.settings.getSettingValue("Comfy.VueNodes.Enabled"); }
+    catch (_) { vueMode = undefined; }
     for (const node of _texOverlayNodes) {
         // In Nodes 1.0, onDrawForeground already positioned overlays.
         // Clear the flag so next frame we can detect whether it fired again.
         if (node._texV1Positioned) {
             node._texV1Positioned = false;
+            node._texOverlaySig = null; // V1 places overlays with its own conventions
             continue;
         }
+
+        if (vueMode === false) continue;
 
         const collapsed = node.flags?.collapsed;
         if (collapsed) {
             if (node._texErrorBanner) node._texErrorBanner.style.display = "none";
             if (node._texHelpBtn) node._texHelpBtn.style.display = "none";
+            node._texOverlaySig = null;
             continue;
         }
 
         // Find the Vue-rendered DOM element for this node (Nodes 2.0)
-        const el = document.querySelector(`[data-node-id="${node.id}"]`);
+        let el = node._texVueEl;
+        if (!el || !el.isConnected) {
+            el = document.querySelector(`[data-node-id="${node.id}"]`);
+            node._texVueEl = el;
+        }
         if (!el) continue;
 
         const rect = el.getBoundingClientRect();
@@ -1086,11 +1154,17 @@ function _texOverlayRafLoop() {
         // Estimate scale from node size vs rendered size
         const scale = node.size[0] > 0 ? rect.width / node.size[0] : 1;
 
+        // Skip the style writes when nothing moved. Banner create/remove and
+        // collapse reset the signature so fresh overlays position immediately.
+        const sig = rect.left + "," + rect.top + "," + rect.width + "," + scale + "," + (node._texErrorBanner ? "b" : "");
+        if (sig === node._texOverlaySig) continue;
+
         _texPositionOverlaysFromRect(node, {
             left: rect.left,
             top: rect.top,
             width: rect.width,
         }, scale, true);   // Nodes 2.0: rect.top includes the title bar
+        node._texOverlaySig = sig;
     }
     requestAnimationFrame(_texOverlayRafLoop);
 }
@@ -1132,24 +1206,20 @@ api.addEventListener("execution_error", (ev) => {
     }
 
     // Push inline diagnostics to the CM6 editor + DOM banner
-    if (app.graph?._nodes) {
-        for (const node of app.graph._nodes) {
-            if (String(node.id) === String(d.node_id)) {
-                // DOM error banner — works in ALL frontend modes
-                showDOMErrorBanner(node, errMsg);
+    const node = app.graph?.getNodeById?.(d.node_id);
+    if (node) {
+        // DOM error banner — works in ALL frontend modes
+        showDOMErrorBanner(node, errMsg);
 
-                // CM6 inline diagnostics (squiggles)
-                const CM6 = getCM6();
-                const editor = texEditors.get(node);
-                if (CM6 && editor) {
-                    try {
-                        const diagnostics = CM6.texErrorToDiagnostics(editor, errData);
-                        editor.dispatch(CM6.setDiagnostics(editor.state, diagnostics));
-                    } catch (err) {
-                        console.warn("[TEX] Failed to push error diagnostics:", err);
-                    }
-                }
-                break;
+        // CM6 inline diagnostics (squiggles)
+        const CM6 = getCM6();
+        const editor = texEditors.get(node);
+        if (CM6 && editor) {
+            try {
+                const diagnostics = CM6.texErrorToDiagnostics(editor, errData);
+                editor.dispatch(CM6.setDiagnostics(editor.state, diagnostics));
+            } catch (err) {
+                console.warn("[TEX] Failed to push error diagnostics:", err);
             }
         }
     }
@@ -2575,15 +2645,7 @@ app.registerExtension({
 
             // Auto-socket updater (shared by both CM6 and fallback paths)
             const updateSockets = debounce(() => {
-                const code = codeWidget.value || "";
-                const { inputs, outputs, params } = parseCode(code);
-                node._texBindings = inputs;
-                node._texOutputs = outputs;
-                node._texParams = params;
-                const paramNames = new Set(params.keys());
-                syncInputs(node, inputs, paramNames);
-                syncOutputs(node, outputs);
-                syncParams(node, params);
+                applyCodeToSockets(node, codeWidget.value || "");
             }, DEBOUNCE_MS);
 
             // ── Try CM6 Editor Integration ──
@@ -2736,15 +2798,7 @@ app.registerExtension({
                 const codeWidget = node.widgets?.find(w => w.name === "code");
                 if (codeWidget) {
                     const code = codeWidget.value || "";
-                    const { inputs, outputs, params } = parseCode(code);
-                    node._texBindings = inputs;
-                    node._texOutputs = outputs;
-                    node._texParams = params;
-
-                    const paramNames = new Set(params.keys());
-                    syncInputs(node, inputs, paramNames);
-                    syncOutputs(node, outputs);
-                    syncParams(node, params);
+                    applyCodeToSockets(node, code);
 
                     // Sync CM6 editor content if it exists
                     const editor = texEditors.get(node);
@@ -2806,7 +2860,7 @@ app.registerExtension({
             this.setDirtyCanvas(true, true);
         };
 
-        // Clean up floating DOM elements when node is removed
+        // Clean up floating DOM elements + editor when node is removed
         const origOnRemoved = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
             if (origOnRemoved) origOnRemoved.apply(this, arguments);
@@ -2816,6 +2870,21 @@ app.registerExtension({
                 this._texHelpBtn = null;
             }
             _texStopV2Positioning(this);
+            this._texVueEl = null;
+
+            // Destroy the CM6 EditorView (detaches its global listeners and
+            // observers). Fallback-textarea nodes have no editor entry.
+            const editor = texEditors.get(this);
+            if (editor) {
+                try { editor.destroy(); } catch (_) { /* already detached */ }
+                texEditors.delete(this);
+                texEditorMeta.delete(this);
+            }
+            this._texEditor = null;
+            this._texEditorContainer = null;
+
+            // Drop this node's $param entries from the shared schema
+            _texSyncParamSchema(this, null);
         };
     },
 });

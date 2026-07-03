@@ -1072,7 +1072,10 @@ def test_latent(r: SubTestResult):
         lat3 = {"samples": torch.randn(1, 3, 4, 4)}
         assert _infer_binding_type(lat3) == TEXType.VEC3
         lat16 = {"samples": torch.randn(1, 16, 4, 4)}
-        assert _infer_binding_type(lat16) == TEXType.VEC4  # 16-ch -> VEC4 best-effort
+        # 16-ch latents map to FLOAT, matching the post-unwrap tensor branch
+        assert _infer_binding_type(lat16) == TEXType.FLOAT
+        lat2 = {"samples": torch.randn(1, 2, 4, 4)}
+        assert _infer_binding_type(lat2) == TEXType.VEC2
         r.ok("latent: infer type dict")
     except Exception as e:
         r.fail("latent: infer type dict", f"{e}\n{traceback.format_exc()}")
@@ -2905,3 +2908,355 @@ def test_node_helpers(r: SubTestResult):
         r.ok("infer_binding: None -> FLOAT fallback")
     except Exception as e:
         r.fail("infer_binding: None -> FLOAT fallback", str(e))
+
+
+# ── Compiled-path audit-fix tests (v0.14.0) ───────────────────────────
+
+def test_compiled_audit_fixes(r: SubTestResult):
+    print("\n--- Compiled-path Audit Fix Tests ---")
+
+    import TEX_Wrangle.tex_runtime.compiled as compiled_mod
+
+    B, H, W = 1, 4, 4
+    torch.manual_seed(3)
+    test_img = torch.rand(B, H, W, 4)
+    bt = {"A": TEXType.VEC4, "OUT": TEXType.VEC4}
+
+    # CG-P1: the codegen-only route must memoize the generated function and
+    # the routing gates per fingerprint (previously re-emitted every frame).
+    # The innermost loop exceeds the optimizer's unroll cap so the loop nest
+    # keeps depth 3 (> _COMPILE_MAX_LOOP_DEPTH) after optimization.
+    deep_code = """
+float s = 0.0;
+for (int i = 0; i < 2; i = i + 1) {
+    for (int j = 0; j < 3; j = j + 1) {
+        for (int k = 0; k < 10; k = k + 1) {
+            s = s + @A.r * 0.1 + @A.g * 0.05 + @A.b * 0.025 + 0.01;
+        }
+    }
+}
+@OUT = @A * 0.0 + s * 0.001;
+"""
+    try:
+        clear_compiled_cache()
+        cache = TEXCache()
+        prog, tm, refs, asg, params, used = cache.compile_tex(deep_code, bt)
+        fp = cache.fingerprint(deep_code, bt)
+
+        calls = {"n": 0}
+        orig_codegen = compiled_mod._try_codegen
+
+        def counting_codegen(*a, **k):
+            calls["n"] += 1
+            return orig_codegen(*a, **k)
+
+        compiled_mod._try_codegen = counting_codegen
+        try:
+            out1 = execute_compiled(prog, {"A": test_img}, tm, "cpu", fp,
+                                    used_builtins=used)
+            out2 = execute_compiled(prog, {"A": test_img}, tm, "cpu", fp,
+                                    used_builtins=used)
+        finally:
+            compiled_mod._try_codegen = orig_codegen
+
+        interp_out = _plain_execute(prog, {"A": test_img}, tm, "cpu",
+                                    used_builtins=used)
+        assert calls["n"] == 1, f"codegen emitted {calls['n']} times, expected 1"
+        assert torch.equal(out1, out2), "cached codegen result differs across frames"
+        assert torch.allclose(out1, interp_out, atol=1e-5)
+        assert fp in compiled_mod._route_memo, "gate verdicts not memoized"
+        assert fp in compiled_mod._cg_only_cache, "codegen fn not memoized"
+        r.ok("compiled: codegen-only route memoized per fingerprint")
+    except Exception as e:
+        r.fail("compiled: codegen-only route memoized per fingerprint",
+               f"{e}\n{traceback.format_exc()}")
+
+    # clear_compiled_cache must clear the new memos too (test isolation).
+    try:
+        assert len(compiled_mod._route_memo) > 0
+        clear_compiled_cache()
+        assert len(compiled_mod._route_memo) == 0
+        assert len(compiled_mod._cg_only_cache) == 0
+        assert len(compiled_mod._backend_status) == 0
+        r.ok("compiled: clear_compiled_cache clears route/codegen memos")
+    except Exception as e:
+        r.fail("compiled: clear_compiled_cache clears route/codegen memos",
+               f"{e}\n{traceback.format_exc()}")
+
+    # CLCG2: precision is part of the compiled-cache key — running the same
+    # fingerprint at fp32 then fp16 must produce two distinct entries instead
+    # of reusing the fp32-baked closure.
+    try:
+        clear_compiled_cache()
+        code_p = "@OUT = sin(@A) * 0.5 + cos(@A) * 0.5 + @A * @A * 0.1 + 0.001;"
+        cache = TEXCache()
+        prog, tm, refs, asg, params, used = cache.compile_tex(code_p, bt)
+        fp = cache.fingerprint(code_p, bt)
+
+        orig_compile = torch.compile
+        torch.compile = lambda fn, **kw: fn  # identity: run adapters eagerly
+        try:
+            out32 = execute_compiled(prog, {"A": test_img}, tm, "cpu", fp,
+                                     used_builtins=used, precision="fp32")
+            out16 = execute_compiled(prog, {"A": test_img}, tm, "cpu", fp,
+                                     used_builtins=used, precision="fp16")
+        finally:
+            torch.compile = orig_compile
+
+        keys = list(compiled_mod._compiled_cache.keys())
+        assert (fp, "cpu", "fp32") in keys, f"fp32 entry missing: {keys}"
+        assert (fp, "cpu", "fp16") in keys, f"fp16 entry missing: {keys}"
+        interp_out = _plain_execute(prog, {"A": test_img}, tm, "cpu",
+                                    used_builtins=used)
+        assert torch.allclose(out32, interp_out, atol=1e-5)
+        assert out16 is not None
+        r.ok("compiled: precision is part of the cache key")
+    except Exception as e:
+        r.fail("compiled: precision is part of the cache key",
+               f"{e}\n{traceback.format_exc()}")
+
+    # CLCG2: the interpreter-wrap route must bake precision/used_builtins into
+    # a closure — the compiled callable is invoked with six positional args,
+    # which previously reset both to defaults (always fp32/None).
+    try:
+        clear_compiled_cache()
+        # String-binding comparison: codegen rejects it (interpreter-wrap
+        # route) and no optimizer pass can constant-fold a binding away.
+        code_s = ('float k = (@name == "abc") ? 1.0 : 0.0;\n'
+                  '@OUT = @A * k + 0.0001;\n')
+        bt_s = {"A": TEXType.VEC4, "name": TEXType.STRING, "OUT": TEXType.VEC4}
+        cache = TEXCache()
+        prog_s, tm_s, refs_s, asg_s, params_s, used_s = cache.compile_tex(code_s, bt_s)
+        assert try_compile(prog_s, tm_s) is None, \
+            "expected codegen to reject string comparison (test premise)"
+
+        orig_compile = torch.compile
+        torch.compile = lambda fn, **kw: fn
+        try:
+            entry = compiled_mod._try_compile("cpu", prog_s, tm_s,
+                                              used_builtins=used_s,
+                                              precision="fp16")
+        finally:
+            torch.compile = orig_compile
+
+        assert entry is not None
+        wrapped, backend = entry
+        assert wrapped is not compiled_mod._plain_execute, \
+            "interpreter wrap must be a closure, not bare _plain_execute"
+        half = torch.full((B, H, W, 4), 0.5)
+        got = wrapped(prog_s, {"A": half, "name": "abc"}, tm_s, "cpu", 0, None)
+        exp16 = _plain_execute(prog_s, {"A": half, "name": "abc"}, tm_s, "cpu",
+                               used_builtins=used_s, precision="fp16")
+        exp32 = _plain_execute(prog_s, {"A": half, "name": "abc"}, tm_s, "cpu",
+                               used_builtins=used_s, precision="fp32")
+        assert torch.equal(got, exp16), "closure did not forward precision"
+        assert (got - exp32).abs().max().item() > 1e-5, \
+            "fp16 vs fp32 should differ (0.5 + 0.0001 rounds away at fp16)"
+        r.ok("compiled: interpreter wrap bakes precision/used_builtins")
+    except Exception as e:
+        r.fail("compiled: interpreter wrap bakes precision/used_builtins",
+               f"{e}\n{traceback.format_exc()}")
+
+    # CLCG4 baseline: a program-specific runtime failure still blacklists the
+    # fingerprint (and the interpreter fallback stays correct).
+    try:
+        clear_compiled_cache()
+        code_f1 = "@OUT = sin(@A) * 0.5 + cos(@A) * 0.5 + @A * @A * 0.2 + 0.001;"
+        cache = TEXCache()
+        prog1, tm1, refs1, asg1, params1, used1 = cache.compile_tex(code_f1, bt)
+        fp1 = cache.fingerprint(code_f1, bt)
+
+        orig_compile = torch.compile
+
+        def broken_compile(fn, **kw):
+            def raiser(*a, **k):
+                raise RuntimeError("synthetic compiled-callable failure")
+            return raiser
+
+        torch.compile = broken_compile
+        try:
+            out = execute_compiled(prog1, {"A": test_img}, tm1, "cpu", fp1,
+                                   used_builtins=used1)
+        finally:
+            torch.compile = orig_compile
+
+        interp_out = _plain_execute(prog1, {"A": test_img}, tm1, "cpu",
+                                    used_builtins=used1)
+        assert torch.allclose(out, interp_out, atol=1e-5)
+        assert fp1 in compiled_mod._compile_blacklist, \
+            "program-specific failure should blacklist the fingerprint"
+        r.ok("compiled: program-specific failure blacklists fingerprint")
+    except Exception as e:
+        r.fail("compiled: program-specific failure blacklists fingerprint",
+               f"{e}\n{traceback.format_exc()}")
+
+    # CLCG4: a Triton-missing BackendCompilerFailed is a (backend, device)
+    # property — mark that pair unavailable, do NOT blacklist the program.
+    try:
+        clear_compiled_cache()
+        code_f2 = "@OUT = sin(@A) * 0.25 + cos(@A) * 0.75 + @A * @A * 0.3 + 0.001;"
+        cache = TEXCache()
+        prog2, tm2, refs2, asg2, params2, used2 = cache.compile_tex(code_f2, bt)
+        fp2 = cache.fingerprint(code_f2, bt)
+
+        class BackendCompilerFailed(Exception):
+            pass
+
+        def tritonless_compile(fn, **kw):
+            def raiser(*a, **k):
+                raise BackendCompilerFailed(
+                    "Cannot find a working triton installation")
+            return raiser
+
+        orig_compile = torch.compile
+        torch.compile = tritonless_compile
+        try:
+            out = execute_compiled(prog2, {"A": test_img}, tm2, "cpu", fp2,
+                                   used_builtins=used2)
+        finally:
+            torch.compile = orig_compile
+
+        interp_out = _plain_execute(prog2, {"A": test_img}, tm2, "cpu",
+                                    used_builtins=used2)
+        assert torch.allclose(out, interp_out, atol=1e-5)
+        assert fp2 not in compiled_mod._compile_blacklist, \
+            "backend-unavailable failure must not blacklist the fingerprint"
+        assert compiled_mod._backend_status.get(("inductor", "cpu")) is False
+        assert compiled_mod._select_backend("cpu") is None
+        # Per-device isolation: the same backend stays untested on CUDA.
+        assert compiled_mod._select_backend("cuda") == "inductor"
+        r.ok("compiled: backend-unavailable failure marked per (backend, device)")
+    except Exception as e:
+        r.fail("compiled: backend-unavailable failure marked per (backend, device)",
+               f"{e}\n{traceback.format_exc()}")
+    finally:
+        clear_compiled_cache()
+
+
+# ── Fusion memo tests (v0.14.0) ───────────────────────────────────────
+
+def test_fusion_memo(r: SubTestResult):
+    print("\n--- Fusion Memo Tests ---")
+
+    import TEX_Wrangle.tex_fusion as tex_fusion
+    from TEX_Wrangle.tex_fusion import compile_fused
+
+    torch.manual_seed(11)
+    img = torch.rand(1, 4, 4, 4)
+
+    def make_stages(amt0=0.3, amt1=0.8, source=None, code1=None, chain_in="X"):
+        return [
+            {"code": "float t = $amt; @OUT = clamp(@A * t + 0.1, 0.0, 1.0);",
+             "chain_input": None,
+             "bindings": {"A": img if source is None else source, "amt": amt0}},
+            {"code": code1 or f"float t = $amt; @OUT = @{chain_in} * t;",
+             "chain_input": chain_in,
+             "bindings": {"amt": amt1}},
+        ]
+
+    def run_fused(stages):
+        program, tm, refs, asg, params, used, merged = compile_fused(
+            stages, _infer_binding_type)
+        interp = Interpreter()
+        out = interp.execute(program, dict(merged), tm, device="cpu",
+                             output_names=sorted(asg.keys()),
+                             used_builtins=used)
+        return out["OUT"], merged
+
+    calls = {"n": 0}
+    orig_parse = tex_fusion._parse
+
+    def counting_parse(code):
+        calls["n"] += 1
+        return orig_parse(code)
+
+    # Repeat execution of the same chain must not re-parse/re-check.
+    try:
+        tex_fusion._FUSED_MEMO.clear()
+        tex_fusion._parse = counting_parse
+        try:
+            out1, _ = run_fused(make_stages())
+            first = calls["n"]
+            out2, _ = run_fused(make_stages())
+        finally:
+            tex_fusion._parse = orig_parse
+        assert first == 2, f"expected one parse per stage, got {first}"
+        assert calls["n"] == first, "second execution re-compiled the chain"
+        assert torch.equal(out1, out2), "memoized chain output differs"
+        r.ok("fusion memo: repeat chain skips recompilation")
+    except Exception as e:
+        r.fail("fusion memo: repeat chain skips recompilation",
+               f"{e}\n{traceback.format_exc()}")
+
+    # Param VALUE changes hit the memo but the new value must flow through
+    # (merged bindings are rebuilt per execution, never cached).
+    try:
+        out_a, _ = run_fused(make_stages(amt1=0.8))
+        calls["n"] = 0
+        tex_fusion._parse = counting_parse
+        try:
+            out_b, merged_b = run_fused(make_stages(amt1=0.4))
+        finally:
+            tex_fusion._parse = orig_parse
+        assert calls["n"] == 0, "param value change should hit the memo"
+        assert merged_b["_s1_u_amt"] == 0.4, "merged bindings not rebuilt"
+        assert not torch.equal(out_a, out_b), "new param value had no effect"
+        r.ok("fusion memo: param value change hits memo, new value applied")
+    except Exception as e:
+        r.fail("fusion memo: param value change hits memo, new value applied",
+               f"{e}\n{traceback.format_exc()}")
+
+    # Structural changes must MISS: binding type change, code edit,
+    # chain-input rename.
+    try:
+        img3 = torch.rand(1, 4, 4, 3)
+        calls["n"] = 0
+        tex_fusion._parse = counting_parse
+        try:
+            run_fused(make_stages(source=img3))               # RGB source
+            n_type = calls["n"]
+            run_fused(make_stages(
+                code1="float t = $amt; @OUT = @X * t + 0.01;"))  # code edit
+            n_code = calls["n"]
+            run_fused(make_stages(
+                chain_in="Y"))                                 # input rename
+            n_rename = calls["n"]
+        finally:
+            tex_fusion._parse = orig_parse
+        assert n_type == 2, "binding-type change should miss the memo"
+        assert n_code == 4, "code edit should miss the memo"
+        assert n_rename == 6, "chain-input rename should miss the memo"
+        r.ok("fusion memo: structural changes miss the memo")
+    except Exception as e:
+        r.fail("fusion memo: structural changes miss the memo",
+               f"{e}\n{traceback.format_exc()}")
+
+    # Repeated execution accumulates no state (guards latent AST mutation).
+    try:
+        outs = [run_fused(make_stages())[0] for _ in range(3)]
+        assert torch.equal(outs[0], outs[1]) and torch.equal(outs[1], outs[2])
+        r.ok("fusion memo: repeated runs are bit-identical")
+    except Exception as e:
+        r.fail("fusion memo: repeated runs are bit-identical",
+               f"{e}\n{traceback.format_exc()}")
+
+    # CLBD2: the fused-chain payload must stay part of the execution
+    # fingerprint (upstream code edits recook the terminal) even though it is
+    # a system kwarg, never a TEX binding.
+    try:
+        from TEX_Wrangle.tex_node import TEXWrangleNode
+        base = dict(code="@OUT = @A;", A=torch.rand(1, 2, 2, 3))
+        fp_none = TEXWrangleNode.fingerprint_inputs(**base)
+        fp_c1 = TEXWrangleNode.fingerprint_inputs(
+            **base, _tex_chain='{"stages":[{"code":"a"}]}')
+        fp_c2 = TEXWrangleNode.fingerprint_inputs(
+            **base, _tex_chain='{"stages":[{"code":"b"}]}')
+        fp_c1_again = TEXWrangleNode.fingerprint_inputs(
+            **base, _tex_chain='{"stages":[{"code":"a"}]}')
+        assert fp_c1 != fp_none, "chain payload must affect the fingerprint"
+        assert fp_c1 != fp_c2, "upstream code edits must recook the terminal"
+        assert fp_c1 == fp_c1_again, "fingerprint must be stable"
+        r.ok("fingerprint: _tex_chain payload is hashed")
+    except Exception as e:
+        r.fail("fingerprint: _tex_chain payload is hashed",
+               f"{e}\n{traceback.format_exc()}")

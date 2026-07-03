@@ -192,6 +192,83 @@ def test_parser_v11(r: SubTestResult):
         r.fail("parse for with += update", str(e))
 
 
+def test_parser_lvalue_clone(r: SubTestResult):
+    """Desugared `+=`/`++`/`--` must not alias the lvalue into both
+    Assignment.target and BinOp.left — optimizer passes mutate the AST in
+    place and assume no shared subtrees. Also pins the for-header scatter
+    update (`@OUT[x,y] += v`) keeping its accumulate op."""
+    print("\n--- Parser Lvalue Clone Tests ---")
+
+    def _parse_stmt(code):
+        return Parser(Lexer(code).tokenize(), source=code).parse().statements[0]
+
+    # x += 1; — target and value.left are distinct but structurally equal
+    try:
+        stmt = _parse_stmt("x += 1;")
+        assert stmt.value.left is not stmt.target, "lvalue aliased into BinOp.left"
+        assert type(stmt.value.left) is type(stmt.target)
+        assert stmt.value.left.name == stmt.target.name == "x"
+        assert (stmt.value.left.loc.line, stmt.value.left.loc.col) == \
+               (stmt.target.loc.line, stmt.target.loc.col)
+        r.ok("lvalue clone: x += 1")
+    except Exception as e:
+        r.fail("lvalue clone: x += 1", f"{e}\n{traceback.format_exc()}")
+
+    # x++; and x--;
+    try:
+        for code in ("x++;", "x--;"):
+            stmt = _parse_stmt(code)
+            assert stmt.value.left is not stmt.target, f"{code}: aliased"
+            assert stmt.value.left.name == stmt.target.name == "x"
+        r.ok("lvalue clone: x++ / x--")
+    except Exception as e:
+        r.fail("lvalue clone: x++ / x--", f"{e}\n{traceback.format_exc()}")
+
+    # for-loop update clause (both ++ and compound forms)
+    try:
+        loop = _parse_stmt("for (int i = 0; i < 4; i++) { }")
+        assert loop.update.value.left is not loop.update.target
+        loop = _parse_stmt("for (int i = 0; i < 4; i += 2) { }")
+        assert loop.update.value.left is not loop.update.target
+        r.ok("lvalue clone: for-loop updates")
+    except Exception as e:
+        r.fail("lvalue clone: for-loop updates", f"{e}\n{traceback.format_exc()}")
+
+    # Channel-access lvalue: the whole chain is cloned, not just the head
+    try:
+        stmt = _parse_stmt("c.rgb += vec3(0.1, 0.1, 0.1);")
+        assert stmt.value.left is not stmt.target
+        assert stmt.value.left.object is not stmt.target.object
+        assert stmt.value.left.channels == stmt.target.channels == "rgb"
+        r.ok("lvalue clone: channel-access lvalue")
+    except Exception as e:
+        r.fail("lvalue clone: channel-access lvalue", f"{e}\n{traceback.format_exc()}")
+
+    # Scatter compound assignment keeps op (no desugar) in statement position
+    try:
+        stmt = _parse_stmt("@OUT[0, 0] += 0.5;")
+        assert stmt.__class__.__name__ == "Assignment"
+        assert stmt.op == "+", f"op={stmt.op!r}"
+        assert stmt.target.__class__.__name__ == "BindingIndexAccess"
+        assert stmt.value.__class__.__name__ == "NumberLiteral"
+        r.ok("scatter compound: statement position keeps op")
+    except Exception as e:
+        r.fail("scatter compound: statement position keeps op", f"{e}\n{traceback.format_exc()}")
+
+    # ... and in the for-loop update clause (was mis-desugared to a
+    # gather-read + plain assignment, losing accumulate semantics)
+    try:
+        loop = _parse_stmt("for (float k = 0.0; k < 1.0; @OUT[0, 0] += 0.5) { }")
+        upd = loop.update
+        assert upd.__class__.__name__ == "Assignment"
+        assert upd.op == "+", f"op={upd.op!r}"
+        assert upd.target.__class__.__name__ == "BindingIndexAccess"
+        assert upd.value.__class__.__name__ == "NumberLiteral"
+        r.ok("scatter compound: for-header update keeps op")
+    except Exception as e:
+        r.fail("scatter compound: for-header update keeps op", f"{e}\n{traceback.format_exc()}")
+
+
 def test_array_decl_no_hang(r: SubTestResult):
     """Regression: a misplaced-bracket array declaration (`float[5] arr`, the
     C#/Java style) once sent the parser into an unbounded loop that consumed

@@ -1606,3 +1606,526 @@ for (int i = 0; i < 3; i = i + 1) {
 }
 @OUT = vec4(acc, 1.0);
 """)
+
+
+def _run_optimized_pipeline(code, bindings):
+    """Mirror the real ComfyUI node path (cache.compile_tex: optimize + the
+    post-optimization re-type-check) with a fresh temp cache dir."""
+    binding_types = {n: _infer_binding_type(v) for n, v in bindings.items()}
+    tmp = tempfile.mkdtemp()
+    try:
+        cache = TEXCache(cache_dir=Path(tmp))
+        program, type_map, _refs, assigned, _params, _bi = cache.compile_tex(
+            code, binding_types)
+        interp = Interpreter()
+        result = interp.execute(program, bindings, type_map, device="cpu",
+                                output_names=sorted(assigned.keys()))
+        return result["OUT"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_optimizer_isint_unary(r: SubTestResult):
+    """Regression: _fold_unary dropped is_int when folding negation, so any
+    surviving `int ... = -N;` (e.g. a non-unrolled stencil loop header) was
+    demoted to a FLOAT literal and the cache's post-optimization re-type-check
+    raised E3200 on valid programs. compile_and_run skips optimize(), so only
+    the full cache pipeline exercises this."""
+    print("\n--- Optimizer Unary is_int Regression ---")
+    from TEX_Wrangle.tex_compiler.optimizer import optimize
+    from TEX_Wrangle.tex_compiler.ast_nodes import VarDecl, NumberLiteral
+
+    torch.manual_seed(3)
+    img = torch.rand(1, 8, 8, 3)
+
+    def _check(name, code):
+        try:
+            baseline = compile_and_run(code, {"A": img})      # no optimization
+            optimized = _run_optimized_pipeline(code, {"A": img})
+            max_diff = (baseline - optimized).abs().max().item()
+            assert max_diff < 1e-5, f"optimized vs unoptimized max_diff={max_diff}"
+            r.ok(f"isint unary: {name}")
+        except Exception as e:
+            r.fail(f"isint unary: {name}", f"{e}\n{traceback.format_exc()}")
+
+    _check("int decl with negative literal",
+           "int x = -1;\n@OUT = @A * float(x) * -1.0;")
+    _check("negative reassignment to int var",
+           "int x = 0;\nx = -2;\n@OUT = @A * float(x) * -0.5;")
+    _check("negative int arg to int-param user function",
+           "float f(int a) { return float(a); }\n@OUT = @A * f(-1) * -1.0;")
+    _check("nested stencil with negative int bounds", """
+vec3 acc = vec3(0.0);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) {
+        float su = u + float(dx) / iw;
+        float sv = v + float(dy) / ih;
+        acc = acc + sample(@A, su, sv);
+    }
+}
+@OUT = acc / 9.0;
+""")
+
+    # Direct fold checks at the AST level
+    try:
+        code = ("int x = -3;\nfloat y = -3.5;\nfloat z = !1.0;\n"
+                "@OUT = vec3(float(x), y, z);")
+        tokens = Lexer(code).tokenize()
+        prog = Parser(tokens, source=code).parse()
+        tc = TypeChecker(binding_types={"OUT": TEXType.VEC3}, source=code)
+        tm = tc.check(prog)
+        prog = optimize(prog, tm)
+        decls = {s.name: s for s in prog.statements if isinstance(s, VarDecl)}
+        x_init = decls["x"].initializer
+        assert isinstance(x_init, NumberLiteral) and x_init.is_int \
+            and x_init.value == -3.0, f"int fold: {x_init!r}"
+        y_init = decls["y"].initializer
+        assert isinstance(y_init, NumberLiteral) and not y_init.is_int \
+            and y_init.value == -3.5, f"float fold: {y_init!r}"
+        z_init = decls["z"].initializer
+        assert isinstance(z_init, NumberLiteral) and not z_init.is_int \
+            and z_init.value == 0.0, f"! fold: {z_init!r}"
+        r.ok("isint unary: folded literal integer-ness at AST level")
+    except Exception as e:
+        r.fail("isint unary: folded literal integer-ness at AST level",
+               f"{e}\n{traceback.format_exc()}")
+
+
+def test_optimizer_pure_fn_cse_licm(r: SubTestResult):
+    """The CSE/LICM purity list holds real stdlib names (luma, rgb2hsv,
+    sincos, spow, ...), so duplicates dedup and loop invariants hoist; and
+    the structural hash keeps INT and FLOAT literals distinct so mixed-type
+    subexpressions never share a temp."""
+    print("\n--- Optimizer Pure-Function CSE/LICM Tests ---")
+    from TEX_Wrangle.tex_compiler.optimizer import optimize
+    from TEX_Wrangle.tex_compiler.ast_nodes import VarDecl, ForLoop, FunctionCall
+
+    torch.manual_seed(11)
+    img = torch.rand(1, 8, 8, 3)
+
+    def _parse_checked(code, bindings=None):
+        tokens = Lexer(code).tokenize()
+        prog = Parser(tokens, source=code).parse()
+        bt = dict(bindings or {})
+        bt.setdefault("OUT", TEXType.VEC3)
+        tc = TypeChecker(binding_types=bt, source=code)
+        tm = tc.check(prog)
+        return prog, tm
+
+    # 1. Duplicated luma() calls share one _cse temp
+    try:
+        code = ("float a = luma(@A * 2.0);\n"
+                "float b = luma(@A * 2.0);\n"
+                "@OUT = vec3(a + b, 0.0, 0.0);")
+        prog, tm = _parse_checked(code, {"A": TEXType.VEC3})
+        prog = optimize(prog, tm)
+        cse_vars = [s for s in prog.statements
+                    if isinstance(s, VarDecl) and s.name.startswith("_cse")]
+        assert len(cse_vars) == 1, f"expected one _cse temp, got {len(cse_vars)}"
+        init = cse_vars[0].initializer
+        assert isinstance(init, FunctionCall) and init.name == "luma", \
+            f"CSE temp holds {type(init).__name__}"
+        r.ok("pure fns: luma() deduplicated by CSE")
+    except Exception as e:
+        r.fail("pure fns: luma() deduplicated by CSE", f"{e}\n{traceback.format_exc()}")
+
+    # 2. sincos CSE temp declares vec2 and survives the cache's re-type-check
+    try:
+        code = ("float x = @A.r;\n"
+                "vec2 a = sincos(x * 2.0);\n"
+                "vec2 b = sincos(x * 2.0);\n"
+                "@OUT = vec3(a.x + b.x, a.y * b.y, 0.0);")
+        tmp = tempfile.mkdtemp()
+        try:
+            cache = TEXCache(cache_dir=Path(tmp))
+            program, _tm, _refs, _assigned, _params, _bi = cache.compile_tex(
+                code, {"A": TEXType.VEC3})
+            cse_vars = [s for s in program.statements
+                        if isinstance(s, VarDecl) and s.name.startswith("_cse")]
+            assert len(cse_vars) == 1, f"expected one _cse temp, got {len(cse_vars)}"
+            assert cse_vars[0].type_name == "vec2", \
+                f"temp declared {cse_vars[0].type_name!r}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        r.ok("pure fns: sincos CSE temp declares vec2, re-type-checks")
+    except Exception as e:
+        r.fail("pure fns: sincos CSE temp declares vec2, re-type-checks",
+               f"{e}\n{traceback.format_exc()}")
+
+    # 3. LICM hoists an invariant hsv2rgb() ahead of the loop
+    try:
+        code = """
+vec3 k = vec3(0.5, 0.8, 0.9);
+vec3 acc = vec3(0.0);
+for (int i = 0; i < 10; i = i + 1) {
+    acc = acc + hsv2rgb(k * 0.9);
+}
+@OUT = acc * 0.1;
+"""
+        prog, tm = _parse_checked(code, {"A": TEXType.VEC3})
+        prog = optimize(prog, tm)
+        licm_vars = [s for s in prog.statements
+                     if isinstance(s, VarDecl) and s.name.startswith("_licm")]
+        for_loops = [s for s in prog.statements if isinstance(s, ForLoop)]
+        assert licm_vars, "hsv2rgb(k * 0.9) should be hoisted into a _licm temp"
+        assert for_loops, "ForLoop should still exist"
+        assert prog.statements.index(licm_vars[0]) < prog.statements.index(for_loops[0])
+        init = licm_vars[0].initializer
+        assert isinstance(init, FunctionCall) and init.name == "hsv2rgb", \
+            f"hoisted {type(init).__name__}"
+        r.ok("pure fns: hsv2rgb() hoisted by LICM")
+    except Exception as e:
+        r.fail("pure fns: hsv2rgb() hoisted by LICM", f"{e}\n{traceback.format_exc()}")
+
+    # 4. Optimized-vs-unoptimized equivalence with the new pure fns in a loop
+    try:
+        code = """
+vec3 hsv = rgb2hsv(@A.rgb);
+float t = 0.0;
+for (int i = 0; i < 10; i = i + 1) {
+    vec2 sc = sincos(hsv.x * 6.28);
+    t = t + spow(sc.x, 2.0) + sdiv(sc.y, hsv.z);
+}
+@OUT = hsv2rgb(hsv) * (t * 0.05);
+"""
+        baseline = compile_and_run(code, {"A": img})
+        optimized = _run_optimized_pipeline(code, {"A": img})
+        max_diff = (baseline - optimized).abs().max().item()
+        assert max_diff < 1e-5, f"max_diff={max_diff}"
+        r.ok("pure fns: loop equivalence (rgb2hsv/sincos/spow/sdiv)")
+    except Exception as e:
+        r.fail("pure fns: loop equivalence (rgb2hsv/sincos/spow/sdiv)",
+               f"{e}\n{traceback.format_exc()}")
+
+    # 5. INT and FLOAT literals hash apart: sin(u + 1) and sin(u + 1.0) do
+    # NOT share a temp (merging would let an INT-typed subtree share a
+    # FLOAT-typed one), while identical float literals still dedup
+    try:
+        code = ("float a = sin(u + 1);\n"
+                "float b = sin(u + 1.0);\n"
+                "@OUT = vec3(a + b, 0.0, 0.0);")
+        prog, tm = _parse_checked(code)
+        prog = optimize(prog, tm)
+        cse_vars = [s for s in prog.statements
+                    if isinstance(s, VarDecl) and s.name.startswith("_cse")]
+        assert len(cse_vars) == 0, f"int/float literal subexprs merged: {cse_vars}"
+
+        code = ("float a = sin(u + 1.0);\n"
+                "float b = sin(u + 1.0);\n"
+                "@OUT = vec3(a + b, 0.0, 0.0);")
+        prog, tm = _parse_checked(code)
+        prog = optimize(prog, tm)
+        cse_vars = [s for s in prog.statements
+                    if isinstance(s, VarDecl) and s.name.startswith("_cse")]
+        assert len(cse_vars) == 1, f"identical subexprs not merged: {len(cse_vars)}"
+        r.ok("pure fns: int vs float literals hash apart in CSE")
+    except Exception as e:
+        r.fail("pure fns: int vs float literals hash apart in CSE",
+               f"{e}\n{traceback.format_exc()}")
+
+    # 6. Compile-time smoke test: a wide expression with many repeated
+    # subexpressions optimizes well inside the memoized-walk budget
+    try:
+        big = "@OUT = vec3(" + " + ".join(["sin(u + 1.0)"] * 250) + ", 0.0, 0.0);"
+        prog, tm = _parse_checked(big)
+        t0 = time.perf_counter()
+        optimize(prog, tm)
+        dt = time.perf_counter() - t0
+        assert dt < 5.0, f"optimize() took {dt:.2f}s on a ~1500-node program"
+        r.ok(f"pure fns: wide-program optimize under budget ({dt*1000:.0f}ms)")
+    except Exception as e:
+        r.fail("pure fns: wide-program optimize under budget",
+               f"{e}\n{traceback.format_exc()}")
+
+
+def test_optimizer_dce_side_effects(r: SubTestResult):
+    """DCE must keep dead statements whose RHS can still act at runtime —
+    wrapped binding reads (can raise on non-readable bindings) and wrapped
+    function calls (user functions can persist scatter writes) — while still
+    dropping plain dead locals."""
+    print("\n--- DCE Side-Effect Preservation Tests ---")
+    from TEX_Wrangle.tex_compiler.optimizer import optimize
+    from TEX_Wrangle.tex_compiler.ast_nodes import VarDecl
+
+    def _optimized_var_names(code, bindings=None):
+        tokens = Lexer(code).tokenize()
+        prog = Parser(tokens, source=code).parse()
+        bt = dict(bindings or {})
+        bt.setdefault("OUT", TEXType.VEC3)
+        tc = TypeChecker(binding_types=bt, source=code)
+        tm = tc.check(prog)
+        prog = optimize(prog, tm)
+        return [s.name for s in prog.statements if isinstance(s, VarDecl)]
+
+    try:
+        names = _optimized_var_names(
+            "float dead = @A(u, v).r;\n@OUT = @A;", {"A": TEXType.VEC3})
+        assert "dead" in names, "swizzle-wrapped sample read was dropped"
+        r.ok("dce: dead swizzled sample read preserved")
+    except Exception as e:
+        r.fail("dce: dead swizzled sample read preserved", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        names = _optimized_var_names(
+            "float dead = float(@A[0, 0].r);\n@OUT = @A;", {"A": TEXType.VEC3})
+        assert "dead" in names, "cast-wrapped fetch read was dropped"
+        r.ok("dce: dead cast-wrapped fetch read preserved")
+    except Exception as e:
+        r.fail("dce: dead cast-wrapped fetch read preserved", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        names = _optimized_var_names(
+            "vec3 f(float a) { return vec3(a, a, a); }\n"
+            "float dead = f(0.5).r;\n"
+            "@OUT = @A;", {"A": TEXType.VEC3})
+        assert "dead" in names, "swizzled user-function call was dropped"
+        r.ok("dce: dead swizzled user-function call preserved")
+    except Exception as e:
+        r.fail("dce: dead swizzled user-function call preserved",
+               f"{e}\n{traceback.format_exc()}")
+
+    try:
+        names = _optimized_var_names("float dead = 1.0;\n@OUT = @A;",
+                                     {"A": TEXType.VEC3})
+        assert "dead" not in names, "plain dead local was kept"
+        r.ok("dce: plain dead local still dropped")
+    except Exception as e:
+        r.fail("dce: plain dead local still dropped", f"{e}\n{traceback.format_exc()}")
+
+
+# ── Codegen audit-fix tests (v0.14.0) ─────────────────────────────────
+
+def _codegen_source(code: str, bindings: dict) -> str:
+    """Generated Python source (preamble + body) for a program, unoptimized."""
+    from TEX_Wrangle.tex_runtime.codegen import _CodeGen
+    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
+    type_map = TypeChecker(binding_types=binding_types, source=code).check(program)
+    gen = _CodeGen(type_map)
+    gen.emit_program(program)
+    return "\n".join(gen._preamble + gen._lines)
+
+
+def _equiv_strict(r: SubTestResult, name: str, code: str, bindings: dict):
+    """run_both() + assert codegen is SUPPORTED and outputs match interpreter."""
+    try:
+        interp_res, cg_res = run_both(code, bindings)
+        assert cg_res is not None, "codegen unexpectedly unsupported"
+        for out_name in interp_res:
+            it = interp_res[out_name]
+            ct = cg_res[out_name]
+            if isinstance(it, torch.Tensor) and isinstance(ct, torch.Tensor):
+                max_diff = (it.float() - ct.float()).abs().max().item()
+                assert max_diff < 1e-5, f"Max diff={max_diff} for output '{out_name}'"
+            else:
+                assert it == ct, f"Output '{out_name}': {it!r} != {ct!r}"
+        r.ok(name)
+    except Exception as e:
+        r.fail(name, f"{e}\n{traceback.format_exc()}")
+
+
+def test_codegen_audit_fixes(r: SubTestResult):
+    print("\n--- Codegen Audit Fix Tests ---")
+
+    torch.manual_seed(7)
+    img = torch.rand(1, 6, 6, 4)
+
+    # ── CG-B1: inline conv2d stencil emission order ──────────────────
+
+    # (a) Binding mutated BEFORE the taps: the conv's _bind read must see the
+    # mutated tensor (old code emitted the conv at the top of the function).
+    _equiv_strict(r, "stencil order: binding mutated before taps", """
+@A = @A * 0.5;
+vec4 c = fetch(@A, ix, iy);
+vec4 l = fetch(@A, ix - 1.0, iy);
+vec4 rr = fetch(@A, ix + 1.0, iy);
+vec4 lap = l + rr - 2.0 * c;
+@OUT = lap + 0.5;
+""", {"A": img.clone()})
+
+    # (b) Gap statement WRITES a tap var between taps and combo: kernel
+    # weights would bake the stale fetch — detection must reject the pattern.
+    _equiv_strict(r, "stencil gap: tap var written in gap", """
+vec4 c = fetch(@A, ix, iy);
+vec4 l = fetch(@A, ix - 1.0, iy);
+vec4 rr = fetch(@A, ix + 1.0, iy);
+c = vec4(0.25);
+vec4 lap = l + rr - 2.0 * c;
+@OUT = lap;
+""", {"A": img.clone()})
+
+    # (c) Gap statement pre-declares the combo target: the conv result must
+    # not be overwritten out of order — detection must reject.
+    _equiv_strict(r, "stencil gap: combo target written in gap", """
+vec4 c = fetch(@A, ix, iy);
+vec4 l = fetch(@A, ix - 1.0, iy);
+vec4 rr = fetch(@A, ix + 1.0, iy);
+vec4 lap = vec4(0.0);
+lap = l + rr - 2.0 * c;
+@OUT = lap;
+""", {"A": img.clone()})
+
+    # (d) Gap statement READS a consumed tap: old code left the tap local as
+    # None (runtime TypeError -> fallback) — detection must reject instead.
+    _equiv_strict(r, "stencil gap: tap var read in gap", """
+vec4 c = fetch(@A, ix, iy);
+vec4 l = fetch(@A, ix - 1.0, iy);
+vec4 rr = fetch(@A, ix + 1.0, iy);
+vec4 w = c * 2.0;
+vec4 lap = l + rr - 2.0 * c;
+@OUT = lap + w;
+""", {"A": img.clone()})
+
+    # (e) Regression watch: sharpen-style tap reuse AFTER the combo must still
+    # take the conv2d fast path (tap un-consumed, stencil kept).
+    sharpen_code = """
+vec4 c = fetch(@A, ix, iy);
+vec4 l = fetch(@A, ix - 1.0, iy);
+vec4 rr = fetch(@A, ix + 1.0, iy);
+vec4 lap = l + rr - 2.0 * c;
+@OUT = c - lap * 0.5;
+"""
+    _equiv_strict(r, "stencil: tap reused after combo (parity)", sharpen_code,
+                  {"A": img.clone()})
+    try:
+        src = _codegen_source(sharpen_code, {"A": img})
+        assert "conv2d" in src, "sharpen-style stencil no longer takes the conv2d fast path"
+        r.ok("stencil: tap reused after combo still stencilizes")
+    except Exception as e:
+        r.fail("stencil: tap reused after combo still stencilizes", f"{e}")
+
+    # (f) Two stencils with a binding mutation between them: each conv must
+    # emit at its own combo position (before/after the mutation respectively).
+    two_stencil_code = """
+vec4 c = fetch(@A, ix, iy);
+vec4 l = fetch(@A, ix - 1.0, iy);
+vec4 rr = fetch(@A, ix + 1.0, iy);
+vec4 lap = l + rr - 2.0 * c;
+@A = @A * 0.5;
+vec4 c2 = fetch(@A, ix, iy);
+vec4 l2 = fetch(@A, ix - 1.0, iy);
+vec4 rr2 = fetch(@A, ix + 1.0, iy);
+vec4 lap2 = l2 + rr2 - 2.0 * c2;
+@OUT = lap + lap2;
+"""
+    _equiv_strict(r, "stencil order: two stencils around a binding mutation",
+                  two_stencil_code, {"A": img.clone()})
+    try:
+        src = _codegen_source(two_stencil_code, {"A": img})
+        assert src.count("conv2d") == 2, f"expected 2 convs, got {src.count('conv2d')}"
+        first = src.index("conv2d")
+        second = src.rindex("conv2d")
+        halve = src.index("_bind['A'] = ")
+        assert first < halve < second, "convs not interleaved with the binding mutation"
+        r.ok("stencil order: convs emitted at their combo positions")
+    except Exception as e:
+        r.fail("stencil order: convs emitted at their combo positions", f"{e}")
+
+    # ── CG-B1 (part 2): hoisted BCHW must not survive a binding rebind ──
+    _equiv_strict(r, "sample hoist: rebind between sampling loops", """
+vec4 acc = vec4(0.0);
+float i = 0.0;
+while (i < 2.0) { acc = acc + sample(@A, u, v); i = i + 1.0; }
+@A = @A * 0.5;
+vec4 acc2 = vec4(0.0);
+float j = 0.0;
+while (j < 2.0) { acc2 = acc2 + sample(@A, u, v); j = j + 1.0; }
+@OUT = (acc + acc2) * 0.25;
+""", {"A": img.clone()})
+
+    # ── CLCG5: walker drift — ArrayLiteral elements are real references ──
+    # Old _collect_ident_refs had no ArrayDecl/ArrayLiteral branch, so `c` was
+    # consumed by the stencil while `{c, lap}` still referenced it (runtime
+    # NameError -> silent interpreter fallback + spurious blacklist).
+    _equiv_strict(r, "walker: tap referenced from array literal", """
+vec4 c = fetch(@A, ix, iy);
+vec4 l = fetch(@A, ix - 1.0, iy);
+vec4 rr = fetch(@A, ix + 1.0, iy);
+vec4 lap = l + rr - 2.0 * c;
+vec4 k[] = {c, lap};
+@OUT = k[0] * 0.5 + k[1] * 0.25;
+""", {"A": img.clone()})
+
+    # ── CG-P3: $param reads hoisted to the preamble ───────────────────
+
+    _equiv_strict(r, "param hoist: float param before/inside loop", """
+float s = $amt;
+for (int i = 0; i < 4; i = i + 1) { s = s + $amt * 0.5; }
+@OUT = @A * 0.0 + s;
+""", {"A": img.clone(), "amt": 0.3})
+
+    _equiv_strict(r, "param hoist: v3 list param", """
+v3$tint;
+@OUT = @A * $tint;
+""", {"A": img.clone(), "tint": [0.5, 0.8, 0.3]})
+
+    _equiv_strict(r, "param hoist: string param stays str", """
+s$label;
+@OUT_str = $label + "!";
+@OUT = @A;
+""", {"A": img.clone(), "label": "hi"})
+
+    _equiv_strict(r, "param hoist: param inside user function", """
+float gain(float x) { return x * $amt; }
+m@OUT = gain(@A.r);
+""", {"A": img.clone(), "amt": 0.7})
+
+    try:
+        src = _codegen_source("""
+float a = $amt + $amt;
+float b = 0.0;
+for (int i = 0; i < 2; i = i + 1) { b = b + $amt * @A.r; }
+m@OUT = a * 0.0 + b * 0.1;
+""", {"A": img, "amt": 0.3})
+        n = src.count("_bind['amt']")
+        assert n == 1, f"$amt read {n} times, expected a single hoisted read"
+        r.ok("param hoist: single _bind read per param")
+    except Exception as e:
+        r.fail("param hoist: single _bind read per param", f"{e}")
+
+    # ── CG-P4: scalar-mode if/else emits only the scalar branch ──────
+
+    scalar_if_code = """
+float acc = 0.0;
+for (int i = 0; i < 4; i = i + 1) {
+    float t = i * 0.25;
+    if (t > 0.1) {
+        if (t > 0.4) {
+            if (t > 0.6) { acc = acc + 0.123456; } else { acc = acc + 0.01; }
+        } else { acc = acc + 0.02; }
+    } else { acc = acc + 0.03; }
+}
+@OUT = @A * 0.0 + acc;
+"""
+    _equiv_strict(r, "scalar if: nested if/else in scalar loop (parity)",
+                  scalar_if_code, {"A": img.clone()})
+    try:
+        src = _codegen_source(scalar_if_code, {"A": img})
+        n = src.count("0.123456")
+        assert n == 1, f"innermost body emitted {n} times (2^depth duplication)"
+        r.ok("scalar if: bodies emitted once (no 2^depth duplication)")
+    except Exception as e:
+        r.fail("scalar if: bodies emitted once (no 2^depth duplication)", f"{e}")
+
+    # Regression watch: tensor-mode loops keep the dual scalar/spatial paths.
+    _equiv_strict(r, "spatial if: cond var turns spatial mid-loop", """
+float x = 0.0;
+float acc = 0.0;
+for (int i = 0; i < 3; i = i + 1) {
+    if (x > 0.5) { acc = acc + 1.0; }
+    x = x + u + 0.4;
+}
+m@OUT = acc * 0.2;
+""", {"A": img.clone()})
+
+    _equiv_strict(r, "spatial if: img reduction condition", """
+float y = 0.0;
+if (img_max(@A).r > 0.5) { y = 1.0; } else { y = 0.25; }
+m@OUT = y;
+""", {"A": img.clone() + 0.5})
+
+    _equiv_strict(r, "spatial if: scalar float binding condition", """
+float y = 0.0;
+if (@t > 0.5) { y = 1.0; } else { y = 0.2; }
+m@OUT = y + @A.r * 0.0;
+""", {"A": img.clone(), "t": 0.7})

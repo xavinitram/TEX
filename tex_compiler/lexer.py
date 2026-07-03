@@ -13,6 +13,7 @@ from __future__ import annotations
 from enum import Enum, auto
 from dataclasses import dataclass
 from .ast_nodes import SourceLoc
+from .diagnostics import make_diagnostic
 
 
 class TokenType(Enum):
@@ -45,6 +46,7 @@ class TokenType(Enum):
     KW_WHILE = auto()
     KW_BREAK = auto()
     KW_CONTINUE = auto()
+    KW_RETURN = auto()
     KW_CONST = auto()
 
     # Operators
@@ -83,8 +85,6 @@ class TokenType(Enum):
     SEMI = auto()
     DOT = auto()
 
-    KW_RETURN = auto()
-
     # Special
     EOF = auto()
 
@@ -108,12 +108,34 @@ KEYWORDS = {
     "const": TokenType.KW_CONST,
 }
 
+# Two-character operators, checked before SINGLE_CHAR_TOKENS so `<=` beats `<`
+# (and comment openers `//`, `/*` are handled before either, preserving
+# maximal munch for `/=`).
+TWO_CHAR_TOKENS = {
+    "++": TokenType.PLUS_PLUS,
+    "--": TokenType.MINUS_MINUS,
+    "+=": TokenType.PLUS_ASSIGN,
+    "-=": TokenType.MINUS_ASSIGN,
+    "*=": TokenType.STAR_ASSIGN,
+    "/=": TokenType.SLASH_ASSIGN,
+    "==": TokenType.EQ,
+    "!=": TokenType.NEQ,
+    "<=": TokenType.LTE,
+    ">=": TokenType.GTE,
+    "&&": TokenType.AND,
+    "||": TokenType.OR,
+}
+
 SINGLE_CHAR_TOKENS = {
     "+": TokenType.PLUS,
     "-": TokenType.MINUS,
     "*": TokenType.STAR,
     "/": TokenType.SLASH,
     "%": TokenType.PERCENT,
+    "=": TokenType.ASSIGN,
+    "<": TokenType.LT,
+    ">": TokenType.GT,
+    "!": TokenType.NOT,
     "(": TokenType.LPAREN,
     ")": TokenType.RPAREN,
     "{": TokenType.LBRACE,
@@ -126,6 +148,10 @@ SINGLE_CHAR_TOKENS = {
     "?": TokenType.QUESTION,
     ":": TokenType.COLON,
 }
+
+# Escapes recognized inside string literals. The E1004 message in read_string
+# spells out this list — keep the two in sync.
+_STRING_ESCAPE_MAP = {"\\": "\\", '"': '"', "n": "\n", "t": "\t", "r": "\r"}
 
 # Type prefixes that can appear immediately before @ or $ to form typed bindings.
 # e.g. f@threshold → TYPED_AT_BINDING with prefix="f"
@@ -153,7 +179,7 @@ def _is_ident_continue(c: str) -> bool:
     return _is_ascii_alpha(c) or _is_ascii_digit(c) or c == "_"
 
 
-@dataclass
+@dataclass(slots=True)
 class Token:
     type: TokenType
     value: str
@@ -170,7 +196,7 @@ class LexerError(Exception):
     def __init__(self, message: str, loc: SourceLoc, *, source: str = "",
                  code: str = "E1000", hint: str = "", end_col: int | None = None):
         self.loc = loc
-        self.diagnostic = None  # Set below after import-safe construction
+        self.diagnostic = None  # Built lazily
         self._raw_message = message
         self._source = source
         self._code = code
@@ -179,10 +205,9 @@ class LexerError(Exception):
         super().__init__(f"[{loc}] {message}")
 
     def _build_diagnostic(self):
-        """Lazily build the diagnostic (avoids circular import at class load time)."""
+        """Lazily build the diagnostic (only errors that surface need one)."""
         if self.diagnostic is not None:
             return
-        from .diagnostics import make_diagnostic
         self.diagnostic = make_diagnostic(
             code=self._code,
             message=self._raw_message,
@@ -234,85 +259,112 @@ class Lexer:
             self.col += 1
         return ch
 
+    def _advance_run(self, end: int):
+        """Move pos to `end`, updating line/col across the skipped run.
+
+        Batched replacement for repeated advance() calls; handles runs that
+        contain newlines (whitespace, block comments).
+        """
+        src = self.source
+        nl = src.count("\n", self.pos, end)
+        if nl:
+            self.line += nl
+            # 1-based column of the character right after the last newline
+            self.col = end - src.rindex("\n", self.pos, end)
+        else:
+            self.col += end - self.pos
+        self.pos = end
+
     def skip_whitespace(self):
-        while self.pos < len(self.source) and self.source[self.pos] in " \t\r\n":
-            self.advance()
+        src = self.source
+        n = len(src)
+        i = self.pos
+        while i < n and src[i] in " \t\r\n":
+            i += 1
+        if i > self.pos:
+            self._advance_run(i)
 
     def skip_line_comment(self):
-        while self.pos < len(self.source) and self.source[self.pos] != "\n":
-            self.advance()
+        # Leave the terminating "\n" for skip_whitespace (line stays exact)
+        end = self.source.find("\n", self.pos)
+        if end == -1:
+            end = len(self.source)
+        self.col += end - self.pos
+        self.pos = end
 
     def skip_block_comment(self):
-        start_loc = self.loc()
-        self.advance()  # skip *
-        while self.pos < len(self.source):
-            if self.peek() == "*" and self.peek_ahead() == "/":
-                self.advance()  # *
-                self.advance()  # /
-                return
-            self.advance()
-        raise self._error("Unterminated block comment. Did you forget a closing `*/`?",
-                          start_loc, code="E1001")
+        start_loc = self.loc()  # at the `*` of the opening `/*`
+        # Search after the opening `*` so `/*/` does not close itself
+        end = self.source.find("*/", self.pos + 1)
+        if end == -1:
+            raise self._error("Unterminated block comment. Did you forget a closing `*/`?",
+                              start_loc, code="E1001")
+        self._advance_run(end + 2)
 
     def read_number(self) -> Token:
+        # Numbers never contain newlines, so the scan runs on a local index
+        # and commits pos/col once at the end (line stays exact).
         start_loc = self.loc()
         start_pos = self.pos
+        src = self.source
+        n = len(src)
         is_float = False
 
         # Check for hex: 0x...
         if self.peek() == "0" and self.peek_ahead() in ("x", "X"):
-            self.advance()  # 0
-            self.advance()  # x
-            hex_start = self.pos
-            while self.pos < len(self.source) and self.source[self.pos] in "0123456789abcdefABCDEF":
-                self.advance()
-            if self.pos == hex_start:
+            i = self.pos + 2
+            hex_start = i
+            while i < n and src[i] in "0123456789abcdefABCDEF":
+                i += 1
+            if i == hex_start:
                 raise self._error("Hex literal '0x' has no digits. Try something like 0xFF.",
                                   start_loc, code="E1002")
-            text = self.source[start_pos:self.pos]
-            return Token(TokenType.INT_LIT, text, start_loc)
+            self.col += i - self.pos
+            self.pos = i
+            return Token(TokenType.INT_LIT, src[start_pos:i], start_loc)
 
-        while self.pos < len(self.source) and _is_ascii_digit(self.source[self.pos]):
-            self.advance()
+        i = self.pos
+        while i < n and _is_ascii_digit(src[i]):
+            i += 1
 
-        if self.pos < len(self.source) and self.source[self.pos] == ".":
-            next_ch = self.peek_ahead()
+        if i < n and src[i] == ".":
             # Only treat as float if followed by digit (not field access like 1.rgb)
-            if _is_ascii_digit(next_ch):
+            if i + 1 < n and _is_ascii_digit(src[i + 1]):
                 is_float = True
-                self.advance()  # .
-                while self.pos < len(self.source) and _is_ascii_digit(self.source[self.pos]):
-                    self.advance()
+                i += 1  # .
+                while i < n and _is_ascii_digit(src[i]):
+                    i += 1
 
         # Scientific notation
-        if self.pos < len(self.source) and self.source[self.pos] in ("e", "E"):
-            save_pos = self.pos
-            save_line = self.line
-            save_col = self.col
-            self.advance()  # e/E
-            if self.pos < len(self.source) and self.source[self.pos] in ("+", "-"):
-                self.advance()
-            exp_start = self.pos
-            while self.pos < len(self.source) and _is_ascii_digit(self.source[self.pos]):
-                self.advance()
-            if self.pos == exp_start:
-                # No digits after 'e' — backtrack (treat 'e' as separate identifier)
-                self.pos = save_pos
-                self.line = save_line
-                self.col = save_col
-            else:
+        if i < n and src[i] in ("e", "E"):
+            j = i + 1
+            if j < n and src[j] in ("+", "-"):
+                j += 1
+            exp_start = j
+            while j < n and _is_ascii_digit(src[j]):
+                j += 1
+            if j > exp_start:
                 is_float = True
+                i = j
+            # else: no digits after 'e' — leave it for a separate identifier
 
-        text = self.source[start_pos:self.pos]
+        self.col += i - self.pos
+        self.pos = i
+        text = src[start_pos:i]
         tok_type = TokenType.FLOAT_LIT if is_float else TokenType.INT_LIT
         return Token(tok_type, text, start_loc)
 
     def read_identifier(self) -> Token:
         start_loc = self.loc()
         start_pos = self.pos
-        while self.pos < len(self.source) and _is_ident_continue(self.source[self.pos]):
-            self.advance()
-        text = self.source[start_pos:self.pos]
+        src = self.source
+        n = len(src)
+        i = self.pos
+        while i < n and _is_ident_continue(src[i]):
+            i += 1
+        self.col += i - self.pos
+        self.pos = i
+        text = src[start_pos:i]
 
         # Check for typed binding: prefix immediately followed by @ or $
         # e.g. f@threshold, img@result, i$count
@@ -332,32 +384,42 @@ class Lexer:
         start_loc = self.loc()
         self.advance()  # skip opening "
         chars: list[str] = []
-        ESCAPE_MAP = {"\\": "\\", '"': '"', "n": "\n", "t": "\t", "r": "\r"}
-        while self.pos < len(self.source):
-            ch = self.source[self.pos]
+        src = self.source
+        n = len(src)
+        while self.pos < n:
+            # Batch the plain run up to the next terminator. Runs are
+            # newline-free (\n terminates), so col stays exact for esc_loc.
+            i = self.pos
+            while i < n and src[i] not in '"\\\n':
+                i += 1
+            if i > self.pos:
+                chars.append(src[self.pos:i])
+                self.col += i - self.pos
+                self.pos = i
+            if i >= n:
+                break
+            ch = src[i]
             if ch == '"':
                 self.advance()  # skip closing "
                 return Token(TokenType.STRING_LIT, "".join(chars), start_loc)
             if ch == '\\':
                 esc_loc = self.loc()
                 self.advance()  # skip backslash
-                if self.pos >= len(self.source):
+                if self.pos >= n:
                     raise self._error("Unterminated string escape at end of input.",
                                       esc_loc, code="E1003")
-                esc_ch = self.source[self.pos]
-                if esc_ch not in ESCAPE_MAP:
+                esc_ch = src[self.pos]
+                if esc_ch not in _STRING_ESCAPE_MAP:
                     raise self._error(
                         f"Invalid escape sequence: \\{esc_ch}. Valid escapes are: \\\\, \\\", \\n, \\t, \\r.",
                         esc_loc, code="E1004"
                     )
-                chars.append(ESCAPE_MAP[esc_ch])
+                chars.append(_STRING_ESCAPE_MAP[esc_ch])
                 self.advance()
                 continue
-            if ch == '\n':
-                raise self._error("Unterminated string — strings can't span multiple lines. Close it with a `\"` before the line break.",
-                                  start_loc, code="E1005")
-            chars.append(ch)
-            self.advance()
+            # ch == '\n'
+            raise self._error("Unterminated string — strings can't span multiple lines. Close it with a `\"` before the line break.",
+                              start_loc, code="E1005")
         raise self._error("Unterminated string literal. Did you forget a closing `\"`?",
                           start_loc, code="E1006")
 
@@ -369,15 +431,19 @@ class Lexer:
         detection in read_identifier.
         """
         name_start = self.pos
-        if (self.pos >= len(self.source) or
-                not _is_ident_start(self.source[self.pos])):
+        src = self.source
+        n = len(src)
+        if name_start >= n or not _is_ident_start(src[name_start]):
             raise self._error(
                 f"Expected a name after '{prefix_or_sigil}{sigil}'. For example: {sigil}myInput",
                 start_loc, code="E1007"
             )
-        while self.pos < len(self.source) and _is_ident_continue(self.source[self.pos]):
-            self.advance()
-        return self.source[name_start:self.pos]
+        i = name_start
+        while i < n and _is_ident_continue(src[i]):
+            i += 1
+        self.col += i - self.pos
+        self.pos = i
+        return src[name_start:i]
 
     def read_at_binding(self) -> Token:
         start_loc = self.loc()
@@ -421,11 +487,14 @@ class Lexer:
             if ch == "." and _is_ascii_digit(self.peek_ahead()):
                 start_loc = self.loc()
                 start_pos = self.pos
-                self.advance()  # .
-                while self.pos < len(self.source) and _is_ascii_digit(self.source[self.pos]):
-                    self.advance()
-                text = self.source[start_pos:self.pos]
-                self.tokens.append(Token(TokenType.FLOAT_LIT, text, start_loc))
+                src = self.source
+                n = len(src)
+                i = self.pos + 1  # .
+                while i < n and _is_ascii_digit(src[i]):
+                    i += 1
+                self.col += i - self.pos
+                self.pos = i
+                self.tokens.append(Token(TokenType.FLOAT_LIT, src[start_pos:i], start_loc))
                 continue
 
             # String literals
@@ -448,85 +517,23 @@ class Lexer:
                 self.tokens.append(self.read_dollar_binding())
                 continue
 
-            # Multi-character operators (check longest match first)
+            # Multi-character operators (check longest match first). At the
+            # last char the slice is 1 char long, misses the dict, and falls
+            # through to the single-char lookup. No 2-char operator contains
+            # a newline, so col += 2 is exact.
             start_loc = self.loc()
-            next_ch = self.peek_ahead()
-
-            if ch == "+" and next_ch == "+":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.PLUS_PLUS, "++", start_loc))
-                continue
-            if ch == "-" and next_ch == "-":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.MINUS_MINUS, "--", start_loc))
-                continue
-            if ch == "+" and next_ch == "=":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.PLUS_ASSIGN, "+=", start_loc))
-                continue
-            if ch == "-" and next_ch == "=":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.MINUS_ASSIGN, "-=", start_loc))
-                continue
-            if ch == "*" and next_ch == "=":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.STAR_ASSIGN, "*=", start_loc))
-                continue
-            if ch == "/" and next_ch == "=":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.SLASH_ASSIGN, "/=", start_loc))
-                continue
-            if ch == "=" and next_ch == "=":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.EQ, "==", start_loc))
-                continue
-            if ch == "!" and next_ch == "=":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.NEQ, "!=", start_loc))
-                continue
-            if ch == "<" and next_ch == "=":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.LTE, "<=", start_loc))
-                continue
-            if ch == ">" and next_ch == "=":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.GTE, ">=", start_loc))
-                continue
-            if ch == "&" and next_ch == "&":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.AND, "&&", start_loc))
-                continue
-            if ch == "|" and next_ch == "|":
-                self.advance(); self.advance()
-                self.tokens.append(Token(TokenType.OR, "||", start_loc))
+            pair = self.source[self.pos:self.pos + 2]
+            tt = TWO_CHAR_TOKENS.get(pair)
+            if tt is not None:
+                self.pos += 2
+                self.col += 2
+                self.tokens.append(Token(tt, pair, start_loc))
                 continue
 
             # Single-character operators and delimiters
             if ch in SINGLE_CHAR_TOKENS:
                 self.advance()
                 self.tokens.append(Token(SINGLE_CHAR_TOKENS[ch], ch, start_loc))
-                continue
-
-            # Standalone = (assignment)
-            if ch == "=":
-                self.advance()
-                self.tokens.append(Token(TokenType.ASSIGN, "=", start_loc))
-                continue
-
-            # Standalone < and >
-            if ch == "<":
-                self.advance()
-                self.tokens.append(Token(TokenType.LT, "<", start_loc))
-                continue
-            if ch == ">":
-                self.advance()
-                self.tokens.append(Token(TokenType.GT, ">", start_loc))
-                continue
-
-            # ! (not)
-            if ch == "!":
-                self.advance()
-                self.tokens.append(Token(TokenType.NOT, "!", start_loc))
                 continue
 
             raise self._error(f"Unexpected character: {ch!r}. TEX doesn't recognize this symbol.",

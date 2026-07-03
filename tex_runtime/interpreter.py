@@ -16,6 +16,7 @@ Execution model:
 from __future__ import annotations
 import torch
 import math
+from typing import Any
 from ..tex_compiler.ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
     BreakStmt, ContinueStmt, FunctionDef, ReturnStmt,
@@ -27,13 +28,17 @@ from ..tex_compiler.ast_nodes import (
     collect_assigned_vars,
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
-from .stdlib import TEXStdlib, SAFE_EPSILON, VEC_CHANNELS, _scalar_from_tensor
+from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
+                     _scalar_from_tensor, _get_flat_batch_index)
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
 
 # Hard limit on user function call depth to prevent stack overflow
 MAX_CALL_DEPTH = 64
+
+# Max distinct literal tensors kept across executions before a wholesale clear
+_LITERAL_CACHE_MAX = 4096
 
 # Default builtin values for scalar (no-spatial-context) mode
 _SCALAR_BUILTIN_DEFAULTS = {"ix": 0.0, "iy": 0.0, "u": 0.0, "v": 0.0,
@@ -113,12 +118,18 @@ class Interpreter:
         self.bindings: dict[str, torch.Tensor] = {}
         self.type_map: dict[int, TEXType] = {}
         self.functions: dict[str, callable] = self._get_stdlib()
+        # Hoisted binding-access functions — read on every @A[x,y] / @A(u,v)
+        self._fn_fetch = self.functions["fetch"]
+        self._fn_sample = self.functions["sample"]
+        self._fn_fetch_frame = self.functions["fetch_frame"]
+        self._fn_sample_frame = self.functions["sample_frame"]
         self.device: torch.device = torch.device("cpu")
         self.spatial_shape: tuple[int, int, int] | None = None  # (B, H, W)
         self._array_meta: dict[str, int] = {}  # var_name -> array size
         self._source: str = ""  # Original source code for diagnostics
         self._literal_cache: dict[tuple, torch.Tensor] = {}  # (value, device_str, dtype) -> tensor
         self._inplace_ready: set[str] = set()  # vars that have been cloned for in-place ops
+        self._scatter_owned: set[str] = set()  # bindings whose buffer this run owns (safe to scatter into)
         self._user_functions: dict[str, FunctionDef] = {}
         self._call_depth: int = 0
         self._builtins_cache_key: tuple | None = None
@@ -213,11 +224,15 @@ class Interpreter:
         latent_channel_count: int,
         output_names: list[str] | None,
         precision: str = "fp32",
-        tile_offset: tuple[int, int, int] | None = None,
         used_builtins: frozenset[str] | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
-        self.device = torch.device(device) if not isinstance(device, torch.device) else device
-        self._device_str = str(self.device)  # Cache for literal cache key
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        # Canonicalize an index-less "cuda" so cache keys ("cuda" vs "cuda:0")
+        # can't split, and literals survive a current-device switch.
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        self.device = dev
+        self._device_str = str(dev)  # Cache for literal cache key
         self.type_map = type_map
         self.latent_channel_count = latent_channel_count
         self._dtype = self._PRECISION_DTYPES.get(precision, torch.float32)
@@ -229,7 +244,10 @@ class Interpreter:
         # truncated to the declared width, matching codegen's _emit_vec_coerce.
         self._var_widths: dict[str, int] = {}
         self._inplace_ready.clear()
-        self._literal_cache.clear()
+        self._scatter_owned.clear()
+        # _literal_cache deliberately persists across executions — keys are
+        # execution-independent (value, device, dtype) and entries are never
+        # mutated (every write path clones before its first in-place store).
         self._user_functions.clear()
         self._assigned_vars_cache.clear()
 
@@ -261,7 +279,7 @@ class Interpreter:
         self.spatial_shape = self._determine_spatial_shape()
 
         # Create built-in coordinate variables (lazy — only what the program uses)
-        self._create_builtins(program, tile_offset=tile_offset, used_builtins=used_builtins)
+        self._create_builtins(program, used_builtins=used_builtins)
 
         # Execute statements via tree-walking interpreter
         for stmt in program.statements:
@@ -312,32 +330,23 @@ class Interpreter:
                 return (value.shape[0], value.shape[1], value.shape[2])
         return None
 
-    def _create_builtins(self, program: Program, tile_offset: tuple[int, int, int] | None = None,
+    def _create_builtins(self, program: Program,
                          used_builtins: frozenset[str] | None = None):
         """Create built-in variables lazily — only allocate what the program uses.
 
         Builtins use compact broadcast-friendly shapes instead of full
         [B, H, W] expansion. PyTorch broadcasts automatically in ops.
-
-        When tile_offset is provided (y_start, full_H, full_W), coordinates
-        reflect position in the full image rather than the tile.
         """
         used = used_builtins if used_builtins is not None else _collect_identifiers(program)
 
         # Cache builtins: reuse tensors when spatial config hasn't changed
-        cache_key = (self.spatial_shape, self._device_str, self._dtype, tile_offset, used, self.latent_channel_count)
+        cache_key = (self.spatial_shape, self._device_str, self._dtype, used, self.latent_channel_count)
         if cache_key == self._builtins_cache_key:
             self.env.update(self._builtins_cache_env)
             return
 
         if self.spatial_shape:
             B, H, W = self.spatial_shape
-
-            # For tiled execution, use full image dimensions for coordinate normalization
-            if tile_offset is not None:
-                y_start, full_H, full_W = tile_offset
-            else:
-                y_start, full_H, full_W = 0, H, W
 
             # ix: pixel x-coordinate [0, W-1] — compact shape [1, 1, W]
             # u/v use expand() which creates a view (no memory copy) at [B,H,W]
@@ -347,27 +356,27 @@ class Interpreter:
                 if "ix" in used:
                     self.env["ix"] = ix
                 if "u" in used:
-                    self.env["u"] = (ix / max(full_W - 1, 1)).expand(B, H, W)
+                    self.env["u"] = (ix / max(W - 1, 1)).expand(B, H, W)
 
-            # iy: pixel y-coordinate — offset by y_start for tiling
+            # iy: pixel y-coordinate
             if "iy" in used or "v" in used:
-                iy = torch.arange(y_start, y_start + H, dtype=self._dtype, device=self.device).view(1, H, 1)
+                iy = torch.arange(H, dtype=self._dtype, device=self.device).view(1, H, 1)
                 if "iy" in used:
                     self.env["iy"] = iy
                 if "v" in used:
-                    self.env["v"] = (iy / max(full_H - 1, 1)).expand(B, H, W)
+                    self.env["v"] = (iy / max(H - 1, 1)).expand(B, H, W)
 
-            # iw, ih: FULL image dimensions (not tile dimensions)
+            # iw, ih: image dimensions
             if "iw" in used:
-                self.env["iw"] = torch.scalar_tensor(float(full_W), dtype=self._dtype, device=self.device)
+                self.env["iw"] = torch.scalar_tensor(float(W), dtype=self._dtype, device=self.device)
             if "ih" in used:
-                self.env["ih"] = torch.scalar_tensor(float(full_H), dtype=self._dtype, device=self.device)
+                self.env["ih"] = torch.scalar_tensor(float(H), dtype=self._dtype, device=self.device)
 
             # px, py: pixel step in UV space (1/width, 1/height)
             if "px" in used:
-                self.env["px"] = torch.scalar_tensor(1.0 / max(full_W, 1), dtype=self._dtype, device=self.device)
+                self.env["px"] = torch.scalar_tensor(1.0 / max(W, 1), dtype=self._dtype, device=self.device)
             if "py" in used:
-                self.env["py"] = torch.scalar_tensor(1.0 / max(full_H, 1), dtype=self._dtype, device=self.device)
+                self.env["py"] = torch.scalar_tensor(1.0 / max(H, 1), dtype=self._dtype, device=self.device)
 
             if "fi" in used:
                 self.env["fi"] = torch.arange(B, dtype=self._dtype, device=self.device).view(B, 1, 1)
@@ -377,7 +386,7 @@ class Interpreter:
             # No spatial context — pure scalar mode (only create what's used)
             for name, val in _SCALAR_BUILTIN_DEFAULTS.items():
                 if name in used:
-                    self.env[name] = torch.scalar_tensor(val, device=self.device)
+                    self.env[name] = torch.scalar_tensor(val, dtype=self._dtype, device=self.device)
 
         if "PI" in used:
             self.env["PI"] = torch.scalar_tensor(math.pi, dtype=self._dtype, device=self.device)
@@ -413,13 +422,18 @@ class Interpreter:
 
     def _aliased_vars(self, expr) -> set:
         """Variable names whose tensor buffer `expr` may return as a VIEW (shared
-        storage). Fresh-allocating expressions — arithmetic, unary, function calls,
-        constructors, casts, literals — never alias an existing variable, so they
-        return the empty set (which keeps the in-place fast path for `x = x OP c`).
+        storage). Fresh-allocating expressions — arithmetic, unary, multi-arg
+        constructors, literals — never alias an existing variable, so they return
+        the empty set (which keeps the in-place fast path for `x = x OP c`).
         View-producing forms do alias: a bare `x`, a channel/swizzle read `x.rgb`/
         `x.r` (a contiguous slice shares storage), a ternary that passes a branch
-        through, and an array-index read. Used to invalidate in-place readiness so
-        a later in-place mutation of the source can't corrupt an alias of it."""
+        through, an array-index read, a same-dtype cast (float(x) can return x),
+        a same-width constructor (vec3(v3) returns v3), and any function call —
+        user functions may return a parameter unchanged and several stdlib
+        functions pass an input through (e.g. blur with tiny sigma) or return a
+        view (transpose), so calls conservatively alias whatever their arguments
+        alias. Used to invalidate in-place readiness so a later in-place mutation
+        of the source can't corrupt an alias of it."""
         cls = expr.__class__
         if cls is Identifier:
             return {expr.name}
@@ -429,6 +443,15 @@ class Interpreter:
             return self._aliased_vars(expr.true_expr) | self._aliased_vars(expr.false_expr)
         if cls is ArrayIndexAccess:
             return self._aliased_vars(expr.array)
+        if cls is CastExpr:
+            return self._aliased_vars(expr.expr)
+        if cls is FunctionCall:
+            out = set()
+            for a in expr.args:
+                out |= self._aliased_vars(a)
+            return out
+        if cls is VecConstructor and len(expr.args) == 1:
+            return self._aliased_vars(expr.args[0])
         return set()
 
     def _coerce_vec_width(self, value, n: int):
@@ -549,12 +572,12 @@ class Interpreter:
         # Scalar — broadcast to vec
         return tensor.unsqueeze(-1).expand(*tensor.shape, channels)
 
-    # In-place operation mapping: op -> (tensor_method, is_commutative)
+    # In-place operation mapping: op -> (unbound tensor method, is_commutative)
     _INPLACE_OPS = {
-        "+": ("add_", True),
-        "-": ("sub_", False),
-        "*": ("mul_", True),
-        "/": ("div_", False),
+        "+": (torch.Tensor.add_, True),
+        "-": (torch.Tensor.sub_, False),
+        "*": (torch.Tensor.mul_, True),
+        "/": (torch.Tensor.div_, False),  # kept for the "/" key; division uses its own guarded branch
     }
 
     def _ensure_inplace_ready(self, name: str) -> torch.Tensor:
@@ -575,7 +598,7 @@ class Interpreter:
             rhs = node.value
             op_info = self._INPLACE_OPS.get(rhs.op)
             if op_info is not None:
-                method_name, commutative = op_info
+                method, commutative = op_info
                 name = target.name
                 is_div = rhs.op == "/"
                 # Pattern 1: x = x OP expr
@@ -589,9 +612,10 @@ class Interpreter:
                             current = self._ensure_inplace_ready(name)
                             if is_div:
                                 # Safe in-place division: x /= where(rhs==0, eps, rhs)
-                                current.div_(torch.where(other_val == 0, SAFE_EPSILON, other_val))
+                                eps = ZERO_GUARD_EPS.get(other_val.dtype, SAFE_EPSILON)
+                                current.div_(torch.where(other_val == 0, eps, other_val))
                             else:
-                                getattr(current, method_name)(other_val)
+                                method(current, other_val)
                             return
                 # Pattern 2: x = expr OP x (only for commutative ops)
                 elif commutative and isinstance(rhs.right, Identifier) and rhs.right.name == name:
@@ -602,7 +626,7 @@ class Interpreter:
                             other_val.dim() == 0 or other_val.shape == current.shape
                         ):
                             current = self._ensure_inplace_ready(name)
-                            getattr(current, method_name)(other_val)
+                            method(current, other_val)
                             return
 
         value = self._eval(node.value)
@@ -626,12 +650,19 @@ class Interpreter:
 
         elif isinstance(target, BindingRef):
             self.bindings[target.name] = value
+            # The binding now shares storage with anything the value aliases:
+            # this run no longer owns the buffer for scatter writes, and any
+            # aliased variable must lose in-place readiness so a later write to
+            # it can't mutate the stored output.
+            self._scatter_owned.discard(target.name)
+            for _name in self._aliased_vars(node.value):
+                self._inplace_ready.discard(_name)
 
         elif isinstance(target, ChannelAccess):
-            self._exec_channel_assign(target, value)
+            self._exec_channel_assign(target, value, node.value)
 
         elif isinstance(target, ArrayIndexAccess):
-            self._exec_array_index_assign(target, value)
+            self._exec_array_index_assign(target, value, node.value)
 
         elif isinstance(target, BindingIndexAccess):
             self._exec_scatter_write(target, value, op=node.op)
@@ -643,10 +674,30 @@ class Interpreter:
                 hint="Assignments work with variables, @bindings, channels (.r), array indices ([i]), and scatter writes (@OUT[x,y]).",
             )
 
-    def _exec_channel_assign(self, target: ChannelAccess, value: torch.Tensor):
+    def _can_write_inplace(self, name: str | None, base, value, rhs_node) -> bool:
+        """True when an indexed write may mutate `base` directly instead of
+        cloning first: the buffer was cloned by this run (in-place ready), the
+        RHS can't alias the target by AST shape, and the evaluated value doesn't
+        share the target's storage (catches views the AST guard can't see, e.g.
+        a user function returning its argument)."""
+        return (
+            name is not None
+            and name in self._inplace_ready
+            and (rhs_node is None or name not in self._aliased_vars(rhs_node))
+            and not (value.__class__ is torch.Tensor
+                     and base.__class__ is torch.Tensor
+                     and value.untyped_storage().data_ptr() == base.untyped_storage().data_ptr())
+        )
+
+    def _exec_channel_assign(self, target: ChannelAccess, value: torch.Tensor, rhs_node=None):
         """Handle assignment to a channel: `@A.r = expr;` or `color.rgb = expr;`"""
         base = self._eval(target.object)
         channels = target.channels
+        obj = target.object
+        # Copy-on-first-write: only bare variables participate (bindings hold
+        # caller-owned tensors and share the flat name space with variables).
+        name = obj.name if obj.__class__ is Identifier else None
+        inplace = self._can_write_inplace(name, base, value, rhs_node)
 
         if len(channels) == 1:
             idx = CHANNEL_MAP.get(channels)
@@ -656,21 +707,20 @@ class Interpreter:
                     target.loc, source=self._source, code="E6004",
                     hint="Use one of: .r, .g, .b, .a (or .x, .y, .z, .w).",
                 )
-            result = base.clone()
-            if result.dim() >= 1 and result.shape[-1] > idx:
-                result[..., idx] = _ensure_spatial(value, result.shape[:-1])
-            else:
-                nchan = result.shape[-1] if result.dim() >= 1 else 1
+            if not (base.dim() >= 1 and base.shape[-1] > idx):
+                nchan = base.shape[-1] if base.dim() >= 1 else 1
                 raise InterpreterError(
                     f"This value has {nchan} channel{'s' if nchan != 1 else ''}, so it has no "
                     f"channel #{idx + 1} to write to.",
                     target.loc, source=self._source, code="E6004",
                     hint="A vec3 has 3 channels (r, g, b); build a vec4 (e.g. vec4(color, 1.0)) if you need a 4th (alpha).",
                 )
+            result = base if inplace else base.clone()
+            result[..., idx] = _ensure_spatial(value, result.shape[:-1])
         else:
             # Multi-channel assignment: .rgb, .xy, .rgba, etc.
             indices = [CHANNEL_MAP[ch] for ch in channels]
-            result = base.clone()
+            result = base if inplace else base.clone()
             val = _ensure_spatial(value, result.shape[:-1]) if self.spatial_shape else value
             val_is_multi = isinstance(val, torch.Tensor) and val.dim() >= 1 and val.shape[-1] > 1
             for i, idx in enumerate(indices):
@@ -678,10 +728,14 @@ class Interpreter:
                     result[..., idx] = val[..., i] if val_is_multi else val
 
         # Write back to the correct location
-        if isinstance(target.object, Identifier):
-            self.env[target.object.name] = result
-        elif isinstance(target.object, BindingRef):
-            self.bindings[target.object.name] = result
+        if name is not None:
+            self.env[name] = result
+            # result is either the already-owned buffer or a fresh clone —
+            # subsequent writes to this variable may skip the clone.
+            self._inplace_ready.add(name)
+        elif isinstance(obj, BindingRef):
+            self.bindings[obj.name] = result
+            self._scatter_owned.discard(obj.name)
         else:
             raise InterpreterError(
                 "This channel assignment needs a variable or @binding as its target",
@@ -689,7 +743,7 @@ class Interpreter:
                 hint="Assign to a named variable's channel, e.g. 'color.r = 1.0;' or '@OUT.r = 1.0;'.",
             )
 
-    def _exec_array_index_assign(self, target: ArrayIndexAccess, value):
+    def _exec_array_index_assign(self, target: ArrayIndexAccess, value, rhs_node=None):
         """Handle: arr[i] = expr;"""
         array = self._eval(target.array)
         index = self._eval(target.index)
@@ -703,11 +757,17 @@ class Interpreter:
                 self.env[target.array.name] = result
             return
 
+        # Copy-on-first-write: clone only the first write to a variable-held
+        # array; later writes (e.g. a fill loop) mutate the owned buffer.
+        tgt = target.array
+        name = tgt.name if tgt.__class__ is Identifier else None
+        inplace = self._can_write_inplace(name, array, value, rhs_node)
+
         # Vector array: dim 5 (spatial) or 2 (non-spatial) → [..., N, C]
         if array.dim() in (2, 5):
             arr_size = array.shape[-2]
             idx = _safe_array_index(index, arr_size)
-            result = array.clone()
+            result = array if inplace else array.clone()
 
             if result.dim() == 2:
                 # Non-spatial vector array [N, C]
@@ -731,7 +791,7 @@ class Interpreter:
             # Scalar array: dim 4 (spatial) or 1 (non-spatial) → [..., N]
             arr_size = array.shape[-1]
             idx = _safe_array_index(index, arr_size)
-            result = array.clone()
+            result = array if inplace else array.clone()
 
             if result.dim() == 1:
                 result[idx] = value if isinstance(value, torch.Tensor) else torch.scalar_tensor(float(value), dtype=self._dtype, device=self.device)
@@ -747,10 +807,14 @@ class Interpreter:
                 result.scatter_(-1, idx_expanded, val_expanded)
 
         # Write back to the correct location
-        if isinstance(target.array, Identifier):
-            self.env[target.array.name] = result
-        elif isinstance(target.array, BindingRef):
-            self.bindings[target.array.name] = result
+        if name is not None:
+            self.env[name] = result
+            # result is either the already-owned buffer or a fresh clone —
+            # subsequent writes to this array may skip the clone.
+            self._inplace_ready.add(name)
+        elif isinstance(tgt, BindingRef):
+            self.bindings[tgt.name] = result
+            self._scatter_owned.discard(tgt.name)
         else:
             raise InterpreterError(
                 "This array index assignment needs a variable or @binding as its target",
@@ -789,26 +853,32 @@ class Interpreter:
                 new_buf[...] = buf
             buf = new_buf
             self.bindings[name] = buf
-        elif not buf.is_contiguous():
-            # Clone expanded tensors (e.g. from vec3(1.0) broadcast) so index_put_ works
+        elif name not in self._scatter_owned:
+            # First scatter into a buffer this run didn't allocate: clone before
+            # writing. The stored tensor may be (a view of) caller-owned storage —
+            # an input binding, a cached literal, or a builtin grid (`@OUT = u;`) —
+            # and an in-place index write would corrupt it for every other reader.
+            # Cloning also materializes expanded views so index_put_ works.
             buf = buf.clone()
             self.bindings[name] = buf
+        self._scatter_owned.add(name)
 
         # Clamp coordinates
         ix_t = torch.clamp(torch.floor(_ensure_spatial(px, (B, H, W)) if self.spatial_shape else px).long(), 0, W - 1)
         iy_t = torch.clamp(torch.floor(_ensure_spatial(py, (B, H, W)) if self.spatial_shape else py).long(), 0, H - 1)
         val = _ensure_spatial(value, (B, H, W)) if self.spatial_shape else value
 
-        # Build flat indices
+        # Build flat indices — the batch index is data-independent, so its
+        # flattened form comes from the shared sampler cache.
         if frame is not None:
             batch_idx = torch.clamp(
                 (_ensure_spatial(frame, (B, H, W)) if self.spatial_shape else frame).long(),
                 0, B - 1
             )
+            flat_b = batch_idx.contiguous().reshape(-1)
         else:
-            batch_idx = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, H, W)
+            flat_b = _get_flat_batch_index(B, H, W, self.device)
 
-        flat_b = batch_idx.contiguous().reshape(-1)
         flat_y = iy_t.contiguous().reshape(-1)
         flat_x = ix_t.contiguous().reshape(-1)
 
@@ -843,7 +913,8 @@ class Interpreter:
         elif op == "*":
             buf[idx] *= flat_v
         elif op == "/":
-            buf[idx] /= torch.where(flat_v == 0, SAFE_EPSILON, flat_v)
+            eps = ZERO_GUARD_EPS.get(flat_v.dtype, SAFE_EPSILON) if isinstance(flat_v, torch.Tensor) else SAFE_EPSILON
+            buf[idx] /= torch.where(flat_v == 0, eps, flat_v)
 
     _collect_assigned_vars = staticmethod(collect_assigned_vars)
 
@@ -1110,6 +1181,11 @@ class Interpreter:
         if cached is not None:
             return cached
         t = torch.scalar_tensor(node.value, dtype=self._dtype, device=self.device)
+        # The cache persists across executions; entries are 0-dim (a few hundred
+        # bytes each) but distinct literals accumulate over a session of code
+        # edits — wholesale-clear on overflow (entries are trivially recreated).
+        if len(self._literal_cache) >= _LITERAL_CACHE_MAX:
+            self._literal_cache.clear()
         self._literal_cache[key] = t
         return t
 
@@ -1285,8 +1361,9 @@ class Interpreter:
                 # the interpreter is the hot path on compiler-less boxes.
                 if isinstance(node.right, NumberLiteral) and node.right.value != 0:
                     return left / right
-                # Avoid division by zero: replace 0 with SAFE_EPSILON (fewer temporaries than multiply+add)
-                return left / torch.where(right == 0, SAFE_EPSILON, right)
+                # Avoid division by zero: replace 0 with a dtype-safe epsilon
+                # (fewer temporaries than multiply+add)
+                return left / torch.where(right == 0, ZERO_GUARD_EPS.get(right.dtype, SAFE_EPSILON), right)
             if op == "<":
                 return (left < right).float()
             if op == ">":
@@ -1306,7 +1383,7 @@ class Interpreter:
             if op == "%":
                 if isinstance(node.right, NumberLiteral) and node.right.value != 0:
                     return torch.fmod(left, right)
-                return torch.fmod(left, torch.where(right == 0, SAFE_EPSILON, right))
+                return torch.fmod(left, torch.where(right == 0, ZERO_GUARD_EPS.get(right.dtype, SAFE_EPSILON), right))
             raise InterpreterError(
                 f"Operator '{op}' is not supported",
                 node.loc, source=self._source, code="E6040",
@@ -1334,6 +1411,15 @@ class Interpreter:
                 hint="Both sides of the operator must be the same type. "
                      "Use string() or float() to convert.",
             )
+
+        # Neither the tensor fast path nor the string path matched (e.g. a
+        # string-array list operand) — fail loudly here instead of returning
+        # None and surfacing as an AttributeError far from the source.
+        raise InterpreterError(
+            f"Operator '{op}' is not supported for these operand types",
+            node.loc, source=self._source, code="E6040",
+            hint="Arrays and mixed types cannot be combined with binary operators.",
+        )
 
     def _eval_unary(self, node: UnaryOp) -> torch.Tensor:
         operand = self._eval(node.operand)
@@ -1389,9 +1475,14 @@ class Interpreter:
 
         args = [self._eval(arg) for arg in call_node.args]
 
-        # Save and replace environment
+        # Save and replace environment. The in-place ready set is scoped per
+        # call: params are bound by reference to caller tensors, so readiness
+        # must not leak in (a body write would mutate the caller's buffer) or
+        # out (a callee-local name would falsely ready a same-named caller var).
         saved_env = self.env
+        saved_ready = self._inplace_ready
         self.env = dict(saved_env)  # shallow copy — inherits builtins
+        self._inplace_ready = set()
 
         # Bind parameters
         for (ptype, pname), arg_val in zip(func_def.params, args):
@@ -1407,6 +1498,7 @@ class Interpreter:
             result = torch.scalar_tensor(0.0, dtype=self._dtype, device=self.device)
         finally:
             self.env = saved_env
+            self._inplace_ready = saved_ready
             self._call_depth -= 1
 
         return result
@@ -1428,8 +1520,8 @@ class Interpreter:
         self._require_image(node.binding, image, "[ ]")
         args = [self._eval(a) for a in node.args]
         if len(args) == 3:
-            return self.functions["fetch_frame"](image, args[2], args[0], args[1])
-        return self.functions["fetch"](image, args[0], args[1])
+            return self._fn_fetch_frame(image, args[2], args[0], args[1])
+        return self._fn_fetch(image, args[0], args[1])
 
     def _eval_binding_sample(self, node: BindingSampleAccess):
         """@Image(u, v) → sample, @Image(u, v, frame) → sample_frame"""
@@ -1437,8 +1529,8 @@ class Interpreter:
         self._require_image(node.binding, image, "( )")
         args = [self._eval(a) for a in node.args]
         if len(args) == 3:
-            return self.functions["sample_frame"](image, args[2], args[0], args[1])
-        return self.functions["sample"](image, args[0], args[1])
+            return self._fn_sample_frame(image, args[2], args[0], args[1])
+        return self._fn_sample(image, args[0], args[1])
 
     def _eval_function_call(self, node: FunctionCall) -> torch.Tensor | str:
         fn = self.functions.get(node.name)

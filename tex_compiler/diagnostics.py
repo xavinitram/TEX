@@ -264,7 +264,6 @@ _FOREIGN_KEYWORD_HINTS: dict[str, str] = {
     "out":     "TEX uses @OUT for output. Assign to @OUT = value; to set it.",
     "inout":   "TEX uses @name for both input and output. Read from @A, write to @OUT.",
     "elif":    "TEX uses else if (two words), not elif.",
-    "else if": None,  # valid — no hint needed
     "switch":  "TEX doesn't have switch/case. Use if/else if chains instead.",
     "case":    "TEX doesn't have switch/case. Use if/else if chains instead.",
     "true":    "TEX uses 1.0 for true and 0.0 for false. Comparisons like (x > 0.5) already give 1.0/0.0, so use them directly in if-conditions, or multiply by them to mask.",
@@ -314,10 +313,7 @@ def get_type_hint(name: str) -> str:
 
 
 def get_keyword_hint(keyword: str) -> str | None:
-    """
-    Return a contextual hint for a foreign keyword, or None if not recognized.
-    Returns '' (empty string) if keyword is valid TEX (no hint needed).
-    """
+    """Return a hint string for a known foreign keyword, or None otherwise."""
     return _FOREIGN_KEYWORD_HINTS.get(keyword)
 
 

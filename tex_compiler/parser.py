@@ -34,6 +34,8 @@ Grammar (simplified):
                | '(' expr ')' | vec_constructor | cast_expr
 """
 from __future__ import annotations
+import copy
+
 from .lexer import Token, TokenType
 from .ast_nodes import (
     SourceLoc, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
@@ -41,8 +43,9 @@ from .ast_nodes import (
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor, CastExpr, ASTNode,
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
-    BindingIndexAccess, BindingSampleAccess,
+    BindingIndexAccess, BindingSampleAccess, ErrorNode,
 )
+from .diagnostics import make_diagnostic, get_keyword_hint, TEXMultiError
 
 TYPE_KEYWORDS = {TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_VEC2, TokenType.KW_VEC3, TokenType.KW_VEC4, TokenType.KW_STRING, TokenType.KW_MAT3, TokenType.KW_MAT4}
 
@@ -69,7 +72,6 @@ class ParseError(Exception):
     def _build_diagnostic(self):
         if self.diagnostic is not None:
             return
-        from .diagnostics import make_diagnostic
         self.diagnostic = make_diagnostic(
             code=self._code,
             message=self._raw_message,
@@ -189,7 +191,6 @@ class Parser:
         compiler frontend it previously fed an expression-parse path that looped
         forever. Record one clear diagnostic and skip the bad statement.
         """
-        from .ast_nodes import ErrorNode
         loc = self.loc()
         type_name = self.current().value
         err = self._make_error(
@@ -205,8 +206,6 @@ class Parser:
 
     def parse(self) -> Program:
         """Parse a complete TEX program with error recovery."""
-        from .ast_nodes import ErrorNode
-        from .diagnostics import TEXMultiError
         loc = self.loc()
         stmts: list[ASTNode] = []
         while self.peek() != TokenType.EOF:
@@ -306,7 +305,6 @@ class Parser:
 
         # Check for foreign keywords (const, let, var, etc.)
         if self.peek() == TokenType.IDENT:
-            from .diagnostics import get_keyword_hint
             kw_hint = get_keyword_hint(self.current().value)
             if kw_hint is not None:
                 tok = self.current()
@@ -537,37 +535,73 @@ class Parser:
         """
         loc = self.loc()
         expr = self.parse_expr()
+        return self._parse_assign_tail(expr, loc, expect_semi=False)
 
-        # Check for postfix ++ / --
+    def _parse_assign_tail(self, expr: ASTNode, loc: SourceLoc,
+                           expect_semi: bool) -> ASTNode:
+        """Parse the assignment suffix (`++`, `--`, `op=`, `=`, or nothing)
+        after an already-parsed lvalue/expression.
+
+        Shared by statement position (expect_semi=True, consumes the trailing
+        `;`) and the for-loop update clause (expect_semi=False).
+        """
+        # Postfix ++ / --
         if self.match(TokenType.PLUS_PLUS):
-            return self._desugar_increment(expr, "+", loc)
+            stmt = self._desugar_increment(expr, "+", loc)
+            if expect_semi:
+                self.expect(TokenType.SEMI, "I need a semicolon after `++`",
+                           code="E2010", hint="Add `;` to end this statement.")
+            return stmt
         if self.match(TokenType.MINUS_MINUS):
-            return self._desugar_increment(expr, "-", loc)
+            stmt = self._desugar_increment(expr, "-", loc)
+            if expect_semi:
+                self.expect(TokenType.SEMI, "I need a semicolon after `--`",
+                           code="E2010", hint="Add `;` to end this statement.")
+            return stmt
 
-        # Check for compound assignment
+        # Compound assignment operators (+=, -=, *=, /=)
         for tok_type, op in COMPOUND_ASSIGN_OPS.items():
             if self.match(tok_type):
                 value = self.parse_expr()
+                if expect_semi:
+                    self.expect(TokenType.SEMI, f"It looks like there's a missing semicolon after this `{op}=` assignment",
+                               code="E2010", hint="Every statement in TEX ends with `;`.")
+                # For scatter targets (@OUT[x,y] += val), preserve op for scatter_add_
+                if isinstance(expr, BindingIndexAccess):
+                    return Assignment(loc=loc, target=expr, value=value, op=op)
+                # Clone the lvalue for the read side: passes that mutate the
+                # AST in place assume no shared subtrees (see _clone_expr in
+                # the optimizer).
                 return Assignment(
                     loc=loc,
                     target=expr,
-                    value=BinOp(loc=loc, op=op, left=expr, right=value),
+                    value=BinOp(loc=loc, op=op, left=copy.deepcopy(expr), right=value),
                 )
 
-        # Check for plain assignment
+        # Plain assignment
         if self.match(TokenType.ASSIGN):
             value = self.parse_expr()
+            if expect_semi:
+                self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this assignment",
+                           code="E2010", hint="Every statement in TEX ends with `;`.")
             return Assignment(loc=loc, target=expr, value=value)
 
+        if expect_semi:
+            self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this expression",
+                       code="E2010", hint="Every statement in TEX ends with `;`.")
         return ExprStatement(loc=loc, expr=expr)
 
     def _desugar_increment(self, target: ASTNode, op: str, loc: SourceLoc) -> Assignment:
-        """Desugar i++ -> i = i + 1, i-- -> i = i - 1"""
+        """Desugar i++ -> i = i + 1, i-- -> i = i - 1
+
+        The read side gets a clone of the lvalue: passes that mutate the AST
+        in place assume no shared subtrees.
+        """
         one = NumberLiteral(loc=loc, value=1.0, is_int=True)
         return Assignment(
             loc=loc,
             target=target,
-            value=BinOp(loc=loc, op=op, left=target, right=one),
+            value=BinOp(loc=loc, op=op, left=copy.deepcopy(target), right=one),
         )
 
     def parse_block(self) -> list[ASTNode]:
@@ -582,44 +616,7 @@ class Parser:
         """Parse an expression; if followed by `=`, `+=`, `++`, etc., treat as assignment."""
         loc = self.loc()
         expr = self.parse_expr()
-
-        # Postfix ++ / --
-        if self.match(TokenType.PLUS_PLUS):
-            stmt = self._desugar_increment(expr, "+", loc)
-            self.expect(TokenType.SEMI, "I need a semicolon after `++`",
-                       code="E2010", hint="Add `;` to end this statement.")
-            return stmt
-        if self.match(TokenType.MINUS_MINUS):
-            stmt = self._desugar_increment(expr, "-", loc)
-            self.expect(TokenType.SEMI, "I need a semicolon after `--`",
-                       code="E2010", hint="Add `;` to end this statement.")
-            return stmt
-
-        # Compound assignment operators (+=, -=, *=, /=)
-        for tok_type, op in COMPOUND_ASSIGN_OPS.items():
-            if self.match(tok_type):
-                value = self.parse_expr()
-                self.expect(TokenType.SEMI, f"It looks like there's a missing semicolon after this `{op}=` assignment",
-                           code="E2010", hint="Every statement in TEX ends with `;`.")
-                # For scatter targets (@OUT[x,y] += val), preserve op for scatter_add_
-                if isinstance(expr, BindingIndexAccess):
-                    return Assignment(loc=loc, target=expr, value=value, op=op)
-                return Assignment(
-                    loc=loc,
-                    target=expr,
-                    value=BinOp(loc=loc, op=op, left=expr, right=value),
-                )
-
-        # Plain assignment
-        if self.match(TokenType.ASSIGN):
-            value = self.parse_expr()
-            self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this assignment",
-                       code="E2010", hint="Every statement in TEX ends with `;`.")
-            return Assignment(loc=loc, target=expr, value=value)
-
-        self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this expression",
-                   code="E2010", hint="Every statement in TEX ends with `;`.")
-        return ExprStatement(loc=loc, expr=expr)
+        return self._parse_assign_tail(expr, loc, expect_semi=True)
 
     # -- Expressions (precedence climbing) ------------------------------
 

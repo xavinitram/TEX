@@ -582,12 +582,16 @@ def measure(prog: BenchmarkProgram, B: int, H: int, W: int,
         output_names = (list(assigned.keys())
                         if assigned and "OUT" not in assigned else None)
 
+        # Sync-bracket GPU timing (unsynced CUDA timing only measures enqueue)
+        sync = torch.cuda.synchronize if device == "cuda" else None
+
         # Warmup
         for _ in range(WARMUP_RUNS):
             if cache_mode == "cold":
                 program, type_map, assigned, used = compile_program(prog.code, btypes)
             run_interpreter(program, bindings, type_map, device,
                             output_names, precision, used)
+        if sync: sync()
 
         comp_t, interp_t, total_t = [], [], []
         n = 0
@@ -609,6 +613,7 @@ def measure(prog: BenchmarkProgram, B: int, H: int, W: int,
             ti = time.perf_counter()
             run_interpreter(program, bindings, type_map, device,
                             output_names, precision, used)
+            if sync: sync()
             interp_t.append((time.perf_counter() - ti) * 1000)
             total_t.append((time.perf_counter() - t0) * 1000)
 

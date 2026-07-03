@@ -158,11 +158,19 @@ def infer_binding_type(value: Any) -> TEXType:
             return infer_binding_type(value[0])
         return TEXType.FLOAT
     if isinstance(value, dict) and "samples" in value:
-        # LATENT dict — infer from channel count (dim 1 = C before permute)
+        # LATENT dict — infer from channel count (dim 1 = C before permute),
+        # using the same mapping as the post-unwrap [B,H,W,C] tensor branch
+        # below (the node unwraps latent dicts before inference, so this
+        # branch only serves direct API callers).
         c = value["samples"].shape[1]
-        if c == 3:
+        if c == 4:
+            return TEXType.VEC4
+        elif c == 3:
             return TEXType.VEC3
-        return TEXType.VEC4
+        elif c == 2:
+            return TEXType.VEC2
+        else:
+            return TEXType.FLOAT
     if isinstance(value, str):
         return TEXType.STRING
     if isinstance(value, torch.Tensor):
@@ -285,4 +293,8 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
             return int(raw.item())
         return int(raw.float().mean().item())  # .float(): mean() rejects integer dtypes
 
-    return raw.cpu()
+    # Unmapped output types pass through unchanged — keep on the compute
+    # device (see IMAGE above). Unreachable from the node (map_inferred_type
+    # only emits the strings handled above); serves direct prepare_output
+    # callers (see DEVELOPMENT.md extension points).
+    return raw

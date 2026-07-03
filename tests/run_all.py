@@ -2,9 +2,12 @@
 """Standalone TEX test runner — python tests/run_all.py"""
 from helpers import SubTestResult
 
-from test_lexer import test_lexer, test_lexer_v11
-from test_parser import test_parser, test_parser_v11, test_array_decl_no_hang
-from test_type_checker import test_type_checker
+from test_lexer import test_lexer, test_lexer_locations, test_lexer_v11
+from test_parser import (
+    test_parser, test_parser_v11, test_parser_lvalue_clone,
+    test_array_decl_no_hang,
+)
+from test_type_checker import test_type_checker, test_stdlib_promote_typing
 from test_interpreter import (
     test_interpreter, test_for_loops, test_break_continue,
     test_while_loops, test_compound_assignments,
@@ -44,11 +47,18 @@ from test_integration import (
     test_device_selection, test_torch_compile, test_is_changed_hash,
     test_batch_temporal, test_latent, test_auto_inference, test_v03_features,
     test_realistic_sizes, test_matrix_types, test_matrix_benchmarks,
-    test_node_helpers,
+    test_node_helpers, test_compiled_audit_fixes, test_fusion_memo,
 )
 from test_codegen_optimizer import (
     test_codegen_equivalence, test_optimization_regressions, test_licm,
     test_optimizer_passes, test_optimizer_type_consistency,
+    test_optimizer_isint_unary, test_optimizer_pure_fn_cse_licm,
+    test_optimizer_dce_side_effects, test_codegen_audit_fixes,
+)
+from test_aliasing_cow import (
+    test_cow_channel_array_writes, test_cow_binding_and_function_holes,
+    test_literal_cache_persistence, test_scatter_ownership,
+    test_clamp_and_gridbuf, test_fp16_guards, test_noise_backend_gate,
 )
 
 
@@ -60,11 +70,14 @@ def main():
     r = SubTestResult()
 
     test_lexer(r)
+    test_lexer_locations(r)
     test_lexer_v11(r)
     test_parser(r)
     test_parser_v11(r)
+    test_parser_lvalue_clone(r)
     test_array_decl_no_hang(r)
     test_type_checker(r)
+    test_stdlib_promote_typing(r)
     test_interpreter(r)
     test_for_loops(r)
     test_break_continue(r)
@@ -124,6 +137,13 @@ def main():
     test_nan_inf_propagation(r)
     test_codegen_equivalence(r)
     test_scatter_writes(r)
+    test_cow_channel_array_writes(r)
+    test_cow_binding_and_function_holes(r)
+    test_literal_cache_persistence(r)
+    test_scatter_ownership(r)
+    test_clamp_and_gridbuf(r)
+    test_fp16_guards(r)
+    test_noise_backend_gate(r)
     test_vec2_type(r)
     test_arithmetic_hash_noise(r)
     test_new_noise_functions(r)
@@ -137,6 +157,12 @@ def main():
     test_stdlib_nan_inf(r)
     test_optimizer_passes(r)
     test_optimizer_type_consistency(r)
+    test_optimizer_isint_unary(r)
+    test_optimizer_pure_fn_cse_licm(r)
+    test_optimizer_dce_side_effects(r)
+    test_codegen_audit_fixes(r)
+    test_compiled_audit_fixes(r)
+    test_fusion_memo(r)
     test_node_helpers(r)
 
     success = r.summary()

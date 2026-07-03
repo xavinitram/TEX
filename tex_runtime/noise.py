@@ -33,7 +33,7 @@ _worley_offsets_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 def _get_worley_offsets(device: torch.device, ndim: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Return cached (dx_off, dy_off) tensors for Worley 9-neighbor lookup."""
-    key = (str(device), ndim)
+    key = (device, ndim)
     cached = _worley_offsets_cache.get(key)
     if cached is not None:
         return cached
@@ -55,7 +55,7 @@ def _get_worley3d_offsets(device: torch.device, ndim: int) -> tuple:
     """Cached (dx, dy, dz) offsets for the Worley 27-neighbor 3D lookup —
     mirrors _get_worley_offsets so the meshgrid isn't rebuilt (and re-uploaded)
     on every call."""
-    key = (str(device), ndim)
+    key = (device, ndim)
     cached = _worley3d_offsets_cache.get(key)
     if cached is not None:
         return cached
@@ -286,12 +286,16 @@ class _TieredCache:
         val = self.cache.get(key)
         return val if val is not None and val is not False else None
 
-    def try_upgrade(self, key, compile_fn):
+    def try_upgrade(self, key, compile_fn, device=None):
         """Attempt torch.compile upgrade after _COMPILE_AFTER_CALLS calls.
 
-        compile_fn() should return the compiled callable, or raise on failure.
+        compile_fn() should return the compiled callable, or raise on failure —
+        and it must WARM the compiled callable on the target device, so a
+        backend failure (e.g. Triton missing for CUDA) is caught here and the
+        traced tier stays in place, instead of caching a callable that raises
+        lazily at the real call site.
         """
-        if key in self._compile_attempted or not _can_inductor_compile():
+        if key in self._compile_attempted or not _can_inductor_compile(device):
             return
         with self._lock:
             if key in self._compile_attempted:
@@ -328,10 +332,10 @@ class _TieredCache:
 _simplex_cache = _TieredCache()
 
 
-def _compile_simplex():
-    """Compile simplex with Inductor and warmup."""
+def _compile_simplex(device):
+    """Compile simplex with Inductor and warm it on the target device."""
     compiled = torch.compile(_simplex2d_fast, backend='inductor', fullgraph=True)
-    dummy = torch.rand(1, 64, 64)
+    dummy = torch.rand(1, 64, 64, device=device)
     compiled(dummy, dummy)
     return compiled
 
@@ -341,7 +345,7 @@ def _simplex2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     key = x.device
     cached = _simplex_cache.get(key)
     if cached is not None:
-        _simplex_cache.try_upgrade(key, _compile_simplex)
+        _simplex_cache.try_upgrade(key, lambda: _compile_simplex(key), device=key)
         return _simplex_cache.get(key)(x, y)
 
     result = _simplex2d_fast(x, y)
@@ -371,16 +375,28 @@ def _make_fbm_fast_fn(octaves: int):
 _fbm_cache = _TieredCache()
 
 
-_inductor_available: bool | None = None
+_inductor_available: dict[str, bool] = {}  # device type -> backend availability
 
-def _can_inductor_compile() -> bool:
-    """Check if TorchInductor is available, enabling FxGraph cache on first call."""
-    global _inductor_available
-    if _inductor_available is None:
+def _can_inductor_compile(device=None) -> bool:
+    """Check if TorchInductor can compile for *device* (default: CPU).
+
+    The backend requirement is per-device: CUDA needs Triton, CPU needs a host
+    C++ compiler (MSVC on Windows). Gating on the wrong one caches a compiled
+    callable that raises at its first real call (bit fbm/ridged/billow/
+    turbulence on Triton-less CUDA boxes).
+    """
+    dev_type = device.type if isinstance(device, torch.device) else ("cuda" if device == "cuda" else "cpu")
+    cached = _inductor_available.get(dev_type)
+    if cached is not None:
+        return cached
+    if dev_type == "cuda":
+        import importlib.util as _ilu
+        ok = _ilu.find_spec("triton") is not None
+    else:
         import shutil
         import sys
         if sys.platform != 'win32':
-            _inductor_available = True  # Linux/macOS have gcc/clang by default
+            ok = True  # Linux/macOS have gcc/clang by default
         else:
             # Try the robust MSVC setup from compiled.py
             try:
@@ -388,16 +404,17 @@ def _can_inductor_compile() -> bool:
                 _setup_compiled_msvc()
             except Exception:
                 pass
-            _inductor_available = shutil.which('cl') is not None
-        if _inductor_available:
-            # Enable persistent FxGraph cache so compiled C++ kernels survive
-            # process restarts — eliminates the ~28s MSVC compile on cold start.
-            try:
-                import torch._inductor.config as _ind_cfg
-                _ind_cfg.fx_graph_cache = True
-            except Exception:
-                pass
-    return _inductor_available
+            ok = shutil.which('cl') is not None
+    if ok:
+        # Enable persistent FxGraph cache so compiled kernels survive process
+        # restarts — eliminates the ~28s MSVC compile on cold start.
+        try:
+            import torch._inductor.config as _ind_cfg
+            _ind_cfg.fx_graph_cache = True
+        except Exception:
+            pass
+    _inductor_available[dev_type] = ok
+    return ok
 
 
 def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
@@ -420,9 +437,10 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
         def _compile_fbm():
             fn = _make_fbm_fast_fn(octaves)
             compiled = torch.compile(fn, backend='inductor', fullgraph=True)
-            compiled(torch.rand(1, 64, 64), torch.rand(1, 64, 64))
+            dummy = torch.rand(1, 64, 64, device=x.device)
+            compiled(dummy, dummy)
             return compiled
-        _fbm_cache.try_upgrade(key, _compile_fbm)
+        _fbm_cache.try_upgrade(key, _compile_fbm, device=x.device)
         return _fbm_cache.get(key)(x, y)
 
     # Eager execution using arithmetic hash (first call).
@@ -515,11 +533,11 @@ def _worley2d(x: torch.Tensor, y: torch.Tensor, return_f2: bool = False) -> torc
         def _compile_worley():
             fn = _worley2d_f2 if return_f2 else _worley2d_f1
             compiled = torch.compile(fn, backend='inductor', fullgraph=True)
-            dummy = torch.rand(1, 64, 64)
+            dummy = torch.rand(1, 64, 64, device=x.device)
             warmup_dx, warmup_dy = _get_worley_offsets(dummy.device, dummy.dim())
             compiled(dummy, dummy, warmup_dx, warmup_dy)
             return compiled
-        _worley_cache.try_upgrade(key, _compile_worley)
+        _worley_cache.try_upgrade(key, _compile_worley, device=x.device)
         return _worley_cache.get(key)(x, y, dx_off, dy_off)
 
     # Eager execution (first call)

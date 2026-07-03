@@ -5,7 +5,7 @@ A per-pixel kernel DSL for writing compact image/mask processing logic
 directly inside ComfyUI. Inspired by Houdini VEX and Nuke BlinkScript.
 """
 
-__version__ = "0.12.0"
+__version__ = "0.14.0"
 
 import os
 

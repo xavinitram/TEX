@@ -53,10 +53,10 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "asin":      {"args": (1, 1), "return": _passthrough_type},
     "acos":      {"args": (1, 1), "return": _passthrough_type},
     "atan":      {"args": (1, 1), "return": _passthrough_type},
-    "atan2":     {"args": (2, 2), "return": _passthrough_type},
+    "atan2":     {"args": (2, 2), "return": _promote_args},
     "sincos":    {"args": (1, 1), "return": lambda _: TEXType.VEC2},   # sincos(x) → vec2(sin, cos)
     "sqrt":      {"args": (1, 1), "return": _passthrough_type},
-    "pow":       {"args": (2, 2), "return": _passthrough_type},
+    "pow":       {"args": (2, 2), "return": _promote_args},
     "exp":       {"args": (1, 1), "return": _passthrough_type},
     "log":       {"args": (1, 1), "return": _passthrough_type},
     "abs":       {"args": (1, 1), "return": _passthrough_type},
@@ -66,7 +66,7 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "round":     {"args": (1, 1), "return": _passthrough_type},
     "trunc":     {"args": (1, 1), "return": _passthrough_type},
     "fract":     {"args": (1, 1), "return": _passthrough_type},
-    "mod":       {"args": (2, 2), "return": _passthrough_type},
+    "mod":       {"args": (2, 2), "return": _promote_args},
 
     "log2":      {"args": (1, 1), "return": _passthrough_type},
     "log10":     {"args": (1, 1), "return": _passthrough_type},
@@ -75,23 +75,25 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "sinh":      {"args": (1, 1), "return": _passthrough_type},
     "cosh":      {"args": (1, 1), "return": _passthrough_type},
     "tanh":      {"args": (1, 1), "return": _passthrough_type},
-    "hypot":     {"args": (2, 2), "return": _passthrough_type},
+    "hypot":     {"args": (2, 2), "return": _promote_args},
     "isnan":     {"args": (1, 1), "return": lambda _: TEXType.FLOAT},  # always returns float (0.0/1.0)
     "isinf":     {"args": (1, 1), "return": lambda _: TEXType.FLOAT},  # always returns float (0.0/1.0)
     "degrees":   {"args": (1, 1), "return": _passthrough_type},
     "radians":   {"args": (1, 1), "return": _passthrough_type},
-    "spow":      {"args": (2, 2), "return": _passthrough_type},        # safe power — sign(x)*pow(abs(x),y)
-    "sdiv":      {"args": (2, 2), "return": _passthrough_type},        # safe division — 0 when b≈0
+    "spow":      {"args": (2, 2), "return": _promote_args},            # safe power — sign(x)*pow(abs(x),y)
+    "sdiv":      {"args": (2, 2), "return": _promote_args},            # safe division — 0 when b≈0
 
-    # Clamping and interpolation
+    # Clamping and interpolation — the runtime broadcasts a vector in ANY
+    # argument position (e.g. step(0.5, @vec)), so these promote across all
+    # args rather than passing through the first arg's type.
     "min":       {"args": (2, 2), "return": _promote_args},
     "max":       {"args": (2, 2), "return": _promote_args},
-    "clamp":     {"args": (3, 3), "return": _passthrough_type},
+    "clamp":     {"args": (3, 3), "return": _promote_args},
     "lerp":      {"args": (3, 3), "return": _promote_args},
     "mix":       {"args": (3, 3), "return": _promote_args},     # alias for lerp
-    "fit":       {"args": (5, 5), "return": _passthrough_type},  # fit(val, old_min, old_max, new_min, new_max)
-    "smoothstep": {"args": (3, 3), "return": _passthrough_type},
-    "step":      {"args": (2, 2), "return": _passthrough_type},
+    "fit":       {"args": (5, 5), "return": _promote_args},      # fit(val, old_min, old_max, new_min, new_max)
+    "smoothstep": {"args": (3, 3), "return": _promote_args},
+    "step":      {"args": (2, 2), "return": _promote_args},
 
     # Vector operations — always return float (scalar result)
     "dot":       {"args": (2, 2), "return": lambda _: TEXType.FLOAT},

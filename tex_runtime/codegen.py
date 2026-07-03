@@ -2,8 +2,9 @@
 TEX Codegen — compile TEX AST to Python functions for zero-overhead execution.
 
 Instead of tree-walking the AST on every frame, this module generates a Python
-function string, compiles it via exec(), and caches the callable. Subsequent
-executions call the function directly, eliminating:
+function string and compiles it via exec(); the caller (tex_runtime/compiled.py)
+caches the callable per fingerprint. Subsequent executions call the function
+directly, eliminating:
   - Per-node dispatch table lookups
   - Per-node Python function call overhead
   - Redundant dict lookups for env/bindings
@@ -15,8 +16,12 @@ function specializations (pow, luma, clamp, etc.).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+
+from dataclasses import dataclass, fields
 from typing import Any
+
+import torch
 
 from ..tex_compiler.ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop,
@@ -30,7 +35,9 @@ from ..tex_compiler.ast_nodes import (
     collect_assigned_vars,
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
-from .interpreter import MAX_CALL_DEPTH, _BUILTIN_NAMES
+from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
+                          _broadcast_pair, _ensure_spatial)
+from .stdlib import SAFE_EPSILON
 
 
 class _Unsupported(Exception):
@@ -89,6 +96,19 @@ def try_compile(program: Program, type_map: dict[int, TEXType]) -> Any | None:
         return None
 
 
+def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
+               device: Any, spatial_shape: tuple | None) -> None:
+    """Invoke a codegen-generated function with the constant argument tail.
+
+    Single owner of the positional calling convention — it must match the
+    _tex_fn signature emitted by _CodeGen.build().
+    """
+    cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
+          torch, _broadcast_pair, _ensure_spatial, torch.where,
+          math, SAFE_EPSILON, CHANNEL_MAP, MAX_LOOP_ITERATIONS,
+          _CgBreak, _CgContinue)
+
+
 # Stdlib functions that are simple torch.XXX(arg) wrappers.
 # In codegen, arguments are always tensors so _to_tensor is a no-op.
 # We emit _torch.XXX(arg) directly, avoiding dict lookup + function call + _to_tensor.
@@ -137,6 +157,41 @@ _SPATIAL_STDLIB: frozenset[str] = frozenset((
 ))
 
 
+def _iter_child_nodes(node: ASTNode):
+    """Yield the direct AST children of `node` (descending into list fields).
+
+    Generic dataclass-field walk shared by the AST walkers, so new node types
+    or fields can't silently drift out of any single hand-written traversal.
+    """
+    for f in fields(node):
+        val = getattr(node, f.name)
+        if isinstance(val, ASTNode):
+            yield val
+        elif isinstance(val, list):
+            for x in val:
+                if isinstance(x, ASTNode):
+                    yield x
+
+
+def _collect_reassigned_bindings(program: Program) -> set[str]:
+    """Binding names REBOUND via `@name = ...` or `@name.ch = ...` anywhere in
+    the program (loop/if/function bodies included). Rebinding replaces the
+    _bind entry with a new tensor, so a hoisted BCHW permute view of it goes
+    stale. In-place scatter writes (`@name[x, y] = ...`) mutate through shared
+    storage and stay coherent with the view, so they are not collected.
+    """
+    names: set[str] = set()
+    stack: list[ASTNode] = list(program.statements)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Assignment):
+            t = node.target
+            if isinstance(t, BindingRef):
+                names.add(t.name)
+            elif isinstance(t, ChannelAccess) and isinstance(t.object, BindingRef):
+                names.add(t.object.name)
+        stack.extend(_iter_child_nodes(node))
+    return names
 
 
 def _collect_sample_bindings(stmts: list[ASTNode]) -> set[str]:
@@ -995,58 +1050,23 @@ def _extract_linear_weights(expr: ASTNode, tap_vars: dict[str, tuple[int, int]]
 
 
 def _collect_ident_refs(node: ASTNode, refs: set[str]) -> None:
-    """Recursively collect all Identifier names referenced in an AST subtree."""
+    """Recursively collect all Identifier names READ in an AST subtree.
+
+    Uses the generic child iterator so every node type (ArrayDecl/ArrayLiteral
+    elements, MatConstructor, ReturnStmt, FunctionDef bodies, ...) is covered.
+    Plain-Identifier assignment targets are writes, not reads, and stay
+    excluded — stencil tap consumption must not become needlessly conservative.
+    """
     if isinstance(node, Identifier):
         refs.add(node.name)
-    elif isinstance(node, (BinOp,)):
-        _collect_ident_refs(node.left, refs)
-        _collect_ident_refs(node.right, refs)
-    elif isinstance(node, UnaryOp):
-        _collect_ident_refs(node.operand, refs)
-    elif isinstance(node, TernaryOp):
-        _collect_ident_refs(node.condition, refs)
-        _collect_ident_refs(node.true_expr, refs)
-        _collect_ident_refs(node.false_expr, refs)
-    elif isinstance(node, FunctionCall):
-        for arg in node.args:
-            _collect_ident_refs(arg, refs)
-    elif isinstance(node, VecConstructor):
-        for arg in node.args:
-            _collect_ident_refs(arg, refs)
-    elif isinstance(node, ChannelAccess):
-        _collect_ident_refs(node.object, refs)
-    elif isinstance(node, CastExpr):
-        _collect_ident_refs(node.expr, refs)
-    elif isinstance(node, VarDecl):
-        if node.initializer:
-            _collect_ident_refs(node.initializer, refs)
-    elif isinstance(node, Assignment):
-        if isinstance(node.target, Identifier):
-            pass  # target is a write, not a read
-        else:
+        return
+    if isinstance(node, Assignment):
+        if not isinstance(node.target, Identifier):
             _collect_ident_refs(node.target, refs)
         _collect_ident_refs(node.value, refs)
-    elif isinstance(node, IfElse):
-        _collect_ident_refs(node.condition, refs)
-        for s in node.then_body:
-            _collect_ident_refs(s, refs)
-        for s in (node.else_body or []):
-            _collect_ident_refs(s, refs)
-    elif isinstance(node, ForLoop):
-        _collect_ident_refs(node.init, refs)
-        _collect_ident_refs(node.condition, refs)
-        _collect_ident_refs(node.update, refs)
-        for s in node.body:
-            _collect_ident_refs(s, refs)
-    elif isinstance(node, WhileLoop):
-        _collect_ident_refs(node.condition, refs)
-        for s in node.body:
-            _collect_ident_refs(s, refs)
-    elif isinstance(node, ExprStatement):
-        _collect_ident_refs(node.expr, refs)
-    elif isinstance(node, ArrayIndexAccess):
-        _collect_ident_refs(node.array, refs)
-        _collect_ident_refs(node.index, refs)
+        return
+    for child in _iter_child_nodes(node):
+        _collect_ident_refs(child, refs)
 
 
 def _try_detect_inline_stencil(stmts: list[ASTNode], start: int
@@ -1154,6 +1174,29 @@ def _try_detect_inline_stencil(stmts: list[ASTNode], start: int
     if kernel_weights is None or len(kernel_weights) > 49:  # max 7x7 kernel
         return None
 
+    # Gap statements (skipped by the combo search between the last tap and the
+    # combo) execute BETWEEN the taps and the combo in the interpreter, while
+    # the emitted conv2d collapses taps+combo into one op at the combo's
+    # position. That is only sound when the gap cannot observe or perturb
+    # stencil state: a gap write to a tap var would be baked over by the kernel
+    # weights, a gap read of a consumed tap would hit an undefined local, a gap
+    # write to the combo target must not be overwritten out of order, and a gap
+    # binding assignment would be seen by the deferred _bind read. Reject all
+    # of those patterns — normal per-statement emission handles them correctly.
+    if combo_idx > i:
+        gap_stmts = stmts[i:combo_idx]
+        gap_writes, gap_bind_writes = collect_assigned_vars(gap_stmts)
+        if gap_bind_writes:
+            return None
+        gap_refs: set[str] = set()
+        for g in gap_stmts:
+            if isinstance(g, FunctionDef):
+                return None  # function scoping — bail out conservatively
+            _collect_ident_refs(g, gap_refs)
+        touched = gap_writes | gap_refs
+        if combo_var in touched or any(name in touched for name in tap_var_map):
+            return None
+
     all_offsets = list(kernel_weights.keys())
     dy_min = min(o[0] for o in all_offsets)
     dy_max = max(o[0] for o in all_offsets)
@@ -1223,9 +1266,13 @@ class _CodeGen:
         # Declared vector types per variable name (for channel coercion)
         self._var_vec_type: dict[str, TEXType] = {}
         # Hoisted BCHW images for inline sample(): binding_name → (bchw_var, grid_var).
-        # Cross-loop reuse is safe: bindings are immutable within a TEX program
-        # (read from _bind dict, never reassigned), so the BCHW permute stays valid.
+        # Cross-loop reuse is only safe for bindings that are never REBOUND:
+        # `@A = ...` / `@A.ch = ...` emit `_bind[name] = ...`, which stales the
+        # hoisted permute view. _hoist_sample_setup skips _reassigned_bindings;
+        # in-place scatter writes share storage with the view and stay coherent.
         self._hoisted_bchw: dict[str, tuple[str, str]] = {}
+        # Bindings rebound anywhere in the program (set by emit_program).
+        self._reassigned_bindings: set[str] = set()
         # VarDecl initializer AST nodes for sample→fetch pattern resolution
         self._var_initializers: dict[str, ASTNode] = {}
         # Vars currently holding a per-pixel/spatial value. Unlike _var_initializers
@@ -1236,6 +1283,11 @@ class _CodeGen:
         # Pre-resolved stdlib function locals: name → preamble variable.
         # Avoids _fns['name'] dict lookup on every call.
         self._fn_locals: dict[str, str] = {}
+        # Pre-resolved $param locals: binding name → preamble variable.
+        # Hoists the _bind[...] read + as_tensor conversion to one per
+        # execution instead of one per use site (and per loop iteration —
+        # bare $param reads are below the optimizer's LICM/CSE depth cutoff).
+        self._param_locals: dict[str, str] = {}
         # When True, BreakStmt/ContinueStmt emit native Python break/continue
         # instead of raising _CgBreak/_CgContinue. Set by static range for-loops.
         self._use_native_flow_control: bool = False
@@ -1295,6 +1347,29 @@ class _CodeGen:
         local = f"_fn_{name}"
         self._preamble.append(f"    {local} = _fns[{name!r}]")
         self._fn_locals[name] = local
+        return local
+
+    def _get_param_local(self, name: str) -> str:
+        """Preamble-hoisted local for a $param binding read.
+
+        Params are read-only (the type checker rejects `$x = ...` and
+        @wire/$param name collisions), so one _bind read + tensor conversion
+        per execution is safe — widget changes between runs are still picked
+        up. The str guard keeps string params as Python str; float-list params
+        (vec/color widgets) convert via as_tensor exactly like the per-site
+        known-numeric emission did. The guard is applied unconditionally
+        because different use-site nodes of the same param can disagree in the
+        id()-keyed type_map (optimizer-created nodes may be absent from it).
+        """
+        local = self._param_locals.get(name)
+        if local is not None:
+            return local
+        local = self._tmp()
+        self._preamble.append(f"    {local} = _bind[{name!r}]")
+        self._preamble.append(
+            f"    if not isinstance({local}, str): {local} = _torch.as_tensor({local})"
+        )
+        self._param_locals[name] = local
         return local
 
     def _direct_fetch_coords_available(self) -> bool:
@@ -1370,6 +1445,11 @@ class _CodeGen:
         for bname in sorted(bindings):
             if bname in self._hoisted_bchw:
                 continue  # Already hoisted by an outer loop
+            if bname in self._reassigned_bindings:
+                # Rebinding (`@A = ...`) anywhere in the program would stale
+                # the hoisted permute view; the _fns['sample'] fallback reads
+                # _bind at call time instead.
+                continue
             bchw_var = self._tmp()
             grid_var = self._tmp()
             self._emit(f"{bchw_var} = _bind[{bname!r}].permute(0, 3, 1, 2)")
@@ -1420,6 +1500,10 @@ class _CodeGen:
         for TorchInductor (no dict guard overhead) and is faster in eager
         mode too (local variable access is faster than dict access).
         """
+        # Bindings rebound anywhere in the program can't have their BCHW
+        # permute view hoisted (the view would go stale on rebind).
+        self._reassigned_bindings = _collect_reassigned_bindings(program)
+
         # Register all program-level env vars as locals
         all_env_vars, _ = self._collect_modified_vars(program.statements)
         for vname in sorted(all_env_vars):
@@ -1435,8 +1519,14 @@ class _CodeGen:
             else:
                 self._preamble.append(f"    {local} = None")
 
-        # Pre-scan for inline stencil patterns (non-loop conv2d)
+        # Pre-scan for inline stencil patterns (non-loop conv2d). Detection
+        # runs up front, but EMISSION is deferred to the combo statement's
+        # position in the main loop below: the conv reads _bind[...] when its
+        # code runs, so emitting it at the top of the function would read the
+        # binding BEFORE a preceding statement (e.g. `@A = @A * 0.5;`) mutates
+        # it — silently diverging from the interpreter's textual order.
         inline_skip: set[int] = set()
+        pending_stencils: dict[int, _StencilInfo] = {}
         stmts = program.statements
         idx = 0
         while idx < len(stmts):
@@ -1447,15 +1537,22 @@ class _CodeGen:
                 # sample()-based patterns have sub-pixel coordinate errors because
                 # px = 1/W but the UV pixel step is 1/(W-1) (align_corners=True).
                 if inline is not None and inline.consumed_stmts and inline.is_fetch:
-                    self._emit_conv2d_stencil(inline)
+                    # max(consumed) is the combo statement — where the
+                    # interpreter materializes the result. Consumed sets are
+                    # strictly increasing, so pending keys never collide.
+                    pending_stencils[max(inline.consumed_stmts)] = inline
                     inline_skip.update(inline.consumed_stmts)
-                    # Also emit the tap variables that are used elsewhere
-                    # (outside the consumed set) as normal statements
+                    # Tap variables used elsewhere (outside the consumed set)
+                    # still emit as normal statements
                     idx = max(inline.consumed_stmts) + 1
                     continue
             idx += 1
 
         for i, stmt in enumerate(stmts):
+            # Emit deferred stencils BEFORE the skip check: the combo index is
+            # always in inline_skip.
+            if i in pending_stencils:
+                self._emit_conv2d_stencil(pending_stencils[i])
             if i in inline_skip:
                 continue
             self._emit_stmt(stmt)
@@ -1503,8 +1600,14 @@ class _CodeGen:
         elif isinstance(stmt, Assignment):
             self._emit_assignment(stmt)
         elif isinstance(stmt, ExprStatement):
-            expr = self._emit_expr(stmt.expr)
-            self._emit(f"{expr}")
+            # The expression's side effects live in the lines _emit_expr emits;
+            # the returned name needs no bare-echo line. If nothing was emitted
+            # (bare Identifier/NumberLiteral), keep the enclosing block
+            # non-empty — a then-body may contain only this statement.
+            lines_before = len(self._lines)
+            self._emit_expr(stmt.expr)
+            if len(self._lines) == lines_before:
+                self._emit("pass")
         elif isinstance(stmt, ParamDecl):
             pass  # no-op at runtime
         elif isinstance(stmt, IfElse):
@@ -1978,6 +2081,28 @@ class _CodeGen:
         cond_tmp = self._tmp()
         self._emit(f"{cond_tmp} = {cond_expr}")
 
+        if self._scalar_loop:
+            # Scalar-mode loops (_is_scalar_body) guarantee every value in the
+            # body — this condition included — stays a Python float (or 0-dim
+            # tensor) on every iteration, so the spatial merge path is provably
+            # dead. Emitting only the scalar branch avoids the 2^depth body
+            # duplication of nested if/else (worst inside unrolled loops).
+            self._emit(f"if float({cond_tmp}) > 0.5:")
+            self._indent += 1
+            if stmt.then_body:
+                for s in stmt.then_body:
+                    self._emit_stmt(s)
+            else:
+                self._emit("pass")
+            self._indent -= 1
+            if stmt.else_body:
+                self._emit(f"else:")
+                self._indent += 1
+                for s in stmt.else_body:
+                    self._emit_stmt(s)
+                self._indent -= 1
+            return
+
         # Check if this could be a scalar condition
         # We emit both paths: scalar short-circuit and spatial vectorized
         self._emit(f"if not _torch.is_tensor({cond_tmp}) or {cond_tmp}.dim() == 0:")
@@ -2252,53 +2377,22 @@ class _CodeGen:
         return names
 
     def _collect_reads_node(self, node: ASTNode, names: set[str]):
-        """Recursively collect Identifier names read in an AST node."""
+        """Recursively collect Identifier names read in an AST node.
+
+        Generic child walk (covers array/matrix constructs and nested loop
+        headers); plain-Identifier assignment targets are write-only and stay
+        excluded, while channel/index write targets read their base.
+        """
         if isinstance(node, Identifier):
             names.add(node.name)
-        elif isinstance(node, BinOp):
-            self._collect_reads_node(node.left, names)
-            self._collect_reads_node(node.right, names)
-        elif isinstance(node, UnaryOp):
-            self._collect_reads_node(node.operand, names)
-        elif isinstance(node, TernaryOp):
-            self._collect_reads_node(node.condition, names)
-            self._collect_reads_node(node.true_expr, names)
-            self._collect_reads_node(node.false_expr, names)
-        elif isinstance(node, FunctionCall):
-            for a in node.args:
-                self._collect_reads_node(a, names)
-        elif isinstance(node, VecConstructor):
-            for a in node.args:
-                self._collect_reads_node(a, names)
-        elif isinstance(node, CastExpr):
-            self._collect_reads_node(node.expr, names)
-        elif isinstance(node, ChannelAccess):
-            self._collect_reads_node(node.object, names)
-        elif isinstance(node, Assignment):
+            return
+        if isinstance(node, Assignment):
             self._collect_reads_node(node.value, names)
-            # Also collect reads from target (e.g., channel access on identifier)
-            if isinstance(node.target, ChannelAccess):
-                self._collect_reads_node(node.target.object, names)
-        elif isinstance(node, VarDecl):
-            if node.initializer:
-                self._collect_reads_node(node.initializer, names)
-        elif isinstance(node, IfElse):
-            self._collect_reads_node(node.condition, names)
-            for s in node.then_body:
-                self._collect_reads_node(s, names)
-            if node.else_body:
-                for s in node.else_body:
-                    self._collect_reads_node(s, names)
-        elif isinstance(node, ExprStatement):
-            self._collect_reads_node(node.expr, names)
-        elif isinstance(node, ForLoop):
-            # Recurse into nested loops so outer scope can localize all vars
-            for s in node.body:
-                self._collect_reads_node(s, names)
-        elif isinstance(node, WhileLoop):
-            self._collect_reads_node(node.condition, names)
-            for s in node.body:
-                self._collect_reads_node(s, names)
+            if not isinstance(node.target, Identifier):
+                self._collect_reads_node(node.target, names)
+            return
+        for child in _iter_child_nodes(node):
+            self._collect_reads_node(child, names)
 
     def _emit_body_with_flow(self, body: list[ASTNode]):
         """Emit loop body wrapped in try/except for break/continue signals."""
@@ -2715,8 +2809,7 @@ class _CodeGen:
         for vname in all_vars:
             if vname != loop_var:
                 local = self._local_vars[vname]
-                if local is not None:
-                    self._emit(f"if _torch.is_tensor({local}): {local} = {local}.item()")
+                self._emit(f"if _torch.is_tensor({local}): {local} = {local}.item()")
 
     def _setup_tensor_loop(self, start: int, stop: int, step: int):
         """Prepare variables for a tensor-mode for loop.
@@ -2848,17 +2941,9 @@ class _CodeGen:
 
         if isinstance(node, BindingRef):
             if node.kind == "param":
-                # $params may be Python float/int from defaults — ensure tensor
-                tmp = self._tmp()
-                self._emit(f"{tmp} = _bind[{node.name!r}]")
-                param_type = self.type_map.get(id(node))
-                if param_type is None or param_type == TEXType.STRING:
-                    # Unknown or string type — guard needed
-                    self._emit(f"if not isinstance({tmp}, (str, list)): {tmp} = _torch.as_tensor({tmp})")
-                else:
-                    # Known numeric type — convert directly (no isinstance guard)
-                    self._emit(f"{tmp} = _torch.as_tensor({tmp})")
-                return tmp
+                # $params may be Python float/int/list from widget defaults —
+                # hoisted to one _bind read + tensor conversion per execution.
+                return self._get_param_local(node.name)
             return f"_bind[{node.name!r}]"
 
         if isinstance(node, ChannelAccess):

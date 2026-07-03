@@ -2,11 +2,12 @@
 TEX Cache — two-tier compilation cache for TEX programs.
 
 Tier 1 (memory): OrderedDict with LRU eviction. Stores ready-to-execute
-(program, type_map, referenced_bindings, assigned_bindings, param_declarations) tuples.
+(program, type_map, referenced_bindings, assigned_bindings,
+param_declarations, used_builtins) tuples.
 
-Tier 2 (disk): Pickle files in .tex_cache/. Stores (program_ast,
-binding_types, version). On load, re-runs type checker to regenerate
-type_map with valid id() keys (~0.1ms, negligible).
+Tier 2 (disk): Pickle files in .tex_cache/. Stores a dict
+{version, program, binding_types, timestamp}. On load, re-runs the type
+checker to regenerate type_map with valid id() keys (~0.1ms, negligible).
 """
 from __future__ import annotations
 
@@ -229,8 +230,8 @@ class TEXCache:
         try:
             for p in self._cache_dir.glob("*.pkl"):
                 p.unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("[TEX] Disk cache clear failed: %s", e)
 
     # ── Internal: memory tier ─────────────────────────────────────────
 

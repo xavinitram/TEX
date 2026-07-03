@@ -8,7 +8,7 @@ Otherwise, falls back to wrapping the tree-walking interpreter.
 If compilation fails for any reason the plain interpreter is used instead —
 execution never fails because of torch.compile.
 
-Cache key: (code_fingerprint, device_type).
+Cache key: (code_fingerprint, device_type, precision).
 torch.compile handles shape-based recompilation internally via guards.
 """
 from __future__ import annotations
@@ -25,11 +25,14 @@ from typing import Any, Callable
 
 import torch
 
-from .interpreter import (Interpreter, _ensure_spatial, _broadcast_pair,
-                          _collect_identifiers, _SCALAR_BUILTIN_DEFAULTS)
-from .codegen import try_compile as _try_codegen, _CgBreak, _CgContinue
-from .stdlib import TEXStdlib, SAFE_EPSILON
-from ..tex_compiler.type_checker import CHANNEL_MAP
+from ..tex_compiler.ast_nodes import (BinOp, UnaryOp, TernaryOp, FunctionCall,
+                                      VecConstructor, MatConstructor, CastExpr,
+                                      IfElse, ForLoop, WhileLoop)
+from .interpreter import (Interpreter, _collect_identifiers,
+                          _SCALAR_BUILTIN_DEFAULTS)
+from .codegen import (try_compile as _try_codegen, _invoke_cg,
+                      _iter_child_nodes)
+from .stdlib import TEXStdlib
 
 logger = logging.getLogger("TEX")
 
@@ -117,10 +120,13 @@ def _setup_msvc_env():
 
 # ── Caches & state ───────────────────────────────────────────────────
 
-# Compiled executors: (fingerprint, device_type) -> compiled callable
+# Compiled executors: (fingerprint, device_type, precision) -> (callable, backend)
+# `backend` is the torch.compile backend that produced the callable, or None
+# for the codegen-only adapter (no torch.compile involved). precision is in
+# the key because the adapters bake it into their closures.
 # Bounded to prevent memory leaks in long sessions (each entry holds a compiled
 # function with captured closure state, ~100 KB+ per entry).
-_compiled_cache: _OrderedDict[tuple[str, str], Callable] = _OrderedDict()
+_compiled_cache: _OrderedDict[tuple[str, str, str], tuple[Callable, str | None]] = _OrderedDict()
 # Cap compiled-function cache to limit process memory growth.
 # Each torch.compile'd program adds ~30-60 MB of Inductor-compiled
 # C++ kernels to process RSS. 16 entries ≈ 0.5-1 GB ceiling.
@@ -140,12 +146,27 @@ def _blacklist_add(fp: str) -> None:
     while len(_compile_blacklist) > _BLACKLIST_MAX:
         _compile_blacklist.popitem(last=False)
 
-# Track which backends have been tested and whether they work.
-# None = untested, True = works, False = failed
-_backend_status: dict[str, bool | None] = {
-    "inductor": None,
-    "cudagraphs": None,
-}
+# Track which (backend, device_type) pairs have been tested and whether they
+# work. Missing key = untested, True = works, False = failed/unavailable.
+# Keyed per device: inductor failing on a Triton-less CUDA setup says nothing
+# about inductor on CPU (where MSVC may be perfectly usable), and vice versa.
+_backend_status: dict[tuple[str, str], bool | None] = {}
+
+# Routing-gate memo: fingerprint -> (op_count, loop_depth). Both are pure
+# functions of the AST, which is keyed by the same (code, binding-types)
+# fingerprint, so the two full AST walks run once per program instead of on
+# every uncached frame. has_spatial is deliberately NOT memoized: it depends
+# on binding VALUES (a [B,H,W] mask and a Python float scalar both fingerprint
+# as FLOAT but need different routes).
+_route_memo: "_OrderedDict[str, tuple[int, int]]" = _OrderedDict()
+_ROUTE_MEMO_MAX = 256
+
+# Codegen-only flat functions: fingerprint -> cg_fn. A None value means
+# "codegen unsupported for this program" — skip re-attempting emit+exec on
+# every frame. cg_fn captures no device/precision/bindings (everything is
+# passed per call), so the fingerprint alone is a sufficient key.
+_cg_only_cache: "_OrderedDict[str, Callable | None]" = _OrderedDict()
+_CG_ONLY_CACHE_MAX = 64
 
 # One-time log messages (avoid spamming the console)
 _warnings_shown: set[str] = set()
@@ -177,82 +198,30 @@ def _show_once(key: str, msg: str, level: str = "info"):
         getattr(logger, level)(msg)
 
 
+_OP_TYPES = (BinOp, UnaryOp, TernaryOp, FunctionCall,
+             VecConstructor, MatConstructor, CastExpr)
+
+
 def _count_tensor_ops(program: Any) -> int:
     """Count tensor operations in an AST to estimate torch.compile benefit.
 
-    Uses the same traversal pattern as interpreter._collect_identifiers.
     Counts BinOps, FunctionCalls, VecConstructors, TernaryOps, UnaryOps,
-    and CastExprs — the operations that produce tensor work.
+    MatConstructors, and CastExprs — the operations that produce tensor work.
+    Traverses via the shared generic child iterator, so user-function bodies
+    and array/matrix constructs are all covered.
     """
-    from ..tex_compiler.ast_nodes import (
-        BinOp, UnaryOp, TernaryOp, FunctionCall, VecConstructor,
-        CastExpr, MatConstructor, VarDecl, Assignment, IfElse, ForLoop,
-        WhileLoop, ExprStatement, ArrayDecl, ChannelAccess,
-        ArrayIndexAccess, ArrayLiteral,
-    )
-    _OP_TYPES = (BinOp, UnaryOp, TernaryOp, FunctionCall,
-                 VecConstructor, MatConstructor, CastExpr)
     count = 0
     stack = list(program.statements)
     while stack:
         node = stack.pop()
-        cls = type(node)
         if isinstance(node, _OP_TYPES):
             count += 1
-        # Traverse children (same pattern as _collect_identifiers)
-        if cls is VarDecl:
-            if node.initializer:
-                stack.append(node.initializer)
-        elif cls is Assignment:
-            stack.append(node.target)
-            stack.append(node.value)
-        elif cls is IfElse:
-            stack.append(node.condition)
-            stack.extend(node.then_body)
-            stack.extend(node.else_body)
-        elif cls is ForLoop:
-            stack.append(node.init)
-            stack.append(node.condition)
-            stack.append(node.update)
-            stack.extend(node.body)
-        elif cls is WhileLoop:
-            stack.append(node.condition)
-            stack.extend(node.body)
-        elif cls is ExprStatement:
-            stack.append(node.expr)
-        elif cls is ArrayDecl:
-            if node.initializer:
-                stack.append(node.initializer)
-        elif cls is BinOp:
-            stack.append(node.left)
-            stack.append(node.right)
-        elif cls is UnaryOp:
-            stack.append(node.operand)
-        elif cls is TernaryOp:
-            stack.append(node.condition)
-            stack.append(node.true_expr)
-            stack.append(node.false_expr)
-        elif cls is FunctionCall:
-            stack.extend(node.args)
-        elif cls is VecConstructor:
-            stack.extend(node.args)
-        elif cls is MatConstructor:
-            stack.extend(node.args)
-        elif cls is CastExpr:
-            stack.append(node.expr)
-        elif cls is ChannelAccess:
-            stack.append(node.object)
-        elif cls is ArrayIndexAccess:
-            stack.append(node.array)
-            stack.append(node.index)
-        elif cls is ArrayLiteral:
-            stack.extend(node.elements)
+        stack.extend(_iter_child_nodes(node))
     return count
 
 
 def _max_loop_depth(program: Any) -> int:
     """Return the maximum nesting depth of for/while loops in the AST."""
-    from ..tex_compiler.ast_nodes import ForLoop, WhileLoop, IfElse
     def _depth(stmts: list, current: int) -> int:
         mx = current
         for s in stmts:
@@ -275,7 +244,7 @@ def _select_backend(device_type: str) -> str | None:
       GPU → inductor > cudagraphs > None
       CPU → inductor > None
 
-    Backends already marked as failed are skipped.
+    Backends already marked as failed on this device type are skipped.
     """
     candidates = []
     if device_type == "cuda":
@@ -284,7 +253,7 @@ def _select_backend(device_type: str) -> str | None:
         candidates = ["inductor"]
 
     for backend in candidates:
-        if _backend_status.get(backend) is not False:
+        if _backend_status.get((backend, device_type)) is not False:
             return backend
     return None
 
@@ -327,7 +296,7 @@ def execute_compiled(
     """
     device_obj = torch.device(device)
     device_type = device_obj.type  # "cpu" or "cuda"
-    cache_key = (fingerprint, device_type)
+    cache_key = (fingerprint, device_type, precision)
 
     # ── Blacklist: skip programs that previously crashed torch.compile
     if fingerprint in _compile_blacklist:
@@ -335,9 +304,20 @@ def execute_compiled(
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision)
 
-    # ── Program analysis gates (only on first compile, not cached reruns)
+    # ── Program analysis gates (only on first compile, not cached reruns).
+    # op_count/loop_depth are memoized per fingerprint so routes that never
+    # enter _compiled_cache (codegen-only, below-threshold) don't re-walk the
+    # AST every frame.
     if cache_key not in _compiled_cache:
-        op_count = _count_tensor_ops(program)
+        route = _route_memo.get(fingerprint)
+        if route is None:
+            route = (_count_tensor_ops(program), _max_loop_depth(program))
+            _route_memo[fingerprint] = route
+            while len(_route_memo) > _ROUTE_MEMO_MAX:
+                _route_memo.popitem(last=False)
+        else:
+            _route_memo.move_to_end(fingerprint)
+        op_count, loop_depth = route
         # Skip torch.compile for trivial programs (tracing overhead > benefit)
         if op_count < _COMPILE_OP_THRESHOLD:
             return _plain_execute(program, bindings, type_map, device,
@@ -345,11 +325,11 @@ def execute_compiled(
                                   used_builtins=used_builtins, precision=precision)
         # Use codegen WITHOUT torch.compile for deeply nested loops
         # (graph breaks and recompilation make torch.compile slower)
-        loop_depth = _max_loop_depth(program)
         if loop_depth > _COMPILE_MAX_LOOP_DEPTH:
             return _codegen_only_execute(program, bindings, type_map, device,
                                          latent_channel_count, output_names,
-                                         used_builtins=used_builtins, precision=precision)
+                                         used_builtins=used_builtins, precision=precision,
+                                         fingerprint=fingerprint)
         # Use plain interpreter for programs without spatial tensor context
         # (procedural noise, etc.) — codegen env setup overhead exceeds
         # benefit when all operations are on scalar tensors
@@ -388,14 +368,14 @@ def execute_compiled(
             with torch.inference_mode():
                 # Get or create the compiled callable (on THIS thread)
                 if cache_key not in _compiled_cache:
-                    compiled_fn = _try_compile(cache_key, device_type, program, type_map,
-                                               used_builtins=used_builtins, precision=precision)
-                    if compiled_fn is None:
+                    entry = _try_compile(device_type, program, type_map,
+                                         used_builtins=used_builtins, precision=precision)
+                    if entry is None:
                         # No backend available — run plain interpreter here
                         return _plain_execute(program, contiguous_bindings, type_map,
                                               device, latent_channel_count, output_names,
                                               used_builtins=used_builtins, precision=precision)
-                    _compiled_cache[cache_key] = compiled_fn
+                    _compiled_cache[cache_key] = entry
                     if len(_compiled_cache) > _COMPILED_CACHE_MAX:
                         # Evict the oldest. Do NOT torch._dynamo.reset() here:
                         # this runs on the disposable worker thread, and dynamo
@@ -404,7 +384,7 @@ def execute_compiled(
                         # calling thread). The bounded cache already caps growth.
                         _compiled_cache.popitem(last=False)
 
-                compiled_fn = _compiled_cache[cache_key]
+                compiled_fn, _entry_backend = _compiled_cache[cache_key]
                 _compiled_cache.move_to_end(cache_key)
                 return compiled_fn(program, contiguous_bindings, type_map, device,
                                    latent_channel_count, output_names)
@@ -431,8 +411,26 @@ def execute_compiled(
             f"[TEX] torch.compile execution failed, falling back to interpreter: {compile_error}",
             level="warning",
         )
-        _compiled_cache.pop(cache_key, None)
-        if not is_user_limit:
+        popped = _compiled_cache.pop(cache_key, None)
+        failed_backend = popped[1] if popped is not None else None
+        # torch.compile() wraps lazily, so a missing backend toolchain (Triton
+        # on CUDA, cl.exe on Windows CPU) only surfaces HERE, at the first
+        # execution of the compiled callable. That is a property of the
+        # (backend, device) pair, not of the program: mark the backend
+        # unavailable so the next run cascades (inductor -> cudagraphs on
+        # CUDA) instead of blacklisting every new fingerprint.
+        _lower = _emsg.lower()
+        backend_unavailable = (
+            type(compile_error).__name__ == "BackendCompilerFailed"
+            and failed_backend in ("inductor", "cudagraphs")
+            and ("triton" in _lower or "cl.exe" in _lower
+                 or "cl is not found" in _lower)
+        )
+        if backend_unavailable:
+            _backend_status[(failed_backend, device_type)] = False
+        elif not is_user_limit:
+            # BackendCompilerFailed can also be program-specific — those (and
+            # all other runtime failures) blacklist the fingerprint only.
             _blacklist_add(fingerprint)
         # IMPORTANT: torch.compile / dynamo state is PROCESS-GLOBAL, not
         # thread-local.  Resetting it on a *disposable worker thread* corrupts
@@ -552,17 +550,29 @@ def _codegen_only_execute(
     output_names: list[str] | None = None,
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
+    fingerprint: str | None = None,
 ) -> torch.Tensor | dict:
     """Execute via codegen flat function WITHOUT torch.compile.
 
     For loop-heavy programs where torch.compile overhead exceeds benefit.
     Still faster than the tree-walking interpreter (no per-node dispatch).
     Falls back to plain interpreter if codegen fails.
+
+    The generated function (or a None "unsupported" sentinel) is memoized per
+    fingerprint so re-executions skip the per-frame emit+compile()+exec().
     """
-    try:
-        cg_fn = _try_codegen(program, type_map)
-    except Exception:
-        cg_fn = None
+    if fingerprint is not None and fingerprint in _cg_only_cache:
+        cg_fn = _cg_only_cache[fingerprint]
+        _cg_only_cache.move_to_end(fingerprint)
+    else:
+        try:
+            cg_fn = _try_codegen(program, type_map)
+        except Exception:
+            cg_fn = None
+        if fingerprint is not None:
+            _cg_only_cache[fingerprint] = cg_fn
+            while len(_cg_only_cache) > _CG_ONLY_CACHE_MAX:
+                _cg_only_cache.popitem(last=False)
 
     if cg_fn is None:
         return _plain_execute(program, bindings, type_map, device,
@@ -585,10 +595,7 @@ def _codegen_only_execute(
 
     try:
         with torch.inference_mode():
-            cg_fn(env, contiguous_bindings, stdlib_fns, dev, sp,
-                   torch, _broadcast_pair, _ensure_spatial, torch.where,
-                   math, SAFE_EPSILON, CHANNEL_MAP, _MAX_LOOP_ITERATIONS,
-                   _CgBreak, _CgContinue)
+            _invoke_cg(cg_fn, env, contiguous_bindings, stdlib_fns, dev, sp)
     except Exception as e:
         _show_once(
             "codegen_only_fallback",
@@ -605,11 +612,11 @@ def _codegen_only_execute(
 
 
 def _try_compile(
-    cache_key: tuple[str, str], device_type: str,
+    device_type: str,
     program: Any = None, type_map: dict | None = None,
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
-) -> Callable | None:
+) -> tuple[Callable, str | None] | None:
     """
     Attempt to create a torch.compile-d callable for a TEX program.
 
@@ -620,7 +627,8 @@ def _try_compile(
          but still catches some fusion opportunities).
 
     Cascades through backends until one works or all fail.
-    Returns None if torch.compile is entirely unavailable.
+    Returns (callable, backend_name) — backend_name is None for the
+    codegen-only adapter — or None if torch.compile is entirely unavailable.
     """
     # Ensure MSVC env is set up before first compile attempt (Windows)
     _setup_msvc_env()
@@ -652,10 +660,7 @@ def _try_compile(
             env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
                                             used_builtins=used_builtins, precision=precision)
 
-            cg_fn(env, bindings, stdlib_fns, dev, sp,
-                   torch, _broadcast_pair, _ensure_spatial, torch.where,
-                   math, SAFE_EPSILON, CHANNEL_MAP, _MAX_LOOP_ITERATIONS,
-                   _CgBreak, _CgContinue)
+            _invoke_cg(cg_fn, env, bindings, stdlib_fns, dev, sp)
 
             if output_names is not None:
                 return {name: bindings[name] for name in output_names}
@@ -666,14 +671,23 @@ def _try_compile(
         if getattr(cg_fn, '_has_fn_calls', False):
             _show_once("codegen_only_fn_calls",
                        "[TEX] Codegen has stdlib calls — using codegen-only (no torch.compile)")
-            return _codegen_exec
+            return _codegen_exec, None
 
         target_fn = _codegen_exec
         _show_once("codegen_active", "[TEX] Using codegen path for torch.compile (flat function)")
     else:
-        # Fall back to wrapping the interpreter directly
-        target_fn = _plain_execute
-        if cg_fn is None and program is not None:
+        # Fall back to wrapping the interpreter — bake precision/used_builtins
+        # into a closure (mirroring _codegen_exec): the compiled callable is
+        # invoked with only the six positional args, which would otherwise
+        # silently reset both to their defaults.
+        def _interp_exec(program, bindings, type_map, device,
+                         latent_channel_count=0, output_names=None):
+            return _plain_execute(program, bindings, type_map, device,
+                                  latent_channel_count, output_names,
+                                  used_builtins=used_builtins, precision=precision)
+
+        target_fn = _interp_exec
+        if program is not None:
             _show_once("codegen_fallback",
                        "[TEX] Codegen unsupported for this program, wrapping interpreter")
 
@@ -698,15 +712,15 @@ def _try_compile(
             fullgraph=False,  # Allow graph breaks at for-loop .item() calls
         )
 
-        _backend_status[backend] = True
+        _backend_status[(backend, device_type)] = True
         _show_once(
             f"compile_ok_{backend}",
             f"[TEX] torch.compile using '{backend}' backend",
         )
-        return compiled
+        return compiled, backend
 
     except Exception as e:
-        _backend_status[backend] = False
+        _backend_status[(backend, device_type)] = False
         _show_once(
             f"compile_fail_{backend}",
             f"[TEX] torch.compile backend '{backend}' unavailable: {e}",
@@ -724,17 +738,18 @@ def _try_compile(
             )
 
         # Recurse to try the next backend in the cascade
-        return _try_compile(cache_key, device_type, program, type_map,
+        return _try_compile(device_type, program, type_map,
                             used_builtins=used_builtins, precision=precision)
 
 
 def clear_compiled_cache():
-    """Clear all cached compiled functions (useful for testing)."""
+    """Clear all cached compiled functions and memos (useful for testing)."""
     _compiled_cache.clear()
     _compile_blacklist.clear()
-    # Reset backend status so they are re-probed
-    for k in _backend_status:
-        _backend_status[k] = None
+    # Reset backend status so backends are re-probed
+    _backend_status.clear()
+    _route_memo.clear()
+    _cg_only_cache.clear()
     _warnings_shown.clear()
 
 

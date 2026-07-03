@@ -19,6 +19,7 @@ behaves exactly as before.
 from __future__ import annotations
 
 import dataclasses
+from collections import OrderedDict
 from typing import Any, Callable
 
 from .tex_compiler.lexer import Lexer
@@ -26,14 +27,21 @@ from .tex_compiler.parser import Parser
 from .tex_compiler.type_checker import TypeChecker, TypeCheckError
 from .tex_compiler.optimizer import optimize
 from .tex_compiler import ast_nodes as A
-from .tex_runtime.stdlib import TEXStdlib
 from .tex_runtime.interpreter import _collect_identifiers
 
 # Names the splicer must NEVER prefix — they resolve globally, not per stage.
 _BUILTINS = frozenset({
     "ix", "iy", "iw", "ih", "u", "v", "px", "py", "fi", "fn", "PI", "TAU", "E", "ic",
 })
-_STDLIB = frozenset(TEXStdlib.get_functions().keys())
+
+# Memory LRU for compiled fused chains: chain key -> the 6-tuple compile_fused
+# produces (program, type_map, referenced, assigned, param_info, used_builtins).
+# The frontend rebuilds the _tex_chain payload on every queue, so without this
+# memo every execution of a fused terminal re-parses and re-type-checks the
+# whole chain. merged_bindings is NEVER cached — binding VALUES are rebuilt per
+# execution (caching them would alias tensors and freeze param updates).
+_FUSED_MEMO: "OrderedDict[tuple, tuple]" = OrderedDict()
+_FUSED_MEMO_MAX = 32
 
 
 class FusionError(Exception):
@@ -243,6 +251,28 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     if len(stages) < 2:
         raise FusionError("fusion needs at least two stages")
 
+    # Memo key: exactly what compilation depends on — per-stage code, chain
+    # input name, and STRUCTURAL binding types (infer_binding_type is value-
+    # independent), in stage order. Binding values are deliberately absent:
+    # a param tweak hits the memo, an RGB→RGBA swap correctly misses it.
+    # prev_out types need no entry — they are functions of earlier stages'
+    # (code, types), which the key already covers.
+    memo_key = tuple(
+        (st["code"], st.get("chain_input"),
+         tuple(sorted((n, infer_binding_type(v).value)
+                      for n, v in (st.get("bindings") or {}).items())))
+        for st in stages
+    )
+    cached = _FUSED_MEMO.get(memo_key)
+    if cached is not None:
+        _FUSED_MEMO.move_to_end(memo_key)
+        merged = {
+            _user_prefix(f"_s{i}_") + name: val
+            for i, st in enumerate(stages)
+            for name, val in (st.get("bindings") or {}).items()
+        }
+        return (*cached, merged)
+
     fused_stmts: list[A.ASTNode] = []
     merged_bindings: dict[str, Any] = {}
     prev_out: str | None = None
@@ -343,8 +373,14 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
             "type hint like m@OUT/img@OUT on an upstream node, or mismatched channel "
             f"types across stages). Break the chain at that node. [{e}]") from e
     used_builtins = _collect_identifiers(fused)
-    return (fused, type_map, checker.referenced_bindings, checker.assigned_bindings,
-            checker.param_declarations, used_builtins, merged_bindings)
+    result = (fused, type_map, checker.referenced_bindings, checker.assigned_bindings,
+              checker.param_declarations, used_builtins)
+    # Cache only on success (a failing chain must re-raise on every run) and
+    # only the compile artifacts — never the binding values.
+    _FUSED_MEMO[memo_key] = result
+    while len(_FUSED_MEMO) > _FUSED_MEMO_MAX:
+        _FUSED_MEMO.popitem(last=False)
+    return (*result, merged_bindings)
 
 
 def prepare_fused(spec: dict, terminal_code: str, terminal_bindings: dict,
@@ -369,7 +405,7 @@ def prepare_fused(spec: dict, terminal_code: str, terminal_bindings: dict,
     # The terminal's chain-link socket carries the SOURCE image (the frontend
     # rewired it) AND is the @binding the terminal's code reads as the chain — one
     # key serves both roles (they are the same socket).
-    chain_key = spec.get("terminal_image_input") or spec.get("source_key")
+    chain_key = spec.get("terminal_image_input")
     bindings = dict(terminal_bindings)
     source = bindings.pop(chain_key, None)
     if source is None:

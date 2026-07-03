@@ -163,7 +163,7 @@ def worker_main(payload: str) -> None:
 
     # Honest status detection from the compiled module's caches.
     if out["status"] != "error":
-        if (fp, dtype) in C._compiled_cache:
+        if (fp, dtype, "fp32") in C._compiled_cache:
             out["status"] = "compiled"      # torch.compile actually engaged
         elif fp in C._compile_blacklist:
             out["status"] = "fallback"      # compile attempted, failed -> interpreter

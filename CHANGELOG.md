@@ -5,6 +5,115 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-07-02
+
+Full-engine optimization and cleanliness audit: every layer was audited by
+independent reviewers, every finding adversarially verified before
+implementation, and every performance change proven (or reverted) with
+before/after benchmarks on CPU and CUDA.
+
+### Fixed (correctness)
+- **In-place aliasing holes in the interpreter** — `@OUT = c; c = c + 1.0;`
+  no longer mutates the already-stored output; user-function parameters can no
+  longer mutate the caller's variable (or a cached literal) through the
+  in-place fast path; function passthrough returns (`return p;`) and
+  view-returning stdlib calls now correctly invalidate in-place readiness
+- **Scatter writes no longer corrupt shared buffers** — `@OUT = @A;
+  @OUT[x,y] = v;` used to write straight into the *upstream node's* image;
+  scatter now clones any buffer this execution doesn't own (also protects
+  cached literals and builtin coordinate grids reached through views)
+- **Codegen conv2d stencil ordering** — the inline-stencil fast path could
+  emit the convolution *before* statements that textually precede it (e.g. a
+  binding reassignment), silently diverging from the interpreter; emission is
+  now order-preserving, with hardened pattern detection and hoisted-BCHW
+  invalidation
+- **Optimizer dropped `is_int` on negation** — `-3` folded to a float literal,
+  which could fail the cache's re-type-check with a hard E3200 on valid
+  programs (e.g. negative constants reaching array indices)
+- **`for (…; @X[a,b] += v)` mis-desugared** — compound scatter assignment in a
+  for-loop header parsed to a plain write, dropping the accumulate
+- **Elementwise builtins mistyped** — `step`, `smoothstep`, `clamp`, `fit`,
+  `pow`, `mod`, `atan2`, `hypot`, `spow`, `sdiv` now type as the promotion of
+  their arguments instead of the first argument's type, so
+  `@OUT = smoothstep(0.0, 1.0, @A);` correctly infers an IMAGE output (was
+  MASK). Inferred output socket types can change for affected programs —
+  matching what the runtime always produced
+- **Stencil-tap AST walker drift** — array-literal-referenced taps could be
+  consumed by the stencil detector and crash the generated code at runtime
+  (silent fallback + spurious blacklist); the three duplicated AST walkers are
+  now one shared traversal
+- **Fused-path error messages** — errors in fused chains showed the internal
+  `u_` prefix (`@u_amt` instead of `@amt`)
+- **`fbm`/`ridged`/`billow`/`turbulence` hard-errored on CUDA without Triton**
+  (since 0.13.0) — the noise compile tier gated on MSVC and warmed on a CPU
+  dummy, so a CUDA-poisoned compiled callable was cached and raised at every
+  later call; the gate is now per-device (CUDA requires Triton) and warmup
+  happens on the target device, falling back to the traced tier
+
+### Changed (performance)
+- **Fused chains compile once** — the fusion path now memoizes spliced
+  programs (LRU, keyed by per-stage code/topology/binding types); previously
+  every queue execution re-parsed, re-spliced, re-type-checked (twice) and
+  re-optimized the whole chain, which could cost more than fusion saved
+- **Channel/array writes are copy-on-first-write** — `c.r = …` / `arr[i] = …`
+  cloned the full tensor on *every* write; now only the first write clones
+  (guarded by AST alias analysis plus a runtime storage-overlap check), so an
+  N-element array fill loop does O(N) work instead of O(N²)
+- **Literal tensors persist across executions** — constants are no longer
+  re-uploaded every frame (bounded cache; matters most on the launch-bound
+  CUDA path)
+- **`clamp()` is sync-free on CUDA** — 0-dim tensor bounds previously forced
+  two `.item()` pipeline flushes per call; bounds now pass through as tensors
+  on CUDA while CPU keeps the faster scalar-overload kernel
+- **codegen-only executions are cached** — deep-loop programs routed to the
+  codegen backend under `compile_mode="torch_compile"` regenerated and
+  re-`exec`'d their source every frame; the adapter and its gate verdicts are
+  now cached per fingerprint (the compiled-cache key also gains `precision`)
+- **$params hoisted in generated code** — one `as_tensor` per parameter per
+  execution instead of one per use-site per loop iteration
+- **Scalar-loop if/else emits once** — nested if/else in scalar loops emitted
+  both vectorized and scalar bodies (2× per nesting level of dead generated
+  source)
+- **torch.compile backend failures classified** — a Triton-less CUDA box now
+  marks the backend unavailable per-device after the first failure instead of
+  paying a full failed inductor compile for every new program (and no longer
+  disables CPU compilation because CUDA failed)
+- **Compiler frontend** — batched lexer scanning (no per-character method
+  calls), `slots=True` tokens, two-char-operator table, memoized CSE/LICM
+  subexpression info (O(n²) → O(n) on fused-sized programs), exact-class
+  dispatch in the type checker, hoisted per-node imports
+- **CSE/LICM pure-function list fixed** — the list named seven functions that
+  don't exist (`rgb_to_hsv`, `luminance`, `saturate`, …) while the real ones
+  (`rgb2hsv`, `hsv2rgb`, `luma`, …) were missing, so common color conversions
+  were never deduplicated or hoisted
+- **Interpreter micro-hots** — unbound-method in-place ops, hoisted
+  fetch/sample dispatch, cached flat batch index for scatter writes,
+  device-object cache keys, true-LRU sampler caches
+- **fp16-safe zero-divisor guards** — division/mod guards use a
+  dtype-aware epsilon (1e-8 underflows to zero in fp16)
+- **Frontend (JS)** — the help-overlay RAF loop no longer does per-frame
+  `querySelector` calls in Nodes 1.0 or redundant style writes in Nodes 2.0;
+  CodeMirror editors are destroyed on node removal (leak); param schema
+  updates are refcounted instead of last-writer-wins on the shared node type
+- Benchmarks: `run_benchmarks.py` now sync-brackets CUDA timing (previously
+  measured kernel-launch enqueue only); `eight_config_bench.py` probes the new
+  compiled-cache key
+
+### Removed
+- Dead `tile_offset` plumbing (never wired to any caller), dead `_STDLIB`
+  fusion constant, dead `source_key` legacy payload, dead `cache_key`
+  parameter, unreachable `prepare_output` CPU fallback, `TypeChecker.get_type`
+  (no callers), stale/contradictory comments and duplicated branches
+  throughout
+
+### Documented
+- Two measured CPU performance traps now carry explanatory comments so they
+  can't be "fixed" back: the sample-grid buffer deliberately allocates fresh
+  while holding the previous allocation (true reuse measured ~30% slower on
+  CPU), and `clamp()` bounds are device-split
+- Version strings aligned (`__init__.py`/`pyproject.toml` said 0.12.0 while
+  the changelog shipped 0.13.0)
+
 ## [0.13.0] - 2026-06-27
 
 ### Added

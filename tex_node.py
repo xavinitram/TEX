@@ -84,7 +84,7 @@ class TEXWrangleNode(_BaseClass):
     MAX_OUTPUTS = 8
 
     # System kwargs that are NOT TEX bindings
-    _SYSTEM_KWARGS = {"code", "device", "compile_mode", "_tex_any"}
+    _SYSTEM_KWARGS = {"code", "device", "compile_mode", "_tex_any", "_tex_chain"}
 
     @classmethod
     def define_schema(cls):
@@ -97,7 +97,8 @@ class TEXWrangleNode(_BaseClass):
                 "Reference inputs with @name (e.g. @A, @base_image).\n"
                 "Write outputs with @name = expr (e.g. @OUT, @mask, @result).\n"
                 "Add parameter widgets with $name (e.g. f$strength = 0.5).\n"
-                "Supports float, int, vec3, vec4, string types with if/else, for loops, and 100+ stdlib functions.\n"
+                "Supports float, int, vec2/vec3/vec4, mat3/mat4, string, and array types "
+                "with if/else, for/while loops, and 100+ stdlib functions.\n"
                 "Click the ? icon for a quick reference."
             ),
             inputs=[
@@ -145,7 +146,7 @@ class TEXWrangleNode(_BaseClass):
                     display_name=f"out_{i}",
                     tooltip="TEX output. Type auto-inferred from code.",
                 )
-                for i in range(8)
+                for i in range(cls.MAX_OUTPUTS)
             ],
             accept_all_inputs=True,
         )
@@ -158,6 +159,13 @@ class TEXWrangleNode(_BaseClass):
         # Include device and compile_mode in the hash
         parts.append(kwargs.get("device", "auto"))
         parts.append(kwargs.get("compile_mode", "none"))
+        # LOAD-BEARING: the fused-chain payload (upstream code + params) must
+        # be hashed explicitly. It sits in _SYSTEM_KWARGS so the loop below
+        # never treats it as a TEX binding — without this line, editing an
+        # upstream node's code would no longer recook the fused terminal.
+        chain_payload = kwargs.get("_tex_chain")
+        if chain_payload is not None:
+            parts.append(f"_tex_chain:{chain_payload}")
         # Hash all binding inputs (everything except system kwargs)
         for name in sorted(kwargs.keys()):
             if name in cls._SYSTEM_KWARGS:
@@ -192,7 +200,7 @@ class TEXWrangleNode(_BaseClass):
                     parts.append(f"{name}:{_tensor_fingerprint(val)}")
                 else:
                     parts.append(f"{name}:{val}")
-        return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
     @classmethod
     def execute(cls, **kwargs):
@@ -286,9 +294,10 @@ class TEXWrangleNode(_BaseClass):
                             bindings[ref_name] = default_val
                             continue
                     sigil = "$" if ref_name in param_info else "@"
-                    # On the fused path bindings are stage-prefixed (_s0_amt); show
-                    # the user's original name, not the synthetic one.
-                    disp = re.sub(r"^_s\d+_", "", ref_name) if fused_chain else ref_name
+                    # On the fused path user bindings are stage-prefixed
+                    # (_s0_u_amt — see tex_fusion._user_prefix); show the
+                    # user's original name, not the synthetic one.
+                    disp = re.sub(r"^_s\d+_u_", "", ref_name) if fused_chain else ref_name
                     raise InterpreterError(
                         f"TEX code references {sigil}{disp} but no input is connected to slot '{disp}'.",
                         loc=SourceLoc(1, 1), source=code, code="E6003",
@@ -363,9 +372,9 @@ class TEXWrangleNode(_BaseClass):
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             compile_tag = " [compiled]" if compile_mode == "torch_compile" else ""
             logger.info(
-                f"Executed in {elapsed_ms:.1f}ms{compile_tag} | "
-                f"device: {device} | outputs: [{', '.join(output_types_log)}] | "
-                f"bindings: {list(bindings.keys())}"
+                "Executed in %.1fms%s | device: %s | outputs: [%s] | bindings: %s",
+                elapsed_ms, compile_tag, device,
+                ", ".join(output_types_log), list(bindings.keys()),
             )
 
             # Return NodeOutput for v3, or tuple for standalone/test usage

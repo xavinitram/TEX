@@ -14,6 +14,7 @@ interpretation. Operates on the AST in-place (mutates nodes).
 from __future__ import annotations
 import copy
 import math
+from collections.abc import Callable
 
 from .ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop,
@@ -21,7 +22,7 @@ from .ast_nodes import (
     FunctionDef, ReturnStmt, BindingIndexAccess, BindingSampleAccess,
     BinOp, UnaryOp, TernaryOp, FunctionCall, Identifier, BindingRef,
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor,
-    MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral,
+    MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral, SourceLoc,
     try_extract_static_range,
 )
 from .type_checker import TEXType
@@ -42,7 +43,7 @@ def _clone_expr(expr: ASTNode) -> ASTNode:
     return copy.deepcopy(expr)
 
 # Pure math functions safe for constant folding (no side effects, deterministic)
-_PURE_FUNCTIONS: dict[str, callable] = {
+_PURE_FUNCTIONS: dict[str, Callable[..., float]] = {
     "sin": math.sin, "cos": math.cos, "tan": math.tan,
     # asin/acos clamp their arg to [-1,1] to mirror the runtime domain guard
     # (fn_asin/fn_acos), matching how sqrt/log are clamped below. Without this
@@ -245,7 +246,7 @@ def _make_num(value: float, loc=None, is_int: bool = False) -> NumberLiteral:
     INT-typed after the post-optimization re-type-check (the type checker maps
     is_int -> INT/FLOAT, which affects array indexing, %, and INT dispatch).
     """
-    return NumberLiteral(loc=loc or NumberLiteral().loc, value=float(value),
+    return NumberLiteral(loc=loc or SourceLoc(0, 0), value=float(value),
                          is_int=is_int)
 
 
@@ -338,8 +339,12 @@ def _fold_unary(node: UnaryOp) -> ASTNode:
     if _is_num_lit(node.operand):
         val = _num_val(node.operand)
         if node.op == "-":
-            return _make_num(-val, node.loc)
+            # Negation is type-preserving, so keep the operand's integer-ness
+            # (folding `-1` to a FLOAT literal would fail the re-type-check of
+            # `int x = -1;` — _is_assignable rejects float -> int).
+            return _make_num(-val, node.loc, is_int=node.operand.is_int)
         if node.op == "!":
+            # `!` always yields FLOAT in the type checker — never propagate is_int.
             return _make_num(0.0 if val > 0.5 else 1.0, node.loc)
     return node
 
@@ -382,9 +387,6 @@ def _fold_function(node: FunctionCall) -> ASTNode:
             return args[0]
         if t == 1.0:
             return args[1]
-
-    # clamp(x, 0, 1) -> saturate-style (still clamp, but note for future vectorization)
-    # abs(x) where x is already abs(y) -> abs(y) (idempotent, handled by constant fold)
 
     # sqrt(x*x) -> abs(x) — only when the argument is exactly x*x
     if name == "sqrt" and len(args) == 1:
@@ -433,7 +435,10 @@ def _eliminate_dead_code(stmts: list[ASTNode],
     for stmt in stmts:
         if isinstance(stmt, VarDecl):
             if stmt.name not in used:
-                continue  # Dead variable — skip it
+                # Dead variable — skip it, unless the initializer has side
+                # effects (same guard as dead assignments below)
+                if stmt.initializer is None or not _has_side_effects(stmt.initializer):
+                    continue
         elif isinstance(stmt, Assignment):
             target = stmt.target
             if isinstance(target, Identifier) and target.name not in used:
@@ -586,11 +591,18 @@ def _collect_used_in_expr(expr: ASTNode, used: set[str]):
         for arg in expr.args:
             _collect_used_in_expr(arg, used)
 
-    # NumberLiteral, StringLiteral, BindingRef — no local vars to collect
+    # NumberLiteral, StringLiteral — nothing to collect
 
 
 def _has_side_effects(expr: ASTNode) -> bool:
-    """Check if an expression might have side effects (conservative)."""
+    """Check if an expression might have side effects (conservative).
+
+    Function calls count because user functions can persist scatter writes to
+    bindings; indexed/sampled binding reads count because they can raise at
+    runtime (e.g. fetching from a non-image binding). Wrapper nodes (casts,
+    swizzles, indexing, constructors) recurse so a wrapped call or binding
+    read is still preserved.
+    """
     if isinstance(expr, FunctionCall):
         return True  # Functions could have side effects
     if isinstance(expr, BinOp):
@@ -603,6 +615,16 @@ def _has_side_effects(expr: ASTNode) -> bool:
                 _has_side_effects(expr.false_expr))
     if isinstance(expr, VecConstructor):
         return any(_has_side_effects(a) for a in expr.args)
+    if isinstance(expr, MatConstructor):
+        return any(_has_side_effects(a) for a in expr.args)
+    if isinstance(expr, ArrayLiteral):
+        return any(_has_side_effects(e) for e in expr.elements)
+    if isinstance(expr, CastExpr):
+        return _has_side_effects(expr.expr)
+    if isinstance(expr, ChannelAccess):
+        return _has_side_effects(expr.object)
+    if isinstance(expr, ArrayIndexAccess):
+        return _has_side_effects(expr.array) or _has_side_effects(expr.index)
     if isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
         return True  # Reads from bindings — preserve
     return False
@@ -613,109 +635,146 @@ def _has_side_effects(expr: ASTNode) -> bool:
 # Minimum expression complexity to consider for CSE (avoid hoisting trivial nodes)
 _CSE_MIN_DEPTH = 2
 
-# Pure functions safe for CSE (deterministic, no side effects, no sampling)
+# Pure functions safe for CSE and LICM (deterministic, no side effects, no
+# sampling — sample/fetch/img_* are binding reads and noise is excluded
+# pending a determinism audit). Deliberately absent: inverse (raises on
+# singular matrices, so hoisting it ahead of a zero-trip loop could turn a
+# working program into a crashing one) and all string/array functions
+# (STRING/ARRAY are missing from _TYPE_TO_NAME, so a synthesized temp VarDecl
+# would be mistyped and fail the cache's re-type-check).
 _CSE_PURE_FUNCTIONS = frozenset(_PURE_FUNCTIONS.keys()) | frozenset({
-    "vec2", "vec3", "vec4", "mat3", "mat4",
-    "normalize", "length", "distance", "dot", "cross",
-    "rgb_to_hsv", "hsv_to_rgb", "rgb_to_hsl", "hsl_to_rgb",
-    "luminance", "contrast", "saturate",
+    "normalize", "length", "distance", "dot", "cross", "reflect",
+    "rgb2hsv", "hsv2rgb", "luma", "hypot", "trunc",
+    "spow", "sdiv", "sincos", "isnan", "isinf",
 })
 
 
-def _expr_hash(expr: ASTNode) -> str | None:
-    """Compute a canonical string hash for an expression.
+def _intern_key(intern: dict[tuple, int], sig: tuple) -> int:
+    """Hash-cons a structural signature: equal signatures -> the same small int."""
+    return intern.setdefault(sig, len(intern))
 
-    Returns None for expressions that should not be CSE candidates
-    (leaves, side-effectful calls, binding refs that may be reassigned).
+
+_NO_READS: frozenset[str] = frozenset()
+
+
+def _expr_info(expr: ASTNode, memo: dict[int, tuple],
+               intern: dict[tuple, int]) -> tuple:
+    """Memoized per-node facts for CSE/LICM, computed in one bottom-up walk.
+
+    Returns (hash_key, depth, reads, pure):
+      hash_key: interned structural id (int) — equal iff the subtrees are
+                structurally identical — or None for non-CSE candidates
+                (leaves are hashable but string literals, impure calls, and
+                array/matrix/binding accesses are not).
+      depth:    expression nesting depth (leaves are 0).
+      reads:    frozenset of variable/binding names the expression reads.
+      pure:     safe to hoist for LICM — allows known-pure stdlib functions
+                but rejects sampling, binding access, and user functions.
+
+    memo is keyed by id(node) and must stay local to one CSE/LICM invocation:
+    within an invocation the collect/find/replace phases each visit parents
+    before children and mutation only happens at or below the visit point, so
+    entries never go stale mid-pass — but a fixpoint loop would need a fresh
+    memo per round. A shared long-lived memo would also risk id() reuse
+    across unrelated ASTs.
     """
+    info = memo.get(id(expr))
+    if info is not None:
+        return info
+
     if isinstance(expr, NumberLiteral):
-        return f"N:{expr.value}"
-    if isinstance(expr, StringLiteral):
-        return None  # Not worth CSE
-    if isinstance(expr, Identifier):
-        return f"I:{expr.name}"
-    if isinstance(expr, BindingRef):
-        return f"B:{expr.name}"
-    if isinstance(expr, BinOp):
-        lh = _expr_hash(expr.left)
-        rh = _expr_hash(expr.right)
-        if lh is None or rh is None:
-            return None
-        return f"({lh}{expr.op}{rh})"
-    if isinstance(expr, UnaryOp):
-        oh = _expr_hash(expr.operand)
-        if oh is None:
-            return None
-        return f"(u{expr.op}{oh})"
-    if isinstance(expr, FunctionCall):
-        if expr.name not in _CSE_PURE_FUNCTIONS:
-            return None  # Side-effectful or nondeterministic
-        arg_hashes = []
-        for a in expr.args:
-            ah = _expr_hash(a)
-            if ah is None:
-                return None
-            arg_hashes.append(ah)
-        return f"F:{expr.name}({','.join(arg_hashes)})"
-    if isinstance(expr, ChannelAccess):
-        oh = _expr_hash(expr.object)
-        if oh is None:
-            return None
-        return f"C:{oh}.{expr.channels}"
-    if isinstance(expr, VecConstructor):
-        arg_hashes = []
-        for a in expr.args:
-            ah = _expr_hash(a)
-            if ah is None:
-                return None
-            arg_hashes.append(ah)
-        return f"V{expr.size}({','.join(arg_hashes)})"
-    if isinstance(expr, CastExpr):
-        eh = _expr_hash(expr.expr)
-        if eh is None:
-            return None
-        return f"T:{expr.target_type}({eh})"
-    if isinstance(expr, TernaryOp):
-        ch = _expr_hash(expr.condition)
-        th = _expr_hash(expr.true_expr)
-        fh = _expr_hash(expr.false_expr)
-        if ch is None or th is None or fh is None:
-            return None
-        return f"?:{ch}?{th}:{fh}"
-    return None
+        # repr(value) canonicalizes the float; is_int keeps INT-typed literals
+        # from sharing a CSE temp with FLOAT-typed ones (dtype promotion).
+        info = (_intern_key(intern, ("N", repr(expr.value), expr.is_int)),
+                0, _NO_READS, True)
+    elif isinstance(expr, StringLiteral):
+        info = (None, 0, _NO_READS, True)  # Not worth CSE
+    elif isinstance(expr, Identifier):
+        info = (_intern_key(intern, ("I", expr.name)),
+                0, frozenset((expr.name,)), True)
+    elif isinstance(expr, BindingRef):
+        info = (_intern_key(intern, ("B", expr.name)),
+                0, frozenset((expr.name,)), True)
+    elif isinstance(expr, BinOp):
+        lh, ld, lr, lp = _expr_info(expr.left, memo, intern)
+        rh, rd, rr, rp = _expr_info(expr.right, memo, intern)
+        h = (None if lh is None or rh is None
+             else _intern_key(intern, ("O", expr.op, lh, rh)))
+        info = (h, 1 + max(ld, rd), lr | rr, lp and rp)
+    elif isinstance(expr, UnaryOp):
+        oh, od, orr, opure = _expr_info(expr.operand, memo, intern)
+        h = None if oh is None else _intern_key(intern, ("U", expr.op, oh))
+        info = (h, 1 + od, orr, opure)
+    elif isinstance(expr, FunctionCall):
+        infos = [_expr_info(a, memo, intern) for a in expr.args]
+        is_pure_fn = expr.name in _CSE_PURE_FUNCTIONS
+        if not is_pure_fn or any(i[0] is None for i in infos):
+            h = None  # Side-effectful or nondeterministic
+        else:
+            h = _intern_key(intern, ("F", expr.name, *(i[0] for i in infos)))
+        info = (h,
+                1 + max((i[1] for i in infos), default=0),
+                _NO_READS.union(*(i[2] for i in infos)),
+                is_pure_fn and all(i[3] for i in infos))
+    elif isinstance(expr, ChannelAccess):
+        oh, od, orr, opure = _expr_info(expr.object, memo, intern)
+        h = None if oh is None else _intern_key(intern, ("C", expr.channels, oh))
+        info = (h, 1 + od, orr, opure)
+    elif isinstance(expr, VecConstructor):
+        infos = [_expr_info(a, memo, intern) for a in expr.args]
+        h = (None if any(i[0] is None for i in infos)
+             else _intern_key(intern, ("V", expr.size, *(i[0] for i in infos))))
+        info = (h,
+                1 + max((i[1] for i in infos), default=0),
+                _NO_READS.union(*(i[2] for i in infos)),
+                all(i[3] for i in infos))
+    elif isinstance(expr, CastExpr):
+        eh, ed, er, ep = _expr_info(expr.expr, memo, intern)
+        h = None if eh is None else _intern_key(intern, ("T", expr.target_type, eh))
+        info = (h, 1 + ed, er, ep)
+    elif isinstance(expr, TernaryOp):
+        ch, cd, cr, cp = _expr_info(expr.condition, memo, intern)
+        th, td, tr, tp = _expr_info(expr.true_expr, memo, intern)
+        fh, fd, fr, fp = _expr_info(expr.false_expr, memo, intern)
+        h = (None if ch is None or th is None or fh is None
+             else _intern_key(intern, ("?", ch, th, fh)))
+        info = (h, 1 + max(cd, td, fd), cr | tr | fr, cp and tp and fp)
+    elif isinstance(expr, MatConstructor):
+        info = (None, 0,
+                _NO_READS.union(*(_expr_info(a, memo, intern)[2] for a in expr.args)),
+                False)
+    elif isinstance(expr, ArrayLiteral):
+        info = (None, 0,
+                _NO_READS.union(*(_expr_info(e, memo, intern)[2] for e in expr.elements)),
+                False)
+    elif isinstance(expr, ArrayIndexAccess):
+        info = (None, 0,
+                _expr_info(expr.array, memo, intern)[2]
+                | _expr_info(expr.index, memo, intern)[2],
+                False)
+    elif isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
+        # Sampling is not pure for LICM, and binding refs may be reassigned
+        info = (None, 0,
+                _expr_info(expr.binding, memo, intern)[2]
+                | _NO_READS.union(*(_expr_info(a, memo, intern)[2] for a in expr.args)),
+                False)
+    else:
+        info = (None, 0, _NO_READS, False)
+
+    memo[id(expr)] = info
+    return info
 
 
-def _expr_depth(expr: ASTNode) -> int:
-    """Compute the nesting depth of an expression."""
-    if isinstance(expr, (NumberLiteral, StringLiteral, Identifier, BindingRef)):
-        return 0
-    if isinstance(expr, BinOp):
-        return 1 + max(_expr_depth(expr.left), _expr_depth(expr.right))
-    if isinstance(expr, UnaryOp):
-        return 1 + _expr_depth(expr.operand)
-    if isinstance(expr, FunctionCall):
-        return 1 + max((_expr_depth(a) for a in expr.args), default=0)
-    if isinstance(expr, ChannelAccess):
-        return 1 + _expr_depth(expr.object)
-    if isinstance(expr, VecConstructor):
-        return 1 + max((_expr_depth(a) for a in expr.args), default=0)
-    if isinstance(expr, CastExpr):
-        return 1 + _expr_depth(expr.expr)
-    if isinstance(expr, TernaryOp):
-        return 1 + max(_expr_depth(expr.condition),
-                       _expr_depth(expr.true_expr),
-                       _expr_depth(expr.false_expr))
-    return 0
-
-
-def _collect_subexprs(expr: ASTNode, seen: dict[str, int], depth_threshold: int = _CSE_MIN_DEPTH):
+def _collect_subexprs(expr: ASTNode, seen: dict[int, int],
+                      memo: dict[int, tuple], intern: dict[tuple, int],
+                      depth_threshold: int = _CSE_MIN_DEPTH):
     """Walk an expression and count sub-expressions by hash.
 
     seen: maps hash -> occurrence count.
     Only records expressions with depth >= depth_threshold.
     """
-    h = _expr_hash(expr)
-    if h is not None and _expr_depth(expr) >= depth_threshold:
+    h, depth, _reads, _pure = _expr_info(expr, memo, intern)
+    if h is not None and depth >= depth_threshold:
         if h not in seen:
             seen[h] = 1
         else:
@@ -723,41 +782,43 @@ def _collect_subexprs(expr: ASTNode, seen: dict[str, int], depth_threshold: int 
 
     # Recurse into children
     if isinstance(expr, BinOp):
-        _collect_subexprs(expr.left, seen, depth_threshold)
-        _collect_subexprs(expr.right, seen, depth_threshold)
+        _collect_subexprs(expr.left, seen, memo, intern, depth_threshold)
+        _collect_subexprs(expr.right, seen, memo, intern, depth_threshold)
     elif isinstance(expr, UnaryOp):
-        _collect_subexprs(expr.operand, seen, depth_threshold)
+        _collect_subexprs(expr.operand, seen, memo, intern, depth_threshold)
     elif isinstance(expr, FunctionCall):
         for a in expr.args:
-            _collect_subexprs(a, seen, depth_threshold)
+            _collect_subexprs(a, seen, memo, intern, depth_threshold)
     elif isinstance(expr, VecConstructor):
         for a in expr.args:
-            _collect_subexprs(a, seen, depth_threshold)
+            _collect_subexprs(a, seen, memo, intern, depth_threshold)
     elif isinstance(expr, ChannelAccess):
-        _collect_subexprs(expr.object, seen, depth_threshold)
+        _collect_subexprs(expr.object, seen, memo, intern, depth_threshold)
     elif isinstance(expr, CastExpr):
-        _collect_subexprs(expr.expr, seen, depth_threshold)
+        _collect_subexprs(expr.expr, seen, memo, intern, depth_threshold)
     elif isinstance(expr, TernaryOp):
-        _collect_subexprs(expr.condition, seen, depth_threshold)
-        _collect_subexprs(expr.true_expr, seen, depth_threshold)
-        _collect_subexprs(expr.false_expr, seen, depth_threshold)
+        _collect_subexprs(expr.condition, seen, memo, intern, depth_threshold)
+        _collect_subexprs(expr.true_expr, seen, memo, intern, depth_threshold)
+        _collect_subexprs(expr.false_expr, seen, memo, intern, depth_threshold)
     elif isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
         for a in expr.args:
-            _collect_subexprs(a, seen, depth_threshold)
+            _collect_subexprs(a, seen, memo, intern, depth_threshold)
 
 
-def _collect_subexprs_in_stmt(stmt: ASTNode, seen: dict[str, int]):
+def _collect_subexprs_in_stmt(stmt: ASTNode, seen: dict[int, int],
+                              memo: dict[int, tuple], intern: dict[tuple, int]):
     """Collect sub-expression hashes from a statement."""
     if isinstance(stmt, VarDecl):
         if stmt.initializer:
-            _collect_subexprs(stmt.initializer, seen)
+            _collect_subexprs(stmt.initializer, seen, memo, intern)
     elif isinstance(stmt, Assignment):
-        _collect_subexprs(stmt.value, seen)
+        _collect_subexprs(stmt.value, seen, memo, intern)
     elif isinstance(stmt, ExprStatement):
-        _collect_subexprs(stmt.expr, seen)
+        _collect_subexprs(stmt.expr, seen, memo, intern)
 
 
-def _replace_expr(expr: ASTNode, replacements: dict[str, str],
+def _replace_expr(expr: ASTNode, replacements: dict[int, str],
+                  memo: dict[int, tuple], intern: dict[tuple, int],
                   type_map: dict | None = None,
                   hash_to_type: dict | None = None) -> ASTNode:
     """Replace sub-expressions whose hash matches a CSE temp variable.
@@ -766,7 +827,7 @@ def _replace_expr(expr: ASTNode, replacements: dict[str, str],
     registered in type_map with the hoisted expression's type, keeping id()-keyed
     type lookups valid for the optimizer-created references.
     """
-    h = _expr_hash(expr)
+    h = _expr_info(expr, memo, intern)[0]
     if h is not None and h in replacements:
         ident = Identifier(loc=expr.loc, name=replacements[h])
         # hash_to_type is only populated when type_map is not None, so a truthy
@@ -776,38 +837,39 @@ def _replace_expr(expr: ASTNode, replacements: dict[str, str],
         return ident
 
     if isinstance(expr, BinOp):
-        expr.left = _replace_expr(expr.left, replacements, type_map, hash_to_type)
-        expr.right = _replace_expr(expr.right, replacements, type_map, hash_to_type)
+        expr.left = _replace_expr(expr.left, replacements, memo, intern, type_map, hash_to_type)
+        expr.right = _replace_expr(expr.right, replacements, memo, intern, type_map, hash_to_type)
     elif isinstance(expr, UnaryOp):
-        expr.operand = _replace_expr(expr.operand, replacements, type_map, hash_to_type)
+        expr.operand = _replace_expr(expr.operand, replacements, memo, intern, type_map, hash_to_type)
     elif isinstance(expr, FunctionCall):
-        expr.args = [_replace_expr(a, replacements, type_map, hash_to_type) for a in expr.args]
+        expr.args = [_replace_expr(a, replacements, memo, intern, type_map, hash_to_type) for a in expr.args]
     elif isinstance(expr, VecConstructor):
-        expr.args = [_replace_expr(a, replacements, type_map, hash_to_type) for a in expr.args]
+        expr.args = [_replace_expr(a, replacements, memo, intern, type_map, hash_to_type) for a in expr.args]
     elif isinstance(expr, ChannelAccess):
-        expr.object = _replace_expr(expr.object, replacements, type_map, hash_to_type)
+        expr.object = _replace_expr(expr.object, replacements, memo, intern, type_map, hash_to_type)
     elif isinstance(expr, CastExpr):
-        expr.expr = _replace_expr(expr.expr, replacements, type_map, hash_to_type)
+        expr.expr = _replace_expr(expr.expr, replacements, memo, intern, type_map, hash_to_type)
     elif isinstance(expr, TernaryOp):
-        expr.condition = _replace_expr(expr.condition, replacements, type_map, hash_to_type)
-        expr.true_expr = _replace_expr(expr.true_expr, replacements, type_map, hash_to_type)
-        expr.false_expr = _replace_expr(expr.false_expr, replacements, type_map, hash_to_type)
+        expr.condition = _replace_expr(expr.condition, replacements, memo, intern, type_map, hash_to_type)
+        expr.true_expr = _replace_expr(expr.true_expr, replacements, memo, intern, type_map, hash_to_type)
+        expr.false_expr = _replace_expr(expr.false_expr, replacements, memo, intern, type_map, hash_to_type)
     elif isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
-        expr.args = [_replace_expr(a, replacements, type_map, hash_to_type) for a in expr.args]
+        expr.args = [_replace_expr(a, replacements, memo, intern, type_map, hash_to_type) for a in expr.args]
     return expr
 
 
-def _replace_in_stmt(stmt: ASTNode, replacements: dict[str, str],
+def _replace_in_stmt(stmt: ASTNode, replacements: dict[int, str],
+                     memo: dict[int, tuple], intern: dict[tuple, int],
                      type_map: dict | None = None,
                      hash_to_type: dict | None = None):
     """Replace CSE sub-expressions within a statement."""
     if isinstance(stmt, VarDecl):
         if stmt.initializer:
-            stmt.initializer = _replace_expr(stmt.initializer, replacements, type_map, hash_to_type)
+            stmt.initializer = _replace_expr(stmt.initializer, replacements, memo, intern, type_map, hash_to_type)
     elif isinstance(stmt, Assignment):
-        stmt.value = _replace_expr(stmt.value, replacements, type_map, hash_to_type)
+        stmt.value = _replace_expr(stmt.value, replacements, memo, intern, type_map, hash_to_type)
     elif isinstance(stmt, ExprStatement):
-        stmt.expr = _replace_expr(stmt.expr, replacements, type_map, hash_to_type)
+        stmt.expr = _replace_expr(stmt.expr, replacements, memo, intern, type_map, hash_to_type)
 
 
 def _eliminate_common_subexpressions(stmts: list[ASTNode],
@@ -835,10 +897,17 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
         elif isinstance(stmt, FunctionDef):
             stmt.body = _eliminate_common_subexpressions(stmt.body, type_map)
 
+    # Per-invocation scratch tables for _expr_info: valid across the whole
+    # collect -> find -> replace sequence because each phase visits parents
+    # before children and mutation only happens in replace, at or below the
+    # visit point. If a fixpoint loop is ever added, rebuild them per round.
+    memo: dict[int, tuple] = {}
+    intern: dict[tuple, int] = {}
+
     # Collect all sub-expression hashes across the block
-    seen: dict[str, int] = {}  # hash -> occurrence count
+    seen: dict[int, int] = {}  # hash -> occurrence count
     for stmt in stmts:
-        _collect_subexprs_in_stmt(stmt, seen)
+        _collect_subexprs_in_stmt(stmt, seen, memo, intern)
 
     # Find expressions that appear 2+ times
     duplicates = {h for h, count in seen.items() if count >= 2}
@@ -847,9 +916,9 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
 
     # Variables REASSIGNED anywhere in this block. A subexpression that reads one
     # of them is NOT safe to hoist — its value can change between occurrences
-    # (e.g. `a = s*s; s = v; b = s*s;` — the two `s*s` differ). `_expr_hash` keys
-    # identifiers by name only, so without this guard CSE would share one temp
-    # across the write and silently corrupt the result.
+    # (e.g. `a = s*s; s = v; b = s*s;` — the two `s*s` differ). The structural
+    # hash keys identifiers by name only, so without this guard CSE would share
+    # one temp across the write and silently corrupt the result.
     reassigned = _collect_reassigned_vars(stmts)
 
     # Build replacement map and generate temp VarDecls
@@ -857,12 +926,12 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
     # Walk the statements again to find first occurrence of each duplicate,
     # tracking which statement index it was found in so we can insert the
     # temp decl just before that statement (not at the top of the block).
-    first_occurrence: dict[str, tuple[ASTNode, int]] = {}  # hash -> (expr, stmt_index)
+    first_occurrence: dict[int, tuple[ASTNode, int]] = {}  # hash -> (expr, stmt_index)
 
     def _find_first(expr: ASTNode, stmt_idx: int):
-        h = _expr_hash(expr)
+        h, _depth, reads, _pure = _expr_info(expr, memo, intern)
         if (h is not None and h in duplicates and h not in first_occurrence
-                and not (_expr_reads_vars(expr) & reassigned)):
+                and not (reads & reassigned)):
             first_occurrence[h] = (expr, stmt_idx)
             # Don't recurse into children of a found duplicate —
             # we want the outermost match
@@ -899,8 +968,8 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
         return stmts
 
     # Assign temp variable names and build replacements
-    replacements: dict[str, str] = {}  # hash -> temp var name
-    hash_to_type: dict[str, TEXType] = {}  # hash -> hoisted expr's type (if known)
+    replacements: dict[int, str] = {}  # hash -> temp var name
+    hash_to_type: dict[int, TEXType] = {}  # hash -> hoisted expr's type (if known)
     # Group CSE decls by the statement index they should be inserted before
     insert_before: dict[int, list[VarDecl]] = {}  # stmt_index -> [VarDecl, ...]
     for i, (h, (expr_node, stmt_idx)) in enumerate(first_occurrence.items()):
@@ -933,7 +1002,7 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
 
     # Replace all occurrences in all statements
     for stmt in stmts:
-        _replace_in_stmt(stmt, replacements, type_map, hash_to_type)
+        _replace_in_stmt(stmt, replacements, memo, intern, type_map, hash_to_type)
 
     # Insert temp decls just before the statement that first uses them
     result: list[ASTNode] = []
@@ -1032,64 +1101,29 @@ def _collect_reassigned_in_stmt(stmt: ASTNode, out: set[str]):
             _collect_reassigned_in_stmt(s, out)
 
 
-def _expr_reads_vars(expr: ASTNode) -> set[str]:
-    """Collect all variable names read by an expression."""
-    names: set[str] = set()
-    _collect_used_in_expr(expr, names)
-    return names
-
-
-def _is_pure_for_licm(expr: ASTNode) -> bool:
-    """Check if an expression is pure enough for LICM hoisting.
-
-    More permissive than _has_side_effects: allows known-pure stdlib functions
-    (sin, cos, sqrt, etc.) but rejects sampling, binding access, and user functions.
-    """
-    if isinstance(expr, FunctionCall):
-        if expr.name not in _CSE_PURE_FUNCTIONS:
-            return False
-        return all(_is_pure_for_licm(a) for a in expr.args)
-    if isinstance(expr, BinOp):
-        return _is_pure_for_licm(expr.left) and _is_pure_for_licm(expr.right)
-    if isinstance(expr, UnaryOp):
-        return _is_pure_for_licm(expr.operand)
-    if isinstance(expr, TernaryOp):
-        return (_is_pure_for_licm(expr.condition) and
-                _is_pure_for_licm(expr.true_expr) and
-                _is_pure_for_licm(expr.false_expr))
-    if isinstance(expr, VecConstructor):
-        return all(_is_pure_for_licm(a) for a in expr.args)
-    if isinstance(expr, CastExpr):
-        return _is_pure_for_licm(expr.expr)
-    if isinstance(expr, ChannelAccess):
-        return _is_pure_for_licm(expr.object)
-    if isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
-        return False  # Sampling is not pure for LICM
-    if isinstance(expr, (NumberLiteral, StringLiteral, Identifier, BindingRef)):
-        return True
-    return False
-
-
-def _is_loop_invariant(expr: ASTNode, modified: set[str]) -> bool:
+def _is_loop_invariant(expr: ASTNode, modified: set[str],
+                       memo: dict[int, tuple], intern: dict[tuple, int]) -> bool:
     """Check if an expression is loop-invariant (doesn't depend on modified vars).
 
     An expression is loop-invariant if:
-    - It is pure (no side effects, no sampling)
+    - It is pure (no side effects, no sampling; see _expr_info)
     - None of its referenced variables are in the modified set
     - It has sufficient depth to be worth hoisting
     """
-    if not _is_pure_for_licm(expr):
+    _h, depth, reads, pure = _expr_info(expr, memo, intern)
+    if not pure:
         return False
-    if _expr_depth(expr) < _LICM_MIN_DEPTH:
+    if depth < _LICM_MIN_DEPTH:
         return False
-    reads = _expr_reads_vars(expr)
     return reads.isdisjoint(modified)
 
 
 def _extract_invariant_subexpr(expr: ASTNode, modified: set[str],
                                 hoisted: list[tuple[str, ASTNode, TEXType | None]],
                                 counter: list[int],
-                                type_map: dict | None = None) -> ASTNode:
+                                type_map: dict | None,
+                                memo: dict[int, tuple],
+                                intern: dict[tuple, int]) -> ASTNode:
     """Walk an expression tree and replace loop-invariant subtrees with temp vars.
 
     Replaces the largest (outermost) invariant subtrees first. If the entire
@@ -1102,7 +1136,7 @@ def _extract_invariant_subexpr(expr: ASTNode, modified: set[str],
     id()-keyed type lookups valid for the optimizer-created nodes.
     """
     # Check if the entire expression is invariant
-    if _is_loop_invariant(expr, modified):
+    if _is_loop_invariant(expr, modified, memo, intern):
         t = type_map.get(id(expr)) if type_map is not None else None
         # If a type_map is supplied but this subtree's type is unknown, it was
         # synthesized by an earlier pass (e.g. const-folded vec*vec) and isn't
@@ -1122,47 +1156,48 @@ def _extract_invariant_subexpr(expr: ASTNode, modified: set[str],
 
     # Otherwise recurse into children to find invariant sub-expressions
     if isinstance(expr, BinOp):
-        expr.left = _extract_invariant_subexpr(expr.left, modified, hoisted, counter, type_map)
-        expr.right = _extract_invariant_subexpr(expr.right, modified, hoisted, counter, type_map)
+        expr.left = _extract_invariant_subexpr(expr.left, modified, hoisted, counter, type_map, memo, intern)
+        expr.right = _extract_invariant_subexpr(expr.right, modified, hoisted, counter, type_map, memo, intern)
     elif isinstance(expr, UnaryOp):
-        expr.operand = _extract_invariant_subexpr(expr.operand, modified, hoisted, counter, type_map)
+        expr.operand = _extract_invariant_subexpr(expr.operand, modified, hoisted, counter, type_map, memo, intern)
     elif isinstance(expr, FunctionCall):
-        expr.args = [_extract_invariant_subexpr(a, modified, hoisted, counter, type_map) for a in expr.args]
+        expr.args = [_extract_invariant_subexpr(a, modified, hoisted, counter, type_map, memo, intern) for a in expr.args]
     elif isinstance(expr, VecConstructor):
-        expr.args = [_extract_invariant_subexpr(a, modified, hoisted, counter, type_map) for a in expr.args]
+        expr.args = [_extract_invariant_subexpr(a, modified, hoisted, counter, type_map, memo, intern) for a in expr.args]
     elif isinstance(expr, TernaryOp):
-        expr.condition = _extract_invariant_subexpr(expr.condition, modified, hoisted, counter, type_map)
-        expr.true_expr = _extract_invariant_subexpr(expr.true_expr, modified, hoisted, counter, type_map)
-        expr.false_expr = _extract_invariant_subexpr(expr.false_expr, modified, hoisted, counter, type_map)
+        expr.condition = _extract_invariant_subexpr(expr.condition, modified, hoisted, counter, type_map, memo, intern)
+        expr.true_expr = _extract_invariant_subexpr(expr.true_expr, modified, hoisted, counter, type_map, memo, intern)
+        expr.false_expr = _extract_invariant_subexpr(expr.false_expr, modified, hoisted, counter, type_map, memo, intern)
     elif isinstance(expr, CastExpr):
-        expr.expr = _extract_invariant_subexpr(expr.expr, modified, hoisted, counter, type_map)
+        expr.expr = _extract_invariant_subexpr(expr.expr, modified, hoisted, counter, type_map, memo, intern)
     elif isinstance(expr, ChannelAccess):
-        expr.object = _extract_invariant_subexpr(expr.object, modified, hoisted, counter, type_map)
+        expr.object = _extract_invariant_subexpr(expr.object, modified, hoisted, counter, type_map, memo, intern)
 
     return expr
 
 
 def _licm_stmt(stmt: ASTNode, modified: set[str],
                hoisted: list[tuple[str, ASTNode, TEXType | None]], counter: list[int],
-               type_map: dict | None = None):
+               type_map: dict | None,
+               memo: dict[int, tuple], intern: dict[tuple, int]):
     """Extract loop-invariant expressions from a single statement in a loop body."""
     if isinstance(stmt, VarDecl):
         if stmt.initializer:
             stmt.initializer = _extract_invariant_subexpr(
-                stmt.initializer, modified, hoisted, counter, type_map)
+                stmt.initializer, modified, hoisted, counter, type_map, memo, intern)
     elif isinstance(stmt, Assignment):
-        stmt.value = _extract_invariant_subexpr(stmt.value, modified, hoisted, counter, type_map)
+        stmt.value = _extract_invariant_subexpr(stmt.value, modified, hoisted, counter, type_map, memo, intern)
     elif isinstance(stmt, ExprStatement):
-        stmt.expr = _extract_invariant_subexpr(stmt.expr, modified, hoisted, counter, type_map)
+        stmt.expr = _extract_invariant_subexpr(stmt.expr, modified, hoisted, counter, type_map, memo, intern)
     elif isinstance(stmt, ReturnStmt):
         if stmt.value:
-            stmt.value = _extract_invariant_subexpr(stmt.value, modified, hoisted, counter, type_map)
+            stmt.value = _extract_invariant_subexpr(stmt.value, modified, hoisted, counter, type_map, memo, intern)
     elif isinstance(stmt, IfElse):
-        stmt.condition = _extract_invariant_subexpr(stmt.condition, modified, hoisted, counter, type_map)
+        stmt.condition = _extract_invariant_subexpr(stmt.condition, modified, hoisted, counter, type_map, memo, intern)
         for s in stmt.then_body:
-            _licm_stmt(s, modified, hoisted, counter, type_map)
+            _licm_stmt(s, modified, hoisted, counter, type_map, memo, intern)
         for s in stmt.else_body:
-            _licm_stmt(s, modified, hoisted, counter, type_map)
+            _licm_stmt(s, modified, hoisted, counter, type_map, memo, intern)
 
 
 def _licm_loop(loop: ForLoop | WhileLoop, counter: list[int],
@@ -1178,10 +1213,15 @@ def _licm_loop(loop: ForLoop | WhileLoop, counter: list[int],
         if isinstance(loop.update, Assignment) and isinstance(loop.update.target, Identifier):
             modified.add(loop.update.target.name)
 
-    # Extract invariant sub-expressions from body statements
+    # Extract invariant sub-expressions from body statements. The scratch
+    # tables are per-loop: inner-loop LICM has already mutated this body
+    # (hoisted decls, new _licm identifiers), so entries from another loop's
+    # walk must not be reused.
+    memo: dict[int, tuple] = {}
+    intern: dict[tuple, int] = {}
     hoisted: list[tuple[str, ASTNode, TEXType | None]] = []
     for stmt in loop.body:
-        _licm_stmt(stmt, modified, hoisted, counter, type_map)
+        _licm_stmt(stmt, modified, hoisted, counter, type_map, memo, intern)
 
     if not hoisted:
         return [loop]

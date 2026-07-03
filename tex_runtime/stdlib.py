@@ -24,6 +24,11 @@ _POW_NAN_STATE = {"checked": 0, "warned": False}
 # to be invisible in image-processing contexts.
 SAFE_EPSILON = 1e-8
 
+# Dtype-aware zero-divisor guard: 1e-8 underflows to 0.0 in fp16 (min normal
+# ~6.1e-5), which would defeat the where(divisor==0, eps, divisor) guard and
+# yield NaN. Look up by divisor dtype, falling back to SAFE_EPSILON.
+ZERO_GUARD_EPS = {torch.float16: 6.104e-5}
+
 # Rec.709 luma coefficients for RGB → luminance conversion
 LUMA_R, LUMA_G, LUMA_B = 0.2126, 0.7152, 0.0722
 
@@ -102,11 +107,20 @@ _GRID_BUF_MAX = 16
 
 
 def _get_grid_buf(B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
-    """Get or allocate a reusable [B, H, W, 2] grid buffer."""
+    """Allocate a [B, H, W, 2] grid buffer, keeping the previous one alive.
+
+    PERF TRAP — do not "fix" this into an actual reuse cache. The is_inference
+    guard means the hit path never fires in production (everything runs under
+    torch.inference_mode), so this always allocates — but storing the buffer in
+    the dict keeps the PREVIOUS allocation alive until it is overwritten here,
+    which prevents the allocator from returning the block to the OS between
+    sample() calls. Measured on CPU at 512²: enabling reuse (or dropping the
+    dict and allocating fresh) makes sample-heavy programs ~30% SLOWER
+    (cross-region in-place writes / page-fault churn); this exact form is the
+    fast one. On CUDA reuse measured neutral.
+    """
     key = (B, H, W, device)
     buf = _grid_buf.get(key)
-    # Recreate if cached buffer was created under inference_mode
-    # (inference tensors can't be written to outside inference_mode)
     if buf is not None and not buf.is_inference():
         return buf
     buf = torch.empty(B, H, W, 2, dtype=torch.float32, device=device)
@@ -130,9 +144,10 @@ _MIP_MAX_LEVELS = 12   # cap: 4096 → 1px in 12 halvings
 
 def _get_batch_index(B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
     """Get or create cached batch index tensor [B, H, W] for advanced indexing."""
-    key = ("bidx", B, H, W, str(device))
+    key = ("bidx", B, H, W, device)
     cached = _sampler_cache.get(key)
     if cached is not None:
+        _sampler_cache.move_to_end(key)
         return cached
     t = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)
     _sampler_cache[key] = t
@@ -141,11 +156,29 @@ def _get_batch_index(B: int, H: int, W: int, device: torch.device) -> torch.Tens
     return t
 
 
-def _get_lanczos_taps(device: torch.device) -> torch.Tensor:
-    """Get or create cached Lanczos-3 tap offset tensor [-2, -1, 0, 1, 2, 3]."""
-    key = ("ltaps", str(device))
+def _get_flat_batch_index(B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
+    """Get or create the flattened [B*H*W] batch index for scatter writes.
+
+    Materializing the contiguous flat copy of the expanded [B, H, W] index is
+    the expensive part (a full int64 tensor), so it is what gets cached."""
+    key = ("bidx_flat", B, H, W, device)
     cached = _sampler_cache.get(key)
     if cached is not None:
+        _sampler_cache.move_to_end(key)
+        return cached
+    t = _get_batch_index(B, H, W, device).contiguous().reshape(-1)
+    _sampler_cache[key] = t
+    if len(_sampler_cache) > _SAMPLER_CACHE_MAX:
+        _sampler_cache.popitem(last=False)
+    return t
+
+
+def _get_lanczos_taps(device: torch.device) -> torch.Tensor:
+    """Get or create cached Lanczos-3 tap offset tensor [-2, -1, 0, 1, 2, 3]."""
+    key = ("ltaps", device)
+    cached = _sampler_cache.get(key)
+    if cached is not None:
+        _sampler_cache.move_to_end(key)
         return cached
     t = torch.arange(-2, 4, device=device, dtype=torch.float32)
     _sampler_cache[key] = t
@@ -451,7 +484,7 @@ class TEXStdlib:
     @staticmethod
     def fn_mod(a, b):
         a_t, b_t = _to_tensor(a), _to_tensor(b)
-        safe_b = b_t + SAFE_EPSILON * (b_t == 0).float()
+        safe_b = torch.where(b_t == 0, ZERO_GUARD_EPS.get(b_t.dtype, SAFE_EPSILON), b_t)
         return torch.fmod(a_t, safe_b)
 
     @staticmethod
@@ -557,9 +590,21 @@ class TEXStdlib:
 
     @staticmethod
     def fn_clamp(x, lo, hi):
-        return torch.clamp(_to_tensor(x), min=_to_float(lo) if _is_scalar(lo) else None,
-                          max=_to_float(hi) if _is_scalar(hi) else None) if _is_scalar(lo) and _is_scalar(hi) \
-            else torch.minimum(torch.maximum(_to_tensor(x), _to_tensor(lo)), _to_tensor(hi))
+        # Python-number bounds: the scalar torch.clamp overload (one kernel).
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+            return torch.clamp(_to_tensor(x), min=lo, max=hi)
+        # 0-dim tensor bounds (interpreter literals live on-device), split by
+        # device: on CUDA pass them through as tensor bounds — sync-free (each
+        # .item() would flush the launch-bound pipeline); on CPU .item() is
+        # nearly free and the scalar overload's kernel is measurably faster
+        # than the broadcasting tensor overload.
+        if _is_scalar(lo) and _is_scalar(hi):
+            xt = _to_tensor(x)
+            if xt.is_cuda:
+                return torch.clamp(xt, min=_to_tensor(lo), max=_to_tensor(hi))
+            return torch.clamp(xt, min=_to_float(lo), max=_to_float(hi))
+        # Spatially-varying bounds
+        return torch.minimum(torch.maximum(_to_tensor(x), _to_tensor(lo)), _to_tensor(hi))
 
     @staticmethod
     def fn_lerp(a, b, t):
@@ -1746,7 +1791,7 @@ def _get_gauss_kernels(sigma: float, device: torch.device) -> tuple[torch.Tensor
     Returns (kernel_h, kernel_v) as contiguous [1, 1, 1, K] and [1, 1, K, 1] tensors,
     ready for depthwise conv2d (expand to [C, 1, ...] before use).
     """
-    key = (round(sigma, 3), str(device))
+    key = (round(sigma, 3), device)
     cached = _gauss_kernel_cache.get(key)
     if cached is not None:
         _gauss_kernel_cache.move_to_end(key)
