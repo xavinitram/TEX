@@ -5,6 +5,20 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 2026-07-06
+
+### Fixed (correctness)
+- **Codegen scalar-loop misclassification after a spatial `if`** — a spatial
+  `if`/`if-else` that assigns a scalar-typed variable turns it into a
+  `torch.where`-merged `[B,H,W]` tensor at runtime, but the merge left the
+  codegen's `_spatial_vars` set reflecting only the last-emitted branch. A
+  subsequent static `for`-loop then classified the variable as scalar and
+  emitted `.item()` on the tensor, raising at runtime and silently falling back
+  to the interpreter (a correctness-preserving but slow path). The merge now
+  marks every possibly-spatial merged variable so the following loop stays in
+  tensor mode. (Follow-up to the 0.14.0 CG-P4 if/else single-emit change, which
+  the audit had deferred.)
+
 ## [0.14.0] - 2026-07-02
 
 Full-engine optimization and cleanliness audit: every layer was audited by

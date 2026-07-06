@@ -2129,3 +2129,50 @@ float y = 0.0;
 if (@t > 0.5) { y = 1.0; } else { y = 0.2; }
 m@OUT = y + @A.r * 0.0;
 """, {"A": img.clone(), "t": 0.7})
+
+    # ── CG-P4 (follow-up): spatial-if merged var read by a later scalar loop ──
+    # A spatial if/else that assigns a scalar-typed var turns it into a
+    # torch.where-merged [B,H,W] tensor at runtime. The merge pops
+    # _var_initializers and leaves _spatial_vars reflecting only the last-emitted
+    # branch, so a subsequent static for-loop classified the var as scalar and
+    # emitted `.item()` on the tensor -> RuntimeError -> silent interpreter
+    # fallback. The var must be marked spatial so the loop stays in tensor mode.
+    branch_var_scalar_loop = """
+float x = 0.0;
+if (u > 0.5) { x = 1.0; }
+float acc = 0.0;
+for (int i = 0; i < 4; i = i + 1) { acc = acc + x; }
+m@OUT = acc;
+"""
+    _equiv_strict(r, "spatial if: branch-assigned var read by scalar loop",
+                  branch_var_scalar_loop, {"A": img.clone()})
+    try:
+        src = _codegen_source(branch_var_scalar_loop, {"A": img})
+        assert "_lv_x = _lv_x.item()" not in src, \
+            "merged spatial var collapsed with .item() (scalar-loop misclassification)"
+        r.ok("spatial if: merged var stays tensor-mode in the following loop")
+    except Exception as e:
+        r.fail("spatial if: merged var stays tensor-mode in the following loop", f"{e}")
+
+    # With an else branch the merge is a full torch.where of both branch values.
+    _equiv_strict(r, "spatial if/else: merged var read by scalar loop", """
+float x = 0.0;
+if (u > 0.5) { x = 1.0; } else { x = 0.25; }
+float acc = 0.0;
+for (int i = 0; i < 4; i = i + 1) { acc = acc + x; }
+m@OUT = acc;
+""", {"A": img.clone()})
+
+    # Clause 2: the condition is NOT spatial (plain scalar comparison), but the
+    # then-branch assigns a spatial value while the else-branch reassigns it to a
+    # scalar. The else-branch emission clears the var from _spatial_vars, so only
+    # the then_spatial snapshot (captured before the else ran) keeps the runtime
+    # scalar-cond path's per-pixel value in tensor mode for the later loop.
+    _equiv_strict(r, "spatial if: scalar-cond branch assigns spatial var", """
+int flag = 1;
+float s = 0.0;
+if (flag > 0) { s = @A.r; } else { s = 0.5; }
+float acc = 0.0;
+for (int i = 0; i < 3; i = i + 1) { acc = acc + s; }
+m@OUT = acc * 0.2;
+""", {"A": img.clone()})

@@ -2103,6 +2103,14 @@ class _CodeGen:
                 self._indent -= 1
             return
 
+        # Capture the condition's spatial-ness NOW, before either branch is
+        # emitted: branch emission pops _var_initializers for any reassigned var,
+        # which would make a later _init_is_spatial(condition) under-report. A
+        # spatial condition means the vectorized merge below broadcasts every
+        # modified var to the condition's [B,H,W] shape, so they must all be
+        # treated as spatial afterwards (see the fixup in _emit_spatial_if_else).
+        cond_spatial = self._init_is_spatial(stmt.condition)
+
         # Check if this could be a scalar condition
         # We emit both paths: scalar short-circuit and spatial vectorized
         self._emit(f"if not _torch.is_tensor({cond_tmp}) or {cond_tmp}.dim() == 0:")
@@ -2132,17 +2140,20 @@ class _CodeGen:
         # For spatial if/else, we need the full clone/merge logic.
         # Emit it inline.
         lines_before = len(self._lines)
-        self._emit_spatial_if_else(stmt, cond_tmp)
+        self._emit_spatial_if_else(stmt, cond_tmp, cond_spatial)
         if len(self._lines) == lines_before:
             self._emit("pass")  # guard against empty else block
 
         self._indent -= 1
 
-    def _emit_spatial_if_else(self, stmt: IfElse, cond_var: str):
+    def _emit_spatial_if_else(self, stmt: IfElse, cond_var: str, cond_spatial: bool):
         """Emit spatial if/else with selective cloning and torch.where merge.
 
         Uses local variables for env vars when available (program-level locals),
         falls back to _env dict for any vars not in _local_vars.
+
+        ``cond_spatial`` is the pre-computed spatial-ness of the condition (see
+        _emit_if_else); it drives the post-merge _spatial_vars fixup at the end.
         """
         # Collect modified variables (same analysis as interpreter)
         then_mods = self._collect_modified_vars(stmt.then_body)
@@ -2175,6 +2186,9 @@ class _CodeGen:
         # Execute then-branch
         for s in stmt.then_body:
             self._emit_stmt(s)
+        # Which modified vars the then-branch left holding a spatial value. Read
+        # here, before the else-branch below can reassign (and un-spatial) them.
+        then_spatial = {k for k in all_env_mods if k in self._spatial_vars}
 
         # Capture then-state
         then_vars: dict[str, str] = {}
@@ -2196,6 +2210,9 @@ class _CodeGen:
         if stmt.else_body:
             for s in stmt.else_body:
                 self._emit_stmt(s)
+        # Which modified vars are spatial on the else path (with no else body this
+        # is the unchanged post-then/restore state, i.e. their pre-if value).
+        else_spatial = {k for k in all_env_mods if k in self._spatial_vars}
 
         # Merge with torch.where
         cond_bool = self._tmp()
@@ -2228,6 +2245,23 @@ class _CodeGen:
             self._indent += 1
             self._emit(f"_bind[{k!r}] = {tv}")
             self._indent -= 1
+
+        # Post-merge, a modified var can hold a per-pixel tensor even when its
+        # declared type is scalar: the torch.where merge broadcasts to the
+        # condition's [B,H,W] shape whenever the condition is spatial, and the
+        # scalar-cond runtime path can assign a spatial value inside a branch.
+        # The per-branch emission above leaves _spatial_vars reflecting only the
+        # last branch (and pops _var_initializers on any reassignment), so a
+        # later scalar-mode for-loop would misclassify the var as scalar and emit
+        # `.item()` on the tensor -> RuntimeError -> silent interpreter fallback.
+        # Conservatively mark every possibly-spatial merged var so the scalar-loop
+        # analysis keeps it in tensor mode (over-marking only forgoes the scalar
+        # fast path; under-marking crashes).
+        if cond_spatial:
+            self._spatial_vars.update(all_env_mods)
+        else:
+            self._spatial_vars.update(then_spatial)
+            self._spatial_vars.update(else_spatial)
 
     def _init_is_spatial(self, expr: ASTNode, _seen: set | None = None) -> bool:
         """True if an expression draws from a per-pixel/spatial source — a binding,
