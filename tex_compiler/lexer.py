@@ -224,9 +224,7 @@ class Lexer:
 
     def __init__(self, source: str):
         self.source = source
-        self.pos = 0
-        self.line = 1
-        self.col = 1
+        self.pos = 0  # CT-2: the byte offset is the sole cursor (no line/col)
         self.tokens: list[Token] = []
 
     def _error(self, message: str, loc: SourceLoc, *,
@@ -236,7 +234,9 @@ class Lexer:
                           code=code, hint=hint, end_col=end_col)
 
     def loc(self) -> SourceLoc:
-        return SourceLoc(self.line, self.col)
+        # CT-2: capture only the byte offset; line/col are resolved lazily by
+        # SourceLoc, and only if a diagnostic ever renders this location.
+        return SourceLoc.from_offset(self.pos, self.source)
 
     def peek(self) -> str:
         if self.pos >= len(self.source):
@@ -252,27 +252,11 @@ class Lexer:
     def advance(self) -> str:
         ch = self.source[self.pos]
         self.pos += 1
-        if ch == "\n":
-            self.line += 1
-            self.col = 1
-        else:
-            self.col += 1
         return ch
 
     def _advance_run(self, end: int):
-        """Move pos to `end`, updating line/col across the skipped run.
-
-        Batched replacement for repeated advance() calls; handles runs that
-        contain newlines (whitespace, block comments).
-        """
-        src = self.source
-        nl = src.count("\n", self.pos, end)
-        if nl:
-            self.line += nl
-            # 1-based column of the character right after the last newline
-            self.col = end - src.rindex("\n", self.pos, end)
-        else:
-            self.col += end - self.pos
+        """Move pos to `end` (batched replacement for repeated advance() calls).
+        CT-2: no line/col bookkeeping — the byte offset is the only cursor."""
         self.pos = end
 
     def skip_whitespace(self):
@@ -289,7 +273,6 @@ class Lexer:
         end = self.source.find("\n", self.pos)
         if end == -1:
             end = len(self.source)
-        self.col += end - self.pos
         self.pos = end
 
     def skip_block_comment(self):
@@ -319,7 +302,6 @@ class Lexer:
             if i == hex_start:
                 raise self._error("Hex literal '0x' has no digits. Try something like 0xFF.",
                                   start_loc, code="E1002")
-            self.col += i - self.pos
             self.pos = i
             return Token(TokenType.INT_LIT, src[start_pos:i], start_loc)
 
@@ -348,7 +330,6 @@ class Lexer:
                 i = j
             # else: no digits after 'e' — leave it for a separate identifier
 
-        self.col += i - self.pos
         self.pos = i
         text = src[start_pos:i]
         tok_type = TokenType.FLOAT_LIT if is_float else TokenType.INT_LIT
@@ -362,7 +343,6 @@ class Lexer:
         i = self.pos
         while i < n and _is_ident_continue(src[i]):
             i += 1
-        self.col += i - self.pos
         self.pos = i
         text = src[start_pos:i]
 
@@ -394,7 +374,6 @@ class Lexer:
                 i += 1
             if i > self.pos:
                 chars.append(src[self.pos:i])
-                self.col += i - self.pos
                 self.pos = i
             if i >= n:
                 break
@@ -441,7 +420,6 @@ class Lexer:
         i = name_start
         while i < n and _is_ident_continue(src[i]):
             i += 1
-        self.col += i - self.pos
         self.pos = i
         return src[name_start:i]
 
@@ -492,7 +470,6 @@ class Lexer:
                 i = self.pos + 1  # .
                 while i < n and _is_ascii_digit(src[i]):
                     i += 1
-                self.col += i - self.pos
                 self.pos = i
                 self.tokens.append(Token(TokenType.FLOAT_LIT, src[start_pos:i], start_loc))
                 continue
@@ -526,7 +503,6 @@ class Lexer:
             tt = TWO_CHAR_TOKENS.get(pair)
             if tt is not None:
                 self.pos += 2
-                self.col += 2
                 self.tokens.append(Token(tt, pair, start_loc))
                 continue
 

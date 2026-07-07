@@ -17,6 +17,7 @@ from __future__ import annotations
 import torch
 import math
 from typing import Any
+from dataclasses import fields as _dc_fields
 from ..tex_compiler.ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
     BreakStmt, ContinueStmt, FunctionDef, ReturnStmt,
@@ -135,6 +136,8 @@ class Interpreter:
         self._builtins_cache_key: tuple | None = None
         self._builtins_cache_env: dict[str, torch.Tensor] = {}
         self._assigned_vars_cache: dict[int, tuple[set[str], set[str]]] = {}
+        # UC-3: per-loop-node structural eligibility for uniform-range resolution.
+        self._uniform_range_cache: dict[int, tuple | bool] = {}
 
         # ── Dispatch tables (O(1) lookup, built once per instance) ──
         self._stmt_dispatch: dict[type, callable] = {
@@ -179,9 +182,14 @@ class Interpreter:
         precision: str = "fp32",
         used_builtins: frozenset[str] | None = None,
         source: str = "",
+        tile: tuple[int, int] | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Execute a TEX program.
+
+        tile: (y0, H_total) for M-4 strip execution — this call processes a
+            horizontal strip whose top row is y0 of a full image of H_total rows.
+            iy/v/ih/py are computed against the full image so seams are exact.
 
         Args:
             program: Parsed and type-checked AST
@@ -204,7 +212,8 @@ class Interpreter:
         with torch.inference_mode():
             return self._execute_inner(program, bindings, type_map, device,
                                        latent_channel_count, output_names,
-                                       precision, used_builtins=used_builtins)
+                                       precision, used_builtins=used_builtins,
+                                       tile=tile)
 
 
 
@@ -225,6 +234,7 @@ class Interpreter:
         output_names: list[str] | None,
         precision: str = "fp32",
         used_builtins: frozenset[str] | None = None,
+        tile: tuple[int, int] | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         # Canonicalize an index-less "cuda" so cache keys ("cuda" vs "cuda:0")
@@ -250,6 +260,7 @@ class Interpreter:
         # mutated (every write path clones before its first in-place store).
         self._user_functions.clear()
         self._assigned_vars_cache.clear()
+        self._uniform_range_cache.clear()  # id()-keyed — clear per run (id reuse)
 
         # Process bindings — skip redundant .to() when already on target device/dtype
         target_device = self.device
@@ -266,12 +277,8 @@ class Interpreter:
                     t = t.to(target_dtype)
                 self.bindings[name] = t
             elif isinstance(value, (list, tuple)):
-                # Vec param defaults / converted widget values (e.g. [0.5, 0.3, 0.1])
-                # Shape as [1, 1, 1, C] (channel-last spatial) for correct broadcasting
-                t = torch.tensor(value, dtype=target_dtype, device=target_device)
-                if t.dim() == 1 and t.shape[0] in (2, 3, 4):
-                    t = t.view(1, 1, 1, -1)
-                self.bindings[name] = t
+                # Vec param defaults / converted widget values (e.g. [0.5, 0.3, 0.1]).
+                self.bindings[name] = vec_list_to_tensor(value, target_dtype, target_device)
             else:
                 self.bindings[name] = torch.scalar_tensor(float(value), dtype=target_dtype, device=target_device)
 
@@ -279,7 +286,7 @@ class Interpreter:
         self.spatial_shape = self._determine_spatial_shape()
 
         # Create built-in coordinate variables (lazy — only what the program uses)
-        self._create_builtins(program, used_builtins=used_builtins)
+        self._create_builtins(program, used_builtins=used_builtins, tile=tile)
 
         # Execute statements via tree-walking interpreter
         for stmt in program.statements:
@@ -331,62 +338,74 @@ class Interpreter:
         return None
 
     def _create_builtins(self, program: Program,
-                         used_builtins: frozenset[str] | None = None):
+                         used_builtins: frozenset[str] | None = None,
+                         tile: tuple[int, int] | None = None):
         """Create built-in variables lazily — only allocate what the program uses.
 
         Builtins use compact broadcast-friendly shapes instead of full
         [B, H, W] expansion. PyTorch broadcasts automatically in ops.
+
+        When `tile=(y0, H_total)` (M-4 strip execution), the vertical builtins are
+        computed against the FULL image: iy starts at y0, and v/ih/py use H_total,
+        so a strip's coordinates match the untiled cook exactly (seam-exact).
         """
         used = used_builtins if used_builtins is not None else _collect_identifiers(program)
 
         # Cache builtins: reuse tensors when spatial config hasn't changed
-        cache_key = (self.spatial_shape, self._device_str, self._dtype, used, self.latent_channel_count)
+        cache_key = (self.spatial_shape, self._device_str, self._dtype, used, self.latent_channel_count, tile)
         if cache_key == self._builtins_cache_key:
             self.env.update(self._builtins_cache_env)
             return
 
+        # M-3: coordinate/spatial builtins are ALWAYS fp32 (never self._dtype).
+        # fp16 `u` has only 4097 distinct values across 8192 pixels and
+        # floor().long() mis-addresses 1024 of 4096 rows at H=4096 — coordinates
+        # and sampler grids must stay fp32 regardless of the image-data precision.
+        cdt = torch.float32
         if self.spatial_shape:
             B, H, W = self.spatial_shape
+            # M-4: vertical coordinates reference the full image under tiling.
+            y0, H_total = (tile if tile is not None else (0, H))
 
             # ix: pixel x-coordinate [0, W-1] — compact shape [1, 1, W]
             # u/v use expand() which creates a view (no memory copy) at [B,H,W]
             # for compatibility with torch.stack in sampling functions.
             if "ix" in used or "u" in used:
-                ix = torch.arange(W, dtype=self._dtype, device=self.device).view(1, 1, W)
+                ix = torch.arange(W, dtype=cdt, device=self.device).view(1, 1, W)
                 if "ix" in used:
                     self.env["ix"] = ix
                 if "u" in used:
                     self.env["u"] = (ix / max(W - 1, 1)).expand(B, H, W)
 
-            # iy: pixel y-coordinate
+            # iy: pixel y-coordinate (offset by the strip's top row under tiling)
             if "iy" in used or "v" in used:
-                iy = torch.arange(H, dtype=self._dtype, device=self.device).view(1, H, 1)
+                iy = torch.arange(y0, y0 + H, dtype=cdt, device=self.device).view(1, H, 1)
                 if "iy" in used:
                     self.env["iy"] = iy
                 if "v" in used:
-                    self.env["v"] = (iy / max(H - 1, 1)).expand(B, H, W)
+                    self.env["v"] = (iy / max(H_total - 1, 1)).expand(B, H, W)
 
-            # iw, ih: image dimensions
+            # iw, ih: image dimensions (ih is the FULL height under tiling)
             if "iw" in used:
-                self.env["iw"] = torch.scalar_tensor(float(W), dtype=self._dtype, device=self.device)
+                self.env["iw"] = torch.scalar_tensor(float(W), dtype=cdt, device=self.device)
             if "ih" in used:
-                self.env["ih"] = torch.scalar_tensor(float(H), dtype=self._dtype, device=self.device)
+                self.env["ih"] = torch.scalar_tensor(float(H_total), dtype=cdt, device=self.device)
 
-            # px, py: pixel step in UV space (1/width, 1/height)
+            # px, py: pixel step in UV space (1/width, 1/full-height)
             if "px" in used:
-                self.env["px"] = torch.scalar_tensor(1.0 / max(W, 1), dtype=self._dtype, device=self.device)
+                self.env["px"] = torch.scalar_tensor(1.0 / max(W, 1), dtype=cdt, device=self.device)
             if "py" in used:
-                self.env["py"] = torch.scalar_tensor(1.0 / max(H, 1), dtype=self._dtype, device=self.device)
+                self.env["py"] = torch.scalar_tensor(1.0 / max(H_total, 1), dtype=cdt, device=self.device)
 
             if "fi" in used:
-                self.env["fi"] = torch.arange(B, dtype=self._dtype, device=self.device).view(B, 1, 1)
+                self.env["fi"] = torch.arange(B, dtype=cdt, device=self.device).view(B, 1, 1)
             if "fn" in used:
-                self.env["fn"] = torch.scalar_tensor(float(B), dtype=self._dtype, device=self.device)
+                self.env["fn"] = torch.scalar_tensor(float(B), dtype=cdt, device=self.device)
         else:
             # No spatial context — pure scalar mode (only create what's used)
             for name, val in _SCALAR_BUILTIN_DEFAULTS.items():
                 if name in used:
-                    self.env[name] = torch.scalar_tensor(val, dtype=self._dtype, device=self.device)
+                    self.env[name] = torch.scalar_tensor(val, dtype=cdt, device=self.device)
 
         if "PI" in used:
             self.env["PI"] = torch.scalar_tensor(math.pi, dtype=self._dtype, device=self.device)
@@ -774,9 +793,13 @@ class Interpreter:
                 val_t = value if isinstance(value, torch.Tensor) else torch.scalar_tensor(float(value), dtype=self._dtype, device=self.device)
                 result[idx] = val_t
             elif idx.dim() == 0:
-                # Constant index: [..., N, C] → assign vec to [..., C]
+                # Constant index: [..., N, C] → assign vec to [..., C]. Literal
+                # index resolves without .item() (UC-5); runtime scalar syncs.
                 spatial_shape = result.shape[:-2]  # [B, H, W]
-                result[..., idx.item(), :] = _ensure_spatial(value, spatial_shape)
+                ci = _const_index(target.index, arr_size)
+                if ci is None:
+                    ci = int(idx.item())
+                result[..., ci, :] = _ensure_spatial(value, spatial_shape)
             else:
                 # Per-pixel assignment via scatter on dim=-2
                 C = result.shape[-1]
@@ -797,7 +820,10 @@ class Interpreter:
                 result[idx] = value if isinstance(value, torch.Tensor) else torch.scalar_tensor(float(value), dtype=self._dtype, device=self.device)
             elif idx.dim() == 0:
                 spatial_shape = result.shape[:-1]
-                result[..., idx.item()] = _ensure_spatial(value, spatial_shape)
+                ci = _const_index(target.index, arr_size)
+                if ci is None:
+                    ci = int(idx.item())
+                result[..., ci] = _ensure_spatial(value, spatial_shape)
             else:
                 idx_expanded = idx.unsqueeze(-1)
                 if idx_expanded.shape[:3] != result.shape[:3]:
@@ -1088,6 +1114,11 @@ class Interpreter:
         """
         # Try fully static loop: pre-compute range() from init/cond/update literals
         static_range = self._try_extract_static_range(node)
+        # UC-3: else try a *uniform* range — same shape but with scalar-expression
+        # bounds (e.g. `for (dy = -$radius; dy <= $radius; ...)`), resolved once at
+        # loop entry instead of an `.item()` sync every iteration.
+        if static_range is None:
+            static_range = self._try_resolve_uniform_range(node)
 
         if static_range is not None:
             loop_var, iter_range = static_range
@@ -1144,6 +1175,82 @@ class Interpreter:
         if result is None:
             return None
         loop_var, start, end, step = result
+        try:
+            return (loop_var, range(start, end, step))
+        except ValueError:
+            return None
+
+    def _analyze_uniform_range(self, node: ForLoop):
+        """Structural check for a uniform (scalar-expression-bounded) for-loop —
+        same shape as try_extract_static_range but the start/end/step may be any
+        expressions, provided they don't reference the loop var or any variable
+        assigned in the loop body (which would make them non-uniform). Returns
+        (loop_var, start_expr, cond_op, end_expr, step_expr, step_sign) or False.
+        """
+        init = node.init
+        if not isinstance(init, VarDecl) or init.initializer is None:
+            return False
+        loop_var = init.name
+        start_e = init.initializer
+
+        cond = node.condition
+        if (not isinstance(cond, BinOp) or cond.op not in ("<", "<=")
+                or not isinstance(cond.left, Identifier) or cond.left.name != loop_var):
+            return False
+        end_e = cond.right
+
+        upd = node.update
+        if (not isinstance(upd, Assignment) or not isinstance(upd.target, Identifier)
+                or upd.target.name != loop_var or not isinstance(upd.value, BinOp)):
+            return False
+        ub = upd.value
+        if (not isinstance(ub.left, Identifier) or ub.left.name != loop_var
+                or ub.op not in ("+", "-")):
+            return False
+        step_e = ub.right
+        step_sign = 1 if ub.op == "+" else -1
+
+        # Bounds must not depend on the loop var or anything mutated in the body —
+        # for BOTH env vars AND bindings (UC-3b: a bound reading @A while the body
+        # reassigns @A resolves once and diverges from per-iteration semantics).
+        body_assigned, body_bindings = self._collect_assigned_vars(node.body)
+        forbidden = body_assigned | {loop_var}
+        names: set[str] = set()
+        bind_names: set[str] = set()
+        for e in (start_e, end_e, step_e):
+            _collect_expr_names(e, names, bind_names)
+        if (names & forbidden) or (bind_names & body_bindings):
+            return False
+        return (loop_var, start_e, cond.op, end_e, step_e, step_sign)
+
+    def _try_resolve_uniform_range(self, node: ForLoop) -> tuple[str, range] | None:
+        """Resolve a uniform-range for-loop to a Python range() by evaluating its
+        scalar bound expressions once (UC-3). Structural eligibility is memoized."""
+        elig = self._uniform_range_cache.get(id(node))
+        if elig is None:
+            elig = self._analyze_uniform_range(node)
+            self._uniform_range_cache[id(node)] = elig
+        if elig is False:
+            return None
+        loop_var, start_e, cond_op, end_e, step_e, step_sign = elig
+        try:
+            # UC-3a: only resolve to a Python range() when start/end/step are all
+            # INTEGER-VALUED. The general per-iteration path evaluates the float
+            # condition with true fractional values, so flooring a fractional
+            # bound/step (e.g. i=0.5, step 1.5) silently changes the loop values
+            # and trip count vs v0.14.1. A fractional bound → fall back.
+            start = _int_valued_scalar(self._eval(start_e))
+            end = _int_valued_scalar(self._eval(end_e))
+            step_mag = _int_valued_scalar(self._eval(step_e))
+        except (ValueError, TypeError, RuntimeError):
+            return None  # non-scalar / non-numeric bound → fall back to general path
+        if start is None or end is None or step_mag is None:
+            return None  # fractional or non-scalar bound → general path
+        step = step_sign * step_mag
+        if step == 0:
+            return None
+        if cond_op == "<=":
+            end += 1
         try:
             return (loop_var, range(start, end, step))
         except ValueError:
@@ -1253,26 +1360,36 @@ class Interpreter:
         return torch.stack([base[..., i] for i in indices], dim=-1)
 
     def _eval_array_index(self, node: ArrayIndexAccess) -> torch.Tensor | str:
-        """Evaluate array[index] with clamped bounds."""
+        """Evaluate array[index] with clamped bounds.
+
+        A literal index (`arr[2]`) resolves to a Python int via _const_index —
+        skipping the 0-dim device tensor and its .item() sync (a CUDA-graph
+        capture blocker; UC-5). Otherwise the index is evaluated to a tensor.
+        """
         array = self._eval(node.array)
-        index = self._eval(node.index)
 
         # String array (Python list)
         if isinstance(array, list):
-            idx_int = max(0, min(int(round(index.item() if isinstance(index, torch.Tensor) else float(index))), len(array) - 1))
-            return array[idx_int]
+            ci = _const_index(node.index, len(array))
+            if ci is None:
+                index = self._eval(node.index)
+                ci = max(0, min(int(round(index.item() if isinstance(index, torch.Tensor) else float(index))), len(array) - 1))
+            return array[ci]
 
         # Vector array: dim 5 (spatial) or 2 (non-spatial) → [..., N, C]
         if array.dim() in (2, 5):
             arr_size = array.shape[-2]
-            idx = _safe_array_index(index, arr_size)
+            ci = _const_index(node.index, arr_size)
+            if ci is not None:
+                return array[ci] if array.dim() == 2 else array[..., ci, :]
 
+            index = self._eval(node.index)
+            idx = _safe_array_index(index, arr_size)
             if array.dim() == 2:
                 # Non-spatial: [N, C]
                 return array[idx]
-
             if idx.dim() == 0:
-                # Constant index: [..., N, C] → [..., C]
+                # Constant (runtime scalar) index: [..., N, C] → [..., C]
                 return array[..., idx.item(), :]
 
             # Per-pixel index: gather on dim=-2
@@ -1284,11 +1401,14 @@ class Interpreter:
 
         # Scalar array: dim 4 (spatial) or 1 (non-spatial) → [..., N]
         arr_size = array.shape[-1]
-        idx = _safe_array_index(index, arr_size)
+        ci = _const_index(node.index, arr_size)
+        if ci is not None:
+            return array[ci] if array.dim() == 1 else array[..., ci]
 
+        index = self._eval(node.index)
+        idx = _safe_array_index(index, arr_size)
         if array.dim() == 1:
             return array[idx]
-
         if idx.dim() == 0:
             return array[..., idx.item()]
 
@@ -1856,6 +1976,70 @@ def _safe_array_index(idx: torch.Tensor, size: int) -> torch.Tensor:
     Equivalent to ``torch.clamp(torch.floor(idx).long(), 0, size - 1)``.
     """
     return torch.clamp(torch.floor(idx).long(), 0, size - 1)
+
+
+def _const_index(index_node, size: int) -> int | None:
+    """Resolve a compile-time literal array index to a floor+clamped Python int
+    (identical semantics to _safe_array_index), or None if the index isn't a
+    NumberLiteral. Computed without a 0-dim device tensor or the .item() sync
+    (a CUDA-graph capture blocker; UC-5)."""
+    if index_node.__class__ is NumberLiteral:
+        return max(0, min(int(math.floor(index_node.value)), size - 1))
+    return None
+
+
+def vec_list_to_tensor(value, dtype, device) -> torch.Tensor:
+    """A vec/color param list (e.g. [r,g,b]) → a [1,1,1,C] channel-last tensor
+    (len 2/3/4, for correct spatial broadcast) or a plain 1-D tensor otherwise.
+    The single source of the vecN reshape rule, shared by the interpreter's
+    binding setup and the CUDA-graph stager (UC-1) so they can't drift."""
+    t = torch.tensor(value, dtype=dtype, device=device)
+    if t.dim() == 1 and t.shape[0] in (2, 3, 4):
+        t = t.view(1, 1, 1, -1)
+    return t
+
+
+def _collect_expr_names(expr, idents: set, bindings: set) -> None:
+    """Single-pass generic AST walk collecting both Identifier names (into
+    *idents*) and BindingRef names (into *bindings*) referenced in an expression.
+    Used by UC-3's uniform-range guard, which needs both to reject a bound that
+    reads a loop-var/env-var OR a binding the loop body reassigns."""
+    cls = expr.__class__
+    if cls is Identifier:
+        idents.add(expr.name)
+        return
+    if cls is BindingRef:
+        bindings.add(expr.name)
+        return
+    for f in _dc_fields(expr):
+        v = getattr(expr, f.name)
+        if isinstance(v, ASTNode):
+            _collect_expr_names(v, idents, bindings)
+        elif isinstance(v, list):
+            for x in v:
+                if isinstance(x, ASTNode):
+                    _collect_expr_names(x, idents, bindings)
+
+
+def _int_valued_scalar(value) -> int | None:
+    """The exact integer of a scalar bound when it is integer-valued; None for a
+    fractional bound, a non-finite value, or a spatial/multi-element tensor.
+
+    UC-3a: uniform-range resolution must only fire on integer-valued bounds —
+    for those, floor/int/truncate all agree and the resolved Python range()
+    matches the general per-iteration path for both int and float loop counters.
+    A fractional bound falls back to the general path (correct fractional loop)."""
+    if isinstance(value, torch.Tensor):
+        if value.dim() != 0:
+            return None
+        value = value.item()
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f != math.floor(f):
+        return None
+    return int(f)
 
 
 def _ensure_spatial(tensor: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:

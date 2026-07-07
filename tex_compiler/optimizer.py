@@ -24,6 +24,7 @@ from .ast_nodes import (
     ChannelAccess, NumberLiteral, StringLiteral, VecConstructor,
     MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral, SourceLoc,
     try_extract_static_range,
+    iter_child_nodes as _iter_children,
 )
 from .type_checker import TEXType
 
@@ -94,6 +95,10 @@ def optimize(program: Program, type_map: dict | None = None) -> Program:
     synthesized by CSE/LICM are registered in it so the post-optimization AST and
     type_map stay consistent — otherwise id()-keyed lookups miss those nodes.
     """
+    # Pass 0: constant-propagate literal locals (UC-4) so the folds below fire on
+    # TEX's named-tuning-constant style (`float gamma = 1.0; ... pow(g, 1.0/gamma)`).
+    program.statements = _propagate_literal_locals(program.statements)
+
     # Pass 1: constant folding + algebraic simplification
     for i, stmt in enumerate(program.statements):
         program.statements[i] = _opt_stmt(stmt)
@@ -104,6 +109,13 @@ def optimize(program: Program, type_map: dict | None = None) -> Program:
     # Pass 3: common subexpression elimination
     program.statements = _eliminate_common_subexpressions(program.statements, type_map)
 
+    # Pass 3.5: re-run DCE (Q-2). CSE creates a merged temp but leaves the
+    # superseded inner temps as dead-but-executed VarDecls; and the now
+    # purity-aware _has_side_effects can delete unused pure-call decls that the
+    # first DCE pass (before the whitelist) had to keep. The post-optimize
+    # re-typecheck (in compile_tex / compile_fused) covers the removed nodes.
+    program.statements = _eliminate_dead_code(program.statements)
+
     # Pass 4: loop-invariant code motion
     program.statements = _hoist_loop_invariants(program.statements, type_map=type_map)
 
@@ -111,6 +123,95 @@ def optimize(program: Program, type_map: dict | None = None) -> Program:
     program.statements = _unroll_small_loops(program.statements)
 
     return program
+
+
+# ── UC-4: constant propagation of literal locals ──────────────────────
+
+def _subst_all_literals(expr, subs: dict) -> ASTNode:
+    if expr is None:
+        return None
+    for name, (val, is_int) in subs.items():
+        expr = _subst_expr(expr, name, val, is_int)
+    return expr
+
+
+def _subst_stmt_literals(stmt: ASTNode, subs: dict) -> ASTNode:
+    """Substitute the eligible literal locals throughout a statement, recursing
+    into control-flow bodies but NOT function bodies (a separate scope)."""
+    cls = stmt.__class__
+    if cls is FunctionDef:
+        return stmt
+    if cls is VarDecl:
+        stmt.initializer = _subst_all_literals(stmt.initializer, subs)
+    elif cls is ArrayDecl:
+        stmt.initializer = _subst_all_literals(stmt.initializer, subs)
+    elif cls is Assignment:
+        stmt.value = _subst_all_literals(stmt.value, subs)
+        stmt.target = _subst_all_literals(stmt.target, subs)
+    elif cls is ExprStatement:
+        stmt.expr = _subst_all_literals(stmt.expr, subs)
+    elif cls is ReturnStmt:
+        stmt.value = _subst_all_literals(stmt.value, subs)
+    elif cls is IfElse:
+        stmt.condition = _subst_all_literals(stmt.condition, subs)
+        stmt.then_body = [_subst_stmt_literals(s, subs) for s in stmt.then_body]
+        stmt.else_body = [_subst_stmt_literals(s, subs) for s in stmt.else_body]
+    elif cls is ForLoop:
+        stmt.init = _subst_stmt_literals(stmt.init, subs)
+        stmt.condition = _subst_all_literals(stmt.condition, subs)
+        stmt.update = _subst_stmt_literals(stmt.update, subs)
+        stmt.body = [_subst_stmt_literals(s, subs) for s in stmt.body]
+    elif cls is WhileLoop:
+        stmt.condition = _subst_all_literals(stmt.condition, subs)
+        stmt.body = [_subst_stmt_literals(s, subs) for s in stmt.body]
+    return stmt
+
+
+def _propagate_literal_locals(statements: list[ASTNode]) -> list[ASTNode]:
+    """Substitute top-level float/int locals that are (a) initialized to a
+    NumberLiteral, (b) never reassigned, (c) declared exactly once and never a
+    function parameter or loop variable — with that literal, so the existing
+    folds fire. Scope-aware: a name shadowed anywhere (param / redeclare) is
+    excluded, and function bodies are never substituted into (verified: a
+    function param may legally shadow a top-level literal local)."""
+    reassigned: set[str] = set()
+    params: set[str] = set()
+    loopvars: set[str] = set()
+    decl_count: dict[str, int] = {}
+    stack = list(statements)
+    while stack:
+        n = stack.pop()
+        cls = n.__class__
+        # UC-4: an ArrayDecl shadowing a top-level literal local must count as a
+        # declaration too, or const-prop substitutes the scalar into the array's
+        # index sites (`g[i]` on a NumberLiteral) and the mandatory re-typecheck
+        # rejects a program that was legal in v0.14.1.
+        if cls is VarDecl or cls is ArrayDecl:
+            decl_count[n.name] = decl_count.get(n.name, 0) + 1
+        elif cls is Assignment:
+            t = n.target
+            if isinstance(t, Identifier):
+                reassigned.add(t.name)
+            elif isinstance(t, ChannelAccess) and isinstance(t.object, Identifier):
+                reassigned.add(t.object.name)
+            elif isinstance(t, ArrayIndexAccess) and isinstance(t.array, Identifier):
+                reassigned.add(t.array.name)
+        elif cls is FunctionDef:
+            for (_pt, pn) in n.params:
+                params.add(pn)
+        elif cls is ForLoop and isinstance(n.init, VarDecl):
+            loopvars.add(n.init.name)
+        stack.extend(_iter_children(n))
+
+    subs: dict[str, tuple] = {}
+    for stmt in statements:  # top level only
+        if (stmt.__class__ is VarDecl and stmt.initializer.__class__ is NumberLiteral
+                and stmt.name not in reassigned and stmt.name not in params
+                and stmt.name not in loopvars and decl_count.get(stmt.name, 0) == 1):
+            subs[stmt.name] = (stmt.initializer.value, stmt.initializer.is_int)
+    if not subs:
+        return statements
+    return [_subst_stmt_literals(s, subs) for s in statements]
 
 
 # ── Statement optimization ────────────────────────────────────────────
@@ -604,7 +705,13 @@ def _has_side_effects(expr: ASTNode) -> bool:
     read is still preserved.
     """
     if isinstance(expr, FunctionCall):
-        return True  # Functions could have side effects
+        # Pure builtins (the CSE/LICM whitelist) have no side effects — but a
+        # wrapped binding read or impure arg still does, so recurse into args
+        # (Q-2: type_checker forbids redefining builtin names, so name-keyed
+        # purity can't be spoofed). Non-whitelisted / user calls stay impure.
+        if expr.name in _CSE_PURE_FUNCTIONS:
+            return any(_has_side_effects(a) for a in expr.args)
+        return True
     if isinstance(expr, BinOp):
         return _has_side_effects(expr.left) or _has_side_effects(expr.right)
     if isinstance(expr, UnaryOp):

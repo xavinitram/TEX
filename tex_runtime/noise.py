@@ -406,11 +406,12 @@ def _can_inductor_compile(device=None) -> bool:
                 pass
             ok = shutil.which('cl') is not None
     if ok:
-        # Enable persistent FxGraph cache so compiled kernels survive process
-        # restarts — eliminates the ~28s MSVC compile on cold start.
+        # Persist compiled kernels across restarts: point inductor's disk cache
+        # at TEX's owned dir (shared helper — the TORCHINDUCTOR_CACHE_DIR env var,
+        # since torch._inductor.config.cache_dir does not exist on torch 2.10).
         try:
-            import torch._inductor.config as _ind_cfg
-            _ind_cfg.fx_graph_cache = True
+            from .compiled import _ensure_inductor_cache_dir
+            _ensure_inductor_cache_dir()
         except Exception:
             pass
     _inductor_available[dev_type] = ok

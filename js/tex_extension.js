@@ -2299,6 +2299,66 @@ function _texCollapseChains(result) {
     }
 }
 
+// ─── Q-5: chain preflight + perf HUD ────────────────────────────────────────
+let _texPreflightEnabled = true;              // TEX.Fusion.preflight
+const _texPreflight = new Map();              // termId -> {ok, error, stage_of_error, stats}
+const _texPreflightSig = new Map();           // termId -> last-checked signature
+const _texPreflightBusy = new Set();          // termIds with an in-flight request
+
+function _texCodeOf(node) {
+    const w = (node.widgets || []).find(w => w.name === "code");
+    return typeof w?.value === "string" ? w.value : "";
+}
+
+// Serialize a chain's fusability-relevant shape (codes + wiring) so preflight
+// only re-runs when the structure actually changes — not on every pan/repaint.
+function _texChainSig(chain) {
+    return chain.map(n => {
+        const up = _texSingleWiredInput(n);
+        return n.id + ":" + _texCodeOf(n).length + ":" + (up ? up.bindingName : "-");
+    }).join("|") + "#" + chain.map(n => _texCodeOf(n)).join("\x00");
+}
+
+// Build the preflight spec (source-first stages + terminal code) from live node
+// widgets — mirrors _texCollapseOne's payload but at draw time (no prompt dict).
+function _texPreflightSpec(chain) {
+    const upstream = chain.slice(0, -1);
+    const terminal = chain[chain.length - 1];
+    const stages = [];
+    for (const n of upstream) {
+        const wi = _texSingleWiredInput(n);
+        if (!wi) return null;
+        stages.push({ code: _texCodeOf(n), image_input: wi.bindingName,
+                      params: _texParamWidgets(n) });
+    }
+    const termUp = _texSingleWiredInput(terminal);
+    if (!termUp) return null;
+    return { stages, terminal_image_input: termUp.bindingName,
+             terminal_code: _texCodeOf(terminal) };
+}
+
+// Debounced-per-signature preflight of one chain. Never throws; a network/route
+// error simply leaves the bubble in its neutral (fusable) state.
+function _texMaybePreflight(chain) {
+    if (!_texPreflightEnabled) return;
+    const termId = chain[chain.length - 1].id;
+    let sig;
+    try { sig = _texChainSig(chain); } catch (e) { return; }
+    if (_texPreflightSig.get(termId) === sig || _texPreflightBusy.has(termId)) return;
+    const spec = (() => { try { return _texPreflightSpec(chain); } catch (e) { return null; } })();
+    if (!spec) return;
+    _texPreflightSig.set(termId, sig);
+    _texPreflightBusy.add(termId);
+    fetch("/tex_wrangle/chain_preflight", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(spec),
+    }).then(r => r.json()).then(res => {
+        _texPreflight.set(termId, res);
+        app.canvas?.setDirty(true, true);   // repaint the bubble with the verdict
+    }).catch(() => { /* endpoint absent / offline → neutral bubble */ })
+      .finally(() => _texPreflightBusy.delete(termId));
+}
+
 function _texRoundRect(ctx, x, y, w, h, r) {
     if (typeof ctx.roundRect === "function") { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); return; }
     ctx.beginPath();
@@ -2363,6 +2423,7 @@ function _texPointInConvex(pts, x, y) {
 
 // Compile-block accent colour, shared by the fill, stroke, and hover label.
 const BUBBLE_COLOR = "#4FC3F7";
+const BUBBLE_ERROR_COLOR = "#EF5350";   // Q-5: red bubble for an unfusable chain
 
 // Per-frame cache of the visible bubbles (shape + label), populated by
 // _texDrawBubbles on the background pass and read by the hover-label foreground
@@ -2388,6 +2449,11 @@ function _texDrawBubbles(ctx) {
     const alpha = app.canvas?.editor_alpha ?? 1;
     const pad = 16;
     for (const chain of chains) {
+        // Q-5: debounced preflight of this chain (validates fusability + stats).
+        _texMaybePreflight(chain);
+        const termId = chain[chain.length - 1].id;
+        const pf = _texPreflight.get(termId);
+        const bad = pf && pf.ok === false;
         // Padded corner points of every node (title bar included) + the group's
         // bounding box (used for the rectangle fallback and label placement).
         const pts = [];
@@ -2402,17 +2468,28 @@ function _texDrawBubbles(ctx) {
         const useHull = _texHullShape && pts.length >= 3;
         const poly = useHull ? _texConvexHull(pts)
             : [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }];
+        const color = bad ? BUBBLE_ERROR_COLOR : BUBBLE_COLOR;
         ctx.save();
         if (useHull) _texRoundedPolyPath(ctx, poly, 18);
         else _texRoundRect(ctx, x0, y0, x1 - x0, y1 - y0, 12);
-        ctx.globalAlpha = 0.10 * alpha; ctx.fillStyle = BUBBLE_COLOR; ctx.fill();
-        ctx.globalAlpha = 0.6 * alpha; ctx.strokeStyle = BUBBLE_COLOR;
-        ctx.lineWidth = 1; ctx.setLineDash([]);   // fine, continuous line
+        ctx.globalAlpha = (bad ? 0.14 : 0.10) * alpha; ctx.fillStyle = color; ctx.fill();
+        ctx.globalAlpha = 0.6 * alpha; ctx.strokeStyle = color;
+        ctx.lineWidth = 1; ctx.setLineDash(bad ? [6, 4] : []);
         ctx.stroke();
         ctx.restore();
         if (poly.length >= 3) {
-            _texBubbleCache.push({ hull: poly, text: `TEX fused · ${chain.length} stages · 1 cook`,
-                                   lx: x0 + 10, ly: y0 - 6 });
+            // Q-5 HUD: red bubble names the blocking reason; green bubble shows
+            // the fused stage count and (when preflight reported it) the op count.
+            let text;
+            if (bad) {
+                const where = (pf.stage_of_error != null) ? ` (node #${chain[pf.stage_of_error]?.id ?? "?"})` : "";
+                text = `⚠ chain not fusable${where}: ${pf.error}`;
+            } else {
+                const ops = pf?.stats?.tensor_ops;
+                text = `TEX fused · ${chain.length} stages · 1 cook`
+                     + (ops != null ? ` · ~${ops} ops` : "");
+            }
+            _texBubbleCache.push({ hull: poly, text, lx: x0 + 10, ly: y0 - 6 });
         }
     }
 }
@@ -2553,6 +2630,7 @@ app.registerExtension({
         _texFusionEnabled = app.ui.settings.getSettingValue("TEX.Fusion.enabled", true);
         _texShowBubble    = app.ui.settings.getSettingValue("TEX.Fusion.showBubble", true);
         _texHullShape     = app.ui.settings.getSettingValue("TEX.Fusion.bubbleHull", true);
+        _texPreflightEnabled = app.ui.settings.getSettingValue("TEX.Fusion.preflight", true);
 
         app.ui.settings.addSetting({
             id:           "TEX.Fusion.enabled",
@@ -2583,6 +2661,17 @@ app.registerExtension({
             type:         "boolean",
             defaultValue: true,
             onChange(val) { _texHullShape = val; app.canvas?.setDirty(true, true); },
+        });
+
+        app.ui.settings.addSetting({
+            id:           "TEX.Fusion.preflight",
+            name:         "TEX Fusion: Preflight chains + HUD",
+            tooltip:      "Validate a linked TEX chain's fusability as you edit (a red " +
+                          "dashed bubble names the blocking node/reason before you queue), " +
+                          "and show the fused stage count and op count on the bubble.",
+            type:         "boolean",
+            defaultValue: true,
+            onChange(val) { _texPreflightEnabled = val; app.canvas?.setDirty(true, true); },
         });
 
         // ── Compile-block bubble: shape behind nodes (onDrawBackground), label

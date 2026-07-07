@@ -17,8 +17,9 @@ function specializations (pow, luma, clamp, etc.).
 from __future__ import annotations
 
 import math
+import os
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -33,6 +34,7 @@ from ..tex_compiler.ast_nodes import (
     BindingIndexAccess, BindingSampleAccess,
     try_extract_static_range,
     collect_assigned_vars,
+    iter_child_nodes as _ast_iter_child_nodes,
 )
 from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
 from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
@@ -58,6 +60,18 @@ class _CgContinue(Exception):
 # Operators that map directly to Python infix ops
 _INFIX_OPS = {"+", "-", "*"}
 
+# M-5: infix op → in-place torch function for `out=` temp reuse.
+_INFIX_OUT_FN = {"+": "add", "-": "sub", "*": "mul"}
+
+# M-5: reuse a dead, freshly-allocated arithmetic temp as the `out=` target of
+# the next elementwise op, saving one allocator call per fused arithmetic node.
+# Legality (verified): the reused buffer is a codegen `_tN` produced by this same
+# method (never a binding/builtin/literal/user-var/view), same-shape (no
+# broadcast), single-use (the AST is a tree; CSE-shared exprs become Identifiers,
+# which are excluded), and per-call (not a cross-execute ring). Kill switch:
+# TEX_CODEGEN_NO_OUT_REUSE=1.
+_OUT_REUSE_ENABLED = os.environ.get("TEX_CODEGEN_NO_OUT_REUSE") != "1"
+
 # Comparison operators
 _CMP_OPS = {
     "==": "==", "!=": "!=", "<": "<", ">": ">", "<=": "<=", ">=": ">=",
@@ -69,7 +83,55 @@ _IMG_REDUCE_OPS = {
 }
 
 
-def try_compile(program: Program, type_map: dict[int, TEXType]) -> Any | None:
+import linecache as _linecache
+from collections import deque as _deque
+
+# Bounded set of registered codegen pseudo-filenames, pruned oldest-first so
+# linecache can't grow without bound across a long session.
+_LINECACHE_KEYS: "_deque[str]" = _deque()
+_LINECACHE_MAX = 64
+
+
+def _cg_filename(fingerprint: str) -> str:
+    """The pseudo-filename for a fingerprinted codegen module — must match
+    between build() and materialize_codegen() so linecache keys line up."""
+    return f"<tex_codegen_{fingerprint[:16]}>"
+
+
+def _register_codegen_linecache(filename: str, src: str) -> None:
+    """Register generated source with linecache (for diagnostics / getsource),
+    pruning the oldest entry when over the cap. Deterministic filenames repeat,
+    so skip re-registering (and re-queuing) an already-present key."""
+    if filename in _linecache.cache:
+        return
+    _linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)
+    _LINECACHE_KEYS.append(filename)
+    while len(_LINECACHE_KEYS) > _LINECACHE_MAX:
+        _linecache.cache.pop(_LINECACHE_KEYS.popleft(), None)
+
+
+def materialize_codegen(blob: bytes, src: str, has_fn_calls: bool,
+                        fingerprint: str) -> Any:
+    """Rebuild a codegen fn from a marshalled MODULE code object (PC-3).
+
+    The caller is responsible for validating the blob (version/MAGIC/SHA) before
+    calling this — marshal.loads on corrupted bytes can hard-crash the process.
+    """
+    import marshal
+    code_obj = marshal.loads(blob)
+    filename = _cg_filename(fingerprint)
+    _register_codegen_linecache(filename, src)
+    namespace: dict[str, Any] = {}
+    exec(code_obj, namespace)
+    fn = namespace["_tex_fn"]
+    fn._has_fn_calls = has_fn_calls
+    fn._tex_code = code_obj
+    fn._tex_src = src
+    return fn
+
+
+def try_compile(program: Program, type_map: dict[int, TEXType],
+                fingerprint: str | None = None) -> Any | None:
     """Try to compile a TEX program AST to a Python function.
 
     Returns a callable with signature:
@@ -77,11 +139,15 @@ def try_compile(program: Program, type_map: dict[int, TEXType]) -> Any | None:
 
     The function mutates env and bindings dicts in-place.
     Returns None if the program uses unsupported features.
+
+    *fingerprint* (when given) makes the compiled code object reproducible so
+    it can be marshalled and persisted (PC-3). The returned fn carries
+    `_tex_code` / `_tex_src` for that persistence.
     """
     try:
         gen = _CodeGen(type_map)
         gen.emit_program(program)
-        fn = gen.build()
+        fn = gen.build(fingerprint)
         # Attach metadata: whether the generated code has stdlib function calls.
         # Programs with fn calls have graph breaks that make torch.compile slower.
         fn._has_fn_calls = bool(gen._fn_locals)
@@ -157,20 +223,9 @@ _SPATIAL_STDLIB: frozenset[str] = frozenset((
 ))
 
 
-def _iter_child_nodes(node: ASTNode):
-    """Yield the direct AST children of `node` (descending into list fields).
-
-    Generic dataclass-field walk shared by the AST walkers, so new node types
-    or fields can't silently drift out of any single hand-written traversal.
-    """
-    for f in fields(node):
-        val = getattr(node, f.name)
-        if isinstance(val, ASTNode):
-            yield val
-        elif isinstance(val, list):
-            for x in val:
-                if isinstance(x, ASTNode):
-                    yield x
+# Shared memoized AST child-iterator lives in ast_nodes (CG-1); alias kept for
+# the many call sites in this module.
+_iter_child_nodes = _ast_iter_child_nodes
 
 
 def _collect_reassigned_bindings(program: Program) -> set[str]:
@@ -621,6 +676,39 @@ def _collect_local_defs(stmts: list[ASTNode], local_defs: dict[str, ASTNode]) ->
             if not (isinstance(stmt.value, BinOp) and stmt.value.op == "+"
                     and _is_ident(stmt.value.left, stmt.target.name)):
                 local_defs[stmt.target.name] = stmt.value
+
+
+def _iter_for_loops(stmts: list[ASTNode]):
+    """Yield every ForLoop node in a statement tree (nested included)."""
+    stack = list(stmts)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, ForLoop):
+            yield n
+        stack.extend(_iter_child_nodes(n))
+
+
+def detect_stencil_route(program: Program) -> bool:
+    """UC-2: True iff this program should be default-routed through the codegen
+    tier for stencil lowering. Routes only when it contains at least one EXACT
+    (fetch-based / conv2d) stencil and NO sample-based stencil — the sample-based
+    avg_pool2d lowering diverges from the interpreter's sub-pixel grid_sample
+    (~25·r/W), so those stay opt-in. Uses codegen's own detectors, so the query
+    sees exactly what emission would lower."""
+    has_exact = False
+    stmts = program.statements
+    for idx in range(len(stmts)):
+        inline = _try_detect_inline_stencil(stmts, idx)
+        if inline is not None and inline.is_fetch:
+            has_exact = True
+    for loop in _iter_for_loops(stmts):
+        st = _try_detect_stencil(loop)
+        if st is not None:
+            if st.is_fetch:
+                has_exact = True
+            else:
+                return False  # sample-based stencil → lowering would diverge
+    return has_exact
 
 
 def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
@@ -1235,8 +1323,7 @@ def _try_detect_inline_stencil(stmts: list[ASTNode], start: int
 class _CodeGen:
     """Generates Python source code from a TEX AST."""
 
-    _codegen_counter: int = 0  # class-level counter for unique filenames
-    _LINECACHE_KEEP: int = 64  # max linecache entries to prevent unbounded growth
+    _codegen_counter: int = 0  # class-level counter for unique (no-fingerprint) filenames
 
     def __init__(self, type_map: dict[int, TEXType]):
         self.type_map = type_map
@@ -1253,6 +1340,13 @@ class _CodeGen:
         # copy-on-write clone. Conservatively invalidated on ANY read (a read may
         # produce a view that shares storage) and never carried across control flow.
         self._owned: set[str] = set()
+        # M-5: codegen `_tN` temps currently holding a freshly-allocated,
+        # contiguous, exclusively-owned, single-use tensor — eligible to be the
+        # `out=` target of the next elementwise op. Populated ONLY by
+        # _emit_binop's own arithmetic results (the analysis stays local; every
+        # stdlib/channel/identifier result is treated as possibly a view and is
+        # never added). Never carried across control-flow boundaries.
+        self._fresh_temps: set[str] = set()
         # Local variable mapping: TEX var name → Python local var name.
         # When set, Identifier emission uses locals instead of _env[name].
         self._local_vars: dict[str, str] = {}
@@ -1562,8 +1656,13 @@ class _CodeGen:
         # (inside _emit_for) still happen so that subsequent statements
         # can see loop-modified vars via _env when they aren't locals.
 
-    def build(self) -> Any:
-        """Compile the generated source to a callable function."""
+    def build(self, fingerprint: str | None = None) -> Any:
+        """Compile the generated source to a callable function.
+
+        When *fingerprint* is given, the pseudo-filename is derived from it so
+        the compiled module code object (and its marshalled blob) is
+        reproducible across processes — the basis for PC-3 disk persistence.
+        """
         preamble = "\n".join(self._preamble)
         body = "\n".join(self._lines)
         # Hoisted constants go before the main body so they're available
@@ -1575,26 +1674,29 @@ class _CodeGen:
             "_CgBreak, _CgContinue):\n"
             f"{func_body}\n"
         )
-        # Use a unique pseudo-filename so TorchInductor/linecache can find the source
-        _CodeGen._codegen_counter += 1
-        filename = f"<tex_codegen_{_CodeGen._codegen_counter}>"
+        if fingerprint is not None:
+            filename = _cg_filename(fingerprint)
+        else:
+            _CodeGen._codegen_counter += 1
+            filename = f"<tex_codegen_{_CodeGen._codegen_counter}>"
         namespace: dict[str, Any] = {}
         code_obj = compile(func_src, filename, "exec")
-        # Register source with linecache so torch.compile can read it for tracing.
-        # Prune old entries to prevent unbounded linecache growth in long sessions.
-        import linecache
-        stale = _CodeGen._codegen_counter - _CodeGen._LINECACHE_KEEP
-        if stale > 0:
-            linecache.cache.pop(f"<tex_codegen_{stale}>", None)
-        linecache.cache[filename] = (
-            len(func_src), None, func_src.splitlines(True), filename,
-        )
+        _register_codegen_linecache(filename, func_src)
         exec(code_obj, namespace)
-        return namespace["_tex_fn"]
+        fn = namespace["_tex_fn"]
+        # Stash the module code object + source for PC-3 marshal persistence.
+        fn._tex_code = code_obj
+        fn._tex_src = func_src
+        return fn
 
     # ── Statement emission ──────────────────────────────────────────────
 
     def _emit_stmt(self, stmt: ASTNode):
+        # M-5: fresh-temp reuse is scoped to a single statement's expression
+        # tree. Clearing here guarantees a temp is never offered as an out=
+        # target after it may have escaped into a var target on the previous
+        # statement, nor carried across a control-flow boundary.
+        self._fresh_temps.clear()
         if isinstance(stmt, VarDecl):
             self._emit_var_decl(stmt)
         elif isinstance(stmt, Assignment):
@@ -1974,7 +2076,7 @@ class _CodeGen:
 
         # Collect all vars declared anywhere in function body (including nested blocks)
         body_vars, _ = self._collect_modified_vars(stmt.body)
-        for vname in body_vars:
+        for vname in sorted(body_vars):  # sorted → deterministic local naming order
             if vname not in self._local_vars:  # don't overwrite params
                 self._local_vars[vname] = f"_uf_lv_{vname}"
 
@@ -2158,8 +2260,11 @@ class _CodeGen:
         # Collect modified variables (same analysis as interpreter)
         then_mods = self._collect_modified_vars(stmt.then_body)
         else_mods = self._collect_modified_vars(stmt.else_body) if stmt.else_body else (set(), set())
-        all_env_mods = then_mods[0] | else_mods[0]
-        all_bind_mods = then_mods[1] | else_mods[1]
+        # Sort to lists so emission order (and the repr() baked into source below)
+        # is deterministic across processes — set iteration is PYTHONHASHSEED-
+        # dependent, which breaks cross-process byte-identity of cached codegen.
+        all_env_mods = sorted(then_mods[0] | else_mods[0])
+        all_bind_mods = sorted(then_mods[1] | else_mods[1])
 
         if not all_env_mods and not all_bind_mods:
             # Nothing modified — just execute both branches for side effects
@@ -2714,6 +2819,15 @@ class _CodeGen:
         if stencil is None:
             return False
 
+        # UC-2: only lower EXACT (fetch-based) stencils. The sample-based
+        # avg_pool/max_pool lowering diverges from the interpreter's sub-pixel
+        # grid_sample (~25·r/W); `detect_stencil_route` already keeps them off the
+        # DEFAULT path, but a direct codegen caller (compile_mode="auto"/
+        # "torch_compile") bypasses that gate, so refuse the lowering here too and
+        # fall through to the bit-exact per-sample codegen.
+        if not stencil.is_fetch:
+            return False
+
         if stencil.kind == "box":
             return self._emit_box_stencil(stencil)
         elif stencil.kind == "minmax":
@@ -2753,9 +2867,11 @@ class _CodeGen:
         # local Python variables instead of _env[name] dict lookups.
         modified_vars, _ = self._collect_modified_vars(stmt.body)
         read_vars = self._collect_read_vars(stmt.body)
-        all_vars = modified_vars | read_vars
-        all_vars.add(loop_var)
-        writeback_vars = modified_vars | {loop_var}
+        # Sorted lists so per-var emission order is deterministic across processes
+        # (set iteration is PYTHONHASHSEED-dependent — breaks cached-codegen
+        # byte-identity). modified_vars stays a set for the O(1) membership tests.
+        all_vars = sorted(modified_vars | read_vars | {loop_var})
+        writeback_vars = sorted(modified_vars | {loop_var})
 
         # Register local variables for all vars used in this loop.
         # If a var is already a local (from an outer loop), reuse its name.
@@ -2814,7 +2930,7 @@ class _CodeGen:
 
         if use_scalar:
             # Convert scalar results back to tensors for downstream code
-            for vname in modified_vars:
+            for vname in sorted(modified_vars):  # deterministic emission order
                 local = self._local_vars.get(vname)
                 if local is not None:
                     self._emit(f"if not _torch.is_tensor({local}): {local} = _torch.scalar_tensor(float({local}), dtype=_torch.float32, device=_dev)")
@@ -3145,6 +3261,28 @@ class _CodeGen:
                     self._emit(f"{tmp} = _torch.matmul({left}, {right}.unsqueeze(-1)).squeeze(-1)")
                 return tmp
 
+        # M-5: reuse a dead fresh arithmetic temp as the out= target when the
+        # OTHER operand is a compile-time scalar constant (NumberLiteral). A
+        # scalar broadcasts INTO the fresh temp natively, so result.shape ==
+        # fresh-temp.shape regardless of the temp's spatial-ness — provably
+        # shape-safe. Handled BEFORE _bp so the dominant color-grade `vec*k ± j`
+        # pattern (whose operands _bp would otherwise reassign to view temps)
+        # actually reuses; native torch broadcasting matches _bp bit-for-bit for
+        # scalar⊗tensor. Single-use is guaranteed (fresh temps come only from
+        # this method's own results; CSE-shared exprs are Identifiers, excluded).
+        if _OUT_REUSE_ENABLED and node.op in _INFIX_OUT_FN:
+            target = None
+            if left in self._fresh_temps and isinstance(node.right, NumberLiteral):
+                target = left
+            elif right in self._fresh_temps and isinstance(node.left, NumberLiteral):
+                target = right
+            if target is not None:
+                self._fresh_temps.discard(left)
+                self._fresh_temps.discard(right)
+                self._emit(f"_torch.{_INFIX_OUT_FN[node.op]}({left}, {right}, out={target})")
+                self._fresh_temps.add(target)  # result buffer stays owned+fresh
+                return target
+
         # Check if broadcasting is needed (scalar vs vector mixed)
         needs_broadcast = False
         needs_channel_pad = False
@@ -3212,6 +3350,8 @@ class _CodeGen:
 
         if op in _INFIX_OPS:
             self._emit(f"{tmp} = ({left} {op} {right})")
+            self._fresh_temps.difference_update((left, right))
+            self._fresh_temps.add(tmp)  # fresh contiguous elementwise result
         elif op == "/":
             # Skip safe-divisor guard when divisor is a non-zero compile-time constant
             if isinstance(node.right, NumberLiteral) and node.right.value != 0:
@@ -3219,6 +3359,8 @@ class _CodeGen:
             else:
                 sd = self._emit_safe_divisor(right)
                 self._emit(f"{tmp} = ({left} / {sd})")
+            self._fresh_temps.difference_update((left, right))
+            self._fresh_temps.add(tmp)
         elif op == "%":
             if isinstance(node.right, NumberLiteral) and node.right.value != 0:
                 self._emit(f"{tmp} = _torch.fmod({left}, {right})")

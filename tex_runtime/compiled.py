@@ -161,15 +161,113 @@ _backend_status: dict[tuple[str, str], bool | None] = {}
 _route_memo: "_OrderedDict[str, tuple[int, int]]" = _OrderedDict()
 _ROUTE_MEMO_MAX = 256
 
-# Codegen-only flat functions: fingerprint -> cg_fn. A None value means
-# "codegen unsupported for this program" — skip re-attempting emit+exec on
-# every frame. cg_fn captures no device/precision/bindings (everything is
-# passed per call), so the fingerprint alone is a sufficient key.
-_cg_only_cache: "_OrderedDict[str, Callable | None]" = _OrderedDict()
-_CG_ONLY_CACHE_MAX = 64
-
 # One-time log messages (avoid spamming the console)
 _warnings_shown: set[str] = set()
+
+
+def _precompile_ctx():
+    """Context manager enabling dynamo's persistent precompile cache (PC-2),
+    scoped so the process-global flag is only held around dynamo entry on the
+    compile worker thread. No-op when unsupported."""
+    try:
+        import torch._dynamo.config as _dc
+        if hasattr(_dc, "caching_precompile"):
+            return _dc.patch(caching_precompile=True)
+    except Exception:
+        pass
+    import contextlib
+    return contextlib.nullcontext()
+
+
+# Error signatures that mean a persisted precompile entry failed to ATTACH
+# (stale/corrupt/shape- or version-mismatched) rather than the program being
+# genuinely uncompilable. These must NOT blacklist the fingerprint — instead the
+# stale dynamo store is cleared so the next run recompiles fresh (PC-2).
+def _is_precompile_attach_failure(e: Exception) -> bool:
+    name = type(e).__name__
+    msg = str(e)
+    if name == "AssertionError":
+        return True  # guard miss after attach (incl. first-call shape != saved)
+    if name == "NameError" and "__compiled_fn_" in msg:
+        return True  # same-position source-body edit / stale bytecode
+    if "Compile package was created with a different" in msg:
+        return True  # torch/CUDA/GPU/triton version mismatch (SystemInfo check)
+    return False
+
+
+def _clear_dynamo_precompile_store() -> None:
+    """Delete the persisted dynamo precompile subdir so a poisoned/stale entry
+    can't crash every later session (PC-2 recovery)."""
+    try:
+        import shutil
+        from pathlib import Path
+        root = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+        if not root:
+            return
+        # PC-2 safety: only clear a TEX-OWNED store. A user (or another custom
+        # node) may point TORCHINDUCTOR_CACHE_DIR at a shared dir — deleting its
+        # dynamo/ would wipe every tool's precompile entries on one TEX failure.
+        try:
+            from ..tex_cache import get_cache
+            owned = get_cache().torch_compile_cache_dir.resolve()
+            rp = Path(root).resolve()
+            if rp != owned and owned not in rp.parents:
+                return  # foreign dir — leave it untouched
+        except Exception:
+            return  # can't prove ownership → don't delete
+        d = os.path.join(root, "dynamo")
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
+
+
+# UC-2: fingerprint -> whether the program should default-route to the codegen
+# tier for stencil lowering (exact/fetch stencils only). Memoized: detection is
+# a full AST walk, run once per program.
+_stencil_route_memo: "_OrderedDict[str, bool]" = _OrderedDict()
+
+
+def should_stencil_route(fingerprint: str, program: Any) -> bool:
+    """UC-2 gate (memoized per fingerprint): route the default cook through the
+    codegen tier when the program has an exact stencil the lowering accelerates."""
+    v = _stencil_route_memo.get(fingerprint)
+    if v is None:
+        try:
+            from .codegen import detect_stencil_route
+            v = bool(detect_stencil_route(program))
+        except Exception:
+            v = False
+        _stencil_route_memo[fingerprint] = v
+        while len(_stencil_route_memo) > _ROUTE_MEMO_MAX:
+            _stencil_route_memo.popitem(last=False)
+    else:
+        _stencil_route_memo.move_to_end(fingerprint)
+    return v
+
+
+def _get_or_make_codegen_fn(program: Any, type_map: dict | None,
+                            fingerprint: str | None):
+    """Return the codegen flat fn for a program, or None if unsupported.
+
+    Unified accessor for both codegen consumers (_codegen_only_execute and
+    _try_compile). The fingerprinted result — the materialized fn or an
+    "unsupported" sentinel — is memoized and marshal-persisted by TEXCache
+    (PC-3), so re-executions and process restarts skip emit+compile()+exec().
+    cg_fn captures no device/precision/bindings (all passed per call), so the
+    fingerprint alone is a sufficient key.
+    """
+    from ..tex_cache import get_cache, _CG_UNSUPPORTED
+    cache = get_cache() if fingerprint is not None else None
+    cg_fn = cache.get_codegen_fn(fingerprint) if cache is not None else None
+    if cg_fn is None:  # not yet generated (or no fingerprint) — emit now
+        try:
+            cg_fn = _try_codegen(program, type_map, fingerprint)
+        except Exception:
+            cg_fn = None
+        if cache is not None:
+            cache.store_codegen_fn(fingerprint, cg_fn)
+    return None if cg_fn is _CG_UNSUPPORTED else cg_fn
 
 # Persistent single-thread worker for the torch.compile lifecycle.
 # A long-lived worker provides the same dynamo-TLS isolation as a fresh pool
@@ -196,6 +294,72 @@ def _show_once(key: str, msg: str, level: str = "info"):
     if key not in _warnings_shown and len(_warnings_shown) < _WARNINGS_SHOWN_CAP:
         _warnings_shown.add(key)
         getattr(logger, level)(msg)
+
+
+def _maybe_triton_hint(err_str_lower: str, device_type: str) -> None:
+    """CC-1: surface the Triton-on-Windows community-wheel pin when a CUDA
+    inductor compile fails for lack of Triton. Must be called from BOTH the
+    torch.compile() WRAP except AND the first-CALL execution except: on the target
+    config (torch 2.10, CUDA, no Triton) the wrap succeeds and TritonMissing only
+    surfaces at first invocation, so a hint living only at the wrap is dead code."""
+    if device_type == "cuda" and "triton" in err_str_lower:
+        _tv = torch.__version__.split("+")[0]
+        _pin = '"triton-windows<3.7"' if _tv.startswith("2.10") else "triton-windows"
+        _show_once(
+            "triton_hint",
+            f"[TEX] CUDA torch.compile needs Triton. On Windows install the "
+            f"community wheel matched to torch {_tv}:  pip install {_pin}  "
+            f"(enable the Windows LongPathsEnabled registry key too). Falling "
+            f"back to CUDA-graph / interpreter for now.",
+            level="warning",
+        )
+
+
+def _ensure_inductor_cache_dir() -> None:
+    """Point TorchInductor's on-disk cache at TEX's owned cache dir.
+
+    `torch._inductor.config.cache_dir` does NOT exist on torch 2.10 — assigning
+    it raises AttributeError, so the previous wiring silently left inductor
+    writing to %TEMP% (lost to cleanup, invisible to clear_all). The supported,
+    dynamically-read control is the TORCHINDUCTOR_CACHE_DIR env var; a pre-set
+    value (ours from an earlier call, or a user/ComfyUI override) is respected,
+    which also makes this idempotent.
+    """
+    if "TORCHINDUCTOR_CACHE_DIR" in os.environ:
+        return
+    try:
+        from ..tex_cache import get_cache, _CACHE_VERSION
+        # Version the dir by cache-version + torch build so a TEX or torch
+        # upgrade starts from a clean inductor/dynamo store (PC-2). The parent
+        # torch_compile/ is still what clear_all() removes.
+        ver = f"{_CACHE_VERSION}_{torch.__version__.split('+')[0].replace('.', '')}"
+        parent = get_cache().torch_compile_cache_dir
+        tc_dir = str(parent / ver)
+        os.makedirs(tc_dir, exist_ok=True)
+        # PC-1: a TEX or torch upgrade mints a new {ver} subdir; the old one
+        # (30–60 MB/program of inductor artifacts) would otherwise accumulate
+        # forever. Sweep sibling version dirs that don't match the current tag.
+        # Runs once per process (the env guard above makes this idempotent).
+        try:
+            import shutil
+            for child in parent.iterdir():
+                if child.is_dir() and child.name != ver:
+                    shutil.rmtree(child, ignore_errors=True)
+        except Exception:
+            pass
+        # cl.exe fails with C1083 (and torch.compile can escalate to an uncaught
+        # AssertionError during precompile attach) when the cache path approaches
+        # ~185 chars. Warn on deep installs so the user can enable Windows long
+        # paths (same registry fix triton-windows documents).
+        if os.name == "nt" and len(tc_dir) > 130:
+            _show_once("inductor_cache_longpath",
+                       f"[TEX] torch.compile cache path is {len(tc_dir)} chars deep; if "
+                       "compiles fail with 'fatal error C1083', enable Windows long-path "
+                       "support (LongPathsEnabled registry key).",
+                       level="warning")
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = tc_dir
+    except Exception:
+        pass  # Not critical — torch falls back to its default cache location.
 
 
 _OP_TYPES = (BinOp, UnaryOp, TernaryOp, FunctionCall,
@@ -343,12 +507,7 @@ def execute_compiled(
     # Ensure tensor bindings are contiguous — Inductor's codegen can
     # fail on non-contiguous strides (e.g. BHWC images loaded with
     # stride patterns like [1090020, 2220, 3, 1]).
-    contiguous_bindings = {}
-    for k, v in bindings.items():
-        if isinstance(v, torch.Tensor) and not v.is_contiguous():
-            contiguous_bindings[k] = v.contiguous()
-        else:
-            contiguous_bindings[k] = v
+    contiguous_bindings = _contiguous_bindings(bindings)
 
     # Run the ENTIRE torch.compile lifecycle in an ISOLATED THREAD.
     #
@@ -365,11 +524,16 @@ def execute_compiled(
         """Compile (if needed) and execute — all on this worker thread."""
         nonlocal compile_error
         try:
-            with torch.inference_mode():
+            # caching_precompile persists dynamo entries under
+            # TORCHINDUCTOR_CACHE_DIR so a warm restart skips most of the compile
+            # (PC-2). Scoped to this worker so the process-global flag is never
+            # held across another node's cook.
+            with _precompile_ctx(), torch.inference_mode():
                 # Get or create the compiled callable (on THIS thread)
                 if cache_key not in _compiled_cache:
                     entry = _try_compile(device_type, program, type_map,
-                                         used_builtins=used_builtins, precision=precision)
+                                         used_builtins=used_builtins, precision=precision,
+                                         fingerprint=fingerprint)
                     if entry is None:
                         # No backend available — run plain interpreter here
                         return _plain_execute(program, contiguous_bindings, type_map,
@@ -420,15 +584,33 @@ def execute_compiled(
         # unavailable so the next run cascades (inductor -> cudagraphs on
         # CUDA) instead of blacklisting every new fingerprint.
         _lower = _emsg.lower()
+        _errname = type(compile_error).__name__
+        # CC-1: a missing backend toolchain surfaces at FIRST CALL. It may be a
+        # BackendCompilerFailed OR a bare TritonMissing / RuntimeError naming
+        # triton/cl.exe — either way it is a (backend, device) property, so mark
+        # the backend down (→ cascade to cudagraphs/interpreter) rather than
+        # blacklisting this one fingerprint.
         backend_unavailable = (
-            type(compile_error).__name__ == "BackendCompilerFailed"
-            and failed_backend in ("inductor", "cudagraphs")
+            failed_backend in ("inductor", "cudagraphs")
+            and (_errname == "BackendCompilerFailed" or "triton" in _errname.lower())
             and ("triton" in _lower or "cl.exe" in _lower
                  or "cl is not found" in _lower)
         )
+        # Surface the actionable Triton pin at the point the failure actually
+        # occurs (the wrap-time hint in _try_compile is dead on this config).
+        _maybe_triton_hint(_lower, device_type)
+        precompile_attach_failed = _is_precompile_attach_failure(compile_error)
+        if precompile_attach_failed:
+            # A persisted precompile entry failed to attach (stale/corrupt/shape-
+            # or version-mismatch). Clear the dynamo store and recompile fresh
+            # next run — do NOT blacklist (the program is fine); PC-2 recovery.
+            _clear_dynamo_precompile_store()
+            _show_once("precompile_recover",
+                       "[TEX] Cleared a stale torch.compile precompile entry; "
+                       "will recompile on the next run.", level="warning")
         if backend_unavailable:
             _backend_status[(failed_backend, device_type)] = False
-        elif not is_user_limit:
+        elif not is_user_limit and not precompile_attach_failed:
             # BackendCompilerFailed can also be program-specific — those (and
             # all other runtime failures) blacklist the fingerprint only.
             _blacklist_add(fingerprint)
@@ -452,6 +634,218 @@ def execute_compiled(
                               used_builtins=used_builtins, precision=precision)
 
     return result
+
+
+# ── CC-2: measured auto-tier orchestration ────────────────────────────────
+# Background compiles in flight, keyed by cache_key. The compile runs on the
+# same TLS-isolated worker; the cook never blocks on future.result().
+_bg_futures: dict = {}
+
+
+def _timed(fn, device_type: str):
+    """Run fn() and return (result, elapsed_ms). CUDA uses an event pair whose
+    end is synchronized (only that event, at the cook boundary — not a device
+    barrier); CPU uses perf_counter."""
+    import time as _time
+    if device_type == "cuda":
+        try:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            out = fn()
+            end.record()
+            end.synchronize()
+            return out, start.elapsed_time(end)
+        except Exception:
+            pass  # fall through to wall-clock
+    t0 = _time.perf_counter()
+    out = fn()
+    return out, (_time.perf_counter() - t0) * 1000.0
+
+
+def _contiguous_bindings(bindings: dict) -> dict:
+    """Normalize tensor bindings to contiguous (inductor/codegen can fail on
+    BHWC stride patterns). Non-tensors and already-contiguous tensors pass
+    through by reference."""
+    return {k: (v.contiguous() if (isinstance(v, torch.Tensor)
+                                   and not v.is_contiguous()) else v)
+            for k, v in bindings.items()}
+
+
+def _cuda_headroom_ok(device_type: str) -> bool:
+    """Only submit a background CUDA compile with comfortable VRAM headroom, so
+    a compile never allocates while another node's inference needs the memory."""
+    if device_type != "cuda":
+        return True
+    try:
+        import comfy.model_management as _mm  # noqa
+        free = _mm.get_free_memory(torch.device("cuda"))
+        return free > 2 * 1024 * 1024 * 1024  # >2 GB
+    except Exception:
+        try:
+            free, _total = torch.cuda.mem_get_info()
+            return free > 2 * 1024 * 1024 * 1024
+        except Exception:
+            return True
+
+
+def _capture_in_flight() -> bool:
+    try:
+        from .graphed import is_capturing
+        return is_capturing()
+    except Exception:
+        return False
+
+
+def _submit_bg_compile(cache_key, program, type_map, device_type,
+                       used_builtins, precision, fingerprint) -> bool:
+    """Submit a compile-only job (populates _compiled_cache) without blocking.
+    Returns True if a job is now in flight (or already was)."""
+    if cache_key in _compiled_cache or cache_key in _bg_futures:
+        return True
+    if fingerprint in _compile_blacklist:
+        return False
+
+    def _compile_only():
+        try:
+            with _precompile_ctx(), torch.inference_mode():
+                if cache_key not in _compiled_cache:
+                    entry = _try_compile(device_type, program, type_map,
+                                         used_builtins=used_builtins,
+                                         precision=precision, fingerprint=fingerprint)
+                    if entry is None:
+                        return "no_backend"
+                    _compiled_cache[cache_key] = entry
+                    if len(_compiled_cache) > _COMPILED_CACHE_MAX:
+                        _compiled_cache.popitem(last=False)
+            return "ok"
+        except Exception:
+            return "failed"
+
+    try:
+        _bg_futures[cache_key] = _COMPILE_POOL.submit(_compile_only)
+        return True
+    except Exception:
+        return False
+
+
+def _bg_status(cache_key) -> str:
+    """'pending' | 'ready' | 'failed' | 'absent'."""
+    fut = _bg_futures.get(cache_key)
+    if fut is None:
+        return "ready" if cache_key in _compiled_cache else "absent"
+    if not fut.done():
+        return "pending"
+    _bg_futures.pop(cache_key, None)
+    try:
+        res = fut.result()
+    except Exception:
+        res = "failed"
+    if res == "ok" and cache_key in _compiled_cache:
+        return "ready"
+    return "failed"
+
+
+def _run_cached_compiled(cache_key, program, bindings, type_map, device,
+                         latent_channel_count, output_names, device_type,
+                         timed):
+    """Run the cached compiled fn on the worker thread (dynamo-TLS isolation is
+    load-bearing even for an already-built artifact — a guard failure can retrace
+    and corrupt the calling thread's TLS). Returns (result, ms) when *timed*, or
+    (result, None) otherwise — the COMMITTED tier skips timing so it never forces
+    a per-cook CUDA sync. Returns (None, None) if the run crashed."""
+    contiguous = _contiguous_bindings(bindings)
+
+    def _worker():
+        with torch.inference_mode():
+            compiled_fn, _b = _compiled_cache[cache_key]
+            call = lambda: compiled_fn(program, contiguous, type_map, device,
+                                       latent_channel_count, output_names)
+            return _timed(call, device_type) if timed else (call(), None)
+
+    try:
+        return _COMPILE_POOL.submit(_worker).result()
+    except Exception:
+        # Crash — demote (do not blacklist forever). Reset dynamo on the calling
+        # thread; the caller routes to codegen-only.
+        _compiled_cache.pop(cache_key, None)
+        try:
+            torch._dynamo.reset()
+        except Exception:
+            pass
+        return None, None
+
+
+def run_auto(program, bindings, type_map, device, fingerprint,
+             latent_channel_count: int = 0, output_names=None,
+             used_builtins=None, precision: str = "fp32"):
+    """CC-2 entry: measure the always-safe codegen baseline, background-compile,
+    trial the compiled fn, and commit only on a measured win. Never blocks on
+    the compile; never routes to a slower tier than codegen-only."""
+    from . import autotier
+    device_obj = torch.device(device)
+    device_type = device_obj.type
+    cache_key = (fingerprint, device_type, precision)
+
+    sp = None
+    for v in bindings.values():
+        if isinstance(v, torch.Tensor) and v.dim() >= 3:
+            sp = (v.shape[0], v.shape[1], v.shape[2])
+            break
+    key = autotier.make_key(fingerprint, device_type, precision, sp)
+    autotier.seed_from_disk(key)
+    state = autotier.verdict(key)
+
+    def _codegen(bind):
+        return _codegen_only_execute(program, bind, type_map, device,
+                                     latent_channel_count, output_names,
+                                     used_builtins=used_builtins,
+                                     precision=precision, fingerprint=fingerprint)
+
+    # Terminal: rejected → always-safe codegen; committed → cached compiled.
+    if state == autotier.REJECTED:
+        return _codegen(bindings)
+    if state == autotier.COMMITTED and cache_key in _compiled_cache:
+        # Terminal — skip timing (no per-cook CUDA sync; the verdict is frozen).
+        res, _ = _run_cached_compiled(cache_key, program, bindings, type_map,
+                                      device, latent_channel_count,
+                                      output_names, device_type, timed=False)
+        if res is None:
+            autotier.record_trial(key, None)  # demote to rejected
+            return _codegen(bindings)
+        return res
+    # Committed but artifact gone (restart w/o PC-2 persistence, or evicted):
+    # re-establish by trialling again this cook.
+    if state == autotier.COMMITTED:
+        autotier.mark_ready(key)
+        state = autotier.TRIAL
+
+    if state == autotier.TRIAL and cache_key in _compiled_cache:
+        res, ms = _run_cached_compiled(cache_key, program, bindings, type_map,
+                                       device, latent_channel_count,
+                                       output_names, device_type, timed=True)
+        if res is None:
+            autotier.record_trial(key, None)
+            return _codegen(bindings)
+        autotier.record_trial(key, ms)
+        return res
+
+    # MEASURING or COMPILING (or TRIAL with a lost artifact): run the codegen
+    # baseline, timed, and advance the state machine off the hot path.
+    res, ms = _timed(lambda: _codegen(bindings), device_type)
+    autotier.record_interp(key, ms)
+    if state == autotier.MEASURING and autotier.should_submit_compile(key):
+        if _cuda_headroom_ok(device_type) and not _capture_in_flight():
+            if _submit_bg_compile(cache_key, program, type_map, device_type,
+                                  used_builtins, precision, fingerprint):
+                autotier.mark_submitted(key)
+    elif state == autotier.COMPILING:
+        st = _bg_status(cache_key)
+        if st == "ready":
+            autotier.mark_ready(key)
+        elif st in ("failed", "absent"):
+            autotier.record_trial(key, None)  # compile failed → reject, stay on codegen
+    return res
 
 
 def _plain_execute(
@@ -561,18 +955,7 @@ def _codegen_only_execute(
     The generated function (or a None "unsupported" sentinel) is memoized per
     fingerprint so re-executions skip the per-frame emit+compile()+exec().
     """
-    if fingerprint is not None and fingerprint in _cg_only_cache:
-        cg_fn = _cg_only_cache[fingerprint]
-        _cg_only_cache.move_to_end(fingerprint)
-    else:
-        try:
-            cg_fn = _try_codegen(program, type_map)
-        except Exception:
-            cg_fn = None
-        if fingerprint is not None:
-            _cg_only_cache[fingerprint] = cg_fn
-            while len(_cg_only_cache) > _CG_ONLY_CACHE_MAX:
-                _cg_only_cache.popitem(last=False)
+    cg_fn = _get_or_make_codegen_fn(program, type_map, fingerprint)
 
     if cg_fn is None:
         return _plain_execute(program, bindings, type_map, device,
@@ -582,12 +965,7 @@ def _codegen_only_execute(
     dev = torch.device(device) if not isinstance(device, torch.device) else device
 
     # Ensure tensor bindings are contiguous (same as torch.compile path)
-    contiguous_bindings = {}
-    for k, v in bindings.items():
-        if isinstance(v, torch.Tensor) and not v.is_contiguous():
-            contiguous_bindings[k] = v.contiguous()
-        else:
-            contiguous_bindings[k] = v
+    contiguous_bindings = _contiguous_bindings(bindings)
 
     env, sp, _ = _build_codegen_env(program, contiguous_bindings, dev, latent_channel_count,
                                     used_builtins=used_builtins, precision=precision)
@@ -616,6 +994,7 @@ def _try_compile(
     program: Any = None, type_map: dict | None = None,
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
+    fingerprint: str | None = None,
 ) -> tuple[Callable, str | None] | None:
     """
     Attempt to create a torch.compile-d callable for a TEX program.
@@ -641,13 +1020,11 @@ def _try_compile(
         )
         return None
 
-    # ── Try codegen path first (flat function → much better for torch.compile)
+    # ── Try codegen path first (flat function → much better for torch.compile).
+    # Reuse the persisted/memoized codegen fn (PC-3) rather than re-emitting.
     cg_fn = None
     if program is not None and type_map is not None:
-        try:
-            cg_fn = _try_codegen(program, type_map)
-        except Exception:
-            cg_fn = None
+        cg_fn = _get_or_make_codegen_fn(program, type_map, fingerprint)
 
     if cg_fn is not None:
         # Build an adapter that matches the execute_compiled calling convention
@@ -692,18 +1069,9 @@ def _try_compile(
                        "[TEX] Codegen unsupported for this program, wrapping interpreter")
 
     try:
-        # Configure torch.compile cache directory if the cache is available
-        try:
-            from ..tex_cache import get_cache
-
-            tc_dir = str(get_cache().torch_compile_cache_dir)
-            os.makedirs(tc_dir, exist_ok=True)
-            # Point inductor's disk cache here and enable FxGraph caching
-            # to persist compiled kernels across process restarts
-            torch._inductor.config.cache_dir = tc_dir  # type: ignore[attr-defined]
-            torch._inductor.config.fx_graph_cache = True  # type: ignore[attr-defined]
-        except Exception:
-            pass  # Not critical — torch uses its default cache location
+        # Point inductor's disk cache at TEX's owned, evictable location so
+        # compiled kernels persist across process restarts.
+        _ensure_inductor_cache_dir()
 
         compiled = torch.compile(
             target_fn,
@@ -736,6 +1104,10 @@ def _try_compile(
                 "'Desktop development with C++' workload for best torch.compile "
                 "performance on Windows.  https://visualstudio.microsoft.com/visual-cpp-build-tools/",
             )
+        # CC-1: CUDA inductor needs Triton, which base torch doesn't ship on
+        # Windows (usually surfaces at first call, not here — see _maybe_triton_hint).
+        if backend == "inductor":
+            _maybe_triton_hint(err_str, device_type)
 
         # Recurse to try the next backend in the cascade
         return _try_compile(device_type, program, type_map,
@@ -749,8 +1121,15 @@ def clear_compiled_cache():
     # Reset backend status so backends are re-probed
     _backend_status.clear()
     _route_memo.clear()
-    _cg_only_cache.clear()
+    _stencil_route_memo.clear()
     _warnings_shown.clear()
+    # The codegen memo now lives in TEXCache (PC-3); clear its memory tier too
+    # for test isolation (disk sidecars are cleared by TEXCache.clear_all()).
+    try:
+        from ..tex_cache import get_cache
+        get_cache()._codegen_memory.clear()
+    except Exception:
+        pass
 
 
 

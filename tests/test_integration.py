@@ -2938,10 +2938,16 @@ for (int i = 0; i < 2; i = i + 1) {
 @OUT = @A * 0.0 + s * 0.001;
 """
     try:
+        from TEX_Wrangle.tex_cache import get_cache as _gc
         clear_compiled_cache()
         cache = TEXCache()
         prog, tm, refs, asg, params, used = cache.compile_tex(deep_code, bt)
         fp = cache.fingerprint(deep_code, bt)
+        # PC-3: the codegen memo now lives in the TEXCache singleton (memory +
+        # marshal sidecar). Clear both so "emitted exactly once" is deterministic
+        # regardless of a sidecar left by a previous run.
+        _gc()._codegen_memory.clear()
+        _gc()._cg_path(fp).unlink(missing_ok=True)
 
         calls = {"n": 0}
         orig_codegen = compiled_mod._try_codegen
@@ -2965,7 +2971,7 @@ for (int i = 0; i < 2; i = i + 1) {
         assert torch.equal(out1, out2), "cached codegen result differs across frames"
         assert torch.allclose(out1, interp_out, atol=1e-5)
         assert fp in compiled_mod._route_memo, "gate verdicts not memoized"
-        assert fp in compiled_mod._cg_only_cache, "codegen fn not memoized"
+        assert fp in _gc()._codegen_memory, "codegen fn not memoized"
         r.ok("compiled: codegen-only route memoized per fingerprint")
     except Exception as e:
         r.fail("compiled: codegen-only route memoized per fingerprint",
@@ -2976,7 +2982,7 @@ for (int i = 0; i < 2; i = i + 1) {
         assert len(compiled_mod._route_memo) > 0
         clear_compiled_cache()
         assert len(compiled_mod._route_memo) == 0
-        assert len(compiled_mod._cg_only_cache) == 0
+        assert len(_gc()._codegen_memory) == 0
         assert len(compiled_mod._backend_status) == 0
         r.ok("compiled: clear_compiled_cache clears route/codegen memos")
     except Exception as e:
@@ -3140,6 +3146,14 @@ def test_fusion_memo(r: SubTestResult):
 
     import TEX_Wrangle.tex_fusion as tex_fusion
     from TEX_Wrangle.tex_fusion import compile_fused
+    from TEX_Wrangle.tex_cache import get_cache as _gc_fused
+
+    def _clear_fused():
+        # CT-1: fused results now persist to disk, so clearing the in-memory
+        # memo alone no longer forces a recompile — drop the disk tier too.
+        tex_fusion._FUSED_MEMO.clear()
+        for _p in _gc_fused()._cache_dir.glob("fused_*.pkl"):
+            _p.unlink(missing_ok=True)
 
     torch.manual_seed(11)
     img = torch.rand(1, 4, 4, 4)
@@ -3172,7 +3186,7 @@ def test_fusion_memo(r: SubTestResult):
 
     # Repeat execution of the same chain must not re-parse/re-check.
     try:
-        tex_fusion._FUSED_MEMO.clear()
+        _clear_fused()
         tex_fusion._parse = counting_parse
         try:
             out1, _ = run_fused(make_stages())
@@ -3210,6 +3224,7 @@ def test_fusion_memo(r: SubTestResult):
     # chain-input rename.
     try:
         img3 = torch.rand(1, 4, 4, 3)
+        _clear_fused()  # CT-1: ensure the structural variants recompile (not disk-load)
         calls["n"] = 0
         tex_fusion._parse = counting_parse
         try:

@@ -89,6 +89,29 @@ def _get_bchw(img: torch.Tensor) -> torch.Tensor:
     return img.permute(0, 3, 1, 2)
 
 
+def _grid_sample_f32(inp: torch.Tensor, grid: torch.Tensor, **kwargs) -> torch.Tensor:
+    """grid_sample reconciling dtype (M-3): the grid is always fp32, so if the
+    image is fp16/bf16, sample in fp32 and cast the result back — grid_sample
+    rejects mixed dtypes, and fp32 sampling is the only correct high-res option."""
+    if inp.dtype != grid.dtype:
+        out = torch.nn.functional.grid_sample(inp.to(grid.dtype), grid, **kwargs)
+        return out.to(inp.dtype)
+    return torch.nn.functional.grid_sample(inp, grid, **kwargs)
+
+
+def _lerp_f32(a: torch.Tensor, b: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """torch.lerp reconciling dtype (M-3): lerp requires start/end/weight to share
+    one dtype, but in fp16 mode image-data operands are fp16 while coordinate-
+    derived weights stay fp32 — so `mix`/`lerp`/`fit`/`smin`/`smax`/`sample_mip`
+    would raise 'expected dtype Half … but got dtype float'. Promote the three to
+    their common (widest) dtype, compute, then cast back to the data operand's
+    dtype so the fp16 memory contract is preserved. No-op on the all-fp32 path."""
+    if a.dtype == b.dtype == t.dtype:
+        return torch.lerp(a, b, t)
+    common = torch.promote_types(torch.promote_types(a.dtype, b.dtype), t.dtype)
+    return torch.lerp(a.to(common), b.to(common), t.to(common)).to(a.dtype)
+
+
 def _expand_to_bhw(t: torch.Tensor, B: int, H: int, W: int) -> torch.Tensor:
     """Expand a scalar (dim 0) or 2D [H, W] tensor to [B, H, W]."""
     d = t.dim()
@@ -432,8 +455,12 @@ class TEXStdlib:
         out = torch.pow(b, e)
         # Make silent NaN visible: pow(-2, 0.5) and similar have no real answer.
         # Bounded so this never adds a per-call sync to steady-state execution.
+        # CUDA-only exception: the .any() bool sync is a verified CUDA-graph
+        # CAPTURE BLOCKER for the first 32 pow calls process-wide (capture failed
+        # with 9 warm pow calls, succeeded with 36). The diagnostic is a
+        # best-effort nicety, so skip it on CUDA and keep it CPU-only.
         _st = _POW_NAN_STATE
-        if not _st["warned"] and _st["checked"] < 32:
+        if not _st["warned"] and _st["checked"] < 32 and not out.is_cuda:
             _st["checked"] += 1
             if torch.isnan(out).any() and not torch.isnan(b).any():
                 _st["warned"] = True
@@ -612,7 +639,7 @@ class TEXStdlib:
         # Auto-unsqueeze weight for channel broadcast: [B,H,W] weight with [B,H,W,C] values
         if t_t.dim() + 1 == a_t.dim():
             t_t = t_t.unsqueeze(-1)
-        return torch.lerp(a_t, b_t, t_t)
+        return _lerp_f32(a_t, b_t, t_t)
 
     @staticmethod
     def fn_fit(val, old_min, old_max, new_min, new_max):
@@ -621,7 +648,7 @@ class TEXStdlib:
         o_min, o_max = _to_tensor(old_min), _to_tensor(old_max)
         n_min, n_max = _to_tensor(new_min), _to_tensor(new_max)
         t = (v - o_min) / (o_max - o_min + SAFE_EPSILON)
-        return torch.lerp(n_min, n_max, t)
+        return _lerp_f32(n_min, n_max, t)
 
     @staticmethod
     def fn_smoothstep(edge0, edge1, x):
@@ -817,7 +844,7 @@ class TEXStdlib:
         grid[..., 1] = grid_y
 
         # Sample with bilinear interpolation (fused C++ kernel)
-        result_bchw = torch.nn.functional.grid_sample(
+        result_bchw = _grid_sample_f32(
             img_bchw, grid,
             mode='bilinear',
             padding_mode='border',
@@ -982,7 +1009,7 @@ class TEXStdlib:
         grid = _build_sample_grid(u, v, B, H, W)
 
         # Sample with bicubic interpolation
-        result_bchw = torch.nn.functional.grid_sample(
+        result_bchw = _grid_sample_f32(
             img_bchw, grid,
             mode='bicubic',
             padding_mode='border',
@@ -1333,7 +1360,7 @@ class TEXStdlib:
         b_t = _to_tensor(b)
         k_t = _to_tensor(k)
         h = torch.clamp(0.5 + 0.5 * (b_t - a_t) / (k_t + SAFE_EPSILON), 0.0, 1.0)
-        return torch.lerp(b_t, a_t, h) - k_t * h * (1.0 - h)
+        return _lerp_f32(b_t, a_t, h) - k_t * h * (1.0 - h)
 
     @staticmethod
     def fn_smax(a, b, k):
@@ -1342,7 +1369,7 @@ class TEXStdlib:
         b_t = _to_tensor(b)
         k_t = _to_tensor(k)
         h = torch.clamp(0.5 - 0.5 * (b_t - a_t) / (k_t + SAFE_EPSILON), 0.0, 1.0)
-        return torch.lerp(b_t, a_t, h) + k_t * h * (1.0 - h)
+        return _lerp_f32(b_t, a_t, h) + k_t * h * (1.0 - h)
 
     # -- Gradient sampling -----------------------------------------------
 
@@ -1826,8 +1853,11 @@ def _gauss_blur_bchw(
     C = img.shape[1]
     kernel_h, kernel_v = _get_gauss_kernels(sigma, img.device)
     radius = kernel_h.shape[-1] // 2
-    kh = kernel_h.expand(C, 1, 1, -1)
-    kv = kernel_v.expand(C, 1, -1, 1)
+    # M-3: conv2d requires the kernel and input to share a dtype; the cached
+    # gaussian kernels are fp32, so reconcile to the image dtype (a no-op on the
+    # fp32 path, an fp16 cast under fp16 mode — consistent with fp16 image data).
+    kh = kernel_h.to(img.dtype).expand(C, 1, 1, -1)
+    kv = kernel_v.to(img.dtype).expand(C, 1, -1, 1)
     stride_w = 2 if downsample_2x else 1
     stride_h = 2 if downsample_2x else 1
     padded = torch.nn.functional.pad(img, (radius, radius, 0, 0), mode='replicate')
@@ -1897,16 +1927,28 @@ def _build_mip_pyramid(
     return pyramid
 
 
+def _safe_version(t: torch.Tensor) -> int:
+    """`t._version` for a normal tensor, 0 for an inference tensor.
+
+    Reading `_version` on an inference tensor raises ("Inference tensors do not
+    track version counter"). Inference tensors are immutable within their
+    inference-mode region, so a constant is a sound cache-version stand-in.
+    Without this, a plain fp32 CUDA `sample_mip` with a CPU-resident IMAGE
+    binding fails outright (the binding is moved on-device inside inference mode,
+    producing an inference tensor)."""
+    return 0 if t.is_inference() else t._version
+
+
 def _get_mip_pyramid(img: torch.Tensor) -> list[torch.Tensor]:
     """Area-downsample mipmap pyramid (cached)."""
-    # Version-safe key: id() + _version detects in-place mutations.
-    return _build_mip_pyramid(img, _mip_cache, (id(img), img._version))
+    # Version-safe key: id() + version detects in-place mutations.
+    return _build_mip_pyramid(img, _mip_cache, (id(img), _safe_version(img)))
 
 
 def _get_mip_pyramid_gauss(img: torch.Tensor, sigma: float = 1.13) -> list[torch.Tensor]:
     """Gaussian-prefiltered mipmap pyramid (sigma=1.13, SIGMA_C ≈ 0.825, cached)."""
     sigma_q = round(sigma, 3)
-    key = (id(img), img._version, sigma_q)
+    key = (id(img), _safe_version(img), sigma_q)
     return _build_mip_pyramid(
         img, _gauss_mip_cache, key,
         pre_blur_fn=lambda bchw: _gauss_blur_bchw(bchw, sigma),
@@ -1933,7 +1975,7 @@ def _sample_mip_level(
             level_bchw, size=out_size, mode='bilinear', align_corners=True,
         )
         return result_bchw.permute(0, 2, 3, 1)
-    result_bchw = torch.nn.functional.grid_sample(
+    result_bchw = _grid_sample_f32(
         level_bchw, grid,
         mode='bilinear',
         padding_mode='border',
@@ -2001,7 +2043,7 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
         if lo_i == hi_i:
             return s_lo
         s_hi = _sample_mip_level(pyramid[hi_i], grid, out_size)
-        return torch.lerp(s_lo, s_hi, lod_frac)
+        return _lerp_f32(s_lo, s_hi, lod_frac)
 
     # Per-pixel LOD: gather-based blending (avoids N boolean mask allocations)
     lo_min = lo.min().item()
@@ -2023,7 +2065,7 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
     s_lo = torch.gather(stacked, 1, lo_local.expand(expand_shape)).squeeze(1)
     s_hi = torch.gather(stacked, 1, hi_local.expand(expand_shape)).squeeze(1)
     frac_expanded = lod_frac.unsqueeze(-1) if lod_frac.dim() == 3 else lod_frac
-    return torch.lerp(s_lo, s_hi, frac_expanded)
+    return _lerp_f32(s_lo, s_hi, frac_expanded)
 
 
 # -- Noise functions (extracted to noise.py) --------------------------------
@@ -2041,9 +2083,11 @@ from .noise import (
 
 
 def _to_tensor(x) -> torch.Tensor:
-    """Ensure a value is a torch.Tensor (skip recast if already float32)."""
+    """Ensure a value is a float torch.Tensor. Preserves an existing floating
+    dtype (fp16/bf16/fp32) so the M-3 fp16 image-data mode isn't silently
+    upcast to fp32; promotes int/bool tensors to float."""
     if x.__class__ is torch.Tensor:
-        return x if x.dtype == torch.float32 else x.float()
+        return x if x.is_floating_point() else x.float()
     return torch.scalar_tensor(float(x), dtype=torch.float32)
 
 

@@ -60,6 +60,35 @@ from test_aliasing_cow import (
     test_literal_cache_persistence, test_scatter_ownership,
     test_clamp_and_gridbuf, test_fp16_guards, test_noise_backend_gate,
 )
+from test_v015_phase0 import (
+    test_pc1_inductor_cache_dir, test_oom_detection,
+    test_sample_mip_inference_tensor, test_uc5_literal_array_index,
+)
+from test_v015_phase1 import (
+    test_pc3_codegen_persistence, test_ct1_fused_disk_persistence,
+    test_pc2_precompile_safety,
+)
+from test_v015_phase2 import (
+    test_q2_purity_dce, test_uc3_uniform_loop, test_uc2_stencil_routing,
+    test_uc1_cuda_graph, test_uc4_const_prop, test_q1_fused_capture,
+)
+from test_v015_phase3 import (
+    test_m1_peak_estimator, test_m1_free_caches, test_m2_cache_budget,
+    test_m3_fp16_mode, test_m4_tiling, test_m5_out_reuse,
+)
+from test_v015_phase4 import test_q4_stage_attribution, test_ct2_offset_sourceloc
+from test_v015_phase5 import (
+    test_cc2_state_machine, test_cc2_no_stall_sim, test_cc2_end_to_end,
+    test_q3_fusion_widening, test_q5_chain_preflight, test_q6_preview_downscale,
+)
+from test_v015_audit_fixes import (
+    test_uc3_fractional_and_bindingmut, test_uc4_array_shadow_constprop,
+    test_q5_preflight_from_spec, test_q6_preview_kwarg_popped,
+    test_m1_oom_unwrap, test_m3_fp16_reconcile, test_uc2_stencil_exact_only,
+    test_m4_tiling_guards, test_uc1_graph_vec_param, test_cc1_triton_hint,
+    test_p2_cache_hygiene, test_p2_tap_cap, test_p2_evict_clears_graphs,
+    test_p2_pc2_scoped_deletion, test_p2_pc1_sibling_sweep,
+)
 
 
 def main():
@@ -144,6 +173,33 @@ def main():
     test_clamp_and_gridbuf(r)
     test_fp16_guards(r)
     test_noise_backend_gate(r)
+    test_pc1_inductor_cache_dir(r)
+    test_oom_detection(r)
+    test_sample_mip_inference_tensor(r)
+    test_uc5_literal_array_index(r)
+    test_pc3_codegen_persistence(r)
+    test_pc2_precompile_safety(r)
+    test_ct1_fused_disk_persistence(r)
+    test_q2_purity_dce(r)
+    test_uc4_const_prop(r)
+    test_uc1_cuda_graph(r)
+    test_q1_fused_capture(r)
+    test_m1_peak_estimator(r)
+    test_m1_free_caches(r)
+    test_m2_cache_budget(r)
+    test_m3_fp16_mode(r)
+    test_m4_tiling(r)
+    test_m5_out_reuse(r)
+    test_q4_stage_attribution(r)
+    test_ct2_offset_sourceloc(r)
+    test_cc2_state_machine(r)
+    test_cc2_no_stall_sim(r)
+    test_cc2_end_to_end(r)
+    test_q3_fusion_widening(r)
+    test_q5_chain_preflight(r)
+    test_q6_preview_downscale(r)
+    test_uc2_stencil_routing(r)
+    test_uc3_uniform_loop(r)
     test_vec2_type(r)
     test_arithmetic_hash_noise(r)
     test_new_noise_functions(r)
@@ -164,6 +220,21 @@ def main():
     test_compiled_audit_fixes(r)
     test_fusion_memo(r)
     test_node_helpers(r)
+    test_uc3_fractional_and_bindingmut(r)
+    test_uc4_array_shadow_constprop(r)
+    test_q5_preflight_from_spec(r)
+    test_q6_preview_kwarg_popped(r)
+    test_m1_oom_unwrap(r)
+    test_m3_fp16_reconcile(r)
+    test_uc2_stencil_exact_only(r)
+    test_m4_tiling_guards(r)
+    test_uc1_graph_vec_param(r)
+    test_cc1_triton_hint(r)
+    test_p2_cache_hygiene(r)
+    test_p2_tap_cap(r)
+    test_p2_evict_clears_graphs(r)
+    test_p2_pc2_scoped_deletion(r)
+    test_p2_pc1_sibling_sweep(r)
 
     success = r.summary()
     return 0 if success else 1

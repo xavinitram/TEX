@@ -5,21 +5,75 @@ Every node in the TEX abstract syntax tree is defined here.
 Nodes are dataclasses with __slots__ for reduced memory and faster attribute access.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as _fields
 from typing import Optional
 
 
 # ---------------------------------------------------------------------------
 # Source location tracking
 # ---------------------------------------------------------------------------
-@dataclass(slots=True)
 class SourceLoc:
-    """Line/column in the original TEX source (1-based)."""
-    line: int
-    col: int
+    """A source location in the original TEX source (1-based line/col).
+
+    CT-2: the lexer builds these lazily from a byte offset — `line`/`col` are
+    resolved on first access (only when a diagnostic actually surfaces), so the
+    hot tokenization path allocates no line/col bookkeeping. The eager
+    `SourceLoc(line, col)` constructor is retained for direct construction
+    (tests, defaults, synthetic optimizer nodes). `stage` (Q-4) tags which
+    fused-chain stage a node came from so a runtime error can be attributed to
+    the originating linked node.
+    """
+    __slots__ = ("_line", "_col", "_offset", "_source", "stage")
+
+    def __init__(self, line: int = 0, col: int = 0, stage: Optional[int] = None):
+        self._line = line
+        self._col = col
+        self._offset = -1
+        self._source = ""
+        self.stage = stage
+
+    @classmethod
+    def from_offset(cls, offset: int, source: str,
+                    stage: Optional[int] = None) -> "SourceLoc":
+        """Lazy location: store the byte offset; resolve line/col on demand."""
+        o = cls.__new__(cls)
+        o._line = None
+        o._col = None
+        o._offset = offset
+        o._source = source
+        o.stage = stage
+        return o
+
+    def _resolve(self) -> None:
+        src, pos = self._source, self._offset
+        if pos < 0 or not src:
+            self._line = self._line or 0
+            self._col = self._col or 0
+            return
+        self._line = src.count("\n", 0, pos) + 1
+        # col = chars since the last newline (rfind == -1 → col = pos + 1).
+        self._col = pos - src.rfind("\n", 0, pos)
+
+    @property
+    def line(self) -> int:
+        if self._line is None:
+            self._resolve()
+        return self._line
+
+    @property
+    def col(self) -> int:
+        if self._col is None:
+            self._resolve()
+        return self._col
 
     def __repr__(self):
         return f"{self.line}:{self.col}"
+
+    def __eq__(self, other):
+        return (isinstance(other, SourceLoc) and self.line == other.line
+                and self.col == other.col and self.stage == other.stage)
+
+    __hash__ = None
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +353,29 @@ class ErrorNode(ASTNode):
     error_message: str = ""
 
 
+# Canonical AST child-iterator, memoized per node type. The single shared walker
+# so new node types/fields can't silently drift out of any traversal (used by
+# codegen emission, the optimizer, the memory estimator, and the graph gate).
+_CHILD_FIELDS: dict[type, tuple] = {}
+
+
+def iter_child_nodes(node):
+    """Yield the direct AST children of `node` (descending into list fields)."""
+    cls = type(node)
+    names = _CHILD_FIELDS.get(cls)
+    if names is None:
+        names = tuple(f.name for f in _fields(cls))
+        _CHILD_FIELDS[cls] = names
+    for name in names:
+        v = getattr(node, name)
+        if isinstance(v, ASTNode):
+            yield v
+        elif isinstance(v, list):
+            for x in v:
+                if isinstance(x, ASTNode):
+                    yield x
+
+
 def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     """Extract a fully static for-loop as (var_name, start, stop, step).
 
@@ -314,6 +391,14 @@ def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     if not isinstance(init.initializer, NumberLiteral):
         return None
     loop_var = init.name
+    # UC-3a: a fractional literal bound/step (e.g. `for(float i=0.5; …)`) must NOT
+    # be truncated to an integer range — that silently changes the loop values and
+    # trip count vs the general per-iteration path. Resolve to a static range only
+    # when start/end/step are all integer-valued; otherwise fall through (None) to
+    # the general path. (The old code truncated the start via int() and only caught
+    # a fractional STEP incidentally, when int(0.5)==0 tripped the step==0 guard.)
+    if not float(init.initializer.value).is_integer():
+        return None
     start = int(init.initializer.value)
 
     cond = node.condition
@@ -322,6 +407,8 @@ def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     if not isinstance(cond.left, Identifier) or cond.left.name != loop_var:
         return None
     if not isinstance(cond.right, NumberLiteral):
+        return None
+    if not float(cond.right.value).is_integer():
         return None
     end = int(cond.right.value)
     if cond.op == "<=":
@@ -338,6 +425,8 @@ def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     if not isinstance(upd.left, Identifier) or upd.left.name != loop_var:
         return None
     if not isinstance(upd.right, NumberLiteral):
+        return None
+    if not float(upd.right.value).is_integer():
         return None
     if upd.op == "+":
         step = int(upd.right.value)

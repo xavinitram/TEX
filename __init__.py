@@ -5,7 +5,7 @@ A per-pixel kernel DSL for writing compact image/mask processing logic
 directly inside ComfyUI. Inspired by Houdini VEX and Nuke BlinkScript.
 """
 
-__version__ = "0.14.1"
+__version__ = "0.15.0"
 
 import os
 
@@ -202,6 +202,53 @@ try:
     async def get_snippets(request):
         """Return built-in example snippets as JSON."""
         return web.json_response(_load_example_snippets())
+
+    @routes.post("/tex_wrangle/free_caches")
+    async def free_caches(request):
+        """M-2: drop every TEX tensor cache (mip pyramids, grid buffers, compiled
+        codegen, CUDA graphs) and soft-empty CUDA, on user request."""
+        freed = False
+        try:
+            from .tex_memory import free_tensor_caches
+            free_tensor_caches()
+            freed = True
+        except Exception:
+            pass
+        try:
+            from .tex_cache import get_cache
+            get_cache().clear_all()
+        except Exception:
+            pass
+        try:
+            import comfy.model_management as mm
+            if hasattr(mm, "soft_empty_cache"):
+                mm.soft_empty_cache()
+        except Exception:
+            pass
+        return web.json_response({"ok": freed})
+
+    @routes.post("/tex_wrangle/chain_preflight")
+    async def chain_preflight(request):
+        """Q-5: validate a drawn fusion chain before queue time. Body:
+        {"stages": [...], "terminal_code": "..."} (a `_tex_chain`-shaped spec).
+        Returns {ok, error, stage_of_error, stats} — a red bubble + node
+        highlight on failure, perf HUD stats on success. Never 500s."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad request body",
+                                      "stage_of_error": None, "stats": None})
+        try:
+            from .tex_fusion import preflight_from_spec
+            from .tex_node import _infer_binding_type
+            spec = {"stages": body.get("stages", []),
+                    "terminal_image_input": body.get("terminal_image_input")}
+            result = preflight_from_spec(spec, body.get("terminal_code", ""),
+                                         _infer_binding_type)
+        except Exception as e:
+            result = {"ok": False, "error": f"preflight error: {e}",
+                      "stage_of_error": None, "stats": None}
+        return web.json_response(result)
 
 except (ImportError, AttributeError):
     # PromptServer or aiohttp not available (e.g. running tests or CLI mode)

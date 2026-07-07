@@ -5,6 +5,127 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-07-07
+
+Optimization-roadmap release: all 24 proposals from the 2026-07 TEX Optimization
+Roadmap, implemented in priority order, then hardened by a pre-push audit (see
+`TEX_research/21`). Every item ships with a regression test, and every
+performance claim below is a **measured, same-session interleaved A/B** on the
+affected programs (this box drifts 10–30 %/hour, so full-suite deltas are
+noise-dominated and were not used). 1590 sub-tests pass.
+
+### Fixed — pre-push audit (doc 21)
+- **UC-3** — uniform-range loop resolution now only fires on integer-valued
+  bounds; a fractional `for(float …)` bound/step (or a bound reading a
+  body-mutated binding) falls back to the exact per-iteration path instead of
+  silently changing the loop values vs v0.14.1.
+- **UC-4** — an array shadowing a same-named literal local no longer corrupts the
+  const-propagation pass (was a spurious compile error on legal code).
+- **Q-5** — the chain-preflight endpoint now succeeds on valid chains (it seeds a
+  placeholder terminal binding); previously every fused chain showed a false-red
+  "not fusable" bubble.
+- **M-1** — an out-of-memory error raised *inside* a stdlib call (sample_mip,
+  gauss_blur) is re-raised unwrapped so ComfyUI's OOM handling (memory summary +
+  model unload) fires, instead of being masked as a generic error.
+- **M-3** — fp16 mode no longer hard-fails on `mix`/`lerp`/`fit`/`smin`/`smax`/
+  `sample_mip`/`gauss_blur` (dtypes are reconciled around the strict `torch.lerp`
+  / `conv2d` ops); ~5e-4 vs fp32.
+- **UC-1** — `cuda_graph` now stages vec/color params as `[1,1,1,C]` tensors
+  (were collapsed to the R component → silent wrong output); a cache-budget
+  eviction that could free a graph-baked tensor now tears down the graph cache.
+- **UC-2** — the codegen/`auto` stencil path refuses sample-based (bilinear)
+  stencils so it stays bit-exact with the interpreter (fetch stencils keep the
+  fast avg_pool lowering).
+- **M-4** — tiled execution refuses to tile a LATENT (`[B,C,H,W]`) or bindings of
+  disagreeing height, falling back to an untiled cook.
+- **CC-1** — the Triton-on-Windows install hint now fires at the point the failure
+  actually occurs (first compiled call), and a missing Triton marks the backend
+  unavailable instead of blacklisting the program.
+- **Q-3** — preview-tap exports are capped at `MAX_OUTPUTS` (8), dropping excess
+  taps with a log instead of overflowing the node's output slots.
+- **Hygiene** — codegen in-memory cache is LRU-bounded again; the `out=`-reuse
+  kill switch is folded into the cache key; the dead "last-cook ms" HUD field was
+  removed; `compile_mode="auto"` is labelled experimental (its background-compile
+  timing is still being hardened — it only ever falls back to a correct path).
+
+### Added — compiled-code persistence (restarts are free)
+- **PC-3 — persisted codegen objects**: the generated Python code object is
+  marshalled to a `.cg` sidecar (validated by cache version + CPython bytecode
+  magic + SHA-256). A warm restart materializes from disk instead of re-emitting.
+  Measured **2.2–6.4× faster** first-cook-after-restart on the codegen path.
+- **PC-2 — precompile safety**: `caching_precompile` entries attach with a
+  crash-signature allowlist; a stale/corrupt entry clears the dynamo store and
+  recompiles fresh instead of blacklisting.
+- **CT-1 — fused-chain disk persistence**: a fused chain's compiled artifact
+  survives restart (skips the ~2.5 ms splice+double-typecheck+optimize).
+  Measured **7.5×** on the restart path.
+
+### Added — CUDA-graph & codegen routing
+- **UC-1 — CUDA-graph replay** (`compile_mode="cuda_graph"`): captures and
+  replays the unmodified interpreter per (program × input-signature). Measured
+  **up to ~6.2× aggregate** on small launch-bound GPU programs; per-graph pools,
+  RNG-poison recovery, bytes-aware LRU.
+- **Q-1 — fused chain as the capture unit**: a fused chain gets a first-class
+  fingerprint and can route through the graph tier as one capture region.
+- **UC-2 — stencil-codegen routing**: exact fetch/conv stencils default-route
+  through the codegen tier (avg_pool2d/conv2d/unfold lowering).
+- **UC-3 — uniform-range loop analysis** and **UC-5 — literal array indexing**
+  broaden what the graph/codegen tiers accept.
+- **CC-2 — measured auto-tier** (`compile_mode="auto"`, opt-in): starts on the
+  always-safe codegen path, compiles in the **background without ever stalling
+  the cook** (the 28 s foreground compile is gone), trials the compiled fn timed,
+  and switches only on a measured >10 % win over codegen-only. Verdicts persist.
+- **CC-1**: a Triton-on-Windows install hint when CUDA inductor is unavailable.
+
+### Added — memory cooperation
+- **M-1/M-2 — peak estimator + byte-budgeted cache eviction**: preflight OOM
+  and cap TEX's tensor-cache residency at a VRAM/CPU byte budget (env override
+  `TEX_CACHE_BUDGET_MB`).
+- **M-4 — tiled (strip) execution**: under GPU memory pressure a tile-safe
+  program runs in horizontal strips with seam-exact coordinates. Measured 4096²:
+  peak **1074 → 612 MB** at 8 strips (transient 0.24×); seams bitwise-identical.
+- **M-3 — fp16 image-data mode** (`precision="fp16"`, opt-in): fp16 image data,
+  fp32 coordinates (a fp16 `u` would collapse at high res). Peak/churn win is
+  **conditional** on an fp16-native input (0.69×/0.63×); neutral-to-worse when
+  fed fp32 — tooltip states this. Output stays fp32 (IMAGE contract).
+- **M-5 — codegen `out=` temp reuse**: reuses a dead fresh arithmetic temp as
+  the `out=` target for constant-scalar ops. Measured **26 % fewer allocator
+  calls** on the color-grade chain, bit-exact, timing-neutral (kill switch
+  `TEX_CODEGEN_NO_OUT_REUSE=1`).
+
+### Added — chained-node QOL
+- **Q-3 — fusion coverage widening (backend)**: `compile_fused` generalized from
+  a linear chain to a **DAG** — stages can read any earlier stage's output
+  (`chain_inputs`), export multiple outputs (`exports`), or expose an observed
+  intermediate as a `@_tap_s{i}` output (`tap`). All bit-exact vs unfused; the
+  legacy linear path is byte-identical. (The frontend maximal-component collapse
+  is pending a live-ComfyUI validation pass; the backend accepts payloads now.)
+- **Q-5 — chain preflight + perf HUD**: `POST /tex_wrangle/chain_preflight`
+  validates a drawn chain's fusability as you edit — the fusion bubble turns
+  **red** with the blocking node/reason before you queue, instead of failing the
+  queued prompt. Green bubble shows stage count / op estimate. Setting
+  `TEX Fusion: Preflight chains + perf HUD` (default on).
+- **Q-4 — fused-chain error attribution**: a runtime error inside a fused chain
+  names the originating linked node (stage-tagged `SourceLoc`).
+- **Q-6 — low-res live preview (scaffold)**: a preview downscale primitive +
+  `_tex_preview` kwarg; the live-preview orchestration remains gated on ComfyUI's
+  unverified `partial_execution` API (exploratory).
+
+### Changed — compile times
+- **CT-2 — offset-based lazy source locations**: `SourceLoc` is now offset-backed
+  and resolves line/col only when a diagnostic renders, dropping the lexer's
+  per-token bookkeeping. Measured **~8–9 % faster lexing** (first-compile only).
+  Reconciled with Q-4 (loc stays a mutable object carrying `stage`).
+- **UC-4 — const-propagation pass** and **Q-2 — purity-aware DCE** in the
+  optimizer.
+
+### Notes
+- New `compile_mode` options: `auto` (measured auto-tier) and `cuda_graph`.
+- New `precision` option: `fp16` (interpreter-only; forced to fp32 under any
+  compile mode).
+- `fp16` and the graph/compile tiers are opt-in; the default path
+  (`compile_mode="none"`, `precision="fp32"`) is unchanged.
+
 ## [0.14.1] - 2026-07-06
 
 ### Fixed (correctness)

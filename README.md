@@ -68,9 +68,11 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **Multiple outputs** | Write to `@result`, `@mask`, etc. for multiple output sockets |
 | **Control flow** | `if/else` (vectorized), `for` loops, `while` loops, `break`/`continue` |
 | **GPU acceleration** | CPU or GPU with auto device detection |
-| **`torch.compile`** | Optional JIT compilation for faster repeated execution |
-| **Two-tier caching** | In-memory LRU + disk persistence for instant re-execution |
-| **Cross-node fusion** | Compile a chain of linked TEX nodes into one program — only the last node cooks (opt-in via Settings → TEX Fusion) |
+| **Acceleration tiers** | `compile_mode`: `none` (default), `auto` (experimental measured auto-tier — trials `torch.compile` in the background and commits only on a measured win; always falls back to a correct path), `torch_compile`, `cuda_graph` (GPU replay for small launch-bound programs) |
+| **`fp16` mode** | `precision="fp16"` runs image data in half precision (fp32 coordinates); opt-in, best for fp16-native pipelines |
+| **Two-tier caching** | In-memory LRU + disk persistence for instant re-execution — compiled objects and fused chains persist across restarts |
+| **Memory cooperation** | OOM preflight + byte-budgeted cache eviction; tile-safe programs run in strips under VRAM pressure |
+| **Cross-node fusion** | Compile a chain of linked TEX nodes into one program — only the last node cooks (opt-in via Settings → TEX Fusion). A live **preflight** flags an unfusable chain (red bubble) before you queue |
 | **124 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |
@@ -224,7 +226,7 @@ The `examples/` directory contains 114 ready-to-use snippets:
 
 **Variable `v` conflict:** The built-in `v` (normalized y-coordinate) is always defined. Use `val` or `value` instead. Same for `u`, `ix`, `iy`, `iw`, `ih`, `px`, `py`, `fi`, `fn`, `ic`, `PI`, `TAU`, `E`.
 
-**torch.compile on Windows:** Install Visual Studio Build Tools with "Desktop development with C++" for full `inductor` support. The default `none` mode works everywhere.
+**torch.compile on Windows:** Install Visual Studio Build Tools with "Desktop development with C++" for CPU `inductor`. For **CUDA** `inductor` you also need Triton — on Windows, `pip install "triton-windows<3.7"` (match your torch version; TEX shows the exact pin when it detects the gap). The default `none` mode works everywhere; `cuda_graph` mode needs neither.
 
 | Error | Fix |
 |-------|-----|
@@ -245,8 +247,11 @@ Each program is compiled to PyTorch and cached (in-memory LRU + disk), so a warm
 | `dot()` / `luma` / `normalize` | `mul + sum` instead of `einsum` on CUDA — **~9.8×** (vec3) |
 | Input fingerprinting | Sample-byte hashing — **~2×** per input per frame |
 | Chained nodes | Image/mask outputs stay on the compute device (no CPU↔GPU round-trip); linked chains can be compiled together — see **Settings → TEX Fusion** |
+| CUDA-graph replay (`compile_mode="cuda_graph"`) | Replays the captured interpreter for small launch-bound programs — **up to ~6× aggregate** on GPU |
+| Warm restarts | Compiled code objects and fused chains persist to disk — first-cook-after-restart **2–7× faster** |
+| Codegen `out=` reuse | **~26 % fewer allocator calls** on constant-arithmetic (grade) chains, bit-exact |
 
-Benchmark harnesses live in `benchmarks/` — `eight_config_bench.py` (device × cache × compile matrix) and `gpu_profile.py` (resolution-scaling), both `torch.cuda.synchronize()`-bracketed.
+Benchmark harnesses live in `benchmarks/` — `eight_config_bench.py` (device × cache × compile matrix) and `gpu_profile.py` (resolution-scaling), both `torch.cuda.synchronize()`-bracketed. Every performance change is proven with same-session interleaved A/B (see `CHANGELOG.md`).
 
 ## Development
 

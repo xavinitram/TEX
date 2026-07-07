@@ -19,8 +19,12 @@ behaves exactly as before.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import logging
 from collections import OrderedDict
 from typing import Any, Callable
+
+logger = logging.getLogger("TEX.fusion")
 
 from .tex_compiler.lexer import Lexer
 from .tex_compiler.parser import Parser
@@ -149,6 +153,15 @@ def _seedless_out_index(statements):
     return None
 
 
+def _tag_stage(node, stage: int) -> None:
+    """Set loc.stage = stage on a node and all its descendants (Q-4)."""
+    loc = getattr(node, "loc", None)
+    if loc is not None and getattr(loc, "stage", None) is None:
+        loc.stage = stage
+    for ch in A.iter_child_nodes(node):
+        _tag_stage(ch, stage)
+
+
 def _user_prefix(prefix: str) -> str:
     """The sub-namespace for user-authored names within a stage. Kept distinct
     from the bare `prefix` (reserved for compiler-generated handoff locals like
@@ -157,26 +170,97 @@ def _user_prefix(prefix: str) -> str:
     return prefix + "u_"
 
 
-def _transform(node, prefix, user_fns, chain_input, prev_out, out_local, is_terminal):
+# ── CT-1: fused-chain disk persistence ────────────────────────────────
+# The in-memory _FUSED_MEMO is lost on restart, forcing a full ~2.5 ms cold
+# splice+compile per chain. Reuse TEXCache's disk tier (which stores the
+# optimized AST and re-type-checks on load, respecting the id()-keyed type_map
+# contract) keyed by a hash of the value-independent memo_key.
+
+def _fused_memo_key(stages: list[dict], infer_binding_type: Callable) -> tuple:
+    """The value-independent compile key for a stage list: per-stage (code,
+    chain topology, sorted (name, binding-type)) in order. Q-3: the topology
+    covers legacy `chain_input`, DAG `chain_inputs`, multi-@OUT `exports`, and
+    `tap` — structurally different chains must key apart. prev_out types need no
+    entry — they follow from earlier stages' (code, types)."""
+    def _topology(st):
+        ci = st.get("chain_inputs")
+        ci_key = (tuple(sorted((b, tuple(src)) for b, src in ci.items()))
+                  if ci is not None else st.get("chain_input"))
+        return (ci_key,
+                tuple(sorted(st.get("exports") or ())),
+                bool(st.get("tap")))
+    return tuple(
+        (st["code"], _topology(st),
+         tuple(sorted((n, infer_binding_type(v).value)
+                      for n, v in (st.get("bindings") or {}).items())))
+        for st in stages
+    )
+
+
+def _fused_fp(memo_key: tuple) -> str:
+    """Stable filename-safe fingerprint over the fusion memo_key (tuples of
+    str / None / sorted (name, type) tuples — repr is stable and canonical)."""
+    return "fused_" + hashlib.sha256(repr(memo_key).encode()).hexdigest()[:24]
+
+
+def _binding_types_from_memo_key(memo_key: tuple) -> dict:
+    """Reconstruct the merged (prefixed) external-binding types from the memo_key
+    — the same dict compile_fused builds from merged_bindings — needed to
+    re-type-check the fused AST on disk load, without the binding VALUES."""
+    from .tex_compiler.type_checker import TEXType
+    bt: dict[str, Any] = {}
+    for i, (_code, _chain_in, sorted_bt) in enumerate(memo_key):
+        pfx = _user_prefix(f"_s{i}_")
+        for name, tv in sorted_bt:
+            bt[pfx + name] = TEXType(tv)
+    return bt
+
+
+def _load_fused_from_disk(memo_key: tuple):
+    """Load a persisted fused compile result (the 6-tuple), or None."""
+    try:
+        from .tex_cache import get_cache
+        bt = _binding_types_from_memo_key(memo_key)
+        return get_cache()._load_from_disk(_fused_fp(memo_key), bt)
+    except Exception:
+        return None
+
+
+def _save_fused_to_disk(memo_key: tuple, fused_program, binding_types) -> None:
+    try:
+        from .tex_cache import get_cache
+        get_cache()._save_to_disk(_fused_fp(memo_key), fused_program, binding_types)
+    except Exception:
+        pass  # best-effort; a miss just recompiles next restart
+
+
+def _transform(node, prefix, user_fns, wire_map, redirect_map, passthrough):
     """Recursively namespace one stage's AST and wire its boundaries in place.
 
-    Non-terminal stages: `@OUT` reads/writes (including `@OUT.rgb =` and
-    `@OUT += `) are redirected to the handoff local `out_local` (declared+seeded
-    by compile_fused); the chain-input @binding reads the previous stage's local.
-    Every other user identifier is prefixed so stages never collide. Returns the
-    (possibly replaced) node."""
+    `wire_map` (Q-3 DAG): {binding_name: upstream_handoff_local} — a wired input
+    read resolves to the producing stage's handoff local (any earlier stage, not
+    just i-1). `redirect_map` (Q-3 multi-@OUT): {binding_name: this_stage_local}
+    for every output this stage exports downstream — `@OUT` and each extra
+    exported `@binding` read/write (incl. `.rgb =`, `+=`) redirect to their
+    handoff locals (declared+seeded by compile_fused). `passthrough`: binding
+    names that are the chain's REAL outputs (the terminal's `@OUT` and any extra
+    output bindings) — kept unprefixed. Every other user identifier is prefixed
+    so stages never collide. Returns the (possibly replaced) node."""
     if node is None:
         return None
     cls = node.__class__
     up = _user_prefix(prefix)
 
     if cls is A.BindingRef:
-        if node.kind == "wire" and node.name == "OUT":
-            # A non-terminal @OUT READ resolves to the handoff local; the terminal
-            # keeps its real @OUT (the chain's actual output).
-            return node if is_terminal else A.Identifier(loc=node.loc, name=out_local)
-        if chain_input is not None and node.kind == "wire" and node.name == chain_input:
-            return A.Identifier(loc=node.loc, name=prev_out)  # chain handoff
+        if node.kind == "wire":
+            if node.name in passthrough:     # a real chain output — leave as @name
+                return node
+            local = redirect_map.get(node.name)
+            if local is not None:            # reading back this stage's own output
+                return A.Identifier(loc=node.loc, name=local)
+            local = wire_map.get(node.name)
+            if local is not None:            # reading an upstream handoff (DAG edge)
+                return A.Identifier(loc=node.loc, name=local)
         node.name = up + node.name
         return node
 
@@ -186,36 +270,37 @@ def _transform(node, prefix, user_fns, chain_input, prev_out, out_local, is_term
         return node
 
     if cls is A.Assignment:
-        node.value = _transform(node.value, prefix, user_fns, chain_input,
-                                prev_out, out_local, is_terminal)
+        node.value = _transform(node.value, prefix, user_fns, wire_map,
+                                redirect_map, passthrough)
         base = _out_target_binding(node.target)
-        if base is not None and base.kind == "wire" and base.name == "OUT" and not is_terminal:
+        if base is not None and base.kind == "wire" and base.name in redirect_map:
+            local = redirect_map[base.name]
             tgt = node.target
-            if tgt.__class__ is A.BindingRef:                       # @OUT = / @OUT += expr
+            if tgt.__class__ is A.BindingRef:                       # @X = / @X += expr
                 return A.Assignment(loc=node.loc, op=node.op,
-                                    target=A.Identifier(loc=tgt.loc, name=out_local),
+                                    target=A.Identifier(loc=tgt.loc, name=local),
                                     value=node.value)
-            if tgt.__class__ is A.ChannelAccess:                    # @OUT.rgb = expr
-                tgt.object = A.Identifier(loc=tgt.object.loc, name=out_local)
+            if tgt.__class__ is A.ChannelAccess:                    # @X.rgb = expr
+                tgt.object = A.Identifier(loc=tgt.object.loc, name=local)
                 return node
-            # @OUT[x,y] = expr scatters into self.bindings (not env) — not fusable.
+            # @X[x,y] = expr scatters into self.bindings (not env) — not fusable.
             raise FusionError(
                 "This fused chain has a node that scatter-writes @OUT[x,y], which "
                 "can't be passed on to the next node. Break the chain at that node.")
-        node.target = _transform(node.target, prefix, user_fns, chain_input,
-                                 prev_out, out_local, is_terminal)
+        node.target = _transform(node.target, prefix, user_fns, wire_map,
+                                 redirect_map, passthrough)
         return node
 
     # Generic structural recursion over dataclass fields.
     for f in dataclasses.fields(node):
         val = getattr(node, f.name)
         if isinstance(val, A.ASTNode):
-            setattr(node, f.name, _transform(val, prefix, user_fns, chain_input,
-                                             prev_out, out_local, is_terminal))
+            setattr(node, f.name, _transform(val, prefix, user_fns, wire_map,
+                                             redirect_map, passthrough))
         elif isinstance(val, list):
             setattr(node, f.name, [
-                _transform(x, prefix, user_fns, chain_input, prev_out, out_local,
-                           is_terminal) if isinstance(x, A.ASTNode) else x
+                _transform(x, prefix, user_fns, wire_map, redirect_map,
+                           passthrough) if isinstance(x, A.ASTNode) else x
                 for x in val
             ])
 
@@ -255,62 +340,87 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     # input name, and STRUCTURAL binding types (infer_binding_type is value-
     # independent), in stage order. Binding values are deliberately absent:
     # a param tweak hits the memo, an RGB→RGBA swap correctly misses it.
-    # prev_out types need no entry — they are functions of earlier stages'
-    # (code, types), which the key already covers.
-    memo_key = tuple(
-        (st["code"], st.get("chain_input"),
-         tuple(sorted((n, infer_binding_type(v).value)
-                      for n, v in (st.get("bindings") or {}).items())))
-        for st in stages
-    )
-    cached = _FUSED_MEMO.get(memo_key)
-    if cached is not None:
-        _FUSED_MEMO.move_to_end(memo_key)
-        merged = {
+    memo_key = _fused_memo_key(stages, infer_binding_type)
+    def _merged_bindings():
+        return {
             _user_prefix(f"_s{i}_") + name: val
             for i, st in enumerate(stages)
             for name, val in (st.get("bindings") or {}).items()
         }
-        return (*cached, merged)
+
+    cached = _FUSED_MEMO.get(memo_key)
+    if cached is not None:
+        _FUSED_MEMO.move_to_end(memo_key)
+        return (*cached, _merged_bindings())
+
+    # CT-1: disk tier — a persisted result survives process restart, skipping the
+    # full splice + double-typecheck + optimize below.
+    disk = _load_fused_from_disk(memo_key)
+    if disk is not None:
+        _FUSED_MEMO[memo_key] = disk
+        while len(_FUSED_MEMO) > _FUSED_MEMO_MAX:
+            _FUSED_MEMO.popitem(last=False)
+        return (*disk, _merged_bindings())
 
     fused_stmts: list[A.ASTNode] = []
     merged_bindings: dict[str, Any] = {}
-    prev_out: str | None = None
-    prev_out_type = None  # TEXType of the previous stage's @OUT
     n = len(stages)
+    # Q-3 DAG: (handoff_local, type) produced by each (stage, output). Keyed by
+    # (stage_idx, out_name); `_s{i}_out` for @OUT (back-compat), `_s{i}_{name}`
+    # for an extra export.
+    produced: dict[tuple, tuple[str, Any]] = {}
+    tap_exports: list[tuple[int, str]] = []  # (stage_idx, handoff_local) for @_tap_s{i}
 
     for i, st in enumerate(stages):
         prefix = f"_s{i}_"
         is_terminal = (i == n - 1)
-        chain_in = st.get("chain_input")
         ext = st.get("bindings", {})
+
+        # Resolve wired inputs. Legacy `chain_input: str` == a single edge from the
+        # previous stage's @OUT; Q-3 `chain_inputs: {binding: [src_stage, out]}`
+        # generalizes to arbitrary upstream edges (DAG) and named outputs (multi-@OUT).
+        chain_inputs = st.get("chain_inputs")
+        if chain_inputs is None:
+            ci = st.get("chain_input")
+            chain_inputs = {ci: [i - 1, "OUT"]} if ci is not None else {}
 
         # Per-stage binding types for the standalone validation pass (un-prefixed).
         bt = {name: infer_binding_type(val) for name, val in ext.items()}
-        if chain_in is not None:
-            if prev_out_type is None:
-                raise FusionError(f"stage {i} declares a chain input but has no upstream output")
-            bt[chain_in] = prev_out_type
+        wire_map: dict[str, str] = {}
+        for binding, (src_stage, src_out) in chain_inputs.items():
+            src = produced.get((src_stage, src_out))
+            if src is None:
+                raise FusionError(
+                    f"stage {i} wires @{binding} from stage {src_stage}'s "
+                    f"@{src_out}, which isn't produced upstream")
+            wire_map[binding], bt[binding] = src
 
         prog = _parse(st["code"])
         # Standalone type-check: validates the stage (good error attribution) and
-        # gives us @OUT's concrete type for the handoff local.
+        # gives each exported binding's concrete type for its handoff local.
         checker = TypeChecker(binding_types=bt, source=st["code"])
         checker.check(prog)
 
-        out_local = f"_s{i}_out"
-        seed = None
+        # Which of this stage's assigned bindings are exported downstream.
+        # Non-terminal: @OUT always (the primary handoff) + any declared extras
+        # (Q-3 multi-@OUT). Terminal: nothing is redirected (real outputs stay).
+        redirect_map: dict[str, str] = {}
+        seeds: list[A.VarDecl] = []
+        seedless_idx = None
+        ot = checker.assigned_bindings.get("OUT")
         if not is_terminal:
-            ot = checker.assigned_bindings.get("OUT")
             if ot is None:
                 raise FusionError(
                     f"A fused TEX chain needs every upstream node to write @OUT, but "
                     f"stage {i} doesn't — it has nothing to pass to the next node.")
-            extra = [k for k in checker.assigned_bindings if k != "OUT"]
-            if extra:
+            declared_exports = list(st.get("exports") or [])
+            unexpected = [k for k in checker.assigned_bindings
+                          if k != "OUT" and k not in declared_exports]
+            if unexpected:
                 raise FusionError(
-                    f"Upstream stage {i} writes {', '.join('@' + e for e in extra)} "
-                    f"besides @OUT; only single-@OUT nodes fuse. Break the chain there.")
+                    f"Upstream stage {i} writes {', '.join('@' + e for e in unexpected)} "
+                    f"besides @OUT; only single-@OUT (or declared multi-output) nodes "
+                    f"fuse. Break the chain there.")
             if _out_used_in_loop(prog):
                 raise FusionError(
                     f"Upstream stage {i} uses @OUT inside a loop; @OUT has special "
@@ -321,36 +431,74 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
                     f"Upstream stage {i} uses @OUT inside a user-defined function; "
                     f"the handoff local fusion redirects @OUT to isn't in scope there, "
                     f"so fusion can't preserve it. Break the chain at that node.")
-            # If the first top-level @OUT touch is a plain unconditional `@OUT =`,
-            # the handoff local is born from that write (lowered to a VarDecl below)
-            # and the typed-zero seed would be a dead full-frame allocation. Only
-            # the conditional / channel / compound case needs the seed.
+            # @OUT handoff (with the seedless optimization for the plain `@OUT =` case).
+            out_local = f"_s{i}_out"
+            redirect_map["OUT"] = out_local
+            produced[(i, "OUT")] = (out_local, ot)
             seedless_idx = _seedless_out_index(prog.statements)
             if seedless_idx is None:
-                # Declare the handoff local once, at the stage's top level, seeded — so
-                # conditional / channel writes to @OUT are always defined.
-                seed = A.VarDecl(type_name=ot.value, name=out_local,
-                                 initializer=_seed_initializer(ot.value), is_const=False)
-        else:
-            seedless_idx = None
+                seeds.append(A.VarDecl(type_name=ot.value, name=out_local,
+                                       initializer=_seed_initializer(ot.value), is_const=False))
+            # Extra exported outputs (Q-3 multi-@OUT): always seeded handoff locals.
+            for name in declared_exports:
+                et = checker.assigned_bindings.get(name)
+                if et is None:
+                    raise FusionError(
+                        f"stage {i} declares export @{name} but never writes it")
+                loc = f"_s{i}_{name}"
+                redirect_map[name] = loc
+                produced[(i, name)] = (loc, et)
+                seeds.append(A.VarDecl(type_name=et.value, name=loc,
+                                       initializer=_seed_initializer(et.value), is_const=False))
+            if st.get("tap"):
+                tap_exports.append((i, out_local))
 
+        # The terminal's assigned bindings are the chain's real outputs — keep
+        # them unprefixed. Non-terminal outputs all route through redirect_map.
+        passthrough = set(checker.assigned_bindings) if is_terminal else set()
         user_fns = {s.name for s in prog.statements if isinstance(s, A.FunctionDef)}
-        _transform(prog, prefix, user_fns, chain_in, prev_out, out_local, is_terminal)
+        _transform(prog, prefix, user_fns, wire_map, redirect_map, passthrough)
         if seedless_idx is not None:
             # _transform rewrote `@OUT = expr` to `Assignment(Identifier(out_local) = expr)`;
             # promote that first write to the declaration of the handoff local.
             written = prog.statements[seedless_idx]
             prog.statements[seedless_idx] = A.VarDecl(
-                loc=written.loc, type_name=ot.value, name=out_local,
+                loc=written.loc, type_name=ot.value, name=redirect_map["OUT"],
                 initializer=written.value, is_const=False)
-        if seed is not None:
-            fused_stmts.append(seed)
+        fused_stmts.extend(seeds)
+        # Q-4: tag every node in this stage with its stage index so a fused-chain
+        # runtime error can be attributed to the originating linked node.
+        for s in prog.statements:
+            _tag_stage(s, i)
         fused_stmts.extend(prog.statements)
 
         for name, val in ext.items():
             merged_bindings[_user_prefix(prefix) + name] = val
-        prev_out = out_local
-        prev_out_type = None if is_terminal else checker.assigned_bindings.get("OUT")
+
+    # Q-3(c): observed-intermediate taps — expose a marked upstream handoff as a
+    # terminal output @_tap_s{i} so a Preview can read it without breaking the
+    # chain. Respect MAX_OUTPUTS (8, mirrors tex_node.TEXWrangleNode.MAX_OUTPUTS):
+    # taps are optional conveniences, so DROP the excess (with a log) rather than
+    # letting sorted(assigned) overflow the node's output slots and fail the cook.
+    _MAX_FUSED_OUTPUTS = 8
+    # Count outputs already assigned by the spliced stages (recurses into nested
+    # if/for bodies, unlike a flat scan) — its binding-names half is exactly the
+    # set of names that become node output slots.
+    _, _existing_outputs = A.collect_assigned_vars(fused_stmts)
+    _budget = _MAX_FUSED_OUTPUTS - len(_existing_outputs)
+    _dropped = 0
+    for i, out_local in tap_exports:
+        if _budget <= 0:
+            _dropped += 1
+            continue
+        fused_stmts.append(A.Assignment(
+            op="=", target=A.BindingRef(kind="wire", name=f"_tap_s{i}"),
+            value=A.Identifier(name=out_local)))
+        _budget -= 1
+    if _dropped:
+        logger.warning("[TEX] fused chain has more preview taps than free output "
+                       "slots; dropped %d tap(s) beyond MAX_OUTPUTS=%d.",
+                       _dropped, _MAX_FUSED_OUTPUTS)
 
     fused = A.Program(statements=fused_stmts)
     binding_types = {name: infer_binding_type(val) for name, val in merged_bindings.items()}
@@ -380,7 +528,90 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     _FUSED_MEMO[memo_key] = result
     while len(_FUSED_MEMO) > _FUSED_MEMO_MAX:
         _FUSED_MEMO.popitem(last=False)
+    _save_fused_to_disk(memo_key, fused, binding_types)  # CT-1 persist
     return (*result, merged_bindings)
+
+
+def _stage_index_from_error(msg: str):
+    """Best-effort: extract the offending stage index from a FusionError message
+    (they render 'stage {i}'). Returns int or None."""
+    import re
+    m = re.search(r"stage (\d+)", msg)
+    return int(m.group(1)) if m else None
+
+
+def _count_fused_ops(program) -> int:
+    """Cheap tensor-op estimate for the HUD (BinOp + FunctionCall nodes)."""
+    n = 0
+    stack = list(program.statements)
+    while stack:
+        node = stack.pop()
+        cls = node.__class__
+        if cls is A.BinOp or cls is A.FunctionCall:
+            n += 1
+        stack.extend(A.iter_child_nodes(node))
+    return n
+
+
+def chain_preflight(stages: list[dict],
+                    infer_binding_type: Callable[[Any], Any]) -> dict:
+    """Q-5: validate a drawn chain's fusability BEFORE queue time so the bubble
+    can go red with the reason + offending stage immediately, instead of failing
+    the whole queued prompt. Runs the real compile_fused (placeholder binding
+    values are fine — infer_binding_type is value-shape-based) in try/except.
+
+    Returns {ok, error, stage_of_error, stats}. Never raises."""
+    try:
+        prog, tm, refs, asg, params, used, merged = compile_fused(
+            stages, infer_binding_type)
+        return {
+            "ok": True, "error": None, "stage_of_error": None,
+            "stats": {
+                "stages": len(stages),
+                "statements": len(prog.statements),
+                "tensor_ops": _count_fused_ops(prog),
+                "outputs": sorted(asg.keys()),
+            },
+        }
+    except FusionError as e:
+        return {"ok": False, "error": str(e),
+                "stage_of_error": _stage_index_from_error(str(e)), "stats": None}
+    except TypeCheckError as e:
+        return {"ok": False, "error": str(e),
+                "stage_of_error": _stage_index_from_error(str(e)), "stats": None}
+    except Exception as e:  # never let preflight hard-fail the UI
+        return {"ok": False, "error": f"preflight error: {e}",
+                "stage_of_error": None, "stats": None}
+
+
+def preflight_from_spec(spec: dict, terminal_code: str,
+                        infer_binding_type: Callable[[Any], Any]) -> dict:
+    """Q-5 endpoint helper: build placeholder stages from a `_tex_chain` spec
+    (1×8×8×3 zero image per wired input) and preflight them."""
+    import torch
+    placeholder = torch.zeros(1, 8, 8, 3)
+    # Q-5 fix: seed a placeholder terminal binding for the chain-source key BEFORE
+    # assembling. `_stages_from_spec` pops that key as the chain source and raises
+    # if it is missing — passing {} here made EVERY chain preflight as not-fusable
+    # (permanent false-red bubble). The per-stage placeholder loop below then fills
+    # each stage's own wired image inputs.
+    chain_key = spec.get("terminal_image_input")
+    terminal_bindings = {chain_key: placeholder} if chain_key else {}
+    stages = _stages_from_spec(spec, terminal_code, terminal_bindings)
+    for st in stages:
+        binds = st.get("bindings") or {}
+        # Fill any wired image inputs / missing params with harmless placeholders.
+        st["bindings"] = {k: (placeholder if _looks_image(v) else v)
+                          for k, v in binds.items()}
+    return chain_preflight(stages, infer_binding_type)
+
+
+def _looks_image(v) -> bool:
+    try:
+        import torch
+        return isinstance(v, torch.Tensor) and v.dim() >= 3
+    except Exception:
+        return False
 
 
 def prepare_fused(spec: dict, terminal_code: str, terminal_bindings: dict,
@@ -399,6 +630,13 @@ def prepare_fused(spec: dict, terminal_code: str, terminal_bindings: dict,
     used_builtins, merged_bindings) — drop-in for the node's interpreter call with
     output_names = sorted(assigned_bindings).
     """
+    fused_stages = _stages_from_spec(spec, terminal_code, terminal_bindings)
+    return compile_fused(fused_stages, infer_binding_type)
+
+
+def _stages_from_spec(spec: dict, terminal_code: str, terminal_bindings: dict) -> list[dict]:
+    """Assemble the ordered stage list (source-first) from a `_tex_chain` spec.
+    Shared by prepare_fused and fused_fingerprint so both see the same key."""
     stages = spec.get("stages") or []
     if not stages:
         raise FusionError("fused chain payload has no upstream stages")
@@ -425,5 +663,16 @@ def prepare_fused(spec: dict, terminal_code: str, terminal_bindings: dict,
     fused_stages.append({"code": terminal_code,
                          "chain_input": chain_key,
                          "bindings": bindings})
+    return fused_stages
 
-    return compile_fused(fused_stages, infer_binding_type)
+
+def fused_fingerprint(spec: dict, terminal_code: str, terminal_bindings: dict,
+                      infer_binding_type: Callable) -> str | None:
+    """Q-1: the value-independent fingerprint of a fused chain (same key the
+    memo/disk cache use), so the fused program can be a CUDA-graph capture unit.
+    Returns None if the spec can't be assembled."""
+    try:
+        stages = _stages_from_spec(spec, terminal_code, dict(terminal_bindings))
+        return _fused_fp(_fused_memo_key(stages, infer_binding_type))
+    except Exception:
+        return None

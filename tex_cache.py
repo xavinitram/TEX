@@ -12,10 +12,13 @@ checker to regenerate type_map with valid id() keys (~0.1ms, negligible).
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import logging
+import marshal
 import os
 import pickle
+import shutil
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -44,6 +47,9 @@ def _compute_compiler_hash() -> str:
         pkg_dir / "tex_runtime" / "codegen.py",
         pkg_dir / "tex_runtime" / "stdlib.py",
         pkg_dir / "tex_runtime" / "noise.py",
+        # CT-1: fused programs are now persisted, so a splicer change must
+        # invalidate their disk entries too.
+        pkg_dir / "tex_fusion.py",
     ])
     h = hashlib.sha256()
     for p in source_files:
@@ -51,6 +57,10 @@ def _compute_compiler_hash() -> str:
             h.update(p.read_bytes())
         except FileNotFoundError:
             h.update(p.name.encode())
+    # M-5: the out= reuse kill switch changes generated code without changing any
+    # source file, so fold it in — else a persisted .cg blob emitted with reuse ON
+    # is served after the flag is toggled OFF (and vice-versa).
+    h.update(b"cgreuse:" + os.environ.get("TEX_CODEGEN_NO_OUT_REUSE", "").encode())
     return h.hexdigest()[:16]
 
 
@@ -59,11 +69,19 @@ _CACHE_VERSION = _compute_compiler_hash()
 
 # Limits
 _MEMORY_MAX_ENTRIES = 128
+_CODEGEN_MEMORY_MAX_ENTRIES = 128  # in-memory codegen tier (disk sidecar backs evictions)
 _DISK_MAX_ENTRIES = 512
 
 # Cache directory lives alongside tex_cache.py (inside the TEX_Wrangle package)
 _CACHE_DIR_NAME = ".tex_cache"
 _TORCH_COMPILE_CACHE_SUBDIR = "torch_compile"
+
+# PC-3: persisted generated-code (marshal) sidecar. CPython bytecode magic
+# invalidates blobs across interpreter versions (marshal isn't portable).
+_BYTECODE_MAGIC = importlib.util.MAGIC_NUMBER
+# Sentinel for "codegen tried and this program is unsupported" — persisted so a
+# restart doesn't re-attempt emission every time.
+_CG_UNSUPPORTED = object()
 
 # Memoizes computed fingerprints per (code, sorted binding-types tuple) so the
 # SHA256 over the full source runs once per unique program, not on every probe.
@@ -91,6 +109,10 @@ class TEXCache:
             cache_dir = pkg_dir / _CACHE_DIR_NAME
         self._cache_dir = cache_dir
         self._torch_compile_cache_dir = cache_dir / _TORCH_COMPILE_CACHE_SUBDIR
+        # PC-3: fingerprint -> materialized codegen fn (or _CG_UNSUPPORTED).
+        # LRU-bounded (was an unbounded dict — a long session with many distinct
+        # programs grew it without limit; the disk sidecar backs evicted entries).
+        self._codegen_memory: OrderedDict[str, Any] = OrderedDict()
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -225,13 +247,24 @@ class TEXCache:
         self._memory.clear()
 
     def clear_all(self):
-        """Clear both memory and disk caches."""
+        """Clear memory, disk, and torch.compile/inductor caches."""
         self._memory.clear()
+        self._codegen_memory.clear()
         try:
-            for p in self._cache_dir.glob("*.pkl"):
-                p.unlink(missing_ok=True)
+            # *.tmp also sweeps autotier.json.tmp; autotier.json itself (CC-2
+            # measured-tier verdicts) is named explicitly.
+            for pat in ("*.pkl", "*.cg", "*.tmp", "autotier.json"):
+                for p in self._cache_dir.glob(pat):
+                    p.unlink(missing_ok=True)
         except Exception as e:
             logger.warning("[TEX] Disk cache clear failed: %s", e)
+        # Inductor artifacts (~30-60 MB/program) live under torch_compile/ now
+        # that the cache dir is deliberately owned (PC-1). Remove the tree.
+        try:
+            if self._torch_compile_cache_dir.exists():
+                shutil.rmtree(self._torch_compile_cache_dir, ignore_errors=True)
+        except Exception as e:
+            logger.warning("[TEX] torch.compile cache clear failed: %s", e)
 
     # ── Internal: memory tier ─────────────────────────────────────────
 
@@ -247,19 +280,27 @@ class TEXCache:
     def _disk_path(self, fp: str) -> Path:
         return self._cache_dir / f"{fp}.pkl"
 
+    @staticmethod
+    def _atomic_pickle(path: Path, data: Any) -> None:
+        """Pickle *data* to *path* atomically (temp file + os.replace) so a
+        concurrent reader — e.g. a second ComfyUI instance sharing the dir —
+        can never observe a half-written entry."""
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)  # atomic on same-volume NTFS
+
     def _save_to_disk(self, fp: str, program: Any, binding_types: dict[str, TEXType]):
         """Persist compilation artifacts to disk."""
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
-            path = self._disk_path(fp)
             data = {
                 "version": _CACHE_VERSION,
                 "program": program,
                 "binding_types": {k: v.value for k, v in binding_types.items()},
                 "timestamp": time.time(),
             }
-            with open(path, "wb") as f:
-                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            self._atomic_pickle(self._disk_path(fp), data)
             self._evict_disk_if_needed()
         except Exception as e:
             logger.warning("[TEX] Disk cache write failed: %s", e)
@@ -315,8 +356,107 @@ class TEXCache:
             to_remove = len(entries) - _DISK_MAX_ENTRIES
             for p in entries[:to_remove]:
                 p.unlink(missing_ok=True)
+                p.with_suffix(".pkl.tmp").unlink(missing_ok=True)
+                # Drop the paired codegen sidecar (and any orphan .tmp).
+                p.with_suffix(".cg").unlink(missing_ok=True)
+                p.with_suffix(".cg.tmp").unlink(missing_ok=True)
         except Exception as e:
             logger.warning("[TEX] Disk cache eviction failed: %s", e)
+
+    # ── PC-3: generated-code (marshal) persistence ────────────────────
+
+    def _cg_path(self, fp: str) -> Path:
+        return self._cache_dir / f"{fp}.cg"
+
+    def _codegen_memory_put(self, fp: str, val) -> None:
+        """Insert into the in-memory codegen tier as MRU, then LRU-evict to the
+        bound (disk sidecar backs evictions). Mirrors the `_memory` tier's put."""
+        self._codegen_memory[fp] = val
+        self._codegen_memory.move_to_end(fp)
+        while len(self._codegen_memory) > _CODEGEN_MEMORY_MAX_ENTRIES:
+            self._codegen_memory.popitem(last=False)
+
+    def get_codegen_fn(self, fp: str):
+        """Return the codegen fn for *fp*: a callable, the _CG_UNSUPPORTED
+        sentinel, or None (not yet generated — the caller should emit and then
+        call store_codegen_fn). Memory tier first, then the marshal sidecar."""
+        cached = self._codegen_memory.get(fp)
+        if cached is not None:
+            self._codegen_memory.move_to_end(fp)
+            return cached
+        fn = self._load_codegen_from_disk(fp)
+        if fn is not None:
+            self._codegen_memory_put(fp, fn)
+        return fn
+
+    def store_codegen_fn(self, fp: str, fn) -> None:
+        """Record a freshly generated codegen fn (callable) or None (unsupported)
+        in memory and persist it to a marshal sidecar."""
+        if fn is None:
+            self._codegen_memory_put(fp, _CG_UNSUPPORTED)
+            self._persist_codegen(fp, unsupported=True)
+            return
+        self._codegen_memory_put(fp, fn)
+        code = getattr(fn, "_tex_code", None)
+        src = getattr(fn, "_tex_src", None)
+        if code is None or src is None:
+            return  # nothing to persist (fn not from build())
+        try:
+            blob = marshal.dumps(code)
+        except Exception:
+            return
+        self._persist_codegen(
+            fp, blob=blob, sha=hashlib.sha256(blob).hexdigest(),
+            src=src, has_fn_calls=bool(getattr(fn, "_has_fn_calls", False)))
+
+    def _persist_codegen(self, fp: str, *, blob: bytes | None = None,
+                         sha: str = "", src: str = "",
+                         has_fn_calls: bool = False,
+                         unsupported: bool = False) -> None:
+        try:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            data = {
+                "version": _CACHE_VERSION,
+                "magic": _BYTECODE_MAGIC,
+                "unsupported": unsupported,
+                "blob": blob,
+                "sha": sha,
+                "src": src,
+                "has_fn_calls": has_fn_calls,
+            }
+            self._atomic_pickle(self._cg_path(fp), data)
+        except Exception:
+            # Persistence is best-effort — a concurrent reader (second ComfyUI
+            # instance) can PermissionError; codegen simply regenerates next time.
+            pass
+
+    def _load_codegen_from_disk(self, fp: str):
+        path = self._cg_path(fp)
+        if not path.exists():
+            return None
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            if (data.get("version") != _CACHE_VERSION
+                    or data.get("magic") != _BYTECODE_MAGIC):
+                path.unlink(missing_ok=True)
+                return None
+            if data.get("unsupported"):
+                return _CG_UNSUPPORTED
+            blob = data.get("blob")
+            if not blob or hashlib.sha256(blob).hexdigest() != data.get("sha"):
+                path.unlink(missing_ok=True)  # corrupt — never marshal.loads it
+                return None
+            from .tex_runtime.codegen import materialize_codegen
+            return materialize_codegen(blob, data.get("src", ""),
+                                       data.get("has_fn_calls", False), fp)
+        except Exception as e:
+            logger.warning("[TEX] Codegen sidecar load failed for %s…: %s", fp[:12], e)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
 
 
 # ── Module-level singleton ────────────────────────────────────────────
