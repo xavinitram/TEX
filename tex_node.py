@@ -255,7 +255,7 @@ class TEXWrangleNode(_BaseClass):
                     "compile_mode",
                     options=["none", "auto", "torch_compile", "cuda_graph"],
                     default="none",
-                    tooltip="none: standard interpreter (recommended default). auto: EXPERIMENTAL measured auto-tier — runs the fast codegen path and trials torch.compile in the background, committing only on a measured win (the background-compile timing is still being hardened; safe — it only ever falls back to a correct path). torch_compile: force JIT-compile via torch.compile. cuda_graph: CUDA-graph replay of the interpreter (GPU only; big win for small launch-bound programs). All fall back to the interpreter on failure.",
+                    tooltip="none: standard interpreter (recommended default). auto: EXPERIMENTAL measured auto-tier — runs the fast codegen path and trials torch.compile in the background, committing only on a measured win. torch_compile: force JIT-compile via torch.compile. NOTE: auto/torch_compile need Triton for any GPU speedup — Triton is absent on most Windows installs, where they simply fall back to the interpreter on CUDA (CPU torch.compile works but is often slower for small programs). Run `tex doctor` to see whether Triton is present. cuda_graph: CUDA-graph replay (GPU only, needs NO Triton; big win for small launch-bound programs). All tiers fall back to the interpreter on failure.",
                     optional=True,
                 ),
                 IO.Combo.Input(

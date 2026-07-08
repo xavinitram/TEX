@@ -221,3 +221,59 @@ def test_lx5_debug_print(r: SubTestResult):
     else:
         r.ok("probe records value-at-pixel + returns value unchanged (@OUT bit-exact); "
              "codegen falls back so the probe never silently no-ops")
+
+
+def test_dbg4_doctor(r: SubTestResult):
+    print("\n--- DBG-4: tex doctor environment report (never raises) ---")
+    from TEX_Wrangle.tex_doctor import collect_doctor_facts
+    KEYS = {"torch", "triton", "msvc", "cache", "tiers", "recent_tiers"}
+    fails = []
+    facts = collect_doctor_facts()
+    if not KEYS <= set(facts):
+        fails.append(f"missing keys: {KEYS - set(facts)}")
+    # tier routing is reported for every (mode, device)
+    tiers = facts.get("tiers", {})
+    if isinstance(tiers, dict) and "cuda_graph@cuda" not in tiers:
+        fails.append("tier routing not reported")
+
+    # a probe that throws must NOT take the report down — still 200-shaped, all keys,
+    # the failing fact captured as an {error} stub, the others intact.
+    saved = torch.cuda.is_available
+    torch.cuda.is_available = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        facts2 = collect_doctor_facts()
+    except Exception as e:
+        fails.append(f"collect raised when a probe threw: {e}")
+        facts2 = {}
+    finally:
+        torch.cuda.is_available = saved
+    if facts2:
+        if not KEYS <= set(facts2):
+            fails.append("keys dropped when a probe threw")
+        if "error" not in facts2.get("torch", {}):
+            fails.append("torch fact didn't capture the probe error")
+        if not isinstance(facts2.get("tiers"), dict) or "error" in facts2["tiers"]:
+            fails.append("an unrelated fact was collateral-damaged")
+
+    if fails:
+        r.fail("DBG-4 doctor", "; ".join(fails))
+    else:
+        r.ok("doctor reports torch/triton/msvc/cache/tiers/recent_tiers; a throwing probe "
+             "is isolated (all keys stay, others intact) — never 500s")
+
+
+def test_ux2_tooltip_honesty(r: SubTestResult):
+    print("\n--- UX-2: compile_mode tooltip states the Triton reality ---")
+    import re
+    import TEX_Wrangle.tex_node as TN
+    src = Path(TN.__file__).read_text(encoding="utf-8")
+    m = re.search(r'IO\.Combo\.Input\(\s*"compile_mode".*?tooltip="([^"]*)"', src, re.S)
+    tip = m.group(1) if m else ""
+    if "Triton" not in tip:
+        r.fail("UX-2 tooltip", "compile_mode tooltip does not mention Triton (dishonest "
+               "about auto/torch_compile falling back to the interpreter without it)")
+    elif "fall back" not in tip.lower():
+        r.fail("UX-2 tooltip", "tooltip mentions Triton but not the fallback consequence")
+    else:
+        r.ok("compile_mode tooltip is honest: names the Triton dependency + the "
+             "interpreter fallback (points to `tex doctor`)")

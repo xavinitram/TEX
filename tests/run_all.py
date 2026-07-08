@@ -134,7 +134,8 @@ from test_v018_memory import (
 )
 from test_v018_ux import (
     test_dbg1_perf_hud_payload, test_ux1_diagnostics_reachability,
-    test_dbg3_nan_overlay, test_lx5_debug_print,
+    test_dbg3_nan_overlay, test_lx5_debug_print, test_dbg4_doctor,
+    test_ux2_tooltip_honesty,
 )
 
 
@@ -340,6 +341,8 @@ def main():
     test_ux1_diagnostics_reachability(r)
     test_dbg3_nan_overlay(r)
     test_lx5_debug_print(r)
+    test_dbg4_doctor(r)
+    test_ux2_tooltip_honesty(r)
 
     success = r.summary()
     return 0 if success else 1

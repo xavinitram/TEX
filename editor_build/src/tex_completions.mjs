@@ -6,7 +6,9 @@
  *   B. Built-in variables — with type and description
  *   C. @ binding completions — triggered by "@" character
  *   D. $ parameter completions — triggered by "$" character
+ * Plus (LX-6) a hover-tooltip provider reusing the same completion data.
  */
+import { hoverTooltip } from "@codemirror/view";
 
 // ─── Stdlib function completions ─────────────────────────────────────
 
@@ -169,6 +171,49 @@ const VARIABLE_COMPLETIONS = [
 // ─── All non-binding completions ─────────────────────────────────────
 
 const ALL_COMPLETIONS = [...STDLIB_COMPLETIONS, ...TYPE_COMPLETIONS, ...VARIABLE_COMPLETIONS];
+
+// ─── LX-6: hover tooltips (reuse the completion data) ─────────────────
+
+const _HOVER_INDEX = new Map(ALL_COMPLETIONS.map(c => [c.label, c]));
+
+/**
+ * Create a hover-tooltip provider: hovering a known TEX token shows its signature
+ * (detail) + description (info) from the same ALL_COMPLETIONS the autocomplete uses,
+ * so docs are one hover away and can't drift from the completion list.
+ */
+export function createTexHover() {
+    return hoverTooltip((view, pos) => {
+        const line = view.state.doc.lineAt(pos);
+        const text = line.text, base = line.from;
+        const isWord = c => c && /[A-Za-z0-9_]/.test(c);
+        let start = pos, end = pos;
+        while (start > base && isWord(text[start - base - 1])) start--;
+        while (end < line.to && isWord(text[end - base])) end++;
+        if (start >= end) return null;
+        const entry = _HOVER_INDEX.get(text.slice(start - base, end - base));
+        if (!entry) return null;
+        return {
+            pos: start, end, above: true,
+            create() {
+                const dom = document.createElement("div");
+                dom.className = "cm-tooltip-tex-hover";
+                dom.style.cssText = "padding:4px 8px;max-width:360px;font-size:12px";
+                const sig = document.createElement("div");
+                sig.style.fontWeight = "bold";
+                sig.textContent = entry.label + (entry.detail || "");
+                dom.appendChild(sig);
+                if (entry.info) {
+                    const desc = document.createElement("div");
+                    desc.style.opacity = "0.85";
+                    desc.style.marginTop = "2px";
+                    desc.textContent = entry.info;
+                    dom.appendChild(desc);
+                }
+                return { dom };
+            },
+        };
+    });
+}
 
 // ─── Completion function factory ─────────────────────────────────────
 

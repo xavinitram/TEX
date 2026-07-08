@@ -12,9 +12,14 @@ Thread-local because the auto-tier's background compile runs on a worker thread;
 each cook's record lives on the thread that produced its result. Recording is
 one attribute write per cook (never per-pixel) — perf-neutral.
 """
+import collections
 import threading
 
 _local = threading.local()
+
+# DBG-4: a small PROCESS-wide ring of recent tier decisions, so the `tex doctor` route
+# (which runs on the server thread, not the cook thread) can report what actually ran.
+_ring = collections.deque(maxlen=16)
 
 
 class TierRecord:
@@ -37,6 +42,12 @@ def record(tier, fallback_from=None, reason=None):
     (codegen success/fallback, graph replay); the interpreter primitive itself
     does not record, so a fallback shows as tier='interpreter'."""
     _local.last = TierRecord(tier, fallback_from, reason)
+    _ring.append({"tier": tier, "fallback_from": fallback_from, "reason": reason})
+
+
+def recent():
+    """DBG-4: the recent process-wide tier decisions (newest last), for `tex doctor`."""
+    return list(_ring)
 
 
 def last():

@@ -1337,6 +1337,10 @@ function createTexEditor(node, codeWidget, updateSockets) {
                     CM6.tooltips({
                         position: "absolute",
                     }),
+                    // LX-6: hover docs — signature + description on hover, from the same
+                    // completion data. Guarded so an older bundle (no createTexHover)
+                    // still loads the editor.
+                    ...(CM6.createTexHover ? [CM6.createTexHover()] : []),
                     // Lint gutter (error markers)
                     CM6.lintGutter(),
                     // Listen for doc changes → sync to widget + update sockets

@@ -227,6 +227,16 @@ try:
             pass
         return web.json_response({"ok": freed})
 
+    @routes.get("/tex_wrangle/doctor")
+    async def doctor(request):
+        """DBG-4: environment + tier-availability report for troubleshooting. Every
+        probe is isolated, so this never 500s — always 200 with all keys."""
+        try:
+            from .tex_doctor import collect_doctor_facts
+            return web.json_response(collect_doctor_facts())
+        except Exception as e:
+            return web.json_response({"error": f"{type(e).__name__}: {e}"})
+
     @routes.post("/tex_wrangle/chain_preflight")
     async def chain_preflight(request):
         """Q-5: validate a drawn fusion chain before queue time. Body:

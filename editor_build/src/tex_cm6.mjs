@@ -32,7 +32,7 @@ import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 
 // ── TEX-specific modules ──
 import { texLanguageDef, TEX_KEYWORDS, TEX_BUILTINS, TEX_CONSTANTS, TEX_COORD_VARS } from "./tex_language.mjs";
-import { createTexCompletions } from "./tex_completions.mjs";
+import { createTexCompletions, createTexHover } from "./tex_completions.mjs";
 import { texEditorTheme, texHighlightStyle } from "./tex_theme.mjs";
 import { texErrorToDiagnostics, setDiagnostics } from "./tex_lint.mjs";
 
@@ -91,6 +91,7 @@ const TEX_CM6_API = {
     // Autocomplete
     autocompletion,
     createTexCompletions,
+    createTexHover,
     startCompletion,
     closeCompletion,
     completionStatus,
@@ -129,6 +130,7 @@ export {
     TEX_COORD_VARS,
     autocompletion,
     createTexCompletions,
+    createTexHover,
     startCompletion,
     closeCompletion,
     completionStatus,
