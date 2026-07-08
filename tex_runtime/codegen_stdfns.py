@@ -362,7 +362,9 @@ class _EmitStdFnsMixin:
         op = _IMG_REDUCE_OPS.get(node.name)
         if op is None:
             return None
-        self._emit(f"{tmp} = {args[0]}.{op}(dim=(1, 2), keepdim=True)")
+        # PR-LP4: mirror fn_img_* — .float() before the reduce so an fp16 sum can't
+        # overflow to inf; a no-op on fp32 so this stays bit-identical to the interp.
+        self._emit(f"{tmp} = {args[0]}.float().{op}(dim=(1, 2), keepdim=True)")
         return tmp
 
     @_emits("transpose", "determinant", "inverse")

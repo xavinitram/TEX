@@ -1967,7 +1967,10 @@ class TEXStdlib:
         """Sum of all pixels per channel per frame. Returns broadcast-friendly shape."""
         img = _to_tensor(image)
         if img.dim() >= 3:
-            return img.sum(dim=(1, 2), keepdim=True)
+            # PR-LP4: accumulate + return fp32 — an fp16 sum overflows to inf at
+            # >=1024^2 (5.2e5 > 65504). .float() is a no-op on fp32 (bit-identical,
+            # and identically mirrored in codegen_stdfns), so never cast the result back.
+            return img.float().sum(dim=(1, 2), keepdim=True)
         return img
 
     @stdlib("img_mean", non_local=True, doc='Per-channel mean (average) of the image.', ex='vec3 avg = img_mean(@A);')
@@ -1976,7 +1979,7 @@ class TEXStdlib:
         """Mean of all pixels per channel per frame."""
         img = _to_tensor(image)
         if img.dim() >= 3:
-            return img.mean(dim=(1, 2), keepdim=True)
+            return img.float().mean(dim=(1, 2), keepdim=True)  # PR-LP4: fp32 accumulate
         return img
 
     @stdlib("img_min", non_local=True, doc='Per-channel minimum across the entire image.', ex='vec3 lo = img_min(@A);')
@@ -1985,7 +1988,7 @@ class TEXStdlib:
         """Min pixel value per channel per frame."""
         img = _to_tensor(image)
         if img.dim() >= 3:
-            return img.amin(dim=(1, 2), keepdim=True)
+            return img.float().amin(dim=(1, 2), keepdim=True)  # PR-LP4: fp32 return
         return img
 
     @stdlib("img_max", non_local=True, doc='Per-channel maximum across the entire image.', ex='vec3 hi = img_max(@A);')
@@ -1994,14 +1997,14 @@ class TEXStdlib:
         """Max pixel value per channel per frame."""
         img = _to_tensor(image)
         if img.dim() >= 3:
-            return img.amax(dim=(1, 2), keepdim=True)
+            return img.float().amax(dim=(1, 2), keepdim=True)  # PR-LP4: fp32 return
         return img
 
     @stdlib("img_median", non_local=True, doc='Per-channel median of the image.', ex='vec3 mid = img_median(@A);')
     @staticmethod
     def fn_img_median(image) -> torch.Tensor:
         """Median pixel value per channel per frame."""
-        img = _to_tensor(image)
+        img = _to_tensor(image).float()  # PR-LP4: reduce + return fp32 (fp16-safe)
         if img.dim() == 4:
             B, H, W, C = img.shape
             flat = img.reshape(B, H * W, C)

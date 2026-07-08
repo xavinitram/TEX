@@ -44,7 +44,20 @@ def last():
     return getattr(_local, "last", None)
 
 
+def record_precision(precision, reason=None):
+    """PR-LP2: record the resolved precision for this cook (especially the auto-mode
+    fp16/fp32 decision) + why. Surfaced by the DBG-1 HUD and asserted by the auto
+    gate's determinism test — so the decision is never silent."""
+    _local.precision = (precision, reason)
+
+
+def last_precision():
+    """(precision, reason) for the last cook on this thread, or None."""
+    return getattr(_local, "precision", None)
+
+
 def reset():
     """Clear this thread's record (tests call this before a cook to detect a
     tier that silently didn't run at all)."""
     _local.last = None
+    _local.precision = None

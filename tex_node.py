@@ -241,9 +241,9 @@ class TEXWrangleNode(_BaseClass):
                 ),
                 IO.Combo.Input(
                     "precision",
-                    options=["fp32", "fp16"],
+                    options=["fp32", "auto", "fp16"],
                     default="fp32",
-                    tooltip="fp32: full precision (default). fp16: EXPERIMENTAL half-precision IMAGE-class temps (coordinates & sampling stay fp32; ~1e-3 accuracy, and it diverges on threshold/branch programs — see CHANGELOG). Cuts peak/churn ~30% when the INPUT is already fp16; for an fp32 input the cast can raise peak, so it's most useful in all-fp16 pipelines. LATENT stays fp32.",
+                    tooltip="fp32: full precision (default). auto: fp16 ONLY where it measurably wins and stays accurate — CUDA, >=1024x1024, pointwise programs with no sampling/scatter/reduction and no image-derived threshold (measured 1.4-1.5x on grade-class); everything else runs fp32. fp16: EXPERIMENTAL — force half-precision IMAGE-class temps (coordinates & sampling stay fp32; ~1e-3 accuracy, diverges on threshold/branch programs). LATENT stays fp32.",
                     optional=True,
                 ),
                 # Wildcard input so the node appears in the search panel
@@ -579,6 +579,23 @@ class TEXWrangleNode(_BaseClass):
             # STR-2/STR-3: bundle every arg the tiers need once (fp hoisted here so no
             # strategy re-touches execute()'s locals), select the tier (pure), dispatch
             # to its strategy, and normalize the output shape in ONE place.
+            # PR-LP2: resolve precision="auto" now that the program + resolution are
+            # known — fp16 only in the measured win region (CUDA, >=1024^2, pointwise,
+            # no image-derived threshold); fp32 otherwise. Record the decision + reason
+            # (tier_trace) so it's never silent. fp16 stays out of the compiled/graph
+            # tiers this cycle (mirrors the compile-mode fp32 force above).
+            auto_fp16 = False
+            if precision == "auto":
+                from .tex_runtime.precision_policy import resolve_auto_precision
+                from .tex_runtime import tier_trace
+                dev_type = torch.device(device).type
+                spatial_px = next((v.shape[1] * v.shape[2] for v in bindings.values()
+                                   if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)
+                precision, auto_reason = resolve_auto_precision(program, spatial_px, dev_type)
+                if precision == "fp16" and compile_mode != "none":
+                    precision, auto_reason = "fp32", auto_reason + " [compiled tier: fp32]"
+                auto_fp16 = precision == "fp16"
+                tier_trace.record_precision(precision, auto_reason)
             # M-3: LATENT data exceeds [0,1] and feeds further math, so it must stay
             # fp32 even in fp16 mode.
             eff_precision = "fp32" if has_latent_input else precision
@@ -591,6 +608,22 @@ class TEXWrangleNode(_BaseClass):
             raw_output = getattr(cls, cls._TIER_METHOD[tier_id])(ctx)
             if not isinstance(raw_output, dict):
                 raw_output = {output_names[0]: raw_output}
+
+            # PR-LP2 safety net: an auto->fp16 cook can still go non-finite on a
+            # fp16-fragile pointwise program the static gate can't tell from grade's
+            # safe pow (e.g. brightness_contrast's pivot pow -> NaN). Cheap all-reduce
+            # on the auto-fp16 path only; on a NaN/Inf, transparently re-cook fp32.
+            if auto_fp16 and eff_precision == "fp16" and any(
+                    isinstance(v, torch.Tensor) and not torch.isfinite(v).all()
+                    for v in raw_output.values()):
+                from .tex_runtime import tier_trace
+                tier_trace.record_precision("fp32", "auto: fp16 non-finite -> fp32 fallback")
+                ctx = ExecContext(program, bindings, type_map, device, code,
+                                  latent_channel_count, output_names, used_builtins,
+                                  "fp32", fp, fused_chain, fused_fp)
+                raw_output = getattr(cls, cls._TIER_METHOD[tier_id])(ctx)
+                if not isinstance(raw_output, dict):
+                    raw_output = {output_names[0]: raw_output}
 
             # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
             # oldest mip/grid entries; allocate-and-hold semantics untouched).
