@@ -103,6 +103,25 @@ from test_v016_phase4 import (
     test_sl4_morphology, test_lx8_const_arrays, test_lx9_self_swizzle_write,
     test_sl2_fp16_divide_guard,
 )
+from test_no_numpy_ban import test_no_numpy_ban
+from test_release_gate import test_version_consistency, test_codegen_determinism
+from test_v017_phase1 import (
+    test_tst5_tier_trace,
+    test_tst6_registry_parity,
+    test_tst2_edge_matrix,
+    test_tst4_operator_completeness,
+    test_tst1_differential_fuzzer,
+    test_tst7_runner_coverage,
+)
+from test_v017_phase2 import (
+    test_reg1_registry_parity, test_tst3_taxonomy_consistency, test_doc4_reference,
+    test_doc5_examples_index, test_reg2_loc_budget,
+)
+from test_v017_phase3 import (
+    test_str5_passes_order, test_str6_emit_dispatch_registry,
+    test_str7_codegen_split, test_str9_stmt_dispatch, test_str4_write_collectors,
+    test_str2_select_tier_matrix, test_c2_clamp_mixed_bounds,
+)
 
 
 def main():
@@ -266,6 +285,27 @@ def main():
     test_lx8_const_arrays(r)
     test_lx9_self_swizzle_write(r)
     test_sl2_fp16_divide_guard(r)
+    test_no_numpy_ban(r)
+    test_version_consistency(r)
+    test_codegen_determinism(r)
+    test_tst5_tier_trace(r)
+    test_tst6_registry_parity(r)
+    test_tst2_edge_matrix(r)
+    test_tst4_operator_completeness(r)
+    test_tst1_differential_fuzzer(r)
+    test_tst7_runner_coverage(r)
+    test_reg1_registry_parity(r)
+    test_tst3_taxonomy_consistency(r)
+    test_doc4_reference(r)
+    test_doc5_examples_index(r)
+    test_reg2_loc_budget(r)
+    test_str5_passes_order(r)
+    test_str6_emit_dispatch_registry(r)
+    test_str7_codegen_split(r)
+    test_str9_stmt_dispatch(r)
+    test_str4_write_collectors(r)
+    test_str2_select_tier_matrix(r)
+    test_c2_clamp_mixed_bounds(r)
 
     success = r.summary()
     return 0 if success else 1

@@ -14,7 +14,7 @@ from TEX_Wrangle.tex_runtime.codegen import try_compile as try_codegen, _CgBreak
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib, SAFE_EPSILON
 from TEX_Wrangle.tex_runtime.interpreter import _broadcast_pair, _ensure_spatial
 from TEX_Wrangle.tex_runtime.compiled import _build_codegen_env, _MAX_LOOP_ITERATIONS
-from TEX_Wrangle.tex_compiler.type_checker import CHANNEL_MAP
+from TEX_Wrangle.tex_compiler.types import CHANNEL_MAP
 
 assert torch.cuda.is_available()
 allp = {p.name: p for p in (list(SYNTHETIC_PROGRAMS) + list(load_example_programs()))}

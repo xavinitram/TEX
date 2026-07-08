@@ -1,0 +1,50 @@
+"""
+TST-5 — tier-execution observability.
+
+Records which acceleration tier actually served the last cook, and (on a
+fallback) which tier declined and why. Replaces the `_show_once`-and-forget
+logging and the fragile per-test `_plain_execute` monkeypatch: a tier that
+*stops* engaging becomes a red test (`tier_trace.last().tier != 'codegen'`),
+not a silent 3x slowdown — and the fuzzer/edge-matrix can assert "no unexpected
+fallback" for free.
+
+Thread-local because the auto-tier's background compile runs on a worker thread;
+each cook's record lives on the thread that produced its result. Recording is
+one attribute write per cook (never per-pixel) — perf-neutral.
+"""
+import threading
+
+_local = threading.local()
+
+
+class TierRecord:
+    __slots__ = ("tier", "fallback_from", "reason")
+
+    def __init__(self, tier, fallback_from=None, reason=None):
+        self.tier = tier                    # which tier PRODUCED the result
+        self.fallback_from = fallback_from  # the tier that declined, if any
+        self.reason = reason                # why it declined (diagnostics)
+
+    def __repr__(self):
+        if self.fallback_from:
+            return (f"<TierRecord {self.tier} (fell back from {self.fallback_from}"
+                    f": {self.reason})>")
+        return f"<TierRecord {self.tier}>"
+
+
+def record(tier, fallback_from=None, reason=None):
+    """Record the tier that served this cook. Called at the tier-DECISION sites
+    (codegen success/fallback, graph replay); the interpreter primitive itself
+    does not record, so a fallback shows as tier='interpreter'."""
+    _local.last = TierRecord(tier, fallback_from, reason)
+
+
+def last():
+    """The last cook's TierRecord on this thread, or None."""
+    return getattr(_local, "last", None)
+
+
+def reset():
+    """Clear this thread's record (tests call this before a cook to detect a
+    tier that silently didn't run at all)."""
+    _local.last = None

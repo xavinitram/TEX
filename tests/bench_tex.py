@@ -38,7 +38,8 @@ sys.path.insert(0, _custom_nodes_dir)
 import torch
 from TEX_Wrangle.tex_compiler.lexer import Lexer
 from TEX_Wrangle.tex_compiler.parser import Parser
-from TEX_Wrangle.tex_compiler.type_checker import TypeChecker, TEXType
+from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
+from TEX_Wrangle.tex_compiler.types import TEXType
 from TEX_Wrangle.tex_compiler.optimizer import optimize
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter, _collect_identifiers
 from TEX_Wrangle.tex_cache import TEXCache

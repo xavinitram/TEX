@@ -377,6 +377,50 @@ def iter_child_nodes(node):
                     yield x
 
 
+class NodeVisitor:
+    """CPython-`ast`-style visitor over `iter_child_nodes` (STR-4).
+
+    `visit(node)` dispatches to `visit_<ClassName>` if defined, else `generic_visit`,
+    which recurses into every child via `iter_child_nodes` — so a NEW ASTNode field
+    on a node is traversed automatically instead of silently escaping a hand-written
+    walk (the exact hazard `iter_child_nodes`'s docstring warns about). Override a
+    `visit_X` for the nodes whose traversal is *selective* (a write target, a leaf
+    that contributes a name, a field to skip), and call `self.generic_visit(node)`
+    from it when you also want the default recursion."""
+
+    def visit(self, node):
+        return getattr(self, "visit_" + type(node).__name__, self.generic_visit)(node)
+
+    def generic_visit(self, node):
+        for child in iter_child_nodes(node):
+            self.visit(child)
+
+
+class NodeTransformer(NodeVisitor):
+    """A `NodeVisitor` that rewrites the tree in place: `generic_visit` replaces each
+    child (or list of children) with the result of visiting it, and returns `node`.
+    A `visit_X` returning a different node substitutes it; returning None drops it
+    from its containing list (matching CPython's `ast.NodeTransformer`)."""
+
+    def generic_visit(self, node):
+        for f in _fields(type(node)):
+            old = getattr(node, f.name)
+            if isinstance(old, ASTNode):
+                setattr(node, f.name, self.visit(old))
+            elif isinstance(old, list):
+                new = []
+                for x in old:
+                    if isinstance(x, ASTNode):
+                        r = self.visit(x)
+                        if r is None:
+                            continue
+                        new.append(r)
+                    else:
+                        new.append(x)
+                old[:] = new
+        return node
+
+
 def try_extract_static_range(node: ForLoop) -> tuple[str, int, int, int] | None:
     """Extract a fully static for-loop as (var_name, start, stop, step).
 

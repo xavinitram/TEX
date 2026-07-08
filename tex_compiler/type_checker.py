@@ -25,8 +25,14 @@ Output types:
   vec4: 4-channel image (RGBA)
 """
 from __future__ import annotations
-from enum import Enum
 from dataclasses import dataclass, field
+# STR-1: the type vocabulary lives in the dependency-free `types` leaf. Re-imported
+# here so `type_checker`'s own logic — and any legacy `from .type_checker import
+# TEXType` — keep working, but the pipeline's other modules now depend on `.types`.
+from .types import (
+    TEXType, TEXArrayType, TYPE_NAME_MAP, CHANNEL_MAP, VALID_SWIZZLES,
+    _VEC_RANK, _VEC_SIZE_TYPE,
+)
 from .ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
     BreakStmt, ContinueStmt, FunctionDef, ReturnStmt,
@@ -41,106 +47,15 @@ from .diagnostics import (
 )
 
 
-class TEXType(Enum):
-    INT = "int"
-    FLOAT = "float"
-    VEC2 = "vec2"
-    VEC3 = "vec3"
-    VEC4 = "vec4"
-    MAT3 = "mat3"
-    MAT4 = "mat4"
-    STRING = "string"
-    ARRAY = "array"  # fixed-size array; metadata in TEXArrayType
-    VOID = "void"    # for statements
-
-    @property
-    def is_scalar(self) -> bool:
-        return self in (TEXType.INT, TEXType.FLOAT)
-
-    @property
-    def is_vector(self) -> bool:
-        return self in (TEXType.VEC2, TEXType.VEC3, TEXType.VEC4)
-
-    @property
-    def is_matrix(self) -> bool:
-        return self in (TEXType.MAT3, TEXType.MAT4)
-
-    @property
-    def is_string(self) -> bool:
-        return self == TEXType.STRING
-
-    @property
-    def is_array(self) -> bool:
-        return self == TEXType.ARRAY
-
-    @property
-    def is_numeric(self) -> bool:
-        return self in (TEXType.INT, TEXType.FLOAT, TEXType.VEC2, TEXType.VEC3,
-                        TEXType.VEC4, TEXType.MAT3, TEXType.MAT4)
-
-    @property
-    def channels(self) -> int:
-        if self == TEXType.VEC2:
-            return 2
-        elif self == TEXType.VEC3:
-            return 3
-        elif self == TEXType.VEC4:
-            return 4
-        elif self == TEXType.MAT3:
-            return 9
-        elif self == TEXType.MAT4:
-            return 16
-        return 1
-
-    @property
-    def mat_size(self) -> int:
-        """Matrix dimension (3 for mat3, 4 for mat4). 0 for non-matrix types."""
-        if self == TEXType.MAT3:
-            return 3
-        elif self == TEXType.MAT4:
-            return 4
-        return 0
+# TEXType / TEXArrayType / TYPE_NAME_MAP / _VEC_RANK / _VEC_SIZE_TYPE / CHANNEL_MAP
+# / VALID_SWIZZLES now live in `.types` (STR-1) and are imported at the top of this
+# module. `type_checker` keeps only the checking logic below.
 
 
-@dataclass
-class TEXArrayType:
-    """Metadata for an array type: element type + fixed size."""
-    element_type: TEXType  # FLOAT, INT, VEC3, VEC4, or STRING
-    size: int
-
-
-TYPE_NAME_MAP = {
-    "float": TEXType.FLOAT,
-    "int": TEXType.INT,
-    "vec2": TEXType.VEC2,
-    "vec3": TEXType.VEC3,
-    "vec4": TEXType.VEC4,
-    "mat3": TEXType.MAT3,
-    "mat4": TEXType.MAT4,
-    "string": TEXType.STRING,
-}
-
-_VEC_RANK = {TEXType.VEC2: 0, TEXType.VEC3: 1, TEXType.VEC4: 2}
-_VEC_SIZE_TYPE = {2: TEXType.VEC2, 3: TEXType.VEC3, 4: TEXType.VEC4}
-
-# Valid swizzle characters and their meanings
-CHANNEL_MAP = {
-    "r": 0, "g": 1, "b": 2, "a": 3,
-    "x": 0, "y": 1, "z": 2, "w": 3,
-}
-
-# Valid multi-channel swizzles
-VALID_SWIZZLES = {
-    "rg", "rb", "ra", "gr", "gb", "ga", "br", "bg", "ba", "ar", "ag", "ab",
-    "xy", "xz", "xw", "yx", "yz", "yw", "zx", "zy", "zw", "wx", "wy", "wz",
-    "rgb", "rgba", "xyz", "xyzw",
-    "bgr", "abgr",
-}
-
-
-# stdlib_signatures imports TEXType from this module at load time, so a plain
-# module-level import of FUNCTION_SIGNATURES here would be circular (it would
-# break whenever stdlib_signatures is imported first). Bind the table lazily.
+# STR-1 broke the old stdlib_signatures↔type_checker cycle (stdlib_signatures now
+# takes its TEXType from `.types`, not from here). The table is still bound lazily
+# so importing the checker alone doesn't eagerly drag in the whole signature table,
+# and to stay robust to import order.
 _FUNCTION_SIGNATURES: dict | None = None
 
 
@@ -377,6 +292,7 @@ class TypeChecker:
     # -- Statement checking ---------------------------------------------
 
     def _check_stmt(self, node: ASTNode):
+        """Dispatch a statement node to its type-checking handler."""
         handler = _STMT_HANDLERS.get(node.__class__)
         if handler is None:
             self._error(f"This statement type isn't recognized: {type(node).__name__}.", node.loc,
@@ -385,18 +301,22 @@ class TypeChecker:
         handler(self, node)
 
     def _check_error_node(self, node: ErrorNode):
+        """An ErrorNode (parser recovery) type-checks as VOID; its error was already reported."""
         return  # Skip — already reported by parser
 
     def _check_expr_statement(self, node: ExprStatement):
+        """Type-check a bare-expression statement (evaluated for its effect)."""
         self._check_expr(node.expr)
 
     def _check_break_continue(self, node: ASTNode):
+        """Validate that break/continue appears inside a loop."""
         kind = "break" if node.__class__ is BreakStmt else "continue"
         if self._loop_depth <= 0:
             self._error(f"'{kind}' statement outside of a loop.", node.loc, code="E3002",
                         hint=f"'{kind}' can only be used inside for or while loops.")
 
     def _check_var_decl(self, node: VarDecl):
+        """Type-check a variable declaration: the initializer must be assignable to the declared type."""
         declared_type = TYPE_NAME_MAP.get(node.type_name)
         if declared_type is None:
             hint = (get_type_hint(node.type_name)
@@ -588,6 +508,7 @@ class TypeChecker:
         self._set_type(node, TEXType.VOID)
 
     def _check_assignment(self, node: Assignment):
+        """Type-check an assignment: the value must be assignable to the target's type."""
         target_type = self._check_expr(node.target)
         value_type = self._check_expr(node.value)
 
@@ -718,12 +639,14 @@ class TypeChecker:
         self._set_type(node, TEXType.VOID)
 
     def _check_scalar_condition(self, cond_type: TEXType, keyword: str, loc):
+        """Require a condition expression to be a scalar (float/int) value."""
         if cond_type.is_vector:
             self._error(f"This '{keyword}' condition needs a scalar expression (int or float), but found a vector.",
                         loc, code="E3500",
                         hint="Try using a single component like .r or .x, or compare with length().")
 
     def _check_if_else(self, node: IfElse):
+        """Type-check an if/else: a scalar condition plus both branch bodies."""
         cond_type = self._check_expr(node.condition)
         self._check_scalar_condition(cond_type, "if", node.loc)
 
@@ -741,6 +664,7 @@ class TypeChecker:
         self._set_type(node, TEXType.VOID)
 
     def _check_for_loop(self, node: ForLoop):
+        """Type-check a for-loop: init / scalar condition / update plus the loop-scoped body."""
         self._push_scope()
 
         # Check init
@@ -763,6 +687,7 @@ class TypeChecker:
         self._set_type(node, TEXType.VOID)
 
     def _check_while_loop(self, node: WhileLoop):
+        """Type-check a while-loop: a scalar condition plus the body."""
         self._push_scope()
 
         cond_type = self._check_expr(node.condition)
@@ -777,6 +702,7 @@ class TypeChecker:
         self._set_type(node, TEXType.VOID)
 
     def _check_function_def(self, node: FunctionDef):
+        """Type-check a user function definition: parameters, body, and return-type consistency."""
         if self._current_function_return_type is not None:
             self._error("Functions cannot be defined inside other functions.",
                         node.loc, code="E3014",
@@ -827,6 +753,7 @@ class TypeChecker:
         self._set_type(node, TEXType.VOID)
 
     def _check_return_stmt(self, node: ReturnStmt):
+        """Type-check a return: the value's type must match the enclosing function's return type."""
         if self._current_function_return_type is None:
             self._error("'return' can only appear inside a function body.",
                         node.loc, code="E3012",
@@ -847,6 +774,7 @@ class TypeChecker:
     # -- Expression checking --------------------------------------------
 
     def _check_expr(self, node: ASTNode) -> TEXType:
+        """Dispatch an expression node to its type-inference handler; returns its TEXType."""
         handler = _EXPR_HANDLERS.get(node.__class__)
         if handler is None:
             self._error(f"This expression type isn't recognized: {type(node).__name__}.",
@@ -857,16 +785,19 @@ class TypeChecker:
         return handler(self, node)
 
     def _check_number_literal(self, node: NumberLiteral) -> TEXType:
+        """A numeric literal is INT when integer-valued, else FLOAT."""
         t = TEXType.INT if node.is_int else TEXType.FLOAT
         self._set_type(node, t)
         return t
 
     def _check_string_literal(self, node: StringLiteral) -> TEXType:
+        """A string literal has type STRING."""
         self._set_type(node, TEXType.STRING)
         return TEXType.STRING
 
     def _check_array_literal_expr(self, node: ArrayLiteral) -> TEXType:
         # Standalone array literals only appear in declarations (handled there)
+        """Infer an array literal's element type and fixed size from its elements."""
         self._error("Array literal '{...}' can only appear in array declarations.",
                     node.loc, code="E3900",
                     hint="Try: float arr[] = {1, 2, 3}; — array literals need a declaration.")
@@ -874,6 +805,7 @@ class TypeChecker:
         return TEXType.ARRAY
 
     def _check_identifier(self, node: Identifier) -> TEXType:
+        """Resolve an identifier to its declared variable/builtin type in the current scope."""
         t = self._lookup_var(node.name)
         if t is None:
             # Collect all variables in scope for suggestions
@@ -895,6 +827,7 @@ class TypeChecker:
         return t
 
     def _check_binding_ref(self, node: BindingRef) -> TEXType:
+        """Resolve an @/$ binding reference to its input/parameter type."""
         self.referenced_bindings.add(node.name)
 
         # $ parameter bindings — type from declaration or type hint
@@ -963,6 +896,7 @@ class TypeChecker:
         return ret
 
     def _check_channel_access(self, node: ChannelAccess) -> TEXType:
+        """Type-check a swizzle/channel access (.rgb/.xy…): validate channels against the base width."""
         obj_type = self._check_expr(node.object)
         channels = node.channels
 
@@ -1027,6 +961,7 @@ class TypeChecker:
             return TEXType.FLOAT
 
     def _check_binop(self, node: BinOp) -> TEXType:
+        """Type-check a binary operation: promote the operands and compute the result type."""
         lt = self._check_expr(node.left)
         rt = self._check_expr(node.right)
 
@@ -1075,6 +1010,7 @@ class TypeChecker:
         return result
 
     def _check_unary(self, node: UnaryOp) -> TEXType:
+        """Type-check a unary operation (-/!): the operand must be numeric/scalar."""
         t = self._check_expr(node.operand)
         if t.is_string:
             self._error(f"Unary operator '{node.op}' is not supported for strings.",
@@ -1090,6 +1026,7 @@ class TypeChecker:
         return t
 
     def _check_ternary(self, node: TernaryOp) -> TEXType:
+        """Type-check a ternary: a scalar condition plus the promoted common type of both arms."""
         self._check_expr(node.condition)
         tt = self._check_expr(node.true_expr)
         ft = self._check_expr(node.false_expr)
@@ -1103,6 +1040,7 @@ class TypeChecker:
         return result
 
     def _check_vec_constructor(self, node: VecConstructor) -> TEXType:
+        """Type-check a vecN constructor: the component widths must sum to N."""
         arg_types: list[TEXType] = []
         for arg in node.args:
             arg_type = self._check_expr(arg)
@@ -1142,6 +1080,7 @@ class TypeChecker:
         return t
 
     def _check_mat_constructor(self, node: MatConstructor) -> TEXType:
+        """Type-check a matN constructor (scalar-diagonal or full component list)."""
         for arg in node.args:
             arg_type = self._check_expr(arg)
             if arg_type.is_string:
@@ -1241,6 +1180,7 @@ class TypeChecker:
             return lt if lt.is_matrix else rt
 
     def _check_cast(self, node: CastExpr) -> TEXType:
+        """Type-check an explicit cast to a numeric/vector target type."""
         expr_type = self._check_expr(node.expr)
         t = TYPE_NAME_MAP.get(node.target_type, TEXType.FLOAT)
         # string(vec3/vec4/mat3/mat4) is not allowed — the str conversion code
@@ -1287,6 +1227,7 @@ class TypeChecker:
         return elem_type
 
     def _check_function_call(self, node: FunctionCall) -> TEXType:
+        """Type-check a stdlib/user call: argument count plus the signature's return-type rule."""
         arg_types = [self._check_expr(arg) for arg in node.args]
 
         # Validate len() argument type: only STRING and ARRAY allowed

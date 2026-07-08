@@ -14,8 +14,22 @@ import struct
 import torch
 from typing import Any
 
-from .tex_compiler.type_checker import TEXType
+from .tex_compiler.types import TEXType
 from .tex_runtime.stdlib import LUMA_R, LUMA_G, LUMA_B
+
+
+def to_fp32_if_int_image(t):
+    """M5-INT: an integer image-like tensor binding (dim>=3, not bool) has TEX type
+    VECn (float), so BOTH the interpreter and codegen cast it to fp32 at ingestion —
+    otherwise the tiers diverge for FLOAT/LATENT outputs (or int64 values > 2^24).
+    Scalar int params / int index arrays (dim<3) and bool masks pass through.
+
+    Single source for both ingestion paths (the interpreter binding loop and
+    codegen's `_contiguous_bindings`); guarded by the M5-INT bit-exactness test."""
+    if (isinstance(t, torch.Tensor) and t.dim() >= 3
+            and not t.is_floating_point() and t.dtype != torch.bool):
+        return t.to(torch.float32)
+    return t
 
 
 # ── Tensor fingerprinting ──

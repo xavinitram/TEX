@@ -36,7 +36,11 @@ from ..tex_compiler.ast_nodes import (
     collect_assigned_vars,
     iter_child_nodes as _ast_iter_child_nodes,
 )
-from ..tex_compiler.type_checker import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
+from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
+from .codegen_stdfns import _EMIT_DISPATCH, _EmitStdFnsMixin
+from .codegen_stencil import (
+    _StencilInfo, _ast_equal, _is_ident, _try_detect_stencil, _try_detect_inline_stencil, detect_stencil_route,
+)
 from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
                           _broadcast_pair, _ensure_spatial)
 from .stdlib import SAFE_EPSILON
@@ -77,57 +81,12 @@ _CMP_OPS = {
     "==": "==", "!=": "!=", "<": "<", ">": ">", "<=": "<=", ">=": ">=",
 }
 
-_IMG_REDUCE_OPS = {
-    "img_sum": "sum", "img_mean": "mean",
-    "img_min": "amin", "img_max": "amax",
-}
 
 
-import linecache as _linecache
-from collections import deque as _deque
 
-# Bounded set of registered codegen pseudo-filenames, pruned oldest-first so
-# linecache can't grow without bound across a long session.
-_LINECACHE_KEYS: "_deque[str]" = _deque()
-_LINECACHE_MAX = 64
-
-
-def _cg_filename(fingerprint: str) -> str:
-    """The pseudo-filename for a fingerprinted codegen module — must match
-    between build() and materialize_codegen() so linecache keys line up."""
-    return f"<tex_codegen_{fingerprint[:16]}>"
-
-
-def _register_codegen_linecache(filename: str, src: str) -> None:
-    """Register generated source with linecache (for diagnostics / getsource),
-    pruning the oldest entry when over the cap. Deterministic filenames repeat,
-    so skip re-registering (and re-queuing) an already-present key."""
-    if filename in _linecache.cache:
-        return
-    _linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)
-    _LINECACHE_KEYS.append(filename)
-    while len(_LINECACHE_KEYS) > _LINECACHE_MAX:
-        _linecache.cache.pop(_LINECACHE_KEYS.popleft(), None)
-
-
-def materialize_codegen(blob: bytes, src: str, has_fn_calls: bool,
-                        fingerprint: str) -> Any:
-    """Rebuild a codegen fn from a marshalled MODULE code object (PC-3).
-
-    The caller is responsible for validating the blob (version/MAGIC/SHA) before
-    calling this — marshal.loads on corrupted bytes can hard-crash the process.
-    """
-    import marshal
-    code_obj = marshal.loads(blob)
-    filename = _cg_filename(fingerprint)
-    _register_codegen_linecache(filename, src)
-    namespace: dict[str, Any] = {}
-    exec(code_obj, namespace)
-    fn = namespace["_tex_fn"]
-    fn._has_fn_calls = has_fn_calls
-    fn._tex_code = code_obj
-    fn._tex_src = src
-    return fn
+from .codegen_persist import (
+    _cg_filename, _register_codegen_linecache, materialize_codegen,
+)
 
 
 def try_compile(program: Program, type_map: dict[int, TEXType],
@@ -216,11 +175,11 @@ _SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy"))
 
 # Stdlib functions that read/write spatial image data — incompatible with
 # the scalar loop fast path.
-_SPATIAL_STDLIB: frozenset[str] = frozenset((
-    "sample", "fetch", "sample_cubic", "sample_mip", "sample_grad",
-    "sample_frame", "fetch_frame", "gauss_blur", "sample_lanczos",
-    "sample_mip_gauss", "bilateral_filter",
-))
+# STR-7: single-sourced from the REG-1 registry's `spatial=` tags (TST-3 proves the
+# derivation equals the old hand-maintained literal exactly). Dissolving this shared
+# constant before the cluster-2 split removes the stencil/core coupling on it.
+from .stdlib_registry import spatial_names as _spatial_names
+_SPATIAL_STDLIB: frozenset[str] = _spatial_names()
 
 
 # Shared memoized AST child-iterator lives in ast_nodes (CG-1); alias kept for
@@ -298,733 +257,6 @@ def _body_has_break_continue(stmts: list[ASTNode]) -> bool:
     return False
 
 
-# ── Stencil pattern detection ──────────────────────────────────────────
-
-@dataclass(slots=True)
-class _StencilInfo:
-    """Detected stencil pattern from nested for-loops or inline fetch sequences."""
-    kind: str                # "box", "minmax", "median", "conv2d"
-    binding_name: str        # The @binding being fetched/sampled
-    is_fetch: bool           # True for fetch() pattern, False for sample()
-    channels: str | None     # Channel swizzle ("rgb", "r", etc.) or None for all
-    # Radius expression: int for static, or ASTNode for parameterized
-    y_radius: int | ASTNode | None = None
-    x_radius: int | ASTNode | None = None
-    is_symmetric: bool = False
-    # For asymmetric static ranges only:
-    dy_start: int | None = None
-    dy_stop: int | None = None   # exclusive
-    dx_start: int | None = None
-    dx_stop: int | None = None   # exclusive
-    # Box blur
-    accum_var: str | None = None
-    count_var: str | None = None
-    # Min/max pool
-    minmax_op: str | None = None  # "max" or "min"
-    result_var: str | None = None
-    # Conv2d (inline stencil with fixed kernel weights)
-    kernel_weights: dict | None = None  # {(dy, dx): float_weight}
-    consumed_stmts: set | None = None   # indices of statements consumed by the stencil
-    # Median (array collect pattern)
-    array_vars: list | None = None      # [(arr_name, ch_idx|None)] per array
-
-
-def _is_ident(node: ASTNode, name: str) -> bool:
-    return isinstance(node, Identifier) and node.name == name
-
-
-def _is_affine_fetch_coord(expr: ASTNode, base_var: str, loop_var: str) -> bool:
-    """Check if expr is `base_var + loop_var`."""
-    if not isinstance(expr, BinOp) or expr.op != "+":
-        return False
-    if _is_ident(expr.left, base_var) and _is_ident(expr.right, loop_var):
-        return True
-    if _is_ident(expr.left, loop_var) and _is_ident(expr.right, base_var):
-        return True
-    return False
-
-
-def _ast_equal(a: ASTNode, b: ASTNode) -> bool:
-    """Shallow structural equality for simple expression trees."""
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, Identifier):
-        return a.name == b.name
-    if isinstance(a, NumberLiteral):
-        return a.value == b.value
-    if isinstance(a, BindingRef):
-        return a.name == b.name and a.kind == b.kind
-    if isinstance(a, BinOp):
-        return a.op == b.op and _ast_equal(a.left, b.left) and _ast_equal(a.right, b.right)
-    if isinstance(a, UnaryOp):
-        return a.op == b.op and _ast_equal(a.operand, b.operand)
-    return False
-
-
-def _try_extract_symmetric_range(loop: ForLoop) -> tuple[str, ASTNode | int] | None:
-    """Detect for(int var = -R; var <= R; var++) where R is a constant or parameter.
-
-    Returns (var_name, radius) where radius is int (static) or ASTNode (parameterized).
-    """
-    init = loop.init
-    if not isinstance(init, VarDecl) or init.initializer is None:
-        return None
-    loop_var = init.name
-
-    # Check update is var = var + 1
-    upd = loop.update
-    if not isinstance(upd, Assignment):
-        return None
-    if not _is_ident(upd.target, loop_var):
-        return None
-    if not isinstance(upd.value, BinOp) or upd.value.op != "+":
-        return None
-    if not _is_ident(upd.value.left, loop_var):
-        return None
-    if not (isinstance(upd.value.right, NumberLiteral) and upd.value.right.value == 1.0):
-        return None
-
-    # Check condition is var <= R
-    cond = loop.condition
-    if not isinstance(cond, BinOp) or cond.op != "<=":
-        return None
-    if not _is_ident(cond.left, loop_var):
-        return None
-    radius_expr = cond.right
-
-    # Check init is var = -R
-    init_val = init.initializer
-    if isinstance(init_val, UnaryOp) and init_val.op == "-":
-        if not _ast_equal(init_val.operand, radius_expr):
-            return None
-    elif isinstance(init_val, NumberLiteral) and isinstance(radius_expr, NumberLiteral):
-        if init_val.value != -radius_expr.value:
-            return None
-    else:
-        return None
-
-    # Return radius as int or ASTNode
-    if isinstance(radius_expr, NumberLiteral):
-        return (loop_var, int(radius_expr.value))
-    return (loop_var, radius_expr)
-
-
-def _find_fetch_call(expr: ASTNode) -> FunctionCall | BindingIndexAccess | None:
-    """Find a fetch() or sample() call inside an expression tree.
-
-    Handles both FunctionCall("fetch"/"sample", ...) and BindingIndexAccess/BindingSampleAccess.
-    """
-    if isinstance(expr, FunctionCall) and expr.name in ("fetch", "sample"):
-        return expr
-    if isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
-        return expr
-    if isinstance(expr, ChannelAccess):
-        return _find_fetch_call(expr.object)
-    if isinstance(expr, BinOp):
-        found = _find_fetch_call(expr.left)
-        if found:
-            return found
-        return _find_fetch_call(expr.right)
-    return None
-
-
-def _is_affine_sample_coord(expr: ASTNode, base_var: str, loop_var: str) -> bool:
-    """Check if expr is `base_var + float(loop_var) * px` or similar pixel-step patterns.
-
-    Matches: u + float(dx) * px,  u + dx * px,  u + float(dx) / iw, etc.
-    """
-    if not isinstance(expr, BinOp) or expr.op != "+":
-        return False
-    if not _is_ident(expr.left, base_var):
-        return False
-    rhs = expr.right
-    if not isinstance(rhs, BinOp):
-        return False
-    px_var = "px" if base_var == "u" else "py"
-    dim_var = "iw" if base_var == "u" else "ih"
-
-    def _is_loop_var(n: ASTNode) -> bool:
-        return (_is_ident(n, loop_var) or
-                (isinstance(n, CastExpr) and n.target_type == "float"
-                 and _is_ident(n.expr, loop_var)))
-
-    if rhs.op == "*":
-        if _is_loop_var(rhs.left) and _is_ident(rhs.right, px_var):
-            return True
-        if _is_ident(rhs.left, px_var) and _is_loop_var(rhs.right):
-            return True
-    elif rhs.op == "/":
-        if _is_loop_var(rhs.left) and _is_ident(rhs.right, dim_var):
-            return True
-    return False
-
-
-def _resolve_coord(expr: ASTNode, local_defs: dict[str, ASTNode]) -> ASTNode:
-    """Resolve identifiers through local variable definitions (transitively)."""
-    seen: set[str] = set()
-    while isinstance(expr, Identifier) and expr.name in local_defs:
-        if expr.name in seen:
-            break  # cycle guard
-        seen.add(expr.name)
-        expr = local_defs[expr.name]
-    return expr
-
-
-def _check_fetch_coords(fetch_node: ASTNode, inner_var: str, outer_var: str,
-                        local_defs: dict[str, ASTNode] | None = None
-                        ) -> tuple[str, bool] | None:
-    """Validate fetch/sample coordinates are affine in loop vars.
-
-    Returns (binding_name, is_fetch) or None.
-    local_defs: mapping from variable name to its definition expression
-                (for tracing through intermediate vars like su, sv).
-    """
-    if local_defs is None:
-        local_defs = {}
-
-    if isinstance(fetch_node, FunctionCall):
-        if len(fetch_node.args) != 3:
-            return None
-        binding_node, coord_a, coord_b = fetch_node.args
-        if not isinstance(binding_node, BindingRef):
-            return None
-        is_fetch = fetch_node.name == "fetch"
-        if is_fetch:
-            if not _is_affine_fetch_coord(coord_a, "ix", inner_var):
-                return None
-            if not _is_affine_fetch_coord(coord_b, "iy", outer_var):
-                return None
-        else:
-            # sample() — resolve coords through local definitions
-            resolved_a = _resolve_coord(coord_a, local_defs)
-            resolved_b = _resolve_coord(coord_b, local_defs)
-            if not _is_affine_sample_coord(resolved_a, "u", inner_var):
-                return None
-            if not _is_affine_sample_coord(resolved_b, "v", outer_var):
-                return None
-        return (binding_node.name, is_fetch)
-    if isinstance(fetch_node, BindingIndexAccess):
-        if len(fetch_node.args) != 2:
-            return None
-        if not _is_affine_fetch_coord(fetch_node.args[0], "ix", inner_var):
-            return None
-        if not _is_affine_fetch_coord(fetch_node.args[1], "iy", outer_var):
-            return None
-        name = fetch_node.binding.name if isinstance(fetch_node.binding, BindingRef) else None
-        return (name, True) if name else None
-    return None
-
-
-def _is_sum_accum(stmt: Assignment, inner_var: str, outer_var: str,
-                  local_defs: dict[str, ASTNode] | None = None
-                  ) -> tuple[str, str | None, str, bool] | None:
-    """Check if stmt is `acc = acc + fetch(...)` or with .channels.
-
-    Returns (accum_var_name, channels_or_none, binding_name, is_fetch) or None.
-    """
-    if not isinstance(stmt, Assignment):
-        return None
-    target = stmt.target
-    if not isinstance(target, Identifier):
-        return None
-    value = stmt.value
-    if not isinstance(value, BinOp) or value.op != "+":
-        return None
-    if _is_ident(value.left, target.name):
-        rhs = value.right
-    elif _is_ident(value.right, target.name):
-        rhs = value.left
-    else:
-        return None
-
-    # Unwrap channel access
-    channels = None
-    fetch_expr = rhs
-    if isinstance(rhs, ChannelAccess):
-        channels = rhs.channels
-        fetch_expr = rhs.object
-
-    fetch_node = _find_fetch_call(fetch_expr)
-    if fetch_node is None:
-        return None
-
-    coord_info = _check_fetch_coords(fetch_node, inner_var, outer_var, local_defs)
-    if coord_info is None:
-        return None
-    binding_name, is_fetch = coord_info
-
-    return (target.name, channels, binding_name, is_fetch)
-
-
-def _is_count_increment(stmt: ASTNode) -> str | None:
-    """Check if stmt is `count = count + 1`. Return var name."""
-    if not isinstance(stmt, Assignment):
-        return None
-    target = stmt.target
-    if not isinstance(target, Identifier):
-        return None
-    value = stmt.value
-    if not isinstance(value, BinOp) or value.op != "+":
-        return None
-    if not _is_ident(value.left, target.name):
-        return None
-    if isinstance(value.right, NumberLiteral) and value.right.value == 1.0:
-        return target.name
-    return None
-
-
-def _is_array_collect_assign(stmt: Assignment, inner_var: str, outer_var: str,
-                             local_defs: dict[str, ASTNode]
-                             ) -> tuple[str, str | None, str, bool] | None:
-    """Check if stmt is `arr[idx] = fetch(...)` or `arr[idx] = s.channel`.
-
-    Returns (array_name, channel_or_none, binding_name, is_fetch) or None.
-    """
-    if not isinstance(stmt.target, ArrayIndexAccess):
-        return None
-    arr_node = stmt.target.array
-    if not isinstance(arr_node, Identifier):
-        return None
-
-    value = stmt.value
-    channel = None
-
-    if isinstance(value, ChannelAccess):
-        channel = value.channels
-        fetch_expr = _resolve_coord(value.object, local_defs)
-    elif isinstance(value, Identifier):
-        fetch_expr = _resolve_coord(value, local_defs)
-    else:
-        fetch_expr = value
-
-    fc = _find_fetch_call(fetch_expr)
-    if fc is None:
-        return None
-
-    coord_info = _check_fetch_coords(fc, inner_var, outer_var, local_defs)
-    if coord_info is None:
-        return None
-
-    binding_name, is_fetch = coord_info
-    return (arr_node.name, channel, binding_name, is_fetch)
-
-
-def _is_minmax_accum(stmt: Assignment, inner_var: str, outer_var: str,
-                     local_defs: dict[str, ASTNode] | None = None
-                     ) -> tuple[str, str, str | None, str, bool] | None:
-    """Check if stmt is `result = max(result, fetch(...))` or min variant.
-
-    Also handles indirect patterns like:
-        vec3 s = fetch(@image, ix + dx, iy + dy);
-        result = max(result, s);
-
-    Returns (result_var, "max"|"min", channels, binding_name, is_fetch) or None.
-    """
-    if not isinstance(stmt, Assignment):
-        return None
-    target = stmt.target
-    if not isinstance(target, Identifier):
-        return None
-    value = stmt.value
-    if not isinstance(value, FunctionCall) or value.name not in ("max", "min"):
-        return None
-    if len(value.args) != 2:
-        return None
-
-    if local_defs is None:
-        local_defs = {}
-
-    op = value.name  # "max" or "min"
-
-    # One arg must be the result var, the other must contain a fetch/sample
-    for i in range(2):
-        other = value.args[1 - i]
-        if _is_ident(value.args[i], target.name):
-            # Unwrap channel access
-            channels = None
-            fetch_expr = other
-            if isinstance(other, ChannelAccess):
-                channels = other.channels
-                fetch_expr = other.object
-
-            # Resolve through local variable definitions (e.g. s = fetch(...))
-            resolved = _resolve_coord(fetch_expr, local_defs)
-
-            # Unwrap channel access on the resolved expression too
-            if isinstance(resolved, ChannelAccess):
-                if channels is None:
-                    channels = resolved.channels
-                resolved = resolved.object
-
-            fetch_node = _find_fetch_call(resolved)
-            if fetch_node is None:
-                continue
-            coord_info = _check_fetch_coords(fetch_node, inner_var, outer_var, local_defs)
-            if coord_info is None:
-                continue
-            binding_name, is_fetch = coord_info
-            return (target.name, op, channels, binding_name, is_fetch)
-    return None
-
-
-def _collect_local_defs(stmts: list[ASTNode], local_defs: dict[str, ASTNode]) -> None:
-    """Collect variable definitions from a statement list into local_defs."""
-    for stmt in stmts:
-        if isinstance(stmt, VarDecl) and stmt.initializer is not None:
-            local_defs[stmt.name] = stmt.initializer
-        elif isinstance(stmt, Assignment) and isinstance(stmt.target, Identifier):
-            if not (isinstance(stmt.value, BinOp) and stmt.value.op == "+"
-                    and _is_ident(stmt.value.left, stmt.target.name)):
-                local_defs[stmt.target.name] = stmt.value
-
-
-def _iter_for_loops(stmts: list[ASTNode]):
-    """Yield every ForLoop node in a statement tree (nested included)."""
-    stack = list(stmts)
-    while stack:
-        n = stack.pop()
-        if isinstance(n, ForLoop):
-            yield n
-        stack.extend(_iter_child_nodes(n))
-
-
-def detect_stencil_route(program: Program) -> bool:
-    """UC-2: True iff this program should be default-routed through the codegen
-    tier for stencil lowering. Routes only when it contains at least one EXACT
-    (fetch-based / conv2d) stencil and NO sample-based stencil — the sample-based
-    avg_pool2d lowering diverges from the interpreter's sub-pixel grid_sample
-    (~25·r/W), so those stay opt-in. Uses codegen's own detectors, so the query
-    sees exactly what emission would lower."""
-    has_exact = False
-    stmts = program.statements
-    for idx in range(len(stmts)):
-        inline = _try_detect_inline_stencil(stmts, idx)
-        if inline is not None and inline.is_fetch:
-            has_exact = True
-    for loop in _iter_for_loops(stmts):
-        st = _try_detect_stencil(loop)
-        if st is not None:
-            if st.is_fetch:
-                has_exact = True
-            else:
-                return False  # sample-based stencil → lowering would diverge
-    return has_exact
-
-
-def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
-    """Detect a box-blur stencil in nested for-loops.
-
-    Handles both static ranges (for dy = -2; dy <= 2) and parameterized
-    ranges (for dy = -$radius; dy <= $radius).
-    """
-    # Try symmetric range first (handles both static and parameterized)
-    outer_sym = _try_extract_symmetric_range(outer_loop)
-    if outer_sym is None:
-        # Also try static non-symmetric via try_extract_static_range
-        static = try_extract_static_range(outer_loop)
-        if static is None:
-            return None
-        outer_var, dy_start, dy_stop, step = static
-        if step != 1:
-            return None
-        y_radius = None  # non-symmetric, use dy_start/dy_stop
-    else:
-        outer_var, y_radius = outer_sym
-        dy_start = dy_stop = None
-
-    # Find inner ForLoop in outer body
-    inner_loop = None
-    outer_count_var = None
-    for stmt in outer_loop.body:
-        if isinstance(stmt, ForLoop):
-            if inner_loop is not None:
-                return None
-            inner_loop = stmt
-        elif isinstance(stmt, Assignment):
-            cv = _is_count_increment(stmt)
-            if cv is not None:
-                outer_count_var = cv
-        elif isinstance(stmt, (VarDecl, ExprStatement)):
-            pass
-        else:
-            return None
-
-    if inner_loop is None:
-        return None
-
-    # Check inner loop range
-    inner_sym = _try_extract_symmetric_range(inner_loop)
-    if inner_sym is None:
-        static = try_extract_static_range(inner_loop)
-        if static is None:
-            return None
-        inner_var, dx_start, dx_stop, step = static
-        if step != 1:
-            return None
-        x_radius = None
-    else:
-        inner_var, x_radius = inner_sym
-        dx_start = dx_stop = None
-
-    # Determine is_symmetric: both loops use symmetric range
-    is_symmetric = y_radius is not None and x_radius is not None
-
-    # Collect local variable definitions for sample() tracing.
-    # Include outer loop body (LICM-hoisted vars like _licm0) and inner loop body.
-    local_defs: dict[str, ASTNode] = {}
-    _collect_local_defs(outer_loop.body, local_defs)
-    _collect_local_defs(inner_loop.body, local_defs)
-
-    # Inner body: classify the stencil pattern.
-    # Try box blur (sum accumulation), min/max, median (array collect).
-    accum_info = None
-    minmax_info = None
-    array_collects: list[tuple[str, str | None, str, bool]] = []
-    inner_count_var = None
-    has_unknown = False
-
-    for stmt in inner_loop.body:
-        if isinstance(stmt, Assignment):
-            info = _is_sum_accum(stmt, inner_var, outer_var, local_defs)
-            if info is not None:
-                if accum_info is not None:
-                    has_unknown = True
-                else:
-                    accum_info = info
-                continue
-
-            mm = _is_minmax_accum(stmt, inner_var, outer_var, local_defs)
-            if mm is not None:
-                if minmax_info is not None:
-                    has_unknown = True
-                else:
-                    minmax_info = mm
-                continue
-
-            ac = _is_array_collect_assign(stmt, inner_var, outer_var, local_defs)
-            if ac is not None:
-                array_collects.append(ac)
-                continue
-
-            cv = _is_count_increment(stmt)
-            if cv is not None:
-                inner_count_var = cv
-                continue
-            # Allow intermediate variable definitions (su, sv for sample pattern)
-            if isinstance(stmt.target, Identifier) and stmt.target.name in local_defs:
-                continue
-        elif isinstance(stmt, (VarDecl, ExprStatement)):
-            continue
-        # Unknown statement type or unrecognized assignment — not necessarily fatal
-        has_unknown = True
-
-    # Return the detected stencil kind (prefer box, then minmax, then median)
-    if accum_info is not None and not has_unknown:
-        accum_var, channels, binding_name, is_fetch = accum_info
-        return _StencilInfo(
-            kind="box",
-            binding_name=binding_name,
-            is_fetch=is_fetch,
-            channels=channels,
-            y_radius=y_radius,
-            x_radius=x_radius,
-            is_symmetric=is_symmetric,
-            dy_start=dy_start,
-            dy_stop=dy_stop,
-            dx_start=dx_start,
-            dx_stop=dx_stop,
-            accum_var=accum_var,
-            count_var=inner_count_var or outer_count_var,
-        )
-
-    if minmax_info is not None and not has_unknown:
-        result_var, op, channels, binding_name, is_fetch = minmax_info
-        return _StencilInfo(
-            kind="minmax",
-            binding_name=binding_name,
-            is_fetch=is_fetch,
-            channels=channels,
-            y_radius=y_radius,
-            x_radius=x_radius,
-            is_symmetric=is_symmetric,
-            dy_start=dy_start,
-            dy_stop=dy_stop,
-            dx_start=dx_start,
-            dx_stop=dx_stop,
-            minmax_op=op,
-            result_var=result_var,
-        )
-
-    # Try median: array collect pattern (arr[idx] = fetch(...))
-    if array_collects and not accum_info and not minmax_info:
-        # Validate: all from same binding
-        bindings = set(ac[2] for ac in array_collects)
-        if len(bindings) == 1:
-            binding_name = array_collects[0][2]
-            is_fetch = array_collects[0][3]
-            array_names = list(dict.fromkeys(ac[0] for ac in array_collects))
-            # Build channel mapping: [(array_name, bchw_channel_index)]
-            # For per-channel arrays (r[idx]=s.r): map channel name to index
-            # For direct vec arrays (samples[idx]=fetch(...)): channel is None
-            array_chan_pairs: list[tuple[str, int | None]] = []
-            valid = True
-            for arr_name in array_names:
-                # Find first collect entry for this array
-                for ac in array_collects:
-                    if ac[0] == arr_name:
-                        ch = ac[1]
-                        if ch is not None:
-                            ch_idx = CHANNEL_MAP.get(ch)
-                            if ch_idx is None:
-                                valid = False
-                            else:
-                                array_chan_pairs.append((arr_name, ch_idx))
-                        else:
-                            array_chan_pairs.append((arr_name, None))
-                        break
-            if valid:
-                return _StencilInfo(
-                    kind="median",
-                    binding_name=binding_name,
-                    is_fetch=is_fetch,
-                    channels=None,
-                    y_radius=y_radius,
-                    x_radius=x_radius,
-                    is_symmetric=is_symmetric,
-                    dy_start=dy_start,
-                    dy_stop=dy_stop,
-                    dx_start=dx_start,
-                    dx_stop=dx_stop,
-                    array_vars=array_chan_pairs,
-                    count_var=inner_count_var or outer_count_var,
-                )
-
-    return None
-
-
-# ── Inline stencil detection (non-loop conv2d patterns) ───────────────
-
-
-def _extract_fetch_offset(node: ASTNode) -> tuple[str, int, int, str | None] | None:
-    """Extract (binding_name, dx, dy, channels) from a fetch/sample at constant offset.
-
-    Matches patterns:
-      fetch(@img, ix + CONST, iy + CONST)       → (img, CONST, CONST, None)
-      fetch(@img, ix - CONST, iy)                → (img, -CONST, 0, None)
-      fetch(@img, ix, iy).rgb                    → (img, 0, 0, "rgb")
-      sample(@img, u + CONST*px, v - CONST*py)   → (img, CONST, -CONST, None)
-      sample(@img, u, v)                          → (img, 0, 0, None)
-      @img[ix + CONST, iy + CONST]               → (img, CONST, CONST, None)
-
-    Returns None if the pattern doesn't match.
-    """
-    channels = None
-    expr = node
-    if isinstance(expr, ChannelAccess):
-        channels = expr.channels
-        expr = expr.object
-
-    if isinstance(expr, BindingIndexAccess):
-        # @img[x_expr, y_expr]
-        if not isinstance(expr.binding, BindingRef) or len(expr.args) != 2:
-            return None
-        binding = expr.binding.name
-        dx = _extract_pixel_offset(expr.args[0], "ix")
-        dy = _extract_pixel_offset(expr.args[1], "iy")
-        if dx is None or dy is None:
-            return None
-        return (binding, dx, dy, channels)
-
-    if isinstance(expr, FunctionCall):
-        if expr.name == "fetch" and len(expr.args) == 3:
-            if not isinstance(expr.args[0], BindingRef):
-                return None
-            binding = expr.args[0].name
-            dx = _extract_pixel_offset(expr.args[1], "ix")
-            dy = _extract_pixel_offset(expr.args[2], "iy")
-            if dx is None or dy is None:
-                return None
-            return (binding, dx, dy, channels)
-
-        if expr.name == "sample" and len(expr.args) == 3:
-            if not isinstance(expr.args[0], BindingRef):
-                return None
-            binding = expr.args[0].name
-            dx = _extract_uv_offset(expr.args[1], "u")
-            dy = _extract_uv_offset(expr.args[2], "v")
-            if dx is None or dy is None:
-                return None
-            return (binding, dx, dy, channels)
-
-    if isinstance(expr, BindingSampleAccess):
-        if not isinstance(expr.binding, BindingRef) or len(expr.args) != 2:
-            return None
-        binding = expr.binding.name
-        dx = _extract_uv_offset(expr.args[0], "u")
-        dy = _extract_uv_offset(expr.args[1], "v")
-        if dx is None or dy is None:
-            return None
-        return (binding, dx, dy, channels)
-
-    return None
-
-
-def _extract_pixel_offset(expr: ASTNode, base: str) -> int | None:
-    """Extract integer pixel offset from `base + CONST` or `base - CONST` or `base`."""
-    if _is_ident(expr, base):
-        return 0
-    if not isinstance(expr, BinOp):
-        return None
-    if expr.op == "+" and _is_ident(expr.left, base) and isinstance(expr.right, NumberLiteral):
-        return int(expr.right.value)
-    if expr.op == "+" and isinstance(expr.left, NumberLiteral) and _is_ident(expr.right, base):
-        return int(expr.left.value)
-    if expr.op == "-" and _is_ident(expr.left, base) and isinstance(expr.right, NumberLiteral):
-        return -int(expr.right.value)
-    return None
-
-
-def _extract_uv_offset(expr: ASTNode, base: str) -> int | None:
-    """Extract integer pixel offset from `base + CONST*px` or `base - px` etc."""
-    if _is_ident(expr, base):
-        return 0
-    if not isinstance(expr, BinOp):
-        return None
-    px_var = "px" if base == "u" else "py"
-
-    if expr.op in ("+", "-"):
-        if not _is_ident(expr.left, base):
-            return None
-        rhs = expr.right
-        sign = 1 if expr.op == "+" else -1
-
-        # u + px  or  u - px  (offset = ±1)
-        if _is_ident(rhs, px_var):
-            return sign
-
-        if isinstance(rhs, BinOp):
-            # u + CONST * px  or  u + px * CONST
-            if rhs.op == "*":
-                if isinstance(rhs.left, NumberLiteral) and _is_ident(rhs.right, px_var):
-                    return sign * int(rhs.left.value)
-                if _is_ident(rhs.left, px_var) and isinstance(rhs.right, NumberLiteral):
-                    return sign * int(rhs.right.value)
-                # float(CONST) * px — CastExpr wrapping
-                if isinstance(rhs.left, CastExpr) and _is_ident(rhs.right, px_var):
-                    if isinstance(rhs.left.expr, NumberLiteral):
-                        return sign * int(rhs.left.expr.value)
-                if _is_ident(rhs.left, px_var) and isinstance(rhs.right, CastExpr):
-                    if isinstance(rhs.right.expr, NumberLiteral):
-                        return sign * int(rhs.right.expr.value)
-            # u + float(CONST) / iw
-            dim_var = "iw" if base == "u" else "ih"
-            if rhs.op == "/":
-                if isinstance(rhs.left, NumberLiteral) and _is_ident(rhs.right, dim_var):
-                    return sign * int(rhs.left.value)
-                if isinstance(rhs.left, CastExpr) and isinstance(rhs.left.expr, NumberLiteral):
-                    if _is_ident(rhs.right, dim_var):
-                        return sign * int(rhs.left.expr.value)
-    return None
 
 
 def _resolve_through_locals(expr: ASTNode, local_defs: dict[str, ASTNode]) -> ASTNode:
@@ -1096,231 +328,10 @@ def _extract_uv_offset_expr(expr: ASTNode, base: str) -> ASTNode | bool | None:
     return None
 
 
-def _extract_linear_weights(expr: ASTNode, tap_vars: dict[str, tuple[int, int]]
-                            ) -> dict[tuple[int, int], float] | None:
-    """Extract linear combination weights from an expression.
-
-    tap_vars maps variable names to (dx, dy) offsets.
-    Returns {(dy, dx): weight} or None if not a linear combination.
-    """
-    weights: dict[tuple[int, int], float] = {}
-
-    def _extract(node: ASTNode, scale: float) -> bool:
-        """Recursively extract weights. Returns True on success."""
-        if isinstance(node, Identifier) and node.name in tap_vars:
-            dy, dx = tap_vars[node.name]
-            weights[(dy, dx)] = weights.get((dy, dx), 0.0) + scale
-            return True
-
-        if isinstance(node, BinOp):
-            if node.op == "+":
-                return _extract(node.left, scale) and _extract(node.right, scale)
-            if node.op == "-":
-                return _extract(node.left, scale) and _extract(node.right, -scale)
-            if node.op == "*":
-                # scalar * tap_expr or tap_expr * scalar
-                if isinstance(node.left, NumberLiteral):
-                    return _extract(node.right, scale * node.left.value)
-                if isinstance(node.right, NumberLiteral):
-                    return _extract(node.left, scale * node.right.value)
-                return False
-            return False
-
-        if isinstance(node, UnaryOp) and node.op == "-":
-            return _extract(node.operand, -scale)
-
-        # Parenthesized expression or other — not a simple linear combination
-        return False
-
-    if _extract(expr, 1.0):
-        return weights
-    return None
 
 
-def _collect_ident_refs(node: ASTNode, refs: set[str]) -> None:
-    """Recursively collect all Identifier names READ in an AST subtree.
 
-    Uses the generic child iterator so every node type (ArrayDecl/ArrayLiteral
-    elements, MatConstructor, ReturnStmt, FunctionDef bodies, ...) is covered.
-    Plain-Identifier assignment targets are writes, not reads, and stay
-    excluded — stencil tap consumption must not become needlessly conservative.
-    """
-    if isinstance(node, Identifier):
-        refs.add(node.name)
-        return
-    if isinstance(node, Assignment):
-        if not isinstance(node.target, Identifier):
-            _collect_ident_refs(node.target, refs)
-        _collect_ident_refs(node.value, refs)
-        return
-    for child in _iter_child_nodes(node):
-        _collect_ident_refs(child, refs)
-
-
-def _try_detect_inline_stencil(stmts: list[ASTNode], start: int
-                               ) -> _StencilInfo | None:
-    """Detect an inline stencil pattern starting at position `start` in stmts.
-
-    Looks for a cluster of VarDecl/Assignment statements that fetch/sample from
-    the same binding at constant offsets, followed by a VarDecl/Assignment that
-    combines them linearly. Emits a conv2d stencil.
-
-    Returns a _StencilInfo with kind="conv2d" or None.
-    """
-    if start >= len(stmts):
-        return None
-
-    # Phase 1: Collect consecutive fetch/sample taps at constant offsets
-    # Each tap is: (var_name, binding, dx, dy, channels)
-    taps: list[tuple[str, str, int, int, str | None]] = []
-    tap_indices: list[int] = []
-    binding_name: str | None = None
-    all_channels: str | None = None
-    is_fetch = True
-
-    i = start
-    while i < len(stmts):
-        stmt = stmts[i]
-        var_name = None
-        init_expr = None
-
-        if isinstance(stmt, VarDecl) and stmt.initializer is not None:
-            var_name = stmt.name
-            init_expr = stmt.initializer
-        elif isinstance(stmt, Assignment) and isinstance(stmt.target, Identifier):
-            # Also handle `gx += luma(fetch(...)) * weight` patterns
-            # For now, only simple VarDecl fetch assignments
-            break
-        else:
-            break
-
-        # Check if initializer is a fetch/sample at constant offset
-        info = _extract_fetch_offset(init_expr)
-        if info is None:
-            # Could be a binding ref like `@image` (center pixel at 0,0)
-            if isinstance(init_expr, BindingRef):
-                info = (init_expr.name, 0, 0, None)
-            elif isinstance(init_expr, ChannelAccess) and isinstance(init_expr.object, BindingRef):
-                info = (init_expr.object.name, 0, 0, init_expr.channels)
-            else:
-                break
-
-        b_name, dx, dy, ch = info
-        if binding_name is None:
-            binding_name = b_name
-            all_channels = ch
-            # Determine if fetch or sample based on first tap.
-            # Unwrap ChannelAccess to find the underlying fetch/sample call.
-            inner = init_expr
-            if isinstance(inner, ChannelAccess):
-                inner = inner.object
-            if isinstance(inner, FunctionCall):
-                is_fetch = inner.name != "sample"
-            elif isinstance(inner, BindingSampleAccess):
-                is_fetch = False
-            else:
-                is_fetch = True  # BindingRef, BindingIndexAccess → fetch-like
-        elif b_name != binding_name:
-            break  # Different binding — stop
-
-        taps.append((var_name, b_name, dx, dy, ch))
-        tap_indices.append(i)
-        i += 1
-
-    if len(taps) < 3:
-        return None  # Need at least 3 taps for a meaningful stencil
-
-    # Phase 2: Look for a linear combination of the tap variables
-    # in the next statement(s)
-    tap_var_map = {name: (dy, dx) for name, _, dx, dy, _ in taps}
-    combo_idx = None
-    combo_var = None
-    kernel_weights = None
-
-    for j in range(i, min(i + 3, len(stmts))):
-        stmt = stmts[j]
-        expr = None
-        vname = None
-
-        if isinstance(stmt, VarDecl) and stmt.initializer is not None:
-            vname = stmt.name
-            expr = stmt.initializer
-        elif isinstance(stmt, Assignment) and isinstance(stmt.target, Identifier):
-            vname = stmt.target.name
-            expr = stmt.value
-
-        if expr is None:
-            continue
-
-        weights = _extract_linear_weights(expr, tap_var_map)
-        if weights is not None and len(weights) >= 2:
-            kernel_weights = weights
-            combo_var = vname
-            combo_idx = j
-            break
-
-    if kernel_weights is None or len(kernel_weights) > 49:  # max 7x7 kernel
-        return None
-
-    # Gap statements (skipped by the combo search between the last tap and the
-    # combo) execute BETWEEN the taps and the combo in the interpreter, while
-    # the emitted conv2d collapses taps+combo into one op at the combo's
-    # position. That is only sound when the gap cannot observe or perturb
-    # stencil state: a gap write to a tap var would be baked over by the kernel
-    # weights, a gap read of a consumed tap would hit an undefined local, a gap
-    # write to the combo target must not be overwritten out of order, and a gap
-    # binding assignment would be seen by the deferred _bind read. Reject all
-    # of those patterns — normal per-statement emission handles them correctly.
-    if combo_idx > i:
-        gap_stmts = stmts[i:combo_idx]
-        gap_writes, gap_bind_writes = collect_assigned_vars(gap_stmts)
-        if gap_bind_writes:
-            return None
-        gap_refs: set[str] = set()
-        for g in gap_stmts:
-            if isinstance(g, FunctionDef):
-                return None  # function scoping — bail out conservatively
-            _collect_ident_refs(g, gap_refs)
-        touched = gap_writes | gap_refs
-        if combo_var in touched or any(name in touched for name in tap_var_map):
-            return None
-
-    all_offsets = list(kernel_weights.keys())
-    dy_min = min(o[0] for o in all_offsets)
-    dy_max = max(o[0] for o in all_offsets)
-    dx_min = min(o[1] for o in all_offsets)
-    dx_max = max(o[1] for o in all_offsets)
-
-    consumed = set(tap_indices)
-    consumed.add(combo_idx)
-
-    # Don't consume tap vars that are referenced in later statements
-    # (e.g., sharpen.tex uses `center` both in the conv kernel and the output).
-    later_refs: set[str] = set()
-    for k in range(combo_idx + 1, len(stmts)):
-        _collect_ident_refs(stmts[k], later_refs)
-    for idx in list(tap_indices):
-        stmt = stmts[idx]
-        vname = stmt.name if isinstance(stmt, VarDecl) else None
-        if vname and vname in later_refs:
-            consumed.discard(idx)
-
-    return _StencilInfo(
-        kind="conv2d",
-        binding_name=binding_name,
-        is_fetch=is_fetch,
-        channels=all_channels,
-        dy_start=dy_min,
-        dy_stop=dy_max + 1,
-        dx_start=dx_min,
-        dx_stop=dx_max + 1,
-        kernel_weights=kernel_weights,
-        result_var=combo_var,
-        consumed_stmts=consumed,
-    )
-
-
-class _CodeGen:
+class _CodeGen(_EmitStdFnsMixin):
     """Generates Python source code from a TEX AST."""
 
     _codegen_counter: int = 0  # class-level counter for unique (no-fingerprint) filenames
@@ -1347,6 +358,25 @@ class _CodeGen:
         # stdlib/channel/identifier result is treated as possibly a view and is
         # never added). Never carried across control-flow boundaries.
         self._fresh_temps: set[str] = set()
+        # STR-9: statements dispatch on type(node) (mirrors interpreter._stmt_dispatch).
+        # The 12 statement types are mutually-exclusive flat ASTNode subclasses, so
+        # this is behaviour-exact for the old isinstance cascade. NOTE: _emit_expr is
+        # deliberately NOT table-driven (§5) — its branch order + inter-branch temp
+        # state are load-bearing.
+        self._stmt_dispatch = {
+            VarDecl: self._emit_var_decl,
+            ArrayDecl: self._emit_array_decl,
+            Assignment: self._emit_assignment,
+            ReturnStmt: self._emit_return_stmt,
+            ExprStatement: self._stmt_expr,
+            ParamDecl: self._stmt_noop,
+            IfElse: self._stmt_if_else,
+            ForLoop: self._stmt_for_loop,
+            WhileLoop: self._stmt_while_loop,
+            FunctionDef: self._stmt_function_def,
+            BreakStmt: self._stmt_break,
+            ContinueStmt: self._stmt_continue,
+        }
         # Local variable mapping: TEX var name → Python local var name.
         # When set, Identifier emission uses locals instead of _env[name].
         self._local_vars: dict[str, str] = {}
@@ -1391,41 +421,11 @@ class _CodeGen:
         # Dispatch table: function name → handler method for tensor-path
         # specializations.  Each handler has signature
         #   (node: FunctionCall, args: list[str], tmp: str) -> str | None
-        # and returns the result variable name, or None to fall through.
+        # STR-6: dispatch table built from the co-located @_emits decorators
+        # (see _EMIT_DISPATCH). Handler signature:
+        #   (node: FunctionCall, args: list[str], tmp: str) -> str | None
         self._fn_dispatch: dict[str, object] = {
-            # Complex specializations (own methods)
-            "pow": self._emit_fn_pow,
-            "max": self._emit_fn_minmax, "min": self._emit_fn_minmax,
-            "lerp": self._emit_fn_lerp,
-            "luma": self._emit_fn_luma,
-            # Math 1-arg
-            "sqrt": self._emit_fn_math_1arg, "log": self._emit_fn_math_1arg,
-            "log2": self._emit_fn_math_1arg, "log10": self._emit_fn_math_1arg,
-            "fract": self._emit_fn_math_1arg, "isnan": self._emit_fn_math_1arg,
-            "isinf": self._emit_fn_math_1arg, "pow2": self._emit_fn_math_1arg,
-            "pow10": self._emit_fn_math_1arg, "sincos": self._emit_fn_math_1arg,
-            # Vector geometry
-            "dot": self._emit_fn_vector, "distance": self._emit_fn_vector,
-            "normalize": self._emit_fn_vector, "length": self._emit_fn_vector,
-            "cross": self._emit_fn_vector, "reflect": self._emit_fn_vector,
-            # Shaping functions
-            "smoothstep": self._emit_fn_shaping, "step": self._emit_fn_shaping,
-            "clamp": self._emit_fn_shaping, "fit": self._emit_fn_shaping,
-            # Safe arithmetic
-            "spow": self._emit_fn_safe, "sdiv": self._emit_fn_safe,
-            "smin": self._emit_fn_safe, "smax": self._emit_fn_safe,
-            "mod": self._emit_fn_safe,
-            # SDF primitives
-            "sdf_circle": self._emit_fn_sdf, "sdf_box": self._emit_fn_sdf,
-            "sdf_line": self._emit_fn_sdf,
-            # Image reductions
-            "img_sum": self._emit_fn_reduce, "img_mean": self._emit_fn_reduce,
-            "img_min": self._emit_fn_reduce, "img_max": self._emit_fn_reduce,
-            # Matrix operations
-            "transpose": self._emit_fn_matrix, "determinant": self._emit_fn_matrix,
-            "inverse": self._emit_fn_matrix,
-            # Sampling — inline when binding is hoisted, else fallthrough to _fns[]
-            "sample": self._emit_fn_sample, "fetch": self._emit_fn_fetch,
+            name: getattr(self, attr) for name, attr in _EMIT_DISPATCH.items()
         }
 
     def _tmp(self) -> str:
@@ -1697,56 +697,62 @@ class _CodeGen:
         # target after it may have escaped into a var target on the previous
         # statement, nor carried across a control-flow boundary.
         self._fresh_temps.clear()
-        if isinstance(stmt, VarDecl):
-            self._emit_var_decl(stmt)
-        elif isinstance(stmt, Assignment):
-            self._emit_assignment(stmt)
-        elif isinstance(stmt, ExprStatement):
-            # The expression's side effects live in the lines _emit_expr emits;
-            # the returned name needs no bare-echo line. If nothing was emitted
-            # (bare Identifier/NumberLiteral), keep the enclosing block
-            # non-empty — a then-body may contain only this statement.
-            lines_before = len(self._lines)
-            self._emit_expr(stmt.expr)
-            if len(self._lines) == lines_before:
-                self._emit("pass")
-        elif isinstance(stmt, ParamDecl):
-            pass  # no-op at runtime
-        elif isinstance(stmt, IfElse):
-            # Ownership established on one path may not hold on another, and
-            # pre-branch ownership may not survive the merge — clear on both
-            # sides so in-place writes are only elided within a straight-line run.
-            self._owned.clear()
-            self._emit_if_else(stmt)
-            self._owned.clear()
-        elif isinstance(stmt, ForLoop):
-            self._owned.clear()
-            self._emit_for_loop(stmt)
-            self._owned.clear()
-        elif isinstance(stmt, WhileLoop):
-            self._owned.clear()
-            self._emit_while_loop(stmt)
-            self._owned.clear()
-        elif isinstance(stmt, (BreakStmt, ContinueStmt)):
-            # Static range for-loops use native Python break/continue (no update
-            # to skip). Non-static for-loops and while-loops use exception-based
-            # flow because continue must not skip the update statement.
-            if self._use_native_flow_control:
-                self._emit("break" if isinstance(stmt, BreakStmt) else "continue")
-            elif isinstance(stmt, BreakStmt):
-                self._emit("raise _CgBreak()")
-            else:
-                self._emit("raise _CgContinue()")
-        elif isinstance(stmt, ArrayDecl):
-            self._emit_array_decl(stmt)
-        elif isinstance(stmt, FunctionDef):
-            self._owned.clear()
-            self._emit_function_def(stmt)
-            self._owned.clear()
-        elif isinstance(stmt, ReturnStmt):
-            self._emit_return_stmt(stmt)
-        else:
+        handler = self._stmt_dispatch.get(type(stmt))
+        if handler is None:
             raise _Unsupported(f"Unknown statement: {type(stmt).__name__}")
+        handler(stmt)
+
+    # ── STR-9 statement handlers (extracted verbatim from the old cascade) ──
+    def _stmt_expr(self, stmt):
+        # The expression's side effects live in the lines _emit_expr emits; the
+        # returned name needs no bare-echo line. If nothing was emitted (bare
+        # Identifier/NumberLiteral), keep the enclosing block non-empty — a
+        # then-body may contain only this statement.
+        lines_before = len(self._lines)
+        self._emit_expr(stmt.expr)
+        if len(self._lines) == lines_before:
+            self._emit("pass")
+
+    def _stmt_noop(self, stmt):
+        pass  # ParamDecl — no runtime emission
+
+    def _stmt_if_else(self, stmt):
+        # Ownership established on one path may not hold on another, and pre-branch
+        # ownership may not survive the merge — clear on both sides so in-place
+        # writes are only elided within a straight-line run.
+        self._owned.clear()
+        self._emit_if_else(stmt)
+        self._owned.clear()
+
+    def _stmt_for_loop(self, stmt):
+        self._owned.clear()
+        self._emit_for_loop(stmt)
+        self._owned.clear()
+
+    def _stmt_while_loop(self, stmt):
+        self._owned.clear()
+        self._emit_while_loop(stmt)
+        self._owned.clear()
+
+    def _stmt_function_def(self, stmt):
+        self._owned.clear()
+        self._emit_function_def(stmt)
+        self._owned.clear()
+
+    def _stmt_break(self, stmt):
+        # Static range for-loops use native Python break/continue (no update to
+        # skip). Non-static for-loops and while-loops use exception-based flow
+        # because continue must not skip the update statement.
+        if self._use_native_flow_control:
+            self._emit("break")
+        else:
+            self._emit("raise _CgBreak()")
+
+    def _stmt_continue(self, stmt):
+        if self._use_native_flow_control:
+            self._emit("continue")
+        else:
+            self._emit("raise _CgContinue()")
 
     def _var_target(self, name: str) -> str:
         """Return the Python expression for writing to a TEX variable."""
@@ -3603,373 +2609,6 @@ class _CodeGen:
         # Fall through to tensor path for unhandled scalar functions
         return None
 
-    def _emit_fn_pow(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit pow(base, exp) with constant-exponent specializations."""
-        if len(args) != 2:
-            return None
-        exp_node = node.args[1]
-        if isinstance(exp_node, NumberLiteral):
-            v = exp_node.value
-            if v == 0.0:
-                self._emit(f"{tmp} = _torch.ones_like({args[0]})")
-                return tmp
-            if v == 1.0:
-                return args[0]
-            if v == 2.0:
-                self._emit(f"{tmp} = {args[0]} * {args[0]}")
-                return tmp
-            if v == 3.0:
-                sq = self._tmp()
-                self._emit(f"{sq} = {args[0]} * {args[0]}")
-                self._emit(f"{tmp} = {sq} * {args[0]}")
-                return tmp
-            # NOTE: pow(x, 0.5) is deliberately NOT specialized to sqrt(clamp):
-            # sqrt(clamp(x,min=0)) returns 0 for negative bases whereas the
-            # interpreter's fn_pow returns NaN. Fall through to _torch.pow to
-            # preserve codegen<->interpreter equivalence (matches optimizer.py:364).
-            if v == -1.0:
-                self._emit(f"{tmp} = _torch.reciprocal({args[0]} + _SAFE_EPS)")
-                return tmp
-            if v == -0.5:
-                self._emit(f"{tmp} = _torch.rsqrt(_torch.clamp({args[0]}, min=_SAFE_EPS))")
-                return tmp
-            if v == 4.0:
-                sq = self._tmp()
-                self._emit(f"{sq} = {args[0]} * {args[0]}")
-                self._emit(f"{tmp} = {sq} * {sq}")
-                return tmp
-            if v == -2.0:
-                sq = self._tmp()
-                self._emit(f"{sq} = {args[0]} * {args[0]}")
-                self._emit(f"{tmp} = _torch.reciprocal({sq} + _SAFE_EPS)")
-                return tmp
-        # General case: mirror the interpreter (torch.pow) so codegen and the
-        # interpreter agree on negative bases. The exp-log trick clamps negative
-        # bases to ~0 and silently diverges from fn_pow (see stdlib.fn_pow).
-        self._emit(f"{tmp} = _torch.pow({args[0]}, {args[1]})")
-        return tmp
-
-    def _emit_fn_minmax(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit max/min with clamp specializations and nested-clamp detection."""
-        if len(args) != 2:
-            return None
-        name = node.name
-        # Detect min(max(x, lo), hi) or max(min(x, hi), lo) → torch.clamp
-        inner_name = "max" if name == "min" else "min"
-        for outer_const_idx in (0, 1):
-            if not isinstance(node.args[outer_const_idx], NumberLiteral):
-                continue
-            inner_idx = 1 - outer_const_idx
-            inner_node = node.args[inner_idx]
-            if (isinstance(inner_node, FunctionCall)
-                    and inner_node.name == inner_name
-                    and len(inner_node.args) == 2):
-                for inner_const_idx in (0, 1):
-                    if isinstance(inner_node.args[inner_const_idx], NumberLiteral):
-                        inner_val_idx = 1 - inner_const_idx
-                        if name == "min":
-                            lo = inner_node.args[inner_const_idx].value
-                            hi = node.args[outer_const_idx].value
-                        else:
-                            hi = inner_node.args[inner_const_idx].value
-                            lo = node.args[outer_const_idx].value
-                        # torch.clamp(x, lo, hi) only equals the nested
-                        # max(min(x,hi),lo) when lo<=hi. With inverted bounds
-                        # clamp returns hi while the nested form returns lo, so
-                        # fall through to the plain maximum/minimum composition.
-                        if lo > hi:
-                            continue
-                        inner_arg = self._emit_expr(inner_node.args[inner_val_idx])
-                        self._emit(f"{tmp} = _torch.clamp({inner_arg}, {lo}, {hi})")
-                        return tmp
-        # Single constant arg → clamp_min/clamp_max
-        clamp_fn = "clamp_min" if name == "max" else "clamp_max"
-        if isinstance(node.args[1], NumberLiteral):
-            self._emit(f"{tmp} = _torch.{clamp_fn}({args[0]}, {node.args[1].value})")
-            return tmp
-        if isinstance(node.args[0], NumberLiteral):
-            self._emit(f"{tmp} = _torch.{clamp_fn}({args[1]}, {node.args[0].value})")
-            return tmp
-        # No constant → standard torch.maximum/minimum
-        torch_fn = "maximum" if name == "max" else "minimum"
-        self._emit(f"{tmp} = _torch.{torch_fn}({args[0]}, {args[1]})")
-        return tmp
-
-    def _emit_fn_lerp(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit lerp(a, b, t) with type-aware broadcast."""
-        if len(args) != 3:
-            return None
-        # a + (b - a) * t — avoids torch.lerp which requires tensor first arg
-        at = self.type_map.get(id(node.args[0]))
-        tt = self.type_map.get(id(node.args[2]))
-        diff = self._tmp()
-        self._emit(f"{diff} = {args[1]} - {args[0]}")
-        if at is not None and tt is not None:
-            if at.is_vector and tt.is_scalar:
-                # Known vec/scalar: inline unsqueeze, skip _bp call entirely
-                self._emit(f"{tmp} = {args[0]} + {diff} * {args[2]}.unsqueeze(-1)")
-            else:
-                # Same rank (vec+vec or scalar+scalar): no broadcast needed
-                self._emit(f"{tmp} = {args[0]} + {diff} * {args[2]}")
-        else:
-            # Type info missing — conservative runtime fallback via _bp
-            bd, bt = self._emit_bp(diff, args[2])
-            self._emit(f"{tmp} = {args[0]} + {bd} * {bt}")
-        return tmp
-
-    def _emit_fn_luma(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit luma(color) as weighted channel sum (Rec.709)."""
-        if len(args) != 1:
-            return None
-        ret_type = self.type_map.get(id(node.args[0]))
-        if ret_type is None or not ret_type.is_vector or ret_type.channels < 3:
-            return None
-        c = args[0]
-        self._emit(f"{tmp} = {c}[..., 0] * 0.2126 + {c}[..., 1] * 0.7152 + {c}[..., 2] * 0.0722")
-        return tmp
-
-    def _emit_fn_math_1arg(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit specialized 1-arg math: sqrt, log variants, fract, trig, etc."""
-        if len(args) != 1:
-            return None
-        name = node.name
-        if name == "sqrt":
-            self._emit(f"{tmp} = _torch.sqrt(_torch.clamp({args[0]}, min=0.0))")
-        elif name == "log":
-            self._emit(f"{tmp} = _torch.log(_torch.clamp({args[0]}, min=_SAFE_EPS))")
-        elif name == "log2":
-            self._emit(f"{tmp} = _torch.log2(_torch.clamp({args[0]}, min=_SAFE_EPS))")
-        elif name == "log10":
-            self._emit(f"{tmp} = _torch.log10(_torch.clamp({args[0]}, min=_SAFE_EPS))")
-        elif name == "fract":
-            self._emit(f"{tmp} = {args[0]} - _torch.floor({args[0]})")
-        elif name == "isnan":
-            self._emit(f"{tmp} = _torch.isnan({args[0]}).float()")
-        elif name == "isinf":
-            self._emit(f"{tmp} = _torch.isinf({args[0]}).float()")
-        elif name == "pow2":
-            self._emit(f"{tmp} = _torch.pow(2.0, {args[0]})")
-        elif name == "pow10":
-            self._emit(f"{tmp} = _torch.pow(10.0, {args[0]})")
-        elif name == "sincos":
-            self._emit(f"{tmp} = _torch.stack([_torch.sin({args[0]}), _torch.cos({args[0]})], dim=-1)")
-        else:
-            return None
-        return tmp
-
-    def _emit_fn_vector(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit vector geometry: dot, distance, normalize, length, cross, reflect."""
-        name = node.name
-        # length/distance/normalize only reduce over the channel axis for true
-        # vectors. The interpreter guards with _has_channel_axis: a scalar field
-        # whose last dim is a spatial/width axis is NOT reduced (returns abs/sign).
-        # When the static arg type is not a known vector, fall through to the
-        # _fns[] stdlib path so the runtime _has_channel_axis guard decides,
-        # preserving codegen↔interpreter equivalence.
-        if name in ("length", "normalize") and len(args) == 1:
-            at = self.type_map.get(id(node.args[0]))
-            if at is None or not at.is_vector:
-                return None
-        if name == "distance" and len(args) == 2:
-            at0 = self.type_map.get(id(node.args[0]))
-            at1 = self.type_map.get(id(node.args[1]))
-            if (at0 is None or not at0.is_vector) and (at1 is None or not at1.is_vector):
-                return None
-        if name == "dot" and len(args) == 2:
-            # Mirror stdlib fn_dot's device split: (a*b).sum(-1) is ~6-10x faster
-            # than einsum on CUDA; einsum is kept for CPU. Numerically equivalent.
-            self._emit(f"{tmp} = ({args[0]} * {args[1]}).sum(dim=-1) if {args[0]}.is_cuda else _torch.einsum('...c,...c->...', {args[0]}, {args[1]})")
-        elif name == "distance" and len(args) == 2:
-            self._emit(f"{tmp} = _torch.linalg.vector_norm({args[0]} - {args[1]}, dim=-1)")
-        elif name == "normalize" and len(args) == 1:
-            self._emit(f"{tmp} = {args[0]} / (_torch.linalg.vector_norm({args[0]}, dim=-1, keepdim=True) + _SAFE_EPS)")
-        elif name == "length" and len(args) == 1:
-            self._emit(f"{tmp} = _torch.linalg.vector_norm({args[0]}, dim=-1)")
-        elif name == "cross" and len(args) == 2:
-            self._emit(f"{tmp} = _torch.cross({args[0]}[..., :3], {args[1]}[..., :3], dim=-1)")
-        elif name == "reflect" and len(args) == 2:
-            dt = self._tmp()
-            self._emit(f"{dt} = ({args[0]} * {args[1]}).sum(dim=-1, keepdim=True)")
-            self._emit(f"{tmp} = {args[0]} - 2.0 * {dt} * {args[1]}")
-        else:
-            return None
-        return tmp
-
-    def _emit_fn_shaping(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit shaping functions: smoothstep, step, clamp, fit."""
-        name = node.name
-        if name == "clamp" and len(args) == 3:
-            # Pass Python floats directly when lo/hi are constants
-            # (avoids scalar tensor creation overhead)
-            lo = node.args[1].value if isinstance(node.args[1], NumberLiteral) else args[1]
-            hi = node.args[2].value if isinstance(node.args[2], NumberLiteral) else args[2]
-            self._emit(f"{tmp} = _torch.clamp({args[0]}, {lo}, {hi})")
-        elif name == "step" and len(args) == 2:
-            threshold = node.args[0].value if isinstance(node.args[0], NumberLiteral) else args[0]
-            self._emit(f"{tmp} = ({args[1]} >= {threshold}).float()")
-        elif name == "smoothstep" and len(args) == 3:
-            num, den = self._emit_bp(f"{args[2]} - {args[0]}", f"{args[1]} - {args[0]} + _SAFE_EPS")
-            tt = self._tmp()
-            self._emit(f"{tt} = _torch.clamp({num} / {den}, 0.0, 1.0)")
-            self._emit(f"{tmp} = {tt} * {tt} * (3.0 - 2.0 * {tt})")
-        elif name == "fit" and len(args) == 5:
-            tt = self._tmp()
-            self._emit(f"{tt} = ({args[0]} - {args[1]}) / ({args[2]} - {args[1]} + _SAFE_EPS)")
-            rng = self._tmp()
-            self._emit(f"{rng} = {args[4]} - {args[3]}")
-            br, btt = self._emit_bp(rng, tt)
-            self._emit(f"{tmp} = {args[3]} + {br} * {btt}")
-        else:
-            return None
-        return tmp
-
-    def _emit_fn_safe(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit safe arithmetic: spow, sdiv, smin, smax, mod."""
-        name = node.name
-        if name == "mod" and len(args) == 2:
-            self._emit(f"{tmp} = _torch.fmod({args[0]}, _tw({args[1]} == 0, _SAFE_EPS, {args[1]}))")
-        elif name == "spow" and len(args) == 2:
-            at = self._tmp()
-            self._emit(f"{at} = _torch.abs({args[0]})")
-            mask = self._tmp()
-            self._emit(f"{mask} = {at} < _SAFE_EPS")
-            self._emit(f"{tmp} = _tw({mask}, _torch.zeros_like({args[0]}), _torch.sign({args[0]}) * _torch.pow(_torch.clamp({at}, min=_SAFE_EPS), {args[1]}))")
-        elif name == "sdiv" and len(args) == 2:
-            mask = self._tmp()
-            self._emit(f"{mask} = _torch.abs({args[1]}) < _SAFE_EPS")
-            self._emit(f"{tmp} = _tw({mask}, _torch.zeros_like({args[0]}), {args[0]} / _tw({mask}, _torch.ones_like({args[1]}), {args[1]}))")
-        elif name == "smin" and len(args) == 3:
-            h = self._tmp()
-            self._emit(f"{h} = _torch.clamp(0.5 + 0.5 * ({args[1]} - {args[0]}) / ({args[2]} + _SAFE_EPS), 0.0, 1.0)")
-            diff, bh = self._emit_bp(f"{args[0]} - {args[1]}", h)
-            self._emit(f"{tmp} = {args[1]} + {diff} * {bh} - {args[2]} * {bh} * (1.0 - {bh})")
-        elif name == "smax" and len(args) == 3:
-            h = self._tmp()
-            self._emit(f"{h} = _torch.clamp(0.5 - 0.5 * ({args[1]} - {args[0]}) / ({args[2]} + _SAFE_EPS), 0.0, 1.0)")
-            diff, bh = self._emit_bp(f"{args[0]} - {args[1]}", h)
-            self._emit(f"{tmp} = {args[1]} + {diff} * {bh} + {args[2]} * {bh} * (1.0 - {bh})")
-        else:
-            return None
-        return tmp
-
-    def _emit_fn_sdf(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit SDF primitives: sdf_circle, sdf_box, sdf_line."""
-        name = node.name
-        if name == "sdf_circle" and len(args) == 3:
-            self._emit(f"{tmp} = _torch.hypot({args[0]}, {args[1]}) - {args[2]}")
-        elif name == "sdf_box" and len(args) == 4:
-            dx = self._tmp()
-            dy = self._tmp()
-            self._emit(f"{dx} = _torch.abs({args[0]}) - {args[2]}")
-            self._emit(f"{dy} = _torch.abs({args[1]}) - {args[3]}")
-            dxc = self._tmp()
-            dyc = self._tmp()
-            self._emit(f"{dxc} = _torch.clamp({dx}, min=0.0)")
-            self._emit(f"{dyc} = _torch.clamp({dy}, min=0.0)")
-            self._emit(f"{tmp} = _torch.sqrt({dxc} * {dxc} + {dyc} * {dyc}) + _torch.clamp(_torch.maximum({dx}, {dy}), max=0.0)")
-        elif name == "sdf_line" and len(args) == 6:
-            pax = self._tmp()
-            pay = self._tmp()
-            bax = self._tmp()
-            bay = self._tmp()
-            self._emit(f"{pax} = {args[0]} - {args[2]}")
-            self._emit(f"{pay} = {args[1]} - {args[3]}")
-            self._emit(f"{bax} = {args[4]} - {args[2]}")
-            self._emit(f"{bay} = {args[5]} - {args[3]}")
-            h = self._tmp()
-            self._emit(f"{h} = _torch.clamp(({pax} * {bax} + {pay} * {bay}) / ({bax} * {bax} + {bay} * {bay} + _SAFE_EPS), 0.0, 1.0)")
-            self._emit(f"{tmp} = _torch.hypot({pax} - {bax} * {h}, {pay} - {bay} * {h})")
-        else:
-            return None
-        return tmp
-
-    def _emit_fn_reduce(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit image reductions: img_sum, img_mean, img_min, img_max."""
-        if len(args) != 1:
-            return None
-        op = _IMG_REDUCE_OPS.get(node.name)
-        if op is None:
-            return None
-        self._emit(f"{tmp} = {args[0]}.{op}(dim=(1, 2), keepdim=True)")
-        return tmp
-
-    def _emit_fn_matrix(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit matrix operations: transpose, determinant, inverse."""
-        if len(args) != 1:
-            return None
-        name = node.name
-        if name == "transpose":
-            self._emit(f"{tmp} = {args[0]}.transpose(-2, -1)")
-        elif name == "determinant":
-            self._emit(f"{tmp} = _torch.linalg.det({args[0]})")
-        elif name == "inverse":
-            self._emit(f"{tmp} = _torch.linalg.inv({args[0]})")
-        else:
-            return None
-        return tmp
-
-    def _emit_fn_sample(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit sample(@img, u, v) with inline grid_sample when binding is hoisted."""
-        if len(args) != 3:
-            return None  # sample_frame has 4 args — fall through
-        # args[0] is the binding (already emitted), args[1]=u, args[2]=v
-        binding_node = node.args[0]
-        bname = binding_node.name if isinstance(binding_node, BindingRef) else None
-        if bname and bname in self._hoisted_bchw:
-            return self._emit_inline_grid_sample(bname, args[1], args[2])
-        return None  # fall through to _fns[] path
-
-    def _emit_fn_fetch(
-        self, node: FunctionCall, args: list[str], tmp: str,
-    ) -> str | None:
-        """Emit fetch(@img, px, py) with direct tensor indexing when binding is hoisted."""
-        if len(args) != 3:
-            return None
-        binding_node = node.args[0]
-        bname = binding_node.name if isinstance(binding_node, BindingRef) else None
-        if bname and bname in self._hoisted_bchw:
-            img_var = f"_bind[{bname!r}]"
-            px = self._tmp()
-            py = self._tmp()
-            self._emit(f"{px} = {args[1]}.clamp(0, {img_var}.shape[2] - 1).long()")
-            self._emit(f"{py} = {args[2]}.clamp(0, {img_var}.shape[1] - 1).long()")
-            # B=1 fast path: direct indexing without batch dim
-            self._emit(f"if {img_var}.shape[0] == 1:")
-            self._indent += 1
-            self._emit(f"{tmp} = {img_var}[0, {py}, {px}]"
-                       f" if {px}.dim() < 3"
-                       f" else {img_var}[0, {py}[0], {px}[0]]")
-            self._indent -= 1
-            self._emit(f"else:")
-            self._indent += 1
-            self._emit(f"{tmp} = {img_var}[_torch.arange({img_var}.shape[0], device=_dev).view(-1,1,1), {py}, {px}]")
-            self._indent -= 1
-            return tmp
-        return None
 
     def _emit_vec_constructor(self, node: VecConstructor) -> str:
         n = node.size

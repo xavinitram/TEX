@@ -33,7 +33,8 @@ sys.path.insert(0, str(_pkg_dir.parent))
 import torch
 from TEX_Wrangle.tex_compiler.lexer import Lexer
 from TEX_Wrangle.tex_compiler.parser import Parser
-from TEX_Wrangle.tex_compiler.type_checker import TypeChecker, TEXType, CHANNEL_MAP
+from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
+from TEX_Wrangle.tex_compiler.types import TEXType, CHANNEL_MAP
 from TEX_Wrangle.tex_compiler.optimizer import optimize
 from TEX_Wrangle.tex_runtime.interpreter import (
     Interpreter, _collect_identifiers, _ensure_spatial, _broadcast_pair,

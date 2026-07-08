@@ -28,3 +28,4 @@ error_reports/
 tests/*.json
 
 wiki/
+.coverage

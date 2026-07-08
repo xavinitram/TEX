@@ -17,7 +17,7 @@ from .tex_compiler.ast_nodes import (
     BindingIndexAccess, BindingSampleAccess,
     iter_child_nodes as _iter_children,
 )
-from .tex_compiler.type_checker import TEXType, TYPE_NAME_MAP
+from .tex_compiler.types import TEXType, TYPE_NAME_MAP
 
 # M-4: stdlib functions whose output at a pixel depends on OTHER pixels (or the
 # whole image), so a program that calls them cannot be split into horizontal

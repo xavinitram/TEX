@@ -1,0 +1,32 @@
+name: Nightly differential fuzz
+# TST-1 durability engine at scale (audit #2): the fast suite runs the fuzzer at
+# N=300 with a FIXED seed (reproducible); this nightly widens it to N=2000 with a
+# date-derived seed so the grammar explores new programs each night. A divergence
+# here is a real interp↔codegen bug to triage into a permanent test_codegen_
+# equivalence row.
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Wide differential fuzz (N=2000, date-seeded)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest
+      - name: Fuzz
+        run: |
+          export TEX_FUZZ_N=2000
+          export TEX_FUZZ_SEED=$(date +%Y%m%d)
+          python -m pytest tests/test_v017_phase1.py -k differential_fuzzer -v

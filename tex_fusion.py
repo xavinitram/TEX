@@ -29,9 +29,9 @@ logger = logging.getLogger("TEX.fusion")
 from .tex_compiler.lexer import Lexer
 from .tex_compiler.parser import Parser
 from .tex_compiler.type_checker import TypeChecker, TypeCheckError
-from .tex_compiler.optimizer import optimize
 from .tex_compiler import ast_nodes as A
-from .tex_runtime.interpreter import _collect_identifiers
+# STR-8: optimize + _collect_identifiers are no longer imported here — the shared
+# post-parse pipeline now lives in TEXCache.compile_ast (called by compile_fused).
 
 # Names the splicer must NEVER prefix — they resolve globally, not per stage.
 _BUILTINS = frozenset({
@@ -76,18 +76,6 @@ def _is_out_ref(node) -> bool:
             and node.name == "OUT")
 
 
-def _child_nodes(node):
-    """Yield the direct AST children of `node` (descending into list fields)."""
-    for f in dataclasses.fields(node):
-        val = getattr(node, f.name)
-        if isinstance(val, A.ASTNode):
-            yield val
-        elif isinstance(val, list):
-            for x in val:
-                if isinstance(x, A.ASTNode):
-                    yield x
-
-
 def _out_used_inside(node, enclosing, _inside=False) -> bool:
     """True if a wire `@OUT` appears anywhere inside a node whose type is in
     `enclosing`. Drives both fusion guards:
@@ -101,7 +89,7 @@ def _out_used_inside(node, enclosing, _inside=False) -> bool:
     if _inside and _is_out_ref(node):
         return True
     nxt = _inside or node.__class__ in enclosing
-    return any(_out_used_inside(c, enclosing, nxt) for c in _child_nodes(node))
+    return any(_out_used_inside(c, enclosing, nxt) for c in A.iter_child_nodes(node))
 
 
 def _out_used_in_loop(node) -> bool:
@@ -131,7 +119,7 @@ def _references_out(node) -> bool:
         return False
     if _is_out_ref(node):
         return True
-    return any(_references_out(c) for c in _child_nodes(node))
+    return any(_references_out(c) for c in A.iter_child_nodes(node))
 
 
 def _seedless_out_index(statements):
@@ -207,7 +195,7 @@ def _binding_types_from_memo_key(memo_key: tuple) -> dict:
     """Reconstruct the merged (prefixed) external-binding types from the memo_key
     — the same dict compile_fused builds from merged_bindings — needed to
     re-type-check the fused AST on disk load, without the binding VALUES."""
-    from .tex_compiler.type_checker import TEXType
+    from .tex_compiler.types import TEXType
     bt: dict[str, Any] = {}
     for i, (_code, _chain_in, sorted_bt) in enumerate(memo_key):
         pfx = _user_prefix(f"_s{i}_")
@@ -503,14 +491,14 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     fused = A.Program(statements=fused_stmts)
     binding_types = {name: infer_binding_type(val) for name, val in merged_bindings.items()}
 
-    checker = TypeChecker(binding_types=binding_types, source="<fused chain>")
+    # STR-8: the post-parse pipeline (type-check → optimize → re-type-check → collect)
+    # is the SAME as the normal path's; run it through the shared TEXCache.compile_ast
+    # (fusion just supplies a spliced AST). Fusion keeps its own error translation so
+    # tex_cache never has to import FusionError (which would create an import cycle).
     try:
-        type_map = checker.check(fused)
-        fused = optimize(fused, type_map)
-        # Re-type-check the optimized AST from scratch (mirrors TEXCache.compile_tex):
-        # rebuilds a complete id()-keyed type_map covering optimizer-synthesized nodes.
-        type_map = TypeChecker(binding_types=binding_types, source="<fused chain>",
-                               strict_redeclare=False).check(fused)
+        from .tex_cache import get_cache
+        fused, type_map, refs, asg, params, used_builtins = get_cache().compile_ast(
+            fused, binding_types, source="<fused chain>")
     except TypeCheckError as e:
         # A fused chain that doesn't type-check as one program is unfusable —
         # surface it as a clean FusionError (the node's contract) instead of an
@@ -520,9 +508,7 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
             "This chain can't be fused into a single valid program (often an @OUT "
             "type hint like m@OUT/img@OUT on an upstream node, or mismatched channel "
             f"types across stages). Break the chain at that node. [{e}]") from e
-    used_builtins = _collect_identifiers(fused)
-    result = (fused, type_map, checker.referenced_bindings, checker.assigned_bindings,
-              checker.param_declarations, used_builtins)
+    result = (fused, type_map, refs, asg, params, used_builtins)
     # Cache only on success (a failing chain must re-raise on every run) and
     # only the compile artifacts — never the binding values.
     _FUSED_MEMO[memo_key] = result

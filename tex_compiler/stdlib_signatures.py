@@ -9,7 +9,7 @@ The callable form allows return type to depend on argument types
 (e.g., clamp returns the type of its first argument).
 """
 from __future__ import annotations
-from .type_checker import TEXType
+from .types import TEXType  # STR-1: leaf type module — breaks the old cycle with type_checker
 
 
 def _passthrough_type(arg_types: list[TEXType]) -> TEXType:

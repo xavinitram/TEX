@@ -33,6 +33,7 @@ from .interpreter import (Interpreter, _collect_identifiers,
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
                       _iter_child_nodes)
 from .stdlib import TEXStdlib
+from . import tier_trace  # leaf module (imports only threading) — no cycle
 
 logger = logging.getLogger("TEX")
 
@@ -448,12 +449,15 @@ def execute_compiled(
     ComfyUI and subsequent TEX runs stay healthy even after failures.
 
     Args:
-        program:      Parsed AST (Program node).
-        bindings:     Mapping of @ binding names to tensor / scalar values.
-        type_map:     AST node id -> TEXType (from type checker).
-        device:       Target device ("cpu", "cuda", "cuda:0", …).
-        fingerprint:  Cache key produced by TEXCache.fingerprint().
-        output_names: List of named outputs for multi-output programs.
+        program:              Parsed AST (Program node).
+        bindings:             Mapping of @ binding names to tensor / scalar values.
+        type_map:             AST node id -> TEXType (from type checker).
+        device:               Target device ("cpu", "cuda", "cuda:0", …).
+        fingerprint:          Cache key produced by TEXCache.fingerprint().
+        latent_channel_count: Channel count when the input is a LATENT (0 for IMAGE/MASK).
+        output_names:         List of named outputs for multi-output programs.
+        used_builtins:        Set of coordinate builtins the program uses (env pruning).
+        precision:            "fp32" (default) or "fp16" — see the M-3 fp16 contract.
 
     Returns:
         The @OUT tensor result, or a dict of {name: tensor} for multi-output.
@@ -681,11 +685,11 @@ def _contiguous_bindings(bindings: dict) -> dict:
 
     Non-tensors pass through by reference.
     """
+    from ..tex_marshalling import to_fp32_if_int_image
     def _norm(v):
         if not isinstance(v, torch.Tensor):
             return v
-        if v.dim() >= 3 and not v.is_floating_point() and v.dtype != torch.bool:
-            v = v.to(torch.float32)
+        v = to_fp32_if_int_image(v)   # M5-INT: single source (see tex_marshalling)
         return v if v.is_contiguous() else v.contiguous()
     return {k: _norm(v) for k, v in bindings.items()}
 
@@ -976,6 +980,7 @@ def _codegen_only_execute(
     cg_fn = _get_or_make_codegen_fn(program, type_map, fingerprint)
 
     if cg_fn is None:
+        tier_trace.record("interpreter", fallback_from="codegen", reason="unsupported")
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision)
@@ -998,10 +1003,12 @@ def _codegen_only_execute(
             f"[TEX] Codegen-only execution failed, falling back to interpreter: {e}",
             level="warning",
         )
+        tier_trace.record("interpreter", fallback_from="codegen", reason=str(e))
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision)
 
+    tier_trace.record("codegen")
     if output_names is not None:
         return {name: contiguous_bindings[name] for name in output_names}
     return contiguous_bindings.get("OUT")

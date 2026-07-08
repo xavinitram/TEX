@@ -41,6 +41,7 @@ from ..tex_compiler.ast_nodes import (
     iter_child_nodes as _iter_child_nodes,
 )
 from .interpreter import Interpreter, _collect_identifiers
+from . import tier_trace  # leaf module (imports only threading) — no cycle
 
 logger = logging.getLogger("TEX.graphed")
 
@@ -412,7 +413,9 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
     if gp is not None:
         _graph_cache.move_to_end(key)
         try:
-            return gp.replay(bindings)
+            out = gp.replay(bindings)
+            tier_trace.record("graph")
+            return out
         except Exception as e:
             logger.warning("[TEX] graph replay failed (%s); disabling this key.", e)
             if _graph_cache.pop(key, None) is not None:
@@ -444,7 +447,9 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
         _, old = _graph_cache.popitem(last=False)
         _graph_bytes -= old.bytes
     try:
-        return gp.replay(bindings)
+        out = gp.replay(bindings)
+        tier_trace.record("graph")
+        return out
     except Exception as e:
         logger.warning("[TEX] first graph replay failed (%s); using interpreter.", e)
         if _graph_cache.pop(key, None) is not None:

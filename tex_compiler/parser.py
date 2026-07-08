@@ -239,6 +239,7 @@ class Parser:
 
     def parse_statement(self) -> ASTNode:
         # const qualifier: const type_kw IDENT = expr;
+        """Parse one statement (declaration / assignment / control-flow / expression / return)."""
         if self.peek() == TokenType.KW_CONST:
             return self._parse_const_decl()
 
@@ -317,6 +318,7 @@ class Parser:
         return self.parse_assignment_or_expr()
 
     def parse_var_decl(self) -> VarDecl:
+        """Parse a typed variable declaration `T name = expr;` (or its array/param form)."""
         loc = self.loc()
         type_tok = self.advance()  # consume type keyword
         type_name = type_tok.value
@@ -331,6 +333,7 @@ class Parser:
         return VarDecl(loc=loc, type_name=type_name, name=name_tok.value, initializer=initializer)
 
     def _parse_const_decl(self) -> VarDecl:
+        """Parse a `$`-parameter / const declaration with its widget metadata."""
         loc = self.loc()
         self.advance()  # consume 'const'
         if self.peek() not in TYPE_KEYWORDS:
@@ -366,6 +369,7 @@ class Parser:
                        initializer=initializer, is_const=True)
 
     def parse_function_def(self) -> FunctionDef:
+        """Parse a user `def name(params) { body }` function definition."""
         loc = self.loc()
         return_type = self.advance().value  # consume type keyword
 
@@ -467,6 +471,7 @@ class Parser:
         return ArrayLiteral(loc=loc, elements=elements)
 
     def parse_if_else(self) -> IfElse:
+        """Parse an if/else statement, including an else-if chain."""
         loc = self.loc()
         self.expect(TokenType.KW_IF)
         self.expect(TokenType.LPAREN, "I expected `(` after `if`")
@@ -616,6 +621,7 @@ class Parser:
         )
 
     def parse_block(self) -> list[ASTNode]:
+        """Parse a `{ … }` brace-delimited statement block."""
         self.expect(TokenType.LBRACE, "I expected `{` to start a block")
         stmts: list[ASTNode] = []
         while self.peek() != TokenType.RBRACE and self.peek() != TokenType.EOF:
@@ -632,9 +638,11 @@ class Parser:
     # -- Expressions (precedence climbing) ------------------------------
 
     def parse_expr(self) -> ASTNode:
+        """Parse a full expression (entry point to the precedence ladder)."""
         return self.parse_ternary()
 
     def parse_ternary(self) -> ASTNode:
+        """Parse a `cond ? a : b` ternary (lowest-precedence expression)."""
         expr = self.parse_logic_or()
         if self.peek() == TokenType.QUESTION:
             loc = self.advance().loc  # point diagnostics at the `?` operator
@@ -645,6 +653,7 @@ class Parser:
         return expr
 
     def parse_logic_or(self) -> ASTNode:
+        """Parse `||` logical-or (left-associative)."""
         left = self.parse_logic_and()
         while self.peek() == TokenType.OR:
             tok = self.advance()
@@ -653,6 +662,7 @@ class Parser:
         return left
 
     def parse_logic_and(self) -> ASTNode:
+        """Parse `&&` logical-and (left-associative)."""
         left = self.parse_equality()
         while self.peek() == TokenType.AND:
             tok = self.advance()
@@ -661,6 +671,7 @@ class Parser:
         return left
 
     def parse_equality(self) -> ASTNode:
+        """Parse `==`/`!=` equality comparisons."""
         left = self.parse_comparison()
         while self.peek() in (TokenType.EQ, TokenType.NEQ):
             tok = self.advance()
@@ -669,6 +680,7 @@ class Parser:
         return left
 
     def parse_comparison(self) -> ASTNode:
+        """Parse `<`/`<=`/`>`/`>=` relational comparisons."""
         left = self.parse_addition()
         while self.peek() in (TokenType.LT, TokenType.GT, TokenType.LTE, TokenType.GTE):
             tok = self.advance()
@@ -677,6 +689,7 @@ class Parser:
         return left
 
     def parse_addition(self) -> ASTNode:
+        """Parse `+`/`-` additive terms (left-associative)."""
         left = self.parse_multiply()
         while self.peek() in (TokenType.PLUS, TokenType.MINUS):
             tok = self.advance()
@@ -685,6 +698,7 @@ class Parser:
         return left
 
     def parse_multiply(self) -> ASTNode:
+        """Parse `*`/`/`/`%` multiplicative factors (left-associative)."""
         left = self.parse_unary()
         while self.peek() in (TokenType.STAR, TokenType.SLASH, TokenType.PERCENT):
             tok = self.advance()
@@ -693,6 +707,7 @@ class Parser:
         return left
 
     def parse_unary(self) -> ASTNode:
+        """Parse a prefix unary `-`/`!` (right-associative)."""
         if self.peek() in (TokenType.MINUS, TokenType.NOT):
             tok = self.advance()
             operand = self.parse_unary()
@@ -700,6 +715,7 @@ class Parser:
         return self.parse_postfix()
 
     def parse_postfix(self) -> ASTNode:
+        """Parse postfix channel-access / array-index / call chains."""
         expr = self.parse_primary()
         while True:
             if self.peek() == TokenType.DOT:
@@ -748,6 +764,7 @@ class Parser:
         return expr
 
     def _parse_call(self, callee: Identifier) -> FunctionCall:
+        """Parse a function call's parenthesized argument list."""
         loc = callee.loc
         self.expect(TokenType.LPAREN)
         args: list[ASTNode] = []
@@ -759,6 +776,7 @@ class Parser:
         return FunctionCall(loc=loc, name=callee.name, args=args)
 
     def parse_primary(self) -> ASTNode:
+        """Parse an atom: literal, identifier, binding, constructor, or `( … )` group."""
         tok = self.current()
 
         # Numeric literals
@@ -849,6 +867,7 @@ class Parser:
             hint="A value was expected at this point — a number, variable, @input, or vec(...).")
 
     def _parse_vec_constructor(self) -> VecConstructor:
+        """Parse a `vecN(...)` constructor call."""
         tok = self.advance()  # vec3 or vec4
         size = 2 if tok.type == TokenType.KW_VEC2 else 3 if tok.type == TokenType.KW_VEC3 else 4
         self.expect(TokenType.LPAREN, f"Expected '(' after {tok.value}")
@@ -861,6 +880,7 @@ class Parser:
         return VecConstructor(loc=tok.loc, size=size, args=args)
 
     def _parse_mat_constructor(self) -> MatConstructor:
+        """Parse a `matN(...)` constructor call."""
         tok = self.advance()  # mat3 or mat4
         size = 3 if tok.type == TokenType.KW_MAT3 else 4
         self.expect(TokenType.LPAREN, f"Expected '(' after {tok.value}")
@@ -873,6 +893,7 @@ class Parser:
         return MatConstructor(loc=tok.loc, size=size, args=args)
 
     def _parse_cast(self) -> CastExpr:
+        """Parse an explicit `type(expr)` cast."""
         tok = self.advance()  # float or int
         self.expect(TokenType.LPAREN, f"Expected '(' after {tok.value}")
         expr = self.parse_expr()

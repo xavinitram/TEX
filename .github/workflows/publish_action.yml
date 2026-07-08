@@ -17,6 +17,23 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+      # TST-8 release gate: a red suite must NOT ship to the registry.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest pytest-cov
+      # TST-7 (coverage half): report coverage and fail on a catastrophic drop.
+      # The floor is conservative because CI is CPU-only — the CUDA-graph /
+      # torch_compile tier branches don't execute here (they lower local coverage
+      # to ~82%; the .coveragerc fail_under=82 gates CUDA-capable local runs).
+      - name: Run tests (publish gate) + coverage
+        run: >
+          python -m pytest tests/ -v -m 'not slow'
+          --cov=TEX_Wrangle --cov-report=term-missing --cov-fail-under=70
       - name: Publish Custom Node
         uses: Comfy-Org/publish-node-action@main
         with:

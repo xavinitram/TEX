@@ -276,11 +276,20 @@ if node.name == "saturate":
         self._error("saturate() expects a numeric argument", node.loc)
 ```
 
-4. **`js/tex_extension.js`** -- add to `TEX_BUILTINS` set for syntax highlighting:
+4. **`js/tex_extension.js`** -- add a `TEX_HELP_DATA` entry (autocomplete + help popup):
 ```javascript
-"saturate",  // in the TEX_BUILTINS Set
+{ name: "saturate", sig: "saturate(x) → float", desc: "Clamp value to [0,1].", example: "@OUT = vec4(saturate(@A.rgb), 1.0);" },
 ```
-Update `TEX_HELP_HTML` to document it in the help popup.
+
+**⚠️ 4b. If your function reads NEIGHBOURING pixels or the whole image**
+(sample/fetch/blur/morphology/reduction), you MUST also classify it, or it is
+**silently wrong when the program is tiled** and/or fails CUDA-graph capture:
+- `tex_memory.py` `_NON_LOCAL_FNS` — add it (default is *pixel-local* → wrong output when tiled).
+- `tex_runtime/graphed.py` `_SYNC_STDLIB` — add it if it does an internal `.item()`/sync.
+- `tex_runtime/codegen.py` `_SPATIAL_STDLIB` — add it if codegen should lower it as a stencil.
+
+> **Canonical recipe: `AGENTS.md`** (this repo root). The invariants and the full
+> table list live there; keep this section in sync with it.
 
 5. **`tests/test_stdlib.py`** -- add a test (see `tests/README.md` for the full pattern):
 ```python
@@ -543,3 +552,28 @@ __init__.py                               tex_extension.js
 1. Create a `.tex` file in the `examples/` directory
 2. Add the filename stem to `_EXAMPLE_CATEGORIES` in `__init__.py` with a `"Category/Display Name"` value
 3. The snippet will appear automatically in the cascade menu under `Examples/Category/Display Name`
+
+## Research index
+
+The deep design rationale lives in `TEX_research/` (**outside this repo** — a sibling
+of `comfyUI/`). Before reversing a design decision, check the relevant doc so you
+don't re-derive something already decided. One line each:
+
+| Doc | What it is |
+|-----|------------|
+| `soul_of_tex.md` | The ethos/design philosophy. **Rejected on ethos grounds:** a cross-node include/import system — self-containment ("five lines of self-contained plaintext") is a deliberate shareability feature. |
+| `0. tex_wrangle_node_for_comfyui.md` | The original language/node spec. |
+| `12a/12b. Custom Inputs.md` | Wireable-param / custom-socket design. |
+| `13. Compiling TEX Graphs Inside ComfyUI.md` | Compilation-inside-ComfyUI research. |
+| `14. Transparent TEX Fusion.md` | Fusion design. **User rejected the extra wire** → transparent frontend collapse-into-terminal instead. |
+| `20. TEX Optimization Roadmap (2026-07).md` | v0.15 roadmap (24 perf items). |
+| `21. TEX v0.15.0 Pre-Push Audit.md` | v0.15 adversarial audit (the green-but-broken class). |
+| `22. TEX Optimization Roadmap v0.16.md` | v0.16 roadmap. |
+| `23. TEX v0.16.0 Build Log.md` | v0.16 per-item build log — **measured-then-ditched** decisions (PF-4 codegen routing regresses color-grade; fp16 stays experimental; grid-buf reuse is a perf trap). |
+| `24. TEX v0.17.0 Longevity & LLM-Coding Roadmap.md` | This cycle: structure/longevity/LLM-fitness. Its §5 (trades to refuse) + §6 (DO-NOT-TOUCH) are captured in `AGENTS.md`. |
+| `25. TEX v0.17.0 Build Log.md` | v0.17 per-item build log. |
+
+**Rejected/decided elsewhere (don't re-propose):** whole-pipeline fp16 & bf16 IMAGE
+(accuracy — bf16 err > the 8-bit quantum); full ACES/OCIO color management (scope
+creep — sRGB↔linear + OKLab only); merging the interpreter and codegen stdlib
+implementations (the duplication is the bit-exactness safety margin).

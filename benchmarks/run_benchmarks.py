@@ -56,7 +56,8 @@ sys.path.insert(0, str(_custom_nodes_dir))
 import torch
 from TEX_Wrangle.tex_compiler.lexer import Lexer
 from TEX_Wrangle.tex_compiler.parser import Parser
-from TEX_Wrangle.tex_compiler.type_checker import TypeChecker, TEXType
+from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
+from TEX_Wrangle.tex_compiler.types import TEXType
 
 # Optional modules — not present in all TEX versions
 try:

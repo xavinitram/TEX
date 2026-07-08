@@ -1,0 +1,25 @@
+# TST-7 (coverage half): dev/CI-only measurement of the TEX package.
+# coverage/pytest-cov are NOT runtime deps — TEX stays torch-only at runtime.
+# Run:  coverage run --source=TEX_Wrangle tests/run_all.py && coverage report
+[run]
+source = TEX_Wrangle
+branch = False
+omit =
+    */tests/*
+    */benchmarks/*
+    */__pycache__/*
+    */tools/*
+
+[report]
+# Lines that never need coverage (defensive / unreachable / display-only).
+exclude_lines =
+    pragma: no cover
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    def __repr__
+show_missing = False
+skip_covered = False
+# TST-7: measured baseline 86% (2026-07). Gate a few points below so a real
+# coverage regression is caught without flapping on run-to-run tier variation
+# (tex_node.py tier branches need CUDA/Triton not always present).
+fail_under = 82

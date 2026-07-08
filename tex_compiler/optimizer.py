@@ -3,7 +3,9 @@ TEX Optimizer — AST transformation passes for compile-time optimization.
 
 Passes:
   1. Constant folding: evaluate expressions with all-literal operands at compile time
-  2. Algebraic simplification: x*0 -> 0, x*1 -> x, pow(x,2) -> x*x, etc.
+  2. Algebraic simplification: x*1 -> x, pow(x,2) -> x*x, etc.
+     (NOTE: x*0 -> 0 is deliberately NOT done — it's shape-unsafe when x is a
+      spatial tensor; see _fold_binop.)
   3. Dead code elimination
   4. Common Subexpression Elimination (CSE)
   5. Loop-Invariant Code Motion (LICM): hoist pure expressions out of loops
@@ -25,8 +27,9 @@ from .ast_nodes import (
     MatConstructor, CastExpr, ArrayIndexAccess, ArrayLiteral, SourceLoc,
     try_extract_static_range,
     iter_child_nodes as _iter_children,
+    NodeVisitor,
 )
-from .type_checker import TEXType
+from .types import TEXType
 
 # Reverse of TYPE_NAME_MAP: TEXType -> declaration keyword. Used so temp
 # VarDecls synthesized by CSE/LICM declare the type they actually hold (vec/mat,
@@ -81,47 +84,39 @@ _PURE_FUNCTIONS: dict[str, Callable[..., float]] = {
 }
 
 
-def optimize(program: Program, type_map: dict | None = None) -> Program:
-    """Run all optimization passes on a program AST (in-place).
+def _fold_all(statements: list) -> list:
+    """Constant folding + algebraic simplification, per statement."""
+    return [_opt_stmt(s) for s in statements]
 
-    Passes (in order):
-      1. Constant folding + algebraic simplification (per-expression)
-      2. Dead code elimination (remove unused variable assignments)
-      3. Common Subexpression Elimination (CSE) within basic blocks
-      4. Loop-Invariant Code Motion (LICM) — hoist invariant expressions
-      5. Small loop unrolling (preserving nested loops for stencil detection)
+
+# STR-5: the optimization pipeline as data. ORDER IS LOAD-BEARING and documented
+# inline: `dce-repeat` must follow CSE (CSE merges a temp but leaves the superseded
+# inner temps as dead-but-executed VarDecls; and the now purity-aware
+# `_has_side_effects` can delete unused pure-call decls the first DCE had to keep),
+# and `unroll` must follow LICM (so hoisted vars are already out of the loop body).
+# Each entry is (name, run(statements, type_map)); the lambdas are pure call-site
+# glue adapting the heterogeneous pass signatures — no pass logic lives here.
+PASSES = [
+    ("const-propagate-locals", lambda s, tm: _propagate_literal_locals(s)),
+    ("const-fold",             lambda s, tm: _fold_all(s)),
+    ("dce",                    lambda s, tm: _eliminate_dead_code(s)),
+    ("cse",                    lambda s, tm: _eliminate_common_subexpressions(s, tm)),
+    ("dce-repeat",             lambda s, tm: _eliminate_dead_code(s)),
+    ("licm",                   lambda s, tm: _hoist_loop_invariants(s, type_map=tm)),
+    ("unroll",                 lambda s, tm: _unroll_small_loops(s)),
+]
+
+
+def optimize(program: Program, type_map: dict | None = None) -> Program:
+    """Run the `PASSES` pipeline on a program AST (in-place). See `PASSES` for the
+    passes and their load-bearing order.
 
     If type_map (id(node) -> TEXType, from the type checker) is supplied, nodes
     synthesized by CSE/LICM are registered in it so the post-optimization AST and
     type_map stay consistent — otherwise id()-keyed lookups miss those nodes.
     """
-    # Pass 0: constant-propagate literal locals (UC-4) so the folds below fire on
-    # TEX's named-tuning-constant style (`float gamma = 1.0; ... pow(g, 1.0/gamma)`).
-    program.statements = _propagate_literal_locals(program.statements)
-
-    # Pass 1: constant folding + algebraic simplification
-    for i, stmt in enumerate(program.statements):
-        program.statements[i] = _opt_stmt(stmt)
-
-    # Pass 2: dead code elimination
-    program.statements = _eliminate_dead_code(program.statements)
-
-    # Pass 3: common subexpression elimination
-    program.statements = _eliminate_common_subexpressions(program.statements, type_map)
-
-    # Pass 3.5: re-run DCE (Q-2). CSE creates a merged temp but leaves the
-    # superseded inner temps as dead-but-executed VarDecls; and the now
-    # purity-aware _has_side_effects can delete unused pure-call decls that the
-    # first DCE pass (before the whitelist) had to keep. The post-optimize
-    # re-typecheck (in compile_tex / compile_fused) covers the removed nodes.
-    program.statements = _eliminate_dead_code(program.statements)
-
-    # Pass 4: loop-invariant code motion
-    program.statements = _hoist_loop_invariants(program.statements, type_map=type_map)
-
-    # Pass 5: small loop unrolling (after LICM so hoisted vars are already out)
-    program.statements = _unroll_small_loops(program.statements)
-
+    for _name, run in PASSES:
+        program.statements = run(program.statements, type_map)
     return program
 
 
@@ -580,135 +575,49 @@ def _eliminate_dead_code(stmts: list[ASTNode],
     return result
 
 
-def _collect_used_names(stmts: list[ASTNode]) -> set[str]:
-    """Collect all variable names that are READ (not just assigned) in a block."""
-    used: set[str] = set()
-    for stmt in stmts:
-        _collect_used_in_stmt(stmt, used)
-    return used
+class _UsedNamesVisitor(NodeVisitor):
+    """STR-4: collect variable/binding names that are READ. `generic_visit`
+    (iter_child_nodes) covers every recurse-into-all-children node automatically —
+    so a new AST field can't silently drop a read from the used-set — and only the
+    *selective* nodes are overridden: identifiers/bindings contribute a name; an
+    Assignment target is a WRITE (only its sub-reads count); a FunctionDef recurses
+    into its body, not its param declarations."""
 
+    def __init__(self):
+        self.used: set[str] = set()
 
-def _collect_used_in_stmt(stmt: ASTNode, used: set[str]):
-    """Recursively collect variable names read in a statement."""
-    if isinstance(stmt, VarDecl):
-        if stmt.initializer:
-            _collect_used_in_expr(stmt.initializer, used)
+    def visit_Identifier(self, node):
+        self.used.add(node.name)
 
-    elif isinstance(stmt, Assignment):
-        # The target Identifier is a WRITE, not a read
-        # But ChannelAccess reads the base, ArrayIndexAccess reads the index,
-        # and BindingIndexAccess reads its coordinate arguments
-        target = stmt.target
+    def visit_BindingRef(self, node):
+        # @name/$name reads share the namespace with binding write targets so the
+        # CSE reassignment guard blocks hoisting across a binding reassignment.
+        self.used.add(node.name)
+
+    def visit_Assignment(self, node):
+        target = node.target
         if isinstance(target, ChannelAccess):
-            _collect_used_in_expr(target.object, used)
+            self.visit(target.object)
         elif isinstance(target, ArrayIndexAccess):
-            _collect_used_in_expr(target.array, used)
-            _collect_used_in_expr(target.index, used)
+            self.visit(target.array)
+            self.visit(target.index)
         elif isinstance(target, BindingIndexAccess):
             for arg in target.args:
-                _collect_used_in_expr(arg, used)
-        _collect_used_in_expr(stmt.value, used)
+                self.visit(arg)
+        # a plain Identifier target is a pure write — not read
+        self.visit(node.value)
 
-    elif isinstance(stmt, IfElse):
-        _collect_used_in_expr(stmt.condition, used)
-        for s in stmt.then_body:
-            _collect_used_in_stmt(s, used)
-        for s in stmt.else_body:
-            _collect_used_in_stmt(s, used)
-
-    elif isinstance(stmt, ForLoop):
-        _collect_used_in_stmt(stmt.init, used)
-        _collect_used_in_expr(stmt.condition, used)
-        _collect_used_in_stmt(stmt.update, used)
-        for s in stmt.body:
-            _collect_used_in_stmt(s, used)
-
-    elif isinstance(stmt, WhileLoop):
-        _collect_used_in_expr(stmt.condition, used)
-        for s in stmt.body:
-            _collect_used_in_stmt(s, used)
-
-    elif isinstance(stmt, ExprStatement):
-        _collect_used_in_expr(stmt.expr, used)
-
-    elif isinstance(stmt, ArrayDecl):
-        if stmt.initializer:
-            if isinstance(stmt.initializer, ArrayLiteral):
-                for elem in stmt.initializer.elements:
-                    _collect_used_in_expr(elem, used)
-            else:
-                _collect_used_in_expr(stmt.initializer, used)
-
-    elif isinstance(stmt, FunctionDef):
-        for s in stmt.body:
-            _collect_used_in_stmt(s, used)
-
-    elif isinstance(stmt, ReturnStmt):
-        if stmt.value:
-            _collect_used_in_expr(stmt.value, used)
+    def visit_FunctionDef(self, node):
+        for s in node.body:
+            self.visit(s)
 
 
-def _collect_used_in_expr(expr: ASTNode, used: set[str]):
-    """Recursively collect variable names read in an expression."""
-    if isinstance(expr, Identifier):
-        used.add(expr.name)
-
-    elif isinstance(expr, BindingRef):
-        # Record binding reads (@name/$name) in the same namespace as
-        # _collect_reassigned_in_stmt's binding write targets, so the CSE
-        # reassignment guard correctly blocks hoisting an expression across a
-        # binding reassignment (bindings are reassignable at runtime).
-        used.add(expr.name)
-
-    elif isinstance(expr, BinOp):
-        _collect_used_in_expr(expr.left, used)
-        _collect_used_in_expr(expr.right, used)
-
-    elif isinstance(expr, UnaryOp):
-        _collect_used_in_expr(expr.operand, used)
-
-    elif isinstance(expr, TernaryOp):
-        _collect_used_in_expr(expr.condition, used)
-        _collect_used_in_expr(expr.true_expr, used)
-        _collect_used_in_expr(expr.false_expr, used)
-
-    elif isinstance(expr, FunctionCall):
-        for arg in expr.args:
-            _collect_used_in_expr(arg, used)
-
-    elif isinstance(expr, VecConstructor):
-        for arg in expr.args:
-            _collect_used_in_expr(arg, used)
-
-    elif isinstance(expr, MatConstructor):
-        for arg in expr.args:
-            _collect_used_in_expr(arg, used)
-
-    elif isinstance(expr, CastExpr):
-        _collect_used_in_expr(expr.expr, used)
-
-    elif isinstance(expr, ChannelAccess):
-        _collect_used_in_expr(expr.object, used)
-
-    elif isinstance(expr, ArrayIndexAccess):
-        _collect_used_in_expr(expr.array, used)
-        _collect_used_in_expr(expr.index, used)
-
-    elif isinstance(expr, ArrayLiteral):
-        for elem in expr.elements:
-            _collect_used_in_expr(elem, used)
-
-    elif isinstance(expr, BindingIndexAccess):
-        _collect_used_in_expr(expr.binding, used)
-        for arg in expr.args:
-            _collect_used_in_expr(arg, used)
-
-    elif isinstance(expr, BindingSampleAccess):
-        _collect_used_in_expr(expr.binding, used)
-        for arg in expr.args:
-            _collect_used_in_expr(arg, used)
-
-    # NumberLiteral, StringLiteral — nothing to collect
+def _collect_used_names(stmts: list[ASTNode]) -> set[str]:
+    """Collect all variable names that are READ (not just assigned) in a block."""
+    v = _UsedNamesVisitor()
+    for stmt in stmts:
+        v.visit(stmt)
+    return v.used
 
 
 def _has_side_effects(expr: ASTNode) -> bool:
@@ -1142,86 +1051,112 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
 _LICM_MIN_DEPTH = 2
 
 
+def _write_target_name(target: ASTNode) -> str | None:
+    """The variable name an Assignment *target* writes to, or None. Reads inside the
+    target (an index/channel expression) are NOT writes — only the container name is."""
+    if isinstance(target, (Identifier, BindingRef)):
+        return target.name
+    if isinstance(target, ChannelAccess) and isinstance(target.object, (Identifier, BindingRef)):
+        return target.object.name
+    if isinstance(target, ArrayIndexAccess) and isinstance(target.array, Identifier):
+        return target.array.name
+    if isinstance(target, BindingIndexAccess) and isinstance(target.binding, BindingRef):
+        return target.binding.name
+    return None
+
+
+class _WrittenVarsVisitor(NodeVisitor):
+    """STR-4: names WRITTEN (declared or assigned). The inverse-selective mirror of
+    `_UsedNamesVisitor`: it adds a name only at a *write* position and never enters a
+    read subtree (Assignment.value, conditions, index expressions). Every recursing
+    node is explicitly overridden to descend only into sub-statements — `generic_visit`
+    is the safe fallback for a future new statement type, not a read-harvester."""
+
+    def __init__(self):
+        self.written: set[str] = set()
+
+    def visit_VarDecl(self, node):
+        self.written.add(node.name)
+
+    def visit_ArrayDecl(self, node):
+        self.written.add(node.name)
+
+    def visit_Assignment(self, node):
+        name = _write_target_name(node.target)
+        if name is not None:
+            self.written.add(name)  # NOT node.value (that is a read)
+
+    def visit_IfElse(self, node):
+        for s in node.then_body:
+            self.visit(s)
+        for s in node.else_body:
+            self.visit(s)
+
+    def visit_ForLoop(self, node):
+        for part in (node.init, node.update):  # init/update ARE writes; condition is a read
+            if part is not None:
+                self.visit(part)
+        for s in node.body:
+            self.visit(s)
+
+    def visit_WhileLoop(self, node):
+        for s in node.body:
+            self.visit(s)
+
+    def visit_FunctionDef(self, node):
+        for s in node.body:
+            self.visit(s)
+
+
 def _collect_written_vars(stmts: list[ASTNode]) -> set[str]:
     """Collect all variable names written (assigned/declared) in a statement list."""
-    written: set[str] = set()
+    v = _WrittenVarsVisitor()
     for stmt in stmts:
-        _collect_written_in_stmt(stmt, written)
-    return written
+        v.visit(stmt)
+    return v.written
 
 
-def _collect_written_in_stmt(stmt: ASTNode, written: set[str]):
-    """Recursively collect written variable names."""
-    if isinstance(stmt, VarDecl):
-        written.add(stmt.name)
-    elif isinstance(stmt, Assignment):
-        target = stmt.target
-        if isinstance(target, Identifier):
-            written.add(target.name)
-        elif isinstance(target, BindingRef):
-            written.add(target.name)
-        elif isinstance(target, ChannelAccess):
-            obj = target.object
-            if isinstance(obj, Identifier):
-                written.add(obj.name)
-            elif isinstance(obj, BindingRef):
-                written.add(obj.name)
-        elif isinstance(target, ArrayIndexAccess) and isinstance(target.array, Identifier):
-            written.add(target.array.name)
-        elif isinstance(target, BindingIndexAccess) and isinstance(target.binding, BindingRef):
-            written.add(target.binding.name)
-    elif isinstance(stmt, ArrayDecl):
-        written.add(stmt.name)
-    elif isinstance(stmt, IfElse):
-        for s in stmt.then_body:
-            _collect_written_in_stmt(s, written)
-        for s in stmt.else_body:
-            _collect_written_in_stmt(s, written)
-    elif isinstance(stmt, ForLoop):
-        _collect_written_in_stmt(stmt.init, written)
-        _collect_written_in_stmt(stmt.update, written)
-        for s in stmt.body:
-            _collect_written_in_stmt(s, written)
-    elif isinstance(stmt, WhileLoop):
-        for s in stmt.body:
-            _collect_written_in_stmt(s, written)
-    elif isinstance(stmt, FunctionDef):
-        for s in stmt.body:
-            _collect_written_in_stmt(s, written)
+class _ReassignedVarsVisitor(NodeVisitor):
+    """STR-4: names REASSIGNED (an Assignment target) — NOT merely declared once. The
+    deliberate asymmetry vs the written-collector: a ForLoop/WhileLoop recurses into
+    its *body only* (a loop-var's init/update reassignment is not a block-level
+    reassignment for the CSE guard), and declarations (VarDecl/ArrayDecl) are ignored."""
+
+    def __init__(self):
+        self.out: set[str] = set()
+
+    def visit_Assignment(self, node):
+        name = _write_target_name(node.target)
+        if name is not None:
+            self.out.add(name)
+
+    def visit_IfElse(self, node):
+        for s in node.then_body:
+            self.visit(s)
+        for s in node.else_body:
+            self.visit(s)
+
+    def visit_ForLoop(self, node):
+        for s in node.body:  # body ONLY — do not visit init/update/condition
+            self.visit(s)
+
+    def visit_WhileLoop(self, node):
+        for s in node.body:
+            self.visit(s)
+
+    def visit_FunctionDef(self, node):
+        for s in node.body:
+            self.visit(s)
 
 
 def _collect_reassigned_vars(stmts: list[ASTNode]) -> set[str]:
     """Names REASSIGNED (Assignment target) in a block — not merely declared once.
     A subexpression reading a reassigned variable cannot be CSE-hoisted, since its
     value can change between occurrences (declarations alone are stable)."""
-    out: set[str] = set()
+    v = _ReassignedVarsVisitor()
     for stmt in stmts:
-        _collect_reassigned_in_stmt(stmt, out)
-    return out
-
-
-def _collect_reassigned_in_stmt(stmt: ASTNode, out: set[str]):
-    if isinstance(stmt, Assignment):
-        t = stmt.target
-        if isinstance(t, (Identifier, BindingRef)):
-            out.add(t.name)
-        elif isinstance(t, ChannelAccess) and isinstance(t.object, (Identifier, BindingRef)):
-            out.add(t.object.name)
-        elif isinstance(t, ArrayIndexAccess) and isinstance(t.array, Identifier):
-            out.add(t.array.name)
-        elif isinstance(t, BindingIndexAccess) and isinstance(t.binding, BindingRef):
-            out.add(t.binding.name)
-    elif isinstance(stmt, IfElse):
-        for s in stmt.then_body:
-            _collect_reassigned_in_stmt(s, out)
-        for s in stmt.else_body:
-            _collect_reassigned_in_stmt(s, out)
-    elif isinstance(stmt, (ForLoop, WhileLoop)):
-        for s in stmt.body:
-            _collect_reassigned_in_stmt(s, out)
-    elif isinstance(stmt, FunctionDef):
-        for s in stmt.body:
-            _collect_reassigned_in_stmt(s, out)
+        v.visit(stmt)
+    return v.out
 
 
 def _is_loop_invariant(expr: ASTNode, modified: set[str],

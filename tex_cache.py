@@ -26,7 +26,8 @@ from typing import Any
 
 from .tex_compiler.lexer import Lexer
 from .tex_compiler.parser import Parser
-from .tex_compiler.type_checker import TypeChecker, TEXType
+from .tex_compiler.type_checker import TypeChecker
+from .tex_compiler.types import TEXType
 from .tex_compiler.optimizer import optimize
 from .tex_runtime.interpreter import _collect_identifiers
 
@@ -210,10 +211,26 @@ class TEXCache:
         if cached is not None:
             return cached
 
-        # Full compilation pipeline
+        # Full compilation pipeline: lex + parse, then the shared post-parse
+        # orchestration (STR-8: identical to the fusion path's).
         tokens = Lexer(code).tokenize()
         program = Parser(tokens, source=code).parse()
-        checker = TypeChecker(binding_types=binding_types, source=code)
+        program, type_map, referenced, assigned, params, used_builtins = \
+            self.compile_ast(program, binding_types, source=code)
+
+        self.put(code, binding_types, program, type_map,
+                 referenced, assigned, params, used_builtins)
+        return (program, type_map, referenced, assigned, params, used_builtins)
+
+    def compile_ast(self, program, binding_types, *, source: str):
+        """STR-8: the shared post-parse compile pipeline (type-check → optimize →
+        re-type-check on the optimized AST → collect builtins), used by BOTH the
+        normal path (`compile_tex`, from source) and fusion (`compile_fused`, from a
+        spliced AST). Returns the same 6-tuple as `compile_tex`. Error-agnostic: a
+        `TypeCheckError` propagates so each caller translates it as it sees fit
+        (fusion wraps it as `FusionError`).
+        """
+        checker = TypeChecker(binding_types=binding_types, source=source)
         type_map = checker.check(program)
         # Pass type_map so optimizer-created nodes (CSE/LICM temps + their
         # references) are registered, keeping the AST type-consistent during
@@ -224,23 +241,16 @@ class TEXCache:
         # (const-folded BinOps, CSE/LICM temps, unrolled-loop bodies) that the
         # original id()-keyed type_map can never cover; a stale lookup would
         # mistype them (e.g. a vec arg counted as one scalar component, crashing
-        # vec constructors). This mirrors what the disk-cache reload path
-        # already does — both paths now share identical, correct semantics.
-        # strict_redeclare=False: unrolling flattens N copies of a local-declaring
-        # loop body into one scope; the strict check above already validated the
-        # user's original code, so tolerate those benign redeclarations here.
-        type_map = TypeChecker(binding_types=binding_types, source=code,
+        # vec constructors). This mirrors what the disk-cache reload path already
+        # does. strict_redeclare=False: unrolling flattens N copies of a local-
+        # declaring loop body into one scope; the strict check above already
+        # validated the user's original code, so tolerate benign redeclarations.
+        type_map = TypeChecker(binding_types=binding_types, source=source,
                                strict_redeclare=False).check(program)
-
         # Pre-compute builtin identifiers (avoids AST walk on every execution)
         used_builtins = _collect_identifiers(program)
-
-        self.put(code, binding_types, program, type_map,
-                 checker.referenced_bindings, checker.assigned_bindings,
-                 checker.param_declarations, used_builtins)
         return (program, type_map, checker.referenced_bindings,
-                checker.assigned_bindings, checker.param_declarations,
-                used_builtins)
+                checker.assigned_bindings, checker.param_declarations, used_builtins)
 
     def clear_memory(self):
         """Clear in-memory cache only (disk entries remain)."""
@@ -447,7 +457,7 @@ class TEXCache:
             if not blob or hashlib.sha256(blob).hexdigest() != data.get("sha"):
                 path.unlink(missing_ok=True)  # corrupt — never marshal.loads it
                 return None
-            from .tex_runtime.codegen import materialize_codegen
+            from .tex_runtime.codegen_persist import materialize_codegen
             return materialize_codegen(blob, data.get("src", ""),
                                        data.get("has_fn_calls", False), fp)
         except Exception as e:

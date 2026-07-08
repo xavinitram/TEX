@@ -15,6 +15,7 @@ import re
 import time
 import torch
 import traceback
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger("TEX")
@@ -61,6 +62,30 @@ try:
     import comfy.model_management as _mm
 except Exception:
     _mm = None
+
+
+@dataclass(frozen=True)
+class ExecContext:
+    """STR-2/STR-3: the value bundle threaded from `execute()` into the tier strategies
+    (`_run_torch_compile`/`_run_auto`/`_run_cuda_graph`/`_run_default`) and the shared
+    `_interp_fallback` recovery path. Built once per cook so a strategy never re-touches
+    execute()'s locals; `select_tier` picks the strategy, `execute()` dispatches via
+    `_TIER_METHOD` and normalizes the output shape in one place."""
+    program: Any
+    bindings: dict
+    type_map: dict
+    device: Any
+    code: str
+    latent_channel_count: int
+    output_names: list
+    used_builtins: Any
+    eff_precision: str  # M-3: fp32 when a LATENT input is present, else `precision`
+    # STR-2: fields the accelerated/default tier strategies read (hoisted once so a
+    # strategy never re-touches execute()'s locals). `fp` is the value-independent
+    # fingerprint, or None on a fused chain (which is keyed by `fused_fp` instead).
+    fp: Any = None
+    fused_chain: bool = False
+    fused_fp: Any = None
 
 
 def _downscale_for_preview(img: torch.Tensor, max_dim: int = 256) -> torch.Tensor:
@@ -218,7 +243,7 @@ class TEXWrangleNode(_BaseClass):
                     "precision",
                     options=["fp32", "fp16"],
                     default="fp32",
-                    tooltip="fp32: full precision (default). fp16: half-precision IMAGE-class temps (coordinates & sampling stay fp32; ~1e-3 accuracy). Cuts peak/churn ~30% when the INPUT is already fp16; for an fp32 input the cast can raise peak, so it's most useful in all-fp16 pipelines. LATENT stays fp32.",
+                    tooltip="fp32: full precision (default). fp16: EXPERIMENTAL half-precision IMAGE-class temps (coordinates & sampling stay fp32; ~1e-3 accuracy, and it diverges on threshold/branch programs — see CHANGELOG). Cuts peak/churn ~30% when the INPUT is already fp16; for an fp32 input the cast can raise peak, so it's most useful in all-fp16 pipelines. LATENT stays fp32.",
                     optional=True,
                 ),
                 # Wildcard input so the node appears in the search panel
@@ -293,6 +318,135 @@ class TEXWrangleNode(_BaseClass):
                 else:
                     parts.append(f"{name}:{val}")
         return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+    @classmethod
+    def _interp_fallback(cls, ctx: ExecContext, *, reset_dynamo: bool,
+                         pass_precision: bool):
+        """STR-2: the single copy of the tier→interpreter recovery path, previously
+        duplicated in the torch_compile / auto / cuda_graph branches. The two flags
+        reproduce each branch's *exact* original call:
+          - torch_compile: reset_dynamo=True,  pass_precision=False
+          - auto:          reset_dynamo=True,  pass_precision=True
+          - cuda_graph:    reset_dynamo=False, pass_precision=False
+        (dynamo state is process-global — see compiled.py — so a failed compile/auto
+        cook resets it on THIS thread before retrying; the graph path never touched
+        dynamo, so it does not reset.)"""
+        if reset_dynamo:
+            try:
+                torch._dynamo.reset()
+            except Exception:
+                pass
+        interp = _get_interpreter()
+        kw = dict(source=ctx.code, latent_channel_count=ctx.latent_channel_count,
+                  output_names=ctx.output_names, used_builtins=ctx.used_builtins)
+        if pass_precision:
+            kw["precision"] = ctx.eff_precision
+        return interp.execute(ctx.program, ctx.bindings, ctx.type_map,
+                              device=ctx.device, **kw)
+
+    @staticmethod
+    def select_tier(compile_mode, device, fused_chain: bool, fused_fp_present: bool) -> str:
+        """STR-2: PURE tier SELECTION — which acceleration strategy `(mode, device,
+        fused)` picks, WITHOUT executing it. The branch ORDER and every guard mirror
+        the old cascade verbatim; this is the CPU-testable core where the routing
+        complexity lives (a fake `device="cuda:0"` string exercises the cuda_graph
+        classification without a GPU)."""
+        if compile_mode == "torch_compile" and not fused_chain:
+            return "torch_compile"
+        if compile_mode == "auto" and not fused_chain:
+            return "auto"
+        if (compile_mode == "cuda_graph" and str(device).startswith("cuda")
+                and (not fused_chain or fused_fp_present)):
+            return "cuda_graph"
+        return "default"
+
+    # ── STR-2 tier strategies: each runs one tier and returns raw_output; the
+    #    dict-normalization is lifted to execute() post-dispatch. ──
+    @classmethod
+    def _run_torch_compile(cls, ctx: ExecContext):
+        try:
+            return execute_compiled(ctx.program, ctx.bindings, ctx.type_map, ctx.device,
+                                    ctx.fp, latent_channel_count=ctx.latent_channel_count,
+                                    output_names=ctx.output_names, used_builtins=ctx.used_builtins)
+        except Exception as compile_exc:
+            # Defense in depth: torch_compile must NEVER hard-fail the node.
+            logger.warning("[TEX] torch_compile path failed (%s); using interpreter.",
+                           compile_exc)
+            return cls._interp_fallback(ctx, reset_dynamo=True, pass_precision=False)
+
+    @classmethod
+    def _run_auto(cls, ctx: ExecContext):
+        try:
+            from .tex_runtime.compiled import run_auto
+            return run_auto(ctx.program, ctx.bindings, ctx.type_map, ctx.device, ctx.fp,
+                            latent_channel_count=ctx.latent_channel_count,
+                            output_names=ctx.output_names, used_builtins=ctx.used_builtins,
+                            precision=ctx.eff_precision)
+        except Exception as auto_exc:
+            logger.warning("[TEX] auto tier failed (%s); using interpreter.", auto_exc)
+            return cls._interp_fallback(ctx, reset_dynamo=True, pass_precision=True)
+
+    @classmethod
+    def _run_cuda_graph(cls, ctx: ExecContext):
+        # UC-1: CUDA-graph replay. A fused chain is captured as ONE graph keyed by its
+        # fused fingerprint. run_graphed returns None (→ interpreter) when the program
+        # isn't graphable or capture failed — never hard-fails on this path.
+        from .tex_runtime.graphed import run_graphed
+        _fp = ctx.fused_fp if ctx.fused_chain else ctx.fp
+        out = None
+        try:
+            out = run_graphed(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
+                              latent_channel_count=ctx.latent_channel_count,
+                              output_names=ctx.output_names, used_builtins=ctx.used_builtins)
+        except Exception as _g_exc:
+            logger.warning("[TEX] cuda_graph path failed (%s); using interpreter.", _g_exc)
+            out = None
+        if out is None:
+            return cls._interp_fallback(ctx, reset_dynamo=False, pass_precision=False)
+        return out
+
+    @classmethod
+    def _run_default(cls, ctx: ExecContext):
+        # UC-2: default-route an exact (fetch/conv) stencil through the codegen tier
+        # (avg_pool2d/conv2d/unfold). _codegen_only_execute self-falls-back; the outer
+        # guard covers env-build edge cases so this can never hard-fail the node.
+        if not ctx.fused_chain:
+            try:
+                if _should_stencil_route(ctx.fp, ctx.program):
+                    return _codegen_only_execute(
+                        ctx.program, ctx.bindings, ctx.type_map, ctx.device,
+                        latent_channel_count=ctx.latent_channel_count,
+                        output_names=ctx.output_names,
+                        used_builtins=ctx.used_builtins, fingerprint=ctx.fp)
+            except Exception as _stencil_exc:
+                logger.warning("[TEX] stencil codegen route failed (%s); using "
+                               "interpreter.", _stencil_exc)
+        interp = _get_interpreter()
+        # M-4: under GPU memory pressure, run a tile-safe program in horizontal strips
+        # (peak transient ~1/n). Falls back to the whole-image cook on any strip error.
+        n_strips = (cls._tile_plan(ctx.program, ctx.bindings, ctx.device, ctx.latent_channel_count)
+                    if not ctx.fused_chain else None)
+        if n_strips:
+            try:
+                from .tex_memory import run_tiled
+                return run_tiled(interp, ctx.program, ctx.bindings, ctx.type_map, ctx.device,
+                                 ctx.latent_channel_count, ctx.output_names, ctx.used_builtins,
+                                 ctx.eff_precision, n_strips)
+            except Exception as _tile_exc:
+                logger.warning("[TEX] tiled cook failed (%s); running untiled.", _tile_exc)
+        # Pass source so runtime (E6xxx) errors render a source-line caret. Fused chains
+        # splice many sources, so leave source empty there (errors stay message-only).
+        return interp.execute(ctx.program, ctx.bindings, ctx.type_map, device=ctx.device,
+                              source=("" if ctx.fused_chain else ctx.code),
+                              latent_channel_count=ctx.latent_channel_count,
+                              output_names=ctx.output_names, used_builtins=ctx.used_builtins,
+                              precision=ctx.eff_precision)
+
+    # tier_id → strategy method name (getattr avoids the callable-in-dict binding trap)
+    _TIER_METHOD = {
+        "torch_compile": "_run_torch_compile", "auto": "_run_auto",
+        "cuda_graph": "_run_cuda_graph", "default": "_run_default",
+    }
 
     @classmethod
     def execute(cls, **kwargs):
@@ -422,148 +576,21 @@ class TEXWrangleNode(_BaseClass):
                 if pname in bindings:
                     bindings[pname] = _convert_param_value(bindings[pname], pinfo, pname)
 
-            # Execute — optionally with torch.compile acceleration.
-            # Fused chains always use the interpreter (the spliced program isn't
-            # keyed in the torch_compile fingerprint cache).
-            if compile_mode == "torch_compile" and not fused_chain:
-                fp = cache.fingerprint(code, binding_types)
-                try:
-                    raw_output = execute_compiled(program, bindings, type_map, device, fp,
-                                                  latent_channel_count=latent_channel_count,
-                                                  output_names=output_names,
-                                                  used_builtins=used_builtins)
-                except Exception as compile_exc:
-                    # Defense in depth: selecting torch_compile must NEVER hard-fail
-                    # the node. If execute_compiled's own fallback still raised,
-                    # reset dynamo on THIS thread and run the plain interpreter
-                    # (dynamo state is process-global — see compiled.py).
-                    logger.warning(
-                        "[TEX] torch_compile path failed (%s); using interpreter.",
-                        compile_exc,
-                    )
-                    try:
-                        torch._dynamo.reset()
-                    except Exception:
-                        pass
-                    interp = _get_interpreter()
-                    raw_output = interp.execute(program, bindings, type_map, device=device,
-                                                source=code,
-                                                latent_channel_count=latent_channel_count,
-                                                output_names=output_names,
-                                                used_builtins=used_builtins)
-                # torch_compile returns single value — wrap for compat
-                if not isinstance(raw_output, dict):
-                    raw_output = {output_names[0]: raw_output}
-            elif compile_mode == "auto" and not fused_chain:
-                # CC-2: measured auto-tier — run the always-safe codegen path,
-                # background-compile without stalling, and switch to torch.compile
-                # only on a measured per-machine win. Never hard-fails the node.
-                fp = cache.fingerprint(code, binding_types)
-                try:
-                    from .tex_runtime.compiled import run_auto
-                    raw_output = run_auto(program, bindings, type_map, device, fp,
-                                          latent_channel_count=latent_channel_count,
-                                          output_names=output_names,
-                                          used_builtins=used_builtins,
-                                          precision=("fp32" if has_latent_input else precision))
-                except Exception as auto_exc:
-                    logger.warning("[TEX] auto tier failed (%s); using interpreter.",
-                                   auto_exc)
-                    try:
-                        torch._dynamo.reset()
-                    except Exception:
-                        pass
-                    interp = _get_interpreter()
-                    raw_output = interp.execute(program, bindings, type_map, device=device,
-                                                source=code,
-                                                latent_channel_count=latent_channel_count,
-                                                output_names=output_names,
-                                                used_builtins=used_builtins,
-                                                precision=("fp32" if has_latent_input else precision))
-                if not isinstance(raw_output, dict):
-                    raw_output = {output_names[0]: raw_output}
-            elif (compile_mode == "cuda_graph" and str(device).startswith("cuda")
-                  and (not fused_chain or fused_fp is not None)):
-                # UC-1: CUDA-graph replay of the interpreter. Q-1: a fused chain is
-                # captured as ONE graph, keyed by its fused fingerprint. Returns
-                # None (falls through to the interpreter) when the program isn't
-                # graphable or capture failed — never hard-fails on this path.
-                from .tex_runtime.graphed import run_graphed
-                _fp = fused_fp if fused_chain else cache.fingerprint(code, binding_types)
-                raw_output = None
-                try:
-                    raw_output = run_graphed(
-                        program, bindings, type_map, device, _fp,
-                        latent_channel_count=latent_channel_count,
-                        output_names=output_names, used_builtins=used_builtins)
-                except Exception as _g_exc:
-                    logger.warning("[TEX] cuda_graph path failed (%s); using interpreter.", _g_exc)
-                    raw_output = None
-                if raw_output is None:
-                    interp = _get_interpreter()
-                    raw_output = interp.execute(program, bindings, type_map, device=device,
-                                                source=code,
-                                                latent_channel_count=latent_channel_count,
-                                                output_names=output_names,
-                                                used_builtins=used_builtins)
-                elif not isinstance(raw_output, dict):
-                    raw_output = {output_names[0]: raw_output}
-            else:
-                # UC-2: default-route programs with an exact (fetch/conv) stencil
-                # through the codegen tier, which lowers the stencil to
-                # avg_pool2d/conv2d/unfold (10-40x CPU on box_blur-class programs).
-                # Sample-based stencils are excluded by the gate (their lowering
-                # would diverge). _codegen_only_execute self-falls-back to the
-                # interpreter; the outer guard covers env-build edge cases so this
-                # default-path change can never hard-fail the node.
-                routed = False
-                if not fused_chain:
-                    try:
-                        _fp = cache.fingerprint(code, binding_types)
-                        if _should_stencil_route(_fp, program):
-                            raw_output = _codegen_only_execute(
-                                program, bindings, type_map, device,
-                                latent_channel_count=latent_channel_count,
-                                output_names=output_names,
-                                used_builtins=used_builtins, fingerprint=_fp)
-                            if not isinstance(raw_output, dict):
-                                raw_output = {output_names[0]: raw_output}
-                            routed = True
-                    except Exception as _stencil_exc:
-                        logger.warning("[TEX] stencil codegen route failed (%s); "
-                                       "using interpreter.", _stencil_exc)
-                        routed = False
-                if not routed:
-                    interp = _get_interpreter()
-                    # M-3: LATENT data exceeds [0,1] and feeds further math, so it
-                    # must stay fp32 even in fp16 mode.
-                    eff_precision = "fp32" if has_latent_input else precision
-                    # M-4: under GPU memory pressure, run a tile-safe program in
-                    # horizontal strips (peak transient ~1/n). Falls back to the
-                    # whole-image cook on any strip error.
-                    n_strips = (cls._tile_plan(program, bindings, device, latent_channel_count)
-                                if not fused_chain else None)
-                    if n_strips:
-                        try:
-                            from .tex_memory import run_tiled
-                            raw_output = run_tiled(interp, program, bindings, type_map,
-                                                   device, latent_channel_count,
-                                                   output_names, used_builtins, eff_precision,
-                                                   n_strips)
-                        except Exception as _tile_exc:
-                            logger.warning("[TEX] tiled cook failed (%s); running untiled.",
-                                           _tile_exc)
-                            n_strips = None
-                    if not n_strips:
-                        # Pass source so runtime (E6xxx) errors render a source-line caret.
-                        # Fused chains splice many sources, so their line numbers wouldn't
-                        # map to `code` — leave source empty there (errors stay message-only).
-                        raw_output = interp.execute(program, bindings, type_map, device=device,
-                                                    source=("" if fused_chain else code),
-                                                    latent_channel_count=latent_channel_count,
-                                                    output_names=output_names,
-                                                    used_builtins=used_builtins,
-                                                    precision=eff_precision)
+            # STR-2/STR-3: bundle every arg the tiers need once (fp hoisted here so no
+            # strategy re-touches execute()'s locals), select the tier (pure), dispatch
+            # to its strategy, and normalize the output shape in ONE place.
+            # M-3: LATENT data exceeds [0,1] and feeds further math, so it must stay
+            # fp32 even in fp16 mode.
+            eff_precision = "fp32" if has_latent_input else precision
+            fp = cache.fingerprint(code, binding_types) if not fused_chain else None
+            ctx = ExecContext(program, bindings, type_map, device, code,
+                              latent_channel_count, output_names, used_builtins,
+                              eff_precision, fp, fused_chain, fused_fp)
+            tier_id = cls.select_tier(compile_mode, device, fused_chain,
+                                      fused_fp is not None)
+            raw_output = getattr(cls, cls._TIER_METHOD[tier_id])(ctx)
+            if not isinstance(raw_output, dict):
+                raw_output = {output_names[0]: raw_output}
 
             # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
             # oldest mip/grid entries; allocate-and-hold semantics untouched).

@@ -5,6 +5,42 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-07-08
+
+Longevity / LLM-coding / structure release. **No user-facing behavior change** — the
+interp↔codegen bit-exactness contract holds across every refactor (verified: the full
+suite stays green, 1683→1689 sub-tests, plus a live-GPU cuda_graph parity pass). The
+whole cycle makes the codebase navigable, its invariants machine-enforced, and its
+biggest modules decomposed.
+
+### The LLM map + machine-enforced invariants
+- **`AGENTS.md`** — the entry point: pipeline map, a MUST-NOT-BREAK invariant table (each
+  naming its enforcing test), the corrected stdlib recipe, the DO-NOT-TOUCH register, a
+  module LOC-budget policy, and a doc-layering policy.
+- **`ARCHITECTURE.md`** — single module-graph/layering source; **`Function-Reference.md`**
+  and **`examples/INDEX.md`** are now *generated* views (drift-tested).
+- New safety net: a **grammar-driven differential fuzzer** (interp↔codegen; nightly at
+  N=2000), an **edge-input matrix** (fp16/1×1/batch/int64 × every fn × tier), **tier-
+  execution observability**, taxonomy-consistency checks (closes the `_NON_LOCAL_FNS`
+  wrong-when-tiled trap), operator-completeness, a release gate (version-consistency +
+  hash-seed determinism), a numpy-ban lint, coverage tooling, and a runner-drift guard.
+
+### Single-source spine
+- **`TEXType` → `tex_compiler/types.py`** (a dependency-free leaf; breaks the
+  stdlib_signatures↔type_checker cycle; checker fan-in 9→~2).
+- **Single-source stdlib registry** — one `@stdlib(...)` decorator per function replaces
+  the hand-maintained 143-entry map + the parallel taxonomy tables; `codegen`'s emit
+  dispatch self-registers likewise. Documentation drift closed (8 previously-undocumented
+  functions added; 47 dispatch methods + 140 stdlib return-type hints).
+
+### Decomposition (bit-exact code motion)
+- **`codegen.py` split 4092→~2730** across `codegen_stdfns` / `codegen_stencil` /
+  `codegen_persist` (strict DAG, gated cluster-by-cluster on the fuzzer + edge matrix).
+- **`execute()` 388→277** — the tier cascade is now a pure, CPU-testable `select_tier`
+  classifier + a strategy registry; the duplicated recovery path is single-sourced.
+- Optimizer pipeline is a data-driven `PASSES` list; a CPython-style `NodeVisitor` base
+  backs the pure-traversal optimizer walks; fusion reuses a shared `compile_ast`.
+
 ## [0.16.0] - 2026-07-07
 
 Correctness-and-honesty release driven by the v0.16 roadmap (`TEX_research/22`),

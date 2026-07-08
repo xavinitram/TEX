@@ -26,7 +26,8 @@ import torch
 from TEX_Wrangle.tex_marshalling import prepare_output as _prepare_output, unwrap_latent as _unwrap_latent, infer_binding_type as _infer_binding_type, map_inferred_type as _map_inferred_type
 from TEX_Wrangle.tex_compiler.lexer import Lexer, LexerError, TokenType
 from TEX_Wrangle.tex_compiler.parser import Parser, ParseError
-from TEX_Wrangle.tex_compiler.type_checker import TypeChecker, TypeCheckError, TEXType, CHANNEL_MAP
+from TEX_Wrangle.tex_compiler.type_checker import TypeChecker, TypeCheckError
+from TEX_Wrangle.tex_compiler.types import TEXType, CHANNEL_MAP
 from TEX_Wrangle.tex_compiler.diagnostics import TEXMultiError
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter, InterpreterError
 from TEX_Wrangle.tex_runtime.interpreter import _ensure_spatial, _broadcast_pair, _collect_identifiers
