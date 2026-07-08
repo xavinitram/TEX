@@ -148,8 +148,29 @@ def _entry_bytes(entry, extract) -> int:
     return total
 
 
-def _total_cache_bytes() -> int:
-    return sum(_entry_bytes(e, ex) for c, ex in _budget_caches() for e in c.values())
+def _entry_dev_type(entry, extract):
+    """MEM-4: the device.type of this cache entry's tensors (an entry's tensors share
+    a device), or None if it holds none."""
+    try:
+        for t in extract(entry):
+            if isinstance(t, torch.Tensor):
+                return t.device.type
+    except Exception:
+        pass
+    return None
+
+
+def _total_cache_bytes(dev_type=None) -> int:
+    """MEM-4: total tensor-cache bytes, optionally restricted to entries on `dev_type`.
+    A CPU cook's 512 MB budget must not count (or evict) CUDA-resident mip entries, and
+    a CUDA cook must not be throttled by CPU-resident ones — each device is accounted
+    against its own budget."""
+    total = 0
+    for c, ex in _budget_caches():
+        for e in c.values():
+            if dev_type is None or _entry_dev_type(e, ex) == dev_type:
+                total += _entry_bytes(e, ex)
+    return total
 
 
 def cache_budget_bytes(device) -> int:
@@ -186,12 +207,15 @@ def _entry_pinned(entry, extract, pinned) -> bool:
     return False
 
 
-def _oldest_unpinned_key(cache, extract, pinned):
-    """The oldest key in `cache` whose entry isn't graph-pinned, never the most-recent
-    entry (kept so the current cook's working set survives). None if none qualify."""
+def _oldest_unpinned_key(cache, extract, pinned, dev_type=None):
+    """The oldest key in `cache` whose entry isn't graph-pinned and (MEM-4) is on
+    `dev_type`, never the most-recent entry (kept so the current cook's working set
+    survives). None if none qualify."""
     newest = next(reversed(cache), None)
     for k in cache:  # OrderedDict iterates oldest -> newest
         if k == newest:
+            continue
+        if dev_type is not None and _entry_dev_type(cache[k], extract) != dev_type:
             continue
         if not _entry_pinned(cache[k], extract, pinned):
             return k
@@ -208,8 +232,10 @@ def enforce_cache_budget(device) -> None:
     kill switch and blacklist, silently re-arming doomed captures — is gone.
     Best-effort; never raises."""
     try:
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        dev_type = dev.type  # MEM-4: only account + evict entries on the cook's device
         budget = cache_budget_bytes(device)
-        if _total_cache_bytes() <= budget:
+        if _total_cache_bytes(dev_type) <= budget:
             return
         try:
             from .tex_runtime.graphed import pinned_storages
@@ -217,13 +243,36 @@ def enforce_cache_budget(device) -> None:
         except Exception:
             pinned = set()
         for cache, extract in _budget_caches():
-            while len(cache) > 1 and _total_cache_bytes() > budget:
-                victim = _oldest_unpinned_key(cache, extract, pinned)
+            while len(cache) > 1 and _total_cache_bytes(dev_type) > budget:
+                victim = _oldest_unpinned_key(cache, extract, pinned, dev_type)
                 if victim is None:
-                    break  # every evictable entry here is pinned by a live graph
+                    break  # every evictable same-device entry is pinned by a live graph
                 del cache[victim]
-            if _total_cache_bytes() <= budget:
+            if _total_cache_bytes(dev_type) <= budget:
                 break
+    except Exception:
+        pass
+
+
+def trim_reserved_pool(device) -> None:
+    """MEM-2: return stranded reserved VRAM after a big->small cook downshift. When the
+    caching allocator holds far more reserved than is live (measured: a 512->4096->512
+    sequence stranded 1551 MB), a threshold-gated `empty_cache()` reclaims it (measured
+    3.4 ms, +0.09 ms next-cook tax). Threshold-gated so it NEVER fires at steady state;
+    CUDA-only; `TEX_NO_POOL_TRIM=1` disables. Safe with live captured graphs — their
+    pool blocks are in-use, so empty_cache leaves them intact."""
+    if os.environ.get("TEX_NO_POOL_TRIM") == "1":
+        return
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type != "cuda":
+        return
+    try:
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        reserved = torch.cuda.memory_reserved(idx)
+        allocated = torch.cuda.memory_allocated(idx)
+        total = torch.cuda.get_device_properties(idx).total_memory
+        if reserved - allocated > max(1024 * 1024 * 1024, total // 8):
+            torch.cuda.empty_cache()
     except Exception:
         pass
 

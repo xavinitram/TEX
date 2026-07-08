@@ -424,7 +424,8 @@ class TEXWrangleNode(_BaseClass):
         interp = _get_interpreter()
         # M-4: under GPU memory pressure, run a tile-safe program in horizontal strips
         # (peak transient ~1/n). Falls back to the whole-image cook on any strip error.
-        n_strips = (cls._tile_plan(ctx.program, ctx.bindings, ctx.device, ctx.latent_channel_count)
+        n_strips = (cls._tile_plan(ctx.program, ctx.bindings, ctx.device, ctx.latent_channel_count,
+                                   2 if ctx.eff_precision == "fp16" else 4)
                     if not ctx.fused_chain else None)
         if n_strips:
             try:
@@ -533,7 +534,8 @@ class TEXWrangleNode(_BaseClass):
             # do). Prevents a big cook OOMing while GBs sit locked in models. Zero
             # cost on the common path (one memory-stats read). cuda only.
             if _mm is not None and str(device).startswith("cuda"):
-                cls._preflight_memory(program, bindings, device)
+                cls._preflight_memory(program, bindings, device,
+                                      2 if precision == "fp16" and not has_latent_input else 4)
 
             # Determine output names (sorted alphabetically for stable ordering)
             output_names = sorted(assigned_bindings.keys())
@@ -632,8 +634,9 @@ class TEXWrangleNode(_BaseClass):
             # CPU budget; the eviction is cheap (early-returns when under budget)
             # and the graph-cache teardown on eviction is a no-op off CUDA.
             try:
-                from .tex_memory import enforce_cache_budget
+                from .tex_memory import enforce_cache_budget, trim_reserved_pool
                 enforce_cache_budget(device)
+                trim_reserved_pool(device)  # MEM-2: reclaim stranded reserved VRAM
             except Exception:
                 pass
 
@@ -762,9 +765,11 @@ class TEXWrangleNode(_BaseClass):
 
     @staticmethod
     def _tile_plan(program, bindings: dict[str, Any], device,
-                   latent_channel_count: int = 0) -> int | None:
+                   latent_channel_count: int = 0, dtype_bytes: int = 4) -> int | None:
         """M-4: strip count if the cook should be tiled (tile-safe + under memory
-        pressure), else None. cuda only; needs ComfyUI's free-memory query."""
+        pressure), else None. cuda only; needs ComfyUI's free-memory query.
+        MEM-3: dtype_bytes=2 in fp16 mode halves the peak estimate (a fp16 cook that
+        fits shouldn't be tiled as if it were fp32)."""
         if _mm is None or not (hasattr(_mm, "get_free_memory") and str(device).startswith("cuda")):
             return None
         # M-4 safety: never tile a LATENT ([B,C,H,W] — dim 1 is channels, not
@@ -787,7 +792,7 @@ class TEXWrangleNode(_BaseClass):
                     break
             if spatial is None:
                 return None
-            est = estimate_peak_bytes(program, spatial)
+            est = estimate_peak_bytes(program, spatial, dtype_bytes)
             free = _mm.get_free_memory(torch.device(device))
             if not free or est <= 0:
                 return None
@@ -803,9 +808,11 @@ class TEXWrangleNode(_BaseClass):
             return None
 
     @staticmethod
-    def _preflight_memory(program, bindings: dict[str, Any], device) -> None:
+    def _preflight_memory(program, bindings: dict[str, Any], device,
+                          dtype_bytes: int = 4) -> None:
         """M-1: if the estimated cook peak exceeds free VRAM, free resident
-        models first (best-effort; never raises)."""
+        models first (best-effort; never raises). MEM-3: dtype_bytes=2 for an explicit
+        fp16 cook (auto is still unresolved here, so it stays the conservative 4)."""
         if _mm is None or not (hasattr(_mm, "get_free_memory") and hasattr(_mm, "free_memory")):
             return
         try:
@@ -817,7 +824,7 @@ class TEXWrangleNode(_BaseClass):
             if spatial is None:
                 return
             from .tex_memory import estimate_peak_bytes
-            est = estimate_peak_bytes(program, spatial)
+            est = estimate_peak_bytes(program, spatial, dtype_bytes)
             if est <= 0:
                 return
             dev_t = torch.device(device)

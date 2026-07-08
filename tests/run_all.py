@@ -129,6 +129,9 @@ from test_v018_precision import (
     test_prlp4_fp16_safe_reductions, test_prlp2_auto_gate,
     test_prlp2_fp16_accuracy_fuzzer,
 )
+from test_v018_memory import (
+    test_mem2_pool_trim_gating, test_mem3_fp16_estimator, test_mem4_per_device_budget,
+)
 
 
 def main():
@@ -324,6 +327,9 @@ def main():
     test_prlp4_fp16_safe_reductions(r)
     test_prlp2_auto_gate(r)
     test_prlp2_fp16_accuracy_fuzzer(r)
+    test_mem2_pool_trim_gating(r)
+    test_mem3_fp16_estimator(r)
+    test_mem4_per_device_budget(r)
 
     success = r.summary()
     return 0 if success else 1
