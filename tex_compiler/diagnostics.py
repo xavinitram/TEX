@@ -298,6 +298,8 @@ _FOREIGN_TYPE_HINTS: dict[str, str] = {
 # Built-in variable/constant names a user commonly shadows (UX-1). Declaring `float v`
 # collides with the built-in normalized-y coordinate — a confusing "already declared"
 # without this specific explanation (the `v` gotcha bites often enough to name it).
+# NOTE: the KEY SET must track `interpreter._BUILTIN_NAMES` (the authoritative list);
+# a built-in added there without a hint here just yields the generic message (safe).
 _BUILTIN_VAR_HINTS: dict[str, str] = {
     "u": "the normalized x coordinate (0..1)",
     "v": "the normalized y coordinate (0..1)",

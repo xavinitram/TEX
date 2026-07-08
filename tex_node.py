@@ -655,7 +655,6 @@ class TEXWrangleNode(_BaseClass):
             if auto_fp16 and eff_precision == "fp16" and any(
                     isinstance(v, torch.Tensor) and not torch.isfinite(v).all()
                     for v in raw_output.values()):
-                from .tex_runtime import tier_trace
                 tier_trace.record_precision("fp32", "auto: fp16 non-finite -> fp32 fallback")
                 ctx = ExecContext(program, bindings, type_map, device, code,
                                   latent_channel_count, output_names, used_builtins,
