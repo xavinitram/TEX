@@ -535,7 +535,9 @@ def _disable_graph_mode() -> None:
 
 
 def clear_graph_cache() -> None:
-    """Testing / free-memory hook."""
+    """Test-only full reset: graphs + `_blacklist` + the RNG-poison kill switch.
+    The memory-pressure/free-memory path uses `free_graphs_only()` instead (MEM-1),
+    so reclaiming memory never re-arms a doomed capture."""
     global _graph_mode_disabled
     _free_all_graphs()
     _blacklist.clear()
