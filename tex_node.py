@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 import torch
@@ -162,6 +163,25 @@ def _nan_highlight(t):
         bad_pixel = (~finite).any(dim=-1, keepdim=True)
         return torch.where(bad_pixel, magenta, t)
     return torch.where(finite, t, torch.ones_like(t))
+
+
+def _apply_cpu_threads_env() -> None:
+    """HW-4: if TEX_CPU_THREADS is set, pin torch's CPU thread count (measured 64t = 1.27x
+    pointwise vs the torch default 32; fbm neutral +/-5%). Strictly OPT-IN and read once —
+    NEVER auto-set: torch.set_num_threads is process-global in ComfyUI, and oversubscribing
+    it harms concurrent nodes. Unset -> the thread count is left untouched."""
+    val = os.environ.get("TEX_CPU_THREADS")
+    if not val:
+        return
+    try:
+        n = int(val)
+        if n > 0:
+            torch.set_num_threads(n)
+    except Exception:
+        pass
+
+
+_apply_cpu_threads_env()  # HW-4: opt-in, once at import
 
 
 # ── Cached interpreter (reused across executions to avoid rebuild overhead) ──

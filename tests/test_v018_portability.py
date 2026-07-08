@@ -200,3 +200,74 @@ def test_port2_program_shape(r: SubTestResult):
                f"Program fields changed: {got} != {expected} (breaks the CLI/host API)")
     else:
         r.ok(f"Program fields stable: {', '.join(expected)}")
+
+
+def test_hw2_multi_gpu_device_context(r: SubTestResult):
+    print("\n--- HW-2: multi-GPU device-index correctness ---")
+    from TEX_Wrangle.tex_runtime import graphed as G
+    fails = []
+    # (a) the capture key includes the device INDEX — a cuda:0 and a cuda:1 cook of the
+    #     same program never collide on one captured graph (works CPU-side; the device
+    #     objects are just labels).
+    k0 = G._capture_key("fp", torch.device("cuda:0"), "fp32", {}, ["OUT"], 0)
+    k1 = G._capture_key("fp", torch.device("cuda:1"), "fp32", {}, ["OUT"], 0)
+    if k0 == k1:
+        fails.append("capture key does not distinguish device index")
+
+    # (b) RNG-recovery targets the COOK's device index (mock torch.cuda.device to record
+    #     the target and abort before any real CUDA op). Recovering on the wrong device
+    #     would leave the real generator poisoned and trip the process-wide kill switch.
+    entered = []
+    real = torch.cuda.device
+
+    class _Rec:
+        def __init__(self, idx): entered.append(idx)
+        def __enter__(self): raise RuntimeError("abort before CUDA ops")
+        def __exit__(self, *a): return False
+    torch.cuda.device = lambda idx: _Rec(idx)
+    try:
+        G._recover_from_capture_failure(1)
+    except Exception:
+        pass
+    finally:
+        torch.cuda.device = real
+    if 1 not in entered:
+        fails.append(f"recovery did not target device index 1 (targets: {set(entered)})")
+
+    if fails:
+        r.fail("HW-2 multi-GPU", "; ".join(fails))
+    else:
+        r.ok("capture key carries device index; RNG-recovery pins the cook's device "
+             "(index-0 paths unchanged on a single GPU)")
+
+
+def test_hw4_cpu_threads(r: SubTestResult):
+    print("\n--- HW-4: TEX_CPU_THREADS opt-in knob ---")
+    from TEX_Wrangle.tex_node import _apply_cpu_threads_env
+    saved_env = os.environ.get("TEX_CPU_THREADS")
+    saved_threads = torch.get_num_threads()
+    fails = []
+    try:
+        # unset -> untouched
+        os.environ.pop("TEX_CPU_THREADS", None)
+        before = torch.get_num_threads()
+        _apply_cpu_threads_env()
+        if torch.get_num_threads() != before:
+            fails.append("unset TEX_CPU_THREADS changed the thread count (must never auto-set)")
+        # set -> reflected (use a small, safe target distinct from `before`)
+        target = 2 if before != 2 else 3
+        os.environ["TEX_CPU_THREADS"] = str(target)
+        _apply_cpu_threads_env()
+        if torch.get_num_threads() != target:
+            fails.append(f"set TEX_CPU_THREADS={target} not reflected "
+                         f"(got {torch.get_num_threads()})")
+    finally:
+        torch.set_num_threads(saved_threads)
+        if saved_env is None:
+            os.environ.pop("TEX_CPU_THREADS", None)
+        else:
+            os.environ["TEX_CPU_THREADS"] = saved_env
+    if fails:
+        r.fail("HW-4 cpu threads", "; ".join(fails))
+    else:
+        r.ok("unset -> untouched (never auto-set); set -> reflected")

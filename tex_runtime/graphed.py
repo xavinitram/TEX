@@ -230,24 +230,29 @@ def _graph_capture_worthwhile(est_ops: int, px: int) -> bool:
 
 # ── RNG-poison recovery (verified protocol V4) ────────────────────────
 
-def _recover_from_capture_failure() -> bool:
+def _recover_from_capture_failure(dev_index=None) -> bool:
     """A failed capture leaves the CUDA generator's capture flag stuck.
     set_rng_state does NOT clear it; the working protocol is to run a trivial
     successful 1-op capture whose generator epilogue clears the flag. Returns
-    True if torch.rand works afterward. Caps at 6 iterations."""
+    True if torch.rand works afterward. Caps at 6 iterations. HW-2: recover on the
+    COOK's device — recovering on the wrong device leaves the real generator poisoned."""
+    if dev_index is None:
+        dev_index = torch.cuda.current_device()
+    dev = f"cuda:{dev_index}"
     for _ in range(6):
         try:
-            torch.cuda.synchronize()
-            _ = (torch.zeros(1, device="cuda") + 1)  # swallow a sticky error
-            g = torch.cuda.CUDAGraph()
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                with torch.cuda.graph(g):
-                    _ = torch.zeros(1, device="cuda") + 1
-            torch.cuda.current_stream().wait_stream(s)
-            torch.cuda.synchronize()
-            _ = torch.rand(1, device="cuda")  # verify generator is clean
+            with torch.cuda.device(dev_index):
+                torch.cuda.synchronize()
+                _ = (torch.zeros(1, device=dev) + 1)  # swallow a sticky error
+                g = torch.cuda.CUDAGraph()
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    with torch.cuda.graph(g):
+                        _ = torch.zeros(1, device=dev) + 1
+                torch.cuda.current_stream().wait_stream(s)
+                torch.cuda.synchronize()
+                _ = torch.rand(1, device=dev)  # verify generator is clean
             return True
         except Exception:
             continue
@@ -305,13 +310,19 @@ class GraphedProgram:
 
     def capture(self, program, bindings, type_map, device, latent_channel_count,
                 output_names, precision, used_builtins) -> bool:
-        """Warm up, then capture. Returns True on success."""
+        """Warm up, then capture. Returns True on success. HW-2: pin capture to the
+        COOK's device — a cuda:1 cook must capture on cuda:1's stream, not whatever
+        device happens to be current, else capture fails loudly and RNG-recovery runs
+        against the wrong generator (spuriously tripping the process-wide kill switch)."""
         global _CAPTURING
         _CAPTURING = True
+        dev = device if isinstance(device, torch.device) else torch.device(device)
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
         try:
-            return self._capture_inner(program, bindings, type_map, device,
-                                       latent_channel_count, output_names,
-                                       precision, used_builtins)
+            with torch.cuda.device(idx):
+                return self._capture_inner(program, bindings, type_map, device,
+                                           latent_channel_count, output_names,
+                                           precision, used_builtins)
         finally:
             _CAPTURING = False
 
@@ -423,9 +434,11 @@ def _free_all_graphs() -> None:
         pass
 
 
-def _under_memory_pressure() -> bool:
+def _under_memory_pressure(device=None) -> bool:
     try:
-        free = get_host_services().get_free_memory(torch.device("cuda"))
+        # HW-2: query the COOK's device, not a bare "cuda" (device 0)
+        dev = device if device is not None else torch.device("cuda")
+        free = get_host_services().get_free_memory(dev)
         return free is not None and free < 512 * 1024 * 1024
     except Exception:
         return False
@@ -478,8 +491,10 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
             _blacklist.add(key)
             return None
 
-    # First sight of this key: check pressure, then attempt capture.
-    if _under_memory_pressure():
+    # First sight of this key: check pressure, then attempt capture. HW-2: all device-
+    # scoped ops target the COOK's device index, not a bare "cuda".
+    dev_index = dev.index if dev.index is not None else torch.cuda.current_device()
+    if _under_memory_pressure(dev):
         _free_all_graphs()
     _build_keepalive()
     gp = GraphedProgram(key)
@@ -490,7 +505,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
         ok = False
         logger.info("[TEX] CUDA-graph capture failed (%s); using interpreter.", e)
         _last_capture_error[0] = f"{type(e).__name__}: {e}"
-        if not _recover_from_capture_failure():
+        if not _recover_from_capture_failure(dev_index):
             _disable_graph_mode()
     if not ok:
         _blacklist.add(key)

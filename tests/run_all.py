@@ -139,7 +139,8 @@ from test_v018_ux import (
 )
 from test_v018_portability import (
     test_port1_import_lint, test_port1_host_services, test_port2_facade,
-    test_port2_program_shape, test_port3_cli,
+    test_port2_program_shape, test_port3_cli, test_hw2_multi_gpu_device_context,
+    test_hw4_cpu_threads,
 )
 
 
@@ -354,6 +355,8 @@ def main():
     test_port2_facade(r)
     test_port2_program_shape(r)
     test_port3_cli(r)
+    test_hw2_multi_gpu_device_context(r)
+    test_hw4_cpu_threads(r)
 
     success = r.summary()
     return 0 if success else 1

@@ -8,6 +8,16 @@ correctly with ComfyUI absent — the host seam degrades to NullHostServices).
 
     python -m TEX_Wrangle.tex_cli run examples/grayscale.tex --in in.png --out out.png
     python -m TEX_Wrangle.tex_cli run prog.tex --in a.png --out b.png --device cuda --precision auto
+
+Bit-depth policy (PORT-4)
+-------------------------
+I/O is **8-bit** (uint8 PNG): TEX cooks in fp32 (or fp16), but the CLI quantises to 8-bit
+on write — matching ComfyUI's IMAGE convention and the 3.9e-3 "8-bit quantum" that gates
+the whole precision story (doc 22/28). The uint8<->float round-trip is bit-exact
+(round, not truncate). A 16-bit PNG variant (`--bit-depth 16`) is a deliberate NON-goal
+this cycle: there is no 16-bit consumer in the ComfyUI pipeline, and torchvision's
+`encode_png` is 8-bit; a future host with an HDR sink can add it against this same
+`load_image`/`save_image` seam.
 """
 import argparse
 import re
