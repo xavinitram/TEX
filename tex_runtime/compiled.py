@@ -700,8 +700,10 @@ def _cuda_headroom_ok(device_type: str) -> bool:
     if device_type != "cuda":
         return True
     try:
-        import comfy.model_management as _mm  # noqa
-        free = _mm.get_free_memory(torch.device("cuda"))
+        from .host import get_host_services  # PORT-1 seam
+        free = get_host_services().get_free_memory(torch.device("cuda"))
+        if free is None:
+            raise RuntimeError("no host free-memory query")
         return free > 2 * 1024 * 1024 * 1024  # >2 GB
     except Exception:
         try:

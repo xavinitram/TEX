@@ -57,11 +57,8 @@ except ImportError:
     IO = None
     _V3_AVAILABLE = False
 
-# ── ComfyUI memory-management (optional; absent in standalone tests) ──
-try:
-    import comfy.model_management as _mm
-except Exception:
-    _mm = None
+# ── Host memory-management (PORT-1: the seam; ComfyUI or a Null host) ──
+from .tex_runtime.host import get_host_services
 
 
 @dataclass(frozen=True)
@@ -113,17 +110,8 @@ def _is_oom_error(e: BaseException) -> bool:
     surface as ``torch.AcceleratorError`` (error_code==2), not just
     ``torch.cuda.OutOfMemoryError``, and ``is_oom`` also clears poisoned async
     CUDA error state. Falls back to ``OOM_EXCEPTION`` then the torch type so
-    standalone runs still detect it."""
-    if _mm is not None:
-        try:
-            if hasattr(_mm, "is_oom"):
-                return bool(_mm.is_oom(e))
-            if hasattr(_mm, "OOM_EXCEPTION"):
-                return isinstance(e, _mm.OOM_EXCEPTION)
-        except Exception:
-            pass
-    oom_t = getattr(torch.cuda, "OutOfMemoryError", None)
-    return isinstance(oom_t, type) and isinstance(e, oom_t)
+    standalone runs still detect it (the Null host falls back to the torch type)."""
+    return get_host_services().is_oom(e)
 
 
 def _oom_in_chain(e: BaseException) -> BaseException | None:
@@ -562,7 +550,7 @@ class TEXWrangleNode(_BaseClass):
             # VRAM, ask ComfyUI to free resident models first (what model loaders
             # do). Prevents a big cook OOMing while GBs sit locked in models. Zero
             # cost on the common path (one memory-stats read). cuda only.
-            if _mm is not None and str(device).startswith("cuda"):
+            if str(device).startswith("cuda"):
                 cls._preflight_memory(program, bindings, device,
                                       2 if precision == "fp16" and not has_latent_input else 4)
 
@@ -827,8 +815,8 @@ class TEXWrangleNode(_BaseClass):
         pressure), else None. cuda only; needs ComfyUI's free-memory query.
         MEM-3: dtype_bytes=2 in fp16 mode halves the peak estimate (a fp16 cook that
         fits shouldn't be tiled as if it were fp32)."""
-        if _mm is None or not (hasattr(_mm, "get_free_memory") and str(device).startswith("cuda")):
-            return None
+        if not str(device).startswith("cuda"):
+            return None  # host.get_free_memory returns None off a host → no tiling
         # M-4 safety: never tile a LATENT ([B,C,H,W] — dim 1 is channels, not
         # height) or a cook whose spatial bindings disagree on height (they can't
         # be co-tiled). run_tiled re-checks, but planning here avoids a bogus
@@ -850,7 +838,7 @@ class TEXWrangleNode(_BaseClass):
             if spatial is None:
                 return None
             est = estimate_peak_bytes(program, spatial, dtype_bytes)
-            free = _mm.get_free_memory(torch.device(device))
+            free = get_host_services().get_free_memory(torch.device(device))
             if not free or est <= 0:
                 return None
             budget = 0.25 * free
@@ -870,8 +858,7 @@ class TEXWrangleNode(_BaseClass):
         """M-1: if the estimated cook peak exceeds free VRAM, free resident
         models first (best-effort; never raises). MEM-3: dtype_bytes=2 for an explicit
         fp16 cook (auto is still unresolved here, so it stays the conservative 4)."""
-        if _mm is None or not (hasattr(_mm, "get_free_memory") and hasattr(_mm, "free_memory")):
-            return
+        host = get_host_services()  # PORT-1: Null host → free is None → this no-ops
         try:
             spatial = None
             for v in bindings.values():
@@ -885,10 +872,10 @@ class TEXWrangleNode(_BaseClass):
             if est <= 0:
                 return
             dev_t = torch.device(device)
-            free = _mm.get_free_memory(dev_t)
+            free = host.get_free_memory(dev_t)
             headroom = 128 * 1024 * 1024
             if free is not None and free < est + headroom:
-                _mm.free_memory(est + 256 * 1024 * 1024, dev_t)
+                host.free_memory(est + 256 * 1024 * 1024, dev_t)
         except Exception:
             pass
 

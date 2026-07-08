@@ -220,9 +220,8 @@ try:
         except Exception:
             pass
         try:
-            import comfy.model_management as mm
-            if hasattr(mm, "soft_empty_cache"):
-                mm.soft_empty_cache()
+            from .tex_runtime.host import get_host_services  # PORT-1 seam
+            get_host_services().soft_empty_cache()
         except Exception:
             pass
         return web.json_response({"ok": freed})

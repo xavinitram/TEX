@@ -30,10 +30,7 @@ from typing import Any
 
 import torch
 
-try:
-    import comfy.model_management as _mm
-except Exception:
-    _mm = None
+from .host import get_host_services  # PORT-1: the ONE seam to comfy.model_management
 
 from ..tex_compiler.ast_nodes import (
     Program, ForLoop, WhileLoop, FunctionCall,
@@ -427,10 +424,8 @@ def _free_all_graphs() -> None:
 
 
 def _under_memory_pressure() -> bool:
-    if _mm is None or not hasattr(_mm, "get_free_memory"):
-        return False
     try:
-        free = _mm.get_free_memory(torch.device("cuda"))
+        free = get_host_services().get_free_memory(torch.device("cuda"))
         return free is not None and free < 512 * 1024 * 1024
     except Exception:
         return False
