@@ -86,7 +86,7 @@ from test_v015_audit_fixes import (
     test_q5_preflight_from_spec, test_q6_preview_kwarg_popped,
     test_m1_oom_unwrap, test_m3_fp16_reconcile, test_uc2_stencil_exact_only,
     test_m4_tiling_guards, test_uc1_graph_vec_param, test_cc1_triton_hint,
-    test_p2_cache_hygiene, test_p2_tap_cap, test_p2_evict_clears_graphs,
+    test_p2_cache_hygiene, test_p2_tap_cap, test_mem1_evict_preserves_graphs,
     test_p2_pc2_scoped_deletion, test_p2_pc1_sibling_sweep,
 )
 from test_failure_modes import (
@@ -122,6 +122,9 @@ from test_v017_phase3 import (
     test_str7_codegen_split, test_str9_stmt_dispatch, test_str4_write_collectors,
     test_str2_select_tier_matrix, test_c2_clamp_mixed_bounds,
 )
+from test_cross_device_envelope import test_prlp1_cross_device_envelope
+from test_determinism_pin import test_prlp5_determinism_pin
+from test_v018_docs import test_doc7b_map_drift, test_reg1b_doc_ex_populated
 
 
 def main():
@@ -265,7 +268,7 @@ def main():
     test_cc1_triton_hint(r)
     test_p2_cache_hygiene(r)
     test_p2_tap_cap(r)
-    test_p2_evict_clears_graphs(r)
+    test_mem1_evict_preserves_graphs(r)
     test_p2_pc2_scoped_deletion(r)
     test_p2_pc1_sibling_sweep(r)
     test_fm_class_a_auto_lifecycle(r)
@@ -306,6 +309,12 @@ def main():
     test_str4_write_collectors(r)
     test_str2_select_tier_matrix(r)
     test_c2_clamp_mixed_bounds(r)
+
+    # v0.18.0 Phase 0 — stability pins + doc integrity
+    test_prlp1_cross_device_envelope(r)
+    test_prlp5_determinism_pin(r)
+    test_doc7b_map_drift(r)
+    test_reg1b_doc_ex_populated(r)
 
     success = r.summary()
     return 0 if success else 1

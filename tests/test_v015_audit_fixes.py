@@ -444,37 +444,114 @@ def test_p2_tap_cap(r: SubTestResult):
         r.fail("P2 tap cap", str(e))
 
 
-# ── P2 · UC-1 cache-eviction tears down captured graphs ──────────────────
-def test_p2_evict_clears_graphs(r: SubTestResult):
-    print("\n--- P2: cache-budget eviction clears the graph cache ---")
+# ── MEM-1 · surgical graph-safe eviction + kill-switch preservation ──────
+def test_mem1_evict_preserves_graphs(r: SubTestResult):
+    print("\n--- MEM-1: surgical graph-safe eviction + kill-switch preservation ---")
     import os
     from TEX_Wrangle import tex_memory as MEM
     from TEX_Wrangle.tex_runtime import stdlib as SL
     from TEX_Wrangle.tex_runtime import graphed as G
-    try:
-        MEM.free_tensor_caches()
-        # A live captured graph could bake the address of a warmup stdlib tensor;
-        # an eviction that frees it must tear the graph cache down (UC-1 safety).
-        G._graph_cache["SENTINEL"] = object()
-        G._graph_bytes = 123
-        for s in range(4):
-            SL._mip_cache[("k", s)] = ((1, 512, 512), torch.zeros(512, 512, 3),
-                                       [torch.zeros(256, 256, 3)])
+
+    class _FakeGP:  # a GraphedProgram stand-in (pinned_entries + bytes)
+        def __init__(self, pinned): self.pinned_entries = list(pinned); self.bytes = 0
+
+    def _with_budget_1mb(dev):
         saved = os.environ.get("TEX_CACHE_BUDGET_MB")
         os.environ["TEX_CACHE_BUDGET_MB"] = "1"
         try:
-            MEM.enforce_cache_budget("cpu")
+            MEM.enforce_cache_budget(dev)
         finally:
             if saved is None:
                 os.environ.pop("TEX_CACHE_BUDGET_MB", None)
             else:
                 os.environ["TEX_CACHE_BUDGET_MB"] = saved
-        assert "SENTINEL" not in G._graph_cache, "graph cache not cleared on eviction"
-        assert G._graph_bytes == 0, "graph byte counter not reset"
-        r.ok("eviction tears down captured graphs (no stale-replay hazard)")
+
+    # (1) An UNPINNED eviction must NOT tear the graph cache down and must NOT reset
+    #     the RNG-poison kill switch — the two silent failure modes the old blunt
+    #     clear_graph_cache()-on-eviction created (doc 28 MEM-1).
+    try:
+        MEM.free_tensor_caches()
+        G._graph_cache["SENTINEL"] = _FakeGP([])   # pins nothing
+        G._graph_bytes = 456
+        G._graph_mode_disabled = True              # simulate a prior kill-switch trip
+        for s in range(4):
+            SL._mip_cache[("junk", s)] = ((1, 512, 512), torch.zeros(512, 512, 3),
+                                          [torch.zeros(256, 256, 3)])
+        _with_budget_1mb("cpu")
+        assert "SENTINEL" in G._graph_cache, "eviction wrongly tore down the graph cache"
+        assert G._graph_bytes == 456, "eviction wrongly touched the graph byte counter"
+        assert G._graph_mode_disabled is True, "eviction wrongly reset the kill switch"
+        assert len(SL._mip_cache) <= 1, "unpinned junk was not evicted under budget"
+        r.ok("unpinned eviction preserves graphs + kill switch; junk evicted")
     except Exception as e:
-        r.fail("P2 evict clears graphs", str(e))
+        r.fail("MEM-1 preserve graphs/kill-switch", str(e))
     finally:
+        G._graph_mode_disabled = False
+        G._graph_cache.pop("SENTINEL", None)
+        G._graph_bytes = 0
+        MEM.free_tensor_caches()
+
+    # (2) A cache entry PINNED by a live graph is skipped (reclaims 0 bytes) while
+    #     unpinned entries around it are evicted — the honest-accounting fix.
+    try:
+        MEM.free_tensor_caches()
+        pinned_t = torch.zeros(512, 512, 3)
+        G._graph_cache["PINNED_HOLDER"] = _FakeGP([pinned_t])
+        SL._grid_buf[("pinned",)] = pinned_t                 # baked into the graph
+        for s in range(4):
+            SL._grid_buf[("junk", s)] = torch.zeros(512, 512, 3)  # not baked
+        assert pinned_t.untyped_storage().data_ptr() in G.pinned_storages()
+        _with_budget_1mb("cpu")
+        assert ("pinned",) in SL._grid_buf, "graph-pinned entry was wrongly evicted"
+        assert len(SL._grid_buf) < 5, "unpinned entries were not evicted"
+        r.ok("graph-pinned entry survives eviction; unpinned neighbours evicted")
+    except Exception as e:
+        r.fail("MEM-1 pinned-skip", str(e))
+    finally:
+        G._graph_cache.pop("PINNED_HOLDER", None)
+        MEM.free_tensor_caches()
+
+    # (3) CUDA: a real captured graph survives an unpinned eviction and still
+    #     replays bit-exact (zero recapture — same GraphedProgram identity).
+    if not torch.cuda.is_available():
+        r.ok("MEM-1 CUDA graph-survival (no GPU, SKIPPED)")
+        return
+    try:
+        from TEX_Wrangle.tex_runtime.interpreter import _collect_identifiers
+        from TEX_Wrangle.tex_runtime.compiled import _plain_execute
+        MEM.free_tensor_caches()
+        G.clear_graph_cache()
+        bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
+        code = "vec3 c=@A.rgb; float g=luma(c); @OUT=vec4(mix(c,vec3(g),0.4)*1.1,1.0);"
+        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        tm = TypeChecker(binding_types=bt, source=code).check(prog)
+        used = _collect_identifiers(prog)
+        img = torch.rand(1, 64, 64, 3, device="cuda")
+        out1 = G.run_graphed(prog, {"A": img}, tm, "cuda", "mem1_surv",
+                             output_names=["OUT"], used_builtins=used)
+        assert out1 is not None, "program was not captured"
+        gp_ids = {id(gp) for gp in G._graph_cache.values()}
+        # junk unpinned entries + budget pressure → eviction pass
+        for s in range(4):
+            SL._mip_cache[("junk", s)] = ((1, 512, 512),
+                                          torch.zeros(512, 512, 3, device="cuda"),
+                                          [torch.zeros(256, 256, 3, device="cuda")])
+        _with_budget_1mb("cuda")
+        assert {id(gp) for gp in G._graph_cache.values()} >= gp_ids, \
+            "captured graph was evicted by an unrelated cache eviction"
+        out2 = G.run_graphed(prog, {"A": img}, tm, "cuda", "mem1_surv",
+                             output_names=["OUT"], used_builtins=used)
+        it = _plain_execute(prog, {"A": img}, tm, "cuda",
+                            output_names=["OUT"], used_builtins=used)
+        g2 = (out2["OUT"] if isinstance(out2, dict) else out2).float()
+        itt = (it["OUT"] if isinstance(it, dict) else it).float()
+        md = (g2 - itt).abs().max().item()
+        assert md < 1e-5, f"post-eviction replay diverges (maxdiff {md})"
+        r.ok(f"captured graph survives eviction + replays bit-exact (maxdiff {md:.1e})")
+    except Exception as e:
+        r.fail("MEM-1 CUDA graph-survival", str(e))
+    finally:
+        G.clear_graph_cache()
         MEM.free_tensor_caches()
 
 

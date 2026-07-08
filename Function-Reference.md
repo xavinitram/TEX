@@ -51,7 +51,7 @@
 | `max` | `max(a, b) → float` | Returns the larger value. | — |
 | `clamp` | `clamp(x, lo, hi) → float` | Clamp x to [lo, hi] range. | — |
 | `lerp` | `lerp(a, b, t) → float` | Linear interpolation from a to b by t. | — |
-| `mix` | `mix(a, b, t) → float` | Alias for lerp. Linear interpolation. | — |
+| `mix` | `mix(a, b, t) → float` | Linear interpolation from a to b by t. | — |
 | `fit` | `fit(x, inLo, inHi, outLo, outHi) → float` | Remap x from [inLo, inHi] to [outLo, outHi]. | — |
 | `step` | `step(edge, x) → float` | Returns 0 if x < edge, 1 otherwise. | — |
 | `smoothstep` | `smoothstep(lo, hi, x) → float` | Smooth Hermite interpolation between lo and hi. | — |

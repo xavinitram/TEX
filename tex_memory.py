@@ -171,31 +171,59 @@ def cache_budget_bytes(device) -> int:
     return 512 * 1024 * 1024
 
 
+def _entry_pinned(entry, extract, pinned) -> bool:
+    """MEM-1: True if any storage in this cache entry is baked into a live captured
+    graph (its `data_ptr()` is in `pinned`). Such an entry reclaims 0 bytes if
+    evicted — the graph still holds it — so the evictor skips it."""
+    if not pinned:
+        return False
+    try:
+        for t in extract(entry):
+            if isinstance(t, torch.Tensor) and t.untyped_storage().data_ptr() in pinned:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _oldest_unpinned_key(cache, extract, pinned):
+    """The oldest key in `cache` whose entry isn't graph-pinned, never the most-recent
+    entry (kept so the current cook's working set survives). None if none qualify."""
+    newest = next(reversed(cache), None)
+    for k in cache:  # OrderedDict iterates oldest -> newest
+        if k == newest:
+            continue
+        if not _entry_pinned(cache[k], extract, pinned):
+            return k
+    return None
+
+
 def enforce_cache_budget(device) -> None:
-    """Evict oldest cache entries (mip caches first — they pin full frames) until
-    total tensor-cache bytes are under budget. Best-effort; never raises."""
+    """MEM-1: evict oldest UNPINNED cache entries (mip caches first — they pin full
+    frames) until total tensor-cache bytes are under budget. An entry whose storage
+    is baked into a live CUDA graph is skipped — evicting it frees 0 bytes and would
+    only force a needless recapture. Captured graphs are left intact: the graph's own
+    pinning (graphed.pinned_storages) is what makes freeing the unpinned entries safe,
+    so the old blunt clear_graph_cache() teardown — which also reset the RNG-poison
+    kill switch and blacklist, silently re-arming doomed captures — is gone.
+    Best-effort; never raises."""
     try:
         budget = cache_budget_bytes(device)
         if _total_cache_bytes() <= budget:
             return
-        evicted = False
-        for cache, _ in _budget_caches():
+        try:
+            from .tex_runtime.graphed import pinned_storages
+            pinned = pinned_storages()
+        except Exception:
+            pinned = set()
+        for cache, extract in _budget_caches():
             while len(cache) > 1 and _total_cache_bytes() > budget:
-                cache.popitem(last=False)
-                evicted = True
+                victim = _oldest_unpinned_key(cache, extract, pinned)
+                if victim is None:
+                    break  # every evictable entry here is pinned by a live graph
+                del cache[victim]
             if _total_cache_bytes() <= budget:
                 break
-        if evicted:
-            # UC-1 safety: a captured CUDA graph may bake the device address of a
-            # warmup-populated stdlib cache entry (e.g. a sampler batch-index
-            # tensor). Freeing that storage here would let a later replay read
-            # reused/foreign memory. Tear down the graph cache so those programs
-            # re-capture against live buffers instead of replaying stale ones.
-            try:
-                from .tex_runtime.graphed import clear_graph_cache
-                clear_graph_cache()
-            except Exception:
-                pass
     except Exception:
         pass
 
@@ -267,6 +295,15 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
 
 def free_tensor_caches() -> None:
     """Drop every module-level tensor cache TEX holds (M-1/M-2 recovery)."""
+    # MEM-1: free captured graphs FIRST — they bake addresses of the cache entries
+    # cleared below, so tearing graphs down before their baked storages avoids any
+    # stale replay. free_graphs_only() leaves the blacklist + RNG-poison kill switch
+    # intact; clear_graph_cache() (which resets those) is now test-only.
+    try:
+        from .tex_runtime.graphed import free_graphs_only
+        free_graphs_only()
+    except Exception:
+        pass
     try:
         from .tex_runtime import stdlib as _sl
         for c in (_sl._sampler_cache, _sl._grid_buf, _sl._mip_cache,
@@ -286,10 +323,5 @@ def free_tensor_caches() -> None:
         interp._literal_cache.clear()
         interp._builtins_cache_env.clear()
         interp._builtins_cache_key = None
-    except Exception:
-        pass
-    try:
-        from .tex_runtime.graphed import clear_graph_cache
-        clear_graph_cache()
     except Exception:
         pass

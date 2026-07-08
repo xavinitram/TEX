@@ -106,15 +106,16 @@ grown a second responsibility. This is a policy, not a gate: `test_reg2_loc_budg
 *reports* over-budget modules and **ratchets** (a **new** module crossing 2000 is a
 red test; the known-over baseline below is grandfathered pending its planned split).
 
-Currently over the hard budget — each with a Phase-3 decomposition already planned:
+Currently over the hard budget — status as of v0.18.0 (drift-checked by
+`test_doc7b_map_drift`, which reds if any `~LOC` here diverges >20% from `wc -l`):
 
-| Module | LOC | Planned split |
-|--------|-----|---------------|
-| `tex_runtime/codegen.py` | ~3700 | STR-7 in progress: cluster 1 done (`codegen_stdfns.py` mixin extracted); next `codegen_stencil.py` / `codegen_persist.py` (guarded by the fuzzer/edge-matrix — do NOT split before them) |
-| `tex_runtime/stdlib.py` | ~2300 | per-domain `stdlib_*.py` — unblocked by REG-1 (registration is per-decorator, not one central dict) |
-| `tex_runtime/interpreter.py` | ~2100 | STR-3/STR-4 — extract `ExecContext` + the shared `NodeVisitor` |
+| Module | LOC | Status |
+|--------|-----|--------|
+| `tex_runtime/codegen.py` | ~2730 | STR-7 split **shipped** (4092→2731: `codegen_stdfns.py` / `codegen_stencil.py` / `codegen_persist.py` extracted). Docs 27/28 verdict: **stop here** — the remainder is one cohesive emitter; further splitting is aesthetic, not domain-driven |
+| `tex_runtime/stdlib.py` | ~2330 | per-domain `stdlib_*.py` still planned — unblocked by REG-1 (registration is per-decorator, not one central dict) |
+| `tex_runtime/interpreter.py` | ~2140 | STR-3/STR-4 **shipped** (`ExecContext` + shared `NodeVisitor` extracted); the residual is the core tree-walk |
 
-`tex_compiler/optimizer.py` (~1580) is over *soft*; STR-5 (a `PASSES` list) addresses it.
+`tex_compiler/optimizer.py` (~1520) is over *soft*; STR-5 (the `PASSES` list) **shipped**.
 
 ## Doc-layering policy (DOC-6)
 

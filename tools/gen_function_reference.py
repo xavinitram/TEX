@@ -48,6 +48,13 @@ def _unescape(s):
     return s.replace("|", r"\|")  # keep markdown table cells intact
 
 
+def _cell(s):
+    """REG-1b: a registry `doc` string (already decoded unicode) as a markdown cell —
+    collapse newlines, escape pipes. Distinct from `_unescape` (which decodes the raw
+    JS-escaped TEX_HELP_DATA `sig`)."""
+    return (s or "").replace("\n", " ").replace("|", r"\|")
+
+
 def generate():
     entries, cats = parse_help()
     reg_names = {n for e in R.REGISTRY for n in e.names}
@@ -72,7 +79,10 @@ def generate():
             e = entries[n]
             tags = [t for t, on in (("spatial", tag[n].spatial), ("sync", tag[n].sync),
                                     ("non-local", tag[n].non_local)) if on]
-            out.append(f"| `{n}` | `{_unescape(e['sig'])}` | {_unescape(e['desc'])} | "
+            # REG-1b: the description is now sourced from the registry `doc=` (the
+            # single source), not re-parsed from TEX_HELP_DATA. sig still comes from
+            # the editor help (not migrated to the registry).
+            out.append(f"| `{n}` | `{_unescape(e['sig'])}` | {_cell(tag[n].doc)} | "
                        f"{', '.join(tags) or '—'} |")
         out.append("")
     # functions with no help entry (drift) — list explicitly so the gap is visible
