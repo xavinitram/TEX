@@ -316,8 +316,7 @@ class GraphedProgram:
         against the wrong generator (spuriously tripping the process-wide kill switch)."""
         global _CAPTURING
         _CAPTURING = True
-        dev = device if isinstance(device, torch.device) else torch.device(device)
-        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        idx = _dev_index(device)
         try:
             with torch.cuda.device(idx):
                 return self._capture_inner(program, bindings, type_map, device,
@@ -424,6 +423,13 @@ def _capture_key(fingerprint, device, precision, bindings, output_names,
             tuple(output_names) if output_names else (), latent_channel_count)
 
 
+def _dev_index(device) -> int:
+    """HW-2: the concrete CUDA device index for a device (falling back to the current
+    device when unspecified) — the one place that idiom lives."""
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    return dev.index if dev.index is not None else torch.cuda.current_device()
+
+
 def _free_all_graphs() -> None:
     global _graph_bytes
     _graph_cache.clear()
@@ -493,7 +499,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
 
     # First sight of this key: check pressure, then attempt capture. HW-2: all device-
     # scoped ops target the COOK's device index, not a bare "cuda".
-    dev_index = dev.index if dev.index is not None else torch.cuda.current_device()
+    dev_index = _dev_index(dev)
     if _under_memory_pressure(dev):
         _free_all_graphs()
     _build_keepalive()

@@ -20,16 +20,9 @@ this cycle: there is no 16-bit consumer in the ComfyUI pipeline, and torchvision
 `load_image`/`save_image` seam.
 """
 import argparse
-import re
 import sys
 
 import torch
-
-# `@name` reads and writes (a write is `@name =`, `@name[...] =`, or `@name op=`); the
-# input bindings are reads minus writes. A leading type-hint prefix (m@, v@) isn't part
-# of the captured name.
-_READ_RE = re.compile(r"@([A-Za-z_]\w*)")
-_WRITE_RE = re.compile(r"@([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*[-+*/]?=")
 
 
 def _require_torchvision():
@@ -68,26 +61,23 @@ def save_image(tensor: torch.Tensor, path: str) -> None:
     write_file(path, encode_png(u8))
 
 
-def _detect_inputs(code: str) -> set:
-    return set(_READ_RE.findall(code)) - set(_WRITE_RE.findall(code))
-
-
 def run_program(code: str, image: torch.Tensor, device="cpu", precision="fp32",
                 compile_mode="none") -> torch.Tensor:
     """Run a TEX program on one image through the real node; return the primary IMAGE
-    output (the first vec3/vec4 output, else the first output)."""
+    output (the first vec3/vec4 output, else the first output). Compiles ONCE — the
+    compiler's own `referenced`/`assigned` give the input bindings and output types (no
+    regex to drift from the grammar); the node then re-infers types from the tensor."""
     from .tex_node import TEXWrangleNode
     from .tex_api import compile as tex_compile
     from .tex_compiler.types import TEXType
 
-    inputs = _detect_inputs(code)
+    prog = tex_compile(code, {})            # authoritative binding sets from the compiler
+    inputs = set(prog.referenced) - set(prog.assigned)
     kwargs = {name: image for name in inputs}
     kwargs.update(code=code, device=device, precision=precision, compile_mode=compile_mode)
     out = TEXWrangleNode.execute(**kwargs)
     results = out if isinstance(out, tuple) else out.result
 
-    # pick the primary IMAGE output by compiling for the output types/order
-    prog = tex_compile(code, {n: TEXType.VEC3 for n in inputs})
     names = sorted(prog.assigned.keys())
     idx = next((i for i, n in enumerate(names)
                 if prog.assigned[n] in (TEXType.VEC3, TEXType.VEC4)), 0)
