@@ -295,7 +295,30 @@ _FOREIGN_TYPE_HINTS: dict[str, str] = {
 }
 
 
+# Built-in variable/constant names a user commonly shadows (UX-1). Declaring `float v`
+# collides with the built-in normalized-y coordinate — a confusing "already declared"
+# without this specific explanation (the `v` gotcha bites often enough to name it).
+_BUILTIN_VAR_HINTS: dict[str, str] = {
+    "u": "the normalized x coordinate (0..1)",
+    "v": "the normalized y coordinate (0..1)",
+    "ix": "the integer pixel x", "iy": "the integer pixel y",
+    "iw": "the image width in pixels", "ih": "the image height in pixels",
+    "px": "the pixel x (float)", "py": "the pixel y (float)",
+    "fi": "the frame index", "fn": "the frame count", "ic": "the input channel count",
+    "PI": "the constant pi", "TAU": "the constant 2*pi", "E": "Euler's number",
+}
+
+
 # ── Hint lookup helpers ──────────────────────────────────────────────
+
+def get_builtin_var_hint(name: str) -> str:
+    """UX-1: if `name` shadows a TEX built-in, explain what it is and to rename, else ''."""
+    desc = _BUILTIN_VAR_HINTS.get(name)
+    if not desc:
+        return ""
+    return (f"'{name}' is a TEX built-in ({desc}), pre-declared in every program. "
+            f"Rename your variable (e.g. '{name}_' or a descriptive name).")
+
 
 def get_function_hint(name: str) -> str:
     """Return a contextual hint for a foreign/unknown function name, or ''."""

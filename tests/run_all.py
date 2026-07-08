@@ -132,6 +132,10 @@ from test_v018_precision import (
 from test_v018_memory import (
     test_mem2_pool_trim_gating, test_mem3_fp16_estimator, test_mem4_per_device_budget,
 )
+from test_v018_ux import (
+    test_dbg1_perf_hud_payload, test_ux1_diagnostics_reachability,
+    test_dbg3_nan_overlay, test_lx5_debug_print,
+)
 
 
 def main():
@@ -330,6 +334,12 @@ def main():
     test_mem2_pool_trim_gating(r)
     test_mem3_fp16_estimator(r)
     test_mem4_per_device_budget(r)
+
+    # v0.18.0 Phase 2 — UX/debugging
+    test_dbg1_perf_hud_payload(r)
+    test_ux1_diagnostics_reachability(r)
+    test_dbg3_nan_overlay(r)
+    test_lx5_debug_print(r)
 
     success = r.summary()
     return 0 if success else 1

@@ -2451,6 +2451,12 @@ class _CodeGen(_EmitStdFnsMixin):
     def _emit_function_call(self, node: FunctionCall) -> str:
         name = node.name
 
+        # LX-5: debug_print is an interpreter-only value probe (a thread-local
+        # side-effect). Refuse to codegen it — _Unsupported forces the whole program
+        # to the interpreter so the probe ALWAYS records, never silently no-ops.
+        if name == "debug_print":
+            raise _Unsupported("debug_print is interpreter-only (LX-5)")
+
         # Fast path: convert sample(@img, u+expr*px, v+expr*py) → direct fetch
         # Resolves through local variable definitions (e.g. off_u = float(px2) * px)
         if (name == "sample" and len(node.args) == 3

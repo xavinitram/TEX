@@ -24,6 +24,7 @@ SKIP = frozenset({
     "count", "matches", "hash", "hash_float", "hash_int", "char_at", "join",
     # array ops
     "sort", "reverse", "arr_sum", "arr_min", "arr_max", "median", "arr_avg",
+    "debug_print",   # LX-5: string label + interpreter-only side-effect probe
 })
 
 _IMG_UV3 = {"sample", "fetch", "sample_cubic", "sample_lanczos"}      # (img, u, v) -> vec3

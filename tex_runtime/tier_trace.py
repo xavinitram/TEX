@@ -56,8 +56,23 @@ def last_precision():
     return getattr(_local, "precision", None)
 
 
+def record_probe(label, value, x, y):
+    """LX-5: append a debug_print value-at-pixel probe for this cook (drained by
+    execute() into the same ui= payload as the tier facts)."""
+    probes = getattr(_local, "probes", None)
+    if probes is None:
+        probes = _local.probes = []
+    probes.append({"label": str(label), "value": value, "x": int(x), "y": int(y)})
+
+
+def get_probes():
+    """This cook's debug_print probes on this thread (a list, possibly empty)."""
+    return getattr(_local, "probes", None) or []
+
+
 def reset():
     """Clear this thread's record (tests call this before a cook to detect a
     tier that silently didn't run at all)."""
     _local.last = None
     _local.precision = None
+    _local.probes = []

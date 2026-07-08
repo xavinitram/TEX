@@ -208,3 +208,9 @@
 |----------|-----------|-------------|------|
 | `fetch_frame` | `fetch_frame(img, frame, px, py) → vec` | Nearest-neighbor fetch from a specific batch frame. | spatial, non-local |
 | `sample_frame` | `sample_frame(img, frame, u, v) → vec` | Bilinear sample from a specific batch frame. | spatial, non-local |
+
+## Debugging
+
+| Function | Signature | Description | Tags |
+|----------|-----------|-------------|------|
+| `debug_print` | `debug_print(label, value[, x, y]) → value` | Probe a value at a pixel — records it for the node's HUD and returns the value unchanged (a print-style debug tap). Interpreter-only; a compiled tier falls back so the probe always fires. | sync |

@@ -2015,6 +2015,33 @@ class TEXStdlib:
             return torch.median(flat, dim=1).values.unsqueeze(1).unsqueeze(1)
         return img
 
+    @stdlib("debug_print", sync=True,
+            doc="Probe a value at a pixel — records it for the node's "
+            "HUD and returns the value unchanged (a print-style debug tap). Interpreter"
+            "-only; a compiled tier falls back so the probe always fires.",
+            ex='float g = debug_print("luma", luma(@A.rgb), 0, 0);')
+    @staticmethod
+    def fn_debug_print(label, value, x=0.0, y=0.0):
+        """LX-5: value-at-pixel probe. Records value at (x,y) into the tier_trace probe
+        list (folded into the ui= HUD payload) and returns `value` UNCHANGED so @OUT is
+        bit-identical with or without the probe. torch-native readout, no numpy."""
+        from . import tier_trace
+        try:
+            xi = int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+            yi = int(y.item()) if isinstance(y, torch.Tensor) else int(y)
+            if isinstance(value, torch.Tensor) and value.dim() >= 3:
+                H, W = value.shape[1], value.shape[2]
+                pv = value[0, min(max(yi, 0), H - 1), min(max(xi, 0), W - 1)]
+                recorded = pv.detach().float().reshape(-1)[:4].tolist()
+            elif isinstance(value, torch.Tensor):
+                recorded = value.detach().float().reshape(-1)[:4].tolist()
+            else:
+                recorded = float(value)
+            tier_trace.record_probe(label, recorded, xi, yi)
+        except Exception:
+            pass
+        return value
+
 
 # -- Utility helpers (module-level) ------------------------------------
 

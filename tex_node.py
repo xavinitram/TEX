@@ -157,6 +157,25 @@ def _drop_tex_caches_on_oom() -> None:
         pass
 
 
+def _nan_highlight(t):
+    """DBG-3: paint every NaN/Inf PIXEL magenta so non-finite output is obvious. For a
+    [B,H,W,C] image, any non-finite channel magenta-flags the whole pixel; for a
+    [B,H,W] mask (or other), non-finite elements are set to 1.0. A no-op (returns the
+    input) for a finite tensor or a non-tensor — the caller only calls it when the
+    toggle is on, so a finite cook pays one isfinite reduction and nothing else."""
+    if not (isinstance(t, torch.Tensor) and t.is_floating_point()):
+        return t
+    finite = torch.isfinite(t)
+    if bool(finite.all()):
+        return t
+    if t.dim() >= 4:
+        C = t.shape[-1]
+        magenta = torch.tensor([1.0, 0.0, 1.0, 1.0][:C], dtype=t.dtype, device=t.device)
+        bad_pixel = (~finite).any(dim=-1, keepdim=True)
+        return torch.where(bad_pixel, magenta, t)
+    return torch.where(finite, t, torch.ones_like(t))
+
+
 # ── Cached interpreter (reused across executions to avoid rebuild overhead) ──
 _interpreter: Interpreter | None = None
 
@@ -193,7 +212,7 @@ class TEXWrangleNode(_BaseClass):
 
     # System kwargs that are NOT TEX bindings
     _SYSTEM_KWARGS = {"code", "device", "compile_mode", "precision", "_tex_any",
-                      "_tex_chain", "_tex_preview"}
+                      "_tex_chain", "_tex_preview", "debug_nan_highlight"}
 
     @classmethod
     def define_schema(cls):
@@ -244,6 +263,15 @@ class TEXWrangleNode(_BaseClass):
                     options=["fp32", "auto", "fp16"],
                     default="fp32",
                     tooltip="fp32: full precision (default). auto: fp16 ONLY where it measurably wins and stays accurate — CUDA, >=1024x1024, pointwise programs with no sampling/scatter/reduction and no image-derived threshold (measured 1.4-1.5x on grade-class); everything else runs fp32. fp16: EXPERIMENTAL — force half-precision IMAGE-class temps (coordinates & sampling stay fp32; ~1e-3 accuracy, diverges on threshold/branch programs). LATENT stays fp32.",
+                    optional=True,
+                ),
+                IO.Boolean.Input(
+                    "debug_nan_highlight",
+                    default=False,
+                    tooltip="DBG-3: paint any pixel that is NaN or Inf bright magenta so "
+                            "non-finite output is visible at a glance (a 0/0, a log of a "
+                            "negative, an fp16 overflow). Off by default and zero-cost when "
+                            "off. Sits above all tiers, so it works on every execution path.",
                     optional=True,
                 ),
                 # Wildcard input so the node appears in the search panel
@@ -463,6 +491,7 @@ class TEXWrangleNode(_BaseClass):
         # precision into their keys but aren't validated for fp16 yet.
         if precision == "fp16" and compile_mode != "none":
             precision = "fp32"
+        debug_nan_highlight = bool(kwargs.pop("debug_nan_highlight", False))  # DBG-3
         kwargs.pop("_tex_any", None)  # search-panel wildcard slot, unused
         kwargs.pop("_tex_preview", None)  # Q-6 preview hint; pop so it never
         # becomes a phantom @_tex_preview binding (it is a _SYSTEM_KWARG).
@@ -586,9 +615,12 @@ class TEXWrangleNode(_BaseClass):
             # no image-derived threshold); fp32 otherwise. Record the decision + reason
             # (tier_trace) so it's never silent. fp16 stays out of the compiled/graph
             # tiers this cycle (mirrors the compile-mode fp32 force above).
+            # DBG-1: clear the tier/precision trace so the HUD payload below reflects
+            # THIS cook (the trace is thread-local and persists across cooks).
+            from .tex_runtime import tier_trace
+            tier_trace.reset()
             auto_fp16 = False
             if precision == "auto":
-                from .tex_runtime import tier_trace
                 if has_latent_input:
                     # M-3 forces LATENT to fp32; short-circuit so the trace is honest and
                     # we never size the gate off a LATENT's [B,H,W,C] axis.
@@ -650,6 +682,8 @@ class TEXWrangleNode(_BaseClass):
             output_types_log = []
             for name in output_names:
                 raw = raw_output[name]
+                if debug_nan_highlight:  # DBG-3: only executes when the toggle is on
+                    raw = _nan_highlight(raw)
                 inferred_type = assigned_bindings[name]
                 effective_type = _map_inferred_type(inferred_type, has_latent_input)
                 result = _prepare_output(raw, effective_type)
@@ -670,9 +704,28 @@ class TEXWrangleNode(_BaseClass):
                 ", ".join(output_types_log), list(bindings.keys()),
             )
 
-            # Return NodeOutput for v3, or tuple for standalone/test usage
+            # DBG-1: per-cook tier/timing facts for the frontend HUD, carried on the v3
+            # `ui=` channel (the frontend renders a badge on the `executed` event). This
+            # is ADDITIVE — the result tuple is byte-identical with or without it. A
+            # missing tier record (pure interpreter) reads as tier='interpreter'.
+            tr = tier_trace.last()
+            pr = tier_trace.last_precision()
+            ui_payload = {"tex_perf": [{
+                "tier": tr.tier if tr is not None else "interpreter",
+                "fallback_from": tr.fallback_from if tr is not None else None,
+                "reason": tr.reason if tr is not None else None,
+                "elapsed_ms": round(elapsed_ms, 2),
+                "device": str(device),
+                "precision": pr[0] if pr is not None else eff_precision,
+                "precision_reason": pr[1] if pr is not None else None,
+            }]}
+            probes = tier_trace.get_probes()  # LX-5: debug_print value-at-pixel taps
+            if probes:
+                ui_payload["tex_probes"] = probes
+
+            # Return NodeOutput for v3 (with the HUD payload), or tuple for standalone/test.
             if _V3_AVAILABLE:
-                return IO.NodeOutput(*results)
+                return IO.NodeOutput(*results, ui=ui_payload)
             return tuple(results)
 
         except TEXMultiError as e:

@@ -1878,6 +1878,13 @@ const TEX_HELP_DATA = [
             { name: "ic", sig: "ic \u2192 int", desc: "Number of latent channels (4 for SD1.5/SDXL, 16 for SD3).", example: "// ic tells you the latent space width" },
         ]
     },
+    {
+        title: "Debugging",
+        icon: "\u{1F41E}",
+        entries: [
+            { name: "debug_print", sig: "debug_print(label, value[, x, y]) \u2192 value", desc: "Probe a value at pixel (x, y): records it for the node's tier/timing HUD and returns the value unchanged. Interpreter-only \u2014 a compiled tier falls back so the probe always fires.", example: "float g = debug_print(\"luma\", luma(@A.rgb), 0, 0);" },
+        ]
+    },
 ];
 
 // ─── Help Popup Show/Hide ────────────────────────────────────────────
@@ -2326,6 +2333,9 @@ function _texCollapseChains(result) {
     }
 }
 
+// DBG-1: per-node tier/timing HUD badge toggle (TEX.Debug.perfHud).
+let _texPerfHudEnabled = true;
+
 // ─── Q-5: chain preflight + perf HUD ────────────────────────────────────────
 let _texPreflightEnabled = true;              // TEX.Fusion.preflight
 const _texPreflight = new Map();              // termId -> {ok, error, stage_of_error, stats}
@@ -2691,6 +2701,17 @@ app.registerExtension({
         });
 
         app.ui.settings.addSetting({
+            id:           "TEX.Debug.perfHud",
+            name:         "TEX Debug: Per-node tier/timing HUD",
+            tooltip:      "Show a small badge under each TEX node after it cooks: which " +
+                          "acceleration tier served it (interpreter/codegen/cuda_graph), " +
+                          "the cook time in ms, and the precision — amber if a tier fell back.",
+            type:         "boolean",
+            defaultValue: true,
+            onChange(val) { _texPerfHudEnabled = val; app.canvas?.setDirty(true, true); },
+        });
+
+        app.ui.settings.addSetting({
             id:           "TEX.Fusion.preflight",
             name:         "TEX Fusion: Preflight chains + HUD",
             tooltip:      "Validate a linked TEX chain's fusability as you edit (a red " +
@@ -2949,6 +2970,22 @@ app.registerExtension({
             ctx.fillText("TEX", this.size[0] - 8, -6);
             ctx.restore();
 
+            // DBG-1: per-cook tier/timing HUD badge below the node (green normally,
+            // amber when a tier fell back). Feature-flagged; drawn from the ui= facts
+            // captured in onExecuted.
+            if (_texPerfHudEnabled && this._texPerf) {
+                const p = this._texPerf;
+                ctx.save();
+                ctx.font = "9px 'Cascadia Code', 'Consolas', monospace";
+                ctx.textAlign = "left";
+                ctx.fillStyle = p.fallback_from ? "#FFB300" : "#66BB6A";
+                const prec = p.precision && p.precision !== "fp32" ? " · " + p.precision : "";
+                const fb = p.fallback_from ? " (←" + p.fallback_from + ")" : "";
+                ctx.fillText(p.tier + fb + " · " + Number(p.elapsed_ms).toFixed(1) + "ms" + prec,
+                             8, this.size[1] + 12);
+                ctx.restore();
+            }
+
             // ── Position floating DOM overlays ──
             // Nodes 1.0: use canvas transform (ctx.getTransform())
             // Nodes 2.0: onDrawForeground doesn't fire — handled by _texOverlayRafLoop
@@ -2960,6 +2997,13 @@ app.registerExtension({
         const origExecuted = nodeType.prototype.onExecuted;
         nodeType.prototype.onExecuted = function (output) {
             if (origExecuted) origExecuted.apply(this, arguments);
+            // DBG-1: capture this cook's tier/timing facts from the ui= payload for the
+            // per-node perf badge (drawn in onDrawForeground). Defensive — any shape
+            // change just leaves the previous badge.
+            try {
+                const perf = output?.tex_perf?.[0];
+                if (perf) this._texPerf = perf;
+            } catch { /* ignore */ }
             texErrorCache.delete(String(this.id));
             // Clear DOM error banner
             clearDOMErrorBanner(this);

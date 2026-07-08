@@ -45,7 +45,7 @@ from .ast_nodes import (
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
     BindingIndexAccess, BindingSampleAccess, ErrorNode,
 )
-from .diagnostics import make_diagnostic, get_keyword_hint, TEXMultiError
+from .diagnostics import make_diagnostic, get_keyword_hint, get_type_hint, TEXMultiError
 
 TYPE_KEYWORDS = {TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_VEC2, TokenType.KW_VEC3, TokenType.KW_VEC4, TokenType.KW_STRING, TokenType.KW_MAT3, TokenType.KW_MAT4}
 
@@ -603,8 +603,18 @@ class Parser:
             return Assignment(loc=loc, target=expr, value=value)
 
         if expect_semi:
-            self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this expression",
-                       code="E2010", hint="Every statement in TEX ends with `;`.")
+            # UX-1: `float3 p` — a foreign type name (float3/half4/…) followed by an
+            # identifier reads as a declaration; surface the vec3/vec4 hint instead of a
+            # bare "missing semicolon" (the parser rejects the type before the checker's
+            # type-hint path can run).
+            ft_hint = (get_type_hint(expr.name)
+                       if isinstance(expr, Identifier) and self.peek() == TokenType.IDENT
+                       else "")
+            self.expect(
+                TokenType.SEMI,
+                f"'{expr.name}' isn't a TEX type." if ft_hint
+                else "It looks like there's a missing semicolon after this expression",
+                code="E2010", hint=ft_hint or "Every statement in TEX ends with `;`.")
         return ExprStatement(loc=loc, expr=expr)
 
     def _desugar_increment(self, target: ASTNode, op: str, loc: SourceLoc) -> Assignment:

@@ -110,6 +110,12 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "determinant": {"args": (1, 1), "return": lambda _: TEXType.FLOAT},            # determinant(mat) — scalar
     "inverse":     {"args": (1, 1), "return": _passthrough_type},                  # inverse(mat) — matrix inverse
 
+    # Debugging
+    # LX-5: debug_print(label, value[, x, y]) — records value at a pixel, returns value
+    # unchanged (so @OUT is bit-identical). Return type = the value arg's type.
+    "debug_print": {"args": (2, 4),
+                    "return": lambda a: a[1] if len(a) > 1 else TEXType.FLOAT},
+
     # Color operations
     "luma":      {"args": (1, 1), "return": lambda _: TEXType.FLOAT},  # luminance of vec3/vec4
     "hsv2rgb":   {"args": (1, 1), "return": _passthrough_type},

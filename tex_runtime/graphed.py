@@ -70,6 +70,9 @@ _SYNC_STDLIB = frozenset({
     "fbm", "ridged", "billow", "turbulence", "flow", "alligator",
     # SL-4 morphology: the radius resolves via int(.item()) → capture-illegal sync.
     "erode", "dilate",
+    # LX-5: debug_print records a thread-local side-effect via an .item() readout —
+    # capture-illegal, and it must run on the interpreter anyway so the probe fires.
+    "debug_print",
 })
 
 # fingerprint-signature -> GraphedProgram (LRU, bytes-aware).

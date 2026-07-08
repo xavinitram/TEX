@@ -42,8 +42,8 @@ from .ast_nodes import (
     BindingIndexAccess, BindingSampleAccess, ErrorNode,
 )
 from .diagnostics import (
-    TEXMultiError, get_function_hint, get_keyword_hint, get_type_hint,
-    get_variable_hint, make_diagnostic, suggest_similar,
+    TEXMultiError, get_builtin_var_hint, get_function_hint, get_keyword_hint,
+    get_type_hint, get_variable_hint, make_diagnostic, suggest_similar,
 )
 
 
@@ -222,9 +222,13 @@ class TypeChecker:
     def _declare_var(self, name: str, t: TEXType, loc: SourceLoc):
         if name in self._scopes[-1]:
             if self.strict_redeclare:
+                # UX-1: a collision with a built-in (the `v` gotcha) gets a specific
+                # explanation; a genuine re-declaration gets the generic one.
+                builtin_hint = get_builtin_var_hint(name)
                 self._error(f"Variable '{name}' is already declared in this scope.",
                            loc, code="E3001",
-                           hint="Each variable can only be declared once per scope. Choose a different name, or assign to the existing one.")
+                           hint=builtin_hint or "Each variable can only be declared once "
+                           "per scope. Choose a different name, or assign to the existing one.")
                 return
             # Lenient (post-optimization re-check): overwrite with the new type.
             # Unrolled loop bodies legitimately redeclare the same local.
