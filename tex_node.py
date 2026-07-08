@@ -588,15 +588,20 @@ class TEXWrangleNode(_BaseClass):
             # tiers this cycle (mirrors the compile-mode fp32 force above).
             auto_fp16 = False
             if precision == "auto":
-                from .tex_runtime.precision_policy import resolve_auto_precision
                 from .tex_runtime import tier_trace
-                dev_type = torch.device(device).type
-                spatial_px = next((v.shape[1] * v.shape[2] for v in bindings.values()
-                                   if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)
-                precision, auto_reason = resolve_auto_precision(program, spatial_px, dev_type)
-                if precision == "fp16" and compile_mode != "none":
-                    precision, auto_reason = "fp32", auto_reason + " [compiled tier: fp32]"
-                auto_fp16 = precision == "fp16"
+                if has_latent_input:
+                    # M-3 forces LATENT to fp32; short-circuit so the trace is honest and
+                    # we never size the gate off a LATENT's [B,H,W,C] axis.
+                    precision, auto_reason = "fp32", "auto->fp32: LATENT input (stays fp32)"
+                else:
+                    from .tex_runtime.precision_policy import resolve_auto_precision
+                    dev_type = torch.device(device).type
+                    spatial_px = next((v.shape[1] * v.shape[2] for v in bindings.values()
+                                       if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)
+                    precision, auto_reason = resolve_auto_precision(program, spatial_px, dev_type)
+                    if precision == "fp16" and compile_mode != "none":
+                        precision, auto_reason = "fp32", auto_reason + " [compiled tier: fp32]"
+                    auto_fp16 = precision == "fp16"
                 tier_trace.record_precision(precision, auto_reason)
             # M-3: LATENT data exceeds [0,1] and feeds further math, so it must stay
             # fp32 even in fp16 mode.
