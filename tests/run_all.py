@@ -89,6 +89,20 @@ from test_v015_audit_fixes import (
     test_p2_cache_hygiene, test_p2_tap_cap, test_p2_evict_clears_graphs,
     test_p2_pc2_scoped_deletion, test_p2_pc1_sibling_sweep,
 )
+from test_failure_modes import (
+    test_fm_class_a_auto_lifecycle, test_fm_class_b_restart,
+    test_fm_class_c_entrypoint, test_fm_class_d_cross_tier,
+    test_fm_class_e_fp16_sweep,
+)
+from test_v016_phase1 import test_pf1_pf2_graph_gate, test_static_gate_noise
+from test_v016_phase2 import (
+    test_uc4_neg_const_prop, test_m5_int_binding, test_m2cpu_and_m1_freeretry,
+)
+from test_v016_phase4 import (
+    test_sl3_color_management, test_sl1_compositing, test_sl2_blend_modes,
+    test_sl4_morphology, test_lx8_const_arrays, test_lx9_self_swizzle_write,
+    test_sl2_fp16_divide_guard,
+)
 
 
 def main():
@@ -235,6 +249,23 @@ def main():
     test_p2_evict_clears_graphs(r)
     test_p2_pc2_scoped_deletion(r)
     test_p2_pc1_sibling_sweep(r)
+    test_fm_class_a_auto_lifecycle(r)
+    test_fm_class_b_restart(r)
+    test_fm_class_c_entrypoint(r)
+    test_fm_class_d_cross_tier(r)
+    test_fm_class_e_fp16_sweep(r)
+    test_pf1_pf2_graph_gate(r)
+    test_static_gate_noise(r)
+    test_uc4_neg_const_prop(r)
+    test_m5_int_binding(r)
+    test_m2cpu_and_m1_freeretry(r)
+    test_sl3_color_management(r)
+    test_sl1_compositing(r)
+    test_sl2_blend_modes(r)
+    test_sl4_morphology(r)
+    test_lx8_const_arrays(r)
+    test_lx9_self_swizzle_write(r)
+    test_sl2_fp16_divide_guard(r)
 
     success = r.summary()
     return 0 if success else 1

@@ -454,6 +454,8 @@ class TypeChecker:
         self._declare_var(node.name, TEXType.ARRAY, node.loc)
         self._array_scopes[-1][node.name] = arr_type
         self._set_type(node, TEXType.ARRAY)
+        if node.is_const:  # LX-8: forbid reassignment / element writes of a const array
+            self._const_scopes[-1].add(node.name)
 
     def _check_array_initializer(
         self, node: ArrayDecl, elem_type: TEXType, size: int | None,
@@ -602,6 +604,13 @@ class TypeChecker:
                     f"Variable '{node.target.object.name}' is declared as const and cannot be modified.",
                     node.loc, code="E3204",
                     hint="Remove the 'const' qualifier if you need to modify this variable.",
+                )
+        elif isinstance(node.target, ArrayIndexAccess) and isinstance(node.target.array, Identifier):
+            if self._is_const(node.target.array.name):   # LX-8: const-array element write
+                self._error(
+                    f"Array '{node.target.array.name}' is declared as const and cannot be modified.",
+                    node.loc, code="E3204",
+                    hint="Remove the 'const' qualifier if you need to write to this array.",
                 )
 
         # Track @binding assignments as outputs (multi-output inference)

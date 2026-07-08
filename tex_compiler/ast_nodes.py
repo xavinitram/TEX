@@ -314,6 +314,7 @@ class ArrayDecl(ASTNode):
     name: str = ""
     size: Optional[int] = None     # None when inferred from initializer
     initializer: Optional[ASTNode] = None  # ArrayLiteral or Identifier (copy)
+    is_const: bool = False         # LX-8: `const float lut[3] = {...};` — immutable LUT
 
 
 @dataclass(slots=True)

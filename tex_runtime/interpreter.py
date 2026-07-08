@@ -273,6 +273,14 @@ class Interpreter:
                 t = value
                 if t.device != target_device:
                     t = t.to(target_device)
+                # M5-INT: an integer image-like binding (dim>=3) has TEX type VECn
+                # (float), so cast it to fp32 — mirrors codegen's _contiguous_bindings
+                # so the two tiers can't diverge for FLOAT/LATENT outputs (or int64
+                # values > 2^24). Scalar int params / int index arrays (dim<3) and
+                # bool masks are left intact. Keep this rule in sync with
+                # tex_runtime/compiled.py::_contiguous_bindings.
+                if t.dim() >= 3 and not t.is_floating_point() and t.dtype != torch.bool:
+                    t = t.to(torch.float32)
                 if needs_dtype_cast and t.is_floating_point() and t.dtype != target_dtype:
                     t = t.to(target_dtype)
                 self.bindings[name] = t

@@ -664,12 +664,30 @@ def _timed(fn, device_type: str):
 
 
 def _contiguous_bindings(bindings: dict) -> dict:
-    """Normalize tensor bindings to contiguous (inductor/codegen can fail on
-    BHWC stride patterns). Non-tensors and already-contiguous tensors pass
-    through by reference."""
-    return {k: (v.contiguous() if (isinstance(v, torch.Tensor)
-                                   and not v.is_contiguous()) else v)
-            for k, v in bindings.items()}
+    """Normalize tensor bindings for the codegen path.
+
+    * Make non-contiguous tensors contiguous (inductor/codegen can fail on BHWC
+      stride patterns).
+    * M-5-INT: cast an anomalous INTEGER image-like tensor (dim>=3) to fp32. A
+      wired int tensor binding (e.g. torch.ones(1,H,W,3,dtype=long)) builds an int
+      fresh temp, and the M-5 `out=` reuse then emits torch.mul(int, fp32, out=int)
+      → "result type Float can't be cast to Long", silently dropping codegen to
+      the interpreter. Its TEX type is float (shape→VECn) and the output marshals
+      to fp32 regardless — at zero hot-path cost (a one-time ingestion cast, vs a
+      per-op runtime dtype branch on the dominant color-grade reuse pattern). The
+      interpreter applies the SAME cast (interpreter.py binding loop) so the two
+      tiers converge even for FLOAT/LATENT outputs and int64 values > 2^24. Scalar
+      int params and int index arrays (dim<3) are left intact.
+
+    Non-tensors pass through by reference.
+    """
+    def _norm(v):
+        if not isinstance(v, torch.Tensor):
+            return v
+        if v.dim() >= 3 and not v.is_floating_point() and v.dtype != torch.bool:
+            v = v.to(torch.float32)
+        return v if v.is_contiguous() else v.contiguous()
+    return {k: _norm(v) for k, v in bindings.items()}
 
 
 def _cuda_headroom_ok(device_type: str) -> bool:

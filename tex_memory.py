@@ -27,6 +27,7 @@ _NON_LOCAL_FNS = frozenset({
     "sample_mip", "sample_mip_gauss", "fetch", "fetch_frame",
     "gauss_blur", "bilateral_filter",
     "img_min", "img_max", "img_mean", "img_median", "img_sum",
+    "erode", "dilate",   # SL-4: neighbourhood morphology, not pixel-local
 })
 
 

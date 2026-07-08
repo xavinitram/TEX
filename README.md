@@ -10,7 +10,7 @@
   <img src="TEX_node.webp" alt="TEX Wrangle node" width="500">
 </p>
 
-A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 124 stdlib functions.
+A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 143 stdlib functions.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://python.org)
@@ -73,7 +73,7 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **Two-tier caching** | In-memory LRU + disk persistence for instant re-execution — compiled objects and fused chains persist across restarts |
 | **Memory cooperation** | OOM preflight + byte-budgeted cache eviction; tile-safe programs run in strips under VRAM pressure |
 | **Cross-node fusion** | Compile a chain of linked TEX nodes into one program — only the last node cooks (opt-in via Settings → TEX Fusion). A live **preflight** flags an unfusable chain (red bubble) before you queue |
-| **124 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions |
+| **143 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |
 | **Snippets** | Right-click → Snippets for 114 built-in examples; save your own with folder organization |
@@ -164,7 +164,7 @@ while (val < 100.0) { val = val * 2.0; }
 | `ic` | Latent channel count (0 for images) |
 | `PI`, `TAU`, `E` | Math constants (`TAU` = 2·PI) |
 
-### Standard Library (124 functions)
+### Standard Library (143 functions)
 
 **Math:** `sin` `cos` `tan` `asin` `acos` `atan` `atan2` `sinh` `cosh` `tanh` `sqrt` `pow` `pow2` `pow10` `exp` `log` `log2` `log10` `abs` `sign` `floor` `ceil` `round` `fract` `mod` `hypot` `degrees` `radians` `spow` `sdiv` `isnan` `isinf`
 
@@ -172,7 +172,11 @@ while (val < 100.0) { val = val * 2.0; }
 
 **Vector & Matrix:** `dot` `length` `distance` `normalize` `cross` `reflect` `transpose` `determinant` `inverse`
 
-**Color:** `luma` `hsv2rgb` `rgb2hsv`
+**Color:** `luma` `hsv2rgb` `rgb2hsv` `srgb_to_linear` `linear_to_srgb` `oklab_from_rgb` `oklab_to_rgb`
+
+**Compositing & blend:** `over` `under` `atop` `premultiply` `unpremultiply` · `screen` `overlay` `hard_light` `soft_light` `color_dodge` `color_burn` `linear_light` `vivid_light`
+
+**Morphology:** `erode` `dilate`
 
 **Noise:** `perlin` `simplex` `fbm` `ridged` `billow` `turbulence` `flow` `curl` `worley_f1` `worley_f2` `voronoi` `alligator`
 

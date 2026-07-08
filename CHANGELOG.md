@@ -5,6 +5,76 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-07-07
+
+Correctness-and-honesty release driven by the v0.16 roadmap (`TEX_research/22`),
+with a full per-item build log (`TEX_research/23`). Every performance claim is a
+**measured, same-session interleaved A/B** (this box drifts 10–30 %/hour, so
+full-suite deltas are noise-dominated). Several roadmap items were **measured and
+then NOT adopted** because the measurement refuted their premise — that is the
+headline of this release. 1649 sub-tests pass.
+
+### ⚠️ Breaking — new reserved built-in names
+The stdlib additions below reserve their names; TEX forbids a user function from
+redefining a built-in. If your program defines a function named any of
+`over` `under` `atop` `premultiply` `unpremultiply` `srgb_to_linear`
+`linear_to_srgb` `oklab_from_rgb` `oklab_to_rgb` `screen` `overlay` `hard_light`
+`soft_light` `color_dodge` `color_burn` `linear_light` `vivid_light`
+`erode` `dilate`, rename it (e.g. prefix `my_`).
+
+### Added
+- **Color management** — `srgb_to_linear` / `linear_to_srgb` (piecewise sRGB
+  EOTF/OETF) and `oklab_from_rgb` / `oklab_to_rgb` (Ottosson OKLab). Blur/blend in
+  linear-light to avoid gamma-space halos; mix in OKLab for perceptually-even
+  gradients.
+- **Compositing** — `over` / `under` / `atop` / `premultiply` / `unpremultiply`
+  (Porter-Duff on straight-alpha RGBA, ComfyUI's un-premultiplied convention).
+- **Blend modes** — `screen` `overlay` `hard_light` `soft_light` `color_dodge`
+  `color_burn` `linear_light` `vivid_light` (curated set).
+- **Morphology** — `erode` / `dilate` (iterative separable min/max; O(1) extra
+  memory in the radius). All 19 new stdlib functions run bit-identically on the
+  codegen tier and appear in the editor autocomplete.
+- **`const` arrays** — `const float lut[3] = {…};` is now accepted (was a parser
+  error); const arrays reject reassignment and element writes.
+- **Failure-mode test harness (PROC-1)** — a reusable `tests/failure_harness.py`
+  covering the five classes (async lifecycle, restart/persistence, real
+  entry-point, cross-tier equivalence, full-surface sweep) that the v0.15 suite
+  was structurally blind to; every v0.16 fix plugs its regression test into it.
+
+### Fixed
+- **CUDA-graph tier is never worse than eager (PF-1/PF-2).** The tier captured
+  unconditionally and was a *measured loss* above ~1024² for low-kernel programs
+  and at every resolution for ~0-kernel programs. A crossover gate now captures
+  only in the measured win region (256²/512² for kernel-bearing programs),
+  preserving the 3.5–6.5× wins while removing the 0.7–0.96× losses.
+- **Octave-noise no longer eats doomed graph captures (P1-UC1-STATIC-GATE).** The
+  octave/count noise family (`fbm`/`ridged`/`billow`/`turbulence`/`flow`/
+  `alligator`) is excluded from capture (its count resolves via a capture-illegal
+  `.item()`); single-eval noise (`perlin`/`simplex`/`worley`/`voronoi`/`curl`)
+  stays capturable and wins ~6× at 256².
+- **Negative-literal constants fold (P2-UC4-NEG).** `float k = -0.5;` is now
+  constant-propagated (it parses as a unary-minus and was previously missed).
+- **int64 tensor bindings keep the codegen path (P2-M5-INT).** A wired int tensor
+  binding no longer forces a silent fallback to the interpreter on the M-5 `out=`
+  reuse (integer image tensors are cast to fp32 at codegen ingestion).
+- **CPU cache budget (P1-M2-CPU).** The mip/grid/sampler byte budget is now
+  enforced on CPU cooks too (was CUDA-only → unbounded growth on CPU installs).
+- **OOM frees TEX's caches (P1-M1-FREERETRY).** On OOM the node drops its own
+  tensor caches before re-raising, so ComfyUI's unload+retry has that memory.
+
+### Changed / measured-not-adopted
+- **`fp16` stays experimental.** A full re-measure (88 programs) shows fp16 is
+  accurate for smooth-pointwise programs (median ~1e-3) but diverges badly on
+  threshold/quantize/branch programs (up to 1.0) and can NaN — it must not be a
+  default.
+- **Default CPU codegen routing was evaluated and NOT adopted (PF-4).** On the
+  post-v0.15 codebase, the interpreter's own optimizations closed codegen's lead;
+  a blanket route would *regress* the dominant color-grade shape ~30%. Measurement
+  prevented a regression.
+- **`auto` tier hardening, torch.compile persistence, and DAG-fusion widening are
+  deferred** — unreproducible/unvalidatable on this no-Triton box or frontend-
+  heavy; see `TEX_research/23` for the per-item rationale.
+
 ## [0.15.0] - 2026-07-07
 
 Optimization-roadmap release: all 24 proposals from the 2026-07 TEX Optimization

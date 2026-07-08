@@ -114,6 +114,28 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "luma":      {"args": (1, 1), "return": lambda _: TEXType.FLOAT},  # luminance of vec3/vec4
     "hsv2rgb":   {"args": (1, 1), "return": _passthrough_type},
     "rgb2hsv":   {"args": (1, 1), "return": _passthrough_type},
+    "srgb_to_linear": {"args": (1, 1), "return": _passthrough_type},   # SL-3 color management
+    "linear_to_srgb": {"args": (1, 1), "return": _passthrough_type},
+    "oklab_from_rgb": {"args": (1, 1), "return": _passthrough_type},   # linear RGB <-> OKLab (Ottosson)
+    "oklab_to_rgb":   {"args": (1, 1), "return": _passthrough_type},
+    # SL-1 compositing (Porter-Duff, straight-alpha vec4)
+    "premultiply":   {"args": (1, 1), "return": _passthrough_type},
+    "unpremultiply": {"args": (1, 1), "return": _passthrough_type},
+    "over":          {"args": (2, 2), "return": _promote_args},
+    "under":         {"args": (2, 2), "return": _promote_args},
+    "atop":          {"args": (2, 2), "return": _promote_args},
+    # SL-2 blend modes (per-channel base⊗blend)
+    "screen":        {"args": (2, 2), "return": _promote_args},
+    "overlay":       {"args": (2, 2), "return": _promote_args},
+    "hard_light":    {"args": (2, 2), "return": _promote_args},
+    "soft_light":    {"args": (2, 2), "return": _promote_args},
+    "color_dodge":   {"args": (2, 2), "return": _promote_args},
+    "color_burn":    {"args": (2, 2), "return": _promote_args},
+    "linear_light":  {"args": (2, 2), "return": _promote_args},
+    "vivid_light":   {"args": (2, 2), "return": _promote_args},
+    # SL-4 morphology (image, radius)
+    "erode":         {"args": (2, 2), "return": _passthrough_type},
+    "dilate":        {"args": (2, 2), "return": _passthrough_type},
 
     # Sampling — return type matches the binding's type (VEC3 for IMAGE, FLOAT for MASK, etc.)
     "sample":         {"args": (3, 3), "return": _passthrough_type},

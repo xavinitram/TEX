@@ -776,10 +776,10 @@ def test_user_functions(r: SubTestResult):
     # Vec4 return type
     try:
         result = compile_and_run("""
-            vec4 premultiply(vec4 c) {
+            vec4 my_premultiply(vec4 c) {
                 return vec4(c.rgb * c.a, c.a);
             }
-            @OUT = premultiply(@A);
+            @OUT = my_premultiply(@A);
         """, {"A": img})
         expected = torch.cat([img[..., :3] * img[..., 3:4], img[..., 3:4]], dim=-1)
         assert torch.allclose(result, expected, atol=1e-5)

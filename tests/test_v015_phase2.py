@@ -136,13 +136,13 @@ def test_uc1_cuda_graph(r: SubTestResult):
     # Gate: pointwise program capturable; while-loop and param-loop are not.
     try:
         prog, _, _ = _compile("@OUT = vec4(sin(@A) * 0.5 + 0.5, 1.0);", bt)
-        assert G._capturable(prog) is True
+        assert G._capturable(prog)[0] is True   # (capturable, op_count)
         prog2, _, _ = _compile("float s=0.0; while (s < 3.0) { s = s + 1.0; } @OUT = @A * s;", bt)
-        assert G._capturable(prog2) is False
+        assert G._capturable(prog2)[0] is False
         prog3, _, _ = _compile(
             "i$radius=2; vec3 a=vec3(0.0); for (int d=-$radius; d<=$radius; d=d+1){ a=a+@A.rgb; } @OUT=vec4(a,1.0);",
             {"A": TEXType.VEC3, "radius": TEXType.INT, "OUT": TEXType.VEC4})
-        assert G._capturable(prog3) is False  # param loop → .item() at entry
+        assert G._capturable(prog3)[0] is False  # param loop → .item() at entry
         r.ok("capturability gate (pointwise yes; while/param-loop no)")
     except Exception as e:
         r.fail("capturability gate", str(e))
@@ -228,7 +228,7 @@ def test_q1_fused_capture(r: SubTestResult):
         prog, tm, ref, asg, par, used, merged = FUS.compile_fused(stages, _infer_binding_type)
         fp = FUS._fused_fp(FUS._fused_memo_key(stages, _infer_binding_type))
         out = sorted(asg.keys())
-        assert G._capturable(prog), "pointwise fused chain should be capturable"
+        assert G._capturable(prog)[0], "pointwise fused chain should be capturable"
         G.clear_graph_cache()
         ref_out = Interpreter().execute(prog, dict(merged), tm, device="cuda",
                                         output_names=out, used_builtins=used)

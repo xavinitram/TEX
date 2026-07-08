@@ -342,11 +342,17 @@ class Parser:
         type_tok = self.advance()
         name_tok = self.expect(TokenType.IDENT, "Expected a variable name after the type")
         if self.peek() == TokenType.LBRACKET:
-            raise self._make_error(
-                "`const` arrays are not supported.",
-                name_tok.loc, code="E2010",
-                hint="Declare the array without `const`: e.g. vec3 colors[3] = {...};",
-            )
+            # LX-8: const arrays (immutable LUTs). Parse the array tail and mark it
+            # const so the type checker forbids reassignment / element writes.
+            decl = self._finish_array_decl(loc, type_tok.value, name_tok.value)
+            if decl.initializer is None:
+                raise self._make_error(
+                    "A 'const' array must be initialized.",
+                    name_tok.loc, code="E2010",
+                    hint="Add an initializer: const float lut[3] = {1.0, 2.0, 3.0};",
+                )
+            decl.is_const = True
+            return decl
         if not self.match(TokenType.ASSIGN):
             raise self._make_error(
                 "A 'const' variable must be initialized.",
@@ -408,6 +414,11 @@ class Parser:
         loc = self.loc()
         type_tok = self.advance()  # consume type keyword
         name_tok = self.expect(TokenType.IDENT, "I expected an array name after the type")
+        return self._finish_array_decl(loc, type_tok.value, name_tok.value)
+
+    def _finish_array_decl(self, loc, type_name: str, name: str) -> ArrayDecl:
+        """Parse the array tail from `[` onward (shared by plain and const array
+        decls). `type IDENT` has already been consumed by the caller."""
         self.expect(TokenType.LBRACKET, "I expected `[` after the array name")
 
         size = None
@@ -437,8 +448,8 @@ class Parser:
 
         return ArrayDecl(
             loc=loc,
-            element_type_name=type_tok.value,
-            name=name_tok.value,
+            element_type_name=type_name,
+            name=name,
             size=size,
             initializer=initializer,
         )

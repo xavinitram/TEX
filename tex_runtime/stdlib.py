@@ -310,6 +310,25 @@ class TEXStdlib:
             "luma": TEXStdlib.fn_luma,
             "hsv2rgb": TEXStdlib.fn_hsv2rgb,
             "rgb2hsv": TEXStdlib.fn_rgb2hsv,
+            "srgb_to_linear": TEXStdlib.fn_srgb_to_linear,
+            "linear_to_srgb": TEXStdlib.fn_linear_to_srgb,
+            "oklab_from_rgb": TEXStdlib.fn_oklab_from_rgb,
+            "oklab_to_rgb": TEXStdlib.fn_oklab_to_rgb,
+            "premultiply": TEXStdlib.fn_premultiply,
+            "unpremultiply": TEXStdlib.fn_unpremultiply,
+            "over": TEXStdlib.fn_over,
+            "under": TEXStdlib.fn_under,
+            "atop": TEXStdlib.fn_atop,
+            "screen": TEXStdlib.fn_screen,
+            "overlay": TEXStdlib.fn_overlay,
+            "hard_light": TEXStdlib.fn_hard_light,
+            "soft_light": TEXStdlib.fn_soft_light,
+            "color_dodge": TEXStdlib.fn_color_dodge,
+            "color_burn": TEXStdlib.fn_color_burn,
+            "linear_light": TEXStdlib.fn_linear_light,
+            "vivid_light": TEXStdlib.fn_vivid_light,
+            "erode": TEXStdlib.fn_erode,
+            "dilate": TEXStdlib.fn_dilate,
 
             # Sampling
             "sample": TEXStdlib.fn_sample,
@@ -801,6 +820,229 @@ class TEXStdlib:
         if c.shape[-1] == 4:
             result = torch.cat([result, c[..., 3:4]], dim=-1)
         return result
+
+    # -- Color management (SL-3): sRGB<->linear + OKLab -----------------
+    # Blurring/blending in gamma space produces wrong halos; convert to
+    # linear-light first. OKLab gives perceptually-uniform gradients/mixes.
+    # Each is elementwise and preserves a vec4 alpha unchanged.
+
+    @staticmethod
+    def fn_srgb_to_linear(color):
+        """sRGB EOTF: gamma-encoded sRGB -> linear-light (piecewise). vec4 alpha
+        passes through. Compose before blur/blend, then linear_to_srgb after."""
+        c = _to_tensor(color)
+        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        rgb = c[..., 0:3] if has_alpha else c
+        lin = torch.where(rgb <= 0.04045, rgb / 12.92,
+                          ((rgb + 0.055) / 1.055).clamp(min=0.0) ** 2.4)
+        return torch.cat([lin, c[..., 3:4]], dim=-1) if has_alpha else lin
+
+    @staticmethod
+    def fn_linear_to_srgb(color):
+        """sRGB OETF: linear-light -> gamma-encoded sRGB (inverse of
+        srgb_to_linear). vec4 alpha passes through."""
+        c = _to_tensor(color)
+        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        rgb = c[..., 0:3] if has_alpha else c
+        srgb = torch.where(rgb <= 0.0031308, rgb * 12.92,
+                           1.055 * rgb.clamp(min=0.0) ** (1.0 / 2.4) - 0.055)
+        return torch.cat([srgb, c[..., 3:4]], dim=-1) if has_alpha else srgb
+
+    @staticmethod
+    def fn_oklab_from_rgb(color):
+        """Linear-light RGB -> OKLab (Ottosson). Mix/interpolate in OKLab then
+        convert back for perceptually-even gradients. Expects LINEAR RGB — compose
+        with srgb_to_linear for gamma-encoded images. vec4 alpha passes through."""
+        c = _to_tensor(color)
+        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        r, g, b = c[..., 0:1], c[..., 1:2], c[..., 2:3]
+        l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+        m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+        s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+        l_ = torch.sign(l) * torch.abs(l).pow(1.0 / 3.0)
+        m_ = torch.sign(m) * torch.abs(m).pow(1.0 / 3.0)
+        s_ = torch.sign(s) * torch.abs(s).pow(1.0 / 3.0)
+        L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
+        A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
+        B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+        lab = torch.cat([L, A, B], dim=-1)
+        return torch.cat([lab, c[..., 3:4]], dim=-1) if has_alpha else lab
+
+    @staticmethod
+    def fn_oklab_to_rgb(color):
+        """OKLab -> linear-light RGB (inverse Ottosson). Compose with
+        linear_to_srgb for a gamma-encoded result. vec4 alpha passes through."""
+        c = _to_tensor(color)
+        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        L, A, B = c[..., 0:1], c[..., 1:2], c[..., 2:3]
+        l_ = L + 0.3963377774 * A + 0.2158037573 * B
+        m_ = L - 0.1055613458 * A - 0.0638541728 * B
+        s_ = L - 0.0894841775 * A - 1.2914855480 * B
+        l, m, s = l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_
+        r = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s
+        g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s
+        b = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
+        rgb = torch.cat([r, g, b], dim=-1)
+        return torch.cat([rgb, c[..., 3:4]], dim=-1) if has_alpha else rgb
+
+    # -- Compositing (SL-1): Porter-Duff on straight (un-premultiplied) vec4 --
+    # ComfyUI IMAGE/MASK are un-premultiplied; over/under/atop take & return
+    # straight-alpha vec4. premultiply/unpremultiply convert between conventions.
+
+    @staticmethod
+    def fn_premultiply(color):
+        """Straight -> premultiplied alpha: rgb *= a (vec4)."""
+        c = _to_tensor(color)
+        a = c[..., 3:4]
+        return torch.cat([c[..., 0:3] * a, a], dim=-1)
+
+    @staticmethod
+    def fn_unpremultiply(color):
+        """Premultiplied -> straight alpha: rgb /= a (vec4; safe at a=0, incl. fp16)."""
+        c = _to_tensor(color)
+        a = c[..., 3:4]
+        return torch.cat([TEXStdlib._safe_div(c[..., 0:3], a), a], dim=-1)
+
+    @staticmethod
+    def fn_over(fg, bg):
+        """Porter-Duff 'over': fg composited over bg (straight-alpha vec4)."""
+        f = _to_tensor(fg)
+        b = _to_tensor(bg)
+        fa, ba = f[..., 3:4], b[..., 3:4]
+        oa = fa + ba * (1.0 - fa)
+        orgb = TEXStdlib._safe_div(f[..., 0:3] * fa + b[..., 0:3] * ba * (1.0 - fa), oa)
+        return torch.cat([orgb, oa], dim=-1)
+
+    @staticmethod
+    def fn_under(fg, bg):
+        """'under': fg under bg == over(bg, fg)."""
+        return TEXStdlib.fn_over(bg, fg)
+
+    @staticmethod
+    def fn_atop(fg, bg):
+        """'atop': fg atop bg — output confined to bg's coverage (out_a = bg.a)."""
+        f = _to_tensor(fg)
+        b = _to_tensor(bg)
+        fa = f[..., 3:4]
+        orgb = f[..., 0:3] * fa + b[..., 0:3] * (1.0 - fa)
+        return torch.cat([orgb, b[..., 3:4]], dim=-1)
+
+    # -- Blend modes (SL-2): per-channel, curated ~8 --------------------
+    # Each op(base, blend) works on RGB channels; a vec4 base keeps its alpha.
+
+    @staticmethod
+    def _blend_rgb(base, blend, op):
+        b = _to_tensor(base)
+        s = _to_tensor(blend)
+        n = min(b.shape[-1], 3)
+        rgb = op(b[..., :n], s[..., :n])
+        return torch.cat([rgb, b[..., 3:4]], dim=-1) if b.shape[-1] == 4 else rgb
+
+    @staticmethod
+    def _safe_div(num, denom):
+        """num / denom with a DTYPE-AWARE, SIGN-PRESERVING zero floor on denom.
+
+        The epsilon is dtype-aware because SAFE_EPSILON (1e-8) underflows to 0 in
+        fp16 (ZERO_GUARD_EPS uses fp16's smallest normal there; fp32 keeps 1e-8).
+
+        It floors the MAGNITUDE, not the signed value: `denom.clamp(min=eps)` would
+        raise a small NEGATIVE denominator up to +eps — flipping the sign and
+        blowing up the quotient (wrong for over/unpremultiply when an alpha goes
+        out of [0,1], e.g. a mask subtraction dipping below zero). Here a
+        below-threshold denominator is replaced by ±eps carrying denom's own sign."""
+        eps = ZERO_GUARD_EPS.get(denom.dtype, SAFE_EPSILON)
+        eps_t = torch.as_tensor(eps, dtype=denom.dtype, device=denom.device)
+        safe = torch.where(denom.abs() < eps, torch.copysign(eps_t, denom), denom)
+        return num / safe
+
+    @staticmethod
+    def fn_screen(base, blend):
+        """1 - (1-a)(1-b)."""
+        return TEXStdlib._blend_rgb(base, blend, lambda a, b: 1.0 - (1.0 - a) * (1.0 - b))
+
+    @staticmethod
+    def fn_overlay(base, blend):
+        """a<0.5 ? 2ab : 1-2(1-a)(1-b)."""
+        return TEXStdlib._blend_rgb(base, blend, lambda a, b: torch.where(
+            a < 0.5, 2.0 * a * b, 1.0 - 2.0 * (1.0 - a) * (1.0 - b)))
+
+    @staticmethod
+    def fn_hard_light(base, blend):
+        """overlay with the operands swapped."""
+        return TEXStdlib._blend_rgb(base, blend, lambda a, b: torch.where(
+            b < 0.5, 2.0 * a * b, 1.0 - 2.0 * (1.0 - a) * (1.0 - b)))
+
+    @staticmethod
+    def fn_soft_light(base, blend):
+        """Pegtop soft-light: (1-2b)a^2 + 2ab (smooth, no branch)."""
+        return TEXStdlib._blend_rgb(base, blend,
+                                    lambda a, b: (1.0 - 2.0 * b) * a * a + 2.0 * a * b)
+
+    @staticmethod
+    def fn_color_dodge(base, blend):
+        """min(1, a / (1-b)); b>=1 -> 1."""
+        return TEXStdlib._blend_rgb(base, blend, lambda a, b: torch.clamp(
+            TEXStdlib._safe_div(a, 1.0 - b), max=1.0))
+
+    @staticmethod
+    def fn_color_burn(base, blend):
+        """1 - min(1, (1-a)/b); b<=0 -> 0."""
+        return TEXStdlib._blend_rgb(base, blend, lambda a, b: 1.0 - torch.clamp(
+            TEXStdlib._safe_div(1.0 - a, b), max=1.0))
+
+    @staticmethod
+    def fn_linear_light(base, blend):
+        """clamp(a + 2b - 1, 0, 1)."""
+        return TEXStdlib._blend_rgb(base, blend,
+                                    lambda a, b: torch.clamp(a + 2.0 * b - 1.0, 0.0, 1.0))
+
+    @staticmethod
+    def fn_vivid_light(base, blend):
+        """b<0.5 -> color_burn(a,2b); else color_dodge(a,2(b-0.5))."""
+        def _op(a, b):
+            burn = 1.0 - torch.clamp(TEXStdlib._safe_div(1.0 - a, 2.0 * b), max=1.0)
+            dodge = torch.clamp(TEXStdlib._safe_div(a, 1.0 - 2.0 * (b - 0.5)), max=1.0)
+            return torch.where(b < 0.5, burn, dodge)
+        return TEXStdlib._blend_rgb(base, blend, _op)
+
+    # -- Morphology (SL-4): erode / dilate ------------------------------
+    # Iterative separable 3-window min/max, `radius` times. A square structuring
+    # element is separable, and iterating a 3-window r times == a (2r+1)-window,
+    # so this is O(1) extra memory in the radius (a 3-tensor transient per pass) —
+    # avoiding the O((2r+1)^2) unfold blow-up at large radius/resolution. Replaces
+    # the hand-rolled interpreted double loop that was radius-capped by the
+    # 1024-iteration limit. Non-local (reads neighbours): excluded from tiling and
+    # from CUDA-graph capture (the radius resolves via .item()).
+
+    @staticmethod
+    def _morph(image, radius, grow: bool):
+        img = _to_tensor(image)
+        r = max(0, min(int(_to_float(radius)), 256))
+        if r == 0:
+            return img
+        squeeze = img.dim() == 3          # [B,H,W] mask -> add a channel
+        x = (img.unsqueeze(-1) if squeeze else img).permute(0, 3, 1, 2)  # [B,C,H,W]
+        op = torch.amax if grow else torch.amin
+        pad = torch.nn.functional.pad
+        for _ in range(r):
+            xp = pad(x, (1, 1, 0, 0), mode="replicate")               # horizontal
+            x = op(torch.stack([xp[..., :-2], xp[..., 1:-1], xp[..., 2:]]), dim=0)
+            xp = pad(x, (0, 0, 1, 1), mode="replicate")               # vertical
+            x = op(torch.stack([xp[..., :-2, :], xp[..., 1:-1, :], xp[..., 2:, :]]), dim=0)
+        x = x.permute(0, 2, 3, 1)         # [B,H,W,C]
+        return x.squeeze(-1) if squeeze else x
+
+    @staticmethod
+    def fn_erode(image, radius):
+        """Grayscale erosion (local min over a (2r+1)² square). Shrinks bright
+        regions; the classic mask-shrink op."""
+        return TEXStdlib._morph(image, radius, grow=False)
+
+    @staticmethod
+    def fn_dilate(image, radius):
+        """Grayscale dilation (local max over a (2r+1)² square). Grows bright
+        regions; the classic mask-grow op."""
+        return TEXStdlib._morph(image, radius, grow=True)
 
     # -- Sampling -------------------------------------------------------
 

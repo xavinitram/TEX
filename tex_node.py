@@ -120,6 +120,18 @@ def _oom_in_chain(e: BaseException) -> BaseException | None:
     return None
 
 
+def _drop_tex_caches_on_oom() -> None:
+    """P1-M1-FREERETRY: drop TEX's own module-level tensor caches (mip/grid/sampler
+    pyramids) on OOM before re-raising, so ComfyUI's OOM handling (unload_all_models
+    + execution retry) has that memory available — its unload frees resident models
+    but never TEX's caches. Best-effort; the caches rebuild lazily next cook."""
+    try:
+        from .tex_memory import free_tensor_caches
+        free_tensor_caches()
+    except Exception:
+        pass
+
+
 # ── Cached interpreter (reused across executions to avoid rebuild overhead) ──
 _interpreter: Interpreter | None = None
 
@@ -555,12 +567,15 @@ class TEXWrangleNode(_BaseClass):
 
             # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
             # oldest mip/grid entries; allocate-and-hold semantics untouched).
-            if str(device).startswith("cuda"):
-                try:
-                    from .tex_memory import enforce_cache_budget
-                    enforce_cache_budget(device)
-                except Exception:
-                    pass
+            # P1-M2-CPU: enforce on CPU cooks too — the mip/grid/sampler caches
+            # grow unbounded there otherwise. cache_budget_bytes returns a 512 MB
+            # CPU budget; the eviction is cheap (early-returns when under budget)
+            # and the graph-cache teardown on eviction is a no-op off CUDA.
+            try:
+                from .tex_memory import enforce_cache_budget
+                enforce_cache_budget(device)
+            except Exception:
+                pass
 
             # Format each output based on inferred type
             results = []
@@ -604,6 +619,7 @@ class TEXWrangleNode(_BaseClass):
             # precede the diagnostic re-wrap, which would otherwise mask it.
             _oom = _oom_in_chain(e)
             if _oom is not None:
+                _drop_tex_caches_on_oom()   # P1-M1-FREERETRY
                 raise _oom
             # Q-4: attribute a fused-chain runtime error to its originating linked
             # node (the stage tag survives the splice; the frontend collapsed the
@@ -650,6 +666,7 @@ class TEXWrangleNode(_BaseClass):
             # below would hide it. (Preflight/retry recovery is M-1, Phase 3.)
             _oom = _oom_in_chain(e)
             if _oom is not None:
+                _drop_tex_caches_on_oom()   # P1-M1-FREERETRY
                 raise _oom
             msg = str(e)
             # Ordinary user/config RuntimeErrors — a device selection issue, a
@@ -672,6 +689,7 @@ class TEXWrangleNode(_BaseClass):
             # unwrapped for ComfyUI's OOM handling (see the RuntimeError branch).
             _oom = _oom_in_chain(e)
             if _oom is not None:
+                _drop_tex_caches_on_oom()   # P1-M1-FREERETRY
                 raise _oom
             # Genuinely unexpected — this may be a TEX bug. Include the traceback
             # and a report link so it can be diagnosed.

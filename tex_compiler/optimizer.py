@@ -205,13 +205,29 @@ def _propagate_literal_locals(statements: list[ASTNode]) -> list[ASTNode]:
 
     subs: dict[str, tuple] = {}
     for stmt in statements:  # top level only
-        if (stmt.__class__ is VarDecl and stmt.initializer.__class__ is NumberLiteral
+        if (stmt.__class__ is VarDecl
                 and stmt.name not in reassigned and stmt.name not in params
                 and stmt.name not in loopvars and decl_count.get(stmt.name, 0) == 1):
-            subs[stmt.name] = (stmt.initializer.value, stmt.initializer.is_int)
+            lit = _const_literal_value(stmt.initializer)
+            if lit is not None:
+                subs[stmt.name] = lit
     if not subs:
         return statements
     return [_subst_stmt_literals(s, subs) for s in statements]
+
+
+def _const_literal_value(expr) -> tuple | None:
+    """(value, is_int) if `expr` is a numeric literal or a unary-minus on one,
+    else None. P2-UC4-NEG: `float k = -0.5;` parses as UnaryOp('-', NumberLiteral)
+    and Pass 0 runs before folding, so bare-NumberLiteral matching would miss the
+    whole negative-tuning-constant class. Consistent with the existing int-literal
+    handling (an int literal in a float local was already propagated)."""
+    if expr.__class__ is NumberLiteral:
+        return (expr.value, expr.is_int)
+    if (expr.__class__ is UnaryOp and expr.op == "-"
+            and expr.operand.__class__ is NumberLiteral):
+        return (-expr.operand.value, expr.operand.is_int)
+    return None
 
 
 # ── Statement optimization ────────────────────────────────────────────
@@ -1500,7 +1516,8 @@ def _subst_stmt(stmt: ASTNode, var_name: str, value: float,
     if isinstance(stmt, ArrayDecl):
         init = _subst_expr(stmt.initializer, var_name, value, is_int) if stmt.initializer else None
         return ArrayDecl(loc=stmt.loc, element_type_name=stmt.element_type_name,
-                         name=stmt.name, size=stmt.size, initializer=init)
+                         name=stmt.name, size=stmt.size, initializer=init,
+                         is_const=stmt.is_const)
     return stmt
 
 

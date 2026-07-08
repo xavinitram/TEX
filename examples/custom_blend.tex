@@ -4,18 +4,21 @@
 // Implements the Photoshop Overlay blend mode per-channel, then
 // mixes the result with the original base using $blend_amount.
 //
-// Also includes a soft_light function for reference (unused by default).
+// NOTE: TEX now ships built-in overlay()/soft_light()/screen()/... that work
+// directly on vec3 (see the Blend section of the cookbook). This example keeps
+// its own my_overlay()/my_soft_light() to show how to write a CUSTOM blend —
+// user functions may NOT reuse a built-in's name, so we prefix them with my_.
 //
 // Connect @base and @overlay to RGB images.
 
-float overlay(float a, float b) {
+float my_overlay(float a, float b) {
     if (a < 0.5) {
         return 2.0 * a * b;
     }
     return 1.0 - 2.0 * (1.0 - a) * (1.0 - b);
 }
 
-float soft_light(float a, float b) {
+float my_soft_light(float a, float b) {
     if (b < 0.5) {
         return a - (1.0 - 2.0 * b) * a * (1.0 - a);
     }
@@ -31,9 +34,11 @@ vec3 base = @base.rgb;
 vec3 over = @overlay.rgb;
 
 vec3 result = vec3(
-    overlay(base.r, over.r),
-    overlay(base.g, over.g),
-    overlay(base.b, over.b)
+    my_overlay(base.r, over.r),
+    my_overlay(base.g, over.g),
+    my_overlay(base.b, over.b)
 );
+
+// The built-in would be the one-liner:  vec3 result = overlay(base, over);
 
 @OUT = lerp(base, result, $blend_amount);

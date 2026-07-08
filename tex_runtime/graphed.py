@@ -53,11 +53,22 @@ def is_capturing() -> bool:
     return _CAPTURING
 
 
-# stdlib calls that .item()/sync internally (blur sigma, mip lod, bilateral) —
-# capturing a program that calls them is doomed, so gate them out statically.
+# stdlib calls that .item()/sync internally — capturing a program that calls
+# them is doomed, so gate them out statically (never attempt the capture).
 _SYNC_STDLIB = frozenset({
+    # sample-space sync: blur sigma / mip lod / bilateral read a scalar via .item()
     "blur", "gauss_blur", "bilateral_filter",
     "sample_mip", "sample_mip_gauss", "sample_lod",
+    # P1-UC1-STATIC-GATE: the octave/iteration-count noise family resolves its
+    # loop count via int(_to_float(count)) → a capture-illegal .item() sync, so
+    # every fresh key ate a doomed capture + RNG-poison recovery. Single-eval
+    # noise (perlin/simplex/worley/voronoi/curl) has no such sync and stays
+    # capturable — measured 6.4× at 256². (Verified empirically, 2026-07; the
+    # doc-22 PF-3 "compile-upgrade mid-capture" hypothesis doesn't apply on a
+    # no-Triton box, where the compile tier never fires — the sync is the blocker.)
+    "fbm", "ridged", "billow", "turbulence", "flow", "alligator",
+    # SL-4 morphology: the radius resolves via int(.item()) → capture-illegal sync.
+    "erode", "dilate",
 })
 
 # fingerprint-signature -> GraphedProgram (LRU, bytes-aware).
@@ -66,7 +77,18 @@ _graph_cache: "OrderedDict[tuple, GraphedProgram]" = OrderedDict()
 _blacklist: set[tuple] = set()
 # fingerprint -> static capturability (the AST gate is a full walk; memoize it so
 # cache-hit replays don't re-walk the program every cook).
-_capturable_memo: dict[str, bool] = {}
+_capturable_memo: "dict[str, tuple[bool, int]]" = {}
+
+# PF-1/PF-2 — CUDA-graph crossover gate (calibrated on RTX 2080S / torch 2.10
+# from Appendix A + v016_bench). The tier elides a FIXED per-kernel launch cost
+# but pays a staging copy that scales with pixel count, so it wins only for
+# enough-kernels at low-enough-resolution. Measured: wins ≤512² broadly, breaks
+# even/loses at 1024² unless kernel-heavy, loses everywhere for ~0-kernel
+# programs, loses at 2048² for all program classes tested.
+_GRAPH_MIN_OPS = 2                    # PF-2: 0/1-op programs capture an ~empty graph → pure loss
+_GRAPH_HIGH_OPS = 40                  # kernel-heavy programs keep winning up to 1024²
+_GRAPH_BASE_PX_CEIL = 512 * 512       # low-kernel programs win only up to ~512²
+_GRAPH_HIGH_PX_CEIL = 1024 * 1024     # hard cap: no class tested wins above 1024²
 
 # Bytes budget for the shared pool's reserved growth. Freed wholesale when over.
 _GRAPH_BYTES_BUDGET = 512 * 1024 * 1024
@@ -101,23 +123,57 @@ def _build_keepalive() -> None:
 
 # ── Static capturability gate ─────────────────────────────────────────
 
-def _capturable(program: Program) -> bool:
-    """True if the program has no statically-detectable sync. Excludes while
-    loops, non-static-range for loops (param/uniform bounds resolve via .item()
-    at loop entry — a capture blocker), and sync-bearing stdlib calls. Anything
-    that slips through still fails capture loudly (never silent-wrong)."""
+def _capturable(program: Program) -> tuple[bool, int]:
+    """(capturable, op_count) from a single AST walk.
+
+    capturable = no statically-detectable sync: excludes while loops, non-static
+    -range for loops (param/uniform bounds resolve via .item() at loop entry — a
+    capture blocker), and sync-bearing stdlib calls. Anything that slips through
+    still fails capture loudly (never silent-wrong). op_count is the static
+    tensor-op count (the launch proxy for the PF-1/PF-2 gate), counted in the
+    same walk so the graph tier never traverses the AST twice; it is 0 (unused)
+    on a non-capturable early-out."""
+    from .compiled import _OP_TYPES   # lazy: canonical op-type set, avoids import cycle
+    ops = 0
     stack = list(program.statements)
     while stack:
         n = stack.pop()
         cls = n.__class__
         if cls is WhileLoop:
-            return False
+            return (False, 0)
         if cls is ForLoop and try_extract_static_range(n) is None:
-            return False
+            return (False, 0)
         if cls is FunctionCall and n.name in _SYNC_STDLIB:
-            return False
+            return (False, 0)
+        if isinstance(n, _OP_TYPES):
+            ops += 1
         stack.extend(_iter_child_nodes(n))
-    return True
+    return (True, ops)
+
+
+def _spatial_px(bindings) -> int:
+    """Pixels per frame (H*W) of the program's spatial input, or 0 if none."""
+    for v in bindings.values():
+        if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+            v = v[0]
+        if isinstance(v, torch.Tensor) and v.dim() >= 3:
+            return v.shape[1] * v.shape[2]
+    return 0
+
+
+def _graph_capture_worthwhile(est_ops: int, px: int) -> bool:
+    """PF-1/PF-2 crossover gate: True only inside the measured win region.
+    Near-zero-kernel programs never win (empty-graph overhead); low-kernel
+    programs win only up to ~512²; kernel-heavy programs up to ~1024²; nothing
+    tested wins above 1024². px==0 means no spatial input to size against (a
+    pure-scalar program) — tiny either way, and the _GRAPH_MIN_OPS floor already
+    rejected the trivial 0/1-op case, so allow rather than forgo a possible win."""
+    if est_ops < _GRAPH_MIN_OPS:
+        return False
+    if px == 0:
+        return True
+    ceil = _GRAPH_HIGH_PX_CEIL if est_ops >= _GRAPH_HIGH_OPS else _GRAPH_BASE_PX_CEIL
+    return px <= ceil
 
 
 # ── RNG-poison recovery (verified protocol V4) ────────────────────────
@@ -334,7 +390,14 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
     if cap is None:
         cap = _capturable(program)
         _capturable_memo[fingerprint] = cap
-    if not cap:
+    capturable, est_ops = cap
+    if not capturable:
+        return None
+    # PF-1/PF-2: skip capture/replay outside the measured win region (0-kernel
+    # programs at any resolution; low-kernel programs above ~512²) so cuda_graph
+    # is never slower than eager. Each resolution is its own capture key, so this
+    # decides per (program, resolution); below-region → fall to the interpreter.
+    if not _graph_capture_worthwhile(est_ops, _spatial_px(bindings)):
         return None
     if used_builtins is None:
         used_builtins = _collect_identifiers(program)

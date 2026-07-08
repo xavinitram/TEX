@@ -1666,23 +1666,25 @@ for (int dy = -1; dy <= 1; dy = dy + 1) {
 @OUT = acc / 9.0;
 """)
 
-    # Direct fold checks at the AST level
+    # Direct fold checks at the AST level. Fold each initializer via _opt_expr
+    # directly (invokes _fold_unary) rather than through the full optimize()
+    # pipeline: P2-UC4-NEG's literal-propagation pass now substitutes and DCE's
+    # these single-use negative-literal locals away, so they no longer survive as
+    # decls — but the unary FOLD's integer-ness is exactly what this test targets,
+    # and folding the initializer directly isolates it from propagation.
     try:
+        from TEX_Wrangle.tex_compiler.optimizer import _opt_expr
         code = ("int x = -3;\nfloat y = -3.5;\nfloat z = !1.0;\n"
                 "@OUT = vec3(float(x), y, z);")
         tokens = Lexer(code).tokenize()
         prog = Parser(tokens, source=code).parse()
-        tc = TypeChecker(binding_types={"OUT": TEXType.VEC3}, source=code)
-        tm = tc.check(prog)
-        prog = optimize(prog, tm)
-        decls = {s.name: s for s in prog.statements if isinstance(s, VarDecl)}
-        x_init = decls["x"].initializer
+        x_init = _opt_expr(prog.statements[0].initializer)
         assert isinstance(x_init, NumberLiteral) and x_init.is_int \
             and x_init.value == -3.0, f"int fold: {x_init!r}"
-        y_init = decls["y"].initializer
+        y_init = _opt_expr(prog.statements[1].initializer)
         assert isinstance(y_init, NumberLiteral) and not y_init.is_int \
             and y_init.value == -3.5, f"float fold: {y_init!r}"
-        z_init = decls["z"].initializer
+        z_init = _opt_expr(prog.statements[2].initializer)
         assert isinstance(z_init, NumberLiteral) and not z_init.is_int \
             and z_init.value == 0.0, f"! fold: {z_init!r}"
         r.ok("isint unary: folded literal integer-ness at AST level")
