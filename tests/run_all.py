@@ -137,7 +137,10 @@ from test_v018_ux import (
     test_dbg3_nan_overlay, test_lx5_debug_print, test_dbg4_doctor,
     test_ux2_tooltip_honesty,
 )
-from test_v018_portability import test_port1_import_lint, test_port1_host_services
+from test_v018_portability import (
+    test_port1_import_lint, test_port1_host_services, test_port2_facade,
+    test_port2_program_shape, test_port3_cli,
+)
 
 
 def main():
@@ -348,6 +351,9 @@ def main():
     # v0.18.0 Phase 3 — portability + hardware
     test_port1_import_lint(r)
     test_port1_host_services(r)
+    test_port2_facade(r)
+    test_port2_program_shape(r)
+    test_port3_cli(r)
 
     success = r.summary()
     return 0 if success else 1
