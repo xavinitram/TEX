@@ -133,14 +133,28 @@ determinism would *cost* 1.48× on scatter, so TEX already rides the fast path
 (`tests/test_determinism_pin.py`). The CPU is the honest caveat (~5.5e-6 threaded-accumulation
 variance).
 
-**`precision="auto"`** (PR-LP2) resolves to fp16 only in the measured win region — CUDA,
-≥1024², a smooth pointwise program (no sampling/scatter/reduction, no discontinuous/domain
-function, no data branch, no image-derived threshold; `tex_runtime/precision_policy.py`).
-The decision is memoized per (fingerprint, resolution-bucket, device); a first-cook
-finiteness check re-cooks + pins fp32 on any NaN, then trusts the verified fingerprint — so
-the win (~1.45× at 2048²) isn't eaten by a per-cook CUDA-sync. fp16 stays out of the
-compiled/graph tiers this cycle. Reductions (`img_*`, `arr_*`) accumulate in fp32 (an fp16
-sum overflows to inf at ≥1024²).
+**`precision="auto"`** (PR-LP2, `tex_runtime/precision_policy.py`) is an **experimental,
+conservative fp16 gate**. It resolves to fp16 only on CUDA, ≥1024², for a smooth pointwise
+program, and — the doc-32 rework — only when a **condition-number heuristic proves the
+program won't amplify fp16's ~1e-3 input error past the 8-bit quantum**. That heuristic
+(`_amplification_hazard`) is a flow-sensitive image-**gain + magnitude** analysis: it tracks
+amplification assembled from sub-threshold steps (`sin(@A.r*3*3)`), image×image squaring,
+`/const` chains, builtin-const/dimension products (`@A.r*iw`), dot/matrix-row/length/cross
+fan-in, `fit` remaps, additive round-trips (`(@A.r+60000)-60000`), and array reductions,
+with scalar const-propagation; it declines ill-conditioned fns (tan/atan2/normalize/hypot/
+sdiv). Verified **0 accuracy violations across 225 adversarial programs (two independent
+red-team rounds) + the fuzzer** — but it is a **heuristic, not a proof** (the two rounds each
+found new classes), so a per-cook finiteness net re-cooks + pins fp32 on any non-finite
+(runs EVERY fp16 cook — doc 32 C2 — never memoized). The decision (not the finiteness
+verdict) is memoized per (fingerprint, resolution-bucket, device).
+
+**Honest perf:** on the real `TEXWrangleNode.execute` path `auto` is essentially
+**neutral (~0.99×@1024 / ~1.08×@2048)** — the finiteness backstop costs about what fp16
+saves. The earlier "1.45×" was a repeated-input microbenchmark off `Interpreter.execute`;
+the raw fp16 win (~1.35–1.45×) is available, without the safety net, via expert
+`precision="fp16"`. fp16 stays out of the compiled/graph tiers this cycle. Reductions
+(`img_*`, `arr_*`) accumulate in fp32 (an fp16 sum overflows to inf at ≥1024²); an
+out-of-fp16-range literal / a large-value `vec()` also stays fp32 (interp==codegen).
 
 ## The 14-cache architecture
 

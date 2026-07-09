@@ -128,6 +128,7 @@ from test_v018_docs import test_doc7b_map_drift, test_reg1b_doc_ex_populated
 from test_v018_precision import (
     test_prlp4_fp16_safe_reductions, test_prlp4_arr_reductions_fp16_safe,
     test_prlp2_auto_gate, test_prlp2_fp16_accuracy_fuzzer, test_prlp2_node_path_perf,
+    test_c1_amplification_gate, test_c2_data_dependent_nan,
 )
 from test_v018_memory import (
     test_mem2_pool_trim_gating, test_mem3_fp16_estimator, test_mem4_per_device_budget,
@@ -148,6 +149,7 @@ from test_v018_phase4 import (
 )
 from test_lazy_cooking import (
     test_lazy_analysis, test_lazy_check_status, test_lazy_execute_path,
+    test_lazy_schema_pool_ci,
 )
 
 
@@ -346,6 +348,8 @@ def main():
     test_prlp2_auto_gate(r)
     test_prlp2_fp16_accuracy_fuzzer(r)
     test_prlp2_node_path_perf(r)
+    test_c1_amplification_gate(r)
+    test_c2_data_dependent_nan(r)
     test_mem2_pool_trim_gating(r)
     test_mem3_fp16_estimator(r)
     test_mem4_per_device_budget(r)
@@ -377,6 +381,7 @@ def main():
     test_lazy_analysis(r)
     test_lazy_check_status(r)
     test_lazy_execute_path(r)
+    test_lazy_schema_pool_ci(r)
 
     success = r.summary()
     return 0 if success else 1

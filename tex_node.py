@@ -191,24 +191,22 @@ def _apply_cpu_threads_env() -> None:
 _apply_cpu_threads_env()  # HW-4: opt-in, once at import
 
 
-# PR-LP2 (audit B1): memoize the auto-precision decision + the first-cook finiteness
-# verdict per program, so steady-state cooks pay NEITHER the resolve_auto AST walk NOR
-# the per-cook finiteness CUDA-sync (the two costs that turned auto into a node-path
-# regression). Keyed by (fingerprint, resolution-bucket, device) for the decision;
-# fingerprints verified finite once are trusted thereafter.
+# PR-LP2: memoize the auto-precision DECISION per program (B1) so steady-state cooks skip
+# the resolve_auto AST walk. Keyed by (fingerprint, resolution-bucket, device). NOTE: the
+# per-cook fp16 finiteness net is NOT memoized (doc 32 C2) — trusting a first-cook verdict
+# shipped NaN silently when the same program met a new input; the net runs every fp16 cook.
 _AUTO_DECISION: dict = {}          # (fp, px>=min, dev_type) -> (precision, reason)
-_AUTO_FINITE_OK: set = set()       # fingerprints whose fp16 output was verified finite
-_MIN_FP16_PX = 1024 * 1024
+# _MIN_FP16_PX (the fp16 resolution floor) is single-sourced in precision_policy (F5, doc
+# 32) — imported function-locally in execute() so the decision-cache resolution bucket can
+# never drift from the gate's actual threshold.
 _AUTO_CACHE_MAX = 512              # bound (audit): a long session editing code = new fp each
 
 
 def _cap_auto_caches() -> None:
     """Keep the auto-decision memo bounded — a long editing session mints a new fingerprint
-    per code edit. Clear-on-overflow (not LRU): the decision + finiteness recompute cheaply
-    on the next cook, so the rare wholesale clear is fine."""
-    if len(_AUTO_DECISION) > _AUTO_CACHE_MAX or len(_AUTO_FINITE_OK) > _AUTO_CACHE_MAX:
+    per code edit. Clear-on-overflow (not LRU): the decision recomputes cheaply next cook."""
+    if len(_AUTO_DECISION) > _AUTO_CACHE_MAX:
         _AUTO_DECISION.clear()
-        _AUTO_FINITE_OK.clear()
 
 
 # ── Cached interpreter (reused across executions to avoid rebuild overhead) ──
@@ -309,7 +307,7 @@ class TEXWrangleNode(_BaseClass):
                     "precision",
                     options=["fp32", "auto", "fp16"],
                     default="fp32",
-                    tooltip="fp32: full precision (default). auto: fp16 ONLY where it measurably wins and stays accurate — CUDA, >=1024x1024, pointwise programs with no sampling/scatter/reduction and no image-derived threshold (measured 1.4-1.5x on grade-class); everything else runs fp32. fp16: EXPERIMENTAL — force half-precision IMAGE-class temps (coordinates & sampling stay fp32; ~1e-3 accuracy, diverges on threshold/branch programs). LATENT stays fp32.",
+                    tooltip="fp32: full precision (default, recommended). auto: EXPERIMENTAL — runs fp16 ONLY where a condition-number gate proves it stays accurate (CUDA, >=1024x1024, smooth pointwise, no amplification/ill-conditioning; verified across 225 adversarial programs); everything else runs fp32. A per-cook finiteness net makes auto ~perf-NEUTRAL — it's an accuracy-safe convenience, not a speedup. fp16: EXPERT — force half-precision IMAGE temps for the raw ~1.35-1.45x win with NO safety net (coordinates & sampling stay fp32; ~1e-3 accuracy, diverges on threshold/branch/amplifying programs). LATENT stays fp32.",
                     optional=True,
                 ),
                 IO.Boolean.Input(
@@ -815,25 +813,31 @@ class TEXWrangleNode(_BaseClass):
                     precision, auto_reason = "fp32", "auto->fp32: LATENT input (stays fp32)"
                 else:
                     dev_type = torch.device(device).type
-                    # B1: memoize the decision per (program, resolution-bucket, device) so
-                    # the resolve_auto AST walk runs once, not per cook.
+                    from .tex_runtime.precision_policy import (
+                        resolve_auto_precision, _MIN_FP16_PX)
+                    # B1: memoize the DECISION per (program, resolution-bucket, device) so
+                    # the resolve_auto AST walk runs once, not per cook (a static property of
+                    # code+resolution+device — value-independent).
                     ckey = (fp, cook_px >= _MIN_FP16_PX, dev_type) if fp is not None else None
                     cached = _AUTO_DECISION.get(ckey) if ckey is not None else None
                     if cached is not None:
                         precision, auto_reason = cached
                     else:
-                        from .tex_runtime.precision_policy import resolve_auto_precision
                         precision, auto_reason = resolve_auto_precision(program, cook_px, dev_type)
                         if precision == "fp16" and compile_mode != "none":
                             precision, auto_reason = "fp32", auto_reason + " [compiled tier: fp32]"
                         if ckey is not None:
                             _AUTO_DECISION[ckey] = (precision, auto_reason)
                             _cap_auto_caches()
-                    # B1: run the finiteness safety-net only on the FIRST fp16 cook of a
-                    # program (fingerprint unknown, e.g. fused, always checks). Once a
-                    # program's fp16 output is verified finite, trust it — the per-cook
-                    # .all() CUDA-sync was what erased the fp16 win.
-                    auto_fp16 = precision == "fp16" and (fp is None or fp not in _AUTO_FINITE_OK)
+                    # C2 (doc 32): the finiteness safety-net runs on EVERY fp16 cook. The B1
+                    # "check once then trust the fingerprint" shipped NaN silently when the
+                    # SAME program met a new input value (3.1M NaN pixels) — and in real
+                    # ComfyUI use every cook already HAS a new input (identical inputs are
+                    # cache hits), so a value-keyed skip is pure overhead on top of the check
+                    # it can't avoid. Checking every cook is correct AND, measured, cheaper on
+                    # the real path than hashing the input to decide whether to check. A
+                    # non-finite result re-cooks + pins the program to fp32 thereafter.
+                    auto_fp16 = precision == "fp16"
                 tier_trace.record_precision(precision, auto_reason)
             # M-3: LATENT data exceeds [0,1] and feeds further math, so it must stay
             # fp32 even in fp16 mode.
@@ -847,11 +851,11 @@ class TEXWrangleNode(_BaseClass):
             if not isinstance(raw_output, dict):
                 raw_output = {output_names[0]: raw_output}
 
-            # PR-LP2 safety net (B1): the FIRST fp16 cook of a program is checked for
-            # NaN/Inf (a fp16-fragile pointwise program the static gate can't tell from
-            # grade's safe pow). If finite, the fingerprint is trusted henceforth (no more
-            # per-cook sync). If not, re-cook fp32 AND pin the decision to fp32 so future
-            # cooks skip fp16 entirely — no repeated double-cook.
+            # PR-LP2 safety net (C2): every fp16 cook's output is checked for NaN/Inf — the
+            # residual data-dependent case the static gate can't rule out (a gate blind
+            # spot, or pow of a value that goes negative). If non-finite, re-cook fp32 AND
+            # pin the DECISION to fp32 so the program skips fp16 for ALL future inputs — a
+            # program that can go non-finite in fp16 for any input is declined outright.
             if auto_fp16 and eff_precision == "fp16":
                 if any(isinstance(v, torch.Tensor) and not torch.isfinite(v).all()
                        for v in raw_output.values()):
@@ -866,9 +870,6 @@ class TEXWrangleNode(_BaseClass):
                     raw_output = getattr(cls, cls._TIER_METHOD[tier_id])(ctx)
                     if not isinstance(raw_output, dict):
                         raw_output = {output_names[0]: raw_output}
-                elif fp is not None:
-                    _AUTO_FINITE_OK.add(fp)  # verified finite; skip the sync next time
-                    _cap_auto_caches()
 
             # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
             # oldest mip/grid entries; allocate-and-hold semantics untouched).

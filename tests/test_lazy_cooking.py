@@ -314,3 +314,47 @@ def test_lazy_execute_path(r: SubTestResult):
             r.ok("schema pool check skipped (v3 API absent in test venv)")
     except Exception as e:
         r.fail("schema declares lazy pool", str(e))
+
+
+def test_lazy_schema_pool_ci(r: SubTestResult):
+    """C3 (doc 32): the lazy pool (in_0..in_15, lazy=True) must be DECLARED even in the CI
+    venv where the real V3 API is absent (IO is None, so the existing schema check no-ops).
+    ComfyUI fires the lazy-cook trigger ONLY for schema-declared lazy inputs, so a dropped
+    lazy=True would silently turn lazy cooking off (fail-safe, but the feature vanishes). A
+    stub IO records the declared inputs so this is verified in CI, not just with ComfyUI."""
+    import types
+    import TEX_Wrangle.tex_node as tn
+
+    def _mk(*a, **kw):
+        ns = types.SimpleNamespace(**kw)
+        ns.id = kw.get("id", a[0] if a else None)
+        return ns
+
+    class _StubSchema:
+        def __init__(self, **kw):
+            self.inputs = kw.get("inputs", [])
+            self.outputs = kw.get("outputs", [])
+
+    stub = types.SimpleNamespace(
+        Schema=_StubSchema,
+        String=types.SimpleNamespace(Input=_mk),
+        Combo=types.SimpleNamespace(Input=_mk),
+        Boolean=types.SimpleNamespace(Input=_mk),
+        AnyType=types.SimpleNamespace(Input=_mk, Output=_mk),
+    )
+    saved = tn.IO
+    try:
+        tn.IO = stub
+        schema = tn.TEXWrangleNode.define_schema()
+        n = tn.TEXWrangleNode.MAX_LAZY_INPUTS
+        pool = [i for i in schema.inputs if str(getattr(i, "id", "")).startswith("in_")]
+        ids = {getattr(i, "id", None) for i in pool}
+        lazy_flags = [getattr(i, "lazy", None) for i in pool]
+        assert len(pool) == n, f"expected {n} lazy pool slots, got {len(pool)}"
+        assert "in_0" in ids and f"in_{n - 1}" in ids, f"pool ids wrong: {sorted(ids)}"
+        assert all(f is True for f in lazy_flags), f"pool not all lazy=True: {lazy_flags}"
+        r.ok(f"lazy pool declared in CI: {n} in_N slots, all lazy=True (V3 API stubbed)")
+    except Exception as e:
+        r.fail("lazy schema pool (CI stub)", str(e))
+    finally:
+        tn.IO = saved

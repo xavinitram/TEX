@@ -41,6 +41,11 @@ MAX_CALL_DEPTH = 64
 # Max distinct literal tensors kept across executions before a wholesale clear
 _LITERAL_CACHE_MAX = 4096
 
+# fp16's finite maximum. A literal beyond it realised in fp16 becomes +/-inf; such
+# literals are kept fp32 (doc 32 medium) so interp matches codegen (invariant #2) and a
+# large constant does not spuriously go non-finite under fp16.
+_FP16_MAX = 65504.0
+
 # Default builtin values for scalar (no-spatial-context) mode
 _SCALAR_BUILTIN_DEFAULTS = {"ix": 0.0, "iy": 0.0, "u": 0.0, "v": 0.0,
                             "iw": 1.0, "ih": 1.0, "px": 1.0, "py": 1.0,
@@ -1296,7 +1301,15 @@ class Interpreter:
         cached = self._literal_cache.get(key)
         if cached is not None:
             return cached
-        t = torch.scalar_tensor(node.value, dtype=self._dtype, device=self.device)
+        # A literal outside fp16's range would overflow to +/-inf if realised in fp16
+        # (e.g. 100000.0 -> inf). Keep it fp32 — matching codegen (which emits the Python
+        # float, fp32) so interp==codegen holds (invariant #2), and so a large constant
+        # doesn't spuriously go non-finite under fp16. Normal literals (|v| <= 65504) are
+        # untouched: bit-identical to before.
+        dt = self._dtype
+        if dt is not torch.float32 and not (-_FP16_MAX <= node.value <= _FP16_MAX):
+            dt = torch.float32
+        t = torch.scalar_tensor(node.value, dtype=dt, device=self.device)
         # The cache persists across executions; entries are 0-dim (a few hundred
         # bytes each) but distinct literals accumulate over a session of code
         # edits — wholesale-clear on overflow (entries are trivially recreated).
@@ -1804,15 +1817,27 @@ class Interpreter:
                 hint=f"Provide exactly {n} scalar values, or combine vectors and scalars that add up to {n} components.",
             )
 
-        # Allocate and fill channels
+        # Allocate and fill channels. Promote to fp32 if any component is fp32 — a
+        # component kept fp32 to avoid fp16 overflow (a large literal, an fp32-accumulated
+        # reduction) must not be downcast back into an fp16 result (doc 32: the
+        # vec-constructor was the residual fp16 overflow path — `vec3(arr_sum(...))` still
+        # went inf). An all-fp16 program is unchanged (res_dtype stays self._dtype).
+        res_dtype = self._dtype
+        if res_dtype is not torch.float32:
+            for c in components:
+                if isinstance(c, torch.Tensor) and c.dtype is torch.float32:
+                    res_dtype = torch.float32
+                    break
         max_shape = self._get_max_spatial_shape(components)
         if max_shape:
-            result = torch.empty(*max_shape, n, dtype=self._dtype, device=self.device)
+            result = torch.empty(*max_shape, n, dtype=res_dtype, device=self.device)
             for i, c in enumerate(components):
                 result[..., i] = _ensure_spatial(c, max_shape)
             return result
         else:
-            return torch.stack([_ensure_spatial(c, max_shape) for c in components], dim=-1)
+            comps = ([c.to(res_dtype) if isinstance(c, torch.Tensor) else c for c in components]
+                     if res_dtype is not self._dtype else components)
+            return torch.stack([_ensure_spatial(c, max_shape) for c in comps], dim=-1)
 
     def _eval_mat_constructor(self, node: MatConstructor) -> torch.Tensor:
         n = node.size  # 3 or 4

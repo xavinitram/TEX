@@ -41,16 +41,26 @@ host-agnostic core. Suite **1691 → 1757/1757**.
   cache correctly.
 
 ### Precision
-- **`precision="auto"`** — a new mode that runs **fp16 only where it measurably wins and
-  stays accurate**: CUDA, ≥1024×1024, smooth pointwise programs (no sampling, scatter,
-  reduction, discontinuous/domain functions, data branches, or image-derived thresholds).
-  Measured **≈1.45× at 2048² / 1.33× at 1024²** on grade-class chains through the node
-  (`TEXWrangleNode.execute`); every other program runs fp32. A first-cook finiteness check
-  re-cooks (and pins) fp32 on any NaN, then trusts the verified fingerprint — so the win
-  isn't eaten by a per-cook sync. Verified 0 accuracy violations across all 114 examples.
-  Gated by the v0.17 `@stdlib` registry tags.
-- **fp16-safe reductions** — `img_sum`/`mean`/`min`/`max`/`median` now accumulate in fp32
-  (an fp16 sum overflowed to inf at ≥1024²); bit-identical on fp32.
+- **`precision="auto"`** — an **experimental, conservative fp16 mode** (default stays fp32).
+  It runs fp16 only on CUDA, ≥1024×1024, for a smooth pointwise program that a
+  **condition-number gate proves won't amplify fp16's ~1e-3 input error past the 8-bit
+  quantum** — a flow-sensitive image-**gain + magnitude** analysis that declines
+  amplification assembled from sub-threshold steps (`sin(@A.r*3*3)`), squaring, `/const`
+  chains, builtin-dimension products (`@A.r*iw`), dot/matrix/length/cross fan-in, `fit`
+  remaps, additive round-trips, array reductions, and ill-conditioned fns (tan/atan2/
+  normalize/hypot/sdiv). **Verified 0 accuracy violations across 225 adversarial programs
+  (two independent red-team rounds) + a fuzzer** — but it is a heuristic, not a proof, so a
+  per-cook finiteness net re-cooks fp32 on any non-finite (**runs every cook**; the earlier
+  "check once then trust the fingerprint" shipped 3.1M NaN silently when a program met a
+  new input — that regression is fixed).
+  **Honest perf:** through the node (`TEXWrangleNode.execute`) `auto` is essentially
+  **perf-neutral (~0.99× @1024² / ~1.08× @2048²)** — the safety net costs about what fp16
+  saves. (An earlier "≈1.45×" was a repeated-input microbenchmark measured off
+  `Interpreter.execute`, not the user path; this corrects it.) The raw fp16 win
+  (~1.35–1.45×) is available, **without the safety net**, via expert `precision="fp16"`.
+- **fp16-safe reductions** — `img_sum`/`mean`/`min`/`max`/`median` and `arr_sum`/`arr_avg`
+  now accumulate in fp32 (an fp16 sum overflowed to inf at ≥1024²); a large-value
+  `vec()`/literal also stays fp32, so interp == codegen. Bit-identical on fp32.
 - **TF32 profile** (`apply_tf32_profile`) — opt-in, default OFF, no-op on Turing.
 
 ### Debugging / UX

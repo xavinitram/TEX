@@ -69,7 +69,7 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **Control flow** | `if/else` (vectorized), `for` loops, `while` loops, `break`/`continue` |
 | **GPU acceleration** | CPU or GPU with auto device detection |
 | **Acceleration tiers** | `compile_mode`: `none` (default), `auto` (experimental measured auto-tier — trials `torch.compile` in the background and commits only on a measured win; always falls back to a correct path), `torch_compile`, `cuda_graph` (GPU replay for small launch-bound programs) |
-| **Precision** | `precision`: `fp32` (default), **`auto`** (fp16 only where it measurably wins and stays accurate — CUDA, ≥1024², smooth pointwise; measured ~1.5× on grade-class, else fp32), `fp16` (force half-precision, expert) |
+| **Precision** | `precision`: `fp32` (default), **`auto`** (experimental — runs fp16 only where a condition-number gate proves it accurate: CUDA, ≥1024², smooth pointwise; verified 0 accuracy violations across 225 adversarial programs. A per-cook finiteness net makes it ~perf-neutral, so it's an accuracy-safe convenience, not a speedup), `fp16` (force half-precision, expert — the raw ~1.35–1.45× win, no safety net) |
 | **Debug HUD** | A per-node badge shows the tier, cook time, and precision after each run (amber on a tier fallback); toggle in Settings → TEX Debug |
 | **`tex doctor`** | An environment report (torch/CUDA, Triton, MSVC, cache, tier availability) for troubleshooting why a tier isn't engaging |
 | **Standalone CLI** | `python -m TEX_Wrangle.tex_cli run prog.tex --in a.png --out b.png` — run a program on an image file with **no ComfyUI** (torchvision-only I/O) |

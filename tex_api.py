@@ -7,10 +7,18 @@ bit-for-bit identical to `Interpreter.execute`, and `compile()` wraps the cache'
 6-tuple. The `Program` dataclass field NAMES are a public contract (a canary test pins
 them), so a host can depend on `program.assigned` / `program.type_map` etc.
 
+**Scope (doc 32 F4):** `execute()` returns the interpreter's RAW per-output tensors — it
+deliberately does NOT apply the ComfyUI node's IMAGE post-formatting (`prepare_output`:
+clamp to [0,1], alpha-drop to 3 channels, gray→RGB broadcast, MASK/LATENT typing). So
+`execute(compile("@OUT=vec4(@A.rgb*3,1);"), {"A": half_grey})` returns a `[1,H,W,4]`
+tensor with values to 1.5, whereas the node would return a clamped `[1,H,W,3]` IMAGE. A
+host that needs pixel-identical ComfyUI output should cook through `TEXWrangleNode.execute`
+(as the `tex run` CLI does); this facade is the lower-level, host-agnostic engine call.
+
     from TEX_Wrangle.tex_api import compile, execute
     from TEX_Wrangle.tex_compiler.types import TEXType
     prog = compile("@OUT = vec4(@A.rgb * 1.2, 1.0);", {"A": TEXType.VEC3})
-    out = execute(prog, {"A": img}, device="cuda", precision="auto")
+    out = execute(prog, {"A": img}, device="cuda", precision="auto")  # raw, unclamped
 """
 from dataclasses import dataclass
 from typing import Any

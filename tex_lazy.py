@@ -147,7 +147,13 @@ def _param_key(param_values: dict) -> tuple:
         v = param_values[name]
         if isinstance(v, bool):
             items.append((name, "b", int(v)))
-        elif isinstance(v, (int, float)):
+        elif isinstance(v, int):
+            # type-tag int distinctly from float (doc 32): struct.pack("f", 1) and
+            # struct.pack("f", 1.0) are identical bytes, so an un-tagged int 1 and float
+            # 1.0 would share a memo entry. Harmless today (both fold to the same fp32
+            # literal), but the tag keeps the key honest if the analysis ever distinguishes.
+            items.append((name, "i", v))
+        elif isinstance(v, float):
             items.append((name, "f", struct.pack("f", float(v))))
         else:
             items.append((name, "s", str(v)))

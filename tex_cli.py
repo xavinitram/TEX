@@ -120,8 +120,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
-    if args.cmd == "run":
-        run(args)
+    # F3 (doc 32): a bad path / syntax error / cook failure must exit with a one-line
+    # message, not a raw Python traceback — the flagship host-agnostic runner should fail
+    # like a CLI, not dump a stack. Function-local imports keep the module cheap to import
+    # as a library (load_image/save_image) without pulling the whole compiler chain.
+    from .tex_compiler.lexer import LexerError
+    from .tex_compiler.parser import ParseError
+    from .tex_compiler.type_checker import TypeCheckError
+    from .tex_compiler.diagnostics import TEXMultiError
+    from .tex_runtime.interpreter import InterpreterError
+    try:
+        if args.cmd == "run":
+            run(args)
+    except (OSError, LexerError, ParseError, TypeCheckError, TEXMultiError,
+            InterpreterError, ValueError, RuntimeError) as e:
+        sys.exit(f"tex run: error: {e}")
 
 
 if __name__ == "__main__":

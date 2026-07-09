@@ -63,8 +63,11 @@ def test_prlp4_arr_reductions_fp16_safe(r: SubTestResult):
     # are tile-safe, arr_* not fragile), so the overflow must be fixed, not just caught.
     fails = []
     for name in ("arr_sum", "arr_avg", "arr_min", "arr_max", "median"):
+        # doc 32 (un-masked): arr_sum(arr)=1e5 goes straight into vec3() with NO *0.00001
+        # scaling — the vec-constructor now keeps the fp32 value instead of downcasting it
+        # to fp16 inf, so the un-scaled program must be finite on interp AND codegen.
         code = (f"float arr[20]; for(int i=0;i<20;i++){{ arr[i]=5000.0; }} "
-                f"@OUT = vec4(vec3({name}(arr) * 0.00001), 1.0);")
+                f"@OUT = vec4(vec3({name}(arr)), 1.0);")
         for tier in ("interp", "codegen"):
             try:
                 out = run_tier(code, binds, tier, precision="fp16")
@@ -87,7 +90,7 @@ def test_prlp4_arr_reductions_fp16_safe(r: SubTestResult):
 
 
 def test_prlp2_node_path_perf(r: SubTestResult):
-    print("\n--- PR-LP2: precision=auto node-path speedup (H7 / audit B1) ---")
+    print("\n--- PR-LP2: precision node-path perf (H7 / doc 32 honesty) ---")
     if not torch.cuda.is_available():
         r.ok("PR-LP2 node-path perf (no GPU, SKIPPED)")
         return
@@ -95,22 +98,26 @@ def test_prlp2_node_path_perf(r: SubTestResult):
     bench = Path(__file__).resolve().parent.parent / "benchmarks" / "prlp2_node_path.py"
     spec = importlib.util.spec_from_file_location("prlp2_node_path", bench)
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-    # Substantiates the CHANGELOG claim on the REAL path (TEXWrangleNode.execute), not
-    # Interpreter.execute. Thresholds are drift-robust (measured after B1: 1.33x@1024,
-    # 1.45x@2048): >=0.9x@1024 catches a re-introduced regression (the B1 bug was 0.79x);
-    # >=1.15x@2048 asserts a genuine speedup (20% margin under the measured 1.45x).
+    # Machine-checks the HONEST claim on the real TEXWrangleNode.execute path (doc 32):
+    #   * `auto` is essentially perf-NEUTRAL (measured 0.99x@1024 / 1.08x@2048) — the
+    #     per-cook finiteness backstop that keeps it SAFE costs about what fp16 saves. It
+    #     must not REGRESS (>=0.85x) and must not be sold as a speedup.
+    #   * the raw fp16 win lives in expert `precision="fp16"` (no net): >=1.2x @2048.
     fails = []
-    for res, floor in ((1024, 0.9), (2048, 1.15)):
+    for res in (1024, 2048):
         f32 = mod._time(res, "fp32", iters=15)
         auto = mod._time(res, "auto", iters=15)
-        speedup = f32 / auto
-        if speedup < floor:
-            fails.append(f"{res}²: auto {speedup:.2f}× < {floor}× (node-path B1 regression)")
+        if f32 / auto < 0.85:
+            fails.append(f"{res}²: auto {f32/auto:.2f}× < 0.85× (a real regression)")
+    f32 = mod._time(2048, "fp32", iters=15)
+    fp16 = mod._time(2048, "fp16", iters=15)
+    if f32 / fp16 < 1.2:
+        fails.append(f"2048²: expert fp16 {f32/fp16:.2f}× < 1.2× (fp16 win vanished)")
     if fails:
         r.fail("PR-LP2 node-path perf", "; ".join(fails))
     else:
-        r.ok("precision=auto is a node-path speedup (>=0.9x@1024, >=1.15x@2048) — not the "
-             "0.79x/1.02x pre-B1 regression")
+        r.ok("precision=auto is perf-neutral+safe (>=0.85x, not sold as a speedup); the "
+             "fp16 win (>=1.2x@2048) lives in expert precision='fp16'")
 
 
 def _resolve(code, px=2048 * 2048, dev="cuda"):
@@ -218,3 +225,116 @@ def test_prlp2_fp16_accuracy_fuzzer(r: SubTestResult):
     else:
         r.ok(f"{accepted} gate-accepted programs within 3.9e-3 (declined {declined}, "
              f"fp32-fallback {fell_back})")
+
+
+# ── C1/C2 (doc 32) adversarial precision gate ────────────────────────────
+# Amplification families the gain+magnitude gate MUST decline — each is a MEASURED
+# gate-accepted-but-inaccurate hole from doc 32's adversarial sweep (node-path maxerr in
+# the comment). The gain analysis assembles sub-threshold amplification (chained products,
+# squaring, /const chains, builtin-const, dot/matrix/length/cross fan-in) + peak magnitude
+# (additive round-trips) + ill-conditioned fns (atan2/tan/normalize).
+_C1_MUST_DECLINE = [
+    "@OUT = vec4(vec3(sin(@A.r*3.0*3.0*3.0)),1.0);",                                 # *27 chain 2.7e-2
+    "float x=@A.r; x=x*3.0; x=x*3.0; x=x*3.0; @OUT=vec4(vec3(sin(x)),1.0);",         # split reassign
+    "@OUT = vec4(vec3(sin(@A.r*PI*PI)),1.0);",                                       # builtin-const chain
+    "@OUT = vec4(vec3(sin(@A.r/0.3/0.3)),1.0);",                                     # division chain
+    "float x=@A.r*3.0; float y=x*x; float w=y*y; @OUT=vec4(vec3(sin(w)),1.0);",      # squaring tower
+    "@OUT = vec4(vec3((@A.r+60000.0)-60000.0),1.0);",                               # additive round-trip
+    "@OUT = vec4(vec3(600.0-(600.0-@A.r)),1.0);",
+    "@OUT = vec4(vec3(sin(dot(@A.rgb, vec3(3.9,3.9,3.9)))),1.0);",                  # dot fan-in
+    "mat3 m=mat3(3.9,3.9,3.9,3.9,3.9,3.9,3.9,3.9,3.9); @OUT=vec4(vec3(sin((m*@A.rgb).r)),1.0);",  # matrix
+    "@OUT = vec4(vec3(sin(length(@A.rgb*3.9))),1.0);",                              # length fan-in
+    "@OUT = vec4(vec3(cross(@A.rgb*3.9, vec3(1.0,2.0,3.0)).r),1.0);",               # cross
+    "float a[3]; a[0]=@A.r*3.9; a[1]=@A.g*3.9; a[2]=@A.b*3.9; @OUT=vec4(vec3(sin(arr_sum(a))),1.0);",  # arr_sum
+    "@OUT = vec4(vec3(atan2(@A.r-0.5, @A.g-0.5)),1.0);",                            # ill-conditioned origin
+    "@OUT = vec4(vec3(tan(@A.r*3.0+1.5)),1.0);",                                    # poles
+    "@OUT = vec4(vec3(vec3(100000.0)),1.0);",                                        # out-of-fp16 literal
+    # doc 32 round 2 classes:
+    "float s=1.5; mat3 m=mat3(s,s,s,s,s,s,s,s,s); @OUT=vec4(vec3(sin((m*@A.rgb).r)),1.0);",  # matrix-VARIABLE (const-prop)
+    "@OUT = vec4(vec3(sin(@A.r*iw)),1.0);",                                          # builtin-dimension amplify
+    "@OUT = vec4(vec3(fit(@A.r, 0.49, 0.51, 0.0, 1.0)),1.0);",                       # fit narrow-band 50x
+    "@OUT = vec4(fit(@A, vec3(0.49), vec3(0.51), vec3(0.0), vec3(1.0)),1.0);",       # fit VECTOR bounds
+    "float a[3]; a[0]=@A.r*3.9; a[1]=@A.g*3.9; a[2]=@A.b*3.9; @OUT=vec4(vec3(sin(arr_max(a))),1.0);",  # array reduction
+    "@OUT = vec4(vec3(sin((@A.r+1.0)*3.9)),1.0);",                                   # shift-then-amplify (gain 3.9)
+]
+# Smooth pointwise programs the gate MUST still accept (fp16) — the headline win region.
+_C1_MUST_ACCEPT = [
+    "vec3 c=@A.rgb; c=pow(c,vec3(0.4545)); @OUT=vec4(lerp(c,vec3(0.5),0.2),1.0);",   # grade
+    "mat3 m=mat3(0.4,0.8,0.2,0.3,0.7,0.2,0.3,0.5,0.1); @OUT=vec4(m*@A.rgb,1.0);",
+    "@OUT=vec4(1.0-@A.rgb,1.0);",
+    "@OUT=vec4(@A.r*0.6+@A.g*0.4, @A.g, @A.b, 1.0);",
+    "@OUT=vec4(vec3(sin(@A.r*3.0)*0.5+0.5),1.0);",                                    # single sin, gain 3
+    "@OUT=vec4(vec3(dot(@A.rgb, vec3(0.299,0.587,0.114))),1.0);",                    # luma
+    "@OUT=vec4(vec3(length(@A.rgb)),1.0);",
+    "@OUT=vec4(@A.rgb*1.5,1.0);",                                                     # brightness
+]
+
+
+def test_c1_amplification_gate(r: SubTestResult):
+    print("\n--- C1 (doc 32): amplification/condition-number gate ---")
+    fails = []
+    # (a) gate DECISION (CPU-fine): declines every measured hole, accepts the headline
+    for code in _C1_MUST_DECLINE:
+        if _resolve(code)[0] != "fp32":
+            fails.append(f"MUST-DECLINE accepted fp16: {code[:56]}")
+    for code in _C1_MUST_ACCEPT:
+        if _resolve(code)[0] != "fp16":
+            fails.append(f"MUST-ACCEPT declined: {code[:56]} -> {_resolve(code)[1]}")
+    # (b) node-path accuracy: every ACCEPTED program is within the 8-bit quantum (CUDA)
+    if torch.cuda.is_available():
+        from TEX_Wrangle.tex_node import TEXWrangleNode as _N
+        img = torch.rand(1, 1024, 1024, 3, device="cuda")
+        for code in _C1_MUST_ACCEPT:
+            try:
+                a = _N.execute(code=code, A=img, device="cuda", precision="auto")[0]
+                b = _N.execute(code=code, A=img, device="cuda", precision="fp32")[0]
+                md = (a.float() - b.float()).abs().max().item()
+                if md > _FP16_BAR:
+                    fails.append(f"accepted but node maxerr {md:.2e} > {_FP16_BAR}: {code[:44]}")
+            except Exception as e:
+                fails.append(f"{type(e).__name__} on {code[:44]}: {e}")
+        note = "gate decisions + node accuracy (CUDA)"
+    else:
+        note = "gate decisions only (no GPU)"
+    if fails:
+        r.fail("C1 amplification gate", "; ".join(fails[:12]))
+    else:
+        r.ok(f"{len(_C1_MUST_DECLINE)} holes declined, {len(_C1_MUST_ACCEPT)} headline "
+             f"accepted+accurate ({note})")
+
+
+def test_c2_data_dependent_nan(r: SubTestResult):
+    print("\n--- C2 (doc 32): no silent NaN on a data-dependent input ---")
+    fails = []
+    # The regression: the B1 finiteness memo (keyed on code+types) trusted the FIRST cook
+    # forever, so `1.0/@A.r`-class programs shipped 3.1M NaN on a later input that overflowed
+    # fp16. TWO defences now: (a) the div-by-image / big-const-roundtrip repro class is
+    # gate-DECLINED outright (image denominator -> inf gain; transient magnitude), and
+    # (b) the finiteness net runs on EVERY fp16 cook (never memoized), pinning fp32 on any
+    # non-finite. (a) is verifiable without a GPU; (b) needs CUDA.
+    repro = [
+        "@OUT = vec4(vec3(1.0/@A.r), 1.0);",
+        "float b=@A.r/0.0002; b=b/0.0002; @OUT=vec4(vec3(b-b),1.0);",
+        "@OUT = vec4(vec3((@A.r+60000.0)-60000.0), 1.0);",
+    ]
+    for code in repro:
+        if _resolve(code)[0] != "fp32":
+            fails.append(f"repro accepted fp16 (must decline): {code[:48]}")
+    # (b) the user-facing guarantee: cooking the repro on two DIFFERENT inputs never ships a
+    # non-finite pixel (the exact failure the audit measured at 3,145,728).
+    if torch.cuda.is_available():
+        from TEX_Wrangle.tex_node import TEXWrangleNode as _N
+        code = "@OUT = vec4(vec3(1.0/@A.r), 1.0);"
+        for val in (0.5, 1e-5):
+            o = _N.execute(code=code, A=torch.full((1, 1024, 1024, 3), val, device="cuda"),
+                           device="cuda", precision="auto")[0]
+            nf = int((~torch.isfinite(o)).sum())
+            if nf:
+                fails.append(f"A={val}: shipped {nf} non-finite (was 3.1M pre-fix)")
+        note = "declined + node ships 0 non-finite on two inputs (CUDA)"
+    else:
+        note = "gate declines the repro class (no GPU)"
+    if fails:
+        r.fail("C2 data-dependent NaN", "; ".join(fails))
+    else:
+        r.ok(f"C2: {note}")
