@@ -36,8 +36,9 @@ Three layers; **imports point downward only**. The `tex_compiler` package has
 |-------|---------|-----------|
 | **Types** (leaf vocabulary) | `types` (`TEXType`, `CHANNEL_MAP`, `TYPE_NAME_MAP`, swizzles) | nothing (stdlib `enum`/`dataclasses` only) |
 | **Compiler** (IR + front end) | `ast_nodes`, `lexer`, `parser`, `type_checker`, `optimizer`, `stdlib_signatures`, `diagnostics` | types + itself |
-| **Runtime** (execution tiers) | `interpreter`, `codegen` (+ `codegen_stdfns` mixin, STR-7), `compiled`, `graphed`, `stdlib` (+ `stdlib_registry`), `tier_trace`, `noise`, `autotier`, `tex_cache`, `tex_marshalling`, `tex_memory` | types + compiler + itself |
-| **Orchestration** | `tex_node`, `tex_fusion` | all of the above |
+| **Runtime** (execution tiers) | `interpreter`, `codegen` (+ `codegen_stdfns`/`codegen_stencil`/`codegen_persist`, STR-7), `compiled`, `graphed`, `stdlib` (+ `stdlib_registry`), `precision_policy` (PR-LP2 `auto` gate), `tier_trace`, `noise`, `autotier`, `tex_cache`, `tex_marshalling`, `tex_memory`, `host` (PORT-1 seam — the ONLY `comfy.model_management` consumer) | types + compiler + itself |
+| **Public API** (host-agnostic) | `tex_api` (`compile`/`execute`/`Program`, PORT-2), `tex_cli` (`tex run`, PORT-3) | runtime + compiler |
+| **Orchestration** | `tex_node` (+ `tex_doctor` route, DBG-4), `tex_fusion` | all of the above |
 
 **Coupling hubs** (Appendix A, doc 24): `tex_node` fan-out 12; `ast_nodes` fan-in 11
 (pure data — fine). `type_checker` was fan-in 9 (the `TEXType` leak — 9 modules imported

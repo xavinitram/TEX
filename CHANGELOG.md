@@ -5,6 +5,61 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-07-09
+
+The "make it visible, make it honest, make it portable" release — it converts two cycles
+of built-but-unwired infrastructure into user-visible value, ships the one *measured*
+precision lever, fixes a memory-path safety bug, and lays the first stones of a
+host-agnostic core. Suite **1691 → 1726/1726**.
+
+### Precision
+- **`precision="auto"`** — a new mode that runs **fp16 only where it measurably wins and
+  stays accurate**: CUDA, ≥1024×1024, smooth pointwise programs (no sampling, scatter,
+  reduction, discontinuous/domain functions, data branches, or image-derived thresholds).
+  Measured **1.51× at 2048²** on grade-class chains; every other program runs fp32. A
+  runtime finiteness fallback re-cooks fp32 on any NaN. Verified 0 accuracy violations
+  across all 114 examples. Gated by the v0.17 `@stdlib` registry tags.
+- **fp16-safe reductions** — `img_sum`/`mean`/`min`/`max`/`median` now accumulate in fp32
+  (an fp16 sum overflowed to inf at ≥1024²); bit-identical on fp32.
+- **TF32 profile** (`apply_tf32_profile`) — opt-in, default OFF, no-op on Turing.
+
+### Debugging / UX
+- **Per-node tier/timing HUD** — a badge under each TEX node shows which acceleration tier
+  served the cook, the time, and the precision (amber on a tier fallback).
+- **`tex doctor`** — a `/tex_wrangle/doctor` route reporting torch/CUDA, Triton presence,
+  MSVC, cache size, and which tiers are actually reachable on your box.
+- **Hover docs** in the code editor (signature + description).
+- **NaN/Inf overlay** — `debug_nan_highlight` paints non-finite pixels magenta.
+- **`debug_print(label, value[, x, y])`** — a value-at-pixel probe (returns the value
+  unchanged); results surface on the node.
+- **Better diagnostics** — declaring a variable named `v`/`u`/`ix`/… now explains it's a
+  built-in and to rename; `float3`/`texture2D`-style mistakes point to the TEX name.
+- **Honest tooltips** — compile-mode tooltips state the Triton reality.
+
+### Portability
+- **`tex run` CLI** — run a `.tex` program on an image file with **no ComfyUI**
+  (`python -m TEX_Wrangle.tex_cli run prog.tex --in a.png --out b.png`); torchvision-only I/O.
+- **Public API** — `tex_api.compile()` / `execute()` + a stable `Program` dataclass.
+- **Host seam** — `comfy.model_management` is now behind a single `HostServices` interface,
+  pinned by a lint; TEX runs host-agnostic (a Null host when ComfyUI is absent).
+
+### Memory / hardware / safety
+- **Graph-safe cache eviction (safety fix)** — cache-budget eviction no longer tears down
+  every captured CUDA graph (nor resets the RNG-poison kill switch) on an unrelated
+  eviction; it pins the graph's baked storages and evicts only what's actually free.
+- **Reserved-pool trim** — reclaims stranded VRAM after a big→small resolution downshift
+  (measured ~1.5 GB back for ~3.4 ms), threshold-gated so it never fires at steady state.
+- **Per-device cache budget** — a CPU cook no longer evicts CUDA-resident cache entries.
+- **Multi-GPU correctness** — CUDA-graph capture/recovery pin the cook's device index.
+- **`TEX_CPU_THREADS`** — opt-in CPU-thread override (never auto-set).
+
+### Internal / honesty
+- Cross-device parity pinned as a *characterization envelope* (there is no CPU↔GPU bit
+  parity to sell — it's already 1.8e-7…6.1e-2); determinism pinned (TEX is bitwise
+  run-to-run deterministic on CUDA — a free property). Both machine-checked.
+- All 143 stdlib functions carry inline `doc=`/`ex=`; the reference is generated from them.
+  AGENTS.md map-drift canary. No user-facing behavior change from these.
+
 ## [0.17.0] - 2026-07-08
 
 Longevity / LLM-coding / structure release. **No user-facing behavior change** — the

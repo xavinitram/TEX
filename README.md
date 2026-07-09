@@ -10,7 +10,7 @@
   <img src="TEX_node.webp" alt="TEX Wrangle node" width="500">
 </p>
 
-A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 143 stdlib functions.
+A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 144 stdlib functions.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://python.org)
@@ -69,11 +69,14 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **Control flow** | `if/else` (vectorized), `for` loops, `while` loops, `break`/`continue` |
 | **GPU acceleration** | CPU or GPU with auto device detection |
 | **Acceleration tiers** | `compile_mode`: `none` (default), `auto` (experimental measured auto-tier — trials `torch.compile` in the background and commits only on a measured win; always falls back to a correct path), `torch_compile`, `cuda_graph` (GPU replay for small launch-bound programs) |
-| **`fp16` mode** | `precision="fp16"` runs image data in half precision (fp32 coordinates); opt-in, best for fp16-native pipelines |
+| **Precision** | `precision`: `fp32` (default), **`auto`** (fp16 only where it measurably wins and stays accurate — CUDA, ≥1024², smooth pointwise; measured ~1.5× on grade-class, else fp32), `fp16` (force half-precision, expert) |
+| **Debug HUD** | A per-node badge shows the tier, cook time, and precision after each run (amber on a tier fallback); toggle in Settings → TEX Debug |
+| **`tex doctor`** | An environment report (torch/CUDA, Triton, MSVC, cache, tier availability) for troubleshooting why a tier isn't engaging |
+| **Standalone CLI** | `python -m TEX_Wrangle.tex_cli run prog.tex --in a.png --out b.png` — run a program on an image file with **no ComfyUI** (torchvision-only I/O) |
 | **Two-tier caching** | In-memory LRU + disk persistence for instant re-execution — compiled objects and fused chains persist across restarts |
 | **Memory cooperation** | OOM preflight + byte-budgeted cache eviction; tile-safe programs run in strips under VRAM pressure |
 | **Cross-node fusion** | Compile a chain of linked TEX nodes into one program — only the last node cooks (opt-in via Settings → TEX Fusion). A live **preflight** flags an unfusable chain (red bubble) before you queue |
-| **143 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions |
+| **144 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions, `debug_print` |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |
 | **Snippets** | Right-click → Snippets for 114 built-in examples; save your own with folder organization |
@@ -164,7 +167,7 @@ while (val < 100.0) { val = val * 2.0; }
 | `ic` | Latent channel count (0 for images) |
 | `PI`, `TAU`, `E` | Math constants (`TAU` = 2·PI) |
 
-### Standard Library (143 functions)
+### Standard Library (144 functions)
 
 **Math:** `sin` `cos` `tan` `asin` `acos` `atan` `atan2` `sinh` `cosh` `tanh` `sqrt` `pow` `pow2` `pow10` `exp` `log` `log2` `log10` `abs` `sign` `floor` `ceil` `round` `fract` `mod` `hypot` `degrees` `radians` `spow` `sdiv` `isnan` `isinf`
 
@@ -202,6 +205,8 @@ while (val < 100.0) { val = val * 2.0; }
 **String:** `str` `len` `replace` `strip` `lower` `upper` `contains` `startswith` `endswith` `find` `substr` `to_int` `to_float` `sanitize_filename` `split` `pad_left` `pad_right` `format` `repeat` `str_reverse` `count` `matches` `hash` `hash_float` `hash_int` `char_at`
 
 **Array:** `sort` `reverse` `arr_sum` `arr_min` `arr_max` `median` `arr_avg` `len` `join`
+
+**Debugging:** `debug_print(label, value[, x, y])` — probe a value at a pixel (surfaces on the node; returns the value unchanged)
 
 ## Examples
 

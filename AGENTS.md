@@ -21,7 +21,10 @@ the **oracle** every other tier must match bit-for-bit. Full map: `ARCHITECTURE.
 | 4 | **Coordinate/spatial builtins are forced fp32** (never `self._dtype`). | The M-3 fp16 contract; fp16 coords mis-address rows at large H. | `interpreter.py` (~line 368) — do not "unify" the dtype |
 | 5 | **A non-pixel-local stdlib fn MUST be tagged** `non_local=True` in its `@stdlib(...)` decorator. | The tag *derives* `_NON_LOCAL_FNS` (default pixel-local); a missing tag is **wrong output only when tiled** (passes non-tiled tests). | TST-3 taxonomy test (derivation + name-prefix heuristic); see recipe below |
 | 6 | **GPU timing wraps `torch.cuda.synchronize()`.** | Unsynced CUDA timing measures only kernel-launch enqueue. Has bitten benchmarks before. | benchmark harness convention |
-| 7 | **Every change is behavior-preserving + perf-neutral.** | The v0.17 theme is structure, not speed. A refactor that risks bit-exactness or a hot path is a **bad trade** — see §"Trades to refuse". | full suite green + benchmark neutral |
+| 7 | **Every change is behavior-preserving + perf-neutral** on the DEFAULT path. | v0.18 adds one opt-in perf lever (`precision="auto"`, default fp32); everything else is still structure/UX. A refactor that risks bit-exactness or a hot path is a **bad trade** — see §"Trades to refuse". | full suite green + benchmark neutral |
+| 8 | **`comfy.model_management` is imported ONLY in `tex_runtime/host.py`** (PORT-1). | The host seam keeps TEX runnable host-agnostic (CLI, tests, future hosts); re-scattering the import re-couples it. | `test_port1_import_lint` |
+| 9 | **CPU↔GPU is a *characterization envelope*, not bit-parity** (same-device interp↔codegen is the only exactness contract). | Cross-device divergence is already 1.8e-7…6.1e-2; a torch/driver bump that blows a class band must be a loud decision, not silent drift. | `test_cross_device_envelope` (PR-LP1); determinism `test_determinism_pin` (PR-LP5) |
+| 10 | **`precision="auto"` never accepts an inaccurate program** (gate is static + deterministic; a NaN escapee re-cooks fp32). | The fp16 win must never cost correctness — accepted programs stay within the 8-bit quantum (3.9e-3). | gate-filtered fp16 fuzzer + 114-example sweep (PR-LP2) |
 
 ## Adding a stdlib function (the current recipe — REG-1 registry)
 
