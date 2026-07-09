@@ -5,8 +5,11 @@ from helpers import *
 import re
 
 _PKG = Path(__file__).resolve().parent.parent
-_IMPORT_RE = re.compile(r"^\s*(import\s+comfy\.model_management|from\s+comfy\.model_management)",
-                        re.M)
+_IMPORT_RE = re.compile(
+    r"^\s*(import\s+comfy\.model_management"        # import comfy.model_management [as mm]
+    r"|from\s+comfy\.model_management"              # from comfy.model_management import ...
+    r"|from\s+comfy\s+import\s+[^#\n]*\bmodel_management\b)",  # doc 33: from comfy import model_management [as mm]
+    re.M)
 
 
 def test_port1_import_lint(r: SubTestResult):
@@ -167,8 +170,11 @@ def test_port3_cli(r: SubTestResult):
         if not Path(out_png).exists() or Path(out_png).stat().st_size == 0:
             fails.append("CLI did not write a PNG")
 
-        # (c) a small corpus runs clean through the CLI core (ComfyUI-free harness)
-        for ex in ("invert.tex", "brightness_contrast.tex"):
+        # (c) a small corpus of SINGLE-input examples runs clean through the CLI core
+        # (ComfyUI-free harness). Multi-input examples (brightness_contrast wires
+        # @contrast/@exposure) now correctly error via the CLI — that path is asserted in
+        # test_port3_cli_edges (doc 33 S1), so the corpus here stays single-input.
+        for ex in ("invert.tex", "grayscale.tex"):
             p = _EX / ex
             if p.exists():
                 try:
@@ -185,6 +191,49 @@ def test_port3_cli(r: SubTestResult):
     else:
         r.ok("bit-exact uint8<->float I/O; CLI matches direct execute within 1/255; "
              "corpus runs clean" + note)
+
+
+def test_port3_cli_edges(r: SubTestResult):
+    print("\n--- PORT-3: tex run CLI edges (doc 33 B1 mask-save, S1 multi-input) ---")
+    try:
+        from torchvision.io import decode_image  # noqa: F401
+    except Exception:
+        r.ok("PORT-3 CLI edges (no torchvision, SKIPPED)")
+        return
+    from torchvision.io import decode_image
+    from TEX_Wrangle import tex_cli
+    fails = []
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        # B1: a [1,H,W] MASK output round-trips to (H,W) — NOT a width-sliced 1px garbage PNG.
+        out = tex_cli.run_program("@OUT = luma(@image);", make_img(1, 17, 23, 3, seed=2), device="cpu")
+        if out.dim() != 3:
+            fails.append(f"mask program output dim {out.dim()} (expected 3, [1,H,W])")
+        mp = str(tmp / "m.png")
+        tex_cli.save_image(out, mp)
+        mh, mw = (int(x) for x in decode_image(mp).shape[1:])
+        if (mh, mw) != (17, 23):
+            fails.append(f"mask PNG shape ({mh},{mw}) != (17,23) — B1 width-slice corruption")
+        # an IMAGE output must remain correct (no regression from the dim==3 branch)
+        ip = str(tmp / "i.png")
+        tex_cli.save_image(make_img(1, 11, 13, 3, seed=3), ip)
+        if tuple(int(x) for x in decode_image(ip).shape[1:]) != (11, 13):
+            fails.append("image PNG shape regressed")
+        # S1: a two-input program must ERROR (not silently alias @A == @B to one --in image).
+        try:
+            tex_cli.run_program("@OUT = vec4(mix(@A.rgb,@B.rgb,0.5),1.0);",
+                                make_img(1, 8, 8, 3), device="cpu")
+            fails.append("multi-input program did NOT error (silent single-image aliasing)")
+        except ValueError as e:
+            if "2 inputs" not in str(e):
+                fails.append(f"multi-input error message unclear: {e}")
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+    if fails:
+        r.fail("PORT-3 CLI edges", "; ".join(fails))
+    else:
+        r.ok("mask output round-trips to (H,W) [B1]; multi-input errors clearly [S1]")
 
 
 def test_port2_program_shape(r: SubTestResult):

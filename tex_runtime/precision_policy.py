@@ -486,12 +486,20 @@ def _has_fp16_hazard(program, out_names) -> bool:
     tainted = _image_tainted_vars(program, out_names)
     if _amplification_hazard(program, out_names):
         return True
+    user_fns = {n.name for n in _walk(program) if n.__class__.__name__ == "FunctionDef"}
     for n in _walk(program):
         cls = n.__class__.__name__
         if cls == "FunctionCall":
             if n.name in _FP16_FRAGILE_FNS:
                 return True
             if n.name in ("pow", "spow") and not _pow_is_safe(n):
+                return True
+            # F1 (doc 33): the gain forward-pass never enters user-function BODIES, so
+            # amplification assembled inside `float amp(float x){ return x*50; }` is invisible
+            # to it (the _walk-based fragile/branch checks DO descend, so those are caught).
+            # Over-decline: a user-fn call carrying image lineage -> fp32. User functions are
+            # rare in the pointwise fp16 target, so keeping the gate honest beats eligibility.
+            if n.name in user_fns and any(_reads_image(a, tainted, out_names) for a in n.args):
                 return True
         elif cls in ("IfElse", "TernaryOp", "WhileLoop"):
             return True  # a fp16 value steering control flow -> unstable output

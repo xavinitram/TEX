@@ -142,9 +142,11 @@ amplification assembled from sub-threshold steps (`sin(@A.r*3*3)`), image×image
 `/const` chains, builtin-const/dimension products (`@A.r*iw`), dot/matrix-row/length/cross
 fan-in, `fit` remaps, additive round-trips (`(@A.r+60000)-60000`), and array reductions,
 with scalar const-propagation; it declines ill-conditioned fns (tan/atan2/normalize/hypot/
-sdiv). Verified **0 accuracy violations across 225 adversarial programs (two independent
-red-team rounds) + the fuzzer** — but it is a **heuristic, not a proof** (the two rounds each
-found new classes), so a per-cook finiteness net re-cooks + pins fp32 on any non-finite
+sdiv) and **any user-function call touching image lineage** (the gain pass does not recurse
+into `FunctionDef` bodies — doc 33 F1 — so it declines rather than model them). Verified
+**0 accuracy violations across 225 direct-expression adversarial programs (two independent
+red-team rounds) + the fuzzer** — but it is a **heuristic, not a proof** (each round found
+new classes), so a per-cook finiteness net re-cooks + pins fp32 on any non-finite
 (runs EVERY fp16 cook — doc 32 C2 — never memoized). The decision (not the finiteness
 verdict) is memoized per (fingerprint, resolution-bucket, device).
 

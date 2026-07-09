@@ -375,7 +375,8 @@ class GraphedProgram:
         """Stage inputs, replay, and clone outputs out (ComfyUI caches node
         outputs while the next replay overwrites the static buffer)."""
         self._stage(bindings)
-        self.graph.replay()
+        with torch.cuda.device(self.key[1]):   # S5 (doc 33): replay on the COOK's device
+            self.graph.replay()                #   index (key[1]), not the ambient current one
         out = self.static_outputs
         if isinstance(out, dict):
             return {k: (v.clone() if isinstance(v, torch.Tensor) else v)
@@ -442,8 +443,9 @@ def _free_all_graphs() -> None:
 
 def _under_memory_pressure(device=None) -> bool:
     try:
-        # HW-2: query the COOK's device, not a bare "cuda" (device 0)
-        dev = device if device is not None else torch.device("cuda")
+        # HW-2/S4: query the COOK's device, not a bare "cuda" (device 0) — default to the
+        # ambient current device index when the caller doesn't pass one.
+        dev = device if device is not None else torch.device("cuda", torch.cuda.current_device())
         free = get_host_services().get_free_memory(dev)
         return free is not None and free < 512 * 1024 * 1024
     except Exception:

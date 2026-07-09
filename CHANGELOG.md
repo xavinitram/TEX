@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The "make it visible, make it honest, make it portable" release — it converts two cycles
 of built-but-unwired infrastructure into user-visible value, ships the one *measured*
 precision lever, fixes a memory-path safety bug, and lays the first stones of a
-host-agnostic core. Suite **1691 → 1757/1757**.
+host-agnostic core. Suite **1691 → 1761/1761**.
 
 ### Lazy input cooking
 - **Wired inputs the code cannot use are never cooked** — their whole upstream
@@ -47,10 +47,12 @@ host-agnostic core. Suite **1691 → 1757/1757**.
   quantum** — a flow-sensitive image-**gain + magnitude** analysis that declines
   amplification assembled from sub-threshold steps (`sin(@A.r*3*3)`), squaring, `/const`
   chains, builtin-dimension products (`@A.r*iw`), dot/matrix/length/cross fan-in, `fit`
-  remaps, additive round-trips, array reductions, and ill-conditioned fns (tan/atan2/
-  normalize/hypot/sdiv). **Verified 0 accuracy violations across 225 adversarial programs
-  (two independent red-team rounds) + a fuzzer** — but it is a heuristic, not a proof, so a
-  per-cook finiteness net re-cooks fp32 on any non-finite (**runs every cook**; the earlier
+  remaps, additive round-trips, array reductions, ill-conditioned fns (tan/atan2/normalize/
+  hypot/sdiv), and **any user-function call touching image lineage** (the gain pass doesn't
+  model `FunctionDef` bodies, so it declines them — doc 33 F1). **Verified 0 accuracy
+  violations across 225 *direct-expression* adversarial programs (two independent red-team
+  rounds) + a fuzzer** — but it is a heuristic, not a proof, so a per-cook finiteness net
+  re-cooks fp32 on any non-finite (**runs every cook**; the earlier
   "check once then trust the fingerprint" shipped 3.1M NaN silently when a program met a
   new input — that regression is fixed).
   **Honest perf:** through the node (`TEXWrangleNode.execute`) `auto` is essentially
@@ -97,8 +99,9 @@ host-agnostic core. Suite **1691 → 1757/1757**.
 - Cross-device parity pinned as a *characterization envelope* (there is no CPU↔GPU bit
   parity to sell — it's already 1.8e-7…6.1e-2); determinism pinned (TEX is bitwise
   run-to-run deterministic on CUDA — a free property). Both machine-checked.
-- All 143 stdlib functions carry inline `doc=`/`ex=`; the reference is generated from them.
-  AGENTS.md map-drift canary. No user-facing behavior change from these.
+- All 143 stdlib functions (144 callable names incl. the `mix`→`lerp` alias) carry inline
+  `doc=`/`ex=`; the reference is generated from them. AGENTS.md map-drift canary. No
+  user-facing behavior change from these.
 
 ## [0.17.0] - 2026-07-08
 

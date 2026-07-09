@@ -256,6 +256,10 @@ _C1_MUST_DECLINE = [
     "@OUT = vec4(fit(@A, vec3(0.49), vec3(0.51), vec3(0.0), vec3(1.0)),1.0);",       # fit VECTOR bounds
     "float a[3]; a[0]=@A.r*3.9; a[1]=@A.g*3.9; a[2]=@A.b*3.9; @OUT=vec4(vec3(sin(arr_max(a))),1.0);",  # array reduction
     "@OUT = vec4(vec3(sin((@A.r+1.0)*3.9)),1.0);",                                   # shift-then-amplify (gain 3.9)
+    # doc 33 F1 — amplification inside a user-function body (the gain pass can't see in):
+    "float amp(float x){ return x*50.0; } @OUT = vec4(vec3(amp(@A.r)), 1.0);",
+    "float amp(float x){ return x*50.0; } @OUT = vec4(vec3(sin(amp(@A.r))), 1.0);",
+    "float g(vec3 c){return dot(c,vec3(0.3,0.6,0.1));} @OUT=vec4(vec3(g(@A.rgb)*50.0),1.0);",
 ]
 # Smooth pointwise programs the gate MUST still accept (fp16) — the headline win region.
 _C1_MUST_ACCEPT = [

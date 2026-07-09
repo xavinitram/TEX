@@ -54,14 +54,21 @@ def load_image(path: str, device: str = "cpu") -> torch.Tensor:
 
 
 def save_image(tensor: torch.Tensor, path: str) -> None:
-    """[1, H, W, C] float [0,1] (or [1,H,W]) -> PNG. Round (not truncate) for a bit-exact
-    round-trip: round(u/255*255) == u."""
+    """[1, H, W, C] float [0,1] (or [1, H, W] / [H, W] mask) -> PNG. Round (not truncate)
+    for a bit-exact round-trip: round(u/255*255) == u."""
     from torchvision.io import encode_png, write_file
     t = tensor.detach().float().cpu()
-    if t.dim() == 4:
+    if t.dim() == 4:                              # [1, H, W, C] -> [H, W, C]
         t = t[0]
+    elif t.dim() == 3 and t.shape[0] == 1:        # doc 32 B1: [1, H, W] batched mask/scalar
+        t = t[0].unsqueeze(-1)                    #   -> [H, W, 1] (NOT slice the width axis)
     if t.dim() == 2:                              # [H, W] mask -> [H, W, 1]
         t = t.unsqueeze(-1)
+    if t.shape[-1] > 4:                           # a stray non-channels-last shape
+        raise ValueError(f"tex run: cannot save a tensor of shape {tuple(tensor.shape)} as a "
+                         f"PNG (expected [1,H,W,C], [1,H,W] or [H,W])")
+    if t.shape[-1] == 4:                          # doc 32 S6: 8-bit PNG has no alpha
+        print("tex run: note: dropping alpha channel (PNG output is RGB)", file=sys.stderr)
     t = t[..., :3]
     if t.shape[-1] == 1:
         t = t.expand(-1, -1, 3)
@@ -80,7 +87,15 @@ def run_program(code: str, image: torch.Tensor, device="cpu", precision="fp32",
     from .tex_compiler.types import TEXType
 
     prog = tex_compile(code, {})            # authoritative binding sets from the compiler
-    inputs = set(prog.referenced) - set(prog.assigned)
+    inputs = sorted(set(prog.referenced) - set(prog.assigned))
+    # S1 (doc 33): `tex run` has a single --in image. Binding it to EVERY referenced input
+    # would silently alias a multi-input program (@A == @B) and satisfy a typo'd @binding,
+    # bypassing the node's E6003 "not connected" guard. Refuse >1 distinct wire input.
+    if len(inputs) > 1:
+        raise ValueError(
+            f"tex run takes one --in image, but this program wires {len(inputs)} inputs "
+            f"({', '.join('@' + n for n in inputs)}). Multi-input programs need ComfyUI "
+            f"(a --bind NAME=path option is a future addition).")
     kwargs = {name: image for name in inputs}
     kwargs.update(code=code, device=device, precision=precision, compile_mode=compile_mode)
     out = TEXWrangleNode.execute(**kwargs)
@@ -134,7 +149,10 @@ def main(argv=None) -> None:
             run(args)
     except (OSError, LexerError, ParseError, TypeCheckError, TEXMultiError,
             InterpreterError, ValueError, RuntimeError) as e:
-        sys.exit(f"tex run: error: {e}")
+        # S2 (doc 33): the node appends a machine-readable "\nTEX_DIAG:{json}" blob to some
+        # errors for the frontend — strip it from the human CLI message.
+        msg = str(e).split("\nTEX_DIAG:", 1)[0].strip()
+        sys.exit(f"tex run: error: {msg}")
 
 
 if __name__ == "__main__":

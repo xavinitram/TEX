@@ -255,11 +255,21 @@ def test_dbg4_doctor(r: SubTestResult):
         if not isinstance(facts2.get("tiers"), dict) or "error" in facts2["tiers"]:
             fails.append("an unrelated fact was collateral-damaged")
 
+    # doc 33: the /tex_wrangle/doctor route serialises this payload — it must be strict JSON
+    # (no NaN/Inf/tensor/set leaking a non-conforming token to the browser).
+    import json
+    for label, payload in (("facts", facts), ("facts-under-probe-error", facts2)):
+        if payload:
+            try:
+                json.dumps(payload, allow_nan=False)
+            except (ValueError, TypeError) as e:
+                fails.append(f"{label} not strict-JSON serialisable: {type(e).__name__}: {e}")
+
     if fails:
         r.fail("DBG-4 doctor", "; ".join(fails))
     else:
         r.ok("doctor reports torch/triton/msvc/cache/tiers/recent_tiers; a throwing probe "
-             "is isolated (all keys stay, others intact) — never 500s")
+             "is isolated (all keys stay, others intact); payload is strict JSON — never 500s")
 
 
 def test_lx5_json_nan_safe(r: SubTestResult):

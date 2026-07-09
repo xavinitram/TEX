@@ -140,7 +140,7 @@ from test_v018_ux import (
 )
 from test_v018_portability import (
     test_port1_import_lint, test_port1_host_services, test_port2_facade,
-    test_port2_program_shape, test_port3_cli, test_hw2_multi_gpu_device_context,
+    test_port2_program_shape, test_port3_cli, test_port3_cli_edges, test_hw2_multi_gpu_device_context,
     test_hw4_cpu_threads, test_port3_16bit_png,
 )
 from test_v018_phase4 import (
@@ -370,6 +370,7 @@ def main():
     test_port2_facade(r)
     test_port2_program_shape(r)
     test_port3_cli(r)
+    test_port3_cli_edges(r)
     test_port3_16bit_png(r)
     test_hw2_multi_gpu_device_context(r)
     test_hw4_cpu_threads(r)
