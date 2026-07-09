@@ -14,6 +14,8 @@ threshold, e.g. `halftone`'s `smoothstep(luma(@image)+/-e, dot)`).
 Over-declining is always safe (fp32 is exact and the 1.0x baseline); the gate only ever
 declines a possible win, never accepts an inaccurate one.
 """
+import torch
+
 from ..tex_memory import is_tile_safe  # single source for pointwise-ness (M-4)
 from ..tex_compiler.ast_nodes import iter_child_nodes as _children
 
@@ -135,6 +137,32 @@ def _has_fp16_hazard(program, out_names) -> bool:
             if _reads_image(n.left, tainted, out_names) or _reads_image(n.right, tainted, out_names):
                 return True
     return False
+
+
+def apply_tf32_profile(enable: bool = True):
+    """PR-LP6 — opt-in TF32 for fp32 matmul/conv on Ampere+ (sm_80+). Returns a restore
+    callable. Default OFF. **No-op on Turing (sm_75)** — no TF32 hardware, so it's inert
+    here (verified: results bit-identical). The 1.5–2.5x Ampere claim is NOT shipped as a
+    planning input until measured on sm_80+; this ships the Turing-safe half only — a
+    profile a host/user can flip, with an honest restore. It's a *precision* trade (TF32
+    keeps run-to-run determinism), never a determinism trade."""
+    prev_mm = torch.get_float32_matmul_precision()
+    prev_cudnn = bool(getattr(torch.backends.cudnn, "allow_tf32", False))
+
+    def restore():
+        torch.set_float32_matmul_precision(prev_mm)
+        try:
+            torch.backends.cudnn.allow_tf32 = prev_cudnn
+        except Exception:
+            pass
+
+    if enable:
+        torch.set_float32_matmul_precision("high")
+        try:
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+    return restore
 
 
 def resolve_auto_precision(program, spatial_px: int, device_type: str):

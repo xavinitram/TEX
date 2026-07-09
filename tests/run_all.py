@@ -142,6 +142,10 @@ from test_v018_portability import (
     test_port2_program_shape, test_port3_cli, test_hw2_multi_gpu_device_context,
     test_hw4_cpu_threads,
 )
+from test_v018_phase4 import (
+    test_prlp6_tf32_profile, test_hw3_triton_validation_skips,
+    test_hw1_pf1_calibration_smoke,
+)
 
 
 def main():
@@ -357,6 +361,11 @@ def main():
     test_port3_cli(r)
     test_hw2_multi_gpu_device_context(r)
     test_hw4_cpu_threads(r)
+
+    # v0.18.0 Phase 4 — options & spikes
+    test_prlp6_tf32_profile(r)
+    test_hw3_triton_validation_skips(r)
+    test_hw1_pf1_calibration_smoke(r)
 
     success = r.summary()
     return 0 if success else 1
