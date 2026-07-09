@@ -199,6 +199,16 @@ _apply_cpu_threads_env()  # HW-4: opt-in, once at import
 _AUTO_DECISION: dict = {}          # (fp, px>=min, dev_type) -> (precision, reason)
 _AUTO_FINITE_OK: set = set()       # fingerprints whose fp16 output was verified finite
 _MIN_FP16_PX = 1024 * 1024
+_AUTO_CACHE_MAX = 512              # bound (audit): a long session editing code = new fp each
+
+
+def _cap_auto_caches() -> None:
+    """Keep the auto-decision memo bounded — a long editing session mints a new fingerprint
+    per code edit. Clear-on-overflow (not LRU): the decision + finiteness recompute cheaply
+    on the next cook, so the rare wholesale clear is fine."""
+    if len(_AUTO_DECISION) > _AUTO_CACHE_MAX or len(_AUTO_FINITE_OK) > _AUTO_CACHE_MAX:
+        _AUTO_DECISION.clear()
+        _AUTO_FINITE_OK.clear()
 
 
 # ── Cached interpreter (reused across executions to avoid rebuild overhead) ──
@@ -793,6 +803,10 @@ class TEXWrangleNode(_BaseClass):
             from .tex_runtime import tier_trace
             tier_trace.reset()
             fp = cache.fingerprint(code, binding_types) if not fused_chain else None
+            # cook resolution (H*W of the first spatial binding) — used by the auto gate
+            # AND the MEM-2 downshift trim; computed ONCE (audit: was scanned twice/cook).
+            cook_px = next((v.shape[1] * v.shape[2] for v in bindings.values()
+                            if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)
             auto_fp16 = False
             if precision == "auto":
                 if has_latent_input:
@@ -801,21 +815,20 @@ class TEXWrangleNode(_BaseClass):
                     precision, auto_reason = "fp32", "auto->fp32: LATENT input (stays fp32)"
                 else:
                     dev_type = torch.device(device).type
-                    spatial_px = next((v.shape[1] * v.shape[2] for v in bindings.values()
-                                       if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)
                     # B1: memoize the decision per (program, resolution-bucket, device) so
                     # the resolve_auto AST walk runs once, not per cook.
-                    ckey = (fp, spatial_px >= _MIN_FP16_PX, dev_type) if fp is not None else None
+                    ckey = (fp, cook_px >= _MIN_FP16_PX, dev_type) if fp is not None else None
                     cached = _AUTO_DECISION.get(ckey) if ckey is not None else None
                     if cached is not None:
                         precision, auto_reason = cached
                     else:
                         from .tex_runtime.precision_policy import resolve_auto_precision
-                        precision, auto_reason = resolve_auto_precision(program, spatial_px, dev_type)
+                        precision, auto_reason = resolve_auto_precision(program, cook_px, dev_type)
                         if precision == "fp16" and compile_mode != "none":
                             precision, auto_reason = "fp32", auto_reason + " [compiled tier: fp32]"
                         if ckey is not None:
                             _AUTO_DECISION[ckey] = (precision, auto_reason)
+                            _cap_auto_caches()
                     # B1: run the finiteness safety-net only on the FIRST fp16 cook of a
                     # program (fingerprint unknown, e.g. fused, always checks). Once a
                     # program's fp16 output is verified finite, trust it — the per-cook
@@ -855,6 +868,7 @@ class TEXWrangleNode(_BaseClass):
                         raw_output = {output_names[0]: raw_output}
                 elif fp is not None:
                     _AUTO_FINITE_OK.add(fp)  # verified finite; skip the sync next time
+                    _cap_auto_caches()
 
             # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
             # oldest mip/grid entries; allocate-and-hold semantics untouched).
@@ -865,10 +879,8 @@ class TEXWrangleNode(_BaseClass):
             try:
                 from .tex_memory import enforce_cache_budget, trim_reserved_pool
                 enforce_cache_budget(device)
-                # MEM-2 (B2): pass the cook size so the trim only queries the allocator
-                # after a resolution downshift (zero cost on same-size steady state).
-                cook_px = next((v.shape[1] * v.shape[2] for v in bindings.values()
-                                if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)
+                # MEM-2 (B2): the trim only queries the allocator after a resolution
+                # downshift (zero cost on same-size steady state). cook_px hoisted above.
                 trim_reserved_pool(device, cook_px)
             except Exception:
                 pass

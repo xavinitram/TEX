@@ -183,6 +183,10 @@ def lazy_required_bindings(code: str,
         if subs:
             for stmt in stmts:
                 _substitute_params(stmt, subs)
+        # fold -> propagate -> fold: the first fold turns substituted-param
+        # initializers into literals (`float k = $n * 2.0;`), propagation
+        # spreads them, the second fold collapses the now-literal conditions.
+        stmts = _fold_all(stmts)
         stmts = _propagate_literal_locals(stmts)
         stmts = _fold_all(stmts)
         stmts = _prune_static_flow(stmts)

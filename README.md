@@ -76,6 +76,7 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **Two-tier caching** | In-memory LRU + disk persistence for instant re-execution — compiled objects and fused chains persist across restarts |
 | **Memory cooperation** | OOM preflight + byte-budgeted cache eviction; tile-safe programs run in strips under VRAM pressure |
 | **Cross-node fusion** | Compile a chain of linked TEX nodes into one program — only the last node cooks (opt-in via Settings → TEX Fusion). A live **preflight** flags an unfusable chain (red bubble) before you queue |
+| **Lazy input cooking** | Wired inputs the code can't use are **never cooked upstream** — including branches disabled by a `$param` (`if ($mode > 0.5) { @OUT = @B; } else { @OUT = @A; }` cooks only the taken side). Build cheap switches that prune dead branches from the workflow. Default on (Settings → TEX Lazy) |
 | **144 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions, `debug_print` |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |

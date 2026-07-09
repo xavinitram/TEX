@@ -146,6 +146,9 @@ from test_v018_phase4 import (
     test_prlp6_tf32_profile, test_hw3_triton_validation_skips,
     test_hw1_pf1_calibration_smoke,
 )
+from test_lazy_cooking import (
+    test_lazy_analysis, test_lazy_check_status, test_lazy_execute_path,
+)
 
 
 def main():
@@ -371,6 +374,9 @@ def main():
     test_prlp6_tf32_profile(r)
     test_hw3_triton_validation_skips(r)
     test_hw1_pf1_calibration_smoke(r)
+    test_lazy_analysis(r)
+    test_lazy_check_status(r)
+    test_lazy_execute_path(r)
 
     success = r.summary()
     return 0 if success else 1

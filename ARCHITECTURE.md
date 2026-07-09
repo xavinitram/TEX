@@ -86,6 +86,37 @@ measure→trial→commit) · `torch_compile` · `cuda_graph` (GPU replay). Every
 **falls back to the interpreter** on any failure; the interpreter is the universal
 oracle and the bit-exactness reference.
 
+## Lazy input cooking (`tex_lazy.py` + the `in_N` slot pool)
+
+ComfyUI decides input laziness **per schema-declared input name at graph-build time**
+(`comfy_execution/graph.py::get_input_info` — an unknown name is never lazy), so TEX's
+dynamic user-named inputs cannot be lazy directly. The mechanism instead:
+
+1. **Schema** declares a fixed pool of lazy AnyType slots (`in_0..in_15`, hidden —
+   the frontend removes all initial slots in `onNodeCreated`).
+2. **Frontend** (`_texLazyRename`, after fusion collapse in the `graphToPrompt`
+   wrapper) renames wired user inputs onto pool slots **in the queued prompt only**
+   (graph/workflow/labels keep user names) and adds the `_tex_slot_map` constant.
+   Fail-safe: pool-name collision or >16 wires → the node stays fully eager.
+3. **`check_lazy_status`** (tex_node.py) runs `tex_lazy.lazy_required_bindings(code,
+   scalar_params)` — parse → substitute $params as fp32 literals → fold → propagate →
+   fold → prune literal-condition flow → collect surviving `@/$` references — and
+   requests only the needed slots. Uncooked slots arrive as `None`; ComfyUI re-invokes
+   iteratively, so **wired scalar $params cook first** and fold on the next round
+   (the "T4-lite" round). Unrequested slots' upstream subgraphs are **never cooked**.
+4. **`execute()`** maps cooked `in_N` values back to user names and forgives E6003
+   for references that are statically dead under the current params (same memoized
+   analysis — the two callers cannot disagree).
+
+**Safety rules (all fail toward "cook everything"):** R1 — if any spatial-capable wire
+exists, the *first* one (first-wins shape derivation, `_determine_spatial_shape`) must
+be needed and of known tensor type (IMAGE/MASK); R2 — LATENT wires always cook (they
+flip output typing/fp32); R3 — analysis failure keeps all. **Never severed:** `@A*0`
+(NaN·0=NaN; the optimizer refuses x*0→0 for shape safety), `&&`/`||` operands (the
+interpreter evaluates both sides), spatial-condition branches (torch.where computes
+both) — invariant #11. Fused chains (`_tex_chain`) request everything in v1.
+Setting: `TEX Lazy: skip cooking unused inputs` (default on).
+
 ## Precision & parity (PR-LP1)
 
 The **only** exactness contract is **interp↔codegen on the SAME device** (`tol=1e-5`
@@ -111,9 +142,10 @@ the win (~1.45× at 2048²) isn't eaten by a per-cook CUDA-sync. fp16 stays out 
 compiled/graph tiers this cycle. Reductions (`img_*`, `arr_*`) accumulate in fp32 (an fp16
 sum overflows to inf at ≥1024²).
 
-## The 13-cache architecture
+## The 14-cache architecture
 
 Non-redundant by design — each store keys on a different thing (source-hash vs
 `id()`-type_map vs device/precision tuple vs AST-fingerprint vs resolution-bucket)
 with a distinct lifecycle (persist-across-restart vs per-run-clear vs LRU). Do not
-"consolidate" them (doc 24 §6).
+"consolidate" them (doc 24 §6). #14 is `tex_lazy._memo` (code-hash × fp32 param bits →
+required-binding set; shared by `check_lazy_status` and `execute()`).

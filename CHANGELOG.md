@@ -10,7 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The "make it visible, make it honest, make it portable" release — it converts two cycles
 of built-but-unwired infrastructure into user-visible value, ships the one *measured*
 precision lever, fixes a memory-path safety bug, and lays the first stones of a
-host-agnostic core. Suite **1691 → 1726/1726**.
+host-agnostic core. Suite **1691 → 1757/1757**.
+
+### Lazy input cooking
+- **Wired inputs the code cannot use are never cooked** — their whole upstream
+  subgraphs are pruned from execution. Covers: inputs never referenced (T1),
+  references inside statically-dead flow (T2), and — the sweet spot — branches
+  disabled by a `$param` value (T3): `if ($mode > 0.5) { @OUT = @B; } else
+  { @OUT = @A; }` cooks only the taken side's upstream. **Wired scalar params
+  cook first and fold on the next round** (iterative `check_lazy_status`), so a
+  param fed by a Primitive node still prunes image branches ("T4-lite").
+- Mechanism: ComfyUI only honours `lazy` on schema-declared input names, so the
+  schema declares a hidden pool of lazy AnyType slots (`in_0..in_15`); the
+  frontend maps wired user inputs onto them **in the queued prompt only**
+  (`_tex_slot_map`) — workflows, slots, and labels keep user names. New module
+  `tex_lazy.py` (analysis: substitute $params as fp32 literals → fold →
+  propagate → fold → prune literal-condition flow → collect survivors; memoized,
+  cache #14). Setting: **TEX Lazy: skip cooking unused inputs** (default on).
+- Deliberately NEVER severed (correctness): `@A * 0.0` (NaN·0 = NaN), `&&`/`||`
+  operands (both sides always evaluate), spatial per-pixel conditions
+  (torch.where computes both branches), string-param conditions (never fold).
+  Safety rails: the first spatial wire (the first-wins shape anchor) must
+  survive or nothing is skipped; LATENT wires always cook (they flip output
+  typing/fp32); any analysis failure cooks everything. Fused chains skip
+  nothing in v1. Full T4 (conditions on *image* values) is deferred by design.
+- Behaviour notes: a `@ref` that is statically dead under the current params no
+  longer raises E6003 *when queued through the lazy path* (it is dead code);
+  the legacy path (no slot map — old prompts, direct API calls) is byte-for-byte
+  unchanged. `fingerprint_inputs` hashes the slot map, so remapping busts the
+  cache correctly.
 
 ### Precision
 - **`precision="auto"`** — a new mode that runs **fp16 only where it measurably wins and

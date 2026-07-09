@@ -2575,6 +2575,56 @@ app.registerExtension({
     // Since TEX params are dynamic (parsed from code), they aren't in the schema.
     // This hook adds their widget values so accept_all_inputs passes them to execute().
     setup() {
+        // Lazy input cooking: ComfyUI only honours `lazy` on schema-declared
+        // input names, so wired user inputs are renamed onto the schema's
+        // lazy slot pool (in_0..in_15) IN THE QUEUED PROMPT ONLY — the graph,
+        // saved workflow, slots, and labels all keep the user names. The
+        // `_tex_slot_map` constant lets the backend map values back and
+        // drives check_lazy_status. Runs AFTER fusion collapse so it maps
+        // the post-collapse wiring. Fail-safe: on any doubt (pool-name
+        // collision, >16 wires) inputs stay user-named and simply cook
+        // eagerly, exactly as before v0.18.
+        const TEX_SYS_INPUTS = new Set([
+            "code", "device", "compile_mode", "precision",
+            "debug_nan_highlight", "_tex_any", "_tex_chain",
+            "_tex_preview", "_tex_slot_map",
+        ]);
+        function _texLazyRename(result) {
+            if (!app.ui.settings.getSettingValue("TEX.Lazy.enabled", true)) return;
+            for (const [nodeId, nodeData] of Object.entries(result.output)) {
+                if (nodeData.class_type !== TEX_NODE_TYPE) continue;
+                const node = app.graph.getNodeById(parseInt(nodeId));
+                if (!node) continue;
+                // Collision guard: a user input literally named like a pool
+                // slot would collide after renaming — leave the node eager.
+                const names = (node.inputs || []).map(i => i?.name).filter(Boolean);
+                if (names.some(n => /^in_\d+$/.test(n))) continue;
+                const map = [];
+                let idx = 0;
+                for (const input of node.inputs || []) {
+                    if (idx >= 16) break; // pool size; extras stay eager
+                    const name = input?.name;
+                    if (!name || TEX_SYS_INPUTS.has(name)) continue;
+                    const val = nodeData.inputs[name];
+                    // Only wired links ([nodeId, slotIdx] arrays) move to the
+                    // pool; widget constants keep their user names.
+                    if (!Array.isArray(val)) continue;
+                    const slot = `in_${idx++}`;
+                    nodeData.inputs[slot] = val;
+                    delete nodeData.inputs[name];
+                    let t = input.type || "*";
+                    if (input.link != null) {
+                        const link = app.graph.links[input.link];
+                        if (link?.type) t = link.type;
+                    }
+                    map.push({ name, slot, type: String(t) });
+                }
+                if (map.length) {
+                    nodeData.inputs._tex_slot_map = JSON.stringify(map);
+                }
+            }
+        }
+
         const origGraphToPrompt = app.graphToPrompt;
         app.graphToPrompt = async function (...args) {
             const result = await origGraphToPrompt.apply(this, args);
@@ -2596,6 +2646,10 @@ app.registerExtension({
                 // produces a prompt with a dangling reference).
                 try { _texCollapseChains(result); }
                 catch (e) { console.warn("[TEX] fusion collapse skipped", e); }
+                // Lazy input cooking (gated by TEX.Lazy.enabled; fail-safe —
+                // any error leaves the prompt user-named and fully eager).
+                try { _texLazyRename(result); }
+                catch (e) { console.warn("[TEX] lazy rename skipped", e); }
             }
             return result;
         };
@@ -2644,6 +2698,18 @@ app.registerExtension({
                 _texFontSize = val;
                 _updateDynStyles();
             },
+        });
+
+        // Lazy input cooking toggle (see _texLazyRename)
+        app.ui.settings.addSetting({
+            id:           "TEX.Lazy.enabled",
+            name:         "TEX Lazy: Skip cooking unused inputs",
+            type:         "boolean",
+            defaultValue: true,
+            tooltip:      "When TEX code doesn't use a wired input (including " +
+                          "branches disabled by a $param), the upstream nodes " +
+                          "feeding it are never cooked. Disable to always cook " +
+                          "every wired input.",
         });
 
         // Line-number gutter toggle
