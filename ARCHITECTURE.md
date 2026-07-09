@@ -86,6 +86,31 @@ measure→trial→commit) · `torch_compile` · `cuda_graph` (GPU replay). Every
 **falls back to the interpreter** on any failure; the interpreter is the universal
 oracle and the bit-exactness reference.
 
+## Precision & parity (PR-LP1)
+
+The **only** exactness contract is **interp↔codegen on the SAME device** (`tol=1e-5`
+fp32) — invariant #2. **CPU↔GPU bit-parity does not exist and is not sold**: measured
+fp32 cross-device divergence is already 1.8e-7 (pointwise) → 7.9e-5 (grid_sample) → 6.1e-2
+(scatter, where a coordinate-rounding ULP legally moves a whole deposit to a neighbouring
+pixel — structurally benign, numerically large). Instead a **characterization envelope**
+(`tests/test_cross_device_envelope.py`) pins each program class inside its measured band,
+so a torch/driver bump that blows a band is a loud, recorded decision, not silent drift.
+
+**Determinism is a free, marketed property**: TEX is bitwise run-to-run deterministic on
+CUDA across every class incl. scatter atomics under collision stress; forcing strict
+determinism would *cost* 1.48× on scatter, so TEX already rides the fast path
+(`tests/test_determinism_pin.py`). The CPU is the honest caveat (~5.5e-6 threaded-accumulation
+variance).
+
+**`precision="auto"`** (PR-LP2) resolves to fp16 only in the measured win region — CUDA,
+≥1024², a smooth pointwise program (no sampling/scatter/reduction, no discontinuous/domain
+function, no data branch, no image-derived threshold; `tex_runtime/precision_policy.py`).
+The decision is memoized per (fingerprint, resolution-bucket, device); a first-cook
+finiteness check re-cooks + pins fp32 on any NaN, then trusts the verified fingerprint — so
+the win (~1.45× at 2048²) isn't eaten by a per-cook CUDA-sync. fp16 stays out of the
+compiled/graph tiers this cycle. Reductions (`img_*`, `arr_*`) accumulate in fp32 (an fp16
+sum overflows to inf at ≥1024²).
+
 ## The 13-cache architecture
 
 Non-redundant by design — each store keys on a different thing (source-hash vs

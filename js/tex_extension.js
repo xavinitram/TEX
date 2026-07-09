@@ -31,6 +31,21 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+// DBG-4: expose the `tex doctor` environment report from the browser console —
+// `await texDoctor()` fetches /tex_wrangle/doctor and logs torch/CUDA/Triton/MSVC/cache/
+// tier facts. The minimal API-accessible surface the plan called for (a full panel is a
+// live-session follow-up); the route itself is tested + never-500.
+globalThis.texDoctor = async function () {
+    try {
+        const resp = await api.fetchApi("/tex_wrangle/doctor");
+        const facts = await resp.json();
+        console.log("[TEX doctor]", facts);
+        return facts;
+    } catch (e) {
+        console.warn("[TEX doctor] route unavailable:", e);
+    }
+};
+
 const TEX_NODE_TYPE = "TEX_Wrangle";
 // Resolve font URL at module scope where import.meta.url is reliable
 const TEX_FONT_URL = (() => {

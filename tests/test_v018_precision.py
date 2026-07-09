@@ -54,6 +54,65 @@ def test_prlp4_fp16_safe_reductions(r: SubTestResult):
         r.ok(f"all {len(fns)} reductions fp16-finite+fp32 (interp); codegen mirrors .float()")
 
 
+def test_prlp4_arr_reductions_fp16_safe(r: SubTestResult):
+    print("\n--- PR-LP4: arr_* reductions fp32-accumulate (audit) ---")
+    from failure_harness import run_tier, max_diff
+    binds = {"A": make_img(1, 8, 8, 3, seed=1)}
+    # 20-element array of 5000 -> sum 1e5 > fp16 max 65504: arr_sum/arr_avg overflow in
+    # fp16 without the .float() accumulate. The auto gate ACCEPTS such a program (arrays
+    # are tile-safe, arr_* not fragile), so the overflow must be fixed, not just caught.
+    fails = []
+    for name in ("arr_sum", "arr_avg", "arr_min", "arr_max", "median"):
+        code = (f"float arr[20]; for(int i=0;i<20;i++){{ arr[i]=5000.0; }} "
+                f"@OUT = vec4(vec3({name}(arr) * 0.00001), 1.0);")
+        for tier in ("interp", "codegen"):
+            try:
+                out = run_tier(code, binds, tier, precision="fp16")
+                t = next(v for v in out.values() if isinstance(v, torch.Tensor))
+                if not torch.isfinite(t).all():
+                    fails.append(f"{name}/{tier} fp16 non-finite (overflow)")
+            except Exception as e:
+                fails.append(f"{name}/{tier}: {type(e).__name__}: {e}")
+        try:
+            a = run_tier(code, binds, "interp", precision="fp32")
+            c = run_tier(code, binds, "codegen", precision="fp32")
+            if max_diff(a, c) > 1e-5:
+                fails.append(f"{name} fp32 interp!=codegen {max_diff(a, c):.2e}")
+        except Exception as e:
+            fails.append(f"{name} fp32 parity: {e}")
+    if fails:
+        r.fail("PR-LP4 arr_* fp16", "; ".join(fails))
+    else:
+        r.ok("all 5 arr_* reductions fp16-finite (interp+codegen) + fp32 bit-exact")
+
+
+def test_prlp2_node_path_perf(r: SubTestResult):
+    print("\n--- PR-LP2: precision=auto node-path speedup (H7 / audit B1) ---")
+    if not torch.cuda.is_available():
+        r.ok("PR-LP2 node-path perf (no GPU, SKIPPED)")
+        return
+    import importlib.util
+    bench = Path(__file__).resolve().parent.parent / "benchmarks" / "prlp2_node_path.py"
+    spec = importlib.util.spec_from_file_location("prlp2_node_path", bench)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    # Substantiates the CHANGELOG claim on the REAL path (TEXWrangleNode.execute), not
+    # Interpreter.execute. Thresholds are drift-robust (measured after B1: 1.33x@1024,
+    # 1.45x@2048): >=0.9x@1024 catches a re-introduced regression (the B1 bug was 0.79x);
+    # >=1.15x@2048 asserts a genuine speedup (20% margin under the measured 1.45x).
+    fails = []
+    for res, floor in ((1024, 0.9), (2048, 1.15)):
+        f32 = mod._time(res, "fp32", iters=15)
+        auto = mod._time(res, "auto", iters=15)
+        speedup = f32 / auto
+        if speedup < floor:
+            fails.append(f"{res}²: auto {speedup:.2f}× < {floor}× (node-path B1 regression)")
+    if fails:
+        r.fail("PR-LP2 node-path perf", "; ".join(fails))
+    else:
+        r.ok("precision=auto is a node-path speedup (>=0.9x@1024, >=1.15x@2048) — not the "
+             "0.79x/1.02x pre-B1 regression")
+
+
 def _resolve(code, px=2048 * 2048, dev="cuda"):
     prog = Parser(Lexer(code).tokenize(), source=code).parse()
     return resolve_auto_precision(prog, px, dev)

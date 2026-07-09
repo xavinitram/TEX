@@ -209,10 +209,15 @@ def _entry_pinned(entry, extract, pinned) -> bool:
 
 def _oldest_unpinned_key(cache, extract, pinned, dev_type=None):
     """The oldest key in `cache` whose entry isn't graph-pinned and (MEM-4) is on
-    `dev_type`, never the most-recent entry (kept so the current cook's working set
-    survives). None if none qualify."""
-    newest = next(reversed(cache), None)
-    for k in cache:  # OrderedDict iterates oldest -> newest
+    `dev_type`, never the most-recent entry OF THAT dev_type (kept so the current cook's
+    working set survives). None if none qualify. (Audit: `newest` must be scoped to
+    `dev_type` — a global newest let a CPU sweep evict the newest CUDA entry, defeating
+    the per-device isolation MEM-4 adds.)"""
+    newest = None
+    for k in cache:  # oldest -> newest; the LAST matching entry is the newest of dev_type
+        if dev_type is None or _entry_dev_type(cache[k], extract) == dev_type:
+            newest = k
+    for k in cache:
         if k == newest:
             continue
         if dev_type is not None and _entry_dev_type(cache[k], extract) != dev_type:
@@ -254,23 +259,42 @@ def enforce_cache_budget(device) -> None:
         pass
 
 
-def trim_reserved_pool(device) -> None:
+# MEM-2 (audit B2): per-device last-seen spatial pixel count + cached total VRAM, so the
+# allocator is queried ONLY after a resolution downshift — not on every cook.
+_last_trim_px: dict = {}
+_total_mem_cache: dict = {}
+
+
+def trim_reserved_pool(device, spatial_px: int = 0) -> None:
     """MEM-2: return stranded reserved VRAM after a big->small cook downshift. When the
     caching allocator holds far more reserved than is live (measured: a 512->4096->512
     sequence stranded 1551 MB), a threshold-gated `empty_cache()` reclaims it (measured
-    3.4 ms, +0.09 ms next-cook tax). Threshold-gated so it NEVER fires at steady state;
-    CUDA-only; `TEX_NO_POOL_TRIM=1` disables. Safe with live captured graphs — their
-    pool blocks are in-use, so empty_cache leaves them intact."""
+    3.4 ms, +0.09 ms next-cook tax).
+
+    B2 fix: the allocator query is gated on a **resolution downshift** (spatial_px < the
+    previous cook's) — the only case the reclaim targets. Same-size / upshift steady state
+    pays NOTHING (the old always-on `memory_reserved`+`memory_allocated`+`get_device_
+    properties` query was a measured +48% tax on tiny fp32 cooks). CUDA-only; total VRAM is
+    cached per device; `TEX_NO_POOL_TRIM=1` disables. Safe with live captured graphs."""
     if os.environ.get("TEX_NO_POOL_TRIM") == "1":
         return
     dev = torch.device(device) if not isinstance(device, torch.device) else device
     if dev.type != "cuda":
         return
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    prev = _last_trim_px.get(idx, 0)
+    if spatial_px:
+        _last_trim_px[idx] = spatial_px
+    # only a genuine downshift warrants an allocator query
+    if not spatial_px or spatial_px >= prev:
+        return
     try:
-        idx = dev.index if dev.index is not None else torch.cuda.current_device()
         reserved = torch.cuda.memory_reserved(idx)
         allocated = torch.cuda.memory_allocated(idx)
-        total = torch.cuda.get_device_properties(idx).total_memory
+        total = _total_mem_cache.get(idx)
+        if total is None:
+            total = torch.cuda.get_device_properties(idx).total_memory
+            _total_mem_cache[idx] = total
         if reserved - allocated > max(1024 * 1024 * 1024, total // 8):
             torch.cuda.empty_cache()
     except Exception:

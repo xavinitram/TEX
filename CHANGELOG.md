@@ -16,9 +16,11 @@ host-agnostic core. Suite **1691 → 1726/1726**.
 - **`precision="auto"`** — a new mode that runs **fp16 only where it measurably wins and
   stays accurate**: CUDA, ≥1024×1024, smooth pointwise programs (no sampling, scatter,
   reduction, discontinuous/domain functions, data branches, or image-derived thresholds).
-  Measured **1.51× at 2048²** on grade-class chains; every other program runs fp32. A
-  runtime finiteness fallback re-cooks fp32 on any NaN. Verified 0 accuracy violations
-  across all 114 examples. Gated by the v0.17 `@stdlib` registry tags.
+  Measured **≈1.45× at 2048² / 1.33× at 1024²** on grade-class chains through the node
+  (`TEXWrangleNode.execute`); every other program runs fp32. A first-cook finiteness check
+  re-cooks (and pins) fp32 on any NaN, then trusts the verified fingerprint — so the win
+  isn't eaten by a per-cook sync. Verified 0 accuracy violations across all 114 examples.
+  Gated by the v0.17 `@stdlib` registry tags.
 - **fp16-safe reductions** — `img_sum`/`mean`/`min`/`max`/`median` now accumulate in fp32
   (an fp16 sum overflowed to inf at ≥1024²); bit-identical on fp32.
 - **TF32 profile** (`apply_tf32_profile`) — opt-in, default OFF, no-op on Turing.

@@ -1923,31 +1923,31 @@ class TEXStdlib:
     @staticmethod
     def fn_arr_sum(arr) -> torch.Tensor:
         """Sum all elements of an array. Returns scalar (or vec) per pixel."""
-        return _reduce_channels(_to_tensor(arr), lambda t, d: t.sum(dim=d))
+        return _reduce_channels(_to_tensor(arr).float(), lambda t, d: t.sum(dim=d))
 
     @stdlib("arr_min", doc='Minimum value in array.', ex='float lo = arr_min(arr);')
     @staticmethod
     def fn_arr_min(arr) -> torch.Tensor:
         """Minimum element of an array per channel. Returns scalar (or vec) per pixel."""
-        return _reduce_channels(_to_tensor(arr), lambda t, d: t.min(dim=d).values)
+        return _reduce_channels(_to_tensor(arr).float(), lambda t, d: t.min(dim=d).values)
 
     @stdlib("arr_max", doc='Maximum value in array.', ex='float hi = arr_max(arr);')
     @staticmethod
     def fn_arr_max(arr) -> torch.Tensor:
         """Maximum element of an array per channel. Returns scalar (or vec) per pixel."""
-        return _reduce_channels(_to_tensor(arr), lambda t, d: t.max(dim=d).values)
+        return _reduce_channels(_to_tensor(arr).float(), lambda t, d: t.max(dim=d).values)
 
     @stdlib("median", doc='Median value of array.', ex='float mid = median(arr);')
     @staticmethod
     def fn_median(arr) -> torch.Tensor:
         """Median element of an array per channel. Returns scalar (or vec) per pixel."""
-        return _reduce_channels(_to_tensor(arr), lambda t, d: torch.median(t, dim=d).values)
+        return _reduce_channels(_to_tensor(arr).float(), lambda t, d: torch.median(t, dim=d).values)
 
     @stdlib("arr_avg", doc='Average of all array elements.', ex='float avg = arr_avg(arr);')
     @staticmethod
     def fn_arr_avg(arr) -> torch.Tensor:
         """Average of array elements per channel. Returns scalar (or vec) per pixel."""
-        return _reduce_channels(_to_tensor(arr), lambda t, d: t.mean(dim=d))
+        return _reduce_channels(_to_tensor(arr).float(), lambda t, d: t.mean(dim=d))
 
     @stdlib("join", doc='Concatenate string array with separator.', ex='string csv = join(names, ", ");')
     @staticmethod
@@ -2026,6 +2026,15 @@ class TEXStdlib:
         list (folded into the ui= HUD payload) and returns `value` UNCHANGED so @OUT is
         bit-identical with or without the probe. torch-native readout, no numpy."""
         from . import tier_trace
+        import math
+
+        def _json_safe(v):
+            # audit: a NaN/Inf probe would serialize as a bare NaN/Infinity token — invalid
+            # JSON that breaks the ui= websocket frame. Map non-finite floats to None (null).
+            if isinstance(v, list):
+                return [_json_safe(x) for x in v]
+            return None if isinstance(v, float) and not math.isfinite(v) else v
+
         try:
             xi = int(x.item()) if isinstance(x, torch.Tensor) else int(x)
             yi = int(y.item()) if isinstance(y, torch.Tensor) else int(y)
@@ -2037,7 +2046,7 @@ class TEXStdlib:
                 recorded = value.detach().float().reshape(-1)[:4].tolist()
             else:
                 recorded = float(value)
-            tier_trace.record_probe(label, recorded, xi, yi)
+            tier_trace.record_probe(label, _json_safe(recorded), xi, yi)
         except Exception:
             pass
         return value

@@ -694,20 +694,25 @@ def _contiguous_bindings(bindings: dict) -> dict:
     return {k: _norm(v) for k, v in bindings.items()}
 
 
-def _cuda_headroom_ok(device_type: str) -> bool:
+def _cuda_headroom_ok(device) -> bool:
     """Only submit a background CUDA compile with comfortable VRAM headroom, so
-    a compile never allocates while another node's inference needs the memory."""
-    if device_type != "cuda":
+    a compile never allocates while another node's inference needs the memory.
+    HW-2 (audit): query the COOK's device index, not a bare "cuda" (device 0) —
+    a cuda:1 cook mis-reads GPU 0's headroom otherwise. Single-GPU unaffected."""
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type != "cuda":
         return True
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
     try:
         from .host import get_host_services  # PORT-1 seam
-        free = get_host_services().get_free_memory(torch.device("cuda"))
+        free = get_host_services().get_free_memory(torch.device("cuda", idx))
         if free is None:
             raise RuntimeError("no host free-memory query")
         return free > 2 * 1024 * 1024 * 1024  # >2 GB
     except Exception:
         try:
-            free, _total = torch.cuda.mem_get_info()
+            with torch.cuda.device(idx):
+                free, _total = torch.cuda.mem_get_info()
             return free > 2 * 1024 * 1024 * 1024
         except Exception:
             return True
@@ -859,7 +864,7 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     res, ms = _timed(lambda: _codegen(bindings), device_type)
     autotier.record_interp(key, ms)
     if state == autotier.MEASURING and autotier.should_submit_compile(key):
-        if _cuda_headroom_ok(device_type) and not _capture_in_flight():
+        if _cuda_headroom_ok(device) and not _capture_in_flight():
             if _submit_bg_compile(cache_key, program, type_map, device_type,
                                   used_builtins, precision, fingerprint):
                 autotier.mark_submitted(key)

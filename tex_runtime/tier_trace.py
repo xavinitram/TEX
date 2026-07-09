@@ -81,6 +81,12 @@ def get_probes():
     return getattr(_local, "probes", None) or []
 
 
+def clear_probes():
+    """Drop this thread's probes without touching the tier/precision record — used before
+    an auto fp16->fp32 re-cook so the discarded cook's probes don't duplicate (audit)."""
+    _local.probes = []
+
+
 def reset():
     """Clear this thread's record (tests call this before a cook to detect a
     tier that silently didn't run at all)."""

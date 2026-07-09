@@ -126,8 +126,8 @@ from test_cross_device_envelope import test_prlp1_cross_device_envelope
 from test_determinism_pin import test_prlp5_determinism_pin
 from test_v018_docs import test_doc7b_map_drift, test_reg1b_doc_ex_populated
 from test_v018_precision import (
-    test_prlp4_fp16_safe_reductions, test_prlp2_auto_gate,
-    test_prlp2_fp16_accuracy_fuzzer,
+    test_prlp4_fp16_safe_reductions, test_prlp4_arr_reductions_fp16_safe,
+    test_prlp2_auto_gate, test_prlp2_fp16_accuracy_fuzzer, test_prlp2_node_path_perf,
 )
 from test_v018_memory import (
     test_mem2_pool_trim_gating, test_mem3_fp16_estimator, test_mem4_per_device_budget,
@@ -135,12 +135,12 @@ from test_v018_memory import (
 from test_v018_ux import (
     test_dbg1_perf_hud_payload, test_ux1_diagnostics_reachability,
     test_dbg3_nan_overlay, test_lx5_debug_print, test_dbg4_doctor,
-    test_ux2_tooltip_honesty,
+    test_ux2_tooltip_honesty, test_lx5_json_nan_safe, test_dbg1_nan_fingerprint,
 )
 from test_v018_portability import (
     test_port1_import_lint, test_port1_host_services, test_port2_facade,
     test_port2_program_shape, test_port3_cli, test_hw2_multi_gpu_device_context,
-    test_hw4_cpu_threads,
+    test_hw4_cpu_threads, test_port3_16bit_png,
 )
 from test_v018_phase4 import (
     test_prlp6_tf32_profile, test_hw3_triton_validation_skips,
@@ -339,8 +339,10 @@ def main():
 
     # v0.18.0 Phase 1 — precision core
     test_prlp4_fp16_safe_reductions(r)
+    test_prlp4_arr_reductions_fp16_safe(r)
     test_prlp2_auto_gate(r)
     test_prlp2_fp16_accuracy_fuzzer(r)
+    test_prlp2_node_path_perf(r)
     test_mem2_pool_trim_gating(r)
     test_mem3_fp16_estimator(r)
     test_mem4_per_device_budget(r)
@@ -352,6 +354,8 @@ def main():
     test_lx5_debug_print(r)
     test_dbg4_doctor(r)
     test_ux2_tooltip_honesty(r)
+    test_lx5_json_nan_safe(r)
+    test_dbg1_nan_fingerprint(r)
 
     # v0.18.0 Phase 3 — portability + hardware
     test_port1_import_lint(r)
@@ -359,6 +363,7 @@ def main():
     test_port2_facade(r)
     test_port2_program_shape(r)
     test_port3_cli(r)
+    test_port3_16bit_png(r)
     test_hw2_multi_gpu_device_context(r)
     test_hw4_cpu_threads(r)
 

@@ -6,54 +6,79 @@ from TEX_Wrangle import tex_memory as MEM
 
 
 def test_mem2_pool_trim_gating(r: SubTestResult):
-    print("\n--- MEM-2: threshold-gated reserved-pool trim ---")
+    print("\n--- MEM-2: downshift-gated reserved-pool trim (B2) ---")
+    import types
+    import os
     fails = []
-    # CPU is always a no-op (never raises).
     try:
-        MEM.trim_reserved_pool("cpu")
+        MEM.trim_reserved_pool("cpu", 512 * 512)  # CPU is always a no-op
     except Exception as e:
         fails.append(f"cpu path raised: {e}")
 
-    # Gating logic — monkeypatch the CUDA memory stats so we don't allocate GBs.
-    import types
-    calls = {"n": 0}
+    # Count BOTH allocator queries and empty_cache — the B2 fix is that same-size steady
+    # state does ZERO allocator queries (the +48% tax was the always-on query).
+    q = {"reserved": 0, "empty": 0}
     real = {k: getattr(torch.cuda, k, None) for k in
             ("memory_reserved", "memory_allocated", "get_device_properties",
              "empty_cache", "current_device")}
     try:
         torch.cuda.current_device = lambda: 0
         torch.cuda.get_device_properties = lambda i: types.SimpleNamespace(total_memory=8 * 1024**3)
-        torch.cuda.empty_cache = lambda: calls.__setitem__("n", calls["n"] + 1)
+        torch.cuda.empty_cache = lambda: q.__setitem__("empty", q["empty"] + 1)
 
         def _set(reserved_gb, alloc_gb):
-            torch.cuda.memory_reserved = lambda i=0: int(reserved_gb * 1024**3)
+            def _mr(i=0):
+                q["reserved"] += 1
+                return int(reserved_gb * 1024**3)
+            torch.cuda.memory_reserved = _mr
             torch.cuda.memory_allocated = lambda i=0: int(alloc_gb * 1024**3)
 
-        # under threshold (reserved-allocated = 0.5 GB < max(1GB,12.5%*8GB=1GB)) -> no trim
-        calls["n"] = 0; _set(1.0, 0.5); MEM.trim_reserved_pool(torch.device("cuda:0"))
-        if calls["n"] != 0:
-            fails.append("trimmed under threshold (should be gated off)")
-        # over threshold (reserved-allocated = 1.5 GB > 1 GB) -> trim fires
-        calls["n"] = 0; _set(1.7, 0.2); MEM.trim_reserved_pool(torch.device("cuda:0"))
-        if calls["n"] != 1:
-            fails.append("did NOT trim when stranded > threshold")
-        # kill switch
-        import os
-        calls["n"] = 0; os.environ["TEX_NO_POOL_TRIM"] = "1"
-        _set(1.7, 0.2); MEM.trim_reserved_pool(torch.device("cuda:0"))
+        MEM._last_trim_px.clear(); MEM._total_mem_cache.clear()
+        _set(1.7, 0.2)  # 1.5 GB stranded (> the 1 GB threshold) — always over
+
+        # (1) first cook @512² (prev=0, not a downshift) -> NO allocator query
+        q["reserved"] = q["empty"] = 0
+        MEM.trim_reserved_pool(torch.device("cuda:0"), 512 * 512)
+        if q["reserved"] != 0 or q["empty"] != 0:
+            fails.append("first (non-downshift) cook queried/trimmed")
+        # (2) same-size steady state @512² -> STILL no allocator query (the B2 win)
+        q["reserved"] = q["empty"] = 0
+        MEM.trim_reserved_pool(torch.device("cuda:0"), 512 * 512)
+        if q["reserved"] != 0:
+            fails.append("same-size cook queried the allocator (B2 regression not fixed)")
+        # (3) DOWNSHIFT @256² -> queries + trims (stranded > threshold)
+        q["reserved"] = q["empty"] = 0
+        MEM.trim_reserved_pool(torch.device("cuda:0"), 256 * 256)
+        if q["reserved"] == 0:
+            fails.append("downshift did not query the allocator")
+        if q["empty"] != 1:
+            fails.append("downshift over-threshold did not trim")
+        # (4) downshift but UNDER threshold -> query, no trim
+        MEM._last_trim_px[0] = 512 * 512
+        _set(1.0, 0.5)  # 0.5 GB stranded < 1 GB
+        q["empty"] = 0
+        MEM.trim_reserved_pool(torch.device("cuda:0"), 256 * 256)
+        if q["empty"] != 0:
+            fails.append("trimmed under threshold")
+        # (5) kill switch
+        MEM._last_trim_px[0] = 512 * 512
+        _set(1.7, 0.2)
+        os.environ["TEX_NO_POOL_TRIM"] = "1"; q["empty"] = 0
+        MEM.trim_reserved_pool(torch.device("cuda:0"), 256 * 256)
         os.environ.pop("TEX_NO_POOL_TRIM", None)
-        if calls["n"] != 0:
+        if q["empty"] != 0:
             fails.append("TEX_NO_POOL_TRIM=1 did not disable the trim")
     finally:
         for k, v in real.items():
             if v is not None:
                 setattr(torch.cuda, k, v)
+        MEM._last_trim_px.clear(); MEM._total_mem_cache.clear()
 
     if fails:
         r.fail("MEM-2 pool trim", "; ".join(fails))
     else:
-        r.ok("trim gated off under threshold, fires when stranded > max(1GB,12.5%), "
-             "kill switch honored, CPU no-op")
+        r.ok("same-size steady state does 0 allocator queries; downshift queries + trims "
+             "over threshold; under-threshold + kill-switch honored; CPU no-op")
 
 
 def test_mem3_fp16_estimator(r: SubTestResult):
@@ -99,6 +124,27 @@ def test_mem4_per_device_budget(r: SubTestResult):
         cpu_left = sum(1 for k in SL._mip_cache if k[0] == "cpu")
         if cpu_left > 1:
             fails.append(f"CPU entries not evicted under CPU budget ({cpu_left} left)")
+
+        # skip-newest scoping (audit): with the CUDA entry inserted LAST (the GLOBAL
+        # newest), a CPU sweep must still protect its OWN newest CPU entry — the old
+        # global `newest` let it evict ("cpu", 3), defeating the isolation.
+        MEM.free_tensor_caches()
+        for s in range(4):
+            SL._mip_cache[("cpu", s)] = ((1, 512, 512), torch.zeros(512, 512, 3),
+                                         [torch.zeros(256, 256, 3)])
+        SL._mip_cache[("cuda_newest",)] = ((1, 512, 512),
+                                           torch.zeros(512, 512, 3, device="cuda"),
+                                           [torch.zeros(256, 256, 3, device="cuda")])
+        os.environ["TEX_CACHE_BUDGET_MB"] = "1"
+        try:
+            MEM.enforce_cache_budget("cpu")
+        finally:
+            if saved is None: os.environ.pop("TEX_CACHE_BUDGET_MB", None)
+            else: os.environ["TEX_CACHE_BUDGET_MB"] = saved
+        if ("cpu", 3) not in SL._mip_cache:
+            fails.append("CPU sweep evicted its OWN newest entry (skip-newest not dev-scoped)")
+        if ("cuda_newest",) not in SL._mip_cache:
+            fails.append("CPU sweep evicted the CUDA entry")
     except Exception as e:
         fails.append(f"{type(e).__name__}: {e}")
     finally:

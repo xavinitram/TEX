@@ -612,8 +612,8 @@ class Parser:
                        else "")
             self.expect(
                 TokenType.SEMI,
-                f"'{expr.name}' isn't a TEX type." if ft_hint
-                else "It looks like there's a missing semicolon after this expression",
+                f"'{expr.name}' isn't a TEX type" if ft_hint  # no trailing '.' — expect()
+                else "It looks like there's a missing semicolon after this expression",  # appends ", but found …"
                 code="E2010", hint=ft_hint or "Every statement in TEX ends with `;`.")
         return ExprStatement(loc=loc, expr=expr)
 

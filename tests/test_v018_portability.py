@@ -234,11 +234,55 @@ def test_hw2_multi_gpu_device_context(r: SubTestResult):
     if 1 not in entered:
         fails.append(f"recovery did not target device index 1 (targets: {set(entered)})")
 
+    # (c) _cuda_headroom_ok now accepts a full device (queries the cook's index, not GPU 0)
+    from TEX_Wrangle.tex_runtime.compiled import _cuda_headroom_ok
+    if _cuda_headroom_ok("cpu") is not True:
+        fails.append("_cuda_headroom_ok('cpu') should be True")
+    if not isinstance(_cuda_headroom_ok(torch.device("cuda:0")), bool):
+        fails.append("_cuda_headroom_ok(device) did not accept a full device")
+
     if fails:
         r.fail("HW-2 multi-GPU", "; ".join(fails))
     else:
-        r.ok("capture key carries device index; RNG-recovery pins the cook's device "
-             "(index-0 paths unchanged on a single GPU)")
+        r.ok("capture key carries device index; RNG-recovery pins the cook's device; "
+             "_cuda_headroom_ok takes the cook device (index-0 unchanged on a single GPU)")
+
+
+def test_port3_16bit_png(r: SubTestResult):
+    print("\n--- PORT-3: 16-bit PNG normalized by bit depth, not 257x too bright (audit) ---")
+    try:
+        import torchvision.io as tvio
+    except Exception:
+        r.ok("PORT-3 16-bit (no torchvision, SKIPPED)")
+        return
+    from TEX_Wrangle import tex_cli
+    saved_read, saved_decode = tvio.read_file, tvio.decode_image
+    fails = []
+    try:
+        tvio.read_file = lambda p: b""
+        # uint16 mid-gray 32768/65535 ~= 0.5 (the bug divided by 255 -> ~128, 257x bright)
+        tvio.decode_image = lambda data: torch.full((3, 8, 8), 32768, dtype=torch.uint16)
+        mid16 = tex_cli.load_image("x.png", "cpu").mean().item()
+        if not (0.49 < mid16 < 0.51):
+            fails.append(f"uint16 mid-gray -> {mid16:.3f} (expected ~0.5)")
+        # uint8 still normalized by 255
+        tvio.decode_image = lambda data: torch.full((3, 8, 8), 128, dtype=torch.uint8)
+        mid8 = tex_cli.load_image("x.png", "cpu").mean().item()
+        if not (0.49 < mid8 < 0.51):
+            fails.append(f"uint8 mid-gray -> {mid8:.3f} (expected ~0.5)")
+        # an unsupported dtype errors clearly (not silently wrong)
+        tvio.decode_image = lambda data: torch.full((3, 8, 8), 0.5, dtype=torch.float32)
+        try:
+            tex_cli.load_image("x.png", "cpu")
+            fails.append("float dtype did not raise")
+        except ValueError:
+            pass
+    finally:
+        tvio.read_file, tvio.decode_image = saved_read, saved_decode
+    if fails:
+        r.fail("PORT-3 16-bit", "; ".join(fails))
+    else:
+        r.ok("uint16 normalized by 65535 (~0.5); uint8 by 255; unsupported dtype errors")
 
 
 def test_hw4_cpu_threads(r: SubTestResult):

@@ -60,6 +60,10 @@ except ImportError:
 
 # ── Host memory-management (PORT-1: the seam; ComfyUI or a Null host) ──
 from .tex_runtime.host import get_host_services
+from . import tex_lazy as _tex_lazy
+
+# Matches the schema's lazy input-pool slot names (in_0..in_{MAX_LAZY_INPUTS-1}).
+_LAZY_SLOT_RE = re.compile(r"^in_\d+$")
 
 
 @dataclass(frozen=True)
@@ -157,7 +161,10 @@ def _nan_highlight(t):
     finite = torch.isfinite(t)
     if bool(finite.all()):
         return t
-    if t.dim() >= 4:
+    # channels-last image ([B,H,W,C], C<=4): magenta-flag the whole pixel. The C<=4 guard
+    # (audit) avoids mis-reading a non-channels-last tensor ([B,C,H,W]) as a giant channel
+    # dim — those fall through to the element-wise marker below.
+    if t.dim() >= 4 and t.shape[-1] <= 4:
         C = t.shape[-1]
         magenta = torch.tensor([1.0, 0.0, 1.0, 1.0][:C], dtype=t.dtype, device=t.device)
         bad_pixel = (~finite).any(dim=-1, keepdim=True)
@@ -182,6 +189,16 @@ def _apply_cpu_threads_env() -> None:
 
 
 _apply_cpu_threads_env()  # HW-4: opt-in, once at import
+
+
+# PR-LP2 (audit B1): memoize the auto-precision decision + the first-cook finiteness
+# verdict per program, so steady-state cooks pay NEITHER the resolve_auto AST walk NOR
+# the per-cook finiteness CUDA-sync (the two costs that turned auto into a node-path
+# regression). Keyed by (fingerprint, resolution-bucket, device) for the decision;
+# fingerprints verified finite once are trusted thereafter.
+_AUTO_DECISION: dict = {}          # (fp, px>=min, dev_type) -> (precision, reason)
+_AUTO_FINITE_OK: set = set()       # fingerprints whose fp16 output was verified finite
+_MIN_FP16_PX = 1024 * 1024
 
 
 # ── Cached interpreter (reused across executions to avoid rebuild overhead) ──
@@ -218,9 +235,21 @@ class TEXWrangleNode(_BaseClass):
     # Maximum number of output slots (pre-allocated for dynamic outputs)
     MAX_OUTPUTS = 8
 
+    # Lazy input cooking: ComfyUI decides laziness per *schema-declared* input
+    # name at graph-build time (comfy_execution/graph.py get_input_info), so
+    # TEX's dynamic user-named inputs can never be lazy directly. Instead the
+    # schema declares this fixed pool of lazy AnyType slots (in_0..in_N); the
+    # frontend maps wired user inputs onto them IN THE QUEUED PROMPT ONLY
+    # (workflow JSON / slots / labels keep user names) and passes the mapping
+    # as the `_tex_slot_map` constant. check_lazy_status() then tells ComfyUI
+    # which slots the program actually needs; upstream subgraphs feeding the
+    # rest are never cooked.
+    MAX_LAZY_INPUTS = 16
+
     # System kwargs that are NOT TEX bindings
     _SYSTEM_KWARGS = {"code", "device", "compile_mode", "precision", "_tex_any",
-                      "_tex_chain", "_tex_preview", "debug_nan_highlight"}
+                      "_tex_chain", "_tex_preview", "debug_nan_highlight",
+                      "_tex_slot_map"}
 
     @classmethod
     def define_schema(cls):
@@ -291,6 +320,16 @@ class TEXWrangleNode(_BaseClass):
                     optional=True,
                     tooltip="TEX accepts any input type. Use @name in code to reference it.",
                 ),
+            ] + [
+                # Lazy slot pool (see MAX_LAZY_INPUTS above). Never rendered:
+                # the frontend removes all initial input slots in onNodeCreated.
+                IO.AnyType.Input(
+                    f"in_{i}",
+                    optional=True,
+                    lazy=True,
+                    tooltip="Internal lazy input slot — mapped from wired user inputs at queue time.",
+                )
+                for i in range(cls.MAX_LAZY_INPUTS)
             ],
             outputs=[
                 IO.AnyType.Output(
@@ -312,6 +351,10 @@ class TEXWrangleNode(_BaseClass):
         parts.append(kwargs.get("device", "auto"))
         parts.append(kwargs.get("compile_mode", "none"))
         parts.append(kwargs.get("precision", "fp32"))
+        # DBG-3 (audit): the NaN-overlay toggle changes the OUTPUT, so it must bust the
+        # cache — else toggling it on serves the stale (un-overlaid) cook and the debug
+        # aid silently does nothing on first toggle.
+        parts.append(str(kwargs.get("debug_nan_highlight", False)))
         # LOAD-BEARING: the fused-chain payload (upstream code + params) must
         # be hashed explicitly. It sits in _SYSTEM_KWARGS so the loop below
         # never treats it as a TEX binding — without this line, editing an
@@ -319,6 +362,11 @@ class TEXWrangleNode(_BaseClass):
         chain_payload = kwargs.get("_tex_chain")
         if chain_payload is not None:
             parts.append(f"_tex_chain:{chain_payload}")
+        # Lazy slot mapping: renaming is semantics-relevant (it decides which
+        # user name each wired value binds to), so the map must bust the cache.
+        slot_map = kwargs.get("_tex_slot_map")
+        if slot_map is not None:
+            parts.append(f"_tex_slot_map:{slot_map}")
         # Hash all binding inputs (everything except system kwargs)
         for name in sorted(kwargs.keys()):
             if name in cls._SYSTEM_KWARGS:
@@ -354,6 +402,97 @@ class TEXWrangleNode(_BaseClass):
                 else:
                     parts.append(f"{name}:{val}")
         return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+    @staticmethod
+    def _parse_slot_map(slot_map) -> list[dict]:
+        """Normalize the frontend's `_tex_slot_map` constant into an ordered
+        list of {"name", "slot", "type"} dicts. Tolerates a JSON string or a
+        list; anything else (or malformed entries) yields []."""
+        if isinstance(slot_map, str):
+            try:
+                slot_map = json.loads(slot_map)
+            except Exception:
+                return []
+        if not isinstance(slot_map, list):
+            return []
+        out = []
+        for e in slot_map:
+            if (isinstance(e, dict) and isinstance(e.get("name"), str)
+                    and isinstance(e.get("slot"), str)):
+                out.append({"name": e["name"], "slot": e["slot"],
+                            "type": e.get("type", "*")})
+        return out
+
+    @classmethod
+    def check_lazy_status(cls, **kwargs):
+        """Lazy input cooking: name the `in_N` pool slots this cook actually
+        needs; ComfyUI never cooks the upstream subgraphs of the rest.
+
+        Protocol (execution.py): wired-but-uncooked lazy inputs arrive as None;
+        the method is re-invoked as requested inputs become available, so wired
+        scalar $params can be cooked FIRST and folded like widget values (the
+        iterative "T4-lite" round). Analysis is tex_lazy.lazy_required_bindings
+        (memoized; shared with execute()'s E6003 gate — same inputs, same
+        result, so the two can never disagree).
+
+        Safety rules (semantics preservation — see tex_lazy docstring):
+          R1  if any spatial-capable wire exists, the FIRST one (slot order,
+              first-wins shape derivation) must be needed and of a known
+              tensor type (IMAGE/MASK) — else keep everything.
+          R2  LATENT wires are always cooked (they flip output typing/fp32).
+          R3  analysis failure -> keep everything.
+        Fused chains (_tex_chain) keep everything in v1. Never raises: any
+        internal error degrades to "cook everything wired".
+        """
+        entries = cls._parse_slot_map(kwargs.get("_tex_slot_map"))
+        if not entries:
+            return []
+
+        def _pending(subset=None):
+            src = entries if subset is None else subset
+            return [e["slot"] for e in src if kwargs.get(e["slot"]) is None]
+
+        try:
+            if kwargs.get("_tex_chain"):
+                return _pending()
+            code = kwargs.get("code", "")
+            # Foldable values: scalar widget constants + already-cooked wired
+            # scalars (bool/int/float). Pool-slot keys are never params.
+            params: dict[str, Any] = {}
+            for name, val in kwargs.items():
+                if name in cls._SYSTEM_KWARGS or _LAZY_SLOT_RE.match(name):
+                    continue
+                if isinstance(val, (bool, int, float)):
+                    params[name] = val
+            scalar_pending = []
+            for e in entries:
+                v = kwargs.get(e["slot"])
+                if v is None:
+                    if e["type"] in _tex_lazy.SCALAR_WIRE_TYPES:
+                        scalar_pending.append(e)
+                elif isinstance(v, (bool, int, float)):
+                    params[e["name"]] = v
+            needed = _tex_lazy.lazy_required_bindings(code, params)
+            if needed is None:
+                return _pending()  # R3
+            # T4-lite: cook referenced wired scalars first; the next round
+            # folds their values and may prune whole image branches.
+            first = [e["slot"] for e in scalar_pending if e["name"] in needed]
+            if first:
+                return first
+            # R1: first-wins shape anchor must survive and be a known tensor.
+            spatial = [e for e in entries
+                       if e["type"] in _tex_lazy.SPATIAL_WIRE_TYPES]
+            if spatial and (spatial[0]["name"] not in needed
+                            or spatial[0]["type"] not in _tex_lazy.SHAPE_ANCHOR_TYPES):
+                return _pending()
+            return [e["slot"] for e in entries
+                    if kwargs.get(e["slot"]) is None
+                    and (e["type"] == "LATENT" or e["name"] in needed)]
+        except Exception:
+            logger.warning("[TEX] lazy analysis failed; cooking all wired inputs.",
+                           exc_info=True)
+            return _pending()
 
     @classmethod
     def _interp_fallback(cls, ctx: ExecContext, *, reset_dynamo: bool,
@@ -503,6 +642,18 @@ class TEXWrangleNode(_BaseClass):
         kwargs.pop("_tex_any", None)  # search-panel wildcard slot, unused
         kwargs.pop("_tex_preview", None)  # Q-6 preview hint; pop so it never
         # becomes a phantom @_tex_preview binding (it is a _SYSTEM_KWARG).
+        # Lazy slot pool: map cooked in_N values back to their user names.
+        # Slots the lazy analysis skipped arrive as None and simply stay
+        # absent — identical to an unwired input (the E6003 gate below
+        # forgives their dead references). Unmapped in_N keys (no entry —
+        # defensive) are dropped so they never become phantom bindings.
+        slot_entries = cls._parse_slot_map(kwargs.pop("_tex_slot_map", None))
+        for entry in slot_entries:
+            val = kwargs.pop(entry["slot"], None)
+            if val is not None:
+                kwargs[entry["name"]] = val
+        for stray in [k for k in kwargs if _LAZY_SLOT_RE.match(k)]:
+            kwargs.pop(stray)
         # Cross-node fusion: when the frontend collapses a linked TEX chain into
         # this (terminal) node, it passes the upstream stages here. Absent → the
         # node behaves exactly as a single program (no behaviour change).
@@ -591,8 +742,22 @@ class TEXWrangleNode(_BaseClass):
             # Check that referenced input bindings are available.
             # For $params with code-defined defaults, inject the default as a
             # fallback when no widget value or wire connection is provided.
+            # Lazy gate: `referenced` is the pre-optimization set, so it still
+            # contains names whose only uses are statically dead given the
+            # current params — exactly the inputs check_lazy_status skipped.
+            # Recompute the live set (memo hit: same code + same scalar values
+            # the lazy round saw) and forgive dead references instead of
+            # raising E6003. Single programs only; fused chains keep v0.17
+            # behaviour (their lazy round requests everything).
+            lazy_needed = None
+            if not fused_chain and slot_entries:
+                scalar_params = {n: v for n, v in bindings.items()
+                                 if isinstance(v, (bool, int, float))}
+                lazy_needed = _tex_lazy.lazy_required_bindings(code, scalar_params)
             for ref_name in referenced:
                 if ref_name not in assigned_bindings and ref_name not in bindings:
+                    if lazy_needed is not None and ref_name not in lazy_needed:
+                        continue  # statically dead under the current params
                     # Try param default before erroring
                     if ref_name in param_info:
                         default_val = param_info[ref_name].get("default_value")
@@ -627,6 +792,7 @@ class TEXWrangleNode(_BaseClass):
             # THIS cook (the trace is thread-local and persists across cooks).
             from .tex_runtime import tier_trace
             tier_trace.reset()
+            fp = cache.fingerprint(code, binding_types) if not fused_chain else None
             auto_fp16 = False
             if precision == "auto":
                 if has_latent_input:
@@ -634,19 +800,31 @@ class TEXWrangleNode(_BaseClass):
                     # we never size the gate off a LATENT's [B,H,W,C] axis.
                     precision, auto_reason = "fp32", "auto->fp32: LATENT input (stays fp32)"
                 else:
-                    from .tex_runtime.precision_policy import resolve_auto_precision
                     dev_type = torch.device(device).type
                     spatial_px = next((v.shape[1] * v.shape[2] for v in bindings.values()
                                        if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)
-                    precision, auto_reason = resolve_auto_precision(program, spatial_px, dev_type)
-                    if precision == "fp16" and compile_mode != "none":
-                        precision, auto_reason = "fp32", auto_reason + " [compiled tier: fp32]"
-                    auto_fp16 = precision == "fp16"
+                    # B1: memoize the decision per (program, resolution-bucket, device) so
+                    # the resolve_auto AST walk runs once, not per cook.
+                    ckey = (fp, spatial_px >= _MIN_FP16_PX, dev_type) if fp is not None else None
+                    cached = _AUTO_DECISION.get(ckey) if ckey is not None else None
+                    if cached is not None:
+                        precision, auto_reason = cached
+                    else:
+                        from .tex_runtime.precision_policy import resolve_auto_precision
+                        precision, auto_reason = resolve_auto_precision(program, spatial_px, dev_type)
+                        if precision == "fp16" and compile_mode != "none":
+                            precision, auto_reason = "fp32", auto_reason + " [compiled tier: fp32]"
+                        if ckey is not None:
+                            _AUTO_DECISION[ckey] = (precision, auto_reason)
+                    # B1: run the finiteness safety-net only on the FIRST fp16 cook of a
+                    # program (fingerprint unknown, e.g. fused, always checks). Once a
+                    # program's fp16 output is verified finite, trust it — the per-cook
+                    # .all() CUDA-sync was what erased the fp16 win.
+                    auto_fp16 = precision == "fp16" and (fp is None or fp not in _AUTO_FINITE_OK)
                 tier_trace.record_precision(precision, auto_reason)
             # M-3: LATENT data exceeds [0,1] and feeds further math, so it must stay
             # fp32 even in fp16 mode.
             eff_precision = "fp32" if has_latent_input else precision
-            fp = cache.fingerprint(code, binding_types) if not fused_chain else None
             ctx = ExecContext(program, bindings, type_map, device, code,
                               latent_channel_count, output_names, used_builtins,
                               eff_precision, fp, fused_chain, fused_fp)
@@ -656,20 +834,27 @@ class TEXWrangleNode(_BaseClass):
             if not isinstance(raw_output, dict):
                 raw_output = {output_names[0]: raw_output}
 
-            # PR-LP2 safety net: an auto->fp16 cook can still go non-finite on a
-            # fp16-fragile pointwise program the static gate can't tell from grade's
-            # safe pow (e.g. brightness_contrast's pivot pow -> NaN). Cheap all-reduce
-            # on the auto-fp16 path only; on a NaN/Inf, transparently re-cook fp32.
-            if auto_fp16 and eff_precision == "fp16" and any(
-                    isinstance(v, torch.Tensor) and not torch.isfinite(v).all()
-                    for v in raw_output.values()):
-                tier_trace.record_precision("fp32", "auto: fp16 non-finite -> fp32 fallback")
-                ctx = ExecContext(program, bindings, type_map, device, code,
-                                  latent_channel_count, output_names, used_builtins,
-                                  "fp32", fp, fused_chain, fused_fp)
-                raw_output = getattr(cls, cls._TIER_METHOD[tier_id])(ctx)
-                if not isinstance(raw_output, dict):
-                    raw_output = {output_names[0]: raw_output}
+            # PR-LP2 safety net (B1): the FIRST fp16 cook of a program is checked for
+            # NaN/Inf (a fp16-fragile pointwise program the static gate can't tell from
+            # grade's safe pow). If finite, the fingerprint is trusted henceforth (no more
+            # per-cook sync). If not, re-cook fp32 AND pin the decision to fp32 so future
+            # cooks skip fp16 entirely — no repeated double-cook.
+            if auto_fp16 and eff_precision == "fp16":
+                if any(isinstance(v, torch.Tensor) and not torch.isfinite(v).all()
+                       for v in raw_output.values()):
+                    tier_trace.clear_probes()  # discard the fp16 cook's probes (no dup)
+                    tier_trace.record_precision("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
+                    if fp is not None:
+                        _AUTO_DECISION[(fp, True, torch.device(device).type)] = \
+                            ("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
+                    ctx = ExecContext(program, bindings, type_map, device, code,
+                                      latent_channel_count, output_names, used_builtins,
+                                      "fp32", fp, fused_chain, fused_fp)
+                    raw_output = getattr(cls, cls._TIER_METHOD[tier_id])(ctx)
+                    if not isinstance(raw_output, dict):
+                        raw_output = {output_names[0]: raw_output}
+                elif fp is not None:
+                    _AUTO_FINITE_OK.add(fp)  # verified finite; skip the sync next time
 
             # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
             # oldest mip/grid entries; allocate-and-hold semantics untouched).
@@ -680,7 +865,11 @@ class TEXWrangleNode(_BaseClass):
             try:
                 from .tex_memory import enforce_cache_budget, trim_reserved_pool
                 enforce_cache_budget(device)
-                trim_reserved_pool(device)  # MEM-2: reclaim stranded reserved VRAM
+                # MEM-2 (B2): pass the cook size so the trim only queries the allocator
+                # after a resolution downshift (zero cost on same-size steady state).
+                cook_px = next((v.shape[1] * v.shape[2] for v in bindings.values()
+                                if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)
+                trim_reserved_pool(device, cook_px)
             except Exception:
                 pass
 

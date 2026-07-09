@@ -35,13 +35,21 @@ def _require_torchvision():
 
 
 def load_image(path: str, device: str = "cpu") -> torch.Tensor:
-    """PNG/JPG -> [1, H, W, 3] float32 in [0,1] (ComfyUI IMAGE layout), torchvision-only."""
+    """PNG/JPG -> [1, H, W, 3] float32 in [0,1] (ComfyUI IMAGE layout), torchvision-only.
+    Branches on BIT DEPTH: a uint16 (16-bit) PNG decodes to 0-65535, so dividing by 255
+    (audit) would make it 257x too bright — normalise by the dtype's max."""
     from torchvision.io import read_file, decode_image
-    img = decode_image(read_file(path))          # [C, H, W] uint8
+    img = decode_image(read_file(path))          # [C, H, W], uint8 or uint16
     if img.shape[0] == 1:
         img = img.expand(3, -1, -1)              # grayscale -> RGB
     img = img[:3]                                # drop alpha
-    t = img.to(torch.float32) / 255.0            # [C, H, W] in [0,1]
+    if img.dtype == torch.uint8:
+        denom = 255.0
+    elif img.dtype == torch.uint16:
+        denom = 65535.0
+    else:
+        raise ValueError(f"tex run: unsupported image dtype {img.dtype} (expected uint8/uint16)")
+    t = img.to(torch.float32) / denom            # [C, H, W] in [0,1]
     return t.permute(1, 2, 0).unsqueeze(0).to(device)   # [1, H, W, 3]
 
 

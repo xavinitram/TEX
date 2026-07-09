@@ -262,6 +262,36 @@ def test_dbg4_doctor(r: SubTestResult):
              "is isolated (all keys stay, others intact) — never 500s")
 
 
+def test_lx5_json_nan_safe(r: SubTestResult):
+    print("\n--- LX-5: debug_print of NaN/Inf serializes as valid JSON (audit) ---")
+    import json
+    from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib as S
+    from TEX_Wrangle.tex_runtime import tier_trace
+    tier_trace.reset()
+    S.fn_debug_print("scalar_nan", float("nan"))
+    S.fn_debug_print("scalar_inf", float("inf"))
+    S.fn_debug_print("tensor_nan", torch.full((1, 4, 4, 3), float("nan")), 0, 0)
+    payload = {"tex_probes": tier_trace.get_probes()}
+    try:
+        json.dumps(payload, allow_nan=False)  # strict JSON: raises on NaN/Infinity tokens
+        r.ok("non-finite probe values sanitized to null; payload is strict-JSON valid")
+    except ValueError as e:
+        r.fail("LX-5 JSON NaN", f"probe payload is invalid JSON (NaN/Inf leaked): {e}")
+
+
+def test_dbg1_nan_fingerprint(r: SubTestResult):
+    print("\n--- DBG-1: debug_nan_highlight busts the cache fingerprint (audit) ---")
+    from TEX_Wrangle.tex_node import TEXWrangleNode as N
+    base = dict(code="@OUT = vec4(@A.rgb, 1.0);", A=make_img(1, 8, 8, 3, seed=1), device="cpu")
+    fp_off = N.fingerprint_inputs(**base, debug_nan_highlight=False)
+    fp_on = N.fingerprint_inputs(**base, debug_nan_highlight=True)
+    if fp_off == fp_on:
+        r.fail("DBG-1 fingerprint", "toggling debug_nan_highlight does not bust the cache "
+               "(the overlay silently does nothing on first toggle)")
+    else:
+        r.ok("debug_nan_highlight toggle changes the fingerprint (fresh cook on toggle)")
+
+
 def test_ux2_tooltip_honesty(r: SubTestResult):
     print("\n--- UX-2: compile_mode tooltip states the Triton reality ---")
     import re
