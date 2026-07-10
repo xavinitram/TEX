@@ -1,0 +1,84 @@
+{
+  "last_node_id": 2,
+  "last_link_id": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "TEX_Wrangle",
+      "pos": [
+        96,
+        128
+      ],
+      "size": [
+        420,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "OUT",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TEX_Wrangle"
+      },
+      "widgets_values": [
+        "// Gradient \u2014 procedural two-color linear gradient\n// Uses built-in u/v coordinates (0..1)\n// Note: connect any image to @ref to set output resolution\n\nvec4 _ref = @ref;\n@OUT = vec3(u, v, 1.0 - u);\n",
+        "auto",
+        "none",
+        "fp32",
+        false
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PreviewImage",
+      "pos": [
+        560,
+        128
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "version": 0.4,
+  "extra": {
+    "tex_workflow": "Linear gradient (procedural)",
+    "tex_snippet_source": true
+  }
+}

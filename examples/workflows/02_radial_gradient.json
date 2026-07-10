@@ -1,0 +1,84 @@
+{
+  "last_node_id": 2,
+  "last_link_id": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "TEX_Wrangle",
+      "pos": [
+        96,
+        128
+      ],
+      "size": [
+        420,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "OUT",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TEX_Wrangle"
+      },
+      "widgets_values": [
+        "// Radial gradient \u2014 circular falloff from center\n//\n// Generates a white-to-black gradient radiating outward\n// from the image center using smoothstep for a soft edge.\n// Useful as a mask, vignette layer, or compositing element.\n// Purely procedural \u2014 no inputs required.\n\n// Distance from center of image\nfloat cx = u - 0.5;\nfloat cy = v - 0.5;\nfloat dist = hypot(cx, cy);\n\n// Smooth falloff: white at center, black at edges\nfloat grad = 1.0 - smoothstep(0.0, 0.5, dist);\n\n@OUT = vec3(grad);",
+        "auto",
+        "none",
+        "fp32",
+        false
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PreviewImage",
+      "pos": [
+        560,
+        128
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "version": 0.4,
+  "extra": {
+    "tex_workflow": "Radial gradient / vignette base",
+    "tex_snippet_source": true
+  }
+}

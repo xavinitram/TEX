@@ -99,8 +99,9 @@ silent-wrong result.
 `TORCHINDUCTOR_CACHE_DIR` ownership-check, the `_tex_any` phantom search-panel slot,
 the `bf16` bench plumbing (deliberately dev/bench-only, not user-exposed).
 
-**The 13 caches are non-redundant** — each keys on a different thing with a distinct
-lifecycle. Do not consolidate them.
+**The 15 caches are non-redundant** — each keys on a different thing with a distinct
+lifecycle. Do not consolidate them. (See ARCHITECTURE.md for the enumerated inventory;
+the count there and here must match — a DOC-7b check enforces it.)
 
 ## Module size budget (REG-2 — soft policy)
 

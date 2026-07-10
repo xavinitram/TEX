@@ -130,6 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--precision", default="fp32", choices=["fp32", "auto", "fp16"])
     rp.add_argument("--compile-mode", dest="compile_mode", default="none",
                     choices=["none", "auto", "torch_compile", "cuda_graph"])
+    sub.add_parser("validate-hw", help="measure whether TEX's Turing-calibrated perf "
+                   "gates hold on THIS GPU; emit a shareable report (S-4)")
     return p
 
 
@@ -147,6 +149,9 @@ def main(argv=None) -> None:
     try:
         if args.cmd == "run":
             run(args)
+        elif args.cmd == "validate-hw":
+            from .tex_validate_hw import main as validate_hw_main
+            validate_hw_main()
     except (OSError, LexerError, ParseError, TypeCheckError, TEXMultiError,
             InterpreterError, ValueError, RuntimeError) as e:
         # S2 (doc 33): the node appends a machine-readable "\nTEX_DIAG:{json}" blob to some

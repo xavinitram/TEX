@@ -1462,16 +1462,16 @@ class Interpreter:
                                 m = left.shape[-1]     # matrix dim: 3 or 4
                                 vc = right.shape[-1]   # vector channels
                                 if vc == m:
-                                    return torch.matmul(left, right.unsqueeze(-1)).squeeze(-1)
+                                    return _matvec(left, right)
                                 if m == 3 and vc == 4:
                                     # mat3 * vec4: transform xyz, preserve w/alpha
-                                    xyz = torch.matmul(left, right[..., :3].unsqueeze(-1)).squeeze(-1)
+                                    xyz = _matvec(left, right[..., :3])
                                     return torch.cat([xyz, right[..., 3:4]], dim=-1)
                                 if m == 4 and vc == 3:
                                     # mat4 * vec3: promote vec3 to a point (w = 1)
                                     v4 = torch.cat([right, torch.ones_like(right[..., :1])], dim=-1)
-                                    return torch.matmul(left, v4.unsqueeze(-1)).squeeze(-1)
-                                return torch.matmul(left, right.unsqueeze(-1)).squeeze(-1)
+                                    return _matvec(left, v4)
+                                return _matvec(left, right)
 
             # Ensure compatible shapes.
             # Fast path: same shape — skip all checks (most common case in loops)
@@ -2089,6 +2089,21 @@ def _ensure_spatial(tensor: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:
         return tensor.expand(spatial_shape)
     except RuntimeError:
         return tensor
+
+
+def _matvec(m: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Batched matrix @ vector (last-dim contraction), device-tuned (P3).
+
+    For TEX's tiny-matrix / huge-per-pixel-batch shape, `torch.matmul` on a 3x3 (or 4x4)
+    against a [B,H,W] batch is launch/overhead-bound on CUDA -- the elementwise
+    `(m * v.unsqueeze(-2)).sum(-1)` is 3.4-3.9x faster (mat3) there. On CPU matmul is ~7x
+    faster, so keep it. Codegen emits the SAME device-gated expression (`_matvec_expr`),
+    so interp<->codegen stays bit-exact on each device. The CUDA broadcast form differs
+    from the CPU matmul form by <=1 fp32 ULP (2.4e-7) -- the identical cross-device class
+    matmul already has, and 16000x below the 8-bit output quantum."""
+    if m.is_cuda:
+        return (m * v.unsqueeze(-2)).sum(-1)
+    return torch.matmul(m, v.unsqueeze(-1)).squeeze(-1)
 
 
 def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

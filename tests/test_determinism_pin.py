@@ -10,10 +10,10 @@ deterministic-in-practice path.
 The one genuine exposure is that torch does not *promise* atomic-add ordering, so a
 future torch upgrade could break run-to-run scatter determinism. This test pins that:
 - CUDA scatter (plain + 1024-way collision stress) must be bitwise identical across 5
-  runs. **WARN-first** this cycle (doc 28: "first release WARN-level, then hard-gate"):
-  a regression prints a loud decision prompt but does not yet red the suite, because
-  the fix is a deliberate choice (scoped `use_deterministic_algorithms` at 1.48x vs
-  re-banding the claim), not a bug to panic over. Flip TEX_DETERMINISM_HARD=1 to gate.
+  runs. **GATED on a band by default** (A1-4, v0.19: was WARN-first in v0.18): measured
+  bitwise-0.0, and a torch atomic-add reorder is a discrete jump well above the 1e-9 band,
+  so gating catches a real regression without flapping. Set `TEX_DETERMINISM_SOFT=1` to
+  DOWNGRADE to a warning (the old behavior) if a future torch upgrade forces a re-band.
 - The CPU is the honest caveat: threaded float accumulation is run-to-run
   nondeterministic at ~5.5e-6. We assert it stays within a loose 1e-5 sanity bound
   (a real red if it blows up), documenting rather than fixing it (pin, don't chase).
@@ -54,9 +54,19 @@ def _max_run_to_run(code, device, runs=5):
     return worst
 
 
+# A1-4: CUDA scatter determinism is now GATED on a band (was WARN-first). Measured
+# bitwise-0.0; a torch atomic-add reorder is a discrete jump well above this band, so
+# gating catches a real regression without flapping. TEX_DETERMINISM_SOFT=1 downgrades
+# to WARN (inverse of the old HARD flag) if an environment ever flaps in practice. The
+# release gate (TST-8) also reads LAST_CUDA_DET_VAR to fail a publish on out-of-band drift.
+_CUDA_DET_BAND = 1e-9
+LAST_CUDA_DET_VAR = None   # worst CUDA run-to-run measured; None = not measured (CPU box)
+
+
 def test_prlp5_determinism_pin(r: SubTestResult):
-    print("\n--- PR-LP5: determinism pin (CUDA bitwise; CPU documented caveat) ---")
-    hard = os.environ.get("TEX_DETERMINISM_HARD") == "1"
+    print("\n--- PR-LP5: determinism pin (CUDA gated band; CPU documented caveat) ---")
+    global LAST_CUDA_DET_VAR
+    soft = os.environ.get("TEX_DETERMINISM_SOFT") == "1"
 
     # CPU caveat: threaded accumulation is nondeterministic — pin the loose bound.
     try:
@@ -73,18 +83,23 @@ def test_prlp5_determinism_pin(r: SubTestResult):
         r.ok("PR-LP5 CUDA bitwise determinism (no GPU, SKIPPED)")
         return
 
+    worst_all = 0.0
     for label, code in (("scatter", _SCATTER), ("collision-stress", _COLLIDE)):
         try:
             worst = _max_run_to_run(code, "cuda")
-            if worst == 0.0:
-                r.ok(f"CUDA {label}: bitwise deterministic across 5 runs")
-            elif hard:
-                r.fail(f"PR-LP5 CUDA {label}",
-                       f"run-to-run {worst:.2e} != 0 (hard-gate on)")
+            worst_all = max(worst_all, worst)
+            if worst <= _CUDA_DET_BAND:
+                r.ok(f"CUDA {label}: run-to-run {worst:.1e} within gated band "
+                     f"(<= {_CUDA_DET_BAND:.0e})")
+            elif soft:
+                r.ok(f"[WARN] CUDA {label} run-to-run {worst:.2e} > band — torch atomic-add "
+                     "ordering changed (soft mode; suite stays green). Decide: scoped "
+                     "use_deterministic_algorithms (~1.48x) vs re-band.")
             else:
-                # WARN-first: visible decision prompt, suite stays green this cycle.
-                r.ok(f"[WARN] CUDA {label} run-to-run {worst:.2e} != 0 — torch atomic-add "
-                     "ordering changed; decide: scoped use_deterministic_algorithms "
-                     "(~1.48x) vs re-band. Set TEX_DETERMINISM_HARD=1 to gate.")
+                r.fail(f"PR-LP5 CUDA {label}",
+                       f"run-to-run {worst:.2e} > band {_CUDA_DET_BAND:.0e} — atomic-add "
+                       "ordering regressed. Fix (scoped use_deterministic_algorithms, "
+                       "~1.48x) or consciously re-band; TEX_DETERMINISM_SOFT=1 to downgrade.")
         except Exception as e:
             r.fail(f"PR-LP5 CUDA {label}", f"{type(e).__name__}: {e}")
+    LAST_CUDA_DET_VAR = worst_all  # release gate (TST-8) reads this

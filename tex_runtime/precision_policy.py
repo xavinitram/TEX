@@ -52,35 +52,18 @@ _BUILTIN_CONSTS = {"PI": math.pi, "TAU": 2.0 * math.pi, "E": math.e}
 _BUILTIN_MAG = {"iw": 8192.0, "ih": 8192.0, "ix": 8192.0, "iy": 8192.0, "fi": 4096.0,
                 "fn": 4096.0}
 
-# fp16-fragile stdlib functions — a half-ULP wrecks them (measured in the 114-sweep:
-# posterize floor -> 0.33, film_vignette acos/sqrt/smoothstep -> 0.63, hue_shift
-# fract -> NaN). Declined on ANY lineage, because fp16 *intermediates* lose precision
-# even for coordinate-derived values (u/v stay fp32, but `float d = ...` does not).
-#   - discontinuous: a fp16 rounding flips the branch/level
-#   - domain-restricted: a fp16 overshoot leaves the domain -> NaN (acos/asin |x|>1, sqrt/log<0)
-# NOTE: pow/spow/sdiv are NOT here — the grade-class headline needs pow([0,1], 0.45),
-# which is exact enough; the rare pow/division NaN is caught by execute()'s runtime
-# finiteness fallback instead (can't be told apart statically from grade's safe pow).
-_FP16_FRAGILE_FNS = frozenset({
-    "floor", "round", "ceil", "fract", "trunc", "mod", "sign",
-    "step", "smoothstep",
-    "acos", "asin", "sqrt", "inversesqrt", "log", "log2",
-    # magnitude-amplifying / near-singular — a fp16 mantissa is too coarse above ~1
-    # (measured in the fp16 fuzzer: exp-towers 0.02-0.08, smin/smax blends 0.4)
-    "exp", "exp2", "smin", "smax",
-    # ill-conditioned near a singularity the static gate can't prove the args avoid
-    # (doc 32 adversarial sweep): tan (poles), atan2 (origin — angle undefined),
-    # normalize (zero vector), hypot / sdiv (near-zero → sqrt-/divide-sensitive),
-    # sinh/cosh (exp-like growth). Single-arg atan is bounded+smooth and stays eligible.
-    "tan", "atan2", "normalize", "hypot", "sdiv", "sinh", "cosh",
-    # arr_sum grows unboundedly over image-filled elements the flow-analysis can't see
-    # inside the array (arr_avg/min/max/median stay bounded by the input range).
-    "arr_sum",
-})
-# Bounded-range fns (accepted) whose magnitude is capped regardless of argument, so a big
-# argument doesn't propagate as a big output magnitude (their fp16 *error* from a big
-# argument is caught by the gain/argument-magnitude checks instead).
-_BOUNDED_FNS = frozenset({"sin", "cos", "tanh", "atan"})
+# C2-st: the fp16 taxonomy is now single-sourced in the @stdlib registry (doc 34
+# weakness #8 — this used to be a second, un-federated hand-list that let a new fragile
+# fn silently default to fp16-eligible; the A1-1 fuzzer proved it via `degrees`). These
+# derive from `stdlib_registry`; `test_c2st` machine-checks completeness + loud-on-new.
+#   FP16_FRAGILE: a half-ULP wrecks it — discontinuous (floor/round/step flip a level),
+#   domain-restricted (acos/asin/sqrt/log leave the domain -> NaN), magnitude-amplifying
+#   (exp/exp2/sinh/cosh/smin/smax), near-singular (tan/atan2/normalize/hypot/sdiv), or an
+#   unbounded reduction (arr_sum). FP16_BOUNDED: range-capped smooth (sin/cos/tanh/atan) —
+#   accepted; their fp16 error is caught by the gain/magnitude analysis. pow/spow are
+#   deliberately neither (the grade headline needs pow([0,1],0.45); a rare pow NaN is
+#   caught by execute()'s runtime finiteness net).
+from .stdlib_registry import FP16_FRAGILE as _FP16_FRAGILE_FNS, FP16_BOUNDED as _BOUNDED_FNS  # noqa: E402
 
 
 def _walk(node):
@@ -303,6 +286,14 @@ def _gm(node, vg, vm, out_names, hz, consts):
                 g, m = gb * la, mb * la
             else:
                 g, m = (ga + gb) * 4.0, ma * mb * 4.0
+        elif name in ("degrees", "radians"):
+            # scale-by-constant: degrees multiplies by 180/pi (~57.3x) — a fp16
+            # amplifier the generic branch misses (A1-1 fuzzer found degrees(@A.b)
+            # accepted as fp16 at 57x); radians multiplies by pi/180 (~0.0175x, de-
+            # amplifying but tracked for correctness). Fold the factor into gain+mag.
+            factor = (180.0 / math.pi) if name == "degrees" else (math.pi / 180.0)
+            bg, bm = parts[0]
+            g, m = bg * factor, bm * factor
         elif name in ("length", "distance"):
             # sqrt(sum of squares) over up to 4 channels: ~2x the operand gain/mag
             if name == "distance" and len(parts) == 2:

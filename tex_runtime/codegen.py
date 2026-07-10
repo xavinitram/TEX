@@ -134,6 +134,15 @@ def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
           _CgBreak, _CgContinue)
 
 
+def _matvec_expr(m: str, v: str) -> str:
+    """P3: emit `m @ v` as the SAME device-gated expression `interpreter._matvec` computes
+    -- CUDA elementwise broadcast-sum (3.4-3.9x faster for mat3), CPU matmul -- so codegen
+    stays bit-exact with the interpreter on each device. The `A if cond else B` ternary
+    short-circuits, so `v` (a slice/cat expression) is evaluated exactly once."""
+    return (f"(({m} * {v}.unsqueeze(-2)).sum(-1) if {m}.is_cuda "
+            f"else _torch.matmul({m}, {v}.unsqueeze(-1)).squeeze(-1))")
+
+
 # Stdlib functions that are simple torch.XXX(arg) wrappers.
 # In codegen, arguments are always tensors so _to_tensor is a no-op.
 # We emit _torch.XXX(arg) directly, avoiding dict lookup + function call + _to_tensor.
@@ -166,6 +175,19 @@ _SCALAR_MATH_2ARG: dict[str, str] = {
     "max": "max", "min": "min",
     "atan2": "atan2", "hypot": "hypot",
 }
+
+# The stdlib fns that `_emit_scalar_fn_call` can lower to pure Python/`_math` (so they are
+# safe inside a scalar-mode loop). A stdlib call NOT in this set falls through to the TENSOR
+# emission, which crashes on Python-scalar args (`spow(3.0, 0.5)` -> `_torch.abs(3.0)`) — the
+# F5 codegen-crash class the differential fuzzer was blind to. `_is_scalar_node` gates on
+# this so such calls (and all user-fn calls) stay in tensor mode. KEEP IN SYNC with
+# `_emit_scalar_fn_call` (test_f5_codegen_scalar_loop_no_crash guards the behaviour).
+_SCALAR_EMITTABLE_FNS: frozenset[str] = (
+    frozenset(_SCALAR_MATH_1ARG) | frozenset(_SCALAR_MATH_2ARG)
+    | frozenset({"asin", "acos", "sqrt", "fract", "round",   # 1-arg specials
+                 "pow", "step", "mod",                         # 2-arg specials
+                 "lerp", "clamp", "smoothstep"})               # 3-arg specials
+)
 
 # Builtins that are spatially-varying tensors at runtime (shape [B,H,W] or
 # [1,1,W] etc.) despite being typed as FLOAT by the type checker.
@@ -1189,6 +1211,19 @@ class _CodeGen(_EmitStdFnsMixin):
         cond_tmp = self._tmp()
         self._emit(f"{cond_tmp} = {cond_expr}")
 
+        # A sample-hoist (BCHW permute view + grid buffer) is emitted by
+        # _hoist_sample_setup at the CURRENT indent — not the preamble — so it is
+        # only bound on the path it was emitted on. Every if/else re-emits its
+        # bodies per branch, and the scalar-vs-spatial duplication below emits them
+        # twice more; the _hoisted_bchw memo would otherwise let the second
+        # emission skip the allocation yet still reference the temp
+        # (UnboundLocalError). Snapshot the dominating hoists and reset to this
+        # snapshot before each branch so every branch re-hoists what it samples —
+        # its allocation then dominates its own uses. Preamble-hoisted caches
+        # (const/range/vec/kernel/fn/param) already dominate the whole function
+        # and need no such scoping.
+        hoist_snap = dict(self._hoisted_bchw)
+
         if self._scalar_loop:
             # Scalar-mode loops (_is_scalar_body) guarantee every value in the
             # body — this condition included — stays a Python float (or 0-dim
@@ -1197,6 +1232,7 @@ class _CodeGen(_EmitStdFnsMixin):
             # duplication of nested if/else (worst inside unrolled loops).
             self._emit(f"if float({cond_tmp}) > 0.5:")
             self._indent += 1
+            self._hoisted_bchw = dict(hoist_snap)
             if stmt.then_body:
                 for s in stmt.then_body:
                     self._emit_stmt(s)
@@ -1206,9 +1242,11 @@ class _CodeGen(_EmitStdFnsMixin):
             if stmt.else_body:
                 self._emit(f"else:")
                 self._indent += 1
+                self._hoisted_bchw = dict(hoist_snap)
                 for s in stmt.else_body:
                     self._emit_stmt(s)
                 self._indent -= 1
+            self._hoisted_bchw = hoist_snap
             return
 
         # Capture the condition's spatial-ness NOW, before either branch is
@@ -1225,6 +1263,7 @@ class _CodeGen(_EmitStdFnsMixin):
         self._indent += 1
         self._emit(f"if float({cond_tmp}) > 0.5:")
         self._indent += 1
+        self._hoisted_bchw = dict(hoist_snap)
         if stmt.then_body:
             for s in stmt.then_body:
                 self._emit_stmt(s)
@@ -1234,6 +1273,7 @@ class _CodeGen(_EmitStdFnsMixin):
         if stmt.else_body:
             self._emit(f"else:")
             self._indent += 1
+            self._hoisted_bchw = dict(hoist_snap)
             for s in stmt.else_body:
                 self._emit_stmt(s)
             self._indent -= 1
@@ -1246,15 +1286,22 @@ class _CodeGen(_EmitStdFnsMixin):
         self._indent += 1
 
         # For spatial if/else, we need the full clone/merge logic.
-        # Emit it inline.
+        # Emit it inline. It re-emits the SAME bodies as the scalar path above, so
+        # it must start from the same pre-if hoist snapshot (the scalar path's
+        # branch-local hoists are unbound on this path).
         lines_before = len(self._lines)
-        self._emit_spatial_if_else(stmt, cond_tmp, cond_spatial)
+        self._emit_spatial_if_else(stmt, cond_tmp, cond_spatial, hoist_snap)
         if len(self._lines) == lines_before:
             self._emit("pass")  # guard against empty else block
 
         self._indent -= 1
 
-    def _emit_spatial_if_else(self, stmt: IfElse, cond_var: str, cond_spatial: bool):
+        # Every hoist emitted inside a branch above is branch-local; restore the
+        # pre-if dominating snapshot for the straight-line code that follows.
+        self._hoisted_bchw = hoist_snap
+
+    def _emit_spatial_if_else(self, stmt: IfElse, cond_var: str, cond_spatial: bool,
+                              hoist_snap: dict[str, tuple[str, str]]):
         """Emit spatial if/else with selective cloning and torch.where merge.
 
         Uses local variables for env vars when available (program-level locals),
@@ -1262,7 +1309,14 @@ class _CodeGen(_EmitStdFnsMixin):
 
         ``cond_spatial`` is the pre-computed spatial-ness of the condition (see
         _emit_if_else); it drives the post-merge _spatial_vars fixup at the end.
+
+        ``hoist_snap`` is the sample-hoist (_hoisted_bchw) state that dominates the
+        whole if/else. This method (and the scalar path in _emit_if_else) re-emit
+        the same branch bodies, so a hoist from a sibling emission is unbound here;
+        reset to this snapshot before each branch so every branch re-hoists what it
+        samples (its allocation then dominates its own uses).
         """
+        self._hoisted_bchw = dict(hoist_snap)
         # Collect modified variables (same analysis as interpreter)
         then_mods = self._collect_modified_vars(stmt.then_body)
         else_mods = self._collect_modified_vars(stmt.else_body) if stmt.else_body else (set(), set())
@@ -1274,9 +1328,11 @@ class _CodeGen(_EmitStdFnsMixin):
 
         if not all_env_mods and not all_bind_mods:
             # Nothing modified — just execute both branches for side effects
+            self._hoisted_bchw = dict(hoist_snap)
             for s in stmt.then_body:
                 self._emit_stmt(s)
             if stmt.else_body:
+                self._hoisted_bchw = dict(hoist_snap)
                 for s in stmt.else_body:
                     self._emit_stmt(s)
             return
@@ -1295,6 +1351,7 @@ class _CodeGen(_EmitStdFnsMixin):
         self._emit(f"{snap_bind} = {{k: _bind[k].clone() if _torch.is_tensor(_bind[k]) else _bind[k] for k in {bind_mod_repr} if k in _bind}}")
 
         # Execute then-branch
+        self._hoisted_bchw = dict(hoist_snap)
         for s in stmt.then_body:
             self._emit_stmt(s)
         # Which modified vars the then-branch left holding a spatial value. Read
@@ -1319,6 +1376,7 @@ class _CodeGen(_EmitStdFnsMixin):
         self._emit(f"_bind.update({snap_bind})")
 
         if stmt.else_body:
+            self._hoisted_bchw = dict(hoist_snap)
             for s in stmt.else_body:
                 self._emit_stmt(s)
         # Which modified vars are spatial on the else path (with no else body this
@@ -1499,6 +1557,12 @@ class _CodeGen(_EmitStdFnsMixin):
                 return False
             t = self.type_map.get(id(node))
             if t is not None and not t.is_scalar:
+                return False
+            # F5 fix: a call is scalar-safe ONLY if it has a scalar (math/Python) codegen
+            # lowering. A stdlib fn without one (spow/degrees/smin/mix) — or ANY user fn —
+            # falls through to the tensor emission, which crashes on Python-scalar args; keep
+            # such calls in tensor mode. (Previously any all-scalar-arg call was "scalar".)
+            if node.name not in _SCALAR_EMITTABLE_FNS:
                 return False
             return all(self._is_scalar_node(a, loop_var) for a in node.args)
         if isinstance(node, CastExpr):
@@ -2256,15 +2320,17 @@ class _CodeGen(_EmitStdFnsMixin):
                 m = lt.mat_size      # matrix dim: 3 or 4
                 vc = rt.channels     # vector channels: 2, 3, or 4
                 if vc == m:
-                    self._emit(f"{tmp} = _torch.matmul({left}, {right}.unsqueeze(-1)).squeeze(-1)")
+                    self._emit(f"{tmp} = {_matvec_expr(left, right)}")
                 elif m == 3 and vc == 4:
                     # mat3 * vec4: transform xyz, preserve w/alpha
-                    self._emit(f"{tmp} = _torch.cat([_torch.matmul({left}, {right}[..., :3].unsqueeze(-1)).squeeze(-1), {right}[..., 3:4]], dim=-1)")
+                    self._emit(f"{tmp} = _torch.cat([{_matvec_expr(left, f'{right}[..., :3]')}, {right}[..., 3:4]], dim=-1)")
                 elif m == 4 and vc == 3:
                     # mat4 * vec3: promote vec3 to a point (w = 1)
-                    self._emit(f"{tmp} = _torch.matmul({left}, _torch.cat([{right}, _torch.ones_like({right}[..., :1])], dim=-1).unsqueeze(-1)).squeeze(-1)")
+                    v4 = self._tmp()
+                    self._emit(f"{v4} = _torch.cat([{right}, _torch.ones_like({right}[..., :1])], dim=-1)")
+                    self._emit(f"{tmp} = {_matvec_expr(left, v4)}")
                 else:
-                    self._emit(f"{tmp} = _torch.matmul({left}, {right}.unsqueeze(-1)).squeeze(-1)")
+                    self._emit(f"{tmp} = {_matvec_expr(left, right)}")
                 return tmp
 
         # M-5: reuse a dead fresh arithmetic temp as the out= target when the

@@ -9,6 +9,7 @@ omit =
     */benchmarks/*
     */__pycache__/*
     */tools/*
+    */.tex_cache/*
 
 [report]
 # Lines that never need coverage (defensive / unreachable / display-only).

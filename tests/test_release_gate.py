@@ -86,3 +86,24 @@ def test_codegen_determinism(r: SubTestResult):
         r.ok("codegen source byte-identical across PYTHONHASHSEED 0/1 (sorted() invariant holds)")
     except Exception as e:
         r.fail("codegen determinism", f"{type(e).__name__}: {e}")
+
+
+def test_scatter_determinism_band(r: SubTestResult):
+    print("\n--- TST-8 / A1-4: CUDA scatter-determinism release band ---")
+    # A1-4: read the value the PR-LP5 pin recorded and gate a release on out-of-band
+    # drift, even if the pin itself was in SOFT (WARN) mode. Must run AFTER the pin.
+    try:
+        import test_determinism_pin as pin
+        val = pin.LAST_CUDA_DET_VAR
+        if val is None:
+            # No CUDA on this runner (the CPU CI lane) — can't gate what wasn't measured.
+            # This is the honest hardware limitation S-4 (validate-hw) exists to close.
+            r.ok("scatter-determinism band: not measured (no CUDA on this runner) — SKIPPED")
+        elif val <= pin._CUDA_DET_BAND:
+            r.ok(f"scatter-determinism within release band ({val:.1e} <= {pin._CUDA_DET_BAND:.0e})")
+        else:
+            r.fail("scatter-determinism band",
+                   f"recorded CUDA run-to-run {val:.2e} > band {pin._CUDA_DET_BAND:.0e} "
+                   "— do not publish; resolve the atomic-add ordering regression (A1-4)")
+    except Exception as e:
+        r.fail("scatter-determinism band", f"{type(e).__name__}: {e}")

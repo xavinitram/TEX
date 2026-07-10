@@ -1,0 +1,84 @@
+{
+  "last_node_id": 2,
+  "last_link_id": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "TEX_Wrangle",
+      "pos": [
+        96,
+        128
+      ],
+      "size": [
+        420,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "OUT",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TEX_Wrangle"
+      },
+      "widgets_values": [
+        "// SDF Shapes \u2014 all four signed-distance-field primitives\n//\n// Renders a circle, box, line, and polygon in the four quadrants of the\n// image. Each SDF returns a signed distance (negative = inside) which\n// is passed through smoothstep for antialiased rendering.\n//\n// Quadrant layout:\n//   top-left  = circle       top-right  = box\n//   bot-left  = line segment  bot-right = polygon (hexagon)\n\nf$edge_soft = 0.005;   // antialiasing width (in UV space)\n\n// Pixel position in UV space (0..1)\nfloat cx = px;\nfloat cy = py;\n\n// \u2500\u2500 Circle (top-left quadrant, centered at 0.25, 0.25) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfloat d_circle = sdf_circle(cx - 0.25, cy - 0.25, 0.15);\n\n// \u2500\u2500 Box (top-right quadrant, centered at 0.75, 0.25) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfloat d_box = sdf_box(cx - 0.75, cy - 0.25, 0.14, 0.10);\n\n// \u2500\u2500 Line segment (bottom-left quadrant) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nfloat d_line = sdf_line(cx, cy, 0.10, 0.60, 0.40, 0.85);\n\n// \u2500\u2500 Polygon \u2014 hexagon (bottom-right quadrant, centered 0.75, 0.75)\nfloat d_poly = sdf_polygon(cx - 0.75, cy - 0.75, 0.14, 6);\n\n// \u2500\u2500 Composite all four shapes \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n// smoothstep maps the signed distance to a soft mask (1 inside, 0 outside)\nfloat s = $edge_soft;\nfloat m_circle = 1.0 - smoothstep(-s, s, d_circle);\nfloat m_box    = 1.0 - smoothstep(-s, s, d_box);\nfloat m_line   = 1.0 - smoothstep(-s, s, d_line);\nfloat m_poly   = 1.0 - smoothstep(-s, s, d_poly);\n\n// Give each shape a distinct color\nvec3 col = vec3(0.05);  // dark background\ncol = lerp(col, vec3(0.9, 0.2, 0.2), m_circle);   // red circle\ncol = lerp(col, vec3(0.2, 0.8, 0.3), m_box);       // green box\ncol = lerp(col, vec3(0.3, 0.5, 1.0), m_line);       // blue line\ncol = lerp(col, vec3(1.0, 0.8, 0.1), m_poly);       // yellow hexagon\n\n@OUT = col;\n",
+        "auto",
+        "none",
+        "fp32",
+        false
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PreviewImage",
+      "pos": [
+        560,
+        128
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "version": 0.4,
+  "extra": {
+    "tex_workflow": "Signed-distance-field shapes",
+    "tex_snippet_source": true
+  }
+}

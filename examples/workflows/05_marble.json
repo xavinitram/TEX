@@ -1,0 +1,84 @@
+{
+  "last_node_id": 2,
+  "last_link_id": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "TEX_Wrangle",
+      "pos": [
+        96,
+        128
+      ],
+      "size": [
+        420,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "OUT",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TEX_Wrangle"
+      },
+      "widgets_values": [
+        "// Marble \u2014 Classic turbulence-driven veined stone\n//\n// Produces a marble texture by feeding turbulence noise into a sine\n// function, creating the characteristic wavy veins. The amplitude\n// parameter controls how much the veins meander.\n//\n// Inputs:  (none \u2014 purely procedural)\n// Outputs: @OUT (vec3)\n\nf$frequency = 5.0;    // base stripe frequency along X\nf$amplitude = 5.0;    // how much turbulence displaces the veins\nf$scale     = 4.0;    // spatial scale of the turbulence field\n\nfloat x = u * $scale;\nfloat y = v * $scale;\n\n// Turbulence adds multi-octave absolute-value noise\nfloat turb = turbulence(x, y, 6);\n\n// Classic marble formula: sin sweeping across X, perturbed by turbulence\nfloat vein = sin(u * $frequency * PI + turb * $amplitude);\n\n// Remap from [-1,1] to [0,1]\nfloat t = vein * 0.5 + 0.5;\n\n// Sharpen veins with a power curve\nt = pow(t, 0.8);\n\n// Colour ramp: white stone with dark grey-blue veins\nvec3 white_stone = vec3(0.95, 0.93, 0.90);\nvec3 mid_grey    = vec3(0.55, 0.55, 0.58);\nvec3 dark_vein   = vec3(0.18, 0.18, 0.22);\n\nvec3 result = t < 0.4\n    ? lerp(dark_vein, mid_grey, t / 0.4)\n    : lerp(mid_grey, white_stone, (t - 0.4) / 0.6);\n\n@OUT = result;\n",
+        "auto",
+        "none",
+        "fp32",
+        false
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PreviewImage",
+      "pos": [
+        560,
+        128
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "version": 0.4,
+  "extra": {
+    "tex_workflow": "Marble texture (fbm)",
+    "tex_snippet_source": true
+  }
+}

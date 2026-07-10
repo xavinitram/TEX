@@ -12,6 +12,7 @@ from collections import OrderedDict as _OrderedDict
 import torch
 import logging
 from .stdlib_registry import stdlib
+from . import guard_trace  # C4-ux: guarded-division near-singularity trace (leaf, no cycle)
 
 _texlog = logging.getLogger("TEX")
 
@@ -385,7 +386,9 @@ class TEXStdlib:
     @staticmethod
     def fn_mod(a, b) -> torch.Tensor:
         a_t, b_t = _to_tensor(a), _to_tensor(b)
-        safe_b = torch.where(b_t == 0, ZERO_GUARD_EPS.get(b_t.dtype, SAFE_EPSILON), b_t)
+        zero = b_t == 0
+        guard_trace.note(zero)  # C4-ux (no-op unless armed)
+        safe_b = torch.where(zero, ZERO_GUARD_EPS.get(b_t.dtype, SAFE_EPSILON), b_t)
         return torch.fmod(a_t, safe_b)
 
     @stdlib("log2", doc='Logarithm base 2.', ex='float l = log2(256.0);')
@@ -465,6 +468,7 @@ class TEXStdlib:
         """Safe division — returns 0.0 where abs(b) < SAFE_EPSILON."""
         a_t, b_t = _to_tensor(a), _to_tensor(b)
         mask = torch.abs(b_t) < SAFE_EPSILON
+        guard_trace.note(mask)  # C4-ux (no-op unless armed)
         safe_b = torch.where(mask, torch.ones_like(b_t), b_t)
         return torch.where(mask, torch.zeros_like(a_t), a_t / safe_b)
 
@@ -849,7 +853,9 @@ class TEXStdlib:
         below-threshold denominator is replaced by ±eps carrying denom's own sign."""
         eps = ZERO_GUARD_EPS.get(denom.dtype, SAFE_EPSILON)
         eps_t = torch.as_tensor(eps, dtype=denom.dtype, device=denom.device)
-        safe = torch.where(denom.abs() < eps, torch.copysign(eps_t, denom), denom)
+        below = denom.abs() < eps
+        guard_trace.note(below)  # C4-ux (no-op unless armed)
+        safe = torch.where(below, torch.copysign(eps_t, denom), denom)
         return num / safe
 
     @stdlib("screen", doc='Screen blend: 1 - (1-a)(1-b). Brightens.', ex='@OUT = vec4(screen(@A.rgb, @B.rgb), 1.0);')

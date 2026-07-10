@@ -16,7 +16,7 @@ import re
 import time
 import torch
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 logger = logging.getLogger("TEX")
@@ -150,6 +150,21 @@ def _drop_tex_caches_on_oom() -> None:
         pass
 
 
+def _is_channels_last_image(t):
+    """A channels-last IMAGE ([B,H,W,C], C<=4). The C<=4 guard avoids mis-reading a
+    non-channels-last tensor ([B,C,H,W]) as a giant channel dim."""
+    return isinstance(t, torch.Tensor) and t.is_floating_point() and t.dim() >= 4 \
+        and t.shape[-1] <= 4
+
+
+def _paint_pixels(t, pixel_mask_keepdim, rgba):
+    """Paint the image pixels selected by `pixel_mask_keepdim` ([...,H,W,1]) a constant
+    RGBA (clipped to the channel count). The single home of the debug pixel-paint contract,
+    shared by DBG-3's magenta NaN flag and C4-ux's cyan near-singularity flag."""
+    color = torch.tensor(list(rgba)[:t.shape[-1]], dtype=t.dtype, device=t.device)
+    return torch.where(pixel_mask_keepdim, color, t)
+
+
 def _nan_highlight(t):
     """DBG-3: paint every NaN/Inf PIXEL magenta so non-finite output is obvious. For a
     [B,H,W,C] image, any non-finite channel magenta-flags the whole pixel; for a
@@ -161,15 +176,28 @@ def _nan_highlight(t):
     finite = torch.isfinite(t)
     if bool(finite.all()):
         return t
-    # channels-last image ([B,H,W,C], C<=4): magenta-flag the whole pixel. The C<=4 guard
-    # (audit) avoids mis-reading a non-channels-last tensor ([B,C,H,W]) as a giant channel
-    # dim — those fall through to the element-wise marker below.
-    if t.dim() >= 4 and t.shape[-1] <= 4:
-        C = t.shape[-1]
-        magenta = torch.tensor([1.0, 0.0, 1.0, 1.0][:C], dtype=t.dtype, device=t.device)
-        bad_pixel = (~finite).any(dim=-1, keepdim=True)
-        return torch.where(bad_pixel, magenta, t)
+    if _is_channels_last_image(t):
+        return _paint_pixels(t, (~finite).any(dim=-1, keepdim=True), (1.0, 0.0, 1.0, 1.0))
     return torch.where(finite, t, torch.ones_like(t))
+
+
+def _singularity_highlight(t, pix_mask):
+    """C4-ux: paint pixels where a guarded division hit the epsilon branch CYAN (0,1,1) —
+    distinct from DBG-3's magenta NaN. `pix_mask` is guard_trace's accumulated per-pixel
+    boolean. A no-op for a non-image tensor, an empty mask, or a shape that won't align
+    (a diagnostic must never break a cook). Applied only when debug_nan_highlight is on."""
+    if pix_mask is None or not _is_channels_last_image(t):
+        return t
+    try:
+        m = pix_mask
+        while m.dim() < t.dim() - 1:   # align rank to [..., H, W]
+            m = m.unsqueeze(0)
+        m = m.unsqueeze(-1)            # -> [..., H, W, 1] to broadcast over channels
+        if m.shape[-2] != t.shape[-2] or m.shape[-3] != t.shape[-3]:
+            return t                   # spatial dims disagree — can't localise safely
+        return _paint_pixels(t, m, (0.0, 1.0, 1.0, 1.0))
+    except Exception:
+        return t
 
 
 def _apply_cpu_threads_env() -> None:
@@ -282,7 +310,8 @@ class TEXWrangleNode(_BaseClass):
                     default=(
                         "// TEX Wrangle\n"
                         "// Read inputs with @A, @B, etc.\n"
-                        "// Write output to @OUT\n\n"
+                        "// Write output to @OUT\n"
+                        "// Right-click → TEX Snippets for 116 examples\n\n"
                         "float gray = luma(@IN);\n"
                         "@OUT = vec3(gray);\n"
                     ),
@@ -608,7 +637,7 @@ class TEXWrangleNode(_BaseClass):
         # M-4: under GPU memory pressure, run a tile-safe program in horizontal strips
         # (peak transient ~1/n). Falls back to the whole-image cook on any strip error.
         n_strips = (cls._tile_plan(ctx.program, ctx.bindings, ctx.device, ctx.latent_channel_count,
-                                   2 if ctx.eff_precision == "fp16" else 4)
+                                   2 if ctx.eff_precision == "fp16" else 4, ctx.fp)
                     if not ctx.fused_chain else None)
         if n_strips:
             try:
@@ -631,6 +660,64 @@ class TEXWrangleNode(_BaseClass):
         "torch_compile": "_run_torch_compile", "auto": "_run_auto",
         "cuda_graph": "_run_cuda_graph", "default": "_run_default",
     }
+
+    @classmethod
+    def _run_tier(cls, ctx, tier_id):
+        """Dispatch a cook to the selected tier strategy and normalize its result to an
+        output dict. Single home for the `tier method -> {name: tensor}` idiom used by
+        both execute() and the C2 re-cook path (reuse review)."""
+        out = getattr(cls, cls._TIER_METHOD[tier_id])(ctx)
+        return out if isinstance(out, dict) else {ctx.output_names[0]: out}
+
+    @classmethod
+    def _fp16_finiteness_net(cls, raw_output, auto_fp16, ctx, tier_id):
+        """C2 (extracted from execute, C1-st): the residual data-dependent safety net
+        for `precision="auto"`. Every auto->fp16 cook's output is checked for NaN/Inf
+        (the case the static gate can't rule out — a blind spot, or a pow going
+        negative). On non-finite: discard the fp16 probes, re-cook fp32, and PIN the
+        auto decision to fp32 so the program skips fp16 for all future inputs. Returns
+        the (possibly re-cooked) output dict; a no-op when the cook wasn't auto->fp16."""
+        if not (auto_fp16 and ctx.eff_precision == "fp16"):
+            return raw_output
+        if not any(isinstance(v, torch.Tensor) and not torch.isfinite(v).all()
+                   for v in raw_output.values()):
+            return raw_output
+        # F1 fix: tier_trace is imported function-locally per method (the SCC convention);
+        # the C1-st extraction moved this block out of execute() without carrying the import,
+        # so the recovery path NameError-crashed exactly when auto-fp16 overflowed.
+        from .tex_runtime import tier_trace
+        tier_trace.clear_probes()  # discard the fp16 cook's probes (no dup)
+        tier_trace.record_precision("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
+        if ctx.fp is not None:
+            _AUTO_DECISION[(ctx.fp, True, torch.device(ctx.device).type)] = \
+                ("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
+        return cls._run_tier(replace(ctx, eff_precision="fp32"), tier_id)
+
+    @classmethod
+    def _build_ui_payload(cls, elapsed_ms, device, eff_precision, debug_nan_highlight):
+        """DBG-1/C1-ux (extracted from execute, C1-st): assemble the ADDITIVE `ui=` HUD
+        payload — tier/timing/precision + C7-ux reasons + debug_print probes + the C4-ux
+        near-singularity count (present only with the debug toggle; also disarms the trace).
+        The result tuple is byte-identical whether or not this payload is attached."""
+        from .tex_runtime import tier_trace, guard_trace
+        tr = tier_trace.last()
+        pr = tier_trace.last_precision()
+        perf = {
+            "tier": tr.tier if tr is not None else "interpreter",
+            "fallback_from": tr.fallback_from if tr is not None else None,
+            "reason": tr.reason if tr is not None else None,
+            "elapsed_ms": round(elapsed_ms, 2),
+            "device": str(device),
+            "precision": pr[0] if pr is not None else eff_precision,
+            "precision_reason": pr[1] if pr is not None else None,
+        }
+        if debug_nan_highlight:  # C4-ux: count is armed with the toggle
+            perf["near_singularities"] = guard_trace.count()
+        ui_payload = {"tex_perf": [perf]}
+        probes = tier_trace.get_probes()  # LX-5: debug_print value-at-pixel taps
+        if probes:
+            ui_payload["tex_probes"] = probes
+        return ui_payload
 
     @classmethod
     def execute(cls, **kwargs):
@@ -798,8 +885,12 @@ class TEXWrangleNode(_BaseClass):
             # tiers this cycle (mirrors the compile-mode fp32 force above).
             # DBG-1: clear the tier/precision trace so the HUD payload below reflects
             # THIS cook (the trace is thread-local and persists across cooks).
-            from .tex_runtime import tier_trace
+            from .tex_runtime import tier_trace, guard_trace
             tier_trace.reset()
+            # C4-ux: arm the near-singularity trace ONLY with the debug toggle (guard hooks
+            # are a no-op otherwise — the zero-cost-when-off contract). Set the state
+            # explicitly every cook so a prior debug cook that threw can't leave it armed.
+            guard_trace.arm() if debug_nan_highlight else guard_trace.disarm()
             fp = cache.fingerprint(code, binding_types) if not fused_chain else None
             # cook resolution (H*W of the first spatial binding) — used by the auto gate
             # AND the MEM-2 downshift trim; computed ONCE (audit: was scanned twice/cook).
@@ -847,29 +938,12 @@ class TEXWrangleNode(_BaseClass):
                               eff_precision, fp, fused_chain, fused_fp)
             tier_id = cls.select_tier(compile_mode, device, fused_chain,
                                       fused_fp is not None)
-            raw_output = getattr(cls, cls._TIER_METHOD[tier_id])(ctx)
-            if not isinstance(raw_output, dict):
-                raw_output = {output_names[0]: raw_output}
+            raw_output = cls._run_tier(ctx, tier_id)
 
-            # PR-LP2 safety net (C2): every fp16 cook's output is checked for NaN/Inf — the
-            # residual data-dependent case the static gate can't rule out (a gate blind
-            # spot, or pow of a value that goes negative). If non-finite, re-cook fp32 AND
-            # pin the DECISION to fp32 so the program skips fp16 for ALL future inputs — a
-            # program that can go non-finite in fp16 for any input is declined outright.
-            if auto_fp16 and eff_precision == "fp16":
-                if any(isinstance(v, torch.Tensor) and not torch.isfinite(v).all()
-                       for v in raw_output.values()):
-                    tier_trace.clear_probes()  # discard the fp16 cook's probes (no dup)
-                    tier_trace.record_precision("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
-                    if fp is not None:
-                        _AUTO_DECISION[(fp, True, torch.device(device).type)] = \
-                            ("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
-                    ctx = ExecContext(program, bindings, type_map, device, code,
-                                      latent_channel_count, output_names, used_builtins,
-                                      "fp32", fp, fused_chain, fused_fp)
-                    raw_output = getattr(cls, cls._TIER_METHOD[tier_id])(ctx)
-                    if not isinstance(raw_output, dict):
-                        raw_output = {output_names[0]: raw_output}
+            # PR-LP2 safety net (C2): re-cook fp32 (and pin the auto decision) if an
+            # auto->fp16 cook went non-finite. Extracted to a helper (C1-st) so execute()
+            # stays within its per-function line budget and can't silently re-inline.
+            raw_output = cls._fp16_finiteness_net(raw_output, auto_fp16, ctx, tier_id)
 
             # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
             # oldest mip/grid entries; allocate-and-hold semantics untouched).
@@ -891,8 +965,9 @@ class TEXWrangleNode(_BaseClass):
             output_types_log = []
             for name in output_names:
                 raw = raw_output[name]
-                if debug_nan_highlight:  # DBG-3: only executes when the toggle is on
-                    raw = _nan_highlight(raw)
+                if debug_nan_highlight:  # DBG-3 magenta NaN + C4-ux cyan near-singularity
+                    raw = _singularity_highlight(raw, guard_trace.mask())
+                    raw = _nan_highlight(raw)  # NaN magenta wins over cyan where both
                 inferred_type = assigned_bindings[name]
                 effective_type = _map_inferred_type(inferred_type, has_latent_input)
                 result = _prepare_output(raw, effective_type)
@@ -913,24 +988,12 @@ class TEXWrangleNode(_BaseClass):
                 ", ".join(output_types_log), list(bindings.keys()),
             )
 
-            # DBG-1: per-cook tier/timing facts for the frontend HUD, carried on the v3
-            # `ui=` channel (the frontend renders a badge on the `executed` event). This
-            # is ADDITIVE — the result tuple is byte-identical with or without it. A
-            # missing tier record (pure interpreter) reads as tier='interpreter'.
-            tr = tier_trace.last()
-            pr = tier_trace.last_precision()
-            ui_payload = {"tex_perf": [{
-                "tier": tr.tier if tr is not None else "interpreter",
-                "fallback_from": tr.fallback_from if tr is not None else None,
-                "reason": tr.reason if tr is not None else None,
-                "elapsed_ms": round(elapsed_ms, 2),
-                "device": str(device),
-                "precision": pr[0] if pr is not None else eff_precision,
-                "precision_reason": pr[1] if pr is not None else None,
-            }]}
-            probes = tier_trace.get_probes()  # LX-5: debug_print value-at-pixel taps
-            if probes:
-                ui_payload["tex_probes"] = probes
+            # DBG-1/C1-ux: per-cook tier/timing/probe facts for the frontend HUD, on the v3
+            # `ui=` channel — ADDITIVE (the result tuple is byte-identical without it).
+            ui_payload = cls._build_ui_payload(elapsed_ms, device, eff_precision,
+                                               debug_nan_highlight)
+            if debug_nan_highlight:   # C4-ux: teardown lives here, not in the payload builder
+                guard_trace.disarm()
 
             # Return NodeOutput for v3 (with the HUD payload), or tuple for standalone/test.
             if _V3_AVAILABLE:
@@ -1032,7 +1095,8 @@ class TEXWrangleNode(_BaseClass):
 
     @staticmethod
     def _tile_plan(program, bindings: dict[str, Any], device,
-                   latent_channel_count: int = 0, dtype_bytes: int = 4) -> int | None:
+                   latent_channel_count: int = 0, dtype_bytes: int = 4,
+                   fingerprint: str | None = None) -> int | None:
         """M-4: strip count if the cook should be tiled (tile-safe + under memory
         pressure), else None. cuda only; needs ComfyUI's free-memory query.
         MEM-3: dtype_bytes=2 in fp16 mode halves the peak estimate (a fp16 cook that
@@ -1046,8 +1110,8 @@ class TEXWrangleNode(_BaseClass):
         if latent_channel_count:
             return None
         try:
-            from .tex_memory import is_tile_safe, estimate_peak_bytes, shared_tile_height
-            if not is_tile_safe(program):
+            from .tex_memory import is_tile_safe_cached, estimate_peak_bytes, shared_tile_height
+            if not is_tile_safe_cached(program, fingerprint):  # P4: memoized per fingerprint
                 return None
             H = shared_tile_height(bindings)
             if H is None:

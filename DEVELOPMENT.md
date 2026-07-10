@@ -385,7 +385,32 @@ python benchmarks/four_scenario_bench.py
 
 # Synthetic + example program benchmarks
 python benchmarks/run_benchmarks.py
+
+# Measure whether the Turing-calibrated perf gates hold on YOUR GPU (S-4)
+python -m TEX_Wrangle.tex_cli validate-hw
 ```
+
+### Performance facts worth knowing (P6)
+
+These are measured, non-obvious behaviours a maintainer will otherwise rediscover the hard way:
+
+- **Codegen is NOT a universal win.** A forced-codegen sweep across the 116 examples regresses
+  ~61/100 (median 0.94×) — widening the codegen route naively is *slower* on most programs
+  (color_grade is 0.43–0.57× vs the interpreter). So the default cook stays on the interpreter
+  and only routes to codegen where a measured win exists (the UC-2 stencil gate). The honest fix
+  for broad codegen routing is a cost model (deferred to v0.20); until then, **~4% of programs
+  benefit from codegen routing** — treat "just codegen everything" as a known trap.
+- **Noise `torch.compile` is `dynamic=True` (P2).** One compiled kernel serves every resolution,
+  so a resolution dance (512→1024→512) no longer thrashes torch.compile's shape guards — that was
+  a measured **134× / 5.6 s** recompile stall. CPU compile is ~13× faster than the jit.trace tier
+  (so we do NOT cap CPU at trace), and dynamic stays within ~1 fp32 ULP of the static kernel.
+  Any noise compile (or future recompile) is now surfaced in `tex doctor` (`noise_compiles`, P6).
+- **CUDA mat×vec uses an elementwise broadcast, not `matmul` (P3).** For TEX's tiny-matrix /
+  huge-per-pixel-batch shape, `(m * v.unsqueeze(-2)).sum(-1)` is 3.4–3.9× faster than `matmul` on
+  CUDA; CPU keeps `matmul` (7× faster there). Both the interpreter and codegen emit the identical
+  device-gated expression, so interp↔codegen stays bit-exact per device.
+- **`is_tile_safe` is memoized per fingerprint (P4)** — the tile-safety AST walk (~22 µs) ran every
+  CUDA cook; it's a static property, so it's cached on the same key `should_stencil_route` uses.
 
 ## Error Reporting Guidelines
 

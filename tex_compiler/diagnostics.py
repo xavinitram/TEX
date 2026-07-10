@@ -342,6 +342,29 @@ def get_keyword_hint(keyword: str) -> str | None:
     return _FOREIGN_KEYWORD_HINTS.get(keyword)
 
 
+# A5-1: identifiers reserved for the v0.20 multi-pass execution model. Unlike the foreign
+# keywords above, these are only rejected in the future BLOCK position (`pass { … }`,
+# `stage { … }`) so they stay usable as ordinary variable names elsewhere — the parser
+# fires this only when the word is followed by `{` (or `;` for bare `pass`). The hint
+# points at what to do today, mirroring the `struct` rejection's spirit.
+_V020_RESERVED_HINTS: dict[str, str] = {
+    "pass":   "`pass { … }` (multi-pass) isn't supported yet — it's the v0.20 execution "
+              "model. For a multi-stage pipeline today, chain TEX Wrangle nodes; see the "
+              "wiki 'Batch and Temporal Processing'.",
+    "stage":  "`stage { … }` (multi-stage) isn't supported yet — it's the v0.20 multi-pass "
+              "model. Chain TEX Wrangle nodes for now.",
+    "kernel": "TEX has no `kernel { … }` blocks — every program is already a per-pixel "
+              "kernel. Write the expression directly and assign @OUT.",
+    "image":  "There's no `image { … }` block — inputs are @A..@H and output is @OUT. A "
+              "multi-stage pipeline is chained TEX nodes today (v0.20 adds in-node passes).",
+}
+
+
+def get_v020_reserved_hint(word: str) -> str | None:
+    """A5-1: hint for a v0.20-reserved word used in block position, or None."""
+    return _V020_RESERVED_HINTS.get(word)
+
+
 # ── Diagnostic builder helpers ────────────────────────────────────────
 
 def make_diagnostic(

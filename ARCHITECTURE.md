@@ -40,6 +40,17 @@ Three layers; **imports point downward only**. The `tex_compiler` package has
 | **Public API** (host-agnostic) | `tex_api` (`compile`/`execute`/`Program`, PORT-2), `tex_cli` (`tex run`, PORT-3) | runtime + compiler |
 | **Orchestration** | `tex_node` (+ `tex_doctor` route, DBG-4), `tex_fusion` | all of the above |
 
+**`tex_core` boundary (S-1, doc 30/35).** The ComfyUI-adapter layer is exactly three
+files — `tex_node.py`, `__init__.py`, `tex_runtime/host.py`; **every other module is
+`tex_core`** and imports no ComfyUI surface (`comfy*`/`server`/`folder_paths`/`nodes`).
+This is machine-enforced by `test_s1_core_no_comfy` (a package-level lint) and exercised
+by `test_s1_comfyui_free_execution` (blocks every comfy import, then drives
+`TEXWrangleNode.execute` + `tex_api.compile`). The whole suite already runs ComfyUI-free
+(comfy is not on the CI path), so CI **is** the standalone lane — the payoff of a physical
+`tex_core/` package split without the churn. The physical `git mv` reroot is deferred to a
+live-ComfyUI session (import-path verification can't be done headlessly); the manifest above
+is the split's contents.
+
 **Coupling hubs** (Appendix A, doc 24): `tex_node` fan-out 12; `ast_nodes` fan-in 11
 (pure data — fine). `type_checker` was fan-in 9 (the `TEXType` leak — 9 modules imported
 the *checker* just to know what a `vec3` is); **STR-1 relocated `TEXType`/`TEXArrayType`/
@@ -158,10 +169,13 @@ the raw fp16 win (~1.35–1.45×) is available, without the safety net, via expe
 (`img_*`, `arr_*`) accumulate in fp32 (an fp16 sum overflows to inf at ≥1024²); an
 out-of-fp16-range literal / a large-value `vec()` also stays fp32 (interp==codegen).
 
-## The 14-cache architecture
+## The 15-cache architecture
 
 Non-redundant by design — each store keys on a different thing (source-hash vs
 `id()`-type_map vs device/precision tuple vs AST-fingerprint vs resolution-bucket)
 with a distinct lifecycle (persist-across-restart vs per-run-clear vs LRU). Do not
 "consolidate" them (doc 24 §6). #14 is `tex_lazy._memo` (code-hash × fp32 param bits →
-required-binding set; shared by `check_lazy_status` and `execute()`).
+required-binding set; shared by `check_lazy_status` and `execute()`). #15 is
+`tex_node._AUTO_DECISION` (fingerprint × resolution-bucket × device → the `precision="auto"`
+fp16/fp32 gate decision — the *decision*, not the per-cook finiteness verdict; bounded LRU,
+cleared at 512 entries). The count here must match AGENTS.md (a DOC-7b check enforces it).

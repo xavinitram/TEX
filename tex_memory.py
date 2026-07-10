@@ -9,6 +9,7 @@ models. `free_tensor_caches` drops every module-level tensor cache TEX holds.
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 
 import torch
 
@@ -46,6 +47,32 @@ def is_tile_safe(program) -> bool:
             return False
         stack.extend(_iter_children(n))
     return True
+
+
+# P4: is_tile_safe is a full AST walk (~22 us) run every CUDA cook in `_tile_plan`.
+# Tile-safety is a STATIC property of the program, so memoize it on the same cook
+# fingerprint `should_stencil_route` keys on (mirrors `_stencil_route_memo` exactly,
+# cap included) -- the walk then runs once per program, not once per cook.
+_TILE_SAFE_MEMO_MAX = 256
+_tile_safe_memo: "OrderedDict[str, bool]" = OrderedDict()
+
+
+def is_tile_safe_cached(program, fingerprint) -> bool:
+    """`is_tile_safe(program)` memoized per cook fingerprint (P4). `fingerprint=None`
+    (a fused chain, whose AST is spliced per-cook) falls through to the uncached walk.
+    Stored values are always bool, so a `.get() is None` unambiguously means 'absent'
+    (a cached False is served, not recomputed) -- identical to `should_stencil_route`."""
+    if fingerprint is None:
+        return is_tile_safe(program)
+    v = _tile_safe_memo.get(fingerprint)
+    if v is None:
+        v = is_tile_safe(program)
+        _tile_safe_memo[fingerprint] = v
+        while len(_tile_safe_memo) > _TILE_SAFE_MEMO_MAX:
+            _tile_safe_memo.popitem(last=False)
+    else:
+        _tile_safe_memo.move_to_end(fingerprint)
+    return v
 
 # stdlib calls whose peak is dominated by extra full-frame allocations.
 _SAMPLE_FAMILY = frozenset({

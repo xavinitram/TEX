@@ -31,9 +31,16 @@ jobs:
       # torch_compile tier branches don't execute here (they lower local coverage
       # to ~82%; the .coveragerc fail_under=82 gates CUDA-capable local runs).
       - name: Run tests (publish gate) + coverage
-        run: >
-          python -m pytest tests/ -v -m 'not slow'
-          --cov=TEX_Wrangle --cov-report=term-missing --cov-fail-under=70
+        # The tests import the package as `TEX_Wrangle`, but the GitHub repo is named
+        # `TEX`, so the default checkout dir is `TEX` -> `import TEX_Wrangle` fails. Run the
+        # gate against a `TEX_Wrangle`-named copy (leaving the root checkout untouched so the
+        # publish step below still finds pyproject.toml at the workspace root).
+        run: |
+          mkdir -p /tmp/texpkg
+          cp -r "$GITHUB_WORKSPACE/." /tmp/texpkg/TEX_Wrangle
+          cd /tmp/texpkg/TEX_Wrangle
+          python -m pytest tests/ -v -m 'not slow' \
+            --cov=TEX_Wrangle --cov-report=term-missing --cov-fail-under=70
       - name: Publish Custom Node
         uses: Comfy-Org/publish-node-action@main
         with:

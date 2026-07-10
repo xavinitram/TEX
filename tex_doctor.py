@@ -66,6 +66,7 @@ def _tier_facts():
 def collect_doctor_facts() -> dict:
     """Flat, never-raising environment report (see module docstring)."""
     from .tex_runtime import tier_trace
+    from .tex_runtime.arch_support import current_arch_status
     return {
         "torch": _fact(_torch_facts),
         "triton": _fact(lambda: {"present": _has_module("triton")}),
@@ -73,4 +74,6 @@ def collect_doctor_facts() -> dict:
         "cache": _fact(_cache_facts),
         "tiers": _fact(_tier_facts),
         "recent_tiers": _fact(tier_trace.recent),
+        "arch": _fact(current_arch_status),  # S-5: verified-arch caveat
+        "noise_compiles": _fact(tier_trace.noise_compiles),  # P6: noise compile visibility
     }

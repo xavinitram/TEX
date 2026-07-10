@@ -50,6 +50,22 @@ def recent():
     return list(_ring)
 
 
+# P6: a small ring of noise torch.compile events, so the one-time compile pause (and any
+# future shape recompile — P2's dynamic=True should keep this at one entry per program) is
+# VISIBLE in `tex doctor` / the HUD instead of a mystery stall.
+_noise_ring = collections.deque(maxlen=16)
+
+
+def record_noise_compile(name, ms, kind="compile"):
+    """P6: record that a noise fn (`name`) was torch.compiled, taking `ms` ms."""
+    _noise_ring.append({"noise": name, "ms": round(float(ms), 1), "kind": kind})
+
+
+def noise_compiles():
+    """P6: recent noise compile events (newest last), for `tex doctor` / the HUD."""
+    return list(_noise_ring)
+
+
 def last():
     """The last cook's TierRecord on this thread, or None."""
     return getattr(_local, "last", None)

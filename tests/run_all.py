@@ -54,6 +54,7 @@ from test_codegen_optimizer import (
     test_optimizer_passes, test_optimizer_type_consistency,
     test_optimizer_isint_unary, test_optimizer_pure_fn_cse_licm,
     test_optimizer_dce_side_effects, test_codegen_audit_fixes,
+    test_codegen_sample_hoist_in_branches,
 )
 from test_aliasing_cow import (
     test_cow_channel_array_writes, test_cow_binding_and_function_holes,
@@ -104,13 +105,13 @@ from test_v016_phase4 import (
     test_sl2_fp16_divide_guard,
 )
 from test_no_numpy_ban import test_no_numpy_ban
-from test_release_gate import test_version_consistency, test_codegen_determinism
+from test_release_gate import test_version_consistency, test_codegen_determinism, test_scatter_determinism_band
 from test_v017_phase1 import (
     test_tst5_tier_trace,
     test_tst6_registry_parity,
     test_tst2_edge_matrix,
     test_tst4_operator_completeness,
-    test_tst1_differential_fuzzer,
+    test_tst1_differential_fuzzer, test_a1_1_auto_precision_fuzz,
     test_tst7_runner_coverage,
 )
 from test_v017_phase2 import (
@@ -124,11 +125,15 @@ from test_v017_phase3 import (
 )
 from test_cross_device_envelope import test_prlp1_cross_device_envelope
 from test_determinism_pin import test_prlp5_determinism_pin
-from test_v018_docs import test_doc7b_map_drift, test_reg1b_doc_ex_populated
+from test_v018_docs import test_doc7b_map_drift, test_reg1b_doc_ex_populated, test_c5ux_no_render_overstatement, test_c6st_cache_count_agree, test_c3ux_error_codes_resolve
+from test_v019_phase1 import (test_a1_2_fusion_lazy_precision_tiers, test_c2st_fp16_taxonomy_federated, test_c3st_gm_rules, test_c1st_execute_line_budget, test_c4st_js_loc_ratchet, test_a1_6_cli_argv)
+from test_v019_phase2 import (test_s1_core_no_comfy, test_s1_comfyui_free_execution,
+    test_s5_arch_caveat, test_s5_doctor_carries_caveat, test_s4_validate_hw_cli,
+    test_s4_validate_hw_runs, test_s4_validate_hw_console_cp1252_safe)
 from test_v018_precision import (
     test_prlp4_fp16_safe_reductions, test_prlp4_arr_reductions_fp16_safe,
     test_prlp2_auto_gate, test_prlp2_fp16_accuracy_fuzzer, test_prlp2_node_path_perf,
-    test_c1_amplification_gate, test_c2_data_dependent_nan,
+    test_c1_amplification_gate, test_c2_data_dependent_nan, test_c2_finiteness_net_recovers,
 )
 from test_v018_memory import (
     test_mem2_pool_trim_gating, test_mem3_fp16_estimator, test_mem4_per_device_budget,
@@ -279,6 +284,7 @@ def main():
     test_optimizer_pure_fn_cse_licm(r)
     test_optimizer_dce_side_effects(r)
     test_codegen_audit_fixes(r)
+    test_codegen_sample_hoist_in_branches(r)
     test_compiled_audit_fixes(r)
     test_fusion_memo(r)
     test_node_helpers(r)
@@ -322,6 +328,7 @@ def main():
     test_tst2_edge_matrix(r)
     test_tst4_operator_completeness(r)
     test_tst1_differential_fuzzer(r)
+    test_a1_1_auto_precision_fuzz(r)
     test_tst7_runner_coverage(r)
     test_reg1_registry_parity(r)
     test_tst3_taxonomy_consistency(r)
@@ -339,8 +346,57 @@ def main():
     # v0.18.0 Phase 0 — stability pins + doc integrity
     test_prlp1_cross_device_envelope(r)
     test_prlp5_determinism_pin(r)
+    test_scatter_determinism_band(r)  # A1-4: reads the pin's recorded value; must follow it
     test_doc7b_map_drift(r)
     test_reg1b_doc_ex_populated(r)
+    test_c5ux_no_render_overstatement(r)
+    test_c6st_cache_count_agree(r)
+    test_c3ux_error_codes_resolve(r)
+    test_a1_2_fusion_lazy_precision_tiers(r)
+    test_c2st_fp16_taxonomy_federated(r)
+    test_c3st_gm_rules(r)
+    test_c1st_execute_line_budget(r)
+    test_c4st_js_loc_ratchet(r)
+    test_a1_6_cli_argv(r)
+    test_s1_core_no_comfy(r)
+    test_s1_comfyui_free_execution(r)
+    test_s5_arch_caveat(r)
+    test_s5_doctor_carries_caveat(r)
+    test_s4_validate_hw_cli(r)
+    test_s4_validate_hw_runs(r)
+    test_s4_validate_hw_console_cp1252_safe(r)
+
+    from test_v019_phase3 import (test_c6ux_default_code_snippet_hint, test_s3_cheatsheet_drift,
+        test_s3_worked_examples_compile, test_s2_workflows_smoke, test_s2_workflows_drift,
+        test_c4ux_cyan_on_singularity, test_c4ux_clean_no_cyan, test_c4ux_additive_and_zero_cost_off,
+        test_c1ux_c2ux_frontend_present, test_c2ux_doctor_payload_shape)
+    test_c6ux_default_code_snippet_hint(r)
+    test_s3_cheatsheet_drift(r)
+    test_s3_worked_examples_compile(r)
+    test_s2_workflows_smoke(r)
+    test_s2_workflows_drift(r)
+    test_c4ux_cyan_on_singularity(r)
+    test_c4ux_clean_no_cyan(r)
+    test_c4ux_additive_and_zero_cost_off(r)
+    test_c1ux_c2ux_frontend_present(r)
+    test_c2ux_doctor_payload_shape(r)
+
+    from test_v019_phase4 import (test_p3_matvec_interp_codegen_bit_exact,
+        test_p3_cuda_matches_matmul_within_ulp, test_p3_cpu_keeps_matmul,
+        test_p4_tile_safe_memo, test_p4_memo_key_is_cook_fingerprint,
+        test_p2_noise_compile_dynamic, test_p6_noise_compile_visibility,
+        test_a5_1_reserved_word_hints, test_a5_2_recursive_examples,
+        test_f5_codegen_scalar_loop_no_crash)
+    test_p3_matvec_interp_codegen_bit_exact(r)
+    test_p3_cuda_matches_matmul_within_ulp(r)
+    test_p3_cpu_keeps_matmul(r)
+    test_p4_tile_safe_memo(r)
+    test_p4_memo_key_is_cook_fingerprint(r)
+    test_p2_noise_compile_dynamic(r)
+    test_p6_noise_compile_visibility(r)
+    test_a5_1_reserved_word_hints(r)
+    test_a5_2_recursive_examples(r)
+    test_f5_codegen_scalar_loop_no_crash(r)
 
     # v0.18.0 Phase 1 — precision core
     test_prlp4_fp16_safe_reductions(r)
@@ -350,6 +406,7 @@ def main():
     test_prlp2_node_path_perf(r)
     test_c1_amplification_gate(r)
     test_c2_data_dependent_nan(r)
+    test_c2_finiteness_net_recovers(r)
     test_mem2_pool_trim_gating(r)
     test_mem3_fp16_estimator(r)
     test_mem4_per_device_budget(r)

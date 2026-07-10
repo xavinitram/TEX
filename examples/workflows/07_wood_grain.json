@@ -1,0 +1,84 @@
+{
+  "last_node_id": 2,
+  "last_link_id": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "TEX_Wrangle",
+      "pos": [
+        96,
+        128
+      ],
+      "size": [
+        420,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "OUT",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TEX_Wrangle"
+      },
+      "widgets_values": [
+        "// Wood Grain \u2014 Concentric rings with FBM perturbation\n//\n// Generates realistic wood-like rings by computing distance from a\n// centre point, multiplying by a ring frequency, then perturbing the\n// result with FBM noise. A colour ramp maps from light to dark wood.\n//\n// Inputs:  (none \u2014 purely procedural)\n// Outputs: @OUT (vec3)\n\nf$ring_freq   = 20.0;    // number of rings across the surface\nf$noise_scale = 4.0;     // scale of the FBM perturbation\nf$noise_amp   = 2.5;     // strength of the FBM perturbation\nf$center_x    = 0.5;     // ring centre X (0-1 UV space)\nf$center_y    = 0.5;     // ring centre Y (0-1 UV space)\n\nfloat x = u * $noise_scale;\nfloat y = v * $noise_scale;\n\n// Distance from ring centre\nfloat dist = distance(vec2(u, v), vec2($center_x, $center_y));\n\n// Perturb with FBM for organic variation\nfloat perturbation = fbm(x, y, 4) * $noise_amp;\n\n// Concentric rings\nfloat ring = sin(dist * $ring_freq + perturbation);\n\n// Remap sin output from [-1,1] to [0,1]\nfloat t = ring * 0.5 + 0.5;\n\n// Wood colour palette: light sapwood to dark heartwood\nvec3 light_wood = vec3(0.85, 0.65, 0.35);\nvec3 mid_wood   = vec3(0.55, 0.35, 0.15);\nvec3 dark_wood  = vec3(0.30, 0.18, 0.08);\n\n// Two-segment ramp\nvec3 result = t < 0.5\n    ? lerp(dark_wood, mid_wood, t * 2.0)\n    : lerp(mid_wood, light_wood, (t - 0.5) * 2.0);\n\n@OUT = result;\n",
+        "auto",
+        "none",
+        "fp32",
+        false
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PreviewImage",
+      "pos": [
+        560,
+        128
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "version": 0.4,
+  "extra": {
+    "tex_workflow": "Wood-grain texture",
+    "tex_snippet_source": true
+  }
+}

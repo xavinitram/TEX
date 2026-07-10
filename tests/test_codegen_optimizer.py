@@ -1607,6 +1607,91 @@ for (int i = 0; i < 3; i = i + 1) {
 @OUT = vec4(acc, 1.0);
 """)
 
+    # ── LICM after const-propagation: an untouched loop-invariant line whose
+    # type_map entry was orphaned by const-prop's whole-tree rebuild, then
+    # re-typed via id() reuse (bilateral_approx `_licm0` int/float regression).
+    # `v + float(dy)/ih` references none of the propagated sigma_* locals, so
+    # const-prop must keep its node identity (and FLOAT type). Before the fix
+    # the fresh node reused a freed INT node's id, so LICM declared `_licm0`
+    # int and the mandatory post-optimize re-type-check rejected it.
+    _check("LICM invariant survives const-prop (bilateral shape)", """
+float sigma_s = 2.0;
+float sigma_r = 0.1;
+float inv_2ss = -0.5 / (sigma_s * sigma_s);
+float inv_2sr = -0.5 / (sigma_r * sigma_r);
+vec3 acc = vec3(0.0);
+float wsum = 0.0;
+for (int dy = -2; dy <= 2; dy = dy + 1) {
+    for (int dx = -2; dx <= 2; dx = dx + 1) {
+        float su = u + float(dx) / iw;
+        float sv = v + float(dy) / ih;
+        vec3 nb = sample(@A, su, sv);
+        float d2 = float(dx * dx + dy * dy);
+        float ws = exp(d2 * inv_2ss);
+        vec3 diff = nb - @A;
+        float cd = diff.r * diff.r + diff.g * diff.g + diff.b * diff.b;
+        float wr = exp(cd * inv_2sr);
+        float w = ws * wr;
+        acc = acc + nb * w;
+        wsum = wsum + w;
+    }
+}
+@OUT = acc / wsum;
+""")
+
+    # The exact reported bug: the shipped example must compile through the real
+    # cache path (which passes type_map to optimize(), unlike the example-suite
+    # helper), with the image bound as VEC3.
+    try:
+        ex = Path(__file__).resolve().parent.parent / "examples" / "bilateral_approx.tex"
+        TEXCache(cache_dir=Path(tempfile.mkdtemp())).compile_tex(
+            ex.read_text(encoding="utf-8"), {"image": TEXType.VEC3})
+        r.ok("type-consistency: shipped bilateral_approx.tex compiles (image=VEC3)")
+    except Exception as e:
+        r.fail("type-consistency: shipped bilateral_approx.tex compiles (image=VEC3)",
+               f"{e}\n{traceback.format_exc()}")
+
+    # Deterministic (allocator-independent) mechanism check: const-propagation
+    # must NOT rebuild an expression that references none of the propagated
+    # locals — rebuilding orphans its id()-keyed type_map entry and is the root
+    # cause of the id()-reuse mistyping above.
+    try:
+        from TEX_Wrangle.tex_compiler.optimizer import _propagate_literal_locals
+        from TEX_Wrangle.tex_compiler.ast_nodes import (
+            VarDecl as _VD, iter_child_nodes as _icn)
+        src = """
+float k = 2.0;
+vec3 acc = vec3(0.0);
+for (int dy = -2; dy <= 2; dy = dy + 1) {
+    float sv = v + float(dy) / ih;
+    acc = acc + @A * sv;
+}
+@OUT = acc + @A * (k * 0.0);
+"""
+        prog = Parser(Lexer(src).tokenize(), source=src).parse()
+
+        def _walk(n):
+            yield n
+            for c in _icn(n):
+                yield from _walk(c)
+
+        def _sv_init(p):
+            for n in _walk(p):
+                if isinstance(n, _VD) and n.name == "sv":
+                    return n.initializer
+            return None
+
+        before = _sv_init(prog)
+        prog.statements = _propagate_literal_locals(prog.statements)
+        after = _sv_init(prog)
+        assert before is not None and after is before, (
+            "const-prop rebuilt the untouched 'sv' initializer, orphaning its "
+            "type_map entry")
+        r.ok("type-consistency: const-prop preserves untouched-subtree identity")
+    except Exception as e:
+        r.fail("type-consistency: const-prop preserves untouched-subtree identity",
+               f"{e}\n{traceback.format_exc()}")
+
 
 def _run_optimized_pipeline(code, bindings):
     """Mirror the real ComfyUI node path (cache.compile_tex: optimize + the
@@ -2178,3 +2263,120 @@ float acc = 0.0;
 for (int i = 0; i < 3; i = i + 1) { acc = acc + s; }
 m@OUT = acc * 0.2;
 """, {"A": img.clone()})
+
+
+def test_codegen_sample_hoist_in_branches(r: SubTestResult):
+    """CG-B3: a hoisted sample() setup inside an if/else branch is BRANCH-LOCAL.
+
+    _hoist_sample_setup emits the BCHW permute view + reusable grid buffer at the
+    CURRENT indent (not the preamble) and memoizes the temp names in
+    self._hoisted_bchw. _emit_if_else re-emits its bodies once per branch AND
+    duplicates them across the scalar-vs-spatial runtime paths; the memo made the
+    second emission SKIP the allocation while still referencing the temp, so the
+    generated function raised `UnboundLocalError: _tNN` on whichever path did not
+    allocate it. Discovered forcing examples/zdefocus.tex (a dynamic-bound
+    sample() loop inside an `if (coc < 0.5) {...} else {...}`) through
+    _codegen_only_execute during the v0.19 perf audit.
+
+    The loops use a DYNAMIC scalar bound (int(min(iw, N))) so they compile through
+    _emit_general_for_loop -> _hoist_sample_setup (the hoisted inline grid_sample
+    path). A static `for (i < N)` range would use the _fn_sample fallback and
+    never hoist, so it would not exercise this bug.
+    """
+    print("\n--- Codegen Sample-Hoist Branch-Scope Tests (CG-B3) ---")
+
+    torch.manual_seed(7)
+    imgA = torch.rand(1, 8, 8, 3)
+    imgB = torch.rand(1, 8, 8, 3)
+
+    # (a) zdefocus's shape: outer spatial-conditioned if/else whose else-branch
+    # holds per-field accumulators, a dynamic sample() loop, and nested
+    # normalization if/elses. The else body is emitted on BOTH the scalar and the
+    # spatial runtime path — each must re-hoist its own grid buffer.
+    zdefocus_shape = """
+int ns = int(min(iw, 8.0));
+vec3 acc_far = vec3(0.0);
+vec3 acc_near = vec3(0.0);
+float wsum_far = 0.0;
+float wsum_near = 0.0;
+if (@A.r < 0.5) {
+    @OUT = @A;
+} else {
+    for (int i = 0; i < ns; i++) {
+        float t = float(i) / float(ns);
+        float su = clamp(u + (t - 0.5) * 0.2, 0.0, 1.0);
+        float sv = clamp(v + (t - 0.5) * 0.2, 0.0, 1.0);
+        vec3 s = sample(@A, su, sv);
+        float wf = step(0.25, s.r);
+        acc_far = acc_far + s * wf;
+        wsum_far = wsum_far + wf;
+        float wn = step(s.g, 0.75);
+        acc_near = acc_near + s * wn;
+        wsum_near = wsum_near + wn;
+    }
+    vec3 far_color = vec3(0.0);
+    if (wsum_far > 0.0) { far_color = acc_far / wsum_far; } else { far_color = @A; }
+    vec3 near_color = vec3(0.0);
+    if (wsum_near > 0.0) { near_color = acc_near / wsum_near; } else { near_color = @A; }
+    @OUT = near_color * 0.5 + far_color * 0.5;
+}
+"""
+    _equiv_strict(r, "sample hoist: zdefocus-shape loop in if/else else-branch",
+                  zdefocus_shape, {"A": imgA.clone()})
+    try:
+        src = _codegen_source(zdefocus_shape, {"A": imgA})
+        # _torch.empty( is emitted ONLY by _hoist_sample_setup (the grid buffer).
+        n_grid = src.count("_torch.empty(")
+        # Scalar path + spatial path each re-hoist @A -> >= 2 grid buffers. Pre-fix
+        # this collapsed to 1 (shared across branches -> unbound temp).
+        assert n_grid >= 2, f"grid buffer hoisted {n_grid}x; expected per-branch (>=2)"
+        r.ok("sample hoist: grid buffer re-hoisted per branch (no shared temp)")
+    except Exception as e:
+        r.fail("sample hoist: grid buffer re-hoisted per branch (no shared temp)",
+               f"{e}\n{traceback.format_exc()}")
+
+    # (b) Both branches of a spatial if/else carry their OWN sample() loop —
+    # exercises the then-vs-else duplication within the scalar path as well.
+    _equiv_strict(r, "sample hoist: each if/else branch has its own sample loop", """
+int ns = int(min(iw, 4.0));
+vec3 col = vec3(0.0);
+if (@A.g > 0.5) {
+    for (int i = 0; i < ns; i++) { col = col + sample(@A, clamp(u + float(i) * 0.02, 0.0, 1.0), v); }
+} else {
+    for (int i = 0; i < ns; i++) { col = col + sample(@A, clamp(u - float(i) * 0.02, 0.0, 1.0), v); }
+}
+@OUT = col / float(ns);
+""", {"A": imgA.clone()})
+
+    # (c) Two distinct sampled bindings inside the else-branch loop — the grid
+    # buffers for BOTH @A and @B must be re-hoisted on the duplicated path.
+    _equiv_strict(r, "sample hoist: two bindings sampled in else-branch loop", """
+int ns = int(min(iw, 6.0));
+vec3 acc = vec3(0.0);
+float w = 0.0;
+if (@A.b < 0.5) {
+    @OUT = @B;
+} else {
+    for (int i = 0; i < ns; i++) {
+        float su = clamp(u + float(i) * 0.03, 0.0, 1.0);
+        vec3 a = sample(@A, su, v);
+        vec3 b = sample(@B, su, v);
+        acc = acc + a * 0.5 + b * 0.5;
+        w = w + 1.0;
+    }
+    if (w > 0.0) { @OUT = acc / w; } else { @OUT = @A; }
+}
+""", {"A": imgA.clone(), "B": imgB.clone()})
+
+    # (d) While-loop variant (also routes through _hoist_sample_setup), with the
+    # sample loop nested one level deeper inside the else-branch.
+    _equiv_strict(r, "sample hoist: while-loop sample in if/else else-branch", """
+vec4 acc = vec4(0.0);
+if (@A.r > 0.5) {
+    @OUT = @A;
+} else {
+    float i = 0.0;
+    while (i < min(iw, 4.0)) { acc = acc + sample(@A, u, v); i = i + 1.0; }
+    @OUT = acc * 0.25;
+}
+""", {"A": torch.rand(1, 8, 8, 4)})

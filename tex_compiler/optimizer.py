@@ -122,9 +122,35 @@ def optimize(program: Program, type_map: dict | None = None) -> Program:
 
 # ── UC-4: constant propagation of literal locals ──────────────────────
 
+def _expr_reads_name(expr, names) -> bool:
+    """True if `expr` contains an Identifier read of any name in `names`.
+
+    Only plain Identifiers count — the names in `subs` are local scalars, and
+    _subst_expr only rewrites matching Identifier nodes (never BindingRef), so
+    this exactly predicts whether substitution would change anything here."""
+    stack = [expr]
+    while stack:
+        n = stack.pop()
+        if type(n) is Identifier and n.name in names:
+            return True
+        stack.extend(_iter_children(n))
+    return False
+
+
 def _subst_all_literals(expr, subs: dict) -> ASTNode:
     if expr is None:
         return None
+    # Identity-preservation: if none of the propagated locals occur in this
+    # expression, return it UNCHANGED (same node objects) instead of rebuilding
+    # it. _subst_expr reconstructs every interior node it visits, so rebuilding
+    # an untouched subtree would orphan its id()-keyed type_map entries. A
+    # later-allocated node reusing a freed id() then reads a STALE type, and
+    # CSE/LICM would declare a temp with that wrong type — which the mandatory
+    # post-optimize re-type-check rejects. (Root cause of the bilateral_approx
+    # `_licm0` int/float TypeCheckError: the untouched `v + float(dy)/ih` line
+    # was rebuilt, and the fresh node reused a freed INT node's id.)
+    if not _expr_reads_name(expr, subs):
+        return expr
     for name, (val, is_int) in subs.items():
         expr = _subst_expr(expr, name, val, is_int)
     return expr

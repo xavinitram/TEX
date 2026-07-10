@@ -1,0 +1,13 @@
+// Recursive fractal noise — fbm written as a genuinely RECURSIVE user function.
+// Each level halves the amplitude and doubles the frequency; the recursion DEPTH is
+// the octave count. This shows TEX supports real recursion (a function calling itself),
+// not just for/while loops. Connect any image to @A (only its size is used here).
+
+float fractal(float x, float y, float amp, float freq, int depth) {
+    if (depth <= 0) { return 0.0; }
+    float here = perlin(x * freq, y * freq) * amp;
+    return here + fractal(x, y, amp * 0.5, freq * 2.0, depth - 1);
+}
+
+float f = fractal(u, v, 0.5, 4.0, 5);   // 5 octaves via recursion depth
+@OUT = vec4(vec3(f * 0.5 + 0.5), 1.0);

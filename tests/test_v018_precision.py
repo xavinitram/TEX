@@ -342,3 +342,46 @@ def test_c2_data_dependent_nan(r: SubTestResult):
         r.fail("C2 data-dependent NaN", "; ".join(fails))
     else:
         r.ok(f"C2: {note}")
+
+
+def test_c2_finiteness_net_recovers(r: SubTestResult):
+    print("\n--- C2/F1: the finiteness net RECOVERS (doesn't crash) when auto-fp16 overflows ---")
+    # F1 regression guard: the C1-st extraction moved this block out of execute() without its
+    # tier_trace import, so it NameError-crashed exactly when auto accepted fp16 but the output
+    # went non-finite (the gate's blind spot). The other C2 test only uses gate-DECLINED
+    # programs, so the net returns early and never reaches the crash lines — this drives the
+    # net's real recovery body: auto_fp16=True, eff_precision='fp16', a NON-finite output.
+    from TEX_Wrangle.tex_node import TEXWrangleNode as N, ExecContext
+    from TEX_Wrangle import tex_api
+    prog = tex_api.compile("@OUT = vec4(@A.rgb, 1.0);", {"A": TEXType.VEC3, "OUT": TEXType.VEC4})
+    ctx = ExecContext(program=prog.ast, bindings={"A": torch.rand(1, 8, 8, 3)},
+                      type_map=prog.type_map, device="cpu", code="@OUT = vec4(@A.rgb, 1.0);",
+                      latent_channel_count=0, output_names=["OUT"],
+                      used_builtins=prog.used_builtins, eff_precision="fp16", fp=None)
+    try:
+        out = N._fp16_finiteness_net({"OUT": torch.tensor([float("inf")])}, True, ctx, "default")
+    except Exception as e:
+        r.fail("F1 crash", f"finiteness net raised {type(e).__name__}: {e} (the F1 NameError)")
+        return
+    t = out.get("OUT")
+    ok_unit = isinstance(t, torch.Tensor) and bool(torch.isfinite(t).all())
+
+    # And end-to-end through the REAL execute(): force auto->fp16 on an fp16-OVERFLOWING
+    # program (CUDA only — auto is a no-op on CPU); the node must ship finite pixels, not crash.
+    e2e = "skipped (no CUDA)"
+    if torch.cuda.is_available():
+        import TEX_Wrangle.tex_runtime.precision_policy as pp
+        orig = pp.resolve_auto_precision
+        pp.resolve_auto_precision = lambda *a, **k: ("fp16", "forced (F1 test)")
+        try:
+            code = "@OUT = vec4(vec3(@A.r * 50000.0 * 50000.0), 1.0);"  # >> fp16 max -> inf
+            o = N.execute(code=code, A=torch.full((1, 1024, 1024, 3), 1.0, device="cuda"),
+                          device="cuda", precision="auto")[0]
+            e2e = "0 non-finite" if int((~torch.isfinite(o)).sum()) == 0 else "SHIPPED non-finite"
+        finally:
+            pp.resolve_auto_precision = orig
+
+    if ok_unit and e2e in ("0 non-finite", "skipped (no CUDA)"):
+        r.ok(f"finiteness net recovers to finite fp32 (no F1 crash); e2e: {e2e}")
+    else:
+        r.fail("C2 finiteness recovery", f"unit-finite={ok_unit}, e2e={e2e}")

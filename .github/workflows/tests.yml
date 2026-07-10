@@ -29,8 +29,10 @@ jobs:
       - name: Install dependencies
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pytest
+          pip install pytest pytest-cov
 
-      - name: Run tests
+      - name: Run tests (with coverage — A1-3, gates per-PR not just at publish)
         working-directory: TEX_Wrangle
-        run: python -m pytest tests/ -v -m 'not slow'
+        # --cov-config reads .coveragerc (source=TEX_Wrangle, omit .tex_cache, fail_under=82).
+        # The gate now fires on every PR; previously coverage ran only in publish_action.yml.
+        run: python -m pytest tests/ -v -m 'not slow' --cov=TEX_Wrangle --cov-config=.coveragerc --cov-report=term-missing

@@ -1,7 +1,7 @@
 # TEX Examples Index
 
 > **Generated** by `tools/gen_examples_index.py` from the `// Name — desc`
-> header of each `examples/*.tex`. 114 examples. Do not edit by hand.
+> header of each `examples/*.tex`. 116 examples. Do not edit by hand.
 
 | Example | Description |
 |---------|-------------|
@@ -88,7 +88,9 @@
 | [Posterize](examples/posterize.tex) | Quantise pixel values to a limited number of discrete levels |
 | [Premultiply](examples/premultiply.tex) | premultiply / unpremultiply alpha round-trip |
 | [Radial gradient](examples/radial_gradient.tex) | circular falloff from center |
+| [Recursive fractal noise](examples/recursive_fractal.tex) | fbm written as a genuinely RECURSIVE user function. |
 | [Mandelbrot Fractal](examples/recursive_pattern.tex) | escape-time fractal with cosine palette |
+| [Recursive subdivision](examples/recursive_subdivision.tex) | refine detail by recursively descending into finer cells |
 | [Sample Comparison](examples/sample_comparison.tex) | Bilinear vs Cubic vs Lanczos resampling |
 | [SDF Shapes](examples/sdf_shapes.tex) | all four signed-distance-field primitives |
 | [Sharpen](examples/sharpen.tex) | Laplacian 3x3 kernel |
@@ -122,6 +124,6 @@
 
 ## Function coverage (soft)
 
-77/144 registered stdlib functions are exercised by an example. The 67 below are not — a nudge to add one, not a build break:
+79/144 registered stdlib functions are exercised by an example. The 65 below are not — a nudge to add one, not a build break:
 
-`asin`, `atop`, `bilateral_filter`, `ceil`, `char_at`, `color_burn`, `color_dodge`, `contains`, `cosh`, `count`, `cross`, `debug_print`, `degrees`, `determinant`, `dilate`, `endswith`, `erode`, `find`, `fit`, `hard_light`, `hash`, `hash_float`, `hash_int`, `img_mean`, `img_median`, `img_sum`, `inverse`, `join`, `len`, `linear_light`, `linear_to_srgb`, `lstrip`, `matches`, `mix`, `normalize`, `oklab_from_rgb`, `oklab_to_rgb`, `over`, `pad_left`, `pad_right`, `perlin`, `premultiply`, `reflect`, `repeat`, `replace`, `reverse`, `ridged`, `round`, `rstrip`, `sample_frame`, `sign`, `sinh`, `split`, `srgb_to_linear`, `startswith`, `str`, `str_reverse`, `substr`, `tanh`, `to_float`, `to_int`, `trunc`, `under`, `unpremultiply`, `upper`, `vivid_light`, `voronoi`
+`asin`, `atop`, `bilateral_filter`, `ceil`, `char_at`, `color_burn`, `color_dodge`, `contains`, `cosh`, `count`, `cross`, `debug_print`, `degrees`, `determinant`, `dilate`, `endswith`, `erode`, `find`, `fit`, `hard_light`, `hash`, `hash_float`, `hash_int`, `img_mean`, `img_median`, `img_sum`, `inverse`, `join`, `len`, `linear_light`, `linear_to_srgb`, `lstrip`, `matches`, `normalize`, `oklab_from_rgb`, `oklab_to_rgb`, `over`, `pad_left`, `pad_right`, `premultiply`, `reflect`, `repeat`, `replace`, `reverse`, `ridged`, `round`, `rstrip`, `sample_frame`, `sign`, `sinh`, `split`, `srgb_to_linear`, `startswith`, `str`, `str_reverse`, `substr`, `tanh`, `to_float`, `to_int`, `trunc`, `under`, `unpremultiply`, `upper`, `vivid_light`, `voronoi`

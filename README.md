@@ -20,6 +20,8 @@ A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke Blin
 
 ## Quick Start
 
+> **New to TEX?** Start with [Learn TEX in 5 Minutes](wiki/Learn-TEX-in-5-Minutes.md). Hit an error? Every diagnostic links to the [Error Codes reference](wiki/Error-Codes.md).
+
 Add a **TEX Wrangle** node (category: TEX). Write code using `@name` to reference inputs — sockets are created automatically:
 
 ```c
@@ -70,8 +72,8 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **GPU acceleration** | CPU or GPU with auto device detection |
 | **Acceleration tiers** | `compile_mode`: `none` (default), `auto` (experimental measured auto-tier — trials `torch.compile` in the background and commits only on a measured win; always falls back to a correct path), `torch_compile`, `cuda_graph` (GPU replay for small launch-bound programs) |
 | **Precision** | `precision`: `fp32` (default), **`auto`** (experimental — runs fp16 only where a condition-number gate proves it accurate: CUDA, ≥1024², smooth pointwise; verified 0 accuracy violations across 225 adversarial programs. A per-cook finiteness net makes it ~perf-neutral, so it's an accuracy-safe convenience, not a speedup), `fp16` (force half-precision, expert — the raw ~1.35–1.45× win, no safety net) |
-| **Debug HUD** | A per-node badge shows the tier, cook time, and precision after each run (amber on a tier fallback); toggle in Settings → TEX Debug |
-| **`tex doctor`** | An environment report (torch/CUDA, Triton, MSVC, cache, tier availability) for troubleshooting why a tier isn't engaging |
+| **Debug HUD** | A per-node badge shows the tier, cook time, and precision after each run (amber on a tier fallback); toggle in Settings → TEX Debug. Renders on the classic canvas today; Nodes-2.0 render lands in v0.19 |
+| **`tex doctor`** | An environment report (torch/CUDA, Triton, MSVC, cache, tier availability) via the `/tex_wrangle/doctor` route for troubleshooting why a tier isn't engaging (one-click UI panel lands in v0.19) |
 | **Standalone CLI** | `python -m TEX_Wrangle.tex_cli run prog.tex --in a.png --out b.png` — run a program on an image file with **no ComfyUI** (torchvision-only I/O) |
 | **Two-tier caching** | In-memory LRU + disk persistence for instant re-execution — compiled objects and fused chains persist across restarts |
 | **Memory cooperation** | OOM preflight + byte-budgeted cache eviction; tile-safe programs run in strips under VRAM pressure |
@@ -80,7 +82,7 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **144 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions, `debug_print` |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |
-| **Snippets** | Right-click → Snippets for 114 built-in examples; save your own with folder organization |
+| **Snippets** | Right-click → Snippets for 116 built-in examples; save your own with folder organization |
 | **Nodes v3** | Built on ComfyUI's Nodes v3 API (`comfy_api.latest`) |
 
 ## Language Reference
@@ -207,11 +209,11 @@ while (val < 100.0) { val = val * 2.0; }
 
 **Array:** `sort` `reverse` `arr_sum` `arr_min` `arr_max` `median` `arr_avg` `len` `join`
 
-**Debugging:** `debug_print(label, value[, x, y])` — probe a value at a pixel (surfaces on the node; returns the value unchanged)
+**Debugging:** `debug_print(label, value[, x, y])` — probe a value at a pixel (returned in the node's `ui` payload; on-node display lands in v0.19; returns the value unchanged)
 
 ## Examples
 
-The `examples/` directory contains 114 ready-to-use snippets:
+The `examples/` directory contains 116 ready-to-use snippets:
 
 | Category | Examples |
 |----------|---------|

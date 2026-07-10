@@ -17,7 +17,13 @@ jobs:
     name: Wide differential fuzz (N=2000, date-seeded)
     runs-on: ubuntu-latest
     steps:
+      # Check out INTO a `TEX_Wrangle/` dir so the package imports as `TEX_Wrangle`.
+      # The GitHub repo is named `TEX`; without `path:` the checkout dir is `TEX` and
+      # `from TEX_Wrangle...` -> ModuleNotFoundError (the failure this fixes). Mirrors
+      # tests.yml, which already does this and passes.
       - uses: actions/checkout@v4
+        with:
+          path: TEX_Wrangle
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -26,6 +32,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install pytest
       - name: Fuzz
+        working-directory: TEX_Wrangle
         run: |
           export TEX_FUZZ_N=2000
           export TEX_FUZZ_SEED=$(date +%Y%m%d)

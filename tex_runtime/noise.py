@@ -275,7 +275,8 @@ class _TieredCache:
         return result
     """
 
-    def __init__(self):
+    def __init__(self, name: str = "noise"):
+        self.name = name          # P6: which noise type, for the compile-visibility event
         self.cache: dict = {}
         self._compile_attempted: set = set()
         self._call_count: dict = {}
@@ -306,7 +307,11 @@ class _TieredCache:
                 return
             self._compile_attempted.add(key)
         try:
+            import time as _time
+            from . import tier_trace as _tt
+            _t0 = _time.perf_counter()
             self.cache[key] = compile_fn()
+            _tt.record_noise_compile(self.name, (_time.perf_counter() - _t0) * 1000.0)  # P6
         except Exception:
             pass
         self._call_count.pop(key, None)
@@ -329,12 +334,22 @@ class _TieredCache:
             self.cache[key] = False
 
 
-_simplex_cache = _TieredCache()
+_simplex_cache = _TieredCache("simplex")
+
+
+def _compile_noise(fn):
+    """P2: compile a noise fn with `dynamic=True` so ONE kernel serves every resolution.
+    Without it, a resolution dance (512->1024->512) thrashes torch.compile's per-shape
+    guards -- the measured 134x / 5.6 s recompile stall. Verified: 1 graph across
+    512/1024/2048, within ~1 fp32 ULP of the static-compiled path (invariant-#2 gate),
+    full compile speedup kept (~13-18x over eager). The cache key stays shape-UNAWARE
+    (one entry), so no per-shape re-trace fragility."""
+    return torch.compile(fn, backend='inductor', fullgraph=True, dynamic=True)
 
 
 def _compile_simplex(device):
     """Compile simplex with Inductor and warm it on the target device."""
-    compiled = torch.compile(_simplex2d_fast, backend='inductor', fullgraph=True)
+    compiled = _compile_noise(_simplex2d_fast)
     dummy = torch.rand(1, 64, 64, device=device)
     compiled(dummy, dummy)
     return compiled
@@ -372,7 +387,7 @@ def _make_fbm_fast_fn(octaves: int):
     return fbm_fn
 
 
-_fbm_cache = _TieredCache()
+_fbm_cache = _TieredCache("fbm")
 
 
 _inductor_available: dict[str, bool] = {}  # device type -> backend availability
@@ -437,7 +452,7 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
     if cached is not None:
         def _compile_fbm():
             fn = _make_fbm_fast_fn(octaves)
-            compiled = torch.compile(fn, backend='inductor', fullgraph=True)
+            compiled = _compile_noise(fn)
             dummy = torch.rand(1, 64, 64, device=x.device)
             compiled(dummy, dummy)
             return compiled
@@ -517,7 +532,7 @@ def _worley2d_f2(x: torch.Tensor, y: torch.Tensor,
     return torch.sqrt(sorted_dist[1])
 
 
-_worley_cache = _TieredCache()
+_worley_cache = _TieredCache("worley")
 
 
 def _worley2d(x: torch.Tensor, y: torch.Tensor, return_f2: bool = False) -> torch.Tensor:
@@ -533,7 +548,7 @@ def _worley2d(x: torch.Tensor, y: torch.Tensor, return_f2: bool = False) -> torc
     if cached is not None:
         def _compile_worley():
             fn = _worley2d_f2 if return_f2 else _worley2d_f1
-            compiled = torch.compile(fn, backend='inductor', fullgraph=True)
+            compiled = _compile_noise(fn)
             dummy = torch.rand(1, 64, 64, device=x.device)
             warmup_dx, warmup_dy = _get_worley_offsets(dummy.device, dummy.dim())
             compiled(dummy, dummy, warmup_dx, warmup_dy)

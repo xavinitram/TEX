@@ -64,6 +64,77 @@ def test_doc7b_map_drift(r: SubTestResult):
         r.ok(f"AGENTS.md map is honest ({checked} LOC rows within 20%; split modules present)")
 
 
+def test_c3ux_error_codes_resolve(r: SubTestResult):
+    print("\n--- C3-ux: every source error code has a resolving anchor in Error-Codes.md ---")
+    # Every rendered diagnostic links to wiki/Error-Codes#e<NNNN>; the page must have an
+    # anchor for each code used in the source, and the generator must be in sync.
+    import sys as _sys
+    sys_path0 = str(_PKG)
+    if sys_path0 not in _sys.path:
+        _sys.path.insert(0, sys_path0)
+    try:
+        from tools import gen_error_codes as gen
+    except Exception as e:
+        r.fail("C3-ux import generator", f"{type(e).__name__}: {e}")
+        return
+    page = _PKG / "wiki" / "Error-Codes.md"
+    if not page.exists():
+        r.fail("C3-ux Error-Codes.md", "missing — run tools/gen_error_codes.py")
+        return
+    text = page.read_text(encoding="utf-8").lower()
+    codes = gen.harvest_codes()
+    missing = [c for c in codes if f"### {c.lower()}" not in text]
+    if missing:
+        r.fail("C3-ux anchors", f"{len(missing)} source codes have no anchor: {missing[:10]}")
+        return
+    # in-process staleness check (no subprocess): the rendered content must match the file
+    if gen.render(codes) != page.read_text(encoding="utf-8"):
+        r.fail("C3-ux drift", "Error-Codes.md is stale — regenerate (tools/gen_error_codes.py)")
+    else:
+        r.ok(f"all {len(codes)} source error codes resolve to an anchor; page in sync")
+
+
+def test_c6st_cache_count_agree(r: SubTestResult):
+    print("\n--- C6-st: AGENTS.md and ARCHITECTURE.md agree on the cache count ---")
+    # doc 34/35 C6: the two docs disagreed (13 vs 14) and both missed _AUTO_DECISION.
+    # Machine-check they quote the SAME number so this class of drift can't recur.
+    def _count(fname):
+        text = (_PKG / fname).read_text(encoding="utf-8")
+        m = re.search(r"[Tt]he\s+(\d+)[ -]cache", text)
+        return int(m.group(1)) if m else None
+    a, c = _count("AGENTS.md"), _count("ARCHITECTURE.md")
+    if a is None or c is None:
+        r.fail("C6-st cache count", f"couldn't find the count (AGENTS={a}, ARCHITECTURE={c})")
+    elif a != c:
+        r.fail("C6-st cache count", f"AGENTS.md says {a} caches, ARCHITECTURE.md says {c} — reconcile")
+    else:
+        r.ok(f"cache count agrees across both docs ({a})")
+
+
+def test_c5ux_no_render_overstatement(r: SubTestResult):
+    print("\n--- C5-ux: docs don't overstate what actually renders on-node ---")
+    # v0.18 shipped CHANGELOG/README claims that debug_print "surface[s] on the node"
+    # and the HUD/doctor render, before the DOM render path existed (doc 33/34). Guard
+    # the specific overstatements so they can't silently return; when Phase-3 lands the
+    # real rendering, THESE strings stay retired (the true claim uses different words).
+    banned = [
+        "results surface on the node",
+        "surfaces on the node",  # bare debug_print render claim without the ui= caveat
+    ]
+    hits = []
+    for fname in ("CHANGELOG.md", "README.md"):
+        text = (_PKG / fname).read_text(encoding="utf-8").lower()
+        for phrase in banned:
+            if phrase in text:
+                hits.append(f"{fname}: '{phrase}'")
+    if hits:
+        r.fail("C5-ux overstatement guard",
+               "; ".join(hits) + " — debug_print returns values via the ui payload; "
+               "describe rendering honestly (see doc 35 C5-ux)")
+    else:
+        r.ok("no retired render-overstatement phrasings in CHANGELOG/README")
+
+
 def test_reg1b_doc_ex_populated(r: SubTestResult):
     print("\n--- REG-1b: every shipped stdlib fn carries doc= and ex= ---")
     from TEX_Wrangle.tex_runtime import stdlib_registry as R

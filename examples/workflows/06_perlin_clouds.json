@@ -1,0 +1,84 @@
+{
+  "last_node_id": 2,
+  "last_link_id": 1,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "TEX_Wrangle",
+      "pos": [
+        96,
+        128
+      ],
+      "size": [
+        420,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "OUT",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TEX_Wrangle"
+      },
+      "widgets_values": [
+        "// Perlin Clouds \u2014 procedural cloud pattern using FBM noise\n//\n// Uses fbm() with 6 octaves to create organic cloud shapes.\n\nf$frequency = 6.0;   // detail scale (higher = more features)\n\nfloat n = fbm(u * $frequency, v * $frequency, 6);\n\n// Remap from [-1, 1] to [0, 1]\nfloat cloud = n * 0.5 + 0.5;\n\n// Apply contrast curve for puffier clouds\ncloud = smoothstep(0.3, 0.7, cloud);\n\n// Sky blue to white\nvec3 sky = vec3(0.4, 0.6, 0.9);\nvec3 white = vec3(1.0);\n@OUT = lerp(sky, white, cloud);\n",
+        "auto",
+        "none",
+        "fp32",
+        false
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PreviewImage",
+      "pos": [
+        560,
+        128
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "version": 0.4,
+  "extra": {
+    "tex_workflow": "Perlin clouds",
+    "tex_snippet_source": true
+  }
+}

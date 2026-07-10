@@ -1,0 +1,13 @@
+// Recursive subdivision — refine detail by recursively descending into finer cells
+// and blending each level, a compact recursive level-of-detail / anti-aliasing idea.
+// The recursion adds progressively higher-frequency structure the deeper it goes.
+// Connect any image to @A (only its size is used here).
+
+float refine(float x, float y, float cell, int depth) {
+    float n = perlin(x / cell, y / cell);
+    if (depth <= 0) { return n; }
+    return mix(n, refine(x, y, cell * 0.5, depth - 1), 0.5);   // blend coarse + finer
+}
+
+float s = refine(u * iw, v * ih, 32.0, 4);
+@OUT = vec4(vec3(s * 0.5 + 0.5), 1.0);

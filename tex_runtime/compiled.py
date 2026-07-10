@@ -1155,6 +1155,11 @@ def clear_compiled_cache():
     _route_memo.clear()
     _stencil_route_memo.clear()
     _warnings_shown.clear()
+    try:  # P4: the is_tile_safe fingerprint memo (mirror of _stencil_route_memo)
+        from ..tex_memory import _tile_safe_memo
+        _tile_safe_memo.clear()
+    except Exception:
+        pass
     # The codegen memo now lives in TEXCache (PC-3); clear its memory tier too
     # for test isolation (disk sidecars are cleared by TEXCache.clear_all()).
     try:

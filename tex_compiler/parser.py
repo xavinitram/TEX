@@ -45,7 +45,8 @@ from .ast_nodes import (
     ArrayDecl, ArrayIndexAccess, ArrayLiteral, MatConstructor, ParamDecl,
     BindingIndexAccess, BindingSampleAccess, ErrorNode,
 )
-from .diagnostics import make_diagnostic, get_keyword_hint, get_type_hint, TEXMultiError
+from .diagnostics import (make_diagnostic, get_keyword_hint, get_v020_reserved_hint,
+                          get_type_hint, TEXMultiError)
 
 TYPE_KEYWORDS = {TokenType.KW_FLOAT, TokenType.KW_INT, TokenType.KW_VEC2, TokenType.KW_VEC3, TokenType.KW_VEC4, TokenType.KW_STRING, TokenType.KW_MAT3, TokenType.KW_MAT4}
 
@@ -312,6 +313,16 @@ class Parser:
                 raise self._make_error(
                     f"Unexpected keyword '{tok.value}'.",
                     tok.loc, code="E2001", hint=kw_hint
+                )
+            # A5-1: v0.20-reserved words in BLOCK position (`pass { … }`, `stage { … }`,
+            # `pass;`) — reject with a purpose-written hint. Only fires before `{`/`;`, so
+            # these stay usable as ordinary variable names (`vec3 image = …; image = …`).
+            v020_hint = get_v020_reserved_hint(self.current().value)
+            if v020_hint is not None and self.peek_ahead() in (TokenType.LBRACE, TokenType.SEMI):
+                tok = self.current()
+                raise self._make_error(
+                    f"'{tok.value}' is reserved for a future TEX feature.",
+                    tok.loc, code="E2001", hint=v020_hint
                 )
 
         # Assignment or expression statement

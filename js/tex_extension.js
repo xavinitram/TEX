@@ -304,6 +304,61 @@ function _showSaveSnippetDialog(content) {
     requestAnimationFrame(() => input.focus());
 }
 
+// Modal factory — the snippet-dialog overlay chrome (backdrop-close + Escape) as one home,
+// so new modals don't re-copy it. Returns {overlay, dialog, close}. (The pre-existing
+// snippet dialogs still inline their own chrome; they can adopt this later.)
+function _texMakeModal(innerHTML) {
+    const old = document.querySelector(".tex-snippet-dialog-overlay");
+    if (old) old.remove();
+    const overlay = document.createElement("div");
+    overlay.className = "tex-snippet-dialog-overlay";
+    const dialog = document.createElement("div");
+    dialog.className = "tex-snippet-dialog";
+    dialog.innerHTML = innerHTML;
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    const close = () => { overlay.remove(); document.removeEventListener("keydown", onKey); };
+    function onKey(e) { if (e.key === "Escape") close(); }
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+    document.addEventListener("keydown", onKey);
+    return { overlay, dialog, close };
+}
+
+// C2-ux — "TEX Doctor" modal: renders the /tex_wrangle/doctor JSON as a key-value table.
+// The S-5 arch caveat is surfaced at the top.
+function _showDoctorDialog() {
+    const { dialog, close } = _texMakeModal(`
+        <div class="tex-snippet-dialog-title">TEX Doctor</div>
+        <div class="tex-doctor-body">Loading…</div>
+        <div class="tex-snippet-dialog-buttons">
+            <button class="tex-snippet-btn tex-snippet-btn-cancel">Close</button>
+        </div>`);
+    dialog.querySelector(".tex-snippet-btn-cancel").addEventListener("click", close);
+    const body = dialog.querySelector(".tex-doctor-body");
+    Promise.resolve(globalThis.texDoctor ? globalThis.texDoctor() : null).then((facts) => {
+        body.innerHTML = facts ? _renderDoctorFacts(facts)
+            : "<div class='tex-doctor-row'>Doctor route unavailable — is the server running?</div>";
+    });
+}
+
+function _renderDoctorFacts(facts) {
+    const rows = [];
+    const arch = facts.arch || {};
+    if (arch.note) rows.push(`<div class="tex-doctor-caveat">⚠ ${arch.note}</div>`);
+    const fmt = (v) => typeof v === "boolean"
+        ? `<span style="color:${v ? "#66BB6A" : "#FFB300"}">${v}</span>`
+        : (Array.isArray(v) ? JSON.stringify(v) : String(v));
+    const walk = (obj, prefix) => {
+        for (const [k, v] of Object.entries(obj || {})) {
+            if (v && typeof v === "object" && !Array.isArray(v)) walk(v, prefix + k + ".");
+            else rows.push(`<div class="tex-doctor-row"><span class="tex-doctor-key">`
+                + `${prefix}${k}</span><span>${fmt(v)}</span></div>`);
+        }
+    };
+    walk(facts, "");
+    return rows.join("");
+}
+
 /**
  * Show the "Manage Snippets" dialog — rename / delete user snippets.
  */
@@ -1043,6 +1098,43 @@ function _texEnsureHelpBtn(node) {
     return btn;
 }
 
+// C1-ux — the perf HUD as a floating DOM badge (the Nodes-1.0/2.0 dual-path guarantee;
+// the canvas draw stays for Nodes-1.0 aesthetics). Populated from the same tex_perf/
+// tex_probes payload; the hover title carries the C7-ux reason/precision_reason.
+function _texEnsurePerfBadge(node) {
+    if (node._texPerfBadge) return node._texPerfBadge;
+    const b = document.createElement("div");
+    b.className = "tex-floating-perf-badge";
+    b.addEventListener("mousedown", (e) => e.stopPropagation());
+    b.addEventListener("pointerdown", (e) => e.stopPropagation());
+    document.body.appendChild(b);
+    node._texPerfBadge = b;
+    return b;
+}
+
+function _texUpdatePerfBadge(node) {
+    const p = node._texPerf;
+    if (!(_texPerfHudEnabled && p)) {
+        if (node._texPerfBadge) node._texPerfBadge.style.display = "none";
+        return;
+    }
+    const b = _texEnsurePerfBadge(node);
+    const prec = p.precision && p.precision !== "fp32" ? " · " + p.precision : "";
+    const fb = p.fallback_from ? " (←" + p.fallback_from + ")" : "";
+    let txt = p.tier + fb + " · " + Number(p.elapsed_ms).toFixed(1) + "ms" + prec;
+    if (p.near_singularities) txt += " · ⬤" + p.near_singularities;  // C4-ux count
+    const probes = node._texProbes;                                  // debug_print taps
+    if (probes && probes.length) {
+        txt += probes.slice(0, 4).map((pr) => `\n${pr.label}=${pr.value} @${pr.x},${pr.y}`).join("");
+    }
+    b.textContent = txt;
+    b.style.color = p.fallback_from ? "#FFB300" : "#66BB6A";
+    b.title = [p.reason && ("tier: " + p.reason),
+               p.precision_reason && ("precision: " + p.precision_reason)]
+        .filter(Boolean).join("\n") || "TEX perf";
+    b.style.display = "";
+}
+
 function _texPositionOverlaysFromRect(node, rect, scale, titleInside) {
     // rect: { left, top, width } in screen (client) coordinates
     // scale: zoom level — overlays scale proportionally with the node
@@ -1085,6 +1177,22 @@ function _texPositionOverlaysFromRect(node, rect, scale, titleInside) {
         // the title bar). Nodes 2.0: rect.top already includes the title bar, so
         // place the button down inside that top edge — otherwise it floats above.
         btn.style.top = (titleInside ? rect.top + 6 * scale : rect.top - btnSize - 2) + "px";
+    }
+
+    // ── C1-ux perf badge (below the node) ──
+    const badge = node._texPerfBadge;
+    if (badge && badge.style.display !== "none") {
+        if (tooSmall) {
+            badge.style.display = "none";
+        } else {
+            const nodeH = (node.size ? node.size[1] : 0) * scale;
+            badge.style.transform = `scale(${scale})`;
+            badge.style.transformOrigin = "top left";
+            badge.style.left = rect.left + "px";
+            // Nodes 1.0: rect.top is the body top → node bottom is +nodeH. Nodes 2.0:
+            // rect.top includes the title bar, so add a little for it. Tuned live.
+            badge.style.top = (rect.top + nodeH + (titleInside ? 34 * scale : 6)) + "px";
+        }
     }
 }
 
@@ -1502,6 +1610,7 @@ function showTexContextMenu(x, y, editorView) {
         { label: "TEX Help", shortcut: "F1", action: () => {
             showHelpPopup(x, y);
         }},
+        { label: "TEX Doctor", action: () => { _showDoctorDialog(); } },  // C2-ux
         { label: "Snippets", shortcut: "\u25B8", cascade: true },
     ];
 
@@ -3088,6 +3197,9 @@ app.registerExtension({
             try {
                 const perf = output?.tex_perf?.[0];
                 if (perf) this._texPerf = perf;
+                this._texProbes = output?.tex_probes || null;  // C1-ux: debug_print taps
+                _texUpdatePerfBadge(this);                     // C1-ux: DOM dual-path badge
+                _texStartV2Positioning(this);                  // ensure the RAF positions it
             } catch { /* ignore */ }
             texErrorCache.delete(String(this.id));
             // Clear DOM error banner
@@ -3113,6 +3225,10 @@ app.registerExtension({
             if (this._texHelpBtn) {
                 this._texHelpBtn.remove();
                 this._texHelpBtn = null;
+            }
+            if (this._texPerfBadge) {   // C1-ux
+                this._texPerfBadge.remove();
+                this._texPerfBadge = null;
             }
             _texStopV2Positioning(this);
             this._texVueEl = null;
@@ -3625,6 +3741,24 @@ app.registerExtension({
         .tex-floating-error::-webkit-scrollbar-thumb { background: #553333; border-radius: 2px; }
 
         /* ── Floating Help "?" Button (top-right of node, on document.body) ── */
+        /* C1-ux — perf HUD DOM badge (dual-path with the canvas draw) */
+        .tex-floating-perf-badge {
+            position: fixed;
+            z-index: 9998;
+            font: 9px 'Cascadia Code', 'Consolas', monospace;
+            background: rgba(20, 20, 20, 0.82);
+            padding: 2px 5px;
+            border-radius: 3px;
+            pointer-events: auto;
+            white-space: pre;
+        }
+        /* C2-ux — doctor modal rows (reuses the snippet dialog chrome) */
+        .tex-doctor-body { max-height: 60vh; overflow-y: auto; font: 12px 'Cascadia Code', monospace; }
+        .tex-doctor-row { display: flex; justify-content: space-between; gap: 16px;
+            padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+        .tex-doctor-key { color: #9E9E9E; }
+        .tex-doctor-caveat { color: #FFB300; background: rgba(255,179,0,0.1);
+            padding: 6px 8px; border-radius: 4px; margin-bottom: 8px; }
         .tex-floating-help-btn {
             position: fixed;
             z-index: 9999;

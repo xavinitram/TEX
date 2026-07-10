@@ -5,6 +5,86 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-07-10
+
+The **"Prove It"** release — validation catches up to velocity. After six releases in seven
+days, v0.19 hardens the durability net, *proves* the machine is host-agnostic and its perf
+gates measurable, opens the first external-adoption loop, and lands three measured perf wins
+— every change shipping with the test that guards it. Suite **1761 → 1813/1813**.
+
+### Harden the net (durability)
+- **The differential fuzzer now generates real programs** — user-function defs/calls, bounded
+  loops, multi-statement locals — not just single expressions, and adds an fp16-`auto`
+  tolerance arm. It immediately found **two real accuracy holes** that shipped green in three
+  prior releases: `degrees()` amplified image lineage ×57 past the fp16 gate, and `log10` was
+  fp16-fragile but unclassified. Both fixed; the fuzzer is now clean at **0 divergences /
+  6000 programs**.
+- **fp16 precision taxonomy federated into the stdlib registry** — a new fp16-fragile stdlib
+  function can no longer silently default to fp16-eligible; an unclassified one fails the suite
+  loudly.
+- `execute()` re-extracted behind a per-function line budget; a combined fusion × lazy ×
+  precision × tier end-to-end test closes the highest-risk untested seam.
+
+### Prove the machine (host-agnostic + measurable)
+- **ComfyUI-free core, machine-enforced.** A package-level boundary lint keeps the compiler +
+  runtime free of any ComfyUI import (the host layer is exactly three files), and a smoke test
+  drives the node with ComfyUI fully blocked — the whole test suite is already the standalone
+  lane. *Scope note:* this **enforces** the tex_core boundary but does **not** yet ship a
+  physical `pip install ./tex_core` package — the doc-30 file reroot is deferred to a live
+  session (it needs live import-path verification). Portability is *proven and guarded*, not
+  *packaged* — that packaging is a v0.20 follow-up.
+- **`tex validate-hw`** — a new CLI subcommand that measures whether TEX's Turing-calibrated
+  perf gates hold on *your* GPU (fp16 crossover, the CUDA-graph gate, TF32, determinism) and
+  emits a shareable report; an issue template invites Ampere/Ada/Blackwell reports. On the
+  calibration box: fp16 gate sound, graph gate 4/4, scatter determinism 0.0.
+- **Per-architecture honesty** — on any unmeasured GPU, `tex doctor` now says the gates were
+  calibrated on Turing and points at `validate-hw`. Behavior unchanged; the caveat is honest.
+
+### Show the truth & open the loop (adoption)
+- **Perf HUD on a DOM dual-path** designed to render under both classic and Vue node modes,
+  now showing `debug_print` probes and a hover tooltip with the tier/precision reasons.
+  *(The Vue/Nodes-2.0 render path ships as code with a headless guard; final in-canvas
+  verification is pending the live-ComfyUI session — see `docs/live-session-checklist.md`.)*
+- **`tex doctor` modal** in the node's right-click menu; the default node code points at the
+  snippet browser (116 examples).
+- **Near-singularity diagnostic** — with `debug_nan_highlight` on, a guarded division that hits
+  the epsilon branch (e.g. `1/(x-x)`) paints **cyan**, distinct from a magenta NaN, and a count
+  is surfaced. Zero-cost when the toggle is off.
+- **Adoption artifacts** — a registry-generated **LLM-authoring cheatsheet** (paste into any
+  model to have it write valid TEX) and **8 drag-and-drop example workflows**, both drift-tested.
+
+### Measured performance
+- **CUDA mat3/mat4 × vector is 3.9× faster** (op-level) via an elementwise broadcast instead of
+  `matmul`; CPU keeps `matmul` (7× faster there). The interpreter and codegen emit the identical
+  device-gated expression, so they stay bit-exact per device.
+- **The noise resolution-recompile stall is gone.** `torch.compile(dynamic=True)` gives one
+  kernel for every resolution, eliminating a measured **134× / 5.6 s** recompile when a program's
+  resolution changes — while keeping the full compile speedup.
+- **`is_tile_safe` is memoized** per program fingerprint — a 22 µs AST walk that ran every CUDA
+  cook now runs once (43× faster on a hit).
+- Noise compiles are surfaced in `tex doctor`; a reach for the future `pass { }` multi-pass
+  syntax gets a helpful hint (chain nodes today); two recursive examples added; the v0.20
+  multi-pass execution model is scoped in a design spike.
+
+### Correctness hardening (post-audit fixes)
+These closed findings from the release-readiness audits — all on the opt-in `precision="auto"`
+path; the default `fp32` path was clean throughout.
+- **Fixed a crash in the `precision="auto"` safety net.** An extraction had dropped a needed
+  import, so when the fp16 fast-path overflowed, the automatic recovery to `fp32`
+  *crashed* instead of recovering. It now recovers end-to-end (verified on a real overflow),
+  with a regression test that exercises the actual recovery path.
+- **Completed the fp16 accuracy gate.** `pow2`/`pow10` (2^x/10^x) and six alpha-dividing
+  compositing functions (`over`, `under`, `unpremultiply`, `color_dodge`, `color_burn`,
+  `vivid_light`) were unclassified and could take the fp16 path when they shouldn't; they now
+  correctly force `fp32`. The guard that catches this is now implementation-based (it scans for
+  data-dependent division, plus one level of delegation), not just name-based.
+- **Made the differential fuzzer honest about codegen.** It now reports when a program falls
+  back from codegen to the interpreter (previously invisible), and the fp16-accuracy fuzzer now
+  counts a NaN-vs-finite mismatch as a failure. A codegen scalar-loop crash class this surfaced
+  was fixed (such calls stay on the tensor path).
+- **`tex validate-hw` no longer crashes on a Windows (cp1252) console** when printing its report
+  glyphs — the terminal echo degrades to ASCII; the written report files keep the glyphs.
+
 ## [0.18.0] - 2026-07-09
 
 The "make it visible, make it honest, make it portable" release — it converts two cycles
@@ -67,13 +147,16 @@ host-agnostic core. Suite **1691 → 1761/1761**.
 
 ### Debugging / UX
 - **Per-node tier/timing HUD** — a badge under each TEX node shows which acceleration tier
-  served the cook, the time, and the precision (amber on a tier fallback).
+  served the cook, the time, and the precision (amber on a tier fallback). Renders on the
+  classic (Nodes 1.0) canvas; the Nodes-2.0/Vue render path lands in v0.19.
 - **`tex doctor`** — a `/tex_wrangle/doctor` route reporting torch/CUDA, Triton presence,
-  MSVC, cache size, and which tiers are actually reachable on your box.
+  MSVC, cache size, and which tiers are actually reachable on your box (queryable via the
+  route; a one-click UI panel lands in v0.19).
 - **Hover docs** in the code editor (signature + description).
 - **NaN/Inf overlay** — `debug_nan_highlight` paints non-finite pixels magenta.
 - **`debug_print(label, value[, x, y])`** — a value-at-pixel probe (returns the value
-  unchanged); results surface on the node.
+  unchanged); the probed values are returned in the node's `ui` payload (on-node display
+  lands in v0.19).
 - **Better diagnostics** — declaring a variable named `v`/`u`/`ix`/… now explains it's a
   built-in and to rename; `float3`/`texture2D`-style mistakes point to the TEX name.
 - **Honest tooltips** — compile-mode tooltips state the Triton reality.
