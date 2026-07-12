@@ -79,7 +79,10 @@ def test_c3ux_error_codes_resolve(r: SubTestResult):
         return
     page = _PKG / "wiki" / "Error-Codes.md"
     if not page.exists():
-        r.fail("C3-ux Error-Codes.md", "missing — run tools/gen_error_codes.py")
+        # wiki/ is a separate (gitignored) repo checkout — absent on a fresh CI
+        # clone. The drift check is a dev-time guard; skip when the page isn't here
+        # rather than failing CI for a file this repo intentionally doesn't track.
+        r.skip("C3-ux Error-Codes.md", "wiki/ checkout absent (separate wiki repo); run tools/gen_error_codes.py in a wiki checkout")
         return
     text = page.read_text(encoding="utf-8").lower()
     codes = gen.harvest_codes()

@@ -35,7 +35,7 @@ from TEX_Wrangle.tex_compiler.optimizer import optimize
 from TEX_Wrangle.tex_compiler.type_checker import BINDING_HINT_TYPES
 from TEX_Wrangle.tex_cache import TEXCache
 from TEX_Wrangle.tex_runtime.compiled import execute_compiled, _plain_execute, clear_compiled_cache
-from TEX_Wrangle.tex_runtime.codegen import try_compile, _CgBreak, _CgContinue
+from TEX_Wrangle.tex_runtime.codegen import try_compile, _CgBreak, _CgContinue, _invoke_cg
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib, SAFE_EPSILON
 from TEX_Wrangle.tex_runtime.noise import _perlin2d_fast, _grad2d_dot, _lowbias32
 
@@ -74,6 +74,7 @@ class SubTestResult:
     def __init__(self):
         self.passed = 0
         self.failed = 0
+        self.skipped = 0
         self.errors: list[str] = []
 
     @staticmethod
@@ -92,10 +93,18 @@ class SubTestResult:
         self.errors.append(f"{name}: {msg}")
         self._safe_print(f"  FAIL  {name}: {msg}")
 
+    def skip(self, name: str, reason: str):
+        """Record a sub-test that could not run in this environment (not a pass,
+        not a failure). Used when a check needs a resource CI doesn't have — e.g.
+        a CUDA device on CPU-only torch, or the separate-repo wiki/ checkout."""
+        self.skipped += 1
+        self._safe_print(f"  SKIP  {name}: {reason}")
+
     def summary(self):
         total = self.passed + self.failed
         self._safe_print(f"\n{'='*60}")
-        self._safe_print(f"Results: {self.passed}/{total} passed, {self.failed} failed")
+        skip_note = f", {self.skipped} skipped" if self.skipped else ""
+        self._safe_print(f"Results: {self.passed}/{total} passed, {self.failed} failed{skip_note}")
         if self.errors:
             self._safe_print(f"\nFailures:")
             for e in self.errors:
@@ -246,10 +255,9 @@ def run_both(code, bindings, B=1, H=4, W=4):
     cg_bindings = {k: (v.clone() if isinstance(v, torch.Tensor) else v)
                    for k, v in bindings.items()}
 
-    cg_fn(env, cg_bindings, stdlib_fns, dev, sp,
-          torch, _broadcast_pair, _ensure_spatial, torch.where,
-          math, SAFE_EPSILON, CHANNEL_MAP, _MAX_LOOP_ITERATIONS,
-          _CgBreak, _CgContinue)
+    # Route through _invoke_cg (the single owner of the positional calling
+    # convention) so new codegen runtime helpers don't need updating here too.
+    _invoke_cg(cg_fn, env, cg_bindings, stdlib_fns, dev, sp)
 
     cg_result = {name: cg_bindings[name] for name in output_names}
     return interp_result, cg_result

@@ -386,7 +386,8 @@ def main():
         test_p4_tile_safe_memo, test_p4_memo_key_is_cook_fingerprint,
         test_p2_noise_compile_dynamic, test_p6_noise_compile_visibility,
         test_a5_1_reserved_word_hints, test_a5_2_recursive_examples,
-        test_f5_codegen_scalar_loop_no_crash)
+        test_f5_codegen_scalar_loop_no_crash, test_f5b_lerp_family_fused_bit_exact,
+        test_f5c_pow_mod_codegen_fidelity)
     test_p3_matvec_interp_codegen_bit_exact(r)
     test_p3_cuda_matches_matmul_within_ulp(r)
     test_p3_cpu_keeps_matmul(r)
@@ -397,6 +398,8 @@ def main():
     test_a5_1_reserved_word_hints(r)
     test_a5_2_recursive_examples(r)
     test_f5_codegen_scalar_loop_no_crash(r)
+    test_f5b_lerp_family_fused_bit_exact(r)
+    test_f5c_pow_mod_codegen_fidelity(r)
 
     # v0.18.0 Phase 1 — precision core
     test_prlp4_fp16_safe_reductions(r)

@@ -57,31 +57,20 @@ class _EmitStdFnsMixin:
                 self._emit(f"{sq} = {args[0]} * {args[0]}")
                 self._emit(f"{tmp} = {sq} * {args[0]}")
                 return tmp
-            # NOTE: pow(x, 0.5) is deliberately NOT specialized to sqrt(clamp):
-            # sqrt(clamp(x,min=0)) returns 0 for negative bases whereas the
-            # interpreter's fn_pow returns NaN. Fall through to _torch.pow to
-            # preserve codegen<->interpreter equivalence (matches optimizer.py:364).
-            if v == -1.0:
-                self._emit(f"{tmp} = _torch.reciprocal({args[0]} + _SAFE_EPS)")
-                return tmp
-            if v == -0.5:
-                self._emit(f"{tmp} = _torch.rsqrt(_torch.clamp({args[0]}, min=_SAFE_EPS))")
-                return tmp
-            if v == 4.0:
-                sq = self._tmp()
-                self._emit(f"{sq} = {args[0]} * {args[0]}")
-                self._emit(f"{tmp} = {sq} * {sq}")
-                return tmp
-            if v == -2.0:
-                sq = self._tmp()
-                self._emit(f"{sq} = {args[0]} * {args[0]}")
-                self._emit(f"{tmp} = _torch.reciprocal({sq} + _SAFE_EPS)")
-                return tmp
-        # General case: mirror the interpreter (torch.pow) so codegen and the
-        # interpreter agree on negative bases. The exp-log trick clamps negative
-        # bases to ~0 and silently diverges from fn_pow (see stdlib.fn_pow).
-        self._emit(f"{tmp} = _torch.pow({args[0]}, {args[1]})")
-        return tmp
+            # Only x^{0,1,2,3} have a bit-exact closed form. EVERY other constant
+            # exponent must defer to the interpreter's fn_pow (the general dispatch
+            # below), never a local specialization:
+            #  - the old rsqrt(clamp)/reciprocal(+eps) forms for -0.5/-1/-2 FLIPPED
+            #    finiteness on x<=0 and diverged by up to 8e-3 (a nightly-class
+            #    interp!=codegen bug), and (x*x)*(x*x) for 4.0 lost ~8e-6;
+            #  - even a plain _torch.pow(x, <python-float exp>) diverges from fn_pow's
+            #    torch.pow(x, _to_tensor(exp)) — the scalar-exponent kernel rounds
+            #    differently (~3.7e-9 on 0.5/-0.5).
+            # (pow(x, 0.5) was already correctly deferred here; matches optimizer.py:364.)
+        # Non-{0,1,2,3} constant OR a variable exponent: fall through to the general
+        # path, which calls the SAME _fns['pow'] (fn_pow) the interpreter uses — so
+        # codegen stays bit-exact with the interpreter for every exponent.
+        return None
 
     @_emits("max", "min")
     def _emit_fn_minmax(
@@ -136,25 +125,15 @@ class _EmitStdFnsMixin:
     def _emit_fn_lerp(
         self, node: FunctionCall, args: list[str], tmp: str,
     ) -> str | None:
-        """Emit lerp(a, b, t) with type-aware broadcast."""
+        """Emit lerp(a, b, t) via the fused _lerpw helper (interp fn_lerp exact)."""
         if len(args) != 3:
             return None
-        # a + (b - a) * t — avoids torch.lerp which requires tensor first arg
-        at = self.type_map.get(id(node.args[0]))
-        tt = self.type_map.get(id(node.args[2]))
-        diff = self._tmp()
-        self._emit(f"{diff} = {args[1]} - {args[0]}")
-        if at is not None and tt is not None:
-            if at.is_vector and tt.is_scalar:
-                # Known vec/scalar: inline unsqueeze, skip _bp call entirely
-                self._emit(f"{tmp} = {args[0]} + {diff} * {args[2]}.unsqueeze(-1)")
-            else:
-                # Same rank (vec+vec or scalar+scalar): no broadcast needed
-                self._emit(f"{tmp} = {args[0]} + {diff} * {args[2]}")
-        else:
-            # Type info missing — conservative runtime fallback via _bp
-            bd, bt = self._emit_bp(diff, args[2])
-            self._emit(f"{tmp} = {args[0]} + {bd} * {bt}")
+        # _lerpw mirrors interpreter fn_lerp: the fused torch.lerp (FMA) plus its
+        # channel-broadcast dim-guard. The old unfused `a + (b-a)*t` diverged from
+        # the interpreter by ~2e-8 — invisible until a singular smoothstep edge
+        # amplified it to a 0↔1 flip (nightly fuzz). The helper does the vec/scalar
+        # unsqueeze at runtime, so no compile-time type-map branch is needed.
+        self._emit(f"{tmp} = _lerpw({args[0]}, {args[1]}, {args[2]})")
         return tmp
 
     @_emits("luma")
@@ -278,23 +257,28 @@ class _EmitStdFnsMixin:
         elif name == "fit" and len(args) == 5:
             tt = self._tmp()
             self._emit(f"{tt} = ({args[0]} - {args[1]}) / ({args[2]} - {args[1]} + _SAFE_EPS)")
-            rng = self._tmp()
-            self._emit(f"{rng} = {args[4]} - {args[3]}")
-            br, btt = self._emit_bp(rng, tt)
-            self._emit(f"{tmp} = {args[3]} + {br} * {btt}")
+            # fused lerp (interp fn_fit uses _lerp_f32(n_min, n_max, t)) — see _cg_lerp
+            self._emit(f"{tmp} = _lerp({args[3]}, {args[4]}, {tt})")
         else:
             return None
         return tmp
 
-    @_emits("spow", "sdiv", "smin", "smax", "mod")
+    @_emits("spow", "sdiv", "smin", "smax")
     def _emit_fn_safe(
         self, node: FunctionCall, args: list[str], tmp: str,
     ) -> str | None:
-        """Emit safe arithmetic: spow, sdiv, smin, smax, mod."""
+        """Emit safe arithmetic: spow, sdiv, smin, smax.
+
+        mod() is intentionally NOT specialized here: the interpreter's fn_mod uses a
+        DTYPE-AWARE zero-guard (ZERO_GUARD_EPS = 6.104e-5 for fp16, where 1e-8
+        underflows to 0 and fmod yields NaN). A local _SAFE_EPS (1e-8) guard diverges
+        from fn_mod in fp16, so mod falls through to the general path (_fns['mod']),
+        which is the interpreter fn_mod itself — bit-exact, and it also carries the
+        guard_trace singularity note. (Scalar-loop mode still lowers mod via
+        _emit_scalar_fn_call, checked before this dispatch.)
+        """
         name = node.name
-        if name == "mod" and len(args) == 2:
-            self._emit(f"{tmp} = _torch.fmod({args[0]}, _tw({args[1]} == 0, _SAFE_EPS, {args[1]}))")
-        elif name == "spow" and len(args) == 2:
+        if name == "spow" and len(args) == 2:
             at = self._tmp()
             self._emit(f"{at} = _torch.abs({args[0]})")
             mask = self._tmp()
@@ -307,13 +291,13 @@ class _EmitStdFnsMixin:
         elif name == "smin" and len(args) == 3:
             h = self._tmp()
             self._emit(f"{h} = _torch.clamp(0.5 + 0.5 * ({args[1]} - {args[0]}) / ({args[2]} + _SAFE_EPS), 0.0, 1.0)")
-            diff, bh = self._emit_bp(f"{args[0]} - {args[1]}", h)
-            self._emit(f"{tmp} = {args[1]} + {diff} * {bh} - {args[2]} * {bh} * (1.0 - {bh})")
+            # fused _lerp(b, a, h) matches interp fn_smin's _lerp_f32(b_t, a_t, h)
+            # bit-for-bit; the old unfused b + (a-b)*h diverged by ~2e-8 (nightly fuzz)
+            self._emit(f"{tmp} = _lerp({args[1]}, {args[0]}, {h}) - {args[2]} * {h} * (1.0 - {h})")
         elif name == "smax" and len(args) == 3:
             h = self._tmp()
             self._emit(f"{h} = _torch.clamp(0.5 - 0.5 * ({args[1]} - {args[0]}) / ({args[2]} + _SAFE_EPS), 0.0, 1.0)")
-            diff, bh = self._emit_bp(f"{args[0]} - {args[1]}", h)
-            self._emit(f"{tmp} = {args[1]} + {diff} * {bh} + {args[2]} * {bh} * (1.0 - {bh})")
+            self._emit(f"{tmp} = _lerp({args[1]}, {args[0]}, {h}) + {args[2]} * {h} * (1.0 - {h})")
         else:
             return None
         return tmp

@@ -43,7 +43,7 @@ from .codegen_stencil import (
 )
 from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
                           _broadcast_pair, _ensure_spatial)
-from .stdlib import SAFE_EPSILON
+from .stdlib import SAFE_EPSILON, _lerp_f32, _to_tensor
 
 
 class _Unsupported(Exception):
@@ -131,7 +131,29 @@ def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
     cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
           torch, _broadcast_pair, _ensure_spatial, torch.where,
           math, SAFE_EPSILON, CHANNEL_MAP, MAX_LOOP_ITERATIONS,
-          _CgBreak, _CgContinue)
+          _CgBreak, _CgContinue, _cg_lerp, _cg_lerpw)
+
+
+def _cg_lerp(a, b, t):
+    """Fused lerp, bit-exact with the interpreter's _lerp_f32 (torch.lerp / FMA).
+
+    The unfused ``a + (b - a) * t`` codegen emitted before diverged from the
+    interpreter by ~2e-8 (one rounding vs the FMA's one), which a singular
+    smoothstep edge amplified into a full 0↔1 flip on 22% of pixels (found by
+    the nightly differential fuzzer, seed 20260712). Coerces python-scalar
+    operands like _to_tensor does, so torch.lerp's tensor-``start`` requirement
+    holds for constant edges. Weights are pre-shaped by the caller (smin/smax/
+    fit), exactly as the interpreter's own call sites do."""
+    return _lerp_f32(_to_tensor(a), _to_tensor(b), _to_tensor(t))
+
+
+def _cg_lerpw(a, b, t):
+    """Fused lerp for lerp()/mix() — mirrors interpreter fn_lerp exactly, including
+    its channel-broadcast dim-guard (a [B,H,W] weight against [B,H,W,C] values)."""
+    at, bt, tt = _to_tensor(a), _to_tensor(b), _to_tensor(t)
+    if tt.dim() + 1 == at.dim():
+        tt = tt.unsqueeze(-1)
+    return _lerp_f32(at, bt, tt)
 
 
 def _matvec_expr(m: str, v: str) -> str:
@@ -693,7 +715,7 @@ class _CodeGen(_EmitStdFnsMixin):
         func_src = (
             "def _tex_fn(_env, _bind, _fns, _dev, _sp, "
             "_torch, _bp, _es, _tw, _math, _SAFE_EPS, _CMAP, _MAX_ITER, "
-            "_CgBreak, _CgContinue):\n"
+            "_CgBreak, _CgContinue, _lerp, _lerpw):\n"
             f"{func_body}\n"
         )
         if fingerprint is not None:

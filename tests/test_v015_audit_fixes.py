@@ -344,6 +344,13 @@ def test_cc1_triton_hint(r: SubTestResult):
     # Wiring: a TritonMissing at the FIRST CALL of the compiled fn must reach the
     # hint through the real execute_compiled handler (not just the helper in
     # isolation) — the whole CC-1 point is that the wrap-time except was dead.
+    # This drives execute_compiled with device="cuda", so it needs a CUDA-capable
+    # torch build; CI installs CPU-only torch, where the .cuda() move raises
+    # "Torch not compiled with CUDA enabled". Skip the wiring leg there — the
+    # helper-level assertion above already covers the hint logic device-agnostically.
+    if not torch.cuda.is_available():
+        r.skip("CC-1 hint call-site wiring", "CPU-only torch (no CUDA device to exercise the cuda path)")
+        return
     try:
         msgs = []
         class _H2(logging.Handler):

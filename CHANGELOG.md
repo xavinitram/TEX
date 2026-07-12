@@ -5,6 +5,39 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.1] - 2026-07-12
+
+A correctness + CI patch. The nightly differential fuzzer earned its keep — it caught a real
+interpreter↔codegen divergence, and an exhaustive follow-up audit found two more of the same
+class. **No behaviour change on the default `compile_mode="none"` (interpreter) path**; the
+fixes matter only on the opt-in codegen tiers, where they restore bit-exactness with the
+interpreter.
+
+### Codegen ↔ interpreter fidelity (the bit-exactness contract)
+- **`smin` / `smax` / `lerp` / `mix` / `fit`** emitted an *unfused* lerp (`b + (a-b)*h`) while the
+  interpreter uses the fused `torch.lerp` (one FMA rounding). The ~2e-8 gap is normally invisible,
+  but a near-equal-edge `smoothstep` amplified it into a full **0↔1 flip on 22 % of pixels**
+  (found by the nightly fuzzer, seed 20260712). All five now route through the fused helper.
+- **`pow`** specialized non-folded constant exponents (`-0.5`, `-2.0`, `-1.0`, `4.0`) to
+  `rsqrt`/`reciprocal` forms that **flipped finiteness on x ≤ 0** and diverged up to 8e-3 from the
+  interpreter's `torch.pow`. It now keeps only the bit-exact `x^{0,1,2,3}` and defers every other
+  exponent to the interpreter's `fn_pow`.
+- **`mod`** used a non-dtype-aware `1e-8` zero-guard that underflows to `NaN` in fp16 (where the
+  interpreter's dtype-aware `6.104e-5` stays finite); it now defers to `fn_mod`.
+- Verified **0 divergences across 80,000 fuzzed programs** (40 seeds incl. the next 30 nightly
+  dates); pinned by two new regression tests. `codegen_stdfns.py` is now folded into the
+  compiler hash, so an emit change always invalidates the persisted codegen cache.
+
+### CI
+- Three tests only began running on CI once v0.19.0's `path: TEX_Wrangle` checkout fix let pytest
+  import the package. They assumed a CUDA device (`test_cc1_triton_hint`) or the separate
+  gitignored `wiki/` checkout (`Error-Codes` / `LLM-Cheatsheet` drift); all three now **skip**
+  gracefully via a new `SubTestResult.skip()` instead of failing on a CPU-only, wiki-less runner.
+- The Tests matrix gained `fail-fast: false`, so one Python version's failure no longer cancels
+  and hides the others.
+
+Suite **1818/1818**.
+
 ## [0.19.0] - 2026-07-10
 
 The **"Prove It"** release — validation catches up to velocity. After six releases in seven

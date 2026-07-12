@@ -277,3 +277,82 @@ def test_f5_codegen_scalar_loop_no_crash(r: SubTestResult):
         r.fail("F5 codegen scalar loop", "; ".join(bad))
     else:
         r.ok("scalar-loop spow/degrees/smin run codegen in tensor mode: no crash, bit-exact")
+
+
+def test_f5b_lerp_family_fused_bit_exact(r: SubTestResult):
+    print("\n--- F5b: smin/smax/lerp/mix/fit codegen is interp==codegen BIT-EXACT "
+          "(nightly-fuzz regression, seed 20260712) ---")
+    # The nightly differential fuzzer found a full 0<->1 flip on 22% of pixels for a
+    # smin(...) feeding a near-equal-edge smoothstep. Root cause: codegen emitted the
+    # lerp inside smin UNFUSED (b + (a-b)*h) while the interpreter uses the fused
+    # torch.lerp (one FMA rounding). The ~2e-8 gap is invisible normally, but the
+    # singular smoothstep edge (e0~=e1, constant per row) amplified it across whole
+    # rows. Codegen now calls the same fused lerp for the whole family, so they match
+    # bit-for-bit. This pins the exact canary program plus the general property.
+    from failure_harness import run_tier
+    binds = {"A": make_img(1, 32, 32, 3, seed=11), "B": make_img(1, 32, 32, 3, seed=22)}
+    nightly = ("float lv0 = smin(0.1, 1.5, (v - 0.1)); float lv2 = 0.1; "
+               "@OUT = vec4(smoothstep(lv0, lv2, (@B.r - 3.0)), u, v, 1.0);")
+    progs = [
+        nightly,                                               # the exact canary
+        "@OUT = vec4(smin(@A.r, 0.5, v), u, v, 1.0);",         # smin, scalar
+        "@OUT = vec4(smax(@A.r, 0.5, v), u, v, 1.0);",         # smax, scalar
+        "@OUT = vec4(lerp(@A.rgb, @B.rgb, v), 1.0);",          # lerp vec, scalar weight (unsqueeze)
+        "@OUT = vec4(mix(@A.rgb, @B.rgb, @B.bgr), 1.0);",      # mix vec, vec weight
+        "@OUT = vec4(fit(@A.r, 0.1, 0.9, 0.0, 1.0), u, v, 1.0);",  # fit
+    ]
+    bad = []
+    for code in progs:
+        b = run_tier(code, binds, "interp")["OUT"]
+        c = run_tier(code, binds, "codegen")["OUT"]
+        finmis = int((torch.isfinite(b) != torch.isfinite(c)).sum())
+        mx = float((b - c).abs().max())
+        if finmis or mx != 0.0:                                # demand BIT-EXACT, not merely close
+            bad.append(f"finmis={finmis} max={mx:.3e}: {code[:45]}")
+    if bad:
+        r.fail("F5b lerp-family fused fidelity", "; ".join(bad))
+    else:
+        r.ok("smin/smax/lerp/mix/fit + the nightly canary: interp==codegen bit-exact")
+
+
+def test_f5c_pow_mod_codegen_fidelity(r: SubTestResult):
+    print("\n--- F5c: pow(non-{0,1,2,3}) and mod defer to the interpreter fn "
+          "-> interp==codegen (post-audit fidelity) ---")
+    # The exhaustive fidelity audit (after the lerp fix) found the NEXT interp!=codegen
+    # class: _emit_fn_pow specialized non-folded exponents to expressions that diverge
+    # from the interpreter's torch.pow — rsqrt(clamp(x,eps)) for -0.5 and reciprocal(x*x+eps)
+    # for -2.0 FLIPPED finiteness on x<=0 / diverged up to 8e-3, and even a plain
+    # _torch.pow(x, <python-float>) rounds differently from fn_pow's torch.pow(x,_to_tensor(exp))
+    # (~3.7e-9). pow now keeps only x^{0,1,2,3} and defers everything else to _fns['pow'].
+    # Separately, codegen's mod used a non-dtype-aware 1e-8 zero-guard that UNDERFLOWS in
+    # fp16 (-> NaN) where fn_mod's 6.104e-5 stays finite; mod now defers to _fns['mod'].
+    from failure_harness import run_tier
+    binds = {"A": make_img(1, 32, 32, 3, seed=11), "B": make_img(1, 32, 32, 3, seed=22)}
+    # exponents the optimizer does NOT fold to x*x* -> reach _emit_fn_pow -> must defer.
+    # (negative bases give NaN in BOTH tiers -> finiteness matches; that is the point.)
+    pow_progs = [f"@OUT = vec4(pow(u - 0.5, {e}), 0, 0, 1);"
+                 for e in ("-0.5", "-2.0", "-1.0", "4.0", "0.5", "2.5")]
+    pow_progs.append("@OUT = vec4(pow(@A.r, @B.r * 3.0), 0, 0, 1);")   # variable exponent
+    mod_progs = ["@OUT = vec4(mod(@A.r * 5.0, u - 0.5), 0, 0, 1);",    # divisor hits 0
+                 "@OUT = vec4(mod(@A.r, 0.3), 0, 0, 1);"]
+    bad = []
+    for code in pow_progs + mod_progs:
+        b = run_tier(code, binds, "interp")["OUT"]
+        c = run_tier(code, binds, "codegen")["OUT"]
+        finmis = int((torch.isfinite(b) != torch.isfinite(c)).sum())
+        fin = torch.isfinite(b) & torch.isfinite(c)
+        mx = float((b[fin] - c[fin]).abs().max()) if fin.any() else 0.0
+        if finmis or mx != 0.0:                                        # demand BIT-EXACT (fp32)
+            bad.append(f"finmis={finmis} max={mx:.2e}: {code[:45]}")
+    # mod fp16: the zero-guard must be dtype-aware (1e-8 underflows -> NaN in fp16). fp16 is
+    # a lossy accuracy band, so assert FINITENESS parity (no NaN-vs-finite), not bit-exactness.
+    code16 = "@OUT = vec4(mod(@A.r, u - 0.5), 0, 0, 1);"
+    b16 = run_tier(code16, binds, "interp", precision="fp16")["OUT"]
+    c16 = run_tier(code16, binds, "codegen", precision="fp16")["OUT"]
+    fin16 = int((torch.isfinite(b16) != torch.isfinite(c16)).sum())
+    if fin16:
+        bad.append(f"mod fp16 finiteness mismatch: {fin16} px (dtype-aware guard regressed)")
+    if bad:
+        r.fail("F5c pow/mod fidelity", "; ".join(bad))
+    else:
+        r.ok("pow(non-{0,1,2,3}) + mod defer to interp fn: fp32 bit-exact, fp16 finiteness parity")

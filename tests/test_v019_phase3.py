@@ -61,7 +61,10 @@ def test_s3_cheatsheet_drift(r: SubTestResult):
     import gen_llm_cheatsheet as G
     out = _PKG / "wiki" / "LLM-Cheatsheet.md"
     if not out.exists():
-        r.fail("S-3 missing", "wiki/LLM-Cheatsheet.md missing — run tools/gen_llm_cheatsheet.py")
+        # wiki/ is a separate (gitignored) repo checkout — absent on a fresh CI
+        # clone. Skip the drift guard when the page isn't present rather than
+        # failing CI for a file this repo intentionally doesn't track.
+        r.skip("S-3 cheatsheet drift", "wiki/ checkout absent (separate wiki repo); run tools/gen_llm_cheatsheet.py in a wiki checkout")
         return
     if out.read_text(encoding="utf-8") != G.render():
         r.fail("S-3 drift", "LLM-Cheatsheet.md is stale — run tools/gen_llm_cheatsheet.py")

@@ -46,6 +46,7 @@ def _compute_compiler_hash() -> str:
         pkg_dir / "tex_compiler" / "stdlib_signatures.py",
         pkg_dir / "tex_runtime" / "interpreter.py",
         pkg_dir / "tex_runtime" / "codegen.py",
+        pkg_dir / "tex_runtime" / "codegen_stdfns.py",
         pkg_dir / "tex_runtime" / "stdlib.py",
         pkg_dir / "tex_runtime" / "noise.py",
         # CT-1: fused programs are now persisted, so a splicer change must
