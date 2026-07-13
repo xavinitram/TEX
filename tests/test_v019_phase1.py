@@ -145,7 +145,10 @@ def test_c3st_gm_rules(r: SubTestResult):
     def gate(code):
         prog = Parser(Lexer(code).tokenize(), source=code).parse()
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
-        return pp.resolve_auto_precision(prog, 1024 * 1024, "cuda")[0]
+        # px sits AT the per-arch fp16 floor (S-5) — this test exercises the
+        # amplify/fragile/bounded RULES, not the resolution gate, so it must
+        # stay above the floor on every verified arch (2048² on sm_120).
+        return pp.resolve_auto_precision(prog, pp._MIN_FP16_PX, "cuda")[0]
 
     cases = [
         # (program, expected precision, why)

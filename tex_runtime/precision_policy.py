@@ -28,8 +28,14 @@ import torch
 
 from ..tex_memory import is_tile_safe  # single source for pointwise-ness (M-4)
 from ..tex_compiler.ast_nodes import iter_child_nodes as _children
+from .arch_support import gate_profile as _gate_profile
 
-_MIN_FP16_PX = 1024 * 1024          # measured: fp16 win starts at 1024^2 (0.96x at 512^2)
+# fp16 resolution floor, per-arch (S-5). Turing measured: win starts at 1024²
+# (0.96x at 512²). sm_120 measured: node-path fp16-auto is 0.80x at 1024² (the
+# kernel-level 1.35x is eaten by cast-in/cast-out on Blackwell's faster fp32),
+# clear 2.0x at 2048² — so its verified profile raises the floor to 2048².
+# Unverified arches keep the Turing value. Module attribute stays the contract.
+_MIN_FP16_PX = _gate_profile()["min_fp16_px"]
 _COMPARE_OPS = frozenset({">", "<", ">=", "<=", "==", "!="})
 # C1 (doc 32): decline a constant magnitude amplification of image lineage at or above
 # this factor. At |K|>=4 an fp16 operand reaches the [4,8) binade whose ULP (2^-8 ~= 3.9e-3)
@@ -512,10 +518,13 @@ def _has_fp16_hazard(program, out_names) -> bool:
 def apply_tf32_profile(enable: bool = True):
     """PR-LP6 — opt-in TF32 for fp32 matmul/conv on Ampere+ (sm_80+). Returns a restore
     callable. Default OFF. **No-op on Turing (sm_75)** — no TF32 hardware, so it's inert
-    here (verified: results bit-identical). The 1.5–2.5x Ampere claim is NOT shipped as a
-    planning input until measured on sm_80+; this ships the Turing-safe half only — a
-    profile a host/user can flip, with an honest restore. It's a *precision* trade (TF32
-    keeps run-to-run determinism), never a determinism trade."""
+    here (verified: results bit-identical). MEASURED on sm_120 (RTX 5070 Ti Laptop,
+    torch 2.12+cu130): ~1.0x — TEX's op mix has essentially no TF32 surface (elementwise
+    ops don't use matmul; the CUDA matvec path is broadcast-sum by design; the depthwise
+    conv2d stencils never pick tensor-core kernels — timing AND bits identical with TF32
+    on). The 1.5–2.5x generic-Ampere claim does NOT transfer to TEX workloads, so this
+    stays an unwired profile a host/user can flip, with an honest restore. It's a
+    *precision* trade (TF32 keeps run-to-run determinism), never a determinism trade."""
     prev_mm = torch.get_float32_matmul_precision()
     prev_cudnn = bool(getattr(torch.backends.cudnn, "allow_tf32", False))
 
@@ -542,7 +551,9 @@ def resolve_auto_precision(program, spatial_px: int, device_type: str):
     if device_type != "cuda":
         return "fp32", "auto->fp32: CPU (fp16 is slower on CPU)"
     if spatial_px < _MIN_FP16_PX:
-        return "fp32", "auto->fp32: <1024^2 (fp16 gain only above)"
+        # The floor is per-arch (S-5) — say the live value, not a Turing literal.
+        _side = int(_MIN_FP16_PX ** 0.5)
+        return "fp32", f"auto->fp32: <{_side}^2 (fp16 gain only above)"
     if not is_tile_safe(program):
         return "fp32", "auto->fp32: sampling/fetch/reduction/scatter (fp16-unsafe)"
     if _has_fp16_hazard(program, _output_names(program)):

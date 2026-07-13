@@ -126,9 +126,11 @@ def test_str2_select_tier_matrix(r: SubTestResult):
 
     def expected(mode, device, fused, fp_present):
         # the cascade guards, restated independently as the oracle
-        if mode == "torch_compile" and not fused:
+        # (v0.20: fused chains take the compile tiers too when their chain
+        # fingerprint exists — the guard shape cuda_graph has had since v0.17)
+        if mode == "torch_compile" and (not fused or fp_present):
             return "torch_compile"
-        if mode == "auto" and not fused:
+        if mode == "auto" and (not fused or fp_present):
             return "auto"
         if str(device).startswith("cuda") and mode == "cuda_graph" and (not fused or fp_present):
             return "cuda_graph"

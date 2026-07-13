@@ -444,6 +444,23 @@ def main():
     test_lazy_execute_path(r)
     test_lazy_schema_pool_ci(r)
 
+    # v0.20.0 Phase 1 — XPU transfer scheduling + tier honesty
+    from test_v020_phase1 import (
+        test_xpu1_pinned_egress, test_xpu2_unwrap_latent_pinned,
+        test_xpu3_nonblocking_ingestion_bitexact, test_xpu4_egress_ingest_roundtrip,
+        test_f1_fused_compile_tiers, test_a2_env_cache_scatter_cow,
+        test_c1_gate_profiles_sane, test_g2_verify_arming, test_g1_compile_demotion,
+    )
+    test_xpu1_pinned_egress(r)
+    test_xpu2_unwrap_latent_pinned(r)
+    test_xpu3_nonblocking_ingestion_bitexact(r)
+    test_xpu4_egress_ingest_roundtrip(r)
+    test_f1_fused_compile_tiers(r)
+    test_a2_env_cache_scatter_cow(r)
+    test_c1_gate_profiles_sane(r)
+    test_g2_verify_arming(r)
+    test_g1_compile_demotion(r)
+
     success = r.summary()
     return 0 if success else 1
 

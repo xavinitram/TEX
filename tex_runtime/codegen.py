@@ -642,6 +642,25 @@ class _CodeGen(_EmitStdFnsMixin):
         # permute view hoisted (the view would go stale on rebind).
         self._reassigned_bindings = _collect_reassigned_bindings(program)
 
+        # Scatter copy-on-write (v0.20, mirrors interpreter._scatter_owned):
+        # a scatter target the program didn't freshly allocate may alias
+        # caller-owned storage — an input binding, or (worse, since the env
+        # tensor cache) a cross-cook cached builtin grid (`@OUT = ix;
+        # @OUT[x,y] = v;` would corrupt the cached arange for every later
+        # cook). Emit a runtime owned-set + clone-before-first-write exactly
+        # like the interpreter. Pre-scan so BindingRef reassignments can
+        # disown even when they appear before the first scatter in the loop.
+        self._has_scatter = False
+        _scan = list(program.statements)
+        while _scan:
+            n = _scan.pop()
+            if isinstance(n, Assignment) and isinstance(n.target, BindingIndexAccess):
+                self._has_scatter = True
+                break
+            _scan.extend(_iter_child_nodes(n))
+        if self._has_scatter:
+            self._preamble.append("    _scat_owned = set()")
+
         # Register all program-level env vars as locals
         all_env_vars, _ = self._collect_modified_vars(program.statements)
         for vname in sorted(all_env_vars):
@@ -1063,10 +1082,20 @@ class _CodeGen(_EmitStdFnsMixin):
         self._indent += 1
         self._emit(f"_bind[{name!r}] = _torch.zeros(1, 1, 1, _sc, dtype=_torch.float32, device=_dev) if _sc > 1 else _torch.zeros(1, 1, 1, dtype=_torch.float32, device=_dev)")
         self._indent -= 1
+        self._emit(f"_scat_owned.add({name!r})")  # freshly allocated → owned
         self._indent -= 1
         self._emit(f"else:")
         self._indent += 1
         self._emit(f"_sv = {value_expr}")
+        # COW (mirrors interpreter.py _scatter_owned): first scatter into a
+        # buffer this cook didn't allocate clones before the in-place write —
+        # the stored tensor may alias an input binding or a cached builtin
+        # grid. Cloning also materializes expanded views so index writes work.
+        self._emit(f"if {name!r} not in _scat_owned:")
+        self._indent += 1
+        self._emit(f"_bind[{name!r}] = _bind[{name!r}].clone()")
+        self._emit(f"_scat_owned.add({name!r})")
+        self._indent -= 1
         self._indent -= 1
 
         self._emit(f"_sb = _bind[{name!r}]")
@@ -1172,6 +1201,10 @@ class _CodeGen(_EmitStdFnsMixin):
                 self._spatial_vars.discard(target.name)
         elif isinstance(target, BindingRef):
             self._emit(f"_bind[{target.name!r}] = {value_expr}")
+            if self._has_scatter:
+                # Rebound to an arbitrary (possibly aliasing) value — a later
+                # scatter must clone again (mirrors interpreter disown-on-rebind).
+                self._emit(f"_scat_owned.discard({target.name!r})")
         elif isinstance(target, ChannelAccess):
             self._emit_channel_assign(target, value_expr)
         elif isinstance(target, ArrayIndexAccess):

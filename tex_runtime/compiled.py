@@ -153,6 +153,65 @@ def _blacklist_add(fp: str) -> None:
 # about inductor on CPU (where MSVC may be perfectly usable), and vice versa.
 _backend_status: dict[tuple[str, str], bool | None] = {}
 
+# G (v0.20) — post-commit verification. `torch_compile` mode commits blind (unlike
+# the measured `auto` tier), so a compiled artifact that dynamo keeps re-tracing
+# (guard churn) would be served forever at ~100x the interpreter's cost. Each
+# committed cache_key has its first _VERIFY_COOKS warm cooks timed; the window's
+# best sample is then compared against ONE timed interpreter cook, and an artifact
+# slower than _DEMOTE_RATIO x interpreter is evicted + blacklisted (tier honesty:
+# never keep serving a tier that measures worse than the fallback it replaced).
+# The window is px-scoped: cache_key has no resolution in it, so a size change
+# mid-window resets the samples (a 512² sample must never be judged against a
+# 2048² interpreter baseline). Only real torch.compile artifacts arm a window —
+# the codegen-eager entry (backend None) has no dynamo to churn.
+_verify_state: "_OrderedDict[tuple, dict]" = _OrderedDict()
+_VERIFY_COOKS = 3
+_DEMOTE_RATIO = 1.5
+_VERIFY_STATE_MAX = 256
+
+
+def _bindings_px(bindings) -> int:
+    """Pixels per frame (H*W) of the first spatial binding, or 0."""
+    for v in bindings.values():
+        if isinstance(v, torch.Tensor) and v.dim() >= 3:
+            return v.shape[1] * v.shape[2]
+    return 0
+
+
+def _canon_device(device) -> "torch.device":
+    """torch.device with an index-less "cuda" resolved to the current device —
+    single source with the interpreter's canonicalization, so codegen cache keys
+    ("cuda" vs "cuda:0") can't split and cached env tensors can't be served for
+    the wrong GPU after a current-device switch."""
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type == "cuda" and dev.index is None:
+        try:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        except Exception:
+            pass
+    return dev
+
+
+def _record_ingest_event(orig_bindings, dev) -> "torch.cuda.Event | None":
+    """XPU (v0.20): when ingestion issued a non_blocking pinned→CUDA copy, record
+    an event AT THE COPY POINT on the stream. The caller synchronizes it before
+    returning the cook's output — closing the cross-node window where a
+    (convention-violating) downstream in-place write to the shared pinned source
+    could race the in-flight DMA. The wait covers only the copy (recorded before
+    compute kernels queue), so it's ~free once the cook's Python work has run."""
+    if getattr(dev, "type", None) != "cuda":
+        return None
+    try:
+        for v in orig_bindings.values():
+            if (isinstance(v, torch.Tensor) and v.device.type == "cpu"
+                    and v.device != dev and v.is_pinned()):
+                ev = torch.cuda.Event()
+                ev.record(torch.cuda.current_stream(dev))
+                return ev
+    except Exception:
+        return None
+    return None
+
 # Routing-gate memo: fingerprint -> (op_count, loop_depth). Both are pure
 # functions of the AST, which is keyed by the same (code, binding-types)
 # fingerprint, so the two full AST walks run once per program instead of on
@@ -462,7 +521,7 @@ def execute_compiled(
     Returns:
         The @OUT tensor result, or a dict of {name: tensor} for multi-output.
     """
-    device_obj = torch.device(device)
+    device_obj = _canon_device(device)
     device_type = device_obj.type  # "cpu" or "cuda"
     cache_key = (fingerprint, device_type, precision)
 
@@ -510,8 +569,11 @@ def execute_compiled(
 
     # Ensure tensor bindings are contiguous — Inductor's codegen can
     # fail on non-contiguous strides (e.g. BHWC images loaded with
-    # stride patterns like [1090020, 2220, 3, 1]).
-    contiguous_bindings = _contiguous_bindings(bindings)
+    # stride patterns like [1090020, 2220, 3, 1]) — and co-located on
+    # the compute device (XPU: one direct hop instead of raise+retry).
+    contiguous_bindings = _contiguous_bindings(bindings, device_obj)
+    ingest_event = _record_ingest_event(bindings, device_obj)
+    cook_px = _bindings_px(bindings)
 
     # Run the ENTIRE torch.compile lifecycle in an ISOLATED THREAD.
     #
@@ -544,6 +606,16 @@ def execute_compiled(
                                               device, latent_channel_count, output_names,
                                               used_builtins=used_builtins, precision=precision)
                     _compiled_cache[cache_key] = entry
+                    # G: arm post-commit verification for this fresh artifact
+                    # (samples collect on the NEXT cooks — the commit cook itself
+                    # includes compile latency and would poison the verdict).
+                    # Only real torch.compile artifacts arm: the codegen-eager
+                    # entry (backend None) has no dynamo to guard-churn, and its
+                    # baseline cook would be pure waste.
+                    if entry[1] is not None:
+                        _verify_state[cache_key] = {"px": cook_px, "samples": []}
+                        while len(_verify_state) > _VERIFY_STATE_MAX:
+                            _verify_state.popitem(last=False)
                     if len(_compiled_cache) > _COMPILED_CACHE_MAX:
                         # Evict the oldest. Do NOT torch._dynamo.reset() here:
                         # this runs on the disposable worker thread, and dynamo
@@ -551,9 +623,26 @@ def execute_compiled(
                         # very thread that invokes compiled_fn just below (and the
                         # calling thread). The bounded cache already caps growth.
                         _compiled_cache.popitem(last=False)
+                    compiled_fn, _entry_backend = _compiled_cache[cache_key]
+                    return compiled_fn(program, contiguous_bindings, type_map, device,
+                                       latent_channel_count, output_names)
 
                 compiled_fn, _entry_backend = _compiled_cache[cache_key]
                 _compiled_cache.move_to_end(cache_key)
+                verify = _verify_state.get(cache_key)
+                if verify is not None and len(verify["samples"]) < _VERIFY_COOKS:
+                    # G: verification window — time this warm compiled cook.
+                    # A resolution change mid-window resets it (samples at one
+                    # px must never be judged against a baseline at another).
+                    if verify["px"] != cook_px:
+                        verify["px"] = cook_px
+                        verify["samples"] = []
+                    out, ms = _timed(
+                        lambda: compiled_fn(program, contiguous_bindings, type_map, device,
+                                            latent_channel_count, output_names),
+                        device_type)
+                    verify["samples"].append(ms)
+                    return out
                 return compiled_fn(program, contiguous_bindings, type_map, device,
                                    latent_channel_count, output_names)
         except Exception as e:
@@ -580,6 +669,7 @@ def execute_compiled(
             level="warning",
         )
         popped = _compiled_cache.pop(cache_key, None)
+        _verify_state.pop(cache_key, None)   # G: window dies with the artifact
         failed_backend = popped[1] if popped is not None else None
         # torch.compile() wraps lazily, so a missing backend toolchain (Triton
         # on CUDA, cl.exe on Windows CPU) only surfaces HERE, at the first
@@ -637,6 +727,51 @@ def execute_compiled(
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision)
 
+    # G (v0.20): post-commit verification verdict. Once the window is full,
+    # time ONE interpreter cook of the same program and demote the compiled
+    # artifact if its warm cooks are clearly slower (dynamo guard churn:
+    # measured ~100x on interpreter-class guard failures). One-shot per
+    # cache_key; the baseline cook uses the pristine bindings, and only fires
+    # when the window's samples were taken at THIS cook's resolution.
+    verify = _verify_state.get(cache_key)
+    if (verify is not None and len(verify["samples"]) >= _VERIFY_COOKS
+            and verify["px"] == cook_px):
+        _verify_state.pop(cache_key, None)
+        try:
+            _, interp_ms = _timed(
+                lambda: _plain_execute(program, dict(bindings), type_map, device,
+                                       latent_channel_count, output_names,
+                                       used_builtins=used_builtins, precision=precision),
+                device_type)
+            # min(), not median: the first post-commit cooks can include cudagraph
+            # recording (reduce-overhead), which would overstate a good artifact.
+            # A bad artifact (guard churn) is slow on EVERY cook, so min still
+            # catches it decisively.
+            compiled_ms = min(verify["samples"])
+            if compiled_ms > interp_ms * _DEMOTE_RATIO:
+                _compiled_cache.pop(cache_key, None)
+                _blacklist_add(fingerprint)
+                tier_trace.record("interpreter", fallback_from="torch_compile",
+                                  reason=f"demoted: compiled {compiled_ms:.1f}ms > "
+                                         f"{_DEMOTE_RATIO}x interp {interp_ms:.1f}ms")
+                _show_once(
+                    f"compile_demoted_{fingerprint[:12]}",
+                    f"[TEX] torch.compile artifact measured {compiled_ms:.1f}ms vs "
+                    f"interpreter {interp_ms:.1f}ms — demoted to interpreter for this "
+                    f"program (honest tiering).",
+                    level="warning",
+                )
+        except Exception:
+            pass  # verification is best-effort; never fail a successful cook
+
+    # XPU fence: the async pinned→CUDA ingest DMA must land before the cook
+    # returns (see _record_ingest_event) — ~always already signaled by now.
+    if ingest_event is not None:
+        try:
+            ingest_event.synchronize()
+        except Exception:
+            pass
+
     return result
 
 
@@ -667,7 +802,7 @@ def _timed(fn, device_type: str):
     return out, (_time.perf_counter() - t0) * 1000.0
 
 
-def _contiguous_bindings(bindings: dict) -> dict:
+def _contiguous_bindings(bindings: dict, device: "torch.device | None" = None) -> dict:
     """Normalize tensor bindings for the codegen path.
 
     * Make non-contiguous tensors contiguous (inductor/codegen can fail on BHWC
@@ -682,6 +817,12 @@ def _contiguous_bindings(bindings: dict) -> dict:
       interpreter applies the SAME cast (interpreter.py binding loop) so the two
       tiers converge even for FLOAT/LATENT outputs and int64 values > 2^24. Scalar
       int params and int index arrays (dim<3) are left intact.
+    * XPU co-location (when `device` is given): a binding on another device is
+      moved to the compute device here — fused with the M-5 cast when both apply.
+      Codegen assumes bindings sit on `_dev`; without this, a forced cross-device
+      cook raised at the first mixed op and burned a codegen attempt before the
+      interpreter fallback did the same move anyway. Same-device inputs are
+      untouched (the `!=` guard), so chained same-device nodes stay zero-copy.
 
     Non-tensors pass through by reference.
     """
@@ -689,7 +830,7 @@ def _contiguous_bindings(bindings: dict) -> dict:
     def _norm(v):
         if not isinstance(v, torch.Tensor):
             return v
-        v = to_fp32_if_int_image(v)   # M5-INT: single source (see tex_marshalling)
+        v = to_fp32_if_int_image(v, device=device)   # M5-INT + co-location: single source
         return v if v.is_contiguous() else v.contiguous()
     return {k: _norm(v) for k, v in bindings.items()}
 
@@ -783,7 +924,7 @@ def _run_cached_compiled(cache_key, program, bindings, type_map, device,
     and corrupt the calling thread's TLS). Returns (result, ms) when *timed*, or
     (result, None) otherwise — the COMMITTED tier skips timing so it never forces
     a per-cook CUDA sync. Returns (None, None) if the run crashed."""
-    contiguous = _contiguous_bindings(bindings)
+    contiguous = _contiguous_bindings(bindings, _canon_device(device))
 
     def _worker():
         with torch.inference_mode():
@@ -896,6 +1037,32 @@ def _plain_execute(
                           used_builtins=used_builtins)
 
 
+# Cross-cook cache for codegen builtin tensors (coordinates + constants). The
+# interpreter has cached these across executes for ages (_builtins_cache_env);
+# the codegen path was re-allocating every single cook — a fresh arange/expand/
+# scalar-tensor per builtin per frame (a handful of tiny kernel launches on CUDA,
+# allocs on CPU). Values are NEVER mutated downstream: generated code treats
+# builtins as read-only operands (the language forbids assigning them, and the
+# in-place/`out=` reuse analysis only targets fresh-materialized locals), and the
+# env DICT is built fresh per cook so loop-scoped rebinds can't leak across cooks.
+# Registered in graphed._build_keepalive so a captured graph's baked addresses
+# always outlive eviction (MEM-1).
+_ENV_TENSOR_CACHE: "_OrderedDict[tuple, torch.Tensor]" = _OrderedDict()
+_ENV_TENSOR_CACHE_MAX = 256
+
+
+def _env_cached(key: tuple, make) -> torch.Tensor:
+    t = _ENV_TENSOR_CACHE.get(key)
+    if t is None:
+        t = make()
+        _ENV_TENSOR_CACHE[key] = t
+        while len(_ENV_TENSOR_CACHE) > _ENV_TENSOR_CACHE_MAX:
+            _ENV_TENSOR_CACHE.popitem(last=False)
+    else:
+        _ENV_TENSOR_CACHE.move_to_end(key)
+    return t
+
+
 def _build_codegen_env(
     program: Any, bindings: dict[str, Any],
     device: torch.device, latent_channel_count: int,
@@ -909,6 +1076,9 @@ def _build_codegen_env(
 
     used_builtins (when provided) is the precomputed identifier set; passing it
     avoids a full per-frame AST walk via _collect_identifiers.
+
+    Builtin tensors come from the cross-cook _ENV_TENSOR_CACHE (keyed on shape/
+    device/dtype); only the env dict itself is per-cook.
     """
     env: dict[str, Any] = {}
     sp = None
@@ -920,46 +1090,62 @@ def _build_codegen_env(
     used = used_builtins if used_builtins is not None else _collect_identifiers(program)
     # Single owner: the interpreter's precision->dtype map (both backends agree).
     dtype = Interpreter._PRECISION_DTYPES.get(precision, torch.float32)
+    dev_key = str(device)
 
     if sp:
         B, H, W = sp
         if "ix" in used or "u" in used:
-            ix = torch.arange(W, dtype=dtype, device=device).view(1, 1, W)
+            ix = _env_cached(("ix", W, dev_key, dtype),
+                             lambda: torch.arange(W, dtype=dtype, device=device).view(1, 1, W))
             if "ix" in used:
                 env["ix"] = ix
             if "u" in used:
-                env["u"] = (ix / max(W - 1, 1)).expand(B, H, W)
+                env["u"] = _env_cached(("u", B, H, W, dev_key, dtype),
+                                       lambda: (ix / max(W - 1, 1)).expand(B, H, W))
         if "iy" in used or "v" in used:
-            iy = torch.arange(H, dtype=dtype, device=device).view(1, H, 1)
+            iy = _env_cached(("iy", H, dev_key, dtype),
+                             lambda: torch.arange(H, dtype=dtype, device=device).view(1, H, 1))
             if "iy" in used:
                 env["iy"] = iy
             if "v" in used:
-                env["v"] = (iy / max(H - 1, 1)).expand(B, H, W)
+                env["v"] = _env_cached(("v", B, H, W, dev_key, dtype),
+                                       lambda: (iy / max(H - 1, 1)).expand(B, H, W))
         if "iw" in used:
-            env["iw"] = torch.tensor(float(W), dtype=dtype, device=device)
+            env["iw"] = _env_cached(("iw", W, dev_key, dtype),
+                                    lambda: torch.tensor(float(W), dtype=dtype, device=device))
         if "ih" in used:
-            env["ih"] = torch.tensor(float(H), dtype=dtype, device=device)
+            env["ih"] = _env_cached(("ih", H, dev_key, dtype),
+                                    lambda: torch.tensor(float(H), dtype=dtype, device=device))
         if "px" in used:
-            env["px"] = torch.tensor(1.0 / max(W, 1), dtype=dtype, device=device)
+            env["px"] = _env_cached(("px", W, dev_key, dtype),
+                                    lambda: torch.tensor(1.0 / max(W, 1), dtype=dtype, device=device))
         if "py" in used:
-            env["py"] = torch.tensor(1.0 / max(H, 1), dtype=dtype, device=device)
+            env["py"] = _env_cached(("py", H, dev_key, dtype),
+                                    lambda: torch.tensor(1.0 / max(H, 1), dtype=dtype, device=device))
         if "fi" in used:
-            env["fi"] = torch.arange(B, dtype=dtype, device=device).view(B, 1, 1)
+            env["fi"] = _env_cached(("fi", B, dev_key, dtype),
+                                    lambda: torch.arange(B, dtype=dtype, device=device).view(B, 1, 1))
         if "fn" in used:
-            env["fn"] = torch.tensor(float(B), dtype=dtype, device=device)
+            env["fn"] = _env_cached(("fn", B, dev_key, dtype),
+                                    lambda: torch.tensor(float(B), dtype=dtype, device=device))
     else:
         for name, val in _SCALAR_BUILTIN_DEFAULTS.items():
             if name in used:
-                env[name] = torch.tensor(val, device=device)
+                env[name] = _env_cached((name, "scalar", dev_key, None),
+                                        lambda v=val: torch.tensor(v, device=device))
 
     if "PI" in used:
-        env["PI"] = torch.tensor(math.pi, dtype=dtype, device=device)
+        env["PI"] = _env_cached(("PI", dev_key, dtype),
+                                lambda: torch.tensor(math.pi, dtype=dtype, device=device))
     if "TAU" in used:
-        env["TAU"] = torch.tensor(math.tau, dtype=dtype, device=device)
+        env["TAU"] = _env_cached(("TAU", dev_key, dtype),
+                                 lambda: torch.tensor(math.tau, dtype=dtype, device=device))
     if "E" in used:
-        env["E"] = torch.tensor(math.e, dtype=dtype, device=device)
+        env["E"] = _env_cached(("E", dev_key, dtype),
+                               lambda: torch.tensor(math.e, dtype=dtype, device=device))
     if "ic" in used:
-        env["ic"] = torch.tensor(float(latent_channel_count), dtype=dtype, device=device)
+        env["ic"] = _env_cached(("ic", latent_channel_count, dev_key, dtype),
+                                lambda: torch.tensor(float(latent_channel_count), dtype=dtype, device=device))
 
     return env, sp, used
 
@@ -992,10 +1178,12 @@ def _codegen_only_execute(
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision)
 
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    dev = _canon_device(device)
 
-    # Ensure tensor bindings are contiguous (same as torch.compile path)
-    contiguous_bindings = _contiguous_bindings(bindings)
+    # Ensure tensor bindings are contiguous (same as torch.compile path) and
+    # co-located on the compute device (XPU: one direct hop instead of raise+retry)
+    contiguous_bindings = _contiguous_bindings(bindings, dev)
+    ingest_event = _record_ingest_event(bindings, dev)
 
     env, sp, _ = _build_codegen_env(program, contiguous_bindings, dev, latent_channel_count,
                                     used_builtins=used_builtins, precision=precision)
@@ -1016,6 +1204,12 @@ def _codegen_only_execute(
                               used_builtins=used_builtins, precision=precision)
 
     tier_trace.record("codegen")
+    # XPU fence: async ingest DMA must land before the cook's outputs escape.
+    if ingest_event is not None:
+        try:
+            ingest_event.synchronize()
+        except Exception:
+            pass
     if output_names is not None:
         return {name: contiguous_bindings[name] for name in output_names}
     return contiguous_bindings.get("OUT")
@@ -1058,66 +1252,92 @@ def _try_compile(
     if program is not None and type_map is not None:
         cg_fn = _get_or_make_codegen_fn(program, type_map, fingerprint)
 
-    if cg_fn is not None:
-        # Build an adapter that matches the execute_compiled calling convention
-        # but delegates to the codegen-generated flat function.
-        stdlib_fns = TEXStdlib.get_functions()
+    if cg_fn is None:
+        # No codegen — DON'T wrap the tree-walking interpreter in torch.compile.
+        # Measured (v0.20): there is no configuration where it wins — CPU inductor
+        # needs MSVC (always fails → blacklist), CUDA-without-Triton fails at first
+        # call, and CUDA-WITH-Triton is the worst case: dynamo can't stably guard
+        # the interpreter's dynamic dict-driven dispatch (CLASS_MATCH guards on
+        # interpreter classes, unserializable under caching_precompile) and
+        # re-traces every cook — ~100x slower than the plain interpreter it wraps.
+        if program is not None:
+            _show_once("codegen_fallback",
+                       "[TEX] Codegen unsupported for this program — plain interpreter "
+                       "(interpreter-wrapping torch.compile measured as never beneficial)")
+        return None
 
-        def _codegen_exec(program, bindings, type_map, device,
-                          latent_channel_count=0, output_names=None):
-            dev = torch.device(device) if not isinstance(device, torch.device) else device
+    # Build an adapter that matches the execute_compiled calling convention
+    # but delegates to the codegen-generated flat function.
+    stdlib_fns = TEXStdlib.get_functions()
+
+    # If codegen has stdlib function calls (graph breaks), skip torch.compile
+    # and return the codegen adapter directly — torch.compile overhead exceeds benefit
+    if getattr(cg_fn, '_has_fn_calls', False):
+        def _codegen_exec_eager(program, bindings, type_map, device,
+                                latent_channel_count=0, output_names=None):
+            dev = _canon_device(device)
             env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
                                             used_builtins=used_builtins, precision=precision)
-
             _invoke_cg(cg_fn, env, bindings, stdlib_fns, dev, sp)
-
             if output_names is not None:
                 return {name: bindings[name] for name in output_names}
             return bindings.get("OUT")
 
-        # If codegen has stdlib function calls (graph breaks), skip torch.compile
-        # and return the codegen adapter directly — torch.compile overhead exceeds benefit
-        if getattr(cg_fn, '_has_fn_calls', False):
-            _show_once("codegen_only_fn_calls",
-                       "[TEX] Codegen has stdlib calls — using codegen-only (no torch.compile)")
-            return _codegen_exec, None
-
-        target_fn = _codegen_exec
-        _show_once("codegen_active", "[TEX] Using codegen path for torch.compile (flat function)")
-    else:
-        # Fall back to wrapping the interpreter — bake precision/used_builtins
-        # into a closure (mirroring _codegen_exec): the compiled callable is
-        # invoked with only the six positional args, which would otherwise
-        # silently reset both to their defaults.
-        def _interp_exec(program, bindings, type_map, device,
-                         latent_channel_count=0, output_names=None):
-            return _plain_execute(program, bindings, type_map, device,
-                                  latent_channel_count, output_names,
-                                  used_builtins=used_builtins, precision=precision)
-
-        target_fn = _interp_exec
-        if program is not None:
-            _show_once("codegen_fallback",
-                       "[TEX] Codegen unsupported for this program, wrapping interpreter")
+        _show_once("codegen_only_fn_calls",
+                   "[TEX] Codegen has stdlib calls — using codegen-only (no torch.compile)")
+        return _codegen_exec_eager, None
 
     try:
         # Point inductor's disk cache at TEX's owned, evictable location so
         # compiled kernels persist across process restarts.
         _ensure_inductor_cache_dir()
 
-        compiled = torch.compile(
-            target_fn,
+        # G' (v0.20): compile ONLY the flat generated _tex_fn — pure tensor ops.
+        # Compiling the whole adapter put _build_codegen_env's AST-walking /
+        # dict-building Python inside the traced region; dynamo guarded on
+        # interpreter-module classes (CLASS_MATCH, unserializable under
+        # caching_precompile) and re-traced EVERY cook — measured 125ms/cook vs
+        # 0.9ms plain interpreter on for_10@1024² (sm_120, torch 2.12 + Triton).
+        # With env construction eager and a stable tensor-only compile target,
+        # dynamo's guards hold and warm cooks run the cached kernel.
+        compiled_flat = torch.compile(
+            cg_fn,
             backend=backend,
             mode="reduce-overhead" if device_type == "cuda" else "default",
             fullgraph=False,  # Allow graph breaks at for-loop .item() calls
         )
 
+        # Under mode="reduce-overhead" (CUDA) inductor's cudagraph trees OWN the
+        # output storage — static buffers reused by the next replay. Outputs that
+        # escape to ComfyUI must be cloned out at the graph boundary (same
+        # stage→replay→clone contract as the graphed tier), else the next cook
+        # overwrites them ("accessing tensor output of CUDAGraphs that has been
+        # overwritten" — reproduced on sm_120/torch 2.12).
+        _clone_out = device_type == "cuda"
+
+        def _codegen_exec(program, bindings, type_map, device,
+                          latent_channel_count=0, output_names=None):
+            dev = _canon_device(device)
+            env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
+                                            used_builtins=used_builtins, precision=precision)
+            _invoke_cg(compiled_flat, env, bindings, stdlib_fns, dev, sp)
+            if output_names is not None:
+                if _clone_out:
+                    return {name: bindings[name].clone()
+                            if isinstance(bindings[name], torch.Tensor) else bindings[name]
+                            for name in output_names}
+                return {name: bindings[name] for name in output_names}
+            out = bindings.get("OUT")
+            if _clone_out and isinstance(out, torch.Tensor):
+                out = out.clone()
+            return out
+
         _backend_status[(backend, device_type)] = True
         _show_once(
             f"compile_ok_{backend}",
-            f"[TEX] torch.compile using '{backend}' backend",
+            f"[TEX] torch.compile using '{backend}' backend (flat codegen fn)",
         )
-        return compiled, backend
+        return _codegen_exec, backend
 
     except Exception as e:
         _backend_status[(backend, device_type)] = False
@@ -1141,15 +1361,19 @@ def _try_compile(
         if backend == "inductor":
             _maybe_triton_hint(err_str, device_type)
 
-        # Recurse to try the next backend in the cascade
+        # Recurse to try the next backend in the cascade (fingerprint kept so the
+        # codegen-fn memo isn't re-emitted on the retry)
         return _try_compile(device_type, program, type_map,
-                            used_builtins=used_builtins, precision=precision)
+                            used_builtins=used_builtins, precision=precision,
+                            fingerprint=fingerprint)
 
 
 def clear_compiled_cache():
     """Clear all cached compiled functions and memos (useful for testing)."""
     _compiled_cache.clear()
     _compile_blacklist.clear()
+    _verify_state.clear()      # G: post-commit verification windows
+    _ENV_TENSOR_CACHE.clear()  # codegen builtin tensors (test isolation)
     # Reset backend status so backends are re-probed
     _backend_status.clear()
     _route_memo.clear()

@@ -15,19 +15,25 @@ def test_pf1_pf2_graph_gate(r: SubTestResult):
     # early-returns off CUDA, so the decision logic is factored out to test here).
     try:
         W = G._graph_capture_worthwhile
+        # The ceilings are per-arch (S-5: arch_support gate profiles) — assert
+        # against the LIVE module constants, not Turing literals, so the contract
+        # ("declines past the measured crossover") holds on every verified arch.
+        base_ceil, high_ceil = G._GRAPH_BASE_PX_CEIL, G._GRAPH_HIGH_PX_CEIL
         # PF-2: 0/1-op programs capture a near-empty graph → pure loss at all res.
         assert W(0, 256 * 256) is False
         assert W(1, 256 * 256) is False
-        # Low-kernel: win up to 512², decline at 1024²+ (measured 0.8–0.96× losses).
-        assert W(15, 512 * 512) is True
-        assert W(15, 1024 * 1024) is False
-        assert W(15, 2048 * 2048) is False
-        # Kernel-heavy (edge_detect ≈ 80 static ops / 546 kernels): win up to 1024².
-        assert W(80, 1024 * 1024) is True
-        assert W(80, 2048 * 2048) is False    # hard cap: nothing tested wins above 1024²
+        # Low-kernel: win up to the base ceiling, decline strictly above it.
+        assert W(15, base_ceil) is True
+        assert W(15, base_ceil + 1) is False
+        assert W(15, 4 * base_ceil) is False
+        # Kernel-heavy: win up to the high ceiling (the hard cap), decline above.
+        assert W(80, high_ceil) is True
+        assert W(80, high_ceil + 1) is False
+        assert W(80, 4 * high_ceil) is False
         # No spatial input → can't size → allow (tiny scalar programs).
         assert W(10, 0) is True
-        r.ok("crossover predicate matches the measured win region")
+        r.ok("crossover predicate matches the measured win region "
+             f"(base_ceil={base_ceil}, high_ceil={high_ceil})")
     except Exception as e:
         r.fail("PF-1/PF-2 predicate", str(e))
 
@@ -43,8 +49,12 @@ def test_pf1_pf2_graph_gate(r: SubTestResult):
         G.clear_graph_cache()   # reset any session-wide disable from earlier tests
         code = ("vec4 a = vec4(u, v, u * v, 1.0); vec3 d = a.rgb * 2.0 - vec3(0.5);"
                 "@OUT = vec4(clamp(d.r,0.0,1.0), clamp(d.g,0.0,1.0), clamp(d.b,0.0,1.0), 1.0);")
+        # Sizes derive from the LIVE per-arch base ceiling (S-5): 256² is inside
+        # every profile's win region; the decline probe sits strictly above it
+        # (2x the ceiling side → 4x the px).
+        over_side = 2 * int(G._GRAPH_BASE_PX_CEIL ** 0.5)
         img256 = make_img(1, 256, 256, 3).cuda()
-        img1024 = make_img(1, 1024, 1024, 3).cuda()
+        img_over = make_img(1, over_side, over_side, 3).cuda()
 
         # 256² low-kernel → win region → captures and matches the interpreter.
         base = run_tier(code, {"A": img256}, "interp", device="cuda")
@@ -52,14 +62,14 @@ def test_pf1_pf2_graph_gate(r: SubTestResult):
         assert max_diff(base, got) < 1e-4, "graph@256² diverged from interpreter"
         r.ok("graph captures + matches interp at 256² (win region)")
 
-        # 1024² low-kernel → past the crossover → declines (PF-1).
+        # Above the base ceiling → past the crossover → declines (PF-1).
         declined = False
         try:
-            run_tier(code, {"A": img1024}, "graph", device="cuda")
+            run_tier(code, {"A": img_over}, "graph", device="cuda")
         except TierUnavailable:
             declined = True
-        assert declined, "low-kernel program NOT declined at 1024² (PF-1 gate leak)"
-        r.ok("graph declines low-kernel program at 1024² (PF-1)")
+        assert declined, f"low-kernel program NOT declined at {over_side}² (PF-1 gate leak)"
+        r.ok(f"graph declines low-kernel program at {over_side}² (PF-1)")
 
         # passthrough (0 ops) → declines at any resolution (PF-2).
         declined2 = False

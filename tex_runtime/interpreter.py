@@ -279,14 +279,23 @@ class Interpreter:
         # codegen's _contiguous_bindings — see tex_marshalling). Imported once per
         # execute (cold path), not per binding.
         from ..tex_marshalling import to_fp32_if_int_image
+        async_ingest = False
         for name, value in bindings.items():
             if isinstance(value, str):
                 self.bindings[name] = value  # strings pass through as Python str
             elif isinstance(value, torch.Tensor):
-                t = value
-                if t.device != target_device:
-                    t = t.to(target_device)
-                t = to_fp32_if_int_image(t)
+                # XPU: a pinned CPU source headed to CUDA rides an async DMA
+                # inside the helper — note it so the cook can fence before
+                # returning (see the ingest-event sync below).
+                if (not async_ingest and target_device.type == "cuda"
+                        and value.device.type == "cpu"):
+                    try:
+                        async_ingest = value.is_pinned()
+                    except Exception:
+                        pass
+                # Device move + M5-INT cast fused into one copy (single source
+                # in tex_marshalling); same-device fp inputs pass through untouched.
+                t = to_fp32_if_int_image(value, device=target_device)
                 if needs_dtype_cast and t.is_floating_point() and t.dtype != target_dtype:
                     t = t.to(target_dtype)
                 self.bindings[name] = t
@@ -302,9 +311,30 @@ class Interpreter:
         # Create built-in coordinate variables (lazy — only what the program uses)
         self._create_builtins(program, used_builtins=used_builtins, tile=tile)
 
+        # XPU fence: the async pinned→CUDA ingest DMA is stream-ordered ahead of
+        # every kernel this cook launched — record its completion point NOW so
+        # the pre-return sync waits only for the copy, not the compute.
+        ingest_event = None
+        if async_ingest:
+            try:
+                ingest_event = torch.cuda.Event()
+                ingest_event.record(torch.cuda.current_stream(target_device))
+            except Exception:
+                ingest_event = None
+
         # Execute statements via tree-walking interpreter
         for stmt in program.statements:
             self._exec_stmt(stmt)
+
+        # XPU fence (see above): guarantee the ingest DMA has landed before the
+        # cook returns, so a downstream host-side writer of the shared pinned
+        # source can never race an in-flight copy. By now the cook's Python work
+        # has long overlapped the DMA — this is ~always an already-signaled event.
+        if ingest_event is not None:
+            try:
+                ingest_event.synchronize()
+            except Exception:
+                pass
 
         # Collect outputs — skip precision conversion for the common fp32 case
         needs_upcast = self._dtype != torch.float32

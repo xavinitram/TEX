@@ -5,6 +5,105 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-07-13
+
+The **hardware-honesty** release — the perf gates meet their second GPU. Every constant in the
+engine was calibrated on one Turing card (RTX 2080 SUPER); this release runs the whole
+measurement kit on Blackwell (RTX 5070 Ti Laptop, sm_120, torch 2.12+cu130 + working Triton)
+and ships what the numbers actually said — including the ones that said "don't".
+
+Headline (eight-config, 24 programs @1024², vs v0.19.1 on the same box): **GPU warm Compiled
+geomean 2.2–3.0x** (matrix total 1682ms → 100–139ms), CPU cold Compiled 1.1–1.3x, interpreter
+configs at parity (verified tree-for-tree under identical measurement). Suite 1814 → **1823/1824**
+(the one remaining failure is a dev-box-only subprocess-import artifact of the embedded Python).
+
+### Per-arch gate profiles (S-5 grows teeth)
+- `arch_support` gains `_GATE_PROFILES` + `gate_profile()`: **verified** architectures get their
+  measured gate constants; unverified ones keep the Turing calibration untouched (never silent
+  per-box auto-tuning — profiles are repo-committed measurements, recorded inline in the
+  profile table and in this entry).
+- **sm_120 profile** (first non-Turing entry): CUDA-graph low-op ceiling **512² → 1024²**
+  (measured 1.66x win at 1024² where the Turing gate declined; still correctly declines at
+  2048², 0.94x) and fp16 floor **1024² → 2048²** (node-path fp16-auto measured **0.80x at
+  1024²** — a real end-to-end loss eaten by cast-in/cast-out; kernel-level 2.0x at 2048² is
+  real). Fixes the shipped PR-LP2 node-path perf gate on Blackwell.
+- Gate-consuming tests now assert against the live module constants instead of Turing literals,
+  so they hold on every verified arch; the fp16 decline reason states the live floor.
+
+### torch.compile tier — narrowed, verified, honest
+- **Compile ONLY the flat codegen fn** (G'): wrapping the whole adapter put AST-walking/dict
+  Python inside the traced region; dynamo guard-churned (CLASS_MATCH on interpreter classes,
+  unserializable under caching_precompile) and re-traced EVERY cook — measured **125ms/cook vs
+  0.9ms plain interpreter** on `for_10`@1024². With env construction eager, `for_100` goes from
+  60x slower than the interpreter to **2.96x faster**.
+- **Post-commit verification** (G): `torch_compile` mode committed blind (unlike the measured
+  `auto` tier). Each fresh artifact's first 3 warm cooks are timed (px-scoped — a resolution
+  change resets the window); anything slower than **1.5x one timed interpreter cook** is
+  evicted + blacklisted with a visible demotion notice. Codegen-eager entries (backend None —
+  no dynamo to churn) don't arm a window.
+- **Interpreter-wrap removed**: measured as never beneficial in ANY configuration (CPU inductor
+  needs MSVC; CUDA-with-Triton is the 100x guard-churn case above; CUDA-without-Triton fails at
+  first call). Codegen-rejected programs now go straight to the plain interpreter.
+- **cudagraph output-escape fix**: under `reduce-overhead`, inductor's cudagraph trees own the
+  output storage — the next cook overwrites it. Outputs escaping to ComfyUI are now cloned at
+  the graph boundary (same stage→replay→clone contract as the graph tier).
+
+### Fused chains meet the compile tiers
+- `select_tier` now routes a fused chain into **`torch_compile` and `auto`** (keyed by its chain
+  fingerprint — the same pattern `cuda_graph` has used since v0.17). Fused chains were
+  interpreter-only on these modes; measured on a fused-chain-shaped program at 1024²
+  (sm_120 + Triton): **inductor 2.63x vs interpreter**. Toolchain-less boxes self-fall-back,
+  and `auto` measures-then-rejects, so enabling them is never a regression.
+
+### XPU — staggered copy/compute for mixed-device chains
+- **Pinned egress**: a CPU cook (with CUDA present) writes IMAGE/MASK/LATENT outputs in the
+  1MB–256MB band into page-locked memory — same write, and torch's caching host allocator
+  amortizes the lock. `unwrap_latent`'s BCHW→BHWC copy is pinned too, so latent chains keep
+  pinned-ness. (The 256MB cap exists because pinned pages are unswappable and the allocator
+  retains freed blocks for the process lifetime — an uncapped video-scale egress would
+  permanently page-lock GBs; above the cap nothing hides a seconds-scale copy anyway.)
+- **Non-blocking ingestion**: a pinned CPU binding headed to CUDA rides the DMA engine in the
+  background while Python keeps working (remaining bindings, coordinate builtins, dispatch);
+  stream ordering makes the first consuming kernel wait exactly until the copy lands — no
+  events, no manual sync, bit-identical (the standard DataLoader pattern). An ingest fence
+  (event recorded at the copy point, synchronized before the cook returns — ~free by then)
+  guarantees the DMA has landed before the output escapes, so no downstream host-side writer
+  can race an in-flight copy.
+- Measured on the mixed CPU→CUDA chain: **1.10x at 1024²** (16MB), **1.41x at 2048²** (64MB,
+  3.5ms/cook saved). All-CPU and all-GPU chains are untouched (zero copies either way).
+- Cross-device cooks stopped burning a codegen attempt: `_contiguous_bindings` now co-locates
+  off-device bindings on every tier incl. the auto-tier artifact paths (fused with the M5-INT
+  cast — one copy, single-sourced in `to_fp32_if_int_image`), instead of raising at the first
+  mixed op and retrying on the interpreter.
+- Design notes for the v0.21 follow-ups (3-stream tiled pipeline; speculative return-time
+  upload) live in `docs/xpu-transfer-scheduling.md`.
+
+### Codegen warm-cook cost + scatter copy-on-write
+- Builtin env tensors (`u`/`v`/`ix`/…) are now cached across cooks (`_ENV_TENSOR_CACHE`, keyed
+  shape/device/dtype, keepalive-registered for graph safety, device-canonicalized so an
+  index-less "cuda" can't split keys or serve wrong-GPU tensors) — the codegen path was
+  re-allocating every one of them per frame while the interpreter has cached its equivalents
+  for ages.
+- **Codegen scatter COW** (caught by this release's 28-agent adversarial verification pass
+  before it shipped): `@OUT = ix; @OUT[x,y] = v;` wrote in place through the bare alias — with
+  the env cache that would have corrupted the cached coordinate grid for every later cook.
+  Codegen now mirrors the interpreter's `_scatter_owned` clone-before-first-write exactly
+  (including disown-on-rebind), which also stops scatters from mutating caller-owned input
+  bindings — restoring interpreter parity on that side effect.
+
+### Measured and declined (the honest column)
+- **TF32**: ~1.0x on sm_120 — TEX's op mix has no TF32 surface (elementwise ops don't matmul,
+  the CUDA matvec is broadcast-sum by design, depthwise conv never picks tensor-core kernels;
+  timing AND bits identical with TF32 on). `apply_tf32_profile` stays an unwired opt-in; the
+  generic "1.5–2.5x on Ampere+" claim does not transfer to TEX workloads.
+- **channels_last conv stencils**: 0.65–0.78x on CUDA (depthwise conv prefers the current
+  NCHW-materialized path), wash on CPU. Not shipped.
+- **CUDA graphs above 1024²**: 0.80–0.99x at 2048²+ on sm_120 for every program class — the
+  hard cap stays.
+
+Suite **1823/1824** on the dev box (the 1 failure + 2 skips are dev-box env artifacts;
+9 new v0.20 tests incl. the scatter-COW and XPU regression pins).
+
 ## [0.19.1] - 2026-07-12
 
 A correctness + CI patch. The nightly differential fuzzer earned its keep — it caught a real

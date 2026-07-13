@@ -433,7 +433,11 @@ def test_a1_1_auto_precision_fuzz(r: SubTestResult):
             tm = TypeChecker(binding_types=bt, source=code).check(prog)
             prog = optimize(prog, tm)
             tm = TypeChecker(binding_types=bt, source=code).check(prog)
-            prec, _reason = pp.resolve_auto_precision(prog, res * res, "cuda")
+            # Gate px sits AT the per-arch fp16 floor (S-5): this fuzzer probes the
+            # amplify/fragile RULES, and a raised floor (2048² on sm_120) must not
+            # silently zero out the fp16-taken arm. Execution stays at 1024² —
+            # fp16 accuracy of pointwise programs is px-independent.
+            prec, _reason = pp.resolve_auto_precision(prog, max(res * res, pp._MIN_FP16_PX), "cuda")
             checked += 1
             if prec != "fp16":
                 continue

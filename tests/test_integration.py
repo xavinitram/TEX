@@ -3021,15 +3021,22 @@ for (int i = 0; i < 2; i = i + 1) {
         r.fail("compiled: precision is part of the cache key",
                f"{e}\n{traceback.format_exc()}")
 
-    # CLCG2: the interpreter-wrap route must bake precision/used_builtins into
-    # a closure — the compiled callable is invoked with six positional args,
-    # which previously reset both to defaults (always fp32/None).
+    # CLCG2 (updated for v0.20): codegen-rejected programs no longer get an
+    # interpreter-wrapping torch.compile — measured as never beneficial (CPU
+    # inductor needs MSVC; CUDA-with-Triton guard-churns ~100x on interpreter
+    # classes). _try_compile now returns None for them, and execute_compiled's
+    # plain fallback must STILL forward precision/used_builtins (the original
+    # CLCG2 regression: both silently reset to defaults on this route).
     try:
         clear_compiled_cache()
-        # String-binding comparison: codegen rejects it (interpreter-wrap
-        # route) and no optimizer pass can constant-fold a binding away.
+        # String-binding comparison: codegen rejects it and no optimizer pass
+        # can constant-fold a binding away. Padded past _COMPILE_OP_THRESHOLD
+        # (8 tensor ops) so execute_compiled genuinely reaches _try_compile's
+        # None return — below the threshold the op gate would route to plain
+        # BEFORE the codegen-reject path this test exists to pin.
         code_s = ('float k = (@name == "abc") ? 1.0 : 0.0;\n'
-                  '@OUT = @A * k + 0.0001;\n')
+                  'vec4 t = @A * 0.5 + @A * 0.25 + sin(@A) * 0.125 + cos(@A) * 0.0625;\n'
+                  '@OUT = @A * k + t * 0.0001 + 0.0001;\n')
         bt_s = {"A": TEXType.VEC4, "name": TEXType.STRING, "OUT": TEXType.VEC4}
         cache = TEXCache()
         prog_s, tm_s, refs_s, asg_s, params_s, used_s = cache.compile_tex(code_s, bt_s)
@@ -3044,23 +3051,24 @@ for (int i = 0; i < 2; i = i + 1) {
                                               precision="fp16")
         finally:
             torch.compile = orig_compile
+        assert entry is None, \
+            "codegen-rejected program must NOT be interpreter-wrapped (v0.20)"
 
-        assert entry is not None
-        wrapped, backend = entry
-        assert wrapped is not compiled_mod._plain_execute, \
-            "interpreter wrap must be a closure, not bare _plain_execute"
+        # End-to-end: the full execute_compiled route still bakes precision in.
         half = torch.full((B, H, W, 4), 0.5)
-        got = wrapped(prog_s, {"A": half, "name": "abc"}, tm_s, "cpu", 0, None)
+        fp_s = cache.fingerprint(code_s, bt_s)
+        got = compiled_mod.execute_compiled(prog_s, {"A": half, "name": "abc"}, tm_s, "cpu",
+                                            fp_s, used_builtins=used_s, precision="fp16")
         exp16 = _plain_execute(prog_s, {"A": half, "name": "abc"}, tm_s, "cpu",
                                used_builtins=used_s, precision="fp16")
         exp32 = _plain_execute(prog_s, {"A": half, "name": "abc"}, tm_s, "cpu",
                                used_builtins=used_s, precision="fp32")
-        assert torch.equal(got, exp16), "closure did not forward precision"
+        assert torch.equal(got, exp16), "plain fallback did not forward precision"
         assert (got - exp32).abs().max().item() > 1e-5, \
             "fp16 vs fp32 should differ (0.5 + 0.0001 rounds away at fp16)"
-        r.ok("compiled: interpreter wrap bakes precision/used_builtins")
+        r.ok("compiled: no interp-wrap (v0.20); plain fallback bakes precision/used_builtins")
     except Exception as e:
-        r.fail("compiled: interpreter wrap bakes precision/used_builtins",
+        r.fail("compiled: no interp-wrap (v0.20); plain fallback bakes precision/used_builtins",
                f"{e}\n{traceback.format_exc()}")
 
     # CLCG4 baseline: a program-specific runtime failure still blacklists the

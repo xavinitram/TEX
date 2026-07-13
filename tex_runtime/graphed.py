@@ -80,16 +80,22 @@ _blacklist: set[tuple] = set()
 # cache-hit replays don't re-walk the program every cook).
 _capturable_memo: "dict[str, tuple[bool, int]]" = {}
 
-# PF-1/PF-2 — CUDA-graph crossover gate (calibrated on RTX 2080S / torch 2.10
-# from Appendix A + v016_bench). The tier elides a FIXED per-kernel launch cost
-# but pays a staging copy that scales with pixel count, so it wins only for
-# enough-kernels at low-enough-resolution. Measured: wins ≤512² broadly, breaks
-# even/loses at 1024² unless kernel-heavy, loses everywhere for ~0-kernel
-# programs, loses at 2048² for all program classes tested.
+# PF-1/PF-2 — CUDA-graph crossover gate (originally calibrated on RTX 2080S /
+# torch 2.10 from Appendix A + v016_bench). The tier elides a FIXED per-kernel
+# launch cost but pays a staging copy that scales with pixel count, so it wins
+# only for enough-kernels at low-enough-resolution. Turing measured: wins ≤512²
+# broadly, breaks even/loses at 1024² unless kernel-heavy, loses everywhere for
+# ~0-kernel programs, loses at 2048² for all program classes tested.
+# The px ceilings are per-arch (S-5): initialized from arch_support.gate_profile()
+# — a VERIFIED arch (e.g. sm_120, where low-op programs still win 1.66x at 1024²)
+# gets its measured ceilings; everything else keeps the Turing values. The module
+# attributes stay the contract (HW-1 canary + probes monkeypatch them).
+from .arch_support import gate_profile as _gate_profile
+_PROFILE = _gate_profile()
 _GRAPH_MIN_OPS = 2                    # PF-2: 0/1-op programs capture an ~empty graph → pure loss
-_GRAPH_HIGH_OPS = 40                  # kernel-heavy programs keep winning up to 1024²
-_GRAPH_BASE_PX_CEIL = 512 * 512       # low-kernel programs win only up to ~512²
-_GRAPH_HIGH_PX_CEIL = 1024 * 1024     # hard cap: no class tested wins above 1024²
+_GRAPH_HIGH_OPS = 40                  # kernel-heavy programs keep winning up to the high ceiling
+_GRAPH_BASE_PX_CEIL = _PROFILE["graph_base_px_ceil"]   # low-kernel win ceiling (Turing: 512²)
+_GRAPH_HIGH_PX_CEIL = _PROFILE["graph_high_px_ceil"]   # hard cap (Turing + sm_120: 1024²)
 
 # Bytes budget for the shared pool's reserved growth. Freed wholesale when over.
 _GRAPH_BYTES_BUDGET = 512 * 1024 * 1024
@@ -113,10 +119,12 @@ def _build_keepalive() -> None:
     try:
         from . import stdlib as _sl
         from . import noise as _ns
+        from . import compiled as _cp
         _keepalive.extend([
             _sl._sampler_cache, _sl._grid_buf, _sl._mip_cache,
             _sl._gauss_mip_cache, _sl._gauss_kernel_cache,
             _ns._worley_offsets_cache, _ns._worley3d_offsets_cache,
+            _cp._ENV_TENSOR_CACHE,   # codegen builtin tensors (u/v/ix/... cross-cook cache)
         ])
     except Exception:
         pass

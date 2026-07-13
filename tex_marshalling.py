@@ -18,17 +18,116 @@ from .tex_compiler.types import TEXType
 from .tex_runtime.stdlib import LUMA_R, LUMA_G, LUMA_B
 
 
-def to_fp32_if_int_image(t):
+# ── XPU: pinned egress + non-blocking ingestion (v0.20) ──────────────────────
+#
+# A mixed-device chain (CPU-cooked TEX node → CUDA-cooked TEX node) pays one H2D
+# copy at ingestion. In v0.19.1 that copy was strictly serial: the source was
+# ordinary pageable memory, and CUDA can only DMA asynchronously from page-locked
+# (pinned) memory — PyTorch silently downgrades non_blocking=True to a sync copy
+# from pageable sources. So the timeline was copy-finishes → compute-starts.
+#
+# v0.20 staggers them: a CPU cook (with CUDA present) writes its output into
+# pinned memory (same write, page-locked allocation — torch's caching host
+# allocator amortizes the lock cost across cooks), and ingestion issues
+# .to("cuda", non_blocking=True) for pinned sources. The DMA rides in the
+# background while Python keeps working (remaining bindings, coordinate
+# builtins, interpreter dispatch); CUDA stream ordering makes the first kernel
+# that touches the data wait exactly until the copy lands. No events, no manual
+# sync, bit-identical — the standard DataLoader pattern. ~1.2-1.5ms hidden per
+# 16MB 1024² vec4 frame on PCIe; proportionally more at 4K (67MB).
+#
+# All-CPU and all-GPU chains are untouched (zero copies either way); pinned
+# tensors read/write like any CPU memory for a downstream CPU consumer.
+
+_PIN_MIN_BYTES = 1 << 20    # <1MB DMAs in <0.1ms — nothing worth hiding
+# Upper cap: pinned pages are unswappable, and torch's caching host allocator
+# retains freed blocks for the process lifetime — an uncapped video-scale egress
+# (e.g. a [81,1088,1920,3] fp32 batch ≈ 1.9GB) would permanently page-lock RAM
+# the OS can never reclaim. Above the cap the copy is seconds-scale anyway; no
+# amount of Python-side overlap hides it, so pageable loses nothing.
+_PIN_MAX_BYTES = 256 << 20  # 256MB
+
+
+def _pin_worthwhile(t) -> bool:
+    """True when an egress alloc for `t` should be page-locked: it's a CPU tensor
+    in the size band where a background H2D copy has real latency to hide (1MB —
+    256MB), and CUDA exists to DMA to. Never raises (a wedged driver reads as
+    no-CUDA)."""
+    try:
+        nbytes = t.numel() * t.element_size() if isinstance(t, torch.Tensor) else 0
+        return (isinstance(t, torch.Tensor)
+                and t.device.type == "cpu"
+                and _PIN_MIN_BYTES <= nbytes <= _PIN_MAX_BYTES
+                and torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _pinned_clamp01(raw: torch.Tensor) -> torch.Tensor:
+    """`raw.clamp(0, 1)` whose fresh output tensor is page-locked when worthwhile
+    (same write either way). Falls back to a pageable clamp on any host-memory
+    pressure — pinning is an optimization, never a requirement."""
+    if _pin_worthwhile(raw):
+        try:
+            out = torch.empty(raw.shape, dtype=raw.dtype, pin_memory=True)
+            return torch.clamp(raw, 0.0, 1.0, out=out)
+        except Exception:
+            pass
+    return raw.clamp(0, 1)
+
+
+def _pinned_contiguous(t: torch.Tensor) -> torch.Tensor:
+    """`t.contiguous()` whose materialization is page-locked when worthwhile.
+    Used by the LATENT permute copies (egress AND unwrap) so latent chains keep
+    pinned-ness through to ingestion. Already-contiguous tensors pass through."""
+    if t.is_contiguous():
+        return t
+    if _pin_worthwhile(t):
+        try:
+            out = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            out.copy_(t)
+            return out
+        except Exception:
+            pass
+    return t.contiguous()
+
+
+def to_fp32_if_int_image(t, device=None):
     """M5-INT: an integer image-like tensor binding (dim>=3, not bool) has TEX type
     VECn (float), so BOTH the interpreter and codegen cast it to fp32 at ingestion —
     otherwise the tiers diverge for FLOAT/LATENT outputs (or int64 values > 2^24).
     Scalar int params / int index arrays (dim<3) and bool masks pass through.
 
+    `device` (optional) additionally co-locates the tensor on the compute device,
+    FUSED with the cast when both apply — one copy instead of two. This makes a
+    cross-device handoff (e.g. a CPU-cooked TEX node feeding a CUDA-forced one)
+    a single direct hop on every tier, instead of an exception + interpreter
+    retry on the codegen tiers.
+
     Single source for both ingestion paths (the interpreter binding loop and
     codegen's `_contiguous_bindings`); guarded by the M5-INT bit-exactness test."""
-    if (isinstance(t, torch.Tensor) and t.dim() >= 3
-            and not t.is_floating_point() and t.dtype != torch.bool):
+    if not isinstance(t, torch.Tensor):
+        return t
+    needs_cast = (t.dim() >= 3 and not t.is_floating_point()
+                  and t.dtype != torch.bool)
+    needs_move = device is not None and t.device != device
+    if needs_cast and needs_move:
+        return t.to(device=device, dtype=torch.float32)
+    if needs_cast:
         return t.to(torch.float32)
+    if needs_move:
+        # XPU (v0.20): a pinned CPU source headed to CUDA rides the DMA engine in
+        # the background — the CPU returns immediately and the rest of ingestion
+        # (remaining bindings, coordinate builtins, dispatch) overlaps the copy.
+        # Stream ordering makes the first kernel touching the data wait exactly
+        # until the copy lands: no events, no manual sync, bit-identical. Pure
+        # device move only (a dtype-converting copy stays synchronous above);
+        # pageable sources take the plain path (PyTorch would silently degrade
+        # non_blocking to sync anyway). D2H is never non_blocking (a CPU-side
+        # read could observe an in-flight buffer).
+        if getattr(device, "type", None) == "cuda" and t.is_pinned():
+            return t.to(device, non_blocking=True)
+        return t.to(device)
     return t
 
 
@@ -78,7 +177,11 @@ def unwrap_latent(value: dict) -> tuple[torch.Tensor, dict]:
             f"This LATENT input's 'samples' isn't the expected [batch, channels, height, "
             f"width] shape (got {got}). This usually means an upstream node produced an "
             f"empty or malformed latent — try re-running it.")
-    tensor_cl = samples.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
+    # The BCHW→BHWC materialization goes to pinned memory when this latent is a
+    # CPU tensor on a CUDA-capable box — without this, the unwrap copy would
+    # strip the pinned-ness a pinned LATENT egress just paid for, and ingestion's
+    # non-blocking H2D would silently degrade to a sync copy (XPU, v0.20).
+    tensor_cl = _pinned_contiguous(samples.permute(0, 2, 3, 1))  # [B, H, W, C]
     metadata = {k: v for k, v in value.items() if k != "samples"}
     return tensor_cl, metadata
 
@@ -269,7 +372,9 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
         # Keep on the compute device (GPU stays GPU): forcing .cpu() here makes
         # chained TEX nodes round-trip over PCIe per link and collapses the next
         # node's auto-device to CPU. Terminal nodes (Save/Preview) .cpu() themselves.
-        return raw.clamp(0, 1)
+        # CPU cooks (with CUDA present) egress into pinned memory so a downstream
+        # CUDA cook's H2D copy can overlap its Python-side setup (XPU, v0.20).
+        return _pinned_clamp01(raw)
 
     elif output_type == "MASK":
         # MASK expects [B, H, W] float32 in [0, 1]
@@ -282,8 +387,8 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
         elif raw.dim() == 0:
             raw = raw.view(1, 1, 1)
         # dim == 3 ([B, H, W]) is the correct format — pass through.
-        # Keep on the compute device (see IMAGE above).
-        return raw.clamp(0, 1)
+        # Keep on the compute device (see IMAGE above); pinned egress ditto.
+        return _pinned_clamp01(raw)
 
     elif output_type == "FLOAT":
         if raw.dim() == 0:
@@ -291,9 +396,10 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
         return raw.float().mean().item()  # .float(): mean() rejects integer dtypes
 
     elif output_type == "LATENT":
-        # LATENT expects [B, C, H, W] — permute back from channel-last
+        # LATENT expects [B, C, H, W] — permute back from channel-last.
+        # The materializing copy goes to pinned memory on CPU cooks (see IMAGE).
         if raw.dim() == 4:
-            raw = raw.permute(0, 3, 1, 2).contiguous()
+            raw = _pinned_contiguous(raw.permute(0, 3, 1, 2))
         elif raw.dim() == 3:
             # [B, H, W] -> [B, 1, H, W]
             raw = raw.unsqueeze(1)

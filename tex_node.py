@@ -563,9 +563,14 @@ class TEXWrangleNode(_BaseClass):
         the old cascade verbatim; this is the CPU-testable core where the routing
         complexity lives (a fake `device="cuda:0"` string exercises the cuda_graph
         classification without a GPU)."""
-        if compile_mode == "torch_compile" and not fused_chain:
+        # v0.20: fused chains may take the compile tiers too — keyed by fused_fp
+        # (same pattern cuda_graph used since v0.17). Measured on a fused-chain-
+        # shaped program (sm_120 + Triton): inductor 2.63x vs interpreter at
+        # 1024²; on toolchain-less boxes the tiers self-fall-back (and `auto`
+        # measures-then-rejects), so enabling them is never a regression.
+        if compile_mode == "torch_compile" and (not fused_chain or fused_fp_present):
             return "torch_compile"
-        if compile_mode == "auto" and not fused_chain:
+        if compile_mode == "auto" and (not fused_chain or fused_fp_present):
             return "auto"
         if (compile_mode == "cuda_graph" and str(device).startswith("cuda")
                 and (not fused_chain or fused_fp_present)):
@@ -576,9 +581,11 @@ class TEXWrangleNode(_BaseClass):
     #    dict-normalization is lifted to execute() post-dispatch. ──
     @classmethod
     def _run_torch_compile(cls, ctx: ExecContext):
+        # Fused chains are keyed by their chain fingerprint (ctx.fp is None there).
+        _fp = ctx.fused_fp if ctx.fused_chain else ctx.fp
         try:
             return execute_compiled(ctx.program, ctx.bindings, ctx.type_map, ctx.device,
-                                    ctx.fp, latent_channel_count=ctx.latent_channel_count,
+                                    _fp, latent_channel_count=ctx.latent_channel_count,
                                     output_names=ctx.output_names, used_builtins=ctx.used_builtins)
         except Exception as compile_exc:
             # Defense in depth: torch_compile must NEVER hard-fail the node.
@@ -588,9 +595,11 @@ class TEXWrangleNode(_BaseClass):
 
     @classmethod
     def _run_auto(cls, ctx: ExecContext):
+        # Fused chains are keyed by their chain fingerprint (ctx.fp is None there).
+        _fp = ctx.fused_fp if ctx.fused_chain else ctx.fp
         try:
             from .tex_runtime.compiled import run_auto
-            return run_auto(ctx.program, ctx.bindings, ctx.type_map, ctx.device, ctx.fp,
+            return run_auto(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
                             latent_channel_count=ctx.latent_channel_count,
                             output_names=ctx.output_names, used_builtins=ctx.used_builtins,
                             precision=ctx.eff_precision)
