@@ -178,6 +178,73 @@ def test_f1_fused_compile_tiers(r: SubTestResult):
         r.fail("F-1 fused compile tiers", f"{type(e).__name__}: {e}")
 
 
+def test_f1b_fused_node_path_reaches_compile_tier(r: SubTestResult):
+    print("\n--- F-1b: a fused chain cooked THROUGH THE NODE reaches the compile tier ---")
+    try:
+        import json
+        import TEX_Wrangle.tex_runtime.compiled as C
+        from TEX_Wrangle.tex_node import TEXWrangleNode
+
+        # A real 2-stage chain exactly as graphToPrompt hands the terminal: one
+        # UPSTREAM stage reads the source (@A); the TERMINAL reads the chain (@Y).
+        # Same _tex_chain spec shape as benchmarks/fusion_splice_test.run_payload.
+        spec = {
+            "stages": [
+                {"code": "float t = $amt; @OUT = clamp(@A * vec4(t, 1.0, 1.0 - t, 1.0), 0.0, 1.0);",
+                 "image_input": "A", "params": {"amt": 0.3}},
+            ],
+            "terminal_image_input": "Y",
+        }
+        terminal_code = ("float t = $amt; vec4 c = @Y - vec4(t, t, t, 0.0); "
+                         "@OUT = clamp(c, 0.0, 1.0);")
+        img = torch.rand(1, 32, 32, 4)
+
+        # Spy on the node's tier DISPATCH — the routing decision IS the bug: with
+        # fused_fp left None (the pre-fix cuda_graph-only guard) select_tier returns
+        # "default" and the spliced chain runs on the interpreter, never the compile
+        # tier. We assert on the dispatched tier_id (and the ctx that produced it),
+        # NOT on tier_trace: a SUCCESSFUL compiled cook records nothing to tier_trace
+        # (only fallbacks/demotes do), and the buggy interpreter path records nothing
+        # either — so tier_trace can't distinguish them, but the dispatched tier can.
+        # (F-1 exercises select_tier with a synthetic fp; that is exactly what let the
+        # node gate hide — this drives the whole node so the gate can't be bypassed.)
+        seen = {}
+        orig = TEXWrangleNode._run_tier.__func__
+
+        def _spy(cls, ctx, tier_id):
+            seen.setdefault("tier_id", tier_id)
+            seen["fused_chain"] = ctx.fused_chain
+            seen["fused_fp"] = ctx.fused_fp
+            return orig(cls, ctx, tier_id)
+
+        C.clear_compiled_cache()
+        TEXWrangleNode._run_tier = classmethod(_spy)
+        try:
+            result = TEXWrangleNode.execute(
+                code=terminal_code, _tex_chain=json.dumps(spec),
+                Y=img, amt=0.05, device="cpu", compile_mode="torch_compile",
+            )
+        finally:
+            TEXWrangleNode._run_tier = classmethod(orig)
+            C.clear_compiled_cache()
+
+        assert seen.get("fused_chain") is True, "cook was not recognized as a fused chain"
+        assert seen.get("fused_fp") is not None, \
+            "node left fused_fp None under torch_compile (the bug: cuda_graph-only guard)"
+        assert seen.get("tier_id") == "torch_compile", \
+            f"fused chain routed to {seen.get('tier_id')!r}, not the compile tier"
+
+        # And the cook completed end-to-end: the compile tier self-falls-back to the
+        # interpreter on a toolchain-less box, so a finite @OUT is always produced.
+        vals = result if isinstance(result, tuple) else getattr(result, "args", result)
+        out0 = vals[0]
+        assert out0 is not None and torch.isfinite(out0).all(), \
+            "fused compiled-tier cook produced no finite output"
+        r.ok(f"fused chain reached tier '{seen['tier_id']}' via the node (fused_fp set); @OUT finite")
+    except Exception as e:
+        r.fail("F-1b fused node-path compile tier", f"{type(e).__name__}: {e}")
+
+
 def test_a2_env_cache_scatter_cow(r: SubTestResult):
     print("\n--- A-2: codegen scatter COW protects the cross-cook env tensor cache ---")
     try:

@@ -801,11 +801,16 @@ class TEXWrangleNode(_BaseClass):
                 # failure here raises (we must NOT silently run the terminal
                 # alone — the upstream nodes were collapsed away in the prompt).
                 spec = json.loads(chain_payload) if isinstance(chain_payload, str) else chain_payload
-                # Q-1: the fused fingerprint (value-independent) lets the whole
-                # spliced chain be a CUDA-graph capture unit — computed from the
-                # original bindings before _prepare_fused merges them. Only needed
-                # for cuda_graph mode, so skip the extra stage-assembly otherwise.
-                if compile_mode == "cuda_graph":
+                # Q-1 / v0.20: the fused fingerprint (value-independent) is the KEY
+                # under which select_tier admits a fused chain to the accelerated
+                # tiers — a CUDA-graph capture unit (cuda_graph) OR a torch.compile/
+                # auto artifact. So it must be computed for EVERY compiling mode, not
+                # cuda_graph alone: without it select_tier strands a fused chain on the
+                # interpreter under torch_compile/auto (the measured inductor win is
+                # then unreachable from the node). Computed from the original bindings
+                # before _prepare_fused merges them; value-independent + memoized (see
+                # tex_fusion.fused_fingerprint), so cheap on every mode.
+                if compile_mode in ("cuda_graph", "torch_compile", "auto"):
                     fused_fp = _fused_fingerprint(spec, code, bindings, _infer_binding_type)
                 (program, type_map, referenced, assigned_bindings, param_info,
                  used_builtins, bindings) = _prepare_fused(spec, code, bindings, _infer_binding_type)

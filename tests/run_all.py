@@ -448,7 +448,8 @@ def main():
     from test_v020_phase1 import (
         test_xpu1_pinned_egress, test_xpu2_unwrap_latent_pinned,
         test_xpu3_nonblocking_ingestion_bitexact, test_xpu4_egress_ingest_roundtrip,
-        test_f1_fused_compile_tiers, test_a2_env_cache_scatter_cow,
+        test_f1_fused_compile_tiers, test_f1b_fused_node_path_reaches_compile_tier,
+        test_a2_env_cache_scatter_cow,
         test_c1_gate_profiles_sane, test_g2_verify_arming, test_g1_compile_demotion,
     )
     test_xpu1_pinned_egress(r)
@@ -456,6 +457,7 @@ def main():
     test_xpu3_nonblocking_ingestion_bitexact(r)
     test_xpu4_egress_ingest_roundtrip(r)
     test_f1_fused_compile_tiers(r)
+    test_f1b_fused_node_path_reaches_compile_tier(r)
     test_a2_env_cache_scatter_cow(r)
     test_c1_gate_profiles_sane(r)
     test_g2_verify_arming(r)
