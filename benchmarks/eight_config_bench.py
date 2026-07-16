@@ -30,10 +30,12 @@ import argparse
 import gc
 import json
 import math
+import os
 import platform
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -42,6 +44,13 @@ _pkg_dir = _bench_dir.parent
 _custom_nodes_dir = _pkg_dir.parent
 sys.path.insert(0, str(_custom_nodes_dir))
 sys.path.insert(0, str(_bench_dir))
+
+# CACHE-0: scratch cache dir, set before any TEX import (get_cache() resolves the
+# location once, on first call), so a bench run never writes compiled artifacts into
+# the shipping package's .tex_cache. The per-program compile-ON subprocesses inherit
+# it, so they share this dir and cold/warm semantics are unchanged.
+os.environ.setdefault(
+    "TEX_CACHE_DIR", str(Path(tempfile.gettempdir()) / "tex_bench_cache"))
 
 import torch
 from run_benchmarks import (

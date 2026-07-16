@@ -20,9 +20,17 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import heapq
 import logging
 from collections import OrderedDict
 from typing import Any, Callable
+
+# FUS-1: cap how large a single fused region can grow. A 50-node region compiles into
+# ONE torch.compile program (longer trace, bigger capture) and materializes full-res
+# intermediates (CACHE-6 hasn't landed) — Blender and torch.compile both cap their fuse
+# units for the same reason. Past the cap the region is left unfused (the linear pass
+# still fuses sub-chains); safe, just not one giant program.
+_MAX_FUSED_REGION_STAGES = 16
 
 logger = logging.getLogger("TEX.fusion")
 
@@ -338,7 +346,16 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
 
     cached = _FUSED_MEMO.get(memo_key)
     if cached is not None:
-        _FUSED_MEMO.move_to_end(memo_key)
+        # move_to_end can race a concurrent popitem: FUS-1's /detect_regions route
+        # runs compile_fused on an aiohttp executor thread while a cook thread also
+        # compiles a fused terminal, and a lost key would raise KeyError that fails
+        # the whole prompt. GIL-atomic per op, but get-then-move_to_end is not one
+        # op — tolerate the eviction (the value is still valid; only its LRU
+        # recency is lost). ENG-9 will give the memo a real lock.
+        try:
+            _FUSED_MEMO.move_to_end(memo_key)
+        except KeyError:
+            pass
         return (*cached, _merged_bindings())
 
     # CT-1: disk tier — a persisted result survives process restart, skipping the
@@ -446,6 +463,22 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
         passthrough = set(checker.assigned_bindings) if is_terminal else set()
         user_fns = {s.name for s in prog.statements if isinstance(s, A.FunctionDef)}
         _transform(prog, prefix, user_fns, wire_map, redirect_map, passthrough)
+        # C-fix: a TERMINAL that read-modify-writes one of its wired chain inputs
+        # (`@b += …`, `@b = @b*2`, `@b.rgb = …`) both READS and ASSIGNS @b, so @b is
+        # in `passthrough` (an output) — `_transform` keeps it as bare `@b` and never
+        # resolves the READ to the upstream handoff (passthrough is matched before
+        # wire_map). @b is not a merged binding either, so the read raises E6021 at
+        # cook (a broken prompt invisible to preflight). Seed the output from the
+        # upstream handoff BEFORE the terminal's statements — inserted POST-transform
+        # so the handoff local isn't re-prefixed. Bit-exact to the unfused
+        # read-modify-write; a write-first terminal just overwrites the seed.
+        if is_terminal:
+            rmw_seeds = [
+                A.Assignment(op="=", target=A.BindingRef(kind="wire", name=name),
+                             value=A.Identifier(name=wire_map[name]))
+                for name in sorted(wire_map) if name in passthrough
+            ]
+            prog.statements[:0] = rmw_seeds
         if seedless_idx is not None:
             # _transform rewrote `@OUT = expr` to `Assignment(Identifier(out_local) = expr)`;
             # promote that first write to the declaration of the handoff local.
@@ -636,6 +669,43 @@ def _stages_from_spec(spec: dict, terminal_code: str, terminal_bindings: dict) -
         raise FusionError(f"the fused chain's source image ('{chain_key}') reached "
                           f"the terminal node empty — re-run the upstream nodes.")
 
+    # FUS-1: DAG payload (fan-out / diamonds). Each upstream stage carries its own
+    # `chain_inputs` (which of its @-bindings read which earlier stage's @OUT), the
+    # terminal carries `terminal_chain_inputs`, and the single external source is
+    # injected into the stage/binding that reads it. The `terminal_image_input`
+    # socket is only the SOURCE TRANSPORT here (the terminal's real reads are its
+    # chain_inputs), so it is popped but not re-attached. Linear payloads (no `dag`)
+    # take the unchanged path below and stay byte-identical (same memo/disk keys).
+    if spec.get("dag"):
+        source_stage = spec.get("source_stage", 0)
+        source_binding = spec.get("source_binding")
+        fused_stages = []
+        for idx, st in enumerate(stages):
+            sb = dict(st.get("params") or {})
+            if idx == source_stage and source_binding:
+                sb[source_binding] = source
+            entry = {"code": st["code"], "bindings": sb}
+            ci = st.get("chain_inputs")
+            if ci:
+                entry["chain_inputs"] = _listify_chain_inputs(ci)
+            fused_stages.append(entry)
+        term = {"code": terminal_code, "bindings": bindings}
+        # C14 — defensive only, UNREACHABLE via detect_fusable_regions: the detector
+        # rejects any region whose single external source feeds the terminal directly
+        # (`src_dst == terminal`, the spatial-fragility guard), so `source_stage` never
+        # points past the upstream stages here. Kept so a non-detector caller that
+        # hand-builds a "source feeds the terminal" spec still injects the source into
+        # the terminal rather than silently dropping it.
+        if source_stage == len(stages) and source_binding:
+            term["bindings"][source_binding] = source
+        tci = spec.get("terminal_chain_inputs")
+        if tci:
+            term["chain_inputs"] = _listify_chain_inputs(tci)
+        else:
+            term["chain_input"] = chain_key       # terminal reads the source directly
+        fused_stages.append(term)
+        return fused_stages
+
     fused_stages: list[dict] = []
     for idx, st in enumerate(stages):
         sb = dict(st.get("params") or {})
@@ -662,3 +732,387 @@ def fused_fingerprint(spec: dict, terminal_code: str, terminal_bindings: dict,
         return _fused_fp(_fused_memo_key(stages, infer_binding_type))
     except Exception:
         return None
+
+
+# ── FUS-1: DAG-region detection (the host-agnostic fusion authority) ──────────
+# compile_fused already consumes arbitrary DAG specs (chain_inputs / exports / tap,
+# Q-3), but the production producer (_stages_from_spec) only ever emitted a LINEAR
+# chain, and the frontend detector broke on any fan-out. detect_fusable_regions is
+# the single pure-Python detector — any host (the ComfyUI frontend via the
+# /detect_regions route, a standalone host, PORT-5) drives fusion by handing it the
+# graph topology, so fusion legality is decided ONCE and can't drift per host.
+#
+# v0.21 scope: single-terminal regions over @OUT (slot-0) handoffs, fed by exactly ONE
+# external image edge. A node folds iff EVERY consumer is an in-region TEX node
+# (generalizes the linear "sole TEX consumer" rule).
+#
+# What that does and does NOT cover — the distinction is INTERNAL vs EXTERNAL fan-out:
+#   covered:  a region member fans out to other members and they rejoin at the
+#             terminal (`src -> A -> [B, C] -> D`). The branch point is inside R, so
+#             the region still has one external edge: A's source.
+#   NOT yet:  one EXTERNAL producer feeding two members (`Load -> [blur, sharpen] ->
+#             merge`) — a common compositor shape. That's two external edges, so it
+#             needs multi-injection (a source spec per edge, splicer + transport work),
+#             not the single-source splice here. Left unfused: always safe, just not
+#             collapsed. Same for a genuine two-source merge.
+# Multi-output (exports) / preview-tap detection stays a later cut; the compile_fused
+# machinery for them is untouched.
+
+def _listify_chain_inputs(ci) -> dict:
+    """chain_inputs with each [src_stage, out] edge as a JSON-safe list (the detector
+    builds them as lists already, but region plans / specs pass through tuples too).
+    One spelling, shared by the region assemblers and the DAG `_stages_from_spec`."""
+    return {b: list(v) for b, v in (ci or {}).items()}
+
+
+def _index_edges(edges):
+    """(out_by_src, in_by_dst): src_id -> [edge], dst_id -> [edge]. Each edge is a
+    dict {from, from_slot, to, to_binding}."""
+    out_by_src, in_by_dst = {}, {}
+    for e in edges:
+        out_by_src.setdefault(e["from"], []).append(e)
+        in_by_dst.setdefault(e["to"], []).append(e)
+    return out_by_src, in_by_dst
+
+
+def detect_fusable_regions(nodes: dict, edges: list) -> list:
+    """`nodes`: {id: {"code_wired": bool}} for the non-muted TEX nodes ONLY.
+    `edges`: image-carrying handoff edges {from, from_slot, to, to_binding} — the
+    caller passes edges whose payload is a fusable IMAGE/MASK handoff; non-TEX
+    producers/consumers appear as ids NOT in `nodes`. Returns a list of region
+    plans (see _grow_region). Pure; never raises on well-formed input."""
+    tex = set(nodes)
+    out_by_src, in_by_dst = _index_edges(edges)
+
+    def _consumers_internalizable(nid):
+        """A non-terminal candidate: every out-edge goes to a TEX node via slot 0.
+        An empty out-edge list => a sink (terminal), not a foldable member."""
+        outs = out_by_src.get(nid, [])
+        return bool(outs) and all(e["to"] in tex and e["from_slot"] == 0 for e in outs)
+
+    regions = []
+    for term in nodes:
+        if _consumers_internalizable(term):
+            continue  # internal to some region — not a terminal
+        if nodes[term].get("code_wired"):
+            continue  # C5: a wired-code terminal has no static code to fuse (it would
+                      # serialize as "" and preflight an empty program — a false pass)
+        plan = _grow_region(term, nodes, tex, out_by_src, in_by_dst)
+        if plan is not None:
+            regions.append(plan)
+    return regions
+
+
+def _grow_region(terminal, nodes, tex, out_by_src, in_by_dst):
+    """Fixpoint-grow R(terminal) upstream, validate the single-external-source
+    constraint, and emit the plan (or None if not fusably shaped in v0.21 scope):
+        {"terminal", "order" (topo, source-first, terminal last), "delete",
+         "source": {"origin","origin_slot","stage","binding"},
+         "stages": [{"id","chain_inputs": {binding: [src_stage_idx, "OUT"]}}]}"""
+    R = {terminal}
+    changed = True
+    while changed:
+        changed = False
+        frontier = set()
+        for nid in R:
+            for e in in_by_dst.get(nid, []):
+                if e["from"] in tex and e["from"] not in R:
+                    frontier.add(e["from"])
+        for u in frontier:
+            # A wired `code` or `$param` input can't fold: the serializer captures
+            # only widget values, so folding would sever the dynamic wired value and
+            # bake the stale widget (② silent-wrong). A zero-image-input generator
+            # can't fold either: spatial-less, it would adopt the fused source's
+            # resolution, diverging from its standalone cook (③ invariant #2).
+            if nodes[u].get("code_wired") or nodes[u].get("param_wired"):
+                continue
+            if not in_by_dst.get(u):
+                continue
+            outs = out_by_src.get(u, [])
+            if outs and all(e["to"] in R and e["from_slot"] == 0 for e in outs):
+                R.add(u)
+                changed = True
+                if len(R) > _MAX_FUSED_REGION_STAGES:
+                    # Early-out: stop growing the moment the region exceeds the cap
+                    # (it will be rejected anyway). Otherwise a huge upstream cone
+                    # feeding one sink is walked to fixpoint — O(cone × depth) —
+                    # before the post-loop cap check rejects it, making detection
+                    # pathological on a dense graph (every terminal re-walks its
+                    # whole cone). Bounds each grow to O(cap × degree).
+                    return None
+
+    if len(R) < 2:
+        return None
+
+    # Region-EXTERNAL image inputs (edges into R from outside R). v0.21: exactly one.
+    external = [(nid, e["to_binding"], e["from"], e["from_slot"], e.get("from_type"))
+                for nid in R for e in in_by_dst.get(nid, []) if e["from"] not in R]
+    if len(external) != 1:
+        # 0 (no source), or >1 — which includes the case where ONE producer fans out
+        # to two members (`Load -> [blur, sharpen] -> merge`): that's two external
+        # EDGES, so it needs multi-injection (one source spec per edge), not the
+        # single-source splice v0.21 implements. Out of scope; left unfused.
+        return None
+    src_dst, src_binding, src_origin, src_slot, src_type = external[0]
+    if src_dst == terminal:
+        # The single external source feeds the TERMINAL directly, which means every
+        # other region member is a generator (no external input). Fusing a
+        # spatial-less generator into a spatial program is shape-fragile — leave the
+        # whole region unfused (always correct, just not collapsed).
+        return None
+
+    order = _topo_order(R, in_by_dst)
+    if order is None or order[-1] != terminal:
+        return None  # cycle, or the terminal is not R's unique sink
+    idx = {nid: i for i, nid in enumerate(order)}
+
+    stages = []
+    for nid in order:
+        chain_inputs = {e["to_binding"]: [idx[e["from"]], "OUT"]
+                        for e in in_by_dst.get(nid, []) if e["from"] in R}
+        stages.append({"id": nid, "chain_inputs": chain_inputs})
+
+    return {
+        "terminal": terminal,
+        "order": list(order),
+        "delete": [nid for nid in order if nid != terminal],
+        "source": {"origin": src_origin, "origin_slot": src_slot,
+                   "stage": idx[src_dst], "binding": src_binding,
+                   "type": src_type},
+        "stages": stages,
+    }
+
+
+def _topo_order(R, in_by_dst):
+    """Kahn topo sort of the subgraph induced by R (producer -> consumer),
+    source-first, id-repr tie-break for determinism. Returns None on a cycle."""
+    succs = {nid: [] for nid in R}
+    indeg = {nid: 0 for nid in R}
+    for nid in R:
+        preds = {e["from"] for e in in_by_dst.get(nid, []) if e["from"] in R}
+        indeg[nid] = len(preds)
+        for p in preds:
+            succs[p].append(nid)
+    # str-keyed min-heap: same deterministic order as a sorted ready-list, but
+    # O((V+E) log V) instead of the re-sort-every-pop O(V^2 log V). ids are unique so
+    # the str key never ties (the node itself is never compared).
+    heap = [(str(n), n) for n in R if indeg[n] == 0]
+    heapq.heapify(heap)
+    order = []
+    while heap:
+        _, n = heapq.heappop(heap)
+        order.append(n)
+        for m in succs[n]:
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                heapq.heappush(heap, (str(m), m))
+    return order if len(order) == len(R) else None
+
+
+def region_to_stages(region: dict, node_code: dict, node_params: dict) -> list:
+    """Turn a detect_fusable_regions plan into a compile_fused `stages` list (with
+    DAG `chain_inputs`). `node_code`/`node_params` map node id -> code / {param:
+    value}. The single external source is left OUT of the stage bindings here — the
+    caller injects its value at region['source'] (stage index, binding). Terminal is
+    the last stage (its assigned bindings are the real outputs)."""
+    stages = []
+    for st in region["stages"]:
+        nid = st["id"]
+        entry = {"code": node_code[nid], "bindings": dict(node_params.get(nid, {}))}
+        if st["chain_inputs"]:
+            entry["chain_inputs"] = _listify_chain_inputs(st["chain_inputs"])
+        stages.append(entry)
+    return stages
+
+
+def region_to_collapse_plan(region: dict, node_code: dict, node_params: dict) -> dict:
+    """Build a host-applyable collapse plan from a region: the DAG `_tex_chain`
+    payload (everything except `terminal_image_input` — the physical socket the host
+    picks to transport the source), plus which node survives (terminal), which are
+    deleted, and where the source comes from. The host rewires the chosen terminal
+    socket to `source_origin[:2]`, sets payload['terminal_image_input'] to that
+    socket's binding name, attaches the payload to the terminal, and deletes the
+    upstream nodes. Splitting it this way keeps DETECTION (drift-prone legality) in
+    Python and only socket wiring in the host."""
+    upstream = region["stages"][:-1]
+    term_stage = region["stages"][-1]
+    payload = {
+        "dag": True,
+        "stages": [{"code": node_code[st["id"]],
+                    "params": dict(node_params.get(st["id"], {}) or {}),
+                    "chain_inputs": _listify_chain_inputs(st["chain_inputs"])}
+                   for st in upstream],
+        "terminal_chain_inputs": _listify_chain_inputs(term_stage["chain_inputs"]),
+        "source_stage": region["source"]["stage"],   # index into `stages` (upstream)
+        "source_binding": region["source"]["binding"],
+    }
+    return {
+        "terminal": region["terminal"],
+        "delete": list(region["delete"]),
+        "source_origin": [region["source"]["origin"], region["source"]["origin_slot"]],
+        "payload": payload,
+    }
+
+
+def _region_is_linear(region: dict) -> bool:
+    """A single-terminal region is non-linear (fan-out/diamond) iff it has more
+    internal handoff edges than a path — a reconverging fan-out adds a fan-in at the
+    terminal. A purely linear region is the JS linear-collapse pass's job (C17)."""
+    stages = region.get("stages") or []
+    internal = sum(len(st.get("chain_inputs") or {}) for st in stages)
+    return internal <= len(stages) - 1
+
+
+def _preflight_samples(source_type):
+    """The tensor(s) a region's external source can plausibly BE at cook, given the
+    producer's declared socket type. _region_compiles must splice+compile against all
+    of them, since any one is what the host may hand the fused terminal.
+
+    Families, per tex_marshalling.infer_binding_type:
+      MASK   -> [B,H,W]                     -> FLOAT
+      LATENT -> unwrapped to [B,H,W,C]      -> VEC4 when C==4 (SD/SDXL), but FLOAT when
+                                               C==16 (SD3/Flux/Wan-class) — see below
+      IMAGE  -> [B,H,W,C], C in (3,4)       -> VEC3 / VEC4
+    Unknown/absent (an older JS transport, or an exotic socket type such as a litegraph
+    wildcard) falls back to IMAGE, which is the pre-v0.21 behaviour.
+
+    Why MASK matters even though scalars broadcast: TEX promotes a float through both
+    operators and swizzles (`@in.rgb` on a float is a legal vec3), so most programs
+    type-check either way. What an IMAGE-shaped guess actually costs is two things, and
+    neither is a wrong pixel:
+      * lost fusion — `@in.a` is legal on a float but not on a vec3, so the (3,4)
+        preflight REJECTED mask regions that would have cooked fine;
+      * a misleading error — vector-only calls (`length`, `normalize`) pass under
+        VEC3/VEC4 and reject a FLOAT, so a mask-fed one false-PASSED, fused, and then
+        died at cook as "couldn't fuse this chain, turn off TEX Fusion". Unfused it
+        fails too (the program is simply invalid for a float), but with the honest
+        `length() needs a vector, but argument 1 is float` at the offending node.
+
+    Known coverage limits (stated, not silent). The socket type names a family, not a
+    channel count, so two cases are deliberately preflighted at their DOMINANT shape and
+    can still false-PASS a vector-only call:
+      * a 1-channel (FLOAT) or 2-channel (VEC2) IMAGE — exotic;
+      * a LATENT with C != 4 — NOT exotic: SD3/Flux/Wan-class latents are 16-channel and
+        infer as FLOAT, yet are preflighted here as VEC4.
+    Requiring both shapes to compile would fix the false-PASS by dropping every vector
+    region off a *normal* image or 4-channel latent (`length(@lat)` doesn't type-check
+    against a float) — a real loss to buy a better error message for a program that is
+    already invalid either way. So each family stays at its dominant shape. The residue
+    is exactly {vector-only call} x {non-dominant channel count}: never a wrong pixel,
+    just "couldn't fuse this chain" where the true type error would read better."""
+    import torch
+    t = (source_type or "IMAGE").upper()
+    if t == "MASK":
+        return [torch.zeros(1, 8, 8)]
+    if t == "LATENT":
+        return [torch.zeros(1, 8, 8, 4)]
+    return [torch.zeros(1, 8, 8, 3), torch.zeros(1, 8, 8, 4)]
+
+
+def _region_compiles(region: dict, node_code: dict, node_params: dict) -> bool:
+    """PREFLIGHT: does this region actually splice+compile? detect_fusable_regions
+    only checks TOPOLOGY — it can't see the per-stage guards compile_fused enforces
+    (@OUT inside a loop/user-function, a scatter-write @OUT[x,y], an undeclared extra
+    output). A region that passes topology but trips one of those would, once its
+    upstream nodes are deleted from the prompt, hard-fail the cook with a FusionError.
+    Compiling it here drops it cleanly (host runs it unfused) AND warms the memo.
+
+    C3: the real source SHAPE is unknown at detect time (the host sends no tensor
+    shapes), and shape-sensitive stages (e.g. `vec4(@src, 1.0)` needs a vec3) compile
+    against one binding type but not another — a fixed vec3 preflight would false-PASS
+    a region whose source is a vec4 (or a mask) and then fails to cook. Preflight every
+    shape the source's declared socket type can actually take (_preflight_samples); a
+    region that isn't valid across all of them is left unfused (safe, minor coverage
+    loss). Never raises."""
+    try:
+        from .tex_marshalling import infer_binding_type
+        src = region["source"]
+        for sample in _preflight_samples(src.get("type")):
+            stages = region_to_stages(region, node_code, node_params)
+            stages[src["stage"]]["bindings"][src["binding"]] = sample
+            compile_fused(stages, infer_binding_type)
+        return True
+    except Exception:
+        return False
+
+
+def detect_region_plans(graph: dict) -> list:
+    """Route entry (FUS-1): given a serialized TEX subgraph
+        {nodes: [{id, code, params, code_wired, param_wired}],
+         edges: [{from, from_slot, to, to_binding}]}
+    return host-applyable collapse plans (region_to_collapse_plan). Detection +
+    preflight live here so every host performs the SAME fusion and legality can't
+    drift per host. Never raises — a malformed graph yields [] (host runs unfused)."""
+    try:
+        gnodes = graph.get("nodes", [])
+        node_code = {n["id"]: n.get("code", "") for n in gnodes}
+        node_params = {n["id"]: (n.get("params") or {}) for n in gnodes}
+        nodes = {n["id"]: {"code_wired": bool(n.get("code_wired")),
+                           "param_wired": bool(n.get("param_wired"))} for n in gnodes}
+        plans = []
+        for reg in detect_fusable_regions(nodes, graph.get("edges", [])):
+            if _region_is_linear(reg):
+                continue  # C17: the JS linear-collapse pass owns linear chains
+            if _region_compiles(reg, node_code, node_params):
+                plans.append(region_to_collapse_plan(reg, node_code, node_params))
+            # else: trips a compile_fused guard -> leave the region unfused (safe)
+        return plans
+    except Exception:
+        logger.warning("[TEX] region detection failed; nothing fused this queue.",
+                       exc_info=True)
+        return []
+
+
+# ── FUS-2: fused-chain lazy composition (the mechanism) ──────────────────────
+# Walks a fused chain's stages terminal-first, folding each stage's params, to find
+# which stages (and their external inputs) the fused program can actually reference.
+# Over-approximate by construction (lazy_required_bindings already is; a stage is
+# kept whenever any needed downstream reads its handoff), so a wrongly-dropped input
+# would fail LOUD as E6003, never silent.
+#
+# WIRING DEFERRED (see tests/test_v021_phase1.py): in v0.21's single-external-source
+# fusion scope the source is always the R1 shape anchor (never prunable) and every
+# input traces to it, so hooking this into check_lazy_status/execute's E6003 gate
+# would prune nothing yet add E6003-breakage risk. When multi-source regions land,
+# ONE memoized result of this analysis must feed BOTH consumers (invariant #11's
+# dual-consumer rule), exactly as tex_lazy does for the single-node case.
+
+def fused_required_bindings(stages: list, source_stage: int | None = None,
+                            source_binding: str | None = None):
+    """`stages`: the SAME list compile_fused / region_to_stages produce — each
+    {code, bindings, chain_inputs: {binding: [src_idx, "OUT"]}}. `source_stage` /
+    `source_binding` name which stage reads the external chain source (from a region
+    plan's `source`). Returns {source_needed, needed_stages, needed_names} or None
+    (any stage's lazy analysis failed -> caller cooks everything). The foldable
+    scalars come from each stage's `bindings` (the real contract — widget/wired param
+    values live there), NOT a fabricated `params` key. Pure over-approximation."""
+    from .tex_lazy import lazy_required_bindings
+    n = len(stages)
+    if n == 0:
+        return None
+    ref = []
+    for st in stages:
+        params = {k: v for k, v in (st.get("bindings") or {}).items()
+                  if isinstance(v, (bool, int, float))}
+        got = lazy_required_bindings(st.get("code", ""), params)
+        if got is None:
+            return None
+        ref.append(got)
+    needed = {n - 1}                        # the terminal always cooks
+    changed = True
+    while changed:
+        changed = False
+        for i in list(needed):
+            for binding, edge in (stages[i].get("chain_inputs") or {}).items():
+                src_idx = edge[0]
+                if binding in ref[i] and src_idx not in needed:
+                    needed.add(src_idx)
+                    changed = True
+    needed_names: set = set()
+    for i in needed:
+        needed_names |= set(ref[i])
+    source_needed = (source_stage is not None and source_binding is not None
+                     and 0 <= source_stage < n and source_stage in needed
+                     and source_binding in ref[source_stage])
+    return {"source_needed": source_needed, "needed_stages": needed,
+            "needed_names": needed_names}

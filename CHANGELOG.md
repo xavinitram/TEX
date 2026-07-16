@@ -5,6 +5,177 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-07-16
+
+**Fuse the graph** — the first release on the compositor-engine roadmap
+(`docs/roadmap.md`). v0.20 let a *linear* TEX chain compile as one kernel set; a real
+comp graph is a DAG — merges, masks, A/B branches — where linear-only fusion fuses
+almost nothing. This release makes fusion real on internally-branching regions (see the
+scope note below for what that does and doesn't reach), sharpens the compile tier's
+timing, and lands the measurement + hygiene the roadmap's next steps stand on. Suite green except the one known dev-box-only S-4 subprocess-import artifact of the
+embedded Python (`._pth` ignores PYTHONPATH); ~24 new v0.21 sub-tests across FUS-1/2/3 +
+LAT/CACHE/ENG, including a fusion-region preflight and interp↔codegen DAG parity.
+
+**Performance (invariant #7, measured).** LAT-4 changes the *default* interpreter path,
+so it gets a real gate: `benchmarks/lat4_ab.py`. The two questions need different
+instruments, and conflating them yields a vacuous answer.
+
+*Steady path (same resolution — where most cooks live).* Both versions HIT their cache,
+so the entire delta is the lookup: v0.20's `cache_key == self._builtins_cache_key`
+(one tuple compare) versus v0.21's `lru.get(...)` + `move_to_end(...)`. Timed directly
+(200k×7, min-of-N): **65.1 ns → 106.2 ns, i.e. LAT-4 costs +41 ns per cook**. Against a
+171 µs cook that is **+0.024%**, roughly 15× below this box's own 0.35% whole-cook noise
+floor (established by an A/A null control in the same script). So the cost is real, named,
+and far below observability — invariant #7 holds, and the honest claim is "+0.024%", not
+"zero".
+
+*The win it was built for.* Under proxy↔full-res alternation the v0.20 single slot
+thrashes (rebuild every cook) while the LRU hits — paired and interleaved in one process
+so thermal drift hits both arms:
+
+| proxy↔full alternation | LRU(8) v0.21 | single slot v0.20 | paired speedup (95% CI) |
+|---|---|---|---|
+| cpu | 0.2636 ms | 0.3119 ms | **1.16×** [1.14, 1.19], wins 82% of reps |
+| cuda | 0.0785 ms | 0.1309 ms | **1.73×** [1.58, 1.80], wins 100% of reps |
+
+LAT-3 *removes* a per-cook `synchronize`, and cache entries are `expand()` views (~64 KB
+even at 4K, measured).
+
+The eight-config `--compare` was **run and is reported as inconclusive, not as a pass**:
+on this laptop its per-program CV is 16–26% median (max 223%; e.g. `matrix_heavy` "gained"
+11.9x at CV 101.8%), which is far wider than any LAT-4-scale effect — its ±6% geomean
+flags are noise in both directions, and the v0.20 baseline was itself captured on a loaded
+box. That instrument cannot answer this question, so the paired A/B above is the gate that
+does. Re-running the eight-config on a quiet machine remains worthwhile for gross
+regressions.
+
+### Fusion on DAGs (FUS-1, FUS-3)
+- **`detect_fusable_regions(nodes, edges)`** — one pure-Python detector is now the
+  fusion authority: single-terminal regions over `@OUT` (slot-0) handoffs, fed by
+  exactly one external image edge (a node folds iff *every* consumer is an in-region
+  TEX node — the linear "sole consumer" rule generalized). The `compile_fused` backend
+  already consumed DAG specs (Q-3 `chain_inputs`); this supplies the producer it never had.
+- **Scope — internal vs external fan-out (read this before expecting a win).** Covered:
+  fan-out *inside* a region, where a member branches and the branches rejoin at the
+  terminal (`src → A → [B, C] → D`) — the branch point is in-region, so there's still
+  one external edge. **Not yet covered:** one *external* producer feeding two members
+  (`Load → [blur, sharpen] → merge`) — a canonical comp shape, but two external edges,
+  which needs multi-injection (one source spec per edge: splicer + transport work),
+  deferred to **v0.21.1**. Two-source merges are likewise unfused. So on a real comp
+  graph this release fuses strictly more than v0.20, but a shared-source split still
+  runs unfused — always safe, just not collapsed.
+- **`POST /tex_wrangle/detect_regions`** exposes the detector so every host performs
+  the *same* fusion (legality can't drift per host); it **preflight-compiles** each
+  region before trusting it — the exact tensor is unknown at detect time, so the frontend
+  now sends the producer's socket type and the preflight tests that family (IMAGE → 3-
+  *and* 4-channel; MASK → the `[B,H,W]` float; LATENT → its 4-channel unwrapped form).
+  A socket type names a family, not a channel count, so each family is checked at its
+  dominant shape: a 16-channel SD3/Flux/Wan-class latent (which infers as a *float*) and
+  an exotic 1-/2-channel image are knowingly not covered — see `_preflight_samples` for
+  why widening it would cost more fusion than it buys. The preflight drops any region
+  that passes topology but trips a `compile_fused` guard
+  (`@OUT` in a loop/function, a scatter-write, an extra output, a channel mismatch), so
+  a region's upstream nodes are never deleted from the prompt only for the cook to then
+  hard-fail. Detection runs in a thread executor so it never blocks the aiohttp event
+  loop. The graphToPrompt hook adds an **additive, fail-safe** region pass (memoized by
+  graph signature): the proven linear collapse is untouched, purely-linear regions are
+  left to it, and the collapse verifies the source node still exists (the linear pass or
+  a bypass/mute can remove it) before rewiring — so a region never produces a
+  dangling-reference prompt that ComfyUI rejects. A wired-`$param` member, a zero-input
+  generator, a wired-`code` terminal, and a >16-stage region are all left unfused
+  (value severing / resolution divergence / no static code / oversized compile).
+- **FUS-3 (the release gate, PM-1):** a fused DAG region is **bit-exact** to running
+  its nodes sequentially, AND the merged program runs through **codegen** identically to
+  the interpreter (invariant #2 for the DAG-spliced program). Verified on CPU and CUDA
+  across linear / diamond / fan-out tree / spatial-`sample` regions (maxdiff 0.0).
+- **FUS-2 mechanism** (`fused_required_bindings`): terminal-first lazy composition over
+  a fused chain, tested and ready. Its check_lazy_status/E6003 *wiring* is deliberately
+  deferred — in this release's single-external-source fusion scope the source is always
+  the R1 shape anchor (never prunable), so the "dead upstream branch" win needs
+  multi-source regions and lands with them.
+
+### Latency & cache (LAT-3, LAT-4, LAT-1a, CACHE-0)
+- **Deferred timing readback** (LAT-3): the frequent MEASURING baseline no longer forces
+  a per-cook `torch.cuda.synchronize()` — it records the event pair and reads the prior
+  same-resolution cook's elapsed time only if already complete (a non-blocking `query()`),
+  so the sync leaves the interactive path; the autotier deque tolerates the sparse
+  samples. The slot is keyed by resolution so a proxy↔full-res flip can't fold a timing
+  into the wrong px bucket. Invariant #6 holds (a reading is still fenced — deferral
+  changes *when*, not *whether*). The TRIAL cook and the one-shot post-commit verify
+  window stay **synchronous** — the verify window is bounded (3 cooks) so its sync
+  doesn't hurt interactivity, and deferring it would let a resolution-flip-heavy session
+  never accumulate its samples (a genuinely slow artifact would escape demotion).
+- **Interpreter coordinate-builtin LRU** (LAT-4): the single-slot cache that rebuilt
+  fp32 `u/v/ix/iy` on every proxy↔full-res flip is now a small (8-entry) LRU, the
+  interpreter counterpart of the codegen path's `_ENV_TENSOR_CACHE` (`u`/`v` are
+  `.expand()` views, so a full entry is ~64 KB even at 4K). The interpreter-FALLBACK
+  path (`_plain_execute`, the never-cached no-backend path) now reuses ONE persistent
+  interpreter instead of a fresh one per cook, so the LRU actually persists there — the
+  path that needed it most. Swept by `free_tensor_caches`; invariant #4 untouched.
+- **LAT-1a is deferred.** torch.compile is lazy — the ~28 s inductor cost is at first
+  *execution*, not at wrap — so a background *wrap* doesn't hide it, and a naive
+  non-blocking gate moved compile-failure handling (blacklist / backend-status / Triton
+  hint) off the synchronous path (caught by the compiled-audit tests). Truly hiding the
+  stall needs a background *execution* pass; deferred to a follow-up with that design.
+  The forced `torch_compile` path keeps its proven synchronous behavior unchanged.
+- **Orphan `.cg` census** (CACHE-0): `store_codegen_fn` writes a `.cg` sidecar for any
+  fingerprint, paired with a `.pkl` or not (the bench harness mints thousands). The
+  `.pkl`-only eviction never reclaimed the unpaired ones — they leaked without bound.
+  A grace-gated census now reclaims orphan `.cg` oldest-first past a cap. A
+  **`TEX_CACHE_DIR`** env override points a test/bench harness at a scratch dir so its
+  artifacts never land in the shipping cache (also the first rung of ENG-11's order).
+
+### Engine seams (ENG-8, ENG-10)
+- **`tex_runtime/xfer.py`** — a measured host↔device transfer-cost model
+  (`transfer_ms(nbytes, pinned, direction)`): a once-per-process, disk-persisted PCIe
+  probe fits latency + inverse-bandwidth per (direction, pinned) lane and surfaces in
+  `tex doctor`. This is the measurement the v0.21 note in `docs/xpu-transfer-scheduling.md`
+  promised; it feeds the mid-term placement scheduler (SCHED-2) and the 3-stream
+  crossover gate. Torch-only (no numpy), imports no ComfyUI surface.
+- **Rejected decisions recorded** (ENG-10): `DEVELOPMENT.md` gains the compositor-roadmap
+  §7 entries — split-frame dual-device cooking, mid-sequence device-placement migration,
+  a second "fast" kernel dialect, a scanline/tile-granular core, and a recursive pull
+  executor — each with its rationale, so they aren't re-derived.
+
+### Fixed (pre-existing, found auditing this release)
+- **A fused terminal that read-modify-writes a wired input** (`@b += …`, `@b = @b*2`,
+  `@b.rgb = …`) raised `E6021` at cook. Such a binding is both read and assigned, so it
+  was treated purely as an output and its READ never resolved to the upstream handoff —
+  and because the failure is at cook, the preflight couldn't see it: a broken prompt.
+  The terminal's output is now seeded from the upstream handoff (post-transform, so the
+  local isn't re-prefixed); a write-first terminal just overwrites the seed. Hit both the
+  DAG path and v0.20's linear path. Gate: `test_fus3_terminal_rmw` (4 forms × CPU/CUDA,
+  maxdiff 0.0).
+- **A linear chain whose source is bypassed/muted produced a dangling prompt** (v0.20).
+  The chain source is read from litegraph but spliced into the *serialized* prompt, and
+  ComfyUI omits mode 2/4 nodes from it — so the rewrite could name a node that isn't
+  there and ComfyUI rejected the *whole* prompt. The linear collapse now verifies the
+  source survived, mirroring the region path; unfused is always correct.
+- **The linear pass baked a stale widget for a wire-driven `$param`** (v0.20) — silent
+  wrong output. It now mirrors the region pass's `param_wired` guard.
+- **Variable-resolution sessions never promoted to the compiled tier**: the LAT-3
+  deferred-timing slot keyed on exact shape while autotier buckets by pixel-octave, so
+  no bucket ever accumulated the samples to promote. The slot now uses the bucketed key.
+- **Region preflight assumed its source was an IMAGE.** It tested 3- and 4-channel
+  tensors only, but a MASK infers as a *float*. To be precise about what that cost —
+  it was never a wrong pixel, since a program invalid off a mask is invalid fused or
+  not: (a) *lost fusion* — `@in.a` is legal on a float but not a vec3, so valid
+  mask-fed regions were rejected; (b) *a misleading error* — vector-only calls
+  (`length`, `normalize`) pass as vec3/vec4 but reject a float, so a mask-fed one
+  false-passed, fused, and died as "couldn't fuse this chain, turn off TEX Fusion"
+  instead of the true `length() needs a vector, but argument 1 is float` at the node.
+  (Scalars broadcast through operators *and* swizzles, so vector-only calls are the
+  only shape that actually diverges.)
+
+### Notes
+- The FUS-1 frontend (region serialize/collapse in `js/tex_extension.js`) can't be
+  render-verified headlessly — it is on the release live-session checklist. The
+  automated gate (FUS-3) does not depend on it.
+- `TEX_CACHE_DIR` is now actually set by `tests/run_all.py` and `benchmarks/eight_config_bench.py`,
+  so a test or bench run no longer writes compiled artifacts into the shipping package's
+  `.tex_cache` (the knob shipped in CACHE-0 but nothing used it).
+- v0.20.1 (fused chains reach `torch_compile`/`auto` from the node path) is folded in.
+
 ## [0.20.0] - 2026-07-13
 
 The **hardware-honesty** release — the perf gates meet their second GPU. Every constant in the
@@ -261,7 +432,7 @@ host-agnostic core. Suite **1691 → 1761/1761**.
   chains, builtin-dimension products (`@A.r*iw`), dot/matrix/length/cross fan-in, `fit`
   remaps, additive round-trips, array reductions, ill-conditioned fns (tan/atan2/normalize/
   hypot/sdiv), and **any user-function call touching image lineage** (the gain pass doesn't
-  model `FunctionDef` bodies, so it declines them — doc 33 F1). **Verified 0 accuracy
+  model `FunctionDef` bodies, so it declines them). **Verified 0 accuracy
   violations across 225 *direct-expression* adversarial programs (two independent red-team
   rounds) + a fuzzer** — but it is a heuristic, not a proof, so a per-cook finiteness net
   re-cooks fp32 on any non-finite (**runs every cook**; the earlier
@@ -356,8 +527,8 @@ biggest modules decomposed.
 
 ## [0.16.0] - 2026-07-07
 
-Correctness-and-honesty release driven by the v0.16 roadmap (`TEX_research/22`),
-with a full per-item build log (`TEX_research/23`). Every performance claim is a
+Correctness-and-honesty release driven by the v0.16 roadmap, with a full
+per-item build log. Every performance claim is a
 **measured, same-session interleaved A/B** (this box drifts 10–30 %/hour, so
 full-suite deltas are noise-dominated). Several roadmap items were **measured and
 then NOT adopted** because the measurement refuted their premise — that is the
@@ -422,18 +593,18 @@ redefining a built-in. If your program defines a function named any of
   prevented a regression.
 - **`auto` tier hardening, torch.compile persistence, and DAG-fusion widening are
   deferred** — unreproducible/unvalidatable on this no-Triton box or frontend-
-  heavy; see `TEX_research/23` for the per-item rationale.
+  heavy.
 
 ## [0.15.0] - 2026-07-07
 
 Optimization-roadmap release: all 24 proposals from the 2026-07 TEX Optimization
-Roadmap, implemented in priority order, then hardened by a pre-push audit (see
-`TEX_research/21`). Every item ships with a regression test, and every
+Roadmap, implemented in priority order, then hardened by a pre-push audit.
+Every item ships with a regression test, and every
 performance claim below is a **measured, same-session interleaved A/B** on the
 affected programs (this box drifts 10–30 %/hour, so full-suite deltas are
 noise-dominated and were not used). 1590 sub-tests pass.
 
-### Fixed — pre-push audit (doc 21)
+### Fixed — pre-push audit
 - **UC-3** — uniform-range loop resolution now only fires on integer-valued
   bounds; a fractional `for(float …)` bound/step (or a bound reading a
   body-mutated binding) falls back to the exact per-iteration path instead of

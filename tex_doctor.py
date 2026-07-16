@@ -63,6 +63,17 @@ def _tier_facts():
     return out
 
 
+def _xfer_facts():
+    """ENG-8: the cached host<->device transfer-cost model, if measured. Uses the
+    non-probing peek() so the report never triggers a bandwidth probe."""
+    from .tex_runtime import xfer
+    lanes = xfer.peek()
+    # b is ms_per_byte; GB/s = 1e9 bytes / (b ms * 1e-3 s/ms) / 1e9 = 1e-6 / b.
+    return {"measured": bool(lanes),
+            "lanes": {k: {"latency_ms": round(a, 4), "gb_per_s": (round(1e-6 / b, 2)
+                          if b > 0 else None)} for k, (a, b) in lanes.items()}}
+
+
 def collect_doctor_facts() -> dict:
     """Flat, never-raising environment report (see module docstring)."""
     from .tex_runtime import tier_trace
@@ -76,4 +87,5 @@ def collect_doctor_facts() -> dict:
         "recent_tiers": _fact(tier_trace.recent),
         "arch": _fact(current_arch_status),  # S-5: verified-arch caveat
         "noise_compiles": _fact(tier_trace.noise_compiles),  # P6: noise compile visibility
+        "xfer": _fact(_xfer_facts),  # ENG-8: measured PCIe transfer-cost model
     }

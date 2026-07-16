@@ -55,6 +55,20 @@ time ≈ compute time (big frames, simple programs); gate it on a measured
 crossover like every other tier. Do NOT build it before measuring how often
 that regime occurs in real chains.
 
+### v0.21 go/no-go verdict — DEFER (measurement shipped, pipeline not)
+
+The v0.21 decision this doc gated on: **do not build the 3-stream pipeline yet.**
+What v0.21 shipped is the *measurement* it depends on — ENG-8's `tex_runtime/xfer.py`
+now fits a latency + inverse-bandwidth model per (direction, pinned) PCIe lane
+(`transfer_ms(nbytes, pinned, direction)`), so the "transfer ≈ compute" crossover is
+arithmetic instead of a guess. But fusion (the v0.21 headline) removes inter-node
+transfer for linear/DAG TEX regions entirely — the strongest XPU win is *not
+transferring* — so the pipeline's real domain shrinks to the unfusable boundaries
+(scatter/multi-output stages, non-TEX neighbours). Until a real chain is observed
+spending its time at those boundaries in the transfer≈compute regime, the pipeline
+stays unbuilt; ENG-8 + the placement scheduler (SCHED-2, mid-term) are the next steps,
+not the streams. Revisit when a driving workload appears.
+
 ## Speculative (design-only, do not build without a driving workflow) —
 ## return-time upload
 

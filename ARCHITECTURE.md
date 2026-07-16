@@ -19,8 +19,16 @@ source text
   → marshalling    (tex_marshalling.py)          IMAGE/MASK/LATENT/string in & out
 ```
 
-**Fusion** (`tex_fusion.py`) splices a linked chain of TEX nodes into ONE program
-*before* compilation, so only the terminal node cooks. **Caching** (`tex_cache.py`)
+**Fusion** (`tex_fusion.py`) splices a linked TEX subgraph into ONE program *before*
+compilation, so only the terminal node cooks. `detect_fusable_regions` (FUS-1) is the
+pure-Python authority for which nodes form a single-terminal fusable region — internal
+fan-out (a member branches, branches rejoin at the terminal); an external producer
+feeding two members needs multi-injection and is left unfused until v0.21.1. Exposed
+host-agnostically via the `POST /tex_wrangle/detect_regions` route (preflight-compiled
+there, against the source socket type's shape family, so an unfusable region is dropped
+rather than hard-failing the cook with its upstream already deleted).
+**Transfer cost** (`tex_runtime/xfer.py`, ENG-8) measures per-lane PCIe latency +
+bandwidth for the placement scheduler. **Caching** (`tex_cache.py`)
 keys compiled artifacts and fused programs. **Memory** (`tex_memory.py`) does OOM
 preflight, byte-budgeted cache eviction, and horizontal-strip tiling.
 **Autotier** (`tex_runtime/autotier.py`) is the `auto` mode's measure→trial→commit
@@ -36,11 +44,11 @@ Three layers; **imports point downward only**. The `tex_compiler` package has
 |-------|---------|-----------|
 | **Types** (leaf vocabulary) | `types` (`TEXType`, `CHANNEL_MAP`, `TYPE_NAME_MAP`, swizzles) | nothing (stdlib `enum`/`dataclasses` only) |
 | **Compiler** (IR + front end) | `ast_nodes`, `lexer`, `parser`, `type_checker`, `optimizer`, `stdlib_signatures`, `diagnostics` | types + itself |
-| **Runtime** (execution tiers) | `interpreter`, `codegen` (+ `codegen_stdfns`/`codegen_stencil`/`codegen_persist`, STR-7), `compiled`, `graphed`, `stdlib` (+ `stdlib_registry`), `precision_policy` (PR-LP2 `auto` gate), `tier_trace`, `noise`, `autotier`, `tex_cache`, `tex_marshalling`, `tex_memory`, `host` (PORT-1 seam — the ONLY `comfy.model_management` consumer) | types + compiler + itself |
+| **Runtime** (execution tiers) | `interpreter`, `codegen` (+ `codegen_stdfns`/`codegen_stencil`/`codegen_persist`, STR-7), `compiled`, `graphed`, `stdlib` (+ `stdlib_registry`), `precision_policy` (PR-LP2 `auto` gate), `tier_trace`, `noise`, `autotier`, `xfer` (ENG-8 transfer-cost probe), `tex_cache`, `tex_marshalling`, `tex_memory`, `host` (PORT-1 seam — the ONLY `comfy.model_management` consumer) | types + compiler + itself |
 | **Public API** (host-agnostic) | `tex_api` (`compile`/`execute`/`Program`, PORT-2), `tex_cli` (`tex run`, PORT-3) | runtime + compiler |
 | **Orchestration** | `tex_node` (+ `tex_doctor` route, DBG-4), `tex_fusion` | all of the above |
 
-**`tex_core` boundary (S-1, doc 30/35).** The ComfyUI-adapter layer is exactly three
+**`tex_core` boundary (S-1).** The ComfyUI-adapter layer is exactly three
 files — `tex_node.py`, `__init__.py`, `tex_runtime/host.py`; **every other module is
 `tex_core`** and imports no ComfyUI surface (`comfy*`/`server`/`folder_paths`/`nodes`).
 This is machine-enforced by `test_s1_core_no_comfy` (a package-level lint) and exercised
@@ -51,7 +59,7 @@ by `test_s1_comfyui_free_execution` (blocks every comfy import, then drives
 live-ComfyUI session (import-path verification can't be done headlessly); the manifest above
 is the split's contents.
 
-**Coupling hubs** (Appendix A, doc 24): `tex_node` fan-out 12; `ast_nodes` fan-in 11
+**Coupling hubs:** `tex_node` fan-out 12; `ast_nodes` fan-in 11
 (pure data — fine). `type_checker` was fan-in 9 (the `TEXType` leak — 9 modules imported
 the *checker* just to know what a `vec3` is); **STR-1 relocated `TEXType`/`TEXArrayType`/
 `CHANNEL_MAP`/`TYPE_NAME_MAP`/`VALID_SWIZZLES` to the dependency-free `tex_compiler/types.py`
@@ -60,7 +68,7 @@ never the checker). `type_checker` re-imports them for its own use, so legacy
 `from .type_checker import TEXType` still resolves.
 
 **Two logical import cycles** remain, broken by hand via *function-local* imports
-(deliberate — see §5/§6 of doc 24, and `AGENTS.md`): a 7-node runtime SCC
+(deliberate — see `AGENTS.md`): a 7-node runtime SCC
 (`codegen/graphed/compiled/noise/stdlib/interpreter/tex_cache`); `tex_node ↔ tex_memory`.
 (STR-1 removed the third — `stdlib_signatures ↔ type_checker` — by moving `TEXType` to the
 leaf; `type_checker`'s lazy `FUNCTION_SIGNATURES` bind is now defensive, not cycle-breaking.)
@@ -154,11 +162,11 @@ amplification assembled from sub-threshold steps (`sin(@A.r*3*3)`), image×image
 fan-in, `fit` remaps, additive round-trips (`(@A.r+60000)-60000`), and array reductions,
 with scalar const-propagation; it declines ill-conditioned fns (tan/atan2/normalize/hypot/
 sdiv) and **any user-function call touching image lineage** (the gain pass does not recurse
-into `FunctionDef` bodies — doc 33 F1 — so it declines rather than model them). Verified
+into `FunctionDef` bodies, so it declines rather than model them). Verified
 **0 accuracy violations across 225 direct-expression adversarial programs (two independent
 red-team rounds) + the fuzzer** — but it is a **heuristic, not a proof** (each round found
 new classes), so a per-cook finiteness net re-cooks + pins fp32 on any non-finite
-(runs EVERY fp16 cook — doc 32 C2 — never memoized). The decision (not the finiteness
+(runs EVERY fp16 cook, never memoized). The decision (not the finiteness
 verdict) is memoized per (fingerprint, resolution-bucket, device).
 
 **Honest perf:** on the real `TEXWrangleNode.execute` path `auto` is essentially
@@ -169,13 +177,17 @@ the raw fp16 win (~1.35–1.45×) is available, without the safety net, via expe
 (`img_*`, `arr_*`) accumulate in fp32 (an fp16 sum overflows to inf at ≥1024²); an
 out-of-fp16-range literal / a large-value `vec()` also stays fp32 (interp==codegen).
 
-## The 15-cache architecture
+## The 17-cache architecture
 
 Non-redundant by design — each store keys on a different thing (source-hash vs
 `id()`-type_map vs device/precision tuple vs AST-fingerprint vs resolution-bucket)
 with a distinct lifecycle (persist-across-restart vs per-run-clear vs LRU). Do not
-"consolidate" them (doc 24 §6). #14 is `tex_lazy._memo` (code-hash × fp32 param bits →
+"consolidate" them. #14 is `tex_lazy._memo` (code-hash × fp32 param bits →
 required-binding set; shared by `check_lazy_status` and `execute()`). #15 is
 `tex_node._AUTO_DECISION` (fingerprint × resolution-bucket × device → the `precision="auto"`
 fp16/fp32 gate decision — the *decision*, not the per-cook finiteness verdict; bounded LRU,
-cleared at 512 entries). The count here must match AGENTS.md (a DOC-7b check enforces it).
+cleared at 512 entries). #16 (v0.21 LAT-3) is `compiled._deferred_ev` (slot →
+pending CUDA event pair for the deferred timing readback; bounded, cleared with the
+compiled cache). #17 (v0.21 ENG-8) is `xfer._MODEL` (transfer-lane → fitted
+latency+bandwidth; persisted to `xfer.json`, versioned by device+torch). The count
+here must match AGENTS.md (a DOC-7b check enforces it).

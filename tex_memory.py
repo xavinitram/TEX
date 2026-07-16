@@ -421,7 +421,11 @@ def free_tensor_caches() -> None:
         from .tex_node import _get_interpreter
         interp = _get_interpreter()
         interp._literal_cache.clear()
-        interp._builtins_cache_env.clear()
-        interp._builtins_cache_key = None
+        interp._builtins_lru.clear()   # LAT-4: coordinate-builtin env LRU
+    except Exception:
+        pass
+    try:
+        from .tex_runtime.compiled import clear_plain_interp_caches
+        clear_plain_interp_caches()    # C6: the persistent fallback interpreter's LRUs
     except Exception:
         pass

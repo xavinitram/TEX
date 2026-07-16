@@ -73,6 +73,15 @@ _CACHE_VERSION = _compute_compiler_hash()
 _MEMORY_MAX_ENTRIES = 128
 _CODEGEN_MEMORY_MAX_ENTRIES = 128  # in-memory codegen tier (disk sidecar backs evictions)
 _DISK_MAX_ENTRIES = 512
+# CACHE-0: store_codegen_fn writes a .cg sidecar for ANY fingerprint — paired with
+# a .pkl or not (the fused/codegen tiers and the bench harness mint .cg without a
+# sibling .pkl). The .pkl-only census below never reclaims those, so orphan .cg
+# accumulate without bound. Evict orphan .cg (no sibling .pkl) oldest-first past
+# this cap, with a grace so a .cg legitimately preceding its .pkl within a session
+# is never nuked.
+_CG_DISK_MAX_ENTRIES = 1024
+_CG_ORPHAN_GRACE_SEC = 600
+_CG_CENSUS_INTERVAL_SEC = 300  # throttle: at most one orphan-.cg glob per 5 min
 
 # Cache directory lives alongside tex_cache.py (inside the TEX_Wrangle package)
 _CACHE_DIR_NAME = ".tex_cache"
@@ -107,14 +116,24 @@ class TEXCache:
         self._memory: OrderedDict[str, tuple] = OrderedDict()
 
         if cache_dir is None:
-            pkg_dir = Path(__file__).parent
-            cache_dir = pkg_dir / _CACHE_DIR_NAME
+            # CACHE-0: a TEX_CACHE_DIR env override lets a test/bench harness (or a
+            # pip-installed / read-only deployment) point the cache at a scratch dir
+            # so harness artifacts never land in the shipping package cache. (This is
+            # also the first rung of ENG-11's eventual resolution order.) Unset →
+            # the package-local .tex_cache, exactly as before.
+            env_dir = os.environ.get("TEX_CACHE_DIR")
+            if env_dir:
+                cache_dir = Path(env_dir)
+            else:
+                pkg_dir = Path(__file__).parent
+                cache_dir = pkg_dir / _CACHE_DIR_NAME
         self._cache_dir = cache_dir
         self._torch_compile_cache_dir = cache_dir / _TORCH_COMPILE_CACHE_SUBDIR
         # PC-3: fingerprint -> materialized codegen fn (or _CG_UNSUPPORTED).
         # LRU-bounded (was an unbounded dict — a long session with many distinct
         # programs grew it without limit; the disk sidecar backs evicted entries).
         self._codegen_memory: OrderedDict[str, Any] = OrderedDict()
+        self._last_cg_census = 0.0  # CACHE-0: throttle timestamp for the orphan sweep
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -262,9 +281,10 @@ class TEXCache:
         self._memory.clear()
         self._codegen_memory.clear()
         try:
-            # *.tmp also sweeps autotier.json.tmp; autotier.json itself (CC-2
-            # measured-tier verdicts) is named explicitly.
-            for pat in ("*.pkl", "*.cg", "*.tmp", "autotier.json"):
+            # *.tmp also sweeps autotier.json.tmp; the persisted-verdict/model JSONs
+            # (autotier.json = CC-2 tier verdicts, xfer.json = ENG-8 transfer model)
+            # are named explicitly.
+            for pat in ("*.pkl", "*.cg", "*.tmp", "autotier.json", "xfer.json"):
                 for p in self._cache_dir.glob(pat):
                     p.unlink(missing_ok=True)
         except Exception as e:
@@ -358,6 +378,10 @@ class TEXCache:
 
     def _evict_disk_if_needed(self):
         """Remove oldest disk entries if over the limit."""
+        # CACHE-0: the orphan-.cg sweep runs FIRST, independent of the .pkl cap —
+        # if it sat after the early return below it would almost never fire (a
+        # session rarely exceeds 512 .pkl, but mints .cg freely).
+        self._evict_orphan_cg()
         try:
             entries = list(self._cache_dir.glob("*.pkl"))
             if len(entries) <= _DISK_MAX_ENTRIES:
@@ -373,6 +397,46 @@ class TEXCache:
                 p.with_suffix(".cg.tmp").unlink(missing_ok=True)
         except Exception as e:
             logger.warning("[TEX] Disk cache eviction failed: %s", e)
+
+    def _evict_orphan_cg(self):
+        """CACHE-0: reclaim orphan .cg sidecars (no sibling .pkl) oldest-first when
+        their count exceeds _CG_DISK_MAX_ENTRIES. The .pkl census only drops .cg it
+        PAIRS with, so codegen/fused/bench-harness .cg written without a matching
+        .pkl leak forever otherwise. Grace-gated so a fresh .cg still awaiting its
+        .pkl within the session is never removed (the loader regenerates on a miss,
+        so even an over-eager delete is only a recompile, never wrong output)."""
+        now = time.time()
+        # Throttle: the census does a full glob (+ a stat-storm once over cap), and it
+        # runs from every disk save AND every .cg write. Once-per-interval keeps it off
+        # the hot path while still reclaiming within a session.
+        if now - self._last_cg_census < _CG_CENSUS_INTERVAL_SEC:
+            return
+        self._last_cg_census = now
+        try:
+            cgs = list(self._cache_dir.glob("*.cg"))
+            over = len(cgs) - _CG_DISK_MAX_ENTRIES
+            if over <= 0:
+                return
+            # (mtime, path) for orphans past the grace window — one stat() per file.
+            aged = []
+            for p in cgs:
+                try:
+                    if p.with_suffix(".pkl").exists():
+                        continue
+                    mt = p.stat().st_mtime
+                except OSError:
+                    continue  # concurrent unlink / vanished — skip, don't abort census
+                if now - mt > _CG_ORPHAN_GRACE_SEC:
+                    aged.append((mt, p))
+            aged.sort()  # oldest first
+            for _mt, p in aged[:over]:
+                try:
+                    p.unlink(missing_ok=True)
+                    p.with_suffix(".cg.tmp").unlink(missing_ok=True)
+                except OSError:
+                    pass  # a concurrent reader/unlink on one file never aborts the rest
+        except Exception as e:
+            logger.warning("[TEX] Orphan .cg census failed: %s", e)
 
     # ── PC-3: generated-code (marshal) persistence ────────────────────
 
@@ -436,6 +500,10 @@ class TEXCache:
                 "has_fn_calls": has_fn_calls,
             }
             self._atomic_pickle(self._cg_path(fp), data)
+            # CACHE-0: also census here (the .cg-WRITE site), throttled — so a
+            # codegen-heavy but .pkl-quiet session still reclaims orphans, not only
+            # sessions that write new .pkl (which is what triggers _evict_disk_if_needed).
+            self._evict_orphan_cg()
         except Exception:
             # Persistence is best-effort — a concurrent reader (second ComfyUI
             # instance) can PermissionError; codegen simply regenerates next time.

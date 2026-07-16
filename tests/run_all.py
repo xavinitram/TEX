@@ -1,5 +1,14 @@
 #!/usr/bin/env python
 """Standalone TEX test runner — python tests/run_all.py"""
+# CACHE-0: point the disk cache at a scratch dir BEFORE any TEX import — get_cache()
+# resolves the location once, on first call — so a test run never writes compiled
+# artifacts into the shipping package's .tex_cache. setdefault: an outer harness that
+# already chose a dir wins.
+import os as _os
+import tempfile as _tempfile
+_os.environ.setdefault(
+    "TEX_CACHE_DIR", _os.path.join(_tempfile.gettempdir(), "tex_test_cache"))
+
 from helpers import SubTestResult
 
 from test_lexer import test_lexer, test_lexer_locations, test_lexer_v11
@@ -462,6 +471,26 @@ def main():
     test_c1_gate_profiles_sane(r)
     test_g2_verify_arming(r)
     test_g1_compile_demotion(r)
+
+    # v0.21.0 Phase 1 — "Fuse the graph" (FUS-1/2/3) + latency/cache/xfer
+    from test_v021_phase1 import (
+        test_fus1_detector, test_fus3_dag_equivalence, test_fus3_codegen_parity,
+        test_fus3_terminal_rmw,
+        test_fus1_route_path, test_fus2_fused_lazy, test_fus1_hardening,
+        test_cache0_orphan_cg_census, test_lat3_deferred_timing, test_lat4_builtins_lru,
+        test_eng8_transfer_model,
+    )
+    test_fus1_detector(r)
+    test_fus3_dag_equivalence(r)
+    test_fus3_codegen_parity(r)
+    test_fus3_terminal_rmw(r)
+    test_fus1_route_path(r)
+    test_fus2_fused_lazy(r)
+    test_fus1_hardening(r)
+    test_cache0_orphan_cg_census(r)
+    test_lat3_deferred_timing(r)
+    test_lat4_builtins_lru(r)
+    test_eng8_transfer_model(r)
 
     success = r.summary()
     return 0 if success else 1

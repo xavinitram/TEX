@@ -16,6 +16,7 @@ Execution model:
 from __future__ import annotations
 import torch
 import math
+from collections import OrderedDict
 from typing import Any
 from dataclasses import fields as _dc_fields
 from ..tex_compiler.ast_nodes import (
@@ -40,6 +41,15 @@ MAX_CALL_DEPTH = 64
 
 # Max distinct literal tensors kept across executions before a wholesale clear
 _LITERAL_CACHE_MAX = 4096
+# LAT-4: coordinate-builtin env sets kept across cooks. A compositor alternates
+# resolutions constantly (proxy-viewer cook, then full-res render; an A/B wipe of
+# two branches at different sizes), and a SINGLE-slot cache rebuilt fp32 u/v/ix/iy
+# every flip. A small LRU keeps the last few configs hot — the codegen path already
+# does this (compiled._ENV_TENSOR_CACHE, 256 entries); this is its interpreter
+# (oracle, most-travelled) counterpart. The memory is trivial: u/v are `.expand()`
+# VIEWS over [1,1,W]/[1,H,1] base tensors, so a full entry is ~64 KB even at 4K
+# (measured), ~0.5 MB across 8 entries — and free_tensor_caches sweeps it anyway.
+_BUILTINS_LRU_MAX = 8
 
 # fp16's finite maximum. A literal beyond it realised in fp16 becomes +/-inf; such
 # literals are kept fp32 (doc 32 medium) so interp matches codegen (invariant #2) and a
@@ -138,8 +148,10 @@ class Interpreter:
         self._scatter_owned: set[str] = set()  # bindings whose buffer this run owns (safe to scatter into)
         self._user_functions: dict[str, FunctionDef] = {}
         self._call_depth: int = 0
-        self._builtins_cache_key: tuple | None = None
-        self._builtins_cache_env: dict[str, torch.Tensor] = {}
+        # LAT-4: bounded LRU of coordinate-builtin env sets, keyed by the same
+        # (spatial_shape, device, dtype, used, latent_channels, tile) tuple. Replaces
+        # a single (key, env) slot that thrashed under proxy/full-res alternation.
+        self._builtins_lru: "OrderedDict[tuple, dict[str, torch.Tensor]]" = OrderedDict()
         self._assigned_vars_cache: dict[int, tuple[set[str], set[str]]] = {}
         # UC-3: per-loop-node structural eligibility for uniform-range resolution.
         self._uniform_range_cache: dict[int, tuple | bool] = {}
@@ -395,10 +407,13 @@ class Interpreter:
         """
         used = used_builtins if used_builtins is not None else _collect_identifiers(program)
 
-        # Cache builtins: reuse tensors when spatial config hasn't changed
+        # Cache builtins: reuse tensors when spatial config hasn't changed (LAT-4:
+        # small LRU, so proxy<->full-res alternation hits instead of rebuilding).
         cache_key = (self.spatial_shape, self._device_str, self._dtype, used, self.latent_channel_count, tile)
-        if cache_key == self._builtins_cache_key:
-            self.env.update(self._builtins_cache_env)
+        hit = self._builtins_lru.get(cache_key)
+        if hit is not None:
+            self._builtins_lru.move_to_end(cache_key)
+            self.env.update(hit)
             return
 
         # M-3: coordinate/spatial builtins are ALWAYS fp32 (never self._dtype).
@@ -460,9 +475,12 @@ class Interpreter:
         if "ic" in used:
             self.env["ic"] = torch.scalar_tensor(float(self.latent_channel_count), dtype=self._dtype, device=self.device)
 
-        # Store only builtin tensors in cache (not user variables)
-        self._builtins_cache_key = cache_key
-        self._builtins_cache_env = {k: v for k, v in self.env.items() if k in _BUILTIN_NAMES}
+        # Store only builtin tensors in cache (not user variables). cache_key is a
+        # fresh key here (we returned above on a hit), so the insert already lands
+        # MRU — no move_to_end needed (mirrors compiled._env_cached).
+        self._builtins_lru[cache_key] = {k: v for k, v in self.env.items() if k in _BUILTIN_NAMES}
+        while len(self._builtins_lru) > _BUILTINS_LRU_MAX:
+            self._builtins_lru.popitem(last=False)
 
     # -- Statement execution --------------------------------------------
 

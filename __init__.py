@@ -5,7 +5,7 @@ A per-pixel kernel DSL for writing compact image/mask processing logic
 directly inside ComfyUI. Inspired by Houdini VEX and Nuke BlinkScript.
 """
 
-__version__ = "0.20.0"
+__version__ = "0.21.0"
 
 import os
 
@@ -258,6 +258,29 @@ try:
             result = {"ok": False, "error": f"preflight error: {e}",
                       "stage_of_error": None, "stats": None}
         return web.json_response(result)
+
+    @routes.post("/tex_wrangle/detect_regions")
+    async def detect_regions(request):
+        """FUS-1: given a serialized TEX subgraph {nodes, edges}, return the
+        fusable-region collapse plans (detect_region_plans). Detection lives in
+        Python so every host performs the SAME fusion — the frontend only applies
+        the plans (socket rewire + payload attach + delete). Never 500s: a bad body
+        or a detection failure returns {plans: []} (the graph runs unfused)."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"plans": []})
+        try:
+            import asyncio
+            from .tex_fusion import detect_region_plans
+            # C18: detection preflight-COMPILES each region (CPU-bound + disk I/O).
+            # Run it in the default thread executor so it never blocks the aiohttp
+            # event loop (websocket / progress / queue) for the whole detection.
+            plans = await asyncio.get_event_loop().run_in_executor(
+                None, detect_region_plans, body)
+            return web.json_response({"plans": plans})
+        except Exception as e:
+            return web.json_response({"plans": [], "error": f"{type(e).__name__}: {e}"})
 
 except (ImportError, AttributeError):
     # PromptServer or aiohttp not available (e.g. running tests or CLI mode)

@@ -71,10 +71,14 @@ def test_a1_6_cli_argv(r: SubTestResult):
 
 def test_c4st_js_loc_ratchet(r: SubTestResult):
     print("\n--- C4-st: js/tex_extension.js LOC ratchet ---")
-    # doc 34 weakness: the 3,655-line single-file frontend has no LOC governance (REG-2
-    # watches only .py). Grandfather the current size with modest headroom; further
-    # growth reds the suite (the on-ramp to the deferred v0.20 JS decomposition).
-    JS_HARD = 3800
+    # doc 34 weakness: the single-file frontend has no LOC governance (REG-2 watches
+    # only .py). Grandfather the current size with modest headroom; further growth reds
+    # the suite (the on-ramp to the deferred v0.20 JS decomposition).
+    # v0.21 (FUS-1): +~120 lines for DAG-region serialize/collapse. This growth is
+    # explicitly temporary — SCHED-1 (roadmap, mid-term) moves fusion detection OUT of
+    # the JS into Python (the JS becomes a thin route caller), which will shrink this
+    # back below the pre-FUS-1 line; the budget is raised with that plan of record.
+    JS_HARD = 3960
     js = _PKG / "js" / "tex_extension.js"
     if not js.exists():
         r.fail("C4-st JS ratchet", "js/tex_extension.js missing")

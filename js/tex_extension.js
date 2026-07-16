@@ -2419,12 +2419,22 @@ function _texCollapseOne(out, chain) {
         const nid = String(n.id);
         const code = out[nid].inputs?.code;
         if (typeof code !== "string") return false;     // a wired `code` input — can't fuse
+        // A $param driven by a WIRE (not its widget) can't be folded away: this
+        // upstream node is DELETED, taking its param wire with it, and the fused
+        // stage would bake the STALE widget value (② silent-wrong). Mirror the
+        // region path's param_wired guard (_grow_region). The terminal is not
+        // deleted, so its own wired $params survive and are fine.
+        if ((n.inputs || []).some(i => i._texParam && i.link != null)) return false;
         const wi = _texSingleWiredInput(n);
         if (!wi) return false;                          // must have exactly one image input
         stages.push({ code, image_input: wi.bindingName, params: _texParamWidgets(n) });
     }
     const headSource = _texSingleWiredInput(upstream[0]);   // [originId, slot] feeding the chain head
     if (!headSource) return false;
+    // Origin comes from LITEGRAPH but is spliced into the SERIALIZED prompt, which
+    // omits bypassed/muted (mode 2/4) nodes — so a raw origin can name a node that
+    // isn't in `out`, and that dangling ref makes ComfyUI reject the WHOLE prompt.
+    if (!out[String(headSource.origin[0])]) return false;
 
     const delSet = new Set(upstream.map(n => String(n.id)));
     // Up-front integrity scan: no SURVIVING node may reference a to-be-deleted node.
@@ -2458,6 +2468,160 @@ function _texCollapseChains(result) {
                              "— running those nodes separately.");
             }
         } catch (e) { console.warn("[TEX] fuse skipped (left unfused)", e); }
+    }
+}
+
+// FUS-1: DAG-region fusion (fan-out / diamonds). Detection is the Python authority
+// (/tex_wrangle/detect_regions — same legality every host uses); the frontend only
+// serializes the graph and applies the returned collapse plans. ADDITIVE to the linear
+// pass above, which already ran: purely-linear regions are the route's to skip
+// (_region_is_linear), so they never arrive here. The "all region nodes present" check
+// below therefore has ONE real effect — a BRANCHING region whose cone overlaps a chain
+// the linear pass just deleted is rejected wholesale (we serialize litegraph, which
+// still shows those nodes): costs fusion, never correctness (roadmap v0.21.1).
+// Fail-safe — a route miss / timeout / unsafe plan leaves those nodes unfused.
+
+// {nodes: [{id, code, params, code_wired}], edges: [{from, from_slot, to, to_binding}]}
+// for the detector. Image handoffs only (a $param / code wire is not a fusable edge);
+// a consumer that is non-TEX or a non-image socket is marked EXTERNAL (synthetic id)
+// so the detector treats the producer as a boundary instead of folding across it.
+function _texSerializeGraph() {
+    const texNodes = (app.graph?._nodes || []).filter(
+        n => n.type === TEX_NODE_TYPE && n.mode !== 2 && n.mode !== 4);
+    const nodes = [], edges = [], seen = new Map();
+    const addEdge = (from, fromSlot, to, toBinding, fromType) => {
+        const k = from + ":" + fromSlot + "->" + to + ":" + toBinding;
+        const prev = seen.get(k);
+        if (prev) {
+            // Let a typed add upgrade an untyped one rather than let iteration order
+            // decide. Inert today (only TEX->TEX edges collide, and a TEX output is
+            // ANY_TYPE "*" -> IMAGE either way); guards concrete TEX output types later.
+            if (fromType && !prev.from_type) prev.from_type = fromType;
+            return;
+        }
+        const e = { from: String(from), from_slot: fromSlot, to: String(to), to_binding: toBinding };
+        if (fromType) e.from_type = fromType;
+        seen.set(k, e);
+        edges.push(e);
+    };
+    const isImageSocket = (node, slotIdx) => {
+        const inp = (node.inputs || [])[slotIdx];
+        return !!(inp && !inp._texParam && inp.name !== "code");
+    };
+    for (const n of texNodes) {
+        const nid = String(n.id);
+        const codeInput = (n.inputs || []).find(i => i.name === "code");
+        const codeWired = !!(codeInput && codeInput.link != null);
+        // A $param driven by a WIRE (not its widget) can't be folded away — the
+        // serializer only captures widget values, so folding would sever the dynamic
+        // value and bake the stale widget (② silent-wrong). Mark such a node so the
+        // detector keeps it a region boundary, mirroring code_wired.
+        const paramWired = (n.inputs || []).some(i => i._texParam && i.link != null);
+        const codeW = (n.widgets || []).find(w => w.name === "code");
+        nodes.push({ id: nid, code: codeWired ? "" : (codeW ? String(codeW.value) : ""),
+                     params: _texParamWidgets(n), code_wired: codeWired, param_wired: paramWired });
+        for (const inp of (n.inputs || [])) {   // image in-edges (producer -> n)
+            if (inp.link == null || inp._texParam || inp.name === "code") continue;
+            const link = _texGetLink(inp.link);
+            if (!link) continue;
+            // The producer's declared socket type ("IMAGE"/"MASK"/"LATENT"): for a
+            // region-EXTERNAL source it is the only clue to the binding's TEX type at
+            // cook, so the preflight can test the family it will really be handed
+            // (a MASK is a float, not a vec3/vec4). See _preflight_samples.
+            const srcNode = app.graph.getNodeById(link.origin_id);
+            const ftype = srcNode?.outputs?.[link.origin_slot]?.type;
+            addEdge(link.origin_id, link.origin_slot, nid, inp.name,
+                    typeof ftype === "string" ? ftype : null);
+        }
+        const outputs = n.outputs || [];        // out-edges (escape detection)
+        for (let oi = 0; oi < outputs.length; oi++) {
+            for (const linkId of (outputs[oi].links || [])) {
+                const link = _texGetLink(linkId);
+                if (!link) continue;
+                const tn = app.graph.getNodeById(link.target_id);
+                if (tn && tn.type === TEX_NODE_TYPE && isImageSocket(tn, link.target_slot)) {
+                    addEdge(nid, oi, String(link.target_id), tn.inputs[link.target_slot].name);
+                } else {
+                    addEdge(nid, oi, "ext_" + link.target_id + "_" + link.target_slot, "-");
+                }
+            }
+        }
+    }
+    return { nodes, edges };
+}
+
+// Apply ONE region collapse plan to the prompt dict. CHECK-then-MUTATE: nothing is
+// written unless the whole rewrite is provably safe (mirrors _texCollapseOne).
+function _texCollapseRegion(out, plan) {
+    const termId = String(plan.terminal);
+    const delIds = (plan.delete || []).map(String);
+    const delSet = new Set(delIds);
+    const srcOrigin = plan.source_origin;   // [originIdString, slot]
+    if (!out[termId] || !Array.isArray(srcOrigin) || delSet.has(termId)) return false;
+    for (const id of delIds) if (!out[id]) return false;         // whole region present?
+    if (delSet.has(String(srcOrigin[0]))) return false;          // source not in THIS delete set
+    // C1/C2: the source node must still EXIST in the prompt. The linear pass runs first
+    // and can delete it (a boundary node it collapses anyway), and ComfyUI strips
+    // bypassed/muted (mode 2/4) nodes — either way rewiring the terminal to a vanished
+    // origin makes the prompt reference a deleted node and ComfyUI rejects the WHOLE
+    // queue. Leaving the region unfused is always correct.
+    if (!out[String(srcOrigin[0])]) return false;
+
+    // Terminal input sockets currently fed by a to-be-deleted region node.
+    const termInputs = out[termId].inputs || {};
+    const upstream = [];
+    for (const [binding, v] of Object.entries(termInputs))
+        if (Array.isArray(v) && v.length === 2 && delSet.has(String(v[0]))) upstream.push(binding);
+    if (!upstream.length) return false;
+
+    // No SURVIVING node outside the region may reference a to-be-deleted node.
+    for (const [id, data] of Object.entries(out)) {
+        if (delSet.has(id) || id === termId) continue;
+        for (const v of Object.values(data.inputs || {}))
+            if (Array.isArray(v) && v.length === 2 && delSet.has(String(v[0]))) return false;
+    }
+
+    // Safe → mutate. Reuse the first upstream socket as the SOURCE transport (rewired
+    // to the source origin); the fused program routes it to the source stage and the
+    // terminal's own reads come from its chain_inputs. Remove the other upstream
+    // sockets — their values are internal handoffs now.
+    const transport = upstream[0];
+    out[termId].inputs[transport] = [String(srcOrigin[0]), srcOrigin[1]];
+    for (let i = 1; i < upstream.length; i++) delete out[termId].inputs[upstream[i]];
+    out[termId].inputs["_tex_chain"] = JSON.stringify(
+        Object.assign({}, plan.payload, { terminal_image_input: transport }));
+    for (const id of delSet) delete out[id];
+    return true;
+}
+
+// Memoize the route result by the serialized-graph signature: re-queuing an
+// unchanged graph (or auto-queue) shouldn't re-serialize + round-trip to localhost
+// every time (the sibling preflight route memoizes the same way). The signature must
+// include param VALUES — the collapse payload bakes them, so a stale plan would fuse
+// the wrong values — so a widget tweak correctly re-detects.
+let _texRegionSig = null;
+let _texRegionPlans = [];
+async function _texCollapseRegions(result) {
+    if (!_texFusionEnabled || !result?.output) return;
+    let graph;
+    try { graph = _texSerializeGraph(); } catch (e) { return; }
+    if (!graph.nodes.length) return;
+    const sig = JSON.stringify(graph);
+    if (sig !== _texRegionSig) {
+        try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 800);   // never stall the queue
+            const resp = await fetch("/tex_wrangle/detect_regions", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: sig, signal: ctrl.signal });
+            clearTimeout(timer);
+            _texRegionPlans = ((await resp.json()) || {}).plans || [];
+            _texRegionSig = sig;
+        } catch (e) { _texRegionSig = null; return; }   // route absent/slow → unfused; retry next queue
+    }
+    for (const plan of _texRegionPlans) {
+        try { _texCollapseRegion(result.output, plan); }
+        catch (e) { console.warn("[TEX] region fuse skipped", e); }
     }
 }
 
@@ -2755,6 +2919,11 @@ app.registerExtension({
                 // produces a prompt with a dangling reference).
                 try { _texCollapseChains(result); }
                 catch (e) { console.warn("[TEX] fusion collapse skipped", e); }
+                // FUS-1: DAG-region fusion (fan-out the linear pass skips). Awaited
+                // (Python detection via route) but timeout-bounded + fail-safe, so it
+                // never stalls or breaks a queue.
+                try { await _texCollapseRegions(result); }
+                catch (e) { console.warn("[TEX] region fusion skipped", e); }
                 // Lazy input cooking (gated by TEX.Lazy.enabled; fail-safe —
                 // any error leaves the prompt user-named and fully eager).
                 try { _texLazyRename(result); }

@@ -578,27 +578,40 @@ __init__.py                               tex_extension.js
 2. Add the filename stem to `_EXAMPLE_CATEGORIES` in `__init__.py` with a `"Category/Display Name"` value
 3. The snippet will appear automatically in the cascade menu under `Examples/Category/Display Name`
 
-## Research index
+## Rejected design decisions (don't re-propose)
 
-The deep design rationale lives in `TEX_research/` (**outside this repo** — a sibling
-of `comfyUI/`). Before reversing a design decision, check the relevant doc so you
-don't re-derive something already decided. One line each:
+Settled calls, kept here so they're not re-derived:
+- **A cross-node include/import system** — rejected on ethos grounds; self-containment
+  ("five lines of self-contained plaintext") is a deliberate shareability feature.
+- **An extra fusion wire** — the frontend collapses a chain into the terminal node
+  transparently instead.
+- **Whole-pipeline fp16 & bf16 IMAGE** — accuracy (bf16 err > the 8-bit quantum).
+- **Full ACES/OCIO color management** — scope creep (sRGB↔linear + OKLab only).
+- **Merging the interpreter and codegen stdlib implementations** — the duplication is
+  the bit-exactness safety margin.
+- **Default CPU codegen routing (PF-4)** — measured to regress the dominant color-grade
+  shape; the interpreter's own optimizations closed codegen's lead.
 
-| Doc | What it is |
-|-----|------------|
-| `soul_of_tex.md` | The ethos/design philosophy. **Rejected on ethos grounds:** a cross-node include/import system — self-containment ("five lines of self-contained plaintext") is a deliberate shareability feature. |
-| `0. tex_wrangle_node_for_comfyui.md` | The original language/node spec. |
-| `12a/12b. Custom Inputs.md` | Wireable-param / custom-socket design. |
-| `13. Compiling TEX Graphs Inside ComfyUI.md` | Compilation-inside-ComfyUI research. |
-| `14. Transparent TEX Fusion.md` | Fusion design. **User rejected the extra wire** → transparent frontend collapse-into-terminal instead. |
-| `20. TEX Optimization Roadmap (2026-07).md` | v0.15 roadmap (24 perf items). |
-| `21. TEX v0.15.0 Pre-Push Audit.md` | v0.15 adversarial audit (the green-but-broken class). |
-| `22. TEX Optimization Roadmap v0.16.md` | v0.16 roadmap. |
-| `23. TEX v0.16.0 Build Log.md` | v0.16 per-item build log — **measured-then-ditched** decisions (PF-4 codegen routing regresses color-grade; fp16 stays experimental; grid-buf reuse is a perf trap). |
-| `24. TEX v0.17.0 Longevity & LLM-Coding Roadmap.md` | This cycle: structure/longevity/LLM-fitness. Its §5 (trades to refuse) + §6 (DO-NOT-TOUCH) are captured in `AGENTS.md`. |
-| `25. TEX v0.17.0 Build Log.md` | v0.17 per-item build log. |
-
-**Rejected/decided elsewhere (don't re-propose):** whole-pipeline fp16 & bf16 IMAGE
-(accuracy — bf16 err > the 8-bit quantum); full ACES/OCIO color management (scope
-creep — sRGB↔linear + OKLab only); merging the interpreter and codegen stdlib
-implementations (the duplication is the bit-exactness safety margin).
+Recorded by the compositor-engine roadmap (`docs/roadmap.md` §7 is the provenance):
+- **Split-frame dual-device cooking (ENG-10)** — cooking one frame half-on-CPU,
+  half-on-GPU. The CPU↔GPU envelope (invariant #9) is characterized, not bit-parity
+  (up to 6.1e-2 on scatter), so a row-split would put that divergence on a visible
+  mid-frame seam; the output would depend on the split ratio, breaking the pinned
+  run-to-run determinism; and a laptop CPU adds only single-digit % of GPU pointwise
+  throughput while contending for the same memory bus. "Both CPU and GPU" is honestly
+  satisfied by branch-parallel execution + copy/compute overlap, not frame-splitting.
+- **Mid-sequence device-placement migration (SCHED-2's temporal twin of ENG-10)** —
+  moving a node between devices between frames of one render range changes pixels by
+  up to the same envelope (temporal popping). Placement is part of the result key and
+  freezes per render range; re-planning happens only at interactive/idle boundaries.
+- **A second, "fast" kernel language or dialect** — the Copernicus VEX(CPU)/OpenCL(GPU)
+  and Fusion Lua/DCTL trap: an easy-but-slow language and a fast-but-hostile one. TEX's
+  single source runs interpreter-on-CPU and codegen-on-GPU; device placement is a
+  scheduler concern, never an authoring one.
+- **A scanline- or tile-granular execution core** — Blender deleted its tile compositor
+  (full-frame rewrite: bounded memory, "often several times faster"); GEGL's per-tile
+  dual CPU/GPU residency kept OpenCL broken for 15 years. TEX is full-frame planar;
+  stripes/halos are a memory-streaming tactic under that model, not a scheduling model.
+- **A recursive pull executor with per-node locking** — the Natron post-mortem (its own
+  developers cite engine race conditions as what killed it). Plan lazily (demand, ROI,
+  frame ranges), then compile the resolved cook into a static push plan.

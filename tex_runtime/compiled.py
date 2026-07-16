@@ -637,6 +637,12 @@ def execute_compiled(
                     if verify["px"] != cook_px:
                         verify["px"] = cook_px
                         verify["samples"] = []
+                    # LAT-3: the verify window stays SYNCHRONOUS. It is one-shot and
+                    # bounded (3 warm cooks post-commit), so its sync doesn't hurt
+                    # interactivity — and deferring it would let a resolution-flip-heavy
+                    # session never accumulate 3 samples at a stable px, so a genuinely
+                    # slow artifact would escape demotion. Only the FREQUENT MEASURING
+                    # path is deferred.
                     out, ms = _timed(
                         lambda: compiled_fn(program, contiguous_bindings, type_map, device,
                                             latent_channel_count, output_names),
@@ -784,19 +790,79 @@ _bg_futures: dict = {}
 def _timed(fn, device_type: str):
     """Run fn() and return (result, elapsed_ms). CUDA uses an event pair whose
     end is synchronized (only that event, at the cook boundary — not a device
-    barrier); CPU uses perf_counter."""
+    barrier); CPU uses perf_counter. The synchronous form — used where the caller
+    must have the ms THIS cook: the TRIAL cook (its ms decides commit/reject) and the
+    one-shot verify window. Only the FREQUENT MEASURING path uses _timed_deferred."""
     import time as _time
     if device_type == "cuda":
         try:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
+        except Exception:
+            start = None
+        if start is not None:
+            # fn() runs EXACTLY once: after it has run, a timing-readback failure
+            # falls back to the wall-clock captured at t0 rather than re-invoking the
+            # (side-effecting codegen) fn — the earlier "except -> fall through -> fn()
+            # again" shape double-executed it.
+            t0 = _time.perf_counter()
             start.record()
             out = fn()
             end.record()
-            end.synchronize()
-            return out, start.elapsed_time(end)
+            try:
+                end.synchronize()
+                return out, start.elapsed_time(end)
+            except Exception:
+                return out, (_time.perf_counter() - t0) * 1000.0
+    t0 = _time.perf_counter()
+    out = fn()
+    return out, (_time.perf_counter() - t0) * 1000.0
+
+
+# LAT-3: deferred CUDA-event readback. A per-cook `end.synchronize()` (as _timed
+# does) stalls the CPU on the GPU at EVERY measured cook — fine for a batch ComfyUI
+# render, hostile to an interactive viewport that re-enters MEASURING on each code
+# edit. The deferred form records this cook's event pair and reads back the PRIOR
+# cook's pair only if it is ALREADY complete (a non-blocking end.query()), so the
+# sync never lands on the interactive path. Median-based verdicts (autotier's deque)
+# tolerate the resulting stale-by-one / occasionally-skipped samples. Invariant #6
+# holds: a reading is still taken only after its event pair completes — deferral
+# changes WHEN the read happens, never WHETHER it is fenced.
+_deferred_ev: "_OrderedDict[Any, tuple]" = _OrderedDict()
+_DEFERRED_EV_MAX = 256
+
+
+def _timed_deferred(fn, device_type: str, slot):
+    """Run fn(), return (result, ms_or_None). ms is the prior same-slot cook's
+    elapsed time if its end event has completed (no sync), else None (skip this
+    sample). CPU path stays synchronous perf_counter (no GPU sync to avoid)."""
+    import time as _time
+    if device_type == "cuda":
+        try:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
         except Exception:
-            pass  # fall through to wall-clock
+            start = None
+        if start is not None:
+            start.record()
+            out = fn()                     # runs EXACTLY once (see _timed)
+            try:
+                end.record()
+                # Store THIS cook's pair BEFORE reading the prior one: if the
+                # readback below raises on a stale/invalidated prior pair, the fresh
+                # pair has already replaced it, so the slot self-heals next cook
+                # instead of re-reading the dead pair forever.
+                prev = _deferred_ev.get(slot)
+                _deferred_ev[slot] = (start, end)
+                _deferred_ev.move_to_end(slot)
+                while len(_deferred_ev) > _DEFERRED_EV_MAX:
+                    _deferred_ev.popitem(last=False)
+                ms = None
+                if prev is not None and prev[1].query():   # prior end done → free read
+                    ms = prev[0].elapsed_time(prev[1])
+                return out, ms
+            except Exception:
+                return out, None           # fn ran; deferral failed → skip the sample
     t0 = _time.perf_counter()
     out = fn()
     return out, (_time.perf_counter() - t0) * 1000.0
@@ -1001,9 +1067,20 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         return res
 
     # MEASURING or COMPILING (or TRIAL with a lost artifact): run the codegen
-    # baseline, timed, and advance the state machine off the hot path.
-    res, ms = _timed(lambda: _codegen(bindings), device_type)
-    autotier.record_interp(key, ms)
+    # baseline, timed via the DEFERRED reader (LAT-3) so the measure window never
+    # syncs on the interactive path; a None (prior sample not yet complete) just
+    # skips this cook's sample — the deque converges over the next few cooks.
+    # Slot is `key` itself — the SAME px-BUCKET granularity autotier commits its
+    # verdict at (make_key buckets by px.bit_length). Keying on the EXACT shape `sp`
+    # instead would mean a session at jittering resolutions (a folder of
+    # near-1000px photos, a zoom-drag within one octave) never sees a prior same-slot
+    # cook, so `interp_ms` never fills and the program never promotes to the
+    # compiled tier — the deferred reader must group at the bucket autotier medians
+    # over, not below it.
+    res, ms = _timed_deferred(lambda: _codegen(bindings), device_type,
+                              (key, "measure"))
+    if ms is not None:
+        autotier.record_interp(key, ms)
     if state == autotier.MEASURING and autotier.should_submit_compile(key):
         if _cuda_headroom_ok(device) and not _capture_in_flight():
             if _submit_bg_compile(cache_key, program, type_map, device_type,
@@ -1028,17 +1105,42 @@ def _plain_execute(
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
 ) -> torch.Tensor | dict:
-    """Execute without torch.compile (standard tree-walking interpreter)."""
-    interp = Interpreter()
-    return interp.execute(program, bindings, type_map, device=device,
-                          latent_channel_count=latent_channel_count,
-                          output_names=output_names,
-                          precision=precision,
-                          used_builtins=used_builtins)
+    """Execute without torch.compile (standard tree-walking interpreter). Reuses ONE
+    persistent interpreter (C6) so its coordinate-builtin LRU (LAT-4) actually persists
+    across cooks on the interpreter-FALLBACK path — the no-backend / codegen-declined
+    path is never cached, so a fresh `Interpreter()` per call rebuilt u/v/ix/iy every
+    cook, exactly what LAT-4 set out to avoid. This instance is SEPARATE from the graph
+    tier's dedicated interpreter (graphed.py), so a module-shared builtins cache never
+    lets another cook evict a captured graph's baked builtins. Under ComfyUI's
+    one-cook-at-a-time executor this reuse is race-free (same contract as the node's
+    _get_interpreter singleton)."""
+    return _get_plain_interp().execute(
+        program, bindings, type_map, device=device,
+        latent_channel_count=latent_channel_count, output_names=output_names,
+        precision=precision, used_builtins=used_builtins)
+
+
+_PLAIN_INTERP = None
+
+
+def _get_plain_interp():
+    global _PLAIN_INTERP
+    if _PLAIN_INTERP is None:
+        _PLAIN_INTERP = Interpreter()
+    return _PLAIN_INTERP
+
+
+def clear_plain_interp_caches():
+    """Sweep the persistent fallback interpreter's tensor LRUs (C6) — for
+    free_tensor_caches (memory pressure) + clear_compiled_cache (test isolation).
+    No-op if it was never created."""
+    if _PLAIN_INTERP is not None:
+        _PLAIN_INTERP._builtins_lru.clear()
+        _PLAIN_INTERP._literal_cache.clear()
 
 
 # Cross-cook cache for codegen builtin tensors (coordinates + constants). The
-# interpreter has cached these across executes for ages (_builtins_cache_env);
+# interpreter has cached these across executes for ages (its _builtins_lru);
 # the codegen path was re-allocating every single cook — a fresh arange/expand/
 # scalar-tensor per builtin per frame (a handful of tiny kernel launches on CUDA,
 # allocs on CPU). Values are NEVER mutated downstream: generated code treats
@@ -1373,7 +1475,9 @@ def clear_compiled_cache():
     _compiled_cache.clear()
     _compile_blacklist.clear()
     _verify_state.clear()      # G: post-commit verification windows
+    _deferred_ev.clear()       # LAT-3: pending deferred-readback event pairs
     _ENV_TENSOR_CACHE.clear()  # codegen builtin tensors (test isolation)
+    clear_plain_interp_caches()  # C6: the persistent fallback interpreter's LRUs
     # Reset backend status so backends are re-probed
     _backend_status.clear()
     _route_memo.clear()
