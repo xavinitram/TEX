@@ -95,21 +95,24 @@ def test_c1st_execute_line_budget(r: SubTestResult):
     print("\n--- C1-st: execute() per-function line budget (anti-regrowth tripwire) ---")
     # doc 34 weakness #10: execute() regrew 276->395 across v0.18 (the v0.17 decomposition
     # silently reversed) because REG-2 watches MODULES, not functions. This is the missing
-    # per-function tripwire doc 27 asked for. Budget set just above the post-C1-st size
-    # (380, down from 395); further extraction is deferred but the function can no longer
-    # silently accrete a whole tier's worth of logic again.
+    # per-function tripwire doc 27 asked for.
+    # RATCHET, v0.22 (ENG-1): execute() is now marshal-in -> engine.prepare/run ->
+    # marshal-out and measures 205 lines (was 376 at v0.21). The budget drops 385 -> 240 to
+    # LOCK THAT IN — the cook belongs in tex_engine now, so any regrowth here is the
+    # ComfyUI adapter re-absorbing engine logic, which is exactly the S-1 drift to catch.
     import ast
     src = (_PKG / "tex_node.py").read_text(encoding="utf-8")
-    BUDGET = 385
+    BUDGET = 240
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, ast.FunctionDef) and node.name == "execute":
             span = node.end_lineno - node.lineno
             if span > BUDGET:
                 r.fail("C1-st execute budget",
-                       f"execute() is {span} lines > budget {BUDGET} — extract a block "
-                       "into a helper (see _fp16_finiteness_net) rather than growing it")
+                       f"execute() is {span} lines > budget {BUDGET} — the cook moved to "
+                       "tex_engine (ENG-1); marshalling logic that grows past this budget "
+                       "usually means engine logic leaked back into the ComfyUI adapter")
             else:
-                r.ok(f"execute() {span} lines <= budget {BUDGET} (was 395 pre-v0.19)")
+                r.ok(f"execute() {span} lines <= budget {BUDGET} (376 at v0.21, pre-ENG-1)")
             return
     r.fail("C1-st execute budget", "execute() not found in tex_node.py")
 

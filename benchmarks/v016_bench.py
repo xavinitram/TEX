@@ -111,7 +111,7 @@ def bench_one(name, code, H, W, device, iters):
     def run_codegen():
         _codegen_only_execute(prog, {k: (v.clone() if isinstance(v, torch.Tensor) else v)
                                      for k, v in bindings.items()},
-                              tm, device, output_names=outs, fingerprint=fp)
+                              tm, device, output_names=outs, fingerprint=fp, time_context=None)
     ms_cg = timeit(run_codegen, iters, sync)
     row["codegen_ms"] = round(ms_cg, 3)
     row["cg_speedup"] = round(ms_interp / ms_cg, 2) if ms_cg > 0 else None

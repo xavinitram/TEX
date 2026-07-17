@@ -42,8 +42,11 @@ from .tex_compiler import ast_nodes as A
 # post-parse pipeline now lives in TEXCache.compile_ast (called by compile_fused).
 
 # Names the splicer must NEVER prefix — they resolve globally, not per stage.
+# ENG-7 adds frame/fps/time: the host's playhead is one value for the whole fused
+# program, so a per-stage `_s0_u_frame` would be an undefined identifier at cook time.
 _BUILTINS = frozenset({
     "ix", "iy", "iw", "ih", "u", "v", "px", "py", "fi", "fn", "PI", "TAU", "E", "ic",
+    "frame", "fps", "time",
 })
 
 # Memory LRU for compiled fused chains: chain key -> the 6-tuple compile_fused
@@ -498,10 +501,11 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
 
     # Q-3(c): observed-intermediate taps — expose a marked upstream handoff as a
     # terminal output @_tap_s{i} so a Preview can read it without breaking the
-    # chain. Respect MAX_OUTPUTS (8, mirrors tex_node.TEXWrangleNode.MAX_OUTPUTS):
-    # taps are optional conveniences, so DROP the excess (with a log) rather than
-    # letting sorted(assigned) overflow the node's output slots and fail the cook.
-    _MAX_FUSED_OUTPUTS = 8
+    # chain. Respect the engine's output ceiling: taps are optional conveniences, so
+    # DROP the excess (with a log) rather than letting sorted(assigned) overflow the
+    # host's output slots and fail the cook. Function-local import — tex_engine imports
+    # tex_fusion at module level, so the edge only exists in this direction (ENG-1).
+    from .tex_engine import MAX_OUTPUTS as _MAX_FUSED_OUTPUTS
     # Count outputs already assigned by the spliced stages (recurses into nested
     # if/for bodies, unlike a flat scan) — its binding-names half is exactly the
     # set of names that become node output slots.
@@ -633,20 +637,76 @@ def _looks_image(v) -> bool:
         return False
 
 
+# ── SCHED-1: the GraphSpec ───────────────────────────────────────────────────
+#
+# The `_tex_chain` payload started as a private handshake between TEX's own JS and its
+# own node. It is now the INTERFACE any host uses to drive fusion: emit a GraphSpec,
+# call detect_fusable_regions / prepare_fused, and DAG fusion works — the detector is
+# pure Python (FUS-1) precisely so no host reimplements the legality rules. That makes
+# the payload shape a contract, so it gets a version.
+#
+# GRAPHSPEC_SCHEMA is the version THIS build emits and accepts. It is a compatibility
+# gate, not decoration: a host that pins an old TEX, or a stale workflow JSON carrying
+# an embedded payload, must fail with a legible message instead of mis-splicing a graph.
+#
+# Bump it when the shape changes in a way an older reader would MISREAD. Adding an
+# optional key that older readers ignore harmlessly does not qualify.
+#
+# Schema history:
+#   1 — v0.15 linear chains; v0.21 added the optional DAG payload (`dag`, `chain_inputs`,
+#       `source_stage`, `source_binding`, `terminal_chain_inputs`). Both read as schema 1:
+#       the DAG keys are additive and a linear spec is byte-identical to v0.15's.
+GRAPHSPEC_SCHEMA = 1
+
+# Absent `schema` means a pre-v0.22 emitter, which by definition emitted schema 1 — the
+# shape is unchanged, so accepting it is correct, not lenient. Every workflow saved
+# before v0.22 relies on this.
+_GRAPHSPEC_DEFAULT_SCHEMA = 1
+
+
+def _check_graphspec_schema(spec: dict) -> None:
+    """SCHED-1: reject a GraphSpec this build cannot read. Never guesses — a spec from a
+    NEWER TEX may have re-meant a key we still recognise, and silently splicing it would
+    produce wrong pixels from a graph the user thinks is supported."""
+    got = spec.get("schema", _GRAPHSPEC_DEFAULT_SCHEMA)
+    if not isinstance(got, int) or got < 1:
+        raise FusionError(
+            f"this fused chain's GraphSpec has an invalid schema ({got!r}). The payload "
+            f"is malformed — turn off TEX Fusion in settings, or re-create the link.")
+    if got > GRAPHSPEC_SCHEMA:
+        raise FusionError(
+            f"this fused chain was built by a newer TEX (GraphSpec schema {got}; this "
+            f"build reads {GRAPHSPEC_SCHEMA}). Update TEX, or turn off 'TEX Fusion: "
+            f"Compile linked TEX nodes together' in settings to run the nodes unfused.")
+
+
 def prepare_fused(spec: dict, terminal_code: str, terminal_bindings: dict,
                   infer_binding_type: Callable[[Any], Any]):
-    """Assemble + compile a fused chain from a frontend `_tex_chain` payload.
+    """Assemble + compile a fused chain from a GraphSpec payload (SCHED-1).
 
-    spec (from graphToPrompt):
-        {"stages": [{"code", "image_input", "params": {name: value}}, ...],  # upstream, source-first
-         "terminal_image_input": str}    # the terminal's @binding that carries the
-                                         # chain SOURCE (and that its code reads as the chain)
+    spec — the shape a host emits (`_tex_chain` on the ComfyUI node):
+
+        {"schema": 1,                    # SCHED-1; optional, defaults to 1 (pre-v0.22)
+         "stages": [                     # UPSTREAM stages, source-first; terminal excluded
+             {"code": str,               #   the stage's TEX source
+              "image_input": str,        #   linear only: the @binding carrying the chain
+              "params": {name: value}},  #   the stage's own widget values
+             ...],
+         "terminal_image_input": str,    # the terminal's @binding carrying the chain SOURCE
+
+         # --- optional DAG payload (FUS-1); absent => a linear chain ---
+         "dag": True,
+         "source_stage": int,            # which stage the ONE external edge feeds
+         "source_binding": str,          # ...and under which @binding
+         "terminal_chain_inputs": {binding: [src_stage, out]},
+         # ...and per-stage: "chain_inputs": {binding: [src_stage, out]}
+        }
 
     terminal_bindings: the terminal node's own bindings (its $params and any
         extras) PLUS the source image under terminal_image_input; consumed here.
 
     Returns (program, type_map, referenced, assigned_bindings, param_info,
-    used_builtins, merged_bindings) — drop-in for the node's interpreter call with
+    used_builtins, merged_bindings) — drop-in for the engine's interpreter call with
     output_names = sorted(assigned_bindings).
     """
     fused_stages = _stages_from_spec(spec, terminal_code, terminal_bindings)
@@ -654,8 +714,9 @@ def prepare_fused(spec: dict, terminal_code: str, terminal_bindings: dict,
 
 
 def _stages_from_spec(spec: dict, terminal_code: str, terminal_bindings: dict) -> list[dict]:
-    """Assemble the ordered stage list (source-first) from a `_tex_chain` spec.
+    """Assemble the ordered stage list (source-first) from a GraphSpec.
     Shared by prepare_fused and fused_fingerprint so both see the same key."""
+    _check_graphspec_schema(spec)
     stages = spec.get("stages") or []
     if not stages:
         raise FusionError("fused chain payload has no upstream stages")
@@ -937,6 +998,7 @@ def region_to_collapse_plan(region: dict, node_code: dict, node_params: dict) ->
     upstream = region["stages"][:-1]
     term_stage = region["stages"][-1]
     payload = {
+        "schema": GRAPHSPEC_SCHEMA,   # SCHED-1
         "dag": True,
         "stages": [{"code": node_code[st["id"]],
                     "params": dict(node_params.get(st["id"], {}) or {}),

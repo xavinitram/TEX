@@ -1718,7 +1718,7 @@ const TEX_HELP_DATA = [
             { name: "Type Prefixes", sig: "f@ i@ v@ v4@ img@ m@ l@ s@", desc: "Prefix a binding to set its type: f@ float, i@ int, v@ vec3, v4@ vec4, img@ IMAGE, m@ MASK, l@ LATENT, s@ string.", example: "img@photo = ...;" },
             { name: "Parameters ($)", sig: "f$name = val;  i$name = val;  s$name = val;", desc: "Declare adjustable widgets on the node. f$ = FLOAT, i$ = INT, s$ = STRING. Use $name in expressions.", example: "f$strength = 0.75;\n@OUT = @A * $strength;" },
             { name: "Output", sig: "@OUT = expr;  @name = expr;", desc: "Assign to @OUT for a single output, or use named outputs for multiple results.", example: "@result = lerp(@base, @overlay, 0.5);\n@mask = luma(@base);" },
-            { name: "Built-in Variables", sig: "ix iy u v iw ih px py fi fn ic PI TAU E", desc: "ix/iy = pixel coords. u/v = normalized [0,1]. iw/ih = image dimensions. px/py = pixel step (1/iw, 1/ih). fi = frame index. fn = frame count. ic = latent channels. PI, TAU, E constants.", example: "float cx = u - 0.5;\nfloat cy = v - 0.5;" },
+            { name: "Built-in Variables", sig: "ix iy u v iw ih px py fi fn ic frame fps time PI TAU E", desc: "ix/iy = pixel coords. u/v = normalized [0,1]. iw/ih = image dimensions. px/py = pixel step (1/iw, 1/ih). fi = frame index IN THE BATCH. fn = batch frame count. ic = latent channels. frame/fps/time = the HOST timeline (new in v0.22; 0 in ComfyUI, which has no playhead - use fi for position within a batch). PI, TAU, E constants. ALL of these are RESERVED: you cannot declare a variable with these names ($time, the parameter, is unaffected).", example: "float cx = u - 0.5;\nfloat cy = v - 0.5;" },
         ]
     },
     {
@@ -2449,6 +2449,7 @@ function _texCollapseOne(out, chain) {
     // The terminal's chain socket carries the source AND is read as the chain — one key.
     out[termId].inputs[terminalImageInput] = headSource.origin;
     out[termId].inputs["_tex_chain"] = JSON.stringify({
+        schema: 1,   // SCHED-1 GraphSpec; keep in step with tex_fusion.GRAPHSPEC_SCHEMA
         stages,
         terminal_image_input: terminalImageInput,
     });

@@ -129,6 +129,38 @@ class TEXMultiError(Exception):
         super().__init__(rendered)
 
 
+# ── ENG-4: the public compile-error type ─────────────────────────────
+
+class TEXCompileError(Exception):
+    """The PUBLIC error type for a failed compile (ENG-4, v0.22).
+
+    Until v0.22 the only way to handle a TEX compile failure was to catch
+    `LexerError`/`ParseError`/`TypeCheckError`/`TEXMultiError` — four internal types,
+    one per compiler phase, named after TEX's own structure. An embedding host had to
+    import the compiler's guts to write an except clause, and any phase we add or merge
+    later would silently break it. This is the one type such a host catches, and
+    `.diagnostics` is the structured payload it renders.
+
+        from TEX_Wrangle import tex_api
+        try:
+            prog = tex_api.compile(src, {"A": TEXType.VEC3})
+        except tex_api.TEXCompileError as e:
+            for d in e.diagnostics:      # [TEXDiagnostic]
+                show(d.to_dict())        # key set is canary-pinned (ENG-5)
+
+    Always carries at least one diagnostic. Raised by `tex_api.compile`; the ComfyUI
+    node deliberately still catches the raw types, because it needs the per-phase detail
+    to build its `TEX_DIAG:` suffix and Q-4 stage attribution — the string protocol the
+    shipped frontend parses. It lives HERE, not in tex_api, so that the raiser can move
+    down to tex_engine later without the type moving with it.
+    """
+
+    def __init__(self, diagnostics: list[TEXDiagnostic]):
+        self.diagnostics = list(diagnostics)
+        super().__init__("\n\n".join(d.render() for d in self.diagnostics)
+                         or "TEX compile failed")
+
+
 # ── Source snippet helper ─────────────────────────────────────────────
 
 def get_source_line(source: str, line: int) -> str:
@@ -232,9 +264,9 @@ _FOREIGN_VARIABLE_HINTS: dict[str, str] = {
     "UV":            "TEX provides separate u and v variables (not a vec2 UV). Use u, v instead.",
     "resolution":    "TEX provides iw (width) and ih (height) as separate floats.",
     "iResolution":   "TEX provides iw (width) and ih (height) as separate floats.",
-    "iTime":         "TEX provides fi (frame index) and fn (normalized frame 0–1).",
+    "iTime":         "TEX has `time` — the host's playhead in seconds (v0.22). ComfyUI has no timeline, so it reads 0 there; `fi` is your position within an image batch, which is usually what you want in ComfyUI.",
     "time":          "TEX provides fi (frame index) and fn (normalized frame 0–1).",
-    "iFrame":        "TEX provides fi (frame index) and fn (normalized frame 0–1).",
+    "iFrame":        "TEX has `frame` — the host's frame on its timeline (v0.22). ComfyUI has no timeline, so it reads 0 there; `fi` is your position within an image batch, which is usually what you want in ComfyUI.",
     "iMouse":        "TEX has no mouse input. Expose interactive values as $param widgets instead.",
     "iChannel0":     "TEX inputs are @A through @H. Read the first one with @A(u, v).",
     "iChannel1":     "TEX inputs are @A through @H. The second input is @B.",
@@ -308,6 +340,16 @@ _BUILTIN_VAR_HINTS: dict[str, str] = {
     "px": "the pixel x (float)", "py": "the pixel y (float)",
     "fi": "the frame index", "fn": "the frame count", "ic": "the input channel count",
     "PI": "the constant pi", "TAU": "the constant 2*pi", "E": "Euler's number",
+    # ENG-7 (v0.22): reserving these three CAN break a program that declared its own
+    # `float time = ...`, so these hints carry the migration, not just the definition.
+    # `$time` (the param) is untouched — the sigil keeps the namespaces apart.
+    "frame": "the host's current frame on its timeline (v0.22). Rename your variable, "
+             "or use $frame for your own parameter. For position within an image BATCH, "
+             "use fi",
+    "fps": "the host's frames per second (v0.22). Rename your variable, or use $fps for "
+           "your own parameter",
+    "time": "the host's playhead in seconds (v0.22). Rename your variable, or use $time "
+            "for your own parameter — the $ sigil keeps them separate",
 }
 
 

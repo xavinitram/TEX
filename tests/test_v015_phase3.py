@@ -246,7 +246,7 @@ def test_m5_out_reuse(r: SubTestResult):
         cgmod._OUT_REUSE_ENABLED = enabled
         try:
             return cmod._codegen_only_execute(prog, {"A": img}, tm, "cpu",
-                                              output_names=["OUT"], fingerprint=fp)["OUT"]
+                                              output_names=["OUT"], fingerprint=fp, time_context=None)["OUT"]
         finally:
             cgmod._OUT_REUSE_ENABLED = saved
 
@@ -295,7 +295,7 @@ def test_m5_out_reuse(r: SubTestResult):
         cgmod._OUT_REUSE_ENABLED = True
         try:
             got = cmod._codegen_only_execute(prog, {"A": img}, tm, "cpu",
-                                             output_names=["OUT"], fingerprint="m5_hz")["OUT"]
+                                             output_names=["OUT"], fingerprint="m5_hz", time_context=None)["OUT"]
         finally:
             cgmod._OUT_REUSE_ENABLED = saved
         ref = Interpreter().execute(prog, {"A": img}, tm, device="cpu",

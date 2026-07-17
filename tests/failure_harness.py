@@ -90,7 +90,7 @@ def run_tier(code, bindings, tier, device="cpu", precision="fp32"):
                         output_names=outs, precision=precision), outs)
     if tier == "codegen":
         return _as_dict(_codegen_only_execute(prog, b, tm, device,
-                        output_names=outs, precision=precision, fingerprint=fp), outs)
+                        output_names=outs, precision=precision, fingerprint=fp, time_context=None), outs)
     if tier == "compiled":
         return _as_dict(execute_compiled(prog, b, tm, device, fp,
                         output_names=outs, precision=precision), outs)

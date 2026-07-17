@@ -121,8 +121,8 @@ def test_str4_write_collectors(r: SubTestResult):
 
 def test_str2_select_tier_matrix(r: SubTestResult):
     print("\n--- STR-2: pure tier-SELECTION matrix (CPU-testable, no execution) ---")
-    from TEX_Wrangle.tex_node import TEXWrangleNode
-    S = TEXWrangleNode.select_tier
+    # ENG-1 (v0.22): tier selection is the ENGINE's — it never needed the node.
+    from TEX_Wrangle.tex_engine import select_tier as S
 
     def expected(mode, device, fused, fp_present):
         # the cascade guards, restated independently as the oracle

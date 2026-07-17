@@ -89,6 +89,19 @@ from .codegen_persist import (
 )
 
 
+def _reads_time_builtin(program: Program) -> bool:
+    """ENG-7: does this program read a host-time builtin? (see try_compile).
+
+    Derived from `_collect_identifiers`, the compiler's existing builtin collector —
+    ENG-7 put the time names into `_BUILTIN_NAMES`, which is what that function filters
+    against, so it already knows the answer. A private AST walk here would be a second
+    implementation of the same question, free to drift from the declaration it reads.
+    Compile-path only (fingerprint-cached, never per-cook), so building the full set
+    rather than early-exiting costs nothing that matters."""
+    from .interpreter import _collect_identifiers, _TIME_BUILTIN_NAMES
+    return not _TIME_BUILTIN_NAMES.isdisjoint(_collect_identifiers(program))
+
+
 def try_compile(program: Program, type_map: dict[int, TEXType],
                 fingerprint: str | None = None) -> Any | None:
     """Try to compile a TEX program AST to a Python function.
@@ -102,8 +115,27 @@ def try_compile(program: Program, type_map: dict[int, TEXType],
     *fingerprint* (when given) makes the compiled code object reproducible so
     it can be marshalled and persisted (PC-3). The returned fn carries
     `_tex_code` / `_tex_src` for that persistence.
+
+    ENG-7 (v0.22): a program that reads the host-time builtins (`frame`/`fps`/`time`)
+    is DECLINED here, so every compile tier self-falls-back to the interpreter — the
+    one backend that reads the playhead fresh per cook.
+
+    The reason is caching, not codegen capability: the emitter would handle these fine
+    as ordinary `_env.get(...)` reads. But everything downstream of this function caches
+    keyed by the program FINGERPRINT, which by design does not move when a playhead does
+    — `_env_cached` would hand back frame 1's tensor forever, the codegen-only executor
+    is a closure built once per fingerprint, and a captured CUDA graph replays the value
+    it captured. Each of those fails the same way: the cook SUCCEEDS and the animation is
+    frozen. Declining is the only variant that can't be silently wrong, and it costs
+    nothing today (ComfyUI has no timeline, so these read 0 there anyway).
+
+    Lifting this means feeding the playhead as a per-replay static input buffer — the
+    same mechanism the graph tier needs — and belongs with the first host that has a
+    real playhead (roadmap PORT-5 / GRAPH-1), not ahead of it.
     """
     try:
+        if _reads_time_builtin(program):
+            return None
         gen = _CodeGen(type_map)
         gen.emit_program(program)
         fn = gen.build(fingerprint)
@@ -1752,6 +1784,23 @@ class _CodeGen(_EmitStdFnsMixin):
             return sel_tmp, img_tmp
         return bchw_tmp, img_tmp
 
+    def _stencil_drop_channel_axis(self, stencil: _StencilInfo, tmp: str) -> str:
+        """Undo the size-1 channel axis a single-channel selection carries.
+
+        `_stencil_to_bchw` slices one channel as `bchw[:, i:i+1]` — the pool ops
+        need that axis to stay 4-D — so permuting back yields [B, H, W, 1]. But a
+        single channel is a SCALAR per pixel, which the interpreter holds as
+        [B, H, W]. Assigning the un-squeezed form to a `float` accumulator leaves
+        codegen one rank above the oracle, which surfaces as a rank-5 output or a
+        stack() size error downstream. Multi-channel swizzles are already right
+        (.rg -> 2 == vec2, .rgb -> 3 == vec3), so only len == 1 is squeezed.
+        """
+        if stencil.channels and len(stencil.channels) == 1:
+            sq_tmp = self._tmp()
+            self._emit(f"{sq_tmp} = {tmp}.squeeze(-1)")
+            return sq_tmp
+        return tmp
+
     def _stencil_pad_and_kernel_size(self, stencil: _StencilInfo, sel_tmp: str
                                      ) -> tuple[str, str, str, str | None]:
         """Emit padding + compute kernel size for a stencil.
@@ -1805,12 +1854,44 @@ class _CodeGen(_EmitStdFnsMixin):
             self._emit(f"{pad_tmp} = _torch.nn.functional.pad({sel_tmp}, ({pad_l}, {pad_r}, {pad_t}, {pad_b}), mode='replicate')")
             return pad_tmp, str(kH), str(kW), str(kH * kW)
 
+    @staticmethod
+    def _seed_is_provably_nonzero(node: ASTNode | None) -> bool:
+        """True iff `node` is a compile-time-constant seed with a non-zero component.
+
+        Gates the box-sum pool lowering. `avg_pool2d` sums the taps in the interpreter's
+        OWN left-to-right order, so a zero seed is bit-exact even at large magnitudes.
+        But a non-identity additive seed folded onto the pool sum sits at the OPPOSITE
+        end of the accumulation from the interpreter's seed-first left-fold
+        (`((seed+t0)+t1)+...`), and FP reassociation error there scales with |seed|
+        relative to the tap sum — enough to break invariant #2's 1e-5 for a large seed
+        (measured: seed 100 over [0,1) data -> 2.3e-5; seed ~8 over latent-magnitude
+        taps -> ~1.5e-5). Only a PROVABLE non-zero constant is declined (so the bit-exact
+        static unroll runs instead); a zero/default/runtime seed keeps the pool — zero is
+        exact, and a runtime seed is undecidable here yet still strictly improved by the
+        fold below versus the old drop-the-seed overwrite. min/max are exempt: their fold
+        is a selection (`torch.maximum`/`minimum`), which is order-independent and stays
+        bit-exact for any seed."""
+        if isinstance(node, NumberLiteral):
+            return node.value != 0.0
+        if isinstance(node, VecConstructor):
+            # Provable only when every component is a literal; a runtime arg is undecidable.
+            if node.args and all(isinstance(a, NumberLiteral) for a in node.args):
+                return any(a.value != 0.0 for a in node.args)
+        return False
+
     def _emit_box_stencil(self, stencil: _StencilInfo) -> bool:
         """Emit avg_pool2d for a box blur stencil."""
         accum_local = self._local_vars.get(stencil.accum_var, f"_env[{stencil.accum_var!r}]")
         count_local = None
         if stencil.count_var:
             count_local = self._local_vars.get(stencil.count_var, f"_env[{stencil.count_var!r}]")
+
+        # A provably non-identity constant seed cannot be folded onto the pool sum within
+        # invariant #2 (see _seed_is_provably_nonzero); decline BEFORE emitting anything so
+        # _emit_for_loop falls through to the bit-exact static unroll (which accumulates in
+        # the interpreter's order). Nothing has been emitted yet, so the fall-through is clean.
+        if self._seed_is_provably_nonzero(self._var_initializers.get(stencil.accum_var)):
+            return False
 
         sel_tmp, _ = self._stencil_to_bchw(stencil)
         pad_tmp, kh, kw, n_expr = self._stencil_pad_and_kernel_size(stencil, sel_tmp)
@@ -1820,7 +1901,19 @@ class _CodeGen(_EmitStdFnsMixin):
         # avg_pool2d with divisor_override=1 computes raw sum directly
         self._emit(f"{pool_tmp} = _torch.nn.functional.avg_pool2d({pad_tmp}, kernel_size=({kh}, {kw}), stride=1, padding=0, divisor_override=1)")
         self._emit(f"{result_tmp} = {pool_tmp}.permute(0, 2, 3, 1)")
-        self._emit(f"{accum_local} = {result_tmp}")
+        result_tmp = self._stencil_drop_channel_axis(stencil, result_tmp)
+        # Fold the accumulator's pre-loop SEED. The interpreter runs `acc = acc + tap`
+        # from acc's entry value, so the neighbourhood sum must be ADDED to it, not
+        # overwritten. `accum_local` already holds that seed — its VarDecl was emitted
+        # before this loop (the nest replaced here does not touch it). We only reach here
+        # for a seed that is provably zero (the identity — fold is a no-op, so bare-box
+        # parity is byte-preserved) or one whose value is unknown at emit time (a runtime
+        # expression, or a default-init/reassigned var not tracked in _var_initializers):
+        # a provably non-zero CONSTANT was already declined above, because for it the fold
+        # would reassociate past invariant #2. For the unknown case the fold is still the
+        # right answer up to the pool's magnitude-dependent reassociation, and strictly
+        # better than the old overwrite, which dropped the seed outright.
+        self._emit(f"{accum_local} = {accum_local} + {result_tmp}")
         if count_local and n_expr:
             self._emit(f"{count_local} = _torch.scalar_tensor(float({n_expr}), dtype=_torch.float32, device=_dev)")
         return True
@@ -1842,7 +1935,19 @@ class _CodeGen(_EmitStdFnsMixin):
             self._emit(f"{neg_tmp} = -{pad_tmp}")
             self._emit(f"{pool_tmp} = -_torch.nn.functional.max_pool2d({neg_tmp}, kernel_size=({kh}, {kw}), stride=1, padding=0)")
         self._emit(f"{result_tmp} = {pool_tmp}.permute(0, 2, 3, 1)")
-        self._emit(f"{result_local} = {result_tmp}")
+        result_tmp = self._stencil_drop_channel_axis(stencil, result_tmp)
+        # Fold the accumulator's pre-loop SEED. The interpreter runs `m = max/min(m, tap)`
+        # starting from m's entry value, so the pooled neighbourhood must be COMBINED
+        # with it, not overwritten. Unlike box-sum, max/min have NO finite identity: a
+        # seed of `vec3(0.0)` over SIGNED data (latents — the core domain) legitimately
+        # clamps the neighbourhood, and dropping it diverged by up to ~0.6 on the default
+        # path. `result_local` holds the seed (its VarDecl was emitted before this loop);
+        # `torch.maximum`/`torch.minimum` mirror the interpreter's `max()`/`min()` (both
+        # go through `torch.maximum`/`minimum` in stdlib), so this is bit-exact. A seed
+        # that can never win (max seed 0.0 over non-negative data) folds to a no-op, so
+        # the existing bare-pool parity tests are unaffected. Invariant #2 fold.
+        fold = "maximum" if stencil.minmax_op == "max" else "minimum"
+        self._emit(f"{result_local} = _torch.{fold}({result_local}, {result_tmp})")
         return True
 
     def _emit_conv2d_stencil(self, stencil: _StencilInfo) -> bool:
@@ -1884,6 +1989,7 @@ class _CodeGen(_EmitStdFnsMixin):
 
         result_tmp = self._tmp()
         self._emit(f"{result_tmp} = {conv_tmp}.permute(0, 2, 3, 1)")
+        result_tmp = self._stencil_drop_channel_axis(stencil, result_tmp)
 
         target = self._local_vars.get(stencil.result_var, f"_env[{stencil.result_var!r}]")
         self._emit(f"{target} = {result_tmp}")

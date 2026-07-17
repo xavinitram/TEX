@@ -133,6 +133,10 @@ class Interpreter:
         self.env: dict[str, torch.Tensor] = {}
         self.bindings: dict[str, torch.Tensor] = {}
         self.type_map: dict[int, TEXType] = {}
+        # ENG-7: the host's playhead for the current cook. Set per-execute; declared here
+        # so a direct _create_builtins caller (tests, tex_memory's cache sweep) never
+        # trips over a missing attribute on a fresh Interpreter.
+        self.time_context: dict | None = None
         self.functions: dict[str, callable] = self._get_stdlib()
         # Hoisted binding-access functions — read on every @A[x,y] / @A(u,v)
         self._fn_fetch = self.functions["fetch"]
@@ -200,6 +204,7 @@ class Interpreter:
         used_builtins: frozenset[str] | None = None,
         source: str = "",
         tile: tuple[int, int] | None = None,
+        time_context: dict | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Execute a TEX program.
@@ -230,7 +235,7 @@ class Interpreter:
             return self._execute_inner(program, bindings, type_map, device,
                                        latent_channel_count, output_names,
                                        precision, used_builtins=used_builtins,
-                                       tile=tile)
+                                       tile=tile, time_context=time_context)
 
 
 
@@ -256,6 +261,7 @@ class Interpreter:
         precision: str = "fp32",
         used_builtins: frozenset[str] | None = None,
         tile: tuple[int, int] | None = None,
+        time_context: dict | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         # Canonicalize an index-less "cuda" so cache keys ("cuda" vs "cuda:0")
@@ -267,6 +273,7 @@ class Interpreter:
         self.type_map = type_map
         self.latent_channel_count = latent_channel_count
         self._dtype = self._PRECISION_DTYPES.get(precision, torch.float32)
+        self.time_context = time_context   # ENG-7: host playhead for THIS cook (or None)
         self.env = {}
         self.bindings = {}
         self._array_meta = {}
@@ -414,6 +421,7 @@ class Interpreter:
         if hit is not None:
             self._builtins_lru.move_to_end(cache_key)
             self.env.update(hit)
+            self._set_time_builtins(used)   # ENG-7: never cached — see _TIME_BUILTIN_NAMES
             return
 
         # M-3: coordinate/spatial builtins are ALWAYS fp32 (never self._dtype).
@@ -478,9 +486,55 @@ class Interpreter:
         # Store only builtin tensors in cache (not user variables). cache_key is a
         # fresh key here (we returned above on a hit), so the insert already lands
         # MRU — no move_to_end needed (mirrors compiled._env_cached).
-        self._builtins_lru[cache_key] = {k: v for k, v in self.env.items() if k in _BUILTIN_NAMES}
+        # ENG-7: _CACHEABLE_BUILTIN_NAMES, not _BUILTIN_NAMES — the host-time builtins are
+        # not a function of this key. ORDER IS LOAD-BEARING: the store must stay ABOVE
+        # `_set_time_builtins`, so a playhead is never in `env` when the entry is taken.
+        # (The filter is the belt to that braces — see _CACHEABLE_BUILTIN_NAMES.)
+        self._builtins_lru[cache_key] = {k: v for k, v in self.env.items()
+                                         if k in _CACHEABLE_BUILTIN_NAMES}
         while len(self._builtins_lru) > _BUILTINS_LRU_MAX:
             self._builtins_lru.popitem(last=False)
+        self._set_time_builtins(used)
+
+    def _set_time_builtins(self, used: frozenset[str]) -> None:
+        """ENG-7: write the host-time builtins fresh for THIS cook.
+
+        Deliberately outside the LRU (see _TIME_BUILTIN_NAMES): their value comes from the
+        host's playhead, not from the cache key, so they must be rewritten on the hit path
+        too. Cheap enough that not caching them costs nothing measurable — three scalar
+        tensors, only for the names the program actually reads.
+
+        Forced fp32: these are TIMELINE coordinates, not image data, and the builtin's own
+        value should not be lossy (fp16 holds integers exactly only to 2048, so a raw fp16
+        `frame` would read 2049 as 2048 and round every later frame to even — a 24fps
+        two-hour timeline is ~172k frames).
+
+        HONEST LIMIT — fp32 here does NOT make `@A.rgb * frame` exact under fp16. These are
+        0-dim tensors, and torch's promotion treats a 0-dim operand as a scalar that does
+        not lift the result dtype: `fp16_image * fp32_scalar -> fp16`, so the 2049 rounds
+        back to 2048 at the multiply. `fi` genuinely does escape this, but not for the
+        reason it looks: it is `[B,1,1]` — DIMENSIONED — and a dimensioned fp32 operand does
+        promote. So the "same rule as fi" reading of invariant #4 is wrong here, and an
+        earlier version of this comment claimed it.
+
+        What actually protects users is the gate, not this line: `frame`/`time` are
+        registered in precision_policy._BUILTIN_MAG at _FP16_MAX, so the C1 amplification
+        gate always declines a program that mixes a playhead into image lineage, and
+        `precision="auto"` never reaches fp16 for one. Expert `precision="fp16"` has no
+        gate by definition ("no safety net" — AGENTS.md invariant #10), and there the
+        multiply is fp16 like everything else. Making these dimensioned to force promotion
+        was considered and rejected: `fi`'s `[B,1,1]` broadcasts correctly against a
+        `[B,H,W]` mask but mis-aligns against a `[B,H,W,C]` image, so the shape that saves
+        `fi` is not one these can borrow."""
+        # A host with no timeline (ComfyUI's default) passes nothing; every name then
+        # falls to the .get() default below. Spelling that as a {name: 0.0} constant
+        # would be a second copy of _TIME_BUILTIN_NAMES, wrong-but-harmless the day a
+        # fourth one is added — the worst kind of stale.
+        tc = self.time_context or {}
+        for name in _TIME_BUILTIN_NAMES:
+            if name in used:
+                self.env[name] = torch.scalar_tensor(
+                    float(tc.get(name, 0.0)), dtype=torch.float32, device=self.device)
 
     # -- Statement execution --------------------------------------------
 
@@ -1966,8 +2020,60 @@ class Interpreter:
 
 # -- AST scanning for lazy builtins ------------------------------------
 
+# ENG-7 (v0.22): the HOST TIME context. `fi`/`fn` are batch-relative (where am I in this
+# tensor); these are timeline-absolute (where is the host's playhead). ComfyUI has no
+# playhead, so its adapter feeds 0 / a wired INT; an engine host feeds the real one.
+#
+# They are BUILTINS, deliberately, not $params: a $param is part of the tex_lazy memo key
+# and the compile fingerprint, so an animating value would mint a new key every frame and
+# churn both (roadmap ENG-7). As builtins they are pure per-cook VALUES — the program's
+# identity does not move when the playhead does.
+#
+# They are also the first builtins whose value is NOT derived from the binding shapes.
+# That single fact breaks an assumption in FIVE places, because everything between a
+# playhead and a pixel is keyed on — or re-derived from — things that do not move when
+# the playhead does. Each had to be taught separately, and each fails identically: the
+# cook SUCCEEDS and the animation sits still. There is no error to notice.
+#   * this module's builtins LRU (LAT-4) keys on the spatial config -> `_set_time_builtins`
+#     rewrites them every cook, on the hit path too.
+#   * codegen caches per program fingerprint (a closure + `_env_cached`) -> codegen
+#     declines these programs outright (codegen.try_compile).
+#   * a captured CUDA graph replays the tensor it captured -> graphed._capturable bars them.
+#   * ComfyUI's own result cache keys on `fingerprint_inputs` -> tex_node hashes `_tex_time`.
+#   * M-4 strip tiling re-enters execute() per strip, and the playhead is per-execute
+#     state -> tex_memory.run_tiled forwards `time_context` to every strip.
+#   * `compiled._plain_execute` is where a codegen-DECLINED program actually lands: the
+#     decline happens inside execute_compiled / run_auto / _codegen_only_execute, which
+#     RETURN rather than raise, so the engine's `_interp_fallback` never sees them.
+#   * `run_auto`'s internal codegen closure is a third route to the same place.
+#
+# Only the first four were found by design. Tiling came from review; the last two from a
+# bug hunt — and one of them froze the playhead on the SHIPPED DEFAULT path (an exact
+# stencil at compile_mode="none"), which is to say the design was wrong about where a
+# declined program goes. The lesson is the shape of the mistake, not the count: a bar is
+# worth nothing unless the path it forces you onto is itself checked, END TO END, by
+# cooking and looking at the pixel. `test_eng7_time_barred_from_frozen_tiers` now does
+# that on all six tier routes; the unit assertions it started as proved only that the bar
+# existed. If a seventh route appears it will look like none of these either — the
+# question to ask is "does this re-enter execute(), or reuse anything keyed by the
+# fingerprint?", and then to go and cook one.
+_TIME_BUILTIN_NAMES = frozenset({"frame", "fps", "time"})
+
 # Names that are built-in variables (not user-defined)
-_BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", "fn", "PI", "TAU", "E", "ic"})
+_BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", "fn",
+                            "PI", "TAU", "E", "ic"}) | _TIME_BUILTIN_NAMES
+
+# Builtins that may live in the cross-cook LRU: everything whose value is a function of
+# the cache key (spatial shape / device / dtype / latent channels / tile).
+#
+# Honest scope, because the obvious reading is wrong: this filter is NOT what keeps the
+# playhead fresh — `_set_time_builtins` running on both paths is, and the LRU store
+# happens before it, so `env` holds no playhead to capture at store time either way.
+# What the filter buys is that the guarantee stops depending on the ORDER of those two
+# statements. Reorder them without it and every later cook at the same resolution
+# silently replays a stale playhead; with it, the entry simply never holds one. Cheap
+# insurance against a silent-wrong class, and pinned by test_eng7_time_builtins_advance.
+_CACHEABLE_BUILTIN_NAMES = _BUILTIN_NAMES - _TIME_BUILTIN_NAMES
 
 
 def _collect_identifiers(program: Program) -> frozenset[str]:

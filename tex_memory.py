@@ -88,21 +88,21 @@ def _array_element_floats(decl: ArrayDecl) -> int:
     return t.channels if getattr(t, "is_vector", False) else 1
 
 
-def estimate_peak_bytes(program, spatial_shape, dtype_bytes: int = 4) -> int:
-    """Estimate a cook's peak transient bytes (M-1).
+# LAT-2: the four results of the AST walk below (has_loop_sample, has_mip, pointwise,
+# array_floats) are a STATIC, value-independent property of the program — exactly like
+# is_tile_safe / should_stencil_route — so memoize them on the same cook fingerprint those
+# two key on. Only the trailing spatial/dtype arithmetic is per-call. On a default CUDA cook
+# the walk ran up to twice/cook (once in _preflight_memory, once in _tile_plan); this makes
+# it once per PROGRAM. Mirrors _tile_safe_memo exactly, cap included.
+_PEAK_STATIC_MEMO_MAX = 256
+_peak_static_memo: "OrderedDict[str, tuple]" = OrderedDict()
 
-    Base unit is a [B,H,W,4] tensor. K scales the live-temp count: K=4 when a
-    sample-family call appears inside a loop (measured godrays ~3.75), K=1 for a
-    pointwise program, K=1.5 otherwise. Added terms: the static ArrayDecl bytes
-    (a `vec4 arr[25]` at 2048² is ~1.6 GB — a ~17x underestimate without it) and
-    ~1.33x a frame per cold mip pyramid when sample_mip-family calls are present.
-    """
-    if not spatial_shape:
-        return 0
-    B, H, W = spatial_shape
-    px = B * H * W
-    frame4 = px * 4 * dtype_bytes  # a [B,H,W,4] tensor
 
+def _estimate_peak_statics(program) -> tuple:
+    """The value-independent results of estimate_peak_bytes's AST walk:
+    `(has_loop_sample, has_mip, pointwise, array_floats)`. A pure function of the program
+    AST — nothing here depends on spatial_shape or dtype_bytes (those enter only in the
+    per-call arithmetic estimate_peak_bytes does afterwards)."""
     has_loop_sample = False
     has_mip = False
     pointwise = True
@@ -131,6 +131,52 @@ def estimate_peak_bytes(program, spatial_shape, dtype_bytes: int = 4) -> int:
         child_depth = depth + 1 if cls in (ForLoop, WhileLoop) else depth
         for ch in _iter_children(node):
             stack.append((ch, child_depth))
+
+    return has_loop_sample, has_mip, pointwise, array_floats
+
+
+def _estimate_peak_statics_cached(program, fingerprint) -> tuple:
+    """`_estimate_peak_statics(program)` memoized per cook fingerprint (LAT-2). `fingerprint=
+    None` (a fused chain, whose AST is spliced per-cook) falls through to the uncached walk —
+    identical posture to `is_tile_safe_cached`. Stored values are always a 4-tuple, so a
+    `.get() is None` unambiguously means 'absent'."""
+    if fingerprint is None:
+        return _estimate_peak_statics(program)
+    v = _peak_static_memo.get(fingerprint)
+    if v is None:
+        v = _estimate_peak_statics(program)
+        _peak_static_memo[fingerprint] = v
+        while len(_peak_static_memo) > _PEAK_STATIC_MEMO_MAX:
+            _peak_static_memo.popitem(last=False)
+    else:
+        _peak_static_memo.move_to_end(fingerprint)
+    return v
+
+
+def estimate_peak_bytes(program, spatial_shape, dtype_bytes: int = 4,
+                        fingerprint=None) -> int:
+    """Estimate a cook's peak transient bytes (M-1).
+
+    Base unit is a [B,H,W,4] tensor. K scales the live-temp count: K=4 when a
+    sample-family call appears inside a loop (measured godrays ~3.75), K=1 for a
+    pointwise program, K=1.5 otherwise. Added terms: the static ArrayDecl bytes
+    (a `vec4 arr[25]` at 2048² is ~1.6 GB — a ~17x underestimate without it) and
+    ~1.33x a frame per cold mip pyramid when sample_mip-family calls are present.
+
+    LAT-2: the AST walk that derives (has_loop_sample, has_mip, pointwise, array_floats) is
+    static per program, so it's memoized on `fingerprint` (None → uncached walk). Only the
+    spatial/dtype arithmetic below runs per call — which is why the two engine call sites
+    pass their OWN `dtype_bytes` (preflight 4; tile-plan post-auto 2 or 4). That difference
+    is intentional and must NOT be shared — only the walk is.
+    """
+    if not spatial_shape:
+        return 0
+    B, H, W = spatial_shape
+    px = B * H * W
+    frame4 = px * 4 * dtype_bytes  # a [B,H,W,4] tensor
+
+    has_loop_sample, has_mip, pointwise, array_floats = \
+        _estimate_peak_statics_cached(program, fingerprint)
 
     k = 4.0 if has_loop_sample else (1.0 if pointwise else 1.5)
     est = int(k * frame4)
@@ -292,6 +338,25 @@ _last_trim_px: dict = {}
 _total_mem_cache: dict = {}
 
 
+def device_total_mem(device) -> int | None:
+    """LAT-2/MEM-2: total VRAM for a CUDA device, cached per index in the same
+    `_total_mem_cache` that `trim_reserved_pool` populates. None on CPU or if the device
+    query fails. Lets the M-1 preflight size its skip-gate against total VRAM without paying
+    a per-cook driver query (get_device_properties is hit once per device, then cached)."""
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type != "cuda":
+        return None
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    total = _total_mem_cache.get(idx)
+    if total is None:
+        try:
+            total = torch.cuda.get_device_properties(idx).total_memory
+        except Exception:
+            return None
+        _total_mem_cache[idx] = total
+    return total
+
+
 def trim_reserved_pool(device, spatial_px: int = 0) -> None:
     """MEM-2: return stranded reserved VRAM after a big->small cook downshift. When the
     caching allocator holds far more reserved than is live (measured: a 512->4096->512
@@ -339,17 +404,22 @@ def shared_tile_height(bindings) -> int | None:
 
 
 def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
-              output_names, used_builtins, precision, n_strips: int) -> dict:
+              output_names, used_builtins, precision, n_strips: int,
+              time_context: dict | None = None) -> dict:
     """M-4: execute a tile-safe program in `n_strips` horizontal strips, keeping
     peak transient to ~1/n_strips of the full-image cook. Spatial bindings are
     narrowed (zero-copy views); outputs are preallocated once and strips copy_'d
     in (avoids a full-size torch.cat transient). Coordinates stay seam-exact via
-    the interpreter's tile=(y0, H_total)."""
+    the interpreter's tile=(y0, H_total).
+
+    `time_context` (ENG-7) must be forwarded to every strip: the interpreter reads the
+    playhead off per-execute state, so a strip cooked without it silently reads zeros —
+    a frozen animation on exactly the big cooks that need tiling."""
     def _untiled():
         return interp.execute(program, bindings, type_map, device=device,
                               latent_channel_count=latent_channel_count,
                               output_names=output_names, used_builtins=used_builtins,
-                              precision=precision)
+                              precision=precision, time_context=time_context)
 
     # M-4 safety: tiling narrows dim 1 (the image HEIGHT for [B,H,W,C] IMAGE /
     # [B,H,W] MASK). Refuse — and cook untiled — when that axis isn't a shared
@@ -377,7 +447,8 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
         res = interp.execute(program, strip_bindings, type_map, device=device,
                              latent_channel_count=latent_channel_count,
                              output_names=output_names, used_builtins=used_builtins,
-                             precision=precision, tile=(y0, H_total))
+                             precision=precision, tile=(y0, H_total),
+                             time_context=time_context)
         for name, strip_out in res.items():
             if isinstance(strip_out, torch.Tensor) and strip_out.dim() >= 3:
                 buf = outputs.get(name)
@@ -418,7 +489,11 @@ def free_tensor_caches() -> None:
     except Exception:
         pass
     try:
-        from .tex_node import _get_interpreter
+        # ENG-1: the interpreter singleton is the ENGINE's, not the node's. This moves
+        # the documented `tex_node ↔ tex_memory` cycle to `tex_engine ↔ tex_memory` —
+        # it does NOT remove it (tex_engine still calls back into tex_memory for
+        # run_tiled / enforce_cache_budget). Still function-local, still load-bearing.
+        from .tex_engine import _get_interpreter
         interp = _get_interpreter()
         interp._literal_cache.clear()
         interp._builtins_lru.clear()   # LAT-4: coordinate-builtin env LRU

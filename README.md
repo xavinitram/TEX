@@ -166,8 +166,9 @@ while (val < 100.0) { val = val * 2.0; }
 | `u`, `v` | Normalized coordinates (0.0 – 1.0) |
 | `iw`, `ih` | Image dimensions |
 | `px`, `py` | Pixel size in UV space (`1/iw`, `1/ih`) |
-| `fi`, `fn` | Frame index / frame count |
+| `fi`, `fn` | Frame index / frame count **within the image batch** |
 | `ic` | Latent channel count (0 for images) |
+| `frame`, `fps`, `time` | The **host timeline** (v0.22). ComfyUI has no playhead, so these read `0` there — use `fi`/`fn` for batch position. A standalone host feeds its own. Reserved names. |
 | `PI`, `TAU`, `E` | Math constants (`TAU` = 2·PI) |
 
 ### Standard Library (144 functions)
@@ -236,7 +237,7 @@ The `examples/` directory contains 116 ready-to-use snippets:
 
 **1×1 output with no inputs:** Procedural code without image inputs produces 1×1 because output resolution comes from connected inputs. Connect an image to set the size.
 
-**Variable `v` conflict:** The built-in `v` (normalized y-coordinate) is always defined. Use `val` or `value` instead. Same for `u`, `ix`, `iy`, `iw`, `ih`, `px`, `py`, `fi`, `fn`, `ic`, `PI`, `TAU`, `E`.
+**Variable `v` conflict:** The built-in `v` (normalized y-coordinate) is always defined. Use `val` or `value` instead. Same for `u`, `ix`, `iy`, `iw`, `ih`, `px`, `py`, `fi`, `fn`, `ic`, `PI`, `TAU`, `E` — and, **new in v0.22**, `frame`, `fps` and `time` (the host timeline). If you have an older program that declares `float time = ...;`, rename the variable. `$time` — the *parameter* — is unaffected: the `$` sigil keeps the two apart.
 
 **torch.compile on Windows:** Install Visual Studio Build Tools with "Desktop development with C++" for CPU `inductor`. For **CUDA** `inductor` you also need Triton — on Windows, `pip install "triton-windows<3.7"` (match your torch version; TEX shows the exact pin when it detects the gap). The default `none` mode works everywhere; `cuda_graph` mode needs neither.
 

@@ -698,7 +698,7 @@ touching the frontend. FUS-0 ships as **v0.20.1** (hotfix, in flight).
 |---------|-------|-------|-------------|
 | v0.21.0 | **Fuse the graph** — fusion real on internally-branching regions | FUS-1, FUS-3, FUS-2 (mechanism), ~~LAT-1a~~ (deferred: compile is lazy), LAT-3, LAT-4, CACHE-0, ENG-8, ENG-10 (doc) | `tex_runtime/xfer.py` |
 | v0.21.1 | **Multi-injection** — an external producer may feed >1 region member (`Load → [blur, sharpen] → merge`), the canonical comp split v0.21 leaves unfused | FUS-1b (source spec becomes a list: splicer + JS transport), FUS-1c (see below) | — |
-| v0.22.0 | **The engine seam** — the cook engine stops being a ComfyUI classmethod | ENG-1, LAT-2, ENG-2, ENG-3, ENG-4, ENG-5, ENG-7, SCHED-1 | `tex_engine.py` |
+| v0.22.0 | **The engine seam** — the cook engine stops being a ComfyUI classmethod | ENG-1, ~~LAT-2~~ (deferred: measured at 2% of a cook; see below), ENG-2, ENG-3, ENG-4, ENG-5, ENG-7, SCHED-1 | `tex_engine.py` |
 | v0.23.0 | **Authoring** — the language grows its tool-era surface | LANG-1, LANG-2, LANG-3, LANG-4, LANG-5, ENG-6, ENG-9, ROI-1, LAT-1b | — (LANGUAGE.md) |
 | v0.24.0 | **See less, cook less** — spatial laziness | ROI-2, ROI-3 (flagged), ROI-4 (ship gate), ROI-6 | `tex_roi.py` |
 | v0.25.0 | **Remember frames** — results become first-class | ENG-12, CACHE-1, CACHE-2, CACHE-3, CACHE-4 | `tex_results.py` |
@@ -745,10 +745,54 @@ Per-release notes:
   - *Multi-GPU*: `xfer`'s `_MODEL` is not device-keyed, so a second GPU with different
     PCIe characteristics would read the first one's fit.
 - **v0.22.0** is deliberately *one big mechanical move plus small seams*: ENG-1 is
-  the release. LAT-2 rides it (PreparedProgram builds on the freshly-moved
-  ExecContext seam — doing them together avoids moving the same code twice). Exit:
-  the S-1 import-blocker suite green, `tex run` rerouted through `engine.cook`,
-  benchmark strictly neutral (invariant #7 — a refactor release must be invisible).
+  the release. Exit: the S-1 import-blocker suite green, `tex run` rerouted through
+  `engine.cook`, benchmark strictly neutral (invariant #7 — a refactor release must be
+  invisible). **All met.** ENG-1 measured at +1.3 µs/cook (O(1), +0.19% at 1024² CUDA)
+  and the whole-suite PASS set is identical to v0.21.0's.
+  - **LAT-2 was DEFERRED on measurement, and the number re-cuts the item.** The plan was
+    for LAT-2 to ride ENG-1 (PreparedProgram building on the freshly-moved ExecContext
+    seam). Measured after the move, on a 256² CUDA cook (263 µs): `prepare()` is 66.3 µs,
+    of which **the M-1 preflight's `get_free_memory` is 61.0 µs — 92%** — and everything
+    LAT-2 proposed to cache is **5.27 µs, 2.0% of the cook**. So LAT-2 would mint a new
+    (fingerprint × binding-signature × device × precision) cache — the silent-staleness
+    class ENG-7 had to defend against in four separate places — to chase 2%, standing
+    next to a 61 µs query it doesn't touch. Not measured, so not claimed: the compile
+    tiers' per-cook env/capture-key building (LAT-2's other half), which sits off the
+    default path invariant #7 governs. Re-open LAT-2 only with a measurement showing the
+    scans matter on a path someone actually uses.
+  - **LAT-5 (S/M, NEW — the target LAT-2 was aiming past).** The M-1 memory preflight
+    queries free VRAM on *every* CUDA cook, and that query is 92% of `prepare()`
+    (ComfyUI's own `get_free_memory` ≈ 44–61 µs; TEX's own probe is ~8 µs since ENG-2).
+    **The 61 µs above still undercounts the shipped path, and the review that caught it is
+    the reason this item exists at its current size:** `_tile_plan` independently bought a
+    *second* free-memory reading in `run()`, microseconds after `prepare()`'s, so a default
+    CUDA cook of a tile-safe program paid **2 × ~68 µs = ~42% of a 345 µs 256² cook**
+    (independently re-measured at 48.3% by stubbing the query). v0.22 fixed the redundancy
+    — the plan carries the preflight's reading and `_tile_plan` reuses it, guarded by a
+    `preflight_freed` flag because asking the host to unload *raises* true free and makes
+    the number stale-low. Measured after: `get_free_memory` 2 → 1 per cook.
+    Do NOT extend that to the *estimate*, which looks like the same redundancy and is not:
+    the two sites pass different `dtype_bytes` (the preflight runs before `auto` resolves,
+    so it passes 4; `_tile_plan` passes 2 once auto→fp16), and reusing it hands `_tile_plan`
+    a 2× inflated peak that over-tiles precisely the cooks `auto` accepted. It is ~6% of
+    the cost anyway.
+    What remains for LAT-5 is the *last* query. It is live state, so it cannot be memoized
+    — the lever is *skipping* it: the estimate is usually orders under free VRAM, and the
+    query only decides whether to ask the host to unload models. A cheap "obviously fits"
+    pre-check (against a cached device total, say) would drop it from the interactive path
+    entirely. Needs its own design note: the failure mode of skipping wrongly is an OOM a
+    preflight would have prevented, so the cheap check must be conservative in the right
+    direction. Scope honestly: this is CPU-side latency on a launch-bound async cook — at
+    2048² real GPU work dominates and the fixed cost falls to ~7%, so the win concentrates
+    at ≤1024², which is exactly the interactive/proxy path (and the small animated cooks
+    ENG-7 just enabled).
+  - **ENG-4's split is worth re-cutting before LANG-2 lands** (raised by the v0.22
+    review). This doc put `TEXCompileError` at *tex_api*, but `tex_node` and `tex_cli`
+    each catch the raw per-phase set independently, so three modules now know that tuple
+    — and `tex_engine.cook`, the advertised host-agnostic entry, still raises raw
+    internal compiler types. The class was landed in `tex_compiler/diagnostics.py`
+    (shared) precisely so the *raiser* can move down to the engine later without the type
+    moving. Decide in v0.23, when LANG-2's `check()` gives the second consumer.
 - **v0.23.0** carries ROI-1 (pure registry metadata, zero behavior change) so
   v0.24 starts on a settled substrate, and LAT-1b (async graph capture) as its own
   mini-design now that the engine seam exists. Exit: PM-4 dry-run (compat corpus

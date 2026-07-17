@@ -260,6 +260,33 @@ _C1_MUST_DECLINE = [
     "float amp(float x){ return x*50.0; } @OUT = vec4(vec3(amp(@A.r)), 1.0);",
     "float amp(float x){ return x*50.0; } @OUT = vec4(vec3(sin(amp(@A.r))), 1.0);",
     "float g(vec3 c){return dot(c,vec3(0.3,0.6,0.1));} @OUT=vec4(vec3(g(@A.rgb)*50.0),1.0);",
+    # F2 (v0.22) — the ZERO-ARG half of F1. Every row above carries its image through an
+    # ARGUMENT, which is the only thing F1 inspected; a call with no arguments has no
+    # interface to inspect, and `_gm` scores an unknown call FROM its args, so `default=0.0`
+    # / `default=1.0` hand it gain 0 and magnitude 1 no matter what the body assembled.
+    # Each row here is the SAME MATH as a row that is already correctly declined — inline,
+    # or through an argument — and was shipping fp16 purely because of the wrapper.
+    # Measured maxdiff on CUDA at 2048², all pixels FINITE (the C2 net cannot see these):
+    "float f(){ return frame; } @OUT = vec4(@A.rgb * f(), 1.0);",                    # 3.2163 @frame=5000
+    "float g(){ return frame; } @OUT=vec4(vec3(sin(@A.r*g())),1.0);",                # playhead via wrapper
+    "float f(){ return time; } @OUT = vec4(@A.rgb * f(), 1.0);",                     # time, not just frame
+    "float f(){ return fps; } @OUT = vec4(@A.rgb * f(), 1.0);",
+    "float g(){ return iw; } @OUT=vec4(vec3(sin(@A.r*g())),1.0);",                   # cf. the inline iw row
+    "float ar(){ return iw/ih; } @OUT=vec4(@A.rgb*ar(),1.0);",                       # aspect wrapper
+    "float nx(){ return ix/iw; } @OUT=vec4(@A.rgb*nx(),1.0);",                       # normalized-coord wrapper
+    "float f(float x){ return x*frame; } @OUT=vec4(@A.rgb*f(0.5),1.0);",             # args, but NON-image
+    "float f(){ return @A.r*50.0; } @OUT=vec4(vec3(f()),1.0);",                      # 0.0278 (7x bar)
+    "float f(){ return @A.r*@A.r*40.0; } @OUT=vec4(vec3(f()),1.0);",                 # 0.0440 (11x bar)
+    "float f(){ float y = @A.r; return y*50.0; } @OUT=vec4(vec3(f()),1.0);",         # lineage via a body local
+    "float f(float k){ return @A.r*k*50.0; } @OUT=vec4(vec3(f(1.0)),1.0);",          # image from BODY, not arg
+    # TRANSITIVE: the magnitude is two and three user-fn hops from the call site. A
+    # body-scan that does not follow calls reads f's body, sees only `g()`, and accepts.
+    "float g(){return frame;} float f(){return g();} @OUT=vec4(vec3(sin(@A.r*f())),1.0);",
+    "float h(){return frame;} float g(){return h();} float f(){return g();} @OUT=vec4(vec3(sin(@A.r*f())),1.0);",
+    # RECURSION is legal in TEX (a shipped feature — examples/recursive_fractal.tex), so the
+    # call graph has real cycles. This row is a decline; it is also the row that HANGS the
+    # cook thread if the body-scan ever loses its `seen` guard.
+    "float f(){ return f()*frame; } @OUT=vec4(vec3(@A.r*f()),1.0);",
 ]
 # Smooth pointwise programs the gate MUST still accept (fp16) — the headline win region.
 _C1_MUST_ACCEPT = [
@@ -271,12 +298,43 @@ _C1_MUST_ACCEPT = [
     "@OUT=vec4(vec3(dot(@A.rgb, vec3(0.299,0.587,0.114))),1.0);",                    # luma
     "@OUT=vec4(vec3(length(@A.rgb)),1.0);",
     "@OUT=vec4(@A.rgb*1.5,1.0);",                                                     # brightness
+    # F2's counter-canaries: the body rule is SCOPED, not a blanket "user fns -> fp32".
+    # `u`/`v`/`px`/`py` are deliberately absent from _BUILTIN_MAG (they are bounded [0,1]
+    # coordinates, and invariant #4 forces them fp32 anyway), so the vignette/gradient
+    # idiom survives the wrapper. If a future widening of _BUILTIN_MAG or of the body scan
+    # turns "defines a user function" into an automatic decline, these two go red first.
+    "float c(){ return u; } @OUT=vec4(@A.rgb*c(),1.0);",                              # coord builtin via fn
+    "float half(){ return 0.5; } @OUT=vec4(@A.rgb*half(),1.0);",                      # pure-constant fn
 ]
 
 
 def test_c1_amplification_gate(r: SubTestResult):
     print("\n--- C1 (doc 32): amplification/condition-number gate ---")
     fails = []
+    # F2's static walk follows user-fn calls, so its cost is the shape of the CALL GRAPH,
+    # not of the program text. `seen` bounds cycles completely (mutual recursion can't be
+    # spelled — callees resolve backward-only, E5001) but NOT depth: one Python frame per
+    # link meant a chain of ~995 DISTINCT defs raised RecursionError *inside a cook*, on a
+    # program that parses and typechecks fine. Capped at the interpreter's own
+    # MAX_CALL_DEPTH, so anything truncated is a chain it would refuse to run anyway.
+    # These must RESOLVE, not raise, and must not go exponential on a fan-out graph.
+    import time as _time
+    _deep = ("float f0(){ return frame; } "
+             + "".join(f"float f{i}(){{ return f{i-1}(); }} " for i in range(1, 2000))
+             + "@OUT=vec4(vec3(@A.r*f1999()),1.0);")
+    _fan = ("float g0(){ return frame; } "
+            + "".join(f"float g{i}(){{ return g{i-1}() + g{i-1}(); }} " for i in range(1, 27))
+            + "@OUT=vec4(vec3(@A.r*g26()),1.0);")
+    for _label, _src in (("2000-deep chain", _deep), ("2^26-path fan-out", _fan)):
+        _t0 = _time.perf_counter()
+        try:
+            if _resolve(_src)[0] != "fp32":
+                fails.append(f"{_label}: accepted fp16 through a user-fn chain")
+        except RecursionError:
+            fails.append(f"{_label}: the gate raised RecursionError — a cook would die on "
+                         f"a program that parses and typechecks")
+        if (_ms := (_time.perf_counter() - _t0) * 1e3) > 2000:
+            fails.append(f"{_label}: gate took {_ms:.0f} ms — the walk went superlinear")
     # (a) gate DECISION (CPU-fine): declines every measured hole, accepts the headline
     for code in _C1_MUST_DECLINE:
         if _resolve(code)[0] != "fp32":
@@ -351,7 +409,8 @@ def test_c2_finiteness_net_recovers(r: SubTestResult):
     # went non-finite (the gate's blind spot). The other C2 test only uses gate-DECLINED
     # programs, so the net returns early and never reaches the crash lines — this drives the
     # net's real recovery body: auto_fp16=True, eff_precision='fp16', a NON-finite output.
-    from TEX_Wrangle.tex_node import TEXWrangleNode as N, ExecContext
+    from TEX_Wrangle.tex_engine import ExecContext, _fp16_finiteness_net  # ENG-1: engine-side
+    from TEX_Wrangle.tex_node import TEXWrangleNode as N   # the node-path half of this test
     from TEX_Wrangle import tex_api
     prog = tex_api.compile("@OUT = vec4(@A.rgb, 1.0);", {"A": TEXType.VEC3, "OUT": TEXType.VEC4})
     ctx = ExecContext(program=prog.ast, bindings={"A": torch.rand(1, 8, 8, 3)},
@@ -359,7 +418,7 @@ def test_c2_finiteness_net_recovers(r: SubTestResult):
                       latent_channel_count=0, output_names=["OUT"],
                       used_builtins=prog.used_builtins, eff_precision="fp16", fp=None)
     try:
-        out = N._fp16_finiteness_net({"OUT": torch.tensor([float("inf")])}, True, ctx, "default")
+        out = _fp16_finiteness_net({"OUT": torch.tensor([float("inf")])}, True, ctx, "default")
     except Exception as e:
         r.fail("F1 crash", f"finiteness net raised {type(e).__name__}: {e} (the F1 NameError)")
         return

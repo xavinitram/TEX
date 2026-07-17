@@ -1,5 +1,9 @@
-# TEX cache (auto-generated at runtime)
+# TEX cache (auto-generated at runtime). The glob catches any variant a stray
+# TEX_CACHE_DIR or a direct `pytest` run (which skips run_all.py's scratch default)
+# might drop — e.g. tests/.tex_cache_test/ — so cook artifacts never reach a commit.
 .tex_cache/
+.tex_cache*/
+**/.tex_cache*/
 
 # Python bytecode
 __pycache__/

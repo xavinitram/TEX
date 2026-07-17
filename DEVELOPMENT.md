@@ -578,6 +578,38 @@ __init__.py                               tex_extension.js
 2. Add the filename stem to `_EXAMPLE_CATEGORIES` in `__init__.py` with a `"Category/Display Name"` value
 3. The snippet will appear automatically in the cascade menu under `Examples/Category/Display Name`
 
+## API stability tiers (ENG-5)
+
+TEX is embeddable (`tex_api`, `tex_engine`, `tex_cli` all run with ComfyUI absent), so
+some of its surface is other people's problem when it moves. This table says which.
+Everything in **Tier 1** has a canary test whose whole job is to fail when the shape
+changes — the point is not that these can never change, but that changing one is a
+decision someone makes on purpose, in a release note, rather than a rename that quietly
+breaks a host.
+
+| Tier | Surface | Contract | Pinned by |
+|------|---------|----------|-----------|
+| **1 — Public** | `tex_api.compile` / `execute` / `Program` field names | Names + shape are stable; additive only | `test_port2_program_shape`, `test_port2_facade` |
+| **1 — Public** | `tex_api.TEXCompileError` + `.diagnostics` (ENG-4) | The ONE exception type a host catches for a bad compile | `test_eng4_structured_compile_error` |
+| **1 — Public** | `TEXDiagnostic.to_dict()` key set | A de-facto frontend contract since v0.15 | `test_eng5_embedding_canaries` |
+| **1 — Public** | `tex_engine.cook` / `prepare` / `run`, `CookResult` fields (ENG-1) | The host-agnostic cook entry point | `test_eng1_engine_cooks_without_the_node` |
+| **1 — Public** | The `ui=` HUD payload (`tex_perf` / `tex_probes` keys) | Read by the shipped JS | `test_eng5_embedding_canaries` |
+| **1 — Public** | `HostServices` method set (PORT-1) | What a host must implement | `test_port1_host_services`, `test_eng5_embedding_canaries` |
+| **1 — Public** | GraphSpec (`_tex_chain`) + `GRAPHSPEC_SCHEMA` (SCHED-1) | Versioned; absent == 1; a newer schema is REFUSED, never guessed | `test_eng5_embedding_canaries` |
+| **1 — Public** | Egress profiles `comfy` / `engine` (ENG-3) | `comfy` is byte-identical, forever | `test_eng3_comfy_profile_canary` |
+| **2 — Semi** | TEX the language | Additive; new builtin/function names are RESERVED, so adding one is a minor breaking change — note it in the CHANGELOG (v0.22 reserved `frame`/`fps`/`time`) | the compat corpus (LANG-3, planned) |
+| **2 — Semi** | Error codes (E1xxx–E6xxx) | Codes are stable; message TEXT is not | `test_c3ux_error_codes_resolve` |
+| **3 — Internal** | Everything else — `tex_runtime.*`, `tex_compiler.*`, `tex_fusion` internals, `tex_engine._*` | No promise. Import at your own risk | — |
+
+**Fingerprints are NOT stable — never persist one.** `TEXCache.fingerprint` /
+`fused_fingerprint` are value-independent keys for TEX's own caches, deliberately derived
+from a mono-hash over the compiler sources (and the codegen-reuse env flag). They are
+*designed* to change when TEX changes: that is what invalidates stale compiled artifacts
+across an upgrade. A host that writes one to disk and expects a hit after upgrading TEX
+has stored a number whose whole purpose is to become different. Key your own storage on
+your own identity (the roadmap's CACHE-1 lineage key is the durable one); TEX's cache
+directory is TEX's business, and `TEX_CACHE_DIR` tells it where to live.
+
 ## Rejected design decisions (don't re-propose)
 
 Settled calls, kept here so they're not re-derived:

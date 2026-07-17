@@ -143,8 +143,7 @@ def test_xpu4_egress_ingest_roundtrip(r: SubTestResult):
 def test_f1_fused_compile_tiers(r: SubTestResult):
     print("\n--- F-1: fused chains route to the compile tiers (keyed by fused_fp) ---")
     try:
-        from TEX_Wrangle.tex_node import TEXWrangleNode
-        S = TEXWrangleNode.select_tier
+        from TEX_Wrangle.tex_engine import select_tier as S  # ENG-1: moved to the engine
         # Routing: a fused chain WITH a fingerprint takes the requested tier...
         assert S("torch_compile", "cpu", True, True) == "torch_compile"
         assert S("auto", "cuda:0", True, True) == "auto"
@@ -169,7 +168,7 @@ def test_f1_fused_compile_tiers(r: SubTestResult):
         img = torch.rand(1, 128, 128, 4, device=dev)
         C.clear_compiled_cache()
         got = C.execute_compiled(prog, {"A": img}, tm, dev, fused_fp)
-        ref = C._plain_execute(prog, {"A": img}, tm, dev)
+        ref = C._plain_execute(prog, {"A": img}, tm, dev, time_context=None)
         md = (got - ref).abs().max().item()
         assert md < 1e-5, f"fused-fp compiled cook diverged from interpreter: {md:.2e}"
         C.clear_compiled_cache()
@@ -208,24 +207,28 @@ def test_f1b_fused_node_path_reaches_compile_tier(r: SubTestResult):
         # either — so tier_trace can't distinguish them, but the dispatched tier can.
         # (F-1 exercises select_tier with a synthetic fp; that is exactly what let the
         # node gate hide — this drives the whole node so the gate can't be bypassed.)
+        # ENG-1 (v0.22): the dispatch moved to tex_engine, so the spy patches the
+        # engine's module-level _run_tier. Still driven through the whole NODE — that is
+        # the point of F-1b (the node gate is what hid the bug), only its callee moved.
         seen = {}
-        orig = TEXWrangleNode._run_tier.__func__
+        from TEX_Wrangle import tex_engine as _E
+        orig = _E._run_tier
 
-        def _spy(cls, ctx, tier_id):
+        def _spy(ctx, tier_id):
             seen.setdefault("tier_id", tier_id)
             seen["fused_chain"] = ctx.fused_chain
             seen["fused_fp"] = ctx.fused_fp
-            return orig(cls, ctx, tier_id)
+            return orig(ctx, tier_id)
 
         C.clear_compiled_cache()
-        TEXWrangleNode._run_tier = classmethod(_spy)
+        _E._run_tier = _spy
         try:
             result = TEXWrangleNode.execute(
                 code=terminal_code, _tex_chain=json.dumps(spec),
                 Y=img, amt=0.05, device="cpu", compile_mode="torch_compile",
             )
         finally:
-            TEXWrangleNode._run_tier = classmethod(orig)
+            _E._run_tier = orig
             C.clear_compiled_cache()
 
         assert seen.get("fused_chain") is True, "cook was not recognized as a fused chain"
@@ -261,15 +264,15 @@ def test_a2_env_cache_scatter_cow(r: SubTestResult):
         fp = TEXCache.fingerprint(code, bt)
         img = torch.rand(1, 8, 8, 4)
 
-        out1 = C._codegen_only_execute(prog, {"A": img}, tm, "cpu", fingerprint=fp)
-        ref = C._plain_execute(prog, {"A": img}, tm, "cpu")
+        out1 = C._codegen_only_execute(prog, {"A": img}, tm, "cpu", fingerprint=fp, time_context=None)
+        ref = C._plain_execute(prog, {"A": img}, tm, "cpu", time_context=None)
         assert torch.equal(out1, ref), "codegen scatter-through-alias diverged from interpreter"
         # The cached ix must be pristine: cook a pure '@OUT = ix' and compare.
         code2 = "@OUT = ix;"
         prog2, tm2, *_ = TEXCache().compile_tex(code2, bt)
         fp2 = TEXCache.fingerprint(code2, bt)
-        out2 = C._codegen_only_execute(prog2, {"A": img}, tm2, "cpu", fingerprint=fp2)
-        ref2 = C._plain_execute(prog2, {"A": img}, tm2, "cpu")  # interpreter = pristine oracle
+        out2 = C._codegen_only_execute(prog2, {"A": img}, tm2, "cpu", fingerprint=fp2, time_context=None)
+        ref2 = C._plain_execute(prog2, {"A": img}, tm2, "cpu", time_context=None)  # interpreter = pristine oracle
         assert torch.equal(out2, ref2), \
             "cached ix corrupted by a previous cook's scatter (COW guard broken)"
         assert float(out2.reshape(-1).max()) < 99.0, \
@@ -374,7 +377,7 @@ def test_g1_compile_demotion(r: SubTestResult):
         assert fp in C._compile_blacklist, "slow artifact not blacklisted"
         # And the next cook takes the honest interpreter path (values correct)
         out = C.execute_compiled(prog, {"A": img}, tm, "cpu", fp)
-        ref = C._plain_execute(prog, {"A": img}, tm, "cpu")
+        ref = C._plain_execute(prog, {"A": img}, tm, "cpu", time_context=None)
         assert torch.equal(out, ref), "post-demotion cook diverged from interpreter"
         C.clear_compiled_cache()
         r.ok(f"artifact at 1000ms vs interp demoted (ratio gate {C._DEMOTE_RATIO}x) + blacklisted")

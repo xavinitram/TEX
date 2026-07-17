@@ -5,6 +5,386 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-07-16
+
+**The engine seam** — the cook engine stops being a ComfyUI classmethod. This is a
+refactor release: it should be invisible from inside ComfyUI, and the interesting part
+is what it makes possible outside it.
+
+### Added
+
+- **ENG-1 — `tex_engine`, the host-agnostic cook engine.** Tier selection, the
+  interpreter fallbacks, strip tiling, the OOM ladder and the `precision="auto"` gate
+  were reachable only through `TEXWrangleNode.execute`, a ComfyUI v3 node classmethod —
+  so even `tex run`, the CLI whose job is proving TEX is host-agnostic, imported the node
+  to cook one frame. All of it now lives in `tex_engine`:
+  - `cook(code, bindings, **opts) -> CookResult` — the one-shot call, for a host with
+    nothing to marshal. Returns RAW tensors (no clamp / alpha-drop).
+  - `prepare(...) -> CookPlan` / `run(plan) -> CookResult` — the two-step. The split is
+    load-bearing, not stylistic: a `prepare` failure means *nothing cooked*, which is
+    what lets the node tell "this chain never spliced" from "a linked node failed
+    mid-cook" (the Q-4 stage attribution).
+  - `tex_node.execute` is now marshal-in → engine → marshal-out: **1207 → ~600 LOC**,
+    `execute()` **376 → 205 lines** (its budget ratchets 385 → 240 to hold that).
+  - `tex run` cooks through `engine.cook`. Byte-identical output, verified against the
+    node path across clamped / gray / alpha-bearing / MASK outputs.
+- **ENG-3 — egress profiles.** `comfy` (default) is the shipped conversion, byte-identical
+  and canary-pinned forever. `engine` is value-preserving: no clamp, alpha kept, channels
+  kept, fp32 BHWC — so scene-linear values survive a node hop. Host-set, never per-node;
+  a per-node toggle would let two TEX nodes disagree about what an IMAGE *is*.
+- **ENG-4 — `TEXCompileError(diagnostics=[TEXDiagnostic])`.** One public exception type
+  for a failed compile, instead of making an embedding host import four internal
+  per-phase errors. Raised by `tex_api.compile`; the node keeps its `TEX_DIAG:` suffix,
+  which the shipped JS parses. **This is a breaking change to `tex_api.compile` — see
+  below.**
+- **ENG-2 — a standalone host can see its own VRAM.** `NullHostServices.get_free_memory`
+  returned `None`, which disabled preflight, tiling and retry for every non-ComfyUI host:
+  the same 8K cook that tiled happily under ComfyUI just OOMed under `tex_api`. It now
+  measures the driver + allocator slack. Plus an engine-side OOM ladder (drop TEX's
+  caches → re-cook in strips), strictly additive: if it cannot recover it re-raises **the
+  original OOM**, so ComfyUI's own `unload_all_models` + retry still fires.
+- **ENG-7 — host time builtins `frame` / `fps` / `time`.** Fed per cook from the host's
+  playhead (`_tex_time` on the node; `time_context=` on the engine). Builtins, not
+  `$params` — a param is part of the lazy memo and the compile fingerprint, so an
+  animating value would churn both every frame.
+- **ENG-5 / SCHED-1 — the embedding contracts are pinned.** The `_tex_chain` payload is
+  now a schema-versioned **GraphSpec** (`GRAPHSPEC_SCHEMA = 1`; an absent field means a
+  pre-v0.22 emitter and reads as 1, so every saved workflow keeps working; a *newer*
+  schema is refused with an actionable message rather than mis-spliced). Canaries pin
+  `TEXDiagnostic.to_dict`, the `ui=` payload keys, `HostServices`' method set and the
+  GraphSpec. `DEVELOPMENT.md` gains an **API stability tiers** table and the rule that
+  fingerprints are deliberately unstable across versions — a host must never persist one.
+
+### Changed — BREAKING
+
+- **`frame`, `fps` and `time` are now reserved built-in names** (ENG-7). A program that
+  declares its own `float time = ...;` will fail to compile; rename the variable. The
+  error names the collision and the fix. `$time` — the *parameter* — is unaffected: the
+  `$` sigil keeps the namespaces apart, so `examples/caustics.tex` and anything like it
+  still works. The README's reserved list and the editor's help panel name all three.
+
+- **`tex_api.compile` now raises `TEXCompileError`, not the per-phase types** (ENG-4).
+  v0.21's docstring told hosts to catch `LexerError` / `ParseError` / `TypeCheckError`;
+  `TEXCompileError` subclasses only `Exception`, so that tuple silently stops catching —
+  the failure is an uncaught exception, not a wrong result, but it is a real break on a
+  Tier-1 Public surface and it is filed here rather than under "Added" because that is
+  what it is. Our own `tex run` needed exactly this fix, which is how we found it.
+
+  ```python
+  # before (v0.21)
+  try:    prog = tex_api.compile(src, types)
+  except (LexerError, ParseError, TypeCheckError) as e: ...
+
+  # after (v0.22) — one type, and the structured payload comes with it
+  try:    prog = tex_api.compile(src, types)
+  except tex_api.TEXCompileError as e:
+      for d in e.diagnostics: show(d.to_dict())
+  ```
+
+  A shared base class was considered and rejected: for the old tuple to keep working,
+  `TEXCompileError` would have to subclass all three phase errors, which would make the
+  type a lie about what it is. A clean break with a migration note beats an inheritance
+  graph nobody can read. `__cause__` is preserved, so the original error is still there.
+
+### Fixed
+
+- **A weighted stencil tap silently computed the wrong answer on the shipped default
+  path** (pre-existing since v0.17.0, `649c195`). `acc = acc + @A[ix+dx, iy+dy] * 0.5`
+  lowered to an **unweighted** `avg_pool2d`: the `* 0.5` never reached the emitted
+  kernel, so the result was exactly 2x, with shapes intact and no diagnostic. maxdiff
+  0.42 against invariant #2's 1e-5 — ~42,000x over — at `compile_mode="none"`, no
+  opt-in required.
+  The matcher did a **search where it needed a match**. `_is_sum_accum` documents itself
+  as matching `acc = acc + fetch(...)`, but resolved the tap with `_find_fetch_call`,
+  which recursed into `BinOp` and returned a fetch found *anywhere* in the subtree — so
+  a composed term matched as if the accumulated term *were* the bare tap it contained.
+  The pool lowerings (`avg_pool2d` / `max_pool2d` / `unfold`) can only express an
+  unweighted neighbourhood, so the tap must BE the whole term. It is now `_match_tap`:
+  strict, no `BinOp` descent, and no `ChannelAccess` descent either (every caller peels
+  the swizzle itself to record `channels`; a residual one meant the swizzle sat
+  somewhere unattributable and was being dropped too). A composed tap now DECLINES the
+  route and runs on the interpreter — correct, just not accelerated. Lowering the weight
+  into the kernel is a separate, deliberate feature; the inline `conv2d` path already
+  does it and was never affected.
+  **All three matchers shared the helper, and all three were wrong.** `_is_minmax_accum`
+  dropped weights the same way — and worse: for `max(m, @A[...].bgr * 0.5)` the
+  `ChannelAccess` sits *under* the `BinOp`, so `channels` stayed `None` and codegen
+  corrupted channel **order** as well as magnitude. `_is_array_collect_assign` (the
+  shape behind `examples/median_filter.tex`) funnelled a `BinOp` into the search from
+  all three of its branches.
+- **The median gate accepted loop bodies it could not account for.** Box and min/max
+  refuse a body containing anything they did not match (`not has_unknown`); median did
+  not. Lowering REPLACES the whole loop nest, so an array-collect sitting beside any
+  other statement silently dropped that statement (maxdiff 1.29). This also gated the
+  fix above: while a weighted accumulator still (wrongly) matched, `accum_info` was set
+  and `not accum_info` kept median out — making the matcher strict *opened* the gate and
+  merely converted a box mis-lowering into a median one of the same magnitude. The two
+  ship together because neither is sufficient alone.
+- **Only one lowering may claim a loop.** Two accumulators of different kinds in one
+  body (`acc = acc + tap; m = max(m, tap);`) hit the box-then-minmax-then-median
+  preference order: box won, the nest was replaced, and `m` silently kept its init.
+  Detection now declines when more than one kind is present (two of the *same* kind
+  already did).
+- **A single-channel stencil tap came back one rank too high.** `_stencil_to_bchw`
+  slices one channel as `bchw[:, i:i+1]` — the pool ops need that axis to stay 4-D — so
+  permuting back gave `[B,H,W,1]` where the interpreter holds a `float` as `[B,H,W]`.
+  A plain `.r` box blur (no weight anywhere) returned rank-5 output or raised inside a
+  downstream `stack()`. Affected box, min/max **and** the inline `conv2d` emitter;
+  median was immune (it is built with `channels=None`). Multi-channel swizzles were
+  always right (`.rg` -> vec2, `.rgb` -> vec3), so only `len == 1` is squeezed.
+  This one was load-bearing in an unpleasant way: the `stack()` error it raised is what
+  *masked* the multi-accumulator bug above, by crashing codegen into a silent
+  interpreter fallback that produced the right answer by accident. Fixing the rank
+  unmasks the claim bug, which is why they land in the same release.
+- **TST-1 could not have caught any of this.** Its atom alphabet held no tap at all —
+  no `fetch`, no `sample`, no `@A[...]` — and the only loop it emitted was a flat
+  `0..n`, never the nested symmetric `-R..R` that `_try_extract_symmetric_range`
+  requires. Measured over 3000 generated programs: **0 stencil routes**. That is how a
+  default-path 2x error sat under 1866 green tests. The generator now emits stencil
+  nests (both tap spellings, box / min-max / array-collect, ~55% composed taps), and
+  folds the result into `@OUT` rather than leaving it to chance — a stencil whose atom
+  never reaches an output is dead code the parity check cannot see, which measured only
+  ~23% live. Same 3000 programs now: 762 carry a tap, 404 route, all three lowerings
+  exercised. Restoring the old matcher makes the fuzzer fail 26/300.
+  One known defect is deliberately *not* generated yet, because it would flag instead
+  of the tap grammar: a count variable in the outer loop (`count_var` collapses which
+  loop it lived in and is always emitted as `kH*kW`, so an outer counter is 3x low). It
+  is pre-existing, survives this release, and needs a semantics decision rather than a
+  mechanical fix. (The sibling seed defect that shipped beside it — a non-identity
+  accumulator seed — turned out to need no semantics decision at all and is now fixed;
+  see the next entry.)
+- **A non-identity accumulator seed was overwritten instead of accounted for.**
+  `_emit_box_stencil` and `_emit_minmax_stencil` replace the loop nest with a single
+  pool, then assigned that pool straight into the accumulator — discarding the value it
+  held at loop entry. But the interpreter runs `acc = acc + tap` / `m = max/min(m, tap)`
+  FROM that entry value, so any non-identity seed diverged on the shipped default path
+  (`compile_mode="none"`, no opt-in): `vec3 acc = vec3(0.5)` box came back low by the
+  seed (maxdiff 0.0556), and — worse, because min/max have **no finite identity** —
+  `vec3 m = vec3(0.0)` max/min over **signed** data (latents, the core domain) dropped
+  the seed's clamp entirely (maxdiff up to ~0.6). The two lowerings needed different
+  treatment, because their folds differ in kind:
+  - **min/max now fold** via `torch.maximum` / `torch.minimum` — the exact ops the
+    interpreter's `max()` / `min()` go through. A max/min fold is a *selection*, so it is
+    order-independent and stays **bit-exact for any seed**, including `+/-inf`, `NaN`, and
+    signed latents (verified on CPU and CUDA sm_120). min/max have no finite identity, so
+    folding is the only way to accelerate a seeded pool at all.
+  - **box-sum now declines a provably non-zero constant seed** instead of folding it.
+    `avg_pool2d` sums the taps in the interpreter's own left-to-right order, so a zero
+    seed is bit-exact *even at large magnitude*; but a non-identity additive seed folded
+    onto that sum sits at the opposite end of the accumulation from the interpreter's
+    seed-first left-fold, and the FP reassociation error there scales with `|seed|`
+    (measured: `vec3(100.0)` over `[0,1)` data → 2.3e-5, over the 1e-5 bound; ~1.5e-5 for
+    a seed comparable to latent-magnitude taps). So a provably non-zero constant seed
+    (`vec3(0.5)`, `vec3(1000.0)`) declines to the **bit-exact static unroll** (which
+    accumulates in the interpreter's order), matching how the weighted-tap fix already
+    declines what the pool cannot express exactly. A zero/default seed keeps the pool
+    (byte-identical bare-box output, no fast-path regression); a *runtime* seed
+    (undecidable at emit time) still folds — correct up to the same pool reassociation,
+    and strictly better than the old overwrite, which dropped the seed outright.
+  Pinned by `test_codegen_audit_fixes` (box seeded `0.5` and a large `1000.0` that reds
+  without the decline, the single-channel `[B,H,W,1]->[B,H,W]` squeeze, signed max/min
+  seeded `0.0`, min seeded `0.5` over a deterministic ramp, and a routing control that a
+  non-zero-constant box declines while a zero/default box and every seeded min/max lower).
+- Programs reading the new time builtins are declined by codegen and by CUDA-graph
+  capture, and run on the interpreter. Not a limitation for its own sake: everything
+  between a playhead and a pixel is keyed on something that does *not* move when the
+  playhead does (the codegen executor is a per-fingerprint closure; `_env_cached` and a
+  captured graph both replay the value they captured). Each would have failed the same
+  way — the cook succeeds and the animation sits still. Declining is the only variant
+  that cannot be silently wrong, and it costs nothing today, since ComfyUI has no
+  timeline and these read 0 there.
+  **Seven routes needed teaching, and only four were found by design.** M-4 strip tiling
+  re-enters the interpreter per strip (review); `compiled._plain_execute` is where a
+  declined program actually *lands* — the decline happens inside the tier and returns
+  rather than raising, so the engine's own fallback never sees it, which froze the
+  playhead at 0 on the **shipped default path** (an exact stencil at `compile_mode="none"`);
+  and `run_auto`'s internal codegen closure was a third. Both of the latter were found by
+  the pre-commit bug hunt — and an **eighth** was found by the release audit, after the
+  other seven were pinned: `execute_compiled`'s deep-loop branch (post-optimizer
+  `loop_depth > 2`, reachable at `compile_mode="torch_compile"` with e.g. a raymarcher or
+  an iterated fbm) handed off to `_codegen_only_execute` without the playhead, while both
+  of its siblings six lines away forwarded it. Measured: deep-nest at `compile_mode="none"`
+  → 0.9000, the same program at `"torch_compile"` → 0.0000, cook successful, no
+  diagnostic. The suite could not see it because the routing needs all of a deep nest, an
+  op count over the compile threshold, and trip counts over `_UNROLL_MAX_ITERS`, and the
+  existing rows had none of them: `simple` has no loops, and `stencil`'s two unroll away.
+  All nine routes are now cooked end-to-end by `test_eng7_time_barred_from_frozen_tiers`
+  (which also pins the deep nest's post-optimizer *shape*, so an unroller change cannot
+  quietly retire the coverage) — the old test only asserted that `try_compile` returned
+  `None`, which proved the bar existed but never that the path it forced you onto was
+  correct. `time_context` is now **keyword-only and required** on the two functions those
+  declines land on: `None` and "forgotten" are indistinguishable at the interpreter (both
+  read 0.0 and cook a still image), so a default could not be safe, and an omission is now
+  a `TypeError` at the call instead of a frozen playhead.
+- `frame`/`fps`/`time` are built in **fp32**, so the builtin's own value is exact (fp16
+  holds integers exactly only to 2048; frame 2049 read as 2048, and every later frame
+  rounded to even). **The first version of this note went further and was wrong**: it
+  claimed the fp32 made `@A.rgb * frame` exact under fp16 "exactly as it does for `fi`".
+  It does not. These are 0-dim tensors, and torch does not let a 0-dim operand lift the
+  result dtype — `fp16_image * fp32_scalar -> fp16`, so 2049 rounds back to 2048 at the
+  multiply. `fi` escapes only because it is `[B,1,1]`, i.e. DIMENSIONED, a shape these
+  cannot borrow (it mis-aligns against `[B,H,W,C]`). What protects users is the
+  amplification gate above, not this line; expert `precision="fp16"` has no gate by
+  definition, and there the multiply is fp16 like everything else.
+- **`precision="auto"` now knows the playhead exists.** ENG-7 added three builtins and
+  never registered them in the C1 amplification gate's magnitude table — and they are the
+  only *unbounded* ones in the language, where every other entry is capped by an image
+  dimension or a batch length. So `sin(@A.r * frame)` was ACCEPTED for fp16 while
+  `sin(@A.r * iw)`, the identical shape with a registered builtin, was correctly declined.
+  Measured on CUDA at 2048²: frame=500 shipped maxdiff **0.2443 — 63× the 3.9e-3 budget**;
+  frame=5000 shipped **2.0 (513×)**, every pixel finite so the C2 net never fired.
+  AGENTS.md invariant #10 is explicit — "Any accepted program exceeding 3.9e-3 is a gate
+  bug" — and this was one, new in v0.22, on a mode a user selects from a dropdown.
+  `frame`/`time` are now pinned at fp16's max (not an estimate of their magnitude, but a
+  statement that none can be assumed) and `fps` at 240. After: maxdiff **0.000000**.
+- **…and a zero-arg user function could still launder one straight past that gate** (F2).
+  Registering `frame`/`time` fixed the direct expression; wrapping it did not.
+  `float f(){ return frame; } @OUT = vec4(@A.rgb * f(), 1.0);` was ACCEPTED for fp16 and
+  shipped maxdiff **3.2163 at frame=5000 — 825× the 3.9e-3 budget**, every pixel finite, so
+  the C2 net never fired and the gate reported "gate-verified accurate (smooth, bounded
+  condition number)" while doing it. The mechanism is a `default=`: the gain pass scores an
+  unknown call FROM ITS ARGS (`max(..., default=0.0)` / `max(..., default=1.0)`), so a call
+  with *no* args is handed gain 0 and magnitude 1 whatever its body assembled. F1 had
+  declined user-fn calls since v0.19 and read as though it closed the class; it closed only
+  the half that arrives through the interface, and a zero-arg call has no interface. The
+  same hole was open for image lineage the whole time — `float f(){ return @A.r*50.0; }`
+  measured **0.0278 (7×)** and its squared twin **0.0440 (11×)** — so both halves are now
+  declined: any user-fn call whose ARGS carry image lineage (F1) *or* whose BODY reads image
+  lineage or a magnitude builtin (F2), followed transitively through calls. The walk is
+  cycle-guarded because TEX permits self-recursion (a shipped feature — an unguarded scan
+  would hang a cook on a program that merely parses) and depth-capped at the interpreter's
+  own `MAX_CALL_DEPTH`, so a chain too deep to model is one it would refuse to run anyway.
+  Deliberately as blunt as F1, and over-declining by the same rule #10 already states —
+  `float f(){ return @A.r*1.1; }` is fp16-safe at 0.0011 and is now fp32. Measured cost:
+  no shipped example changes verdict, no accepted-case test uses a user fn, and the A1-1
+  fuzzer's fp16-taken count is unchanged at 5/150. After: every one **fp32**.
+- **Two stencil gate holes** (pre-existing; both silently DROP statements on the shipped
+  default `compile_mode="none"`). The `local_defs` guard validated against a set it
+  populated itself: `_collect_local_defs` records every identifier assignment so taps can
+  resolve through temporaries, so reusing it to decide what may be *discarded* accepted
+  everything — and the lowering, which replaces the whole nest, then deleted it. It now
+  requires the name to be DECLARED inside the nest, which provably cannot outlive it.
+  Separately the outer-loop scan had no `has_unknown` mechanism at all: a non-count
+  assignment fell through the `elif` chain and was accepted by silence, which also defeated
+  the one-lowering-per-loop check (that only ever inspects the inner body). Neither fix
+  cost a lowering — UC-2 routing and the codegen-equivalence oracle are unchanged.
+- **Inline conv2d applied the first tap's swizzle to every tap** (pre-existing). The
+  collector compared each tap's *binding* but never its *channels*, so `@A.r` followed by
+  `@A.g` lowered as if both read `.r`. The emitter has one channel selection to give; a
+  nest needing two is not a conv2d, so it now declines.
+- The codegen decline reports itself honestly on the channel users actually see. The first
+  fix landed on the `_show_once` log line; the HUD tooltip reads `tier_trace`, which still
+  said "unsupported" — the wild-goose chase the fix was meant to remove. The message would
+  have been false either way: the emitter handles these fine, and the decline is a caching
+  policy, so a program reading `frame`/`fps`/`time` now says exactly that.
+- The OOM ladder clears the failed cook's traceback frames before retrying. The
+  interpreter holds whole `[B,H,W,C]` tensors as frame locals (~127 MB apiece at 4K
+  fp32), and the OOM's traceback pins one set per nesting level — measured at 160 MB
+  still reachable inside the retry. Without this, rung 1 freed the mip caches and rung 2
+  re-cooked straight back into the peak that had just failed.
+- The `precision="fp16"` × compiled-tier clamp moved from the node into the engine. It is
+  engine policy — which precisions a tier supports — and leaving half of it in the host
+  meant `engine.cook(precision="fp16", compile_mode="torch_compile")` violated the
+  engine's own documented contract.
+- `tex run` still fails like a CLI. `tex_api.compile` raising the new `TEXCompileError`
+  (ENG-4) put it outside `tex_cli.main`'s except tuple, so every syntax error dumped a
+  Python traceback instead of a one-line message — breaking the F3 contract that function
+  exists to keep. Found by the bug hunt.
+- **A cooked output never aliases an input binding.** `@OUT = @A;` binds the output name
+  straight to the input tensor — and const-folding widens that past literal identity, so
+  `@OUT = @A * 1.0;` does it too. The ComfyUI node never noticed, because its egress clamp
+  materializes a fresh tensor on the way out; ENG-3's `engine` profile removed the clamp
+  and, with it, that accidental copy — so a host recycling frame buffers would have had its
+  input silently rewritten by its own output. `tex_engine.run` now clones an output that
+  shares storage with a binding — and "storage" is literal, which the first version of this
+  fix got wrong twice over. Not object identity (a reshape returns a new object over the
+  same buffer), and **not `.data_ptr()`**, which is the address of the first ELEMENT: a
+  view at a non-zero offset compares unequal and sails through. `@X = @A.rgb;` starts at
+  offset 0 and looked caught, which is exactly what made that spelling dangerous — `@X =
+  @A.a;` starts at offset 3 and did not. `untyped_storage().data_ptr()` is the buffer.
+  Conditional, so a genuinely computed output is never copied. **Ownership is a property of
+  the CALL, not of a process global:** `prepare(disown=True)` (the default) is what makes
+  `tex_api`'s published promise — "`cook()` guarantees its outputs do not alias your input
+  bindings" — true for the host that does exactly what the docs say and never touches
+  `set_egress_profile`. Gating it on the process-wide egress profile instead, as the first
+  version of this fix did, answered a question nobody asked: the global says what a host
+  *set*, not what *this call* will do with the result, and `cook()`'s whole contract is to
+  return RAW tensors with no profile applied at all. Under the default (`comfy`) that made
+  the guarantee silently false — `@OUT = @A;` handed back the caller's own buffer — with
+  zero in-tree impact (the node clamps, the CLI pins `comfy`), which is precisely why
+  nothing went red: a false guarantee on a Tier-1 public surface is invisible from inside
+  the tree. A caller that can PROVE its own egress materializes passes `disown=False`;
+  `tex_node` is the only one, and it derives that from the profile it will actually format
+  through (`egress_materializes()`) rather than hardcoding it — under `comfy` the clamp
+  allocates regardless, so cloning first cost a full-frame copy immediately thrown away
+  (measured 1.349 ms vs 0.019 ms on a 2048² passthrough: the clone WAS the cook), on the
+  default path, in a release whose budget is +1.3 µs/cook; under `engine`, the profile that
+  REMOVES the clamp, that proof evaporates and the node buys the guarantee instead.
+  `tex_api.execute` — the raw interpreter call — makes no ownership promise, and now says so.
+- The engine egress profile honours its own "never pinned" claim: LATENT was delegating to
+  the comfy body and inheriting its page-locking.
+- The C2 fp16→fp32 pin actually reads back. Adding `compile_mode` to the memo key (below)
+  updated the reader and left the writer at the old 3-tuple — and a 3-tuple can never match
+  a 4-tuple lookup, so "pin the program to fp32 thereafter" was write-only. Correctness
+  never depended on it (the net re-runs every cook), only cost: every such program
+  double-cooked forever. The net is now handed the key `prepare()` looked up, deleting the
+  second construction site rather than re-synchronising it.
+- The `precision="auto"` decision memo keys on `compile_mode`. It caches a
+  compile-mode-*adjusted* verdict (`[compiled tier: fp32]`) under a key that omitted the
+  mode, so whichever mode cooked a program first decided the precision for every later
+  mode — a `torch_compile` cook would pin fp32 and the next `compile_mode="none"` cook
+  silently lost fp16. Pre-existing; `cook()` newly makes it public API.
+- The OOM ladder clears the traceback that actually holds the tensors. `_oom_in_chain`
+  digs the OOM out of the `__cause__` chain, but M-1 re-wraps a stdlib OOM as
+  `InterpreterError` — the likeliest OOM there is — and in that shape the big tree-walk
+  frames hang off the **wrapper**, while the inner OOM carries only the innermost two.
+  Measured: clearing the inner one freed 0 of 24 MB. It also clears the doomed attempt's
+  `debug_print` probes, which were otherwise duplicated into the HUD — and the re-cook is
+  tiled, so its per-strip probes reported the wrong pixel.
+- The codegen decline reports itself honestly on the path users actually see. The v0.22
+  fix landed on the `_show_once` log line; the channel that reaches the HUD tooltip is
+  `tier_trace`, which still said "unsupported" — the wild-goose chase this was supposed
+  to have removed.
+- `tex_memory` no longer imports `tex_node`. The documented `tex_node ↔ tex_memory` cycle
+  is now `tex_engine ↔ tex_memory` — moved, not removed.
+
+### Performance
+
+Invariant #7 says a refactor release must be **invisible**. That is the claim, and here
+is exactly what backs it — including which of the usual gates does *not*:
+
+- **ENG-1's move costs +1.3 µs/cook, O(1)** — two dataclass constructions and a call hop,
+  against a normalized structural diff of the old and new cook bodies that reduces to
+  three additions and nothing else. **+0.19%** of a 1024² CUDA cook, under the jitter.
+- **The whole-suite result set is identical to v0.21.0's, program for program** (1855
+  PASS / 1 known-env FAIL, diffed line by line; only embedded timings differ). For a
+  behaviour-preserving move this is the strongest evidence available, and it is the gate
+  that actually bit during development.
+- `tex run` through `engine.cook` is byte-identical to the old node path.
+- **`eight_config_bench --compare` does NOT gate this release, and saying otherwise would
+  be false.** The harness drives `Interpreter.execute` directly (`run_benchmarks.run_
+  interpreter`) and imports neither `tex_node` nor `tex_engine` — so it never executes the
+  cook path ENG-1 moved. Run anyway on an idle box, it reports both a 1.35× *gain* and a
+  0.91× *loss* across configs of code this release did not touch, which is the shape of
+  noise, not of a regression (CVs on this box are 16–26% median). It does cover ENG-7's
+  interpreter change, measured at **+66 ns/cook** — ~0.002% of a 4 ms cook, i.e. invisible.
+  The gate for a change this small is a direct microbenchmark on the real path, which is
+  where the +1.3 µs above comes from.
+
+### Deferred, with the measurement
+
+- **LAT-2 (`PreparedProgram`) — deferred, because it aims at the wrong 5 microseconds.**
+  Measured on a 256² CUDA cook (263 µs): `prepare()` is 66.3 µs, of which the M-1
+  preflight's free-VRAM query is **61.0 µs (92%)** and *everything LAT-2 proposes to
+  cache* is **5.27 µs — 2.0% of the cook**. A perfect PreparedProgram would win that 2%
+  in exchange for a new (fingerprint × binding-signature × device × precision) cache —
+  the same silent-staleness class ENG-7 had to defend against in four separate places.
+  Not measured, and so not claimed either way: the compile tiers' per-cook env/capture
+  key building, which is LAT-2's other half but sits off the default path. **The real
+  target, found while measuring:** that 61 µs preflight query, on every CUDA cook. It is
+  live state, so it cannot be cached — it needs to be *skippable*, which is its own
+  design. Recorded in the roadmap.
+
 ## [0.21.0] - 2026-07-16
 
 **Fuse the graph** — the first release on the compositor-engine roadmap

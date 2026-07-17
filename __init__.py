@@ -5,7 +5,7 @@ A per-pixel kernel DSL for writing compact image/mask processing logic
 directly inside ComfyUI. Inspired by Houdini VEX and Nuke BlinkScript.
 """
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 import os
 
@@ -249,7 +249,7 @@ try:
                                       "stage_of_error": None, "stats": None})
         try:
             from .tex_fusion import preflight_from_spec
-            from .tex_node import _infer_binding_type
+            from .tex_marshalling import infer_binding_type as _infer_binding_type
             spec = {"stages": body.get("stages", []),
                     "terminal_image_input": body.get("terminal_image_input")}
             result = preflight_from_spec(spec, body.get("terminal_code", ""),

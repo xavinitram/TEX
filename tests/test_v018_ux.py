@@ -136,7 +136,8 @@ def test_ux1_diagnostics_reachability(r: SubTestResult):
 
 def test_dbg3_nan_overlay(r: SubTestResult):
     print("\n--- DBG-3: NaN/Inf magenta overlay ---")
-    from TEX_Wrangle.tex_node import _nan_highlight, TEXWrangleNode as N
+    from TEX_Wrangle.tex_engine import _nan_highlight   # ENG-1: overlays are engine-side
+    from TEX_Wrangle.tex_node import TEXWrangleNode as N
     fails = []
     # (a) the helper: a non-finite CHANNEL magenta-flags the whole PIXEL; finite untouched
     img = torch.rand(1, 4, 4, 3)

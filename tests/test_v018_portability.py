@@ -39,10 +39,19 @@ def test_port1_host_services(r: SubTestResult):
     from TEX_Wrangle.tex_runtime import host
     fails = []
 
-    # NullHostServices: unknown free memory, no-op hooks, torch-only OOM detection
+    # NullHostServices: no-op cooperation hooks, torch-only OOM detection — and, since
+    # ENG-2 (v0.22), a REAL free-VRAM answer measured from the driver + allocator. It
+    # used to return None, which disabled preflight/tiling/retry for every non-ComfyUI
+    # host; the contract now is "None only when there is nothing to measure".
     null = host.NullHostServices()
-    if null.get_free_memory("cuda") is not None:
-        fails.append("Null.get_free_memory should be None")
+    free_cuda = null.get_free_memory("cuda")
+    if torch.cuda.is_available():
+        if not (isinstance(free_cuda, float) and free_cuda > 0):
+            fails.append(f"Null.get_free_memory('cuda') should measure VRAM, got {free_cuda!r}")
+    elif free_cuda is not None:
+        fails.append("Null.get_free_memory should be None with no CUDA")
+    if null.get_free_memory("cpu") is not None:
+        fails.append("Null.get_free_memory('cpu') should be None (VRAM-only probe)")
     null.free_memory(1, "cuda"); null.soft_empty_cache()  # must not raise
     if null.is_oom(ValueError("x")) is not False:
         fails.append("Null.is_oom(non-OOM) should be False")
@@ -75,8 +84,14 @@ def test_port1_host_services(r: SubTestResult):
         def is_oom(self, e): raise RuntimeError("boom")
     broken = host.ComfyHostServices(_BrokenMM())
     try:
-        if broken.get_free_memory("cuda") is not None:
-            fails.append("broken host free-memory should degrade to None")
+        # ENG-2: degrades to the Null BEHAVIOUR, which now means "measure it yourself"
+        # rather than "give up" — a host with a broken API must not cost us tiling.
+        bf = broken.get_free_memory("cuda")
+        if torch.cuda.is_available():
+            if not (isinstance(bf, float) and bf > 0):
+                fails.append(f"broken host should fall back to measuring VRAM, got {bf!r}")
+        elif bf is not None:
+            fails.append("broken host free-memory should be None with no CUDA")
         broken.free_memory(1, "cuda"); broken.soft_empty_cache()  # must not raise
         broken.is_oom(ValueError())  # must not raise
     except Exception as e:
@@ -336,7 +351,7 @@ def test_port3_16bit_png(r: SubTestResult):
 
 def test_hw4_cpu_threads(r: SubTestResult):
     print("\n--- HW-4: TEX_CPU_THREADS opt-in knob ---")
-    from TEX_Wrangle.tex_node import _apply_cpu_threads_env
+    from TEX_Wrangle.tex_engine import _apply_cpu_threads_env   # ENG-1: engine-side
     saved_env = os.environ.get("TEX_CPU_THREADS")
     saved_threads = torch.get_num_threads()
     fails = []

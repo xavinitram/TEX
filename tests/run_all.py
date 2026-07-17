@@ -492,6 +492,28 @@ def main():
     test_lat4_builtins_lru(r)
     test_eng8_transfer_model(r)
 
+    # v0.22.0 Phase 1 — "The engine seam" (ENG-1/2/3/4/5/7, SCHED-1, LAT-2)
+    from test_v022_phase1 import (
+        test_eng3_comfy_profile_canary, test_eng3_engine_profile_preserves_values,
+        test_eng1_engine_cooks_without_the_node, test_eng1_node_is_a_marshaller,
+        test_eng7_time_builtins_advance, test_eng7_time_barred_from_frozen_tiers,
+        test_eng4_structured_compile_error, test_eng5_embedding_canaries,
+        test_eng2_null_host_measures_vram, test_eng2_oom_ladder,
+        test_eng1_cook_outputs_do_not_alias_inputs, test_eng1_fp16_compiled_tier_clamp,
+    )
+    test_eng3_comfy_profile_canary(r)
+    test_eng3_engine_profile_preserves_values(r)
+    test_eng1_engine_cooks_without_the_node(r)
+    test_eng1_node_is_a_marshaller(r)
+    test_eng7_time_builtins_advance(r)
+    test_eng7_time_barred_from_frozen_tiers(r)
+    test_eng4_structured_compile_error(r)
+    test_eng5_embedding_canaries(r)
+    test_eng2_null_host_measures_vram(r)
+    test_eng2_oom_ladder(r)
+    test_eng1_cook_outputs_do_not_alias_inputs(r)
+    test_eng1_fp16_compiled_tier_clamp(r)
+
     success = r.summary()
     return 0 if success else 1
 

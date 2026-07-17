@@ -494,6 +494,7 @@ def execute_compiled(
     output_names: list[str] | None = None,
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
+    time_context: dict | None = None,
 ) -> torch.Tensor | dict:
     """
     Execute a TEX program with optional torch.compile acceleration.
@@ -529,7 +530,8 @@ def execute_compiled(
     if fingerprint in _compile_blacklist:
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
-                              used_builtins=used_builtins, precision=precision)
+                              used_builtins=used_builtins, precision=precision,
+                              time_context=time_context)
 
     # ── Program analysis gates (only on first compile, not cached reruns).
     # op_count/loop_depth are memoized per fingerprint so routes that never
@@ -549,14 +551,16 @@ def execute_compiled(
         if op_count < _COMPILE_OP_THRESHOLD:
             return _plain_execute(program, bindings, type_map, device,
                                   latent_channel_count, output_names,
-                                  used_builtins=used_builtins, precision=precision)
+                                  used_builtins=used_builtins, precision=precision,
+                                  time_context=time_context)
         # Use codegen WITHOUT torch.compile for deeply nested loops
         # (graph breaks and recompilation make torch.compile slower)
         if loop_depth > _COMPILE_MAX_LOOP_DEPTH:
             return _codegen_only_execute(program, bindings, type_map, device,
                                          latent_channel_count, output_names,
                                          used_builtins=used_builtins, precision=precision,
-                                         fingerprint=fingerprint)
+                                         fingerprint=fingerprint,
+                                         time_context=time_context)   # ENG-7
         # Use plain interpreter for programs without spatial tensor context
         # (procedural noise, etc.) — codegen env setup overhead exceeds
         # benefit when all operations are on scalar tensors
@@ -565,7 +569,8 @@ def execute_compiled(
         if not has_spatial:
             return _plain_execute(program, bindings, type_map, device,
                                   latent_channel_count, output_names,
-                                  used_builtins=used_builtins, precision=precision)
+                                  used_builtins=used_builtins, precision=precision,
+                                  time_context=time_context)
 
     # Ensure tensor bindings are contiguous — Inductor's codegen can
     # fail on non-contiguous strides (e.g. BHWC images loaded with
@@ -604,7 +609,8 @@ def execute_compiled(
                         # No backend available — run plain interpreter here
                         return _plain_execute(program, contiguous_bindings, type_map,
                                               device, latent_channel_count, output_names,
-                                              used_builtins=used_builtins, precision=precision)
+                                              used_builtins=used_builtins, precision=precision,
+                                              time_context=time_context)
                     _compiled_cache[cache_key] = entry
                     # G: arm post-commit verification for this fresh artifact
                     # (samples collect on the NEXT cooks — the commit cook itself
@@ -731,7 +737,8 @@ def execute_compiled(
         # interpreter recompute. Matches _codegen_only_execute's fallback.
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
-                              used_builtins=used_builtins, precision=precision)
+                              used_builtins=used_builtins, precision=precision,
+                              time_context=time_context)
 
     # G (v0.20): post-commit verification verdict. Once the window is full,
     # time ONE interpreter cook of the same program and demote the compiled
@@ -747,7 +754,8 @@ def execute_compiled(
             _, interp_ms = _timed(
                 lambda: _plain_execute(program, dict(bindings), type_map, device,
                                        latent_channel_count, output_names,
-                                       used_builtins=used_builtins, precision=precision),
+                                       used_builtins=used_builtins, precision=precision,
+                                       time_context=time_context),
                 device_type)
             # min(), not median: the first post-commit cooks can include cudagraph
             # recording (reduce-overhead), which would overstate a good artifact.
@@ -1014,7 +1022,8 @@ def _run_cached_compiled(cache_key, program, bindings, type_map, device,
 
 def run_auto(program, bindings, type_map, device, fingerprint,
              latent_channel_count: int = 0, output_names=None,
-             used_builtins=None, precision: str = "fp32"):
+             used_builtins=None, precision: str = "fp32",
+             time_context: dict | None = None):
     """CC-2 entry: measure the always-safe codegen baseline, background-compile,
     trial the compiled fn, and commit only on a measured win. Never blocks on
     the compile; never routes to a slower tier than codegen-only."""
@@ -1036,7 +1045,8 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         return _codegen_only_execute(program, bind, type_map, device,
                                      latent_channel_count, output_names,
                                      used_builtins=used_builtins,
-                                     precision=precision, fingerprint=fingerprint)
+                                     precision=precision, fingerprint=fingerprint,
+                                     time_context=time_context)   # ENG-7
 
     # Terminal: rejected → always-safe codegen; committed → cached compiled.
     if state == autotier.REJECTED:
@@ -1104,6 +1114,8 @@ def _plain_execute(
     output_names: list[str] | None = None,
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
+    *,
+    time_context: dict | None,
 ) -> torch.Tensor | dict:
     """Execute without torch.compile (standard tree-walking interpreter). Reuses ONE
     persistent interpreter (C6) so its coordinate-builtin LRU (LAT-4) actually persists
@@ -1112,12 +1124,32 @@ def _plain_execute(
     cook, exactly what LAT-4 set out to avoid. This instance is SEPARATE from the graph
     tier's dedicated interpreter (graphed.py), so a module-shared builtins cache never
     lets another cook evict a captured graph's baked builtins. Under ComfyUI's
-    one-cook-at-a-time executor this reuse is race-free (same contract as the node's
-    _get_interpreter singleton)."""
+    one-cook-at-a-time executor this reuse is race-free (same contract as the engine's
+    _get_interpreter singleton — tex_engine, ENG-1).
+
+    ENG-7: `time_context` MUST be forwarded. This is where a time-reading program
+    actually lands — codegen declines it (see codegen.try_compile), and that decline
+    happens INSIDE execute_compiled / run_auto / _codegen_only_execute, which return
+    through here rather than raising, so the engine's own `_interp_fallback` (which does
+    forward it) is never reached. Missing it froze the playhead at 0 on the SHIPPED
+    DEFAULT path — `compile_mode="none"` routes an exact stencil through
+    _codegen_only_execute. The closure that made threading this dangerous elsewhere
+    (`_codegen_exec_eager`, built once per fingerprint) is unreachable for these
+    programs, precisely because codegen declined them.
+
+    Which is why it is KEYWORD-ONLY and REQUIRED, with no default. `None` is a legitimate
+    value (no host playhead) and is indistinguishable, at the interpreter, from a caller
+    that simply forgot — `tc.get("frame", 0.0)` reads 0.0 for both, cooks happily, and
+    returns a still image. A default therefore cannot be safe here: it converts an
+    omission into a frozen playhead with no error, no diagnostic, and a plausible picture.
+    Requiring it moves the failure to the call, where it is a TypeError naming the
+    parameter. v0.22 shipped a route (execute_compiled's deep-loop branch) that omitted
+    it, past a suite that already had SEVEN routes pinned; pass `time_context=None`
+    explicitly to mean "no playhead"."""
     return _get_plain_interp().execute(
         program, bindings, type_map, device=device,
         latent_channel_count=latent_channel_count, output_names=output_names,
-        precision=precision, used_builtins=used_builtins)
+        precision=precision, used_builtins=used_builtins, time_context=time_context)
 
 
 _PLAIN_INTERP = None
@@ -1249,6 +1281,10 @@ def _build_codegen_env(
         env["ic"] = _env_cached(("ic", latent_channel_count, dev_key, dtype),
                                 lambda: torch.tensor(float(latent_channel_count), dtype=dtype, device=device))
 
+    # ENG-7: no host-time builtins here BY DESIGN — codegen declines any program that
+    # reads them (codegen.try_compile -> _Unsupported), so this env never needs to carry
+    # a playhead. See the note in codegen for why; the short version is that both this
+    # module's cached executor closure and _env_cached would freeze the value.
     return env, sp, used
 
 
@@ -1262,6 +1298,8 @@ def _codegen_only_execute(
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
     fingerprint: str | None = None,
+    *,
+    time_context: dict | None,
 ) -> torch.Tensor | dict:
     """Execute via codegen flat function WITHOUT torch.compile.
 
@@ -1271,14 +1309,29 @@ def _codegen_only_execute(
 
     The generated function (or a None "unsupported" sentinel) is memoized per
     fingerprint so re-executions skip the per-frame emit+compile()+exec().
+
+    `time_context` is KEYWORD-ONLY and REQUIRED for the reason spelled out on
+    `_plain_execute` — a forgotten forward is a frozen playhead, not an error, and this
+    function is where the codegen decline lands a time-reading program. Pass
+    `time_context=None` to mean "no host playhead".
     """
     cg_fn = _get_or_make_codegen_fn(program, type_map, fingerprint)
 
     if cg_fn is None:
-        tier_trace.record("interpreter", fallback_from="codegen", reason="unsupported")
+        # ENG-7: "unsupported" is a lie for a time-reading program — the emitter handles
+        # them fine, and the decline is a CACHING policy (see codegen.try_compile). This
+        # is the channel the user actually sees on the DEFAULT path: it reaches the HUD
+        # tooltip via tier_trace, not the _show_once log line. Sending someone hunting for
+        # an unsupported construct in a program that has none is the whole cost.
+        from .codegen import _reads_time_builtin
+        reason = ("reads frame/fps/time — the compiled tiers cache per program and would "
+                  "replay a stale playhead (ENG-7)"
+                  if _reads_time_builtin(program) else "unsupported")
+        tier_trace.record("interpreter", fallback_from="codegen", reason=reason)
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
-                              used_builtins=used_builtins, precision=precision)
+                              used_builtins=used_builtins, precision=precision,
+                              time_context=time_context)
 
     dev = _canon_device(device)
 
@@ -1303,7 +1356,8 @@ def _codegen_only_execute(
         tier_trace.record("interpreter", fallback_from="codegen", reason=str(e))
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
-                              used_builtins=used_builtins, precision=precision)
+                              used_builtins=used_builtins, precision=precision,
+                              time_context=time_context)
 
     tier_trace.record("codegen")
     # XPU fence: async ingest DMA must land before the cook's outputs escape.
@@ -1363,9 +1417,22 @@ def _try_compile(
         # interpreter classes, unserializable under caching_precompile) and
         # re-traces every cook — ~100x slower than the plain interpreter it wraps.
         if program is not None:
-            _show_once("codegen_fallback",
-                       "[TEX] Codegen unsupported for this program — plain interpreter "
-                       "(interpreter-wrapping torch.compile measured as never beneficial)")
+            # ENG-7: distinguish "codegen can't express this" from "codegen is barred
+            # from this". The time-builtin decline is a CACHING policy (every artifact
+            # downstream of codegen is keyed by a fingerprint that does not move when the
+            # playhead does), not a capability limit — telling a user with an animating
+            # program that codegen "doesn't support" it would be false, and would send
+            # them looking for the unsupported construct.
+            from .codegen import _reads_time_builtin
+            if _reads_time_builtin(program):
+                _show_once("codegen_time_builtin",
+                           "[TEX] This program reads frame/fps/time, so it runs on the "
+                           "interpreter — the compiled tiers cache per program, and would "
+                           "replay a stale playhead (ENG-7).")
+            else:
+                _show_once("codegen_fallback",
+                           "[TEX] Codegen unsupported for this program — plain interpreter "
+                           "(interpreter-wrapping torch.compile measured as never beneficial)")
         return None
 
     # Build an adapter that matches the execute_compiled calling convention

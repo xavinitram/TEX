@@ -56,7 +56,33 @@ _BUILTIN_CONSTS = {"PI": math.pi, "TAU": 2.0 * math.pi, "E": math.e}
 # fp16's error the same way a big constant does (doc 32 round 2: `sin(@A.r * iw)` where iw is
 # the image width ~1024). They are fp32 themselves, but the PRODUCT `@A.r*iw` is fp16.
 _BUILTIN_MAG = {"iw": 8192.0, "ih": 8192.0, "ix": 8192.0, "iy": 8192.0, "fi": 4096.0,
-                "fn": 4096.0}
+                "fn": 4096.0,
+                # ENG-7 (v0.22). Every other entry here is bounded by something: an image
+                # dimension, a batch length. The host's playhead is bounded by NOTHING —
+                # it grows all day — so `frame`/`time` are pinned at `inf`, not an estimate
+                # of magnitude but a statement that NONE can be assumed.
+                #
+                # It must be inf, not _FP16_MAX, and that is not pedantry: the amplification
+                # analysis const-folds a scale constant through `*`/`/` (see `_gm`), so a
+                # FINITE 65504 lets a tiny scale-down evade — `frame*0.00001` folds to
+                # 0.655 < _MAG_MAX and resolves fp16, then at a large runtime playhead
+                # (frame ~ 3e5, about 3.5 h at 24 fps) `sin(@A.r * frame*1e-5)` ships
+                # finite-but-wrong pixels, the exact silent class this entry closes.
+                # `inf * 1e-5` stays inf, so the hazard fires for any image-lineage product
+                # of the playhead regardless of the constant. A BOUNDED function of the
+                # playhead is unaffected — `sin(frame)`'s magnitude is capped at ~1 inside
+                # `_gm` no matter its argument — so `@A.rgb + sin(frame)` still resolves
+                # fp16. (Found by the v0.22 bug hunt after the finite pin shipped.)
+                #
+                # This closes invariant #10's gate bug. Measured on CUDA at 2048²:
+                # `sin(@A.r * frame)` was ACCEPTED for fp16 pre-fix and at frame=500 shipped
+                # maxdiff 0.2443 — 63x the 3.9e-3 budget; every pixel finite, so the C2 net
+                # never fires.
+                #
+                # fps is genuinely bounded (240 is a high-speed camera), so a finite pin is
+                # honest there — but it multiplies image lineage the same way, so it is
+                # registered rather than trusted.
+                "frame": float("inf"), "time": float("inf"), "fps": 240.0}
 
 # C2-st: the fp16 taxonomy is now single-sourced in the @stdlib registry (doc 34
 # weakness #8 — this used to be a second, un-federated hand-list that let a new fragile
@@ -473,17 +499,107 @@ def _for_accumulates_image(loop, tainted) -> bool:
     return False
 
 
+# F2's static-walk depth cap. `seen` bounds CYCLES completely (mutual recursion is
+# impossible — the type checker resolves callees backward-only, E5001 — so a `seen` set is
+# a total cycle guard), but it does not bound DEPTH: a chain of N *distinct* defs costs N
+# Python frames, and at ~995 links that is a RecursionError raised inside a cook, on a
+# program that parses and typechecks. 64 is not a guess — it is the interpreter's own
+# MAX_CALL_DEPTH (interpreter.py:40), so any chain this cap truncates is one the
+# interpreter would refuse to execute anyway (E6060). Truncating to True (decline -> fp32)
+# keeps the direction #10 asks for: the deepest programs are the least likely to be
+# fp16-safe, and fp32 is always correct.
+_FN_WALK_MAX_DEPTH = 64
+
+
+def _fn_body_conditions(name, user_fns, tainted, out_names, seen=None, depth=0) -> bool:
+    """True if user function `name`'s BODY reads anything the gain pass would have needed
+    to see — a magnitude builtin (`frame`/`time`/`iw`/`ih`/`ix`/`iy`/`fi`/`fn`/`fps`) or
+    image lineage — directly or through another user function it calls.
+
+    F2 — the ZERO-ARG laundering hole, and the other half of F1. F1 (the arg-scoped
+    conjunct below) declines a user-fn call whose ARGS carry image lineage, which is the
+    only way the gain pass can be fooled *through the interface*. It reads as though it
+    closed the user-fn class. It closed one side of it: a zero-arg call has no interface to
+    inspect, and `_gm`'s FunctionCall branch scores an unknown call FROM ITS ARGS —
+    `g = max((p[0] for p in parts), default=0.0)`, `m = max((p[1] for p in parts),
+    default=1.0)`. With `parts` empty, those `default=`s hand the call gain 0.0 and
+    magnitude 1.0 unconditionally. Everything the body assembled is laundered by a
+    signature. Written inline, every one of these is correctly declined; the wrapper is
+    the whole trick. Measured, CUDA, 2048², all finite (so the C2 net never fires):
+
+        float f(){ return frame; }      @OUT = vec4(@A.rgb * f(), 1.0);     3.2163  (825x)
+        float f(){ return @A.r*50.0; }  @OUT = vec4(vec3(f()), 1.0);        0.0278  (7x)
+        float f(){ return @A.r*@A.r*40.0; } ...                             0.0440  (11x)
+
+    against invariant #10's 3.9e-3. ENG-7 made the first class ship by adding frame/time —
+    magnitudes bounded by nothing — to the builtins a body may read; the image-lineage
+    ones predate it and were reachable the whole time.
+
+    So the rule is symmetric with F1's, and deliberately as blunt: F1 declines ANY call
+    with an image arg without asking what the body does with it, and this declines ANY call
+    whose body touches lineage or magnitude without asking whether it amplified. Both
+    over-decline (`float f(){ return @A.r*1.1; }` is fp16-safe at 0.0011 and is now fp32)
+    and that is the trade #10 names — over-decline rather than risk accuracy. Measured
+    cost: no shipped example changes verdict, no accepted-case test uses a user fn.
+
+    Scoped to the BODY, ALONGSIDE the arg conjunct, not replacing it — `float amp(float
+    x){ return x*50.0; }` has a body that reads neither (the magnitude arrives as a param),
+    so only F1 catches it. And an arg-scoped *magnitude* rule would newly decline
+    `refine(u*iw, v*ih, ...)`, whose magnitude the gain pass can already see and score.
+
+    `seen` is not an optimization, it is a correctness requirement: TEX permits
+    self-recursion (`float f(){ return f()*2.0; }` typechecks, and recursion is a shipped,
+    tested feature — examples/recursive_fractal.tex), so the call graph has real cycles and
+    an unguarded walk would hang the cook thread on a program that merely parses. Mutual
+    recursion is impossible (the type checker resolves callees backward-only, E5001), so
+    `seen` is a complete guard. It doubles as a memo: the property is path-independent, so
+    a name already explored can never answer differently on a second visit.
+    """
+    if depth >= _FN_WALK_MAX_DEPTH:
+        return True                        # too deep to model -> decline (see the cap)
+    seen = set() if seen is None else seen
+    if name in seen:
+        return False                       # cycle back-edge: contributes nothing new
+    seen.add(name)
+    fn = user_fns.get(name)
+    if fn is None:
+        return False                       # a stdlib/builtin call: not a user body
+    for stmt in fn.body:
+        for n in _walk(stmt):
+            cls = n.__class__.__name__
+            if cls == "Identifier":
+                # Name membership, the same recognition `_gm` uses (:261). A *parameter*
+                # shadowing a builtin name reads as a magnitude here: an over-decline,
+                # which is the safe direction and the one #10 asks for.
+                if n.name in _BUILTIN_MAG or n.name in tainted:
+                    return True
+            elif cls == "BindingRef" and n.kind == "wire" and n.name not in out_names:
+                return True                # the body reaches for @A itself, past any arg
+            elif cls == "FunctionCall" and _fn_body_conditions(n.name, user_fns, tainted,
+                                                               out_names, seen, depth + 1):
+                return True
+    return False
+
+
 def _has_fp16_hazard(program, out_names) -> bool:
     """Decline fp16 if the program has a fp16-fragile function anywhere, an unsafe
     `pow`, a data-dependent branch (if/ternary/while — a fp16 value decides control
     flow), an image-lineage comparison (an image thresholded directly, `@A.r>0.5`),
     an out-of-fp16-range literal, a `for` loop that accumulates image lineage (C1), or an
     image-lineage amplification of gain >= _AMP assembled anywhere (C1: `@A*40`,
-    `@A/0.0002`, but also `sin(@A*3*3)`, `x*x` squaring, `/0.3/0.3`, `@A*PI*PI`)."""
+    `@A/0.0002`, but also `sin(@A*3*3)`, `x*x` squaring, `/0.3/0.3`, `@A*PI*PI`).
+
+    User-function calls are declined from BOTH sides — image lineage in the ARGS (F1) and
+    lineage or a magnitude builtin in the BODY (F2) — because the gain pass models neither
+    a function body nor a zero-arg call. See `_fn_body_conditions`."""
     tainted = _image_tainted_vars(program, out_names)
     if _amplification_hazard(program, out_names):
         return True
-    user_fns = {n.name for n in _walk(program) if n.__class__.__name__ == "FunctionDef"}
+    # name -> FunctionDef, not just the name: F2 below has to read the BODY. Membership
+    # (`n.name in user_fns`) is unchanged over a dict. Redefinition can't collide — the
+    # type checker rejects it (E3010), as it does shadowing a builtin name (E3011).
+    user_fns = {n.name: n for n in _walk(program)
+                if n.__class__.__name__ == "FunctionDef"}
     for n in _walk(program):
         cls = n.__class__.__name__
         if cls == "FunctionCall":
@@ -496,7 +612,15 @@ def _has_fp16_hazard(program, out_names) -> bool:
             # to it (the _walk-based fragile/branch checks DO descend, so those are caught).
             # Over-decline: a user-fn call carrying image lineage -> fp32. User functions are
             # rare in the pointwise fp16 target, so keeping the gate honest beats eligibility.
-            if n.name in user_fns and any(_reads_image(a, tainted, out_names) for a in n.args):
+            #
+            # F2 (v0.22): ...and a call whose BODY carries lineage or magnitude out, which
+            # needs no argument to do it — see _fn_body_conditions. F1 alone reads as though
+            # it closed the user-fn class; it only closed the half that arrives through the
+            # interface. A zero-arg call has no interface, and the gain pass scores it from
+            # its (empty) args.
+            if n.name in user_fns and (
+                    any(_reads_image(a, tainted, out_names) for a in n.args)
+                    or _fn_body_conditions(n.name, user_fns, tainted, out_names)):
                 return True
         elif cls in ("IfElse", "TernaryOp", "WhileLoop"):
             return True  # a fp16 value steering control flow -> unstable output

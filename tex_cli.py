@@ -3,8 +3,10 @@ PORT-3 — `tex run`: a standalone CLI that runs a .tex program on an image file
 ComfyUI. Proves TEX is host-agnostic and doubles as a ComfyUI-free regression harness.
 
 I/O is **torchvision-only** (no numpy, no PIL — a bit-exact uint8<->float round-trip is
-verified). The cook wires through the REAL `TEXWrangleNode.execute()` (which runs
-correctly with ComfyUI absent — the host seam degrades to NullHostServices).
+verified). The cook wires through the real engine — `tex_engine.cook` (ENG-1, v0.22) —
+so no ComfyUI node, schema or slot protocol is in the call path at all; the host seam
+degrades to NullHostServices. Before v0.22 this called `TEXWrangleNode.execute`, which
+made the host-agnostic CLI depend on a ComfyUI v3 node classmethod to cook one frame.
 
     python -m TEX_Wrangle.tex_cli run examples/grayscale.tex --in in.png --out out.png
     python -m TEX_Wrangle.tex_cli run prog.tex --in a.png --out b.png --device cuda --precision auto
@@ -78,31 +80,45 @@ def save_image(tensor: torch.Tensor, path: str) -> None:
 
 def run_program(code: str, image: torch.Tensor, device="cpu", precision="fp32",
                 compile_mode="none") -> torch.Tensor:
-    """Run a TEX program on one image through the real node; return the primary IMAGE
-    output (the first vec3/vec4 output, else the first output). Compiles ONCE — the
+    """Run a TEX program on one image; return the primary IMAGE output (the first
+    vec3/vec4 output, else the first output). Compiles ONCE for its binding sets — the
     compiler's own `referenced`/`assigned` give the input bindings and output types (no
-    regex to drift from the grammar); the node then re-infers types from the tensor."""
-    from .tex_node import TEXWrangleNode
+    regex to drift from the grammar); the engine then re-infers types from the tensor.
+
+    ENG-1 (v0.22): cooks through `tex_engine.cook`. The CLI exists to prove TEX is
+    host-agnostic, and until v0.22 it had to import a ComfyUI v3 node classmethod to cook
+    one frame — dragging in the node schema, the lazy slot-map protocol and the HUD
+    payload for a job with no host at all. Output is unchanged: the engine returns raw
+    tensors, and the 'comfy' egress profile (ENG-3) is the same conversion the node
+    applied — verified byte-identical against the node path across clamped, gray,
+    alpha-bearing and MASK outputs.
+    """
+    from . import tex_engine
     from .tex_api import compile as tex_compile
+    from .tex_marshalling import prepare_output, map_inferred_type
     from .tex_compiler.types import TEXType
 
     prog = tex_compile(code, {})            # authoritative binding sets from the compiler
     inputs = sorted(set(prog.referenced) - set(prog.assigned))
     # S1 (doc 33): `tex run` has a single --in image. Binding it to EVERY referenced input
     # would silently alias a multi-input program (@A == @B) and satisfy a typo'd @binding,
-    # bypassing the node's E6003 "not connected" guard. Refuse >1 distinct wire input.
+    # bypassing the engine's E6003 "not connected" guard. Refuse >1 distinct wire input.
     if len(inputs) > 1:
         raise ValueError(
             f"tex run takes one --in image, but this program wires {len(inputs)} inputs "
             f"({', '.join('@' + n for n in inputs)}). Multi-input programs need ComfyUI "
             f"(a --bind NAME=path option is a future addition).")
-    kwargs = {name: image for name in inputs}
-    kwargs.update(code=code, device=device, precision=precision, compile_mode=compile_mode)
-    out = TEXWrangleNode.execute(**kwargs)
-    results = out if isinstance(out, tuple) else out.result
+    res = tex_engine.cook(code, {name: image for name in inputs},
+                          device_mode=device, precision=precision,
+                          compile_mode=compile_mode)
+    # The CLI writes an 8-bit PNG, so it wants the ComfyUI conversion (clamp + alpha-drop
+    # + gray-expand) that save_image's own quantisation assumes — profile pinned, not
+    # inherited, so a host that flipped the process-wide profile can't change `tex run`.
+    results = [prepare_output(res.outputs[n],
+                              map_inferred_type(res.assigned[n], False), profile="comfy")
+               for n in res.output_names]
 
-    names = sorted(prog.assigned.keys())
-    idx = next((i for i, n in enumerate(names)
+    idx = next((i for i, n in enumerate(res.output_names)
                 if prog.assigned[n] in (TEXType.VEC3, TEXType.VEC4)), 0)
     return results[idx]
 
@@ -144,7 +160,7 @@ def main(argv=None) -> None:
     from .tex_compiler.lexer import LexerError
     from .tex_compiler.parser import ParseError
     from .tex_compiler.type_checker import TypeCheckError
-    from .tex_compiler.diagnostics import TEXMultiError
+    from .tex_compiler.diagnostics import TEXMultiError, TEXCompileError
     from .tex_runtime.interpreter import InterpreterError
     try:
         if args.cmd == "run":
@@ -152,7 +168,10 @@ def main(argv=None) -> None:
         elif args.cmd == "validate-hw":
             from .tex_validate_hw import main as validate_hw_main
             validate_hw_main()
-    except (OSError, LexerError, ParseError, TypeCheckError, TEXMultiError,
+    # TEXCompileError (ENG-4) is what tex_api.compile now raises, and run_program calls
+    # it BEFORE the cook — so without it here every syntax error in `tex run` dumps a
+    # stack, breaking the F3 contract this function exists to keep.
+    except (OSError, LexerError, ParseError, TypeCheckError, TEXMultiError, TEXCompileError,
             InterpreterError, ValueError, RuntimeError) as e:
         # S2 (doc 33): the node appends a machine-readable "\nTEX_DIAG:{json}" blob to some
         # errors for the frontend — strip it from the human CLI message.

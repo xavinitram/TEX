@@ -194,6 +194,11 @@ class TypeChecker:
             "PI": TEXType.FLOAT, "TAU": TEXType.FLOAT,
             "E": TEXType.FLOAT,
             "ic": TEXType.FLOAT,
+            # ENG-7 (v0.22): the HOST time context. fi/fn are batch-relative; these are
+            # timeline-absolute (the host's playhead). Fed as builtin VALUES per cook —
+            # never $params, which would churn the lazy memo + fingerprint every frame.
+            # Keep in step with interpreter._TIME_BUILTIN_NAMES (the authoritative set).
+            "frame": TEXType.FLOAT, "fps": TEXType.FLOAT, "time": TEXType.FLOAT,
         }
         self._scopes[0].update(builtins)
 

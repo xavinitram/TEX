@@ -44,7 +44,7 @@ def test_pc1_inductor_cache_dir(r: SubTestResult):
 
 def test_oom_detection(r: SubTestResult):
     print("\n--- OOM-unwrap: detection ---")
-    from TEX_Wrangle.tex_node import _is_oom_error
+    from TEX_Wrangle.tex_engine import _is_oom_error   # ENG-1: OOM detection is the engine's
     try:
         oom_t = getattr(torch.cuda, "OutOfMemoryError", None)
         if oom_t is not None:

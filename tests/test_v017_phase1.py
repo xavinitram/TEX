@@ -217,6 +217,91 @@ def _gen_expr(rng, depth):
             f"{_gen_expr(rng, depth-1)}, {_gen_expr(rng, depth-1)})")
 
 
+def _gen_stencil(rng, i):
+    """A1-2: a random EXACT (fetch-based) stencil nest — the shape the loop-stencil
+    lowerings claim (avg_pool2d / max_pool2d / unfold).
+
+    TST-1 could not reach this class at all before: `_ATOMS` holds no tap (no
+    fetch/sample/@A[...]) and the only loop it emitted was a flat `0..n`, never the
+    nested symmetric `-R..R` that `_try_extract_symmetric_range` requires. So every
+    stencil bug was structurally outside the fuzzer's grammar — which is exactly how
+    the weight-drop defect survived under 1866 tests.
+
+    ~55% of taps are COMPOSED (`tap * 0.5`, `/ 2.0`, `+ 0.1`). A composed tap has no
+    unweighted-pool form, so it must DECLINE the lowering and fall to the ordinary
+    loop path; the pre-v0.22.0 matcher searched *past* the weight, found the bare tap
+    and emitted a kernel with no trace of it — silently ~2x wrong. Both outcomes are
+    parity-checked here, so this generator covers the fix in both directions.
+
+    Accumulator seeds are pinned to the operation's IDENTITY (0.0 for +/max, 1.0 for
+    min over the [0,1] bindings) on purpose: folding a non-identity seed into the pool
+    is a SEPARATE known defect (`_emit_minmax_stencil` / `_emit_box_stencil` overwrite
+    the accumulator instead of folding its pre-state). Generating one here would flag
+    that bug rather than the tap grammar. Same reason no count variable is emitted.
+
+    Returns (lines, atom) — atom is float-typed, so it drops straight into the pool.
+    """
+    R = rng.randint(1, 2)
+    n = (2 * R + 1) ** 2
+    b = rng.choice(["A", "B"])
+    # Both tap spellings reach the same matcher: fetch() is a FunctionCall,
+    # @A[...] a BindingIndexAccess.
+    idx = f"ix + dx, iy + dy"
+
+    # WHOLE-VECTOR taps matter more than they look. When the old matcher dropped a
+    # weight it kept the rank, so the result was SILENTLY ~2x wrong with shapes
+    # intact — the case that actually shipped, and the only one a parity fuzzer can
+    # flag. A single-channel tap under a weight ALSO loses its swizzle (the
+    # ChannelAccess sits under the BinOp, so `channels` is never recorded), which
+    # changes rank and merely crashes codegen into a silent interpreter fallback:
+    # disclosed as robustness debt, but never a parity failure. Generate both, and
+    # keep vec taps the majority so the silent class stays well covered.
+    vec_tap = rng.random() < 0.6
+    if vec_tap:
+        tap = (f"fetch(@{b}, {idx})" if rng.random() < 0.5 else f"@{b}[{idx}]")
+        ty, mx_seed, mn_seed = "vec3", "vec3(0.0)", "vec3(1.0)"
+        pick = "." + rng.choice(["r", "g", "b"])   # collapse to float for the pool
+    else:
+        ch = rng.choice(["r", "g", "b"])
+        tap = (f"fetch(@{b}, {idx}).{ch}" if rng.random() < 0.5
+               else f"@{b}[{idx}].{ch}")
+        ty, mx_seed, mn_seed = "float", "0.0", "1.0"
+        pick = ""
+
+    w = rng.random()
+    if w < 0.45:
+        term = tap                                            # bare -> must LOWER
+    elif w < 0.65:
+        term = f"{tap} * {rng.choice(['0.5', '2.0', '0.25'])}"  # -> must DECLINE
+    elif w < 0.80:
+        term = f"{tap} / 2.0"
+    else:
+        term = f"({tap} + {'vec3(0.1)' if vec_tap else '0.1'})"
+
+    hdr = (f"for (int dy = -{R}; dy <= {R}; dy = dy + 1) {{ "
+           f"for (int dx = -{R}; dx <= {R}; dx = dx + 1) {{ ")
+    end = "} }"
+
+    k = rng.random()
+    if k < 0.45:                                              # box (avg_pool2d)
+        v = f"sacc{i}"
+        return ([f"{ty} {v} = {mx_seed}; {hdr}{v} = {v} + {term}; {end}"],
+                f"({v}{pick} / {float(n)})")
+    if k < 0.80:                                              # min/max (max_pool2d)
+        v = f"smm{i}"
+        fn = rng.choice(["max", "min"])
+        return ([f"{ty} {v} = {mx_seed if fn == 'max' else mn_seed}; "
+                 f"{hdr}{v} = {fn}({v}, {term}); {end}"], f"{v}{pick}")
+    # array collect (unfold) — float arrays only; sort() is float-typed.
+    ch = rng.choice(["r", "g", "b"])
+    ctap = (f"fetch(@{b}, {idx}).{ch}" if rng.random() < 0.5 else f"@{b}[{idx}].{ch}")
+    cterm = ctap if rng.random() < 0.5 else f"{ctap} * 0.5"
+    v, iv = f"sarr{i}", f"si{i}"
+    return ([f"float {v}[{n}]; int {iv} = 0; "
+             f"{hdr}{v}[{iv}] = {cterm}; {iv} = {iv} + 1; {end}",
+             f"{v} = sort({v});"], f"{v}[{n // 2}]")
+
+
 def _gen_program(rng, depth=3):
     """A1-1: a random VALID multi-statement program — widens the fuzzer beyond a
     single float expression to the shapes that shipped real bugs green (doc 33 §5):
@@ -254,7 +339,27 @@ def _gen_program(rng, depth=3):
         lines.append(f"float acc = 0.0; for (int i = 0; i < {n}; i = i + 1) {{ acc = acc + {_expr()}; }}")
         atoms.append("acc")
 
-    lines.append(f"@OUT = vec4({_gen_expr_over(rng, edepth, atoms)}, u, v, 1.0);")
+    # A1-2: 0–2 EXACT stencil nests, each feeding its result in as an atom. This is
+    # the only shape that reaches the loop-stencil route; see _gen_stencil. Two nests
+    # also exercise a stencil sitting next to unrelated work, which is where the
+    # lowering's "replace the whole nest" behaviour can drop statements.
+    stencil_atoms = []
+    for i in range(rng.randint(0, 2)):
+        slines, satom = _gen_stencil(rng, i)
+        lines.extend(slines)
+        atoms.append(satom)
+        stencil_atoms.append(satom)
+
+    tail = _gen_expr_over(rng, edepth, atoms)
+    # A generated stencil whose atom never reaches @OUT is DEAD CODE: the tier
+    # comparison cannot see it, so it buys no coverage. Drawing the tail from the
+    # atom pool leaves that to chance (measured: only ~23% of generated stencils
+    # were live). Fold one in explicitly so every stencil program actually tests
+    # its stencil.
+    if stencil_atoms:
+        tail = f"({tail} + {rng.choice(stencil_atoms)})"
+
+    lines.append(f"@OUT = vec4({tail}, u, v, 1.0);")
     return " ".join(lines)
 
 

@@ -35,7 +35,7 @@ def test_uc3_fractional_and_bindingmut(r: SubTestResult):
         from TEX_Wrangle.tex_runtime.compiled import _codegen_only_execute
         pl = Parser(Lexer(lit).tokenize(), source=lit).parse()
         tml = TypeChecker(binding_types={"OUT": TEXType.VEC3}, source=lit).check(pl)
-        vc = _r0(_codegen_only_execute(pl, {}, tml, "cpu", output_names=["OUT"], fingerprint="uc3lit")["OUT"])
+        vc = _r0(_codegen_only_execute(pl, {}, tml, "cpu", output_names=["OUT"], fingerprint="uc3lit", time_context=None)["OUT"])
         assert vc == 4.5, f"fractional LITERAL start floored (codegen): got {vc}, want 4.5"
         # (c) Fractional step (this one was already rejected by the step==0 guard —
         # confirm it stays correct).
@@ -148,6 +148,9 @@ def test_q6_preview_kwarg_popped(r: SubTestResult):
 def test_m1_oom_unwrap(r: SubTestResult):
     print("\n--- P1: M-1 OOM unwrap through InterpreterError ---")
     import TEX_Wrangle.tex_node as TN
+    # ENG-1 (v0.22): OOM detection + the interpreter singleton are the ENGINE's; the node
+    # only maps the escaped OOM onto ComfyUI's handler. Both surfaces are asserted here.
+    import TEX_Wrangle.tex_engine as _E
     from TEX_Wrangle.tex_runtime.interpreter import InterpreterError
     oom_t = getattr(torch.cuda, "OutOfMemoryError", None)
     if oom_t is None:
@@ -160,13 +163,13 @@ def test_m1_oom_unwrap(r: SubTestResult):
             except Exception as inner:
                 raise InterpreterError("Function 'sample_mip' encountered a problem", None, source="") from inner
         except InterpreterError as e:
-            assert TN._is_oom_error(e) is False
-            assert TN._oom_in_chain(e) is oom
+            assert _E._is_oom_error(e) is False
+            assert _E._oom_in_chain(e) is oom
         r.ok("_oom_in_chain sees OOM through the InterpreterError wrapper")
     except Exception as e:
         r.fail("M-1 _oom_in_chain", str(e))
     try:
-        interp = TN._get_interpreter()
+        interp = _E._get_interpreter()   # ENG-1: the interpreter singleton is the engine's
         orig = interp.execute
         oom = oom_t("CUDA out of memory")
         def fake(*a, **k):
@@ -183,7 +186,7 @@ def test_m1_oom_unwrap(r: SubTestResult):
             raised = e
         finally:
             interp.execute = orig
-        assert raised is not None and TN._is_oom_error(raised), \
+        assert raised is not None and _E._is_oom_error(raised), \
             f"node masked the OOM (raised {type(raised).__name__ if raised else None})"
         r.ok("node re-raises OOM unwrapped (ComfyUI OOM handling can fire)")
     except Exception as e:
@@ -234,7 +237,7 @@ def test_uc2_stencil_exact_only(r: SubTestResult):
         tm = TypeChecker(binding_types={"A": TEXType.VEC4, "OUT": TEXType.VEC4}, source=code).check(prog)
         img = torch.rand(1, 64, 64, 4)
         ref = Interpreter().execute(prog, {"A": img}, tm, device="cpu", output_names=["OUT"])["OUT"]
-        cg = _codegen_only_execute(prog, {"A": img}, tm, "cpu", output_names=["OUT"], fingerprint=fp)["OUT"]
+        cg = _codegen_only_execute(prog, {"A": img}, tm, "cpu", output_names=["OUT"], fingerprint=fp, time_context=None)["OUT"]
         return (ref - cg).abs().max().item(), detect_stencil_route(prog)
     try:
         sblur = "vec3 acc=vec3(0.0); for(int dy=-1;dy<=1;dy=dy+1){for(int dx=-1;dx<=1;dx=dx+1){acc=acc+sample(@A,u+float(dx)*px,v+float(dy)*py).rgb;}} @OUT=vec4(acc/9.0,1.0);"
@@ -549,7 +552,7 @@ def test_mem1_evict_preserves_graphs(r: SubTestResult):
         out2 = G.run_graphed(prog, {"A": img}, tm, "cuda", "mem1_surv",
                              output_names=["OUT"], used_builtins=used)
         it = _plain_execute(prog, {"A": img}, tm, "cuda",
-                            output_names=["OUT"], used_builtins=used)
+                            output_names=["OUT"], used_builtins=used, time_context=None)
         g2 = (out2["OUT"] if isinstance(out2, dict) else out2).float()
         itt = (it["OUT"] if isinstance(it, dict) else it).float()
         md = (g2 - itt).abs().max().item()

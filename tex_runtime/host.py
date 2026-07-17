@@ -30,14 +30,63 @@ class HostServices(Protocol):
     def soft_empty_cache(self) -> None: ...
 
 
-class NullHostServices:
-    """No host (CLI / tests / future host): unknown free memory, no cooperation hooks —
-    but still recognise a torch OOM so a standalone run can drop caches and retry."""
-    def get_free_memory(self, device):
+def _allocator_slack(idx: int) -> int:
+    """Bytes torch has RESERVED but not allocated — cached blocks it will hand back out.
+
+    Read from ONE `memory_stats_as_nested_dict` snapshot rather than via
+    `torch.cuda.memory_reserved()` + `memory_allocated()`. Those two look like the
+    obvious call and are a trap: each re-derives the whole stats table and FLATTENS it
+    into a dotted-key dict, measured at ~38 us apiece — 76 us on a cook that can be
+    263 us. The nested snapshot they are both built on costs ~5 us once (measured,
+    sm_120/torch 2.12). This sits in the preflight of every CUDA cook, so that
+    difference is the whole cost of ENG-2.
+
+    Returns 0 on any shape surprise: slack is a refinement to the driver's number, and
+    a wrong refinement is worse than none."""
+    try:
+        st = torch.cuda.memory_stats_as_nested_dict(device=idx)
+        res = st["reserved_bytes"]["all"]["current"]
+        alloc = st["allocated_bytes"]["all"]["current"]
+        return max(int(res) - int(alloc), 0)
+    except Exception:
+        return 0
+
+
+def _cuda_free_memory(device) -> "float | None":
+    """ENG-2: free VRAM on *device*, measured directly from the driver + torch's
+    allocator. None off CUDA, or if anything is unavailable.
+
+    `mem_get_info` alone UNDER-reports: torch's caching allocator holds freed blocks as
+    `reserved`, which the driver counts as used but torch will happily hand back out. So
+    the cached-but-unallocated slack is added — otherwise a standalone cook would look
+    starved and tile itself pointlessly. This is the same accounting a host does."""
+    try:
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if dev.type != "cuda" or not torch.cuda.is_available():
+            return None
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        driver_free, _total = torch.cuda.mem_get_info(idx)
+        return float(driver_free + _allocator_slack(idx))
+    except Exception:
         return None
 
+
+class NullHostServices:
+    """No host (CLI / tests / a standalone engine): no cooperation hooks, but it still
+    recognises a torch OOM, and since ENG-2 it can answer "how much VRAM is free?" on
+    its own.
+
+    That answer is what makes the Null host a real host rather than a stub. Every memory
+    decision TEX makes — the M-1 preflight, M-4 strip tiling, the OOM ladder — is gated
+    on a free-memory number, and returning None disabled all of them: an 8K cook that
+    tiled happily under ComfyUI simply OOMed under `tex_api`. It cannot ask anyone to
+    unload models (there is nobody to ask), so `free_memory` stays a no-op — but it no
+    longer has to pretend it doesn't know how much room it has."""
+    def get_free_memory(self, device):
+        return _cuda_free_memory(device)
+
     def free_memory(self, amount, device):
-        pass
+        pass  # nobody to ask: a standalone host owns no models to unload
 
     def is_oom(self, exc):
         return _torch_oom(exc)
@@ -59,7 +108,10 @@ class ComfyHostServices:
                 return self._mm.get_free_memory(device)
         except Exception:
             pass
-        return None
+        # ENG-2: a host whose API is missing/broken falls back to measuring the device
+        # itself rather than to None — degrading to "I don't know" would silently disable
+        # preflight, tiling and the OOM ladder on a box where the numbers are readable.
+        return _cuda_free_memory(device)
 
     def free_memory(self, amount, device):
         try:

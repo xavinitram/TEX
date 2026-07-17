@@ -45,8 +45,17 @@ Three layers; **imports point downward only**. The `tex_compiler` package has
 | **Types** (leaf vocabulary) | `types` (`TEXType`, `CHANNEL_MAP`, `TYPE_NAME_MAP`, swizzles) | nothing (stdlib `enum`/`dataclasses` only) |
 | **Compiler** (IR + front end) | `ast_nodes`, `lexer`, `parser`, `type_checker`, `optimizer`, `stdlib_signatures`, `diagnostics` | types + itself |
 | **Runtime** (execution tiers) | `interpreter`, `codegen` (+ `codegen_stdfns`/`codegen_stencil`/`codegen_persist`, STR-7), `compiled`, `graphed`, `stdlib` (+ `stdlib_registry`), `precision_policy` (PR-LP2 `auto` gate), `tier_trace`, `noise`, `autotier`, `xfer` (ENG-8 transfer-cost probe), `tex_cache`, `tex_marshalling`, `tex_memory`, `host` (PORT-1 seam — the ONLY `comfy.model_management` consumer) | types + compiler + itself |
-| **Public API** (host-agnostic) | `tex_api` (`compile`/`execute`/`Program`, PORT-2), `tex_cli` (`tex run`, PORT-3) | runtime + compiler |
-| **Orchestration** | `tex_node` (+ `tex_doctor` route, DBG-4), `tex_fusion` | all of the above |
+| **Engine** (host-agnostic cook) | `tex_engine` (`cook`/`prepare`/`run`, tier selection, OOM ladder, tiling, precision-auto — ENG-1), `tex_fusion` (splice + the FUS-1 detector), `tex_lazy` | runtime + compiler |
+| **Public API** (host-agnostic) | `tex_api` (`compile`/`execute`/`Program`/`TEXCompileError`, PORT-2/ENG-4), `tex_cli` (`tex run`, PORT-3) | engine + runtime + compiler |
+| **ComfyUI adapter** | `tex_node` (marshalling + schema + `ui=` payload only, S-1), `__init__` (routes), `tex_runtime/host` | all of the above |
+
+**ENG-1 (v0.22) re-cut the top two rows.** `tex_fusion` and `tex_lazy` were only ever
+"Orchestration" because `tex_node` was their sole caller — by dependency they never
+imported it. Lifting the cook into `tex_engine` made that visible: the engine layer is
+what a second host links against, and `tex_node` shrank to the ComfyUI adapter it always
+should have been (1207 → ~600 LOC; `execute` 376 → ~205 lines). `tex_cli` used to import
+`tex_node` — a Public-API → Orchestration edge the old table quietly mis-stated; it now
+cooks through `tex_engine.cook`, so imports point downward for real.
 
 **`tex_core` boundary (S-1).** The ComfyUI-adapter layer is exactly three
 files — `tex_node.py`, `__init__.py`, `tex_runtime/host.py`; **every other module is
@@ -59,7 +68,7 @@ by `test_s1_comfyui_free_execution` (blocks every comfy import, then drives
 live-ComfyUI session (import-path verification can't be done headlessly); the manifest above
 is the split's contents.
 
-**Coupling hubs:** `tex_node` fan-out 12; `ast_nodes` fan-in 11
+**Coupling hubs:** `tex_node` fan-out 12 → **~7 after ENG-1** (the cook's 5 runtime edges moved to `tex_engine`); `ast_nodes` fan-in 11
 (pure data — fine). `type_checker` was fan-in 9 (the `TEXType` leak — 9 modules imported
 the *checker* just to know what a `vec3` is); **STR-1 relocated `TEXType`/`TEXArrayType`/
 `CHANNEL_MAP`/`TYPE_NAME_MAP`/`VALID_SWIZZLES` to the dependency-free `tex_compiler/types.py`
@@ -69,7 +78,9 @@ never the checker). `type_checker` re-imports them for its own use, so legacy
 
 **Two logical import cycles** remain, broken by hand via *function-local* imports
 (deliberate — see `AGENTS.md`): a 7-node runtime SCC
-(`codegen/graphed/compiled/noise/stdlib/interpreter/tex_cache`); `tex_node ↔ tex_memory`.
+(`codegen/graphed/compiled/noise/stdlib/interpreter/tex_cache`); `tex_engine ↔ tex_memory`
+(ENG-1 moved this one off `tex_node` — the interpreter singleton and the tiling/budget
+calls are the engine's; it did NOT remove it, the count is still 2).
 (STR-1 removed the third — `stdlib_signatures ↔ type_checker` — by moving `TEXType` to the
 leaf; `type_checker`'s lazy `FUNCTION_SIGNATURES` bind is now defensive, not cycle-breaking.)
 Do **not** hoist the remaining two to top-level imports — the cycles are logical; the fix is
@@ -184,7 +195,8 @@ Non-redundant by design — each store keys on a different thing (source-hash vs
 with a distinct lifecycle (persist-across-restart vs per-run-clear vs LRU). Do not
 "consolidate" them. #14 is `tex_lazy._memo` (code-hash × fp32 param bits →
 required-binding set; shared by `check_lazy_status` and `execute()`). #15 is
-`tex_node._AUTO_DECISION` (fingerprint × resolution-bucket × device → the `precision="auto"`
+`tex_engine._AUTO_DECISION` (v0.22 ENG-1 re-homed it from `tex_node`; fingerprint ×
+resolution-bucket × device → the `precision="auto"`
 fp16/fp32 gate decision — the *decision*, not the per-cook finiteness verdict; bounded LRU,
 cleared at 512 entries). #16 (v0.21 LAT-3) is `compiled._deferred_ev` (slot →
 pending CUDA event pair for the deferred timing readback; bounded, cleared with the

@@ -71,7 +71,7 @@ def test_pc3_codegen_persistence(r: SubTestResult):
         cache._codegen_memory.pop(fp, None)  # force disk materialize path
         out_cg = execute_compiled(prog, {"A": img}, tm, "cpu", fp,
                                   used_builtins=used)
-        out_interp = _plain_execute(prog, {"A": img}, tm, "cpu", used_builtins=used)
+        out_interp = _plain_execute(prog, {"A": img}, tm, "cpu", used_builtins=used, time_context=None)
         if isinstance(out_cg, dict):
             out_cg = out_cg["OUT"]
         if isinstance(out_interp, dict):

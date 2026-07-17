@@ -328,10 +328,109 @@ def map_inferred_type(inferred: TEXType | None, has_latent_input: bool) -> str:
     }.get(inferred, "IMAGE")
 
 
+# ── ENG-3: egress profiles ───────────────────────────────────────────────────
+#
+# TEX cooks in fp32 and can produce values outside [0,1] (scene-linear highlights, a
+# normal map, a signed flow field, an unpremultiplied alpha). ComfyUI's IMAGE wire
+# cannot: it is 3-channel, [0,1]. So egress has always clamped, dropped alpha, and
+# expanded gray -> RGB. That is CORRECT for ComfyUI and LOSSY for a compositor — the
+# same node hop that ships a clean IMAGE also destroys every HDR value TEX computed.
+#
+# So the format is the HOST's, not the node's:
+#
+#   'comfy'  (default) — exactly today's behaviour, byte-identical. Canary-pinned by
+#              test_eng3_comfy_profile_canary: this profile may never drift.
+#   'engine' — value-preserving: fp32 BHWC, NO clamp, alpha kept, channels kept.
+#              Scene-linear values survive a node hop. For a standalone host / PORT-5.
+#
+# Set once by the host, never per-node — a per-node toggle would let two TEX nodes in
+# one graph disagree about what an IMAGE *is*, and the wire type would stop meaning
+# anything. Lossless reshapes (adding a channel axis, the LATENT permute) are kept in
+# both profiles; only the LOSSY steps (clamp, alpha-drop, gray-expand, 2ch-pad) are
+# what 'engine' declines.
+
+EGRESS_PROFILES = ("comfy", "engine")
+_egress_profile = "comfy"
+
+
+def set_egress_profile(name: str) -> None:
+    """Set the process-wide egress profile (host-level; see EGRESS_PROFILES)."""
+    global _egress_profile
+    if name not in EGRESS_PROFILES:
+        raise ValueError(f"unknown egress profile {name!r} (expected one of "
+                         f"{', '.join(EGRESS_PROFILES)})")
+    _egress_profile = name
+
+
+def get_egress_profile() -> str:
+    """The process-wide egress profile."""
+    return _egress_profile
+
+
+def egress_materializes(profile: str | None = None) -> bool:
+    """True when `profile` (default: the process-wide one) is GUARANTEED to allocate a
+    fresh tensor on the way out, so a caller that formats through it needs no ownership
+    clone of its own — `tex_engine.run(plan)`'s `disown` would be dead work.
+
+    `comfy` clamps, and a clamp always materializes: that accident is why the ComfyUI node
+    never had an aliasing bug in the first place. `engine` exists precisely to REMOVE the
+    lossy steps, so it may hand back a view (`_prepare_output_engine` says so itself) and
+    guarantees nothing.
+
+    This lives here because the answer is a property of the PROFILE, and profiles are this
+    module's business — the engine must not consult it (ownership is a property of the
+    CALL, not of a process global; that confusion is exactly what made `cook()`'s published
+    no-alias guarantee false by default). It is for a caller deciding about ITS OWN egress:
+    `tex_node` formats through the process-wide profile without pinning one, so the
+    process-wide answer IS the node's answer, and it passes `disown=not egress_materializes()`.
+    A caller that PINS a profile (`tex_cli`) must pass that profile here, not read the global
+    — the global does not describe what that call will do.
+    """
+    return (profile or _egress_profile) == "comfy"
+
+
 # ── Output formatting ──
 
-def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
-    """Convert the interpreter's raw output to the expected ComfyUI format."""
+def _reject_string_output(raw, output_type: str) -> None:
+    """A string output must be declared `s@name`. Shared by every egress profile: the
+    rule is TEX's, not a profile's, and the message is user-facing (ENG-3)."""
+    if isinstance(raw, str):
+        raise RuntimeError(
+            f"TEX Error: Output is a string but inferred type is '{output_type}'. "
+            f"Use s@name prefix for string outputs."
+        )
+
+
+def _to_mask_shape(raw: torch.Tensor) -> torch.Tensor:
+    """Reduce any cooked output to MASK's [B, H, W]. Shared by every egress profile: a
+    vec image becomes luminance (that IS what MASK means) and a bare [H,W]/scalar gains
+    its batch axis. Range is NOT touched here — clamping is per-profile (ENG-3)."""
+    if raw.dim() == 4:
+        # Vec3/Vec4 image → luminance scalar
+        return LUMA_R * raw[..., 0] + LUMA_G * raw[..., 1] + LUMA_B * raw[..., 2]
+    if raw.dim() == 2:
+        return raw.unsqueeze(0)        # [H, W] without batch dim — add it
+    if raw.dim() == 0:
+        return raw.view(1, 1, 1)
+    return raw                         # dim == 3 ([B, H, W]) is already correct
+
+
+def prepare_output(raw: torch.Tensor | str, output_type: str, *,
+                   profile: str | None = None) -> Any:
+    """Convert a cooked output to the host's wire format — the public egress entry point.
+
+    Dispatches to the process-wide egress profile (ENG-3). `profile=` overrides it for
+    ONE call, and exists for a host pinning its own conversion (`tex run` writes an 8-bit
+    PNG, so it asks for 'comfy' regardless of what an embedding host chose) — NOT for a
+    node to disagree with its neighbours about what an IMAGE is. That distinction is the
+    caller's to keep; the profile itself stays host-level."""
+    return _EGRESS[profile or _egress_profile](raw, output_type)
+
+
+def _prepare_output_comfy(raw: torch.Tensor | str, output_type: str) -> Any:
+    """The ComfyUI wire format: clamp to [0,1], drop alpha, expand gray -> RGB. Lossy by
+    necessity — that IS the IMAGE contract every downstream node expects. Byte-identical
+    to every version before v0.22 and canary-pinned (test_eng3_comfy_profile_canary)."""
     if output_type == "STRING":
         if isinstance(raw, str):
             return raw
@@ -343,12 +442,7 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
             return str(raw.float().mean().item())
         return str(raw)
 
-    # For non-STRING outputs, if raw is a string, error
-    if isinstance(raw, str):
-        raise RuntimeError(
-            f"TEX Error: Output is a string but inferred type is '{output_type}'. "
-            f"Use s@name prefix for string outputs."
-        )
+    _reject_string_output(raw, output_type)
 
     if output_type == "IMAGE":
         # IMAGE expects [B, H, W, C] float32 in [0, 1]
@@ -377,18 +471,10 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
         return _pinned_clamp01(raw)
 
     elif output_type == "MASK":
-        # MASK expects [B, H, W] float32 in [0, 1]
-        if raw.dim() == 4:
-            # Vec3/Vec4 image → luminance scalar
-            raw = LUMA_R * raw[..., 0] + LUMA_G * raw[..., 1] + LUMA_B * raw[..., 2]
-        elif raw.dim() == 2:
-            # [H, W] without batch dim — add it
-            raw = raw.unsqueeze(0)
-        elif raw.dim() == 0:
-            raw = raw.view(1, 1, 1)
-        # dim == 3 ([B, H, W]) is the correct format — pass through.
+        # MASK expects [B, H, W] float32 in [0, 1]. The shape half is shared with the
+        # engine profile (ENG-3); only the clamp is this profile's own decision.
         # Keep on the compute device (see IMAGE above); pinned egress ditto.
-        return _pinned_clamp01(raw)
+        return _pinned_clamp01(_to_mask_shape(raw))
 
     elif output_type == "FLOAT":
         if raw.dim() == 0:
@@ -418,3 +504,57 @@ def prepare_output(raw: torch.Tensor | str, output_type: str) -> Any:
     # only emits the strings handled above); serves direct prepare_output
     # callers (see DEVELOPMENT.md extension points).
     return raw
+
+
+def _prepare_output_engine(raw: torch.Tensor | str, output_type: str) -> Any:
+    """ENG-3's 'engine' profile: the value-preserving egress.
+
+    Differs from 'comfy' in exactly the LOSSY steps, and nowhere else:
+      IMAGE   no clamp, no alpha-drop, no gray->RGB expand, no 2ch pad — the cooked
+              channels and magnitudes survive verbatim, normalized to fp32 BHWC.
+      MASK    no clamp. A vec image still reduces to luma (that IS what MASK means),
+              but a >1.0 or negative mask value is now preserved rather than crushed.
+      LATENT  identical to 'comfy' — the BCHW permute is lossless and latents were
+              never clamped, so there is nothing to preserve.
+      scalars identical (STRING/FLOAT/INT carry no range to lose).
+    Never pinned — including LATENT, which is why this profile spells out the permute
+    instead of delegating: pinning is an H2D-overlap optimization for the ComfyUI node-hop
+    path (XPU, v0.20), and an engine host owns its own transfers (XPU-2). Page-locking
+    RAM the host never asked to be page-locked is a cost, not a favour.
+
+    OWNERSHIP: this is a format CONVERSION, not a transfer of ownership — it may return a
+    view of `raw` (e.g. an already-fp32 IMAGE passes straight through). The guarantee that
+    a cooked output does not alias an INPUT BINDING belongs one level up, in
+    `tex_engine.run`, which is the only layer that knows what the bindings were."""
+    if output_type == "STRING":
+        return _prepare_output_comfy(raw, "STRING")   # no range to preserve
+    _reject_string_output(raw, output_type)
+
+    if output_type == "IMAGE":
+        if raw.dim() == 3:            # [B,H,W] -> [B,H,W,1]: add the axis, keep the value
+            raw = raw.unsqueeze(-1)
+        elif raw.dim() == 0:
+            raw = raw.view(1, 1, 1, 1)
+        return raw.float()
+    if output_type == "MASK":
+        return _to_mask_shape(raw).float()        # same shape rule, no clamp
+    if output_type == "LATENT":
+        # Same shape rule as 'comfy', minus the page-locking (see the docstring). Latents
+        # were never clamped, so there is no range to preserve here — only the pinning to
+        # decline.
+        if raw.dim() == 4:
+            return raw.permute(0, 3, 1, 2).contiguous()
+        if raw.dim() == 3:
+            return raw.unsqueeze(1)
+        if raw.dim() == 0:
+            return raw.view(1, 1, 1, 1)
+        return raw
+    # FLOAT / INT / unmapped: 'comfy' is already value-preserving and allocation-free for
+    # these (they return Python scalars). Call the profile body directly, not back through
+    # the public dispatcher — re-entering would re-run every pre-dispatch step it grows.
+    return _prepare_output_comfy(raw, output_type)
+
+
+# ENG-3: the profile registry. A third profile is a dict entry, not another branch in
+# the dispatcher — and no profile can reach another through the public entry point.
+_EGRESS = {"comfy": _prepare_output_comfy, "engine": _prepare_output_engine}

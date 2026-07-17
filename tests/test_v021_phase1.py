@@ -185,7 +185,7 @@ def test_fus3_codegen_parity(r: SubTestResult):
                 tm, device=dev, output_names=on)["OUT"]
             cg = _codegen_only_execute(
                 prog, {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in merged.items()},
-                tm, dev, output_names=on, used_builtins=used, fingerprint=f"fus3cg_{dev}")
+                tm, dev, output_names=on, used_builtins=used, fingerprint=f"fus3cg_{dev}", time_context=None)
             cg = cg["OUT"] if isinstance(cg, dict) else cg
             md = (interp.float() - cg.float()).abs().max().item()
             if md < 1e-5:

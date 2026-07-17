@@ -82,7 +82,7 @@ def test_m5_int_binding(r: SubTestResult):
         C._plain_execute = counting
         try:
             out_cg = C._codegen_only_execute(prog, {"A": imgL.clone()}, tm, "cpu",
-                                             output_names=outs, fingerprint="m5int")
+                                             output_names=outs, fingerprint="m5int", time_context=None)
         finally:
             C._plain_execute = orig
         out_cg = out_cg["OUT"] if isinstance(out_cg, dict) else out_cg
@@ -156,7 +156,8 @@ def test_m2cpu_and_m1_freeretry(r: SubTestResult):
         return
     calls = {"n": 0}
     orig_free = M.free_tensor_caches
-    interp = NODE._get_interpreter()
+    from TEX_Wrangle import tex_engine as _E   # ENG-1: interpreter singleton moved
+    interp = _E._get_interpreter()
     orig_exec = interp.execute
     try:
         M.free_tensor_caches = lambda: calls.__setitem__("n", calls["n"] + 1)

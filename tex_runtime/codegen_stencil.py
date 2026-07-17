@@ -128,22 +128,28 @@ def _try_extract_symmetric_range(loop: ForLoop) -> tuple[str, ASTNode | int] | N
     return (loop_var, radius_expr)
 
 
-def _find_fetch_call(expr: ASTNode) -> FunctionCall | BindingIndexAccess | None:
-    """Find a fetch() or sample() call inside an expression tree.
+def _match_tap(expr: ASTNode) -> FunctionCall | BindingIndexAccess | BindingSampleAccess | None:
+    """Match expr EXACTLY as a stencil tap: a bare fetch()/sample() call, or
+    @binding[...] / @binding(...) access.
 
-    Handles both FunctionCall("fetch"/"sample", ...) and BindingIndexAccess/BindingSampleAccess.
+    This is a MATCH, not a search. It deliberately does NOT look inside BinOp:
+    the lowerings this feeds (avg_pool2d / max_pool2d / unfold) can only express
+    an *unweighted* neighbourhood over the tap itself, so the tap must BE the
+    whole accumulated term. A composed term like `@A[ix+dx, iy+dy] * 0.5` has no
+    such form — returning the inner fetch would emit a kernel with no trace of
+    the `* 0.5`, silently computing 2x the right answer. Returning None instead
+    makes the caller decline the stencil route, and the program falls back to the
+    interpreter, which evaluates the weight correctly (just not accelerated).
+
+    It likewise does not unwrap ChannelAccess: every caller peels the swizzle off
+    itself so it can record `channels`. A ChannelAccess still present here means
+    the swizzle sits somewhere this matcher cannot attribute (e.g. under a BinOp),
+    and diving past it would silently drop the channel selection.
     """
     if isinstance(expr, FunctionCall) and expr.name in ("fetch", "sample"):
         return expr
     if isinstance(expr, (BindingIndexAccess, BindingSampleAccess)):
         return expr
-    if isinstance(expr, ChannelAccess):
-        return _find_fetch_call(expr.object)
-    if isinstance(expr, BinOp):
-        found = _find_fetch_call(expr.left)
-        if found:
-            return found
-        return _find_fetch_call(expr.right)
     return None
 
 
@@ -263,7 +269,7 @@ def _is_sum_accum(stmt: Assignment, inner_var: str, outer_var: str,
         channels = rhs.channels
         fetch_expr = rhs.object
 
-    fetch_node = _find_fetch_call(fetch_expr)
+    fetch_node = _match_tap(fetch_expr)
     if fetch_node is None:
         return None
 
@@ -316,7 +322,7 @@ def _is_array_collect_assign(stmt: Assignment, inner_var: str, outer_var: str,
     else:
         fetch_expr = value
 
-    fc = _find_fetch_call(fetch_expr)
+    fc = _match_tap(fetch_expr)
     if fc is None:
         return None
 
@@ -375,7 +381,7 @@ def _is_minmax_accum(stmt: Assignment, inner_var: str, outer_var: str,
                     channels = resolved.channels
                 resolved = resolved.object
 
-            fetch_node = _find_fetch_call(resolved)
+            fetch_node = _match_tap(resolved)
             if fetch_node is None:
                 continue
             coord_info = _check_fetch_coords(fetch_node, inner_var, outer_var, local_defs)
@@ -395,6 +401,24 @@ def _collect_local_defs(stmts: list[ASTNode], local_defs: dict[str, ASTNode]) ->
             if not (isinstance(stmt.value, BinOp) and stmt.value.op == "+"
                     and _is_ident(stmt.value.left, stmt.target.name)):
                 local_defs[stmt.target.name] = stmt.value
+
+
+def _collect_local_decls(stmts: list[ASTNode], out: set) -> None:
+    """Names DECLARED (`VarDecl`) directly in a loop body.
+
+    Distinct from `_collect_local_defs`, and the distinction is the whole point:
+    `_collect_local_defs` records every identifier ASSIGNMENT so taps can be resolved
+    through temporaries (`su = u + i*px; ... sample(su, sv)`). Using that same map to
+    decide which statements may be DISCARDED is circular — it contains every assignment
+    by construction, so the check passes for all of them, and the lowering then deletes
+    statements nobody accounted for.
+
+    A name declared inside the body cannot be read after the loop, so dropping its
+    assignment is safe. A name assigned but declared OUTSIDE escapes, and the lowering
+    would silently stop computing it."""
+    for stmt in stmts:
+        if isinstance(stmt, VarDecl):
+            out.add(stmt.name)
 
 
 def _iter_for_loops(stmts: list[ASTNode]):
@@ -461,8 +485,14 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
             inner_loop = stmt
         elif isinstance(stmt, Assignment):
             cv = _is_count_increment(stmt)
-            if cv is not None:
-                outer_count_var = cv
+            if cv is None:
+                # The inner body has a has_unknown mechanism; this scan had none, so an
+                # arbitrary outer-body assignment fell through the elif chain and was
+                # accepted by silence — then deleted, because emission replaces the ENTIRE
+                # nest. It also defeated the one-lowering-per-loop check, which only ever
+                # inspects the inner body. Decline: the interpreter computes it correctly.
+                return None
+            outer_count_var = cv
         elif isinstance(stmt, (VarDecl, ExprStatement)):
             pass
         else:
@@ -493,6 +523,9 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
     local_defs: dict[str, ASTNode] = {}
     _collect_local_defs(outer_loop.body, local_defs)
     _collect_local_defs(inner_loop.body, local_defs)
+    local_decls: set = set()
+    _collect_local_decls(outer_loop.body, local_decls)
+    _collect_local_decls(inner_loop.body, local_decls)
 
     # Inner body: classify the stencil pattern.
     # Try box blur (sum accumulation), min/max, median (array collect).
@@ -529,12 +562,25 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
             if cv is not None:
                 inner_count_var = cv
                 continue
-            # Allow intermediate variable definitions (su, sv for sample pattern)
-            if isinstance(stmt.target, Identifier) and stmt.target.name in local_defs:
+            # Allow intermediate definitions (su/sv for the sample pattern) — but only
+            # for names DECLARED inside the nest. `local_defs` would accept every
+            # assignment here, since it recorded them all itself (see
+            # _collect_local_decls); a name declared outside outlives the loop, and the
+            # lowering replaces the whole nest, so its update would just stop happening.
+            if isinstance(stmt.target, Identifier) and stmt.target.name in local_decls:
                 continue
         elif isinstance(stmt, (VarDecl, ExprStatement)):
             continue
         # Unknown statement type or unrecognized assignment — not necessarily fatal
+        has_unknown = True
+
+    # Exactly ONE lowering may claim the loop. Emission replaces the entire nest
+    # with a single pool/unfold, so a second accumulator of a different kind would
+    # simply stop being computed: `acc = acc + tap; m = max(m, tap);` in one body
+    # used to lower as box and leave `m` at its init, silently. (Two accumulators
+    # of the SAME kind already set has_unknown above; this covers the cross-kind
+    # case, which the box-then-minmax-then-median preference order otherwise hides.)
+    if sum((accum_info is not None, minmax_info is not None, bool(array_collects))) > 1:
         has_unknown = True
 
     # Return the detected stencil kind (prefer box, then minmax, then median)
@@ -575,7 +621,12 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
         )
 
     # Try median: array collect pattern (arr[idx] = fetch(...))
-    if array_collects and not accum_info and not minmax_info:
+    # `not has_unknown` for the same reason box and minmax check it: lowering
+    # REPLACES the whole loop nest with the unfold, so any statement in the body
+    # this pass could not account for would simply stop running. Without it, a
+    # body that collects taps AND does anything else — accumulate, branch, call —
+    # silently loses that other work.
+    if array_collects and not accum_info and not minmax_info and not has_unknown:
         # Validate: all from same binding
         bindings = set(ac[2] for ac in array_collects)
         if len(bindings) == 1:
@@ -870,8 +921,14 @@ def _try_detect_inline_stencil(stmts: list[ASTNode], start: int
                 is_fetch = False
             else:
                 is_fetch = True  # BindingRef, BindingIndexAccess → fetch-like
-        elif b_name != binding_name:
-            break  # Different binding — stop
+        elif b_name != binding_name or ch != all_channels:
+            # Different binding — stop. And likewise a different SWIZZLE: `all_channels` is
+            # recorded from the FIRST tap and then applied to the whole lowered kernel, so
+            # a `@A.r` tap followed by a `@A.g` one used to lower as if both read `.r` —
+            # every later tap silently reading the wrong channel. The conv2d emitter has
+            # one channel selection to give; a nest that needs two is not a conv2d, so stop
+            # collecting and let the interpreter read each tap as written.
+            break
 
         taps.append((var_name, b_name, dx, dy, ch))
         tap_indices.append(i)

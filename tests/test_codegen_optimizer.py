@@ -2264,6 +2264,352 @@ for (int i = 0; i < 3; i = i + 1) { acc = acc + s; }
 m@OUT = acc * 0.2;
 """, {"A": img.clone()})
 
+    # ── UC-2: a weighted/composed tap must not be lowered as if it were bare ──
+    #
+    # The loop stencil matchers used to SEARCH the accumulated term for a fetch
+    # (`_find_fetch_call` recursed into BinOp) and treat whatever it found as the
+    # whole term. So `acc = acc + @A[ix+dx, iy+dy] * 0.5` matched as a plain box
+    # blur: the `* 0.5` was discarded and the emitted avg_pool2d computed exactly
+    # 2x the right answer, with shapes intact — silently, on the DEFAULT path.
+    # The matcher now demands the tap BE the term (`_match_tap`), so these decline
+    # the stencil route and lower as ordinary loops instead: slower, but correct.
+    # Every row below diverges (maxdiff ~0.4-0.7 vs tol 1e-5) without that fix.
+    #
+    # These use the `@A[...]` index form; the routing-side assertions live in
+    # test_v015_phase2.test_uc2_stencil_routing and use the fetch() form.
+    _equiv_strict(r, "stencil tap: scaled (* 0.5) is not an unweighted box", """
+vec4 acc = vec4(0.0);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { acc = acc + @A[ix+dx, iy+dy] * 0.5; }
+}
+@OUT = acc / 9.0;
+""", {"A": img.clone()})
+
+    _equiv_strict(r, "stencil tap: divided (/ 2.0) is not an unweighted box", """
+vec4 acc = vec4(0.0);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { acc = acc + @A[ix+dx, iy+dy] / 2.0; }
+}
+@OUT = acc / 9.0;
+""", {"A": img.clone()})
+
+    # A runtime param weight: its value (and sign) is unknowable at emit time, so
+    # no static fold could rescue this even in principle — it must decline.
+    _equiv_strict(r, "stencil tap: param-weighted (* $w) is not an unweighted box", """
+f$w = 0.5;
+vec4 acc = vec4(0.0);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { acc = acc + @A[ix+dx, iy+dy] * $w; }
+}
+@OUT = acc / 9.0;
+""", {"A": img.clone(), "w": 0.5})
+
+    # ChannelAccess NOT at the top of the term: the old code dove past it to the
+    # fetch, losing the weight AND leaving channels=None, so it pooled every
+    # channel — corrupting rank/channel selection on top of magnitude.
+    _equiv_strict(r, "stencil tap: swizzle under a BinOp (.r * 0.5)", """
+float acc = 0.0;
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { acc = acc + @A[ix+dx, iy+dy].r * 0.5; }
+}
+@OUT = vec4(acc / 9.0);
+""", {"A": img.clone()})
+
+    # Same defect via the min/max matcher (`_is_minmax_accum`) — max_pool2d has no
+    # weighted form either. Signed weights make this unfoldable in principle.
+    _equiv_strict(r, "stencil tap: weighted min/max is not an unweighted pool", """
+vec4 m = vec4(0.0);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { m = max(m, @A[ix+dx, iy+dy] * 0.5); }
+}
+@OUT = m;
+""", {"A": img.clone()})
+
+    # And via the array-collect matcher (`_is_array_collect_assign` -> unfold),
+    # the shape behind the shipped examples/median_filter.tex.
+    _equiv_strict(r, "stencil tap: weighted array-collect is not an unweighted unfold", """
+float s0[9];
+int idx = 0;
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) {
+        s0[idx] = @A[ix+dx, iy+dy].r * 0.5;
+        idx = idx + 1;
+    }
+}
+s0 = sort(s0);
+@OUT = vec4(s0[4]);
+""", {"A": img.clone()})
+
+    # Control: the BARE tap these all derive from must still take the fast path.
+    # Without this the fix could "pass" by declining everything.
+    bare_box = """
+vec4 acc = vec4(0.0);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { acc = acc + @A[ix+dx, iy+dy]; }
+}
+@OUT = acc / 9.0;
+"""
+    _equiv_strict(r, "stencil tap: bare box still lowers (parity)", bare_box,
+                  {"A": img.clone()})
+    try:
+        src = _codegen_source(bare_box, {"A": img})
+        assert "avg_pool2d" in src, "bare box blur no longer takes the avg_pool2d fast path"
+        r.ok("stencil tap: bare box still stencilizes")
+    except Exception as e:
+        r.fail("stencil tap: bare box still stencilizes", f"{e}")
+
+    # ── The emitter must not assume the loop's SHAPE or its PRE-STATE ──
+    #
+    # (a) Single-channel rank. `_stencil_to_bchw` slices one channel as
+    # `bchw[:, i:i+1]` — the pool ops need that axis to stay 4-D — so permuting back
+    # yields [B,H,W,1], one rank above the [B,H,W] the interpreter holds for a
+    # `float`. No weight is involved: these are BARE taps that legitimately lower,
+    # and they were rank-wrong on the shipped default path. Multi-channel swizzles
+    # were always fine (.rg -> vec2, .rgb -> vec3), so they guard the squeeze's edges.
+    for name, ch, decl, out in [
+        ("box .r", "r", "float acc = 0.0;", "@OUT = vec4(acc / 9.0);"),
+        ("box .g", "g", "float acc = 0.0;", "@OUT = vec4(acc / 9.0);"),
+    ]:
+        _equiv_strict(r, f"stencil rank: bare {name} stays scalar", f"""
+{decl}
+for (int dy = -1; dy <= 1; dy = dy + 1) {{
+    for (int dx = -1; dx <= 1; dx = dx + 1) {{ acc = acc + @A[ix+dx, iy+dy].{ch}; }}
+}}
+{out}
+""", {"A": img.clone()})
+
+    _equiv_strict(r, "stencil rank: bare .b max stays scalar", """
+float m = 0.0;
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { m = max(m, @A[ix+dx, iy+dy].b); }
+}
+@OUT = vec4(m);
+""", {"A": img.clone()})
+
+    _equiv_strict(r, "stencil rank: bare .r min stays scalar", """
+float m = 1.0;
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { m = min(m, @A[ix+dx, iy+dy].r); }
+}
+@OUT = vec4(m);
+""", {"A": img.clone()})
+
+    _equiv_strict(r, "stencil rank: bare .rg box (2ch) unaffected", """
+vec2 acc = vec2(0.0, 0.0);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { acc = acc + @A[ix+dx, iy+dy].rg; }
+}
+@OUT = vec4(acc.r / 9.0, acc.g / 9.0, 0.0, 1.0);
+""", {"A": img.clone()})
+
+    # (b) Only ONE lowering may claim a loop. Emission replaces the entire nest, so
+    # when box won, a co-resident min/max or array-collect simply stopped being
+    # computed — `m` kept its init. This was masked until the rank fix above: the
+    # [B,H,W,1] accumulator made the downstream stack() raise, which fell back to the
+    # interpreter and produced the right answer by accident. Fixing (a) unmasks (b),
+    # so they ship together.
+    _equiv_strict(r, "stencil claim: box + minmax in one body", """
+float acc = 0.0;
+float m = 0.0;
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) {
+        acc = acc + @A[ix+dx, iy+dy].r;
+        m = max(m, @A[ix+dx, iy+dy].g);
+    }
+}
+@OUT = vec4(acc / 9.0, m, 0.0, 1.0);
+""", {"A": img.clone()})
+
+    _equiv_strict(r, "stencil claim: box + array-collect in one body", """
+float s0[9];
+int idx = 0;
+float acc = 0.0;
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) {
+        s0[idx] = @A[ix+dx, iy+dy].r;
+        acc = acc + @A[ix+dx, iy+dy].g;
+        idx = idx + 1;
+    }
+}
+s0 = sort(s0);
+@OUT = vec4(s0[4], acc / 9.0, 0.0, 1.0);
+""", {"A": img.clone()})
+
+    # (c) The median gate. Box and minmax refuse a body with unaccounted statements
+    # (`not has_unknown`); median did not. That only became reachable once weighted
+    # taps started DECLINING: while `acc = acc + tap * 0.5` still (wrongly) matched,
+    # `accum_info` was set and `not accum_info` kept median out. Making the matcher
+    # strict opened the gate, converting a box mis-lowering into a median one of the
+    # same magnitude — so the gate is part of that fix, not a separate nicety.
+    _equiv_strict(r, "stencil claim: weighted accum + array-collect (median gate)", """
+float s0[9];
+int idx = 0;
+float acc = 0.0;
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) {
+        s0[idx] = @A[ix+dx, iy+dy].r;
+        acc = acc + @A[ix+dx, iy+dy].g * 0.5;
+        idx = idx + 1;
+    }
+}
+s0 = sort(s0);
+@OUT = vec4(s0[4], acc / 9.0, 0.0, 1.0);
+""", {"A": img.clone()})
+
+    # An array-collect beside ANY unaccounted statement — the gate's standalone case,
+    # independent of the weight defect.
+    _equiv_strict(r, "stencil claim: array-collect + unrelated statement", """
+float s0[9];
+int idx = 0;
+float junk = 0.0;
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) {
+        s0[idx] = @A[ix+dx, iy+dy].r;
+        junk = junk + sqrt(@A[ix+dx, iy+dy].g + 1.0);
+        idx = idx + 1;
+    }
+}
+s0 = sort(s0);
+@OUT = vec4(s0[4], junk / 9.0, 0.0, 1.0);
+""", {"A": img.clone()})
+
+    # ── The emitter must ACCOUNT for the accumulator's pre-loop SEED ──
+    #
+    # `_emit_box_stencil` / `_emit_minmax_stencil` replace the nested loop with a
+    # single pool, then assigned the pool straight into the accumulator — dropping
+    # whatever value it held at loop entry. But the interpreter runs
+    # `acc = acc + tap` / `m = max/min(m, tap)` FROM that entry value, so a
+    # non-identity seed changed the answer. This shipped on the DEFAULT path
+    # (`compile_mode="none"`, no opt-in) and was disclosed as a known gap.
+    #
+    # Why the bare-tap tests above could not catch it: they all seed with the
+    # lowering's *effective* identity for `torch.rand` data in [0,1) — 0.0 for box
+    # and max (a max against 0.0 over non-negative data never wins), 1.0 for min.
+    # The seed silently vanishing looks identical to folding a no-op. Divergence
+    # needs a seed that actually participates: a non-zero box seed, or a min/max
+    # seed over SIGNED data (latents) where the neighbourhood can fall on the far
+    # side of it.
+    #
+    # min/max and box need DIFFERENT treatment, because their folds differ in kind:
+    #   - min/max FOLD via torch.maximum/minimum — a selection, order-independent, so
+    #     it is bit-exact against the interpreter's iterated max()/min() for ANY seed.
+    #   - box-sum CANNOT fold bit-exactly: avg_pool2d sums the taps in the interpreter's
+    #     own order (a zero seed is exact even at large magnitude), but a non-identity
+    #     additive seed folded onto that sum sits at the opposite end of the
+    #     accumulation from the interpreter's seed-first left-fold, so FP reassociation
+    #     error scales with |seed| (seed 100 over [0,1) -> 2.3e-5, over the 1e-5 bound).
+    #     So a PROVABLY non-zero constant box seed DECLINES to the bit-exact static
+    #     unroll; only a zero/default/runtime seed keeps the pool. Every row below is
+    #     bit-exact under the fix and diverged (maxdiff ~0.05-0.6, or ~2e-5 for the large
+    #     box seed) under the old overwrite.
+    #
+    # Deterministic spatial ramps, not random data, so the discriminating window is a
+    # GUARANTEE not an RNG accident: `signed` in [-1,1) has an all-negative window
+    # (top-left — a max seeded 0.0 clamps it) and an all-positive window (bottom-right —
+    # a min seeded 0.0 clamps it); `bright` in [0,1) has a bottom-right window whose min
+    # exceeds 0.5 (so a min seed of 0.5 actually wins there). A uniform `rand*2-1` can,
+    # on some RNG seeds, contain no such window, and then the row passes even against the
+    # buggy overwrite (it did, in an earlier draft of this test).
+    _B, _H, _W, _C = img.shape
+    _ramp = torch.linspace(-1.0, 1.0, _H * _W).reshape(1, _H, _W, 1)
+    signed = _ramp.expand(_B, _H, _W, _C).contiguous()
+    bright = ((_ramp + 1.0) * 0.5).expand(_B, _H, _W, _C).contiguous()   # [0,1)
+
+    # (a) Box-sum, small non-zero constant seed: declines to the bit-exact unroll.
+    _equiv_strict(r, "stencil seed: box seeded vec4(0.5) stays bit-exact", """
+vec4 acc = vec4(0.5);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { acc = acc + @A[ix+dx, iy+dy]; }
+}
+@OUT = acc / 9.0;
+""", {"A": img.clone()})
+
+    # (b) Box-sum, LARGE constant seed. This is the row that pins the decline: folding
+    # vec4(1000.0) onto the pool sum reassociates ~1e-4 past the interpreter (well over
+    # 1e-5); declining to the unroll keeps it bit-exact. Reds if the decline is removed.
+    _equiv_strict(r, "stencil seed: box seeded vec4(1000.0) stays bit-exact", """
+vec4 acc = vec4(1000.0);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { acc = acc + @A[ix+dx, iy+dy]; }
+}
+@OUT = acc;
+""", {"A": img.clone()})
+
+    # (c) Single-channel seeded box: the [B,H,W,1]->[B,H,W] squeeze + a 0-dim scalar seed
+    # (`float acc`) still route correctly (declines here too, exact via unroll).
+    _equiv_strict(r, "stencil seed: single-channel box seeded 0.5 stays bit-exact", """
+float acc = 0.5;
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { acc = acc + @A[ix+dx, iy+dy].r; }
+}
+@OUT = vec4(acc / 9.0);
+""", {"A": img.clone()})
+
+    # (d) max-pool over SIGNED data seeded vec4(0.0): interp clamps the neighbourhood
+    # against 0.0 (all-negative windows stay 0.0); the raw max_pool2d returns the true
+    # negative max. min/max FOLD (torch.maximum) — bit-exact for any seed, so it lowers.
+    _equiv_strict(r, "stencil seed: signed max seeded 0.0 folds (latents)", """
+vec4 m = vec4(0.0);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { m = max(m, @A[ix+dx, iy+dy]); }
+}
+@OUT = m;
+""", {"A": signed.clone()})
+
+    # (e) min-pool over SIGNED data seeded vec4(0.0): mirror of (d) on the low side.
+    _equiv_strict(r, "stencil seed: signed min seeded 0.0 folds (latents)", """
+vec4 m = vec4(0.0);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { m = min(m, @A[ix+dx, iy+dy]); }
+}
+@OUT = m;
+""", {"A": signed.clone()})
+
+    # (f) min seeded a NON-zero constant 0.5, over data whose bottom-right window min
+    # exceeds 0.5 (so the seed wins there). Confirms the min/max fold folds a live seed,
+    # not just a losing one — and still lowers (min/max never decline on the seed).
+    _equiv_strict(r, "stencil seed: min seeded 0.5 folds", """
+vec4 m = vec4(0.5);
+for (int dy = -1; dy <= 1; dy = dy + 1) {
+    for (int dx = -1; dx <= 1; dx = dx + 1) { m = min(m, @A[ix+dx, iy+dy]); }
+}
+@OUT = m;
+""", {"A": bright.clone()})
+
+    # Routing control. The two lowerings resolve the seed differently, and the emitted
+    # source must show it: a non-zero-CONSTANT box DECLINES (no avg_pool2d — runs the
+    # bit-exact unroll), while a zero/default box and ANY seeded min/max still take the
+    # pool. Guards both directions: a regression that stopped declining the box would
+    # reintroduce the >1e-5 fold; one that stopped lowering the zero box or the min/max
+    # would silently lose the fast path (the unroller would still give right numbers, so
+    # _equiv_strict alone can't see it).
+    def _src(code, binding):
+        return _codegen_source(code, {"A": binding})
+    def _box(seed, decl="vec4"):
+        return (f"{decl} acc = {decl}({seed});\n"
+                "for (int dy=-1; dy<=1; dy=dy+1){ for (int dx=-1; dx<=1; dx=dx+1){"
+                " acc = acc + @A[ix+dx, iy+dy]; } }\n@OUT = vec4(acc);")
+    try:
+        # Non-zero constant box seeds decline (bit-exact unroll, no pool).
+        assert "avg_pool2d" not in _src(_box("0.5"), img), "seeded box should DECLINE, not pool"
+        assert "avg_pool2d" not in _src(_box("1000.0"), img), "large seeded box should DECLINE"
+        # Zero seed AND default-init (no explicit initializer, defaults to zero) keep the
+        # pool — declining these would be a fast-path regression on the common bare box.
+        assert "avg_pool2d" in _src(_box("0.0"), img), "bare box lost the avg_pool2d fast path"
+        default_box = ("vec4 acc;\nfor (int dy=-1; dy<=1; dy=dy+1){ for (int dx=-1; dx<=1;"
+                       " dx=dx+1){ acc = acc + @A[ix+dx, iy+dy]; } }\n@OUT = vec4(acc);")
+        assert "avg_pool2d" in _src(default_box, img), "default-init box lost the fast path"
+        # Every seeded min/max lowers (the fold is exact, so it never declines).
+        max_src = _src("vec4 m = vec4(0.0);\nfor (int dy=-1; dy<=1; dy=dy+1){ for (int dx=-1;"
+                       " dx<=1; dx=dx+1){ m = max(m, @A[ix+dx, iy+dy]); } }\n@OUT = m;", signed)
+        assert "max_pool2d" in max_src, "seeded max lost the max_pool2d fast path"
+        min_src = _src("vec4 m = vec4(0.5);\nfor (int dy=-1; dy<=1; dy=dy+1){ for (int dx=-1;"
+                       " dx<=1; dx=dx+1){ m = min(m, @A[ix+dx, iy+dy]); } }\n@OUT = m;", bright)
+        assert "max_pool2d" in min_src, "seeded min lost the max_pool2d fast path"
+        r.ok("stencil seed: routing (non-zero box declines; zero box + min/max lower)")
+    except Exception as e:
+        r.fail("stencil seed: routing (non-zero box declines; zero box + min/max lower)", f"{e}")
+
 
 def test_codegen_sample_hoist_in_branches(r: SubTestResult):
     """CG-B3: a hoisted sample() setup inside an if/else branch is BRANCH-LOCAL.

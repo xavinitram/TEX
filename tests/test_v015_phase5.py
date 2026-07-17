@@ -4,7 +4,7 @@ v0.15.0 Phase 5 regression tests — CC-2 measured auto-tier + Q-3 fusion wideni
 from helpers import *
 from TEX_Wrangle.tex_runtime import autotier as AT
 import TEX_Wrangle.tex_fusion as _FUS
-from TEX_Wrangle.tex_node import _infer_binding_type
+from TEX_Wrangle.tex_marshalling import infer_binding_type as _infer_binding_type  # ENG-1: not via the node
 
 
 def _run_fused(stages):

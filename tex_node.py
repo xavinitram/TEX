@@ -5,18 +5,24 @@ Provides a single node where users write compact TEX scripts to process
 images, masks, and scalar values using per-pixel tensor operations.
 
 Requires ComfyUI with Nodes v3 API support (comfy_api.latest).
+
+**ENG-1 (v0.22): this file is the ComfyUI ADAPTER, not the engine.** The cook itself
+— tier selection, fallbacks, the OOM ladder, tiling, the `precision="auto"` gate —
+lives in `tex_engine`. `execute()` is marshal-in → `engine.prepare`/`engine.run` →
+marshal-out, and what stays here is exactly what ComfyUI imposes: the kwargs +
+lazy-slot-pool protocol, LATENT dict wrap/unwrap, the `ui=` HUD payload, and the
+`TEX_DIAG:`-suffixed RuntimeError the frontend parses. Anything host-agnostic that
+lands here is in the wrong module (S-1).
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
-import os
 import re
 import time
 import torch
 import traceback
-from dataclasses import dataclass, replace
 from typing import Any
 
 logger = logging.getLogger("TEX")
@@ -25,28 +31,20 @@ from .tex_compiler.lexer import LexerError
 from .tex_compiler.parser import ParseError
 from .tex_compiler.type_checker import TypeCheckError
 from .tex_compiler.diagnostics import TEXMultiError, TEX_BUG_REPORT_URL
-from .tex_compiler.ast_nodes import SourceLoc
-from .tex_runtime.interpreter import Interpreter, InterpreterError
-from .tex_cache import get_cache
-from .tex_runtime.compiled import (
-    execute_compiled,
-    _codegen_only_execute,
-    should_stencil_route as _should_stencil_route,
-)
-from .tex_fusion import (
-    prepare_fused as _prepare_fused,
-    fused_fingerprint as _fused_fingerprint,
-    FusionError,
-)
+from .tex_runtime.interpreter import InterpreterError
+from .tex_fusion import FusionError
+
+# ENG-1: the cook engine (host-agnostic). This node is one of its callers.
+from . import tex_engine as _engine
+from .tex_engine import _oom_in_chain, _drop_tex_caches_on_oom
 
 # Marshalling and type inference utilities (extracted to tex_marshalling.py)
 from .tex_marshalling import (
     tensor_fingerprint as _tensor_fingerprint,
     unwrap_latent as _unwrap_latent,
-    convert_param_value as _convert_param_value,
-    infer_binding_type as _infer_binding_type,
     prepare_output as _prepare_output,
     map_inferred_type as _map_inferred_type,
+    egress_materializes as _egress_materializes,
 )
 
 # ── v3 API import ──
@@ -58,36 +56,10 @@ except ImportError:
     IO = None
     _V3_AVAILABLE = False
 
-# ── Host memory-management (PORT-1: the seam; ComfyUI or a Null host) ──
-from .tex_runtime.host import get_host_services
 from . import tex_lazy as _tex_lazy
 
 # Matches the schema's lazy input-pool slot names (in_0..in_{MAX_LAZY_INPUTS-1}).
 _LAZY_SLOT_RE = re.compile(r"^in_\d+$")
-
-
-@dataclass(frozen=True)
-class ExecContext:
-    """STR-2/STR-3: the value bundle threaded from `execute()` into the tier strategies
-    (`_run_torch_compile`/`_run_auto`/`_run_cuda_graph`/`_run_default`) and the shared
-    `_interp_fallback` recovery path. Built once per cook so a strategy never re-touches
-    execute()'s locals; `select_tier` picks the strategy, `execute()` dispatches via
-    `_TIER_METHOD` and normalizes the output shape in one place."""
-    program: Any
-    bindings: dict
-    type_map: dict
-    device: Any
-    code: str
-    latent_channel_count: int
-    output_names: list
-    used_builtins: Any
-    eff_precision: str  # M-3: fp32 when a LATENT input is present, else `precision`
-    # STR-2: fields the accelerated/default tier strategies read (hoisted once so a
-    # strategy never re-touches execute()'s locals). `fp` is the value-independent
-    # fingerprint, or None on a fused chain (which is keyed by `fused_fp` instead).
-    fp: Any = None
-    fused_chain: bool = False
-    fused_fp: Any = None
 
 
 def _downscale_for_preview(img: torch.Tensor, max_dim: int = 256) -> torch.Tensor:
@@ -106,147 +78,6 @@ def _downscale_for_preview(img: torch.Tensor, max_dim: int = 256) -> torch.Tenso
     out = torch.nn.functional.interpolate(bchw, size=(nh, nw), mode="bilinear",
                                           align_corners=False)
     return out.permute(0, 2, 3, 1).contiguous()
-
-
-def _is_oom_error(e: BaseException) -> bool:
-    """True when *e* is an out-of-memory error.
-
-    Prefers ComfyUI's ``model_management.is_oom`` — on recent torch, OOM can
-    surface as ``torch.AcceleratorError`` (error_code==2), not just
-    ``torch.cuda.OutOfMemoryError``, and ``is_oom`` also clears poisoned async
-    CUDA error state. Falls back to ``OOM_EXCEPTION`` then the torch type so
-    standalone runs still detect it (the Null host falls back to the torch type)."""
-    return get_host_services().is_oom(e)
-
-
-def _oom_in_chain(e: BaseException) -> BaseException | None:
-    """The OOM error in *e*'s ``__cause__`` chain (or *e* itself), else None.
-
-    M-1: an OOM raised inside a stdlib call is re-wrapped as ``InterpreterError``
-    (``from e``), so the node's InterpreterError branch must look PAST the wrapper
-    — otherwise ComfyUI's OOM handling (memory summary + model unload) never fires
-    for the very allocations most likely to OOM (sample_mip/gauss_blur pyramids)."""
-    seen: set[int] = set()
-    cur: BaseException | None = e
-    depth = 0
-    while cur is not None and id(cur) not in seen and depth < 8:
-        if _is_oom_error(cur):
-            return cur
-        seen.add(id(cur))
-        cur = cur.__cause__
-        depth += 1
-    return None
-
-
-def _drop_tex_caches_on_oom() -> None:
-    """P1-M1-FREERETRY: drop TEX's own module-level tensor caches (mip/grid/sampler
-    pyramids) on OOM before re-raising, so ComfyUI's OOM handling (unload_all_models
-    + execution retry) has that memory available — its unload frees resident models
-    but never TEX's caches. Best-effort; the caches rebuild lazily next cook."""
-    try:
-        from .tex_memory import free_tensor_caches
-        free_tensor_caches()
-    except Exception:
-        pass
-
-
-def _is_channels_last_image(t):
-    """A channels-last IMAGE ([B,H,W,C], C<=4). The C<=4 guard avoids mis-reading a
-    non-channels-last tensor ([B,C,H,W]) as a giant channel dim."""
-    return isinstance(t, torch.Tensor) and t.is_floating_point() and t.dim() >= 4 \
-        and t.shape[-1] <= 4
-
-
-def _paint_pixels(t, pixel_mask_keepdim, rgba):
-    """Paint the image pixels selected by `pixel_mask_keepdim` ([...,H,W,1]) a constant
-    RGBA (clipped to the channel count). The single home of the debug pixel-paint contract,
-    shared by DBG-3's magenta NaN flag and C4-ux's cyan near-singularity flag."""
-    color = torch.tensor(list(rgba)[:t.shape[-1]], dtype=t.dtype, device=t.device)
-    return torch.where(pixel_mask_keepdim, color, t)
-
-
-def _nan_highlight(t):
-    """DBG-3: paint every NaN/Inf PIXEL magenta so non-finite output is obvious. For a
-    [B,H,W,C] image, any non-finite channel magenta-flags the whole pixel; for a
-    [B,H,W] mask (or other), non-finite elements are set to 1.0. A no-op (returns the
-    input) for a finite tensor or a non-tensor — the caller only calls it when the
-    toggle is on, so a finite cook pays one isfinite reduction and nothing else."""
-    if not (isinstance(t, torch.Tensor) and t.is_floating_point()):
-        return t
-    finite = torch.isfinite(t)
-    if bool(finite.all()):
-        return t
-    if _is_channels_last_image(t):
-        return _paint_pixels(t, (~finite).any(dim=-1, keepdim=True), (1.0, 0.0, 1.0, 1.0))
-    return torch.where(finite, t, torch.ones_like(t))
-
-
-def _singularity_highlight(t, pix_mask):
-    """C4-ux: paint pixels where a guarded division hit the epsilon branch CYAN (0,1,1) —
-    distinct from DBG-3's magenta NaN. `pix_mask` is guard_trace's accumulated per-pixel
-    boolean. A no-op for a non-image tensor, an empty mask, or a shape that won't align
-    (a diagnostic must never break a cook). Applied only when debug_nan_highlight is on."""
-    if pix_mask is None or not _is_channels_last_image(t):
-        return t
-    try:
-        m = pix_mask
-        while m.dim() < t.dim() - 1:   # align rank to [..., H, W]
-            m = m.unsqueeze(0)
-        m = m.unsqueeze(-1)            # -> [..., H, W, 1] to broadcast over channels
-        if m.shape[-2] != t.shape[-2] or m.shape[-3] != t.shape[-3]:
-            return t                   # spatial dims disagree — can't localise safely
-        return _paint_pixels(t, m, (0.0, 1.0, 1.0, 1.0))
-    except Exception:
-        return t
-
-
-def _apply_cpu_threads_env() -> None:
-    """HW-4: if TEX_CPU_THREADS is set, pin torch's CPU thread count (measured 64t = 1.27x
-    pointwise vs the torch default 32; fbm neutral +/-5%). Strictly OPT-IN and read once —
-    NEVER auto-set: torch.set_num_threads is process-global in ComfyUI, and oversubscribing
-    it harms concurrent nodes. Unset -> the thread count is left untouched."""
-    val = os.environ.get("TEX_CPU_THREADS")
-    if not val:
-        return
-    try:
-        n = int(val)
-        if n > 0:
-            torch.set_num_threads(n)
-    except Exception:
-        pass
-
-
-_apply_cpu_threads_env()  # HW-4: opt-in, once at import
-
-
-# PR-LP2: memoize the auto-precision DECISION per program (B1) so steady-state cooks skip
-# the resolve_auto AST walk. Keyed by (fingerprint, resolution-bucket, device). NOTE: the
-# per-cook fp16 finiteness net is NOT memoized (doc 32 C2) — trusting a first-cook verdict
-# shipped NaN silently when the same program met a new input; the net runs every fp16 cook.
-_AUTO_DECISION: dict = {}          # (fp, px>=min, dev_type) -> (precision, reason)
-# _MIN_FP16_PX (the fp16 resolution floor) is single-sourced in precision_policy (F5, doc
-# 32) — imported function-locally in execute() so the decision-cache resolution bucket can
-# never drift from the gate's actual threshold.
-_AUTO_CACHE_MAX = 512              # bound (audit): a long session editing code = new fp each
-
-
-def _cap_auto_caches() -> None:
-    """Keep the auto-decision memo bounded — a long editing session mints a new fingerprint
-    per code edit. Clear-on-overflow (not LRU): the decision recomputes cheaply next cook."""
-    if len(_AUTO_DECISION) > _AUTO_CACHE_MAX:
-        _AUTO_DECISION.clear()
-
-
-# ── Cached interpreter (reused across executions to avoid rebuild overhead) ──
-_interpreter: Interpreter | None = None
-
-
-def _get_interpreter() -> Interpreter:
-    """Get or create the cached Interpreter singleton."""
-    global _interpreter
-    if _interpreter is None:
-        _interpreter = Interpreter()
-    return _interpreter
 
 
 # ── Node class ──
@@ -268,8 +99,10 @@ class TEXWrangleNode(_BaseClass):
         @OUT = vec4(gray, gray, gray, 1.0);
     """
 
-    # Maximum number of output slots (pre-allocated for dynamic outputs)
-    MAX_OUTPUTS = 8
+    # Maximum number of output slots (pre-allocated for dynamic outputs). Single-sourced
+    # from the engine's ceiling (ENG-1) — the socket count and the cook's E6002 gate are
+    # the same number, and the node's schema is what makes it 8.
+    MAX_OUTPUTS = _engine.MAX_OUTPUTS
 
     # Lazy input cooking: ComfyUI decides laziness per *schema-declared* input
     # name at graph-build time (comfy_execution/graph.py get_input_info), so
@@ -285,7 +118,7 @@ class TEXWrangleNode(_BaseClass):
     # System kwargs that are NOT TEX bindings
     _SYSTEM_KWARGS = {"code", "device", "compile_mode", "precision", "_tex_any",
                       "_tex_chain", "_tex_preview", "debug_nan_highlight",
-                      "_tex_slot_map"}
+                      "_tex_slot_map", "_tex_time"}
 
     @classmethod
     def define_schema(cls):
@@ -399,6 +232,15 @@ class TEXWrangleNode(_BaseClass):
         chain_payload = kwargs.get("_tex_chain")
         if chain_payload is not None:
             parts.append(f"_tex_chain:{chain_payload}")
+        # ENG-7: the playhead CHANGES THE PIXELS, so it must bust the cache — and being a
+        # _SYSTEM_KWARG it is skipped by the binding loop below, exactly like _tex_chain.
+        # Without this line the host would serve frame 1's cached result for frame 2 and
+        # the animation would sit still: the same freeze the builtins LRU, the codegen
+        # closure and CUDA-graph capture each had to be taught about separately. This is
+        # the last of the four caches between a playhead and a pixel.
+        time_payload = kwargs.get("_tex_time")
+        if time_payload is not None:
+            parts.append(f"_tex_time:{time_payload}")
         # Lazy slot mapping: renaming is semantics-relevant (it decides which
         # user name each wired value binds to), so the map must bust the cache.
         slot_map = kwargs.get("_tex_slot_map")
@@ -439,6 +281,27 @@ class TEXWrangleNode(_BaseClass):
                 else:
                     parts.append(f"{name}:{val}")
         return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+    @staticmethod
+    def _parse_time_context(raw) -> dict | None:
+        """ENG-7: normalize the `_tex_time` payload into {"frame","fps","time"} floats.
+
+        Tolerates a JSON string or a dict (same shape as `_tex_chain`); anything else, or
+        a payload with no usable key, yields None — the engine then reads zeros. Never
+        raises: a malformed time hint must not fail a cook that would otherwise render."""
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                return None
+        if not isinstance(raw, dict):
+            return None
+        out = {}
+        for k in ("frame", "fps", "time"):
+            v = raw.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[k] = float(v)
+        return out or None
 
     @staticmethod
     def _parse_slot_map(slot_map) -> list[dict]:
@@ -532,183 +395,14 @@ class TEXWrangleNode(_BaseClass):
             return _pending()
 
     @classmethod
-    def _interp_fallback(cls, ctx: ExecContext, *, reset_dynamo: bool,
-                         pass_precision: bool):
-        """STR-2: the single copy of the tier→interpreter recovery path, previously
-        duplicated in the torch_compile / auto / cuda_graph branches. The two flags
-        reproduce each branch's *exact* original call:
-          - torch_compile: reset_dynamo=True,  pass_precision=False
-          - auto:          reset_dynamo=True,  pass_precision=True
-          - cuda_graph:    reset_dynamo=False, pass_precision=False
-        (dynamo state is process-global — see compiled.py — so a failed compile/auto
-        cook resets it on THIS thread before retrying; the graph path never touched
-        dynamo, so it does not reset.)"""
-        if reset_dynamo:
-            try:
-                torch._dynamo.reset()
-            except Exception:
-                pass
-        interp = _get_interpreter()
-        kw = dict(source=ctx.code, latent_channel_count=ctx.latent_channel_count,
-                  output_names=ctx.output_names, used_builtins=ctx.used_builtins)
-        if pass_precision:
-            kw["precision"] = ctx.eff_precision
-        return interp.execute(ctx.program, ctx.bindings, ctx.type_map,
-                              device=ctx.device, **kw)
-
-    @staticmethod
-    def select_tier(compile_mode, device, fused_chain: bool, fused_fp_present: bool) -> str:
-        """STR-2: PURE tier SELECTION — which acceleration strategy `(mode, device,
-        fused)` picks, WITHOUT executing it. The branch ORDER and every guard mirror
-        the old cascade verbatim; this is the CPU-testable core where the routing
-        complexity lives (a fake `device="cuda:0"` string exercises the cuda_graph
-        classification without a GPU)."""
-        # v0.20: fused chains may take the compile tiers too — keyed by fused_fp
-        # (same pattern cuda_graph used since v0.17). Measured on a fused-chain-
-        # shaped program (sm_120 + Triton): inductor 2.63x vs interpreter at
-        # 1024²; on toolchain-less boxes the tiers self-fall-back (and `auto`
-        # measures-then-rejects), so enabling them is never a regression.
-        if compile_mode == "torch_compile" and (not fused_chain or fused_fp_present):
-            return "torch_compile"
-        if compile_mode == "auto" and (not fused_chain or fused_fp_present):
-            return "auto"
-        if (compile_mode == "cuda_graph" and str(device).startswith("cuda")
-                and (not fused_chain or fused_fp_present)):
-            return "cuda_graph"
-        return "default"
-
-    # ── STR-2 tier strategies: each runs one tier and returns raw_output; the
-    #    dict-normalization is lifted to execute() post-dispatch. ──
-    @classmethod
-    def _run_torch_compile(cls, ctx: ExecContext):
-        # Fused chains are keyed by their chain fingerprint (ctx.fp is None there).
-        _fp = ctx.fused_fp if ctx.fused_chain else ctx.fp
-        try:
-            return execute_compiled(ctx.program, ctx.bindings, ctx.type_map, ctx.device,
-                                    _fp, latent_channel_count=ctx.latent_channel_count,
-                                    output_names=ctx.output_names, used_builtins=ctx.used_builtins)
-        except Exception as compile_exc:
-            # Defense in depth: torch_compile must NEVER hard-fail the node.
-            logger.warning("[TEX] torch_compile path failed (%s); using interpreter.",
-                           compile_exc)
-            return cls._interp_fallback(ctx, reset_dynamo=True, pass_precision=False)
-
-    @classmethod
-    def _run_auto(cls, ctx: ExecContext):
-        # Fused chains are keyed by their chain fingerprint (ctx.fp is None there).
-        _fp = ctx.fused_fp if ctx.fused_chain else ctx.fp
-        try:
-            from .tex_runtime.compiled import run_auto
-            return run_auto(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
-                            latent_channel_count=ctx.latent_channel_count,
-                            output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                            precision=ctx.eff_precision)
-        except Exception as auto_exc:
-            logger.warning("[TEX] auto tier failed (%s); using interpreter.", auto_exc)
-            return cls._interp_fallback(ctx, reset_dynamo=True, pass_precision=True)
-
-    @classmethod
-    def _run_cuda_graph(cls, ctx: ExecContext):
-        # UC-1: CUDA-graph replay. A fused chain is captured as ONE graph keyed by its
-        # fused fingerprint. run_graphed returns None (→ interpreter) when the program
-        # isn't graphable or capture failed — never hard-fails on this path.
-        from .tex_runtime.graphed import run_graphed
-        _fp = ctx.fused_fp if ctx.fused_chain else ctx.fp
-        out = None
-        try:
-            out = run_graphed(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
-                              latent_channel_count=ctx.latent_channel_count,
-                              output_names=ctx.output_names, used_builtins=ctx.used_builtins)
-        except Exception as _g_exc:
-            logger.warning("[TEX] cuda_graph path failed (%s); using interpreter.", _g_exc)
-            out = None
-        if out is None:
-            return cls._interp_fallback(ctx, reset_dynamo=False, pass_precision=False)
-        return out
-
-    @classmethod
-    def _run_default(cls, ctx: ExecContext):
-        # UC-2: default-route an exact (fetch/conv) stencil through the codegen tier
-        # (avg_pool2d/conv2d/unfold). _codegen_only_execute self-falls-back; the outer
-        # guard covers env-build edge cases so this can never hard-fail the node.
-        if not ctx.fused_chain:
-            try:
-                if _should_stencil_route(ctx.fp, ctx.program):
-                    return _codegen_only_execute(
-                        ctx.program, ctx.bindings, ctx.type_map, ctx.device,
-                        latent_channel_count=ctx.latent_channel_count,
-                        output_names=ctx.output_names,
-                        used_builtins=ctx.used_builtins, fingerprint=ctx.fp)
-            except Exception as _stencil_exc:
-                logger.warning("[TEX] stencil codegen route failed (%s); using "
-                               "interpreter.", _stencil_exc)
-        interp = _get_interpreter()
-        # M-4: under GPU memory pressure, run a tile-safe program in horizontal strips
-        # (peak transient ~1/n). Falls back to the whole-image cook on any strip error.
-        n_strips = (cls._tile_plan(ctx.program, ctx.bindings, ctx.device, ctx.latent_channel_count,
-                                   2 if ctx.eff_precision == "fp16" else 4, ctx.fp)
-                    if not ctx.fused_chain else None)
-        if n_strips:
-            try:
-                from .tex_memory import run_tiled
-                return run_tiled(interp, ctx.program, ctx.bindings, ctx.type_map, ctx.device,
-                                 ctx.latent_channel_count, ctx.output_names, ctx.used_builtins,
-                                 ctx.eff_precision, n_strips)
-            except Exception as _tile_exc:
-                logger.warning("[TEX] tiled cook failed (%s); running untiled.", _tile_exc)
-        # Pass source so runtime (E6xxx) errors render a source-line caret. Fused chains
-        # splice many sources, so leave source empty there (errors stay message-only).
-        return interp.execute(ctx.program, ctx.bindings, ctx.type_map, device=ctx.device,
-                              source=("" if ctx.fused_chain else ctx.code),
-                              latent_channel_count=ctx.latent_channel_count,
-                              output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                              precision=ctx.eff_precision)
-
-    # tier_id → strategy method name (getattr avoids the callable-in-dict binding trap)
-    _TIER_METHOD = {
-        "torch_compile": "_run_torch_compile", "auto": "_run_auto",
-        "cuda_graph": "_run_cuda_graph", "default": "_run_default",
-    }
-
-    @classmethod
-    def _run_tier(cls, ctx, tier_id):
-        """Dispatch a cook to the selected tier strategy and normalize its result to an
-        output dict. Single home for the `tier method -> {name: tensor}` idiom used by
-        both execute() and the C2 re-cook path (reuse review)."""
-        out = getattr(cls, cls._TIER_METHOD[tier_id])(ctx)
-        return out if isinstance(out, dict) else {ctx.output_names[0]: out}
-
-    @classmethod
-    def _fp16_finiteness_net(cls, raw_output, auto_fp16, ctx, tier_id):
-        """C2 (extracted from execute, C1-st): the residual data-dependent safety net
-        for `precision="auto"`. Every auto->fp16 cook's output is checked for NaN/Inf
-        (the case the static gate can't rule out — a blind spot, or a pow going
-        negative). On non-finite: discard the fp16 probes, re-cook fp32, and PIN the
-        auto decision to fp32 so the program skips fp16 for all future inputs. Returns
-        the (possibly re-cooked) output dict; a no-op when the cook wasn't auto->fp16."""
-        if not (auto_fp16 and ctx.eff_precision == "fp16"):
-            return raw_output
-        if not any(isinstance(v, torch.Tensor) and not torch.isfinite(v).all()
-                   for v in raw_output.values()):
-            return raw_output
-        # F1 fix: tier_trace is imported function-locally per method (the SCC convention);
-        # the C1-st extraction moved this block out of execute() without carrying the import,
-        # so the recovery path NameError-crashed exactly when auto-fp16 overflowed.
+    def _build_ui_payload(cls, elapsed_ms, device, eff_precision, near_singularities):
+        """DBG-1/C1-ux: assemble the ADDITIVE `ui=` HUD payload — tier/timing/precision +
+        C7-ux reasons + debug_print probes + the C4-ux near-singularity count (present only
+        with the debug toggle). The result tuple is byte-identical whether or not this
+        payload is attached. ENG-1: the count now arrives on the CookResult (the engine
+        reads it before disarming the trace) instead of being re-read from guard_trace here.
+        ENG-5 canary-pins this key set — it is a frontend contract."""
         from .tex_runtime import tier_trace
-        tier_trace.clear_probes()  # discard the fp16 cook's probes (no dup)
-        tier_trace.record_precision("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
-        if ctx.fp is not None:
-            _AUTO_DECISION[(ctx.fp, True, torch.device(ctx.device).type)] = \
-                ("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
-        return cls._run_tier(replace(ctx, eff_precision="fp32"), tier_id)
-
-    @classmethod
-    def _build_ui_payload(cls, elapsed_ms, device, eff_precision, debug_nan_highlight):
-        """DBG-1/C1-ux (extracted from execute, C1-st): assemble the ADDITIVE `ui=` HUD
-        payload — tier/timing/precision + C7-ux reasons + debug_print probes + the C4-ux
-        near-singularity count (present only with the debug toggle; also disarms the trace).
-        The result tuple is byte-identical whether or not this payload is attached."""
-        from .tex_runtime import tier_trace, guard_trace
         tr = tier_trace.last()
         pr = tier_trace.last_precision()
         perf = {
@@ -720,8 +414,8 @@ class TEXWrangleNode(_BaseClass):
             "precision": pr[0] if pr is not None else eff_precision,
             "precision_reason": pr[1] if pr is not None else None,
         }
-        if debug_nan_highlight:  # C4-ux: count is armed with the toggle
-            perf["near_singularities"] = guard_trace.count()
+        if near_singularities is not None:  # C4-ux: count is armed with the toggle
+            perf["near_singularities"] = near_singularities
         ui_payload = {"tex_perf": [perf]}
         probes = tier_trace.get_probes()  # LX-5: debug_print value-at-pixel taps
         if probes:
@@ -738,14 +432,18 @@ class TEXWrangleNode(_BaseClass):
         device_mode = kwargs.pop("device", "auto")
         compile_mode = kwargs.pop("compile_mode", "none")
         precision = kwargs.pop("precision", "fp32")
-        # fp16 is an interpreter-only mode for now — the compile/graph paths bake
-        # precision into their keys but aren't validated for fp16 yet.
-        if precision == "fp16" and compile_mode != "none":
-            precision = "fp32"
+        # (the fp16 x compiled-tier clamp is engine policy — tex_engine.prepare, ENG-1)
         debug_nan_highlight = bool(kwargs.pop("debug_nan_highlight", False))  # DBG-3
         kwargs.pop("_tex_any", None)  # search-panel wildcard slot, unused
         kwargs.pop("_tex_preview", None)  # Q-6 preview hint; pop so it never
         # becomes a phantom @_tex_preview binding (it is a _SYSTEM_KWARG).
+        # ENG-7: the host's playhead for the frame/fps/time builtins. ComfyUI has no
+        # timeline, so this is normally absent -> the engine reads zeros. Carried as an
+        # underscore-prefixed SYSTEM kwarg (like _tex_chain) rather than a plain `frame`
+        # input on purpose: a bare name would collide with any user binding called
+        # `frame`, and _SYSTEM_KWARGS members are excluded from bindings. In ComfyUI,
+        # position within an image BATCH is `fi`/`fn`, which is the axis that exists here.
+        time_context = cls._parse_time_context(kwargs.pop("_tex_time", None))
         # Lazy slot pool: map cooked in_N values back to their user names.
         # Slots the lazy analysis skipped arrive as None and simply stay
         # absent — identical to an unwired input (the E6003 gate below
@@ -792,199 +490,46 @@ class TEXWrangleNode(_BaseClass):
                 if not latent_channel_count:
                     latent_channel_count = tensor_cl.shape[-1]
 
+        fused_chain = False
         try:
-            fused_chain = False
-            fused_fp = None
-            if chain_payload:
-                # Fused path: splice the whole linked chain into one program.
-                # Per-stage validation already happened in compile_fused, so a
-                # failure here raises (we must NOT silently run the terminal
-                # alone — the upstream nodes were collapsed away in the prompt).
-                spec = json.loads(chain_payload) if isinstance(chain_payload, str) else chain_payload
-                # Q-1 / v0.20: the fused fingerprint (value-independent) is the KEY
-                # under which select_tier admits a fused chain to the accelerated
-                # tiers — a CUDA-graph capture unit (cuda_graph) OR a torch.compile/
-                # auto artifact. So it must be computed for EVERY compiling mode, not
-                # cuda_graph alone: without it select_tier strands a fused chain on the
-                # interpreter under torch_compile/auto (the measured inductor win is
-                # then unreachable from the node). Computed from the original bindings
-                # before _prepare_fused merges them; value-independent + memoized (see
-                # tex_fusion.fused_fingerprint), so cheap on every mode.
-                if compile_mode in ("cuda_graph", "torch_compile", "auto"):
-                    fused_fp = _fused_fingerprint(spec, code, bindings, _infer_binding_type)
-                (program, type_map, referenced, assigned_bindings, param_info,
-                 used_builtins, bindings) = _prepare_fused(spec, code, bindings, _infer_binding_type)
-                fused_chain = True
-            else:
-                # Infer binding types for inputs
-                binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
-
-                # Compile (uses two-tier Mega-Cache: memory LRU + disk persistence)
-                cache = get_cache()
-                program, type_map, referenced, assigned_bindings, param_info, used_builtins = cache.compile_tex(code, binding_types)
-
-            # Resolve target device (from the effective bindings — merged for a chain)
-            device = cls._resolve_device(device_mode, bindings)
-
-            # M-1: preflight — estimate this cook's peak and, if it exceeds free
-            # VRAM, ask ComfyUI to free resident models first (what model loaders
-            # do). Prevents a big cook OOMing while GBs sit locked in models. Zero
-            # cost on the common path (one memory-stats read). cuda only.
-            if str(device).startswith("cuda"):
-                cls._preflight_memory(program, bindings, device,
-                                      2 if precision == "fp16" and not has_latent_input else 4)
-
-            # Determine output names (sorted alphabetically for stable ordering)
-            output_names = sorted(assigned_bindings.keys())
-            if not output_names:
-                raise InterpreterError(
-                    "TEX program has no outputs. Assign to @OUT or another @name.",
-                    loc=SourceLoc(1, 1), source=code, code="E6001",
-                )
-            if len(output_names) > cls.MAX_OUTPUTS:
-                raise InterpreterError(
-                    f"TEX program has {len(output_names)} outputs, "
-                    f"exceeding the maximum ({cls.MAX_OUTPUTS}).",
-                    loc=SourceLoc(1, 1), source=code, code="E6002",
-                )
-
-            # Check that referenced input bindings are available.
-            # For $params with code-defined defaults, inject the default as a
-            # fallback when no widget value or wire connection is provided.
-            # Lazy gate: `referenced` is the pre-optimization set, so it still
-            # contains names whose only uses are statically dead given the
-            # current params — exactly the inputs check_lazy_status skipped.
-            # Recompute the live set (memo hit: same code + same scalar values
-            # the lazy round saw) and forgive dead references instead of
-            # raising E6003. Single programs only; fused chains keep v0.17
-            # behaviour (their lazy round requests everything).
-            lazy_needed = None
-            if not fused_chain and slot_entries:
-                scalar_params = {n: v for n, v in bindings.items()
-                                 if isinstance(v, (bool, int, float))}
-                lazy_needed = _tex_lazy.lazy_required_bindings(code, scalar_params)
-            for ref_name in referenced:
-                if ref_name not in assigned_bindings and ref_name not in bindings:
-                    if lazy_needed is not None and ref_name not in lazy_needed:
-                        continue  # statically dead under the current params
-                    # Try param default before erroring
-                    if ref_name in param_info:
-                        default_val = param_info[ref_name].get("default_value")
-                        if default_val is not None:
-                            bindings[ref_name] = default_val
-                            continue
-                    sigil = "$" if ref_name in param_info else "@"
-                    # On the fused path user bindings are stage-prefixed
-                    # (_s0_u_amt — see tex_fusion._user_prefix); show the
-                    # user's original name, not the synthetic one.
-                    disp = re.sub(r"^_s\d+_u_", "", ref_name) if fused_chain else ref_name
-                    raise InterpreterError(
-                        f"TEX code references {sigil}{disp} but no input is connected to slot '{disp}'.",
-                        loc=SourceLoc(1, 1), source=code, code="E6003",
-                    )
-
-            # Convert param widget values to appropriate types for the interpreter
-            # (e.g. hex color strings → RGB lists, comma vec strings → float lists)
-            for pname, pinfo in param_info.items():
-                if pname in bindings:
-                    bindings[pname] = _convert_param_value(bindings[pname], pinfo, pname)
-
-            # STR-2/STR-3: bundle every arg the tiers need once (fp hoisted here so no
-            # strategy re-touches execute()'s locals), select the tier (pure), dispatch
-            # to its strategy, and normalize the output shape in ONE place.
-            # PR-LP2: resolve precision="auto" now that the program + resolution are
-            # known — fp16 only in the measured win region (CUDA, >=1024^2, pointwise,
-            # no image-derived threshold); fp32 otherwise. Record the decision + reason
-            # (tier_trace) so it's never silent. fp16 stays out of the compiled/graph
-            # tiers this cycle (mirrors the compile-mode fp32 force above).
-            # DBG-1: clear the tier/precision trace so the HUD payload below reflects
-            # THIS cook (the trace is thread-local and persists across cooks).
-            from .tex_runtime import tier_trace, guard_trace
-            tier_trace.reset()
-            # C4-ux: arm the near-singularity trace ONLY with the debug toggle (guard hooks
-            # are a no-op otherwise — the zero-cost-when-off contract). Set the state
-            # explicitly every cook so a prior debug cook that threw can't leave it armed.
-            guard_trace.arm() if debug_nan_highlight else guard_trace.disarm()
-            fp = cache.fingerprint(code, binding_types) if not fused_chain else None
-            # cook resolution (H*W of the first spatial binding) — used by the auto gate
-            # AND the MEM-2 downshift trim; computed ONCE (audit: was scanned twice/cook).
-            cook_px = next((v.shape[1] * v.shape[2] for v in bindings.values()
-                            if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)
-            auto_fp16 = False
-            if precision == "auto":
-                if has_latent_input:
-                    # M-3 forces LATENT to fp32; short-circuit so the trace is honest and
-                    # we never size the gate off a LATENT's [B,H,W,C] axis.
-                    precision, auto_reason = "fp32", "auto->fp32: LATENT input (stays fp32)"
-                else:
-                    dev_type = torch.device(device).type
-                    from .tex_runtime.precision_policy import (
-                        resolve_auto_precision, _MIN_FP16_PX)
-                    # B1: memoize the DECISION per (program, resolution-bucket, device) so
-                    # the resolve_auto AST walk runs once, not per cook (a static property of
-                    # code+resolution+device — value-independent).
-                    ckey = (fp, cook_px >= _MIN_FP16_PX, dev_type) if fp is not None else None
-                    cached = _AUTO_DECISION.get(ckey) if ckey is not None else None
-                    if cached is not None:
-                        precision, auto_reason = cached
-                    else:
-                        precision, auto_reason = resolve_auto_precision(program, cook_px, dev_type)
-                        if precision == "fp16" and compile_mode != "none":
-                            precision, auto_reason = "fp32", auto_reason + " [compiled tier: fp32]"
-                        if ckey is not None:
-                            _AUTO_DECISION[ckey] = (precision, auto_reason)
-                            _cap_auto_caches()
-                    # C2 (doc 32): the finiteness safety-net runs on EVERY fp16 cook. The B1
-                    # "check once then trust the fingerprint" shipped NaN silently when the
-                    # SAME program met a new input value (3.1M NaN pixels) — and in real
-                    # ComfyUI use every cook already HAS a new input (identical inputs are
-                    # cache hits), so a value-keyed skip is pure overhead on top of the check
-                    # it can't avoid. Checking every cook is correct AND, measured, cheaper on
-                    # the real path than hashing the input to decide whether to check. A
-                    # non-finite result re-cooks + pins the program to fp32 thereafter.
-                    auto_fp16 = precision == "fp16"
-                tier_trace.record_precision(precision, auto_reason)
-            # M-3: LATENT data exceeds [0,1] and feeds further math, so it must stay
-            # fp32 even in fp16 mode.
-            eff_precision = "fp32" if has_latent_input else precision
-            ctx = ExecContext(program, bindings, type_map, device, code,
-                              latent_channel_count, output_names, used_builtins,
-                              eff_precision, fp, fused_chain, fused_fp)
-            tier_id = cls.select_tier(compile_mode, device, fused_chain,
-                                      fused_fp is not None)
-            raw_output = cls._run_tier(ctx, tier_id)
-
-            # PR-LP2 safety net (C2): re-cook fp32 (and pin the auto decision) if an
-            # auto->fp16 cook went non-finite. Extracted to a helper (C1-st) so execute()
-            # stays within its per-function line budget and can't silently re-inline.
-            raw_output = cls._fp16_finiteness_net(raw_output, auto_fp16, ctx, tier_id)
-
-            # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
-            # oldest mip/grid entries; allocate-and-hold semantics untouched).
-            # P1-M2-CPU: enforce on CPU cooks too — the mip/grid/sampler caches
-            # grow unbounded there otherwise. cache_budget_bytes returns a 512 MB
-            # CPU budget; the eviction is cheap (early-returns when under budget)
-            # and the graph-cache teardown on eviction is a no-op off CUDA.
-            try:
-                from .tex_memory import enforce_cache_budget, trim_reserved_pool
-                enforce_cache_budget(device)
-                # MEM-2 (B2): the trim only queries the allocator after a resolution
-                # downshift (zero cost on same-size steady state). cook_px hoisted above.
-                trim_reserved_pool(device, cook_px)
-            except Exception:
-                pass
+            # ENG-1: the cook itself is the engine's. The two-step (prepare then run) is
+            # deliberate: `fused_chain` must be set only once a chain has actually
+            # ASSEMBLED, because the Q-4 stage attribution below distinguishes "a linked
+            # node failed while running" from "the chain never spliced" (a splice-time
+            # type error carries a stage tag too, but has no running stage to blame).
+            plan = _engine.prepare(
+                code, bindings, chain_payload=chain_payload, device_mode=device_mode,
+                compile_mode=compile_mode, precision=precision,
+                has_latent_input=has_latent_input,
+                latent_channel_count=latent_channel_count,
+                # The lazy pool may have skipped statically-dead inputs, so E6003 must
+                # forgive references the optimizer will drop (invariant #11's gate).
+                forgive_dead_refs=bool(slot_entries),
+                debug_nan_highlight=debug_nan_highlight,
+                time_context=time_context,
+                # ENG-1/ENG-3: skip the engine's no-alias clone only while THIS node's own
+                # egress is guaranteed to allocate anyway. `_prepare_output` below pins no
+                # profile, so it formats through the process-wide one — which makes the
+                # process-wide answer the honest answer for this call, and is why the node
+                # may ask. Under 'comfy' (every shipping user) the clamp materializes and
+                # the clone would be pure waste: +0.236 ms at 2048² passthrough, on the
+                # default path (invariant #7). Under 'engine' there is no clamp — that
+                # profile exists to remove the lossy steps — so the guarantee has to be
+                # bought, and this asks for it. Deriving it beats hardcoding False: that
+                # would hand ComfyUI a live view of an input buffer the moment a host
+                # flipped the profile, which is the bug one layer down.
+                disown=not _egress_materializes(),
+                max_outputs=cls.MAX_OUTPUTS)
+            fused_chain = plan.fused_chain
+            cooked = _engine.run(plan)
 
             # Format each output based on inferred type
             results = []
             output_types_log = []
-            for name in output_names:
-                raw = raw_output[name]
-                if debug_nan_highlight:  # DBG-3 magenta NaN + C4-ux cyan near-singularity
-                    raw = _singularity_highlight(raw, guard_trace.mask())
-                    raw = _nan_highlight(raw)  # NaN magenta wins over cyan where both
-                inferred_type = assigned_bindings[name]
+            for name in cooked.output_names:
+                inferred_type = cooked.assigned[name]
                 effective_type = _map_inferred_type(inferred_type, has_latent_input)
-                result = _prepare_output(raw, effective_type)
+                result = _prepare_output(cooked.outputs[name], effective_type)
                 if effective_type == "LATENT":
                     result = {"samples": result, **latent_meta}
                 results.append(result)
@@ -998,16 +543,14 @@ class TEXWrangleNode(_BaseClass):
             compile_tag = " [compiled]" if compile_mode == "torch_compile" else ""
             logger.info(
                 "Executed in %.1fms%s | device: %s | outputs: [%s] | bindings: %s",
-                elapsed_ms, compile_tag, device,
-                ", ".join(output_types_log), list(bindings.keys()),
+                elapsed_ms, compile_tag, cooked.device,
+                ", ".join(output_types_log), cooked.binding_names,
             )
 
             # DBG-1/C1-ux: per-cook tier/timing/probe facts for the frontend HUD, on the v3
             # `ui=` channel — ADDITIVE (the result tuple is byte-identical without it).
-            ui_payload = cls._build_ui_payload(elapsed_ms, device, eff_precision,
-                                               debug_nan_highlight)
-            if debug_nan_highlight:   # C4-ux: teardown lives here, not in the payload builder
-                guard_trace.disarm()
+            ui_payload = cls._build_ui_payload(elapsed_ms, cooked.device, cooked.precision,
+                                               cooked.near_singularities)
 
             # Return NodeOutput for v3 (with the HUD payload), or tuple for standalone/test.
             if _V3_AVAILABLE:
@@ -1107,101 +650,3 @@ class TEXWrangleNode(_BaseClass):
                 f"{TEX_BUG_REPORT_URL}\n{tb}"
             ) from e
 
-    @staticmethod
-    def _tile_plan(program, bindings: dict[str, Any], device,
-                   latent_channel_count: int = 0, dtype_bytes: int = 4,
-                   fingerprint: str | None = None) -> int | None:
-        """M-4: strip count if the cook should be tiled (tile-safe + under memory
-        pressure), else None. cuda only; needs ComfyUI's free-memory query.
-        MEM-3: dtype_bytes=2 in fp16 mode halves the peak estimate (a fp16 cook that
-        fits shouldn't be tiled as if it were fp32)."""
-        if not str(device).startswith("cuda"):
-            return None  # host.get_free_memory returns None off a host → no tiling
-        # M-4 safety: never tile a LATENT ([B,C,H,W] — dim 1 is channels, not
-        # height) or a cook whose spatial bindings disagree on height (they can't
-        # be co-tiled). run_tiled re-checks, but planning here avoids a bogus
-        # peak estimate off the wrong axis.
-        if latent_channel_count:
-            return None
-        try:
-            from .tex_memory import is_tile_safe_cached, estimate_peak_bytes, shared_tile_height
-            if not is_tile_safe_cached(program, fingerprint):  # P4: memoized per fingerprint
-                return None
-            H = shared_tile_height(bindings)
-            if H is None:
-                return None
-            spatial = None
-            for v in bindings.values():
-                if isinstance(v, torch.Tensor) and v.dim() >= 3 and v.shape[1] == H:
-                    spatial = (v.shape[0], v.shape[1], v.shape[2])
-                    break
-            if spatial is None:
-                return None
-            est = estimate_peak_bytes(program, spatial, dtype_bytes)
-            free = get_host_services().get_free_memory(torch.device(device))
-            if not free or est <= 0:
-                return None
-            budget = 0.25 * free
-            if est <= budget:
-                return None  # no pressure — don't pay the launch tax
-            import math as _math
-            n = _math.ceil(est / budget)
-            max_strips = max(1, spatial[1] // 64)  # ≥64-row strip floor
-            n = min(n, max_strips)
-            return n if n >= 2 else None
-        except Exception:
-            return None
-
-    @staticmethod
-    def _preflight_memory(program, bindings: dict[str, Any], device,
-                          dtype_bytes: int = 4) -> None:
-        """M-1: if the estimated cook peak exceeds free VRAM, free resident
-        models first (best-effort; never raises). MEM-3: dtype_bytes=2 for an explicit
-        fp16 cook (auto is still unresolved here, so it stays the conservative 4)."""
-        host = get_host_services()  # PORT-1: Null host → free is None → this no-ops
-        try:
-            spatial = None
-            for v in bindings.values():
-                if isinstance(v, torch.Tensor) and v.dim() >= 3:
-                    spatial = (v.shape[0], v.shape[1], v.shape[2])
-                    break
-            if spatial is None:
-                return
-            from .tex_memory import estimate_peak_bytes
-            est = estimate_peak_bytes(program, spatial, dtype_bytes)
-            if est <= 0:
-                return
-            dev_t = torch.device(device)
-            free = host.get_free_memory(dev_t)
-            headroom = 128 * 1024 * 1024
-            if free is not None and free < est + headroom:
-                host.free_memory(est + 256 * 1024 * 1024, dev_t)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _resolve_device(device_mode: str, bindings: dict[str, Any]) -> str:
-        """
-        Resolve the target execution device.
-
-        "auto" — infer from inputs (prefer GPU if any input is on GPU, else CPU)
-        "cpu"  — force CPU execution
-        "cuda" — force GPU execution (raises if CUDA unavailable)
-        """
-        if device_mode == "cpu":
-            return "cpu"
-
-        if device_mode == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "TEX Error: device='cuda' selected but CUDA is not available. "
-                    "Select 'auto' or 'cpu' instead."
-                )
-            return "cuda"
-
-        # "auto" mode: prefer GPU if any input tensor is on GPU
-        # (latent dicts are already unwrapped to tensors before this is called)
-        for val in bindings.values():
-            if isinstance(val, torch.Tensor) and val.is_cuda:
-                return str(val.device)
-        return "cpu"

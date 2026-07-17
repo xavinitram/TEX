@@ -33,7 +33,7 @@ import torch
 from .host import get_host_services  # PORT-1: the ONE seam to comfy.model_management
 
 from ..tex_compiler.ast_nodes import (
-    Program, ForLoop, WhileLoop, FunctionCall,
+    Program, ForLoop, WhileLoop, FunctionCall, Identifier,
     try_extract_static_range,
     iter_child_nodes as _iter_child_nodes,
 )
@@ -192,8 +192,19 @@ def _capturable(program: Program) -> tuple[bool, int]:
     still fails capture loudly (never silent-wrong). op_count is the static
     tensor-op count (the launch proxy for the PF-1/PF-2 gate), counted in the
     same walk so the graph tier never traverses the AST twice; it is 0 (unused)
-    on a non-capturable early-out."""
+    on a non-capturable early-out.
+
+    ENG-7 also bars the host-time builtins, and for a DIFFERENT reason than everything
+    else here: they do not sync, they *change*. Every other builtin is derived from the
+    binding shapes, so it is constant for a given capture key and baking it into the
+    graph is correct. `frame`/`fps`/`time` come from the host's playhead, so a replay
+    would keep re-serving whatever the playhead read at capture — an animation frozen on
+    one frame, with no error. Unlike a sync, capture would SUCCEED and be wrong, so this
+    is the one blocker that has to be caught statically or not at all. (Feeding them as
+    static input buffers copied per replay is the real fix; it needs the capture plumbing
+    to own the buffer, so it waits for a host that has a playhead at all.)"""
     from .compiled import _OP_TYPES   # lazy: canonical op-type set, avoids import cycle
+    from .interpreter import _TIME_BUILTIN_NAMES
     ops = 0
     stack = list(program.statements)
     while stack:
@@ -204,6 +215,8 @@ def _capturable(program: Program) -> tuple[bool, int]:
         if cls is ForLoop and try_extract_static_range(n) is None:
             return (False, 0)
         if cls is FunctionCall and n.name in _SYNC_STDLIB:
+            return (False, 0)
+        if cls is Identifier and n.name in _TIME_BUILTIN_NAMES:
             return (False, 0)
         if isinstance(n, _OP_TYPES):
             ops += 1

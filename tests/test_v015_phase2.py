@@ -155,7 +155,7 @@ def test_uc1_cuda_graph(r: SubTestResult):
         img = torch.rand(1, 64, 64, 3, device="cuda")
         g = G.run_graphed(prog, {"A": img}, tm, "cuda", "t_uc1a",
                           output_names=["OUT"], used_builtins=used)
-        it = _plain_execute(prog, {"A": img}, tm, "cuda", output_names=["OUT"], used_builtins=used)
+        it = _plain_execute(prog, {"A": img}, tm, "cuda", output_names=["OUT"], used_builtins=used, time_context=None)
         assert g is not None, "program was not captured"
         gt = g["OUT"] if isinstance(g, dict) else g
         itt = it["OUT"] if isinstance(it, dict) else it
@@ -300,8 +300,8 @@ def test_uc2_stencil_routing(r: SubTestResult):
         prog, tm = _prog(FETCH, bt)
         b = {"A": img, "radius": 2}
         cg = _codegen_only_execute(prog, dict(b), tm, "cpu", output_names=["OUT"],
-                                   used_builtins=None, fingerprint="uc2test")
-        it = _plain_execute(prog, dict(b), tm, "cpu", output_names=["OUT"])
+                                   used_builtins=None, fingerprint="uc2test", time_context=None)
+        it = _plain_execute(prog, dict(b), tm, "cpu", output_names=["OUT"], time_context=None)
         cg = cg["OUT"] if isinstance(cg, dict) else cg
         it = it["OUT"] if isinstance(it, dict) else it
         md = (cg.float() - it.float()).abs().max().item()
@@ -309,6 +309,80 @@ def test_uc2_stencil_routing(r: SubTestResult):
         r.ok(f"routed fetch stencil bit-exact (maxdiff {md:.1e})")
     except Exception as e:
         r.fail("routed fetch stencil bit-exact", str(e))
+
+    # A WEIGHTED or otherwise composed tap must DECLINE the route. The pool
+    # lowerings (avg_pool2d / max_pool2d / unfold) can only express an UNWEIGHTED
+    # neighbourhood, so the tap has to BE the whole accumulated term. Before
+    # v0.22.0 the matcher SEARCHED the term's subtree for a fetch and found one
+    # here, matching as if the term were the bare tap — the `* 0.5` never reached
+    # the emitted kernel, so this routed DEFAULT path returned exactly 2x, with
+    # shapes intact (silently). Declining is correct, just not accelerated.
+    wbt = dict(bt, w=TEXType.FLOAT)
+    HDR = "i$radius = 1;\n    f$w = 0.5;\n"
+    LOOP = ("    for (int dy = -$radius; dy <= $radius; dy = dy + 1) {\n"
+            "        for (int dx = -$radius; dx <= $radius; dx = dx + 1) {\n"
+            "            %s\n        }\n    }\n")
+
+    def _sum(term):
+        return (HDR + "    vec3 acc = vec3(0.0);\n" + (LOOP % term)
+                + "    @OUT = vec4(acc / 9.0, 1.0);")
+
+    def _mm(term):
+        return (HDR + "    vec3 m = vec3(0.0);\n" + (LOOP % term)
+                + "    @OUT = vec4(m, 1.0);")
+
+    TAP = "fetch(@A, ix + dx, iy + dy)"
+    composed = [
+        ("sum: scaled tap (* 0.5)", _sum(f"acc = acc + {TAP}.rgb * 0.5;")),
+        ("sum: divided tap (/ 2.0)", _sum(f"acc = acc + {TAP}.rgb / 2.0;")),
+        ("sum: param-weighted tap (* $w)", _sum(f"acc = acc + {TAP}.rgb * $w;")),
+        ("sum: offset tap (+ 0.1)", _sum(f"acc = acc + ({TAP}.rgb + vec3(0.1));")),
+        # Swizzle UNDER the BinOp: the old code dove past the ChannelAccess to the
+        # fetch, so it lost the weight AND left channels=None — corrupting channel
+        # ORDER as well as magnitude.
+        ("sum: swizzle under a BinOp (.bgr * 0.5)", _sum(f"acc = acc + {TAP}.bgr * 0.5;")),
+        ("minmax: scaled tap (max)", _mm(f"m = max(m, {TAP}.rgb * 0.5);")),
+        ("minmax: swizzle under a BinOp (max)", _mm(f"m = max(m, {TAP}.bgr * 0.5);")),
+    ]
+    for name, code in composed:
+        try:
+            prog, _tm = _prog(code, wbt)
+            assert detect_stencil_route(prog) is False, \
+                "composed tap must not route (its weight cannot survive the pool lowering)"
+            r.ok(f"composed tap declines: {name}")
+        except Exception as e:
+            r.fail(f"composed tap declines: {name}", str(e))
+
+    # Guard the other direction: the fix must not over-decline. A BARE tap in the
+    # same shape still has to route, or this became a silent perf regression.
+    for name, code in [("sum", _sum(f"acc = acc + {TAP}.rgb;")),
+                       ("minmax", _mm(f"m = max(m, {TAP}.rgb);"))]:
+        try:
+            prog, _tm = _prog(code, wbt)
+            assert detect_stencil_route(prog) is True, "bare tap must still route"
+            r.ok(f"bare tap still routes: {name}")
+        except Exception as e:
+            r.fail(f"bare tap still routes: {name}", str(e))
+
+    # The declining programs must also be CORRECT, not merely unrouted: force
+    # codegen and require bit-exactness with the interpreter oracle.
+    try:
+        img = make_img(1, 16, 16, 3)
+        worst = 0.0
+        for name, code in composed:
+            prog, tm = _prog(code, wbt)
+            b = {"A": img, "radius": 1, "w": 0.5}
+            cg = _codegen_only_execute(prog, dict(b), tm, "cpu", output_names=["OUT"],
+                                       used_builtins=None, fingerprint=f"uc2w{abs(hash(name))}", time_context=None)
+            it = _plain_execute(prog, dict(b), tm, "cpu", output_names=["OUT"], time_context=None)
+            cg = cg["OUT"] if isinstance(cg, dict) else cg
+            it = it["OUT"] if isinstance(it, dict) else it
+            assert cg.shape == it.shape, f"{name}: shape {tuple(cg.shape)} != {tuple(it.shape)}"
+            worst = max(worst, (cg.float() - it.float()).abs().max().item())
+        assert worst < 1e-5, f"composed tap diverges from interpreter (maxdiff {worst})"
+        r.ok(f"composed taps bit-exact under forced codegen (maxdiff {worst:.1e})")
+    except Exception as e:
+        r.fail("composed taps bit-exact under forced codegen", str(e))
 
 
 def test_uc3_uniform_loop(r: SubTestResult):

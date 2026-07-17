@@ -54,12 +54,13 @@ def _cache_facts():
 
 def _tier_facts():
     """Which tier `select_tier` picks for each (compile_mode, device) — the routing a
-    user actually gets, so 'auto on a no-Triton box → interpreter' is visible."""
-    from .tex_node import TEXWrangleNode as N
+    user actually gets, so 'auto on a no-Triton box → interpreter' is visible.
+    ENG-1: asks the engine directly; the doctor never needed the ComfyUI node for this."""
+    from .tex_engine import select_tier as _select_tier
     out = {}
     for dev in ("cpu", "cuda"):
         for mode in ("none", "torch_compile", "auto", "cuda_graph"):
-            out[f"{mode}@{dev}"] = N.select_tier(mode, dev, False, False)
+            out[f"{mode}@{dev}"] = _select_tier(mode, dev, False, False)
     return out
 
 

@@ -361,7 +361,9 @@ def test_example_files_compiled(r: SubTestResult):
     execute_compiled never crashes, even if it degrades to the interpreter.
 
     Each program has a 30-second timeout to prevent torch.compile from
-    blocking the entire test suite on pathological programs.
+    blocking the entire test suite on pathological programs. A program that
+    exceeds it is reported as a named skip, so the sub-test count
+    (passed + failed + skipped) is invariant to machine load.
     """
     import gc
     import concurrent.futures
@@ -416,8 +418,14 @@ def test_example_files_compiled(r: SubTestResult):
                     result = future.result(timeout=_PER_PROGRAM_TIMEOUT)
                 except concurrent.futures.TimeoutError:
                     timed_out += 1
-                    print(f"    WARNING: {name} timed out (torch.compile >{_PER_PROGRAM_TIMEOUT}s)")
-                    continue  # Don't count as pass or fail
+                    # Emit a named skip, never a silent drop: the timeout is
+                    # load-dependent (a program that compiles in 10s alone can
+                    # exceed 30s under whole-suite GPU contention), so a dropped
+                    # sub-test would make the suite total vary with machine load
+                    # and break PASS-set diffing.
+                    r.skip(f"example compiled: {name}",
+                           f"torch.compile exceeded {_PER_PROGRAM_TIMEOUT}s")
+                    continue
 
             # Verify we got outputs
             if isinstance(result, dict):
@@ -459,7 +467,7 @@ def test_example_files_compiled(r: SubTestResult):
                 pass
 
     example_failed = r.failed - start_failed
-    example_passed = len(tex_files) - example_failed
+    example_passed = len(tex_files) - example_failed - timed_out
     timeout_note = f", timed out: {timed_out}" if timed_out else ""
     print(f"  Compiled examples: {example_passed}/{len(tex_files)} passed "
           f"(codegen: {codegen_ok}, fallback: {codegen_fallback}{timeout_note})")
@@ -673,7 +681,7 @@ def test_torch_compile(r: SubTestResult):
 
     # Plain execution baseline
     try:
-        result_plain = _plain_execute(program, {"A": test_img}, type_map, "cpu")
+        result_plain = _plain_execute(program, {"A": test_img}, type_map, "cpu", time_context=None)
         expected = test_img * 0.5
         assert torch.allclose(result_plain, expected, atol=1e-5)
         r.ok("torch_compile: plain baseline")
@@ -2966,7 +2974,7 @@ for (int i = 0; i < 2; i = i + 1) {
             compiled_mod._try_codegen = orig_codegen
 
         interp_out = _plain_execute(prog, {"A": test_img}, tm, "cpu",
-                                    used_builtins=used)
+                                    used_builtins=used, time_context=None)
         assert calls["n"] == 1, f"codegen emitted {calls['n']} times, expected 1"
         assert torch.equal(out1, out2), "cached codegen result differs across frames"
         assert torch.allclose(out1, interp_out, atol=1e-5)
@@ -3013,7 +3021,7 @@ for (int i = 0; i < 2; i = i + 1) {
         assert (fp, "cpu", "fp32") in keys, f"fp32 entry missing: {keys}"
         assert (fp, "cpu", "fp16") in keys, f"fp16 entry missing: {keys}"
         interp_out = _plain_execute(prog, {"A": test_img}, tm, "cpu",
-                                    used_builtins=used)
+                                    used_builtins=used, time_context=None)
         assert torch.allclose(out32, interp_out, atol=1e-5)
         assert out16 is not None
         r.ok("compiled: precision is part of the cache key")
@@ -3060,9 +3068,9 @@ for (int i = 0; i < 2; i = i + 1) {
         got = compiled_mod.execute_compiled(prog_s, {"A": half, "name": "abc"}, tm_s, "cpu",
                                             fp_s, used_builtins=used_s, precision="fp16")
         exp16 = _plain_execute(prog_s, {"A": half, "name": "abc"}, tm_s, "cpu",
-                               used_builtins=used_s, precision="fp16")
+                               used_builtins=used_s, precision="fp16", time_context=None)
         exp32 = _plain_execute(prog_s, {"A": half, "name": "abc"}, tm_s, "cpu",
-                               used_builtins=used_s, precision="fp32")
+                               used_builtins=used_s, precision="fp32", time_context=None)
         assert torch.equal(got, exp16), "plain fallback did not forward precision"
         assert (got - exp32).abs().max().item() > 1e-5, \
             "fp16 vs fp32 should differ (0.5 + 0.0001 rounds away at fp16)"
@@ -3095,7 +3103,7 @@ for (int i = 0; i < 2; i = i + 1) {
             torch.compile = orig_compile
 
         interp_out = _plain_execute(prog1, {"A": test_img}, tm1, "cpu",
-                                    used_builtins=used1)
+                                    used_builtins=used1, time_context=None)
         assert torch.allclose(out, interp_out, atol=1e-5)
         assert fp1 in compiled_mod._compile_blacklist, \
             "program-specific failure should blacklist the fingerprint"
@@ -3131,7 +3139,7 @@ for (int i = 0; i < 2; i = i + 1) {
             torch.compile = orig_compile
 
         interp_out = _plain_execute(prog2, {"A": test_img}, tm2, "cpu",
-                                    used_builtins=used2)
+                                    used_builtins=used2, time_context=None)
         assert torch.allclose(out, interp_out, atol=1e-5)
         assert fp2 not in compiled_mod._compile_blacklist, \
             "backend-unavailable failure must not blacklist the fingerprint"
