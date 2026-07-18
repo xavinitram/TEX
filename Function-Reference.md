@@ -131,10 +131,10 @@
 
 | Function | Signature | Description | Tags |
 |----------|-----------|-------------|------|
-| `sdf_circle` | `sdf_circle(x, y, cx, cy, r) → float` | Signed distance to circle. Negative inside, positive outside. | — |
-| `sdf_box` | `sdf_box(x, y, cx, cy, hw, hh) → float` | Signed distance to axis-aligned box. | — |
+| `sdf_circle` | `sdf_circle(px, py, radius) → float` | Signed distance to a circle centered at the origin (offset px/py to move it). Negative inside, positive outside. | — |
+| `sdf_box` | `sdf_box(px, py, half_w, half_h) → float` | Signed distance to an axis-aligned box centered at the origin (half-extents half_w/half_h). | — |
 | `sdf_line` | `sdf_line(x, y, x1, y1, x2, y2) → float` | Distance to line segment. | — |
-| `sdf_polygon` | `sdf_polygon(x, y, cx, cy, r, n) → float` | Signed distance to regular polygon with n sides. | — |
+| `sdf_polygon` | `sdf_polygon(px, py, radius, sides) → float` | Signed distance to a regular polygon (sides>=3) centered at the origin. | — |
 | `smin` | `smin(a, b, k) → float\|vec` | Smooth minimum. Polynomial blending with radius k. Works on scalars and vectors. | — |
 | `smax` | `smax(a, b, k) → float\|vec` | Smooth maximum. Polynomial blending with radius k. Works on scalars and vectors. | — |
 

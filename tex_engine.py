@@ -43,6 +43,7 @@ logger = logging.getLogger("TEX")
 
 from .tex_compiler.ast_nodes import SourceLoc
 from .tex_runtime.interpreter import Interpreter, InterpreterError
+from .tex_runtime.interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
 from .tex_cache import get_cache
 from .tex_runtime.compiled import (
     execute_compiled,
@@ -147,15 +148,21 @@ def _cap_auto_caches() -> None:
 
 
 # ── Cached interpreter (reused across executions to avoid rebuild overhead) ──
-_interpreter: Interpreter | None = None
+# ENG-9: the interpreter is PER-THREAD, not a process singleton — the interpreter carries
+# per-instance execution state (scope stack, `_literal_cache`, `_builtins_lru`) that a
+# branch-parallel executor would corrupt if shared. Single-cook ComfyUI is unchanged (one
+# thread → one instance). The pool machinery is single-sourced in `interp_pool`.
+_interp_pool = _ThreadLocalInterpreterPool(Interpreter)
 
 
 def _get_interpreter() -> Interpreter:
-    """Get or create the cached Interpreter singleton."""
-    global _interpreter
-    if _interpreter is None:
-        _interpreter = Interpreter()
-    return _interpreter
+    """The current thread's cook Interpreter (ENG-9), created on first use."""
+    return _interp_pool.get()
+
+
+def _clear_all_interpreter_caches():
+    """Sweep EVERY per-thread interpreter's tensor LRUs (free_tensor_caches / memory pressure)."""
+    _interp_pool.clear_all()
 
 
 # ── The cook value bundles ───────────────────────────────────────────────────
@@ -233,6 +240,65 @@ class CookResult:
     precision: str                 # the EFFECTIVE precision this cook ran at
     binding_names: list            # effective bindings (merged, on a fused chain)
     near_singularities: int | None = None   # C4-ux, only when the debug toggle is on
+
+
+# ── ENG-6: zero-copy AI handoff (DLPack) ─────────────────────────────────────
+# A cook output ALREADY is what a vision model wants: a device-resident, fp32,
+# channels-last [B,H,W,C] image (or [B,H,W] mask). These helpers hand one to another
+# framework over the DLPack protocol with no host round-trip.
+#
+# CONTRACT (canary-pinned, test_v023_phase1): an engine output is (1) a torch.Tensor,
+# (2) fp32, (3) on the cook's device, (4) BHWC. `to_dlpack` can transpose to BCHW (the
+# NCHW most models expect) as a zero-copy view.
+#
+# OWNERSHIP — copy=True is the DEFAULT and the safe posture. Codegen may reuse an output
+# buffer (M-5 `out=`), and in the engine era an output may be a CACHED frame (CACHE-2);
+# a consumer writing in place through a zero-copy view would corrupt engine state. So by
+# default we hand out an OWNED contiguous copy. Pass copy=False only for a buffer you own
+# and will not let the model mutate.
+#
+# AUTOGRAD — every cook runs under torch.inference_mode(), so a raw output carries the
+# inference flag. The DLPack round-trip drops it (from_dlpack hands back an ORDINARY tensor
+# over the shared memory either way), so a consumer CAN attach the result to an autograd
+# graph — but for copy=False that graph would be backed by an engine buffer the next cook
+# overwrites. Use copy=True (default) whenever the consumer will train through or mutate the
+# tensor; copy=False is for read-only, same-tick consumption. Differentiable cooking (grad
+# flowing back INTO the cook) is out of scope until the engine era.
+
+def _owned_copy(t):
+    """An owned, contiguous copy of `t` that is NOT inference-flagged (so an ML consumer
+    can attach it to an autograd graph). `empty_like`+`copy_` runs outside the cook's
+    inference_mode, unlike `.clone()`, which would inherit the flag."""
+    src = t.contiguous()
+    out = torch.empty_like(src)
+    out.copy_(src)
+    return out
+
+
+def to_dlpack(tensor, *, layout="bhwc", copy=True):
+    """Export a cooked output tensor as a DLPack capsule (ENG-6). `layout='bchw'` returns
+    an NCHW-shaped view (a zero-copy permute); `copy=True` (default) first re-materializes
+    an owned, contiguous, grad-ready tensor — see the ownership/autograd notes above."""
+    import torch.utils.dlpack as _dl
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"to_dlpack expects a torch.Tensor, got {type(tensor).__name__}")
+    t = tensor
+    if layout == "bchw":
+        if t.dim() != 4:
+            raise ValueError(f"layout='bchw' needs a 4-D [B,H,W,C] tensor, got {tuple(t.shape)}")
+        t = t.permute(0, 3, 1, 2)
+    elif layout != "bhwc":
+        raise ValueError(f"layout must be 'bhwc' or 'bchw', got {layout!r}")
+    if copy:
+        t = _owned_copy(t)
+    return _dl.to_dlpack(t)
+
+
+def from_dlpack(capsule):
+    """Import a DLPack capsule (from torch or another framework) as a torch tensor that
+    shares its memory (ENG-6). The inverse of `to_dlpack`."""
+    import torch.utils.dlpack as _dl
+    return _dl.from_dlpack(capsule)
 
 
 # ── Debug overlays (DBG-3 magenta NaN, C4-ux cyan near-singularity) ──────────

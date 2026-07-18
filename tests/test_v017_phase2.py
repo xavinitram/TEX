@@ -108,15 +108,16 @@ def test_tst3_taxonomy_consistency(r: SubTestResult):
     except Exception as e:
         r.fail("TST-3 dispatch", f"{type(e).__name__}: {e}")
 
-    # (4) FORGOTTEN-TAG CATCH — a sample_*/fetch_*/blur/erode/dilate/*_filter fn MUST be
-    #     non_local. This turns the single most dangerous LLM stdlib edit (adding a
-    #     neighbour-reading fn without tagging it) from silent-wrong into a red test.
+    # (4) FORGOTTEN-TAG CATCH (ROI-1: now in footprint terms) — a sample_*/fetch_*/blur/
+    #     erode/dilate/*_filter fn MUST carry a non-'point' footprint. This turns the
+    #     single most dangerous LLM stdlib edit (adding a neighbour-reading fn without
+    #     classifying its footprint) from silent-wrong-if-tiled into a red test.
     try:
         untagged = sorted(n for e in R.REGISTRY for n in e.names
-                          if _looks_spatial(n) and not e.non_local)
-        assert not untagged, (f"spatial-named fns missing non_local=True (would tile "
-                              f"WRONG): {untagged}")
-        r.ok("every neighbour-reading-named fn is tagged non_local (tiling-safe)")
+                          if _looks_spatial(n) and e.footprint == "point")
+        assert not untagged, (f"spatial-named fns left at the default 'point' footprint "
+                              f"(would tile WRONG): {untagged}")
+        r.ok("every neighbour-reading-named fn has a non-'point' footprint (tiling-safe)")
     except Exception as e:
         r.fail("TST-3 forgotten-tag", f"{type(e).__name__}: {e}")
 
@@ -154,6 +155,38 @@ def test_doc4_reference(r: SubTestResult):
         r.ok("Function-Reference.md matches a fresh regen (view is current)")
     except Exception as e:
         r.fail("DOC-4 drift", f"{type(e).__name__}: {e}")
+
+    # (3) LANG-4 FLIP — the function help DATA now lives in the registry (single source);
+    #     the JS TEX_HELP_DATA sig for every function MIRRORS it, so neither can silently
+    #     drift from the other. (Descriptions legitimately differ: the JS panel keeps its
+    #     richer prose; only the migrated `sig` is pinned.)
+    try:
+        import TEX_Wrangle.tex_runtime.stdlib  # noqa: F401 (populate REGISTRY)
+        from TEX_Wrangle.tex_runtime import stdlib_registry as R
+        entries, _cats = G.parse_help()
+        drift = []
+        for e in R.REGISTRY:
+            js = entries.get(e.name)
+            if js is None:
+                drift.append(f"{e.name}: no JS entry")
+            elif js["sig"] != e.sig:
+                drift.append(f"{e.name}: JS {js['sig']!r} != registry {e.sig!r}")
+        assert not drift, "; ".join(drift[:6])
+        r.ok(f"all {len(R.REGISTRY)} function sigs agree between the registry and JS TEX_HELP_DATA")
+    except Exception as e:
+        r.fail("LANG-4 JS↔registry sig", f"{type(e).__name__}: {e}")
+
+    # (4) the registry-sourced help JSON (tex_help.json) is current.
+    try:
+        import gen_help_data as GH
+        text = GH.render(GH.build())
+        committed = open(os.path.join(_repo_root(), "tex_help.json"),
+                         encoding="utf-8").read().replace("\r\n", "\n")
+        assert committed == text.replace("\r\n", "\n"), \
+            "tex_help.json is stale — run `python tools/gen_help_data.py`"
+        r.ok("tex_help.json matches a fresh regen (registry-sourced help JSON is current)")
+    except Exception as e:
+        r.fail("LANG-4 help JSON drift", f"{type(e).__name__}: {e}")
 
 
 def test_doc5_examples_index(r: SubTestResult):

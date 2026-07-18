@@ -61,7 +61,13 @@ function structuredToCM6(view, d) {
     const lineInfo = doc.line(line);
     const from = lineInfo.from + Math.min(col - 1, lineInfo.length);
     let to;
-    if (d.end_col && d.end_col > col) {
+    // LANG-2: a multi-line span (end_line > line) underlines through to end_col on the
+    // last line; otherwise fall back to end_col on the same line, else to end-of-line.
+    if (d.end_line && d.end_line > line && d.end_line <= doc.lines) {
+        const endInfo = doc.line(d.end_line);
+        to = d.end_col ? endInfo.from + Math.min(d.end_col - 1, endInfo.length)
+                       : endInfo.to;
+    } else if (d.end_col && d.end_col > col) {
         to = lineInfo.from + Math.min(d.end_col - 1, lineInfo.length);
     } else {
         to = lineInfo.to;

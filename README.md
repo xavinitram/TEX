@@ -116,6 +116,9 @@ c$tint = "#FF8800";  // COLOR picker
 v3$offset = vec3(1.0, 0.5, 0.0);  // VEC3 (X/Y/Z float inputs)
 
 @OUT = @image * $strength;
+
+// Optional widget metadata (min / max / step / label) — literals only:
+f$gain = 1.0 [min: 0, max: 4, step: 0.05, label: "Gain"];
 ```
 
 ### Channel Access & Swizzling
@@ -268,7 +271,14 @@ Benchmark harnesses live in `benchmarks/` — `eight_config_bench.py` (device ×
 
 ## Development
 
-See **[DEVELOPMENT.md](DEVELOPMENT.md)** for architecture, compilation pipeline internals, and guides for adding functions, types, and operators.
+See **[LANGUAGE.md](LANGUAGE.md)** for the language reference — grammar, type-promotion
+rules, reserved words, and the compatibility policy (`LANGUAGE_VERSION`, the `//!tex`
+pragma, and the frozen compat corpus). **[Function-Reference.md](Function-Reference.md)**
+lists every built-in; the CLI has `tex help <fn>` for the same, and
+`tex_api.check(source, types)` returns non-raising diagnostics (errors + warnings) for
+editor tooling.
+
+See **[DEVELOPMENT.md](DEVELOPMENT.md)** for architecture, compilation pipeline internals, the concurrency/thread-safety contract, and guides for adding functions, types, and operators.
 
 See **[CONTRIBUTING.md](CONTRIBUTING.md)** for dev setup, testing, and pull request guidelines.
 

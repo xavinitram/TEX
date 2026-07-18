@@ -92,6 +92,10 @@ class Parser:
         self.pos = 0
         self._source = source
         self._errors: list[ParseError] = []
+        # LANG-1: while parsing a param DEFAULT, a trailing `[` opens the metadata
+        # block, not an array index — a param default is always a literal, so array
+        # indexing there is never valid. Suppresses only the postfix `[expr]` branch.
+        self._suppress_index = False
 
     # -- Helpers --------------------------------------------------------
 
@@ -262,12 +266,13 @@ class Parser:
             if self.peek_ahead() == TokenType.LBRACKET:
                 return self._recover_misplaced_array_brackets()
 
-        # Parameter declaration: f$name = 0.5; or $name; or i$count = 10;
+        # Parameter declaration: f$name = 0.5; or $name; or i$count = 10; or, with a
+        # LANG-1 metadata block and no default, f$name [min: 0, max: 1];
         if self.peek() == TokenType.TYPED_DOLLAR_BINDING:
-            if self.peek_ahead() in (TokenType.ASSIGN, TokenType.SEMI):
+            if self.peek_ahead() in (TokenType.ASSIGN, TokenType.SEMI, TokenType.LBRACKET):
                 return self.parse_param_decl()
         if self.peek() == TokenType.DOLLAR_BINDING:
-            if self.peek_ahead() in (TokenType.ASSIGN, TokenType.SEMI):
+            if self.peek_ahead() in (TokenType.ASSIGN, TokenType.SEMI, TokenType.LBRACKET):
                 return self.parse_param_decl()
 
         # if/else
@@ -409,12 +414,20 @@ class Parser:
                            params=params, body=body)
 
     def parse_param_decl(self) -> ParamDecl:
-        """Parse: ($name | prefix$name) ('=' expr)? ';'"""
+        """Parse: ($name | prefix$name) ('=' expr)? metadata_block? ';'
+        metadata_block = '[' IDENT ':' literal (',' IDENT ':' literal)* ']'  (LANG-1)."""
         loc = self.loc()
         tok = self.advance()  # TYPED_DOLLAR_BINDING or DOLLAR_BINDING
         default_expr = None
         if self.match(TokenType.ASSIGN):
-            default_expr = self.parse_expr()
+            self._suppress_index = True   # a trailing `[…]` is metadata, not an index
+            try:
+                default_expr = self.parse_expr()
+            finally:
+                self._suppress_index = False
+        metadata = None
+        if self.peek() == TokenType.LBRACKET:
+            metadata = self._parse_param_metadata()
         self.expect(TokenType.SEMI, "It looks like there's a missing semicolon after this parameter declaration",
                    code="E2010", hint="Every statement in TEX ends with `;`.")
         return ParamDecl(
@@ -422,7 +435,61 @@ class Parser:
             name=tok.value,
             type_hint=tok.prefix,
             default_expr=default_expr,
+            metadata=metadata,
         )
+
+    def _parse_param_metadata(self) -> dict:
+        """LANG-1 UI-widget metadata: `[ key: literal (, key: literal)* ]`. Keys are
+        identifiers (e.g. min/max/step/label); values are LITERALS ONLY — a number
+        (optionally negated) or a string. Parsing literals directly (not `parse_expr`)
+        is the enforcement: a binding ref, a call, or any expression here is a syntax
+        error, so a declaration can never smuggle a computed value into its UI schema.
+        Returns a plain {str: float|int|str} dict (never AST nodes)."""
+        self.advance()  # consume '['
+        meta: dict = {}
+        if self.peek() != TokenType.RBRACKET:
+            while True:
+                key_tok = self.expect(
+                    TokenType.IDENT,
+                    "I expected a metadata key like `min`, `max`, `step`, or `label`",
+                    code="E2011",
+                    hint="Parameter metadata looks like `[min: 0, max: 1, label: \"Gain\"]`.")
+                if key_tok.value in meta:
+                    raise self._make_error(
+                        f"Duplicate metadata key '{key_tok.value}'.", key_tok.loc,
+                        code="E2011", hint="Each metadata key may appear at most once.")
+                self.expect(TokenType.COLON,
+                            f"I expected ':' after the metadata key '{key_tok.value}'",
+                            code="E2011")
+                meta[key_tok.value] = self._parse_metadata_literal(key_tok.value)
+                if not self.match(TokenType.COMMA):
+                    break
+        self.expect(TokenType.RBRACKET,
+                    "I expected ']' to close the parameter metadata block",
+                    code="E2011",
+                    hint="Parameter metadata looks like `[min: 0, max: 1, label: \"Gain\"]`.")
+        return meta
+
+    def _parse_metadata_literal(self, key: str):
+        """One metadata value: a number (INT/FLOAT, optionally `-`) or a string. Anything
+        else — an identifier, a `(`, a `$binding` — is rejected here (literals only)."""
+        neg = self.match(TokenType.MINUS)
+        tok = self.current()
+        if tok.type == TokenType.INT_LIT:
+            self.advance()
+            val = int(tok.value, 16) if tok.value[:2] in ("0x", "0X") else int(tok.value)
+            return -val if neg else val
+        if tok.type == TokenType.FLOAT_LIT:
+            self.advance()
+            val = float(tok.value)
+            return -val if neg else val
+        if tok.type == TokenType.STRING_LIT and not neg:
+            self.advance()
+            return tok.value
+        raise self._make_error(
+            f"Metadata value for '{key}' must be a literal number or string.",
+            tok.loc, code="E2011",
+            hint="Use a plain literal, e.g. `min: 0`, `step: 0.05`, or `label: \"Gain\"`.")
 
     def parse_array_decl(self) -> ArrayDecl:
         """Parse: type IDENT '[' INT? ']' ('=' ('{' expr_list '}' | IDENT))? ';'"""
@@ -762,8 +829,9 @@ class Parser:
                     args.append(self.parse_expr())
                 self.expect(TokenType.RPAREN, "I expected `)` to close the binding sample access")
                 expr = BindingSampleAccess(loc=loc, binding=expr, args=args)
-            elif self.peek() == TokenType.LBRACKET:
-                # Array indexing: expr[index]
+            elif self.peek() == TokenType.LBRACKET and not self._suppress_index:
+                # Array indexing: expr[index]  (suppressed inside a param default so a
+                # trailing `[…]` reads as the LANG-1 metadata block, not an index)
                 loc = self.loc()
                 self.advance()  # consume [
                 index = self.parse_expr()

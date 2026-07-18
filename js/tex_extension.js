@@ -62,7 +62,10 @@ const DEBOUNCE_MS = 400;
 // ─── Snippet System ─────────────────────────────────────────────────
 // Built-in example snippets are fetched from the backend (/tex_wrangle/snippets)
 // which reads them from the examples/ directory.  Cached after first fetch.
-// User snippets are stored in localStorage.
+// User snippets are SERVER-BACKED since v0.23 (LANG-5): the source of truth is a JSON
+// file in the host's user dir (/tex_wrangle/user_snippets), so snippets survive a browser
+// wipe and follow the user across machines. localStorage is now an OFFLINE CACHE — synced
+// from the server on menu-open, written through on save so an offline edit isn't lost.
 
 let _builtinSnippetsCache = null;
 
@@ -80,15 +83,149 @@ async function _fetchBuiltinSnippets() {
 }
 
 const SNIPPET_STORAGE_KEY = "tex_wrangle_snippets";
+// LANG-5 (BUG 1): names whose latest local edit has NOT yet been confirmed durable by the
+// server. A save marks its changed names pending and writes the cache immediately; the
+// server POST clears them only once it confirms the write landed. Until then a sync must
+// not let server truth clobber them, and must re-push them. Persisted so an edit made
+// offline (or rejected by a read-only disk) survives a reload.
+const SNIPPET_PENDING_KEY = "tex_wrangle_snippets_pending";
 const _cmpLocale = (a, b) => a.localeCompare(b, undefined, { sensitivity: "base" });
+const _hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+// Serializes the whole-map snippet POSTs: a newer write is not SENT until the previous one
+// settles, so the server never applies two whole-map replaces out of order (which would let
+// an older map clobber a newer one and drop a snippet). Rapid saves therefore land in issue
+// order, last-write-wins. (Cross-TAB writes share localStorage but not this chain — true
+// cross-tab ordering needs a server-side per-key/versioned store, out of scope here.)
+let _snipPostChain = Promise.resolve();
 
 function _loadUserSnippets() {
-    try { return JSON.parse(localStorage.getItem(SNIPPET_STORAGE_KEY) || "{}"); }
-    catch (_) { return {}; }
+    // The synchronous offline cache. Server truth is folded into it by
+    // _syncUserSnippetsFromServer (called at menu-open) so this stays current. Normalize a
+    // tampered / non-object cache to {} so the spread + Object.keys downstream never throw.
+    try {
+        const v = JSON.parse(localStorage.getItem(SNIPPET_STORAGE_KEY) || "{}");
+        return (v && typeof v === "object" && !Array.isArray(v)) ? v : {};
+    } catch (_) { return {}; }
 }
 
-function _saveUserSnippets(snippets) {
+function _loadPendingSnippets() {
+    try {
+        const a = JSON.parse(localStorage.getItem(SNIPPET_PENDING_KEY) || "[]");
+        return new Set(Array.isArray(a) ? a : []);
+    } catch (_) { return new Set(); }
+}
+
+function _savePendingSnippets(set) {
+    try {
+        if (set && set.size) localStorage.setItem(SNIPPET_PENDING_KEY, JSON.stringify([...set]));
+        else localStorage.removeItem(SNIPPET_PENDING_KEY);
+    } catch (_) { /* storage unavailable */ }
+}
+
+// POST the whole cache to the server and, ONLY on a confirmed-durable write (resp.ok AND
+// body {"ok": true}), clear the just-written names from the pending set — and only those
+// whose cache value is unchanged since this POST, so a newer edit issued while this POST
+// was in flight is never wrongly marked durable. A rejected / offline POST leaves the
+// names pending so the next sync retries them (BUG 1).
+function _postUserSnippets(snippets, names) {
+    const snapshot = {};   // value being persisted for each pending name (undefined = absent/deleted)
+    for (const n of names) snapshot[n] = _hasOwn(snippets, n) ? snippets[n] : undefined;
+    // Append to the single-flight chain so this POST is SENT only after the previous one
+    // settles — whole-map replaces then land in order (see _snipPostChain above). Each link
+    // is time-BOUNDED and aborts on timeout, so a hung / never-settling POST can't wedge the
+    // saves queued behind it (head-of-line blocking) and a late reply can't land out of order
+    // after a newer save. On any failure the names stay pending and retry on the next sync.
+    // (fetchApi spreads these options into fetch(), so the AbortSignal is honored.)
+    _snipPostChain = _snipPostChain.then(async () => {
+        const ctl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+        const timer = ctl ? setTimeout(() => ctl.abort(), 15000) : null;
+        try {
+            let r;
+            try {
+                r = await api.fetchApi("/tex_wrangle/user_snippets", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ snippets }),
+                    signal: ctl ? ctl.signal : undefined,
+                });
+            } catch (_) { return; }   // offline / aborted / hung — keep pending, retried on next sync
+            let ok = false;
+            try { ok = !!(r && r.ok) && (((await r.json()) || {}).ok === true); } catch (_) { ok = false; }
+            if (!ok) return;   // undurable (offline / read-only disk / rejected) — keep pending
+            const cur = _loadUserSnippets();
+            const pend = _loadPendingSnippets();
+            for (const n of names) {
+                const curHas = _hasOwn(cur, n);
+                const snapHas = snapshot[n] !== undefined;
+                // clear a name only if its cache value is UNCHANGED since this POST's snapshot,
+                // so a newer edit issued while this POST was queued/in-flight stays pending.
+                if (curHas === snapHas && (!curHas || cur[n] === snapshot[n])) pend.delete(n);
+            }
+            _savePendingSnippets(pend);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }).catch(() => {});
+}
+
+function _saveUserSnippets(snippets, changed) {
+    // Write the offline cache immediately (so the UI is responsive and an offline edit is
+    // kept), mark the changed names pending, then write through to the server. `changed`
+    // is the affected name(s) (including a deleted name, now absent from `snippets`); it
+    // defaults to the whole map for callers that don't know their diff.
     localStorage.setItem(SNIPPET_STORAGE_KEY, JSON.stringify(snippets));
+    const names = (changed && changed.length) ? [...new Set(changed)] : Object.keys(snippets);
+    const pending = _loadPendingSnippets();
+    for (const n of names) pending.add(n);
+    _savePendingSnippets(pending);
+    _postUserSnippets(snippets, names);
+}
+
+// LANG-5: fold the server's user snippets into the localStorage cache. Called before the
+// snippet menu builds its tree, so the menu shows server truth. NON-DESTRUCTIVE (BUG 2):
+// the cache is overwritten ONLY on a signalled-successful read; a 503 / read_error / offline
+// leaves it untouched.
+//
+// The merge is CACHE-BASED, not GET-based, and favors PRESERVATION: it starts from the
+// local cache (so a snippet saved concurrently — present in the cache but absent from THIS
+// possibly-stale GET response — is never dropped), then adopts server values for names the
+// client is NOT locally pending on (cross-machine adds/updates propagate; pending edits win
+// per key — BUG 1). The only removal is a LOCAL pending-delete. Consequence: a delete made
+// on another machine does not passively propagate here (and a coincident re-POST may even
+// re-push the entry) — the deliberate safe direction for a store whose whole purpose is to
+// not lose snippets. Full cross-machine convergence (including delete propagation) needs a
+// versioned / per-key server store; that is out of scope for this data-loss fix.
+async function _syncUserSnippetsFromServer() {
+    // Snapshot pending BEFORE the GET is issued. The GET is not on the POST chain, so its
+    // response can predate an in-flight POST's landing; a name that was pending when we
+    // asked may have been confirmed-and-cleared by the time we merge, and the stale GET
+    // would then adopt the server's PRE-confirmation value — silently reverting a durable
+    // local edit (then a later whole-map save makes the loss permanent). So a name pending
+    // at issue-time OR now is not trusted from this response; it re-syncs once the GET is
+    // demonstrably newer than the last confirmed write (next menu-open, pending clear).
+    const pendingAtIssue = _loadPendingSnippets();
+    let resp;
+    try { resp = await api.fetchApi("/tex_wrangle/user_snippets"); }
+    catch (_) { return; }                 // offline — keep the cache + pending
+    if (!resp.ok) return;                 // 503 read-error — server couldn't read; keep the cache
+    let data;
+    try { data = await resp.json(); } catch (_) { return; }
+    const server = data && data.snippets;
+    if (!data || data.read_error || typeof server !== "object" || server === null || Array.isArray(server)) {
+        return;                           // signalled read failure / bad shape — do not sync over the cache
+    }
+    const cache = _loadUserSnippets();
+    const pendingNow = _loadPendingSnippets();
+    const guard = new Set([...pendingAtIssue, ...pendingNow]);   // names this GET can't be trusted for
+    const merged = { ...cache };                       // base: never blindly drop a locally-known snippet
+    for (const n of Object.keys(server)) {
+        if (!guard.has(n)) merged[n] = server[n];      // adopt server truth only for un-guarded names
+    }
+    for (const n of pendingNow) {
+        if (!_hasOwn(cache, n)) delete merged[n];      // a LOCAL pending-delete stays deleted
+    }
+    localStorage.setItem(SNIPPET_STORAGE_KEY, JSON.stringify(merged));
+    if (pendingNow.size) _postUserSnippets(merged, [...pendingNow]);   // push pending edits, clear on confirm
 }
 
 /** Build a nested tree from flat "folder/folder/name" → content map. */
@@ -288,7 +425,7 @@ function _showSaveSnippetDialog(content) {
         if (!name) { input.focus(); return; }
         const snippets = _loadUserSnippets();
         snippets[name] = content;
-        _saveUserSnippets(snippets);
+        _saveUserSnippets(snippets, [name]);
         doClose();
     }
 
@@ -414,7 +551,7 @@ function _showManageSnippetsDialog() {
                         const snips = _loadUserSnippets();
                         snips[newName.trim()] = snips[key];
                         delete snips[key];
-                        _saveUserSnippets(snips);
+                        _saveUserSnippets(snips, [newName.trim(), key]);
                         render();
                     }
                 });
@@ -427,7 +564,7 @@ function _showManageSnippetsDialog() {
                     if (confirm(`Delete snippet "${key}"?`)) {
                         const snips = _loadUserSnippets();
                         delete snips[key];
-                        _saveUserSnippets(snips);
+                        _saveUserSnippets(snips, [key]);
                         render();
                     }
                 });
@@ -470,6 +607,22 @@ const texEditorMeta = new WeakMap();  // node → { autocompleteCompartment, com
 
 // ─── Code Parser (inputs, outputs, params) ──────────────────────────
 
+// LANG-1: parse a param's UI-metadata block `[min: 0, max: 2, step: 0.05, label: "…"]`.
+// Called on the STRIPPED source, where string values are blanked to "" — so only the
+// NUMERIC keys (min/max/step/precision) are recovered here; the string `label` is
+// recovered separately from the raw code (see parseCode). Returns null when empty.
+function _parseParamMetadata(block) {
+    if (!block) return null;
+    const meta = {};
+    const inner = block.replace(/^\[/, "").replace(/\]$/, "");
+    const KV_RE = /([A-Za-z_]\w*)\s*:\s*(-?\d*\.?\d+)/g;
+    let mm;
+    while ((mm = KV_RE.exec(inner)) !== null) {
+        meta[mm[1]] = parseFloat(mm[2]);
+    }
+    return Object.keys(meta).length ? meta : null;
+}
+
 function parseCode(code) {
     const stripped = code
         .replace(/\/\/[^\n]*/g, "")
@@ -505,16 +658,31 @@ function parseCode(code) {
     }
 
     // 4) Detect parameter bindings ($name with optional type prefix)
-    const params = new Map(); // name → { typeHint, defaultValue }
-    // Explicit declarations: f$strength = 0.5; or i$count; (supports all type prefixes)
+    const params = new Map(); // name → { typeHint, defaultValue, metadata }
+    // Explicit declarations: f$strength = 0.5; or i$count; (supports all type prefixes),
+    // with an optional LANG-1 metadata block: f$strength = 0.5 [min: 0, max: 2].
     // Lookbehind requires statement boundary (^, ;, {, }) to avoid matching
     // $name inside expressions like for-loop headers: for (int dy = -$radius; ...)
-    const PARAM_DECL_RE = /(?<=(?:^|[;{}])\s*)(?:(img|v[234]|[fismvlcb]))?\$([A-Za-z_]\w*)\s*(?:=\s*([^;]+))?\s*;/gm;
+    // Group 3 = default (stops before `[` or `;`); group 4 = the `[…]` metadata block.
+    const PARAM_DECL_RE = /(?<=(?:^|[;{}])\s*)(?:(img|v[234]|[fismvlcb]))?\$([A-Za-z_]\w*)\s*(?:=\s*([^;\[]*?))?\s*(\[[^\]]*\])?\s*;/gm;
     while ((m = PARAM_DECL_RE.exec(stripped)) !== null) {
         params.set(m[2], {
             typeHint: m[1] || "f",
             defaultValue: m[3]?.trim() || null,
+            metadata: _parseParamMetadata(m[4]),
         });
+    }
+    // LANG-1: recover the string-valued `label` from RAW code (the strip blanks string
+    // contents, so labels never survive into `stripped`). Keyed by the param names we
+    // already found, so a `label:"…"` inside an unrelated string literal can't leak in.
+    const LABEL_RE = /(?:img|v[234]|[fismvlcb])?\$([A-Za-z_]\w*)[^;\n]*?\[[^\]]*?\blabel\s*:\s*"([^"]*)"/g;
+    let lm;
+    while ((lm = LABEL_RE.exec(code)) !== null) {
+        const p = params.get(lm[1]);
+        if (p) {
+            if (!p.metadata) p.metadata = {};
+            p.metadata.label = lm[2];
+        }
     }
     // Also find $name references not yet captured (preserve type prefix from reference)
     const PARAM_REF_RE = /([a-z]\d{0,2})?\$([A-Za-z_]\w*)/g;
@@ -848,8 +1016,10 @@ function syncParams(node, params) {
         } else if (typeHint === "i") {
             const parsed = info.defaultValue != null ? parseInt(info.defaultValue) : NaN;
             const def = Number.isFinite(parsed) ? parsed : 0;
+            const md = info.metadata || {};   // LANG-1 ranges (fall back to the old defaults)
             widget = node.addWidget("number", name, def, () => {}, {
-                min: -9999, max: 9999, step: 10, precision: 0,
+                min: md.min ?? -9999, max: md.max ?? 9999,
+                step: md.step ?? 10, precision: md.precision ?? 0,
             });
         } else if (typeHint === "s") {
             const raw = info.defaultValue || "";
@@ -859,13 +1029,17 @@ function syncParams(node, params) {
             // float (default)
             const parsed = info.defaultValue != null ? parseFloat(info.defaultValue) : NaN;
             const def = Number.isFinite(parsed) ? parsed : 0.0;
+            const md = info.metadata || {};   // LANG-1 ranges (fall back to the old defaults)
             widget = node.addWidget("number", name, def, () => {}, {
-                min: -9999, max: 9999, step: 0.1, precision: 3,
+                min: md.min ?? -9999, max: md.max ?? 9999,
+                step: md.step ?? 0.1, precision: md.precision ?? 3,
             });
         }
         if (widget) {
             widget._texParam = true;
             widget._texTypeHint = typeHint;
+            // LANG-1: a `label: "…"` overrides the widget's displayed name (value unchanged).
+            if (info.metadata && info.metadata.label) widget.label = info.metadata.label;
             const prefixMap = { i: "i", s: "s", b: "b", c: "c", v2: "v2", v3: "v3" };
             const prefixChar = prefixMap[typeHint] || "f";
             const defaultStr = info.defaultValue != null ? String(info.defaultValue) : (typeHint === "s" ? '""' : typeHint === "b" ? "0" : typeHint === "c" ? '"#000000"' : "0");
@@ -1376,6 +1550,42 @@ api.addEventListener("execution_start", () => {
 
 // ─── CodeMirror 6 Editor Creation ────────────────────────────────────
 
+// LANG-2: debounced live-lint. POSTs the current source to /tex_wrangle/check and paints
+// the returned diagnostics (errors + W7xxx warnings) as CM6 squiggles. Best-effort — any
+// network/parse failure leaves the existing markers untouched and never throws.
+const _lintDebouncers = new WeakMap();   // EditorView → debounced fetch
+
+async function _texRequestLint(view, code) {
+    let diags;
+    try {
+        const resp = await api.fetchApi("/tex_wrangle/check", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ source: code }),
+        });
+        if (!resp.ok) return;
+        diags = (await resp.json()).diagnostics || [];
+    } catch (_) { return; }
+    const CM6 = getCM6();
+    if (!CM6 || !view) return;
+    try {
+        // Reuse the WS-error converter by wrapping the list in its TEX_DIAG envelope; an
+        // empty list clears stale squiggles once the program parses clean again.
+        const errData = { message: "TEX_DIAG:" + JSON.stringify(diags) };
+        const cmDiags = CM6.texErrorToDiagnostics(view, errData);
+        view.dispatch(CM6.setDiagnostics(view.state, cmDiags));
+    } catch (_) { /* older bundle without the converter — skip live squiggles */ }
+}
+
+function _texScheduleLint(view, code) {
+    let dl = _lintDebouncers.get(view);
+    if (!dl) {
+        dl = debounce((v, c) => _texRequestLint(v, c), 400);
+        _lintDebouncers.set(view, dl);
+    }
+    dl(view, code);
+}
+
 function createTexEditor(node, codeWidget, updateSockets) {
     const CM6 = getCM6();
     if (!CM6) {
@@ -1476,6 +1686,7 @@ function createTexEditor(node, codeWidget, updateSockets) {
                                 codeWidget.callback(newCode);
                             }
                             updateSockets();
+                            _texScheduleLint(update.view, newCode);   // LANG-2 live-lint
 
                             // ── Manual completion trigger (Electron compatibility) ──
                             // CM6's activateOnTyping relies on transactions being tagged
@@ -1634,6 +1845,7 @@ function showTexContextMenu(x, y, editorView) {
                     if (row._childSub) return;
 
                     const builtins = await _fetchBuiltinSnippets();
+                    await _syncUserSnippetsFromServer();   // LANG-5: fold server truth into the cache
                     if (row._childSub) return;  // re-check after await
                     const combined = { ...builtins, ..._loadUserSnippets() };
                     const tree = _buildSnippetTree(combined);
@@ -1873,10 +2085,10 @@ const TEX_HELP_DATA = [
         title: "SDF & Smooth",
         icon: "\u{1F7E2}",
         entries: [
-            { name: "sdf_circle", sig: "sdf_circle(x, y, cx, cy, r) \u2192 float", desc: "Signed distance to circle. Negative inside, positive outside.", example: "float d = sdf_circle(u, v, 0.5, 0.5, 0.3);" },
-            { name: "sdf_box", sig: "sdf_box(x, y, cx, cy, hw, hh) \u2192 float", desc: "Signed distance to axis-aligned box.", example: "float d = sdf_box(u, v, 0.5, 0.5, 0.2, 0.15);" },
+            { name: "sdf_circle", sig: "sdf_circle(px, py, radius) \u2192 float", desc: "Signed distance to a circle centered at the origin (offset px/py to move it). Negative inside, positive outside.", example: "float d = sdf_circle(u - 0.5, v - 0.5, 0.3);" },
+            { name: "sdf_box", sig: "sdf_box(px, py, half_w, half_h) \u2192 float", desc: "Signed distance to an axis-aligned box centered at the origin (half-extents half_w/half_h).", example: "float d = sdf_box(u - 0.5, v - 0.5, 0.2, 0.15);" },
             { name: "sdf_line", sig: "sdf_line(x, y, x1, y1, x2, y2) \u2192 float", desc: "Distance to line segment.", example: "float d = sdf_line(u, v, 0.2, 0.2, 0.8, 0.8);" },
-            { name: "sdf_polygon", sig: "sdf_polygon(x, y, cx, cy, r, n) \u2192 float", desc: "Signed distance to regular polygon with n sides.", example: "float d = sdf_polygon(u, v, 0.5, 0.5, 0.3, 6);" },
+            { name: "sdf_polygon", sig: "sdf_polygon(px, py, radius, sides) \u2192 float", desc: "Signed distance to a regular polygon (sides>=3) centered at the origin.", example: "float d = sdf_polygon(u - 0.5, v - 0.5, 0.3, 6);" },
             { name: "smin", sig: "smin(a, b, k) \u2192 float|vec", desc: "Smooth minimum. Polynomial blending with radius k. Works on scalars and vectors.", example: "float d = smin(d1, d2, 0.1);" },
             { name: "smax", sig: "smax(a, b, k) \u2192 float|vec", desc: "Smooth maximum. Polynomial blending with radius k. Works on scalars and vectors.", example: "float d = smax(d1, d2, 0.1);" },
         ]

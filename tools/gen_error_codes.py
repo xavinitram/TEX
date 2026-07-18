@@ -34,13 +34,16 @@ _FAMILIES = [
     ("E6", "Runtime / node", "Errors while executing or wiring the node "
      "(an input `@X` isn't connected, a runtime value went non-finite, a fused-chain or "
      "lazy-input problem, an OOM the node re-raised for ComfyUI to handle)."),
+    ("W7", "Warnings", "Non-fatal advisories (LANG-2). The program still compiles and "
+     "runs; these flag likely mistakes — an unused variable or wired input, or a name "
+     "that shadows a built-in or an outer-scope variable."),
 ]
 
 
 def harvest_codes():
-    """Return the sorted set of ENNNN codes used across the source (excluding tests)."""
+    """Return the sorted set of ENNNN/WNNNN codes used across the source (excluding tests)."""
     codes = set()
-    pat = re.compile(r"\bE\d{4}\b")
+    pat = re.compile(r"\b[EW]\d{4}\b")
     for root, _dirs, files in os.walk(_PKG):
         if any(s in root for s in ("tests", "benchmarks", "__pycache__", ".tex_cache", "tools", "wiki")):
             continue
@@ -57,7 +60,8 @@ def render(codes):
     out = [
         "# Error codes",
         "",
-        "Every TEX diagnostic carries a stable `ENNNN` code and links here. Codes are grouped "
+        "Every TEX diagnostic carries a stable `ENNNN` (error) or `WNNNN` (warning) code and "
+        "links here. Codes are grouped "
         "by compiler/runtime phase (the first digit). The exact message is written for your "
         "specific program at the point of failure; this page explains the *class* and how to "
         "approach it. **This page is generated** (`tools/gen_error_codes.py`) — do not edit by hand.",
@@ -77,7 +81,7 @@ def render(codes):
         for c in fam_codes:
             out.append(f"### {c}")
             out.append("")
-            out.append(f"{name} error. See the message shown with the code for the specific cause "
+            out.append(f"{name}. See the message shown with the code for the specific cause "
                        "and fix; the class is described above.")
             out.append("")
     return "\n".join(out).rstrip() + "\n"

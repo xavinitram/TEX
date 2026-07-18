@@ -84,6 +84,44 @@ The linear-chain collapse is UNCHANGED — verify it still works AND the new fan
       (its intermediate escapes) — no dangling reference, prompt still valid.
 - [ ] Browser console shows no `[TEX] region fuse skipped` errors on a valid graph.
 
+## LANG-5 — server-backed snippet sync + data-loss hardening (v0.23)
+The store round-trip is headless-tested (`test_lang5_snippet_route`); the localStorage
+cache / pending-set / merge logic in `_saveUserSnippets`, `_postUserSnippets` and
+`_syncUserSnippetsFromServer` can only be checked on a live canvas. Open DevTools →
+Application → Local Storage and watch `tex_wrangle_snippets` + `tex_wrangle_snippets_pending`.
+- [ ] **Happy path**: select code → right-click → Snippets → *Save Snippet* with a name.
+      Reopen the menu — it appears. `tex_wrangle_snippets_pending` is empty (POST confirmed).
+      Confirm `<user_dir>/tex_wrangle/user_snippets.json` on disk contains it.
+- [ ] **Manage**: *Manage Snippets…* → Rename and Delete each round-trip to disk and the
+      pending set clears after each (reopen the menu to trigger a sync).
+- [ ] **Offline save survives (BUG 1)**: stop the ComfyUI server (or DevTools → Network →
+      Offline). Save a snippet — it shows locally and its name is in
+      `tex_wrangle_snippets_pending`. Bring the server back, reopen the Snippets menu (a
+      sync). The snippet is now on disk and the pending set clears. It must NOT vanish.
+- [ ] **Rejected save survives**: make `user_snippets.json` read-only (or its dir), save a
+      snippet → the POST returns 503, the name stays pending, the snippet stays in the menu
+      (not discarded). Restore write permission → next sync persists it and clears pending.
+- [ ] **Transient read-error doesn't wipe (BUG 2)**: with saved snippets present, force the
+      GET to fail (temporarily lock/rename `user_snippets.json`, or DevTools throttle to make
+      `/tex_wrangle/user_snippets` 503). Reopen the menu — the existing snippets must STILL be
+      there (the cache is not overwritten). Console shows no data loss; restoring the file
+      and reopening syncs cleanly.
+- [ ] **Cross-tab / cross-machine merge**: with snippet X pending locally (offline), have the
+      server store already contain a different snippet Y. On reconnect + sync, the menu shows
+      BOTH X and Y (server truth merged, local pending preserved), and X reaches disk.
+- [ ] **Rapid saves land in order (single-flight POST)**: save two different snippets in quick
+      succession (P then Q). Both end up on disk — the older whole-map POST must not clobber
+      the newer one. (DevTools → Network: the second POST is sent only after the first settles.)
+- [ ] **A stale sync GET does not revert a durable edit (BUG 3)**: edit a snippet's body, then
+      immediately open the Snippets menu (forces a sync GET that may race the save's POST). The
+      menu and `tex_wrangle_snippets` must show the NEW body, never the pre-edit one — the merge
+      snapshots the pending set at GET-issue time and won't adopt server truth for a name that
+      was pending when it asked. (Throttle the GET in DevTools to widen the race.)
+- [ ] Browser console shows no errors from snippet save/sync on any of the above.
+- [ ] *Known limitation (not a bug):* deleting a snippet on one machine/tab may not passively
+      propagate to another that already has it cached (the merge favors preservation over
+      delete-propagation). Full convergence is a follow-up needing a versioned server store.
+
 ## Also verify (carried from prior cycles)
 - [ ] Hover docs (F1 / hover a function) render.
 - [ ] Preflight fusion bubble + stats appear for a chained TEX graph.

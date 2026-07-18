@@ -109,6 +109,7 @@ class TEXDiagnostic:
             "message": self.message,
             "line": self.loc.line if self.loc else None,
             "col": self.loc.col if self.loc else None,
+            "end_line": self.loc.end_line if self.loc else None,  # LANG-2 (multi-line spans)
             "end_col": self.end_col,
             "source_line": self.source_line,
             "suggestions": self.suggestions,

@@ -30,6 +30,8 @@ error_reports/
 
 # Intermediate benchmark JSON files from development
 tests/*.json
+# ...but the LANG-3 compat-corpus goldens are a COMMITTED release artifact (the PM-4 gate).
+!tests/compat_corpus_goldens.json
 
 wiki/
 .coverage

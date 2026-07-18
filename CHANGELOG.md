@@ -5,6 +5,125 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-07-18
+
+**Authoring** — the language grows its tool-era surface. Param widgets get metadata, the
+compiler gets a non-raising lint API with the first real warnings, the language gets a
+version and a frozen compatibility corpus, function help moves into the registry, user
+snippets become server-backed, and the engine gets a documented zero-copy AI-handoff and a
+per-thread interpreter. One roadmap item (LAT-1b) lands as a measured design note.
+
+### Added
+
+- **LANG-1 — parameter UI metadata.** A declaration may carry an optional, literal-only
+  metadata block the frontend uses to build a widget: `f$strength = 0.5 [min: 0, max: 2,
+  label: "Strength"];` (metadata without a default is allowed too: `i$count [min: 1, max:
+  16];`). Values are literals only — a binding ref or an expression inside the block is a
+  syntax error. The type checker **ignores** the metadata (a nonsensical range is not a
+  compile error); it rides through the optimizer on the AST for tool manifests later.
+- **LANG-2 — `tex_api.check()` + the first W7xxx warnings + live lint.** A new
+  `check(source, types) -> list[TEXDiagnostic]` that lexes, parses and type-checks and
+  **never raises** (errors *and* warnings in one pass, empty when clean). Backs a new
+  `POST /tex_wrangle/check` route and debounced editor squiggles. The first three
+  advisories: **W7001** unused variable, **W7002** unused input, **W7003** shadowing a
+  built-in / an outer-scope variable. `SourceLoc` gains `end_line` (surfaced in
+  `to_dict`) for multi-line spans.
+- **LANG-3 — language versioning + a frozen compat corpus.** `tex_api.LANGUAGE_VERSION`
+  (`0.23`, versioned separately from the package); an optional `//!tex X.Y` pragma
+  (`check()` advises **W7004** when a program targets a newer language). A frozen
+  **compatibility corpus** (`tests/compat_corpus.py`) runs every example plus adversarial
+  grammar programs on the CPU interpreter and hashes their quantized outputs against
+  committed goldens, so a language change that alters what an existing program computes
+  fails the suite (PM-4). New root `LANGUAGE.md` (grammar, promotion rules, reserved words,
+  the compatibility policy).
+- **LANG-4 — function help from the registry.** The per-function signature and category
+  moved out of the hand-kept JS into the stdlib registry (which already held doc/example),
+  so help is single-sourced. New `tex_help.json` (generated), a `tex help <fn>` CLI, and
+  a flipped drift test that pins the editor's `TEX_HELP_DATA` sigs to the registry.
+- **LANG-5 — server-backed user snippets.** User snippets now persist as JSON in the
+  host's user directory via a new `get_user_dir()` host seam; the editor's localStorage
+  becomes an offline cache (synced from the server on menu-open, written through on save).
+  New `GET/POST /tex_wrangle/user_snippets` routes and `tex_snippets.py` store.
+- **ENG-6 — zero-copy AI handoff (DLPack).** `tex_engine.to_dlpack` / `from_dlpack` hand a
+  cooked output to another framework over DLPack. The pinned contract: an output is a
+  device-resident, fp32, channels-last `[B,H,W,C]` tensor. `layout='bchw'` returns an
+  NCHW view; `copy=True` (default) hands back an owned, contiguous, grad-ready tensor
+  (materialized out of `inference_mode`) — the safe posture, since codegen reuses output
+  buffers; `copy=False` is a genuine zero-copy view.
+- **ROI-1 — access-footprint registry.** The boolean `non_local` stdlib tag became a
+  footprint descriptor (`point` | `('halo', r)` | `('halo_arg', i)` | `image` | `('frame',
+  i)`); the M-4 tiling set `_NON_LOCAL_FNS` is now *derived* from it (`footprint !=
+  'point'`), so it can't drift from the impls. Zero behaviour change — the substrate the
+  §3 ROI program stands on.
+
+### Changed
+
+- **ENG-9 — the interpreter is per-thread.** `tex_engine._get_interpreter()` and
+  `compiled._get_plain_interp()` return a `threading.local` instance. The interpreter
+  carries per-instance execution state (scope stack, literal/builtin caches); a shared
+  instance mixes up programs across threads (a two-thread cook was proven to corrupt).
+  Single-cook ComfyUI is unchanged (one thread → one instance). DEVELOPMENT.md gains the
+  first written thread-safety contract + the module-cache classification; a two-thread CPU
+  smoke test pins it. Prerequisite for the future branch-parallel executor (GRAPH-2).
+
+### Fixed
+
+- **LANG-5 — two user-snippet data-loss bugs (server-truth vs. read-failure).** The sync
+  trusted the server unconditionally while the server could not tell "empty" from "read
+  failed", so two paths silently destroyed saved snippets:
+  - *An offline / rejected save was discarded on the next menu-open.* `_saveUserSnippets`
+    POSTed best-effort and never checked `resp.ok` or the `{"ok": false}` body, so a write
+    that never reached disk (read-only dir, unresolved path) was treated as durable; the
+    next `_syncUserSnippetsFromServer` then overwrote the cache with the server map,
+    dropping the edit. Saves now mark their names *pending* (persisted in localStorage);
+    the POST clears a name only on a confirmed-durable write (`resp.ok` **and** body
+    `{"ok": true}`), and pending names are re-pushed on the next sync.
+  - *A transient server read error wiped everything.* `load_user_snippets` returned `{}`
+    on **any** exception, so a briefly-locked / unreadable `user_snippets.json` (e.g. AV
+    scanning it right after another tab's `os.replace`) was indistinguishable from a
+    genuinely empty store; the frontend synced that `{}` over its cache and the next save
+    POSTed the near-empty map as the whole new store. `load_user_snippets` now raises
+    `SnippetStoreError` when the store exists but is unreadable / not a JSON object (an
+    absent or explicitly-empty store still reads as `{}`); the GET route returns **HTTP 503
+    + `{"read_error": true}`** instead of an empty 200, and `_syncUserSnippetsFromServer`
+    is non-destructive — it overwrites the cache only on a signalled-successful read and
+    otherwise merges server truth with locally-pending edits (last-write-wins per key).
+  - Route policy (`user_snippets_get_payload` / `user_snippets_post_payload`) moved into
+    `tex_snippets.py` (pure `os`/`json`, PORT-1/S-1) so the read-error 503 and failed-save
+    503 are unit-tested off the event loop; a malformed POST body is now a 400 that leaves
+    the store untouched (it can no longer wipe snippets). New route test covers the
+    round-trip, the read-error path, and the failed-save-preserves-store guarantee.
+  - *Concurrency hardening (from an adversarial review of the fix).* `load_user_snippets`
+    no longer gates presence on `os.path.isfile` — that swallows the `OSError` of a locked /
+    permission-denied stat and would mis-report a present-but-unreadable store as empty (the
+    same read-vs-empty confusion, moved onto the stat path); it now opens directly and splits
+    `FileNotFoundError` (absent → `{}`) from any other read fault (→ `SnippetStoreError`). The
+    client sync merge is now CACHE-BASED and preservation-favoring, so a snippet saved
+    concurrently (present in the cache but absent from a possibly-stale GET) is never dropped
+    by the re-POST; and whole-map POSTs are serialized through a single-flight chain so rapid
+    saves land in issue order instead of racing. Residual: full cross-TAB / cross-machine
+    convergence *including delete propagation* needs a versioned or per-key server store — the
+    whole-map-replace design predates this fix — and stays a follow-up, out of scope here.
+
+### Deferred
+
+- **LAT-1b — asynchronous CUDA-graph capture — deferred, with the measurement** (the
+  LAT-1a / LAT-2 precedent). The synchronous capture stall is a **one-time ~72 ms** on the
+  first cook of a graph key (1024², sm_120); the capture key excludes `$param` values, so
+  an interactive scrub captures once and replays every later frame at 0.34 ms. Weighed
+  against the async machinery's real cost — serializing *all* foreground device cooks
+  against the capture window (CUDA capture forbids concurrent device work), through the
+  engine seam and a DO-NOT-TOUCH tier, plus a GPU soak test — the one-time stall does not
+  justify it yet. The design, the crux, and the reopen gate are recorded in
+  `docs/lat1b-async-graph-capture.md`.
+
+### Notes
+
+- Frontend-touching (LANG-1 widgets, LANG-2 live-lint, LANG-5 snippet sync + the
+  pending-set / non-destructive-merge data-loss fix above): the JS ships again on this box,
+  which has no JS runtime — the CM6 bundle rebuild (LANG-2 multi-line squiggles) and the
+  live-session checklist (now including the LANG-5 snippet-sync section) remain to be walked.
+
 ## [0.22.0] - 2026-07-16
 
 **The engine seam** — the cook engine stops being a ComfyUI classmethod. This is a

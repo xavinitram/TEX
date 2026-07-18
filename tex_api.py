@@ -40,11 +40,63 @@ promise (`@OUT = @A;` hands back the tensor you passed in).
     prog = compile("@OUT = vec4(@A.rgb * 1.2, 1.0);", {"A": TEXType.VEC3})
     out = execute(prog, {"A": img}, device="cuda", precision="auto")  # raw, unclamped
 """
+import re as _re
 from dataclasses import dataclass
 from typing import Any
 
 # ENG-4: the public error type + its payload, re-exported so a host imports ONE module.
 from .tex_compiler.diagnostics import TEXCompileError, TEXDiagnostic  # noqa: F401
+
+# LANG-3: the TEX LANGUAGE version — grammar + semantics — versioned SEPARATELY from the
+# package `__version__`. A program may declare the language level it targets with a leading
+# `//!tex X.Y` pragma; `check()` advises (W7004) when a program targets a NEWER language
+# than this engine implements. The frozen compat corpus (tests/) pins that a program keeps
+# computing the same pixels across versions. See LANGUAGE.md for the compatibility policy.
+LANGUAGE_VERSION = "0.23"
+
+# A `//!tex X.Y` pragma on its own comment line (the lexer discards comments, so this is
+# recovered from the raw source, not from tokens).
+_PRAGMA_RE = _re.compile(r"//!tex\s+(\d+)\.(\d+)\b")
+
+
+def language_pragma(source: str):
+    """Return the language version a program targets via a LEADING `//!tex X.Y` pragma (as
+    the string 'X.Y'), or None. Only a pragma in the header run of blank / `//` line-comment
+    lines is recognized — one buried after real code or inside a `/* … */` block comment is
+    ignored (it would otherwise raise a spurious W7004)."""
+    for raw in (source or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue                      # blank line — keep scanning the header
+        m = _PRAGMA_RE.match(line)
+        if m:
+            return f"{m.group(1)}.{m.group(2)}"
+        if line.startswith("//"):
+            continue                      # an ordinary leading line comment — keep scanning
+        break                             # first real code (or a block comment): no pragma
+    return None
+
+
+def _ver_tuple(v):
+    try:
+        parts = str(v).split(".")
+        return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+    except (ValueError, IndexError, AttributeError):
+        return (0, 0)
+
+
+def _diag_from_exc(e, source: str):
+    """Materialize the structured diagnostic for a per-phase compiler exception (Lexer/
+    Parse/TypeCheckError build it lazily), synthesizing an E0000 fallback so the public
+    contract is never downgraded to a bare message. Shared by `compile()` and `check()`."""
+    from .tex_compiler.diagnostics import make_diagnostic
+    if hasattr(e, "_build_diagnostic"):
+        e._build_diagnostic()
+    diag = getattr(e, "diagnostic", None)
+    if diag is None:
+        diag = make_diagnostic(code="E0000", message=str(e),
+                               loc=getattr(e, "loc", None), source=source, phase="compile")
+    return diag
 
 
 @dataclass(frozen=True)
@@ -72,25 +124,14 @@ def compile(source: str, binding_types: dict) -> Program:  # noqa: A001 (public 
     from .tex_compiler.lexer import LexerError
     from .tex_compiler.parser import ParseError
     from .tex_compiler.type_checker import TypeCheckError
-    from .tex_compiler.diagnostics import TEXMultiError, make_diagnostic
+    from .tex_compiler.diagnostics import TEXMultiError
     try:
         ast, type_map, referenced, assigned, params, used_builtins = \
             get_cache().compile_tex(source, binding_types)
     except TEXMultiError as e:
         raise TEXCompileError(e.diagnostics) from e
     except (LexerError, ParseError, TypeCheckError) as e:
-        # The per-phase errors build their diagnostic lazily (the node calls this too),
-        # so materialize it here rather than shipping a half-built one.
-        if hasattr(e, "_build_diagnostic"):
-            e._build_diagnostic()
-        diag = getattr(e, "diagnostic", None)
-        if diag is None:
-            # No structured diagnostic (shouldn't happen) — never downgrade the contract
-            # to a bare message: synthesize one so `.diagnostics` is never empty.
-            diag = make_diagnostic(code="E0000", message=str(e),
-                                   loc=getattr(e, "loc", None), source=source,
-                                   phase="compile")
-        raise TEXCompileError([diag]) from e
+        raise TEXCompileError([_diag_from_exc(e, source)]) from e
     return Program(ast, type_map, referenced, assigned, params, used_builtins, source)
 
 
@@ -103,3 +144,54 @@ def execute(program: Program, bindings: dict, *, device: str = "cpu",
     return Interpreter().execute(
         program.ast, bindings, program.type_map, device=device,
         output_names=outs, precision=precision, used_builtins=program.used_builtins)
+
+
+def check(source: str, binding_types: dict) -> list:
+    """LANG-2: compile-only diagnostics. Lex, parse and type-check `source` and return a
+    `list[TEXDiagnostic]` (errors AND W7xxx warnings) — and NEVER raise. This is the
+    backend for the editor's live-lint (`/tex_wrangle/check`) and any future LSP.
+
+    `binding_types` maps @input names to `TEXType`; pass `{}` when the caller does not
+    know the wired types yet (undeclared inputs then resolve to VEC4, exactly as at cook
+    time). A lexer or parser error is fatal for deeper analysis, so it is returned alone;
+    only a clean parse reaches the type checker, which accumulates every type error plus
+    the W7xxx advisories in one pass. Diagnostics carry `.severity` ('error' | 'warning')
+    so a consumer can render errors and warnings differently.
+
+    Unlike `compile()`, which raises `TEXCompileError`, `check()` is total: it always
+    returns a list, empty when the program is clean."""
+    from .tex_compiler.lexer import Lexer, LexerError
+    from .tex_compiler.parser import Parser, ParseError
+    from .tex_compiler.type_checker import TypeChecker
+    from .tex_compiler.diagnostics import make_diagnostic, TEXMultiError
+
+    # LANG-3: a program targeting a NEWER language than we implement gets an up-front
+    # advisory (independent of whether it then compiles), so a version mismatch is not
+    # mistaken for an ordinary syntax error.
+    pragma_diags = []
+    pragma = language_pragma(source)
+    if pragma and _ver_tuple(pragma) > _ver_tuple(LANGUAGE_VERSION):
+        pragma_diags.append(make_diagnostic(
+            code="W7004",
+            message=f"This program targets TEX language {pragma}, newer than this "
+                    f"engine's {LANGUAGE_VERSION}; newer features may not compile.",
+            loc=None, source=source, phase="compile", severity="warning"))
+
+    try:
+        try:
+            tokens = Lexer(source).tokenize()
+        except LexerError as e:
+            return pragma_diags + [_diag_from_exc(e, source)]
+        try:
+            program = Parser(tokens, source=source).parse()
+        except TEXMultiError as e:
+            return pragma_diags + list(e.diagnostics)
+        except ParseError as e:
+            return pragma_diags + [_diag_from_exc(e, source)]
+        errors, warnings = TypeChecker(
+            binding_types=binding_types, source=source).check_collect(program)
+        return pragma_diags + errors + warnings
+    except Exception as e:  # the contract is absolute: check() must never raise
+        return pragma_diags + [make_diagnostic(
+            code="E0000", message=f"internal error during check(): {e}",
+            loc=None, source=source, phase="compile")]

@@ -213,7 +213,7 @@ def test_eng5_embedding_canaries(r: SubTestResult):
     # (a) TEXDiagnostic.to_dict — a de-facto frontend contract since v0.15.
     d = TEXDiagnostic(code="E3001", severity="error", message="m",
                       loc=SourceLoc(1, 1), source_line="x", docs_url="u")
-    want = {"code", "severity", "message", "line", "col", "end_col",
+    want = {"code", "severity", "message", "line", "col", "end_line", "end_col",
             "source_line", "suggestions", "hint", "phase", "docs_url"}
     got = set(d.to_dict().keys())
     if got != want:
@@ -252,8 +252,9 @@ def test_eng5_embedding_canaries(r: SubTestResult):
             1.0, "cpu", "fp32", 3)["tex_perf"][0]:
         fails.append("near_singularities missing when the debug toggle supplies a count")
 
-    # (c) HostServices — the method set a host must implement (PORT-1).
-    for m in ("get_free_memory", "free_memory", "is_oom", "soft_empty_cache"):
+    # (c) HostServices — the method set a host must implement (PORT-1). get_user_dir
+    #     added by LANG-5 (the user snippet store's seam).
+    for m in ("get_free_memory", "free_memory", "is_oom", "soft_empty_cache", "get_user_dir"):
         if not callable(getattr(_host.NullHostServices(), m, None)):
             fails.append(f"HostServices lost {m}()")
 
@@ -285,8 +286,8 @@ def test_eng5_embedding_canaries(r: SubTestResult):
     if fails:
         r.fail("ENG-5 embedding canaries", "; ".join(fails))
     else:
-        r.ok("pinned: TEXDiagnostic.to_dict (11 keys, conditional docs_url), the ui= "
-             "payload (tex_perf/tex_probes), HostServices' 4 methods, GraphSpec schema=1 "
+        r.ok("pinned: TEXDiagnostic.to_dict (12 keys, conditional docs_url), the ui= "
+             "payload (tex_perf/tex_probes), HostServices' 5 methods, GraphSpec schema=1 "
              "(absent==1, future rejected)")
 
 

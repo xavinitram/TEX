@@ -23,18 +23,24 @@ class SourceLoc:
     fused-chain stage a node came from so a runtime error can be attributed to
     the originating linked node.
     """
-    __slots__ = ("_line", "_col", "_offset", "_source", "stage")
+    __slots__ = ("_line", "_col", "_offset", "_source", "stage", "_end_line")
 
-    def __init__(self, line: int = 0, col: int = 0, stage: Optional[int] = None):
+    def __init__(self, line: int = 0, col: int = 0, stage: Optional[int] = None,
+                 end_line: Optional[int] = None):
+        # NB: `end_line` follows `stage` positionally on purpose — a couple of call
+        # sites pass `stage` positionally (SourceLoc(1, 1, 2)); inserting before it
+        # would silently reinterpret their stage as an end_line.
         self._line = line
         self._col = col
         self._offset = -1
         self._source = ""
         self.stage = stage
+        self._end_line = end_line
 
     @classmethod
     def from_offset(cls, offset: int, source: str,
-                    stage: Optional[int] = None) -> "SourceLoc":
+                    stage: Optional[int] = None,
+                    end_line: Optional[int] = None) -> "SourceLoc":
         """Lazy location: store the byte offset; resolve line/col on demand."""
         o = cls.__new__(cls)
         o._line = None
@@ -42,6 +48,7 @@ class SourceLoc:
         o._offset = offset
         o._source = source
         o.stage = stage
+        o._end_line = end_line
         return o
 
     def _resolve(self) -> None:
@@ -65,6 +72,13 @@ class SourceLoc:
         if self._col is None:
             self._resolve()
         return self._col
+
+    @property
+    def end_line(self) -> int:
+        """LANG-2: the last line a diagnostic spans (1-based). Defaults to `line` — a
+        single-line span — when no explicit multi-line end was set. Consumed by the
+        editor's CM6 lint bridge to draw multi-line squiggles."""
+        return self._end_line if self._end_line is not None else self.line
 
     def __repr__(self):
         return f"{self.line}:{self.col}"
@@ -202,6 +216,12 @@ class ParamDecl(ASTNode):
     #   "v4" — vec4 comma string ("x, y, z, w" → [float, float, float, float])
     type_hint: str = ""
     default_expr: Optional[ASTNode] = None  # Literal for default value
+    # LANG-1: optional UI-widget metadata parsed from `[min: 0, max: 2, label: "…"]`.
+    # A plain {str: float|int|str} dict of literal scalars (NEVER AST nodes), so the
+    # type checker and every NodeVisitor/NodeTransformer ignore it for free (traversal
+    # only walks ASTNode / list-of-ASTNode fields). Consumed by the frontend auto-widget
+    # builder and, later, tool manifests (TOOL-1). None when no block was written.
+    metadata: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------

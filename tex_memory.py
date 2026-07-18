@@ -23,13 +23,31 @@ from .tex_compiler.types import TEXType, TYPE_NAME_MAP
 # M-4: stdlib functions whose output at a pixel depends on OTHER pixels (or the
 # whole image), so a program that calls them cannot be split into horizontal
 # strips. A whitelist posture: anything not here is treated as pixel-local.
-_NON_LOCAL_FNS = frozenset({
-    "sample", "sample_cubic", "sample_frame", "sample_grad", "sample_lanczos",
-    "sample_mip", "sample_mip_gauss", "fetch", "fetch_frame",
-    "gauss_blur", "bilateral_filter",
-    "img_min", "img_max", "img_mean", "img_median", "img_sum",
-    "erode", "dilate",   # SL-4: neighbourhood morphology, not pixel-local
-})
+#
+# ROI-1: this set is now DERIVED from the stdlib registry's per-function `footprint`
+# (invariant #5's single-source discipline), not a hand-kept literal — a footprint of
+# anything but 'point' is non-local. Derived LAZILY: the registry is populated only
+# when TEXStdlib's class body runs (a `tex_runtime.stdlib` import), which has always
+# happened by the time any cook or test reaches this code. The historical public name
+# `tex_memory._NON_LOCAL_FNS` stays a readable module attribute via `__getattr__`, so
+# every existing consumer (is_tile_safe, TST-3) is unchanged.
+_non_local_fns_cache: "frozenset | None" = None
+
+
+def _non_local_fns() -> frozenset:
+    global _non_local_fns_cache
+    if _non_local_fns_cache is None:
+        from .tex_runtime.stdlib_registry import non_local_names
+        _non_local_fns_cache = non_local_names()
+    return _non_local_fns_cache
+
+
+def __getattr__(name):
+    # PEP 562: expose the derived set under its historical public name without forcing
+    # derivation at import time (REGISTRY is empty until stdlib.py's class body runs).
+    if name == "_NON_LOCAL_FNS":
+        return _non_local_fns()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def is_tile_safe(program) -> bool:
@@ -37,11 +55,12 @@ def is_tile_safe(program) -> bool:
     the input (pointwise), so H can be split into strips. Excludes sample/fetch/
     blur/img-reduction calls and any binding index/sample access (a gather or a
     scatter `@OUT[x,y]=` — the latter parses as Assignment(target=BindingIndex))."""
+    non_local = _non_local_fns()   # ROI-1: registry-derived, hoisted so the walk stays hot
     stack = list(program.statements)
     while stack:
         n = stack.pop()
         cls = n.__class__
-        if cls is FunctionCall and n.name in _NON_LOCAL_FNS:
+        if cls is FunctionCall and n.name in non_local:
             return False
         if cls is BindingIndexAccess or cls is BindingSampleAccess:
             return False
@@ -493,10 +512,9 @@ def free_tensor_caches() -> None:
         # the documented `tex_node ↔ tex_memory` cycle to `tex_engine ↔ tex_memory` —
         # it does NOT remove it (tex_engine still calls back into tex_memory for
         # run_tiled / enforce_cache_budget). Still function-local, still load-bearing.
-        from .tex_engine import _get_interpreter
-        interp = _get_interpreter()
-        interp._literal_cache.clear()
-        interp._builtins_lru.clear()   # LAT-4: coordinate-builtin env LRU
+        from .tex_engine import _clear_all_interpreter_caches
+        _clear_all_interpreter_caches()   # ENG-9: sweep every per-thread interpreter
+        #                                   (_literal_cache + LAT-4 coordinate-builtin LRU)
     except Exception:
         pass
     try:

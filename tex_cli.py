@@ -148,7 +148,35 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["none", "auto", "torch_compile", "cuda_graph"])
     sub.add_parser("validate-hw", help="measure whether TEX's Turing-calibrated perf "
                    "gates hold on THIS GPU; emit a shareable report (S-4)")
+    hp = sub.add_parser("help", help="show the signature, description and example for a "
+                        "built-in function (LANG-4), or list all functions")
+    hp.add_argument("fn", nargs="?", help="function name (omit to list every function)")
     return p
+
+
+def help_fn(args) -> None:
+    """`tex help [<fn>]` — print help for one function, or list all (LANG-4). Reads the
+    stdlib registry (the single source), not the JS."""
+    from .tex_runtime.stdlib import TEXStdlib  # noqa: F401  (populates REGISTRY)
+    from .tex_runtime import stdlib_registry as R
+    if not args.fn:
+        by_cat = {}
+        for e in R.help_entries(decode=True):
+            by_cat.setdefault(e["category"] or "Other", []).append(e["name"])
+        for cat in sorted(by_cat):
+            print(f"{cat}: {', '.join(sorted(by_cat[cat]))}")
+        return
+    e = R.help_lookup(args.fn)
+    if e is None:
+        sys.exit(f"tex help: no function named '{args.fn}' "
+                 f"(try `tex help` to list all)")
+    tags = f"  [{', '.join(e['tags'])}]" if e["tags"] else ""
+    alias = f"  (aliases: {', '.join(e['aliases'])})" if e["aliases"] else ""
+    print(f"{e['sig']}{tags}{alias}")
+    if e["desc"]:
+        print(f"\n  {e['desc']}")
+    if e["example"]:
+        print(f"\n  example: {e['example']}")
 
 
 def main(argv=None) -> None:
@@ -168,6 +196,8 @@ def main(argv=None) -> None:
         elif args.cmd == "validate-hw":
             from .tex_validate_hw import main as validate_hw_main
             validate_hw_main()
+        elif args.cmd == "help":
+            help_fn(args)
     # TEXCompileError (ENG-4) is what tex_api.compile now raises, and run_program calls
     # it BEFORE the cook — so without it here every syntax error in `tex run` dumps a
     # stack, breaking the F3 contract this function exists to keep.

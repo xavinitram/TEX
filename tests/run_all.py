@@ -514,6 +514,44 @@ def main():
     test_eng1_cook_outputs_do_not_alias_inputs(r)
     test_eng1_fp16_compiled_tier_clamp(r)
 
+    # v0.23.0 Phase 1 — "Authoring" (ROI-1 footprint registry, LANG-1 param metadata)
+    from test_v023_phase1 import (
+        test_roi1_derivation_matches_historical,
+        test_roi1_footprints_wellformed_and_classified,
+        test_roi1_malformed_footprint_fails_loud,
+        test_roi1_is_tile_safe_unchanged,
+        test_lang1_metadata_grammar,
+        test_lang1_metadata_literals_only,
+        test_lang1_metadata_ignored_by_typecheck,
+        test_lang2_check_never_raises,
+        test_lang2_w7xxx_warnings,
+        test_lang2_sourceloc_end_line,
+        test_lang3_version_and_pragma,
+        test_lang3_compat_corpus,
+        test_eng6_dlpack_contract,
+        test_eng9_two_thread_cpu_cook,
+        test_lang4_registry_help,
+        test_lang5_snippet_store,
+        test_lang5_snippet_route,
+    )
+    test_roi1_derivation_matches_historical(r)
+    test_roi1_footprints_wellformed_and_classified(r)
+    test_roi1_malformed_footprint_fails_loud(r)
+    test_roi1_is_tile_safe_unchanged(r)
+    test_lang1_metadata_grammar(r)
+    test_lang1_metadata_literals_only(r)
+    test_lang1_metadata_ignored_by_typecheck(r)
+    test_lang2_check_never_raises(r)
+    test_lang2_w7xxx_warnings(r)
+    test_lang2_sourceloc_end_line(r)
+    test_lang3_version_and_pragma(r)
+    test_lang3_compat_corpus(r)
+    test_eng6_dlpack_contract(r)
+    test_eng9_two_thread_cpu_cook(r)
+    test_lang4_registry_help(r)
+    test_lang5_snippet_store(r)
+    test_lang5_snippet_route(r)
+
     success = r.summary()
     return 0 if success else 1
 

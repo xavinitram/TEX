@@ -5,7 +5,7 @@ A per-pixel kernel DSL for writing compact image/mask processing logic
 directly inside ComfyUI. Inspired by Houdini VEX and Nuke BlinkScript.
 """
 
-__version__ = "0.22.0"
+__version__ = "0.23.0"
 
 import os
 
@@ -281,6 +281,66 @@ try:
             return web.json_response({"plans": plans})
         except Exception as e:
             return web.json_response({"plans": [], "error": f"{type(e).__name__}: {e}"})
+
+    @routes.post("/tex_wrangle/check")
+    async def check_source(request):
+        """LANG-2: compile-only diagnostics for the editor's live-lint. Body:
+        {"source": "...", "types": {"A": "VEC3", ...}} (types optional; an unknown name
+        resolves to VEC4, exactly as at cook time). Returns
+        {"diagnostics": [TEXDiagnostic.to_dict(), ...]} — errors AND W7xxx warnings.
+        Never 500s: a bad body returns an empty list, and tex_api.check() never raises."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"diagnostics": []})
+        try:
+            import asyncio
+            from .tex_api import check as _check
+            from .tex_compiler.types import TEXType
+            types = {}
+            for name, tname in (body.get("types") or {}).items():
+                try:
+                    types[name] = TEXType[str(tname).upper()]
+                except (KeyError, ValueError):
+                    types[name] = TEXType.VEC4
+            # check() compiles (CPU-bound) — run off the event loop like detect_regions.
+            diags = await asyncio.get_event_loop().run_in_executor(
+                None, _check, body.get("source", ""), types)
+            return web.json_response({"diagnostics": [d.to_dict() for d in diags]})
+        except Exception as e:
+            return web.json_response({"diagnostics": [], "error": f"{type(e).__name__}: {e}"})
+
+    @routes.get("/tex_wrangle/user_snippets")
+    async def get_user_snippets(request):
+        """LANG-5: the server-side user snippet store ({name: code}). The frontend's
+        localStorage is an offline cache synced from here. A read failure returns HTTP 503
+        + {"read_error": true} (NOT an empty 200) so a transient/locked read can't wipe the
+        cache (BUG 2). Thin caller over tex_snippets.user_snippets_get_payload. Never 500s."""
+        try:
+            from .tex_snippets import user_snippets_get_payload
+            payload, status = user_snippets_get_payload()
+            return web.json_response(payload, status=status)
+        except Exception as e:
+            return web.json_response(
+                {"snippets": {}, "read_error": True, "error": f"{type(e).__name__}: {e}"},
+                status=503)
+
+    @routes.post("/tex_wrangle/user_snippets")
+    async def set_user_snippets(request):
+        """LANG-5: replace the whole user snippet map (the frontend load-modify-saves it,
+        mirroring its localStorage cache). Body: {"snippets": {name: code}}. A failed /
+        undurable save returns HTTP 503 + {"ok": false} so the frontend keeps the edit
+        pending and retries (BUG 1). Thin caller over user_snippets_post_payload. Never 500s."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad request body"}, status=400)
+        try:
+            from .tex_snippets import user_snippets_post_payload
+            payload, status = user_snippets_post_payload(body)
+            return web.json_response(payload, status=status)
+        except Exception as e:
+            return web.json_response({"ok": False, "error": f"{type(e).__name__}: {e}"}, status=503)
 
 except (ImportError, AttributeError):
     # PromptServer or aiohttp not available (e.g. running tests or CLI mode)

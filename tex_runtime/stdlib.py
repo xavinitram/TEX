@@ -260,54 +260,54 @@ class TEXStdlib:
 
     # -- Math functions -------------------------------------------------
 
-    @stdlib("sin", doc='Sine (radians).', ex='float s = sin(u * PI * 2.0);')
+    @stdlib("sin", sig='sin(x) \\u2192 float', category='Math', doc='Sine (radians).', ex='float s = sin(u * PI * 2.0);')
     @staticmethod
     def fn_sin(x) -> torch.Tensor:
         return torch.sin(_to_tensor(x))
 
-    @stdlib("cos", doc='Cosine (radians).', ex='float c = cos(v * PI);')
+    @stdlib("cos", sig='cos(x) \\u2192 float', category='Math', doc='Cosine (radians).', ex='float c = cos(v * PI);')
     @staticmethod
     def fn_cos(x) -> torch.Tensor:
         return torch.cos(_to_tensor(x))
 
-    @stdlib("tan", doc='Tangent (radians).', ex='float t = tan(u);')
+    @stdlib("tan", sig='tan(x) \\u2192 float', category='Math', doc='Tangent (radians).', ex='float t = tan(u);')
     @staticmethod
     def fn_tan(x) -> torch.Tensor:
         return torch.tan(_to_tensor(x))
 
-    @stdlib("asin", doc='Arcsine. Returns radians.', ex='float angle = asin(0.5);')
+    @stdlib("asin", sig='asin(x) \\u2192 float', category='Math', doc='Arcsine. Returns radians.', ex='float angle = asin(0.5);')
     @staticmethod
     def fn_asin(x) -> torch.Tensor:
         return torch.asin(torch.clamp(_to_tensor(x), -1.0, 1.0))
 
-    @stdlib("acos", doc='Arccosine. Returns radians.', ex='float angle = acos(0.5);')
+    @stdlib("acos", sig='acos(x) \\u2192 float', category='Math', doc='Arccosine. Returns radians.', ex='float angle = acos(0.5);')
     @staticmethod
     def fn_acos(x) -> torch.Tensor:
         return torch.acos(torch.clamp(_to_tensor(x), -1.0, 1.0))
 
-    @stdlib("atan", doc='Arctangent. Returns radians.', ex='float angle = atan(1.0);')
+    @stdlib("atan", sig='atan(x) \\u2192 float', category='Math', doc='Arctangent. Returns radians.', ex='float angle = atan(1.0);')
     @staticmethod
     def fn_atan(x) -> torch.Tensor:
         return torch.atan(_to_tensor(x))
 
-    @stdlib("atan2", doc='Two-argument arctangent. Returns radians.', ex='float angle = atan2(v - 0.5, u - 0.5);')
+    @stdlib("atan2", sig='atan2(y, x) \\u2192 float', category='Math', doc='Two-argument arctangent. Returns radians.', ex='float angle = atan2(v - 0.5, u - 0.5);')
     @staticmethod
     def fn_atan2(y, x) -> torch.Tensor:
         return torch.atan2(_to_tensor(y), _to_tensor(x))
 
-    @stdlib("sincos", doc='Returns vec2(sin(x), cos(x)). More efficient than separate sin/cos calls.', ex='vec2 sc = sincos(angle);\nfloat s = sc.x;\nfloat c = sc.y;')
+    @stdlib("sincos", sig='sincos(x) \\u2192 vec2', category='Math', doc='Returns vec2(sin(x), cos(x)). More efficient than separate sin/cos calls.', ex='vec2 sc = sincos(angle);\nfloat s = sc.x;\nfloat c = sc.y;')
     @staticmethod
     def fn_sincos(x) -> torch.Tensor:
         """Returns vec2(sin(x), cos(x)) — computes both in a single pass."""
         t = _to_tensor(x)
         return torch.stack([torch.sin(t), torch.cos(t)], dim=-1)
 
-    @stdlib("sqrt", doc='Square root.', ex='float s = sqrt(u * u + v * v);')
+    @stdlib("sqrt", sig='sqrt(x) \\u2192 float', category='Math', doc='Square root.', ex='float s = sqrt(u * u + v * v);')
     @staticmethod
     def fn_sqrt(x) -> torch.Tensor:
         return torch.sqrt(torch.clamp(_to_tensor(x), min=0.0))
 
-    @stdlib("pow", doc='Raise x to the power y.', ex='float p = pow(u, 2.2);')
+    @stdlib("pow", sig='pow(x, y) \\u2192 float', category='Math', doc='Raise x to the power y.', ex='float p = pow(u, 2.2);')
     @staticmethod
     def fn_pow(base, exp) -> torch.Tensor:
         b = _to_tensor(base)
@@ -336,53 +336,53 @@ class TEXStdlib:
                 )
         return out
 
-    @stdlib("exp", doc='e raised to the power x.', ex='float e = exp(-u * 5.0);')
+    @stdlib("exp", sig='exp(x) \\u2192 float', category='Math', doc='e raised to the power x.', ex='float e = exp(-u * 5.0);')
     @staticmethod
     def fn_exp(x) -> torch.Tensor:
         return torch.exp(_to_tensor(x))
 
-    @stdlib("log", doc='Natural logarithm (base e).', ex='float l = log(u + 1.0);')
+    @stdlib("log", sig='log(x) \\u2192 float', category='Math', doc='Natural logarithm (base e).', ex='float l = log(u + 1.0);')
     @staticmethod
     def fn_log(x) -> torch.Tensor:
         return torch.log(torch.clamp(_to_tensor(x), min=SAFE_EPSILON))
 
-    @stdlib("abs", doc='Absolute value.', ex='float a = abs(u - 0.5);')
+    @stdlib("abs", sig='abs(x) \\u2192 float', category='Math', doc='Absolute value.', ex='float a = abs(u - 0.5);')
     @staticmethod
     def fn_abs(x) -> torch.Tensor:
         return torch.abs(_to_tensor(x))
 
-    @stdlib("sign", doc='Returns -1, 0, or 1.', ex='float s = sign(u - 0.5);')
+    @stdlib("sign", sig='sign(x) \\u2192 float', category='Math', doc='Returns -1, 0, or 1.', ex='float s = sign(u - 0.5);')
     @staticmethod
     def fn_sign(x) -> torch.Tensor:
         return torch.sign(_to_tensor(x))
 
-    @stdlib("floor", doc='Round down to nearest integer.', ex='float f = floor(u * 10.0);')
+    @stdlib("floor", sig='floor(x) \\u2192 float', category='Math', doc='Round down to nearest integer.', ex='float f = floor(u * 10.0);')
     @staticmethod
     def fn_floor(x) -> torch.Tensor:
         return torch.floor(_to_tensor(x))
 
-    @stdlib("ceil", doc='Round up to nearest integer.', ex='float c = ceil(u * 10.0);')
+    @stdlib("ceil", sig='ceil(x) \\u2192 float', category='Math', doc='Round up to nearest integer.', ex='float c = ceil(u * 10.0);')
     @staticmethod
     def fn_ceil(x) -> torch.Tensor:
         return torch.ceil(_to_tensor(x))
 
-    @stdlib("round", doc='Round to nearest integer.', ex='float r = round(u * 10.0) / 10.0;')
+    @stdlib("round", sig='round(x) \\u2192 float', category='Math', doc='Round to nearest integer.', ex='float r = round(u * 10.0) / 10.0;')
     @staticmethod
     def fn_round(x) -> torch.Tensor:
         return torch.round(_to_tensor(x))
 
-    @stdlib("trunc", doc='Truncate toward zero (drop fractional part).', ex='float t = trunc(u * 10.0);')
+    @stdlib("trunc", sig='trunc(x) \\u2192 float', category='Math', doc='Truncate toward zero (drop fractional part).', ex='float t = trunc(u * 10.0);')
     @staticmethod
     def fn_trunc(x) -> torch.Tensor:
         return torch.trunc(_to_tensor(x))
 
-    @stdlib("fract", doc='Fractional part: x - floor(x).', ex='float f = fract(u * 5.0);')
+    @stdlib("fract", sig='fract(x) \\u2192 float', category='Math', doc='Fractional part: x - floor(x).', ex='float f = fract(u * 5.0);')
     @staticmethod
     def fn_fract(x) -> torch.Tensor:
         t = _to_tensor(x)
         return t - torch.floor(t)
 
-    @stdlib("mod", doc='Modulo (remainder).', ex='float m = mod(u * 10.0, 1.0);')
+    @stdlib("mod", sig='mod(x, y) \\u2192 float', category='Math', doc='Modulo (remainder).', ex='float m = mod(u * 10.0, 1.0);')
     @staticmethod
     def fn_mod(a, b) -> torch.Tensor:
         a_t, b_t = _to_tensor(a), _to_tensor(b)
@@ -391,67 +391,67 @@ class TEXStdlib:
         safe_b = torch.where(zero, ZERO_GUARD_EPS.get(b_t.dtype, SAFE_EPSILON), b_t)
         return torch.fmod(a_t, safe_b)
 
-    @stdlib("log2", doc='Logarithm base 2.', ex='float l = log2(256.0);')
+    @stdlib("log2", sig='log2(x) \\u2192 float', category='Math', doc='Logarithm base 2.', ex='float l = log2(256.0);')
     @staticmethod
     def fn_log2(x) -> torch.Tensor:
         return torch.log2(torch.clamp(_to_tensor(x), min=SAFE_EPSILON))
 
-    @stdlib("log10", doc='Logarithm base 10.', ex='float l = log10(1000.0);')
+    @stdlib("log10", sig='log10(x) \\u2192 float', category='Math', doc='Logarithm base 10.', ex='float l = log10(1000.0);')
     @staticmethod
     def fn_log10(x) -> torch.Tensor:
         return torch.log10(torch.clamp(_to_tensor(x), min=SAFE_EPSILON))
 
-    @stdlib("pow2", doc='2 raised to the power x.', ex='float p = pow2(8.0);')
+    @stdlib("pow2", sig='pow2(x) \\u2192 float', category='Math', doc='2 raised to the power x.', ex='float p = pow2(8.0);')
     @staticmethod
     def fn_pow2(x) -> torch.Tensor:
         return torch.pow(2.0, _to_tensor(x))
 
-    @stdlib("pow10", doc='10 raised to the power x.', ex='float p = pow10(3.0);')
+    @stdlib("pow10", sig='pow10(x) \\u2192 float', category='Math', doc='10 raised to the power x.', ex='float p = pow10(3.0);')
     @staticmethod
     def fn_pow10(x) -> torch.Tensor:
         return torch.pow(10.0, _to_tensor(x))
 
-    @stdlib("sinh", doc='Hyperbolic sine.', ex='float s = sinh(u);')
+    @stdlib("sinh", sig='sinh(x) \\u2192 float', category='Math', doc='Hyperbolic sine.', ex='float s = sinh(u);')
     @staticmethod
     def fn_sinh(x) -> torch.Tensor:
         return torch.sinh(_to_tensor(x))
 
-    @stdlib("cosh", doc='Hyperbolic cosine.', ex='float c = cosh(u);')
+    @stdlib("cosh", sig='cosh(x) \\u2192 float', category='Math', doc='Hyperbolic cosine.', ex='float c = cosh(u);')
     @staticmethod
     def fn_cosh(x) -> torch.Tensor:
         return torch.cosh(_to_tensor(x))
 
-    @stdlib("tanh", doc='Hyperbolic tangent.', ex='float t = tanh(u * 2.0);')
+    @stdlib("tanh", sig='tanh(x) \\u2192 float', category='Math', doc='Hyperbolic tangent.', ex='float t = tanh(u * 2.0);')
     @staticmethod
     def fn_tanh(x) -> torch.Tensor:
         return torch.tanh(_to_tensor(x))
 
-    @stdlib("hypot", doc='Hypotenuse: sqrt(x*x + y*y).', ex='float d = hypot(u - 0.5, v - 0.5);')
+    @stdlib("hypot", sig='hypot(x, y) \\u2192 float', category='Math', doc='Hypotenuse: sqrt(x*x + y*y).', ex='float d = hypot(u - 0.5, v - 0.5);')
     @staticmethod
     def fn_hypot(x, y) -> torch.Tensor:
         return torch.hypot(_to_tensor(x), _to_tensor(y))
 
-    @stdlib("isnan", doc='Returns 1.0 if x is NaN, 0.0 otherwise.', ex='float check = isnan(x);')
+    @stdlib("isnan", sig='isnan(x) \\u2192 float', category='Math', doc='Returns 1.0 if x is NaN, 0.0 otherwise.', ex='float check = isnan(x);')
     @staticmethod
     def fn_isnan(x) -> torch.Tensor:
         return torch.isnan(_to_tensor(x)).float()
 
-    @stdlib("isinf", doc='Returns 1.0 if x is infinite, 0.0 otherwise.', ex='float check = isinf(x);')
+    @stdlib("isinf", sig='isinf(x) \\u2192 float', category='Math', doc='Returns 1.0 if x is infinite, 0.0 otherwise.', ex='float check = isinf(x);')
     @staticmethod
     def fn_isinf(x) -> torch.Tensor:
         return torch.isinf(_to_tensor(x)).float()
 
-    @stdlib("degrees", doc='Convert radians to degrees.', ex='float d = degrees(PI);')
+    @stdlib("degrees", sig='degrees(x) \\u2192 float', category='Math', doc='Convert radians to degrees.', ex='float d = degrees(PI);')
     @staticmethod
     def fn_degrees(x) -> torch.Tensor:
         return torch.rad2deg(_to_tensor(x))
 
-    @stdlib("radians", doc='Convert degrees to radians.', ex='float r = radians(180.0);')
+    @stdlib("radians", sig='radians(x) \\u2192 float', category='Math', doc='Convert degrees to radians.', ex='float r = radians(180.0);')
     @staticmethod
     def fn_radians(x) -> torch.Tensor:
         return torch.deg2rad(_to_tensor(x))
 
-    @stdlib("spow", doc='Sign-preserving power. Safe for negative x.', ex='float s = spow(u - 0.5, 2.0);')
+    @stdlib("spow", sig='spow(x, y) \\u2192 float', category='Math', doc='Sign-preserving power. Safe for negative x.', ex='float s = spow(u - 0.5, 2.0);')
     @staticmethod
     def fn_spow(x, y) -> torch.Tensor:
         """Safe power — sign(x) * pow(abs(x), y). Avoids NaN on negative bases."""
@@ -462,7 +462,7 @@ class TEXStdlib:
         safe_abs = torch.clamp(abs_t, min=SAFE_EPSILON)
         return torch.where(mask, torch.zeros_like(t), torch.sign(t) * torch.pow(safe_abs, yt))
 
-    @stdlib("sdiv", doc='Safe divide. Returns 0 when b is zero.', ex='float d = sdiv(1.0, u);')
+    @stdlib("sdiv", sig='sdiv(a, b) \\u2192 float', category='Math', doc='Safe divide. Returns 0 when b is zero.', ex='float d = sdiv(1.0, u);')
     @staticmethod
     def fn_sdiv(a, b) -> torch.Tensor:
         """Safe division — returns 0.0 where abs(b) < SAFE_EPSILON."""
@@ -474,17 +474,17 @@ class TEXStdlib:
 
     # -- Matrix operations ----------------------------------------------
 
-    @stdlib("transpose", doc='Transpose a matrix.', ex='mat3 mt = transpose(m);')
+    @stdlib("transpose", sig='transpose(m) \\u2192 mat', category='Matrix', doc='Transpose a matrix.', ex='mat3 mt = transpose(m);')
     @staticmethod
     def fn_transpose(m) -> torch.Tensor:
         return m.transpose(-1, -2)
 
-    @stdlib("determinant", doc='Compute the determinant.', ex='float det = determinant(m);')
+    @stdlib("determinant", sig='determinant(m) \\u2192 float', category='Matrix', doc='Compute the determinant.', ex='float det = determinant(m);')
     @staticmethod
     def fn_determinant(m) -> torch.Tensor:
         return torch.linalg.det(m)
 
-    @stdlib("inverse", doc='Compute the matrix inverse.', ex='mat3 inv = inverse(m);')
+    @stdlib("inverse", sig='inverse(m) \\u2192 mat', category='Matrix', doc='Compute the matrix inverse.', ex='mat3 inv = inverse(m);')
     @staticmethod
     def fn_inverse(m) -> torch.Tensor:
         try:
@@ -502,17 +502,17 @@ class TEXStdlib:
 
     # -- Clamping / interpolation ---------------------------------------
 
-    @stdlib("min", doc='Returns the smaller value.', ex='float m = min(u, 0.5);')
+    @stdlib("min", sig='min(a, b) \\u2192 float', category='Interpolation', doc='Returns the smaller value.', ex='float m = min(u, 0.5);')
     @staticmethod
     def fn_min(a, b) -> torch.Tensor:
         return torch.minimum(_to_tensor(a), _to_tensor(b))
 
-    @stdlib("max", doc='Returns the larger value.', ex='float m = max(u, 0.0);')
+    @stdlib("max", sig='max(a, b) \\u2192 float', category='Interpolation', doc='Returns the larger value.', ex='float m = max(u, 0.0);')
     @staticmethod
     def fn_max(a, b) -> torch.Tensor:
         return torch.maximum(_to_tensor(a), _to_tensor(b))
 
-    @stdlib("clamp", doc='Clamp x to [lo, hi] range.', ex='float c = clamp(u * 2.0, 0.0, 1.0);')
+    @stdlib("clamp", sig='clamp(x, lo, hi) \\u2192 float', category='Interpolation', doc='Clamp x to [lo, hi] range.', ex='float c = clamp(u * 2.0, 0.0, 1.0);')
     @staticmethod
     def fn_clamp(x, lo, hi) -> torch.Tensor:
         # Python-number bounds: the scalar torch.clamp overload (one kernel).
@@ -531,7 +531,7 @@ class TEXStdlib:
         # Spatially-varying bounds
         return torch.minimum(torch.maximum(_to_tensor(x), _to_tensor(lo)), _to_tensor(hi))
 
-    @stdlib("lerp", aliases=("mix",), doc='Linear interpolation from a to b by t.', ex='@OUT = lerp(@A, @B, 0.5);')
+    @stdlib("lerp", sig='lerp(a, b, t) \\u2192 float', category='Interpolation', aliases=("mix",), doc='Linear interpolation from a to b by t.', ex='@OUT = lerp(@A, @B, 0.5);')
     @staticmethod
     def fn_lerp(a, b, t) -> torch.Tensor:
         a_t, b_t, t_t = _to_tensor(a), _to_tensor(b), _to_tensor(t)
@@ -540,7 +540,7 @@ class TEXStdlib:
             t_t = t_t.unsqueeze(-1)
         return _lerp_f32(a_t, b_t, t_t)
 
-    @stdlib("fit", doc='Remap x from [inLo, inHi] to [outLo, outHi].', ex='float y = fit(u, 0.2, 0.8, 0.0, 1.0);')
+    @stdlib("fit", sig='fit(x, inLo, inHi, outLo, outHi) \\u2192 float', category='Interpolation', doc='Remap x from [inLo, inHi] to [outLo, outHi].', ex='float y = fit(u, 0.2, 0.8, 0.0, 1.0);')
     @staticmethod
     def fn_fit(val, old_min, old_max, new_min, new_max) -> torch.Tensor:
         """Remap val from [old_min, old_max] to [new_min, new_max]."""
@@ -550,21 +550,21 @@ class TEXStdlib:
         t = (v - o_min) / (o_max - o_min + SAFE_EPSILON)
         return _lerp_f32(n_min, n_max, t)
 
-    @stdlib("smoothstep", doc='Smooth Hermite interpolation between lo and hi.', ex='float s = smoothstep(0.3, 0.7, u);')
+    @stdlib("smoothstep", sig='smoothstep(lo, hi, x) \\u2192 float', category='Interpolation', doc='Smooth Hermite interpolation between lo and hi.', ex='float s = smoothstep(0.3, 0.7, u);')
     @staticmethod
     def fn_smoothstep(edge0, edge1, x) -> torch.Tensor:
         e0, e1, xv = _to_tensor(edge0), _to_tensor(edge1), _to_tensor(x)
         t = torch.clamp((xv - e0) / (e1 - e0 + SAFE_EPSILON), 0.0, 1.0)
         return t * t * (3.0 - 2.0 * t)
 
-    @stdlib("step", doc='Returns 0 if x < edge, 1 otherwise.', ex='float s = step(0.5, u);')
+    @stdlib("step", sig='step(edge, x) \\u2192 float', category='Interpolation', doc='Returns 0 if x < edge, 1 otherwise.', ex='float s = step(0.5, u);')
     @staticmethod
     def fn_step(edge, x) -> torch.Tensor:
         return ((_to_tensor(x)) >= _to_tensor(edge)).float()
 
     # -- Vector operations ----------------------------------------------
 
-    @stdlib("dot", doc='Dot product of two vectors.', ex='float d = dot(normal, lightDir);')
+    @stdlib("dot", sig='dot(a, b) \\u2192 float', category='Vector', doc='Dot product of two vectors.', ex='float d = dot(normal, lightDir);')
     @staticmethod
     def fn_dot(a, b) -> torch.Tensor:
         """Dot product over the channel (last) dim.
@@ -576,7 +576,7 @@ class TEXStdlib:
             return (a_t * b_t).sum(dim=-1)
         return torch.einsum('...c,...c->...', a_t, b_t)
 
-    @stdlib("length", doc='Length (magnitude) of a vector.', ex='float len = length(vec3(u, v, 0.0));')
+    @stdlib("length", sig='length(v) \\u2192 float', category='Vector', doc='Length (magnitude) of a vector.', ex='float len = length(vec3(u, v, 0.0));')
     @staticmethod
     def fn_length(v) -> torch.Tensor:
         """Length (magnitude) of a vector, reduced over the channel (last) dim.
@@ -591,7 +591,7 @@ class TEXStdlib:
             return torch.linalg.vector_norm(t, dim=-1)
         return torch.abs(t)
 
-    @stdlib("distance", doc='Distance between two points.', ex='float d = distance(vec3(u,v,0), vec3(0.5,0.5,0));')
+    @stdlib("distance", sig='distance(a, b) \\u2192 float', category='Vector', doc='Distance between two points.', ex='float d = distance(vec3(u,v,0), vec3(0.5,0.5,0));')
     @staticmethod
     def fn_distance(a, b) -> torch.Tensor:
         diff = _to_tensor(a) - _to_tensor(b)
@@ -599,7 +599,7 @@ class TEXStdlib:
             return torch.linalg.vector_norm(diff, dim=-1)
         return torch.abs(diff)
 
-    @stdlib("normalize", doc='Unit vector in the same direction.', ex='vec3 dir = normalize(vec3(u-0.5, v-0.5, 1.0));')
+    @stdlib("normalize", sig='normalize(v) \\u2192 vec', category='Vector', doc='Unit vector in the same direction.', ex='vec3 dir = normalize(vec3(u-0.5, v-0.5, 1.0));')
     @staticmethod
     def fn_normalize(v) -> torch.Tensor:
         # Pinned convention (the single oracle both backends use): a vector
@@ -614,7 +614,7 @@ class TEXStdlib:
             return t / (norm + SAFE_EPSILON)
         return torch.sign(t)
 
-    @stdlib("cross", doc='Cross product of two vec3 vectors.', ex='vec3 n = cross(tangent, bitangent);')
+    @stdlib("cross", sig='cross(a, b) \\u2192 vec3', category='Vector', doc='Cross product of two vec3 vectors.', ex='vec3 n = cross(tangent, bitangent);')
     @staticmethod
     def fn_cross(a, b) -> torch.Tensor:
         """Cross product. Only works on vec3 (last dim = 3)."""
@@ -626,7 +626,7 @@ class TEXStdlib:
             b_t = b_t[..., :3]
         return torch.cross(a_t, b_t, dim=-1)
 
-    @stdlib("reflect", doc='Reflect vector v around normal n.', ex='vec3 r = reflect(incoming, normal);')
+    @stdlib("reflect", sig='reflect(v, n) \\u2192 vec', category='Vector', doc='Reflect vector v around normal n.', ex='vec3 r = reflect(incoming, normal);')
     @staticmethod
     def fn_reflect(incident, normal) -> torch.Tensor:
         i, n = _to_tensor(incident), _to_tensor(normal)
@@ -635,7 +635,7 @@ class TEXStdlib:
 
     # -- Color operations -----------------------------------------------
 
-    @stdlib("luma", doc='Perceptual luminance of an RGB color.', ex='float gray = luma(@image);')
+    @stdlib("luma", sig='luma(rgb) \\u2192 float', category='Color', doc='Perceptual luminance of an RGB color.', ex='float gray = luma(@image);')
     @staticmethod
     def fn_luma(color) -> torch.Tensor:
         """Compute luminance from RGB(A). Returns scalar per pixel."""
@@ -644,7 +644,7 @@ class TEXStdlib:
             return LUMA_R * c[..., 0] + LUMA_G * c[..., 1] + LUMA_B * c[..., 2]
         return c
 
-    @stdlib("hsv2rgb", doc='Convert HSV color to RGB.', ex='vec3 rgb = hsv2rgb(vec3(u, 1.0, 1.0));')
+    @stdlib("hsv2rgb", sig='hsv2rgb(hsv) \\u2192 vec3', category='Color', doc='Convert HSV color to RGB.', ex='vec3 rgb = hsv2rgb(vec3(u, 1.0, 1.0));')
     @staticmethod
     def fn_hsv2rgb(hsv) -> torch.Tensor:
         """Convert HSV to RGB. Expects vec3 [H, S, V] with H in [0, 1]."""
@@ -684,7 +684,7 @@ class TEXStdlib:
             result = torch.cat([result, c[..., 3:4]], dim=-1)
         return result
 
-    @stdlib("rgb2hsv", doc='Convert RGB color to HSV.', ex='vec3 hsv = rgb2hsv(@image);')
+    @stdlib("rgb2hsv", sig='rgb2hsv(rgb) \\u2192 vec3', category='Color', doc='Convert RGB color to HSV.', ex='vec3 hsv = rgb2hsv(@image);')
     @staticmethod
     def fn_rgb2hsv(rgb) -> torch.Tensor:
         """Convert RGB to HSV. Returns vec3 [H, S, V] with H in [0, 1]."""
@@ -718,7 +718,7 @@ class TEXStdlib:
     # linear-light first. OKLab gives perceptually-uniform gradients/mixes.
     # Each is elementwise and preserves a vec4 alpha unchanged.
 
-    @stdlib("srgb_to_linear", doc='Gamma-encoded sRGB → linear-light. Blur/blend in linear to avoid halos.', ex='vec3 lin = srgb_to_linear(@image.rgb);')
+    @stdlib("srgb_to_linear", sig='srgb_to_linear(c) \\u2192 vec', category='Color', doc='Gamma-encoded sRGB → linear-light. Blur/blend in linear to avoid halos.', ex='vec3 lin = srgb_to_linear(@image.rgb);')
     @staticmethod
     def fn_srgb_to_linear(color) -> torch.Tensor:
         """sRGB EOTF: gamma-encoded sRGB -> linear-light (piecewise). vec4 alpha
@@ -730,7 +730,7 @@ class TEXStdlib:
                           ((rgb + 0.055) / 1.055).clamp(min=0.0) ** 2.4)
         return torch.cat([lin, c[..., 3:4]], dim=-1) if has_alpha else lin
 
-    @stdlib("linear_to_srgb", doc='Linear-light → gamma-encoded sRGB (inverse of srgb_to_linear).', ex='@OUT = vec4(linear_to_srgb(lin), 1.0);')
+    @stdlib("linear_to_srgb", sig='linear_to_srgb(c) \\u2192 vec', category='Color', doc='Linear-light → gamma-encoded sRGB (inverse of srgb_to_linear).', ex='@OUT = vec4(linear_to_srgb(lin), 1.0);')
     @staticmethod
     def fn_linear_to_srgb(color) -> torch.Tensor:
         """sRGB OETF: linear-light -> gamma-encoded sRGB (inverse of
@@ -742,7 +742,7 @@ class TEXStdlib:
                            1.055 * rgb.clamp(min=0.0) ** (1.0 / 2.4) - 0.055)
         return torch.cat([srgb, c[..., 3:4]], dim=-1) if has_alpha else srgb
 
-    @stdlib("oklab_from_rgb", doc='Linear RGB → OKLab. Mix/interpolate in OKLab for perceptually-even gradients.', ex='vec3 lab = oklab_from_rgb(srgb_to_linear(@image.rgb));')
+    @stdlib("oklab_from_rgb", sig='oklab_from_rgb(c) \\u2192 vec3', category='Color', doc='Linear RGB → OKLab. Mix/interpolate in OKLab for perceptually-even gradients.', ex='vec3 lab = oklab_from_rgb(srgb_to_linear(@image.rgb));')
     @staticmethod
     def fn_oklab_from_rgb(color) -> torch.Tensor:
         """Linear-light RGB -> OKLab (Ottosson). Mix/interpolate in OKLab then
@@ -763,7 +763,7 @@ class TEXStdlib:
         lab = torch.cat([L, A, B], dim=-1)
         return torch.cat([lab, c[..., 3:4]], dim=-1) if has_alpha else lab
 
-    @stdlib("oklab_to_rgb", doc='OKLab → linear RGB (inverse of oklab_from_rgb).', ex='vec3 rgb = oklab_to_rgb(lab);')
+    @stdlib("oklab_to_rgb", sig='oklab_to_rgb(lab) \\u2192 vec3', category='Color', doc='OKLab → linear RGB (inverse of oklab_from_rgb).', ex='vec3 rgb = oklab_to_rgb(lab);')
     @staticmethod
     def fn_oklab_to_rgb(color) -> torch.Tensor:
         """OKLab -> linear-light RGB (inverse Ottosson). Compose with
@@ -785,7 +785,7 @@ class TEXStdlib:
     # ComfyUI IMAGE/MASK are un-premultiplied; over/under/atop take & return
     # straight-alpha vec4. premultiply/unpremultiply convert between conventions.
 
-    @stdlib("premultiply", doc='Straight → premultiplied alpha (rgb *= a).', ex='vec4 p = premultiply(@image);')
+    @stdlib("premultiply", sig='premultiply(rgba) \\u2192 vec4', category='Color', doc='Straight → premultiplied alpha (rgb *= a).', ex='vec4 p = premultiply(@image);')
     @staticmethod
     def fn_premultiply(color) -> torch.Tensor:
         """Straight -> premultiplied alpha: rgb *= a (vec4)."""
@@ -793,7 +793,7 @@ class TEXStdlib:
         a = c[..., 3:4]
         return torch.cat([c[..., 0:3] * a, a], dim=-1)
 
-    @stdlib("unpremultiply", doc='Premultiplied → straight alpha (rgb /= a).', ex='vec4 s = unpremultiply(p);')
+    @stdlib("unpremultiply", sig='unpremultiply(rgba) \\u2192 vec4', category='Color', doc='Premultiplied → straight alpha (rgb /= a).', ex='vec4 s = unpremultiply(p);')
     @staticmethod
     def fn_unpremultiply(color) -> torch.Tensor:
         """Premultiplied -> straight alpha: rgb /= a (vec4; safe at a=0, incl. fp16)."""
@@ -801,7 +801,7 @@ class TEXStdlib:
         a = c[..., 3:4]
         return torch.cat([TEXStdlib._safe_div(c[..., 0:3], a), a], dim=-1)
 
-    @stdlib("over", doc="Porter-Duff 'over': composite fg atop bg (straight-alpha RGBA).", ex='@OUT = over(@A, @B);')
+    @stdlib("over", sig='over(fg, bg) \\u2192 vec4', category='Color', doc="Porter-Duff 'over': composite fg atop bg (straight-alpha RGBA).", ex='@OUT = over(@A, @B);')
     @staticmethod
     def fn_over(fg, bg) -> torch.Tensor:
         """Porter-Duff 'over': fg composited over bg (straight-alpha vec4)."""
@@ -812,13 +812,13 @@ class TEXStdlib:
         orgb = TEXStdlib._safe_div(f[..., 0:3] * fa + b[..., 0:3] * ba * (1.0 - fa), oa)
         return torch.cat([orgb, oa], dim=-1)
 
-    @stdlib("under", doc='Composite fg under bg (= over(bg, fg)).', ex='@OUT = under(@A, @B);')
+    @stdlib("under", sig='under(fg, bg) \\u2192 vec4', category='Color', doc='Composite fg under bg (= over(bg, fg)).', ex='@OUT = under(@A, @B);')
     @staticmethod
     def fn_under(fg, bg) -> torch.Tensor:
         """'under': fg under bg == over(bg, fg)."""
         return TEXStdlib.fn_over(bg, fg)
 
-    @stdlib("atop", doc="'atop': fg confined to bg's coverage.", ex='@OUT = atop(@A, @B);')
+    @stdlib("atop", sig='atop(fg, bg) \\u2192 vec4', category='Color', doc="'atop': fg confined to bg's coverage.", ex='@OUT = atop(@A, @B);')
     @staticmethod
     def fn_atop(fg, bg) -> torch.Tensor:
         """'atop': fg atop bg — output confined to bg's coverage (out_a = bg.a)."""
@@ -858,55 +858,55 @@ class TEXStdlib:
         safe = torch.where(below, torch.copysign(eps_t, denom), denom)
         return num / safe
 
-    @stdlib("screen", doc='Screen blend: 1 - (1-a)(1-b). Brightens.', ex='@OUT = vec4(screen(@A.rgb, @B.rgb), 1.0);')
+    @stdlib("screen", sig='screen(a, b) \\u2192 vec', category='Color', doc='Screen blend: 1 - (1-a)(1-b). Brightens.', ex='@OUT = vec4(screen(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
     def fn_screen(base, blend) -> torch.Tensor:
         """1 - (1-a)(1-b)."""
         return TEXStdlib._blend_rgb(base, blend, lambda a, b: 1.0 - (1.0 - a) * (1.0 - b))
 
-    @stdlib("overlay", doc='Overlay blend (multiply/screen by base).', ex='@OUT = vec4(overlay(@A.rgb, @B.rgb), 1.0);')
+    @stdlib("overlay", sig='overlay(a, b) \\u2192 vec', category='Color', doc='Overlay blend (multiply/screen by base).', ex='@OUT = vec4(overlay(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
     def fn_overlay(base, blend) -> torch.Tensor:
         """a<0.5 ? 2ab : 1-2(1-a)(1-b)."""
         return TEXStdlib._blend_rgb(base, blend, lambda a, b: torch.where(
             a < 0.5, 2.0 * a * b, 1.0 - 2.0 * (1.0 - a) * (1.0 - b)))
 
-    @stdlib("hard_light", doc='Hard-light blend (overlay with operands swapped).', ex='@OUT = vec4(hard_light(@A.rgb, @B.rgb), 1.0);')
+    @stdlib("hard_light", sig='hard_light(a, b) \\u2192 vec', category='Color', doc='Hard-light blend (overlay with operands swapped).', ex='@OUT = vec4(hard_light(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
     def fn_hard_light(base, blend) -> torch.Tensor:
         """overlay with the operands swapped."""
         return TEXStdlib._blend_rgb(base, blend, lambda a, b: torch.where(
             b < 0.5, 2.0 * a * b, 1.0 - 2.0 * (1.0 - a) * (1.0 - b)))
 
-    @stdlib("soft_light", doc='Soft-light blend (Pegtop, smooth).', ex='@OUT = vec4(soft_light(@A.rgb, @B.rgb), 1.0);')
+    @stdlib("soft_light", sig='soft_light(a, b) \\u2192 vec', category='Color', doc='Soft-light blend (Pegtop, smooth).', ex='@OUT = vec4(soft_light(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
     def fn_soft_light(base, blend) -> torch.Tensor:
         """Pegtop soft-light: (1-2b)a^2 + 2ab (smooth, no branch)."""
         return TEXStdlib._blend_rgb(base, blend,
                                     lambda a, b: (1.0 - 2.0 * b) * a * a + 2.0 * a * b)
 
-    @stdlib("color_dodge", doc='Color-dodge: brightens base by blend.', ex='@OUT = vec4(color_dodge(@A.rgb, @B.rgb), 1.0);')
+    @stdlib("color_dodge", sig='color_dodge(a, b) \\u2192 vec', category='Color', doc='Color-dodge: brightens base by blend.', ex='@OUT = vec4(color_dodge(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
     def fn_color_dodge(base, blend) -> torch.Tensor:
         """min(1, a / (1-b)); b>=1 -> 1."""
         return TEXStdlib._blend_rgb(base, blend, lambda a, b: torch.clamp(
             TEXStdlib._safe_div(a, 1.0 - b), max=1.0))
 
-    @stdlib("color_burn", doc='Color-burn: darkens base by blend.', ex='@OUT = vec4(color_burn(@A.rgb, @B.rgb), 1.0);')
+    @stdlib("color_burn", sig='color_burn(a, b) \\u2192 vec', category='Color', doc='Color-burn: darkens base by blend.', ex='@OUT = vec4(color_burn(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
     def fn_color_burn(base, blend) -> torch.Tensor:
         """1 - min(1, (1-a)/b); b<=0 -> 0."""
         return TEXStdlib._blend_rgb(base, blend, lambda a, b: 1.0 - torch.clamp(
             TEXStdlib._safe_div(1.0 - a, b), max=1.0))
 
-    @stdlib("linear_light", doc='Linear-light blend: clamp(a + 2b - 1).', ex='@OUT = vec4(linear_light(@A.rgb, @B.rgb), 1.0);')
+    @stdlib("linear_light", sig='linear_light(a, b) \\u2192 vec', category='Color', doc='Linear-light blend: clamp(a + 2b - 1).', ex='@OUT = vec4(linear_light(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
     def fn_linear_light(base, blend) -> torch.Tensor:
         """clamp(a + 2b - 1, 0, 1)."""
         return TEXStdlib._blend_rgb(base, blend,
                                     lambda a, b: torch.clamp(a + 2.0 * b - 1.0, 0.0, 1.0))
 
-    @stdlib("vivid_light", doc='Vivid-light blend (burn/dodge by blend).', ex='@OUT = vec4(vivid_light(@A.rgb, @B.rgb), 1.0);')
+    @stdlib("vivid_light", sig='vivid_light(a, b) \\u2192 vec', category='Color', doc='Vivid-light blend (burn/dodge by blend).', ex='@OUT = vec4(vivid_light(@A.rgb, @B.rgb), 1.0);')
     @staticmethod
     def fn_vivid_light(base, blend) -> torch.Tensor:
         """b<0.5 -> color_burn(a,2b); else color_dodge(a,2(b-0.5))."""
@@ -943,14 +943,14 @@ class TEXStdlib:
         x = x.permute(0, 2, 3, 1)         # [B,H,W,C]
         return x.squeeze(-1) if squeeze else x
 
-    @stdlib("erode", sync=True, non_local=True, doc='Morphological erosion (local min over a (2r+1)² square). Shrinks bright regions.', ex='@OUT = erode(@mask, 3);')
+    @stdlib("erode", sig='erode(img, radius) \\u2192 vec', category='Sampling', sync=True, footprint=('halo_arg', 1), doc='Morphological erosion (local min over a (2r+1)² square). Shrinks bright regions.', ex='@OUT = erode(@mask, 3);')
     @staticmethod
     def fn_erode(image, radius) -> torch.Tensor:
         """Grayscale erosion (local min over a (2r+1)² square). Shrinks bright
         regions; the classic mask-shrink op."""
         return TEXStdlib._morph(image, radius, grow=False)
 
-    @stdlib("dilate", sync=True, non_local=True, doc='Morphological dilation (local max). Grows bright regions.', ex='@OUT = dilate(@mask, 3);')
+    @stdlib("dilate", sig='dilate(img, radius) \\u2192 vec', category='Sampling', sync=True, footprint=('halo_arg', 1), doc='Morphological dilation (local max). Grows bright regions.', ex='@OUT = dilate(@mask, 3);')
     @staticmethod
     def fn_dilate(image, radius) -> torch.Tensor:
         """Grayscale dilation (local max over a (2r+1)² square). Grows bright
@@ -959,7 +959,7 @@ class TEXStdlib:
 
     # -- Sampling -------------------------------------------------------
 
-    @stdlib("sample", spatial=True, non_local=True, doc='Bilinear sample at normalized UV coordinates.', ex='@OUT = sample(@A, u + 0.01, v);')
+    @stdlib("sample", sig='sample(img, u, v) \\u2192 vec', category='Sampling', spatial=True, footprint='image', doc='Bilinear sample at normalized UV coordinates.', ex='@OUT = sample(@A, u + 0.01, v);')
     @staticmethod
     def fn_sample(image, u_coord, v_coord) -> torch.Tensor:
         """Sample an image at (u, v) coordinates using bilinear interpolation.
@@ -1010,7 +1010,7 @@ class TEXStdlib:
         # Back to [B, H, W, C]
         return result_bchw.permute(0, 2, 3, 1)
 
-    @stdlib("fetch", spatial=True, non_local=True, doc='Nearest-neighbor fetch at pixel coordinates.', ex='@OUT = fetch(@A, ix, iy);')
+    @stdlib("fetch", sig='fetch(img, px, py) \\u2192 vec', category='Sampling', spatial=True, footprint='image', doc='Nearest-neighbor fetch at pixel coordinates.', ex='@OUT = fetch(@A, ix, iy);')
     @staticmethod
     def fn_fetch(image, px, py) -> torch.Tensor:
         """Fetch a pixel at integer coordinates (nearest-neighbor).
@@ -1062,7 +1062,7 @@ class TEXStdlib:
 
         return img[_get_batch_index(B, H, W, img.device), py_i, px_i]
 
-    @stdlib("fetch_frame", spatial=True, non_local=True, doc='Nearest-neighbor fetch from a specific batch frame.', ex='@OUT = fetch_frame(@A, fi-1, ix, iy);')
+    @stdlib("fetch_frame", sig='fetch_frame(img, frame, px, py) \\u2192 vec', category='Batch / Temporal', spatial=True, footprint=('frame', 1), doc='Nearest-neighbor fetch from a specific batch frame.', ex='@OUT = fetch_frame(@A, fi-1, ix, iy);')
     @staticmethod
     def fn_fetch_frame(image, frame, px, py) -> torch.Tensor:
         """Fetch a pixel from a specific frame at integer coordinates.
@@ -1095,7 +1095,7 @@ class TEXStdlib:
 
         return img[f_idx, py_i, px_i]
 
-    @stdlib("sample_frame", spatial=True, non_local=True, doc='Bilinear sample from a specific batch frame.', ex='@OUT = sample_frame(@A, 0, u, v);')
+    @stdlib("sample_frame", sig='sample_frame(img, frame, u, v) \\u2192 vec', category='Batch / Temporal', spatial=True, footprint=('frame', 1), doc='Bilinear sample from a specific batch frame.', ex='@OUT = sample_frame(@A, 0, u, v);')
     @staticmethod
     def fn_sample_frame(image, frame, u_coord, v_coord) -> torch.Tensor:
         """Sample from a specific frame using bilinear interpolation.
@@ -1144,7 +1144,7 @@ class TEXStdlib:
                  v10 * (1 - fx) * fy + v11 * fx * fy
         return result
 
-    @stdlib("sample_cubic", spatial=True, non_local=True, doc='Bicubic (Catmull-Rom) sampling.', ex='@OUT = sample_cubic(@A, u, v);')
+    @stdlib("sample_cubic", sig='sample_cubic(img, u, v) \\u2192 vec', category='Sampling', spatial=True, footprint='image', doc='Bicubic (Catmull-Rom) sampling.', ex='@OUT = sample_cubic(@A, u, v);')
     @staticmethod
     def fn_sample_cubic(image, u_coord, v_coord) -> torch.Tensor:
         """Sample an image at (u, v) coordinates using bicubic (Catmull-Rom) interpolation.
@@ -1179,7 +1179,7 @@ class TEXStdlib:
         # Back to [B, H, W, C]
         return result_bchw.permute(0, 2, 3, 1)
 
-    @stdlib("sample_lanczos", spatial=True, non_local=True, doc='Lanczos-3 high-quality sampling.', ex='@OUT = sample_lanczos(@A, u * 0.5, v * 0.5);')
+    @stdlib("sample_lanczos", sig='sample_lanczos(img, u, v) \\u2192 vec', category='Sampling', spatial=True, footprint='image', doc='Lanczos-3 high-quality sampling.', ex='@OUT = sample_lanczos(@A, u * 0.5, v * 0.5);')
     @staticmethod
     def fn_sample_lanczos(image, u_coord, v_coord) -> torch.Tensor:
         """Sample an image at (u, v) coordinates using Lanczos-3 interpolation.
@@ -1261,7 +1261,7 @@ class TEXStdlib:
 
         return result
 
-    @stdlib("sample_mip", spatial=True, sync=True, non_local=True, doc='Mipmap sampling with LOD. 0 = full res, 1 = half, etc. Trilinear between levels.', ex='@OUT = sample_mip(@A, u, v, 2.5);')
+    @stdlib("sample_mip", sig='sample_mip(img, u, v, lod) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint='image', doc='Mipmap sampling with LOD. 0 = full res, 1 = half, etc. Trilinear between levels.', ex='@OUT = sample_mip(@A, u, v, 2.5);')
     @staticmethod
     def fn_sample_mip(image, u_coord, v_coord, lod) -> torch.Tensor:
         """Sample an image with mipmap filtering at an explicit level of detail.
@@ -1279,7 +1279,7 @@ class TEXStdlib:
         """
         return _sample_mip_trilinear(image, u_coord, v_coord, lod, _get_mip_pyramid)
 
-    @stdlib("gauss_blur", spatial=True, sync=True, non_local=True, doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.', ex='@OUT = gauss_blur(@A, 2.0);')
+    @stdlib("gauss_blur", sig='gauss_blur(img, sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1), doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.', ex='@OUT = gauss_blur(@A, 2.0);')
     @staticmethod
     def fn_gauss_blur(image, sigma) -> torch.Tensor:
         """Separable Gaussian blur.
@@ -1302,7 +1302,7 @@ class TEXStdlib:
         result = _gauss_blur_bchw(bchw, sigma_val)
         return result.permute(0, 2, 3, 1)
 
-    @stdlib("bilateral_filter", spatial=True, sync=True, non_local=True, doc='Edge-preserving smoothing: blurs within regions but keeps edges. Window capped at 7×7.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
+    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo', 3), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Window capped at 7×7.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
     @staticmethod
     def fn_bilateral_filter(image, sigma_s, sigma_r) -> torch.Tensor:
         """Edge-preserving bilateral filter using Tensor.unfold.
@@ -1363,7 +1363,7 @@ class TEXStdlib:
 
         return result.permute(0, 2, 3, 1)  # back to BHWC
 
-    @stdlib("sample_mip_gauss", spatial=True, sync=True, non_local=True, doc='Gaussian-prefiltered mipmap sampling. Smoother pyramid (sigma=1.13) gives ~5 dB better exponential blur accuracy vs sample_mip.', ex='@OUT = sample_mip_gauss(@A, u, v, 2.5);')
+    @stdlib("sample_mip_gauss", sig='sample_mip_gauss(img, u, v, lod) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint='image', doc='Gaussian-prefiltered mipmap sampling. Smoother pyramid (sigma=1.13) gives ~5 dB better exponential blur accuracy vs sample_mip.', ex='@OUT = sample_mip_gauss(@A, u, v, 2.5);')
     @staticmethod
     def fn_sample_mip_gauss(image, u_coord, v_coord, lod) -> torch.Tensor:
         """Sample with Gaussian-prefiltered mipmap (sigma=1.13 pyramid).
@@ -1379,7 +1379,7 @@ class TEXStdlib:
     #   2 args = 2D, 3 args = 3D (for base noise)
     #   3 args = 2D with octaves, 4 args = 3D with octaves (for FBM family)
 
-    @stdlib("perlin", doc='2D Perlin noise. Returns value in [-1, 1].', ex='float n = perlin(u * 10.0, v * 10.0);')
+    @stdlib("perlin", sig='perlin(x, y) \\u2192 float', category='Noise', doc='2D Perlin noise. Returns value in [-1, 1].', ex='float n = perlin(u * 10.0, v * 10.0);')
     @staticmethod
     def fn_perlin(x, y, z=None) -> torch.Tensor:
         """Perlin noise. 2D when z omitted, 3D when z provided. Returns float in ~[-1, 1]."""
@@ -1387,7 +1387,7 @@ class TEXStdlib:
             return _perlin3d_fast(_to_tensor(x), _to_tensor(y), _to_tensor(z))
         return _perlin2d_fast(_to_tensor(x), _to_tensor(y))
 
-    @stdlib("simplex", doc='2D Simplex noise. Returns value in [-1, 1].', ex='float n = simplex(u * 8.0, v * 8.0);')
+    @stdlib("simplex", sig='simplex(x, y) \\u2192 float', category='Noise', doc='2D Simplex noise. Returns value in [-1, 1].', ex='float n = simplex(u * 8.0, v * 8.0);')
     @staticmethod
     def fn_simplex(x, y, z=None) -> torch.Tensor:
         """Simplex noise. 2D when z omitted, 3D falls back to Perlin. Returns float in ~[-1, 1]."""
@@ -1395,7 +1395,7 @@ class TEXStdlib:
             return _perlin3d_fast(_to_tensor(x), _to_tensor(y), _to_tensor(z))
         return _simplex2d(_to_tensor(x), _to_tensor(y))
 
-    @stdlib("fbm", sync=True, doc='Fractal Brownian Motion (multi-octave Perlin).', ex='float n = fbm(u * 4.0, v * 4.0, 6);')
+    @stdlib("fbm", sig='fbm(x, y, octaves) \\u2192 float', category='Noise', sync=True, doc='Fractal Brownian Motion (multi-octave Perlin).', ex='float n = fbm(u * 4.0, v * 4.0, 6);')
     @staticmethod
     def fn_fbm(x, y, z_or_oct, octaves=None) -> torch.Tensor:
         """FBM noise. fbm(x,y,octaves) for 2D, fbm(x,y,z,octaves) for 3D."""
@@ -1404,7 +1404,7 @@ class TEXStdlib:
                           int(_to_float(octaves)))
         return _fbm2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
 
-    @stdlib("worley_f1", doc='Worley (cellular) noise — distance to nearest cell center.', ex='float n = worley_f1(u * 5.0, v * 5.0);')
+    @stdlib("worley_f1", sig='worley_f1(x, y) \\u2192 float', category='Noise', doc='Worley (cellular) noise — distance to nearest cell center.', ex='float n = worley_f1(u * 5.0, v * 5.0);')
     @staticmethod
     def fn_worley_f1(x, y, z=None) -> torch.Tensor:
         """Worley F1 noise (nearest cell distance). Returns float in ~[0, 1]."""
@@ -1412,7 +1412,7 @@ class TEXStdlib:
             return _worley3d(_to_tensor(x), _to_tensor(y), _to_tensor(z), return_f2=False)
         return _worley2d(_to_tensor(x), _to_tensor(y), return_f2=False)
 
-    @stdlib("worley_f2", doc='Worley noise — distance to second-nearest cell center.', ex='float n = worley_f2(u * 5.0, v * 5.0);')
+    @stdlib("worley_f2", sig='worley_f2(x, y) \\u2192 float', category='Noise', doc='Worley noise — distance to second-nearest cell center.', ex='float n = worley_f2(u * 5.0, v * 5.0);')
     @staticmethod
     def fn_worley_f2(x, y, z=None) -> torch.Tensor:
         """Worley F2 noise (2nd nearest cell distance). Returns float in ~[0, 1]."""
@@ -1420,13 +1420,13 @@ class TEXStdlib:
             return _worley3d(_to_tensor(x), _to_tensor(y), _to_tensor(z), return_f2=True)
         return _worley2d(_to_tensor(x), _to_tensor(y), return_f2=True)
 
-    @stdlib("voronoi", doc='Voronoi cell ID noise. Returns a unique value per cell.', ex='float cell = voronoi(u * 8.0, v * 8.0);')
+    @stdlib("voronoi", sig='voronoi(x, y) \\u2192 float', category='Noise', doc='Voronoi cell ID noise. Returns a unique value per cell.', ex='float cell = voronoi(u * 8.0, v * 8.0);')
     @staticmethod
     def fn_voronoi(x, y, z=None) -> torch.Tensor:
         """Voronoi noise (alias for worley_f1)."""
         return TEXStdlib.fn_worley_f1(x, y, z)
 
-    @stdlib("curl", doc='Curl of 2D noise field. Returns a divergence-free vector.', ex='vec2 c = curl(u * 5.0, v * 5.0);')
+    @stdlib("curl", sig='curl(x, y) \\u2192 vec2', category='Noise', doc='Curl of 2D noise field. Returns a divergence-free vector.', ex='vec2 c = curl(u * 5.0, v * 5.0);')
     @staticmethod
     def fn_curl(x, y, z=None) -> torch.Tensor:
         """Curl noise. 2D → vec2 (divergence-free), 3D → vec3."""
@@ -1434,7 +1434,7 @@ class TEXStdlib:
             return _curl3d(_to_tensor(x), _to_tensor(y), _to_tensor(z))
         return _curl2d(_to_tensor(x), _to_tensor(y))
 
-    @stdlib("ridged", sync=True, doc='Ridged multifractal — sharp ridges, good for mountains.', ex='float n = ridged(u * 4.0, v * 4.0, 6);')
+    @stdlib("ridged", sig='ridged(x, y, octaves) \\u2192 float', category='Noise', sync=True, doc='Ridged multifractal — sharp ridges, good for mountains.', ex='float n = ridged(u * 4.0, v * 4.0, 6);')
     @staticmethod
     def fn_ridged(x, y, z_or_oct, octaves=None) -> torch.Tensor:
         """Ridged FBM. ridged(x,y,octaves) for 2D, ridged(x,y,z,octaves) for 3D."""
@@ -1443,7 +1443,7 @@ class TEXStdlib:
                              int(_to_float(octaves)))
         return _ridged2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
 
-    @stdlib("billow", sync=True, doc='Billowy noise — abs(fbm). Puffy cloud shapes.', ex='float n = billow(u * 4.0, v * 4.0, 6);')
+    @stdlib("billow", sig='billow(x, y, octaves) \\u2192 float', category='Noise', sync=True, doc='Billowy noise — abs(fbm). Puffy cloud shapes.', ex='float n = billow(u * 4.0, v * 4.0, 6);')
     @staticmethod
     def fn_billow(x, y, z_or_oct, octaves=None) -> torch.Tensor:
         """Billow FBM. billow(x,y,octaves) for 2D, billow(x,y,z,octaves) for 3D."""
@@ -1452,7 +1452,7 @@ class TEXStdlib:
                              int(_to_float(octaves)))
         return _billow2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
 
-    @stdlib("turbulence", sync=True, doc='Turbulence — sum of abs(noise) per octave. Veiny patterns.', ex='float n = turbulence(u * 4.0, v * 4.0, 6);')
+    @stdlib("turbulence", sig='turbulence(x, y, octaves) \\u2192 float', category='Noise', sync=True, doc='Turbulence — sum of abs(noise) per octave. Veiny patterns.', ex='float n = turbulence(u * 4.0, v * 4.0, 6);')
     @staticmethod
     def fn_turbulence(x, y, z_or_oct, octaves=None) -> torch.Tensor:
         """Turbulence. turbulence(x,y,octaves) for 2D, turbulence(x,y,z,octaves) for 3D."""
@@ -1461,7 +1461,7 @@ class TEXStdlib:
                                  int(_to_float(octaves)))
         return _turbulence2d(_to_tensor(x), _to_tensor(y), int(_to_float(z_or_oct)))
 
-    @stdlib("flow", sync=True, doc='Flow noise — Perlin rotated by angle per octave. Avoids static patterns.', ex='float n = flow(u * 6.0, v * 6.0, fi * 0.1);')
+    @stdlib("flow", sig='flow(x, y, angle) \\u2192 float', category='Noise', sync=True, doc='Flow noise — Perlin rotated by angle per octave. Avoids static patterns.', ex='float n = flow(u * 6.0, v * 6.0, fi * 0.1);')
     @staticmethod
     def fn_flow(x, y, z_or_time, time=None) -> torch.Tensor:
         """Flow noise. flow(x,y,time) for 2D, flow(x,y,z,time) for 3D."""
@@ -1470,7 +1470,7 @@ class TEXStdlib:
                            _to_float(time))
         return _flow2d(_to_tensor(x), _to_tensor(y), _to_float(z_or_time))
 
-    @stdlib("alligator", sync=True, doc='Alligator noise — cellular crack patterns.', ex='float n = alligator(u * 5.0, v * 5.0);')
+    @stdlib("alligator", sig='alligator(x, y) \\u2192 float', category='Noise', sync=True, doc='Alligator noise — cellular crack patterns.', ex='float n = alligator(u * 5.0, v * 5.0);')
     @staticmethod
     def fn_alligator(x, y, z_or_oct=None, octaves=None) -> torch.Tensor:
         """Alligator noise. 2 args: 2D default octaves; 3 args: 2D custom octaves; 4 args: 3D."""
@@ -1483,13 +1483,13 @@ class TEXStdlib:
 
     # -- SDF primitives -------------------------------------------------
 
-    @stdlib("sdf_circle", doc='Signed distance to circle. Negative inside, positive outside.', ex='float d = sdf_circle(u, v, 0.5, 0.5, 0.3);')
+    @stdlib("sdf_circle", sig='sdf_circle(px, py, radius) \\u2192 float', category='SDF & Smooth', doc='Signed distance to a circle centered at the origin (offset px/py to move it). Negative inside, positive outside.', ex='float d = sdf_circle(u - 0.5, v - 0.5, 0.3);')
     @staticmethod
     def fn_sdf_circle(px, py, radius) -> torch.Tensor:
         """Signed distance to a circle centered at origin."""
         return torch.hypot(_to_tensor(px), _to_tensor(py)) - _to_tensor(radius)
 
-    @stdlib("sdf_box", doc='Signed distance to axis-aligned box.', ex='float d = sdf_box(u, v, 0.5, 0.5, 0.2, 0.15);')
+    @stdlib("sdf_box", sig='sdf_box(px, py, half_w, half_h) \\u2192 float', category='SDF & Smooth', doc='Signed distance to an axis-aligned box centered at the origin (half-extents half_w/half_h).', ex='float d = sdf_box(u - 0.5, v - 0.5, 0.2, 0.15);')
     @staticmethod
     def fn_sdf_box(px, py, half_w, half_h) -> torch.Tensor:
         """Signed distance to an axis-aligned box centered at origin."""
@@ -1501,7 +1501,7 @@ class TEXStdlib:
         inside = torch.clamp(torch.max(dx, dy), max=0.0)
         return outside + inside
 
-    @stdlib("sdf_line", doc='Distance to line segment.', ex='float d = sdf_line(u, v, 0.2, 0.2, 0.8, 0.8);')
+    @stdlib("sdf_line", sig='sdf_line(x, y, x1, y1, x2, y2) \\u2192 float', category='SDF & Smooth', doc='Distance to line segment.', ex='float d = sdf_line(u, v, 0.2, 0.2, 0.8, 0.8);')
     @staticmethod
     def fn_sdf_line(px, py, ax, ay, bx, by) -> torch.Tensor:
         """Unsigned distance to a line segment from (ax,ay) to (bx,by). Always >= 0."""
@@ -1515,7 +1515,7 @@ class TEXStdlib:
         h = torch.clamp((pa_x * ba_x + pa_y * ba_y) / (ba_x * ba_x + ba_y * ba_y + SAFE_EPSILON), 0.0, 1.0)
         return torch.hypot(pa_x - ba_x * h, pa_y - ba_y * h)
 
-    @stdlib("sdf_polygon", doc='Signed distance to regular polygon with n sides.', ex='float d = sdf_polygon(u, v, 0.5, 0.5, 0.3, 6);')
+    @stdlib("sdf_polygon", sig='sdf_polygon(px, py, radius, sides) \\u2192 float', category='SDF & Smooth', doc='Signed distance to a regular polygon (sides>=3) centered at the origin.', ex='float d = sdf_polygon(u - 0.5, v - 0.5, 0.3, 6);')
     @staticmethod
     def fn_sdf_polygon(px, py, radius, sides) -> torch.Tensor:
         """Signed distance to a regular polygon centered at origin."""
@@ -1534,7 +1534,7 @@ class TEXStdlib:
 
     # -- Smooth min/max -------------------------------------------------
 
-    @stdlib("smin", doc='Smooth minimum. Polynomial blending with radius k. Works on scalars and vectors.', ex='float d = smin(d1, d2, 0.1);')
+    @stdlib("smin", sig='smin(a, b, k) \\u2192 float|vec', category='SDF & Smooth', doc='Smooth minimum. Polynomial blending with radius k. Works on scalars and vectors.', ex='float d = smin(d1, d2, 0.1);')
     @staticmethod
     def fn_smin(a, b, k) -> torch.Tensor:
         """Polynomial smooth minimum with smoothing radius k."""
@@ -1544,7 +1544,7 @@ class TEXStdlib:
         h = torch.clamp(0.5 + 0.5 * (b_t - a_t) / (k_t + SAFE_EPSILON), 0.0, 1.0)
         return _lerp_f32(b_t, a_t, h) - k_t * h * (1.0 - h)
 
-    @stdlib("smax", doc='Smooth maximum. Polynomial blending with radius k. Works on scalars and vectors.', ex='float d = smax(d1, d2, 0.1);')
+    @stdlib("smax", sig='smax(a, b, k) \\u2192 float|vec', category='SDF & Smooth', doc='Smooth maximum. Polynomial blending with radius k. Works on scalars and vectors.', ex='float d = smax(d1, d2, 0.1);')
     @staticmethod
     def fn_smax(a, b, k) -> torch.Tensor:
         """Polynomial smooth maximum with smoothing radius k."""
@@ -1556,7 +1556,7 @@ class TEXStdlib:
 
     # -- Gradient sampling -----------------------------------------------
 
-    @stdlib("sample_grad", spatial=True, non_local=True, doc='Image gradient (Sobel) at UV. Returns vec2(dI/dx, dI/dy) of luminance.', ex='vec2 grad = sample_grad(@A, u, v);')
+    @stdlib("sample_grad", sig='sample_grad(img, u, v) \\u2192 vec2', category='Sampling', spatial=True, footprint='image', doc='Image gradient (Sobel) at UV. Returns vec2(dI/dx, dI/dy) of luminance.', ex='vec2 grad = sample_grad(@A, u, v);')
     @staticmethod
     def fn_sample_grad(image, u_coord, v_coord) -> torch.Tensor:
         """Sample the luminance gradient of an image at (u, v). Returns vec2 (dx, dy)."""
@@ -1581,7 +1581,7 @@ class TEXStdlib:
 
     # -- String functions -----------------------------------------------
 
-    @stdlib("str", doc='Convert a number to a string.', ex='string s = str(42);')
+    @stdlib("str", sig='str(x) \\u2192 string', category='Strings', doc='Convert a number to a string.', ex='string s = str(42);')
     @staticmethod
     def fn_str(x) -> str:
         """Convert number to string."""
@@ -1592,7 +1592,7 @@ class TEXStdlib:
             return str(int(v)) if v == int(v) else str(v)
         return str(x)
 
-    @stdlib("len", doc='Length of a string, array, or vec-array (element count).', ex='float n = len("hello");')
+    @stdlib("len", sig='len(x) \\u2192 float', category='Strings', doc='Length of a string, array, or vec-array (element count).', ex='float n = len("hello");')
     @staticmethod
     def fn_len(s) -> torch.Tensor:
         """String length, array length, or vec array element count -> float tensor."""
@@ -1607,7 +1607,7 @@ class TEXStdlib:
             return torch.scalar_tensor(float(s.shape[-1]), dtype=torch.float32)
         raise ValueError("len() expects a string or array argument")
 
-    @stdlib("replace", doc='Replace all occurrences of old with new.', ex='string r = replace(s, "foo", "bar");')
+    @stdlib("replace", sig='replace(s, old, new) \\u2192 string', category='Strings', doc='Replace all occurrences of old with new.', ex='string r = replace(s, "foo", "bar");')
     @staticmethod
     def fn_replace(s, old, new, max_count=None) -> str:
         """Replace occurrences of old with new. Optional max_count limits replacements."""
@@ -1618,7 +1618,7 @@ class TEXStdlib:
             return s.replace(old, new, n)
         return s.replace(old, new)
 
-    @stdlib("strip", doc='Remove leading/trailing whitespace.', ex='string clean = strip(s);')
+    @stdlib("strip", sig='strip(s) \\u2192 string', category='Strings', doc='Remove leading/trailing whitespace.', ex='string clean = strip(s);')
     @staticmethod
     def fn_strip(s) -> str:
         """Trim leading/trailing whitespace."""
@@ -1626,7 +1626,7 @@ class TEXStdlib:
             raise ValueError("strip() expects a string argument")
         return s.strip()
 
-    @stdlib("lower", doc='Convert to lowercase.', ex='string lc = lower("Hello");')
+    @stdlib("lower", sig='lower(s) \\u2192 string', category='Strings', doc='Convert to lowercase.', ex='string lc = lower("Hello");')
     @staticmethod
     def fn_lower(s) -> str:
         """Convert to lowercase."""
@@ -1634,7 +1634,7 @@ class TEXStdlib:
             raise ValueError("lower() expects a string argument")
         return s.lower()
 
-    @stdlib("upper", doc='Convert to uppercase.', ex='string uc = upper("hello");')
+    @stdlib("upper", sig='upper(s) \\u2192 string', category='Strings', doc='Convert to uppercase.', ex='string uc = upper("hello");')
     @staticmethod
     def fn_upper(s) -> str:
         """Convert to uppercase."""
@@ -1642,7 +1642,7 @@ class TEXStdlib:
             raise ValueError("upper() expects a string argument")
         return s.upper()
 
-    @stdlib("contains", doc='Returns 1.0 if s contains sub, 0.0 otherwise.', ex='float has = contains(s, "test");')
+    @stdlib("contains", sig='contains(s, sub) \\u2192 float', category='Strings', doc='Returns 1.0 if s contains sub, 0.0 otherwise.', ex='float has = contains(s, "test");')
     @staticmethod
     def fn_contains(s, sub) -> torch.Tensor:
         """Check if s contains sub. Returns 1.0 or 0.0."""
@@ -1650,7 +1650,7 @@ class TEXStdlib:
             raise ValueError("contains() expects two string arguments")
         return torch.scalar_tensor(1.0 if sub in s else 0.0, dtype=torch.float32)
 
-    @stdlib("startswith", doc='Returns 1.0 if s starts with prefix.', ex='float sw = startswith(s, "img_");')
+    @stdlib("startswith", sig='startswith(s, prefix) \\u2192 float', category='Strings', doc='Returns 1.0 if s starts with prefix.', ex='float sw = startswith(s, "img_");')
     @staticmethod
     def fn_startswith(s, prefix) -> torch.Tensor:
         """Check if s starts with prefix. Returns 1.0 or 0.0."""
@@ -1658,7 +1658,7 @@ class TEXStdlib:
             raise ValueError("startswith() expects two string arguments")
         return torch.scalar_tensor(1.0 if s.startswith(prefix) else 0.0, dtype=torch.float32)
 
-    @stdlib("endswith", doc='Returns 1.0 if s ends with suffix.', ex='float ew = endswith(s, ".png");')
+    @stdlib("endswith", sig='endswith(s, suffix) \\u2192 float', category='Strings', doc='Returns 1.0 if s ends with suffix.', ex='float ew = endswith(s, ".png");')
     @staticmethod
     def fn_endswith(s, suffix) -> torch.Tensor:
         """Check if s ends with suffix. Returns 1.0 or 0.0."""
@@ -1666,7 +1666,7 @@ class TEXStdlib:
             raise ValueError("endswith() expects two string arguments")
         return torch.scalar_tensor(1.0 if s.endswith(suffix) else 0.0, dtype=torch.float32)
 
-    @stdlib("find", doc='Index of first occurrence, or -1.0 if not found.', ex='float idx = find(s, "world");')
+    @stdlib("find", sig='find(s, sub) \\u2192 float', category='Strings', doc='Index of first occurrence, or -1.0 if not found.', ex='float idx = find(s, "world");')
     @staticmethod
     def fn_find(s, sub) -> torch.Tensor:
         """Find index of sub in s. Returns -1.0 if not found."""
@@ -1674,7 +1674,7 @@ class TEXStdlib:
             raise ValueError("find() expects two string arguments")
         return torch.scalar_tensor(float(s.find(sub)), dtype=torch.float32)
 
-    @stdlib("substr", doc='Extract a substring. len is optional.', ex='string sub = substr(s, 0, 5);')
+    @stdlib("substr", sig='substr(s, start, len?) \\u2192 string', category='Strings', doc='Extract a substring. len is optional.', ex='string sub = substr(s, 0, 5);')
     @staticmethod
     def fn_substr(s, start, length=None) -> str:
         """Extract substring. start is 0-based index."""
@@ -1686,7 +1686,7 @@ class TEXStdlib:
             return s[start_i:start_i + len_i]
         return s[start_i:]
 
-    @stdlib("to_int", doc='Parse a string as an integer.', ex='int n = to_int("42");')
+    @stdlib("to_int", sig='to_int(s) \\u2192 int', category='Strings', doc='Parse a string as an integer.', ex='int n = to_int("42");')
     @staticmethod
     def fn_to_int(s) -> torch.Tensor:
         """Parse integer from string."""
@@ -1697,7 +1697,7 @@ class TEXStdlib:
         except ValueError:
             raise ValueError(f"to_int(): cannot parse '{s}' as integer")
 
-    @stdlib("to_float", doc='Parse a string as a float.', ex='float f = to_float("3.14");')
+    @stdlib("to_float", sig='to_float(s) \\u2192 float', category='Strings', doc='Parse a string as a float.', ex='float f = to_float("3.14");')
     @staticmethod
     def fn_to_float(s) -> torch.Tensor:
         """Parse float from string."""
@@ -1708,7 +1708,7 @@ class TEXStdlib:
         except ValueError:
             raise ValueError(f"to_float(): cannot parse '{s}' as float")
 
-    @stdlib("sanitize_filename", doc='Remove unsafe characters for use in file paths.', ex='string safe = sanitize_filename(s);')
+    @stdlib("sanitize_filename", sig='sanitize_filename(s) \\u2192 string', category='Strings', doc='Remove unsafe characters for use in file paths.', ex='string safe = sanitize_filename(s);')
     @staticmethod
     def fn_sanitize_filename(s) -> str:
         """Remove characters illegal in filenames."""
@@ -1718,7 +1718,7 @@ class TEXStdlib:
         cleaned = cleaned.strip('. ')
         return cleaned if cleaned else "unnamed"
 
-    @stdlib("split", doc='Split string into array by separator.', ex='string parts[4] = split(s, ",");')
+    @stdlib("split", sig='split(s, sep) \\u2192 string[]', category='Strings', doc='Split string into array by separator.', ex='string parts[4] = split(s, ",");')
     @staticmethod
     def fn_split(s, delimiter, max_splits=None) -> list:
         """Split string by delimiter. Returns a list of strings."""
@@ -1731,7 +1731,7 @@ class TEXStdlib:
             return s.split(delimiter, n)
         return s.split(delimiter)
 
-    @stdlib("lstrip", doc='Remove leading whitespace.', ex='string clean = lstrip(s);')
+    @stdlib("lstrip", sig='lstrip(s) \\u2192 string', category='Strings', doc='Remove leading whitespace.', ex='string clean = lstrip(s);')
     @staticmethod
     def fn_lstrip(s) -> str:
         """Trim leading whitespace."""
@@ -1739,7 +1739,7 @@ class TEXStdlib:
             raise ValueError("lstrip() expects a string argument")
         return s.lstrip()
 
-    @stdlib("rstrip", doc='Remove trailing whitespace.', ex='string clean = rstrip(s);')
+    @stdlib("rstrip", sig='rstrip(s) \\u2192 string', category='Strings', doc='Remove trailing whitespace.', ex='string clean = rstrip(s);')
     @staticmethod
     def fn_rstrip(s) -> str:
         """Trim trailing whitespace."""
@@ -1747,7 +1747,7 @@ class TEXStdlib:
             raise ValueError("rstrip() expects a string argument")
         return s.rstrip()
 
-    @stdlib("pad_left", doc='Pad string on the left to reach width.', ex='string n = pad_left(str(fi), 4, "0");')
+    @stdlib("pad_left", sig='pad_left(s, width, fill) \\u2192 string', category='Strings', doc='Pad string on the left to reach width.', ex='string n = pad_left(str(fi), 4, "0");')
     @staticmethod
     def fn_pad_left(s, width, char=None) -> str:
         """Pad string on the left to reach target width. Default pad char is space."""
@@ -1761,7 +1761,7 @@ class TEXStdlib:
             fill = char
         return s.rjust(w, fill)
 
-    @stdlib("pad_right", doc='Pad string on the right to reach width.', ex='string n = pad_right(s, 20, " ");')
+    @stdlib("pad_right", sig='pad_right(s, width, fill) \\u2192 string', category='Strings', doc='Pad string on the right to reach width.', ex='string n = pad_right(s, 20, " ");')
     @staticmethod
     def fn_pad_right(s, width, char=None) -> str:
         """Pad string on the right to reach target width. Default pad char is space."""
@@ -1775,7 +1775,7 @@ class TEXStdlib:
             fill = char
         return s.ljust(w, fill)
 
-    @stdlib("format", doc='Printf-style formatting. %d = int, %f = float, %s = string.', ex='string s = format("Frame %d of %d", fi, fn);')
+    @stdlib("format", sig='format(fmt, ...) \\u2192 string', category='Strings', doc='Printf-style formatting. %d = int, %f = float, %s = string.', ex='string s = format("Frame %d of %d", fi, fn);')
     @staticmethod
     def fn_format(template, *args) -> str:
         """String interpolation. Replaces {} placeholders with arguments.
@@ -1809,7 +1809,7 @@ class TEXStdlib:
                 f"but {len(converted)} value{'s' if len(converted) != 1 else ''} "
                 f"{'were' if len(converted) != 1 else 'was'} given.") from e
 
-    @stdlib("repeat", doc='Repeat a string N times.', ex='string bar = repeat("=", 10);')
+    @stdlib("repeat", sig='repeat(s, n) \\u2192 string', category='Strings', doc='Repeat a string N times.', ex='string bar = repeat("=", 10);')
     @staticmethod
     def fn_repeat(s, count) -> str:
         """Repeat a string N times."""
@@ -1820,7 +1820,7 @@ class TEXStdlib:
             n = 0
         return s * n
 
-    @stdlib("str_reverse", doc='Reverse a string.', ex='string r = str_reverse("abc");')
+    @stdlib("str_reverse", sig='str_reverse(s) \\u2192 string', category='Strings', doc='Reverse a string.', ex='string r = str_reverse("abc");')
     @staticmethod
     def fn_str_reverse(s) -> str:
         """Reverse a string."""
@@ -1828,7 +1828,7 @@ class TEXStdlib:
             raise ValueError("str_reverse() expects a string argument")
         return s[::-1]
 
-    @stdlib("count", doc='Count non-overlapping occurrences of sub in s.', ex='float n = count(s, "the");')
+    @stdlib("count", sig='count(s, sub) \\u2192 float', category='Strings', doc='Count non-overlapping occurrences of sub in s.', ex='float n = count(s, "the");')
     @staticmethod
     def fn_count(s, sub) -> torch.Tensor:
         """Count non-overlapping occurrences of sub in s."""
@@ -1836,7 +1836,7 @@ class TEXStdlib:
             raise ValueError("count() expects two string arguments")
         return torch.scalar_tensor(float(s.count(sub)), dtype=torch.float32)
 
-    @stdlib("matches", doc='Returns 1.0 if the whole string matches the regex pattern, else 0.0.', ex='float ok = matches(s, "[0-9]+");')
+    @stdlib("matches", sig='matches(s, pattern) \\u2192 float', category='Strings', doc='Returns 1.0 if the whole string matches the regex pattern, else 0.0.', ex='float ok = matches(s, "[0-9]+");')
     @staticmethod
     def fn_matches(s, pattern) -> torch.Tensor:
         """Test if string matches a regex pattern. Returns 1.0 if the full string matches, 0.0 otherwise."""
@@ -1847,7 +1847,7 @@ class TEXStdlib:
         except re.error as e:
             raise ValueError(f"matches() invalid regex: {e}")
 
-    @stdlib("hash", doc='Deterministic string hash (SHA-256 hex, first 16 chars).', ex='string h = hash("seed");')
+    @stdlib("hash", sig='hash(s) \\u2192 string', category='Strings', doc='Deterministic string hash (SHA-256 hex, first 16 chars).', ex='string h = hash("seed");')
     @staticmethod
     def fn_hash(s) -> str:
         """Deterministic hash of a string. Returns a stable string hash (SHA-256 hex, first 16 chars)."""
@@ -1855,7 +1855,7 @@ class TEXStdlib:
             raise ValueError("hash() expects a string argument")
         return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
-    @stdlib("hash_float", doc='Deterministic hash of a string to a float in [0, 1).', ex='float r = hash_float("seed");')
+    @stdlib("hash_float", sig='hash_float(s) \\u2192 float', category='Strings', doc='Deterministic hash of a string to a float in [0, 1).', ex='float r = hash_float("seed");')
     @staticmethod
     def fn_hash_float(s) -> torch.Tensor:
         """Deterministic hash of a string to a float in [0, 1).
@@ -1867,7 +1867,7 @@ class TEXStdlib:
         value = int.from_bytes(h[:8], "big") / (2**64)
         return torch.scalar_tensor(value, dtype=torch.float32)
 
-    @stdlib("hash_int", doc='Deterministic hash of a string to a non-negative int (optional exclusive max).', ex='int i = hash_int("seed", 100);')
+    @stdlib("hash_int", sig='hash_int(s, max?) \\u2192 int', category='Strings', doc='Deterministic hash of a string to a non-negative int (optional exclusive max).', ex='int i = hash_int("seed", 100);')
     @staticmethod
     def fn_hash_int(s, max_val=None) -> torch.Tensor:
         """Deterministic hash of a string to a non-negative integer.
@@ -1890,7 +1890,7 @@ class TEXStdlib:
         value = min(value, 2**24 - 1)
         return torch.scalar_tensor(float(value), dtype=torch.float32)
 
-    @stdlib("char_at", doc='Character at index (0-based).', ex='string c = char_at(s, 0);')
+    @stdlib("char_at", sig='char_at(s, idx) \\u2192 string', category='Strings', doc='Character at index (0-based).', ex='string c = char_at(s, 0);')
     @staticmethod
     def fn_char_at(s, index) -> str:
         """Get character at index. Returns empty string if out of bounds."""
@@ -1903,7 +1903,7 @@ class TEXStdlib:
 
     # -- Array functions ------------------------------------------------
 
-    @stdlib("sort", doc='Sort array elements in ascending order.', ex='sort(arr);')
+    @stdlib("sort", sig='sort(arr) \\u2192 array', category='Arrays', doc='Sort array elements in ascending order.', ex='sort(arr);')
     @staticmethod
     def fn_sort(arr):
         """Sort array elements in ascending order. Returns sorted copy."""
@@ -1914,7 +1914,7 @@ class TEXStdlib:
             return torch.sort(t, dim=-2).values
         return torch.sort(t, dim=-1).values
 
-    @stdlib("reverse", doc='Reverse array element order.', ex='reverse(arr);')
+    @stdlib("reverse", sig='reverse(arr) \\u2192 array', category='Arrays', doc='Reverse array element order.', ex='reverse(arr);')
     @staticmethod
     def fn_reverse(arr):
         """Reverse array elements. Returns reversed copy."""
@@ -1925,37 +1925,37 @@ class TEXStdlib:
             return torch.flip(t, dims=[-2])
         return torch.flip(t, dims=[-1])
 
-    @stdlib("arr_sum", doc='Sum of all array elements.', ex='float total = arr_sum(arr);')
+    @stdlib("arr_sum", sig='arr_sum(arr) \\u2192 float', category='Arrays', doc='Sum of all array elements.', ex='float total = arr_sum(arr);')
     @staticmethod
     def fn_arr_sum(arr) -> torch.Tensor:
         """Sum all elements of an array. Returns scalar (or vec) per pixel."""
         return _reduce_channels(_to_tensor(arr).float(), lambda t, d: t.sum(dim=d))
 
-    @stdlib("arr_min", doc='Minimum value in array.', ex='float lo = arr_min(arr);')
+    @stdlib("arr_min", sig='arr_min(arr) \\u2192 float', category='Arrays', doc='Minimum value in array.', ex='float lo = arr_min(arr);')
     @staticmethod
     def fn_arr_min(arr) -> torch.Tensor:
         """Minimum element of an array per channel. Returns scalar (or vec) per pixel."""
         return _reduce_channels(_to_tensor(arr).float(), lambda t, d: t.min(dim=d).values)
 
-    @stdlib("arr_max", doc='Maximum value in array.', ex='float hi = arr_max(arr);')
+    @stdlib("arr_max", sig='arr_max(arr) \\u2192 float', category='Arrays', doc='Maximum value in array.', ex='float hi = arr_max(arr);')
     @staticmethod
     def fn_arr_max(arr) -> torch.Tensor:
         """Maximum element of an array per channel. Returns scalar (or vec) per pixel."""
         return _reduce_channels(_to_tensor(arr).float(), lambda t, d: t.max(dim=d).values)
 
-    @stdlib("median", doc='Median value of array.', ex='float mid = median(arr);')
+    @stdlib("median", sig='median(arr) \\u2192 float', category='Arrays', doc='Median value of array.', ex='float mid = median(arr);')
     @staticmethod
     def fn_median(arr) -> torch.Tensor:
         """Median element of an array per channel. Returns scalar (or vec) per pixel."""
         return _reduce_channels(_to_tensor(arr).float(), lambda t, d: torch.median(t, dim=d).values)
 
-    @stdlib("arr_avg", doc='Average of all array elements.', ex='float avg = arr_avg(arr);')
+    @stdlib("arr_avg", sig='arr_avg(arr) \\u2192 float', category='Arrays', doc='Average of all array elements.', ex='float avg = arr_avg(arr);')
     @staticmethod
     def fn_arr_avg(arr) -> torch.Tensor:
         """Average of array elements per channel. Returns scalar (or vec) per pixel."""
         return _reduce_channels(_to_tensor(arr).float(), lambda t, d: t.mean(dim=d))
 
-    @stdlib("join", doc='Concatenate string array with separator.', ex='string csv = join(names, ", ");')
+    @stdlib("join", sig='join(arr, sep) \\u2192 string', category='Arrays', doc='Concatenate string array with separator.', ex='string csv = join(names, ", ");')
     @staticmethod
     def fn_join(arr, sep) -> str:
         """Concatenate string array elements with separator."""
@@ -1967,7 +1967,7 @@ class TEXStdlib:
 
     # -- Image reduction functions ---------------------------------------
 
-    @stdlib("img_sum", non_local=True, doc='Per-channel sum of all pixel values.', ex='vec3 total = img_sum(@A);')
+    @stdlib("img_sum", sig='img_sum(img) \\u2192 vec', category='Image Stats', footprint='image', doc='Per-channel sum of all pixel values.', ex='vec3 total = img_sum(@A);')
     @staticmethod
     def fn_img_sum(image) -> torch.Tensor:
         """Sum of all pixels per channel per frame. Returns broadcast-friendly shape."""
@@ -1979,7 +1979,7 @@ class TEXStdlib:
             return img.float().sum(dim=(1, 2), keepdim=True)
         return img
 
-    @stdlib("img_mean", non_local=True, doc='Per-channel mean (average) of the image.', ex='vec3 avg = img_mean(@A);')
+    @stdlib("img_mean", sig='img_mean(img) \\u2192 vec', category='Image Stats', footprint='image', doc='Per-channel mean (average) of the image.', ex='vec3 avg = img_mean(@A);')
     @staticmethod
     def fn_img_mean(image) -> torch.Tensor:
         """Mean of all pixels per channel per frame."""
@@ -1988,7 +1988,7 @@ class TEXStdlib:
             return img.float().mean(dim=(1, 2), keepdim=True)  # PR-LP4: fp32 accumulate
         return img
 
-    @stdlib("img_min", non_local=True, doc='Per-channel minimum across the entire image.', ex='vec3 lo = img_min(@A);')
+    @stdlib("img_min", sig='img_min(img) \\u2192 vec', category='Image Stats', footprint='image', doc='Per-channel minimum across the entire image.', ex='vec3 lo = img_min(@A);')
     @staticmethod
     def fn_img_min(image) -> torch.Tensor:
         """Min pixel value per channel per frame."""
@@ -1997,7 +1997,7 @@ class TEXStdlib:
             return img.float().amin(dim=(1, 2), keepdim=True)  # PR-LP4: fp32 return
         return img
 
-    @stdlib("img_max", non_local=True, doc='Per-channel maximum across the entire image.', ex='vec3 hi = img_max(@A);')
+    @stdlib("img_max", sig='img_max(img) \\u2192 vec', category='Image Stats', footprint='image', doc='Per-channel maximum across the entire image.', ex='vec3 hi = img_max(@A);')
     @staticmethod
     def fn_img_max(image) -> torch.Tensor:
         """Max pixel value per channel per frame."""
@@ -2006,7 +2006,7 @@ class TEXStdlib:
             return img.float().amax(dim=(1, 2), keepdim=True)  # PR-LP4: fp32 return
         return img
 
-    @stdlib("img_median", non_local=True, doc='Per-channel median of the image.', ex='vec3 mid = img_median(@A);')
+    @stdlib("img_median", sig='img_median(img) \\u2192 vec', category='Image Stats', footprint='image', doc='Per-channel median of the image.', ex='vec3 mid = img_median(@A);')
     @staticmethod
     def fn_img_median(image) -> torch.Tensor:
         """Median pixel value per channel per frame."""
@@ -2021,7 +2021,7 @@ class TEXStdlib:
             return torch.median(flat, dim=1).values.unsqueeze(1).unsqueeze(1)
         return img
 
-    @stdlib("debug_print", sync=True,
+    @stdlib("debug_print", sig='debug_print(label, value[, x, y]) \\u2192 value', category='Debugging', sync=True,
             doc="Probe a value at a pixel — records it for the node's "
             "HUD and returns the value unchanged (a print-style debug tap). Interpreter"
             "-only; a compiled tier falls back so the probe always fires.",

@@ -18,6 +18,7 @@ checks registry↔signatures parity, so the two representations cannot silently
 drift. The `spatial`/`sync`/`non_local` tags carried here let TST-3 *derive* the
 codegen/graphed/tiling taxonomy sets.
 """
+import re as _re
 from dataclasses import dataclass
 
 
@@ -30,29 +31,73 @@ class StdlibEntry:
     aliases: tuple = ()
     spatial: bool = False      # codegen routes specially (stencil/sample)
     sync: bool = False         # graph tier must synchronise around it
-    non_local: bool = False    # reads neighbouring pixels — wrong if tiled
+    # ROI-1: access footprint — which input pixels one output pixel reads; the
+    # substrate ROI-2/5/6 build on. One of: 'point' (per-pixel, default), 'image'
+    # (whole-image reduction or data-dependent gather), ('halo', r) (fixed radius r),
+    # ('halo_arg', i) (radius from arg i), ('frame', i) (temporal window from arg i).
+    footprint: "str | tuple" = "point"
     doc: str = ""
     ex: str = ""
+    # LANG-4: help data migrated OUT of the hand-kept JS `TEX_HELP_DATA` into the registry
+    # so it is single-sourced. `sig` is the human signature ("sin(x) → float"); `category`
+    # is the help-panel grouping ("Math"). Empty on entries with no help (none, today).
+    sig: str = ""
+    category: str = ""
 
     @property
     def names(self) -> tuple:
         """Primary name plus any aliases."""
         return (self.name, *self.aliases)
 
+    @property
+    def non_local(self) -> bool:
+        """Derived (ROI-1, invariant #5): a non-'point' footprint reads beyond the
+        current pixel, so a program calling it can't be split into strips (M-4). This
+        is the single source `tex_memory._NON_LOCAL_FNS` and `gen_function_reference`
+        read — it replaces the old hand-set boolean field, no consumer changed."""
+        return self.footprint != "point"
+
 
 # Registered in decoration (source) order as the class body of TEXStdlib executes.
 REGISTRY: list[StdlibEntry] = []
 
 
-def stdlib(name, *, aliases=(), spatial=False, sync=False, non_local=False,
-           doc="", ex=""):
+def _valid_footprint(fp) -> bool:
+    """ROI-1 footprint well-formedness. A malformed descriptor (a typo like
+    ('halo', 'x') or a bare ('frame',)) must fail LOUD at import, not silently
+    mis-tag a function — the exact silent-wrong class the taxonomy exists to close.
+    'halo' takes a positive number; 'halo_arg'/'frame' a non-negative arg index.
+    bool is rejected explicitly (it is an int subclass, and True as a radius is a
+    bug, not a radius)."""
+    if fp == "point" or fp == "image":
+        return True
+    if isinstance(fp, tuple) and len(fp) == 2:
+        kind, val = fp
+        if isinstance(val, bool):
+            return False
+        if kind == "halo":
+            return isinstance(val, (int, float)) and val > 0
+        if kind in ("halo_arg", "frame"):
+            return isinstance(val, int) and val >= 0
+    return False
+
+
+def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
+           doc="", ex="", sig="", category=""):
     """Record one StdlibEntry and return the decorated object UNCHANGED (so an
     inner `@staticmethod` still applies). Pure data attachment — the name is
-    explicit; nothing is inferred or discovered."""
+    explicit; nothing is inferred or discovered. `footprint` (ROI-1) is validated
+    here so a malformed descriptor can never reach the registry. `sig`/`category`
+    (LANG-4) carry the help data that used to live only in the JS."""
+    if not _valid_footprint(footprint):
+        raise ValueError(
+            f"stdlib({name!r}): invalid footprint {footprint!r}. Expected 'point', "
+            f"'image', ('halo', r>0), ('halo_arg', i>=0), or ('frame', i>=0).")
+
     def deco(obj):
         fn = obj.__func__ if isinstance(obj, staticmethod) else obj
         REGISTRY.append(StdlibEntry(name, fn, tuple(aliases), spatial, sync,
-                                    non_local, doc, ex))
+                                    footprint, doc, ex, sig, category))
         return obj
     return deco
 
@@ -74,6 +119,53 @@ def spatial_names() -> frozenset:
     class body has populated `REGISTRY` — TST-3 already proves this derivation equals
     the old literal exactly."""
     return frozenset(n for e in REGISTRY for n in e.names if e.spatial)
+
+
+def non_local_names() -> frozenset:
+    """The registry-derived set of names whose footprint != 'point' (ROI-1): the
+    single source for `tex_memory._NON_LOCAL_FNS`, replacing that hand-kept literal.
+    Function form (evaluated AFTER `TEXStdlib`'s class body has populated `REGISTRY`),
+    mirroring `spatial_names()` — TST-3 proves it equals the old 18-name literal."""
+    return frozenset(n for e in REGISTRY for n in e.names if e.non_local)
+
+
+def _decode_sig(s: str) -> str:
+    """Decode a stored JS-escaped `sig` (\\uXXXX, \\n, \\", \\\\) into display text. The
+    registry stores sigs in their JS-escaped form so they compare byte-for-byte against
+    the editor's TEX_HELP_DATA (the LANG-4 drift test); callers decode for display."""
+    s = _re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+    return s.replace("\\n", " ").replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _help_entry(e, decode: bool) -> dict:
+    """One help dict from a registry entry: name, aliases, sig, desc (`doc`), example
+    (`ex`), category, tags. The single entry-builder for `help_entries`/`help_lookup`."""
+    return {
+        "name": e.name,
+        "aliases": list(e.aliases),
+        "sig": _decode_sig(e.sig) if decode else e.sig,
+        "desc": e.doc,
+        "example": e.ex,
+        "category": e.category,
+        "tags": [t for t, on in (("spatial", e.spatial), ("sync", e.sync),
+                                 ("non-local", e.non_local)) if on],
+    }
+
+
+def help_entries(decode: bool = False) -> list:
+    """LANG-4: the function help data, single-sourced from the registry (the JS
+    `TEX_HELP_DATA` function entries are now a drift-pinned MIRROR of this). `decode=True`
+    turns the stored JS-escaped sig into display text."""
+    return [_help_entry(e, decode) for e in REGISTRY]
+
+
+def help_lookup(name: str, decode: bool = True):
+    """The help entry for one function name (primary or alias), or None — builds only the
+    matched entry, not the whole list. Used by the CLI `tex help <fn>`."""
+    for e in REGISTRY:
+        if name == e.name or name in e.aliases:
+            return _help_entry(e, decode)
+    return None
 
 
 # ── C2-st: fp16 precision taxonomy (single source) ────────────────────────────

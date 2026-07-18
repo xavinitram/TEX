@@ -43,9 +43,9 @@ def parse_help():
 
 
 def _unescape(s):
-    s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
-    s = s.replace("\\n", " ").replace('\\"', '"').replace("\\\\", "\\")
-    return s.replace("|", r"\|")  # keep markdown table cells intact
+    # Delegate the JS-escape decode to the registry's single-source `_decode_sig` (LANG-4),
+    # then escape markdown pipes so the sig survives intact in a table cell.
+    return R._decode_sig(s).replace("|", r"\|")
 
 
 def _cell(s):

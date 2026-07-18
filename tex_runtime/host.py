@@ -28,6 +28,7 @@ class HostServices(Protocol):
     def free_memory(self, amount, device) -> None: ...
     def is_oom(self, exc) -> bool: ...
     def soft_empty_cache(self) -> None: ...
+    def get_user_dir(self) -> "str | None": ...   # LANG-5: per-user data dir, or None
 
 
 def _allocator_slack(idx: int) -> int:
@@ -94,6 +95,9 @@ class NullHostServices:
     def soft_empty_cache(self):
         pass
 
+    def get_user_dir(self):
+        return None  # LANG-5: no host user dir standalone — the store falls back to the cache dir
+
 
 class ComfyHostServices:
     """Delegates to `comfy.model_management` — the ONLY consumer of that import in TEX.
@@ -136,6 +140,17 @@ class ComfyHostServices:
                 self._mm.soft_empty_cache()
         except Exception:
             pass
+
+    def get_user_dir(self):
+        # LANG-5: ComfyUI's per-user data root (multi-user aware; falls back to <comfy>/user).
+        # folder_paths is a host module — imported here, inside the PORT-1 boundary, only.
+        try:
+            import folder_paths
+            if hasattr(folder_paths, "get_user_directory"):
+                return folder_paths.get_user_directory()
+        except Exception:
+            pass
+        return None
 
 
 _cached = None

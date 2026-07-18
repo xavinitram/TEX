@@ -100,7 +100,7 @@ below, so they can no longer silently drift.
 | name → arg-count + return rule | `FUNCTION_SIGNATURES` (compiler; **not** derived — Option-1, TST-3 checks parity) | `type_checker` | (type error) |
 | `spatial=` | `@stdlib` tag → `_SPATIAL_STDLIB` (`codegen.py`) | codegen stencil path | non-spatial |
 | `sync=` | `@stdlib` tag → `_SYNC_STDLIB` (`graphed.py`) | CUDA-graph capture gate | capturable (may fail loudly) |
-| `non_local=` | `@stdlib` tag → `_NON_LOCAL_FNS` (`tex_memory.py`) | tiling planner | **pixel-local → WRONG OUTPUT WHEN TILED** ⚠️ |
+| `footprint=` | `@stdlib` tag → `_NON_LOCAL_FNS` (`footprint != 'point'`, `tex_memory.py`) | tiling planner | **left `'point'` → WRONG OUTPUT WHEN TILED** ⚠️ |
 | help/autocomplete | `TEX_HELP_DATA` (`js/tex_extension.js`) | editor | (no autocomplete) |
 
 ⚠️ `non_local` defaults to "pixel-local": forgetting the tag on a

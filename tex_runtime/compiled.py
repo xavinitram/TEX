@@ -28,6 +28,7 @@ import torch
 from ..tex_compiler.ast_nodes import (BinOp, UnaryOp, TernaryOp, FunctionCall,
                                       VecConstructor, MatConstructor, CastExpr,
                                       IfElse, ForLoop, WhileLoop)
+from .interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
 from .interpreter import (Interpreter, _collect_identifiers,
                           _SCALAR_BUILTIN_DEFAULTS)
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
@@ -1152,23 +1153,20 @@ def _plain_execute(
         precision=precision, used_builtins=used_builtins, time_context=time_context)
 
 
-_PLAIN_INTERP = None
+# ENG-9: the persistent fallback interpreter is PER-THREAD, like the engine's cook
+# interpreter (tex_engine._get_interpreter). Same per-instance state, same reason; the pool
+# machinery (thread-local + WeakSet + insert-only lock) is single-sourced in interp_pool.
+_plain_pool = _ThreadLocalInterpreterPool(Interpreter)
 
 
 def _get_plain_interp():
-    global _PLAIN_INTERP
-    if _PLAIN_INTERP is None:
-        _PLAIN_INTERP = Interpreter()
-    return _PLAIN_INTERP
+    return _plain_pool.get()
 
 
 def clear_plain_interp_caches():
-    """Sweep the persistent fallback interpreter's tensor LRUs (C6) — for
-    free_tensor_caches (memory pressure) + clear_compiled_cache (test isolation).
-    No-op if it was never created."""
-    if _PLAIN_INTERP is not None:
-        _PLAIN_INTERP._builtins_lru.clear()
-        _PLAIN_INTERP._literal_cache.clear()
+    """Sweep EVERY per-thread fallback interpreter's tensor LRUs (C6) — for
+    free_tensor_caches (memory pressure) + clear_compiled_cache (test isolation)."""
+    _plain_pool.clear_all()
 
 
 # Cross-cook cache for codegen builtin tensors (coordinates + constants). The

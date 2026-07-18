@@ -266,7 +266,12 @@ already proves seam-exact coordinates and zero-copy view narrowing.
   whole-image.
 - **ROI-3 (L).** ROI execution: generalize `tile=` to `roi=(x0,y0,w,h,W,H)` in the
   interpreter; the executor slices each input to output-ROI ⊕ footprint; border-clamp
-  only at true image edges. Exposed host-agnostically as `execute(..., roi=)` on
+  only at true image edges. **Precondition (v0.23 audit):** ROI-1's `('halo_arg', i)`
+  descriptors name the *argument*, not the true reach — `gauss_blur`'s halo is
+  `ceil(3·sigma)`, ~3× the sigma the descriptor points at. Before the executor reads any
+  radius, add the reach multiplier + a TST-3-style test pinning each `halo`/`halo_arg`
+  descriptor to its impl's actual neighbour reach, or the slice under-approximates and
+  seams appear at every tile edge (invariant #11 under-approximation). Exposed host-agnostically as `execute(..., roi=)` on
   PORT-2. Interpreter-tier first; compiled tiers fall back until ROI-bucketed keys
   exist (quantize rects to buckets so compile/graph caches don't explode).
 - **ROI-4 (M, gate).** The fail-loud discipline does not carry over automatically: a
@@ -699,7 +704,7 @@ touching the frontend. FUS-0 ships as **v0.20.1** (hotfix, in flight).
 | v0.21.0 | **Fuse the graph** — fusion real on internally-branching regions | FUS-1, FUS-3, FUS-2 (mechanism), ~~LAT-1a~~ (deferred: compile is lazy), LAT-3, LAT-4, CACHE-0, ENG-8, ENG-10 (doc) | `tex_runtime/xfer.py` |
 | v0.21.1 | **Multi-injection** — an external producer may feed >1 region member (`Load → [blur, sharpen] → merge`), the canonical comp split v0.21 leaves unfused | FUS-1b (source spec becomes a list: splicer + JS transport), FUS-1c (see below) | — |
 | v0.22.0 | **The engine seam** — the cook engine stops being a ComfyUI classmethod | ENG-1, ~~LAT-2~~ (deferred: measured at 2% of a cook; see below), ENG-2, ENG-3, ENG-4, ENG-5, ENG-7, SCHED-1 | `tex_engine.py` |
-| v0.23.0 | **Authoring** — the language grows its tool-era surface | LANG-1, LANG-2, LANG-3, LANG-4, LANG-5, ENG-6, ENG-9, ROI-1, LAT-1b | — (LANGUAGE.md) |
+| v0.23.0 | **Authoring** — the language grows its tool-era surface | LANG-1, LANG-2, LANG-3, LANG-4, LANG-5, ENG-6, ENG-9, ROI-1, ~~LAT-1b~~ (deferred: one-time capture stall; see below) | `tex_snippets.py`, `LANGUAGE.md`, `tex_help.json` |
 | v0.24.0 | **See less, cook less** — spatial laziness | ROI-2, ROI-3 (flagged), ROI-4 (ship gate), ROI-6 | `tex_roi.py` |
 | v0.25.0 | **Remember frames** — results become first-class | ENG-12, CACHE-1, CACHE-2, CACHE-3, CACHE-4 | `tex_results.py` |
 | v0.26.0 | **Tools** — the bundling promise | TOOL-1..5, first STOCK exemplars, LANG-7 | `tex_tool.py`, `tex_lsp.py` |
@@ -793,10 +798,24 @@ Per-release notes:
     internal compiler types. The class was landed in `tex_compiler/diagnostics.py`
     (shared) precisely so the *raiser* can move down to the engine later without the type
     moving. Decide in v0.23, when LANG-2's `check()` gives the second consumer.
-- **v0.23.0** carries ROI-1 (pure registry metadata, zero behavior change) so
-  v0.24 starts on a settled substrate, and LAT-1b (async graph capture) as its own
-  mini-design now that the engine seam exists. Exit: PM-4 dry-run (compat corpus
-  green against v0.22-frozen goldens).
+- **v0.23.0** shipped the authoring surface: LANG-1 param metadata, LANG-2 `check()` +
+  the first W7xxx warnings + live lint, LANG-3 language versioning + the frozen compat
+  corpus + LANGUAGE.md, LANG-4 registry-sourced function help (+ `tex help` CLI), LANG-5
+  server-backed snippets, ENG-6 DLPack handoff, ENG-9 per-thread interpreters, and ROI-1
+  (pure registry metadata, zero behaviour change) so v0.24 starts on a settled substrate.
+  **Exit met:** PM-4 — the compat corpus is green against v0.23-frozen goldens (129
+  programs: 116 examples + adversarial grammar), the mechanism that keeps a v0.22 program
+  computing the same pixels on later versions.
+  - **LAT-1b was DEFERRED on measurement** (the LAT-1a / LAT-2 precedent). The synchronous
+    CUDA-graph capture stall is a **one-time ~72 ms** on the first cook of a graph key
+    (1024², sm_120); the capture key excludes `$param` values, so an interactive scrub
+    captures once and every later frame replays at 0.34 ms. Async capture's real cost is
+    serializing *all* foreground device cooks against the capture window (CUDA capture
+    forbids concurrent device work) — a whole-cook lock through the engine seam and a
+    DO-NOT-TOUCH tier, plus a GPU soak test — which a one-time-per-key stall does not
+    justify. The design + the reopen gate (repeated capture stalls on an interactive path)
+    are in `docs/lat1b-async-graph-capture.md`. Landing it as a mini-design is the
+    roadmap's own §10.1 "design note first for L/XL items" discipline.
 - **v0.24.0**: build order per §6 — ROI-3 lands *flagged off*, ROI-4's oracle lane
   gates the flag flip. Exit: differential ROI fuzz lane green; no ROI cook ships
   wrong pixels silently.

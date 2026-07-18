@@ -78,7 +78,15 @@ def test_c4st_js_loc_ratchet(r: SubTestResult):
     # explicitly temporary — SCHED-1 (roadmap, mid-term) moves fusion detection OUT of
     # the JS into Python (the JS becomes a thin route caller), which will shrink this
     # back below the pre-FUS-1 line; the budget is raised with that plan of record.
-    JS_HARD = 3960
+    # v0.23 (Authoring): +~100 lines across LANG-1 (param-metadata widgets), LANG-2
+    # (debounced live-lint fetch → CM6 setDiagnostics) and LANG-5 (server-backed snippet
+    # store sync). All frontend-facing; the decomposition on-ramp still stands.
+    # v0.23 (LANG-5 data-loss hardening): +~86 lines for the pending-set + non-destructive,
+    # preservation-favoring server-truth merge (a rejected/offline save is retried, not
+    # silently discarded; a transient server read-error no longer wipes the cache) plus the
+    # single-flight POST chain (concurrent whole-map writes land in order). Still
+    # frontend-only; the SCHED-1 decomposition that shrinks this file is unaffected.
+    JS_HARD = 4185
     js = _PKG / "js" / "tex_extension.js"
     if not js.exists():
         r.fail("C4-st JS ratchet", "js/tex_extension.js missing")

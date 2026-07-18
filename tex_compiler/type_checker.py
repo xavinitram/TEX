@@ -113,6 +113,17 @@ class TypeCheckError(Exception):
         )
 
 
+# LANG-2: the built-in variable names pre-populated into the top scope (all FLOAT).
+# A single source so the scope seed and the param-shadow warning (W7003) can't drift.
+# Keep in step with interpreter._TIME_BUILTIN_NAMES for the timeline trio.
+_BUILTIN_VAR_NAMES = frozenset({
+    "ix", "iy", "iw", "ih", "u", "v", "px", "py", "fi", "fn",
+    "PI", "TAU", "E", "ic", "frame", "fps", "time",
+})
+# The {name: FLOAT} top-scope seed, built once at import rather than per check().
+_BUILTIN_VAR_SEED = {n: TEXType.FLOAT for n in _BUILTIN_VAR_NAMES}
+
+
 @dataclass
 class TypeChecker:
     """
@@ -166,13 +177,23 @@ class TypeChecker:
     # with 'const' qualifier so reassignment is rejected per-scope.
     _const_scopes: list[set[str]] = field(default_factory=list)
 
+    # LANG-2: opt-in diagnostic collection for tex_api.check() — a non-raising lint pass.
+    # OFF on the compile path (invariant #7: no warning bookkeeping during a normal cook).
+    _collect_warnings: bool = False
+    warnings: list = field(default_factory=list)            # list[TEXDiagnostic]
+    _used_var_names: set = field(default_factory=set)       # local names read (W7001)
+    _declared_locals: list = field(default_factory=list)    # [(name, loc)] declared (W7001)
+
     @property
     def inferred_out_type(self) -> TEXType | None:
         """Convenience: inferred type for @OUT binding."""
         return self.assigned_bindings.get("OUT")
 
-    def check(self, program: Program) -> dict[int, TEXType]:
-        """Run type checking on a program. Returns a map from AST node id to TEXType."""
+    def _run(self, program: Program) -> dict[int, TEXType]:
+        """Type-check WITHOUT raising: reset state, walk every statement, compute W7xxx
+        warnings (if armed), and materialize a diagnostic for each error. The walk always
+        completes — `_error` only appends. `check()` raises afterwards; `check_collect()`
+        returns. (`_error` never raises, so there is no exception to catch here.)"""
         self._scopes = [{}]
         self._array_scopes = [{}]
         self._types = {}
@@ -183,37 +204,34 @@ class TypeChecker:
         self._user_functions = {}
         self._current_function_return_type = None
         self._const_scopes = [set()]
+        self.warnings = []
+        self._used_var_names = set()
+        self._declared_locals = []
 
-        # Pre-populate built-in variables
-        builtins = {
-            "ix": TEXType.FLOAT, "iy": TEXType.FLOAT,
-            "iw": TEXType.FLOAT, "ih": TEXType.FLOAT,
-            "u": TEXType.FLOAT, "v": TEXType.FLOAT,
-            "px": TEXType.FLOAT, "py": TEXType.FLOAT,
-            "fi": TEXType.FLOAT, "fn": TEXType.FLOAT,
-            "PI": TEXType.FLOAT, "TAU": TEXType.FLOAT,
-            "E": TEXType.FLOAT,
-            "ic": TEXType.FLOAT,
-            # ENG-7 (v0.22): the HOST time context. fi/fn are batch-relative; these are
-            # timeline-absolute (the host's playhead). Fed as builtin VALUES per cook —
-            # never $params, which would churn the lazy memo + fingerprint every frame.
-            # Keep in step with interpreter._TIME_BUILTIN_NAMES (the authoritative set).
-            "frame": TEXType.FLOAT, "fps": TEXType.FLOAT, "time": TEXType.FLOAT,
-        }
-        self._scopes[0].update(builtins)
+        # Pre-populate built-in variables (ix/iy/u/v/…, and ENG-7's timeline trio
+        # frame/fps/time — HOST time fed as builtin VALUES per cook, never $params,
+        # which would churn the lazy memo + fingerprint every frame). All FLOAT.
+        self._scopes[0].update(_BUILTIN_VAR_SEED)
 
         for stmt in program.statements:
             self._check_stmt(stmt)
 
+        if self._collect_warnings:
+            self._compute_warnings()   # W7xxx advisories (opt-in — off on the cook path)
+
+        for e in self.errors:          # no-op on the success path (errors is empty)
+            e._build_diagnostic()
+        return self._types
+
+    def check(self, program: Program) -> dict[int, TEXType]:
+        """Run type checking. Returns node-id → TEXType; raises on the first (or, for
+        several, the aggregated TEXMultiError) error — a contract the cook path depends on."""
+        types = self._run(program)
         if self.errors:
-            for e in self.errors:
-                e._build_diagnostic()
             if len(self.errors) == 1:
                 raise self.errors[0]
-            diagnostics = [e.diagnostic for e in self.errors if e.diagnostic]
-            raise TEXMultiError(diagnostics)
-
-        return self._types
+            raise TEXMultiError([e.diagnostic for e in self.errors if e.diagnostic])
+        return types
 
     def _set_type(self, node: ASTNode, t: TEXType):
         self._types[id(node)] = t
@@ -234,10 +252,11 @@ class TypeChecker:
                            loc, code="E3001",
                            hint=builtin_hint or "Each variable can only be declared once "
                            "per scope. Choose a different name, or assign to the existing one.")
-                return
+                return False   # LANG-2: a rejected redeclaration is NOT a new local decl
             # Lenient (post-optimization re-check): overwrite with the new type.
             # Unrolled loop bodies legitimately redeclare the same local.
         self._scopes[-1][name] = t
+        return True
 
     def _push_scope(self):
         self._scopes.append({})
@@ -274,6 +293,55 @@ class TypeChecker:
             msg, loc, source=self.source, code=code,
             hint=hint, suggestions=suggestions,
         ))
+
+    # -- LANG-2: non-fatal advisories (W7xxx), collected only in check() ----
+
+    def _warn(self, code: str, msg: str, loc: SourceLoc, *, hint: str = ""):
+        """Record a W7xxx warning. No-op unless the lint pass is armed, so a normal
+        cook's type-check does zero warning work (invariant #7)."""
+        if not self._collect_warnings:
+            return
+        self.warnings.append(make_diagnostic(
+            code=code, message=msg, loc=loc, source=self.source,
+            hint=hint, phase="type_checker", severity="warning"))
+
+    def _note_local_decl(self, name: str, loc: SourceLoc):
+        """Register a genuine LOCAL declaration (var/array) for the unused-variable
+        (W7001) and shadow (W7003) checks. Deliberately NOT called for function params
+        or the timeline builtins — those are not 'unused local' candidates."""
+        if not self._collect_warnings:
+            return
+        self._declared_locals.append((name, loc))
+        # W7003 shadow: a local hiding an OUTER-scope name or a builtin (top-of-scope
+        # collisions are already the E3001 error; this catches the nested-scope case).
+        if any(name in s for s in self._scopes[:-1]):
+            self._warn("W7003", f"'{name}' shadows a variable from an outer scope.",
+                       loc, hint="Shadowing is legal but easy to misread; a distinct "
+                       "name avoids the ambiguity.")
+
+    def _compute_warnings(self):
+        """Emit the whole-program W7xxx advisories after the walk (opt-in)."""
+        # W7002 unused input: a wired @input the code never reads (and never writes).
+        for name in self.binding_types:
+            if name not in self.referenced_bindings and name not in self.assigned_bindings:
+                self._warn("W7002", f"Input '@{name}' is connected but never used.",
+                           SourceLoc(1, 1),
+                           hint=f"Reference it with @{name}, or disconnect the wire.")
+        # W7001 unused variable: a declared local that is never read.
+        for name, loc in self._declared_locals:
+            if name not in self._used_var_names:
+                self._warn("W7001", f"Variable '{name}' is declared but never used.",
+                           loc, hint="Remove it, or use it — an unused local is usually "
+                           "a typo or leftover.")
+
+    def check_collect(self, program: Program):
+        """LANG-2: type-check WITHOUT raising, for tex_api.check()/live lint. Returns
+        (error_diagnostics, warning_diagnostics) as two lists of TEXDiagnostic — the same
+        errors check() would raise, plus the W7xxx warnings, in one non-raising pass."""
+        self._collect_warnings = True
+        self._run(program)
+        err_diags = [e.diagnostic for e in self.errors if e.diagnostic is not None]
+        return err_diags, list(self.warnings)
 
     # -- Promotion rules ------------------------------------------------
 
@@ -345,7 +413,8 @@ class TypeChecker:
                     hint=f"The right-hand side produces a {init_type.value}, which doesn't fit into {node.type_name}.",
                 )
 
-        self._declare_var(node.name, declared_type, node.loc)
+        if self._declare_var(node.name, declared_type, node.loc) and self._collect_warnings:
+            self._note_local_decl(node.name, node.loc)   # LANG-2 W7001/W7003 (only if declared)
         self._set_type(node, declared_type)
         if node.is_const:
             self._const_scopes[-1].add(node.name)
@@ -380,7 +449,8 @@ class TypeChecker:
                         hint="Keep array sizes at 1024 or below.")
 
         arr_type = TEXArrayType(element_type=elem_type, size=size)
-        self._declare_var(node.name, TEXType.ARRAY, node.loc)
+        if self._declare_var(node.name, TEXType.ARRAY, node.loc) and self._collect_warnings:
+            self._note_local_decl(node.name, node.loc)   # LANG-2 W7001/W7003 (only if declared)
         self._array_scopes[-1][node.name] = arr_type
         self._set_type(node, TEXType.ARRAY)
         if node.is_const:  # LX-8: forbid reassignment / element writes of a const array
@@ -465,6 +535,15 @@ class TypeChecker:
         """Type-check a parameter declaration: f$strength = 0.5;"""
         # Resolve type from hint (default: FLOAT)
         tex_type = BINDING_HINT_TYPES.get(node.type_hint, TEXType.FLOAT)
+
+        # W7003 (LANG-2): a $param sharing a name with a built-in variable is legal (the
+        # $ sigil keeps `$time` and the `time` builtin distinct) but easy to misread.
+        if self._collect_warnings and node.name in _BUILTIN_VAR_NAMES:
+            self._warn("W7003",
+                       f"Parameter '${node.name}' shares its name with the built-in "
+                       f"'{node.name}'.", node.loc,
+                       hint=f"They stay distinct ($'{node.name}' vs '{node.name}'), but "
+                       "the shared name is easy to confuse — consider renaming the param.")
 
         # Check for @wire / $param name conflict
         if node.name in self.referenced_bindings:
@@ -816,6 +895,8 @@ class TypeChecker:
     def _check_identifier(self, node: Identifier) -> TEXType:
         """Resolve an identifier to its declared variable/builtin type in the current scope."""
         t = self._lookup_var(node.name)
+        if self._collect_warnings and t is not None:
+            self._used_var_names.add(node.name)   # LANG-2: mark the local as read (W7001)
         if t is None:
             # Collect all variables in scope for suggestions
             all_vars = set()

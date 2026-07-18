@@ -249,16 +249,14 @@ Validated by `benchmarks/fusion_splice_test.py` and `benchmarks/fusion_regressio
 
 **Example: adding `saturate(x)` that clamps to [0, 1].**
 
-1. **`tex_runtime/stdlib.py`** -- implement the function (or `tex_runtime/noise.py` for noise functions):
+1. **`tex_runtime/stdlib.py`** -- implement the function (or `tex_runtime/noise.py` for noise functions) and register it with the co-located `@stdlib(...)` decorator (REG-1 — there is no central `get_functions()` dict; it derives from the decorators). `sig=`/`category=` carry the help data (LANG-4), `doc=`/`ex=` the description/example:
 ```python
+@stdlib("saturate", doc="Clamp value to [0,1].", ex="@OUT = vec4(saturate(@A.rgb), 1.0);",
+        sig="saturate(x) → float", category="Math")
 @staticmethod
 def fn_saturate(x):
     """Clamp value to [0, 1] range."""
     return torch.clamp(_to_tensor(x), 0.0, 1.0)
-```
-Register it in `get_functions()`:
-```python
-"saturate": TEXStdlib.fn_saturate,
 ```
 
 2. **`tex_compiler/stdlib_signatures.py`** -- add the type signature:
@@ -282,11 +280,14 @@ if node.name == "saturate":
 ```
 
 **⚠️ 4b. If your function reads NEIGHBOURING pixels or the whole image**
-(sample/fetch/blur/morphology/reduction), you MUST also classify it, or it is
-**silently wrong when the program is tiled** and/or fails CUDA-graph capture:
-- `tex_memory.py` `_NON_LOCAL_FNS` — add it (default is *pixel-local* → wrong output when tiled).
-- `tex_runtime/graphed.py` `_SYNC_STDLIB` — add it if it does an internal `.item()`/sync.
-- `tex_runtime/codegen.py` `_SPATIAL_STDLIB` — add it if codegen should lower it as a stencil.
+(sample/fetch/blur/morphology/reduction), you MUST classify it **in the `@stdlib(...)`
+decorator** — the taxonomy sets DERIVE from the tags (TST-3 fails a mismatch); do NOT
+edit the sets by hand. Leaving a footprint unset is **silently wrong when tiled** and/or
+fails CUDA-graph capture:
+- `footprint=` (ROI-1) — one of `('halo', r)`, `('halo_arg', i)`, `'image'`, `('frame', i)`;
+  derives `tex_memory._NON_LOCAL_FNS` (default `'point'` → wrong output when tiled).
+- `sync=True` — if it does an internal `.item()`/sync (derives `graphed._SYNC_STDLIB`).
+- `spatial=True` — if codegen should lower it as a stencil (derives `codegen._SPATIAL_STDLIB`).
 
 > **Canonical recipe: `AGENTS.md`** (this repo root). The invariants and the full
 > table list live there; keep this section in sync with it.
@@ -609,6 +610,55 @@ across an upgrade. A host that writes one to disk and expects a hit after upgrad
 has stored a number whose whole purpose is to become different. Key your own storage on
 your own identity (the roadmap's CACHE-1 lineage key is the durable one); TEX's cache
 directory is TEX's business, and `TEX_CACHE_DIR` tells it where to live.
+
+## Concurrency & thread-safety (ENG-9)
+
+The written contract for TEX's module-level runtime state. It exists because a
+branch-parallel executor (GRAPH-2) will cook on more than one thread, and finding out
+where that races during the engine build is the expensive way.
+
+**Today's model is single-cook-thread.** Under ComfyUI's one-cook-at-a-time executor
+(and the engine's own default), exactly one thread cooks; the compile worker pool is
+`max_workers=1`. Everything below is written so the single-threaded fast path stays
+**lock-free** — locks guard *inserts*, never reads.
+
+**The interpreter is per-thread, not a process singleton (ENG-9).** `tex_engine._get_interpreter()`
+and `compiled._get_plain_interp()` return a `threading.local` instance. The interpreter
+carries per-instance mutable execution state (the scope stack, `_literal_cache`,
+`_builtins_lru`); a *shared* instance corrupts under concurrent cooks — a two-thread cook
+mixes up programs (proven, then pinned by `test_eng9_two_thread_cpu_cook`). One cook thread
+still gets exactly one instance, so ComfyUI is unchanged. A small locked registry of every
+instance created lets `free_tensor_caches` sweep them all (its clear runs on whatever thread
+called it, which thread-local storage would otherwise miss).
+
+**Cache classification** (the register lives in AGENTS.md / ARCHITECTURE.md; this is the
+concurrency lens on it):
+
+- **Immutable-after-insert (IAI)** — value never mutated once stored; only the LRU
+  container is managed. `_FINGERPRINT_MEMO`, `_tile_safe_memo`, `_peak_static_memo`,
+  `tex_lazy._memo`, `_stencil_route_memo`, `_route_memo`, `_ENV_TENSOR_CACHE`,
+  `_gauss_kernel_cache`, the worley-offset caches, `_AUTO_DECISION`, `_FUSED_MEMO`. A
+  concurrent insert of the same key recomputes the same value (harmless); a racy eviction
+  at worst *over-evicts* (a later recompute). Safe for concurrent CPU cooks under CPython's
+  GIL (verified under eviction pressure). A future non-GIL/free-threaded runtime should
+  lock the insert+evict sequence — never the `get` hit.
+- **Device-keyed** — the device/index is part of the key, so different devices never
+  collide: `_grid_buf`, `_total_mem_cache`, `_last_trim_px`, `_backend_status`,
+  `_compiled_cache`, `_graph_cache` (keys include `dev.index`), the noise tiered caches,
+  `xfer._MODEL`.
+- **Per-worker / lifecycle-coupled** — the per-thread interpreters above, and the
+  `_COMPILE_POOL` background-compile futures (`_bg_futures`) which are owned by the single
+  compile worker.
+- **Mutable-after-insert (MUT) — still single-cook-thread only.** The compile/graph-tier
+  state machines mutate their entries in place and are *not* yet safe for a parallel
+  executor: `autotier._STATE`, `graphed._graph_cache`/`_blacklist`/`_CAPTURING`/`_graph_bytes`,
+  `compiled._verify_state`, `compiled._deferred_ev`. A pure-interpreter CPU cook never
+  touches these; a branch-parallel executor that drives the compile tiers must serialize
+  or shard them (GRAPH-2's work). The single genuine multi-writer today —
+  `_compiled_cache`, written by both the foreground and background compile — is race-free
+  *only* because both run on the one `max_workers=1` worker.
+
+The single existing data lock (`noise._TieredCache._lock`) predates ENG-9 and stays.
 
 ## Rejected design decisions (don't re-propose)
 
