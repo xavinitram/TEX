@@ -188,7 +188,7 @@ the raw fp16 win (~1.35–1.45×) is available, without the safety net, via expe
 (`img_*`, `arr_*`) accumulate in fp32 (an fp16 sum overflows to inf at ≥1024²); an
 out-of-fp16-range literal / a large-value `vec()` also stays fp32 (interp==codegen).
 
-## The 18-cache architecture
+## The 19-cache architecture
 
 Non-redundant by design — each store keys on a different thing (source-hash vs
 `id()`-type_map vs device/precision tuple vs AST-fingerprint vs resolution-bucket)
@@ -204,5 +204,16 @@ compiled cache). #17 (v0.21 ENG-8) is `xfer._MODEL` (transfer-lane → fitted
 latency+bandwidth; persisted to `xfer.json`, versioned by device+torch). #18 (v0.24
 ROI-2) is `tex_roi._walk_memo` (code-hash × fp32 param bits → the spatial footprint walk
 `(reads, blocked, halo)`; shared by `binding_footprints`/`roi_plan`, keyed exactly like
-`tex_lazy._memo` but a distinct analysis). The count here must match AGENTS.md (a DOC-7b
+`tex_lazy._memo` but a distinct analysis). #19 (v0.25 CACHE-2) is `tex_results.ResultCache`
+(lineage-key → cooked frame; RAM byte-budget LRU + disk spill through the pinned-egress helpers,
+frames frozen per ENG-12) — the first **host-instantiated** store in this register rather than a
+module-level singleton, so its lifecycle is the engine host's; CACHE-5's governor will fold its
+byte total into the per-device arbitration. The count here must match AGENTS.md (a DOC-7b
 check enforces it).
+
+Two v0.25 mechanisms touch this register without adding a store: `tex_runtime/warm_state.py`
+(CACHE-3) *persists* three existing in-memory verdicts (graph-capturability, backend probes,
+the compile blacklist) to `warm_state.json` so a relaunch skips re-trialling; and CACHE-4 splits
+the one compiler mono-hash that versioned every artifact into a nested epoch lattice
+(AST ⊑ CODEGEN ⊑ VERDICT), so a codegen-only edit no longer cold-starts the parsed-program
+(`.pkl`) tier. See docs/results-caching.md.

@@ -418,12 +418,14 @@ def test_c2_finiteness_net_recovers(r: SubTestResult):
                       latent_channel_count=0, output_names=["OUT"],
                       used_builtins=prog.used_builtins, eff_precision="fp16", fp=None)
     try:
-        out = _fp16_finiteness_net({"OUT": torch.tensor([float("inf")])}, True, ctx, "default")
+        # v0.25: the net now returns (output_dict, effective_precision) so a re-cook reports the
+        # fp32 it actually cooked at (else CookResult.precision + the CACHE-1 key mislabel fp16).
+        out, prec = _fp16_finiteness_net({"OUT": torch.tensor([float("inf")])}, True, ctx, "default")
     except Exception as e:
         r.fail("F1 crash", f"finiteness net raised {type(e).__name__}: {e} (the F1 NameError)")
         return
     t = out.get("OUT")
-    ok_unit = isinstance(t, torch.Tensor) and bool(torch.isfinite(t).all())
+    ok_unit = isinstance(t, torch.Tensor) and bool(torch.isfinite(t).all()) and prec == "fp32"
 
     # And end-to-end through the REAL execute(): force auto->fp16 on an fp16-OVERFLOWING
     # program (CUDA only — auto is a no-op on CPU); the node must ship finite pixels, not crash.

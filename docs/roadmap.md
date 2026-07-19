@@ -836,8 +836,29 @@ Per-release notes:
     a decoupled gather output grid is **ROI-5**. Cross-frame temporal reads are the batch
     twin of that limitation, also ROI-5-era. The bit-exactness is exact for pointwise +
     integer morphology, ~1 ulp for conv/bilateral (size-dependent kernel dispatch).
-- **v0.25.0**: ENG-12 (ownership) lands first, in the same release, before any
-  frame is cached. Exit: PM-3 dry-run (relaunch cold-start budget measured).
+- **v0.25.0** shipped results as first-class: ENG-12 (the buffer ownership & immutability
+  contract — a cook output is born frozen; a frame cache stores it frozen or version-stamps a
+  normal one and re-verifies at re-entry) landed first, before any frame is cached; CACHE-1
+  (`tex_results.lineage_key` — device/precision mandatory, tensor inputs by upstream key not
+  pixels, env_epoch carries the CACHE-4 codegen epoch); CACHE-2 (`tex_results.ResultCache` — RAM
+  byte-budget + disk spill through the pinned helpers, frames frozen, keyed by CACHE-1, **armed
+  by an engine host, not the ComfyUI node** — the ROI-3 posture); CACHE-3 (`warm_state.json` +
+  `tex_api.prewarm` — the graph-capturability verdict persists so a relaunch skips re-walking the
+  gate; backend probes / blacklists are deliberately not persisted as inert or transient); CACHE-4
+  (the mono-hash split into the nested AST ⊑ CODEGEN ⊑ VERDICT
+  epoch lattice — a codegen-only edit no longer cold-starts the `.pkl` tier). New modules
+  `tex_results.py`, `tex_runtime/warm_state.py`; design in `docs/results-caching.md`.
+  **Exit met — PM-3 dry-run measured:** on the sm_120 box, relaunching a 100-program project
+  against a prewarmed cache cooks all 100 first-frames in ~116 ms (vs ~226 ms cold/empty — the
+  persisted `.pkl`/`.cg` + warm_state roughly halve the project warm cost), with a to-first-frame
+  cook of ~13 ms; the ~4 s of wall-clock is torch's own import, a fixed host constant identical
+  warm-or-cold and outside TEX's budget. Well under the 2 s TEX-side target, no re-trial jank.
+- The default ComfyUI cook path is byte-identical (invariant #7): no watched compiler/runtime
+  file was touched, so existing program disk caches survive the upgrade apart from the one-time
+  CACHE-4 version-format reset; the lineage attach is gated on `want_lineage` (off by default),
+  the epoch split runs once at import, and the warm-state hooks live only on the compile/graph
+  tiers. The frame-cache flag flip to on-under-ComfyUI is a later release, gated on a host that
+  owns its downstream consumers (ENG-12) + GRAPH-1's demand signal.
 - **v0.26.0**: needs LANG-1/LANG-3 (v0.23) and FUS-1 (v0.21) — all satisfied.
   TOOL-5's threat-model note gates the install flow. Exit: a `.textool` round-trips
   author → publish → fresh-install → cook, bit-identical to the unfused graph.

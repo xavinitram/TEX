@@ -142,7 +142,9 @@ _BLACKLIST_MAX = 256
 
 
 def _blacklist_add(fp: str) -> None:
-    """Record a fingerprint that crashed torch.compile, bounding total size."""
+    """Record a fingerprint that crashed torch.compile, bounding total size. Session-scoped: the
+    compile blacklist is deliberately NOT persisted (a transient runtime/OOM crash must not harden
+    into a permanent cross-launch demotion — see warm_state.py)."""
     _compile_blacklist[fp] = None
     _compile_blacklist.move_to_end(fp)
     while len(_compile_blacklist) > _BLACKLIST_MAX:
@@ -389,11 +391,12 @@ def _ensure_inductor_cache_dir() -> None:
     if "TORCHINDUCTOR_CACHE_DIR" in os.environ:
         return
     try:
-        from ..tex_cache import get_cache, _CACHE_VERSION
-        # Version the dir by cache-version + torch build so a TEX or torch
-        # upgrade starts from a clean inductor/dynamo store (PC-2). The parent
-        # torch_compile/ is still what clear_all() removes.
-        ver = f"{_CACHE_VERSION}_{torch.__version__.split('+')[0].replace('.', '')}"
+        from ..tex_cache import get_cache, codegen_epoch
+        # Version the dir by the CACHE-4 codegen epoch + torch build so a codegen or torch upgrade
+        # starts from a clean inductor/dynamo store (PC-2). The codegen epoch nests the AST epoch,
+        # so an AST-file edit bumps it too — as it must, since emitted code changes when the AST
+        # does. The parent torch_compile/ is still what clear_all() removes.
+        ver = f"{codegen_epoch()}_{torch.__version__.split('+')[0].replace('.', '')}"
         parent = get_cache().torch_compile_cache_dir
         tc_dir = str(parent / ver)
         os.makedirs(tc_dir, exist_ok=True)

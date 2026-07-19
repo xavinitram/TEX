@@ -34,40 +34,98 @@ from .tex_runtime.interpreter import _collect_identifiers
 logger = logging.getLogger("TEX")
 
 
-def _compute_compiler_hash() -> str:
-    """Hash all compiler/runtime source files to auto-invalidate disk cache on code changes."""
-    pkg_dir = Path(__file__).parent
-    source_files = sorted([
-        pkg_dir / "tex_compiler" / "ast_nodes.py",
-        pkg_dir / "tex_compiler" / "lexer.py",
-        pkg_dir / "tex_compiler" / "parser.py",
-        pkg_dir / "tex_compiler" / "type_checker.py",
-        pkg_dir / "tex_compiler" / "optimizer.py",
-        pkg_dir / "tex_compiler" / "stdlib_signatures.py",
-        pkg_dir / "tex_runtime" / "interpreter.py",
-        pkg_dir / "tex_runtime" / "codegen.py",
-        pkg_dir / "tex_runtime" / "codegen_stdfns.py",
-        pkg_dir / "tex_runtime" / "stdlib.py",
-        pkg_dir / "tex_runtime" / "noise.py",
-        # CT-1: fused programs are now persisted, so a splicer change must
-        # invalidate their disk entries too.
-        pkg_dir / "tex_fusion.py",
-    ])
+# CACHE-4: LAYERED CACHE EPOCHS. A single mono-hash over every source file cold-started every
+# artifact on any edit — a comment-only stdlib change threw away the parsed-program (.pkl) tier
+# for every user (fatal at monthly app-update cadence). The invalidation is split into a NESTED
+# lattice, each epoch gating exactly the artifacts a change to its files can affect:
+#
+#   AST_EPOCH      parse/typecheck/optimize files          -> the compiled-program .pkl tier
+#   CODEGEN_EPOCH  = H(AST_EPOCH, codegen/interpreter files, cgreuse) -> .cg sidecars + inductor
+#   VERDICT_EPOCH  = H(CODEGEN_EPOCH, tier-policy files)     -> autotier.json + warm_state.json
+#
+# The nesting is load-bearing: a .cg blob is emitted FROM the compiled program, so it depends on
+# the AST pipeline as well as the codegen files — CODEGEN_EPOCH folds AST_EPOCH in, or an
+# AST-file edit would leave a stale .cg passing its version check (codegen drifting from the
+# interpreter). THE WIN: a codegen-only edit bumps CODEGEN_EPOCH (invalidating .cg + verdicts)
+# while AST_EPOCH is unchanged, so the parse/typecheck/optimize .pkl SURVIVES. The full mono-hash
+# is DEMOTED to a completeness tripwire (test_v025_phase1: the partition file-sets must union to
+# the watched set and AST/CODEGEN must be disjoint) plus a fail-safe oracle spot-check, so a
+# watched file can never silently fall out of every epoch.
+_C_DIR = Path(__file__).parent / "tex_compiler"
+_R_DIR = Path(__file__).parent / "tex_runtime"
+# AST pipeline — a change alters the parsed/optimized program (the .pkl).
+_AST_FILES = [_C_DIR / "ast_nodes.py", _C_DIR / "lexer.py", _C_DIR / "parser.py",
+              _C_DIR / "type_checker.py", _C_DIR / "optimizer.py",
+              _C_DIR / "stdlib_signatures.py"]
+# Codegen / interpreter — a change alters emitted code or interpreter semantics (the .cg).
+# CT-1: tex_fusion is here — a splicer change must invalidate fused .cg entries too.
+_CODEGEN_FILES = [_R_DIR / "interpreter.py", _R_DIR / "codegen.py", _R_DIR / "codegen_stdfns.py",
+                  _R_DIR / "stdlib.py", _R_DIR / "noise.py", Path(__file__).parent / "tex_fusion.py"]
+# Tier-policy — a change moves a measured win/lose verdict (autotier.json / warm_state.json).
+# NEW under CACHE-4: previously a compiled.py tiering change kept stale verdicts.
+_VERDICT_FILES = [_R_DIR / "precision_policy.py", _R_DIR / "autotier.py",
+                  _R_DIR / "compiled.py", _R_DIR / "graphed.py"]
+
+
+def _hash_files(files, *extra: bytes) -> str:
+    """SHA-256 (16 hex) over a set of source files (missing → hash the name) plus any extra
+    byte fragments. The building block of every epoch and the mono-hash tripwire."""
     h = hashlib.sha256()
-    for p in source_files:
+    for p in sorted(files, key=lambda x: x.name):
         try:
             h.update(p.read_bytes())
         except FileNotFoundError:
             h.update(p.name.encode())
-    # M-5: the out= reuse kill switch changes generated code without changing any
-    # source file, so fold it in — else a persisted .cg blob emitted with reuse ON
-    # is served after the flag is toggled OFF (and vice-versa).
-    h.update(b"cgreuse:" + os.environ.get("TEX_CODEGEN_NO_OUT_REUSE", "").encode())
+    for e in extra:
+        h.update(e)
     return h.hexdigest()[:16]
 
 
-# Auto-computed from compiler/runtime source files — any code change invalidates disk cache.
-_CACHE_VERSION = _compute_compiler_hash()
+_AST_EPOCH = _hash_files(_AST_FILES)
+# M-5: the out= reuse kill switch changes emitted code without touching a file, so fold it into
+# the codegen epoch — else a persisted .cg emitted with reuse ON is served after it toggles OFF.
+_CODEGEN_EPOCH = _hash_files(
+    _CODEGEN_FILES, b"ast:" + _AST_EPOCH.encode(),
+    b"cgreuse:" + os.environ.get("TEX_CODEGEN_NO_OUT_REUSE", "").encode())
+_VERDICT_EPOCH = _hash_files(_VERDICT_FILES, b"cg:" + _CODEGEN_EPOCH.encode())
+
+
+def ast_epoch() -> str:
+    """CACHE-4: the epoch gating the compiled-program (.pkl) tier — parse/typecheck/optimize."""
+    return _AST_EPOCH
+
+
+def codegen_epoch() -> str:
+    """CACHE-4: the epoch gating codegen .cg sidecars + the inductor dir (nests AST_EPOCH). Also
+    the code-identity component of a CACHE-1 result key (tex_results.env_epoch)."""
+    return _CODEGEN_EPOCH
+
+
+def verdict_epoch() -> str:
+    """CACHE-4: the epoch gating measured tier verdicts (autotier.json / warm_state.json)."""
+    return _VERDICT_EPOCH
+
+
+def epoch_partitions() -> dict:
+    """The three epoch file-sets, for the CACHE-4 completeness tripwire (a test asserts they
+    union to the watched set and that AST/CODEGEN are disjoint)."""
+    return {"ast": list(_AST_FILES), "codegen": list(_CODEGEN_FILES),
+            "verdict": list(_VERDICT_FILES)}
+
+
+def _compute_compiler_hash() -> str:
+    """The full mono-hash over every AST + codegen watched file. Under CACHE-4 NO artifact keys on
+    it anymore (the specific epochs do; `_CACHE_VERSION` now merely aliases `_CODEGEN_EPOCH`). It
+    survives only so a test can hash the watched set — the completeness tripwire itself lives in
+    tests/test_v025_phase1 (it asserts the AST/CODEGEN partitions union to the watched set and are
+    disjoint), not in this function."""
+    return _hash_files(_AST_FILES + _CODEGEN_FILES,
+                       b"cgreuse:" + os.environ.get("TEX_CODEGEN_NO_OUT_REUSE", "").encode())
+
+
+# Back-compat: a few call sites / external hosts still import _CACHE_VERSION. It now aliases the
+# codegen epoch (the broadest program-identity code hash); artifact keys use the specific epochs.
+_CACHE_VERSION = _CODEGEN_EPOCH
 
 # Limits
 _MEMORY_MAX_ENTRIES = 128
@@ -326,7 +384,7 @@ class TEXCache:
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
             data = {
-                "version": _CACHE_VERSION,
+                "version": _AST_EPOCH,          # CACHE-4: .pkl gated by the AST epoch only
                 "program": program,
                 "binding_types": {k: v.value for k, v in binding_types.items()},
                 "timestamp": time.time(),
@@ -347,8 +405,8 @@ class TEXCache:
             with open(path, "rb") as f:
                 data = pickle.load(f)
 
-            # Version check — stale entries are deleted
-            if data.get("version") != _CACHE_VERSION:
+            # Version check — stale entries are deleted (CACHE-4: AST epoch gates the .pkl)
+            if data.get("version") != _AST_EPOCH:
                 path.unlink(missing_ok=True)
                 return None
 
@@ -491,7 +549,7 @@ class TEXCache:
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
             data = {
-                "version": _CACHE_VERSION,
+                "version": _CODEGEN_EPOCH,      # CACHE-4: .cg gated by the codegen epoch
                 "magic": _BYTECODE_MAGIC,
                 "unsupported": unsupported,
                 "blob": blob,
@@ -516,7 +574,7 @@ class TEXCache:
         try:
             with open(path, "rb") as f:
                 data = pickle.load(f)
-            if (data.get("version") != _CACHE_VERSION
+            if (data.get("version") != _CODEGEN_EPOCH
                     or data.get("magic") != _BYTECODE_MAGIC):
                 path.unlink(missing_ok=True)
                 return None

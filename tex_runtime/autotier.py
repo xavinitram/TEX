@@ -160,9 +160,9 @@ def _persist_path() -> str | None:
 
 def _version_tag() -> str:
     try:
-        from ..tex_cache import _CACHE_VERSION
+        from ..tex_cache import verdict_epoch   # CACHE-4: verdicts gated by the verdict epoch
         import torch
-        return f"{_CACHE_VERSION}_{torch.__version__.split('+')[0]}"
+        return f"{verdict_epoch()}_{torch.__version__.split('+')[0]}"
     except Exception:
         return "0"
 

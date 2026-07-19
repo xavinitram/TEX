@@ -211,7 +211,7 @@ compile_and_run(code, bindings)
 
 **Disk cache**: Pickle files in `.tex_cache/` directory (512 max). Stores `(program_ast, binding_types, cache_version)`. On load, the TypeChecker must re-run because `type_map` keys are `id()` values that change between sessions.
 
-**Cache version** (`_CACHE_VERSION`): Bumped when AST structure or type checker changes would make existing `.pkl` files invalid. Causes graceful cache miss, not crash.
+**Cache version (CACHE-4 layered epochs)**: as of v0.25 the one mono-hash is split into a nested epoch lattice — `AST_EPOCH` gates the `.pkl` (parse/typecheck/optimize files), `CODEGEN_EPOCH = H(AST_EPOCH, codegen/interpreter files, cgreuse)` gates the `.cg` sidecars + inductor dir, `VERDICT_EPOCH = H(CODEGEN_EPOCH, tier-policy files)` gates `autotier.json`/`warm_state.json`. A codegen-only edit no longer cold-starts the `.pkl` tier. `_CACHE_VERSION` remains as a back-compat alias of `codegen_epoch()`; the full mono-hash is demoted to a completeness tripwire. All still cause a graceful cache miss, not a crash. See `docs/results-caching.md`.
 
 ## String vs Tensor Execution
 
@@ -702,3 +702,22 @@ Recorded by the compositor-engine roadmap (`docs/roadmap.md` §7 is the provenan
 - **A recursive pull executor with per-node locking** — the Natron post-mortem (its own
   developers cite engine race conditions as what killed it). Plan lazily (demand, ROI,
   frame ranges), then compile the resolved cook into a static push plan.
+
+Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance):
+- **Enabling the frame cache (CACHE-2) under the ComfyUI node** — the ComfyUI host already
+  caches every node's output, so a second TEX-owned frame cache under it only doubles the
+  memory for no reuse it doesn't already have. `ResultCache` is host-instantiated and armed
+  by an engine host; the flip to on-under-ComfyUI needs a host that owns its downstream
+  consumers (ownership guaranteed, not hoped — ENG-12) *and* a demand signal a node graph
+  can't answer more cheaply, i.e. GRAPH-1's version counters.
+- **Persisting the runtime CUDA-graph capture blacklist (CACHE-3)** — the *capturability*
+  verdict (a deterministic function of the program AST + arch) IS persisted; the runtime
+  *capture-failed* blacklist is not. Its key is a shape/driver-specific opaque capture
+  signature, and a transient failure (a one-off memory-pressure/OOM during capture) must not
+  harden into a permanent cross-restart "never capture this" verdict — the capturability memo
+  already keeps the expensive path away from the programs that genuinely can't capture.
+- **Content-hashing tensors for cache REUSE (CACHE-1)** — the sampling hash
+  (`tensor_fingerprint`) stays only for ComfyUI's `IS_CHANGED` cache-*busting* (a false
+  "changed" just recooks). A result cache keys on a *lineage* key (the cook that produced a
+  frame), never re-sampling its pixels: the sampling hash has an admitted collision class that
+  is harmless for busting and a silent stale-serve for reuse.

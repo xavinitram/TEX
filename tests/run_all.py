@@ -580,6 +580,49 @@ def main():
     test_roi6_batch_strip_equivalence(r)
     test_roi6_fi_seam_exact(r)
 
+    # v0.25.0 Phase 1 — "Remember frames" (ENG-12 ownership, CACHE-1 lineage keys,
+    # CACHE-2 frame cache, CACHE-3 warm state/prewarm, CACHE-4 layered epochs)
+    from test_v025_phase1 import (
+        test_eng12_output_is_born_frozen,
+        test_eng12_two_strata,
+        test_eng12_frozen_frame_reenters_scatter,
+        test_cache1_key_construction,
+        test_cache1_not_a_content_hash,
+        test_cache1_engine_integration,
+        test_cache1_playhead_keys,
+        test_cache1_precision_and_batch,
+        test_cache1_pixel_moving_flags,
+        test_cache2_hit_is_bit_exact,
+        test_cache2_spill_restore_bit_exact,
+        test_cache2_verify_drop_and_replace,
+        test_cache3_warm_state_roundtrip,
+        test_cache3_version_tag_guard,
+        test_cache3_prewarm,
+        test_cache4_epoch_tripwire,
+        test_cache4_layering,
+        test_cache4_codegen_edit_spares_pkl,
+        test_cache4_failsafe_oracle,
+    )
+    test_eng12_output_is_born_frozen(r)
+    test_eng12_two_strata(r)
+    test_eng12_frozen_frame_reenters_scatter(r)
+    test_cache1_key_construction(r)
+    test_cache1_not_a_content_hash(r)
+    test_cache1_engine_integration(r)
+    test_cache1_playhead_keys(r)
+    test_cache1_precision_and_batch(r)
+    test_cache1_pixel_moving_flags(r)
+    test_cache2_hit_is_bit_exact(r)
+    test_cache2_spill_restore_bit_exact(r)
+    test_cache2_verify_drop_and_replace(r)
+    test_cache3_warm_state_roundtrip(r)
+    test_cache3_version_tag_guard(r)
+    test_cache3_prewarm(r)
+    test_cache4_epoch_tripwire(r)
+    test_cache4_layering(r)
+    test_cache4_codegen_edit_spares_pkl(r)
+    test_cache4_failsafe_oracle(r)
+
     success = r.summary()
     return 0 if success else 1
 

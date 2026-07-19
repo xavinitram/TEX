@@ -226,6 +226,13 @@ class CookPlan:
     # PROVABLY materializes downstream passes False to skip the clone — today that is
     # exactly one caller, `tex_node`, whose egress clamp allocates anyway. See `prepare()`.
     disown: bool = True
+    # CACHE-1: when True, run() attaches a per-output lineage key to the CookResult (the
+    # identity a frame cache keys on). Off by default so the ComfyUI cook path is untouched
+    # (invariant #7). `upstream_keys` are the lineage keys of this cook's tensor inputs,
+    # supplied by a graph host that tracks them (empty under ComfyUI — no TEX-internal
+    # upstream edge yet).
+    want_lineage: bool = False
+    upstream_keys: tuple = ()
 
     @property
     def fused_chain(self) -> bool:
@@ -246,6 +253,10 @@ class CookResult:
     precision: str                 # the EFFECTIVE precision this cook ran at
     binding_names: list            # effective bindings (merged, on a fused chain)
     near_singularities: int | None = None   # C4-ux, only when the debug toggle is on
+    # CACHE-1: {output_name: lineage_key} — the identity of each cooked frame, or None
+    # unless the caller asked for it (prepare(want_lineage=True)). Off the default path so a
+    # ComfyUI cook, which has no result cache to key, never pays for it (invariant #7).
+    lineage: dict | None = None
 
 
 # ── ENG-6: zero-copy AI handoff (DLPack) ─────────────────────────────────────
@@ -305,6 +316,78 @@ def from_dlpack(capsule):
     shares its memory (ENG-6). The inverse of `to_dlpack`."""
     import torch.utils.dlpack as _dl
     return _dl.from_dlpack(capsule)
+
+
+# ── ENG-12: buffer ownership & immutability contract ─────────────────────────
+# WHO MAY WRITE A COOKED TENSOR AFTER IT IS PRODUCED. Undefined write discipline is the
+# bug class that killed Natron's engine, so it lands BEFORE any frame is cached (CACHE-2)
+# and every later cross-owner edge (GRAPH-2 threads, XPU-2 frame handles) inherits it.
+#
+# FROZEN IS A SIGNAL, NOT A FENCE. A cook output is usually born an *inference tensor* (the
+# interpreter and compiled tiers run under torch.inference_mode()), and torch RAISES on an in-place
+# op on one — BUT that raise is not a rollback: on torch 2.12 (verified, CPU + CUDA) the in-place op
+# LANDS THE WRITE and *then* raises. So a frozen frame handed straight back to a consumer that does
+# `frame.clamp_(...)` is silently corrupted (the write took) even though the op "failed", and a
+# version stamp can't catch it (frame_version of an inference tensor is a constant 0). Freezing is
+# therefore a loud tripwire for a cache-INTERNAL mistake, never a guarantee against a CONSUMER write.
+# (This is also why the born-frozen floor is not universal anyway: the cuda_graph replay hands back
+# a normal .clone(), the debug paint a normal tensor.)
+#
+# THE CACHE CONTRACT (CACHE-2) — the real guarantee is COPY-ON-READ, mirroring to_dlpack(copy=True):
+#   * put() stores the frame frozen (the canonical master — freezing keeps the cache's own code from
+#     scribbling it, and torch's raise surfaces such a bug loudly).
+#   * get()/_restore return an OWNED COPY by default (frame.clone() — a normal, mutable, independent
+#     buffer), so a consumer's in-place write can never reach the stored master. copy=False is the
+#     opt-in fast path for a read-only consumer that promises not to mutate (same posture as
+#     to_dlpack(copy=False) / a `.data` alias — the caller opting out, not a hole).
+#   * verify_unmutated (stratum 2, torch's t._version) is a live defense only for a NORMAL
+#     (host-supplied, non-frozen) entry — a bumped counter drops it; it is inert for a frozen master
+#     (which is why copy-on-read, not the version stamp, is what protects that master).
+# _disown_inputs (input-alias net) and to_dlpack's copy=True default uphold the same ownership at
+# egress.
+#
+# M-5 out= reuse (codegen, a DO-NOT-TOUCH) can NEVER target a cached frame: its reuse set is
+# codegen _tN arithmetic temps only — never a binding — and a cached frame can only re-enter
+# a cook AS an input binding. The one residual write into a binding, a scatter, is already
+# COW-guarded (interpreter _scatter_owned / codegen _scat_owned: clone-before-first-write).
+# See docs/results-caching.md and the AGENTS.md DO-NOT-TOUCH register.
+
+def is_frozen(t) -> bool:
+    """True if `t` is an inference tensor — one torch RAISES on for an in-place op. Note that on
+    torch 2.12 the raise does not roll back the write (the op lands, then raises), so "frozen" is a
+    loud tripwire, not a write fence; CACHE-2's actual consumer-facing guarantee is copy-on-read."""
+    return isinstance(t, torch.Tensor) and t.is_inference()
+
+
+def frame_version(t) -> int:
+    """ENG-12 version stamp: torch's in-place mutation counter `t._version` for a normal tensor,
+    else a constant 0 for a frozen (inference) tensor — reading _version on one would itself raise.
+    Mirrors stdlib._safe_version. Because it is constant for a frozen tensor, verify_unmutated is a
+    live mutation-detector only for NORMAL entries (a frozen master is protected by copy-on-read)."""
+    return 0 if (not isinstance(t, torch.Tensor) or t.is_inference()) else t._version
+
+
+def verify_unmutated(t, stamp) -> bool:
+    """ENG-12 re-entry check: True iff `t`'s in-place mutation counter is unchanged since `stamp`.
+    A live detector for a NORMAL entry (a bumped counter -> drop it); always True for a frozen
+    master (stamp is a constant 0), which the cache protects by copy-on-read instead."""
+    return frame_version(t) == stamp
+
+
+def frozen_copy(t):
+    """An immutable (inference-flagged) copy of `t`: any in-place write to the RESULT raises.
+    Made inside inference_mode so the clone carries the inference flag even when `t` is a
+    normal tensor — the exact inverse of _owned_copy (which strips the flag for autograd).
+    Use to store a tamper-PROOF frame when the source is a normal (mutable) buffer."""
+    with torch.inference_mode():
+        return t.clone()
+
+
+def freeze(t):
+    """Idempotent hard-freeze: return `t` unchanged if it is already frozen (immutable),
+    else a frozen_copy. The one call a frame cache uses to guarantee an entry cannot be
+    written through, whatever the provenance of the tensor handed to it."""
+    return t if is_frozen(t) else frozen_copy(t)
 
 
 # ── Debug overlays (DBG-3 magenta NaN, C4-ux cyan near-singularity) ──────────
@@ -534,7 +617,8 @@ def _fp16_finiteness_net(raw_output, auto_fp16, ctx, tier_id, auto_ckey=None):
     (the case the static gate can't rule out — a blind spot, or a pow going
     negative). On non-finite: discard the fp16 probes, re-cook fp32, and PIN the
     auto decision to fp32 so the program skips fp16 for all future inputs. Returns
-    the (possibly re-cooked) output dict; a no-op when the cook wasn't auto->fp16.
+    `(output_dict, effective_precision)`; a no-op (returning the original precision) when the
+    cook wasn't auto->fp16 or stayed finite.
 
     `auto_ckey` is the memo key prepare() actually LOOKED UP, handed over rather than
     rebuilt here. Rebuilding it is what broke the pin: v0.22's B3 fix added compile_mode to
@@ -543,11 +627,16 @@ def _fp16_finiteness_net(raw_output, auto_fp16, ctx, tier_id, auto_ckey=None):
     because nothing about correctness depends on it (the net re-runs every cook), only the
     cost: every such program double-cooks forever. Passing the key deletes the second
     construction site rather than re-synchronising it."""
+    # Returns (raw_output, effective_precision): the SECOND element is the precision the
+    # returned frame was ACTUALLY cooked at — "fp32" when the net re-cooked, else the original
+    # eff_precision. The caller stamps CookResult.precision AND the lineage key from it, or a
+    # re-cooked-fp32 frame would be mislabelled fp16 and keyed under fp16 (a false cache miss
+    # against the auto-pinned-fp32 cook of the same inputs, and a lie to a host reading .precision).
     if not (auto_fp16 and ctx.eff_precision == "fp16"):
-        return raw_output
+        return raw_output, ctx.eff_precision
     if not any(isinstance(v, torch.Tensor) and not torch.isfinite(v).all()
                for v in raw_output.values()):
-        return raw_output
+        return raw_output, ctx.eff_precision
     # F1 fix: tier_trace is imported function-locally per method (the SCC convention);
     # the C1-st extraction moved this block out of execute() without carrying the import,
     # so the recovery path NameError-crashed exactly when auto-fp16 overflowed.
@@ -556,7 +645,7 @@ def _fp16_finiteness_net(raw_output, auto_fp16, ctx, tier_id, auto_ckey=None):
     tier_trace.record_precision("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
     if auto_ckey is not None:
         _AUTO_DECISION[auto_ckey] = ("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
-    return _run_tier(replace(ctx, eff_precision="fp32"), tier_id)
+    return _run_tier(replace(ctx, eff_precision="fp32"), tier_id), "fp32"
 
 
 # ── Memory planning ──────────────────────────────────────────────────────────
@@ -709,7 +798,8 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             latent_channel_count: int = 0, forgive_dead_refs: bool = False,
             debug_nan_highlight: bool = False, time_context: dict | None = None,
             max_outputs: int = MAX_OUTPUTS, disown: bool = True,
-            roi: tuple | None = None) -> CookPlan:
+            roi: tuple | None = None, want_lineage: bool = False,
+            upstream_keys: tuple = ()) -> CookPlan:
     """Resolve everything a cook needs *without running it*: compile (or splice a fused
     chain), resolve the device, gate the outputs and references, fold params, resolve
     `precision="auto"`, and select the tier.
@@ -746,6 +836,14 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     # The `auto`-resolved twin of this rule is in the precision block further down.
     if precision == "fp16" and compile_mode != "none":
         precision = "fp32"
+    # CACHE-1: the interpreter reads the playhead by duck-typing (`time_context.get(name)`, any
+    # Mapping), but the lineage keyer type-checks it — so a Mapping-but-not-dict playhead (a
+    # MappingProxyType read-only view a host might hand out) would drive the pixels yet fall out
+    # of the key, a silent stale serve. Normalize to a plain dict ONCE here so both consumers see
+    # the same object. (The ComfyUI adapter already passes a plain dict or None.)
+    if time_context is not None and not isinstance(time_context, dict) \
+            and hasattr(time_context, "items"):
+        time_context = dict(time_context)
     fused_chain = False
     fused_fp = None
     # LAT-2: the program fingerprint, hoisted above the M-1 preflight so it can memoize its
@@ -945,7 +1043,8 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
                       free_hint, roi_out, roi_plan_obj)  # ROI-3 window + plan (None unless armed)
     return CookPlan(ctx=ctx, tier_id=tier_id, assigned=assigned_bindings,
                     auto_fp16=auto_fp16, debug_nan_highlight=debug_nan_highlight,
-                    cook_px=cook_px, auto_ckey=auto_ckey, disown=disown)
+                    cook_px=cook_px, auto_ckey=auto_ckey, disown=disown,
+                    want_lineage=want_lineage, upstream_keys=tuple(upstream_keys))
 
 
 def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
@@ -1076,6 +1175,68 @@ def _disown_inputs(raw_output: dict, bindings: dict) -> dict:
         return raw_output   # ownership is a safety net; it must never fail a cook
 
 
+def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
+                     raw_output: dict) -> dict | None:
+    """CACHE-1: per-output lineage keys for this cook — the identity a frame cache keys on.
+    Only reached when a caller asked (plan.want_lineage), so the deferred import and the
+    walk stay entirely off the default ComfyUI cook path (invariant #7).
+
+    program_fp is the fused fingerprint on a chain, else the single-program fp; params are
+    the non-tensor bindings (widget $params) by value; a tensor input contributes its UPSTREAM
+    lineage key (plan.upstream_keys), never its pixels; `eff_precision` is the precision the
+    frame was ACTUALLY cooked at (fp32 if the finiteness net re-cooked). Each output is keyed by
+    its OWN produced-frame shape (batch + every dim, so a batch-N or a BCHW-latent cook can't
+    collide with a batch-1/BHWC one — the old (W,H)-from-an-input canvas dropped batch and read
+    H as W for latents) plus the ROI rect. Best-effort: a keying failure returns None rather
+    than failing the cook."""
+    try:
+        from . import tex_results
+        program_fp = ctx.fused_fp or ctx.fp
+        if program_fp is None:
+            return None
+        params = {n: v for n, v in ctx.bindings.items() if not isinstance(v, torch.Tensor)}
+        # The WHOLE playhead keys, not just `frame`: `time`/`fps` move the output pixels too
+        # (ENG-7's _TIME_BUILTIN_NAMES), so a time- or fps-animation is a distinct result at the
+        # same frame — keying only `frame` would serve a stale frame. Duck-type the Mapping the
+        # SAME way the interpreter does (prepare() already normalizes to a dict, but a directly
+        # built ExecContext must not slip a Mapping-but-not-dict playhead past the key).
+        tc = dict(ctx.time_context) if hasattr(ctx.time_context, "items") else None
+        roi_rect = list(ctx.roi) if ctx.roi is not None else None
+        # Cook-invariant flags that MOVE PIXELS but are neither bindings nor shape — so they
+        # would otherwise fall out of the key and silent-serve a stale frame across a toggle:
+        #   * debug_nan_highlight paints magenta/cyan overlays onto raw_output BEFORE this keys
+        #     it (run() reassigns raw_output at the DBG-3/C4-ux block) — the node cache already
+        #     folds this toggle in for the same reason (tex_node.fingerprint_inputs).
+        #   * latent_channel_count materializes the program-readable `ic` builtin (interpreter/
+        #     compiled env), so a program reading `ic` produces channel-count-dependent pixels
+        #     even when the OUTPUT shape is channel-count-independent — graphed._capture_key
+        #     already folds it into the CUDA-graph capture key for exactly this reason.
+        base_flags = []
+        if plan.debug_nan_highlight:
+            base_flags.append("dbg:nan")
+        if ctx.latent_channel_count:
+            base_flags.append(f"ic:{int(ctx.latent_channel_count)}")
+        out = {}
+        for name in ctx.output_names:
+            t = raw_output.get(name)
+            shape = list(t.shape) if isinstance(t, torch.Tensor) else None
+            # Key the device by the produced FRAME's concrete device, not ctx.device: device_mode
+            # "cuda" resolves to the bare string "cuda" (no index), which would collide cuda:0 and
+            # cuda:1 on a multi-GPU host — a cross-device wrong-pixel serve, violating the key's
+            # own MANDATORY-device guarantee. The output tensor carries the real index (cuda:0).
+            dev = str(t.device) if isinstance(t, torch.Tensor) else str(ctx.device)
+            # canvas = the PRODUCED frame's full shape + the ROI rect (so two same-size
+            # sub-windows at different offsets, or two different batch sizes, key apart).
+            canvas = {"shape": shape, "roi": roi_rect}
+            out[name] = tex_results.lineage_key(
+                program_fp=program_fp, device=dev, precision=eff_precision,
+                params=params, upstream=plan.upstream_keys, time_context=tc,
+                canvas=canvas, flags=(*base_flags, f"out:{name}"))
+        return out
+    except Exception:
+        return None
+
+
 def run(plan: CookPlan) -> CookResult:
     """Execute a prepared plan: dispatch to the tier, apply the fp16 finiteness net and
     the debug overlays, enforce the cache budgets. Returns RAW outputs (no host egress
@@ -1095,8 +1256,8 @@ def run(plan: CookPlan) -> CookResult:
     # PR-LP2 safety net (C2): re-cook fp32 (and pin the auto decision) if an
     # auto->fp16 cook went non-finite. Extracted to a helper (C1-st) so the cook
     # stays within its per-function line budget and can't silently re-inline.
-    raw_output = _fp16_finiteness_net(raw_output, plan.auto_fp16, ctx, plan.tier_id,
-                                      plan.auto_ckey)
+    raw_output, eff_precision = _fp16_finiteness_net(raw_output, plan.auto_fp16, ctx,
+                                                     plan.tier_id, plan.auto_ckey)
 
     # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
     # oldest mip/grid entries; allocate-and-hold semantics untouched).
@@ -1130,10 +1291,17 @@ def run(plan: CookPlan) -> CookResult:
         near_sing = guard_trace.count()   # read BEFORE the disarm below
         guard_trace.disarm()
 
+    # CACHE-1: attach per-output lineage keys when the caller asked (a frame cache / graph
+    # host). Off the default path — computed only under plan.want_lineage. `eff_precision` is
+    # the precision the frame was ACTUALLY cooked at (fp32 if the finiteness net re-cooked), so
+    # the key and CookResult.precision match the pixels.
+    lineage = _compute_lineage(plan, ctx, eff_precision, raw_output) if plan.want_lineage else None
+
     return CookResult(
         outputs=raw_output, output_names=ctx.output_names, assigned=plan.assigned,
-        device=ctx.device, precision=ctx.eff_precision,
+        device=ctx.device, precision=eff_precision,
         binding_names=list(ctx.bindings.keys()), near_singularities=near_sing,
+        lineage=lineage,
     )
 
 

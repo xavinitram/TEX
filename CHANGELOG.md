@@ -5,6 +5,165 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] - 2026-07-19
+
+**Remember frames** — results become first-class. TEX persisted *programs* superbly and
+*results* not at all; the standalone engine shipped with no way to hold a cooked frame. This
+release builds that half: the ownership contract a cached frame needs (ENG-12), the identity it
+is keyed by (CACHE-1), the frame cache itself (CACHE-2, `tex_results.py`), warm-tier persistence
++ prewarm (CACHE-3), and layered cache epochs so a codegen-only edit stops cold-starting the
+whole cache (CACHE-4). Like ROI-3 in v0.24, the frame cache ships **armed by an engine host, not
+by the ComfyUI node** — the ComfyUI host already caches node outputs, so a second cache under it
+is pure memory cost. It is measured, tested, and dormant until a host asks. The default ComfyUI
+cook path is byte-identical (invariant #7): none of the five items touches a watched
+compiler/runtime file, and every new hook is off the default path. New modules `tex_results.py`
+and `tex_runtime/warm_state.py`; design in `docs/results-caching.md`.
+
+### ENG-12 — buffer ownership & immutability contract (lands first, before any frame is cached)
+- *Who may write a cooked tensor after it is produced.* Undefined write discipline is the bug
+  class that killed Natron's engine, so it lands before CACHE-2 and every later cross-owner edge
+  (GRAPH-2 threads, XPU-2 handles) inherits it. THE FLOOR: a cook output is **born frozen** —
+  every tier runs under `torch.inference_mode()`, so its outputs are inference tensors and torch
+  itself raises on any in-place write. A buffer another party holds cannot be silently scribbled.
+- Two enforcement strata for a cached frame: (1) frozen (inference) frames are immutable by
+  torch, version stamp a constant 0; (2) normal frames carry `t._version` and are
+  version-stamped at insert / re-verified at re-entry (the proven mip-cache pattern) — a bumped
+  counter drops the entry, never serves it. New helpers in `tex_engine.py`: `is_frozen`,
+  `frame_version`, `verify_unmutated`, `frozen_copy` (a hard-freeze — a `.clone()` made *inside*
+  inference_mode), `freeze` (idempotent). M-5 `out=` reuse can never target a cached frame (its
+  reuse set is codegen `_tN` temps, never a binding); the one residual write into a binding, a
+  scatter, is already COW-guarded. No DO-NOT-TOUCH mechanism was altered.
+
+### CACHE-1 — lineage keys (`tex_results.lineage_key` / `env_epoch`)
+- Every cooked output can carry the key that produced it: `H(program_fp × params × upstream_keys
+  × frame × device × precision/quality × env_epoch × flags × canvas/ROI)` — Nuke's op-hash. The
+  fused memo key already proved the value-independent half; CACHE-1 adds the value-dependent half
+  **without content-hashing pixels**: a tensor input enters by its *upstream lineage key*, never
+  its content (the sampling hash's admitted collision class is fine for cache-BUST, wrong for
+  cache-REUSE).
+- **Device and precision are MANDATORY** (a `None` raises, never a wildcard): invariant #9's
+  up-to-6.1e-2 CPU↔GPU envelope makes placement visible, so ENG-2's CPU-retry and a future
+  SCHED-2 placement change must mint a NEW key and recook, never serve a cross-device hit.
+  `env_epoch` (torch version + GPU name + compute capability + the CACHE-4 codegen epoch) keeps a
+  spilled frame from surviving a torch/driver/GPU/code change. The engine attaches
+  `CookResult.lineage` (per-output) only under `prepare(want_lineage=True)` — off the default
+  path, so a ComfyUI cook pays nothing.
+
+### CACHE-2 — the engine frame cache (`tex_results.ResultCache`, the 19th cache)
+- RAM-tier byte-budgeted (`TEX_RESULTS_BUDGET_MB`, a conservative default slice of VRAM) with a
+  disk-spill tail: an LRU victim is staged GPU→host as a plain contiguous CPU copy and atomically
+  pickled under `results/` (page-locking is applied on RESTORE — pinning doesn't survive pickle —
+  where the loaded tensor is staged into a page-locked buffer so the H2D can overlap cook time),
+  filename = the lineage key; `get` restores host→device (`non_blocking` when pinned) and
+  re-admits to RAM. Every entry frozen per ENG-12; `get` re-verifies unmutated before serving.
+- Keyed by CACHE-1, keys carry a canvas/ROI descriptor from day one (ties into ROI-3). The
+  ComfyUI node does not use it — armed by an engine host. Differential gate (test_v025_phase1): a
+  served frame == a freshly cooked one bit-exact; a spill→restore round-trip is bit-exact (CPU +
+  CUDA); eviction stays under budget; a mutated normal frame is dropped, not served.
+
+### CACHE-3 — warm-tier persistence + prewarm (`tex_runtime/warm_state.py`, `tex_api.prewarm`)
+- Generalizes the `autotier.json` pattern into `warm_state.json`, persisting the graph-capturability
+  verdict (`graphed._capturable_memo`) — the static AST capture-gate result, deterministic per
+  program AST + arch — so a relaunch skips re-walking the gate. CUDA graphs can't serialize — we
+  persist the *decision* and re-capture off the hot path. Version-tagged by the CACHE-4 **VERDICT
+  epoch × GPU identity** (device name + torch): a tier-policy/codegen change invalidates a stale
+  verdict, and a warm_state from another GPU is ignored. Backend probes and the compile/capture
+  blacklists are deliberately NOT persisted — a persisted positive backend probe is inert
+  (`_select_backend` only skips a known-False), and persisting any negative would harden a one-off
+  runtime/OOM failure into a permanent cross-launch demotion. The load hook is best-effort and off
+  the interpreter path.
+- `tex_api.prewarm(programs, shapes, ...)` drives the LAT-1a machinery for project-load / idle
+  warm: per program it materializes + persists the codegen fn (writes the `.cg`), submits a
+  background `torch.compile`, and seeds the capturability verdict, so the first scrub after
+  relaunch replays instead of trialling.
+
+### CACHE-4 — layered cache epochs (`tex_cache.py`)
+- The one compiler mono-hash that versioned every artifact (a comment-only stdlib edit
+  cold-started `.pkl` + `.cg` + inductor + verdicts for every user) is split into a NESTED epoch
+  lattice: `AST_EPOCH` gates the parsed-program `.pkl`; `CODEGEN_EPOCH` (= H(AST_EPOCH, codegen
+  files, cgreuse)) gates the `.cg` sidecars + inductor dir; `VERDICT_EPOCH` (= H(CODEGEN_EPOCH,
+  tier-policy files)) gates `autotier.json` + `warm_state.json`. The nesting is load-bearing (a
+  `.cg` is emitted from the compiled program, so it depends on the AST pipeline too). THE WIN: a
+  codegen-only edit bumps CODEGEN_EPOCH while AST_EPOCH is unchanged, so the
+  parse/typecheck/optimize `.pkl` **survives**.
+- The mono-hash is demoted to a completeness tripwire (a test asserts the partition file-sets
+  union to the watched set and AST/CODEGEN are disjoint); a fail-safe oracle spot-check asserts a
+  reloaded persisted artifact cooks identically to a fresh compile. `codegen_epoch()` is exported
+  for CACHE-1's `env_epoch`. Introducing the scheme is a one-time cache reset at the v0.25
+  upgrade; every subsequent codegen-only edit then spares the `.pkl` tier. Also strictly safer:
+  a tier-policy edit (`compiled.py`/`graphed.py`/…) now invalidates stale verdicts, which the old
+  12-file mono-hash never watched.
+
+### Gates
+- Full suite **2118/2119** (only the S-4 subprocess-import env artifact; +43 v0.25 sub-tests:
+  ENG-12 ownership canaries, CACHE-1 key discrimination + not-a-content-hash + cross-device +
+  the playhead never-collide regression, CACHE-2 bit-exact hit / spill-restore / mutation-drop,
+  CACHE-3 warm_state round-trip + version-tag guard + prewarm, CACHE-4 tripwire + layering +
+  codegen-spares-pkl + fail-safe oracle — CPU + CUDA).
+- Invariant #7 (default cook path unchanged) holds by construction (the lineage attach is gated
+  on `want_lineage`, off by default; the epoch split runs once at import; the warm-state hooks
+  are only on the compile/graph tiers) and by measurement — a same-environment A/B (git-stash to
+  v0.24 vs v0.25 on the identical box) is statistically indistinguishable, and a direct micro-bench
+  of the added default-path work measures ~50 ns/cook (the `want_lineage` branch + two frozen-
+  dataclass fields). No watched compiler/runtime file was touched, so existing program disk caches
+  survive the upgrade apart from the one-time CACHE-4 version-format reset.
+- Adversarial bug-hunt: a 7-dimension multi-agent review (ENG-12 / CACHE-1..4 / invariant-#7 /
+  simplify), each finding reproduced or refuted by an independent skeptic — **13 confirmed and
+  fixed**, headlined by a CRITICAL: `lineage_key` keyed only `frame` (int-truncated), so a
+  `time`/`fps`-animation or a fractional frame collided onto one key and would serve a stale frame;
+  the whole normalized playhead now keys by exact value (pinned by a never-collide test). Also:
+  `warm_state.json` now gated by the VERDICT epoch; transient compile failures no longer persist
+  across launches; layout-exact spill/restore; several doc-precision corrections. A focused second
+  review pass over the fixes found 3 more (all fixed) — headlined by a Mapping-playhead asymmetry:
+  the interpreter reads the playhead by duck-typing while the keyer type-checked it, so a
+  read-only `MappingProxyType` playhead drove pixels but fell out of the key; `time_context` is now
+  normalized to a plain dict at the `prepare()` boundary and the keyer duck-types (pinned by the
+  same never-collide test).
+- A third (maintainer) audit — 22 agents, 6 hunters → adversarial verify, 7 candidates refuted —
+  caught two more keystone stale-serve classes the CPU/CUDA suite structurally couldn't reach
+  (they only bite the host-armed engine path), plus a tautological test and quality/perf items,
+  all fixed: (1) when the fp16 finiteness net re-cooks fp32, the frame is now labelled fp32 and
+  keyed fp32 (was left "fp16" → a false miss vs the auto-pinned-fp32 cook and a lie to a host);
+  (2) the lineage canvas now carries the produced frame's FULL shape (batch + every dim), so a
+  batch-N or BCHW-latent cook can't collide with a batch-1/BHWC one (was keyed by (W,H) off an
+  input, dropping batch); (3) the CACHE-4 fail-safe oracle now compares the reloaded `.pkl`
+  against SOURCE-independent ground truth (it previously compiled both sides through the same
+  `.pkl` — a tautology that could never detect drift); plus a frozen-sub-view byte over-count/pin,
+  an honest scoping of `warm_state` to capturability-only (a persisted backend probe is inert), a
+  committed PM-3 benchmark (`benchmarks/cache3_cold_start.py`), an O(N²)→O(N) disk-budget sweep,
+  and doc-precision corrections.
+- A fourth (independent) audit — 18 agents, 3 hunters → adversarial verify — found **two more
+  stale-serve classes** in the same family the prior passes kept surfacing (a pixel-moving input
+  that falls out of the key), both fixed and pinned by `test_cache1_pixel_moving_flags` (CPU+CUDA):
+  (1) `debug_nan_highlight` — the DBG-3 magenta / C4-ux cyan overlay repaints `raw_output` *before*
+  it is keyed, so a debug-overlaid frame could be served for a non-debug cook (or vice-versa); the
+  toggle now keys via a `dbg:nan` flag, mirroring the node cache which already folds it in.
+  (2) `latent_channel_count` — it materializes the program-readable `ic` builtin, so a program
+  reading `ic` produces channel-count-dependent pixels even at a channel-count-*independent* output
+  shape; it now keys via an `ic:N` flag, mirroring `graphed._capture_key`. Both are off the default
+  path (want_lineage) and latent (no in-tree consumer yet), so no shipped cook was affected. Plus
+  perf/robustness on the spill path: the disk-budget check is now O(1)/spill via a running byte
+  total (full scan only on a budget crossing); spill does one host copy (was `to()`+`clone()`);
+  restore is born frozen so `put()`'s freeze is a no-op (no redundant VRAM re-clone); `prewarm`'s
+  background compiles are gated on VRAM headroom + not-capturing (matching the interactive auto
+  path); a `warm_state` `atexit` flush keeps last-throttle-window verdicts; and doc-precision
+  corrections (auto-placement deferral, restore-overlap threshold, the CACHE-5 governor scope).
+- A fifth (final-polish) pass — a `/simplify` (3 `put()` dedups) then an 18-agent bug-hunt — found
+  a **MAJOR** that re-bases the ENG-12 model: the "born-frozen = immutable" floor is empirically
+  **false on torch 2.12** — an in-place op on an inference tensor LANDS the write and *then* raises,
+  so the raise is a loud tripwire, not a rollback, and `frame_version` (constant 0 for a frozen
+  tensor) can't catch it. Since `get()` returned the stored buffer, a consumer's `frame.clamp_(...)`
+  silently corrupted the cache and the next `get()` served the corrupted frame. Fixed with
+  **copy-on-read**: `get()` returns an owned copy by default (mirroring `to_dlpack(copy=True)`);
+  `get(key, copy=False)` is the opt-in zero-copy path; the frozen master is never handed out. The
+  ENG-12 contract, helper docstrings, design note, and the `_raises_inplace` test (which had only
+  checked that the op *raised*, never that the value survived — the false confidence that hid this)
+  are corrected, and `test_cache2_hit_is_bit_exact` now mutates a served frame and asserts the cache
+  stays clean. Also fixed: a bare-`"cuda"` device string + a process-wide `env_epoch` memo could
+  collide two GPUs on a multi-GPU host (now keyed by the produced frame's concrete device + a
+  per-device epoch memo), and `clear(disk=True)` zeroing the disk-byte total when a file failed to
+  delete (now forces a reconciling scan). A same-key-double-spill counter over-count was also fixed.
+
 ## [0.24.0] - 2026-07-18
 
 **See less, cook less** — spatial laziness. The single biggest interactivity lever a

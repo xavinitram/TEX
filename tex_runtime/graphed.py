@@ -486,8 +486,20 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
         return None
     cap = _capturable_memo.get(fingerprint)
     if cap is None:
+        try:                                   # CACHE-3: adopt a persisted verdict first
+            from . import warm_state as _ws
+            _ws.ensure_loaded()
+            cap = _capturable_memo.get(fingerprint)
+        except Exception:
+            pass
+    if cap is None:
         cap = _capturable(program)
         _capturable_memo[fingerprint] = cap
+        try:                                   # CACHE-3: persist the new verdict (throttled)
+            from . import warm_state as _ws
+            _ws.note_update()
+        except Exception:
+            pass
     capturable, est_ops = cap
     if not capturable:
         return None

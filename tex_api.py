@@ -195,3 +195,60 @@ def check(source: str, binding_types: dict) -> list:
         return pragma_diags + [make_diagnostic(
             code="E0000", message=f"internal error during check(): {e}",
             loc=None, source=source, phase="compile")]
+
+
+def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp32",
+            compile_mode: str = "auto") -> dict:
+    """CACHE-3: warm the compile/codegen tiers for a set of programs so the first scrub after
+    a project load / relaunch replays instead of trialling ("first scrub doesn't jank").
+
+    `programs` is an iterable of `(source, binding_types)` — the same pair `compile()` takes.
+    `shapes` is an optional list of `(B,H,W)` the host expects to cook at; it is accepted for
+    forward compatibility (per-resolution timing warm) — the warming below is shape-independent
+    (codegen emission, backend compile, and the static capturability verdict don't depend on
+    resolution). Per program it: materializes + persists the codegen fn (writes the `.cg`
+    sidecar), submits a background `torch.compile` (LAT-1a, non-blocking), and seeds the
+    graph-capturability verdict. CUDA graphs cannot be pre-captured (capture must be on the hot
+    path), so their *verdict* is persisted via warm_state and the graph re-captures off the hot
+    path on first cook. Loads and re-persists `warm_state.json` around the run. Best-effort per
+    program (a bad program is skipped, never fatal). Returns a summary of what was warmed."""
+    import torch
+    from .tex_cache import get_cache
+    from .tex_runtime import compiled, graphed, warm_state
+    warm_state.ensure_loaded()
+    dev_type = "cuda" if (str(device).startswith("cuda") and torch.cuda.is_available()) else "cpu"
+    summary = {"programs": 0, "codegen": 0, "bg_compile": 0, "capturable": 0, "errors": 0}
+    for source, binding_types in programs:
+        try:
+            prog = compile(source, binding_types)
+            fp = get_cache().fingerprint(source, binding_types)
+            summary["programs"] += 1
+            try:                                   # 1. codegen fn → persisted .cg sidecar
+                if compiled._get_or_make_codegen_fn(prog.ast, prog.type_map, fp) is not None:
+                    summary["codegen"] += 1
+            except Exception:
+                pass
+            if dev_type == "cuda" and compile_mode in ("auto", "torch_compile"):
+                try:                               # 2. background torch.compile (LAT-1a)
+                    # Gate on the SAME preconditions the interactive auto path enforces on this
+                    # call (compiled.py's auto tier): only submit with comfortable VRAM headroom
+                    # and never during a CUDA-graph capture. A mid-session prewarm must not queue
+                    # compiles that starve a live cook or collide with an in-flight capture.
+                    if compiled._cuda_headroom_ok(device) and not compiled._capture_in_flight():
+                        ck = (fp, dev_type, precision)
+                        if compiled._submit_bg_compile(ck, prog.ast, prog.type_map, dev_type,
+                                                       prog.used_builtins, precision, fp):
+                            summary["bg_compile"] += 1
+                except Exception:
+                    pass
+            if dev_type == "cuda":
+                try:                               # 3. seed the graph-capturability verdict
+                    graphed._capturable_memo[fp] = graphed._capturable(prog.ast)
+                    summary["capturable"] += 1
+                except Exception:
+                    pass
+        except Exception:
+            summary["errors"] += 1
+            continue
+    warm_state.persist(force=True)
+    return summary
