@@ -46,7 +46,7 @@ Three layers; **imports point downward only**. The `tex_compiler` package has
 | **Compiler** (IR + front end) | `ast_nodes`, `lexer`, `parser`, `type_checker`, `optimizer`, `stdlib_signatures`, `diagnostics` | types + itself |
 | **Runtime** (execution tiers) | `interpreter`, `codegen` (+ `codegen_stdfns`/`codegen_stencil`/`codegen_persist`, STR-7), `compiled`, `graphed`, `stdlib` (+ `stdlib_registry`), `precision_policy` (PR-LP2 `auto` gate), `tier_trace`, `noise`, `autotier`, `xfer` (ENG-8 transfer-cost probe), `tex_cache`, `tex_marshalling`, `tex_memory`, `host` (PORT-1 seam — the ONLY `comfy.model_management` consumer) | types + compiler + itself |
 | **Engine** (host-agnostic cook) | `tex_engine` (`cook`/`prepare`/`run`, tier selection, OOM ladder, tiling, precision-auto — ENG-1), `tex_fusion` (splice + the FUS-1 detector), `tex_lazy` | runtime + compiler |
-| **Public API** (host-agnostic) | `tex_api` (`compile`/`execute`/`Program`/`TEXCompileError`, PORT-2/ENG-4), `tex_cli` (`tex run`, PORT-3) | engine + runtime + compiler |
+| **Public API** (host-agnostic) | `tex_api` (`compile`/`execute`/`Program`/`TEXCompileError`, PORT-2/ENG-4), `tex_cli` (`tex run`/`tex build`, PORT-3/TOOL-4), `tex_tool` (the `.textool` loader/publish/cook, TOOL-1..5), `tex_lsp` (the stdio LSP, LANG-7) | engine + runtime + compiler |
 | **ComfyUI adapter** | `tex_node` (marshalling + schema + `ui=` payload only, S-1), `__init__` (routes), `tex_runtime/host` | all of the above |
 
 **ENG-1 (v0.22) re-cut the top two rows.** `tex_fusion` and `tex_lazy` were only ever

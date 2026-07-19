@@ -5,6 +5,171 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] - 2026-07-19
+
+**Tools** — the bundling promise. A tool is the compositor's gizmo / macro / HDA: a named,
+self-contained bundle of TEX code with a UI. This release ships the `.textool` format
+(TOOL-1), the publish backend (TOOL-2), tool-as-compilation-unit warm keys (TOOL-3), the
+`tex build` CLI (TOOL-4), the threat model for sharing tools (TOOL-5), the first stock-node
+exemplars (Grade, Blur, Merge, Vignette), and a standalone LSP (LANG-7). A tool carries every
+stage's source **inline** — sharing one is sharing one plaintext file, and no program's
+compilation ever resolves an external name (this is *not* the rejected cross-node import
+system; no by-name tool nesting in v1). The fused tool cook reuses the FUS-3-proven fused
+path, so a `.textool` round-trips author → publish → install → cook **bit-identical to the
+unfused graph** (the release exit gate). The default ComfyUI cook path is byte-identical
+(invariant #7): no watched compiler/runtime file was touched — the tool loader, CLI, and LSP
+are new modules beside the engine, exercised only when a tool is built or cooked. New modules
+`tex_tool.py`, `tex_lsp.py`; stock tools under `stock/`; design + threat model in `docs/tools.md`.
+
+### TOOL-1 — the `.textool` manifest + loader (`tex_tool.py`)
+
+- A UTF-8 JSON manifest: `{manifest_schema, name, tool_version, tex_language, min_engine,
+  category, context, doc, author, inputs, promoted_params}` + one of `code` (single-stage)
+  or `graphspec`+`terminal_code` (fused). `TEXTOOL_SCHEMA = 1` versions the format; a newer
+  manifest is rejected, never mis-read.
+- **Promoted params** map an external widget name → a `$param` in one stage, carrying the
+  LANG-1 `ParamDecl.metadata` (`min`/`max`/`step`/`precision`/`label`) so an instanced tool
+  reconstructs the source node's widget. Applied uniformly into the target stage's bindings.
+- Two cook shapes: **single-stage** tools (all four stock exemplars, and multi-input nodes
+  like Merge) cook as a plain program; **fused** tools store the GraphSpec `region_to_collapse_plan`
+  emits and `engine.cook(chain_payload=)` consumes — a thin pass-through over the fused path.
+- Loader order is TOOL-5-safe: parse → **schema validation (before any TEX is parsed)** →
+  language-pin advisory → engine-version gate (fails at install, not at cook). `preflight_tool`
+  type-checks without cooking (`tex_api.check` / `tex_fusion.chain_preflight`, both total).
+
+### TOOL-2 — publish flow (backend + JS)
+
+- Backend: `tex_tool.write_tool` (atomic write to `<user_dir>/tex_wrangle/tools/`, the LANG-5
+  `get_user_dir` seam), `load_all_tools`/`tool_summary` (the palette), and routes
+  `/tex_wrangle/publish_tool` (validate-first, never compiles) + `/tex_wrangle/list_tools`.
+- Frontend: a "Publish as TEX tool…" node command that collapses a node's program into a
+  single-stage `.textool` with every `$param` promoted (metadata from the code). The richer
+  multi-node collapse + drag-promote picker and the instanced-tool-node rendering are the
+  documented live-checklist follow-up (pure frontend; the manifest they exchange is
+  backend-proven).
+
+### TOOL-3 — tool = compilation unit
+
+- `tool_warm_keys` re-derives a tool's value-independent fingerprint **at install, from the
+  inline code** (`fused_fingerprint` / `TEXCache.fingerprint`) — never carried in the file
+  (ENG-5: fingerprints are unstable across TEX versions; a stored one would be wrong after any
+  update). `warm_tool` / `install_tool(warm=True)` compile the tool at its promoted-param
+  signature and warm the codegen/compile tiers off the hot path — single-stage OR the **real
+  fused program** (via `prepare_fused`, not `terminal_code` in isolation). **Validate-only by
+  default** (no compile on install without consent, TOOL-5).
+
+### TOOL-4 — the `tex build` CLI
+
+- `tex build <tool.textool>` validates + type-checks + reports diagnostics (`--json` for a
+  machine report, `--emit` to refresh a normalized manifest, `--warm` to opt into compile).
+  Exits non-zero on a preflight error so it can gate a CI/install step. Context tags
+  (generator/filter/transition/keyer) and `min_engine` surface in the report.
+
+### TOOL-5 — threat model for shared tools (design note + fuzz lane)
+
+- A downloaded `.textool` is untrusted input to a code generator (`codegen.py` emits Python
+  from a user AST). The posture: **validate-only install**, **schema validation before any
+  compile**, an **emitter injection audit**, and **documented resource limits**
+  (`MAX_TOOL_BYTES`/`MAX_STAGES`/`MAX_PROMOTED_PARAMS`/`MAX_STAGE_CODE_BYTES` — they bound
+  parse/compile, *not* cook). The audit confirmed and pinned the two structural safeties: the
+  lexer is ASCII-only (`_is_ascii_alpha` rejects Unicode confusables) and identifiers are
+  namespaced (`_lv_`/`_p_`/`_uf_lv_`), so no source identifier becomes an un-prefixed Python
+  name; string literals are emitted with `repr()`; the type checker rejects unknown functions
+  (E5002/E5003) *before* codegen, so `__import__`/`eval` never reach the emitter; and
+  `_torch.{name}`/`_math.{name}` dispatch a whitelist, never a raw name. **No change to the
+  watched `codegen.py`** — the safety was already there; this release proves it. The
+  adversarial-AST fuzz lane (`test_tool_emitter_fuzz`) drives hostile programs through the
+  compiler and `ast`-walks the generated source: 6 hostile programs are rejected pre-codegen,
+  6 benign-but-hostile (dunder/keyword identifiers, pathological strings) emit **zero**
+  dangerous call/attribute/import nodes.
+
+### STOCK — first stock-node exemplars (`stock/`)
+
+- Grade, Blur, Merge, Vignette shipped as `.textool` (single-stage), plus `GradeVignette`
+  (fused 2-stage) — the strategic-bet-#8 dogfood. Generated + drift-checked by
+  `tools/gen_stock_tools.py` (each manifest is validated + preflighted before it is written).
+
+### LANG-7 — the TEX LSP (`tex_lsp.py`) + offline docs
+
+- A thin stdio JSON-RPC Language Server over LANG-2's `check()` (diagnostics/squiggles) and the
+  REG-1 registry (`help_entries`/`help_lookup` → completion + hover). Dispatch is split from
+  I/O (`LSPServer.handle` is pure, unit-testable). `python -m TEX_Wrangle.tex_lsp` speaks LSP.
+- Offline reference: a `/tex_wrangle/docs/{page}` route serves the shipped `Function-Reference.md`,
+  `Error-Codes.md`, and `LANGUAGE.md`, and `wiki_url_for_code` returns the local route when
+  `TEX_DOCS_LOCAL` is set *and the page exists*. `Error-Codes.md` now ships at the package root
+  (generated by `tools/gen_error_codes.py`, like `Function-Reference.md`) so the offline route
+  serves real content — an air-gapped editor gets error-code docs, not a 404.
+
+### Gates
+
+- Full suite green (+9 v0.26 sub-tests: the fused-tool↔unfused-graph exit-gate oracle CPU+CUDA,
+  the stock-exemplar canary, the manifest/promoted-param key canaries, the promoted-param
+  derivation test, the TOOL-3 warm-key/validate-only test, the TOOL-5 schema-reject + emitter
+  fuzz lanes, the LANG-7 LSP smoke, and the `tex build` CLI test).
+- **Exit gate met:** a `.textool` round-trips author → publish → install → cook, bit-identical
+  to the unfused graph (`test_tool_roundtrip_unfused`, maxdiff 0.0 on CPU and CUDA).
+- Invariant #7 holds by construction and by the byte-level check: **no watched compiler/runtime
+  file was touched** (the change set is docs + `__init__` routes + the `tex build` CLI arm +
+  `diagnostics.wiki_url_for_code` + JS + the new `tex_tool.py`/`tex_lsp.py`/stock assets — none in
+  `_AST_FILES`/`_CODEGEN_FILES`/`_VERDICT_FILES`), and **codegen source is byte-identical across
+  `PYTHONHASHSEED`** (`test_c1st_execute_line_budget`/the codegen-determinism canary). The tool
+  loader, CLI, and LSP execute only on a tool build/cook, never on the default ComfyUI node cook.
+  (`eight_config_bench` gave an unstable partial read this session — only the noisy cold-CPU
+  config completed, cv up to ~60% — so the byte-identical-codegen check is the load-bearing
+  evidence, as in prior refactor-neutral releases.)
+- Adversarial bug-hunt (3 parallel skeptics — tool-correctness, security, LSP/JS/invariant —
+  each finding reproduced): the emitter injection/RCE claims held under attack (no escape found),
+  but the *robustness* posture had gaps, all fixed: a schema-valid-but-malformed fused manifest
+  could crash the "never raises" preflight (an out-of-range/negative promoted `stage`, a non-dict
+  `terminal_params`, a `code`+non-dict-`graphspec` that `is_fused` and the validator disagreed on)
+  — `validate_manifest` now bound-checks every promoted `stage`, requires one external input per
+  fused tool with `terminal_image_input` among the inputs, rejects internal/input name collisions,
+  and keys fused-ness on presence so `is_fused` can't diverge; the single-stage warm key coerced
+  every default to float (mis-keying Merge's int `operation` so the warm key never matched the
+  cook) → now inferred from the real default; `TEX_DOCS_LOCAL` is gated on the page existing (no
+  dead 404); the publish command handles generators (no inputs) and filters param metadata to the
+  validator's key set. The emitter fuzz lane was hardened to the escape-vector blocklist it
+  documents (added user-function programs exercising the `_uf_{name}`/depth-guard sites, a fused
+  chain, and pickle/`load`/`save` attr vectors); 17 malformed manifests + 6 hostile programs are
+  now rejected, 8 benign-hostile + a fused chain emit no dangerous code.
+- Maintainer audit (full suite 2128/2129, the 1 fail being the known S-4 cp1252 console) caught
+  defects clustered in the warm/preflight/instancing/docs seams — the parts least exercised by the
+  exit gate — all fixed and pinned (`test_tool_audit5_fixes`): **TOOL-3's warm was dead** —
+  `install_tool(warm=True)` passed bare strings to `prewarm` (which wants `(source, binding_types)`
+  pairs), swallowed into a warning, and the fused branch warmed `terminal_code` in isolation (a
+  different program than the fused chain) → now `warm_tool` compiles the tool (single-stage or the
+  real spliced fused program) and warms the tiers, and `tex build --warm` actually warms;
+  **single-stage preflight was type-blind** (`check(code, {})` typed every input VEC4, so `@image.a`
+  on a VEC3 input false-passed then failed at cook) → now type-checks against the tool's real
+  binding types, and the fused preflight/warm placeholder is shaped by the declared input type
+  (MASK/LATENT no longer forced to VEC3); **the Merge exemplar was unfaithful** (ops 4/5 fell
+  through as a no-op; the doc claimed alpha "over") → all ten modes implemented, doc corrected;
+  plus a `KeyError`→`TEXToolError` on a missing fused source, JSON `true` rejected as a promoted
+  `stage`, and an LSP stdio guard so one bad frame can't kill the server. Manifests now declare
+  **`outputs`** (a host needs them to wire an instanced tool — the multi-output Vignette
+  especially), and the fused-cook per-frame `deepcopy` is a structure-share + completion is memoized.
+- Independent audit#6 (24-agent adversarial review, each finding reproduced; full suite 2130/2131,
+  the 1 fail the known S-4 cp1252 console) — no critical/high, the emitter/RCE surface held under
+  attack; the survivors clustered again in the warm/preflight/robustness seams and are fixed +
+  pinned (`test_tool_audit6_fixes`): **warm keys mis-typed a whole class of params** — `_hint_value`
+  keyed `b`→FLOAT (not INT) and vector/color hints via scalar lists (which infer FLOAT), so the
+  TOOL-3 warm artifact was stored under a fingerprint the cook never asks for → silent warm-miss
+  for every bool/vector/color param; now every hint infers to `BINDING_HINT_TYPES` (bool→INT,
+  vectors→4-D tensors), the fused warm path types params by hint (not raw default), and warm keys
+  cover both the RGB and **RGBA** channel variant a cook may hand an IMAGE input. **Two schema-valid
+  manifests could still crash the cook** (violating `validate_manifest`'s own "never a raw KeyError"
+  invariant, reachable because publish is validate-only): a linear fused stage missing `image_input`
+  (now a validate error) and a graphspec omitting `terminal_image_input` (which `region_to_collapse_plan`
+  does) — `_fused_cook_inputs` now makes the manifest field authoritative on the copy. **The 512 KB
+  `MAX_TOOL_BYTES` cap was advisory** (only on file-load, so the `/publish_tool` route was bounded
+  only by ComfyUI's ~100 MB upload cap) → enforced on the whole serialized manifest at every entry
+  point, and `_read_capped` bounds the read (no stat-then-slurp TOCTOU). Publish now records the true
+  socket type (`m@`→MASK, `l@`→LATENT) instead of flattening to IMAGE; the LSP no longer busy-spins
+  on a closed pipe or exits on a headerless frame, and skips redundant re-analysis of unchanged text;
+  preflight cross-checks declared vs assigned outputs; `validate_manifest` returns its parsed lists
+  (one validation pass per load); `load_all_tools` caches summaries by mtime; the docs route caches by
+  mtime; and the CLI error prefix names the actual subcommand.
+
 ## [0.25.0] - 2026-07-19
 
 **Remember frames** — results become first-class. TEX persisted *programs* superbly and

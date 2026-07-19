@@ -623,6 +623,35 @@ def main():
     test_cache4_codegen_edit_spares_pkl(r)
     test_cache4_failsafe_oracle(r)
 
+    # v0.26.0 Phase 1 — "Tools" (TOOL-1 manifest/loader/cook, TOOL-3 warm keys, TOOL-4 CLI,
+    # TOOL-5 schema+emitter-fuzz, STOCK exemplars, LANG-7 LSP)
+    from test_v026_phase1 import (
+        test_tool_roundtrip_unfused,
+        test_tool_stock_exemplars,
+        test_tool_manifest_keys,
+        test_tool_promoted_params,
+        test_tool_warm_keys,
+        test_tool_audit5_fixes,
+        test_tool_audit6_fixes,
+        test_tool_schema_rejects,
+        test_tool_emitter_fuzz,
+        test_lsp_smoke,
+        test_lsp_bad_frames,
+        test_cli_build,
+    )
+    test_tool_roundtrip_unfused(r)
+    test_tool_stock_exemplars(r)
+    test_tool_manifest_keys(r)
+    test_tool_promoted_params(r)
+    test_tool_warm_keys(r)
+    test_tool_audit5_fixes(r)
+    test_tool_audit6_fixes(r)
+    test_tool_schema_rejects(r)
+    test_tool_emitter_fuzz(r)
+    test_lsp_smoke(r)
+    test_lsp_bad_frames(r)
+    test_cli_build(r)
+
     success = r.summary()
     return 0 if success else 1
 

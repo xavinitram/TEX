@@ -859,9 +859,30 @@ Per-release notes:
   the epoch split runs once at import, and the warm-state hooks live only on the compile/graph
   tiers. The frame-cache flag flip to on-under-ComfyUI is a later release, gated on a host that
   owns its downstream consumers (ENG-12) + GRAPH-1's demand signal.
-- **v0.26.0**: needs LANG-1/LANG-3 (v0.23) and FUS-1 (v0.21) — all satisfied.
-  TOOL-5's threat-model note gates the install flow. Exit: a `.textool` round-trips
-  author → publish → fresh-install → cook, bit-identical to the unfused graph.
+- **v0.26.0** shipped the bundling promise: TOOL-1 (`tex_tool.py` — the `.textool` manifest +
+  loader, schema-validated before any compile, promoted-param → per-stage mapping, single-stage
+  + fused cook paths), TOOL-2 (the publish backend — `write_tool` on the `get_user_dir` seam,
+  `/tex_wrangle/publish_tool` + `/tex_wrangle/list_tools`, and a "Publish as TEX tool…" node
+  command), TOOL-3 (warm keys re-fingerprinted at install from the inline code, never stored —
+  ENG-5; `install_tool` validate-only by default), TOOL-4 (`tex build`), TOOL-5 (the threat
+  model: validate-only install, schema-first validation, the emitter injection audit + the
+  adversarial-AST fuzz lane, resource limits), the first STOCK exemplars (Grade/Blur/Merge/
+  Vignette + a fused `GradeVignette` under `stock/`), and LANG-7 (`tex_lsp.py` — the stdio LSP
+  over `check()` + the registry, plus the offline-docs route). New modules `tex_tool.py`,
+  `tex_lsp.py`; design + threat model in `docs/tools.md`. **Exit met:** a `.textool` round-trips
+  author → publish → install → cook, bit-identical to the unfused graph
+  (`test_tool_roundtrip_unfused`, maxdiff 0.0 CPU + CUDA).
+  - The TOOL-5 audit found the emitter was **already** injection-safe (lexer is ASCII-only so
+    confusables can't tokenise; identifiers are namespace-prefixed; strings are `repr()`'d;
+    the type checker rejects unknown functions before codegen; `_torch`/`_math` dispatch a
+    whitelist) — so **no watched compiler file was touched**, and invariant #7 holds. The fuzz
+    lane pins it: 6 hostile programs rejected pre-codegen, 6 benign-hostile emit no dangerous
+    call/attribute/import (verified by `ast`-walking the generated source — string data is
+    `ast.Constant`, so only real code trips a finding).
+  - The frontend **collapse-selection picker + instanced-tool-node rendering** land as pure JS
+    and are verified in a running ComfyUI (the live-session checklist); the manifest they
+    exchange, the publish route, and the tool cook are backend-proven here. Recorded honestly
+    in `docs/tools.md` §8 as the follow-up.
 - **v0.28.0**: PM-2 is the release gate — the demo cooks <50 ms/frame warm at
   1024², zero comfy imports, scrubbing param history from CACHE-2.
 

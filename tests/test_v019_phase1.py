@@ -86,7 +86,14 @@ def test_c4st_js_loc_ratchet(r: SubTestResult):
     # silently discarded; a transient server read-error no longer wipes the cache) plus the
     # single-flight POST chain (concurrent whole-map writes land in order). Still
     # frontend-only; the SCHED-1 decomposition that shrinks this file is unaffected.
-    JS_HARD = 4185
+    # v0.26 (TOOL-2): +~50 lines for the "Publish as TEX tool…" node command (parse the
+    # program's params → a single-stage .textool manifest → POST /tex_wrangle/publish_tool).
+    # Frontend-only; the backend validates schema-first (tex_tool). The SCHED-1 decomposition
+    # on-ramp still stands.
+    # v0.26 audit#6 (#5): +~12 lines so publish records the true socket type (m@→MASK, l@→LATENT)
+    # from each binding's prefix instead of flattening every input/output to IMAGE. Still
+    # frontend-only; the SCHED-1 file split remains the real remedy — this bump buys that plan time.
+    JS_HARD = 4250
     js = _PKG / "js" / "tex_extension.js"
     if not js.exists():
         r.fail("C4-st JS ratchet", "js/tex_extension.js missing")

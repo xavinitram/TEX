@@ -11,6 +11,8 @@ TEX_Wrangle/
   tex_marshalling.py       # Input marshalling, type inference, output preparation
   tex_cache.py             # Two-tier compilation cache (memory LRU + disk pickle)
   tex_fusion.py            # Cross-node fusion: splice a linked TEX chain into one program
+  tex_tool.py              # TOOL-1..5: the .textool bundling format (loader, publish, cook, warm keys)
+  tex_lsp.py               # LANG-7: stdio JSON-RPC Language Server (diagnostics/completion/hover)
   tex_compiler/
     lexer.py               # Tokenizer
     parser.py              # Recursive-descent parser -> AST
@@ -600,6 +602,7 @@ breaks a host.
 | **1 — Public** | The `ui=` HUD payload (`tex_perf` / `tex_probes` keys) | Read by the shipped JS | `test_eng5_embedding_canaries` |
 | **1 — Public** | `HostServices` method set (PORT-1) | What a host must implement | `test_port1_host_services`, `test_eng5_embedding_canaries` |
 | **1 — Public** | GraphSpec (`_tex_chain`) + `GRAPHSPEC_SCHEMA` (SCHED-1) | Versioned; absent == 1; a newer schema is REFUSED, never guessed | `test_eng5_embedding_canaries` |
+| **1 — Public** | The `.textool` manifest + `TEXTOOL_SCHEMA` + `promoted_params` key set (TOOL-1) | Versioned; a newer `manifest_schema` is REFUSED; validated before any compile | `test_tool_manifest_keys`, `test_tool_schema_rejects` |
 | **1 — Public** | Egress profiles `comfy` / `engine` (ENG-3) | `comfy` is byte-identical, forever | `test_eng3_comfy_profile_canary` |
 | **2 — Semi** | TEX the language | Additive; new builtin/function names are RESERVED, so adding one is a minor breaking change — note it in the CHANGELOG (v0.22 reserved `frame`/`fps`/`time`) | the compat corpus (LANG-3, planned) |
 | **2 — Semi** | Error codes (E1xxx–E6xxx) | Codes are stable; message TEXT is not | `test_c3ux_error_codes_resolve` |

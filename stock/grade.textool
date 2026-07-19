@@ -1,0 +1,134 @@
+{
+  "manifest_schema": 1,
+  "name": "Grade",
+  "tool_version": "1.0.0",
+  "tex_language": "0.23",
+  "min_engine": "0.26.0",
+  "category": "Color",
+  "context": "filter",
+  "author": "TEX",
+  "doc": "Nuke-style lift / gamma / gain / offset color grade.",
+  "code": "// Grade — Nuke-style lift / gamma / gain / offset color grade.\nf$blackpoint = 0.0;\nf$whitepoint = 1.0;\nf$black = 0.0;\nf$white = 1.0;\nf$multiply = 1.0;\nf$offset = 0.0;\nf$gamma = 1.0;\nf$saturation = 1.0;\nf$mix = 1.0;\n\nvec3 src = @image;\nfloat A = $multiply * ($white - $black) / max($whitepoint - $blackpoint, 0.0001);\nfloat B = $offset + $black - A * $blackpoint;\nvec3 linear = src * A + B;\nfloat ex = 1.0 / max($gamma, 0.0001);\nfloat r = linear.r; float g = linear.g; float b = linear.b;\nr = r < 0.0 ? r : (r > 1.0 ? (r - 1.0) * ex + 1.0 : spow(r, ex));\ng = g < 0.0 ? g : (g > 1.0 ? (g - 1.0) * ex + 1.0 : spow(g, ex));\nb = b < 0.0 ? b : (b > 1.0 ? (b - 1.0) * ex + 1.0 : spow(b, ex));\nr = max(r, 0.0); g = max(g, 0.0); b = max(b, 0.0);\nvec3 graded = vec3(r, g, b);\nfloat lum = luma(graded);\nvec3 result = lerp(vec3(lum), graded, $saturation);\n@OUT = lerp(src, result, $mix);\n",
+  "inputs": [
+    {
+      "name": "image",
+      "type": "IMAGE"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "OUT",
+      "type": "IMAGE"
+    }
+  ],
+  "promoted_params": [
+    {
+      "name": "blackpoint",
+      "internal": "blackpoint",
+      "stage": null,
+      "type": "f",
+      "default": 0.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 1.0,
+        "label": "Black Point"
+      }
+    },
+    {
+      "name": "whitepoint",
+      "internal": "whitepoint",
+      "stage": null,
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 2.0,
+        "label": "White Point"
+      }
+    },
+    {
+      "name": "black",
+      "internal": "black",
+      "stage": null,
+      "type": "f",
+      "default": 0.0,
+      "metadata": {
+        "min": -1.0,
+        "max": 1.0,
+        "label": "Lift"
+      }
+    },
+    {
+      "name": "white",
+      "internal": "white",
+      "stage": null,
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 4.0,
+        "label": "Gain"
+      }
+    },
+    {
+      "name": "multiply",
+      "internal": "multiply",
+      "stage": null,
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 4.0,
+        "label": "Multiply"
+      }
+    },
+    {
+      "name": "offset",
+      "internal": "offset",
+      "stage": null,
+      "type": "f",
+      "default": 0.0,
+      "metadata": {
+        "min": -1.0,
+        "max": 1.0,
+        "label": "Offset"
+      }
+    },
+    {
+      "name": "gamma",
+      "internal": "gamma",
+      "stage": null,
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.01,
+        "max": 4.0,
+        "label": "Gamma"
+      }
+    },
+    {
+      "name": "saturation",
+      "internal": "saturation",
+      "stage": null,
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 2.0,
+        "label": "Saturation"
+      }
+    },
+    {
+      "name": "mix",
+      "internal": "mix",
+      "stage": null,
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 1.0,
+        "label": "Mix"
+      }
+    }
+  ]
+}

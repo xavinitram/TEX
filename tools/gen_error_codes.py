@@ -87,13 +87,19 @@ def render(codes):
     return "\n".join(out).rstrip() + "\n"
 
 
+# LANG-7: a package-root copy that ships with the node (like Function-Reference.md), so the
+# offline `/tex_wrangle/docs/Error-Codes` route + `TEX_DOCS_LOCAL` serve real content. The
+# wiki/ copy (a separate gitignored checkout) is still written when that dir is present.
+_ROOT_OUT = os.path.join(_PKG, "Error-Codes.md")
+
+
 def main():
     check = "--check" in sys.argv
     codes = harvest_codes()
     content = render(codes)
     if check:
         try:
-            existing = open(_OUT, encoding="utf-8").read()
+            existing = open(_ROOT_OUT, encoding="utf-8").read()
         except FileNotFoundError:
             print("Error-Codes.md missing — run tools/gen_error_codes.py")
             return 1
@@ -102,10 +108,14 @@ def main():
             return 1
         print(f"Error-Codes.md up to date ({len(codes)} codes)")
         return 0
-    os.makedirs(os.path.dirname(_OUT), exist_ok=True)
-    with open(_OUT, "w", encoding="utf-8") as f:
+    with open(_ROOT_OUT, "w", encoding="utf-8") as f:  # shipped, package-root
         f.write(content)
-    print(f"wrote {_OUT} ({len(codes)} codes)")
+    outs = [_ROOT_OUT]
+    if os.path.isdir(os.path.dirname(_OUT)):           # wiki/ checkout present -> also update it
+        with open(_OUT, "w", encoding="utf-8") as f:
+            f.write(content)
+        outs.append(_OUT)
+    print(f"wrote {', '.join(outs)} ({len(codes)} codes)")
     return 0
 
 

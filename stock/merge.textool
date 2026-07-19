@@ -1,0 +1,55 @@
+{
+  "manifest_schema": 1,
+  "name": "Merge",
+  "tool_version": "1.0.0",
+  "tex_language": "0.23",
+  "min_engine": "0.26.0",
+  "category": "Compositing",
+  "context": "filter",
+  "author": "TEX",
+  "doc": "Blend @A and @B with a selectable mode (add/subtract/multiply/screen/overlay/soft-light/min/max/difference/divide). Not alpha compositing -- no @A.a channel.",
+  "code": "// Merge — blend two images with a selectable mode.\n// 0=add 1=subtract 2=multiply 3=screen 4=overlay 5=soft-light 6=min 7=max 8=difference 9=divide\ni$operation = 0;\nf$mix = 1.0;\nvec3 a = @A;\nvec3 b = @B;\nvec3 result = b;\nfloat eps = 1e-6;\nif ($operation == 0) { result = a + b; }\nelse if ($operation == 1) { result = a - b; }\nelse if ($operation == 2) { result = a * b; }\nelse if ($operation == 3) { result = a + b - a * b; }\nelse if ($operation == 4) {\n    float rr = (b.r < 0.5) ? 2.0 * a.r * b.r : 1.0 - 2.0 * (1.0 - a.r) * (1.0 - b.r);\n    float rg = (b.g < 0.5) ? 2.0 * a.g * b.g : 1.0 - 2.0 * (1.0 - a.g) * (1.0 - b.g);\n    float rb = (b.b < 0.5) ? 2.0 * a.b * b.b : 1.0 - 2.0 * (1.0 - a.b) * (1.0 - b.b);\n    result = vec3(rr, rg, rb);\n}\nelse if ($operation == 5) {\n    float sr = (1.0 - 2.0 * a.r) * b.r * b.r + 2.0 * a.r * b.r;\n    float sg = (1.0 - 2.0 * a.g) * b.g * b.g + 2.0 * a.g * b.g;\n    float sb = (1.0 - 2.0 * a.b) * b.b * b.b + 2.0 * a.b * b.b;\n    result = vec3(sr, sg, sb);\n}\nelse if ($operation == 6) { result = vec3(min(a.r, b.r), min(a.g, b.g), min(a.b, b.b)); }\nelse if ($operation == 7) { result = vec3(max(a.r, b.r), max(a.g, b.g), max(a.b, b.b)); }\nelse if ($operation == 8) { result = vec3(abs(a.r - b.r), abs(a.g - b.g), abs(a.b - b.b)); }\nelse if ($operation == 9) { result = vec3(a.r / max(b.r, eps), a.g / max(b.g, eps), a.b / max(b.b, eps)); }\n@OUT = b + (result - b) * $mix;\n",
+  "inputs": [
+    {
+      "name": "A",
+      "type": "IMAGE"
+    },
+    {
+      "name": "B",
+      "type": "IMAGE"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "OUT",
+      "type": "IMAGE"
+    }
+  ],
+  "promoted_params": [
+    {
+      "name": "operation",
+      "internal": "operation",
+      "stage": null,
+      "type": "i",
+      "default": 0,
+      "metadata": {
+        "min": 0,
+        "max": 9,
+        "label": "Operation",
+        "step": 1
+      }
+    },
+    {
+      "name": "mix",
+      "internal": "mix",
+      "stage": null,
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 1.0,
+        "label": "Mix"
+      }
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "manifest_schema": 1,
+  "name": "Vignette",
+  "tool_version": "1.0.0",
+  "tex_language": "0.23",
+  "min_engine": "0.26.0",
+  "category": "Effects",
+  "context": "filter",
+  "author": "TEX",
+  "doc": "Darken image edges with a soft radial falloff (image + mask outputs).",
+  "code": "// Vignette — darken image edges with a soft radial falloff.\nf$strength = 1.0;\nfloat cx = u - 0.5;\nfloat cy = v - 0.5;\nfloat dist = hypot(cx, cy);\nfloat falloff = 1.0 - smoothstep(0.3, 0.7, dist * $strength);\n@darkened = @image * falloff;\nm@vignette_mask = falloff;\n",
+  "inputs": [
+    {
+      "name": "image",
+      "type": "IMAGE"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "darkened",
+      "type": "IMAGE"
+    },
+    {
+      "name": "vignette_mask",
+      "type": "MASK"
+    }
+  ],
+  "promoted_params": [
+    {
+      "name": "strength",
+      "internal": "strength",
+      "stage": null,
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 2.0,
+        "label": "Strength"
+      }
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "manifest_schema": 1,
+  "name": "Blur",
+  "tool_version": "1.0.0",
+  "tex_language": "0.23",
+  "min_engine": "0.26.0",
+  "category": "Filter",
+  "context": "filter",
+  "author": "TEX",
+  "doc": "Separable Gaussian blur (radius ~= 3*sigma pixels).",
+  "code": "// Blur — separable Gaussian (stdlib gauss_blur, radius ~= 3*sigma px).\nf$sigma = 2.0;\n@OUT = gauss_blur(@image, $sigma);\n",
+  "inputs": [
+    {
+      "name": "image",
+      "type": "IMAGE"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "OUT",
+      "type": "IMAGE"
+    }
+  ],
+  "promoted_params": [
+    {
+      "name": "sigma",
+      "internal": "sigma",
+      "stage": null,
+      "type": "f",
+      "default": 2.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 50.0,
+        "label": "Sigma",
+        "step": 0.1
+      }
+    }
+  ]
+}

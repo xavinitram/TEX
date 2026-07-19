@@ -623,6 +623,16 @@ function _parseParamMetadata(block) {
     return Object.keys(meta).length ? meta : null;
 }
 
+// The ComfyUI socket type carried by a binding's @-prefix (m@ = MASK, l@ = LATENT, and
+// everything else — img/v/v2/v3/v4/f/i/c/b/s/none — wires as IMAGE). Mirrors the prefix
+// legend in TEX_HELP_DATA ("m@ MASK, l@ LATENT") and tex_marshalling's socket families, so a
+// published tool records the true socket type instead of flattening mask/latent to IMAGE.
+function _socketTypeForPrefix(prefix) {
+    if (prefix === "m") return "MASK";
+    if (prefix === "l") return "LATENT";
+    return "IMAGE";
+}
+
 function parseCode(code) {
     const stripped = code
         .replace(/\/\/[^\n]*/g, "")
@@ -631,12 +641,17 @@ function parseCode(code) {
 
     // 1) Count ALL @name occurrences (including typed prefixes like f@name)
     const refCounts = new Map();
-    const AT_RE = /(?:[a-z]\d{0,2})?@([A-Za-z_]\w*)/g;
+    const socketTypes = new Map();   // name → "IMAGE"/"MASK"/"LATENT" from its @-prefix (#5)
+    const AT_RE = /([a-z]\d{0,2})?@([A-Za-z_]\w*)/g;
     let m;
     while ((m = AT_RE.exec(stripped)) !== null) {
-        if (!RESERVED_NAMES.has(m[1])) {
-            refCounts.set(m[1], (refCounts.get(m[1]) || 0) + 1);
-        }
+        const nm = m[2];
+        if (RESERVED_NAMES.has(nm)) continue;
+        refCounts.set(nm, (refCounts.get(nm) || 0) + 1);
+        // A MASK/LATENT prefix on ANY occurrence wins over a bare/IMAGE one (first non-IMAGE
+        // prefix seen sticks); names with no explicit prefix default to IMAGE at lookup.
+        const st = _socketTypeForPrefix(m[1] || "");
+        if (st !== "IMAGE" && !socketTypes.has(nm)) socketTypes.set(nm, st);
     }
 
     // 2) Count simple assignment targets (@name = ..., not ==)
@@ -716,7 +731,7 @@ function parseCode(code) {
         outputs.delete(name);
     }
 
-    return { inputs, outputs, params };
+    return { inputs, outputs, params, socketTypes };
 }
 
 // ─── Debounce ────────────────────────────────────────────────────────
@@ -3333,6 +3348,67 @@ app.registerExtension({
 
     async beforeRegisterNodeDef(nodeType, nodeData, appRef) {
         if (nodeData.name !== TEX_NODE_TYPE) return;
+
+        // ── TOOL-2: "Publish as TEX tool…" — collapse this node's program into a
+        // single-stage `.textool` with every $param promoted as a widget (metadata carried
+        // from LANG-1). The backend (/tex_wrangle/publish_tool) validates schema-first and
+        // writes it to the user tool store; nothing is compiled on publish (TOOL-5). The
+        // richer multi-node collapse + promoted-params picker is the live-checklist follow-up.
+        const origMenu = nodeType.prototype.getExtraMenuOptions;
+        nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+            // Preserve the prior handler's return value — LiteGraph concats a returned array
+            // of extra items, so dropping it would swallow another extension's menu entries.
+            const origRet = origMenu ? origMenu.apply(this, arguments) : undefined;
+            const node = this;
+            options.push({
+                content: "Publish as TEX tool…",
+                callback: async () => {
+                    try {
+                        const codeW = (node.widgets || []).find(w => w.name === "code");
+                        const code = codeW ? String(codeW.value || "") : "";
+                        if (!code.trim()) { alert("TEX: this node has no code to publish."); return; }
+                        const { inputs, outputs, params, socketTypes } = parseCode(code);
+                        const name = prompt("Tool name:", "MyTool");
+                        if (!name) return;
+                        const VALID = new Set(["f", "i", "s", "b", "c", "v2", "v3", "v4"]);
+                        const META_KEYS = new Set(["min", "max", "step", "precision", "label"]);
+                        const promoted = [];
+                        for (const [pname, info] of params) {
+                            const t = VALID.has(info.typeHint) ? info.typeHint : "f";
+                            let def = info.defaultValue;
+                            def = (t === "s") ? (def || "") : (def == null ? 0 : (Number(def) || 0));
+                            // Forward only metadata keys the tool validator accepts (the editor's
+                            // parser is more permissive), so an extra key can't 422 the publish.
+                            const meta = {};
+                            for (const [mk, mv] of Object.entries(info.metadata || {})) {
+                                if (META_KEYS.has(mk)) meta[mk] = mv;
+                            }
+                            promoted.push({ name: pname, internal: pname, stage: null,
+                                            type: t, default: def, metadata: meta });
+                        }
+                        const manifest = {
+                            manifest_schema: 1, name, tool_version: "1.0.0",
+                            tex_language: "0.23", min_engine: "0.26.0",
+                            category: "User", context: "filter", author: "", doc: "",
+                            code,
+                            inputs: [...inputs].map(n => ({ name: n, type: socketTypes.get(n) || "IMAGE" })),
+                            outputs: [...outputs].map(n => ({ name: n, type: socketTypes.get(n) || "IMAGE" })),
+                            promoted_params: promoted,
+                        };
+                        const resp = await api.fetchApi("/tex_wrangle/publish_tool", {
+                            method: "POST", headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(manifest),
+                        });
+                        const data = await resp.json();
+                        if (data.ok) alert("TEX: published tool to\n" + data.path);
+                        else alert("TEX: publish failed — " + (data.error || "unknown error"));
+                    } catch (e) {
+                        alert("TEX: publish error — " + e);
+                    }
+                },
+            });
+            return origRet;
+        };
 
         // ── onNodeCreated ──
         const origCreated = nodeType.prototype.onNodeCreated;

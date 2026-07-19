@@ -5,7 +5,7 @@ A per-pixel kernel DSL for writing compact image/mask processing logic
 directly inside ComfyUI. Inspired by Houdini VEX and Nuke BlinkScript.
 """
 
-__version__ = "0.25.0"
+__version__ = "0.26.0"
 
 import os
 
@@ -341,6 +341,67 @@ try:
             return web.json_response(payload, status=status)
         except Exception as e:
             return web.json_response({"ok": False, "error": f"{type(e).__name__}: {e}"}, status=503)
+
+    @routes.post("/tex_wrangle/publish_tool")
+    async def publish_tool(request):
+        """TOOL-2: publish a `.textool`. Body is a manifest dict (the frontend's
+        collapse-selection-to-tool result). Validated (schema BEFORE any compile, TOOL-5)
+        and atomically written to the user tool store. Returns {ok, path} or a 4xx with a
+        legible error. Never 500s; compiles nothing."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad request body"}, status=400)
+        try:
+            from .tex_tool import write_tool, TEXToolError
+            try:
+                path = write_tool(body)
+            except TEXToolError as e:
+                return web.json_response({"ok": False, "error": str(e)}, status=422)
+            return web.json_response({"ok": True, "path": path})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": f"{type(e).__name__}: {e}"}, status=503)
+
+    @routes.get("/tex_wrangle/list_tools")
+    async def list_installed_tools(request):
+        """TOOL-2: enumerate installed tools (palette). Summaries only — no source."""
+        try:
+            from .tex_tool import load_all_tools
+            return web.json_response({"tools": load_all_tools()})
+        except Exception as e:
+            return web.json_response({"tools": [], "error": f"{type(e).__name__}: {e}"}, status=503)
+
+    _DOCS_CACHE = {}   # path -> (mtime, text); static shipped docs, re-read only when mtime changes
+
+    @routes.get("/tex_wrangle/docs/{page}")
+    async def get_offline_docs(request):
+        """LANG-7: serve the shipped offline reference (Function-Reference.md, and
+        Error-Codes.md when a wiki/ checkout is present) as text/markdown, so an air-gapped
+        box gets docs without the remote GitHub wiki (paired with TEX_DOCS_LOCAL, which
+        points diagnostics' docs_url here). Only whitelisted page names, read from disk."""
+        import os as _os
+        page = request.match_info.get("page", "")
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        candidates = {
+            "Function-Reference": _os.path.join(here, "Function-Reference.md"),
+            "Error-Codes": _os.path.join(here, "Error-Codes.md"),
+            "LANGUAGE": _os.path.join(here, "LANGUAGE.md"),
+        }
+        path = candidates.get(page.replace(".md", ""))
+        if not path or not _os.path.exists(path):
+            return web.json_response({"error": f"no offline doc '{page}'"}, status=404)
+        try:
+            # Cache by mtime: these are static shipped files, so re-reading from disk on every
+            # docs-panel open / "open docs" click is wasted I/O.
+            mtime = _os.path.getmtime(path)
+            cached = _DOCS_CACHE.get(path)
+            if cached is None or cached[0] != mtime:
+                with open(path, "r", encoding="utf-8") as fh:
+                    cached = (mtime, fh.read())
+                _DOCS_CACHE[path] = cached
+            return web.Response(text=cached[1], content_type="text/markdown")
+        except Exception as e:
+            return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
 
 except (ImportError, AttributeError):
     # PromptServer or aiohttp not available (e.g. running tests or CLI mode)

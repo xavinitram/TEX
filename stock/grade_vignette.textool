@@ -1,0 +1,75 @@
+{
+  "manifest_schema": 1,
+  "name": "GradeVignette",
+  "tool_version": "1.0.0",
+  "tex_language": "0.23",
+  "min_engine": "0.26.0",
+  "category": "Look",
+  "context": "filter",
+  "author": "TEX",
+  "doc": "A fused look: gain/gamma grade feeding a radial vignette (one compiled block).",
+  "graphspec": {
+    "schema": 1,
+    "stages": [
+      {
+        "code": "// Grade stage — gain + gamma (single output for chaining).\nf$gain = 1.0;\nf$gamma = 1.0;\nvec3 c = @image * $gain;\nfloat ex = 1.0 / max($gamma, 0.0001);\n@OUT = vec3(spow(c.r, ex), spow(c.g, ex), spow(c.b, ex));\n",
+        "image_input": "image",
+        "params": {}
+      }
+    ],
+    "terminal_image_input": "image"
+  },
+  "terminal_code": "// Vignette terminal stage — single output.\nf$strength = 1.0;\nfloat cx = u - 0.5;\nfloat cy = v - 0.5;\nfloat falloff = 1.0 - smoothstep(0.3, 0.7, hypot(cx, cy) * $strength);\n@OUT = @image * falloff;\n",
+  "terminal_image_input": "image",
+  "terminal_params": {},
+  "inputs": [
+    {
+      "name": "image",
+      "type": "IMAGE"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "OUT",
+      "type": "IMAGE"
+    }
+  ],
+  "promoted_params": [
+    {
+      "name": "gain",
+      "internal": "gain",
+      "stage": 0,
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 4.0,
+        "label": "Gain"
+      }
+    },
+    {
+      "name": "gamma",
+      "internal": "gamma",
+      "stage": 0,
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.01,
+        "max": 4.0,
+        "label": "Gamma"
+      }
+    },
+    {
+      "name": "strength",
+      "internal": "strength",
+      "stage": "terminal",
+      "type": "f",
+      "default": 1.0,
+      "metadata": {
+        "min": 0.0,
+        "max": 2.0,
+        "label": "Vignette"
+      }
+    }
+  ]
+}

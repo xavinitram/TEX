@@ -26,6 +26,7 @@ rather than renumbering existing ones.
 from __future__ import annotations
 
 import difflib
+import os
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -36,8 +37,19 @@ TEX_WIKI_URL = "https://github.com/xavinitram/TEX/wiki"
 
 
 def wiki_url_for_code(code: str) -> str:
-    """Return the wiki URL for an error code, e.g. E3001 -> wiki/Error-Codes#e3001"""
-    return f"{TEX_WIKI_URL}/Error-Codes#{code.lower()}"
+    """Return the docs URL for an error code, e.g. E3001 -> wiki/Error-Codes#e3001.
+
+    LANG-7: when TEX_DOCS_LOCAL is set (an air-gapped box or a standalone editor with no
+    internet), return the local `/tex_wrangle/docs` route the offline reference is served
+    from — but ONLY when the shipped page actually exists, so enabling the flag never turns a
+    working remote link into a dead local 404 (wiki/Error-Codes.md lives in a separate repo).
+    Default is unchanged (the remote wiki)."""
+    frag = code.lower()
+    if os.environ.get("TEX_DOCS_LOCAL"):
+        page = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Error-Codes.md")
+        if os.path.exists(page):
+            return f"/tex_wrangle/docs/Error-Codes#{frag}"
+    return f"{TEX_WIKI_URL}/Error-Codes#{frag}"
 
 
 # ── Diagnostic dataclass ──────────────────────────────────────────────

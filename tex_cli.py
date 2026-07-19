@@ -151,6 +151,16 @@ def build_parser() -> argparse.ArgumentParser:
     hp = sub.add_parser("help", help="show the signature, description and example for a "
                         "built-in function (LANG-4), or list all functions")
     hp.add_argument("fn", nargs="?", help="function name (omit to list every function)")
+    bp = sub.add_parser("build", help="validate + type-check a .textool tool manifest, "
+                        "report diagnostics, optionally warm-compile it (TOOL-4)")
+    bp.add_argument("tool", help="path to a .textool file")
+    bp.add_argument("--warm", action="store_true",
+                    help="warm-compile the tool at its promoted-param signature (TOOL-3; "
+                         "OFF by default — validate-only, TOOL-5)")
+    bp.add_argument("--emit", dest="emit", metavar="PATH",
+                    help="write a normalized/refreshed manifest to PATH")
+    bp.add_argument("--json", dest="as_json", action="store_true",
+                    help="emit the build report as JSON")
     return p
 
 
@@ -179,6 +189,56 @@ def help_fn(args) -> None:
         print(f"\n  example: {e['example']}")
 
 
+def build_fn(args) -> None:
+    """`tex build <tool.textool>` (TOOL-4) — validate + type-check + report. Validate-only
+    by default (TOOL-5): no code is generated unless --warm is passed. Exits non-zero on a
+    preflight error so it can gate a CI/install step."""
+    import json as _json
+    from .tex_tool import load_tool, preflight_tool, tool_warm_keys, TEXToolError
+    try:
+        manifest = load_tool(args.tool)      # parse -> schema -> language pin -> engine gate
+    except TEXToolError as e:
+        sys.exit(f"tex build: error: {e}")
+    pf = preflight_tool(manifest)
+    shape = "fused" if manifest.is_fused else "single-stage"
+    if args.as_json:
+        print(_json.dumps({
+            "name": manifest.name, "tool_version": manifest.tool_version,
+            "tex_language": manifest.tex_language, "min_engine": manifest.min_engine,
+            "category": manifest.category, "context": manifest.context, "shape": shape,
+            "inputs": manifest.inputs, "promoted_params": [p.name for p in manifest.promoted_params],
+            "warnings": manifest.warnings, "ok": pf["ok"], "diagnostics": pf["diagnostics"],
+            "output_warnings": pf.get("output_warnings", []),
+        }, indent=2))
+    else:
+        print(f"{manifest.name} v{manifest.tool_version}  [{shape}, {manifest.context}]")
+        print(f"  language: {manifest.tex_language}   min-engine: {manifest.min_engine}")
+        print(f"  inputs: {', '.join(i['name'] for i in manifest.inputs)}")
+        print(f"  params: {', '.join(p.name for p in manifest.promoted_params) or '(none)'}")
+        for w in manifest.warnings:
+            print(f"  warning: {w}")
+        for w in pf.get("output_warnings", []):
+            print(f"  warning: {w}")
+        if pf["ok"]:
+            print("  preflight: OK")
+        else:
+            for d in pf["diagnostics"]:
+                print(f"  ERROR {d.get('code', '')}: {d.get('message', '')}")
+    if not pf["ok"]:
+        sys.exit(1)
+    if args.warm:
+        from .tex_tool import warm_tool
+        print(f"  warm keys: {tool_warm_keys(manifest)}")
+        try:
+            print(f"  warmed: {warm_tool(manifest)}")
+        except Exception as e:
+            print(f"  warm-compile skipped: {e}")
+    if args.emit:
+        with open(args.emit, "w", encoding="utf-8") as fh:
+            _json.dump(manifest.to_dict(), fh, indent=2, ensure_ascii=False)
+        print(f"  wrote: {args.emit}")
+
+
 def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
     # F3 (doc 32): a bad path / syntax error / cook failure must exit with a one-line
@@ -198,6 +258,8 @@ def main(argv=None) -> None:
             validate_hw_main()
         elif args.cmd == "help":
             help_fn(args)
+        elif args.cmd == "build":
+            build_fn(args)
     # TEXCompileError (ENG-4) is what tex_api.compile now raises, and run_program calls
     # it BEFORE the cook — so without it here every syntax error in `tex run` dumps a
     # stack, breaking the F3 contract this function exists to keep.
@@ -206,7 +268,7 @@ def main(argv=None) -> None:
         # S2 (doc 33): the node appends a machine-readable "\nTEX_DIAG:{json}" blob to some
         # errors for the frontend — strip it from the human CLI message.
         msg = str(e).split("\nTEX_DIAG:", 1)[0].strip()
-        sys.exit(f"tex run: error: {msg}")
+        sys.exit(f"tex {getattr(args, 'cmd', None) or 'run'}: error: {msg}")
 
 
 if __name__ == "__main__":
