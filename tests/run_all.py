@@ -552,6 +552,34 @@ def main():
     test_lang5_snippet_store(r)
     test_lang5_snippet_route(r)
 
+    # v0.24.0 Phase 1 — "See less, cook less" (ROI-2/3/4 spatial laziness, ROI-6 temporal)
+    from test_v024_phase1 import (
+        test_roi2_footprints,
+        test_roi2_plan_executability,
+        test_roi4_reach_pinning,
+        test_roi4_never_sever,
+        test_roi3_tile_is_roi_special_case,
+        test_roi4_differential_oracle,
+        test_roi4_partition_assembly,
+        test_roi4_partial_broadcast_crop,
+        test_roi3_engine_integration,
+        test_roi6_frame_window,
+        test_roi6_batch_strip_equivalence,
+        test_roi6_fi_seam_exact,
+    )
+    test_roi2_footprints(r)
+    test_roi2_plan_executability(r)
+    test_roi4_reach_pinning(r)
+    test_roi4_never_sever(r)
+    test_roi3_tile_is_roi_special_case(r)
+    test_roi4_differential_oracle(r)
+    test_roi4_partition_assembly(r)
+    test_roi4_partial_broadcast_crop(r)
+    test_roi3_engine_integration(r)
+    test_roi6_frame_window(r)
+    test_roi6_batch_strip_equivalence(r)
+    test_roi6_fi_seam_exact(r)
+
     success = r.summary()
     return 0 if success else 1
 

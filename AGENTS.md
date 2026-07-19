@@ -19,7 +19,7 @@ the **oracle** every other tier must match bit-for-bit. Full map: `ARCHITECTURE.
 | 2 | **interp ↔ codegen are bit-exact** (`tol=1e-5` fp32). | The crown-jewel contract; codegen falls back to interp. | `test_codegen_equivalence` + the differential fuzzer (TST-1) |
 | 3 | **The optimizer re-typechecks its output AST.** | CSE/LICM synthesize nodes outside the `id()`-keyed `type_map`; dropping the re-check silently corrupts types. | `tex_cache` calls it; optimizer/type_map contract |
 | 4 | **Coordinate/spatial builtins are forced fp32** (never `self._dtype`). | The M-3 fp16 contract; fp16 coords mis-address rows at large H. | `interpreter.py` (~line 368) — do not "unify" the dtype |
-| 5 | **A non-pixel-local stdlib fn MUST carry a `footprint=`** (`('halo', r)` / `('halo_arg', i)` / `'image'` / `('frame', i)`) in its `@stdlib(...)` decorator (ROI-1; default `'point'`). | The footprint *derives* `_NON_LOCAL_FNS` (`footprint != 'point'`); leaving it `'point'` is **wrong output only when tiled** (passes non-tiled tests). | TST-3 taxonomy test (derivation + name-prefix heuristic); see recipe below |
+| 5 | **A non-pixel-local stdlib fn MUST carry a `footprint=`** (`('halo', r)` / `('halo_arg', i[, mult])` / `'image'` / `('frame', i)`) in its `@stdlib(...)` decorator (ROI-1; default `'point'`). The `('halo_arg', i, mult)` **reach multiplier** (default `1.0`) converts arg `i` to a *pixel* reach when it isn't already one — `gauss_blur`'s radius is `3·sigma`, so it is `('halo_arg', 1, 3.0)`; omitting a needed multiplier under-pads by that factor. | The footprint *derives* `_NON_LOCAL_FNS` (`footprint != 'point'`) and the ROI-2 cook halo; leaving it `'point'` (or dropping a needed `mult`) is **wrong output only when tiled / ROI-narrowed** (passes non-tiled tests). | TST-3 taxonomy test (derivation + name-prefix heuristic) + ROI-4 reach-pinning; see recipe below |
 | 6 | **GPU timing wraps `torch.cuda.synchronize()`.** | Unsynced CUDA timing measures only kernel-launch enqueue. Has bitten benchmarks before. | benchmark harness convention |
 | 7 | **Every change is behavior-preserving + perf-neutral** on the DEFAULT path. | v0.18 adds one opt-in perf lever (`precision="auto"`, default fp32); everything else is still structure/UX. A refactor that risks bit-exactness or a hot path is a **bad trade** — see §"Trades to refuse". | full suite green + benchmark neutral |
 | 8 | **`comfy.model_management` is imported ONLY in `tex_runtime/host.py`** (PORT-1). | The host seam keeps TEX runnable host-agnostic (CLI, tests, future hosts); re-scattering the import re-couples it. | `test_port1_import_lint` |
@@ -48,10 +48,12 @@ For a **pixel-local** function (output at a pixel depends only on that pixel):
 If your function **reads neighbouring pixels or the whole image** (sample/fetch/
 blur/morphology/reduction), set the tags **in the same decorator** — do NOT edit the
 downstream sets by hand (they derive from these tags; TST-3 fails a mismatch):
-- `footprint=` (ROI-1) — **required**: one of `('halo', r)`, `('halo_arg', i)` (radius from
-  arg i), `'image'`, `('frame', i)`. Leaving the default `'point'` is *silently wrong when
-  tiled* (TST-3's name-prefix heuristic catches a forgotten footprint on `sample*`/`blur`/
-  morphology names).
+- `footprint=` (ROI-1) — **required**: one of `('halo', r)`, `('halo_arg', i[, mult])` (pixel
+  reach from arg i, times an optional `mult` — use `mult` when the arg is not already in pixels,
+  e.g. `gauss_blur` is `('halo_arg', 1, 3.0)` because its radius is `3·sigma`; default `1.0`),
+  `'image'`, `('frame', i)`. Leaving the default `'point'` — or dropping a needed `mult` — is
+  *silently wrong when tiled / ROI-narrowed* (TST-3's name-prefix heuristic catches a forgotten
+  footprint on `sample*`/`blur`/morphology names; ROI-4's reach-pinning test catches a wrong `mult`).
 - `sync=True` — if it does an internal `.item()`/sync (radius/octave count), else CUDA-graph capture fails.
 - `spatial=True` — if codegen should lower it as a stencil.
 
@@ -103,7 +105,7 @@ silent-wrong result.
 `TORCHINDUCTOR_CACHE_DIR` ownership-check, the `_tex_any` phantom search-panel slot,
 the `bf16` bench plumbing (deliberately dev/bench-only, not user-exposed).
 
-**The 17 caches are non-redundant** — each keys on a different thing with a distinct
+**The 18 caches are non-redundant** — each keys on a different thing with a distinct
 lifecycle. Do not consolidate them. (See ARCHITECTURE.md for the enumerated inventory;
 the count there and here must match — a DOC-7b check enforces it.)
 

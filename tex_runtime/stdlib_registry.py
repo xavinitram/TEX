@@ -34,7 +34,8 @@ class StdlibEntry:
     # ROI-1: access footprint — which input pixels one output pixel reads; the
     # substrate ROI-2/5/6 build on. One of: 'point' (per-pixel, default), 'image'
     # (whole-image reduction or data-dependent gather), ('halo', r) (fixed radius r),
-    # ('halo_arg', i) (radius from arg i), ('frame', i) (temporal window from arg i).
+    # ('halo_arg', i) (radius from arg i), ('halo_arg', i, mult) (pixel reach = mult·arg i —
+    # gauss_blur's radius is 3·sigma, so mult=3.0), ('frame', i) (temporal window from arg i).
     footprint: "str | tuple" = "point"
     doc: str = ""
     ex: str = ""
@@ -67,18 +68,29 @@ def _valid_footprint(fp) -> bool:
     ('halo', 'x') or a bare ('frame',)) must fail LOUD at import, not silently
     mis-tag a function — the exact silent-wrong class the taxonomy exists to close.
     'halo' takes a positive number; 'halo_arg'/'frame' a non-negative arg index.
-    bool is rejected explicitly (it is an int subclass, and True as a radius is a
-    bug, not a radius)."""
+    'halo_arg' takes an OPTIONAL third element `mult` (>0) — the ROI-2 reach multiplier
+    that turns the argument into a pixel reach (`gauss_blur`'s kernel radius is 3·sigma,
+    not sigma; the descriptor carries `mult=3.0`). Default multiplier is 1.0 (erode/dilate,
+    whose radius argument already is the pixel reach). bool is rejected explicitly (it is an
+    int subclass, and True as a radius is a bug, not a radius)."""
     if fp == "point" or fp == "image":
         return True
-    if isinstance(fp, tuple) and len(fp) == 2:
-        kind, val = fp
-        if isinstance(val, bool):
+    if not isinstance(fp, tuple) or len(fp) not in (2, 3):
+        return False
+    kind, val = fp[0], fp[1]
+    if isinstance(val, bool):
+        return False
+    if kind == "halo":
+        return len(fp) == 2 and isinstance(val, (int, float)) and val > 0
+    if kind == "frame":
+        return len(fp) == 2 and isinstance(val, int) and val >= 0
+    if kind == "halo_arg":
+        if not (isinstance(val, int) and val >= 0):
             return False
-        if kind == "halo":
-            return isinstance(val, (int, float)) and val > 0
-        if kind in ("halo_arg", "frame"):
-            return isinstance(val, int) and val >= 0
+        if len(fp) == 2:
+            return True
+        mult = fp[2]
+        return isinstance(mult, (int, float)) and not isinstance(mult, bool) and mult > 0
     return False
 
 

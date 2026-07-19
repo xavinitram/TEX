@@ -816,9 +816,26 @@ Per-release notes:
     justify. The design + the reopen gate (repeated capture stalls on an interactive path)
     are in `docs/lat1b-async-graph-capture.md`. Landing it as a mini-design is the
     roadmap's own §10.1 "design note first for L/XL items" discipline.
-- **v0.24.0**: build order per §6 — ROI-3 lands *flagged off*, ROI-4's oracle lane
-  gates the flag flip. Exit: differential ROI fuzz lane green; no ROI cook ships
-  wrong pixels silently.
+- **v0.24.0** shipped spatial laziness: ROI-2 (`tex_roi.py` footprint analysis on the
+  point ⊑ halo ⊑ image lattice), ROI-3 (`roi=(x0,y0,w,h,W,H)` execution — the M-4
+  `tile=` machinery generalized to a 2-D window and normalized to one seam-exact path;
+  `tex_memory.run_roi` narrows to `ROI ⊕ H` + crops), ROI-4 (the differential oracle
+  ship-gate: reach-pinning + spatial never-sever rows + fuzz `maxdiff < 1e-5`), and ROI-6
+  (temporal groundwork: `frame_window`/`batch_sliceable` + the interpreter `batch_slice=`
+  + `run_batch_strips`). **Exit met:** the differential ROI fuzz lane is green (CPU + CUDA)
+  and no ROI cook ships wrong pixels silently.
+  - ROI-3 lands **flagged off** (`TEX_ROI_EXEC`, default off; no ComfyUI cook passes
+    `roi=`). The flag flip to a production viewport is a later release, gated on the fuzz
+    lane green across a nightly run *and* a host that asks for a sub-region.
+  - **The reach-multiplier precondition** (v0.23 audit) is closed: `gauss_blur`'s
+    `('halo_arg', 1, 3.0)` descriptor carries the `3·sigma` reach; the ROI-4 reach-pinning
+    test pins every halo descriptor to its impl's measured neighbour reach.
+  - v1 scope honestly recorded (`docs/roi-spatial-laziness.md`): ROI executes the point +
+    direct-tensor-halo (blur/morphology) class; gathers/reductions cook whole-frame because
+    `fn_sample`/`fn_fetch` size their output from the input image, not the coordinate grid —
+    a decoupled gather output grid is **ROI-5**. Cross-frame temporal reads are the batch
+    twin of that limitation, also ROI-5-era. The bit-exactness is exact for pointwise +
+    integer morphology, ~1 ulp for conv/bilateral (size-dependent kernel dispatch).
 - **v0.25.0**: ENG-12 (ownership) lands first, in the same release, before any
   frame is cached. Exit: PM-3 dry-run (relaunch cold-start budget measured).
 - **v0.26.0**: needs LANG-1/LANG-3 (v0.23) and FUS-1 (v0.21) — all satisfied.

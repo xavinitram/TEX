@@ -412,14 +412,32 @@ def trim_reserved_pool(device, spatial_px: int = 0) -> None:
         pass
 
 
+def _shared_dim_size(bindings, dim: int, min_ndim: int) -> int | None:
+    """The single size shared by every tensor binding on axis `dim` that isn't a broadcast
+    singleton (size 1), or None when zero or >1 distinct sizes qualify (heterogeneous inputs
+    can't be co-strided). Backs both `shared_tile_height` (dim 1) and `shared_batch_size`
+    (dim 0)."""
+    sizes = {v.shape[dim] for v in bindings.values()
+             if isinstance(v, torch.Tensor) and v.dim() >= min_ndim and v.shape[dim] > 1}
+    return next(iter(sizes)) if len(sizes) == 1 else None
+
+
+def _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
+                output_names, used_builtins, precision, time_context) -> dict:
+    """The whole-frame (untiled / un-ROI'd / un-strided) cook — the shared fallback body for
+    `run_tiled` / `run_roi` / `run_batch_strips`."""
+    return interp.execute(program, bindings, type_map, device=device,
+                          latent_channel_count=latent_channel_count,
+                          output_names=output_names, used_builtins=used_builtins,
+                          precision=precision, time_context=time_context)
+
+
 def shared_tile_height(bindings) -> int | None:
     """M-4: the single image height shared by every spatial (dim>=3) binding that
     isn't a broadcast singleton (shape[1]==1), or None when zero or >1 distinct
     heights qualify (heterogeneous inputs can't be co-tiled). One source of truth
     for both the tile PLAN (`_tile_plan`) and the tile EXECUTOR (`run_tiled`)."""
-    heights = {v.shape[1] for v in bindings.values()
-               if isinstance(v, torch.Tensor) and v.dim() >= 3 and v.shape[1] > 1}
-    return next(iter(heights)) if len(heights) == 1 else None
+    return _shared_dim_size(bindings, 1, 3)
 
 
 def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
@@ -435,10 +453,8 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
     playhead off per-execute state, so a strip cooked without it silently reads zeros —
     a frozen animation on exactly the big cooks that need tiling."""
     def _untiled():
-        return interp.execute(program, bindings, type_map, device=device,
-                              latent_channel_count=latent_channel_count,
-                              output_names=output_names, used_builtins=used_builtins,
-                              precision=precision, time_context=time_context)
+        return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
+                           output_names, used_builtins, precision, time_context)
 
     # M-4 safety: tiling narrows dim 1 (the image HEIGHT for [B,H,W,C] IMAGE /
     # [B,H,W] MASK). Refuse — and cook untiled — when that axis isn't a shared
@@ -480,6 +496,155 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
                 buf[:, y0:y1] = strip_out
             elif name not in outputs:
                 outputs[name] = strip_out  # scalar/string: any strip suffices
+    return outputs
+
+
+def shared_batch_size(bindings) -> int | None:
+    """ROI-6: the single batch size (dim 0) shared by every batched binding that isn't a
+    broadcast singleton (shape[0]==1), or None when zero or >1 distinct sizes qualify. The
+    batch-axis twin of `shared_tile_height`."""
+    return _shared_dim_size(bindings, 0, 1)
+
+
+def run_batch_strips(interp, program, bindings, type_map, device, latent_channel_count,
+                     output_names, used_builtins, precision, n_strips: int,
+                     time_context: dict | None = None) -> dict:
+    """ROI-6: cook a PER-FRAME-INDEPENDENT program's batch in `n_strips` frame-strips (narrow
+    dim 0), bounding peak transient to ~1/n_strips of the full-batch cook, and stitch — the
+    batch-axis twin of `run_tiled`. The caller guarantees `tex_roi.batch_sliceable` (no
+    cross-frame read); `fi`/`fn` stay seam-exact via `batch_slice=(f0, B_total)`. Unlike
+    `run_tiled` this narrows the BATCH axis (dim 0), so a LATENT ([B,C,H,W]) batch-strips
+    safely (its batch is also dim 0). Falls back to a whole-batch cook when the batch isn't a
+    single shared size (heterogeneous / broadcast-only inputs).
+
+    ROI-6 GROUNDWORK: this has NO engine caller yet — the mechanism + analysis
+    (`tex_roi.batch_sliceable`) ship so a host / a future OOM-ladder path can drive it; wiring
+    it into the auto-tiling memory-pressure path is the near-term follow-up."""
+    def _whole():
+        return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
+                           output_names, used_builtins, precision, time_context)
+
+    B_total = shared_batch_size(bindings)
+    if B_total is None or B_total < 2:
+        return _whole()
+    n_strips = max(1, min(n_strips, B_total))
+    bounds = [(i * B_total) // n_strips for i in range(n_strips)] + [B_total]
+    # A batch-BROADCAST companion output (shape[0]==1 — e.g. `@MASK = @B` passing through a
+    # [1,H,W] input) is frame-independent: it must be returned once as [1,...], matching the
+    # whole-batch cook, NOT stitched into a [B_total,...] buffer. A per-frame output has
+    # shape[0]==(f1-f0) at every strip (including size-1 strips). The two are only
+    # distinguishable at a MULTI-frame strip (there a broadcast output is 1 while a per-frame
+    # output is >1); if the caller asked for so many strips that every strip is size 1, they
+    # are indistinguishable — cook whole-batch (no memory win over frame-by-frame anyway).
+    if max(bounds[k + 1] - bounds[k] for k in range(n_strips)) < 2:
+        return _whole()
+
+    batched: dict = {}     # name -> list[(f0, f1, tensor)] — a per-frame slice, stitched
+    broadcast: dict = {}   # name -> tensor — frame-independent / scalar / string (first wins)
+    for k in range(n_strips):
+        f0, f1 = bounds[k], bounds[k + 1]
+        if f1 <= f0:
+            continue
+        strip_bindings = {}
+        for name, v in bindings.items():
+            if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_total:
+                strip_bindings[name] = v.narrow(0, f0, f1 - f0)
+            else:
+                strip_bindings[name] = v          # broadcast singleton / scalar passes through
+        res = interp.execute(program, strip_bindings, type_map, device=device,
+                             latent_channel_count=latent_channel_count,
+                             output_names=output_names, used_builtins=used_builtins,
+                             precision=precision, batch_slice=(f0, B_total),
+                             time_context=time_context)
+        for name, so in res.items():
+            if isinstance(so, torch.Tensor) and so.dim() >= 1 and so.shape[0] == (f1 - f0):
+                batched.setdefault(name, []).append((f0, f1, so))
+            else:
+                broadcast.setdefault(name, so)    # shape[0]==1 at a multi-frame strip, scalar, string
+    outputs: dict = dict(broadcast)
+    for name, parts in batched.items():
+        if name in broadcast:
+            continue                              # also seen broadcast at a multi-frame strip → store once
+        first = parts[0][2]
+        full_shape = list(first.shape)
+        full_shape[0] = B_total
+        buf = torch.empty(full_shape, dtype=first.dtype, device=first.device)
+        for f0, f1, so in parts:
+            buf[f0:f1] = so
+        outputs[name] = buf
+    return outputs
+
+
+def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
+            output_names, used_builtins, precision, roi, narrow_names, halo: int,
+            time_context: dict | None = None) -> dict:
+    """ROI-3: cook only the output window `roi=(x0, y0, w, h, W, H)` of a full W×H image
+    (the 2-D generalization of `run_tiled`'s strip). The cook region is `ROI ⊕ halo`, clamped
+    to the image; `narrow_names` bindings are sliced to it (a zero-copy view, per spatial dim
+    so a broadcast singleton is left intact), and every other spatial binding passes WHOLE —
+    a gather reads it at absolute / full-normalized coordinates while the output stays the
+    ROI. The interpreter cooks the cook-region grid seam-exact (`roi=`); each cook-region
+    output is cropped back to the ROI sub-window.
+
+    Bit-exact vs the full cook: an ROI-interior pixel of a direct-tensor halo op (blur/
+    morphology) is `halo` pixels from the cook-region edge, so it reads the same real
+    neighbours as the whole-image cook (a conv's interior is independent of tensor extent);
+    a clamped edge replicate-pads at the true image edge either way. See
+    docs/roi-spatial-laziness.md.
+
+    LATENT ([B,C,H,W]) narrows the wrong axis, so it cooks whole-frame (the caller — the ROI
+    plan — already excludes it; this is belt-and-braces)."""
+    x0, y0, w, h, W, H = roi
+
+    def _whole():
+        return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
+                           output_names, used_builtins, precision, time_context)
+
+    if latent_channel_count:
+        return _whole()
+    # No spatial binding to anchor the shape → a purely generative program (no image input).
+    # The whole-frame cook of such a program has NO spatial grid (scalar mode), so cooking an
+    # ROI would fabricate a gradient the whole cook never produces — cook whole-frame instead.
+    if not any(isinstance(v, torch.Tensor) and v.dim() >= 3 for v in bindings.values()):
+        return _whole()
+    # Cook region = ROI ⊕ halo, clamped to the image.
+    cx0, cy0 = max(0, x0 - halo), max(0, y0 - halo)
+    cx1, cy1 = min(W, x0 + w + halo), min(H, y0 + h + halo)
+    cw, ch = cx1 - cx0, cy1 - cy0
+    if cw <= 0 or ch <= 0:
+        return _whole()
+
+    cook_bindings = {}
+    for name, v in bindings.items():
+        if name in narrow_names and isinstance(v, torch.Tensor) and v.dim() >= 3:
+            # Narrow each spatial dim ONLY if it is full-size (a broadcast singleton
+            # H==1 / W==1 is left to broadcast over the cook region, mirroring run_tiled).
+            if v.shape[1] == H:
+                v = v.narrow(1, cy0, ch)
+            if v.shape[2] == W:
+                v = v.narrow(2, cx0, cw)
+        cook_bindings[name] = v
+
+    res = interp.execute(program, cook_bindings, type_map, device=device,
+                         latent_channel_count=latent_channel_count,
+                         output_names=output_names, used_builtins=used_builtins,
+                         precision=precision, roi=(cx0, cy0, cw, ch, W, H),
+                         time_context=time_context)
+
+    # Crop each cook-region output to the ROI sub-window, PER SPATIAL DIM independently
+    # (mirroring the per-dim narrow): an output can legitimately be full in one spatial dim
+    # and broadcast (size 1) in the other — a horizontal/vertical gradient companion output,
+    # a broadcast strip. An all-or-nothing `shape[1]==ch AND shape[2]==cw` crop would leave
+    # such an output at the cook-region extent, uncropped and offset-wrong.
+    lx, ly = x0 - cx0, y0 - cy0
+    outputs = {}
+    for name, val in res.items():
+        if isinstance(val, torch.Tensor) and val.dim() >= 3:
+            if val.shape[1] == ch:
+                val = val[:, ly:ly + h]
+            if val.shape[2] == cw:
+                val = val[:, :, lx:lx + w]
+        outputs[name] = val   # scalar / string / genuinely-broadcast dims pass through
     return outputs
 
 

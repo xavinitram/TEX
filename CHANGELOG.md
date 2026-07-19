@@ -5,6 +5,167 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-07-18
+
+**See less, cook less** — spatial laziness. The single biggest interactivity lever a
+compositor has is to cook only the pixels the viewer asks for. This release builds the
+substrate: a per-binding spatial **footprint** analysis, a sub-region (`roi=`) executor that
+generalizes the M-4 height-strip to a 2-D window, the differential oracle that gates it, and
+the batch-axis (temporal) twin. ROI execution ships **flagged off** — measured, tested, and
+dormant behind `TEX_ROI_EXEC` until a viewport host consumes it. `tex_roi.py` is the new
+module; the design lives in `docs/roi-spatial-laziness.md`.
+
+### Added
+
+- **ROI-2 — `tex_roi.py`, spatial footprint analysis (the spatial sibling of `tex_lazy`).**
+  Per-binding access footprints on the lattice `point ⊑ halo(up,down,left,right) ⊑ image`,
+  composing `$param` folding (reused from `tex_lazy`), the ROI-1 registry taxonomy + the
+  **reach model**, and affine offset extraction (reused from `codegen_stencil`). `binding_
+  footprints()` returns the substrate; `roi_plan()` the ROI-3 execution plan. `where`/`if`
+  branches union; anything unresolved → whole-image. Never raises, over-approximates (a
+  too-large footprint is a missed optimisation, never a wrong pixel — invariant #11 ported
+  to the spatial lattice).
+  - **The reach multiplier** closes the trap the v0.23 audit flagged: `('halo_arg', i)` names
+    *which argument* carries the radius, not a pixel reach — `gauss_blur`'s kernel radius is
+    `ceil(3·sigma)`, **not** `sigma`. The descriptor gains an optional third element `mult`
+    (`('halo_arg', 1, 3.0)` for `gauss_blur`; default `1.0` for `erode`/`dilate`, whose
+    radius already is pixels), so a wrong reach can't silently under-pad. `_valid_footprint`
+    validates the new form and still fails loud on a malformed one.
+- **ROI-3 — `roi=(x0,y0,w,h,W,H)` sub-region execution (interpreter tier, flagged off).**
+  The M-4 `tile=(y0,H_total)` machinery generalized to a 2-D window: `ix`/`iy` offset by
+  `x0`/`y0`, `u`/`v`/`iw`/`ih`/`px`/`py` against the full `W`/`H` — seam-exact. `tile` is now
+  the 1-D special case `roi=(0,y0,W,H,W,H_total)`, **normalized to `roi` so there is one
+  coordinate path**. `tex_memory.run_roi` narrows every spatial input uniformly to the cook
+  region `ROI ⊕ H` (a zero-copy view), cooks, and crops each output to the ROI. Bit-exact
+  for pointwise + integer morphology; conv/bilateral within ~1 ulp (size-dependent kernel
+  dispatch). v1 executes the point + direct-tensor-halo (blur/morphology) class — the
+  dominant compositing ops; gathers/reductions fall to whole-frame (a decoupled gather output
+  grid is ROI-5). Wired through `tex_engine.cook(roi=)` → `prepare` → `_run_default`, gated by
+  `tex_roi.roi_exec_enabled()` (env `TEX_ROI_EXEC`, default off) and the interpreter tier
+  (compiled tiers don't thread `roi`, so they cook whole-frame — same posture as tiling).
+- **ROI-4 — the differential ROI oracle (the ship gate; `tests/test_v024_phase1.py`).** ROI
+  ships nothing until this is green: a **reach-pinning** test (a one-pixel impulse's output
+  spread ≤ the descriptor's declared reach — a wrong multiplier reds here), **spatial
+  never-sever rows** (any gather / reduction / symbolic radius / scatter → whole-frame, never
+  a shrunk ROI), and the **fuzz oracle** (seeded random ROI-executable programs × random ROIs,
+  ROI-assembled == whole-frame cook to `maxdiff < 1e-5`, the FUS-3 convention) plus a
+  partition-assembly test. CPU-pinned; CUDA looped. *The oracle earned its keep: it caught a
+  real bug during development — the cook halo must be the max reach of **any** halo op,
+  including one wrapping a generated (binding-free) expression like `erode(vec4(u,v),3)`, not
+  just those over bindings.*
+- **ROI-6 — temporal laziness groundwork (the batch-axis twin of ROI-3).** `tex_roi.frame_
+  window()` computes the program's temporal footprint `(min,max)` frame offset relative to
+  `fi` (via ROI-1's `('frame', i)` descriptors + affine frame-index extraction —
+  `fetch_frame(@A, fi-1, …)` → `(-1, 0)`); `batch_sliceable()` is the per-frame whitelist.
+  The interpreter gains `batch_slice=(f0, B_total)` — `fi` starts at `f0`, `fn` reports
+  `B_total`, seam-exact — and `tex_memory.run_batch_strips` cooks a per-frame program's batch
+  in frame-strips (narrowing dim 0, so a LATENT batch-strips safely) to bound VRAM on video
+  cooks. Cross-frame reads (a strip lacks the neighbour frames) stay whole-batch — the
+  temporal analog of a spatial gather, deferred with the same absolute-index limitation.
+
+### Changed
+
+- `interpreter.execute` / `_execute_inner` / `_create_builtins` gain sibling `roi=` and
+  `batch_slice=` parameters; `tile=` is normalized into `roi=` internally (one seam-exact
+  coordinate path). The builtins LRU keys on the raw `(tile, roi, batch_slice)` so a
+  sub-region / frame-strip cook can't alias a whole cook of the same `spatial_shape`; the
+  `tile→roi` normalization runs only after an LRU miss, so the warm-hit default path
+  (`tile=roi=batch_slice=None`) allocates nothing new and every coordinate is byte-identical
+  to before (invariant #7; measured +2.6 ns/cook, effectively neutral).
+- `gauss_blur`'s registry footprint is now `('halo_arg', 1, 3.0)` (was `('halo_arg', 1)`) —
+  a metadata-only change; `non_local`, `is_tile_safe`, and every other consumer are unchanged
+  (the classifier reads `footprint[0]`).
+
+### Fixed (pre-release adversarial bug-hunt — 6 agents on the ROI diff)
+
+Seven confirmed defects, all in the (flagged-off) ROI path — none reachable by a production
+ComfyUI cook, but each would make the ship gate dishonest. Each reproduced, fixed, and now
+covered by a new oracle/never-sever row so the ROI-4 gate would catch a regression:
+
+- **`roi_plan` executability made presence-based, not attribution-based.** A gather /
+  reduction reaching a binding through a **local-variable alias** (`vec4 x=@A; sample(x,…)`),
+  a **user-function parameter**, or a **bindless generated image** (`sample(vec4(u,v,…),…)`)
+  was wrongly declared ROI-executable → silent wrong pixels. Now ANY gather / reduction /
+  index-access present → whole-frame (the design doc's own gate, enforced on presence).
+- **Ungrounded halos block.** A blur/morphology chain split across a local variable
+  (`vec4 b = gauss_blur(@A,2); @OUT = gauss_blur(b,2)`) under-sized the cook halo (6, not the
+  true 12) → ROI-edge contamination. A halo op behind a local var / function / loop now cooks
+  whole-frame (v1 has no local-variable dataflow model).
+- **`run_roi` crops each spatial dim independently.** A companion output broadcast in exactly
+  one spatial dim (a gradient row `@ROW = iy/ih`, a broadcast strip passthrough) skipped the
+  all-or-nothing crop and returned at cook-region extent, wrong size and offset. Now cropped
+  per dim, mirroring the per-dim narrow.
+- **`batch_sliceable` is now false for ANY frame op** — including offset-0
+  `fetch_frame(@A, fi, …)` (an absolute-index gather that a strip clamps to a frozen edge
+  frame) and the 3-arg cross-frame sugar `@A[ix,iy,frame]` / `@A(u,v,frame)` (which
+  `_frame_ops` missed, as it parses to an index/sample access with the frame in the *last*
+  arg). Only pointwise-over-batch programs batch-slice in v1.
+- **The analysis honors its "never raises" contract** — the memo key (which could throw on a
+  non-`str` program or an unsortable param dict) moved inside the `try`; `binding_footprints`
+  and `roi_plan` were also consolidated onto one memoized `_walk` (the 18th cache).
+
+A **second audit** (19 findings) surfaced a further hole in the executability guard and
+coverage gaps — fixed before the flag can ever flip:
+
+- **A halo result flowing through a NAME** — a bare `t = gauss_blur(@A,2)`, a reassignment
+  `x = gauss_blur(x,2)`, or an intermediate output `@T = gauss_blur(@A,2)` — then blurred
+  again slipped past the first ungrounded-halo guard (which only caught VarDecl *initializers*)
+  → under-sized cook halo, ROI-edge contamination. The guard now blocks whenever a name
+  assigned a halo-containing value is read elsewhere; a name carrying a mere INPUT
+  (`vec4 x=@A; gauss_blur(x,2)`) and multi-output programs stay executable.
+- A **purely generative** program (no image input) given `roi=` cooked a fabricated gradient
+  the whole-frame cook (scalar mode) never produces → `run_roi` now falls back to whole-frame
+  when no spatial binding is present.
+- The ROI cook is **clamped to fp32** even under `precision="fp16"` (the ~1-ulp conv slack
+  scales at fp16; the oracle validates fp32).
+- **Coverage**: the differential oracle now fuzzes multi-statement programs with locals and a
+  partial-broadcast companion output (the gap that let the above through) and reports all
+  mismatches instead of breaking on the first; a new test drives the real
+  `cook(roi=)`→`prepare`→`_run_default` engine path (flag gate, fp32 clamp, non-executable
+  fallback); and the `tile≡roi` test now pins coordinates against an independent literal grid.
+
+A **third bug-hunt** (post-`/simplify`, 4 finders) confirmed the diff clean and surfaced two
+low/latent gaps in `roi_plan`, now closed: a **channel/array-wrapped scatter target**
+(`@OUT[x,y].r = …`, `@OUT[x,y][0] = …` — a `ChannelAccess`/`ArrayIndexAccess` around the
+`BindingIndexAccess`) escaped the scatter gate (a pre-existing `_has_scatter` gap, not a
+regression); and a degenerate zero-arg spatial call (`img_mean()`) was reported executable.
+Both now block; a plain swizzle write (`@OUT.rgb = …`, not a scatter) stays executable.
+
+A **third audit** (4-finder × per-finding verify sweep) closed the last executability hole
+and two coverage/doc gaps — again, all before the flag can flip:
+
+- **A halo chain through a name NESTED in an `if`/loop body** — `if (u>0.5) { @T =
+  gauss_blur(@A,2); @OUT = gauss_blur(@T,2); }` — escaped BOTH ungrounded-halo detectors: the
+  block-scan didn't treat `if` as a reach boundary (correctly — a single grounded blur in a
+  branch composes fine), and the halo-through-name collector only scanned *top-level*
+  statements. So the ±12 chain cooked on `ROI ⊕ 6` → seam contamination (measured maxdiff
+  3.2e-3, ~320× the ship tolerance). The collector now recurses into every block, mirroring
+  the read-side walk; a single grounded blur in an `if` stays executable (new positive row).
+- **`run_batch_strips` mis-stitched a batch-broadcast companion output** (`@OUT=@A; @AUX=@B`
+  with `@B` a `[1,H,W]` passthrough): the stitch keyed on `shape[0]==(f1-f0)`, so a `[1,…]`
+  output was left `torch.empty` garbage on multi-frame strips and wrongly replicated to
+  `[B_total,…]` when every strip was size 1. Now classified per output (per-frame → stitched,
+  frame-independent → stored once as `[1,…]`, matching the whole-batch cook), with a
+  multi-output/all-strip-size regression row (the ROI-6 oracle previously cooked only
+  single-output fully-batched programs, so the bug was invisible).
+- **Coverage + docs**: `bilateral_filter` — the 4th whitelist op, named in the oracle's
+  "conv/bilateral ~1 ulp" tolerance — is now generated by the differential fuzzer (was never
+  cooked through `run_roi`); and the `('halo_arg', i, mult)` reach-multiplier form is now in
+  AGENTS.md invariant #5 + the stdlib recipe and DEVELOPMENT.md (it lived only in the
+  registry/CHANGELOG, so a maintainer adding a `k·arg` blur could have re-introduced the 3×
+  under-pad trap).
+
+Full suite green after all three rounds (2074/2075; the one failure is the pre-existing
+`S-4 console` env-only case — an embedded-Python subprocess can't import `TEX_Wrangle`).
+
+### Notes
+
+- **Flagged off by design.** No ComfyUI cook passes `roi=`/`batch_slice=`; the oracle drives
+  `run_roi`/`run_batch_strips` directly. The flag flips to a production path when a viewport
+  host consumes a sub-region and the fuzz lane is green across a nightly run — a later release.
+- Exit gate (roadmap §9 v0.24): the differential ROI fuzz lane is green (CPU + CUDA); no ROI
+  cook ships wrong pixels silently.
+
 ## [0.23.0] - 2026-07-18
 
 **Authoring** — the language grows its tool-era surface. Param widgets get metadata, the

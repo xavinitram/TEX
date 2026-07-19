@@ -165,7 +165,7 @@ def test_roi1_is_tile_safe_unchanged(r: SubTestResult):
     cases = [
         ("@OUT = vec4(@A.rgb * v + u, 1.0);", True, "pointwise arithmetic"),
         ("@OUT = vec4(sample(@A, u + 0.01, v).rgb, 1.0);", False, "sample -> 'image'"),
-        ("@OUT = vec4(gauss_blur(@A, 2.0).rgb, 1.0);", False, "gauss_blur -> ('halo_arg',1)"),
+        ("@OUT = vec4(gauss_blur(@A, 2.0).rgb, 1.0);", False, "gauss_blur -> ('halo_arg',1,3.0)"),
         ("@OUT = vec4(vec3(img_mean(@A)), 1.0);", False, "img_mean -> 'image'"),
         ("@OUT = vec4(sample_frame(@A, 0, u, v).rgb, 1.0);", False, "sample_frame -> ('frame',1)"),
     ]

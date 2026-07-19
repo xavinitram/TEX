@@ -188,7 +188,7 @@ the raw fp16 win (~1.35–1.45×) is available, without the safety net, via expe
 (`img_*`, `arr_*`) accumulate in fp32 (an fp16 sum overflows to inf at ≥1024²); an
 out-of-fp16-range literal / a large-value `vec()` also stays fp32 (interp==codegen).
 
-## The 17-cache architecture
+## The 18-cache architecture
 
 Non-redundant by design — each store keys on a different thing (source-hash vs
 `id()`-type_map vs device/precision tuple vs AST-fingerprint vs resolution-bucket)
@@ -201,5 +201,8 @@ fp16/fp32 gate decision — the *decision*, not the per-cook finiteness verdict;
 cleared at 512 entries). #16 (v0.21 LAT-3) is `compiled._deferred_ev` (slot →
 pending CUDA event pair for the deferred timing readback; bounded, cleared with the
 compiled cache). #17 (v0.21 ENG-8) is `xfer._MODEL` (transfer-lane → fitted
-latency+bandwidth; persisted to `xfer.json`, versioned by device+torch). The count
-here must match AGENTS.md (a DOC-7b check enforces it).
+latency+bandwidth; persisted to `xfer.json`, versioned by device+torch). #18 (v0.24
+ROI-2) is `tex_roi._walk_memo` (code-hash × fp32 param bits → the spatial footprint walk
+`(reads, blocked, halo)`; shared by `binding_footprints`/`roi_plan`, keyed exactly like
+`tex_lazy._memo` but a distinct analysis). The count here must match AGENTS.md (a DOC-7b
+check enforces it).

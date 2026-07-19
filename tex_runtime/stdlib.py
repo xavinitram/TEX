@@ -1279,7 +1279,7 @@ class TEXStdlib:
         """
         return _sample_mip_trilinear(image, u_coord, v_coord, lod, _get_mip_pyramid)
 
-    @stdlib("gauss_blur", sig='gauss_blur(img, sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1), doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.', ex='@OUT = gauss_blur(@A, 2.0);')
+    @stdlib("gauss_blur", sig='gauss_blur(img, sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0), doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.', ex='@OUT = gauss_blur(@A, 2.0);')
     @staticmethod
     def fn_gauss_blur(image, sigma) -> torch.Tensor:
         """Separable Gaussian blur.

@@ -196,6 +196,12 @@ class ExecContext:
     # P1: free VRAM as the M-1 preflight measured it, for _tile_plan to reuse. None when
     # unknown or when the preflight freed models (which makes the reading stale-low).
     free_hint: Any = None
+    # ROI-3: the output sub-window (x0,y0,w,h,W,H) to cook, and the tex_roi plan (narrow
+    # names + halo). Both None unless a host passed `roi=`, the program is ROI-executable,
+    # and TEX_ROI_EXEC is on — then `_run_default` routes through tex_memory.run_roi. Flagged
+    # off by default (no ComfyUI caller passes roi=). See docs/roi-spatial-laziness.md.
+    roi: Any = None
+    roi_plan: Any = None
 
 
 @dataclass(frozen=True)
@@ -453,6 +459,19 @@ def _run_cuda_graph(ctx: ExecContext):
 
 
 def _run_default(ctx: ExecContext):
+    # ROI-3: cook only the requested sub-window (interpreter tier, flagged off — set only
+    # when a host passed `roi=`, the program is ROI-executable, and TEX_ROI_EXEC is on). The
+    # narrow-cook-crop is bit-exact for pointwise/morphology, ~1 ulp for conv. Whole-frame on
+    # any run_roi error (never hard-fail the cook).
+    if ctx.roi is not None and ctx.roi_plan is not None:
+        try:
+            from .tex_memory import run_roi
+            return run_roi(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
+                           ctx.device, ctx.latent_channel_count, ctx.output_names,
+                           ctx.used_builtins, ctx.eff_precision, ctx.roi,
+                           ctx.roi_plan.narrow, ctx.roi_plan.halo, ctx.time_context)
+        except Exception as _roi_exc:
+            logger.warning("[TEX] ROI cook failed (%s); running whole-frame.", _roi_exc)
     # UC-2: default-route an exact (fetch/conv) stencil through the codegen tier
     # (avg_pool2d/conv2d/unfold). _codegen_only_execute self-falls-back; the outer
     # guard covers env-build edge cases so this can never hard-fail the node.
@@ -689,7 +708,8 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             precision: str = "fp32", has_latent_input: bool = False,
             latent_channel_count: int = 0, forgive_dead_refs: bool = False,
             debug_nan_highlight: bool = False, time_context: dict | None = None,
-            max_outputs: int = MAX_OUTPUTS, disown: bool = True) -> CookPlan:
+            max_outputs: int = MAX_OUTPUTS, disown: bool = True,
+            roi: tuple | None = None) -> CookPlan:
     """Resolve everything a cook needs *without running it*: compile (or splice a fused
     chain), resolve the device, gate the outputs and references, fold params, resolve
     `precision="auto"`, and select the tier.
@@ -902,11 +922,27 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     # M-3: LATENT data exceeds [0,1] and feeds further math, so it must stay
     # fp32 even in fp16 mode.
     eff_precision = "fp32" if has_latent_input else precision
+    tier_id = select_tier(compile_mode, device, fused_chain, fused_fp is not None)
+    # ROI-3: gate the sub-window cook. Flagged OFF (TEX_ROI_EXEC) and interpreter-tier only —
+    # compiled tiers don't thread roi, so a would-be ROI cook that resolved to a compiled tier
+    # simply runs whole-frame (same posture as tiling). Non-fused, non-latent, executable.
+    roi_out = roi_plan_obj = None
+    if roi is not None and tier_id == "default" and not fused_chain and not has_latent_input:
+        from . import tex_roi as _tex_roi
+        if _tex_roi.roi_exec_enabled():
+            scalar_params = {n: v for n, v in bindings.items()
+                             if isinstance(v, (bool, int, float))}
+            _plan = _tex_roi.roi_plan(code, scalar_params)
+            if _plan.executable:
+                roi_out, roi_plan_obj = roi, _plan
+                # ROI is validated (oracle) at fp32 only, and the ~1-ulp conv slack the
+                # narrow-cook-crop leaves would scale up at fp16 — clamp the ROI cook to fp32
+                # (the same conservative posture as the compiled-tier / LATENT fp32 forces).
+                eff_precision = "fp32"
     ctx = ExecContext(program, bindings, type_map, device, code,
                       latent_channel_count, output_names, used_builtins,
                       eff_precision, fp, fused_chain, fused_fp, time_context,
-                      free_hint)   # the free-VRAM reading _tile_plan reuses (P1)
-    tier_id = select_tier(compile_mode, device, fused_chain, fused_fp is not None)
+                      free_hint, roi_out, roi_plan_obj)  # ROI-3 window + plan (None unless armed)
     return CookPlan(ctx=ctx, tier_id=tier_id, assigned=assigned_bindings,
                     auto_fp16=auto_fp16, debug_nan_highlight=debug_nan_highlight,
                     cook_px=cook_px, auto_ckey=auto_ckey, disown=disown)

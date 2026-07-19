@@ -284,8 +284,11 @@ if node.name == "saturate":
 decorator** — the taxonomy sets DERIVE from the tags (TST-3 fails a mismatch); do NOT
 edit the sets by hand. Leaving a footprint unset is **silently wrong when tiled** and/or
 fails CUDA-graph capture:
-- `footprint=` (ROI-1) — one of `('halo', r)`, `('halo_arg', i)`, `'image'`, `('frame', i)`;
-  derives `tex_memory._NON_LOCAL_FNS` (default `'point'` → wrong output when tiled).
+- `footprint=` (ROI-1) — one of `('halo', r)`, `('halo_arg', i[, mult])`, `'image'`,
+  `('frame', i)`; derives `tex_memory._NON_LOCAL_FNS` (default `'point'` → wrong output when
+  tiled). The optional `mult` (default `1.0`) turns a non-pixel arg into a pixel reach —
+  `gauss_blur` is `('halo_arg', 1, 3.0)` (radius `= 3·sigma`); a missing `mult` under-pads the
+  ROI cook halo (ROI-4's reach-pinning test catches it).
 - `sync=True` — if it does an internal `.item()`/sync (derives `graphed._SYNC_STDLIB`).
 - `spatial=True` — if codegen should lower it as a stencil (derives `codegen._SPATIAL_STDLIB`).
 
@@ -636,8 +639,10 @@ concurrency lens on it):
 
 - **Immutable-after-insert (IAI)** — value never mutated once stored; only the LRU
   container is managed. `_FINGERPRINT_MEMO`, `_tile_safe_memo`, `_peak_static_memo`,
-  `tex_lazy._memo`, `_stencil_route_memo`, `_route_memo`, `_ENV_TENSOR_CACHE`,
-  `_gauss_kernel_cache`, the worley-offset caches, `_AUTO_DECISION`, `_FUSED_MEMO`. A
+  `tex_lazy._memo`, `tex_roi._walk_memo` (ROI-2, keyed on `(code-hash, param-key)` exactly
+  like `tex_lazy._memo`; shared by `binding_footprints`/`roi_plan`), `_stencil_route_memo`,
+  `_route_memo`, `_ENV_TENSOR_CACHE`, `_gauss_kernel_cache`, the worley-offset caches,
+  `_AUTO_DECISION`, `_FUSED_MEMO`. A
   concurrent insert of the same key recomputes the same value (harmless); a racy eviction
   at worst *over-evicts* (a later recompute). Safe for concurrent CPU cooks under CPython's
   GIL (verified under eviction pressure). A future non-GIL/free-threaded runtime should

@@ -152,9 +152,10 @@ class Interpreter:
         self._scatter_owned: set[str] = set()  # bindings whose buffer this run owns (safe to scatter into)
         self._user_functions: dict[str, FunctionDef] = {}
         self._call_depth: int = 0
-        # LAT-4: bounded LRU of coordinate-builtin env sets, keyed by the same
-        # (spatial_shape, device, dtype, used, latent_channels, tile) tuple. Replaces
-        # a single (key, env) slot that thrashed under proxy/full-res alternation.
+        # LAT-4: bounded LRU of coordinate-builtin env sets, keyed by the
+        # (spatial_shape, device, dtype, used, latent_channels, tile, roi, batch_slice) tuple
+        # (ROI-3/ROI-6 added roi/batch_slice; `tile` is normalized into `roi` only after a
+        # miss). Replaces a single (key, env) slot that thrashed under proxy/full-res alternation.
         self._builtins_lru: "OrderedDict[tuple, dict[str, torch.Tensor]]" = OrderedDict()
         self._assigned_vars_cache: dict[int, tuple[set[str], set[str]]] = {}
         # UC-3: per-loop-node structural eligibility for uniform-range resolution.
@@ -204,6 +205,8 @@ class Interpreter:
         used_builtins: frozenset[str] | None = None,
         source: str = "",
         tile: tuple[int, int] | None = None,
+        roi: tuple[int, int, int, int, int, int] | None = None,
+        batch_slice: tuple[int, int] | None = None,
         time_context: dict | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
@@ -212,6 +215,21 @@ class Interpreter:
         tile: (y0, H_total) for M-4 strip execution — this call processes a
             horizontal strip whose top row is y0 of a full image of H_total rows.
             iy/v/ih/py are computed against the full image so seams are exact.
+
+        roi: (x0, y0, w, h, W, H) for ROI-3 sub-region execution — this call cooks a
+            w×h window whose top-left is (x0, y0) of a full W×H image. The 2-D
+            generalization of `tile` (which is exactly roi=(0, y0, W, H, W, H_total)):
+            ix/iy start at x0/y0 and u/v/iw/ih/px/py are computed against the full W/H, so
+            the window's coordinates match the untiled cook exactly. The bindings this call
+            receives are already sliced by `tex_memory.run_roi` (narrow inputs to ROI ⊕ halo,
+            gathers passed whole). Mutually exclusive with `tile`.
+
+        batch_slice: (f0, B_total) for ROI-6 temporal batch-strip execution — this call cooks
+            frames [f0, f0+B) of a full batch of B_total frames (the batch-axis twin of
+            `tile`). `fi` starts at f0 and `fn` reports B_total, so a per-frame program's
+            frame builtins match the whole-batch cook exactly (seam-exact). v1 is per-frame
+            only: cross-frame `fetch_frame`/`sample_frame` are not batch-sliced (they read
+            neighbour frames a strip lacks — the temporal analog of a spatial gather).
 
         Args:
             program: Parsed and type-checked AST
@@ -235,7 +253,8 @@ class Interpreter:
             return self._execute_inner(program, bindings, type_map, device,
                                        latent_channel_count, output_names,
                                        precision, used_builtins=used_builtins,
-                                       tile=tile, time_context=time_context)
+                                       tile=tile, roi=roi, batch_slice=batch_slice,
+                                       time_context=time_context)
 
 
 
@@ -261,6 +280,8 @@ class Interpreter:
         precision: str = "fp32",
         used_builtins: frozenset[str] | None = None,
         tile: tuple[int, int] | None = None,
+        roi: tuple[int, int, int, int, int, int] | None = None,
+        batch_slice: tuple[int, int] | None = None,
         time_context: dict | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
@@ -324,11 +345,14 @@ class Interpreter:
             else:
                 self.bindings[name] = torch.scalar_tensor(float(value), dtype=target_dtype, device=target_device)
 
-        # Determine spatial context from image inputs
-        self.spatial_shape = self._determine_spatial_shape()
+        # Determine spatial context from image inputs. Under an ROI cook the grid is the
+        # cook-region (w,h) from `roi`, NOT a binding's shape — a whole-passed gather input
+        # keeps the full W×H, so first-wins binding inference would size the grid wrong.
+        self.spatial_shape = self._determine_spatial_shape(roi=roi)
 
         # Create built-in coordinate variables (lazy — only what the program uses)
-        self._create_builtins(program, used_builtins=used_builtins, tile=tile)
+        self._create_builtins(program, used_builtins=used_builtins, tile=tile, roi=roi,
+                              batch_slice=batch_slice)
 
         # XPU fence: the async pinned→CUDA ingest DMA is stream-ordered ahead of
         # every kernel this cook launched — record its completion point NOW so
@@ -388,41 +412,62 @@ class Interpreter:
             val = val.float()
         return val
 
-    def _determine_spatial_shape(self) -> tuple[int, int, int] | None:
-        """Find the spatial dimensions from image inputs."""
+    def _determine_spatial_shape(self, roi=None) -> tuple[int, int, int] | None:
+        """Find the spatial dimensions from image inputs. Under an ROI cook (`roi` set) the
+        grid is the cook-region (w, h) the executor sliced to, with the batch taken from the
+        first spatial binding — a whole-passed gather input keeps the full W×H, so it must
+        not size the grid."""
+        batch = None
         for name, value in self.bindings.items():
-            if name == "OUT":
+            if name == "OUT" or isinstance(value, str):
                 continue
-            if isinstance(value, str):
-                continue  # strings have no spatial shape
             if isinstance(value, torch.Tensor) and value.dim() >= 3:
                 # IMAGE: [B, H, W, C] or MASK: [B, H, W]
-                return (value.shape[0], value.shape[1], value.shape[2])
+                if roi is None:
+                    return (value.shape[0], value.shape[1], value.shape[2])
+                batch = value.shape[0]
+                break
+        if roi is not None:
+            _x0, _y0, w, h, _W, _H = roi
+            return (batch if batch is not None else 1, h, w)
         return None
 
     def _create_builtins(self, program: Program,
                          used_builtins: frozenset[str] | None = None,
-                         tile: tuple[int, int] | None = None):
+                         tile: tuple[int, int] | None = None,
+                         roi: tuple[int, int, int, int, int, int] | None = None,
+                         batch_slice: tuple[int, int] | None = None):
         """Create built-in variables lazily — only allocate what the program uses.
 
         Builtins use compact broadcast-friendly shapes instead of full
         [B, H, W] expansion. PyTorch broadcasts automatically in ops.
 
-        When `tile=(y0, H_total)` (M-4 strip execution), the vertical builtins are
-        computed against the FULL image: iy starts at y0, and v/ih/py use H_total,
-        so a strip's coordinates match the untiled cook exactly (seam-exact).
+        ROI-3: `roi=(x0, y0, w, h, W, H)` cooks a sub-window — ix/iy start at x0/y0 and
+        u/v/iw/ih/px/py reference the FULL W/H, so the window's coordinates match the
+        untiled cook exactly (seam-exact in 2-D). The M-4 strip `tile=(y0, H_total)` is the
+        1-D special case `roi=(0, y0, W, H, W, H_total)`; it is normalized to `roi` here so
+        there is a SINGLE seam-exact coordinate path to reason about.
         """
         used = used_builtins if used_builtins is not None else _collect_identifiers(program)
 
-        # Cache builtins: reuse tensors when spatial config hasn't changed (LAT-4:
-        # small LRU, so proxy<->full-res alternation hits instead of rebuilding).
-        cache_key = (self.spatial_shape, self._device_str, self._dtype, used, self.latent_channel_count, tile)
+        # Cache builtins: reuse tensors when spatial config hasn't changed (LAT-4: small LRU,
+        # so proxy<->full-res alternation hits instead of rebuilding). Key on the RAW
+        # (tile, roi, batch_slice) — on the default cook all three are None (like the old
+        # `tile=None` slot), so the warm-hit path allocates nothing; the tile→roi normalization
+        # runs only AFTER a miss (below), for the coordinate build (the sole `roi` consumer).
+        cache_key = (self.spatial_shape, self._device_str, self._dtype, used,
+                     self.latent_channel_count, tile, roi, batch_slice)
         hit = self._builtins_lru.get(cache_key)
         if hit is not None:
             self._builtins_lru.move_to_end(cache_key)
             self.env.update(hit)
             self._set_time_builtins(used)   # ENG-7: never cached — see _TIME_BUILTIN_NAMES
             return
+
+        # MISS: normalize the strip form into the general ROI form (the one coordinate path).
+        if self.spatial_shape and roi is None:
+            _B, _H, _W = self.spatial_shape
+            roi = (0, tile[0], _W, _H, _W, tile[1]) if tile is not None else (0, 0, _W, _H, _W, _H)
 
         # M-3: coordinate/spatial builtins are ALWAYS fp32 (never self._dtype).
         # fp16 `u` has only 4097 distinct values across 8192 pixels and
@@ -431,43 +476,48 @@ class Interpreter:
         cdt = torch.float32
         if self.spatial_shape:
             B, H, W = self.spatial_shape
-            # M-4: vertical coordinates reference the full image under tiling.
-            y0, H_total = (tile if tile is not None else (0, H))
+            # ROI-3: the grid is W×H (the cook-region); coordinates offset by (x0, y0)
+            # reference the full W_full×H_full image.
+            x0, y0, _w, _h, W_full, H_full = roi
 
-            # ix: pixel x-coordinate [0, W-1] — compact shape [1, 1, W]
+            # ix: pixel x-coordinate (offset by the ROI's left column)
             # u/v use expand() which creates a view (no memory copy) at [B,H,W]
             # for compatibility with torch.stack in sampling functions.
             if "ix" in used or "u" in used:
-                ix = torch.arange(W, dtype=cdt, device=self.device).view(1, 1, W)
+                ix = torch.arange(x0, x0 + W, dtype=cdt, device=self.device).view(1, 1, W)
                 if "ix" in used:
                     self.env["ix"] = ix
                 if "u" in used:
-                    self.env["u"] = (ix / max(W - 1, 1)).expand(B, H, W)
+                    self.env["u"] = (ix / max(W_full - 1, 1)).expand(B, H, W)
 
-            # iy: pixel y-coordinate (offset by the strip's top row under tiling)
+            # iy: pixel y-coordinate (offset by the ROI's top row)
             if "iy" in used or "v" in used:
                 iy = torch.arange(y0, y0 + H, dtype=cdt, device=self.device).view(1, H, 1)
                 if "iy" in used:
                     self.env["iy"] = iy
                 if "v" in used:
-                    self.env["v"] = (iy / max(H_total - 1, 1)).expand(B, H, W)
+                    self.env["v"] = (iy / max(H_full - 1, 1)).expand(B, H, W)
 
-            # iw, ih: image dimensions (ih is the FULL height under tiling)
+            # iw, ih: image dimensions (the FULL image under an ROI/strip)
             if "iw" in used:
-                self.env["iw"] = torch.scalar_tensor(float(W), dtype=cdt, device=self.device)
+                self.env["iw"] = torch.scalar_tensor(float(W_full), dtype=cdt, device=self.device)
             if "ih" in used:
-                self.env["ih"] = torch.scalar_tensor(float(H_total), dtype=cdt, device=self.device)
+                self.env["ih"] = torch.scalar_tensor(float(H_full), dtype=cdt, device=self.device)
 
-            # px, py: pixel step in UV space (1/width, 1/full-height)
+            # px, py: pixel step in UV space (1/full-width, 1/full-height)
             if "px" in used:
-                self.env["px"] = torch.scalar_tensor(1.0 / max(W, 1), dtype=cdt, device=self.device)
+                self.env["px"] = torch.scalar_tensor(1.0 / max(W_full, 1), dtype=cdt, device=self.device)
             if "py" in used:
-                self.env["py"] = torch.scalar_tensor(1.0 / max(H_total, 1), dtype=cdt, device=self.device)
+                self.env["py"] = torch.scalar_tensor(1.0 / max(H_full, 1), dtype=cdt, device=self.device)
 
+            # ROI-6: under a batch strip, fi references the FULL batch (fi starts at f0) and
+            # fn reports B_total — the temporal twin of iy/ih under a tile, so a per-frame
+            # program's frame builtins match the whole-batch cook exactly (seam-exact).
+            f0, B_total = batch_slice if batch_slice is not None else (0, B)
             if "fi" in used:
-                self.env["fi"] = torch.arange(B, dtype=cdt, device=self.device).view(B, 1, 1)
+                self.env["fi"] = torch.arange(f0, f0 + B, dtype=cdt, device=self.device).view(B, 1, 1)
             if "fn" in used:
-                self.env["fn"] = torch.scalar_tensor(float(B), dtype=cdt, device=self.device)
+                self.env["fn"] = torch.scalar_tensor(float(B_total), dtype=cdt, device=self.device)
         else:
             # No spatial context — pure scalar mode (only create what's used)
             for name, val in _SCALAR_BUILTIN_DEFAULTS.items():
