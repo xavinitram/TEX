@@ -667,6 +667,25 @@ def main():
     test_roi5_halo_tiling(r)
     test_cache6_fusion_recook(r)
 
+    # v0.28.0 Phase 1 — "Second host" (DATA-1 metadata sidecar, DATA-2 storage/EXR/PNG16,
+    # DATA-3 array wires, DATA-4 session + soak, PORT-5 the standalone host demo / PM-2)
+    from test_v028_phase1 import (
+        test_data1_metadata,
+        test_data2_storage_exr,
+        test_data3_array_wires,
+        test_data4_session_soak,
+        test_port5_second_host,
+        test_data_canaries,
+        test_root_channel_and_swizzle_fixes,
+    )
+    test_data1_metadata(r)
+    test_data2_storage_exr(r)
+    test_data3_array_wires(r)
+    test_data4_session_soak(r)
+    test_port5_second_host(r)
+    test_data_canaries(r)
+    test_root_channel_and_swizzle_fixes(r)
+
     success = r.summary()
     return 0 if success else 1
 

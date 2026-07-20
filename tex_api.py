@@ -51,6 +51,19 @@ from .tex_compiler.diagnostics import TEXCompileError, TEXDiagnostic  # noqa: F4
 # catches CookCancelled and wires a CancelToken from the same facade it cooks through.
 from .tex_runtime.host import CookCancelled, CancelToken  # noqa: F401
 
+# DATA-1: the buffer-metadata sidecar — a host tags inputs with colour/alpha/frame, passes
+# them to `tex_engine.cook(binding_meta=...)`, and reads the merged tags back off
+# `CookResult.out_meta`. The tags + merge policy live in tex_marshalling (the wire seam); the
+# W7005 gamma-halo lint is `color_advisories` below (an analysis, so it lives beside check()).
+from .tex_marshalling import (  # noqa: F401
+    BufferMeta, COLORSPACES, PREMULT, merge_buffer_meta,
+)
+
+# DATA-4: the engine session — one handle a standalone host holds over the process's cook state
+# (program cache, governor, host services, interpreter) with `reset()` / `close()` / `stats()`.
+# Phase 1 is a view of the module singletons (ComfyUI byte-identical); see tex_session.
+from .tex_session import EngineSession, default_session  # noqa: F401
+
 # LANG-3: the TEX LANGUAGE version — grammar + semantics — versioned SEPARATELY from the
 # package `__version__`. A program may declare the language level it targets with a leading
 # `//!tex X.Y` pragma; `check()` advises (W7004) when a program targets a NEWER language
@@ -204,6 +217,43 @@ def check(source: str, binding_types: dict) -> list:
         return pragma_diags + [make_diagnostic(
             code="E0000", message=f"internal error during check(): {e}",
             loc=None, source=source, phase="compile")]
+
+
+# W7005 (DATA-1 phase 2): the gamma-space halo hazard. A spatial op — blur, morphology, any
+# neighbourhood gather — averages a pixel's neighbours; averaging in a NON-LINEAR space (srgb,
+# oklab) darkens edges and shifts hue, the mistake the stdlib docstrings warn about in prose.
+# (W7004 above is LANG-3's language-version advisory; this is the next free warning code.)
+_NONLINEAR_SPACES = ("srgb", "oklab")
+
+
+def color_advisories(source: str, param_values: dict | None, binding_meta: dict | None) -> list:
+    """W7005 diagnostics (DATA-1): a non-pointwise read of a non-linearly-tagged buffer. A
+    host/editor advisory that pairs the program's spatial footprints (`tex_roi.binding_footprints`,
+    the ROI-2 substrate) with the host's per-input colour tags (`BufferMeta.colorspace`). Pure
+    analysis — no cook, no side effects — and total (never raises). Returns [] when the host
+    tagged nothing non-linear (the default path) or the footprint analysis is unavailable; it is
+    off the cook path. It lives here beside `check()`, the host-facing diagnostics surface."""
+    if not binding_meta:
+        return []
+    tagged = {n: m for n, m in binding_meta.items() if m.colorspace in _NONLINEAR_SPACES}
+    if not tagged:
+        return []
+    from . import tex_roi
+    from .tex_compiler.diagnostics import make_diagnostic
+    fps = tex_roi.binding_footprints(source, param_values or {})
+    if not fps:
+        return []
+    out = []
+    for name, meta in tagged.items():
+        fp = fps.get(name)
+        if fp is not None and fp.kind != "point":
+            out.append(make_diagnostic(
+                "W7005",
+                f"A spatial operation reads '@{name}', tagged {meta.colorspace}: averaging a "
+                f"neighbourhood in a non-linear space darkens edges and shifts hue. Convert to "
+                f"linear first (e.g. srgb_to_linear), operate, then convert back.",
+                loc=None, source=source, severity="warning", phase="type_checker"))
+    return out
 
 
 def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp32",

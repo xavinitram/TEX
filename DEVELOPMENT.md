@@ -604,6 +604,10 @@ breaks a host.
 | **1 — Public** | GraphSpec (`_tex_chain`) + `GRAPHSPEC_SCHEMA` (SCHED-1) | Versioned; absent == 1; a newer schema is REFUSED, never guessed | `test_eng5_embedding_canaries` |
 | **1 — Public** | The `.textool` manifest + `TEXTOOL_SCHEMA` + `promoted_params` key set (TOOL-1) | Versioned; a newer `manifest_schema` is REFUSED; validated before any compile | `test_tool_manifest_keys`, `test_tool_schema_rejects` |
 | **1 — Public** | Egress profiles `comfy` / `engine` (ENG-3) | `comfy` is byte-identical, forever | `test_eng3_comfy_profile_canary` |
+| **1 — Public** | `tex_marshalling.BufferMeta` fields + `merge_buffer_meta` + `CookResult.out_meta` (DATA-1) | The colour/alpha/frame tag vocabularies + the merge-to-`unknown` policy; a value channel, never keyed | `test_v028_phase1` |
+| **1 — Public** | `tex_io.BufferDesc` + `tex_io.exr` / `tex_io.png` (DATA-2) | Storage dtypes; EXR is the OpenEXR format (NONE/ZIP scanline, HALF/FLOAT) — the file bytes are the standard's contract | `test_v028_phase1` |
+| **1 — Public** | `tex_session.EngineSession` / `default_session` (DATA-4) | The session handle; phase-1 `.cache`/`.registry`/`.host` view the module singletons | `test_v028_phase1` |
+| **2 — Semi** | `a@name` ARRAY wire + array outputs (DATA-3) | Engine-profile only; `a` is now a RESERVED binding prefix; comfy rejects array outputs (E3203 + egress guard) | `test_v028_phase1` |
 | **2 — Semi** | TEX the language | Additive; new builtin/function names are RESERVED, so adding one is a minor breaking change — note it in the CHANGELOG (v0.22 reserved `frame`/`fps`/`time`) | the compat corpus (LANG-3, planned) |
 | **2 — Semi** | Error codes (E1xxx–E6xxx) | Codes are stable; message TEXT is not | `test_c3ux_error_codes_resolve` |
 | **3 — Internal** | Everything else — `tex_runtime.*`, `tex_compiler.*`, `tex_fusion` internals, `tex_engine._*` | No promise. Import at your own risk | — |
@@ -667,6 +671,23 @@ concurrency lens on it):
   *only* because both run on the one `max_workers=1` worker.
 
 The single existing data lock (`noise._TieredCache._lock`) predates ENG-9 and stays.
+
+**The engine session (DATA-4).** `tex_session.EngineSession` is a *handle* over the state
+classified above — the program cache, the CACHE-5 governor, host services, and the per-thread
+interpreter pool — not a new owner of it. Phase 1 has exactly one session (the process default);
+its `.cache` / `.registry` / `.host` / `.interpreter` **are** those module singletons (views),
+so ComfyUI is byte-identical and this section's classification is unchanged. The session adds no
+lock: `session.reset()` runs the existing `free_tensor_caches()` sweep, which is single-cook-thread
+safe and, exactly like calling it directly today, must **not** run concurrently with a live cook
+(it clears the IAI/device-keyed tensor caches other threads may be reading). The `.interpreter`
+property returns *this thread's* instance (the ENG-9 per-thread pool), never a shared one. What a
+session does NOT yet provide is isolation: a second `EngineSession` is still a view of the same
+globals (`isolated == False`). Threading a session through `engine.cook(session=…)` so an isolated
+session owns its own caches is **phase 2** (it needs the ENG-1 cook-signature change) and inherits
+the MUT-cache sharding this section already flags for a parallel executor — the session handle
+*names* that boundary, it does not move it. The `tests/test_v028_phase1` soak lane (thousands of
+cooks across tiers + `reset()` cycles, flat RSS/VRAM watermarks) guards the single-thread lifecycle
+against the slow leaks a days-long compositor process would otherwise hide.
 
 ## Rejected design decisions (don't re-propose)
 

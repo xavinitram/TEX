@@ -366,12 +366,16 @@ def test_fus1_hardening(r: SubTestResult):
         SCALAR = {"A": "@OUT = @in * 1.1;", "B": "@OUT = @in + 0.1;",
                   "C": "@OUT = @in * 0.9;", "D": "@OUT = (@b + @c) * 0.5;"}
         assert len(_plans(SCALAR, MASK_E)) == 1, "[15]: float-safe MASK region dropped"
-        # The COVERAGE half: `.a` is legal on a float but NOT on a vec3, so the old
-        # IMAGE-only (3,4) preflight rejected mask regions that cook perfectly well.
-        # Reading the real family fuses them — a gain, not just a guard.
+        # `.a` (index 3) discriminates by SOURCE family: legal on a vec4 (LATENT) but a type
+        # error on a vec3 (IMAGE) AND on a float (MASK) — a scalar/vec3 has no alpha. (A scalar
+        # swizzle used to slip past the type checker's is_vector-only bounds gate and then slice
+        # the SPATIAL axis at runtime — a real silent-corruption bug now fixed at the root: the
+        # bounds check now covers a scalar base, so `.a`/`.rgb` on a float errors E3301.) The float-safe
+        # MASK coverage above is carried by SCALAR (arithmetic); `.a` off a MASK correctly does
+        # NOT fuse, exactly like the vector-only LEN case.
         ALPHA = {"A": "@OUT = @in.a * 1.1;", "B": "@OUT = @in * 1.1;",
                  "C": "@OUT = @in * 0.9;", "D": "@OUT = (@b + @c) * 0.5;"}
-        assert len(_plans(ALPHA, MASK_E)) == 1, "[15]: float-legal .a region rejected on MASK"
+        assert _plans(ALPHA, MASK_E) == [], "[15]: .a on a MASK (float) is a type error, not fused"
         assert _plans(ALPHA, DIAMOND_E) == [], "[15]: .a region fused on IMAGE (ch=3 fails)"
         # A 4-channel LATENT unwraps to [B,H,W,4] -> VEC4. These two assertions are
         # COMPLEMENTARY and both are needed to pin the LATENT branch: `length()` compiles

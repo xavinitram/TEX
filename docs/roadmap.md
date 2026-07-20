@@ -925,8 +925,29 @@ Per-release notes:
     per-device memory budget is CUDA-only (CPU is the unbudgeted fallback), and SCHED-3
     cancellation is reachable via `tex_engine.cook(cancel=)` only — the ComfyUI node does not yet
     bridge the host's own interrupt (a pure-frontend follow-up).
-- **v0.28.0**: PM-2 is the release gate — the demo cooks <50 ms/frame warm at
-  1024², zero comfy imports, scrubbing param history from CACHE-2.
+- **v0.28.0** shipped "second host": DATA-1 (`tex_marshalling.BufferMeta` — colour/alpha/frame tags
+  on the `ExecContext` value channel, merge-to-`unknown` on conflict, never keyed; the W7005
+  gamma-halo advisory `tex_api.color_advisories`), DATA-2 (`tex_io` — `BufferDesc` + a pure-torch
+  scanline EXR reader/writer and a 16-bit PNG writer, half/uint16 as storage dtypes cast to fp32 at
+  the seam), DATA-3 (ARRAY host wires under the engine profile — `a@name` inputs + array outputs as
+  `[N]`/`[N,C]`, gated by a set-once flag with the comfy egress as the always-on guard), DATA-4
+  (`tex_session.EngineSession` phase 1 — one handle over the module singletons as views, + the soak
+  lane), and PORT-5 (`examples/host_demo.py`). New package `tex_io/`, new module `tex_session.py`.
+  **Exit met — PM-2:** the demo cooks **~1.4 ms/frame warm at 1024²** on the sm_120 box (target
+  <50 ms; display excluded), zero comfy imports (green under the S-1 blocker), scrubbing param history
+  from a host-armed CACHE-2 frame cache.
+  - **DATA-3 v1 is output + builtin-consumption + pass-through only.** Direct element indexing
+    `a@name[i]` (the parser routes a `BindingRef` index to image-fetch, not array-index) and
+    per-element vec typing of an INPUT array are the deferred half — v1 already lets curves/palettes
+    flow between tools (produce an array, or receive one and `arr_avg`/`sort`/`len` it). The flag is
+    deliberately NOT fingerprinted (the comfy egress rejects ARRAY regardless, so caches survive).
+  - **DATA-4 phase 2 is deferred** (it needs the ENG-1 cook-signature change): threading a session
+    through `engine.cook(session=…)` so an ISOLATED session owns its own caches. Phase 1 is one
+    process-default session whose caches ARE the module singletons — the MUT-cache sharding for a
+    parallel executor (GRAPH-2) inherits ENG-9's boundary, which the session handle names, not moves.
+  - **EXR scope (honest):** scanline only — NONE/ZIPS/ZIP, HALF/FLOAT (UINT read-only). Tiled,
+    multipart, deep, and the lossy codecs (PIZ/PXR24/B44/DWA) raise a clean error rather than
+    mis-decode. Little-endian hosts (every target). Cross-validated zero-error against OpenCV.
 
 ## 10. How an item lands (the implementation mapping)
 

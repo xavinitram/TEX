@@ -1080,11 +1080,19 @@ def test_latent(r: SubTestResult):
         lat3 = {"samples": torch.randn(1, 3, 4, 4)}
         assert _infer_binding_type(lat3) == TEXType.VEC3
         lat16 = {"samples": torch.randn(1, 16, 4, 4)}
-        # 16-ch latents map to FLOAT, matching the post-unwrap tensor branch
-        assert _infer_binding_type(lat16) == TEXType.FLOAT
+        # A >4-channel latent (SD3/Flux/Wan 16ch, LTX-2 128ch) has no TEX type (vec4 is the
+        # widest), so it is REFUSED — the SAME policy as the post-unwrap [B,H,W,C] tensor branch
+        # (the node unwraps dict->tensor before inference, so both must agree). It was a silent
+        # ->FLOAT collapse that lost every channel past luma at the MASK egress.
+        raised16 = False
+        try:
+            _infer_binding_type(lat16)
+        except ValueError:
+            raised16 = True
+        assert raised16, "16-ch latent (>vec4) must be refused, not silently ->FLOAT"
         lat2 = {"samples": torch.randn(1, 2, 4, 4)}
         assert _infer_binding_type(lat2) == TEXType.VEC2
-        r.ok("latent: infer type dict")
+        r.ok("latent: infer type dict (>4ch refused, matching the tensor branch)")
     except Exception as e:
         r.fail("latent: infer type dict", f"{e}\n{traceback.format_exc()}")
 

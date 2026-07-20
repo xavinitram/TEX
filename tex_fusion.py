@@ -22,6 +22,7 @@ import dataclasses
 import hashlib
 import heapq
 import logging
+import re
 from collections import OrderedDict
 from typing import Any, Callable
 
@@ -167,6 +168,18 @@ def _user_prefix(prefix: str) -> str:
     out_local) so user names and synthetic names can never collide. The one and
     only place the `u_` convention is spelled."""
     return prefix + "u_"
+
+
+_USER_PREFIX_RE = re.compile(r"^_s\d+_u_")
+
+
+def strip_user_prefix(name: str) -> str:
+    """Recover a user's ORIGINAL binding name from its fused stage-renamed form
+    (`_s0_u_amt` → `amt`); an unfused / already-bare name passes through unchanged. The one and
+    only place the INVERSE of the `_s{i}_` + `_user_prefix` rename is spelled — so a consumer that
+    needs the original name (the E6003 message; the DATA-1 tag match) calls this instead of
+    hard-coding the pattern out of band (and Runtime-layer marshalling need not know it at all)."""
+    return _USER_PREFIX_RE.sub("", name)
 
 
 # ── CT-1: fused-chain disk persistence ────────────────────────────────

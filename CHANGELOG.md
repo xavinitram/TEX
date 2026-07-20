@@ -5,6 +5,164 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-07-20
+
+**Second host — the proof release.** v0.28 makes good on the roadmap's PM-2 milestone: a
+standalone image viewer (`examples/host_demo.py`) that cooks a fused grade→blur→vignette pipeline
+with **zero ComfyUI imports**, scrubs one slider live off the CACHE-2 frame cache, and holds it all
+through one engine session — the first time "the tests pass with comfy blocked" becomes "a second
+host exists." Around it, four data-model items give the engine the buffer vocabulary a compositor
+needs: colour/alpha metadata tags (DATA-1), a storage-format seam with pure-torch EXR + 16-bit PNG
+(DATA-2), ARRAY values on a host wire (DATA-3), and the session handle (DATA-4). New package
+`tex_io/` (`exr.py`, `png.py`) and module `tex_session.py`; new proof artifact `examples/host_demo.py`.
+Everything ships **off the default ComfyUI cook path** (invariant #7): the tags and session are
+host-armed / views of the singletons, array wires need the engine profile, and EXR/PNG are opt-in
+I/O — the full suite's only failure is the pre-existing S-4 cp1252 console env gap, identical on
+committed v0.27.0.
+
+### DATA-1 — buffer metadata sidecar (`BufferMeta`)
+
+- A per-binding `{colorspace, premult, frame, extra}` tag (colorspace ∈ srgb/linear/oklab/unknown,
+  premult ∈ premultiplied/unassociated/opaque/unknown) rides the cook on the **value channel** —
+  a new `ExecContext.binding_meta` field passed via `tex_engine.cook(binding_meta=…)`, surfacing on
+  the new `CookResult.out_meta`. Like `time_context`/`cancel`, it is a pure VALUE: verified absent
+  from `fp`, `auto_ckey`, and the lineage key (a tag does not move a pixel). A host supplies the tags;
+  the default ComfyUI cook supplies none, so `out_meta` is `None` and the path is byte-identical.
+- **Merge on conflict is `unknown`, never a silent pick** (`merge_buffer_meta`): an output derived
+  from an srgb and a linear input is tagged `unknown` — the honest answer. `extra` keeps only keys
+  every input carries with an equal value.
+- **W7005** (`tex_api.color_advisories`): the gamma-space halo hazard — a spatial op (blur/morphology)
+  reading a buffer a host tagged srgb/oklab, since averaging a neighbourhood in a non-linear space
+  darkens edges. Pure analysis over `tex_roi.binding_footprints` × the tags; off the cook path.
+- Tags ONLY, never transforms (roadmap §7) — this is exactly what lets the ACES/OCIO rejection stand.
+
+### DATA-2 — storage-format descriptor + `tex_io` (EXR + 16-bit PNG)
+
+- `tex_io.BufferDesc` (storage dtype ∈ uint8/uint16/float16/float32) resolves the storage envelope at
+  the ONE seam that matters — ingestion (`decode_to_fp32`) and egress (`encode_from_fp32`). half and
+  uint16 are storage dtypes cast to fp32 exactly like uint8; compute and the wire stay fp32 (NOT
+  whole-pipeline fp16 — roadmap §7). The CLI's uint8 load/save now routes through this seam.
+- `tex_io/exr.py` — a **pure-torch scanline OpenEXR reader/writer** (struct + zlib + torch, no numpy
+  bindings; invariant #1). NONE / ZIPS / ZIP compression, HALF or FLOAT (UINT read-only); the ZIP
+  interleave + delta predictor are vectorized (a cumsum, not a per-byte loop). FLOAT round-trips
+  bit-exact and preserves HDR (negatives, >1); HALF to ~1e-3. **Cross-validated zero-error against
+  OpenCV** both directions. Tiled / multipart / deep / lossy codecs raise a clean `EXRError`.
+- `tex_io/png.py` — a 16-bit PNG writer (torchvision's encoder is uint8-only); `tex run --bit-depth 16`.
+  `tex run … out.exr` writes a float/half EXR under the value-preserving `engine` egress (DATA-2 lands
+  the HDR sink the CLI's 8-bit PNG never had), `--half` for HALF storage. EXR is also a CLI **ingest**
+  format now (`tex run --in scene.exr` reads scene-linear fp32, HDR + alpha kept), so
+  `tex run --in a.exr --out b.exr` round-trips values the PNG path would clamp/drop. Ingest is
+  RGB/RGBA-only; a depth/AOV/multi-plane EXR is refused with a clear message (named planes are a
+  future host feature), never silently reinterpreted.
+
+### DATA-3 — ARRAY values on a host wire (engine profile)
+
+- Curves / palettes / histograms flow between tools: an `a@name` input hint and array **outputs** are
+  now legal under the engine profile — marshalled as `[N]` (scalar) / `[N,C]` (vec) tensors. An array
+  input is consumable via the array builtins (`arr_avg`/`sort`/`median`/`len`/…); a non-spatial
+  array pass-through preserves `[N,C]` bit-for-bit.
+- Profile-gated by a set-once host flag (`tex_compiler.types.array_wires_enabled`, driven by
+  `set_egress_profile`), deliberately **not** in the fingerprint: the always-on guard is the **comfy
+  egress**, which refuses an ARRAY output regardless — so existing disk caches survive an upgrade and
+  the default path is byte-identical (the E3203 compile-time rejection still fires under comfy).
+- **v1 scope, honestly recorded:** direct element indexing `a@name[i]` (the parser routes a
+  `BindingRef` index to image-fetch) and per-element vec typing of an input array are the follow-up;
+  v1 delivers array output + builtin consumption + pass-through, which is "flows between tools."
+
+### DATA-4 — the engine session (`tex_session.EngineSession`)
+
+- One handle over the process's cook state (program cache, CACHE-5 governor, host services, the
+  per-thread interpreter) with `reset()` / `close()` / `stats()`, instead of six imports and six reset
+  functions. **Phase 1**: exactly one session (the process default); its `.cache`/`.registry`/`.host`
+  ARE the module singletons (views), so ComfyUI is byte-identical. A written thread-safety contract
+  extends DEVELOPMENT.md's ENG-9 section (the session adds no lock; it names the single-cook-thread
+  boundary a parallel executor must shard).
+- Companion **soak lane** (`tests/test_v028_phase1`): hundreds of cooks across shapes + `reset()`
+  cycles hold flat RSS and VRAM watermarks (measured +0.0 MB) — the slow leak a days-long compositor
+  process would otherwise hide. Isolated sessions threaded through `engine.cook` are phase 2 (ENG-1).
+
+### PORT-5 — the standalone host demo (`examples/host_demo.py`) — PM-2
+
+- ~250 LOC, stdlib + torch + the TEX package, no ComfyUI, no JS: an `http.server` viewer (the Windows
+  embedded CPython has no tkinter) that builds a 3-stage GraphSpec, compiles it fused via
+  `tex_engine.cook(chain_payload=…)`, hands back raw fp32 (ENG-3 `engine` profile), and scrubs a
+  vignette-strength slider. **CACHE-2 is armed by the host** (a `ResultCache` keyed by CACHE-1 lineage):
+  scrub back to a visited strength and the frame is a cache HIT, no recook. Each cook takes a
+  SCHED-3 cancel token, so a fast drag abandons the stale cook.
+- **PM-2 met:** the engine-side cook is **~1.4 ms/frame warm at 1024² on the sm_120 box** (target
+  <50 ms; display transport excluded), and the demo runs green under the S-1 comfy-import blocker.
+  This regression-guards ENG-1 / SCHED-1 / SCHED-3 / the engine profile forever.
+
+### Post-implementation audit fixes (all OFF the default ComfyUI cook path, invariant #7)
+
+- Audit (3 finder dims × adversarial verify) confirmed the hand-rolled EXR/PNG codec is **bit-exact
+  vs OpenCV both directions**, and found three shape/plumbing bugs at the codec's boundary plus one
+  off-budget perf win — each reproduced, fixed, and mutation-pinned in `test_v028_phase1`:
+  - **B1 (major):** `tex run --out x.exr` on a MASK/scalar program crashed (or, at widths 1–4,
+    *silently transposed*). The engine `MASK` egress is `[1,H,W]`, which `write_exr`'s `[H,W,C]`
+    dim-ladder read as `[H=1,W,C]`. `write_exr` now collapses a dim-3 `[1,H,W]` to `[H,W,1]`,
+    mirroring `tex_cli.save_image`'s branch; a MASK-output program now round-trips through EXR.
+  - **B2 (major):** DATA-1 tags were silently dropped on **every fused cook** (`out_meta` always
+    `None`) — `_prepare_fused` renames external bindings to `_s{i}_u_<name>`, so `egress_meta`'s
+    `binding_meta` match (keyed by the original name) never hit. It now strips the `^_s\d+_u_`
+    prefix (the same one `tex_engine` strips for E6003), so the sidecar works on the flagship path.
+  - **B3 (minor):** `read_exr` leaked a raw `ValueError` from `torch.frombuffer(b'')` on a zero-length
+    NONE block; `ValueError` is now in the caught tuple, honouring its "never a raw error" contract.
+  - **P1 (perf):** the EXR/PNG writers marshalled every pixel via `.tolist()` + `struct.pack(*millions)`
+    (measured 105 ms→4.2 ms at 1024²×4). They now reinterpret the contiguous tensor's raw bytes via
+    `ctypes.string_at` (EXR is little-endian == torch native order; PNG needs a vectorized
+    `view(uint8)…flip(-1)` byteswap) — verified **byte-identical** to the old output (whole-file,
+    across float/half/HDR/inf and 1–4 channels) and still bit-exact vs OpenCV. Stdlib only (no numpy,
+    invariant #1).
+- Also: `read_exr` now tags its `BufferDesc.transfer="linear"` (EXR's scene-linear convention — the
+  field's first producer, previously declared-but-dead); dropped a redundant `.contiguous()` on the
+  EXR read path; new ENG-5 key-set canaries pin `BufferDesc` (STORAGE_DTYPES + fields/defaults) and
+  `EngineSession`'s surface. Full suite **2223/2224** (S-4 cp1252 console the only fail, env-only,
+  identical on committed v0.27.0); v028 phase-1 40/40.
+
+- **Follow-up root fixes — the C∉{3,4} 4-D-image family + scalar swizzle + `$param` wire count**
+  (surfaced by the EXR-ingest work, then hardened by an adversarial-review pass; each mutation-pinned
+  in `test_v028_phase1.test_root_channel_and_swizzle_fixes`). Five latent, pre-existing defects — none
+  blocked v0.28 (the 3-channel IMAGE wire + `load_image`'s {3,4} EXR pin shielded them), each a genuine
+  root defect in how the engine handles a 4-D `[B,H,W,C]` with C∉{3,4}, a scalar base, or an array base:
+  - **`_to_mask_shape` channel guard:** a 1-/2-channel 4-D image at a MASK egress IndexError'd on the
+    unguarded `raw[...,2]`. Now channel-count-guarded (missing channels read as 0, matching the IMAGE
+    2ch zero-pad), so a mask egress of any width is defined.
+  - **`infer_binding_type` deliberate C-policy, unified across the LATENT-dict + tensor branches**
+    (new `_spatial_channels_to_type`): C=1 and C≥5 both fell to `else → FLOAT`, so a >4-channel
+    passthrough *silently collapsed to 1-channel luma* at the MASK egress. Now C=1→FLOAT (lossless
+    mask) and C=0/C≥5 raise. **Reachable via the mainstream LATENT wire** — the node unwraps a
+    >4-channel latent (SD3/Flux/Wan 16ch, LTX-2 128ch) into a `[B,H,W,C]` tensor *before* inference —
+    so a wide-latent TEX node now fails **loud** with a clear message ("VAE-decode it to an image
+    first") instead of the old silent luma-MASK that couldn't even re-wire to a latent consumer. The
+    dict branch (which had kept collapsing) was reconciled to the same policy; `test_integration`'s
+    stale "16-ch → FLOAT" assertion was corrected to expect the refusal.
+  - **Scalar swizzle bounds-checked:** the swizzle range check was gated on `is_vector`, so `.rgb`/
+    `.rgba`/`.g`/`.a` on a FLOAT/INT (scalar, C=1) base was neither errored nor expanded — the
+    interpreter then sliced the *spatial* axis, not channels (`@in.a` on a `[1,H,W]` mask returned
+    column 3). The check now covers a scalar base (E3301); `vec3(x)` is the correct scalar→vector
+    broadcast. `.r`/`.x` (index 0) stays valid — a count-preserving reduction no-op relied on by
+    `arr_avg(a@pal).r`. A FUS-1 `[15]` assertion that assumed a scalar `.a` was legal-and-fusable off
+    a MASK was corrected (such a region now correctly does not fuse).
+  - **ARRAY-base channel access gated** (closes the ARRAY tracked follow-up this entry flagged): a
+    swizzle on an `a@name` array wire (DATA-3) hit *none* of the guards — the single/multi bounds
+    checks gate on `is_vector or is_scalar`, so `a@pal.rgb`/`a@pal.g` fell straight through, claimed a
+    VECn from the swizzle width, and the interpreter then sliced an `[…,N,C]`/`[…,N]` array by a
+    channel index (undefined/silently-wrong). An early `is_array` guard now rejects it (E3300),
+    mirroring the string/matrix guards; under the engine profile the cook now *aborts* cleanly instead
+    of mis-slicing. Swizzling a reduction's SCALAR result (`arr_avg(a@pal).r`) is a FLOAT base that
+    never reaches the guard, so the load-bearing pattern is untouched. Only reachable under the engine
+    egress profile (array wires off by default in ComfyUI), so low-severity — but now closed.
+  - **`tex run` `$param` wire-count:** `run_program`'s `referenced − assigned` counted `$param` names
+    as wire inputs (they are in `referenced`; param_info is empty at that compile site), so a single-
+    image program with a `$param` (`examples/vignette.tex`'s `f$strength`) was falsely rejected as
+    ">1 input". Now excludes `set(prog.params)`; the >1-wire guard is preserved.
+  `load_image`'s `.exr` C∈{3,4} guard is deliberately kept strict (`test_data2_storage_exr` pins a
+  C=1/C=5 EXR refusal at ingest). One same-family gap remains a tracked follow-up: the narrow
+  spatial-scalar `.r`/`.x` runtime mis-slice can't be distinguished at the type layer from the
+  load-bearing `arr_avg(...).r`. Full suite **2231/2232** (S-4 cp1252 console the only fail, env-only);
+  v028 phase-1 **48/48**.
+
 ## [0.27.0] - 2026-07-20
 
 **Big frames, placed well.** This release makes the engine survive scale — an 8K blur that

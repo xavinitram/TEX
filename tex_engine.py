@@ -34,7 +34,6 @@ import json
 import logging
 import math
 import os
-import re
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -54,10 +53,12 @@ from .tex_runtime.compiled import (
 from .tex_fusion import (
     prepare_fused as _prepare_fused,
     fused_fingerprint as _fused_fingerprint,
+    strip_user_prefix as _strip_user_prefix,
 )
 from .tex_marshalling import (
     convert_param_value as _convert_param_value,
     infer_binding_type as _infer_binding_type,
+    egress_meta as _egress_meta,
 )
 from .tex_runtime.host import (get_host_services, CookCancelled,
                                _cancel_check, _report_progress)
@@ -210,6 +211,10 @@ class ExecContext:
     # `replace(ctx, ...)` at the fp16 re-cook preserves them automatically.
     cancel: Any = None
     on_progress: Any = None
+    # DATA-1: per-binding colour/alpha/frame tags {name: BufferMeta} — a VALUE on the same
+    # never-keyed channel (a tag does not move a pixel, unlike time_context). None unless a
+    # host supplied it; the merged output tags surface on CookResult.out_meta.
+    binding_meta: Any = None
 
 
 @dataclass(frozen=True)
@@ -265,6 +270,10 @@ class CookResult:
     # unless the caller asked for it (prepare(want_lineage=True)). Off the default path so a
     # ComfyUI cook, which has no result cache to key, never pays for it (invariant #7).
     lineage: dict | None = None
+    # DATA-1: {output_name: BufferMeta} — the merged colour/alpha/frame tags of this cook's
+    # inputs, or None unless a host supplied binding_meta. A host re-attaches these to the
+    # egress buffers; the default ComfyUI path supplies no tags, so this stays None.
+    out_meta: dict | None = None
 
 
 # ── ENG-6: zero-copy AI handoff (DLPack) ─────────────────────────────────────
@@ -928,7 +937,8 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             debug_nan_highlight: bool = False, time_context: dict | None = None,
             max_outputs: int = MAX_OUTPUTS, disown: bool = True,
             roi: tuple | None = None, want_lineage: bool = False,
-            upstream_keys: tuple = (), cancel=None, on_progress=None) -> CookPlan:
+            upstream_keys: tuple = (), cancel=None, on_progress=None,
+            binding_meta: dict | None = None) -> CookPlan:
     """Resolve everything a cook needs *without running it*: compile (or splice a fused
     chain), resolve the device, gate the outputs and references, fold params, resolve
     `precision="auto"`, and select the tier.
@@ -1071,7 +1081,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             # On the fused path user bindings are stage-prefixed
             # (_s0_u_amt — see tex_fusion._user_prefix); show the
             # user's original name, not the synthetic one.
-            disp = re.sub(r"^_s\d+_u_", "", ref_name) if fused_chain else ref_name
+            disp = _strip_user_prefix(ref_name) if fused_chain else ref_name
             raise InterpreterError(
                 f"TEX code references {sigil}{disp} but no input is connected to slot '{disp}'.",
                 loc=SourceLoc(1, 1), source=code, code="E6003",
@@ -1170,7 +1180,8 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
                       latent_channel_count, output_names, used_builtins,
                       eff_precision, fp, fused_chain, fused_fp, time_context,
                       free_hint, roi_out, roi_plan_obj,  # ROI-3 window + plan (None unless armed)
-                      cancel, on_progress)               # SCHED-3 (None unless a host passed them)
+                      cancel, on_progress,               # SCHED-3 (None unless a host passed them)
+                      binding_meta)                      # DATA-1 tags (None unless a host passed them)
     return CookPlan(ctx=ctx, tier_id=tier_id, assigned=assigned_bindings,
                     auto_fp16=auto_fp16, debug_nan_highlight=debug_nan_highlight,
                     cook_px=cook_px, auto_ckey=auto_ckey, disown=disown,
@@ -1460,6 +1471,16 @@ def run(plan: CookPlan) -> CookResult:
         device=ctx.device, precision=eff_precision,
         binding_names=list(ctx.bindings.keys()), near_singularities=near_sing,
         lineage=lineage,
+        # DATA-1: merged TENSOR-input tags for every output, or None when the host passed no
+        # binding_meta (the default ComfyUI path) — value channel, never keyed. The engine
+        # resolves the ORIGINAL tensor-input names here (de-prefixing fused stage renames via
+        # tex_fusion.strip_user_prefix) so the host's tags match and marshalling stays free of
+        # fusion's naming; only tensor inputs contribute (a scalar param can't downgrade an output).
+        out_meta=_egress_meta(
+            ctx.binding_meta, ctx.output_names,
+            {(_strip_user_prefix(n) if ctx.fused_chain else n)   # de-prefix ONLY on a fused chain
+             for n, v in ctx.bindings.items() if isinstance(v, torch.Tensor)}  # (mirror the E6003 site)
+            if ctx.binding_meta else None),
     )
 
 

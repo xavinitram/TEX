@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 # TEXType` — keep working, but the pipeline's other modules now depend on `.types`.
 from .types import (
     TEXType, TEXArrayType, TYPE_NAME_MAP, CHANNEL_MAP, VALID_SWIZZLES,
-    _VEC_RANK, _VEC_SIZE_TYPE,
+    _VEC_RANK, _VEC_SIZE_TYPE, array_wires_enabled,
 )
 from .ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
@@ -81,6 +81,7 @@ BINDING_HINT_TYPES = {
     "l": TEXType.VEC4,     # LATENT → vec4 at the tensor level
     "c": TEXType.VEC3,     # Color → RGB vec3 (hex string in widget)
     "b": TEXType.INT,      # Boolean → 0/1 checkbox
+    "a": TEXType.ARRAY,    # DATA-3: an ARRAY wire (curve / palette / histogram; engine profile)
 }
 
 
@@ -655,7 +656,11 @@ class TypeChecker:
                     )
                     self._set_type(node, TEXType.VOID)
                     return
-                if value_type.is_array:
+                # DATA-3: an array output is rejected under the ComfyUI wire (no ARRAY type),
+                # but ALLOWED when a host enables array wires (the engine profile) — a curve /
+                # palette / histogram flowing to another tool. The comfy EGRESS still refuses it
+                # (the always-on guard), so this compile-time gate only sharpens the error.
+                if value_type.is_array and not array_wires_enabled():
                     self._error(
                         f"Assigning an array to @{name} isn't supported "
                         f"(array types are not valid as outputs).",
@@ -990,19 +995,22 @@ class TypeChecker:
         obj_type = self._check_expr(node.object)
         channels = node.channels
 
-        if obj_type.is_string:
-            self._error("Channel access (.rgb, .x, etc.) doesn't work on strings.",
-                        node.loc, code="E3300",
-                        hint="Strings don't have channels. Try len() or substr() instead.")
-            self._set_type(node, TEXType.FLOAT)
-            return TEXType.FLOAT
-
-        if obj_type.is_matrix:
-            self._error("Channel access (.rgb, .x, etc.) doesn't work on matrix types.",
-                        node.loc, code="E3300",
-                        hint="Use matrix indexing or multiply by a vector instead.")
-            self._set_type(node, TEXType.FLOAT)
-            return TEXType.FLOAT
+        # Types with NO addressable channels reject a swizzle up front (E3300). An ARRAY base
+        # (an `a@name` wire, DATA-3) matters most: the bounds checks below gate only vectors/
+        # scalars, so a swizzle here would fall through, claim a VECn from the swizzle width, and
+        # the interpreter would slice an [...,N,C]/[...,N] array by a channel index — silently
+        # wrong. (Swizzling a reduction's SCALAR result — `arr_avg(a@pal).r` — is FLOAT, not an
+        # array, so it never reaches this guard.)
+        for has_no_channels, noun, hint in (
+            (obj_type.is_string, "strings", "Strings don't have channels. Try len() or substr() instead."),
+            (obj_type.is_matrix, "matrix types", "Use matrix indexing or multiply by a vector instead."),
+            (obj_type.is_array, "an array", "Index the array with arr[i], then swizzle the element."),
+        ):
+            if has_no_channels:
+                self._error(f"Channel access (.rgb, .x, etc.) doesn't work on {noun}.",
+                            node.loc, code="E3300", hint=hint)
+                self._set_type(node, TEXType.FLOAT)
+                return TEXType.FLOAT
 
         if len(channels) == 1:
             # Single channel -> float
@@ -1010,7 +1018,14 @@ class TypeChecker:
                 self._error(f"'.{channels}' isn't a recognized channel name.",
                             node.loc, code="E3301",
                             hint="Try: .r, .g, .b, .a (color) or .x, .y, .z, .w (position).")
-            elif obj_type.is_vector and CHANNEL_MAP[channels] >= obj_type.channels:
+            # A scalar (FLOAT/INT) has 1 component (.channels == 1), so this bounds check must
+            # cover it too — else `.g`/`.b`/`.a` on a scalar was silently accepted and the
+            # interpreter mis-sliced the spatial axis. `.r`/`.x` (index 0) stays valid on a
+            # scalar: it's a reduction's own channel (e.g. `arr_avg(a@pal).r`) and, being a
+            # count-preserving no-op, isn't the wrong-channel-count bug this closes. (A genuine
+            # spatial-scalar `.r` mis-slice is a narrower pre-existing gap not fixable here
+            # without also rejecting that legitimate reduction pattern.)
+            elif (obj_type.is_vector or obj_type.is_scalar) and CHANNEL_MAP[channels] >= obj_type.channels:
                 self._error(
                     f"{obj_type.value} doesn't have a '.{channels}' channel "
                     f"(only {obj_type.channels} components).",
@@ -1024,9 +1039,13 @@ class TypeChecker:
             self._error(f"'.{channels}' isn't a recognized swizzle pattern.",
                         node.loc, code="E3302",
                         hint="Try common swizzles like .rgb, .xyz, .rgba, or .xyzw.")
-        elif obj_type.is_vector and any(
+        elif (obj_type.is_vector or obj_type.is_scalar) and any(
             CHANNEL_MAP[ch] >= obj_type.channels for ch in channels if ch in CHANNEL_MAP
         ):
+            # A scalar base (C=1) has no channel past .r/.x, so a multi-swizzle like `.rgb` on a
+            # FLOAT must error here — the old is_vector-only gate let it fall through and silently
+            # claim vec3 (the interpreter then sliced pixels, not channels). Covers the scalar
+            # exactly as the single-channel branch above.
             self._error(
                 f"Swizzle '.{channels}' references channels {obj_type.value} doesn't have "
                 f"(only {obj_type.channels} components).",

@@ -156,7 +156,8 @@ _STRING_ESCAPE_MAP = {"\\": "\\", '"': '"', "n": "\n", "t": "\t", "r": "\r"}
 # Type prefixes that can appear immediately before @ or $ to form typed bindings.
 # e.g. f@threshold → TYPED_AT_BINDING with prefix="f"
 # e.g. img@result → TYPED_AT_BINDING with prefix="img"
-BINDING_TYPE_PREFIXES = {"f", "i", "v", "v2", "v3", "v4", "s", "img", "m", "l", "c", "b"}
+# e.g. a@palette → an ARRAY wire (DATA-3; only reachable under the engine profile)
+BINDING_TYPE_PREFIXES = {"f", "i", "v", "v2", "v3", "v4", "s", "img", "m", "l", "c", "b", "a"}
 
 
 def _is_ascii_digit(c: str) -> bool:

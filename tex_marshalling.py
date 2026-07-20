@@ -12,9 +12,10 @@ from __future__ import annotations
 import hashlib
 import struct
 import torch
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Iterable
 
-from .tex_compiler.types import TEXType
+from .tex_compiler.types import TEXType, set_array_wires, array_wires_enabled, _VEC_SIZE_TYPE
 from .tex_runtime.stdlib import LUMA_R, LUMA_G, LUMA_B
 
 
@@ -267,6 +268,29 @@ def convert_param_value(value: Any, param_info: dict, param_name: str = "") -> A
 
 # ── Type inference ──
 
+def _spatial_channels_to_type(c: int) -> TEXType:
+    """Map a spatial buffer's channel count → a TEX type. The SINGLE policy shared by the
+    LATENT-dict branch and the [B,H,W,C] tensor branch of `infer_binding_type` — which used to
+    be two separate copies of this ladder (both `else → FLOAT` for C≥5), free to drift apart.
+    TEX's type vocabulary tops out at vec4, so C∉{1,2,3,4} is a
+    DELIBERATE refusal, not a silent `else → FLOAT` collapse (which lost every channel past
+    luma at the MASK egress). C=1 is a scalar field (mask), egressed losslessly as FLOAT.
+
+    The refusal is REACHABLE — not just via the exotic EXR/AOV path but via the mainstream
+    LATENT wire: the node unwraps a >4-channel latent (SD3/Flux/Wan 16ch, LTX-2 128ch) into a
+    [B,H,W,C] tensor before inference. It surfaces as a clean cook error (the node's handler
+    wraps the ValueError), replacing the old silent luma-MASK that couldn't even re-wire to a
+    latent consumer."""
+    if c == 1:
+        return TEXType.FLOAT
+    if c in _VEC_SIZE_TYPE:           # {2: VEC2, 3: VEC3, 4: VEC4} — the one canonical size→vec map
+        return _VEC_SIZE_TYPE[c]
+    raise ValueError(
+        f"a {c}-channel buffer isn't representable in TEX's types (vec4 is the widest). "
+        f"A >4-channel LATENT (SD3/Flux/Wan/LTX) is not a decoded image — VAE-decode it to "
+        f"an image first; a depth/AOV/multi-plane EXR needs a host with named planes (DATA-6).")
+
+
 def infer_binding_type(value: Any) -> TEXType:
     """Infer the TEX type of a ComfyUI input value."""
     # Image/latent lists — use first element for type inference
@@ -275,36 +299,24 @@ def infer_binding_type(value: Any) -> TEXType:
             return infer_binding_type(value[0])
         return TEXType.FLOAT
     if isinstance(value, dict) and "samples" in value:
-        # LATENT dict — infer from channel count (dim 1 = C before permute),
-        # using the same mapping as the post-unwrap [B,H,W,C] tensor branch
-        # below (the node unwraps latent dicts before inference, so this
-        # branch only serves direct API callers).
-        c = value["samples"].shape[1]
-        if c == 4:
-            return TEXType.VEC4
-        elif c == 3:
-            return TEXType.VEC3
-        elif c == 2:
-            return TEXType.VEC2
-        else:
-            return TEXType.FLOAT
+        # LATENT dict — infer from the channel count (dim 1 = C before the BCHW→BHWC permute),
+        # via the SAME policy as the post-unwrap [B,H,W,C] tensor branch below. The node unwraps
+        # latent dicts before inference, so this branch only serves direct-API callers — but the
+        # two MUST agree, else a wide latent refuses via the node yet types as FLOAT via a raw dict.
+        return _spatial_channels_to_type(value["samples"].shape[1])
     if isinstance(value, str):
         return TEXType.STRING
     if isinstance(value, torch.Tensor):
         if value.dim() == 4:
-            # [B, H, W, C]
-            c = value.shape[-1]
-            if c == 4:
-                return TEXType.VEC4
-            elif c == 3:
-                return TEXType.VEC3
-            elif c == 2:
-                return TEXType.VEC2
-            else:
-                return TEXType.FLOAT
+            return _spatial_channels_to_type(value.shape[-1])   # [B, H, W, C]
         elif value.dim() == 3:
             # [B, H, W] — mask
             return TEXType.FLOAT
+        elif value.dim() in (1, 2) and array_wires_enabled():
+            # DATA-3: a low-rank tensor is an ARRAY wire under the engine profile — [N] (scalar
+            # array) or [N, C] (vec array). Under ComfyUI (default) this stays FLOAT below, so a
+            # host that never enables array wires is byte-identical.
+            return TEXType.ARRAY
         else:
             return TEXType.FLOAT
     elif isinstance(value, (int, bool)):
@@ -325,6 +337,7 @@ def map_inferred_type(inferred: TEXType | None, has_latent_input: bool) -> str:
         TEXType.FLOAT: "MASK",
         TEXType.INT: "INT",
         TEXType.STRING: "STRING",
+        TEXType.ARRAY: "ARRAY",   # DATA-3: an array wire (engine profile only)
     }.get(inferred, "IMAGE")
 
 
@@ -354,12 +367,16 @@ _egress_profile = "comfy"
 
 
 def set_egress_profile(name: str) -> None:
-    """Set the process-wide egress profile (host-level; see EGRESS_PROFILES)."""
+    """Set the process-wide egress profile (host-level; see EGRESS_PROFILES). DATA-3: the
+    `engine` profile ALSO enables ARRAY host wires (a host that carries `engine` values can carry
+    array values too), and `comfy` disables them — arrays are an engine-profile capability, so
+    the one host-level switch governs both."""
     global _egress_profile
     if name not in EGRESS_PROFILES:
         raise ValueError(f"unknown egress profile {name!r} (expected one of "
                          f"{', '.join(EGRESS_PROFILES)})")
     _egress_profile = name
+    set_array_wires(name == "engine")
 
 
 def get_egress_profile() -> str:
@@ -406,8 +423,16 @@ def _to_mask_shape(raw: torch.Tensor) -> torch.Tensor:
     vec image becomes luminance (that IS what MASK means) and a bare [H,W]/scalar gains
     its batch axis. Range is NOT touched here — clamping is per-profile (ENG-3)."""
     if raw.dim() == 4:
-        # Vec3/Vec4 image → luminance scalar
-        return LUMA_R * raw[..., 0] + LUMA_G * raw[..., 1] + LUMA_B * raw[..., 2]
+        # Vec image → luminance scalar. GUARD the channel count: a low-channel 4-D image
+        # (a 1-/2-channel FLOAT/AOV buffer) reaches a MASK egress too, and the old
+        # unguarded raw[..., 2] IndexError'd on it. Missing channels read as 0, matching
+        # the IMAGE path's 2ch zero-pad, so a mask egress of any-width image is DEFINED.
+        c = raw.shape[-1]
+        if c >= 3:
+            return LUMA_R * raw[..., 0] + LUMA_G * raw[..., 1] + LUMA_B * raw[..., 2]
+        if c == 2:
+            return LUMA_R * raw[..., 0] + LUMA_G * raw[..., 1]   # no blue → reads as 0
+        return raw[..., 0]                                        # c == 1: the channel IS the mask
     if raw.dim() == 2:
         return raw.unsqueeze(0)        # [H, W] without batch dim — add it
     if raw.dim() == 0:
@@ -443,6 +468,15 @@ def _prepare_output_comfy(raw: torch.Tensor | str, output_type: str) -> Any:
         return str(raw)
 
     _reject_string_output(raw, output_type)
+
+    if output_type == "ARRAY":
+        # DATA-3: the always-on guard. ARRAY outputs are an engine-profile capability; ComfyUI's
+        # IMAGE/MASK/LATENT wires cannot carry one, so refuse here regardless of whether the
+        # compile-time E3203 gate ran (a cross-profile disk-cache hit could have skipped it).
+        raise RuntimeError(
+            "TEX Error: an ARRAY output needs a host that carries array wires (the 'engine' "
+            "egress profile). ComfyUI's wires cannot represent an array — output individual "
+            "elements or a string (join()) instead.")
 
     if output_type == "IMAGE":
         # IMAGE expects [B, H, W, C] float32 in [0, 1]
@@ -530,6 +564,11 @@ def _prepare_output_engine(raw: torch.Tensor | str, output_type: str) -> Any:
         return _prepare_output_comfy(raw, "STRING")   # no range to preserve
     _reject_string_output(raw, output_type)
 
+    if output_type == "ARRAY":
+        # DATA-3: an array wire — [N] (scalar) or [N,C] (vec) — passes through as fp32, the whole
+        # point of the engine profile. A string array (Python list) passes through untouched.
+        return raw.float() if isinstance(raw, torch.Tensor) else raw
+
     if output_type == "IMAGE":
         if raw.dim() == 3:            # [B,H,W] -> [B,H,W,1]: add the axis, keep the value
             raw = raw.unsqueeze(-1)
@@ -558,3 +597,106 @@ def _prepare_output_engine(raw: torch.Tensor | str, output_type: str) -> Any:
 # ENG-3: the profile registry. A third profile is a dict entry, not another branch in
 # the dispatcher — and no profile can reach another through the public entry point.
 _EGRESS = {"comfy": _prepare_output_comfy, "engine": _prepare_output_engine}
+
+
+# ── DATA-1: buffer metadata sidecar ──────────────────────────────────────────
+#
+# A cooked buffer is not just pixels — it has a colour interpretation (is 0.5 half the
+# LIGHT, or half the perceptual lightness?) and an alpha convention (are the RGB values
+# already multiplied by alpha?). ComfyUI's IMAGE wire carries none of that; a compositor's
+# does. DATA-1 is the seam that carries it: a per-binding `{colorspace, premult, frame,
+# host-opaque extra}` tag that rides the cook and re-attaches at egress.
+#
+# THREE hard boundaries (roadmap §7):
+#   - Tags only, NEVER transforms. A buffer tagged `srgb` is not converted to `linear` by
+#     anything here — conversions stay the user's explicit `srgb_to_linear()` call. This is
+#     exactly what lets the ACES/OCIO rejection stand (DATA-1 is not a colour engine).
+#   - It rides the VALUE channel (the ExecContext.time_context / cancel model), so it NEVER
+#     enters a fingerprint, cache, or lineage key — a tag does not move a pixel, and keying on
+#     it would split the cache for nothing. (Contrast time_context, which DOES move pixels and
+#     so IS keyed.) The default ComfyUI cook supplies no tags → the whole path is dormant
+#     (invariant #7).
+#   - Merge on conflict is `unknown`, NEVER a silent pick. Two inputs tagged `srgb` and
+#     `linear` produce an output tagged `unknown` — the honest answer, not whichever came
+#     first. Losing the tag is safe; asserting the wrong one corrupts a downstream transform.
+
+COLORSPACES = ("srgb", "linear", "oklab", "unknown")
+PREMULT = ("premultiplied", "unassociated", "opaque", "unknown")
+
+
+@dataclass(frozen=True)
+class BufferMeta:
+    """One binding's non-pixel metadata (DATA-1). All fields default to the honest `unknown`
+    (or None for `frame`), so an untagged buffer is a valid, fully-`unknown` BufferMeta and
+    the default path never has to special-case its absence. `extra` is a host-opaque mapping
+    (a LATENT's `noise_mask`, a frame's source path) merged key-wise; keep it small and
+    hashable-valued if a host means to compare it. Frozen: a buffer's tag is as immutable as
+    the buffer (ENG-12) — re-tagging mints a new BufferMeta, it never mutates one in place."""
+    colorspace: str = "unknown"
+    premult: str = "unknown"
+    frame: int | None = None
+    extra: dict | None = None
+
+    def __post_init__(self):
+        if self.colorspace not in COLORSPACES:
+            raise ValueError(f"unknown colorspace {self.colorspace!r} (expected one of "
+                             f"{', '.join(COLORSPACES)})")
+        if self.premult not in PREMULT:
+            raise ValueError(f"unknown premult {self.premult!r} (expected one of "
+                             f"{', '.join(PREMULT)})")
+
+
+def merge_buffer_meta(metas: Iterable[BufferMeta]) -> BufferMeta:
+    """The DATA-1 merge policy for an output derived from several tagged inputs: a field
+    survives ONLY if every input agrees on it, else it collapses to `unknown`/None (never a
+    silent pick). `extra` keeps only keys all inputs carry with an equal value. Empty input →
+    all-`unknown` (nothing is known); a single input → itself. This is deliberately
+    conservative in the safe direction: an output that IS srgb but reads `unknown` merely
+    forfeits an advisory; an output that is linear but reads `srgb` would mislead a transform."""
+    metas = [m for m in metas if m is not None]
+    if not metas:
+        return BufferMeta()
+    if len(metas) == 1:
+        return metas[0]
+
+    def _agree(vals, absent):
+        return vals[0] if len(set(vals)) == 1 else absent
+
+    colorspace = _agree([m.colorspace for m in metas], "unknown")
+    premult = _agree([m.premult for m in metas], "unknown")
+    frame = _agree([m.frame for m in metas], None)
+    # extra: keys present in EVERY input with an equal value (an intersection where the value
+    # agrees). `k in common` already means every input carries it, so `m.extra[k]` is safe.
+    common = set(metas[0].extra or {})
+    for m in metas[1:]:
+        common &= set(m.extra or {})
+    kept = {k: metas[0].extra[k] for k in common
+            if all(m.extra[k] == metas[0].extra[k] for m in metas)}
+    return BufferMeta(colorspace, premult, frame, kept or None)
+
+
+def egress_meta(binding_meta: dict | None, output_names: Iterable[str],
+                tensor_names: set | None = None) -> dict | None:
+    """The output-side tags for a cook, given the host's per-input `binding_meta` (or None).
+    Every output carries the SAME merge of every TENSOR-input tag — v1 does not track which input a
+    given output derived from (the LATENT `noise_mask` round-trip re-attaches to every LATENT output
+    the same way). `tensor_names` is the set of ORIGINAL binding names that hold a tensor; only those
+    contribute, so a scalar `$param`'s tag can't silently downgrade every output to `unknown`. The
+    ENGINE supplies it (de-prefixing any fused `_s{i}_u_` stage rename via
+    `tex_fusion.strip_user_prefix`), so this Runtime-layer seam stays free of fusion's naming; `None`
+    means "merge every tag" (a legacy/positional caller). None in → None out (and no outputs → None),
+    so the default ComfyUI path stays byte-identical."""
+    if not binding_meta:
+        return None
+    if tensor_names is not None:
+        metas = [m for n, m in binding_meta.items() if n in tensor_names]
+    else:
+        metas = list(binding_meta.values())
+    if not metas or not output_names:
+        return None
+    merged = merge_buffer_meta(metas)
+    return {name: merged for name in output_names}
+
+# The DATA-1 gamma-space halo lint (W7005) lives in tex_api, not here: it is a footprint ×
+# tag ANALYSIS (tex_roi + diagnostics), not a wire conversion, so it belongs in the host-facing
+# facade beside check(), and keeps this low-level module free of an upward tex_roi dependency.

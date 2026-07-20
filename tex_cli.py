@@ -39,25 +39,41 @@ def _require_torchvision():
 def load_image(path: str, device: str = "cpu") -> torch.Tensor:
     """PNG/JPG -> [1, H, W, 3] float32 in [0,1] (ComfyUI IMAGE layout), torchvision-only.
     Branches on BIT DEPTH: a uint16 (16-bit) PNG decodes to 0-65535, so dividing by 255
-    (audit) would make it 257x too bright — normalise by the dtype's max."""
+    (audit) would make it 257x too bright — normalise by the dtype's max.
+
+    DATA-2: an `.exr` input is read by the pure-torch EXR reader instead — scene-linear fp32
+    [1,H,W,C] with ALL channels + HDR kept (no [0,1] normalize, no 3-channel force), so
+    `tex run --in a.exr --out b.exr` round-trips values the PNG path would clamp/drop."""
+    if path.lower().endswith(".exr"):
+        from .tex_io import exr
+        px = exr.read_exr(path).pixels                # [H, W, C] fp32, HDR + all channels
+        if px.shape[-1] not in (3, 4):
+            # `tex run` cooks one IMAGE; the engine reads C as RGB(A). A 1-/2-/5+-channel EXR
+            # (depth, AOV, multi-plane) would be silently reinterpreted downstream (a mask-output
+            # program crushes it to luma; a <3-ch input can crash a mask egress), so refuse it
+            # with a clean message instead — named multi-plane EXR is a future host feature (DATA-6).
+            raise ValueError(
+                f"tex run: EXR input has {px.shape[-1]} channels; only 3 (RGB) or 4 (RGBA) are "
+                f"supported. A depth/AOV/multi-plane EXR needs a host that carries named planes.")
+        return px.unsqueeze(0).to(device)             # [1, H, W, C] fp32, HDR + alpha kept
     from torchvision.io import read_file, decode_image
+    from .tex_io import BufferDesc, decode_to_fp32
     img = decode_image(read_file(path))          # [C, H, W], uint8 or uint16
     if img.shape[0] == 1:
         img = img.expand(3, -1, -1)              # grayscale -> RGB
     img = img[:3]                                # drop alpha
-    if img.dtype == torch.uint8:
-        denom = 255.0
-    elif img.dtype == torch.uint16:
-        denom = 65535.0
-    else:
+    storage = {torch.uint8: "uint8", torch.uint16: "uint16"}.get(img.dtype)
+    if storage is None:
         raise ValueError(f"tex run: unsupported image dtype {img.dtype} (expected uint8/uint16)")
-    t = img.to(torch.float32) / denom            # [C, H, W] in [0,1]
+    t = decode_to_fp32(img, BufferDesc(storage))        # [C, H, W] in [0,1] (DATA-2 seam)
     return t.permute(1, 2, 0).unsqueeze(0).to(device)   # [1, H, W, 3]
 
 
-def save_image(tensor: torch.Tensor, path: str) -> None:
+def save_image(tensor: torch.Tensor, path: str, *, bit_depth: int = 8) -> None:
     """[1, H, W, C] float [0,1] (or [1, H, W] / [H, W] mask) -> PNG. Round (not truncate)
-    for a bit-exact round-trip: round(u/255*255) == u."""
+    for a bit-exact round-trip: round(u/255*255) == u. `bit_depth=16` (DATA-2) writes a
+    16-bit PNG via `tex_io` (torchvision's encoder is uint8-only) — a higher-fidelity
+    normalized-integer sink than 8-bit; still [0,1], so EXR remains the HDR path."""
     from torchvision.io import encode_png, write_file
     t = tensor.detach().float().cpu()
     if t.dim() == 4:                              # [1, H, W, C] -> [H, W, C]
@@ -69,21 +85,29 @@ def save_image(tensor: torch.Tensor, path: str) -> None:
     if t.shape[-1] > 4:                           # a stray non-channels-last shape
         raise ValueError(f"tex run: cannot save a tensor of shape {tuple(tensor.shape)} as a "
                          f"PNG (expected [1,H,W,C], [1,H,W] or [H,W])")
-    if t.shape[-1] == 4:                          # doc 32 S6: 8-bit PNG has no alpha
+    if t.shape[-1] == 4:                          # doc 32 S6: PNG output is RGB (alpha dropped)
         print("tex run: note: dropping alpha channel (PNG output is RGB)", file=sys.stderr)
     t = t[..., :3]
     if t.shape[-1] == 1:
         t = t.expand(-1, -1, 3)
-    u8 = (t.clamp(0, 1) * 255.0).round().to(torch.uint8).permute(2, 0, 1)  # [C, H, W]
+    from .tex_io import BufferDesc, encode_from_fp32
+    if bit_depth == 16:
+        from .tex_io.png import write_png16
+        write_png16(path, encode_from_fp32(t, BufferDesc("uint16")))   # clamp+round to uint16
+        return
+    u8 = encode_from_fp32(t, BufferDesc("uint8")).permute(2, 0, 1)     # [C, H, W] (DATA-2 seam)
     write_file(path, encode_png(u8))
 
 
 def run_program(code: str, image: torch.Tensor, device="cpu", precision="fp32",
-                compile_mode="none") -> torch.Tensor:
+                compile_mode="none", profile="comfy") -> torch.Tensor:
     """Run a TEX program on one image; return the primary IMAGE output (the first
     vec3/vec4 output, else the first output). Compiles ONCE for its binding sets — the
     compiler's own `referenced`/`assigned` give the input bindings and output types (no
     regex to drift from the grammar); the engine then re-infers types from the tensor.
+
+    `profile` (ENG-3): 'comfy' clamps for a PNG sink; 'engine' preserves the raw fp32 values
+    (unclamped, alpha kept) for the EXR sink (DATA-2) — the whole point of a float format.
 
     ENG-1 (v0.22): cooks through `tex_engine.cook`. The CLI exists to prove TEX is
     host-agnostic, and until v0.22 it had to import a ComfyUI v3 node classmethod to cook
@@ -99,7 +123,11 @@ def run_program(code: str, image: torch.Tensor, device="cpu", precision="fp32",
     from .tex_compiler.types import TEXType
 
     prog = tex_compile(code, {})            # authoritative binding sets from the compiler
-    inputs = sorted(set(prog.referenced) - set(prog.assigned))
+    # `referenced` mixes @wire bindings AND $param names (the type checker adds both), so a
+    # legit single-image program with a $param (e.g. examples/vignette.tex's f$strength) would
+    # count as >1 input. Exclude the params (prog.params is keyed by $-name) — they carry their
+    # own widget defaults, they are not wires. Assigned names are the outputs.
+    inputs = sorted(set(prog.referenced) - set(prog.assigned) - set(prog.params))
     # S1 (doc 33): `tex run` has a single --in image. Binding it to EVERY referenced input
     # would silently alias a multi-input program (@A == @B) and satisfy a typo'd @binding,
     # bypassing the engine's E6003 "not connected" guard. Refuse >1 distinct wire input.
@@ -111,11 +139,12 @@ def run_program(code: str, image: torch.Tensor, device="cpu", precision="fp32",
     res = tex_engine.cook(code, {name: image for name in inputs},
                           device_mode=device, precision=precision,
                           compile_mode=compile_mode)
-    # The CLI writes an 8-bit PNG, so it wants the ComfyUI conversion (clamp + alpha-drop
-    # + gray-expand) that save_image's own quantisation assumes — profile pinned, not
-    # inherited, so a host that flipped the process-wide profile can't change `tex run`.
+    # The profile is PINNED per call, not inherited from the process-wide global, so a host
+    # that flipped the profile can't change `tex run`. A PNG sink pins 'comfy' (the clamp +
+    # alpha-drop + gray-expand save_image's quantisation assumes); an EXR sink pins 'engine'
+    # so the float format actually carries the scene-linear values TEX cooked (DATA-2).
     results = [prepare_output(res.outputs[n],
-                              map_inferred_type(res.assigned[n], False), profile="comfy")
+                              map_inferred_type(res.assigned[n], False), profile=profile)
                for n in res.output_names]
 
     idx = next((i for i, n in enumerate(res.output_names)
@@ -128,11 +157,21 @@ def run(args) -> None:
     with open(args.program, encoding="utf-8") as f:
         code = f.read()
     image = load_image(args.in_path, args.device)
+    is_exr = args.out_path.lower().endswith(".exr")
+    # EXR is the value-preserving sink → cook under the 'engine' profile (raw fp32, alpha kept,
+    # unclamped); a PNG sink stays 'comfy' (clamped, the quantiser's contract) (DATA-2, ENG-3).
     result = run_program(code, image, device=args.device, precision=args.precision,
-                         compile_mode=args.compile_mode)
-    save_image(result, args.out_path)
+                         compile_mode=args.compile_mode,
+                         profile="engine" if is_exr else "comfy")
+    if is_exr:
+        from .tex_io import exr
+        exr.write_exr(args.out_path, result, half=args.half)
+        fmt = "exr/half" if args.half else "exr/float"
+    else:
+        save_image(result, args.out_path, bit_depth=args.bit_depth)
+        fmt = f"png/{args.bit_depth}bit"
     print(f"tex run: {args.program} on {args.in_path} -> {args.out_path} "
-          f"({args.device}/{args.precision})")
+          f"({args.device}/{args.precision}/{fmt})")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -140,12 +179,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
     rp = sub.add_parser("run", help="run a .tex program on an image file")
     rp.add_argument("program", help="path to a .tex program")
-    rp.add_argument("--in", dest="in_path", required=True, help="input image (png/jpg)")
-    rp.add_argument("--out", dest="out_path", required=True, help="output PNG")
+    rp.add_argument("--in", dest="in_path", required=True,
+                    help="input image (png/jpg, or .exr — scene-linear fp32, HDR/alpha kept)")
+    rp.add_argument("--out", dest="out_path", required=True,
+                    help="output image — .exr writes a float/half EXR (HDR, value-preserving), "
+                         "otherwise a PNG (DATA-2)")
     rp.add_argument("--device", default="cpu", help="cpu | cuda")
     rp.add_argument("--precision", default="fp32", choices=["fp32", "auto", "fp16"])
     rp.add_argument("--compile-mode", dest="compile_mode", default="none",
                     choices=["none", "auto", "torch_compile", "cuda_graph"])
+    rp.add_argument("--bit-depth", dest="bit_depth", type=int, default=8, choices=[8, 16],
+                    help="PNG bit depth (DATA-2; 16 = higher-fidelity normalized integer). "
+                         "Ignored for .exr output")
+    rp.add_argument("--half", action="store_true",
+                    help="for .exr output, store HALF instead of FLOAT (compact, ~1e-3 error)")
     sub.add_parser("validate-hw", help="measure whether TEX's Turing-calibrated perf "
                    "gates hold on THIS GPU; emit a shareable report (S-4)")
     hp = sub.add_parser("help", help="show the signature, description and example for a "

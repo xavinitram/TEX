@@ -85,6 +85,31 @@ class TEXArrayType:
     size: int
 
 
+# ── DATA-3: ARRAY values on a host wire ───────────────────────────────────────
+#
+# Whether ARRAY values may cross a host wire — an input `a@name` (curve / palette / histogram)
+# or an array output. OFF by default = the ComfyUI convention (its wire has no ARRAY type), so
+# the checker rejects an array output (E3203) and marshalling never infers ARRAY — byte-identical
+# to before. A standalone/engine host that CAN carry arrays turns it on via
+# `tex_marshalling.set_egress_profile("engine")`. Process-global, set once by the host (the
+# egress-profile model), read at compile + marshalling time. Deliberately NOT in the program
+# fingerprint: the only compile that differs is an array-OUTPUT program, which the comfy egress
+# rejects anyway (the always-on guard) — so caches need no separate namespace and existing disk
+# caches survive an upgrade (invariant #7). Single-cook-thread, set-once (the ENG-9 IAI posture).
+_ARRAY_WIRES = False
+
+
+def set_array_wires(enabled: bool) -> None:
+    """Enable/disable ARRAY host wires (DATA-3). Host-level; the egress profile drives it."""
+    global _ARRAY_WIRES
+    _ARRAY_WIRES = bool(enabled)
+
+
+def array_wires_enabled() -> bool:
+    """True when ARRAY values may cross a host wire (DATA-3). False under ComfyUI (default)."""
+    return _ARRAY_WIRES
+
+
 TYPE_NAME_MAP = {
     "float": TEXType.FLOAT,
     "int": TEXType.INT,
