@@ -17,6 +17,52 @@ from typing import Protocol
 import torch
 
 
+# ── SCHED-3: cancellation + progress ──────────────────────────────────────────
+# A cook is a ladder of tier attempts, strip loops, and per-statement tree-walks. A host
+# driving an interactive viewer must be able to ABANDON a stale cook the instant a newer
+# edit arrives (the most-used code path in any scrubbing UI) and to report progress. These
+# two primitives ride the VALUE channel exactly like ENG-7's `time_context` — threaded
+# host → prepare() → ExecContext → every tier + interp.execute — and are NEVER part of any
+# fingerprint / cache / lineage key (a per-cook token identity in a key would poison every
+# cache). They live here, the lowest-level seam every consumer (engine/memory/interpreter)
+# already imports, so no module grows a circular import to reach the exception type.
+#
+# HONEST GRANULARITY (documented, not a bug): checks fire between tier attempts, before the
+# fp16/OOM re-cooks, per strip, and per TOP-LEVEL interpreter statement. An in-flight torch
+# kernel and a `for`-loop body are NOT preempted — the floor is per-statement / per-strip.
+class CookCancelled(Exception):
+    """Raised at a cook yield point when the host's CancelToken reports cancellation.
+
+    A plain Exception, deliberately unrelated to any OOM type: `tex_engine.run`'s OOM ladder
+    keys on `_oom_in_chain`, and a CookCancelled must propagate straight out, never be
+    mistaken for a recoverable OOM and silently retried."""
+
+
+class CancelToken(Protocol):
+    """The host's cooperative-cancellation surface. `check()` returns normally to continue
+    or raises `CookCancelled` to abort. A host wires this to its own interrupt flag (e.g.
+    ComfyUI's `throw_exception_if_processing_interrupted`, a newer-edit epoch, a SIGINT)."""
+    def check(self) -> None: ...
+
+
+def _cancel_check(token) -> None:
+    """Poll a cancel token if one was supplied (a no-op when None — the default path pays a
+    single `is not None` per yield point). A non-CookCancelled raised by a misbehaving token
+    is left to propagate: swallowing it would turn a broken host into an un-abortable cook."""
+    if token is not None:
+        token.check()
+
+
+def _report_progress(cb, phase: str, frac: float) -> None:
+    """Invoke an on_progress(phase, frac) callback if supplied, best-effort — a host's
+    progress sink must never be able to fail a cook (mirrors the tier_trace posture)."""
+    if cb is not None:
+        try:
+            cb(phase, frac)
+        except Exception:
+            pass
+
+
 def _torch_oom(e) -> bool:
     oom_t = getattr(torch.cuda, "OutOfMemoryError", None)
     return isinstance(oom_t, type) and isinstance(e, oom_t)

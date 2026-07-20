@@ -13,6 +13,8 @@ from collections import OrderedDict
 
 import torch
 
+from .tex_runtime.host import (_report_progress as _progress,  # SCHED-3 best-effort progress sink
+                               _cancel_check)                  # SCHED-3 yield-point poll (None-safe)
 from .tex_compiler.ast_nodes import (
     ForLoop, WhileLoop, FunctionCall, ArrayDecl,
     BindingIndexAccess, BindingSampleAccess,
@@ -351,6 +353,188 @@ def enforce_cache_budget(device) -> None:
         pass
 
 
+# ── CACHE-5: the global cache governor (CacheRegistry) ────────────────────────
+# Four cache families hold per-device VRAM/RAM and NONE sees the others: the stdlib env-tensor
+# pools (mip/grid/sampler), the CUDA-graph pool, and — armed by an engine host — the CACHE-2
+# frame cache. On a 12 GB box their independent caps sum past 37.5% of VRAM before the cook's
+# own transients. The governor is the ONE place that arbitrates them against a SINGLE budget.
+#
+# What it does NOT do:
+#   * It is NOT the per-cook default path. `enforce_cache_budget` (above) still runs every cook
+#     and is byte-identical to before (invariant #7). The governor is armed by a host that owns
+#     a frame cache (the ROI-3 / CACHE-2 dormant-by-default posture) — under ComfyUI the host
+#     caches results itself, so the frame cache (and thus the cross-pool pressure) never arms.
+#   * It does NOT centralize keys or lifecycles — those stay per-cache (the "19 caches are
+#     non-redundant" register). ONLY eviction ARBITRATION centralizes.
+#   * It does NOT call `clear_graph_cache()`. That note in the register is stale: tex_memory has
+#     used pin-and-skip since MEM-1, never a blunt graph teardown. The governor preserves that
+#     exact graph-address safety — it skips graph-pinned storages (`pinned_storages()`), and to
+#     free VRAM a live graph holds it tears graphs down with `free_graphs_only()` (which keeps
+#     the capture blacklist + RNG-poison kill switch — `clear_graph_cache()` would re-arm doomed
+#     captures and regress MEM-1). Disk tiers keep their OWN size caps (CACHE-0 / ResultCache
+#     disk), never per-device VRAM arbitration.
+
+def governor_budget(device) -> int:
+    """The ONE coordinated VRAM/RAM budget the governor holds all arbitrated pools under — set
+    BELOW the sum of the pools' independent caps (the point of CACHE-5). Env override
+    TEX_GOVERNOR_BUDGET_MB; else ~40% of free VRAM on CUDA (a single pressure-responsive cap
+    the stdlib/graph/frame pools share), 1 GB on CPU."""
+    override = os.environ.get("TEX_GOVERNOR_BUDGET_MB")
+    if override:
+        try:
+            return int(override) * 1024 * 1024
+        except ValueError:
+            pass
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type == "cuda":
+        try:
+            from .tex_runtime.host import get_host_services
+            free = get_host_services().get_free_memory(dev)
+            if free:
+                return int(0.4 * free)
+        except Exception:
+            pass
+        total = device_total_mem(dev)
+        return int(0.4 * total) if total else 1024 * 1024 * 1024
+    return 1024 * 1024 * 1024
+
+
+def _evict_stdlib_bytes(dev_type, need: int, playhead=None) -> int:
+    """Governor evict hook for the stdlib env-tensor pools: drop oldest UNPINNED entries on
+    `dev_type` until ~`need` bytes are freed (graph-pinned entries skipped — MEM-1). Returns
+    bytes freed. `playhead` is unused (these pools carry no frame identity)."""
+    try:
+        from .tex_runtime.graphed import pinned_storages
+        pinned = pinned_storages()
+    except Exception:
+        pinned = set()
+    freed = 0
+    for cache, extract in _budget_caches():
+        while len(cache) > 1 and freed < need:
+            victim = _oldest_unpinned_key(cache, extract, pinned, dev_type)
+            if victim is None:
+                break
+            freed += _entry_bytes(cache[victim], extract)
+            del cache[victim]
+    return freed
+
+
+def _graph_pool_bytes(dev_type) -> int:
+    """Bytes the CUDA-graph pool holds (CUDA only — graphs never live on CPU)."""
+    if dev_type != "cuda":
+        return 0
+    try:
+        from .tex_runtime import graphed
+        return max(0, int(graphed._graph_bytes))
+    except Exception:
+        return 0
+
+
+def _evict_graphs(dev_type, need: int, playhead=None) -> int:
+    """Governor evict hook for the CUDA-graph pool. Graphs can't be partially freed (a replay
+    reads baked addresses), so this is all-or-nothing: when VRAM is needed it tears every graph
+    down via `free_graphs_only()` — preserving the blacklist + kill switch (NOT
+    `clear_graph_cache`). Registered LAST (highest evict_order) because recapture is costly, so
+    it only fires when the rebuildable stdlib/frame pools couldn't free enough."""
+    if dev_type != "cuda" or need <= 0:
+        return 0
+    held = _graph_pool_bytes(dev_type)
+    if held <= 0:
+        return 0
+    try:
+        from .tex_runtime.graphed import free_graphs_only
+        free_graphs_only()
+        return held
+    except Exception:
+        return 0
+
+
+class CacheRegistry:
+    """CACHE-5: arbitrates the per-device VRAM/RAM cache pools against one budget. Pools register
+    a `(bytes_fn, evict_fn, evict_order)`; `arbitrate()` frees across them, cheapest-to-rebuild
+    first, until under budget — the single coordination point four independent budgets lacked.
+    Not thread-safe by itself (the MUT caches are single-cook-thread; a parallel host guards it —
+    DATA-4)."""
+
+    def __init__(self):
+        # name -> (bytes_fn(dev_type)->int, evict_fn(dev_type, need, playhead)->freed, evict_order)
+        self._pools: "OrderedDict[str, tuple]" = OrderedDict()
+
+    def register(self, name: str, bytes_fn, evict_fn, *, evict_order: int = 50) -> None:
+        self._pools[name] = (bytes_fn, evict_fn, evict_order)
+
+    def unregister(self, name: str) -> None:
+        self._pools.pop(name, None)
+
+    def total_bytes(self, dev_type: str) -> int:
+        return sum(self.stats(dev_type).values())
+
+    def stats(self, dev_type: str) -> dict:
+        out = {}
+        for name, (bytes_fn, _ev, _o) in self._pools.items():
+            try:
+                out[name] = int(bytes_fn(dev_type))
+            except Exception:
+                out[name] = 0
+        return out
+
+    def arbitrate(self, device, *, budget: int | None = None, playhead=None) -> int:
+        """Evict across the registered pools until total ≤ budget (default: `governor_budget`).
+        Pools are drained in ascending `evict_order` — rebuildable stdlib pyramids first, frame
+        cache next, CUDA graphs last. The roadmap's "live-graph-key" priority hint is realized by
+        THIS ordering plus the stdlib evictor's pin-skip (a graph-pinned storage is never freed),
+        not a separate hint arg; `playhead` is the one passed hint (far-from-playhead frames first,
+        when a pool carries the frame). Best-effort; never raises. Returns bytes freed."""
+        try:
+            dev = torch.device(device) if not isinstance(device, torch.device) else device
+            dev_type = dev.type
+            budget = budget if budget is not None else governor_budget(dev)
+            total = self.total_bytes(dev_type)
+            if total <= budget:
+                return 0                      # cheap early-out (mirrors enforce_cache_budget)
+            freed = 0
+            for _name, (_bytes_fn, evict_fn, _order) in sorted(
+                    self._pools.items(), key=lambda kv: kv[1][2]):
+                if total - freed <= budget:
+                    break
+                need = (total - freed) - budget
+                try:
+                    freed += int(evict_fn(dev_type, need, playhead))
+                except Exception:
+                    pass
+            return freed
+        except Exception:
+            return 0
+
+
+_registry: "CacheRegistry | None" = None
+
+
+def get_cache_registry() -> CacheRegistry:
+    """The process-wide governor, with the always-present pools (stdlib env tensors, CUDA
+    graphs) registered on first use. A host arms the frame cache with `register_result_cache`."""
+    global _registry
+    if _registry is None:
+        reg = CacheRegistry()
+        reg.register("stdlib", lambda dt: _total_cache_bytes(dt), _evict_stdlib_bytes,
+                     evict_order=10)
+        reg.register("graphs", _graph_pool_bytes, _evict_graphs, evict_order=90)
+        _registry = reg
+    return _registry
+
+
+def register_result_cache(cache, *, name: str = "results", evict_order: int = 50) -> None:
+    """Arm a CACHE-2 `ResultCache` into the governor (the frame cache is host-instantiated, so a
+    host calls this when it creates one). Its RAM bytes then count toward the per-device budget
+    and its LRU frames become evictable under pressure — the fold-in the CACHE-5 register
+    promises. `cache.evict_bytes` supplies the eviction (playhead-aware when frames carry one)."""
+    reg = get_cache_registry()
+    reg.register(name,
+                 lambda dt: cache.governed_bytes(dt),
+                 lambda dt, need, playhead: cache.evict_bytes(need, dev_type=dt, playhead=playhead),
+                 evict_order=evict_order)
+
+
 # MEM-2 (audit B2): per-device last-seen spatial pixel count + cached total VRAM, so the
 # allocator is queried ONLY after a resolution downshift — not on every cook.
 _last_trim_px: dict = {}
@@ -423,13 +607,16 @@ def _shared_dim_size(bindings, dim: int, min_ndim: int) -> int | None:
 
 
 def _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
-                output_names, used_builtins, precision, time_context) -> dict:
+                output_names, used_builtins, precision, time_context,
+                cancel=None, on_progress=None) -> dict:
     """The whole-frame (untiled / un-ROI'd / un-strided) cook — the shared fallback body for
-    `run_tiled` / `run_roi` / `run_batch_strips`."""
+    `run_tiled` / `run_roi` / `run_batch_strips`. SCHED-3: forwards the cancel token / progress
+    sink so a whole-frame fallback stays as abortable as the tiled path it replaced."""
     return interp.execute(program, bindings, type_map, device=device,
                           latent_channel_count=latent_channel_count,
                           output_names=output_names, used_builtins=used_builtins,
-                          precision=precision, time_context=time_context)
+                          precision=precision, time_context=time_context,
+                          cancel=cancel, on_progress=on_progress)
 
 
 def shared_tile_height(bindings) -> int | None:
@@ -442,7 +629,7 @@ def shared_tile_height(bindings) -> int | None:
 
 def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
               output_names, used_builtins, precision, n_strips: int,
-              time_context: dict | None = None) -> dict:
+              time_context: dict | None = None, cancel=None, on_progress=None) -> dict:
     """M-4: execute a tile-safe program in `n_strips` horizontal strips, keeping
     peak transient to ~1/n_strips of the full-image cook. Spatial bindings are
     narrowed (zero-copy views); outputs are preallocated once and strips copy_'d
@@ -451,10 +638,15 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
 
     `time_context` (ENG-7) must be forwarded to every strip: the interpreter reads the
     playhead off per-execute state, so a strip cooked without it silently reads zeros —
-    a frozen animation on exactly the big cooks that need tiling."""
+    a frozen animation on exactly the big cooks that need tiling.
+
+    SCHED-3: `cancel`/`on_progress` ride the same channel — checked at each strip boundary
+    (a natural yield point) and forwarded into every strip's cook, so a big tiled cook is
+    the MOST abortable path, not the least."""
     def _untiled():
         return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
-                           output_names, used_builtins, precision, time_context)
+                           output_names, used_builtins, precision, time_context,
+                           cancel, on_progress)
 
     # M-4 safety: tiling narrows dim 1 (the image HEIGHT for [B,H,W,C] IMAGE /
     # [B,H,W] MASK). Refuse — and cook untiled — when that axis isn't a shared
@@ -473,17 +665,21 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
         y0, y1 = bounds[k], bounds[k + 1]
         if y1 <= y0:
             continue
+        _cancel_check(cancel)               # SCHED-3 yield F: abort a stale cook between strips
         strip_bindings = {}
         for name, v in bindings.items():
             if isinstance(v, torch.Tensor) and v.dim() >= 3 and v.shape[1] == H_total:
                 strip_bindings[name] = v.narrow(1, y0, y1 - y0)
             else:
                 strip_bindings[name] = v
+        # SCHED-3: forward the CANCEL token (finer per-statement abort inside the strip) but
+        # NOT on_progress — the strip loop owns the progress axis; letting each strip also emit
+        # per-statement fractions would reset 0→1 every strip and read as noise to a host.
         res = interp.execute(program, strip_bindings, type_map, device=device,
                              latent_channel_count=latent_channel_count,
                              output_names=output_names, used_builtins=used_builtins,
                              precision=precision, tile=(y0, H_total),
-                             time_context=time_context)
+                             time_context=time_context, cancel=cancel)
         for name, strip_out in res.items():
             if isinstance(strip_out, torch.Tensor) and strip_out.dim() >= 3:
                 buf = outputs.get(name)
@@ -496,6 +692,8 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
                 buf[:, y0:y1] = strip_out
             elif name not in outputs:
                 outputs[name] = strip_out  # scalar/string: any strip suffices
+        if on_progress is not None:         # SCHED-3: report per-strip fraction
+            _progress(on_progress, "strip", (k + 1) / n_strips)
     return outputs
 
 
@@ -508,7 +706,7 @@ def shared_batch_size(bindings) -> int | None:
 
 def run_batch_strips(interp, program, bindings, type_map, device, latent_channel_count,
                      output_names, used_builtins, precision, n_strips: int,
-                     time_context: dict | None = None) -> dict:
+                     time_context: dict | None = None, cancel=None, on_progress=None) -> dict:
     """ROI-6: cook a PER-FRAME-INDEPENDENT program's batch in `n_strips` frame-strips (narrow
     dim 0), bounding peak transient to ~1/n_strips of the full-batch cook, and stitch — the
     batch-axis twin of `run_tiled`. The caller guarantees `tex_roi.batch_sliceable` (no
@@ -522,7 +720,8 @@ def run_batch_strips(interp, program, bindings, type_map, device, latent_channel
     it into the auto-tiling memory-pressure path is the near-term follow-up."""
     def _whole():
         return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
-                           output_names, used_builtins, precision, time_context)
+                           output_names, used_builtins, precision, time_context,
+                           cancel, on_progress)
 
     B_total = shared_batch_size(bindings)
     if B_total is None or B_total < 2:
@@ -545,22 +744,27 @@ def run_batch_strips(interp, program, bindings, type_map, device, latent_channel
         f0, f1 = bounds[k], bounds[k + 1]
         if f1 <= f0:
             continue
+        _cancel_check(cancel)               # SCHED-3 yield F: abort between batch strips
         strip_bindings = {}
         for name, v in bindings.items():
             if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_total:
                 strip_bindings[name] = v.narrow(0, f0, f1 - f0)
             else:
                 strip_bindings[name] = v          # broadcast singleton / scalar passes through
+        # SCHED-3: forward CANCEL (per-statement abort within the strip) but not on_progress —
+        # the batch-strip loop owns the progress axis (mirrors run_tiled).
         res = interp.execute(program, strip_bindings, type_map, device=device,
                              latent_channel_count=latent_channel_count,
                              output_names=output_names, used_builtins=used_builtins,
                              precision=precision, batch_slice=(f0, B_total),
-                             time_context=time_context)
+                             time_context=time_context, cancel=cancel)
         for name, so in res.items():
             if isinstance(so, torch.Tensor) and so.dim() >= 1 and so.shape[0] == (f1 - f0):
                 batched.setdefault(name, []).append((f0, f1, so))
             else:
                 broadcast.setdefault(name, so)    # shape[0]==1 at a multi-frame strip, scalar, string
+        if on_progress is not None:               # SCHED-3: report per-batch-strip fraction
+            _progress(on_progress, "strip", (k + 1) / n_strips)
     outputs: dict = dict(broadcast)
     for name, parts in batched.items():
         if name in broadcast:
@@ -577,7 +781,7 @@ def run_batch_strips(interp, program, bindings, type_map, device, latent_channel
 
 def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
             output_names, used_builtins, precision, roi, narrow_names, halo: int,
-            time_context: dict | None = None) -> dict:
+            time_context: dict | None = None, cancel=None, on_progress=None) -> dict:
     """ROI-3: cook only the output window `roi=(x0, y0, w, h, W, H)` of a full W×H image
     (the 2-D generalization of `run_tiled`'s strip). The cook region is `ROI ⊕ halo`, clamped
     to the image; `narrow_names` bindings are sliced to it (a zero-copy view, per spatial dim
@@ -598,7 +802,8 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
 
     def _whole():
         return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
-                           output_names, used_builtins, precision, time_context)
+                           output_names, used_builtins, precision, time_context,
+                           cancel, on_progress)
 
     if latent_channel_count:
         return _whole()
@@ -629,7 +834,8 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
                          latent_channel_count=latent_channel_count,
                          output_names=output_names, used_builtins=used_builtins,
                          precision=precision, roi=(cx0, cy0, cw, ch, W, H),
-                         time_context=time_context)
+                         time_context=time_context,
+                         cancel=cancel, on_progress=on_progress)
 
     # Crop each cook-region output to the ROI sub-window, PER SPATIAL DIM independently
     # (mirroring the per-dim narrow): an output can legitimately be full in one spatial dim
@@ -645,6 +851,73 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
             if val.shape[2] == cw:
                 val = val[:, :, lx:lx + w]
         outputs[name] = val   # scalar / string / genuinely-broadcast dims pass through
+    return outputs
+
+
+def shared_tile_width(bindings) -> int | None:
+    """ROI-5: the single image width shared by every spatial (dim>=3) binding that isn't a
+    broadcast singleton (shape[2]==1), or None otherwise — the width twin of
+    `shared_tile_height`, needed to size the full-image W a halo strip clamps against."""
+    return _shared_dim_size(bindings, 2, 3)
+
+
+def run_tiled_halo(interp, program, bindings, type_map, device, latent_channel_count,
+                   output_names, used_builtins, precision, n_strips: int,
+                   narrow_names, halo: int, time_context: dict | None = None,
+                   cancel=None, on_progress=None) -> dict:
+    """ROI-5: cook a HALO program (a bounded direct-tensor neighbourhood op — blur / erode /
+    dilate) in `n_strips` horizontal strips, each grown by `halo` rows so an interior pixel
+    reads the SAME neighbours it would in the whole-image cook. This is the seam-exact
+    generalization of `run_tiled` to NON-local programs — the class `is_tile_safe` refuses and
+    an 8K `gauss_blur` could not tile at all before. It is driven entirely over `run_roi`'s
+    proven 2-D grow-cook-crop (a vertical strip is `run_roi` with `x0=0, w=W`), so the ROI-4
+    differential oracle's bit-exactness carries over unchanged. Falls back to a whole-frame cook
+    on any shape it can't strip (LATENT, no shared H, no anchor width).
+
+    COST (inherent, not a defect): each strip cooks its `y0..y1` rows PLUS a `halo` margin on each
+    side, so the `halo` rows adjacent to every interior seam are cooked in two strips — up to
+    ~2× the interior work at the smallest useful strip (`4·halo` rows). That recompute IS the price
+    of tiling an image too big to cook whole; the strip planner (`_halo_tile_plan`) only pays it
+    under real memory pressure or the TDR cap, never on a cook that fits."""
+    def _untiled():
+        return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
+                           output_names, used_builtins, precision, time_context,
+                           cancel, on_progress)
+
+    if latent_channel_count:
+        return _untiled()
+    H_total = shared_tile_height(bindings)
+    W_total = shared_tile_width(bindings)
+    if H_total is None or W_total is None:
+        return _untiled()
+    bounds = [(i * H_total) // n_strips for i in range(n_strips)] + [H_total]
+    outputs: dict = {}
+    for k in range(n_strips):
+        y0, y1 = bounds[k], bounds[k + 1]
+        if y1 <= y0:
+            continue
+        _cancel_check(cancel)                   # SCHED-3 yield F: abort between halo strips
+        # A full-width horizontal strip is exactly an ROI window (x0=0, w=W); run_roi grows it
+        # by `halo` (clamped at the true image edges), cooks the seam-exact region grid, and
+        # crops the halo back to [y0, y1). Cancel forwarded (per-statement abort within the
+        # strip); on_progress suppressed — the strip loop owns the progress axis.
+        strip = run_roi(interp, program, bindings, type_map, device, latent_channel_count,
+                        output_names, used_builtins, precision,
+                        (0, y0, W_total, y1 - y0, W_total, H_total), narrow_names, halo,
+                        time_context, cancel=cancel)
+        for name, so in strip.items():
+            if isinstance(so, torch.Tensor) and so.dim() >= 3 and so.shape[1] == (y1 - y0):
+                buf = outputs.get(name)
+                if buf is None:
+                    full_shape = list(so.shape)
+                    full_shape[1] = H_total
+                    buf = torch.empty(full_shape, dtype=so.dtype, device=so.device)
+                    outputs[name] = buf
+                buf[:, y0:y1] = so
+            elif name not in outputs:
+                outputs[name] = so              # scalar/string/broadcast: any strip suffices
+        if on_progress is not None:
+            _progress(on_progress, "strip", (k + 1) / n_strips)
     return outputs
 
 

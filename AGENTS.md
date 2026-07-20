@@ -93,7 +93,12 @@ silent-wrong result.
 **Correctness contracts (removing = silent-wrong):**
 - `tex_cache` post-optimize re-typecheck (invariant #3).
 - `interpreter.py` coordinate builtins forced fp32 (invariant #4).
-- `tex_memory` `clear_graph_cache()` after cache eviction — stale-CUDA-graph-address safety.
+- `tex_memory` cache eviction preserves the **stale-CUDA-graph-address safety** by
+  **pin-and-skip** (MEM-1): `enforce_cache_budget` skips any storage in `graphed.pinned_storages()`,
+  and reclaiming graph VRAM uses `free_graphs_only()` (keeps the blacklist + RNG-poison kill switch).
+  It does NOT call `clear_graph_cache()` — that blunt reset is test-only, and calling it on eviction
+  regresses MEM-1 (re-arms doomed captures). CACHE-5's `CacheRegistry` governor arbitrates the
+  per-device pools (stdlib / graphs / frame cache) against one budget and keeps this exact discipline.
 - `graphed.py` `_graph_mode_disabled` kill-switch, `capture_error_mode="thread_local"`, `_build_keepalive` refs, per-graph pool.
 - `compiled.py` dynamo reset on the **calling** thread (dynamo state is process-global); `has_spatial` deliberately NOT memoized (depends on binding *values*).
 - `tex_marshalling` numpy-free `struct.pack` fingerprint (invariant #1).

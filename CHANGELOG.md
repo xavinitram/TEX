@@ -5,6 +5,166 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0] - 2026-07-20
+
+**Big frames, placed well.** This release makes the engine survive scale — an 8K blur that
+could not tile at all, a graph whose caches sum past VRAM, a scrub that recooked a whole fused
+chain per tick — and adds the substrate a standalone host needs to place work across devices and
+abandon a stale cook. Five items: halo-aware tiling (ROI-5), the global cache governor (CACHE-5),
+fusion↔caching reconciliation (CACHE-6), the device-placement scheduler (SCHED-2), and
+cancellation + progress (SCHED-3). New module `tex_scheduler.py`. Everything ships **off the
+default ComfyUI cook path** (invariant #7): the scheduler, governor, and stage-boundary tap are
+host-armed (the ROI-3 / CACHE-2 dormant-by-default posture), halo tiling engages only under
+memory pressure on programs that could not tile before, and cancel/progress are `None` unless a
+host passes them. Full suite green (the one failure is the pre-existing S-4 cp1252 console, an
+environment gap confirmed identical on committed v0.26.0).
+
+### ROI-5 — halo-aware tiling (`tex_memory.run_tiled_halo`)
+
+- `is_tile_safe` refuses **any** non-pixel-local program, so an 8K `gauss_blur` — exactly the
+  program that dominates compositing VRAM — could not tile at all. ROI-5 tiles the bounded
+  neighbourhood class (blur / erode / dilate) with a **grown strip**: each horizontal strip is
+  cooked over `ROI ⊕ halo` so an interior pixel reads the same neighbours as the whole-image
+  cook. It is driven entirely over `run_roi`'s proven 2-D grow-cook-crop (a vertical strip is
+  `run_roi` with `x0=0, w=W`), so the **ROI-4 differential-oracle bit-exactness carries over
+  unchanged**. `is_tile_safe` itself is untouched (still the point-only fast path read by the
+  OOM ladder + TST-3); the halo class routes through a separate `_halo_tile_plan`.
+- The reach comes from `tex_roi.roi_plan` (`gauss_blur`'s halo is `ceil(3·sigma)`); **global
+  reductions and gathers are not halo-tileable** (`roi_plan` is not executable for them) and
+  cook whole-frame — the conservative correct choice.
+- **WDDM TDR time cap:** the strip planner caps estimated per-**strip** cook time (~1.8 s, under
+  the ~2 s display-driver watchdog) using autotier's persisted whole-frame median, not just
+  bytes — BlinkScript's driver timeouts are this failure, un-planned-for. The OOM ladder gains a
+  halo-tiling backstop for a blur that OOMs whole-frame.
+- Honest scope: tiled cooks run on the **interpreter tier** (compiled tiers fall back, exactly
+  as ROI-3 ships); routing tiled cooks through codegen is the documented follow-up. Exit gate:
+  the halo-tiled cook equals the whole-frame cook (CPU + CUDA, bit-exact morphology / <1e-5 blur).
+
+### CACHE-5 — the global cache governor (`tex_memory.CacheRegistry`)
+
+- Four cache families held per-device VRAM/RAM and **none saw the others** (stdlib env tensors,
+  CUDA graphs, the CACHE-2 frame cache; their independent caps sum past 37.5% of VRAM on a 12 GB
+  box). `CacheRegistry` arbitrates them against **one** `governor_budget` (~40% of free VRAM, a
+  single pressure-responsive cap), evicting cheapest-to-rebuild first: stdlib pyramids → frame
+  cache → CUDA graphs.
+- **The graph-address safety is preserved, not the stale function.** The register's note said
+  eviction calls `clear_graph_cache()`; it has not since MEM-1 — tex_memory uses **pin-and-skip**
+  (`pinned_storages()` + `free_graphs_only()`). The governor keeps that exactly: it never frees a
+  storage a live graph baked, and to reclaim graph VRAM it tears graphs down with
+  `free_graphs_only()` (which keeps the capture blacklist + RNG-poison kill switch —
+  `clear_graph_cache()` would re-arm doomed captures and regress MEM-1). The stale note is
+  corrected in AGENTS.md.
+- Keys and lifecycles stay **per-cache** (the 19-cache register); only eviction **arbitration**
+  centralizes. Disk tiers keep their own size caps (CACHE-0 / ResultCache disk), never per-device
+  VRAM arbitration. The frame cache folds in via `ResultCache.governed_bytes` / `evict_bytes`
+  (host-armed with `register_result_cache`; spill, don't drop). The per-cook
+  `enforce_cache_budget` is byte-identical — the governor is a separate opt-in layer.
+
+### CACHE-6 — fusion ↔ caching reconciliation
+
+- A fused chain has no interior cut-points, so twiddling the last node's param recooked all N
+  stages per tick — fusion made interactivity **worse** exactly where it matters. CACHE-6 cuts
+  the chain at a stage boundary `k`: a **stage-boundary tap** caches the stage-(k-1) fp32 handoff
+  (keyed by the upstream *sub-chain* fingerprint `tex_fusion.prefix_fingerprint` × the prefix
+  param VALUES × the host-supplied source identity `upstream` × device × precision × playhead ×
+  canvas), and a **suffix splice** recooks only
+  stages k..N reading that cached boundary while a downstream knob is hot; the full program
+  recooks on idle.
+- The boundary **must be the exact fp32 handoff** or the oracle breaks (an interior handoff is
+  fp16 under auto→fp16), so `cook_fused_cached` gates taps to fp32 and falls back to a whole-chain
+  cook otherwise. `cook_stage_list` replicates prepare()'s param default-inject + convert so a
+  sub-chain cooks bit-identically to those stages inside the full program. Exit gate: the
+  suffix-spliced cook equals the full fused cook (CPU + CUDA, maxdiff 0.0); a hot downstream param
+  reuses the cached boundary, an upstream param busts its key.
+- OPT-IN and dormant (invariant #7): a host passes the `ResultCache` + cut-point; nothing on the
+  default path calls it. v1 covers **linear** chains (the interactive grade→blur→vignette case); a
+  `chain_inputs` DAG recooks whole (a documented follow-up — correct, just not incremental).
+
+### SCHED-2 — device-placement scheduler (`tex_scheduler.py`, NEW)
+
+- Where should each node cook — CPU or CUDA? Minimize `Σ cook_cost + Σ transfer_cost` subject to
+  user pins and per-device memory budgets. Cook costs from autotier's persisted medians (new
+  public `autotier.cook_ms`), transfer costs from the ENG-8 probe (`xfer.transfer_ms`), with
+  **boundary transfers** (the external input's upload, the result's download) so the CPU-vs-GPU
+  trade is real. Exact where it can be (a **Viterbi DP** for a linear chain, exact **enumeration**
+  for a small DAG), **greedy** where it must be — and greedy ("a node runs where its input is,
+  else the default device") is `resolve_device`'s own auto rule, so it is the correctness baseline
+  the plan defers to when cost data is missing or a node is pinned.
+- Device is part of every result key (CACHE-1), so a placement is visible: the plan is **frozen
+  per render range**, re-solved only at an interactive/idle boundary (mid-sequence migration is a
+  rejected decision — it pops pixels by the invariant-#9 envelope), with **hysteresis** damping
+  interactive flapping. Distinct from the rejected PF-4: it chooses *where* a node runs, never
+  *which tier*. CUDA + CPU only. Pure planner — no `comfy` import (PORT-1), no bare `torch.cuda.*`;
+  cost hooks are injectable so tests drive it with explicit numbers. Ships measured, tested, and
+  **dormant** (its consumer is a GraphSpec host — PORT-5 / GRAPH-1); an additive per-stage
+  `device` pin in GraphSpec (`graph_from_spec`) an older reader ignores harmlessly.
+
+### SCHED-3 — cancellation + progress
+
+- A `CancelToken` (`.check()` raising `CookCancelled`) is polled at every natural cook yield
+  point — before the first tier attempt, before each interpreter fallback, before the fp16 and
+  OOM re-cooks, per tile/halo strip, and per top-level interpreter statement — and an
+  `on_progress(phase, frac)` callback reports (`tier` bookends, `strip` per strip, `stmt` per
+  statement). Aborting a stale cook the instant a newer edit arrives is *the* most-used path in an
+  interactive viewer.
+- Both ride the **value channel** exactly like ENG-7's `time_context` (threaded host → prepare →
+  ExecContext → every tier + `interp.execute`) and are **never** part of any fingerprint / cache /
+  lineage key. The default path is byte-identical: the interpreter takes one `is-None` branch per
+  cook and runs the unchanged plain loop when no token/sink is supplied. `CookCancelled` is a
+  plain exception unrelated to any OOM type (an explicit guard keeps the OOM ladder from retrying
+  it). Honest granularity: an in-flight kernel and a `for`-loop body are not preempted — the floor
+  is per-statement / per-strip. Exposed on `tex_api.execute` + re-exported from `tex_api`.
+
+### Gates
+
+- v0.27 phase-1: SCHED-3 cancellation (yield points, per-statement, per-strip, `tiled == untiled`
+  bit-exact, default path unaffected), SCHED-2 placement (DP / enumeration / greedy / pins /
+  hysteresis / adapter / `cook_ms`), CACHE-5 governor (pool register, frame-cache fold-in, evict +
+  spill, graph-safety no-op, early-out), ROI-5 halo oracle (blur/morphology tiled == whole-frame,
+  CPU + CUDA), CACHE-6 oracle (suffix-splice == full fused, boundary hit/miss/reuse). Compat corpus
+  + release gates green; version 0.27.0 consistent.
+- **Invariant #7 holds by construction** on the default ComfyUI cook: no watched compiler/runtime
+  file changed the default path — halo tiling is a new branch reached only under pressure on
+  programs that could not tile before; the governor's `enforce_cache_budget` is byte-identical; the
+  scheduler, tap, and cancel/progress are opt-in/host-armed/None-by-default. The cache register
+  count is unchanged (the governor holds pools, adds no store). Measured neutral: the interpreter's
+  per-statement loop is byte-identical when no cancel/progress is set (one `is-None` branch/cook).
+- **A /simplify pass** caught one real invariant-#7 regression: the ROI-5 halo probe ran
+  `roi_plan` + `estimate` + `get_free_memory` (the ~61 µs driver query) + `cook_ms` on *every*
+  non-tiled CUDA blur/morphology cook. `_halo_tile_plan` now cheap-gates on a memoized estimate +
+  cached total VRAM + a dict `cook_ms` lookup (`est < total//8` skip, mirroring `_preflight_memory`),
+  so a small default cook returns before any driver query; genuine pressure on a small cook is still
+  caught by the OOM ladder's new halo backstop.
+- **An adversarial bug-hunt** (5 find+verify agent pairs on the diff) caught three real bugs, all
+  fixed and pinned (a SCHED-3 "swallowed cancel" candidate was verified refuted — the
+  `except CookCancelled: raise` guards are correct):
+  - (HIGH) CACHE-6's `boundary_lineage_key` omitted the source identity, so a different source image
+    of the same shape + params served the prior image's cached boundary (silent-wrong). The source
+    identity must be **content-sensitive** — a raw `data_ptr` is not (a reused/overwritten frame
+    buffer keeps its address; `src.copy_(next_frame)` in a video pipeline, or allocator address
+    reuse, both reproduce a stale serve). `cook_fused_cached` now **requires** a host-supplied
+    `upstream` CACHE-1 source key to cache a boundary (the "tensor enters by upstream key"
+    contract); with no `upstream` it falls back to a correct full cook.
+  - (MED) `tex_scheduler._is_linear_chain` accepted a **forest** (≥2 disconnected chains — a dead
+    stage in a GraphSpec produces one); the Viterbi reconstruction assumes one source, so a second
+    source's `None` back-pointer raised `KeyError`, breaking the "never raises → greedy" contract on
+    a ≥2-device box. It now requires exactly one source; a forest routes to enumeration/greedy.
+  - (LOW-MED) `_halo_tile_plan` sized the cook off a first-match scan that didn't skip broadcast
+    singletons, so a `[B,H,1]` companion bound first under-sized `est` and diverged the autotier
+    px-bucket, silently zeroing the WDDM TDR floor (no wrong pixels). It now derives spatial from
+    `shared_tile_height`/`shared_tile_width` (both skip singletons).
+- **A second, larger audit** (8 finders + adversarial verify) over the full diff: 28 findings
+  survived, 3 refuted. One genuine bug — `_oom_retry`'s outer `except Exception` reclassified a
+  `CookCancelled` (raised at the OOM yield point or inside the tiled/halo OOM re-cook) as the
+  original OOM and retried an abandoned cook — now re-raises cancel first, completing the
+  `_run_default` cancel-passthrough. Plus dormant/defensive hardenings: CACHE-6 requires `upstream`
+  to key EVERY prefix tensor (not just be non-empty) and wraps `suffix_stage_list`'s `FusionError`
+  to the whole-chain fallback; SCHED-2's greedy matches device by CLASS (a `cuda:0`-pinned node's
+  consumer no longer drops to CPU) and applies the any-input-on-GPU rule for fan-in; `_halo_tile_plan`
+  bails on `is_tile_safe_cached` first so a pointwise CUDA cook skips its scans. Honest scope notes
+  added (CACHE-5 live-graph-key realized by evict-order + pin-skip; TDR cap halo-only; SCHED-2
+  budget CUDA-only; SCHED-3 cancel not yet node-wired; halo strip-overlap cost).
+
 ## [0.26.0] - 2026-07-19
 
 **Tools** — the bundling promise. A tool is the compositor's gizmo / macro / HDA: a named,

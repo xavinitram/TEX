@@ -434,6 +434,41 @@ class ResultCache:
         except Exception:
             self._disk_bytes = None             # scan failed: stay in the safe rescan-next-time state
 
+    # ── CACHE-5: governor hooks (the frame cache folded into the global arbitration) ──
+    def governed_bytes(self, dev_type: str | None = None) -> int:
+        """RAM bytes this cache holds on `dev_type` ("cuda"/"cpu"), or all if None — the figure
+        the CACHE-5 governor sums against the per-device VRAM/RAM budget. O(entries); called only
+        when a host has armed this cache into the governor."""
+        if dev_type is None:
+            return self._ram_bytes
+        return sum(e[2] for e in self._ram.values()
+                   if (str(e[3]).startswith("cuda")) == (dev_type == "cuda"))
+
+    def evict_bytes(self, need: int, *, dev_type: str | None = None, playhead=None) -> int:
+        """CACHE-5 evict hook: spill LRU frames on `dev_type` to disk until ~`need` bytes are
+        freed; returns bytes freed. Never drops the whole cache (leaves ≥1 entry so a just-served
+        frame survives). `playhead` is accepted for a future far-from-playhead ordering; today the
+        LRU front already approximates it (a scrub touches near-playhead frames most recently)."""
+        if need <= 0:
+            return 0
+        freed = 0
+        # snapshot LRU order (oldest first) so mutation during iteration is safe
+        for key in list(self._ram.keys()):
+            if freed >= need or len(self._ram) <= 1:
+                break
+            entry = self._ram.get(key)
+            if entry is None:
+                continue
+            if dev_type is not None and (str(entry[3]).startswith("cuda")) != (dev_type == "cuda"):
+                continue
+            nbytes = entry[2]
+            self._ram.pop(key)
+            self._ram_bytes -= nbytes
+            self.evictions += 1
+            self._spill(key, entry)     # to disk (best-effort) — a miss just recooks
+            freed += nbytes
+        return freed
+
     # ── introspection / lifecycle ──
     def stats(self) -> dict:
         return {"ram_entries": len(self._ram), "ram_bytes": self._ram_bytes,

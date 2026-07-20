@@ -30,10 +30,15 @@ rather than hard-failing the cook with its upstream already deleted).
 **Transfer cost** (`tex_runtime/xfer.py`, ENG-8) measures per-lane PCIe latency +
 bandwidth for the placement scheduler. **Caching** (`tex_cache.py`)
 keys compiled artifacts and fused programs. **Memory** (`tex_memory.py`) does OOM
-preflight, byte-budgeted cache eviction, and horizontal-strip tiling.
+preflight, byte-budgeted cache eviction, horizontal-strip tiling (pointwise M-4 + the
+v0.27 ROI-5 **halo** tiling `run_tiled_halo` for the blur/morphology class, over `run_roi`'s
+grow-cook-crop), and the v0.27 CACHE-5 **cache governor** (`CacheRegistry`) that arbitrates the
+per-device stdlib/graph/frame pools against one budget. **Placement** (`tex_scheduler.py`,
+v0.27 SCHED-2) plans per-node CPU-vs-CUDA device assignment (Viterbi DP / enumeration / greedy
+fallback) over the autotier + xfer costs — a pure planner a GraphSpec host arms; it never cooks.
 **Autotier** (`tex_runtime/autotier.py`) is the `auto` mode's measure→trial→commit
-state machine. **Noise** (`tex_runtime/noise.py`) is the arithmetic-hash procedural
-noise family. The ComfyUI node itself is `tex_node.py`.
+state machine (and exposes `cook_ms` medians to the scheduler). **Noise** (`tex_runtime/noise.py`)
+is the arithmetic-hash procedural noise family. The ComfyUI node itself is `tex_node.py`.
 
 ## Module layers (the import rule)
 
@@ -207,9 +212,8 @@ ROI-2) is `tex_roi._walk_memo` (code-hash × fp32 param bits → the spatial foo
 `tex_lazy._memo` but a distinct analysis). #19 (v0.25 CACHE-2) is `tex_results.ResultCache`
 (lineage-key → cooked frame; RAM byte-budget LRU + disk spill through the pinned-egress helpers,
 frames frozen per ENG-12) — the first **host-instantiated** store in this register rather than a
-module-level singleton, so its lifecycle is the engine host's; CACHE-5's governor will fold its
-byte total into the per-device arbitration. The count here must match AGENTS.md (a DOC-7b
-check enforces it).
+module-level singleton, so its lifecycle is the engine host's. The count here must match AGENTS.md
+(a DOC-7b check enforces it).
 
 Two v0.25 mechanisms touch this register without adding a store: `tex_runtime/warm_state.py`
 (CACHE-3) *persists* three existing in-memory verdicts (graph-capturability, backend probes,
@@ -217,3 +221,11 @@ the compile blacklist) to `warm_state.json` so a relaunch skips re-trialling; an
 the one compiler mono-hash that versioned every artifact into a nested epoch lattice
 (AST ⊑ CODEGEN ⊑ VERDICT), so a codegen-only edit no longer cold-starts the parsed-program
 (`.pkl`) tier. See docs/results-caching.md.
+
+**v0.27 CACHE-5 — the global cache governor** — also touches this register without adding a store:
+`tex_memory.CacheRegistry` arbitrates the per-device VRAM/RAM pools (the stdlib env-tensor caches,
+the CUDA-graph pool, and — host-armed via `register_result_cache` — #19's `ResultCache`) against
+ONE `governor_budget`, evicting cheapest-to-rebuild first. Keys and lifecycles stay per-cache; only
+eviction **arbitration** centralizes, so the count stays 19. It preserves the stale-graph-address
+safety by pin-and-skip / `free_graphs_only` (NOT `clear_graph_cache`), and the per-cook
+`enforce_cache_budget` is unchanged — the governor is a separate opt-in layer an engine host drives.

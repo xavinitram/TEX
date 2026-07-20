@@ -92,6 +92,22 @@ def verdict(key: tuple) -> str:
     return _get(key).state
 
 
+def cook_ms(key: tuple) -> float | None:
+    """SCHED-2: the effective median cook time (ms) recorded for `key`, or None if this
+    program was never cooked on that (device_type, precision, resolution-bucket). The
+    scheduler reads this as `cook_cost(node, device)`. Loads persisted verdicts first (a cold
+    process has an empty in-memory table), then returns the compiled median for a COMMITTED
+    program (the tier it actually runs) else the interpreter/codegen median — mirroring how a
+    real cook routes. `0.0`/empty deques → None so the caller falls back to greedy rather than
+    treating 'unmeasured' as 'free' (the trap that would place everything on one device)."""
+    load()
+    st = _STATE.get(key)
+    if st is None:
+        return None
+    ms = _median(st.compiled_ms) if st.state == COMMITTED and st.compiled_ms else _median(st.interp_ms)
+    return ms if ms > 0 else None
+
+
 def record_interp(key: tuple, ms: float) -> None:
     _get(key).interp_ms.append(ms)
 

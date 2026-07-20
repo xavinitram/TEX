@@ -795,6 +795,49 @@ def fused_fingerprint(spec: dict, terminal_code: str, terminal_bindings: dict,
         return None
 
 
+# ── CACHE-6: fusion ↔ caching reconciliation (stage-list surgery) ─────────────
+# A fused chain has no interior cut-points, so twiddling the LAST node's param recooks all N
+# stages every tick — fusion makes interactivity WORSE exactly where it matters. CACHE-6's two
+# levers cut the chain at a stage boundary k: cache the stage-(k-1) handoff (a stage-boundary
+# TAP, keyed by the upstream SUB-CHAIN fingerprint below), then compile + cook only stages k..N
+# reading that handoff (SUFFIX SPLICING) while a downstream knob is hot; recook the whole fused
+# program on idle. The boundary MUST be the exact fp32 handoff or the FUS-3 oracle breaks — so
+# the engine gates taps to fp32. v1 covers LINEAR chains (the interactive grade→blur→vignette
+# case); a chain_inputs DAG is not suffix-split (a documented follow-up — the whole-chain recook
+# stays correct, just not incremental).
+
+def is_linear_stage_list(stages: list[dict]) -> bool:
+    """True if `stages` is a plain source-first linear chain (no DAG `chain_inputs` on any
+    stage) — the shape a suffix split rebases trivially. A DAG needs positional chain_inputs
+    rebasing (deferred), so CACHE-6 v1 recooks it whole."""
+    return bool(stages) and not any(st.get("chain_inputs") for st in stages)
+
+
+def prefix_fingerprint(stages: list[dict], k: int, infer_binding_type: Callable) -> str:
+    """The 'upstream sub-chain fingerprint' a stage-boundary tap keys on: the value-independent
+    `_fused_fp` of the prefix `stages[:k]` (the stages producing the boundary). Derived, never
+    stored (ENG-5: fingerprints are unstable across TEX versions). Value-independent — the
+    param VALUES the boundary also depends on enter the tap's lineage key separately."""
+    return _fused_fp(_fused_memo_key(stages[:k], infer_binding_type))
+
+
+def suffix_stage_list(stages: list[dict], k: int, boundary_value) -> list[dict]:
+    """Build the suffix `stages[k:]` as a standalone chain: old stage k, which read the chain on
+    its `chain_input` binding, is rewritten to read the cached BOUNDARY as an external source
+    (chain_input=None, boundary injected into its bindings) — exactly how stage 0 of a full chain
+    reads the real source. The remaining stages are unchanged (they read within the suffix). The
+    result cooks through the same compile_fused / single-program path as any chain. LINEAR only."""
+    if not (1 <= k < len(stages)):
+        raise FusionError(f"suffix cut-point {k} out of range for {len(stages)} stages")
+    head = stages[k]
+    chain_binding = head.get("chain_input")
+    if chain_binding is None:
+        raise FusionError("suffix head stage has no chain_input to rebind to the boundary")
+    first = {"code": head["code"], "chain_input": None,
+             "bindings": {**(head.get("bindings") or {}), chain_binding: boundary_value}}
+    return [first] + [dict(st) for st in stages[k + 1:]]
+
+
 # ── FUS-1: DAG-region detection (the host-agnostic fusion authority) ──────────
 # compile_fused already consumes arbitrary DAG specs (chain_inputs / exports / tap,
 # Q-3), but the production producer (_stages_from_spec) only ever emitted a LINEAR

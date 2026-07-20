@@ -137,6 +137,12 @@ class Interpreter:
         # so a direct _create_builtins caller (tests, tex_memory's cache sweep) never
         # trips over a missing attribute on a fresh Interpreter.
         self.time_context: dict | None = None
+        # SCHED-3: the host's cancel token + progress callback for the current cook. Set
+        # per-execute (like time_context); declared here so a fresh Interpreter or a direct
+        # _create_builtins caller never trips over a missing attribute. Pure values — never
+        # in any key. `_cancel.check()` raises CookCancelled at the per-top-level-statement seam.
+        self._cancel = None
+        self._on_progress = None
         self.functions: dict[str, callable] = self._get_stdlib()
         # Hoisted binding-access functions — read on every @A[x,y] / @A(u,v)
         self._fn_fetch = self.functions["fetch"]
@@ -208,6 +214,8 @@ class Interpreter:
         roi: tuple[int, int, int, int, int, int] | None = None,
         batch_slice: tuple[int, int] | None = None,
         time_context: dict | None = None,
+        cancel=None,
+        on_progress=None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Execute a TEX program.
@@ -254,7 +262,8 @@ class Interpreter:
                                        latent_channel_count, output_names,
                                        precision, used_builtins=used_builtins,
                                        tile=tile, roi=roi, batch_slice=batch_slice,
-                                       time_context=time_context)
+                                       time_context=time_context,
+                                       cancel=cancel, on_progress=on_progress)
 
 
 
@@ -283,6 +292,8 @@ class Interpreter:
         roi: tuple[int, int, int, int, int, int] | None = None,
         batch_slice: tuple[int, int] | None = None,
         time_context: dict | None = None,
+        cancel=None,
+        on_progress=None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         # Canonicalize an index-less "cuda" so cache keys ("cuda" vs "cuda:0")
@@ -295,6 +306,11 @@ class Interpreter:
         self.latent_channel_count = latent_channel_count
         self._dtype = self._PRECISION_DTYPES.get(precision, torch.float32)
         self.time_context = time_context   # ENG-7: host playhead for THIS cook (or None)
+        # SCHED-3: bind the cook's cancel token + progress callback for THIS execute. Set
+        # unconditionally every run (the interpreter is a per-thread REUSED singleton — a
+        # token left on self would abort a later, unrelated cook). Pure values, never keyed.
+        self._cancel = cancel
+        self._on_progress = on_progress
         self.env = {}
         self.bindings = {}
         self._array_meta = {}
@@ -365,9 +381,23 @@ class Interpreter:
             except Exception:
                 ingest_event = None
 
-        # Execute statements via tree-walking interpreter
-        for stmt in program.statements:
-            self._exec_stmt(stmt)
+        # Execute statements via tree-walking interpreter.
+        # SCHED-3: when a host supplied a cancel token or progress sink, check/report per
+        # top-level statement; otherwise run the plain loop so the DEFAULT path pays nothing —
+        # the hot tree-walk stays byte-identical (invariant #7), the whole cost is one
+        # is-None branch per cook. Honest granularity: a single top-level statement (a `for`
+        # body, a fused kernel) is NOT preempted mid-flight — per-statement is the floor.
+        stmts = program.statements
+        if self._cancel is None and self._on_progress is None:
+            for stmt in stmts:
+                self._exec_stmt(stmt)
+        else:
+            from .host import _cancel_check, _report_progress
+            n = len(stmts) or 1
+            for i, stmt in enumerate(stmts):
+                _cancel_check(self._cancel)
+                self._exec_stmt(stmt)
+                _report_progress(self._on_progress, "stmt", (i + 1) / n)
 
         # XPU fence (see above): guarantee the ingest DMA has landed before the
         # cook returns, so a downstream host-side writer of the shared pinned

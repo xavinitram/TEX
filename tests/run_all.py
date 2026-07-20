@@ -652,6 +652,21 @@ def main():
     test_lsp_bad_frames(r)
     test_cli_build(r)
 
+    # v0.27.0 Phase 1 — "Big frames, placed well" (SCHED-3 cancel/progress, SCHED-2 placement,
+    # CACHE-5 governor, ROI-5 halo tiling, CACHE-6 fusion<->caching)
+    from test_v027_phase1 import (
+        test_sched3_cancellation,
+        test_sched2_placement,
+        test_cache5_governor,
+        test_roi5_halo_tiling,
+        test_cache6_fusion_recook,
+    )
+    test_sched3_cancellation(r)
+    test_sched2_placement(r)
+    test_cache5_governor(r)
+    test_roi5_halo_tiling(r)
+    test_cache6_fusion_recook(r)
+
     success = r.summary()
     return 0 if success else 1
 

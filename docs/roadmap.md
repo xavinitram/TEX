@@ -883,6 +883,48 @@ Per-release notes:
     and are verified in a running ComfyUI (the live-session checklist); the manifest they
     exchange, the publish route, and the tool cook are backend-proven here. Recorded honestly
     in `docs/tools.md` §8 as the follow-up.
+- **v0.27.0** shipped "big frames, placed well": ROI-5 (`tex_memory.run_tiled_halo` — the
+  blur/morphology class `is_tile_safe` refuses now tiles with a halo-grown strip, driven over
+  `run_roi`'s ROI-4-validated grow-cook-crop, so an 8K `gauss_blur` tiles bit-exact; `_halo_tile_plan`
+  gates it on memory pressure OR a `_tdr_strip_floor` WDDM ~1.8 s per-strip time cap from autotier
+  medians; reductions/gathers stay whole-frame), CACHE-5 (`tex_memory.CacheRegistry` arbitrating the
+  stdlib/graph/frame pools against one `governor_budget`, cheapest-to-rebuild first, preserving the
+  graph-address safety via pin-skip / `free_graphs_only` — NOT `clear_graph_cache`, the stale note
+  now corrected; `ResultCache.governed_bytes`/`evict_bytes` fold the frame cache in, host-armed),
+  CACHE-6 (`tex_fusion.prefix_fingerprint`/`suffix_stage_list` + `tex_engine.cook_stage_list`/
+  `boundary_lineage_key`/`cook_fused_cached` — a stage-boundary tap caches the fp32 handoff keyed by
+  the upstream sub-chain fp × prefix param values × the host-supplied `upstream` source key, a
+  suffix splice recooks only stages k..N while a downstream knob is hot; fp32-gated, requires a
+  source key to cache (else a correct full cook), linear-v1, DAG deferred), SCHED-2 (`tex_scheduler.py` — a
+  Viterbi-DP-for-chains / exact-enumeration-for-small-DAGs / greedy-fallback placement planner over
+  autotier `cook_ms` + `xfer.transfer_ms` with boundary transfers, user pins, per-device budgets,
+  hysteresis, frozen-per-range; PORT-1-clean, dormant), and SCHED-3 (a `CancelToken`→`CookCancelled`
+  polled at every cook yield point + `on_progress`, on the ENG-7 value channel, never keyed). New
+  module `tex_scheduler.py`. **Exit met:** ROI-5's halo oracle (tiled == whole-frame, CPU+CUDA) and
+  CACHE-6's oracle (suffix-splice == full fused, maxdiff 0.0) are green.
+  - The default ComfyUI cook path is byte-identical (invariant #7): no watched compiler/runtime file
+    changed the default path. Halo tiling is a new branch reached only under pressure on programs
+    that could not tile before; `enforce_cache_budget` is byte-identical (the governor is a separate
+    opt-in layer); the scheduler, tap, and cancel/progress are opt-in / host-armed / None-by-default.
+  - **Routing tiled cooks through codegen is DEFERRED** (honest scope, the ROI-3 posture): tiled +
+    ROI cooks run on the interpreter tier, compiled tiers fall back. The memory-correctness win (an
+    8K blur tiles at all) lands here; a codegen tile/ROI path threading the strip offset through the
+    coordinate-env builder is the measured follow-up.
+  - **CACHE-6 v1 is LINEAR-only.** A `chain_inputs` DAG is not suffix-split (positional chain-input
+    rebasing across a cut is the deferred half); it recooks whole — correct, just not incremental.
+    The interactive case CACHE-6 targets ("twiddle the last node's param") is a linear chain. It
+    also REQUIRES a host-supplied `upstream` source key to cache (a raw `data_ptr` is unsafe under
+    buffer reuse) — no key → correct full cook.
+  - **Scope notes shipped honestly, for symmetry with the above deferrals:** CACHE-5's
+    "live-graph-key" priority hint is realized by MECHANISM, not a hint parameter — graph pools
+    evict LAST (`evict_order=90`) and any graph-pinned storage is pin-skipped (`pinned_storages`),
+    so a live capture's memory is preserved without a separate key; only `playhead` is a passed
+    hint. The WDDM TDR per-strip time-cap is on the halo planner only — the pointwise `_tile_plan`
+    stays byte-only (a per-cook median is a no-op on the first, TDR-prone cook, so a code cap there
+    would buy nothing; the halo class is the one that both tiles new AND runs long). SCHED-2's
+    per-device memory budget is CUDA-only (CPU is the unbudgeted fallback), and SCHED-3
+    cancellation is reachable via `tex_engine.cook(cancel=)` only — the ComfyUI node does not yet
+    bridge the host's own interrupt (a pure-frontend follow-up).
 - **v0.28.0**: PM-2 is the release gate — the demo cooks <50 ms/frame warm at
   1024², zero comfy imports, scrubbing param history from CACHE-2.
 

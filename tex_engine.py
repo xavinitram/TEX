@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, replace
@@ -58,7 +59,8 @@ from .tex_marshalling import (
     convert_param_value as _convert_param_value,
     infer_binding_type as _infer_binding_type,
 )
-from .tex_runtime.host import get_host_services
+from .tex_runtime.host import (get_host_services, CookCancelled,
+                               _cancel_check, _report_progress)
 from . import tex_lazy as _tex_lazy
 
 
@@ -202,6 +204,12 @@ class ExecContext:
     # off by default (no ComfyUI caller passes roi=). See docs/roi-spatial-laziness.md.
     roi: Any = None
     roi_plan: Any = None
+    # SCHED-3: the host's cancel token and progress callback for this cook — pure VALUES on
+    # the `time_context` model (never in any key). `cancel.check()` raises CookCancelled at a
+    # yield point; `on_progress(phase, frac)` reports. Both None unless a host passed them;
+    # `replace(ctx, ...)` at the fp16 re-cook preserves them automatically.
+    cancel: Any = None
+    on_progress: Any = None
 
 
 @dataclass(frozen=True)
@@ -454,6 +462,7 @@ def _interp_fallback(ctx: ExecContext, *, reset_dynamo: bool, pass_precision: bo
     (dynamo state is process-global — see compiled.py — so a failed compile/auto
     cook resets it on THIS thread before retrying; the graph path never touched
     dynamo, so it does not reset.)"""
+    _cancel_check(ctx.cancel)   # SCHED-3 yield C: a tier failed — don't fall back into a stale cook
     if reset_dynamo:
         try:
             torch._dynamo.reset()
@@ -462,7 +471,8 @@ def _interp_fallback(ctx: ExecContext, *, reset_dynamo: bool, pass_precision: bo
     interp = _get_interpreter()
     kw = dict(source=ctx.code, latent_channel_count=ctx.latent_channel_count,
               output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-              time_context=ctx.time_context)
+              time_context=ctx.time_context,
+              cancel=ctx.cancel, on_progress=ctx.on_progress)  # SCHED-3: token survives the fallback
     if pass_precision:
         kw["precision"] = ctx.eff_precision
     return interp.execute(ctx.program, ctx.bindings, ctx.type_map,
@@ -552,7 +562,10 @@ def _run_default(ctx: ExecContext):
             return run_roi(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
                            ctx.device, ctx.latent_channel_count, ctx.output_names,
                            ctx.used_builtins, ctx.eff_precision, ctx.roi,
-                           ctx.roi_plan.narrow, ctx.roi_plan.halo, ctx.time_context)
+                           ctx.roi_plan.narrow, ctx.roi_plan.halo, ctx.time_context,
+                           cancel=ctx.cancel, on_progress=ctx.on_progress)
+        except CookCancelled:
+            raise                       # SCHED-3: a cancel aborts — never fall back to whole-frame
         except Exception as _roi_exc:
             logger.warning("[TEX] ROI cook failed (%s); running whole-frame.", _roi_exc)
     # UC-2: default-route an exact (fetch/conv) stencil through the codegen tier
@@ -582,16 +595,41 @@ def _run_default(ctx: ExecContext):
             from .tex_memory import run_tiled
             return run_tiled(interp, ctx.program, ctx.bindings, ctx.type_map, ctx.device,
                              ctx.latent_channel_count, ctx.output_names, ctx.used_builtins,
-                             ctx.eff_precision, n_strips, ctx.time_context)
+                             ctx.eff_precision, n_strips, ctx.time_context,
+                             cancel=ctx.cancel, on_progress=ctx.on_progress)
+        except CookCancelled:
+            raise                       # SCHED-3: a cancel aborts — never fall back to untiled
         except Exception as _tile_exc:
             logger.warning("[TEX] tiled cook failed (%s); running untiled.", _tile_exc)
+    elif not ctx.fused_chain:
+        # ROI-5: `_tile_plan` refused (a non-pixel-local program — a blur/morphology), but a
+        # BOUNDED-halo op can still tile with a grown strip. Under memory pressure OR the TDR
+        # time cap, cook it in halo strips (an 8K gauss_blur that could not tile at all before).
+        # `_halo_tile_plan` cheap-gates so a small default cook returns before any real work.
+        halo_plan = _halo_tile_plan(ctx.program, ctx.code, ctx.bindings, ctx.device,
+                                    ctx.latent_channel_count,
+                                    2 if ctx.eff_precision == "fp16" else 4, ctx.fp,
+                                    ctx.free_hint, ctx.eff_precision)
+        if halo_plan:
+            n_h, narrow_names, halo = halo_plan
+            try:
+                from .tex_memory import run_tiled_halo
+                return run_tiled_halo(interp, ctx.program, ctx.bindings, ctx.type_map, ctx.device,
+                                      ctx.latent_channel_count, ctx.output_names, ctx.used_builtins,
+                                      ctx.eff_precision, n_h, narrow_names, halo, ctx.time_context,
+                                      cancel=ctx.cancel, on_progress=ctx.on_progress)
+            except CookCancelled:
+                raise                   # SCHED-3: a cancel aborts — never fall back to untiled
+            except Exception as _halo_exc:
+                logger.warning("[TEX] halo-tiled cook failed (%s); running untiled.", _halo_exc)
     # Pass source so runtime (E6xxx) errors render a source-line caret. Fused chains
     # splice many sources, so leave source empty there (errors stay message-only).
     return interp.execute(ctx.program, ctx.bindings, ctx.type_map, device=ctx.device,
                           source=("" if ctx.fused_chain else ctx.code),
                           latent_channel_count=ctx.latent_channel_count,
                           output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                          precision=ctx.eff_precision, time_context=ctx.time_context)
+                          precision=ctx.eff_precision, time_context=ctx.time_context,
+                          cancel=ctx.cancel, on_progress=ctx.on_progress)
 
 
 # tier_id → strategy function (module-level; the dict holds the fn objects directly —
@@ -645,6 +683,7 @@ def _fp16_finiteness_net(raw_output, auto_fp16, ctx, tier_id, auto_ckey=None):
     tier_trace.record_precision("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
     if auto_ckey is not None:
         _AUTO_DECISION[auto_ckey] = ("fp32", "auto: fp16 non-finite -> fp32 (pinned)")
+    _cancel_check(ctx.cancel)   # SCHED-3 yield D: don't climb into an fp32 re-cook if abandoned
     return _run_tier(replace(ctx, eff_precision="fp32"), tier_id), "fp32"
 
 
@@ -702,11 +741,101 @@ def _tile_plan(program, bindings: dict[str, Any], device,
         budget = 0.25 * free
         if est <= budget:
             return None  # no pressure — don't pay the launch tax
-        import math as _math
-        n = _math.ceil(est / budget)
+        n = math.ceil(est / budget)
         max_strips = max(1, spatial[1] // 64)  # ≥64-row strip floor
         n = min(n, max_strips)
         return n if n >= 2 else None
+    except Exception:
+        return None
+
+
+# ROI-5/WDDM: a per-strip cook-time ceiling. A display GPU's driver resets (TDR) any kernel
+# that runs past ~2 s, killing the cook — so the strip planner caps estimated per-STRIP time,
+# not just bytes. ~1.8 s leaves headroom under the 2 s watchdog.
+_TDR_BUDGET_MS = 1800.0
+
+
+def _tdr_strip_floor(fingerprint, spatial, precision, device) -> int:
+    """ROI-5: the minimum strip count that keeps each strip's estimated cook time under the ~2 s
+    WDDM TDR watchdog, derived from autotier's persisted WHOLE-FRAME median (BlinkScript's driver
+    timeouts are this failure, un-planned-for). Best-effort: 0 when the program was never measured
+    on this device (the very first big cook can't be pre-timed — the reach of persisted medians)."""
+    if not str(device).startswith("cuda"):
+        return 0
+    try:
+        from .tex_runtime import autotier
+        whole_ms = autotier.cook_ms(autotier.make_key(fingerprint, "cuda", precision, spatial))
+        if whole_ms and whole_ms > _TDR_BUDGET_MS:
+            return int(math.ceil(whole_ms / _TDR_BUDGET_MS))
+    except Exception:
+        pass
+    return 0
+
+
+def _scalar_params(bindings) -> dict:
+    """The foldable scalar/bool/int params of a binding set — what `tex_roi`/`tex_lazy` fold to
+    resolve halo radii and dead branches. Shared by the halo planner and the OOM ladder (the
+    default `prepare()` param loop keeps its own inline copy to stay off a per-cook call frame)."""
+    return {n: v for n, v in bindings.items() if isinstance(v, (bool, int, float))}
+
+
+def _halo_tile_plan(program, code, bindings, device, latent_channel_count, dtype_bytes,
+                    fingerprint, free_hint, precision):
+    """ROI-5: `(n_strips, narrow_names, halo)` when a NON-tile-safe program is HALO-tileable — a
+    bounded direct-tensor neighbourhood op (blur / erode / dilate), which `tex_roi.roi_plan`
+    reports executable with a positive cook halo — and either memory pressure OR the TDR time cap
+    calls for strips; else None. This is the class `is_tile_safe` refuses, so it never overlaps
+    the pointwise `_tile_plan`. cuda + non-latent only (fused chains are excluded by the caller).
+
+    CHEAP-GATED for invariant #7: a small cook returns BEFORE `roi_plan`, `_scalar_params`, and the
+    free-VRAM driver query. `est` is a memo hit (the M-1 preflight already walked it this cook),
+    `device_total_mem` is cached, and `_tdr_strip_floor` is a dict lookup — so a program a small
+    fraction of VRAM with no TDR-risk median can't need tiling and never pays the ~61 µs
+    `get_free_memory`, exactly mirroring `_preflight_memory`'s `est < total // 8` skip."""
+    if latent_channel_count or not str(device).startswith("cuda"):
+        return None
+    try:
+        # Hot-path bail FIRST: a POINTWISE (tile-safe) program reaches here whenever `_tile_plan`
+        # found no pressure, but halo tiling is only for the NON-tile-safe blur/morphology class (a
+        # tile-safe program's roi_plan has halo 0 → None below anyway). The memoized tile-safe check
+        # lets a pointwise cook skip roi_plan/estimate/the dim scans AND the imports below entirely —
+        # this runs on every default pointwise CUDA cook (invariant #7).
+        from .tex_memory import is_tile_safe_cached
+        if is_tile_safe_cached(program, fingerprint):
+            return None
+        from .tex_memory import (shared_tile_height, shared_tile_width, estimate_peak_bytes,
+                                 device_total_mem)
+        H = shared_tile_height(bindings)
+        W = shared_tile_width(bindings)
+        if H is None or W is None:
+            return None
+        # Batch of the height-H anchor image — guaranteed present, since `shared_tile_height`
+        # derived `H` from exactly such a tensor (a StopIteration if that ever breaks is caught by
+        # the outer guard → None). The cook is sized off the SHARED height/width (both skip
+        # broadcast singletons), never the anchor's own width — a [B,H,1] companion bound first
+        # would otherwise under-size `est` by a factor of W and silently zero the TDR px-bucket.
+        batch = next(v.shape[0] for v in bindings.values()
+                     if isinstance(v, torch.Tensor) and v.dim() >= 3 and v.shape[1] == H)
+        spatial = (batch, H, W)
+        est = estimate_peak_bytes(program, spatial, dtype_bytes, fingerprint)   # memoized walk
+        tdr_floor = _tdr_strip_floor(fingerprint, spatial, precision, device)   # dict lookup
+        total = device_total_mem(device)                                       # cached, no query
+        if tdr_floor < 2 and total and 0 < est < total // 8:
+            return None    # not big enough for memory pressure, not TDR-risky → skip (no free query)
+        from . import tex_roi
+        plan = tex_roi.roi_plan(code, _scalar_params(bindings))
+        if not plan.executable or plan.halo <= 0 or not plan.narrow:
+            return None
+        halo = plan.halo
+        # Strip floor: ≥ 4·halo rows/strip so the grown-halo overhead stays under ~50%.
+        max_strips = max(1, H // max(64, 4 * halo))
+        n_mem = 0
+        free = (free_hint if free_hint is not None
+                else get_host_services().get_free_memory(torch.device(device)))
+        if free and est > 0 and est > 0.25 * free:
+            n_mem = math.ceil(est / (0.25 * free))
+        n = min(max(n_mem, tdr_floor), max_strips)
+        return (n, plan.narrow, halo) if n >= 2 else None
     except Exception:
         return None
 
@@ -799,7 +928,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             debug_nan_highlight: bool = False, time_context: dict | None = None,
             max_outputs: int = MAX_OUTPUTS, disown: bool = True,
             roi: tuple | None = None, want_lineage: bool = False,
-            upstream_keys: tuple = ()) -> CookPlan:
+            upstream_keys: tuple = (), cancel=None, on_progress=None) -> CookPlan:
     """Resolve everything a cook needs *without running it*: compile (or splice a fused
     chain), resolve the device, gate the outputs and references, fold params, resolve
     `precision="auto"`, and select the tier.
@@ -1040,7 +1169,8 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     ctx = ExecContext(program, bindings, type_map, device, code,
                       latent_channel_count, output_names, used_builtins,
                       eff_precision, fp, fused_chain, fused_fp, time_context,
-                      free_hint, roi_out, roi_plan_obj)  # ROI-3 window + plan (None unless armed)
+                      free_hint, roi_out, roi_plan_obj,  # ROI-3 window + plan (None unless armed)
+                      cancel, on_progress)               # SCHED-3 (None unless a host passed them)
     return CookPlan(ctx=ctx, tier_id=tier_id, assigned=assigned_bindings,
                     auto_fp16=auto_fp16, debug_nan_highlight=debug_nan_highlight,
                     cook_px=cook_px, auto_ckey=auto_ckey, disown=disown,
@@ -1106,9 +1236,8 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
     if ctx.fused_chain or ctx.latent_channel_count or not str(ctx.device).startswith("cuda"):
         return None            # rung 2 is strip tiling; these are the shapes it can't tile
     try:
-        from .tex_memory import is_tile_safe_cached, shared_tile_height, run_tiled
-        if not is_tile_safe_cached(ctx.program, ctx.fp):
-            return None
+        from .tex_memory import (is_tile_safe_cached, shared_tile_height, run_tiled,
+                                 shared_tile_width, run_tiled_halo)
         H = shared_tile_height(ctx.bindings)
         if H is None:
             return None
@@ -1118,10 +1247,31 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
         n_strips = max(2, min(H // 64, 16))
         if n_strips < 2:
             return None
-        logger.warning("[TEX] retrying the cook in %d strips.", n_strips)
-        return run_tiled(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
-                         ctx.device, ctx.latent_channel_count, ctx.output_names,
-                         ctx.used_builtins, ctx.eff_precision, n_strips, ctx.time_context)
+        _cancel_check(ctx.cancel)   # SCHED-3 yield E: don't start a tiled OOM re-cook if abandoned
+        if is_tile_safe_cached(ctx.program, ctx.fp):
+            logger.warning("[TEX] retrying the cook in %d strips.", n_strips)
+            return run_tiled(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
+                             ctx.device, ctx.latent_channel_count, ctx.output_names,
+                             ctx.used_builtins, ctx.eff_precision, n_strips, ctx.time_context,
+                             cancel=ctx.cancel, on_progress=ctx.on_progress)
+        # ROI-5: not pixel-local, but a bounded blur/morphology can still HALO-tile out of an OOM.
+        from . import tex_roi
+        rplan = tex_roi.roi_plan(ctx.code, _scalar_params(ctx.bindings))
+        if (rplan.executable and rplan.halo > 0 and rplan.narrow
+                and shared_tile_width(ctx.bindings) is not None):
+            n_h = max(2, min(H // max(64, 4 * rplan.halo), 16))
+            if n_h >= 2:
+                logger.warning("[TEX] retrying the cook in %d halo strips.", n_h)
+                return run_tiled_halo(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
+                                      ctx.device, ctx.latent_channel_count, ctx.output_names,
+                                      ctx.used_builtins, ctx.eff_precision, n_h, rplan.narrow,
+                                      rplan.halo, ctx.time_context,
+                                      cancel=ctx.cancel, on_progress=ctx.on_progress)
+        return None
+    except CookCancelled:
+        raise                       # SCHED-3: a cancel at yield E (or inside the tiled/halo OOM
+        #                             re-cook) must abort — never be reclassified as the original
+        #                             OOM and retried on a cook the user already abandoned.
     except Exception as retry_exc:
         # The retry failed too (possibly with a second OOM). Report nothing recovered and
         # let the ORIGINAL OOM propagate — the host's own ladder is the next rung, and it
@@ -1242,9 +1392,16 @@ def run(plan: CookPlan) -> CookResult:
     the debug overlays, enforce the cache budgets. Returns RAW outputs (no host egress
     formatting — that is ENG-3's profile, applied by the caller)."""
     ctx = plan.ctx
+    _cancel_check(ctx.cancel)                         # SCHED-3 yield A: abort a stale cook up front
+    _report_progress(ctx.on_progress, "tier", 0.0)
     try:
         raw_output = _run_tier(ctx, plan.tier_id)
     except BaseException as e:                       # ENG-2: the OOM ladder
+        # SCHED-3: a cancellation raised inside the tier must propagate straight out, never be
+        # mistaken for a recoverable OOM and silently retried (GOTCHA: _oom_in_chain returns
+        # None for it today, but an explicit guard makes the intent load-bearing, not incidental).
+        if isinstance(e, CookCancelled):
+            raise
         oom = _oom_in_chain(e)
         if oom is None:
             raise
@@ -1297,6 +1454,7 @@ def run(plan: CookPlan) -> CookResult:
     # the key and CookResult.precision match the pixels.
     lineage = _compute_lineage(plan, ctx, eff_precision, raw_output) if plan.want_lineage else None
 
+    _report_progress(ctx.on_progress, "tier", 1.0)   # SCHED-3: the cook produced a frame
     return CookResult(
         outputs=raw_output, output_names=ctx.output_names, assigned=plan.assigned,
         device=ctx.device, precision=eff_precision,
@@ -1320,3 +1478,125 @@ def cook(code: str, bindings: dict, **kwargs) -> CookResult:
     RAW (no clamp / alpha-drop / gray-expand — apply an egress profile for that; ENG-3).
     """
     return run(prepare(code, bindings, **kwargs))
+
+
+# ── CACHE-6: fusion ↔ caching reconciliation (the cook side) ──────────────────
+
+def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_count=0,
+                    time_context=None, cancel=None, on_progress=None) -> dict:
+    """Cook a raw fusion stage list (≥1) and return the interpreter's RAW {output: tensor}. One
+    stage cooks as a plain program; ≥2 splice through `compile_fused`. It replicates prepare()'s
+    param default-inject + widget-value conversion so a SUB-chain (a CACHE-6 prefix or suffix)
+    cooks BIT-IDENTICALLY to those same stages inside the full fused program — the equivalence
+    the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does."""
+    from .tex_cache import get_cache
+    if len(stages) == 1:
+        st = stages[0]
+        bindings = dict(st.get("bindings") or {})
+        binding_types = {n: _infer_binding_type(v) for n, v in bindings.items()}
+        program, type_map, referenced, assigned, param_info, used_builtins = \
+            get_cache().compile_tex(st["code"], binding_types)
+    else:
+        from .tex_fusion import compile_fused
+        program, type_map, referenced, assigned, param_info, used_builtins, bindings = \
+            compile_fused(stages, _infer_binding_type)
+    # prepare()'s shared param handling: inject code-defined defaults for referenced-but-unbound
+    # params, then convert widget values (hex colour → RGB, comma vec → floats). Identical order
+    # to the full cook so the merged bindings — and thus the pixels — match.
+    for ref_name in referenced:
+        if ref_name not in assigned and ref_name not in bindings and ref_name in param_info:
+            dv = param_info[ref_name].get("default_value")
+            if dv is not None:
+                bindings[ref_name] = dv
+    for pname, pinfo in param_info.items():
+        if pname in bindings:
+            bindings[pname] = _convert_param_value(bindings[pname], pinfo, pname)
+    interp = _get_interpreter()
+    return interp.execute(program, bindings, type_map, device=device,
+                          latent_channel_count=latent_channel_count,
+                          output_names=sorted(assigned.keys()), used_builtins=used_builtins,
+                          precision=("fp32" if latent_channel_count else precision),
+                          time_context=time_context, cancel=cancel, on_progress=on_progress)
+
+
+def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context=None,
+                         canvas=None, latent_channel_count=0) -> str:
+    """CACHE-6: the lineage key a stage-(k-1) boundary tap is cached under — the upstream
+    SUB-CHAIN fingerprint (`tex_fusion.prefix_fingerprint`) × the prefix stages' param VALUES ×
+    the SOURCE identity `upstream` × device × precision × playhead × canvas, namespaced by the cut
+    and the `ic` channel-count flag.
+
+    `upstream` is MANDATORY and carries the CACHE-1 lineage key(s) of the external tensor(s)
+    feeding the prefix — the host's content-sensitive source identity. It is what stops two
+    different source IMAGES from colliding onto one boundary (a silent stale serve): the prefix
+    program fingerprint is value-independent and the params fold only NON-tensor bindings, so
+    without a source key the tensor axis is unkeyed. It must be CONTENT-sensitive — a raw
+    `data_ptr` is NOT (a reused/overwritten frame buffer keeps its address; the caching allocator
+    reuses freed addresses), so a video pipeline doing `src.copy_(next_frame)` would serve a stale
+    boundary. A GRAPH-1 host already stamps such a key per produced value; `cook_fused_cached`
+    refuses to cache without one. fp32 is the exact-handoff contract, so precision keys it too."""
+    from . import tex_results
+    from .tex_fusion import prefix_fingerprint
+    fp = prefix_fingerprint(stages, k, _infer_binding_type)
+    params = {f"s{i}:{n}": v
+              for i, st in enumerate(stages[:k])
+              for n, v in (st.get("bindings") or {}).items()
+              if not isinstance(v, torch.Tensor)}
+    flags = [f"tap:s{k - 1}"]
+    if latent_channel_count:
+        flags.append(f"ic:{int(latent_channel_count)}")
+    return tex_results.lineage_key(program_fp=fp, device=str(device), precision=precision,
+                                   params=params, upstream=tuple(upstream), time_context=time_context,
+                                   canvas=canvas, flags=flags)
+
+
+def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32",
+                      time_context=None, latent_channel_count=0, upstream=(), cancel=None,
+                      on_progress=None) -> dict:
+    """CACHE-6: cook a fused chain with a stage-(k-1) boundary TAP + SUFFIX SPLICE. On a cache
+    HIT (the hot downstream param didn't touch the prefix) only stages k..N recook, reading the
+    cached fp32 boundary; on a MISS the prefix is materialized, cached, and the suffix cooked.
+    Equals the full fused cook within the fused-vs-sequential envelope (invariant #2, <1e-5).
+
+    OPT-IN and dormant: a host passes the `ResultCache` + cut-point `k` + the source's CACHE-1
+    identity via `upstream`; nothing on the default ComfyUI path calls this (invariant #7). Falls
+    back to a whole-chain cook when the gate isn't met — non-fp32 (the boundary would be fp16, NOT
+    the exact handoff), a LATENT, a DAG chain, a cut-point out of range, no cache, or NO `upstream`
+    source key (without a content-sensitive source identity a cached boundary could be served for a
+    different image — the safe default is a correct-but-not-incremental full cook)."""
+    from .tex_fusion import is_linear_stage_list, suffix_stage_list, FusionError
+
+    def _full():
+        return cook_stage_list(stages, device=device, precision=precision,
+                               latent_channel_count=latent_channel_count,
+                               time_context=time_context, cancel=cancel, on_progress=on_progress)
+
+    # `upstream` must key EVERY tensor input of the prefix — the source, and any EXTRA image a
+    # prefix stage reads — not just be non-empty (a partial cover could stale-serve when only an
+    # unkeyed prefix tensor changes; the count also subsumes the no-upstream `()` default, since a
+    # chain's prefix always has ≥1 source tensor → 0<1). The range check `not (1 <= k < len)` is
+    # ordered BEFORE the tensor-count term so an out-of-range (or non-int) `k` short-circuits to a
+    # full cook without ever slicing `stages[:k]`.
+    if (precision != "fp32" or latent_channel_count or result_cache is None
+            or not is_linear_stage_list(stages) or not (1 <= k < len(stages))
+            or len(upstream) < sum(1 for st in stages[:k]
+                                   for v in (st.get("bindings") or {}).values()
+                                   if isinstance(v, torch.Tensor))):
+        return _full()
+    key = boundary_lineage_key(stages, k, device, "fp32", time_context=time_context,
+                               latent_channel_count=latent_channel_count, upstream=upstream)
+    boundary = result_cache.get(key)
+    if boundary is None:
+        b = cook_stage_list(stages[:k], device=device, precision="fp32",
+                            time_context=time_context, cancel=cancel).get("OUT")
+        if b is None:            # a chain always assigns @OUT; if not, cook whole (correct)
+            return _full()
+        result_cache.put(key, b, canvas={"shape": list(b.shape)})
+        boundary = b     # the freshly-cooked, locally-owned prefix output — put stored its own
+        #                  frozen copy, so `b` is unaliased; feed it straight in (no re-get clone)
+    try:
+        suffix = suffix_stage_list(stages, k, boundary)
+    except FusionError:          # a malformed cut (head stage lacks a chain_input to rebind) — the
+        return _full()           #   documented whole-chain fallback, not a crash after the put
+    return cook_stage_list(suffix, device=device, precision="fp32",
+                           time_context=time_context, cancel=cancel, on_progress=on_progress)

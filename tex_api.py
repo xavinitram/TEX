@@ -47,6 +47,10 @@ from typing import Any
 # ENG-4: the public error type + its payload, re-exported so a host imports ONE module.
 from .tex_compiler.diagnostics import TEXCompileError, TEXDiagnostic  # noqa: F401
 
+# SCHED-3: the cooperative-cancellation exception + token protocol, re-exported so a host
+# catches CookCancelled and wires a CancelToken from the same facade it cooks through.
+from .tex_runtime.host import CookCancelled, CancelToken  # noqa: F401
+
 # LANG-3: the TEX LANGUAGE version — grammar + semantics — versioned SEPARATELY from the
 # package `__version__`. A program may declare the language level it targets with a leading
 # `//!tex X.Y` pragma; `check()` advises (W7004) when a program targets a NEWER language
@@ -136,14 +140,19 @@ def compile(source: str, binding_types: dict) -> Program:  # noqa: A001 (public 
 
 
 def execute(program: Program, bindings: dict, *, device: str = "cpu",
-            precision: str = "fp32", output_names=None) -> dict:
+            precision: str = "fp32", output_names=None, cancel=None, on_progress=None) -> dict:
     """Execute a compiled `Program` against `bindings` → `{output_name: tensor}`. Calls
-    straight through to `Interpreter.execute` (bit-for-bit identical)."""
+    straight through to `Interpreter.execute` (bit-for-bit identical).
+
+    SCHED-3: an optional `cancel` token (`.check()` raising `CookCancelled`) is polled per
+    top-level statement, and `on_progress(phase, frac)` reports statement progress — the
+    thinnest surface that exercises the interpreter's cancellation seam directly."""
     from .tex_runtime.interpreter import Interpreter
     outs = output_names if output_names is not None else sorted(program.assigned.keys())
     return Interpreter().execute(
         program.ast, bindings, program.type_map, device=device,
-        output_names=outs, precision=precision, used_builtins=program.used_builtins)
+        output_names=outs, precision=precision, used_builtins=program.used_builtins,
+        cancel=cancel, on_progress=on_progress)
 
 
 def check(source: str, binding_types: dict) -> list:

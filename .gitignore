@@ -23,6 +23,7 @@ editor_build/node_modules/
 
 # Benchmark results (machine-specific; not committed)
 benchmarks/results/
+results/
 
 # Internal reports (not shipped)
 optimization_reports/
