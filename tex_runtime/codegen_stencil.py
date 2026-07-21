@@ -477,22 +477,21 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
 
     # Find inner ForLoop in outer body
     inner_loop = None
-    outer_count_var = None
     for stmt in outer_loop.body:
         if isinstance(stmt, ForLoop):
             if inner_loop is not None:
                 return None
             inner_loop = stmt
         elif isinstance(stmt, Assignment):
-            cv = _is_count_increment(stmt)
-            if cv is None:
-                # The inner body has a has_unknown mechanism; this scan had none, so an
-                # arbitrary outer-body assignment fell through the elif chain and was
-                # accepted by silence — then deleted, because emission replaces the ENTIRE
-                # nest. It also defeated the one-lowering-per-loop check, which only ever
-                # inspects the inner body. Decline: the interpreter computes it correctly.
-                return None
-            outer_count_var = cv
+            # DECLINE every outer-body assignment. Emission replaces the ENTIRE nest, so an
+            # outer-body statement's effect is simply dropped: an arbitrary assignment would be
+            # deleted silently (and it defeats the one-lowering-per-loop check, which only
+            # inspects the inner body), and a COUNT increment is never correctly materialized
+            # either — the box/median emitters always emit kH*kW, the INNER count, so an outer
+            # counter (incremented kH times) diverges from the interpreter on any downstream
+            # use, with or WITHOUT a co-resident inner counter. The interpreter computes both
+            # correctly; let it. (The parity fuzzer generates neither shape.)
+            return None
         elif isinstance(stmt, (VarDecl, ExprStatement)):
             pass
         else:
@@ -583,6 +582,9 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
     if sum((accum_info is not None, minmax_info is not None, bool(array_collects))) > 1:
         has_unknown = True
 
+    # (count_var: the outer-counter route is declined in the outer-body scan above, where the
+    # decision is made — an outer counter never survives the nest replacement.)
+
     # Return the detected stencil kind (prefer box, then minmax, then median)
     if accum_info is not None and not has_unknown:
         accum_var, channels, binding_name, is_fetch = accum_info
@@ -599,7 +601,7 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
             dx_start=dx_start,
             dx_stop=dx_stop,
             accum_var=accum_var,
-            count_var=inner_count_var or outer_count_var,
+            count_var=inner_count_var,   # outer-counter case is declined above (has_unknown)
         )
 
     if minmax_info is not None and not has_unknown:
@@ -666,7 +668,7 @@ def _try_detect_stencil(outer_loop: ForLoop) -> _StencilInfo | None:
                     dx_start=dx_start,
                     dx_stop=dx_stop,
                     array_vars=array_chan_pairs,
-                    count_var=inner_count_var or outer_count_var,
+                    count_var=inner_count_var,   # outer-counter case is declined above (has_unknown)
                 )
 
     return None

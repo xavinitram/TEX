@@ -29,7 +29,8 @@ from ..tex_compiler.ast_nodes import (
     try_extract_static_range,
     collect_assigned_vars,
 )
-from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
+from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
+from .host import _cancel_check, _report_progress   # SCHED-3 seam (no cycle: host imports torch only)
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
                      _scalar_from_tensor, _get_flat_batch_index)
 
@@ -388,16 +389,23 @@ class Interpreter:
         # is-None branch per cook. Honest granularity: a single top-level statement (a `for`
         # body, a fused kernel) is NOT preempted mid-flight — per-statement is the floor.
         stmts = program.statements
-        if self._cancel is None and self._on_progress is None:
+        cancel, on_progress = self._cancel, self._on_progress
+        if cancel is None and on_progress is None:
             for stmt in stmts:
                 self._exec_stmt(stmt)
+        elif on_progress is None:
+            # SCHED-3: cancel wired, no progress sink — the DEFAULT ComfyUI path now that the
+            # node passes an interrupt token. Poll cancel per statement, but skip the `(i+1)/n`
+            # progress arithmetic only a wired on_progress consumes (measured ~37 ns/stmt).
+            for stmt in stmts:
+                _cancel_check(cancel)
+                self._exec_stmt(stmt)
         else:
-            from .host import _cancel_check, _report_progress
             n = len(stmts) or 1
             for i, stmt in enumerate(stmts):
-                _cancel_check(self._cancel)
+                _cancel_check(cancel)
                 self._exec_stmt(stmt)
-                _report_progress(self._on_progress, "stmt", (i + 1) / n)
+                _report_progress(on_progress, "stmt", (i + 1) / n)
 
         # XPU fence (see above): guarantee the ingest DMA has landed before the
         # cook returns, so a downstream host-side writer of the shared pinned
@@ -922,16 +930,42 @@ class Interpreter:
                     target.loc, source=self._source, code="E6004",
                     hint="Use one of: .r, .g, .b, .a (or .x, .y, .z, .w).",
                 )
-            if not (base.dim() >= 1 and base.shape[-1] > idx):
+            # Spatial-scalar base guard (mirror of the read side): gate on the STATIC TYPE so
+            # interp and codegen agree — a channel-less scalar/mask makes `m.r = v` mean `m = v`
+            # (replace it), but a VECTOR-typed base (even one channel-less at runtime, e.g. a
+            # `vec3 cc = @mask` local) writes a channel exactly as codegen does. `.g/.b/.a` on a
+            # scalar are compile-rejected (E3301), so idx is 0; the >0 branch is defensive.
+            # Rank test FIRST (cheap), then the shared tier-agreement predicate — mirrors the
+            # read side exactly, including falling through to ONE shared raise.
+            sp = self.spatial_shape
+            result = None
+            if (sp is not None and base.dim() == len(sp)
+                    and not base_is_vector(self.type_map, target.object)):
+                if idx == 0:
+                    # `m.r = v` on a channel-less scalar means `m = v` — but it MUST own its
+                    # buffer, exactly like the clone in the sibling branch below. `_ensure_spatial`
+                    # hands back the RHS tensor ITSELF when its dims already match sp (and a
+                    # stride-0 `.expand()` view for a 0-dim value), while the write-back below
+                    # claims ownership via `_inplace_ready.add(name)`. Storing an alias there lets
+                    # a later in-place op scribble on another variable — or on a CALLER-OWNED
+                    # input tensor, which under ComfyUI is the wire shared with every consumer —
+                    # and makes an expanded view raise "more than one element ... single memory
+                    # location". Clone: correctness first, and it costs what every other
+                    # channel-assign already pays.
+                    result = _ensure_spatial(value, sp).clone()
+                nchan = 1
+            elif base.dim() >= 1 and base.shape[-1] > idx:
+                result = base if inplace else base.clone()
+                result[..., idx] = _ensure_spatial(value, result.shape[:-1])
+            else:
                 nchan = base.shape[-1] if base.dim() >= 1 else 1
+            if result is None:
                 raise InterpreterError(
                     f"This value has {nchan} channel{'s' if nchan != 1 else ''}, so it has no "
                     f"channel #{idx + 1} to write to.",
                     target.loc, source=self._source, code="E6004",
                     hint="A vec3 has 3 channels (r, g, b); build a vec4 (e.g. vec4(color, 1.0)) if you need a 4th (alpha).",
                 )
-            result = base if inplace else base.clone()
-            result[..., idx] = _ensure_spatial(value, result.shape[:-1])
         else:
             # Multi-channel assignment: .rgb, .xy, .rgba, etc.
             indices = [CHANNEL_MAP[ch] for ch in channels]
@@ -1540,9 +1574,27 @@ class Interpreter:
                     node.loc, source=self._source, code="E6030",
                     hint="Use one of: .r, .g, .b, .a (or .x, .y, .z, .w).",
                 )
-            if base.dim() >= 1 and base.shape[-1] > idx:
+            # Spatial-scalar base guard: a channel-less spatial base ([B,H,W] — a MASK, a broadcast
+            # scalar, or an arr_avg()/reduce result) has its trailing dim SPATIAL, not a channel
+            # axis, so `base[..., idx]` would slice a pixel COLUMN (`@mask.r` returned an x-column).
+            # `.r`/`.x` on it is identity. Gate on the STATIC TYPE, not rank alone: codegen bails a
+            # single-channel access on a NON-vector base to the interpreter (codegen.py), so the
+            # interpreter must key on the SAME signal — a vector-TYPED local that is channel-less at
+            # runtime (`vec3 cc = @mask`, truncate-coerced to [B,H,W]) must index like codegen, not
+            # go identity here (else the two tiers diverge — invariant #2).
+            # Rank test FIRST (cheap): a vec base is [B,H,W,C], one rank higher, so the common
+            # `@image.r` short-circuits before the type lookup. `base_is_vector` is the shared
+            # tier-agreement predicate — codegen bails on its exact complement.
+            sp = self.spatial_shape
+            if (sp is not None and base.dim() == len(sp)
+                    and not base_is_vector(self.type_map, node.object)):
+                if idx == 0:
+                    return base
+                nchan = 1
+            elif base.dim() >= 1 and base.shape[-1] > idx:
                 return base[..., idx]
-            nchan = base.shape[-1] if base.dim() >= 1 else 1
+            else:
+                nchan = base.shape[-1] if base.dim() >= 1 else 1
             raise InterpreterError(
                 f"This value has {nchan} channel{'s' if nchan != 1 else ''}, so it has no "
                 f"'.{channels}' channel.",

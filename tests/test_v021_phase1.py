@@ -44,10 +44,13 @@ def _run(code, binds, device="cpu"):
 
 
 def _fused_run(region, code_map, source, device="cpu"):
-    """detect-plan region -> region_to_stages -> compile_fused -> interpret."""
+    """detect-plan region -> region_to_stages -> compile_fused -> interpret. FUS-1b: the one
+    source is injected into EVERY injection point (a single-source region has exactly one)."""
     stages = F.region_to_stages(region, code_map, {k: {} for k in code_map})
     src = region["source"]
-    stages[src["stage"]]["bindings"][src["binding"]] = source
+    injections = src["injections"]
+    for inj in injections:
+        stages[inj["stage"]]["bindings"][inj["binding"]] = source
     prog, tm, refs, asg, params, used, merged = F.compile_fused(stages, _ibt)
     return Interpreter().execute(prog, merged, tm, device=device,
                                  output_names=sorted(asg))["OUT"]
@@ -91,6 +94,63 @@ def test_fus1_detector(r: SubTestResult):
         [])
     # single node -> nothing
     one("single node -> none", {"A": N()}, [_E("S", 0, "A", "in")], [])
+
+
+def test_fus1b_multi_injection(r: SubTestResult):
+    print("\n--- FUS-1b: one producer feeds >1 region member (multi-injection) ---")
+    N = lambda: {"code_wired": False}
+    # Load -> [blur, sharpen] -> merge: S feeds BOTH A and B (two external EDGES, one producer).
+    code_map = {"A": "@OUT = @in * 1.2;",
+                "B": "@OUT = @in + vec4(0.1, 0.0, 0.0, 0.0);",
+                "M": "@OUT = (@a + @b) * 0.5;"}
+    edges = [_E("S", 0, "A", "in", "IMAGE"), _E("S", 0, "B", "in", "IMAGE"),
+             _E("A", 0, "M", "a"), _E("B", 0, "M", "b")]
+    nodes = {k: N() for k in code_map}
+
+    # 1) the detector returns ONE region with TWO injection points (v0.21 left it unfused)
+    regs = F.detect_fusable_regions(nodes, edges)
+    if len(regs) != 1:
+        r.fail("FUS-1b detect", f"expected 1 region, got {len(regs)}")
+        return
+    region = regs[0]
+    inj = region["source"].get("injections") or []
+    r.ok(f"detector: Load->[blur,sharpen]->merge fuses ({len(inj)} injections, terminal M)") \
+        if len(inj) == 2 and region["terminal"] == "M" \
+        else r.fail("FUS-1b detect", f"injections={inj} terminal={region['terminal']}")
+    # it must NOT be classified linear (else the route skips it to the JS linear pass)
+    r.ok("multi-injection region is non-linear (reaches the region path)") \
+        if not F._region_is_linear(region) else r.fail("FUS-1b linear", "misclassified linear")
+    # a genuine TWO-producer merge still doesn't fuse
+    two = F.detect_fusable_regions({k: N() for k in "MB"},
+        [_E("X", 0, "M", "a"), _E("Y", 0, "B", "in"), _E("B", 0, "M", "b")])
+    r.ok("two distinct producers still left unfused") if two == [] \
+        else r.fail("FUS-1b 2-producer", f"got {two}")
+
+    # 2) the fused region is BIT-EXACT to sequential execution (CPU + CUDA)
+    for dev in (["cpu"] + (["cuda"] if _CUDA else [])):
+        torch.manual_seed(11)
+        src = torch.rand(1, 10, 10, 4, device=dev)
+        a = _run(code_map["A"], {"in": src}, dev)
+        b = _run(code_map["B"], {"in": src}, dev)
+        seq = _run(code_map["M"], {"a": a, "b": b}, dev)
+        fused = _fused_run(region, code_map, src, dev)
+        md = (seq.float() - fused.float()).abs().max().item()
+        r.ok(f"[{dev}] multi-injection fused == sequential (maxdiff {md:.1e})") if md < 1e-5 \
+            else r.fail("FUS-1b equiv", f"[{dev}] maxdiff {md:.2e}")
+
+    # 3) the collapse plan carries source_injections + schema 2
+    p = F.region_to_collapse_plan(region, code_map, {k: {} for k in code_map})["payload"]
+    r.ok("multi-injection plan: schema 2 + 2 source_injections") \
+        if p.get("schema") == 2 and len(p.get("source_injections") or []) == 2 \
+        else r.fail("FUS-1b plan", f"schema={p.get('schema')} inj={p.get('source_injections')}")
+    # a single-injection (linear) region stays schema 1, byte-identical, NO source_injections
+    lin = F.detect_fusable_regions({k: N() for k in "AB"},
+        [_E("S", 0, "A", "in"), _E("A", 0, "B", "in")])[0]
+    lp = F.region_to_collapse_plan(lin, {"A": "@OUT=@in*1.1;", "B": "@OUT=@in+0.1;"},
+                                   {"A": {}, "B": {}})["payload"]
+    r.ok("single-injection plan stays schema 1 (byte-identical, no source_injections)") \
+        if lp.get("schema") == 1 and "source_injections" not in lp \
+        else r.fail("FUS-1b backcompat", f"schema={lp.get('schema')} keys={list(lp)}")
 
 
 # ── FUS-3: fused == sequential, bit-exact (the release gate) ──────────────────
@@ -175,8 +235,8 @@ def test_fus3_codegen_parity(r: SubTestResult):
             torch.manual_seed(11)
             src = torch.rand(1, 16, 16, 4, device=dev)
             stages = F.region_to_stages(regs[0], CODE, {k: {} for k in CODE})
-            s = regs[0]["source"]
-            stages[s["stage"]]["bindings"][s["binding"]] = src
+            for inj in regs[0]["source"]["injections"]:
+                stages[inj["stage"]]["bindings"][inj["binding"]] = src
             prog, tm, refs, asg, params, used, merged = F.compile_fused(stages, _ibt)
             on = sorted(asg)
             interp = Interpreter().execute(

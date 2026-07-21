@@ -274,10 +274,13 @@ def test_roi5_halo_tiling(r: SubTestResult):
     for dev in _DEVICES:
         g, msg = oracle("@OUT = vec4(gauss_blur(@A, 2.0).rgb, 1.0);", dev=dev)
         r.ok(f"[{dev}] gauss_blur halo-tiled == whole-frame ({msg})") if g else r.fail("ROI-5 blur", f"[{dev}] {msg}")
-    e, msg = oracle("@OUT = vec4(erode(@A, 2.0).rgb, 1.0);", exact=True)
-    r.ok(f"erode halo-tiled bit-exact ({msg})") if e else r.fail("ROI-5 erode", msg)
-    d, msg = oracle("@OUT = vec4(dilate(@A, 3.0).rgb, 1.0);", exact=True)
-    r.ok(f"dilate halo-tiled bit-exact ({msg})") if d else r.fail("ROI-5 dilate", msg)
+    # Morphology bit-exactness is most at risk on CUDA (different pooling kernels), so pin it
+    # on every device, not CPU-only (the oracle defaulted dev="cpu").
+    for dev in _DEVICES:
+        e, msg = oracle("@OUT = vec4(erode(@A, 2.0).rgb, 1.0);", dev=dev, exact=True)
+        r.ok(f"[{dev}] erode halo-tiled bit-exact ({msg})") if e else r.fail("ROI-5 erode", f"[{dev}] {msg}")
+        d, msg = oracle("@OUT = vec4(dilate(@A, 3.0).rgb, 1.0);", dev=dev, exact=True)
+        r.ok(f"[{dev}] dilate halo-tiled bit-exact ({msg})") if d else r.fail("ROI-5 dilate", f"[{dev}] {msg}")
     g2, msg = oracle("@OUT = vec4(gauss_blur(@A, 4.0).rgb, 1.0);", H=128, W=96, strips=(2, 4, 6))
     r.ok(f"gauss_blur(4) larger halo == whole-frame ({msg})") if g2 else r.fail("ROI-5 blur4", msg)
 
@@ -346,8 +349,10 @@ def test_cache6_fusion_recook(r: SubTestResult):
         for k in (1, 2):
             rc = ResultCache(budget_mb=100, cache_dir=tempfile.mkdtemp(prefix="tex_c6_"))
             out = tex_engine.cook_fused_cached(S, k, rc, device=dev, precision="fp32", upstream=UP)["OUT"]
-            r.ok(f"[{dev}] suffix-splice k={k} == full (maxdiff {md(out, full):.1e})") if md(out, full) < 1e-5 \
-                else r.fail("CACHE-6 oracle", f"[{dev}] k={k} maxdiff {md(out, full)}")
+            # The claim is BIT-EXACT (fp32 suffix-recook from the exact cached fp32 boundary is
+            # deterministic), so assert torch.equal — not a <1e-5 tolerance the docstring never promised.
+            r.ok(f"[{dev}] suffix-splice k={k} == full (bit-exact)") if torch.equal(out, full) \
+                else r.fail("CACHE-6 oracle", f"[{dev}] k={k} not bit-exact, maxdiff {md(out, full)}")
 
     # boundary cache HIT on repeat; hot downstream param reuses boundary; upstream busts it
     src, S = _c6_stages(g=0.9)

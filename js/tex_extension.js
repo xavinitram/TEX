@@ -2676,7 +2676,10 @@ function _texCollapseOne(out, chain) {
     // The terminal's chain socket carries the source AND is read as the chain — one key.
     out[termId].inputs[terminalImageInput] = headSource.origin;
     out[termId].inputs["_tex_chain"] = JSON.stringify({
-        schema: 1,   // SCHED-1 GraphSpec; keep in step with tex_fusion.GRAPHSPEC_SCHEMA
+        // A linear chain is a single-injection GraphSpec: schema 1, byte-identical across
+        // versions (the schema-2 source_injections key is region-only; FUS-1b). Older builds
+        // must keep reading it, so this stays 1 even though GRAPHSPEC_SCHEMA is now 2.
+        schema: 1,   // SCHED-1
         stages,
         terminal_image_input: terminalImageInput,
     });
@@ -2684,11 +2687,15 @@ function _texCollapseOne(out, chain) {
     return true;
 }
 
-function _texCollapseChains(result) {
+// `chains` is detected by the caller BEFORE any await, so it reflects the same litegraph the
+// prompt was serialized from (see graphToPrompt); an empty array means detection failed there and
+// this queue simply fuses no linear chains (the pre-v0.29 fail-safe).
+function _texCollapseChains(result, chains) {
     if (!_texFusionEnabled || !result?.output) return;
-    let chains;
-    try { chains = _texDetectChains(); } catch (e) { console.warn("[TEX] chain detect failed", e); return; }
     for (const chain of chains) {
+        // FUS-1c: this runs AFTER the region pass, so a chain whose nodes a region already
+        // consumed is skipped by _texCollapseOne's own "every chain node still present" check —
+        // no predicted skip-set needed, and an un-appliable region leaves the chain fusable.
         try {
             if (!_texCollapseOne(result.output, chain)) {
                 console.info("[TEX] a linked chain was left unfused (an intermediate " +
@@ -2699,15 +2706,12 @@ function _texCollapseChains(result) {
     }
 }
 
-// FUS-1: DAG-region fusion (fan-out / diamonds). Detection is the Python authority
-// (/tex_wrangle/detect_regions — same legality every host uses); the frontend only
-// serializes the graph and applies the returned collapse plans. ADDITIVE to the linear
-// pass above, which already ran: purely-linear regions are the route's to skip
-// (_region_is_linear), so they never arrive here. The "all region nodes present" check
-// below therefore has ONE real effect — a BRANCHING region whose cone overlaps a chain
-// the linear pass just deleted is rejected wholesale (we serialize litegraph, which
-// still shows those nodes): costs fusion, never correctness (roadmap v0.21.1).
-// Fail-safe — a route miss / timeout / unsafe plan leaves those nodes unfused.
+// FUS-1: DAG-region fusion (fan-out / diamonds / multi-injection). Detection is the Python
+// authority (/tex_wrangle/detect_regions); the frontend serializes the graph and applies the
+// returned plans. Purely-linear regions are the route's to skip (_region_is_linear).
+// FUS-1c (v0.29): the linear pass DEFERS to any node a region will claim, so it no longer
+// deletes one out from under a region; the "all present" check below stays a safety net
+// (bypassed/muted source, route mismatch). Fail-safe — a route miss leaves nodes unfused.
 
 // {nodes: [{id, code, params, code_wired}], edges: [{from, from_slot, to, to_binding}]}
 // for the detector. Image handoffs only (a $param / code wire is not a fusable edge);
@@ -2788,11 +2792,12 @@ function _texCollapseRegion(out, plan) {
     if (!out[termId] || !Array.isArray(srcOrigin) || delSet.has(termId)) return false;
     for (const id of delIds) if (!out[id]) return false;         // whole region present?
     if (delSet.has(String(srcOrigin[0]))) return false;          // source not in THIS delete set
-    // C1/C2: the source node must still EXIST in the prompt. The linear pass runs first
-    // and can delete it (a boundary node it collapses anyway), and ComfyUI strips
-    // bypassed/muted (mode 2/4) nodes — either way rewiring the terminal to a vanished
-    // origin makes the prompt reference a deleted node and ComfyUI rejects the WHOLE
-    // queue. Leaving the region unfused is always correct.
+    // C1/C2: the source node must still EXIST in the prompt — ComfyUI strips bypassed/muted
+    // (mode 2/4) nodes from it, and `_texSerializeGraph`'s mode filter only skips TEX nodes, so a
+    // bypassed non-TEX source (a Load Image) still reaches the detector. Rewiring the terminal to
+    // a vanished origin would make the prompt reference a deleted node and ComfyUI would reject
+    // the WHOLE queue. Leaving the region unfused is always correct — and since v0.29 the linear
+    // pass runs AFTER this, it stays free to fuse those nodes instead.
     if (!out[String(srcOrigin[0])]) return false;
 
     // Terminal input sockets currently fed by a to-be-deleted region node.
@@ -2829,11 +2834,15 @@ function _texCollapseRegion(out, plan) {
 // the wrong values — so a widget tweak correctly re-detects.
 let _texRegionSig = null;
 let _texRegionPlans = [];
-async function _texCollapseRegions(result) {
-    if (!_texFusionEnabled || !result?.output) return;
+
+// FUS-1c: DETECT region plans (Python route, memoized by graph signature), split from the
+// collapse so `graphToPrompt` can detect BEFORE the linear pass and let it defer to any node
+// a region will claim. Route absent/slow → [] (fail-safe: linear pass then behaves as before).
+async function _texDetectRegionPlans() {
+    if (!_texFusionEnabled) return [];
     let graph;
-    try { graph = _texSerializeGraph(); } catch (e) { return; }
-    if (!graph.nodes.length) return;
+    try { graph = _texSerializeGraph(); } catch (e) { return []; }
+    if (!graph.nodes.length) return [];
     const sig = JSON.stringify(graph);
     if (sig !== _texRegionSig) {
         try {
@@ -2845,9 +2854,14 @@ async function _texCollapseRegions(result) {
             clearTimeout(timer);
             _texRegionPlans = ((await resp.json()) || {}).plans || [];
             _texRegionSig = sig;
-        } catch (e) { _texRegionSig = null; return; }   // route absent/slow → unfused; retry next queue
+        } catch (e) { _texRegionSig = null; return []; }   // route absent/slow → unfused; retry next queue
     }
-    for (const plan of _texRegionPlans) {
+    return _texRegionPlans;
+}
+
+function _texApplyRegionPlans(result, plans) {
+    if (!_texFusionEnabled || !result?.output) return;
+    for (const plan of (plans || [])) {
         try { _texCollapseRegion(result.output, plan); }
         catch (e) { console.warn("[TEX] region fuse skipped", e); }
     }
@@ -3142,16 +3156,26 @@ app.registerExtension({
                         }
                     }
                 }
-                // Cross-node fusion: collapse linked TEX chains into their
-                // terminal (gated by TEX.Fusion.enabled; fail-safe — never
-                // produces a prompt with a dangling reference).
-                try { _texCollapseChains(result); }
-                catch (e) { console.warn("[TEX] fusion collapse skipped", e); }
-                // FUS-1: DAG-region fusion (fan-out the linear pass skips). Awaited
-                // (Python detection via route) but timeout-bounded + fail-safe, so it
-                // never stalls or breaks a queue.
-                try { await _texCollapseRegions(result); }
+                // Cross-node fusion in two coordinated passes (TEX.Fusion.enabled; fail-safe).
+                // FUS-1c: detect the linear chains NOW, while litegraph is still the graph this
+                // prompt was serialized from — the region route below can await up to 800 ms, and
+                // reading litegraph after that could see a graph the user has since edited.
+                // Then apply REGIONS FIRST and the linear pass second, so the linear pass
+                // coordinates by OBSERVATION: `_texCollapseOne`'s existing "every chain node still
+                // in the prompt" pre-check skips whatever a region already consumed. That beats a
+                // predicted skip-set — if a region plan turns out un-appliable (e.g. a bypassed
+                // non-TEX source is absent from the prompt), the linear pass is still free to fuse
+                // those nodes, where a prediction would have lost BOTH.
+                let _chains = [];
+                try { _chains = _texDetectChains(); }
+                catch (e) { console.warn("[TEX] chain detect failed", e); }
+                let _regionPlans = [];
+                try { _regionPlans = await _texDetectRegionPlans(); }
+                catch (e) { console.warn("[TEX] region detection skipped", e); }
+                try { _texApplyRegionPlans(result, _regionPlans); }   // (1) DAG regions
                 catch (e) { console.warn("[TEX] region fusion skipped", e); }
+                try { _texCollapseChains(result, _chains); }          // (2) linear, over what remains
+                catch (e) { console.warn("[TEX] fusion collapse skipped", e); }
                 // Lazy input cooking (gated by TEX.Lazy.enabled; fail-safe —
                 // any error leaves the prompt user-named and fully eager).
                 try { _texLazyRename(result); }

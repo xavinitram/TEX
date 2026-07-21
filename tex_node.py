@@ -27,11 +27,12 @@ from typing import Any
 
 logger = logging.getLogger("TEX")
 
-from .tex_compiler.lexer import LexerError
-from .tex_compiler.parser import ParseError
-from .tex_compiler.type_checker import TypeCheckError
-from .tex_compiler.diagnostics import TEXMultiError, TEX_BUG_REPORT_URL
+# ENG-4: the node catches the ONE public compile-error type, not the raw per-phase tuple
+# (the raiser is tex_engine._compile_or_raise, reached via prepare()). A RUNTIME error still
+# arrives as InterpreterError — that stays, and keeps the Q-4 fused-stage attribution below.
+from .tex_compiler.diagnostics import TEXCompileError, TEX_BUG_REPORT_URL
 from .tex_runtime.interpreter import InterpreterError
+from .tex_runtime.host import get_host_services, CookCancelled  # SCHED-3 bridge
 from .tex_fusion import FusionError
 
 # ENG-1: the cook engine (host-agnostic). This node is one of its callers.
@@ -507,6 +508,7 @@ class TEXWrangleNode(_BaseClass):
                 forgive_dead_refs=bool(slot_entries),
                 debug_nan_highlight=debug_nan_highlight,
                 time_context=time_context,
+                cancel=get_host_services().cancel_token(),   # SCHED-3: host interrupt -> cook
                 # ENG-1/ENG-3: skip the engine's no-alias clone only while THIS node's own
                 # egress is guaranteed to allocate anyway. `_prepare_output` below pins no
                 # profile, so it formats through the process-wide one — which makes the
@@ -557,12 +559,24 @@ class TEXWrangleNode(_BaseClass):
                 return IO.NodeOutput(*results, ui=ui_payload)
             return tuple(results)
 
-        except TEXMultiError as e:
-            # Multiple errors — human-readable first, JSON at end for frontend
+        except CookCancelled:
+            # SCHED-3: re-surface the host's OWN clean interrupt (comfy's InterruptProcessing-
+            # Exception, a BaseException the executor treats as a clean stop, not a node error).
+            # Off ComfyUI this is a no-op and CookCancelled propagates. First, so it short-
+            # circuits the error clauses below (else it lands in the bug-report catch-all).
+            get_host_services().raise_if_interrupted()
+            raise
+        except TEXCompileError as e:
+            # ENG-4: a compile failure (lex/parse/type-check) arrives as the ONE public
+            # type carrying `.diagnostics`. It never carries a running-stage blame — the
+            # Q-4 stage note is a RUNTIME concern, and `fused_chain` is only set once
+            # prepare() returns (a compile error leaves it False), so no stage note here.
+            # Both the old single- and multi-error paths emitted a JSON array; `.diagnostics`
+            # is always a list, so this reproduces the TEX_DIAG suffix exactly.
             readable = "\n\n".join(d.render() for d in e.diagnostics)
             payload = json.dumps([d.to_dict() for d in e.diagnostics])
             raise RuntimeError(f"{readable}\nTEX_DIAG:{payload}") from e
-        except (LexerError, ParseError, TypeCheckError, InterpreterError) as e:
+        except InterpreterError as e:
             # M-1: an OOM raised inside a stdlib call arrives here wrapped as an
             # InterpreterError — re-raise the underlying OOM UNWRAPPED so ComfyUI's
             # OOM handling (memory summary + unload_all_models) still fires. Must

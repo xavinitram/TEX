@@ -161,11 +161,14 @@ class TEXCompileError(Exception):
             for d in e.diagnostics:      # [TEXDiagnostic]
                 show(d.to_dict())        # key set is canary-pinned (ENG-5)
 
-    Always carries at least one diagnostic. Raised by `tex_api.compile`; the ComfyUI
-    node deliberately still catches the raw types, because it needs the per-phase detail
-    to build its `TEX_DIAG:` suffix and Q-4 stage attribution — the string protocol the
-    shipped frontend parses. It lives HERE, not in tex_api, so that the raiser can move
-    down to tex_engine later without the type moving with it.
+    Always carries at least one diagnostic. Raised by `tex_engine._compile_or_raise` —
+    the ENG-4 single raiser, reached via `prepare()` / `cook_stage_list` and delegated to
+    by `tex_api.compile`. The ComfyUI node and `tex_cli` catch THIS type, not the raw
+    per-phase set: the node builds its `TEX_DIAG:` suffix from `.diagnostics` (`to_dict()`),
+    and Q-4 fused-stage attribution now rides the runtime `InterpreterError` path only (a
+    compile error never has a running stage to blame). It lives HERE, not in tex_api, so
+    the raiser sits down in tex_engine without the type moving with it (v0.29 completed
+    that move; the class predates it).
     """
 
     def __init__(self, diagnostics: list[TEXDiagnostic]):
@@ -448,3 +451,62 @@ def make_diagnostic(
         docs_url=wiki_url_for_code(code),
         phase=phase,
     )
+
+
+def compile_error_from(e, source: str) -> TEXCompileError:
+    """ENG-4: translate ONE raw per-phase compiler exception into the public `TEXCompileError`.
+
+    The compiler's error taxonomy lives HERE, beside the public type — not in every module that
+    has to translate it. Both compile implementations use it: `tex_engine._compile_or_raise`
+    (the cache path) and `tex_fusion.compile_fused`'s per-stage validation (which parses and
+    type-checks each stage directly, never through the cache). Pair it with `RAW_COMPILE_ERRORS`
+    in the `except` clause so a new phase type is added in one place:
+
+        try:
+            ...compile...
+        except RAW_COMPILE_ERRORS as e:
+            raise compile_error_from(e, src) from e
+
+    Both v0.29 audits found a bug of the form "someone forgot a member of the 4-name tuple";
+    keeping the tuple and the translator together is what stops the next one.
+    """
+    if isinstance(e, TEXMultiError):
+        return TEXCompileError(e.diagnostics)
+    return TEXCompileError([diagnostic_from_exc(e, source)])
+
+
+_RAW_COMPILE_ERRORS = None
+
+
+def raw_compile_errors() -> tuple:
+    """The raw per-phase compiler exceptions as ONE tuple (lexer/parser/type-check + the
+    multi-error wrapper). Resolved LAZILY and cached: the phase modules import THIS module, so a
+    module-level import would cycle. Python evaluates an `except` clause's expression only when an
+    exception propagates, so it reads naturally at the call site:
+
+        except raw_compile_errors() as e:
+            raise compile_error_from(e, src) from e
+    """
+    global _RAW_COMPILE_ERRORS
+    if _RAW_COMPILE_ERRORS is None:
+        from .lexer import LexerError
+        from .parser import ParseError
+        from .type_checker import TypeCheckError
+        _RAW_COMPILE_ERRORS = (LexerError, ParseError, TypeCheckError, TEXMultiError)
+    return _RAW_COMPILE_ERRORS
+
+
+def diagnostic_from_exc(e, source: str) -> TEXDiagnostic:
+    """Materialize the structured diagnostic for a per-phase compiler exception
+    (LexerError/ParseError/TypeCheckError build theirs lazily via `_build_diagnostic`),
+    synthesizing an E0000 fallback so the public contract is never downgraded to a bare
+    message. Shared by `tex_engine._compile_or_raise` (the ENG-4 raiser), `tex_api.compile`,
+    and `tex_api.check()` — it lives HERE, not in tex_api, so the single raiser can reach it
+    without an import cycle."""
+    if hasattr(e, "_build_diagnostic"):
+        e._build_diagnostic()
+    diag = getattr(e, "diagnostic", None)
+    if diag is None:
+        diag = make_diagnostic(code="E0000", message=str(e),
+                               loc=getattr(e, "loc", None), source=source, phase="compile")
+    return diag

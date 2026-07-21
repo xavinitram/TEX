@@ -62,7 +62,30 @@ from .tex_marshalling import (
 )
 from .tex_runtime.host import (get_host_services, CookCancelled,
                                _cancel_check, _report_progress)
+# ENG-4: the shared compile-error taxonomy + translator (lives beside TEXCompileError so the
+# per-phase tuple is spelled once, not once per compile implementation).
+from .tex_compiler.diagnostics import raw_compile_errors, compile_error_from
 from . import tex_lazy as _tex_lazy
+
+
+# ── ENG-4: the single compile raiser ─────────────────────────────────────────
+
+def _compile_or_raise(code: str, binding_types: dict):
+    """Compile `code` to the cache's 6-tuple, or raise the PUBLIC `TEXCompileError`
+    (carrying `[.diagnostics]`) on failure.
+
+    This is the raiser for the CACHE compile path — the one every host-facing caller reaches:
+    the ComfyUI node (via `prepare()`), `tex_cli`, and `tex_api.compile`. They catch
+    `TEXCompileError`, so no host module imports the compiler's internals (ENG-4's goal).
+    `tex_fusion.compile_fused` is the OTHER compile implementation (it parses + type-checks each
+    stage directly, never through the cache) and raises the same public type via the same shared
+    translator — so the exception TAXONOMY lives in one place even though there are two compile
+    sites. `check()` (LANG-2) keeps its own collect-don't-raise path.
+    """
+    try:
+        return get_cache().compile_tex(code, binding_types)
+    except raw_compile_errors() as e:
+        raise compile_error_from(e, code) from e
 
 
 # ── HW-4: opt-in CPU thread pinning ──────────────────────────────────────────
@@ -1012,10 +1035,12 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
         # Infer binding types for inputs
         binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
 
-        # Compile (uses two-tier Mega-Cache: memory LRU + disk persistence)
+        # Compile (uses two-tier Mega-Cache: memory LRU + disk persistence). ENG-4: the
+        # compile failure surfaces as the public TEXCompileError from this single raiser —
+        # the node/cli catch that, not the raw per-phase types.
         cache = get_cache()
         program, type_map, referenced, assigned_bindings, param_info, used_builtins = \
-            cache.compile_tex(code, binding_types)
+            _compile_or_raise(code, binding_types)
         # LAT-2: compute the fingerprint here (memoized in TEXCache, so this is the SAME
         # single call that used to sit below the preflight — value-identical, since
         # binding_types is snapshotted before param injection) so _preflight_memory can
@@ -1510,13 +1535,12 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
     param default-inject + widget-value conversion so a SUB-chain (a CACHE-6 prefix or suffix)
     cooks BIT-IDENTICALLY to those same stages inside the full fused program — the equivalence
     the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does."""
-    from .tex_cache import get_cache
     if len(stages) == 1:
         st = stages[0]
         bindings = dict(st.get("bindings") or {})
         binding_types = {n: _infer_binding_type(v) for n, v in bindings.items()}
         program, type_map, referenced, assigned, param_info, used_builtins = \
-            get_cache().compile_tex(st["code"], binding_types)
+            _compile_or_raise(st["code"], binding_types)
     else:
         from .tex_fusion import compile_fused
         program, type_map, referenced, assigned, param_info, used_builtins, bindings = \

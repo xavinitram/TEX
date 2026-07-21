@@ -292,10 +292,7 @@ def main(argv=None) -> None:
     # message, not a raw Python traceback — the flagship host-agnostic runner should fail
     # like a CLI, not dump a stack. Function-local imports keep the module cheap to import
     # as a library (load_image/save_image) without pulling the whole compiler chain.
-    from .tex_compiler.lexer import LexerError
-    from .tex_compiler.parser import ParseError
-    from .tex_compiler.type_checker import TypeCheckError
-    from .tex_compiler.diagnostics import TEXMultiError, TEXCompileError
+    from .tex_compiler.diagnostics import TEXCompileError
     from .tex_runtime.interpreter import InterpreterError
     try:
         if args.cmd == "run":
@@ -307,11 +304,11 @@ def main(argv=None) -> None:
             help_fn(args)
         elif args.cmd == "build":
             build_fn(args)
-    # TEXCompileError (ENG-4) is what tex_api.compile now raises, and run_program calls
-    # it BEFORE the cook — so without it here every syntax error in `tex run` dumps a
-    # stack, breaking the F3 contract this function exists to keep.
-    except (OSError, LexerError, ParseError, TypeCheckError, TEXMultiError, TEXCompileError,
-            InterpreterError, ValueError, RuntimeError) as e:
+    # TEXCompileError (ENG-4) is what tex_api.compile / tex_engine both raise on a compile
+    # failure, and run_program calls compile BEFORE the cook — so without it here every
+    # syntax error in `tex run` dumps a stack, breaking the F3 contract this function keeps.
+    # No HOST module catches the raw per-phase types any more — the compile raisers wrap them.
+    except (OSError, TEXCompileError, InterpreterError, ValueError, RuntimeError) as e:
         # S2 (doc 33): the node appends a machine-readable "\nTEX_DIAG:{json}" blob to some
         # errors for the frontend — strip it from the human CLI message.
         msg = str(e).split("\nTEX_DIAG:", 1)[0].strip()

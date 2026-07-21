@@ -6,6 +6,10 @@ ComfyUI, in **both** node modes (classic / Nodes 1.0 **and** Vue / Nodes 2.0), a
 screenshots into the build log. Re-run each release — the JS is version-sensitive.
 
 ## Setup
+- [ ] **Housekeeping first (LIVE-1):** remove the `TEX_Wrangle` test junction from
+      `custom_nodes/` before launching — it is a symlink to `TEX/`, so leaving it makes
+      ComfyUI **double-load** the node (two entries, duplicated routes). The test harness
+      needs it; a live ComfyUI must not have it. Restore it after the session if you run tests.
 - [ ] ComfyUI launched with the TEX Wrangle node installed; browser console open.
 - [ ] Confirm the node loads with **no console errors** on graph open.
 - [ ] Toggle **Settings → TEX → Debug → perfHud** ON.
@@ -44,9 +48,11 @@ screenshots into the build log. Re-run each release — the JS is version-sensit
 
 ## FUS-1 — DAG-region fusion (v0.21, NEW — the release's live-checklist gate)
 The Python core + `/tex_wrangle/detect_regions` route + FUS-3 equivalence gate are
-headless-verified; the frontend serialize/collapse (`_texSerializeGraph`,
-`_texCollapseRegion`, `_texCollapseRegions`) can only be checked on a live canvas.
-The linear-chain collapse is UNCHANGED — verify it still works AND the new fan-out path.
+headless-verified; the frontend serialize/collapse (`_texSerializeGraph`, `_texCollapseRegion`,
+`_texDetectRegionPlans` / `_texApplyRegionPlans`) can only be checked on a live canvas.
+**v0.29 note:** the linear-chain collapse is no longer *untouched* — it now runs AFTER the region
+pass (FUS-1c), so re-run every row below, not just the fan-out ones. See the FUS-1c/1b section for
+the new behaviours.
 - [ ] **Linear chain still fuses** (regression): a straight A→B→C TEX chain collapses
       to the terminal and cooks correctly (unchanged behavior — this must not break).
 - [ ] **Diamond fuses**: A→{B,C}→D (A feeds B and C; D merges both, e.g. `@OUT=(@b+@c)*0.5`).
@@ -121,6 +127,69 @@ Application → Local Storage and watch `tex_wrangle_snippets` + `tex_wrangle_sn
 - [ ] *Known limitation (not a bug):* deleting a snippet on one machine/tab may not passively
       propagate to another that already has it cached (the merge favors preservation over
       delete-propagation). Full convergence is a follow-up needing a versioned server store.
+
+## LANG-2 — live lint + W7xxx warnings (v0.23, RETRO-AUDITED in v0.29 — LIVE-1)
+The debounced live-lint (`_texRequestLint` → `/tex_wrangle/check` → CM6 squiggles) and the
+W7xxx warnings shipped in v0.23 without a live-checklist run. The `check()` backend + the
+route are headless-tested; the editor squiggles/gutter can only be verified on a live canvas.
+- [ ] Type a **syntax error** (`@OUT = @A +;`) in a node's code editor. After ~400 ms a **red
+      squiggle** appears at the error, with a **gutter marker** on that line. Fix it → the
+      squiggle clears once the program parses clean.
+- [ ] Type an **unused variable** (`float x = 1.0;` never used) → a **warning** squiggle
+      (distinct colour from an error) with the **W7001** message on hover.
+- [ ] An **unused @input** (wire an input, never reference it) → **W7002** warning squiggle.
+- [ ] A **param shadowing a builtin** (`f$sin = 0.5;`) → **W7003** warning.
+- [ ] A `//!tex 9.9` pragma (newer than this build) → a **W7004** advisory, not a hard error.
+- [ ] Lint is **debounced** (no request per keystroke — watch DevTools → Network: one POST
+      settles after you stop typing) and a route error leaves existing squiggles untouched
+      (throttle/stop the server → the last squiggles persist, no console throw).
+
+## TOOL-2 — publish flow (v0.26, RETRO-AUDITED in v0.29 — LIVE-1)
+The `.textool` manifest, the publish/list/install routes, and the fused tool cook are
+headless-proven; the **collapse-selection picker + instanced-tool node rendering** (pure JS)
+were recorded as a follow-up in `docs/tools.md` §8 and never run live. Verify:
+- [ ] Select a linked TEX chain (e.g. grade → blur → vignette) → right-click → **Publish as
+      TEX tool…** → the promoted-params picker opens; pick a param from each stage, name the tool.
+- [ ] Confirm `<user_dir>/tex_wrangle/tools/<name>.textool` is written (validated, not compiled).
+- [ ] The published tool appears in the node list; drag it in → it renders as **one node whose
+      widgets are the promoted params** (the internal stages are sealed).
+- [ ] The instanced tool **cooks** to the same pixels as the original unfused chain.
+- [ ] A malformed / newer-`manifest_schema` `.textool` is **refused at install** with a clear
+      message (never compiled on install without consent — TOOL-5).
+- [ ] Browser console shows no errors from publish / list / install / instance.
+
+## FUS-1c + FUS-1b — fusion coordination + multi-injection (v0.29, NEW — LIVE-1 gate)
+v0.29 changed the frontend fusion orchestration (`graphToPrompt`): region detection now runs
+FIRST and the linear pass **defers** to any node a region will claim (FUS-1c), and a single
+producer may feed >1 region member (FUS-1b, GraphSpec schema 2). The Python detector + splicer
+are bit-exact-tested; the JS pass ordering can only be verified on a live canvas. **This is the
+release's highest-risk frontend change — it touches the linear pass that runs on EVERY graph.**
+- [ ] **Linear chain still fuses** (regression, the most-used path): a straight A→B→C TEX chain
+      collapses to the terminal and cooks correctly. This MUST NOT break.
+- [ ] **Linear run into a region's fan-out now fuses (FUS-1c)**: build `S→A→B→{C,D}→E`
+      (A→B a linear run, then B fans out to C and D, E merges). Queue it — the WHOLE region
+      `{A,B,C,D,E}` collapses into E and matches the same graph run **unfused** (toggle
+      **Settings → TEX → Fusion → enabled** off to compare). Before v0.29 only `A→B` fused.
+- [ ] **Multi-injection fuses (FUS-1b)**: `Load → [blur, sharpen] → merge` (one Load feeds BOTH
+      blur and sharpen; merge combines them). Queue it — the diamond collapses into merge and
+      matches the unfused run. Console shows no `region fuse skipped`.
+- [ ] **Two distinct producers still left unfused** (safe): a merge reading two DIFFERENT
+      external images does not collapse — its nodes cook separately, result still correct.
+- [ ] **Route absent/slow fail-safe**: throttle/stop the `/tex_wrangle/detect_regions` route —
+      linear chains still fuse (the linear pass falls back to its v0.20 behaviour) and fan-out
+      graphs cook unfused. Never a stalled or rejected queue.
+- [ ] Re-run the **whole v0.21 FUS-1 section above** (diamond / fan-out / bypass-mute / MASK
+      source) — the pass reordering must not regress any of it.
+
+## SCHED-3 bridge — the host interrupt aborts a cook (v0.29, NEW — LIVE-1)
+The ComfyUI node now passes the host's Stop/interrupt into the cook (`cancel=`). The token +
+re-surface are headless-tested; the end-to-end Stop behaviour is live-only.
+- [ ] Queue a **slow** TEX cook (a large image + an expensive program, e.g. a big `gauss_blur`
+      or a high strip count) and press **Stop** mid-cook. The node aborts **promptly** at the
+      next yield point and ComfyUI shows a **clean interrupt** (the queue stops) — NOT a red
+      "TEX hit an unexpected problem" bug-report error.
+- [ ] After a Stop, the next queue cooks normally (the interrupt flag was cleared).
+- [ ] A normal cook (no Stop) is unaffected — same pixels, same timing as before.
 
 ## Also verify (carried from prior cycles)
 - [ ] Hover docs (F1 / hover a function) render.

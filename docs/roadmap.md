@@ -101,6 +101,12 @@ ten pillars. They are the load-bearing assumptions of everything below.
 
 ## 2. Near term (v0.21–v0.23): finish what exists, harden the seams
 
+> **Status (v0.29 DOCS-1):** §2 is **shipped** across v0.21–v0.23 (see §9 for the per-release
+> record) — FUS-1/2/3, the ENG/LAT/CACHE-0/LANG/ROI-1 seams. The residuals the v0.28 audit
+> tracked closed in v0.29: FUS-1b/1c (the unshipped v0.21.1) and ENG-4's re-cut. LAT-1a/1b and
+> LAT-2 are deferred-on-measurement (§9). The §5 scorecard's "Today (v0.28)" column is the
+> concise current state.
+
 Work TEX can ship *inside ComfyUI* that is simultaneously the compositor's foundation.
 Four workstreams. Effort tags: S/M/L.
 
@@ -251,6 +257,13 @@ Four workstreams. Effort tags: S/M/L.
 ---
 
 ## 3. Mid term (v0.24–v0.3x): the five programs
+
+> **Status (v0.29 DOCS-1):** the five programs are **shipped** through v0.28 — P1 ROI/DoD
+> (v0.24, flagged off), P2 results & caching (v0.25), P3 tools (v0.26), P4 scheduling & GraphSpec
+> (v0.27, scheduler dormant), P5 data model & sessions (v0.28). What remains mid-term is the
+> flag flips + first live consumers (v0.30: ROI viewport, SCHED-2's first graph, codegen ROI/tile
+> routing). Per-item shipped-state is in §9; the deferrals (CACHE-6 DAG split, DATA-3 indexing,
+> DATA-4 phase 2) keep their recorded gates.
 
 ### P1 — ROI / DoD (pillar 4's spatial dimension)
 
@@ -558,18 +571,22 @@ programs, not tasks — each needs its own design doc when its time comes.
 
 ## 5. Pillar scorecard
 
-| Pillar | Today (v0.20) | Near | Mid | Far |
-|--------|---------------|------|-----|-----|
-| 1 Compilation | linear chains fuse; compile tiers verified (but FUS-0 bug) | DAG regions, fused lazy | tools as compile units, suffix recook | whole-plan compilation in tex_graph |
-| 2 XPU | per-node greedy placement; single-source language | transfer probe, concurrency audit | placement scheduler, GraphSpec | branch-parallel executor |
-| 3 Caching | program caches persistent & layered; zero result caching | speculative warm (LAT-1), hygiene (CACHE-0) | lineage keys, frame cache, epochs, governor, prewarm (CACHE-3) | version-counter dirty tracking |
-| 4 Lazy | input-level, over-approximate, dual-consumer | footprint registry, fused-chain lazy | ROI/DoD analysis + execution + oracle | demand-driven pull planner |
-| 5 Unified memory | pinned egress + async ingest, budget ladder | Null-host authority | halo tiling, spill-through-pinned | 3-stream out-of-core, async D2H handles |
-| 6 Wrangling | one node, snippets, fusion substrate | param metadata, snippet store | .textool + publish flow + tex build + first exemplars | canvas decl, stock-node library (STOCK-1), roto/paint sources (ROTO-1) |
-| 7 AI-ready | torch-native, device-resident | DLPack contract (ENG-6) | ARRAY wires (DATA-3) | in-graph inference nodes (ML-1) |
-| 8 Low overhead | 4 measured tiers, ~15 memos | bg compile everywhere, PreparedProgram, deferred timing | ROI cooks, result reuse | version-counter invalidation, trusted interior edges |
-| 9 Learnability | error codes, hints, HUD, doctor | check() API, W7xxx, live lint, DOC-4 | LSP + offline docs (LANG-7) | in-app manual on LANG-7's pages; generated-code inspector (an emitted-source viewer over codegen's flat fn — Copernicus's best UX idea) |
-| 10 Versatile | IMAGE/MASK/LATENT/STRING/INT/FLOAT, 144 fns | time builtins | metadata tags, EXR/half storage, arrays | planes/AOVs, FrameProvider, Domain |
+The **Today (v0.28)** column is the shipped reality as of the v0.29 status pass (DOCS-1);
+the Near/Mid columns are the original planning view, now largely landed (§9 has the per-release
+record). "Today (v0.20)" was the doc's drafting baseline.
+
+| Pillar | Today (v0.28) | Mid (in progress) | Far |
+|--------|---------------|-------------------|-----|
+| 1 Compilation | DAG-region fusion (diamonds/fan-out + **v0.29 multi-injection**), all 4 compile tiers verified, tools as compile units, suffix-recook (CACHE-6) | — | whole-plan compilation in tex_graph |
+| 2 XPU | placement scheduler (dormant), GraphSpec (schema 2), transfer probe, concurrency audit; single-source language | SCHED-2's first live consumer (v0.30) | branch-parallel executor |
+| 3 Caching | lineage keys + frame cache (CACHE-2, host-armed), layered epochs, prewarm, governor (CACHE-5) | — | version-counter dirty tracking |
+| 4 Lazy | ROI/DoD analysis + execution + oracle (flagged off), footprint registry, fused-chain lazy | ROI flag flip (v0.30) | demand-driven pull planner |
+| 5 Unified memory | halo tiling (ROI-5), spill-through-pinned, Null-host authority, governor arbitration | — | 3-stream out-of-core, async D2H handles |
+| 6 Wrangling | param metadata, snippet store, `.textool` + publish + `tex build` + stock exemplars, LSP | canvas decl, stock library (STOCK-1), roto (ROTO-1) | full stock-node library |
+| 7 AI-ready | torch-native, device-resident, DLPack contract (ENG-6), ARRAY wires (DATA-3) | — | in-graph inference nodes (ML-1) |
+| 8 Low overhead | 5 measured tiers, bg compile, deferred timing, coord LRU, ROI cooks, result reuse | — | version-counter invalidation, trusted interior edges |
+| 9 Learnability | error codes/hints/HUD/doctor, `check()` + W7xxx + live lint, registry help, LSP + offline docs | — | in-app manual; generated-code inspector |
+| 10 Versatile | IMAGE/MASK/LATENT/STRING/INT/FLOAT, time builtins, metadata tags, EXR/half storage, arrays, 144 fns | — | planes/AOVs, FrameProvider, Domain |
 
 ---
 
@@ -689,6 +706,8 @@ Proof milestones (each converts a claim into a regression test):
   v0.20 tool" is a mechanism, not a promise).
 - **PM-5**: an 8K `gauss_blur` cooks on the 12 GB box via halo tiling (ROI-5), and a
   50-node 4K graph stays under budget with the governor (CACHE-5).
+- **PM-6**: the viewer host scrubs a 10-node comp at proxy resolution with ROI cooks
+  and frame-cache hits at interactive rate on the sm_120 box (v0.30's exit).
 
 ---
 
@@ -710,7 +729,9 @@ touching the frontend. FUS-0 ships as **v0.20.1** (hotfix, in flight).
 | v0.26.0 | **Tools** — the bundling promise | TOOL-1..5, first STOCK exemplars, LANG-7 | `tex_tool.py`, `tex_lsp.py` |
 | v0.27.0 | **Big frames, placed well** | ROI-5, CACHE-5, CACHE-6, SCHED-2, SCHED-3 | `tex_scheduler.py` |
 | v0.28.0 | **Second host** — the proof release | DATA-1, DATA-2, DATA-3, DATA-4, PORT-5 (PM-2) | `tex_io/exr.py`, `examples/host_demo.py` |
-| v0.3x → v1.0 | **Engine era** | §4 programs (GRAPH/XPU/DATA-5..7/STOCK/ML/ROTO/COLOR), each behind its own design doc | `tex_graph.py`, `tex_runtime/streams.py` |
+| v0.29.0 | **Close the register** — the consolidation the v0.28 audit ordered; no new mechanisms | LIVE-1 (the overdue checklist run), FUS-1b/1c (the unshipped v0.21.1), ENG-4 re-cut, SCHED-3 interrupt bridge, BENCH-1 (cumulative v0.20↔v0.28 compare + PM-5 governor soak), DOCS-1 (status pass + DOC-6 amendment) | — |
+| v0.30.0 | **First viewer** — host_demo grows into the §8 rung-2 host; the switches flip *for that host* | ROI flag flip (nightly-fuzz-gated), codegen ROI/tile routing (measured), SCHED-2's first consumer, TOOL collapse picker, PM-6 | — |
+| v0.31+ → v1.0 | **Engine era** | §4 programs (GRAPH/XPU/DATA-5..7/STOCK/ML/ROTO/COLOR), each behind its own design doc | `tex_graph.py`, `tex_runtime/streams.py` |
 
 Per-release notes:
 
@@ -948,6 +969,63 @@ Per-release notes:
   - **EXR scope (honest):** scanline only — NONE/ZIPS/ZIP, HALF/FLOAT (UINT read-only). Tiled,
     multipart, deep, and the lossy codecs (PIZ/PXR24/B44/DWA) raise a clean error rather than
     mis-decode. Little-endian hosts (every target). Cross-validated zero-error against OpenCV.
+- **v0.29.0 — SHIPPED 2026-07-20** (penciled by the 2026-07-20 audit of v0.21–v0.28).
+  Consolidation only; the theme is closing the deferral register this section accumulated.
+  **Landed + headless-verified:** ENG-4 re-cut (one raiser), SCHED-3 bridge (node passes the
+  host interrupt as `cancel=`), FUS-1b (multi-injection detector/splicer/collapse-plan, schema
+  1→2, bit-exact CPU+CUDA), the small-item sweep (count_var decline, spatial-scalar `.r`/`.x`
+  base-rank fix on both tiers, CACHE-6/morphology test-hygiene), and BENCH-1's PM-5 governor
+  soak. **Implemented, verified in the LIVE-1 live session (the tag gate):** the FUS-1c JS
+  pass-reordering and the FUS-1b/SCHED-3 frontend behaviours — v0.29 does not tag until the
+  live-session checklist is green. **Rides the idle-box bench sitting:** BENCH-1's cumulative
+  v0.20↔v0.28 eight-config compare + the durable baseline JSON. Per-item notes:
+  - **LIVE-1 — the one process violation found.** Three frontend-touching releases
+    (v0.21 region collapse, v0.23 live lint/W7xxx, v0.26 publish flow) shipped without
+    the checklist run their own exit criterion demands; `docs/live-session-checklist.md`
+    is still v0.20-era. Extend it with rows for those features, run it in a live ComfyUI
+    (both node modes), screenshots into the build log. v0.29 does not tag until this is
+    green. Housekeeping first: remove the `TEX_Wrangle` test junction from custom_nodes
+    before launching (it double-loads the node).
+  - **FUS-1b/1c** — the unshipped v0.21.1, unchanged from its note above. FUS-1c's
+    linear-first/region coordination is the priority half: any linear run ≥2 into a
+    region's fan-out still defeats that region's fusion entirely (lost coverage, never
+    a wrong pixel).
+  - **ENG-4 re-cut** — decided now (it was due v0.23): `engine.cook` becomes the raiser
+    of `TEXCompileError`; tex_node/tex_cli catch the public type; the raw per-phase
+    tuple collapses from three modules' knowledge to one raiser + one type.
+  - **SCHED-3 bridge** — the ComfyUI adapter passes the host interrupt as `cancel=`
+    (pure frontend + adapter work; rides the LIVE-1 session).
+  - **BENCH-1** — durable benchmark bracketing: a cumulative eight-config compare of
+    v0.20.0 (85610f3, via git worktree) vs v0.28.0, a saved baseline JSON that survives
+    the session, and PM-5's second half (the 50-node 4K governor soak) in the same
+    bench sitting. Eight releases each claimed neutrality; the cumulative number should
+    exist once, in writing. Same idle sitting: confirm the canonical suite count
+    (2232 expected; the 2026-07-20 audit measured 2231 with the `example compiled:
+    merge` timeout flake eating one sub-test — 116/116 green standalone).
+  - **DOCS-1** — the status pass: mark shipped items in §§2–5 against §9, refresh the
+    §5 scorecard's "Today" column to v0.28 reality, and land the DOC-6 amendment in
+    AGENTS.md (docs/ as the third layer — seven design docs now live there against a
+    policy that names two layers).
+  - **The small-item sweep** (each open in a CHANGELOG/session note, none release-worthy
+    alone): the `count_var` stencil semantics decision (open since the v0.22 stencil
+    fixes — the counter collapses which loop it lived in and emits `kH*kW`; decide the
+    semantics or decline the route); the spatial-scalar `.r`/`.x` runtime mis-slice
+    (`@in.a` on a `[1,H,W]` mask slices a spatial column — can't be closed at the type
+    layer without breaking `arr_avg(...).r`; needs an interpreter-side base-rank check);
+    the v0.27 test-hygiene bundle (CACHE-6 oracle asserts `<1e-5` where `torch.equal`
+    is the claim; CUDA morphology halo unpinned; governor graph-safety a CPU no-op;
+    SCHED-3 yields C/D/E untested); LANG-4's deferred remainder (generate the full JS
+    help panel from the registry — gated on a live-UI walk, so it rides LIVE-1).
+  - **Explicit non-items** (their recorded gates stand): codegen ROI/tile routing
+    (v0.30's measured headline), CACHE-6 DAG suffix-split, DATA-3 element indexing,
+    DATA-4 phase 2, LAT-1b, XPU-1/2, xfer multi-GPU keying (single-GPU box; note kept).
+- **v0.30.0 — First viewer (penciled).** `examples/host_demo.py` grows into the §8
+  rung-2 host: an ROI viewport becomes the first real `roi=` consumer (`TEX_ROI_EXEC`
+  flips *for that host* behind the nightly-fuzz gate), the frame cache serves a real
+  scrub loop, SCHED-2 plans placement for a real graph, tiled/ROI cooks get their
+  measured codegen route (the v0.27 deferral's reopen condition), and the collapse-
+  selection picker completes `docs/tools.md` §8. Exit: **PM-6** — scrub a 10-node comp
+  at proxy resolution with ROI cooks + cache hits at interactive rate on the sm_120 box.
 
 ## 10. How an item lands (the implementation mapping)
 

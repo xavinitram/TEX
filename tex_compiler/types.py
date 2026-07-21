@@ -130,6 +130,27 @@ CHANNEL_MAP = {
     "x": 0, "y": 1, "z": 2, "w": 3,
 }
 
+
+def base_is_vector(type_map: dict, node) -> bool:
+    """The ONE signal the interpreter and codegen must agree on for a single-channel access:
+    does the base carry a CHANNEL axis (a vector), or is it a channel-less scalar/mask whose
+    `.r`/`.x` is identity rather than a `[..., 0]` slice?
+
+    This is the STATIC half, and it is the half the two tiers must agree on. v0.29 first shipped a
+    RANK-ONLY interpreter guard against codegen's type-based bail, and the two DIVERGED on a
+    vector-TYPED-but-channel-less local (`vec3 cc = @mask`, truncate-coerced to [B,H,W]) — an
+    invariant-#2 break. Codegen bails on the exact complement of this predicate, handing every
+    ambiguous base to the interpreter, so the tiers now agree by construction.
+
+    The interpreter ANDs a runtime rank test on top (`base.dim() == len(spatial_shape)`), because
+    it alone can tell a spatially-broadcast scalar (identity `.r`) from a 0-dim uniform scalar
+    (which has no spatial axis to be identity over, and errors as it always has). That extra
+    conjunct can only ever make the interpreter MORE conservative than codegen's bail, never less
+    — which is what keeps the superset relation safe. Keep it that way: one definition, four sites.
+    """
+    t = type_map.get(id(node))
+    return t is not None and t.is_vector
+
 # Valid multi-channel swizzles
 VALID_SWIZZLES = {
     "rg", "rb", "ra", "gr", "gb", "ga", "br", "bg", "ba", "ar", "ag", "ab",

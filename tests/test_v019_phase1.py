@@ -93,7 +93,12 @@ def test_c4st_js_loc_ratchet(r: SubTestResult):
     # v0.26 audit#6 (#5): +~12 lines so publish records the true socket type (m@→MASK, l@→LATENT)
     # from each binding's prefix instead of flattening every input/output to IMAGE. Still
     # frontend-only; the SCHED-1 file split remains the real remedy — this bump buys that plan time.
-    JS_HARD = 4250
+    # v0.29 (FUS-1c): +~13 lines for the linear/region coordination — region detection split into
+    # detect + apply, and REGIONS now run first so the linear pass coordinates by observation
+    # (_texCollapseOne's own "every chain node still present" check) instead of a predicted
+    # skip-set. Frontend-only pass reordering; the SCHED-1 decomposition (fusion detection already
+    # lives in Python) still stands as the file-shrinking remedy — this bump buys that plan time.
+    JS_HARD = 4290
     js = _PKG / "js" / "tex_extension.js"
     if not js.exists():
         r.fail("C4-st JS ratchet", "js/tex_extension.js missing")

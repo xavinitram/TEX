@@ -38,6 +38,11 @@ logger = logging.getLogger("TEX.fusion")
 from .tex_compiler.lexer import Lexer
 from .tex_compiler.parser import Parser
 from .tex_compiler.type_checker import TypeChecker, TypeCheckError
+# ENG-4: the shared per-phase tuple + translator (compile_fused is the SECOND compile
+# implementation — it validates each stage directly, not through the cache). TEXMultiError is
+# also caught explicitly at the SPLICE below, where the policy is FusionError, not a compile error.
+from .tex_compiler.diagnostics import (
+    TEXCompileError, TEXMultiError, raw_compile_errors, compile_error_from)
 from .tex_compiler import ast_nodes as A
 # STR-8: optimize + _collect_identifiers are no longer imported here — the shared
 # post-parse pipeline now lives in TEXCache.compile_ast (called by compile_fused).
@@ -416,11 +421,20 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
                     f"@{src_out}, which isn't produced upstream")
             wire_map[binding], bt[binding] = src
 
-        prog = _parse(st["code"])
-        # Standalone type-check: validates the stage (good error attribution) and
-        # gives each exported binding's concrete type for its handoff local.
-        checker = TypeChecker(binding_types=bt, source=st["code"])
-        checker.check(prog)
+        # ENG-4: a per-stage compile error (a typo in ONE fused node's code) must surface as the
+        # public TEXCompileError carrying the real diagnostic. The fused cook path never runs
+        # through `_compile_or_raise`, so without this a raw Lexer/Parse/TypeCheckError skips the
+        # node's `except TEXCompileError` and lands in the bug-report catch-all — losing the clean
+        # TEX_DIAG the frontend parses. (A genuine FUSION problem — a missing @OUT, a bad wire — is
+        # a FusionError, raised elsewhere; this is only the per-stage standalone compile.)
+        try:
+            prog = _parse(st["code"])
+            # Standalone type-check: validates the stage (good error attribution) and
+            # gives each exported binding's concrete type for its handoff local.
+            checker = TypeChecker(binding_types=bt, source=st["code"])
+            checker.check(prog)
+        except raw_compile_errors() as e:
+            raise compile_error_from(e, st["code"]) from e
 
         # Which of this stage's assigned bindings are exported downstream.
         # Non-terminal: @OUT always (the primary handoff) + any declared extras
@@ -549,11 +563,15 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
         from .tex_cache import get_cache
         fused, type_map, refs, asg, params, used_builtins = get_cache().compile_ast(
             fused, binding_types, source="<fused chain>")
-    except TypeCheckError as e:
-        # A fused chain that doesn't type-check as one program is unfusable —
-        # surface it as a clean FusionError (the node's contract) instead of an
-        # uncaught crash. The common trigger is an @OUT type hint (m@/img@/s@ )
-        # on a non-terminal stage that fusion can't reproduce.
+    except (TypeCheckError, TEXMultiError) as e:
+        # A fused chain that doesn't type-check as one program is unfusable — surface it as a
+        # clean FusionError (the node's contract) instead of an uncaught crash. TEXMultiError
+        # (the >=2-error case) is a SIBLING of TypeCheckError, not a subclass, so it must be
+        # caught explicitly — else a spliced program with two type errors escapes to the node's
+        # bug-report catch-all (ENG-4 removed the node's old `except TEXMultiError` net). Both
+        # mean "the spliced program isn't one valid program"; the message is actionable and the
+        # raw diagnostics would only point into the never-shown `<fused chain>` source anyway.
+        # The common trigger is an @OUT type hint (m@/img@/s@) on a non-terminal stage.
         raise FusionError(
             "This chain can't be fused into a single valid program (often an @OUT "
             "type hint like m@OUT/img@OUT on an upstream node, or mismatched channel "
@@ -609,10 +627,11 @@ def chain_preflight(stages: list[dict],
                 "outputs": sorted(asg.keys()),
             },
         }
-    except FusionError as e:
-        return {"ok": False, "error": str(e),
-                "stage_of_error": _stage_index_from_error(str(e)), "stats": None}
-    except TypeCheckError as e:
+    except (FusionError, TEXCompileError) as e:
+        # Render the real message, not the catch-all's "preflight error:" wrapper. These are the
+        # only two compile_fused can raise: a structural/splice problem (FusionError) or a
+        # PER-STAGE compile failure (TEXCompileError since ENG-4 — the commonest unfusable cause;
+        # note `stage_of_error` stays None for it, since a rendered diagnostic carries no "stage N").
         return {"ok": False, "error": str(e),
                 "stage_of_error": _stage_index_from_error(str(e)), "stats": None}
     except Exception as e:  # never let preflight hard-fail the UI
@@ -669,7 +688,11 @@ def _looks_image(v) -> bool:
 #   1 — v0.15 linear chains; v0.21 added the optional DAG payload (`dag`, `chain_inputs`,
 #       `source_stage`, `source_binding`, `terminal_chain_inputs`). Both read as schema 1:
 #       the DAG keys are additive and a linear spec is byte-identical to v0.15's.
-GRAPHSPEC_SCHEMA = 1
+#   2 — v0.29 (FUS-1b) added `source_injections` (one external producer feeding >1 member).
+#       A schema-1 reader would inject the source into only ONE member and mis-splice the
+#       rest, so a multi-injection spec is stamped schema 2 and refused by older builds.
+#       Single-injection specs stay schema 1 / byte-identical (no source_injections emitted).
+GRAPHSPEC_SCHEMA = 2
 
 # Absent `schema` means a pre-v0.22 emitter, which by definition emitted schema 1 — the
 # shape is unchanged, so accepting it is correct, not lenient. Every workflow saved
@@ -709,7 +732,9 @@ def prepare_fused(spec: dict, terminal_code: str, terminal_bindings: dict,
 
          # --- optional DAG payload (FUS-1); absent => a linear chain ---
          "dag": True,
-         "source_stage": int,            # which stage the ONE external edge feeds
+         "source_injections": [[stage, binding], ...],   # schema 2 (FUS-1b): one entry per
+                                         #   external edge; OVERRIDES the two scalars below
+         "source_stage": int,            # schema 1: which stage the external edge feeds
          "source_binding": str,          # ...and under which @binding
          "terminal_chain_inputs": {binding: [src_stage, out]},
          # ...and per-stage: "chain_inputs": {binding: [src_stage, out]}
@@ -751,13 +776,20 @@ def _stages_from_spec(spec: dict, terminal_code: str, terminal_bindings: dict) -
     # chain_inputs), so it is popped but not re-attached. Linear payloads (no `dag`)
     # take the unchanged path below and stay byte-identical (same memo/disk keys).
     if spec.get("dag"):
-        source_stage = spec.get("source_stage", 0)
-        source_binding = spec.get("source_binding")
+        # FUS-1b: one or more injection points, all fed the SAME transported source. A
+        # single-injection (schema 1) spec carries no `source_injections` and falls back to
+        # the scalar `source_stage`/`source_binding` — byte-identical to v0.21.
+        raw_inj = spec.get("source_injections")
+        if raw_inj:
+            inj_points = [(int(s), b) for (s, b) in raw_inj]
+        else:
+            inj_points = [(spec.get("source_stage", 0), spec.get("source_binding"))]
         fused_stages = []
         for idx, st in enumerate(stages):
             sb = dict(st.get("params") or {})
-            if idx == source_stage and source_binding:
-                sb[source_binding] = source
+            for s_stage, s_binding in inj_points:
+                if idx == s_stage and s_binding:
+                    sb[s_binding] = source
             entry = {"code": st["code"], "bindings": sb}
             ci = st.get("chain_inputs")
             if ci:
@@ -765,13 +797,13 @@ def _stages_from_spec(spec: dict, terminal_code: str, terminal_bindings: dict) -
             fused_stages.append(entry)
         term = {"code": terminal_code, "bindings": bindings}
         # C14 — defensive only, UNREACHABLE via detect_fusable_regions: the detector
-        # rejects any region whose single external source feeds the terminal directly
-        # (`src_dst == terminal`, the spatial-fragility guard), so `source_stage` never
-        # points past the upstream stages here. Kept so a non-detector caller that
-        # hand-builds a "source feeds the terminal" spec still injects the source into
-        # the terminal rather than silently dropping it.
-        if source_stage == len(stages) and source_binding:
-            term["bindings"][source_binding] = source
+        # rejects any region whose external source feeds the terminal directly
+        # (`dst == terminal`, the spatial-fragility guard), so no injection points past the
+        # upstream stages here. Kept so a non-detector caller that hand-builds a "source
+        # feeds the terminal" spec still injects the source rather than silently dropping it.
+        for s_stage, s_binding in inj_points:
+            if s_stage == len(stages) and s_binding:
+                term["bindings"][s_binding] = source
         tci = spec.get("terminal_chain_inputs")
         if tci:
             term["chain_inputs"] = _listify_chain_inputs(tci)
@@ -961,22 +993,25 @@ def _grow_region(terminal, nodes, tex, out_by_src, in_by_dst):
     if len(R) < 2:
         return None
 
-    # Region-EXTERNAL image inputs (edges into R from outside R). v0.21: exactly one.
+    # Region-EXTERNAL image inputs (edges into R from outside R).
     external = [(nid, e["to_binding"], e["from"], e["from_slot"], e.get("from_type"))
                 for nid in R for e in in_by_dst.get(nid, []) if e["from"] not in R]
-    if len(external) != 1:
-        # 0 (no source), or >1 — which includes the case where ONE producer fans out
-        # to two members (`Load -> [blur, sharpen] -> merge`): that's two external
-        # EDGES, so it needs multi-injection (one source spec per edge), not the
-        # single-source splice v0.21 implements. Out of scope; left unfused.
+    if not external:
+        return None    # a pure-generator region with no external source — leave unfused
+    # FUS-1b: ONE external producer may feed >1 region member (`Load -> [blur, sharpen] ->
+    # merge` is two external EDGES from a single producer). Group by producer socket: a
+    # genuine two-PRODUCER merge still can't fuse (the splice carries one source), but a
+    # single producer fanning in becomes a MULTI-INJECTION source — one injection per edge,
+    # all fed the same transported tensor. v0.21 accepted only the len(external)==1 case.
+    producers = {(o, s) for (_, _, o, s, _) in external}
+    if len(producers) != 1:
+        return None    # 0 or >1 distinct producers — unfused (unchanged 2-source behaviour)
+    if any(dst == terminal for (dst, _, _, _, _) in external):
+        # An external edge into the TERMINAL directly is the spatial-fragility case v0.21
+        # rejected (a generator fused into a spatial program) — leave the region unfused.
         return None
-    src_dst, src_binding, src_origin, src_slot, src_type = external[0]
-    if src_dst == terminal:
-        # The single external source feeds the TERMINAL directly, which means every
-        # other region member is a generator (no external input). Fusing a
-        # spatial-less generator into a spatial program is shape-fragile — leave the
-        # whole region unfused (always correct, just not collapsed).
-        return None
+    src_origin, src_slot = next(iter(producers))
+    src_type = external[0][4]
 
     order = _topo_order(R, in_by_dst)
     if order is None or order[-1] != terminal:
@@ -989,13 +1024,19 @@ def _grow_region(terminal, nodes, tex, out_by_src, in_by_dst):
                         for e in in_by_dst.get(nid, []) if e["from"] in R}
         stages.append({"id": nid, "chain_inputs": chain_inputs})
 
+    # One injection per external edge, in a deterministic order (stage, then binding) so the
+    # plan is stable. `injections` is the SOLE in-memory representation — the scalar
+    # stage/binding pair exists only at the WIRE boundary (region_to_collapse_plan), where the
+    # schema-1 compat story actually lives.
+    injections = sorted(({"stage": idx[dst], "binding": binding}
+                         for (dst, binding, _, _, _) in external),
+                        key=lambda j: (j["stage"], j["binding"]))
     return {
         "terminal": terminal,
         "order": list(order),
         "delete": [nid for nid in order if nid != terminal],
-        "source": {"origin": src_origin, "origin_slot": src_slot,
-                   "stage": idx[src_dst], "binding": src_binding,
-                   "type": src_type},
+        "source": {"origin": src_origin, "origin_slot": src_slot, "type": src_type,
+                   "injections": injections},
         "stages": stages,
     }
 
@@ -1053,17 +1094,25 @@ def region_to_collapse_plan(region: dict, node_code: dict, node_params: dict) ->
     Python and only socket wiring in the host."""
     upstream = region["stages"][:-1]
     term_stage = region["stages"][-1]
+    injections = region["source"]["injections"]
+    multi = len(injections) > 1
     payload = {
-        "schema": GRAPHSPEC_SCHEMA,   # SCHED-1
+        # FUS-1b: a SINGLE-injection region stays schema 1 / byte-identical (source_stage +
+        # source_binding). A MULTI-injection region adds source_injections and bumps to
+        # schema 2 — a schema-1 reader would inject the source into only one member and
+        # mis-splice the rest, so it MUST be refused there, not silently degraded.
+        "schema": GRAPHSPEC_SCHEMA if multi else 1,   # SCHED-1 (1 = the single-injection shape)
         "dag": True,
         "stages": [{"code": node_code[st["id"]],
                     "params": dict(node_params.get(st["id"], {}) or {}),
                     "chain_inputs": _listify_chain_inputs(st["chain_inputs"])}
                    for st in upstream],
         "terminal_chain_inputs": _listify_chain_inputs(term_stage["chain_inputs"]),
-        "source_stage": region["source"]["stage"],   # index into `stages` (upstream)
-        "source_binding": region["source"]["binding"],
+        "source_stage": injections[0]["stage"],   # index into `stages` (upstream)
+        "source_binding": injections[0]["binding"],
     }
+    if multi:
+        payload["source_injections"] = [[j["stage"], j["binding"]] for j in injections]
     return {
         "terminal": region["terminal"],
         "delete": list(region["delete"]),
@@ -1075,7 +1124,15 @@ def region_to_collapse_plan(region: dict, node_code: dict, node_params: dict) ->
 def _region_is_linear(region: dict) -> bool:
     """A single-terminal region is non-linear (fan-out/diamond) iff it has more
     internal handoff edges than a path — a reconverging fan-out adds a fan-in at the
-    terminal. A purely linear region is the JS linear-collapse pass's job (C17)."""
+    terminal. A purely linear region is the JS linear-collapse pass's job (C17).
+
+    FUS-1b: a multi-injection region (one external producer fanning into >1 member) is
+    ALSO non-linear even though its INTERNAL handoffs look path-like — the fan-out lives on
+    the external edges, not internal ones (`Load -> [blur, sharpen] -> merge` has one
+    internal fan-in at merge, so the count alone reads linear). The linear pass can't
+    collapse it, so it must reach the region path, not be skipped here."""
+    if len(region.get("source", {}).get("injections") or []) > 1:
+        return False
     stages = region.get("stages") or []
     internal = sum(len(st.get("chain_inputs") or {}) for st in stages)
     return internal <= len(stages) - 1
@@ -1145,9 +1202,11 @@ def _region_compiles(region: dict, node_code: dict, node_params: dict) -> bool:
     try:
         from .tex_marshalling import infer_binding_type
         src = region["source"]
+        injections = src["injections"]
         for sample in _preflight_samples(src.get("type")):
             stages = region_to_stages(region, node_code, node_params)
-            stages[src["stage"]]["bindings"][src["binding"]] = sample
+            for inj in injections:          # FUS-1b: the one source feeds every injection point
+                stages[inj["stage"]]["bindings"][inj["binding"]] = sample
             compile_fused(stages, infer_binding_type)
         return True
     except Exception:

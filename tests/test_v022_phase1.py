@@ -253,14 +253,18 @@ def test_eng5_embedding_canaries(r: SubTestResult):
         fails.append("near_singularities missing when the debug toggle supplies a count")
 
     # (c) HostServices — the method set a host must implement (PORT-1). get_user_dir
-    #     added by LANG-5 (the user snippet store's seam).
-    for m in ("get_free_memory", "free_memory", "is_oom", "soft_empty_cache", "get_user_dir"):
+    #     added by LANG-5 (the user snippet store's seam); cancel_token / raise_if_interrupted
+    #     added by the SCHED-3 bridge (v0.29 — the host's interrupt reaches the cook).
+    for m in ("get_free_memory", "free_memory", "is_oom", "soft_empty_cache", "get_user_dir",
+              "cancel_token", "raise_if_interrupted"):
         if not callable(getattr(_host.NullHostServices(), m, None)):
             fails.append(f"HostServices lost {m}()")
 
     # (d) SCHED-1: the GraphSpec is versioned, defaults to 1, and refuses the future.
-    if tex_fusion.GRAPHSPEC_SCHEMA != 1:
-        fails.append(f"GRAPHSPEC_SCHEMA is {tex_fusion.GRAPHSPEC_SCHEMA}, expected 1")
+    #     v0.29 (FUS-1b) bumped the current schema 1 -> 2 (source_injections); schema 1
+    #     is still read (single-injection specs stay 1), absent still defaults to 1.
+    if tex_fusion.GRAPHSPEC_SCHEMA != 2:
+        fails.append(f"GRAPHSPEC_SCHEMA is {tex_fusion.GRAPHSPEC_SCHEMA}, expected 2")
     spec = {"stages": [{"code": "@OUT = @A * 2.0;", "image_input": "A", "params": {}}],
             "terminal_image_input": "A"}
     img = make_img(1, 8, 8, 3)
@@ -269,11 +273,12 @@ def test_eng5_embedding_canaries(r: SubTestResult):
                                  _infer_binding_type)
     except Exception as e:
         fails.append(f"a schema-less (pre-v0.22) GraphSpec was rejected: {e}")
-    try:      # explicit current schema
-        tex_fusion.prepare_fused({**spec, "schema": 1}, "@OUT = @A + 0.1;", {"A": img},
-                                 _infer_binding_type)
-    except Exception as e:
-        fails.append(f"schema=1 rejected: {e}")
+    for sc in (1, 2):     # both the legacy (single-injection) and current schema are read
+        try:
+            tex_fusion.prepare_fused({**spec, "schema": sc}, "@OUT = @A + 0.1;", {"A": img},
+                                     _infer_binding_type)
+        except Exception as e:
+            fails.append(f"schema={sc} rejected: {e}")
     try:      # a NEWER emitter must fail legibly, never be mis-spliced
         tex_fusion.prepare_fused({**spec, "schema": 99}, "@OUT = @A + 0.1;", {"A": img},
                                  _infer_binding_type)
@@ -287,8 +292,8 @@ def test_eng5_embedding_canaries(r: SubTestResult):
         r.fail("ENG-5 embedding canaries", "; ".join(fails))
     else:
         r.ok("pinned: TEXDiagnostic.to_dict (12 keys, conditional docs_url), the ui= "
-             "payload (tex_perf/tex_probes), HostServices' 5 methods, GraphSpec schema=1 "
-             "(absent==1, future rejected)")
+             "payload (tex_perf/tex_probes), HostServices' 7 methods, GraphSpec schema=2 "
+             "(1 still read, absent==1, future rejected)")
 
 
 # ── ENG-7: host time context ──────────────────────────────────────────────

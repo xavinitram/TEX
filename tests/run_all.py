@@ -474,13 +474,15 @@ def main():
 
     # v0.21.0 Phase 1 — "Fuse the graph" (FUS-1/2/3) + latency/cache/xfer
     from test_v021_phase1 import (
-        test_fus1_detector, test_fus3_dag_equivalence, test_fus3_codegen_parity,
+        test_fus1_detector, test_fus1b_multi_injection,
+        test_fus3_dag_equivalence, test_fus3_codegen_parity,
         test_fus3_terminal_rmw,
         test_fus1_route_path, test_fus2_fused_lazy, test_fus1_hardening,
         test_cache0_orphan_cg_census, test_lat3_deferred_timing, test_lat4_builtins_lru,
         test_eng8_transfer_model,
     )
     test_fus1_detector(r)
+    test_fus1b_multi_injection(r)
     test_fus3_dag_equivalence(r)
     test_fus3_codegen_parity(r)
     test_fus3_terminal_rmw(r)
@@ -685,6 +687,22 @@ def main():
     test_port5_second_host(r)
     test_data_canaries(r)
     test_root_channel_and_swizzle_fixes(r)
+
+    # v0.29.0 Phase 1 — "Close the register" (ENG-4 re-cut, SCHED-3 bridge, FUS-1b, sweep)
+    from test_v029_phase1 import (
+        test_eng4_recut_single_raiser,
+        test_sched3_bridge_token,
+        test_sched3_bridge_node,
+        test_count_var_outer_decline,
+        test_spatial_scalar_channel_access,
+        test_pm5_governor_soak,
+    )
+    test_eng4_recut_single_raiser(r)
+    test_sched3_bridge_token(r)
+    test_sched3_bridge_node(r)
+    test_count_var_outer_decline(r)
+    test_spatial_scalar_channel_access(r)
+    test_pm5_governor_soak(r)
 
     success = r.summary()
     return 0 if success else 1

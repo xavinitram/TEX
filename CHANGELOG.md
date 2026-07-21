@@ -5,6 +5,120 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] - 2026-07-20
+
+**Close the register — the consolidation the v0.28 audit ordered.** No new mechanisms: v0.29
+closes the deferral register §9 of the roadmap accumulated across v0.21–v0.28. The compile-error
+raiser finally moves down to the engine (ENG-4), the ComfyUI Stop button reaches a running cook
+(SCHED-3 bridge), one producer can feed several members of a fused region (FUS-1b) and a linear
+run no longer defeats a region's fusion (FUS-1c), and a sweep of small correctness/hygiene items
+lands. **Invariant #7, stated precisely (measured, not asserted):** the CLI / standalone / test
+path (`cancel=None`) is byte-identical — the interpreter's statement-loop body is untouched. The
+**ComfyUI** cook is deliberately *not* byte-identical, because the node now always arms an
+interrupt token: it moves to the cancel-polling branch, measured at **0.00 %–0.37 %** of a real
+cook (worst at 64², nil by 512²) — perf-neutral, not unchanged. ENG-4 is an error-path refactor
+(~0.6 µs/cook), the fusion changes sit behind the fusion flag, and the channel-access guards add
+~44 ns per single-channel access (the cheap rank test short-circuits `@image.r` before any type
+lookup). Full suite green apart from the standing S-4 cp1252-console env gap.
+
+### ENG-4 — `tex_engine._compile_or_raise` is the one `TEXCompileError` raiser
+
+- The raw per-phase compiler exceptions (`LexerError`/`ParseError`/`TypeCheckError`/`TEXMultiError`)
+  are now caught in **exactly one place** — `tex_engine._compile_or_raise`, reached by `prepare()`,
+  `cook_stage_list`, and (by delegation) `tex_api.compile`. `tex_node` and `tex_cli` catch the public
+  `TEXCompileError` instead of the raw tuple: the "three modules know the tuple" state collapses to
+  one raiser + one type. The `_diag_from_exc` materializer moved to `tex_compiler.diagnostics`
+  (`diagnostic_from_exc`) so the raiser and `check()` share it without an import cycle.
+- The node's `TEX_DIAG:` JSON suffix and the `to_dict` 12-key contract are byte-identical (built from
+  `.diagnostics`); Q-4 fused-stage attribution now rides the runtime `InterpreterError` path only (a
+  compile error never has a running stage to blame). The ENG-5 canary confirms the surfaces held.
+- **Bug-hunt fix (fused path):** `compile_fused`'s per-stage parse/type-check never ran through the
+  raiser, so a typo in a fused upstream node escaped as a raw per-phase type into the node's
+  bug-report catch-all (losing the `TEX_DIAG`). Per-stage errors now wrap to `TEXCompileError` (the
+  clean diagnostic); the final *spliced* compile catches `TypeCheckError` AND its sibling
+  `TEXMultiError` (the second audit's find — a ≥2-error chain no longer escapes) → a clean
+  `FusionError`; a genuine fusion problem (missing `@OUT`) stays a `FusionError`. Pinned in
+  `test_v029_phase1.test_eng4_recut_single_raiser`.
+
+### SCHED-3 bridge — the ComfyUI Stop button reaches a running cook
+
+- `tex_node.execute` now passes `cancel=get_host_services().cancel_token()` into `prepare()`. The token
+  (`tex_runtime.host._ComfyInterruptToken`) reads ComfyUI's interrupt flag READ-ONLY and raises
+  `CookCancelled` at the next cook yield point (per-strip / per-statement / between tiers); the node's
+  `except CookCancelled` re-surfaces the host's own clean `InterruptProcessingException` (a
+  BaseException the executor treats as a clean stop, not a red node error). Off ComfyUI the token is
+  `None` — the CLI/standalone/default path is byte-identical. `HostServices` gains `cancel_token()` /
+  `raise_if_interrupted()` (the ENG-5 method-set canary updated 5 → 7). Live end-to-end verify is LIVE-1.
+
+### FUS-1b / FUS-1c — multi-injection + linear/region coordination (the unshipped v0.21.1)
+
+- **FUS-1b:** one external producer may now feed >1 region member (`Load → [blur, sharpen] → merge`).
+  The detector groups external edges by producer (a genuine two-producer merge still stays unfused) and
+  the source spec carries an `injections` list; the splicer already handled multi-injection, proven
+  bit-exact (CPU+CUDA) vs sequential. GraphSpec **schema 1 → 2** (`source_injections`); a single-injection
+  region stays schema 1 / byte-identical, and an older build refuses schema 2 rather than mis-splice.
+- **FUS-1c:** the frontend now DETECTS regions before the linear collapse pass and the linear pass
+  DEFERS to any node a region will claim — so a linear run ≥2 into a region's fan-out no longer defeats
+  that region's fusion (`S→A→B→{C,D}→E` now fuses whole, not just `A→B`). Pure-linear chains are
+  unchanged; a route miss falls back to the proven v0.20 linear behaviour. The JS pass reordering is
+  verified in the LIVE-1 live-canvas session (it touches the linear pass that runs on every graph).
+
+### The small-item sweep
+
+- **count_var** (open since v0.22): the stencil route now DECLINES an outer-loop counter (it emits
+  `kH*kW` regardless of which loop the counter lived in — right for an inner counter, wrong by ×kW for
+  an outer one). Codegen falls to a generic loop that matches the interpreter bit-for-bit. **Audit fix:**
+  the decline now fires whenever ANY outer counter is present (not only the outer-*only* case) — a nest
+  with both counters still deletes the outer one when the box lowers with the inner count.
+- **spatial-scalar `.r`/`.x`**: `@mask.r` on a `[B,H,W]` mask used to slice a pixel COLUMN. The
+  interpreter now makes it identity (the scalar is its own red), keyed on the base's STATIC TYPE so
+  it matches codegen (which bails a single-channel access on a non-vector base to the interpreter) —
+  invariant #2 preserved, the common `@image.r` vector fast-path untouched. The write twin
+  (`m.r = v` → `m = v`) is fixed to match. **Bug-hunt fix:** the first cut keyed on runtime RANK,
+  which diverged from codegen for a vector-TYPED value that is channel-less at runtime (`vec3 cc =
+  @mask`, truncate-coerced to `[B,H,W]`); the type-based gate makes both tiers agree there too. The
+  type checker still rejects `.g/.b/.a` on a scalar (E3301); the compat corpus (PM-4) is unchanged.
+- **v0.27 test-hygiene:** the CACHE-6 oracle asserts `torch.equal` (the real bit-exact claim, not `<1e-5`);
+  the morphology halo oracle now runs on CUDA too.
+
+### BENCH-1 / DOCS-1 / LIVE-1
+
+- **BENCH-1:** a many-frame governor soak (PM-5's second half — 50 frames incl. a 4K result held under
+  budget across repeated arbitrations, flat RSS). The canonical suite total is confirmed 2232-class (the
+  ±1 is the `example compiled: merge` 30 s timeout flake under GPU contention; the one persistent failure
+  is the S-4 cp1252 console env gap). A cumulative v0.20↔v0.28 eight-config compare + the durable baseline
+  JSON ride the idle-box bench sitting (the roadmap's "machine idle, on AC" requirement).
+- **DOCS-1:** the §5 pillar scorecard's "Today" column refreshed to v0.28 reality; the DOC-6 doc-layering
+  policy amended in AGENTS.md to name `docs/` as the third layer (seven design docs live there).
+- **LIVE-1:** `docs/live-session-checklist.md` extended with the retro-audit rows for v0.23 live-lint/W7xxx
+  and v0.26 publish-flow, plus the new v0.29 frontend behaviours (FUS-1c/1b, SCHED-3 Stop) and the
+  pre-launch `TEX_Wrangle` junction-removal step. The live run + screenshots is the release's tag gate.
+
+### Adversarial audits (three passes) and the consolidation they forced
+
+- A 4-dimension bug-hunt caught **2 invariant-critical bugs this release introduced**: the
+  spatial-scalar rank-vs-type tier divergence (a `vec3 cc = @mask` local read/wrote differently on the
+  two tiers) and the ENG-4 fused-path escape (a fused compile typo bypassed the clean `TEX_DIAG`). A
+  second independent 17-agent audit caught **2 more one-liners**: `count_var` declined only the
+  outer-*only* case, and the fused splice caught `TypeCheckError` but not its sibling `TEXMultiError`.
+- A final `/simplify` (4 angles over the whole diff) then removed the duplication those bugs grew in:
+  the raw per-phase exception tuple is now spelled **once** (`diagnostics.raw_compile_errors()` +
+  `compile_error_from`), and the interpreter/codegen tier-agreement signal is **one predicate**
+  (`types.base_is_vector`) instead of four copies — the two seams that had each already drifted into a
+  bug. It also replaced FUS-1c's predicted skip-set with region-first + observation (fixing a coverage
+  regression where a detected-but-un-appliable region left nodes fused by *neither* pass), collapsed
+  `count_var` to a single `return None` in the scanner, and made `injections` the sole in-memory
+  source representation.
+- The bug-hunt over *those* refactors caught the release's most severe defect: the `m.r = v` identity
+  write stored the RHS tensor **itself** (or a stride-0 expanded view) while claiming ownership, so a
+  later in-place op could corrupt another local, an already-stored `@OUT`, or the **caller's input
+  tensor** — the ComfyUI wire shared with every downstream consumer — and a 0-dim RHS crashed outright.
+  Codegen bails on these, so the interpreter was the sole executor: silent wrong pixels, not a
+  divergence. Fixed by cloning (matching every sibling branch) and pinned with three regression checks.
+- Perf tidies aligned with the compositor loop: the SCHED-3 token is built once per host, the
+  interpreter skips the progress arithmetic on the cancel-only path, the channel guards test cheap rank
+  before the type lookup (−68 % of their overhead), and the PM-5 soak no longer spills ~600 MB per run.
+
 ## [0.28.0] - 2026-07-20
 
 **Second host — the proof release.** v0.28 makes good on the roadmap's PM-2 milestone: a

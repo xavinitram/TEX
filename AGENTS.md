@@ -138,12 +138,20 @@ Currently over the hard budget — status as of v0.18.0 (drift-checked by
 
 ## Doc-layering policy (DOC-6)
 
-Two layers, each with one audience — put a doc where its reader looks:
+Three layers, each with one audience — put a doc where its reader looks:
 - **Repo root** = agent/developer facing — `AGENTS.md` (this file), `ARCHITECTURE.md`,
   `DEVELOPMENT.md`, `Function-Reference.md` (generated), `CHANGELOG.md`.
 - **`wiki/`** = end-user facing — tutorials + reference (`Learn-TEX-in-5-Minutes.md`
   is canonical; the root copy is a redirect stub). Don't duplicate a wiki page at
   the root — link to it.
+- **`docs/`** = internal design/planning — design notes, the roadmap, and live
+  checklists that would bloat the root: `roadmap.md`, `xpu-transfer-scheduling.md`,
+  `results-caching.md`, `roi-spatial-laziness.md`, `tools.md`,
+  `lat1b-async-graph-capture.md`, `live-session-checklist.md`, `bench1-v020-v028.md`.
+  The xpu/roi/results/
+  tools notes follow the "shipped-state + deferred-state + the measured gate that
+  would change the verdict" mold; an L/XL roadmap item lands its design note here
+  first (§10.1). Not user-facing — link from a CHANGELOG entry, don't inline.
 
 Before reversing a settled design decision (e.g. "add an import system"), check
 `DEVELOPMENT.md` → "Rejected design decisions".

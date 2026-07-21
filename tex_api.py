@@ -45,7 +45,10 @@ from dataclasses import dataclass
 from typing import Any
 
 # ENG-4: the public error type + its payload, re-exported so a host imports ONE module.
-from .tex_compiler.diagnostics import TEXCompileError, TEXDiagnostic  # noqa: F401
+# `diagnostic_from_exc` is the shared per-phase→diagnostic materializer (it lives in
+# diagnostics.py so the engine raiser and check() share it without an import cycle).
+from .tex_compiler.diagnostics import (  # noqa: F401
+    TEXCompileError, TEXDiagnostic, diagnostic_from_exc as _diag_from_exc)
 
 # SCHED-3: the cooperative-cancellation exception + token protocol, re-exported so a host
 # catches CookCancelled and wires a CancelToken from the same facade it cooks through.
@@ -102,20 +105,6 @@ def _ver_tuple(v):
         return (0, 0)
 
 
-def _diag_from_exc(e, source: str):
-    """Materialize the structured diagnostic for a per-phase compiler exception (Lexer/
-    Parse/TypeCheckError build it lazily), synthesizing an E0000 fallback so the public
-    contract is never downgraded to a bare message. Shared by `compile()` and `check()`."""
-    from .tex_compiler.diagnostics import make_diagnostic
-    if hasattr(e, "_build_diagnostic"):
-        e._build_diagnostic()
-    diag = getattr(e, "diagnostic", None)
-    if diag is None:
-        diag = make_diagnostic(code="E0000", message=str(e),
-                               loc=getattr(e, "loc", None), source=source, phase="compile")
-    return diag
-
-
 @dataclass(frozen=True)
 class Program:
     """A compiled TEX program — a named view over the compiler's 6-tuple. The field
@@ -136,19 +125,14 @@ def compile(source: str, binding_types: dict) -> Program:  # noqa: A001 (public 
     Raises `TEXCompileError` (ENG-4) on invalid code — one public type carrying
     `.diagnostics`, instead of the four internal per-phase exceptions a caller used to
     have to know. Everything else propagates unchanged.
+
+    The raw per-phase catch now lives in ONE place — `tex_engine._compile_or_raise` (the
+    raiser `prepare()` and the ComfyUI node also flow through) — so this delegates to it
+    rather than re-knowing the tuple itself.
     """
-    from .tex_cache import get_cache
-    from .tex_compiler.lexer import LexerError
-    from .tex_compiler.parser import ParseError
-    from .tex_compiler.type_checker import TypeCheckError
-    from .tex_compiler.diagnostics import TEXMultiError
-    try:
-        ast, type_map, referenced, assigned, params, used_builtins = \
-            get_cache().compile_tex(source, binding_types)
-    except TEXMultiError as e:
-        raise TEXCompileError(e.diagnostics) from e
-    except (LexerError, ParseError, TypeCheckError) as e:
-        raise TEXCompileError([_diag_from_exc(e, source)]) from e
+    from . import tex_engine
+    ast, type_map, referenced, assigned, params, used_builtins = \
+        tex_engine._compile_or_raise(source, binding_types)
     return Program(ast, type_map, referenced, assigned, params, used_builtins, source)
 
 

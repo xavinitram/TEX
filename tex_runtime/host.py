@@ -75,6 +75,10 @@ class HostServices(Protocol):
     def is_oom(self, exc) -> bool: ...
     def soft_empty_cache(self) -> None: ...
     def get_user_dir(self) -> "str | None": ...   # LANG-5: per-user data dir, or None
+    # SCHED-3 bridge: hand the engine a CancelToken bound to the host's own interrupt (or None
+    # if it has none), and re-surface that host's clean interrupt after a CookCancelled.
+    def cancel_token(self) -> "CancelToken | None": ...
+    def raise_if_interrupted(self) -> None: ...
 
 
 def _allocator_slack(idx: int) -> int:
@@ -144,6 +148,36 @@ class NullHostServices:
     def get_user_dir(self):
         return None  # LANG-5: no host user dir standalone — the store falls back to the cache dir
 
+    def cancel_token(self):
+        return None  # SCHED-3: no host interrupt to bridge (CLI / standalone / tests)
+
+    def raise_if_interrupted(self):
+        pass  # nothing to re-surface: there was no host interrupt flag
+
+
+class _ComfyInterruptToken:
+    """SCHED-3 bridge: a `CancelToken` (the protocol above) bound to ComfyUI's process-wide
+    interrupt flag. `check()` raises `CookCancelled` when the host has requested an interrupt.
+
+    READ-ONLY by design — it polls `processing_interrupted()` and does NOT clear the flag, so
+    ComfyUI's own executor still sees the interrupt (the node re-surfaces the clean host
+    exception via `raise_if_interrupted()`). A missing / broken host API never fails a cook: an
+    unreadable flag reads as 'not interrupted'. It honours the CancelToken contract (raise
+    `CookCancelled`, not comfy's `InterruptProcessingException`), so every engine `except
+    CookCancelled` guard fires on the ComfyUI path exactly as on the CLI/test path."""
+    __slots__ = ("_mm",)
+
+    def __init__(self, mm):
+        self._mm = mm
+
+    def check(self) -> None:
+        try:
+            hit = self._mm.processing_interrupted()
+        except Exception:
+            return
+        if hit:
+            raise CookCancelled()
+
 
 class ComfyHostServices:
     """Delegates to `comfy.model_management` — the ONLY consumer of that import in TEX.
@@ -151,6 +185,10 @@ class ComfyHostServices:
     behaviour) so a ComfyUI version bump can never hard-fail a cook."""
     def __init__(self, mm):
         self._mm = mm
+        # SCHED-3: the interrupt token is stateless (it only reads the flag), so build it ONCE
+        # and hand back the same instance every cook — the compositor loop calls cancel_token()
+        # per frame, and a fresh alloc each time is pure waste.
+        self._cancel_token_obj = _ComfyInterruptToken(mm)
 
     def get_free_memory(self, device):
         try:
@@ -197,6 +235,24 @@ class ComfyHostServices:
         except Exception:
             pass
         return None
+
+    def cancel_token(self):
+        # SCHED-3 bridge: hand the engine the (cached, stateless) token that reads ComfyUI's
+        # interrupt flag. The node passes it as `tex_engine.prepare(cancel=...)`, so a Stop mid-
+        # cook aborts at the next yield point (per-strip / per-statement / between tiers).
+        return self._cancel_token_obj
+
+    def raise_if_interrupted(self):
+        # After a CookCancelled, re-surface the CLEAN host interrupt. The token was read-only,
+        # so the flag is still set; `throw_exception_if_processing_interrupted` clears it and
+        # raises comfy's InterruptProcessingException — a BaseException, so it flies past the
+        # node's `except Exception` catch-all straight to ComfyUI's executor, which marks the
+        # prompt interrupted rather than rendering a red node error.
+        try:
+            if hasattr(self._mm, "throw_exception_if_processing_interrupted"):
+                self._mm.throw_exception_if_processing_interrupted()
+        except Exception:
+            pass
 
 
 _cached = None

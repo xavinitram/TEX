@@ -36,7 +36,7 @@ from ..tex_compiler.ast_nodes import (
     collect_assigned_vars,
     iter_child_nodes as _ast_iter_child_nodes,
 )
-from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP
+from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
 from .codegen_stdfns import _EMIT_DISPATCH, _EmitStdFnsMixin
 from .codegen_stencil import (
     _StencilInfo, _ast_equal, _is_ident, _try_detect_stencil, _try_detect_inline_stencil, detect_stencil_route,
@@ -1248,6 +1248,15 @@ class _CodeGen(_EmitStdFnsMixin):
 
     def _emit_channel_assign(self, target: ChannelAccess, value_expr: str):
         channels = target.channels
+        # Spatial-scalar disambiguation is the interpreter's job: `m.r = v` on a channel-less
+        # [B,H,W] base means `m = v`, not a `[..., 0]` column write. Bail for a single-channel
+        # assign to a non-vector base so the interpreter runs it (invariant #2) — the exact
+        # complement of the shared `base_is_vector` predicate; a vector base ([B,H,W,C]) is
+        # unambiguous and keeps the fast path (`col.r = …`).
+        if len(channels) == 1 and not base_is_vector(self.type_map, target.object):
+            raise _Unsupported(
+                "single-channel assign to a non-vector base (interpreter does the "
+                "base-rank check that makes `m.r = v` mean `m = v`)")
         # Clone for copy-on-write — unless the base is an exclusively-owned local,
         # in which case write the channel slice in place. Capture ownership before
         # the base read (which disowns it).
@@ -2416,6 +2425,16 @@ class _CodeGen(_EmitStdFnsMixin):
             idx = CHANNEL_MAP.get(channels)
             if idx is None:
                 raise _Unsupported(f"Invalid channel: {channels}")
+            # Spatial-scalar disambiguation is the interpreter's job (a channel-less [B,H,W] base
+            # makes `.r`/`.x` identity, not a `[..., 0]` column slice). Emitting the slice here
+            # would diverge from the interpreter (invariant #2), so BAIL to it for any non-vector
+            # base — the exact complement of the shared `base_is_vector` predicate the interpreter
+            # keys on. A vector base is unambiguous ([B,H,W,C]): keep the fast path, which covers
+            # the overwhelmingly common `@image.r` / `col.rgb` case.
+            if not base_is_vector(self.type_map, node.object):
+                raise _Unsupported(
+                    "single-channel access on a non-vector base (interpreter does the "
+                    "base-rank check that keeps `@mask.r` identity, not a column slice)")
             return f"{base}[..., {idx}]"
 
         # Multi-channel swizzle
