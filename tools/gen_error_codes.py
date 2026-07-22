@@ -20,6 +20,9 @@ _OUT = os.path.join(_PKG, "wiki", "Error-Codes.md")
 
 # Family descriptions (the stable contract; the phase prefix of each code).
 _FAMILIES = [
+    ("E0", "Internal", "Internal errors — a compiler phase raised without a structured "
+     "diagnostic, so TEX synthesized a fallback (E0000) rather than surface a bare message. "
+     "Rare and not your fault; please file an issue with the program that triggered it."),
     ("E1", "Lexer", "Tokenization errors — a character or literal the scanner can't read "
      "(bad number, unterminated string/comment, stray symbol)."),
     ("E2", "Parser", "Grammar errors — a statement or expression that doesn't parse "
@@ -34,6 +37,9 @@ _FAMILIES = [
     ("E6", "Runtime / node", "Errors while executing or wiring the node "
      "(an input `@X` isn't connected, a runtime value went non-finite, a fused-chain or "
      "lazy-input problem, an OOM the node re-raised for ComfyUI to handle)."),
+    ("E9", "Tools", "Tool errors — building or preflighting a `.textool` bundle failed "
+     "(a fused-tool graphspec is malformed, or its stages don't compile together). Check the "
+     "tool's stages and manifest; the message names the stage that broke."),
     ("W7", "Warnings", "Non-fatal advisories (LANG-2). The program still compiles and "
      "runs; these flag likely mistakes — an unused variable or wired input, or a name "
      "that shadows a built-in or an outer-scope variable."),

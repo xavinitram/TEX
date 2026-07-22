@@ -2,6 +2,14 @@
 
 Every TEX diagnostic carries a stable `ENNNN` (error) or `WNNNN` (warning) code and links here. Codes are grouped by compiler/runtime phase (the first digit). The exact message is written for your specific program at the point of failure; this page explains the *class* and how to approach it. **This page is generated** (`tools/gen_error_codes.py`) — do not edit by hand.
 
+## Internal (`E0xxx`)
+
+Internal errors — a compiler phase raised without a structured diagnostic, so TEX synthesized a fallback (E0000) rather than surface a bare message. Rare and not your fault; please file an issue with the program that triggered it.
+
+### E0000
+
+Internal. See the message shown with the code for the specific cause and fix; the class is described above.
+
 ## Lexer (`E1xxx`)
 
 Tokenization errors — a character or literal the scanner can't read (bad number, unterminated string/comment, stray symbol).
@@ -302,6 +310,14 @@ Runtime / node. See the message shown with the code for the specific cause and f
 
 Runtime / node. See the message shown with the code for the specific cause and fix; the class is described above.
 
+## Tools (`E9xxx`)
+
+Tool errors — building or preflighting a `.textool` bundle failed (a fused-tool graphspec is malformed, or its stages don't compile together). Check the tool's stages and manifest; the message names the stage that broke.
+
+### E9001
+
+Tools. See the message shown with the code for the specific cause and fix; the class is described above.
+
 ## Warnings (`W7xxx`)
 
 Non-fatal advisories (LANG-2). The program still compiles and runs; these flag likely mistakes — an unused variable or wired input, or a name that shadows a built-in or an outer-scope variable.
@@ -319,5 +335,9 @@ Warnings. See the message shown with the code for the specific cause and fix; th
 Warnings. See the message shown with the code for the specific cause and fix; the class is described above.
 
 ### W7004
+
+Warnings. See the message shown with the code for the specific cause and fix; the class is described above.
+
+### W7005
 
 Warnings. See the message shown with the code for the specific cause and fix; the class is described above.
