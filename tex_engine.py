@@ -297,6 +297,13 @@ class CookResult:
     # inputs, or None unless a host supplied binding_meta. A host re-attaches these to the
     # egress buffers; the default ComfyUI path supplies no tags, so this stays None.
     out_meta: dict | None = None
+    # ROI-3 / v0.30: the `(x0, y0, w, h, W, H)` window this cook ACTUALLY narrowed to, or None
+    # when it ran whole-frame. A host cannot infer this from shapes — an ROI equal to the frame
+    # and a whole-frame fallback produce identically-shaped outputs, and `run_roi` supports
+    # per-dim-cropped broadcast outputs — so a viewport that blits at the window's size must be
+    # told. None on every fallback path (refused window, non-executable program, failed narrow,
+    # and the OOM ladder, which always returns whole-frame).
+    cooked_roi: tuple | None = None
 
 
 # ── ENG-6: zero-copy AI handoff (DLPack) ─────────────────────────────────────
@@ -583,23 +590,67 @@ def _run_cuda_graph(ctx: ExecContext):
     return out
 
 
+def _roi_codegen_exec(fp):
+    """An `exec_fn` for `tex_memory.run_roi` that serves the narrowed cook from the CODEGEN
+    tier instead of the tree-walking interpreter (v0.30 — the v0.27 deferral's reopen
+    condition, "thread the strip offset through the coordinate-env builder").
+
+    Safe because the pieces that make ROI correct live OUTSIDE the executor: `run_roi` narrows
+    the bindings and crops the result, and `_build_codegen_env(roi=...)` now offsets the
+    coordinate builtins exactly as `Interpreter._create_builtins` does — so codegen sees a
+    correct grid for the window. `_codegen_only_execute` self-falls-back to the interpreter
+    (forwarding `roi`) if the program is unsupported or emission fails, so this can only be a
+    speed choice, never a correctness one. Signature matches `Interpreter.execute`'s keywords;
+    `cancel`/`on_progress` are accepted and dropped (the compiled tiers have no yield points —
+    a cancel is honoured between region cooks, not inside one)."""
+    def _exec(program, bindings, type_map, *, device, latent_channel_count, output_names,
+              used_builtins, precision, roi, time_context, cancel=None, on_progress=None):
+        return _codegen_only_execute(
+            program, bindings, type_map, device, latent_channel_count, output_names,
+            used_builtins=used_builtins, precision=precision, fingerprint=fp,
+            time_context=time_context, roi=roi)
+    return _exec
+
+
+def _roi_codegen_enabled() -> bool:
+    """Whether an ROI cook routes through codegen. v0.30 ships this OFF by default: measured on
+    this box the codegen tier is not faster than the interpreter for the small windows an ROI
+    cook produces (both are launch-bound there), so the default keeps the tier the ROI-4 oracle
+    validates. `TEX_ROI_CODEGEN=1` turns it on — the A/B switch the reopen condition asks for,
+    and the lane a faster box (or a larger window) can re-measure without a code change."""
+    return os.environ.get("TEX_ROI_CODEGEN", "0") == "1"
+
+
 def _run_default(ctx: ExecContext):
     # ROI-3: cook only the requested sub-window (interpreter tier, flagged off — set only
     # when a host passed `roi=`, the program is ROI-executable, and TEX_ROI_EXEC is on). The
-    # narrow-cook-crop is bit-exact for pointwise/morphology, ~1 ulp for conv. Whole-frame on
-    # any run_roi error (never hard-fail the cook).
+    # narrow-cook-crop is bit-exact for pointwise/morphology, ~1 ulp for conv — and on CPU also
+    # ~1 ulp for NOISE, whose kernels are shape-dependent at the last ulp, which a noise
+    # derivative (`curl`) then amplifies by its 1/(2*eps) factor to ~3e-5 (measured; CUDA is
+    # exact for every class). See the table in CHANGELOG 0.30.0. Whole-frame on any run_roi
+    # error (never hard-fail the cook).
     if ctx.roi is not None and ctx.roi_plan is not None:
+        # Bind tier_trace OUTSIDE the try: it is imported function-locally per the SCC
+        # convention (see the F1 note below), and an import inside the try would leave the
+        # `except` branch's own record_roi raising NameError instead of reporting the failure.
+        from .tex_runtime import tier_trace
         try:
             from .tex_memory import run_roi
             return run_roi(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
                            ctx.device, ctx.latent_channel_count, ctx.output_names,
                            ctx.used_builtins, ctx.eff_precision, ctx.roi,
                            ctx.roi_plan.narrow, ctx.roi_plan.halo, ctx.time_context,
-                           cancel=ctx.cancel, on_progress=ctx.on_progress)
+                           cancel=ctx.cancel, on_progress=ctx.on_progress,
+                           exec_fn=(_roi_codegen_exec(ctx.fp) if _roi_codegen_enabled() else None))
         except CookCancelled:
             raise                       # SCHED-3: a cancel aborts — never fall back to whole-frame
         except Exception as _roi_exc:
-            logger.warning("[TEX] ROI cook failed (%s); running whole-frame.", _roi_exc)
+            # A DETERMINISTIC failure here re-cooks whole-frame on every frame of a pan (a
+            # wasted partial + a full cook + a log line), so make the reason visible. Format
+            # once — this path is per-frame by construction.
+            _roi_why = f"roi cook failed: {_roi_exc}"
+            tier_trace.record_roi(None, _roi_why)
+            logger.warning("[TEX] %s; running whole-frame.", _roi_why)
     # UC-2: default-route an exact (fetch/conv) stencil through the codegen tier
     # (avg_pool2d/conv2d/unfold). _codegen_only_execute self-falls-back; the outer
     # guard covers env-build edge cases so this can never hard-fail the node.
@@ -959,7 +1010,8 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             latent_channel_count: int = 0, forgive_dead_refs: bool = False,
             debug_nan_highlight: bool = False, time_context: dict | None = None,
             max_outputs: int = MAX_OUTPUTS, disown: bool = True,
-            roi: tuple | None = None, want_lineage: bool = False,
+            roi: tuple | None = None, roi_exec: bool | None = None,
+            want_lineage: bool = False,
             upstream_keys: tuple = (), cancel=None, on_progress=None,
             binding_meta: dict | None = None) -> CookPlan:
     """Resolve everything a cook needs *without running it*: compile (or splice a fused
@@ -1189,18 +1241,66 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     # compiled tiers don't thread roi, so a would-be ROI cook that resolved to a compiled tier
     # simply runs whole-frame (same posture as tiling). Non-fused, non-latent, executable.
     roi_out = roi_plan_obj = None
+    _roi_why = None
     if roi is not None and tier_id == "default" and not fused_chain and not has_latent_input:
         from . import tex_roi as _tex_roi
-        if _tex_roi.roi_exec_enabled():
-            scalar_params = {n: v for n, v in bindings.items()
-                             if isinstance(v, (bool, int, float))}
-            _plan = _tex_roi.roi_plan(code, scalar_params)
-            if _plan.executable:
+        if not _tex_roi.roi_exec_enabled(roi_exec):
+            _roi_why = "roi not armed (pass roi_exec=True or set TEX_ROI_EXEC=1)"
+        else:
+            # Cheap ARITHMETIC validation only (no `image_wh`, so no binding scan): it rejects a
+            # malformed or whole-frame window before this cook pays for `roi_plan` and, more
+            # importantly, before the ROI fp32 clamp below drops an fp16-eligible cook out of
+            # fp16 for nothing. The EXTENT check (does (W,H) match the bindings?) needs the
+            # binding scans, so it lives in `run_roi` — which owns the crop arithmetic the
+            # check protects and is also reachable without this gate (the ROI-4 oracle calls
+            # it directly). One cheap check here, the authoritative one there.
+            if (_bad := _tex_roi.validate_roi(roi)):
+                _roi_why = f"roi refused: {_bad}"
+            # Rebind `roi` to a plain-int COPY the moment it is known good, so everything after
+            # this line — including the `cooked_roi` the host is handed — is the engine's own
+            # object. A viewport that recycles one mutable rect buffer per frame could otherwise
+            # mutate the window it just cooked, leaving `cooked_roi` naming a different rect
+            # than the patch covers; and a list in yielded a list out of a documented 6-tuple.
+            elif (roi := _tex_roi.canonical_roi(roi))[2:4] == roi[4:6]:
+                # POLICY, not validity, so it lives here rather than in the validator: a window
+                # covering the whole frame narrows nothing, yet arming it would still pay the
+                # plan, the narrow-cook-crop round trip and — the expensive part — the ROI fp32
+                # clamp below, dropping an fp16-eligible cook out of fp16 for byte-identical
+                # output. A zoom-to-fit viewport frame hits this every time.
+                _roi_why = "roi covers the whole frame (nothing to narrow)"
+            elif (_plan := _tex_roi.roi_plan(code, _scalar_params(bindings))).executable:
                 roi_out, roi_plan_obj = roi, _plan
-                # ROI is validated (oracle) at fp32 only, and the ~1-ulp conv slack the
-                # narrow-cook-crop leaves would scale up at fp16 — clamp the ROI cook to fp32
-                # (the same conservative posture as the compiled-tier / LATENT fp32 forces).
-                eff_precision = "fp32"
+                # An fp16 cook does not get a window. ROI is oracle-validated at fp32 ONLY, and
+                # the ~1-ulp conv slack narrow-cook-crop leaves would scale up at fp16 — so the
+                # window cannot be cooked at fp16. This used to clamp it to fp32 instead, which
+                # is conservative when it applies to a WHOLE cook (the compiled-tier / LATENT
+                # forces) but not here, because an ROI patch is half of a pair that has to
+                # match: the canvas it gets composited into came from a whole-frame cook that
+                # stayed fp16, so the two disagreed by an fp16 ulp — measured 1.05e-03 max, 47%
+                # of pixels past 1e-4, on the exact use case v0.30 exists for. Neither
+                # precision is safe, so decline the window and cook whole-frame at the
+                # precision that was asked for: one consistent answer, identical to v0.29.
+                # That is the whitelist posture — a missed optimisation, never a wrong pixel.
+                # A host that wants the ROI speedup asks for fp32 (what the viewport already
+                # does; PM-6 and the ROI benchmarks are fp32 rows).
+                if eff_precision != "fp32":
+                    roi_out = roi_plan_obj = None
+                    _roi_why = (f"roi declined: the cook is {eff_precision}"
+                                + (" (auto)" if auto_fp16 else "")
+                                + ", and ROI is only validated at fp32")
+            else:
+                _roi_why = ("roi declined: program is not ROI-executable "
+                            "(whole-image gather / unbounded reach)")
+    if roi is not None:
+        # `roi`, not a "was it still eligible" flag: a MALFORMED window used to null `roi` out
+        # here and so skipped this record entirely, leaving a host that sent a bad rect with no
+        # reason on the trace — the one case that most needs one.
+        # ONE record per cook that passed a window, and it records None even when ARMING: the
+        # slot means "this window was COOKED", not "a window was armed". Only the serve site
+        # (`run_roi`, after it has actually narrowed) may put a window there, so every path
+        # that arms but does not reach a narrowed cook — a compiled tier, an OOM ladder
+        # retry, an internal refusal — reports None without needing its own record.
+        tier_trace.record_roi(None, _roi_why or ("roi armed" if roi_out is not None else None))
     ctx = ExecContext(program, bindings, type_map, device, code,
                       latent_channel_count, output_names, used_builtins,
                       eff_precision, fp, fused_chain, fused_fp, time_context,
@@ -1445,6 +1545,12 @@ def run(plan: CookPlan) -> CookResult:
         if retried is None:
             raise
         raw_output = retried
+        if ctx.roi is not None:
+            # The OOM ladder ignores `ctx.roi` and always returns a WHOLE frame (run_tiled /
+            # run_tiled_halo). Whatever the failed ROI attempt left on the trace — including a
+            # window equal to the request — no longer describes this result, so say so.
+            from .tex_runtime import tier_trace as _tt
+            _tt.record_roi(None, "roi abandoned: OOM ladder returned a whole frame")
 
     # PR-LP2 safety net (C2): re-cook fp32 (and pin the auto decision) if an
     # auto->fp16 cook went non-finite. Extracted to a helper (C1-st) so the cook
@@ -1490,6 +1596,16 @@ def run(plan: CookPlan) -> CookResult:
     # the key and CookResult.precision match the pixels.
     lineage = _compute_lineage(plan, ctx, eff_precision, raw_output) if plan.want_lineage else None
 
+    # ROI-3 / v0.30: report what the cook actually narrowed to. Only an ARMED cook
+    # (`ctx.roi_plan is not None`) can have narrowed, so every declined path answers None
+    # without consulting anything; the armed path reads the window off the trace, where the
+    # decider wrote it (`run_roi` refuses → None; the ROI branch's failure → None). The import
+    # stays inside the guard so the default cook path pays nothing for this.
+    cooked_roi = None
+    if ctx.roi_plan is not None:
+        from .tex_runtime import tier_trace
+        cooked_roi = tier_trace.last_roi()[0]
+
     _report_progress(ctx.on_progress, "tier", 1.0)   # SCHED-3: the cook produced a frame
     return CookResult(
         outputs=raw_output, output_names=ctx.output_names, assigned=plan.assigned,
@@ -1506,6 +1622,7 @@ def run(plan: CookPlan) -> CookResult:
             {(_strip_user_prefix(n) if ctx.fused_chain else n)   # de-prefix ONLY on a fused chain
              for n, v in ctx.bindings.items() if isinstance(v, torch.Tensor)}  # (mirror the E6003 site)
             if ctx.binding_meta else None),
+        cooked_roi=cooked_roi,
     )
 
 

@@ -24,6 +24,7 @@ is the display surface, and its transport (a raw-RGBA blit to a <canvas>) is del
 out of the cook budget.
 """
 import argparse
+import hashlib
 import os
 import statistics
 import sys
@@ -37,7 +38,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(_HERE)))   # .../custom_nodes
 
 import torch
-from TEX_Wrangle import tex_engine, tex_fusion, tex_results, tex_marshalling, tex_api
+from TEX_Wrangle import tex_engine, tex_fusion, tex_results, tex_marshalling, tex_api, tex_roi
 from TEX_Wrangle.tex_runtime.host import NullHostServices, CookCancelled
 
 
@@ -69,6 +70,263 @@ _SPEC = {"schema": 1,
          "stages": [{"code": _GRADE, "image_input": "IN", "params": {}},
                     {"code": _BLUR, "image_input": "IN", "params": {}}],
          "terminal_image_input": "IN"}
+
+
+# ── v0.30 rung-2: the ROI viewport comp ──────────────────────────────────────────────────
+# PM-6 asks for "a 10-node comp at proxy resolution with ROI cooks + cache hits at interactive
+# rate". These ten stages are a real grade/filter chain, not padding — each is a node a
+# compositor would actually ship, and each is ROI-EXECUTABLE (pointwise, or a direct-tensor
+# halo op). They are cooked UNFUSED, one engine cook per stage, for two reasons the roadmap
+# makes structural: `roi=` is refused on a fused chain (tex_engine's gate), and fusion splices
+# stages behind local variables, which blocks the reach analysis outright. Unfused per-stage
+# cooking is also what gives SCHED-2 a per-region graph and CACHE-2 a per-stage cache point.
+_WHOLE_FRAME = 1 << 30   # "unbounded reach" — clamps to the whole frame in _needed_windows
+
+
+def _code_fp(code: str) -> str:
+    """A process-STABLE fingerprint for a stage's source."""
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
+
+_COMP_STAGES = [
+    ("exposure",   "@OUT = vec4(@IN.rgb * $exposure, 1.0);",                      {"exposure": 1.05}),
+    ("blackpoint", "@OUT = vec4(max(@IN.rgb - vec3($black), vec3(0.0)), 1.0);",    {"black": 0.02}),
+    ("gamma",      "@OUT = vec4(spow(@IN.rgb, vec3($gamma)), 1.0);",               {"gamma": 0.95}),
+    ("saturation", "float y = luma(@IN);\n"
+                   "@OUT = vec4(mix(vec3(y), @IN.rgb, $sat), 1.0);",               {"sat": 1.10}),
+    ("blur",       "@OUT = gauss_blur(@IN, $sigma);",                              {"sigma": 1.5}),
+    ("sharpen",    "@OUT = vec4(clamp(@IN.rgb + ($amount) * (@IN.rgb - gauss_blur(@IN, 2.0).rgb), "
+                   "vec3(0.0), vec3(1.0)), 1.0);",                                 {"amount": 0.6}),
+    ("tint",       "@OUT = vec4(@IN.rgb * vec3(1.0 + $tint, 1.0, 1.0 - $tint), 1.0);", {"tint": 0.03}),
+    ("contrast",   "@OUT = vec4((@IN.rgb - vec3(0.5)) * $contrast + vec3(0.5), 1.0);", {"contrast": 1.08}),
+    ("glow",       "@OUT = vec4(@IN.rgb + $glow * gauss_blur(@IN, 4.0).rgb, 1.0);", {"glow": 0.12}),
+    ("vignette",   "float d = distance(vec2(u, v), vec2(0.5, 0.5));\n"
+                   "@OUT = vec4(@IN.rgb * (1.0 - $strength * smoothstep(0.15, 0.75, d)), 1.0);",
+                                                                                   {"strength": 0.5}),
+]
+
+
+class RoiComp:
+    """The rung-2 viewport: a 10-stage comp where each stage keeps a persistent FULL-FRAME
+    canvas and an edit re-cooks only the viewport window through the dirty suffix.
+
+    Why canvases: a stage's ROI cook needs its input over `window ⊕ halo`, which the upstream
+    canvas already holds from the last full cook — so a window cook never has to widen back up
+    the chain. `run_roi` narrows the upstream canvas internally (we hand it the whole tensor and
+    the window), and the returned patch is pasted into this stage's canvas. Every stage result
+    is also keyed into a CACHE-2 `ResultCache` by a CACHE-1 lineage key that includes the window,
+    so revisiting a value the user already scrubbed to is a cache hit, not a cook."""
+
+    def __init__(self, res: int, device: str = DEVICE):
+        self.res, self.device = res, device
+        self.source = Host._make_source(res).to(device)
+        self.params = {n: dict(p) for n, _c, p in _COMP_STAGES}
+        self.cache = tex_results.ResultCache()          # CACHE-2, armed by THIS host
+        self.canvas: list = [None] * len(_COMP_STAGES)  # per-stage full-frame result
+        # Whether canvas[i] is a buffer WE own and may write in place. A cook output arrives
+        # frozen under ENG-12, so the first window write has to clone; after that it is ours.
+        self._owned: list = [False] * len(_COMP_STAGES)
+        self._halo_memo: dict = {}                      # (stage, params) -> reach; see _halo_of
+
+    def _key(self, i: int, roi, up_key):
+        """CACHE-1 lineage key for stage i, INCLUDING its upstream chain.
+
+        The upstream link is load-bearing, not decoration: without it a stage's identity is
+        blind to every edit above it, so changing `exposure` and re-cooking serves the stale
+        downstream frame from cache and reports a perfect match against the pre-edit image.
+        CACHE-1 exists to key a tensor input by its producer's key rather than its pixels —
+        this is that contract. The window is in the key too, so a window cook and a
+        whole-frame cook of the same params can never be served for each other.
+
+        `up_key` is stage i-1's whole-frame key, and it is REQUIRED (None only for i == 0).
+        Deriving it here by recursion instead makes the chain O(n^2) — 55 SHA-256 keys per
+        all-dirty frame at 10 stages, 210 at 20 — which `cook()` measured at 1.20 ms/frame,
+        more than the terminal scrub it is supposed to be timing. Keeping a recursive fallback
+        would leave that quadratic path alive as a silent possibility; a caller that forgets
+        now gets a TypeError instead."""
+        up = [] if i == 0 else [up_key]
+        return tex_results.lineage_key(
+            # sha256, not hash(): str hashing is PYTHONHASHSEED-salted, so a `hash()` key is
+            # not stable across processes — a trap this repo has hit before.
+            program_fp=f"{_COMP_STAGES[i][0]}:{_code_fp(_COMP_STAGES[i][1])}",
+            device=self.device, precision="fp32",
+            params={**{k: round(float(v), 4) for k, v in self.params[_COMP_STAGES[i][0]].items()},
+                    "_stage": i, "_roi": tuple(roi) if roi else None},
+            upstream=up,
+            canvas={"shape": [1, self.res, self.res, 4]})
+
+    def _cache_hit(self, key, win):
+        """A CACHE-2 entry for `key` as `(patch, served_window)`, or None meaning "cook it".
+
+        The window an entry covers is NOT necessarily `win`. A stage can DECLINE the window (a
+        gather, an unbounded reach, a refused rect) and hand back a WHOLE FRAME, which is then
+        stored under a key that names the window — so assuming `win` on a hit pastes a full
+        frame into a w×h slice and raises ("expanded size (120) must match 192").
+
+        It has to be re-derived here rather than stored beside the tensor: CACHE-2 holds
+        TENSORS, and `ResultCache.put` silently ignores anything else, so caching a
+        `(patch, served)` pair does not fail — it just never caches at all (measured: every
+        revisit re-cooked, and the hit-rate probe went to zero). Shape answers it exactly,
+        because the engine serves one of those two extents and nothing else. An entry matching
+        neither is not what this stage asked for, so distrust it and cook."""
+        patch = self.cache.get(key)
+        if patch is None:
+            return None
+        ph, pw = int(patch.shape[1]), int(patch.shape[2])
+        if (pw, ph) == (self.res, self.res):
+            return patch, None                             # a whole-frame result (or a decline)
+        if win is not None and (pw, ph) == (win[2], win[3]):
+            return patch, win
+        return None
+
+    def _halo_of(self, i: int) -> int:
+        """The neighbour reach stage `i` reads, from the same ROI-1 descriptors the engine uses.
+
+        A NON-EXECUTABLE stage reports `halo=0`, which is the opposite of what it means: it has
+        unbounded reach (a gather), so a consumer must widen to the whole frame, not to nothing.
+        Answering 0 there would under-grow the upstream window and leave exactly the stale ring
+        `_needed_windows` exists to prevent — the whitelist posture ("unknown → whole image")
+        inverted. Memoized per (stage, params) because a scrub changes params every frame and
+        `roi_plan`'s own memo keys on them, so an un-memoized call re-parses inside the loop
+        (measured 0.431 ms/frame across a 10-stage comp)."""
+        key = (i, tuple(sorted(self.params[_COMP_STAGES[i][0]].items())))
+        hit = self._halo_memo.get(key)
+        if hit is None:
+            plan = tex_roi.roi_plan(_COMP_STAGES[i][1], self.params[_COMP_STAGES[i][0]])
+            hit = self._halo_memo[key] = (int(plan.halo) if plan.executable else _WHOLE_FRAME)
+        return hit
+
+    def _needed_windows(self, roi, dirty_from: int) -> list:
+        """The window each dirty stage must cook so the FINAL window is correct.
+
+        Patching only the requested rect is wrong the moment a downstream stage has a halo: it
+        reads a ring of neighbours just outside the patch, and that ring still holds pre-edit
+        pixels. So walk the suffix BACKWARDS, growing the window by each consumer's halo and
+        clamping to the frame — the same `ROI ⊕ halo` composition `run_roi` does within one
+        stage, lifted to the chain. Measured before this: stage-5 sharpen was wrong over
+        2157 px and stage-9 vignette over 3987 px on any upstream edit."""
+        last = len(_COMP_STAGES) - 1
+        need = [None] * len(_COMP_STAGES)
+        need[last] = roi
+        for i in range(last - 1, dirty_from - 1, -1):
+            x0, y0, w, h, W, H = need[i + 1]
+            pad = self._halo_of(i + 1)
+            nx0, ny0 = max(0, x0 - pad), max(0, y0 - pad)
+            nx1, ny1 = min(W, x0 + w + pad), min(H, y0 + h + pad)
+            need[i] = (nx0, ny0, nx1 - nx0, ny1 - ny0, W, H)
+        return need
+
+    def cook(self, roi=None, dirty_from: int = 0, cancel=None, use_cache: bool = True):
+        """Cook stages `dirty_from..end`, over `roi` when given. Returns (frame, ms, hits).
+
+        `use_cache=False` forces every dirty stage to actually cook — the honest setting for a
+        benchmark row that claims to measure an all-dirty recook."""
+        t0 = time.perf_counter()
+        hits = 0
+        # A window cook writes INTO an existing canvas, so every stage must already hold one.
+        # Priming here (rather than seeding mid-loop) keeps the invariant in one place: a
+        # mid-loop seed could not work anyway, since stage i's input IS canvas[i-1].
+        if roi is not None and any(c is None for c in self.canvas):
+            self.cook(None, 0, cancel=cancel, use_cache=use_cache)
+        need = self._needed_windows(roi, dirty_from) if roi is not None else None
+        up_key = None                                      # stage i-1's whole-frame key
+        for i, (name, code, _defaults) in enumerate(_COMP_STAGES):
+            win = need[i] if need is not None else None
+            key = None
+            if use_cache:
+                # The whole-frame key is what stage i+1 links to, so it is carried forward even
+                # for a clean-prefix stage that never cooks — hence before any `continue`. With
+                # `use_cache=False` nothing reads a key, and hashing one anyway put 1.20 ms of
+                # SHA-256 per frame inside the all-dirty rows that claim to time cooking.
+                prev_key, up_key = up_key, self._key(i, None, up_key)
+                key = up_key if win is None else self._key(i, win, prev_key)
+            if i < dirty_from and self.canvas[i] is not None:
+                hits += 1
+                continue                                   # clean prefix: the canvas stands
+            hit = self._cache_hit(key, win) if use_cache else None
+            src = self.source if i == 0 else self.canvas[i - 1]
+            if hit is not None:
+                patch, served = hit
+                hits += 1
+            else:
+                res = tex_engine.cook(code, {"IN": src, **self.params[name]},
+                                      device_mode=self.device, precision="fp32",
+                                      roi=win, roi_exec=win is not None, cancel=cancel)
+                patch = res.outputs["OUT"]
+                # A stage can DECLINE the window (a gather, an unbounded reach, a refused
+                # rect) and hand back a whole frame. `cooked_roi` is how the engine says so —
+                # ignoring it and pasting a full-frame tensor into a window is a crash, which
+                # is exactly what this demo did before.
+                served = res.cooked_roi
+                if use_cache:
+                    self.cache.put(key, patch, canvas={"shape": list(patch.shape)})
+            if served is None:
+                # A whole-frame result REPLACES the canvas, and it arrives frozen (ENG-12) —
+                # a cook output, or a cache entry other stages may still be holding. Take it
+                # as-is and remember we do not own it; copying here would charge every
+                # whole-frame cook for a write that may never come (measured: 10 full-frame
+                # clones per frame, +2.8 ms at 1920^2, on a row that never opens a window).
+                self.canvas[i], self._owned[i] = patch, False
+            else:
+                if not self._owned[i]:
+                    # First in-place write to this canvas: buy our own buffer now. Once, not
+                    # per frame — the next window cook writes straight into it.
+                    self.canvas[i], self._owned[i] = self.canvas[i].clone(), True
+                x0, y0, w, h, _W, _H = served
+                self.canvas[i][:, y0:y0 + h, x0:x0 + w] = patch   # our buffer: write in place
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+        return self.canvas[-1], (time.perf_counter() - t0) * 1000.0, hits
+
+
+def bench_pm6(res: int = 1024, roi_side: int = 512, frames: int = 12) -> dict:
+    """PM-6: scrub a 10-node comp at proxy resolution with ROI cooks + cache hits.
+
+    Three rows, which together are the claim: an all-dirty WHOLE-FRAME recook (what a host
+    without ROI pays), an all-dirty ROI recook (the window win), and the interactive case — the
+    user drags the LAST node's slider, so the nine upstream canvases stand and only the terminal
+    stage cooks its window. HONEST SCOPE: PM-6 names the sm_120 box; this is measured on
+    whatever card is present and must be reported as such."""
+    comp = RoiComp(res)
+    comp.cook(None, 0)                                     # prime every canvas (cold)
+    span = max(1, res - roi_side)
+
+    def _med(fn):
+        fn(-1)          # warm on a value the measured range never repeats
+        return round(statistics.median([_timed(fn, i) for i in range(frames)]), 3)
+
+    def _timed(fn, i):
+        t = time.perf_counter(); fn(i); return (time.perf_counter() - t) * 1000.0
+
+    # The two "all-dirty" rows pass use_cache=False so they genuinely cook all ten stages.
+    # With the cache on they were one engine cook plus nine CACHE-2 hits — about a tenth of
+    # the work their label claimed, which made the speedups a comparison between two
+    # equally-hollow rows.
+    def _whole_all(i):
+        comp.params["vignette"]["strength"] = 0.30 + i * 0.01
+        comp.cook(None, 0, use_cache=False)
+
+    def _roi_all(i):
+        comp.params["vignette"]["strength"] = 0.50 + i * 0.01
+        comp.cook((span // 2, span // 2, roi_side, roi_side, res, res), 0, use_cache=False)
+
+    def _roi_terminal(i):
+        # The interactive case: the user drags the LAST node's slider, so the nine upstream
+        # canvases stand and only the terminal stage cooks its window. The cache stays ON —
+        # serving a revisited value is part of what makes a scrub cheap.
+        comp.params["vignette"]["strength"] = 0.70 + i * 0.01
+        comp.cook((span // 2, span // 2, roi_side, roi_side, res, res), len(_COMP_STAGES) - 1)
+
+    out = {"stages": len(_COMP_STAGES), "res": res, "roi": roi_side,
+           "device": DEVICE,
+           "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+           "capability": ("sm_" + "".join(map(str, torch.cuda.get_device_capability(0))))
+                         if torch.cuda.is_available() else None,
+           "whole_all_ms": _med(_whole_all),
+           "roi_all_ms": _med(_roi_all),
+           "roi_terminal_ms": _med(_roi_terminal)}
+    out["roi_speedup"] = round(out["whole_all_ms"] / max(out["roi_all_ms"], 1e-9), 2)
+    out["terminal_speedup"] = round(out["whole_all_ms"] / max(out["roi_terminal_ms"], 1e-9), 2)
+    return out
 
 
 class Host:
@@ -230,10 +488,29 @@ def serve(host: Host, port: int) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="TEX standalone host demo (PORT-5)")
+    ap = argparse.ArgumentParser(description="TEX standalone host demo (PORT-5 / PM-6)")
     ap.add_argument("--bench", action="store_true", help="run only the PM-2 benchmark, no server")
+    ap.add_argument("--bench-pm6", action="store_true",
+                    help="run only the PM-6 ROI-viewport benchmark (10-node comp), no server")
+    ap.add_argument("--resolution", type=int, default=1024, help="PM-6 frame size (default 1024)")
+    ap.add_argument("--roi", type=int, default=512, help="PM-6 viewport window (default 512)")
     ap.add_argument("--port", type=int, default=8760)
     args = ap.parse_args()
+
+    if args.bench_pm6:
+        r = bench_pm6(res=args.resolution, roi_side=args.roi)
+        print(f"\n=== PM-6: {r['stages']}-node comp @ {r['res']}^2, ROI {r['roi']}^2, "
+              f"{r['capability'] or r['device']} ===")
+        print(f"  all-dirty WHOLE-FRAME : {r['whole_all_ms']:8.2f} ms/frame")
+        print(f"  all-dirty ROI         : {r['roi_all_ms']:8.2f} ms/frame   ({r['roi_speedup']}x)")
+        print(f"  terminal-knob scrub   : {r['roi_terminal_ms']:8.2f} ms/frame   "
+              f"({r['terminal_speedup']}x)")
+        print(f"  (the two all-dirty rows cook all {r['stages']} stages; the scrub row reuses "
+              f"the {r['stages'] - 1} clean upstream canvases)")
+        if r["capability"]:
+            print(f"  NOTE: measured on {r['capability']} — PM-6 names the sm_120 box.")
+        sys.exit(0)
+
     ok = run_benchmark()
     if args.bench:
         sys.exit(0 if ok else 1)

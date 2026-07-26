@@ -704,6 +704,38 @@ def main():
     test_spatial_scalar_channel_access(r)
     test_pm5_governor_soak(r)
 
+    # v0.30 — First viewer
+    from test_v030_phase1 import (
+        test_v030_roi_host_optin,
+        test_v030_roi_malformed_windows,
+        test_v030_roi_extent_per_binding,
+        test_v030_roi_broadcast_anchor,
+        test_v030_roi_refusals_stay_off_the_default_path,
+        test_v030_roi_window_is_copied_and_coerced,
+        test_v030_roi_never_desyncs_from_its_canvas,
+        test_v030_roi_accuracy_envelope,
+        test_v030_roi_folded_binding_still_narrows,
+        test_v030_comfy_never_arms_roi,
+        test_v030_roi_codegen_route_equivalence,
+        test_v030_pm6_roi_viewport,
+        test_v030_codegen_roi_defaults_off,
+        test_v030_nightly_wires_roi_oracle,
+    )
+    test_v030_roi_host_optin(r)
+    test_v030_roi_malformed_windows(r)
+    test_v030_roi_extent_per_binding(r)
+    test_v030_roi_broadcast_anchor(r)
+    test_v030_roi_refusals_stay_off_the_default_path(r)
+    test_v030_roi_window_is_copied_and_coerced(r)
+    test_v030_roi_never_desyncs_from_its_canvas(r)
+    test_v030_roi_accuracy_envelope(r)
+    test_v030_roi_folded_binding_still_narrows(r)
+    test_v030_comfy_never_arms_roi(r)
+    test_v030_roi_codegen_route_equivalence(r)
+    test_v030_pm6_roi_viewport(r)
+    test_v030_codegen_roi_defaults_off(r)
+    test_v030_nightly_wires_roi_oracle(r)
+
     success = r.summary()
     return 0 if success else 1
 

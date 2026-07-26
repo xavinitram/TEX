@@ -8,6 +8,7 @@ models. `free_tensor_caches` drops every module-level tensor cache TEX holds.
 """
 from __future__ import annotations
 
+import logging
 import os
 from collections import OrderedDict
 
@@ -21,6 +22,8 @@ from .tex_compiler.ast_nodes import (
     iter_child_nodes as _iter_children,
 )
 from .tex_compiler.types import TEXType, TYPE_NAME_MAP
+
+logger = logging.getLogger("TEX")
 
 # M-4: stdlib functions whose output at a pixel depends on OTHER pixels (or the
 # whole image), so a program that calls them cannot be split into horizontal
@@ -781,7 +784,8 @@ def run_batch_strips(interp, program, bindings, type_map, device, latent_channel
 
 def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
             output_names, used_builtins, precision, roi, narrow_names, halo: int,
-            time_context: dict | None = None, cancel=None, on_progress=None) -> dict:
+            time_context: dict | None = None, cancel=None, on_progress=None,
+            exec_fn=None, record_trace: bool = True) -> dict:
     """ROI-3: cook only the output window `roi=(x0, y0, w, h, W, H)` of a full W×H image
     (the 2-D generalization of `run_tiled`'s strip). The cook region is `ROI ⊕ halo`, clamped
     to the image; `narrow_names` bindings are sliced to it (a zero-copy view, per spatial dim
@@ -800,24 +804,92 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
     plan — already excludes it; this is belt-and-braces)."""
     x0, y0, w, h, W, H = roi
 
-    def _whole():
+    # This function DECIDES whether the window is really cooked, so it RECORDS: every refusal
+    # funnels through `_whole(reason)`, and the engine reads the answer back off the trace for
+    # `CookResult.cooked_roi` rather than re-deriving it from output shapes. Callers outside the
+    # engine (the ROI-4 oracle, run_tiled_halo) get the same protection.
+    # `record_trace=False` for an INTERNAL strip cook: `run_tiled_halo` drives this function
+    # once per strip to assemble a WHOLE frame, and each strip's window is not the host's
+    # request. Recording them left the last strip's rect on the trace, so a whole-frame
+    # halo-tiled cook reported a `cooked_roi` it never served.
+    from .tex_runtime import tier_trace as _tier_trace
+
+    def _mark(window, reason):
+        if record_trace:
+            _tier_trace.record_roi(window, reason)
+
+    def _whole(reason):
+        _mark(None, reason)
         return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
                            output_names, used_builtins, precision, time_context,
                            cancel, on_progress)
 
     if latent_channel_count:
-        return _whole()
+        return _whole("roi declined: LATENT narrows the wrong axis")
+    # v0.30: refuse a MALFORMED window HERE, beside the other belt-and-braces refusals, not only
+    # at the engine's arming gate. The wrong-pixel arithmetic is local to this function (the
+    # `lx`/`ly` crop offsets below go negative for a negative origin, and an overhanging window
+    # silently clips), and this function has callers that never pass through that gate:
+    # `run_tiled_halo` (correct by construction, not by invariant) and the ROI-4 oracle, which
+    # drives it directly — so without this the nightly differential lane cannot see the bug
+    # class at all. The extent check needs the shared dims (both skip broadcast singletons and
+    # return None when there is no single answer); the engine gate does the cheap arithmetic
+    # half without them.
+    from .tex_roi import validate_roi as _validate_roi
+    _bad_roi = _validate_roi(roi)                       # arithmetic: bounds, signs, arity, ints
+    if _bad_roi is not None:
+        return _whole(f"roi refused in run_roi: {_bad_roi}")
+    # EXTENT, per binding and per dim. A shared-size lookup is the wrong instrument here:
+    # `_shared_dim_size` answers None whenever an axis has zero or several distinct
+    # non-singleton sizes, and folding that into one all-or-nothing test drops BOTH axes'
+    # checks — the exact failure `validate_roi`'s docstring warns about. Measured: a window
+    # requesting 4x4 of a claimed 8x4 image came back 32 wide with `cooked_roi` reporting
+    # success, because the 32-wide binding was never narrowed (`shape[2] != W`) and so passed
+    # through whole. Mirror the narrow instead: every spatial binding must be full-size or a
+    # broadcast singleton in each dim, or the window does not describe this input.
+    # The FIRST spatial binding is also the interpreter's grid anchor, so capture it in the same
+    # pass rather than re-walking the dict for it below.
+    _anchor = None
+    for _n, _v in bindings.items():
+        if isinstance(_v, torch.Tensor) and _v.dim() >= 3:
+            _bh, _bw = int(_v.shape[1]), int(_v.shape[2])
+            if _bw not in (1, W) or _bh not in (1, H):
+                return _whole(f"roi refused in run_roi: window says the image is {W}x{H} "
+                              f"but binding @{_n} is {_bw}x{_bh}")
+            if _anchor is None:
+                _anchor = (_bw, _bh)
     # No spatial binding to anchor the shape → a purely generative program (no image input).
     # The whole-frame cook of such a program has NO spatial grid (scalar mode), so cooking an
     # ROI would fabricate a gradient the whole cook never produces — cook whole-frame instead.
-    if not any(isinstance(v, torch.Tensor) and v.dim() >= 3 for v in bindings.values()):
-        return _whole()
+    if _anchor is None:
+        return _whole("roi declined: no spatial binding to anchor the window")
+    # …and no VALID anchor is the same refusal. `Interpreter._determine_spatial_shape` sizes the
+    # whole-frame grid from the FIRST spatial binding *including broadcast singletons*, so with a
+    # `[B,1,W,C]` strip bound first the whole-frame cook collapses `v`/`iy`/`ih` to one row. The
+    # ROI cook is the CORRECT one there, which means the two disagree (measured maxdiff 0.60) and
+    # `cooked_roi` would report success on a window that does not match its own whole-frame cook.
+    # Refusing is the conservative half: the caller keeps v0.29's answer, right or wrong, instead
+    # of getting two different ones. The root cause is a default-path pixel change in
+    # `_determine_spatial_shape` (a consensus extent, not first-wins) and ships on its own.
+    # ...and only for a HOST's window (`record_trace`), never for an internal strip cook.
+    # `run_tiled_halo` drives this function per strip to assemble a WHOLE frame on the OOM
+    # ladder, and there is no second answer for a host to disagree with — the strip IS the
+    # whole-frame path. Applying the refusal there sent every strip to `_whole()`, i.e. the
+    # collapsed-grid cook, which then raises: measured, a singleton-first binding turned a
+    # working memory-bounded cook into `RuntimeError: expanded size (1) must match 96` on the
+    # DEFAULT path (no roi, no roi_exec). Strips keep v0.29's behaviour exactly.
+    # The extent loop already passed, so every spatial dim is full-size or 1 — this is precisely
+    # "the anchor has a broadcast singleton".
+    if record_trace and _anchor != (W, H):
+        return _whole(f"roi declined: the anchor binding is {_anchor[0]}x{_anchor[1]}, not the "
+                      f"{W}x{H} the window describes — the whole-frame grid would be sized off "
+                      f"a broadcast singleton")
     # Cook region = ROI ⊕ halo, clamped to the image.
     cx0, cy0 = max(0, x0 - halo), max(0, y0 - halo)
     cx1, cy1 = min(W, x0 + w + halo), min(H, y0 + h + halo)
     cw, ch = cx1 - cx0, cy1 - cy0
     if cw <= 0 or ch <= 0:
-        return _whole()
+        return _whole(f"roi declined: degenerate cook region {cw}x{ch}")
 
     cook_bindings = {}
     for name, v in bindings.items():
@@ -830,12 +902,25 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
                 v = v.narrow(2, cx0, cw)
         cook_bindings[name] = v
 
-    res = interp.execute(program, cook_bindings, type_map, device=device,
-                         latent_channel_count=latent_channel_count,
-                         output_names=output_names, used_builtins=used_builtins,
-                         precision=precision, roi=(cx0, cy0, cw, ch, W, H),
-                         time_context=time_context,
-                         cancel=cancel, on_progress=on_progress)
+    # v0.30 (the v0.27 deferral's reopen condition): the narrowing and the crop-back are
+    # OUTSIDE the executor, so any tier that accepts the cook-region window can serve here —
+    # `exec_fn` lets the engine route a narrowed cook through codegen instead of the
+    # interpreter. Default (None) is the interpreter, so every existing caller is unchanged.
+    _exec = exec_fn if exec_fn is not None else interp.execute
+    _cancel_check(cancel)                   # SCHED-3: abort a stale window before cooking it
+    res = _exec(program, cook_bindings, type_map, device=device,
+                latent_channel_count=latent_channel_count,
+                output_names=output_names, used_builtins=used_builtins,
+                precision=precision, roi=(cx0, cy0, cw, ch, W, H),
+                time_context=time_context,
+                cancel=cancel, on_progress=on_progress)
+    # …and again after. The interpreter honours `cancel` at every top-level statement, but an
+    # `exec_fn` need not: the codegen adapter compiles the whole program to one flat function,
+    # so under TEX_ROI_CODEGEN=1 the ONLY poll an ROI cook performed was run()'s yield-A before
+    # the tier started, and a cancel raised at any later point was ignored — the cook ran to
+    # completion and returned a frame. Measured: trip-on-check-2/3/5 all COMPLETED with the flag
+    # on and aborted with it off. Bracketing here restores the abort for any executor.
+    _cancel_check(cancel)
 
     # Crop each cook-region output to the ROI sub-window, PER SPATIAL DIM independently
     # (mirroring the per-dim narrow): an output can legitimately be full in one spatial dim
@@ -851,6 +936,31 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
             if val.shape[2] == cw:
                 val = val[:, :, lx:lx + w]
         outputs[name] = val   # scalar / string / genuinely-broadcast dims pass through
+    # POSTCONDITION, and the last line of defence for the whole feature: `cooked_roi` must never
+    # be able to name a window the outputs do not actually have. Everything above is an
+    # ANALYSIS — the plan says which bindings narrow, the loops check the ones it named — and an
+    # analysis that is merely incomplete produced exactly this: a binding folding had dropped
+    # from the plan passed through whole, the output came back at the FULL frame extent, and
+    # `_mark(roi, None)` still reported the window as served. The host then blitted a 48x64
+    # tensor into a 1x1 slice. Checking the result costs one shape read per output and does not
+    # care WHY the extent is wrong, so it also covers the next analysis gap.
+    for name, val in outputs.items():
+        if isinstance(val, torch.Tensor) and val.dim() >= 3:
+            if val.shape[1] not in (1, h) or val.shape[2] not in (1, w):
+                return _whole(f"roi abandoned: output @{name} came back "
+                              f"{int(val.shape[2])}x{int(val.shape[1])}, not the {w}x{h} window")
+    # `debug_print` probes indexed the WINDOW-local tensor while reporting the absolute pixel
+    # the user asked for, so a probe at (40,40) under a window at (32,32) silently reported the
+    # pixel at (47,47) under the label and coordinates of (40,40) — a debugging tool that lies
+    # is worse than one that is quiet. Dropping them is the honest minimum: a narrowed cook
+    # reports NO probe rather than a wrong one. (Reporting the right one means threading the
+    # cook-region origin down to the probe site so it can rebase and skip pixels outside the
+    # window; that is the useful behaviour for a viewport and is left for the ROI HUD work.)
+    if record_trace and _tier_trace.get_probes():
+        _tier_trace.clear_probes()
+        logger.warning("[TEX] debug_print is suppressed under an roi= cook "
+                       "(the probe would name an absolute pixel it did not read).")
+    _mark(roi, None)                    # served: this is what CookResult.cooked_roi reports
     return outputs
 
 
@@ -904,7 +1014,11 @@ def run_tiled_halo(interp, program, bindings, type_map, device, latent_channel_c
         strip = run_roi(interp, program, bindings, type_map, device, latent_channel_count,
                         output_names, used_builtins, precision,
                         (0, y0, W_total, y1 - y0, W_total, H_total), narrow_names, halo,
-                        time_context, cancel=cancel)
+                        time_context, cancel=cancel,
+                        # These strips assemble a WHOLE frame; they are not the host's window.
+                        # Recording them would leave the last strip's rect on the trace and
+                        # make `CookResult.cooked_roi` claim a window never requested.
+                        record_trace=False)
         for name, so in strip.items():
             if isinstance(so, torch.Tensor) and so.dim() >= 3 and so.shape[1] == (y1 - y0):
                 buf = outputs.get(name)

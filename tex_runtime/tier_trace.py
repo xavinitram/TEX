@@ -83,6 +83,23 @@ def last_precision():
     return getattr(_local, "precision", None)
 
 
+def record_roi(cooked_roi, reason=None):
+    """ROI-3 / v0.30: record whether this cook narrowed to a sub-window, and why not.
+
+    `cooked_roi` is the `(x0, y0, w, h, W, H)` actually cooked, or None when the cook ran
+    whole-frame. v0.30 makes `roi=` a production path, so an armed-but-declined ROI must not
+    be silent: a refused window (malformed), a non-executable program (a gather), and a
+    fallback after a failed narrow each land here with a reason — the same
+    "never-silent decision" discipline as `record_precision`."""
+    _local.roi = (cooked_roi, reason)
+
+
+def last_roi():
+    """(cooked_roi, reason) for the last cook on this thread — `(None, None)` if never
+    recorded, so a consumer can unpack unconditionally."""
+    return getattr(_local, "roi", None) or (None, None)
+
+
 def record_probe(label, value, x, y):
     """LX-5: append a debug_print value-at-pixel probe for this cook (drained by
     execute() into the same ui= payload as the tier facts)."""
@@ -109,3 +126,4 @@ def reset():
     _local.last = None
     _local.precision = None
     _local.probes = []
+    _local.roi = None          # ROI-3: else CookResult.cooked_roi could read a PRIOR cook's window

@@ -490,15 +490,22 @@ def test_roi3_engine_integration(r: SubTestResult):
         r.ok("engine: flag ON non-executable (gather) → whole frame") \
             if tuple(ng.shape) == (1, H, W, 4) else r.fail("engine ON non-exec", f"shape {tuple(ng.shape)}")
 
-        # (4) the ROI path is clamped to fp32 even when precision=fp16 (the ~1-ulp conv slack
-        #     would scale at fp16, and the oracle only validates fp32).
+        # (4) an fp16 cook gets NO window — it is declined, and the cook runs whole-frame at
+        #     fp16. Through v0.29 this CLAMPED the window to fp32 instead (the oracle validates
+        #     ROI at fp32 only, and the ~1-ulp conv slack would scale at fp16). v0.30 dropped
+        #     the clamp: a clamp is conservative for a whole cook, but an ROI patch is half of a
+        #     matched pair, and the canvas it composites into came from a whole-frame cook that
+        #     stayed fp16 — so the pair disagreed by an fp16 ulp (measured 1.05e-03 max, 47% of
+        #     pixels past 1e-4, CUDA 1024^2). Declining keeps one consistent answer.
         code = "@OUT = gauss_blur(@A, 2.0);"
-        full = _full(code, {"A": A})
+        full16 = _full(code, {"A": A}, precision="fp16")
         got16 = _roi(code, {"A": A}, precision="fp16")
-        md = (full[:, y0:y0 + h, x0:x0 + w].float() - got16.float()).abs().max().item() \
-            if tuple(got16.shape) == (1, h, w, 4) else 9.9
-        r.ok(f"engine: precision=fp16 ROI cook clamped to fp32 (maxdiff {md:.1e})") \
-            if md < _TOL else r.fail("engine fp16 clamp", f"shape {tuple(got16.shape)} maxdiff {md:.2e}")
+        md = (full16.float() - got16.float()).abs().max().item() \
+            if tuple(got16.shape) == tuple(full16.shape) else 9.9
+        r.ok(f"engine: precision=fp16 declines the window, cooks whole-frame fp16 "
+             f"(maxdiff {md:.1e})") \
+            if md < _TOL else r.fail("engine fp16 decline",
+                                     f"shape {tuple(got16.shape)} maxdiff {md:.2e}")
     except Exception as e:
         r.fail("ROI-3 engine integration", f"{type(e).__name__}: {e}")
     finally:

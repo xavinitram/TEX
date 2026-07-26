@@ -5,6 +5,151 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] - 2026-07-26
+
+**First viewer** — ROI execution stops being dormant. `roi=` becomes a production path a host
+can arm per cook, the engine grows an ROI viewport in `examples/host_demo.py`, and the codegen
+ROI route the v0.27 deferral asked for is built, proven bit-exact, measured — and shipped off,
+because on this hardware it is slower. All numbers below are **sm_75** (RTX 2080 SUPER, no
+Triton); PM-6 names the sm_120 box, so these are not a restatement of that claim.
+
+### The default cook path is unchanged (invariant #7)
+Measured, not asserted: an interleaved A/B of the DEFAULT path (no `roi`, no `roi_exec`) against
+a `HEAD` worktree, 10 programs x 3 reps at 512², CUDA-synchronized — **geomean 0.994 (CPU) /
+1.001 (CUDA)**, with every CUDA row inside ±1%. The whole ROI gate lives behind
+`if roi is not None`, so a ComfyUI cook never enters it.
+
+### The ROI flag flip (per cook, not per process)
+- **`cook(roi=…, roi_exec=True)`** arms the sub-window path for ONE cook. Deliberately not a
+  new global default: a host wants an ROI viewport cook and a whole-frame final render in the
+  same process, which one env var cannot express. `TEX_ROI_EXEC` remains the CI/rollback
+  channel (`roi_exec=None`), and a cook that passes neither behaves exactly as v0.29 —
+  the ComfyUI node passes neither, pinned by a canary.
+- **Two silent-wrong-pixel bugs fixed.** An overhanging window (`roi=(28,28,10,10,32,32)` on a
+  32×32 input) returned a **4×4** result for a requested 10×10, and a negative origin returned
+  wrong pixels through a negative crop offset. Both now fall back to the whole frame,
+  bit-identically. Validation lives in `tex_memory.run_roi` — where the crop arithmetic is —
+  so the ROI-4 oracle, which calls it directly, can finally see the class.
+- **`CookResult.cooked_roi`** reports the window actually cooked (`None` on every fallback):
+  shapes alone are ambiguous, and a viewport must know what it got. `run_roi` records the
+  decision; `tier_trace.record_roi` is the channel, cleared by `reset()` like its siblings.
+- **The ROI-4 differential oracle now runs nightly.** Gate (a) of the flip's own verdict was
+  literally unsatisfiable before: the nightly ran only the TST-1 interp↔codegen fuzzer.
+- ROI at 256²-of-1024²: **2.37× (CPU) / 3.25× (CUDA)** faster than whole-frame — sublinear
+  because a small window is launch-bound, which is exactly why proxy resolution matters.
+
+### What narrow-cook-crop actually guarantees (measured, by program class)
+The v1 claim was a flat "bit-exact". That holds for the class it was measured on and not for
+one it was not, so here is the measured envelope — an ROI cook vs the whole-frame cook's crop:
+
+| program class            | CPU        | CUDA |
+|--------------------------|------------|------|
+| pointwise / halo, no noise | **0.0** (bit-exact) | **0.0** |
+| `perlin` (and noise generally) | 2.98e-08 (1 ulp) | 0.0 |
+| `curl` — a noise *derivative* | 2.98e-05 | 0.0 |
+
+torch's CPU kernels are **shape-dependent at the last ulp** (the vectorized body and the
+scalar tail are different code paths), so a narrowed cook can differ from the whole-frame crop
+with no spatial reach at all; the differing pixels are always the narrowed tensor's tail, and a
+window that leaves no tail is exact. `curl` amplifies that ulp by its own centred-difference
+factor of 1/(2·ε) = 500. Pinned as a test per class, so the envelope regresses loudly instead
+of surfacing as a viewport seam. **The ROI-4 nightly oracle does not yet generate noise calls**
+— covering this class needs a per-class tolerance, and is recorded as follow-up rather than
+silently widening the oracle's global 1e-5.
+
+### Fixed before tagging (found by an adversarial hunt over the v0.30 diff)
+- **A `$param`-folded-away binding was passed WHOLE into a narrowed cook** — the worst of the
+  batch. `roi_plan` folds `$params` before tallying binding reads, so `mix(@A, @B, $k)` at
+  `k=0.0` folded to `@A` and `@B` never entered the plan's `narrow` set; the engine does *not*
+  fold `$params` (they are runtime bindings, and the compile cache is keyed on their types),
+  so the program that ran still read `@B` at full extent. A (5,5,1,1) window of a 64×48 image
+  came back as the **whole frame while `cooked_roi` reported it served**, and the viewport
+  blitting that raised. Fixed at the source (the plan now includes folded-away bindings) and
+  backstopped by a postcondition: `run_roi` verifies every output's extent before marking a
+  window served, so `cooked_roi` can never name a window the outputs do not have.
+- **An fp16 cook no longer gets a window.** It used to be clamped to fp32, which is
+  conservative for a whole cook but not for an ROI patch — the canvas it composites into came
+  from a whole-frame cook that stayed fp16, so the pair disagreed by an fp16 ulp (1.05e-03
+  max, 47% of pixels past 1e-4, CUDA 1024², `precision="auto"`). The window is declined
+  instead: one consistent answer, identical to v0.29.
+- **`cooked_roi` is the engine's own tuple**, not the caller's object. A viewport that recycles
+  one mutable rect buffer per frame could mutate the window it had already been told was
+  cooked; a `list` in also yielded a `list` out of a documented 6-tuple.
+- **`roi_exec="0"` / `"false"` / `"off"` now disarm** instead of arming — a string is truthy,
+  so every spelling of the documented kill switch turned the path ON.
+- **Any `__index__` integer is accepted** as a window coordinate: a host computing its viewport
+  with numpy hands over `numpy.int64`, which is not an `int`, and those windows were silently
+  refused — the feature quietly did nothing for exactly the callers most likely to use it.
+- **`debug_print` is suppressed under an ROI cook** (with a warning) instead of reporting the
+  value of a pixel it did not read under the coordinates of one it did not cook.
+- **A cancel token is honoured on the codegen ROI lane.** With `TEX_ROI_CODEGEN=1` the only
+  poll a window cook performed was the one before the tier started, so a cancel raised later
+  was ignored and the cook ran to completion.
+- **The OOM ladder no longer inherits an ROI refusal.** `run_tiled_halo` drives `run_roi` per
+  strip to assemble a whole frame; a v0.30 refusal added for hosts fired there too and turned
+  a working memory-bounded cook into a `RuntimeError` on the **default** path (no `roi`, no
+  `roi_exec`). Now pinned by a seam-exactness test.
+
+### Codegen **ROI** routing — built, proven, measured, defaulted OFF
+*(scope deviation, recorded: the roadmap item said "tiled/ROI". Only the **ROI** half is built.
+`run_tiled` / `run_tiled_halo` keep no `exec_fn` and `_build_codegen_env` takes no `tile=`, so a
+strip-tiled cook still runs on the interpreter. The measurement below is why the tile half was
+not chased: the ROI half it shares a mechanism with came back slower, so building the twin would
+add a second unused path. Reopens with the ROI half's reopen condition.)*
+- `roi=` now threads through **`_build_codegen_env`** (the v0.27 deferral's reopen condition,
+  "thread the strip offset through the coordinate-env builder"), `_codegen_only_execute`, and
+  both interpreter-fallback paths; `run_roi` gained an `exec_fn` seam. Coordinate builtins
+  mirror `Interpreter._create_builtins` exactly, with the window in every cache key.
+- A differential oracle demands **bit-exact** interp==codegen per window across pointwise,
+  halo, coordinate and codegen-declining programs, over windows that share an extent but
+  differ in origin. It caught a real bug: a program that never reads its image binding cooked
+  a WHOLE FRAME on the codegen route, because codegen sized its grid from the bindings while
+  the interpreter sizes it from the window.
+- **One recorded exception, so the route is EXPERIMENTAL rather than bit-exact:**
+  `mix()`/`lerp()` against a hoisted constant vector lands **1 ulp** apart on CPU
+  (5.96e-08 over 32 px). Codegen hands `torch.lerp` a broadcast view of the constant while
+  the interpreter materializes it, and that kernel is layout-sensitive — the v0.19.1
+  fused-lerp family, different mechanism. Not reachable from `run_roi` (making the narrowed
+  binding contiguous does not move it — measured), so it is pinned as a bounded envelope and
+  is the first thing to fix if this route is ever turned on.
+- **Measured: 0.94–0.96× (slower)** at 256²-of-1024² and again at 1024²-of-2048² — no
+  crossover. So it ships behind `TEX_ROI_CODEGEN=0`; the switch stays for a box with different
+  launch/kernel economics to re-measure without a code change.
+
+### The rung-2 viewport (PM-6)
+- `examples/host_demo.py` grows a **10-node comp** cooked UNFUSED, one engine cook per stage,
+  each stage keeping a persistent full-frame canvas that an ROI cook patches. Unfused is
+  structural, not a shortcut: `roi=` is refused on a fused chain, and fusion splices stages
+  behind local variables, which blocks the reach analysis outright.
+- Per-stage results are keyed into a CACHE-2 `ResultCache` by a CACHE-1 lineage key that
+  includes the window, so a revisited slider value is a hit, not a cook.
+- **PM-6 measured (sm_75), via `python examples/host_demo.py --bench-pm6`:** at 1920², an
+  all-dirty whole-frame recook is **34.0 ms/frame**; an all-dirty ROI recook is **5.6 ms
+  (6.1×)**; dragging the terminal node's slider — the actual scrub, with the nine clean
+  upstream canvases reused — is **1.5 ms/frame (~22×)**. At 1024²: 10.4 → 5.6 → 1.5 ms
+  (1.9× / 7.0×). The two all-dirty rows pass `use_cache=False` so they genuinely cook all ten
+  stages. Quoted to the precision the measurement supports: over six runs the spread is
+  33.90–34.04, 5.57–5.69 and 1.48–1.52 ms, so the third digit is noise, not signal.
+- Pinned as regression tests, not claims: an ROI-updated window is **bit-identical** to a
+  whole-frame recook; a terminal-node edit reuses all nine upstream stages; and an edit to the
+  **first** stage reaches the window exactly — the row that fails if a stage's cache key
+  forgets its upstream chain, or if a window patch leaves a stale halo ring behind.
+
+### Measured and deferred (recorded so they are not re-derived)
+- **`roi_plan`'s memo key folds every scalar param**, so a scrubbing slider re-parses the
+  program every frame: **+0.19 ms/frame (52× memo miss)**. A non-halo param provably cannot
+  change the plan (`$amount`: identical halo/narrow/executable) while a halo-radius param can
+  (`$sigma`: halo 3→12), so the fix is to key on halo-relevant params only — but that needs
+  instrumentation inside a correctness-critical path (a wrong cached halo is wrong edge
+  pixels), and a provably-safe parse cache recovers only ~28%. Deferred with the measurement.
+- **Per-node device placement (SCHED-2's consumer) is measurably harmful** at stage
+  granularity: the same 10-node comp is 4.09 ms fused-CUDA, 5.91 ms as ten separate CUDA cooks
+  (+44%), and 12.65 ms alternating CPU/CUDA (3.1×). The executable unit is a fused REGION, not
+  a stage; per-node placement reopens with GRAPH-1's unfused multi-region executor.
+- **The TOOL collapse-selection picker remains the one human-gated item.** `docs/tools.md` §8
+  records it as JS "visually verified by the maintainer in-session (screenshots into the build
+  log)" — the standing practice for frontend-touching releases (roadmap §10.6).
+
 ## [0.29.0] - 2026-07-20
 
 **Close the register — the consolidation the v0.28 audit ordered.** No new mechanisms: v0.29

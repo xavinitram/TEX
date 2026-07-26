@@ -118,6 +118,14 @@ correct:
 
 - **Pointwise** (`H = 0`): identical to `run_tiled`, in 2-D — **bit-exact**. The narrowed
   input view and the coordinate grid share the ROI shape.
+  - **One CPU exception, measured in v0.30:** torch's CPU kernels are shape-dependent at the
+    last ulp (the vectorized body and the scalar tail are different code paths), so a
+    *pointwise* program can still differ from the whole-frame crop when it calls **noise**:
+    `perlin` lands 2.98e-08 out, and `curl` — a centred difference of it — amplifies that by
+    1/(2·ε) = 500 to **2.98e-05**. The differing pixels are always the narrowed tensor's tail,
+    and a window leaving no tail is exact. CUDA is 0.0 for every class. Pinned per class by
+    `test_v030_roi_accuracy_envelope`; the ROI-4 oracle does not yet generate noise calls
+    (covering it needs a per-class tolerance, not a wider global one).
 - **A direct-tensor halo op** (`gauss_blur`/`erode`/`dilate`/`bilateral_filter`) operates
   on the tensor it is handed and returns the same shape. On the `(ROI ⊕ H)`-narrowed
   input, every ROI-interior output pixel is `H` pixels from the narrowed edge, so its
@@ -178,19 +186,39 @@ but the program falls to whole-frame. Documented scope, not a silent gap; the do
 compositing ops (grade, blur, vignette, mask shrink/grow) are pointwise + blur/morphology
 and *are* ROI-executable.
 
-### Flagged off
+### Flagged off → armed per cook (v0.30)
 
 The `roi=` parameter threads through `interpreter.execute` / `_execute_inner` /
-`_create_builtins` (a sibling of `tile=`) and the engine's `cook`/`prepare`. It is
-**off by default**: no production caller passes `roi=`, and the engine-level auto-narrow
-path is gated behind `tex_roi.roi_exec_enabled()` (env `TEX_ROI_EXEC`, default off), the
-same "interpreter-only feature, clamp elsewhere" pattern `prepare()` uses to force
-compiled modes to fp32. The oracle lane (ROI-4) exercises the mechanism directly; the flag
-flip to a production viewport is a later release, gated on that lane being green.
+`_create_builtins` (a sibling of `tile=`) and the engine's `cook`/`prepare`.
 
-Compiled tiers (`torch_compile` / `auto` / `cuda_graph`) do not thread `tile`/`roi` and
-have no ROI seam today: a cook that would ROI-narrow runs on the interpreter tier, exactly
-as tiling already does.
+**v0.29 and earlier:** off by default, no production caller passed `roi=`, and the
+auto-narrow path was gated behind `tex_roi.roi_exec_enabled()` (env `TEX_ROI_EXEC`).
+
+**v0.30 flips it PER COOK, not per process.** A host arms one cook with
+`cook(roi=…, roi_exec=True)`; `TEX_ROI_EXEC` is demoted to the CI / nightly-oracle /
+rollback channel (`roi_exec=None` reads it), and a caller passing neither is byte-identical
+to v0.29 — which is what keeps the ComfyUI node (which passes neither, pinned by a canary)
+on exactly its old path. The arm is per cook because a host legitimately wants an ROI
+viewport cook and a whole-frame final render in one process, which one global cannot
+express; `disown` is the precedent — ownership rides the call.
+
+Two safety additions ship with the flip, both from measured failures:
+
+* **Window validation** (`tex_roi.validate_roi`, enforced in `tex_memory.run_roi`). An
+  overhanging window silently returned a 4×4 result for a requested 10×10, and a negative
+  origin returned wrong pixels through a negative crop offset. Both now fall back to the
+  whole frame. The check lives in `run_roi` — beside its other belt-and-braces refusals,
+  and where the crop arithmetic actually is — because `run_tiled_halo` and the ROI-4 oracle
+  call it *without* passing through the engine gate. The gate keeps only the cheap
+  arithmetic half (no binding scan), which also rejects a whole-frame window before it can
+  cost the cook its fp16 eligibility.
+* **`CookResult.cooked_roi`** — the window actually cooked, `None` on every fallback. A host
+  cannot infer this from shapes (an ROI equal to the frame and a fallback are identical, and
+  `run_roi` supports per-dim-cropped broadcast outputs). `run_roi` decides, so `run_roi`
+  records it (`tier_trace.record_roi`).
+
+Compiled tiers (`torch_compile` / `auto` / `cuda_graph`) still do not thread `tile`/`roi`.
+The **codegen** tier now can (see below), but ships off by default on measurement.
 
 ---
 
@@ -241,13 +269,31 @@ ROI-5-era executor that would plumb `f0`/`B_total` into `fetch_frame`/`sample_fr
 
 ---
 
-## The gate that would change the verdict
+## The gate that would change the verdict — MET in v0.30
 
 ROI-3's flag flips to a production path (a viewport, a slap-comp host) when: (a) ROI-4's
 differential fuzz lane is green across a nightly run, and (b) a real host consumes
 `roi=` — i.e., PORT-5's demo or the standalone viewport exists to *ask* for a sub-region.
-Until a consumer asks, whole-frame is the honest default and ROI is measured, tested, and
-dormant. The ROI-5 reopen items, named here so they are not re-derived:
+
+**Both are met in v0.30.** (a) The ROI-4 oracle was added to `.github/workflows/
+nightly_fuzz.yml`, which until then ran only the TST-1 interp↔codegen fuzzer — so the gate
+had no nightly to be green on, and a derivation test now pins the workflow to keep naming it.
+(b) `examples/host_demo.py` grew a 10-node ROI viewport (PM-6) that arms `roi_exec=True` per
+cook, plus `benchmarks/roi_scrub_bench.py`.
+
+**The codegen ROI route (the v0.27 deferral) is BUILT and OFF.** `roi=` now threads through
+`_build_codegen_env` — the reopen condition's exact words, "thread the strip offset through
+the coordinate-env builder" — so codegen's coordinate builtins mirror
+`Interpreter._create_builtins` per window, and `run_roi` takes an `exec_fn`. A differential
+oracle pins interp==codegen **bit-exactly per window** (it caught codegen sizing its grid
+from the bindings rather than the window, which cooked a whole frame for a program that
+never reads its image input). But measured on sm_75 it is **0.94–0.96× — slower** — at both
+256²-of-1024² and 1024²-of-2048², with no crossover: at these sizes both tiers are
+launch-bound and codegen only adds per-cook env/dispatch work. It therefore ships behind
+`TEX_ROI_CODEGEN=0`. Re-measure on a box with different launch/kernel economics before
+flipping; the switch exists so that needs no code change.
+
+The ROI-5 reopen items, named here so they are not re-derived:
 
 - **Correctness/coverage extensions**: compiled-tier ROI (ROI-bucketed graph/compile keys so
   a scrubbed ROI does not explode the cache); affine-gather narrowing (a decoupled gather
@@ -255,6 +301,17 @@ dormant. The ROI-5 reopen items, named here so they are not re-derived:
   local-variable dataflow (inline non-literal locals before analysis, so a blur through a
   named value composes its reach instead of blocking); and plumbing `f0`/`B_total` into
   `fetch_frame`/`sample_frame` so cross-frame temporal reads can batch-slice.
+- **The `roi_plan` memo key (MEASURED in v0.30, deferred with a number).** `_walk`'s key folds
+  every scalar param's bits (`tex_lazy._param_key`), so a viewport scrubbing *any* slider
+  re-parses + re-folds + re-walks the program every frame: memo hit 0.0037 ms vs miss 0.194 ms
+  (**52×**, +0.19 ms/frame — ~36% of a 0.53 ms CUDA ROI cook). The discrimination needed to fix
+  it is real and provable: `$amount` in `mix(…, $amount)` leaves halo/narrow/executable
+  *identical*, while `$sigma` in `gauss_blur(@A, $sigma)` moves the halo 3→12. So the sound fix
+  is to key on halo-relevant params only — but that means instrumenting which params reach a
+  radius position inside the analysis, and a wrong cached halo is wrong edge pixels (the class
+  this doc calls the worst in the codebase). Component split of the miss: lex 0.054, +parse
+  0.096, +fold 0.134, +walk 0.192 ms — so a *provably safe* parse/token cache recovers only
+  ~28%. Deferred deliberately: the measurement is here, the shortcut is not taken.
 - **Performance (only matters once a viewport actually pans)**: the builtins LRU keys on the
   full `roi`, so a *panning* viewport misses the LAT-4 cache every frame — bucket ROI rects,
   or cache full-frame coords once and take affine `.narrow()` views. A deterministic

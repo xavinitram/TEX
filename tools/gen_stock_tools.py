@@ -20,10 +20,15 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.dirname(ROOT))  # custom_nodes on path
 
 from TEX_Wrangle import tex_tool  # noqa: E402
-from TEX_Wrangle import __version__  # noqa: E402
 
 _OUT_DIR = os.path.join(ROOT, "stock")
 _LANG = "0.23"
+# `min_engine` is a COMPATIBILITY FLOOR — the oldest engine that can cook these tools — not a
+# stamp of the engine that generated them. It was `__version__`, which re-stamped all five
+# manifests on every release and made `--check` fail from v0.27 onward for no substantive
+# reason (nothing about the tools had changed). Bump this literal only when a stage starts
+# using a mechanism an older engine genuinely lacks.
+_MIN_ENGINE = "0.26.0"
 
 # ── stage sources ────────────────────────────────────────────────────────────────
 _GRADE = """// Grade — Nuke-style lift / gamma / gain / offset color grade.
@@ -128,7 +133,7 @@ def _p(name, default, mn, mx, label, internal=None, stage=None, thint="f", step=
 def _manifests() -> dict:
     grade = {
         "manifest_schema": 1, "name": "Grade", "tool_version": "1.0.0",
-        "tex_language": _LANG, "min_engine": __version__, "category": "Color",
+        "tex_language": _LANG, "min_engine": _MIN_ENGINE, "category": "Color",
         "context": "filter", "author": "TEX",
         "doc": "Nuke-style lift / gamma / gain / offset color grade.",
         "code": _GRADE,
@@ -148,7 +153,7 @@ def _manifests() -> dict:
     }
     blur = {
         "manifest_schema": 1, "name": "Blur", "tool_version": "1.0.0",
-        "tex_language": _LANG, "min_engine": __version__, "category": "Filter",
+        "tex_language": _LANG, "min_engine": _MIN_ENGINE, "category": "Filter",
         "context": "filter", "author": "TEX",
         "doc": "Separable Gaussian blur (radius ~= 3*sigma pixels).",
         "code": _BLUR,
@@ -158,7 +163,7 @@ def _manifests() -> dict:
     }
     merge = {
         "manifest_schema": 1, "name": "Merge", "tool_version": "1.0.0",
-        "tex_language": _LANG, "min_engine": __version__, "category": "Compositing",
+        "tex_language": _LANG, "min_engine": _MIN_ENGINE, "category": "Compositing",
         "context": "filter", "author": "TEX",
         "doc": "Blend @A and @B with a selectable mode (add/subtract/multiply/screen/overlay/"
                "soft-light/min/max/difference/divide). Not alpha compositing -- no @A.a channel.",
@@ -172,7 +177,7 @@ def _manifests() -> dict:
     }
     vignette = {
         "manifest_schema": 1, "name": "Vignette", "tool_version": "1.0.0",
-        "tex_language": _LANG, "min_engine": __version__, "category": "Effects",
+        "tex_language": _LANG, "min_engine": _MIN_ENGINE, "category": "Effects",
         "context": "filter", "author": "TEX",
         "doc": "Darken image edges with a soft radial falloff (image + mask outputs).",
         "code": _VIGNETTE,
@@ -184,7 +189,7 @@ def _manifests() -> dict:
     # Fused composite — linear 2-stage: grade (upstream) -> vignette (terminal).
     grade_vignette = {
         "manifest_schema": 1, "name": "GradeVignette", "tool_version": "1.0.0",
-        "tex_language": _LANG, "min_engine": __version__, "category": "Look",
+        "tex_language": _LANG, "min_engine": _MIN_ENGINE, "category": "Look",
         "context": "filter", "author": "TEX",
         "doc": "A fused look: gain/gamma grade feeding a radial vignette (one compiled block).",
         "graphspec": {

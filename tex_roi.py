@@ -40,11 +40,12 @@ from __future__ import annotations
 
 import hashlib
 import math
+import operator
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
 
-from .tex_compiler.lexer import Lexer
+from .tex_compiler.lexer import Lexer, TokenType
 from .tex_compiler.parser import Parser
 from .tex_compiler.ast_nodes import (
     BindingRef, NumberLiteral, ChannelAccess, FunctionCall, Assignment, Identifier,
@@ -328,7 +329,7 @@ def _mark_whole(reads: dict, img_node, gather_node, state: dict) -> None:
 # ── Public analysis ───────────────────────────────────────────────────────────
 
 _MEMO_MAX = 256
-_walk_memo: "OrderedDict[tuple, tuple | None]" = OrderedDict()  # key -> (reads, blocked, halo)
+_walk_memo: "OrderedDict[tuple, tuple | None]" = OrderedDict()  # key -> (reads, blocked, halo, erased)
 
 
 def _is_halo_call(n, fm) -> bool:
@@ -348,17 +349,22 @@ def _subtree_has_halo(node, fm) -> bool:
     return False
 
 
-def _write_target_name(tgt):
-    """The base binding/variable name an assignment writes, or None if un-nameable."""
+def _write_target_name(tgt, bindings_only: bool = False):
+    """The base binding/variable name an assignment writes, or None if un-nameable.
+
+    `bindings_only` restricts the answer to `@bindings`, skipping local variables — what a
+    caller asking "which @names does this program WRITE" wants."""
     cls = tgt.__class__
-    if cls is Identifier or cls is BindingRef:
+    if cls is BindingRef:
         return tgt.name
+    if cls is Identifier:
+        return None if bindings_only else tgt.name
     if cls is ChannelAccess:
-        return _write_target_name(tgt.object)
+        return _write_target_name(tgt.object, bindings_only)
     if cls in (BindingIndexAccess, BindingSampleAccess):
         return tgt.binding.name if tgt.binding.__class__ is BindingRef else None
     if cls is ArrayIndexAccess:
-        return _write_target_name(tgt.array)
+        return _write_target_name(tgt.array, bindings_only)
     return None
 
 
@@ -465,9 +471,31 @@ def _fold_program(code: str, param_values: dict):
     return program
 
 
+def _referenced_at_bindings(code: str) -> frozenset:
+    """Every `@name` the SOURCE mentions — lexed, so comments and strings can't spoof one.
+
+    `_walk` accumulates its read set on the `$param`-FOLDED program. That is right for halo
+    radii (a symbolic radius cannot be composed into a reach) and WRONG for the binding set,
+    because the engine does not fold `$params`: they are runtime bindings and the compile cache
+    is keyed on their TYPES, not their values. So a read that folding discarded is still
+    evaluated, at FULL extent, by the program that actually runs.
+
+    Measured: `@OUT = mix(@A, @B, $k);` with `k=0.0` folds to `@A`, so `@B` never reached the
+    read set and `run_roi` passed it whole into a narrowed cook. The output came back as the
+    whole frame while `cooked_roi` reported the window as served — and the shipped host blitted
+    it, raising "expanded size (1) must match 64". Same for `lerp`, for a `$param`-guarded
+    ternary, and for a blur inside either branch."""
+    try:
+        toks = Lexer(code).tokenize()
+    except Exception:
+        return frozenset()          # unparseable → the caller's own walk fails too
+    return frozenset(t.value for t in toks
+                     if t.type in (TokenType.AT_BINDING, TokenType.TYPED_AT_BINDING))
+
+
 def _walk(code: str, param_values: dict):
     """Parse + `$param`-fold + accumulate, memoized on `(code-hash, param bits)`. Returns
-    `(reads, blocked, halo)` or None on ANY failure — the single shared engine behind
+    `(reads, blocked, halo, fold_erased)` or None on ANY failure — the single shared engine behind
     `binding_footprints` and `roi_plan`, so the parse+walk runs once. `blocked` is True when
     the program cannot be cooked on a sub-region: a gather/reduction/scatter is present, a
     halo op has a symbolic radius, or a halo op is ungrounded (behind a local var / function /
@@ -488,7 +516,14 @@ def _walk(code: str, param_values: dict):
         for stmt in program.statements:
             _accumulate(stmt, 0, reads, state)
         blocked = state["blocked"] or _has_ungrounded_halo(program)
-        result = (reads, blocked, state["halo"])
+        # Bindings the $param-fold ERASED from `reads` but the engine still evaluates. Write
+        # targets are excluded — `@OUT` is not an input and narrowing it means nothing. Computed
+        # here so it rides the same memo as the walk instead of re-lexing on every cook.
+        written = {n for n in (_write_target_name(s.target, bindings_only=True)
+                               for s in program.statements if isinstance(s, Assignment))
+                   if n is not None}
+        result = (reads, blocked, state["halo"],
+                  _referenced_at_bindings(code) - written - set(reads))
     except Exception:
         result = None
     _walk_memo[key] = result
@@ -557,10 +592,22 @@ def roi_plan(code: str, param_values: dict | None = None) -> RoiPlan:
     walked = _walk(code, param_values or {})
     if walked is None:
         return _NOT_EXECUTABLE
-    reads, blocked, halo = walked
+    reads, blocked, halo, fold_erased = walked
     if blocked:
         return _NOT_EXECUTABLE
     narrow = frozenset(name for name, e in reads.items() if e.has_narrow)
+    # …plus every binding `$param`-folding removed from `reads` entirely. The plan is EXECUTABLE
+    # here, which means no gather and no reduction (either sets `blocked`), so there is no such
+    # thing as a legitimately whole-passed spatial binding — a name the fold dropped can only be
+    # a pointwise or narrowable-halo read, and leaving it un-narrowed is what let a full-extent
+    # operand back into a windowed cook. Only names absent from `reads` are added: a name that
+    # IS there keeps its own has_narrow verdict rather than having one imposed on it.
+    #
+    # Safe even when the dropped read sits under a LARGER halo than the folded program's: the
+    # fold is a semantic equivalence at these exact `$param` values (and the memo key includes
+    # them), so the discarded branch cannot affect output VALUES — only its extent matters, and
+    # narrowing it to the same window is what makes the extents agree.
+    narrow |= fold_erased
     return RoiPlan(True, halo, narrow)
 
 
@@ -627,12 +674,107 @@ def batch_sliceable(code: str, param_values: dict | None = None) -> bool:
         return False
 
 
-def roi_exec_enabled() -> bool:
-    """ROI-3 is FLAGGED OFF: the engine auto-narrow path engages only when `TEX_ROI_EXEC=1`.
-    The oracle lane (ROI-4) drives `tex_memory.run_roi` directly, so it exercises the
-    mechanism regardless of this flag; production flips it on once that lane is green and a
-    host (a viewport) actually asks for a sub-region."""
+def roi_exec_enabled(opt_in: bool | None = None) -> bool:
+    """Whether the engine's auto-narrow ROI path may engage — v0.30's flip, **per cook**.
+
+    The v0.30 flip is deliberately not a new global default. The arming decision belongs to
+    the same call that supplies the window (`cook(roi=..., roi_exec=True)`), for the reason
+    `prepare()`'s own `disown` docstring gives: a process-wide global "describes what a host
+    set, not what THIS call will do" — and a host legitimately wants an ROI viewport cook and
+    a whole-frame final render in one process, which one global cannot express. `disown` is
+    the precedent: ownership rides the CALL.
+
+      * `opt_in=True`  — arm ROI for this cook (the viewport channel).
+      * `opt_in=False` — refuse regardless of the env (an explicit host kill switch).
+      * `opt_in=None`  — fall back to `TEX_ROI_EXEC` (default off): the CI / nightly-oracle /
+        rollback channel. A caller passing neither is byte-identical to v0.29.
+
+    The oracle lane (ROI-4) also drives `tex_memory.run_roi` directly, so the mechanism is
+    exercised regardless of this gate. Of the flip's two standing conditions (docs/
+    roi-spatial-laziness.md, "The gate that would change the verdict"), (a) is met — the ROI-4
+    differential lane now runs nightly — and (b), "a real host consumes `roi=`", is met by the
+    host that passes `roi_exec=True`; the in-repo consumer is the v0.30 viewport in
+    `examples/host_demo.py` plus `benchmarks/roi_scrub_bench.py`.
+    """
+    if opt_in is not None:
+        # Coerced, not returned raw. `False` is documented above as an explicit KILL SWITCH, and
+        # the truthiness of a string defeats that: `roi_exec="0"`, `"false"`, `"off"` — the
+        # spellings a host reads out of a config file or an env var — are all truthy, so every
+        # one of them ARMED the path they were written to disable. Strings get the same
+        # vocabulary `TEX_ROI_EXEC` accepts; everything else is a plain truth test.
+        if isinstance(opt_in, str):
+            return opt_in.strip().lower() in ("1", "true", "yes", "on")
+        return bool(opt_in)
     return os.environ.get("TEX_ROI_EXEC", "0") == "1"
+
+
+def canonical_roi(roi) -> tuple:
+    """The window as a fresh tuple of plain `int`s. Raises TypeError/ValueError if it is not.
+
+    Two jobs, both about the window the ENGINE reports back. `CookResult.cooked_roi` used to be
+    whatever object the caller passed, which meant (a) a list in, a list out, contradicting the
+    documented 6-tuple, and worse (b) the host's own object handed back to it: a viewport that
+    recycles one mutable rect buffer per frame — the obvious way to write one — mutates the
+    rect it just cooked, and `cooked_roi` retroactively names a DIFFERENT window than the patch
+    covers, so the next blit lands in the wrong place. Copying at the boundary ends both."""
+    out = []
+    for v in roi:
+        if isinstance(v, bool):          # True is a bug in a coordinate slot, not a 1
+            raise TypeError("roi entries must be ints, not bools")
+        out.append(operator.index(v))
+    return tuple(out)
+
+
+def validate_roi(roi) -> str | None:
+    """Is this `roi=` window WELL-FORMED? None when it is, else a short reason for the trace.
+
+    Pure arithmetic, and only arithmetic (this module stays torch-free). Two things it
+    deliberately does NOT answer, because each belongs to a caller that knows more:
+      * whether the window's `(W, H)` matches the actual bindings — that is per-binding and
+        per-dim, so `tex_memory.run_roi` (which holds the tensors and does the narrowing) owns
+        it; a shared-size lookup here answered None for heterogeneous inputs and silently
+        dropped the check;
+      * whether a whole-frame window is worth arming — that is an fp16-economy POLICY, and it
+        lives in `tex_engine.prepare`'s gate beside the fp32 clamp it protects. Baking it in
+        here meant `run_roi` and the ROI-4 oracle inherited an optimization verdict when they
+        only asked "is this window valid?".
+
+    v0.30 makes `roi=` a production path, so an out-of-range or mis-sized window stops being a
+    test-only concern. Unvalidated, two measured cases returned WRONG PIXELS silently rather
+    than failing: an overhanging window (`roi=(28,28,10,10,32,32)` on a 32x32 input) came back
+    4x4 instead of the requested 10x10, and a negative origin (`roi=(-4,0,8,8,32,32)`) produced
+    a wrong-sized 8x4 through a negative crop offset in `tex_memory.run_roi`. Both are the
+    silent-wrong-output class docs/roi-spatial-laziness.md calls the worst in the codebase.
+
+    A bad window falls back to the whole frame (the whitelist posture — over-approximate,
+    never guess), and the caller learns the window was refused from `CookResult.cooked_roi`
+    being None.
+    """
+    if not (isinstance(roi, (tuple, list)) and len(roi) == 6):
+        return "roi must be a 6-tuple (x0, y0, w, h, W, H)"
+    # Any INTEGER, not just `int`. A host computing its viewport with numpy hands over
+    # `numpy.int64`, which is not an `int` — an `isinstance` test refused those windows and
+    # silently dropped the host to whole-frame cooks, i.e. the feature quietly did nothing for
+    # exactly the callers most likely to use it. `__index__` is the language's own "this is an
+    # integer" protocol: numpy/torch scalars satisfy it, floats and strings do not. `bool` does
+    # too and is still refused — `True` as a coordinate is a bug, not a 1.
+    try:
+        roi = canonical_roi(roi)
+    except (TypeError, ValueError):
+        return "roi entries must be ints"
+    x0, y0, w, h, W, H = roi
+    if w <= 0 or h <= 0:
+        return f"roi w/h must be positive (got {w}x{h})"
+    if W <= 0 or H <= 0:
+        return f"roi W/H must be positive (got {W}x{H})"
+    if x0 < 0 or y0 < 0:
+        return f"roi origin must be non-negative (got {x0},{y0})"
+    if x0 + w > W or y0 + h > H:
+        return f"roi window ({x0},{y0},{w},{h}) overhangs the {W}x{H} image"
+    # The window's (W, H) must describe the image the bindings actually carry, or the narrow
+    # slices the wrong extent (measured: a mismatch raises inside run_roi and re-cooks
+    # whole-frame with a log line on EVERY frame of a pan).
+    return None
 
 
 def clear_roi_memo() -> None:

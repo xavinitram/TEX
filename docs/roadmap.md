@@ -258,12 +258,16 @@ Four workstreams. Effort tags: S/M/L.
 
 ## 3. Mid term (v0.24–v0.3x): the five programs
 
-> **Status (v0.29 DOCS-1):** the five programs are **shipped** through v0.28 — P1 ROI/DoD
-> (v0.24, flagged off), P2 results & caching (v0.25), P3 tools (v0.26), P4 scheduling & GraphSpec
-> (v0.27, scheduler dormant), P5 data model & sessions (v0.28). What remains mid-term is the
-> flag flips + first live consumers (v0.30: ROI viewport, SCHED-2's first graph, codegen ROI/tile
-> routing). Per-item shipped-state is in §9; the deferrals (CACHE-6 DAG split, DATA-3 indexing,
-> DATA-4 phase 2) keep their recorded gates.
+> **Status (v0.30):** the five programs are **shipped** through v0.28 — P1 ROI/DoD (v0.24),
+> P2 results & caching (v0.25), P3 tools (v0.26), P4 scheduling & GraphSpec (v0.27, scheduler
+> dormant), P5 data model & sessions (v0.28). v0.30 delivered the ROI half of the flag flips:
+> **ROI execution is live** (armed per cook, window-validated, nightly-gated, with a viewport
+> consumer). Still outstanding, each deferred on a recorded measurement rather than skipped:
+> **SCHED-2's first graph** (per-node placement measured 3.1× worse than fused — needs GRAPH-1's
+> multi-region executor), the **codegen ROI route** (built and proven, measured slower, shipped
+> behind `TEX_ROI_CODEGEN=0`), and the **tile** half of that route (not built). Per-item
+> shipped-state is in §9; the deferrals (CACHE-6 DAG split, DATA-3 indexing, DATA-4 phase 2)
+> keep their recorded gates.
 
 ### P1 — ROI / DoD (pillar 4's spatial dimension)
 
@@ -571,16 +575,16 @@ programs, not tasks — each needs its own design doc when its time comes.
 
 ## 5. Pillar scorecard
 
-The **Today (v0.28)** column is the shipped reality as of the v0.29 status pass (DOCS-1);
+The **Today** column is the shipped reality as of v0.30 (rows updated per release);
 the Near/Mid columns are the original planning view, now largely landed (§9 has the per-release
 record). "Today (v0.20)" was the doc's drafting baseline.
 
-| Pillar | Today (v0.28) | Mid (in progress) | Far |
+| Pillar | Today (v0.30) | Mid (in progress) | Far |
 |--------|---------------|-------------------|-----|
 | 1 Compilation | DAG-region fusion (diamonds/fan-out + **v0.29 multi-injection**), all 4 compile tiers verified, tools as compile units, suffix-recook (CACHE-6) | — | whole-plan compilation in tex_graph |
-| 2 XPU | placement scheduler (dormant), GraphSpec (schema 2), transfer probe, concurrency audit; single-source language | SCHED-2's first live consumer (v0.30) | branch-parallel executor |
+| 2 XPU | placement scheduler (**still dormant** — v0.30 deferred its first consumer on measurement: per-node placement is 3.1× worse than fused), GraphSpec (schema 2), transfer probe, concurrency audit; single-source language | first live consumer needs GRAPH-1's unfused multi-region executor | branch-parallel executor |
 | 3 Caching | lineage keys + frame cache (CACHE-2, host-armed), layered epochs, prewarm, governor (CACHE-5) | — | version-counter dirty tracking |
-| 4 Lazy | ROI/DoD analysis + execution + oracle (flagged off), footprint registry, fused-chain lazy | ROI flag flip (v0.30) | demand-driven pull planner |
+| 4 Lazy | ROI/DoD analysis + execution + oracle, footprint registry, fused-chain lazy; **v0.30: ROI armed per cook (`roi_exec`), window-validated, nightly-gated, with a viewport consumer** | codegen ROI route built but OFF (slower); fused-chain ROI still out of reach | demand-driven pull planner |
 | 5 Unified memory | halo tiling (ROI-5), spill-through-pinned, Null-host authority, governor arbitration | — | 3-stream out-of-core, async D2H handles |
 | 6 Wrangling | param metadata, snippet store, `.textool` + publish + `tex build` + stock exemplars, LSP | canvas decl, stock library (STOCK-1), roto (ROTO-1) | full stock-node library |
 | 7 AI-ready | torch-native, device-resident, DLPack contract (ENG-6), ARRAY wires (DATA-3) | — | in-graph inference nodes (ML-1) |
@@ -599,7 +603,7 @@ before it can gate it.
 
 ```
 FUS-0 → FUS-1/FUS-3 (regions proven) → TOOL-2 (collapse selection = a region)
-ROI-1 → ROI-2 → ROI-3 (built, flagged off) → ROI-4 (oracle gate) → ship ROI-3 + ROI-5
+ROI-1 → ROI-2 → ROI-3 (SHIPPED v0.30, armed per cook) → ROI-4 (oracle gate, now nightly) → ROI-5
 ENG-1 (engine.cook) → SCHED-1 (GraphSpec) → PORT-5 (demo) → GRAPH-1 (executor)
 ENG-12 (ownership) + CACHE-1 (lineage) → CACHE-2 (frames) → CACHE-6 (suffix recook)
 ENG-8 + ENG-9 → SCHED-2 (placement) → GRAPH-2 / XPU-1     ROI-5 → XPU-1
@@ -730,7 +734,7 @@ touching the frontend. FUS-0 ships as **v0.20.1** (hotfix, in flight).
 | v0.27.0 | **Big frames, placed well** | ROI-5, CACHE-5, CACHE-6, SCHED-2, SCHED-3 | `tex_scheduler.py` |
 | v0.28.0 | **Second host** — the proof release | DATA-1, DATA-2, DATA-3, DATA-4, PORT-5 (PM-2) | `tex_io/exr.py`, `examples/host_demo.py` |
 | v0.29.0 | **Close the register** — the consolidation the v0.28 audit ordered; no new mechanisms | LIVE-1 (the overdue checklist run), FUS-1b/1c (the unshipped v0.21.1), ENG-4 re-cut, SCHED-3 interrupt bridge, BENCH-1 (cumulative v0.20↔v0.28 compare + PM-5 governor soak), DOCS-1 (status pass + DOC-6 amendment) | — |
-| v0.30.0 | **First viewer** — host_demo grows into the §8 rung-2 host; the switches flip *for that host* | ROI flag flip (nightly-fuzz-gated), codegen ROI/tile routing (measured), SCHED-2's first consumer, TOOL collapse picker, PM-6 | — |
+| v0.30.0 | **First viewer** — host_demo grows into the §8 rung-2 host; the switches flip *for that host* | ROI flag flip (per-cook `roi_exec`, nightly-fuzz-gated), codegen **ROI** routing (measured 0.94–0.96× → shipped OFF; ~~tile half~~ not built), ~~SCHED-2's first consumer~~ (deferred on measurement), ~~TOOL collapse picker~~ (human-gated), PM-6 ✅ | — |
 | v0.31+ → v1.0 | **Engine era** | §4 programs (GRAPH/XPU/DATA-5..7/STOCK/ML/ROTO/COLOR), each behind its own design doc | `tex_graph.py`, `tex_runtime/streams.py` |
 
 Per-release notes:
@@ -1019,13 +1023,69 @@ Per-release notes:
   - **Explicit non-items** (their recorded gates stand): codegen ROI/tile routing
     (v0.30's measured headline), CACHE-6 DAG suffix-split, DATA-3 element indexing,
     DATA-4 phase 2, LAT-1b, XPU-1/2, xfer multi-GPU keying (single-GPU box; note kept).
-- **v0.30.0 — First viewer (penciled).** `examples/host_demo.py` grows into the §8
-  rung-2 host: an ROI viewport becomes the first real `roi=` consumer (`TEX_ROI_EXEC`
-  flips *for that host* behind the nightly-fuzz gate), the frame cache serves a real
-  scrub loop, SCHED-2 plans placement for a real graph, tiled/ROI cooks get their
-  measured codegen route (the v0.27 deferral's reopen condition), and the collapse-
-  selection picker completes `docs/tools.md` §8. Exit: **PM-6** — scrub a 10-node comp
-  at proxy resolution with ROI cooks + cache hits at interactive rate on the sm_120 box.
+- **v0.30.0 — First viewer (SHIPPED, partial: 3 of 5 items + PM-6).** All numbers **sm_75**
+  (RTX 2080 SUPER, no Triton) — PM-6 names the sm_120 box, so these are not that claim.
+  - **ROI flag flip — SHIPPED, per cook.** `cook(roi=…, roi_exec=True)` arms one cook;
+    `TEX_ROI_EXEC` demoted to the CI/rollback channel. A cook passing neither is
+    byte-identical to v0.29 (canary-pinned on `tex_node`). Fixed **two silent-wrong-pixel
+    bugs** (overhanging window returned 4×4 for a requested 10×10; negative origin returned
+    wrong pixels) by validating in `run_roi`, where the crop arithmetic is and where the
+    ROI-4 oracle actually calls. Added `CookResult.cooked_roi`. **Gate (a) closed**: the
+    ROI-4 oracle now runs in `nightly_fuzz.yml` — it never had a nightly to be green on.
+    ROI at 256²-of-1024²: 2.37× (CPU) / 3.25× (CUDA) vs whole-frame.
+  - **Codegen ROI routing — BUILT, PROVEN, MEASURED, OFF (the *tile* half NOT built).**
+    Scope deviation recorded: the item said "tiled/ROI"; `run_tiled`/`run_tiled_halo` still
+    have no `exec_fn` and `_build_codegen_env` takes no `tile=`, so a strip-tiled cook stays
+    on the interpreter. The ROI half's measurement is why — the twin would share the
+    mechanism that came back slower. `roi=` threads through
+    `_build_codegen_env` (the deferral's exact reopen wording); a differential oracle pins
+    interp==codegen bit-exactly per window and caught codegen sizing its grid from bindings
+    instead of the window. Measured **0.94–0.96× (slower)** at 256²-of-1024² AND
+    1024²-of-2048² — no crossover, both tiers launch-bound — so it ships behind
+    `TEX_ROI_CODEGEN=0` for a different box to re-measure.
+  - **PM-6 — MET (sm_75).** `examples/host_demo.py` grew a 10-node comp cooked UNFUSED
+    (structural: `roi=` is refused on a fused chain, and fusion splices stages behind local
+    vars, blocking the reach analysis), each stage keeping a full-frame canvas an ROI cook
+    patches, each result CACHE-2-keyed with the window AND its upstream chain in the CACHE-1
+    lineage key. Run it: `python examples/host_demo.py --bench-pm6 --resolution 1920 --roi 512`. At 1920²: all-dirty
+    whole-frame 34.0 → all-dirty ROI 5.6 (6.1×) → **terminal-knob scrub 1.5 ms/frame
+    (~22×)**. At 1024²: 10.4 → 5.6 → 1.5 (1.9× / 7.0×). Six runs spread 33.90–34.04 / 5.57–5.69
+    / 1.48–1.52 ms, so the third digit is noise. The all-dirty rows force `use_cache=False`, or
+    they would be one cook plus nine cache hits — a tenth of the work the label claims.
+    Pinned as tests, not claims: the window is bit-identical to a whole-frame recook, a
+    terminal edit reuses all nine upstream stages, and an edit to the FIRST stage reaches the
+    window exactly (the row that catches an upstream-blind cache key or a stale halo ring).
+  - **SCHED-2's first consumer — DEFERRED on measurement.** Per-node placement is
+    *measurably harmful* at stage granularity: the same 10-node comp is 4.09 ms fused-CUDA,
+    5.91 ms as ten separate CUDA cooks (+44%), 12.65 ms alternating CPU/CUDA (3.1×). The
+    executable unit is a fused REGION, not a stage, and `default_cook_cost` returns None for
+    the device the host did not cook on, so a naive consumer degenerates to a greedy echo
+    with a plausible-looking plan. Reopen with GRAPH-1's unfused multi-region executor, or
+    at region granularity with a host-side calibration pass.
+  - **The collapse-selection picker — NOT DONE (human-gated).** `docs/tools.md` §8 records it
+    as JS "visually verified by the maintainer in-session (screenshots into the build log)",
+    the standing practice for frontend-touching releases (§10.6). It cannot be completed
+    without a live ComfyUI walk.
+  - **Deferred with a number:** `roi_plan`'s memo key folds every scalar param, costing
+    **+0.19 ms/frame (52× miss)** on a scrubbing slider; the sound fix needs halo-relevance
+    instrumentation in a correctness-critical path, and a provably-safe parse cache recovers
+    only ~28%. See `docs/roi-spatial-laziness.md`.
+  - **Found and fixed by an adversarial hunt before tagging** (11 verified findings; the full
+    list is in the v0.30.0 CHANGELOG). The one that mattered: `roi_plan` folded `$params`
+    before tallying binding reads, so a binding the fold erased — `@B` in
+    `mix(@A, @B, $k)` at `k=0.0` — was never narrowed, while the engine (which does not fold
+    `$params`) still read it at full extent. The cook returned the WHOLE FRAME with
+    `cooked_roi` reporting the window served. Fixed at the source, and backstopped by a
+    postcondition in `run_roi`: every output's extent is checked before a window is marked
+    served, so `cooked_roi` cannot name a window the outputs do not have, whatever the cause.
+    Also: an fp16 cook now declines the window rather than being clamped to fp32 (the patch
+    would not match its own fp16 canvas — 1.05e-03, 47% of pixels); `cooked_roi` is the
+    engine's own tuple, not the caller's mutable object; `roi_exec="0"`/`"false"`/`"off"`
+    disarm; `numpy.int64` windows are accepted.
+  - **Open follow-up:** the ROI-4 nightly oracle's generator emits no **noise** calls, so the
+    class with the widest measured envelope (`curl`, 2.98e-05 on CPU) is the one it cannot
+    see. Covering it needs a per-class tolerance rather than widening the global 1e-5. The
+    envelope is pinned by a unit test in the meantime.
 
 ## 10. How an item lands (the implementation mapping)
 

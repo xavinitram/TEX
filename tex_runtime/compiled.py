@@ -1120,6 +1120,7 @@ def _plain_execute(
     precision: str = "fp32",
     *,
     time_context: dict | None,
+    roi: tuple[int, int, int, int, int, int] | None = None,
 ) -> torch.Tensor | dict:
     """Execute without torch.compile (standard tree-walking interpreter). Reuses ONE
     persistent interpreter (C6) so its coordinate-builtin LRU (LAT-4) actually persists
@@ -1153,7 +1154,12 @@ def _plain_execute(
     return _get_plain_interp().execute(
         program, bindings, type_map, device=device,
         latent_channel_count=latent_channel_count, output_names=output_names,
-        precision=precision, used_builtins=used_builtins, time_context=time_context)
+        precision=precision, used_builtins=used_builtins, time_context=time_context,
+        # ROI-3 / v0.30: MUST forward — the bindings may already be narrowed to a cook region,
+        # and without the window the interpreter would derive coordinates from the narrowed
+        # tensor's own shape (wrong pixels, silently). Same class of forgotten-forward bug as
+        # `time_context` above, and the same reason it is spelled out here.
+        roi=roi)
 
 
 # ENG-9: the persistent fallback interpreter is PER-THREAD, like the engine's cook
@@ -1203,6 +1209,7 @@ def _build_codegen_env(
     device: torch.device, latent_channel_count: int,
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
+    roi: tuple[int, int, int, int, int, int] | None = None,
 ) -> tuple[dict, tuple | None, set[str]]:
     """Build the environment dict and spatial shape for codegen execution.
 
@@ -1214,6 +1221,18 @@ def _build_codegen_env(
 
     Builtin tensors come from the cross-cook _ENV_TENSOR_CACHE (keyed on shape/
     device/dtype); only the env dict itself is per-cook.
+
+    ROI-3 / v0.30 (the v0.27 deferral's reopen condition — "thread the strip offset through
+    the coordinate-env builder"): `roi=(x0, y0, w, h, W_full, H_full)` says the bindings have
+    ALREADY been narrowed to a cook region by `tex_memory.run_roi`, so the coordinate builtins
+    must describe that window's place in the FULL image: `ix`/`iy` start at the window origin
+    and `u`/`v`/`iw`/`ih`/`px`/`py` reference the full extent. Without this the builder derives
+    everything from the narrowed tensor's own shape and every coordinate is wrong — measured at
+    maxdiff 4.5e-1 (silent wrong pixels) when codegen was pointed at a narrowed cook.
+
+    These expressions MIRROR `Interpreter._create_builtins`' ROI branch exactly (same `arange`
+    bounds, same `max(W_full - 1, 1)` divisor, same `expand`), because interp<->codegen must
+    stay bit-exact PER WINDOW, not just per whole frame.
     """
     env: dict[str, Any] = {}
     sp = None
@@ -1221,6 +1240,14 @@ def _build_codegen_env(
         if isinstance(v, torch.Tensor) and v.dim() >= 3:
             sp = (v.shape[0], v.shape[1], v.shape[2])
             break
+    if roi is not None and sp is not None:
+        # The GRID is the cook region, not whatever the bindings happen to be. These differ
+        # whenever a binding is not narrowed — most sharply for a program that never reads its
+        # image input (`@OUT = vec4(ix/iw, iy/ih, .5, 1);`), where `narrow_names` is empty and
+        # the binding stays full-size: sizing off it would cook a WHOLE FRAME for an ROI
+        # request. The interpreter sizes its grid from `roi` for exactly this reason, so
+        # matching it here is also what keeps the two tiers shape-identical per window.
+        sp = (sp[0], roi[3], roi[2])
 
     used = used_builtins if used_builtins is not None else _collect_identifiers(program)
     # Single owner: the interpreter's precision->dtype map (both backends agree).
@@ -1229,34 +1256,41 @@ def _build_codegen_env(
 
     if sp:
         B, H, W = sp
+        # The cook-region grid is H×W; coordinates are offset by the window origin and
+        # normalized against the full image. Absent an ROI this collapses to the old
+        # behaviour exactly (x0=y0=0, W_full=W, H_full=H), so the default path is untouched.
+        x0, y0 = (roi[0], roi[1]) if roi is not None else (0, 0)
+        W_full, H_full = (roi[4], roi[5]) if roi is not None else (W, H)
+        # ROI components join every cache key they affect, or a panning viewport would be
+        # served the previous window's coordinates out of _ENV_TENSOR_CACHE.
         if "ix" in used or "u" in used:
-            ix = _env_cached(("ix", W, dev_key, dtype),
-                             lambda: torch.arange(W, dtype=dtype, device=device).view(1, 1, W))
+            ix = _env_cached(("ix", W, x0, dev_key, dtype),
+                             lambda: torch.arange(x0, x0 + W, dtype=dtype, device=device).view(1, 1, W))
             if "ix" in used:
                 env["ix"] = ix
             if "u" in used:
-                env["u"] = _env_cached(("u", B, H, W, dev_key, dtype),
-                                       lambda: (ix / max(W - 1, 1)).expand(B, H, W))
+                env["u"] = _env_cached(("u", B, H, W, x0, W_full, dev_key, dtype),
+                                       lambda: (ix / max(W_full - 1, 1)).expand(B, H, W))
         if "iy" in used or "v" in used:
-            iy = _env_cached(("iy", H, dev_key, dtype),
-                             lambda: torch.arange(H, dtype=dtype, device=device).view(1, H, 1))
+            iy = _env_cached(("iy", H, y0, dev_key, dtype),
+                             lambda: torch.arange(y0, y0 + H, dtype=dtype, device=device).view(1, H, 1))
             if "iy" in used:
                 env["iy"] = iy
             if "v" in used:
-                env["v"] = _env_cached(("v", B, H, W, dev_key, dtype),
-                                       lambda: (iy / max(H - 1, 1)).expand(B, H, W))
+                env["v"] = _env_cached(("v", B, H, W, y0, H_full, dev_key, dtype),
+                                       lambda: (iy / max(H_full - 1, 1)).expand(B, H, W))
         if "iw" in used:
-            env["iw"] = _env_cached(("iw", W, dev_key, dtype),
-                                    lambda: torch.tensor(float(W), dtype=dtype, device=device))
+            env["iw"] = _env_cached(("iw", W_full, dev_key, dtype),
+                                    lambda: torch.tensor(float(W_full), dtype=dtype, device=device))
         if "ih" in used:
-            env["ih"] = _env_cached(("ih", H, dev_key, dtype),
-                                    lambda: torch.tensor(float(H), dtype=dtype, device=device))
+            env["ih"] = _env_cached(("ih", H_full, dev_key, dtype),
+                                    lambda: torch.tensor(float(H_full), dtype=dtype, device=device))
         if "px" in used:
-            env["px"] = _env_cached(("px", W, dev_key, dtype),
-                                    lambda: torch.tensor(1.0 / max(W, 1), dtype=dtype, device=device))
+            env["px"] = _env_cached(("px", W_full, dev_key, dtype),
+                                    lambda: torch.tensor(1.0 / max(W_full, 1), dtype=dtype, device=device))
         if "py" in used:
-            env["py"] = _env_cached(("py", H, dev_key, dtype),
-                                    lambda: torch.tensor(1.0 / max(H, 1), dtype=dtype, device=device))
+            env["py"] = _env_cached(("py", H_full, dev_key, dtype),
+                                    lambda: torch.tensor(1.0 / max(H_full, 1), dtype=dtype, device=device))
         if "fi" in used:
             env["fi"] = _env_cached(("fi", B, dev_key, dtype),
                                     lambda: torch.arange(B, dtype=dtype, device=device).view(B, 1, 1))
@@ -1301,6 +1335,7 @@ def _codegen_only_execute(
     fingerprint: str | None = None,
     *,
     time_context: dict | None,
+    roi: tuple[int, int, int, int, int, int] | None = None,
 ) -> torch.Tensor | dict:
     """Execute via codegen flat function WITHOUT torch.compile.
 
@@ -1332,7 +1367,7 @@ def _codegen_only_execute(
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision,
-                              time_context=time_context)
+                              time_context=time_context, roi=roi)
 
     dev = _canon_device(device)
 
@@ -1342,7 +1377,7 @@ def _codegen_only_execute(
     ingest_event = _record_ingest_event(bindings, dev)
 
     env, sp, _ = _build_codegen_env(program, contiguous_bindings, dev, latent_channel_count,
-                                    used_builtins=used_builtins, precision=precision)
+                                    used_builtins=used_builtins, precision=precision, roi=roi)
     stdlib_fns = TEXStdlib.get_functions()
 
     try:
@@ -1358,7 +1393,7 @@ def _codegen_only_execute(
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision,
-                              time_context=time_context)
+                              time_context=time_context, roi=roi)   # ROI-3: see _plain_execute
 
     tier_trace.record("codegen")
     # XPU fence: async ingest DMA must land before the cook's outputs escape.
