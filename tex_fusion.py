@@ -198,7 +198,13 @@ def _fused_memo_key(stages: list[dict], infer_binding_type: Callable) -> tuple:
     chain topology, sorted (name, binding-type)) in order. Q-3: the topology
     covers legacy `chain_input`, DAG `chain_inputs`, multi-@OUT `exports`, and
     `tap` — structurally different chains must key apart. prev_out types need no
-    entry — they follow from earlier stages' (code, types)."""
+    entry — they follow from earlier stages' (code, types).
+
+    ANIM-1: a stage's PARAM-only names are excluded from its type tuple, for the same reason
+    the single-program fingerprint excludes them — a param's type comes from its declaration,
+    so an animated `$k` crossing a whole number (2.0 → 2) would otherwise re-key the whole
+    chain and force a re-splice + recompile mid-scrub. `identity_binding_types` is the one
+    place that rule lives."""
     def _topology(st):
         ci = st.get("chain_inputs")
         ci_key = (tuple(sorted((b, tuple(src)) for b, src in ci.items()))
@@ -206,18 +212,44 @@ def _fused_memo_key(stages: list[dict], infer_binding_type: Callable) -> tuple:
         return (ci_key,
                 tuple(sorted(st.get("exports") or ())),
                 bool(st.get("tap")))
+    from .tex_marshalling import identity_binding_types
     return tuple(
         (st["code"], _topology(st),
-         tuple(sorted((n, infer_binding_type(v).value)
-                      for n, v in (st.get("bindings") or {}).items())))
+         tuple(sorted((n, t.value) for n, t in
+                      identity_binding_types(st["code"],
+                                             st.get("bindings") or {}).items())))
         for st in stages
     )
+
+
+#: `_fused_fp` hashes `repr(memo_key)`, which contains every stage's FULL SOURCE — measured at
+#: 24.4 µs for a 4-stage / 5.3 KB chain, and it scales with total source length. Before v0.31 it
+#: was only reached on a `_FUSED_MEMO` miss; `prepare()` now asks for a chain's fingerprint on
+#: EVERY cook (so PROF-1 can key a fused chain at the default compile mode), which put that hash
+#: on the per-cook path. Memoized on the key, which is itself value-independent.
+_FUSED_FP_MEMO: "OrderedDict[tuple, str]" = OrderedDict()
+_FUSED_FP_MEMO_MAX = 256
 
 
 def _fused_fp(memo_key: tuple) -> str:
     """Stable filename-safe fingerprint over the fusion memo_key (tuples of
     str / None / sorted (name, type) tuples — repr is stable and canonical)."""
-    return "fused_" + hashlib.sha256(repr(memo_key).encode()).hexdigest()[:24]
+    # Same unguarded-LRU race `_FUSED_MEMO` documents below: a lost key would raise
+    # KeyError through `prefix_fingerprint` / `boundary_lineage_key`, neither of which
+    # guards — and inside `fused_fingerprint` it would be swallowed to None, silently
+    # stranding the chain on the interpreter and collapsing PROF-1's key.
+    hit = _FUSED_FP_MEMO.get(memo_key)
+    if hit is not None:
+        try:
+            _FUSED_FP_MEMO.move_to_end(memo_key)
+        except KeyError:
+            pass          # lost the LRU race to a concurrent evict; the value stands
+        return hit
+    fp = "fused_" + hashlib.sha256(repr(memo_key).encode()).hexdigest()[:24]
+    _FUSED_FP_MEMO[memo_key] = fp
+    while len(_FUSED_FP_MEMO) > _FUSED_FP_MEMO_MAX:
+        _FUSED_FP_MEMO.popitem(last=False)
+    return fp
 
 
 def _binding_types_from_memo_key(memo_key: tuple) -> dict:
@@ -553,6 +585,15 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
                        _dropped, _MAX_FUSED_OUTPUTS)
 
     fused = A.Program(statements=fused_stmts)
+    # The WHOLE merged map, params included — this feeds the TypeChecker (via compile_ast), not
+    # the chain's identity. Identity is `_fused_memo_key`, which does the ANIM-1 filtering.
+    #
+    # An earlier draft filtered here too, by unioning the per-stage param sets and matching the
+    # de-prefixed name, and claimed the two "had to agree". They did not and need not: the union
+    # would drop `_s1_u_k` when `k` is a `$param` in stage 0 and an `@wire` in stage 1, taking a
+    # real wire's type out of the checker's map — while `_fused_memo_key` filters PER STAGE and
+    # would keep it. They need not agree because a param is INERT to the checker (its type comes
+    # from its declaration), which is the same fact that makes the filtering safe at all.
     binding_types = {name: infer_binding_type(val) for name, val in merged_bindings.items()}
 
     # STR-8: the post-parse pipeline (type-check → optimize → re-type-check → collect)

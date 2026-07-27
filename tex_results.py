@@ -470,6 +470,38 @@ class ResultCache:
         return freed
 
     # ── introspection / lifecycle ──
+    def sweep_temps(self) -> int:
+        """Drop crash-orphaned `tex_recovery` temps from the spill dir. Called from
+        `reindex_disk` (i.e. on ENG-13 recovery), which is exactly when a previous
+        process's leftovers are known to be dead."""
+        from .tex_recovery import sweep_temps as _sweep
+        try:
+            return _sweep(self._spill_dir())
+        except Exception:
+            return 0
+
+    def reindex_disk(self) -> tuple:
+        """ENG-13: re-walk the spill directory and adopt its size. Returns (frames, bytes).
+
+        A `ResultCache` in a fresh process already SERVES frames another process spilled —
+        `get` falls through to `_restore`, which reads by key and re-checks `env_epoch`. What
+        it lacks is the byte accounting, and a `None` total forces a reconciling scan on the
+        next spill, i.e. on a cook. This does that walk once, off the cook path, and is what
+        `tex_recovery.reattach` calls instead of reaching in for `_spill_dir`, `_disk_bytes`
+        and the `.frame` suffix from outside the class."""
+        self.sweep_temps()          # a crashed writer's leftovers are dead by definition
+        n = nbytes = 0
+        try:
+            with os.scandir(self._spill_dir()) as it:
+                for entry in it:
+                    if entry.name.endswith(".frame") and entry.is_file():
+                        n += 1
+                        nbytes += entry.stat().st_size
+            self._disk_bytes = nbytes
+        except OSError:
+            self._disk_bytes = None      # lost track: let the next spill reconcile
+        return n, nbytes
+
     def stats(self) -> dict:
         return {"ram_entries": len(self._ram), "ram_bytes": self._ram_bytes,
                 "budget_bytes": self._budget, "hits": self.hits, "misses": self.misses,
@@ -496,10 +528,21 @@ class ResultCache:
 
 
 def _atomic_pickle(path: str, data) -> None:
-    """Atomic pickle (temp + os.replace) — the frame-cache twin of TEXCache._atomic_pickle, so
-    a second process sharing the results/ dir never observes a half-written frame."""
+    """Atomic pickle, so a second process sharing the results/ dir never observes a
+    half-written frame. ENG-13 routes it through the shared `tex_recovery.atomic_write` — one
+    temp-and-rename discipline spelled once for every persisted engine file rather than once
+    per module.
+
+    STREAMED, not blobbed: `pickle.dump(data, f)` writes through the file object, where
+    `pickle.dumps` would materialize the whole frame as a second `bytes` copy first. This runs
+    from `_enforce_ram_budget`, i.e. *precisely when the RAM budget is already exceeded* — the
+    spill that exists to shed pressure must not transiently double it (measured 2.5× the frame
+    at 1024²; ~100 MB extra at 4K).
+
+    NOT fsynced, unlike the verdict files. A spilled frame is pure cache: losing one to a crash
+    costs a recook, which the cache is built to do anyway, and the flush measured 14 ms per
+    eviction on this box against 9.9 ms for the whole write. Durability is for state whose loss
+    is expensive to re-derive; this is not that."""
     import pickle
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, path)
+    from .tex_recovery import atomic_write
+    atomic_write(path, lambda f: pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL))

@@ -80,6 +80,22 @@ class EngineSession:
         from .tex_memory import free_tensor_caches
         free_tensor_caches()
 
+    def reattach(self, *, result_cache=None) -> dict:
+        """ENG-13: re-adopt the engine's persisted warm state IN THIS PROCESS, and report what
+        came back — `{"verdicts", "capturable", "frames", "frame_bytes", "errors"}`.
+
+        The recovery half of the crash contract. `reset()` sheds state a host no longer wants;
+        this is its opposite — a host whose engine thread died, or which is picking up a cache
+        directory another process wrote, calls it and keeps going without a restart. Nothing is
+        torn down and every restored fact merges with `setdefault` semantics, so anything this
+        session already learned (which is fresher) wins.
+
+        Pass the `ResultCache` a host armed to have its disk tier re-indexed too; spilled frames
+        are already SERVABLE without it (`get` falls through to `_restore`, which re-checks
+        `env_epoch`), so the argument buys the byte accounting and the report, not the frames."""
+        from .tex_recovery import reattach as _reattach
+        return _reattach(result_cache=result_cache)
+
     def close(self) -> None:
         """Shut the session down: `reset()` the tensor caches, then drop host services back to
         the process default. A standalone host calls this at exit (engine-era ENG-11 grows this

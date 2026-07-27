@@ -735,7 +735,8 @@ touching the frontend. FUS-0 ships as **v0.20.1** (hotfix, in flight).
 | v0.28.0 | **Second host** — the proof release | DATA-1, DATA-2, DATA-3, DATA-4, PORT-5 (PM-2) | `tex_io/exr.py`, `examples/host_demo.py` |
 | v0.29.0 | **Close the register** — the consolidation the v0.28 audit ordered; no new mechanisms | LIVE-1 (the overdue checklist run), FUS-1b/1c (the unshipped v0.21.1), ENG-4 re-cut, SCHED-3 interrupt bridge, BENCH-1 (cumulative v0.20↔v0.28 compare + PM-5 governor soak), DOCS-1 (status pass + DOC-6 amendment) | — |
 | v0.30.0 | **First viewer** — host_demo grows into the §8 rung-2 host; the switches flip *for that host* | ROI flag flip (per-cook `roi_exec`, nightly-fuzz-gated), codegen **ROI** routing (measured 0.94–0.96× → shipped OFF; ~~tile half~~ not built), ~~SCHED-2's first consumer~~ (deferred on measurement), ~~TOOL collapse picker~~ (human-gated), PM-6 ✅ | — |
-| v0.31+ → v1.0 | **Engine era** | §4 programs (GRAPH/XPU/DATA-5..7/STOCK/ML/ROTO/COLOR), each behind its own design doc | `tex_graph.py`, `tex_runtime/streams.py` |
+| v0.31.0 | **Never idle** — the scheduler grows two tiers (doc 39 §3) | SCHED-4 (three admission classes, cooperative preemption, head-requeue), PROF-1 (per-stage cost profiler, disarmed by default), PRED-1 (speculative admission by confidence × predicted cost), ANIM-1 (the keyframe contract, pinned + normative in LANGUAGE.md), ENG-13 (journal/fsync ordering + `session.reattach()`), PM-7 ✅ | `tex_cookqueue.py`, `tex_recovery.py`, `tex_runtime/profile.py` |
+| v0.32+ → v1.0 | **Engine era** | §4 programs (CACHE-7/9, GOV-1, GRAPH/XPU/DATA-5..7/STOCK/ML/ROTO/COLOR), each behind its own design doc | `tex_graph.py`, `tex_runtime/streams.py` |
 
 Per-release notes:
 

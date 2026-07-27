@@ -65,15 +65,15 @@ def _median(xs) -> float:
 def make_key(fingerprint: str, device_type: str, precision: str,
              spatial_shape) -> tuple:
     """Verdicts are resolution-dependent (the win/lose boundary moves with
-    pixel count), so bucket by (H*W).bit_length()."""
-    px = 1
-    if spatial_shape:
-        try:
-            _b, h, w = spatial_shape
-            px = int(h) * int(w)
-        except Exception:
-            px = 1
-    return (fingerprint, device_type, precision, max(1, px).bit_length())
+    pixel count), so bucket by (H*W).bit_length().
+
+    The bucketing itself comes from `profile.bucket_of` (PROF-1) rather than being
+    re-derived here. The two tables MUST agree: PRED-1 prices a program from PROF-1's
+    bucket and the tier verdict is committed at autotier's, so an octave rule that
+    changed in one place would have the cost table and the tier table describing
+    different cooks. Both modules are pure stdlib; no cycle."""
+    from .profile import bucket_of
+    return (fingerprint, device_type, precision, bucket_of(spatial_shape)[0])
 
 
 def _get(key: tuple) -> _KeyState:
@@ -212,7 +212,13 @@ def load() -> None:
                 st.interp_ms.append(float(rec["interp_ms"]))
             if rec.get("compiled_ms"):
                 st.compiled_ms.append(float(rec["compiled_ms"]))
-            _STATE[tuple(rec["key"])] = st
+            # setdefault, NOT assignment: at cold start `_STATE` is empty so this is the
+            # same thing, but `reload()` runs against a LIVE table and a persisted verdict
+            # must never overwrite one this session measured itself. `reattach` promises
+            # exactly that ("anything learned in THIS session wins"), and assignment broke
+            # it silently — a peer's REJECTED demoted a live COMMITTED to codegen-only
+            # while the report said 0 verdicts restored.
+            _STATE.setdefault(tuple(rec["key"]), st)
     except Exception:
         pass
 
@@ -228,12 +234,42 @@ def _persist() -> None:
              "compiled_ms": round(_median(st.compiled_ms), 4) if st.compiled_ms else None}
             for key, st in _STATE.items() if st.state in (COMMITTED, REJECTED)
         ]
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"version": _version_tag(), "verdicts": verdicts}, f)
-        os.replace(tmp, p)
+        # ENG-13: the shared atomic write, but NOT fsynced. Two reasons, both specific to
+        # this file. (1) `record_trial` runs on the COOK THREAD (compiled.run_auto), so an
+        # fsync here is a disk flush inline in a cook — and this rewrites the whole table on
+        # every terminal verdict, up to `_STATE_MAX` times per epoch. (2) A verdict lost to a
+        # machine crash costs one re-measure cycle, which the state machine performs by
+        # itself; the process-crash guarantee ENG-13 states comes from the atomic rename and
+        # is unaffected. No journal either: the loss window is already the single verdict
+        # being written. (If `_persist` is ever throttled to cut the O(N) rewrite, that is
+        # when it needs the journal+compact pattern warm_state uses.)
+        from ..tex_recovery import atomic_write_json
+        atomic_write_json(p, {"version": _version_tag(), "verdicts": verdicts})
     except Exception:
         pass
+
+
+def _reset_for_test() -> None:
+    """Test hook mirroring `warm_state._reset_for_test`: forget the table, the load latch
+    and the memoized path, so a fixture that moves TEX_CACHE_DIR is actually obeyed.
+    Without this, `tests/helpers.cold_engine_state` left autotier pinned to whichever
+    directory it saw first for the whole one-process suite run."""
+    global _loaded, _persist_path_cache
+    _STATE.clear()
+    _loaded = False
+    _persist_path_cache = None
+
+
+def reload() -> int:
+    """ENG-13: drop the load latch and re-read the persisted verdicts, returning how many NEW
+    keys arrived. What `tex_recovery.reattach` calls, so recovery does not have to know that
+    `load()` latches or that the table is `_STATE` (the counterpart to
+    `ResultCache.reindex_disk`)."""
+    global _loaded
+    _loaded = False
+    before = len(_STATE)
+    load()
+    return max(0, len(_STATE) - before)
 
 
 def seed_from_disk(key: tuple) -> None:

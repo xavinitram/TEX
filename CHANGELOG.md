@@ -5,6 +5,397 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] - 2026-07-26
+
+**Never idle** — the scheduler grows two tiers. The engine could already be *stopped*; now it
+can be *interrupted by something more important*. A cook queue with three admission classes
+preempts background work for interactive work at the yield points SCHED-3 already installed, a
+cost profiler finally gives "effort-based" a measured effort, a speculative protocol lets a
+host bet on what the user will need next, the keyframe guarantee becomes normative and tested,
+and an engine-process crash now loses at most the in-flight cook. All numbers are **sm_75**
+(RTX 2080 SUPER, no Triton); PM-7's target names the sm_120 box, so these are this hardware's,
+not a restatement of that claim.
+
+### The default cook path is unchanged (invariant #7) — warm AND cold
+Doc 39 §8 applies the invariant to *the queue and the profiler themselves*. Measured against a
+`HEAD` worktree:
+
+| probe | CPU | CUDA |
+|---|---|---|
+| **warm**: 24 synthetic programs @ 512², adaptive runs to CV<5% | **1.012 / 1.044 / 1.057 / 1.033×** | **0.997 / 0.998 / 1.001×** |
+| slower than baseline, of 24 | 0 / 3 / 0 / 0 | 0 / 0 / 0 |
+| **cold**: 120 never-before-seen programs, fresh cache dir, 3 interleaved reps | 1.005 / 1.007 / 1.027× | 0.998 / 1.021 / 1.011× |
+| 10-program A/B worktree probe, 2 reps | 0.997 / 0.980 | 1.011 / 1.012 |
+
+Every geomean is at or above 1.0 against a stop-ship line of 0.95. The CPU column is reported
+as several runs rather than one because it genuinely scatters ±5% between runs on this box — the
+honest reading is **neutral, not faster**, and the individual CPU rows above 1.05 are that
+scatter, not a win.
+
+One row (`vector_ops`, CPU) came back +8.7% twice in the low-rep probe, which would have been
+a stop-ship, so it was settled on its own: 200 reps × 3 interleaved runs gave HEAD
+4.939/5.015/5.024 ms against 4.963/4.944/4.971 ms — ratios 1.005/0.986/0.989. Probe noise.
+
+**The COLD row exists because the first version of this measurement did not, and missed a real
+regression.** Steady-state cooks were all it covered, and `+44.4% CPU / +45.6% CUDA on cold
+compile` hid behind that — see "Fixed before tagging" below. The cold path is the one a user
+hits on every code edit, so it is now part of the gate rather than an assumption.
+
+The scheduler is a module a host *constructs*; no engine module imports it (swept for import
+forms, not name-listed), and no thread exists until the first `submit()`. The profiler is
+disarmed by default, so the engine's whole cost is one `enabled()` call in `run()` and one in
+`Interpreter.execute` — 32.9 ns each, ~0.025% of a 260 µs cook.
+
+### SCHED-4 — the two-tier preemptive cook queue (`tex_cookqueue.py`)
+Design note: `docs/cook-queue-scheduling.md`.
+
+- **The preemption points already existed** — the load-bearing finding, and the reason an L
+  item shipped in one release. SCHED-3's `_cancel_check` already sits at every tier attempt,
+  every tile/batch/halo strip, and every top-level interpreter statement; `compile_fused`
+  splices a chain into ONE program whose statements carry `loc.stage` (Q-4), so *every
+  fused-stage boundary is already a poll site*. SCHED-4 adds **no instrumentation to the cook
+  path**. It mints the token, decides who may trip it, and decides what happens to the job
+  that was tripped. The diff to `tex_engine`'s cook path is empty, which is what makes
+  invariant #7 provable rather than asserted.
+- **Three admission classes, not two.** `INTERACTIVE` preempts everything and is never shed.
+  `COMMITTED` — a render the user explicitly started while continuing to work — pauses under
+  Tier A and is **never** shed. `SPECULATIVE` pauses under both and is shed **first**. Two
+  classes cannot express that: the last two are identical in priority and opposite in
+  durability, so a single "background" tier has to pick one and is wrong for half the work.
+- **Preempt and shed are distinct outcomes.** A preempted job returns to the **head** of its
+  class, still `PENDING`, and its waiter is never woken; a shed or cancelled job is terminal.
+  Collapsing them into one `cancelled` flag is how a scheduler silently loses work. Head- and
+  not tail-requeue, because tail-requeue under sustained Tier-A pressure is a livelock.
+- **A cook that returned is never discarded.** Preemption is cooperative, so a cook can finish
+  after the flag was raised and before the next yield. That result is real and already paid
+  for: the worker completes the job with it, whatever flags were set while it ran — written as
+  the `else` of the try, not as a post-cook flag check. The inverse would throw away completed
+  frames under exactly the load where frames are most expensive.
+- **A cancellation the queue did not cause is TERMINAL.** Requeue happens only for a preemption
+  the queue itself asked for. Reading "not shed, therefore transient" is a livelock rather than
+  a style question: a host token that stays tripped — a superseded slider frame, a global
+  Stop — raises again on the retry's first yield, forever, at the head of its class. Measured
+  at **452,729 requeues per second**, starving every other job. Found in review; pinned.
+- **One worker thread, not a pool** — a deliberate rejection. The tree-walking interpreter is
+  Python-heavy and holds the GIL between kernels, so a concurrent Tier-B cook would not overlap
+  Tier A; it would interleave two Python interpreters onto one core and slow Tier A down, which
+  is the one outcome the item exists to prevent. Mirrors `compiled._COMPILE_POOL`'s
+  `max_workers=1`. GRAPH-2's parallel region executor is what reopens it.
+
+### PROF-1 — the per-stage cost profiler (`tex_runtime/profile.py`)
+- **Minted because verification confirmed it did not exist.** Q-4 is stage-tagged *error*
+  attribution, not cost, and `autotier.cook_ms` is whole-program *and* only ever fed on the
+  `compile_mode="auto"` path — the default interpreter cook records nothing. Without it,
+  "effort-based" has no measured effort.
+- An EWMA keyed by (program fp, device, precision) and bucketed by `px.bit_length()`, plus a
+  per-**stage** breakdown for fused programs (CACHE-7's input in v0.32). **Disarmed by
+  default**; when armed, the first few cooks of an unseen key are measured and after that one
+  in 16, which is what makes the mandatory CUDA sync at each stage boundary affordable.
+- **Accuracy, measured.** A 3-stage fused chain at 256² CPU profiles as 0.75 / **2.27** / 0.72
+  ms against standalone cooks of the same three programs at 0.70 / **2.31** / 0.43 ms — the
+  four-blur stage is fingered at 3× its neighbours, which is the property a checkpoint
+  placement actually depends on.
+- **The cold cook does not get to anchor the estimate.** A key's first cook pays the compile,
+  the allocator growth and every kernel's first touch: the same chain reads 7.4 / 6.4 / 0.6 ms
+  cold. A fixed-α EWMA needs dozens of samples to shed that, and at a 1-in-16 rate that is
+  hundreds of cooks — long enough to rank a cheap stage above an expensive one for most of a
+  session. The blend is `α = max(0.35, 1/n)`: a running mean while a key is young, an EWMA once
+  it is established.
+
+### PRED-1 — the speculative-cook protocol
+- A host submits Tier-B work with a **confidence** and a **reason** (`panel-open`,
+  `play-hover`, `neighbor-frame`, …). **The host owns the psychology, TEX owns the economics**
+  — which UI signal means 0.8 is a question about users that only a real session answers, so
+  confidence is an input, never inferred from the reason.
+- **Admission is `confidence × predicted cost`**, and both halves matter. A job nobody will
+  probably want is refused however expensive it is; a job everyone will want is refused if it
+  is **cheap**, because the point of speculation is to hide latency the user would otherwise
+  feel and there is none to hide on work that is already instant. That second half is the
+  counter-intuitive one and it is pinned as a test row.
+- An **unmeasured** program is scored at a neutral placeholder rather than refused — a cold
+  session that refuses everything never cooks one, never measures one and never learns — but
+  only from a host confident enough to clear a separate brake.
+- **Shedding drops the lowest-scoring queued work first** and never touches the running job,
+  which has already paid for what it has done and will be preempted anyway if something urgent
+  arrives. `COMMITTED` is absent from the sheddable set by contract.
+- The queue **feeds PROF-1 back** from its own job bracket — no engine involvement, no sampling
+  gate, nothing on the default cook path — so the next speculative submit of the same program
+  is priced on a measured cost.
+
+### ANIM-1 — the keyframe contract, pinned and normative
+> A `$param` value is a cook-time binding. Changing it never recompiles, never re-optimizes,
+> never re-emits codegen, never recaptures a CUDA graph, and never changes the program's cache
+> identity.
+
+- True by accident of three separate decisions before this release, and tested as **one
+  property** now: `tests/test_v031_anim_contract.py` spies on the compiler, the codegen emitter
+  and the graph capturer across the interpreter, `auto` and `cuda_graph` tiers on both devices,
+  and over float / int / vec3 / string params, a fused mid-chain param, and the stock Grade
+  tool's promoted `$gamma`. Every sweep asserts N cooks, 0 compiles, 0 emissions, 0 captures,
+  0 new fingerprints. Merged into LANGUAGE.md §5.1 as normative.
+- **The guarantee was FALSE when first written** — see "Fixed before tagging". It is true now,
+  and the row that proves it is an int-crossing ramp (`[1, 1.5, 2, 2.5, 3, 0]` → one
+  fingerprint), asserted at the FINGERPRINT rather than through the spies, because identity *is*
+  the guarantee and a spy only sees a consequence of losing it.
+- **The negative control earned its keep twice.** It first failed because a code edit produced
+  *zero* compiles — the disk cache tier had the "new" programs from an earlier run, so the
+  assertion needs a genuinely cold cache, and without that fix the test would have passed
+  forever on any machine whose cache happened to be warm. It then caught a wrong claim in the
+  documentation draft: **a param's type comes from its declaration in the code**
+  (`f$k` / `v3$tint`), never from the bound value — `infer_binding_type` maps a float and a
+  3-float list to `FLOAT` alike — so "change a param's type" is not something a host can do at
+  cook time at all. The binding-type axis of the fingerprint is about `@` wires. LANGUAGE.md
+  says so.
+- **The contract's price, measured** (`benchmarks/param_scrub_bench.py`, 1000 cooks at 512²,
+  changing `$x` every cook). The shape of the result *is* the claim — a flat line, no
+  compile-cost slope, no periodic spike:
+
+| | CUDA | CPU |
+|---|---|---|
+| cold cook (the one compile) | 39.45 ms | 27.09 ms |
+| scrub, first decile → last decile | 0.3536 → 0.3508 ms (**slope 0.992×**) | 0.6884 → 0.6937 ms (**slope 1.008×**) |
+| max after warmup | 1.2169 ms | 1.1841 ms |
+| cost of *animating* vs a static param | **+0.0007 ms** | **+0.0049 ms** |
+| what a recompiling host would pay | 1.893 ms (**5.4×**) | 19.29 ms (**27.2×**) |
+
+The max-after-warmup rows are the ones that would catch a single recompile hiding in a
+thousand cooks: a recompile costs 2.9 ms (CUDA) / 18.8 ms (CPU), and the worst cook seen after
+warmup is 0.43 / 1.24 ms.
+
+### ENG-13 — the engine recovery contract (`tex_recovery.py`)
+- **A throttle is not a durability boundary** — the actual defect. `warm_state` coalesced
+  writes over a 5-second window and relied on `atexit` for the tail, and `atexit` does not run
+  on `os._exit`, a SIGKILL, or a crash. Up to five seconds of learning was lost, which is not
+  "at most the in-flight cook". Fixed with an append-only **journal**: a flushed line costs
+  microseconds, the throttled snapshot still compacts, and `load()` merges snapshot + journal.
+- **Ordering is the correctness argument**: snapshot first, clear the journal second, and only
+  if the snapshot succeeded. A crash in between replays records the snapshot already holds,
+  which is idempotent (a capturability verdict is a pure function of the AST and the arch); the
+  reverse order drops them. A torn final line — the signature of a crash mid-append — costs
+  exactly that one record.
+- **`os.replace` is atomic, not durable.** One `fsync` before the rename, now spelled once in
+  `tex_recovery.atomic_write` instead of in four near-identical private copies (`tex_cache`,
+  `tex_results`, `autotier`, `warm_state`). Honest platform note: making the *rename* durable
+  additionally needs a directory fsync, which POSIX has and Windows does not — so on Windows
+  the machine-crash guarantee is "never torn", not "never lost". The process-crash guarantee
+  ENG-13 states holds everywhere.
+- **`EngineSession.reattach()`** restores tier verdicts, capturability verdicts and a
+  `ResultCache`'s view of its own disk tier in a **live** process, and reports what came back.
+  Spilled frames were already servable (`get` falls through to `_restore`, which re-checks
+  `env_epoch`); what a fresh cache lacked was the byte accounting.
+- **The kill-the-process test** is the contract's own: a child cooks, learns a verdict inside
+  the throttle window, and dies via `os._exit(9)`. The parent asserts the snapshot does *not*
+  hold that verdict — so the recovery is attributable to the journal and not to a snapshot that
+  happened to fire — and then recovers it.
+
+### PM-7 (exit) — measured
+`benchmarks/cookqueue_bench.py` at 512², with a long speculative cook running and a backlog
+behind it. The target is "≤ 1 stage/tile boundary, single-digit ms at proxy res":
+
+| | CUDA | CPU |
+|---|---|---|
+| solo cook, no queue (control) | 0.336 ms | 0.671 ms |
+| through an **idle** queue | 0.402 ms (tax **+0.066 ms**) | 0.830 ms (tax **+0.159 ms**) |
+| **submit → tier start, under load** | **0.595 ms** | **0.804 ms** |
+| submit → first executed statement | 0.886 ms | 1.741 ms |
+| submit → result, under load | 1.018 ms (3.03× solo) | 1.882 ms (2.80× solo) |
+| speculative work: submitted / **resumed to DONE** | 27 / **27** | 27 / **27** |
+
+An order of magnitude inside the single-digit-ms bound, and nothing abandoned.
+
+**The starvation brake raised this row, and that is the trade.** Before it, `submit → tier
+start` was 0.193 ms (CUDA) / 0.506 ms (CPU) — because a running background cook was interrupted
+unconditionally, which is also why a real render never finished. With the quantum, a job already
+inside it is allowed to complete rather than be restarted, so Tier A sometimes waits out a short
+cook instead of shredding it. Bounded by `min_quantum_ms` (15 ms) plus one yield, and in
+exchange background renders complete at all. Both numbers are stated because the second is not
+an improvement on the first, it is a different contract.
+
+From the second host (`python examples/host_demo.py --bench-pm7`, a real slider scrub at 512²
+CUDA): interactive frame **1.46 ms** median, 3 of 12 frames served from a prefetch, and — the row
+that matters — **a COMMITTED render started mid-scrub completed, after 3 attempts**, alongside 36
+submitted / 29 completed / 9 preempted / 2 re-queued / 4 refused / 7 shed.
+
+The demo previously reported a requeue count as evidence of preemption; that was wrong twice
+over (first because it discarded the queue's token, then because its ~1.3 ms cooks sit inside the
+quantum and *should* not be interrupted). It now asserts the thing that is actually load-bearing
+— that a long background render finishes while the user keeps working — and the requeue path is
+pinned where the timing can be controlled, in the tests.
+
+### Second-consumer proof
+`examples/host_demo.py` cooks its viewport **through** the queue (`/frame` submits
+`INTERACTIVE`, then submits the two neighbouring slider values as `SPECULATIVE`
+`"play-hover"`), exposes the counters at `/stats`, and grows `--bench-pm7`. Doc 39 §0's rule is
+that every engine feature needs a second consumer or app logic smuggles itself into the engine;
+the demo supplies the confidence values and TEX supplies the arithmetic, which is exactly where
+PRED-1 draws the line.
+
+### Fixed before tagging (found by an 18-agent audit over the v0.31 diff)
+Twelve confirmed findings. **ANIM-1's guarantee was false as first written**, three items
+violated their own contracts, and the release did not import from a fresh clone at all.
+
+- **⓪ BLOCKER: a fresh clone could not import TEX.** Ten files — including all three new
+  modules — were never staged, while `tex_engine` and `interpreter` import
+  `tex_runtime.profile` unconditionally. Every entry point raised `ImportError`. Now staged, and
+  verified by materialising the exact tree that will be committed (`git archive` of the index)
+  and importing `tex_engine`, `tex_api`, `tex_cli` and the package route from it.
+- **① ANIM-1's guarantee was FALSE.** `prepare` built `binding_types` from the whole bindings
+  dict — `$params` beside `@wires` — and the fingerprint hashes those types. Since
+  `infer_binding_type` maps `2` → INT and `2.0` → FLOAT, **an animated `$k` ramping through a
+  whole number recompiled, re-emitted codegen and recaptured its CUDA graph mid-scrub**:
+  `[1, 1.5, 2, 2.5]` gave 2 identities and `omitted / 1.0 / 1` gave 3. JSON hosts send `2` for
+  whole numbers, and `host_demo` — the release's own consumer proof — serves params over
+  HTTP/JSON, so this was the shipping configuration. The same defect was in `_fused_memo_key`.
+  Fixed by excluding names used only with the `$` sigil, which is compile-neutral (the checker
+  reads `binding_types` on the `@`-wire branch only; a param's type comes from its declaration)
+  and deliberately *not* a blanket INT→FLOAT collapse, because a scalar wired to `@k`
+  legitimately keys INT apart from FLOAT — pinned as its own never-sever row.
+- **② COMMITTED renders starved permanently.** No quantum, no aging, no requeue cap, and a
+  preempted cook loses *all* its progress — so preemption does not pause a render, it restarts
+  it. A 460 ms render against a 5 Hz slider made **156 attempts and 0 completions in 25 s**.
+  `T_render > mean interactive gap ⇒ never completes`, and CACHE-2 cannot mitigate it (a cook
+  that never finishes never populates a cache — the design note claimed otherwise and was
+  wrong). Fixed with a two-part brake: a `min_quantum_ms` during which a running job is not
+  interrupted, and a `max_preemptions` budget after which it runs to completion. The same render
+  now finishes **in 1.2 s after 4 attempts**. Note the quantum is enforced by the *token*, not at
+  the submit site — refusing to set the flag would DROP the request rather than defer it, and
+  nothing would re-raise it.
+- **③ The livelock was only half fixed.** `if job.preempt_requested` asks "was a preempt
+  pending?", not "did our token raise this?" — so a foreign cancel landing while a preempt was
+  outstanding was still misclassified transient and requeued forever against a token that can
+  never stop raising. `_JobToken` now stamps the job when *it* raises, and only that stamp
+  requeues.
+- **④ The worker thread died permanently.** The PROF-1 feedback sits in the `else:` of the run
+  try — covered by none of its handlers — and `_run` had no outer guard, so a host passing a
+  `list` instead of a tuple as `profile_key` killed the only worker, after which every waiter,
+  `drain()` and `close()` hung with no diagnostic. Two guards: the feedback can no longer cost a
+  result, and the loop survives anything, charging it to the job.
+- **⑤ PRED-1 admitted what it documents as refused.** `confidence × cost` bounds neither factor,
+  so confidence 0.02 on a 400 ms render scored 8.0 and was **admitted** — verbatim the
+  counter-example below. Each factor now carries its own bound (`min_confidence`, `max_cost_ms`)
+  on top of the product.
+- **⑥ PROF-1 mis-keyed every fused chain.** At the default `compile_mode="none"`, `fused_fp` was
+  unset and `fp` is None on a chain, so the key degenerated to `None|device|precision` and two
+  structurally different chains collapsed onto one entry — inverting the per-stage ranking
+  CACHE-7 consumes in v0.32. `fused_fp` is now computed for every mode (no routing change:
+  `select_tier` returns "default" for `"none"` regardless).
+- **⑦ `profile._STATE` had no lock** — two real mutators in the shipped config (the cook thread
+  when armed, the queue's worker even when disarmed) and `RuntimeError: OrderedDict mutated
+  during iteration` 3/3 runs. Locked; `enabled()` stays outside it so the default path is
+  untouched.
+- **⑧ Two ENG-13 loss paths.** `Journal.replay()` raised `UnicodeDecodeError` out of the
+  function on a single bad byte, discarding **every** good record — turning a one-record loss
+  into total loss, in the code whose whole job is surviving a torn write. And `persist()` cleared
+  the journal after taking the snapshot, losing a verdict learned *during* the write; it now
+  counts what it supersedes first and drops only that prefix.
+- **⑨ ANIM-1's own spies were vacuous** — zeroing the emission and capture counters left all 13
+  rows passing, because nothing ever proved a counter could be non-zero. That is *why* a false
+  guarantee shipped undetected. Each spy is now shown counting before anything is asserted to be
+  zero.
+- **🛑 Cold compile was +44.4% CPU / +45.6% CUDA** — the regression the release's own gate
+  missed, because it measured steady-state cooks only. `TEXCache._atomic_pickle` routed through
+  `atomic_write` with the default `fsync=True`, inline on the cook thread, on the first cook of
+  every distinct program — i.e. on every code edit and every re-queue. An artifact is pure cache
+  (loss costs one ~2.5 ms recompile, and `_load_from_disk` already unlinks-and-recompiles on a
+  bad load), so it no longer fsyncs. Cold compile is now within ~1% of HEAD. The ANIM-1 fix's own
+  lexer scan cost 56 µs per unique program on the same path; it is now skipped entirely unless a
+  binding's type is value-sensitive at all, which the default `{"A": image}` cook never is.
+
+### Fixed before tagging (a second pass: four review agents, then four adversarial hunters)
+Every one of these was reproduced before it was fixed, and the repro re-run after.
+
+- **The shed dropped the BEST speculative bet, not the worst** — and it was self-inflicted, in
+  the round that replaced a `sorted()` with `dq.pop()` on the reasoning that the deque is
+  score-ordered. Head-requeue puts a preempted job at the FRONT regardless of score, so once
+  the tail grows past it *the tail is the maximum*. Reachable from the shipped
+  `SpeculativePolicy` alone (its `shed()` runs on every submit), not just the manual valve.
+  The victim is now found by `min()`, and the score-ordered insert skips the resume prefix
+  instead of stopping at it.
+- **`reattach()` silently DOWNGRADED this session's tier verdicts.** `autotier.load()` assigned
+  rather than `setdefault`-ing, which is identical at cold start and wrong against a live
+  table — a peer instance's `REJECTED` replaced a `COMMITTED` this session had *measured*, and
+  the report said `verdicts: 0`. That is exactly the case `reattach` is advertised for
+  ("adopting a cache directory another process wrote"), and exactly the merge semantics its
+  own docstring promises.
+- **One corrupt journal line disabled warm state for the process.** `Journal.replay()`
+  guarantees well-formed JSON, not a *dict* — a line that is validly `42` raised
+  `AttributeError` out of `load()`, and `ensure_loaded` latches `_loaded` *before* calling it,
+  so nothing ever retried and `graphed` swallowed the error. That re-introduced one level up
+  the "one bad line loses everything" failure `replay()`'s own `errors="replace"` had just
+  fixed.
+- **An append after a torn tail ate the record it acknowledged.** A crash mid-append leaves a
+  line with no terminator; the next append concatenated onto it, merging two records into one
+  malformed line and returning `True`. Now a leading newline terminates the torn line — inert,
+  because `count()`, `replay()` and `drop_prefix` all skip blanks identically (verified across
+  LF/CRLF/torn/BOM/NUL shapes).
+- **Two instances sharing a cache dir lost each other's verdicts.** `persist()` overwrote the
+  whole table from the *local* memo and compacted a journal it did not exclusively own —
+  measured at two verdicts lost across an `os._exit` with nothing in flight. It now re-reads
+  before writing; `load()` adopts by `setdefault`, so the merge only ever ADDS.
+- **An unguarded LRU race on both new memos**, found independently by two hunters. `get()` then
+  `move_to_end()` is two operations, and `sigil_names` now sits under `TEXCache.fingerprint` —
+  i.e. on every cook — where a `KeyError` escapes `_compile_or_raise` and fails the whole
+  prompt. `tex_fusion._FUSED_MEMO` has guarded this exact pattern for releases, naming the
+  same concurrency; the two new memos reintroduced it. Both now guarded.
+- **A failed `Thread.start()` wedged the queue permanently** (`_worker` was published before the
+  start succeeded, and `_ensure_worker` refuses to replace a non-None worker); **a host policy
+  raising in `shed()` failed `submit()` for the caller while the cook ran anyway**; **`close()`
+  returned early for every caller but the first**, claiming shutdown mid-cook; the crash-orphaned
+  `mkstemp` temps were unbounded and invisible to every reclaim path; and the memoized `_path()`
+  cached the *result* of `makedirs`, so a removed cache dir killed persistence forever where the
+  old per-call form self-healed.
+- Two comments were wrong in ways that invited deleting load-bearing code: the `@`-set
+  subtraction in `param_only_names` is **not** belt-and-braces (E3202 only fires if the name was
+  already referenced, so `f$k` + `@k` compiles clean and the subtraction is what keeps a real
+  wire's type in the key), and `preempt_denied` never covered the quantum (a deferral is not a
+  refusal).
+
+**One intended consequence worth naming**, since a hunter's cross-version differential caught it
+and the notes above did not: computing `fused_fp` for every mode also gives a fused chain real
+CACHE-1 lineage keys at `compile_mode="none"`, where v0.30 returned `None`. Verified to separate
+on every axis it owns — stage param, stage code, stage order, stage count, terminal code,
+terminal param. Otherwise the differential over 116 examples × 2 devices × 3 modes, plus fused
+chains and ROI cooks, is **pixel-identical to v0.30**.
+
+And the first cleanup pass, whose findings were also defects rather than tidying:
+
+- **The consumer proof did not prove preemption.** `QueuedHost` handed the engine its own
+  supersede token and *ignored the queue's*, so `_JobToken.check()` was never reached and the
+  demo's counters read `10 preempted, 0 re-queued` — admission and shedding were exercised, the
+  item's headline mechanism was not. Now the two tokens are chained (the queue's is not
+  optional; it is the only channel preemption, shedding and `close()` travel down), and the
+  same scrub reads **10 preempted, 10 re-queued**. This and the livelock above are the same
+  root cause seen from two ends.
+- **The frame spill got 2.6× slower and 2.5× hungrier.** Routing `ResultCache._spill` through
+  the shared write turned a streaming `pickle.dump` into a `pickle.dumps` blob plus an
+  unconditional fsync: 9.9 → 26.0 ms and 1.0 → 2.5× the frame in transient RAM at 1024²
+  (~100 MB extra at 4K) — on the path that runs *precisely when the RAM budget is already
+  exceeded*. `atomic_write` now takes a streaming callable, and the fsync is applied where it
+  earns its cost: not to spilled frames (pure cache, loss = a recook) and not to the
+  verdict/cost tables that `record_trial` writes **from the cook thread**, but yes to compile
+  artifacts and warm state.
+- **A fifth private `tmp + os.replace` survived the consolidation** — `xfer.json` — and the
+  canary could not have caught it, because it listed four filenames. Converted, and the canary
+  is now a sweep for the pattern with the two legitimate `mkstemp` users allow-listed.
+- **`atomic_write` used a fixed `path + ".tmp"`**, while `tex_snippets` had already worked out
+  and documented why that is wrong (two writers race one temp, and the failure-path cleanup
+  deletes the other's in-flight file) — and the motivating case in `tex_cache` and `tex_results`
+  is literally "a second ComfyUI instance sharing the dir". It generalized downward; it now
+  uses `mkstemp` in the target directory.
+- **An idle worker pinned the last cook's input and output tensors.** The worker's `token` was
+  never rebound before parking, so `token → Job → fn` (a closure over the input frame) and
+  `Job.value` (the output) stayed reachable across the whole idle gap between drags — VRAM the
+  allocator could not reuse. One line.
+- Plus the ordinary cleanups: the shed loop pops the tail of an already-ordered deque instead
+  of sorting it (~830 → 26 ns per submit), `drain()` waits on the condition instead of polling
+  at 20 Hz, `submit()` stopped taking the lock twice, the two profiler context managers became
+  one (which makes double-advancing the sampling gate structurally impossible), and the
+  octave-bucketing rule autotier and PROF-1 must agree on is now written once.
+
+### Suite
+**2423/2423 passed** (2307 at v0.30), with one row skipped on a CPU-only box. No language-version change: ANIM-1 adds no
+surface, so the frozen compat corpus is untouched.
+
 ## [0.30.0] - 2026-07-26
 
 **First viewer** — ROI execution stops being dormant. `roi=` becomes a production path a host

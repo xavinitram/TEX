@@ -495,9 +495,9 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
     if cap is None:
         cap = _capturable(program)
         _capturable_memo[fingerprint] = cap
-        try:                                   # CACHE-3: persist the new verdict (throttled)
+        try:                                   # CACHE-3 snapshot (throttled) + ENG-13 journal
             from . import warm_state as _ws
-            _ws.note_update()
+            _ws.note_update(fingerprint)       # named, so the journal can make it crash-tight
         except Exception:
             pass
     capturable, est_ops = cap

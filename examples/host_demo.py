@@ -38,7 +38,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(_HERE)))   # .../custom_nodes
 
 import torch
-from TEX_Wrangle import tex_engine, tex_fusion, tex_results, tex_marshalling, tex_api, tex_roi
+from TEX_Wrangle import (tex_engine, tex_fusion, tex_results, tex_marshalling, tex_api, tex_roi,
+                         tex_cookqueue)
+from TEX_Wrangle.tex_runtime import profile as tex_profile
 from TEX_Wrangle.tex_runtime.host import NullHostServices, CookCancelled
 
 
@@ -54,6 +56,21 @@ class _Cancel:
     def check(self):
         if not self.alive:
             raise CookCancelled("superseded by a newer frame")
+
+
+class _Chain:
+    """Two CancelTokens as one: the SCHED-4 queue's per-attempt token AND this host's own
+    supersede latch. A cook takes exactly one `cancel=`, and the queue's token is not optional
+    — it is the only channel preemption, shedding and `close()` travel down — so a host with a
+    second reason to abort chains rather than substitutes."""
+    __slots__ = ("a", "b")
+
+    def __init__(self, a, b):
+        self.a, self.b = a, b
+
+    def check(self):
+        self.a.check()
+        self.b.check()
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BENCH_RES = 1024          # the PM-2 measurement resolution
@@ -404,6 +421,119 @@ class Host:
         return bytes(u8.reshape(-1).tolist())
 
 
+class QueuedHost:
+    """v0.31 — the SCHED-4 / PRED-1 consumer proof (doc 39 §0: every engine feature needs a
+    second consumer, or app logic smuggles itself into the engine).
+
+    A viewer's slider is exactly the workload the cook queue exists for. Every drag submits an
+    INTERACTIVE frame; every settled value ALSO submits its two neighbours as SPECULATIVE
+    "play-hover" work, on the bet that the user is still dragging. When the next drag arrives
+    it preempts whichever prefetch is mid-cook, and the abandoned prefetch goes back on the
+    queue rather than being thrown away.
+
+    The host supplies the psychology and TEX supplies the economics, which is the PRED-1 split:
+    this file decides that a neighbouring slider value is worth `_NEIGHBOUR_CONFIDENCE`, and
+    `SpeculativePolicy` decides whether that bet clears the floor once PROF-1 has priced the
+    program. Nothing here reaches inside the engine — it is `submit()`, `cancel()`, `result()`."""
+
+    _NEIGHBOUR_CONFIDENCE = 0.45      # "still dragging" — a guess this host owns, not TEX
+    _NEIGHBOUR_STEPS = (-0.05, 0.05)
+
+    def __init__(self, host: "Host"):
+        self.host = host
+        self.queue = tex_cookqueue.CookQueue(name="tex-demo-cook")
+        # A low floor and a shallow backlog: a viewer wants a couple of frames of lookahead,
+        # not a queue that outlives the drag it was predicting.
+        self.queue.install_policy(tex_cookqueue.SpeculativePolicy(
+            min_value_ms=0.2, max_pending=4, unknown_min_confidence=0.4))
+        self.pkey = tex_profile.make_key(host.fp, DEVICE, "fp32")
+        self.px = host.res * host.res
+
+    def _submit(self, strength: float, klass: int, reason: str, confidence: float):
+        # The cook MUST receive the queue's own token — that is the only thing `_JobToken.check`
+        # is ever called through, so a job that swaps it for another can never be preempted,
+        # shed, or stopped by `close()`. An interactive frame ALSO wants the host's supersede
+        # latch (a newer slider drag beats an older cook of the same class, which the queue
+        # will not do for it: same-class work is FIFO), so those two are chained rather than
+        # one replacing the other.
+        if klass == tex_cookqueue.INTERACTIVE:
+            supersede = self.host.new_request()
+            fn = (lambda cancel: self.host.cook(strength, cancel=_Chain(cancel, supersede)))
+        else:
+            fn = (lambda cancel: self.host.cook(strength, cancel=cancel))
+        return self.queue.submit(fn, klass=klass, reason=reason, confidence=confidence,
+                                 profile_key=self.pkey, px=self.px)
+
+    def frame(self, strength: float, *, timeout: float = 30.0):
+        """The viewer's frame request. Returns (frame, cook_ms, was_cache_hit)."""
+        out = self._submit(strength, tex_cookqueue.INTERACTIVE, "slider", 1.0).result(timeout)
+        # Prefetch the neighbours AFTER the frame is in hand, so the speculation can never
+        # be what the interactive request is waiting behind.
+        for d in self._NEIGHBOUR_STEPS:
+            nxt = round(min(1.0, max(0.0, strength + d)), 4)
+            if nxt != strength:
+                self._submit(nxt, tex_cookqueue.SPECULATIVE, tex_cookqueue.PLAY_HOVER,
+                             self._NEIGHBOUR_CONFIDENCE)
+        return out
+
+    def stats(self) -> dict:
+        return self.queue.snapshot()
+
+    def close(self) -> None:
+        self.queue.close()
+
+
+def bench_pm7(res: int = DISPLAY_RES, frames: int = 12) -> dict:
+    """PM-7 from the DEMO's side: does a slider drag actually preempt the prefetches it left
+    behind, and does the abandoned work survive?
+
+    `benchmarks/cookqueue_bench.py` measures the queue in isolation; this measures it inside a
+    real host, which is the part doc 39 §4 asks for. The scrub walks a slider the way a user
+    does — small steps, never revisiting — so every frame lands on speculation that is either
+    already cooked (a win) or still cooking (a preemption)."""
+    host = Host(res)
+    qh = QueuedHost(host)
+    try:
+        qh.frame(0.5)                                  # prime: compile, warm the tiers
+        qh.queue.drain(timeout=60)
+
+        # A COMMITTED render started while the user keeps scrubbing — the workload the
+        # starvation brake exists for, and the one the demo has to be able to finish. Long
+        # enough (many yield points) that the slider genuinely lands on it mid-flight.
+        heavy = ("vec4 b0 = gauss_blur(@IN, 5.0);\n"
+                 + "\n".join(f"vec4 b{i} = gauss_blur(b{i-1}, 5.0);" for i in range(1, 30))
+                 + "\n@OUT = b29;")
+        render = qh.queue.submit(
+            lambda cancel: tex_engine.cook(heavy, {"IN": host.source}, device_mode=DEVICE,
+                                           precision="fp32", cancel=cancel),
+            klass=tex_cookqueue.COMMITTED, reason="user render")
+
+        lat, hits = [], 0
+        for i in range(frames):
+            s = round(0.10 + i * 0.05, 4)
+            t0 = time.perf_counter()
+            _frame, _ms, hit = qh.frame(s)
+            lat.append((time.perf_counter() - t0) * 1000.0)
+            hits += 1 if hit else 0
+        render_done = render.wait(120.0)
+        qh.queue.drain(timeout=120)
+        st = qh.stats()["stats"]
+        return {"res": res, "device": DEVICE, "frames": frames,
+                "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+                "capability": ("sm_" + "".join(map(str, torch.cuda.get_device_capability(0))))
+                              if torch.cuda.is_available() else None,
+                "interactive_median_ms": round(statistics.median(lat), 3),
+                "prefetch_hits": hits,
+                "committed_render_completed": bool(render_done),
+                "committed_render_attempts": render.attempts,
+                "submitted": st["submitted"], "completed": st["completed"],
+                "preempted": st["preempted"], "requeued": st["requeued"],
+                "preempt_denied": st["preempt_denied"],
+                "refused": st["refused"], "shed": st["shed"]}
+    finally:
+        qh.close()
+
+
 def run_benchmark() -> bool:
     """PM-2: cook the fused chain warm at 1024^2 and report the per-frame median. Returns pass/fail."""
     host = Host(BENCH_RES)
@@ -447,6 +577,9 @@ s.addEventListener('input',draw); draw();
 
 def serve(host: Host, port: int) -> None:
     page = (_PAGE % {"res": host.res}).encode()
+    # v0.31: the viewer cooks THROUGH the SCHED-4 queue, so the demo genuinely submits,
+    # preempts and cancels rather than merely being able to. `/stats` exposes the counters.
+    qh = QueuedHost(host)
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -458,15 +591,17 @@ def serve(host: Host, port: int) -> None:
                 self._send(200, "text/html; charset=utf-8", page)
             elif u.path == "/frame":
                 strength = float(parse_qs(u.query).get("s", ["0.5"])[0])
-                tok = host.new_request()                  # SCHED-3: supersedes any in-flight cook
                 try:
-                    frame, ms, hitq = host.cook(strength, cancel=tok)
+                    frame, ms, hitq = qh.frame(strength)
                 except CookCancelled:
                     self._send(204, "text/plain", b"")    # a newer frame won; the browser skips this
                     return
                 body = host.rgba_bytes(frame)
                 self._send(200, "application/octet-stream", body,
                            extra={"X-Cook-Ms": f"{ms:.1f}", "X-Cache": "HIT" if hitq else "cooked"})
+            elif u.path == "/stats":
+                import json as _json
+                self._send(200, "application/json", _json.dumps(qh.stats()).encode())
             else:
                 self._send(404, "text/plain", b"not found")
 
@@ -481,10 +616,13 @@ def serve(host: Host, port: int) -> None:
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
     print(f"TEX host demo on http://127.0.0.1:{port}  (Ctrl-C to stop)")
+    print(f"  cooking through the SCHED-4 queue; counters at http://127.0.0.1:{port}/stats")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         srv.shutdown()
+    finally:
+        qh.close()
 
 
 def main():
@@ -492,10 +630,28 @@ def main():
     ap.add_argument("--bench", action="store_true", help="run only the PM-2 benchmark, no server")
     ap.add_argument("--bench-pm6", action="store_true",
                     help="run only the PM-6 ROI-viewport benchmark (10-node comp), no server")
+    ap.add_argument("--bench-pm7", action="store_true",
+                    help="run only the PM-7 cook-queue scrub (SCHED-4 + PRED-1), no server")
     ap.add_argument("--resolution", type=int, default=1024, help="PM-6 frame size (default 1024)")
     ap.add_argument("--roi", type=int, default=512, help="PM-6 viewport window (default 512)")
     ap.add_argument("--port", type=int, default=8760)
     args = ap.parse_args()
+
+    if args.bench_pm7:
+        r = bench_pm7(res=DISPLAY_RES)
+        print(f"\n=== PM-7: a slider scrub through the SCHED-4 queue @ {r['res']}^2, "
+              f"{r['capability'] or r['device']} ===")
+        print(f"  interactive frame (median) : {r['interactive_median_ms']:8.2f} ms")
+        print(f"  served from a prefetch     : {r['prefetch_hits']}/{r['frames']}")
+        print(f"  COMMITTED render finished  : {r['committed_render_completed']} "
+              f"(attempts={r['committed_render_attempts']})")
+        print(f"  queue: {r['submitted']} submitted, {r['completed']} completed, "
+              f"{r['preempted']} preempted, {r['requeued']} re-queued, "
+              f"{r['preempt_denied']} preempts denied by the brake, "
+              f"{r['refused']} refused, {r['shed']} shed")
+        if r["capability"]:
+            print(f"  NOTE: measured on {r['capability']} — PM-7 names the sm_120 box.")
+        sys.exit(0)
 
     if args.bench_pm6:
         r = bench_pm6(res=args.resolution, roi_side=args.roi)

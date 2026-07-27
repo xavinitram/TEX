@@ -62,6 +62,7 @@ __all__ = [
     # Test helpers
     "SubTestResult", "compile_and_run", "compile_and_infer", "check_code",
     "run_both", "assert_equiv", "check_val", "make_img", "make_latent",
+    "cold_engine_state", "lint_sources",
     "_MAX_LOOP_ITERATIONS",
 ]
 
@@ -307,3 +308,90 @@ def make_latent(B=1, C=4, H=4, W=4, seed=42) -> dict:
     """Fake LATENT dict with 'samples' key in [B,C,H,W] layout."""
     torch.manual_seed(seed)
     return {"samples": torch.rand(B, C, H, W)}
+
+
+class cold_engine_state:
+    """A scratch `TEX_CACHE_DIR` + a clean warm-state/verdict table for the duration of a block,
+    restored exactly on the way out.
+
+    Four v0.31 tests needed this and three had hand-rolled it, which is a real hazard rather
+    than a tidiness one: `run_all.py` runs the whole suite in ONE process, in order, so a single
+    missed restore leaks a deleted cache directory into every later test. One implementation,
+    one teardown.
+
+    It is also load-bearing for correctness in at least one place: a cache probe checks memory
+    and then DISK, so a test asserting "this program compiles" has to start from a cache that
+    has never seen it — otherwise it passes vacuously on the second run of the suite.
+
+        with cold_engine_state():
+            ...                       # a fresh cache dir; warm state and memo start empty
+
+    `warm=True` (the default) also clears `graphed._capturable_memo`, `profile._STATE` and
+    `warm_state`'s load latch + path/tag memos; pass False when only the program cache matters.
+
+    PROF-1's cost table belongs in that list even though it is not "warm state" in the CACHE-3
+    sense: it is process-global engine state this release adds, it is keyed by fingerprints that
+    a scratch cache dir invalidates, and leaving it out is exactly the leak class this fixture
+    was written to end."""
+
+    def __init__(self, *, warm: bool = True):
+        self.warm = warm
+        self.dir = None
+
+    def __enter__(self):
+        from TEX_Wrangle import tex_cache
+        from TEX_Wrangle.tex_runtime import graphed, warm_state, profile, autotier
+        self._cache_mod, self._graphed, self._ws = tex_cache, graphed, warm_state
+        self._prof, self._autotier = profile, autotier
+        self.dir = tempfile.mkdtemp(prefix="tex_cold_")
+        self._prev_env = os.environ.get("TEX_CACHE_DIR")
+        self._prev_cache = tex_cache._cache_instance
+        os.environ["TEX_CACHE_DIR"] = self.dir
+        tex_cache._cache_instance = None
+        if self.warm:
+            self._prev_memo = dict(graphed._capturable_memo)
+            graphed._capturable_memo.clear()
+            warm_state._reset_for_test()
+            profile.reset()
+            autotier._reset_for_test()
+        return self
+
+    def __exit__(self, *exc):
+        if self._prev_env is None:
+            os.environ.pop("TEX_CACHE_DIR", None)
+        else:
+            os.environ["TEX_CACHE_DIR"] = self._prev_env
+        self._cache_mod._cache_instance = self._prev_cache
+        if self.warm:
+            self._graphed._capturable_memo.clear()
+            self._graphed._capturable_memo.update(self._prev_memo)
+            self._ws._reset_for_test()
+            self._prof.reset()
+            self._autotier._reset_for_test()
+        shutil.rmtree(self.dir, ignore_errors=True)
+        return False
+
+
+def lint_sources(pattern, *, allow=(), flags=0) -> list:
+    """Every package `.py` (excluding tests/) whose text matches `pattern`, as `"rel:line"`.
+
+    The shared shape behind the source canaries — PORT-1's comfy-import lint, S-1's, ENG-13's
+    stray-`os.replace` sweep and SCHED-4's invariant-#7 sweep. It walks with `rglob`, which is
+    the point: the two v0.31 canaries had each hardcoded a couple of globs, so `tex_compiler/`
+    was unswept by one and anything added in a new subpackage by both — and "the list missed a
+    file" is the exact failure the ENG-13 canary was rewritten to stop having."""
+    import re as _re
+    rx = _re.compile(pattern, flags)
+    out = []
+    root = Path(_pkg_dir)
+    for path in root.rglob("*.py"):
+        rel = path.relative_to(root).as_posix()
+        if rel in allow or rel.startswith("tests/") or "/tests/" in f"/{rel}":
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for m in rx.finditer(text):
+            out.append(f"{rel}:{text[:m.start()].count(chr(10)) + 1}")
+    return out

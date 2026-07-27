@@ -67,6 +67,89 @@ def _get_worley3d_offsets(device: torch.device, ndim: int) -> tuple:
     return offs
 
 
+# ── Coordinate rank normalization ────────────────────────────────────────────
+#
+# Nothing obliges a caller to pass coordinates that all share a shape. A constant
+# argument — `fbm(u * 8.0, v * 8.0, 0.5, 4)`, `curl(0.5, v * 8.0)` — arrives here
+# as a 0-dim tensor sitting beside full [B, H, W] grids, and the pointwise noise
+# bodies broadcast it without complaint.
+#
+# Two kinds of code do NOT broadcast it: the GPU batching paths, which stack N
+# frequency- or offset-shifted copies of each coord onto a new leading axis, and
+# the accumulator allocations, which size themselves from coords[0] alone. Both
+# used to work only because every coord happened to carry the grid's rank — so a
+# scalar coord made noise diverge by device (the batching is GPU-only) or fail
+# outright. These helpers state the assumption and hold it for any mix of ranks.
+
+def _widest(coords: tuple) -> torch.Tensor:
+    """The coord that carries the broadcast result's rank, dtype and device.
+
+    Ties go to the first, so when every coord already shares a shape this is
+    coords[0] and the callers below reduce exactly to what they did before.
+    """
+    return max(coords, key=lambda c: c.dim())
+
+
+def _stack_coord(parts: list, coord: torch.Tensor, rank: int) -> torch.Tensor:
+    """`torch.stack(parts, dim=0)` with the new leading axis kept leading.
+
+    Every entry of `parts` derives from `coord`, so they all carry its shape.
+    When that rank is below `rank` — the widest coord in the batch — a plain
+    stack is wrong: a 0-dim coord stacks to [N], which broadcasting then RIGHT-
+    aligns against a sibling's [N, B, H, W], putting N against W. Padding the gap
+    with singleton dims reproduces exactly the alignment the un-stacked coords
+    would have had.
+
+    The padding is free: a scalar stays [N, 1, 1, 1] instead of being expanded
+    out to the grid, so batching a constant coord costs no extra memory.
+    """
+    stacked = torch.stack(parts, dim=0)
+    pad = rank - coord.dim()
+    if pad:
+        stacked = stacked.reshape((len(parts),) + (1,) * pad + tuple(coord.shape))
+    return stacked
+
+
+def _align_coords(coords: tuple, ref: torch.Tensor) -> tuple:
+    """Coords on ONE device and ONE dtype, ready to be stacked.
+
+    Stacking is what forces this. An un-stacked 0-dim coord is dtype-WEAK — torch
+    promotes `fp32_grid + fp16_scalar` to fp32, which is why the per-octave path never
+    cared — but `_stack_coord` turns it into a RANKED tensor, and a ranked tensor is
+    dtype-STRONG. `torch.lerp` on CUDA then rejects a weight whose dtype differs from its
+    endpoints ("expected dtype float for `weight` but got c10::Half") where CPU's lerp
+    accepts it: a device divergence with the same cause as the rank one, a constant coord
+    that does not look like its siblings. It is reachable — under `precision="fp16"` the
+    engine hands the noise layer fp32 `u`/`v` grids and casts the literal to fp16, so
+    `fbm(u*8.0, v*8.0, 0.5, 4)` hits it.
+
+    Promoting up front restores exactly what the un-stacked path computes (torch's own
+    promotion rule, applied once instead of per-op), and the device hop covers a constant
+    that `_to_tensor` built on the CPU. Both are no-ops when the coords already agree, so
+    the fp32 same-shape path is untouched.
+    """
+    dt = coords[0].dtype
+    for c in coords[1:]:
+        dt = torch.promote_types(dt, c.dtype)
+    return tuple(c if (c.dtype == dt and c.device == ref.device)
+                 else c.to(device=ref.device, dtype=dt)
+                 for c in coords)
+
+
+def _zeros_broadcast(coords: tuple) -> torch.Tensor:
+    """A zero accumulator shaped like the broadcast of every coord.
+
+    `torch.zeros_like(coords[0])` is correct only while the coords share a shape:
+    a scalar in the first slot makes a 0-dim accumulator, and the first in-place
+    `add_` of a full grid into it fails outright. dtype and device come from the
+    widest coord, so a 0-dim constant cannot drag the accumulator off the cook's
+    precision or device.
+    """
+    ref = _widest(coords)
+    return torch.zeros(torch.broadcast_shapes(*(c.shape for c in coords)),
+                       dtype=ref.dtype, device=ref.device)
+
+
 # ── Arithmetic hash Perlin noise (table-free, TorchInductor-friendly) ────────
 #
 # Replaces permutation table lookups with pure integer arithmetic (lowbias32
@@ -253,6 +336,44 @@ def _simplex2d_fast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 # Number of calls before attempting torch.compile (allows jit.trace to warm up first)
 _COMPILE_AFTER_CALLS = 3
 
+# Upper bound on the settle loop below. torch's profiling executor needs
+# `_jit_get_num_profiled_runs()` (1 on every torch TEX supports) unoptimized runs, so
+# convergence normally lands on the 2nd or 3rd; 8 is slack for a future torch that
+# profiles more, and a hard stop so a pathological input cannot spin.
+_SETTLE_MAX_RUNS = 8
+
+
+def _profiled_runs() -> int:
+    """How many UNOPTIMIZED passes TorchScript runs per new input signature before it
+    installs the fused plan. 1 on every torch TEX currently supports.
+
+    The fallback is deliberately 2, not 1: over-burning costs one extra evaluation once
+    per signature, while under-burning silently reopens the reproducibility hole.
+    """
+    try:
+        return max(1, int(torch._C._jit_get_num_profiled_runs()))
+    except Exception:
+        return 2
+
+
+def _bitwise_same(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Bit-pattern equality — deliberately stricter than `torch.equal` in both directions.
+
+    NaN must compare EQUAL to itself here (torch.equal says no), or a program that legally
+    produces NaN could never settle; and -0.0 must compare UNEQUAL to +0.0 (torch.equal
+    says yes), because reproducibility is a claim about the bits a user gets back, and a
+    sign-flipped zero survives into `1.0/x`. Comparing the byte view gives both.
+    """
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    # reshape(-1) BEFORE the byte view: `Tensor.view(dtype)` rejects a 0-dim tensor
+    # outright ("self.dim() cannot be 0 to view Float as Byte"), and scalar coordinates
+    # are ordinary in TEX — `simplex(2.0, 3.0)` produces exactly that, which broke seven
+    # example programs (caustics, simplex_terrain, wood_grain, …) when this compared the
+    # 0-dim form directly. Flattening first also normalises any non-contiguous layout.
+    return torch.equal(a.contiguous().reshape(-1).view(torch.uint8),
+                       b.contiguous().reshape(-1).view(torch.uint8))
+
 
 # ── 3-tier compilation cache helper ─────────────────────────────────────────
 #
@@ -280,6 +401,7 @@ class _TieredCache:
         self.cache: dict = {}
         self._compile_attempted: set = set()
         self._call_count: dict = {}
+        self._settled: set = set()   # (key, shape, dtype) signatures past the profiling window
         self._lock = threading.Lock()
 
     def get(self, key):
@@ -295,6 +417,22 @@ class _TieredCache:
         backend failure (e.g. Triton missing for CUDA) is caught here and the
         traced tier stays in place, instead of caching a callable that raises
         lazily at the real call site.
+
+        KNOWN, UNCLOSED: this promotion swaps the callable mid-process, so if the
+        Inductor tier is not bit-identical to the traced tier, cook #4 onward can
+        differ from cooks #1-3 — the same shape of defect first_call() closes for
+        tier 1 vs tier 2. It is left open deliberately, on two grounds: unlike the
+        tier-1 swap (which bought nothing) this one is worth a measured 13-18x, and
+        it could not be characterized on the box where this was fixed — neither
+        backend compiles there (CUDA has no Triton; the CPU Inductor build fails
+        with a CppCompileError), so tier 3 never engages and a bit-equality
+        adoption gate could not be tested. Gating adoption on
+        `torch.equal(compiled(*probe), incumbent(*probe))` using the dummy
+        compile_fn already warms with would close it for ~one 64x64 call on a path
+        that already costs ~28s — but on a Triton box that gate would silently
+        forfeit the speedup whenever the tiers disagree, so it wants a measurement
+        first, not a guess. Nothing here is a *new* regression: this path predates
+        the cold-frame fix and is unchanged by it.
         """
         if key in self._compile_attempted or not _can_inductor_compile(device):
             return
@@ -310,7 +448,13 @@ class _TieredCache:
             import time as _time
             from . import tier_trace as _tt
             _t0 = _time.perf_counter()
-            self.cache[key] = compile_fn()
+            built = compile_fn()
+            # Clear the settled marks BEFORE publishing the new callable, never after:
+            # the reverse order leaves a window where another thread reads the new tier
+            # while the old tier's signatures still read as settled, and serves an
+            # unsettled value from it — the exact defect _settle exists to prevent.
+            self.forget_settled(key)
+            self.cache[key] = built
             _tt.record_noise_compile(self.name, (_time.perf_counter() - _t0) * 1000.0)  # P6
         except Exception:
             pass
@@ -332,6 +476,118 @@ class _TieredCache:
             self.cache[key] = trace_fn()
         except Exception:
             self.cache[key] = False
+
+    def call(self, key, args, *, device, trace_fn, compile_fn, eager_fn):
+        """The one entry point for a tiered noise fn: tier selection + settle discipline.
+
+        Two separate things used to make the value depend on the CALL INDEX rather than on
+        the inputs, and both are closed here:
+
+          1. The cold frame returned the EAGER result and cached a trace for every call
+             after it, so call #1 of a process ran a different tier than calls #2+.
+          2. A traced module is not one numeric object. See _settle().
+
+        Falls back to `eager_fn` whenever no stable compiled tier is available — a failed
+        trace, or a signature that refused to settle. Slower and always right, the same
+        direction every other TEX tier falls back in.
+        """
+        fn = self.get(key)
+        if fn is not None:
+            self.try_upgrade(key, compile_fn, device=device)
+            fn = self.get(key)
+        elif key not in self.cache:
+            # Cold frame: build the trace and answer THIS call from it as well, so tier 1
+            # and tier 2 are the same callable by construction. This is free — torch.jit
+            # .trace already evaluates the function while recording, so the cold frame was
+            # always paying for two evaluations; it only changes which result is returned.
+            self.store(key, trace_fn)
+            fn = self.get(key)
+        if fn is None:
+            return eager_fn(*args)
+        return self._settle(key, fn, eager_fn, args)
+
+    def _settle(self, key, fn, eager_fn, args):
+        """Run `args` through `fn`, first settling a NEW (shape, dtype) signature.
+
+        A traced module is not one numeric object. TorchScript's profiling executor runs
+        `torch._C._jit_get_num_profiled_runs()` (= 1) UNOPTIMIZED passes for each new input
+        signature and only then installs the fused plan. Measured on CUDA: a module traced
+        at 24x32 and then called at 48x64 returned the *eager* value on that shape's first
+        call and the fused value forever after (4d40b133 → 952dbe87), and a settled
+        signature stays settled even after other shapes run. The same reopening happens per
+        dtype — an fp16 cook through the fp32-recorded trace (the cache key is device-only).
+
+        So pinning the cold frame to the traced tier is necessary but NOT sufficient: on its
+        own it fixes the process-first cook and silently reopens the identical bug at every
+        new resolution — the 512→1024→512 dance is ordinary ComfyUI use, and each new size
+        would render one odd frame.
+
+        Each new signature is therefore run until two consecutive results are bit-identical,
+        and the settled one is what the caller gets. Because the transition is one-way per
+        signature, this is a fixed cost, not a recurring one.
+
+        MEASURED COST (RTX 2080 SUPER, torch 2.5.0+cu118) — settling adds ONE evaluation per
+        new signature, and nothing else:
+          * steady state: ~1 us/call for the signature build + set lookup, ~0.03% of a warm
+            512² fbm(6) call (3.7 ms) and ~0.2% of a warm 512² simplex call (0.56 ms). Warm
+            throughput is unchanged inside run-to-run noise.
+          * per new (shape, dtype): the big number in a profile here is NOT ours. A raw
+            traced module at a new 640² shape already timed 4.74 / 1983.32 / 0.79 ms for its
+            first three calls — the NNC fuser compiles the kernel for each new shape, and
+            that ~2 s was always paid, just on call #2. Settling makes call #1 pay it
+            instead (measured 1993.75 ms vs 1988.85 ms for the same three calls), so the
+            delta is a single extra evaluation: ~0.65 ms at 640² CUDA, ~6 ms at 640² CPU.
+        """
+        sig = (key,) + tuple((tuple(a.shape), a.stride(), a.dtype)
+                             for a in args if isinstance(a, torch.Tensor))
+        if sig in self._settled:
+            return fn(*args)
+
+        # STRIDES are in the signature, not just shape+dtype, because torch's guards are.
+        # Measured: after a contiguous 64x64 settled, a TRANSPOSED 64x64 view (same shape,
+        # same dtype, stride (1,64)) went ff73847f → b45a711d — the gap reopened on a
+        # tensor a shape-only signature calls identical. `is_contiguous()` as a bool is not
+        # enough either: transposed (1,64) and expanded (0,1) are both False yet are
+        # different guard classes.
+
+        # Inside a real CUDA-graph capture, do NOT settle: the discarded runs would be
+        # RECORDED into the graph and re-executed on every replay, forever. This tests the
+        # stream rather than graphed.is_capturing(), which is also set during the warm-up
+        # that precedes capture — warm-up is exactly when we DO want to settle, so that by
+        # capture time the signature is already known and this guard never fires.
+        if args and isinstance(args[0], torch.Tensor) and args[0].is_cuda \
+                and torch.cuda.is_current_stream_capturing():
+            return fn(*args)
+
+        # Burn the profiling passes explicitly rather than inferring them from the first
+        # two results agreeing. If a future torch profiles more than once, runs 1..N are
+        # ALL unoptimized and would agree with each other, so a bare last-two-agree rule
+        # would settle on the unfused value and silently reopen this hole.
+        for _ in range(_profiled_runs()):
+            fn(*args)
+
+        out = fn(*args)
+        for _ in range(_SETTLE_MAX_RUNS):
+            nxt = fn(*args)
+            if _bitwise_same(out, nxt):
+                self._settled.add(sig)
+                return nxt
+            out = nxt
+
+        # Never converged. Demote the key to eager for the rest of the process: store()
+        # short-circuits on the False sentinel and get() maps it to None, so every later
+        # call takes the eager path above.
+        self.cache[key] = False
+        return eager_fn(*args)
+
+    def forget_settled(self, key):
+        """Drop the settled signatures for `key` — its callable is about to be replaced.
+
+        A settled signature is a claim about ONE callable's profiling state. Carrying it
+        across a tier swap would let the very first call of the new tier be served
+        unsettled, which is exactly the defect this class now exists to prevent.
+        """
+        self._settled = {s for s in self._settled if s[0] != key}
 
 
 _simplex_cache = _TieredCache("simplex")
@@ -358,14 +614,11 @@ def _compile_simplex(device):
 def _simplex2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """2D Simplex noise with 3-tier compilation (eager → jit.trace → torch.compile)."""
     key = x.device
-    cached = _simplex_cache.get(key)
-    if cached is not None:
-        _simplex_cache.try_upgrade(key, lambda: _compile_simplex(key), device=key)
-        return _simplex_cache.get(key)(x, y)
-
-    result = _simplex2d_fast(x, y)
-    _simplex_cache.store(key, lambda: torch.jit.trace(_simplex2d_fast, (x, y)))
-    return result
+    return _simplex_cache.call(
+        key, (x, y), device=key,
+        trace_fn=lambda: torch.jit.trace(_simplex2d_fast, (x, y)),
+        compile_fn=lambda: _compile_simplex(key),
+        eager_fn=_simplex2d_fast)
 
 
 def _make_fbm_fast_fn(octaves: int):
@@ -447,46 +700,31 @@ def _fbm2d(x: torch.Tensor, y: torch.Tensor, octaves: int) -> torch.Tensor:
     octaves = max(1, min(octaves, 10))
     key = (octaves, x.device)
 
-    # Fast path: compiled or traced arithmetic hash FBM
-    cached = _fbm_cache.get(key)
-    if cached is not None:
-        def _compile_fbm():
-            fn = _make_fbm_fast_fn(octaves)
-            compiled = _compile_noise(fn)
-            dummy = torch.rand(1, 64, 64, device=x.device)
-            compiled(dummy, dummy)
-            return compiled
-        _fbm_cache.try_upgrade(key, _compile_fbm, device=x.device)
-        return _fbm_cache.get(key)(x, y)
+    # ONE function body, used to build the trace, to answer the cold frame, and as the
+    # eager fallback — see _TieredCache.call. What this replaces was a hand-mirrored eager
+    # copy of fbm_fn, carrying the note "MUST be bit-identical to _make_fbm_fast_fn's
+    # fbm_fn so the cold (eager) frame matches every subsequent traced/compiled frame".
+    # That goal was right and the mechanism could not deliver it: on CUDA the fuser
+    # reassociates the very source the copy was mirroring, so the cold fbm frame measured
+    # 2 distinct hashes across 6 cooks. Mirroring is now moot — there is only one body
+    # left for the trace to agree with.
+    # (The older bug where the no-MSVC branch traced a DIFFERENT, table-based FBM — the
+    # first rendered frame and every cached frame showing visibly different noise with
+    # no input change — stays fixed: _can_inductor_compile() governs only whether the
+    # trace is later upgraded via torch.compile, never which field is computed.)
+    fast_fn = _make_fbm_fast_fn(octaves)
 
-    # Eager execution using arithmetic hash (first call).
-    # This MUST be bit-identical to _make_fbm_fast_fn's fbm_fn so the cold
-    # (eager) frame matches every subsequent traced/compiled frame exactly:
-    #   - out-of-place accumulation: result = result + noise * amp
-    #   - final scale by inv_max = 1.0 / max_amp (not div_ by max_amp)
-    # so codegen (which mirrors the traced formulation) stays bit-identical.
-    result = _perlin2d_fast(x, y)
-    max_amp = sum(0.5 ** i for i in range(octaves))
-    inv_max = 1.0 / max_amp
+    def _compile_fbm():
+        compiled = _compile_noise(_make_fbm_fast_fn(octaves))
+        dummy = torch.rand(1, 64, 64, device=x.device)
+        compiled(dummy, dummy)
+        return compiled
 
-    if octaves > 1:
-        freq = 2.0
-        amplitude = 0.5
-        for _ in range(octaves - 1):
-            result = result + _perlin2d_fast(x * freq, y * freq) * amplitude
-            amplitude = amplitude * 0.5
-            freq = freq * 2.0
-        result = result * inv_max
-
-    # Always cache a trace of the ARITHMETIC-hash FBM — the same noise field as
-    # the eager first call above. Previously the no-MSVC branch traced a
-    # DIFFERENT, table-based FBM, so the first rendered frame and every cached
-    # frame produced visibly different noise with no input change.
-    # _can_inductor_compile() only governs whether the trace is later upgraded
-    # via torch.compile (in the cached-hit path), not which field is computed.
-    _fbm_cache.store(key, lambda: torch.jit.trace(_make_fbm_fast_fn(octaves), (x, y)))
-
-    return result
+    return _fbm_cache.call(
+        key, (x, y), device=x.device,
+        trace_fn=lambda: torch.jit.trace(fast_fn, (x, y)),
+        compile_fn=_compile_fbm,
+        eager_fn=fast_fn)
 
 
 # ── Worley / Voronoi noise (arithmetic hash, table-free) ─────────────────────
@@ -540,33 +778,30 @@ def _worley2d(x: torch.Tensor, y: torch.Tensor, return_f2: bool = False) -> torc
 
     Tiers: eager → jit.trace → torch.compile/Inductor.
     """
-    key = (return_f2, x.device)
-    dx_off, dy_off = _get_worley_offsets(x.device, x.dim())
+    # Rank/device come from the widest coord, not from x: a scalar x beside a grid
+    # y would otherwise size the 9 neighbour offsets for rank 0 and mis-align them.
+    ref = _widest((x, y))
+    key = (return_f2, ref.device)
+    dx_off, dy_off = _get_worley_offsets(ref.device, ref.dim())
 
-    # Fast path: cached compiled or traced version
-    cached = _worley_cache.get(key)
-    if cached is not None:
-        def _compile_worley():
-            fn = _worley2d_f2 if return_f2 else _worley2d_f1
-            compiled = _compile_noise(fn)
-            dummy = torch.rand(1, 64, 64, device=x.device)
-            warmup_dx, warmup_dy = _get_worley_offsets(dummy.device, dummy.dim())
-            compiled(dummy, dummy, warmup_dx, warmup_dy)
-            return compiled
-        _worley_cache.try_upgrade(key, _compile_worley, device=x.device)
-        return _worley_cache.get(key)(x, y, dx_off, dy_off)
-
-    # Eager execution (first call)
-    dist = _worley2d_core(x, y, dx_off, dy_off)
-    if return_f2:
-        sorted_dist, _ = torch.sort(dist, dim=0)
-        result = torch.sqrt(sorted_dist[1])
-    else:
-        result = torch.sqrt(dist.min(dim=0).values)
-
+    # Worley's own eager/traced pair happens to agree bitwise on this box — its min/sort
+    # over squared distances gives the fuser far less to reassociate than simplex's
+    # cancelling `x - X0`. Routing it through the same discipline anyway is the point:
+    # it stops parity from depending on which ops the fuser declines to touch.
     fn = _worley2d_f2 if return_f2 else _worley2d_f1
-    _worley_cache.store(key, lambda: torch.jit.trace(fn, (x, y, dx_off, dy_off)))
-    return result
+
+    def _compile_worley():
+        compiled = _compile_noise(fn)
+        dummy = torch.rand(1, 64, 64, device=ref.device)
+        warmup_dx, warmup_dy = _get_worley_offsets(dummy.device, dummy.dim())
+        compiled(dummy, dummy, warmup_dx, warmup_dy)
+        return compiled
+
+    return _worley_cache.call(
+        key, (x, y, dx_off, dy_off), device=ref.device,
+        trace_fn=lambda: torch.jit.trace(fn, (x, y, dx_off, dy_off)),
+        compile_fn=_compile_worley,
+        eager_fn=fn)
 
 
 # ── Curl noise ───────────────────────────────────────────────────────────────
@@ -581,10 +816,19 @@ def _curl2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Curl of 2D Perlin noise. Returns [..., 2] tensor (vec2)."""
     eps = 0.001
     inv_2eps = 500.0  # 1.0 / (2.0 * 0.001)
-    if x.is_cuda:
+    # Promote BEFORE the branch, not inside it. Curl is a central difference, so the
+    # offset has to land in the same dtype on both devices or they answer differently:
+    # a 0-dim fp16 constant keeps its dtype under `x + eps`, and at |x| ~ 8 the fp16 ulp
+    # (~0.008) swallows an eps of 0.001 outright, while the promoted path resolves it.
+    # Measured before this moved out of the branch: curl2 disagreed by 1.1e-01 and curl3
+    # by 2.2e+00 across devices under precision="fp16".
+    ref = _widest((x, y))
+    x, y = _align_coords((x, y), ref)
+    if ref.is_cuda:
         # GPU: one batched Perlin call instead of four (see _curl3d). Bit-exact.
-        xs = torch.stack([x + eps, x - eps, x, x], dim=0)
-        ys = torch.stack([y, y, y + eps, y - eps], dim=0)
+        rank = ref.dim()
+        xs = _stack_coord([x + eps, x - eps, x, x], x, rank)
+        ys = _stack_coord([y, y, y + eps, y - eps], y, rank)
         n = _perlin2d_fast(xs, ys)
         curl_x = (n[2] - n[3]) * inv_2eps    #  dN/dy
         curl_y = -(n[0] - n[1]) * inv_2eps   # -dN/dx
@@ -614,10 +858,21 @@ def _octave_perlins(noise_fn, coords: tuple, octaves: int) -> list:
     ~50, about 3x faster for fbm/ridged/billow/turbulence. On CPU there's no launch
     overhead to amortize, so it falls back to per-octave calls. Bit-exact either
     way: the i-th result equals noise_fn(coords * 2**i) in both paths (x * 1.0 == x).
+
+    The stacking goes through `_stack_coord` so a constant coord — which reaches
+    us 0-dim, e.g. `fbm(u * 8.0, v * 8.0, 0.5, 4)` — keeps its octave axis leading
+    instead of right-aligning into a spatial one. Without that the GPU path raised
+    where CPU returned a picture.
     """
     freqs = [2.0 ** i for i in range(octaves)]
-    if octaves > 1 and coords[0].is_cuda:
-        stacked = tuple(torch.stack([c * f for f in freqs], dim=0) for c in coords)
+    # Promote BEFORE the branch so both paths scale the coords in one dtype — the two
+    # are only interchangeable if they compute the same expression (see _align_coords).
+    ref = _widest(coords)
+    coords = _align_coords(coords, ref)
+    if octaves > 1 and ref.is_cuda:
+        rank = ref.dim()
+        stacked = tuple(_stack_coord([c * f for f in freqs], c, rank)
+                        for c in coords)
         n = noise_fn(*stacked)
         return [n[i] for i in range(octaves)]
     return [noise_fn(*(c * f for c in coords)) for f in freqs]
@@ -636,7 +891,7 @@ def _ridged_nd(noise_fn, coords: tuple, octaves: int) -> torch.Tensor:
     amp = 1.0
     weight = 1.0
     max_amp = 0.0
-    result = torch.zeros_like(coords[0])
+    result = _zeros_broadcast(coords)
 
     for i in range(octaves):
         signal = 1.0 - torch.abs(oct_n[i])
@@ -740,7 +995,7 @@ def _alligator_nd(worley_fn, coords: tuple, octaves: int) -> torch.Tensor:
     octaves = max(1, min(octaves, 8))
     freq = 1.0
     amp = 1.0
-    result = torch.zeros_like(coords[0])
+    result = _zeros_broadcast(coords)
     max_amp = 0.0
 
     for _ in range(octaves):
@@ -854,7 +1109,10 @@ def _worley3d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
     zi = z_floor.to(torch.int32)
 
     # 27 neighbor offsets [-1,0,1]^3, cached per (device, rank) — see the 2D path.
-    dx_off, dy_off, dz_off = _get_worley3d_offsets(x.device, xi.dim())
+    # Rank comes from the widest coord, not from x: a scalar x with grid y/z would
+    # otherwise size the offsets for rank 0 and mis-align every neighbour.
+    ref = _widest((x, y, z))
+    dx_off, dy_off, dz_off = _get_worley3d_offsets(ref.device, ref.dim())
 
     # Cell coords for all 27 neighbors: [27, *spatial]
     cx = xi.unsqueeze(0) + dx_off
@@ -894,20 +1152,26 @@ def _curl3d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
     off1x, off1y, off1z = 31.416, 47.853, 12.679
     off2x, off2y, off2z = 73.156, 19.827, 63.941
 
-    if x.is_cuda:
+    # Promote BEFORE the branch — see _curl2d: an fp16 constant coord makes the central
+    # difference resolve differently per device unless both compute the offset in the
+    # same dtype.
+    ref = _widest((x, y, z))
+    x, y, z = _align_coords((x, y, z), ref)
+    if ref.is_cuda:
         # GPU: batch all 12 Perlin evaluations into ONE call (stack the coord
         # triples on a leading dim). Collapses ~600 kernel launches to ~50 — about
         # 3x faster at 512^2 — and is bit-exact with the per-call form. On CPU the
         # stacking overhead outweighs the (absent) launch saving, so fall through.
-        xs = torch.stack([x + off2x, x + off2x, x + off1x, x + off1x, x, x,
-                          x + off2x + eps, x + off2x - eps,
-                          x + off1x + eps, x + off1x - eps, x, x], dim=0)
-        ys = torch.stack([y + off2y + eps, y + off2y - eps, y + off1y, y + off1y, y, y,
-                          y + off2y, y + off2y, y + off1y, y + off1y,
-                          y + eps, y - eps], dim=0)
-        zs = torch.stack([z + off2z, z + off2z, z + off1z + eps, z + off1z - eps,
-                          z + eps, z - eps, z + off2z, z + off2z,
-                          z + off1z, z + off1z, z, z], dim=0)
+        rank = ref.dim()
+        xs = _stack_coord([x + off2x, x + off2x, x + off1x, x + off1x, x, x,
+                           x + off2x + eps, x + off2x - eps,
+                           x + off1x + eps, x + off1x - eps, x, x], x, rank)
+        ys = _stack_coord([y + off2y + eps, y + off2y - eps, y + off1y, y + off1y, y, y,
+                           y + off2y, y + off2y, y + off1y, y + off1y,
+                           y + eps, y - eps], y, rank)
+        zs = _stack_coord([z + off2z, z + off2z, z + off1z + eps, z + off1z - eps,
+                           z + eps, z - eps, z + off2z, z + off2z,
+                           z + off1z, z + off1z, z, z], z, rank)
         n = _perlin3d_fast(xs, ys, zs)
         curl_x = (n[0] - n[1] - n[2] + n[3]) * inv_2eps   # dF3/dy - dF2/dz
         curl_y = (n[4] - n[5] - n[6] + n[7]) * inv_2eps   # dF1/dz - dF3/dx

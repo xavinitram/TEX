@@ -45,7 +45,7 @@ import os
 from collections import OrderedDict
 from dataclasses import dataclass
 
-from .tex_compiler.lexer import Lexer, TokenType
+from .tex_compiler.lexer import Lexer
 from .tex_compiler.parser import Parser
 from .tex_compiler.ast_nodes import (
     BindingRef, NumberLiteral, ChannelAccess, FunctionCall, Assignment, Identifier,
@@ -484,13 +484,14 @@ def _referenced_at_bindings(code: str) -> frozenset:
     read set and `run_roi` passed it whole into a narrowed cook. The output came back as the
     whole frame while `cooked_roi` reported the window as served — and the shipped host blitted
     it, raising "expanded size (1) must match 64". Same for `lerp`, for a `$param`-guarded
-    ternary, and for a blur inside either branch."""
-    try:
-        toks = Lexer(code).tokenize()
-    except Exception:
-        return frozenset()          # unparseable → the caller's own walk fails too
-    return frozenset(t.value for t in toks
-                     if t.type in (TokenType.AT_BINDING, TokenType.TYPED_AT_BINDING))
+    ternary, and for a blur inside either branch.
+
+    ONE SCAN, shared: `tex_marshalling.sigil_names` does the tokenize for both this and ANIM-1's
+    param-only set, memoized on the SOURCE. That matters here beyond tidiness — `_walk`'s memo
+    is keyed on code + param VALUES, so before this an ROI param scrub re-tokenized the program
+    on every frame."""
+    from .tex_marshalling import sigil_names
+    return sigil_names(code)[0]
 
 
 def _walk(code: str, param_values: dict):

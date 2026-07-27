@@ -16,6 +16,7 @@ Execution model:
 from __future__ import annotations
 import torch
 import math
+import time
 from collections import OrderedDict
 from typing import Any
 from dataclasses import fields as _dc_fields
@@ -31,11 +32,16 @@ from ..tex_compiler.ast_nodes import (
 )
 from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
 from .host import _cancel_check, _report_progress   # SCHED-3 seam (no cycle: host imports torch only)
+from . import profile as _prof                      # PROF-1 seam (pure stdlib; disarmed by default)
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
                      _scalar_from_tensor, _get_flat_batch_index)
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
+
+# PROF-1: "no stage seen yet". Distinct from None, which is a REAL stage key — an unfused
+# program carries no `loc.stage` tags and legitimately profiles as the single stage `None`.
+_MISSING = object()
 
 # Hard limit on user function call depth to prevent stack overflow
 MAX_CALL_DEPTH = 64
@@ -390,7 +396,13 @@ class Interpreter:
         # body, a fused kernel) is NOT preempted mid-flight — per-statement is the floor.
         stmts = program.statements
         cancel, on_progress = self._cancel, self._on_progress
-        if cancel is None and on_progress is None:
+        # PROF-1: a per-stage sink, or None. The `enabled()` guard is what keeps the DEFAULT
+        # path at one function call per cook instead of a thread-local probe — the profiler is
+        # disarmed unless a host armed it, and invariant #7 applies to the profiler itself.
+        sink = _prof.stage_sink() if _prof.enabled() else None
+        if sink is not None:
+            self._exec_stmts_profiled(stmts, sink, cancel, on_progress, dev)
+        elif cancel is None and on_progress is None:
             for stmt in stmts:
                 self._exec_stmt(stmt)
         elif on_progress is None:
@@ -625,6 +637,54 @@ class Interpreter:
                     float(tc.get(name, 0.0)), dtype=torch.float32, device=self.device)
 
     # -- Statement execution --------------------------------------------
+
+    def _exec_stmts_profiled(self, stmts, sink: dict, cancel, on_progress, dev):
+        """PROF-1: the statement walk with per-STAGE timing. A separate method, not a branch
+        inside the hot loop, so the default walk above stays byte-identical.
+
+        Fusion splices a chain into ONE program and tags every node with `loc.stage` (Q-4),
+        so a stage boundary is simply the statement at which `loc.stage` changes. An unfused
+        program has no tags at all and lands entirely in stage `None`, which is the honest
+        answer: it IS one stage.
+
+        CUDA is synchronized at each boundary — without it the timer reads kernel-LAUNCH time
+        and attributes a stage's real work to whichever later stage happens to sync. That sync
+        is the profiler's whole cost, and it is why `should_sample` exists.
+
+        `stmt.loc.stage` is a plain attribute chain, not `getattr(..., None)`: `ASTNode.loc`
+        has a `default_factory` and `stage` is in `SourceLoc.__slots__`, so neither can be
+        absent, and the defensive form measured ~22 ns/stmt to say otherwise. `enumerate` is
+        likewise only paid when a progress sink is wired — the same discipline the three
+        unprofiled loops above were split apart to keep."""
+        cuda = dev.type == "cuda"
+        n = len(stmts) or 1
+
+        def close(stage, t0):
+            """Bank the elapsed time against `stage`. One definition, so the final stage —
+            the one CACHE-7 reads to place a checkpoint — is attributed exactly like the rest."""
+            if cuda:
+                torch.cuda.synchronize()
+            now = time.perf_counter()
+            sink[stage] = sink.get(stage, 0.0) + (now - t0) * 1000.0
+            return now
+
+        if cuda:
+            torch.cuda.synchronize()
+        cur, t0, i = _MISSING, time.perf_counter(), 0
+        for stmt in stmts:
+            stage = stmt.loc.stage
+            if stage != cur:
+                if cur is not _MISSING:
+                    t0 = close(cur, t0)
+                cur = stage
+            if cancel is not None:
+                _cancel_check(cancel)
+            self._exec_stmt(stmt)
+            if on_progress is not None:
+                i += 1
+                _report_progress(on_progress, "stmt", i / n)
+        if cur is not _MISSING:
+            close(cur, t0)
 
     def _exec_stmt(self, node: ASTNode):
         # Fast path: dispatch table lookup (O(1) instead of isinstance chain)

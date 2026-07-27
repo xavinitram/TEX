@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import struct
 import torch
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -324,6 +325,112 @@ def infer_binding_type(value: Any) -> TEXType:
     elif isinstance(value, float):
         return TEXType.FLOAT
     return TEXType.FLOAT
+
+
+# ── ANIM-1: which bindings actually IDENTIFY a program ───────────────────────
+# A program's cache identity is H(code, binding TYPES), and that map used to be built from the
+# whole bindings dict — `$params` alongside `@wires`. That breaks the v0.31 animated-parameter
+# guarantee outright: `infer_binding_type` maps 2 → INT and 2.0 → FLOAT, so an animated `$k`
+# ramping through a whole number MINTS A SECOND FINGERPRINT — a recompile, a fresh codegen
+# emission and a CUDA-graph recapture, mid-scrub. Measured: `[1, 1.5, 2, 2.5]` gave 2 identities,
+# and `omitted / 1.0 / 1` gave 3. A JSON host sends `2` for a whole number, and
+# `examples/host_demo.py` — the release's own consumer proof — serves params over HTTP/JSON.
+#
+# A `$param` has no business in that key: the type checker reads `binding_types` ONLY on the
+# `@`-wire branch (and for the W7002 unused-INPUT lint), while a param's type comes from its
+# DECLARATION (`f$k` / `v3$tint`), defaulting to FLOAT when undeclared. So dropping param-only
+# names is identity-fixing and compile-neutral — and it also stops W7002 reporting a param as
+# "Input '@k' is connected but never used."
+#
+# WHERE THE RULE LIVES: inside `TEXCache.fingerprint`, not here and not at the call sites. An
+# earlier draft filtered at each caller and got two of four — `cook_stage_list`'s single-stage
+# branch and `tex_tool`'s warm key stayed unfiltered, so a CACHE-6 sub-chain recompiled per param
+# value and `install_tool(warm=True)` warmed a key no cook probed. `param_only_names` is a LEXER
+# scan, so param names are knowable before the type map; the constraint that seemed to force the
+# filter outward does not exist. Fusion keys through its own hasher and so calls
+# `identity_binding_types` directly.
+#
+# The rule is narrow, deliberately: names used only with the `$` sigil. NOT a blanket INT→FLOAT
+# collapse, because a scalar wired to `@k` legitimately keys INT apart from FLOAT.
+_SIGIL_MEMO: "OrderedDict[str, tuple]" = OrderedDict()
+_SIGIL_MEMO_MAX = 512
+
+
+def sigil_names(code: str) -> tuple:
+    """`(at_names, dollar_names)` — every `@name` and `$name` the SOURCE mentions, LEXED so a
+    comment or a string literal cannot spoof one. Memoized per source.
+
+    One scan with two consumers: `param_only_names` below (which program identity is built from)
+    and `tex_roi._referenced_at_bindings` (which ROI's narrow set is built from). They had
+    separate copies spelling the same token families two ways — enum members in one, type-name
+    strings in the other — so a new sigil token would have had to be added twice and one copy
+    would have silently stopped seeing it. Folding them also moves ROI's scan onto a
+    SOURCE-keyed memo: its own `_walk` memo is keyed on code + param VALUES, so an ROI param
+    scrub re-tokenized the program every single frame.
+
+    Empty on any lexer failure — the caller's own parse is about to fail too."""
+    # get-then-move_to_end is two ops, not one: a concurrent insert that evicts this key
+    # between them raises KeyError out of the memo — and this sits under
+    # `TEXCache.fingerprint`, so it would escape `_compile_or_raise` (which only catches
+    # compile errors) into the node's bug-report catch-all and fail the whole prompt.
+    # `tex_fusion._FUSED_MEMO` already guards the same pattern for the same reason.
+    hit = _SIGIL_MEMO.get(code)
+    if hit is not None:
+        try:
+            _SIGIL_MEMO.move_to_end(code)
+        except KeyError:
+            pass          # lost the LRU race to a concurrent evict; the value stands
+        return hit
+    ats, dollars = frozenset(), frozenset()
+    if "@" in code or "$" in code:
+        try:
+            from .tex_compiler.lexer import Lexer, TokenType
+            a, d = set(), set()
+            for tok in Lexer(code).tokenize():
+                if tok.type in (TokenType.AT_BINDING, TokenType.TYPED_AT_BINDING):
+                    a.add(tok.value)
+                elif tok.type in (TokenType.DOLLAR_BINDING, TokenType.TYPED_DOLLAR_BINDING):
+                    d.add(tok.value)
+            ats, dollars = frozenset(a), frozenset(d)
+        except Exception:
+            pass
+    out = (ats, dollars)
+    _SIGIL_MEMO[code] = out
+    while len(_SIGIL_MEMO) > _SIGIL_MEMO_MAX:
+        _SIGIL_MEMO.popitem(last=False)          # LRU, matching every other memo in the engine
+    return out
+
+
+def param_only_names(code: str) -> frozenset:
+    """The names `code` uses ONLY with the `$` sigil.
+
+    SUBTRACTING THE `@` SET IS LOAD-BEARING, not belt-and-braces. It is tempting to assume a
+    name used both ways is always E3202 — it is not: `_check_param_decl` raises only when the
+    name was ALREADY referenced, so `f$k = 1.0;` followed by `@OUT = vec4(@k.rgb * $k, 1.0);`
+    compiles with zero errors. Without the subtraction `k` would leave the key and a real
+    WIRE's type (VEC3 vs FLOAT) would stop identifying the program.
+
+    On any lexer failure this returns empty — keeping every binding in the key, which is the
+    pre-v0.31 behaviour and correct for a program that is about to fail to compile anyway.
+
+    There is deliberately NO gate on the BINDINGS. An earlier draft skipped the scan unless some
+    binding was int/float/bool/list, which re-admitted the very failure mode it was avoiding:
+    `$k` sent as `"2.0"` (string) on one cook and `2.0` on the next has the same binding NAMES,
+    so the gate flipped and the string-typed params entered and left the key between cooks. The
+    memo is the performance story — one tokenize per unique source, a dict hit thereafter."""
+    ats, dollars = sigil_names(code)
+    return dollars - ats
+
+
+def identity_binding_types(code: str, bindings: dict) -> dict:
+    """The `{name: TEXType}` map that IDENTIFIES `code` under `bindings` — every binding except
+    the param-only ones.
+
+    `TEXCache.fingerprint` applies the same rule to its own input, so the single-program path
+    never needs this. It exists for `tex_fusion._fused_memo_key`, which hashes a chain through
+    its own hasher and so has to filter for itself."""
+    drop = param_only_names(code)
+    return {n: infer_binding_type(v) for n, v in bindings.items() if n not in drop}
 
 
 def map_inferred_type(inferred: TEXType | None, has_latent_input: bool) -> str:

@@ -62,6 +62,9 @@ from .tex_marshalling import (
 )
 from .tex_runtime.host import (get_host_services, CookCancelled,
                                _cancel_check, _report_progress)
+# PROF-1: the cost profiler. Disarmed by default — the default cook path's whole cost is the
+# one `enabled()` call in run(). See tex_runtime/profile.py's invariant-#7 note.
+from .tex_runtime import profile as _profile
 # ENG-4: the shared compile-error taxonomy + translator (lives beside TEXCompileError so the
 # per-phase tuple is spelled once, not once per compile implementation).
 from .tex_compiler.diagnostics import raw_compile_errors, compile_error_from
@@ -1078,13 +1081,26 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
         # then unreachable from the node). Computed from the original bindings
         # before _prepare_fused merges them; value-independent + memoized (see
         # tex_fusion.fused_fingerprint), so cheap on every mode.
-        if compile_mode in ("cuda_graph", "torch_compile", "auto"):
-            fused_fp = _fused_fingerprint(spec, code, bindings, _infer_binding_type)
+        # Computed for EVERY mode, not just the compiling ones. `select_tier` returns "default"
+        # for `compile_mode="none"` regardless of `fused_fp_present`, so this changes no routing
+        # — but leaving it None on the default mode meant a fused chain had NO identity at all,
+        # and PROF-1's key degenerated to `None|device|precision`, collapsing structurally
+        # different chains onto one entry and inverting the per-stage ranking CACHE-7 will read
+        # in v0.32.
+        #
+        # HONEST COST: this is not free, and an earlier draft of this comment claimed it was.
+        # `_fused_fp` hashes a repr of every stage's source — 24.4 µs on a 4-stage chain, on a
+        # path that previously only ran on a splice-cache miss. It is memoized on the memo key
+        # now (`tex_fusion._FUSED_FP_MEMO`), so a warm fused cook pays the key build and a dict
+        # hit rather than the hash.
+        fused_fp = _fused_fingerprint(spec, code, bindings, _infer_binding_type)
         (program, type_map, referenced, assigned_bindings, param_info,
          used_builtins, bindings) = _prepare_fused(spec, code, bindings, _infer_binding_type)
         fused_chain = True
     else:
-        # Infer binding types for inputs
+        # Infer binding types for inputs — the WHOLE map, params included, because that is what
+        # the TypeChecker wants. ANIM-1's exclusion happens inside `TEXCache.fingerprint`, so a
+        # param value cannot move the program's identity no matter which caller built the map.
         binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
 
         # Compile (uses two-tier Mega-Cache: memory LRU + disk persistence). ENG-4: the
@@ -1523,19 +1539,22 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
         return None
 
 
-def run(plan: CookPlan) -> CookResult:
-    """Execute a prepared plan: dispatch to the tier, apply the fp16 finiteness net and
-    the debug overlays, enforce the cache budgets. Returns RAW outputs (no host egress
-    formatting — that is ENG-3's profile, applied by the caller)."""
+def _dispatch_tier(plan: CookPlan):
+    """Everything that EXECUTES the program — the tier dispatch and the ENG-2 OOM ladder —
+    and nothing that prepares or formats it.
+
+    Extracted from `run()` so PROF-1 can bracket exactly this: a cost that included prepare()
+    would charge the first three cooks of a key (the ones the warmup samples) for a compile
+    they will never pay again, and one that included the egress tail would measure the host's
+    formatting as if it were the program's.
+
+    A CookCancelled raised inside the tier propagates straight out, never mistaken for a
+    recoverable OOM and silently retried (GOTCHA: `_oom_in_chain` returns None for it today,
+    but the explicit guard makes the intent load-bearing rather than incidental)."""
     ctx = plan.ctx
-    _cancel_check(ctx.cancel)                         # SCHED-3 yield A: abort a stale cook up front
-    _report_progress(ctx.on_progress, "tier", 0.0)
     try:
-        raw_output = _run_tier(ctx, plan.tier_id)
+        return _run_tier(ctx, plan.tier_id)
     except BaseException as e:                       # ENG-2: the OOM ladder
-        # SCHED-3: a cancellation raised inside the tier must propagate straight out, never be
-        # mistaken for a recoverable OOM and silently retried (GOTCHA: _oom_in_chain returns
-        # None for it today, but an explicit guard makes the intent load-bearing, not incidental).
         if isinstance(e, CookCancelled):
             raise
         oom = _oom_in_chain(e)
@@ -1544,13 +1563,33 @@ def run(plan: CookPlan) -> CookResult:
         retried = _oom_retry(ctx, e, oom)
         if retried is None:
             raise
-        raw_output = retried
         if ctx.roi is not None:
             # The OOM ladder ignores `ctx.roi` and always returns a WHOLE frame (run_tiled /
             # run_tiled_halo). Whatever the failed ROI attempt left on the trace — including a
             # window equal to the request — no longer describes this result, so say so.
             from .tex_runtime import tier_trace as _tt
             _tt.record_roi(None, "roi abandoned: OOM ladder returned a whole frame")
+        return retried
+
+
+def run(plan: CookPlan) -> CookResult:
+    """Execute a prepared plan: dispatch to the tier, apply the fp16 finiteness net and
+    the debug overlays, enforce the cache budgets. Returns RAW outputs (no host egress
+    formatting — that is ENG-3's profile, applied by the caller)."""
+    ctx = plan.ctx
+    _cancel_check(ctx.cancel)                         # SCHED-3 yield A: abort a stale cook up front
+    _report_progress(ctx.on_progress, "tier", 0.0)
+    # PROF-1: when a host has armed the profiler, bracket the execution with the whole-cook
+    # timer and the per-stage sink — ONE object, so there is a single sampling decision (the
+    # rate limiter advances a counter, and two askers for one cook would double-count it).
+    # Disarmed (the default, and every ComfyUI cook) this is one function call, no timers.
+    if _profile.enabled():
+        _pkey = _profile.make_key(ctx.fused_fp or ctx.fp,
+                                  torch.device(ctx.device).type, ctx.eff_precision)
+        with _profile.measure(_pkey, plan.cook_px, device=ctx.device, stages=True):
+            raw_output = _dispatch_tier(plan)
+    else:
+        raw_output = _dispatch_tier(plan)
 
     # PR-LP2 safety net (C2): re-cook fp32 (and pin the auto decision) if an
     # auto->fp16 cook went non-finite. Extracted to a helper (C1-st) so the cook

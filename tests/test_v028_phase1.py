@@ -461,8 +461,9 @@ def test_data_canaries(r: SubTestResult):
         fails.append("BufferDesc.is_float property changed")
 
     # (b) EngineSession — the method/property surface a long-running host holds (DATA-4 phase 1).
+    # `reattach` joined it in v0.31 (ENG-13): the recovery counterpart to `reset()`.
     want = {"cache", "registry", "host", "interpreter", "set_host", "stats", "reset", "close",
-            "isolated"}
+            "isolated", "reattach"}
     got = {n for n in dir(EngineSession) if not n.startswith("_")}
     if got != want:
         fails.append(f"EngineSession surface changed: +{got - want} -{want - got}")
@@ -471,7 +472,7 @@ def test_data_canaries(r: SubTestResult):
 
     r.fail("ENG-5 DATA canaries", "; ".join(fails)) if fails else \
         r.ok("pinned: STORAGE_DTYPES, BufferDesc(storage/transfer + defaults + is_float), "
-             "EngineSession's 9-member surface + default_session singleton")
+             "EngineSession's 10-member surface + default_session singleton")
 
 
 # ── Root fixes: the C∉{3,4} 4-D-image family + scalar swizzle + $param wire count ─────────────

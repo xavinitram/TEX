@@ -210,10 +210,11 @@ def _persist() -> None:
     if not p or not _MODEL:
         return
     try:
-        tmp = p + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"version": _version_tag(),
-                       "lanes": {k: [round(a, 8), b] for k, (a, b) in _MODEL.items()}}, f)
-        os.replace(tmp, p)
+        # ENG-13: the shared atomic write. Not fsynced, for autotier's reason — this is a
+        # measured cost model the probe re-derives on its own, so a machine crash costs a
+        # re-probe, not lost work.
+        from ..tex_recovery import atomic_write_json
+        atomic_write_json(p, {"version": _version_tag(),
+                              "lanes": {k: [round(a, 8), b] for k, (a, b) in _MODEL.items()}})
     except Exception:
         pass

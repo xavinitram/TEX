@@ -209,8 +209,23 @@ class TEXCache:
         descriptors. Memoized per (code, sorted binding-types) so the SHA256
         over the full source is computed once per unique program rather than on
         every cache probe.
-        """
-        binding_key = tuple(sorted((k, v.value) for k, v in binding_types.items()))
+
+        ANIM-1: `$param` names are dropped from the key HERE, by construction, rather than by
+        each caller remembering to filter its map first. `binding_types` has two jobs — it types
+        `@` wires for the TypeChecker, and it identifies the program — and only the second one
+        must exclude params. Filtering at the callers got the first two of four right: this
+        release shipped with `cook_stage_list`'s single-stage branch and `tex_tool`'s warm key
+        still unfiltered, which meant a CACHE-6 sub-chain recompiled per param value and
+        `install_tool(warm=True)` warmed a fingerprint no cook would ever probe. Doing it in the
+        key means the rule cannot be forgotten, and the checker keeps the whole map it wants.
+
+        (Why a param has no business in a program's identity: its type comes from its
+        DECLARATION in the code — already hashed below — not from the bound value, so keeping it
+        made `$k = 2` and `$k = 2.0` two programs. See tex_marshalling.param_only_names.)"""
+        from .tex_marshalling import param_only_names
+        drop = param_only_names(code)
+        binding_key = tuple(sorted((k, v.value) for k, v in binding_types.items()
+                                   if k not in drop))
         memo = _FINGERPRINT_MEMO
         cache_key = (code, binding_key)
         cached = memo.get(cache_key)
@@ -371,13 +386,27 @@ class TEXCache:
 
     @staticmethod
     def _atomic_pickle(path: Path, data: Any) -> None:
-        """Pickle *data* to *path* atomically (temp file + os.replace) so a
-        concurrent reader — e.g. a second ComfyUI instance sharing the dir —
-        can never observe a half-written entry."""
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "wb") as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, path)  # atomic on same-volume NTFS
+        """Pickle *data* to *path* atomically AND durably, so a concurrent reader — e.g. a
+        second ComfyUI instance sharing the dir — can never observe a half-written entry, and
+        a crash never leaves a torn artifact the next launch would load. ENG-13 routes every
+        persisted engine file through the one `tex_recovery.atomic_write`."""
+        from .tex_recovery import atomic_write
+        # Streamed, not blobbed: a compiled artifact is small next to a frame, but there is no
+        # reason to build a second copy of it in memory to reach the same write.
+        #
+        # NOT fsynced, and this is the load-bearing half. This write is INLINE ON THE COOK
+        # THREAD, on the first cook of every distinct program — i.e. on every ComfyUI code edit
+        # and every re-queue. An fsync there measured **+44.4% CPU / +45.6% CUDA on cold
+        # compile** (proven causally by stubbing `os.fsync`, 4/4 interleaved rounds with no
+        # distribution overlap). The release's own invariant-#7 measurement covered steady-state
+        # cooks only, so it missed a regression on the path a user hits every time they type.
+        #
+        # The durability it bought was not worth having: an artifact is pure cache, losing one
+        # costs a single ~2.5 ms recompile, and `_load_from_disk` already unlinks-and-recompiles
+        # on a bad load — so a torn file is a case this code handles by design rather than a case
+        # the fsync was protecting against. Atomicity (temp + rename) is what matters here and
+        # is unaffected.
+        atomic_write(str(path), lambda f: pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL))
 
     def _save_to_disk(self, fp: str, program: Any, binding_types: dict[str, TEXType]):
         """Persist compilation artifacts to disk."""

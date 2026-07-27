@@ -736,6 +736,132 @@ def main():
     test_v030_codegen_roi_defaults_off(r)
     test_v030_nightly_wires_roi_oracle(r)
 
+    from test_v031_phase1 import (
+        test_v031_sched4_priority_and_preemption,
+        test_v031_sched4_finished_work_is_never_discarded,
+        test_v031_sched4_outcome_matrix,
+        test_v031_sched4_a_foreign_cancel_is_terminal,
+        test_v031_sched4_committed_render_completes_under_load,
+        test_v031_sched4_worker_survives_a_bad_submit,
+        test_v031_sched4_class_contract,
+        test_v031_sched4_fifo_and_head_requeue,
+        test_v031_sched4_real_cook_preemption,
+        test_v031_sched4_off_the_default_path,
+    )
+    test_v031_sched4_priority_and_preemption(r)
+    test_v031_sched4_finished_work_is_never_discarded(r)
+    test_v031_sched4_outcome_matrix(r)
+    test_v031_sched4_a_foreign_cancel_is_terminal(r)
+    test_v031_sched4_committed_render_completes_under_load(r)
+    test_v031_sched4_worker_survives_a_bad_submit(r)
+    test_v031_sched4_class_contract(r)
+    test_v031_sched4_fifo_and_head_requeue(r)
+    test_v031_sched4_real_cook_preemption(r)
+    test_v031_sched4_off_the_default_path(r)
+
+    from test_v031_phase2 import (
+        test_v031_prof1_disarmed_by_default,
+        test_v031_prof1_records_and_predicts,
+        test_v031_prof1_sampling_gate,
+        test_v031_prof1_per_stage_breakdown,
+        test_v031_prof1_predicts_an_unseen_resolution,
+        test_v031_prof1_ignores_a_failed_cook,
+        test_v031_prof1_fused_chains_key_apart,
+        test_v031_prof1_state_is_thread_safe,
+        test_v031_pred1_bounds_each_factor_not_just_the_product,
+        test_v031_pred1_admission_arithmetic,
+        test_v031_pred1_unknown_cost_has_a_confidence_brake,
+        test_v031_pred1_never_touches_the_other_classes,
+        test_v031_pred1_orders_and_sheds_by_value,
+        test_v031_pred1_sheds_the_worst_even_after_a_requeue,
+        test_v031_pred1_closes_the_loop_with_prof1,
+    )
+    test_v031_prof1_disarmed_by_default(r)
+    test_v031_prof1_records_and_predicts(r)
+    test_v031_prof1_sampling_gate(r)
+    test_v031_prof1_per_stage_breakdown(r)
+    test_v031_prof1_predicts_an_unseen_resolution(r)
+    test_v031_prof1_ignores_a_failed_cook(r)
+    test_v031_prof1_fused_chains_key_apart(r)
+    test_v031_prof1_state_is_thread_safe(r)
+    test_v031_pred1_bounds_each_factor_not_just_the_product(r)
+    test_v031_pred1_admission_arithmetic(r)
+    test_v031_pred1_unknown_cost_has_a_confidence_brake(r)
+    test_v031_pred1_never_touches_the_other_classes(r)
+    test_v031_pred1_orders_and_sheds_by_value(r)
+    test_v031_pred1_sheds_the_worst_even_after_a_requeue(r)
+    test_v031_pred1_closes_the_loop_with_prof1(r)
+
+    from test_v031_anim_contract import (
+        test_v031_anim_the_spies_are_live,
+        test_v031_anim_int_crossing_ramp,
+        test_v031_anim_param_sweep_never_recompiles,
+        test_v031_anim_negative_control_code_edit_does_recompile,
+        test_v031_anim_param_type_matrix,
+        test_v031_anim_fused_chain_param_sweep,
+        test_v031_anim_textool_promoted_param_sweep,
+        test_v031_anim_contract_is_documented,
+    )
+    test_v031_anim_the_spies_are_live(r)
+    test_v031_anim_int_crossing_ramp(r)
+    test_v031_anim_param_sweep_never_recompiles(r)
+    test_v031_anim_negative_control_code_edit_does_recompile(r)
+    test_v031_anim_param_type_matrix(r)
+    test_v031_anim_fused_chain_param_sweep(r)
+    test_v031_anim_textool_promoted_param_sweep(r)
+    test_v031_anim_contract_is_documented(r)
+
+    from test_v031_recovery import (
+        test_v031_eng13_atomic_write,
+        test_v031_eng13_journal_survives_a_torn_tail,
+        test_v031_eng13_warm_state_journals_each_verdict,
+        test_v031_eng13_kill_the_process,
+        test_v031_eng13_reattach,
+    )
+    test_v031_eng13_atomic_write(r)
+    test_v031_eng13_journal_survives_a_torn_tail(r)
+    test_v031_eng13_warm_state_journals_each_verdict(r)
+    test_v031_eng13_kill_the_process(r)
+    test_v031_eng13_reattach(r)
+
+    # v0.31 NOISE-TIER — the cold frame must render what every later frame renders.
+    # (The _TieredCache cold path served an EAGER result and a traced one thereafter;
+    #  on CUDA those are not bit-identical, so cook #1 differed from cooks #2+.)
+    from test_v031_noise_tiers import (
+        test_v031_noise_cold_frame_parity,
+        test_v031_noise_resolution_dance,
+        test_v031_noise_cold_equals_warm,
+        test_v031_noise_stride_signature,
+        test_v031_noise_cold_path_shape,
+    )
+    test_v031_noise_cold_frame_parity(r)
+    test_v031_noise_resolution_dance(r)
+    test_v031_noise_cold_equals_warm(r)
+    test_v031_noise_stride_signature(r)
+    test_v031_noise_cold_path_shape(r)
+
+    # v0.31 NOISE-SCALAR — a constant coordinate must render the same on every device.
+    # (`fbm(u*8.0, v*8.0, 0.5, 4)` cooked on CPU and raised on CUDA: the GPU-only octave
+    #  batching stacked the 0-dim z to [N] and right-aligned it into a spatial axis.)
+    from test_v031_noise_scalar_coords import (
+        test_v031_noise_scalar_coord_device_parity,
+        test_v031_noise_scalar_coord_equals_grid,
+        test_v031_noise_scalar_coord_cooks_in_any_slot,
+        test_v031_noise_scalar_coord_2d_family,
+        test_v031_noise_scalar_coord_reduced_precision,
+        test_v031_noise_scalar_coord_batched_equals_per_octave,
+        test_v031_noise_scalar_coord_shipped_example,
+        test_v031_noise_scalar_coord_helpers_are_noops,
+    )
+    test_v031_noise_scalar_coord_device_parity(r)
+    test_v031_noise_scalar_coord_equals_grid(r)
+    test_v031_noise_scalar_coord_cooks_in_any_slot(r)
+    test_v031_noise_scalar_coord_2d_family(r)
+    test_v031_noise_scalar_coord_reduced_precision(r)
+    test_v031_noise_scalar_coord_batched_equals_per_octave(r)
+    test_v031_noise_scalar_coord_shipped_example(r)
+    test_v031_noise_scalar_coord_helpers_are_noops(r)
+
     success = r.summary()
     return 0 if success else 1
 

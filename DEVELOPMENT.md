@@ -745,3 +745,29 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   "changed" just recooks). A result cache keys on a *lineage* key (the cook that produced a
   frame), never re-sampling its pixels: the sampling hash has an admitted collision class that
   is harmless for busting and a silent stale-serve for reuse.
+- **A worker POOL for the cook queue (SCHED-4, v0.31)** — one worker thread, deliberately.
+  The tree-walking interpreter is Python-heavy and holds the GIL between kernels, so a
+  concurrent Tier-B cook does not overlap Tier A; it interleaves two Python interpreters onto
+  one core and slows Tier A down, which is the one outcome the item exists to prevent. A second
+  worker would buy overlap only for programs that are almost entirely kernel time, and those
+  are exactly the programs whose Tier-A latency is already GPU-bound. Reopens with GRAPH-2's
+  parallel region executor, which needs the ENG-9 MUT-cache sharding anyway.
+- **Resumable cooks (SCHED-4)** — a preempted job re-cooks from the top. Resuming needs a
+  serializable interpreter state, which the tree-walker does not have and codegen actively does
+  not (its locals are Python frame state). The cost is bounded by the yield granularity (one
+  statement / one strip) and mitigated by CACHE-2 on the retry. Reopens only if PM-7 ever
+  measures preemption cost dominated by re-cook rather than by yield latency — at v0.31 it is
+  0.130 ms (CUDA) / 0.414 ms (CPU) to first kernel.
+- **`CookQueue` arming the in-engine profiler (PROF-1, v0.31)** — it does not call `enable()`.
+  The queue already brackets every job, so it feeds `profile.record()` from that bracket: no
+  sampling gate needed, and it cannot put a CUDA sync into a cook the queue does not own. The
+  in-engine sampler exists for the per-STAGE breakdown and for hosts cooking outside the queue,
+  and stays disarmed until a host asks (invariant #7 applies to the profiler itself).
+- **Persisting PROF-1's cost table across processes (v0.31)** — autotier persists because
+  re-deriving a compile verdict costs a background compile; a PROF-1 estimate costs the few
+  cooks a host was going to run anyway. The `snapshot()` seam is there for CACHE-7 if
+  cross-launch placement stability turns out to matter — that is its design doc's call.
+- **A journal for `autotier.json` (ENG-13, v0.31)** — `warm_state` got one because its writes
+  were throttled; `autotier._persist` already runs on EVERY terminal verdict, so its loss
+  window is the single verdict being written, which is already inside ENG-13's bound. It gained
+  the shared durable write and nothing else.

@@ -117,6 +117,50 @@ i$count [min: 1, max: 16];              // metadata without a default is allowed
 Values are literals only (a number, optionally negated, or a string); an expression or a
 binding reference inside the block is a syntax error.
 
+### 5.1 The animated-parameter guarantee (v0.31, ANIM-1) — normative
+
+> A `$param` value is a **cook-time binding**. Changing it never recompiles, never
+> re-optimizes, never re-emits codegen, never recaptures a CUDA graph, and never changes the
+> program's cache identity. Sweeping a parameter across *N* values costs *N* cooks and
+> nothing else.
+
+This is a **guarantee, not an optimization**: a host may build keyframing, timelines, and
+slider scrubbing directly on it, and does not need to consult TEX or cache anything of its
+own to avoid a recompile. It is normative from language version 0.23 onward and will not be
+withdrawn without a language major bump.
+
+What it rests on, so the scope is unambiguous:
+
+- A program's cache identity is `H(code, binding TYPES)`. Parameter **values** are not in it.
+- A CUDA graph's capture key holds parameter names, shapes and dtypes — again not values;
+  values are re-staged into the captured buffers per replay.
+- Emitted codegen reads parameters through the binding environment at call time, not as
+  baked constants.
+
+What is **not** covered, and does recompile — each because it changes what the program *is*,
+not what it is *given*:
+
+| Change | Recompiles? | Why |
+|---|---|---|
+| `$strength` 0.2 → 0.9 | no | a value |
+| `$tint` `[1,0,0]` → `[0,1,0]` | no | a value (vec params are staged, not baked) |
+| `$mode` `"add"` → `"screen"` | no | a value (string params too) |
+| a param of a mid-chain stage in a **fused** chain | no | the fused key folds per-stage code + types |
+| a promoted param of a `.textool` | no | same guarantee through the tool seam |
+| `@A` wired VEC3 → VEC4 | **yes** | a binding's TYPE is part of the identity |
+| any edit to the program text | **yes** | it is a different program |
+
+One clarification, because it is the easy thing to get wrong: **a parameter's type comes from
+its declaration in the code** (`f$k`, `i$n`, `s$mode`, `v3$tint`), never from the bound value.
+So "change a param's type" is not something a host can do at cook time — it is a code edit,
+and code edits recompile. The binding-type axis in the fingerprint is about `@` wires, whose
+type *is* read from what is connected.
+
+Pinned by `tests/test_v031_anim_contract.py`, which spies on the compiler, the codegen
+emitter and the graph capturer across every tier and both devices — and by a negative
+control that edits the code and asserts those same spies *do* fire, so the guarantee cannot
+pass vacuously. The standing cost is tracked by `benchmarks/param_scrub_bench.py`.
+
 ---
 
 ## 6. Reserved words & built-in variables
