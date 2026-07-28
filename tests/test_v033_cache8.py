@@ -49,7 +49,7 @@ def test_v033_cache8_demote_frees_vram_and_keeps_the_frame(r):
     """The headline. Over the VRAM ceiling, the coldest frame moves to host RAM: the cuda byte
     bucket drops by exactly its size, the cpu bucket gains exactly the same, the entry stays
     servable, and the pixels are unchanged. Measured against the alternative it replaces —
-    a disk spill at 204 ms/4K frame versus 10.8 ms for the D2H."""
+    a disk spill at 77.9-78.8 ms versus 5.7-5.9 ms to demote (2048^2, two runs)."""
     if "cuda" not in _devices():
         r.ok("CACHE-8: demote SKIPPED (no CUDA — nothing to demote from)")
         return
@@ -246,8 +246,8 @@ def test_v033_cache8_uint16_beats_fp16_in_range(r):
 
 def test_v033_cache8_no_compression_path_is_switched_on(r):
     """The negative result, pinned. The measured Pareto rejected every general-purpose codec:
-    at 4K, zlib-1 costs 4126 ms to encode and 565 ms to DECODE against 204 ms to simply write
-    the frame and 36 ms to read it back. Decode is paid on every hit, so this is not close.
+    at 4K, zlib-1 costs 6685 ms to encode and 920 ms to DECODE against 332 ms to simply write
+    the frame and 59 ms to read it back. Decode is paid on every hit, so this is not close.
     This row exists so a future 'small' addition of a codec to the spill path has to argue with
     the measurement instead of slipping past it."""
     import pathlib

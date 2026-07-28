@@ -142,19 +142,49 @@ def test_v033_p0_6_spill_index_mutations_are_locked(r):
     """The structural half: `_spill`'s index/byte bookkeeping must happen UNDER the lock (the
     file write stays outside — that is the drain path's whole purpose). A source check, because
     a timing test for this race is exactly the kind that passes on a fast box."""
+    import ast
     import pathlib
+    # AST, not substrings. A first version grepped for "with self._lock:" appearing before the
+    # write — which went red the moment A5 added a two-line locked read of the generation
+    # counter ahead of it. That is a lock the write is NOT inside, and only the tree can tell
+    # the difference between "precedes" and "encloses".
     src = (pathlib.Path(__file__).resolve().parent.parent / "tex_results.py").read_text(
         encoding="utf-8")
-    body = src.split("def _spill(")[1].split("\n    def ")[0]
-    after_write = body.split("_atomic_pickle(path, rec)")[1]
-    ok = "with self._lock:" in after_write and "self._spilled.add(key)" in after_write
-    # ...and the write itself must NOT be inside it.
-    before = body.split("_atomic_pickle(path, rec)")[0]
-    ok = ok and "with self._lock:" not in before
-    r.ok("P0-6: _spill's index mutations are locked; the file write is not") if ok else \
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_spill")
+
+    def _is_lock_with(node):
+        return isinstance(node, ast.With) and any(
+            isinstance(i.context_expr, ast.Attribute) and i.context_expr.attr == "_lock"
+            for i in node.items)
+
+    def _enclosing_lock(target_pred):
+        """True if some node matching `target_pred` sits inside a `with self._lock:`."""
+        def walk(node, locked):
+            if target_pred(node) and locked:
+                return True
+            inner = locked or _is_lock_with(node)
+            return any(walk(ch, inner) for ch in ast.iter_child_nodes(node))
+        return walk(fn, False)
+
+    def _is_write(n):
+        return (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == "_atomic_pickle")
+
+    def _is_index_mutation(n):
+        # `self._spilled.add(...)` — the membership write P0-6 moved under the lock.
+        return (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "add"
+                and isinstance(n.func.value, ast.Attribute)
+                and n.func.value.attr == "_spilled")
+
+    write_locked = _enclosing_lock(_is_write)
+    index_locked = _enclosing_lock(_is_index_mutation)
+    ok = index_locked and not write_locked
+    r.ok("P0-6: _spill's index mutations are lock-enclosed; the file write is not") if ok else \
         r.fail("P0-6 lock placement",
-               "the bookkeeping after _atomic_pickle must be under self._lock, and the write "
-               "must not be")
+               f"index mutation under the lock: {index_locked} (want True); "
+               f"file write under the lock: {write_locked} (want False)")
 
 
 # ── P0-7 ──────────────────────────────────────────────────────────────────────
@@ -276,3 +306,73 @@ def test_v033_p0_8_docstring_no_longer_claims_free(r):
     honest = "2.46" in doc and "prologue" in doc.lower()
     r.ok("P0-8: the prologue cost is stated, not denied") if honest and not lied else \
         r.fail("P0-8 docstring", f"still-claims-free={lied} states-measurement={honest}")
+
+
+# ── P0-5 (B2): the tap-remap pin the v0.33 docstring claimed and never had ────
+
+def test_v033_p0_5_tap_keys_survive_every_cook_path(r):
+    """B2. `remap_suffix_taps`/`unservable_prefix_taps` shipped in v0.33 with NO test anywhere —
+    this file's own docstring claimed one. The contract is an equality: `cook_checkpointed` and
+    `cook_fused_cached` return the same OUTPUT KEYS as a plain `cook_stage_list`, because a host
+    binds node output slots to them.
+
+    Measured pre-fix: plain gave `['OUT','_tap_s1']`; `cook_checkpointed(cuts=[2])` gave
+    `['OUT']` (tap silently DROPPED — its stage was inside the served prefix) and `cuts=[1]`
+    gave `['OUT','_tap_s0']` (RENAMED); `cook_fused_cached(k=2)` gave `_tap_s0` for `_tap_s2`
+    on both miss and hit."""
+    from TEX_Wrangle import tex_checkpoint as CK
+    from TEX_Wrangle import tex_results as R
+
+    def chain(n, tap_at, src):
+        out = []
+        for i in range(n):
+            st = {"code": f"@OUT = vec4(@IN.rgb * {1.0 + i * 0.05:.2f}, 1.0);",
+                  "chain_input": (None if i == 0 else "IN"),
+                  "bindings": ({"IN": src} if i == 0 else {})}
+            if i in tap_at:
+                st["tap"] = True
+            out.append(st)
+        return out
+
+    bad = []
+    for device in _devices():
+        src = _frame(res=48, device=device)
+        up = ("tap-src",)
+
+        # 3-stage, tap on stage 1, checkpointed at each admissible cut.
+        want = sorted(tex_engine.cook_stage_list(chain(3, {1}, src), device=device,
+                                                 precision="fp32").keys())
+        for cuts in ([1], [2]):
+            c = R.ResultCache()
+            CK.materialize(chain(3, {1}, src), c, device=device, precision="fp32",
+                           upstream=up, cuts=cuts)
+            got = sorted(CK.cook_checkpointed(chain(3, {1}, src), c, device=device,
+                                              precision="fp32", upstream=up,
+                                              cuts=cuts).keys())
+            if got != want:
+                bad.append(f"[{device}] checkpointed cuts={cuts}: {got} != {want}")
+
+        # 4-stage, tap on stage 2, spliced at k=2 — MISS then HIT (both go through the seam).
+        want4 = sorted(tex_engine.cook_stage_list(chain(4, {2}, src), device=device,
+                                                  precision="fp32").keys())
+        c2 = R.ResultCache()
+        for label in ("miss", "hit"):
+            got = sorted(tex_engine.cook_fused_cached(chain(4, {2}, src), 2, c2, device=device,
+                                                      precision="fp32", upstream=up).keys())
+            if got != want4:
+                bad.append(f"[{device}] cook_fused_cached {label}: {got} != {want4}")
+
+        # The REFUSAL: a tap below the cut cannot be served, so the cut must be declined and
+        # the whole chain cooked — dropping a requested output is never the cheap path's call.
+        c3 = R.ResultCache()
+        CK.materialize(chain(3, {0}, src), c3, device=device, precision="fp32",
+                       upstream=up, cuts=[2])
+        want0 = sorted(tex_engine.cook_stage_list(chain(3, {0}, src), device=device,
+                                                  precision="fp32").keys())
+        got0 = sorted(CK.cook_checkpointed(chain(3, {0}, src), c3, device=device,
+                                           precision="fp32", upstream=up, cuts=[2]).keys())
+        if got0 != want0:
+            bad.append(f"[{device}] refusal case tap@0 cuts=[2]: {got0} != {want0}")
+
+    r.ok("P0-5: output keys are identical across plain / checkpointed / spliced cooks") \
+        if not bad else r.fail("P0-5 tap keys", "; ".join(bad))

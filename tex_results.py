@@ -166,6 +166,20 @@ import threading
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 
+#: B5a — the `.frame` spill-record format version. ABSENCE reads as v0 (raw), which is exactly
+#: what every file written before v0.33.1 is, so both formats are readable for one release and
+#: an upgrade is never a silent cold start.
+#:
+#: This field should have landed with v0.33, which CHANGED the record (adding `orig`, and
+#: redefining `device` as the HOME device rather than the current one) without one. Compat held
+#: only by accident: `rec.get("orig")` defaults to `None` = "stored as cooked", and for a
+#: v0.32 frame `device` and `home` were necessarily equal. Neither accident survives the next
+#: change, so the field goes in now, while the reader still knows what v0 meant.
+#:
+#:   v0  (absent)  {t, device, canvas, epoch}                  — v0.32 and earlier
+#:   v1            + orig (storage repr), viewed (uint16 view)  — v0.33.1
+_FRAME_FORMAT = 1
+
 
 class _DepthLock:
     """An `RLock` that knows how deep this thread is inside it.
@@ -370,6 +384,13 @@ class ResultCache:
         # between devices because it was upgraded. GOV-1's presets and `set_vram_budget` arm it.
         self._vram_budget: "int | None" = None
         self._pending_demotes: deque = deque()
+        # A1: keys popped off `_pending_demotes` whose copy has not yet been committed.
+        # Between the pop and the commit a victim is in NEITHER the queue nor its final
+        # device, so without this it is re-queuable and demotable twice — and two commits
+        # of one cuda->cpu transfer drive `_bytes_by_dev['cuda']` negative permanently.
+        self._demoting: set = set()
+        # A5: bumped by `clear()`; a spill that started before the bump must not re-index.
+        self._generation: int = 0
         self.hits = self.misses = self.spills = self.restores = self.evictions = 0
         # CACHE-8: how many frames the residency ladder moved, each direction. These are the
         # numbers that say whether the tier is doing anything, and `stats()` reports them —
@@ -445,7 +466,7 @@ class ResultCache:
         self._admit(key, tex_packing.pack(tensor, want), canvas,
                     tensor.dtype if want is not None else None)
 
-    def _admit(self, key: str, tensor, canvas, orig_dtype, home=None) -> None:
+    def _admit(self, key: str, tensor, canvas, orig_dtype, home=None) -> "_Entry | None":
         """Insert an ALREADY-REPRESENTED frame: freeze it, account it, enforce the budgets.
 
         The shared body of `put` (which decides the representation first) and `_restore`
@@ -484,8 +505,9 @@ class ResultCache:
             # a fresh key lands at the OrderedDict tail (MRU); _enforce_ram_budget evicts from the front
             dev = str(frozen.device)
             prev_home = home if home is not None else (old.home if old is not None else dev)
-            self._ram[key] = _Entry(frozen, stamp, storage_bytes, dev, canvas,
-                                    orig_dtype, prev_home)
+            admitted = _Entry(frozen, stamp, storage_bytes, dev, canvas,
+                              orig_dtype, prev_home)
+            self._ram[key] = admitted
             self._bytes_by_dev[_dev_bucket(dev)] += storage_bytes
             # Residency first, then the total budget. The order is the point of having two
             # ladders: demoting a cold CUDA frame to host RAM costs 10.8 ms at 4K and keeps it
@@ -496,6 +518,11 @@ class ResultCache:
             self._enforce_ram_budget()
         self._drain_demotes()         # D2H outside the lock (see the rule on __init__)
         self._drain_spills()          # disk I/O outside the lock (same rule)
+        # A2: hand the ENTRY back. `orig_dtype` is immutable for an entry's life (only `tensor`
+        # and `device` are ever mutated, by the residency ladder), so a caller that captured the
+        # entry here can read the representation without a second lookup — and a second lookup
+        # is exactly what could return `None` after a racing `clear()`.
+        return admitted
 
     def get(self, key: str, *, copy: bool = True):
         """Return the cached frame for `key`, or None. By DEFAULT (copy=True) returns an OWNED
@@ -544,10 +571,8 @@ class ResultCache:
             # takes the lock itself, so the insert is still serialized. Two threads racing the
             # same key both read and the second `put` simply replaces the first: a duplicated
             # read, never a corrupted table.
-            frame = self._restore(key)                 # re-admits to RAM; returns the master, or None
-            with self._lock:
-                entry = self._ram.get(key)
-                orig_dtype = entry.orig_dtype if entry is not None else None
+            # Returns (master, orig_dtype) together — see A2 on `_restore`. Never re-look-up.
+            frame, orig_dtype = self._restore(key)
         with self._lock:
             if frame is None:
                 self.misses += 1
@@ -723,12 +748,31 @@ class ResultCache:
         choice is a change to one function.
 
         Bytes are charged when a victim is QUEUED, not when the drain frees them: the drain is
-        unconditional from here, and counting an entry twice would demote the world."""
-        queued = {k for k, _e in self._pending_demotes}
+        unconditional from here, and counting an entry twice would demote the world.
+
+        A1: the skip-set is the queue UNION the in-flight set. A victim `_drain_demotes` has
+        already popped is no longer in `_pending_demotes` but its copy has not landed — it is
+        still on CUDA, still matches the walk, and re-queuing it gets it demoted TWICE. Both
+        drains then commit the same cuda→cpu byte transfer, `_bytes_by_dev["cuda"]` goes
+        NEGATIVE and stays skewed, `governed_bytes()` feeds the CACHE-5 governor garbage, and
+        `_enforce_residency` stops firing forever because `over` can no longer be positive.
+        Measured on a natural two-thread race over one 64 MiB frame: `{'cuda': -67107840}`
+        against an actual 1024, with `demotions=2` for a single frame."""
+        queued = {k for k, _e in self._pending_demotes} | self._demoting
         got = 0
+        # A7: the MRU entry is the frame just cooked — the one about to be read. Excluding it
+        # by KEY is what the docstring always promised; the `len(self._ram) <= 1` guard it used
+        # to rely on is dead code here, because this function never removes an entry, so on any
+        # multi-entry cache the walk reached the newest frame whenever `want` covered the older
+        # CUDA bytes. Deterministic at `set_vram_budget(0)`: two puts demoted BOTH, including
+        # the one whose `put` had just returned, which is then promoted back on its next hit —
+        # ~22 ms of pointless copies per cook at 4K.
+        mru = next(reversed(self._ram), None) if self._ram else None
         for key in list(self._ram.keys()):            # oldest -> newest
-            if got >= want or len(self._ram) <= 1:
+            if got >= want:
                 break
+            if key == mru:
+                continue
             entry = self._ram.get(key)
             if entry is None or _dev_bucket(entry.device) != "cuda" or key in queued:
                 continue
@@ -768,16 +812,28 @@ class ResultCache:
                 key, entry = self._pending_demotes.popleft()
                 if self._ram.get(key) is not entry or _dev_bucket(entry.device) != "cuda":
                     continue                          # evicted, replaced, or already demoted
+                # A1: OFF the queue but not yet committed — `_queue_demotions` must still see it
+                # as spoken for, or it re-queues a frame that is still on CUDA and a second drain
+                # commits the same byte transfer.
+                self._demoting.add(key)
                 src = entry.tensor
             try:
                 # Born frozen: slot 0's contract is a FROZEN master (`_spill` reads it as one).
                 with torch.inference_mode():
                     host = egress(src, retained=True).tensor()
             except Exception:
+                with self._lock:
+                    self._demoting.discard(key)
                 continue                              # leave it in VRAM; correctness is unharmed
             with self._lock:
+                self._demoting.discard(key)
                 cur = self._ram.get(key)
-                if cur is not entry:
+                # A1: identity AND device, mirroring `_promote`. Identity alone is not enough —
+                # two drains can hold the SAME entry object, both find it unchanged, and both
+                # apply the transfer. The device is what says whether the move already happened,
+                # and it is the field the transfer itself mutates, so re-reading it under the
+                # lock is the check that cannot be raced.
+                if cur is not entry or _dev_bucket(cur.device) != "cuda":
                     continue                          # it moved on while we copied: drop the copy
                 self._bytes_by_dev["cuda"] -= entry.nbytes
                 self._bytes_by_dev["cpu"] += entry.nbytes
@@ -879,6 +935,8 @@ class ResultCache:
         buffer would deserialize pageable anyway.)"""
         try:
             import torch
+            with self._lock:
+                gen = self._generation          # A5: the generation this write belongs to
             tensor = entry.tensor
             # A normal, contiguous CPU copy for serialization in ONE host-visible copy. A frozen
             # (inference) entry can't be pickled, and `.to("cpu")` on an already-CPU frame is a
@@ -913,9 +971,22 @@ class ResultCache:
                     prev = os.path.getsize(path)
                 except OSError:
                     prev = 0
-            rec = {"t": handle.tensor(),        # ← THE FENCE. Nothing above reads the bytes.
+            cpu_t = handle.tensor()             # ← THE FENCE. Nothing above reads the bytes.
+            # A4: torch 2.10 PICKLES `torch.uint16` at every protocol and then cannot LOAD it
+            # ("UntypedStorage has no attribute 'dtype'"). So the spill "succeeded" — file
+            # written, bytes charged, key indexed — while `_restore` could never read it back:
+            # every uint16 frame was permanently lost on eviction, and the dead `.frame` leaked
+            # the disk budget forever because even the stale-epoch cleanup is unreachable (the
+            # load raises before the epoch is compared).
+            #
+            # Store the same bits as `int16` and re-view on restore. Bit-identical (verified),
+            # costs nothing, and keeps uint16 frames spillable rather than declining them.
+            viewed = None
+            if cpu_t.dtype is torch.uint16:
+                cpu_t, viewed = cpu_t.view(torch.int16), "uint16"
+            rec = {"t": cpu_t, "fmt": _FRAME_FORMAT,
                    "device": entry.home, "canvas": entry.canvas, "epoch": env_epoch(),
-                   "orig": _dtype_tables()[0].get(entry.orig_dtype)}
+                   "orig": _dtype_tables()[0].get(entry.orig_dtype), "viewed": viewed}
             _atomic_pickle(path, rec)
             self.spills += 1
             # P0-6: the INDEX MUTATIONS GO UNDER THE LOCK. The file write above stays outside it
@@ -930,13 +1001,27 @@ class ResultCache:
             # `reindex_disk` additionally MERGES rather than rebinds (see it), so the two halves
             # of the fix close the window from both sides.
             with self._lock:
-                if self._spilled is not None:
-                    self._spilled.add(key)  # still unknown (None) stays unknown, not {this key}
-                if self._disk_bytes is not None:        # keep the running total current
-                    try:
-                        self._disk_bytes += os.path.getsize(path) - prev
-                    except OSError:
-                        self._disk_bytes = None         # lost track: force a reconciling scan
+                if self._generation != gen:
+                    # A5: `clear()` ran while this write was in flight. The frame the user
+                    # cleared must not come back — drop the file we just wrote and index
+                    # nothing. Done under the lock so the check and the decision are atomic
+                    # against another `clear()`.
+                    stale = True
+                else:
+                    stale = False
+                    if self._spilled is not None:
+                        self._spilled.add(key)   # unknown (None) stays unknown, not {this key}
+                    if self._disk_bytes is not None:    # keep the running total current
+                        try:
+                            self._disk_bytes += os.path.getsize(path) - prev
+                        except OSError:
+                            self._disk_bytes = None     # lost track: force a reconciling scan
+            if stale:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                return
             self._enforce_disk_budget()
         except Exception:
             pass
@@ -950,22 +1035,32 @@ class ResultCache:
             if self._spilled is None:
                 self._learn_spilled()      # one scandir, once, instead of a stat per miss
             if self._spilled is not None and key not in self._spilled:
-                return None                # not on the tier — no syscall needed
+                return None, None          # not on the tier — no syscall needed
             path = self._disk_path(key)
             if not os.path.exists(path):
-                return None
+                return None, None
             with open(path, "rb") as f:
                 rec = pickle.load(f)
             if rec.get("epoch") != env_epoch():     # a prior-environment frame: discard
                 try:
                     os.remove(path)
-                    self._disk_bytes = None          # out-of-band removal: invalidate the total
-                    if self._spilled is not None:
-                        self._spilled.discard(key)
                 except OSError:
                     pass
-                return None
+                else:
+                    # A6: UNDER THE LOCK. These are the same two index fields P0-6 moved into
+                    # the lock inside `_spill`, reached through a door P0-6 did not close — and
+                    # unsynchronised they lose to a racing `_spill`, whose locked `+=` can land
+                    # after this `None` and leave `_disk_bytes` a definite WRONG value. The
+                    # file's convention is that an uncertain total is `None`, never a confident
+                    # lie; that only holds if the invalidation cannot be overwritten.
+                    with self._lock:
+                        self._disk_bytes = None      # out-of-band removal: invalidate the total
+                        if self._spilled is not None:
+                            self._spilled.discard(key)
+                return None, None
             host = rec["t"]
+            if rec.get("viewed") == "uint16":       # A4: undo the int16 storage view
+                host = host.view(torch.uint16)
             dev = rec.get("device", "cpu")
             # Restore UNDER inference_mode so the device tensor is born frozen — then put()'s
             # freeze() is a no-op instead of a full-frame VRAM re-clone (which would also force a
@@ -995,11 +1090,18 @@ class ResultCache:
             # and an unknown name resolves to "stored as cooked" rather than to whatever
             # attribute happens to answer to it.
             orig = rec.get("orig")
-            self._admit(key, tensor, rec.get("canvas"),      # already frozen: _admit no-op-freezes
-                        _dtype_tables()[1].get(orig), home=dev)
-            return self._ram[key].tensor if key in self._ram else tensor
+            entry = self._admit(key, tensor, rec.get("canvas"),  # already frozen: no-op-freezes
+                                _dtype_tables()[1].get(orig), home=dev)
+            # A2: the frame AND its representation, from the ONE locked re-admit. This used to
+            # return only the tensor and let `get` re-look-up `orig_dtype` in a second lock
+            # acquisition — a window in which a concurrent `clear()` or eviction drops the entry,
+            # `orig_dtype` reads `None`, and an fp16-STORED frame is served at storage dtype to a
+            # caller owed fp32. Reproduced without any patching, on the first iteration.
+            if entry is None:
+                return tensor, _dtype_tables()[1].get(orig)
+            return entry.tensor, entry.orig_dtype
         except Exception:
-            return None
+            return None, None
 
     def _enforce_disk_budget(self) -> None:
         """Cap the spill directory's total bytes, deleting oldest-first (mtime). A separate cap
@@ -1073,7 +1175,7 @@ class ResultCache:
             # snapshot LRU order (oldest first) so mutation during iteration is safe. Entries
             # already queued for demotion are skipped: their bytes are counted once, and
             # spilling one would race the drain for the same frame.
-            queued = {k for k, _e in self._pending_demotes}
+            queued = {k for k, _e in self._pending_demotes} | self._demoting
             for key in list(self._ram.keys()):
                 if freed >= need or len(self._ram) <= 1:
                     break
@@ -1121,6 +1223,11 @@ class ResultCache:
         # filesystem work over a dir this cache owns, and on a multi-GB spill tier it would
         # otherwise block every `get` and `put` for the length of a scandir.
         self.sweep_temps()              # a crashed writer's leftovers are dead by definition
+        # A3: the two facts that decide whether the scan's answer may be trusted as COMPLETE.
+        # Read before the walk, compared after it.
+        with self._lock:
+            spills_at_entry = self.spills
+            unknown_at_entry = self._spilled is None
         n = nbytes = 0
         total = None
         try:
@@ -1146,14 +1253,31 @@ class ResultCache:
             # stale TRUE costs one syscall in `_restore`, a stale ABSENCE loses a frame. Union
             # with whatever the spiller recorded, and prefer `unknown` (None) over a definite
             # wrong answer when the scan itself failed.
-            if total is None:
+            raced = self.spills != spills_at_entry
+            # `self._spilled` can be dropped to None DURING the scan — `_enforce_disk_budget`
+            # evicts by path and invalidates membership when it does — and the merge below
+            # would then raise `TypeError: unsupported operand type(s) for -: 'NoneType'`.
+            # Found by asking why the `raced` mutation survived: it is redundant for the two
+            # cases already covered, and the case it is NOT redundant for was crashing.
+            if total is None or unknown_at_entry or raced or self._spilled is None:
+                # A3: the v0.33 fix merged `_spilled` with the scan, which closes the window
+                # only for a cache whose membership is already a LEARNED SET. It does nothing
+                # for `_spilled is None` — which is precisely `reindex_disk`'s own reason to
+                # exist, the ENG-13 reattach of a fresh cache over a populated directory:
+                # `_spill` skips recording when membership is unknown, so the merge finds
+                # "nothing missed" and the tail rebinds to a definite set that EXCLUDES the
+                # racing frame. That frame is then unserveable forever (`_restore`
+                # short-circuits on the set without stat-ing) and its bytes are uncounted.
+                #
+                # So the rebind happens only when nothing could have been missed. The spill
+                # counter is the witness: if it moved during the scan, or membership was
+                # unknown when we started, stay UNKNOWN — one stat per miss is the price, and
+                # the file's standing convention is that an uncertain answer is `None`, never
+                # a definite wrong one.
                 self._disk_bytes = None
                 self._spilled = None
             else:
-                # Anything the spiller recorded that the scan did not see landed DURING the
-                # scan. Those keys are kept, and their bytes are unknown to us — so the total
-                # drops to `None` (rescan next time) rather than to a confidently wrong number.
-                missed = (self._spilled - found) if self._spilled is not None else set()
+                missed = self._spilled - found
                 self._spilled = found | missed
                 self._disk_bytes = total if not missed else None
         return n, nbytes
@@ -1180,6 +1304,12 @@ class ResultCache:
             # — a cleared cache must not keep writing the frames it just forgot.
             self._pending_demotes.clear()
             self._pending_spills.clear()
+            # A5: a victim `_drain_spills` ALREADY popped is not in either queue, so clearing
+            # them does not stop it. Its write lands after the unlink loop below, re-creating
+            # `key.frame` and re-adding the key to the index — and a later `get` then serves the
+            # frame the user just cleared. The generation is checked under the lock before the
+            # post-write index add; a stale writer drops its own file instead.
+            self._generation += 1
         if not disk:
             return
         # The unlink loop runs OUTSIDE the lock (see the rule on __init__) — N os.remove calls

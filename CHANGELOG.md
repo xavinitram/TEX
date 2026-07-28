@@ -5,6 +5,75 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.1] - 2026-07-28
+
+**Mind the tiers** — the v0.33.0 release audit's findings, closed. Eight behavioural fixes in
+the frame cache, every one behind an ARMED path (residency via `set_vram_budget`/GOV-1, the
+spill tier, or opt-in `storage="uint16"`) and none reachable from the default ComfyUI cook —
+which is why this is a patch and not a recall. Each lands with a pinned test **verified to fail
+on the v0.33.0 tree** (10/10 against a `git archive HEAD` checkout), and the concurrency fixes
+carry mutation rows.
+
+### Fixed
+
+* **A1 — a doubly-demoted frame drove `_bytes_by_dev["cuda"]` negative.** The commit block
+  re-checked entry *identity* but not *device*, and a victim popped off `_pending_demotes` was
+  invisible to the victim walk, so it could be re-queued while its copy was in flight. Both
+  drains then applied the same cuda→cpu transfer. Measured: `{'cuda': -262144}` against a
+  per-entry recount of `{'cuda': 0}`, `demotions=3` for two frames — and because the skew is
+  permanent, `governed_bytes()` feeds the CACHE-5 governor garbage and `_enforce_residency`
+  can never fire again. Fixed with an in-flight set plus the device re-check.
+* **A2 — `get()` could serve fp16 to a caller owed fp32.** `orig_dtype` was re-looked-up in a
+  SECOND lock acquisition after `_restore` returned; a `clear()` in that window made it read
+  `None` and the fp16-stored frame was served at storage dtype, breaking the storage tier's one
+  guarantee. `_restore` now returns `(frame, orig_dtype)` from its single locked re-admit.
+* **A3 — the P0-6 residual.** The v0.33 merge closed the window only for a *learned* membership
+  set; a fresh cache (`_spilled is None` — `reindex_disk`'s own ENG-13 reattach case) still
+  deterministically lost a frame that spilled during the scan, leaving it unserveable forever
+  and its bytes uncounted. Membership now stays UNKNOWN whenever the scan cannot be shown
+  complete. *The v0.33 pin for this was decorative — it passed against the pre-fix rebind.*
+* **A4 — uint16 frames were destroyed by the spill tier.** torch 2.10 pickles `torch.uint16`
+  and cannot load it back, so the spill "succeeded" (file written, bytes charged, key indexed)
+  while `_restore` could never read it: the frame was lost on eviction and the dead `.frame`
+  leaked the disk budget permanently (even the stale-epoch cleanup is unreachable — the load
+  raises first). Now stored through an `int16` view and re-viewed on restore, bit-identical.
+* **A5 — `clear(disk=True)` lost to an in-flight spill**, which rewrote the file and re-indexed
+  the key afterwards, so a later `get()` served the frame the user had cleared. A generation
+  counter, checked under the lock before the index add, makes the stale writer drop its file.
+* **A6 — `_restore`'s stale-epoch cleanup mutated `_spilled`/`_disk_bytes` unlocked**, through a
+  door P0-6 did not close; a racing `_spill` could overwrite the `None` invalidation and leave a
+  definite wrong total. Moved under the lock.
+* **A7 — the "never demote the MRU entry" guard was dead code.** `_queue_demotions` never
+  removes an entry, so `len(self._ram) <= 1` cannot fire on a multi-entry cache and the walk
+  reached the just-cooked frame — demoted immediately after its own `put`, then promoted back
+  on its next hit (~22 ms of pointless copies per cook at 4K). The MRU key is now excluded.
+* **A8 — fp64-cooked packed frames restored as raw fp16.** `choose_storage` admitted any float
+  wider than 2 bytes, but the spill record's dtype table cannot spell `float64`, so `orig` wrote
+  `None` and the restored entry forgot it was packed. Sources are fp32-only now.
+
+### Added
+
+* **A `.frame` format-version field** (doc 41 §B5a). v0.33 changed the spill record — adding
+  `orig`, redefining `device` as the HOME device — without one; compatibility held only because
+  `rec.get("orig")` defaults safely and a v0.32 frame's device and home were necessarily equal.
+  Absence still reads as v0-raw, so both formats are readable for one release, and a v0-record
+  restore is pinned.
+* **A pin for the P0-5 tap remap** (doc 41 §B2), which shipped in v0.33 with no test anywhere:
+  output keys are now asserted identical across plain / checkpointed / spliced cooks, including
+  the refusal case where a tap below the cut forces the whole chain to cook.
+
+### Notes on the verification
+
+Suite **2626/2626**. Mutation check: 23 rows killed; **two rows retired with their reasons
+recorded in the harness** rather than left as permanent `SURVIVED` noise. Both survivals were
+facts about the code, not the tests — A1's commit-block device check is unreachable given the
+pop-block check, and A3's `raced` term is redundant for both constructible cases. Asking why
+the second one survived surfaced a latent `TypeError` (`_enforce_disk_budget` dropping
+`_spilled` to `None` mid-scan crashed the merge), which is fixed here.
+
+No A/B benchmark run: every change is off the default cook path, and the three invariant-#7
+canaries are untouched and green.
+
 ## [0.33.0] - 2026-07-28
 
 **Remember more** — the memory tiers get deep. v0.32 taught the cache *where* to keep a frame;
@@ -34,10 +103,14 @@ waiting to be looked at again*? Argued fresh in `docs/preview-tier-precision.md`
   than a difference this engine already ships**. bf16 is kept as a live negative control in
   both the benchmark and the tests. *The first draft of the fidelity test measured only
   display-referred data and passed for the wrong reason; it now asserts both regimes.*
-* **Honest gap:** the roadmap's "colour planes half / data planes fp32" is not implementable as
-  stated — DATA-1's vocabulary has no role field and named planes are DATA-6 (v0.35). The split
-  is expressed with an explicit `storage="fp32"` pin and an exact value-range gate, both
-  failing toward fp32. LATENT is not auto-excluded; a host caching latents must pin them.
+* **The colour/data split IS implemented** (corrected in v0.33.1 — this entry previously called
+  it "not implementable until DATA-6", which undersold shipped, pinned code). DATA-1 has no role
+  field, true; but `tex_marshalling.map_inferred_type` has classified output KIND since M-3, and
+  IMAGE-vs-MASK/LATENT is the colour-vs-data line at this scale. `choose_storage(kind=…)` packs
+  IMAGE and refuses MASK/LATENT/scalar wires, threaded through `put`. It stays an ARGUMENT — the
+  cache never sniffs a tensor to guess a role (S-5).
+  *The real caveat:* `kind=None` remains eligible, so a kind-less caller holding latents still
+  needs the explicit `storage="fp32"` pin. DATA-6 supersedes `kind` without a signature change.
 
 ### CACHE-8 — deep cache tiers: residency, packing, and a codec that measured badly
 
@@ -62,7 +135,7 @@ waiting to be looked at again*? Argued fresh in `docs/preview-tier-precision.md`
   report asked for this to be run as a benchmark rather than believed — it was, and it lost.
   A test greps `tex_results.py` for codec names so a future addition argues with the number.
 * **uint16** is offered (`storage="uint16"`), never chosen automatically: **32× more accurate
-  than fp16 inside [0,1]** at the same two bytes, clips outside it, 3× the pack cost.
+  than fp16 inside [0,1]** at the same two bytes, clips outside it, ~5.6× the pack cost at 4K.
 * GOV-1's `_armed_caches` became a dict of remembered defaults per knob. With one remembered
   value, `balanced` could restore the frame budget and would silently leave the residency
   ceiling wherever `efficient` put it — the identical bug GOV-1 shipped once, one knob over.
@@ -117,7 +190,7 @@ equally (`benchmarks/cache_capacity_bench.py --exit-gate`):
 **Target met.** Two honest readings of that table: the 2× comes from PREC-1, and it is *opt-in* —
 a host that tags nothing gets 1.00×, by design. And residency's contribution at this budget is
 not *more* frames but the **same** frames on a quarter of the VRAM, because the total byte budget
-is what binds; its latency win is the separate 13.0×/20.1× above.
+is what binds; its latency win is the separate 13.2–13.8× / 13.7–18.7× above.
 
 Determinism pins (`test_release_gate.py`): version consistency, codegen emission under
 `PYTHONHASHSEED` 0 and 1, and the scatter-determinism band — all green. The egress fence is
@@ -125,7 +198,7 @@ Determinism pins (`test_release_gate.py`): version consistency, codegen emission
 
 ### Gates
 
-Suite **2600/2600**, 0 failed, 1 skipped (2568 at v0.32). **Mutation check 19/19 killed** — and
+Suite **2600/2600**, 0 failed, 1 skipped at the v0.33.0 tag (2568 at v0.32; **2626/2626** at v0.33.1). **Mutation check 19/19 killed** — and
 the three that survived the first run were all real: the demote-then-spill row never actually
 produced a demoted frame (at `budget_mb=0` the entry is evicted before the demote drain runs, so
 `device == home` and the bug could not exist); the fence row read `unsafe_buffer()` before
@@ -146,6 +219,19 @@ of a regression; the CUDA configs (null spread ±0.6%) are the sensitive instrum
 the box, and a process kill mid-run).
 
 ## [0.32.0] - 2026-07-27
+
+> **CORRECTION (v0.33.1).** The fp16 claim below is WRONG and the gate has been re-closed.
+> "The fp32 gate is LIFTED, on a measurement — 22/22 rows" was a real measurement whose
+> conclusion did not follow: every row in its matrix produced an fp16-REPRESENTABLE boundary.
+> M-3 keeps coordinate builtins fp32 (invariant #4), so a stage like `u * 1000.0 + 0.123`
+> carries an fp32-precision local through a straight-through fused cook while the checkpointed
+> path materializes that boundary and the suffix downcasts it at ingest. Counterexample:
+> **maxdiff 6.58e-01**, both devices, with the fp32 control bit-exact. `_gate_ok` refuses fp16
+> again (parity with `cook_fused_cached`), and the shipped admission test is INVERTED rather
+> than deleted so the gate stays pinned in both directions. The principled reopening — a
+> *representability check on the actual boundary tensor*, never a precision label — belongs to
+> PREC-1. Do not re-lift this citing the paragraph below.
+
 
 **Cache where it counts** — effort-based checkpoints. v0.31 gave the engine a measured cost
 signal; this release spends it. A fused chain grows checkpoints wherever the *cumulative

@@ -580,8 +580,8 @@ def register_result_cache(cache, *, name: str = "results", evict_order: int = 50
 # v0.33 adds `vram_mb`, CACHE-8's residency ceiling. It is the knob the v0.32 item text
 # reserved as "compression aggressiveness (from v0.33)" — and it is NOT that, because the
 # measured Pareto said so. `benchmarks/cache_capacity_bench.py` found a general-purpose codec
-# costs 871-4126 ms to encode and 199-565 ms to DECODE a 4K frame, against 204 ms to write the
-# frame to disk uncompressed and 36 ms to read it back: an aggressiveness dial would only have
+# costs 1765-6685 ms to encode and 403-920 ms to DECODE a 4K frame, against 332 ms to write the
+# frame to disk uncompressed and 59 ms to read it back: an aggressiveness dial would only have
 # selected degrees of loss. What actually buys capacity is width (PREC-1's fp16, exactly 2x)
 # and residency (a cold CUDA frame moved to host RAM for 10.8 ms instead of spilled for 204),
 # so the profile carries the knob that exists rather than the one that was predicted.

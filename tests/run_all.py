@@ -5,9 +5,21 @@
 # artifacts into the shipping package's .tex_cache. setdefault: an outer harness that
 # already chose a dir wins.
 import os as _os
+import sys as _sys
 import tempfile as _tempfile
 _os.environ.setdefault(
     "TEX_CACHE_DIR", _os.path.join(_tempfile.gettempdir(), "tex_test_cache"))
+
+# B7: a redirected stdout on Windows defaults to cp1252, and the ROI-4 banner in
+# test_v024_phase1 contains U+2261 — so `run_all.py > log.txt` died with a UnicodeEncodeError
+# partway through a green suite. Force UTF-8 on our own streams rather than asking every
+# caller to remember PYTHONIOENCODING (and rather than removing the glyph, which would only
+# move the trap to the next one someone types).
+for _s in (_sys.stdout, _sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from helpers import SubTestResult
 
@@ -1042,6 +1054,7 @@ def main():
         test_v033_p0_8_empty_cache_short_circuits,
         test_v033_p0_8_default_budget_probe_is_memoized,
         test_v033_p0_8_docstring_no_longer_claims_free,
+        test_v033_p0_5_tap_keys_survive_every_cook_path,
     )
     test_v033_p0_3_generator_head_key_carries_resolution(r)
     test_v033_p0_4_chain_windows_guards_a_past_the_end_start(r)
@@ -1053,6 +1066,36 @@ def main():
     test_v033_p0_8_empty_cache_short_circuits(r)
     test_v033_p0_8_default_budget_probe_is_memoized(r)
     test_v033_p0_8_docstring_no_longer_claims_free(r)
+    test_v033_p0_5_tap_keys_survive_every_cook_path(r)
+
+    # v0.33.1 — the v0.33.0 release-audit findings. Every row fails on the pre-fix
+    # tree (verified against a `git archive HEAD` checkout, 10/10).
+    from test_v0331_audit import (
+        test_v0331_a1_double_demotion_cannot_skew_the_byte_totals,
+        test_v0331_a1_a_demoting_frame_is_not_requeued,
+        test_v0331_a2_restore_returns_the_representation_atomically,
+        test_v0331_a2_a_racing_clear_never_serves_storage_dtype,
+        test_v0331_a3_reindex_never_rebinds_over_a_racing_spill,
+        test_v0331_a4_every_storage_dtype_survives_the_spill_tier,
+        test_v0331_a4_frame_records_carry_a_format_version,
+        test_v0331_a5_clear_is_not_undone_by_an_inflight_spill,
+        test_v0331_a7_the_mru_frame_is_never_demoted,
+        test_v0331_a8_only_fp32_sources_are_packed,
+        test_v0331_a1_a_duplicate_queue_entry_commits_once,
+        test_v0331_a3_a_learned_membership_set_also_survives_the_scan,
+    )
+    test_v0331_a1_double_demotion_cannot_skew_the_byte_totals(r)
+    test_v0331_a1_a_demoting_frame_is_not_requeued(r)
+    test_v0331_a2_restore_returns_the_representation_atomically(r)
+    test_v0331_a2_a_racing_clear_never_serves_storage_dtype(r)
+    test_v0331_a3_reindex_never_rebinds_over_a_racing_spill(r)
+    test_v0331_a4_every_storage_dtype_survives_the_spill_tier(r)
+    test_v0331_a4_frame_records_carry_a_format_version(r)
+    test_v0331_a5_clear_is_not_undone_by_an_inflight_spill(r)
+    test_v0331_a7_the_mru_frame_is_never_demoted(r)
+    test_v0331_a8_only_fp32_sources_are_packed(r)
+    test_v0331_a1_a_duplicate_queue_entry_commits_once(r)
+    test_v0331_a3_a_learned_membership_set_also_survives_the_scan(r)
 
     success = r.summary()
     return 0 if success else 1

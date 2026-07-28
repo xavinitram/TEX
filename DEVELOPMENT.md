@@ -742,6 +742,33 @@ Settled calls, kept here so they're not re-derived:
   guess is exactly the silent auto-tuning the discipline forbids. Shipped instead: an explicit
   `storage="fp32"` pin, and an *exact* value-range gate — both failing toward fp32. When DATA-6
   lands, `choose_storage` grows a role arm and no caller changes.
+- **Doc 41 §2.4's three CACHE-7/9 hardening items** (v0.33) — DEFERRED, not built, recorded the
+  same day per §10.6. Each has a measured trigger already on record, which is what makes the
+  deferral checkable rather than open-ended:
+  (a) *all-dirty routing as an engine answer* — the 0.21×/0.04× cliff is still fenced by prose
+  ("a host must route an all-dirty recook whole-frame") instead of by a `not-worth-it` return
+  from the serviceability API. **Reopen gate:** a host that actually drives region recooks at
+  scale, i.e. the compositor; PROF-1 already prices both sides, so this is wiring, not research.
+  (b) *fast-settle for placement* — 147 cooks to settle (3 warmup + 1-in-16 to `MIN_SAMPLES=12`)
+  is the recorded adoption tax. **Reopen gate:** any host reporting that checkpoints never
+  appear; the burst mode is ~10 lines in `profile.py` and cuts it to ~12 cooks.
+  (c) *per-device checkpoint thresholds* — the 100 ms default places NOTHING on CUDA on this box
+  (12-stage 2048² ≈ 43 ms) while the materialization floor is device-dependent by 18×. **Reopen
+  gate:** the first calibration run on real comps, which doc 39 §4 already marks host-gated.
+- **Doc 41 §2.5's ROTO-lang decision doc** (v0.33) — DEFERRED, and this one is overdue by three
+  releases (doc 40 §5 dates it "written v0.32–33"). It is document-only and it SHAPES DATA-5
+  (v0.37), so the cost of leaving it is that DATA-5 starts without knowing whether fusable
+  procedural masks beat host-rasterized MASK planes. **Reopen gate:** before DATA-5's design doc
+  opens, not after. The recipe is written down (doc 41 §2.5): a throwaway `spline_mask`
+  prototype interpreter-side, benchmarked against rasterized masks wired as bindings at 1080/4K
+  on both devices, with the go/no-go recorded either way — a "not shipped" verdict is a
+  completed item under doc 40 §4.6's own rule.
+- **Doc 41 §B5b/c** (v0.33.1) — two decisions doc 41 assigned that remain unrecorded: the PROF-1
+  `snapshot()` / persisted-placement cross-launch question (its stated gate, CACHE-8's tiers, has
+  now shipped, so it is unblocked), and XPU-2 × CUDA-graph capture — either add the
+  `is_current_stream_capturing()` guard (precedent: `noise.py`) or write the non-interaction
+  argument into `docs/async-egress.md`. **Note for whoever takes the second:** `egress`'s
+  `_blocking` fallback currently sits OUTSIDE the `try`, so it would raise uncaught mid-capture.
 - **A cross-node include/import system** — rejected on ethos grounds; self-containment
   ("five lines of self-contained plaintext") is a deliberate shareability feature.
 - **An extra fusion wire** — the frontend collapses a chain into the terminal node

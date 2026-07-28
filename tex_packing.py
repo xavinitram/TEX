@@ -202,8 +202,15 @@ def choose_storage(t, *, quality=None, storage=None, kind=None):
     # item promised not to touch.
     if quality != PREVIEW:
         return None                           # the default path, byte-identical to pre-v0.33
-    if not t.is_floating_point() or t.element_size() <= 2:
-        return None                           # a uint8 mask / an already-half frame: no win
+    if t.dtype is not torch.float32:
+        # A8: fp32 SOURCES ONLY. The old test was "floating point and wider than 2 bytes",
+        # which admits fp64 — and then the spill record spells `orig` through a table holding
+        # only tex_io's four storage dtypes, so `float64` maps to `None` and the restored entry
+        # FORGETS it was packed: float64 served before eviction, float16 after. Narrowing the
+        # source is the fix that fails toward exactness, and fp32 is the only dtype a TEX cook
+        # actually produces (invariant #4 forces coordinates fp32; outputs upcast on egress).
+        # A uint8 mask and an already-half frame decline here too, as before: no win.
+        return None
     want = FP16 if storage is None else _SPELLINGS.get(storage)
     if want is None:
         return None                           # an unsupported spelling: refuse, never guess

@@ -159,6 +159,17 @@ There is no invalidation protocol to get wrong; the key scheme already is one.
 
 ---
 
+
+> **CORRECTED (v0.33.1).** This section narrated LIFTING the fp32 gate on a 22-row measurement.
+> The gate is closed again. The measurement was real; its conclusion did not follow, because
+> every row in its matrix produced an fp16-REPRESENTABLE boundary. M-3 keeps coordinate builtins
+> fp32, so `u * 1000.0 + 0.123` is an fp32 local through a straight-through fused cook while the
+> checkpointed path materializes it and the suffix downcasts at ingest — **maxdiff 6.58e-01**,
+> both devices, fp32 control bit-exact. The precondition was never "fp16", it was "this boundary
+> happens to hold values fp16 can represent", which is a property of the VALUES that a precision
+> label cannot carry. Reopening requires a representability check on the actual tensor and
+> belongs to PREC-1 (`docs/preview-tier-precision.md`), not to this gate.
+
 ## 5. Precision: the fp32 gate is lifted, and the measurement that lifted it
 
 CACHE-6 gates taps to fp32, on the stated belief that "the boundary MUST be the exact fp32

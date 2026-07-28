@@ -65,7 +65,7 @@ numpy). The stdlib's three codecs are what is actually available, and all three 
   the cheapest entropy coder that reaches a comparable ratio — and it applies to VRAM, RAM *and*
   disk simultaneously, because the frame is packed once, at admission.
 * **uint16 is real but narrow.** 32× more accurate than fp16 inside `[0,1]` at identical size;
-  clips outside it; 7× the pack cost at 4K. Offered as `storage="uint16"`, never chosen
+  clips outside it; **5.6×** the pack cost at 4K (59.1 ms against fp16's 10.5). Offered as `storage="uint16"`, never chosen
   automatically — sniffing a frame's range to pick a codec is exactly the silent auto-tuning
   S-5 forbids, and the first in-range HDR frame would be quietly clipped by the choice.
 

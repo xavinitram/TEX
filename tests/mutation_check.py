@@ -76,8 +76,8 @@ MUTATIONS = [
      "    return max(abs(lo), abs(hi)) <= FP16_MAX",
      "    return True"),
     ("PREC-1: the spill forgets the stored representation", "tex_results.py",
-     '"orig": _dtype_tables()[0].get(entry.orig_dtype)}',
-     '"orig": None}'),
+     '"orig": _dtype_tables()[0].get(entry.orig_dtype), "viewed": viewed}',
+     '"orig": None, "viewed": viewed}'),
     ("CACHE-8: the spill writes where the frame IS, not where it belongs", "tex_results.py",
      '"device": entry.home, "canvas": entry.canvas',
      '"device": entry.device, "canvas": entry.canvas'),
@@ -107,6 +107,47 @@ MUTATIONS = [
      "tex_runtime/streams.py",
      "    if (not isinstance(src, torch.Tensor) or src.device.type != \"cuda\" or retained",
      "    if (not isinstance(src, torch.Tensor) or src.device.type != \"cuda\""),
+    # ── v0.33.1 (the release-audit findings) ───────────────────────────────────────────
+    # RETIRED, with the reason — not silently deleted. This row SURVIVED, and the survival is
+    # a fact about the CODE, not about the tests: the commit-block device re-check is
+    # unreachable. The pop block already rejects on device, and `_demoting` prevents the only
+    # route to a second pop of a live victim, so nothing can reach the commit with a device
+    # that has already moved. The check stays (it mirrors `_promote` and costs one comparison,
+    # and it is the guard a future queueing route would need), but a row that cannot be killed
+    # asserts nothing, and leaving it as permanent SURVIVED noise trains the reader to ignore
+    # the word. Re-arm this if a second producer of `_pending_demotes` ever appears.
+    #   ("A1: the demote commit stops re-checking the DEVICE", ...)
+    ("A1: an in-flight demotion is invisible to the victim walk again", "tex_results.py",
+     "        queued = {k for k, _e in self._pending_demotes} | self._demoting\n"
+     "        got = 0",
+     "        queued = {k for k, _e in self._pending_demotes}\n"
+     "        got = 0"),
+    ("A2: get() re-looks-up orig_dtype after _restore (the two-acquisition read)",
+     "tex_results.py",
+     "            frame, orig_dtype = self._restore(key)",
+     "            frame, _discard = self._restore(key)\n"
+     "            with self._lock:\n"
+     "                _e = self._ram.get(key)\n"
+     "                orig_dtype = _e.orig_dtype if _e is not None else None"),
+    # RETIRED, same reasoning, and it earned its keep on the way out: `raced` is redundant for
+    # both cases a test can construct (a fresh cache is caught by `unknown_at_entry`; a learned
+    # set is caught by the merge, because `_spill` records into it). Asking why the mutation
+    # survived surfaced the case it is NOT redundant for — `_enforce_disk_budget` dropping
+    # `_spilled` to None mid-scan, which was crashing the merge with a TypeError. That guard is
+    # now explicit and the crash is fixed; the mutation still cannot be killed by a test.
+    #   ("A3: reindex rebinds membership over a racing spill", ...)
+    ("A7: the victim walk reaches the MRU frame again", "tex_results.py",
+     "            if key == mru:\n"
+     "                continue",
+     "            if False:\n"
+     "                continue"),
+    ("B2/P0-5: remap_suffix_taps becomes the identity", "tex_fusion.py",
+     "    if not k:\n"
+     "        return outputs\n"
+     "    out = {}",
+     "    if True:\n"
+     "        return outputs\n"
+     "    out = {}"),
 ]
 
 RUNNER = """
@@ -117,8 +158,9 @@ sys.path.insert(0, r"{parent}")
 from helpers import SubTestResult
 import test_v032_checkpoint as A, test_v032_region as B, test_v032_governor as C
 import test_v033_precision as D, test_v033_cache8 as E, test_v033_xpu2 as F
+import test_v033_phase0 as G, test_v0331_audit as H
 r = SubTestResult()
-for m in (A, B, C, D, E, F):
+for m in (A, B, C, D, E, F, G, H):
     for n in sorted(x for x in dir(m) if x.startswith("test_")):
         try:
             getattr(m, n)(r)
