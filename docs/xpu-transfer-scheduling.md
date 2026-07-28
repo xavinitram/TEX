@@ -33,6 +33,17 @@ to a sync copy from pageable sources.
   Pure device moves only — dtype-converting copies stay synchronous; D2H is
   never non_blocking (a CPU-side read could observe an in-flight buffer).
 
+**Re-scoped in v0.33 (XPU-2), not repealed.** The D2H clause above is a rule
+about *bare tensors*, and it is still exactly right for them: a tensor has no
+way to say "not yet", so handing one back over an in-flight copy makes every
+reader a potential reader of garbage. What changed is that there is now a type
+that CAN say it. `tex_runtime/streams.py::FrameHandle` carries the destination
+plus the CUDA event, and `tensor()` fences before returning a single byte — so
+the doctrine reads, in full: **a D2H is never non_blocking behind a bare
+tensor; behind a `FrameHandle` it may be.** Two engine consumers use it
+(`ResultCache._spill`, `_drain_demotes`); the win is small and honestly
+accounted in `docs/async-egress.md` §4.
+
 Measured (RTX 5070 Ti Laptop, PCIe, interpreter cook wall, mixed CPU→CUDA):
 1024² 16MB — 1.55→1.41ms (**1.10x**); 2048² 64MB — 11.94→8.46ms (**1.41x**).
 The saving is bounded by the Python-side work available to hide the copy behind

@@ -435,3 +435,32 @@ re-cuts for it. CACHE-7's taps are placed once, from measurement, and serve ever
   constant until real comps calibrate it"), and GOV-1 is where it will be re-cut. The default
   is left at 100 ms rather than tuned to this hardware, because a constant fitted to one box is
   how a policy stops being portable.
+
+### 13.1 The all-miss prologue (P0-8), measured rather than asserted
+
+`cook_checkpointed`'s docstring used to claim that arming CACHE-7 against a cache that can
+serve nothing was **free**. It is not. `benchmarks/allmiss_prologue_bench.py`, 12-stage chain,
+explicit cuts, empty cache — armed against a plain `cook_stage_list`:
+
+| | warm (same process) | fresh process |
+|---|---|---|
+| CPU 512² | 17.9 / 17.5 ms — **1.03×** | 66.6 / 43.3 ms — **1.54×** |
+| CPU 2048² | 233.3 / 231.2 ms — **1.01×** | 460.1 / 433.3 ms — **1.06×** |
+| CUDA 512² | 3.98 / 3.97 ms — **1.00×** | 115.3 / 117.1 ms — **~1.0×** (noise) |
+| CUDA 2048² | 53.7 / 53.6 ms — **1.00×** | 194.5 / 180.2 ms — **1.08×** |
+
+**Read the absolute cost, not the ratio.** The prologue is a roughly fixed **14–27 ms, once
+per process** (CPU 23.3 ms at 512², 26.8 ms at 2048²; CUDA 14.3 ms at 2048²). Every ratio in
+that table is that constant divided by whatever the chain costs — which is why the same fix
+reads 1.54× on a 17 ms cook and 1.06× on a 433 ms one, and why a ratio quoted without its cook
+cost says nothing. Warm, the memoized `_default_ram_budget` and the `_cache_is_provably_empty`
+short-circuit have taken it to **1.00–1.03×**, i.e. into the noise. A fresh process still pays
+it once, because initializing the CUDA context is not something a memo can do earlier.
+
+The CUDA 512² row is reported as noise rather than as a win: at that shape a fresh process
+spends ~115 ms in context init on *both* arms, so the ±2 ms between them is not a measurement
+of anything. Saying so beats printing 0.99× and letting it read as a speedup.
+
+*(Pre-fix, the same shapes measured 1.09–1.33× warm and 2.46× on a true first cook. The 2.46×
+was a 512²-scale cook against a prologue that then included a ~20 ms `torch.cuda.is_available()`
+per `ResultCache()` plus a lineage key and a disk probe per cut.)*

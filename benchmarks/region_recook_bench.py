@@ -81,6 +81,13 @@ class Comp:
         # escapes it would read pre-edit pixels — `chain_windows` reports NOT SERVICEABLE
         # (None) when told. Tracking it is the host's job; this is that proof.
         self.valid: list = [None] * n
+        # P0-4a: the stages whose LAST cook DECLINED its window and cooked whole-frame. Not
+        # derivable from `valid` — a decline records `valid[i] = None` ("correct everywhere"),
+        # which is exactly the claim that is false: the decliner cooked from ITS input canvas,
+        # which an earlier region cook may have patched over a window only. Declines are
+        # ENGINE-initiated (fp16, a refused `roi_exec`), so a host cannot avoid them by being
+        # careful — it has to carry this set. Measured when it does not: 4.55e-01.
+        self.declined: set = set()
         self.halos = [tex_roi.stage_halo(c, p) for c, p in self.stages]
 
     def _cook(self, i, src, roi):
@@ -91,7 +98,8 @@ class Comp:
 
     def cook(self, roi=None, dirty_from: int = 0, patch: bool = True):
         """Cook stages `dirty_from..n-1`, over `roi` when given, patching each stage's canvas."""
-        windows = (tex_roi.chain_windows(self.halos, roi, dirty_from, valid=self.valid)
+        windows = (tex_roi.chain_windows(self.halos, roi, dirty_from, valid=self.valid,
+                                         declined=self.declined)
                    if roi is not None else [None] * self.n)
         if windows is None:
             # Not serviceable — an upstream canvas is stale where this edit must read it. No
@@ -102,7 +110,7 @@ class Comp:
             out, served = self._cook(i, cur, windows[i])
             if served is None or not patch or self.canvas[i] is None:
                 self.canvas[i] = out            # a declined window REPLACES the canvas
-                self.valid[i] = None                # a whole frame is valid everywhere
+                self.valid[i] = None            # ...over the whole frame, but see below
             else:
                 got = self.cache.patch_region(
                     f"s{i}", out, served, base=self.canvas[i])
@@ -111,6 +119,15 @@ class Comp:
                 # conservative reading — the newly patched window alone — is what this tracks,
                 # because a union of two disjoint rects is not a rect.
                 self.valid[i] = served if got is not None else None
+            # ONE statement of the rule, after the branches rather than inside each: it was ASKED
+            # for a window and handed back a frame. `valid` cannot express "whole frame, but
+            # cooked from a patched input", so the decliner is recorded separately and
+            # `chain_windows` refuses to plan over it. A whole-frame cook the host ITSELF asked
+            # for (`windows[i] is None`) is not a decline — nothing upstream of it was narrowed.
+            if served is None and windows[i] is not None:
+                self.declined.add(i)
+            else:
+                self.declined.discard(i)
             cur = self.canvas[i]
         if self.device == "cuda":
             torch.cuda.synchronize()
@@ -176,8 +193,13 @@ def measure(device, n, res, roi_side, reps, edit_at):
     row["cache_ram_mb"] = round(st["ram_bytes"] / (1 << 20), 1)
     row["under_budget"] = row["cache_ram_mb"] <= row["governor_budget_mb"]
     row["profile"] = tex_memory.active_profile()
-    row["windows"] = [w[2] for w in tex_roi.chain_windows(comp.halos, roi, edit_at)
-                      if w is not None][:4]
+    # Reported through the SAME state the timed path plans with, so this cannot print a
+    # narrowing the comp did not actually get. `None` here means the plan was refused (an
+    # upstream canvas is stale, or a decliner poisoned it) and the timed edit recooked whole —
+    # a fact worth printing rather than a case worth crashing on.
+    plan = tex_roi.chain_windows(comp.halos, roi, edit_at, valid=comp.valid,
+                                 declined=comp.declined)
+    row["windows"] = [w[2] for w in plan if w is not None][:4] if plan is not None else None
     return row
 
 

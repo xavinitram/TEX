@@ -144,3 +144,47 @@ first two drafts each missed one:
 
 Both halves are asserted. Remove the fence and the first fails; remove the ballast and the
 second does.
+
+**What the stress rows do NOT cover, said here so the coverage is not overstated.** They pin
+the *fence*: one handle read through `tensor()` while the copy is in flight, one through
+`unsafe_buffer()`. They do not pin *concurrency between handles* — N threads each issuing an
+egress and racing to fence — because on one DMA engine per direction those copies serialise, so
+such a row would assert scheduling the hardware already guarantees and would fail for
+timing reasons on a busier box. The concurrency that IS in this release lives in the two
+consumers, and it is pinned there instead, in `tests/test_v0331_audit.py` (the demote drain's
+identity-and-device commit re-check) and `tests/test_v0332_audit.py` (spill write ordering).
+When v0.34's async-write path gives a handle to a thread that outlives the caller, that is the
+release where a multi-handle stress row starts asserting something real.
+
+---
+
+## 6. Two decisions this doc owed an argument for
+
+**The copy is issued on the CURRENT stream, not on a dedicated copy stream.** A dedicated
+stream is the textbook shape and it is deliberately not what this does. It would require
+cross-stream ordering in both directions — record on the compute stream, wait on the copy
+stream, and tell the caching allocator about the borrow (`record_stream`) so the source block
+is not recycled into another stream's allocation while the DMA is still reading it. Getting
+that wrong produces a use-after-free that appears only under memory pressure, which is the
+worst-shaped bug this project can ship. Against that: §4 measures the asynchrony itself at
+**1.01–1.06×**, i.e. noise. Buying a class of allocator bug for noise is a bad trade. The
+revisit gate is concrete — a consumer that genuinely has GPU work to overlap the copy against
+(v0.34's async-write path), at which point the copy stream earns the ordering it costs.
+
+**The handle holds its SOURCE, not just its destination, until the fence.** Owning the
+destination is the obvious half; owning `_src` is the half a reader asks about, because the
+caller usually still holds the source anyway. It is held because "usually" is not a lifetime
+rule: a caller that drops its last reference the moment `egress` returns hands the block back
+to the caching allocator, and the DMA is then reading a buffer the allocator considers free.
+One reference for the duration of a copy is the cheapest possible fix. It is released in
+`wait()` — at fence time, not at handle death — so VRAM comes back at the earliest moment it
+provably can, and `_event is None` means "fenced" with no second flag to disagree with it.
+
+**The per-call cost, measured, since "bounded" is not a number.** On the paths where `egress`
+returns an already-complete handle (a CPU source — i.e. every default ComfyUI cook), it costs
+**20.0 µs against 16.3 µs** for the bare `empty()+copy_` it replaced at 512², and
+**1876 µs against 1769 µs** at 2048² — a ~4 µs constant plus the same copy, on a `put()` that
+is itself 1123 µs. On a CUDA source it is **360.7 µs against 348.5 µs** (512²) and
+**5129 µs against 5117 µs** (2048²) versus a pinned blocking copy, fence included. So the
+machinery is a low-microsecond constant everywhere and the §4 ratios are the whole story;
+there is no hidden per-call tax being waived.

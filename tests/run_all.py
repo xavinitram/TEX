@@ -924,6 +924,7 @@ def main():
         test_v032_cache9_second_deeper_edit_needs_valid_regions,
         test_v032_cache9_patch_region_is_atomic,
         test_v032_cache9_second_deeper_edit_pixels,
+        test_v032_cache9_a_declined_stage_poisons_a_later_edit,
     )
     test_v032_cache9_region_recook_oracle(r)
     test_v032_cache9_stale_ring_regression(r)
@@ -935,6 +936,7 @@ def main():
     test_v032_cache9_second_deeper_edit_needs_valid_regions(r)
     test_v032_cache9_patch_region_is_atomic(r)
     test_v032_cache9_second_deeper_edit_pixels(r)
+    test_v032_cache9_a_declined_stage_poisons_a_later_edit(r)
 
     # v0.32 GOV-1 — memory/effort profiles on the CACHE-5 governor (S item: designs in the
     # CHANGELOG entry, per roadmap §10.1).
@@ -968,7 +970,7 @@ def main():
         test_v033_prec1_absolute_error_vs_the_8bit_quantum,
         test_v033_prec1_declines_what_half_cannot_represent,
         test_v033_prec1_survives_the_disk_spill_tier,
-        test_v033_prec1_patch_region_does_not_inherit_the_tier,
+        test_v033_prec1_patch_region_inherits_the_base_tier,
         test_v033_prec1_is_absent_from_the_default_comfyui_path,
         test_v033_prec1_choose_storage_is_the_only_decision_point,
         test_v033_prec1_colour_data_split_at_the_kind_seam,
@@ -984,7 +986,7 @@ def main():
     test_v033_prec1_absolute_error_vs_the_8bit_quantum(r)
     test_v033_prec1_declines_what_half_cannot_represent(r)
     test_v033_prec1_survives_the_disk_spill_tier(r)
-    test_v033_prec1_patch_region_does_not_inherit_the_tier(r)
+    test_v033_prec1_patch_region_inherits_the_base_tier(r)
     test_v033_prec1_is_absent_from_the_default_comfyui_path(r)
     test_v033_prec1_choose_storage_is_the_only_decision_point(r)
     test_v033_prec1_colour_data_split_at_the_kind_seam(r)
@@ -1096,6 +1098,53 @@ def main():
     test_v0331_a8_only_fp32_sources_are_packed(r)
     test_v0331_a1_a_duplicate_queue_entry_commits_once(r)
     test_v0331_a3_a_learned_membership_set_also_survives_the_scan(r)
+
+    # v0.33.2 — the v0.33.1 release-audit findings. Every row fails on the pre-fix
+    # tree (verified against a `git archive v0.33.1` checkout, 11/11).
+    from test_v0332_audit import (
+        test_v0332_a1_a_stale_spill_never_overwrites_the_winner,
+        test_v0332_a1_a_check_and_write_are_one_critical_section,
+        test_v0332_a2_a_restore_cannot_resurrect_a_cleared_frame,
+        test_v0332_a3_clear_does_not_orphan_a_frame_spilled_during_its_walk,
+        test_v0332_a4_the_stored_quality_tag_survives_the_disk_tier,
+        test_v0332_a4_patch_region_cannot_launder_a_preview_base,
+        test_v0332_a4_the_viral_rule_reaches_the_disk_tier_and_spares_bare_bases,
+        test_v0332_a5_propagate_quality_accepts_a_single_tag,
+        test_v0332_a5_a_future_frame_format_is_refused,
+        test_v0332_a5_patch_region_refuses_a_mismatch_instead_of_raising,
+        test_v0332_a5_promote_keeps_a_patched_frame_on_its_home_device,
+        test_v0332_a5_disarming_residency_cancels_queued_demotions,
+        test_v0332_a5_disarming_also_cancels_a_demotion_already_in_flight,
+        test_v0332_h1_the_spill_ticket_orders_by_put_not_by_drain_start,
+        test_v0332_h2_a_restore_cannot_outrun_clears_unlink_walk,
+        test_v0332_h3_the_ratchet_never_packs_a_frame_put_refused_to_pack,
+        test_v0332_h4_learn_spilled_does_not_orphan_a_racing_spill,
+        test_v0332_h5_a_failed_spill_write_is_not_counted_or_indexed,
+        test_v0332_h6_a_disarmed_cache_issues_no_demotion_copy,
+        test_v0332_h7_a_restore_that_starts_inside_a_purge_is_refused_at_capture,
+        test_v0332_h7_the_purge_depth_survives_an_interrupted_walk,
+    )
+    test_v0332_a1_a_stale_spill_never_overwrites_the_winner(r)
+    test_v0332_a1_a_check_and_write_are_one_critical_section(r)
+    test_v0332_a2_a_restore_cannot_resurrect_a_cleared_frame(r)
+    test_v0332_a3_clear_does_not_orphan_a_frame_spilled_during_its_walk(r)
+    test_v0332_a4_the_stored_quality_tag_survives_the_disk_tier(r)
+    test_v0332_a4_patch_region_cannot_launder_a_preview_base(r)
+    test_v0332_a4_the_viral_rule_reaches_the_disk_tier_and_spares_bare_bases(r)
+    test_v0332_a5_propagate_quality_accepts_a_single_tag(r)
+    test_v0332_a5_a_future_frame_format_is_refused(r)
+    test_v0332_a5_patch_region_refuses_a_mismatch_instead_of_raising(r)
+    test_v0332_a5_promote_keeps_a_patched_frame_on_its_home_device(r)
+    test_v0332_a5_disarming_residency_cancels_queued_demotions(r)
+    test_v0332_a5_disarming_also_cancels_a_demotion_already_in_flight(r)
+    test_v0332_h1_the_spill_ticket_orders_by_put_not_by_drain_start(r)
+    test_v0332_h2_a_restore_cannot_outrun_clears_unlink_walk(r)
+    test_v0332_h3_the_ratchet_never_packs_a_frame_put_refused_to_pack(r)
+    test_v0332_h4_learn_spilled_does_not_orphan_a_racing_spill(r)
+    test_v0332_h5_a_failed_spill_write_is_not_counted_or_indexed(r)
+    test_v0332_h6_a_disarmed_cache_issues_no_demotion_copy(r)
+    test_v0332_h7_a_restore_that_starts_inside_a_purge_is_refused_at_capture(r)
+    test_v0332_h7_the_purge_depth_survives_an_interrupted_walk(r)
 
     success = r.summary()
     return 0 if success else 1

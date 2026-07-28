@@ -178,7 +178,8 @@ from dataclasses import dataclass
 #:
 #:   v0  (absent)  {t, device, canvas, epoch}                  — v0.32 and earlier
 #:   v1            + orig (storage repr), viewed (uint16 view)  — v0.33.1
-_FRAME_FORMAT = 1
+#:   v2            + quality (the tier tag the frame was stored under) — v0.33.2
+_FRAME_FORMAT = 2
 
 
 class _DepthLock:
@@ -241,6 +242,11 @@ class _Entry:
     canvas      opaque caller metadata (CACHE-9 records the window it wrote)
     orig_dtype  the dtype the frame was COOKED at when stored reduced, else None (PREC-1)
     home        where the frame BELONGS — its cook device (CACHE-8)
+    quality     the tier tag this frame was STORED under (v0.33.2). The cache needs it for two
+                things the tag alone could not do: `patch_region` must not launder a preview
+                base into a final-shaped result, and a requalify-on-idle pass has to be able to
+                ENUMERATE preview entries. `orig_dtype` is not a substitute — an unpackable
+                preview frame (out of fp16 range, or a MASK) stores full and would read as final.
     """
     tensor: object
     stamp: int
@@ -249,6 +255,7 @@ class _Entry:
     canvas: object
     orig_dtype: object
     home: str
+    quality: object = None
 
 
 #: torch dtype -> the `tex_io.STORAGE_DTYPES` name a spill record persists it under. Built from
@@ -334,7 +341,18 @@ class ResultCache:
     so the guard lives here: an uncontended acquire measures 220 ns against a `put` of 1.13 ms
     (512²×4 fp32) — 0.02%. RE-ENTRANT because `get` → `_restore` → `put` is a real call chain.
     Never on the default ComfyUI path either way (invariant #7): `tex_node.py` has no reference
-    to this module."""
+    to this module.
+
+    **ONE LIVE INSTANCE PER SPILL DIRECTORY.** Thread-safety here is process-and-instance
+    scoped: `_lock`, the generation counter and the per-key spill tickets (`_spill_seq` /
+    `_spill_locks`) are attributes of THIS object. Two live caches pointing at the same
+    `results/` dir therefore serialise nothing between them — their writes to one key can
+    still land in either order, and one's `clear(disk=True)` can unlink the other's frames
+    underneath it. What IS safe across instances is a single frame's file: `_atomic_pickle`
+    is temp-and-rename, so a reader never observes a half-written record, which is why the
+    ENG-13 reattach case (a NEW cache over a populated directory left by a dead process) is
+    supported and pinned. Concurrent live sharers are not. A host that wants two views of one
+    spill tier should share the object, not the path."""
 
     def __init__(self, *, budget_mb=None, disk_budget_mb=None, cache_dir=None):
         # THE RULE, stated once so the scope is checkable rather than a judgement call repeated
@@ -391,6 +409,26 @@ class ResultCache:
         self._demoting: set = set()
         # A5: bumped by `clear()`; a spill that started before the bump must not re-index.
         self._generation: int = 0
+        # A1 (v0.33.2): per-KEY write sequence. `_generation` is global and only moves on
+        # `clear()`, so it cannot order two in-flight spills of the SAME key — and those invert:
+        # put(K,v1) evicts and starts spilling; put(K,v2) evicts and its spill LANDS; v1's write
+        # then overwrites v2 on disk and `get(K)` restores v1. Measured: restored mean 1.0 where
+        # the last put was 2.0. `_drain_spills`' "nothing to guard against here" was true only
+        # for distinct keys.
+        self._spill_seq: dict = {}
+        # ...and a per-KEY write lock. The ticket alone cannot fix the ordering, only detect it
+        # afterwards — and detecting afterwards means the loser has already overwritten the
+        # winner's file, so the only safe response is to delete it and lose the frame. Holding
+        # a lock per key across the write makes the check-and-write atomic, so the stale writer
+        # bails BEFORE touching the file. Contention is per key and only between two in-flight
+        # spills of the same key; readers and other keys never wait on it, and the module-wide
+        # `_lock` is NOT held across the I/O (that rule is the whole point of the drain path).
+        self._spill_locks: dict = {}
+        # Non-zero while a `clear(disk=True)` walks the spill dir with the lock released.
+        # A DEPTH COUNT, not a bool: a bool left True by an interrupt mid-walk would disable the
+        # disk tier for the life of the process with nothing reporting it, and with two
+        # concurrent clears the first to finish would clear it out from under the other's walk.
+        self._purge_depth = 0
         self.hits = self.misses = self.spills = self.restores = self.evictions = 0
         # CACHE-8: how many frames the residency ladder moved, each direction. These are the
         # numbers that say whether the tier is doing anything, and `stats()` reports them —
@@ -424,16 +462,30 @@ class ResultCache:
 
     def _learn_spilled(self) -> None:
         """Populate the spilled-key set from the dir, once. Leaves it None on any error, which
-        is the safe answer: unknown means `_restore` pays the stat and still finds the frame."""
+        is the safe answer: unknown means `_restore` pays the stat and still finds the frame.
+
+        THE THIRD unlocked directory walk in this class, and it needs the same witness the other
+        two carry (`reindex_disk`, `clear`). The scandir runs with no lock, and `_spill` only
+        records into `_spilled` when membership is ALREADY known — so a frame that spills during
+        this walk is recorded nowhere, and asserting a definite set afterwards forgets it. That
+        frame is then on disk, absent from the membership set, and `_restore` short-circuits on
+        the set without stat-ing: unserveable forever, uncounted forever, and unreachable by the
+        stale-epoch cleanup. Same defect as P0-6 and v0.33.2 A3, through the one door neither
+        closed. If the spill counter moved across the walk, stay UNKNOWN — one stat per miss is
+        the price, and this file never gives a definite wrong answer where it can give none."""
         try:
+            with self._lock:
+                spills_at_entry = self.spills
             found = set()
             with os.scandir(self._spill_dir()) as it:
                 for e in it:
                     if e.name.endswith(".frame") and e.is_file():
                         found.add(e.name[:-len(".frame")])
-            self._spilled = found
+            with self._lock:
+                self._spilled = None if self.spills != spills_at_entry else found
         except OSError:
-            self._spilled = None
+            with self._lock:            # the last unlocked write to `_spilled`; P0-6's rule
+                self._spilled = None
 
     def _disk_path(self, key: str) -> str:
         return os.path.join(self._spill_dir(), f"{key}.frame")
@@ -464,9 +516,10 @@ class ResultCache:
         from . import tex_packing
         want = tex_packing.choose_storage(tensor, quality=quality, storage=storage, kind=kind)
         self._admit(key, tex_packing.pack(tensor, want), canvas,
-                    tensor.dtype if want is not None else None)
+                    tensor.dtype if want is not None else None, quality=quality)
 
-    def _admit(self, key: str, tensor, canvas, orig_dtype, home=None) -> "_Entry | None":
+    def _admit(self, key: str, tensor, canvas, orig_dtype, home=None,
+               gen=None, quality=None) -> "_Entry | None":
         """Insert an ALREADY-REPRESENTED frame: freeze it, account it, enforce the budgets.
 
         The shared body of `put` (which decides the representation first) and `_restore`
@@ -501,12 +554,19 @@ class ResultCache:
             storage_bytes = own_bytes
         stamp = tex_engine.frame_version(frozen)
         with self._lock:
+            # A2: the generation check belongs INSIDE this locked section, not before the call.
+            # `_restore` does its file read unlocked (by design — the lock covers structure, not
+            # I/O), so a `clear()` can land at ANY point up to here; checking before `_admit`
+            # leaves the window between that check and this lock, which is exactly where the
+            # second audit's repro pauses. `gen=None` means the caller has no opinion.
+            if gen is not None and gen != self._generation:
+                return None
             old = self._remove(key)                    # replace: drop any prior entry's accounting first
             # a fresh key lands at the OrderedDict tail (MRU); _enforce_ram_budget evicts from the front
             dev = str(frozen.device)
             prev_home = home if home is not None else (old.home if old is not None else dev)
             admitted = _Entry(frozen, stamp, storage_bytes, dev, canvas,
-                              orig_dtype, prev_home)
+                              orig_dtype, prev_home, quality)
             self._ram[key] = admitted
             self._bytes_by_dev[_dev_bucket(dev)] += storage_bytes
             # Residency first, then the total budget. The order is the point of having two
@@ -648,11 +708,28 @@ class ResultCache:
         requested: a stage can DECLINE a window and return a whole frame, and pasting that into
         a w×h slice is a crash. `cooked_roi is None` means "declined" — `put` the frame instead.
 
-        `quality`/`storage` (PREC-1) forward to the `put` of the patched result, and are NOT
-        inherited from the base. Inheritance would be the wrong default here: the base is
-        addressed by a key the caller minted, the result gets a key the caller minted, and the
-        tier is a property of those keys — so the caller states it, exactly as it does for `put`.
-        Passing nothing stores the patched frame at full precision, which is the safe direction.
+        `quality`/`storage` (PREC-1) forward to the `put` of the patched result, and `quality`
+        is RATCHETED DOWN BY THE BASE'S OWN TIER when the base is addressed by key: patching a
+        preview-stored base yields a preview-stored result even if you pass nothing. Preview is
+        viral, and this is the one seam where the cache can SEE the upstream rather than having
+        to trust the host to apply the rule — a patch cannot be more faithful than the frame it
+        is written into, so a final-shaped key over half-quantized pixels is the one outcome
+        this must not produce. It only ratchets DOWN: a final base with no tag stays final.
+
+        The rule cannot apply when you pass `base=` WITHOUT `base_key=` — a bare tensor carries
+        no tier, and the cache will not guess one.
+
+        And it is BEST-EFFORT when you pass `base=` WITH `base_key=`: the tag is read from the
+        live entry, and supplying `base=` is precisely what skips the `get` that would restore
+        a spilled one, so a base that has aged out to the disk tier propagates nothing. Reading
+        it back would mean an unpickle of the whole frame to recover one string, which defeats
+        the reason you passed `base=`. **If the tier matters and the base may not be resident,
+        pass `quality=` explicitly** — that is the spelling with no failure mode.
+
+        *(Reversed in v0.33.2. This paragraph used to say the tier was NOT inherited and that
+        passing nothing stored at full precision "which is the safe direction". It was not: it
+        stored a frame whose out-of-window bytes still carried the base's fp16 quantization
+        under a key that claimed final — measured 1.89e-03, half the 8-bit display quantum.)*
         """
         import torch
         if not isinstance(patch, torch.Tensor):
@@ -675,9 +752,50 @@ class ResultCache:
 
     def _patch_region_locked(self, key, patch, window, base, base_key, canvas,
                              quality=None, storage=None):
+        # A4 (v0.33.2): PREVIEW IS VIRAL, and this is the one seam where the cache itself can
+        # SEE the upstream — `propagate_quality` is otherwise a rule the host has to apply,
+        # because TEX cannot recover a tag from an opaque `upstream` SHA. Here the base is a
+        # cache entry with a recorded tag, so laundering is preventable rather than merely
+        # documented: patching an fp16-STORED base while passing `quality=None` produced a
+        # result stored full-fp32 under a final-shaped key whose out-of-window bytes still
+        # carried fp16 quantization (measured 1.89e-03) — silently mixed fidelity.
+        from . import tex_packing
         frame = base if base is not None else self.get(base_key or key, copy=True)
         if frame is None:
             return None                        # nothing to patch — the caller cooks whole
+        # The lookup runs AFTER the `get` above, and only for a base addressed BY KEY. Both
+        # halves were wrong in the first draft of this fix, and both were measured:
+        #
+        #   * BEFORE the `get`, a base sitting on the disk tier is not in `_ram` yet, so no tag
+        #     propagated and a spilled preview base was laundered exactly as before the fix.
+        #     The `get` is what restores the entry — reading `_ram` first asks the question one
+        #     step too early.
+        #   * `self._ram.get(base_key or key)` on the EXPLICIT-`base` path resolves to `key`,
+        #     the DESTINATION being overwritten, not the base at all. A stale preview entry
+        #     under that key then forced every later patch of it to preview, permanently, since
+        #     `propagate_quality` only ratchets downward. The documented host shape walks into
+        #     this: `patch_region(f"s{i}", out, served, base=canvas[i])` re-patches one stable
+        #     key per stage on every edit (`benchmarks/region_recook_bench.py`).
+        #
+        # So the tag comes from the entry the frame CAME FROM, mirroring the line above it: the
+        # explicit `base_key` when given, else the key we just read, and NOTHING when the caller
+        # handed over a bare tensor — a tensor carries no tier, and inventing one from whatever
+        # happens to sit under the destination key is how the second bug above happened.
+        tag_key = base_key if base_key is not None else (None if base is not None else key)
+        if tag_key is not None:
+            src = self._ram.get(tag_key)
+            # ...and only when the base's BYTES are actually reduced (`orig_dtype is not None`).
+            # The tag alone is not sufficient authority to pack, because `choose_storage` refuses
+            # several preview-tagged frames and the entry keeps the tag anyway: a MASK or LATENT
+            # (`kind` in DATA_KINDS — data planes are NEVER packed) and any frame outside the
+            # fp16 range both store full while reading `quality='preview'`. `patch_region` has no
+            # `kind` parameter, so its nested `put` passes `kind=None` and `choose_storage` would
+            # treat the ratcheted tag as licence to pack — quantizing a mask the host had
+            # explicitly protected, through a rule written to PREVENT fidelity loss. Gating on
+            # the stored representation keeps the rule exactly as strong as its justification:
+            # a patch is never more faithful than its base, and never less faithful either.
+            if src is not None and src.orig_dtype is not None:
+                quality = tex_packing.propagate_quality(quality, (src.quality,))
         x0, y0, w, h = (int(v) for v in tuple(window)[:4])
         if patch.shape[1:3] != (h, w):
             # The engine served a different extent than the window claims — a declined window
@@ -686,6 +804,13 @@ class ResultCache:
             return None
         if frame.shape[1:3] != (int(tuple(window)[5]), int(tuple(window)[4])):
             return None                        # base is not the frame this window describes
+        # A5/PROBE-11: the window describes the SPATIAL extent only, so a base and a patch that
+        # disagree on batch or channels reached the assignment below and raised a RuntimeError
+        # out of a method whose whole contract is "refuse by returning None". Refusing is not a
+        # nicety here: `patch_region` is documented as the call a host makes when it is unsure
+        # whether a region cook is serviceable, so it must never be the thing that raises.
+        if frame.shape[0] != patch.shape[0] or frame.shape[3:] != patch.shape[3:]:
+            return None
         # `base` may be a frozen buffer the caller merely holds a reference to (a cook output
         # arrives frozen), so clone unless we know it is ours. A `get(copy=True)` above already
         # returned an owned clone, which is why this only guards the explicit-`base` path.
@@ -713,6 +838,16 @@ class ResultCache:
         """
         with self._lock:
             self._vram_budget = None if mb is None else max(0, int(mb) * (1 << 20))
+            if self._vram_budget is None:
+                # A5 (v0.33.2): DISARM MEANS OFF, INCLUDING WORK ALREADY DECIDED ON. Victims
+                # queued under the old ceiling would otherwise keep draining after this returns,
+                # so a cache the host had just switched off went on moving frames cross-device —
+                # contradicting the line above it ("`None` disarms it, which is v0.32's
+                # behaviour exactly"; v0.32 never moves a frame between devices). Measured on
+                # CUDA: `demotions` went 0 -> 1 with `vram_budget_bytes=None`.
+                # Only the residency tier queues these (`evict_bytes` demotes solely when the
+                # budget is set), so dropping the queue cannot strand a governor request.
+                self._pending_demotes.clear()
             self._enforce_residency()
         self._drain_demotes()
 
@@ -835,6 +970,14 @@ class ResultCache:
                 # lock is the check that cannot be raced.
                 if cur is not entry or _dev_bucket(cur.device) != "cuda":
                     continue                          # it moved on while we copied: drop the copy
+                if self._vram_budget is None:
+                    # A5, and LOAD-BEARING rather than belt-and-braces: `set_vram_budget(None)`
+                    # empties `_pending_demotes`, but a victim THIS drain already popped is in
+                    # neither the queue nor the clear's reach — it is mid-`egress`, holding only
+                    # a local reference. Same argument `clear()` spells for spills ("a victim
+                    # `_drain_spills` ALREADY popped is not in either queue"). Delete this and
+                    # the disarm still lets one frame cross devices with the tier off.
+                    continue
                 self._bytes_by_dev["cuda"] -= entry.nbytes
                 self._bytes_by_dev["cpu"] += entry.nbytes
                 cur.tensor = host
@@ -848,6 +991,30 @@ class ResultCache:
         Called from `get` on a hit, OUTSIDE the lock — it is an H2D copy (11.1 ms at 4K),
         exactly the class of work the lock rule excludes. The re-entry check under the lock is
         what makes that safe: if the entry changed while we copied, the copy is discarded."""
+        # A5(d) WITHDRAWN in v0.33.2 — the lock-depth early-out that stood here is deferred, not
+        # forgotten (DEVELOPMENT.md carries the row). It read:
+        #
+        #     if self._lock.depth: return entry.tensor
+        #
+        # and its argument was sound as far as it went: the drains refuse to run a full-frame
+        # copy while a composite holds the lock, and `_promote` is an H2D (11.1 ms at 4K) that
+        # `patch_region` reaches at depth 1. What it missed is that `_promote` is not a drain.
+        # A drain DEFERS — the queue survives and `patch_region` runs it on release. This
+        # DEGRADED: it silently handed back the host copy, and there is no `_pending_promotes`
+        # to make good on it. Measured consequence, not a worry:
+        #
+        #     base demoted to host RAM (home=cuda:0) -> patch_region -> result device=cpu,
+        #     result HOME=cpu, promotions=0
+        #
+        # `frame[...] = patch` accepts a CUDA source into a CPU destination (`copy_` is
+        # cross-device), so nothing raises; `_admit` then records `home="cpu"` for the fresh
+        # destination key because that is where the frame it was handed actually lives. The
+        # patched frame has left the residency ladder permanently, and every stage downstream of
+        # it inherits a CPU home — precisely the "one-way trip to the CPU" `_Entry.home` was
+        # introduced to prevent. Trading a latency problem for a residency-correctness one is a
+        # bad trade, and closing it properly needs a promote QUEUE plus home propagation through
+        # `_patch_region_locked`'s nested put — two coupled changes that do not belong in a
+        # patch release. So the H2D runs under the lock here exactly as it did in v0.33.1.
         import torch
         src, home = entry.tensor, entry.home
         try:
@@ -893,10 +1060,12 @@ class ResultCache:
             with self._lock:
                 if not self._pending_spills:
                     return
-                key, entry = self._pending_spills.popleft()
+                key, entry, seq = self._pending_spills.popleft()
             # Both producers (`_enforce_ram_budget`, `evict_bytes`) queue only entries `_remove`
-            # returned non-None, so there is nothing to guard against here.
-            self._spill(key, entry)
+            # returned non-None, so there is nothing to guard against here. The ticket travels
+            # WITH the victim: claiming it below, after this lock is released, would order the
+            # writes by which drain happens to start first rather than by which `put` evicted.
+            self._spill(key, entry, seq)
 
     def _remove(self, key: str):
         """Pop `key` and undo ALL of its accounting. Returns the entry, or None.
@@ -915,6 +1084,27 @@ class ResultCache:
             self._bytes_by_dev[_dev_bucket(entry.device)] -= entry.nbytes
         return entry
 
+    def _claim_spill_ticket(self, key: str) -> int:
+        """Claim this key's next write ticket. CALLER HOLDS `_lock`, and that is the whole point.
+
+        The ticket must be claimed where the EVICTION is decided, not where the write starts.
+        v0.33.2 first claimed it at `_spill`'s own (separate) lock acquisition, and the comment
+        there asserted "the later `put`'s spill always holds the higher number regardless of
+        which write finishes first" — which was false, because `_drain_spills` pops the victim
+        under `_lock`, RELEASES it, and only then calls `_spill`. Two acquisitions, so pop order
+        did not imply ticket order. Measured: thread A pops (K, v1) and is descheduled in that
+        gap; the main thread runs `put(K, v2)` and its whole spill, taking ticket 1; A resumes,
+        takes ticket 2 with the OLDER pixels, passes every check, and overwrites the winner —
+        `get(K)` then serves v1 forever, after both puts and both spills returned. That is the
+        A1 defect surviving the A1 fix, and the A1 test could not see it because its gate sits
+        inside `egress`, which `_spill` reaches AFTER the old claim site.
+
+        Claimed here, the ticket is ordered by the `put` that caused the eviction, under the
+        lock that serialized those puts — which is what the ordering claim needs to be true."""
+        seq = self._spill_seq.get(key, 0) + 1
+        self._spill_seq[key] = seq
+        return seq
+
     def _enforce_ram_budget(self) -> None:
         """Spill LRU victims to disk until under the RAM byte budget. Never evicts the entry
         just inserted (it is newest / move_to_end'd), so a single frame larger than the whole
@@ -925,10 +1115,11 @@ class ResultCache:
             self.evictions += 1
             # QUEUED, not written — the caller must `_drain_spills()` after releasing the lock.
             # Every public method that can reach here does: put, evict_bytes, set_budget.
-            self._pending_spills.append((old_key, entry))
+            # The write ticket is claimed HERE, under this lock (see `_claim_spill_ticket`).
+            self._pending_spills.append((old_key, entry, self._claim_spill_ticket(old_key)))
 
     # ── disk spill / restore ──
-    def _spill(self, key: str, entry) -> None:
+    def _spill(self, key: str, entry, seq: int) -> None:
         """Write an evicted frame to disk (best-effort), then atomically pickle it under results/.
         A failed spill just drops the frame — the cook reproduces it. (Page-locking is applied on
         the RESTORE side, not here: pinning is not preserved through pickle, so a pinned spill
@@ -937,6 +1128,9 @@ class ResultCache:
             import torch
             with self._lock:
                 gen = self._generation          # A5: the generation this write belongs to
+                wlock = self._spill_locks.get(key)
+                if wlock is None:
+                    wlock = self._spill_locks[key] = threading.Lock()
             tensor = entry.tensor
             # A normal, contiguous CPU copy for serialization in ONE host-visible copy. A frozen
             # (inference) entry can't be pickled, and `.to("cpu")` on an already-CPU frame is a
@@ -986,8 +1180,21 @@ class ResultCache:
                 cpu_t, viewed = cpu_t.view(torch.int16), "uint16"
             rec = {"t": cpu_t, "fmt": _FRAME_FORMAT,
                    "device": entry.home, "canvas": entry.canvas, "epoch": env_epoch(),
-                   "orig": _dtype_tables()[0].get(entry.orig_dtype), "viewed": viewed}
-            _atomic_pickle(path, rec)
+                   "orig": _dtype_tables()[0].get(entry.orig_dtype), "viewed": viewed,
+                   "quality": entry.quality}
+            # A1: the check and the write are ONE critical section, per key. Outside it, a
+            # stale writer that has already passed a check can still overwrite the winner.
+            with wlock:
+                with self._lock:
+                    if self._spill_seq.get(key, 0) != seq or self._generation != gen:
+                        return            # a newer spill of this key won; touch nothing
+                if not _atomic_pickle(path, rec):
+                    # `atomic_write` reports failure by RETURN, and this discarded it: the
+                    # counters advanced, the key was indexed, and `_disk_bytes` was adjusted for
+                    # a file that was never written — or, worse, for a key whose PREVIOUS
+                    # `.frame` is still sitting there and now gets served as the current one.
+                    # That is A1's failure mode reached through a full disk instead of a race.
+                    return
             self.spills += 1
             # P0-6: the INDEX MUTATIONS GO UNDER THE LOCK. The file write above stays outside it
             # (that is the whole point of the drain path), but `_spilled` and `_disk_bytes` are
@@ -1033,14 +1240,57 @@ class ResultCache:
             import torch
             import pickle
             if self._spilled is None:
-                self._learn_spilled()      # one scandir, once, instead of a stat per miss
+                # Usually one scandir, ONCE, instead of a stat per miss. Not guaranteed
+                # any more: H4 makes a scan that raced a spill leave membership UNKNOWN
+                # rather than definite-and-wrong, so under sustained spilling this can
+                # re-walk on the next miss. Correctness first; the cost is a recorded
+                # deferral (DEVELOPMENT.md) with `_spilled_since` as the way out.
+                self._learn_spilled()
             if self._spilled is not None and key not in self._spilled:
                 return None, None          # not on the tier — no syscall needed
             path = self._disk_path(key)
             if not os.path.exists(path):
                 return None, None
+            with self._lock:
+                if self._purge_depth:
+                    # H2: a destructive walk is in progress over this directory. `clear(disk=
+                    # True)` bumps the generation under the lock and then unlinks UNLOCKED (N
+                    # `os.remove`s must not block every `get`), so a restore starting now holds
+                    # a generation that MATCHES and a file the walk has not reached yet.
+                    #
+                    # Declined HERE, where the window OPENS — not at the re-admit, where the
+                    # first draft of this fix put it. That draft closed only the case where
+                    # `_admit` also ran inside the walk; a restore that read its file inside the
+                    # window and reached `_admit` after the walk finished found the flag already
+                    # cleared and the generation still matching, and re-admitted the purged
+                    # frame. Measured with the whole `clear()` returned. Refusing at capture also
+                    # saves the doomed unpickle and H2D, and it makes the `_admit` clause
+                    # unreachable — so that clause is deleted rather than left as a guard nothing
+                    # can exercise.
+                    return None, None
+                # A2 (v0.33.2): the generation this READ belongs to. `clear(disk=True)` can run
+                # while the file read below is in flight, and without this the restore re-admits
+                # the cleared frame to RAM — and a later eviction re-SPILLS it to disk, so the
+                # frame the user deleted comes back on both tiers. A5 closed this on the write
+                # side; this is the same defect through the read-side door, and two independent
+                # audits found it.
+                #
+                # Captured BELOW the membership short-circuit, not above it: a total miss is the
+                # common case on this path (`cook_checkpointed` probes one key per cut against a
+                # cache that usually has neither), and the whole point of the `_spilled` set is
+                # that such a miss costs no syscall. Taking the lock to read an int we then throw
+                # away put a 220 ns acquire back on it. Everything from here to `_admit`'s locked
+                # re-check is still inside the window the check covers.
+                gen = self._generation
             with open(path, "rb") as f:
                 rec = pickle.load(f)
+            if int(rec.get("fmt", 0) or 0) > _FRAME_FORMAT:
+                # A5/PROBE-8: the `fmt` field was write-only — a record from a NEWER TEX was
+                # decoded best-effort and served as pixels. A forward-compatible reader cannot
+                # know what a future field means, so the only safe read of "newer than me" is
+                # to decline. (Absence still reads as v0; that is the backward direction, which
+                # IS decodable.) Left on disk, not deleted: the newer TEX that wrote it can.
+                return None, None
             if rec.get("epoch") != env_epoch():     # a prior-environment frame: discard
                 try:
                     os.remove(path)
@@ -1090,15 +1340,22 @@ class ResultCache:
             # and an unknown name resolves to "stored as cooked" rather than to whatever
             # attribute happens to answer to it.
             orig = rec.get("orig")
+            # A2: `_admit` re-checks under ITS lock and refuses to insert if a `clear()` landed
+            # while we were reading — the frame is gone by the user's instruction and a miss is
+            # the correct answer.
             entry = self._admit(key, tensor, rec.get("canvas"),  # already frozen: no-op-freezes
-                                _dtype_tables()[1].get(orig), home=dev)
+                                _dtype_tables()[1].get(orig), home=dev, gen=gen,
+                                quality=rec.get("quality"))
+            if entry is None:
+                return None, None
             # A2: the frame AND its representation, from the ONE locked re-admit. This used to
             # return only the tensor and let `get` re-look-up `orig_dtype` in a second lock
             # acquisition — a window in which a concurrent `clear()` or eviction drops the entry,
             # `orig_dtype` reads `None`, and an fp16-STORED frame is served at storage dtype to a
             # caller owed fp32. Reproduced without any patching, on the first iteration.
-            if entry is None:
-                return tensor, _dtype_tables()[1].get(orig)
+            # A2: the frame AND its representation, from the ONE locked re-admit. Re-looking
+            # the entry up in a second acquisition is what let a `clear()` in between make
+            # `orig_dtype` read None and serve fp16 to a caller owed fp32.
             return entry.tensor, entry.orig_dtype
         except Exception:
             return None, None
@@ -1187,7 +1444,7 @@ class ResultCache:
                 nbytes = entry.nbytes
                 self._remove(key)
                 self.evictions += 1
-                self._pending_spills.append((key, entry))
+                self._pending_spills.append((key, entry, self._claim_spill_ticket(key)))
                 freed += nbytes
         # BOTH drains outside the lock, in ladder order. A demotion is the cheaper rung and is
         # what the governor was really asking for on CUDA; the spill is the fallback for what it
@@ -1304,12 +1561,30 @@ class ResultCache:
             # — a cleared cache must not keep writing the frames it just forgot.
             self._pending_demotes.clear()
             self._pending_spills.clear()
+            self._spill_seq.clear()       # A1: keys are gone; their write tickets go with them
+            # `_spill_locks` is deliberately NOT cleared here, and the asymmetry beside the line
+            # above is the kind that reads as an oversight, so: dropping the lock OBJECTS would
+            # let an in-flight writer (holding a strong local reference to the old lock) and a
+            # fresh post-clear writer of the same key hold TWO DIFFERENT locks and interleave.
+            # The stale one has already passed its check and is inside `_atomic_pickle`, so the
+            # order becomes write-A, write-B, then A's stale-cleanup `os.remove` deleting B's
+            # file while B's key stays indexed — a frame that is present in `_spilled` and absent
+            # from disk. The tickets are safe to drop because a missing ticket reads as 0, which
+            # only makes a stale writer MORE likely to bail. Unbounded growth of this dict is a
+            # known, recorded deferral (DEVELOPMENT.md); it is not fixable by clearing it here.
             # A5: a victim `_drain_spills` ALREADY popped is not in either queue, so clearing
             # them does not stop it. Its write lands after the unlink loop below, re-creating
             # `key.frame` and re-adding the key to the index — and a later `get` then serves the
             # frame the user just cleared. The generation is checked under the lock before the
             # post-write index add; a stale writer drops its own file instead.
             self._generation += 1
+            if disk:
+                self._purge_depth += 1      # restores decline until the walk below finishes
+            # A3: the same witness `reindex_disk` uses, captured HERE rather than in a second
+            # acquisition below. Reading it at the generation bump is strictly more conservative
+            # — a spill landing between this block and the walk now also forces "unknown", which
+            # costs one stat per miss and never a wrong definite answer.
+            spills_at_entry = self.spills
         if not disk:
             return
         # The unlink loop runs OUTSIDE the lock (see the rule on __init__) — N os.remove calls
@@ -1329,12 +1604,32 @@ class ResultCache:
             total = 0 if all_removed else None
         except Exception:
             total = None
+        finally:
+            # The depth MUST come back down on EVERY exit, which is why this is a `finally` and
+            # not a line in the tail block below: the `except` above catches `Exception`, so a
+            # `BaseException` — a Ctrl-C during a large unlink walk is the realistic one — would
+            # skip the tail entirely and leave the count stuck. A stuck count declines every
+            # restore for the life of the process, turning the disk tier into a silent recook
+            # path with no counter or log saying so. Dropping it here rather than after the tail
+            # is safe: the walk is finished, so a restore that slips in between finds no file.
+            with self._lock:
+                self._purge_depth -= 1
         with self._lock:
-            self._disk_bytes = total
-            self._spilled = set() if total == 0 else None
+            # A3: the unlink loop above runs UNLOCKED (N os.remove calls must not block every
+            # concurrent get), so a spill can land during it — legitimately, since it passes the
+            # A5 generation check by design if it started after the bump. Asserting a definite
+            # empty set then ORPHANS that frame: `_restore` short-circuits on the membership set
+            # without stat-ing, so the file is unserveable and its bytes uncounted. Measured:
+            # `_spilled=set()`, `_disk_bytes` 66085 -> 0, `get(K)` None with the file on disk.
+            if self.spills != spills_at_entry:
+                self._disk_bytes = None
+                self._spilled = None        # unknown beats a confident wrong answer
+            else:
+                self._disk_bytes = total
+                self._spilled = set() if total == 0 else None
 
 
-def _atomic_pickle(path: str, data) -> None:
+def _atomic_pickle(path: str, data) -> bool:
     """Atomic pickle, so a second process sharing the results/ dir never observes a
     half-written frame. ENG-13 routes it through the shared `tex_recovery.atomic_write` — one
     temp-and-rename discipline spelled once for every persisted engine file rather than once
@@ -1349,7 +1644,12 @@ def _atomic_pickle(path: str, data) -> None:
     NOT fsynced, unlike the verdict files. A spilled frame is pure cache: losing one to a crash
     costs a recook, which the cache is built to do anyway, and the flush measured 14 ms per
     eviction on this box against 9.9 ms for the whole write. Durability is for state whose loss
-    is expensive to re-derive; this is not that."""
+    is expensive to re-derive; this is not that.
+
+    Returns `atomic_write`'s verdict rather than swallowing it. `_spill` is the caller that
+    keeps a running byte total and a membership set, so it is exactly the caller that must not
+    charge for a write that did not happen."""
     import pickle
     from .tex_recovery import atomic_write
-    atomic_write(path, lambda f: pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL))
+    return bool(atomic_write(path, lambda f: pickle.dump(data, f,
+                                                         protocol=pickle.HIGHEST_PROTOCOL)))

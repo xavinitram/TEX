@@ -76,8 +76,8 @@ MUTATIONS = [
      "    return max(abs(lo), abs(hi)) <= FP16_MAX",
      "    return True"),
     ("PREC-1: the spill forgets the stored representation", "tex_results.py",
-     '"orig": _dtype_tables()[0].get(entry.orig_dtype), "viewed": viewed}',
-     '"orig": None, "viewed": viewed}'),
+     '"orig": _dtype_tables()[0].get(entry.orig_dtype), "viewed": viewed,',
+     '"orig": None, "viewed": viewed,'),
     ("CACHE-8: the spill writes where the frame IS, not where it belongs", "tex_results.py",
      '"device": entry.home, "canvas": entry.canvas',
      '"device": entry.device, "canvas": entry.canvas'),
@@ -141,6 +141,65 @@ MUTATIONS = [
      "                continue",
      "            if False:\n"
      "                continue"),
+    # -- v0.33.2 (the v0.33.1 release-audit findings) ---------------------------------
+    ("A1: the spill drops its per-key ordering ticket", "tex_results.py",
+     "                    if self._spill_seq.get(key, 0) != seq or self._generation != gen:",
+     "                    if self._generation != gen:"),
+    # The A1 fix went through two wrong shapes before this one; both are mutations here,
+    # because "checked, then wrote" and "checked AND wrote" are indistinguishable to any
+    # interleaving a test can force from outside -- which is why one of these rows is killed
+    # by a SOURCE-shape assertion rather than by pixels.
+    ("A1: the ticket check moves back outside the write", "tex_results.py",
+     "            with wlock:\n"
+     "                with self._lock:\n"
+     "                    if self._spill_seq.get(key, 0) != seq or self._generation != gen:\n"
+     "                        return            # a newer spill of this key won; touch nothing\n"
+     "                if not _atomic_pickle(path, rec):",
+     "            with self._lock:\n"
+     "                if self._spill_seq.get(key, 0) != seq or self._generation != gen:\n"
+     "                    return\n"
+     "            if not _atomic_pickle(path, rec):"),
+    ('A2: the re-admit stops checking the generation', 'tex_results.py',
+     '            if gen is not None and gen != self._generation:\n                return None',
+     '            if False:\n                return None'),
+    # The first attempt at this row set `seq = None` after the popleft, which made every
+    # spill bail and was killed by a dozen unrelated rows — a mutant that broad says nothing
+    # about the claim SITE. This restores the pre-hunt code exactly: claim inside `_spill`.
+    ("H1: the spill ticket is claimed at write time again, not at eviction time",
+     "tex_results.py",
+     "            with self._lock:\n"
+     "                gen = self._generation          # A5: the generation this write belongs to",
+     "            with self._lock:\n"
+     "                gen = self._generation\n"
+     "                seq = self._spill_seq.get(key, 0) + 1\n"
+     "                self._spill_seq[key] = seq"),
+    ("H7: the purge marker is read at the re-admit again, not at the read",
+     "tex_results.py",
+     "                if self._purge_depth:",
+     "                if False:"),
+    ("H7: the purge depth is dropped outside the finally again", "tex_results.py",
+     "        finally:",
+     "        except BaseException:\n"
+     "            raise\n"
+     "        if True:"),
+    ("H4: _learn_spilled rebinds membership over a racing spill again", "tex_results.py",
+     "                self._spilled = None if self.spills != spills_at_entry else found",
+     "                self._spilled = found"),
+    ("H5: a failed spill write counts as a success again", "tex_results.py",
+     "                if not _atomic_pickle(path, rec):",
+     "                _atomic_pickle(path, rec)\n"
+     "                if False:"),
+    ("A3: clear's tail asserts a definite empty index again", "tex_results.py",
+     "            if self.spills != spills_at_entry:\n"
+     "                self._disk_bytes = None\n"
+     "                self._spilled = None        # unknown beats a confident wrong answer",
+     "            if False:\n"
+     "                self._disk_bytes = None\n"
+     "                self._spilled = None"),
+    ("A5: the disarm commit-check goes, so an in-flight demote still lands",
+     "tex_results.py",
+     "                if self._vram_budget is None:",
+     "                if False:"),
     ("B2/P0-5: remap_suffix_taps becomes the identity", "tex_fusion.py",
      "    if not k:\n"
      "        return outputs\n"
@@ -158,9 +217,9 @@ sys.path.insert(0, r"{parent}")
 from helpers import SubTestResult
 import test_v032_checkpoint as A, test_v032_region as B, test_v032_governor as C
 import test_v033_precision as D, test_v033_cache8 as E, test_v033_xpu2 as F
-import test_v033_phase0 as G, test_v0331_audit as H
+import test_v033_phase0 as G, test_v0331_audit as H, test_v0332_audit as I
 r = SubTestResult()
-for m in (A, B, C, D, E, F, G, H):
+for m in (A, B, C, D, E, F, G, H, I):
     for n in sorted(x for x in dir(m) if x.startswith("test_")):
         try:
             getattr(m, n)(r)

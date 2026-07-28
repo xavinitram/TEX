@@ -467,6 +467,107 @@ def test_v032_cache9_patch_region_is_atomic(r: SubTestResult):
                f"only {written}/{N} bands survived — read-modify-write is not serialized")
 
 
+def _host_edit(src, halos, canv, valid, declined, roi, dirty_from, knob, *, device,
+               use_valid=True, use_declined=True, decline_at=None):
+    """ONE edit, done exactly the way the docs tell a host to do it: plan with
+    `chain_windows`, cook each dirty stage over its window, patch what was served, and record
+    what the cook actually left behind.
+
+    Three pieces of state travel with the comp, and the third is the one v0.33.1 shipped
+    without: `valid[i]` (the region canvas i is correct over) AND `declined` (the stages whose
+    LAST cook handed back a whole frame instead of the window it was asked for). `decline_at`
+    forces that engine behaviour deterministically by cooking the stage whole — which is what a
+    host observes as `cooked_roi is None`, and is engine-initiated in the field (fp16, or a
+    refused `roi_exec`), so a host cannot avoid it by being careful.
+
+    Returns the new (canvases, valid, declined)."""
+    plan = tex_roi.chain_windows(halos, roi, dirty_from,
+                                 valid=(valid if use_valid else None),
+                                 declined=(declined if use_declined else ()))
+    if plan is None:
+        # Not serviceable: an upstream canvas is stale where this edit needs to read it. No
+        # window choice repairs a stale input; the only correct remedy is to re-cook whole.
+        dirty_from, plan = 0, [None] * len(halos)
+    canv, valid, declined = list(canv), list(valid), set(declined)
+    cur = src if dirty_from == 0 else canv[dirty_from - 1]
+    for i in range(dirty_from, len(halos)):
+        p = dict(_PARAMS[i])
+        if "knob" in p:
+            p["knob"] = knob
+        want = None if i == decline_at else plan[i]
+        out, served = _cook_stage(_CHAIN[i], p, cur, want, device)
+        if served is None:
+            # A whole frame REPLACES the canvas — but "replaces" is not "is valid everywhere".
+            # It was cooked from THIS stage's input canvas, which an earlier region cook may
+            # have patched over a window only, so it is stale wherever its input was. That is
+            # what `declined` carries to the next plan.
+            canv[i], valid[i] = out, None
+            declined.add(i)
+        else:
+            x0, y0, w, h = served[:4]
+            buf = canv[i].clone()
+            buf[:, y0:y0 + h, x0:x0 + w] = out
+            canv[i], valid[i] = buf, served
+            declined.discard(i)
+        cur = canv[i]
+    return canv, valid, declined
+
+
+def test_v032_cache9_a_declined_stage_poisons_a_later_edit(r: SubTestResult):
+    """P0-4a at the HOST-PATTERN level, in pixels, with a negative control.
+
+    The row below proves `valid=` closes the two-corner hole. This one proves the hole is still
+    open when a stage DECLINES, because the decline records `valid[i] = None` — "correct
+    everywhere" — for a frame that is nothing of the sort. `chain_windows` then declares the
+    deeper edit serviceable and the second window reads pre-edit pixels.
+
+    Stage 1 is forced to decline during the first edit (cooked whole), so its output is stale
+    outside the window its own input was patched over. Without `declined=` that stays invisible;
+    with it, the plan refuses and the host recooks from the source."""
+    print("\n--- v0.32 CACHE-9/P0-4a: a declined stage poisons a later edit ---")
+    device = "cpu"
+    torch.manual_seed(11)
+    N = 96
+    src = torch.rand(1, N, N, 3, device=device)
+    halos = [tex_roi.stage_halo(c, p) for c, p in zip(_CHAIN, _PARAMS)]
+    corner_a = (4, 4, 24, 24, N, N)
+    corner_b = (N - 28, N - 28, 24, 24, N, N)
+
+    for use_declined in (False, True):
+        canv, cur = [], src
+        for code, params in zip(_CHAIN, _PARAMS):
+            p = dict(params)
+            if "knob" in p:
+                p["knob"] = 0.80
+            cur, _ = _cook_stage(code, p, cur, None, device)
+            canv.append(cur)
+        valid, declined = [None] * len(_CHAIN), set()
+        canv, valid, declined = _host_edit(src, halos, canv, valid, declined, corner_a, 0, 0.45,
+                                           device=device, use_declined=use_declined,
+                                           decline_at=1)
+        canv, valid, declined = _host_edit(src, halos, canv, valid, declined, corner_b, 2, 0.45,
+                                           device=device, use_declined=use_declined)
+        ref = _cook_chain_whole(src, device, 0.45)
+        x0, y0, w, h = corner_b[:4]
+        err = (canv[-1][:, y0:y0 + h, x0:x0 + w].float()
+               - ref[:, y0:y0 + h, x0:x0 + w].float()).abs().max().item()
+        label = "with `declined`" if use_declined else "without `declined`"
+        if use_declined:
+            if err < 1e-5:
+                r.ok(f"CACHE-9/P0-4a {label}: the second window is correct (maxdiff {err:.2e})")
+            else:
+                r.fail("CACHE-9 declined-stage edit",
+                       f"{label}: maxdiff {err:.3e} — the decliner's stale output survived")
+        else:
+            if err >= 1e-5:
+                r.ok(f"CACHE-9/P0-4a {label}: the poisoned plan IS reproduced ({err:.2e}) — "
+                     "so the guarded row is not vacuous")
+            else:
+                r.fail("CACHE-9 declined-stage edit",
+                       f"{label}: expected stale pixels, measured {err:.2e} — the negative "
+                       "control found nothing, so this test proves nothing")
+
+
 def test_v032_cache9_second_deeper_edit_pixels(r: SubTestResult):
     """The PIXEL-level form of the row above. Window arithmetic changing is not the same claim
     as the stale ring being gone, and the audit measured the bug in pixels (7.79e-02), so this
@@ -491,27 +592,8 @@ def test_v032_cache9_second_deeper_edit_pixels(r: SubTestResult):
         return canv
 
     def _edit(canv, valid, roi, dirty_from, knob, use_valid):
-        plan = tex_roi.chain_windows(halos, roi, dirty_from,
-                                     valid=(valid if use_valid else None))
-        if plan is None:
-            # Not serviceable: the upstream canvas is stale where this edit needs to read it.
-            # The only correct remedy is to re-cook from the source, whole-frame.
-            dirty_from, plan = 0, [None] * len(_CHAIN)
-        canv, valid = list(canv), list(valid)
-        cur = src if dirty_from == 0 else canv[dirty_from - 1]
-        for i in range(dirty_from, len(_CHAIN)):
-            p = dict(_PARAMS[i])
-            if "knob" in p:
-                p["knob"] = knob
-            out, served = _cook_stage(_CHAIN[i], p, cur, plan[i], device)
-            if served is None:
-                canv[i], valid[i] = out, None
-            else:
-                x0, y0, w, h = served[:4]
-                buf = canv[i].clone()
-                buf[:, y0:y0 + h, x0:x0 + w] = out
-                canv[i], valid[i] = buf, served
-            cur = canv[i]
+        canv, valid, _d = _host_edit(src, halos, canv, valid, set(), roi, dirty_from, knob,
+                                     device=device, use_valid=use_valid, use_declined=True)
         return canv, valid
 
     corner_a = (4, 4, 24, 24, N, N)

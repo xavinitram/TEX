@@ -161,6 +161,12 @@ def propagate_quality(own=None, upstream_qualities=()):
     Under ComfyUI there is no TEX-internal upstream edge at all, so nothing to propagate;
     GRAPH-1's version counters are what let the engine carry this itself.
     """
+    # A5/PROBE-10: a BARE STRING is one tag, not an iterable of characters. `tuple("preview")`
+    # is `('p','r','e',...)`, which contains no PREVIEW — so the single-upstream spelling every
+    # caller reaches for first returned the UNSAFE answer while the list spelling returned the
+    # safe one. A rule whose safety depends on the caller's bracket choice is not a rule.
+    if isinstance(upstream_qualities, str):
+        upstream_qualities = (upstream_qualities,)
     return PREVIEW if (own == PREVIEW or PREVIEW in tuple(upstream_qualities)) else own
 
 

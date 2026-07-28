@@ -242,7 +242,10 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
 
     What remains is placement (`_resolve_cuts`, one profile lookup) and, on a cache that is not
     provably empty, one key + one probe per cut. The honest claim: **arming CACHE-7 costs a
-    bounded prologue on a cold cache, not zero** — see `docs/effort-based-checkpoints.md` §13.
+    bounded prologue on a cold cache, not zero** — measured at **1.00-1.03x warm** (into the
+    noise) and a roughly fixed **14-27 ms once per fresh process**, which reads as 1.06-1.54x
+    depending only on what the chain costs. `benchmarks/allmiss_prologue_bench.py` and
+    `docs/effort-based-checkpoints.md` §13.1.
 
     `cuts` may be supplied by a caller that already planned; otherwise placement runs here off
     PROF-1. Returns the interpreter's raw `{output: tensor}`, same as `cook_stage_list`.

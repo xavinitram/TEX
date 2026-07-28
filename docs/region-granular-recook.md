@@ -185,8 +185,29 @@ invariants at once (footprint over-approximation, ENG-12 immutability, lineage k
   convention — pointwise/morphology land bit-exact, conv within ~1 ulp of size-dependent
   kernel dispatch).
 - **The never-sever rows:** a non-executable stage forces a whole-frame window at itself *and
-  at every stage above it*; a declined window (`cooked_roi is None`) replaces rather than
-  patches; a gather anywhere in the suffix widens to the frame.
+  at every stage above it*; a gather anywhere in the suffix widens to the frame.
+- **The declined-stage rows (P0-4a, corrected in v0.33.0).** This bullet used to read "a
+  declined window (`cooked_roi is None`) replaces rather than patches", full stop — and the
+  full stop was the bug. Replacing is what the host does; it is not a statement about
+  *validity*. A stage that declines still cooks **from its own input canvas**, which an earlier
+  region cook may have patched over a window only, so its whole-frame output is stale wherever
+  that input was stale — while being recorded `valid[i] = None`, i.e. correct everywhere. A
+  later deeper edit is then declared serviceable and reads those pixels. **Measured: 4.55e-01
+  over 1,682/2,304 elements**, and **2.10e-01** through the documented host pattern end to end.
+
+  So a host carries a third piece of state beside the canvases and `valid[]`: the set of stages
+  whose **last** cook declined, passed as `chain_windows(..., declined=)`. A decliner whose own
+  input was not whole-frame-valid poisons validity downward and the plan is refused (`None`).
+  This cannot be derived from `valid[]` — a decline records "valid everywhere", which is
+  precisely the claim that is false — and it cannot be avoided by a careful host, because
+  declines are **engine-initiated** (fp16, or a refused `roi_exec`). The set is cleared per
+  stage the moment that stage serves a window again.
+
+  Pinned in `tests/test_v032_region.py` at both levels: `chain_windows` arithmetic, and
+  `test_v032_cache9_a_declined_stage_poisons_a_later_edit`, which runs the two-corner host
+  pattern in pixels with a negative control (2.10e-01 without `declined=`, 0.00e+00 with).
+  `benchmarks/region_recook_bench.py`'s `Comp` carries the set, so the measured numbers below
+  come from a host doing this correctly rather than from one that got lucky.
 - **The ownership row:** the cached base frame is byte-identical after a patch — i.e. the
   patch never reached the master.
 - **The provenance row:** the patched frame's key differs from the base's, and carries it.
@@ -261,3 +282,26 @@ arithmetic* changed, and it passed — while the pixels were still wrong by 2.17
 found it cooks the chain twice and compares against a whole-frame reference, and it carries a
 **negative control**: the same sequence without `valid` must still reproduce the stale ring, or
 the guarded assertion proves nothing. Both halves are in `tests/test_v032_region.py`.
+
+**The second half of the same contract: `declined=` (P0-4a, v0.33.0).** `valid[]` alone is not
+sufficient state, because a stage that DECLINES its window records `valid[i] = None` — "correct
+everywhere" — for a frame cooked from an input that may have been patched over a window only.
+The host therefore carries a third list, the stages whose *last* cook declined:
+
+```python
+plan = tex_roi.chain_windows(halos, roi, dirty_from, valid=valid, declined=declined)
+if plan is None:
+    dirty_from, plan = 0, [None] * len(halos)      # cook from the source instead
+...
+if served is None:
+    canvas[i], valid[i] = out, None
+    declined.add(i)          # a whole frame, but cooked from a possibly-patched input
+else:
+    canvas[i], valid[i] = patch(canvas[i], out, served), served
+    declined.discard(i)      # this stage served its window
+```
+
+Declines are **engine-initiated** — fp16, or a refused `roi_exec`, returns `cooked_roi=None` —
+so this is enforced by the API rather than by asking hosts to track something they do not
+control. Same test shape as above, negative control included: **2.10e-01** without `declined=`,
+**0.00e+00** with (`test_v032_cache9_a_declined_stage_poisons_a_later_edit`).

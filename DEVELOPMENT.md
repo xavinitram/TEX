@@ -722,6 +722,115 @@ Settled calls, kept here so they're not re-derived:
   is *width* (PREC-1's fp16, exactly 2×) and *residency*, both of which shipped. A test greps
   `tex_results.py` for codec names so a future addition has to argue with the number.
   Reopen only for a storage medium under that bandwidth, and only for the disk tier.
+- **`_learn_spilled` can re-walk the spill dir once per miss while spilling continues**
+  (v0.33.2 H4) — DEFERRED, and it is a REGRESSION this release knowingly ships. Before H4 the
+  scan always ended in a definite set, so it ran once; now a scan that raced a spill correctly
+  leaves membership UNKNOWN, and `_restore` calls `_learn_spilled()` on every miss where
+  `_spilled is None`. While membership is unknown `_spill` records nothing into it, so under a
+  sustained spilling workload (the CACHE-7 shape: a worker spilling while the main thread
+  probes) every scan can race and the walk repeats — O(entries) syscalls per miss on the exact
+  path the `_spilled` set exists to keep syscall-free. It self-corrects the moment spilling
+  pauses. Shipped anyway because the alternative is the orphaned-frame bug H4 closes, and a slow
+  cache beats an unserveable frame. *Gate:* have `_spill` record into a small `_spilled_since`
+  set even when membership is unknown, so `_learn_spilled` can return `found | _spilled_since`
+  and be definite — which removes the race from all THREE unlocked walks rather than papering
+  over one. That touches `_spill`'s index block, which is the most-audited code in the file, so
+  it wants its own change and its own repro rather than a patch-release edit.
+- **`patch_region` propagates the packing LICENCE, not the tier tag** (v0.33.2 H3) — DEFERRED.
+  The ratchet is gated on `src.orig_dtype is not None`, which is right for the pack decision but
+  means a patch of a preview-tagged-but-UNPACKED base (a MASK, or an out-of-fp16-range frame) is
+  stored tagged final. Nothing reads the tag today except `choose_storage`, so there is no live
+  defect — but A4's own justification names a second consumer ("requalify-on-idle has to
+  enumerate preview entries"), and that pass would under-count. *Gate:* keep `propagate_quality`
+  unconditional and instead pass `storage="fp32"` to the nested `put` when the base was not
+  reduced — `choose_storage`'s pin arm means exactly "store as cooked, at any tier". Needs a
+  decision about clashing with a caller-supplied `storage=`, which is design, not a patch.
+- **Three unlocked directory walks hand-roll the same capture-walk-compare** (v0.33.2) —
+  DEFERRED. `_learn_spilled`, `reindex_disk` and `clear` each spell "capture the witness under
+  the lock, walk unlocked, compare under the lock", and `clear` additionally maintains
+  `_purge_depth` by hand. *Gate:* one `_unlocked_walk()` context manager owning both the witness
+  and the depth, which would make the depth exception-safe BY CONSTRUCTION rather than by a
+  `finally` that has to be remembered. Three audited call sites — worth doing, not worth doing
+  the week of a tag.
+- **The audit tests hand-roll two gadgets three times each** (v0.33.2) — DEFERRED. The
+  racing-`scandir` fixture appears in `test_v0331_audit.py` twice and `test_v0332_audit.py` once;
+  the "two Events plus a trip flag" parked-subclass appears three times. *Gate:* a
+  `spill_during_scan(cache, ...)` context manager and a `park(obj, method)` helper in
+  `tests/helpers.py`. Test-only churn across two audit files; not the week of a tag.
+- **Frames spilled by v0.33.1 restore UNTAGGED** (v0.33.2 A4) — ACCEPTED, not fixable. `quality`
+  is a format-2 field, so `rec.get("quality")` is `None` for every `.frame` a v0.33.1 process
+  wrote, and `env_epoch()` is unchanged by the upgrade so those records are still served. The
+  viral-quality rule therefore does not fire on a pre-upgrade preview frame. There is nothing to
+  recover — the tag was never written — and inventing one would be worse than admitting it. The
+  exposure is bounded and self-healing: it lasts until each key is next cooked and re-spilled,
+  and it can only under-protect a frame the host already asked to be stored at preview fidelity.
+  A host that cares can `clear(disk=True)` once after upgrading.
+- **`evict_bytes` can over-report to the CACHE-5 governor when the tier disarms mid-flight**
+  (v0.33.2 A5) — DEFERRED, low. `_queue_demotions` charges bytes at QUEUE time on the stated
+  invariant "the drain is unconditional from here", and A5 makes the drain conditional from both
+  ends (`set_vram_budget(None)` empties the queue; the commit re-check drops one already in
+  flight). So a governor that disarms residency in the same window as an `arbitrate()` can be
+  told bytes were freed that were not. It self-corrects on the next call — `governed_bytes()` is
+  recomputed from `_bytes_by_dev`, which stays consistent throughout (verified by recount) — so
+  the error is one arbitration round, not a permanent skew. *Gate:* charge at COMMIT time
+  instead, which means `evict_bytes` can no longer answer synchronously and the CACHE-5 hook
+  contract changes shape. That is a v0.34 conversation, not a patch.
+- **A lock-depth early-out in `ResultCache._promote`** (v0.33.2 A5(d)) — WITHDRAWN after being
+  written, because it traded a latency problem for a correctness one. The idea was sound in
+  isolation: the drains refuse to run a full-frame copy while a composite holds `_lock`, and
+  `_promote` is an 11.1 ms H2D at 4K that `patch_region` reaches at depth 1. What it missed is
+  that `_promote` is not a drain. A drain DEFERS — the queue survives and `patch_region` runs it
+  on release — whereas this DEGRADED, handing back the host copy with no `_pending_promotes` to
+  make good on it. Measured: base demoted (`home=cuda:0`) -> `patch_region` -> result
+  `device=cpu`, `home=cpu`, `promotions=0`. Nothing raises, because `frame[...] = patch` accepts
+  a CUDA source into a CPU destination, so the patched frame just leaves the residency ladder
+  permanently and every stage downstream inherits a CPU home — the "one-way trip to the CPU"
+  `_Entry.home` exists to prevent. *Gate to reopen:* a `_pending_promotes` queue drained like
+  the other two, PLUS home propagation through `_patch_region_locked`'s nested `put` — the
+  second is what the first alone does not fix, since the result is composed while the base is
+  still on the host. Both belong with v0.34's async-write work, not in a patch. The invariant
+  the withdrawal restores is pinned
+  (`test_v0332_a5_promote_keeps_a_patched_frame_on_its_home_device`).
+- **Pruning `_spill_seq` / `_spill_locks`** (v0.33.2 A1) — DEFERRED, quantified rather than
+  waved at. Both dicts gain an entry per distinct key ever spilled and lose it never: ~240 B
+  per key (a `threading.Lock`, its OS mutex block, the dict entry, and the retained 64-hex key
+  string). A 50-node comp scrubbed over 200 frames is ~10k keys / ~2.4 MB; the v0.40 headless
+  shape (10k frames x 12 stages) is ~120k keys / ~29 MB and 120k live lock objects. Small
+  against a 512 MB-2 GB frame budget, and the tier is opt-in, so it does not gate this release.
+  **Do not "fix" it by clearing `_spill_locks` in `clear()`** — the comment there explains why
+  that re-opens A1. *Gate:* fold both into one refcounted `_writers[key]` entry popped when the
+  last in-flight spill of that key leaves, which bounds the map by CONCURRENT spills instead of
+  by keys ever seen.
+- **`examples/host_demo.py::RoiComp` still hand-rolls the window composition** (v0.33.2, P0-4a)
+  — DEFERRED, and worth stating because it makes a CHANGELOG line narrower than it sounds. The
+  `declined=` migration reached `tex_roi.chain_windows`, the bench host and the tests; it did
+  NOT reach the shipped example, which carries its own `_needed_windows` backward walk, its own
+  `_WHOLE_FRAME` sentinel and its own halo inversion, and tracks neither `valid` nor `declined`.
+  So the artifact a host is most likely to copy still demonstrates the pre-P0-4a pattern whose
+  error this release quotes at 2.10e-01. *Gate:* `RoiComp` is load-bearing for PM-2/PM-6 and is
+  imported and asserted on by `test_v028_phase1` and `test_v030_phase1`, so rewriting its cook
+  loop means re-running those measurements — a v0.34 job, not a patch-release one.
+- **Hoisting `patch_region`'s base fetch out of the atomicity lock** (v0.33.2) — DEFERRED.
+  `_patch_region_locked` calls `self.get(base_key)` while `patch_region` holds `_lock`, and on
+  a RAM miss that reaches `_restore` — a pickle load plus an H2D, i.e. 327-496 ms of disk I/O
+  inside the critical section the lock rule exists to keep I/O out of. The lock is not
+  removable (an earlier draft measured 200/200 lost updates without it), so the fix is to
+  resolve the base — fetch, restore, promote — BEFORE acquiring the lock and re-verify entry
+  identity under it. *Gate:* that re-verification needs its own design and its own lost-update
+  measurement; it also subsumes the `_promote` item above. Recorded here so the gap is a known
+  deferral rather than something rediscovered by the next audit.
+- **Frequency- or playhead-weighted residency victims** (v0.33 CACHE-8, v0.33.2) — DEFERRED,
+  recorded here because two APIs already have the slot and neither uses it, which reads as an
+  oversight unless it is written down. `_enforce_residency` picks demotion victims by **LRU**,
+  and `evict_bytes(..., playhead=)` ACCEPTS a playhead and ignores it. The report asks for an
+  access-FREQUENCY policy; the argument for shipping recency anyway is that a frame cache's
+  access pattern is a playhead — a scrub touches near-frames both most recently and most often,
+  so the two orderings largely coincide, and LRU is the one that needs no per-entry counter.
+  *Gate to reopen:* a measured workload where they diverge — a comp with a hot reference frame
+  far from the playhead is the obvious shape. `stats()` already reports demotion/promotion
+  counts so the case can be made with a number rather than an opinion, and a frequency-weighted
+  choice is a change to `_queue_demotions` alone (it is the single victim-choosing walk, which
+  is why that consolidation was worth doing before the policy question was settled).
 - **Asynchronous D2H for the CACHE-8 demote path** (v0.33 XPU-2) — rejected on lifetime, not
   speed. Async egress requires a page-locked destination, and a demoted frame's host buffer is
   *retained* for as long as the entry lives; pinned pages are unswappable and torch's caching
@@ -729,7 +838,8 @@ Settled calls, kept here so they're not re-derived:
   Copying into pinned and cloning to pageable to release the lock costs a second full host
   memcpy of the frame — and the asynchrony it would buy back is MEASURED at 1.01-1.06x over
   a pinned blocking copy, i.e. noise (`benchmarks/`-adjacent measurement, v0.33 review).
-  `egress(staging=False)` states the distinction rather than hiding it. The transient spill
+  `egress(retained=True)` states the distinction rather than hiding it (spelled `staging=`
+  in the first draft; the rename outlived this line for one release). The transient spill
   buffer *is* async, which is the case the mode exists to separate.
 - **Disk→GPU direct paths (GPUDirect / cuFile)** (v0.33) — investigated, measured, **no-go**.
   No first-party torch API; Linux-only in practice (this project's primary platform is Windows);

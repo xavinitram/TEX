@@ -203,23 +203,48 @@ def test_v033_prec1_survives_the_disk_spill_tier(r):
                               f"entry={None if entry is None else (entry.tensor.dtype, entry.orig_dtype)}")
 
 
-def test_v033_prec1_patch_region_does_not_inherit_the_tier(r):
-    """CACHE-9's copy-on-patch stores its result under a NEW key, and the tier is a property
-    of that key. Silently inheriting the base's representation would mean a frame's storage
-    precision depended on the history of the cache rather than on what the caller asked for."""
+def test_v033_prec1_patch_region_inherits_the_base_tier(r):
+    """SUPERSEDES the v0.33.0 row `..._does_not_inherit_the_tier`, which asserted exactly the
+    opposite. Recording the reversal rather than quietly editing the assertion, because the
+    old row was not wrong about its own argument — it was answering the wrong question.
+
+    **It said:** copy-on-patch stores under a NEW key, the tier is a property of that key, and
+    inheriting the base's representation would make a frame's storage precision depend on the
+    history of the cache rather than on what the caller asked for.
+
+    **Why that loses (v0.33.2 A4):** the base's tier is not cache *history*, it is the fidelity
+    of bytes that are physically in the output. A patch composes base pixels with patch pixels,
+    and the result cannot be more faithful than its base — so storing it full-fp32 under a
+    final-shaped key produced a frame whose out-of-window bytes still carried fp16 quantization
+    (measured **1.89e-03**) while its tag claimed final. The old rule kept the tag honest about
+    the CALL and let it lie about the CONTENT; PREC-1's viral rule wants the reverse, and this
+    is the one seam where the cache can see the upstream well enough to enforce it.
+
+    What is unchanged: an EXPLICIT `quality=PREVIEW` still stores preview, and a final base
+    patched with no tag still stores final (`propagate_quality` only ever ratchets downward)."""
     with tempfile.TemporaryDirectory() as d:
         c = _cache(d)
         f = _frame(res=32)
         c.put("base", f, quality=tex_packing.PREVIEW)
+        c.put("final_base", f)
         patch = torch.zeros(1, 8, 8, 4)
         out = c.patch_region("plain", patch, (4, 4, 8, 8, 32, 32), base_key="base")
         out2 = c.patch_region("prev", patch, (4, 4, 8, 8, 32, 32), base_key="base",
                               quality=tex_packing.PREVIEW)
-        ok = (out is not None and out2 is not None
-              and c._ram["plain"].orig_dtype is None and c._ram["prev"].orig_dtype is torch.float32)
-        r.ok("PREC-1: patch_region stores at the tier it is TOLD, never the base's") if ok else \
-            r.fail("PREC-1 patch", f"plain={getattr(c._ram.get('plain'), 'orig_dtype', 'missing')} "
-                                   f"prev={getattr(c._ram.get('prev'), 'orig_dtype', 'missing')}")
+        out3 = c.patch_region("fin", patch, (4, 4, 8, 8, 32, 32), base_key="final_base")
+        ok = (out is not None and out2 is not None and out3 is not None
+              and c._ram["plain"].quality == tex_packing.PREVIEW
+              and c._ram["plain"].orig_dtype is torch.float32
+              and c._ram["prev"].orig_dtype is torch.float32
+              and c._ram["fin"].quality is None and c._ram["fin"].orig_dtype is None)
+        r.ok("PREC-1: patch_region inherits a PREVIEW base's tier; a final base stays final") \
+            if ok else \
+            r.fail("PREC-1 patch",
+                   f"plain={getattr(c._ram.get('plain'), 'quality', 'missing')}/"
+                   f"{getattr(c._ram.get('plain'), 'orig_dtype', 'missing')} "
+                   f"prev={getattr(c._ram.get('prev'), 'orig_dtype', 'missing')} "
+                   f"fin={getattr(c._ram.get('fin'), 'quality', 'missing')}/"
+                   f"{getattr(c._ram.get('fin'), 'orig_dtype', 'missing')}")
 
 
 def test_v033_prec1_is_absent_from_the_default_comfyui_path(r):

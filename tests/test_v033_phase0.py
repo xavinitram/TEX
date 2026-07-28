@@ -2,8 +2,18 @@
 
 Every row here fails on the PRE-FIX tree. That is the whole standard this file is held to: the
 v0.32 release shipped two fixes whose tests passed with the fix removed, so "fixed and tested"
-was demonstrated to be insufficient twice, and the mutation harness (`tests/mutation_check.py`)
-carries a row per defect for exactly that reason.
+was demonstrated to be insufficient twice.
+
+The mutation harness (`tests/mutation_check.py`) backs MOST of these, not all — stated exactly,
+because "carries a row per defect" is what this used to claim and it was not true. P0-5, P0-6
+and P0-7 have rows. **P0-2, P0-3 and P0-4a do not**, and the reason is the same for all three:
+their fixes are refusals whose mutation is not a code edit but a re-derivation. P0-2's gate
+lives as an INVERTED admission row in `test_v032_checkpoint.py` (the shipped row, run
+backwards) rather than as a patch to a line; P0-3's key scheme has no single line whose removal
+reproduces resolution-blindness; P0-4a's `declined` refusal is pinned in pixels with a negative
+control instead (`test_v032_cache9_a_declined_stage_poisons_a_later_edit`), which is the
+stronger check of the two — a negative control that stops reproducing fails loudly, where a
+surviving mutation only fails if someone reads the report.
 
   P0-2  CACHE-7's fp16 gate was unsound — the counterexample lives in test_v032_checkpoint.py
         (the shipped admission row, INVERTED), not here.

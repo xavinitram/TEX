@@ -5,6 +5,217 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.2] - 2026-07-28
+
+**Mind the tiers, again** — the v0.33.1 release audit's findings, closed. Same shape and the
+same standard as v0.33.1: every one of these lives behind an ARMED path (the spill tier,
+`set_vram_budget`/GOV-1 residency, or an opt-in `quality=`/`storage=` tag), none is reachable
+from the default ComfyUI cook, and each lands with a pinned test **verified to fail on the
+v0.33.1 tree** (11/11 against a `git archive v0.33.1` checkout). The three concurrency fixes
+carry mutation rows.
+
+### Fixed
+
+* **A1 — two in-flight spills of the same key could commit in the wrong order.** `put(K, v1)`
+  evicted and spilling, then `put(K, v2)` (the replace path `_admit`'s docstring blesses)
+  evicted and spilling: whichever write finished last won the file, so the disk tier could
+  serve **v1 after both puts and both spills had returned** — stale pixels, permanently, with
+  every counter reporting success. The generation counter cannot catch this (no `clear` ran, so
+  the generation matches); *ordering between two writes of one key is a different fact from
+  liveness*. Fixed with a monotonic per-key write ticket claimed under `_lock`, plus a per-key
+  write lock that makes the ticket check and `_atomic_pickle` **one critical section** — the
+  two earlier shapes are recorded because both were wrong: a ticket-only fix stopped the stale
+  pixels but became lossy (the stale writer deleted the file it had just overwritten), and a
+  pre-write check outside the lock still lost when the *winner's* write was the delayed one.
+  Pinned functionally and structurally (an AST assertion that the check and the write share a
+  block), because no interleaving reachable from outside can tell those two apart.
+* **A2 — a `get` racing `clear(disk=True)` resurrected the cleared frame.** `_restore` does its
+  file read outside the lock by design, so a `clear` can land anywhere up to the re-admit — and
+  the re-admit then put the frame the user had just purged back into `_ram`, where it was served
+  to gets issued *after* `clear()` returned. `_spill` already had the generation check for
+  exactly this class; the restore door did not. The check now lives **inside `_admit`'s locked
+  section** and nowhere earlier: a check before the call leaves the window between it and the
+  lock, which is precisely where the audit's repro pauses.
+* **A3 — `clear(disk=True)`'s tail asserted a definite empty index over a live frame.** The
+  unlink loop runs unlocked (N `os.remove`s must not block every concurrent `get`), so a spill
+  can land during it — legitimately, since a write that started after the generation bump is
+  post-clear content the generation check passes by design. The tail then rebound `_spilled` to
+  `set()` and `_disk_bytes` to 0. A definite *absence* is the one wrong answer this file never
+  gives: `_restore` short-circuits on the membership set without stat-ing, so the frame sat on
+  disk unserveable, unreachable by the epoch cleanup, and uncounted (measured 66085 → 0 with
+  the file present). The spill counter is now the witness, exactly as in `reindex_disk`.
+* **A4 — `patch_region` laundered a preview base into a final-shaped result.** An fp16-*stored*
+  base patched with `quality=None` yielded a frame stored full-fp32 under a final-shaped key
+  whose out-of-window bytes still carried fp16 quantization (**1.89e-03**, half the 8-bit
+  display quantum — exactly the size that survives review). This is the one seam where the
+  cache can *see* the upstream (the base is an entry with a recorded tag, not an opaque SHA), so
+  the viral rule is enforceable here rather than merely documented. `quality` is now an entry
+  slot and a `.frame` field (**format 1 → 2**; v1 records read unchanged) and `patch_region`
+  runs the base's tag through `propagate_quality`. This also unblocks requalify-on-idle, which
+  needs to enumerate preview entries.
+
+  The first draft of this fix asked the question in the wrong place, twice, and both were
+  measured before release: it read `_ram` **before** the `get` that materializes the base, so a
+  preview base sitting on the **disk tier** propagated no tag and was laundered exactly as
+  before; and on the explicit-`base=` path `base_key or key` resolved to the **destination**
+  key, so a stale preview entry there forced every later patch of that key to preview forever
+  (`propagate_quality` only ratchets down). The documented host shape walks straight into the
+  second — `patch_region(f"s{i}", out, served, base=canvas[i])` re-patches one stable key per
+  stage on every edit. The tag now comes from the entry the frame actually came from, and from
+  nothing at all when the caller hands over a bare tensor: a tensor carries no tier, and
+  inventing one from whatever sits under the destination key is how that bug happened.
+* **A5 — five closures.** (a) `propagate_quality(None, "preview")` returned the **unsafe**
+  answer while `[...]` returned the safe one — `tuple("preview")` iterates characters, and a
+  rule whose safety depends on the caller's bracket choice is not a rule. (b) `.frame`'s `fmt`
+  field was write-only: a record from a newer TEX was decoded best-effort and served as pixels;
+  a future format is now declined (an *absent* fmt still reads as v0 — that direction genuinely
+  is decodable). (c) A batch/channel mismatch **raised a `RuntimeError`** out of `patch_region`,
+  whose entire contract is to refuse by returning `None` — it is the call a host makes when it
+  is unsure a region cook is serviceable. (d) `set_vram_budget(None)` documents itself as
+  "v0.32's behaviour exactly" — and v0.32 never moves a frame between devices — but victims
+  queued under the old ceiling kept draining after it returned (`demotions` 0 → 1 with
+  `vram_budget_bytes=None`). Disarming now cancels both the queued victims and one already
+  mid-copy; each half has its own pin, and the commit-time half has a mutation row, because it
+  is the one that reads as redundant and gets deleted.
+
+  *(The fifth closure, a lock-depth early-out in `_promote`, was written and then withdrawn —
+  see below.)*
+
+### Fixed — found by a pre-tag bug hunt, after Parts A/B/C were complete
+
+An adversarial hunt was run over the finished tree before tagging. **Two of this release's own
+headline fixes failed on interleavings their own pins could not reach**, which is the argument
+for hunting a tree you believe is done.
+
+* **H1 (blocker) — A1's spill ticket was claimed in the wrong place, so A1's defect survived
+  A1's fix.** The ticket was taken inside `_spill`, but `_drain_spills` pops the victim under
+  `_lock` and *releases it* before calling `_spill`: two acquisitions, so pop order did not imply
+  ticket order. Thread A pops (K, v1) and is descheduled in that gap; the main thread runs
+  `put(K, v2)` and its entire spill, taking ticket 1; A resumes, takes ticket **2** holding the
+  *older* pixels, passes every check, and overwrites the winner. `get(K)` then served v1 forever.
+  The shipped A1 rows could not see it — their gate is inside `egress`, which `_spill` reaches
+  *after* the old claim site, so the older writer already held the lower ticket and correctly
+  bailed. The ticket is now claimed at ENQUEUE time, under the lock that serialized the puts.
+* **H2 (high) — a restore could outrun `clear(disk=True)`'s unlink walk.** `clear` bumps the
+  generation under the lock and then walks the directory unlocked (N `os.remove`s must not block
+  every `get`). A restore that captures `gen` *after* the bump therefore matches, reads a
+  `.frame` the walk has not reached, and re-admits the frame the user just purged — alive in RAM
+  and back on disk at the next eviction. The generation cannot express this, because the restore
+  is not stale, it is *concurrent*; a `_purging` flag says so for the walk's duration.
+* **H3 (high) — A4's ratchet packed frames `put` refuses to pack.** The tag is not licence to
+  reduce: `choose_storage` declines several preview-tagged frames and the entry keeps the tag
+  anyway (a MASK or LATENT — data planes are never packed — and anything outside the fp16
+  range). `patch_region` has no `kind` parameter, so its nested `put` passed `kind=None` and the
+  ratcheted tag **quantized a mask the host had explicitly protected**, through a rule written to
+  prevent fidelity loss. The ratchet now gates on the base's stored *representation*, which makes
+  it exactly as strong as its justification: a patch is never more faithful than its base, and
+  never less.
+* **H4 (high) — `_learn_spilled` is a third unlocked directory walk**, and neither P0-6 nor A3
+  closed it. `_spill` records into `_spilled` only when membership is already known, so a frame
+  spilled during the scandir was recorded nowhere and the definite set that followed forgot it —
+  unserveable forever, uncounted forever, unreachable by the epoch cleanup. It now carries the
+  same spill-counter witness as the other two walks.
+* **H5 (medium) — a failed spill write was counted as a success.** `atomic_write` reports failure
+  by return value ("so a caller keeping a running byte total can tell") and `_atomic_pickle`
+  discarded it. On a full or read-only disk `_spill` advanced `spills`, indexed the key, and
+  adjusted `_disk_bytes` for a file that was never written — and if a previous `.frame` for that
+  key was still present, that stale record was then served as current. A1's failure mode reached
+  through a full disk instead of a race.
+
+* **H7 (high) — H2's own fix was placed at the wrong end of the window**, found by a second
+  cleanup pass over the hunt fixes and measured before changing anything. The purge flag was
+  read at `_admit`, which a restore reaches *after* its file read; the window a purge must cover
+  opens at the read. So a restore that started inside the walk, read its `.frame`, and reached
+  `_admit` after the walk finished found the flag already cleared and its generation still
+  matching — and re-admitted the purged frame with the whole `clear(disk=True)` returned. The
+  check now sits where the generation is captured, which also saves the doomed unpickle and H2D
+  and makes the `_admit` clause unreachable, so that clause is deleted rather than left as a
+  guard nothing can exercise. The marker is also now a **depth count dropped in a `finally`**: a
+  bool left `True` by a Ctrl-C mid-walk would have declined every restore for the life of the
+  process with nothing reporting it, and two concurrent `clear`s had the first to finish clear
+  it out from under the other's walk.
+
+Each lands with a pin (`tests/test_v0332_audit.py`, the `H` rows). Three findings were accepted
+or deferred rather than fixed, with reasons in DEVELOPMENT.md: pre-upgrade v0.33.1 `.frame`
+records restore untagged (the tag was never written — nothing to recover); `patch_region`'s tag
+lookup is best-effort when you pass `base=` *and* `base_key=` and the base has aged out to disk
+(the docstring now says so and names the spelling with no failure mode); and `evict_bytes` can
+over-report by one arbitration round if residency disarms mid-flight.
+
+The second pass also caught a **decorative mutation row**: the first H1 row set `seq = None`,
+which made *every* spill bail, so a dozen unrelated rows failed and the mutant said nothing
+about the claim site it was guarding. It now restores the pre-hunt code exactly and is killed by
+the H1 row alone. Four more items are deferred with gates in DEVELOPMENT.md, one of them a
+regression this release knowingly ships: H4 correctly leaves membership UNKNOWN after a raced
+scan, which under sustained spilling can re-walk the spill directory once per miss. A slow cache
+beats an unserveable frame, and the way out (`_spilled_since`) is recorded.
+
+### Withdrawn before release
+
+* **The `_promote` lock-depth early-out was written, measured, and taken back out.** It would
+  have kept an 11.1 ms H2D out of a composite's critical section by returning the un-promoted
+  host copy whenever `_lock` was held. But `_promote` is not a drain: a drain *defers* — the
+  queue survives and `patch_region` runs it on release — while this *degraded*, with no
+  `_pending_promotes` to make good on it. Measured on the shipped path: a demoted base
+  (`home=cuda:0`) patched through `patch_region` produced `device=cpu`, `home=cpu`,
+  `promotions=0`. Nothing raised — `frame[...] = patch` accepts a CUDA source into a CPU
+  destination — so the frame simply left the residency ladder for good, and every stage
+  downstream inherited a CPU home. That is the "one-way trip to the CPU" `_Entry.home` was
+  introduced to prevent, and trading a latency problem for a residency-correctness one is a bad
+  trade. Closing it properly needs a promote queue **and** home propagation through the nested
+  `put`; both are v0.34 work. The invariant the withdrawal restores is pinned
+  (`test_v0332_a5_promote_keeps_a_patched_frame_on_its_home_device`) and the reasoning is in
+  DEVELOPMENT.md, not just in a commit message.
+
+### Changed
+
+* **P0-4a reaches the bench host and the tests** — but NOT `examples/host_demo.py::RoiComp`,
+  which still hand-rolls its own window composition and tracks neither `valid` nor `declined`.
+  That is recorded as a deferral with its gate (it is load-bearing for PM-2/PM-6 and asserted on
+  by two test files, so migrating it means re-running those measurements). Stating the limit
+  here because "reaches the host pattern" would otherwise read as covering the shipped example.
+  `benchmarks/region_recook_bench.py`'s
+  `Comp` and the `test_v032_region.py` helpers now carry the `declined` set and pass it to
+  `chain_windows`, and `docs/region-granular-recook.md` §6/§8 stop saying a declined window
+  "replaces rather than patches" full stop — replacing is what the host does; it is not a claim
+  about validity. New pixel-level row with a negative control:
+  **2.10e-01 without `declined=`, 0.00e+00 with**.
+* **The CACHE-7 all-miss prologue is measured, not asserted.** New
+  `benchmarks/allmiss_prologue_bench.py` and `docs/effort-based-checkpoints.md` §13.1: **1.00–
+  1.03× warm** (into the noise) and a roughly fixed **14–27 ms once per fresh process**, which
+  reads as 1.06× or 1.54× depending only on what the chain costs. The ratio is the constant
+  divided by the cook, so a ratio quoted without its cook cost says nothing.
+* **The v0.20 "D2H is never non_blocking" doctrine is re-scoped, not repealed**, where it lives
+  in `docs/xpu-transfer-scheduling.md`: a bare tensor has no way to say "not yet", so the rule
+  stands for tensors; a `FrameHandle` does, so behind one a D2H may be async.
+  `docs/async-egress.md` gains §6, arguing the two decisions it owed an argument for (why the
+  copy rides the **current** stream rather than a dedicated copy stream, and why the handle owns
+  its **source** until the fence) plus the measured per-call cost, and states what the stress
+  rows do *not* cover.
+* **`ResultCache` states its instance scope**: one live cache per spill directory. The lock, the
+  generation counter and the per-key tickets are attributes of the object, so two live caches
+  over one `results/` dir serialise nothing between them. The ENG-13 *reattach* case (a new
+  cache over a directory left by a dead process) is supported and pinned; concurrent live
+  sharers are not.
+* Frequency-/playhead-weighted residency victims are recorded as a **deferral with a gate** in
+  DEVELOPMENT.md — two APIs already have the slot and neither uses it, which reads as an
+  oversight unless it is written down. `docs/roadmap.md` §8 gains PM-7..PM-11 and §9 gains
+  pencil rows for v0.34.0–v0.40.0 with doc 39's minted IDs (IO-1, DATA-6, COLOR-1, TOOL-6/7,
+  SCHED-5, BATCH-1).
+* `tests/test_v033_phase0.py` no longer claims a mutation row per defect. P0-2, P0-3 and P0-4a
+  have none, and the reason is stated: their fixes are refusals whose mutation is a
+  re-derivation rather than a code edit.
+* **One v0.33.0 row is SUPERSEDED, not deleted.**
+  `test_v033_prec1_patch_region_does_not_inherit_the_tier` asserted the exact opposite of A4 —
+  "patch_region stores at the tier it is TOLD, never the base's" — and it was not wrong about
+  its own argument, it was answering the wrong question. Its concern was that inheriting would
+  make storage precision depend on cache *history*; but a base's tier is not history, it is the
+  fidelity of bytes physically present in the output, and a patch cannot be more faithful than
+  its base. The row is rewritten as `..._inherits_the_base_tier` with the reversal and its
+  reason in the docstring. Unchanged either way: an explicit `quality=PREVIEW` still stores
+  preview, and a final base patched with no tag still stores final — `propagate_quality` only
+  ratchets downward.
+
 ## [0.33.1] - 2026-07-28
 
 **Mind the tiers** — the v0.33.0 release audit's findings, closed. Eight behavioural fixes in
