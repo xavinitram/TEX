@@ -744,7 +744,8 @@ touching the frontend. FUS-0 ships as **v0.20.1** (hotfix, in flight).
 | v0.30.0 | **First viewer** — host_demo grows into the §8 rung-2 host; the switches flip *for that host* | ROI flag flip (per-cook `roi_exec`, nightly-fuzz-gated), codegen **ROI** routing (measured 0.94–0.96× → shipped OFF; ~~tile half~~ not built), ~~SCHED-2's first consumer~~ (deferred on measurement), ~~TOOL collapse picker~~ (human-gated), PM-6 ✅ | — |
 | v0.31.0 | **Never idle** — the scheduler grows two tiers (doc 39 §3) | SCHED-4 (three admission classes, cooperative preemption, head-requeue), PROF-1 (per-stage cost profiler, disarmed by default), PRED-1 (speculative admission by confidence × predicted cost), ANIM-1 (the keyframe contract, pinned + normative in LANGUAGE.md), ENG-13 (journal/fsync ordering + `session.reattach()`), PM-7 ✅ | `tex_cookqueue.py`, `tex_recovery.py`, `tex_runtime/profile.py` |
 | v0.32.0 | **Cache where it counts** — effort-based checkpoints (doc 39 §3) | CACHE-7 (multi-tap placement by *cumulative measured* stage cost; fp32 gate lifted on measurement; ~~DAG cut-set execution~~ analysis-only), CACHE-9 (chain window composition + `patch_region` copy-on-patch; ~~fused-region recook~~ deferred — `roi=` is refused on a fused chain), GOV-1 (named governor presets reaching all three budgets; ~~adaptive tier switching~~ deferred on S-5), PM-8 ✅ (split per shape — see below) | `tex_checkpoint.py`, `docs/effort-based-checkpoints.md`, `docs/region-granular-recook.md` |
-| v0.33+ → v1.0 | **Engine era** | §4 programs (CACHE-8, PREC-1, GRAPH/XPU/DATA-5..7/STOCK/ML/ROTO/COLOR), each behind its own design doc | `tex_graph.py`, `tex_runtime/streams.py` |
+| v0.33.0 | **Remember more** — the memory tiers get deep (doc 39 §3) | PREC-1 (the deferred fp16-*storage* decision, argued fresh and shipped opt-in per `put`; ~~colour/data plane split~~ not implementable until DATA-6 — expressed as an explicit pin + a range gate), CACHE-8 (VRAM→RAM→disk residency with promote-on-reuse, 13.0×/20.1× measured; uint16 offered not chosen; ~~entropy codec~~ **measured and rejected**; ~~GPUDirect~~ no-go), XPU-2 (`FrameHandle` + fence, engine-only by assertion; ~~async demote~~ deliberately synchronous — pinning is for transient staging) | `tex_packing.py`, `tex_runtime/streams.py`, `docs/preview-tier-precision.md`, `docs/compressed-cache-tiers.md`, `docs/async-egress.md` |
+| v0.34+ → v1.0 | **Engine era** | §4 programs (GRAPH/XPU-1/DATA-5..7/STOCK/ML/ROTO/COLOR), each behind its own design doc | `tex_graph.py` |
 
 Per-release notes:
 
@@ -1129,6 +1130,58 @@ method made explicit:
     `multi_output` 0.67×, and an audit's `fused_3stage` 0.88× against a byte-identical tree — a
     four-tree symmetric run showed it tracks module-instance heap locality, not version). If a
     row genuinely needs settling, do an interleaved A/B of the two trees in one process state.
+  - **The 0.95 stop-ship threshold is itself inside this box's noise floor for one config.**
+    v0.33 ran a properly-sequenced control — `git checkout-index` (the v0.32 tree) vs a
+    working-tree snapshot vs the v0.32 tree AGAIN, three `eight_config_bench` runs back to
+    back in one sequence on a quiet box. The **null** leg — byte-identical code against
+    itself — returned:
+
+    | config | null geomean | null row range |
+    |---|---|---|
+    | cpu_off_cold | 1.037 | 0.95–1.29 |
+    | **cpu_off_warm** | **0.949** | **0.70–1.08** |
+    | cuda_off_cold / warm | 0.997 / 1.004 | 0.97–1.06 |
+    | cpu_on_cold | 1.105 | 0.88–2.32 |
+    | cpu_on_warm | 1.030 | 0.92–1.12 |
+    | cuda_on_cold / warm | 1.018 / 1.005 | 0.93–1.11 |
+
+    `cpu_off_warm` **tripped the stop-ship threshold against itself**. So a single sub-0.95
+    geomean on a CPU-interpreter config is not evidence of a regression — it is within what
+    identical code produces. The rule that follows: **a geomean below 0.95 opens an
+    investigation, it does not close one.** Confirm with a same-sequence null leg before
+    calling any config a regression, and treat the CUDA configs (null spread ±0.6%) as the
+    sensitive instrument — they are roughly 5× tighter than the CPU ones.
+  - **Run the A/B from ISOLATED TREES, in one sequence.** `git checkout-index -a --prefix=`
+    materializes the index; copy the working tree for the other side. Comparing a baseline
+    recorded hours earlier against a run made now measures the intervening hours as much as
+    the code — the control has to span the same conditions as the claim it protects.
+  - **A timing run is FOREGROUND. If it is backgrounded, the only permitted concurrent
+    activity is READING.** Not "avoid heavy work" — that phrasing failed three times in one
+    session, because the natural habit is to background the benchmark and carry on, and a test
+    suite or a diagnostic never feels like "heavy work" while you are writing it.
+    The v0.33 Phase-0 leg measured `cpu_on_cold` at **0.926** — under the stop-ship threshold,
+    with a suspiciously mechanical signature (a fixed +6 to +10 ms on the SHORT compiled
+    programs only: `array_ops` 5.8→12.2, `binding_fetch` 11.5→18.2, while the 136–145 ms
+    programs were untouched). A same-sequence null leg came back **1.011**, i.e. it did NOT
+    reproduce — so the effect looked real. Re-measuring the identical tree with the box
+    genuinely idle returned **1.030**, and every one of those programs to its baseline.
+    The difference between the two runs was that a 2609-test suite pass and a set of
+    diagnostics had been executed *during* the first one.
+  - **Three legs, not two.** base → after → base. The third leg is what distinguishes "the code
+    changed something" from "that leg was disturbed", and it costs one more run. Had only the
+    first two been taken here, the release would have carried either a phantom regression or a
+    bisect through a diff containing no defect.
+  - **"Machine idle" is a precondition, not a courtesy — and it includes YOUR OWN tooling.**
+    v0.33 produced two false regression reports in a row: the first because a codec measurement
+    was running in another shell, the second because a background review agent was still
+    benchmarking compression. Both showed geomeans of **0.81–0.89 concentrated in the
+    CPU-interpreter configs with the CUDA configs at 1.00** — which is the signature of
+    single-threaded CPU contention, not of a code change, and is *outside* the null band below.
+    The v0.33 null control (same tree twice, box genuinely quiet) came back
+    1.027 / 1.022 / 1.013 / 1.006 / 1.005 / 1.004 / 1.013 / 1.006 with rows spanning 0.87–1.50,
+    against a real v0.33-vs-v0.32 comparison of 0.989 / 1.000 / 0.992 / 0.999 / 1.003 / 1.001 /
+    1.010 / 1.002 — i.e. the real result sits *inside* the noise the control measures. Before
+    starting a timing run: check for background tasks and subagents, not just other windows.
 4. **Every mechanism ships with its pinning test** — the repo's four proven shapes:
   *canary* (contract key-sets: ENG-4/5/6), *derivation* (registry tags → consumer
   sets, TST-3 style: ROI-1), *differential oracle* (new execution path vs the

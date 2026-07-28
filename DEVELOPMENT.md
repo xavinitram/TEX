@@ -404,7 +404,9 @@ These are measured, non-obvious behaviours a maintainer will otherwise rediscove
   ~61/100 (median 0.94×) — widening the codegen route naively is *slower* on most programs
   (color_grade is 0.43–0.57× vs the interpreter). So the default cook stays on the interpreter
   and only routes to codegen where a measured win exists (the UC-2 stencil gate). The honest fix
-  for broad codegen routing is a cost model (deferred to v0.20); until then, **~4% of programs
+  for broad codegen routing is a cost model — **PROF-1 (v0.31) is now that substrate**, and
+  wiring it to routing is unscheduled rather than blocked (this line read "deferred to v0.20"
+  for twelve releases). Until it lands, **~4% of programs
   benefit from codegen routing** — treat "just codegen everything" as a known trap.
 - **Noise `torch.compile` is `dynamic=True` (P2).** One compiled kernel serves every resolution,
   so a resolution dance (512→1024→512) no longer thrashes torch.compile's shape guards — that was
@@ -710,6 +712,36 @@ Settled calls, kept here so they're not re-derived:
   anywhere in the engine to drive it. What shipped is the honest half: named, repo-committed,
   `tex doctor`-reportable presets. Reopen when PRED-1's reason stream has been calibrated
   against a real session — the mechanism it would need, not the policy.
+- **A lossless entropy codec on any cache tier** (v0.33 CACHE-8) — rejected on measurement, and
+  the measurement is committed (`benchmarks/cache_capacity_bench.py`). At 4K, zlib-1 costs
+  6710 ms to encode and **935 ms to decode** a frame that can simply be written to disk in
+  335 ms and read back in 60 ms; bz2 and lzma are an order worse; LZ4/zstd/blosc do not exist in
+  a torch-only package and a new dependency is out of scope (the same rule that bans numpy).
+  Decode is paid on every cache hit, so this is not close. Break-even is derived rather than
+  asserted: compression only pays below **~200 MB/s** of storage bandwidth. What buys capacity
+  is *width* (PREC-1's fp16, exactly 2×) and *residency*, both of which shipped. A test greps
+  `tex_results.py` for codec names so a future addition has to argue with the number.
+  Reopen only for a storage medium under that bandwidth, and only for the disk tier.
+- **Asynchronous D2H for the CACHE-8 demote path** (v0.33 XPU-2) — rejected on lifetime, not
+  speed. Async egress requires a page-locked destination, and a demoted frame's host buffer is
+  *retained* for as long as the entry lives; pinned pages are unswappable and torch's caching
+  host allocator holds freed blocks for the process lifetime, so retaining them is a slow leak.
+  Copying into pinned and cloning to pageable to release the lock costs a second full host
+  memcpy of the frame — and the asynchrony it would buy back is MEASURED at 1.01-1.06x over
+  a pinned blocking copy, i.e. noise (`benchmarks/`-adjacent measurement, v0.33 review).
+  `egress(staging=False)` states the distinction rather than hiding it. The transient spill
+  buffer *is* async, which is the case the mode exists to separate.
+- **Disk→GPU direct paths (GPUDirect / cuFile)** (v0.33) — investigated, measured, **no-go**.
+  No first-party torch API; Linux-only in practice (this project's primary platform is Windows);
+  and it removes only the H2D half of a 46.8 ms path that CACHE-8's residency tier removes
+  *entirely*. Revisit condition: a torch-native GDS API **and** a working set that genuinely
+  exceeds host RAM. See `docs/compressed-cache-tiers.md` §4.
+- **Inferring a colour-vs-data plane role from pixels** (v0.33 PREC-1) — rejected on S-5. The
+  roadmap's shape is "colour planes half / data planes fp32", and TEX cannot tell them apart:
+  DATA-1's vocabulary has no role field and named planes are DATA-6 (v0.35). Sniffing content to
+  guess is exactly the silent auto-tuning the discipline forbids. Shipped instead: an explicit
+  `storage="fp32"` pin, and an *exact* value-range gate — both failing toward fp32. When DATA-6
+  lands, `choose_storage` grows a role arm and no caller changes.
 - **A cross-node include/import system** — rejected on ethos grounds; self-containment
   ("five lines of self-contained plaintext") is a deliberate shareability feature.
 - **An extra fusion wire** — the frontend collapses a chain into the terminal node

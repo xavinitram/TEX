@@ -228,8 +228,21 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
     mints a different key and misses — there is no invalidation protocol, the key scheme is one.
 
     Nothing cached (the first cook of a chain, or a host that never ran phase 2) → the whole
-    chain cooks exactly as today. That is phase 1, and it is why arming CACHE-7 cannot make a
-    first cook slower.
+    chain cooks exactly as today, plus a PROLOGUE. That prologue is not free, and this docstring
+    used to assert that it was — measured at **1.09–1.33× warm and 2.46× on a true first cook**
+    before P0-8. Where it went:
+
+      * `ResultCache()` construction paid a ~20 ms `torch.cuda.is_available()` (the CUDA context
+        initializes on first call). Now memoized in `_default_ram_budget` — it is a constant of
+        the box, not a measurement worth repeating.
+      * one lineage key minted and one disk-tier probe PER CUT, on a cache that has nothing.
+        Now short-circuited by `_cache_is_provably_empty` — which requires a known-empty disk
+        tier, so ENG-13's reattach case (frames on disk, `_spilled` unknown) still walks the
+        loop and still finds them.
+
+    What remains is placement (`_resolve_cuts`, one profile lookup) and, on a cache that is not
+    provably empty, one key + one probe per cut. The honest claim: **arming CACHE-7 costs a
+    bounded prologue on a cold cache, not zero** — see `docs/effort-based-checkpoints.md` §13.
 
     `cuts` may be supplied by a caller that already planned; otherwise placement runs here off
     PROF-1. Returns the interpreter's raw `{output: tensor}`, same as `cook_stage_list`.
@@ -249,8 +262,23 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
     if not cuts:
         return _full()
 
-    from .tex_fusion import FusionError, suffix_stage_list
+    # P0-8: an EMPTY cache cannot serve any cut, so minting a key per cut and probing the disk
+    # tier for each is pure prologue on the exact cook that has the least to gain — the first
+    # one. `stats()` is O(1) for this question. A cache with RAM entries or an unknown/populated
+    # disk tier still walks the loop; only the provably-empty case short-circuits.
+    if _cache_is_provably_empty(result_cache):
+        return _full()
+
+    from .tex_fusion import (FusionError, remap_suffix_taps, suffix_stage_list,
+                             unservable_prefix_taps)
     for k in reversed(cuts):
+        # P0-5: a tap on a stage strictly below `k-1` lives inside the served prefix and is
+        # never cooked by the suffix. Serving the cut anyway DROPS a requested output — which
+        # shifts the host's output slots and breaks this function's "same as `cook_stage_list`"
+        # contract. Refuse the cut instead; a shallower one may still be servable, and the full
+        # cook is always correct.
+        if unservable_prefix_taps(stages, k):
+            continue
         key = tex_engine.boundary_lineage_key(
             stages, k, device, precision, upstream=upstream, time_context=time_context,
             latent_channel_count=latent_channel_count)
@@ -261,10 +289,15 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
             suffix = suffix_stage_list(stages, k, boundary)
         except FusionError:
             continue          # a malformed cut (a headless head stage) — try a shallower one
-        return tex_engine.cook_stage_list(
+        out = remap_suffix_taps(tex_engine.cook_stage_list(
             suffix, device=device, precision=precision,
             latent_channel_count=latent_channel_count, time_context=time_context,
-            cancel=cancel, on_progress=on_progress)
+            cancel=cancel, on_progress=on_progress), k)
+        # The boundary IS stage k-1's output, so a tap there is served for free rather than
+        # costing a refusal.
+        if k >= 1 and stages[k - 1].get("tap"):
+            out.setdefault(f"_tap_s{k - 1}", boundary)
+        return out
     return _full()
 
 
@@ -355,15 +388,50 @@ def _tap_budget() -> int:
     return max(1, int(MAX_OUTPUTS) - 1)
 
 
+def _cache_is_provably_empty(result_cache) -> bool:
+    """True only when the cache can be shown to hold nothing on EITHER tier (P0-8).
+
+    "Provably" is doing real work here. A `ResultCache` whose spill tier is `unknown` (`_spilled
+    is None` — a fresh cache over a directory a previous process populated) is NOT empty: that
+    is precisely ENG-13's reattach case, where the frames exist and `_restore` finds them. So
+    the fast path requires an empty RAM tier AND a KNOWN-empty disk tier, and anything it cannot
+    establish falls through to the full serve loop.
+
+    Best-effort against a duck-typed cache: a host may arm something that only implements the
+    governor hooks, and an unknown object is treated as non-empty (walk the loop)."""
+    try:
+        if result_cache._ram:
+            return False
+        spilled = result_cache._spilled
+        return spilled is not None and not spilled
+    except Exception:
+        return False
+
+
 def _gate_ok(stages, result_cache, latent_channel_count: int, upstream,
              precision: str) -> bool:
-    """The CACHE-6 gate, minus the fp32 clause, plus a resolved-precision clause.
+    """The CACHE-6 gate: fp32 only, and a resolved-precision clause.
 
-    fp16 is admitted because it was MEASURED to be safe, not assumed: a prefix/suffix split at
-    fp16 is bit-exact against the straight-through fp16 cook (22/22 rows, CPU and CUDA, with
-    and without a halo op). The interpreter upcasts outputs to fp32 on egress, so the boundary
-    holds exactly-representable fp16 values and feeding it back downcasts losslessly. Lifting
-    the gate is what makes checkpoints reachable under `precision="auto"` at all.
+    FP16 IS REFUSED, and the reason is worth stating because this gate briefly did admit it.
+
+    v0.32 lifted the fp32 clause on a 22-row measurement showing a prefix/suffix split at fp16
+    bit-exact against the straight-through fp16 cook. That measurement was real and its
+    conclusion was wrong, because the matrix only ever produced **fp16-representable
+    boundaries**. M-3 keeps coordinate builtins fp32 (invariant #4), so a stage like
+    `u * 1000.0 + 0.123` carries an interior local at fp32 precision through a straight-through
+    fused cook — while the checkpointed path *materializes* that boundary and the suffix
+    downcasts it at ingest. Measured on the counterexample: **maxdiff 6.58e-01 over
+    49,152/65,536 elements, CPU and CUDA**, with the fp32 control bit-exact.
+
+    So the precondition was never "fp16", it was "this boundary happens to hold values fp16 can
+    represent" — a property of the VALUES, which a precision label cannot carry. Refusing
+    restores parity with `cook_fused_cached`'s fp32-only clause (`tex_engine`), which never
+    lifted it.
+
+    The principled reopening — admitting a tap whose boundary tensor is *checked* to be
+    fp16-representable, which is the same argument half-packing a checkpoint needs — belongs to
+    PREC-1's storage-precision decision, not to this gate. It requires a representability check
+    on the actual tensor, never a blanket precision label.
 
     `precision` must be RESOLVED — "fp32" or "fp16", never "auto". `prepare()` is where auto
     resolves, and this path never calls it: `cook_stage_list` passes the string straight to the
@@ -388,7 +456,9 @@ def _gate_ok(stages, result_cache, latent_channel_count: int, upstream,
     """
     if result_cache is None or latent_channel_count or len(stages) < 2:
         return False
-    if precision not in ("fp32", "fp16"):
+    # fp32 ONLY. See the docstring: the fp16 lift was measured on a matrix that only produced
+    # fp16-representable boundaries, and the counterexample is 6.58e-01 of wrong pixels.
+    if precision != "fp32":
         return False
     # LINEAR ONLY — the same gate CACHE-6 has always had, restored after a per-cut
     # `cut_set(...) == 1` check was tried in its place and was WRONG.

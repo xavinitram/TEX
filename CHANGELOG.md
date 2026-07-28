@@ -5,6 +5,146 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-07-28
+
+**Remember more** — the memory tiers get deep. v0.32 taught the cache *where* to keep a frame;
+this release is about *how*, and about the ladder between VRAM, host RAM and disk that had a
+rung missing. Three items, and one of them is a measured **no**.
+
+### PREC-1 — preview-tier storage precision (the deferred decision, argued)
+
+The register's rejection of whole-pipeline fp16/bf16 IMAGE stands, unqualified and untouched:
+it is about **compute and wire dtype**. PREC-1 asks the narrower question it left open — must a
+frame that has already been cooked in fp32 occupy 4 bytes per channel while it *sits in a cache
+waiting to be looked at again*? Argued fresh in `docs/preview-tier-precision.md`, measured in
+`benchmarks/storage_precision_bench.py`, and shipped **opt-in per `put`**.
+
+* **`tex_packing.py`** is the only place a storage representation is chosen. `choose_storage`
+  is a pure function of `(tensor, quality, storage)` — no globals, no device query, no
+  environment — so a tier is reproducible across a restart and reportable in a bug report.
+* `ResultCache.put(..., quality="preview")` stores fp16; **the default (no tag) stores exactly
+  what was cooked, byte for byte**, which is every caller written before this release.
+* Storage precision is **invisible** through the class: `get` upcasts, and the unpack *replaces*
+  the copy-on-read clone rather than adding to it (0.04 ms vs 0.03 ms at 1024²). It survives the
+  disk tier — a preview frame is half on disk too, for free.
+* The numbers: fp16 costs **2^-11 = 4.9e-4 relative**, everywhere. Against the 3.9e-3 8-bit
+  display quantum, **bf16 crosses at values ≥ 2.0 and fp16 not until ≥ 16.0** — and a
+  compositor's working space is scene-linear, which is the regime the recorded rejection was
+  made in. Against invariant #9's CPU-vs-GPU envelope (6.1e-2), fp16 storage is **125× smaller
+  than a difference this engine already ships**. bf16 is kept as a live negative control in
+  both the benchmark and the tests. *The first draft of the fidelity test measured only
+  display-referred data and passed for the wrong reason; it now asserts both regimes.*
+* **Honest gap:** the roadmap's "colour planes half / data planes fp32" is not implementable as
+  stated — DATA-1's vocabulary has no role field and named planes are DATA-6 (v0.35). The split
+  is expressed with an explicit `storage="fp32"` pin and an exact value-range gate, both
+  failing toward fp32. LATENT is not auto-excluded; a host caching latents must pin them.
+
+### CACHE-8 — deep cache tiers: residency, packing, and a codec that measured badly
+
+`docs/compressed-cache-tiers.md`; `benchmarks/cache_capacity_bench.py` is the permanent record.
+
+* **The residency ladder.** A cold CUDA frame is now **demoted to host RAM** instead of spilled
+  to disk, and **promoted back on reuse**. Measured through the shipped cache at 2048², over two
+  independent runs: a `put` that has to shed VRAM costs **5.7–5.9 ms** against a **77.9–78.8 ms**
+  disk spill (**13.2–13.8×**), and the `get` that wants it back **6.3–8.6 ms** against a
+  **117.6–118.4 ms** restore (**13.7–18.7×**) — and the frame stays a cache hit rather than
+  becoming a disk read. Ranges, because the promote number moved between the two runs. Entry slot 3 is where a frame *is*; new
+  slot 6 is where it *belongs*. A demotion never removes the entry, so it is servable throughout.
+* `evict_bytes` — the CACHE-5 governor hook — **demotes instead of evicting** when the governor
+  asks for CUDA bytes and the tier is armed: the governor gets the resource it asked for and
+  the cache keeps its contents.
+* **Off by default.** `_vram_budget` starts `None` and `balanced` carries `vram_mb: None`; an
+  unarmed cache behaves exactly as v0.32. `performance` 2048 MB, `efficient` 256 MB.
+* **The codec is a measured NO.** At 4K, zlib-1 costs **6685 ms to encode** and **920 ms to
+  decode** a frame that can simply be written in 332 ms and read back in 59 ms; bz2 and lzma are
+  worse; no LZ4/zstd/blosc exists in a torch-only package. The break-even is derived, not
+  hand-waved: compression only pays below **~200 MB/s** of storage bandwidth. The Memory
+  report asked for this to be run as a benchmark rather than believed — it was, and it lost.
+  A test greps `tex_results.py` for codec names so a future addition argues with the number.
+* **uint16** is offered (`storage="uint16"`), never chosen automatically: **32× more accurate
+  than fp16 inside [0,1]** at the same two bytes, clips outside it, 3× the pack cost.
+* GOV-1's `_armed_caches` became a dict of remembered defaults per knob. With one remembered
+  value, `balanced` could restore the frame budget and would silently leave the residency
+  ceiling wherever `efficient` put it — the identical bug GOV-1 shipped once, one knob over.
+* **Research note, disk→GPU direct paths: NO-GO.** No torch cuFile API, Linux-only in practice,
+  and it removes only the H2D half of a 46.8 ms path the residency tier removes entirely.
+  Revisit condition stated in the design note.
+
+### XPU-2 — engine-owned async D2H egress
+
+`docs/async-egress.md`; `tex_runtime/streams.py`.
+
+* A `FrameHandle` carries a frame **plus the CUDA event that says when it is real**. The v0.20
+  rule ("D2H is never non_blocking") is not weakened — the *object* changes, so a handle has
+  nowhere to be read from that does not fence first.
+* **Engine-only, asserted rather than assumed:** a test greps the package and requires the sole
+  importer to be `tex_results.py` and `tex_node.py` to be unable to reach a handle. That finite,
+  reviewable consumer list is the entire safety argument the shelved objections turned on.
+* Metadata (`shape`/`dtype`/`nbytes`) never fences; `tensor()` does. A handle pins its **source**
+  until the fence, then releases it.
+* `retained=True` for a destination the caller **keeps**: pinning is for transient staging, and
+  a retained page-locked frame is a slow leak of unswappable memory. Named for the fact the
+  caller has, not for what egress allocates. The demote path uses it; the spill path is async.
+* **Honest accounting, measured rather than claimed.** Pinned-vs-pageable is 1.22× / 1.09× /
+  1.14× / **0.93×** at 512²–4096²; the asynchrony *on top of* a pinned destination is
+  1.06× / 1.02× / 1.01× / 1.05× — **noise**. D2H copies on one stream serialise, so a batch
+  cannot overlap with itself, and the event machinery costs ~6.3 µs/call. At the top of the pin
+  band the pinned destination is a net loss. What v0.33 delivers is **the contract, exercised**
+  by two real consumers — not a speedup — a release before v0.34's async-write item is
+  specified in terms of it.
+* The exit gate — "consume a frame from the wrong side on purpose" — is **deterministic**:
+  GPU ballast is enqueued ahead of the copy so it provably cannot have started. *Its first
+  draft passed for the wrong reason: torch's caching host allocator recycled a pinned block
+  still holding an identical frame from an earlier row. Frame content is now tagged per row.*
+
+### Exit gate
+
+*"Cache capacity at fixed budget measurably up (target ≥ 2× frames held at 4K under Balanced
+profile vs v0.32), zero determinism-pin violations, egress fences proven by a stress test that
+consumes frames from the wrong side on purpose."*
+
+Capacity is measured as **frames still servable from a memory tier** after 10 distinct 4096²
+frames are stored under one 1024 MB budget — not as arithmetic on frame sizes, because a
+spilled frame is still *reachable* and counting entries would flatter every configuration
+equally (`benchmarks/cache_capacity_bench.py --exit-gate`):
+
+| configuration | frames in memory | vs v0.32 | spills | VRAM held |
+|---|---|---|---|---|
+| v0.32 — fp32, no residency | 4 | 1.00× | 6 | 1024 MB |
+| PREC-1 — preview storage | 8 | **2.00×** | 2 | 1024 MB |
+| PREC-1 + CACHE-8 residency | 8 | **2.00×** | 2 | **256 MB** |
+
+**Target met.** Two honest readings of that table: the 2× comes from PREC-1, and it is *opt-in* —
+a host that tags nothing gets 1.00×, by design. And residency's contribution at this budget is
+not *more* frames but the **same** frames on a quarter of the VRAM, because the total byte budget
+is what binds; its latency win is the separate 13.0×/20.1× above.
+
+Determinism pins (`test_release_gate.py`): version consistency, codegen emission under
+`PYTHONHASHSEED` 0 and 1, and the scatter-determinism band — all green. The egress fence is
+`test_v033_xpu2_the_fence_is_load_bearing`.
+
+### Gates
+
+Suite **2600/2600**, 0 failed, 1 skipped (2568 at v0.32). **Mutation check 19/19 killed** — and
+the three that survived the first run were all real: the demote-then-spill row never actually
+produced a demoted frame (at `budget_mb=0` the entry is evicted before the demote drain runs, so
+`device == home` and the bug could not exist); the fence row read `unsafe_buffer()` before
+`tensor()`, by which time the copy had landed, so "make `tensor()` skip the fence" survived; and
+one *mutation* was itself a no-op. All three are fixed and re-killed. Invariant #7 canaries assert
+`tex_node.py` can reach none of the three items.
+
+Invariant #7 was measured as three `eight_config_bench` runs **back to back in one sequence**
+on a quiet box — the v0.32 tree (materialized from the git index), the v0.33 working tree, then
+the v0.32 tree **again** as the control. v0.33 vs v0.32: 1.007 / 0.996 / 1.000 / 1.008 / 1.113 /
+1.014 / 1.015 / 1.013, worst config **0.996**. **Neutral.**
+
+The control leg is the more useful result: byte-identical code against itself returned
+**0.949 on `cpu_off_warm`** — *below the 0.95 stop-ship threshold*, with rows spanning
+0.70–1.08. A single sub-threshold geomean on a CPU-interpreter config is therefore not evidence
+of a regression; the CUDA configs (null spread ±0.6%) are the sensitive instrument. Recorded in
+`docs/roadmap.md` §10, along with the reason three earlier runs were discarded (other work on
+the box, and a process kill mid-run).
+
 ## [0.32.0] - 2026-07-27
 
 **Cache where it counts** — effort-based checkpoints. v0.31 gave the engine a measured cost

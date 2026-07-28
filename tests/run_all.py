@@ -945,6 +945,115 @@ def main():
     test_v032_gov1_governed_bytes_never_drifts(r)
     test_v032_gov1_arbitrate_lands_on_budget_not_on_the_floor(r)
 
+    # v0.33 PREC-1 — preview-tier storage precision (the deferred decision, argued and pinned).
+    from test_v033_precision import (
+        test_v033_prec1_default_put_is_unchanged,
+        test_v033_prec1_final_tier_is_never_reduced,
+        test_v033_prec1_preview_and_final_are_different_keys,
+        test_v033_prec1_preview_halves_the_bytes,
+        test_v033_prec1_storage_is_invisible_through_get,
+        test_v033_prec1_relative_error_is_the_mantissa_bound,
+        test_v033_prec1_absolute_error_vs_the_8bit_quantum,
+        test_v033_prec1_declines_what_half_cannot_represent,
+        test_v033_prec1_survives_the_disk_spill_tier,
+        test_v033_prec1_patch_region_does_not_inherit_the_tier,
+        test_v033_prec1_is_absent_from_the_default_comfyui_path,
+        test_v033_prec1_choose_storage_is_the_only_decision_point,
+        test_v033_prec1_colour_data_split_at_the_kind_seam,
+        test_v033_prec1_kind_reaches_the_cache,
+        test_v033_prec1_preview_is_viral,
+    )
+    test_v033_prec1_default_put_is_unchanged(r)
+    test_v033_prec1_final_tier_is_never_reduced(r)
+    test_v033_prec1_preview_and_final_are_different_keys(r)
+    test_v033_prec1_preview_halves_the_bytes(r)
+    test_v033_prec1_storage_is_invisible_through_get(r)
+    test_v033_prec1_relative_error_is_the_mantissa_bound(r)
+    test_v033_prec1_absolute_error_vs_the_8bit_quantum(r)
+    test_v033_prec1_declines_what_half_cannot_represent(r)
+    test_v033_prec1_survives_the_disk_spill_tier(r)
+    test_v033_prec1_patch_region_does_not_inherit_the_tier(r)
+    test_v033_prec1_is_absent_from_the_default_comfyui_path(r)
+    test_v033_prec1_choose_storage_is_the_only_decision_point(r)
+    test_v033_prec1_colour_data_split_at_the_kind_seam(r)
+    test_v033_prec1_kind_reaches_the_cache(r)
+    test_v033_prec1_preview_is_viral(r)
+
+    # v0.33 CACHE-8 — deep cache tiers: the residency ladder, the packing choices, and the
+    # entropy codec the measured Pareto rejected (docs/compressed-cache-tiers.md).
+    from test_v033_cache8 import (
+        test_v033_cache8_residency_is_off_until_armed,
+        test_v033_cache8_demote_frees_vram_and_keeps_the_frame,
+        test_v033_cache8_demoted_frame_is_bit_exact,
+        test_v033_cache8_promote_on_reuse_returns_it_home,
+        test_v033_cache8_a_spilled_demoted_frame_comes_back_to_its_home,
+        test_v033_cache8_governor_prefers_demotion_over_eviction,
+        test_v033_cache8_unarmed_governor_evicts_exactly_as_before,
+        test_v033_cache8_uint16_is_offered_never_chosen,
+        test_v033_cache8_uint16_beats_fp16_in_range,
+        test_v033_cache8_no_compression_path_is_switched_on,
+        test_v033_cache8_profiles_carry_the_residency_ceiling,
+        test_v033_cache8_profile_reaches_and_restores_the_ceiling,
+        test_v033_cache8_is_absent_from_the_default_comfyui_path,
+    )
+    test_v033_cache8_residency_is_off_until_armed(r)
+    test_v033_cache8_demote_frees_vram_and_keeps_the_frame(r)
+    test_v033_cache8_demoted_frame_is_bit_exact(r)
+    test_v033_cache8_promote_on_reuse_returns_it_home(r)
+    test_v033_cache8_a_spilled_demoted_frame_comes_back_to_its_home(r)
+    test_v033_cache8_governor_prefers_demotion_over_eviction(r)
+    test_v033_cache8_unarmed_governor_evicts_exactly_as_before(r)
+    test_v033_cache8_uint16_is_offered_never_chosen(r)
+    test_v033_cache8_uint16_beats_fp16_in_range(r)
+    test_v033_cache8_no_compression_path_is_switched_on(r)
+    test_v033_cache8_profiles_carry_the_residency_ceiling(r)
+    test_v033_cache8_profile_reaches_and_restores_the_ceiling(r)
+    test_v033_cache8_is_absent_from_the_default_comfyui_path(r)
+
+    # v0.33 XPU-2 — engine-owned async D2H egress. The fence row is the release exit gate
+    # ("egress fences proven by a stress test that consumes frames from the wrong side").
+    from test_v033_xpu2 import (
+        test_v033_xpu2_handle_metadata_never_fences,
+        test_v033_xpu2_fenced_read_is_bit_exact,
+        test_v033_xpu2_the_fence_is_load_bearing,
+        test_v033_xpu2_declines_asynchrony_rather_than_faking_it,
+        test_v033_xpu2_wait_is_idempotent_and_releases_the_source,
+        test_v033_xpu2_spill_round_trips_through_the_handle,
+        test_v033_xpu2_is_engine_only,
+    )
+    test_v033_xpu2_handle_metadata_never_fences(r)
+    test_v033_xpu2_fenced_read_is_bit_exact(r)
+    test_v033_xpu2_the_fence_is_load_bearing(r)
+    test_v033_xpu2_declines_asynchrony_rather_than_faking_it(r)
+    test_v033_xpu2_wait_is_idempotent_and_releases_the_source(r)
+    test_v033_xpu2_spill_round_trips_through_the_handle(r)
+    test_v033_xpu2_is_engine_only(r)
+
+    # v0.33 Phase 0 — the fix-first register from the v0.30-v0.32 audit. Every row fails on the
+    # pre-fix tree; P0-2's counterexample lives in test_v032_checkpoint (the inverted row).
+    from test_v033_phase0 import (
+        test_v033_p0_3_generator_head_key_carries_resolution,
+        test_v033_p0_4_chain_windows_guards_a_past_the_end_start,
+        test_v033_p0_4_a_decline_poisons_validity,
+        test_v033_p0_6_reindex_does_not_lose_a_racing_spill,
+        test_v033_p0_6_spill_index_mutations_are_locked,
+        test_v033_p0_7_mkstemp_retry_is_bounded,
+        test_v033_p0_7_every_mkstemp_site_is_bounded,
+        test_v033_p0_8_empty_cache_short_circuits,
+        test_v033_p0_8_default_budget_probe_is_memoized,
+        test_v033_p0_8_docstring_no_longer_claims_free,
+    )
+    test_v033_p0_3_generator_head_key_carries_resolution(r)
+    test_v033_p0_4_chain_windows_guards_a_past_the_end_start(r)
+    test_v033_p0_4_a_decline_poisons_validity(r)
+    test_v033_p0_6_reindex_does_not_lose_a_racing_spill(r)
+    test_v033_p0_6_spill_index_mutations_are_locked(r)
+    test_v033_p0_7_mkstemp_retry_is_bounded(r)
+    test_v033_p0_7_every_mkstemp_site_is_bounded(r)
+    test_v033_p0_8_empty_cache_short_circuits(r)
+    test_v033_p0_8_default_budget_probe_is_memoized(r)
+    test_v033_p0_8_docstring_no_longer_claims_free(r)
+
     success = r.summary()
     return 0 if success else 1
 

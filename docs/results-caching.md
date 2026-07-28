@@ -133,9 +133,17 @@ dirty signal while lineage keys are the persistence/disk identity. Complementary
 A keyed store of cooked frames, RAM-tier byte-budgeted with a disk-spill tail, every entry
 frozen per ENG-12 and keyed by CACHE-1.
 
-**API (host-facing):** `get(key) → tensor|None`, `put(key, tensor, *, canvas=None)`, plus
-`stats()`. A host that has a `CookResult.lineage` calls `put(res.lineage[name], res.outputs[name])`
-and later `get(key)`. The ComfyUI node does not call any of it.
+**API (host-facing):** `get(key) → tensor|None`, `put(key, tensor, *, canvas=None, quality=None,
+storage=None)`, `set_budget(mb)`, `set_vram_budget(mb)`, plus `stats()`. A host that has a
+`CookResult.lineage` calls `put(res.lineage[name], res.outputs[name])` and later `get(key)`. The
+ComfyUI node does not call any of it.
+
+**v0.33 additions, both off unless asked for.** `quality="preview"` (PREC-1) stores the frame at
+half precision — 2× the frames in the same budget, invisible through `get`, which upcasts;
+see `docs/preview-tier-precision.md`. `set_vram_budget(mb)` (CACHE-8) arms the residency tier,
+so a cold CUDA frame is demoted to host RAM rather than spilled to disk and promoted back on
+reuse; see `docs/compressed-cache-tiers.md`. Neither changes anything for a caller that passes
+neither, which is every caller written before v0.33.
 
 **RAM tier** — an `OrderedDict` LRU with its own byte budget (`TEX_RESULTS_BUDGET_MB`, default
 a modest slice of VRAM), accounted with the same `untyped_storage().nbytes()` primitive the
@@ -150,6 +158,14 @@ can never reach the master (a frozen frame is not write-proof on torch 2.12; see
 and `get(key, copy=False)` is the opt-in zero-copy path. It also runs `verify_unmutated` before
 serving, which drops a **normal** (host-supplied) entry that was written through; the differential
 test mutates a served frame and asserts the next `get` is still clean.
+
+**Residency (v0.33, CACHE-8)** — between the RAM tier and the disk spill there is now a rung.
+When the *VRAM* ceiling is exceeded (armed via `set_vram_budget`, or a GOV-1 preset), the coldest
+CUDA frames are **demoted to host RAM**: the entry is never removed, so it stays servable
+throughout, and slot 6 remembers the **home** device so a hit **promotes** it back. Measured at
+2048²: 5.9 ms to shed VRAM against 76.9 ms to spill, 6.0 ms to get it back against 120.5 ms to
+restore. The CACHE-5 governor's evict hook prefers demotion when it is asking for CUDA bytes —
+it gets the resource it asked for and the cache keeps its contents. Off unless armed.
 
 **Disk spill** — when the RAM budget is exceeded, the LRU victim is spilled instead of dropped:
 staged GPU→host as a plain contiguous CPU copy and atomically pickled (`tex_results._atomic_pickle`)

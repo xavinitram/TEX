@@ -1,7 +1,7 @@
-"""Mutation check — do the v0.32 tests actually KILL the bugs they claim to pin?
+"""Mutation check — do the release's tests actually KILL the bugs they claim to pin?
 
-NOT part of `run_all.py`: it copies the tree eight times and runs the v0.32 rows against each,
-which is minutes, not seconds. Run it by hand when a fix lands:
+NOT part of `run_all.py`: it copies the tree once per mutation and runs the v0.32 + v0.33 rows
+against each, which is minutes, not seconds. Run it by hand when a fix lands:
 
     python tests/mutation_check.py
 
@@ -40,10 +40,13 @@ MUTATIONS = [
      "            if False:"),
     ("ResultCache: remove the lock from patch_region", "tex_results.py",
      "        with self._lock:\n"
-     "            return self._patch_region_locked(key, patch, window, base, base_key, canvas)",
-     "        return self._patch_region_locked(key, patch, window, base, base_key, canvas)"),
+     "            out = self._patch_region_locked(key, patch, window, base, base_key, canvas,\n"
+     "                                            quality, storage)",
+     "        if True:\n"
+     "            out = self._patch_region_locked(key, patch, window, base, base_key, canvas,\n"
+     "                                            quality, storage)"),
     ("ResultCache: _remove forgets the per-device total", "tex_results.py",
-     "            self._bytes_by_dev[_dev_bucket(entry[3])] -= entry[2]",
+     "            self._bytes_by_dev[_dev_bucket(entry.device)] -= entry.nbytes",
      "            pass"),
     ("CACHE-7: drop the linear gate again", "tex_checkpoint.py",
      "    if not is_linear_stage_list(stages):",
@@ -56,8 +59,54 @@ MUTATIONS = [
      "        if best is None or not best.stages:\n"
      "            return {}, False"),
     ("GOV-1: balanced stops restoring the shipped budget", "tex_memory.py",
-     "            default = _armed_caches.get(cache)",
+     "            default = defaults.get(knob)",
      "            default = None"),
+    # ── v0.33 ──────────────────────────────────────────────────────────────────────────
+    ("PREC-1: the quality tag stops gating (a storage hint alone reduces)", "tex_packing.py",
+     "    if quality != PREVIEW:\n"
+     "        return None                           # the default path, byte-identical to pre-v0.33",
+     "    if quality != PREVIEW and storage is None:\n"
+     "        return None"),
+    ("PREC-1: get stops unpacking (storage precision leaks to the consumer)", "tex_results.py",
+     "        if orig_dtype is not None:\n"
+     "            from . import tex_packing",
+     "        if False:\n"
+     "            from . import tex_packing"),
+    ("PREC-1: the fp16 range gate accepts anything (HDR -> inf)", "tex_packing.py",
+     "    return max(abs(lo), abs(hi)) <= FP16_MAX",
+     "    return True"),
+    ("PREC-1: the spill forgets the stored representation", "tex_results.py",
+     '"orig": _dtype_tables()[0].get(entry.orig_dtype)}',
+     '"orig": None}'),
+    ("CACHE-8: the spill writes where the frame IS, not where it belongs", "tex_results.py",
+     '"device": entry.home, "canvas": entry.canvas',
+     '"device": entry.device, "canvas": entry.canvas'),
+    # The guard is REMOVED, not neutered. A first attempt kept the `return` and only changed
+    # the arithmetic below it, which is a no-op — the mutation "survived" because it was not a
+    # mutation. A row that cannot change behaviour tests nothing.
+    ("CACHE-8: residency runs even when disarmed", "tex_results.py",
+     "        if self._vram_budget is None:\n"
+     "            return\n"
+     "        over = self._bytes_by_dev[\"cuda\"] - self._vram_budget",
+     "        over = self._bytes_by_dev[\"cuda\"] - (self._vram_budget or 0)"),
+    ("CACHE-8: a demoted frame is never promoted home", "tex_results.py",
+     "        if demoted is not None:\n"
+     "            frame = self._promote(key, demoted)",
+     "        if False:\n"
+     "            frame = self._promote(key, demoted)"),
+    ("CACHE-8: the governor stops preferring demotion over eviction", "tex_results.py",
+     "            if dev_type == \"cuda\" and self._vram_budget is not None:",
+     "            if False:"),
+    ("CACHE-8: uint16 stops refusing out-of-range frames (silent clipping)", "tex_packing.py",
+     "        return lo >= 0.0 and hi <= 1.0",
+     "        return True"),
+    ("XPU-2: tensor() stops fencing", "tex_runtime/streams.py",
+     "        return self.wait()._host",
+     "        return self._host"),
+    ("XPU-2: a RETAINED destination gets pinned anyway (retained= ignored)",
+     "tex_runtime/streams.py",
+     "    if (not isinstance(src, torch.Tensor) or src.device.type != \"cuda\" or retained",
+     "    if (not isinstance(src, torch.Tensor) or src.device.type != \"cuda\""),
 ]
 
 RUNNER = """
@@ -67,8 +116,9 @@ sys.path.insert(0, r"{tests}")
 sys.path.insert(0, r"{parent}")
 from helpers import SubTestResult
 import test_v032_checkpoint as A, test_v032_region as B, test_v032_governor as C
+import test_v033_precision as D, test_v033_cache8 as E, test_v033_xpu2 as F
 r = SubTestResult()
-for m in (A, B, C):
+for m in (A, B, C, D, E, F):
     for n in sorted(x for x in dir(m) if x.startswith("test_")):
         try:
             getattr(m, n)(r)

@@ -96,7 +96,10 @@ def save_user_snippets(snippets) -> bool:
         # A UNIQUE temp per writer (not the shared `p + ".tmp"`): two concurrent saves must
         # not write the same temp then both os.replace it (a corrupt-promote risk on POSIX;
         # a spurious sharing-violation on Windows). mkstemp gives each writer its own file.
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".snip_", suffix=".tmp")
+        # BOUNDED (P0-7): a bare `mkstemp` retries TMP_MAX times on PermissionError, which an
+        # ACL-denied directory raises for every candidate name — an effective hang.
+        from .tex_recovery import bounded_mkstemp
+        fd, tmp = bounded_mkstemp(dir=d, prefix=".snip_", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(clean, f, indent=2, ensure_ascii=False)

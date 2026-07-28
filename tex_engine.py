@@ -1757,10 +1757,26 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
         # Every tensor the prefix reads, by stage-qualified name and shape. Derivable BEFORE
         # the cook: a TEX program's output canvas equals its input canvas until LANG-6's
         # `canvas()` lands, at which point this becomes a derived shape rather than a copied one.
-        canvas = {"in": [[f"s{i}:{n}", *[int(d) for d in v.shape]]
-                         for i, st in enumerate(stages[:k])
-                         for n, v in sorted((st.get("bindings") or {}).items())
-                         if isinstance(v, torch.Tensor)]}
+        def _shapes(sts, off=0):
+            return [[f"s{i + off}:{n}", *[int(d) for d in v.shape]]
+                    for i, st in enumerate(sts)
+                    for n, v in sorted((st.get("bindings") or {}).items())
+                    if isinstance(v, torch.Tensor)]
+
+        canvas = {"in": _shapes(stages[:k])}
+        if not canvas["in"]:
+            # P0-3: a GENERATOR-HEAD prefix reads no tensors, so the enumeration above is empty
+            # and every resolution mints the SAME key — a 64² and a 128² cook of the same chain
+            # collide and the wrong-size boundary is served (reproduced end-to-end as an
+            # `InterpreterError` size mismatch; with a `sample()` suffix it would be silent
+            # wrong pixels instead of a raise).
+            #
+            # The boundary's resolution is the FUSED PROGRAM's grid, and that is set by whatever
+            # spatial binding exists anywhere in the chain — not only in the prefix. So when the
+            # prefix carries none, key on the whole chain's input shapes. A chain with no tensor
+            # bindings at all cooks scalar-mode, where there is genuinely one resolution and
+            # nothing to collide.
+            canvas = {"chain_in": _shapes(stages)}
     flags = [f"tap:s{k - 1}"]
     if latent_channel_count:
         flags.append(f"ic:{int(latent_channel_count)}")
@@ -1802,6 +1818,12 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
                                    for v in (st.get("bindings") or {}).values()
                                    if isinstance(v, torch.Tensor))):
         return _full()
+    # P0-5: a tap on a stage strictly below `k-1` is inside the served prefix and the suffix
+    # cook never produces it. Serving anyway drops a requested output and shifts the host's
+    # output slots — cook whole instead.
+    from .tex_fusion import remap_suffix_taps, unservable_prefix_taps
+    if unservable_prefix_taps(stages, k):
+        return _full()
     key = boundary_lineage_key(stages, k, device, "fp32", time_context=time_context,
                                latent_channel_count=latent_channel_count, upstream=upstream)
     boundary = result_cache.get(key)
@@ -1817,5 +1839,12 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
         suffix = suffix_stage_list(stages, k, boundary)
     except FusionError:          # a malformed cut (head stage lacks a chain_input to rebind) — the
         return _full()           #   documented whole-chain fallback, not a crash after the put
-    return cook_stage_list(suffix, device=device, precision="fp32",
-                           time_context=time_context, cancel=cancel, on_progress=on_progress)
+    # P0-5: the suffix renumbers stages, so `compile_fused` names its taps `_tap_s{j}` where the
+    # original was `k+j`. Remap at the serve seam — on BOTH the miss and the hit path, which is
+    # this single return.
+    out = remap_suffix_taps(
+        cook_stage_list(suffix, device=device, precision="fp32", time_context=time_context,
+                        cancel=cancel, on_progress=on_progress), k)
+    if stages[k - 1].get("tap"):
+        out.setdefault(f"_tap_s{k - 1}", boundary)   # the boundary IS that stage's output
+    return out

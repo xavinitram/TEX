@@ -76,8 +76,22 @@ def generate():
 
 
 if __name__ == "__main__":
+    import sys
+    # See gen_function_reference.py: `--check` was accepted and ignored (P0-9).
+    _out = os.path.join(ROOT, "examples", "INDEX.md")
     md, rows, covered, uncovered = generate()
-    with open(os.path.join(ROOT, "examples", "INDEX.md"), "w", encoding="utf-8") as f:
+    if "--check" in sys.argv:
+        try:
+            stale = open(_out, encoding="utf-8").read() != md
+        except FileNotFoundError:
+            print("examples/INDEX.md missing — run tools/gen_examples_index.py")
+            raise SystemExit(1)
+        if stale:
+            print("examples/INDEX.md is stale — regenerate with tools/gen_examples_index.py")
+            raise SystemExit(1)
+        print(f"examples/INDEX.md up to date ({len(rows)} examples)")
+        raise SystemExit(0)
+    with open(_out, "w", encoding="utf-8") as f:
         f.write(md)
     print(f"wrote examples/INDEX.md: {len(rows)} examples; "
           f"{len(covered)}/{len(covered) + len(uncovered)} functions exercised")

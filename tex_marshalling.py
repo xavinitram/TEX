@@ -126,7 +126,10 @@ def to_fp32_if_int_image(t, device=None):
         # device move only (a dtype-converting copy stays synchronous above);
         # pageable sources take the plain path (PyTorch would silently degrade
         # non_blocking to sync anyway). D2H is never non_blocking (a CPU-side
-        # read could observe an in-flight buffer).
+        # read could observe an in-flight buffer) — HERE, and everywhere a bare
+        # tensor is the result, because a tensor has nowhere to keep "not yet".
+        # XPU-2 (v0.33) lifts the rule only for a `tex_runtime.streams.FrameHandle`,
+        # which carries the CUDA event and fences on every route to its bytes.
         if getattr(device, "type", None) == "cuda" and t.is_pinned():
             return t.to(device, non_blocking=True)
         return t.to(device)

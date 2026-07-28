@@ -6,10 +6,12 @@ the note names:
   * THE DIFFERENTIAL ORACLE — a checkpointed cook equals the straight-through fused cook
     BIT-EXACTLY, at every cut, on every device. This is the ship gate (roadmap §10.4), and it
     is what CACHE-6's own oracle asserts for one cut; CACHE-7 asserts it for N.
-  * fp16 IS ADMITTED, AND MEASURED — CACHE-6 gates taps to fp32 on a BELIEF. The gate is
-    lifted because a split at fp16 is bit-exact (the interpreter upcasts on egress, so the
-    boundary round-trips losslessly). These rows are what makes lifting it honest rather than
-    optimistic; if the egress upcast ever changes, they red.
+  * fp16 IS REFUSED (P0-2, v0.33) — and this bullet used to say the opposite. v0.32 lifted the
+    fp32 gate on a 22-row measurement showing a split at fp16 bit-exact. The measurement was
+    real and its conclusion was wrong: every row in its matrix produced an fp16-REPRESENTABLE
+    boundary. The counterexample — a coordinate builtin amplified past fp16's precision AT the
+    cut — diverges 9.00e-01 on both devices while the fp32 control is bit-exact. The row is
+    inverted, not deleted, so the gate stays pinned in both directions.
   * THE RESOLUTION HOLE — `boundary_lineage_key` used to default `canvas` to nothing, so a
     tap's identity carried NO shape and `ResultCache.get` validates none. Reproduced: a 64²
     and a 128² cook minted the same key and the 128² request was SERVED THE 64² FRAME. This
@@ -113,46 +115,97 @@ def test_v032_cache7_differential_oracle(r: SubTestResult):
 
 
 def test_v032_cache7_fp16_gate_is_lifted_and_exact(r: SubTestResult):
-    """CACHE-6 refuses fp16 taps. CACHE-7 admits them — because a split at fp16 was MEASURED
-    bit-exact, not because it was assumed safe.
+    """P0-2 (v0.33). This row used to assert the OPPOSITE — that fp16 taps are admitted and
+    bit-exact — on the strength of a 22-row measurement. The measurement was real; its
+    conclusion was not, because every row in it produced an fp16-REPRESENTABLE boundary.
 
-    The mechanism these rows protect: the interpreter upcasts outputs to fp32 on egress, so a
-    harvested boundary holds exactly-representable fp16 values and feeding it back downcasts
-    losslessly. If that egress upcast ever changes, this reds — which is the point."""
-    print("\n--- v0.32 CACHE-7: fp16 taps admitted, and bit-exact ---")
-    N = 6
+    M-3 keeps coordinate builtins fp32 (invariant #4), so `u * 1000.0 + 0.123` carries an
+    interior local at fp32 precision through a straight-through fused cook, while the
+    checkpointed path materializes that boundary and the suffix downcasts it at ingest.
+
+    The row is INVERTED rather than deleted, so the gate stays pinned in both directions:
+      (a) fp16 taps are REFUSED — `materialize` returns nothing;
+      (b) the counterexample is carried here as a differential row, so if anyone lifts the gate
+          again on a representable-values corpus, THIS is what goes red;
+      (c) the fp32 control over the same stages is still bit-exact — proving the counterexample
+          indicts the precision label, not the checkpoint mechanism.
+    """
+    print("\n--- v0.32/P0-2 CACHE-7: fp16 taps REFUSED (the counterexample) ---")
+    # THE SHAPE OF THE HAZARD, and it took two attempts to get right — the first draft applied
+    # `fract` INSIDE the tapped stage, which collapses the magnitude before the boundary, so the
+    # boundary was fp16-representable after all and the divergence was only 1.07e-03.
+    #
+    # It has to be:
+    #   stage 0  produce a LARGE value from a COORDINATE builtin. M-3 keeps coords fp32
+    #            (invariant #4), so `u * 1000.0` is an fp32 local even under precision="fp16",
+    #            and in a straight-through fused cook it stays one all the way into stage 1.
+    #   stage 1  be SENSITIVE to that value's low bits. `fract` is the sharpest such function:
+    #            fp16's ULP at [512,1024) is 0.5, so a downcast at the boundary moves the
+    #            fractional part by O(1), not by an ulp.
+    #
+    # The checkpointed path materializes stage 0's output and the suffix DOWNCASTS it at ingest;
+    # the straight-through path never does. That difference is the whole defect.
+    #
+    # Kept out of `_POOL` deliberately: the pool is the one the original (over-confident)
+    # measurement used, and it must stay able to reproduce that measurement's success.
+    HAZARD = "@OUT = vec4(vec3(u * 1000.0 + 0.123) + @IN.rgb, 1.0);"
+    SENSITIVE = "@OUT = vec4(fract(@IN.rgb), 1.0);"
+
     for device in _devices():
-        pool, pool_name = _fp16_pool(device)
-        print(f"    ({device}: fp16 pool = {pool_name})")
         torch.manual_seed(1)
-        src = torch.rand(1, 96, 96, 3, device=device)
+        src = torch.rand(1, 128, 128, 3, device=device)
+        stages = [{"code": HAZARD, "chain_input": None, "bindings": {"IN": src}},
+                  {"code": SENSITIVE, "chain_input": "IN"},
+                  {"code": "@OUT = vec4(@IN.rgb + vec3(0.05), 1.0);", "chain_input": "IN"},
+                  {"code": "@OUT = vec4(@IN.rgb * 0.9, 1.0);", "chain_input": "IN"}]
         up = ("fp16-src",)
-        full = tex_engine.cook_stage_list(_stages(src, N, pool), device=device,
-                                          precision="fp16")["OUT"]
-        cache = tex_results.ResultCache()
-        cuts = [2, 4]
-        done = CK.materialize(_stages(src, N, pool), cache, device=device,
-                              precision="fp16", upstream=up, cuts=cuts)
-        if sorted(done) != sorted(cuts):
-            r.fail(f"CACHE-7 fp16 harvest {device}", f"materialized {done} of {cuts} — "
-                   "the gate still refuses fp16")
-            continue
-        got = CK.cook_checkpointed(_stages(src, N, pool), cache, device=device,
-                                   precision="fp16", upstream=up, cuts=cuts)["OUT"]
-        if torch.equal(got, full):
-            r.ok(f"CACHE-7 fp16 {device}: taps admitted and bit-exact vs full fp16 cook")
-        else:
-            d = (got.float() - full.float()).abs().max().item()
-            r.fail(f"CACHE-7 fp16 {device}", f"maxdiff {d:.3e}")
 
-    # And the clause that is NOT lifted: a LATENT still refuses (M-3 forces fp32 and narrows
+        # (a) the gate refuses fp16 outright. CUT AT 1 — immediately after the hazard stage,
+        # while the boundary still holds the large value. A first draft cut at 2, i.e. AFTER
+        # `fract` had already folded it back into [0,1) where fp16 represents it fine, and
+        # measured a harmless 6.8e-04. The cut position IS the counterexample.
+        cache = tex_results.ResultCache()
+        done = CK.materialize(stages, cache, device=device, precision="fp16",
+                              upstream=up, cuts=[1])
+        if done:
+            r.fail(f"CACHE-7 fp16 gate {device}",
+                   f"materialized {done} — the unsound fp16 lift is back")
+            continue
+
+        # (b) THE COUNTEREXAMPLE, measured rather than asserted: had the gate admitted the tap,
+        # this is the divergence it would have shipped. Driven through the same prefix/suffix
+        # splice the checkpoint path uses, with the cache bypassed so the gate cannot hide it.
+        full16 = tex_engine.cook_stage_list(stages, device=device, precision="fp16")["OUT"]
+        boundary = tex_engine.cook_stage_list(stages[:1], device=device,
+                                              precision="fp16")["OUT"]
+        suffix = tex_fusion.suffix_stage_list(stages, 1, boundary)
+        split16 = tex_engine.cook_stage_list(suffix, device=device, precision="fp16")["OUT"]
+        d16 = float((split16.float() - full16.float()).abs().max())
+
+        # (c) the fp32 control over the SAME stages: bit-exact, so the hazard is the label
+        full32 = tex_engine.cook_stage_list(stages, device=device, precision="fp32")["OUT"]
+        b32 = tex_engine.cook_stage_list(stages[:1], device=device, precision="fp32")["OUT"]
+        split32 = tex_engine.cook_stage_list(
+            tex_fusion.suffix_stage_list(stages, 1, b32), device=device,
+            precision="fp32")["OUT"]
+
+        if d16 > 1e-2 and torch.equal(split32, full32):
+            r.ok(f"CACHE-7 {device}: fp16 taps refused; the split they would have served "
+                 f"diverges {d16:.2e} while the fp32 split is bit-exact")
+        else:
+            r.fail(f"CACHE-7 fp16 counterexample {device}",
+                   f"fp16 split maxdiff {d16:.2e} (want > 1e-2), fp32 split exact="
+                   f"{torch.equal(split32, full32)} — if the fp16 divergence has vanished the "
+                   f"counterexample no longer proves the gate is needed; re-derive it before "
+                   f"lifting anything")
+
+    # And the clause that was never lifted: a LATENT still refuses (M-3 forces fp32 and narrows
     # the wrong axis). Belt-and-braces on the gate, not an accident of the cook.
     src = torch.rand(1, 32, 32, 3)
     cache = tex_results.ResultCache()
     done = CK.materialize(_stages(src, 4), cache, device="cpu", precision="fp32",
                           upstream=("s",), cuts=[2], latent_channel_count=4)
-    r.ok("CACHE-7 gate: a LATENT still refuses taps") if done == [] else \
-        r.fail("CACHE-7 latent gate", f"materialized {done} under a LATENT")
+    r.ok("CACHE-7 gate: a LATENT still refuses taps") if done == [] else         r.fail("CACHE-7 latent gate", f"materialized {done} under a LATENT")
 
 
 # ── the regression: the resolution hole in the tap key ───────────────────────────────────

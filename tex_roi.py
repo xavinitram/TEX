@@ -821,7 +821,8 @@ def covers(valid, needed) -> bool:
             and nx + nw <= vx + vw and ny + nh <= vy + vh)
 
 
-def chain_windows(halos, roi, dirty_from: int = 0, valid=None) -> "list | None":
+def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
+                  declined=()) -> "list | None":
     """The window each stage of a linear chain must cook so the FINAL window is correct.
 
     `halos[i]` is stage i's own reach (from `stage_halo`); `roi` is the 6-tuple window wanted
@@ -857,8 +858,32 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None) -> "list | None":
     what caught this; the window-arithmetic test it replaced passed while the pixels were still
     wrong by 2.17e-01.)
 
+    `declined` (P0-4a) is the set of stage indices whose LAST cook DECLINED the window and cooked
+    whole-frame instead. It exists because "a declined window replaces the canvas, so it is valid
+    everywhere" is FALSE, and the falsehood was silent:
+
+        a stage that declines still cooks from ITS input canvas — which a previous region cook
+        may have patched only over a composed window. Its whole-frame output is therefore stale
+        wherever that input was stale, while being recorded `valid[i] = None`, i.e. correct
+        everywhere. A later deeper edit is then declared serviceable and reads those pixels.
+        Measured: 4.55e-01 over 1,682/2,304 elements.
+
+    And a host cannot avoid triggering it: declines are ENGINE-initiated (fp16, or a refused
+    `roi_exec`, returns `cooked_roi=None`), so the contract has to be enforced by this API rather
+    than by asking hosts to track something they do not control. A declined stage whose own input
+    was not whole-frame-valid poisons validity downward, and this returns `None`.
+
     Pure arithmetic — this module stays torch-free."""
     n = len(halos)
+    # P0-4a: a stage that DECLINED its window cooked whole-frame from a possibly-stale input, so
+    # its "valid everywhere" record is only true if its input really was whole-frame valid. Any
+    # decliner whose input canvas was itself a patched region has produced a canvas that is stale
+    # outside that region while claiming to be valid everywhere — and every stage above it
+    # inherits that. Refuse rather than plan over it.
+    if declined and valid is not None:
+        for i in sorted(set(declined)):
+            if 0 <= i < n and i > 0 and valid[i - 1] is not None:
+                return None
     out = [None] * n
     if n == 0:
         return out
@@ -871,6 +896,13 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None) -> "list | None":
         nx1, ny1 = min(W, x0 + w + pad), min(H, y0 + h + pad)
         out[i] = (nx0, ny0, nx1 - nx0, ny1 - ny0, W, H)
     if valid is not None and start > 0:
+        # P0-4(b): `start` can be past the end — a host may pass `dirty_from >= len(halos)` for
+        # a chain whose dirty stage was removed, or for an empty suffix. Without `valid=` that
+        # returns a benign all-None plan; WITH it, `out[start]` was an IndexError. The two
+        # arities must agree on which inputs are degenerate-but-legal, so this refuses the same
+        # way every other unserviceable case does rather than raising.
+        if start >= n:
+            return None
         # The dirty suffix reads canvas `start-1`, which is NOT cooking. Its window must lie
         # inside whatever region that canvas is actually correct over. `+ halos[start]` because
         # stage `start` reaches that far into its input.

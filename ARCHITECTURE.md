@@ -54,6 +54,17 @@ cooked window into a frame under copy-on-patch. **Memory profiles** (v0.32 GOV-1
 repo-committed presets on the governor — `performance`/`balanced`/`efficient` — that set the
 arbitrated budget, every armed frame cache's budget, and CACHE-7's checkpoint threshold together,
 and are reported by `tex doctor` (S-5: never silently auto-tune a box).
+**Storage representation** (`tex_packing.py`, v0.33 PREC-1) is the one place a cached frame's
+*storage* dtype is chosen — a third dtype question, distinct from the compute dtype
+(`tex_engine`) and the wire dtype (`tex_marshalling`), and invisible to every program because
+`get` upcasts on the way out. Opt-in per `put` via a `quality` tag; the default stores exactly
+what was cooked. **Residency** (v0.33 CACHE-8) gives the frame cache its missing rung: a cold
+CUDA frame is demoted to host RAM instead of spilled to disk and promoted back on reuse, so
+shedding VRAM costs 5.9 ms rather than 76.9 (measured, 2048²). **Async egress**
+(`tex_runtime/streams.py`, v0.33 XPU-2) is the `FrameHandle` — a frame plus the CUDA event that
+says when it is real — which is what lets a D2H be non-blocking at all: the v0.20 rule stands
+for bare tensors, and a handle has nowhere to be read from that does not fence first. Engine-only
+by assertion, not convention (a test pins the sole importer).
 **Noise** (`tex_runtime/noise.py`)
 is the arithmetic-hash procedural noise family. The ComfyUI node itself is `tex_node.py`.
 

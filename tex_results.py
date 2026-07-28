@@ -164,6 +164,93 @@ def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
 import os
 import threading
 from collections import OrderedDict, deque
+from dataclasses import dataclass
+
+
+class _DepthLock:
+    """An `RLock` that knows how deep this thread is inside it.
+
+    The one thing it adds is `depth`, and it exists because the drains need to answer "is a
+    composite operation on this thread holding the lock around me?" — which IS re-entrancy
+    depth. `patch_region` takes the lock across a nested `put` for atomicity, and that `put`'s
+    drains must not run a disk write and a D2H under it (the 327-496 ms stall `_drain_spills`
+    was created to remove).
+
+    The first version of this was a thread-local flag `patch_region` set by hand in a
+    `try/finally`. That made correctness a property of one method remembering to do it: a
+    second composite — a batched put, a future `patch_region` that recurses — would silently
+    reintroduce the stall, and no test would notice, because the drains still HAPPEN, just at
+    the wrong time. Deriving it from the lock makes every future composite correct by
+    construction, and a nested composite cannot un-defer its parent (a flag is a boolean where
+    the state is a depth).
+    """
+
+    __slots__ = ("_lock", "_local")
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._local = threading.local()
+
+    @property
+    def depth(self) -> int:
+        return getattr(self._local, "n", 0)
+
+    def __enter__(self):
+        self._lock.acquire()
+        self._local.n = self.depth + 1
+        return self
+
+    def __exit__(self, *exc):
+        self._local.n = self.depth - 1
+        self._lock.release()
+        return False
+
+
+@dataclass(slots=True, eq=False)
+class _Entry:
+    """One cached frame and everything the tiers need to know about it.
+
+    A MUTABLE dataclass, not a NamedTuple: the residency ladder swaps `tensor` and `device` in
+    place on a live entry, and identity (`is not entry`) is how `_drain_demotes`/`_promote`
+    re-check that the entry they copied is still the one in the table — hence `eq=False`.
+
+    It used to be a 7-slot list read positionally, and the release's own mutation table pins
+    the bug that shape makes possible: `_spill` persisting `entry[3]` (where the frame IS)
+    instead of `entry[6]` (where it BELONGS) turns the residency ladder into a one-way trip to
+    the CPU. Two of the seven slots are device strings; only the names tell them apart.
+
+    tensor      the frozen master (ENG-12), contiguous, storage-owning
+    stamp       `frame_version` at insert — a constant 0 for a frozen entry, so `verify_unmutated`
+                is a live detector only for a NORMAL (host-supplied) one
+    nbytes      the byte charge every budget and the governor read
+    device      where the frame IS right now (demotion moves it)
+    canvas      opaque caller metadata (CACHE-9 records the window it wrote)
+    orig_dtype  the dtype the frame was COOKED at when stored reduced, else None (PREC-1)
+    home        where the frame BELONGS — its cook device (CACHE-8)
+    """
+    tensor: object
+    stamp: int
+    nbytes: int
+    device: str
+    canvas: object
+    orig_dtype: object
+    home: str
+
+
+#: torch dtype -> the `tex_io.STORAGE_DTYPES` name a spill record persists it under. Built from
+#: tex_io's own table rather than `str(dtype).replace("torch.", "")`, and read back through a
+#: dict rather than `getattr(torch, <a string that came off disk>)`.
+_DTYPE_NAME: dict = {}
+_NAME_DTYPE: dict = {}
+
+
+def _dtype_tables():
+    global _DTYPE_NAME, _NAME_DTYPE
+    if not _DTYPE_NAME:
+        from .tex_io import _STORAGE_TORCH
+        _NAME_DTYPE = dict(_STORAGE_TORCH)
+        _DTYPE_NAME = {dt: name for name, dt in _STORAGE_TORCH.items()}
+    return _DTYPE_NAME, _NAME_DTYPE
 
 
 def _dev_bucket(device) -> str:
@@ -184,19 +271,35 @@ def _budget_bytes(env_name: str, default: int) -> int:
     return default
 
 
+#: MEMOIZED default budget (P0-8). `torch.cuda.is_available()` initializes the CUDA context on
+#: first call — measured at ~20 ms — and `_default_ram_budget` runs in `ResultCache.__init__`.
+#: `cook_checkpointed` constructs a cache per call in its all-miss prologue, so that 20 ms was
+#: being paid per cook and was the dominant term in the 2.46x first-cook slowdown its docstring
+#: claimed could not happen. The value is a pure function of the box, so computing it once is
+#: not a cache — it is not recomputing a constant.
+_DEFAULT_RAM_BUDGET: "int | None" = None
+
+
 def _default_ram_budget() -> int:
     """A conservative default frame-RAM budget. A cook keeps its outputs on the cook device,
     so a CUDA frame cache lives in VRAM and must not crowd out the cook itself — hence a
     modest slice, host-overridable via TEX_RESULTS_BUDGET_MB. CACHE-5 will fold this into the
-    global governor; until then the frame budget self-evicts."""
+    global governor; until then the frame budget self-evicts.
+
+    Memoized: see `_DEFAULT_RAM_BUDGET`."""
+    global _DEFAULT_RAM_BUDGET
+    if _DEFAULT_RAM_BUDGET is not None:
+        return _DEFAULT_RAM_BUDGET
+    val = 512 << 20
     try:
         import torch
         if torch.cuda.is_available():
             total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
-            return min(2 << 30, int(0.25 * total))
+            val = min(2 << 30, int(0.25 * total))
     except Exception:
         pass
-    return 512 << 20
+    _DEFAULT_RAM_BUDGET = val
+    return val
 
 
 class ResultCache:
@@ -231,8 +334,8 @@ class ResultCache:
         # assume it is HELD; `_spill`/`_restore` deliberately run OUTSIDE it (they are the disk
         # I/O the rule exists to exclude) and are single-writer by drain-path convention.
         # RE-ENTRANT because `get` → `_restore` → `put` is a real call chain.
-        self._lock = threading.RLock()
-        self._ram: OrderedDict = OrderedDict()   # key -> [tensor, stamp, nbytes, device, canvas]
+        self._lock = _DepthLock()
+        self._ram: "OrderedDict[str, _Entry]" = OrderedDict()
         self._budget = (int(budget_mb * (1 << 20)) if budget_mb is not None
                         else _budget_bytes("TEX_RESULTS_BUDGET_MB", _default_ram_budget()))
         self._disk_budget = (int(disk_budget_mb * (1 << 20)) if disk_budget_mb is not None
@@ -261,7 +364,17 @@ class ResultCache:
         # Victims evicted under the lock, spilled to disk OUTSIDE it. See `_drain_spills`.
         # A deque because this is a FIFO drain: `pop(0)` on a list is O(n).
         self._pending_spills: deque = deque()
+        # CACHE-8 residency: the VRAM ceiling above which cold CUDA frames are DEMOTED to host
+        # RAM instead of spilled to disk. None = off, which is v0.32's behaviour exactly — a
+        # frame cache that has never been told a VRAM budget must not start moving frames
+        # between devices because it was upgraded. GOV-1's presets and `set_vram_budget` arm it.
+        self._vram_budget: "int | None" = None
+        self._pending_demotes: deque = deque()
         self.hits = self.misses = self.spills = self.restores = self.evictions = 0
+        # CACHE-8: how many frames the residency ladder moved, each direction. These are the
+        # numbers that say whether the tier is doing anything, and `stats()` reports them —
+        # a residency policy nobody can observe is a residency policy nobody can tune.
+        self.demotions = self.promotions = 0
 
     @property
     def _ram_bytes(self) -> int:
@@ -305,12 +418,47 @@ class ResultCache:
         return os.path.join(self._spill_dir(), f"{key}.frame")
 
     # ── core API ──
-    def put(self, key: str, tensor, *, canvas=None) -> None:
+    def put(self, key: str, tensor, *, canvas=None, quality=None, storage=None,
+            kind=None) -> None:
         """Store `tensor` under `key`, frozen per ENG-12 (an in-place write to a cached frame
-        then raises instead of silently corrupting it). Re-inserting a key replaces it."""
+        then raises instead of silently corrupting it). Re-inserting a key replaces it.
+
+        PREC-1: `quality` is the caller's tier tag — the same string it passed to
+        `lineage_key(quality=...)` to mint `key`. `tex_packing.PREVIEW` makes this frame
+        eligible to be STORED at half precision (2x the frames in the same budget); anything
+        else, INCLUDING the default None, stores exactly what was cooked. `storage="fp32"`
+        pins a frame at full precision regardless. `kind` is the output KIND
+        (`tex_marshalling.map_inferred_type` — IMAGE / MASK / LATENT / ...): the colour-vs-data
+        split, taken from the seam that already classifies it. MASK and LATENT are never packed.
+
+        Storage precision is not visible through this class: `get` returns the cooked dtype
+        either way. It is visible in the BYTES, which is the point, and in the pixels to the
+        tune of 4.9e-4 — 8x under the 8-bit display quantum and 125x under the CPU-vs-GPU
+        envelope invariant #9 already ships. See tex_packing for the argument and
+        `benchmarks/storage_precision_bench.py` for the measurements.
+        """
         import torch
         if not isinstance(tensor, torch.Tensor):
             return
+        from . import tex_packing
+        want = tex_packing.choose_storage(tensor, quality=quality, storage=storage, kind=kind)
+        self._admit(key, tex_packing.pack(tensor, want), canvas,
+                    tensor.dtype if want is not None else None)
+
+    def _admit(self, key: str, tensor, canvas, orig_dtype, home=None) -> None:
+        """Insert an ALREADY-REPRESENTED frame: freeze it, account it, enforce the budgets.
+
+        The shared body of `put` (which decides the representation first) and `_restore`
+        (whose representation was decided when the frame was spilled, and must not be decided
+        again — re-running the policy on a restored half frame would ask `choose_storage`
+        about a tensor whose original dtype is already gone).
+
+        `home` (CACHE-8) is the device this frame BELONGS on. A plain `put` has no opinion, so
+        it defaults to wherever the tensor already is — except on a replace, where the prior
+        entry's home wins: a host re-putting a key whose frame is currently demoted to RAM is
+        stating new pixels, not a new residency, and losing the home there would strand the
+        frame on the CPU with nothing left that remembers it was a CUDA frame.
+        """
         from . import tex_engine
         # Everything down to `stamp` is per-THIS-tensor work touching no shared state, and
         # `frozen_copy` is a full-frame memcpy — so it stays outside the lock, per the rule on
@@ -332,13 +480,22 @@ class ResultCache:
             storage_bytes = own_bytes
         stamp = tex_engine.frame_version(frozen)
         with self._lock:
-            self._remove(key)                          # replace: drop any prior entry's accounting first
+            old = self._remove(key)                    # replace: drop any prior entry's accounting first
             # a fresh key lands at the OrderedDict tail (MRU); _enforce_ram_budget evicts from the front
             dev = str(frozen.device)
-            self._ram[key] = [frozen, stamp, storage_bytes, dev, canvas]
+            prev_home = home if home is not None else (old.home if old is not None else dev)
+            self._ram[key] = _Entry(frozen, stamp, storage_bytes, dev, canvas,
+                                    orig_dtype, prev_home)
             self._bytes_by_dev[_dev_bucket(dev)] += storage_bytes
+            # Residency first, then the total budget. The order is the point of having two
+            # ladders: demoting a cold CUDA frame to host RAM costs 10.8 ms at 4K and keeps it
+            # servable, where spilling it costs 204 ms and makes the next hit a 36 ms disk read.
+            # Relieving VRAM the cheap way BEFORE deciding what to evict entirely means a frame
+            # only reaches the disk when host RAM is full too.
+            self._enforce_residency()
             self._enforce_ram_budget()
-        self._drain_spills()          # disk I/O outside the lock (see the rule on __init__)
+        self._drain_demotes()         # D2H outside the lock (see the rule on __init__)
+        self._drain_spills()          # disk I/O outside the lock (same rule)
 
     def get(self, key: str, *, copy: bool = True):
         """Return the cached frame for `key`, or None. By DEFAULT (copy=True) returns an OWNED
@@ -352,18 +509,34 @@ class ResultCache:
         A RAM hit is version-verified (ENG-12 stratum 2) before serving — a NORMAL (host-supplied)
         entry written through in place is dropped, never served (a frozen master's version is a
         constant 0, so this net catches only mutable entries; copy-on-read is what protects the
-        frozen master). A RAM miss falls to the disk spill tier and re-admits a restored frame."""
+        frozen master). A RAM miss falls to the disk spill tier and re-admits a restored frame.
+
+        PREC-1: an entry STORED at reduced precision is returned at the dtype it was cooked at,
+        so storage precision is invisible here. That unpack is a copy, so `copy=False` cannot
+        hand back the master for such an entry — it returns an owned upcast instead. `copy=False`
+        promises the CALLER will not mutate; it never promised object identity, and the one place
+        identity is asserted (test_v025_phase1) stores at full precision, where the master is
+        still handed back untouched."""
         from . import tex_engine
+        orig_dtype = None
+        demoted = None
         with self._lock:
             frame = None
             entry = self._ram.get(key)
             if entry is not None:
-                tensor, stamp = entry[0], entry[1]
+                tensor, stamp = entry.tensor, entry.stamp
                 if not tex_engine.verify_unmutated(tensor, stamp):
                     self._remove(key)                  # a mutable entry written through: never serve it
                 else:
                     self._ram.move_to_end(key)
-                    frame = tensor
+                    frame, orig_dtype = tensor, entry.orig_dtype
+                    # CACHE-8: a hit on a demoted frame IS the reuse signal the residency
+                    # policy promotes on. Noted here, acted on below — the H2D copy is exactly
+                    # the full-frame work the lock rule keeps outside.
+                    if entry.device != entry.home:
+                        demoted = entry
+        if demoted is not None:
+            frame = self._promote(key, demoted)
         if frame is None:
             # OUTSIDE the lock: `_restore` is a file read plus an H2D copy — measured at
             # hundreds of ms for a large frame, and holding the lock across it stalls every
@@ -372,6 +545,9 @@ class ResultCache:
             # same key both read and the second `put` simply replaces the first: a duplicated
             # read, never a corrupted table.
             frame = self._restore(key)                 # re-admits to RAM; returns the master, or None
+            with self._lock:
+                entry = self._ram.get(key)
+                orig_dtype = entry.orig_dtype if entry is not None else None
         with self._lock:
             if frame is None:
                 self.misses += 1
@@ -384,6 +560,20 @@ class ResultCache:
         # the tensor cannot be freed while this name holds it, and a frozen master is never
         # written in place (that is what the freeze and the copy-on-read exist to guarantee).
         # clone() on a frozen master (outside inference_mode) yields a normal, mutable, owned copy.
+        #
+        # PREC-1: for a reduced-precision entry the upcast IS that copy — `.to(fp32)` on an fp16
+        # master allocates and writes a fresh normal buffer exactly as `clone()` would, so the
+        # unpack REPLACES the clone rather than adding to it (measured 0.04 ms vs 0.03 ms CPU at
+        # 1024²). `copy=False` cannot avoid it, so it does not try: an unpack is a copy whether or
+        # not one was asked for.
+        if orig_dtype is not None:
+            from . import tex_packing
+            out = tex_packing.unpack(frame, orig_dtype)
+            # `unpack` is the identity when there is nothing to convert, and the identity would
+            # hand back the frozen MASTER — the one thing copy-on-read exists to prevent. An
+            # entry with `orig_dtype` set should never be in that state, so this is a guard
+            # against a future codec whose unpack is a no-op, not against today's two.
+            return out if out is not frame else (frame.clone() if copy else frame)
         return frame.clone() if copy else frame
 
     def set_budget(self, mb) -> None:
@@ -402,7 +592,8 @@ class ResultCache:
         self._drain_spills()      # `_enforce_ram_budget` only QUEUES the victims (see it)
 
     def patch_region(self, key: str, patch, window, *, base=None,
-                     base_key: str | None = None, canvas=None):
+                     base_key: str | None = None, canvas=None,
+                     quality=None, storage=None):
         """CACHE-9: write a cooked REGION into a frame and store the result under `key`.
 
         Returns the patched frame (owned, mutable), or None when there is no base to patch —
@@ -431,6 +622,12 @@ class ResultCache:
         reports. A caller MUST pass what the engine actually served (`cooked_roi`), not what it
         requested: a stage can DECLINE a window and return a whole frame, and pasting that into
         a w×h slice is a crash. `cooked_roi is None` means "declined" — `put` the frame instead.
+
+        `quality`/`storage` (PREC-1) forward to the `put` of the patched result, and are NOT
+        inherited from the base. Inheritance would be the wrong default here: the base is
+        addressed by a key the caller minted, the result gets a key the caller minted, and the
+        tier is a property of those keys — so the caller states it, exactly as it does for `put`.
+        Passing nothing stores the patched frame at full precision, which is the safe direction.
         """
         import torch
         if not isinstance(patch, torch.Tensor):
@@ -442,9 +639,17 @@ class ResultCache:
         # comment WITHOUT the `with` below and measured 200/200 lost updates. RLock, so the
         # nested `get`/`put` re-enter freely.
         with self._lock:
-            return self._patch_region_locked(key, patch, window, base, base_key, canvas)
+            out = self._patch_region_locked(key, patch, window, base, base_key, canvas,
+                                            quality, storage)
+        # The nested `put` deferred these — `_lock.depth` was non-zero inside the block above —
+        # so they would not run a disk write and a D2H under the lock this method holds for
+        # atomicity. They run here, released, exactly as they do after a plain `put`.
+        self._drain_demotes()
+        self._drain_spills()
+        return out
 
-    def _patch_region_locked(self, key, patch, window, base, base_key, canvas):
+    def _patch_region_locked(self, key, patch, window, base, base_key, canvas,
+                             quality=None, storage=None):
         frame = base if base is not None else self.get(base_key or key, copy=True)
         if frame is None:
             return None                        # nothing to patch — the caller cooks whole
@@ -466,8 +671,152 @@ class ResultCache:
         frame[:, y0:y0 + h, x0:x0 + w] = patch
         self.put(key, frame, canvas=(canvas if canvas is not None
                                      else {"shape": list(frame.shape),
-                                           "roi": [x0, y0, w, h]}))
+                                           "roi": [x0, y0, w, h]}),
+                 quality=quality, storage=storage)
         return frame
+
+    # ── CACHE-8: residency (VRAM -> host RAM -> disk) ──
+    def set_vram_budget(self, mb) -> None:
+        """Arm the residency tier: above `mb` megabytes of CUDA-resident frames, the coldest
+        are moved to host RAM. `None` disarms it, which is v0.32's behaviour exactly.
+
+        Why a SECOND budget rather than a smarter single one: the two are different resources
+        with different prices. `_budget` caps how much the cache holds AT ALL and its overflow
+        goes to disk; this caps how much of that sits in VRAM, and its overflow goes to a place
+        that is still a cache hit. A frame cache on a CUDA host is competing with the cook
+        itself for VRAM while host RAM sits empty beside it — one number cannot express that.
+        """
+        with self._lock:
+            self._vram_budget = None if mb is None else max(0, int(mb) * (1 << 20))
+            self._enforce_residency()
+        self._drain_demotes()
+
+    def _enforce_residency(self) -> None:
+        """Queue the coldest CUDA frames for demotion until VRAM is under budget.
+
+        POLICY, stated plainly because it is the part worth arguing with: victims are chosen
+        by LRU, and a demoted frame is PROMOTED back on its next hit. That is a recency policy
+        being used where the report asks for an access-FREQUENCY one, and the justification is
+        that a frame cache's access pattern is a playhead — a scrub touches near-frames most
+        recently and most often, so the two orderings largely coincide. `stats()` reports the
+        demotion/promotion counts precisely so this can be revisited with a measurement instead
+        of an opinion; a frequency-weighted victim choice is a change to this function alone.
+
+        Never demotes the MRU entry (`len > 1` and the front-first walk), for the same reason
+        `_enforce_ram_budget` does not: the frame just cooked is the one about to be read.
+
+        Caller holds `_lock`."""
+        if self._vram_budget is None:
+            return
+        over = self._bytes_by_dev["cuda"] - self._vram_budget
+        if over > 0:                                  # O(1) early-out, the common case
+            self._queue_demotions(over)
+
+    def _queue_demotions(self, want: int) -> int:
+        """Queue the coldest CUDA entries until ~`want` bytes are accounted for; returns the
+        bytes queued. Caller holds `_lock`.
+
+        THE one place a demotion victim is chosen. `_enforce_residency` (which wants VRAM back
+        under a ceiling) and `evict_bytes` (which wants a byte count back for the governor)
+        differ only in where that number comes from — and keeping the walk in one place is what
+        makes `_enforce_residency`'s promise true when it says a frequency-weighted victim
+        choice is a change to one function.
+
+        Bytes are charged when a victim is QUEUED, not when the drain frees them: the drain is
+        unconditional from here, and counting an entry twice would demote the world."""
+        queued = {k for k, _e in self._pending_demotes}
+        got = 0
+        for key in list(self._ram.keys()):            # oldest -> newest
+            if got >= want or len(self._ram) <= 1:
+                break
+            entry = self._ram.get(key)
+            if entry is None or _dev_bucket(entry.device) != "cuda" or key in queued:
+                continue
+            self._pending_demotes.append((key, entry))
+            queued.add(key)
+            got += entry.nbytes
+        return got
+
+    def _drain_demotes(self) -> None:
+        """Perform the queued D2H copies and swap the host buffers in. Called by the PUBLIC
+        methods, after they release the lock.
+
+        Unlike a spill, a demotion must leave the frame SERVABLE throughout — so the entry is
+        never removed. It stays in `_ram`, on CUDA, answering `get` with the right pixels until
+        the host copy exists; only then is slot 0 swapped and the per-device accounting moved.
+        A concurrent `get` during the copy therefore serves the VRAM master, which is correct
+        and is why this is not a window anyone has to reason about.
+
+        XPU-2 is deliberately used in its `retained=True` mode here. A demoted frame's host
+        buffer is RETAINED — for as long as the entry lives — and a page-locked buffer of that
+        lifetime is a slow leak of unswappable memory. Copying into pinned and then cloning to
+        pageable to release the lock would cost a second full host memcpy of the frame,
+        which is more than the asynchrony saves on a copy that has almost nothing to overlap
+        with. The handle is still the seam: when v0.34's async-write path hands a demoted frame
+        to a writer thread, it does so through this same object.
+
+        A demotion that fails leaves the frame exactly where it was — over budget, and correct.
+        The budget is a target; the pixels are not."""
+        import torch
+        from .tex_runtime.streams import egress
+        if self._lock.depth:
+            return                # a composite (patch_region) holds the lock; it drains after
+        while True:
+            with self._lock:
+                if not self._pending_demotes:
+                    return
+                key, entry = self._pending_demotes.popleft()
+                if self._ram.get(key) is not entry or _dev_bucket(entry.device) != "cuda":
+                    continue                          # evicted, replaced, or already demoted
+                src = entry.tensor
+            try:
+                # Born frozen: slot 0's contract is a FROZEN master (`_spill` reads it as one).
+                with torch.inference_mode():
+                    host = egress(src, retained=True).tensor()
+            except Exception:
+                continue                              # leave it in VRAM; correctness is unharmed
+            with self._lock:
+                cur = self._ram.get(key)
+                if cur is not entry:
+                    continue                          # it moved on while we copied: drop the copy
+                self._bytes_by_dev["cuda"] -= entry.nbytes
+                self._bytes_by_dev["cpu"] += entry.nbytes
+                cur.tensor = host
+                cur.device = "cpu"
+                self.demotions += 1
+
+    def _promote(self, key: str, entry):
+        """Move a demoted frame back to its home device and return the promoted master, or the
+        entry's current tensor if it cannot be moved.
+
+        Called from `get` on a hit, OUTSIDE the lock — it is an H2D copy (11.1 ms at 4K),
+        exactly the class of work the lock rule excludes. The re-entry check under the lock is
+        what makes that safe: if the entry changed while we copied, the copy is discarded."""
+        import torch
+        src, home = entry.tensor, entry.home
+        try:
+            with torch.inference_mode():
+                dev = torch.device(home)
+                moved = torch.empty(src.shape, dtype=src.dtype, device=dev)
+                moved.copy_(src)
+        except Exception:
+            return src                                # stay on the CPU; a hit is still a hit
+        with self._lock:
+            cur = self._ram.get(key)
+            if cur is not entry:
+                # The entry was replaced or evicted while we copied. `moved` still holds THIS
+                # entry's pixels at THIS entry's representation, which is what `get`'s captured
+                # `orig_dtype` describes — handing back the new entry's tensor instead would
+                # pair one frame's bytes with another frame's unpack.
+                return moved
+            if cur.device == home:
+                return cur.tensor                     # another thread promoted it first
+            self._bytes_by_dev[_dev_bucket(cur.device)] -= cur.nbytes
+            self._bytes_by_dev[_dev_bucket(home)] += cur.nbytes
+            cur.tensor = moved
+            cur.device = home
+            self.promotions += 1
+            return moved
 
     def _drain_spills(self) -> None:
         """Write out entries evicted under the lock. Called by the PUBLIC methods, after they
@@ -482,6 +831,8 @@ class ResultCache:
 
         A frame whose spill fails is simply gone, which is the pre-existing contract — a miss
         recooks."""
+        if self._lock.depth:
+            return                # a composite (patch_region) holds the lock; it drains after
         while True:
             with self._lock:
                 if not self._pending_spills:
@@ -505,7 +856,7 @@ class ResultCache:
         Caller holds `_lock`."""
         entry = self._ram.pop(key, None)
         if entry is not None:
-            self._bytes_by_dev[_dev_bucket(entry[3])] -= entry[2]
+            self._bytes_by_dev[_dev_bucket(entry.device)] -= entry.nbytes
         return entry
 
     def _enforce_ram_budget(self) -> None:
@@ -528,35 +879,64 @@ class ResultCache:
         buffer would deserialize pageable anyway.)"""
         try:
             import torch
-            tensor = entry[0]
+            tensor = entry.tensor
             # A normal, contiguous CPU copy for serialization in ONE host-visible copy. A frozen
             # (inference) entry can't be pickled, and `.to("cpu")` on an already-CPU frame is a
             # no-op view — so a naive `.to("cpu").clone()` costs two host memcpys on CPU frames and
             # a redundant H2H clone on CUDA ones. Copy into a fresh normal (non-inference) buffer
             # instead: empty() outside inference_mode is mutable/picklable, and one copy_ does the
             # (D2H or H2H) move — the clone that only existed to strip the inference flag is gone.
-            cpu_t = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
-            cpu_t.copy_(tensor)
-            rec = {"t": cpu_t, "device": entry[3], "canvas": entry[4], "epoch": env_epoch()}
+            #
+            # XPU-2: for a CUDA frame that copy is a D2H, and `egress` issues it asynchronously
+            # so `_disk_path`/`getsize` overlap it. The fence is `handle.tensor()` below, before
+            # a single byte is read — which is the whole contract, and the reason this is the
+            # one D2H in the tree that is allowed to be non-blocking (a bare tensor has no way
+            # to say "not yet"; a handle has nowhere to be read from that does not wait first).
+            from .tex_runtime.streams import egress
+            handle = egress(tensor)
+            # PREC-1: `orig` travels with the frame. Without it a restored half frame would be
+            # served AS half — the dtype change `get` exists to hide would leak out through the
+            # disk tier only, i.e. intermittently, on eviction, which is the worst shape a bug
+            # can have. It also means a preview frame occupies half the DISK too, for free.
+            # `device` is the HOME device, not the one the frame happens to be sitting on: a
+            # demoted CUDA frame that then spills must come back from disk as a CUDA frame, or
+            # the residency ladder would quietly turn into a one-way trip to the CPU.
             path = self._disk_path(key)
             # A key can spill again after a restore (restore leaves the .frame on disk), so the
             # write may OVERWRITE an existing file — measure the old size first and apply the NET
             # delta, or the running total over-counts and forces needless reconciling scans.
+            # This is also the work that now overlaps the in-flight D2H: two filesystem syscalls,
+            # issued while the DMA engine copies.
             prev = 0
             if self._disk_bytes is not None:
                 try:
                     prev = os.path.getsize(path)
                 except OSError:
                     prev = 0
+            rec = {"t": handle.tensor(),        # ← THE FENCE. Nothing above reads the bytes.
+                   "device": entry.home, "canvas": entry.canvas, "epoch": env_epoch(),
+                   "orig": _dtype_tables()[0].get(entry.orig_dtype)}
             _atomic_pickle(path, rec)
             self.spills += 1
-            if self._spilled is not None:
-                self._spilled.add(key)      # still unknown (None) stays unknown, not {this key}
-            if self._disk_bytes is not None:            # keep the running total current
-                try:
-                    self._disk_bytes += os.path.getsize(path) - prev
-                except OSError:
-                    self._disk_bytes = None             # lost track: force a reconciling scan
+            # P0-6: the INDEX MUTATIONS GO UNDER THE LOCK. The file write above stays outside it
+            # (that is the whole point of the drain path), but `_spilled` and `_disk_bytes` are
+            # shared state and were being mutated with no lock at all — so `reindex_disk`, whose
+            # scandir also runs unlocked by design, could scan, miss this key, and then REBIND
+            # `_spilled` to the scanned set. The frame is then on disk, absent from the
+            # membership set, and `_restore` short-circuits on that set without ever stat-ing:
+            # unserveable, unreachable by the epoch cleanup, and `_disk_bytes` under-counts it
+            # by exactly its size, forever. Demonstrated deterministically.
+            #
+            # `reindex_disk` additionally MERGES rather than rebinds (see it), so the two halves
+            # of the fix close the window from both sides.
+            with self._lock:
+                if self._spilled is not None:
+                    self._spilled.add(key)  # still unknown (None) stays unknown, not {this key}
+                if self._disk_bytes is not None:        # keep the running total current
+                    try:
+                        self._disk_bytes += os.path.getsize(path) - prev
+                    except OSError:
+                        self._disk_bytes = None         # lost track: force a reconciling scan
             self._enforce_disk_budget()
         except Exception:
             pass
@@ -608,8 +988,16 @@ class ResultCache:
                 else:
                     tensor = host.to(dev)
             self.restores += 1
-            self.put(key, tensor, canvas=rec.get("canvas"))   # already frozen: put() no-op-freezes
-            return self._ram[key][0] if key in self._ram else tensor
+            # `_admit`, not `put`: the representation was decided when this frame was spilled and
+            # is recorded in the file. Re-running the policy would ask about a tensor whose
+            # cooked dtype no longer exists to be asked about.
+            # A NAME LOOKUP, not `getattr(torch, <string off disk>)`: the spill record is data,
+            # and an unknown name resolves to "stored as cooked" rather than to whatever
+            # attribute happens to answer to it.
+            orig = rec.get("orig")
+            self._admit(key, tensor, rec.get("canvas"),      # already frozen: _admit no-op-freezes
+                        _dtype_tables()[1].get(orig), home=dev)
+            return self._ram[key].tensor if key in self._ram else tensor
         except Exception:
             return None
 
@@ -665,28 +1053,47 @@ class ResultCache:
             return self._bytes_by_dev["cuda" if dev_type == "cuda" else "cpu"]
 
     def evict_bytes(self, need: int, *, dev_type: str | None = None, playhead=None) -> int:
-        """CACHE-5 evict hook: spill LRU frames on `dev_type` to disk until ~`need` bytes are
-        freed; returns bytes freed. Never drops the whole cache (leaves ≥1 entry so a just-served
-        frame survives). `playhead` is accepted for a future far-from-playhead ordering; today the
-        LRU front already approximates it (a scrub touches near-playhead frames most recently)."""
+        """CACHE-5 evict hook: free ~`need` bytes on `dev_type`; returns bytes freed. Never drops
+        the whole cache (leaves ≥1 entry so a just-served frame survives). `playhead` is accepted
+        for a future far-from-playhead ordering; today the LRU front already approximates it (a
+        scrub touches near-playhead frames most recently).
+
+        CACHE-8: when the residency tier is ARMED and the governor is asking for VRAM, the
+        coldest CUDA frames are DEMOTED to host RAM first. That frees exactly the bytes the
+        governor asked for — VRAM ones — at 10.8 ms/frame at 4K instead of 204 ms, and the frame
+        survives as a cache hit rather than becoming a 36 ms disk read. Only what demotion cannot
+        cover is spilled. With the tier disarmed this is v0.32's behaviour, unchanged: "off"
+        means the cache does not move frames between devices, not that it moves them silently."""
         with self._lock:
             if need <= 0:
                 return 0
             freed = 0
-            # snapshot LRU order (oldest first) so mutation during iteration is safe
+            if dev_type == "cuda" and self._vram_budget is not None:
+                freed += self._queue_demotions(need)
+            # snapshot LRU order (oldest first) so mutation during iteration is safe. Entries
+            # already queued for demotion are skipped: their bytes are counted once, and
+            # spilling one would race the drain for the same frame.
+            queued = {k for k, _e in self._pending_demotes}
             for key in list(self._ram.keys()):
                 if freed >= need or len(self._ram) <= 1:
                     break
                 entry = self._ram.get(key)
-                if entry is None:
+                if entry is None or key in queued:
                     continue
-                if dev_type is not None and _dev_bucket(entry[3]) != dev_type:
+                if dev_type is not None and _dev_bucket(entry.device) != dev_type:
                     continue
-                nbytes = entry[2]
+                nbytes = entry.nbytes
                 self._remove(key)
                 self.evictions += 1
                 self._pending_spills.append((key, entry))
                 freed += nbytes
+        # BOTH drains outside the lock, in ladder order. A demotion is the cheaper rung and is
+        # what the governor was really asking for on CUDA; the spill is the fallback for what it
+        # could not cover. `freed` counts the demotions before the drain runs, deliberately: the
+        # hook's contract is "how many bytes will you release", the drain is unconditional from
+        # here, and making `arbitrate()` block on a full-frame D2H would put exactly the copy
+        # inside the eviction loop that the lock rule exists to keep out of it.
+        self._drain_demotes()         # VRAM -> host RAM: the frame stays a cache hit
         self._drain_spills()          # to disk (best-effort) — a miss just recooks
         return freed
 
@@ -728,22 +1135,51 @@ class ResultCache:
         except OSError:
             total = None                # lost track: let the next spill reconcile
         with self._lock:
-            self._disk_bytes = total
-            # A fresh process over a populated dir starts at `unknown`; this walk is where it
-            # learns the tier's real contents — precisely the ENG-13 reattach path.
-            self._spilled = found if total is not None else None
+            # P0-6: MERGE, never rebind. The scandir above runs unlocked by design, so a
+            # concurrent `_spill` can land a frame between the scan and this block. Rebinding
+            # `_spilled` to the scanned set would then FORGET that frame — and `_restore`
+            # short-circuits on the membership set without stat-ing, so the file becomes
+            # unserveable and unreachable by the epoch cleanup while `_disk_bytes` under-counts
+            # it by exactly its size. The frame is on disk forever and nothing can see it.
+            #
+            # Merging is the conservative direction the whole `_spilled` design already uses: a
+            # stale TRUE costs one syscall in `_restore`, a stale ABSENCE loses a frame. Union
+            # with whatever the spiller recorded, and prefer `unknown` (None) over a definite
+            # wrong answer when the scan itself failed.
+            if total is None:
+                self._disk_bytes = None
+                self._spilled = None
+            else:
+                # Anything the spiller recorded that the scan did not see landed DURING the
+                # scan. Those keys are kept, and their bytes are unknown to us — so the total
+                # drops to `None` (rescan next time) rather than to a confidently wrong number.
+                missed = (self._spilled - found) if self._spilled is not None else set()
+                self._spilled = found | missed
+                self._disk_bytes = total if not missed else None
         return n, nbytes
 
     def stats(self) -> dict:
         with self._lock:
             return {"ram_entries": len(self._ram), "ram_bytes": self._ram_bytes,
                     "budget_bytes": self._budget, "hits": self.hits, "misses": self.misses,
-                    "spills": self.spills, "restores": self.restores, "evictions": self.evictions}
+                    "spills": self.spills, "restores": self.restores, "evictions": self.evictions,
+                    # CACHE-8. `demoted` is what the residency tier is currently HOLDING off the
+                    # GPU; the counters are what it has DONE. Both, because a tier that is
+                    # working and a tier that is thrashing look identical in either one alone.
+                    "vram_bytes": self._bytes_by_dev["cuda"],
+                    "vram_budget_bytes": self._vram_budget,
+                    "demotions": self.demotions, "promotions": self.promotions,
+                    "demoted": sum(1 for e in self._ram.values() if e.device != e.home)}
 
     def clear(self, *, disk=False) -> None:
         with self._lock:
             self._ram.clear()
             self._bytes_by_dev = {"cuda": 0, "cpu": 0}      # `_ram_bytes` derives from this
+            # Both drain queues hold entries that no longer exist. `_drain_demotes` re-checks
+            # identity and would drop them anyway, but a queued spill is written unconditionally
+            # — a cleared cache must not keep writing the frames it just forgot.
+            self._pending_demotes.clear()
+            self._pending_spills.clear()
         if not disk:
             return
         # The unlink loop runs OUTSIDE the lock (see the rule on __init__) — N os.remove calls

@@ -104,6 +104,18 @@ silent-wrong result.
 - `tex_marshalling` numpy-free `struct.pack` fingerprint (invariant #1).
 - `optimizer.py` noise excluded from the CSE-pure whitelist (pending a determinism audit).
 - `interpreter.py` `_literal_cache` persists across executions; spatial-if short-circuit (break/continue correctness).
+- `tex_results` **entry slot 6 (`home`) is not slot 3 (`device`)** (v0.33 CACHE-8). Slot 3 is where
+  a frame *is*, slot 6 where it *belongs*; they differ exactly while a frame is demoted to host
+  RAM. `_spill` must persist slot **6**, or a demoted-then-spilled CUDA frame restores as a CPU
+  frame and the residency ladder becomes a one-way trip, visible only under memory pressure.
+- `tex_results._defer_drain` (v0.33) — `patch_region` holds `_lock` across a nested `put` for
+  atomicity, so that `put`'s drains would run a disk write and a D2H **under the lock**, which is
+  precisely what the lock rule forbids. The thread-local defers them; `patch_region` drains after
+  releasing. Removing it does not fail a test — it silently reintroduces the 327–496 ms stalls.
+- `tex_runtime/streams.egress(staging=False)` (v0.33 XPU-2) — not a perf hint. A **retained**
+  destination must not be page-locked (unswappable pages + torch's caching host allocator holds
+  freed blocks for the process lifetime); the pinned-then-clone alternative costs a second full
+  host memcpy of the frame. The demote path passes it deliberately.
 
 **Config escape hatches (keep even though never set normally):**
 `TEX_CODEGEN_NO_OUT_REUSE` / `_OUT_REUSE_ENABLED`, `TEX_CACHE_BUDGET_MB`, the

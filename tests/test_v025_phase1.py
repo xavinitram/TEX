@@ -302,7 +302,7 @@ def test_cache2_hit_is_bit_exact(r: SubTestResult):
             # NOT the stored buffer — so a consumer's in-place write cannot corrupt the cache. (A
             # frozen frame is NOT write-proof on torch 2.12: an in-place op lands the write, then
             # raises. verify_unmutated can't catch that on a frozen master — copy-on-read is what does.)
-            assert got is not c._ram[key][0], "default get() returned the stored buffer (not a copy)"
+            assert got is not c._ram[key].tensor, "default get() returned the stored buffer (not a copy)"
             snapshot = frame.clone()
             try:
                 got.mul_(0.0)            # a consumer mutates the served frame (would corrupt a shared buffer)
@@ -312,7 +312,7 @@ def test_cache2_hit_is_bit_exact(r: SubTestResult):
             assert torch.equal(again, snapshot), "the cache was corrupted by a write to a served frame"
             # copy=False is the opt-in zero-copy path: it hands back the frozen master.
             master = c.get(key, copy=False)
-            assert master is c._ram[key][0] and tex_engine.is_frozen(master), \
+            assert master is c._ram[key].tensor and tex_engine.is_frozen(master), \
                 "copy=False did not return the frozen master"
             r.ok(f"[{dev}] hit bit-exact; copy-on-read protects the cache; copy=False = the master")
         except Exception as e:
@@ -363,7 +363,12 @@ def test_cache2_verify_drop_and_replace(r: SubTestResult):
         normal = torch.rand(1, 8, 8, 4)
         stamp = tex_engine.frame_version(normal)
         nbytes = normal.untyped_storage().nbytes()
-        c._ram["k"] = [normal, stamp, nbytes, str(normal.device), None]
+        # A real `_Entry`, not a positional list. `orig_dtype=None` means "stored exactly as
+        # cooked" (PREC-1) and `home` is where the frame belongs (CACHE-8) — naming them is the
+        # whole reason the entry stopped being a list one release after it grew a second
+        # device-string field.
+        c._ram["k"] = R._Entry(normal, stamp, nbytes, str(normal.device), None, None,
+                               str(normal.device))
         # This row hand-builds an entry rather than going through put(), so it must also do
         # put()'s accounting. `_ram_bytes` is DERIVED from the per-device totals — there is one
         # place bytes are recorded, so this is it.

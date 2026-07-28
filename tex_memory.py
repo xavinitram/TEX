@@ -576,23 +576,56 @@ def register_result_cache(cache, *, name: str = "results", evict_order: int = 50
 #: name -> the knobs a preset bundles. `frame_mb`/`governor_mb` are None = "leave the existing
 #: default alone", which is what makes BALANCED a true no-op rather than a re-statement of
 #: numbers that would then drift from their real defaults.
+#
+# v0.33 adds `vram_mb`, CACHE-8's residency ceiling. It is the knob the v0.32 item text
+# reserved as "compression aggressiveness (from v0.33)" — and it is NOT that, because the
+# measured Pareto said so. `benchmarks/cache_capacity_bench.py` found a general-purpose codec
+# costs 871-4126 ms to encode and 199-565 ms to DECODE a 4K frame, against 204 ms to write the
+# frame to disk uncompressed and 36 ms to read it back: an aggressiveness dial would only have
+# selected degrees of loss. What actually buys capacity is width (PREC-1's fp16, exactly 2x)
+# and residency (a cold CUDA frame moved to host RAM for 10.8 ms instead of spilled for 204),
+# so the profile carries the knob that exists rather than the one that was predicted.
 _PROFILES = {
     # Hold more, evict later: the interactive editing session the Memory report describes,
     # where a frame you scrubbed past is one the user is about to scrub back to.
-    "performance": {"frame_mb": 4096, "governor_frac": 0.60, "checkpoint_ms": 50.0},
+    "performance": {"frame_mb": 4096, "governor_frac": 0.60, "checkpoint_ms": 50.0,
+                    "vram_mb": 2048},
     # The shipped defaults, named so a host can ask for them explicitly and so
     # `active_profile()` always has something honest to report.
-    "balanced":    {"frame_mb": None, "governor_frac": None, "checkpoint_ms": 100.0},
-    # Give memory back: a batch/headless run, or a box sharing VRAM with a model.
-    "efficient":   {"frame_mb": 512,  "governor_frac": 0.25, "checkpoint_ms": 250.0},
+    "balanced":    {"frame_mb": None, "governor_frac": None, "checkpoint_ms": 100.0,
+                    "vram_mb": None},
+    # Give memory back: a batch/headless run, or a box sharing VRAM with a model. The tightest
+    # residency ceiling, because this is the profile chosen precisely when something else on
+    # the box wants the GPU.
+    "efficient":   {"frame_mb": 512,  "governor_frac": 0.25, "checkpoint_ms": 250.0,
+                    "vram_mb": 256},
 }
 
 _active_profile: str = "balanced"
-#: cache -> the `_budget` it had when the governor first saw it. `frame_mb: None` means "the
-#: shipped default", and the only way to RESTORE a default is to have remembered it: without
-#: this, switching efficient -> balanced left the 512 MB budget in place while `tex doctor`
-#: reported `balanced`, i.e. the report described a profile that was not being enforced.
+#: cache -> {knob: the value it had when the governor first saw it}. A `None` in a profile means
+#: "the shipped default", and the only way to RESTORE a default is to have remembered it:
+#: without this, switching efficient -> balanced left the 512 MB budget in place while
+#: `tex doctor` reported `balanced`, i.e. the report described a profile that was not enforced.
+#:
+#: It is a dict-of-dicts rather than the single `_budget` int it started as because v0.33 adds a
+#: second restorable knob. Remembering one default per cache would have let `balanced` restore
+#: the frame budget and silently leave the residency ceiling wherever `efficient` put it —
+#: the same bug, one knob over.
 _armed_caches: "dict" = {}
+
+#: How a profile knob reaches a `ResultCache`:
+#:   knob name -> (setter method, attribute holding the current value, restorable-as-None)
+#:
+#: The third element is what keeps the apply loop free of knob NAMES. `vram_mb`'s shipped
+#: default IS None (residency off), so `balanced` restores it by setting None; `frame_mb`'s
+#: default is a byte count and `set_budget(None)` is not a thing, so an unknown default means
+#: "leave it alone". Spelling that difference as a `knob == "frame_mb"` test inside the loop
+#: made the table's own promise false — "adding a third is one row here and one row in every
+#: `_PROFILES` entry, not an edit to the apply logic".
+_CACHE_KNOBS = {
+    "frame_mb": ("set_budget", "_budget", False),
+    "vram_mb": ("set_vram_budget", "_vram_budget", True),
+}
 
 
 def profiles() -> tuple:
@@ -635,26 +668,34 @@ def checkpoint_threshold_ms() -> float:
     return float(_PROFILES[_active_profile]["checkpoint_ms"])
 
 
+
 def _apply_profile_to_cache(cache) -> None:
-    """Push the active profile's frame budget into one `ResultCache`, and remember it so a
-    later `set_profile` reaches it too. Best-effort: a host may arm something that only
-    duck-types the governor hooks."""
+    """Push every profile knob the active preset names into one `ResultCache`, and remember the
+    shipped defaults so a later `set_profile` can put them back. Best-effort: a host may arm
+    something that only duck-types the governor hooks."""
     if cache not in _armed_caches:
-        # Remember the shipped default the FIRST time we see this cache, before any preset has
-        # touched it — that is the only moment it is still knowable.
-        _armed_caches[cache] = getattr(cache, "_budget", None)
-    mb = _PROFILES[_active_profile].get("frame_mb")
-    try:
+        # Remember the shipped defaults the FIRST time we see this cache, before any preset has
+        # touched it — that is the only moment they are still knowable.
+        _armed_caches[cache] = {knob: getattr(cache, attr, None)
+                                for knob, (_setter, attr, _n) in _CACHE_KNOBS.items()}
+    defaults = _armed_caches[cache]
+    knobs = _PROFILES[_active_profile]
+    for knob, (setter_name, _attr, none_restorable) in _CACHE_KNOBS.items():
+        setter = getattr(cache, setter_name, None)
+        if setter is None:
+            continue                # an older duck-typed cache: skip the knob, keep the rest
+        mb = knobs.get(knob)
         if mb is None:
             # "the shipped default" is a real setting to RESTORE, not an instruction to skip:
             # a host switching back to `balanced` must actually get the default back.
-            default = _armed_caches.get(cache)
-            if default is not None:
-                cache.set_budget(default / (1 << 20))
-        else:
-            cache.set_budget(mb)    # public seam: takes the cache's own lock, enforces now
-    except Exception:
-        pass
+            default = defaults.get(knob)
+            if default is None and not none_restorable:
+                continue            # no remembered byte budget to restore; leave it alone
+            mb = None if default is None else default / (1 << 20)
+        try:
+            setter(mb)              # public seam: takes the cache's own lock, enforces now
+        except Exception:
+            pass
 
 
 def _reset_profile_for_test() -> None:

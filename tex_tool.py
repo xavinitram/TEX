@@ -721,7 +721,10 @@ def write_tool(manifest_or_dict, dest_dir: str | None = None) -> str:
                                    f"different tool ('{existing.get('name')}'); rename this one")
         except (OSError, json.JSONDecodeError):
             pass                                # unreadable/corrupt existing file: overwrite it
-    fd, tmp = tempfile.mkstemp(dir=dest_dir, suffix=".tmp")
+    # BOUNDED (P0-7): see `tex_recovery.bounded_mkstemp` — an ACL-denied directory makes a
+    # bare `mkstemp` retry ~2.1 billion times rather than raise.
+    from .tex_recovery import bounded_mkstemp
+    fd, tmp = bounded_mkstemp(dir=dest_dir, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(raw, fh, indent=2, ensure_ascii=False)

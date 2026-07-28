@@ -25,6 +25,12 @@ this item:
    happens — replacing five near-identical private copies, and applying the flush where it
    earns its cost (see its `fsync=` note: a re-derivable measurement cache does not).
 
+   SCOPE OF "the single place", stated exactly because it was once broader than it was true:
+   `atomic_write` is the single place the *fsync-before-rename* discipline happens. Temp-file
+   CREATION has two further callers that do not route through it (`tex_snippets`, `tex_tool`) —
+   they now share `bounded_mkstemp` instead, which is the single place the P0-7 retry bound
+   lives. Two disciplines, two single places; neither claims the other's callers.
+
    HONEST PLATFORM NOTE: the fsync makes the *file's* bytes durable. Making the *rename*
    durable additionally needs an fsync of the containing directory, which POSIX supports and
    Windows does not. So on Windows the machine-crash guarantee is "the file is never torn",
@@ -87,6 +93,40 @@ def sweep_temps(directory: str) -> int:
 # ── the one durable atomic write ─────────────────────────────────────────────
 
 
+#: How many names `bounded_mkstemp` will try before giving up. `tempfile.TMP_MAX` is
+#: 2,147,483,647 — a number chosen for "we will never realistically collide", which is the
+#: right bound for COLLISIONS and catastrophically wrong for a directory that rejects every
+#: name. Two is enough to ride out a genuine collision; anything beyond that is a wall.
+_MKSTEMP_TRIES = 2
+
+
+def bounded_mkstemp(**kw):
+    """`tempfile.mkstemp(**kw)` with a BOUNDED retry. Returns `(fd, path)`; raises otherwise.
+
+    THE BUG THIS EXISTS FOR. On Windows, `mkstemp` retries `TMP_MAX` times on `PermissionError`,
+    because on nt that error usually means "name collided with a directory". But an existing
+    directory whose ACL denies write raises `PermissionError` for EVERY name — and
+    `os.access(dir, W_OK)`, the obvious pre-check, returns True there because it only consults
+    FILE_ATTRIBUTE_READONLY and never the ACL. So the loop runs ~2.1 billion times: `put()`
+    hangs effectively forever, on the ONE path a ComfyUI user can reach.
+
+    The spill contract is best-effort — "a failed spill just drops the frame, the cook
+    reproduces it". A hang is not a degraded spill; it is the opposite of one. Bounding the
+    retry converts the unreachable directory into the exception the callers already handle,
+    and names the directory so the failure is diagnosable rather than mysterious.
+    """
+    last = None
+    for _ in range(_MKSTEMP_TRIES):
+        try:
+            return tempfile.mkstemp(**kw)
+        except PermissionError as e:
+            last = e
+    raise PermissionError(
+        f"could not create a temp file in {kw.get('dir', '.')!r} after {_MKSTEMP_TRIES} "
+        f"attempts — the directory exists but rejects writes (an ACL denial reads as "
+        f"PermissionError on every candidate name, and os.access() cannot see it)") from last
+
+
 def atomic_write(path: str, write, *, fsync: bool = False) -> bool:
     """Write to `path` atomically, and durably when `fsync`.
 
@@ -118,8 +158,8 @@ def atomic_write(path: str, write, *, fsync: bool = False) -> bool:
     the weaker form would have generalized downward."""
     fd = tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
-                                   prefix=TMP_PREFIX, suffix=".tmp")
+        fd, tmp = bounded_mkstemp(dir=os.path.dirname(path) or ".",
+                                  prefix=TMP_PREFIX, suffix=".tmp")
         with os.fdopen(fd, "wb") as f:
             fd = None                   # fdopen owns it now; closing twice is an error
             if callable(write):

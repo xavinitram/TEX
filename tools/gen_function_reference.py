@@ -100,8 +100,26 @@ def generate():
 
 
 if __name__ == "__main__":
+    import sys
+    # `--check` used to be accepted and SILENTLY IGNORED — the flag rewrote the file and
+    # reported success, so a CI drift gate built on it would have passed on stale output. Drift
+    # is separately guarded by the DOC-4 suite test, which is why nothing broke; a CLI that
+    # lies is a defect anyway (P0-9). Matches gen_error_codes.py's contract exactly.
+    _out = os.path.join(ROOT, "Function-Reference.md")
     md, documented, reg_names = generate()
-    with open(os.path.join(ROOT, "Function-Reference.md"), "w", encoding="utf-8") as f:
+    if "--check" in sys.argv:
+        try:
+            stale = open(_out, encoding="utf-8").read() != md
+        except FileNotFoundError:
+            print("Function-Reference.md missing — run tools/gen_function_reference.py")
+            raise SystemExit(1)
+        if stale:
+            print("Function-Reference.md is stale — regenerate with "
+                  "tools/gen_function_reference.py")
+            raise SystemExit(1)
+        print(f"Function-Reference.md up to date ({len(documented)} functions)")
+        raise SystemExit(0)
+    with open(_out, "w", encoding="utf-8") as f:
         f.write(md)
     print(f"wrote Function-Reference.md: {len(documented)}/{len(reg_names)} functions documented")
     miss = sorted(reg_names - documented)

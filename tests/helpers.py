@@ -62,6 +62,7 @@ __all__ = [
     # Test helpers
     "SubTestResult", "compile_and_run", "compile_and_infer", "check_code",
     "run_both", "assert_equiv", "check_val", "make_img", "make_latent",
+    "make_gradient_frame", "devices",
     "cold_engine_state", "lint_sources", "armed_profiler",
     "_MAX_LOOP_ITERATIONS",
 ]
@@ -308,6 +309,32 @@ def make_latent(B=1, C=4, H=4, W=4, seed=42) -> dict:
     """Fake LATENT dict with 'samples' key in [B,C,H,W] layout."""
     torch.manual_seed(seed)
     return {"samples": torch.rand(B, C, H, W)}
+
+
+def make_gradient_frame(res=64, c=4, device="cpu", scale=1.0) -> torch.Tensor:
+    """A smooth [1,res,res,c] frame — NOT `make_img`'s white noise.
+
+    Deliberately a second frame builder rather than a seed on the first. Anything that measures
+    a STORAGE representation (PREC-1's fp16/uint16 error, CACHE-8's compression ratios) is
+    misled by noise in both directions: white noise is incompressible, and its values are spread
+    across the top binade almost everywhere, so it flatters no codec and represents no frame a
+    compositor holds. `scale` pushes the range past 1.0 for the scene-linear rows.
+
+    Lives here because three v0.33 files hand-rolled it, two of them with the arguments in a
+    different order — which is exactly the shape that produces a silent wrong-device call at the
+    fourth copy."""
+    g = torch.linspace(0.0, 1.0, res, device=device)
+    y, x = torch.meshgrid(g, g, indexing="ij")
+    return (torch.stack([x, y, x * y, torch.ones_like(x)], dim=-1)[..., :c]
+            .unsqueeze(0) * scale).contiguous()
+
+
+def devices() -> list:
+    """`["cpu"]`, plus `"cuda"` when there is a GPU. The repo's device-loop idiom, spelled once.
+
+    A device LOOP, not a skip: a CUDA-less box runs every row it can rather than reporting a
+    skip that hides which half was checked."""
+    return ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
 class cold_engine_state:

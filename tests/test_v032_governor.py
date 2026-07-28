@@ -260,7 +260,7 @@ def test_v032_gov1_governed_bytes_never_drifts(r: SubTestResult):
         cache.put(f"k{i}", frame)
 
     def _truth():
-        return sum(e[2] for e in cache._ram.values())
+        return sum(e.nbytes for e in cache._ram.values())
 
     got, want = cache.governed_bytes("cpu"), _truth()
     if got == want:

@@ -199,10 +199,16 @@ region_recook_bench.py`.
 The second half — "RAM stays under the governor budget" — needs one honest qualification: the
 CACHE-5 governor is **host-driven**. `arbitrate()` is a call a host makes at its own safe
 points, never a background thread (invariant #7 keeps everything off the default cook path).
-Undriven, the comp's frame cache holds **1984 MB**; one `arbitrate()` frees **1920 MB**,
-leaving **64 MB** against a 1024 MB (CPU) / 744 MB (CUDA) budget. Both numbers are reported,
+Undriven, the comp's frame cache holds **1984 MB**; one `arbitrate()` leaves **960 MB** (CPU,
+against a 1024 MB budget) / **704 MB** (CUDA, against 744 MB). Both numbers are reported,
 because quoting only the second would claim a guarantee the engine does not make, and quoting
 only the first would call a host's omission an engine failure.
+
+*(Corrected in v0.33. This paragraph previously read "frees 1920 MB, leaving 64 MB" — which was
+the governor being LIED TO: `_remove` forgot the per-device total, so `governed_bytes` reported
+16000 MB for 1984 MB held and the governor evicted to the one-entry floor. That is a 16x
+over-eviction wearing the costume of a governor landing exactly on budget. The accounting fix
+and the corrected landing are in the v0.32 CHANGELOG.)*
 
 **4K is not measured here, and the reason is arithmetic, not laziness.** This comp keeps one
 full canvas per stage; at 4096² that is 268 MB × 50 = **13.4 GB**, which fits neither the 8 GB

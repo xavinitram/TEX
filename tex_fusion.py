@@ -28,9 +28,15 @@ from typing import Any, Callable
 
 # FUS-1: cap how large a single fused region can grow. A 50-node region compiles into
 # ONE torch.compile program (longer trace, bigger capture) and materializes full-res
-# intermediates (CACHE-6 hasn't landed) — Blender and torch.compile both cap their fuse
+# intermediates — Blender and torch.compile both cap their fuse
 # units for the same reason. Past the cap the region is left unfused (the linear pass
 # still fuses sub-chains); safe, just not one giant program.
+#
+# The original text justified the cap partly by "CACHE-6 hasn't landed" — it landed in v0.27,
+# and CACHE-7 generalized it in v0.32, so that half of the rationale is spent. What still
+# stands is trace/capture size. Whether 16 is still the right number is a MEASUREMENT nobody
+# has taken: at N=17 a linear chain yields ZERO fusable regions, which is a cliff, not a taper.
+# Doc 41 §3.5 schedules the decision spike.
 _MAX_FUSED_REGION_STAGES = 16
 
 logger = logging.getLogger("TEX.fusion")
@@ -956,6 +962,47 @@ def suffix_stage_list(stages: list[dict], k: int, boundary_value) -> list[dict]:
     first = {**head, "chain_input": None,
              "bindings": {**(head.get("bindings") or {}), chain_binding: boundary_value}}
     return [first] + [dict(st) for st in stages[k + 1:]]
+
+
+# ── P0-5: taps are named POSITIONALLY, and a suffix renumbers ────────────────
+# `compile_fused` exports a tapped stage as `@_tap_s{i}` where `i` is its index IN THE LIST IT
+# WAS HANDED. `suffix_stage_list` hands it `[rebased stages[k]] + stages[k+1:]`, so the stage
+# that was `k+j` is now `j` and its tap comes back as `_tap_s{j}`. Measured: a plain cook
+# returned `['OUT', '_tap_s1']`; the same chain through `cook_fused_cached(k=2)` returned
+# `['OUT', '_tap_s0']` — a RENAMED output, which shifts a host's output slots — and
+# `cook_checkpointed(cuts=[2])` returned `['OUT']`, silently DROPPING it.
+#
+# Both are contract breaks: `cook_checkpointed` documents "same as `cook_stage_list`".
+
+
+def remap_suffix_taps(outputs: dict, k: int) -> dict:
+    """Rename the `_tap_s{j}` keys of a SUFFIX cook back to original stage indices (`k + j`).
+
+    Applied at the serve seam rather than inside `suffix_stage_list`, because the renumbering
+    is a property of the cook that was run, and only the server knows both the cut and the
+    result."""
+    if not k:
+        return outputs
+    out = {}
+    for name, val in outputs.items():
+        if name.startswith("_tap_s"):
+            try:
+                out[f"_tap_s{int(name[len('_tap_s'):]) + k}"] = val
+                continue
+            except ValueError:
+                pass
+        out[name] = val
+    return out
+
+
+def unservable_prefix_taps(stages, k: int) -> list:
+    """The tapped stage indices BELOW cut `k` that a suffix cook cannot produce.
+
+    Stage `k-1` is exempt: its output IS the boundary the checkpoint serves, so its tap is
+    available for free. Anything deeper is inside the served prefix and was never cooked — and
+    dropping an output the caller asked for is not the cheaper cook's decision to make, so a
+    non-empty result means REFUSE this cut and cook whole."""
+    return [i for i in range(max(0, k - 1)) if stages[i].get("tap")]
 
 
 # ── FUS-1: DAG-region detection (the host-agnostic fusion authority) ──────────
