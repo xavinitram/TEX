@@ -862,6 +862,89 @@ def main():
     test_v031_noise_scalar_coord_shipped_example(r)
     test_v031_noise_scalar_coord_helpers_are_noops(r)
 
+    # v0.32 CACHE-7 — effort-based checkpoint placement (docs/effort-based-checkpoints.md).
+    from test_v032_checkpoint import (
+        test_v032_cache7_differential_oracle,
+        test_v032_cache7_fp16_gate_is_lifted_and_exact,
+        test_v032_cache7_boundary_key_carries_resolution,
+        test_v032_cache7_placement_refuses_rather_than_guesses,
+        test_v032_cache7_dag_cut_set_is_analysis_only,
+        test_v032_cache7_one_cook_harvests_every_boundary,
+        test_v032_cache7_serves_the_deepest_cached_checkpoint,
+        test_v032_cache7_upstream_source_key_is_mandatory,
+        test_v032_cache7_result_cache_is_thread_safe,
+        test_v032_cache7_harvest_respects_the_tap_budget,
+        test_v032_cache7_prefix_fingerprint_range_guard,
+        test_v032_cache7_suffix_preserves_stage_keys,
+        test_v032_cache7_precision_must_be_resolved,
+        test_v032_cache7_stage_costs_cross_bucket_fallback,
+        test_v032_cache7_off_the_default_path,
+        test_v032_cache7_refuses_dag_stage_lists,
+        test_v032_cache7_profile_costs_and_confidence_agree,
+    )
+    test_v032_cache7_differential_oracle(r)
+    test_v032_cache7_fp16_gate_is_lifted_and_exact(r)
+    test_v032_cache7_boundary_key_carries_resolution(r)
+    test_v032_cache7_placement_refuses_rather_than_guesses(r)
+    test_v032_cache7_dag_cut_set_is_analysis_only(r)
+    test_v032_cache7_one_cook_harvests_every_boundary(r)
+    test_v032_cache7_serves_the_deepest_cached_checkpoint(r)
+    test_v032_cache7_upstream_source_key_is_mandatory(r)
+    test_v032_cache7_result_cache_is_thread_safe(r)
+    test_v032_cache7_harvest_respects_the_tap_budget(r)
+    test_v032_cache7_prefix_fingerprint_range_guard(r)
+    test_v032_cache7_suffix_preserves_stage_keys(r)
+    test_v032_cache7_precision_must_be_resolved(r)
+    test_v032_cache7_stage_costs_cross_bucket_fallback(r)
+    test_v032_cache7_off_the_default_path(r)
+    test_v032_cache7_refuses_dag_stage_lists(r)
+    test_v032_cache7_profile_costs_and_confidence_agree(r)
+
+    # v0.32 CACHE-9 — region-granular recook (docs/region-granular-recook.md).
+    from test_v032_region import (
+        test_v032_cache9_region_recook_oracle,
+        test_v032_cache9_stale_ring_regression,
+        test_v032_cache9_unbounded_reach_inverts_to_whole_frame,
+        test_v032_cache9_dirty_from_leaves_clean_stages_alone,
+        test_v032_cache9_patch_never_touches_the_cached_master,
+        test_v032_cache9_patch_refuses_a_mismatched_window,
+        test_v032_cache9_provenance_is_in_the_key,
+        test_v032_cache9_second_deeper_edit_needs_valid_regions,
+        test_v032_cache9_patch_region_is_atomic,
+        test_v032_cache9_second_deeper_edit_pixels,
+    )
+    test_v032_cache9_region_recook_oracle(r)
+    test_v032_cache9_stale_ring_regression(r)
+    test_v032_cache9_unbounded_reach_inverts_to_whole_frame(r)
+    test_v032_cache9_dirty_from_leaves_clean_stages_alone(r)
+    test_v032_cache9_patch_never_touches_the_cached_master(r)
+    test_v032_cache9_patch_refuses_a_mismatched_window(r)
+    test_v032_cache9_provenance_is_in_the_key(r)
+    test_v032_cache9_second_deeper_edit_needs_valid_regions(r)
+    test_v032_cache9_patch_region_is_atomic(r)
+    test_v032_cache9_second_deeper_edit_pixels(r)
+
+    # v0.32 GOV-1 — memory/effort profiles on the CACHE-5 governor (S item: designs in the
+    # CHANGELOG entry, per roadmap §10.1).
+    from test_v032_governor import (
+        test_v032_gov1_profile_table,
+        test_v032_gov1_reaches_the_frame_cache_both_orders,
+        test_v032_gov1_tightening_evicts_now,
+        test_v032_gov1_owns_the_checkpoint_threshold,
+        test_v032_gov1_is_named_and_reportable,
+        test_v032_gov1_balanced_restores_the_shipped_budget,
+        test_v032_gov1_governed_bytes_never_drifts,
+        test_v032_gov1_arbitrate_lands_on_budget_not_on_the_floor,
+    )
+    test_v032_gov1_profile_table(r)
+    test_v032_gov1_reaches_the_frame_cache_both_orders(r)
+    test_v032_gov1_tightening_evicts_now(r)
+    test_v032_gov1_owns_the_checkpoint_threshold(r)
+    test_v032_gov1_is_named_and_reportable(r)
+    test_v032_gov1_balanced_restores_the_shipped_budget(r)
+    test_v032_gov1_governed_bytes_never_drifts(r)
+    test_v032_gov1_arbitrate_lands_on_budget_not_on_the_floor(r)
+
     success = r.summary()
     return 0 if success else 1
 

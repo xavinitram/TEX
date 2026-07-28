@@ -778,6 +778,115 @@ def validate_roi(roi) -> str | None:
     return None
 
 
+# ── CACHE-9: chain-level window composition ───────────────────────────────────
+# `roi_plan` answers "what margin does THIS program need". A host recooking a region through a
+# CHAIN of stages needs the composition of those margins, and getting it wrong is silent: patch
+# only the requested rect and every downstream halo op reads a ring of neighbours just outside
+# the patch, which still holds pre-edit pixels. Measured in the demo host before it composed
+# backwards: stage-5 sharpen wrong over 2157 px, stage-9 vignette over 3987 px, on ANY upstream
+# edit. The composition lived only in `examples/host_demo.py`; this is it promoted, so a host
+# gets the two inversions below for free rather than rediscovering them.
+
+#: A reach that clamps to the whole frame. Not `inf` — these are pixel counts that get added to
+#: coordinates, and an `inf` would poison the arithmetic rather than saturate it.
+WHOLE_FRAME = 1 << 30
+
+
+def stage_halo(code: str, param_values: dict | None = None) -> int:
+    """The neighbour reach one stage reads, as a margin in pixels.
+
+    THE INVERSION, and the whole reason this is a function rather than `roi_plan(...).halo`:
+    a NON-EXECUTABLE plan reports `halo = 0`, which is the exact opposite of what it means. It
+    means "there is a gather / an ungrounded halo / a scatter, so cook the whole frame" —
+    unbounded reach, not zero reach. A consumer that trusts that `0` under-grows every upstream
+    window and leaves precisely the stale ring this composition exists to prevent, i.e. it
+    inverts the whitelist posture (unknown → whole image) into its most dangerous form.
+
+    Never raises: `roi_plan` doesn't, and a reach question must always have a conservative
+    answer."""
+    plan = roi_plan(code, param_values or {})
+    return int(plan.halo) if plan.executable else WHOLE_FRAME
+
+
+def covers(valid, needed) -> bool:
+    """Does the region `valid` contain `needed`? `None` means "the whole frame" — a canvas that
+    has only ever been cooked whole is valid everywhere. Pure arithmetic."""
+    if valid is None:
+        return True
+    if needed is None:
+        return False
+    vx, vy, vw, vh = (int(v) for v in tuple(valid)[:4])
+    nx, ny, nw, nh = (int(v) for v in tuple(needed)[:4])
+    return (vx <= nx and vy <= ny
+            and nx + nw <= vx + vw and ny + nh <= vy + vh)
+
+
+def chain_windows(halos, roi, dirty_from: int = 0, valid=None) -> "list | None":
+    """The window each stage of a linear chain must cook so the FINAL window is correct.
+
+    `halos[i]` is stage i's own reach (from `stage_halo`); `roi` is the 6-tuple window wanted
+    out of the LAST stage. Returns one window per stage, `None` for the clean prefix below
+    `dirty_from` (those stages are not cooking at all).
+
+    Walk the suffix BACKWARDS, growing each window by its CONSUMER's halo and clamping to the
+    frame — the same `ROI ⊕ halo` composition `run_roi` performs within one stage, lifted to
+    the chain. Stage i is grown by `halos[i+1]` and not by its own, because the ring stage i
+    must supply is the one its consumer will reach into.
+
+    A `WHOLE_FRAME` reach anywhere saturates: that window clamps to the full frame, and so does
+    every window above it, which is correct and is what makes this safe to call on chains it
+    cannot narrow.
+
+    `valid[i]` is the region canvas `i` is CURRENTLY correct over — `None` for "the whole
+    frame", which is what a canvas cooked whole holds. Supplying it is not optional bookkeeping
+    on a host that edits at more than one position:
+
+        a region cook at `dirty_from=2` leaves canvases 2..n valid only over their composed
+        windows. A LATER edit at `dirty_from=5` reads canvas 4 over a window derived from a
+        different `roi` — and wherever that window escapes the region canvas 4 was patched
+        over, it reads PRE-EDIT pixels. Measured through the documented `dirty_from` usage:
+        2.17e-01 on the second, deeper edit.
+
+    **Returns `None` when the plan cannot be served incrementally at all** — the host must cook
+    the whole chain from the source. Note what does NOT work here, because the first fix for
+    this tried it: widening the returned windows to the full frame is useless. The upstream
+    canvas is not merely being read too narrowly, it is WRONG outside the earlier patch, and no
+    window choice at a downstream stage can repair a stale input. The only correct remedy is to
+    re-cook from far enough upstream, and `chain_windows` does not own `dirty_from` — so it says
+    "not serviceable" and lets the caller do it. (A pixel-level test with a negative control is
+    what caught this; the window-arithmetic test it replaced passed while the pixels were still
+    wrong by 2.17e-01.)
+
+    Pure arithmetic — this module stays torch-free."""
+    n = len(halos)
+    out = [None] * n
+    if n == 0:
+        return out
+    out[n - 1] = canonical_roi(roi)
+    start = max(0, dirty_from)
+    for i in range(n - 2, start - 1, -1):
+        x0, y0, w, h, W, H = out[i + 1]
+        pad = int(halos[i + 1])
+        nx0, ny0 = max(0, x0 - pad), max(0, y0 - pad)
+        nx1, ny1 = min(W, x0 + w + pad), min(H, y0 + h + pad)
+        out[i] = (nx0, ny0, nx1 - nx0, ny1 - ny0, W, H)
+    if valid is not None and start > 0:
+        # The dirty suffix reads canvas `start-1`, which is NOT cooking. Its window must lie
+        # inside whatever region that canvas is actually correct over. `+ halos[start]` because
+        # stage `start` reaches that far into its input.
+        need = out[start]
+        pad = int(halos[start]) if start < n else 0
+        if need is not None:
+            x0, y0, w, h, W, H = need
+            grown = (max(0, x0 - pad), max(0, y0 - pad),
+                     min(W, x0 + w + pad) - max(0, x0 - pad),
+                     min(H, y0 + h + pad) - max(0, y0 - pad), W, H)
+            upstream_valid = valid[start - 1] if start - 1 < len(valid) else None
+            if not covers(upstream_valid, grown):
+                return None        # not serviceable — cook the whole chain from the source
+    return out
+
+
 def clear_roi_memo() -> None:
     """Test hook (mirrors tex_lazy.clear_lazy_memo)."""
     _walk_memo.clear()

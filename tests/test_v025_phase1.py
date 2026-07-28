@@ -364,7 +364,11 @@ def test_cache2_verify_drop_and_replace(r: SubTestResult):
         stamp = tex_engine.frame_version(normal)
         nbytes = normal.untyped_storage().nbytes()
         c._ram["k"] = [normal, stamp, nbytes, str(normal.device), None]
-        c._ram_bytes += nbytes
+        # This row hand-builds an entry rather than going through put(), so it must also do
+        # put()'s accounting. `_ram_bytes` is DERIVED from the per-device totals — there is one
+        # place bytes are recorded, so this is it.
+        from TEX_Wrangle.tex_results import _dev_bucket
+        c._bytes_by_dev[_dev_bucket(normal.device)] += nbytes
         assert c.get("k", copy=False) is normal, "an unmutated normal frame was not served"
         normal.mul_(2.0)  # tamper
         assert c.get("k") is None, "a mutated frame was served instead of dropped"

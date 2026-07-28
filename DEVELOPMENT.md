@@ -692,6 +692,24 @@ against the slow leaks a days-long compositor process would otherwise hide.
 ## Rejected design decisions (don't re-propose)
 
 Settled calls, kept here so they're not re-derived:
+- **Raising `MAX_OUTPUTS` so a fused chain can carry more CACHE-7 taps** (v0.32) — rejected.
+  It is a *host output-slot count* (`tex_node.py` binds its node outputs to it), so raising it
+  changes the node's published surface to buy an engine convenience. `materialize` batches the
+  harvest deepest-first and retries on what actually came back instead. Reopen only if a chain
+  can genuinely need more than 7 checkpoints — which today it cannot, since fusion caps a
+  region at 16 stages.
+- **An engine-side content check on CACHE-6/7's `upstream` source key** (v0.32) — rejected on
+  cost. The gate is an ARITY check; a host passing a content-*insensitive* key still gets a
+  stale boundary (measured maxdiff 0.91 on a swapped source). Verifying it engine-side means
+  hashing every source tensor on every cook, which is the cost caching exists to avoid.
+  GRAPH-1's version counters are the intended answer — a host that stamps a key per produced
+  value gets this for free.
+- **GOV-1 adaptive tier switching** (v0.32) — deferred, not built. Report 39 asks the governor
+  to shift emphasis automatically when a session changes shape. It collides with S-5 ("never
+  silently auto-tune a box we haven't measured"), and there is no session-shape classifier
+  anywhere in the engine to drive it. What shipped is the honest half: named, repo-committed,
+  `tex doctor`-reportable presets. Reopen when PRED-1's reason stream has been calibrated
+  against a real session — the mechanism it would need, not the policy.
 - **A cross-node include/import system** — rejected on ethos grounds; self-containment
   ("five lines of self-contained plaintext") is a deliberate shareability feature.
 - **An extra fusion wire** — the frontend collapses a chain into the terminal node

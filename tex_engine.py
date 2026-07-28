@@ -1735,7 +1735,17 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
     `data_ptr` is NOT (a reused/overwritten frame buffer keeps its address; the caching allocator
     reuses freed addresses), so a video pipeline doing `src.copy_(next_frame)` would serve a stale
     boundary. A GRAPH-1 host already stamps such a key per produced value; `cook_fused_cached`
-    refuses to cache without one. fp32 is the exact-handoff contract, so precision keys it too."""
+    refuses to cache without one. fp32 is the exact-handoff contract, so precision keys it too.
+
+    CACHE-7: `canvas` DEFAULTS to the prefix's input SHAPES rather than to nothing. It used to
+    default to nothing and neither caller passed it, so a tap's identity carried no resolution —
+    and `ResultCache.get` validates neither shape nor device. With one host source key, a 64²
+    cook and a 128² cook minted the SAME key and the 128² request was served the 64² frame:
+    silently, wrong size, no error (reproduced; pinned by a regression row). Resolution rode
+    entirely on the host's `upstream` string, which nothing documented as required to encode one.
+    Defaulting HERE rather than at each call site is what closes it for `cook_fused_cached` and
+    the CACHE-7 multi-tap path at once — the hole was in this function's contract, not in a
+    caller's diligence. An explicit `canvas=` still wins, for a caller that knows better."""
     from . import tex_results
     from .tex_fusion import prefix_fingerprint
     fp = prefix_fingerprint(stages, k, _infer_binding_type)
@@ -1743,6 +1753,14 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
               for i, st in enumerate(stages[:k])
               for n, v in (st.get("bindings") or {}).items()
               if not isinstance(v, torch.Tensor)}
+    if canvas is None:
+        # Every tensor the prefix reads, by stage-qualified name and shape. Derivable BEFORE
+        # the cook: a TEX program's output canvas equals its input canvas until LANG-6's
+        # `canvas()` lands, at which point this becomes a derived shape rather than a copied one.
+        canvas = {"in": [[f"s{i}:{n}", *[int(d) for d in v.shape]]
+                         for i, st in enumerate(stages[:k])
+                         for n, v in sorted((st.get("bindings") or {}).items())
+                         if isinstance(v, torch.Tensor)]}
     flags = [f"tap:s{k - 1}"]
     if latent_channel_count:
         flags.append(f"ic:{int(latent_channel_count)}")

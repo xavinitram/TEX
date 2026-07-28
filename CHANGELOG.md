@@ -5,6 +5,268 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] - 2026-07-27
+
+**Cache where it counts** — effort-based checkpoints. v0.31 gave the engine a measured cost
+signal; this release spends it. A fused chain grows checkpoints wherever the *cumulative
+measured* stage cost crosses a threshold, so a mid-chain edit recooks from the nearest one
+instead of from the source; an unfused comp gains the region-recook machinery that until now
+lived only in the demo host; and the governor gains named presets that reach every budget
+rather than one. All numbers are **sm_75** (RTX 2080 SUPER, no Triton) — PM-8's target names
+the sm_120 box, so these are this hardware's.
+
+### CACHE-7 — effort-based checkpoint placement (`tex_checkpoint.py`, design note `docs/effort-based-checkpoints.md`)
+CACHE-6 cuts a fused chain **once**, at a cut point the *host* guesses. CACHE-7 cuts it
+wherever measured cost says to, and the load-bearing discovery is that the engine could
+already export every interior handoff in one cook: `compile_fused` has accepted a per-stage
+`tap: True` since v0.21, emitting `@_tap_s{i}`. So phase 2 is "cook once, keep what falls
+out", not "re-cook in N segments" — verified **bit-exact** (`torch.equal`) against the
+standalone prefix cook, CPU and CUDA, with `@OUT` unchanged by the tapping.
+
+- **The fp32 gate is LIFTED, on a measurement.** CACHE-6 refuses fp16 taps on the belief that
+  only fp32 is "the exact handoff". Measured instead: a prefix/suffix split at fp16 is
+  **bit-exact** — 22/22 rows, both devices, with and without a halo op. The interpreter upcasts
+  outputs to fp32 on egress, so the boundary holds exactly-representable fp16 values and
+  feeding it back downcasts losslessly. Pinned by a differential row, not asserted.
+- **`precision="auto"` is refused, deliberately** — it resolves inside `prepare()`, which this
+  path never calls, so caching under the label `"auto"` would mint an entry the same host
+  could never find once it resolved. Hosts pass a resolved precision.
+- **Placement refuses rather than guesses.** No profiler (the default), an unsettled estimate,
+  a DAG cut set, or a threshold under the materialization floor all yield *no* checkpoints —
+  i.e. exactly today's cook. `MIN_SAMPLES = 12` is measured, not chosen: at 3 samples a cheap
+  stage is over-attributed ~10× and the stage **ranking is inverted**, which would checkpoint
+  the wrong boundary and report success. The honest price, also measured: settling takes
+  **147 cooks**.
+- **The materialization floor is device-dependent by 18×.** A `put` is 1.117 ms at 512² on CPU
+  but 0.062 ms on CUDA; one CPU-calibrated constant would refuse checkpoints that comfortably
+  pay on the device interactive hosts actually run on.
+
+**Measured (12-stage chain, 2048², placement threshold 10 ms — see the note below).** Against
+a *moving* edit — the case the item exists for, since one cut serves one position and grading
+does not hold still:
+
+| | full recook | CACHE-6 (single tap) | CACHE-7 | |
+|---|---|---|---|---|
+| CPU, scrub across positions | 198.4 ms | 172.2 ms | **122.4 ms** | **1.41×** vs CACHE-6 |
+| CUDA, scrub across positions | 42.7 ms | 36.8 ms | **20.1 ms** | **1.83×** vs CACHE-6 |
+| CUDA, fixed late edit | 41.4 ms | 2.5 ms | 7.6 ms | 5.46× vs full |
+
+**Stated against itself:** on a *fixed* edit position CACHE-6 wins (16.3× vs 5.5×), because the
+benchmark hands it an **oracle** cut — `k = edit_at`, the perfect cut for that exact edit. A
+host does not know that. CACHE-7's taps are edit-agnostic and stand as the user moves.
+
+**And stated against the shipped default:** those rows ran at a **10 ms** threshold. At the
+report's ~100 ms default, CUDA places **no checkpoint at all** on this chain — 12 stages at
+2048² is only ~43 ms, so nothing crosses. That is the policy refusing rather than guessing, and
+it is the calibration report 39 §4 already lists as host-gated. The default is left at 100 ms
+rather than fitted to this box, because a constant tuned to one machine stops being portable;
+`docs/effort-based-checkpoints.md` §13 carries the full disclosure. `checkpoint_bench.py` now
+spies on the splice and reports `NO CHECKPOINT SERVED` rather than timing a silent fallback —
+without it, a populated cache (7.5 ms/cook) and a wiped one (41.4 ms/cook) both return normally
+and a total fallback is indistinguishable from "the feature is slower".
+
+**Two shipped-code defects the generalization exposed, both fixed and pinned:**
+- **A tap's cache key carried no resolution.** `cook_fused_cached` minted its boundary key
+  without `canvas=`, and `ResultCache.get` validates neither shape nor device — so with one
+  host source key a 64² cook and a 128² cook collided, and the 128² request was **served the
+  64² frame**: silent, wrong size, no error. Fixed in `boundary_lineage_key`'s own default, so
+  shipped CACHE-6 is repaired too, not only the new path.
+- **`prefix_fingerprint(stages, k)` had no range guard.** Python slicing clamps, so any
+  `k >= len` returned the **whole chain's** fingerprint — the string PROF-1 keys its per-stage
+  table on. The one shipped caller passed a hand-audited constant; a multi-tap planner
+  generates `k` programmatically. Now raises `FusionError`.
+
+### CACHE-9 — region-granular recook (`tex_roi.chain_windows`, `ResultCache.patch_region`, design note `docs/region-granular-recook.md`)
+The win already existed and was large (PM-6: ~22× at 1920²) — it just lived in
+`examples/host_demo.py`. This promotes it behind the engine seam with the two inversions a host
+is unlikely to get right:
+
+- **A non-executable stage reports UNBOUNDED reach, not zero.** `RoiPlan.halo` is `0` when
+  `executable` is `False`, which means "there is a gather, cook the whole frame" — the
+  opposite of "reads no neighbours". `stage_halo` returns `WHOLE_FRAME`, and one such stage
+  saturates every window above it.
+- **Windows compose backwards, growing by each *consumer's* halo.** Measured: a 32 px window
+  grows to 50 px through one blur, and the naive same-rect patch leaves a stale ring worth
+  **1.33e-01** where the composed path is **0.00e+00**.
+- **`patch_region` is copy-on-patch.** ENG-12's freeze is a tripwire, not a fence — an in-place
+  op on an inference tensor *lands the write* and then raises. Provenance rides the CACHE-1
+  **key** (base in `upstream`, window in `canvas`), because the version stamp cannot carry it:
+  `frame_version` is a constant 0 for every frozen entry, and `put` always freezes.
+
+**Scope, decided in §1 of the note rather than deferred:** `roi=` is refused on a fused chain
+(`tex_engine.py:1261`), so CACHE-9 serves the *unfused* per-stage host and CACHE-7 the fused
+one. They are complements, not layers.
+
+### GOV-1 — memory/effort profiles on the governor (`tex_memory.py`)
+`performance` / `balanced` / `efficient`, in the `arch_support.gate_profile()` mould: named,
+repo-committed, and reported by `tex doctor` (S-5 — never silently auto-tune a box).
+
+The presets had to fix something to mean anything: there were **three live, mutually-unaware
+budgets** (`cache_budget_bytes`, `ResultCache._budget`, `governor_budget`), and a profile
+setting only the arbitrated one would have been a label. A profile now sets the governor
+budget, every armed frame cache's budget (through a new `ResultCache.set_budget`, which
+enforces immediately — a shrunk budget that waits for the next `put` is useless on the idle
+session where a user reaches for `efficient`), and CACHE-7's checkpoint threshold. Applied in
+both orders, so a host may choose a profile before or after it builds its caches. `balanced`
+is a true no-op. **Deferred:** the adaptive tier-switching clause (S-5 tension, and no
+session-shape classifier exists) — recorded in DEVELOPMENT.md.
+
+### PM-8 — met, split by shape
+A 50-node comp has **no fused chain at all**: `_MAX_FUSED_REGION_STAGES` is 16 and
+`_grow_region` returns `None` past it rather than truncating, so a linear graph of 17+ TEX
+nodes yields **zero** fusable regions (measured: N=16 → 1 region, N=17 → 0, N=50 → 0). PM-8's
+literal shape is therefore CACHE-9's, not CACHE-7's, and reporting one blended number would
+hide which mechanism produced it.
+
+**50 nodes, 2048², 512² window:** a mid-graph param edit recooks in **154 ms CPU (5.85×)** /
+**17.4 ms CUDA (9.86×)** against the 898 / 172 ms whole-graph recook.
+
+RAM, with both numbers reported because the CACHE-5 governor is *host-driven* — `arbitrate()`
+is a call a host makes, never a background thread:
+
+| | undriven | after `arbitrate()` | budget |
+|---|---|---|---|
+| CPU | 1984 MB | **960 MB** | 1024 MB |
+| CUDA | 1984 MB | **704 MB** | 744 MB |
+
+> **Corrected before tagging, and the correction is the interesting part.** An earlier draft
+> read "arbitrate() frees 1920 MB, leaving 64 MB". That was not the governor landing on budget —
+> it was the governor being *lied to*. `_bytes_by_dev` was maintained at three removal sites and
+> the eviction loop updated only `_ram_bytes`, so the per-device total ratcheted up on every
+> eviction: `governed_bytes('cpu')` reported **16000 MB** for a cache holding **1984** (8.1×).
+> `arbitrate()` read that and evicted to the one-surviving-entry floor — a 16× over-eviction
+> that silently destroys the frame reuse CACHE-2/CACHE-9 exist to provide, while *looking* like
+> a clean landing. The number above (960 MB in ~15 entries, just under budget) is what the
+> governor does when told the truth. Fixed by making `_remove()` the only path an entry leaves
+> the table, so the accounting cannot be half-done at one site.
+
+**The honest negative, measured:** with **every** stage dirty, region recook is **0.21× (CPU) /
+0.04× (CUDA)** — 5–25× *slower* than cooking the frame, because it pays 50 full-frame clones
+and the accumulated halos have already grown the windows most of the way back to the frame. A
+host must route an all-dirty recook whole-frame; the win comes from the clean prefix standing.
+
+### Also
+- `ResultCache` is **thread-safe** now. CACHE-7's phase-2 harvest makes the *engine* a writer on
+  the SCHED-4 worker while a host `get`s on the main thread — concurrent `move_to_end`/`popitem`
+  on one OrderedDict. The lock covers structure and byte accounting only; every tensor copy and
+  every disk I/O happens outside it, stated once on `__init__` so the scope is checkable.
+- `governed_bytes(dev_type)` was O(entries) **under the lock** (415 µs at 2000 entries, called
+  per arbitration); it now reads maintained per-device counters.
+- `_restore` cost a `stat` syscall on **every** RAM miss, even on a cache that had never
+  spilled (19.1 µs); a spilled-key set short-circuits it.
+- `profile.stage_costs` gained the cross-bucket fallback `predict` already had — and
+  `profile.settled()` now answers "is this estimate trustworthy?" through the *same* bucket
+  selection. Splitting those across two consumer-side calls had already produced a live bug:
+  `stage_costs` fell back, `samples` did not, so CACHE-7's planner got good scaled costs with a
+  sample count of zero and refused to place.
+- `tex_fusion.stage_edges` is one spelling of the stage-list wiring rules (a legacy
+  `chain_input` is the preceding stage's `OUT`), shared by `compile_fused` and CACHE-7's cut
+  analysis rather than restated in each.
+- `docs/roadmap.md`'s CACHE-5 entry **contradicted the shipped code** on a safety-critical
+  point: it required `clear_graph_cache()` on arbitrated eviction, which would re-arm doomed
+  captures and regress MEM-1. `tex_memory` has used pin-and-skip since MEM-1. Corrected, with
+  the correction marked — a GOV-1 implementer reading the roadmap would have regressed it.
+
+### The default cook path is unchanged (invariant #7)
+Nothing here is reachable from a ComfyUI cook: `tex_node.py` never constructs a `ResultCache`,
+so it cannot reach a checkpoint or a patch; placement needs PROF-1, which is disarmed by
+default; and the governor is host-driven. Measured anyway, `eight_config_bench --compare`
+against the v0.31.0 baseline (24 synthetic programs × 8 configs, 512²):
+
+| | geomean | | | geomean |
+|---|---|---|---|---|
+| CPU cold | 1.127× | | GPU cold | 0.992× |
+| CPU warm | 1.013× | | GPU warm | 1.012× |
+| CPU cold compiled | 1.164× | | GPU cold compiled | 1.032× |
+| CPU warm compiled | 1.005× | | GPU warm compiled | 1.012× |
+
+All eight are far above the 0.95 stop-ship line; the honest reading is **neutral**, not faster.
+The strongest form of the claim is structural rather than statistical: **no instruction is added
+to a plain cook.** `boundary_lineage_key` is reachable only from `cook_fused_cached` and
+`tex_checkpoint`; the profile changes are all in read accessors; `ResultCache` is never
+constructed by `tex_node.py`; `cache_budget_bytes` — the per-cook one — is untouched.
+
+**A same-version null control was run to make those numbers mean something** — the current tree
+against itself, same harness:
+
+| | null control | vs v0.31 |
+|---|---|---|
+| CPU cold / warm | 0.984× / 1.021× | 1.127× / 1.013× |
+| GPU cold / warm | 1.010× / 1.009× | 0.992× / 1.012× |
+| CPU cold / warm compiled | 1.027× / 1.022× | 1.164× / 1.005× |
+| GPU cold / warm compiled | 0.992× / 1.004× | 1.032× / 1.012× |
+
+Identical code scatters ±3% at the geomean, and the real comparison sits inside that band. So
+the honest reading is **neutral**, not faster — the CPU-cold 1.127×/1.164× are not a win, they
+are the same noise pointing the other way.
+
+**Individual rows are not interpretable at all**, and that is now a standing rule in
+`docs/roadmap.md` §10.3: the null control produces per-row readings down to **0.83×** on
+*identical code*, on both devices, so the harness's "N/24 regressions" column is noise at this
+rep count. Chasing one row without a null control has produced three false regressions in this
+release cycle alone (`noise_perlin` 0.64×, `multi_output` 0.67×, and an audit's `fused_3stage`
+0.88× against a byte-identical tree). The rule replaces an earlier, wrong version of itself that
+said only CPU needed the control — the null shows GPU compiled rows scattering to 0.83× too.
+
+(The baseline was also re-run: the first was taken on the wrong interpreter — a bare `python` on
+this box is 3.11 / torch 2.5, not the project venv's 3.12 / torch 2.10 — which manufactured five
+phantom fp16 failures.)
+
+### Release audit — 3 blockers + 5 fix-before-tag, all closed
+An independent audit refused the tag. Every finding is now fixed *and* pinned by a test that
+would have caught it; the pattern across all three blockers was the same — the generalization
+work introduced silent-failure paths.
+
+- **CACHE-7 admitted DAG stage lists and returned wrong pixels** (maxdiff 0.146; 425 admitted /
+  30 wrong across a sweep). Replacing CACHE-6's `is_linear_stage_list` with a per-cut
+  `cut_set(...) == 1` check was wrong: a single-edge cut is necessary but *not sufficient*,
+  because `suffix_stage_list` RENUMBERS the stages it keeps and their `chain_inputs` are
+  absolute indices. The linear gate is restored; `cut_set` stays as the analysis it always was.
+- **`_bytes_by_dev` drifted** and invalidated PM-8's own RAM headline (above).
+- **`set_profile("balanced")` did not restore the shipped budget**, so `tex doctor` reported a
+  profile that was not being enforced.
+- **`_spilled` was initialised to `set()`**, so a cache constructed over a spill dir a previous
+  process populated would have served nothing — the ENG-13 reattach path. Now starts *unknown*
+  and is filled by one lazy scandir.
+- **The lock-scope claim was false**: `_spill`/`_restore` ran *inside* the lock (327–496 ms
+  `get` stalls). Eviction now queues victims under the lock and writes them outside it.
+- **`patch_region` took no lock despite its comment** (200/200 lost updates → 32/32 bands
+  survive).
+- **`profile.settled()` resolved a different bucket than `stage_costs`** — the same live bug the
+  release claimed to fix, alive in the placing direction. Replaced by `stage_snapshot()`, which
+  resolves once and cannot disagree with itself.
+- **CACHE-9 left a stale ring on a second, deeper edit** through documented `dirty_from` usage:
+  a region cook leaves canvases valid only over their composed windows, and a later edit
+  derived from a different `roi` read outside them. `chain_windows(..., valid=)` now returns
+  **`None`** — "not serviceable, cook from the source".
+  My first fix widened the returned *windows* to the frame instead, which is useless: the
+  upstream canvas is not being read too narrowly, it is **wrong** there, and no downstream
+  window repairs a stale input. That fix's window-arithmetic test passed while the pixels were
+  still off by **2.17e-01**. The row that caught it compares pixels against a whole-frame
+  reference and carries a **negative control** — the same sequence without `valid` must still
+  reproduce the ring, or the guarded assertion proves nothing.
+
+### Mutation-checked, because "fixed and tested" was not enough twice
+The audit's closing note — 11 of 41 mutations surviving, including the entire `ResultCache`
+lock — is the finding that generalizes, so each fix above was verified by re-introducing the
+bug it fixes into a copied tree and confirming a row actually reds. **8/8 killed**, but two only
+after the test was rewritten:
+
+- **`remove the lock from patch_region` initially SURVIVED.** The atomicity test asserted
+  "≥ half the bands survive" and passed with the lock deleted — the threads simply never
+  interleaved at that scale. It now widens the read-modify-write window deliberately and
+  requires **all** bands, which the unlocked version fails.
+- **CACHE-9's `valid` guard** was pinned by a test that only checked window *arithmetic*. It
+  passed while the pixels were still wrong by 2.17e-01 (see above).
+
+The other six — compose-forward, grow-by-own-halo, drop-the-linear-gate,
+forget-the-per-device-total, resolve-without-`need_stages`, stop-restoring-the-shipped-budget —
+red on 1–5 rows each.
+
+### Suite
+2568 sub-tests (2423 at v0.31), one row skipped on a CPU-only box. **No language-version
+change:** CACHE-7/9 and GOV-1 add no language surface, so the frozen compat corpus is untouched.
+
 ## [0.31.0] - 2026-07-26
 
 **Never idle** — the scheduler grows two tiers. The engine could already be *stopped*; now it

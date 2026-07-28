@@ -62,7 +62,7 @@ __all__ = [
     # Test helpers
     "SubTestResult", "compile_and_run", "compile_and_infer", "check_code",
     "run_both", "assert_equiv", "check_val", "make_img", "make_latent",
-    "cold_engine_state", "lint_sources",
+    "cold_engine_state", "lint_sources", "armed_profiler",
     "_MAX_LOOP_ITERATIONS",
 ]
 
@@ -370,6 +370,34 @@ class cold_engine_state:
             self._autotier._reset_for_test()
         shutil.rmtree(self.dir, ignore_errors=True)
         return False
+
+
+def armed_profiler():
+    """Arm PROF-1 on a clean table, and ALWAYS disarm — a leaked `enable()` puts a CUDA sync
+    into every later test in the suite, and `run_all.py` runs the whole suite in one process.
+
+    Promoted from `test_v031_phase2._armed` when a second release needed it: two copies of a
+    "must always run the finally" fixture is one copy away from a leak nobody notices, because
+    the symptom (everything after it gets slower) does not look like a failure.
+
+        with armed_profiler() as P:
+            ...
+    """
+    import contextlib
+
+    from TEX_Wrangle.tex_runtime import profile as _P
+
+    @contextlib.contextmanager
+    def _cm():
+        _P.reset()
+        _P.enable()
+        try:
+            yield _P
+        finally:
+            _P.disable()
+            _P.reset()
+
+    return _cm()
 
 
 def lint_sources(pattern, *, allow=(), flags=0) -> list:

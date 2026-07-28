@@ -75,6 +75,17 @@ def _xfer_facts():
                           if b > 0 else None)} for k, (a, b) in lanes.items()}}
 
 
+def _memory_profile_facts():
+    """GOV-1: which memory/effort preset is in force, and the knobs it carries.
+
+    Reported because S-5's rule is that a profile must be NAMEABLE, not just effective — the
+    same reason `arch_support.gate_profile` is a committed table rather than a heuristic. Two
+    users comparing numbers have to be able to see they were on different presets."""
+    from .tex_memory import active_profile, profile_knobs, profiles
+    return {"active": active_profile(), "available": list(profiles()),
+            "knobs": profile_knobs()}
+
+
 def collect_doctor_facts() -> dict:
     """Flat, never-raising environment report (see module docstring)."""
     from .tex_runtime import tier_trace
@@ -89,4 +100,5 @@ def collect_doctor_facts() -> dict:
         "arch": _fact(current_arch_status),  # S-5: verified-arch caveat
         "noise_compiles": _fact(tier_trace.noise_compiles),  # P6: noise compile visibility
         "xfer": _fact(_xfer_facts),  # ENG-8: measured PCIe transfer-cost model
+        "memory_profile": _fact(_memory_profile_facts),  # GOV-1: the named preset in force
     }

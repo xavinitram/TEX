@@ -388,18 +388,29 @@ def governor_budget(device) -> int:
             return int(override) * 1024 * 1024
         except ValueError:
             pass
+    # GOV-1: the profile's fraction, or the shipped 0.4. An explicit env override still wins —
+    # a preset is a convenience, not a way to stop a host saying exactly what it wants.
+    # `is None`, not `or`: a future preset declaring governor_frac=0.0 ("arbitrate nothing to
+    # this pool") is a legitimate knob value that `or` would silently rewrite to 0.4.
+    frac = _PROFILES[_active_profile].get("governor_frac")
+    if frac is None:
+        frac = 0.4
     dev = torch.device(device) if not isinstance(device, torch.device) else device
     if dev.type == "cuda":
         try:
             from .tex_runtime.host import get_host_services
             free = get_host_services().get_free_memory(dev)
             if free:
-                return int(0.4 * free)
+                return int(frac * free)
         except Exception:
             pass
         total = device_total_mem(dev)
-        return int(0.4 * total) if total else 1024 * 1024 * 1024
-    return 1024 * 1024 * 1024
+        return int(frac * total) if total else 1024 * 1024 * 1024
+    # CPU has no free-memory query to take a fraction OF, so it scales a fixed reference
+    # instead. The reference is chosen so the DEFAULT fraction reproduces the shipped 1 GiB
+    # exactly (0.4 x 2.5 GiB) — otherwise a GOV-1 preset would advertise a `governor_frac` that
+    # silently did nothing on CPU, which is worse than not offering the knob.
+    return int(frac * 2.5 * 1024 * 1024 * 1024)
 
 
 def _evict_stdlib_bytes(dev_type, need: int, playhead=None) -> int:
@@ -530,12 +541,126 @@ def register_result_cache(cache, *, name: str = "results", evict_order: int = 50
     """Arm a CACHE-2 `ResultCache` into the governor (the frame cache is host-instantiated, so a
     host calls this when it creates one). Its RAM bytes then count toward the per-device budget
     and its LRU frames become evictable under pressure — the fold-in the CACHE-5 register
-    promises. `cache.evict_bytes` supplies the eviction (playhead-aware when frames carry one)."""
+    promises. `cache.evict_bytes` supplies the eviction (playhead-aware when frames carry one).
+
+    GOV-1: if a profile is active, its frame budget is applied to `cache` here — arming is the
+    one moment the governor learns a frame cache exists, so it is the only place a preset can
+    reach one it did not create."""
     reg = get_cache_registry()
     reg.register(name,
                  lambda dt: cache.governed_bytes(dt),
                  lambda dt, need, playhead: cache.evict_bytes(need, dev_type=dt, playhead=playhead),
                  evict_order=evict_order)
+    _apply_profile_to_cache(cache)
+
+
+# ── GOV-1: memory/effort profiles on the governor ────────────────────────────
+# The report asks for Performance / Balanced / Efficient presets "bundling the checkpoint
+# threshold, RAM/VRAM budgets, and (from v0.33) compression aggressiveness". Mostly policy —
+# but it lands on a governor with a structural problem the presets have to fix to mean
+# anything: there are THREE live budgets and none of them knows about the others.
+#
+#   * `cache_budget_bytes`      — per-cook, stdlib tensor caches, off TOTAL VRAM
+#   * `ResultCache._budget`     — self-enforced on every `put`, off TOTAL VRAM
+#   * `governor_budget`         — the arbitrated pool cap
+#
+# A "profile" that set only the third would be a label, not a policy: `ResultCache` would keep
+# spilling against its own constructor default no matter what the preset said. So a profile
+# sets the governor budget AND is pushed into every frame cache armed into the governor.
+#
+# S-5 DISCIPLINE (`arch_support.gate_profile`'s rule, and the reason this is a committed table
+# rather than a heuristic): never silently auto-tune a box. A profile is NAMED, repo-committed,
+# and reportable — `active_profile()` is what `tex doctor` prints — so two users' numbers stay
+# comparable. Nothing selects one automatically; the default is exactly today's behaviour.
+
+#: name -> the knobs a preset bundles. `frame_mb`/`governor_mb` are None = "leave the existing
+#: default alone", which is what makes BALANCED a true no-op rather than a re-statement of
+#: numbers that would then drift from their real defaults.
+_PROFILES = {
+    # Hold more, evict later: the interactive editing session the Memory report describes,
+    # where a frame you scrubbed past is one the user is about to scrub back to.
+    "performance": {"frame_mb": 4096, "governor_frac": 0.60, "checkpoint_ms": 50.0},
+    # The shipped defaults, named so a host can ask for them explicitly and so
+    # `active_profile()` always has something honest to report.
+    "balanced":    {"frame_mb": None, "governor_frac": None, "checkpoint_ms": 100.0},
+    # Give memory back: a batch/headless run, or a box sharing VRAM with a model.
+    "efficient":   {"frame_mb": 512,  "governor_frac": 0.25, "checkpoint_ms": 250.0},
+}
+
+_active_profile: str = "balanced"
+#: cache -> the `_budget` it had when the governor first saw it. `frame_mb: None` means "the
+#: shipped default", and the only way to RESTORE a default is to have remembered it: without
+#: this, switching efficient -> balanced left the 512 MB budget in place while `tex doctor`
+#: reported `balanced`, i.e. the report described a profile that was not being enforced.
+_armed_caches: "dict" = {}
+
+
+def profiles() -> tuple:
+    """The preset names, in increasing thrift — derived from `_PROFILES`, which is declared in
+    that order, so adding a preset does not need a second edit here (and `set_profile`'s error
+    message cannot go stale against the dict it validates against)."""
+    return tuple(_PROFILES)
+
+
+def set_profile(name: str) -> dict:
+    """Activate a GOV-1 preset. Returns the knob dict it applied.
+
+    Applied to every frame cache already armed into the governor AND to any armed later, so a
+    host may set the profile before or after it creates its caches — the ordering trap a
+    "budgets are constructor arguments" design would otherwise have."""
+    key = str(name).strip().lower()
+    if key not in _PROFILES:
+        raise ValueError(f"unknown memory profile {name!r} (expected one of {profiles()})")
+    global _active_profile
+    _active_profile = key
+    for c in list(_armed_caches):
+        _apply_profile_to_cache(c)
+    return profile_knobs()          # one spelling of "the knob dict for the active profile"
+
+
+def active_profile() -> str:
+    return _active_profile
+
+
+def profile_knobs(name: str | None = None) -> dict:
+    """The knob dict for `name` (default: the active profile). What `tex doctor` reports and
+    what CACHE-7 reads for its threshold."""
+    return dict(_PROFILES[str(name or _active_profile).strip().lower()])
+
+
+def checkpoint_threshold_ms() -> float:
+    """GOV-1 owns CACHE-7's placement threshold — the report names it as a profile knob. A
+    thriftier profile checkpoints LESS often (each checkpoint is a whole frame held in RAM),
+    which is the memory/latency trade the preset exists to express."""
+    return float(_PROFILES[_active_profile]["checkpoint_ms"])
+
+
+def _apply_profile_to_cache(cache) -> None:
+    """Push the active profile's frame budget into one `ResultCache`, and remember it so a
+    later `set_profile` reaches it too. Best-effort: a host may arm something that only
+    duck-types the governor hooks."""
+    if cache not in _armed_caches:
+        # Remember the shipped default the FIRST time we see this cache, before any preset has
+        # touched it — that is the only moment it is still knowable.
+        _armed_caches[cache] = getattr(cache, "_budget", None)
+    mb = _PROFILES[_active_profile].get("frame_mb")
+    try:
+        if mb is None:
+            # "the shipped default" is a real setting to RESTORE, not an instruction to skip:
+            # a host switching back to `balanced` must actually get the default back.
+            default = _armed_caches.get(cache)
+            if default is not None:
+                cache.set_budget(default / (1 << 20))
+        else:
+            cache.set_budget(mb)    # public seam: takes the cache's own lock, enforces now
+    except Exception:
+        pass
+
+
+def _reset_profile_for_test() -> None:
+    global _active_profile
+    _active_profile = "balanced"
+    _armed_caches.clear()
 
 
 # MEM-2 (audit B2): per-device last-seen spatial pixel count + cached total VRAM, so the

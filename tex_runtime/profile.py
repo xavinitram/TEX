@@ -252,53 +252,107 @@ def _bucket(key: tuple, spatial) -> _Bucket:
 
 
 # ── prediction ───────────────────────────────────────────────────────────────
-def predict(key: tuple, spatial=None) -> float | None:
-    """Expected cook cost in ms, or None if this program has never been measured on that
-    (device, precision).
+def _resolve_bucket(key: tuple, spatial, *, need_stages: bool = False):
+    """`(bucket, pixel_scale)` for this (key, resolution), or `(None, 1.0)`.
 
-    An exact bucket hit returns its EWMA. A MISS falls back to the nearest measured bucket
-    scaled by the pixel ratio — that fallback is what makes the profiler useful to PRED-1,
-    which is usually asked about a frame at a resolution the session has not cooked yet.
+    An exact bucket hit scales by 1. A MISS falls back to the nearest measured bucket scaled by
+    the pixel ratio — the fallback is what makes the profiler useful to a host asking about a
+    frame at a resolution the session has not cooked yet.
+
+    ONE resolver rather than one per accessor, because the alternative already produced a live
+    bug: `stage_costs` grew this fallback and `samples` did not, so a caller asking both — which
+    is exactly what CACHE-7's planner does — got good scaled costs together with a sample count
+    of ZERO, refused to place, and the fallback was unreachable through the only consumer that
+    wanted it. An estimate and the confidence in that estimate must answer for the SAME bucket,
+    and the only way to guarantee that is to select the bucket once.
 
     HONEST APPROXIMATION: linear-in-pixels over-predicts small frames, because a cook has a
     fixed cost (dispatch, binding marshalling, the Python walk) that does not shrink with the
-    frame — at 64² a TEX cook is almost entirely that fixed part. It is used for ORDERING
-    speculative work, where a consistent bias across candidates cancels, and never as a
-    deadline. A second measured bucket would let this fit a slope+intercept instead; that is
-    left for CACHE-7, whose placement decision is the one that would actually be wrong."""
+    frame — at 64² a TEX cook is almost entirely that fixed part. For ORDERING work the bias
+    cancels across candidates; against an ABSOLUTE threshold it does not, which is why CACHE-7
+    also checks a materialization floor. Caller holds `_LOCK`."""
+    buckets = _buckets(key, create=False)
+    if not buckets:
+        return None, 1.0
+    bkt, px = bucket_of(spatial)
+    st = buckets.get(bkt)
+    if st is not None and st.samples and (st.stages or not need_stages):
+        return st, 1.0
+    # Nearest measured OCTAVE — the dict is keyed by `px.bit_length()`, so compare the keys
+    # rather than re-deriving them from each value.
+    _, best = min(((b_key, b) for b_key, b in buckets.items()
+                   if b.samples and (b.stages or not need_stages)),
+                  key=lambda kv: abs(kv[0] - bkt), default=(None, None))
+    if best is None:
+        return None, 1.0
+    return best, ((px / best.px) if best.px else 1.0)
+
+
+def predict(key: tuple, spatial=None) -> float | None:
+    """Expected cook cost in ms, or None if this program has never been measured on that
+    (device, precision). See `_resolve_bucket` for the cross-resolution fallback and its
+    honest approximation."""
     with _LOCK:
-        buckets = _buckets(key, create=False)
-        if not buckets:
-            return None
-        bkt, px = bucket_of(spatial)
-        st = buckets.get(bkt)
-        if st is not None and st.samples:
-            return st.ewma_ms
-        best = min((b for b in buckets.values() if b.samples),
-                   key=lambda b: abs(b.px.bit_length() - bkt), default=None)
-        if best is None:
-            return None
-        return best.ewma_ms * (px / best.px) if best.px else best.ewma_ms
+        best, scale = _resolve_bucket(key, spatial)
+        return None if best is None else best.ewma_ms * scale
 
 
 def stage_costs(key: tuple, spatial=None) -> dict:
     """{stage_index: EWMA ms} for a fused program, or {} if never measured per stage. This is
     CACHE-7's input: a checkpoint goes where the CUMULATIVE cost crosses its threshold."""
     with _LOCK:
-        buckets = _buckets(key, create=False)
-        if not buckets:
-            return {}
-        st = buckets.get(bucket_of(spatial)[0])
-        return dict(st.stages) if st is not None else {}
+        best, scale = _resolve_bucket(key, spatial, need_stages=True)
+        return {} if best is None else {k: v * scale for k, v in best.stages.items()}
 
 
-def samples(key: tuple, spatial=None) -> int:
+def samples(key: tuple, spatial=None, *, need_stages: bool = False) -> int:
+    """How many cooks back the estimate for this (key, resolution) — INCLUDING one served by
+    the cross-bucket fallback, so a caller reading `stage_costs` and `samples` together is
+    told about the same bucket.
+
+    `need_stages` MUST match what the caller actually read. `_resolve_bucket` skips buckets
+    with no per-stage breakdown when it is True, so the two flags select DIFFERENT buckets on
+    the same key: a resolution measured whole-cook-only but never per-stage answers `samples`
+    generously while `stage_costs` falls back to a distant bucket. See `stage_snapshot`."""
     with _LOCK:
-        buckets = _buckets(key, create=False)
-        if not buckets:
-            return 0
-        st = buckets.get(bucket_of(spatial)[0])
-        return st.samples if st is not None else 0
+        best, _ = _resolve_bucket(key, spatial, need_stages=need_stages)
+        return best.samples if best is not None else 0
+
+
+def settled(key: tuple, spatial=None, *, need: int = 12,
+            need_stages: bool = False) -> bool:
+    """Is this estimate old enough to make an irreversible decision on?
+
+    PROF-1 owns the answer because PROF-1 owns the schedule that determines it: `_blend`'s
+    `max(_ALPHA, 1/n)` rule, `_WARMUP_SAMPLES`, and `_SAMPLE_EVERY` are all private here, and a
+    consumer hard-coding a threshold against them goes silently stale when they change.
+
+    `need` defaults to the measured settling point: on a 3-stage chain whose stage 0 is a
+    multiply and stage 1 a blur, 3 samples attribute stage 0 at ~10x its truth and INVERT the
+    ranking; by 12 the estimate matches standalone cooks closely. At 3 warmup cooks plus 1-in-16
+    sampling, 12 samples is roughly 150 cooks.
+
+    Prefer `stage_snapshot` when you want costs AND confidence — it cannot disagree with itself."""
+    return samples(key, spatial, need_stages=need_stages) >= int(need)
+
+
+def stage_snapshot(key: tuple, spatial=None, *, need: int = 12) -> tuple:
+    """`(stage_costs, settled)` resolved from ONE bucket selection.
+
+    The reason this exists rather than two calls: asking `stage_costs` and `settled`
+    separately reads the table TWICE and can land on two different buckets, because only the
+    first filters to buckets that actually carry a per-stage breakdown. That is not
+    hypothetical — an earlier fix gave `stage_costs` a cross-bucket fallback and left
+    `samples` without one, so a planner received good scaled costs together with a sample
+    count of zero and refused to place. Re-splitting it re-creates the same bug in the
+    opposite direction: costs from a distant bucket, confidence from a near one, and a
+    placement made on numbers whose trustworthiness was measured somewhere else."""
+    with _LOCK:
+        best, scale = _resolve_bucket(key, spatial, need_stages=True)
+        if best is None:
+            return {}, False
+        return ({k: v * scale for k, v in best.stages.items()},
+                best.samples >= int(need))
 
 
 # ── lifecycle / introspection ────────────────────────────────────────────────

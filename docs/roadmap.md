@@ -357,11 +357,18 @@ ships with no way to hold a cooked frame.
   A `CacheRegistry` in tex_memory arbitrates the *per-device VRAM/RAM pools* against
   one budget with host-supplied priority hints (live-graph keys, playhead distance);
   disk tiers get separate size caps (extending CACHE-0), not per-device arbitration.
-  Keys and lifecycles stay per-cache (the "15 caches are non-redundant" register) —
+  Keys and lifecycles stay per-cache (the 19-cache non-redundancy register in AGENTS.md) —
   only eviction *arbitration* centralizes. Registry-level correctness contract: any
-  arbitrated eviction of a pool that captured CUDA graphs may reference must trigger
-  `clear_graph_cache()` exactly as tex_memory does today (the stale-address safety
-  in the DO-NOT-TOUCH register).
+  arbitrated eviction of a pool that captured CUDA graphs may reference must preserve the
+  stale-address safety by **pin-and-skip** — skip graph-pinned storages, and free VRAM a live
+  graph holds with `free_graphs_only()`.
+  > **Corrected (v0.32).** This paragraph used to require `clear_graph_cache()` "exactly as
+  > tex_memory does today". That was wrong in both halves: `tex_memory` has used pin-and-skip
+  > since MEM-1 and has never done a blunt graph teardown, and `clear_graph_cache()` would
+  > **re-arm doomed captures and regress MEM-1** (it drops the capture blacklist and the
+  > RNG-poison kill switch). `tex_memory.py`'s own comment and AGENTS.md's DO-NOT-TOUCH register
+  > carry the correct version; this doc contradicted them, which mattered once GOV-1 sent an
+  > implementer here to read about the governor. The cache count was stale too (15 → 19).
 - **CACHE-6 (L).** Fusion ↔ caching reconciliation: a fused chain has no interior
   cut-points, so twiddling the last node's param recooks all N stages per tick —
   fusion currently makes interactivity *worse* exactly where it matters. Two levers:
@@ -736,7 +743,8 @@ touching the frontend. FUS-0 ships as **v0.20.1** (hotfix, in flight).
 | v0.29.0 | **Close the register** — the consolidation the v0.28 audit ordered; no new mechanisms | LIVE-1 (the overdue checklist run), FUS-1b/1c (the unshipped v0.21.1), ENG-4 re-cut, SCHED-3 interrupt bridge, BENCH-1 (cumulative v0.20↔v0.28 compare + PM-5 governor soak), DOCS-1 (status pass + DOC-6 amendment) | — |
 | v0.30.0 | **First viewer** — host_demo grows into the §8 rung-2 host; the switches flip *for that host* | ROI flag flip (per-cook `roi_exec`, nightly-fuzz-gated), codegen **ROI** routing (measured 0.94–0.96× → shipped OFF; ~~tile half~~ not built), ~~SCHED-2's first consumer~~ (deferred on measurement), ~~TOOL collapse picker~~ (human-gated), PM-6 ✅ | — |
 | v0.31.0 | **Never idle** — the scheduler grows two tiers (doc 39 §3) | SCHED-4 (three admission classes, cooperative preemption, head-requeue), PROF-1 (per-stage cost profiler, disarmed by default), PRED-1 (speculative admission by confidence × predicted cost), ANIM-1 (the keyframe contract, pinned + normative in LANGUAGE.md), ENG-13 (journal/fsync ordering + `session.reattach()`), PM-7 ✅ | `tex_cookqueue.py`, `tex_recovery.py`, `tex_runtime/profile.py` |
-| v0.32+ → v1.0 | **Engine era** | §4 programs (CACHE-7/9, GOV-1, GRAPH/XPU/DATA-5..7/STOCK/ML/ROTO/COLOR), each behind its own design doc | `tex_graph.py`, `tex_runtime/streams.py` |
+| v0.32.0 | **Cache where it counts** — effort-based checkpoints (doc 39 §3) | CACHE-7 (multi-tap placement by *cumulative measured* stage cost; fp32 gate lifted on measurement; ~~DAG cut-set execution~~ analysis-only), CACHE-9 (chain window composition + `patch_region` copy-on-patch; ~~fused-region recook~~ deferred — `roi=` is refused on a fused chain), GOV-1 (named governor presets reaching all three budgets; ~~adaptive tier switching~~ deferred on S-5), PM-8 ✅ (split per shape — see below) | `tex_checkpoint.py`, `docs/effort-based-checkpoints.md`, `docs/region-granular-recook.md` |
+| v0.33+ → v1.0 | **Engine era** | §4 programs (CACHE-8, PREC-1, GRAPH/XPU/DATA-5..7/STOCK/ML/ROTO/COLOR), each behind its own design doc | `tex_graph.py`, `tex_runtime/streams.py` |
 
 Per-release notes:
 
@@ -1103,6 +1111,24 @@ method made explicit:
 3. **Baseline before, compare after** — `eight_config_bench.py --save` before the
   first change of a release, `--compare` before tagging; per-config geomean < 0.95
   is a stop-ship (invariant #7). Machine idle, on AC.
+  - **Run a same-version NULL CONTROL, and read GEOMEANS not rows.** Measured on this box
+    (v0.32, `eight_config_bench` at 512², same tree run twice):
+
+    | | null-control geomean | worst null-control ROW |
+    |---|---|---|
+    | CPU cold / warm | 0.984× / 1.021× | 0.83× / 0.90× |
+    | CPU cold / warm compiled | 1.027× / 1.022× | 0.92× / 0.88× |
+    | GPU cold / warm | 1.010× / 1.009× | 0.96× / 1.00× |
+    | GPU cold / warm compiled | 0.992× / 1.004× | 0.83× / 0.95× |
+
+    So: **per-config geomeans are the interpretable unit** — they sit inside ±3% on identical
+    code, which is what makes the 0.95 stop-ship threshold meaningful. **Individual rows are
+    not**, on either device: identical code produces readings down to 0.83×, and the harness's
+    "N/24 regressions" column is therefore noise at this rep count. Chasing a single row without
+    a null control has now produced three false regressions (`noise_perlin` 0.64×,
+    `multi_output` 0.67×, and an audit's `fused_3stage` 0.88× against a byte-identical tree — a
+    four-tree symmetric run showed it tracks module-instance heap locality, not version). If a
+    row genuinely needs settling, do an interleaved A/B of the two trees in one process state.
 4. **Every mechanism ships with its pinning test** — the repo's four proven shapes:
   *canary* (contract key-sets: ENG-4/5/6), *derivation* (registry tags → consumer
   sets, TST-3 style: ROI-1), *differential oracle* (new execution path vs the

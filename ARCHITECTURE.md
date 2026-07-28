@@ -44,6 +44,16 @@ speculative admission policy priced by **profiling** (`tex_runtime/profile.py`, 
 EWMA of whole-cook and per-fused-stage cost, disarmed by default). **Recovery**
 (`tex_recovery.py`, v0.31 ENG-13) owns the one durable atomic write every persisted engine
 file goes through, the append-only warm-state journal, and `reattach()`.
+**Checkpoints** (`tex_checkpoint.py`, v0.32 CACHE-7) place stage-boundary taps on a fused chain
+where the *cumulative measured* stage cost crosses a threshold — the multi-tap generalization of
+CACHE-6's single host-chosen cut, so a mid-chain edit recooks from the nearest checkpoint rather
+than from the source. **Region recook** (v0.32 CACHE-9) is the unfused twin: `tex_roi`'s
+`chain_windows` composes a per-stage window backwards along a chain (growing by each consumer's
+halo, saturating to the frame on any unbounded reach) and `ResultCache.patch_region` writes a
+cooked window into a frame under copy-on-patch. **Memory profiles** (v0.32 GOV-1) are named,
+repo-committed presets on the governor — `performance`/`balanced`/`efficient` — that set the
+arbitrated budget, every armed frame cache's budget, and CACHE-7's checkpoint threshold together,
+and are reported by `tex doctor` (S-5: never silently auto-tune a box).
 **Noise** (`tex_runtime/noise.py`)
 is the arithmetic-hash procedural noise family. The ComfyUI node itself is `tex_node.py`.
 
@@ -57,7 +67,7 @@ Three layers; **imports point downward only**. The `tex_compiler` package has
 | **Types** (leaf vocabulary) | `types` (`TEXType`, `CHANNEL_MAP`, `TYPE_NAME_MAP`, swizzles) | nothing (stdlib `enum`/`dataclasses` only) |
 | **Compiler** (IR + front end) | `ast_nodes`, `lexer`, `parser`, `type_checker`, `optimizer`, `stdlib_signatures`, `diagnostics` | types + itself |
 | **Runtime** (execution tiers) | `interpreter`, `codegen` (+ `codegen_stdfns`/`codegen_stencil`/`codegen_persist`, STR-7), `compiled`, `graphed`, `stdlib` (+ `stdlib_registry`), `precision_policy` (PR-LP2 `auto` gate), `tier_trace`, `profile` (PROF-1 cost store + the thread-local stage sink), `noise`, `autotier`, `xfer` (ENG-8 transfer-cost probe), `tex_cache`, `tex_marshalling` (+ DATA-1 `BufferMeta`), `tex_memory`, `tex_recovery` (ENG-13 durable write + journal), `tex_io` (DATA-2 `BufferDesc` + EXR/PNG storage), `host` (PORT-1 seam — the ONLY `comfy.model_management` consumer) | types + compiler + itself |
-| **Engine** (host-agnostic cook) | `tex_engine` (`cook`/`prepare`/`run`, tier selection, OOM ladder, tiling, precision-auto — ENG-1), `tex_fusion` (splice + the FUS-1 detector), `tex_lazy`, `tex_scheduler` (SCHED-2 placement), `tex_cookqueue` (SCHED-4 preemptive queue + PRED-1 admission) | runtime + compiler |
+| **Engine** (host-agnostic cook) | `tex_engine` (`cook`/`prepare`/`run`, tier selection, OOM ladder, tiling, precision-auto — ENG-1), `tex_fusion` (splice + the FUS-1 detector), `tex_lazy`, `tex_scheduler` (SCHED-2 placement), `tex_cookqueue` (SCHED-4 preemptive queue + PRED-1 admission), `tex_checkpoint` (CACHE-7 effort-based checkpoint placement) | runtime + compiler |
 | **Public API** (host-agnostic) | `tex_api` (`compile`/`execute`/`Program`/`TEXCompileError` + DATA-1 `color_advisories` + DATA-4 `EngineSession`, PORT-2/ENG-4), `tex_session` (DATA-4 — one handle over the cook singletons, views in phase 1), `tex_cli` (`tex run`/`tex build`, PORT-3/TOOL-4), `tex_tool` (the `.textool` loader/publish/cook, TOOL-1..5), `tex_lsp` (the stdio LSP, LANG-7) | engine + runtime + compiler |
 | **ComfyUI adapter** | `tex_node` (marshalling + schema + `ui=` payload only, S-1), `__init__` (routes), `tex_runtime/host` | all of the above |
 

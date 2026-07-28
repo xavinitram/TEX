@@ -892,6 +892,24 @@ def fused_fingerprint(spec: dict, terminal_code: str, terminal_bindings: dict,
 # case); a chain_inputs DAG is not suffix-split (a documented follow-up — the whole-chain recook
 # stays correct, just not incremental).
 
+def stage_edges(stages: list[dict], j: int) -> set:
+    """Every in-edge of stage `j`, as `(producer_stage, output_name)`.
+
+    ONE spelling of the stage-list wiring rules, because there were two and they could drift.
+    `compile_fused` normalizes a legacy `chain_input` to `{ci: [j-1, "OUT"]}` (see its stage
+    walk) before it splices; anything reading the raw stage list has to apply that same rule,
+    and a second copy that fell behind would under-report the edges crossing a cut — which
+    makes CACHE-7 ADMIT a cut it should refuse, i.e. cache a DAG boundary as if it were one
+    tensor. `_listify_chain_inputs` supplies the list/tuple tolerance."""
+    st = stages[j] if 0 <= j < len(stages) else {}
+    ci = st.get("chain_inputs")
+    if ci:
+        return {(int(e[0]), str(e[1]) if len(e) > 1 else "OUT")
+                for e in _listify_chain_inputs(ci).values() if e}
+    # The legacy LINEAR edge: a stage with `chain_input` reads the PRECEDING stage's OUT.
+    return {(j - 1, "OUT")} if (st.get("chain_input") and j > 0) else set()
+
+
 def is_linear_stage_list(stages: list[dict]) -> bool:
     """True if `stages` is a plain source-first linear chain (no DAG `chain_inputs` on any
     stage) — the shape a suffix split rebases trivially. A DAG needs positional chain_inputs
@@ -903,7 +921,18 @@ def prefix_fingerprint(stages: list[dict], k: int, infer_binding_type: Callable)
     """The 'upstream sub-chain fingerprint' a stage-boundary tap keys on: the value-independent
     `_fused_fp` of the prefix `stages[:k]` (the stages producing the boundary). Derived, never
     stored (ENG-5: fingerprints are unstable across TEX versions). Value-independent — the
-    param VALUES the boundary also depends on enter the tap's lineage key separately."""
+    param VALUES the boundary also depends on enter the tap's lineage key separately.
+
+    CACHE-7: `k` is RANGE-CHECKED. Python slicing clamps, so `stages[:k]` for any `k >= len`
+    is the whole list — which means `prefix_fingerprint(S, 99)` silently returned the WHOLE
+    CHAIN's fingerprint, the same string PROF-1 keys its per-stage table on and CACHE-1 keys
+    frames on. One caller passed a hand-audited constant, so it never fired; a multi-tap
+    planner generates `k` programmatically, and a single off-by-one would have written tap
+    tensors into the profiler's identity. Cheap to check, unbounded to debug."""
+    if not (1 <= k < len(stages)):
+        raise FusionError(
+            f"prefix cut-point {k} out of range for {len(stages)} stages "
+            "(a prefix must be a proper non-empty sub-chain)")
     return _fused_fp(_fused_memo_key(stages[:k], infer_binding_type))
 
 
@@ -919,7 +948,12 @@ def suffix_stage_list(stages: list[dict], k: int, boundary_value) -> list[dict]:
     chain_binding = head.get("chain_input")
     if chain_binding is None:
         raise FusionError("suffix head stage has no chain_input to rebind to the boundary")
-    first = {"code": head["code"], "chain_input": None,
+    # Spread the WHOLE head stage, then override the two keys the rebind owns. Rebuilding it
+    # from `code` alone silently dropped every other key the stage carried — `tap` and
+    # `exports` most of all, so a host that asked for a preview tap on the cut stage got it
+    # from a full cook and lost it from an incremental one. The stages BELOW the cut were
+    # already copied whole (`dict(st)`), so this only makes the head agree with them.
+    first = {**head, "chain_input": None,
              "bindings": {**(head.get("bindings") or {}), chain_binding: boundary_value}}
     return [first] + [dict(st) for st in stages[k + 1:]]
 
