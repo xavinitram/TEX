@@ -37,6 +37,11 @@ _FAMILIES = [
     ("E6", "Runtime / node", "Errors while executing or wiring the node "
      "(an input `@X` isn't connected, a runtime value went non-finite, a fused-chain or "
      "lazy-input problem, an OOM the node re-raised for ComfyUI to handle)."),
+    ("E7", "Host I/O", "Host source and binding errors (DATA-7 / IO-1) — reading a frame "
+     "through a host `FrameProvider`, or wiring a binding whose value TEX cannot type. "
+     "These name the HOST's side of the seam: no provider registered, a provider that "
+     "raised, a time that varies per pixel, a frame of the wrong shape, or a promised "
+     "binding that has not landed."),
     ("E9", "Tools", "Tool errors — building or preflighting a `.textool` bundle failed "
      "(a fused-tool graphspec is malformed, or its stages don't compile together). Check the "
      "tool's stages and manifest; the message names the stage that broke."),

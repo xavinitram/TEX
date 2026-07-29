@@ -463,6 +463,30 @@ def _evict_graphs(dev_type, need: int, playhead=None) -> int:
         return 0
 
 
+def _media_pool_bytes(dev_type) -> int:
+    """Bytes the DATA-7 host-source pool holds on `dev_type`. 0 when no provider was ever
+    armed — the import is deferred so an unarmed engine never builds the pool at all."""
+    try:
+        from .tex_provider import _media_cache
+        return 0 if _media_cache is None else _media_cache.governed_bytes(dev_type)
+    except Exception:
+        return 0
+
+
+def _evict_media(dev_type, need: int, playhead=None) -> int:
+    """Governor evict hook for the media pool. Playhead-aware: a media frame IS a time, so
+    the furthest from the playhead goes first rather than the least recently used."""
+    if need <= 0:
+        return 0
+    try:
+        from .tex_provider import _media_cache
+        if _media_cache is None:
+            return 0
+        return _media_cache.evict_bytes(need, dev_type=dev_type, playhead=playhead)
+    except Exception:
+        return 0
+
+
 class CacheRegistry:
     """CACHE-5: arbitrates the per-device VRAM/RAM cache pools against one budget. Pools register
     a `(bytes_fn, evict_fn, evict_order)`; `arbitrate()` frees across them, cheapest-to-rebuild
@@ -532,6 +556,16 @@ def get_cache_registry() -> CacheRegistry:
         reg = CacheRegistry()
         reg.register("stdlib", lambda dt: _total_cache_bytes(dt), _evict_stdlib_bytes,
                      evict_order=10)
+        # DATA-7: the host-source pool. Registered here (not by a host `register_*` call)
+        # for the same reason the graph pool is: it is process-wide, and an unarmed one
+        # reports 0 bytes forever, so an engine nobody wired a provider into pays a dict
+        # lookup in `stats()` and nothing else.
+        #
+        # evict_order=40 — after `stdlib`, BEFORE `results`. A media frame rebuilds with one
+        # host fetch; a result frame rebuilds with a cook, and that cook may itself have to
+        # fetch sources. Strictly cheaper to rebuild means drained first, which is the
+        # ladder's whole ordering rule.
+        reg.register("media", _media_pool_bytes, _evict_media, evict_order=40)
         reg.register("graphs", _graph_pool_bytes, _evict_graphs, evict_order=90)
         _registry = reg
     return _registry

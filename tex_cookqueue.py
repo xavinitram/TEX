@@ -91,6 +91,10 @@ RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
 CANCELLED = "cancelled"
+#: IO-1: submitted, but one or more of its `inputs=` promises has not landed. NOT eligible —
+#: the worker never sees it, which is what keeps the single-worker contract intact while a
+#: branch waits on host I/O. A landing callback flips it to PENDING.
+WAITING = "waiting"
 
 _TERMINAL = frozenset({DONE, FAILED, CANCELLED})
 
@@ -172,6 +176,16 @@ class Job:
     px: int | None = None
     cost_ms: float | None = None
     score: float = 0.0
+    #: IO-1's PROF-1 pollution guard. An I/O-bound job (a DATA-7 prefetch) must NOT feed the
+    #: compute cost table: an I/O wait recorded as compute cost poisons CACHE-7 placement and
+    #: PRED-1 admission in one stroke. Passing no `profile_key` already skips the feedback —
+    #: this exists because that is an accident of what the caller passed, and the caller is
+    #: the host. An explicit flag is a guard; "we happened not to pass a key" is not.
+    feeds_profile: bool = True
+    #: IO-1: promises this job's cook needs. Duck-typed — anything with `.landed`, `.error`
+    #: and `.on_land(cb)` works, so the queue never imports the marshalling seam and knows
+    #: nothing about bindings. `tex_marshalling.Promise` is the shipped implementation.
+    inputs: tuple = ()
 
     state: str = PENDING
     value: Any = None
@@ -227,6 +241,10 @@ class QueueStats:
     #: rather than refusing one (`_JobToken.check` honours the request at the first yield
     #: past the quantum), and counting a deferral as a refusal would over-report the brake.
     preempt_denied: int = 0
+    #: IO-1: jobs currently parked on an unlanded input. Decremented when they wake or fail,
+    #: so a non-zero value at rest means a host promised something it never delivered — the
+    #: one symptom of a stuck pipeline that looks exactly like an idle queue.
+    waiting: int = 0
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
@@ -274,7 +292,8 @@ class CookQueue:
     def submit(self, fn: Callable[[Any], Any], *, klass: int = INTERACTIVE,
                reason: str = "", confidence: float = 1.0,
                profile_key: tuple | None = None, px: int | None = None,
-               cost_ms: float | None = None) -> Job:
+               cost_ms: float | None = None, feeds_profile: bool = True,
+               inputs=()) -> Job:
         """Queue `fn(cancel_token)` at `klass`. Returns the Job immediately (never blocks).
 
         A submit at a class that OUTRANKS the running job preempts it — the running job's
@@ -284,12 +303,16 @@ class CookQueue:
         than a stampede of mutual aborts.
 
         `reason` / `confidence` / `cost_ms` / `profile_key` / `px` are PRED-1's surface, and
-        inert unless a `SpeculativePolicy` is installed (see `install_policy`)."""
+        inert unless a `SpeculativePolicy` is installed (see `install_policy`).
+        `feeds_profile=False` (IO-1) excludes an I/O-bound job from PROF-1's cost table.
+        `inputs=` (IO-1) is a list of promises: the job sits WAITING — enqueued but not
+        eligible — until every one has landed, so the single worker never blocks on I/O."""
         if klass not in self._q:
             raise ValueError(f"unknown cook class {klass!r} (expected one of {CLASSES})")
         job = Job(id=next(self._ids), klass=klass, fn=fn, reason=reason,
                   confidence=float(confidence), profile_key=profile_key, px=px,
-                  cost_ms=cost_ms)
+                  cost_ms=cost_ms, feeds_profile=bool(feeds_profile),
+                  inputs=tuple(inputs or ()))
         with self._wake:
             if self._closed:
                 raise RuntimeError("CookQueue is closed")
@@ -299,8 +322,16 @@ class CookQueue:
                     f"speculative cook refused by admission policy: {reason or 'no reason given'}"))
                 return job
             self.stats.submitted += 1
+            waiting = bool(job.inputs) and not self._inputs_ready(job)
+            if waiting:
+                job.state = WAITING
+                self.stats.waiting += 1
             self._enqueue_locked(job)
-            self._preempt_for_locked(klass)
+            # A WAITING job must NOT preempt. Tripping a running render for a job that cannot
+            # start is the worst trade available: the render loses all its progress (§4a —
+            # there is no resume) and the preemptor is still waiting on a disk read.
+            if not waiting:
+                self._preempt_for_locked(klass)
             try:
                 self._shed_locked()
             except BaseException:            # noqa: BLE001 — a host policy bug is not ours
@@ -309,9 +340,63 @@ class CookQueue:
                 # side effects and all, with no handle to observe them through.
                 logger.exception("[TEX] cook-queue shed policy raised; ignoring")
             self._wake.notify_all()
+        # Registered OUTSIDE the queue's lock. `on_land` fires an already-landed promise's
+        # callback synchronously, and that callback takes this lock — arming under it would
+        # deadlock on the exact race the WAITING state is for (a promise that lands between
+        # the readiness check above and here).
+        for p in job.inputs:
+            try:
+                p.on_land(self._on_input_landed)
+            except Exception:
+                logger.exception("[TEX] promise refused a landing callback; waking the job")
+                self._wake_if_ready(job)
         if self._worker is None:      # benign unlocked double-check; _ensure_worker re-tests
             self._ensure_worker()
         return job
+
+    @staticmethod
+    def _inputs_ready(job: Job) -> bool:
+        return all(getattr(p, "landed", True) for p in job.inputs)
+
+    def _on_input_landed(self, _promise) -> None:
+        """A promise landed: wake every WAITING job whose inputs are now all in.
+
+        Scans rather than indexing promise -> jobs. The waiting set is bounded by the
+        queue's own depth and a landing is a once-per-frame event, so an index would be a
+        second structure to keep consistent with the deques for no measurable gain."""
+        with self._wake:
+            for dq in self._q.values():
+                for job in list(dq):
+                    if job.state == WAITING:
+                        self._wake_if_ready_locked(job)
+            self._wake.notify_all()
+
+    def _wake_if_ready(self, job: Job) -> None:
+        with self._wake:
+            self._wake_if_ready_locked(job)
+            self._wake.notify_all()
+
+    def _wake_if_ready_locked(self, job: Job) -> None:
+        """WAITING -> PENDING once every input has landed, or -> FAILED if one failed.
+
+        A failed promise fails its jobs rather than leaving them parked: a source that
+        cannot be read is a finished question, not a slow one, and a job waiting forever on
+        it is indistinguishable from a hung queue."""
+        if job.state != WAITING:
+            return
+        for p in job.inputs:
+            err = getattr(p, "error", None)
+            if err is not None:
+                self._remove_locked(job)
+                self.stats.failed += 1
+                self._finish_locked(job, FAILED, error=err)   # decrements `waiting` itself
+                return
+        if not self._inputs_ready(job):
+            return
+        self.stats.waiting -= 1
+        job.state = PENDING
+        # Now that it can actually run, it gets the preemption it was denied at submit.
+        self._preempt_for_locked(job.klass)
 
     def _enqueue_locked(self, job: Job, *, head: bool = False) -> None:
         """Place a PENDING job. SPECULATIVE is kept score-ordered (PRED-1); the other two are
@@ -485,16 +570,26 @@ class CookQueue:
             raise
 
     def _next_locked(self) -> Job | None:
+        """The highest-priority ELIGIBLE job, removed from its deque.
+
+        IO-1 turned this from a `popleft` into a scan, because a WAITING job must be skipped
+        and KEPT — popping it would drop it. The scan is what buys one home for every job:
+        the shed loop, `cancel()`, `close()`'s drain and `snapshot()` all still see waiting
+        jobs by looking exactly where they always looked. A side table would be cheaper by
+        this scan and would hide a waiting speculative prefetch from the shed policy that
+        exists to drop it.
+
+        Cost: index 0 whenever nothing is waiting, which is every cook in the tree today —
+        and `_enqueue_locked` already does a linear insert per speculative submit."""
         for k in CLASSES:                    # numeric order IS priority order
-            dq = self._q[k]
-            while dq:
-                job = dq.popleft()
+            for job in self._q[k]:
                 if job.state == PENDING and not job.shed_requested:
+                    self._q[k].remove(job)   # identity remove — Job is eq=False
                     return job
-                # DEFENCE, not a live case: every path that finishes a QUEUED job removes it
-                # from the deque first, under this same lock (cancel() and the shed loop both
-                # call `_remove_locked` before `_finish_locked`; close() drains). The loop
-                # keeps a future path that forgets that from handing the worker a dead job.
+                # A non-PENDING, non-WAITING job in a deque is DEFENCE, not a live case:
+                # every path that finishes a QUEUED job removes it first, under this same
+                # lock. The scan keeps a future path that forgets that from handing the
+                # worker a dead job.
         return None
 
     def _run(self) -> None:
@@ -582,6 +677,21 @@ class CookQueue:
                 self._finish_locked(job, CANCELLED, error=e)
                 self._wake.notify_all()
         except BaseException as e:                     # noqa: BLE001 — the cook's error is the host's
+            # DATA-7: a HOST-I/O failure (E7xxx) is class-dependent, and the provider cannot
+            # know its job's class — so the decision lives here, where the class is known. An
+            # INTERACTIVE or COMMITTED job reports it: the user asked for that frame and is
+            # owed the reason it did not arrive. A SPECULATIVE one dies into the refusals
+            # ledger instead, because a prefetch that alarms about a source the user never
+            # asked for is worse than a prefetch that quietly did not happen.
+            if job.klass == SPECULATIVE and str(getattr(e, "_code", "")).startswith("E7"):
+                with self._wake:
+                    self._running = None
+                    self._note_speculative_io_failure(job, e)
+                    self.stats.cancelled += 1
+                    self._finish_locked(job, CANCELLED, error=CookCancelled(
+                        f"speculative host-I/O failure ({getattr(e, '_code', 'E7')}): {e}"))
+                    self._wake.notify_all()
+                return
             with self._wake:
                 self._running = None
                 self.stats.failed += 1
@@ -601,7 +711,7 @@ class CookQueue:
             # not "what does computing this program cost". The engine's `measure` feeds the
             # second question, and CACHE-7's input is the per-STAGE table, which only the
             # engine writes.
-            if job.profile_key is not None:
+            if job.profile_key is not None and job.feeds_profile:
                 try:
                     _profile.record(job.profile_key,
                                     (time.perf_counter() - job.started_at) * 1000.0, job.px)
@@ -616,7 +726,30 @@ class CookQueue:
                 self._finish_locked(job, DONE, value=value)
                 self._wake.notify_all()
 
+    def _note_speculative_io_failure(self, job: Job, exc: BaseException) -> None:
+        """Record a shed-by-I/O in the policy's refusals ledger. Lock held.
+
+        Reaches `_refuse` rather than re-implementing the counter, so a host reading
+        `policy.refusals` sees prefetch failures grouped by the same reason string it groups
+        admission refusals by — one ledger, one question ("why did my prefetches stop?"),
+        one answer. Silent when no policy is installed: with nobody scoring speculation
+        there is nobody to report to."""
+        policy = self._policy
+        refuse = getattr(policy, "_refuse", None)
+        if refuse is None:
+            return
+        try:
+            refuse(job, f"host I/O failed: {getattr(exc, '_code', '')} {exc}".strip())
+        except BaseException:                # noqa: BLE001 — a host policy bug is not ours
+            logger.exception("[TEX] cook-queue refusals ledger raised; ignoring")
+
     def _finish_locked(self, job: Job, state: str, *, value=None, error=None) -> None:
+        # IO-1: a WAITING job can be finished by four different paths (a failed promise, a
+        # shed, a host cancel, close()'s drain). Decrementing here — the one door all four go
+        # through — is why `stats.waiting` cannot drift, and a drifted counter is exactly the
+        # symptom it exists to report.
+        if job.state == WAITING:
+            self.stats.waiting -= 1
         job.state = state
         job.value = value
         job.error = error
@@ -632,7 +765,12 @@ class CookQueue:
         with self._wake:
             run = self._running
             return {"stats": self.stats.as_dict(),
-                    "pending": {CLASS_NAMES[k]: len(self._q[k]) for k in CLASSES},
+                    "pending": {CLASS_NAMES[k]: sum(1 for j in self._q[k]
+                                                    if j.state == PENDING)
+                                for k in CLASSES},
+                    "waiting": {CLASS_NAMES[k]: sum(1 for j in self._q[k]
+                                                    if j.state == WAITING)
+                                for k in CLASSES},
                     "running": None if run is None else
                                {"id": run.id, "class": run.class_name, "attempts": run.attempts}}
 

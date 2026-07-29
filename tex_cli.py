@@ -73,8 +73,17 @@ def save_image(tensor: torch.Tensor, path: str, *, bit_depth: int = 8) -> None:
     """[1, H, W, C] float [0,1] (or [1, H, W] / [H, W] mask) -> PNG. Round (not truncate)
     for a bit-exact round-trip: round(u/255*255) == u. `bit_depth=16` (DATA-2) writes a
     16-bit PNG via `tex_io` (torchvision's encoder is uint8-only) — a higher-fidelity
-    normalized-integer sink than 8-bit; still [0,1], so EXR remains the HDR path."""
+    normalized-integer sink than 8-bit; still [0,1], so EXR remains the HDR path.
+
+    v0.34 async writes: `tensor` may be an XPU-2 `FrameHandle` whose device-to-host copy is
+    still in flight. Fencing here — at the sink, not at the caller — is the contract: the
+    engine's obligation ends at "the next cook starts immediately", and the writer waits for
+    the bytes it is about to write. A handle OR a tensor is accepted because a CPU cook hands
+    back a tensor and forcing every caller through a handle would be ceremony on the path
+    with nothing to overlap."""
     from torchvision.io import encode_png, write_file
+    if hasattr(tensor, "tensor") and hasattr(tensor, "is_ready"):
+        tensor = tensor.tensor()              # FrameHandle: fence, then write
     t = tensor.detach().float().cpu()
     if t.dim() == 4:                              # [1, H, W, C] -> [H, W, C]
         t = t[0]

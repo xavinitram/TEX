@@ -1,11 +1,31 @@
 """
-LANG-3 — the frozen language-compatibility corpus.
+LANG-3 — the frozen language-compatibility corpus. R2-archive (v0.34) — append-only.
 
 Runs every `examples/*.tex` plus a set of adversarial grammar programs through the
-INTERPRETER on CPU and hashes the quantized outputs. The hashes are frozen in
-`compat_corpus_goldens.json`. A mismatch means a language change (parser / type
-checker / interpreter / optimizer) altered what an EXISTING program computes — the
-regression PM-4 guards against ("v0.25 runs a v0.22 program the same way").
+INTERPRETER on CPU and hashes the quantized outputs. The hashes are frozen per LANGUAGE
+VERSION in `compat_corpus_goldens/<lang_version>.json`. A mismatch means a language change
+(parser / type checker / interpreter / optimizer) altered what an EXISTING program
+computes — the regression PM-4 guards against ("v0.25 runs a v0.22 program the same way").
+
+R2-ARCHIVE, and why the shape changed (doc 40 §1, doc 41 §3.4). Until v0.34 there was ONE
+golden file and `regen()` **overwrote the whole thing**. "Old goldens are immutable" was
+therefore a convention enforced by review — and a convention is not a compatibility proof,
+because the one action that breaks it (re-freezing after an unintended pixel change) is
+also the one action that makes the suite go green again. So:
+
+  * the single file becomes a per-version **archive directory**, one file per frozen
+    language version;
+  * `regen()` is GONE. `freeze(version)` may only ADD a version that is not there yet, and
+    refuses to rewrite one that is — the immutability is machinery now, not manners;
+  * the corpus test runs current behavior against **every** archived version.
+
+It lands in v0.34 rather than v0.35 (where the first new freeze is due) precisely so it
+lands while it is neutral: there is exactly ONE archived version (0.23), so the test does
+exactly what it did before, and that is the proof the mechanism changed nothing.
+
+Correcting an archived version is deliberately awkward and deliberately possible: delete
+the file and `freeze()` it again, in a commit whose message argues the pixel change. The
+awkwardness is the review gate.
 
 Determinism / portability:
   * single-threaded CPU + the example harness's per-binding fixed seed makes each run
@@ -16,10 +36,10 @@ Determinism / portability:
   * NaN/Inf are mapped to sentinels so a divergent-but-finite change stays detectable.
 CPU-pinned by design (the roadmap: the corpus is CPU-pinned, never GPU).
 
-Regenerate after an INTENTIONAL, reviewed language change:
-    python -X utf8 -c "import texboot, compat_corpus; compat_corpus.regen()"
-(run from tests/, with the scratchpad on sys.path for texboot). Regenerating is a
-deliberate act — it re-freezes the goldens at the current behavior.
+Freeze a NEW language version (only ever after the surface change that earned the bump):
+    python -X utf8 -c "import texboot, compat_corpus; compat_corpus.freeze()"
+(run from tests/, with the scratchpad on sys.path for texboot). It writes
+`compat_corpus_goldens/<tex_api.LANGUAGE_VERSION>.json` and refuses if that file exists.
 """
 import hashlib
 import json
@@ -31,7 +51,7 @@ import test_integration as _ti   # reuse the frozen dummy-input harness (_prepar
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_GOLDENS = os.path.join(_HERE, "compat_corpus_goldens.json")
+_ARCHIVE = os.path.join(_HERE, "compat_corpus_goldens")
 _EXAMPLES = os.path.join(os.path.dirname(_HERE), "examples")
 
 _B, _H, _W = 2, 16, 16   # match test_example_files (B=2 exercises batch/temporal paths)
@@ -133,18 +153,71 @@ def compute_all() -> dict:
         torch.set_num_threads(prev_threads)
 
 
-def load_goldens() -> dict:
-    with open(_GOLDENS, encoding="utf-8") as f:
+def _ver_key(v: str) -> tuple:
+    """Sort key for a language version. Numeric per component so `0.9` sorts BELOW `0.23`
+    — `tex_api._ver_tuple` int-parses the same way, and a lexical sort would silently make
+    the newest archive the wrong file exactly once, at the 0.9 → 0.10 boundary."""
+    try:
+        return tuple(int(p) for p in v.split("."))
+    except ValueError:
+        return (-1,)          # an unparseable name sorts first and is never "the newest"
+
+
+def archived_versions() -> list:
+    """Every frozen language version, oldest first. Empty if the archive is missing."""
+    if not os.path.isdir(_ARCHIVE):
+        return []
+    return sorted((fn[:-5] for fn in os.listdir(_ARCHIVE) if fn.endswith(".json")),
+                  key=_ver_key)
+
+
+def archive_path(version: str) -> str:
+    return os.path.join(_ARCHIVE, f"{version}.json")
+
+
+def load_version(version: str) -> dict:
+    """One archived version's payload: `{"language_version": ..., "hashes": {...}}`."""
+    with open(archive_path(version), encoding="utf-8") as f:
         return json.load(f)
 
 
-def regen():
-    """Freeze the current behavior as the goldens. A DELIBERATE act — only after a
-    reviewed, intentional language change."""
+def load_archive() -> dict:
+    """`{language_version: payload}` for every frozen version, oldest first."""
+    return {v: load_version(v) for v in archived_versions()}
+
+
+def load_goldens(version: str | None = None) -> dict:
+    """One version's payload — the NEWEST archived version by default.
+
+    Kept at its old name and old return shape so a caller that only ever wanted "the
+    goldens" is unaffected by the archive split."""
+    versions = archived_versions()
+    if not versions:
+        raise FileNotFoundError(f"no frozen corpus versions in {_ARCHIVE}")
+    return load_version(version or versions[-1])
+
+
+def freeze(version: str | None = None) -> dict:
+    """Freeze current behavior as a NEW archived version. Defaults to `LANGUAGE_VERSION`.
+
+    **May only ADD.** Re-freezing an existing version raises, because that is the single
+    action the archive exists to prevent: a real pixel regression on a frozen program is
+    also, from the suite's point of view, one overwrite away from green. Correcting an
+    archived version means deleting the file in a commit that argues the change — visible
+    in review, which a silent rewrite was not.
+    """
     from TEX_Wrangle.tex_api import LANGUAGE_VERSION
-    data = {"language_version": LANGUAGE_VERSION, "hashes": compute_all()}
-    with open(_GOLDENS, "w", encoding="utf-8", newline="\n") as f:
+    version = str(version or LANGUAGE_VERSION)
+    path = archive_path(version)
+    if os.path.exists(path):
+        raise FileExistsError(
+            f"language version {version} is already frozen at {path}. The archive is "
+            f"append-only: bump tex_api.LANGUAGE_VERSION for a new surface, or delete "
+            f"that file deliberately if a frozen golden is genuinely wrong.")
+    os.makedirs(_ARCHIVE, exist_ok=True)
+    data = {"language_version": version, "hashes": compute_all()}
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write("\n")
-    print(f"wrote {len(data['hashes'])} goldens to {_GOLDENS}")
+    print(f"froze {len(data['hashes'])} goldens as language version {version} -> {path}")
     return data

@@ -2208,6 +2208,8 @@ const TEX_HELP_DATA = [
             { name: "fn", sig: "fn \u2192 int", desc: "Total number of frames in the batch.", example: "float progress = fi / max(fn - 1, 1);" },
             { name: "fetch_frame", sig: "fetch_frame(img, frame, px, py) \u2192 vec", desc: "Nearest-neighbor fetch from a specific batch frame.", example: "@OUT = fetch_frame(@A, fi-1, ix, iy);" },
             { name: "sample_frame", sig: "sample_frame(img, frame, u, v) \u2192 vec", desc: "Bilinear sample from a specific batch frame.", example: "@OUT = sample_frame(@A, 0, u, v);" },
+            { name: "fetch_time", sig: "fetch_time(source, t, px, py) \u2192 vec", desc: "Nearest-neighbour read of a HOST source at time t (DATA-7). Needs a registered FrameProvider.", example: "@OUT = fetch_time(\"plate\", time, ix, iy);" },
+            { name: "sample_time", sig: "sample_time(source, t, u, v) \u2192 vec", desc: "Bilinear sample of a HOST source at time t (DATA-7). Needs a registered FrameProvider.", example: "@OUT = sample_time(\"plate\", time - 0.5, u, v);" },
             { name: "Fade Example", sig: "fi, fn", desc: "Fade an image in over the batch.", example: "@OUT = @A * (fi / max(fn-1, 1));" },
             { name: "Temporal Blend", sig: "fetch_frame + lerp", desc: "Blend adjacent frames together.", example: "@OUT = lerp(\n  fetch_frame(@A, fi-1, ix, iy),\n  fetch_frame(@A, fi+1, ix, iy),\n  0.5);" },
         ]

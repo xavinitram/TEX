@@ -208,6 +208,8 @@
 |----------|-----------|-------------|------|
 | `fetch_frame` | `fetch_frame(img, frame, px, py) → vec` | Nearest-neighbor fetch from a specific batch frame. | spatial, non-local |
 | `sample_frame` | `sample_frame(img, frame, u, v) → vec` | Bilinear sample from a specific batch frame. | spatial, non-local |
+| `fetch_time` | `fetch_time(source, t, px, py) → vec` | Nearest-neighbour read of a HOST source at time t (DATA-7). Needs a registered FrameProvider. | spatial, sync, non-local |
+| `sample_time` | `sample_time(source, t, u, v) → vec` | Bilinear sample of a HOST source at time t (DATA-7). Needs a registered FrameProvider. | spatial, sync, non-local |
 
 ## Debugging
 

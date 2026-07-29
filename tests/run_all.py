@@ -1146,6 +1146,86 @@ def main():
     test_v0332_h7_a_restore_that_starts_inside_a_purge_is_refused_at_capture(r)
     test_v0332_h7_the_purge_depth_survives_an_interrupted_walk(r)
 
+    # v0.34 DATA-7 — the host source protocol (fetch_time/sample_time) and its pool.
+    from test_v034_data7 import (
+        test_v034_data7_null_provider_refuses,
+        test_v034_data7_reads_cook_on_both_devices,
+        test_v034_data7_motion_blur_exemplar,
+        test_v034_data7_temporal_median_exemplar,
+        test_v034_data7_a_per_pixel_time_is_refused,
+        test_v034_data7_a_bad_frame_is_refused,
+        test_v034_data7_a_provider_failure_is_named,
+        test_v034_data7_quantization_collapses_neighbouring_times,
+        test_v034_data7_no_source_key_never_caches,
+        test_v034_data7_a_version_bump_invalidates,
+        test_v034_data7_refuses_tiling_and_graph_capture,
+        test_v034_data7_unarmed_costs_nothing,
+        test_v034_data7_pool_arbitrates_under_the_governor,
+        test_v034_data7_eviction_is_playhead_aware,
+        test_v034_data7_reattach_reports_the_media_pool,
+        test_v034_data7_speculative_io_failure_never_alarms,
+    )
+    test_v034_data7_null_provider_refuses(r)
+    test_v034_data7_reads_cook_on_both_devices(r)
+    test_v034_data7_motion_blur_exemplar(r)
+    test_v034_data7_temporal_median_exemplar(r)
+    test_v034_data7_a_per_pixel_time_is_refused(r)
+    test_v034_data7_a_bad_frame_is_refused(r)
+    test_v034_data7_a_provider_failure_is_named(r)
+    test_v034_data7_quantization_collapses_neighbouring_times(r)
+    test_v034_data7_no_source_key_never_caches(r)
+    test_v034_data7_a_version_bump_invalidates(r)
+    test_v034_data7_refuses_tiling_and_graph_capture(r)
+    test_v034_data7_unarmed_costs_nothing(r)
+    test_v034_data7_pool_arbitrates_under_the_governor(r)
+    test_v034_data7_eviction_is_playhead_aware(r)
+    test_v034_data7_reattach_reports_the_media_pool(r)
+    test_v034_data7_speculative_io_failure_never_alarms(r)
+
+    # v0.34 IO-1 — promised bindings + dependency-aware admission, and the §3.3
+    # async-write contract (a test, not a subsystem).
+    from test_v034_io1 import (
+        test_v034_io1_unknown_bindings_are_refused,
+        test_v034_io1_a_promise_declares_its_identity,
+        test_v034_io1_prepare_resolves_and_refuses,
+        test_v034_io1_a_ready_branch_cooks_while_its_sibling_waits,
+        test_v034_io1_a_waiting_submit_never_preempts,
+        test_v034_io1_a_failed_promise_fails_its_jobs,
+        test_v034_io1_waiting_jobs_stay_visible_to_shed_and_close,
+        test_v034_io1_prefetch_never_feeds_the_profiler,
+        test_v034_io1_declare_window_prefetches_a_range,
+        test_v034_io1_backpressure_refuses_rather_than_evicting,
+        test_v034_io1_cancellation_drops_on_landing,
+        test_v034_async_write_does_not_block_the_next_cook,
+        test_v034_async_write_bytes_are_bit_exact,
+    )
+    test_v034_io1_unknown_bindings_are_refused(r)
+    test_v034_io1_a_promise_declares_its_identity(r)
+    test_v034_io1_prepare_resolves_and_refuses(r)
+    test_v034_io1_a_ready_branch_cooks_while_its_sibling_waits(r)
+    test_v034_io1_a_waiting_submit_never_preempts(r)
+    test_v034_io1_a_failed_promise_fails_its_jobs(r)
+    test_v034_io1_waiting_jobs_stay_visible_to_shed_and_close(r)
+    test_v034_io1_prefetch_never_feeds_the_profiler(r)
+    test_v034_io1_declare_window_prefetches_a_range(r)
+    test_v034_io1_backpressure_refuses_rather_than_evicting(r)
+    test_v034_io1_cancellation_drops_on_landing(r)
+    test_v034_async_write_does_not_block_the_next_cook(r)
+    test_v034_async_write_bytes_are_bit_exact(r)
+
+    # v0.34 R2-archive — the compat-corpus goldens become an append-only per-version
+    # archive. Landed a release early, while it is still neutral (one frozen version).
+    from test_v034_r2_archive import (
+        test_v034_r2_freeze_may_only_add,
+        test_v034_r2_versions_sort_numerically,
+        test_v034_r2_neutrality,
+        test_v034_r2_regen_is_gone,
+    )
+    test_v034_r2_freeze_may_only_add(r)
+    test_v034_r2_versions_sort_numerically(r)
+    test_v034_r2_neutrality(r)
+    test_v034_r2_regen_is_gone(r)
+
     success = r.summary()
     return 0 if success else 1
 

@@ -26,17 +26,30 @@ import re
 from collections import OrderedDict
 from typing import Any, Callable
 
-# FUS-1: cap how large a single fused region can grow. A 50-node region compiles into
-# ONE torch.compile program (longer trace, bigger capture) and materializes full-res
-# intermediates — Blender and torch.compile both cap their fuse
-# units for the same reason. Past the cap the region is left unfused (the linear pass
-# still fuses sub-chains); safe, just not one giant program.
+# FUS-1: cap how large a single fused region can grow. Past the cap the region is left
+# unfused (the linear pass still fuses sub-chains); safe, just not one giant program.
 #
-# The original text justified the cap partly by "CACHE-6 hasn't landed" — it landed in v0.27,
-# and CACHE-7 generalized it in v0.32, so that half of the rationale is spent. What still
-# stands is trace/capture size. Whether 16 is still the right number is a MEASUREMENT nobody
-# has taken: at N=17 a linear chain yields ZERO fusable regions, which is a cliff, not a taper.
-# Doc 41 §3.5 schedules the decision spike.
+# THE CAP IS NOW MEASURED, not asserted (FUS-cap decision spike, v0.34 —
+# `docs/fusion-cap-decision.md`, `benchmarks/fus_cap_bench.py`). The two rationales this
+# comment used to carry were both wrong or spent: "CACHE-6 hasn't landed" landed in v0.27,
+# and trace/capture size turned out not to be what the cap is buying. What it buys is PEAK
+# MEMORY. A fused region materializes every stage's full-res intermediate and holds them all
+# live for the cook; the unfused route holds two. Measured at 1024², 50 stages, sm_75:
+#
+#     peak VRAM   fused 828 MiB   segmented(16) 816 MiB   unfused 64 MiB   (12.9x)
+#     CPU time    fused 1.54x SLOWER than unfused;  CUDA time  identical (1.00x)
+#
+# So the N=17 "cliff" is PROTECTIVE. Fusing a long chain at production resolution buys
+# nothing on CUDA, loses on CPU, and costs an order of magnitude in peak memory — and
+# segmenting into chained <=16-stage regions reproduces those costs in smaller pieces rather
+# than avoiding them (it tracks the fused numbers, not the unfused ones, on both axes).
+# Fusion's real win is amortizing per-cook overhead, which only dominates at small
+# resolutions: at 512² fusing 50 stages is 1.10x (CPU) / 1.23x (CUDA) faster, and that
+# crossover is gone by 1024². Big comps belong to CACHE-7/9, which is PM-8's own split.
+#
+# Raising the cap makes all of this worse; lowering it would forfeit the small-resolution
+# win. 16 stays, and the reopen gate is a measurement showing fusion that does NOT
+# materialize per-stage intermediates (a real kernel-fusing backend, i.e. GRAPH-2 territory).
 _MAX_FUSED_REGION_STAGES = 16
 
 logger = logging.getLogger("TEX.fusion")

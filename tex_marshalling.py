@@ -10,7 +10,9 @@ conversion (hex colors, comma-separated vectors, booleans).
 from __future__ import annotations
 
 import hashlib
+import logging
 import struct
+import threading
 import torch
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -18,6 +20,8 @@ from typing import Any, Iterable
 
 from .tex_compiler.types import TEXType, set_array_wires, array_wires_enabled, _VEC_SIZE_TYPE
 from .tex_runtime.stdlib import LUMA_R, LUMA_G, LUMA_B
+
+logger = logging.getLogger("TEX")
 
 
 # ── XPU: pinned egress + non-blocking ingestion (v0.20) ──────────────────────
@@ -270,6 +274,164 @@ def convert_param_value(value: Any, param_info: dict, param_name: str = "") -> A
     return value
 
 
+# ── IO-1: promised bindings ──────────────────────────────────────────────────
+#
+# A binding whose pixels have not arrived yet. Design: `docs/async-io.md` §2.
+#
+# THE PROBLEM IT SOLVES, stated once: `prepare()` derives a program's identity from binding
+# VALUES (`infer_binding_type` on each), and that function used to end in a silent
+# `return TEXType.FLOAT`. A promise wired today therefore did not fail — it typed as FLOAT,
+# minted a fingerprint for a program that does not exist, and compiled something wrong.
+# Identity corruption, not an error. A `Promise` declares its type up front so identity is
+# computable before the value lands, and `infer_binding_type` now REFUSES anything it does
+# not recognise (E7005) so the silent path is gone whether or not a host uses promises.
+
+class Promise:
+    """A binding value that has not landed yet, with its identity declared up front.
+
+        p = Promise("A", type=TEXType.VEC4, shape=(1, 1080, 1920, 4), device="cuda:0")
+        job = queue.submit(fn, klass=COMMITTED, inputs=[p])
+        ...                                    # on the host's I/O thread
+        p.land(tensor)
+
+    The declaration is a PROMISE in the contractual sense: `land()` validates the tensor
+    against it and raises E7006 on a mismatch, naming both. A promise that lies fails at the
+    moment of landing — where the host can still see which read produced it — rather than as
+    a shape error inside a cook three seconds later.
+
+    Deliberately NOT a tensor subclass: every existing consumer pattern-matches raw tensors,
+    and a subclass would make an unlanded promise silently usable in arithmetic (the XPU-2
+    handle decision, for the same reason).
+    """
+
+    __slots__ = ("name", "declared_type", "shape", "device", "_value", "_error",
+                 "_lock", "_callbacks")
+
+    def __init__(self, name: str, *, type=None, shape=None, device=None):
+        self.name = str(name)
+        self.declared_type = type if type is not None else TEXType.VEC4
+        self.shape = tuple(shape) if shape is not None else None
+        self.device = str(device) if device is not None else None
+        self._value = None
+        self._error = None
+        #: Guards the value/error/callback triple. A promise is landed by a host's I/O
+        #: thread and read by the queue's worker, so this is a genuinely shared object.
+        self._lock = threading.Lock()
+        self._callbacks = []
+
+    @property
+    def landed(self) -> bool:
+        return self._value is not None or self._error is not None
+
+    @property
+    def value(self):
+        return self._value
+
+    @property
+    def error(self):
+        return self._error
+
+    def land(self, value) -> "Promise":
+        """Deliver the value, validated against the declaration. Wakes every waiter."""
+        self._check(value)
+        with self._lock:
+            if self.landed:
+                raise RuntimeError(f"promise {self.name!r} has already landed")
+            self._value = value
+            cbs, self._callbacks = self._callbacks, []
+        self._fire(cbs)
+        return self
+
+    def fail(self, exc: BaseException) -> "Promise":
+        """Deliver a FAILURE. Jobs waiting on it fail with `exc` rather than waiting forever —
+        a source that cannot be read is a finished question, not a slow one."""
+        with self._lock:
+            if self.landed:
+                raise RuntimeError(f"promise {self.name!r} has already landed")
+            self._error = exc
+            cbs, self._callbacks = self._callbacks, []
+        self._fire(cbs)
+        return self
+
+    def on_land(self, cb) -> None:
+        """Call `cb(self)` when this promise lands — immediately if it already has.
+
+        Fired OUTSIDE the promise's lock, and outside it for the already-landed case too, so
+        a callback that takes the cook queue's lock cannot invert lock order against a
+        concurrent `land()`."""
+        with self._lock:
+            if not self.landed:
+                self._callbacks.append(cb)
+                return
+        self._fire([cb])
+
+    def _fire(self, cbs) -> None:
+        for cb in cbs:
+            try:
+                cb(self)
+            except Exception:
+                logger.exception("[TEX] promise callback raised; ignoring")
+
+    def _check(self, value) -> None:
+        """Validate a landed tensor against the declaration (E7006).
+
+        Shape and device are checked only when they were DECLARED: a host that knows the
+        type but not the resolution says so by omitting them, and gets the type check alone.
+        """
+        from .tex_runtime.interpreter import InterpreterError
+        got = None
+        if isinstance(value, torch.Tensor):
+            got = infer_binding_type(value)
+            if self.shape is not None and tuple(value.shape) != self.shape:
+                raise InterpreterError(
+                    f"promised binding '{self.name}' declared shape {self.shape} but landed "
+                    f"{tuple(value.shape)}.", None, code="E7006",
+                    hint="The declaration is what the cook's identity was computed from, so "
+                         "a mismatch means the program that was compiled is not the program "
+                         "these pixels belong to.")
+            if self.device is not None and str(value.device) != self.device:
+                raise InterpreterError(
+                    f"promised binding '{self.name}' declared device {self.device!r} but "
+                    f"landed on {str(value.device)!r}.", None, code="E7006",
+                    hint="Device is a MANDATORY lineage-key component (invariant #9), so a "
+                         "cross-device landing is a different result, not a movable one.")
+        else:
+            got = infer_binding_type(value)
+        if got != self.declared_type:
+            raise InterpreterError(
+                f"promised binding '{self.name}' declared {self.declared_type.name} but "
+                f"landed a value of type {got.name}.", None, code="E7006",
+                hint="Declare the type the host will actually deliver — identity was already "
+                     "computed from the declaration.")
+
+
+def resolve_promise_bindings(bindings: dict) -> dict:
+    """Replace landed `Promise` values with their tensors. Returns the same dict if there are
+    none, so the default cook path allocates nothing.
+
+    An UNLANDED promise here is E7007, not a wait. It means a host cooked around the queue's
+    admission, and blocking the cook thread on an I/O wait is exactly the failure the WAITING
+    state exists to prevent — so it is refused loudly instead of hidden as a stall.
+    """
+    if not any(v.__class__ is Promise for v in bindings.values()):
+        return bindings
+    from .tex_runtime.interpreter import InterpreterError
+    out = dict(bindings)
+    for name, v in bindings.items():
+        if v.__class__ is not Promise:
+            continue
+        if v.error is not None:
+            raise v.error
+        if v.value is None:
+            raise InterpreterError(
+                f"binding '{name}' is a promise that has not landed.", None, code="E7007",
+                hint="Submit the cook with `inputs=[promise]` so the queue admits it when "
+                     "its inputs land. Cooking a promise directly would block the single "
+                     "cook worker on host I/O, which the WAITING state exists to prevent.")
+        out[name] = v.value
+    return out
+
+
 # ── Type inference ──
 
 def _spatial_channels_to_type(c: int) -> TEXType:
@@ -296,7 +458,19 @@ def _spatial_channels_to_type(c: int) -> TEXType:
 
 
 def infer_binding_type(value: Any) -> TEXType:
-    """Infer the TEX type of a ComfyUI input value."""
+    """Infer the TEX type of a ComfyUI input value.
+
+    IO-1: an UNRECOGNISED value is now E7005, not `TEXType.FLOAT`. The old catch-all was a
+    silent identity corruption — `prepare()` derives a program's fingerprint from these
+    types, so an object nobody thought about typed as FLOAT and compiled a program that does
+    not match the pixels. Every type the tree actually relies on has an explicit branch
+    below; `None` keeps one, because ComfyUI hands `None` for an unconnected optional input
+    and the E6003 "not connected" gate is what is supposed to report that, further down,
+    with a message naming the slot.
+    """
+    if value.__class__ is Promise:
+        # The whole point: identity is computable before the pixels land.
+        return value.declared_type
     # Image/latent lists — use first element for type inference
     if isinstance(value, list):
         if len(value) > 0:
@@ -327,7 +501,17 @@ def infer_binding_type(value: Any) -> TEXType:
         return TEXType.INT
     elif isinstance(value, float):
         return TEXType.FLOAT
-    return TEXType.FLOAT
+    elif value is None:
+        # An unconnected optional input. Typing it FLOAT here is deliberate: the E6003 gate
+        # downstream is the one that reports it, and it names the slot, which this cannot.
+        return TEXType.FLOAT
+    from .tex_runtime.interpreter import InterpreterError
+    raise InterpreterError(
+        f"a binding of type {type(value).__name__} cannot be typed by TEX.", None,
+        code="E7005",
+        hint="Wire a tensor, a number, a string, or a tex_marshalling.Promise. A program's "
+             "cache identity is derived from binding TYPES, so guessing here would compile "
+             "one program and cook another.")
 
 
 # ── ANIM-1: which bindings actually IDENTIFY a program ───────────────────────

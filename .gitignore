@@ -32,7 +32,10 @@ error_reports/
 # Intermediate benchmark JSON files from development
 tests/*.json
 # ...but the LANG-3 compat-corpus goldens are a COMMITTED release artifact (the PM-4 gate).
-!tests/compat_corpus_goldens.json
+# R2-archive (v0.34): one file per frozen language version, append-only. The directory is
+# whitelisted rather than a single filename, so a freeze cannot be silently uncommitted.
+!tests/compat_corpus_goldens/
+!tests/compat_corpus_goldens/*.json
 
 wiki/
 .coverage

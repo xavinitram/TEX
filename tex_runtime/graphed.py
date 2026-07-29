@@ -70,6 +70,10 @@ _SYNC_STDLIB = frozenset({
     # LX-5: debug_print records a thread-local side-effect via an .item() readout —
     # capture-illegal, and it must run on the interpreter anyway so the probe fires.
     "debug_print",
+    # DATA-7: a host callback inside a capture is not a sync, it is a FOREIGN CALL — it
+    # would be baked once and replayed forever, so every later frame would serve the first
+    # frame's pixels with no error anywhere. The uniform-time check also .item()s.
+    "fetch_time", "sample_time",
 })
 
 # fingerprint-signature -> GraphedProgram (LRU, bytes-aware).

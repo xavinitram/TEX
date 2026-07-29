@@ -157,6 +157,15 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "fetch_frame":    {"args": (4, 4), "return": _passthrough_type},
     "sample_frame":   {"args": (4, 4), "return": _passthrough_type},
 
+    # DATA-7 out-of-batch source reads. NOT passthrough: the first argument is a STRING
+    # source key, not a binding, so there is no wire to take the type from. The result is
+    # always VEC4, and `tex_provider._normalize` REQUIRES a 4-channel frame so that
+    # declaration is true rather than hopeful — a host owns decoding, so expanding a mono
+    # or RGB source to RGBA is its job, and a type the checker states must not be a guess.
+    # (Per-source declared channel counts arrive with DATA-6's plane classes in v0.35.)
+    "fetch_time":     {"args": (4, 4), "return": lambda _: TEXType.VEC4},
+    "sample_time":    {"args": (4, 4), "return": lambda _: TEXType.VEC4},
+
     # Noise (all support optional z for 3D: 2 args = 2D, 3 args = 3D)
     "perlin":      {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # perlin(x, y, z?) — Perlin noise
     "simplex":     {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # simplex(x, y, z?) — Simplex noise

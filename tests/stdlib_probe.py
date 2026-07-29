@@ -17,6 +17,10 @@ from TEX_Wrangle.tex_compiler.stdlib_signatures import FUNCTION_SIGNATURES
 SKIP = frozenset({
     "transpose", "determinant", "inverse",                       # matrix args
     "fetch_frame", "sample_frame",                               # need a @frames batch
+    # DATA-7: a string source key plus a registered host FrameProvider — the generator
+    # builds numeric calls over @A/@B, and there is no binding to build a source from.
+    # Covered end to end (both devices, both tiers) by tests/test_v034_data7.py.
+    "fetch_time", "sample_time",
     # string ops
     "str", "len", "replace", "strip", "lower", "upper", "contains", "startswith",
     "endswith", "find", "substr", "to_int", "to_float", "sanitize_filename", "split",

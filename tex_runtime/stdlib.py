@@ -124,6 +124,41 @@ def _expand_to_bhw(t: torch.Tensor, B: int, H: int, W: int) -> torch.Tensor:
     return t  # already [B, H, W] or higher
 
 
+def _provider_read(source, t, mode: str, a, b):
+    """DATA-7: resolve `(source, t)` to ONE host frame, co-located with the coordinates.
+
+    Returns `(frame[1,H,W,C], coord_a, coord_b)`. The frame comes from `tex_provider`'s
+    pool — see `docs/frame-providers.md`; nothing here knows about files.
+
+    DEVICE, and the cost it names. The frame lives wherever the provider put it, and the
+    coordinates live on the cook device, so one of them has to move. Moving the FRAME is
+    right: the coords are the cook's own grid and moving them would drag the result off the
+    cook device. The pool caches the provider-device copy, so a CPU provider feeding a CUDA
+    cook pays one H2D per CALL rather than per pixel — real, measured in the item's bench
+    row, and avoidable by a provider that returns device tensors. Caching a second
+    per-device copy is the deferred alternative (it doubles the pool's bytes for a win only
+    a mismatched host sees).
+
+    All-scalar coordinates have no device of their own (`_to_tensor` puts a Python float on
+    CPU), so the frame's device wins — otherwise a constant-coordinate read in a CUDA cook
+    would silently drag the frame to CPU.
+    """
+    ta, tb = _to_tensor(a), _to_tensor(b)
+    dev = ta.device if ta.dim() else (tb.device if tb.dim() else None)
+    from ..tex_provider import materialize, _uniform_time
+    key = source if isinstance(source, str) else str(source)
+    img = materialize(key, _uniform_time(t, key), mode)
+    if dev is None:
+        dev = img.device
+    elif img.device != dev:
+        img = img.to(dev)
+    if ta.device != dev:
+        ta = ta.to(dev)
+    if tb.device != dev:
+        tb = tb.to(dev)
+    return img, ta, tb
+
+
 # Pre-allocated grid buffer for sample() — avoids torch.stack allocation per call.
 # Keyed by (B, H, W, device) → [B, H, W, 2] tensor.
 # Bounded via LRU eviction (each entry is ~16 MB at 1080p).
@@ -1143,6 +1178,60 @@ class TEXStdlib:
         result = v00 * (1 - fx) * (1 - fy) + v01 * fx * (1 - fy) + \
                  v10 * (1 - fx) * fy + v11 * fx * fy
         return result
+
+    @stdlib("fetch_time", sig='fetch_time(source, t, px, py) \\u2192 vec', category='Batch / Temporal', spatial=True, sync=True, footprint='image', doc='Nearest-neighbour read of a HOST source at time t (DATA-7). Needs a registered FrameProvider.', ex='@OUT = fetch_time("plate", time, ix, iy);')
+    @staticmethod
+    def fn_fetch_time(source, t, px, py) -> torch.Tensor:
+        """DATA-7: fetch a pixel from a host source frame at time `t`.
+
+        The out-of-batch twin of `fetch_frame`. `fetch_frame` indexes INSIDE the marshalled
+        batch; this reaches a frame the batch does not contain, through the `tex_provider`
+        host seam — TEX never opens a file, the host decodes, and the pool remembers.
+
+        Args:
+            source: string source key the host's provider understands
+            t: the SOURCE's own time. Must be uniform across the grid (E7003) — see
+               `_uniform_time`'s note on why a per-pixel retime is refused rather than capped.
+            px, py: pixel coordinates into the SOURCE's grid, which need not match the cook's.
+        """
+        img, px_t, py_t = _provider_read(source, t, "fetch", px, py)
+        _b, Hs, Ws, _c = img.shape
+        px_i = torch.clamp(torch.round(px_t).long(), 0, Ws - 1)
+        py_i = torch.clamp(torch.round(py_t).long(), 0, Hs - 1)
+        shape = torch.broadcast_shapes(px_i.shape, py_i.shape) or (1, 1, 1)
+        return img[0][py_i.expand(shape), px_i.expand(shape)]
+
+    @stdlib("sample_time", sig='sample_time(source, t, u, v) \\u2192 vec', category='Batch / Temporal', spatial=True, sync=True, footprint='image', doc='Bilinear sample of a HOST source at time t (DATA-7). Needs a registered FrameProvider.', ex='@OUT = sample_time("plate", time - 0.5, u, v);')
+    @staticmethod
+    def fn_sample_time(source, t, u_coord, v_coord) -> torch.Tensor:
+        """DATA-7: bilinear sample of a host source frame at time `t`.
+
+        The provider MAY interpolate between the two frames bracketing `t` — that is the
+        difference from `fetch_time`, and it is the provider's to make, which is why the two
+        modes are cached separately. The bilinear math here mirrors `fn_sample_frame`'s
+        expression for expression, so the two agree where they overlap.
+        """
+        img, u, v = _provider_read(source, t, "sample", u_coord, v_coord)
+        _b, Hs, Ws, _c = img.shape
+        shape = torch.broadcast_shapes(u.shape, v.shape) or (1, 1, 1)
+        x = torch.clamp(u * (Ws - 1), 0, Ws - 1).expand(shape)
+        y = torch.clamp(v * (Hs - 1), 0, Hs - 1).expand(shape)
+
+        x0 = torch.floor(x).long()
+        x1 = torch.clamp(x0 + 1, 0, Ws - 1)
+        y0 = torch.floor(y).long()
+        y1 = torch.clamp(y0 + 1, 0, Hs - 1)
+
+        fx = (x - x0.to(x.dtype)).unsqueeze(-1)
+        fy = (y - y0.to(y.dtype)).unsqueeze(-1)
+
+        plane = img[0]
+        v00 = plane[y0, x0]
+        v01 = plane[y0, x1]
+        v10 = plane[y1, x0]
+        v11 = plane[y1, x1]
+        return v00 * (1 - fx) * (1 - fy) + v01 * fx * (1 - fy) + \
+               v10 * (1 - fx) * fy + v11 * fx * fy
 
     @stdlib("sample_cubic", sig='sample_cubic(img, u, v) \\u2192 vec', category='Sampling', spatial=True, footprint='image', doc='Bicubic (Catmull-Rom) sampling.', ex='@OUT = sample_cubic(@A, u, v);')
     @staticmethod

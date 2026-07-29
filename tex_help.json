@@ -741,6 +741,30 @@
             "non-local"
           ],
           "aliases": []
+        },
+        {
+          "name": "fetch_time",
+          "sig": "fetch_time(source, t, px, py) → vec",
+          "desc": "Nearest-neighbour read of a HOST source at time t (DATA-7). Needs a registered FrameProvider.",
+          "example": "@OUT = fetch_time(\"plate\", time, ix, iy);",
+          "tags": [
+            "spatial",
+            "sync",
+            "non-local"
+          ],
+          "aliases": []
+        },
+        {
+          "name": "sample_time",
+          "sig": "sample_time(source, t, u, v) → vec",
+          "desc": "Bilinear sample of a HOST source at time t (DATA-7). Needs a registered FrameProvider.",
+          "example": "@OUT = sample_time(\"plate\", time - 0.5, u, v);",
+          "tags": [
+            "spatial",
+            "sync",
+            "non-local"
+          ],
+          "aliases": []
         }
       ]
     },
@@ -1279,5 +1303,5 @@
       ]
     }
   ],
-  "function_count": 143
+  "function_count": 145
 }

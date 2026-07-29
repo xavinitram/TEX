@@ -415,8 +415,16 @@ class Host:
             self.cache.put(key, out, canvas={"shape": list(out.shape)})
             return out, ms, False
 
-    def rgba_bytes(self, frame: torch.Tensor) -> bytes:
-        """[1,H,W,4] fp32 -> packed RGBA8 bytes for a <canvas> blit (display, off the cook budget)."""
+    def rgba_bytes(self, frame) -> bytes:
+        """[1,H,W,4] fp32 -> packed RGBA8 bytes for a <canvas> blit (display, off the cook budget).
+
+        v0.34 async writes: `frame` may be an XPU-2 `FrameHandle` still copying. The blit is
+        the reference *consumer* of that contract — it fences here, at the point of use, so
+        the cook that produced the frame was free to return before the copy landed. A plain
+        tensor is still accepted: a CPU cook has nothing to overlap and should not be made to
+        wrap itself in a handle to say so."""
+        if hasattr(frame, "tensor") and hasattr(frame, "is_ready"):
+            frame = frame.tensor()
         u8 = (frame[0].clamp(0, 1) * 255.0).round().to(torch.uint8).cpu()
         return bytes(u8.reshape(-1).tolist())
 

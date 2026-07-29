@@ -59,6 +59,7 @@ from .tex_marshalling import (
     convert_param_value as _convert_param_value,
     infer_binding_type as _infer_binding_type,
     egress_meta as _egress_meta,
+    resolve_promise_bindings as _resolve_promise_bindings,
 )
 from .tex_runtime.host import (get_host_services, CookCancelled,
                                _cancel_check, _report_progress)
@@ -1061,6 +1062,16 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     if time_context is not None and not isinstance(time_context, dict) \
             and hasattr(time_context, "items"):
         time_context = dict(time_context)
+    # IO-1: a promised binding becomes its landed tensor HERE, above everything that reads a
+    # binding value — the fingerprint, the type map, the preflight, the tiers. Every one of
+    # them then sees an ordinary tensor, which is the load-bearing simplification (the same
+    # one DATA-6 uses for planes): no tier, no emitter and no cache learns what a promise is.
+    # An unlanded one is refused (E7007) rather than waited on, because blocking the cook
+    # thread on host I/O is the failure the queue's WAITING state exists to prevent.
+    #
+    # INVARIANT #7: the call returns `bindings` unchanged, having allocated nothing, unless a
+    # promise is actually present — the guard is one class check per binding inside a `any()`.
+    bindings = _resolve_promise_bindings(bindings)
     fused_chain = False
     fused_fp = None
     # LAT-2: the program fingerprint, hoisted above the M-1 preflight so it can memoize its

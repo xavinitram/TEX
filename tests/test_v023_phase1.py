@@ -25,24 +25,38 @@ _HISTORICAL_NON_LOCAL = frozenset({
     "erode", "dilate",
 })
 
+# Functions that became non-local AFTER the v0.22 freeze. Each one is a deliberate
+# addition and is named here, so `_HISTORICAL_NON_LOCAL` stays a historical FACT rather
+# than a set that quietly grows: the assertion below is still exact equality, so an
+# unlisted addition fails exactly as drift always did.
+_NON_LOCAL_SINCE_V022 = frozenset({
+    # DATA-7 (v0.34): host-source reads. footprint='image' — an arbitrary-coordinate
+    # gather into a frame the ROI planner does not model, so no strip, no tile.
+    "fetch_time", "sample_time",
+})
+
+_EXPECTED_NON_LOCAL = _HISTORICAL_NON_LOCAL | _NON_LOCAL_SINCE_V022
+
 
 def test_roi1_derivation_matches_historical(r: SubTestResult):
     print("\n--- ROI-1: _NON_LOCAL_FNS derives from footprints, exactly ---")
 
-    # (1) The registry derivation equals the frozen 18-name literal.
+    # (1) The registry derivation equals the frozen literal plus its named additions.
     try:
         derived = R.non_local_names()
-        assert derived == _HISTORICAL_NON_LOCAL, (
+        assert derived == _EXPECTED_NON_LOCAL, (
             f"derived non-local set drifted: "
-            f"+{sorted(derived - _HISTORICAL_NON_LOCAL)} "
-            f"-{sorted(_HISTORICAL_NON_LOCAL - derived)}")
-        r.ok(f"non_local_names() == the historical {len(_HISTORICAL_NON_LOCAL)}-name set")
+            f"+{sorted(derived - _EXPECTED_NON_LOCAL)} "
+            f"-{sorted(_EXPECTED_NON_LOCAL - derived)}")
+        assert _HISTORICAL_NON_LOCAL <= derived, "a v0.22 non-local function stopped being one"
+        r.ok(f"non_local_names() == the historical {len(_HISTORICAL_NON_LOCAL)}-name set "
+             f"+ {len(_NON_LOCAL_SINCE_V022)} named since")
     except Exception as e:
         r.fail("ROI-1 derivation", f"{type(e).__name__}: {e}")
 
     # (2) The public module attribute (via __getattr__) is that same derived set.
     try:
-        assert set(tex_memory._NON_LOCAL_FNS) == _HISTORICAL_NON_LOCAL, \
+        assert set(tex_memory._NON_LOCAL_FNS) == _EXPECTED_NON_LOCAL, \
             "tex_memory._NON_LOCAL_FNS != derived set"
         assert tex_memory._NON_LOCAL_FNS is tex_memory._non_local_fns(), \
             "the public attribute and the helper must return the one cached object"
@@ -448,16 +462,23 @@ def test_lang3_compat_corpus(r: SubTestResult):
     print("\n--- LANG-3: the frozen compat corpus matches its goldens (PM-4) ---")
     import compat_corpus
 
+    # R2-archive (v0.34): the goldens are a per-version append-only ARCHIVE, and current
+    # behavior is checked against EVERY frozen version, not just the latest. Today there is
+    # exactly one (0.23), so this loop runs once and asserts precisely what the single-file
+    # version asserted — which is the proof the mechanism is neutral.
     try:
-        golden = compat_corpus.load_goldens()["hashes"]
+        archive = compat_corpus.load_archive()
     except Exception as e:
-        r.fail("LANG-3 corpus goldens", f"could not load goldens: {e}")
+        r.fail("LANG-3 corpus goldens", f"could not load the golden archive: {e}")
         return
 
-    if len(golden) < 100:
-        r.fail("LANG-3 corpus size", f"only {len(golden)} goldens (<100)")
-    else:
-        r.ok(f"compat corpus covers {len(golden)} programs (116 examples + adversarial)")
+    if not archive:
+        r.fail("LANG-3 corpus archive", "no frozen language versions in the archive")
+        return
+    versions = list(archive)
+    newest = versions[-1]
+    r.ok(f"golden archive holds {len(versions)} frozen language version(s): "
+         f"{', '.join(versions)}")
 
     current = compat_corpus.compute_all()
 
@@ -468,15 +489,33 @@ def test_lang3_compat_corpus(r: SubTestResult):
     else:
         r.ok("every corpus program compiles + runs on CPU")
 
-    mism = [f"{n}" for n, gh in golden.items() if current.get(n) != gh]
-    missing = sorted(set(golden) - set(current))
-    added = sorted(set(current) - set(golden))
-    if mism or missing or added:
-        r.fail("LANG-3 compat drift",
-               f"changed={mism[:6]} missing={missing[:4]} new={added[:4]} — a language "
-               f"change altered existing output; if intentional, regenerate goldens")
+    for version, payload in archive.items():
+        golden = payload["hashes"]
+        if len(golden) < 100:
+            r.fail(f"LANG-3 corpus size ({version})", f"only {len(golden)} goldens (<100)")
+            continue
+        mism = [n for n, gh in golden.items() if current.get(n) != gh]
+        # A frozen program that has DISAPPEARED is drift too — deleting an example is how a
+        # corpus quietly stops proving anything.
+        missing = sorted(set(golden) - set(current))
+        if mism or missing:
+            r.fail(f"LANG-3 compat drift vs {version}",
+                   f"changed={mism[:6]} missing={missing[:4]} — a language change altered "
+                   f"what a frozen program computes. Frozen versions are immutable: fix the "
+                   f"change, or argue the pixel move and re-freeze deliberately.")
+        else:
+            r.ok(f"all {len(golden)} output-hashes match the frozen {version} corpus")
+
+    # ...and nothing may escape the freeze: the NEWEST archived version must cover every
+    # program the corpus currently runs. An older version legitimately covers fewer (a later
+    # release adds programs), so this is asserted once, against the newest.
+    added = sorted(set(current) - set(archive[newest]["hashes"]))
+    if added:
+        r.fail("LANG-3 corpus coverage",
+               f"{len(added)} program(s) are not in the newest frozen version {newest}: "
+               f"{added[:4]} — add them with compat_corpus.freeze() on a language bump")
     else:
-        r.ok(f"all {len(golden)} program output-hashes match the frozen goldens")
+        r.ok(f"every corpus program is covered by the newest frozen version ({newest})")
 
 
 # ─────────────────────── ENG-6: zero-copy AI handoff (DLPack) ───────────────────────

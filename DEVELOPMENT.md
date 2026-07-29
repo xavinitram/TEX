@@ -958,3 +958,50 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   were throttled; `autotier._persist` already runs on EVERY terminal verdict, so its loss
   window is the single verdict being written, which is already inside ENG-13's bound. It gained
   the shared durable write and nothing else.
+- **A per-pixel or per-batch-element `t` for `fetch_time`/`sample_time` (DATA-7, v0.34)** —
+  refused as E7003. A per-PIXEL time is a retime map and is unbounded I/O from one statement:
+  as many source frames as there are distinct values, at cook resolution. There is no honest
+  cap to pick, and the failure mode of guessing one (silently servicing 8 of 4096 requested
+  frames) is wrong pixels. A per-BATCH-ELEMENT time (`time + fi/fps` over a B=100 batch) is
+  the bounded half — at most B frames — and is the natural next step; it needs the pool to
+  admit B frames at once and a scatter assembly over the batch axis. Reopens when a host
+  actually cooks playback as one batch rather than one frame per playhead, which is not the
+  shape the CookQueue and `time_context` have today.
+- **Deriving the source read-set for lineage keys automatically (DATA-7, v0.34)** — a cook
+  that read `plate@v3` and one that read `plate@v4` mint the same `lineage_key`, so a host
+  must stamp `flags=tex_provider.source_flags(...)` itself. The structural fix needs the
+  read-set BEFORE the cook and it is only known after: a source key can be a `$param`, a
+  string expression, or a loop variable. An AST derivation would close the common case and
+  silently miss the rest, which is worse than a stated obligation with a helper. Reopens if
+  the compiler ever grows a "constant string arguments to fn X" analysis for another reason
+  (COLOR-1's space names are the likely one, v0.36).
+- **Per-device residency for the DATA-7 media pool (v0.34)** — the pool caches whatever
+  device the provider returned, and `_provider_read` moves the frame to the cook's device on
+  every call. A CPU provider feeding a CUDA cook therefore pays one H2D per CALL rather than
+  per pixel (the pool still amortizes the decode). Caching a second per-device copy doubles
+  the pool's bytes to serve a win only a mismatched host sees, and a host that wants device
+  residency can return device tensors today. Reopens on a measurement from a host that cannot.
+- **A disk tier for the DATA-7 media pool (v0.34)** — deliberately absent, not missing.
+  CACHE-8's ladder exists because a cooked frame is expensive and has nowhere else to live; a
+  source frame's disk tier is *the source file*, which the host already has and can already
+  decode. Spilling a decoded copy beside it buys a faster decode at the price of a second copy
+  of the user's media on their disk. Reopens only for a source whose decode is so expensive
+  that re-decoding beats reading a cached copy — a measurement, not an assumption.
+- **A promise -> jobs index in the cook queue (IO-1, v0.34)** — `_on_input_landed` scans the
+  three class deques instead. The waiting set is bounded by the queue's own depth and a
+  landing is a once-per-frame event, so an index would be a second structure to keep
+  consistent with the deques — and the deques are already the single home that lets shed,
+  cancel, close and snapshot see waiting jobs without knowing they exist. Reopens if a host
+  ever parks hundreds of jobs on promises, which the `max_pending` shed policy currently
+  prevents.
+- **A host-side readiness gate instead of `Promise` (IO-1, v0.34)** — REFUSED, not deferred,
+  and the argument is worth keeping: a gate object needs no engine change, and it does not
+  solve the actual defect. A host gating `submit()` behind its own check still eventually
+  calls `cook(bindings)`, and the day someone passes an unlanded object `infer_binding_type`
+  types it FLOAT and compiles a program that does not match the pixels. The gate moves the
+  hazard; the declaration removes it.
+- **A provider-polled cancel token mid-read (IO-1, v0.34)** — cancellation is defined as
+  drop-on-landing: a read already inside the provider cannot be stopped from outside, and
+  what TEX guarantees is that its result is never installed. A provider MAY accept the token
+  and poll it; one that ignores it is correct, just slower. Making it mandatory would put a
+  requirement on every host decoder to buy back time only a slow network source loses.

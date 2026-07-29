@@ -322,7 +322,8 @@ def reattach(*, result_cache=None) -> dict:
     already hold, and every restored fact is merged with `setdefault` semantics so anything
     learned in THIS session (which is fresher) wins.
 
-    Returns `{"verdicts": n, "capturable": n, "frames": n, "frame_bytes": n, "errors": [...]}`.
+    Returns `{"verdicts": n, "capturable": n, "frames": n, "frame_bytes": n,
+    "media_frames": n, "media_bytes": n, "errors": [...]}`.
     Best-effort per component: a corrupt `autotier.json` must not stop the warm state from
     coming back, so each restore is independently guarded and named in `errors`."""
     report = {"verdicts": 0, "capturable": 0, "frames": 0, "frame_bytes": 0, "errors": []}
@@ -353,5 +354,19 @@ def reattach(*, result_cache=None) -> dict:
             report["frames"], report["frame_bytes"] = result_cache.reindex_disk()
         except Exception as e:
             report["errors"].append(f"result_cache: {e}")
+
+    # (4) DATA-7's media pool. There is nothing to RESTORE — providers are host-side and
+    # process-global (DATA-4 phase 2 is still deferred), so a host must re-register its
+    # providers and re-declare its prefetch windows after a reattach; that is the contract,
+    # not an omission. What the report adds is the count, and after a restart the count is
+    # ZERO — printing the zero is the point. A host that assumed its pool survived and
+    # finds it did not currently has no way to tell.
+    try:
+        from .tex_provider import _media_cache
+        st = {"frames": 0, "bytes": 0} if _media_cache is None else _media_cache.stats()
+        report["media_frames"], report["media_bytes"] = st["frames"], st["bytes"]
+    except Exception as e:
+        report["media_frames"], report["media_bytes"] = 0, 0
+        report["errors"].append(f"media_pool: {e}")
 
     return report

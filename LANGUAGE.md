@@ -35,11 +35,17 @@ returns the declared `"X.Y"` (or `None`).
 
 **Stability contract.** A program that compiled and ran on version *N* keeps computing
 the **same pixels** on version *N+1*. This is enforced, not merely intended: the frozen
-**compat corpus** (`tests/compat_corpus.py`, goldens in `tests/compat_corpus_goldens.json`)
+**compat corpus** (`tests/compat_corpus.py`, goldens in `tests/compat_corpus_goldens/`)
 runs every bundled example plus a set of adversarial grammar programs on the CPU
 interpreter and hashes their quantized outputs against committed goldens. A drift fails
-the suite. Regenerating the goldens is a deliberate, reviewed act reserved for an
-**intentional** language change.
+the suite.
+
+Since v0.34 (R2-archive) the goldens are an **append-only archive**: one file per frozen
+language version, and current behavior is checked against *every* frozen version, not just
+the latest. `compat_corpus.freeze(version)` may only ADD a version and refuses to rewrite
+one — so "old goldens are immutable" is machinery rather than a convention. A frozen
+program whose pixels genuinely must move requires deleting that archive file in a commit
+that argues the change.
 
 New grammar is added **additively** (v0.23 added the optional parameter-metadata block,
 below) so old programs keep parsing. A genuinely breaking change is called out in the

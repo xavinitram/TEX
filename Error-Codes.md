@@ -310,6 +310,38 @@ Runtime / node. See the message shown with the code for the specific cause and f
 
 Runtime / node. See the message shown with the code for the specific cause and fix; the class is described above.
 
+## Host I/O (`E7xxx`)
+
+Host source and binding errors (DATA-7 / IO-1) — reading a frame through a host `FrameProvider`, or wiring a binding whose value TEX cannot type. These name the HOST's side of the seam: no provider registered, a provider that raised, a time that varies per pixel, a frame of the wrong shape, or a promised binding that has not landed.
+
+### E7001
+
+Host I/O. See the message shown with the code for the specific cause and fix; the class is described above.
+
+### E7002
+
+Host I/O. See the message shown with the code for the specific cause and fix; the class is described above.
+
+### E7003
+
+Host I/O. See the message shown with the code for the specific cause and fix; the class is described above.
+
+### E7004
+
+Host I/O. See the message shown with the code for the specific cause and fix; the class is described above.
+
+### E7005
+
+Host I/O. See the message shown with the code for the specific cause and fix; the class is described above.
+
+### E7006
+
+Host I/O. See the message shown with the code for the specific cause and fix; the class is described above.
+
+### E7007
+
+Host I/O. See the message shown with the code for the specific cause and fix; the class is described above.
+
 ## Tools (`E9xxx`)
 
 Tool errors — building or preflighting a `.textool` bundle failed (a fused-tool graphspec is malformed, or its stages don't compile together). Check the tool's stages and manifest; the message names the stage that broke.

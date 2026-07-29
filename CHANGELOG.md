@@ -5,6 +5,95 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] - 2026-07-29
+
+**Sources & sinks** — I/O joins the pipeline. A frame that isn't in RAM yet, and a frame
+that's leaving, both stop being the cook's problem. Design docs: `docs/frame-providers.md`,
+`docs/async-io.md`, `docs/fusion-cap-decision.md`.
+
+### Added
+
+- **DATA-7 — the host source protocol.** A `FrameProvider` seam (`tex_provider.py`) shaped
+  after `HostServices`: a Protocol, a Null default that refuses with a message rather than an
+  AttributeError, and a process-wide `get/set/reset_provider`. Two stdlib functions,
+  `fetch_time(source, t, px, py)` and `sample_time(source, t, u, v)`, read a frame the
+  marshalled batch does not contain — the out-of-batch twins of `fetch_frame`/`sample_frame`.
+  TEX never opens a file; the host decodes. Motion blur and temporal median cook through it on
+  both devices.
+- **The media pool.** LRU, byte-budgeted, per-device, registered into the CACHE-5 governor at
+  `evict_order=40` — after the stdlib pyramids, **before** the result cache, because a media
+  frame rebuilds with one host fetch and a result frame rebuilds with a cook that may itself
+  have to fetch. Eviction is **playhead-aware**: this is the one pool whose entries carry a
+  time, so the hint the governor has always passed finally means something (furthest from the
+  playhead goes first, not least-recently-used).
+- **IO-1 — promised bindings.** `tex_marshalling.Promise` declares its TEXType/shape/device up
+  front, so a program's identity is computable before its pixels land; the landing is
+  validated against the declaration (E7006). `prepare()` resolves promises to tensors above
+  everything that reads a binding value, so no tier, emitter or cache learns what a promise is.
+- **IO-1 — dependency-aware admission.** `CookQueue.submit(inputs=[promise])` parks a job in
+  the new `WAITING` state — enqueued but not eligible — until every input lands, so the single
+  worker never blocks on I/O. A waiting submit does **not** preempt (a preempted cook loses all
+  its progress; preempting for a job that cannot start is the worst trade available), and the
+  deferred preemption is granted when the input lands. `declare_window()` mints priced,
+  sheddable prefetch jobs; `Job.feeds_profile=False` keeps their I/O wait out of PROF-1's
+  compute table, structurally rather than by happening not to pass a key.
+- **The async-write contract (§3.3)** — shipped as a test, not a subsystem, exactly as
+  scoped. Frame N's `FrameHandle` goes to a slow writer thread and frame N+1 cooks and
+  completes while the writer still holds it; the written bytes are bit-exact against a
+  synchronous read. `tex_cli.save_image` and `host_demo`'s blit adopt the handle.
+- **A new E7xxx error family** (R8, rendered): E7001 no provider, E7002 the provider raised,
+  E7003 a per-pixel time, E7004 a wrong-shaped frame, E7005 an untypable binding, E7006 a
+  promise that lied, E7007 an unlanded promise cooked directly.
+
+### Changed
+
+- **`infer_binding_type` refuses instead of guessing.** Its terminal `return TEXType.FLOAT`
+  was a silent identity corruption: a program's cache identity is derived from binding TYPES,
+  so an object nobody thought about typed as FLOAT and compiled a program that did not match
+  the pixels. Unrecognised values are now E7005. Every type the tree relies on keeps an
+  explicit branch, `None` included (an unconnected optional input is the E6003 gate's to
+  report, and it names the slot).
+- **R2-archive — the compat corpus becomes append-only.** `tests/compat_corpus_goldens.json`
+  is now `tests/compat_corpus_goldens/<lang_version>.json`; `regen()` (which overwrote
+  everything) is replaced by `freeze(version)`, which may only ADD and refuses to rewrite a
+  frozen version; the corpus test runs current behavior against **every** archived version.
+  Landed a release early, while there is exactly one archived version and it is therefore
+  provably neutral. "Old goldens are immutable" is machinery now, not manners.
+- **A host-I/O failure is class-dependent.** A provider cannot know its job's class, so the
+  CookQueue decides: an E7xxx inside INTERACTIVE/COMMITTED raises to the waiter; inside
+  SPECULATIVE it lands in the refusals ledger and the job ends CANCELLED. Speculation never
+  alarms.
+- **The fusion cap's justification is measured, not asserted** (see Decided below).
+
+### Decided (no code change)
+
+- **FUS-cap: reject with the number — the 16-stage cap stays.** The spike measured segmenting
+  a long chain into chained ≤16-stage regions against today's fully-unfused fallback. At 512²
+  fusing 50 stages looks like a 1.10× (CPU) / 1.23× (CUDA) win; by 1024² it is **1.54× SLOWER
+  on CPU** and exactly neutral on CUDA — and it costs **12.9× peak memory** (828 MiB fused vs
+  64 MiB unfused, 1024²/50 stages). Segmenting reproduces those costs in smaller pieces rather
+  than avoiding them (816 MiB, 0.67× CPU). The N=17 cliff is **protective**. Fusion's real win
+  is amortizing per-cook overhead, which only dominates at small resolutions. The stale
+  "CACHE-6 hasn't landed" justification (spent since v0.27) and the unmeasured trace-size claim
+  are replaced by these numbers, and the reopen gate is a backend that fuses at the kernel
+  level rather than materializing per-stage intermediates.
+
+### Measured
+
+- **PM-9 exit: PASS — 94.3% of I/O hidden** (100 frames, 512², 24 grades/frame, sm_75;
+  95.7% at 48 grades), against a ≥80% target. Serial 1374 ms → overlapped 465 ms, **2.95×**.
+  Two honest boundaries ship with it: (1) at ONE grade per frame compute is 3.5% of the work
+  and only 54.9% hides — there is nothing to hide 9.5 ms of I/O behind when the cook is
+  0.35 ms, and the pipeline is already at its three-way overlap floor; (2) `declare_window`
+  prefetch riding the same single worker as the cooks hides ~3% (1332 ms vs 1374 ms serial),
+  because a prefetch occupying the worker takes turns with compute rather than overlapping it.
+  Tier-B prefetch is for an idle worker; the promise path is what hides I/O under load.
+- **Invariant #7 holds.** DATA-7 and IO-1 each measured against the release baseline on the
+  8-config matrix: the discriminating GPU configs sit at 0.992–1.006×. The CPU configs swing
+  ±10% on this box at 24 programs — a null control on an **identical tree** returned
+  0.965–1.102×, which brackets every CPU number either item produced, so the 0.95 stop-ship
+  threshold does not discriminate there and only the GPU rows were read as signal.
+
 ## [0.33.2] - 2026-07-28
 
 **Mind the tiers, again** — the v0.33.1 release audit's findings, closed. Same shape and the
