@@ -306,13 +306,32 @@ def test_v0331_a5_clear_is_not_undone_by_an_inflight_spill(r):
             return real_pickle(path, data)
 
         tex_results._atomic_pickle = blocking_pickle
-        t = threading.Thread(target=c._spill, args=("k", entry), daemon=True)
+        # `_spill` grew a `seq` parameter in v0.33.2's A1 work and this call was never
+        # updated. The worker thread died instantly with TypeError, `inside.wait(5)` timed out
+        # UNCHECKED, and all three assertions below then passed trivially over a race that
+        # never ran — the row printed PASS for two releases while exercising nothing, and
+        # burned 5 s doing it. The waits are asserted now, so a signature drift fails loudly
+        # instead of going quiet.
+        seq = c._claim_spill_ticket("k")
+        err = []
+
+        def _spill_worker():
+            try:
+                c._spill("k", entry, seq)
+            except BaseException as ex:                # noqa: BLE001 — surface it, don't hang
+                err.append(ex)
+                inside.set()
+
+        t = threading.Thread(target=_spill_worker, daemon=True)
         try:
             t.start()
-            inside.wait(5)                             # the writer holds the OLD generation
+            assert inside.wait(5), "the spill worker never entered the pickle write"
+            assert not err, f"the spill worker died: {err[0]!r}"
             c.clear(disk=True)                         # the user clears everything
             release.set()
             t.join(timeout=5)
+            assert not t.is_alive(), "the spill worker never finished"
+            assert not err, f"the spill worker died: {err[0]!r}"
         finally:
             tex_results._atomic_pickle = real_pickle
         served = c.get("k")

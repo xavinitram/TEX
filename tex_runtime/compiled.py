@@ -1382,7 +1382,8 @@ def _codegen_only_execute(
 
     try:
         with torch.inference_mode():
-            _invoke_cg(cg_fn, env, contiguous_bindings, stdlib_fns, dev, sp)
+            _invoke_cg(cg_fn, env, contiguous_bindings, stdlib_fns, dev, sp,
+                       Interpreter._PRECISION_DTYPES.get(precision))
     except Exception as e:
         _show_once(
             "codegen_only_fallback",
@@ -1483,7 +1484,8 @@ def _try_compile(
             dev = _canon_device(device)
             env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
                                             used_builtins=used_builtins, precision=precision)
-            _invoke_cg(cg_fn, env, bindings, stdlib_fns, dev, sp)
+            _invoke_cg(cg_fn, env, bindings, stdlib_fns, dev, sp,
+                       Interpreter._PRECISION_DTYPES.get(precision))
             if output_names is not None:
                 return {name: bindings[name] for name in output_names}
             return bindings.get("OUT")
@@ -1525,7 +1527,8 @@ def _try_compile(
             dev = _canon_device(device)
             env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
                                             used_builtins=used_builtins, precision=precision)
-            _invoke_cg(compiled_flat, env, bindings, stdlib_fns, dev, sp)
+            _invoke_cg(compiled_flat, env, bindings, stdlib_fns, dev, sp,
+                       Interpreter._PRECISION_DTYPES.get(precision))
             if output_names is not None:
                 if _clone_out:
                     return {name: bindings[name].clone()

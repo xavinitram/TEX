@@ -1213,6 +1213,39 @@ def main():
     test_v034_async_write_does_not_block_the_next_cook(r)
     test_v034_async_write_bytes_are_bit_exact(r)
 
+    # v0.34.1 — the v0.34.0 release-audit findings. Every row verified to fail on a
+    # pristine worktree at v0.34.0 (9/9 reproduced pre-fix, 0/9 after).
+    from test_v0341_audit import (
+        test_v0341_a_a_provider_swap_never_serves_the_replaced_pixels,
+        test_v0341_b_cancelling_a_waiting_job_terminates_it,
+        test_v0341_c_a_provider_frame_is_fp32_or_refused,
+        test_v0341_d_constant_coordinates_stay_on_the_cook_grid,
+        test_v0341_e_the_pool_owns_the_bytes_it_accounts,
+        test_v0341_f_a_failed_promise_never_alarms_speculative_work,
+        test_v0341_g_a_promise_cannot_land_none,
+        test_v0341_h_the_stage_list_family_understands_promises,
+        test_v0341_i_high_rank_tensors_and_helper_locations,
+        test_v0341_h_promise_prefixes_key_by_resolution,
+        test_v0341_d_the_cook_grid_agrees_across_tiers,
+        test_v0341_e_a_buffer_reusing_provider_is_still_copied,
+        test_v0341_c_a_half_source_stays_half_in_the_pool,
+        test_v0341_g_fail_none_is_refused_too,
+    )
+    test_v0341_a_a_provider_swap_never_serves_the_replaced_pixels(r)
+    test_v0341_b_cancelling_a_waiting_job_terminates_it(r)
+    test_v0341_c_a_provider_frame_is_fp32_or_refused(r)
+    test_v0341_d_constant_coordinates_stay_on_the_cook_grid(r)
+    test_v0341_e_the_pool_owns_the_bytes_it_accounts(r)
+    test_v0341_f_a_failed_promise_never_alarms_speculative_work(r)
+    test_v0341_g_a_promise_cannot_land_none(r)
+    test_v0341_h_the_stage_list_family_understands_promises(r)
+    test_v0341_i_high_rank_tensors_and_helper_locations(r)
+    test_v0341_h_promise_prefixes_key_by_resolution(r)
+    test_v0341_d_the_cook_grid_agrees_across_tiers(r)
+    test_v0341_e_a_buffer_reusing_provider_is_still_copied(r)
+    test_v0341_c_a_half_source_stays_half_in_the_pool(r)
+    test_v0341_g_fail_none_is_refused_too(r)
+
     # v0.34 R2-archive — the compat-corpus goldens become an append-only per-version
     # archive. Landed a release early, while it is still neutral (one frozen version).
     from test_v034_r2_archive import (

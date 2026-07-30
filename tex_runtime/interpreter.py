@@ -35,6 +35,7 @@ from .host import _cancel_check, _report_progress   # SCHED-3 seam (no cycle: ho
 from . import profile as _prof                      # PROF-1 seam (pure stdlib; disarmed by default)
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
                      _scalar_from_tensor, _get_flat_batch_index)
+from . import stdlib as _stdlib_mod    # P0-D: publishes the cook grid for const-coord reads
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
@@ -400,24 +401,33 @@ class Interpreter:
         # path at one function call per cook instead of a thread-local probe — the profiler is
         # disarmed unless a host armed it, and invariant #7 applies to the profiler itself.
         sink = _prof.stage_sink() if _prof.enabled() else None
-        if sink is not None:
-            self._exec_stmts_profiled(stmts, sink, cancel, on_progress, dev)
-        elif cancel is None and on_progress is None:
-            for stmt in stmts:
-                self._exec_stmt(stmt)
-        elif on_progress is None:
-            # SCHED-3: cancel wired, no progress sink — the DEFAULT ComfyUI path now that the
-            # node passes an interrupt token. Poll cancel per statement, but skip the `(i+1)/n`
-            # progress arithmetic only a wired on_progress consumes (measured ~37 ns/stmt).
-            for stmt in stmts:
-                _cancel_check(cancel)
-                self._exec_stmt(stmt)
-        else:
-            n = len(stmts) or 1
-            for i, stmt in enumerate(stmts):
-                _cancel_check(cancel)
-                self._exec_stmt(stmt)
-                _report_progress(on_progress, "stmt", (i + 1) / n)
+        # P0-D: publish the cook grid for the one stdlib case that cannot derive it from its
+        # own arguments — `fetch_time`/`sample_time` with CONSTANT coordinates, which have no
+        # image argument to size from the way `fetch`/`sample` do. Two attribute writes per
+        # cook on a thread-local, restored in the `finally` because a tiled cook calls
+        # `execute` once per strip and each strip's grid is its own.
+        _grid_token = _stdlib_mod.set_cook_grid(self.spatial_shape, self._dtype)
+        try:
+            if sink is not None:
+                self._exec_stmts_profiled(stmts, sink, cancel, on_progress, dev)
+            elif cancel is None and on_progress is None:
+                for stmt in stmts:
+                    self._exec_stmt(stmt)
+            elif on_progress is None:
+                # SCHED-3: cancel wired, no progress sink — the DEFAULT ComfyUI path now that the
+                # node passes an interrupt token. Poll cancel per statement, but skip the `(i+1)/n`
+                # progress arithmetic only a wired on_progress consumes (measured ~37 ns/stmt).
+                for stmt in stmts:
+                    _cancel_check(cancel)
+                    self._exec_stmt(stmt)
+            else:
+                n = len(stmts) or 1
+                for i, stmt in enumerate(stmts):
+                    _cancel_check(cancel)
+                    self._exec_stmt(stmt)
+                    _report_progress(on_progress, "stmt", (i + 1) / n)
+        finally:
+            _stdlib_mod.restore_cook_ctx(_grid_token)
 
         # XPU fence (see above): guarantee the ingest DMA has landed before the
         # cook returns, so a downstream host-side writer of the shared pinned
@@ -2004,8 +2014,18 @@ class Interpreter:
                 result = fn(a0, a1, a2)
             else:
                 result = fn(*arglist)
-        except InterpreterError:
-            raise  # a nested TEX error (e.g. from a stdlib helper) — keep it intact
+        except InterpreterError as e:
+            # A nested TEX error (e.g. from a stdlib helper) — keep its code, message and hint
+            # intact. P0-I: but ADOPT this call's location when it has none. A helper that
+            # raises from below the AST (the DATA-7 provider seam is the live case) cannot
+            # know where it was called from, so E7002 rendered with no caret and, on a fused
+            # program, no way to say WHICH STAGE's source failed — `loc.stage` is exactly the
+            # Q-4 marker that answers that. Only fills a gap; never overwrites a real location.
+            if e.loc is None:
+                e.loc = node.loc
+                if not e._source:
+                    e._source = self._source
+            raise
         except Exception as e:
             raise InterpreterError(
                 f"Function '{node.name}' encountered a problem: {e}",

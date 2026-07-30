@@ -384,10 +384,36 @@ class CookQueue:
         it is indistinguishable from a hung queue."""
         if job.state != WAITING:
             return
+        # P0-B: a job the host cancelled is NOT woken by a later landing. Without this the
+        # landing granted a preemption on behalf of a job that can never run.
+        #
+        # DEFENSIVE, and deliberately kept as such: every path that sets `shed_requested`
+        # (`cancel`, `_shed_speculative_locked`) also removes the job from its deque under
+        # this same lock, so a WAITING+shed job in a deque is unreachable today and a
+        # mutation row for this branch is unkillable. It stays because the removal and the
+        # flag are set by DIFFERENT call sites, and one future path that sets the flag
+        # without removing would resurrect the whole defect silently.
+        if job.shed_requested:
+            self._remove_locked(job)
+            self.stats.cancelled += 1
+            self._finish_locked(job, CANCELLED,
+                                error=CookCancelled(f"job {job.id} was cancelled while waiting"))
+            return
         for p in job.inputs:
             err = getattr(p, "error", None)
             if err is not None:
                 self._remove_locked(job)
+                # P0-F: the class-dependent host-I/O rule lived only in `_run_one`, so a
+                # promise that FAILED before its job ever ran alarmed even when the job was
+                # SPECULATIVE — FAILED state, a raw E7xxx handed to the waiter, and no
+                # refusals-ledger row. Speculation never alarms, whichever door the failure
+                # arrives through.
+                if job.klass == SPECULATIVE and str(getattr(err, "_code", "")).startswith("E7"):
+                    self._note_speculative_io_failure(job, err)
+                    self.stats.cancelled += 1
+                    self._finish_locked(job, CANCELLED, error=CookCancelled(
+                        f"speculative host-I/O failure ({getattr(err, '_code', 'E7')}): {err}"))
+                    return
                 self.stats.failed += 1
                 self._finish_locked(job, FAILED, error=err)   # decrements `waiting` itself
                 return
@@ -477,7 +503,15 @@ class CookQueue:
             if job.state in _TERMINAL:
                 return False
             job.shed_requested = True
-            if job.state == PENDING:
+            # P0-B: WAITING is cancellable exactly like PENDING, and leaving it out was not a
+            # missing nicety — it was two defects. `job.wait()` and `drain()` hung forever on
+            # a job the host had already given up on; and because `_wake_if_ready_locked` did
+            # not consult `shed_requested`, the promise landing later flipped the cancelled
+            # job back to PENDING and GRANTED ITS DEFERRED PREEMPTION — a running COMMITTED
+            # render lost all its progress for a job that can never run, which then sat in the
+            # deque until `close()`. `_finish_locked` owns the `waiting` counter, so this
+            # needs no separate bookkeeping.
+            if job.state in (PENDING, WAITING):
                 self._remove_locked(job)
                 self.stats.cancelled += 1
                 self._finish_locked(job, CANCELLED,

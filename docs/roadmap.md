@@ -724,7 +724,7 @@ Proof milestones (each converts a claim into a regression test):
 - **PM-8** ✅ (v0.32): a mid-graph param edit on a 50-node 2048² comp recooks at
   **5.98× CPU / 9.88× CUDA**, split per shape because CACHE-7 and CACHE-9 answer
   different host shapes (fused chain vs unfused per-stage cooks).
-- **PM-9** (v0.34, pencil): headless 100-frame playback where input prefetch and
+- **PM-9** (v0.34, ✅ **met** — 94.3% of I/O hidden; see §9's v0.34.0 row): headless 100-frame playback where input prefetch and
   output writes overlap compute — **≥ 80% of I/O hidden** against the serial
   baseline on the bench box. This is the milestone XPU-2's handle exists to serve;
   until a consumer measures it, the async-write contract is a contract only.

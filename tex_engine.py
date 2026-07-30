@@ -60,6 +60,7 @@ from .tex_marshalling import (
     infer_binding_type as _infer_binding_type,
     egress_meta as _egress_meta,
     resolve_promise_bindings as _resolve_promise_bindings,
+    Promise as _Promise,
 )
 from .tex_runtime.host import (get_host_services, CookCancelled,
                                _cancel_check, _report_progress)
@@ -1702,6 +1703,19 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
     param default-inject + widget-value conversion so a SUB-chain (a CACHE-6 prefix or suffix)
     cooks BIT-IDENTICALLY to those same stages inside the full fused program — the equivalence
     the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does."""
+    # P0-H: the stage-list family is a public engine entry point that never learned about
+    # promises — a Promise in a stage's bindings produced a raw TypeError out of the
+    # marshalling seam whether or not it had landed. Resolving here (and refusing an unlanded
+    # one as E7007) makes every stage-list caller behave like `prepare()`, which is the whole
+    # point of the family: a sub-chain must cook identically to those stages inside the full
+    # program. Guarded: the rebuild allocates a list plus a dict per stage, and
+    # `cook_fused_cached` calls this up to three times per cook on the CACHE-6 hot path, so
+    # a no-promise chain (every chain today) must not pay for the feature — the scan is one
+    # class check per binding against ~15-25 us of copying on a 50-stage chain.
+    if any(v.__class__ is _Promise
+           for st in stages for v in (st.get("bindings") or {}).values()):
+        stages = [dict(st, bindings=_resolve_promise_bindings(st.get("bindings") or {}))
+                  for st in stages]
     if len(stages) == 1:
         st = stages[0]
         bindings = dict(st.get("bindings") or {})
@@ -1729,6 +1743,35 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
                           output_names=sorted(assigned.keys()), used_builtins=used_builtins,
                           precision=("fp32" if latent_channel_count else precision),
                           time_context=time_context, cancel=cancel, on_progress=on_progress)
+
+
+def _is_tensor_binding(v) -> bool:
+    """True for a binding that carries PIXELS — a tensor, or a Promise of one (P0-H).
+
+    Spelled once because three places ask it and all three were wrong in different ways when
+    they each asked it themselves: the params/tensor split in `boundary_lineage_key`, its
+    canvas enumeration, and `cook_fused_cached`'s upstream-coverage gate."""
+    # `__class__ is` for the Promise arm, matching `resolve_promise_bindings` and
+    # `infer_binding_type`. With `isinstance`, a Promise SUBCLASS would count as a tensor
+    # binding here, then miss resolution in both of those (they test exact class) and
+    # surface as an E7005 out of `prefix_fingerprint` — a disagreement between three
+    # predicates that are supposed to describe one thing.
+    return isinstance(v, torch.Tensor) or v.__class__ is _Promise
+
+
+def _binding_shape(v):
+    """The shape a tensor binding contributes to a canvas descriptor, or None if unknowable.
+
+    A landed Promise reports its value's real shape; an unlanded one reports its declaration.
+    None means "an unlanded promise that declared no shape" — un-keyable, because the
+    boundary's resolution is part of its identity."""
+    if isinstance(v, torch.Tensor):
+        return tuple(v.shape)
+    val = getattr(v, "value", None)
+    if val is not None:
+        return tuple(val.shape)
+    declared = getattr(v, "shape", None)
+    return tuple(declared) if declared else None
 
 
 def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context=None,
@@ -1760,19 +1803,49 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
     from . import tex_results
     from .tex_fusion import prefix_fingerprint
     fp = prefix_fingerprint(stages, k, _infer_binding_type)
+    # P0-H: a Promise is a TENSOR binding that has not arrived yet, so it belongs on the
+    # tensor side of this split — not in `params`. It landed there because the test asks
+    # "is it a Tensor?", and `_canon_params` folds unknown objects via `repr`, which for a
+    # `__slots__` object is its ADDRESS. That made checkpoint identity address-keyed: two
+    # equivalent promises minted different keys (spurious misses, verified), and CPython
+    # address reuse could alias two genuinely different ones onto the same key.
+    #
+    # THE HALF v0.34.1's FIRST DRAFT FORGOT, and it was worse than the defect it replaced:
+    # removing Promise from `params` without adding it to the tensor side made a promise-fed
+    # prefix invisible to BOTH halves. `_shapes()` skipped it, so the canvas enumeration came
+    # back empty, fell through to the `chain_in` branch, came back empty again — and every
+    # resolution minted the SAME key. Address-keying was merely wasteful (different keys,
+    # spurious misses, safe); one key for two resolutions is a wrong-size boundary served on a
+    # cache HIT, which is the exact failure the P0-3 comment below says it closed.
     params = {f"s{i}:{n}": v
               for i, st in enumerate(stages[:k])
               for n, v in (st.get("bindings") or {}).items()
-              if not isinstance(v, torch.Tensor)}
+              if not _is_tensor_binding(v)}
     if canvas is None:
         # Every tensor the prefix reads, by stage-qualified name and shape. Derivable BEFORE
         # the cook: a TEX program's output canvas equals its input canvas until LANG-6's
         # `canvas()` lands, at which point this becomes a derived shape rather than a copied one.
+        #
+        # A Promise contributes its DECLARED shape — declared up front for exactly this reason
+        # (identity computable before the pixels land). Per-binding device is deliberately not
+        # emitted here, for promises or tensors: `device` is already a mandatory top-level
+        # lineage_key component, so repeating it per binding would change the key shape for
+        # every existing caller to say something the key already says.
         def _shapes(sts, off=0):
-            return [[f"s{i + off}:{n}", *[int(d) for d in v.shape]]
-                    for i, st in enumerate(sts)
-                    for n, v in sorted((st.get("bindings") or {}).items())
-                    if isinstance(v, torch.Tensor)]
+            out = []
+            for i, st in enumerate(sts):
+                for n, v in sorted((st.get("bindings") or {}).items()):
+                    if not _is_tensor_binding(v):
+                        continue
+                    shape = _binding_shape(v)
+                    if shape is None:
+                        raise ValueError(
+                            f"boundary_lineage_key cannot key stage {i + off} binding '{n}': "
+                            f"it is an unlanded Promise that declared no shape, and the "
+                            f"boundary's RESOLUTION is part of its identity. Declare "
+                            f"`shape=` on the promise, or pass `canvas=` explicitly.")
+                    out.append([f"s{i + off}:{n}", *[int(d) for d in shape]])
+            return out
 
         canvas = {"in": _shapes(stages[:k])}
         if not canvas["in"]:
@@ -1825,9 +1898,23 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     # full cook without ever slicing `stages[:k]`.
     if (precision != "fp32" or latent_channel_count or result_cache is None
             or not is_linear_stage_list(stages) or not (1 <= k < len(stages))
+            # P0-H: count PROMISED tensors too. A promise is a tensor input whose pixels have
+            # not arrived, so an uncovered one is exactly the partial cover this term exists to
+            # refuse — and skipping it let a promise-fed prefix through the gate with zero
+            # upstream keys naming it.
             or len(upstream) < sum(1 for st in stages[:k]
                                    for v in (st.get("bindings") or {}).values()
-                                   if isinstance(v, torch.Tensor))):
+                                   if _is_tensor_binding(v))
+            # ...and an unlanded promise with no declared shape cannot be keyed at all
+            # (`_binding_shape` -> None). Refuse to a full cook rather than let
+            # `boundary_lineage_key` raise out of a serve path whose contract is to fall back.
+            # `isinstance` first: `_binding_shape` returns `tuple(v.shape)` for any real
+            # tensor and can only be None for a promise, so without the guard this walks
+            # every prefix binding allocating a torch.Size->tuple purely to compare it to
+            # None — on the cache-HIT path whose whole point is to skip a prefix cook.
+            or any(isinstance(v, _Promise) and _binding_shape(v) is None
+                   for st in stages[:k]
+                   for v in (st.get("bindings") or {}).values())):
         return _full()
     # P0-5: a tap on a stage strictly below `k-1` is inside the served prefix and the suffix
     # cook never produces it. Serving anyway drops a requested output and shifts the host's

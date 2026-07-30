@@ -43,7 +43,9 @@ from .codegen_stencil import (
 )
 from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
                           _broadcast_pair, _ensure_spatial)
-from .stdlib import SAFE_EPSILON, _lerp_f32, _to_tensor
+from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
+                     set_cook_grid as _stdlib_set_cook_grid,
+                     restore_cook_ctx as _stdlib_restore_cook_ctx)  # P0-D: cook grid
 
 
 class _Unsupported(Exception):
@@ -154,16 +156,35 @@ def try_compile(program: Program, type_map: dict[int, TEXType],
 
 
 def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
-               device: Any, spatial_shape: tuple | None) -> None:
+               device: Any, spatial_shape: tuple | None, dtype=None) -> None:
     """Invoke a codegen-generated function with the constant argument tail.
 
     Single owner of the positional calling convention — it must match the
     _tex_fn signature emitted by _CodeGen.build().
-    """
-    cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
-          torch, _broadcast_pair, _ensure_spatial, torch.where,
-          math, SAFE_EPSILON, CHANNEL_MAP, MAX_LOOP_ITERATIONS,
-          _CgBreak, _CgContinue, _cg_lerp, _cg_lerpw)
+
+    P0-D: it is also where the codegen tier publishes the COOK GRID, for the same reason
+    `Interpreter.execute` does — `fetch_time`/`sample_time` with constant coordinates have no
+    image argument to size from. v0.34.1's first draft set it in the interpreter only, which
+    did not leave the defect half-fixed, it created a NEW one: the same program returned
+    [1,16,16,4] under `compile_mode="none"` and [1,1,1,4] under `"auto"`, an interp↔codegen
+    divergence (invariant #2) where before both tiers at least agreed on being wrong. Wrapping
+    the single owner of the convention covers all three `compiled.py` call sites at once
+    rather than three chances to forget one.
+
+    `dtype` is the cook's WORKING dtype, passed in rather than sniffed off the bindings.
+    An earlier draft read the first floating binding's dtype, which is not the same thing:
+    `_contiguous_bindings` casts only INTEGER bindings, so under `precision="fp16"` an
+    fp32 binding would have told codegen "fp32" while the interpreter used
+    `_PRECISION_DTYPES[precision]` — reintroducing an interp/codegen split of exactly the
+    class this publish exists to close. The callers all have `precision` already."""
+    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype)
+    try:
+        cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
+              torch, _broadcast_pair, _ensure_spatial, torch.where,
+              math, SAFE_EPSILON, CHANNEL_MAP, MAX_LOOP_ITERATIONS,
+              _CgBreak, _CgContinue, _cg_lerp, _cg_lerpw)
+    finally:
+        _stdlib_restore_cook_ctx(_grid_token)
 
 
 def _cg_lerp(a, b, t):

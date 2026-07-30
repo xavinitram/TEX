@@ -332,7 +332,28 @@ class Promise:
         return self._error
 
     def land(self, value) -> "Promise":
-        """Deliver the value, validated against the declaration. Wakes every waiter."""
+        """Deliver the value, validated against the declaration. Wakes every waiter.
+
+        P0-G: `None` is REFUSED rather than stored. `landed` is derived from `_value is not
+        None`, so landing None reported success, left `landed` False, and CONSUMED the
+        callback list — after which a later correct `land()` raised "already landed" and woke
+        nobody. A permanent park, from a call that returned normally. There is no legitimate
+        "the value is None" case for a binding: not-connected is expressed by not submitting
+        the job, and a source that cannot be read is `fail()`.
+        """
+        if value is None:
+            # E7006, not a bare ValueError: this is a promise-declaration violation like every
+            # other one `_check` raises, and a host catching E7xxx to route host-I/O failures
+            # would otherwise miss it. The first draft raised ValueError with `_code=None`,
+            # which for a VEC4-declared promise was a REGRESSION — the same call used to reach
+            # `_check` and come back as a routable E7006.
+            from .tex_runtime.interpreter import InterpreterError
+            raise InterpreterError(
+                f"promised binding '{self.name}' cannot land None.", None, code="E7006",
+                hint="Use fail(exc) for a source that could not be read, or do not submit the "
+                     "job at all for an input that is simply absent. `landed` is derived from "
+                     "the value, so a None would leave the promise unlanded with its callbacks "
+                     "already spent.")
         self._check(value)
         with self._lock:
             if self.landed:
@@ -344,7 +365,21 @@ class Promise:
 
     def fail(self, exc: BaseException) -> "Promise":
         """Deliver a FAILURE. Jobs waiting on it fail with `exc` rather than waiting forever —
-        a source that cannot be read is a finished question, not a slow one."""
+        a source that cannot be read is a finished question, not a slow one.
+
+        `None` is refused for the same reason `land(None)` is, and the consequence here
+        is strictly worse: `landed` is derived from `_error is not None`, so `fail(None)`
+        returned success, left the promise unlanded, and CONSUMED the callback list — after
+        which not even a later correct `land()` could wake the parked job, because there was
+        nobody left to notify. `drain()` never returns and `stats.waiting` sticks at 1. The
+        first draft guarded `land()` and left this sibling, which has the identical shape."""
+        if exc is None:
+            from .tex_runtime.interpreter import InterpreterError
+            raise InterpreterError(
+                f"promised binding '{self.name}' cannot fail with None.", None, code="E7006",
+                hint="Pass the exception the read actually raised. A None would leave the "
+                     "promise unlanded with its callbacks already spent, which parks every "
+                     "waiting job permanently.")
         with self._lock:
             if self.landed:
                 raise RuntimeError(f"promise {self.name!r} has already landed")
@@ -495,6 +530,18 @@ def infer_binding_type(value: Any) -> TEXType:
             # array) or [N, C] (vec array). Under ComfyUI (default) this stays FLOAT below, so a
             # host that never enables array wires is byte-identical.
             return TEXType.ARRAY
+        elif value.dim() >= 5:
+            # P0-I: the one residue of the pre-E7005 guess. A >=5-D tensor is not a TEX value
+            # in any profile, and typing it FLOAT is the same silent identity corruption the
+            # E7005 terminal closed — reached through the tensor branch, which the terminal
+            # never sees. (dim 0-2 keep FLOAT deliberately: a 0-dim scalar IS a float, and
+            # 1-2D without array wires is the documented ComfyUI default.)
+            from .tex_runtime.interpreter import InterpreterError
+            raise InterpreterError(
+                f"a {value.dim()}-D tensor binding cannot be typed by TEX "
+                f"(shape {tuple(value.shape)}).", None, code="E7005",
+                hint="TEX bindings are [B,H,W,C] images, [B,H,W] masks, or (with array wires) "
+                     "[N]/[N,C] arrays. A higher-rank tensor needs reshaping host-side.")
         else:
             return TEXType.FLOAT
     elif isinstance(value, (int, bool)):

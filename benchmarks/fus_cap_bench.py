@@ -103,8 +103,26 @@ def bench(res, device, counts, warmup, runs):
         exact = bool(torch.equal(ref, seg_out) and torch.equal(ref, unf_out))
         maxdiff = max(float((ref - seg_out).abs().max()), float((ref - unf_out).abs().max()))
 
+        # The decision's HEADLINE is the peak-memory ratio, and it lived only in prose until
+        # v0.34.1. Measured per route, on CUDA, around a fresh reset so the numbers are the
+        # route's own rather than the process's high-water mark.
+        peaks = {}
+        if str(device).startswith("cuda"):
+            # Free the equality check's three full-resolution results FIRST. Leaving them alive
+            # inflates every route's peak by a constant — and inflates the small denominator
+            # most, which understates the ratio the decision rests on (measured 7.8x with them
+            # held vs 12.9x without, same tree, same run).
+            del ref, seg_out, unf_out
+            for label, seg in (("fused", n), ("segmented", CAP), ("unfused", 1)):
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+                _run(stages, src, device, seg)
+                torch.cuda.synchronize()
+                peaks[label] = int(torch.cuda.max_memory_allocated())
+
         row = {
             "n": n, "device": device, "res": res, "exact": exact, "maxdiff": maxdiff,
+            "peak_bytes": peaks,
             "regions_today": 1 if n <= CAP else 0,
             "regions_segmented": math.ceil(n / CAP),
             "fused_ms": _time(lambda: _run(stages, src, device, n), warmup, runs, device),

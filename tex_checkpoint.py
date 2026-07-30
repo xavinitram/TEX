@@ -479,17 +479,24 @@ def _gate_ok(stages, result_cache, latent_channel_count: int, upstream,
     from .tex_fusion import is_linear_stage_list
     if not is_linear_stage_list(stages):
         return False
-    import torch
-    # `isinstance(v, torch.Tensor)`, matching `cook_fused_cached`'s gate exactly. A duck-typed
-    # `hasattr(v, "shape")` would also count a host object that merely exposes a shape, which
-    # makes the two gates disagree about how many source keys a chain needs — the one number
-    # that decides whether a boundary may be cached at all. Scope DOES differ, deliberately:
+    from .tex_engine import _is_tensor_binding, _binding_shape
+    # THE SAME predicate `cook_fused_cached`'s gate uses — imported, not re-spelled. This
+    # comment used to claim `isinstance(v, torch.Tensor)` matched that gate "exactly", and
+    # v0.34.1's P0-H made the claim false: a Promise is a pixel-carrying binding there and was
+    # not counted here, so a promise-fed chain passed THIS gate with zero upstream keys naming
+    # it — the partial cover the count exists to refuse, through the door the fix did not
+    # close. A duck-typed `hasattr(v, "shape")` is still wrong for the original reason (it
+    # would count a host object that merely exposes a shape). Scope DOES differ, deliberately:
     # the single-tap gate counts `stages[:k]` because it has one cut, while multi-tap has cuts
     # at many k and every stage's tensors can feed some prefix.
-    tensors = sum(1 for st in stages
-                  for v in (st.get("bindings") or {}).values()
-                  if isinstance(v, torch.Tensor))
-    return len(upstream) >= tensors
+    binds = [v for st in stages for v in (st.get("bindings") or {}).values()
+             if _is_tensor_binding(v)]
+    if len(upstream) < len(binds):
+        return False
+    # ...and a binding whose shape is unknowable (an unlanded, shapeless Promise) cannot be
+    # keyed at all. `serve()` must FALL BACK, never raise, so refuse here rather than let
+    # `boundary_lineage_key`'s ValueError escape a path contracted to degrade quietly.
+    return all(_binding_shape(v) is not None for v in binds)
 
 
 def _plan_from_profile(stages, *, threshold_ms: float, profile_key, spatial,

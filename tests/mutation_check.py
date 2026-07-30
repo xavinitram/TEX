@@ -1,6 +1,6 @@
 """Mutation check — do the release's tests actually KILL the bugs they claim to pin?
 
-NOT part of `run_all.py`: it copies the tree once per mutation and runs the v0.32 + v0.33 rows
+NOT part of `run_all.py`: it copies the tree once per mutation and runs the v0.32-v0.34.1 rows
 against each, which is minutes, not seconds. Run it by hand when a fix lands:
 
     python tests/mutation_check.py
@@ -207,6 +207,63 @@ MUTATIONS = [
      "    if True:\n"
      "        return outputs\n"
      "    out = {}"),
+
+    # ── v0.34.1: the v0.34.0 audit register, and the re-audit's holes ──
+    #
+    # RETIRED WITH REASON (3 rows), rather than left surviving:
+    #  * 'the generation is read AFTER the provider' — the fix stopped depending on
+    #    read order at all (both reads now happen under the registration lock), so
+    #    there is no order left to mutate. The 'guard at put() goes' row below still
+    #    covers the mechanism.
+    #  * 'the wake path stops checking shed_requested' — every setter of that flag
+    #    also removes the job from its deque under the same lock, so the branch is
+    #    unreachable today. It is kept in the source as documented belt-and-braces
+    #    (see its comment); an unkillable row asserting it would be decorative.
+    #  * 'the generation guard at put() goes' — RETIRED BY ITS OWN FIX. The /simplify pass
+    #    moved the generation into the pool KEY, so a stale insert now lands under a key
+    #    nobody can look up and removing the guard changes no observable outcome. The row
+    #    was killable only while the guard was the single door; keeping it would assert
+    #    that the weaker design is still load-bearing.
+    #  * 'an unlanded shapeless promise is keyed anyway' — the gate term it mutates
+    #    is unobservable through `cook_fused_cached`: an unlanded promise is refused
+    #    by `_full()`'s E7007 before the term could change any outcome, and the
+    #    raise that DOES matter (a direct `boundary_lineage_key` call getting a
+    #    clear refusal instead of a key over an unknown resolution) lives in
+    #    `_shapes` and is pinned by the H-hole row. The term stays as the
+    #    contract-shaped refusal for a serve path that must fall back, not raise.
+    ('v0.34.1 B: cancel() stops treating WAITING like PENDING', 'tex_cookqueue.py',
+     '            if job.state in (PENDING, WAITING):',
+     '            if job.state == PENDING:'),
+    ('v0.34.1 C: an integer provider frame is accepted again', 'tex_provider.py',
+     '    if not frame.is_floating_point():',
+     '    if False:'),
+    ('v0.34.1 C: f64 is no longer narrowed at the pool boundary', 'tex_provider.py',
+     '    if frame.dtype == torch.float64:\n        frame = frame.to(torch.float32)',
+     '    if False:\n        frame = frame.to(torch.float32)'),
+    ('v0.34.1 D: the const-coord grid falls back to (1,1,1) again', 'tex_runtime/stdlib.py',
+     'def _uniform_grid():\n    return getattr(_cook_ctx, "grid", None)',
+     'def _uniform_grid():\n    return None'),
+    ('v0.34.1 D: the codegen tier stops publishing the grid', 'tex_runtime/codegen.py',
+     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype)',
+     '    _grid_token = _stdlib_set_cook_grid(None, None)'),
+    ('v0.34.1 E: the pool stops copying at its boundary', 'tex_provider.py',
+     '    if not getattr(prov, "frames_are_owned", False):',
+     '    if False:'),
+    ('v0.34.1 F: a speculative wake failure alarms again', 'tex_cookqueue.py',
+     '                if job.klass == SPECULATIVE and str(getattr(err, "_code", "")).startswith("E7"):',
+     '                if False:'),
+    ('v0.34.1 G: land(None) is accepted again', 'tex_marshalling.py',
+     '        if value is None:\n            # E7006, not a bare ValueError',
+     '        if False:\n            # E7006, not a bare ValueError'),
+    ('v0.34.1 G: fail(None) is accepted again', 'tex_marshalling.py',
+     '        if exc is None:\n            from .tex_runtime.interpreter import InterpreterError',
+     '        if False:\n            from .tex_runtime.interpreter import InterpreterError'),
+    ('v0.34.1 H: a Promise is not a tensor binding again', 'tex_engine.py',
+     '    return isinstance(v, torch.Tensor) or v.__class__ is _Promise',
+     '    return isinstance(v, torch.Tensor)'),
+    ('v0.34.1 I: a >=5-D tensor types FLOAT again', 'tex_marshalling.py',
+     '        elif value.dim() >= 5:',
+     '        elif False:'),
 ]
 
 RUNNER = """
@@ -218,8 +275,9 @@ from helpers import SubTestResult
 import test_v032_checkpoint as A, test_v032_region as B, test_v032_governor as C
 import test_v033_precision as D, test_v033_cache8 as E, test_v033_xpu2 as F
 import test_v033_phase0 as G, test_v0331_audit as H, test_v0332_audit as I
+import test_v034_data7 as J, test_v034_io1 as K, test_v0341_audit as L
 r = SubTestResult()
-for m in (A, B, C, D, E, F, G, H, I):
+for m in (A, B, C, D, E, F, G, H, I, J, K, L):
     for n in sorted(x for x in dir(m) if x.startswith("test_")):
         try:
             getattr(m, n)(r)
@@ -250,6 +308,7 @@ base_root = pathlib.Path(tempfile.mkdtemp(prefix="mutbase_"))
 shutil.copytree(SRC, base_root / "TEX_Wrangle",
                 ignore=shutil.ignore_patterns("__pycache__", ".tex_cache", ".git", "results"))
 
+stale: list = []
 print(f"{'mutation':58s} {'verdict'}")
 print("-" * 84)
 for label, rel, old, new in MUTATIONS:
@@ -258,7 +317,14 @@ for label, rel, old, new in MUTATIONS:
     p = work_root / "TEX_Wrangle" / rel
     s = p.read_text(encoding="utf-8")
     if s.count(old) != 1:
-        print(f"{label:58s} SKIP (anchor matched {s.count(old)}x)")
+        # NOT a skip. A row whose anchor no longer matches proves NOTHING while printing
+        # something that reads like a benign outcome — and it goes stale exactly when the
+        # source it guards is edited, i.e. when it is most needed. Two rows drifted this way
+        # in v0.34.1 (a /simplify pass changed the very lines they anchored on) and were
+        # visible only because someone read the log. Loud, and counted.
+        stale.append(label)
+        print(f"{label:58s} *** STALE ANCHOR *** (matched {s.count(old)}x) "
+              f"- re-anchor or retire it; this row asserts nothing")
         continue
     p.write_text(s.replace(old, new, 1), encoding="utf-8", newline="")
     failed = run_tree(work_root / "TEX_Wrangle")
@@ -267,3 +333,11 @@ for label, rel, old, new in MUTATIONS:
     print(f"{label:58s} {verdict:20s} ({failed} failing rows)")
     shutil.rmtree(work_root, ignore_errors=True)
 shutil.rmtree(base_root, ignore_errors=True)
+
+if stale:
+    print()
+    print(f"{len(stale)} STALE ANCHOR(S) - these rows asserted nothing:")
+    for label in stale:
+        print(f"  - {label}")
+    raise SystemExit(1)
+

@@ -5,6 +5,73 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.1] - 2026-07-30
+
+**Mind the sources** — the v0.34.0 release audit's findings, closed, plus the re-audit's. Same
+mold as v0.33.1/v0.33.2: every defect lives behind a REGISTERED-PROVIDER or
+QUEUE-WITH-PROMISES path, none is reachable from a default ComfyUI cook, and each lands with a
+pin verified to fail on a pristine worktree at v0.34.0 (9/9 reproduced pre-fix, 0/9 after).
+
+### Fixed
+
+- **A · `set_provider` racing an in-flight fetch served the REPLACED provider's pixels.**
+  Silent, and through the ordinary path: `provider_id` defaults to the class name, so
+  re-registering the same decoder class made old and new ids equal. A generation counter now
+  guards the insert, and the generation and provider are read **atomically** under the
+  registration lock rather than in a lucky order.
+- **B · `cancel()` of a WAITING job never terminated it.** `wait()`/`drain()` hung, and worse:
+  the later promise landing flipped the cancelled job to PENDING and **granted its deferred
+  preemption**, destroying a running COMMITTED render's progress for a job that could never run.
+- **C · A provider frame's dtype was never checked.** An f64 source reached the cook output
+  under `precision="fp32"`. Floats now narrow only where they must (f64 → fp32 at the pool,
+  keeping the source's width otherwise) and cast to the cook's dtype at the read; integer
+  frames are refused, because normalizing them is a colour decision this seam must not make.
+- **D · All-scalar coordinates took the PROVIDER's device** — a rank test standing in for a
+  device test — raising a bare `RuntimeError` with no E-code in a CUDA cook. Const-coord reads
+  also returned `[1,1,1,C]` where `vec4(…)` and `fetch(@A,4,4)` both give the cook grid; the
+  grid is now published by **both** tiers, so interp and codegen agree.
+- **E · The media pool accounted a view's numel.** A provider returning `clip[i:i+1]`
+  under-reported 64× and pinned the whole clip past every eviction. The pool now copies at its
+  boundary by default; a host that genuinely hands over a fresh tensor declares
+  `frames_are_owned = True`, and the copy cost is reported in `stats()`.
+- **F · A promise that FAILED before its job ran alarmed even for SPECULATIVE work** — the
+  class-dependent rule lived only in `_run_one`, not in the wake path.
+- **G · `Promise.land(None)` half-landed** (success returned, `landed` still False, callbacks
+  consumed → permanent park). Both `land(None)` and its sibling `fail(None)` are now refused as
+  routable **E7006**.
+- **H · The stage-list family neither resolved nor refused Promises**, and
+  `boundary_lineage_key` folded one through `repr` — address-keyed checkpoint identity.
+- **I · A ≥5-D tensor still typed FLOAT** inside the tensor branch, the last residue of the
+  pre-E7005 guess; and a helper-raised diagnostic now adopts its call site, so a fused E7002
+  can name the stage that failed.
+
+### Fixed — found by re-audit, in this patch's own first draft
+
+- **H was a REGRESSION.** Removing `Promise` from the params fold without adding it to the
+  tensor side made a promise-fed prefix invisible to *both* halves of `boundary_lineage_key`:
+  one key for every resolution, i.e. a wrong-size boundary served on a cache **hit**. v0.34.0's
+  address-keying was wasteful but safe. Promises now contribute their declared shape, the
+  coverage gate counts them, and an unlanded shapeless promise is refused rather than keyed.
+- **D published the grid in the interpreter only**, creating an interp↔codegen divergence
+  (invariant #2) that v0.34.0 did not have. Now published by `_invoke_cg`, the single owner of
+  the codegen calling convention.
+- **E's fast path exempted the mainstream provider** (one reusing its decode buffer) — both
+  symptoms the fix claimed to close survived it.
+- **C forced fp32 at the pool boundary**, doubling the pool and un-doing `precision="fp16"` for
+  the half-float EXR source its own comment names.
+- **A's guard failed open** on a two-read window; **G guarded `land()` and left `fail()`**.
+
+### Changed
+
+- **The mutation harness ran no v0.34 tests.** Its RUNNER imported a hardcoded module list that
+  stopped at v0.33, so v0.34 rows had nowhere to live — the real cause behind "zero mutation
+  rows". 12 v0.34.1 rows added, 3 retired with reasons recorded in the file.
+- **A green row that exercised nothing, since v0.33.2.** `test_v0331_audit`'s A5 called
+  `_spill("k", entry)` after `_spill` grew a `seq` parameter; the worker died with TypeError,
+  the wait timed out unchecked, and three assertions passed over a race that never ran. The
+  waits are asserted now.
+- `tex_provider.stats()` no longer claims `tex doctor` reads it. It never did.
+
 ## [0.34.0] - 2026-07-29
 
 **Sources & sinks** — I/O joins the pipeline. A frame that isn't in RAM yet, and a frame
@@ -91,8 +158,11 @@ that's leaving, both stop being the cook's problem. Design docs: `docs/frame-pro
 - **Invariant #7 holds.** DATA-7 and IO-1 each measured against the release baseline on the
   8-config matrix: the discriminating GPU configs sit at 0.992–1.006×. The CPU configs swing
   ±10% on this box at 24 programs — a null control on an **identical tree** returned
-  0.965–1.102×, which brackets every CPU number either item produced, so the 0.95 stop-ship
-  threshold does not discriminate there and only the GPU rows were read as signal.
+  0.965–1.102×, so the 0.95 stop-ship threshold does not discriminate there and only the GPU
+  rows were read as signal. (Corrected in v0.34.1: the original wording said the null control
+  "brackets every CPU number either item produced", which is false — DATA-7's cpu_on_cold
+  0.907× sits below the 0.965 lower edge. The noise-magnitude argument stands; the
+  containment claim did not, and a measurement is not improved by overstating it.)
 
 ## [0.33.2] - 2026-07-28
 

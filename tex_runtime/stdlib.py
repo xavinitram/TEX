@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import threading as _threading
 from collections import OrderedDict as _OrderedDict
 import torch
 import logging
@@ -139,24 +140,87 @@ def _provider_read(source, t, mode: str, a, b):
     per-device copy is the deferred alternative (it doubles the pool's bytes for a win only
     a mismatched host sees).
 
-    All-scalar coordinates have no device of their own (`_to_tensor` puts a Python float on
-    CPU), so the frame's device wins — otherwise a constant-coordinate read in a CUDA cook
-    would silently drag the frame to CPU.
+    P0-D: the device comes from any coordinate that ARRIVED as a tensor, whatever its RANK.
+    The first version tested `.dim()`, which looks like "is this a real grid?" and is not: the
+    interpreter evaluates a numeric literal through `_literal_cache`, keyed by
+    `(value, device_str, dtype)`, so a constant coordinate is already a 0-dim tensor ON THE
+    COOK DEVICE. Testing rank threw that away and fell back to the frame's device, so a CPU
+    provider in a CUDA cook raised a bare `RuntimeError` with no E-code the moment the result
+    met anything else. Only a raw Python scalar — reachable from a direct API call, never from
+    a cooked program — has no device, and then the frame's own device is the honest answer.
     """
     ta, tb = _to_tensor(a), _to_tensor(b)
-    dev = ta.device if ta.dim() else (tb.device if tb.dim() else None)
+    dev = None
+    for orig, coerced in ((a, ta), (b, tb)):
+        if isinstance(orig, torch.Tensor):
+            dev = coerced.device
+            break
     from ..tex_provider import materialize, _uniform_time
     key = source if isinstance(source, str) else str(source)
     img = materialize(key, _uniform_time(t, key), mode)
+    # P0-C: the cast to the cook's working dtype happens HERE, not at the pool boundary, for
+    # the reason the boundary's own comment gives: `_normalize` cannot see the cook's
+    # precision, so forcing fp32 there doubled the pool and un-did `precision="fp16"`. The
+    # pool keeps the source's own width; each read pays a cast only when the widths differ,
+    # which for a matched host is never.
+    #
+    # Device and dtype move in ONE `.to()`. Two calls allocate two full frames for a
+    # cross-device, cross-width read — 133 MB of avoidable allocation at 4K RGBA.
+    dt = _uniform_dtype()
     if dev is None:
         dev = img.device
-    elif img.device != dev:
-        img = img.to(dev)
+    if img.device != dev or (dt is not None and img.dtype != dt):
+        img = img.to(device=dev, dtype=dt if dt is not None else img.dtype)
     if ta.device != dev:
         ta = ta.to(dev)
     if tb.device != dev:
         tb = tb.to(dev)
     return img, ta, tb
+
+
+# P0-D (second half): the cook grid, published by the interpreter for the ONE case that
+# cannot derive it from its arguments.
+#
+# `fetch_time("p", 0.0, 4, 4)` — constant coordinates — produced a [1,1,1,C] result while
+# `vec4(0.5,0.5,0.5,1)` and `fetch(@A, 4, 4)` both produced the cook grid. It broadcasts
+# correctly in an expression and is wrong the moment it IS the output: a 1×1 image where the
+# user wrote a constant-colour frame. The in-batch twins have no such problem because their
+# image argument IS the cook grid; a source frame's resolution is its own, so these two have
+# nothing to size from.
+#
+# Thread-local, not a module global: DATA-4 leaves parallel hosts to guard their own caches,
+# and a second cook thread must not inherit this one's grid. Set and restored by
+# `Interpreter.execute`; absent (None) for any caller outside a cook, where [1,1,1,C] remains
+# the honest broadcast-shaped answer.
+_cook_ctx = _threading.local()
+
+
+def set_cook_grid(grid, dtype=None):
+    """Publish the cook's `(B,H,W)` grid and working dtype. Returns an opaque token.
+
+    Pass the token to `restore_cook_ctx` when the cook ends. Two functions rather than one
+    that also accepts its own return value: cooks nest (a codegen invocation inside an
+    interpreted fallback, a tiled strip loop), so the save/restore pair is real, and a single
+    function would have to SNIFF whether its argument is a grid or a saved pair — which is
+    guesswork in exactly the place P0-D was already caused by a type test standing in for an
+    intent test."""
+    token = (getattr(_cook_ctx, "grid", None), getattr(_cook_ctx, "dtype", None))
+    _cook_ctx.grid = grid
+    _cook_ctx.dtype = dtype
+    return token
+
+
+def restore_cook_ctx(token) -> None:
+    """Undo one `set_cook_grid`."""
+    _cook_ctx.grid, _cook_ctx.dtype = token
+
+
+def _uniform_grid():
+    return getattr(_cook_ctx, "grid", None)
+
+
+def _uniform_dtype():
+    return getattr(_cook_ctx, "dtype", None)
 
 
 # Pre-allocated grid buffer for sample() — avoids torch.stack allocation per call.
@@ -1198,7 +1262,7 @@ class TEXStdlib:
         _b, Hs, Ws, _c = img.shape
         px_i = torch.clamp(torch.round(px_t).long(), 0, Ws - 1)
         py_i = torch.clamp(torch.round(py_t).long(), 0, Hs - 1)
-        shape = torch.broadcast_shapes(px_i.shape, py_i.shape) or (1, 1, 1)
+        shape = torch.broadcast_shapes(px_i.shape, py_i.shape) or _uniform_grid() or (1, 1, 1)
         return img[0][py_i.expand(shape), px_i.expand(shape)]
 
     @stdlib("sample_time", sig='sample_time(source, t, u, v) \\u2192 vec', category='Batch / Temporal', spatial=True, sync=True, footprint='image', doc='Bilinear sample of a HOST source at time t (DATA-7). Needs a registered FrameProvider.', ex='@OUT = sample_time("plate", time - 0.5, u, v);')
@@ -1213,7 +1277,7 @@ class TEXStdlib:
         """
         img, u, v = _provider_read(source, t, "sample", u_coord, v_coord)
         _b, Hs, Ws, _c = img.shape
-        shape = torch.broadcast_shapes(u.shape, v.shape) or (1, 1, 1)
+        shape = torch.broadcast_shapes(u.shape, v.shape) or _uniform_grid() or (1, 1, 1)
         x = torch.clamp(u * (Ws - 1), 0, Ws - 1).expand(shape)
         y = torch.clamp(v * (Hs - 1), 0, Hs - 1).expand(shape)
 

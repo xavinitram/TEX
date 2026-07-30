@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Protocol
@@ -88,6 +89,14 @@ class FrameProvider(Protocol):
     #: gets the engine-side counter `bump_source_version()` drives.
     def source_version(self, source_key: str) -> int: ...
 
+    #: Optional, default False. Declares "every frame I return is freshly allocated and I
+    #: never touch it again", which lets the pool skip its defensive copy (~17 ms per 4K
+    #: frame). It is a promise about the FUTURE — a provider decoding into a reusable buffer
+    #: hands back a tensor indistinguishable from an owned one — so the engine cannot infer
+    #: it, and the safe default is to copy. Same shape as `egress(retained=)`: a fact the
+    #: caller knows, stated.
+    frames_are_owned: bool
+
 
 class NullFrameProvider:
     """No host source (the default): every fetch is E7001.
@@ -122,6 +131,12 @@ class SyntheticFrameProvider:
     identity is readable from any single pixel — which is what makes a "did I get the frame
     I asked for?" assertion a scalar comparison rather than a hash.
     """
+
+    #: `_frame` builds a fresh tensor per call and never revisits it, so the pool's
+    #: defensive copy is pure waste here. Declaring it matters beyond tidiness: this provider
+    #: backs the whole test suite AND `benchmarks/io_playback_bench.py`, so without it every
+    #: synthetic fetch in the PM-9 measurement paid a full-frame clone the real path would not.
+    frames_are_owned = True
 
     def __init__(self, *, res: int = 64, channels: int = 4, rate: float = 24.0,
                  device="cpu", provider_id: str = "synthetic", latency_s: float = 0.0):
@@ -177,7 +192,16 @@ def quantize_at_rate(t: float, rate: float) -> float:
 # ── the process-wide provider (mirrors get_host_services) ────────────────────
 
 _provider = None
-_provider_lock = threading.Lock()
+#: RLock, not Lock: `materialize` holds it across `get_provider()`, which takes it too.
+_provider_lock = threading.RLock()
+#: P0-A: bumped on every registration. `materialize()` stamps it at entry and `put()` refuses
+#: on a change, because dropping the pool at swap time is NOT enough on its own: a fetch that
+#: started before the swap returns after it, and inserts the REPLACED provider's pixels under
+#: the new provider's key. With the default class-name `provider_id` — re-registering the same
+#: decoder class, which is the ordinary case — the two ids are equal and the stale frame is
+#: served silently, which is the exact corruption the drop exists to prevent. Reproduced:
+#: swap 1.0 -> 2.0 mid-fetch, pool serves 1.0.
+_provider_gen = 0
 
 
 def get_provider():
@@ -193,13 +217,15 @@ def get_provider():
 def set_provider(provider) -> None:
     """Register the host's source provider. Passing None restores the Null default.
 
-    Changing the provider drops the pool: entries are keyed by `provider_id`, so a second
-    provider reusing the first's id would otherwise be served the first's pixels. Dropping
-    is the conservative direction and costs a host nothing it can notice.
+    Changing the provider drops the pool AND bumps the generation: entries are keyed by
+    `provider_id`, so a second provider reusing the first's id would otherwise be served the
+    first's pixels. Dropping is the conservative direction and costs a host nothing it can
+    notice; the generation covers the in-flight window the drop cannot reach.
     """
-    global _provider
+    global _provider, _provider_gen
     with _provider_lock:
         _provider = provider
+        _provider_gen += 1
     get_media_cache().clear()
 
 
@@ -307,6 +333,17 @@ class MediaCache:
         #: evictions because they mean the opposite thing: nothing was lost, a guess was
         #: declined.
         self.refused = 0
+        #: P0-E: defensive copies taken at the pool boundary, and what they cost. Reported
+        #: because ~17 ms per 4K frame is a number a host may want to remove (by declaring
+        #: `frames_are_owned`), and it cannot act on a cost it cannot see.
+        self.copies = 0
+        self.copy_ms = 0.0
+
+    def note_copy(self, ms: float) -> None:
+        """Record a defensive copy taken at the pool boundary (P0-E)."""
+        with self._lock:
+            self.copies += 1
+            self.copy_ms += float(ms)
 
     # ── reads ──
     def get(self, key: tuple):
@@ -369,7 +406,9 @@ class MediaCache:
     def invalidate_source(self, source_key: str) -> int:
         """Drop every entry for one source, whatever its version or mode. Returns the count."""
         with self._lock:
-            doomed = [k for k in self._entries if len(k) > 1 and k[1] == source_key]
+            # Index 2 since the key gained a generation component in front of the source
+            # (P0-A). Matching by position is why this is stated rather than obvious.
+            doomed = [k for k in self._entries if len(k) > 2 and k[2] == source_key]
             for k in doomed:
                 self._drop_locked(k)
             return len(doomed)
@@ -417,6 +456,7 @@ class MediaCache:
                     "bytes_by_dev": dict(self._bytes_by_dev),
                     "hits": self.hits, "misses": self.misses,
                     "evictions": self.evictions, "refused": self.refused,
+                    "copies": self.copies, "copy_ms": round(self.copy_ms, 3),
                     "budget": self._budget}
 
 
@@ -441,7 +481,12 @@ def set_media_budget_mb(mb: float) -> None:
 
 
 def stats() -> dict:
-    """What a host HUD, `tex doctor` and the reattach report all read."""
+    """The media pool's counters, for a host HUD or a test.
+
+    (The original docstring claimed `tex doctor` reads this. It does not — `tex_doctor` reports
+    the governor profile and the cache budgets, and has never had a media line. The claim
+    survived three edits to this file; corrected rather than made true, because a doctor line
+    is a UX decision and this is a patch release.)"""
     return {"provider": provider_id(), **get_media_cache().stats()}
 
 
@@ -468,6 +513,33 @@ def _normalize(frame, source_key: str, t: float) -> torch.Tensor:
                hint="A provider returns ONE RGBA frame per call. Batch axes belong to the "
                     "cook, not to the source; expand a mono or RGB source host-side, where "
                     "the decoding decisions already live.")
+    # P0-C: dtype was never checked, so a fp16/f64 provider frame flowed straight into the
+    # cook — f64 drags whole expressions to f64 under `precision="fp32"` (reproduced: both
+    # `fetch_time` and `sample_time` returned f64 from an f64 provider). The split is by
+    # KIND, not by convenience:
+    #   * a floating dtype CONVERTS — half is what an EXR source legitimately decodes to,
+    #     and fp32 is the precision the cook was asked for;
+    #   * an integer dtype REFUSES — turning uint8 into float means choosing a normalization
+    #     (÷255? ÷65535? sRGB-decoded?), and that is a colour decision this seam must never
+    #     make on the host's behalf.
+    if not frame.is_floating_point():
+        _raise(E_BAD_FRAME,
+               f"the frame provider returned {frame.dtype} for `{source_key}` at t={t:g}; "
+               f"a frame must be a floating-point tensor.",
+               hint="Decode integer sources to float host-side. TEX will not guess whether "
+                    "255 means 1.0, nor whether the values are sRGB-encoded — those are "
+                    "decoding decisions and decoding is the host's half of the seam.")
+    # Only f64 is normalized HERE, and only because it is not a TEX compute dtype in any
+    # precision mode — it would drag whole expressions to f64 under `precision="fp32"`.
+    #
+    # v0.34.1's first draft forced EVERYTHING to fp32 at this boundary, which fixed f64 and
+    # broke fp16: this function cannot see the cook's precision, so a half-float EXR source —
+    # the very case the comment above names as legitimate — was upcast, DOUBLING the pool
+    # (31.6 MiB vs 15.8) and promoting every expression it touched back to fp32 under
+    # `precision="fp16"`. The pool now stores the source's own width and `_provider_read`
+    # casts to the cook's dtype at the read, where that dtype is actually known.
+    if frame.dtype == torch.float64:
+        frame = frame.to(torch.float32)
     return frame
 
 
@@ -478,7 +550,19 @@ def materialize(source_key: str, t: float, mode: str = "fetch", *,
     Returns the frame, or None when `speculative=True` and the pool refused the insert
     (backpressure — the caller is a prefetch and has nothing to report).
     """
-    prov = get_provider()
+    # P0-A: the generation and the provider are read ATOMICALLY.
+    #
+    # Two separate reads left a window — narrow, ~2 bytecodes, but the same shape as v0.33.2's
+    # H7 — in which a swap lands between them and this call holds the OLD provider with the NEW
+    # generation: the comparison at `put()` comes out equal and the stale frame is indexed.
+    # Ordering the reads (generation first) makes the failure conservative rather than absent,
+    # and leaves the guard's correctness resting on statement order, which nothing enforces and
+    # no test can reach. Holding the registration lock across both makes the pair indivisible,
+    # so there is no interleaving left to reason about. An uncontended RLock acquire is ~50 ns
+    # against a fetch that is about to touch a decoder.
+    with _provider_lock:
+        gen = _provider_gen
+        prov = get_provider()
     source_key = "" if source_key is None else str(source_key)
     try:
         qt = float(prov.quantize_time(source_key, t))    # type: ignore[attr-defined]
@@ -492,7 +576,16 @@ def materialize(source_key: str, t: float, mode: str = "fetch", *,
     # name a source cannot promise anything about it.
     key = None
     if source_key:
-        key = (provider_id(prov), source_key, mode, repr(qt), source_version(source_key, prov))
+        # The generation is a KEY COMPONENT, not just an insert guard. Guarding only the
+        # insert leaves the READ open: `set_provider` clears the pool after releasing the
+        # lock, so a fetch entering that window looks up a key that is identical (the
+        # default `provider_id` is the class name, and re-registering the same decoder
+        # class is the ordinary case) and is served the replaced provider's pixels. In the
+        # key, a stale entry is simply unreachable and a stale insert lands somewhere
+        # nobody will look — the guard below becomes belt-and-braces rather than the only
+        # thing standing between two providers.
+        key = (provider_id(prov), gen, source_key, mode, repr(qt),
+               source_version(source_key, prov))
         hit = cache.get(key)
         if hit is not None:
             return hit
@@ -511,7 +604,39 @@ def materialize(source_key: str, t: float, mode: str = "fetch", *,
                hint="This is the host's provider raising, not a TEX error. "
                     "A SPECULATIVE prefetch records it in the refusals ledger instead.")
     frame = _normalize(frame, source_key, qt)
+    # P0-E: the pool must own its bytes, and it copies to guarantee that — unconditionally
+    # unless the provider explicitly says otherwise.
+    #
+    # v0.34.1's first draft skipped the copy when the frame "already owned exactly its
+    # storage", which sounds safe and exempts precisely the MAINSTREAM provider: one that
+    # decodes into a reusable buffer and hands it back. That tensor is contiguous and owns its
+    # storage, so it was pooled by reference — and both symptoms this fix claims to close
+    # survived. A host `buf.copy_()` rewrote a frame already in the pool, and one storage
+    # behind three entries accounted 3× while `evict_bytes` "freed" bytes that stayed pinned.
+    # Ownership is not a property you can read off a tensor; it is a promise about the future.
+    #
+    # So the default is to copy, and a host that genuinely hands over a fresh tensor per call
+    # says so with `frames_are_owned = True` — the `egress(retained=)` shape: a fact the
+    # CALLER knows, stated, rather than a guess the callee makes. The cost is recorded in
+    # `stats()` because it is real (~17 ms per 4K frame) and an unrecorded cost is one nobody
+    # can act on; it is paid once per materialize and amortized over every later hit.
     if key is not None:
+        # P0-A: a fetch that spanned a `set_provider` belongs to a provider that is gone.
+        # Return the pixels to THIS caller (it asked, and they are what the old provider
+        # said) but never index them under the new provider's identity.
+        # Belt-and-braces now that `gen` is in the key (a stale insert would be
+        # unreachable anyway); kept because it also stops the pool accruing bytes for a
+        # provider that no longer exists, which `clear()` has already walked past.
+        if _provider_gen != gen:
+            return None if speculative else frame
+        # The defensive copy is taken HERE — below both guards — because it exists to protect
+        # the POOL, and above them it was paid by two paths that never reach the pool: an
+        # unkeyed source (`source_key == ""`, which CACHE-6's precedent says is never cached)
+        # and a fetch whose generation changed. ~17 ms per 4K frame, bought for nothing.
+        if not getattr(prov, "frames_are_owned", False):
+            _t0 = time.perf_counter()
+            frame = frame.clone()
+            cache.note_copy((time.perf_counter() - _t0) * 1000.0)
         if not cache.put(key, frame, t=qt, speculative=speculative):
             return None if speculative else frame
     return frame

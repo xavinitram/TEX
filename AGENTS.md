@@ -102,6 +102,24 @@ silent-wrong result.
 - `graphed.py` `_graph_mode_disabled` kill-switch, `capture_error_mode="thread_local"`, `_build_keepalive` refs, per-graph pool.
 - `compiled.py` dynamo reset on the **calling** thread (dynamo state is process-global); `has_spatial` deliberately NOT memoized (depends on binding *values*).
 - `tex_marshalling` numpy-free `struct.pack` fingerprint (invariant #1).
+- `tex_marshalling.infer_binding_type` **never restores a FLOAT terminal** (v0.34 E7005). A
+  program's cache identity is derived from binding TYPES, so an unrecognised value typed FLOAT
+  compiles one program and cooks another — silently. Unknown objects, and tensors of rank ≥5,
+  RAISE. Ranks 0-2 keep FLOAT deliberately (a 0-dim scalar is a float; 1-2D without array
+  wires is the documented ComfyUI default) and `None` keeps it too, because the E6003 gate
+  downstream reports an unconnected input and names the slot.
+- A **time-reading stdlib fn takes `footprint='image'`, never `('frame', i)`** (v0.34 DATA-7).
+  Invariant #5 as written would send you to `('frame', i)`: it is wrong here. ROI-6's
+  `_frame_ops` reads that argument as a BATCH index relative to `fi` and hands it to
+  `_extract_pixel_offset`, so `fetch_time("plate", fi-1, …)` would be recorded as reading batch
+  frame fi-1 when it reads no batch frame at all — a window the strip planner acts on.
+- `tex_provider.materialize` reads the **generation and the provider atomically** under the
+  registration lock (v0.34.1 P0-A). Splitting them — in either order — leaves a window where a
+  swap yields one provider's pixels stamped with the other's generation, and the class-name
+  default `provider_id` makes the two ids equal in the ordinary case.
+- The **cook grid is published by BOTH tiers** (`Interpreter.execute` and `_invoke_cg`, v0.34.1
+  P0-D). Publishing in one is an interp↔codegen divergence (invariant #2): const-coord
+  `fetch_time` returns the cook grid on one tier and [1,1,1,C] on the other.
 - `optimizer.py` noise excluded from the CSE-pure whitelist (pending a determinism audit).
 - `interpreter.py` `_literal_cache` persists across executions; spatial-if short-circuit (break/continue correctness).
 - `tex_results` **entry slot 6 (`home`) is not slot 3 (`device`)** (v0.33 CACHE-8). Slot 3 is where

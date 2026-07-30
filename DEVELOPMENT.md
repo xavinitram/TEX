@@ -1005,3 +1005,27 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   what TEX guarantees is that its result is never installed. A provider MAY accept the token
   and poll it; one that ignores it is correct, just slower. Making it mandatory would put a
   requirement on every host decoder to buy back time only a slow network source loses.
+- **The FUS-cap 12.9x peak-memory number now has committed instrumentation (v0.34.1)** —
+  `benchmarks/fus_cap_bench.py` records `torch.cuda.max_memory_allocated` per route and saves
+  it, so `docs/fusion-cap-decision.md`'s headline is reproducible rather than a number in prose.
+  The decision itself is unchanged: the cap stays at 16, and the reopen gate is a backend that
+  fuses at the kernel level instead of materializing per-stage intermediates.
+- **`frames_are_owned` is opt-in, and the default costs a copy (v0.34.1 P0-E)** — the media
+  pool copies every frame at its boundary because ownership is a promise about the FUTURE, not
+  a property readable off a tensor: a provider decoding into a reusable buffer hands back a
+  contiguous tensor that owns its storage and then overwrites it. A host that genuinely yields
+  a fresh tensor per call declares `frames_are_owned = True` and pays nothing. Measured ~17 ms
+  per 4K frame, reported in `stats()["copy_ms"]`. Reopens if a host reports the copy dominating
+  a real decode, which would mean the decode is unusually cheap rather than the copy expensive.
+- **Two v0.34.1 mutation rows retired with reasons, not left surviving** — the provider
+  read-ORDER row (the fix stopped depending on order; both reads are under one lock, so there
+  is no order left to mutate) and the wake-path `shed_requested` row (every setter of that flag
+  also removes the job from its deque under the same lock, so the branch is unreachable today;
+  it stays in the source as documented belt-and-braces because the flag and the removal are set
+  by different call sites). Reasons are recorded in `tests/mutation_check.py` beside the rows.
+- **The mutation harness was blind to v0.34 (v0.34.1)** — its RUNNER imported a hardcoded test
+  module list ending at v0.33, so any v0.34 row would have reported SURVIVED with "0 failing
+  rows" whatever the guard did. That, not simple omission, is why v0.34 shipped with none. The
+  list now reaches v0.34.1, and a new release's modules must be added to it or its rows are
+  decorative — the same trap `test_v0331_audit`'s A5 row fell into a different way.
+
