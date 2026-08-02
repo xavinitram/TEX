@@ -1259,6 +1259,30 @@ def main():
     test_v034_r2_neutrality(r)
     test_v034_r2_regen_is_gone(r)
 
+    # v0.35 CF-7 hygiene: pins for three facts synchronised by comment.
+    from test_v035_hygiene import (
+        test_v035_cf7_builtin_name_sets_agree,
+        test_v035_cf7_js_publish_manifest_tracks_the_language_version,
+        test_v035_cf6_the_grid_is_a_consensus_not_first_wins,
+        test_v035_cf6_an_unread_binding_does_not_size_the_grid,
+        test_v035_cf6_the_roi_grid_uses_the_same_participants,
+        test_v035_cf6_the_peak_estimate_describes_the_grid_the_cook_uses,
+        test_v035_cf6_binding_order_does_not_move_the_auto_precision_gate,
+        test_v035_cf2_a_whole_frame_partial_recook_checks_its_prefix,
+        test_v035_cf4_requalify_lands_the_final_and_evicts_the_preview,
+        test_v035_cf1_a_patch_over_a_demoted_base_keeps_its_home,
+    )
+    test_v035_cf7_builtin_name_sets_agree(r)
+    test_v035_cf7_js_publish_manifest_tracks_the_language_version(r)
+    test_v035_cf6_the_grid_is_a_consensus_not_first_wins(r)
+    test_v035_cf6_an_unread_binding_does_not_size_the_grid(r)
+    test_v035_cf6_the_roi_grid_uses_the_same_participants(r)
+    test_v035_cf6_the_peak_estimate_describes_the_grid_the_cook_uses(r)
+    test_v035_cf6_binding_order_does_not_move_the_auto_precision_gate(r)
+    test_v035_cf2_a_whole_frame_partial_recook_checks_its_prefix(r)
+    test_v035_cf4_requalify_lands_the_final_and_evicts_the_preview(r)
+    test_v035_cf1_a_patch_over_a_demoted_base_keeps_its_home(r)
+
     success = r.summary()
     return 0 if success else 1
 

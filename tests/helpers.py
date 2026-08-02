@@ -30,7 +30,8 @@ from TEX_Wrangle.tex_compiler.type_checker import TypeChecker, TypeCheckError
 from TEX_Wrangle.tex_compiler.types import TEXType, CHANNEL_MAP
 from TEX_Wrangle.tex_compiler.diagnostics import TEXMultiError
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter, InterpreterError
-from TEX_Wrangle.tex_runtime.interpreter import _ensure_spatial, _broadcast_pair, _collect_identifiers
+from TEX_Wrangle.tex_runtime.interpreter import (_ensure_spatial, _broadcast_pair,
+                                                 _collect_identifiers, _consensus_extent)
 from TEX_Wrangle.tex_compiler.optimizer import optimize
 from TEX_Wrangle.tex_compiler.type_checker import BINDING_HINT_TYPES
 from TEX_Wrangle.tex_cache import TEXCache
@@ -209,11 +210,10 @@ def run_both(code, bindings, B=1, H=4, W=4):
     stdlib_fns = _STDLIB_FNS
     dev = _CPU_DEVICE
     env = {}
-    sp = None
-    for v in bindings.values():
-        if isinstance(v, torch.Tensor) and v.dim() >= 3:
-            sp = (v.shape[0], v.shape[1], v.shape[2])
-            break
+    # CF-6: the SAME derivation production uses. This helper kept a private first-wins loop —
+    # a THIRD copy of the grid rule, in the very oracle that exists to catch the two tiers
+    # disagreeing. An oracle that derives the grid its own way cannot see a grid bug.
+    sp = _consensus_extent(bindings, program)
 
     # Build builtins (matches compiled.py _codegen_exec logic)
     used = _collect_identifiers(program)

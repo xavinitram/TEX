@@ -53,7 +53,7 @@ from .tex_compiler.ast_nodes import (
 )
 from .tex_compiler.optimizer import _propagate_literal_locals, _fold_all
 
-# Wire types that can carry a spatial tensor (participate in first-wins shape
+# Wire types that can carry a spatial tensor (participate in CF-6 consensus shape
 # derivation). STRING/INT/FLOAT/BOOLEAN wires marshal to non-spatial values.
 SPATIAL_WIRE_TYPES = frozenset({"IMAGE", "MASK", "LATENT", "*"})
 # Wire types R1 accepts as a shape anchor (known [B,H,W,C] tensors post-marshal).

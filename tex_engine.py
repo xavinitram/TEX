@@ -42,7 +42,7 @@ import torch
 logger = logging.getLogger("TEX")
 
 from .tex_compiler.ast_nodes import SourceLoc
-from .tex_runtime.interpreter import Interpreter, InterpreterError
+from .tex_runtime.interpreter import Interpreter, InterpreterError, _consensus_extent
 from .tex_runtime.interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
 from .tex_cache import get_cache
 from .tex_runtime.compiled import (
@@ -945,11 +945,13 @@ def _preflight_memory(program, bindings: dict[str, Any], device,
     the estimate then gates whether the free-VRAM query below runs at all."""
     host = get_host_services()  # PORT-1: a host with no free-memory answer → this no-ops
     try:
-        spatial = None
-        for v in bindings.values():
-            if isinstance(v, torch.Tensor) and v.dim() >= 3:
-                spatial = (v.shape[0], v.shape[1], v.shape[2])
-                break
+        # CF-6: the peak estimate must describe the grid the cook will actually use. Under
+        # first-wins this site and the cook agreed by construction (both collapsed to the first
+        # binding); the consensus moved the cook and would have left this mirror behind,
+        # under-estimating peak bytes by up to H× on a disagreeing binding set — i.e. the
+        # model-unload preflight quietly no-ops on exactly the cook that needed it.
+        from .tex_runtime.interpreter import _consensus_extent
+        spatial = _consensus_extent(bindings, program)
         if spatial is None:
             return None
         from .tex_memory import estimate_peak_bytes, device_total_mem
@@ -1216,10 +1218,22 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     guard_trace.arm() if debug_nan_highlight else guard_trace.disarm()
     # `fp` was computed above (non-fused branch), hoisted so the M-1 preflight could reuse it
     # (LAT-2); it is None for a fused chain, which is keyed by `fused_fp`.
-    # cook resolution (H*W of the first spatial binding) — used by the auto gate
-    # AND the MEM-2 downshift trim; computed ONCE (audit: was scanned twice/cook).
-    cook_px = next((v.shape[1] * v.shape[2] for v in bindings.values()
-                    if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)
+    # Cook resolution (H*W of the CONSENSUS grid) — used by the auto gate AND the MEM-2
+    # downshift trim; computed ONCE (audit: was scanned twice/cook).
+    #
+    # CF-6: this was `next(... for the FIRST spatial binding)`, and it is the mirror that
+    # mattered most, because it is the only one that reaches PIXELS. `precision="auto"` gates
+    # on `cook_px >= _MIN_FP16_PX`, so with a `[1,1,W,C]` strip bound before a `[1,H,W,C]`
+    # frame the gate saw W pixels instead of H*W: on CUDA at 2048², strip-first resolved fp32
+    # and frame-first resolved fp16 — the same graph, the same cook, **maxdiff 7.32e-04**
+    # decided by dict order. That is precisely the property CF-6's headline says is gone by
+    # construction, resurrected one layer up. Under first-wins the gate and the grid agreed;
+    # the consensus moved the grid and left the gate behind.
+    #
+    # The CPU hygiene pin cannot see this — `auto` resolves fp32 on CPU regardless — so the
+    # order-independence pin carries a CUDA `precision="auto"` leg specifically for it.
+    _grid = _consensus_extent(bindings, program)
+    cook_px = (_grid[1] * _grid[2]) if _grid is not None else 0
     auto_fp16 = False
     auto_ckey = None
     if precision == "auto":

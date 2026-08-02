@@ -29,7 +29,7 @@ from ..tex_compiler.ast_nodes import (BinOp, UnaryOp, TernaryOp, FunctionCall,
                                       VecConstructor, MatConstructor, CastExpr,
                                       IfElse, ForLoop, WhileLoop)
 from .interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
-from .interpreter import (Interpreter, _collect_identifiers,
+from .interpreter import (Interpreter, _collect_identifiers, _consensus_extent,
                           _SCALAR_BUILTIN_DEFAULTS)
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
                       _iter_child_nodes)
@@ -1036,11 +1036,12 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     device_type = device_obj.type
     cache_key = (fingerprint, device_type, precision)
 
-    sp = None
-    for v in bindings.values():
-        if isinstance(v, torch.Tensor) and v.dim() >= 3:
-            sp = (v.shape[0], v.shape[1], v.shape[2])
-            break
+    # CF-6: the tier verdict is filed under a resolution BUCKET, so it has to be the resolution
+    # the cook actually grids. This site kept its own first-wins loop 200 lines below the one
+    # `_build_codegen_env` uses — so a `[B,1,W,C]` strip bound before a `[B,H,W,C]` frame filed
+    # the verdict under a one-row bucket, and swapping the two binding names changed the key of
+    # a cache that persists to disk.
+    sp = _consensus_extent(bindings, program)
     key = autotier.make_key(fingerprint, device_type, precision, sp)
     autotier.seed_from_disk(key)
     state = autotier.verdict(key)
@@ -1235,19 +1236,17 @@ def _build_codegen_env(
     stay bit-exact PER WINDOW, not just per whole frame.
     """
     env: dict[str, Any] = {}
-    sp = None
-    for v in bindings.values():
-        if isinstance(v, torch.Tensor) and v.dim() >= 3:
-            sp = (v.shape[0], v.shape[1], v.shape[2])
-            break
-    if roi is not None and sp is not None:
-        # The GRID is the cook region, not whatever the bindings happen to be. These differ
-        # whenever a binding is not narrowed — most sharply for a program that never reads its
-        # image input (`@OUT = vec4(ix/iw, iy/ih, .5, 1);`), where `narrow_names` is empty and
-        # the binding stays full-size: sizing off it would cook a WHOLE FRAME for an ROI
-        # request. The interpreter sizes its grid from `roi` for exactly this reason, so
-        # matching it here is also what keeps the two tiers shape-identical per window.
-        sp = (sp[0], roi[3], roi[2])
+    # CF-6: the SHARED consensus derivation, not a second first-wins loop. This site kept its
+    # own `for ... break` after the interpreter moved to a consensus, which is how the two
+    # tiers ended up 0.98-0.999 apart under `compile_mode="auto"` — invariant #2 broken by a
+    # fix. `_consensus_extent` is the one owner; see its docstring for the rule.
+    # `roi` goes IN, not applied after: under an ROI the grid is the cook region, not whatever
+    # the bindings happen to be. These differ whenever a binding is not narrowed — most sharply
+    # for a program that never reads its image input (`@OUT = vec4(ix/iw, iy/ih, .5, 1);`),
+    # where `narrow_names` is empty and the binding stays full-size, so sizing off it would cook
+    # a WHOLE FRAME for an ROI request. The interpreter passes `roi` to the same function, which
+    # is what keeps the two tiers shape-identical per window.
+    sp = _consensus_extent(bindings, program, roi=roi)
 
     used = used_builtins if used_builtins is not None else _collect_identifiers(program)
     # Single owner: the interpreter's precision->dtype map (both backends agree).

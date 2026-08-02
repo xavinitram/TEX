@@ -1047,30 +1047,33 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
     # success, because the 32-wide binding was never narrowed (`shape[2] != W`) and so passed
     # through whole. Mirror the narrow instead: every spatial binding must be full-size or a
     # broadcast singleton in each dim, or the window does not describe this input.
-    # The FIRST spatial binding is also the interpreter's grid anchor, so capture it in the same
-    # pass rather than re-walking the dict for it below.
-    _anchor = None
     for _n, _v in bindings.items():
         if isinstance(_v, torch.Tensor) and _v.dim() >= 3:
             _bh, _bw = int(_v.shape[1]), int(_v.shape[2])
             if _bw not in (1, W) or _bh not in (1, H):
                 return _whole(f"roi refused in run_roi: window says the image is {W}x{H} "
                               f"but binding @{_n} is {_bw}x{_bh}")
-            if _anchor is None:
-                _anchor = (_bw, _bh)
-    # No spatial binding to anchor the shape → a purely generative program (no image input).
-    # The whole-frame cook of such a program has NO spatial grid (scalar mode), so cooking an
-    # ROI would fabricate a gradient the whole cook never produces — cook whole-frame instead.
-    if _anchor is None:
+    # R1: the ROI cook must agree with the WHOLE-FRAME cook of the same graph, so ask the same
+    # question the whole-frame path asks — `_consensus_extent`, the single owner of the grid
+    # rule — instead of re-deriving it here. This check used to anchor on the FIRST spatial
+    # binding because that is what the interpreter did; CF-6 made the grid a consensus, and a
+    # rule that mirrors a derivation must be rewritten when the derivation is, or it starts
+    # answering a question nobody asks any more.
+    #
+    # None → a purely generative program (no image input). The whole-frame cook of such a
+    # program has NO spatial grid (scalar mode), so cooking an ROI would fabricate a gradient
+    # the whole cook never produces — cook whole-frame instead.
+    from .tex_runtime.interpreter import _consensus_extent
+    _grid = _consensus_extent(bindings, program)
+    if _grid is None:
         return _whole("roi declined: no spatial binding to anchor the window")
-    # …and no VALID anchor is the same refusal. `Interpreter._determine_spatial_shape` sizes the
-    # whole-frame grid from the FIRST spatial binding *including broadcast singletons*, so with a
-    # `[B,1,W,C]` strip bound first the whole-frame cook collapses `v`/`iy`/`ih` to one row. The
-    # ROI cook is the CORRECT one there, which means the two disagree (measured maxdiff 0.60) and
-    # `cooked_roi` would report success on a window that does not match its own whole-frame cook.
-    # Refusing is the conservative half: the caller keeps v0.29's answer, right or wrong, instead
-    # of getting two different ones. The root cause is a default-path pixel change in
-    # `_determine_spatial_shape` (a consensus extent, not first-wins) and ships on its own.
+    # A grid that is not the window's own W×H means the two cooks disagree, and `cooked_roi`
+    # would report success on a window that does not match its own whole-frame cook. Before
+    # CF-6 this fired for the common singleton-first case (measured maxdiff 0.60); now the
+    # consensus reaches W×H whenever any read binding declares it, so what survives here is
+    # the genuinely ambiguous graph — every read binding singleton on an axis the window
+    # claims is full-size. Refusing is the conservative half: the caller keeps one answer.
+    #
     # ...and only for a HOST's window (`record_trace`), never for an internal strip cook.
     # `run_tiled_halo` drives this function per strip to assemble a WHOLE frame on the OOM
     # ladder, and there is no second answer for a host to disagree with — the strip IS the
@@ -1078,12 +1081,10 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
     # collapsed-grid cook, which then raises: measured, a singleton-first binding turned a
     # working memory-bounded cook into `RuntimeError: expanded size (1) must match 96` on the
     # DEFAULT path (no roi, no roi_exec). Strips keep v0.29's behaviour exactly.
-    # The extent loop already passed, so every spatial dim is full-size or 1 — this is precisely
-    # "the anchor has a broadcast singleton".
-    if record_trace and _anchor != (W, H):
-        return _whole(f"roi declined: the anchor binding is {_anchor[0]}x{_anchor[1]}, not the "
-                      f"{W}x{H} the window describes — the whole-frame grid would be sized off "
-                      f"a broadcast singleton")
+    if record_trace and (_grid[2], _grid[1]) != (W, H):
+        return _whole(f"roi declined: the whole-frame grid is {_grid[2]}x{_grid[1]}, not the "
+                      f"{W}x{H} the window describes — every binding the program reads is a "
+                      f"broadcast singleton on an axis the window claims is full-size")
     # Cook region = ROI ⊕ halo, clamped to the image.
     cx0, cy0 = max(0, x0 - halo), max(0, y0 - halo)
     cx1, cy1 = min(W, x0 + w + halo), min(H, y0 + h + halo)

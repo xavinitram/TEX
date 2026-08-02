@@ -337,9 +337,14 @@ class TEXWrangleNode(_BaseClass):
         result, so the two can never disagree).
 
         Safety rules (semantics preservation — see tex_lazy docstring):
-          R1  if any spatial-capable wire exists, the FIRST one (slot order,
-              first-wins shape derivation) must be needed and of a known
-              tensor type (IMAGE/MASK) — else keep everything.
+          R1  if any spatial-capable wire exists, the FIRST one (slot order)
+              must be needed and of a known tensor type (IMAGE/MASK) — else
+              keep everything. LOAD-BEARING: CF-6's consensus narrows to READ
+              bindings only when an axis disagrees, so a LONE spatial wire
+              sizes the grid whether it is read or not. Prune it and the cook
+              drops to scalar mode — 1x1 where a frame used to be. What the
+              rule really states is the grid's precondition, "some spatial
+              wire must survive" (see ARCHITECTURE.md).
           R2  LATENT wires are always cooked (they flip output typing/fp32).
           R3  analysis failure -> keep everything.
         Fused chains (_tex_chain) keep everything in v1. Never raises: any
@@ -381,7 +386,8 @@ class TEXWrangleNode(_BaseClass):
             first = [e["slot"] for e in scalar_pending if e["name"] in needed]
             if first:
                 return first
-            # R1: first-wins shape anchor must survive and be a known tensor.
+            # R1: the first spatial wire must survive and be a known tensor.
+            # Conservative since CF-6 — see the docstring.
             spatial = [e for e in entries
                        if e["type"] in _tex_lazy.SPATIAL_WIRE_TYPES]
             if spatial and (spatial[0]["name"] not in needed

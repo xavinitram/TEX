@@ -1,6 +1,6 @@
 """Mutation check — do the release's tests actually KILL the bugs they claim to pin?
 
-NOT part of `run_all.py`: it copies the tree once per mutation and runs the v0.32-v0.34.1 rows
+NOT part of `run_all.py`: it copies the tree once per mutation and runs the v0.32-v0.35 rows
 against each, which is minutes, not seconds. Run it by hand when a fix lands:
 
     python tests/mutation_check.py
@@ -177,11 +177,17 @@ MUTATIONS = [
      "tex_results.py",
      "                if self._purge_depth:",
      "                if False:"),
+    # Re-anchored in v0.35. The old anchor was the bare `        finally:`, which went ambiguous
+    # the moment a second one appeared at that indent and was reported as a STALE ANCHOR. It is
+    # unique again today, but "unique today" is what made it fragile — so it now carries the
+    # first line of the body it guards, which no unrelated `finally:` can collide with.
     ("H7: the purge depth is dropped outside the finally again", "tex_results.py",
-     "        finally:",
+     "        finally:\n"
+     "            # The depth MUST come back down on EVERY exit,",
      "        except BaseException:\n"
      "            raise\n"
-     "        if True:"),
+     "        if True:\n"
+     "            # The depth MUST come back down on EVERY exit,"),
     ("H4: _learn_spilled rebinds membership over a racing spill again", "tex_results.py",
      "                self._spilled = None if self.spills != spills_at_entry else found",
      "                self._spilled = found"),
@@ -264,6 +270,72 @@ MUTATIONS = [
     ('v0.34.1 I: a >=5-D tensor types FLOAT again', 'tex_marshalling.py',
      '        elif value.dim() >= 5:',
      '        elif False:'),
+    # ── v0.35 phase 0 ──
+    # CF-6's two halves, each mutated back to the state an audit caught it in. The first is the
+    # tier split: codegen deriving the grid ITSELF is how invariant #2 broke, so the row puts
+    # the private first-wins loop back and the pin's `auto` leg must notice.
+    ('CF-6: codegen derives the grid itself again (first-wins, invariant #2)',
+     'tex_runtime/compiled.py',
+     '    sp = _consensus_extent(bindings, program, roi=roi)',
+     '    sp = None\n'
+     '    for _v in bindings.values():\n'
+     '        if isinstance(_v, torch.Tensor) and _v.dim() >= 3:\n'
+     '            sp = (_v.shape[0], _v.shape[1], _v.shape[2])\n'
+     '            break\n'
+     '    if roi is not None and sp is not None:\n'
+     '        sp = (sp[0], roi[3], roi[2])'),
+    ('CF-6: an unread binding is a consensus participant again',
+     'tex_runtime/interpreter.py',
+     '            if (name == "OUT" or name not in read\n'
+     '                    or not isinstance(v, torch.Tensor) or v.dim() < 3):',
+     '            if (name == "OUT"\n'
+     '                    or not isinstance(v, torch.Tensor) or v.dim() < 3):'),
+    ('CF-6: the interpreter goes back to first-wins', 'tex_runtime/interpreter.py',
+     '    if b_split or (hw_split and roi is None):',
+     '    if False:'),
+    # The ROI branch as a BYPASS rather than an axis selector: participation decided before
+    # `roi` is applied, so an unread binding could raise the batch under a window and not on
+    # the whole frame. Both axis-blind gates downstream let that through.
+    ('CF-6: the ROI branch bypasses the participation rule again',
+     'tex_runtime/interpreter.py',
+     '    if b_split or (hw_split and roi is None):',
+     '    if roi is not None:\n'
+     '        return (b, roi[3], roi[2])\n'
+     '    if b_split or hw_split:'),
+    ('CF-6: the peak-bytes preflight sizes itself first-wins again', 'tex_engine.py',
+     '        spatial = _consensus_extent(bindings, program)',
+     '        spatial = next(((v.shape[0], v.shape[1], v.shape[2]) for v in bindings.values()\n'
+     '                        if isinstance(v, torch.Tensor) and v.dim() >= 3), None)'),
+    # The mirror that reaches pixels: `auto` gates on cook_px, so a first-wins cook_px makes
+    # the resolved precision depend on binding order. CUDA-only, like the pin that kills it.
+    ('CF-6: the auto-precision gate sizes itself first-wins again', 'tex_engine.py',
+     '    _grid = _consensus_extent(bindings, program)\n'
+     '    cook_px = (_grid[1] * _grid[2]) if _grid is not None else 0',
+     '    cook_px = next((v.shape[1] * v.shape[2] for v in bindings.values()\n'
+     '                    if isinstance(v, torch.Tensor) and v.dim() >= 3), 0)'),
+    ('CF-2: a whole-frame partial recook skips the prefix validity check again',
+     'examples/host_demo.py',
+     '        if roi is None and dirty_from > 0 and any(\n'
+     '                self._valid[j] is not None or j in self._declined '
+     'for j in range(dirty_from)):\n'
+     '            dirty_from = 0',
+     '        if False:\n'
+     '            dirty_from = 0'),
+    # R1's mirror of the grid rule: if this stops asking `_consensus_extent`, an ROI cook can
+    # be served for a window the whole-frame cook would not agree with.
+    ('CF-6: run_roi stops mirroring the whole-frame grid rule', 'tex_memory.py',
+     '    if record_trace and (_grid[2], _grid[1]) != (W, H):',
+     '    if False:'),
+    ('CF-4: requalify evicts whatever is under the key, not the entry it replaced',
+     'tex_results.py',
+     '            if self._ram.get(preview_key) is prev:\n'
+     '                self._remove(preview_key)',
+     '            if True:\n'
+     '                self._remove(preview_key)'),
+    ('CF-1: the patch stops inheriting the base HOME (the one-way trip to the CPU)',
+     'tex_results.py',
+     '                home = src.home',
+     '                pass'),
 ]
 
 RUNNER = """
@@ -276,8 +348,9 @@ import test_v032_checkpoint as A, test_v032_region as B, test_v032_governor as C
 import test_v033_precision as D, test_v033_cache8 as E, test_v033_xpu2 as F
 import test_v033_phase0 as G, test_v0331_audit as H, test_v0332_audit as I
 import test_v034_data7 as J, test_v034_io1 as K, test_v0341_audit as L
+import test_v035_hygiene as M, test_v030_phase1 as N
 r = SubTestResult()
-for m in (A, B, C, D, E, F, G, H, I, J, K, L):
+for m in (A, B, C, D, E, F, G, H, I, J, K, L, M, N):
     for n in sorted(x for x in dir(m) if x.startswith("test_")):
         try:
             getattr(m, n)(r)

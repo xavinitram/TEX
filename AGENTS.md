@@ -162,7 +162,7 @@ Currently over the hard budget — status as of v0.18.0 (drift-checked by
 |--------|-----|--------|
 | `tex_runtime/codegen.py` | ~2730 | STR-7 split **shipped** (4092→2731: `codegen_stdfns.py` / `codegen_stencil.py` / `codegen_persist.py` extracted). Docs 27/28 verdict: **stop here** — the remainder is one cohesive emitter; further splitting is aesthetic, not domain-driven |
 | `tex_runtime/stdlib.py` | ~2330 | per-domain `stdlib_*.py` still planned — unblocked by REG-1 (registration is per-decorator, not one central dict) |
-| `tex_runtime/interpreter.py` | ~2140 | STR-3/STR-4 **shipped** (`ExecContext` + shared `NodeVisitor` extracted); the residual is the core tree-walk |
+| `tex_runtime/interpreter.py` | ~2700 | STR-3/STR-4 **shipped** (`ExecContext` + shared `NodeVisitor` extracted); the residual is the core tree-walk, plus CF-6's `_consensus_extent` — the single owner of the cook-grid rule, which the codegen tier, `run_roi` and the test oracle all call |
 
 `tex_compiler/optimizer.py` (~1520) is over *soft*; STR-5 (the `PASSES` list) **shipped**.
 

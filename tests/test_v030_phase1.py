@@ -194,17 +194,20 @@ def test_v030_roi_broadcast_anchor(r: SubTestResult):
     # The sibling of the extent row above, and the one the extent check cannot cover: here the
     # anchor binding is a legal broadcast (`[1,1,W,4]` — one row, stretched over y), so the
     # per-dim extent loop passes it (1 is always allowed) and only the anchor guard is left.
-    # Mutation-verified: stubbing `if record_trace and _anchor != (W, H)` to `if False` turns
-    # this red. Without it the guard had NO test at all.
+    # Mutation-verified (`CF-6: run_roi stops mirroring the whole-frame grid rule`): stubbing
+    # the `_grid != (W, H)` refusal to `if False` turns this red. Without it the guard had NO
+    # test at all.
     #
-    # What it pins: `Interpreter._determine_spatial_shape` sizes the whole-frame grid from the
-    # FIRST spatial binding INCLUDING singletons, so the whole-frame cook of this program
-    # collapses `v`/`iy`/`ih` to a single row while the ROI cook grids the real window. The ROI
-    # answer is the correct one, which is exactly the problem — the two disagree (measured
-    # maxdiff 0.60) and `cooked_roi` would report success on a window that does not match its
-    # own whole-frame cook. Refusing is the conservative half: the caller keeps v0.29's answer,
-    # right or wrong, instead of getting two different ones from the same program. Fixing the
-    # root cause is a default-path PIXEL change and ships on its own, not inside an ROI release.
+    # What it pins, RESTATED for v0.35. This used to be a workaround: `_determine_spatial_shape`
+    # sized the grid from the FIRST spatial binding including singletons, so a whole-frame cook
+    # collapsed `v`/`iy`/`ih` to one row, the ROI cook gridded the real window, and the two
+    # disagreed by 0.60 with the ROI answer being the correct one. CF-6 fixed that root cause,
+    # and this row survives it — because here the singleton is the ONLY spatial binding, so the
+    # consensus extent IS one row. That is no longer a collapse to be worked around; a
+    # `[1,1,32,4]` input really is one row, so the whole-frame answer is right and it is the
+    # WINDOW that describes an image this cook does not have. The refusal is now permanent and
+    # principled rather than conservative: `run_roi` asks `_consensus_extent`, the same question
+    # the whole-frame path asks, and declines when the two would not match.
     from TEX_Wrangle import tex_engine, tex_roi as _R
     try:
         torch.manual_seed(3)

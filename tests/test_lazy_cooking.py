@@ -165,8 +165,10 @@ def test_lazy_check_status(r: SubTestResult):
     except Exception as e:
         r.fail("T4-lite: wired $param cooks first, then folds", str(e))
 
-    # R1 fail-safe: when the FIRST spatial input is the dead one, skipping it
-    # could change first-wins shape derivation -> everything is requested.
+    # R1 fail-safe: when the FIRST spatial input is the dead one, everything is
+    # requested. Under first-wins this was load-bearing (skipping it moved the
+    # grid); CF-6 derives the grid from READ bindings, which pruning cannot
+    # reach, so R1 is now conservative — and this row pins that it still holds.
     try:
         req = N.check_lazy_status(code=gate, _tex_slot_map=SM3,
                                   in_0=None, in_1=None, in_2=1.0)

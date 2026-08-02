@@ -29,6 +29,7 @@ from ..tex_compiler.ast_nodes import (
     BindingIndexAccess, BindingSampleAccess,
     try_extract_static_range,
     collect_assigned_vars,
+    iter_child_nodes,
 )
 from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
 from .host import _cancel_check, _report_progress   # SCHED-3 seam (no cycle: host imports torch only)
@@ -371,8 +372,8 @@ class Interpreter:
 
         # Determine spatial context from image inputs. Under an ROI cook the grid is the
         # cook-region (w,h) from `roi`, NOT a binding's shape — a whole-passed gather input
-        # keeps the full W×H, so first-wins binding inference would size the grid wrong.
-        self.spatial_shape = self._determine_spatial_shape(roi=roi)
+        # keeps the full W×H, so binding inference would size the grid wrong.
+        self.spatial_shape = self._determine_spatial_shape(program, roi=roi)
 
         # Create built-in coordinate variables (lazy — only what the program uses)
         self._create_builtins(program, used_builtins=used_builtins, tile=tile, roi=roi,
@@ -472,25 +473,28 @@ class Interpreter:
             val = val.float()
         return val
 
-    def _determine_spatial_shape(self, roi=None) -> tuple[int, int, int] | None:
-        """Find the spatial dimensions from image inputs. Under an ROI cook (`roi` set) the
-        grid is the cook-region (w, h) the executor sliced to, with the batch taken from the
-        first spatial binding — a whole-passed gather input keeps the full W×H, so it must
-        not size the grid."""
-        batch = None
-        for name, value in self.bindings.items():
-            if name == "OUT" or isinstance(value, str):
-                continue
-            if isinstance(value, torch.Tensor) and value.dim() >= 3:
-                # IMAGE: [B, H, W, C] or MASK: [B, H, W]
-                if roi is None:
-                    return (value.shape[0], value.shape[1], value.shape[2])
-                batch = value.shape[0]
-                break
-        if roi is not None:
-            _x0, _y0, w, h, _W, _H = roi
-            return (batch if batch is not None else 1, h, w)
-        return None
+    def _determine_spatial_shape(self, program, roi=None) -> tuple[int, int, int] | None:
+        """Find the spatial dimensions from image inputs — the CF-6 consensus extent, derived
+        by the shared `_consensus_extent` so this tier and codegen cannot disagree.
+
+        Under an ROI cook (`roi` set) the grid is the cook-region (w, h) the executor sliced
+        to, with only the batch taken from the bindings — a whole-passed gather input keeps
+        the full W×H, so it must not size the grid.
+
+        Corpus impact, scanned before landing (doc 40 §1 R2 asks for exactly this): of 129
+        frozen programs, ZERO bind two spatial tensors whose extents disagree, so no golden
+        moves and the fix needs no freeze-boundary argument. It lands before freeze #2 so the
+        freeze snapshots the post-fix truth.
+        """
+        sp = _consensus_extent(self.bindings, program, roi=roi)
+        if sp is None and roi is not None:
+            # An ROI cook with NO spatial binding at all. `run_roi` refuses this case before it
+            # can arrive ("no spatial binding to anchor the window"), so this is unreachable
+            # through the engine; it is kept because it is v0.29's answer for a direct caller,
+            # and a shape rule is a bad place to start returning None where something used to
+            # come back.
+            return (1, roi[3], roi[2])
+        return sp
 
     def _create_builtins(self, program: Program,
                          used_builtins: frozenset[str] | None = None,
@@ -2286,6 +2290,160 @@ _BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", 
 # silently replays a stale playhead; with it, the entry simply never holds one. Cheap
 # insurance against a silent-wrong class, and pinned by test_eng7_time_builtins_advance.
 _CACHEABLE_BUILTIN_NAMES = _BUILTIN_NAMES - _TIME_BUILTIN_NAMES
+
+
+def _collect_binding_reads(program: Program) -> frozenset[str]:
+    """Wire-binding (`@A`) names the program mentions anywhere.
+
+    Over-inclusive on purpose: an assignment TARGET counts as a mention. Narrowing that
+    would buy nothing — the only consumer is `_consensus_extent`, which looks these names
+    up in the INPUT binding dict, and a name that is only ever written is an output, which
+    is not in that dict when the grid is decided.
+
+    Walked with the generic `iter_child_nodes` rather than a hand-written per-class dispatch
+    like `_collect_identifiers`'. That walk is field-driven, so a new ASTNode field is
+    traversed instead of silently escaping — and the speed the hand-written version buys is
+    not needed here, because `_consensus_extent` only calls this when the bindings actually
+    disagree about the frame's size.
+    """
+    found: set[str] = set()
+    stack: list[ASTNode] = [program]
+    while stack:
+        node = stack.pop()
+        if type(node) is BindingRef:
+            if node.kind == "wire":
+                found.add(node.name)
+            continue
+        stack.extend(iter_child_nodes(node))
+    return frozenset(found)
+
+
+#: Memo for the walk above, mirroring `tex_memory._tile_safe_memo` (whose comment prices the
+#: same shape of walk at ~22 us per CUDA cook — worth memoizing, and this one is worse: no
+#: early exit, every node visited). The read set is a pure function of the AST, so it belongs
+#: per PROGRAM, not per cook. Without this, the axis-disagreement gate keeps the walk off most
+#: cooks but not all: an IMAGE `[4,H,W,3]` batch beside a single `[1,H,W]` MASK disagrees on
+#: batch every cook, and that is an ordinary ComfyUI graph, not a corner.
+#:
+#: Keyed by `id()` because `Program` is a slotted dataclass — no `__dict__` to hang an
+#: attribute on and no `__weakref__` to key a WeakKeyDictionary with. The program itself is
+#: held beside the answer and re-checked with `is`, which is what makes `id()` safe: a
+#: recycled id belongs to a different object and misses. Holding it also pins the AST alive,
+#: bounded here to the same order as `tex_cache`'s own program LRU.
+_READS_MEMO: "OrderedDict[int, tuple[Program, frozenset[str]]]" = OrderedDict()
+_READS_MEMO_MAX = 128
+
+
+def _binding_reads_cached(program: Program) -> frozenset[str]:
+    """`_collect_binding_reads`, memoized per program object."""
+    key = id(program)
+    hit = _READS_MEMO.get(key)
+    if hit is not None and hit[0] is program:
+        _READS_MEMO.move_to_end(key)
+        return hit[1]
+    reads = _collect_binding_reads(program)
+    _READS_MEMO[key] = (program, reads)
+    _READS_MEMO.move_to_end(key)
+    while len(_READS_MEMO) > _READS_MEMO_MAX:
+        _READS_MEMO.popitem(last=False)
+    return reads
+
+
+def _consensus_extent(bindings: dict, program: Program,
+                      roi: tuple | None = None) -> tuple[int, int, int] | None:
+    """CF-6 (v0.35): the (B, H, W) cook grid — the CONSENSUS extent, not first-wins.
+
+    THE SINGLE OWNER of the rule. The interpreter (`_determine_spatial_shape`) and codegen
+    (`_build_codegen_env`) both call this, because a grid derived twice is a grid derived two
+    ways: the first CF-6 fix landed in the interpreter alone and put the two tiers 0.98-0.999
+    apart on `compile_mode="auto"` — a fresh break of invariant #2, and the THIRD time this
+    exact shape of bug has been found. There is one derivation now; there is nothing to skew.
+
+    Deriving from the FIRST spatial binding made the output grid depend on dict order. Bind a
+    `[B,1,W,C]` broadcast strip before a `[B,H,W,C]` frame and the whole cook collapsed
+    `v`/`iy`/`ih` to one row — measured maxdiff 0.60 against the same program with the
+    bindings declared the other way round, with nothing anywhere saying which was meant.
+
+    The consensus is the BROADCAST extent: per axis, the largest any participant declares. A
+    singleton is a tensor that broadcasts up to whatever it meets, which is exactly what every
+    downstream op already does with it, so this makes the grid agree with the arithmetic
+    performed on it. And `max` is commutative, so the ordering dependence is gone by
+    construction rather than by convention.
+
+    WHO PARTICIPATES is the second half, and it is not "every binding". A wired-but-unread
+    input is not a participant: it contributes no pixels, and letting it raise an axis both
+    inflates the grid past what the read bindings can broadcast to (a hard RuntimeError on a
+    program that cooked fine before) and makes the output shape depend on whether lazy
+    pruning ran. So when the participants disagree, the set is narrowed to the bindings the
+    PROGRAM READS. Two safeguards keep that from over-reaching:
+
+      * the narrowing runs only when an axis actually DISAGREES. Where every spatial binding
+        declares the same size, the read-set provably cannot change the `max`, so the walk is
+        skipped — 129 of 129 frozen corpus programs are in that case.
+      * if the program reads no spatial binding at all (`@OUT = vec4(u, v, 0, 1);` with an
+        image wired and ignored), the unnarrowed consensus stands. Narrowing to nothing would
+        drop the grid to the scalar path and cook 1x1 where the old code cooked a frame.
+
+    `roi` (the 6-tuple `(x0, y0, w, h, W, H)`) belongs HERE and not in the callers: it is part
+    of the grid rule, so leaving it outside meant two callers re-applying it and the codegen
+    tier keeping an `sp[0]` that came from its own derivation.
+
+    It is applied AFTER the participation rule, not instead of it. An earlier cut returned
+    early on `roi is not None` with a `max` over every spatial binding, on the argument that
+    only the batch comes from the bindings under an ROI so ordering could not bite. Ordering
+    could not, but PARTICIPATION could: `@A [1,H,W,4]` read and `@B [8,H,W,4]` wired-and-unread
+    gridded the whole-frame cook at B=1 and the ROI cook at B=8, and both gates that should
+    catch it are axis-blind (`run_roi`'s R1 and the postcondition loop compare H and W only),
+    so the window was reported served and the host blitted an 8-batch patch into a 1-batch
+    canvas. The ROI branch survives only as the AXIS SELECTOR it always should have been: H and
+    W come from the cook region, so only B needs deciding, and only B's disagreement can
+    trigger the walk. That is what keeps the interactive path free of it — under an ROI the
+    bindings are narrowed to the cook region while whole-passed gather inputs keep their full
+    size, so H and W disagree BY CONSTRUCTION on every window while batches almost never do.
+    """
+    # ONE pass, and no list unless an axis splits. `_build_codegen_env` and this function's
+    # other two callers all run per cook on the default path, where the old code was a `for`
+    # with an early `break`; the comprehension-plus-`all()` this replaced cost ~1.5-2 us of
+    # tuple building for an answer that is three integers.
+    b = h = w = None
+    b_split = hw_split = False
+    for name, v in bindings.items():
+        if name == "OUT" or not isinstance(v, torch.Tensor) or v.dim() < 3:
+            continue
+        shp = v.shape                      # bind once: three `.shape` hits build three Sizes
+        sb, sh, sw = shp[0], shp[1], shp[2]
+        if b is None:
+            b, h, w = sb, sh, sw
+            continue
+        # Compared against the RUNNING max, which detects any disagreement: if every binding
+        # agrees the max never moves, so a mismatch here is a mismatch with all of them.
+        if sb != b:
+            b_split = True
+            b = max(b, sb)
+        if sh != h:
+            hw_split = True
+            h = max(h, sh)
+        if sw != w:
+            hw_split = True
+            w = max(w, sw)
+    if b is None:
+        return None
+    if b_split or (hw_split and roi is None):
+        read = _binding_reads_cached(program)
+        rb = rh = rw = None
+        for name, v in bindings.items():
+            if (name == "OUT" or name not in read
+                    or not isinstance(v, torch.Tensor) or v.dim() < 3):
+                continue
+            shp = v.shape
+            rb = shp[0] if rb is None else max(rb, shp[0])
+            rh = shp[1] if rh is None else max(rh, shp[1])
+            rw = shp[2] if rw is None else max(rw, shp[2])
+        if rb is not None:                 # narrowing to nothing keeps the unnarrowed answer
+            b, h, w = rb, rh, rw
+    if roi is not None:
+        return (b, roi[3], roi[2])
+    return (b, h, w)
 
 
 def _collect_identifiers(program: Program) -> frozenset[str]:

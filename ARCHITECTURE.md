@@ -172,9 +172,19 @@ dynamic user-named inputs cannot be lazy directly. The mechanism instead:
    analysis — the two callers cannot disagree).
 
 **Safety rules (all fail toward "cook everything"):** R1 — if any spatial-capable wire
-exists, the *first* one (first-wins shape derivation, `_determine_spatial_shape`) must
-be needed and of known tensor type (IMAGE/MASK); R2 — LATENT wires always cook (they
-flip output typing/fp32); R3 — analysis failure keeps all. **Never severed:** `@A*0`
+exists, the *first* one must be needed and of known tensor type (IMAGE/MASK); R2 —
+LATENT wires always cook (they flip output typing/fp32); R3 — analysis failure keeps all.
+R1 is **load-bearing, and must not be retired.** It was written against first-wins shape
+derivation; CF-6 (v0.35) made the grid a consensus over the bindings the program *reads*,
+which narrows the rule's job but does not remove it. The read-set narrowing only fires when
+an axis disagrees, so with a *single* spatial wire there is nothing to disagree with and that
+wire sizes the grid whether the program reads it or not — which is exactly what makes
+`@OUT = vec4(u,v,0,1)` with one image wired cook a frame instead of a scalar. Prune that wire
+and `_consensus_extent` returns `None`, i.e. **1×1 where a frame used to be**. What R1 really
+expresses is the consensus function's own precondition — *at least one spatial wire must
+survive to anchor the grid* — and its "slot 0 specifically" spelling is a first-wins fossil
+that over-approximates: it forces a whole-graph cook when slot 0 is dead even where slot 1 is
+a perfectly good anchor. **Never severed:** `@A*0`
 (NaN·0=NaN; the optimizer refuses x*0→0 for shape safety), `&&`/`||` operands (the
 interpreter evaluates both sides), spatial-condition branches (torch.where computes
 both) — invariant #11. Fused chains (`_tex_chain`) request everything in v1.
