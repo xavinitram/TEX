@@ -142,7 +142,13 @@ class RoiComp:
         # Whether canvas[i] is a buffer WE own and may write in place. A cook output arrives
         # frozen under ENG-12, so the first window write has to clone; after that it is ours.
         self._owned: list = [False] * len(_COMP_STAGES)
-        self._halo_memo: dict = {}                      # (stage, params) -> reach; see _halo_of
+        self._halo_memo: dict = {}                       # (stage, params) -> reach; see _halo_of
+        #: CF-2. `_valid[i]` is the window canvas i is correct over (`None` = whole
+        #: frame, which is what a whole-frame cook leaves); `_declined` is the set of
+        #: stages whose last cook refused the window. Both are inputs to
+        #: `chain_windows`, and a host that does not keep them cannot ask the question.
+        self._valid: list = [None] * len(_COMP_STAGES)
+        self._declined: set = set()
 
     def _key(self, i: int, roi, up_key):
         """CACHE-1 lineage key for stage i, INCLUDING its upstream chain.
@@ -212,25 +218,30 @@ class RoiComp:
             hit = self._halo_memo[key] = (int(plan.halo) if plan.executable else _WHOLE_FRAME)
         return hit
 
-    def _needed_windows(self, roi, dirty_from: int) -> list:
-        """The window each dirty stage must cook so the FINAL window is correct.
+    def _needed_windows(self, roi, dirty_from: int):
+        """The window each dirty stage must cook, or `None` if the chain cannot be served
+        incrementally and the host must cook whole.
 
-        Patching only the requested rect is wrong the moment a downstream stage has a halo: it
-        reads a ring of neighbours just outside the patch, and that ring still holds pre-edit
-        pixels. So walk the suffix BACKWARDS, growing the window by each consumer's halo and
-        clamping to the frame — the same `ROI ⊕ halo` composition `run_roi` does within one
-        stage, lifted to the chain. Measured before this: stage-5 sharpen was wrong over
-        2157 px and stage-9 vignette over 3987 px on any upstream edit."""
-        last = len(_COMP_STAGES) - 1
-        need = [None] * len(_COMP_STAGES)
-        need[last] = roi
-        for i in range(last - 1, dirty_from - 1, -1):
-            x0, y0, w, h, W, H = need[i + 1]
-            pad = self._halo_of(i + 1)
-            nx0, ny0 = max(0, x0 - pad), max(0, y0 - pad)
-            nx1, ny1 = min(W, x0 + w + pad), min(H, y0 + h + pad)
-            need[i] = (nx0, ny0, nx1 - nx0, ny1 - ny0, W, H)
-        return need
+        CF-2: this used to hand-roll the backwards halo walk. The arithmetic was right and
+        that was never the problem — what it could not do is know when the arithmetic does not
+        APPLY. `tex_roi.chain_windows` is the same walk plus the two facts this class now
+        tracks:
+
+          * `valid[i]` — the region canvas i is currently correct over. A region cook at
+            `dirty_from=2` leaves canvases 2..n valid only over their composed windows; a
+            later edit at `dirty_from=5` reads canvas 4 over a window derived from a DIFFERENT
+            roi, and wherever that escapes the earlier patch it reads pre-edit pixels
+            (measured 2.17e-01 on the second, deeper edit).
+          * `declined[i]` — stages whose last cook declined the window and cooked whole. Their
+            whole-frame output is stale wherever their INPUT canvas was stale, while looking
+            valid everywhere (measured 4.55e-01 over 1,682/2,304 elements). Declines are
+            engine-initiated, so a host cannot avoid triggering them by being careful.
+
+        A `None` return is not a failure — it is the engine saying "re-cook from the source",
+        which `cook` honours by widening `dirty_from` to 0."""
+        halos = [self._halo_of(i) for i in range(len(_COMP_STAGES))]
+        return tex_roi.chain_windows(halos, roi, dirty_from,
+                                     valid=self._valid, declined=self._declined)
 
     def cook(self, roi=None, dirty_from: int = 0, cancel=None, use_cache: bool = True):
         """Cook stages `dirty_from..end`, over `roi` when given. Returns (frame, ms, hits).
@@ -244,7 +255,25 @@ class RoiComp:
         # mid-loop seed could not work anyway, since stage i's input IS canvas[i-1].
         if roi is not None and any(c is None for c in self.canvas):
             self.cook(None, 0, cancel=cancel, use_cache=use_cache)
+        # CF-2, the case `chain_windows` never sees: a WHOLE-FRAME partial recook. The plan
+        # below is only consulted when a roi is given, so `cook(None, dirty_from=k)` walked
+        # straight past the validity question — and stage k reads canvas k-1, which an earlier
+        # window cook may have left correct only inside its window. The stage then cooks whole
+        # from a partly-stale input and records `_valid=None`, i.e. "correct everywhere", which
+        # is the same false claim a decline makes and is not recoverable by looking at it later.
+        # The clean prefix must be whole-frame valid, or there is no prefix to keep. `_declined`
+        # is checked too: a declined stage's canvas IS whole-frame, so `_valid` alone reports it
+        # as fine while its pixels inherit its input's staleness.
+        if roi is None and dirty_from > 0 and any(
+                self._valid[j] is not None or j in self._declined for j in range(dirty_from)):
+            dirty_from = 0
         need = self._needed_windows(roi, dirty_from) if roi is not None else None
+        if roi is not None and need is None:
+            # Not serviceable incrementally — an earlier partial edit or a decline left an
+            # upstream canvas stale outside this window, and no window choice downstream
+            # repairs a stale input. Cook the chain whole from the source; that is the
+            # remedy `chain_windows` declines on the host's behalf rather than guessing.
+            return self.cook(None, 0, cancel=cancel, use_cache=use_cache)
         up_key = None                                      # stage i-1's whole-frame key
         for i, (name, code, _defaults) in enumerate(_COMP_STAGES):
             win = need[i] if need is not None else None
@@ -276,6 +305,13 @@ class RoiComp:
                 served = res.cooked_roi
                 if use_cache:
                     self.cache.put(key, patch, canvas={"shape": list(patch.shape)})
+            # CF-2: record what this stage actually did, for the NEXT edit's plan.
+            # `served is None` means the stage declined the window and cooked whole.
+            if win is not None and served is None:
+                self._declined.add(i)
+            elif served is not None:
+                self._declined.discard(i)
+            self._valid[i] = served                # None == valid everywhere (whole frame)
             if served is None:
                 # A whole-frame result REPLACES the canvas, and it arrives frozen (ENG-12) —
                 # a cook output, or a cache entry other stages may still be holding. Take it
@@ -290,6 +326,12 @@ class RoiComp:
                     self.canvas[i], self._owned[i] = self.canvas[i].clone(), True
                 x0, y0, w, h, _W, _H = served
                 self.canvas[i][:, y0:y0 + h, x0:x0 + w] = patch   # our buffer: write in place
+        if roi is None and dirty_from == 0:
+            # A full recook makes every canvas correct everywhere, which clears both facts.
+            # Without this the demo would carry a stale `declined` forever and refuse to ever
+            # serve incrementally again — the API's refusal is meant to be recoverable.
+            self._valid = [None] * len(_COMP_STAGES)
+            self._declined.clear()
         if self.device == "cuda":
             torch.cuda.synchronize()
         return self.canvas[-1], (time.perf_counter() - t0) * 1000.0, hits

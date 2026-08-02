@@ -401,6 +401,13 @@ class ResultCache:
         # frame cache that has never been told a VRAM budget must not start moving frames
         # between devices because it was upgraded. GOV-1's presets and `set_vram_budget` arm it.
         self._vram_budget: "int | None" = None
+        #: CF-4: preview entries replaced by a full-precision re-cook.
+        self.requalified = 0
+        #: There is deliberately no `_pending_promotes` mirroring the queue below. CF-1 built
+        #: one, could not arm it (see `_promote`), and it was removed rather than shipped
+        #: unreachable — a queue nothing appends to is a guarantee the code does not make, and
+        #: no mutation row can kill the guards that read it. The argument for the deferral, and
+        #: the lock-scope change that would actually earn the queue, are in DEVELOPMENT.md.
         self._pending_demotes: deque = deque()
         # A1: keys popped off `_pending_demotes` whose copy has not yet been committed.
         # Between the pop and the commit a victim is in NEITHER the queue nor its final
@@ -492,7 +499,7 @@ class ResultCache:
 
     # ── core API ──
     def put(self, key: str, tensor, *, canvas=None, quality=None, storage=None,
-            kind=None) -> None:
+            kind=None, home=None) -> None:
         """Store `tensor` under `key`, frozen per ENG-12 (an in-place write to a cached frame
         then raises instead of silently corrupting it). Re-inserting a key replaces it.
 
@@ -515,8 +522,12 @@ class ResultCache:
             return
         from . import tex_packing
         want = tex_packing.choose_storage(tensor, quality=quality, storage=storage, kind=kind)
+        # CF-1: `home=` forwards the caller's statement of where this frame BELONGS. Only
+        # `patch_region` passes one (the base's home); everything else leaves it None and
+        # `_admit` derives it from where the tensor is, which is right for a freshly cooked
+        # frame and wrong only for one patched from a demoted base.
         self._admit(key, tex_packing.pack(tensor, want), canvas,
-                    tensor.dtype if want is not None else None, quality=quality)
+                    tensor.dtype if want is not None else None, home=home, quality=quality)
 
     def _admit(self, key: str, tensor, canvas, orig_dtype, home=None,
                gen=None, quality=None) -> "_Entry | None":
@@ -746,6 +757,8 @@ class ResultCache:
         # The nested `put` deferred these — `_lock.depth` was non-zero inside the block above —
         # so they would not run a disk write and a D2H under the lock this method holds for
         # atomicity. They run here, released, exactly as they do after a plain `put`.
+        # There is no promote drain beside them: this method's own `get` promotes INLINE at
+        # depth 1 (see `_promote` for why deferring it does not work).
         self._drain_demotes()
         self._drain_spills()
         return out
@@ -782,6 +795,7 @@ class ResultCache:
         # handed over a bare tensor — a tensor carries no tier, and inventing one from whatever
         # happens to sit under the destination key is how the second bug above happened.
         tag_key = base_key if base_key is not None else (None if base is not None else key)
+        home = None
         if tag_key is not None:
             src = self._ram.get(tag_key)
             # ...and only when the base's BYTES are actually reduced (`orig_dtype is not None`).
@@ -794,8 +808,17 @@ class ResultCache:
             # explicitly protected, through a rule written to PREVENT fidelity loss. Gating on
             # the stored representation keeps the rule exactly as strong as its justification:
             # a patch is never more faithful than its base, and never less faithful either.
-            if src is not None and src.orig_dtype is not None:
-                quality = tex_packing.propagate_quality(quality, (src.quality,))
+            if src is not None:
+                if src.orig_dtype is not None:
+                    quality = tex_packing.propagate_quality(quality, (src.quality,))
+                # CF-1, the residency half. `_admit` records `home` as wherever the frame it
+                # was handed actually LIVES, which for a patched demoted base is the host — so
+                # the result recorded `home=cpu` and left the ladder permanently, every
+                # downstream stage inheriting a CPU home. That is the one-way trip to the CPU
+                # `_Entry.home` exists to prevent. The base's home is the patch's home:
+                # patching changes what is in a frame, never where it belongs. NOT gated on
+                # `orig_dtype` like the tier above — residency is not a fidelity question.
+                home = src.home
         x0, y0, w, h = (int(v) for v in tuple(window)[:4])
         if patch.shape[1:3] != (h, w):
             # The engine served a different extent than the window claims — a declined window
@@ -822,7 +845,7 @@ class ResultCache:
         self.put(key, frame, canvas=(canvas if canvas is not None
                                      else {"shape": list(frame.shape),
                                            "roi": [x0, y0, w, h]}),
-                 quality=quality, storage=storage)
+                 quality=quality, storage=storage, home=home)
         return frame
 
     # ── CACHE-8: residency (VRAM -> host RAM -> disk) ──
@@ -1012,9 +1035,31 @@ class ResultCache:
         # patched frame has left the residency ladder permanently, and every stage downstream of
         # it inherits a CPU home — precisely the "one-way trip to the CPU" `_Entry.home` was
         # introduced to prevent. Trading a latency problem for a residency-correctness one is a
-        # bad trade, and closing it properly needs a promote QUEUE plus home propagation through
-        # `_patch_region_locked`'s nested put — two coupled changes that do not belong in a
-        # patch release. So the H2D runs under the lock here exactly as it did in v0.33.1.
+        # bad trade, which is why the early-out came out and stays out.
+        #
+        # The OBVIOUS repair is to make the early-out defer rather than degrade — queue the
+        # entry on `_pending_promotes` and let a public method run the copy after releasing the
+        # lock, exactly as `_drain_demotes` does for the other direction. It does not work.
+        # CF-1 (v0.35) built the queue and then did NOT arm the early-out, because
+        # the A5 pin showed the deferral targets the wrong frame: queueing the BASE is useless
+        # — by the time the drain runs the base has been read and patched — and deferring moves
+        # the patch arithmetic onto the host, so the RESULT lands host-resident. The pin asserts
+        # `device == cuda` as well as `home == cuda`, and it is right to: a patched frame that
+        # is merely homed to CUDA while sitting on the host has not come back.
+        #
+        # The fix that works is to resolve the base BEFORE `patch_region` takes the composite
+        # lock, so `_promote` runs at depth 0 like every other promotion and the patch happens
+        # on CUDA. That is a lock-SCOPE change entangled with `tag_key`'s `base is None` branch
+        # (the A4 quality ratchet reads it) and it needs its own argument, not a ride on a
+        # carry-forward item. The queue and its drain were BUILT for this and then removed
+        # again in the same session rather than shipped: nothing appended to them, so they were
+        # unreachable code claiming a guarantee, and the victim-walk guards that read them could
+        # not be killed by a mutation row. What CF-1 keeps is the residency half — home
+        # propagation through the nested put — which is what closes the one-way trip to the CPU.
+        #
+        # So the H2D below runs at whatever depth the caller reached it at: 0 from `get`, 1 when
+        # `patch_region` holds the composite lock. The commit block re-acquires the RLock, which
+        # is re-entrant and therefore correct at both; what depth 1 costs is latency only.
         import torch
         src, home = entry.tensor, entry.home
         try:
@@ -1539,6 +1584,74 @@ class ResultCache:
                 self._disk_bytes = total if not missed else None
         return n, nbytes
 
+    # ── PREC-1 / CF-4: requalify-on-idle ──────────────────────────────────────
+    #
+    # PREC-1 shipped preview-tier storage with a promise attached: a frame stored at reduced
+    # fidelity for interaction should be re-cooked at full precision when the machine is idle,
+    # and the preview entry evicted when the final one lands. The quality slot that makes the
+    # preview entries FINDABLE landed in v0.33.2; the helper never did, and no register entry
+    # tracked it — doc 41's DoD line simply dangled for three releases.
+    #
+    # The engine ships the mechanism; the HOST decides when (doc 39 §7 puts idle-detection
+    # psychology in host territory, and a cache that re-cooks on its own initiative is a cache
+    # that surprises a governor). So this is two calls: one that says what is requalifiable,
+    # one that lands the result and evicts the preview.
+
+    def preview_entries(self) -> list:
+        """Keys currently stored at preview fidelity, coldest first.
+
+        Coldest first because that is requalify order: the frame the user scrubbed past
+        longest ago is the one they are least likely to re-request at preview quality, and the
+        most likely to be wanted sharp when they come back to it. `_ram` is an LRU, so its
+        natural iteration order already IS coldest first — stated because it looks incidental.
+        """
+        from . import tex_packing
+        with self._lock:
+            return [k for k, e in self._ram.items()
+                    if e.quality == tex_packing.PREVIEW and e.orig_dtype is not None]
+
+    def requalify(self, preview_key: str, final_key: str, frame) -> bool:
+        """Land a full-precision `frame` under `final_key` and evict the preview entry.
+
+        The host cooks — as SPECULATIVE idle work through its CookQueue, which is what makes
+        this preemption-safe in the same way `tex_checkpoint.materialize` is: the `put` happens
+        after the cook returns, so an interactive arrival that preempts the re-cook publishes
+        nothing and the preview entry is still there, still serving. A partial requalify is not
+        a state this can reach.
+
+        THE EVICTION IS THE POINT, not tidiness. Coexistence pays the governor twice: the
+        preview frame and the final frame are both resident, both counted, both eligible to
+        push something else out — so requalifying a scrubbed-through sequence without evicting
+        would grow the pool by exactly the bytes the preview tier was introduced to save.
+
+        Returns False if the preview entry is gone (evicted or already requalified while the
+        host was cooking), having stored nothing: the key the caller was requalifying no longer
+        describes anything, and landing a final frame for a preview nobody holds is a decision
+        the host should make explicitly with a plain `put`.
+
+        The eviction targets the ENTRY this call decided to replace, not the key. Comparing
+        keys instead (`if final_key != preview_key`) covers only the obvious half — an upgrade
+        in place, where the eviction would otherwise delete the frame `put` had just landed
+        under that very key and still return True. It leaves the general form open: `put` and
+        `_remove` are separate lock acquisitions, so a concurrent `put(preview_key, fresher)`
+        landing in the gap has its frame deleted by a requalify that never saw it. Capturing
+        the entry and re-checking it with `is` closes both with one line — `_admit` builds a
+        fresh `_Entry` on every insert, so the in-place case falls out with no special case."""
+        with self._lock:
+            prev = self._ram.get(preview_key)
+            if prev is None:
+                return False
+        # `quality=None` is what makes this a FINAL frame: `choose_storage` reduces nothing
+        # without the tag, so the frame is stored at full width under a final-shaped key —
+        # the immutability clause PREC-1 pins (`quality=None` keys are only ever written by
+        # full-fp32-stored cooks).
+        self.put(final_key, frame)
+        with self._lock:
+            if self._ram.get(preview_key) is prev:
+                self._remove(preview_key)
+            self.requalified += 1
+        return True
+
     def stats(self) -> dict:
         with self._lock:
             return {"ram_entries": len(self._ram), "ram_bytes": self._ram_bytes,
@@ -1550,6 +1663,7 @@ class ResultCache:
                     "vram_bytes": self._bytes_by_dev["cuda"],
                     "vram_budget_bytes": self._vram_budget,
                     "demotions": self.demotions, "promotions": self.promotions,
+                    "requalified": self.requalified,      # CF-4, for the same reason
                     "demoted": sum(1 for e in self._ram.values() if e.device != e.home)}
 
     def clear(self, *, disk=False) -> None:
@@ -1558,7 +1672,10 @@ class ResultCache:
             self._bytes_by_dev = {"cuda": 0, "cpu": 0}      # `_ram_bytes` derives from this
             # Both drain queues hold entries that no longer exist. `_drain_demotes` re-checks
             # identity and would drop them anyway, but a queued spill is written unconditionally
-            # — a cleared cache must not keep writing the frames it just forgot.
+            # — a cleared cache must not keep writing the frames it just forgot. `_demoting` is
+            # deliberately NOT cleared, for the reason spelled out for spills below: a victim
+            # `_drain_demotes` ALREADY popped is mid-copy and out of reach, and dropping its
+            # "spoken for" marker only lets a second transfer commit the same bytes.
             self._pending_demotes.clear()
             self._pending_spills.clear()
             self._spill_seq.clear()       # A1: keys are gone; their write tickets go with them

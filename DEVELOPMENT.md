@@ -772,9 +772,11 @@ Settled calls, kept here so they're not re-derived:
   flight). So a governor that disarms residency in the same window as an `arbitrate()` can be
   told bytes were freed that were not. It self-corrects on the next call — `governed_bytes()` is
   recomputed from `_bytes_by_dev`, which stays consistent throughout (verified by recount) — so
-  the error is one arbitration round, not a permanent skew. *Gate:* charge at COMMIT time
-  instead, which means `evict_bytes` can no longer answer synchronously and the CACHE-5 hook
-  contract changes shape. That is a v0.34 conversation, not a patch.
+  the error is one arbitration round, not a permanent skew. *Gate:* **superseded — see CF-3
+  below (v0.35 phase 0), which is this same deferral re-argued with a gate that can actually
+  fire.** The gate written here was "that is a v0.34 conversation", which v0.34 shipping turned
+  into no gate at all; the replacement is a measurement (a governor consumer measurably
+  over-evicting), not a date.
 - **A lock-depth early-out in `ResultCache._promote`** (v0.33.2 A5(d)) — WITHDRAWN after being
   written, because it traded a latency problem for a correctness one. The idea was sound in
   isolation: the drains refuse to run a full-frame copy while a composite holds `_lock`, and
@@ -785,11 +787,16 @@ Settled calls, kept here so they're not re-derived:
   `device=cpu`, `home=cpu`, `promotions=0`. Nothing raises, because `frame[...] = patch` accepts
   a CUDA source into a CPU destination, so the patched frame just leaves the residency ladder
   permanently and every stage downstream inherits a CPU home — the "one-way trip to the CPU"
-  `_Entry.home` exists to prevent. *Gate to reopen:* a `_pending_promotes` queue drained like
-  the other two, PLUS home propagation through `_patch_region_locked`'s nested `put` — the
-  second is what the first alone does not fix, since the result is composed while the base is
-  still on the host. Both belong with v0.34's async-write work, not in a patch. The invariant
-  the withdrawal restores is pinned
+  `_Entry.home` exists to prevent. *Gate to reopen:* **fired, half-satisfied, and the gate
+  itself was wrong** — v0.35 phase 0 built both halves it named. Home propagation through
+  `_patch_region_locked`'s nested `put` works and shipped; a `_pending_promotes` queue drained
+  like the other two was built and then removed, because arming the early-out on it STILL does
+  not work, for a reason this gate did not anticipate: queueing the BASE is useless (by drain
+  time it has
+  already been read and patched) and deferring moves the patch arithmetic onto the host, so the
+  RESULT lands host-resident. The A5 pin asserts residency, not just homing, and caught it. See
+  the CF-1 row below for the fix that does work (resolve the base before the composite lock is
+  taken) and why it is not a carry-forward. The invariant the withdrawal restores is pinned
   (`test_v0332_a5_promote_keeps_a_patched_frame_on_its_home_device`).
 - **Pruning `_spill_seq` / `_spill_locks`** (v0.33.2 A1) — DEFERRED, quantified rather than
   waved at. Both dicts gain an entry per distinct key ever spilled and lose it never: ~240 B
@@ -802,14 +809,17 @@ Settled calls, kept here so they're not re-derived:
   last in-flight spill of that key leaves, which bounds the map by CONCURRENT spills instead of
   by keys ever seen.
 - **`examples/host_demo.py::RoiComp` still hand-rolls the window composition** (v0.33.2, P0-4a)
-  — DEFERRED, and worth stating because it makes a CHANGELOG line narrower than it sounds. The
-  `declined=` migration reached `tex_roi.chain_windows`, the bench host and the tests; it did
-  NOT reach the shipped example, which carries its own `_needed_windows` backward walk, its own
-  `_WHOLE_FRAME` sentinel and its own halo inversion, and tracks neither `valid` nor `declined`.
-  So the artifact a host is most likely to copy still demonstrates the pre-P0-4a pattern whose
-  error this release quotes at 2.10e-01. *Gate:* `RoiComp` is load-bearing for PM-2/PM-6 and is
-  imported and asserted on by `test_v028_phase1` and `test_v030_phase1`, so rewriting its cook
-  loop means re-running those measurements — a v0.34 job, not a patch-release one.
+  — ~~DEFERRED~~ **CLOSED in v0.35 phase 0 (CF-2).** `_needed_windows` now delegates to
+  `tex_roi.chain_windows` and `RoiComp` tracks `valid` and `declined`, so the artifact a host is
+  most likely to copy demonstrates the post-P0-4a pattern instead of the one whose error this
+  release quotes at 2.10e-01. Verified by probe: a second, deeper edit at a different roi is now
+  REFUSED (`None` → cook whole) where the hand-rolled walk served pre-edit pixels. The gate's
+  condition was honoured rather than waived — `RoiComp` is load-bearing for PM-2/PM-6 and
+  asserted on by `test_v028_phase1`/`test_v030_phase1`, and those measurements were re-run:
+  **PM-2 = 3.43 ms/frame**, comfortably inside target. (Filed as a number because "re-run and
+  pass" is not a measurement — an audit caught that phrasing here and it was right to.) Phase 0 also closed the case `chain_windows` never sees: `cook(None, dirty_from=k)` took
+  no plan at all, so a whole-frame partial recook over a window-valid input recorded "correct
+  everywhere". The prefix is now checked and the recook widens to 0.
 - **Hoisting `patch_region`'s base fetch out of the atomicity lock** (v0.33.2) — DEFERRED.
   `_patch_region_locked` calls `self.get(base_key)` while `patch_region` holds `_lock`, and on
   a RAM miss that reaches `_restore` — a pickle load plus an H2D, i.e. 327-496 ms of disk I/O
@@ -865,20 +875,25 @@ Settled calls, kept here so they're not re-derived:
   (c) *per-device checkpoint thresholds* — the 100 ms default places NOTHING on CUDA on this box
   (12-stage 2048² ≈ 43 ms) while the materialization floor is device-dependent by 18×. **Reopen
   gate:** the first calibration run on real comps, which doc 39 §4 already marks host-gated.
-- **Doc 41 §2.5's ROTO-lang decision doc** (v0.33) — DEFERRED, and this one is overdue by three
-  releases (doc 40 §5 dates it "written v0.32–33"). It is document-only and it SHAPES DATA-5
-  (v0.37), so the cost of leaving it is that DATA-5 starts without knowing whether fusable
-  procedural masks beat host-rasterized MASK planes. **Reopen gate:** before DATA-5's design doc
-  opens, not after. The recipe is written down (doc 41 §2.5): a throwaway `spline_mask`
-  prototype interpreter-side, benchmarked against rasterized masks wired as bindings at 1080/4K
-  on both devices, with the go/no-go recorded either way — a "not shipped" verdict is a
-  completed item under doc 40 §4.6's own rule.
-- **Doc 41 §B5b/c** (v0.33.1) — two decisions doc 41 assigned that remain unrecorded: the PROF-1
-  `snapshot()` / persisted-placement cross-launch question (its stated gate, CACHE-8's tiers, has
-  now shipped, so it is unblocked), and XPU-2 × CUDA-graph capture — either add the
-  `is_current_stream_capturing()` guard (precedent: `noise.py`) or write the non-interaction
-  argument into `docs/async-egress.md`. **Note for whoever takes the second:** `egress`'s
-  `_blocking` fallback currently sits OUTSIDE the `try`, so it would raise uncaught mid-capture.
+- **Doc 41 §2.5's ROTO-lang decision doc** (v0.33) — ~~DEFERRED~~ **CLOSED in v0.35 phase 0**,
+  four releases late, with the measurement the gate always asked for:
+  `docs/roto-lang-decision.md`, from `benchmarks/roto_spike.py`. Verdict **not shipped** —
+  procedural masks are 2.3–8.9× slower on a first frame and 18–93× slower during an unrelated
+  scrub, both devices, 1080p and 4K. The scrub column decides it: a rasterized mask survives a
+  grade drag untouched, while a procedural one is part of the program, so ANIM-1's re-cook
+  guarantee works against it. A recorded no-go is a completed item under doc 40 §4.6's own rule,
+  and DATA-5's shape is unblocked: masks arrive as planes, so it needs no spline surface.
+  **Reopen gate** is in the doc (a mask whose rasterized form cannot be reused — planar
+  tracking — or a kernel-level fusion backend).
+- **Doc 41 §B5b/c** (v0.33.1) — ~~unrecorded~~ **both recorded in v0.35 phase 0.** (b) the PROF-1
+  `snapshot()` / persisted-placement cross-launch question is decided and written up below as
+  CF-5b (persist via `reload()`, let placement re-derive); (c) XPU-2 × CUDA-graph capture took
+  the second of the two offered
+  spellings — the non-interaction argument is now in `docs/async-egress.md`, resting on three
+  independent reasons rather than one. The note that came with the row was load-bearing and was
+  ACTED ON: `egress`'s `_blocking` fallback did sit outside the `try` and would have raised
+  uncaught mid-capture; it was moved (CF-5a), because an argument that a path is unreachable is
+  not a reason to leave a trap on it.
 - **A cross-node include/import system** — rejected on ethos grounds; self-containment
   ("five lines of self-contained plaintext") is a deliberate shareability feature.
 - **An extra fusion wire** — the frontend collapses a chain into the terminal node
@@ -1028,4 +1043,114 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   rows" whatever the guard did. That, not simple omission, is why v0.34 shipped with none. The
   list now reaches v0.34.1, and a new release's modules must be added to it or its rows are
   decorative — the same trap `test_v0331_audit`'s A5 row fell into a different way.
+- **PROF-1 `snapshot()` cross-launch persistence: DECIDED — persist, via the `reload()`
+  protocol, and let placement re-derive (CF-5b, v0.35).** The question doc 41 left open was
+  whether CACHE-7 placement should be stable across launches. It should not be *pinned*: a
+  placement is a function of measured per-stage cost, and cost is a property of the box and
+  the current tree, both of which change. What is worth persisting is the COST TABLE — the
+  expensive half, several settled cooks per key — beside `autotier.json` through the same
+  durable-write protocol. Placement then re-derives on the first cook of a new launch from
+  numbers that are already good, instead of re-measuring 12 cooks per key to reach the same
+  answer. Not implemented in v0.35: it needs the fast-settle burst mode (v0.33 §2.4) to have
+  a settled table worth writing, and no host has yet reported the cold-start tax. Reopens when
+  one does, or when CACHE-7 placement is observed flapping between launches on one box.
+- **CF-3 · `evict_bytes` charge-at-commit stays deferred, now with a gate.** The CACHE-5 hook
+  reports bytes it INTENDS to free, and a queued-but-uncommitted demotion is counted once in
+  that report and again on the next round — a one-round over-report. Changing the hook
+  contract to charge at commit touches every registered pool and the governor's arbitration
+  loop, to fix an over-eviction nobody has measured. The gate is explicit: **this reopens when
+  a governor consumer measurably over-evicts** — a host reporting frames evicted while the
+  pool was under budget, or an arbitration test showing a second round freeing bytes the first
+  round already counted. Until then the one-round over-report is documented behaviour, not an
+  oversight.
+- **CF-1's latency half stays open; its residency half shipped (v0.35 phase 0).** `home`
+  propagation through `patch_region`'s nested `put` is in — a patch over a demoted base now
+  records the BASE's home, so it stays on the residency ladder instead of taking every
+  downstream stage with it to the CPU (measured before: `device=cpu, home=cpu, promotions=0`;
+  after: `home=cuda:0`), and it is pinned by a test verified to FAIL on a pristine v0.34.1
+  worktree (`home=cpu`) — the first cut of that pin passed on pristine, because addressing the
+  base by `base_key=` alone routes through a `get` that promotes it; the recipe that
+  discriminates is `base=` WITH `base_key=`, and the assertion is that a later `get` PROMOTES
+  the patched frame (`promotions` +1), i.e. that the ladder can still reach it.
+
+  The 11.1 ms H2D still runs inside `patch_region`'s critical section. A promote QUEUE and its
+  drain were built for the deferral and then **removed again in the same session**, not shipped:
+  arming the early-out queues the BASE, which by drain time has already been read and patched,
+  and it pushes the patch arithmetic onto the host so the RESULT lands host-resident — caught by
+  `test_v0332_a5_promote_keeps_a_patched_frame_on_its_home_device`, which asserts residency and
+  not just homing. With nothing left to append to it the queue was unreachable code claiming a
+  guarantee, and the victim-walk guards reading it could not be killed by any mutation row, so
+  keeping it "ready for later" would have cost exactly the kind of decorative machinery this
+  project's mutation gate exists to find. The change that works is to resolve the base BEFORE
+  the composite lock is taken (then `_promote` runs at depth 0 and the patch happens on CUDA),
+  which is a lock-scope change entangled with `tag_key`'s `base is None` branch feeding the A4
+  quality ratchet. Reopens as its own item with that argument written out — and it re-adds the
+  queue then, when something appends to it.
+- **A gather source at a different resolution than the direct read still refuses** (measured
+  v0.35 phase 0, CF-6) — DEFERRED, and recorded because CF-6 is the change most likely to be
+  blamed for it. `@OUT = @A.rgb * 0.5 + @T(u,v).rgb * 0.5` with `@A` 32² and `@T` 256² raises
+  `RuntimeError: the size of tensor a (32) must match ... (256)`. A/B'd against v0.34.1 in a
+  worktree: **pristine raises too**, in all three spellings (`@T(u,v)`, `@T[ix,iy]`, and with
+  the bindings declared either way round) — so this is pre-existing, and what CF-6 changed is
+  only that the error is now the same regardless of binding order. Semantically a gather source
+  is not a co-extent participant — sampling produces grid-shaped output whatever the source's
+  size — so the consensus arguably should exclude bindings read ONLY through
+  sample/index access. *Gate:* DATA-6's plane bindings (phase 1-2) are the scheduled lever for
+  "TEX reads a differently-shaped image cheaply", and deciding this before that design doc
+  exists would prejudge it. Revisit when DATA-6 fixes the shape of a non-co-extent input.
+- **A spilled base propagates no home** (v0.35 phase 0) — DEFERRED, low, and the exact mirror of
+  the quality-tier caveat `patch_region` already documents. CF-1's home propagation reads the
+  base's `_Entry` out of `_ram`, so a base that has aged out to the DISK tier contributes
+  nothing and the patch is homed wherever its frame happens to live. The `get(base_key)` on the
+  key-addressed path restores it first, so the gap is the explicit-`base=` path — the same one
+  whose docstring already says the tier propagation is best-effort for the same reason, and
+  with the same workaround (state it explicitly). Bounded: a restored frame is host-resident
+  anyway, so the wrong answer and the right one agree except on a frame whose home was CUDA
+  before it spilled. *Gate:* fold `home` into the spill record so `_restore` brings it back —
+  which is a spill-format change, i.e. a version bump for the disk tier, not a patch.
+- **Two heuristic px-derivations still size themselves first-wins** (v0.35 phase 0, found by
+  a /simplify reuse pass; a third was promoted out of this row by a later audit) — DEFERRED,
+  deliberately. CF-6 gave the cook grid a single owner, and three mirrors were brought along
+  with it because they state a FACT about this cook:
+  `_preflight_memory`'s peak-bytes estimate (`tex_engine.py`, which would otherwise
+  under-estimate by up to H× and no-op the model unload on exactly the cook that needed it) and
+  `run_auto`'s autotier bucket key (`tex_runtime/compiled.py`, a disk-persisted cache whose key
+  changed when two binding names were swapped).
+
+  **`cook_px` was in this row as a deferral and has been promoted OUT of it — the line drawn
+  here was wrong, and an audit was right to reject it.** The reasoning was "thresholds decide
+  routing, so moving them is a measured change, not a cleanup", which is true of the two below
+  and false of this one: `cook_px` gates `precision="auto"`, and precision reaches PIXELS. On
+  CUDA at 2048², a `[1,1,W,C]` strip bound before the frame resolved fp32 while frame-first
+  resolved fp16 — **maxdiff 7.32e-04**, binding-order-dependent output on exactly the property
+  CF-6's headline claims is gone by construction. Under the display quantum and `auto` is
+  opt-in, so it was not a blocker; but a release cannot claim order-independence and ship a
+  gate that inverts on order. Now routed through `_consensus_extent`, with a CUDA
+  `precision="auto"` leg on the order-independence pin — the CPU pin is structurally blind to
+  it, because `auto` resolves fp32 on CPU whatever the resolution.
+
+  Still deferred, and these really are thresholds: `tex_runtime/compiled.py`'s `_bindings_px`
+  (CC-2 verify-state resolution check) and `tex_runtime/graphed.py`'s `_spatial_px`
+  (`_graph_capture_worthwhile`). Neither reaches pixels — they choose between tiers that must
+  agree bit-exactly (invariant #2), so the worst case is a tier chosen on a wrong bucket, not a
+  different answer. Both were order-dependent before CF-6 and remain exactly as order-dependent:
+  pre-existing debt made visible, not a regression CF-6 introduced. *Gate:* consolidate both
+  onto `_consensus_extent` WITH a full 8-config benchmark, because a capture-worthwhile
+  threshold that starts firing at a different resolution is a measured behaviour change.
+- **Generalizing lazy-pruning rule R1** (v0.35 phase 0) — DEFERRED, and **not** as "retire it".
+  An earlier draft of this row said CF-6 had made R1 purposeless and gated its removal on a
+  measurement; a /simplify altitude pass showed that is false, and acting on it would have
+  shipped a regression. CF-6's read-set narrowing fires only when an axis DISAGREES, so a LONE
+  spatial wire sizes the grid whether the program reads it or not — which is what makes
+  `@OUT = vec4(u,v,0,1)` with one image wired cook a frame. R1 is the only thing stopping that
+  wire being pruned (`needed` is empty, so `spatial[0]["name"] not in needed` fires and keeps
+  everything); prune it and `_consensus_extent` returns `None` — 1x1 where a frame used to be.
+  `test_v035_cf6_an_unread_binding_does_not_size_the_grid` pins the ENGINE half of this; the
+  NODE half is R1 and has no pin, which is how the wrong conclusion survived being written down.
+  What is left is an altitude question, not a retirement: R1 states the grid's precondition
+  ("some spatial wire must survive to anchor it") in a first-wins spelling ("slot 0 must
+  survive"), which over-approximates — it forces a whole-graph cook when slot 0 is dead even
+  where slot 1 is a perfectly good anchor. *Gate:* generalize to `any(e["name"] in needed and
+  e["type"] in SHAPE_ANCHOR_TYPES for e in spatial)` — strictly more permissive AND closer to
+  the real rule — together with a node-level pin that a lone unread wire is never pruned.
 

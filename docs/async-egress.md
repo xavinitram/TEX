@@ -188,3 +188,30 @@ is itself 1123 µs. On a CUDA source it is **360.7 µs against 348.5 µs** (512�
 **5129 µs against 5117 µs** (2048²) versus a pinned blocking copy, fence included. So the
 machinery is a low-microsecond constant everywhere and the §4 ratios are the whole story;
 there is no hidden per-call tax being waived.
+
+## XPU-2 × CUDA-graph capture — why there is no interaction (CF-5a, v0.35)
+
+Recorded because it was decided in v0.33, supported by a live probe in the v0.33 audit, and
+then never written anywhere a reader would find it.
+
+**The claim: `egress` is never reached during a graph capture, so the handle and the graph
+tier cannot interact.** Three independent reasons, any one sufficient:
+
+1. **Nothing on the capture path calls it.** `egress` has exactly two engine callers — the
+   `ResultCache` spill/demote path and the v0.34 async-write contract's host-side consumers.
+   A capture replays a program; it does not spill, demote, or write files.
+2. **A captured program cannot produce a frame that needs egress.** Replay hands back a normal
+   clone (the graph tier's own contract), so the D2H that `egress` exists to overlap has
+   already happened by the time anything downstream could ask for a handle.
+3. **The stdlib functions that could reach a provider are capture-barred.** `fetch_time` and
+   `sample_time` are in `graphed._SYNC_STDLIB`, so a program touching host sources is never
+   captured in the first place.
+
+**What was fixed anyway.** `egress`'s pinning path calls `torch.cuda.Event()` and a
+`non_blocking` `copy_`, both capture-illegal. Its fallback used to run *inside* the `except`,
+so a second failure — `_blocking`'s plain `copy_`, equally capture-illegal — was raised during
+handling of the first, chaining the tracebacks and leading with the wrong one. The fallback now
+runs after the handler. This is defence for a path the three reasons above say is unreachable;
+it costs two lines and it means that if the reasoning is ever wrong, the error names the real
+cause instead of a pinning failure that was only a symptom.
+

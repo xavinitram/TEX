@@ -32,8 +32,7 @@ _FAMILIES = [
      "assigning to a built-in, indexing a non-array)."),
     ("E4", "Optimizer", "Errors surfaced while optimizing the checked AST "
      "(rare; usually indicates an internal invariant — please file an issue with the program)."),
-    ("E5", "Compile / cache", "Errors compiling or loading a cached program "
-     "(codegen fell back, a cache artifact was rejected)."),
+    ("E5", "Compile / cache", "Errors from the compile and artifact-cache layer — a program that could not be compiled for the requested tier, a cached artifact that was rejected as unusable (wrong epoch, corrupt, or built by a different code version), or a compile-time argument a pass could not resolve. A codegen tier FALLING BACK is not one of these: that is a routing decision the engine makes silently and reports through the tier trace, not an error."),
     ("E6", "Runtime / node", "Errors while executing or wiring the node "
      "(an input `@X` isn't connected, a runtime value went non-finite, a fused-chain or "
      "lazy-input problem, an OOM the node re-raised for ComfyUI to handle)."),

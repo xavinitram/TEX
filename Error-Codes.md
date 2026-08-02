@@ -232,7 +232,7 @@ Optimizer. See the message shown with the code for the specific cause and fix; t
 
 ## Compile / cache (`E5xxx`)
 
-Errors compiling or loading a cached program (codegen fell back, a cache artifact was rejected).
+Errors from the compile and artifact-cache layer — a program that could not be compiled for the requested tier, a cached artifact that was rejected as unusable (wrong epoch, corrupt, or built by a different code version), or a compile-time argument a pass could not resolve. A codegen tier FALLING BACK is not one of these: that is a routing decision the engine makes silently and reports through the tier trace, not an error.
 
 ### E5001
 

@@ -558,7 +558,14 @@ programs, not tasks — each needs its own design doc when its time comes.
   can't do its core job, and in the standalone host there is no upstream ComfyUI
   graph to supply masks. v1 bet: host-side spline/paint rasterizers emitting MASK
   planes; investigated alternative: TEX-expressible SDF evaluation (which would
-  fuse). The answer shapes DATA-5 and STOCK-1 — decide before §8's rung 3.
+  fuse). **DECIDED in v0.35 phase 0 — the bet stands, the alternative is out**
+  (`docs/roto-lang-decision.md`, from `benchmarks/roto_spike.py`): procedural masks
+  measured 2.3–8.9× slower on a first frame and 18–93× slower on an unrelated scrub,
+  both devices, 1080p and 4K, because a rasterized mask is a host-side value that
+  survives a grade drag while a procedural one is part of the program and re-cooks
+  with it. So no `sdf_bezier`/`spline_mask` stdlib surface, DATA-5 plans for
+  MASK-plane inputs, and what remains here is the rasterizer and the interaction —
+  both host territory. Reopen gate lives in the decision doc.
 - **COLOR-1.** The OCIO decision, properly reopened: a shipping standalone
   compositor cannot avoid studio color management — the *engine-era* answer is the
   OCIO-v2-as-codegen-seam pattern (GpuShaderDesc's op list / baked LUTs translated

@@ -192,5 +192,12 @@ def egress(src: torch.Tensor, *, dtype=None, retained: bool = False) -> FrameHan
         return FrameHandle(host, src, ev)
     except Exception:
         # Host memory pressure, a wedged driver: pinning is an optimisation, never a
-        # requirement. Fall back to the blocking copy and hand back a complete handle.
-        return _blocking(src, want)
+        # requirement. Fall through to the blocking copy.
+        pass
+    # CF-5a: the fallback runs OUTSIDE the handler. Calling `_blocking` from inside the
+    # `except` meant that when it failed too — and the case where both fail is a real one,
+    # mid-CUDA-graph-capture, where `copy_` is capture-illegal by either route — the second
+    # exception was raised *during handling of* the first. Python chains them, so the
+    # traceback led with the pinning failure and buried the capture error underneath, and the
+    # raise escaped `egress` either way. Out here the capture error surfaces as itself.
+    return _blocking(src, want)
