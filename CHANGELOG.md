@@ -5,6 +5,44 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.2] - 2026-08-05
+
+**Mind the doorway** — the package root stops dragging the ComfyUI adapter through it. An
+interim patch release, cut so the tree stops self-identifying as a version it is no longer:
+since v0.34.1 it has carried the v0.35 phase-0/1 groundwork while still reporting `0.34.1`, so
+an embedding host could pin a commit but never a version.
+
+**This is not the Planes release.** `v0.35.0` stays reserved for DATA-6's implementation (plane
+bindings + EXR layers/parts + PM-10) and still belongs at the end of phase 2, exactly as the
+phase-0 commit records — as does the CHANGELOG entry for the phase work itself. The v0.35
+phase-0/1 commits (the CF register, the CF-6 cook-grid consensus, the ROTO decision, the DATA-6
+design doc) are present in this tree and are deliberately **not** catalogued here; their record
+falls due at `v0.35.0`. What follows is this release's own content.
+
+### PORT-6 — the package root no longer loads the ComfyUI adapter
+
+- `import TEX_Wrangle.tex_api` — the entry a SECOND host uses — executed
+  `from .tex_node import TEXWrangleNode` at module scope, so the ComfyUI adapter loaded
+  whatever the importer actually wanted. S-1 could never catch this: it proves no `tex_core`
+  module *imports* a ComfyUI surface, not that the package root leaves the adapter alone.
+  `NODE_CLASS_MAPPINGS` / `TEXWrangleNode` are now built on first access (PEP 562 module
+  `__getattr__`).
+- **The subtler half:** the route block's `from server import PromptServer`. ComfyUI's `server`
+  imports `nodes`, which imports `comfy` — so on any machine with ComfyUI merely on `sys.path`,
+  that one line pulled all of ComfyUI into a host that only wanted the engine. It is now gated
+  on a **non-importing** `"server" in sys.modules` membership test.
+- **ComfyUI is unaffected.** Its loader reads `NODE_CLASS_MAPPINGS` off the module immediately
+  after executing it, so the adapter still loads during node registration — in the same call —
+  and an import error there still surfaces at load time rather than at first cook. An
+  `AttributeError` escaping the adapter import is re-raised as `ImportError`, because `hasattr`
+  (ComfyUI's probe) swallows the former and would otherwise silently unregister the node.
+- Measured on a ComfyUI-free interpreter: the engine import drops from 32 to 26 TEX modules and
+  attempts **zero** ComfyUI imports (it previously reached `comfy`). Pinned from both sides by
+  two mutation-proven subprocess tests — `test_v035_port6_engine_import_is_adapter_free` (the
+  adapter stays unloaded, nothing comfy is imported, and reading the mapping still yields the
+  node) and `test_v035_port6_routes_still_register_under_comfyui` (11 routes still register
+  against a stub host). Architecture note in `ARCHITECTURE.md`'s S-1 section.
+
 ## [0.34.1] - 2026-07-30
 
 **Mind the sources** — the v0.34.0 release audit's findings, closed, plus the re-audit's. Same
