@@ -8,12 +8,26 @@ directly inside ComfyUI. Inspired by Houdini VEX and Nuke BlinkScript.
 __version__ = "0.34.1"
 
 import os
+import sys
 
-from .tex_node import TEXWrangleNode
-
-NODE_CLASS_MAPPINGS = {
-    "TEX_Wrangle": TEXWrangleNode,
-}
+# ── PORT-6: the ComfyUI adapter loads LAZILY ─────────────────────────────────
+# `tex_node` is the ComfyUI adapter (S-1: one of the three files permitted to touch a
+# ComfyUI surface). Importing it HERE meant that `import TEX_Wrangle.tex_api` — the entry
+# a SECOND host uses — pulled the adapter in behind it: executing this module executes
+# line 12, whatever the importer actually wanted. The S-1 lint proved `tex_core` never
+# *imports comfy*; it could not stop the package root from loading the adapter anyway.
+#
+# `NODE_CLASS_MAPPINGS` is the only name that needs the adapter, so it is now built on
+# first access (PEP 562 module `__getattr__`). The ComfyUI path is unchanged in substance:
+# ComfyUI's loader reads `NODE_CLASS_MAPPINGS` off the module immediately after executing
+# it, so the adapter still loads during node registration — microseconds later, in the same
+# call — and an import error inside it still surfaces at load time, not at first cook. A
+# host that imports only `tex_api`/`tex_engine`/`tex_session` never touches the attribute,
+# so it never loads the adapter and never attempts a `comfy` import.
+#
+# Pinned by `tests/test_v035_hygiene.py::test_v035_port6_engine_import_is_adapter_free`,
+# which drives BOTH halves in a ComfyUI-free subprocess (engine import stays adapter-free;
+# reading `NODE_CLASS_MAPPINGS` still yields the registered node).
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "TEX_Wrangle": "TEX Wrangle",
@@ -22,6 +36,39 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 WEB_DIRECTORY = "./js"
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+
+# The adapter-backed names. `TEXWrangleNode` is here because it WAS an attribute of the
+# package root before PORT-6 (a side effect of the old eager import), and something outside
+# this repo may read it; resolving either name loads the adapter once.
+_LAZY_ADAPTER_NAMES = ("NODE_CLASS_MAPPINGS", "TEXWrangleNode")
+
+
+def __getattr__(name):
+    """PEP 562 lazy attributes — see the PORT-6 note above.
+
+    Resolving either lazy name imports the ComfyUI adapter once and writes BOTH results
+    into the module globals, so `__getattr__` does not fire again and later reads cost a
+    normal attribute lookup. Any other missing name raises `AttributeError` as usual (so
+    `hasattr` on an unrelated name stays False instead of importing the adapter)."""
+    if name in _LAZY_ADAPTER_NAMES:
+        try:
+            from .tex_node import TEXWrangleNode
+        except AttributeError as e:
+            # Keep an adapter-import failure LOUD, as it was when this import sat at module
+            # scope. ComfyUI's loader probes with `hasattr`, which swallows AttributeError —
+            # so an AttributeError escaping from here would silently unregister the node
+            # instead of reporting a failed import. Every other exception already propagates.
+            raise ImportError(f"TEX ComfyUI adapter failed to import: {e!r}") from e
+        globals()["TEXWrangleNode"] = TEXWrangleNode
+        globals()["NODE_CLASS_MAPPINGS"] = {"TEX_Wrangle": TEXWrangleNode}
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    """Keep the lazy names discoverable (`dir()`, tab-completion, doc tools) whether or not
+    the adapter has been loaded yet."""
+    return sorted(set(globals()) | set(_LAZY_ADAPTER_NAMES))
 
 # ─── Snippet API ──────────────────────────────────────────────────────
 # Serves built-in example snippets from the examples/ directory.
@@ -194,6 +241,15 @@ def _load_example_snippets():
 
 
 try:
+    # PORT-6: probe `sys.modules` BEFORE importing `server`. ComfyUI's `server` module
+    # imports `nodes`, which imports `comfy` — so on a machine where ComfyUI merely sits on
+    # `sys.path`, this line alone used to drag the whole of ComfyUI into a SECOND host that
+    # only wanted `tex_api`. A membership test imports nothing. It costs ComfyUI nothing:
+    # custom nodes are loaded from `nodes.init_extra_nodes()` long after `server` is
+    # imported and `PromptServer.instance` exists, so the routes register exactly as before
+    # (and in any case where the old code could have succeeded, `server` is already here).
+    if "server" not in sys.modules:
+        raise ImportError("not running under ComfyUI — TEX routes not registered")
     from aiohttp import web
     from server import PromptServer
     routes = PromptServer.instance.routes

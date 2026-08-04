@@ -1271,6 +1271,8 @@ def main():
         test_v035_cf2_a_whole_frame_partial_recook_checks_its_prefix,
         test_v035_cf4_requalify_lands_the_final_and_evicts_the_preview,
         test_v035_cf1_a_patch_over_a_demoted_base_keeps_its_home,
+        test_v035_port6_engine_import_is_adapter_free,
+        test_v035_port6_routes_still_register_under_comfyui,
     )
     test_v035_cf7_builtin_name_sets_agree(r)
     test_v035_cf7_js_publish_manifest_tracks_the_language_version(r)
@@ -1282,6 +1284,8 @@ def main():
     test_v035_cf2_a_whole_frame_partial_recook_checks_its_prefix(r)
     test_v035_cf4_requalify_lands_the_final_and_evicts_the_preview(r)
     test_v035_cf1_a_patch_over_a_demoted_base_keeps_its_home(r)
+    test_v035_port6_engine_import_is_adapter_free(r)
+    test_v035_port6_routes_still_register_under_comfyui(r)
 
     success = r.summary()
     return 0 if success else 1

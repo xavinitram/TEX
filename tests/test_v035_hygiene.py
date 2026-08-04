@@ -410,3 +410,131 @@ def test_v035_cf1_a_patch_over_a_demoted_base_keeps_its_home(r):
         r.ok("CF-1: a patch over a demoted base keeps the base's home and can be promoted back")
     except Exception as e:
         r.fail("CF-1 patched home", f"{type(e).__name__}: {e}")
+
+
+def test_v035_port6_engine_import_is_adapter_free(r):
+    """PORT-6: a second host can import the engine without loading the ComfyUI adapter.
+
+    `__init__.py` used to do `from .tex_node import TEXWrangleNode` at module scope, so
+    `import TEX_Wrangle.tex_api` — the entry a non-ComfyUI host uses — executed the package
+    root and pulled the adapter in behind it. The S-1 lint could not catch this: it proves
+    `tex_core` never *imports comfy*, not that the package root leaves the adapter alone.
+    The second, subtler half was the route block's `from server import PromptServer`:
+    ComfyUI's `server` imports `nodes`, which imports `comfy`, so on any machine with
+    ComfyUI merely on `sys.path` that one line dragged all of ComfyUI into a second host.
+
+    Both halves are checked in a SUBPROCESS, because the assertion is about what a fresh
+    interpreter loads and this suite has already imported everything. The check is the
+    strict one: ComfyUI imports are RECORDED, not blocked, so a probe that would have
+    succeeded still trips the assertion.
+
+    The same subprocess then proves the ComfyUI contract is intact — reading
+    `NODE_CLASS_MAPPINGS` resolves the lazy attribute, loads the adapter, and yields the
+    registered node class. A version of this that only checked the first half would pass
+    just as well with node registration completely broken."""
+    import subprocess
+    import sys as _sys
+    import TEX_Wrangle
+
+    custom_nodes = str(pathlib.Path(TEX_Wrangle.__file__).resolve().parent.parent)
+    code = (
+        "import sys\n"
+        f"sys.path.insert(0, {custom_nodes!r})\n"
+        "import builtins\n"
+        "_real = builtins.__import__\n"
+        "seen = []\n"
+        "def _hook(name, *a, **k):\n"
+        "    if name.split('.')[0] in ('comfy','comfy_api','comfy_execution','folder_paths','nodes','server'):\n"
+        "        seen.append(name.split('.')[0])\n"
+        "    return _real(name, *a, **k)\n"
+        "builtins.__import__ = _hook\n"
+        "import TEX_Wrangle.tex_api\n"
+        "print('ADAPTER', 'TEX_Wrangle.tex_node' in sys.modules)\n"
+        "print('COMFY', ','.join(sorted(set(seen))))\n"
+        "import TEX_Wrangle as pkg\n"
+        "print('HASATTR', hasattr(pkg, 'NODE_CLASS_MAPPINGS'))\n"
+        "print('MAPPING', ','.join(sorted(pkg.NODE_CLASS_MAPPINGS)))\n"
+        "print('NODECLS', type(pkg.NODE_CLASS_MAPPINGS['TEX_Wrangle']).__name__ != 'NoneType')\n"
+        "print('LOADED', 'TEX_Wrangle.tex_node' in sys.modules)\n"
+    )
+    try:
+        proc = subprocess.run([_sys.executable, "-X", "utf8", "-c", code],
+                              capture_output=True, text=True, timeout=180)
+        if proc.returncode != 0:
+            r.fail("PORT-6 adapter-free import",
+                   f"subprocess exit {proc.returncode}: {(proc.stderr or '')[-400:]}")
+            return
+        out = dict(line.split(" ", 1) if " " in line else (line, "")
+                   for line in proc.stdout.strip().splitlines() if line[:1].isupper())
+        assert out.get("ADAPTER") == "False", \
+            "importing TEX_Wrangle.tex_api still loads the ComfyUI adapter (tex_node)"
+        assert out.get("COMFY", "") == "", \
+            f"a ComfyUI import was attempted by the engine import path: {out.get('COMFY')}"
+        # ...and the ComfyUI registration contract still holds in the same process.
+        assert out.get("HASATTR") == "True", "hasattr(pkg, 'NODE_CLASS_MAPPINGS') is False"
+        assert out.get("MAPPING") == "TEX_Wrangle", \
+            f"NODE_CLASS_MAPPINGS keys changed: {out.get('MAPPING')!r}"
+        assert out.get("NODECLS") == "True", "NODE_CLASS_MAPPINGS holds no node class"
+        assert out.get("LOADED") == "True", \
+            "reading NODE_CLASS_MAPPINGS did not load the adapter — registration is broken"
+        r.ok("PORT-6: engine import is adapter-free and comfy-free; node registration intact")
+    except Exception as e:
+        r.fail("PORT-6 adapter-free import", f"{type(e).__name__}: {e}")
+
+
+def test_v035_port6_routes_still_register_under_comfyui(r):
+    """PORT-6 (the other side): the route block must still run when ComfyUI IS the host.
+
+    The routes are now gated on `"server" in sys.modules` — a membership test that imports
+    nothing. Under ComfyUI that is always true by the time custom nodes load (`server` is
+    imported and `PromptServer.instance` exists long before `nodes.init_extra_nodes()`), so
+    the routes register exactly as before. This drives a fresh interpreter with a STUB
+    `server` in `sys.modules` and asserts the TEX routes were actually registered — the
+    guard against 'made it lazy, silently lost the API surface'."""
+    import subprocess
+    import sys as _sys
+    import TEX_Wrangle
+
+    custom_nodes = str(pathlib.Path(TEX_Wrangle.__file__).resolve().parent.parent)
+    code = (
+        "import sys, types\n"
+        f"sys.path.insert(0, {custom_nodes!r})\n"
+        "try:\n"
+        "    import aiohttp  # the route block needs it; skip cleanly if absent\n"
+        "except Exception:\n"
+        "    print('SKIP no-aiohttp'); raise SystemExit(0)\n"
+        "reg = []\n"
+        "class _R:\n"
+        "    def get(self, p):\n"
+        "        def d(f):\n"
+        "            reg.append(('GET', p)); return f\n"
+        "        return d\n"
+        "    def post(self, p):\n"
+        "        def d(f):\n"
+        "            reg.append(('POST', p)); return f\n"
+        "        return d\n"
+        "stub = types.ModuleType('server')\n"
+        "stub.PromptServer = type('PS', (), {'instance': types.SimpleNamespace(routes=_R())})\n"
+        "sys.modules['server'] = stub\n"
+        "import TEX_Wrangle\n"
+        "print('ROUTES', len(reg))\n"
+        "print('SNIPPETS', any(p == '/tex_wrangle/snippets' for _, p in reg))\n"
+    )
+    try:
+        proc = subprocess.run([_sys.executable, "-X", "utf8", "-c", code],
+                              capture_output=True, text=True, timeout=180)
+        if proc.returncode != 0:
+            r.fail("PORT-6 routes under ComfyUI",
+                   f"subprocess exit {proc.returncode}: {(proc.stderr or '')[-400:]}")
+            return
+        text = proc.stdout.strip()
+        if "SKIP" in text:
+            r.ok("PORT-6 routes: skipped (aiohttp absent in this environment)")
+            return
+        out = dict(line.split(" ", 1) for line in text.splitlines() if " " in line)
+        assert int(out.get("ROUTES", "0")) > 0, \
+            "no TEX routes registered with a ComfyUI-like host present (the gate is too tight)"
+        assert out.get("SNIPPETS") == "True", "the /tex_wrangle/snippets route did not register"
+        r.ok(f"PORT-6: {out['ROUTES']} routes still register when ComfyUI is the host")
+    except Exception as e:
+        r.fail("PORT-6 routes under ComfyUI", f"{type(e).__name__}: {e}")

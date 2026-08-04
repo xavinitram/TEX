@@ -95,7 +95,21 @@ files — `tex_node.py`, `__init__.py`, `tex_runtime/host.py`; **every other mod
 `tex_core`** and imports no ComfyUI surface (`comfy*`/`server`/`folder_paths`/`nodes`).
 This is machine-enforced by `test_s1_core_no_comfy` (a package-level lint) and exercised
 by `test_s1_comfyui_free_execution` (blocks every comfy import, then drives
-`TEXWrangleNode.execute` + `tex_api.compile`). The whole suite already runs ComfyUI-free
+`TEXWrangleNode.execute` + `tex_api.compile`).
+
+**PORT-6 (v0.35) closed the lint's blind spot: the package ROOT.** S-1 proves no `tex_core`
+module *imports* a ComfyUI surface; it could not stop `__init__.py` from doing so on every
+importer's behalf. Two lines did: `from .tex_node import TEXWrangleNode` at module scope, and
+the route block's `from server import PromptServer` (ComfyUI's `server` imports `nodes`, which
+imports `comfy`). So `import TEX_Wrangle.tex_api` — the entry a SECOND host uses — loaded the
+adapter, and on any machine with ComfyUI merely on `sys.path` it loaded ComfyUI too. Now
+`NODE_CLASS_MAPPINGS` is built on first access (PEP 562 module `__getattr__`) and the route
+block is gated on a non-importing `"server" in sys.modules` test. ComfyUI is unaffected — its
+loader reads `NODE_CLASS_MAPPINGS` immediately after executing the module, so the adapter still
+loads during registration and an import error there still surfaces at load time. Pinned from
+both sides by `test_v035_port6_engine_import_is_adapter_free` (a ComfyUI-free subprocess: the
+adapter stays unloaded, no comfy import is even attempted, and reading the mapping still yields
+the node) and `test_v035_port6_routes_still_register_under_comfyui`. The whole suite already runs ComfyUI-free
 (comfy is not on the CI path), so CI **is** the standalone lane — the payoff of a physical
 `tex_core/` package split without the churn. The physical `git mv` reroot is deferred to a
 live-ComfyUI session (import-path verification can't be done headlessly); the manifest above
