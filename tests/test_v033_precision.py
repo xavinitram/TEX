@@ -271,13 +271,21 @@ def test_v033_prec1_choose_storage_is_the_only_decision_point(r):
         (dict(quality=tex_packing.PREVIEW), tex_packing.FP16),
         (dict(quality=tex_packing.PREVIEW, storage="fp32"), None),
         (dict(quality="PREVIEW"), None),            # tags are exact strings, not case-folded
+        # mask_eligible is just another argument: pure and exact-match like the rest.
+        (dict(quality=tex_packing.PREVIEW, kind="MASK", mask_eligible=True), tex_packing.FP16),
     ]
     bad = [(kw, tex_packing.choose_storage(f, **kw)) for kw, want in cases
            if tex_packing.choose_storage(f, **kw) is not want]
     stable = all(tex_packing.choose_storage(f, quality=tex_packing.PREVIEW) == tex_packing.FP16
                  for _ in range(5))
-    r.ok("PREC-1: choose_storage is pure, exact-match, and stable across calls") \
-        if not bad and stable else r.fail("PREC-1 choose", f"{bad} stable={stable}")
+    stable_knob = all(
+        tex_packing.choose_storage(f, quality=tex_packing.PREVIEW, kind="MASK",
+                                    mask_eligible=True) == tex_packing.FP16
+        for _ in range(5))
+    r.ok("PREC-1: choose_storage is pure, exact-match, and stable across calls, "
+         "including with mask_eligible") \
+        if not bad and stable and stable_knob else \
+        r.fail("PREC-1 choose", f"{bad} stable={stable} stable_knob={stable_knob}")
 
 
 # ── §2.1 decisions 3 and 5 (doc 41) ───────────────────────────────────────────
@@ -311,6 +319,135 @@ def test_v033_prec1_kind_reaches_the_cache(r):
         r.ok("PREC-1: put(kind=…) packs an IMAGE and refuses a MASK") if ok else \
             r.fail("PREC-1 kind put", f"img={c._ram['img'].orig_dtype} "
                                       f"msk={c._ram['msk'].orig_dtype}")
+
+
+# ── mask_eligible: a per-put opt-in that widens the kind gate for MASK only ───
+
+def test_v033_prec1_mask_eligible_knob_matrix(r):
+    """The whole truth table for `mask_eligible`, on a genuine rank-3 `[1,32,32]` mask —
+    ComfyUI's own MASK shape, with no channel dimension. The knob widens exactly ONE thing:
+    `kind="MASK"` past the kind gate, and only when quality/storage/range already agree the
+    frame may pack. Every other kind, and every other gate, must see it not at all."""
+    P, F = tex_packing.PREVIEW, tex_packing.FINAL
+    m = _frame(res=32, c=1).squeeze(-1)                     # [1,32,32], values in [0,1]
+    hi = _frame(res=32, c=1, scale=7e4).squeeze(-1)         # [1,32,32], values in [0,7e4]
+    cases = {
+        "MASK+knob+PREVIEW packs":
+            (dict(quality=P, kind="MASK", mask_eligible=True), tex_packing.FP16),
+        "MASK+knob+FINAL stays refused":
+            (dict(quality=F, kind="MASK", mask_eligible=True), None),
+        "MASK+knob+untagged stays refused":
+            (dict(quality=None, kind="MASK", mask_eligible=True), None),
+        "MASK+knob+fp32 pin stays refused":
+            (dict(quality=P, kind="MASK", mask_eligible=True, storage="fp32"), None),
+        "LATENT+knob is still data":
+            (dict(quality=P, kind="LATENT", mask_eligible=True), None),
+        "INT+knob is still data":
+            (dict(quality=P, kind="INT", mask_eligible=True), None),
+        "STRING+knob is still data":
+            (dict(quality=P, kind="STRING", mask_eligible=True), None),
+        "ARRAY+knob is still data":
+            (dict(quality=P, kind="ARRAY", mask_eligible=True), None),
+        "IMAGE+knob is a no-op":
+            (dict(quality=P, kind="IMAGE", mask_eligible=True), tex_packing.FP16),
+        "unknown-kind+knob is a no-op":
+            (dict(quality=P, kind=None, mask_eligible=True), tex_packing.FP16),
+    }
+    bad = {name: (tex_packing.choose_storage(m, **kw), want)
+           for name, (kw, want) in cases.items()
+           if tex_packing.choose_storage(m, **kw) is not want}
+    uint16_ok = (tex_packing.choose_storage(m, quality=P, kind="MASK", mask_eligible=True,
+                                             storage="uint16") == tex_packing.UINT16
+                 and tex_packing.choose_storage(m * 2, quality=P, kind="MASK",
+                                                 mask_eligible=True, storage="uint16") is None)
+    hi_ok = tex_packing.choose_storage(hi, quality=P, kind="MASK", mask_eligible=True) is None
+    r.ok("mask_eligible: the knob matrix matches the design's truth table exactly") \
+        if not bad and uint16_ok and hi_ok else \
+        r.fail("mask_eligible knob matrix", f"bad={bad} uint16_ok={uint16_ok} hi_ok={hi_ok}")
+
+
+def test_v033_prec1_mask_eligible_packs_through_put(r):
+    """The knob reaches `ResultCache.put` end to end: a MASK put with `mask_eligible=True`
+    packs to fp16 and reads back within half an fp16 ULP on [0.5,1) — the same envelope
+    PREC-1 already ships for IMAGE (K2)."""
+    with tempfile.TemporaryDirectory() as d:
+        c = _cache(d)
+        m = _frame(res=32, c=1).squeeze(-1)                 # [1,32,32]
+        c.put("m", m, quality=tex_packing.PREVIEW, kind="MASK", mask_eligible=True)
+        entry = c._ram["m"]
+        got = c.get("m")
+        maxdiff = float((got - m).abs().max())
+        ok = (entry.tensor.dtype is torch.float16 and entry.orig_dtype is torch.float32
+              and got.dtype is torch.float32 and maxdiff <= 2.45e-4)
+        r.ok(f"mask_eligible: an opted-in MASK put packs to fp16, reads back at "
+             f"{maxdiff:.2e} (<= 2.45e-4)") if ok else \
+            r.fail("mask_eligible put", f"dtype={entry.tensor.dtype} orig={entry.orig_dtype} "
+                                        f"got={got.dtype} maxdiff={maxdiff:.3e}")
+
+
+def test_v033_prec1_mask_eligible_guard_default_refuses(r):
+    """Guard row (K3): with the knob absent — the call shape every caller before it existed
+    uses — a MASK put stays float32 for a genuine rank-3 `[1,32,32]` mask AND the rank-4
+    `[1,32,32,1]` shape `test_v033_prec1_kind_reaches_the_cache` already covers. The default
+    must not move for either shape."""
+    with tempfile.TemporaryDirectory() as d:
+        c = _cache(d)
+        m3 = _frame(res=32, c=1).squeeze(-1)                # [1,32,32]
+        m4 = _frame(res=32, c=1)                            # [1,32,32,1]
+        c.put("m3", m3, quality=tex_packing.PREVIEW, kind="MASK")
+        c.put("m4", m4, quality=tex_packing.PREVIEW, kind="MASK")
+        ok = (c._ram["m3"].tensor.dtype is torch.float32 and c._ram["m3"].orig_dtype is None
+              and c._ram["m4"].tensor.dtype is torch.float32 and c._ram["m4"].orig_dtype is None)
+        r.ok("mask_eligible: a MASK put with no knob stays float32, rank-3 and rank-4 alike") \
+            if ok else r.fail("mask_eligible guard",
+                               f"m3={c._ram['m3'].tensor.dtype}/{c._ram['m3'].orig_dtype} "
+                               f"m4={c._ram['m4'].tensor.dtype}/{c._ram['m4'].orig_dtype}")
+
+
+def test_v033_prec1_mask_eligible_patch_region_ratchet(r):
+    """`patch_region` gained no knob of its own — it ratchets on the base's STORED
+    representation (v0.33.2 H3), so a patch over a mask that came in through `mask_eligible`
+    packs exactly like a patch over a packed IMAGE, and becomes discoverable by
+    `preview_entries()` for the idle requalifier to reach (K4). The unopted-in MASK row this
+    same ratchet defends (`test_v0332_h3_the_ratchet_never_packs_a_frame_put_refused_to_pack`)
+    asserts the no-knob case, which nothing here moves."""
+    with tempfile.TemporaryDirectory() as d:
+        c = _cache(d)
+        m = _frame(res=32, c=1).squeeze(-1)                 # [1,32,32]
+        c.put("base", m, quality=tex_packing.PREVIEW, kind="MASK", mask_eligible=True)
+        patch = torch.zeros(1, 8, 8)
+        out = c.patch_region("mp", patch, (4, 4, 8, 8, 32, 32), base_key="base")
+        entry = c._ram.get("mp")
+        ok = (out is not None and entry is not None
+              and entry.tensor.dtype is torch.float16 and entry.orig_dtype is torch.float32
+              and entry.quality == tex_packing.PREVIEW
+              and "mp" in c.preview_entries())
+        r.ok("mask_eligible: patch_region over a knob-packed mask packs and is preview-listed") \
+            if ok else r.fail("mask_eligible patch_region",
+                               f"out={out is not None} entry={entry}")
+
+
+def test_v033_prec1_mask_eligible_survives_the_disk_spill_tier(r):
+    """The disk-spill round trip (the same pattern as `..._survives_the_disk_spill_tier`) is
+    where a representation leak would be intermittent — visible only under memory pressure.
+    A knob-packed mask must come back fp32, bit-identical to what it read before it spilled,
+    exactly like a knob-packed IMAGE already does (K5)."""
+    with tempfile.TemporaryDirectory() as d:
+        m = _frame(res=32, c=1).squeeze(-1)                 # [1,32,32]
+        c = _cache(d, budget_mb=0)                          # every insert evicts the previous
+        c.put("a", m, quality=tex_packing.PREVIEW, kind="MASK", mask_eligible=True)
+        pre_spill = c.get("a")
+        c.put("b", m)                                       # forces "a" out to disk
+        got = c.get("a")
+        entry = c._ram.get("a")
+        ok = (c.spills >= 1 and got is not None and got.dtype is torch.float32
+              and entry is not None and entry.tensor.dtype is torch.float16
+              and entry.orig_dtype is torch.float32
+              and torch.equal(got, pre_spill))
+        r.ok("mask_eligible: a knob-packed mask round-trips the disk tier, bit-identical") \
+            if ok else r.fail("mask_eligible spill",
+                               f"spills={c.spills} got={None if got is None else got.dtype} "
+                               f"equal={got is not None and torch.equal(got, pre_spill)}")
 
 
 def test_v033_prec1_preview_is_viral(r):

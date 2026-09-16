@@ -65,7 +65,8 @@ WHAT IS NOT DECIDED HERE, and must not be:
     distinction the split needs at this scale:
 
         IMAGE   colour data, display-referred or scene-linear   -> eligible
-        MASK    a coverage/alpha channel; thresholds ride on it -> never packed
+        MASK    a coverage/alpha channel; thresholds ride on it -> never packed, unless a
+                                                                     host opts in per put
         LATENT  sampler input; not colour in any sense (M-3 already forces it fp32)  -> never
 
     So `choose_storage` takes `kind=`, and the caller that knows passes it. It stays a PURE
@@ -175,7 +176,7 @@ def q8(t):
     return (t.clamp(0.0, 1.0) / Q8_QUANTUM).round().to(torch.int16)
 
 
-def choose_storage(t, *, quality=None, storage=None, kind=None):
+def choose_storage(t, *, quality=None, storage=None, kind=None, mask_eligible=False):
     """The storage representation `t` should be kept as, or None for "store as cooked".
 
     Returns one of `REDUCED` (a `tex_io.STORAGE_DTYPES` name) or None.
@@ -188,6 +189,11 @@ def choose_storage(t, *, quality=None, storage=None, kind=None):
                LATENT / ... This is the colour-vs-data split, at the seam that already knows
                it. `None` means the caller did not say, which stays eligible: `PREVIEW` is
                opt-in and the range gate still applies.
+    `mask_eligible`  a host's per-put statement that THIS mask may take the preview tier —
+               the only thing that can move `kind="MASK"` past the kind gate below. It widens
+               eligibility only: the tier gate (`quality`), the pin (`storage="fp32"`), and
+               every other DATA kind (LATENT / INT / STRING / ARRAY) are exactly as before.
+               Ignored unless `kind == "MASK"`; the default `False` reproduces today's refusal.
 
     PURE in its arguments — no globals, no device query, no sniffing the tensor to guess a
     role. That is what makes a tier reproducible across a restart and reportable in a bug
@@ -201,7 +207,9 @@ def choose_storage(t, *, quality=None, storage=None, kind=None):
     if storage in _PINS:
         return None                           # an explicit pin: store as cooked, at any tier
     if kind is not None and kind not in COLOR_KINDS:
-        return None                           # MASK / LATENT / a scalar wire: data, never packed
+        if not (mask_eligible and kind == "MASK"):
+            return None                       # LATENT / a scalar wire: always data, never
+                                               # packed; MASK only when a host opts in per put
     # THE GATE, and it is the tier tag, not the storage hint. `storage=` selects WHICH reduced
     # representation; it never grants permission to use one. Without this ordering a caller
     # could reduce a FINAL frame by naming a codec, which is precisely the contract the whole

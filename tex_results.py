@@ -499,7 +499,7 @@ class ResultCache:
 
     # ── core API ──
     def put(self, key: str, tensor, *, canvas=None, quality=None, storage=None,
-            kind=None, home=None) -> None:
+            kind=None, home=None, mask_eligible=False) -> None:
         """Store `tensor` under `key`, frozen per ENG-12 (an in-place write to a cached frame
         then raises instead of silently corrupting it). Re-inserting a key replaces it.
 
@@ -509,7 +509,9 @@ class ResultCache:
         else, INCLUDING the default None, stores exactly what was cooked. `storage="fp32"`
         pins a frame at full precision regardless. `kind` is the output KIND
         (`tex_marshalling.map_inferred_type` — IMAGE / MASK / LATENT / ...): the colour-vs-data
-        split, taken from the seam that already classifies it. MASK and LATENT are never packed.
+        split, taken from the seam that already classifies it. MASK and LATENT are never
+        packed — unless a host passes `mask_eligible=True`, which admits a MASK only; LATENT
+        stays refused regardless.
 
         Storage precision is not visible through this class: `get` returns the cooked dtype
         either way. It is visible in the BYTES, which is the point, and in the pixels to the
@@ -521,7 +523,8 @@ class ResultCache:
         if not isinstance(tensor, torch.Tensor):
             return
         from . import tex_packing
-        want = tex_packing.choose_storage(tensor, quality=quality, storage=storage, kind=kind)
+        want = tex_packing.choose_storage(tensor, quality=quality, storage=storage, kind=kind,
+                                           mask_eligible=mask_eligible)
         # CF-1: `home=` forwards the caller's statement of where this frame BELONGS. Only
         # `patch_region` passes one (the base's home); everything else leaves it None and
         # `_admit` derives it from where the tensor is, which is right for a freshly cooked

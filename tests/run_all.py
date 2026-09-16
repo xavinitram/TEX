@@ -995,6 +995,11 @@ def main():
         test_v033_prec1_choose_storage_is_the_only_decision_point,
         test_v033_prec1_colour_data_split_at_the_kind_seam,
         test_v033_prec1_kind_reaches_the_cache,
+        test_v033_prec1_mask_eligible_knob_matrix,
+        test_v033_prec1_mask_eligible_packs_through_put,
+        test_v033_prec1_mask_eligible_guard_default_refuses,
+        test_v033_prec1_mask_eligible_patch_region_ratchet,
+        test_v033_prec1_mask_eligible_survives_the_disk_spill_tier,
         test_v033_prec1_preview_is_viral,
     )
     test_v033_prec1_default_put_is_unchanged(r)
@@ -1011,6 +1016,11 @@ def main():
     test_v033_prec1_choose_storage_is_the_only_decision_point(r)
     test_v033_prec1_colour_data_split_at_the_kind_seam(r)
     test_v033_prec1_kind_reaches_the_cache(r)
+    test_v033_prec1_mask_eligible_knob_matrix(r)
+    test_v033_prec1_mask_eligible_packs_through_put(r)
+    test_v033_prec1_mask_eligible_guard_default_refuses(r)
+    test_v033_prec1_mask_eligible_patch_region_ratchet(r)
+    test_v033_prec1_mask_eligible_survives_the_disk_spill_tier(r)
     test_v033_prec1_preview_is_viral(r)
 
     # v0.33 CACHE-8 — deep cache tiers: the residency ladder, the packing choices, and the
