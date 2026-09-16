@@ -101,6 +101,26 @@ What each row pins:
                              ways — bounded by the same band, while a window on its OWN tier
                              stays bit-exact against the crop. MUTATION: a promotion 2x past
                              the simplex band must turn the envelope and both pair rows red.
+
+Where no band applies, a host declines the mix instead, and for that it needs to know which tier
+cooked a frame: `tex_engine.cook(..., want_noise_tiers=True)` fills `CookResult.noise_tiers`
+(the contract is in `tex_runtime/tier_trace.py`). Three rows pin that record:
+  * tier_record_across_the_promotion — PROVENANCE, per device, in a fresh process: each cook's
+                             record names the tier that served it, read off the cache with
+                             `_tier_of`, and flips where the promotion lands; a program calling
+                             simplex four times straddles the promotion inside one cook and
+                             reads None, with a reason naming both tiers; four tiered keys file
+                             four labels; and the same cooks unasked render the same digests on
+                             the same tiers with the field left None.
+  * tier_record_forced     — the same record with each tier FORCED on CPU, so every box runs it:
+                             promoted from cook #4, a straddling cook None, a promotion that
+                             raises "promotion_failed" in the cook it failed in (a failure is not
+                             a mix), a trace that never settles "eager", and a strategy other than
+                             "default" None.
+  * tier_record_default_path — INVARIANT 7: unasked or False the field is None, asked with no noise
+                             it is {}, the pixels are identical either way, a cook that raised
+                             while asked leaves nothing armed for the next one, and `tex_node`
+                             never asks.
 """
 import inspect
 import json
@@ -888,3 +908,395 @@ def test_v031_noise_promotion_failure_recorded(r: SubTestResult):
         r.ok("a swallowed torch.compile promotion failure is now recorded (naming the real "
              "exception), never counted as a compile, leaves the incumbent trace tier "
              "serving the key, and reads unavailable/measured in capabilities()")
+
+
+# ── The per-cook tier record (`want_noise_tiers`) ───────────────────────────────────────────────
+#
+# A host compositing a region recook over a cached frame patches only when the two cooks' records
+# are dicts and equal, and cooks whole otherwise. So the record must name the tier that ACTUALLY
+# served — read off the cache with `_tier_of`, never inferred from pixels — and asking for it must
+# move neither a pixel nor the promotion. Programs are embedded into the children with repr(),
+# as the promotion-failure child above does.
+
+# Four calls to ONE key in one cook: in a fresh cache the fourth call is the promotion.
+_FOUR_CALL_PROG = ("float a = simplex(u*800.0, v*800.0);\n"
+                   "float b = simplex(u*400.0, v*400.0);\n"
+                   "float c = simplex(u*200.0, v*200.0);\n"
+                   "float d = simplex(u*100.0, v*100.0);\n"
+                   "@OUT = vec4(vec3(a + b + c + d), 1.0);")
+# One call to each of four tiered keys: two fbm octave counts and both worley flavours.
+_LABELS_PROG = ("float a = fbm(u*4.0, v*4.0, 4);\n"
+                "float b = fbm(u*4.0, v*4.0, 6);\n"
+                "float c = worley_f1(u*8.0, v*8.0);\n"
+                "float d = worley_f2(u*8.0, v*8.0);\n"
+                "@OUT = vec4(a, b, c, d);")
+
+_RECORD_HEAD = _CHILD_HEAD + r'''
+dev = sys.argv[3]
+key, cache = device_key(dev), noise._simplex_cache
+SIMPLEX = ''' + repr(_SIMPLEX_PROG) + r'''
+FOUR_CALLS = ''' + repr(_FOUR_CALL_PROG) + r'''
+LABELS = ''' + repr(_LABELS_PROG) + r'''
+torch.manual_seed(5)
+img = torch.rand(1, 24, 32, 4, device=dev)          # the parity child's frame
+
+def clear_simplex():
+    cache.cache.clear(); cache._settled.clear()
+    cache._compile_attempted.clear(); cache._call_count.clear()
+
+def emit(leg, n, prog, keys=None, **kw):
+    # One ROW per cook: the record; why a requested record is None; the tier each key's cache
+    # holds afterwards, under the name the record files it by; the promotion failures this cook
+    # recorded; the frame's digest.
+    keys = keys or {"simplex": (cache, key)}
+    for i in range(1, n + 1):
+        failures = len(tier_trace.noise_compile_failures())
+        res = tex_engine.cook(prog, {"A": img}, device_mode=dev, precision="fp32", **kw)
+        print("ROW " + json.dumps({
+            "leg": leg, "cook": i, "device": str(key), "record": res.noise_tiers,
+            "reason": tier_trace.last_noise_tiers()[1],
+            "tiers": {name: _tier_of(c, k) for name, (c, k) in keys.items()},
+            "failures": len(tier_trace.noise_compile_failures()) - failures,
+            "digest": digest(res.outputs["OUT"])}), flush=True)
+'''
+
+_RECORD_REAL_CHILD = _RECORD_HEAD + r'''
+emit("armed", 5, SIMPLEX, want_noise_tiers=True)      # first in a fresh process: the honest form
+clear_simplex()
+emit("unarmed", 5, SIMPLEX)                           # the same five cooks, never asked
+emit("declined", 1, SIMPLEX, want_noise_tiers=False)
+clear_simplex()
+emit("four_calls", 2, FOUR_CALLS, want_noise_tiers=True)
+emit("labels", 1, LABELS, want_noise_tiers=True,
+     keys={"fbm/4": (noise._fbm_cache, (4, key)), "fbm/6": (noise._fbm_cache, (6, key)),
+           "worley/False": (noise._worley_cache, (False, key)),
+           "worley/True": (noise._worley_cache, (True, key))})
+'''
+
+_RECORD_FORCED_CHILD = _RECORD_HEAD + r'''
+# 1. A strategy other than "default" reads None even when noise ran on this thread: the
+#    torch_compile strategy is routed to the default body here, so only the gate can say None.
+clear_simplex()
+select_tier, method = tex_engine.select_tier, tex_engine._TIER_METHOD["torch_compile"]
+tex_engine.select_tier = lambda *a, **k: "torch_compile"
+tex_engine._TIER_METHOD["torch_compile"] = tex_engine._run_default
+try:
+    emit("gated", 1, SIMPLEX, want_noise_tiers=True)
+finally:
+    tex_engine.select_tier, tex_engine._TIER_METHOD["torch_compile"] = select_tier, method
+emit("ungated", 1, SIMPLEX, want_noise_tiers=True)
+
+# 2. A signature that never settles demotes the key, and the eager body serves.
+clear_simplex()
+bitwise_same = noise._bitwise_same
+noise._bitwise_same = lambda a, b: False
+try:
+    emit("eager", 2, SIMPLEX, want_noise_tiers=True)
+finally:
+    noise._bitwise_same = bitwise_same
+
+# 3. The promotion installing "incumbent + 0": no toolchain needed, so every box runs it.
+clear_simplex()
+promote_to_mutant(0.0)
+emit("forced", 5, SIMPLEX, want_noise_tiers=True)
+clear_simplex()
+emit("forced_four_calls", 2, FOUR_CALLS, want_noise_tiers=True)
+
+# 4. The promotion RAISING — the stand-in for a compiler failure the promotion-failure row uses.
+def _boom(device):
+    raise RuntimeError("C1083: cannot open compiler generated file")
+noise._compile_simplex = _boom
+clear_simplex()
+emit("failed", 5, SIMPLEX, want_noise_tiers=True)
+clear_simplex()
+emit("failed_four_calls", 2, FOUR_CALLS, want_noise_tiers=True)
+'''
+
+
+def _record_legs(script, dev):
+    """({leg: [row, ...]}, error) from one fresh process running `script` on `dev`."""
+    with cold_engine_state() as cold:
+        out, err = _run_child(script, [cold.dir, dev])
+    if err:
+        return None, err
+    legs = {}
+    for line in out.splitlines():
+        if line.startswith("ROW "):
+            row = json.loads(line[len("ROW "):])
+            legs.setdefault(row["leg"], []).append(row)
+    return legs, None
+
+
+def _served_record(row):
+    """The record a cook must carry when every call it made to a key served the tier that key's
+    cache holds afterwards — true of any cook that does not straddle a promotion. A cook whose
+    promotion attempt raised served jit.trace, and says which of the two it was."""
+    return {f"{name}@{row['device']}": ("promotion_failed" if tier == "trace" and row["failures"]
+                                        else tier)
+            for name, tier in row["tiers"].items()}
+
+
+def _straddle_problem(row, label):
+    """Why a cook that crossed the promotion mid-cook is misreported, or None: its record must be
+    None (no single tier served it), with a reason naming the label and both tiers."""
+    reason = row["reason"] or ""
+    if row["record"] is None and all(s in reason for s in (label, "trace", "promoted")):
+        return None
+    return (f"cook #{row['cook']} served trace and promoted but recorded {row['record']!r} "
+            f"(reason {reason!r})")
+
+
+def test_v031_noise_tier_record_across_the_promotion(r: SubTestResult):
+    """PROVENANCE, per device, in a fresh process with the real tiers: `want_noise_tiers=True`.
+
+    Each of five cooks records the tier that served it, and the record flips exactly where the
+    cache's own tier flips — at cook #4 wherever the compile tier engages, so the last jit.trace
+    record and the first promoted one differ and a host declines that pair. On CPU the row states
+    whatever this box's toolchain made of the promotion. A program calling simplex four times
+    crosses the promotion inside its first cook: that record is None, with a reason naming both
+    tiers, and the next cook's is promoted. Four tiered keys in one cook file four labels. And the
+    same five cooks, unasked and in the same process from a cleared cache, render the same digests
+    on the same tiers with `noise_tiers` left None.
+    """
+    print("\n--- NOISE-TIER record: which tier served each cook (want_noise_tiers) ---")
+    for dev in ["cpu"] + (["cuda"] if _CUDA else []):
+        legs, err = _record_legs(_RECORD_REAL_CHILD, dev)
+        if err:
+            r.fail(f"tier record ({dev})", err)
+            continue
+        armed = legs.get("armed", [])
+        if len(armed) != _N_COOKS:
+            r.fail(f"tier record ({dev})", f"the child emitted {len(armed)} armed cooks")
+            continue
+        label = f"simplex@{armed[0]['device']}"
+        tiers = [row["tiers"]["simplex"] for row in armed]
+        records = [row["record"] for row in armed]
+
+        wrong = [f"cook #{row['cook']} recorded {row['record']!r}, the cache served "
+                 f"{_served_record(row)!r}" for row in armed if row["record"] != _served_record(row)]
+        if wrong:
+            r.fail(f"tier record per cook ({dev})", "; ".join(wrong))
+        else:
+            r.ok(f"{dev}: each of {_N_COOKS} cooks records the tier that served it: "
+                 + ", ".join(str(rec[label]) for rec in records))
+            if "promoted" in tiers:
+                flip = tiers.index("promoted") + 1
+                if flip != _COMPILE_AFTER + 1 or set(tiers[flip - 1:]) != {"promoted"}:
+                    r.fail(f"tier record across the promotion ({dev})",
+                           f"the tiers ran {tiers}; the promotion belongs on cook "
+                           f"#{_COMPILE_AFTER + 1} and holds from there")
+                elif records[flip - 2] == records[flip - 1]:
+                    r.fail(f"tier record across the promotion ({dev})",
+                           f"cooks #{flip - 1} and #{flip} straddle the promotion but their records "
+                           f"compare equal ({records[flip - 1]!r}) — a host could not decline the mix")
+                else:
+                    r.ok(f"{dev}: the record flips {records[flip - 2][label]} -> promoted at cook "
+                         f"#{flip}, where the promotion lands, so a host declines that pair")
+            elif dev == "cuda":
+                r.skip(f"tier record across the promotion ({dev})",
+                       "the compile tier does not engage here, so there is no flip to record")
+            else:
+                r.ok(f"cpu: the promotion did not install on this box's toolchain; the record "
+                     f"states {sorted({rec[label] for rec in records})} throughout")
+
+        # INVARIANT 7: unasked and asked-False, the field stays None and nothing else moves.
+        unarmed, declined = legs.get("unarmed", []), legs.get("declined", [])
+        moved = [f"cook #{a['cook']}: asked {a['tiers']['simplex']}/{a['digest']}, unasked "
+                 f"{u['tiers']['simplex']}/{u['digest']}"
+                 for a, u in zip(armed, unarmed) if (a["tiers"], a["digest"]) != (u["tiers"], u["digest"])]
+        filled = [row["record"] for row in unarmed + declined if row["record"] is not None]
+        if len(unarmed) != _N_COOKS or len(declined) != 1:
+            r.fail(f"tier record unasked ({dev})",
+                   f"the child emitted {len(unarmed)} unasked and {len(declined)} declined cooks")
+        elif moved or filled or declined[0]["digest"] != armed[-1]["digest"]:
+            r.fail(f"tier record unasked ({dev})",
+                   "; ".join(moved + [f"unasked records {filled}"] * bool(filled)) or
+                   f"want_noise_tiers=False rendered {declined[0]['digest']}, asked "
+                   f"{armed[-1]['digest']}")
+        else:
+            r.ok(f"{dev}: unasked (and want_noise_tiers=False) the field stays None, and the same "
+                 f"{_N_COOKS} cooks render the same digests on the same tiers as when asked")
+
+        four = legs.get("four_calls", [])
+        if len(four) != 2:
+            r.fail(f"four calls in one cook ({dev})", f"the child emitted {len(four)} cooks")
+        elif four[0]["tiers"]["simplex"] == "promoted":
+            problem = _straddle_problem(four[0], label)
+            if problem or four[1]["record"] != {label: "promoted"}:
+                r.fail(f"four calls in one cook ({dev})",
+                       problem or f"the cook after the straddle recorded {four[1]['record']!r}")
+            else:
+                r.ok(f"{dev}: four simplex calls cross the promotion inside cook #1, which reads "
+                     f"None ({four[0]['reason']}); cook #2 records promoted")
+        elif any(row["record"] != _served_record(row) for row in four):
+            r.fail(f"four calls in one cook ({dev})",
+                   f"no promotion engaged, yet the records read {[row['record'] for row in four]}")
+        elif dev == "cuda":
+            r.skip(f"four calls in one cook ({dev})", "the compile tier does not engage here")
+        else:
+            r.ok(f"cpu: no promotion engaged inside the four-call cook; its records state "
+                 f"{[row['record'] for row in four]}")
+
+        labels = legs.get("labels", [])
+        want = _served_record(labels[0]) if len(labels) == 1 else None
+        if want is None or labels[0]["record"] != want or set(want.values()) != {"trace"}:
+            r.fail(f"tier record labels ({dev})",
+                   f"expected four jit.trace labels {want!r}, recorded "
+                   f"{labels[0]['record'] if labels else None!r}")
+        else:
+            r.ok(f"{dev}: fbm(4), fbm(6), worley_f1 and worley_f2 in one cook file four labels, "
+                 f"each on jit.trace: {sorted(want)}")
+
+
+def test_v031_noise_tier_record_forced(r: SubTestResult):
+    """PROVENANCE with each tier FORCED, on CPU in a fresh process, so every box runs it.
+
+    The promotion forced to install "incumbent + 0" records jit.trace for cooks #1-3 and promoted
+    from #4, and a four-call program straddling it reads None, then promoted. The promotion forced
+    to RAISE — through the same failure hook `tex_doctor.capabilities()` reads — records
+    "promotion_failed" in the cook it failed in and "trace" after it, and a four-call cook that
+    fails mid-cook reads "promotion_failed", not None: jit.trace served every call, so nothing
+    mixed. A trace that never settles records "eager". A strategy other than "default" reads None
+    with its reason, where the same cook on the default strategy records jit.trace.
+    """
+    print("\n--- NOISE-TIER record: forced promotion, failure, eager fallback and strategy gate ---")
+    legs, err = _record_legs(_RECORD_FORCED_CHILD, "cpu")
+    if err:
+        r.fail("tier record (forced)", err)
+        return
+    label = "simplex@cpu"
+
+    def records(leg):
+        return [row["record"] for row in legs.get(leg, [])]
+
+    gated = legs.get("gated", [])
+    if (records("gated") == [None] and "torch_compile" in (gated[0]["reason"] or "")
+            and records("ungated") == [{label: "trace"}]):
+        r.ok(f"a strategy other than default reads None ({gated[0]['reason']}); the same cook on "
+             f"the default strategy records trace")
+    else:
+        r.fail("tier record strategy gate",
+               f"gated {records('gated')} (reason {gated[0]['reason'] if gated else None!r}), "
+               f"ungated {records('ungated')}")
+
+    eager = legs.get("eager", [])
+    if records("eager") == [{label: "eager"}] * 2 and {row["tiers"]["simplex"] for row in eager} == {"eager"}:
+        r.ok("a trace that never settles records eager, the tier that served")
+    else:
+        r.fail("tier record eager", f"recorded {records('eager')}, cache "
+                                    f"{[row['tiers']['simplex'] for row in eager]}")
+
+    want = ([{label: "trace"}] * _COMPILE_AFTER
+            + [{label: "promoted"}] * (_N_COOKS - _COMPILE_AFTER))
+    forced = legs.get("forced", [])
+    if records("forced") == want and all(row["record"] == _served_record(row) for row in forced):
+        r.ok(f"forced promotion: trace for cooks #1-{_COMPILE_AFTER}, promoted from "
+             f"#{_COMPILE_AFTER + 1}, each agreeing with the cache")
+    else:
+        r.fail("tier record forced promotion",
+               f"recorded {records('forced')}, cache {[row['tiers']['simplex'] for row in forced]}")
+
+    straddle = legs.get("forced_four_calls", [])
+    problem = (_straddle_problem(straddle[0], label) if len(straddle) == 2
+               and straddle[0]["tiers"]["simplex"] == "promoted" else "the four-call cook did not promote")
+    if problem or straddle[1]["record"] != {label: "promoted"}:
+        r.fail("tier record forced straddle", problem or f"then {straddle[1]['record']!r}")
+    else:
+        r.ok(f"forced straddle: the four-call cook reads None ({straddle[0]['reason']}), the next "
+             f"records promoted")
+
+    failed = legs.get("failed", [])
+    want = ([{label: "trace"}] * _COMPILE_AFTER + [{label: "promotion_failed"}]
+            + [{label: "trace"}] * (_N_COOKS - _COMPILE_AFTER - 1))
+    if (records("failed") == want and [row["failures"] for row in failed] == [0] * _COMPILE_AFTER
+            + [1] + [0] * (_N_COOKS - _COMPILE_AFTER - 1)
+            and {row["tiers"]["simplex"] for row in failed} == {"trace"}):
+        r.ok(f"a promotion that raises records promotion_failed in cook #{_COMPILE_AFTER + 1}, the "
+             f"cook its one failure was reported in, and trace before and after")
+    else:
+        r.fail("tier record failed promotion",
+               f"recorded {records('failed')}, failures {[row['failures'] for row in failed]}, "
+               f"cache {[row['tiers']['simplex'] for row in failed]}")
+
+    failed_four = legs.get("failed_four_calls", [])
+    if (records("failed_four_calls") == [{label: "promotion_failed"}, {label: "trace"}]
+            and [row["failures"] for row in failed_four] == [1, 0]):
+        r.ok("a four-call cook whose promotion raises mid-cook records promotion_failed, not None "
+             "— jit.trace served every call — and the next cook records trace")
+    else:
+        r.fail("tier record failed straddle",
+               f"recorded {records('failed_four_calls')}, failures "
+               f"{[row['failures'] for row in failed_four]}")
+
+
+def test_v031_noise_tier_record_default_path(r: SubTestResult):
+    """INVARIANT 7 for `want_noise_tiers`, in-process and noise-free, so no tier state moves.
+
+    The keyword defaults False and `CookResult.noise_tiers` defaults None; a cook that does not
+    ask, or asks False, reads None, and one that asks with no tiered builtin reads {} — with the
+    same pixels all three ways. A cook that raises while asking must not leave the thread's record
+    armed past the next cook, or every later noise call would pay the armed path. And the ComfyUI
+    node never asks (the source canary every opt-in engine feature ships with).
+    """
+    print("\n--- NOISE-TIER record: invisible unless a host asks ---")
+    import dataclasses
+    from TEX_Wrangle import tex_engine
+    from TEX_Wrangle.tex_runtime import tier_trace
+    from TEX_Wrangle.tex_runtime.host import CookCancelled
+
+    fails = []
+    try:
+        keyword = inspect.signature(tex_engine.prepare).parameters.get("want_noise_tiers")
+        field = {f.name: f for f in dataclasses.fields(tex_engine.CookResult)}.get("noise_tiers")
+        if keyword is None or keyword.default is not False:
+            fails.append("prepare() has no want_noise_tiers keyword defaulting to False "
+                         f"(found {keyword})")
+        if field is None or field.default is not None:
+            fails.append("CookResult has no noise_tiers field defaulting to None "
+                         f"(found {getattr(field, 'default', field)!r})")
+
+        code, img = "@OUT = vec4(@A.rgb * 0.5, 1.0);", make_img(1, 16, 16, 4, seed=7)
+
+        def cook(**kw):
+            return tex_engine.cook(code, {"A": img}, device_mode="cpu", **kw)
+
+        plain, declined, asked = cook(), cook(want_noise_tiers=False), cook(want_noise_tiers=True)
+        if plain.noise_tiers is not None or declined.noise_tiers is not None:
+            fails.append(f"unasked {plain.noise_tiers!r}, False {declined.noise_tiers!r}: not None")
+        if asked.noise_tiers != {}:
+            fails.append(f"asked with no tiered builtin: {asked.noise_tiers!r}, not {{}}")
+        if not all(torch.equal(plain.outputs["OUT"], other.outputs["OUT"]) for other in (declined, asked)):
+            fails.append("asking for the record changed the pixels")
+
+        class _CancelOnSecondPoll:           # run() polls once on entry; the interpreter polls next
+            polls = 0
+
+            def check(self):
+                self.polls += 1
+                if self.polls > 1:
+                    raise CookCancelled("cancelled mid-cook")
+
+        try:
+            cook(want_noise_tiers=True, cancel=_CancelOnSecondPoll())
+            fails.append("the cancel token never fired, so the leak check below measures nothing")
+        except CookCancelled:
+            pass
+        after = cook()
+        if after.noise_tiers is not None:
+            fails.append(f"an unasked cook after the raising one read {after.noise_tiers!r}")
+        if tier_trace.take_noise_tiers() is not None:
+            fails.append("this thread's record was still armed after an unasked cook: the cook "
+                         "that raised while asking leaked it, or the unasked cook armed it")
+    except Exception as e:
+        fails.append(f"{type(e).__name__}: {e}")
+
+    node = (Path(__file__).resolve().parents[1] / "tex_node.py").read_text(encoding="utf-8")
+    if "noise_tiers" in node:
+        fails.append("tex_node.py mentions noise_tiers — the ComfyUI path must never ask")
+
+    if fails:
+        r.fail("tier record default path", "; ".join(fails))
+    else:
+        r.ok("want_noise_tiers defaults False and noise_tiers None; unasked/False read None, asked "
+             "with no noise {} — identical pixels; a raising cook leaves nothing armed; tex_node "
+             "never asks")

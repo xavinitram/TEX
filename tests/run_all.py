@@ -895,6 +895,9 @@ def main():
         test_v031_noise_cold_path_shape,
         test_v031_noise_promotion_envelope,
         test_v031_noise_promotion_failure_recorded,
+        test_v031_noise_tier_record_across_the_promotion,
+        test_v031_noise_tier_record_forced,
+        test_v031_noise_tier_record_default_path,
     )
     test_v031_noise_cold_frame_parity(r)
     test_v031_noise_resolution_dance(r)
@@ -903,6 +906,11 @@ def main():
     test_v031_noise_cold_path_shape(r)
     test_v031_noise_promotion_envelope(r)
     test_v031_noise_promotion_failure_recorded(r)  # BRIEF-4 C6
+    # The per-cook tier record a host reads before compositing across the promotion
+    # (want_noise_tiers -> CookResult.noise_tiers).
+    test_v031_noise_tier_record_across_the_promotion(r)
+    test_v031_noise_tier_record_forced(r)
+    test_v031_noise_tier_record_default_path(r)
 
     # v0.31 NOISE-SCALAR — a constant coordinate must render the same on every device.
     # (`fbm(u*8.0, v*8.0, 0.5, 4)` cooked on CPU and raised on CUDA: the GPU-only octave

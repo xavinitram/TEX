@@ -22,6 +22,8 @@ import math
 import threading
 import torch
 
+from . import tier_trace as _tier_trace   # a leaf (collections/threading only): no import cycle
+
 
 # Simplex skew/unskew constants
 _SKEW_2D = 0.5 * (math.sqrt(3.0) - 1.0)      # ~0.3660254
@@ -464,7 +466,7 @@ class _TieredCache:
             try:
                 dt = (device.type if isinstance(device, torch.device) else
                      ("cuda" if device == "cuda" else "cpu"))
-                _tt.record_noise_compile_failure(self.name, dt, e)
+                _tt.record_noise_compile_failure(self.name, dt, e, key=key)
             except Exception:
                 pass
         self._call_count.pop(key, None)
@@ -511,9 +513,16 @@ class _TieredCache:
             # always paying for two evaluations; it only changes which result is returned.
             self.store(key, trace_fn)
             fn = self.get(key)
-        if fn is None:
-            return eager_fn(*args)
-        return self._settle(key, fn, eager_fn, args)
+        out = eager_fn(*args) if fn is None else self._settle(key, fn, eager_fn, args)
+        # A host asked which tier served this cook (tier_trace's noise-tier record). Unasked,
+        # this attribute read is all a call pays. The tier is read off the callable that served,
+        # never off the result: eager if none was held or _settle just demoted the key.
+        if _tier_trace._noise_tiers.record is not None:
+            _tier_trace.note_noise_tier(
+                self.name, key,
+                "eager" if fn is None or self.cache.get(key) is False else
+                "trace" if isinstance(fn, torch.jit.ScriptFunction) else "promoted")
+        return out
 
     def _settle(self, key, fn, eager_fn, args):
         """Run `args` through `fn`, first settling a NEW (shape, dtype) signature.

@@ -11,6 +11,33 @@ fallback" for free.
 Thread-local because the auto-tier's background compile runs on a worker thread;
 each cook's record lives on the thread that produced its result. Recording is
 one attribute write per cook (never per-pixel) — perf-neutral.
+
+Noise-tier provenance (`tex_engine.prepare/cook(want_noise_tiers=True)` fills
+`CookResult.noise_tiers`). `noise._TieredCache` swaps a builtin's jit.trace callable
+for a torch.compile'd one on that key's fourth CALL — not cook — on the default path,
+for the life of the process, and the two agree only to a recorded envelope. A region
+recooked after the swap and composited over a frame cooked before it can carry a
+seam no band bounds (worley's follows its coordinates; a threshold amplifies any).
+So a host composites a patch onto a base only when BOTH records are dicts and EQUAL,
+and cooks whole otherwise — which is always correct. The record:
+
+  None  not requested; a tier strategy other than "default" (a compiled or captured
+        tier runs noise where this thread's record cannot see it); or some label
+        served more than one tier in the cook (a promotion landed mid-cook) —
+        `last_noise_tiers()` says which
+  {}    requested, default strategy, no tiered noise builtin called
+  {label: tier}, one label per cache key ("simplex@cuda:0", "fbm/6@cpu"), tier one of
+        "trace"             the jit.trace tier: every key's until its promotion, and for
+                            good where no compiler toolchain is present
+        "promoted"          the torch.compile tier the promotion installed
+        "promotion_failed"  jit.trace, in the cook whose promotion attempt raised (the
+                            exception is on `noise_compile_failures()`); later cooks
+                            read "trace" again
+        "eager"             the eager body: the trace could not be built, or a
+                            signature never settled
+
+Labels and tier words are for EQUALITY only, never parsed. Unrequested (every ComfyUI
+cook) the whole cost is one thread-local attribute read per tiered noise call.
 """
 import collections
 import threading
@@ -74,11 +101,17 @@ def noise_compiles():
 _noise_failure_ring = collections.deque(maxlen=16)
 
 
-def record_noise_compile_failure(name, device_type, exc):
+def record_noise_compile_failure(name, device_type, exc, key=None):
     """BRIEF-4: record that a noise fn's (`name`) torch.compile promotion failed on
-    `device_type` (`"cpu"` / `"cuda"`), with the exception that was raised and swallowed."""
+    `device_type` (`"cpu"` / `"cuda"`), with the exception that was raised and swallowed.
+
+    The one hook a failed promotion reaches, so the per-cook noise-tier record learns of it
+    here too: when a host asked for this cook's record, `key`'s label reads
+    "promotion_failed" for this cook (the ring entry above is unchanged)."""
     _noise_failure_ring.append({"noise": str(name), "device": str(device_type),
                                 "error": f"{type(exc).__name__}: {exc}"})
+    if key is not None and _noise_tiers.record is not None:
+        note_noise_tier(name, key, _PROMOTION_FAILED)
 
 
 def noise_compile_failures():
@@ -86,6 +119,64 @@ def noise_compile_failures():
     `tex_doctor.capabilities()`'s `noise_promotion@*` rows. Never touched by
     `noise_compiles()` — see the ring's own comment."""
     return list(_noise_failure_ring)
+
+
+# The per-cook noise-tier record (contract: the module docstring). Its own thread-local, whose
+# class attributes are the disarmed defaults, so the read `_TieredCache.call` pays on the default
+# path is one attribute lookup — no getattr default, no exception, on any thread.
+class _NoiseTiers(threading.local):
+    record = None              # None = not asked (the default); else {label: {tier: None}} in call order
+    last = (None, None)        # (record, why it is None) for this thread's last cook that asked
+
+
+_noise_tiers = _NoiseTiers()
+_PROMOTION_FAILED = "promotion_failed"
+
+
+def arm_noise_tiers():
+    """Start this thread's record for one cook. Called by `tex_engine.run` only when a host asked."""
+    _noise_tiers.record = {}
+    _noise_tiers.last = (None, None)
+
+
+def note_noise_tier(name, key, tier):
+    """File the `tier` that served (or, for a failed promotion, befell) a call to the tiered-noise
+    cache `name` under `key`. A no-op unless armed; the label is the cache name, the key's other
+    parts, and its device — every `_TieredCache` key ends in (or is) its device."""
+    record = _noise_tiers.record
+    if record is None:
+        return
+    *parts, device = key if isinstance(key, tuple) and key else (key,)
+    label = "/".join([str(name), *map(str, parts)]) + f"@{device}"
+    record.setdefault(label, {})[tier] = None
+
+
+def take_noise_tiers(tier_id="default"):
+    """Close this thread's record and return `CookResult.noise_tiers` for the cook that just ran
+    on the tier strategy `tier_id` (see the module docstring). Always disarms."""
+    record, _noise_tiers.record = _noise_tiers.record, None
+    result, reason = {}, None
+    if record is None:
+        result, reason = None, "disarmed mid-cook (a nested prepare/run on this thread)"
+    elif tier_id != "default":
+        result, reason = None, f"the {tier_id!r} strategy runs noise where this record cannot see it"
+    else:
+        for label, tiers in record.items():
+            served = [tier for tier in tiers if tier != _PROMOTION_FAILED]
+            if len(served) != 1:
+                result, reason = None, f"{label} served {', '.join(tiers)} in one cook"
+                break
+            failed = served[0] == "trace" and _PROMOTION_FAILED in tiers
+            result[label] = _PROMOTION_FAILED if failed else served[0]
+    _noise_tiers.last = (result, reason)
+    return result
+
+
+def last_noise_tiers():
+    """(record, reason) for the most recent cook on this thread that ASKED for its noise tiers —
+    a cook that did not ask leaves it alone — where the reason says why that record is None.
+    `(None, None)` before any cook asked, and while an asking cook is still running."""
+    return _noise_tiers.last
 
 
 def last():
@@ -149,3 +240,5 @@ def reset():
     _local.precision = None
     _local.probes = []
     _local.roi = None          # ROI-3: else CookResult.cooked_roi could read a PRIOR cook's window
+    if _noise_tiers.record is not None:   # a cook that raised while asked: disarm (unasked, a check)
+        _noise_tiers.record = None

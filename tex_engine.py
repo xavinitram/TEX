@@ -274,6 +274,7 @@ class CookPlan:
     # upstream edge yet).
     want_lineage: bool = False
     upstream_keys: tuple = ()
+    want_noise_tiers: bool = False     # fill CookResult.noise_tiers; off, run() pays one test
 
     @property
     def fused_chain(self) -> bool:
@@ -309,6 +310,10 @@ class CookResult:
     # told. None on every fallback path (refused window, non-executable program, failed narrow,
     # and the OOM ladder, which always returns whole-frame).
     cooked_roi: tuple | None = None
+    # {label: tier} — which noise tier served each tiered noise builtin, so a host can decline to
+    # composite frames cooked across the promotion; None unless prepare(want_noise_tiers=True).
+    # Contract (and every reason it can be None): tex_runtime/tier_trace.py.
+    noise_tiers: dict | None = None
 
 
 # ── ENG-6: zero-copy AI handoff (DLPack) ─────────────────────────────────────
@@ -1018,7 +1023,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             debug_nan_highlight: bool = False, time_context: dict | None = None,
             max_outputs: int = MAX_OUTPUTS, disown: bool = True,
             roi: tuple | None = None, roi_exec: bool | None = None,
-            want_lineage: bool = False,
+            want_lineage: bool = False, want_noise_tiers: bool = False,
             upstream_keys: tuple = (), cancel=None, on_progress=None,
             binding_meta: dict | None = None) -> CookPlan:
     """Resolve everything a cook needs *without running it*: compile (or splice a fused
@@ -1352,7 +1357,8 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     return CookPlan(ctx=ctx, tier_id=tier_id, assigned=assigned_bindings,
                     auto_fp16=auto_fp16, debug_nan_highlight=debug_nan_highlight,
                     cook_px=cook_px, auto_ckey=auto_ckey, disown=disown,
-                    want_lineage=want_lineage, upstream_keys=tuple(upstream_keys))
+                    want_lineage=want_lineage, upstream_keys=tuple(upstream_keys),
+                    want_noise_tiers=want_noise_tiers)
 
 
 def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
@@ -1605,6 +1611,9 @@ def run(plan: CookPlan) -> CookResult:
     ctx = plan.ctx
     _cancel_check(ctx.cancel)                         # SCHED-3 yield A: abort a stale cook up front
     _report_progress(ctx.on_progress, "tier", 0.0)
+    if plan.want_noise_tiers:                         # opt-in; the import stays off the default path
+        from .tex_runtime import tier_trace
+        tier_trace.arm_noise_tiers()
     # PROF-1: when a host has armed the profiler, bracket the execution with the whole-cook
     # timer and the per-stage sink — ONE object, so there is a single sampling decision (the
     # rate limiter advances a counter, and two askers for one cook would double-count it).
@@ -1688,6 +1697,7 @@ def run(plan: CookPlan) -> CookResult:
              for n, v in ctx.bindings.items() if isinstance(v, torch.Tensor)}  # (mirror the E6003 site)
             if ctx.binding_meta else None),
         cooked_roi=cooked_roi,
+        noise_tiers=tier_trace.take_noise_tiers(plan.tier_id) if plan.want_noise_tiers else None,
     )
 
 
