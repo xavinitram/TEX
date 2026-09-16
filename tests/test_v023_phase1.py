@@ -33,6 +33,9 @@ _NON_LOCAL_SINCE_V022 = frozenset({
     # DATA-7 (v0.34): host-source reads. footprint='image' — an arbitrary-coordinate
     # gather into a frame the ROI planner does not model, so no strip, no tile.
     "fetch_time", "sample_time",
+    # ASK-1 (v0.35): convolve. footprint='image' — a general kernel-image gather (see
+    # design.md §2 for why ('halo_arg', kernel) can't be built), so no strip, no tile.
+    "convolve",
 })
 
 _EXPECTED_NON_LOCAL = _HISTORICAL_NON_LOCAL | _NON_LOCAL_SINCE_V022

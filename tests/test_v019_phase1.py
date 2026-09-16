@@ -163,6 +163,21 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
     except Exception as e:
         r.fail("C2-st federation", f"{type(e).__name__}: {e}")
 
+    # (e) ASK-1 design §4 T9: a program calling convolve under precision="auto" is
+    # DECLINED (falls to fp32) — "convolve" in FP16_FRAGILE is what makes this so; the
+    # gate itself is exercised end to end here (not just the taxonomy membership above).
+    try:
+        from TEX_Wrangle.tex_runtime import precision_policy as pp
+        bt = {"A": TEXType.VEC3, "K": TEXType.VEC3, "OUT": TEXType.VEC4}
+        code = "@OUT = vec4(convolve(@A, @K), 1.0);"
+        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        tm = TypeChecker(binding_types=bt, source=code).check(prog)
+        got = pp.resolve_auto_precision(prog, pp._MIN_FP16_PX, "cuda")[0]
+        assert got == "fp32", f"convolve under precision='auto' resolved {got!r}, want 'fp32'"
+        r.ok("ASK-1: convolve declines precision='auto' (resolves fp32)")
+    except Exception as e:
+        r.fail("ASK-1 fp16 gate", f"{type(e).__name__}: {e}")
+
 
 def test_c3st_gm_rules(r: SubTestResult):
     print("\n--- C3-st: per-rule units for the precision gate (_gm / resolve) ---")

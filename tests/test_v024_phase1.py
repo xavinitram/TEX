@@ -61,6 +61,10 @@ def test_roi2_footprints(r: SubTestResult):
         ("@OUT = bilateral_filter(@A, 1.5, 0.2);", {}, "A", "halo", 3),
         ("@OUT = sample(@A, u * 0.5, v);", {}, "A", "image", 0),      # gather
         ("@OUT = @A / img_max(@A);", {}, "A", "image", 0),            # reduction
+        # ASK-1: convolve's footprint is 'image' (design.md §2) — arg 0 (the image) is
+        # the whole-image read `_mark_whole` records; see test_ask1_convolve_roi_pin
+        # for the kernel arg's own (non-narrowed) fate.
+        ("@OUT = convolve(@A, @K);", {}, "A", "image", 0),
     ]
     for code, params, name, want_kind, want_reach in cases:
         try:
@@ -105,6 +109,7 @@ def test_roi2_plan_executability(r: SubTestResult):
         ("@OUT = @A * img_mean(@A);", {}, False, 0),                 # reduction → whole-frame
         ("@OUT = fetch(@A, ix + 2, iy);", {}, False, 0),             # gather → whole-frame
         ("@OUT[ix, iy] = vec4(u, v, 0.0, 1.0);", {}, False, 0),      # scatter → whole-frame
+        ("@OUT = convolve(@A, @K);", {}, False, 0),                  # ASK-1: image footprint blocks
     ]
     for code, params, want_exec, want_halo in cases:
         try:
@@ -115,6 +120,28 @@ def test_roi2_plan_executability(r: SubTestResult):
             r.ok(f"plan {code!r} -> exec={want_exec}" + (f" halo={want_halo}" if want_exec else ""))
         except Exception as e:
             r.fail(f"ROI-2 plan {code!r}", f"{type(e).__name__}: {e}")
+
+
+def test_ask1_convolve_roi_pin(r: SubTestResult):
+    print("\n--- ASK-1 design §4 T6 / §6: convolve's ROI reach is pinned ---")
+    # design.md §2: convolve's own footprint descriptor is 'image', not the ask's
+    # requested ('halo_arg', kernel) — a kernel BINDING is never a folded NumberLiteral,
+    # so `_call_reach` can only resolve 'unbounded' for it (never a narrowable radius),
+    # and the variant that WOULD resolve accumulates the kernel into the outer halo ctx,
+    # which is wrong pixels the moment ROI narrows. So: arg 0 (the image) is the whole
+    # read `_mark_whole` records, the plan is not executable (whole-frame fallback,
+    # cost nothing extra — roi_plan already blocks on any gather), and the kernel binding
+    # never appears in `plan.narrow` (which is empty on a non-executable plan).
+    code = "@OUT = convolve(@A, @K);"
+    try:
+        fp = tex_roi.binding_footprints(code, {})
+        assert fp["A"].kind == "image", f"A: kind {fp['A'].kind} != image"
+        plan = tex_roi.roi_plan(code, {})
+        assert plan.executable is False, f"executable {plan.executable} != False"
+        assert "K" not in plan.narrow, f"kernel binding K leaked into plan.narrow: {plan.narrow}"
+        r.ok("convolve: A footprint=image, roi_plan not executable, K never in plan.narrow")
+    except Exception as e:
+        r.fail("ASK-1 ROI pin", f"{type(e).__name__}: {e}")
 
 
 # ── ROI-4 part 1: the reach-pinning derivation test ───────────────────────────

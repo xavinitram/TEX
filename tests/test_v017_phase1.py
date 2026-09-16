@@ -135,8 +135,17 @@ def test_tst2_edge_matrix(r: SubTestResult):
         fails, tested = [], 0
         for name, (code, _) in gen.items():
             try:
-                b = run_tier(code, binds, "interp")
-                c = run_tier(code, binds, "codegen")
+                # ASK-1: convolve's @B is a KERNEL (batch must be 1 — design.md §8 Q2's
+                # decided raise), not a per-batch sibling image like every other
+                # two-binding fn this matrix probes. batch4 legitimately doesn't apply
+                # to it; keep its kernel at batch 1 rather than exercising a restriction
+                # this matrix isn't testing.
+                edge_binds = binds
+                if edge == "batch4" and name == "convolve":
+                    edge_binds = dict(binds)
+                    edge_binds["B"] = make_img(1, 8, 8, 3, seed=2)
+                b = run_tier(code, edge_binds, "interp")
+                c = run_tier(code, edge_binds, "codegen")
                 tested += 1
                 md = _nan_diff(b, c)
                 if md > tol:
@@ -495,6 +504,26 @@ def test_tst1_differential_fuzzer(r: SubTestResult):
                     f"interp; robustness debt): e.g. {cg_crashes[0]}")
         r.ok(f"{tested} random programs: interp == codegen parity holds "
              f"({cg_ran} actually ran codegen, {cg_declined} declined-unsupported){note}")
+
+
+def test_ask1_convolve_fuzzer_scope(r: SubTestResult):
+    print("\n--- ASK-1 design §4 T5: convolve's differential-fuzzer scope, recorded ---")
+    # `convolve` is deliberately NOT added to _FN1/_FN2/_FN3 — those are hand-lists of
+    # (float,...)->float builtins that compose into ONE float expression (_gen_expr /
+    # _gen_expr_over); convolve takes two IMAGE-typed BINDINGS and returns a vec, which
+    # doesn't fit that grammar (same reason gauss_blur/bilateral_filter/erode/dilate and
+    # the over/under/atop/blend family — every other spatial or two-image builtin — are
+    # absent from these lists too). TST-6 parity (stdlib_probe + test_tst6_registry_parity)
+    # and the static codegen-equivalence corpus (test_codegen_optimizer.py) cover
+    # interp==codegen for convolve instead; this test PINS the exclusion so a future
+    # edit can't silently widen the grammar without arguing with it here.
+    try:
+        leaked = [(name, fn_list) for fn_list, name in
+                  ((_FN1, "_FN1"), (_FN2, "_FN2"), (_FN3, "_FN3")) if "convolve" in fn_list]
+        assert not leaked, f"convolve unexpectedly added to: {[n for n, _ in leaked]}"
+        r.ok("convolve intentionally excluded from the float-expression fuzzer grammar")
+    except Exception as e:
+        r.fail("ASK-1 fuzzer scope", f"{type(e).__name__}: {e}")
 
 
 def test_a1_1_auto_precision_fuzz(r: SubTestResult):

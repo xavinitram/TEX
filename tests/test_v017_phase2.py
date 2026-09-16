@@ -58,7 +58,7 @@ def _looks_spatial(n):
     """Name-prefix heuristic for functions that read neighbouring pixels — the
     class that is silently WRONG (tiled into bad output) if left un-tagged."""
     return (n.startswith("sample") or n.startswith("fetch") or "blur" in n
-            or n in ("erode", "dilate") or n.endswith("_filter"))
+            or n in ("erode", "dilate", "convolve") or n.endswith("_filter"))
 
 
 def test_tst3_taxonomy_consistency(r: SubTestResult):

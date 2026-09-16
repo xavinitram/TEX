@@ -1516,6 +1516,88 @@ class TEXStdlib:
 
         return result.permute(0, 2, 3, 1)  # back to BHWC
 
+    # ASK-1: native convolution. `kernel` is a second IMAGE/MASK BINDING, read whole —
+    # not an ARRAY literal (an array is expanded to one full frame per tap by the
+    # interpreter, `interpreter.py:1611-1617`) and not a mat3/mat4 (capped at 4x4,
+    # `DEVELOPMENT.md:165`). footprint='image': see docs/worklog/ask-1/design.md §2 for
+    # why `('halo_arg', kernel)` cannot be built here (the kernel binding is not a
+    # folded NumberLiteral, so `_call_reach` can only ever return 'unbounded' for it —
+    # never a narrowable radius — and the variant that WOULD resolve accumulates the
+    # kernel into the outer halo ctx, which is wrong pixels the moment ROI narrows).
+    @stdlib("convolve", sig='convolve(img, kernel[, normalize]) \\u2192 vec', category='Sampling',
+            spatial=True, sync=True, footprint='image',
+            doc='General image-kernel convolution (the kernel is flipped, not correlated). '
+                'kernel is a second IMAGE/MASK binding, read whole; kernel size in [1,257]. Its '
+                'channel count broadcasts (1 plane -> every image channel) or weights per '
+                'channel (== image channels, depthwise). normalize=1 (default) divides by the '
+                'per-channel kernel sum; 0 returns the raw weighted sum. Replicate border '
+                'padding.',
+            ex='@OUT = convolve(@A, @kernel);')
+    @staticmethod
+    def fn_convolve(image, kernel, normalize=1) -> torch.Tensor:
+        """General depthwise image-kernel convolution.
+
+        Args:
+            image: [B, H, W, C] tensor, or [B, H, W] mask.
+            kernel: a second IMAGE/MASK tensor (batch must be 1), read whole. Its
+                channel count Ck must be 1 (one weight plane, broadcast to every image
+                channel) or equal the image's channel count C (depthwise: one weight
+                plane per channel) — anything else raises. kH, kW must be in [1, 257].
+            normalize: 1 (default, truthy) divides the result by the kernel's
+                per-channel sum (safe-divide guarded near zero); 0 (falsy) returns the
+                raw weighted sum. Resolved host-side (one `.item()` sync), like
+                gauss_blur's sigma.
+
+        TRUE convolution — the kernel is flipped before the tap, not correlated — the
+        semantics a stock "Convolve" tool's own program comment documents; a
+        correlation would silently mirror any asymmetric kernel. Replicate border
+        padding (matches sample/gauss_blur/erode/dilate), chunked so an oversized
+        kernel never asks a single F.pad call for more margin than an axis has. Raises
+        (never clamps) on a kernel batch > 1, an out-of-range kernel size, or a
+        channel-count mismatch.
+        """
+        img = image if image.__class__ is torch.Tensor else _to_tensor(image)
+        ker = kernel if kernel.__class__ is torch.Tensor else _to_tensor(kernel)
+
+        squeeze = img.dim() == 3                              # [B,H,W] mask -> add a channel
+        x = _get_bchw(img.unsqueeze(-1) if squeeze else img)  # [B,C,H,W]
+        C = x.shape[1]
+
+        k4 = ker.unsqueeze(-1) if ker.dim() == 3 else ker      # [Bk,kH,kW,Ck]
+        if k4.dim() != 4:
+            raise ValueError(f"convolve(): kernel must be an image or mask, got rank {ker.dim()}")
+        Bk, kH, kW, Ck = k4.shape
+        if Bk != 1:
+            raise ValueError(f"convolve(): kernel batch must be 1, got {Bk}")
+        if not (1 <= kH <= 257 and 1 <= kW <= 257):
+            raise ValueError(f"convolve(): kernel size {kH}x{kW} out of range [1,257]")
+        if kH * kW > 66049:
+            raise ValueError(f"convolve(): kernel area {kH * kW} exceeds the 257² (66049) cap")
+        if Ck not in (1, C):
+            raise ValueError(f"convolve(): kernel channel count {Ck} must be 1 or match the "
+                              f"image's {C}")
+
+        # TRUE convolution: flip the kernel. [Ck,1,kH,kW] -> (broadcast Ck==1 -> C) -> [C,1,kH,kW].
+        w = torch.flip(k4[0].permute(2, 0, 1).unsqueeze(1), dims=[-2, -1])
+        if Ck == 1 and C > 1:
+            w = w.expand(C, 1, kH, kW)
+        # M-3 reconcile: conv2d requires kernel and input to share a dtype; the kernel is
+        # reconciled TO the image, never the reverse (image data follows self._dtype).
+        w = w.to(x.dtype)
+
+        pad_l, pad_r = kW // 2, kW - 1 - kW // 2
+        pad_t, pad_b = kH // 2, kH - 1 - kH // 2
+        padded = _pad_replicate_chunked(x, pad_l, pad_r, pad_t, pad_b)
+        out = torch.nn.functional.conv2d(padded, w, groups=C)
+
+        norm_t = normalize if normalize.__class__ is torch.Tensor else _to_tensor(normalize)
+        if norm_t.item() != 0:
+            ksum = w.sum(dim=(1, 2, 3)).view(1, C, 1, 1)      # per-channel kernel sum
+            out = TEXStdlib._safe_div(out, ksum)
+
+        result = out.permute(0, 2, 3, 1)                       # [B,H,W,C]
+        return result.squeeze(-1) if squeeze else result
+
     @stdlib("sample_mip_gauss", sig='sample_mip_gauss(img, u, v, lod) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint='image', doc='Gaussian-prefiltered mipmap sampling. Smoother pyramid (sigma=1.13) gives ~5 dB better exponential blur accuracy vs sample_mip.', ex='@OUT = sample_mip_gauss(@A, u, v, 2.5);')
     @staticmethod
     def fn_sample_mip_gauss(image, u_coord, v_coord, lod) -> torch.Tensor:
@@ -2252,6 +2334,37 @@ def _get_gauss_kernels(sigma: float, device: torch.device) -> tuple[torch.Tensor
     if len(_gauss_kernel_cache) > _GAUSS_KERNEL_MAX_ENTRIES:
         _gauss_kernel_cache.popitem(last=False)
     return pair
+
+
+# ASK-1: convolve's replicate-pad, chunked so a single F.pad call is never asked for
+# more margin on an axis than that axis currently has. Replicate padding just repeats
+# the border value, so padding an already-padded tensor with more replicate margin
+# repeats the SAME original border value again — chunking changes nothing about the
+# result (exact, deterministic, no mode change), only how many F.pad calls reach it.
+# `gauss_blur`/`_morph` never needed this: their radius is bounded well under any
+# image dimension in practice, but convolve's kernel is a full IMAGE binding, read
+# whole, up to 257x257 — wider than a small ROI-cooked tile or a thumbnail input.
+def _pad_replicate_chunked(x: torch.Tensor, pad_l: int, pad_r: int,
+                            pad_t: int, pad_b: int) -> torch.Tensor:
+    """Replicate-pad a [B,C,H,W] tensor by (left, right, top, bottom), splitting into
+    multiple F.pad calls so no single call pads an axis by more than that axis's
+    current size allows."""
+    pad = torch.nn.functional.pad
+    while pad_l > 0 or pad_r > 0:
+        w = x.shape[-1]
+        step_l = min(pad_l, max(1, w - 1))
+        step_r = min(pad_r, max(1, w - 1))
+        x = pad(x, (step_l, step_r, 0, 0), mode="replicate")
+        pad_l -= step_l
+        pad_r -= step_r
+    while pad_t > 0 or pad_b > 0:
+        h = x.shape[-2]
+        step_t = min(pad_t, max(1, h - 1))
+        step_b = min(pad_b, max(1, h - 1))
+        x = pad(x, (0, 0, step_t, step_b), mode="replicate")
+        pad_t -= step_t
+        pad_b -= step_b
+    return x
 
 
 def _gauss_blur_bchw(

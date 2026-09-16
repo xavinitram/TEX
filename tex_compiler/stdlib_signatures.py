@@ -142,6 +142,9 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     # SL-4 morphology (image, radius)
     "erode":         {"args": (2, 2), "return": _passthrough_type},
     "dilate":        {"args": (2, 2), "return": _passthrough_type},
+    # ASK-1: convolve(img, kernel[, normalize]) -- passthrough, like gauss_blur/
+    # bilateral_filter below: arg 0 is the image, so its type IS the result type.
+    "convolve":      {"args": (2, 3), "return": _passthrough_type},
 
     # Sampling — return type matches the binding's type (VEC3 for IMAGE, FLOAT for MASK, etc.)
     "sample":         {"args": (3, 3), "return": _passthrough_type},

@@ -72,6 +72,7 @@ def _call_and_kind(name, lo):
     if name == "gauss_blur":  return "gauss_blur(@A, 2.0)", "vec3"
     if name == "bilateral_filter": return "bilateral_filter(@A, 1.5, 0.2)", "vec3"
     if name in ("erode", "dilate"): return f"{name}(@A.rgb, 2)", "vec3"
+    if name == "convolve":   return "convolve(@A, @B, 1)", "vec3"
     if name in _IMG_REDUCE:   return f"{name}(@A.rgb)", "vec3"
     if name == "sample_grad": return "sample_grad(@A, u, v)", "vec2"
     if name in _NOISE2:       return f"{name}(u*6.0, v*6.0)", "float"

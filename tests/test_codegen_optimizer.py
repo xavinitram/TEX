@@ -273,6 +273,11 @@ c.r = 1.0;
         ("two input max", "@OUT = vec3(max(@A.r, @B.r), max(@A.g, @B.g), max(@A.b, @B.b));"),
         ("two input diff", "@OUT = vec3(abs(@A.r - @B.r), abs(@A.g - @B.g), abs(@A.b - @B.b));"),
         ("cross product", "@OUT = cross(@A, @B);"),
+        # ASK-1: convolve — default normalize, explicit normalize=0 (raw weighted sum),
+        # and a MASK-rank input/kernel (exercises the `squeeze` path both tiers share).
+        ("convolve", "@OUT = convolve(@A, @B);"),
+        ("convolve normalize=0", "@OUT = convolve(@A, @B, 0);"),
+        ("convolve mask", "m@OUT = convolve(@A.r, @B.r);"),
     ]
 
     for name, code in programs:

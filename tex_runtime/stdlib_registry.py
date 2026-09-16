@@ -203,6 +203,10 @@ FP16_FRAGILE = frozenset({
     # near a vanishing alpha / (1-b) / b). `under` delegates to `over`; `atop` does NOT
     # divide (out_a = bg.a), so it is correctly omitted.
     "over", "under", "unpremultiply", "color_dodge", "color_burn", "vivid_light",
+    # ASK-1: convolve is an unbounded weighted reduction over up to 66049 taps (the
+    # arr_sum class above) AND normalize divides by a kernel sum that can approach zero
+    # (the F4 class above) -- two independent fp16-fragile reasons, either one enough.
+    "convolve",
 })
 FP16_BOUNDED = frozenset({"sin", "cos", "tanh", "atan"})
 

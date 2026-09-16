@@ -133,6 +133,7 @@ from test_v017_phase1 import (
     test_tst2_edge_matrix,
     test_tst4_operator_completeness,
     test_tst1_differential_fuzzer, test_a1_1_auto_precision_fuzz,
+    test_ask1_convolve_fuzzer_scope,
     test_tst7_runner_coverage,
 )
 from test_v017_phase2 import (
@@ -350,6 +351,7 @@ def main():
     test_tst4_operator_completeness(r)
     test_tst1_differential_fuzzer(r)
     test_a1_1_auto_precision_fuzz(r)
+    test_ask1_convolve_fuzzer_scope(r)
     test_tst7_runner_coverage(r)
     test_reg1_registry_parity(r)
     test_tst3_taxonomy_consistency(r)
@@ -570,6 +572,7 @@ def main():
     from test_v024_phase1 import (
         test_roi2_footprints,
         test_roi2_plan_executability,
+        test_ask1_convolve_roi_pin,
         test_roi4_reach_pinning,
         test_roi4_never_sever,
         test_roi3_tile_is_roi_special_case,
@@ -583,6 +586,7 @@ def main():
     )
     test_roi2_footprints(r)
     test_roi2_plan_executability(r)
+    test_ask1_convolve_roi_pin(r)
     test_roi4_reach_pinning(r)
     test_roi4_never_sever(r)
     test_roi3_tile_is_roi_special_case(r)
@@ -1286,6 +1290,23 @@ def main():
     test_v035_cf1_a_patch_over_a_demoted_base_keeps_its_home(r)
     test_v035_port6_engine_import_is_adapter_free(r)
     test_v035_port6_routes_still_register_under_comfyui(r)
+
+    # ASK-1 — native convolve builtin (design.md §4 T8/T11; T1/T6 land in
+    # test_v017_phase1.py / test_v024_phase1.py above).
+    from test_v035_ask1 import (
+        test_ask1_t8_1x1_kernel_is_scale,
+        test_ask1_t8_2x2_even_kernel_centering,
+        test_ask1_t8_nan_kernel_propagates,
+        test_ask1_t8_kernel_wider_than_image,
+        test_ask1_t8_invalid_args_raise,
+        test_ask1_t11_e3011_reserved_name,
+    )
+    test_ask1_t8_1x1_kernel_is_scale(r)
+    test_ask1_t8_2x2_even_kernel_centering(r)
+    test_ask1_t8_nan_kernel_propagates(r)
+    test_ask1_t8_kernel_wider_than_image(r)
+    test_ask1_t8_invalid_args_raise(r)
+    test_ask1_t11_e3011_reserved_name(r)
 
     # HOOK-3: the linear collapse a host needs, and the gate's refusal as data.
     from test_hook3_checkpoint_collapse import (

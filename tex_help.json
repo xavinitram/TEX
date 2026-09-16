@@ -693,6 +693,18 @@
           "aliases": []
         },
         {
+          "name": "convolve",
+          "sig": "convolve(img, kernel[, normalize]) → vec",
+          "desc": "General image-kernel convolution (the kernel is flipped, not correlated). kernel is a second IMAGE/MASK binding, read whole; kernel size in [1,257]. Its channel count broadcasts (1 plane -> every image channel) or weights per channel (== image channels, depthwise). normalize=1 (default) divides by the per-channel kernel sum; 0 returns the raw weighted sum. Replicate border padding.",
+          "example": "@OUT = convolve(@A, @kernel);",
+          "tags": [
+            "spatial",
+            "sync",
+            "non-local"
+          ],
+          "aliases": []
+        },
+        {
           "name": "sample_mip_gauss",
           "sig": "sample_mip_gauss(img, u, v, lod) → vec",
           "desc": "Gaussian-prefiltered mipmap sampling. Smoother pyramid (sigma=1.13) gives ~5 dB better exponential blur accuracy vs sample_mip.",
@@ -1303,5 +1315,5 @@
       ]
     }
   ],
-  "function_count": 145
+  "function_count": 146
 }
