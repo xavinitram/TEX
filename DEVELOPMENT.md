@@ -1326,4 +1326,31 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   ComfyUI default path (invariant #7). The 16-stage cap is untouched either way. *Gate:* all
   three together — a detection seam that receives producer extents, the FUS-2 wiring into both
   lazy consumers, and a peak-memory measurement on the ComfyUI path.
+- **An UNKEYED integrity check before deserialise (BRIEF-10 option a)** — rejected; a keyed MAC
+  shipped instead. The on-disk program cache (`.pkl`/`.cg`) and the frame spill (`.frame`) reload
+  with `pickle.load`, whose `__reduce__` runs *during* the load, and the cache dir is writable by
+  more than one process by design (the writers' own comments invite "a second instance sharing
+  the dir"). An unkeyed digest stored in — or beside — a file in that dir is recomputable by
+  anyone who can write the dir, so it hardens CORRUPTION (torn writes, bit rot) but NOT a crafted
+  file: the forger recomputes the digest for free. `tex_recovery.sign_pickle` now appends an
+  HMAC-SHA256 trailer under a per-user key kept OUTSIDE the cache dir, and `_load_from_disk` /
+  `_load_codegen_from_disk` / `_restore` authenticate before any deserialise; a missing or wrong
+  tag is a silent MISS (recompile/recook), never an error and never a served frame. Behaviour-
+  preserving on the default path: the tag is a trailer `pickle.load` ignores, HMAC runs at memcpy
+  speed and off the per-frame path (disk loads are memoised in RAM after the first), a
+  pre-integrity file costs one recook once, and no setting is added (the key mints itself; an
+  ephemeral key is the fallback where no per-user dir is writable). This DROPS the backward-read
+  of *unsigned* `.frame` records (a v0 record is now a miss, not served) — an unsigned file and a
+  crafted one are byte-indistinguishable, so serving either is the hole; an unsigned record of
+  ANY prior version (v0 through v2), and every pre-integrity `.pkl`/`.cg`, is a one-time recook
+  after upgrade. **SCOPE, stated exactly.** COVERED: TEX's own `.pkl`, `.cg` and `.frame`. NOT
+  covered: torch's inductor cache under the same dir (`TORCHINDUCTOR_CACHE_DIR` →
+  `torch_compile/`), which torch loads with its own unauthenticated `pickle`/codegen (fxgraph,
+  dynamo, AOT, PyCodeCache `.py`) and which the default node path reaches when a noise tier
+  escalates or under `compile_mode=torch_compile` — so a shared cache dir stays unsafe while
+  torch.compile runs, and closing that is torch's to do, not this seam's. And on the DEFAULT
+  layout (`.tex_cache` INSIDE the package dir) the MAC protects nothing: whoever can plant a
+  pickle beside `tex_cache.py` can also edit the source, so the same ACL covers both. The MAC
+  earns its keep only when `TEX_CACHE_DIR` points somewhere more exposed than the code. Reopen
+  only to REPLACE pickle outright (the format-level fix), a migration of its own.
 

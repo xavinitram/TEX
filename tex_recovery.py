@@ -195,6 +195,299 @@ def atomic_write_json(path: str, obj, *, fsync: bool = False) -> bool:
     return atomic_write(path, payload, fsync=fsync)
 
 
+# ── BRIEF-10: integrity BEFORE deserialise, for the on-disk pickle caches ──────
+#
+# The program cache (`.pkl`/`.cg`) and the frame spill tier (`.frame`) reload with `pickle`, and
+# a pickle's `__reduce__` executes DURING the load, before any field the reader could inspect.
+# The cache dir is writable by more than this process by design (the writers say so: "a second
+# instance sharing the dir"), so anyone who can drop a file there gets code execution on the next
+# cook that hits its fingerprint — the pickle-CVE class exactly.
+#
+# The fix AUTHENTICATES the bytes before `pickle` sees them, with a key the dir-writer cannot
+# read. A digest stored in — or beside — a file the attacker can write is recomputable by the
+# attacker: it catches corruption, not a crafted file. A keyed MAC does not recompute without the
+# key, so a forged file fails the check and is a cache MISS (recompile / re-cook), never an error
+# and never a served frame.
+#
+# READ ONCE, then verify, then unpickle the SAME buffer (`load_verified`). Verifying a streamed
+# read and then re-reading the file to `pickle.load` would be a TOCTOU: on Windows another handle
+# can rewrite the file between the hash and the re-read, so the bytes checked would not be the
+# bytes deserialised. The one buffer closes that; the `.frame` tier pays one transient copy on
+# RESTORE for it, which is off the default ComfyUI path (the frame cache is host-armed) — the
+# WRITE side still streams (`sign_pickle`), so the RAM-pressure spill-out path is unchanged.
+#
+# KEY LOCATION is the security argument: OUTSIDE the cache dir, in the user's own profile
+# (`%LOCALAPPDATA%` / `$XDG_STATE_HOME`), reachable by THIS user but not the OTHER principal who
+# can write a shared cache dir. Same-user is out of scope (that account can already run code as
+# itself). SCOPE, stated honestly: this covers TEX's OWN `.pkl`/`.cg`/`.frame`. It does NOT cover
+# torch's inductor cache under the same dir (`TORCHINDUCTOR_CACHE_DIR`), which torch reads with
+# its own unauthenticated `pickle`/codegen — so a shared cache dir stays unsafe while
+# torch.compile runs, and on the DEFAULT layout (cache inside the package dir) the MAC adds
+# nothing, since whoever can plant a pickle there can edit the source beside it. It earns its
+# keep only when `TEX_CACHE_DIR` points somewhere more exposed than the code.
+#
+# INVISIBLE (invariant #7): the tag is a 37-byte trailer `pickle` ignores, HMAC-SHA256 runs at
+# memcpy speed off the per-frame path (disk loads are memoised in RAM after the first), and a
+# pre-integrity file is a one-time miss+recook. No new setting: the key is minted on first use.
+import hashlib     # noqa: E402  — co-located with the integrity code it serves
+import hmac        # noqa: E402
+import pickle      # noqa: E402
+import threading   # noqa: E402
+
+#: Trailer = MAGIC + tag. `_MAC_FAMILY` is the version-independent prefix: a trailer that starts
+#: with it but is not exactly `_MAC_MAGIC` was written by a NEWER TEX and is declined without
+#: being destroyed (F7). The MAGIC is folded into the MAC input too, so a truncated or
+#: wrong-version trailer cannot be made to verify against a v1 tag.
+_MAC_FAMILY = b"TEXm"
+_MAC_MAGIC = b"TEXm1"
+_MAC_TAG_LEN = 32                       # SHA-256
+_MAC_TRAILER_LEN = len(_MAC_MAGIC) + _MAC_TAG_LEN
+_MAC_KEY_FILE = "cache_mac.key"
+_MAC_KEY_LEN = 32
+
+#: `load_verified`'s two non-object verdicts. UNVERIFIED = missing / unsigned / foreign /
+#: tampered / corrupt — a miss, and the file may be deleted. FUTURE_TRAILER = a newer `TEXm<n>`
+#: wrote it — a miss, but leave it on disk so a downgrade never destroys a readable frame.
+_UNVERIFIED = object()
+_FUTURE_TRAILER = object()
+
+_mac_key_cache: bytes | None = None
+_mac_key_lock = threading.Lock()
+
+
+def _mac_key_home() -> str | None:
+    """The directory the MAC key lives in — deliberately OUTSIDE any cache dir, in a location the
+    other principal who can write a shared cache dir cannot read. Returns None if no per-user
+    writable home resolves (then the caller uses an ephemeral key)."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    else:
+        base = os.environ.get("XDG_STATE_HOME")
+        if not base:
+            home = os.environ.get("HOME") or os.path.expanduser("~")
+            base = os.path.join(home, ".local", "state") if home and home != "~" else None
+    if not base:
+        return None
+    return os.path.join(base, "TEX_Wrangle")
+
+
+def _mac_key() -> bytes:
+    """Resolve-or-create the per-user cache MAC key, memoised for the process under a lock so two
+    threads' first use cannot memoise different keys.
+
+    Persistence (`_resolve_or_create_key`) is CREATE-ONLY and atomic: the key is minted into a
+    temp and published with a link/rename that FAILS if the name exists, so a racing peer never
+    reads a half-written key and exactly one process becomes the creator — everyone else reads the
+    winner's key, so same-user instances share one key and verify each other's files. A malformed
+    key (a crash or full disk mid-mint) is removed and re-minted rather than dooming every later
+    process. Only when no per-user home is writable, or persistence fails outright, does this
+    fall back to a PROCESS-EPHEMERAL key: still unforgeable by another principal (the crafted-file
+    defence holds), at the cost that this process's disk cache neither persists across a restart
+    nor mixes with another instance's — recorded churn, not an error."""
+    global _mac_key_cache
+    if _mac_key_cache is not None:
+        return _mac_key_cache
+    with _mac_key_lock:
+        if _mac_key_cache is not None:
+            return _mac_key_cache
+        key = _resolve_or_create_key()
+        if key is None:
+            key = os.urandom(_MAC_KEY_LEN)
+        _mac_key_cache = key
+        return key
+
+
+def _resolve_or_create_key() -> bytes | None:
+    """A persistent per-user key, or None to signal the ephemeral fallback. Converges under a
+    race: read a well-formed key; else be the single atomic creator (or read the winner if a peer
+    created it first); repair a malformed key ONLY when the file on disk is still the exact
+    malformed one probed — matched by (inode, size, mtime). Between the probe and here a peer may
+    have replaced it with a good key; its stat then differs and we leave it, re-probe, and adopt
+    it (N1). An unreadable file is never removed."""
+    home = _mac_key_home()
+    if home is None:
+        return None
+    path = os.path.join(home, _MAC_KEY_FILE)
+    try:
+        os.makedirs(home, exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(home, 0o700)
+            except OSError:
+                pass
+    except OSError:
+        return None
+    for _ in range(16):
+        kind, info = _probe_key(path)
+        if kind == "ok":
+            return info
+        if kind == "absent":
+            published = _publish_new_key(home, path)
+            if published is not None:
+                return published
+            continue                     # lost the create race: loop and read the winner's key
+        if kind == "malformed":
+            # A short/empty/corrupt key (a crash mid-write, a full disk) must not doom every
+            # later process to ephemeral (F3) — but remove it ONLY if it is STILL the exact file
+            # we probed. A peer that republished a good key between the probe and now changes the
+            # file's (inode, size, mtime), so the guard fails and we leave that key to adopt on
+            # the next probe (N1). Never remove on an open failure (kind == "unreadable").
+            try:
+                st = os.stat(path)
+                if (st.st_ino, st.st_size, st.st_mtime_ns) == info:
+                    os.remove(path)
+            except OSError:
+                pass
+            continue
+        # kind == "unreadable": the file exists but cannot be read, and must not be removed —
+        # there is nothing safe to do with it, so fall back to an ephemeral key.
+        return None
+    return None
+
+
+def _publish_new_key(home: str, path: str) -> bytes | None:
+    """Mint a key and publish it ATOMICALLY and CREATE-ONLY: write a temp, then link/rename it
+    into place with a primitive that FAILS if the name already exists, so a reader never sees a
+    half-written key and exactly one racer wins (F3). Returns the key on success, None if a peer
+    won (caller re-reads) or on any error (caller falls to ephemeral)."""
+    new_key = os.urandom(_MAC_KEY_LEN)
+    fd = tmp = None
+    try:
+        fd, tmp = bounded_mkstemp(dir=home, prefix=".macgen-", suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            fd = None
+            f.write(new_key)
+            if os.name != "nt":
+                try:
+                    os.fchmod(f.fileno(), 0o600)
+                except (OSError, AttributeError):
+                    pass
+        if os.name == "nt":
+            os.rename(tmp, path)     # Windows: raises FileExistsError if `path` exists
+        else:
+            os.link(tmp, path)       # POSIX: raises FileExistsError if `path` exists
+            os.remove(tmp)           # drop the temp link; `path` is the durable name
+        tmp = None
+        return new_key
+    except FileExistsError:
+        return None                  # a peer created it first — caller reads the winner's key
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _probe_key(path: str):
+    """Classify the key file from a SINGLE descriptor (read and stamp the same open file, so a
+    swap cannot slip between the read and the stat). Returns:
+      ("ok", key)                          — a well-formed `_MAC_KEY_LEN`-byte key;
+      ("malformed", (ino, size, mtime_ns)) — a wrong-length file, STAMPED so the caller can
+                                             remove only this exact file (N1);
+      ("absent", None)                     — it does not exist (go create);
+      ("unreadable", None)                 — any other open/read error (never remove it).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return ("absent", None)
+    except OSError:
+        return ("unreadable", None)
+    try:
+        st = os.fstat(fd)
+        data = os.read(fd, _MAC_KEY_LEN + 1)
+    except OSError:
+        return ("unreadable", None)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if len(data) == _MAC_KEY_LEN:
+        return ("ok", data)
+    return ("malformed", (st.st_ino, st.st_size, st.st_mtime_ns))
+
+
+def _mac_init(name: bytes):
+    key = _mac_key()
+    m = hmac.new(key, digestmod=hashlib.sha256)
+    m.update(_MAC_MAGIC)
+    m.update(len(name).to_bytes(4, "little"))
+    m.update(name)                      # bind the tag to the fingerprint filename
+    return m
+
+
+class _HashingWriter:
+    """Tees `pickle.dump`'s streamed bytes into the running MAC and the file in one pass — so the
+    frame spill's whole-frame streaming write is preserved (no second in-memory copy)."""
+
+    __slots__ = ("_f", "_m")
+
+    def __init__(self, f, m):
+        self._f, self._m = f, m
+
+    def write(self, b):
+        self._m.update(b)
+        return self._f.write(b)
+
+
+def sign_pickle(path, data, *, fsync: bool = False) -> bool:
+    """`atomic_write` of `pickle.dump(data)` with a keyed-MAC trailer appended. The one write
+    helper the on-disk pickle caches call, so authentication is spelled once. Streamed, so a
+    frame is never blobbed a second time in memory. Returns `atomic_write`'s success verdict."""
+    name = os.path.basename(str(path)).encode("utf-8", "surrogatepass")
+
+    def _body(f):
+        m = _mac_init(name)
+        pickle.dump(data, _HashingWriter(f, m), protocol=pickle.HIGHEST_PROTOCOL)
+        f.write(_MAC_MAGIC)
+        f.write(m.digest())
+
+    return atomic_write(str(path), _body, fsync=fsync)
+
+
+def load_verified(path):
+    """Read `path` ONCE, authenticate the keyed-MAC trailer, and unpickle from the SAME in-memory
+    buffer — so the bytes `pickle` deserialises are byte-for-byte the bytes the MAC verified, with
+    no second read a concurrent writer could swap under (the F1 TOCTOU). THE GATE: the only
+    deserialiser for the on-disk pickle caches.
+
+    Returns the deserialised object, or `_UNVERIFIED` (missing / too short / unsigned / foreign /
+    tampered / corrupt — the caller treats it as a miss and may delete the file), or
+    `_FUTURE_TRAILER` (a newer `TEXm<n>` wrote it — decline WITHOUT deleting, so a downgrade never
+    destroys a frame the newer build can still read)."""
+    try:
+        with open(str(path), "rb") as f:
+            buf = f.read()
+    except OSError:
+        return _UNVERIFIED
+    if len(buf) < _MAC_TRAILER_LEN:
+        return _UNVERIFIED
+    magic = buf[-_MAC_TRAILER_LEN:-_MAC_TAG_LEN]
+    if magic != _MAC_MAGIC:
+        # A newer TEXm<n> trailer is declined, not destroyed; anything else is a plain miss.
+        return _FUTURE_TRAILER if magic[:len(_MAC_FAMILY)] == _MAC_FAMILY else _UNVERIFIED
+    tag = buf[-_MAC_TAG_LEN:]
+    payload = memoryview(buf)[:-_MAC_TRAILER_LEN]
+    name = os.path.basename(str(path)).encode("utf-8", "surrogatepass")
+    m = _mac_init(name)
+    m.update(payload)
+    if not hmac.compare_digest(m.digest(), tag):
+        return _UNVERIFIED
+    try:
+        return pickle.loads(payload)
+    except Exception:
+        return _UNVERIFIED
+
+
 # ── the journal ──────────────────────────────────────────────────────────────
 
 

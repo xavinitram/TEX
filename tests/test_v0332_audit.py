@@ -332,21 +332,30 @@ def test_v0332_a5_a_future_frame_format_is_refused(r):
         rec = {"t": torch.randint(-32768, 32767, (1, 16, 16, 4), dtype=torch.int16),
                "fmt": tex_results._FRAME_FORMAT + 1, "device": "cpu", "canvas": None,
                "epoch": tex_results.env_epoch(), "orig": "float32", "viewed": "uint16"}
-        with open(c._disk_path("future"), "wb") as fh:
-            pickle.dump(rec, fh)
+        # SIGNED, so the MAC passes and the forward-compat fmt check is what refuses it (BRIEF-10
+        # authenticates before the fmt decode; an unsigned future record would miss for the
+        # wrong reason, hiding the fmt pin).
+        tex_results._atomic_pickle(c._disk_path("future"), rec)
         served = c.get("future")
 
     with tempfile.TemporaryDirectory() as d:
         c2 = tex_results.ResultCache(cache_dir=d)
         v0 = {"t": _frame(res=16), "device": "cpu", "canvas": None,
               "epoch": tex_results.env_epoch()}
-        with open(c2._disk_path("v0"), "wb") as fh:
-            pickle.dump(v0, fh)
+        tex_results._atomic_pickle(c2._disk_path("v0"), v0)      # SIGNED: reads (backward dir)
         back = c2.get("v0")
-    ok = served is None and back is not None and torch.equal(back, v0["t"])
-    r.ok("A5: a future .frame format is refused; a v0 record still reads") if ok else \
+        # An UNSIGNED v0 is a silent miss — authentication precedes the fmt decode (BRIEF-10).
+        with open(c2._disk_path("v0u"), "wb") as fh:
+            pickle.dump(v0, fh)
+        with c2._lock:
+            c2._spilled = None
+        unsigned = c2.get("v0u")
+    ok = (served is None and back is not None and torch.equal(back, v0["t"])
+          and unsigned is None)
+    r.ok("A5: future fmt refused; a signed v0 reads; an unsigned record is a miss") if ok else \
         r.fail("A5 fmt is write-only",
-               f"future record served={served is not None}, v0 compat={back is not None}")
+               f"future served={served is not None}, v0 compat={back is not None}, "
+               f"unsigned_served={unsigned is not None}")
 
 
 def test_v0332_a5_patch_region_refuses_a_mismatch_instead_of_raising(r):

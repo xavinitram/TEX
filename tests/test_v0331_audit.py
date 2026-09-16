@@ -267,18 +267,29 @@ def test_v0331_a4_frame_records_carry_a_format_version(r):
         c.put("evictor", f)
         with open(c._disk_path("k"), "rb") as fh:
             rec = pickle.load(fh)
-        # ...and a v0 record (no `fmt`, no `orig`) must still restore.
+        # ...and a v0-shaped record (no `fmt`, no `orig`), legitimately SIGNED, must still
+        # restore — BRIEF-10's authentication gate is in front of the fmt decode, so the
+        # backward-decodable direction is unchanged for an authentic file.
         v0 = {"t": f[0].clone(), "device": "cpu", "canvas": None,
               "epoch": tex_results.env_epoch()}
-        with open(c._disk_path("legacy"), "wb") as fh:
-            pickle.dump(v0, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tex_results._atomic_pickle(c._disk_path("legacy"), v0)
         with c._lock:
             c._spilled = None
         legacy = c.get("legacy")
-        ok = rec.get("fmt") == tex_results._FRAME_FORMAT and legacy is not None
-        r.ok(f"A4/B5a: records carry fmt={rec.get('fmt')}; a v0 record still restores") if ok \
+        # An UNSIGNED record (a pre-integrity or foreign file) is now a silent MISS: it cannot
+        # be told from a crafted one, so it is re-cooked rather than served (BRIEF-10).
+        with open(c._disk_path("unsigned"), "wb") as fh:
+            pickle.dump(v0, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        with c._lock:
+            c._spilled = None
+        unsigned = c.get("unsigned")
+        ok = (rec.get("fmt") == tex_results._FRAME_FORMAT and legacy is not None
+              and unsigned is None)
+        r.ok(f"A4/B5a: records carry fmt={rec.get('fmt')}; a signed v0 restores, "
+             f"an unsigned record is a miss") if ok \
             else r.fail("A4 format version",
-                        f"fmt={rec.get('fmt')} legacy_restored={legacy is not None}")
+                        f"fmt={rec.get('fmt')} legacy_restored={legacy is not None} "
+                        f"unsigned_served={unsigned is not None}")
         c.clear(disk=True)
 
 

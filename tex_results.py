@@ -167,8 +167,11 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 
 #: B5a — the `.frame` spill-record format version. ABSENCE reads as v0 (raw), which is exactly
-#: what every file written before v0.33.1 is, so both formats are readable for one release and
-#: an upgrade is never a silent cold start.
+#: what every file written before v0.33.1 is; both formats stay DECODABLE across a version bump.
+#: (BRIEF-10 update: an unsigned record is no longer SERVED — the integrity gate authenticates
+#: before decode, so every pre-integrity `.frame`, v0 through v2, is a one-time miss+recook after
+#: upgrade. The `fmt` ladder still governs a SIGNED record's forward/backward decode across TEX
+#: versions that share a key. The frame tier is host-armed, so no ComfyUI default path sees this.)
 #:
 #: This field should have landed with v0.33, which CHANGED the record (adding `orig`, and
 #: redefining `device` as the HOME device rather than the current one) without one. Compat held
@@ -1289,7 +1292,6 @@ class ResultCache:
         restore rides the DMA engine (non_blocking) when the staged host copy is pinned."""
         try:
             import torch
-            import pickle
             if self._spilled is None:
                 # Usually one scandir, ONCE, instead of a stat per miss. Not guaranteed
                 # any more: H4 makes a scan that raced a spill leave membership UNKNOWN
@@ -1333,8 +1335,29 @@ class ResultCache:
                 # away put a 220 ns acquire back on it. Everything from here to `_admit`'s locked
                 # re-check is still inside the window the check covers.
                 gen = self._generation
-            with open(path, "rb") as f:
-                rec = pickle.load(f)
+            # BRIEF-10: AUTHENTICATE before deserialise. `load_verified` reads the file once,
+            # checks the keyed-MAC trailer, and unpickles the SAME buffer — so a `.frame` with no
+            # valid trailer (a pre-integrity file, another user's on a shared dir, or a crafted
+            # one) is a MISS and `__reduce__`/`torch.load` never runs on it, with no re-read a
+            # writer could swap under (F1). An UNVERIFIED frame is discarded like a stale-epoch
+            # one (there is no way to tell a genuine pre-integrity frame from a hostile one, so
+            # serving either is the hole); a FUTURE-trailer frame a newer TEX wrote is a miss but
+            # is LEFT on disk (F7). The fmt/epoch checks below are untouched.
+            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER
+            rec = load_verified(path)
+            if rec is _FUTURE_TRAILER:
+                return None, None                    # a newer TEX's frame — leave it, just miss
+            if rec is _UNVERIFIED:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                else:
+                    with self._lock:
+                        self._disk_bytes = None      # out-of-band removal: invalidate the total
+                        if self._spilled is not None:
+                            self._spilled.discard(key)
+                return None, None
             if int(rec.get("fmt", 0) or 0) > _FRAME_FORMAT:
                 # A5/PROBE-8: the `fmt` field was write-only — a record from a NEWER TEX was
                 # decoded best-effort and served as pixels. A forward-compatible reader cannot
@@ -1852,8 +1875,12 @@ def _atomic_pickle(path: str, data) -> bool:
 
     Returns `atomic_write`'s verdict rather than swallowing it. `_spill` is the caller that
     keeps a running byte total and a membership set, so it is exactly the caller that must not
-    charge for a write that did not happen."""
-    import pickle
-    from .tex_recovery import atomic_write
-    return bool(atomic_write(path, lambda f: pickle.dump(data, f,
-                                                         protocol=pickle.HIGHEST_PROTOCOL)))
+    charge for a write that did not happen.
+
+    BRIEF-10: routed through `sign_pickle`, which appends a keyed-MAC trailer so `_restore` can
+    authenticate the frame BEFORE `pickle.load` runs a crafted `__reduce__`. Still streamed —
+    the MAC is teed into the same single write pass, so the spill never blobs the frame twice
+    (the property this helper's STREAMED note exists to protect). The A1 critical section is
+    unchanged: the call site and signature `(path, data)` are exactly as before."""
+    from .tex_recovery import sign_pickle
+    return bool(sign_pickle(path, data))

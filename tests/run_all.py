@@ -1492,6 +1492,30 @@ def main():
     test_hook4_helpers_reexports_are_tex_testkit_objects(r)
     test_hook4_testkit_stays_off_pytest_and_the_comfy_adapter_path(r)
 
+    # BRIEF-10: integrity BEFORE deserialise in the on-disk pickle caches.
+    from test_brief10_integrity import (
+        test_brief10_pkl_site_never_executes_crafted_reduce,
+        test_brief10_cg_site_never_executes_crafted_reduce,
+        test_brief10_frame_site_never_executes_crafted_reduce,
+        test_brief10_pkl_site_rejects_a_forged_trailer,
+        test_brief10_cg_site_rejects_a_forged_trailer,
+        test_brief10_frame_site_rejects_a_forged_trailer,
+        test_brief10_signed_entries_still_load,
+        test_brief10_unsigned_pkl_is_a_silent_miss_then_recompiles,
+        test_brief10_unsigned_frame_is_a_silent_miss,
+        test_brief10_key_repair_spares_a_peers_republished_key,
+    )
+    test_brief10_pkl_site_never_executes_crafted_reduce(r)
+    test_brief10_cg_site_never_executes_crafted_reduce(r)
+    test_brief10_frame_site_never_executes_crafted_reduce(r)
+    test_brief10_pkl_site_rejects_a_forged_trailer(r)
+    test_brief10_cg_site_rejects_a_forged_trailer(r)
+    test_brief10_frame_site_rejects_a_forged_trailer(r)
+    test_brief10_signed_entries_still_load(r)
+    test_brief10_unsigned_pkl_is_a_silent_miss_then_recompiles(r)
+    test_brief10_unsigned_frame_is_a_silent_miss(r)
+    test_brief10_key_repair_spares_a_peers_republished_key(r)
+
     success = r.summary()
     return 0 if success else 1
 

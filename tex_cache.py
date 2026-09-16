@@ -17,7 +17,6 @@ import json
 import logging
 import marshal
 import os
-import pickle
 import shutil
 import time
 from collections import OrderedDict
@@ -390,9 +389,14 @@ class TEXCache:
         second ComfyUI instance sharing the dir — can never observe a half-written entry, and
         a crash never leaves a torn artifact the next launch would load. ENG-13 routes every
         persisted engine file through the one `tex_recovery.atomic_write`."""
-        from .tex_recovery import atomic_write
+        from .tex_recovery import sign_pickle
         # Streamed, not blobbed: a compiled artifact is small next to a frame, but there is no
         # reason to build a second copy of it in memory to reach the same write.
+        #
+        # BRIEF-10: routed through `sign_pickle`, which appends a keyed-MAC trailer so
+        # `_load_from_disk`/`_load_codegen_from_disk` can authenticate the bytes BEFORE
+        # `pickle.load` runs a crafted `__reduce__`. The signing is HMAC-SHA256 at memcpy speed
+        # on a ≤~200 KB artifact — off the per-frame path and lost in the recompile it guards.
         #
         # NOT fsynced, and this is the load-bearing half. This write is INLINE ON THE COOK
         # THREAD, on the first cook of every distinct program — i.e. on every ComfyUI code edit
@@ -406,7 +410,7 @@ class TEXCache:
         # on a bad load — so a torn file is a case this code handles by design rather than a case
         # the fsync was protecting against. Atomicity (temp + rename) is what matters here and
         # is unaffected.
-        atomic_write(str(path), lambda f: pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL))
+        sign_pickle(str(path), data)
 
     def _save_to_disk(self, fp: str, program: Any, binding_types: dict[str, TEXType]):
         """Persist compilation artifacts to disk."""
@@ -431,8 +435,21 @@ class TEXCache:
         if not path.exists():
             return None
         try:
-            with open(path, "rb") as f:
-                data = pickle.load(f)
+            # BRIEF-10: AUTHENTICATE before deserialise. `load_verified` reads the file once,
+            # checks the keyed-MAC trailer, and unpickles the SAME buffer — so a `.pkl` with no
+            # valid trailer (a pre-integrity file, a foreign one, or a crafted one) is a MISS and
+            # its `__reduce__` never runs, with no re-read a writer could swap under. The
+            # version/epoch checks below are unchanged; the MAC is a gate in front, not a reorder.
+            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER
+            data = load_verified(path)
+            if data is _UNVERIFIED:
+                try:
+                    path.unlink(missing_ok=True)     # unsigned/foreign/corrupt: recompile fresh
+                except OSError:
+                    pass                             # F6: an undeletable file is a silent miss
+                return None
+            if data is _FUTURE_TRAILER:
+                return None                          # a newer TEX's file — leave it, just miss
 
             # Version check — stale entries are deleted (CACHE-4: AST epoch gates the .pkl)
             if data.get("version") != _AST_EPOCH:
@@ -601,8 +618,21 @@ class TEXCache:
         if not path.exists():
             return None
         try:
-            with open(path, "rb") as f:
-                data = pickle.load(f)
+            # BRIEF-10: the OUTER pickle is itself an execution sink, so authenticate the file
+            # before deserialising — the inner-blob sha below only ever guarded corruption of the
+            # marshal blob (and is attacker-recomputable), so it cannot stand in for this.
+            # `load_verified` reads once, checks the MAC, and unpickles that one buffer (no
+            # re-read window — F1).
+            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER
+            data = load_verified(path)
+            if data is _UNVERIFIED:
+                try:
+                    path.unlink(missing_ok=True)     # unsigned/foreign/corrupt: regenerate
+                except OSError:
+                    pass                             # F6: an undeletable file is a silent miss
+                return None
+            if data is _FUTURE_TRAILER:
+                return None                          # a newer TEX's sidecar — leave it, just miss
             if (data.get("version") != _CODEGEN_EPOCH
                     or data.get("magic") != _BYTECODE_MAGIC):
                 path.unlink(missing_ok=True)
