@@ -1,20 +1,22 @@
 """ASK-1 — native `convolve` builtin.
 
-Design: docs/worklog/ask-1/design.md (decided; this file implements its §4 red-first
-list, T8/T11 specifically — T1/T2/T3/T6/T7/T7b/T9/T10 land as edits to the existing
-test files their rows name). Each test below cites the design row it satisfies.
+The T-numbers label rows of ASK-1's test list. T8 (edge cases) and T11 (the reserved
+name) live here; the other rows land as edits to the existing suites that own each
+property: test_codegen_optimizer.py (equivalence corpus), stdlib_probe.py and
+test_v017_phase1.py (fuzzer/edge-matrix coverage and the fuzzer-grammar exclusion),
+test_v017_phase2.py (TST-3 taxonomy), test_v019_phase1.py (precision="auto" decline),
+test_v023_phase1.py (_NON_LOCAL_SINCE_V022) and test_v024_phase1.py (the ROI reach pin).
 
-T8 note (kernel-wider-than-image): the design predicted this fails loud via CF-6
-inflating the cook grid to the kernel's extent. Measured against this head: a BARE
+T8 note (kernel-wider-than-image): the expectation was a loud failure, via CF-6
+inflating the cook grid to the kernel's extent. Measured: a BARE
 `@OUT = convolve(@A, @K);` does NOT raise — `_exec_assignment`'s plain BindingRef
 write path (interpreter.py) never checks a written binding's shape against
 `spatial_shape`, so `@OUT` lands shaped like `@A` (the image), silently inconsistent
-with the inflated grid. The loud failure design describes DOES happen, but only when
-the SAME program also consumes a grid-sized builtin alongside convolve's result (e.g.
-`+ vec3(u, v, 0.0)`) — verified below. Both facts are pinned; the discrepancy from the
-design doc is called out in the hand-back rather than silently "fixed" by forking CF-6
-(which design.md §3 explicitly declines for this ask) or by adding a new guard inside
-fn_convolve that the design never asked for.
+with the inflated grid. The loud failure DOES happen, but only when the SAME program
+also consumes a grid-sized builtin alongside convolve's result (e.g.
+`+ vec3(u, v, 0.0)`) — verified below. Both facts are pinned as measured rather than
+"fixed" here: a fix would either fork CF-6's single cook-grid rule for one builtin or
+add a guard inside fn_convolve that this ask does not call for.
 """
 from helpers import *
 from failure_harness import run_tier, max_diff

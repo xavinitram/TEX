@@ -1153,4 +1153,24 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   where slot 1 is a perfectly good anchor. *Gate:* generalize to `any(e["name"] in needed and
   e["type"] in SHAPE_ANCHOR_TYPES for e in spatial)` — strictly more permissive AND closer to
   the real rule — together with a node-level pin that a lone unread wire is never pruned.
+- **`convolve` declaring `('halo_arg', kernel)` as its footprint (ASK-1, v0.35)** — rejected;
+  it ships `footprint='image'`. A binding argument yields no static reach: `tex_roi._call_reach`
+  resolves a `halo_arg` only from a folded `NumberLiteral`, so a kernel binding resolves
+  `'unbounded'` and blocks ROI — the descriptor would only spell `'image'` the long way. Worse,
+  a narrowed ROI would slice the kernel binding: every argument after the image is read at the
+  outer context, so on any variant that did resolve (a literal radius beside the kernel) the
+  kernel lands in `RoiPlan.narrow` and is cut to `ROI ⊕ halo` — wrong pixels only when
+  narrowed, the class invariant #5 exists to close. `'image'` blocks ROI and passes the kernel
+  whole, which is what the machinery already means. Reopens with a "this argument is read
+  whole" descriptor in `tex_roi` (a fourth footprint field), as its own item: it widens
+  invariant #5's vocabulary, so `_valid_footprint`, TST-3 and ROI-4's reach pinning move with it.
+- **`patch_dist` declaring a `halo_arg` footprint (ASK-13, v0.35)** — rejected; it ships
+  `footprint='image'`. The true reach is `radius + max(|dx|, |dy|)`, which spans two arguments,
+  and the descriptor reads one: `('halo_arg', radius)` declares the radius alone and under-pads
+  by the offset, so a halo-tiled or ROI-narrowed cook reads neighbours its pad never grew to —
+  invariant #5's silent-wrong-when-tiled class. It would not buy narrowing in real use either:
+  `dx`/`dy` are loop variables in a search loop, so they never fold and the reach resolves
+  `'unbounded'` anyway. Reopens with the same footprint-vocabulary item `convolve` waits on, and
+  only if that vocabulary grows a reach summed over more than one argument — neither builtin
+  widens the descriptor grammar for the other.
 

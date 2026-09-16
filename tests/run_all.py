@@ -1295,8 +1295,9 @@ def main():
     test_v035_port6_engine_import_is_adapter_free(r)
     test_v035_port6_routes_still_register_under_comfyui(r)
 
-    # ASK-1 — native convolve builtin (design.md §4 T8/T11; T1/T6 land in
-    # test_v017_phase1.py / test_v024_phase1.py above).
+    # ASK-1 — native convolve builtin (T8 edge cases, T11 reserved name; the other rows
+    # land as edits to the existing test files wired above, e.g. test_v017_phase1.py /
+    # test_v024_phase1.py).
     from test_v035_ask1 import (
         test_ask1_t8_1x1_kernel_is_scale,
         test_ask1_t8_2x2_even_kernel_centering,
@@ -1312,9 +1313,9 @@ def main():
     test_ask1_t8_invalid_args_raise(r)
     test_ask1_t11_e3011_reserved_name(r)
 
-    # ASK-13 — patch-distance builtin (design.md §4 point 6 edge cases + the
-    # reserved-name row; points 1-3/5/7/8 land as edits to the existing test files
-    # their rows name, wired above/near the ASK-1 block).
+    # ASK-13 — patch-distance builtin (T6 edge cases + the reserved-name row; the other
+    # rows land as edits to the existing test files that own each property, wired
+    # above/near the ASK-1 block).
     from test_v035_ask13 import (
         test_ask13_t6_radius0_equals_pointwise,
         test_ask13_t6_zero_offset_exact_zero,

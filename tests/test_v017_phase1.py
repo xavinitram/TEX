@@ -135,8 +135,8 @@ def test_tst2_edge_matrix(r: SubTestResult):
         fails, tested = [], 0
         for name, (code, _) in gen.items():
             try:
-                # ASK-1: convolve's @B is a KERNEL (batch must be 1 — design.md §8 Q2's
-                # decided raise), not a per-batch sibling image like every other
+                # ASK-1: convolve's @B is a KERNEL (batch must be 1 — a kernel batch > 1
+                # raises by decision), not a per-batch sibling image like every other
                 # two-binding fn this matrix probes. batch4 legitimately doesn't apply
                 # to it; keep its kernel at batch 1 rather than exercising a restriction
                 # this matrix isn't testing.
@@ -507,7 +507,7 @@ def test_tst1_differential_fuzzer(r: SubTestResult):
 
 
 def test_ask1_convolve_fuzzer_scope(r: SubTestResult):
-    print("\n--- ASK-1 design §4 T5: convolve's differential-fuzzer scope, recorded ---")
+    print("\n--- ASK-1 T5: convolve's differential-fuzzer scope, recorded ---")
     # `convolve` is deliberately NOT added to _FN1/_FN2/_FN3 — those are hand-lists of
     # (float,...)->float builtins that compose into ONE float expression (_gen_expr /
     # _gen_expr_over); convolve takes two IMAGE-typed BINDINGS and returns a vec, which
@@ -527,7 +527,7 @@ def test_ask1_convolve_fuzzer_scope(r: SubTestResult):
 
 
 def test_ask13_patch_dist_fuzzer_scope(r: SubTestResult):
-    print("\n--- ASK-13 design §4 T5: patch_dist's differential-fuzzer scope, recorded ---")
+    print("\n--- ASK-13 T5: patch_dist's differential-fuzzer scope, recorded ---")
     # Same reasoning as ASK-1's convolve pin just above: `patch_dist` takes an IMAGE-
     # typed BINDING as its first argument and returns a scalar field, which doesn't
     # fit the (float,...)->float composition grammar _FN1/_FN2/_FN3 build programs

@@ -163,7 +163,7 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
     except Exception as e:
         r.fail("C2-st federation", f"{type(e).__name__}: {e}")
 
-    # (e) ASK-1 design §4 T9: a program calling convolve under precision="auto" is
+    # (e) ASK-1 T9: a program calling convolve under precision="auto" is
     # DECLINED (falls to fp32) — "convolve" in FP16_FRAGILE is what makes this so; the
     # gate itself is exercised end to end here (not just the taxonomy membership above).
     try:
@@ -178,7 +178,7 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
     except Exception as e:
         r.fail("ASK-1 fp16 gate", f"{type(e).__name__}: {e}")
 
-    # (f) ASK-13 design §4 point 8: a program calling patch_dist under
+    # (f) ASK-13: a program calling patch_dist under
     # precision="auto" is DECLINED (falls to fp32) — "patch_dist" in FP16_FRAGILE is
     # what makes this so; the gate itself is exercised end to end (invariant 10).
     try:

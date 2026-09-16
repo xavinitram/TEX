@@ -61,7 +61,7 @@ def test_roi2_footprints(r: SubTestResult):
         ("@OUT = bilateral_filter(@A, 1.5, 0.2);", {}, "A", "halo", 3),
         ("@OUT = sample(@A, u * 0.5, v);", {}, "A", "image", 0),      # gather
         ("@OUT = @A / img_max(@A);", {}, "A", "image", 0),            # reduction
-        # ASK-1: convolve's footprint is 'image' (design.md §2) — arg 0 (the image) is
+        # ASK-1: convolve's footprint is 'image' — arg 0 (the image) is
         # the whole-image read `_mark_whole` records; see test_ask1_convolve_roi_pin
         # for the kernel arg's own (non-narrowed) fate.
         ("@OUT = convolve(@A, @K);", {}, "A", "image", 0),
@@ -124,8 +124,8 @@ def test_roi2_plan_executability(r: SubTestResult):
 
 
 def test_ask1_convolve_roi_pin(r: SubTestResult):
-    print("\n--- ASK-1 design §4 T6 / §6: convolve's ROI reach is pinned ---")
-    # design.md §2: convolve's own footprint descriptor is 'image', not the ask's
+    print("\n--- ASK-1 T6: convolve's ROI reach is pinned ---")
+    # convolve's own footprint descriptor is 'image', not the ask's
     # requested ('halo_arg', kernel) — a kernel BINDING is never a folded NumberLiteral,
     # so `_call_reach` can only resolve 'unbounded' for it (never a narrowable radius),
     # and the variant that WOULD resolve accumulates the kernel into the outer halo ctx,
@@ -146,8 +146,8 @@ def test_ask1_convolve_roi_pin(r: SubTestResult):
 
 
 def test_ask13_patch_dist_roi_pin(r: SubTestResult):
-    print("\n--- ASK-13 design §4 T4 / §2: patch_dist's ROI reach is pinned ---")
-    # design.md §2: patch_dist's own footprint descriptor is 'image', not a narrowable
+    print("\n--- ASK-13 T4: patch_dist's ROI reach is pinned ---")
+    # patch_dist's own footprint descriptor is 'image', not a narrowable
     # ('halo_arg', radius) — the true reach is radius + max(|dx|,|dy|), TWO arguments,
     # and _call_reach's descriptor grammar reads exactly one. So: the image argument
     # is the whole read _mark_whole records, and the plan is not executable (whole-

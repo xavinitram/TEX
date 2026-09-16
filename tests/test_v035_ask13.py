@@ -1,15 +1,14 @@
 """ASK-13 — `patch_dist`, a patch-distance primitive.
 
-Design: docs/worklog/ask-13/design.md (decided; this file implements its §4
-red-first list, point 6 (edge cases) and the E3011 reserved-name row — points
-1/2/3 land as edits to the existing test files their rows name: test_v017_phase2.py
-(TST-3 forgotten-tag heuristic), test_v024_phase1.py (ROI reach pin),
+This file carries ASK-13's edge cases (the T6 rows) and the E3011 reserved-name row;
+the other rows land as edits to the existing test files that own each property:
+test_v017_phase2.py (TST-3 forgotten-tag heuristic), test_v024_phase1.py (ROI reach pin),
 test_codegen_optimizer.py (equivalence corpus), stdlib_probe.py (fuzzer/edge-matrix
 coverage), test_v017_phase1.py (fuzzer-grammar exclusion pin), test_v019_phase1.py
 (precision="auto" decline), test_v023_phase1.py (_NON_LOCAL_SINCE_V022 literal).
 
-design.md §4 point 6 asks for each edge case "both devices, both tiers" — `_DEVICES`
-below follows the same convention as test_v024_phase1.py / test_v02[5-8]_phase1.py.
+Each edge case runs on both devices and both tiers — `_DEVICES` below follows the same
+convention as test_v024_phase1.py / test_v02[5-8]_phase1.py.
 """
 from helpers import *
 from failure_harness import run_tier, max_diff
@@ -102,7 +101,7 @@ def test_ask13_t6_nan_propagates(r: SubTestResult):
     img = img.clone()
     img[:, cy, cx, :] = float("nan")
     dx, dy, radius = 1, 0, 1
-    reach = radius + max(abs(dx), abs(dy))  # design.md §4 point 6
+    reach = radius + max(abs(dx), abs(dy))  # the true reach: the patch radius plus the offset
     code = f"m@OUT = patch_dist(@A.rgb, {dx}, {dy}, {radius});"
     for dev in _DEVICES:
         results = {}

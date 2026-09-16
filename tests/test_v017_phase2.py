@@ -59,8 +59,8 @@ def _looks_spatial(n):
     class that is silently WRONG (tiled into bad output) if left un-tagged."""
     return (n.startswith("sample") or n.startswith("fetch") or "blur" in n
             or n in ("erode", "dilate", "convolve") or n.endswith("_filter")
-            # ASK-13: patch_dist escapes all five prefixes above (design.md §4 T5,
-            # which notes convolve escaped them too before ASK-1 added it by name).
+            # ASK-13: patch_dist escapes all five prefixes above (as convolve did too,
+            # before ASK-1 added it by name).
             or n.startswith("patch_"))
 
 

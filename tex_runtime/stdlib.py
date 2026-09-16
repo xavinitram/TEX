@@ -1519,11 +1519,12 @@ class TEXStdlib:
     # ASK-1: native convolution. `kernel` is a second IMAGE/MASK BINDING, read whole —
     # not an ARRAY literal (an array is expanded to one full frame per tap by the
     # interpreter, `interpreter.py:1611-1617`) and not a mat3/mat4 (capped at 4x4,
-    # `DEVELOPMENT.md:165`). footprint='image': see docs/worklog/ask-1/design.md §2 for
-    # why `('halo_arg', kernel)` cannot be built here (the kernel binding is not a
-    # folded NumberLiteral, so `_call_reach` can only ever return 'unbounded' for it —
-    # never a narrowable radius — and the variant that WOULD resolve accumulates the
-    # kernel into the outer halo ctx, which is wrong pixels the moment ROI narrows).
+    # `DEVELOPMENT.md:165`). footprint='image', because `('halo_arg', kernel)` cannot be
+    # built here: `tex_roi._call_reach` resolves a halo_arg only from a folded
+    # NumberLiteral, so a kernel BINDING can only ever resolve 'unbounded' — never a
+    # narrowable radius — and the variant that WOULD resolve accumulates the kernel into
+    # the outer halo ctx, so a narrowed ROI slices the kernel binding itself (wrong pixels
+    # the moment ROI narrows). Recorded in DEVELOPMENT.md §"Rejected design decisions".
     @stdlib("convolve", sig='convolve(img, kernel[, normalize]) \\u2192 vec', category='Sampling',
             spatial=True, sync=True, footprint='image',
             doc='General image-kernel convolution (the kernel is flipped, not correlated). '
@@ -1607,7 +1608,7 @@ class TEXStdlib:
         check each), exactly like gauss_blur's sigma or convolve's normalize flag
         above. Unlike those, a per-pixel value here would be a data-dependent gather
         with no honest cost bound, so it is refused rather than silently meaning one
-        of its values (design.md §1 "Uniform-only, and refused otherwise"). Same
+        of its values. Same
         refusal SHAPE as `tex_provider._uniform_time`'s E7003 — numel==1 / all-equal /
         else raise naming the distinct count — restated for a stdlib argument instead
         of a host `t`. Not the same error FAMILY: E7xxx is `tex_provider.py`'s host-I/O
@@ -1633,11 +1634,12 @@ class TEXStdlib:
 
     # ASK-13: patch-distance primitive. `dx`/`dy` are integer PIXEL offsets, not a
     # vec2 and not UV — pixels because the UV tap-step is off by one pixel in W and
-    # is itself a separate ask (design.md §1); two scalars because fn_fetch's own
+    # is itself a separate ask; two scalars because fn_fetch's own
     # (img, px, py) order already fixes x-then-y here. footprint='image': the true
     # reach is radius + max(|dx|,|dy|) — TWO arguments — and the ROI-1 descriptor
-    # grammar reads exactly one (design.md §2); `('halo_arg', ...)` would under-pad
-    # by the offset the moment ROI narrows a program that uses this call.
+    # grammar reads exactly one; `('halo_arg', ...)` would under-pad by the offset the
+    # moment ROI narrows or halo-tiles a program that uses this call. Recorded in
+    # DEVELOPMENT.md §"Rejected design decisions".
     @stdlib("patch_dist", sig='patch_dist(img, dx, dy, radius) \\u2192 float', category='Sampling',
             spatial=True, sync=True, footprint='image',
             doc='Mean squared difference between the patch at this pixel and the patch at (dx, dy) pixels away. The non-local-means core.',

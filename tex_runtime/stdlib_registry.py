@@ -211,7 +211,7 @@ FP16_FRAGILE = frozenset({
     # (radius clamps to 32) of a SQUARED difference -- the arr_sum class above, and
     # squaring is itself amplifying near zero. Neither `_FRAGILE_NAME_STEMS` (prefix
     # match) nor `_IMPL_FRAGILE_MARKERS` (looks only for `_safe_div(`/`sdiv(`) catches
-    # this name, so it is classified here by hand (design.md §2).
+    # this name, so it is classified here by hand.
     "patch_dist",
 })
 FP16_BOUNDED = frozenset({"sin", "cos", "tanh", "atan"})
