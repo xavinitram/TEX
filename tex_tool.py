@@ -39,10 +39,14 @@ MAX_TOOL_BYTES = 512 * 1024          # a manifest larger than this is rejected u
 MAX_STAGES = 16                      # mirrors tex_fusion._MAX_FUSED_REGION_STAGES
 MAX_PROMOTED_PARAMS = 128
 MAX_STAGE_CODE_BYTES = 64 * 1024
+MAX_TOOLTIP_CHARS = 1024             # metadata['tooltip'] string length cap
+MAX_OPTIONS = 256                    # metadata['options'] entry-count cap
+MAX_OPTION_CHARS = 128               # each metadata['options'][i] string length cap
 
 _TYPE_HINTS = {"f", "i", "s", "b", "c", "v2", "v3", "v4"}   # LANG-1 ParamDecl type_hints
 _CONTEXTS = {"generator", "filter", "transition", "keyer"}  # TOOL-4 context tags
-_META_KEYS = {"min", "max", "step", "precision", "label"}   # LANG-1 recognised widget keys
+_META_KEYS = {"min", "max", "step", "precision", "label",   # LANG-1 recognised widget keys
+              "tooltip", "options"}    # host-rendered hint text + a labelled-choice list
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _TOOL_STORE = "tools"                # <user_dir>/tex_wrangle/tools/
 
@@ -163,8 +167,50 @@ def _validate_promoted(raw_list) -> list[PromotedParam]:
         for mk, mv in meta.items():
             if mk not in _META_KEYS:
                 raise TEXToolError(f"promoted_params[{i}].metadata has unknown key '{mk}'")
-            if not isinstance(mv, (int, float, str)) or isinstance(mv, bool):
+            if mk == "tooltip":
+                if not isinstance(mv, str):
+                    raise TEXToolError(f"promoted_params[{i}].metadata['tooltip'] must be a string")
+                if len(mv) > MAX_TOOLTIP_CHARS:
+                    raise TEXToolError(f"promoted_params[{i}].metadata['tooltip'] exceeds "
+                                       f"{MAX_TOOLTIP_CHARS} characters")
+            elif mk == "options":
+                if thint != "i":
+                    raise TEXToolError(f"promoted_params[{i}].metadata['options'] is only valid "
+                                       f"on type 'i' (got '{thint}')")
+                if not isinstance(mv, list):
+                    raise TEXToolError(f"promoted_params[{i}].metadata['options'] must be a list")
+                if not (1 <= len(mv) <= MAX_OPTIONS):
+                    raise TEXToolError(f"promoted_params[{i}].metadata['options'] must have "
+                                       f"between 1 and {MAX_OPTIONS} entries")
+                for oi, ov in enumerate(mv):
+                    if not isinstance(ov, str) or not ov:
+                        raise TEXToolError(f"promoted_params[{i}].metadata['options'][{oi}] "
+                                           f"must be a non-empty string")
+                    if len(ov) > MAX_OPTION_CHARS:
+                        raise TEXToolError(f"promoted_params[{i}].metadata['options'][{oi}] "
+                                           f"exceeds {MAX_OPTION_CHARS} characters")
+            elif not isinstance(mv, (int, float, str)) or isinstance(mv, bool):
                 raise TEXToolError(f"promoted_params[{i}].metadata['{mk}'] must be a literal scalar")
+        if "options" in meta:
+            # One source of truth: a labelled-choice widget's min/max/step, if given at all,
+            # must agree with the option list instead of racing it, and a given default must
+            # be a valid index into it. All of it optional -- an old manifest with no
+            # 'options' never reaches this block, so it cannot change what it validates.
+            n = len(meta["options"])
+            if "min" in meta and meta["min"] != 0:
+                raise TEXToolError(f"promoted_params[{i}].metadata['min'] must be 0 to match "
+                                   f"'options'")
+            if "max" in meta and meta["max"] != n - 1:
+                raise TEXToolError(f"promoted_params[{i}].metadata['max'] must be {n - 1} to "
+                                   f"match 'options'")
+            if "step" in meta and meta["step"] != 1:
+                raise TEXToolError(f"promoted_params[{i}].metadata['step'] must be 1 to match "
+                                   f"'options'")
+            if "default" in p:
+                dv = p["default"]
+                if isinstance(dv, bool) or not isinstance(dv, int) or not (0 <= dv < n):
+                    raise TEXToolError(f"promoted_params[{i}].default must be an int in "
+                                       f"[0, {n}) to match 'options'")
         out.append(PromotedParam(name=name, internal=internal, stage=stage, type=thint,
                                  default=p.get("default", 0.0), metadata=dict(meta)))
     return out
@@ -183,7 +229,17 @@ def _validate_inputs(raw_list) -> list:
         nm = inp["name"]
         if not isinstance(nm, str) or not _IDENT_RE.match(nm):
             raise TEXToolError(f"inputs[{i}].name must be a valid identifier")
-        out.append({"name": nm, "type": str(inp.get("type", "IMAGE"))})
+        entry = {"name": nm, "type": str(inp.get("type", "IMAGE"))}
+        # "optional" is host UI advice only (which inputs may go unwired) -- TEX binds
+        # nothing for an absent input either way (docs/tools.md §2), so it's copied in ONLY
+        # when present: an old manifest with no such key rebuilds this entry byte-identically.
+        # Any OTHER unknown inputs[*] key keeps silently dropping here, same as before.
+        if "optional" in inp:
+            opt = inp["optional"]
+            if not isinstance(opt, bool):
+                raise TEXToolError(f"inputs[{i}].optional must be a bool")
+            entry["optional"] = opt
+        out.append(entry)
     return out
 
 
@@ -301,6 +357,9 @@ def validate_manifest(raw: dict) -> dict:
         if len(inputs) != 1:
             raise TEXToolError("a fused tool must declare exactly one external input "
                                "(the single fusion source)")
+        if inputs[0].get("optional"):
+            raise TEXToolError("a fused tool's sole external input may not be marked "
+                               "'optional' (the engine requires it to splice the chain)")
         if raw["terminal_image_input"] not in input_names:
             raise TEXToolError(f"terminal_image_input '{raw['terminal_image_input']}' is not a "
                                f"declared input")

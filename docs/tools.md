@@ -70,7 +70,8 @@ Unfusable constructs in a multi-stage tool are **authoring errors** caught at bu
   //   "terminal_image_input": "image",              // socket binding carrying the source
 
   "inputs": [                        // external @-bindings the tool exposes
-    {"name": "image", "type": "IMAGE"}
+    {"name": "image", "type": "IMAGE"},
+    {"name": "mask", "type": "MASK", "optional": true}   // may be left unwired (host UI hint)
   ],
   "outputs": [                       // output ports a host wires when instancing the tool
     {"name": "OUT", "type": "IMAGE"} //   (Vignette declares darkened + vignette_mask)
@@ -82,7 +83,12 @@ Unfusable constructs in a multi-stage tool are **authoring errors** caught at bu
      "stage": null,                  //   null = single-stage / terminal; int = graphspec.stages index; "terminal"
      "type": "f",                    //   LANG-1 type_hint: f i s b c v2 v3 v4
      "default": 1.0,
-     "metadata": {"min": 0.0, "max": 4.0, "label": "Gamma"}}
+     "metadata": {"min": 0.0, "max": 4.0, "label": "Gamma",
+                  "tooltip": "Power curve applied to normalized pixel values."}},
+    {"name": "channel",              //   a labelled-choice ("combo") widget
+     "internal": "channel", "stage": null, "type": "i", "default": 0,
+     "metadata": {"min": 0, "max": 2, "step": 1, "label": "Channel",
+                  "options": ["Red", "Green", "Blue"]}}
   ]
 }
 ```
@@ -92,9 +98,23 @@ Rules:
 - `manifest_schema`, `name`, `tex_language`, and exactly one of `code` / (`graphspec` +
   `terminal_code`) are **required**. Everything else has a documented default.
 - `promoted_params[*].metadata` is a plain `{str: float|int|str}` dict of **literal
-  scalars** — the same shape `ParamDecl.metadata` carries (LANG-1). Recognised keys today:
-  `min`, `max`, `step`, `precision` (numeric) + `label` (string). Publish (TOOL-2) copies
-  it straight off the promoted param's `ParamDecl`; the host auto-widget builder consumes it.
+  scalars** — the same shape `ParamDecl.metadata` carries (LANG-1) — plus two structured
+  keys, each capped to bound parse cost the way the numeric ones already are (§6-D):
+  `tooltip` (a `str`, at most `MAX_TOOLTIP_CHARS` = 1024 characters) and `options` (a
+  labelled-choice list, valid only on an `"i"`-typed param: 1..`MAX_OPTIONS` = 256
+  non-empty strings, each at most `MAX_OPTION_CHARS` = 128 characters). When `options` is
+  present, `min`/`max`/`step` — if given at all — must read `0` / `len(options)-1` / `1`
+  (one source of truth instead of two that could disagree), and a given `default` must be
+  an `int` index into the list. Recognised keys today: `min`, `max`, `step`, `precision`
+  (numeric) + `label`, `tooltip` (string) + `options` (list). Publish (TOOL-2) copies
+  metadata straight off the promoted param's `ParamDecl`; a host auto-widget builder
+  consumes whatever subset it recognises, and a host that doesn't recognise a key ignores it.
+- `inputs[*].optional` (`bool`, default absent/`false`) marks an external input a host may
+  leave unwired — an optional mask or reference plate, say. It is a host UI hint only: TEX
+  binds nothing for an absent input either way, and a program that actually reads an
+  unwired one still fails the ordinary E6021 "not connected" gate at cook, never a silently
+  wrong pixel. A **fused** tool's sole external input (its one fusion source) may never be
+  `optional: true` — the engine requires it to splice the chain.
 - A promoted param's `default` and `type` mirror its `ParamDecl` default/type_hint, so an
   instanced tool node reconstructs the exact widget the source node had.
 - **No fingerprint is ever stored** (ENG-5): the fused warm key is re-derived at install
@@ -182,6 +202,10 @@ adding a tool to a library cannot execute generated code.
 
 **B. Manifest schema validation before any compile** (§3 step 2). No stage source reaches the
 parser until the JSON shape, sizes, and promoted-param metadata are proven well-formed.
+`tooltip` and `options` (§2) are capped literal strings — never parsed as TEX and never
+reaching the emitter — so a host that renders one (a tooltip, a combo widget) owns the same
+output-encoding duty it owes any other untrusted string field; TEX's guarantee here is the
+size/shape cap alone.
 
 **C. Emitter injection audit + adversarial-AST fuzz lane.** The codegen emitter is the trust
 boundary. Two structural facts make it safe, and both are now pinned:
@@ -210,8 +234,9 @@ boundary. Two structural facts make it safe, and both are now pinned:
 
 **D. Documented resource limits.** Schema validation caps the attack surface a *valid* tool
 can present without an emitter escape: `MAX_TOOL_BYTES` (manifest size), `MAX_STAGES`
-(mirrors `tex_fusion._MAX_FUSED_REGION_STAGES = 16`), `MAX_PROMOTED_PARAMS`, `MAX_STAGE_CODE_BYTES`.
-These bound parse/compile cost; they do **not** bound *cook* cost — a valid tool can still
+(mirrors `tex_fusion._MAX_FUSED_REGION_STAGES = 16`), `MAX_PROMOTED_PARAMS`, `MAX_STAGE_CODE_BYTES`,
+and, for the two structured metadata keys (§2), `MAX_TOOLTIP_CHARS`, `MAX_OPTIONS`,
+`MAX_OPTION_CHARS`. These bound parse/compile cost; they do **not** bound *cook* cost — a valid tool can still
 request an 8K `gauss_blur` and OOM/TDR a machine, exactly as a hand-written program can. That
 residual is stated, not silently "handled": a host that installs third-party tools owns the
 same memory-budget / TDR-watchdog duty it owes any user program (CACHE-5 / ROI-5 territory).
@@ -231,6 +256,10 @@ decision (the by-name-nesting exclusion is already in the §7 register).
 | **canary** | `test_tool_stock_exemplars` | every shipped `.textool` loads, preflights clean, and cooks |
 | **security** | `test_tool_emitter_fuzz` | the §6-C adversarial-AST lane |
 | **canary** | `test_tool_schema_rejects` | malformed manifests / newer `manifest_schema` / newer `min_engine` are rejected with `TEXToolError`, before any compile |
+| **derivation** | `test_tool_metadata_tooltip_options` | `tooltip` + a labelled-choice `options` list accepted and round-tripped through `to_dict()`/`tool_summary()` |
+| **derivation** | `test_tool_input_optional` | `inputs[*].optional` round-trips true/false; an absent key and an unrecognised one stay out of the dict |
+| **canary** | `test_tool_manifest_byte_identity` | every stock `.textool` + two representative older manifests still give byte-identical `to_dict()`/`tool_summary()`/written bytes |
+| **canary** | `test_tool_js_publish_filter_pin` | the publish-menu JS still forwards only the original five metadata keys (forwarding the new ones is a separate, later frontend change) |
 
 ---
 

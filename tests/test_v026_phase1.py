@@ -16,7 +16,10 @@ cook, BIT-IDENTICAL to the unfused graph (test_tool_roundtrip_unfused). CPU-pinn
 determinism; CUDA looped when present.
 """
 import ast
+import hashlib
+import json
 import os
+import re
 import tempfile
 
 from helpers import *  # noqa: F401,F403  (SubTestResult, torch, make_img)
@@ -102,6 +105,80 @@ def test_tool_manifest_keys(r: SubTestResult):
         r.ok("manifest + promoted-param key sets are stable")
     except Exception as e:
         r.fail("manifest keys", str(e))
+
+
+def test_tool_metadata_tooltip_options(r: SubTestResult):
+    print("\n--- TOOL-1: metadata 'tooltip' + labelled-choice 'options' (host UI hints) ---")
+    try:
+        base = {"manifest_schema": 1, "name": "X", "tex_language": "0.23",
+                "code": "@OUT = @image;", "inputs": [{"name": "image", "type": "IMAGE"}]}
+        # tooltip: a plain string, round-trips through to_dict()/tool_summary().
+        m = tex_tool.load_tool({**base, "promoted_params": [
+            {"name": "gamma", "type": "f", "default": 1.0,
+             "metadata": {"min": 0.0, "max": 4.0, "tooltip": "Power curve."}}]})
+        assert m.promoted_params[0].metadata["tooltip"] == "Power curve."
+        d = m.to_dict()["promoted_params"][0]["metadata"]
+        assert d["tooltip"] == "Power curve.", d
+        s = tex_tool.tool_summary(m)["widgets"][0]["metadata"]
+        assert s["tooltip"] == "Power curve.", s
+
+        # options: a labelled-choice list, only on an 'i' param, round-trips the same way.
+        m2 = tex_tool.load_tool({**base, "promoted_params": [
+            {"name": "channel", "type": "i", "default": 0,
+             "metadata": {"min": 0, "max": 2, "step": 1, "options": ["Red", "Green", "Blue"]}}]})
+        d2 = m2.to_dict()["promoted_params"][0]["metadata"]
+        assert d2["options"] == ["Red", "Green", "Blue"], d2
+        s2 = tex_tool.tool_summary(m2)["widgets"][0]["metadata"]
+        assert s2["options"] == ["Red", "Green", "Blue"], s2
+
+        # a real-world-shaped combo widget: default 0, min 0, max n-1, step 1, n labelled
+        # options -- the common case a labelled-choice widget takes -- is accepted.
+        n = 11
+        tex_tool.load_tool({**base, "promoted_params": [
+            {"name": "mode", "type": "i", "default": 0,
+             "metadata": {"min": 0, "max": n - 1, "step": 1,
+                          "options": [f"opt{k}" for k in range(n)]}}]})
+        r.ok("tooltip + options accepted, round-trip through to_dict()/tool_summary()")
+    except Exception as e:
+        r.fail("metadata tooltip/options", str(e))
+
+
+def test_tool_input_optional(r: SubTestResult):
+    print("\n--- TOOL-1: inputs[*].optional (host UI hint; TEX binds nothing either way) ---")
+    try:
+        base = {"manifest_schema": 1, "name": "X", "tex_language": "0.23",
+                "code": "@OUT = @image;", "promoted_params": []}
+        m = tex_tool.load_tool({**base, "inputs": [
+            {"name": "image", "type": "IMAGE"},
+            {"name": "mask", "type": "MASK", "optional": True}]})
+        assert m.inputs[1]["optional"] is True and "optional" not in m.inputs[0], m.inputs
+        d = m.to_dict()["inputs"]
+        assert d[1]["optional"] is True and "optional" not in d[0], d
+        s = tex_tool.tool_summary(m)["inputs"]
+        assert s[1]["optional"] is True and "optional" not in s[0], s
+        path = tex_tool.write_tool(m, tempfile.mkdtemp())
+        reloaded = tex_tool.load_tool(path)
+        assert reloaded.inputs[1]["optional"] is True, reloaded.inputs
+
+        # optional: false round-trips as WRITTEN (not dropped for being falsy).
+        m2 = tex_tool.load_tool({**base, "inputs": [
+            {"name": "image", "type": "IMAGE"},
+            {"name": "mask", "type": "MASK", "optional": False}]})
+        assert m2.inputs[1]["optional"] is False, m2.inputs
+
+        # an absent key stays absent (byte-identity with an old manifest).
+        m3 = tex_tool.load_tool({**base, "inputs": [{"name": "image", "type": "IMAGE"}]})
+        assert "optional" not in m3.to_dict()["inputs"][0], m3.to_dict()["inputs"]
+
+        # a declined key ('extent') on an input keeps silently dropping -- nothing here
+        # wires it to anything; it stays unrecognised, same as any other unknown inputs[*] key.
+        m4 = tex_tool.load_tool({**base, "inputs": [
+            {"name": "image", "type": "IMAGE", "extent": "own"}]})
+        assert "extent" not in m4.to_dict()["inputs"][0], m4.to_dict()["inputs"]
+
+        r.ok("inputs[*].optional round-trips true/false; absent key and 'extent' stay unrecognised")
+    except Exception as e:
+        r.fail("input optional", str(e))
 
 
 def test_tool_promoted_params(r: SubTestResult):
@@ -306,6 +383,46 @@ def test_tool_schema_rejects(r: SubTestResult):
         "non-dict terminal_params": {**fbase, "terminal_params": "oops"},
         "fused >1 input": {**fbase, "inputs": [{"name": "image"}, {"name": "extra"}]},
         "terminal_image_input not an input": {**fbase, "terminal_image_input": "nope"},
+        # new metadata keys: 'tooltip' (string, capped) and 'options' (labelled choices on an
+        # 'i' param only, capped, cross-checked against default/min/max/step)
+        "tooltip not a string": {**base, "promoted_params":
+            [{"name": "p", "type": "f", "metadata": {"tooltip": 123}}]},
+        "tooltip too long": {**base, "promoted_params":
+            [{"name": "p", "type": "f",
+              "metadata": {"tooltip": "x" * (tex_tool.MAX_TOOLTIP_CHARS + 1)}}]},
+        "options on a float param": {**base, "promoted_params":
+            [{"name": "p", "type": "f", "metadata": {"options": ["a", "b"]}}]},
+        "options not a list": {**base, "promoted_params":
+            [{"name": "p", "type": "i", "metadata": {"options": "a,b"}}]},
+        "options empty": {**base, "promoted_params":
+            [{"name": "p", "type": "i", "metadata": {"options": []}}]},
+        "options non-str entry": {**base, "promoted_params":
+            [{"name": "p", "type": "i", "metadata": {"options": ["a", 2]}}]},
+        "options empty-str entry": {**base, "promoted_params":
+            [{"name": "p", "type": "i", "metadata": {"options": ["a", ""]}}]},
+        "options over MAX_OPTIONS": {**base, "promoted_params":
+            [{"name": "p", "type": "i",
+              "metadata": {"options": [str(k) for k in range(tex_tool.MAX_OPTIONS + 1)]}}]},
+        "options entry over MAX_OPTION_CHARS": {**base, "promoted_params":
+            [{"name": "p", "type": "i",
+              "metadata": {"options": ["x" * (tex_tool.MAX_OPTION_CHARS + 1)]}}]},
+        "options default out of range": {**base, "promoted_params":
+            [{"name": "p", "type": "i", "default": 5, "metadata": {"options": ["a", "b"]}}]},
+        "options default bool": {**base, "promoted_params":
+            [{"name": "p", "type": "i", "default": True, "metadata": {"options": ["a", "b"]}}]},
+        "options default float": {**base, "promoted_params":
+            [{"name": "p", "type": "i", "default": 0.5, "metadata": {"options": ["a", "b"]}}]},
+        "options contradicts min": {**base, "promoted_params":
+            [{"name": "p", "type": "i", "metadata": {"min": 1, "options": ["a", "b", "c"]}}]},
+        "options contradicts max": {**base, "promoted_params":
+            [{"name": "p", "type": "i", "metadata": {"max": 5, "options": ["a", "b", "c"]}}]},
+        "options contradicts step": {**base, "promoted_params":
+            [{"name": "p", "type": "i", "metadata": {"step": 2, "options": ["a", "b", "c"]}}]},
+        # new inputs[*] key: 'optional' must be a bool; a fused tool's sole source may not be one
+        "input optional not a bool": {**base, "inputs":
+            [{"name": "image", "type": "IMAGE", "optional": "yes"}]},
+        "fused sole input optional": {**fbase, "inputs":
+            [{"name": "image", "type": "IMAGE", "optional": True}]},
     }
     failed = []
     for label, raw in cases.items():
@@ -320,6 +437,117 @@ def test_tool_schema_rejects(r: SubTestResult):
         r.fail("schema rejects", f"these were NOT rejected: {failed}")
     else:
         r.ok(f"all {len(cases)} malformed/unsafe manifests rejected with TEXToolError")
+
+
+# ── byte-identity guard: a pre-existing manifest loads/serialises unchanged ─────────
+# Every hash below was captured against tex_tool.py BEFORE 'tooltip'/'options'/'optional'
+# existed, then re-checked (git stash) to read identically after -- none of the manifests
+# below uses any of the three, so a change to to_dict()/tool_summary()/write_tool's shape
+# for an OLD manifest, or a new key leaking into one, turns one of these red.
+_MANIFEST_BASELINE_SHA256 = {
+    "blur.textool": {
+        "to_dict": "cc8d30cbf3d31a33dd7bb684dcae94561b4da9827fd459b4fd91c5f812135da4",
+        "tool_summary": "37497076f938e2b7086c86f5f807d4658a8388594fbf06bd18bf8c999c22ca1b",
+        "written_bytes": "95b51de7cd8cbc4a4649a6a6d6376f1547e12732364924fe78752db11c97b58d",
+    },
+    "grade.textool": {
+        "to_dict": "108748f0c2c3ceb926551a9188a4cc50096756f000ea098900a78f4a1733b07e",
+        "tool_summary": "040db66ad91572cfe1d2557a02f7260fb0a45af714864fbb9599a45987573802",
+        "written_bytes": "b97b27698ae0302df5c32c5ca7ae9eb5f2876cf8651fde490acc63e7769294c5",
+    },
+    "grade_vignette.textool": {
+        "to_dict": "cfd407ab512b35d0fdca53b1cd0fb29f31a487699210910c182e44d756a4f9db",
+        "tool_summary": "783d1a2d1afa0cca7ac2937c4ded691beff331174ce95b155327e72616c3dc5e",
+        "written_bytes": "9e79d47a2649a8dbae156e11556ac4e801120815ff697323baf73657c70578b5",
+    },
+    "merge.textool": {
+        "to_dict": "52ebde0e7eda07b52b4c9fcec17820a525d24923208ab7666f795aff1879331d",
+        "tool_summary": "f7e68d2ca334ac03e60d46b3f7096c562f7dfc2ded7f9a369219b1b1d5b261b0",
+        "written_bytes": "c7c2a23ee500571a38899dc08639d2322922fb8d26e3b7c84f17743c07381480",
+    },
+    "vignette.textool": {
+        "to_dict": "74a8b0b0b8660dbee20989f3614a7294fb46e2fd9762517ee1a43a2c53430f34",
+        "tool_summary": "11f9fb5e822646fd0e37d6352b2e7ffe4f871e9d300318864b26ea9694bab3f7",
+        "written_bytes": "a5f220a36ae92d331059e2f62a71b4419030597a48250644c923c188921258ba",
+    },
+}
+# Two representative pre-existing manifest shapes (single-stage / fused) -- neither uses any
+# of the new keys -- pinned the same way as the stock exemplars above.
+_OLD_SINGLE_MANIFEST = {"manifest_schema": 1, "name": "OldSingle", "tex_language": "0.23",
+    "code": "f$s = 1.0;\n@OUT = @image * $s;",
+    "inputs": [{"name": "image", "type": "IMAGE"}],
+    "promoted_params": [{"name": "s", "internal": "s", "type": "f", "default": 1.0,
+                          "metadata": {"min": 0.0, "max": 4.0, "label": "Scale"}}]}
+_OLD_SINGLE_SHA256 = {"to_dict": "5b45f25b610e7d2721aafeb64de0845a2ce5c685fa0da07a4c100756c137a6aa",
+                      "tool_summary": "87b30e1509b63f22b4706dfe3fa628d5ff6b5ce2c1933b37a50b3f4a879a8df6",
+                      "written_bytes": "64a534c2cc060790afa6f7fbf8568410d2c047bf47a8f436a1b77fa84317a38f"}
+_OLD_FUSED_MANIFEST = {"manifest_schema": 1, "name": "OldFused", "tex_language": "0.23",
+    "graphspec": {"schema": 1, "stages": [{"code": "@OUT=@image;", "image_input": "image",
+                  "params": {}}], "terminal_image_input": "image"},
+    "terminal_code": "@OUT=@image;", "terminal_image_input": "image",
+    "inputs": [{"name": "image", "type": "IMAGE"}], "promoted_params": []}
+_OLD_FUSED_SHA256 = {"to_dict": "664492abe15a48683a08ac5fa44d107eec568ab5aacff8a81a02b0396935ebc9",
+                     "tool_summary": "492d0a579d93a0e332c4b949085fe53dac96db0e67855d0f39c3705eecb21653",
+                     "written_bytes": "5f1214ae947b73c70ca3e190fd4448ad80c094761d7b85f8e483a4125b024340"}
+
+
+def _hash_manifest(m) -> dict:
+    """sha256 of to_dict()/tool_summary() (canonical JSON) + the exact bytes write_tool
+    writes -- one comparable fingerprint per serialisation path a host might rely on."""
+    d = m.to_dict()
+    s = tex_tool.tool_summary(m)
+    path = tex_tool.write_tool(m, tempfile.mkdtemp())
+    with open(path, "rb") as fh:
+        written = fh.read()
+    return {
+        "to_dict": hashlib.sha256(json.dumps(d, sort_keys=True).encode("utf-8")).hexdigest(),
+        "tool_summary": hashlib.sha256(json.dumps(s, sort_keys=True).encode("utf-8")).hexdigest(),
+        "written_bytes": hashlib.sha256(written).hexdigest(),
+    }
+
+
+def test_tool_manifest_byte_identity(r: SubTestResult):
+    print("\n--- byte-identity guard: a pre-existing manifest loads/serialises unchanged ---")
+    try:
+        mismatches = []
+        for fn, expect in _MANIFEST_BASELINE_SHA256.items():
+            got = _hash_manifest(_stock(fn[:-8]))
+            if got != expect:
+                mismatches.append((fn, expect, got))
+        for label, raw, expect in (("OLD_SINGLE", _OLD_SINGLE_MANIFEST, _OLD_SINGLE_SHA256),
+                                    ("OLD_FUSED", _OLD_FUSED_MANIFEST, _OLD_FUSED_SHA256)):
+            got = _hash_manifest(tex_tool.load_tool(dict(raw)))
+            if got != expect:
+                mismatches.append((label, expect, got))
+        assert not mismatches, f"manifest serialisation drifted: {mismatches}"
+        # no stock tool's summary carries the new 'optional' key (none declares it).
+        for fn in _MANIFEST_BASELINE_SHA256:
+            summ = tex_tool.tool_summary(_stock(fn[:-8]))
+            assert all("optional" not in i for i in summ["inputs"]), summ["inputs"]
+        r.ok(f"{len(_MANIFEST_BASELINE_SHA256) + 2} pre-existing manifests' "
+             f"to_dict()/tool_summary()/written-bytes are unchanged; no stock summary "
+             f"carries 'optional'")
+    except Exception as e:
+        r.fail("manifest byte-identity", str(e))
+
+
+def test_tool_js_publish_filter_pin(r: SubTestResult):
+    print("\n--- ComfyUI-path pin: the JS publish filter still forwards only the five "
+          "original metadata keys ---")
+    try:
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        js_path = os.path.join(here, "js", "tex_extension.js")
+        with open(js_path, encoding="utf-8") as fh:
+            src = fh.read()
+        m = re.search(r"const META_KEYS = new Set\(\[(.*?)\]\)", src)
+        assert m, "META_KEYS literal not found in js/tex_extension.js"
+        keys = set(re.findall(r'"(\w+)"', m.group(1)))
+        assert keys == {"min", "max", "step", "precision", "label"}, (
+            f"js/tex_extension.js META_KEYS changed to {sorted(keys)} -- forwarding "
+            f"tooltip/options to ComfyUI is a deliberate, separate frontend change, not this one")
+        r.ok("js/tex_extension.js still forwards exactly the five original metadata keys")
+    except Exception as e:
+        r.fail("JS publish filter pin", str(e))
 
 
 # ── TOOL-5: the adversarial-AST emitter fuzz lane ───────────────────────────────

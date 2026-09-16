@@ -651,11 +651,15 @@ def main():
         test_tool_roundtrip_unfused,
         test_tool_stock_exemplars,
         test_tool_manifest_keys,
+        test_tool_metadata_tooltip_options,
+        test_tool_input_optional,
         test_tool_promoted_params,
         test_tool_warm_keys,
         test_tool_audit5_fixes,
         test_tool_audit6_fixes,
         test_tool_schema_rejects,
+        test_tool_manifest_byte_identity,
+        test_tool_js_publish_filter_pin,
         test_tool_emitter_fuzz,
         test_lsp_smoke,
         test_lsp_bad_frames,
@@ -664,11 +668,15 @@ def main():
     test_tool_roundtrip_unfused(r)
     test_tool_stock_exemplars(r)
     test_tool_manifest_keys(r)
+    test_tool_metadata_tooltip_options(r)
+    test_tool_input_optional(r)
     test_tool_promoted_params(r)
     test_tool_warm_keys(r)
     test_tool_audit5_fixes(r)
     test_tool_audit6_fixes(r)
     test_tool_schema_rejects(r)
+    test_tool_manifest_byte_identity(r)
+    test_tool_js_publish_filter_pin(r)
     test_tool_emitter_fuzz(r)
     test_lsp_smoke(r)
     test_lsp_bad_frames(r)
