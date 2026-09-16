@@ -1355,6 +1355,18 @@ def main():
     test_hook2_didchange_without_a_map_keeps_the_previous_map(r)
     test_hook2_malformed_map_never_crashes(r)
 
+    # HOOK-4: the state-isolation kit, reachable as TEX_Wrangle.tex_testkit.
+    from test_hook4_testkit import (
+        test_hook4_tex_testkit_importable_without_tests_on_syspath,
+        test_hook4_bare_star_import_yields_the_base_sha_set,
+        test_hook4_helpers_reexports_are_tex_testkit_objects,
+        test_hook4_testkit_stays_off_pytest_and_the_comfy_adapter_path,
+    )
+    test_hook4_tex_testkit_importable_without_tests_on_syspath(r)
+    test_hook4_bare_star_import_yields_the_base_sha_set(r)
+    test_hook4_helpers_reexports_are_tex_testkit_objects(r)
+    test_hook4_testkit_stays_off_pytest_and_the_comfy_adapter_path(r)
+
     success = r.summary()
     return 0 if success else 1
 
