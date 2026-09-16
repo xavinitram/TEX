@@ -705,6 +705,18 @@
           "aliases": []
         },
         {
+          "name": "patch_dist",
+          "sig": "patch_dist(img, dx, dy, radius) → float",
+          "desc": "Mean squared difference between the patch at this pixel and the patch at (dx, dy) pixels away. The non-local-means core.",
+          "example": "float d = patch_dist(@A.rgb, 3, -2, 1);",
+          "tags": [
+            "spatial",
+            "sync",
+            "non-local"
+          ],
+          "aliases": []
+        },
+        {
           "name": "sample_mip_gauss",
           "sig": "sample_mip_gauss(img, u, v, lod) → vec",
           "desc": "Gaussian-prefiltered mipmap sampling. Smoother pyramid (sigma=1.13) gives ~5 dB better exponential blur accuracy vs sample_mip.",
@@ -1315,5 +1327,5 @@
       ]
     }
   ],
-  "function_count": 146
+  "function_count": 147
 }

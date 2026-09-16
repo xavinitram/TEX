@@ -526,6 +526,24 @@ def test_ask1_convolve_fuzzer_scope(r: SubTestResult):
         r.fail("ASK-1 fuzzer scope", f"{type(e).__name__}: {e}")
 
 
+def test_ask13_patch_dist_fuzzer_scope(r: SubTestResult):
+    print("\n--- ASK-13 design §4 T5: patch_dist's differential-fuzzer scope, recorded ---")
+    # Same reasoning as ASK-1's convolve pin just above: `patch_dist` takes an IMAGE-
+    # typed BINDING as its first argument and returns a scalar field, which doesn't
+    # fit the (float,...)->float composition grammar _FN1/_FN2/_FN3 build programs
+    # from — it is deliberately absent, same as every other spatial/two-image
+    # builtin. TST-6 parity (stdlib_probe + test_tst6_registry_parity) and the static
+    # codegen-equivalence corpus (test_codegen_optimizer.py) cover interp==codegen
+    # for patch_dist instead; this test pins the exclusion.
+    try:
+        leaked = [(name, fn_list) for fn_list, name in
+                  ((_FN1, "_FN1"), (_FN2, "_FN2"), (_FN3, "_FN3")) if "patch_dist" in fn_list]
+        assert not leaked, f"patch_dist unexpectedly added to: {[n for n, _ in leaked]}"
+        r.ok("patch_dist intentionally excluded from the float-expression fuzzer grammar")
+    except Exception as e:
+        r.fail("ASK-13 fuzzer scope", f"{type(e).__name__}: {e}")
+
+
 def test_a1_1_auto_precision_fuzz(r: SubTestResult):
     print("\n--- A1-1: fp16-auto accuracy fuzz arm (rediscovers the F1 class) ---")
     # The gate promises "fp16 only where accurate". Fuzz it: generate programs (incl.

@@ -178,6 +178,20 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
     except Exception as e:
         r.fail("ASK-1 fp16 gate", f"{type(e).__name__}: {e}")
 
+    # (f) ASK-13 design §4 point 8: a program calling patch_dist under
+    # precision="auto" is DECLINED (falls to fp32) — "patch_dist" in FP16_FRAGILE is
+    # what makes this so; the gate itself is exercised end to end (invariant 10).
+    try:
+        bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
+        code = "@OUT = vec4(patch_dist(@A, 3, -2, 1), 0.0, 0.0, 1.0);"
+        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        tm = TypeChecker(binding_types=bt, source=code).check(prog)
+        got = pp.resolve_auto_precision(prog, pp._MIN_FP16_PX, "cuda")[0]
+        assert got == "fp32", f"patch_dist under precision='auto' resolved {got!r}, want 'fp32'"
+        r.ok("ASK-13: patch_dist declines precision='auto' (resolves fp32)")
+    except Exception as e:
+        r.fail("ASK-13 fp16 gate", f"{type(e).__name__}: {e}")
+
 
 def test_c3st_gm_rules(r: SubTestResult):
     print("\n--- C3-st: per-rule units for the precision gate (_gm / resolve) ---")

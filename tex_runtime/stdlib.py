@@ -1598,6 +1598,107 @@ class TEXStdlib:
         result = out.permute(0, 2, 3, 1)                       # [B,H,W,C]
         return result.squeeze(-1) if squeeze else result
 
+    @staticmethod
+    def _uniform_scalar_or_raise(x, argname: str) -> int:
+        """The single uniform value `x` names, as an int, or a raise stating how many
+        distinct values it saw.
+
+        ASK-13: `patch_dist`'s dx/dy/radius resolve host-side (one `.item()`-shaped
+        check each), exactly like gauss_blur's sigma or convolve's normalize flag
+        above. Unlike those, a per-pixel value here would be a data-dependent gather
+        with no honest cost bound, so it is refused rather than silently meaning one
+        of its values (design.md §1 "Uniform-only, and refused otherwise"). Same
+        refusal SHAPE as `tex_provider._uniform_time`'s E7003 — numel==1 / all-equal /
+        else raise naming the distinct count — restated for a stdlib argument instead
+        of a host `t`. Not the same error FAMILY: E7xxx is `tex_provider.py`'s host-I/O
+        class; this is a plain stdlib argument check, raised the same way fn_convolve's
+        kernel-shape ValueErrors are above, so both tiers (which call this identical
+        function) raise identically instead of one of them hitting a raw torch
+        RuntimeError from an ambiguous `.item()`.
+        """
+        if not isinstance(x, torch.Tensor):
+            return int(x)
+        if x.numel() == 1:
+            return int(x.reshape(()).item())
+        flat = x.reshape(-1)
+        if bool(torch.all(flat == flat[0])):
+            return int(flat[0].item())
+        n = int(torch.unique(flat).numel())
+        raise ValueError(
+            f"patch_dist(): '{argname}' must be uniform across the grid (one value "
+            f"per cook), but saw {n} distinct values. Hoist it out of the pixel grid "
+            f"(a $param or a scalar expression) — a per-pixel offset is an unbounded "
+            f"data-dependent gather with no honest cost bound."
+        )
+
+    # ASK-13: patch-distance primitive. `dx`/`dy` are integer PIXEL offsets, not a
+    # vec2 and not UV — pixels because the UV tap-step is off by one pixel in W and
+    # is itself a separate ask (design.md §1); two scalars because fn_fetch's own
+    # (img, px, py) order already fixes x-then-y here. footprint='image': the true
+    # reach is radius + max(|dx|,|dy|) — TWO arguments — and the ROI-1 descriptor
+    # grammar reads exactly one (design.md §2); `('halo_arg', ...)` would under-pad
+    # by the offset the moment ROI narrows a program that uses this call.
+    @stdlib("patch_dist", sig='patch_dist(img, dx, dy, radius) \\u2192 float', category='Sampling',
+            spatial=True, sync=True, footprint='image',
+            doc='Mean squared difference between the patch at this pixel and the patch at (dx, dy) pixels away. The non-local-means core.',
+            ex='float d = patch_dist(@A.rgb, 3, -2, 1);')
+    @staticmethod
+    def fn_patch_dist(image, dx, dy, radius) -> torch.Tensor:
+        """Per-pixel mean squared difference between the (2r+1)^2 patch centred at
+        this pixel and the patch centred at this pixel + (dx, dy) pixels, averaged
+        over the patch AND over the channels of `image` as passed.
+
+        Args:
+            image: [B, H, W, C] tensor, or [B, H, W] mask.
+            dx, dy: integer pixel offsets. Must be uniform across the grid (one
+                value per cook) — see `_uniform_scalar_or_raise`; a per-pixel
+                offset raises rather than silently meaning one of its values.
+            radius: patch half-size; uniform-or-raise like dx/dy, then clamped to
+                [0, 32] (mirrors `_morph`'s defensive clamp — the real range is 1-3).
+
+        Replicate border padding throughout (matches sample/gauss_blur/erode/dilate/
+        convolve), via `_pad_replicate_chunked` for both the (dx, dy) shift and the
+        box-mean pad — never a single unchunked F.pad call. The shift is a pad+narrow
+        VIEW (no gather, no index tensors); the box mean is separable with the
+        summation order pinned (ascending offset, W pass then H pass) — explicit
+        slice-adds, never cumsum (integral-image cancellation) or a ones-kernel
+        conv2d (unpinned algorithm selection). No codegen emitter: codegen's general
+        function-call fallback calls this identical callable, so interp and codegen
+        are bit-exact by construction (invariant #2), not by parallel review.
+        """
+        img = _to_tensor(image)
+        r = TEXStdlib._uniform_scalar_or_raise(radius, "radius")
+        sx = TEXStdlib._uniform_scalar_or_raise(dx, "dx")
+        sy = TEXStdlib._uniform_scalar_or_raise(dy, "dy")
+        r = min(max(r, 0), 32)
+
+        squeeze = img.dim() == 3                              # [B,H,W] mask -> add a channel
+        x = _get_bchw(img.unsqueeze(-1) if squeeze else img)  # [B,C,H,W]
+        H, W = x.shape[-2], x.shape[-1]
+
+        # Shifted field: pad by |sx|/|sy| then NARROW to a view reading pixel+(dx,dy),
+        # replicate-clamped at the border — O(1) extra, no gather, no index tensors.
+        ax, ay = abs(sx), abs(sy)
+        padded = _pad_replicate_chunked(x, ax, ax, ay, ay)
+        x_shift = padded.narrow(-1, ax + sx, W).narrow(-2, ay + sy, H)
+
+        # Channel mean FIRST (the box sum below then runs on one plane, not C).
+        d2 = ((x - x_shift) ** 2).mean(dim=1)                  # [B,H,W]
+        if r == 0:
+            return d2                                          # a 1x1 patch IS this
+
+        # Separable box mean over the (2r+1)^2 patch, ascending-offset summation.
+        d2c = d2.unsqueeze(1)                                  # [B,1,H,W]
+        pad_w = _pad_replicate_chunked(d2c, r, r, 0, 0)
+        acc = pad_w[..., 0:W]
+        for k in range(1, 2 * r + 1):
+            acc = acc + pad_w[..., k:k + W]
+        pad_h = _pad_replicate_chunked(acc, 0, 0, r, r)
+        acc2 = pad_h[..., 0:H, :]
+        for k in range(1, 2 * r + 1):
+            acc2 = acc2 + pad_h[..., k:k + H, :]
+        return (acc2 / float((2 * r + 1) ** 2)).squeeze(1)     # [B,H,W]
+
     @stdlib("sample_mip_gauss", sig='sample_mip_gauss(img, u, v, lod) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint='image', doc='Gaussian-prefiltered mipmap sampling. Smoother pyramid (sigma=1.13) gives ~5 dB better exponential blur accuracy vs sample_mip.', ex='@OUT = sample_mip_gauss(@A, u, v, 2.5);')
     @staticmethod
     def fn_sample_mip_gauss(image, u_coord, v_coord, lod) -> torch.Tensor:

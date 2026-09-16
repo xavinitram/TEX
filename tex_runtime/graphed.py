@@ -70,6 +70,9 @@ _SYNC_STDLIB = frozenset({
     # ASK-1: convolve's `normalize` flag resolves via .item() → capture-illegal sync,
     # exactly like gauss_blur's sigma above.
     "convolve",
+    # ASK-13: patch_dist's dx/dy/radius each resolve via a `.item()`-shaped
+    # uniform-or-raise check → capture-illegal, same reason as convolve above.
+    "patch_dist",
     # LX-5: debug_print records a thread-local side-effect via an .item() readout —
     # capture-illegal, and it must run on the interpreter anyway so the probe fires.
     "debug_print",

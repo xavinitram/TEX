@@ -36,6 +36,10 @@ _NON_LOCAL_SINCE_V022 = frozenset({
     # ASK-1 (v0.35): convolve. footprint='image' — a general kernel-image gather (see
     # design.md §2 for why ('halo_arg', kernel) can't be built), so no strip, no tile.
     "convolve",
+    # ASK-13 (v0.35): patch_dist. footprint='image' — its reach depends on TWO
+    # arguments (radius AND max(|dx|,|dy|)), and the ROI-1 descriptor grammar reads
+    # exactly one (design.md §2), so no strip, no tile.
+    "patch_dist",
 })
 
 _EXPECTED_NON_LOCAL = _HISTORICAL_NON_LOCAL | _NON_LOCAL_SINCE_V022

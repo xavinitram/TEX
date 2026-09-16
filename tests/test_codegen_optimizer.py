@@ -263,6 +263,12 @@ c.r = 1.0;
         # Complex expressions
         ("chained math", "@OUT = clamp((@A - 0.5) * 2.0 + 0.5, 0.0, 1.0);"),
         ("nested functions", "@OUT = vec3(sqrt(abs(sin(@A.r))), sqrt(abs(cos(@A.g))), @A.b);"),
+
+        # ASK-13: patch_dist — pins the no-emitter route (codegen's general fallback
+        # calls the identical `_fns['patch_dist']` callable interp uses) at a nonzero
+        # radius, and separately at radius=0 (the pointwise-diff short-circuit path).
+        ("patch_dist", "m@OUT = patch_dist(@A.rgb, 2, -1, 1);"),
+        ("patch_dist radius=0", "m@OUT = patch_dist(@A.rgb, 2, -1, 0);"),
     ]
 
     # ── Two-input programs (bindings A + B) ──

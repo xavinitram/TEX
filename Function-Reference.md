@@ -105,6 +105,7 @@
 | `gauss_blur` | `gauss_blur(img, sigma) → vec` | Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding. | spatial, sync, non-local |
 | `bilateral_filter` | `bilateral_filter(img, spatial_sigma, range_sigma) → vec` | Edge-preserving smoothing: blurs within regions but keeps edges. Window capped at 7×7. | spatial, sync, non-local |
 | `convolve` | `convolve(img, kernel[, normalize]) → vec` | General image-kernel convolution (the kernel is flipped, not correlated). kernel is a second IMAGE/MASK binding, read whole; kernel size in [1,257]. Its channel count broadcasts (1 plane -> every image channel) or weights per channel (== image channels, depthwise). normalize=1 (default) divides by the per-channel kernel sum; 0 returns the raw weighted sum. Replicate border padding. | spatial, sync, non-local |
+| `patch_dist` | `patch_dist(img, dx, dy, radius) → float` | Mean squared difference between the patch at this pixel and the patch at (dx, dy) pixels away. The non-local-means core. | spatial, sync, non-local |
 | `erode` | `erode(img, radius) → vec` | Morphological erosion (local min over a (2r+1)² square). Shrinks bright regions. | sync, non-local |
 | `dilate` | `dilate(img, radius) → vec` | Morphological dilation (local max). Grows bright regions. | sync, non-local |
 | `fetch_frame` | `fetch_frame(img, frame, px, py) → vec` | Nearest-neighbor fetch from a specific batch frame. | spatial, non-local |

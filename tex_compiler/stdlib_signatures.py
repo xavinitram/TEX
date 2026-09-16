@@ -44,6 +44,16 @@ def _promote_args(arg_types: list[TEXType]) -> TEXType:
     return result
 
 
+def _float_type(arg_types: list[TEXType]) -> TEXType:
+    """Always FLOAT. ASK-13: `patch_dist` is a per-pixel scalar field regardless of
+    the image's channel count (the mean is taken over channels too) — a NAMED helper
+    per AGENTS.md's stdlib recipe ("a named helper, not a lambda"), even though the
+    table's other FLOAT-returning rows below (dot/length/distance/luma/determinant)
+    are still lambdas; not touched here, since a REG-1 mechanical move is a different
+    change than adding a row."""
+    return TEXType.FLOAT
+
+
 # Function signatures: name -> {args: (min, max), return: type_or_callable}
 FUNCTION_SIGNATURES: dict[str, dict] = {
     # Math — scalar or element-wise on vectors
@@ -155,6 +165,9 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "sample_mip_gauss": {"args": (4, 4), "return": _passthrough_type},
     "gauss_blur":     {"args": (2, 2), "return": _passthrough_type},
     "bilateral_filter": {"args": (3, 3), "return": _passthrough_type},
+    # ASK-13: patch_dist(img, dx, dy, radius) -- unlike the passthrough rows above,
+    # the result is always a per-pixel scalar (the mean is taken over channels too).
+    "patch_dist":     {"args": (4, 4), "return": _float_type},
 
     # Cross-frame sampling — first arg is still the binding
     "fetch_frame":    {"args": (4, 4), "return": _passthrough_type},

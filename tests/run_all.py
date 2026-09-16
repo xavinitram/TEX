@@ -134,6 +134,7 @@ from test_v017_phase1 import (
     test_tst4_operator_completeness,
     test_tst1_differential_fuzzer, test_a1_1_auto_precision_fuzz,
     test_ask1_convolve_fuzzer_scope,
+    test_ask13_patch_dist_fuzzer_scope,
     test_tst7_runner_coverage,
 )
 from test_v017_phase2 import (
@@ -352,6 +353,7 @@ def main():
     test_tst1_differential_fuzzer(r)
     test_a1_1_auto_precision_fuzz(r)
     test_ask1_convolve_fuzzer_scope(r)
+    test_ask13_patch_dist_fuzzer_scope(r)
     test_tst7_runner_coverage(r)
     test_reg1_registry_parity(r)
     test_tst3_taxonomy_consistency(r)
@@ -573,6 +575,7 @@ def main():
         test_roi2_footprints,
         test_roi2_plan_executability,
         test_ask1_convolve_roi_pin,
+        test_ask13_patch_dist_roi_pin,
         test_roi4_reach_pinning,
         test_roi4_never_sever,
         test_roi3_tile_is_roi_special_case,
@@ -587,6 +590,7 @@ def main():
     test_roi2_footprints(r)
     test_roi2_plan_executability(r)
     test_ask1_convolve_roi_pin(r)
+    test_ask13_patch_dist_roi_pin(r)
     test_roi4_reach_pinning(r)
     test_roi4_never_sever(r)
     test_roi3_tile_is_roi_special_case(r)
@@ -1307,6 +1311,24 @@ def main():
     test_ask1_t8_kernel_wider_than_image(r)
     test_ask1_t8_invalid_args_raise(r)
     test_ask1_t11_e3011_reserved_name(r)
+
+    # ASK-13 — patch-distance builtin (design.md §4 point 6 edge cases + the
+    # reserved-name row; points 1-3/5/7/8 land as edits to the existing test files
+    # their rows name, wired above/near the ASK-1 block).
+    from test_v035_ask13 import (
+        test_ask13_t6_radius0_equals_pointwise,
+        test_ask13_t6_zero_offset_exact_zero,
+        test_ask13_t6_large_offset_finite_clamped,
+        test_ask13_t6_nan_propagates,
+        test_ask13_t6_per_pixel_offset_raises,
+        test_ask13_reserved_name_e3011,
+    )
+    test_ask13_t6_radius0_equals_pointwise(r)
+    test_ask13_t6_zero_offset_exact_zero(r)
+    test_ask13_t6_large_offset_finite_clamped(r)
+    test_ask13_t6_nan_propagates(r)
+    test_ask13_t6_per_pixel_offset_raises(r)
+    test_ask13_reserved_name_e3011(r)
 
     # HOOK-3: the linear collapse a host needs, and the gate's refusal as data.
     from test_hook3_checkpoint_collapse import (
