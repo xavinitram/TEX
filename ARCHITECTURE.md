@@ -97,7 +97,7 @@ This is machine-enforced by `test_s1_core_no_comfy` (a package-level lint) and e
 by `test_s1_comfyui_free_execution` (blocks every comfy import, then drives
 `TEXWrangleNode.execute` + `tex_api.compile`).
 
-**PORT-6 (v0.35) closed the lint's blind spot: the package ROOT.** S-1 proves no `tex_core`
+**PORT-6 (v0.34.2) closed the lint's blind spot: the package ROOT.** S-1 proves no `tex_core`
 module *imports* a ComfyUI surface; it could not stop `__init__.py` from doing so on every
 importer's behalf. Two lines did: `from .tex_node import TEXWrangleNode` at module scope, and
 the route block's `from server import PromptServer` (ComfyUI's `server` imports `nodes`, which

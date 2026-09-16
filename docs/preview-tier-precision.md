@@ -127,7 +127,7 @@ already solved.
 **The colour/data plane split is not implemented as stated.** The roadmap's shape is "colour
 planes half / data planes fp32". TEX cannot tell them apart today: DATA-1's vocabulary is
 `colorspace / premult / frame / extra` with **no role field**, and named planes are DATA-6
-(v0.35). Pretending otherwise would mean inferring a role from pixels, which is exactly the
+(v0.36). Pretending otherwise would mean inferring a role from pixels, which is exactly the
 kind of silent auto-tuning S-5 forbids. So the split is expressed with the two instruments
 that do exist, and both fail toward fp32:
 

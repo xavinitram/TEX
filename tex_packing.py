@@ -58,7 +58,7 @@ WHAT IS NOT DECIDED HERE, and must not be:
     preview. There is no auto-detection and no global switch (S-5: never silently retune a box).
   * COLOR vs DATA planes — and this is where an earlier draft of this file gave up too early.
     It said the engine "cannot tell them apart" because DATA-1's vocabulary
-    (colorspace/premult/frame/extra) has no role field and named planes are DATA-6 (v0.35).
+    (colorspace/premult/frame/extra) has no role field and named planes are DATA-6 (v0.36).
     Both facts are true and the conclusion was wrong: TEX has classified output KIND at the
     marshalling seam since M-3 — `map_inferred_type` turns an inferred TEXType into
     IMAGE / MASK / LATENT / INT / STRING. That is not a plane role, but it is exactly the

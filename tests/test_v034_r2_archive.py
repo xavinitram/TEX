@@ -92,7 +92,7 @@ def test_v034_r2_neutrality(r):
 
     This is the neutrality proof doc 41 §3.4 asks for: with one archived version the corpus
     test runs the same single comparison it ran before R2-archive, so the mechanism changed
-    the machinery and nothing else. When v0.35 freezes 0.24 this row's count becomes 2 and
+    the machinery and nothing else. When v0.36 freezes 0.24 this row's count becomes 2 and
     the assertion below is what makes someone update it deliberately."""
     try:
         from TEX_Wrangle.tex_api import LANGUAGE_VERSION

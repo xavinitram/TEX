@@ -5,6 +5,171 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] - 2026-09-16
+
+**Common ground** — one cook grid whatever order the bindings arrive in, two native builtins,
+a checkpoint gate that says why it refuses, and the decisions the Planes release will stand on.
+Design docs: `docs/plane-bindings.md`, `docs/roto-lang-decision.md`.
+
+**The Planes release (DATA-6's implementation + EXR layers/parts + PM-10) moves to `v0.36.0`.**
+
+This entry also carries the record the `[0.34.2]` entry deferred to `v0.35.0`: the v0.35 phase-0
+work (the carry-forward register, CF-6's cook-grid consensus, the ROTO-lang decision) and phase 1
+(the DATA-6 design doc), filed below by CF id or phase. The version pencil behind Planes moves
+one place with it (`docs/roadmap.md` §9).
+
+### Added
+
+- **`convolve(img, kernel[, normalize]) → vec` — a native image-kernel convolution (ASK-1).** A
+  true convolution (the kernel is flipped, not correlated) with replicate border padding, chunked
+  so an oversized kernel never asks one `F.pad` call for more margin than an axis has. `kernel` is
+  a second IMAGE/MASK binding, read whole: 1–257 taps per axis, batch 1, and a channel count that
+  either broadcasts (one plane to every channel) or weights per channel (depthwise) — anything
+  else raises rather than clamps. `normalize=1` (the default) divides by the per-channel kernel
+  sum; `0` returns the raw weighted sum. **Tiers:** one implementation and no codegen emitter —
+  codegen's general fallback calls the identical callable, so the two tiers are the same bytes
+  by construction. **Footprint `'image'`**, not `('halo_arg', kernel)`: a binding argument yields
+  no static reach, and a narrowed ROI would slice the kernel binding (recorded in
+  `DEVELOPMENT.md` §"Rejected design decisions"). Tagged `sync` (the flag resolves host-side) and
+  classified `FP16_FRAGILE` — an unbounded weighted reduction that can also divide by a
+  near-zero kernel sum — so `precision="auto"` resolves fp32 for any program that calls it.
+  **`convolve` is now a reserved built-in name:** a program defining a function of that name
+  fails E3011, so rename it — per `AGENTS.md`, a minor breaking change. `examples/convolve.tex`
+  is unchanged; it is a frozen compat-corpus program. ComfyUI-invisible because it is one new
+  `@stdlib` entry plus one signature row: every program that does not define its own `convolve`
+  compiles to the same AST and cooks through the same tiers, and the only visible change is one
+  more name in the help panel that a user function can no longer take.
+- **`patch_dist(img, dx, dy, radius) → float` — the non-local-means core as a builtin
+  (ASK-13).** The mean squared difference between the `(2r+1)²` patch at each pixel and the patch
+  `(dx, dy)` pixels away, averaged over the patch and the channels — a mean rather than a raw
+  SSD, so a caller's `h²` does not move with `radius`. `dx`/`dy`/`radius` resolve host-side and
+  must be uniform across the grid: a per-pixel value is refused with a `ValueError` naming the
+  distinct count rather than silently meaning one of its values, and `radius` clamps to
+  `[0, 32]`. Replicate edges through the same chunked pad `convolve` uses, and a pinned summation
+  order (explicit slice-adds, never `cumsum` or a ones-kernel `conv2d`). **Tiers:** one
+  implementation, no emitter, the same bytes on both. **Footprint `'image'`**: the reach,
+  `radius + max(|dx|, |dy|)`, spans two arguments and the descriptor reads one, so a `halo_arg`
+  would under-pad when tiled (recorded beside `convolve`'s). `sync`, and `FP16_FRAGILE` by hand
+  classification, so `precision="auto"` declines it too. **`patch_dist` is now a reserved
+  built-in name** — E3011 on a user function of that name; the same minor breaking change.
+  `examples/denoise.tex` is deliberately not rewritten on it. ComfyUI-invisible because, like
+  `convolve`, it is one registry entry and one signature row: no module removed, no call path
+  changed, no default moved.
+- **`tex_fusion.collapse_linear(stages)` — a region rewritten to the shape the checkpoint gate
+  admits (HOOK-3).** `region_to_stages` spells every chained stage with `chain_inputs`, even for
+  a plain path, so the CACHE-6 gate refused every region the engine's own assembler produced —
+  silently — and a host had to re-derive the wiring rules to get past it. This returns the
+  legacy `chain_input` spelling, or `None`. Legality is read off `stage_edges`, where the wiring
+  rules already live, so there is no second copy to drift; an already-collapsed list comes back
+  as an equal copy, so a host may call it unconditionally. `None` stays the only honest answer
+  for a DAG: the weaker "one in-edge is enough" rule once admitted 425 DAG lists with 30
+  wrong-pixel cases, and the new test rebuilds it and measures what it admits (maxdiff 2.2e-02
+  over 3072 elements). ComfyUI-invisible because it is a new function with no in-tree caller.
+- **`tex_checkpoint.gate_refusal(...)` — the gate refuses audibly (HOOK-3).** `None` when the
+  gate admits, else a frozen `GateRefusal(code, stage, message)`: a stable `REFUSE_*` code
+  (`no-result-cache`, `latent-channel-count`, `too-few-stages`, `precision-not-fp32`,
+  `stage-list-not-collapsed`, `stage-list-not-linear`, `upstream-keys-incomplete`,
+  `binding-shape-unknown`), the offending stage index when one stage is to blame (`None` when the
+  refusal is about the call), and a human message that carries no contract. A region that is
+  linear but uncollapsed gets its own code, apart from a real DAG's, because it is one
+  `collapse_linear` call away from admission. **`_gate_ok`'s decisions are unchanged:** it is now
+  `gate_refusal(...) is None` — the same checks in the same order — pinned by an 11-row decision
+  table on which the boolean and the structured answer agree. ComfyUI-invisible because
+  `_gate_ok` keeps its signature and every decision it has made, and the refusal is data a host
+  has to ask for, inside a module the ComfyUI node never imports. Design note:
+  `docs/effort-based-checkpoints.md` §9.1.
+- **`ResultCache.requalify()` / `preview_entries()` (CF-4, phase 0).** A host lands the
+  final-quality frame and the preview it replaces is evicted in the same call — without the
+  eviction, coexistence pays the governor twice. The eviction targets the ENTRY this call decided
+  to replace, not the key, which covers the in-place upgrade (requalifying a key to itself) and
+  a concurrent `put` in one rule.
+- **CF-7 — pins for facts that were synchronised only by comment (phase 0).** The type checker's,
+  the interpreter's and the diagnostic hints' builtin-name sets must agree, and the editor's
+  publish-manifest `tex_language` must equal `tex_api.LANGUAGE_VERSION`
+  (`tests/test_v035_hygiene.py`).
+
+### Changed
+
+- **The E5xxx family description** (`Error-Codes.md`, from `tools/gen_error_codes.py`) no longer
+  lists a codegen fallback as an error: falling back is a routing decision the engine makes and
+  reports through the tier trace.
+
+### Fixed
+
+- **CF-6 — the output grid depended on binding order.** It came from the FIRST spatial binding,
+  so a `[B,1,W,C]` strip declared before a `[B,H,W,C]` frame collapsed `v`/`iy`/`ih` to one row —
+  0.60 maxdiff between two orderings of the same graph. The grid is now the broadcast consensus,
+  the largest extent per axis, and `max` is commutative: binding order moves pixels by 0.0 by
+  construction. SIX derivations existed, and fixing the interpreter alone left codegen's own
+  first-wins loop 0.98–0.999 away from it (invariant #2), so `_consensus_extent` is now the one
+  owner for the interpreter, `_build_codegen_env`, `run_roi`'s R1 refusal, `run_auto`'s autotier
+  bucket key, M-1's peak-bytes preflight and `tex_engine`'s `cook_px`. `cook_px` reached PIXELS:
+  `precision="auto"` gates on it, and on CUDA at 2048² strip-first resolved fp32 where
+  frame-first resolved fp16 (maxdiff 7.32e-04), so the order-independence pin carries a CUDA
+  leg. Participants are the bindings the program READS, and an ROI cook decides them the same
+  way a whole-frame cook does. None of the 129 frozen compat-corpus programs binds two spatial
+  tensors whose extents disagree, so no golden moves. Lazy-pruning rule R1 is documented as
+  load-bearing, correcting a note that called it purposeless.
+- **CF-1 — a patch over a demoted base left the residency ladder.** `patch_region` records the
+  BASE's home, so the patched frame can be promoted back instead of taking every downstream stage
+  with it to the CPU. The promote queue built for the latency half was removed, not kept: nothing
+  appended to it, so it was unreachable code claiming a guarantee. The latency half (an 11.1 ms
+  H2D inside the composite lock) stays open, with its argument in `DEVELOPMENT.md`.
+- **CF-2 — the shipped host example, and a whole-frame partial recook.**
+  `examples/host_demo.py`'s `RoiComp` composes its windows through `tex_roi.chain_windows` and
+  tracks `valid`/`declined`, instead of demonstrating the hand-rolled walk a host would copy.
+  `cook(None, dirty_from=k)` over a window-valid input used to record "correct everywhere"; the
+  prefix is now checked and the recook widens to 0.
+- **CF-5a — `egress`'s blocking fallback ran inside the `except`.** When it failed too — both
+  routes are capture-illegal mid-CUDA-graph-capture — its error was raised during handling of the
+  pinning failure and buried beneath it. The fallback now runs outside the handler, so the capture
+  error is the one reported.
+
+### Decided (no code change)
+
+- **ROTO-lang: not shipped, on a measurement** (`docs/roto-lang-decision.md`, from
+  `benchmarks/roto_spike.py`). Procedural masks measured 2.3–8.9× slower on a first frame and
+  18–93× slower during an unrelated scrub, both devices, 1080p and 4K. The scrub column decides
+  it: a rasterized mask survives a grade drag untouched, while a procedural one is part of the
+  program and re-cooks with it. No `sdf_bezier`, no `spline_mask`, and DATA-5 is unblocked:
+  masks arrive as planes.
+- **DATA-6, the decisions before any code** (`docs/plane-bindings.md`, phase 1). The lexer owns
+  the dot, greedy over exactly one segment, because the parser never sees binding types:
+  `@beauty.diffuse.rgb` is a plane read followed by a swizzle, and `@A.rgb` is a mis-tokenized
+  swizzle the type checker splits back. An UNTYPED base stays a swizzle, so nothing that
+  compiles today can be re-read as a plane tomorrow. The compat scan ran in phase 1, because a
+  dirty result changes the design: it found 50 dotted `@` forms across 245 programs, all
+  swizzles, which makes the splitback a hot path and gives the implementation a bounded
+  bit-exactness gate over exactly those 50. `tools/planes_compat_scan.py` stays as the tripwire
+  (non-zero only if a dotted segment is not a swizzle). Also decided: `PlanesValue` as the wire
+  shape (deliberately not a tensor subclass), a lowercase-only collision set (38 names, so
+  `@beauty.Z` needs no escape hatch), and expansion inside `compile_ast`, so the three compile
+  paths share one seam that COLOR-1 inherits.
+- **The register** (`DEVELOPMENT.md` §"Rejected design decisions"). Phase 0 closed four falsified
+  rows, replaced two stale gates with ones that can fire — CF-3's among them: charging
+  `evict_bytes` at commit now waits on a governor consumer that measurably over-evicts, not on a
+  date — and recorded three new deferrals with gates. CF-5b decides PROF-1's cross-launch question: persist
+  the cost table and let placement re-derive (not yet built). The XPU-2 × CUDA-graph capture
+  non-interaction is argued on three independent reasons in `docs/async-egress.md`. `convolve`'s
+  and `patch_dist`'s `halo_arg` footprints are recorded as rejected, each with its reopen
+  condition.
+- **No compat-corpus freeze.** `tex_api.LANGUAGE_VERSION` stays `0.23`: `convolve` and
+  `patch_dist` are function additions on unchanged grammar, which do not bump the language
+  (`docs/plane-bindings.md` §9), and `freeze()` may only add a version not already archived.
+  Freeze #2 (`0.24`) comes with the plane grammar.
+
+### Measured
+
+- **Embedding: PORT-6 (v0.34.2) already discharged the request for a lazy package import**, so
+  nothing lands for it here. In a fresh interpreter, after `import TEX_Wrangle` and reading
+  `__version__`, exactly **one** TEX module is loaded (the package root), `torch` is not
+  imported, no ComfyUI module is imported, and `NODE_CLASS_MAPPINGS` still resolves lazily
+  afterwards.
+- **CF-6's cost:** −0.42 µs on the common single-binding path and +1.16 µs worst case, 0.17% of a
+  0.7 ms cook; against v0.34.1 the benchmark flagged no config (GPU 1.004–1.013×), and the
+  mutation sweep killed 50/50. **PM-2**, re-measured after CF-2 rewrote the example it runs:
+  3.43 ms/frame.
+
 ## [0.34.2] - 2026-08-05
 
 **Mind the doorway** — the package root stops dragging the ComfyUI adapter through it. An

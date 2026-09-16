@@ -80,7 +80,7 @@ still recomputes per cook.
   stroke capture, AI assists and the rasterizer itself were never engine items; this measurement
   says the *evaluation* belongs there too.
 * **Not closed: whether TEX should read a mask more cheaply.** `apply` is 0.75–15.58 ms, most of
-  it the ordinary cost of a full-frame multiply. DATA-6's plane bindings (v0.35) are the
+  it the ordinary cost of a full-frame multiply. DATA-6's plane bindings (v0.36) are the
   relevant lever — a mask arriving as a named plane rather than a separate wire — and that is
   already scheduled.
 

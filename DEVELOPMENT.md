@@ -858,7 +858,7 @@ Settled calls, kept here so they're not re-derived:
   exceeds host RAM. See `docs/compressed-cache-tiers.md` §4.
 - **Inferring a colour-vs-data plane role from pixels** (v0.33 PREC-1) — rejected on S-5. The
   roadmap's shape is "colour planes half / data planes fp32", and TEX cannot tell them apart:
-  DATA-1's vocabulary has no role field and named planes are DATA-6 (v0.35). Sniffing content to
+  DATA-1's vocabulary has no role field and named planes are DATA-6 (v0.36). Sniffing content to
   guess is exactly the silent auto-tuning the discipline forbids. Shipped instead: an explicit
   `storage="fp32"` pin, and an *exact* value-range gate — both failing toward fp32. When DATA-6
   lands, `choose_storage` grows a role arm and no caller changes.
@@ -989,7 +989,7 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   string expression, or a loop variable. An AST derivation would close the common case and
   silently miss the rest, which is worse than a stated obligation with a helper. Reopens if
   the compiler ever grows a "constant string arguments to fn X" analysis for another reason
-  (COLOR-1's space names are the likely one, v0.36).
+  (COLOR-1's space names are the likely one, v0.37).
 - **Per-device residency for the DATA-7 media pool (v0.34)** — the pool caches whatever
   device the provider returned, and `_provider_read` moves the frame to the cook's device on
   every call. A CPU provider feeding a CUDA cook therefore pays one H2D per CALL rather than

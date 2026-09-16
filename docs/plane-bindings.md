@@ -233,7 +233,7 @@ Insert-thrice-with-a-parity-pin was the alternative and is rejected: a parity pi
 three copies agree *today*, which is the same bet phase 0 lost six times over on the cook-grid
 derivation. One owner, or it drifts.
 
-**COLOR-1 (v0.36) inherits this decision rather than remaking it** — its expansion pass needs
+**COLOR-1 (v0.37) inherits this decision rather than remaking it** — its expansion pass needs
 the same three insertions one release later, and this is the whole reason the convergence is
 decided in the DATA-6 doc instead of being split across two.
 
@@ -311,7 +311,7 @@ comparison in the tree.
   phase-0 deferral gated on exactly this doc. The answer now: **a plane is co-extent with its
   wire**, so planes do not create the case, and the deferral stays open on its own terms for
   ordinary wires.
-* **UINT planes** — excluded from v0.35, cryptomatte named as the future customer.
+* **UINT planes** — excluded from v0.36, cryptomatte named as the future customer.
 * **Per-plane residency/eviction.** `PlanesValue` holds tensors a `ResultCache` entry could in
   principle tier independently. Out of scope; noted because CF-1's home propagation is the
   machinery it would build on.
