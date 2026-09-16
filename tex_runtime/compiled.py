@@ -27,7 +27,7 @@ import torch
 
 from ..tex_compiler.ast_nodes import (BinOp, UnaryOp, TernaryOp, FunctionCall,
                                       VecConstructor, MatConstructor, CastExpr,
-                                      IfElse, ForLoop, WhileLoop)
+                                      IfElse, ForLoop, WhileLoop, BindingRef)
 from .interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
 from .interpreter import (Interpreter, _collect_identifiers, _consensus_extent,
                           _SCALAR_BUILTIN_DEFAULTS)
@@ -564,7 +564,8 @@ def execute_compiled(
                                          latent_channel_count, output_names,
                                          used_builtins=used_builtins, precision=precision,
                                          fingerprint=fingerprint,
-                                         time_context=time_context)   # ENG-7
+                                         time_context=time_context,   # ENG-7
+                                         place_params=True)           # opt-in route
         # Use plain interpreter for programs without spatial tensor context
         # (procedural noise, etc.) — codegen env setup overhead exceeds
         # benefit when all operations are on scalar tensors
@@ -913,6 +914,75 @@ def _contiguous_bindings(bindings: dict, device: "torch.device | None" = None) -
     return {k: _norm(v) for k, v in bindings.items()}
 
 
+def _params_on_device(cg_fn, program, bindings: dict, device: "torch.device") -> dict:
+    """{name: tensor} for each `$param` binding the program reads, converted on the cook device
+    the way the generated preamble converts it (`as_tensor`, dtype inferred) — the preamble then
+    passes the tensor through untouched. Python values only: a tensor binding is co-located by
+    `_contiguous_bindings` already, a string stays a string, and a value `as_tensor` cannot
+    convert is left for the preamble to raise on, as before. The names come from the program's
+    `$` references, walked once per generated function."""
+    names = getattr(cg_fn, "_tex_param_names", None)
+    if names is None:
+        found, stack = set(), list(program.statements)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, BindingRef) and node.kind == "param":
+                found.add(node.name)
+            stack.extend(_iter_child_nodes(node))
+        names = cg_fn._tex_param_names = frozenset(found)
+    placed = {}
+    for name in names:
+        value = bindings.get(name)
+        if value is None or isinstance(value, (torch.Tensor, str)):
+            continue
+        try:
+            placed[name] = torch.as_tensor(value, device=device)
+        except Exception:
+            pass
+    return placed
+
+
+def _codegen_with_params_on_device(cg_fn, program, bindings: dict, dev, latent_channel_count,
+                                   used_builtins, precision, roi, stdlib_fns):
+    """An opt-in route's one-time placement decision, taken when a generated function's call
+    has just raised on a non-CPU device (see `_codegen_only_execute`).
+
+    The preamble converts a `$param` with `as_tensor(value)`, which lands on the CPU. A 0-dim
+    CPU tensor mixes with CUDA operands only while it stays 0-dim, so a program that expands one
+    (`_bp` against a vec, a vec param, a stdlib bound such as `clamp`'s) raises a cross-device
+    error, and every CUDA cook of it fell back to the interpreter. This calls the function once
+    more with the params on the cook device, from a FRESH copy of the caller's bindings (the
+    failed call may have written into the first one), and records the verdict on the function:
+    True, placed up front from now on (the interpreter binds params on the device too, so the
+    output stays bit-exact), or False, placement does not help and is never tried again.
+    Returns (bindings, ingest_event) when the placed call served, else None.
+
+    It is learned, not applied to every opt-in cook, because a device param is not free: one
+    host-to-device copy per param per cook, plus a device sync wherever the generated code reads
+    a param back to the host (a kernel radius's `.item()`). Measured on CUDA, always placing made
+    blur.tex and sharpen.tex slower, and codegen already served both with CPU params — a program
+    whose call never raises never places. The default route (an exact fetch stencil under
+    compile_mode="none") does not take part at all; moving it is a perf decision of its own."""
+    placed = _params_on_device(cg_fn, program, bindings, dev)
+    if not placed:
+        cg_fn._tex_params_on_device = False
+        return None
+    retry_bindings = _contiguous_bindings(bindings, dev)
+    retry_bindings.update(placed)
+    ingest_event = _record_ingest_event(bindings, dev)
+    env, sp, _ = _build_codegen_env(program, retry_bindings, dev, latent_channel_count,
+                                    used_builtins=used_builtins, precision=precision, roi=roi)
+    try:
+        with torch.inference_mode():
+            _invoke_cg(cg_fn, env, retry_bindings, stdlib_fns, dev, sp,
+                       Interpreter._PRECISION_DTYPES.get(precision))
+    except Exception:
+        cg_fn._tex_params_on_device = False
+        return None
+    cg_fn._tex_params_on_device = True
+    return retry_bindings, ingest_event
+
+
 def _cuda_headroom_ok(device) -> bool:
     """Only submit a background CUDA compile with comfortable VRAM headroom, so
     a compile never allocates while another node's inference needs the memory.
@@ -1051,7 +1121,8 @@ def run_auto(program, bindings, type_map, device, fingerprint,
                                      latent_channel_count, output_names,
                                      used_builtins=used_builtins,
                                      precision=precision, fingerprint=fingerprint,
-                                     time_context=time_context)   # ENG-7
+                                     time_context=time_context,   # ENG-7
+                                     place_params=True)           # opt-in route
 
     # Terminal: rejected → always-safe codegen; committed → cached compiled.
     if state == autotier.REJECTED:
@@ -1335,6 +1406,7 @@ def _codegen_only_execute(
     *,
     time_context: dict | None,
     roi: tuple[int, int, int, int, int, int] | None = None,
+    place_params: bool = False,
 ) -> torch.Tensor | dict:
     """Execute via codegen flat function WITHOUT torch.compile.
 
@@ -1349,6 +1421,11 @@ def _codegen_only_execute(
     `_plain_execute` — a forgotten forward is a frozen playhead, not an error, and this
     function is where the codegen decline lands a time-reading program. Pass
     `time_context=None` to mean "no host playhead".
+
+    `place_params` lets a call that raised on a non-CPU device be retried once with the
+    `$param` bindings on the device, and a generated function that needed it place them up
+    front afterwards (`_codegen_with_params_on_device`). The opt-in routes pass it; the
+    default route does not. The interpreter fallback always receives the caller's own bindings.
     """
     cg_fn = _get_or_make_codegen_fn(program, type_map, fingerprint)
 
@@ -1369,10 +1446,16 @@ def _codegen_only_execute(
                               time_context=time_context, roi=roi)
 
     dev = _canon_device(device)
+    # The placement verdict recorded on this generated function: None until one of its calls
+    # has raised on an opt-in route; always False on the default route and on the CPU.
+    placing = (getattr(cg_fn, "_tex_params_on_device", None)
+               if place_params and dev.type != "cpu" else False)
 
     # Ensure tensor bindings are contiguous (same as torch.compile path) and
     # co-located on the compute device (XPU: one direct hop instead of raise+retry)
     contiguous_bindings = _contiguous_bindings(bindings, dev)
+    if placing:
+        contiguous_bindings.update(_params_on_device(cg_fn, program, bindings, dev))
     ingest_event = _record_ingest_event(bindings, dev)
 
     env, sp, _ = _build_codegen_env(program, contiguous_bindings, dev, latent_channel_count,
@@ -1384,16 +1467,22 @@ def _codegen_only_execute(
             _invoke_cg(cg_fn, env, contiguous_bindings, stdlib_fns, dev, sp,
                        Interpreter._PRECISION_DTYPES.get(precision))
     except Exception as e:
-        _show_once(
-            "codegen_only_fallback",
-            f"[TEX] Codegen-only execution failed, falling back to interpreter: {e}",
-            level="warning",
-        )
-        tier_trace.record("interpreter", fallback_from="codegen", reason=str(e))
-        return _plain_execute(program, bindings, type_map, device,
-                              latent_channel_count, output_names,
-                              used_builtins=used_builtins, precision=precision,
-                              time_context=time_context, roi=roi)   # ROI-3: see _plain_execute
+        served = (_codegen_with_params_on_device(cg_fn, program, bindings, dev,
+                                                 latent_channel_count, used_builtins,
+                                                 precision, roi, stdlib_fns)
+                  if placing is None else None)
+        if served is None:
+            _show_once(
+                "codegen_only_fallback",
+                f"[TEX] Codegen-only execution failed, falling back to interpreter: {e}",
+                level="warning",
+            )
+            tier_trace.record("interpreter", fallback_from="codegen", reason=str(e))
+            return _plain_execute(program, bindings, type_map, device,
+                                  latent_channel_count, output_names,
+                                  used_builtins=used_builtins, precision=precision,
+                                  time_context=time_context, roi=roi)   # ROI-3: see _plain_execute
+        contiguous_bindings, ingest_event = served
 
     tier_trace.record("codegen")
     # XPU fence: async ingest DMA must land before the cook's outputs escape.

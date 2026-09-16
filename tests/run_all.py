@@ -312,6 +312,21 @@ def main():
     test_optimizer_dce_side_effects(r)
     test_codegen_audit_fixes(r)
     test_codegen_sample_hoist_in_branches(r)
+    # The opt-in routes learn to place $params on the cook device, so codegen serves
+    # param-reading programs on CUDA too; programs already served never place, and the default
+    # stencil route is pinned unmoved.
+    from test_codegen_param_device import (
+        test_codegen_param_served_on_cook_device,
+        test_codegen_param_parity_on_every_device,
+        test_codegen_param_precision_requests,
+        test_codegen_param_placement_learned_once,
+        test_codegen_param_default_route_unmoved,
+    )
+    test_codegen_param_served_on_cook_device(r)
+    test_codegen_param_parity_on_every_device(r)
+    test_codegen_param_precision_requests(r)
+    test_codegen_param_placement_learned_once(r)
+    test_codegen_param_default_route_unmoved(r)
     test_compiled_audit_fixes(r)
     test_fusion_memo(r)
     test_node_helpers(r)
