@@ -1333,6 +1333,27 @@ def main():
     test_v035_port6_engine_import_is_adapter_free(r)
     test_v035_port6_routes_still_register_under_comfyui(r)
 
+    # Uniform outputs (LANGUAGE.md §5.2) — a once-per-cook scalar `@` output, computed only
+    # from literals, scalar params and the 0-dim builtins, is pinned identical across the
+    # interpreter, codegen, every compile_mode, the tiled/batch-strip/ROI assemblers and a
+    # fused chain's terminal stage. Docs + tests only; no engine file changed.
+    from test_v035_hygiene import (
+        test_brief9_t1_uniform_output_interp_codegen_equal,
+        test_brief9_t2_uniform_output_stable_across_compile_modes,
+        test_brief9_t3_uniform_output_survives_tiled_batch_roi_assemblers,
+        test_brief9_t4_uniform_output_fusion_terminal_and_midchain_refusal,
+        test_brief9_t5_uniform_output_param_query_never_recompiles_moves_lineage,
+        test_brief9_t6_uniform_output_fp32_exact_at_3841,
+        test_brief9_t7_language_md_documents_uniform_outputs,
+    )
+    test_brief9_t1_uniform_output_interp_codegen_equal(r)
+    test_brief9_t2_uniform_output_stable_across_compile_modes(r)
+    test_brief9_t3_uniform_output_survives_tiled_batch_roi_assemblers(r)
+    test_brief9_t4_uniform_output_fusion_terminal_and_midchain_refusal(r)
+    test_brief9_t5_uniform_output_param_query_never_recompiles_moves_lineage(r)
+    test_brief9_t6_uniform_output_fp32_exact_at_3841(r)
+    test_brief9_t7_language_md_documents_uniform_outputs(r)
+
     # ASK-1 — native convolve builtin (T8 edge cases, T11 reserved name; the other rows
     # land as edits to the existing test files wired above, e.g. test_v017_phase1.py /
     # test_v024_phase1.py).

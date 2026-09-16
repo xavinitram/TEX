@@ -167,6 +167,46 @@ emitter and the graph capturer across every tier and both devices — and by a n
 control that edits the code and asserts those same spies *do* fire, so the guarantee cannot
 pass vacuously. The standing cost is tracked by `benchmarks/param_scrub_bench.py`.
 
+### 5.2 Uniform outputs
+
+An `f@`/`i@` output written **only** from literals, scalar `f$`/`i$` params, and the 0-dim
+builtins `iw ih px py fn ic PI TAU E frame fps time` — through arithmetic, comparisons,
+ternaries, uniform `if`s and scalar math functions — never reads a pixel. TEX returns it as
+one **0-dim** value, computed once per cook, identical across every tier and route that can
+produce it: `compile_mode` `none` / `torch_compile` / `auto` / `cuda_graph`, a tiled,
+batch-strip or ROI-windowed cook, and a fused chain's terminal stage — exact at
+`precision="fp32"`. (A program reading `frame`/`fps`/`time` always cooks on the interpreter,
+an existing caching policy unrelated to this guarantee, so for those three there is only ever
+one tier to be identical with.)
+
+```tex
+@OUT = @A * 0.5;
+f@active_x = max($win_x, 0.0);    // a once-per-cook FLOAT, not a per-pixel one
+f@active_w = iw * 0.5;
+i@active_h = ih - 1;
+```
+
+Like any output, this still costs one of the program's `MAX_OUTPUTS` (8) slots, and a
+declaring stage must be a fused chain's **terminal** stage: an upstream stage writing
+anything besides `@OUT` already refuses to fuse, so a mid-chain declaration is refused
+before it can be spliced into the wrong grid.
+
+**Not covered**, and left as ordinary per-pixel or tier-dependent values: a `v2@`–`v4@`
+output (broadcasts to the cook's full extent even when every component is uniform);
+anything reading `u v ix iy fi` or an image (grid- or batch-shaped by definition); and a
+**vec** `$param` read into a scalar output (rank disagrees across tiers today — filed, not
+promised here).
+
+TEX gives a uniform output no meaning of its own — it is an ordinary `@` binding that
+happens to hold one value. A host may read one as, say, a declared region; TEX neither
+validates nor interprets it either way. The reverse direction needs no new syntax: a value
+the host already knows about one of its own inputs reaches the program as an ordinary
+`$param` — a cook-time binding like any other (§5.1), so sweeping it moves the output's
+result identity but never recompiles the program.
+
+Pinned by `tests/test_v035_hygiene.py`, across the interpreter, codegen, every
+`compile_mode`, the tiled/batch-strip/ROI assemblers, and a fused chain's terminal stage.
+
 ---
 
 ## 6. Reserved words & built-in variables

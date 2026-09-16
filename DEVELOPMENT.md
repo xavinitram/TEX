@@ -1174,4 +1174,24 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   `'unbounded'` anyway. Reopens with the same footprint-vocabulary item `convolve` waits on, and
   only if that vocabulary grows a reach summed over more than one argument — neither builtin
   widens the descriptor grammar for the other.
+- **A `data_window(@A) → vec4` builtin reading a binding's own active-area extent** —
+  rejected. There is no carrier: nothing an engine binding carries today holds an extent a
+  program could read (the way colour/alpha/frame tags already ride alongside a value under
+  DATA-1, without being folded into any cache key), so answering this from inside a program
+  means reaching past the binding's own value — a second builtin family whose result would not
+  be a pure function of what is already bound. Worse, inside a fused chain a chain-internal
+  `@`-wire is a plain local with no such metadata attached, so a fused cook and the same stages
+  cooked unfused would read different windows for one program — precisely the kind of
+  divergence fusion's own splice equivalence is not allowed to produce. Reopens once a
+  per-binding descriptor carries a window field with its own keying and fusion-splice story;
+  until then, a host that knows an input's window passes it in as an ordinary `$param`
+  (`LANGUAGE.md` §5.2), which needs no new carrier at all.
+- **A `declare_window(x0, y0, w, h);` statement, declaring the output's active area once per
+  cook** — rejected. `LANGUAGE.md` §5.2's plain scalar `@` outputs already say this, on every
+  tier and route, with no new name; a dedicated statement would reserve one and take on a
+  side-effecting statement's three route rules (an interpreter-only execution path, a
+  CUDA-graph capture bar, ROI suppression — the shape `debug_print` already needed) to express
+  what four ordinary outputs already express more generally. Reopens only for a declaration a
+  uniform scalar output genuinely cannot make — a data-dependent bounding box, which is
+  batch-shaped under today's engine, not once-per-cook.
 

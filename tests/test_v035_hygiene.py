@@ -538,3 +538,356 @@ def test_v035_port6_routes_still_register_under_comfyui(r):
         r.ok(f"PORT-6: {out['ROUTES']} routes still register when ComfyUI is the host")
     except Exception as e:
         r.fail("PORT-6 routes under ComfyUI", f"{type(e).__name__}: {e}")
+
+
+# ── Uniform outputs (LANGUAGE.md §5.2) ────────────────────────────────────────────────
+#
+# A once-per-cook scalar `@` output — an `f@`/`i@` binding computed only from literals,
+# scalar params and the 0-dim builtins — was already cooking identically on every tier and
+# route before any of this landed; only the DOC and the PIN are new (no engine file changed).
+# These tests convert that from "true by construction, untested" (the design probe's own
+# words for six of the twelve covered builtins) into a machine-checked fact, and pin the two
+# declined builtins' absence implicitly by never naming them.
+#
+# The compound program below is the exact one the design probe used: four scalar outputs
+# beside a normal `@OUT`, mixing a param, `iw`/`ih`, arithmetic and both `f@`/`i@` prefixes.
+
+_U_CODE = ("@OUT = @A * 0.5;\n"
+           "f@dw_x = $cx - 1.0;\n"
+           "f@dw_y = max($cx, 0.0);\n"
+           "f@dw_w = iw * 0.5;\n"
+           "i@dw_h = ih - 1;\n")
+_U_NAMES = ("dw_x", "dw_y", "dw_w", "dw_h")
+
+
+def test_brief9_t1_uniform_output_interp_codegen_equal(r):
+    """T1: interpreter and codegen return the SAME 0-dim value for a uniform output.
+
+    This is invariant #2 (interp/codegen bit-exactness) for the uniform-output shape
+    specifically: the compound program above, plus one row per named builtin that has a real
+    second tier to agree with. `frame`/`fps`/`time` are deliberately NOT rows here — a
+    time-reading program never reaches codegen at all (ENG-7's caching decline), so there is
+    no second tier for `run_both`'s codegen path to compare against; T2 below covers them by
+    checking every `compile_mode` route returns the identical value instead.
+
+    Each single-builtin row keeps a trivial `@A` read (`@OUT = @A * 0.0;`) so the program has
+    a real spatial anchor — `iw`/`ih`/`px`/`py`/`fn` are 0-dim either way, but `run_both`'s
+    codegen-side env builder (a test-only helper, not the engine) only populates them when a
+    binding the program actually reads gives it a shape to derive them from; without one this
+    would test an artifact of the test helper, not the engine."""
+    import torch
+    from helpers import run_both
+    try:
+        A = torch.rand(1, 6, 8, 4)
+        interp_res, cg_res = run_both(_U_CODE, {"A": A, "cx": 10.0})
+        assert cg_res is not None, "the compound program did not reach codegen at all"
+        for name in _U_NAMES:
+            i_t, c_t = interp_res[name], cg_res[name]
+            assert tuple(i_t.shape) == (), f"interpreter {name} shape {tuple(i_t.shape)}"
+            assert tuple(c_t.shape) == (), f"codegen {name} shape {tuple(c_t.shape)}"
+            assert torch.equal(i_t, c_t), \
+                f"{name}: interp {i_t.item()} != codegen {c_t.item()}"
+        assert tuple(interp_res["OUT"].shape) == (1, 6, 8, 4), tuple(interp_res["OUT"].shape)
+
+        for name in ("iw", "ih", "px", "py", "fn", "ic", "PI", "TAU", "E"):
+            row_code = f"@OUT = @A * 0.0;\nf@w = {name};"
+            i_res, c_res = run_both(row_code, {"A": A})
+            assert c_res is not None, f"{name}: never reached codegen"
+            i_t, c_t = i_res["w"], c_res["w"]
+            assert tuple(i_t.shape) == (), f"{name}: interpreter shape {tuple(i_t.shape)}"
+            assert tuple(c_t.shape) == (), f"{name}: codegen shape {tuple(c_t.shape)}"
+            assert torch.equal(i_t, c_t), \
+                f"{name}: interp {i_t.item()} != codegen {c_t.item()}"
+        r.ok("BRIEF-9 T1: the compound program and 9 named builtins agree, "
+             "interpreter vs codegen, 0-dim")
+    except Exception as e:
+        r.fail("BRIEF-9 T1 interp/codegen parity", f"{type(e).__name__}: {e}")
+
+
+def test_brief9_t2_uniform_output_stable_across_compile_modes(r):
+    """T2: every `compile_mode` route returns the same 0-dim value for a uniform output.
+
+    Closes the gap T1 cannot: `frame`/`fps`/`time` never reach codegen (a time-reading
+    program always cooks on the interpreter, ENG-7), so "every route agrees" for them means
+    every `compile_mode` still funnels to that one tier and returns the SAME value — not a
+    vacuous truth, since a future change to the decline gate could easily let one route
+    through while leaving another declined, silently reading a different playhead spelling.
+    `cuda_graph` only exists on CUDA and skips cleanly by device, matching house style."""
+    import torch
+    from TEX_Wrangle import tex_engine
+    try:
+        A = torch.rand(1, 6, 8, 4)
+        modes = ("none", "torch_compile", "auto")
+        results = {}
+        for m in modes:
+            res = tex_engine.cook(_U_CODE, {"A": A, "cx": 10.0}, device_mode="cpu",
+                                  compile_mode=m)
+            for n in _U_NAMES:
+                shp = tuple(res.outputs[n].shape)
+                assert shp == (), f"compile_mode={m}: {n} shape {shp}"
+            results[m] = res
+        for m in modes[1:]:
+            for n in _U_NAMES:
+                assert torch.equal(results["none"].outputs[n], results[m].outputs[n]), \
+                    f"compile_mode={m} vs none diverged on {n}"
+
+        tcode = "f@w_frame = frame;\nf@w_fps = fps;\nf@w_time = time;\n"
+        tc = {"frame": 12.0, "fps": 24.0, "time": 0.5}
+        tnames = ("w_frame", "w_fps", "w_time")
+        tresults = {}
+        for m in modes:
+            res = tex_engine.cook(tcode, {}, device_mode="cpu", compile_mode=m,
+                                  time_context=tc)
+            for n in tnames:
+                shp = tuple(res.outputs[n].shape)
+                assert shp == (), f"compile_mode={m}: {n} shape {shp}"
+            tresults[m] = res
+        for m in modes[1:]:
+            for n in tnames:
+                assert torch.equal(tresults["none"].outputs[n], tresults[m].outputs[n]), \
+                    f"compile_mode={m} vs none diverged on {n} (frame/fps/time)"
+
+        if torch.cuda.is_available():
+            Acuda = A.cuda()
+            resg = tex_engine.cook(_U_CODE, {"A": Acuda, "cx": 10.0}, device_mode="cuda",
+                                   compile_mode="cuda_graph")
+            torch.cuda.synchronize()
+            for n in _U_NAMES:
+                t = resg.outputs[n]
+                assert tuple(t.shape) == (), f"cuda_graph: {n} shape {tuple(t.shape)}"
+                assert torch.equal(t.cpu(), results["none"].outputs[n]), \
+                    f"cuda_graph vs none diverged on {n}"
+        else:
+            r.skip("BRIEF-9 T2 cuda_graph route", "no CUDA on this box")
+        r.ok("BRIEF-9 T2: uniform outputs are 0-dim and equal across every compile_mode route")
+    except Exception as e:
+        r.fail("BRIEF-9 T2 route stability", f"{type(e).__name__}: {e}")
+
+
+def test_brief9_t3_uniform_output_survives_tiled_batch_roi_assemblers(r):
+    """T3: the tiled, batch-strip and ROI assemblers pass a uniform output through unchanged.
+
+    Guards against the exact shape of bug this pin exists to catch: an assembler that treats
+    EVERY output as spatial (a strip write, a per-batch-chunk concat, a crop) would silently
+    broadcast or slice a 0-dim value into something strip- or window-shaped. The `mutation_check.py`
+    row added alongside this test reintroduces exactly that at `tex_memory.py`'s `run_tiled`
+    passthrough and must turn this row red.
+
+    `shared_tile_height`/`shared_batch_size` are asserted non-None BEFORE calling the
+    assembler — the same precondition `run_tiled`/`run_batch_strips` check themselves before
+    deciding to tile at all — so a silent whole-frame fallback (which would make this test
+    pass without ever exercising a strip) is caught here rather than trusted."""
+    import torch
+    from TEX_Wrangle.tex_compiler.lexer import Lexer
+    from TEX_Wrangle.tex_compiler.parser import Parser
+    from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
+    from TEX_Wrangle.tex_compiler.types import TEXType
+    from TEX_Wrangle.tex_runtime.interpreter import Interpreter
+    from TEX_Wrangle import tex_memory
+    try:
+        def _build():
+            prog = Parser(Lexer(_U_CODE).tokenize()).parse()
+            checker = TypeChecker(binding_types={"A": TEXType.VEC4, "cx": TEXType.FLOAT,
+                                                 "OUT": TEXType.VEC4})
+            tm = checker.check(prog)
+            outs = sorted(checker.assigned_bindings.keys())
+            return prog, tm, outs
+
+        prog, tm, outs = _build()
+        interp = Interpreter()
+
+        # run_tiled, 3 strips over a real H=6 image — not a silent whole-frame fallback.
+        A = torch.rand(1, 6, 8, 4)
+        assert tex_memory.shared_tile_height({"A": A, "cx": 10.0}) == 6, \
+            "the binding does not anchor a tile height — this would not exercise run_tiled"
+        whole = interp.execute(prog, {"A": A, "cx": 10.0}, tm, device="cpu",
+                               output_names=outs)
+        tiled = tex_memory.run_tiled(interp, prog, {"A": A, "cx": 10.0}, tm, "cpu", 0,
+                                     outs, None, "fp32", 3)
+        for n in _U_NAMES:
+            assert tuple(tiled[n].shape) == (), f"run_tiled: {n} shape {tuple(tiled[n].shape)}"
+            assert torch.equal(tiled[n], whole[n]), f"run_tiled moved {n}"
+
+        # run_batch_strips, B=4, 2 strips.
+        Ab = torch.rand(4, 6, 8, 4)
+        assert tex_memory.shared_batch_size({"A": Ab, "cx": 10.0}) == 4, \
+            "the binding does not anchor a batch size — this would not exercise run_batch_strips"
+        wholeb = interp.execute(prog, {"A": Ab, "cx": 10.0}, tm, device="cpu",
+                                output_names=outs)
+        batched = tex_memory.run_batch_strips(interp, prog, {"A": Ab, "cx": 10.0}, tm, "cpu",
+                                              0, outs, None, "fp32", 2)
+        for n in _U_NAMES:
+            assert tuple(batched[n].shape) == (), \
+                f"run_batch_strips: {n} shape {tuple(batched[n].shape)}"
+            assert torch.equal(batched[n], wholeb[n]), f"run_batch_strips moved {n}"
+
+        # run_roi, a pointwise program narrowed to a real sub-window (not the whole frame).
+        roi = (1, 1, 4, 3, 8, 6)
+        roid = tex_memory.run_roi(interp, prog, {"A": A, "cx": 10.0}, tm, "cpu", 0, outs,
+                                  None, "fp32", roi, frozenset({"A"}), 0)
+        assert tuple(roid["OUT"].shape) == (1, 3, 4, 4), \
+            f"run_roi: OUT came back {tuple(roid['OUT'].shape)}, not the (1,3,4,4) window " \
+            f"— this would not exercise real ROI narrowing"
+        for n in _U_NAMES:
+            assert tuple(roid[n].shape) == (), f"run_roi: {n} shape {tuple(roid[n].shape)}"
+            assert torch.equal(roid[n], whole[n]), f"run_roi moved {n}"
+
+        r.ok("BRIEF-9 T3: run_tiled/run_batch_strips/run_roi all pass uniform outputs "
+             "through unchanged")
+    except Exception as e:
+        r.fail("BRIEF-9 T3 assemblers", f"{type(e).__name__}: {e}")
+
+
+def test_brief9_t4_uniform_output_fusion_terminal_and_midchain_refusal(r):
+    """T4: a uniform output fuses as a chain's TERMINAL stage, byte-for-byte vs the unfused
+    cook, and REFUSES to fuse mid-chain, naming the offending stage.
+
+    The refusal is not a new rule for this shape — `tex_fusion` already refuses any upstream
+    stage that writes something besides `@OUT` (only a single-@OUT handoff splices) — so a
+    declaring program mid-chain ends fusion the same way any other extra-output stage would.
+    This pins that the SAME compound program gets the SAME two outcomes depending only on
+    chain position, so a future fusion change can't quietly start mis-splicing it instead of
+    refusing it."""
+    import torch
+    from TEX_Wrangle import tex_engine, tex_fusion
+    from TEX_Wrangle.tex_marshalling import infer_binding_type
+    try:
+        A = torch.rand(1, 6, 8, 4)
+
+        # (a) terminal: fused via cook_stage_list == the same program cooked unfused.
+        stage0 = {"code": "@OUT = @A * 0.5;", "bindings": {"A": A}}
+        term_code = ("@OUT = @A * 1.0;\n"
+                     "f@dw_x = $cx - 1.0;\n"
+                     "f@dw_y = max($cx, 0.0);\n"
+                     "f@dw_w = iw * 0.5;\n"
+                     "i@dw_h = ih - 1;\n")
+        stage1 = {"code": term_code, "chain_input": "A", "bindings": {"cx": 10.0}}
+        fused = tex_engine.cook_stage_list([stage0, stage1], device="cpu")
+        unfused = tex_engine.cook(term_code, {"A": A * 0.5, "cx": 10.0},
+                                  device_mode="cpu").outputs
+        for n in ("OUT", *_U_NAMES):
+            assert tuple(fused[n].shape) == tuple(unfused[n].shape), \
+                f"fused/unfused {n} shape: {tuple(fused[n].shape)} vs {tuple(unfused[n].shape)}"
+            assert torch.equal(fused[n], unfused[n]), f"fused terminal moved {n}"
+
+        # (b) mid-chain (stage 0 of 2): refused, naming stage 0.
+        stage0b = {"code": _U_CODE, "bindings": {"A": A, "cx": 10.0}}
+        stage1b = {"code": "@OUT = @A * 2.0;", "chain_input": "A", "bindings": {}}
+        result = tex_fusion.chain_preflight([stage0b, stage1b], infer_binding_type)
+        assert result["ok"] is False, f"a mid-chain declaration was not refused: {result}"
+        assert result["stage_of_error"] == 0, \
+            f"the refusal named stage {result['stage_of_error']!r}, not 0: {result['error']!r}"
+
+        r.ok("BRIEF-9 T4: a uniform output fuses as a terminal stage exactly like the "
+             "unfused cook, and is refused (naming stage 0) mid-chain")
+    except Exception as e:
+        r.fail("BRIEF-9 T4 fusion", f"{type(e).__name__}: {e}")
+
+
+def test_brief9_t5_uniform_output_param_query_never_recompiles_moves_lineage(r):
+    """T5: the QUERY half. A host that already knows an input's window passes it in as an
+    ordinary `$param` — no new syntax. Sweeping it must never recompile (ANIM-1, applied to
+    this specific shape) and must move the produced frame's lineage key (CACHE-1), since the
+    value it carries moves pixels and a lineage key that didn't move would silently serve a
+    stale window on the next cook.
+
+    Spies patch the same three choke points `test_v031_anim_contract.py` does
+    (`TEXCache.compile_ast`, `compiled._try_codegen`, `graphed.GraphedProgram.capture`) so a
+    counter that could never move is not mistaken for a guarantee that holds."""
+    import torch
+    from TEX_Wrangle import tex_engine
+    from TEX_Wrangle.tex_cache import TEXCache, get_cache
+    try:
+        from TEX_Wrangle.tex_runtime import compiled as _C, graphed as _G
+        A = torch.rand(1, 6, 8, 4)
+        code = "@OUT = @A * 0.5 + vec4($dw_x, $dw_y, $dw_w, $dw_h);"
+        cache = get_cache()
+        counts = {"compiles": 0, "emissions": 0, "captures": 0}
+        orig = (TEXCache.compile_ast, _C._try_codegen, _G.GraphedProgram.capture)
+
+        def compile_ast(self_, *a, **k):
+            counts["compiles"] += 1
+            return orig[0](self_, *a, **k)
+
+        def try_codegen(*a, **k):
+            counts["emissions"] += 1
+            return orig[1](*a, **k)
+
+        def capture(self_, *a, **k):
+            counts["captures"] += 1
+            return orig[2](self_, *a, **k)
+
+        TEXCache.compile_ast, _C._try_codegen, _G.GraphedProgram.capture = \
+            compile_ast, try_codegen, capture
+        try:
+            base_binds = {"A": A, "dw_x": 0.0, "dw_y": 0.0, "dw_w": 0.0, "dw_h": 0.0}
+            first = tex_engine.cook(code, base_binds, device_mode="cpu",
+                                    compile_mode="auto", want_lineage=True)
+            after_cold = dict(counts)
+            fps_before = set(cache._memory.keys())
+            keys_seen = {first.lineage["OUT"]}
+            for i in range(1, 6):
+                res = tex_engine.cook(code, {**base_binds, "dw_x": float(i)},
+                                      device_mode="cpu", compile_mode="auto",
+                                      want_lineage=True)
+                keys_seen.add(res.lineage["OUT"])
+            new_fps = set(cache._memory.keys()) - fps_before
+            moved = (counts["compiles"] - after_cold["compiles"],
+                    counts["emissions"] - after_cold["emissions"],
+                    counts["captures"] - after_cold["captures"])
+        finally:
+            TEXCache.compile_ast, _C._try_codegen, _G.GraphedProgram.capture = orig
+
+        assert moved == (0, 0, 0), f"sweeping $dw_x recompiled: {moved}"
+        assert not new_fps, f"sweeping $dw_x created a new program fingerprint: {new_fps}"
+        assert len(keys_seen) == 6, \
+            f"the OUT lineage key did not move with every $dw_x value: only " \
+            f"{len(keys_seen)} distinct keys over 6 cooks"
+        r.ok("BRIEF-9 T5: sweeping a host-bound window $param never recompiles and moves "
+             "the output's lineage key")
+    except Exception as e:
+        r.fail("BRIEF-9 T5 query sweep", f"{type(e).__name__}: {e}")
+
+
+def test_brief9_t6_uniform_output_fp32_exact_at_3841(r):
+    """T6: a uniform output holds an integer value exactly at fp32, and CPU `precision="auto"`
+    (which resolves fp32 on CPU regardless of resolution — the gate never splits there, CF-6)
+    agrees. `3841` is chosen because it is exactly the boundary the design probe measured:
+    fp16 is integer-exact only to 2048, so `precision="fp16"` would round it to `3840.0` —
+    the promise this pin makes is deliberately narrower than "any tier", and says so."""
+    import torch
+    from TEX_Wrangle import tex_engine
+    try:
+        code = "f@dw_x = $cx;"
+        for precision in ("fp32", "auto"):
+            res = tex_engine.cook(code, {"cx": 3841.0}, device_mode="cpu",
+                                  compile_mode="none", precision=precision)
+            t = res.outputs["dw_x"]
+            assert tuple(t.shape) == (), f"precision={precision}: shape {tuple(t.shape)}"
+            assert float(t) == 3841.0, f"precision={precision}: {float(t)} != 3841.0"
+        r.ok("BRIEF-9 T6: a uniform output holds $cx=3841.0 exactly at fp32 and CPU auto")
+    except Exception as e:
+        r.fail("BRIEF-9 T6 fp32 exactness", f"{type(e).__name__}: {e}")
+
+
+def test_brief9_t7_language_md_documents_uniform_outputs(r):
+    """T7: the guarantee T1-T6 pin is written down. Modeled on
+    `test_v031_anim_contract_is_documented` — the doc and the behaviour cannot drift apart
+    silently if a doc edit that drops a promise also drops this test's evidence for it."""
+    import pathlib
+    try:
+        root = pathlib.Path(__file__).resolve().parent.parent
+        txt = (root / "LANGUAGE.md").read_text(encoding="utf-8", errors="ignore")
+        need = [
+            "### 5.2 Uniform outputs",
+            "iw ih px py fn ic PI TAU E frame fps time",   # the covered builtins, verbatim
+            "v2@",                                          # exclusion 1: broadcast vec outputs
+            "u v ix iy fi",                                  # exclusion 2: per-pixel/batch reads
+            "rank disagrees across tiers",                   # exclusion 3: vec params
+        ]
+        missing = [n for n in need if n not in txt]
+        r.ok("LANGUAGE.md documents uniform outputs (§5.2) and its three exclusions") \
+            if not missing else \
+            r.fail("BRIEF-9 T7 doc pin", f"LANGUAGE.md is missing: {missing}")
+    except Exception as e:
+        r.fail("BRIEF-9 T7 doc pin", f"{type(e).__name__}: {e}")

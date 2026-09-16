@@ -336,6 +336,13 @@ MUTATIONS = [
      'tex_results.py',
      '                home = src.home',
      '                pass'),
+    # BRIEF-9 T3: a uniform (once-per-cook, 0-dim) output must stay 0-dim through every
+    # run_tiled strip, not get broadcast across the tile height like a spatial one.
+    ('BRIEF-9 T3: run_tiled broadcasts a uniform output across strips instead of leaving '
+     'it 0-dim', 'tex_memory.py',
+     '                outputs[name] = strip_out  # scalar/string: any strip suffices',
+     "                outputs[name] = (strip_out.expand(H_total) if hasattr(strip_out, "
+     "'dim') and strip_out.dim() == 0 else strip_out)"),
 ]
 
 RUNNER = """
