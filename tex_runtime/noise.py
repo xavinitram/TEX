@@ -456,8 +456,17 @@ class _TieredCache:
             self.forget_settled(key)
             self.cache[key] = built
             _tt.record_noise_compile(self.name, (_time.perf_counter() - _t0) * 1000.0)  # P6
-        except Exception:
-            pass
+        except Exception as e:
+            # BRIEF-4: this used to vanish silently. Record it (never re-raise, never
+            # log) so a doctor-style report can surface it; the jit.trace tier already
+            # in `self.cache[key]` is untouched, so the noise call this promotion
+            # attempt came from still returns its normal result.
+            try:
+                dt = (device.type if isinstance(device, torch.device) else
+                     ("cuda" if device == "cuda" else "cpu"))
+                _tt.record_noise_compile_failure(self.name, dt, e)
+            except Exception:
+                pass
         self._call_count.pop(key, None)
 
     def store(self, key, trace_fn):

@@ -165,6 +165,10 @@ from test_v018_ux import (
     test_dbg1_perf_hud_payload, test_ux1_diagnostics_reachability,
     test_dbg3_nan_overlay, test_lx5_debug_print, test_dbg4_doctor,
     test_ux2_tooltip_honesty, test_lx5_json_nan_safe, test_dbg1_nan_fingerprint,
+    test_dbg4_capabilities_shape, test_dbg4_capabilities_read_only,
+    test_dbg4_capabilities_static_truth, test_dbg4_capabilities_measured_truth,
+    test_dbg4_capabilities_probe_never_raises, test_dbg4_capabilities_not_folded,
+    test_dbg4_doctor_cli_subcommand,
 )
 from test_v018_portability import (
     test_port1_import_lint, test_port1_host_services, test_port2_facade,
@@ -448,6 +452,16 @@ def main():
     test_ux2_tooltip_honesty(r)
     test_lx5_json_nan_safe(r)
     test_dbg1_nan_fingerprint(r)
+
+    # BRIEF-4 — tex_doctor.capabilities(): a per-tier capability report (C1-C5, C7-C8;
+    # C6 is beside the noise-tier promotion tests below).
+    test_dbg4_capabilities_shape(r)
+    test_dbg4_capabilities_read_only(r)
+    test_dbg4_capabilities_static_truth(r)
+    test_dbg4_capabilities_measured_truth(r)
+    test_dbg4_capabilities_probe_never_raises(r)
+    test_dbg4_capabilities_not_folded(r)
+    test_dbg4_doctor_cli_subcommand(r)
 
     # v0.18.0 Phase 3 — portability + hardware
     test_port1_import_lint(r)
@@ -864,6 +878,7 @@ def main():
         test_v031_noise_stride_signature,
         test_v031_noise_cold_path_shape,
         test_v031_noise_promotion_envelope,
+        test_v031_noise_promotion_failure_recorded,
     )
     test_v031_noise_cold_frame_parity(r)
     test_v031_noise_resolution_dance(r)
@@ -871,6 +886,7 @@ def main():
     test_v031_noise_stride_signature(r)
     test_v031_noise_cold_path_shape(r)
     test_v031_noise_promotion_envelope(r)
+    test_v031_noise_promotion_failure_recorded(r)  # BRIEF-4 C6
 
     # v0.31 NOISE-SCALAR — a constant coordinate must render the same on every device.
     # (`fbm(u*8.0, v*8.0, 0.5, 4)` cooked on CPU and raised on CUDA: the GPU-only octave

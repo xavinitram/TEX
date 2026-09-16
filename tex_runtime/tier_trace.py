@@ -66,6 +66,28 @@ def noise_compiles():
     return list(_noise_ring)
 
 
+# BRIEF-4: a third ring, deliberately separate from `_noise_ring` above. A failed
+# torch.compile PROMOTION used to vanish into a bare `except Exception: pass` in
+# `noise.py`'s `try_upgrade` — this makes it observable in `tex_doctor.capabilities()`
+# instead. Kept off `_noise_ring` on purpose: that ring is rendered by the modal and
+# counted per builtin by tests as compile EVENTS, and a failure must never read as one.
+_noise_failure_ring = collections.deque(maxlen=16)
+
+
+def record_noise_compile_failure(name, device_type, exc):
+    """BRIEF-4: record that a noise fn's (`name`) torch.compile promotion failed on
+    `device_type` (`"cpu"` / `"cuda"`), with the exception that was raised and swallowed."""
+    _noise_failure_ring.append({"noise": str(name), "device": str(device_type),
+                                "error": f"{type(exc).__name__}: {exc}"})
+
+
+def noise_compile_failures():
+    """BRIEF-4: recent noise-promotion failures (newest last), for
+    `tex_doctor.capabilities()`'s `noise_promotion@*` rows. Never touched by
+    `noise_compiles()` — see the ring's own comment."""
+    return list(_noise_failure_ring)
+
+
 def last():
     """The last cook's TierRecord on this thread, or None."""
     return getattr(_local, "last", None)

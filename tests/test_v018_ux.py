@@ -224,6 +224,282 @@ def test_lx5_debug_print(r: SubTestResult):
              "codegen falls back so the probe never silently no-ops")
 
 
+def test_dbg4_capabilities_shape(r: SubTestResult):
+    print("\n--- BRIEF-4 C1: capabilities() shape — schema, rows, keys, vocabularies ---")
+    import json
+    from TEX_Wrangle.tex_doctor import capabilities
+    fails = []
+    report = capabilities()
+
+    if report.get("schema") != 1:
+        fails.append(f"schema == {report.get('schema')!r}, expected 1")
+
+    EXPECT_ROWS = {"none@cpu", "none@cuda", "torch_compile:inductor@cuda",
+                   "torch_compile:cudagraphs@cuda", "torch_compile:inductor@cpu",
+                   "cuda_graph@cuda", "noise_promotion@cpu", "noise_promotion@cuda"}
+    rows = report.get("rows", {})
+    if set(rows) != EXPECT_ROWS:
+        fails.append(f"row set mismatch: missing {EXPECT_ROWS - set(rows)}, "
+                     f"extra {set(rows) - EXPECT_ROWS}")
+
+    EXPECT_KEYS = {"status", "evidence", "why_not", "note"}
+    for name, row in rows.items():
+        if set(row) != EXPECT_KEYS:
+            fails.append(f"{name}: keys {set(row)} != {EXPECT_KEYS}")
+            continue
+        if row["status"] not in ("works", "unknown", "unavailable"):
+            fails.append(f"{name}: status {row['status']!r} outside the closed vocabulary")
+        if row["evidence"] not in ("static", "measured"):
+            fails.append(f"{name}: evidence {row['evidence']!r} outside the closed vocabulary")
+        is_unavailable = row["status"] == "unavailable"
+        has_why = bool(row["why_not"])
+        if is_unavailable != has_why:
+            fails.append(f"{name}: why_not {row['why_not']!r} but status {row['status']!r} "
+                         "(why_not must be non-empty iff unavailable)")
+
+    try:
+        json.dumps(report, allow_nan=False)
+    except (ValueError, TypeError) as e:
+        fails.append(f"report not strict-JSON serialisable: {type(e).__name__}: {e}")
+
+    if fails:
+        r.fail("BRIEF-4 C1 capabilities shape", "; ".join(fails))
+    else:
+        r.ok("schema 1, exactly the 8 rows, each exactly the 4 keys, closed vocabularies, "
+             "why_not iff unavailable, strict-JSON")
+
+
+def test_dbg4_capabilities_read_only(r: SubTestResult):
+    print("\n--- BRIEF-4 C2: capabilities() probes read-only — never compiles ---")
+    from TEX_Wrangle.tex_doctor import capabilities
+    from TEX_Wrangle.tex_runtime import compiled as _compiled
+    from TEX_Wrangle.tex_runtime import noise as _noise
+    from TEX_Wrangle.tex_runtime import tier_trace as _tier_trace
+    fails = []
+
+    before_backend = dict(_compiled._backend_status)
+    before_msvc = _compiled._msvc_env_initialized
+    before_inductor = dict(_noise._inductor_available)
+    before_noise_compiles = _tier_trace.noise_compiles()
+    before_cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+
+    saved_run = _compiled.subprocess.run
+
+    def _boom(*a, **kw):
+        raise AssertionError("capabilities() must never shell out (_setup_msvc_env)")
+    _compiled.subprocess.run = _boom
+    try:
+        report = capabilities()
+    except Exception as e:
+        fails.append(f"capabilities() raised with subprocess.run patched to fail: {e}")
+        report = None
+    finally:
+        _compiled.subprocess.run = saved_run
+
+    if report is not None and not isinstance(report, dict):
+        fails.append("capabilities() did not return a dict")
+    if dict(_compiled._backend_status) != before_backend:
+        fails.append("_backend_status mutated by capabilities()")
+    if _compiled._msvc_env_initialized != before_msvc:
+        fails.append("_msvc_env_initialized mutated by capabilities()")
+    if dict(_noise._inductor_available) != before_inductor:
+        fails.append("_inductor_available mutated by capabilities()")
+    if _tier_trace.noise_compiles() != before_noise_compiles:
+        fails.append("noise_compiles() ring mutated by capabilities()")
+    if os.environ.get("TORCHINDUCTOR_CACHE_DIR") != before_cache_dir:
+        fails.append("TORCHINDUCTOR_CACHE_DIR mutated by capabilities()")
+
+    if fails:
+        r.fail("BRIEF-4 C2 read-only", "; ".join(fails))
+    else:
+        r.ok("capabilities() never shells out; every measured cache is byte-for-byte "
+             "unchanged across the call")
+
+
+def test_dbg4_capabilities_static_truth(r: SubTestResult):
+    print("\n--- BRIEF-4 C3: static prerequisites read the stubbed truth ---")
+    import importlib.util as _ilu
+    from TEX_Wrangle.tex_doctor import capabilities
+    fails = []
+
+    saved_cuda = torch.cuda.is_available
+    torch.cuda.is_available = lambda: False
+    try:
+        rows = capabilities()["rows"]
+        for name, row in rows.items():
+            if "@cuda" not in name:
+                continue
+            if row["status"] != "unavailable":
+                fails.append(f"{name}: expected unavailable with no CUDA, got {row['status']}")
+            elif "CUDA" not in (row["why_not"] or ""):
+                fails.append(f"{name}: why_not doesn't name CUDA: {row['why_not']!r}")
+    finally:
+        torch.cuda.is_available = saved_cuda
+
+    saved_find_spec = _ilu.find_spec
+    torch.cuda.is_available = lambda: True
+
+    def _no_triton(name, *a, **kw):
+        if name == "triton":
+            return None
+        return saved_find_spec(name, *a, **kw)
+    _ilu.find_spec = _no_triton
+    try:
+        rows = capabilities()["rows"]
+        for name in ("torch_compile:inductor@cuda", "noise_promotion@cuda"):
+            row = rows[name]
+            if row["status"] != "unavailable" or "riton" not in (row["why_not"] or ""):
+                fails.append(f"{name}: expected unavailable naming Triton, got {row}")
+        for name in ("torch_compile:cudagraphs@cuda", "cuda_graph@cuda"):
+            if rows[name]["status"] == "unavailable":
+                fails.append(f"{name}: a missing Triton must not flag this row, got {rows[name]}")
+    finally:
+        _ilu.find_spec = saved_find_spec
+        torch.cuda.is_available = saved_cuda
+
+    if fails:
+        r.fail("BRIEF-4 C3 static truth", "; ".join(fails))
+    else:
+        r.ok("CUDA-false -> every @cuda row unavailable naming CUDA; Triton-missing -> only "
+             "the two inductor rows unavailable, naming Triton")
+
+
+def test_dbg4_capabilities_measured_truth(r: SubTestResult):
+    print("\n--- BRIEF-4 C4: measured evidence drives works/unavailable, restored after ---")
+    from TEX_Wrangle.tex_doctor import capabilities
+    from TEX_Wrangle.tex_runtime import compiled as _compiled
+    from TEX_Wrangle.tex_runtime import graphed as _graphed
+    fails = []
+
+    _MISSING = object()
+    saved_backend = _compiled._backend_status.get(("inductor", "cpu"), _MISSING)
+    try:
+        _compiled._backend_status[("inductor", "cpu")] = False
+        row = capabilities()["rows"]["torch_compile:inductor@cpu"]
+        if row["status"] != "unavailable" or row["evidence"] != "measured":
+            fails.append(f"backend False -> expected unavailable/measured, got {row}")
+
+        _compiled._backend_status[("inductor", "cpu")] = True
+        row = capabilities()["rows"]["torch_compile:inductor@cpu"]
+        if row["status"] != "works" or row["evidence"] != "measured":
+            fails.append(f"backend True -> expected works/measured, got {row}")
+    finally:
+        if saved_backend is _MISSING:
+            _compiled._backend_status.pop(("inductor", "cpu"), None)
+        else:
+            _compiled._backend_status[("inductor", "cpu")] = saved_backend
+
+    saved_disabled = _graphed._graph_mode_disabled
+    saved_err = _graphed._last_capture_error[0]
+    saved_cuda = torch.cuda.is_available
+    torch.cuda.is_available = lambda: True
+    try:
+        _graphed._graph_mode_disabled = True
+        _graphed._last_capture_error[0] = "E: x"
+        row = capabilities()["rows"]["cuda_graph@cuda"]
+        if row["status"] != "unavailable" or "E: x" not in (row["why_not"] or ""):
+            fails.append(f"kill switch + last error -> expected unavailable naming 'E: x', "
+                         f"got {row}")
+    finally:
+        torch.cuda.is_available = saved_cuda
+        _graphed._graph_mode_disabled = saved_disabled
+        _graphed._last_capture_error[0] = saved_err
+
+    if fails:
+        r.fail("BRIEF-4 C4 measured truth", "; ".join(fails))
+    else:
+        r.ok("_backend_status True/False -> works/unavailable measured; the CUDA-graph kill "
+             "switch's why_not carries the last capture error; both restored")
+
+
+def test_dbg4_capabilities_probe_never_raises(r: SubTestResult):
+    print("\n--- BRIEF-4 C5: a raising probe never takes the report down ---")
+    import importlib.util as _ilu
+    from TEX_Wrangle.tex_doctor import capabilities
+    fails = []
+
+    saved_find_spec = _ilu.find_spec
+    saved_cuda = torch.cuda.is_available
+    torch.cuda.is_available = lambda: True
+
+    def _boom(name, *a, **kw):
+        if name == "triton":
+            raise RuntimeError("boom")
+        return saved_find_spec(name, *a, **kw)
+    _ilu.find_spec = _boom
+    try:
+        report = capabilities()
+    except Exception as e:
+        fails.append(f"capabilities() raised: {e}")
+        report = None
+    finally:
+        _ilu.find_spec = saved_find_spec
+        torch.cuda.is_available = saved_cuda
+
+    if report is not None:
+        rows = report["rows"]
+        for name in ("torch_compile:inductor@cuda", "noise_promotion@cuda"):
+            row = rows[name]
+            if row["status"] != "unknown" or "probe raised" not in (row["note"] or ""):
+                fails.append(f"{name}: expected unknown w/ 'probe raised' note, got {row}")
+        if rows["none@cpu"]["status"] != "works":
+            fails.append("an unrelated row (none@cpu) was collateral-damaged")
+
+    if fails:
+        r.fail("BRIEF-4 C5 probe raised", "; ".join(fails))
+    else:
+        r.ok("a raising probe is isolated to its own row(s) as unknown + 'probe raised' "
+             "note; capabilities() itself never raises; unrelated rows stay intact")
+
+
+def test_dbg4_capabilities_not_folded(r: SubTestResult):
+    print("\n--- BRIEF-4 C7: capabilities() stays out of collect_doctor_facts()/the route ---")
+    from TEX_Wrangle.tex_doctor import collect_doctor_facts
+    facts = collect_doctor_facts()
+    if "capabilities" in facts:
+        r.fail("BRIEF-4 C7 not folded", "'capabilities' leaked into collect_doctor_facts() / "
+               "the /tex_wrangle/doctor route — the ComfyUI modal must stay byte-identical")
+    else:
+        r.ok("collect_doctor_facts() carries no 'capabilities' key — the route/modal payload "
+             "is unchanged")
+
+
+def test_dbg4_doctor_cli_subcommand(r: SubTestResult):
+    print("\n--- BRIEF-4 C8: `tex doctor [--json]` is wired into the CLI ---")
+    import contextlib
+    import io
+    import json
+    from TEX_Wrangle.tex_cli import build_parser, main
+    fails = []
+
+    args = build_parser().parse_args(["doctor"])
+    if args.cmd != "doctor":
+        fails.append(f"parse_args(['doctor']).cmd == {args.cmd!r}, expected 'doctor'")
+
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            main(["doctor", "--json"])
+    except SystemExit as e:
+        fails.append(f"main(['doctor', '--json']) called sys.exit({e.code!r})")
+
+    payload = {}
+    try:
+        payload = json.loads(buf.getvalue())
+    except ValueError as e:
+        fails.append(f"stdout was not parseable JSON: {e}")
+    if payload.get("capabilities", {}).get("schema") != 1:
+        fails.append(f"payload['capabilities']['schema'] != 1: {payload.get('capabilities')}")
+    if "facts" not in payload:
+        fails.append("payload missing 'facts' (collect_doctor_facts())")
+
+    if fails:
+        r.fail("BRIEF-4 C8 doctor subcommand", "; ".join(fails))
+    else:
+        r.ok("`tex doctor` parses to cmd='doctor'; `--json` prints {capabilities, facts} "
+             "with schema 1 and exits 0")
+
+
 def test_dbg4_doctor(r: SubTestResult):
     print("\n--- DBG-4: tex doctor environment report (never raises) ---")
     from TEX_Wrangle.tex_doctor import collect_doctor_facts

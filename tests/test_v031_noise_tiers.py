@@ -807,3 +807,84 @@ def test_v031_noise_promotion_envelope(r: SubTestResult):
     else:
         r.ok(f"{name}: every envelope column red against {band:.0e} "
              f"({', '.join(f'{row[col]:.3e}' for col in _ENVELOPE_COLUMNS)}), exact columns green")
+
+
+# BRIEF-4 C6 — a torch.compile PROMOTION failure used to vanish into `try_upgrade`'s bare
+# `except Exception: pass`. Fresh child, CPU-only and box-independent: seeding
+# `_inductor_available["cpu"]=True` makes the 4th-call attempt fire with no real MSVC
+# needed, and replacing `_compile_simplex` with one that always raises stands in for a
+# genuine compiler failure (a C1083 is MSVC's real "cannot open compiler generated file").
+_PROMOTION_FAILURE_CHILD = _CHILD_HEAD + r'''
+dev = "cpu"
+key, cache = device_key(dev), noise._simplex_cache
+noise._inductor_available["cpu"] = True
+
+def _boom(device):
+    raise RuntimeError("C1083: cannot open compiler generated file")
+noise._compile_simplex = _boom
+
+torch.manual_seed(5)
+img = torch.rand(1, 24, 32, 4, device=dev)
+prog = ''' + repr(_SIMPLEX_PROG) + r'''
+for _ in range(4):
+    tex_engine.cook(prog, {"A": img}, device_mode=dev, precision="fp32")
+
+from TEX_Wrangle.tex_doctor import capabilities
+print(json.dumps({
+    "tier": _tier_of(cache, key),
+    "compile_attempted": key in cache._compile_attempted,
+    "failures": tier_trace.noise_compile_failures(),
+    "compiles": tier_trace.noise_compiles(),
+    "row": capabilities()["rows"]["noise_promotion@cpu"],
+}))
+'''
+
+
+def test_v031_noise_promotion_failure_recorded(r: SubTestResult):
+    """BRIEF-4 C6 — a torch.compile PROMOTION failure (`try_upgrade`'s previously-swallowed
+    exception, `noise.py`) is now RECORDED instead of vanishing: one entry naming the real
+    exception; `noise_compiles()` untouched (a failure must never read as a compile event —
+    the same discipline that ring's own docstring states); the incumbent jit.trace tier still
+    serving the key (a failed promotion must not disturb what already works — the simplex
+    calls above returned normal results throughout); and `tex_doctor.capabilities()`'s
+    `noise_promotion@cpu` row reads unavailable/measured, naming the failure.
+    """
+    print("\n--- BRIEF-4 C6: a noise promotion failure is recorded, not swallowed ---")
+    with cold_engine_state() as cold:
+        out, err = _run_child(_PROMOTION_FAILURE_CHILD, [cold.dir])
+    if err:
+        r.fail("BRIEF-4 C6 promotion failure", err)
+        return
+    try:
+        result = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError) as e:
+        r.fail("BRIEF-4 C6 promotion failure", f"child printed no parseable JSON: {e}\n{out}")
+        return
+
+    fails = []
+    if result["tier"] != "trace":
+        fails.append(f"incumbent tier disturbed by the failed promotion: {result['tier']!r}")
+    if not result["compile_attempted"]:
+        fails.append("the 4th call never attempted the promotion")
+    if result["compiles"]:
+        fails.append(f"a failure was recorded on noise_compiles() as a success: "
+                     f"{result['compiles']}")
+    failures = result["failures"]
+    if len(failures) != 1:
+        fails.append(f"expected exactly one failure entry, got {failures}")
+    else:
+        f0 = failures[0]
+        if (f0.get("noise") != "simplex" or f0.get("device") != "cpu"
+                or "C1083" not in f0.get("error", "")):
+            fails.append(f"failure entry wrong shape/content: {f0}")
+    row = result["row"]
+    if (row.get("status") != "unavailable" or row.get("evidence") != "measured"
+            or "C1083" not in (row.get("why_not") or "")):
+        fails.append(f"noise_promotion@cpu should be unavailable/measured naming C1083: {row}")
+
+    if fails:
+        r.fail("BRIEF-4 C6 promotion failure", "; ".join(fails))
+    else:
+        r.ok("a swallowed torch.compile promotion failure is now recorded (naming the real "
+             "exception), never counted as a compile, leaves the incumbent trace tier "
+             "serving the key, and reads unavailable/measured in capabilities()")

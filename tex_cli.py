@@ -204,6 +204,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="for .exr output, store HALF instead of FLOAT (compact, ~1e-3 error)")
     sub.add_parser("validate-hw", help="measure whether TEX's Turing-calibrated perf "
                    "gates hold on THIS GPU; emit a shareable report (S-4)")
+    dp = sub.add_parser("doctor", help="report which acceleration tiers have WORKED, are "
+                        "UNAVAILABLE (with why), or are UNKNOWN on this box this process "
+                        "(BRIEF-4) — a report of what has engaged, never a fixed ladder")
+    dp.add_argument("--json", dest="as_json", action="store_true",
+                    help="emit {'capabilities': ..., 'facts': ...} as JSON instead of text")
     hp = sub.add_parser("help", help="show the signature, description and example for a "
                         "built-in function (LANG-4), or list all functions")
     hp.add_argument("fn", nargs="?", help="function name (omit to list every function)")
@@ -295,6 +300,24 @@ def build_fn(args) -> None:
         print(f"  wrote: {args.emit}")
 
 
+def doctor_fn(args) -> None:
+    """`tex doctor [--json]` (BRIEF-4) — print `tex_doctor.capabilities()`'s per-tier
+    report, one line per row, or the full `{capabilities, facts}` payload as JSON. Exits
+    0 unconditionally: the probe running and reporting truthfully IS the contract, not
+    any particular tier being available on this box."""
+    import json as _json
+    from .tex_doctor import capabilities, collect_doctor_facts
+    caps = capabilities()
+    if args.as_json:
+        print(_json.dumps({"capabilities": caps, "facts": collect_doctor_facts()}, indent=2))
+        return
+    for name, row in caps["rows"].items():
+        line = f"{name}: {row['status']} ({row['evidence']})"
+        if row["why_not"]:
+            line += f" - {row['why_not']}"
+        print(line)
+
+
 def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
     # F3 (doc 32): a bad path / syntax error / cook failure must exit with a one-line
@@ -313,6 +336,8 @@ def main(argv=None) -> None:
             help_fn(args)
         elif args.cmd == "build":
             build_fn(args)
+        elif args.cmd == "doctor":
+            doctor_fn(args)
     # TEXCompileError (ENG-4) is what tex_api.compile / tex_engine both raise on a compile
     # failure, and run_program calls compile BEFORE the cook — so without it here every
     # syntax error in `tex run` dumps a stack, breaking the F3 contract this function keeps.

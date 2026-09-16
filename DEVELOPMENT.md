@@ -612,6 +612,7 @@ breaks a host.
 | **2 — Semi** | `a@name` ARRAY wire + array outputs (DATA-3) | Engine-profile only; `a` is now a RESERVED binding prefix; comfy rejects array outputs (E3203 + egress guard) | `test_v028_phase1` |
 | **2 — Semi** | TEX the language | Additive; new builtin/function names are RESERVED, so adding one is a minor breaking change — note it in the CHANGELOG (v0.22 reserved `frame`/`fps`/`time`) | the compat corpus (LANG-3, planned) |
 | **2 — Semi** | Error codes (E1xxx–E6xxx) | Codes are stable; message TEXT is not | `test_c3ux_error_codes_resolve` |
+| **2 — Semi** | `tex_doctor.capabilities()` row names, its 4 keys, and the `status`/`evidence` vocabularies (BRIEF-4) | A read-only per-tier capability REPORT, never a fixed ladder — values are whatever a box measures; a row/key/vocabulary rename or removal bumps `schema` | `test_dbg4_capabilities_shape` |
 | **3 — Internal** | Everything else — `tex_runtime.*`, `tex_compiler.*`, `tex_fusion` internals, `tex_engine._*` | No promise. Import at your own risk | — |
 
 **Fingerprints are NOT stable — never persist one.** `TEXCache.fingerprint` /

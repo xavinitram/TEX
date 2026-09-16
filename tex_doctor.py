@@ -53,9 +53,12 @@ def _cache_facts():
 
 
 def _tier_facts():
-    """Which tier `select_tier` picks for each (compile_mode, device) — the routing a
-    user actually gets, so 'auto on a no-Triton box → interpreter' is visible.
-    ENG-1: asks the engine directly; the doctor never needed the ComfyUI node for this."""
+    """Which tier `select_tier` picks for each (compile_mode, device) — SELECTION, not
+    availability. `select_tier` is pure routing and consults no toolchain, so this reads
+    back `"auto"` for `auto@cuda` even on a no-Triton box (the fallback to the
+    interpreter happens later, inside that tier's own trial) — the routing decision is
+    visible here, whether the chosen tier can actually engage is `capabilities()`,
+    below. ENG-1: asks the engine directly; the doctor never needed the ComfyUI node for this."""
     from .tex_engine import select_tier as _select_tier
     out = {}
     for dev in ("cpu", "cuda"):
@@ -102,3 +105,206 @@ def collect_doctor_facts() -> dict:
         "xfer": _fact(_xfer_facts),  # ENG-8: measured PCIe transfer-cost model
         "memory_profile": _fact(_memory_profile_facts),  # GOV-1: the named preset in force
     }
+
+
+# ── BRIEF-4 — capabilities(): a per-tier capability REPORT ──────────────────────────
+#
+# `collect_doctor_facts()` above answers "what does this box look like"; `capabilities()`
+# answers "did tier T actually engage" — a different question `_tier_facts()` cannot answer,
+# because `select_tier` is pure routing (see its docstring). A row is a REPORT, never a
+# contract: it names what THIS process has shown on THIS box so far, never a promise about
+# any other box or any later cook. Every row is isolated by `_row()` below, the `_fact()`
+# discipline above specialised to capabilities()'s fixed 4-key shape, so one raising probe
+# can never take another row — or the call — down. Read-only, always: no row here ever
+# calls `_setup_msvc_env` (a <=30s subprocess) or `_can_inductor_compile` (which compiles and
+# mutates `TORCHINDUCTOR_CACHE_DIR`) — each reads only what a REAL cook already left behind.
+
+_NOISE_PROMOTION_NOTE = ("engages on the default cook path on a key's 4th call, "
+                         "whatever compile_mode says")
+
+
+def _row(fn):
+    """Run one row probe; on any failure return the closed-shape 'unknown' stub instead
+    of raising — never widen this to the free-form `{"error": ...}` shape `_fact` uses,
+    because every capabilities() row is pinned to exactly four keys (C1)."""
+    try:
+        return fn()
+    except Exception as e:
+        return {"status": "unknown", "evidence": "static", "why_not": None,
+                "note": f"probe raised: {type(e).__name__}: {e}"}
+
+
+def _cuda_available() -> bool:
+    import torch
+    return bool(torch.cuda.is_available())
+
+
+def _cuda_unavailable() -> dict:
+    return {"status": "unavailable", "evidence": "static",
+            "why_not": "CUDA is not available (torch.cuda.is_available() is False)",
+            "note": None}
+
+
+def _inductor_prereq(dev_type: str):
+    """Static, side-effect-free: does the inductor backend's PREREQUISITE hold for
+    `dev_type`? Mirrors `noise._can_inductor_compile`'s own gate exactly, without ever
+    calling it (that function compiles a probe kernel and mutates env). Returns
+    `(ok, why_not)`: `ok` is `True` (holds), `False` (fails — `why_not` names what's
+    missing), or `None` (Windows CPU, before any inductor-CPU attempt this process —
+    not knowable without running the vcvarsall search this call must not perform)."""
+    import importlib.util
+    if dev_type == "cuda":
+        if not _cuda_available():
+            return False, "CUDA is not available (torch.cuda.is_available() is False)"
+        if importlib.util.find_spec("triton") is None:
+            return False, ("Triton is not installed (torch.compile's inductor backend "
+                           "needs it on CUDA)")
+        return True, None
+    # cpu
+    import sys
+    if sys.platform != "win32":
+        return True, None
+    if shutil.which("cl") is not None or os.environ.get("INCLUDE"):
+        return True, None
+    from .tex_runtime import compiled as _compiled
+    if _compiled._msvc_env_initialized:
+        return False, ("no MSVC (cl.exe) found on PATH and no INCLUDE set; the vcvarsall "
+                       "search already ran this process and found nothing")
+    return None, None
+
+
+def _row_none(dev_type: str) -> dict:
+    if dev_type == "cuda" and not _cuda_available():
+        return _cuda_unavailable()
+    return {"status": "works", "evidence": "static", "why_not": None, "note": None}
+
+
+def _row_torch_compile(backend: str, dev_type: str) -> dict:
+    if dev_type == "cuda" and not _cuda_available():
+        return _cuda_unavailable()
+    if backend == "inductor":
+        ok, why_not = _inductor_prereq(dev_type)
+        if ok is False:
+            return {"status": "unavailable", "evidence": "static", "why_not": why_not,
+                    "note": None}
+    from .tex_runtime import compiled as _compiled
+    measured = _compiled._backend_status.get((backend, dev_type))
+    if measured is True:
+        return {"status": "works", "evidence": "measured", "why_not": None, "note": None}
+    if measured is False:
+        return {"status": "unavailable", "evidence": "measured",
+                "why_not": f"torch.compile's '{backend}' backend failed at least once on "
+                           f"{dev_type} this process", "note": None}
+    return {"status": "unknown", "evidence": "static", "why_not": None, "note": None}
+
+
+def _row_cuda_graph() -> dict:
+    if not _cuda_available():
+        return _cuda_unavailable()
+    from .tex_runtime import graphed as _graphed
+    if _graphed._graph_mode_disabled:
+        err = _graphed._last_capture_error[0]
+        why = "CUDA-graph capture was disabled after repeated capture failures"
+        if err:
+            why += f": {err}"
+        return {"status": "unavailable", "evidence": "measured", "why_not": why, "note": None}
+    if len(_graphed._graph_cache) > 0:
+        return {"status": "works", "evidence": "measured", "why_not": None, "note": None}
+    return {"status": "unknown", "evidence": "static", "why_not": None, "note": None}
+
+
+def _key_device(key):
+    """The `torch.device` embedded in a `_TieredCache` key: bare for simplex
+    (`x.device`), the last element of a tuple for fbm (`(octaves, device)`) and worley
+    (`(return_f2, device)`)."""
+    import torch
+    if isinstance(key, torch.device):
+        return key
+    if isinstance(key, tuple):
+        for part in reversed(key):
+            if isinstance(part, torch.device):
+                return part
+    return None
+
+
+def _noise_has_promoted(dev_type: str) -> bool:
+    """A live torch.compile'd callable under ANY `_TieredCache` key on `dev_type` — read
+    straight off the three caches, using the same notion of 'promoted' the noise-tier
+    tests use: not cold (`None`), not the eager sentinel (`False`), not a jit.trace
+    `ScriptFunction`."""
+    import torch
+    from .tex_runtime import noise as _noise
+    for cache in (_noise._simplex_cache, _noise._fbm_cache, _noise._worley_cache):
+        for key, held in list(cache.cache.items()):
+            if held is None or held is False or isinstance(held, torch.jit.ScriptFunction):
+                continue
+            dev = _key_device(key)
+            if dev is not None and dev.type == dev_type:
+                return True
+    return False
+
+
+def _noise_promotion_failure(dev_type: str):
+    """The most recent recorded noise-promotion failure on `dev_type`, or `None`. Reads
+    the BRIEF-4 failure ring (`tier_trace.noise_compile_failures`) plus the inductor
+    probe's own cached verdict — never triggers either."""
+    from .tex_runtime import noise as _noise
+    from .tex_runtime import tier_trace as _tier_trace
+    if _noise._inductor_available.get(dev_type) is False:
+        return f"no torch.compile toolchain available for {dev_type} this process"
+    for e in reversed(_tier_trace.noise_compile_failures()):
+        if e.get("device") == dev_type:
+            return f"{e['noise']} failed to promote ({e['error']})"
+    return None
+
+
+def _row_noise_promotion(dev_type: str) -> dict:
+    if dev_type == "cuda" and not _cuda_available():
+        d = _cuda_unavailable()
+        d["note"] = _NOISE_PROMOTION_NOTE
+        return d
+    ok, why_not = _inductor_prereq(dev_type)
+    if ok is False:
+        return {"status": "unavailable", "evidence": "static", "why_not": why_not,
+                "note": _NOISE_PROMOTION_NOTE}
+    # Success outranks failure: a key that promoted reads as engaging even beside a
+    # different key that failed on the same device (each noise type owns its own cache,
+    # so — unlike the bool-per-backend rows above — both can be true at once).
+    if _noise_has_promoted(dev_type):
+        return {"status": "works", "evidence": "measured", "why_not": None,
+                "note": _NOISE_PROMOTION_NOTE}
+    failure = _noise_promotion_failure(dev_type)
+    if failure is not None:
+        return {"status": "unavailable", "evidence": "measured", "why_not": failure,
+                "note": _NOISE_PROMOTION_NOTE}
+    return {"status": "unknown", "evidence": "static", "why_not": None,
+            "note": _NOISE_PROMOTION_NOTE}
+
+
+def capabilities() -> dict:
+    """BRIEF-4 — a read-only, per-tier capability REPORT: for each execution tier, did it
+    (or the toolchain it needs) actually WORK in this process, is it known to be
+    UNAVAILABLE (and why), or is that simply UNKNOWN (prerequisites hold, nothing has
+    exercised it yet)? Never a fixed ladder — a box reports what IT has (see the module-
+    level comment above for the read-only guarantee).
+
+    Schema (DEVELOPMENT.md ENG-5 Tier 2 — additive-only; a row/key/vocabulary change
+    bumps `schema`)::
+
+        {"schema": 1, "rows": {"<mode>[:<backend>]@<device>": {
+            "status": "works" | "unknown" | "unavailable",
+            "evidence": "static" | "measured",
+            "why_not": str | None,   # non-empty iff status == "unavailable"
+            "note": str | None}}}
+    """
+    rows = {
+        "none@cpu": _row(lambda: _row_none("cpu")),
+        "none@cuda": _row(lambda: _row_none("cuda")),
+        "torch_compile:inductor@cuda": _row(lambda: _row_torch_compile("inductor", "cuda")),
+        "torch_compile:cudagraphs@cuda": _row(lambda: _row_torch_compile("cudagraphs", "cuda")),
+        "torch_compile:inductor@cpu": _row(lambda: _row_torch_compile("inductor", "cpu")),
+        "cuda_graph@cuda": _row(_row_cuda_graph),
+        "noise_promotion@cpu": _row(lambda: _row_noise_promotion("cpu")),
+        "noise_promotion@cuda": _row(lambda: _row_noise_promotion("cuda")),
+    }
+    return {"schema": 1, "rows": rows}
