@@ -343,6 +343,36 @@ MUTATIONS = [
      '                outputs[name] = strip_out  # scalar/string: any strip suffices',
      "                outputs[name] = (strip_out.expand(H_total) if hasattr(strip_out, "
      "'dim') and strip_out.dim() == 0 else strip_out)"),
+    # ── residency hints (`touch` / `in`) ──
+    # Each puts back one way a hint turns into a read, outranks demand, or stops being atomic.
+    ('touch: a hint counts as a hit (speculation folded into the read counters)',
+     'tex_results.py',
+     '            self.touches += 1',
+     '            self.hits += 1'),
+    ('touch: the hint takes the top slot from the most recent demand', 'tex_results.py',
+     '                self._ram.move_to_end(key)\n'
+     '                self._ram.move_to_end(mru)',
+     '                self._ram.move_to_end(key)\n'
+     '                pass'),
+    ('touch: the hint is spelled as a read again (delegates to get)', 'tex_results.py',
+     '        with self._lock:\n'
+     '            if key not in self._ram:\n'
+     '                return False',
+     '        return self.get(key, copy=False) is not None\n'
+     '        with self._lock:\n'
+     '            if key not in self._ram:\n'
+     '                return False'),
+    ('touch: reading the top entry and the moves stop being one critical section',
+     'tex_results.py',
+     '        with self._lock:\n'
+     '            if key not in self._ram:\n'
+     '                return False',
+     '        if True:\n'
+     '            if key not in self._ram:\n'
+     '                return False'),
+    ('in: membership is answered by a read (counts, restores, promotes)', 'tex_results.py',
+     '            return key in self._ram',
+     '            return self.get(key, copy=False) is not None'),
 ]
 
 RUNNER = """

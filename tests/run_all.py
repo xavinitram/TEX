@@ -1071,6 +1071,16 @@ def main():
         test_v033_cache8_profiles_carry_the_residency_ceiling,
         test_v033_cache8_profile_reaches_and_restores_the_ceiling,
         test_v033_cache8_is_absent_from_the_default_comfyui_path,
+        test_v033_cache8_touch_is_not_a_read,
+        test_v033_cache8_touch_steers_the_victim_walks,
+        test_v033_cache8_touch_leaves_the_demanded_frame_on_top,
+        test_v033_cache8_touch_never_moves_a_frame_between_devices,
+        test_v033_cache8_a_touched_frame_serves_bit_exact,
+        test_v033_cache8_membership_is_a_pure_question,
+        test_v033_cache8_touch_changes_no_pool_share_under_the_governor,
+        test_v033_cache8_touch_and_in_survive_a_threaded_race,
+        test_v033_cache8_touch_is_atomic_against_a_concurrent_put,
+        test_v033_cache8_hints_never_wait_on_or_undo_in_flight_work,
     )
     test_v033_cache8_residency_is_off_until_armed(r)
     test_v033_cache8_demote_frees_vram_and_keeps_the_frame(r)
@@ -1085,6 +1095,17 @@ def main():
     test_v033_cache8_profiles_carry_the_residency_ceiling(r)
     test_v033_cache8_profile_reaches_and_restores_the_ceiling(r)
     test_v033_cache8_is_absent_from_the_default_comfyui_path(r)
+    # Residency hints: `touch` / `in` steer the victim walks without reading.
+    test_v033_cache8_touch_is_not_a_read(r)
+    test_v033_cache8_touch_steers_the_victim_walks(r)
+    test_v033_cache8_touch_leaves_the_demanded_frame_on_top(r)
+    test_v033_cache8_touch_never_moves_a_frame_between_devices(r)
+    test_v033_cache8_a_touched_frame_serves_bit_exact(r)
+    test_v033_cache8_membership_is_a_pure_question(r)
+    test_v033_cache8_touch_changes_no_pool_share_under_the_governor(r)
+    test_v033_cache8_touch_and_in_survive_a_threaded_race(r)
+    test_v033_cache8_touch_is_atomic_against_a_concurrent_put(r)
+    test_v033_cache8_hints_never_wait_on_or_undo_in_flight_work(r)
 
     # v0.33 XPU-2 — engine-owned async D2H egress. The fence row is the release exit gate
     # ("egress fences proven by a stress test that consumes frames from the wrong side").

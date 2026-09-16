@@ -134,9 +134,26 @@ A keyed store of cooked frames, RAM-tier byte-budgeted with a disk-spill tail, e
 frozen per ENG-12 and keyed by CACHE-1.
 
 **API (host-facing):** `get(key) → tensor|None`, `put(key, tensor, *, canvas=None, quality=None,
-storage=None)`, `set_budget(mb)`, `set_vram_budget(mb)`, plus `stats()`. A host that has a
-`CookResult.lineage` calls `put(res.lineage[name], res.outputs[name])` and later `get(key)`. The
-ComfyUI node does not call any of it.
+storage=None)`, `set_budget(mb)`, `set_vram_budget(mb)`, `touch(key) → bool`, `key in cache`,
+plus `stats()`. A host that has a `CookResult.lineage` calls `put(res.lineage[name],
+res.outputs[name])` and later `get(key)`. The ComfyUI node does not call any of it.
+
+**A hint is not a read.** `get` counts a hit or a miss, promotes a demoted frame, restores a
+spilled one and unpacks a preview one. A host that only *predicts* demand calls `touch(key)`
+instead: it ranks a RAM-resident entry **just below the most recent one** — so `evict_bytes`, the
+RAM budget and residency demotion all reach it after every untouched entry, while the frame just
+cooked or read keeps the top slot those walks spare — and does nothing else. No hit or miss, no
+restore, no promotion (a demoted frame stays demoted until a real `get`), no unpack, no queued or
+cancelled work; it returns False for a key not in RAM and counts the rest in
+`stats()["touches"]`. Because the top slot stays put, a touch changes which entry a walk takes
+first but never how many bytes it can free, so the shortfall the governor passes on to the next
+pool is unchanged. `key in cache` answers RAM residency (VRAM or host RAM) and changes nothing;
+a spilled frame reads False while `get` may still restore it, because disk membership is
+sometimes legitimately unknown. Both are Tier 2: names and non-effects stable, the order a touch
+yields is policy. Not offered, on purpose: promotion on a hint (it allocates what the
+arbitration after it reclaims), a keep-set on `evict_bytes` (a pool that under-delivers hands its
+shortfall to the all-or-nothing CUDA-graph evictor), and the victim order itself (that policy is
+still open).
 
 **v0.33 additions, both off unless asked for.** `quality="preview"` (PREC-1) stores the frame at
 half precision — 2× the frames in the same budget, invisible through `get`, which upcasts;

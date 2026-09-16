@@ -441,6 +441,9 @@ class ResultCache:
         # numbers that say whether the tier is doing anything, and `stats()` reports them —
         # a residency policy nobody can observe is a residency policy nobody can tune.
         self.demotions = self.promotions = 0
+        # Residency HINTS, counted apart from demand: `touch` moves this and never `hits`, so a
+        # hit rate stays a statement about reads (see `touch`).
+        self.touches = 0
 
     @property
     def _ram_bytes(self) -> int:
@@ -1587,6 +1590,86 @@ class ResultCache:
                 self._disk_bytes = total if not missed else None
         return n, nbytes
 
+    # ── residency hints: a statement about the FUTURE that is not a read ──────────
+    #
+    # Without these, a host's only lever on where a cached entry sits in the LRU is `get`, and
+    # `get` is a READ: it counts a hit or a miss, promotes a demoted frame (an allocation plus an
+    # H2D copy), falls through to a disk restore on a miss, and unpacks a preview-stored frame. A
+    # host that PREDICTS demand and wants the victim walks to reach a frame later needs none of
+    # that, and a hint spelled as a `get` is indistinguishable from demand in `hits`. These two
+    # are the non-read half: one reorders, one asks, and neither does anything else.
+    #
+    # Deliberately NOT offered beside them, each for a reason that lives in this file:
+    #   * Promotion on a hint. A hint typically runs right before an arbitration, so promoting
+    #     allocates on the very device the arbitration is about to reclaim, and `_promote`
+    #     commits without re-checking the VRAM ceiling — the arbitration then frees those bytes
+    #     again, from other frames or, past this pool, from the CUDA-graph pool. Demand already
+    #     promotes: the next `get` brings a frame home.
+    #   * A keep-set on `evict_bytes`. A pool that declines to free what it is asked for passes
+    #     the shortfall on in `arbitrate`, and the pool after this one is the all-or-nothing
+    #     `free_graphs_only()` (MEM-1): one protected frame could cost every captured graph.
+    #   * The victim order itself (`keys()`, "which key goes next"). It would publish as
+    #     contract the policy DEVELOPMENT.md still holds open (recency vs frequency victims).
+
+    def __contains__(self, key: str) -> bool:
+        """`key in cache`: is `key` RESIDENT in the RAM tier right now — on its home device, or
+        demoted to host RAM. Asking changes nothing: no LRU move, no counter, no promotion, no
+        restore.
+
+        RAM tier ONLY, deliberately. A frame spilled to disk reads False here while `get` may
+        still restore it: disk membership is legitimately UNKNOWN at times (see `_spilled`), and
+        answering it would mean a directory walk inside a membership test or a definite False
+        where the honest answer is "unknown" — the wrong-answer class this file refuses
+        everywhere else. So True means resident now; False does not mean a `get` would miss.
+        The answer is a snapshot: another thread may admit or evict `key` once the lock is
+        released.
+
+        Tier 2 — Semi (DEVELOPMENT.md §"API stability tiers"): the name, the RAM-tier meaning
+        and the non-effects are stable. Thread-safe, O(1)."""
+        with self._lock:
+            return key in self._ram
+
+    def touch(self, key: str) -> bool:
+        """A residency HINT: rank `key` second to last, just below the most recent entry, so
+        every walk that takes victims oldest-first — `evict_bytes`, the RAM budget, residency
+        demotion — reaches it after every other entry but that one (and `preview_entries` lists
+        it later). Returns True if `key` is resident in the RAM tier and was ranked; False if it
+        is not, which is a no-op, never an error. A key that already IS the most recent entry
+        keeps its place.
+
+        It changes that one entry's place and `touches` (+1 per resident key). What it does NOT
+        do is the contract:
+
+          * count a hit or a miss — a hint is about the future; `hits` stays about reads;
+          * restore a spilled frame, or look for one — an absent key costs no syscall;
+          * promote a demoted frame or move any frame between devices — `device` and `home`
+            are untouched, and the frame's next `get` promotes it exactly as before;
+          * unpack, copy or allocate, or queue, drain or cancel any demotion or spill — a victim
+            a walk has already chosen is not rescued.
+
+        BELOW the most recent entry, not on top of it as `get` puts a frame: the top slot is the
+        frame just cooked or read, which `_queue_demotions` spares by key and `evict_bytes` /
+        `_enforce_ram_budget` keep as their one-entry floor. A prediction taking that slot would
+        hand the protection to a frame nobody has asked for yet and put the demanded one back in
+        the walk. Leaving the top where it is keeps every walk's ELIGIBLE set unchanged, so a
+        touch changes which entry a walk takes first, never how many bytes it can free — the
+        shortfall an arbitration passes on to the next pool is the one it would have passed.
+
+        Tier 2 — Semi: the name, the return value and the non-effects are stable; the ORDER a
+        touch yields is policy (victim choice may change — see `_enforce_residency`). Advice the
+        cache takes, never a pin. Thread-safe and O(1): reading the top entry and both moves are
+        one critical section, so a concurrent `put` cannot land between them and end up beneath
+        a stale top."""
+        with self._lock:
+            if key not in self._ram:
+                return False
+            mru = next(reversed(self._ram))
+            if key != mru:
+                self._ram.move_to_end(key)
+                self._ram.move_to_end(mru)       # the most recent demand keeps the top slot
+            self.touches += 1
+            return True
+
     # ── PREC-1 / CF-4: requalify-on-idle ──────────────────────────────────────
     #
     # PREC-1 shipped preview-tier storage with a promise attached: a frame stored at reduced
@@ -1667,6 +1750,7 @@ class ResultCache:
                     "vram_budget_bytes": self._vram_budget,
                     "demotions": self.demotions, "promotions": self.promotions,
                     "requalified": self.requalified,      # CF-4, for the same reason
+                    "touches": self.touches,              # hints, never folded into `hits`
                     "demoted": sum(1 for e in self._ram.values() if e.device != e.home)}
 
     def clear(self, *, disk=False) -> None:
