@@ -1327,6 +1327,8 @@ def main():
         test_ask13_t6_nan_propagates,
         test_ask13_t6_per_pixel_offset_raises,
         test_ask13_reserved_name_e3011,
+        test_ask13_patch_dist_offset_clamp_pad_bound,
+        test_ask13_patch_dist_offset_clamp_bitexact,
     )
     test_ask13_t6_radius0_equals_pointwise(r)
     test_ask13_t6_zero_offset_exact_zero(r)
@@ -1334,6 +1336,8 @@ def main():
     test_ask13_t6_nan_propagates(r)
     test_ask13_t6_per_pixel_offset_raises(r)
     test_ask13_reserved_name_e3011(r)
+    test_ask13_patch_dist_offset_clamp_pad_bound(r)
+    test_ask13_patch_dist_offset_clamp_bitexact(r)
 
     # HOOK-3: the linear collapse a host needs, and the gate's refusal as data.
     from test_hook3_checkpoint_collapse import (

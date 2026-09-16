@@ -1680,6 +1680,12 @@ class TEXStdlib:
 
         # Shifted field: pad by |sx|/|sy| then NARROW to a view reading pixel+(dx,dy),
         # replicate-clamped at the border — O(1) extra, no gather, no index tensors.
+        # Bound the offset actually used to (extent-1+r) per axis, sign preserved: with
+        # replicate edges, any |shift| beyond that already reads only the edge-replicated
+        # value (the true reach the ROI-1 footprint comment above already names), so this
+        # clamp cannot change a single output value — only how large the pad allocates.
+        bx, by = (W - 1) + r, (H - 1) + r
+        sx, sy = max(-bx, min(sx, bx)), max(-by, min(sy, by))
         ax, ay = abs(sx), abs(sy)
         padded = _pad_replicate_chunked(x, ax, ax, ay, ay)
         x_shift = padded.narrow(-1, ax + sx, W).narrow(-2, ay + sy, H)

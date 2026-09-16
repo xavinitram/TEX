@@ -172,3 +172,125 @@ def test_ask13_reserved_name_e3011(r: SubTestResult):
         r.ok("`float patch_dist(...)` user function is refused as E3011 (reserved builtin)")
     except Exception as e:
         r.fail("ASK-13 E3011", f"{type(e).__name__}: {e}")
+
+
+# ── ASK-13 follow-up: patch_dist's shift offset must not pad by its raw magnitude ──
+# `fn_patch_dist` used to pad the (dx, dy) shift by the UNCLAMPED offset, so a huge
+# uniform dx/dy could allocate `extent + 2*|offset|` before ever touching the
+# (already-clamped) radius. These two rows pin the fix: the pad amount is bounded by
+# (extent-1+radius) independent of the raw offset (red before the fix), and clamping
+# the offset used for the shift/pad to that bound changes not one output value.
+
+def test_ask13_patch_dist_offset_clamp_pad_bound(r: SubTestResult):
+    print("\n--- ASK-13 follow-up: patch_dist's shift pad is bounded by (extent-1+radius), "
+          "independent of the raw offset magnitude ---")
+    from TEX_Wrangle.tex_runtime import stdlib as SL
+
+    def _check(dx, dy, label):
+        img = make_img(1, 8, 8, 3, seed=101)
+        radius = 0                    # returns before any box-mean pad, so exactly one
+                                       # _pad_replicate_chunked call happens, and it is
+                                       # unambiguously the (dx, dy) shift's.
+        calls = []
+        orig = SL._pad_replicate_chunked
+
+        def _spy(x, pad_l, pad_r, pad_t, pad_b):
+            calls.append((pad_l, pad_r, pad_t, pad_b))
+            return orig(x, pad_l, pad_r, pad_t, pad_b)
+
+        SL._pad_replicate_chunked = _spy
+        try:
+            TEXStdlib.fn_patch_dist(img, dx, dy, radius)
+        finally:
+            SL._pad_replicate_chunked = orig      # restore even if the call above raises
+        try:
+            assert calls, f"{label}: the shift pad was never called"
+            pad_l, pad_r, pad_t, pad_b = calls[0]
+            bound = (8 - 1) + radius              # (extent-1+radius); image is 8x8
+            requested = max(pad_l, pad_r, pad_t, pad_b)
+            assert requested <= bound, (
+                f"{label}: shift pad {calls[0]} exceeds the (extent-1+radius) bound="
+                f"{bound} for a raw offset magnitude of {max(abs(dx), abs(dy))} — the "
+                f"padded allocation still scales with the offset, not the image extent")
+            r.ok(f"{label}: shift pad {calls[0]} <= bound={bound} "
+                 f"(raw offset magnitude {max(abs(dx), abs(dy))})")
+        except AssertionError as e:
+            r.fail(f"ASK-13 offset-clamp pad bound [{label}]", str(e))
+
+    # dy=0 / dx=0 hold the OTHER axis's pad at zero, so this stays cheap on both sides
+    # of the fix (a single huge axis pads O(extent), never O(W*H)) — never an actual
+    # out-of-memory run.
+    _check(dx=4096, dy=0, label="dx=4096, dy=0 (W axis)")
+    _check(dx=0, dy=4096, label="dx=0, dy=4096 (H axis)")
+
+
+def test_ask13_patch_dist_offset_clamp_bitexact(r: SubTestResult):
+    print("\n--- ASK-13 follow-up: clamping the shift offset to the (extent-1+radius) bound "
+          "changes no patch_dist output, at/below/above/far-beyond the bound ---")
+    from TEX_Wrangle.tex_runtime import stdlib as SL
+
+    def _unclamped_patch_dist(image, dx, dy, radius):
+        """Differential oracle ONLY: the pre-fix computation, padding the shift by the
+        RAW offset instead of clamping it first. Safe to run here because every offset
+        this test uses is modest (the far-beyond case is the bound plus a small margin,
+        never large enough to pressure memory) — what's under test is bit-exactness of
+        the clamp, not the unbounded allocation it fixes."""
+        img = SL._to_tensor(image)
+        rad = radius
+        sx, sy = dx, dy                          # never clamped -- the pre-fix behaviour
+        squeeze = img.dim() == 3
+        x = SL._get_bchw(img.unsqueeze(-1) if squeeze else img)
+        H, W = x.shape[-2], x.shape[-1]
+        ax, ay = abs(sx), abs(sy)
+        padded = SL._pad_replicate_chunked(x, ax, ax, ay, ay)
+        x_shift = padded.narrow(-1, ax + sx, W).narrow(-2, ay + sy, H)
+        d2 = ((x - x_shift) ** 2).mean(dim=1)
+        if rad == 0:
+            return d2
+        d2c = d2.unsqueeze(1)
+        pad_w = SL._pad_replicate_chunked(d2c, rad, rad, 0, 0)
+        acc = pad_w[..., 0:W]
+        for k in range(1, 2 * rad + 1):
+            acc = acc + pad_w[..., k:k + W]
+        pad_h = SL._pad_replicate_chunked(acc, 0, 0, rad, rad)
+        acc2 = pad_h[..., 0:H, :]
+        for k in range(1, 2 * rad + 1):
+            acc2 = acc2 + pad_h[..., k:k + H, :]
+        return (acc2 / float((2 * rad + 1) ** 2)).squeeze(1)
+
+    def _sweep(img, radius, axis, sign, note):
+        B, H, W, C = img.shape
+        extent = W if axis == "x" else H
+        bound = (extent - 1) + radius
+        deltas = {"just-below": bound - 1, "at": bound,
+                  "just-above": bound + 1, "far-beyond": bound + 50}
+        for pos_label, mag in deltas.items():
+            off = sign * mag
+            dx, dy = (off, 0) if axis == "x" else (0, off)
+            code = f"m@OUT = patch_dist(@A.rgb, {dx}, {dy}, {radius});"
+            label = f"{pos_label} (bound={bound}, axis={axis}, sign={sign:+d}{note})"
+            for dev in _DEVICES:
+                img_dev = img.to(dev)
+                try:
+                    ref = _unclamped_patch_dist(img_dev, dx, dy, radius)
+                except Exception as e:
+                    r.fail(f"ASK-13 offset-clamp bitexact ref [{dev}] {label}",
+                           f"{type(e).__name__}: {e}")
+                    continue
+                for tier in ("interp", "codegen"):
+                    try:
+                        got = run_tier(code, {"A": img_dev}, tier, device=dev)["OUT"]
+                        eq = torch.equal(got.cpu(), ref.cpu())
+                        assert eq, (f"clamped output != unclamped reference "
+                                    f"(dx={dx}, dy={dy}, radius={radius})")
+                        r.ok(f"[{dev}/{tier}] {label}: torch.equal vs the unclamped "
+                             f"computation (dx={dx}, dy={dy})")
+                    except Exception as e:
+                        r.fail(f"ASK-13 offset-clamp bitexact [{dev}/{tier}] {label}",
+                               f"{type(e).__name__}: {e}")
+
+    img = make_img(1, 6, 6, 3, seed=13)
+    _sweep(img, radius=0, axis="x", sign=+1, note="")
+    _sweep(img, radius=0, axis="x", sign=-1, note="")
+    _sweep(img, radius=0, axis="y", sign=+1, note="")
+    _sweep(img, radius=1, axis="x", sign=+1, note=", radius>0")
