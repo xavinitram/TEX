@@ -936,6 +936,60 @@ def is_linear_stage_list(stages: list[dict]) -> bool:
     return bool(stages) and not any(st.get("chain_inputs") for st in stages)
 
 
+def _linear_collapse(stages: list[dict]) -> tuple[list[dict] | None, int | None]:
+    """The ONE spelling of "is this stage list a path, and what is it once collapsed".
+
+    Returns `(collapsed, None)` when every stage reads exactly the stage before it, and
+    `(None, j)` naming the FIRST stage whose wiring is not a path — a fan-in, a fan-out, a
+    skipped edge, a stage reading nothing mid-chain, a stage 0 that reads a chain.
+
+    The legality half comes off `stage_edges`, which is where the wiring rules live and whose
+    own docstring refuses a second copy of them; the BINDING name the legacy shape needs is
+    read off `chain_inputs`, which `stage_edges` deliberately does not carry. Two consumers
+    want different halves of this answer — `collapse_linear` the list, `tex_checkpoint`'s
+    structured refusal the index — and one of them having to re-derive the other's is how the
+    drift this function exists to prevent starts."""
+    if not stages:
+        return None, None
+    out: list[dict] = []
+    for j, st in enumerate(stages):
+        if stage_edges(stages, j) != (set() if j == 0 else {(j - 1, "OUT")}):
+            return None, j
+        ci = _listify_chain_inputs(st.get("chain_inputs"))
+        rest = {k: v for k, v in st.items() if k != "chain_inputs"}
+        if ci:
+            # The edge SET above has one member here, which two bindings naming the same
+            # producer edge also satisfy — and two bindings cannot become one `chain_input`.
+            if len(ci) != 1:
+                return None, j
+            rest["chain_input"] = next(iter(ci))
+        out.append(rest)
+    return out, None
+
+
+def collapse_linear(stages: list[dict]) -> list[dict] | None:
+    """A `region_to_stages` output rewritten to the legacy linear shape, or None (HOOK-3).
+
+    `region_to_stages` emits `chain_inputs` — the DAG spelling — on every chained stage, even
+    when the region it came from is a plain path, so `is_linear_stage_list` is False for every
+    region a host's executor produces and `tex_checkpoint`'s CACHE-6 gate refuses all of them.
+    This is the rewrite that makes such a region eligible: each stage's single `{binding:
+    [j-1, "OUT"]}` edge becomes `chain_input: binding`, every other key is carried through
+    untouched, and the input list is not mutated.
+
+    **None means "this is not a linear chain", and it is the only honest answer** — it is NOT
+    a signal to paper over the difference. A suffix split renumbers every stage while
+    `chain_inputs` entries are ABSOLUTE stage indices, so a DAG collapsed by force is a
+    mis-wired suffix: measured through a weaker linearity check, 425 DAG lists admitted, 30
+    returning wrong pixels (`tex_checkpoint._gate_ok`'s own note). A DAG cooks whole, which is
+    correct, just not incremental.
+
+    Post-condition, and the point of the function: `is_linear_stage_list(collapse_linear(S))`
+    is True for every S this does not refuse. An already-collapsed linear list passes through
+    as an equal copy, so a host may call it unconditionally."""
+    return _linear_collapse(stages)[0]
+
+
 def prefix_fingerprint(stages: list[dict], k: int, infer_binding_type: Callable) -> str:
     """The 'upstream sub-chain fingerprint' a stage-boundary tap keys on: the value-independent
     `_fused_fp` of the prefix `stages[:k]` (the stages producing the boundary). Derived, never

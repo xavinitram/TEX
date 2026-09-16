@@ -5,7 +5,7 @@ chain ONCE, at a cut point the host guesses; CACHE-7 cuts it at every point wher
 CUMULATIVE MEASURED cost since the last cut crosses a threshold, so a mid-graph edit recooks
 at most (threshold + suffix) instead of the whole chain.
 
-Three things live here and nothing else:
+Four things live here and nothing else:
 
   * `plan_checkpoints`  — placement. Reads PROF-1 per-stage costs, returns cut indices.
   * `cook_checkpointed` — the serve path. Splices the suffix from the DEEPEST cached
@@ -13,6 +13,10 @@ Three things live here and nothing else:
   * `materialize`       — phase 2. ONE re-cook with `tap: True` on the planned stages, which
                           harvests every boundary at once (`compile_fused` already exports
                           them as `@_tap_s{i}`), then `put`s them.
+  * `gate_refusal`      — HOOK-3, and the fourth thing: why the two above will decline. The
+                          gate's own answer, structured (code + stage + message), so a host
+                          can report a refusal instead of re-deriving one. `_gate_ok` is the
+                          boolean view of it; the decision is unchanged.
 
 Everything is OFF the default path: placement needs PROF-1 (disarmed by default → no costs →
 no checkpoints → today's cook), and the whole module needs a host-supplied `ResultCache`,
@@ -21,6 +25,7 @@ promise.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 logger = logging.getLogger(__name__)
@@ -456,13 +461,71 @@ def _gate_ok(stages, result_cache, latent_channel_count: int, upstream,
     boundary — measured at maxdiff 0.91 on a swapped source. The contract is documented on
     `boundary_lineage_key` and is the host's to keep; an engine-side content check would mean
     hashing every source tensor on every cook, which is the cost caching exists to avoid.
+
+    The rules EXECUTE in `gate_refusal` below (HOOK-3), which names the clause a refusal fell
+    on and the stage that caused it. This stays the boolean view of that one answer — the same
+    checks in the same order, deriving `True` from "no refusal" — so a host reading the reason
+    and the engine taking the decision can never be looking at two different verdicts.
     """
-    if result_cache is None or latent_channel_count or len(stages) < 2:
-        return False
+    return gate_refusal(stages, result_cache, latent_channel_count=latent_channel_count,
+                        upstream=upstream, precision=precision) is None
+
+
+#: Stable reason codes. A host keys on these strings (to fill its own `reason` slot, say);
+#: the human message beside a code is free to be reworded, a code is not.
+REFUSE_NO_CACHE = "no-result-cache"
+REFUSE_LATENT = "latent-channel-count"
+REFUSE_TOO_FEW_STAGES = "too-few-stages"
+REFUSE_PRECISION = "precision-not-fp32"
+REFUSE_NOT_COLLAPSED = "stage-list-not-collapsed"
+REFUSE_NOT_LINEAR = "stage-list-not-linear"
+REFUSE_UPSTREAM_KEYS = "upstream-keys-incomplete"
+REFUSE_BINDING_SHAPE = "binding-shape-unknown"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GateRefusal:
+    """Why `cook_checkpointed` will cook this chain whole — additional DATA, never a decision.
+
+    `code` is one of the `REFUSE_*` constants above and is the stable part. `stage` is the
+    offending stage index when one stage is to blame (`None` when the refusal is about the
+    call rather than a stage). `message` is for a human reading a log and carries no contract."""
+
+    code: str
+    stage: int | None
+    message: str
+
+
+def gate_refusal(stages, result_cache, *, latent_channel_count: int = 0, upstream=(),
+                 precision: str = "fp32") -> GateRefusal | None:
+    """The CACHE-6 gate's verdict, spelled out: a `GateRefusal`, or None when it admits.
+
+    The rules and the measurements behind each one are documented on `_gate_ok` above — this
+    is where they execute, and the only place they do. It exists because the refusal was
+    otherwise unobservable: a host got `[]` cuts back from a path advertised as a fallback and
+    could not tell a chain that was cooked whole ON PURPOSE from one its own wiring had
+    disqualified, so it had to re-derive this logic to guess.
+
+    Refusing costs nothing but a whole-chain cook, which is always correct, so a `GateRefusal`
+    is never raised and never logged from here — it is returned, and the host decides whether
+    it is worth saying out loud."""
+    if result_cache is None:
+        return GateRefusal(REFUSE_NO_CACHE, None,
+                           "no ResultCache was supplied: there is nowhere to put a boundary")
+    if latent_channel_count:
+        return GateRefusal(REFUSE_LATENT, None,
+                           f"a LATENT ({latent_channel_count} channels) narrows the wrong axis "
+                           "and forces fp32 (M-3)")
+    if len(stages) < 2:
+        return GateRefusal(REFUSE_TOO_FEW_STAGES, None,
+                           f"{len(stages)} stage(s): a checkpoint needs a prefix to cache and a "
+                           "suffix to splice")
     # fp32 ONLY. See the docstring: the fp16 lift was measured on a matrix that only produced
     # fp16-representable boundaries, and the counterexample is 6.58e-01 of wrong pixels.
     if precision != "fp32":
-        return False
+        return GateRefusal(REFUSE_PRECISION, None,
+                           f"precision {precision!r}: a materialized boundary is only bit-exact "
+                           "at fp32, and 'auto' would mislabel a cache entry")
     # LINEAR ONLY — the same gate CACHE-6 has always had, restored after a per-cut
     # `cut_set(...) == 1` check was tried in its place and was WRONG.
     #
@@ -476,9 +539,24 @@ def _gate_ok(stages, result_cache, latent_channel_count: int, upstream,
     # (maxdiff 0.146, ndiff 3072) and 81 raising, against 0 and 0 through CACHE-6. Reachable
     # in production via `region_to_stages` on a FUS-1 fan-out region. `cut_set` stays as the
     # ANALYSIS the design note ships (§9); this is the execution gate it does not replace.
-    from .tex_fusion import is_linear_stage_list
+    from .tex_fusion import is_linear_stage_list, _linear_collapse
     if not is_linear_stage_list(stages):
-        return False
+        # WHICH of the two it is decides whether the host can do anything about it, so the
+        # codes are separate: a chain that IS a path but arrives in the `region_to_stages`
+        # `chain_inputs` spelling is one `collapse_linear` call away from admission, while a
+        # real DAG is the refusal this gate exists for. Both still refuse — the classification
+        # is read off the SAME `_linear_collapse` the collapse uses, never a second rule.
+        collapsed, broken = _linear_collapse(stages)
+        if collapsed is not None:
+            j = next((i for i, st in enumerate(stages) if st.get("chain_inputs")), None)
+            return GateRefusal(REFUSE_NOT_COLLAPSED, j,
+                               f"stage {j} is wired with `chain_inputs`: this chain IS linear, "
+                               "but the gate admits only the collapsed `chain_input` spelling — "
+                               "run it through tex_fusion.collapse_linear() first")
+        return GateRefusal(REFUSE_NOT_LINEAR, broken,
+                           f"stage {broken} does not read exactly the stage before it: a suffix "
+                           "renumbers stages while `chain_inputs` are absolute indices, so a DAG "
+                           "cooks whole rather than mis-wired")
     from .tex_engine import _is_tensor_binding, _binding_shape
     # THE SAME predicate `cook_fused_cached`'s gate uses — imported, not re-spelled. This
     # comment used to claim `isinstance(v, torch.Tensor)` matched that gate "exactly", and
@@ -489,14 +567,23 @@ def _gate_ok(stages, result_cache, latent_channel_count: int, upstream,
     # would count a host object that merely exposes a shape). Scope DOES differ, deliberately:
     # the single-tap gate counts `stages[:k]` because it has one cut, while multi-tap has cuts
     # at many k and every stage's tensors can feed some prefix.
-    binds = [v for st in stages for v in (st.get("bindings") or {}).values()
-             if _is_tensor_binding(v)]
+    # Carries the stage index alongside each binding so a refusal can name it; the count and
+    # the order the shapes are probed in are the ones the boolean gate always had.
+    binds = [(i, v) for i, st in enumerate(stages)
+             for v in (st.get("bindings") or {}).values() if _is_tensor_binding(v)]
     if len(upstream) < len(binds):
-        return False
+        return GateRefusal(REFUSE_UPSTREAM_KEYS, None,
+                           f"{len(upstream)} upstream key(s) for {len(binds)} tensor binding(s): "
+                           "a partial cover can serve a boundary cooked from a different image")
     # ...and a binding whose shape is unknowable (an unlanded, shapeless Promise) cannot be
     # keyed at all. `serve()` must FALL BACK, never raise, so refuse here rather than let
     # `boundary_lineage_key`'s ValueError escape a path contracted to degrade quietly.
-    return all(_binding_shape(v) is not None for v in binds)
+    for i, value in binds:
+        if _binding_shape(value) is None:
+            return GateRefusal(REFUSE_BINDING_SHAPE, i,
+                               f"stage {i} carries a tensor binding with no knowable shape "
+                               "(an unlanded Promise), which cannot be keyed")
+    return None
 
 
 def _plan_from_profile(stages, *, threshold_ms: float, profile_key, spatial,

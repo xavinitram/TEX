@@ -311,6 +311,30 @@ shapes that reach a stage list at all are internal fan-out that rejoins — and 
 interactive case, on both in-repo hosts, is a linear chain. Shipping a multi-tensor rebind
 with no consumer to exercise it is how a mechanism rots. The gate that reopens it is in §11.
 
+### 9.1 The host surface: the collapse, and why the refusal is data (HOOK-3)
+
+The posture above has a seam a host falls into, and it was found by one. `region_to_stages`
+emits `chain_inputs` on **every** chained stage, including a region that is a plain path — so
+`is_linear_stage_list` is False for every region the engine's own assembler produces, the gate
+refuses all of them, and the feature *ships looking armed*. Both halves are now upstream:
+
+- **`tex_fusion.collapse_linear(stages)`** — the `region_to_stages` output rewritten to the
+  legacy `chain_input` spelling, or `None`. A host stopped re-deriving the engine's wiring
+  rules; the engine stopped depending on it getting them right. `None` is not a hint to force
+  the rewrite: `_linear_collapse` (the one spelling, read off `stage_edges`) refuses a fan-in,
+  a fan-out, a skipped edge and a mid-chain stage that reads nothing, because the weaker rule
+  — "one in-edge is enough" — is the one that admitted 425 DAG lists with 30 wrong-pixel cases,
+  and `tests/test_hook3_checkpoint_collapse.py` rebuilds it and measures what it admits
+  (maxdiff 2.2e-02 over 3072 elements on a three-stage skip-edge list).
+- **`tex_checkpoint.gate_refusal(...)`** — the gate's verdict as data: a stable `REFUSE_*`
+  code, the offending stage index, a human message. `_gate_ok` is derived from it (`is None`),
+  so there is exactly one verdict and the boolean decision is unchanged. A refusal was
+  previously unobservable — a host got `[]` cuts from a path documented as a fallback and
+  could not tell "cooked whole on purpose" from "your wiring was disqualified".
+
+Neither is on any ComfyUI path: `collapse_linear` has no in-tree caller, and `gate_refusal`
+is reached from `_gate_ok`, inside a module the node never imports (§10).
+
 ---
 
 ## 10. Not on the default path

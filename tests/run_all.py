@@ -1287,6 +1287,18 @@ def main():
     test_v035_port6_engine_import_is_adapter_free(r)
     test_v035_port6_routes_still_register_under_comfyui(r)
 
+    # HOOK-3: the linear collapse a host needs, and the gate's refusal as data.
+    from test_hook3_checkpoint_collapse import (
+        test_hook3_collapse_linear_on_a_real_region,
+        test_hook3_collapse_refuses_non_linear,
+        test_hook3_gate_refusal_is_structured,
+        test_hook3_gate_decision_is_unchanged,
+    )
+    test_hook3_collapse_linear_on_a_real_region(r)
+    test_hook3_collapse_refuses_non_linear(r)
+    test_hook3_gate_refusal_is_structured(r)
+    test_hook3_gate_decision_is_unchanged(r)
+
     success = r.summary()
     return 0 if success else 1
 
