@@ -12,6 +12,40 @@ The protocol handling is split from I/O: `LSPServer.handle(method, params)` is a
 dispatch returning (result, notifications), so it is unit-testable without a live stdio
 pipe (the stdio loop in `main()` is a thin frame reader/writer around it). Host-agnostic:
 no comfy, no aiohttp.
+
+HOOK-2 — a per-document binding map on `didOpen`/`didChange`. `diagnostics_for` used to
+check every document against a hardcoded `{}`, so every `@input` resolved to VEC4 and a
+real three-channel input's `.a` type-checked clean here and failed only at cook (see
+`tex_api.check`'s own docstring). `didOpen`/`didChange` params may now carry an optional
+`bindingTypes` field, a sibling of `textDocument` (not `initializationOptions` — one stdio
+server serves many documents, and bindings differ per document): a JSON object
+`{name: type-string}`, the wire form of the `{name: TEXType}` map `check()`'s
+`binding_types` parameter already takes.
+
+Type-string vocabulary: exactly `tex_compiler.types.TYPE_NAME_MAP`'s own keys — `float`,
+`int`, `vec2`, `vec3`, `vec4`, `mat3`, `mat4`, `string` — matched case-sensitively with no
+coercion, so the wire never grows a second type vocabulary beside the one the parser and
+type-checker already use for a declared type name. (`array` is absent on both sides: ARRAY
+needs element/size metadata `TYPE_NAME_MAP` doesn't carry.) Once parsed, the map handed to
+`check()` is the identical `{name: TEXType}` shape a host that lint-checks in process would
+build for the same call — a caller doing `tex_api.check(source, binding_types)` directly
+and this wire path now type-check against one shape rather than two.
+
+Defaults are kept byte-for-byte: a client that never sends `bindingTypes` gets today's
+behaviour exactly — `check()` against `{}`. Per open document (by uri): `didOpen` sets the
+map fresh, `{}` when the field is absent or not a JSON object; `didChange` REPLACES the
+stored map only when `bindingTypes` is present and IS a JSON object (even `{}`) — absent,
+`null`, or any other shape leaves the previously-stored map in place, and a bindings-only
+change (no accompanying text edit) still republishes diagnostics against the stored text
+rather than going stale against the old map. `didClose` discards the map with the document.
+
+An entry whose value is not one of `TYPE_NAME_MAP`'s own strings — a typo, or `array` — is
+DROPPED rather than raising; the rest of an otherwise-usable map still applies. Ignored,
+not diagnosed: `handle()`'s contract is that a bad request never tears the session down,
+dropping an unrecognised entry costs nothing a client can observe going wrong (that one
+binding just stays unresolved, exactly like an absent key), and a synthetic diagnostic for
+a wire-shape mistake would need an invented code and a source range with nothing to anchor
+it to. See `_parse_binding_types` for the exact parse.
 """
 from __future__ import annotations
 
@@ -32,12 +66,17 @@ def _registry():
     return R
 
 
-def diagnostics_for(source: str) -> list[dict]:
+def diagnostics_for(source: str, binding_types: dict | None = None) -> list[dict]:
     """Run LANG-2 check() and convert each TEXDiagnostic to an LSP Diagnostic. check() never
-    raises, so this never raises. LSP positions are 0-based; TEXDiagnostic is 1-based."""
+    raises, so this never raises. LSP positions are 0-based; TEXDiagnostic is 1-based.
+
+    `binding_types` is the per-document `{name: TEXType}` map (HOOK-2; see the module
+    docstring), already parsed off the wire by `_parse_binding_types`. `None` — no map has
+    ever been sent for this document — checks against `{}`, byte-for-byte the pre-HOOK-2
+    behaviour: every `@input` resolves to VEC4."""
     from .tex_api import check
     out = []
-    for d in check(source, {}):
+    for d in check(source, binding_types if binding_types is not None else {}):
         dd = d.to_dict()
         line = max(0, (dd.get("line") or 1) - 1)
         col = max(0, (dd.get("col") or 1) - 1)
@@ -98,11 +137,45 @@ def hover_for(source: str, line: int, character: int) -> dict | None:
     return {"contents": {"kind": "markdown", "value": md}}
 
 
+def _parse_binding_types(raw: object) -> dict | None:
+    """Parse a wire `bindingTypes` value (HOOK-2) into `{name: TEXType}` — the exact shape
+    `tex_api.check`'s `binding_types` parameter takes. Reuses `tex_compiler.types.
+    TYPE_NAME_MAP`, the same table the parser/type-checker use for a declared type name, so
+    the wire path and any in-process caller (a host that lint-checks in process by calling
+    `tex_api.check` directly) type-check against one vocabulary rather than two.
+
+    Total: never raises. `raw` that is not a dict (missing, `None`/`null`, or any other JSON
+    shape) returns `None` — the caller's cue that no usable map was sent, so it should leave
+    whatever map is already on file for the document untouched rather than guess (see
+    `didChange` below). `raw` that IS a dict returns a (possibly empty) dict: an entry is
+    kept only when its name is a string and its type string is one of `TYPE_NAME_MAP`'s own
+    keys, matched case-sensitively with no coercion. Any other entry — a non-string value, or
+    a name that resolves to no known `TEXType` (`array` included: ARRAY needs element/size
+    metadata this map doesn't carry) — is dropped: that one binding is treated as not yet
+    known, exactly like an absent key, rather than raising or poisoning every other,
+    well-formed entry in the same map."""
+    if not isinstance(raw, dict):
+        return None
+    from .tex_compiler.types import TYPE_NAME_MAP
+    out = {}
+    for name, type_name in raw.items():
+        if isinstance(name, str) and isinstance(type_name, str):
+            t = TYPE_NAME_MAP.get(type_name)
+            if t is not None:
+                out[name] = t
+    return out
+
+
 class LSPServer:
     """Holds open-document text and dispatches LSP methods. `handle` is pure (no I/O)."""
 
     def __init__(self):
         self.docs: dict[str, str] = {}
+        # HOOK-2: the last-known {name: TEXType} map per open document (by uri), fed to
+        # check() instead of {} so diagnostics reflect what the host actually wired. Absent
+        # for a document that has never carried one, in which case `.get(uri, {})` below is
+        # `{}` — today's behaviour.
+        self.binding_types: dict[str, dict] = {}
         self.shutdown_requested = False
 
     def handle(self, method: str, params: dict) -> tuple:
@@ -120,10 +193,21 @@ class LSPServer:
             doc = params.get("textDocument", {})
             uri, text = doc.get("uri"), doc.get("text", "")
             self.docs[uri] = text
-            return None, [self._publish(uri, text)]
+            # HOOK-2: a fresh document always gets a fresh map — {} (today's behaviour) when
+            # none was sent or it didn't parse as an object.
+            parsed = _parse_binding_types(params.get("bindingTypes"))
+            self.binding_types[uri] = parsed if parsed is not None else {}
+            return None, [self._publish(uri, text, self.binding_types[uri])]
         if method == "textDocument/didChange":
             uri = params.get("textDocument", {}).get("uri")
             changes = params.get("contentChanges", [])
+            # HOOK-2: an explicit, well-formed map REPLACES the stored one; anything else
+            # (absent, null, or not an object) leaves it — the per-document map persists
+            # across edits exactly like the document text does.
+            new_bt = _parse_binding_types(params.get("bindingTypes"))
+            bt_changed = new_bt is not None and new_bt != self.binding_types.get(uri, {})
+            if new_bt is not None:
+                self.binding_types[uri] = new_bt
             if changes:
                 last = changes[-1]
                 # We advertise full-document sync (textDocumentSync=1), so a conformant client
@@ -133,14 +217,20 @@ class LSPServer:
                 if "range" in last:
                     return None, []
                 text = last.get("text", "")
-                if self.docs.get(uri) == text:   # unchanged — skip a redundant full re-analysis
-                    return None, []
+                if self.docs.get(uri) == text and not bt_changed:
+                    return None, []   # neither the text nor the bindings actually changed
                 self.docs[uri] = text
-                return None, [self._publish(uri, text)]
+                return None, [self._publish(uri, text, self.binding_types.get(uri, {}))]
+            if bt_changed:
+                # A bindings-only update (no contentChanges at all) still invalidates any
+                # diagnostics computed under the old map, so republish against the stored text
+                # rather than let it go silently stale until the next text edit.
+                return None, [self._publish(uri, self.docs.get(uri, ""), self.binding_types[uri])]
             return None, []
         if method == "textDocument/didClose":
             uri = params.get("textDocument", {}).get("uri")
             self.docs.pop(uri, None)
+            self.binding_types.pop(uri, None)
             return None, [{"method": "textDocument/publishDiagnostics",
                            "params": {"uri": uri, "diagnostics": []}}]
         if method == "textDocument/completion":
@@ -165,9 +255,9 @@ class LSPServer:
             "serverInfo": {"name": "tex-lsp", "version": LSP_VERSION},
         }
 
-    def _publish(self, uri: str, text: str) -> dict:
+    def _publish(self, uri: str, text: str, binding_types: dict | None = None) -> dict:
         return {"method": "textDocument/publishDiagnostics",
-                "params": {"uri": uri, "diagnostics": diagnostics_for(text)}}
+                "params": {"uri": uri, "diagnostics": diagnostics_for(text, binding_types)}}
 
 
 # ── stdio JSON-RPC framing ────────────────────────────────────────────────────────

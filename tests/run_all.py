@@ -1343,6 +1343,18 @@ def main():
     test_hook3_gate_refusal_is_structured(r)
     test_hook3_gate_decision_is_unchanged(r)
 
+    # HOOK-2: a per-document binding map on tex_lsp's diagnostics path (didOpen/didChange).
+    from test_hook2_lsp_bindings import (
+        test_hook2_binding_map_surfaces_the_vec4_assumption,
+        test_hook2_no_map_is_byte_for_byte_the_base_sha,
+        test_hook2_didchange_without_a_map_keeps_the_previous_map,
+        test_hook2_malformed_map_never_crashes,
+    )
+    test_hook2_binding_map_surfaces_the_vec4_assumption(r)
+    test_hook2_no_map_is_byte_for_byte_the_base_sha(r)
+    test_hook2_didchange_without_a_map_keeps_the_previous_map(r)
+    test_hook2_malformed_map_never_crashes(r)
+
     success = r.summary()
     return 0 if success else 1
 
