@@ -847,18 +847,22 @@ def main():
     # v0.31 NOISE-TIER — the cold frame must render what every later frame renders.
     # (The _TieredCache cold path served an EAGER result and a traced one thereafter;
     #  on CUDA those are not bit-identical, so cook #1 differed from cooks #2+.)
+    # Exact on each tier; the jit.trace -> Inductor promotion is held to a recorded
+    # per-builtin envelope, with its mutation.
     from test_v031_noise_tiers import (
         test_v031_noise_cold_frame_parity,
         test_v031_noise_resolution_dance,
         test_v031_noise_cold_equals_warm,
         test_v031_noise_stride_signature,
         test_v031_noise_cold_path_shape,
+        test_v031_noise_promotion_envelope,
     )
     test_v031_noise_cold_frame_parity(r)
     test_v031_noise_resolution_dance(r)
     test_v031_noise_cold_equals_warm(r)
     test_v031_noise_stride_signature(r)
     test_v031_noise_cold_path_shape(r)
+    test_v031_noise_promotion_envelope(r)
 
     # v0.31 NOISE-SCALAR — a constant coordinate must render the same on every device.
     # (`fbm(u*8.0, v*8.0, 0.5, 4)` cooked on CPU and raised on CUDA: the GPU-only octave
