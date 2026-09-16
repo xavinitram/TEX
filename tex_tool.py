@@ -9,9 +9,11 @@ by-name tool nesting in v1). Design + threat model: docs/tools.md.
 Two shapes, both `.textool`:
   * single-stage — one TEX program with promoted params (the four stock exemplars, and any
     multi-input node like Merge). Cooks as a plain program.
-  * fused — a linear/DAG chain with exactly ONE external image source (the fusion-region
-    model). Stores the GraphSpec `region_to_collapse_plan` emits and `engine.cook`
-    consumes, so the tool layer is a thin pass-through over the FUS-3-proven fused path.
+  * fused — a linear/DAG chain with ONE external image source (the fusion-region model),
+    plus — opt-in — further external inputs, each naming the stage bindings it is written
+    into (`inputs[*].feeds`) and required to share the source's [B,H,W] at cook. Stores the
+    GraphSpec `region_to_collapse_plan` emits and `engine.cook` consumes, so the tool layer
+    is a thin pass-through over the FUS-3-proven fused path.
 
 This module is host-agnostic (no comfy imports); heavy siblings (tex_engine, torch,
 tex_fusion, tex_marshalling) are imported lazily so `import tex_tool` stays cheap.
@@ -32,6 +34,17 @@ from typing import Any
 # The manifest FORMAT version (distinct from tex_fusion.GRAPHSPEC_SCHEMA, which versions
 # the embedded fused payload). Bump only when an older reader would MISREAD a manifest.
 TEXTOOL_SCHEMA = 1
+
+# Stable reason codes carried as `TEXToolError.code` by the fused-input refusals (None on every
+# other TEXToolError). A host keys on these strings — to word a refusal in its own language, say;
+# the message beside a code may be reworded, a code may not (tex_checkpoint's REFUSE_* contract).
+REFUSE_FUSED_INPUT_COUNT = "fused-input-count"            # >1 input, and none declares `feeds`
+REFUSE_FUSED_INPUT_UNROUTED = "fused-input-unrouted"      # a non-source input declares no `feeds`
+REFUSE_FUSED_FEED_INVALID = "fused-feed-invalid"          # a malformed or unsupported `feeds`
+REFUSE_FUSED_FEED_COLLISION = "fused-feed-collision"      # a feed lands on a name its stage binds
+REFUSE_FUSED_STAGE_UNANCHORED = "fused-stage-unanchored"  # a DAG stage reads no chain/source/feed
+REFUSE_FUSED_INPUT_MISSING = "fused-input-missing"        # cook: a declared input was not passed
+REFUSE_FUSED_INPUT_EXTENT = "fused-input-extent"          # cook: an input's [B,H,W] != the source's
 
 # TOOL-5 resource limits — they bound PARSE/COMPILE cost, never COOK cost (a valid tool can
 # still request an 8K gauss_blur; that residual is the host's memory-budget duty, docs/tools.md §6-D).
@@ -54,7 +67,15 @@ _TOOL_STORE = "tools"                # <user_dir>/tex_wrangle/tools/
 class TEXToolError(ValueError):
     """A `.textool` is malformed, unsupported, or fails to install/preflight.
 
-    A ValueError subclass so the CLI's existing except-tuple catches it (tex_cli.main)."""
+    A ValueError subclass so the CLI's existing except-tuple catches it (tex_cli.main).
+    `code` is one of the REFUSE_FUSED_* constants on a fused-input refusal and None on every
+    other one; `input` names the offending input when one input is to blame. Both are DATA
+    beside the message: `str(e)` and `e.args` are exactly what they were before either existed."""
+
+    def __init__(self, *args, code: str | None = None, input: str | None = None):
+        super().__init__(*args)
+        self.code = code
+        self.input = input
 
 
 # ── the manifest ──────────────────────────────────────────────────────────────
@@ -239,7 +260,35 @@ def _validate_inputs(raw_list) -> list:
             if not isinstance(opt, bool):
                 raise TEXToolError(f"inputs[{i}].optional must be a bool")
             entry["optional"] = opt
+        # "feeds" routes an extra input of a FUSED tool into named stage bindings. Copied only
+        # when present, like "optional", so a manifest that never declares it rebuilds each entry
+        # exactly as before. Shape only here; which stages exist and what each already binds is
+        # validate_manifest's cross-field check.
+        if "feeds" in inp:
+            entry["feeds"] = _validate_feeds_shape(i, nm, inp["feeds"])
         out.append(entry)
+    return out
+
+
+def _validate_feeds_shape(i: int, name: str, raw) -> list:
+    """`inputs[i].feeds`: 1..MAX_STAGES `[stage, binding]` pairs — `stage` an int (a
+    graphspec.stages index) or "terminal" (PromotedParam.stage's vocabulary), `binding` an
+    identifier. Returned as a list of lists, the JSON shape."""
+    def bad(msg):
+        return TEXToolError(msg, code=REFUSE_FUSED_FEED_INVALID, input=name)
+    if not isinstance(raw, (list, tuple)) or not (1 <= len(raw) <= MAX_STAGES):
+        raise bad(f"inputs[{i}].feeds must be a list of 1 to {MAX_STAGES} [stage, binding] pairs")
+    out = []
+    for k, pair in enumerate(raw):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise bad(f"inputs[{i}].feeds[{k}] must be a [stage, binding] pair")
+        stage, binding = pair
+        # bool is an int subclass -- reject JSON true/false so it can't index a stage.
+        if not (stage == "terminal" or (isinstance(stage, int) and not isinstance(stage, bool))):
+            raise bad(f"inputs[{i}].feeds[{k}] stage must be an int or 'terminal'")
+        if not isinstance(binding, str) or not _IDENT_RE.match(binding):
+            raise bad(f"inputs[{i}].feeds[{k}] binding must be a valid identifier")
+        out.append([stage, binding])
     return out
 
 
@@ -257,6 +306,132 @@ def _validate_outputs(raw_list) -> list:
             raise TEXToolError(f"outputs[{i}] must be an object with a string 'name'")
         out.append({"name": o["name"], "type": str(o.get("type", "IMAGE"))})
     return out
+
+
+def _source_injection_points(gs: dict, n_stages: int):
+    """Where `tex_fusion._stages_from_spec` writes the source on a DAG spec, as a set of
+    `(stage | "terminal", binding)` — read the way it reads them: schema-2 `source_injections`
+    over the schema-1 `source_stage`/`source_binding` scalars, a falsy binding injecting nothing,
+    index `n_stages` meaning the terminal. A linear spec injects into stage 0's `image_input`,
+    which is already that stage's own binding, so it contributes nothing here. None when the
+    injection list cannot be read: the cook raises on it anyway, so the checks that need it
+    stand down rather than guess."""
+    if not gs.get("dag"):
+        return set()
+    raw_inj = gs.get("source_injections")
+    try:
+        points = ([(int(s), b) for (s, b) in raw_inj] if raw_inj
+                  else [(gs.get("source_stage", 0), gs.get("source_binding"))])
+    except (TypeError, ValueError):
+        return None
+    out = set()
+    for s, b in points:
+        if not b:
+            continue
+        if not isinstance(b, str):
+            return None
+        out.update((j, b) for j in range(n_stages) if j == s)
+        if s == n_stages:
+            out.add(("terminal", b))
+    return out
+
+
+def _stage_bound_names(raw: dict, promoted: list, injections) -> dict:
+    """`{stage | "terminal": {binding: what already binds it}}` for a fused manifest — every name
+    a feed may not take, because the engine (or the promoted-param writer) already writes that
+    binding and one of the two writes would silently win."""
+    gs = raw["graphspec"]
+    stages = gs["stages"]
+    dag = bool(gs.get("dag"))
+    bound: dict = {j: {} for j in range(len(stages))}
+    bound["terminal"] = {raw["terminal_image_input"]: "the source socket (terminal_image_input)"}
+    for j, st in enumerate(stages):
+        if dag:
+            if isinstance(st.get("chain_inputs"), dict):
+                for b in st["chain_inputs"]:
+                    bound[j].setdefault(b, "its chain input")
+        else:
+            bound[j].setdefault(st["image_input"], "its chain input" if j else "the source")
+        if isinstance(st.get("params"), dict):
+            for b in st["params"]:
+                bound[j].setdefault(b, "a baked param")
+    if dag and isinstance(gs.get("terminal_chain_inputs"), dict):
+        for b in gs["terminal_chain_inputs"]:
+            bound["terminal"].setdefault(b, "its chain input")
+    for key, b in injections or ():
+        bound[key].setdefault(b, "a source injection point")
+    if isinstance(raw.get("terminal_params"), dict):
+        for b in raw["terminal_params"]:
+            bound["terminal"].setdefault(b, "a baked param")
+    for pp in promoted:                      # stage range was validated before this runs
+        key = "terminal" if pp.stage in (None, "terminal") else pp.stage
+        bound[key].setdefault(pp.internal, f"promoted param '{pp.name}'")
+    return bound
+
+
+def _validate_fused_feeds(raw: dict, inputs: list, promoted: list) -> None:
+    """The cross-field half of `inputs[*].feeds` — a fused tool with more than one external input.
+
+    The source (`terminal_image_input`) still travels the one way the engine splices it; every
+    OTHER input names the stage bindings it is written into, the same place a promoted value
+    goes, so the fused program cooks through the unchanged GraphSpec path. What can only be
+    known at cook — that the inputs share one [B,H,W] — is cook_tool's refusal. Shape-only,
+    before any TEX is parsed (TOOL-5)."""
+    gs = raw["graphspec"]
+    stages = gs["stages"]
+    n = len(stages)
+    tii = raw["terminal_image_input"]
+    if tii not in {i["name"] for i in inputs}:
+        raise TEXToolError(f"terminal_image_input '{tii}' is not a declared input")
+    injections = _source_injection_points(gs, n)
+    bound = _stage_bound_names(raw, promoted, injections)
+    targets: dict = {}                       # (stage | "terminal", binding) -> feeding input
+    for inp in inputs:
+        nm = inp["name"]
+        if nm == tii:
+            if "feeds" in inp:
+                raise TEXToolError(f"input '{nm}' is the fused tool's source (terminal_image_input) "
+                                   f"and may not declare 'feeds'",
+                                   code=REFUSE_FUSED_FEED_INVALID, input=nm)
+            if inp.get("optional"):
+                raise TEXToolError(f"a fused tool's source input '{nm}' may not be marked "
+                                   f"'optional' (the engine requires it to splice the chain)")
+            continue
+        if "feeds" not in inp:
+            raise TEXToolError(f"input '{nm}' is not routed into the fused chain: every input of a "
+                               f"fused tool other than its source must declare 'feeds'",
+                               code=REFUSE_FUSED_INPUT_UNROUTED, input=nm)
+        if inp["type"].upper() not in ("IMAGE", "MASK"):
+            raise TEXToolError(f"input '{nm}' is {inp['type']}; a fed input must be IMAGE or MASK",
+                               code=REFUSE_FUSED_FEED_INVALID, input=nm)
+        if inp.get("optional"):
+            raise TEXToolError(f"fed input '{nm}' may not be marked 'optional' (a tool with fed "
+                               f"inputs cooks only when every one is passed)",
+                               code=REFUSE_FUSED_FEED_INVALID, input=nm)
+        for stage, binding in inp["feeds"]:
+            if stage != "terminal" and not (0 <= stage < n):
+                raise TEXToolError(f"input '{nm}' feeds stage {stage}, out of range for {n} "
+                                   f"upstream stage(s)", code=REFUSE_FUSED_FEED_INVALID, input=nm)
+            where = "the terminal" if stage == "terminal" else f"stage {stage}"
+            if (stage, binding) in targets:
+                raise TEXToolError(f"input '{nm}' feeds @{binding} on {where}, which input "
+                                   f"'{targets[(stage, binding)]}' already feeds",
+                                   code=REFUSE_FUSED_FEED_COLLISION, input=nm)
+            if binding in bound[stage]:
+                raise TEXToolError(f"input '{nm}' feeds @{binding} on {where}, which is already "
+                                   f"{bound[stage][binding]}",
+                                   code=REFUSE_FUSED_FEED_COLLISION, input=nm)
+            targets[(stage, binding)] = nm
+    # tex_fusion's region detector never folds a node with no image input into a region: such a
+    # stage would adopt the fused program's extent instead of cooking at its own. A DAG spec can
+    # still spell one, so on this branch it is refused here; the terminal always reads a chain.
+    if gs.get("dag") and injections is not None:
+        read = {s for s, _ in injections} | {s for s, _ in targets}
+        for j, st in enumerate(stages):
+            if not st.get("chain_inputs") and j not in read:
+                raise TEXToolError(f"graphspec.stages[{j}] reads no chain, no source and no fed "
+                                   f"input, so it would adopt the fused program's extent instead "
+                                   f"of cooking at its own", code=REFUSE_FUSED_STAGE_UNANCHORED)
 
 
 def validate_manifest(raw: dict) -> dict:
@@ -343,6 +518,7 @@ def validate_manifest(raw: dict) -> dict:
     # raw IndexError/KeyError/ValueError (or, worse, silently write a promoted value into the
     # WRONG stage via a negative index). Everything below is shape-only, still before compile.
     input_names = {i["name"] for i in inputs}
+    fed = [i for i in inputs if "feeds" in i]
     if has_fused:
         n_stages = len(raw["graphspec"]["stages"])
         for pp in promoted:
@@ -352,21 +528,30 @@ def validate_manifest(raw: dict) -> dict:
         tp = raw.get("terminal_params")
         if tp is not None and not isinstance(tp, dict):
             raise TEXToolError("'terminal_params' must be an object (or absent)")
-        # The engine pops the source from terminal_bindings[terminal_image_input]; a fused tool
-        # therefore has exactly ONE external image source, and its socket must be a declared input.
-        if len(inputs) != 1:
-            raise TEXToolError("a fused tool must declare exactly one external input "
-                               "(the single fusion source)")
-        if inputs[0].get("optional"):
-            raise TEXToolError("a fused tool's sole external input may not be marked "
-                               "'optional' (the engine requires it to splice the chain)")
-        if raw["terminal_image_input"] not in input_names:
-            raise TEXToolError(f"terminal_image_input '{raw['terminal_image_input']}' is not a "
-                               f"declared input")
+        if not fed:
+            # The engine pops the source from terminal_bindings[terminal_image_input]; a fused tool
+            # that routes no other input therefore has exactly ONE external image source, and its
+            # socket must be a declared input.
+            if len(inputs) != 1:
+                raise TEXToolError("a fused tool must declare exactly one external input "
+                                   "(the single fusion source)", code=REFUSE_FUSED_INPUT_COUNT)
+            if inputs[0].get("optional"):
+                raise TEXToolError("a fused tool's sole external input may not be marked "
+                                   "'optional' (the engine requires it to splice the chain)")
+            if raw["terminal_image_input"] not in input_names:
+                raise TEXToolError(f"terminal_image_input '{raw['terminal_image_input']}' is not a "
+                                   f"declared input")
+        else:
+            _validate_fused_feeds(raw, inputs, promoted)
         gs_tii = raw["graphspec"].get("terminal_image_input")
         if gs_tii is not None and gs_tii != raw["terminal_image_input"]:
             raise TEXToolError("graphspec.terminal_image_input disagrees with the manifest's")
     else:
+        if fed:
+            nm = fed[0]["name"]
+            raise TEXToolError(f"input '{nm}' declares 'feeds', which only a fused tool reads "
+                               f"(a single-stage tool binds every input by its name)",
+                               code=REFUSE_FUSED_FEED_INVALID, input=nm)
         # single-stage: all promoted params share the program's flat binding namespace, so an
         # internal that duplicates another (last-write-wins) or collides with an input tensor
         # (the scalar would clobber the image) is a manifest error.
@@ -581,7 +766,8 @@ def _preflight_fused(manifest: ToolManifest) -> dict:
     # Placeholder shaped by the tool's declared source type (a MASK/LATENT-fed fused tool must
     # not preflight against VEC3).
     try:
-        stages = _assemble_fused_stages(manifest, _fused_source_placeholder(manifest), _repr_params(manifest))
+        stages = _assemble_fused_stages(manifest, _fused_source_placeholder(manifest), _repr_params(manifest),
+                                        _fed_placeholders(manifest))
     except Exception as e:
         return {"ok": False, "diagnostics": [{"code": "E9001", "severity": "error",
                 "message": f"fused tool graphspec is malformed: {e}"}], "stats": None}
@@ -609,14 +795,19 @@ def _resolve_params(manifest: ToolManifest, params: dict | None) -> dict:
     return out
 
 
-def _fused_cook_inputs(manifest: ToolManifest, source, params: dict | None):
+def _fused_cook_inputs(manifest: ToolManifest, source, params: dict | None,
+                       extras: dict | None = None):
     """The one place that applies promoted values to a fused tool: copy the GraphSpec, write
     each promoted value (or its default) into its target stage, and build the terminal bindings
     (baked terminal params + the source under terminal_image_input). Shared by preflight, cook,
     and warm-key derivation so all three see byte-identical inputs. Structure-shares the graphspec
     (shallow top-level + per-stage dict, params copied only for a written stage) instead of a full
     deepcopy -- this runs every frame of a fused-tool slider drag, and only stages[i]['params'] is
-    ever mutated."""
+    ever mutated.
+
+    `extras` ({input name: value}) carries the inputs a tool routes with `inputs[*].feeds`; each
+    value is written into every binding its input feeds, exactly where a promoted value would go.
+    None (every tool that declares no `feeds`) skips that loop entirely."""
     src = manifest.graphspec
     gs = dict(src)
     gs["stages"] = [dict(s) for s in src.get("stages", [])]
@@ -638,27 +829,100 @@ def _fused_cook_inputs(manifest: ToolManifest, source, params: dict | None):
                 st["params"] = dict(st.get("params") or {})
                 written.add(pp.stage)
             st["params"][pp.internal] = val      # then O(1) writes, not an O(K) rebuild per param
+    if extras:
+        for inp in manifest.inputs:
+            if "feeds" not in inp:
+                continue
+            val = extras[inp["name"]]
+            for stage, binding in inp["feeds"]:
+                if stage == "terminal":
+                    term_params[binding] = val
+                else:
+                    st = gs["stages"][stage]
+                    if stage not in written:
+                        st["params"] = dict(st.get("params") or {})
+                        written.add(stage)
+                    st["params"][binding] = val
     return gs, {**term_params, manifest.terminal_image_input: source}
 
 
-def _assemble_fused_stages(manifest: ToolManifest, source, params: dict) -> list:
+def _assemble_fused_stages(manifest: ToolManifest, source, params: dict,
+                           extras: dict | None = None) -> list:
     """The compile_fused stages list for a fused tool, run through the SAME _stages_from_spec
     the engine uses, so preflight and cook see byte-identical stages."""
     from .tex_fusion import _stages_from_spec
-    gs, term_bindings = _fused_cook_inputs(manifest, source, params)
+    gs, term_bindings = _fused_cook_inputs(manifest, source, params, extras)
     return _stages_from_spec(gs, manifest.terminal_code, term_bindings)
+
+
+def _fed_inputs(manifest: ToolManifest) -> list:
+    """The inputs a fused tool routes with `feeds`, in declaration order ([] for every other tool)."""
+    return [inp for inp in manifest.inputs if "feeds" in inp]
+
+
+def _fed_cook_values(manifest: ToolManifest, inputs: dict, fed: list):
+    """cook_tool's gate for a tool with fed inputs: (source, {fed name: value}), or a coded refusal.
+
+    Every declared input must be passed, and every one must share the source's [B,H,W] EXACTLY.
+    Fused, a fed input joins the one grid the whole program cooks on (the per-axis max over the
+    bindings it reads), while the same stages cooked one by one each grid on their own inputs —
+    so a batch or singleton axis that would broadcast unfused changes an UPSTREAM stage's pixels
+    fused, silently, with the same output shape and no error (measured on random inputs: a B=4
+    input beside a B=1 source moved a `fi`-reading stage by maxdiff 2.99; a one-row source beside
+    a full frame moved a `v`-reading stage by 1.00). A tool without fed inputs cannot meet this:
+    every stage anchors on the one source.
+
+    A promised input is resolved first (E7007 if unlanded, as `tex_engine.prepare` does), because
+    the extent is read off the landed tensor and a fed value travels inside the chain payload,
+    where the engine's own resolution never looks."""
+    import torch
+    from .tex_marshalling import resolve_promise_bindings
+    tii = manifest.terminal_image_input
+    for inp in fed:
+        if inp["name"] not in inputs:
+            raise TEXToolError(f"fused tool '{manifest.name}' needs its fed input '{inp['name']}'",
+                               code=REFUSE_FUSED_INPUT_MISSING, input=inp["name"])
+    vals = resolve_promise_bindings(
+        {tii: inputs[tii], **{inp["name"]: inputs[inp["name"]] for inp in fed}})
+
+    def extent(v):
+        return tuple(v.shape[:3]) if isinstance(v, torch.Tensor) and v.dim() >= 3 else None
+
+    want = extent(vals[tii])
+    if want is None:
+        raise TEXToolError(f"fused tool '{manifest.name}' cannot read the extent of its source "
+                           f"'{tii}': a tool with fed inputs cooks [B,H,W] or [B,H,W,C] tensors",
+                           code=REFUSE_FUSED_INPUT_EXTENT, input=tii)
+    for inp in fed:
+        got = extent(vals[inp["name"]])
+        if got != want:
+            have = "no readable [B,H,W]" if got is None else f"[B,H,W] = {list(got)}"
+            raise TEXToolError(f"fused tool '{manifest.name}': input '{inp['name']}' has {have} but "
+                               f"its source '{tii}' has [B,H,W] = {list(want)}; every input of a "
+                               f"tool with fed inputs must match the source exactly (no batch or "
+                               f"singleton axis is broadcast)",
+                               code=REFUSE_FUSED_INPUT_EXTENT, input=inp["name"])
+    return vals[tii], {inp["name"]: vals[inp["name"]] for inp in fed}
 
 
 def cook_tool(manifest: ToolManifest, inputs: dict, params: dict | None = None, **cook_kwargs):
     """Cook a tool. `inputs`={binding: tensor} (external image/mask), `params`={promoted:
     value} (omitted -> default). Returns a tex_engine.CookResult. Fused tools take the real
-    engine path (tiers, OOM, precision-auto), identical to a collapsed region."""
+    engine path (tiers, OOM, precision-auto), identical to a collapsed region; a fused tool with
+    fed inputs is first refused (TEXToolError, `code` REFUSE_FUSED_INPUT_MISSING /
+    REFUSE_FUSED_INPUT_EXTENT) unless every declared input is passed and co-extent."""
     from . import tex_engine
     if manifest.is_fused:
         if manifest.terminal_image_input not in inputs:
             raise TEXToolError(f"fused tool '{manifest.name}' needs its source input "
-                               f"'{manifest.terminal_image_input}'")
-        gs, term_bindings = _fused_cook_inputs(manifest, inputs[manifest.terminal_image_input], params)
+                               f"'{manifest.terminal_image_input}'",
+                               code=REFUSE_FUSED_INPUT_MISSING, input=manifest.terminal_image_input)
+        fed = _fed_inputs(manifest)
+        if fed:
+            source, extras = _fed_cook_values(manifest, inputs, fed)
+            gs, term_bindings = _fused_cook_inputs(manifest, source, params, extras)
+        else:
+            gs, term_bindings = _fused_cook_inputs(manifest, inputs[manifest.terminal_image_input], params)
         return tex_engine.cook(manifest.terminal_code, term_bindings, chain_payload=gs, **cook_kwargs)
     bindings = {**inputs, **_resolve_params(manifest, params)}
     return tex_engine.cook(manifest.code, bindings, **cook_kwargs)
@@ -691,7 +955,8 @@ def tool_warm_keys(manifest: ToolManifest) -> list[str]:
         from .tex_fusion import fused_fingerprint
         rp = _repr_params(manifest, warm=True)   # match the cook's ingress types (raw defaults)
         for ch in _image_channel_variants(manifest):
-            gs, term_bindings = _fused_cook_inputs(manifest, _fused_source_placeholder(manifest, ch), rp)
+            gs, term_bindings = _fused_cook_inputs(manifest, _fused_source_placeholder(manifest, ch), rp,
+                                                   _fed_placeholders(manifest, ch))
             fp = fused_fingerprint(gs, manifest.terminal_code, term_bindings, infer_binding_type)
             if fp and fp not in keys:
                 keys.append(fp)
@@ -725,12 +990,28 @@ def _placeholder_tensor(type_str, image_channels: int = 3):
 
 
 def _fused_source_placeholder(manifest: ToolManifest, image_channels: int = 3):
-    """The placeholder source tensor a fused tool's single external input is sampled at, shaped by
-    its declared type. A valid fused tool always declares exactly one input (validate_manifest);
-    the fallback is defensive (a shaped zero, so assembly still type-infers rather than seeing None)."""
+    """The placeholder source tensor a fused tool's external source is sampled at, shaped by its
+    declared type. The source is the input named by terminal_image_input: the only input a tool
+    without `feeds` declares (validate_manifest), and one of several — not necessarily the first —
+    on a tool with them. The fallbacks are defensive (a shaped zero, so assembly still type-infers
+    rather than seeing None)."""
+    for inp in manifest.inputs:
+        if inp.get("name") == manifest.terminal_image_input:
+            return _placeholder_tensor(inp.get("type"), image_channels)
     if manifest.inputs:
         return _placeholder_tensor(manifest.inputs[0].get("type"), image_channels)
     return _zeros_bhwc(image_channels)
+
+
+def _fed_placeholders(manifest: ToolManifest, image_channels: int = 3):
+    """{name: placeholder} for each input a fused tool routes with `feeds`, or None when it routes
+    none — so a tool without `feeds` hands `_fused_cook_inputs` exactly what it did before they
+    existed. The channel variant is ALIGNED with the source's: an RGB warm key samples every IMAGE
+    input at 3 channels, an RGBA one at 4 (two keys, not every combination); a cook that mixes
+    them is a warm-cache miss, which compiles."""
+    fed = {inp["name"]: _placeholder_tensor(inp.get("type"), image_channels)
+           for inp in manifest.inputs if "feeds" in inp}
+    return fed or None
 
 
 # ── the user tool store (TOOL-2 backend: get_user_dir seam, LANG-5 pattern) ───────
@@ -859,7 +1140,8 @@ def _compile_tool_program(manifest: ToolManifest, image_channels: int = 3):
     if manifest.is_fused:
         from .tex_fusion import prepare_fused, fused_fingerprint
         gs, term_bindings = _fused_cook_inputs(
-            manifest, _fused_source_placeholder(manifest, image_channels), _repr_params(manifest, warm=True))
+            manifest, _fused_source_placeholder(manifest, image_channels), _repr_params(manifest, warm=True),
+            _fed_placeholders(manifest, image_channels))
         prog, type_map, _referenced, _assigned, _pinfo, used_builtins, _merged = \
             prepare_fused(gs, manifest.terminal_code, term_bindings, infer_binding_type)
         fp = fused_fingerprint(gs, manifest.terminal_code, term_bindings, infer_binding_type)

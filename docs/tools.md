@@ -29,9 +29,11 @@ Two shapes, both `.textool`:
 - **Single-stage tool** — one TEX program with promoted params. All four stock exemplars
   are this shape. May have several external inputs (Merge reads `@fg`, `@bg`, `m@mask`).
   Cooks as a plain program: `tex_engine.cook(code, bindings)`.
-- **Fused (multi-stage) tool** — a linear or DAG chain of stages with **exactly one
-  external image source** (the fusion-region model: `tex_fusion.detect_fusable_regions`
-  admits one external image edge). Internal handoff edges are image/mask-typed. Cooks
+- **Fused (multi-stage) tool** — a linear or DAG chain of stages with **one external image
+  source** (the fusion-region model: `tex_fusion.detect_fusable_regions` admits one external
+  producer) and, **opt-in**, further external inputs, each naming the stage bindings it is
+  written into (`inputs[*].feeds`, §2) and required to be co-extent with the source at cook
+  (§4). Internal handoff edges are image/mask-typed. Cooks
   through the *same* fused path a collapsed region does — the manifest stores the
   `GraphSpec` that `region_to_collapse_plan` emits and `engine.cook(chain_payload=)`
   consumes, so the tool layer is a thin pass-through over machinery FUS-3 already proves
@@ -68,6 +70,8 @@ Unfusable constructs in a multi-stage tool are **authoring errors** caught at bu
   //                  source_binding, terminal_chain_inputs... },
   //   "terminal_code": "...",                       // the terminal stage's source
   //   "terminal_image_input": "image",              // socket binding carrying the source
+  //   and, opt-in, on any input OTHER than the source:
+  //   {"name": "plate", "type": "IMAGE", "feeds": [["terminal", "plate"], [0, "ref"]]}
 
   "inputs": [                        // external @-bindings the tool exposes
     {"name": "image", "type": "IMAGE"},
@@ -113,8 +117,23 @@ Rules:
   leave unwired — an optional mask or reference plate, say. It is a host UI hint only: TEX
   binds nothing for an absent input either way, and a program that actually reads an
   unwired one still fails the ordinary E6021 "not connected" gate at cook, never a silently
-  wrong pixel. A **fused** tool's sole external input (its one fusion source) may never be
-  `optional: true` — the engine requires it to splice the chain.
+  wrong pixel. A **fused** tool's source input may never be `optional: true` — the engine
+  requires it to splice the chain — and neither may a fed input (next rule).
+- `inputs[*].feeds` (**fused tools only**; absent by default) routes an external input other
+  than the source into the chain: a list of 1..`MAX_STAGES` `[stage, binding]` pairs, `stage` a
+  `graphspec.stages` index or `"terminal"` (the `promoted_params[*].stage` vocabulary),
+  `binding` an identifier. At cook the input's tensor is written into every binding it names,
+  exactly where a promoted value goes (§4), so the fused program is the ordinary GraphSpec one.
+  Once any input declares `feeds`, every input except the source (`terminal_image_input`) must
+  declare it and the source may not. A fed input is `IMAGE` or `MASK` and never `optional`. A
+  feed may not target a binding its stage already binds — its chain input, a source injection
+  point, a baked param, a promoted param's `internal`, or another feed — because one of the two
+  writes would silently win. On a DAG spec every stage must read a chain, the source or a feed:
+  a stage that reads none would adopt the fused program's extent instead of cooking at its own,
+  which is why the graph fusion detector never folds such a node either. A fused tool with no
+  `feeds` anywhere is exactly the one-input shape it always was. `feeds` needs no
+  `manifest_schema` bump: a tool with fed inputs declares at least two inputs, which a build
+  without `feeds` refuses at load rather than misreads.
 - A promoted param's `default` and `type` mirror its `ParamDecl` default/type_hint, so an
   instanced tool node reconstructs the exact widget the source node had.
 - **No fingerprint is ever stored** (ENG-5): the fused warm key is re-derived at install
@@ -142,6 +161,24 @@ because a downloaded `.textool` is untrusted input to a code generator (§6):
 4. **Engine-version gate** — if `min_engine` > package `__version__`, raise `TEXToolError`
    ("tool needs TEX ≥ X"). Fails at install, not at cook (roadmap TOOL-4).
 
+**Refusal codes.** The fused-input refusals carry a stable `TEXToolError.code` — a host keys on
+it, for instance to word the refusal in its own language; the message beside it may be
+reworded, the code may not — and `TEXToolError.input` names the offending input when one is to
+blame. Every other `TEXToolError` has `code = None`, and `str(e)` is the message alone, as it
+always was.
+
+| `code` | Raised by | Meaning |
+|--------|-----------|---------|
+| `fused-input-count` | `validate_manifest` | a fused tool that declares no `feeds` declares more than one input |
+| `fused-input-unrouted` | `validate_manifest` | a fused tool with `feeds` has a non-source input that declares none |
+| `fused-feed-invalid` | `validate_manifest` | `feeds` is malformed, on the source, on a non-`IMAGE`/`MASK` or `optional` input, targets a stage out of range, or sits on a single-stage tool |
+| `fused-feed-collision` | `validate_manifest` | a feed targets a binding its stage already binds (§2) |
+| `fused-stage-unanchored` | `validate_manifest` | a DAG stage reads no chain, no source and no feed |
+| `fused-input-missing` | `cook_tool` | a declared input of a fused tool was not passed |
+| `fused-input-extent` | `cook_tool` | an input's `[B,H,W]` differs from the source's, or cannot be read |
+
+The constants are `tex_tool.REFUSE_FUSED_*`.
+
 `preflight_tool(manifest) -> dict` then type-checks the stages *without cooking*: a
 single-stage tool runs `tex_api.check(code, {})`; a fused tool runs
 `tex_fusion.chain_preflight(stages, infer_binding_type)`. Both are total (never raise) and
@@ -164,9 +201,23 @@ then:
 - **Fused**: `tex_engine.cook(terminal_code, {terminal_image_input: source, **terminal_params},
   chain_payload=graphspec, **cook_kwargs)` — the real engine path (tiers, OOM ladder,
   precision-auto), identical to how a host cooks a collapsed region.
+- **Fused with fed inputs**: first every declared input must be passed (`fused-input-missing`)
+  and every input's `shape[:3]` must equal the source's exactly — batch, height and width; no
+  batch broadcast, no singleton axis (`fused-input-extent`). A promised input is resolved before
+  that check (E7007 if it has not landed). Then each fed tensor is written into the bindings it
+  names — a copy of `graphspec.stages[i].params`, or the terminal bindings — and the cook is the
+  unchanged fused call above.
 
 Because the fused path *is* the region path, the tool cook equals the unfused stage-by-stage
 cook by the same construction FUS-3 pins (the round-trip oracle in §7 asserts it for a tool).
+
+**Why co-extent is a refusal, not a convenience.** Fused, a fed input joins the one grid the
+whole program cooks on (the per-axis max over the bindings it reads); cooked stage by stage,
+each stage grids on its own inputs. A batch or singleton axis that broadcasts harmlessly unfused
+therefore changes an *upstream* stage's pixels fused — silently, with the same output shape and
+no error. Measured on random inputs: a `B=4` input beside a `B=1` source moved a stage reading
+`fi` by maxdiff 2.99; a one-row `[1,1,W,C]` source beside a full frame moved a stage reading `v`
+by 1.00. A tool without fed inputs cannot meet this, because every stage anchors on its one source.
 
 ---
 
@@ -180,6 +231,9 @@ fingerprint (`tex_fusion.fused_fingerprint`) **at install time, by re-fingerprin
 inline stage code** — the loader already has the sources in hand. The key is **never carried
 in the file** (ENG-5: fingerprints are deliberately unstable across TEX versions; a stored
 one would be wrong after any TEX update). A single-stage tool's key is `TEXCache.fingerprint`.
+A fused tool with fed inputs derives its keys with every `IMAGE` input sampled at the same
+channel count — one RGB key and one RGBA key, not every combination; a cook that mixes RGB and
+RGBA inputs misses the warm cache and compiles.
 
 `tex_tool.install_tool(manifest, *, warm=False, device=..., ...)` writes the manifest into
 the host user dir (§ TOOL-2) and, **only with explicit `warm=True` consent** (TOOL-5:
@@ -236,7 +290,7 @@ boundary. Two structural facts make it safe, and both are now pinned:
 can present without an emitter escape: `MAX_TOOL_BYTES` (manifest size), `MAX_STAGES`
 (mirrors `tex_fusion._MAX_FUSED_REGION_STAGES = 16`), `MAX_PROMOTED_PARAMS`, `MAX_STAGE_CODE_BYTES`,
 and, for the two structured metadata keys (§2), `MAX_TOOLTIP_CHARS`, `MAX_OPTIONS`,
-`MAX_OPTION_CHARS`. These bound parse/compile cost; they do **not** bound *cook* cost — a valid tool can still
+`MAX_OPTION_CHARS`; an input's `feeds` is at most `MAX_STAGES` pairs. These bound parse/compile cost; they do **not** bound *cook* cost — a valid tool can still
 request an 8K `gauss_blur` and OOM/TDR a machine, exactly as a hand-written program can. That
 residual is stated, not silently "handled": a host that installs third-party tools owns the
 same memory-budget / TDR-watchdog duty it owes any user program (CACHE-5 / ROI-5 territory).
@@ -260,13 +314,31 @@ decision (the by-name-nesting exclusion is already in the §7 register).
 | **derivation** | `test_tool_input_optional` | `inputs[*].optional` round-trips true/false; an absent key and an unrecognised one stay out of the dict |
 | **canary** | `test_tool_manifest_byte_identity` | every stock `.textool` + two representative older manifests still give byte-identical `to_dict()`/`tool_summary()`/written bytes |
 | **canary** | `test_tool_js_publish_filter_pin` | the publish-menu JS still forwards only the original five metadata keys (forwarding the new ones is a separate, later frontend change) |
+| **differential oracle** | `test_tool_fused_feeds_roundtrip_unfused` | a fused tool with a fed input — into the terminal (Blur → Merge), an upstream linear stage, a DAG stage — cooks == its stages cooked one by one (CPU + CUDA), and the cook leaves the manifest unchanged |
+| **differential oracle** | `test_tool_fused_feeds_codegen_parity` | invariant #2 on those fused programs: interpreter == codegen, asserting codegen actually served |
+| **refusal + negative control** | `test_tool_fused_feeds_extent_refusal` | a `B=4` input beside `B=1`, a strip source, an H mismatch → `fused-input-extent` with the engine never called; the first two, handed to the engine anyway, cook silently wrong; missing / non-tensor / promised inputs |
+| **canary** | `test_tool_fused_feeds_rejects` | every malformed, colliding or unanchored `feeds` manifest is refused with its code and offending input |
+| **canary** | `test_tool_fused_input_refusals_unchanged` | a fused tool without `feeds`: the one-input refusals keep their text and type; `fused-input-count` and `fused-input-missing` ride along as codes |
+| **derivation** | `test_tool_fused_feeds_manifest_roundtrip` | `feeds` round-trips `load_tool`/`to_dict()`/`tool_summary()`/`write_tool`; preflight ok; the warm keys include an RGB and an RGBA cook's keys |
+| **derivation** | `test_tool_fused_feeds_rekey` | an RGB then an RGBA fed input compile under distinct fused keys, each cook == stage-by-stage |
+| **canary** | `test_tool_no_feeds_is_pre_feeds_identical` | a tool without `feeds` (the stock tools, the tooltip/options/optional manifests, two older shapes) serialises, hands `tex_engine.cook` the same call, cooks the same pixels and derives the same warm keys as before `feeds` existed |
 
 ---
 
 ## 8. v1 scope, honestly recorded
 
-- **Single external image source per fused tool** (the fusion-region constraint). Multi-input
-  merges are expressible as *single-stage* tools (Merge reads `@fg`/`@bg`), not as fused chains.
+- **One external image source per fused tool, plus opt-in fed inputs** (§2 `feeds`) that must be
+  co-extent with it at cook (§4). A merge that needs no chain is still a *single-stage* tool
+  (Merge reads `@A`/`@B`). Declined, each with what reopens it:
+  - *Several producers in graph fusion* — `tex_fusion`'s region detector keeps its one-producer
+    rule; the reasons are recorded in `DEVELOPMENT.md` §"Rejected design decisions". A tool author
+    routes a second input explicitly; the ComfyUI graph does not fuse one.
+  - *Broadcasting a fed input* over a batch or singleton axis — refused, because fused it changes
+    pixels silently (§4). Reopens with the gather-source deferral in `DEVELOPMENT.md` (a binding
+    read only through sampling is not a co-extent participant).
+  - *`LATENT` fed inputs* — no fused tool exercises the latent axis; reopens when a host names one.
+  - *A GraphSpec key for extra inputs* — a `GRAPHSPEC_SCHEMA` bump for what stage params already carry.
+  - *A code on every `TEXToolError`* — only the fused-input refusals carry one; the rest is its own item.
 - **No by-name tool nesting** (roadmap §7 rejection stands). A tool's stages are all inline.
 - **No sequential fallback** — an unfusable multi-stage tool is a build error.
 - **Warm-compile is opt-in** (TOOL-5-A). Install is validate-only by default.

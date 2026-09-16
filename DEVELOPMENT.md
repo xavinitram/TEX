@@ -1194,4 +1194,29 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   what four ordinary outputs already express more generally. Reopens only for a declaration a
   uniform scalar output genuinely cannot make — a data-dependent bounding box, which is
   batch-shaped under today's engine, not once-per-cook.
+- **Several external producers in one fused region — relaxing `tex_fusion._grow_region`'s
+  one-producer rule** (the `.textool` `feeds` key) — rejected, and recorded because a fused
+  `.textool` may now take more than one external input (`inputs[*].feeds`, `docs/tools.md` §2)
+  while graph fusion still refuses a two-producer region, which reads as an inconsistency unless
+  the difference is written down. The tool layer can admit it because `cook_tool` holds three
+  things the region detector does not. (a) **Tensor shapes.** A second input joins the one grid a
+  fused program cooks on, while the same nodes cooked unfused each grid on their own inputs, so
+  non-co-extent inputs change an UPSTREAM stage's pixels with no error and the same output shape
+  (measured on random inputs: maxdiff 2.99 for a `B=4` input beside a `B=1` source under a stage
+  reading `fi`, 1.00 for a one-row source beside a full frame under a stage reading `v`).
+  `cook_tool` refuses that (`fused-input-extent`) before the engine runs. The detector is handed
+  no tensor shapes (`_region_compiles` preflights placeholder samples), and once a region is
+  collapsed its upstream nodes are gone from the submitted prompt (`FusionError`'s contract), so
+  the same mismatch could only be caught at the point where the cook can no longer fall back to
+  running the nodes unfused. (b) **Lazy pruning.** With one producer the source is always the
+  shape anchor and every input traces to it, so nothing in a region is prunable; a second
+  producer makes an input prunable, which needs `fused_required_bindings` wired into BOTH lazy
+  consumers (`check_lazy_status` and `execute()`'s E6003 gate) from one memoized result —
+  invariant #11's dual-consumer rule — and that wiring is deliberately unbuilt. (c) **Peak
+  memory.** Wider regions fuse nodes that cook unfused today, and a fused region holds every
+  stage's full-res intermediate live for the whole cook — the mechanism
+  `docs/fusion-cap-decision.md` measured at 12.9× — so the change would move peak memory on the
+  ComfyUI default path (invariant #7). The 16-stage cap is untouched either way. *Gate:* all
+  three together — a detection seam that receives producer extents, the FUS-2 wiring into both
+  lazy consumers, and a peak-memory measurement on the ComfyUI path.
 
