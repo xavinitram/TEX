@@ -73,8 +73,9 @@ class EngineSession:
 
     def reset(self) -> None:
         """Shed all in-memory tensor caches — the state a long-running host drops between
-        projects (the umbrella `free_tensor_caches`: stdlib pyramids, noise, CUDA graphs via
-        `free_graphs_only`, and every thread's interpreter caches). Program/codegen DISK caches
+        projects (the umbrella `free_tensor_caches`: stdlib pyramids, noise OFFSETS only (the
+        tiered compile-promotion table survives), CUDA graphs via `free_graphs_only`, and every
+        thread's interpreter caches). Program/codegen DISK caches
         PERSIST (that is the point of a warm relaunch). Single-cook-thread; never call it
         concurrently with a live cook."""
         from .tex_memory import free_tensor_caches

@@ -750,6 +750,7 @@ def main():
         test_data3_array_wires,
         test_data4_session_soak,
         test_port5_second_host,
+        test_data4_embedding_bringup_runs_as_documented,
         test_data_canaries,
         test_root_channel_and_swizzle_fixes,
     )
@@ -758,6 +759,7 @@ def main():
     test_data3_array_wires(r)
     test_data4_session_soak(r)
     test_port5_second_host(r)
+    test_data4_embedding_bringup_runs_as_documented(r)
     test_data_canaries(r)
     test_root_channel_and_swizzle_fixes(r)
 

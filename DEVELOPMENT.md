@@ -586,6 +586,113 @@ __init__.py                               tex_extension.js
 2. Add the filename stem to `_EXAMPLE_CATEGORIES` in `__init__.py` with a `"Category/Display Name"` value
 3. The snippet will appear automatically in the cascade menu under `Examples/Category/Display Name`
 
+## Embedding TEX in a host
+
+ComfyUI stays the first-class host; everything in this section runs with it absent, and nothing
+here moves a default or changes a call path for ComfyUI (invariant #7). `tex_api`'s own docstring
+argues which entry point to cook through (`tex_api.py:17-35`) — this section is the bring-up a
+second host runs before it gets there. **`import TEX_Wrangle` alone loads neither `comfy` nor
+`torch`** (PORT-6): the package root defers the ComfyUI adapter to a lazy attribute and imports
+nothing beyond `os`/`sys` at module scope (`__init__.py:13-30`), so a host pays only for the
+submodules it actually names — an ENGINE name, once touched, is what pulls torch in, never the bare
+package import.
+
+The sequence below is real, not illustrative: `tests/test_v028_phase1.py`'s
+`test_data4_embedding_bringup_runs_as_documented` execs this exact fenced block, in a fresh
+subprocess with ComfyUI genuinely unimportable, on every run — so a rename here fails a test
+instead of aging quietly out from under a host.
+
+```python
+import torch
+from TEX_Wrangle import tex_api, tex_engine, tex_marshalling, tex_cookqueue
+from TEX_Wrangle.tex_runtime.host import NullHostServices
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+session = tex_api.default_session()                 # the process's one session (DATA-4)
+session.set_host(NullHostServices())                # no ComfyUI: TEX answers VRAM questions itself
+tex_marshalling.set_egress_profile("engine")        # raw fp32 out, alpha kept (ENG-3)
+queue = tex_cookqueue.CookQueue(name="host-cook")   # ONE queue owns every cook
+img = torch.rand(1, 64, 64, 4, device=DEVICE)
+job = queue.submit(lambda cancel: tex_engine.cook("@OUT = vec4(@A.rgb * 1.5, 1.0);", {"A": img},
+                                                  device_mode=DEVICE, cancel=cancel),
+                   klass=tex_cookqueue.INTERACTIVE)
+frame = job.result(timeout=60).outputs["OUT"]       # raw: values above 1.0 survive
+queue.submit(lambda cancel: session.reset(),        # lifecycle ops run ON the queue, between cooks
+             klass=tex_cookqueue.COMMITTED, feeds_profile=False).result(timeout=60)
+queue.close()                                       # shutdown: stop cooking first,
+session.close()                                     # then shed caches and host services
+```
+
+Every call is real, not a sketch: `default_session` / `set_host` / `reset` / `close`
+(`tex_session.py:112-118`, `:65-68`, `:74-82`, `:100-106`), the process-wide profile setter
+(`tex_marshalling.py:710-720`), `NullHostServices` (`tex_runtime/host.py:125-137`), and
+`submit` / `result` / `close` (`tex_cookqueue.py:292-309`, `:215-224`, `:832-865`). The lifecycle op
+runs at COMMITTED because that class is never shed and pauses for INTERACTIVE rather than tripping
+it (`tex_cookqueue.py:17-34`); the submit is fenced through the queue because `reset()` must not run
+beside a live cook (`tex_session.py:79-80`) and the queue's single worker thread is the exclusion
+(`tex_cookqueue.py:17-22`); `feeds_profile=False` because a non-cook job must not reach PROF-1's cost
+table, and that has to be said, not left to a `profile_key` the caller happened not to pass
+(`tex_cookqueue.py:179-184`). One fact `close()` does NOT undo: it leaves the egress profile exactly
+where the host last set it (`tex_session.py:100-106`).
+
+**The queue's token, four rules** (`docs/cook-queue-scheduling.md` §3-§6 has the argument): a
+submitted cook must take the queue's OWN token — chained with a host's own reason to abort, never
+substituted for it (`examples/host_demo.py:61-73`, `:503-507`), because that token is the only
+channel preemption, shedding and `close()` travel down. Preempt returns a job to the HEAD of its
+class, transient and never reported to the host; shed is terminal
+(`tex_cookqueue.py:36-40`; `tests/test_v031_phase1.py:127`, `:390`). A cancellation the queue did not
+itself raise — a shed, a host's own supersede latch, a global Stop — is terminal by the same rule,
+never retried (`tex_cookqueue.py:703-707`). A cook that already returned is never discarded for a
+flag raised while it ran (`tex_cookqueue.py:42-47`, `:754-760`).
+
+**Process-global, all of it** (one tenant per process today): host services
+(`tex_runtime/host.py:261-282`), the egress profile and ARRAY wires (`tex_marshalling.py:710-720`),
+the program/codegen cache under `TEX_CACHE_DIR`, the CACHE-5 governor, and the per-thread interpreter
+pool (ENG-9 above). The tiered noise caches are the one exception to `reset()`'s reach: a key's
+compiled tier is promoted starting its 4th call (`tex_runtime/noise.py:423-425`) and STAYS promoted —
+`session.reset()` clears only the worley-offset caches, not that promotion table
+(`tex_memory.py:1257-1261`). An isolated, per-tenant session is phase 2 and unbuilt today
+(`tex_session.py:18-21`).
+
+A host reads a cook back through `CookResult` (`tex_engine.py:287-316`, Tier 1 below): `cooked_roi`,
+`lineage` under `prepare(want_lineage=True)`, and `out_meta` always ride along; the rest are opt-in,
+and everything below is a pointer, one sentence each, to what exists on this tree today:
+
+- `CookResult.noise_tiers`, filled by `prepare`/`cook(want_noise_tiers=True)`, names which tier
+  served each tiered noise builtin so a host can decline to composite frames cooked across a
+  promotion (`tex_engine.py:277`, `:1614-1616`) — Tier 1, the same row as `CookResult` itself.
+- `tex_doctor.capabilities()`, also `tex doctor --json`, is a read-only per-tier report: did this
+  process's box actually run each execution tier, is it known unavailable and why, or simply
+  unmeasured (`tex_doctor.py:284-310`, `tex_cli.py:303-318`) — Tier 2, its own row below.
+- `tex_fusion.collapse_linear(stages)` rewrites a DAG-shaped fused region to the legacy linear shape
+  when the region genuinely is one, or returns `None` rather than force a mis-wired collapse
+  (`tex_fusion.py:970-990`); `tex_checkpoint.gate_refusal(...)` is the structured reason — a stable
+  code, the offending stage, a human message — that a checkpointed cook ran whole instead of
+  incrementally (`tex_checkpoint.py:487-500`). Neither is a row below; both are `tex_fusion`
+  internals, Tier 3, by the catch-all's own example.
+- The language server accepts a per-document `bindingTypes` map on `didOpen`/`didChange` — the wire
+  form of the `{name: TEXType}` map `tex_api.check` already takes — so diagnostics check against the
+  bindings a host actually wired, not an empty guess (`tex_lsp.py:16-23`, `:195-210`). Not a row
+  below; Tier 3.
+- `TEX_Wrangle.tex_testkit` hands a host the suite's own state-isolation kit (`make_img`,
+  `cold_engine_state`, `armed_profiler`) without it having to path-load `tests/helpers.py`
+  (`tex_testkit.py:1-38`). Deliberately not a row below; its own docstring pins it at Tier 2 anyway
+  (`tex_testkit.py:15-22`).
+- `ResultCache.put(..., mask_eligible=True)` opts a MASK output into half-precision preview storage
+  (LATENT stays refused regardless, `tex_results.py:504-517`); `ResultCache.touch(key)` and
+  `key in cache` are non-read residency operations — a hint that reorders the eviction walk, and a
+  resident-now check — and neither counts as a hit or promotes a demoted frame
+  (`tex_results.py:1614-1662`). Not a row below; `touch`/`in` pin their own Tier 2 in their
+  docstrings, and `put`'s new keyword travels with them.
+- A `.textool` manifest's `inputs[]` entries may carry `feeds` (routes an extra input of a fused tool
+  into named stage bindings) and `optional` (host UI advice only); `promoted_params[i].metadata` may
+  carry `tooltip` and `options` (a labelled-choice list) — all four validated, all four opt-in, under
+  the manifest's EXISTING Tier 1 row below (TOOL-1) (`tex_tool.py:61-62`, `:254-268`).
+
+None of this mints a new tier: each surface above keeps whatever this table already says about it,
+or does not — `tex_cookqueue` is not in the table at all. This section is descriptive of what is
+wired today, not a contract; a host's re-pin audit diffs the section and re-verifies the entry
+points, and refactoring freedom was chosen over canary-pinning this list on purpose.
+
 ## API stability tiers (ENG-5)
 
 TEX is embeddable (`tex_api`, `tex_engine`, `tex_cli` all run with ComfyUI absent), so

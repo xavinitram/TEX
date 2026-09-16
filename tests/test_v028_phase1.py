@@ -438,6 +438,78 @@ def test_port5_second_host(r: SubTestResult):
                 del sys.modules[m]
 
 
+# ── BRIEF-5: the embedding guide's bring-up, exercised ────────────────────────
+
+def test_data4_embedding_bringup_runs_as_documented(r: SubTestResult):
+    """BRIEF-5: `DEVELOPMENT.md`'s "Embedding TEX in a host" section carries ONE fenced
+    `python` block as the bring-up a second host runs. This execs that exact text —
+    not a paraphrase, so a doc edit that breaks the walkthrough fails HERE, not in a
+    host's bug report — inside a FRESH subprocess with the `..\\ComfyUI` entry the
+    embedded interpreter's `._pth` injects stripped back out of `sys.path` (the same
+    shape of proof as `test_v035_hygiene.py::test_v035_port6_engine_import_is_adapter_
+    free`), so "runs with ComfyUI absent" is checked against an interpreter where
+    `comfy` genuinely cannot import, not one that merely declined to this time."""
+    print("\n--- BRIEF-5: DEVELOPMENT.md's embedding bring-up runs as documented ---")
+    import re
+    import subprocess
+    import sys as _sys
+
+    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # TEX_Wrangle/
+    custom_nodes = os.path.dirname(pkg_root)                                # its parent
+    try:
+        with open(os.path.join(pkg_root, "DEVELOPMENT.md"), encoding="utf-8") as f:
+            dev_md = f.read()
+    except OSError as e:
+        r.fail("BRIEF-5 embedding bringup", f"could not read DEVELOPMENT.md: {e}")
+        return
+
+    heading = "## Embedding TEX in a host"
+    at = dev_md.find(heading)
+    if at == -1:
+        r.fail("BRIEF-5 embedding bringup",
+               f"heading {heading!r} not found in DEVELOPMENT.md")
+        return
+    fence = re.search(r"```python\n(.*?)```", dev_md[at:], re.S)
+    if not fence:
+        r.fail("BRIEF-5 embedding bringup", "no python fence found after the heading")
+        return
+    block = fence.group(1)
+    if not block.endswith("\n"):
+        block += "\n"
+
+    # Strip exactly the `..\ComfyUI` entry the ._pth adds (never a broad substring match —
+    # every OTHER entry on this box, including site-packages, resolves under a directory
+    # named "ComfyUI_windows_portable" too, so a naive filter would take torch out with it).
+    script = (
+        "import sys, os\n"
+        "_comfy_root = os.path.normpath(os.path.join(os.path.dirname(sys.executable), "
+        "'..', 'ComfyUI'))\n"
+        "sys.path[:] = [p for p in sys.path if os.path.normpath(p) != _comfy_root]\n"
+        f"sys.path.insert(0, {custom_nodes!r})\n"
+    ) + block + (
+        "assert tuple(frame.shape) == (1, 64, 64, 4), frame.shape\n"
+        "assert float(frame.max()) > 1.0, 'raw egress profile did not survive'\n"
+        "assert 'comfy' not in sys.modules, 'the bring-up imported comfy'\n"
+        "try:\n"
+        "    queue.submit(lambda cancel: None)\n"
+        "    raise SystemExit('submit on a closed queue did not raise RuntimeError')\n"
+        "except RuntimeError:\n"
+        "    pass\n"
+        "print('BRIEF5_OK')\n"
+    )
+    try:
+        proc = subprocess.run([_sys.executable, "-X", "utf8", "-c", script],
+                              capture_output=True, text=True, timeout=180)
+        if proc.returncode != 0 or "BRIEF5_OK" not in proc.stdout:
+            r.fail("BRIEF-5 embedding bringup",
+                   f"subprocess exit {proc.returncode}: "
+                   f"{(proc.stderr or proc.stdout)[-800:]}")
+            return
+        r.ok("DEVELOPMENT.md's embedding bring-up block runs verbatim, ComfyUI genuinely absent")
+    except Exception as e:
+        r.fail("BRIEF-5 embedding bringup", f"{type(e).__name__}: {e}")
+
+
 # ── ENG-5 canaries: the DATA-2 / DATA-4 public surfaces ───────────────────────
 
 def test_data_canaries(r: SubTestResult):
