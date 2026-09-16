@@ -389,6 +389,68 @@ string arr[] = split(s, " ");
     except Exception as e:
         r.fail("format: string placeholders", f"{e}\n{traceback.format_exc()}")
 
+    # -- format: help text matches behaviour, not printf (ASK-9) --
+    # Red before the doc fix: the registry's doc= claimed printf %d/%f/%s and the ex=
+    # example returned its own template unsubstituted. Reads the LIVE registry entry
+    # (not a copy) so the doc and the shipped behaviour cannot drift apart silently.
+    try:
+        from TEX_Wrangle.tex_runtime import stdlib_registry as R
+        entry = next(e for e in R.REGISTRY if e.name == "format")
+        assert "{}" in entry.doc, f"format() doc should name {{}} placeholders, got {entry.doc!r}"
+        for bad in ("%d", "%f", "%s"):
+            assert bad not in entry.doc, (
+                f"format() doc should not claim printf-style {bad}, got {entry.doc!r}")
+        ex_result = compile_and_run(entry.ex + "\n@OUT = s;",
+                                    {"A": torch.ones(1, 32, 64, 3)}, out_type=TEXType.STRING)
+        for leftover in ("{", "}", "%"):
+            assert leftover not in ex_result, (
+                f"format()'s own doc example should leave no {{}} or % unreplaced, "
+                f"got {ex_result!r}")
+        r.ok("format: help doc names {} placeholders (not printf %d/%f/%s), and its own example proves it")
+    except Exception as e:
+        r.fail("format: help doc matches behaviour", f"{e}\n{traceback.format_exc()}")
+
+    # -- format: % sequences stay literal text (ASK-9 invisibility guard) --
+    try:
+        assert compile_and_run('@OUT = format("%s-%s", "a", "b");', {}, out_type=TEXType.STRING) == "%s-%s"
+        assert compile_and_run('@OUT = format("100%");', {}, out_type=TEXType.STRING) == "100%"
+        assert compile_and_run('@OUT = format("%d%%", 5);', {}, out_type=TEXType.STRING) == "%d%%"
+        r.ok("format: % sequences pass through as literal text, unaffected by the doc fix")
+    except Exception as e:
+        r.fail("format: % sequences pass through literally", f"{e}\n{traceback.format_exc()}")
+
+    # -- format: {} format specs, as the corrected doc now promises --
+    try:
+        assert compile_and_run('@OUT = format("{:04d}", 7);', {}, out_type=TEXType.STRING) == "0007"
+        assert compile_and_run('@OUT = format("{:.2f}", 3.14159);', {}, out_type=TEXType.STRING) == "3.14"
+        assert compile_and_run(
+            '@OUT = format("{}{}{:0{}d}", "shot", "_", 7, 4);', {}, out_type=TEXType.STRING
+        ) == "shot_0007"
+        r.ok("format: {} format specs (:04d, :.2f, nested width) work as documented")
+    except Exception as e:
+        r.fail("format: {} format specs", f"{e}\n{traceback.format_exc()}")
+
+    try:
+        compile_and_run('@OUT = format("{:04d}", 7.5);', {}, out_type=TEXType.STRING)
+        r.fail("format: {:04d} of a non-whole float should raise", "no exception was raised")
+    except Exception as e:
+        if "Unknown format code" in str(e):
+            r.ok("format: {:04d} of a non-whole float raises 'Unknown format code'")
+        else:
+            r.fail("format: {:04d} of a non-whole float", f"wrong error: {e}")
+
+    # -- format: braces+percent mix — the string Freeze #2 will pin into the compat
+    # corpus as adv_format_braces_percent; until then this unit test carries it
+    # (ASK-9 design open question 3) --
+    try:
+        result = compile_and_run(
+            '@OUT = format("{}|{:04d}|{:.2f}|%s|%d", "a", 7, 3.14159);',
+            {}, out_type=TEXType.STRING)
+        assert result == "a|0007|3.14|%s|%d", f"Expected 'a|0007|3.14|%s|%d', got {result!r}"
+        r.ok("format: braces+percent mix (pre-Freeze-#2 pin for adv_format_braces_percent)")
+    except Exception as e:
+        r.fail("format: braces+percent mix", f"{e}\n{traceback.format_exc()}")
+
     # -- repeat --
     try:
         result = compile_and_run(

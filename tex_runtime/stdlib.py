@@ -2119,7 +2119,7 @@ class TEXStdlib:
             fill = char
         return s.ljust(w, fill)
 
-    @stdlib("format", sig='format(fmt, ...) \\u2192 string', category='Strings', doc='Printf-style formatting. %d = int, %f = float, %s = string.', ex='string s = format("Frame %d of %d", fi, fn);')
+    @stdlib("format", sig='format(fmt, ...) \\u2192 string', category='Strings', doc='Python-style {} placeholders, filled in order; specs like {:04d} and {:.2f} work. A whole number formats as an int. % sequences are not placeholders.', ex='string s = format("{} x {}", iw, ih);')
     @staticmethod
     def fn_format(template, *args) -> str:
         """String interpolation. Replaces {} placeholders with arguments.

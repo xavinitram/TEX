@@ -174,7 +174,7 @@
 | `to_int` | `to_int(s) → int` | Parse a string as an integer. | — |
 | `to_float` | `to_float(s) → float` | Parse a string as a float. | — |
 | `sanitize_filename` | `sanitize_filename(s) → string` | Remove unsafe characters for use in file paths. | — |
-| `format` | `format(fmt, ...) → string` | Printf-style formatting. %d = int, %f = float, %s = string. | — |
+| `format` | `format(fmt, ...) → string` | Python-style {} placeholders, filled in order; specs like {:04d} and {:.2f} work. A whole number formats as an int. % sequences are not placeholders. | — |
 | `split` | `split(s, sep) → string[]` | Split string into array by separator. | — |
 | `lstrip` | `lstrip(s) → string` | Remove leading whitespace. | — |
 | `rstrip` | `rstrip(s) → string` | Remove trailing whitespace. | — |

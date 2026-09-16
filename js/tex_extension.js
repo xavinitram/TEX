@@ -2147,7 +2147,7 @@ const TEX_HELP_DATA = [
             { name: "to_int", sig: "to_int(s) \u2192 int", desc: "Parse a string as an integer.", example: "int n = to_int(\"42\");" },
             { name: "to_float", sig: "to_float(s) \u2192 float", desc: "Parse a string as a float.", example: "float f = to_float(\"3.14\");" },
             { name: "sanitize_filename", sig: "sanitize_filename(s) \u2192 string", desc: "Remove unsafe characters for use in file paths.", example: "string safe = sanitize_filename(s);" },
-            { name: "format", sig: "format(fmt, ...) \u2192 string", desc: "Printf-style formatting. %d = int, %f = float, %s = string.", example: "string s = format(\"Frame %d of %d\", fi, fn);" },
+            { name: "format", sig: "format(fmt, ...) \u2192 string", desc: "Python-style {} placeholders, filled in order; specs like {:04d} and {:.2f} work. A whole number formats as an int. % sequences are not placeholders.", example: "string s = format(\"{} x {}\", iw, ih);" },
             { name: "split", sig: "split(s, sep) \u2192 string[]", desc: "Split string into array by separator.", example: "string parts[4] = split(s, \",\");" },
             { name: "lstrip", sig: "lstrip(s) \u2192 string", desc: "Remove leading whitespace.", example: "string clean = lstrip(s);" },
             { name: "rstrip", sig: "rstrip(s) \u2192 string", desc: "Remove trailing whitespace.", example: "string clean = rstrip(s);" },

@@ -1116,8 +1116,8 @@
         {
           "name": "format",
           "sig": "format(fmt, ...) → string",
-          "desc": "Printf-style formatting. %d = int, %f = float, %s = string.",
-          "example": "string s = format(\"Frame %d of %d\", fi, fn);",
+          "desc": "Python-style {} placeholders, filled in order; specs like {:04d} and {:.2f} work. A whole number formats as an int. % sequences are not placeholders.",
+          "example": "string s = format(\"{} x {}\", iw, ih);",
           "tags": [],
           "aliases": []
         },
