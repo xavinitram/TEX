@@ -168,7 +168,7 @@ while (val < 100.0) { val = val * 2.0; }
 | `ix`, `iy` | Pixel coordinates (integers) |
 | `u`, `v` | Normalized coordinates (0.0 – 1.0) |
 | `iw`, `ih` | Image dimensions |
-| `px`, `py` | Pixel size in UV space (`1/iw`, `1/ih`) |
+| `px`, `py` | One pixel's width (`1/iw`, `1/ih`); neighbouring `u`/`v` centres are `1/(iw-1)` apart |
 | `fi`, `fn` | Frame index / frame count **within the image batch** |
 | `ic` | Latent channel count (0 for images) |
 | `frame`, `fps`, `time` | The **host timeline** (v0.22). ComfyUI has no playhead, so these read `0` there — use `fi`/`fn` for batch position. A standalone host feeds its own. Reserved names. |

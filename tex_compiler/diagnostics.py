@@ -353,7 +353,7 @@ _BUILTIN_VAR_HINTS: dict[str, str] = {
     "v": "the normalized y coordinate (0..1)",
     "ix": "the integer pixel x", "iy": "the integer pixel y",
     "iw": "the image width in pixels", "ih": "the image height in pixels",
-    "px": "the pixel x (float)", "py": "the pixel y (float)",
+    "px": "one pixel's width in u (1/iw)", "py": "one pixel's width in v (1/ih)",
     "fi": "the frame index", "fn": "the frame count", "ic": "the input channel count",
     "PI": "the constant pi", "TAU": "the constant 2*pi", "E": "Euler's number",
     # ENG-7 (v0.22): reserving these three CAN break a program that declared its own

@@ -183,6 +183,14 @@ else for while break continue return const`.
 | Host time | `frame fps time` — the host playhead (reserved built-in names since v0.22) |
 | Constants | `PI TAU E` |
 
+`u`/`v` are pixel-centre coordinates: `u = ix / max(iw-1, 1)`, `v = iy / max(ih-1, 1)` —
+`0` at the first pixel, `1` at the last. `px`/`py` are `1/iw`/`1/ih`: one pixel's
+width/height as a fraction of the *frame*, not the spacing between neighbouring `u`/`v`
+centres — those are `1/(iw-1)` and `1/(ih-1)` apart, so `u + px` is short of a true
+one-pixel step by `1/iw` of a pixel. The exact k-pixel step is
+`u + k / max(iw - 1.0, 1.0)` (`v`/`py`/`ih` alike), or `fetch(@A, ix + k, iy)` by integer
+pixel index.
+
 `frame`, `fps`, and `time` are **hard-reserved**: a program declaring its own
 `float time = …;` fails to compile. The `$` parameter namespace is separate — `$time`
 (a param) does not collide with the `time` builtin, though `check()` warns (W7003) that

@@ -1132,6 +1132,83 @@ def test_new_builtins_and_fixes(r: SubTestResult):
     except Exception as e:
         r.fail("px/py pixel step variables", e)
 
+    # 2b. the reference no longer mis-describes px/py, and the diagnostics hint no
+    # longer calls px "the pixel x" (ASK-12 red-first doc-truth pin)
+    try:
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+        import gen_function_reference as G
+        from TEX_Wrangle.tex_compiler.diagnostics import _BUILTIN_VAR_HINTS
+        entries, _cats = G.parse_help()
+        pixel_step = entries["Pixel Step"]
+        assert "iw - 1" in pixel_step["desc"], (
+            f"'Pixel Step' help should mention iw - 1, got {pixel_step['desc']!r}")
+        assert "u + px" not in pixel_step["example"], (
+            f"'Pixel Step' example should no longer step u + px, got {pixel_step['example']!r}")
+        assert "pixel x" not in _BUILTIN_VAR_HINTS["px"], (
+            f"diagnostics hint for px should no longer say 'pixel x', "
+            f"got {_BUILTIN_VAR_HINTS['px']!r}")
+        r.ok("'Pixel Step' help and the px diagnostics hint state the corrected definition")
+    except Exception as e:
+        r.fail("px/py help truth", f"{e}\n{traceback.format_exc()}")
+
+    # 2c. the value of px/py did NOT move (the invisibility guard): u/v pixel-centre
+    # spacing is 1/(iw-1), which is what the corrected reference now says px/py are
+    # NOT (ASK-12)
+    try:
+        img = torch.ones(1, 10, 20, 3)
+        result = run("@OUT = vec3(u, 0.0, 0.0);", {"@A": img})
+        u0 = result["OUT"][0, 0, 0, 0].item()
+        u1 = result["OUT"][0, 0, 1, 0].item()
+        expected = 1.0 / (20 - 1)
+        assert abs((u1 - u0) - expected) < 1e-5, (
+            f"u(ix=1)-u(ix=0) should be 1/(iw-1)={expected:.7f}, got {u1 - u0}")
+        r.ok("u pixel-centre spacing is 1/(iw-1) (the interpreter)")
+    except Exception as e:
+        r.fail("u pixel-centre spacing is 1/(iw-1)", e)
+
+    # 2d. the same spacing holds on codegen, CPU and CUDA too — the reference's new
+    # px/py text has to describe every tier, not just the interpreter (ASK-12)
+    try:
+        from failure_harness import run_tier
+        code = "@OUT = vec3(u, 0.0, 0.0);"
+        W = 20
+        img_cpu = torch.ones(1, 10, W, 3)
+        expected = 1.0 / (W - 1)
+        for device in devices():
+            bindings = {"A": img_cpu.to(device)}
+            for tier in ("interp", "codegen"):
+                out = run_tier(code, bindings, tier, device=device)["OUT"]
+                got = out[0, 0, 1, 0].item() - out[0, 0, 0, 0].item()
+                assert abs(got - expected) < 1e-5, (
+                    f"[{tier}/{device}] u(ix=1)-u(ix=0) should be {expected:.7f}, got {got}")
+        r.ok("u pixel-centre spacing is 1/(iw-1) on interp and codegen, CPU and CUDA")
+    except Exception as e:
+        r.fail("u pixel-centre spacing (codegen/device)", e)
+
+    # 2e. the corrected help text's own worked example is exact for interior pixels:
+    # sample(@A, u + 1/(iw-1), v) == fetch(@A, ix+1, iy) (ASK-12)
+    try:
+        from failure_harness import run_tier
+        W, H = 12, 8
+        img_cpu = make_img(1, H, W, 3, seed=90)
+        code = ("vec3 samp = sample(@A, u + 1.0 / max(iw - 1.0, 1.0), v);\n"
+                "vec3 fet = fetch(@A, ix + 1, iy);\n"
+                "@OUT = vec3(abs(samp.x - fet.x), abs(samp.y - fet.y), abs(samp.z - fet.z));")
+        for device in devices():
+            bindings = {"A": img_cpu.to(device)}
+            for tier in ("interp", "codegen"):
+                out = run_tier(code, bindings, tier, device=device)["OUT"]
+                interior = out[:, :, :W - 1, :]  # last column: ix+1 is out of range
+                worst = interior.max().item()
+                assert worst < 1e-5, (
+                    f"[{tier}/{device}] sample(u + 1/(iw-1)) should equal fetch(ix+1) "
+                    f"for interior pixels, worst abs diff {worst}")
+        r.ok("sample(@A, u + 1/(iw-1), v) == fetch(@A, ix+1, iy) for interior pixels, "
+             "interp and codegen, CPU and CUDA")
+    except Exception as e:
+        r.fail("documented neighbour-step idiom is exact", e)
+
     # 3. sincos() returns vec2(sin, cos)
     try:
         result = run("vec2 sc = sincos(PI * 0.5);\n@OUT = vec3(sc.x, sc.y, 0.0);", dummy)
