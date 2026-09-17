@@ -240,6 +240,421 @@ def color_advisories(source: str, param_values: dict | None, binding_meta: dict 
     return out
 
 
+# W7006 / W7007: control flow on a condition that can differ from pixel to pixel
+# (LANGUAGE.md §7.1). The engine decides an `if` by the RANK of its condition: a 0-dim value
+# takes one branch; anything else runs BOTH branches on every pixel and merges them with
+# torch.where. So a gather in a per-pixel branch is paid everywhere (W7006), and a
+# break/continue/return under one raises past the merge and acts on every pixel, while a
+# per-pixel loop condition runs every pixel to the frame's maximum, unmasked (W7007).
+#
+# OPT-IN by construction: nothing calls this but a host. It is never reached from `check()`,
+# so neither the editor's `/tex_wrangle/check` live lint nor `tex_lsp` shows these codes —
+# existing programs gain no new squiggles.
+#
+# "Can differ" over-approximates: an `@` wire (a FLOAT type cannot tell a mask from a
+# scalar) unless typed STRING; `u v ix iy fi`; a vector parameter (staged as a tensor, whose
+# component is not 0-dim on the interpreter); a call to a builtin whose ROI footprint is not
+# 'point' (a reduction keeps its dims); a call with such an argument or to a user function
+# whose result can differ; a local computed from any of these, or merged by a per-pixel `if`;
+# and a function parameter some call site feeds such a value. Literals, scalar `$params`,
+# `iw ih px py fn ic PI TAU E frame fps time` and counters of loops bounded by those never
+# count. The walk is flow-sensitive (a plain `x = …;` re-decides `x`) with each loop iterated
+# to a fixed point, and follows the engine's merge rule (`collect_assigned_vars`): a merged
+# name broadcasts only when it existed before the `if` or both branches define it.
+_PER_PIXEL_BUILTINS = frozenset(("u", "v", "ix", "iy", "fi"))
+_VEC_PARAM_HINTS = frozenset(("c", "v", "v2", "v3", "v4"))
+_CF_KEYWORD_LEN = {"IfElse": 2, "ForLoop": 3, "WhileLoop": 5, "BreakStmt": 5,
+                   "ContinueStmt": 8, "ReturnStmt": 6, "TernaryOp": 1}
+
+
+def control_flow_advisories(source: str, binding_types: dict) -> list:
+    """W7006 / W7007 diagnostics — opt-in advisories for control flow on a condition that
+    can differ from pixel to pixel (LANGUAGE.md §7.1). `binding_types` is the same
+    `{name: TEXType}` map `check()` takes; only a STRING type changes the result (a string
+    wire never differs per pixel).
+
+      * **W7006** — an `if` or `?:` whose condition can differ per pixel, with a gather in a
+        branch: `@A(u, v)` / `@A[x, y]`, a builtin whose footprint is not a point
+        (`sample`, `fetch`, a blur, a reduction), or a user function whose body holds one.
+        Both branches run on every pixel, so the gather is never skipped.
+      * **W7007** — control flow that acts on every pixel: `break` / `continue` / `return`
+        under such an `if`, or a `for` / `while` whose condition can differ per pixel.
+
+    Never emitted by `check()`: a host calls this beside it. Pure AST analysis — no compile,
+    no cook, no side effects — and total: a program that does not parse, or that the
+    analysis cannot finish within its work budget, returns []."""
+    try:
+        from .tex_compiler.lexer import Lexer
+        from .tex_compiler.parser import Parser
+        program = Parser(Lexer(source).tokenize(), source=source).parse()
+    except Exception:
+        return []
+    try:
+        return _ControlFlowLint(program, source, binding_types).run()
+    except Exception:  # the contract is absolute, as for check(): never raise
+        return []
+
+
+class _CFBudget(Exception):
+    """The analysis ran past its work budget (a pathological nesting of loops)."""
+
+
+class _CFState:
+    """The abstract state at a program point: names whose value can differ per pixel, and
+    names that may be defined (the merge rule needs the latter)."""
+    __slots__ = ("vary", "defined")
+
+    def __init__(self, vary=(), defined=()):
+        self.vary = set(vary)
+        self.defined = set(defined)
+
+    def copy(self):
+        return _CFState(self.vary, self.defined)
+
+    def join(self, other):
+        self.vary |= other.vary
+        self.defined |= other.defined
+
+    def same(self, other):
+        return self.vary == other.vary and self.defined == other.defined
+
+
+class _CFLoop:
+    """The states that leave a loop body early: at a `break` or a `continue`."""
+    __slots__ = ("breaks", "continues")
+
+    def __init__(self):
+        self.breaks = []
+        self.continues = []
+
+
+class _CFScope:
+    """One analysis scope (the top level, or one function body)."""
+    __slots__ = ("returns_vary", "record_calls")
+
+    def __init__(self, record_calls):
+        self.returns_vary = False
+        self.record_calls = record_calls
+
+
+class _ControlFlowLint:
+    def __init__(self, program, source, binding_types):
+        from .tex_compiler import ast_nodes as A
+        from . import tex_roi
+        self.A = A
+        self.source = source
+        self.footmap = tex_roi._footmap()
+        self.fns = {}
+        for n in self._walk(program):
+            if type(n) is A.FunctionDef:
+                self.fns[n.name] = n
+        self.main = [s for s in program.statements if type(s) is not A.FunctionDef]
+        types = binding_types if isinstance(binding_types, dict) else {}
+        self.string_wires = {n for n, t in types.items() if _is_string_type(t)}
+        self.vec_params = set()
+        for n in self._walk(program):
+            if type(n) is A.ParamDecl and n.type_hint in _VEC_PARAM_HINTS:
+                self.vec_params.add(n.name)
+        self.params_vary = {name: set() for name in self.fns}   # fed a varying argument
+        self.ret_vary = {name: False for name in self.fns}      # varies with uniform arguments
+        self.gathers = {name: False for name in self.fns}       # the body holds a gather
+        self.all_vary = set()                                   # free names a body may inherit
+        self.all_defined = set()
+        self.emit = False
+        self.diags = {}
+        self.budget = 200_000 + 200 * sum(1 for _ in self._walk(program))
+
+    # ── traversal helpers ────────────────────────────────────────────────────
+    def _walk(self, node):
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            yield n
+            stack.extend(self.A.iter_child_nodes(n))
+
+    def _tick(self):
+        self.budget -= 1
+        if self.budget < 0:
+            raise _CFBudget()
+
+    def _varies(self, expr, st) -> bool:
+        A = self.A
+        stack = [expr]
+        while stack:
+            n = stack.pop()
+            cls = type(n)
+            if cls is A.Identifier:
+                if n.name in st.vary or (n.name in _PER_PIXEL_BUILTINS
+                                         and n.name not in st.defined):
+                    return True
+                continue
+            if cls is A.BindingRef:
+                if n.kind == "param":
+                    if n.name in self.vec_params or n.type_hint in _VEC_PARAM_HINTS:
+                        return True
+                elif n.type_hint != "s" and n.name not in self.string_wires:
+                    return True
+                continue
+            if cls is A.BindingSampleAccess or cls is A.BindingIndexAccess:
+                return True
+            if cls is A.ChannelAccess and type(n.object) is A.BindingRef \
+                    and n.object.kind == "param":
+                return True                       # a component of a vector parameter
+            if cls is A.FunctionCall:
+                if n.name in self.fns:
+                    if self.ret_vary[n.name]:
+                        return True
+                elif self.footmap.get(n.name, "point") != "point":
+                    return True
+            stack.extend(A.iter_child_nodes(n))
+        return False
+
+    def _has_gather(self, node) -> bool:
+        A = self.A
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            cls = type(n)
+            if cls is A.BindingSampleAccess or cls is A.BindingIndexAccess:
+                return True
+            if cls is A.FunctionCall:
+                if n.name in self.fns:
+                    if self.gathers[n.name]:
+                        return True
+                elif self.footmap.get(n.name, "point") != "point":
+                    return True
+            elif cls is A.Assignment:             # a write target is not a read
+                stack.append(n.value)
+                t = n.target
+                if type(t) is A.BindingIndexAccess:
+                    stack.extend(t.args)
+                elif type(t) is A.ArrayIndexAccess:
+                    stack.append(t.index)
+                continue
+            elif cls is A.FunctionDef:
+                continue
+            stack.extend(A.iter_child_nodes(n))
+        return False
+
+    def _warn(self, code, node, message, hint):
+        key = (code, id(node))
+        if not self.emit or key in self.diags:
+            return
+        from .tex_compiler.diagnostics import make_diagnostic
+        loc = node.loc
+        width = _CF_KEYWORD_LEN.get(type(node).__name__)
+        end_col = loc.col + width if (width and loc is not None and loc.col) else None
+        self.diags[key] = make_diagnostic(code, message, loc, self.source, end_col=end_col,
+                                          hint=hint, phase="type_checker", severity="warning")
+
+    # ── the passes ───────────────────────────────────────────────────────────
+    def run(self) -> list:
+        changed = True
+        while changed:                            # transitive "holds a gather"
+            changed = False
+            for name, fd in self.fns.items():
+                if not self.gathers[name] and any(self._has_gather(s) for s in fd.body):
+                    self.gathers[name] = changed = True
+        while True:                               # facts only grow, so this terminates
+            before = self._facts()
+            self._pass()
+            if self._facts() == before:
+                break
+        self.emit = True
+        self._pass()
+        return sorted(self.diags.values(), key=lambda d: (d.loc.line, d.loc.col, d.code))
+
+    def _facts(self):
+        return (tuple(sorted((k, tuple(sorted(v))) for k, v in self.params_vary.items())),
+                tuple(sorted(self.ret_vary.items())), len(self.all_vary), len(self.all_defined))
+
+    def _pass(self):
+        self._block(self.main, _CFState(), _CFScope(True), None, False, False)
+        for name, fd in self.fns.items():
+            params = {p for _t, p in fd.params}
+            inherited = self.all_vary - params
+            defined = self.all_defined | params
+            # What the result does with uniform arguments (per call site, a varying argument
+            # is added on top) — no emission, no call-site recording.
+            emit, self.emit = self.emit, False
+            scope = _CFScope(False)
+            self._block(fd.body, _CFState(inherited, defined), scope, None, False, False)
+            self.emit = emit
+            if scope.returns_vary:
+                self.ret_vary[name] = True
+            # The body as its call sites actually feed it: this is the pass that warns.
+            self._block(fd.body, _CFState(inherited | self.params_vary[name], defined),
+                        _CFScope(True), None, False, False)
+
+    def _block(self, stmts, st, scope, loop, pp_loop, pp_fn):
+        for s in stmts:
+            st = self._stmt(s, st, scope, loop, pp_loop, pp_fn)
+        return st
+
+    def _stmt(self, s, st, scope, loop, pp_loop, pp_fn):
+        A = self.A
+        self._tick()
+        cls = type(s)
+        if cls is A.VarDecl or cls is A.ArrayDecl:
+            init = s.initializer
+            v = init is not None and self._expr(init, st, scope)
+            self._set(st, s.name, v, strong=True)
+        elif cls is A.Assignment:
+            v = self._expr(s.value, st, scope)
+            t = s.target
+            if type(t) is A.Identifier:
+                self._set(st, t.name, v, strong=s.op is None)
+            elif type(t) is A.ChannelAccess and type(t.object) is A.Identifier:
+                self._set(st, t.object.name, v, strong=False)
+            elif type(t) is A.ArrayIndexAccess and type(t.array) is A.Identifier:
+                v = self._expr(t.index, st, scope) or v
+                self._set(st, t.array.name, v, strong=False)
+            elif type(t) is A.BindingIndexAccess:
+                for a in t.args:
+                    self._expr(a, st, scope)
+        elif cls is A.ExprStatement:
+            self._expr(s.expr, st, scope)
+        elif cls is A.IfElse:
+            return self._if(s, st, scope, loop, pp_loop, pp_fn)
+        elif cls is A.ForLoop or cls is A.WhileLoop:
+            return self._loop(s, st, scope, loop, pp_fn)
+        elif cls is A.BreakStmt or cls is A.ContinueStmt:
+            if loop is not None:
+                (loop.breaks if cls is A.BreakStmt else loop.continues).append(st.copy())
+            if pp_loop:
+                kw = "break" if cls is A.BreakStmt else "continue"
+                what = ("ends the loop" if cls is A.BreakStmt
+                        else "skips the rest of the pass")
+                self._warn("W7007", s,
+                           f"This `{kw}` sits under an `if` whose condition can differ from pixel "
+                           f"to pixel. Such an `if` runs its branches on every pixel, so the "
+                           f"`{kw}` {what} for ALL pixels the first time the loop reaches it, "
+                           f"whatever the condition says, and the assignments before it in "
+                           f"that branch land on every pixel too.",
+                           "Keep a per-pixel flag the loop body tests instead, e.g. "
+                           "`if (found < 0 && hit) { found = i; }`, and let the loop run a "
+                           "bound that is the same for every pixel (LANGUAGE.md §7.1).")
+        elif cls is A.ReturnStmt:
+            if s.value is not None and self._expr(s.value, st, scope):
+                scope.returns_vary = True
+            if pp_fn:
+                self._warn("W7007", s,
+                           "This `return` sits under an `if` whose condition can differ from "
+                           "pixel to pixel. Such an `if` runs its branches on every pixel, so the "
+                           "function returns this value for ALL pixels the first time it reaches "
+                           "the `return`, whatever the condition says.",
+                           "Assign the result to a local inside the `if` and return it once at "
+                           "the end, or select with `cond ? a : b` (LANGUAGE.md §7.1).")
+        elif cls is A.ParamDecl and s.default_expr is not None:
+            self._expr(s.default_expr, st, scope)
+        return st
+
+    def _set(self, st, name, varies, strong):
+        if varies:
+            st.vary.add(name)
+            self.all_vary.add(name)
+        elif strong:
+            st.vary.discard(name)
+        st.defined.add(name)
+        self.all_defined.add(name)
+
+    def _expr(self, expr, st, scope) -> bool:
+        """Scan an expression — W7006 on a per-pixel `?:` holding a gather, and the call-site
+        facts for user functions — and return whether its value can differ per pixel."""
+        A = self.A
+        stack = [expr]
+        while stack:
+            n = stack.pop()
+            self._tick()
+            cls = type(n)
+            if cls is A.TernaryOp:
+                if self.emit and self._varies(n.condition, st) and (
+                        self._has_gather(n.true_expr) or self._has_gather(n.false_expr)):
+                    self._warn("W7006", n,
+                               "Both operands of this `?:` are evaluated on every pixel, because "
+                               "its condition can differ from pixel to pixel, so the gather "
+                               "inside (a sample, fetch, blur or reduction) costs the same "
+                               "whichever operand a pixel keeps.",
+                               "Nothing is skipped per pixel. To skip work for the whole frame, "
+                               "test a value that is the same for every pixel (LANGUAGE.md §7.1).")
+            elif cls is A.FunctionCall and scope.record_calls and n.name in self.fns:
+                fed = self.params_vary[n.name]
+                for (_ptype, pname), arg in zip(self.fns[n.name].params, n.args):
+                    if pname not in fed and self._varies(arg, st):
+                        fed.add(pname)
+            stack.extend(A.iter_child_nodes(n))
+        return self._varies(expr, st)
+
+    def _if(self, s, st, scope, loop, pp_loop, pp_fn):
+        from .tex_compiler.ast_nodes import collect_assigned_vars
+        per_pixel = self._expr(s.condition, st, scope)
+        if per_pixel and self.emit and (any(self._has_gather(x) for x in s.then_body)
+                                        or any(self._has_gather(x) for x in s.else_body)):
+            self._warn("W7006", s,
+                       "Both branches of this `if` run on every pixel, because its condition "
+                       "can differ from pixel to pixel, so the gather inside (a sample, fetch, "
+                       "blur or reduction) costs the same whether or not a pixel takes that "
+                       "branch.",
+                       "Nothing is skipped per pixel. To skip work for the whole frame, test a "
+                       "value that is the same for every pixel: a parameter, a literal, "
+                       "`iw`/`ih` or a loop counter (LANGUAGE.md §7.1).")
+        inner_loop, inner_fn = pp_loop or per_pixel, pp_fn or per_pixel
+        then_st = self._block(s.then_body, st.copy(), scope, loop, inner_loop, inner_fn)
+        else_st = (self._block(s.else_body, st.copy(), scope, loop, inner_loop, inner_fn)
+                   if s.else_body else st.copy())
+        out = then_st.copy()
+        out.join(else_st)
+        if per_pixel:
+            # The engine's merge: a name either branch assigns or declares is torch.where-d
+            # to the condition's shape when it held a value before the `if` or both branches
+            # define it; otherwise the one branch's value is kept as it is.
+            names = collect_assigned_vars(s.then_body)[0] | collect_assigned_vars(s.else_body)[0]
+            for name in names:
+                if name in st.defined or (name in then_st.defined and name in else_st.defined):
+                    self._set(out, name, True, strong=False)
+        return out
+
+    def _loop(self, s, st, scope, outer_loop, pp_fn):
+        A = self.A
+        is_for = type(s) is A.ForLoop
+        if is_for and s.init is not None:
+            st = self._stmt(s.init, st, scope, outer_loop, False, pp_fn)
+        head = st
+        while True:                               # the head state, to a fixed point
+            frame = _CFLoop()
+            if s.condition is not None:
+                self._expr(s.condition, head, scope)
+            body = self._block(s.body, head.copy(), scope, frame, False, pp_fn)
+            for c in frame.continues:
+                body.join(c)
+            if is_for and s.update is not None:
+                body = self._stmt(s.update, body, scope, frame, False, pp_fn)
+            nxt = head.copy()
+            nxt.join(body)
+            if nxt.same(head):
+                break
+            head = nxt
+        if s.condition is not None and self._varies(s.condition, head):
+            kw = "for" if is_for else "while"
+            self._warn("W7007", s,
+                       f"This `{kw}` loop's condition can differ from pixel to pixel. The loop "
+                       f"keeps running while ANY pixel's condition holds and its body is not "
+                       f"masked, so every pixel runs as many passes as the pixel that needs the "
+                       f"most, including pixels whose own condition is already false.",
+                       "Bound the loop by a value that is the same for every pixel and guard or "
+                       "weight the per-pixel work, e.g. `for (int i = 0; i < $max; i++) "
+                       "{ if (i < n) { ... } }` (LANGUAGE.md §7.1).")
+        out = head.copy()
+        for b in frame.breaks:
+            out.join(b)
+        return out
+
+
+def _is_string_type(t) -> bool:
+    name = getattr(t, "name", None) or getattr(t, "value", None) or t
+    return isinstance(name, str) and name.upper() == "STRING"
+
+
 def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp32",
             compile_mode: str = "auto") -> dict:
     """CACHE-3: warm the compile/codegen tiers for a set of programs so the first scrub after

@@ -1516,6 +1516,23 @@ def main():
     test_brief10_unsigned_frame_is_a_silent_miss(r)
     test_brief10_key_repair_spares_a_peers_republished_key(r)
 
+    # Per-pixel control flow (LANGUAGE.md §7.1): the rule pinned on both tiers, the doc text,
+    # and the opt-in W7006/W7007 advisories, which never reach check().
+    from test_v0351_control_flow import (
+        test_control_flow_per_pixel_condition_semantics_both_tiers,
+        test_control_flow_language_md_states_the_rule,
+        test_control_flow_w7006_marks_gathers_in_per_pixel_branches,
+        test_control_flow_w7007_marks_control_flow_on_every_pixel,
+        test_control_flow_advisories_spare_uniform_shapes,
+        test_control_flow_advisories_are_invisible_to_check,
+    )
+    test_control_flow_per_pixel_condition_semantics_both_tiers(r)
+    test_control_flow_language_md_states_the_rule(r)
+    test_control_flow_w7006_marks_gathers_in_per_pixel_branches(r)
+    test_control_flow_w7007_marks_control_flow_on_every_pixel(r)
+    test_control_flow_advisories_spare_uniform_shapes(r)
+    test_control_flow_advisories_are_invisible_to_check(r)
+
     success = r.summary()
     return 0 if success else 1
 

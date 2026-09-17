@@ -46,7 +46,10 @@ _FAMILIES = [
      "tool's stages and manifest; the message names the stage that broke."),
     ("W7", "Warnings", "Non-fatal advisories (LANG-2). The program still compiles and "
      "runs; these flag likely mistakes — an unused variable or wired input, or a name "
-     "that shadows a built-in or an outer-scope variable."),
+     "that shadows a built-in or an outer-scope variable. W7005, W7006 and W7007 come only "
+     "from analyses a host calls beside `check()` (`tex_api.color_advisories`: a gamma-space "
+     "blur; `tex_api.control_flow_advisories`: a per-pixel `if` or `?:` that gathers in a "
+     "branch, or control flow that acts on every pixel), never from the editor's live lint."),
 ]
 
 

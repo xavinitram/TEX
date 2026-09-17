@@ -147,7 +147,7 @@ PyTorch broadcasting automatically expands these to full `[B, H, W]` when combin
 
 ## Vectorized if/else
 
-TEX's `if/else` uses `torch.where()` for per-pixel branching. **Both branches execute fully** on all pixels:
+TEX's `if/else` uses `torch.where()` for per-pixel branching. **Both branches execute fully** on all pixels, unless the condition is a 0-dim tensor (literals, scalar params, `iw`/`ih`, the counter of a uniformly-bounded loop), which short-circuits to the taken branch:
 
 1. Saves current environment state
 2. Evaluates the condition -> boolean mask `[B, H, W]`
@@ -156,6 +156,8 @@ TEX's `if/else` uses `torch.where()` for per-pixel branching. **Both branches ex
 5. Merges results: `result = torch.where(condition, then_value, else_value)` per variable
 
 Side effects in branches (array assignments, etc.) are merged using the same `torch.where` pattern.
+
+A `break`, `continue` or `return` inside a branch raises past the merge, so it acts on every pixel and leaves that branch's assignments unmerged. `LANGUAGE.md` §7.1 states the rule for program authors; `tex_api.control_flow_advisories` (W7006/W7007) flags it, opt-in, never from `check()`.
 
 ## Loops
 

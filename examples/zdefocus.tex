@@ -39,7 +39,8 @@ float signed_coc = (depth - focus) * coc_scale;
 float coc = min(abs(signed_coc) * $max_blur, $max_blur);
 float is_foreground = step(signed_coc, 0.0);  // 1 if in front of focus
 
-// Skip blur for in-focus pixels (CoC < 0.5 pixel)
+// In-focus pixels (CoC < 0.5 pixel) keep the source. `coc` is per-pixel, so both
+// branches below run on every pixel and the blur is not skipped (LANGUAGE.md §7.1).
 if (coc < 0.5) {
     @OUT = @image;
 } else {

@@ -352,7 +352,7 @@ Tools. See the message shown with the code for the specific cause and fix; the c
 
 ## Warnings (`W7xxx`)
 
-Non-fatal advisories (LANG-2). The program still compiles and runs; these flag likely mistakes — an unused variable or wired input, or a name that shadows a built-in or an outer-scope variable.
+Non-fatal advisories (LANG-2). The program still compiles and runs; these flag likely mistakes — an unused variable or wired input, or a name that shadows a built-in or an outer-scope variable. W7005, W7006 and W7007 come only from analyses a host calls beside `check()` (`tex_api.color_advisories`: a gamma-space blur; `tex_api.control_flow_advisories`: a per-pixel `if` or `?:` that gathers in a branch, or control flow that acts on every pixel), never from the editor's live lint.
 
 ### W7001
 
@@ -371,5 +371,13 @@ Warnings. See the message shown with the code for the specific cause and fix; th
 Warnings. See the message shown with the code for the specific cause and fix; the class is described above.
 
 ### W7005
+
+Warnings. See the message shown with the code for the specific cause and fix; the class is described above.
+
+### W7006
+
+Warnings. See the message shown with the code for the specific cause and fix; the class is described above.
+
+### W7007
 
 Warnings. See the message shown with the code for the specific cause and fix; the class is described above.

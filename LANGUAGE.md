@@ -259,6 +259,40 @@ Operators, in decreasing precedence: postfix (`.`, `[]`, calls) · unary (`- !`)
 `* / %` · `+ -` · comparisons · `&& ||` · ternary `?:` · assignment. Loops are bounded
 (static ranges for `for`; a guard for `while`) so a cook always terminates.
 
+### 7.1 Uniform and per-pixel conditions
+
+A program runs on every pixel at once, so what a condition does depends on whether its value
+can differ from one pixel to the next.
+
+**Uniform** means one value for the whole cook: literals; scalar and string parameters
+(`$gain`, `i$count`, `s$mode`); the built-ins `iw ih px py fn ic PI TAU E frame fps time`; the
+counter of a loop whose bounds are themselves uniform; and arithmetic, comparisons and scalar
+math functions of those.
+
+**Per-pixel** means anything that reads an `@` input, `u v ix iy` or `fi`, or a variable
+computed from one, **including a reduction such as `img_min(@A)`**, which holds one value per
+frame and is still per-pixel here. A variable declared before a per-pixel `if` and assigned
+inside it is per-pixel after it. (A component of a vector parameter, `$tint.r`, is not promised
+either way: the backends disagree on it today.)
+
+* A uniform `if` runs only the branch it takes.
+* A per-pixel `if` runs **both** branches on every pixel and keeps each pixel's side, so a
+  branch costs the same whether a pixel takes it or not: putting a `sample`, a blur or a gather
+  loop behind a per-pixel `if` skips nothing.
+* Assume `?:` evaluates both operands.
+* `break`, `continue` and `return` under a per-pixel `if` act on **every** pixel. The first time
+  the loop or function reaches that `if`, they fire for all pixels whatever the condition says,
+  and the assignments before them in that branch land on every pixel too. To stop per pixel,
+  keep a flag the body tests, `if (found < 0 && hit) { found = i; }`, and let the loop run a
+  uniform bound.
+
+A host can ask for these as warnings with `tex_api.control_flow_advisories(source,
+binding_types)`: **W7006** marks a per-pixel `if` or `?:` with a gather (`sample`, `fetch`,
+`@A(u, v)`, a blur, a reduction) in a branch, and **W7007** marks control flow that acts on
+every pixel, meaning a `break`, `continue` or `return` under a per-pixel `if`, or a loop whose
+condition is per-pixel. They are opt-in: `tex_api.check()`, and so the editor's live lint,
+never reports them.
+
 ---
 
 ## 8. See also
