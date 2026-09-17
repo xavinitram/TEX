@@ -556,7 +556,7 @@ def test_t9_gate_is_never_reached_on_an_unpressured_cook(r: SubTestResult):
 # ── T8: the pragma sunset, per clause ───────────────────────────────────────
 
 def test_t8_pragma_sunsets_the_loop_clause_only(r: SubTestResult):
-    print("\n--- T8: language 0.25 retires clauses (a)/(b), never clause (c) ---")
+    print("\n--- T8: masked flow retires clauses (a)/(b), never clause (c) ---")
     try:
         assert tex_roi.MASKED_FLOW_SINCE == (0, 25)
         r.ok("MASKED_FLOW_SINCE is the single (0, 25) constant")
@@ -564,14 +564,50 @@ def test_t8_pragma_sunsets_the_loop_clause_only(r: SubTestResult):
         r.fail("T8 constant", f"{type(e).__name__}: {e}")
 
     masked = "//!tex 0.25\n" + REPRO
+
+    # A pragma is a REQUEST, not a capability. One naming a language newer than the engine
+    # implements does not block (it is advisory only), so the program still cooks under the
+    # rules this engine actually has — and must therefore keep the gate. Asserted against the
+    # real `LANGUAGE_VERSION` rather than a hardcoded string, so the row documents the
+    # coupling instead of quietly going vacuous when that constant moves.
     try:
-        assert tex_roi.region_dependent(_parse(masked), code=masked) is False, \
-            "a program declaring the masked-flow language is still declined"
-        assert tex_roi.roi_plan(masked, {}).executable is True, \
-            "roi_plan still refuses a masked-flow program"
-        r.ok("`//!tex 0.25` retires the loop clause and the window is executable again")
+        assert tex_api._ver_tuple(tex_api.LANGUAGE_VERSION) < tex_roi.MASKED_FLOW_SINCE, \
+            (f"this row only means something while the engine "
+             f"({tex_api.LANGUAGE_VERSION}) predates masked flow")
+        assert tex_roi.region_dependent(_parse(masked), code=masked) is True, \
+            "a pragma the engine does not implement must not retire the loop clause"
+        assert tex_roi.roi_plan(masked, {}).executable is False, \
+            "roi_plan opened a window for a program the engine still cooks under old rules"
+        r.ok(f"engine at {tex_api.LANGUAGE_VERSION}: `//!tex 0.25` alone retires nothing")
     except Exception as e:
-        r.fail("T8 sunset", f"{type(e).__name__}: {e}")
+        r.fail("T8 a pragma alone does not sunset", f"{type(e).__name__}: {e}")
+
+    # …and the day `LANGUAGE_VERSION` reaches masked flow, the sunset starts working exactly
+    # as designed, with no further edit here.
+    _real_version = tex_api.LANGUAGE_VERSION
+    try:
+        tex_api.LANGUAGE_VERSION = "0.25"
+        tex_roi.clear_roi_memo()
+        assert tex_roi.region_dependent(_parse(masked), code=masked) is False, \
+            "engine and program both at masked flow: clauses (a)/(b) must retire"
+        assert tex_roi.roi_plan(masked, {}).executable is True, \
+            "roi_plan still refuses a program both halves agree is pointwise"
+        r.ok("engine at 0.25: the sunset fires, with no second migration")
+
+        assert tex_roi.region_dependent(_parse(REPRO), code=REPRO) is True, \
+            "a 0.25 engine must not retire the clause for a program that asked for 0.23"
+        r.ok("engine at 0.25, no pragma: still declined (the program did not ask)")
+
+        masked_string_both = "//!tex 0.25\n" + STRING_REPRO
+        assert tex_roi.region_dependent(_parse(masked_string_both),
+                                        code=masked_string_both) is True, \
+            "clause (c) must NOT sunset: masked flow keeps the majority vote verbatim"
+        r.ok("clause (c) survives both halves, which is why the gate is per-clause")
+    except Exception as e:
+        r.fail("T8 sunset once the engine implements it", f"{type(e).__name__}: {e}")
+    finally:
+        tex_api.LANGUAGE_VERSION = _real_version
+        tex_roi.clear_roi_memo()
 
     for label, src in (("an older pragma", "//!tex 0.24\n" + REPRO),
                        ("no pragma", REPRO),

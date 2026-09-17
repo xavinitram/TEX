@@ -354,19 +354,30 @@ def _mark_whole(reads: dict, img_node, gather_node, state: dict) -> None:
 # flow-sensitive, user-function-aware analysis that already backs the W7007 advisory a host
 # reads; a second definition of "per-pixel" would drift against it.
 
-#: The language version at which loops become pointwise (masked per-pixel control flow). From
-#: then on clauses (a)/(b) are moot — a split equals the whole frame — but clause (c) is NOT,
-#: because the majority-vote string merge is kept verbatim. Hence a PER-CLAUSE gate.
+#: The language version at which loops become pointwise (masked per-pixel control flow). Once
+#: the engine IMPLEMENTS that level and a program asks for it, clauses (a)/(b) are moot — a
+#: split equals the whole frame — but clause (c) is NOT, because the majority-vote string merge
+#: is kept verbatim. Hence a PER-CLAUSE gate.
 MASKED_FLOW_SINCE = (0, 25)
 
 
 def _language_tuple(program, code) -> tuple:
-    """The language level this program targets, as `(major, minor)`. Reads a parser-set
-    `Program.language` when one exists and falls back to the source pragma, so the day the
-    parser carries the field no call site here has to move."""
+    """The language level this program is actually COOKED under, as `(major, minor)`:
+    `min(what it asks for, what the engine implements)`.
+
+    A `//!tex X.Y` pragma is a REQUEST, not a capability. Declaring a level newer than the
+    engine implements does not block the compile — it only raises an advisory — so such a
+    program still runs under the rules this engine has, which is what the sunset above has to
+    key on. Taking the minimum means the gate stays fully on for every program until
+    `LANGUAGE_VERSION` itself reaches masked flow, and from that release onwards the sunset
+    applies by itself, with nothing here to edit.
+
+    Reads a parser-set `Program.language` when one exists and falls back to the source pragma,
+    so the day the parser carries the field no call site here has to move."""
     from . import tex_api
     lang = getattr(program, "language", None) or tex_api.language_pragma(code or "")
-    return tex_api._ver_tuple(lang) if lang else (0, 0)
+    asked = tex_api._ver_tuple(lang) if lang else (0, 0)
+    return min(asked, tex_api._ver_tuple(tex_api.LANGUAGE_VERSION))
 
 
 def region_dependent(program, binding_types=None, code=None) -> bool:

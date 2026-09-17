@@ -39,10 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "this changes how your cook is scheduled". Like `W7005`–`W7007` it is never emitted by
   `check()`, so the editor's live lint and `tex_lsp` are untouched.
 - `tex_roi.region_dependent(program, binding_types=None, code=None)` and its per-fingerprint
-  memo, for a host that wants the same verdict before choosing how to cook. A program
-  declaring `//!tex 0.25` or newer retires the loop clause (masked per-pixel control flow
-  makes a split equal the whole frame); the string clause is kept, because that rule does not
-  change.
+  memo, for a host that wants the same verdict before choosing how to cook. The loop clause
+  retires once a program declares `//!tex 0.25` or newer **and** `tex_api.LANGUAGE_VERSION`
+  has reached that level — masked per-pixel control flow makes a split equal the whole frame,
+  but only when the engine actually implements it, and a pragma ahead of the engine is only a
+  request. At `0.23` that means every program is still gated. The string clause is kept either
+  way, because that rule does not change.
 
 ## [0.35.3] - 2026-09-17
 
