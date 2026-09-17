@@ -681,7 +681,7 @@ def _run_default(ctx: ExecContext):
     # (peak transient ~1/n). Falls back to the whole-image cook on any strip error.
     n_strips = (_tile_plan(ctx.program, ctx.bindings, ctx.device, ctx.latent_channel_count,
                            2 if ctx.eff_precision == "fp16" else 4, ctx.fp,
-                           free_hint=ctx.free_hint)
+                           free_hint=ctx.free_hint, code=ctx.code)
                 if not ctx.fused_chain else None)
     if n_strips:
         try:
@@ -785,7 +785,8 @@ def _fp16_finiteness_net(raw_output, auto_fp16, ctx, tier_id, auto_ckey=None):
 def _tile_plan(program, bindings: dict[str, Any], device,
                latent_channel_count: int = 0, dtype_bytes: int = 4,
                fingerprint: str | None = None,
-               free_hint: float | None = None) -> int | None:
+               free_hint: float | None = None,
+               code: str | None = None) -> int | None:
     """M-4: strip count if the cook should be tiled (tile-safe + under memory
     pressure), else None. cuda only; needs the host's free-memory query.
     MEM-3: dtype_bytes=2 in fp16 mode halves the peak estimate (a fp16 cook that
@@ -803,7 +804,10 @@ def _tile_plan(program, bindings: dict[str, Any], device,
     resolves, so it passes 4; here, post-resolution, an auto->fp16 cook passes 2 — reusing
     the preflight's number would hand this function a 2x-inflated peak and over-tile
     exactly the cooks `auto` accepted (measured 67108864 vs 33554432 at 2048²). It is also
-    only ~6% of the cost."""
+    only ~6% of the cost.
+
+    TRK-25: `code` is the raw source, carried only so the region-dependence gate at the end
+    can see a `//!tex X.Y` pragma; `None` means "no pragma visible", the conservative read."""
     if not str(device).startswith("cuda"):
         return None  # host.get_free_memory returns None off a host → no tiling
     # M-4 safety: never tile a LATENT ([B,C,H,W] — dim 1 is channels, not
@@ -837,7 +841,16 @@ def _tile_plan(program, bindings: dict[str, Any], device,
         n = math.ceil(est / budget)
         max_strips = max(1, spatial[1] // 64)  # ≥64-row strip floor
         n = min(n, max_strips)
-        return n if n >= 2 else None
+        if n < 2:
+            return None
+        # TRK-25, and deliberately the LAST question this function asks: a region-dependent
+        # program computes something different in a strip than whole-frame, so whole-frame-or-
+        # OOM is the correct answer and a wrong picture is not. Asking it HERE rather than
+        # beside `is_tile_safe_cached` is invariant 7 — an unpressured cook never gets here.
+        from . import tex_roi
+        if tex_roi.region_dependent_cached(program, fingerprint, code=code):
+            return None
+        return n
     except Exception:
         return None
 
@@ -928,7 +941,14 @@ def _halo_tile_plan(program, code, bindings, device, latent_channel_count, dtype
         if free and est > 0 and est > 0.25 * free:
             n_mem = math.ceil(est / (0.25 * free))
         n = min(max(n_mem, tdr_floor), max_strips)
-        return (n, plan.narrow, halo) if n >= 2 else None
+        if n < 2:
+            return None
+        # TRK-25, at the same late point `_tile_plan` uses. `roi_plan` above already refuses a
+        # region-dependent program; this is the planner saying so in its own voice, because the
+        # halo route is the one `is_tile_safe` does NOT close.
+        if tex_roi.region_dependent_cached(program, fingerprint, code=code):
+            return None
+        return (n, plan.narrow, halo)
     except Exception:
         return None
 
@@ -1432,14 +1452,18 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
         if n_strips < 2:
             return None
         _cancel_check(ctx.cancel)   # SCHED-3 yield E: don't start a tiled OOM re-cook if abandoned
-        if is_tile_safe_cached(ctx.program, ctx.fp):
+        from . import tex_roi
+        # TRK-25: a region-dependent program falls through both rungs (the halo rung below is
+        # closed by `roi_plan`) and the original OOM propagates unwrapped, so the host's own
+        # handling takes its turn. A recovered-but-WRONG picture is what must not happen.
+        if (is_tile_safe_cached(ctx.program, ctx.fp)
+                and not tex_roi.region_dependent_cached(ctx.program, ctx.fp, code=ctx.code)):
             logger.warning("[TEX] retrying the cook in %d strips.", n_strips)
             return run_tiled(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
                              ctx.device, ctx.latent_channel_count, ctx.output_names,
                              ctx.used_builtins, ctx.eff_precision, n_strips, ctx.time_context,
                              cancel=ctx.cancel, on_progress=ctx.on_progress)
         # ROI-5: not pixel-local, but a bounded blur/morphology can still HALO-tile out of an OOM.
-        from . import tex_roi
         rplan = tex_roi.roi_plan(ctx.code, _scalar_params(ctx.bindings))
         if (rplan.executable and rplan.halo > 0 and rplan.narrow
                 and shared_tile_width(ctx.bindings) is not None):

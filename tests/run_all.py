@@ -1684,6 +1684,8 @@ def main():
         test_t5_halo_strip_route_is_declined,
         test_t4_batch_strips_are_declined,
         test_t6_string_merge_is_region_dependent,
+        test_t2_strip_planner_declines,
+        test_t9_gate_is_never_reached_on_an_unpressured_cook,
     )
     test_t1_repro_is_region_dependent(r)
     test_t7_predicate_is_not_a_blanket_disable(r)
@@ -1693,6 +1695,8 @@ def main():
     test_t5_halo_strip_route_is_declined(r)
     test_t4_batch_strips_are_declined(r)
     test_t6_string_merge_is_region_dependent(r)
+    test_t2_strip_planner_declines(r)
+    test_t9_gate_is_never_reached_on_an_unpressured_cook(r)
 
     success = r.summary()
     return 0 if success else 1

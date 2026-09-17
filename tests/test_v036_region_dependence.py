@@ -445,3 +445,104 @@ def test_t6_string_merge_is_region_dependent(r: SubTestResult):
         r.ok('characterization: whole frame votes "hi", two strips vote "lo"')
     except Exception as e:
         r.fail("T6 characterization", f"{type(e).__name__}: {e}")
+
+
+# ── T2 / T9: the strip planner, and where the gate SITS ─────────────────────
+
+# A uniform twin of the repro: the same shape of loop, bounded by a literal instead of `v`.
+UNIFORM_TWIN = ("float n = 0.0;\n"
+                "for (int i = 0; i < 4; i = i + 1) { n = n + 1.0; }\n"
+                "@OUT = vec4(n,n,n,1.0);\n")
+
+
+def _tile_plan_for(src, *, free_hint, device="cuda", fingerprint=None, shape=(1, 256, 256)):
+    """Drive `_tile_plan` without a GPU: the device is a STRING the planner only compares, and
+    `free_hint` is the free-VRAM reading it would otherwise buy from the host, so a low hint is
+    memory pressure and a huge one is none."""
+    from TEX_Wrangle import tex_engine
+    bindings = {"A": _img(*shape)}
+    prog = tex_api.compile(src, {"A": TEXType.VEC4})
+    return tex_engine._tile_plan(prog.ast, bindings, device, 0, 4, fingerprint,
+                                 free_hint=free_hint, code=src)
+
+
+def test_t2_strip_planner_declines(r: SubTestResult):
+    print("\n--- T2: _tile_plan under pressure ---")
+    try:
+        n = _tile_plan_for(UNIFORM_TWIN, free_hint=1024.0)
+        assert isinstance(n, int) and n >= 2, (
+            "the harness never reached the gate — a uniform program under pressure must still "
+            f"get a strip count, got {n!r}")
+        r.ok(f"a uniform-loop twin under pressure still strips ({n} strips)")
+    except Exception as e:
+        r.fail("T2 uniform twin", f"{type(e).__name__}: {e}")
+
+    try:
+        assert _tile_plan_for(REPRO, free_hint=1024.0) is None, \
+            "_tile_plan still strips a region-dependent program under pressure"
+        r.ok("_tile_plan(repro) under pressure is None — the cook runs whole-frame or OOMs")
+    except Exception as e:
+        r.fail("T2 repro", f"{type(e).__name__}: {e}")
+
+
+def test_t9_gate_is_never_reached_on_an_unpressured_cook(r: SubTestResult):
+    print("\n--- T9: placement (structural, never timed) ---")
+    from TEX_Wrangle.tex_runtime import compiled
+    calls = []
+    real = tex_roi.region_dependent
+
+    def counting(program, binding_types=None, code=None):
+        calls.append(code)
+        return real(program, binding_types, code)
+
+    tex_roi.region_dependent = counting
+    try:
+        tex_roi._region_dep_memo.clear()
+        try:
+            _tile_plan_for(REPRO, free_hint=1024.0, device="cpu")
+            assert calls == [], f"a CPU cook consulted the predicate {len(calls)} time(s)"
+            r.ok("a CPU cook never reaches the gate (0 calls)")
+        except Exception as e:
+            r.fail("T9 cpu", f"{type(e).__name__}: {e}")
+
+        calls.clear()
+        try:
+            assert _tile_plan_for(REPRO, free_hint=1e13) is None, "the cook should be unpressured"
+            assert calls == [], f"an unpressured cook consulted the predicate {len(calls)} time(s)"
+            r.ok("an unpressured CUDA-shaped cook never reaches the gate (0 calls)")
+        except Exception as e:
+            r.fail("T9 unpressured", f"{type(e).__name__}: {e}")
+
+        calls.clear()
+        try:
+            fp = "trk25-t9-fingerprint"
+            assert _tile_plan_for(REPRO, free_hint=1024.0, fingerprint=fp) is None
+            assert len(calls) == 1, f"expected one walk, got {len(calls)}"
+            assert _tile_plan_for(REPRO, free_hint=1024.0, fingerprint=fp) is None
+            assert len(calls) == 1, "the second pressured cook re-walked instead of using the memo"
+            r.ok("a pressured cook walks once and is served from the memo thereafter")
+        except Exception as e:
+            r.fail("T9 pressured + memo", f"{type(e).__name__}: {e}")
+    finally:
+        tex_roi.region_dependent = real
+
+    try:
+        tex_roi._region_dep_memo.clear()
+        program = _parse(UNIFORM_TWIN)
+        for i in range(tex_roi._REGION_DEP_MEMO_MAX + 40):
+            tex_roi.region_dependent_cached(program, f"trk25-cap-{i}", code=UNIFORM_TWIN)
+        assert len(tex_roi._region_dep_memo) <= tex_roi._REGION_DEP_MEMO_MAX, \
+            f"memo grew past its cap: {len(tex_roi._region_dep_memo)}"
+        assert "trk25-cap-0" not in tex_roi._region_dep_memo, "the LRU never evicted"
+        r.ok(f"the memo caps at {tex_roi._REGION_DEP_MEMO_MAX} and evicts least-recently-used")
+    except Exception as e:
+        r.fail("T9 memo cap", f"{type(e).__name__}: {e}")
+
+    try:
+        tex_roi.region_dependent_cached(_parse(REPRO), "trk25-clear", code=REPRO)
+        assert "trk25-clear" in tex_roi._region_dep_memo
+        compiled.clear_compiled_cache()
+        assert len(tex_roi._region_dep_memo) == 0, "the memo survived the test-isolation reset"
+        r.ok("compiled.clear_compiled_cache() clears the memo, beside _tile_safe_memo")
+    except Exception as e:
+        r.fail("T9 memo clear", f"{type(e).__name__}: {e}")
