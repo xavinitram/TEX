@@ -1551,6 +1551,26 @@ def main():
     test_control_flow_recursive_pattern_matches_a_per_pixel_reference(r)
     test_control_flow_fixed_examples_keep_their_surface(r)
 
+    # TRK-24: a negative literal `$param` default (`f$k=-0.3;`) was silently dropped to
+    # None by the type checker's default-extraction chain; the JS widget builder already
+    # read it from source text independently, so only bare cook()/CLI/API callers saw it.
+    from test_trk24_negative_param_defaults import (
+        test_negative_literal_defaults_recorded,
+        test_positive_defaults_unchanged,
+        test_unary_op_ast_shape_matches_assumption,
+        test_shipped_examples_declared_defaults,
+        test_bare_cook_omitted_negative_param_uses_default,
+        test_bare_cook_omitted_param_matches_explicit_default,
+        test_tex_node_widget_defaults_unchanged,
+    )
+    test_negative_literal_defaults_recorded(r)
+    test_positive_defaults_unchanged(r)
+    test_unary_op_ast_shape_matches_assumption(r)
+    test_shipped_examples_declared_defaults(r)
+    test_bare_cook_omitted_negative_param_uses_default(r)
+    test_bare_cook_omitted_param_matches_explicit_default(r)
+    test_tex_node_widget_defaults_unchanged(r)
+
     success = r.summary()
     return 0 if success else 1
 

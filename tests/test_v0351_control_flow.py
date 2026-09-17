@@ -874,11 +874,12 @@ _EXAMPLE_SURFACE = {
                        {"tolerance": 0.0001, "max_iter": 20}, {"image"}),
     "vector_blur.tex": ("// Vector Blur — directional per-pixel motion blur driven by a vector map",
                         {"strength": 20.0, "max_samples": 32}, {"image", "vectors"}),
-    # `center_x`'s default reads None because a NEGATIVE literal default is not recorded by
-    # the type checker (`f$center_x = -0.5;`) — true at the base too, so this row pins the
-    # surface as UNCHANGED by the fix, not as correct.
+    # TRK-24: `center_x`'s default (`f$center_x = -0.5;`) now reads -0.5, not None — the
+    # type checker's default-extraction chain previously had no branch for a negative
+    # literal (UnaryOp('-') over a NumberLiteral) and silently dropped it. This is the
+    # corrected surface, not the pre-fix one this row used to pin.
     "recursive_pattern.tex": ("// Mandelbrot Fractal — escape-time fractal with cosine palette",
-                              {"zoom_level": 1.0, "center_x": None, "center_y": 0.0,
+                              {"zoom_level": 1.0, "center_x": -0.5, "center_y": 0.0,
                                "iterations": 50}, set()),
 }
 

@@ -575,6 +575,15 @@ class TypeChecker:
                     if node.default_expr.is_int
                     else node.default_expr.value
                 )
+            elif (isinstance(node.default_expr, UnaryOp) and node.default_expr.op == "-"
+                    and isinstance(node.default_expr.operand, NumberLiteral)):
+                # TRK-24: `f$k=-0.3;` parses as UnaryOp('-', NumberLiteral), which no
+                # earlier branch matched, so a negative literal default silently stayed
+                # None. Same fold the optimizer already does for VarDecl initializers
+                # (optimizer._const_literal_value, P2-UC4-NEG) — mirrored here rather than
+                # imported, since this runs before the optimizer pass exists.
+                lit = node.default_expr.operand
+                default_value = -int(lit.value) if lit.is_int else -lit.value
             elif isinstance(node.default_expr, StringLiteral):
                 default_value = node.default_expr.value
             elif isinstance(node.default_expr, VecConstructor):
