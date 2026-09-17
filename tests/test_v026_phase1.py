@@ -444,31 +444,40 @@ def test_tool_schema_rejects(r: SubTestResult):
 # existed, then re-checked (git stash) to read identically after -- none of the manifests
 # below uses any of the three, so a change to to_dict()/tool_summary()/write_tool's shape
 # for an OLD manifest, or a new key leaking into one, turns one of these red.
+#
+# `written_bytes` is LINE-ENDING-NORMALISED (CRLF -> LF before hashing), and so is every
+# `written_bytes` pin in this file. write_tool writes its JSON through a TEXT-mode handle, so
+# it emits the platform's newline: CRLF on Windows, LF everywhere else. Hashing the raw bytes
+# pinned one platform's newline convention rather than the manifest, and the same unchanged
+# tool read as drifted on Linux. Normalising loses nothing the pin is for: json.dump escapes
+# any CR or LF inside a string value, so the only CRLFs in the file are the ones the handle
+# wrote between lines, and every other byte (key order, indentation, separators, UTF-8
+# content, the trailing newline or its absence) is still pinned exactly.
 _MANIFEST_BASELINE_SHA256 = {
     "blur.textool": {
         "to_dict": "cc8d30cbf3d31a33dd7bb684dcae94561b4da9827fd459b4fd91c5f812135da4",
         "tool_summary": "37497076f938e2b7086c86f5f807d4658a8388594fbf06bd18bf8c999c22ca1b",
-        "written_bytes": "95b51de7cd8cbc4a4649a6a6d6376f1547e12732364924fe78752db11c97b58d",
+        "written_bytes": "e7ffcbc8017bcb6c409d4958ffe85ac995df8e16d6c7f90999cc800be20d5507",
     },
     "grade.textool": {
         "to_dict": "108748f0c2c3ceb926551a9188a4cc50096756f000ea098900a78f4a1733b07e",
         "tool_summary": "040db66ad91572cfe1d2557a02f7260fb0a45af714864fbb9599a45987573802",
-        "written_bytes": "b97b27698ae0302df5c32c5ca7ae9eb5f2876cf8651fde490acc63e7769294c5",
+        "written_bytes": "0ea64dc0227e4489a6eb5f67f811f452ee664750ffed3b616b0aa0158b2f48bd",
     },
     "grade_vignette.textool": {
         "to_dict": "cfd407ab512b35d0fdca53b1cd0fb29f31a487699210910c182e44d756a4f9db",
         "tool_summary": "783d1a2d1afa0cca7ac2937c4ded691beff331174ce95b155327e72616c3dc5e",
-        "written_bytes": "9e79d47a2649a8dbae156e11556ac4e801120815ff697323baf73657c70578b5",
+        "written_bytes": "d23dd4d7065b5ede02fb441faeaee46d3dcbd2144d1ad6a29bd7318e34b89ea6",
     },
     "merge.textool": {
         "to_dict": "52ebde0e7eda07b52b4c9fcec17820a525d24923208ab7666f795aff1879331d",
         "tool_summary": "f7e68d2ca334ac03e60d46b3f7096c562f7dfc2ded7f9a369219b1b1d5b261b0",
-        "written_bytes": "c7c2a23ee500571a38899dc08639d2322922fb8d26e3b7c84f17743c07381480",
+        "written_bytes": "a86aba76b00e2acc9efc148aa6cdba87ae8c5d27bf60b2894e6019a61e07f3d4",
     },
     "vignette.textool": {
         "to_dict": "74a8b0b0b8660dbee20989f3614a7294fb46e2fd9762517ee1a43a2c53430f34",
         "tool_summary": "11f9fb5e822646fd0e37d6352b2e7ffe4f871e9d300318864b26ea9694bab3f7",
-        "written_bytes": "a5f220a36ae92d331059e2f62a71b4419030597a48250644c923c188921258ba",
+        "written_bytes": "c69ab8e7746fdbcc3fe4ed8b8e5b1d09f653473d82d326d0ed00d65e4a6e4692",
     },
 }
 # Two representative pre-existing manifest shapes (single-stage / fused) -- neither uses any
@@ -480,7 +489,7 @@ _OLD_SINGLE_MANIFEST = {"manifest_schema": 1, "name": "OldSingle", "tex_language
                           "metadata": {"min": 0.0, "max": 4.0, "label": "Scale"}}]}
 _OLD_SINGLE_SHA256 = {"to_dict": "5b45f25b610e7d2721aafeb64de0845a2ce5c685fa0da07a4c100756c137a6aa",
                       "tool_summary": "87b30e1509b63f22b4706dfe3fa628d5ff6b5ce2c1933b37a50b3f4a879a8df6",
-                      "written_bytes": "64a534c2cc060790afa6f7fbf8568410d2c047bf47a8f436a1b77fa84317a38f"}
+                      "written_bytes": "452eafa6871f6391d5cde7374e3bf972e142be586a648c2be3fa041d3df294e6"}
 _OLD_FUSED_MANIFEST = {"manifest_schema": 1, "name": "OldFused", "tex_language": "0.23",
     "graphspec": {"schema": 1, "stages": [{"code": "@OUT=@image;", "image_input": "image",
                   "params": {}}], "terminal_image_input": "image"},
@@ -488,12 +497,13 @@ _OLD_FUSED_MANIFEST = {"manifest_schema": 1, "name": "OldFused", "tex_language":
     "inputs": [{"name": "image", "type": "IMAGE"}], "promoted_params": []}
 _OLD_FUSED_SHA256 = {"to_dict": "664492abe15a48683a08ac5fa44d107eec568ab5aacff8a81a02b0396935ebc9",
                      "tool_summary": "492d0a579d93a0e332c4b949085fe53dac96db0e67855d0f39c3705eecb21653",
-                     "written_bytes": "5f1214ae947b73c70ca3e190fd4448ad80c094761d7b85f8e483a4125b024340"}
+                     "written_bytes": "4c64f7ec2e5eb8ec83c39da2a42a7b625c4cbf1388ecf7f160aa24dec8c1353f"}
 
 
 def _hash_manifest(m) -> dict:
-    """sha256 of to_dict()/tool_summary() (canonical JSON) + the exact bytes write_tool
-    writes -- one comparable fingerprint per serialisation path a host might rely on."""
+    """sha256 of to_dict()/tool_summary() (canonical JSON) + the bytes write_tool writes, with
+    its platform newlines normalised to LF -- one comparable fingerprint per serialisation path
+    a host might rely on, identical on every OS (see the note above _MANIFEST_BASELINE_SHA256)."""
     d = m.to_dict()
     s = tex_tool.tool_summary(m)
     path = tex_tool.write_tool(m, tempfile.mkdtemp())
@@ -502,7 +512,7 @@ def _hash_manifest(m) -> dict:
     return {
         "to_dict": hashlib.sha256(json.dumps(d, sort_keys=True).encode("utf-8")).hexdigest(),
         "tool_summary": hashlib.sha256(json.dumps(s, sort_keys=True).encode("utf-8")).hexdigest(),
-        "written_bytes": hashlib.sha256(written).hexdigest(),
+        "written_bytes": hashlib.sha256(written.replace(b"\r\n", b"\n")).hexdigest(),
     }
 
 
@@ -1084,7 +1094,9 @@ def test_tool_fused_feeds_rekey(r: SubTestResult):
 # tooltip/options/optional manifests of the two tests above; the stock and OLD_* ones are already
 # pinned by test_tool_manifest_byte_identity). The cook half is pinned structurally, which holds on
 # any box and torch build: cook_tool must hand tex_engine.cook exactly the call rebuilt below from the
-# manifest alone, and the warm keys must be the ones that call derives.
+# manifest alone, and the warm keys must be the ones that call derives. Their `written_bytes` pins are
+# line-ending-normalised like every other in this file, because write_tool writes platform newlines
+# (the note above _MANIFEST_BASELINE_SHA256).
 _UI_HINT_MANIFESTS = {
     "tooltip": {"manifest_schema": 1, "name": "X", "tex_language": "0.23", "code": "@OUT = @image;",
                 "inputs": [{"name": "image", "type": "IMAGE"}],
@@ -1114,25 +1126,25 @@ _UI_HINT_MANIFESTS = {
 _UI_HINT_SHA256 = {
     "tooltip": {"to_dict": "bc570315648b166935b1034274446ce353feca89f5f100fddb35f8ef813da8c8",
                 "tool_summary": "fbae9d162ccfe05e69af0dd859d4cefdf173551877483fa72e92683d37b1a82d",
-                "written_bytes": "b3f05fa8678714992bcbf0f89d44a2e9d13045abd15e27cbb115f8d112e77274"},
+                "written_bytes": "8bbb7bbc75dd36045363ddc489d2b292ad2df9bbfc1cbf0257ada4946252caee"},
     "options": {"to_dict": "d041ce56b282871a57f0cf459eb3687c58f6f9a5effc98b4d7e676dd9891391f",
                 "tool_summary": "6c59de31d3b8ad9698686d1a31ba138ae289de1793e9ee62cc9db2c601079856",
-                "written_bytes": "27d322a9a2e4010bf15ab4b60586f257ca37484f4a3719bb1c0dda1d87662caa"},
+                "written_bytes": "9331d4a1262bbae43bc24a569ee5a9b9a9f22f188e4fa029951c7f0b676dfefc"},
     "combo11": {"to_dict": "49b635301b1dac97006d106a4fc7cb119c19c987e158f067ce8f649ada5d421a",
                 "tool_summary": "4084060ebd9d7cd17727136806ece595d1c29fad2dcd957b848ebd73e2bdbb03",
-                "written_bytes": "3a77b0532d1b9494eaedfd75fd8246037caba3f2f0a075e8b7e7cf0ffb59fdcd"},
+                "written_bytes": "1642c9c917019f1b5129c14afe9cf3733964a67e645f5275e4b97210c8167954"},
     "optional_true": {"to_dict": "63326c39f4ede45973f8fcb87ed221333e4fba63de458ef4ea87284819a14ac6",
                       "tool_summary": "022f80701d34331bcd2a964d3c04bc21cbd37288faebfd8b6ae53f224d52af7c",
-                      "written_bytes": "c3431775ec1b5ec1b5ea16ab4ab97f0aa1e9ecad3b48edfa85293d045499ae3b"},
+                      "written_bytes": "d644060b022edfd7abcd345a8774c0a807917616c61d2735d7df5a18880f3e37"},
     "optional_false": {"to_dict": "195accf2b5051013b68fa2e9ec7f6ecd8a8e74ef95d2be20f38cac680fa0e368",
                        "tool_summary": "e6c3a352aeaa9d0c296c35190fe46d2585a556f4259280f3658452f6145611da",
-                       "written_bytes": "d79c3321ed718f471057f7fcfd4fedcb5cbf49dcf8b12c43905c0f05fc3b0ef9"},
+                       "written_bytes": "d9f96cb0b51ab2a8bca666627d71d74deca04d29064ba78ca9af2690e40ae646"},
     "optional_absent": {"to_dict": "dc9560cc17e09179f1e9b74b19153aefbecc81f4cb4d7436fd08ad3148d8e305",
                         "tool_summary": "3afc2bc05a5b4bba5a0e4a67a3e7c204c924171a6c525c2891e134c08b065d41",
-                        "written_bytes": "ae8ed80be5340365330e88849d7a3efb8037c0ba3c042c57f23b2881746514c5"},
+                        "written_bytes": "6c5581dc54737ea4185414f5ff0ad76d0bc5b1b03ba09ace6cedc5a7b6cfc1b3"},
     "extent_dropped": {"to_dict": "dc9560cc17e09179f1e9b74b19153aefbecc81f4cb4d7436fd08ad3148d8e305",
                        "tool_summary": "3afc2bc05a5b4bba5a0e4a67a3e7c204c924171a6c525c2891e134c08b065d41",
-                       "written_bytes": "ae8ed80be5340365330e88849d7a3efb8037c0ba3c042c57f23b2881746514c5"},
+                       "written_bytes": "6c5581dc54737ea4185414f5ff0ad76d0bc5b1b03ba09ace6cedc5a7b6cfc1b3"},
 }
 
 
