@@ -12,6 +12,7 @@ inspect `param_declarations` directly. Both tiers see the SAME `param_declaratio
 dict (produced once, by the type checker, ahead of either tier), so there is no
 interp/codegen divergence to test here (invariant #2 doesn't apply to this surface).
 """
+import ast
 from pathlib import Path
 
 from helpers import *
@@ -140,13 +141,63 @@ def test_bare_cook_omitted_param_matches_explicit_default(r: SubTestResult):
         r.fail("omitted param matches explicit default", f"{e}\n{traceback.format_exc()}")
 
 
+def _ast_widget_defaults(source_path: Path) -> dict:
+    """Pull each widget's literal `default=` kwarg straight out of `define_schema()`'s
+    `IO.*.Input(name, ..., default=...)` calls by parsing the source with `ast` —
+    no `comfy_api` import needed, since these are plain literals in the source text.
+    Same spirit as `js/tex_extension.js`'s `PARAM_DECL_RE`, which reads a $param's
+    default from raw source text independently of any runtime object."""
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    defaults = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "Input" and node.args
+                 and isinstance(node.args[0], ast.Constant)
+                 and isinstance(node.args[0].value, str)):
+            continue
+        name = node.args[0].value
+        for kw in node.keywords:
+            if kw.arg == "default":
+                try:
+                    defaults[name] = ast.literal_eval(kw.value)
+                except ValueError:
+                    pass
+    return defaults
+
+
 def test_tex_node_widget_defaults_unchanged(r: SubTestResult):
     """`tex_node.py` owns no per-$param widget defaults at all (those are built by
     `js/tex_extension.js` from raw source text, independently of the type checker —
     the whole reason this fix is invisible). What it DOES own is the fixed static
     schema (code/device/compile_mode/precision/debug_nan_highlight); pin those so this
-    type-checker-only change is confirmed not to have touched them."""
+    type-checker-only change is confirmed not to have touched them.
+
+    `define_schema()` is a v3-API (`comfy_api`) surface: `tex_node.IO` is None and
+    `TEXWrangleNode.define_schema` cannot be called at all when comfy_api is not on
+    the path (CI's lane: no ComfyUI, per invariant... this file has no v1
+    `INPUT_TYPES()` fallback to fall back to). So the defaults are pinned two ways:
+    an AST read of the literal `default=` kwargs in the source (works with or without
+    comfy_api — this is what actually protects the test's purpose everywhere), plus
+    a live `define_schema()` call against the real schema object when `_V3_AVAILABLE`
+    (extra confirmation on the comfy+CUDA lane that the live object matches the source)."""
     print("\n--- TRK-24: tex_node.py static widget defaults unchanged ---")
+    from TEX_Wrangle import tex_node
+    try:
+        defaults = _ast_widget_defaults(Path(tex_node.__file__))
+        assert defaults["device"] == "auto", defaults.get("device")
+        assert defaults["compile_mode"] == "none", defaults.get("compile_mode")
+        assert defaults["precision"] == "fp32", defaults.get("precision")
+        assert defaults["debug_nan_highlight"] is False, defaults.get("debug_nan_highlight")
+        assert isinstance(defaults.get("code"), str) and "@OUT" in defaults["code"], defaults.get("code")
+        r.ok("tex_node.py static widget defaults unchanged (AST-parsed source, comfy_api-free)")
+    except Exception as e:
+        r.fail("tex_node.py static widget defaults (AST)", f"{e}\n{traceback.format_exc()}")
+
+    if not tex_node._V3_AVAILABLE:
+        r.skip("tex_node.py live v3 schema widget defaults",
+               "comfy_api not importable in this environment (CI/no-ComfyUI lane); "
+               "the AST-parsed source check above already pins the same defaults")
+        return
     try:
         from TEX_Wrangle.tex_node import TEXWrangleNode as N
         schema = N.define_schema()
@@ -156,6 +207,6 @@ def test_tex_node_widget_defaults_unchanged(r: SubTestResult):
         assert by_id["precision"].default == "fp32"
         assert by_id["debug_nan_highlight"].default is False
         assert isinstance(by_id["code"].default, str) and "@OUT" in by_id["code"].default
-        r.ok("tex_node.py static schema widget defaults unchanged")
+        r.ok("tex_node.py live v3 schema widget defaults unchanged")
     except Exception as e:
-        r.fail("tex_node.py static widget defaults", f"{e}\n{traceback.format_exc()}")
+        r.fail("tex_node.py live v3 schema widget defaults", f"{e}\n{traceback.format_exc()}")
