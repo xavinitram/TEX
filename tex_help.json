@@ -840,8 +840,16 @@
         {
           "name": "voronoi",
           "sig": "voronoi(x, y) → float",
-          "desc": "Voronoi cell ID noise. Returns a unique value per cell.",
-          "example": "float cell = voronoi(u * 8.0, v * 8.0);",
+          "desc": "Alias of worley_f1 — distance to the nearest feature point. For a per-cell value use worley_id.",
+          "example": "float d = voronoi(u * 8.0, v * 8.0);",
+          "tags": [],
+          "aliases": []
+        },
+        {
+          "name": "worley_id",
+          "sig": "worley_id(x, y) → float",
+          "desc": "Worley cell id: a stable value in [0, 1] per cell of worley_f1's nearest feature point.",
+          "example": "float id = worley_id(u * 8.0, v * 8.0);",
           "tags": [],
           "aliases": []
         },
@@ -1347,5 +1355,5 @@
       ]
     }
   ],
-  "function_count": 149
+  "function_count": 150
 }

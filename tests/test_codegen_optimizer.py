@@ -275,6 +275,13 @@ c.r = 1.0;
         ("img_width", "@OUT = vec3(img_width(@A) / 1000.0, 0.0, 0.0);"),
         ("img_height", "@OUT = vec3(img_height(@A) / 1000.0, 0.0, 0.0);"),
         ("img_width mask arg", "m@OUT = img_width(@A.r) / 1000.0;"),
+
+        # ASK-5: worley_id — no spatial/stencil emitter either, so codegen's general
+        # dispatch calls the identical `_fns['worley_id']` object interp uses
+        # (invariant 2 by construction, not by a matched pair of emitters). 2D and
+        # 3D (z given) forms both.
+        ("worley_id 2d", "@OUT = vec4(vec3(worley_id(u * 8.0, v * 8.0)), 1.0);"),
+        ("worley_id 3d", "@OUT = vec4(vec3(worley_id(u * 8.0, v * 8.0, 0.3)), 1.0);"),
     ]
 
     # ── Two-input programs (bindings A + B) ──

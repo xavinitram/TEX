@@ -1514,6 +1514,33 @@ def main():
     test_ask4_t6_e3011_reserved_names(r)
     test_ask4_t7_e5003_argument_type(r)
 
+    # ASK-5 — a per-cell worley_id builtin (voronoi's own output stays unchanged; only
+    # its help text was wrong). The other rows (taxonomy/fuzzer/edge-matrix/fp16-loud-
+    # guard/_NON_LOCAL_FNS) land as coverage the EXISTING suites pick up automatically
+    # once worley_id is registered footprint='point' — no edit needed there.
+    from test_v036_ask5 import (
+        test_ask5_reserved_name_e3011,
+        test_ask5_determinism_and_cell_count,
+        test_ask5_matches_worley_f1_winner,
+        test_ask5_voronoi_unchanged,
+        test_ask5_help_text_corrected,
+        test_ask5_taxonomy_pin,
+        test_ask5_fp16_fragile_gate,
+        test_ask5_eager_only_no_promotion,
+        test_ask5_both_tiers_bit_exact,
+        test_ask5_graph_tier_bit_exact,
+    )
+    test_ask5_reserved_name_e3011(r)
+    test_ask5_determinism_and_cell_count(r)
+    test_ask5_matches_worley_f1_winner(r)
+    test_ask5_voronoi_unchanged(r)
+    test_ask5_help_text_corrected(r)
+    test_ask5_taxonomy_pin(r)
+    test_ask5_fp16_fragile_gate(r)
+    test_ask5_eager_only_no_promotion(r)
+    test_ask5_both_tiers_bit_exact(r)
+    test_ask5_graph_tier_bit_exact(r)
+
     # HOOK-3: the linear collapse a host needs, and the gate's refusal as data.
     from test_hook3_checkpoint_collapse import (
         test_hook3_collapse_linear_on_a_real_region,

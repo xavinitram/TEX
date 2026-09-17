@@ -189,6 +189,7 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "worley_f1":   {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # worley_f1(x, y, z?) — Worley F1
     "worley_f2":   {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # worley_f2(x, y, z?) — Worley F2
     "voronoi":     {"args": (2, 3), "return": lambda _: TEXType.FLOAT},  # voronoi(x, y, z?) — alias for worley_f1
+    "worley_id":   {"args": (2, 3), "return": _float_type},              # ASK-5: worley_id(x, y, z?) — per-cell hash id
     "curl":        {"args": (2, 3), "return": _curl_return_type},         # curl(x, y) → vec2; curl(x, y, z) → vec3
     "ridged":      {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # ridged(x, y, octaves) or ridged(x, y, z, octaves)
     "billow":      {"args": (3, 4), "return": lambda _: TEXType.FLOAT},  # billow(x, y, octaves) or billow(x, y, z, octaves)

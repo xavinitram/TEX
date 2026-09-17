@@ -224,6 +224,13 @@ FP16_FRAGILE = frozenset({
     # shape read, so -- like patch_dist -- this is classified here by hand rather than
     # relying on the loud guard to notice.
     "img_width", "img_height",
+    # ASK-5: worley_id is the `floor`/`step` class by name (a discontinuous, per-cell
+    # hash of an argmin winner — a half-ULP coordinate nudge can flip which cell wins
+    # and relocate the whole id, not perturb it), but "worley_id" matches neither
+    # `_FRAGILE_NAME_STEMS` (no stem there reads "worley") nor `_IMPL_FRAGILE_MARKERS`
+    # (its body has no `_safe_div`/`sdiv`), so neither loud guard below catches it.
+    # Classified here by hand, same as `patch_dist` above.
+    "worley_id",
 })
 FP16_BOUNDED = frozenset({"sin", "cos", "tanh", "atan"})
 

@@ -788,6 +788,65 @@ def _worley2d_f2(x: torch.Tensor, y: torch.Tensor,
     return torch.sqrt(sorted_dist[1])
 
 
+# ASK-5: one salt, shared by both the 2D and 3D id ranks, distinct from the two jitter
+# salts _worley2d_core/_worley3d already use (0x165667B1 for py, 0x2B873593 for pz in
+# the 3D case) — it only ever re-hashes a winning cell's base_hash into the id output,
+# never the jitter itself, so reusing a jitter salt here is not a collision risk this
+# picks around; it is a separate constant purely so the id stream doesn't reuse a
+# salt already bound to a documented meaning. Pinned by the golden tests below —
+# changing it moves every `worley_id` output.
+_WORLEY_ID_SALT = 0x3C6EF372
+
+
+def _worley2d_id(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Worley per-cell id (ASK-5): a stable value in [0, 1] for the cell whose
+    jittered feature point is nearest (x, y) — worley_f1's own winner, re-hashed.
+
+    Deliberately EAGER-ONLY: this duplicates `_worley2d_core`'s neighbour search
+    instead of calling it or `_worley2d()` (the Trades-to-REFUSE discipline: the
+    duplication is interp/codegen's existing safety margin, not a shortcut to
+    remove), and this function's body never reaches the tiered noise cache at all
+    — no method on `_worley_cache` is invoked anywhere below. That omission is
+    what keeps it out of the noise cache's eager -> jit.trace -> torch.compile
+    promotion path (see `_TieredCache.try_upgrade`'s docstring above): a
+    `_TieredCache` key is only created and promoted from inside its own entry
+    point, so a function whose body never reaches that entry point can never
+    acquire a key, never gets traced, and never gets swapped to a compiled tier —
+    there is no cache entry for the promotion logic to touch. That matters here
+    because a fused torch.compile graph's argmin can flip at a near-tie ULP the
+    eager path doesn't: BRIEF-6 measured that flip moving a whole id, not an fp32
+    quantum, on `worley_f1`/`f2` (a *magnitude* output the promotion envelope can
+    bound); an id has no such envelope to bound a relocated integer against, so
+    this function stays on the one tier that is exercised at every call, forever.
+    """
+    x_floor = torch.floor(x)
+    y_floor = torch.floor(y)
+    xi = x_floor.to(torch.int32)
+    yi = y_floor.to(torch.int32)
+
+    ref = _widest((x, y))
+    dx_off, dy_off = _get_worley_offsets(ref.device, ref.dim())
+
+    cx = xi.unsqueeze(0) + dx_off
+    cy = yi.unsqueeze(0) + dy_off
+
+    base_hash = cx * 0x1B873593 ^ cy * 0x27D4EB2D
+    px = cx.float() + (_lowbias32(base_hash) & 0x7FFFFF).float() / 8388607.0
+    py = cy.float() + (_lowbias32(base_hash + 0x165667B1) & 0x7FFFFF).float() / 8388607.0
+
+    x_exp = x.unsqueeze(0)
+    y_exp = y.unsqueeze(0)
+    dist = (x_exp - px).square() + (y_exp - py).square()
+
+    # Nearest cell's hash, re-salted into the id output. Ties in `dist` resolve to
+    # the FIRST candidate (torch.min's documented tie-break) — the same order the
+    # 3x3 offset table is built in, so this is deterministic given the offsets, and
+    # interp/codegen call this identical object so they can never disagree on it.
+    winner = dist.min(dim=0).indices
+    winner_hash = torch.gather(base_hash, 0, winner.unsqueeze(0)).squeeze(0)
+    return (_lowbias32(winner_hash + _WORLEY_ID_SALT) & 0x7FFFFF).float() / 8388607.0
+
+
 _worley_cache = _TieredCache("worley")
 
 
@@ -1154,6 +1213,39 @@ def _worley3d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
         return torch.sqrt(sorted_dist[1])
     else:
         return torch.sqrt(dist.min(dim=0).values)
+
+
+def _worley3d_id(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """3D twin of `_worley2d_id` (ASK-5) — duplicates `_worley3d`'s 27-neighbour
+    search rather than sharing it, and, like the 2D id, never touches
+    `_TieredCache`: no tier, no promotion, see `_worley2d_id`'s docstring."""
+    x_floor = torch.floor(x)
+    y_floor = torch.floor(y)
+    z_floor = torch.floor(z)
+    xi = x_floor.to(torch.int32)
+    yi = y_floor.to(torch.int32)
+    zi = z_floor.to(torch.int32)
+
+    ref = _widest((x, y, z))
+    dx_off, dy_off, dz_off = _get_worley3d_offsets(ref.device, ref.dim())
+
+    cx = xi.unsqueeze(0) + dx_off
+    cy = yi.unsqueeze(0) + dy_off
+    cz = zi.unsqueeze(0) + dz_off
+
+    base_hash = cx * 0x1B873593 ^ cy * 0x27D4EB2D ^ cz * 0x165667B1
+    px = cx.float() + (_lowbias32(base_hash) & 0x7FFFFF).float() / 8388607.0
+    py = cy.float() + (_lowbias32(base_hash + 0x165667B1) & 0x7FFFFF).float() / 8388607.0
+    pz = cz.float() + (_lowbias32(base_hash + 0x2B873593) & 0x7FFFFF).float() / 8388607.0
+
+    x_exp = x.unsqueeze(0)
+    y_exp = y.unsqueeze(0)
+    z_exp = z.unsqueeze(0)
+    dist = (x_exp - px).square() + (y_exp - py).square() + (z_exp - pz).square()
+
+    winner = dist.min(dim=0).indices
+    winner_hash = torch.gather(base_hash, 0, winner.unsqueeze(0)).squeeze(0)
+    return (_lowbias32(winner_hash + _WORLEY_ID_SALT) & 0x7FFFFF).float() / 8388607.0
 
 
 def _curl3d(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:

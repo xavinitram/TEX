@@ -33,7 +33,7 @@ SKIP = frozenset({
 
 _IMG_UV3 = {"sample", "fetch", "sample_cubic", "sample_lanczos"}      # (img, u, v) -> vec3
 _IMG_UV4 = {"sample_mip", "sample_mip_gauss"}                         # (img, u, v, lod)
-_NOISE2 = {"perlin", "simplex", "worley_f1", "worley_f2", "voronoi", "alligator"}
+_NOISE2 = {"perlin", "simplex", "worley_f1", "worley_f2", "voronoi", "worley_id", "alligator"}
 _NOISE_OCT = {"fbm", "ridged", "billow", "turbulence"}
 _COMPOSITE = {"over", "under", "atop"}                                # (vec4, vec4) -> vec4
 _UNARY_VEC4 = {"premultiply", "unpremultiply"}

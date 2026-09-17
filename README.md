@@ -188,7 +188,7 @@ while (val < 100.0) { val = val * 2.0; }
 
 **Morphology:** `erode` `dilate`
 
-**Noise:** `perlin` `simplex` `fbm` `ridged` `billow` `turbulence` `flow` `curl` `worley_f1` `worley_f2` `voronoi` `alligator`
+**Noise:** `perlin` `simplex` `fbm` `ridged` `billow` `turbulence` `flow` `curl` `worley_f1` `worley_f2` `voronoi` `worley_id` `alligator`
 
 **SDF:** `sdf_circle` `sdf_box` `sdf_line` `sdf_polygon` `smin` `smax`
 

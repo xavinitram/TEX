@@ -121,7 +121,8 @@
 | `fbm` | `fbm(x, y, octaves) → float` | Fractal Brownian Motion (multi-octave Perlin). | sync |
 | `worley_f1` | `worley_f1(x, y) → float` | Worley (cellular) noise — distance to nearest cell center. | — |
 | `worley_f2` | `worley_f2(x, y) → float` | Worley noise — distance to second-nearest cell center. | — |
-| `voronoi` | `voronoi(x, y) → float` | Voronoi cell ID noise. Returns a unique value per cell. | — |
+| `voronoi` | `voronoi(x, y) → float` | Alias of worley_f1 — distance to the nearest feature point. For a per-cell value use worley_id. | — |
+| `worley_id` | `worley_id(x, y) → float` | Worley cell id: a stable value in [0, 1] per cell of worley_f1's nearest feature point. | — |
 | `billow` | `billow(x, y, octaves) → float` | Billowy noise — abs(fbm). Puffy cloud shapes. | sync |
 | `turbulence` | `turbulence(x, y, octaves) → float` | Turbulence — sum of abs(noise) per octave. Veiny patterns. | sync |
 | `ridged` | `ridged(x, y, octaves) → float` | Ridged multifractal — sharp ridges, good for mountains. | sync |

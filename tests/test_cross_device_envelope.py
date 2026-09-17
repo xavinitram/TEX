@@ -47,6 +47,21 @@ _PROBES = [
      "int tx = int(ix + dx); int ty = int(iy + dy);"
      "@OUT[tx, ty] += vec3(0.1);",
      1e-3, True),
+    # ASK-5: worley_id — structural=True like scatter, because a cross-device boundary
+    # flip RELOCATES which cell wins (a whole id moves, not an fp32 quantum), the same
+    # relocation shape as scatter's coordinate rounding, not a magnitude drift a
+    # pointwise band would suit. Unlike worley_f1/f2, worley_id never enters
+    # `_TieredCache` (no jit.trace/torch.compile fusion — the reassociation source
+    # behind worley_f1/f2's OWN same-device tier-promotion envelope), so measured
+    # cross-device divergence here was exactly 0.0 on this box (grid and random
+    # coordinates, 64^2 to 2048^2, coordinate scales 8 to 4080) — no boundary flip
+    # was found, not that none can occur. Banded at a small headroom above that
+    # measurement rather than at literal zero (AGENTS.md invariant 9: CPU<->GPU is
+    # a characterization envelope, never a bit-parity claim), following
+    # `_ENVELOPE_SIMPLEX`'s cpu=0.0 precedent in test_v031_noise_tiers.py.
+    ("worley_id",
+     "float freq = 8.0; float id = worley_id(u * freq, v * freq); @OUT = vec4(id, id, id, 1.0);",
+     1e-6, True),
 ]
 
 

@@ -1764,11 +1764,32 @@ class TEXStdlib:
             return _worley3d(_to_tensor(x), _to_tensor(y), _to_tensor(z), return_f2=True)
         return _worley2d(_to_tensor(x), _to_tensor(y), return_f2=True)
 
-    @stdlib("voronoi", sig='voronoi(x, y) \\u2192 float', category='Noise', doc='Voronoi cell ID noise. Returns a unique value per cell.', ex='float cell = voronoi(u * 8.0, v * 8.0);')
+    @stdlib("voronoi", sig='voronoi(x, y) \\u2192 float', category='Noise', doc='Alias of worley_f1 — distance to the nearest feature point. For a per-cell value use worley_id.', ex='float d = voronoi(u * 8.0, v * 8.0);')
     @staticmethod
     def fn_voronoi(x, y, z=None) -> torch.Tensor:
-        """Voronoi noise (alias for worley_f1)."""
+        """Voronoi noise (alias for worley_f1). Unchanged output — only the help
+        text above was wrong (it claimed a per-cell id; this is a distance)."""
         return TEXStdlib.fn_worley_f1(x, y, z)
+
+    # ASK-5: a per-cell id, distinct from worley_f1/f2's distances above. Footprint
+    # 'point' (reads only its own coordinate args); no sync (single-eval, capturable);
+    # not spatial (no stencil emitter — codegen falls through to the general dispatch,
+    # which calls this exact object, so interp/codegen agree by construction). Runs
+    # eager on every tier deliberately — see noise._worley2d_id's docstring for why it
+    # never touches the noise cache's eager->traced->compiled promotion path.
+    @stdlib("worley_id", sig='worley_id(x, y) \\u2192 float', category='Noise', doc="Worley cell id: a stable value in [0, 1] per cell of worley_f1's nearest feature point.", ex='float id = worley_id(u * 8.0, v * 8.0);')
+    @staticmethod
+    def fn_worley_id(x, y, z=None) -> torch.Tensor:
+        """Worley per-cell id (hash of the nearest cell). Returns float in [0, 1].
+
+        2D when z is omitted, 3D when provided — same arity convention as
+        worley_f1/f2. Always eager: `_worley2d_id`/`_worley3d_id` duplicate the
+        core neighbour search rather than sharing `_worley2d`/`_worley3d`'s
+        `_TieredCache`-backed path, so this never gets traced or torch.compiled.
+        """
+        if z is not None:
+            return _worley3d_id(_to_tensor(x), _to_tensor(y), _to_tensor(z))
+        return _worley2d_id(_to_tensor(x), _to_tensor(y))
 
     @stdlib("curl", sig='curl(x, y) \\u2192 vec2', category='Noise', doc='Curl of 2D noise field. Returns a divergence-free vector.', ex='vec2 c = curl(u * 5.0, v * 5.0);')
     @staticmethod
@@ -2735,6 +2756,7 @@ from .noise import (
     _perlin2d_fast, _perlin3d_fast, _simplex2d,
     _fbm2d, _fbm3d,
     _worley2d, _worley3d,
+    _worley2d_id, _worley3d_id,
     _curl2d, _curl3d,
     _ridged2d, _ridged3d,
     _billow2d, _billow3d,
