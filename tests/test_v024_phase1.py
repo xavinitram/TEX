@@ -65,6 +65,11 @@ def test_roi2_footprints(r: SubTestResult):
         # the whole-image read `_mark_whole` records; see test_ask1_convolve_roi_pin
         # for the kernel arg's own (non-narrowed) fate.
         ("@OUT = convolve(@A, @K);", {}, "A", "image", 0),
+        # ASK-4: img_width/img_height — a shape read, not a gather, but still
+        # 'image' (Inv 5): see test_ask4_img_size_roi_pin for the read binding's
+        # own (non-narrowed) fate, matching convolve's kernel-arg pin.
+        ("@OUT = @A * img_width(@A);", {}, "A", "image", 0),
+        ("@OUT = @A * img_height(@A);", {}, "A", "image", 0),
     ]
     for code, params, name, want_kind, want_reach in cases:
         try:
@@ -107,6 +112,7 @@ def test_roi2_plan_executability(r: SubTestResult):
         ("@OUT = gauss_blur(@A, $s);", {}, False, 0),                # symbolic radius blocks
         ("@OUT = sample(@A, u, v);", {}, False, 0),                  # gather → whole-frame
         ("@OUT = @A * img_mean(@A);", {}, False, 0),                 # reduction → whole-frame
+        ("@OUT = @A * img_width(@A);", {}, False, 0),                # ASK-4: shape read → whole-frame
         ("@OUT = fetch(@A, ix + 2, iy);", {}, False, 0),             # gather → whole-frame
         ("@OUT[ix, iy] = vec4(u, v, 0.0, 1.0);", {}, False, 0),      # scatter → whole-frame
         ("@OUT = convolve(@A, @K);", {}, False, 0),                  # ASK-1: image footprint blocks
@@ -143,6 +149,26 @@ def test_ask1_convolve_roi_pin(r: SubTestResult):
         r.ok("convolve: A footprint=image, roi_plan not executable, K never in plan.narrow")
     except Exception as e:
         r.fail("ASK-1 ROI pin", f"{type(e).__name__}: {e}")
+
+
+def test_ask4_img_size_roi_pin(r: SubTestResult):
+    print("\n--- ASK-4: img_width/img_height's ROI reach is pinned ---")
+    # img_width/img_height's footprint descriptor is 'image', not 'point': the read
+    # is pixel-local in cost, but an ROI-narrowed or M-4-stripped binding would
+    # silently answer with the WINDOW's size instead of the binding's own. So: the
+    # read binding K is the whole read `_mark_whole` records, the plan is not
+    # executable (whole-frame fallback), and K never appears in `plan.narrow`
+    # (which is empty on a non-executable plan) — matching convolve's kernel pin.
+    code = "@OUT = @A * img_width(@K);"
+    try:
+        fp = tex_roi.binding_footprints(code, {})
+        assert fp["K"].kind == "image", f"K: kind {fp['K'].kind} != image"
+        plan = tex_roi.roi_plan(code, {})
+        assert plan.executable is False, f"executable {plan.executable} != False"
+        assert "K" not in plan.narrow, f"binding K leaked into plan.narrow: {plan.narrow}"
+        r.ok("img_width: K footprint=image, roi_plan not executable, K never in plan.narrow")
+    except Exception as e:
+        r.fail("ASK-4 ROI pin", f"{type(e).__name__}: {e}")
 
 
 def test_ask13_patch_dist_roi_pin(r: SubTestResult):

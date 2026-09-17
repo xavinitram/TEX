@@ -192,6 +192,23 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
     except Exception as e:
         r.fail("ASK-13 fp16 gate", f"{type(e).__name__}: {e}")
 
+    # (g) ASK-4: a program multiplying image lineage by img_width(...) is DECLINED
+    # (falls to fp32) — "img_width"/"img_height" in FP16_FRAGILE is what makes this
+    # so. Without it, `_gm` scores the unknown FunctionCall from its ARGS (gain 2,
+    # magnitude 1 from `@A.r`), never from img_width's own large runtime magnitude —
+    # the same `sin(@A.r * iw)` hazard `_BUILTIN_MAG` closes for the coordinate
+    # IDENTIFIER `iw`, left open for the builtin CALL until this membership.
+    try:
+        bt = {"A": TEXType.VEC3, "K": TEXType.VEC3, "OUT": TEXType.VEC4}
+        code = "@OUT = vec4(@A.rgb * img_width(@K), 1.0);"
+        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        tm = TypeChecker(binding_types=bt, source=code).check(prog)
+        got = pp.resolve_auto_precision(prog, pp._MIN_FP16_PX, "cuda")[0]
+        assert got == "fp32", f"img_width under precision='auto' resolved {got!r}, want 'fp32'"
+        r.ok("ASK-4: img_width declines precision='auto' (resolves fp32)")
+    except Exception as e:
+        r.fail("ASK-4 fp16 gate", f"{type(e).__name__}: {e}")
+
 
 def test_c3st_gm_rules(r: SubTestResult):
     print("\n--- C3-st: per-rule units for the precision gate (_gm / resolve) ---")

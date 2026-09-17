@@ -41,6 +41,11 @@ _NON_LOCAL_SINCE_V022 = frozenset({
     # arguments (radius AND max(|dx|,|dy|)), and the ROI-1 descriptor grammar reads
     # exactly one (same register), so no strip, no tile.
     "patch_dist",
+    # ASK-4 (v0.36): img_width/img_height. footprint='image' — a shape read is
+    # pixel-local in COST but not in SAFETY: 'point' would let an ROI cook (`RoiPlan
+    # .narrow`) or an M-4 strip narrow the binding before the read, and the answer
+    # would silently become the window's size instead of the binding's own.
+    "img_width", "img_height",
 })
 
 _EXPECTED_NON_LOCAL = _HISTORICAL_NON_LOCAL | _NON_LOCAL_SINCE_V022
@@ -106,6 +111,7 @@ def test_roi1_footprints_wellformed_and_classified(r: SubTestResult):
     EXPECT = {
         "img_sum": "image", "img_mean": "image", "img_min": "image",
         "img_max": "image", "img_median": "image",
+        "img_width": "image", "img_height": "image",
         "sample": "image", "sample_cubic": "image", "sample_lanczos": "image",
         "sample_mip": "image", "sample_mip_gauss": "image", "sample_grad": "image",
         "fetch": "image",

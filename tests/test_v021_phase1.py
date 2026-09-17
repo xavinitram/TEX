@@ -216,6 +216,35 @@ def test_fus3_dag_equivalence(r: SubTestResult):
         _equiv_case(r, "spatial diamond (sample)", SPATIAL, SPATIAL_E, "S", dev)
 
 
+def test_ask4_img_size_fusion(r: SubTestResult):
+    """ASK-4: a fused chain's stage 2 reading img_width(@in)/img_height(@in) on its
+    chain input must equal the unfused sequential cook, bit-exact — the fusion
+    argument design.md §2 makes for reading a uniform as 1 rather than raising: a
+    non-terminal stage's @OUT becomes a LOCAL (tex_fusion.py) that can be a compact
+    (non-full-grid) shape, and that same compaction happens in a STANDALONE run of
+    the upstream stage too (it is an interpreter property, not a fusion-only one), so
+    fused and sequential read the identical shape either way.
+    Three chain-input shapes for stage 2 to read: a vec handoff (full grid), a float
+    handoff that stays column-compact (`ix/iw`), and a float handoff that collapses
+    to a true 0-dim uniform (a bare literal)."""
+    print("\n--- ASK-4: img_width/img_height fused == sequential on the chain input ---")
+    VEC = {"A": "@OUT = @in * 1.0;",
+           "B": "@OUT = vec4(img_width(@in), img_height(@in), 0.0, 1.0);"}
+    VEC_E = [_E("S", 0, "A", "in"), _E("A", 0, "B", "in")]
+    FLOAT_COORD = {"A": "m@OUT = ix/iw;",
+                   "B": "@OUT = vec4(img_width(@in), img_height(@in), 0.0, 1.0);"}
+    FLOAT_COORD_E = [_E("S", 0, "A", "in"), _E("A", 0, "B", "in")]
+    FLOAT_CONST = {"A": "m@OUT = 0.5;",
+                   "B": "@OUT = vec4(img_width(@in), img_height(@in), 0.0, 1.0);"}
+    FLOAT_CONST_E = [_E("S", 0, "A", "in"), _E("A", 0, "B", "in")]
+    for dev in (["cpu", "cuda"] if _CUDA else ["cpu"]):
+        _equiv_case(r, "vec handoff (full grid)", VEC, VEC_E, "S", dev)
+        _equiv_case(r, "float handoff (ix/iw, column-compact)",
+                    FLOAT_COORD, FLOAT_COORD_E, "S", dev)
+        _equiv_case(r, "float handoff (literal, 0-dim uniform)",
+                    FLOAT_CONST, FLOAT_CONST_E, "S", dev)
+
+
 def test_fus3_codegen_parity(r: SubTestResult):
     """The fused DAG program must also run through CODEGEN bit-identically to the
     interpreter (invariant #2 for the MERGED program, not just interp-vs-sequential)."""

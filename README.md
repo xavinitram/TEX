@@ -209,6 +209,8 @@ while (val < 100.0) { val = val * 2.0; }
 
 **Image Reductions:** `img_sum` `img_mean` `img_min` `img_max` `img_median`
 
+**Image Extent:** `img_width` `img_height`
+
 **String:** `str` `len` `replace` `strip` `lower` `upper` `contains` `startswith` `endswith` `find` `substr` `to_int` `to_float` `sanitize_filename` `split` `pad_left` `pad_right` `format` `repeat` `str_reverse` `count` `matches` `hash` `hash_float` `hash_int` `char_at`
 
 **Array:** `sort` `reverse` `arr_sum` `arr_min` `arr_max` `median` `arr_avg` `len` `join`

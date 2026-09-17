@@ -257,4 +257,9 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "img_min":    {"args": (1, 1), "return": _passthrough_type},                  # img_min(@A) — min per channel
     "img_max":    {"args": (1, 1), "return": _passthrough_type},                  # img_max(@A) — max per channel
     "img_median": {"args": (1, 1), "return": _passthrough_type},                  # img_median(@A) — median per channel
+
+    # ASK-4: a binding's own extent (a shape read, not a reduction — always FLOAT,
+    # never per-channel like the reductions above).
+    "img_width":  {"args": (1, 1), "return": _float_type},                        # img_width(img) — width in pixels
+    "img_height": {"args": (1, 1), "return": _float_type},                       # img_height(img) — height in pixels
 }

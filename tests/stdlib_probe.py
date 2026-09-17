@@ -75,6 +75,7 @@ def _call_and_kind(name, lo):
     if name == "convolve":   return "convolve(@A, @B, 1)", "vec3"
     if name == "patch_dist": return "patch_dist(@A.rgb, 2, -1, 1)", "float"
     if name in _IMG_REDUCE:   return f"{name}(@A.rgb)", "vec3"
+    if name in ("img_width", "img_height"): return f"{name}(@A)", "float"
     if name == "sample_grad": return "sample_grad(@A, u, v)", "vec2"
     if name in _NOISE2:       return f"{name}(u*6.0, v*6.0)", "float"
     if name in _NOISE_OCT:    return f"{name}(u*6.0, v*6.0, 4)", "float"

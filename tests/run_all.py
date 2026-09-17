@@ -76,6 +76,7 @@ from test_codegen_optimizer import (
     test_optimizer_isint_unary, test_optimizer_pure_fn_cse_licm,
     test_optimizer_dce_side_effects, test_codegen_audit_fixes,
     test_codegen_sample_hoist_in_branches,
+    test_ask4_img_size_tier_story,
 )
 from test_aliasing_cow import (
     test_cow_channel_array_writes, test_cow_binding_and_function_holes,
@@ -135,6 +136,7 @@ from test_v017_phase1 import (
     test_tst1_differential_fuzzer, test_a1_1_auto_precision_fuzz,
     test_ask1_convolve_fuzzer_scope,
     test_ask13_patch_dist_fuzzer_scope,
+    test_ask4_img_size_fuzzer_scope,
     test_tst7_runner_coverage,
 )
 from test_v017_phase2 import (
@@ -259,6 +261,7 @@ def main():
     test_realistic_sizes(r)
     test_nan_inf_propagation(r)
     test_codegen_equivalence(r)
+    test_ask4_img_size_tier_story(r)
     test_scatter_writes(r)
     test_cow_channel_array_writes(r)
     test_cow_binding_and_function_holes(r)
@@ -402,6 +405,7 @@ def main():
     test_a1_1_auto_precision_fuzz(r)
     test_ask1_convolve_fuzzer_scope(r)
     test_ask13_patch_dist_fuzzer_scope(r)
+    test_ask4_img_size_fuzzer_scope(r)
     test_tst7_runner_coverage(r)
     test_reg1_registry_parity(r)
     test_tst3_taxonomy_consistency(r)
@@ -551,6 +555,7 @@ def main():
         test_fus1_detector, test_fus1b_multi_injection,
         test_fus3_dag_equivalence, test_fus3_codegen_parity,
         test_fus3_terminal_rmw,
+        test_ask4_img_size_fusion,
         test_fus1_route_path, test_fus2_fused_lazy, test_fus1_hardening,
         test_cache0_orphan_cg_census, test_lat3_deferred_timing, test_lat4_builtins_lru,
         test_eng8_transfer_model,
@@ -560,6 +565,7 @@ def main():
     test_fus3_dag_equivalence(r)
     test_fus3_codegen_parity(r)
     test_fus3_terminal_rmw(r)
+    test_ask4_img_size_fusion(r)
     test_fus1_route_path(r)
     test_fus2_fused_lazy(r)
     test_fus1_hardening(r)
@@ -634,6 +640,7 @@ def main():
         test_roi2_plan_executability,
         test_ask1_convolve_roi_pin,
         test_ask13_patch_dist_roi_pin,
+        test_ask4_img_size_roi_pin,
         test_roi4_reach_pinning,
         test_roi4_never_sever,
         test_roi3_tile_is_roi_special_case,
@@ -649,6 +656,7 @@ def main():
     test_roi2_plan_executability(r)
     test_ask1_convolve_roi_pin(r)
     test_ask13_patch_dist_roi_pin(r)
+    test_ask4_img_size_roi_pin(r)
     test_roi4_reach_pinning(r)
     test_roi4_never_sever(r)
     test_roi3_tile_is_roi_special_case(r)
@@ -1484,6 +1492,27 @@ def main():
     test_ask13_reserved_name_e3011(r)
     test_ask13_patch_dist_offset_clamp_pad_bound(r)
     test_ask13_patch_dist_offset_clamp_bitexact(r)
+
+    # ASK-4 — img_width/img_height, a binding's own width and height (values on both
+    # tiers/devices, mask binding, uniform=1, fp16-precision exact reading, graph
+    # tier, E3011/E5003; the other rows land as edits to the existing test files
+    # wired above, e.g. test_v017_phase2.py / test_v021_phase1.py / test_v024_phase1.py).
+    from test_v036_ask4 import (
+        test_ask4_t1_width_height_values,
+        test_ask4_t2_mask_binding,
+        test_ask4_t3_uniform_reads_one,
+        test_ask4_t4_fp16_precision_exact_at_4095,
+        test_ask4_t5_graph_tier,
+        test_ask4_t6_e3011_reserved_names,
+        test_ask4_t7_e5003_argument_type,
+    )
+    test_ask4_t1_width_height_values(r)
+    test_ask4_t2_mask_binding(r)
+    test_ask4_t3_uniform_reads_one(r)
+    test_ask4_t4_fp16_precision_exact_at_4095(r)
+    test_ask4_t5_graph_tier(r)
+    test_ask4_t6_e3011_reserved_names(r)
+    test_ask4_t7_e5003_argument_type(r)
 
     # HOOK-3: the linear collapse a host needs, and the gate's refusal as data.
     from test_hook3_checkpoint_collapse import (

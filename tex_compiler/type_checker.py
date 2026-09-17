@@ -1373,8 +1373,10 @@ class TypeChecker:
                             self._set_type(node, result_type)
                             return result_type
 
-        # Image reduction validation
-        if node.name in ("img_sum", "img_mean", "img_min", "img_max", "img_median"):
+        # Image reduction validation (+ ASK-4's shape reads, which take the same
+        # numeric-argument contract even though they aren't reductions).
+        if node.name in ("img_sum", "img_mean", "img_min", "img_max", "img_median",
+                          "img_width", "img_height"):
             if arg_types and not arg_types[0].is_numeric:
                 self._error(f"'{node.name}' expects an image or mask input, but found {arg_types[0].value}.",
                             node.loc, code="E5003",

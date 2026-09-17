@@ -269,6 +269,12 @@ c.r = 1.0;
         # radius, and separately at radius=0 (the pointwise-diff short-circuit path).
         ("patch_dist", "m@OUT = patch_dist(@A.rgb, 2, -1, 1);"),
         ("patch_dist radius=0", "m@OUT = patch_dist(@A.rgb, 2, -1, 0);"),
+
+        # ASK-4: img_width/img_height — pins the no-emitter route (codegen's general
+        # fallback calls the identical `_fns['img_width']` callable interp uses).
+        ("img_width", "@OUT = vec3(img_width(@A) / 1000.0, 0.0, 0.0);"),
+        ("img_height", "@OUT = vec3(img_height(@A) / 1000.0, 0.0, 0.0);"),
+        ("img_width mask arg", "m@OUT = img_width(@A.r) / 1000.0;"),
     ]
 
     # ── Two-input programs (bindings A + B) ──
@@ -291,6 +297,48 @@ c.r = 1.0;
 
     for name, code in two_input_programs:
         assert_equiv(r, name, code, {"A": img, "B": img_b}, B=B, H=H, W=W)
+
+
+def test_ask4_img_size_tier_story(r: SubTestResult):
+    """ASK-4: img_width/img_height have no codegen emitter — the general fallback
+    calls the identical `_fns['img_width']` callable interp uses, so interp and
+    codegen agree by construction (invariant 2). Pins that agreement for a binding
+    whose own shape DIFFERS from the main image (a kernel-shaped [1,3,5,3] beside
+    an [1,8,16,3] image, and a [1,3,5] mask) and holds under both fp32 and fp16 —
+    img_width/img_height are forced fp32 internally (invariant 4) regardless of the
+    execution precision."""
+    print("\n--- ASK-4: img_width/img_height tier story (own-extent binding, fp32+fp16) ---")
+    from failure_harness import run_tier
+    torch.manual_seed(99)
+    binds = {
+        "A": torch.rand(1, 8, 16, 3),
+        "K": torch.rand(1, 3, 5, 3),
+        "M": torch.rand(1, 3, 5),
+    }
+    cases = [
+        ("kernel width",  "@OUT = vec3(img_width(@K), 0.0, 0.0);", 5.0),
+        ("kernel height", "@OUT = vec3(img_height(@K), 0.0, 0.0);", 3.0),
+        ("mask width",    "m@OUT = img_width(@M);", 5.0),
+        ("mask height",   "m@OUT = img_height(@M);", 3.0),
+        ("main image width",  "@OUT = vec3(img_width(@A), 0.0, 0.0);", 16.0),
+        ("main image height", "@OUT = vec3(img_height(@A), 0.0, 0.0);", 8.0),
+    ]
+    for name, code, want in cases:
+        for precision in ("fp32", "fp16"):
+            try:
+                interp = run_tier(code, binds, "interp", precision=precision)
+                cg = run_tier(code, binds, "codegen", precision=precision)
+                for out_name, iv in interp.items():
+                    cv = cg[out_name]
+                    got_i = iv.reshape(-1)[0].item()
+                    got_c = cv.reshape(-1)[0].item()
+                    assert abs(got_i - want) < 1e-5, f"interp {got_i} != {want}"
+                    assert abs(got_c - want) < 1e-5, f"codegen {got_c} != {want}"
+                    assert iv.dtype == torch.float32, f"interp dtype {iv.dtype} != fp32"
+                    assert cv.dtype == torch.float32, f"codegen dtype {cv.dtype} != fp32"
+                r.ok(f"[{precision}] {name}: interp==codegen=={want} (dtype fp32 both)")
+            except Exception as e:
+                r.fail(f"ASK-4 tier story [{precision}] {name}", f"{type(e).__name__}: {e}")
 
 
 # ── Optimization Regression Tests ──────────────────────────────────────

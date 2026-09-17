@@ -213,6 +213,17 @@ FP16_FRAGILE = frozenset({
     # match) nor `_IMPL_FRAGILE_MARKERS` (looks only for `_safe_div(`/`sdiv(`) catches
     # this name, so it is classified here by hand.
     "patch_dist",
+    # ASK-4: img_width/img_height are fp32-only builtins (never fp16 themselves,
+    # invariant #4's reason -- a large dimension isn't an fp16 value), but the
+    # PRODUCT of image lineage with their runtime magnitude amplifies fp16 error the
+    # same way `sin(@A.r * iw)` does for the `iw` builtin (`_BUILTIN_MAG` in
+    # precision_policy.py closes that for the coordinate IDENTIFIERS; a FunctionCall's
+    # gain is scored from its args, not its own magnitude, so an unknown call like
+    # `img_width(@K)` reads magnitude 1 by default and would launder the hazard).
+    # Neither the name-prefix stems nor the impl markers above catch "img_" or a
+    # shape read, so -- like patch_dist -- this is classified here by hand rather than
+    # relying on the loud guard to notice.
+    "img_width", "img_height",
 })
 FP16_BOUNDED = frozenset({"sin", "cos", "tanh", "atan"})
 

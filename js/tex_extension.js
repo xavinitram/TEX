@@ -2119,6 +2119,8 @@ const TEX_HELP_DATA = [
             { name: "img_mean", sig: "img_mean(img) \u2192 vec", desc: "Per-channel mean (average) of the image.", example: "vec3 avg = img_mean(@A);" },
             { name: "img_sum", sig: "img_sum(img) \u2192 vec", desc: "Per-channel sum of all pixel values.", example: "vec3 total = img_sum(@A);" },
             { name: "img_median", sig: "img_median(img) \u2192 vec", desc: "Per-channel median of the image.", example: "vec3 mid = img_median(@A);" },
+            { name: "img_width", sig: "img_width(img) \u2192 float", desc: "Width in pixels of an image or mask (a uniform reads 1; iw is the cook grid).", example: "float kw = img_width(@kernel);" },
+            { name: "img_height", sig: "img_height(img) \u2192 float", desc: "Height in pixels of an image or mask (a uniform reads 1; ih is the cook grid).", example: "float kh = img_height(@kernel);" },
             { name: "Auto-levels Example", sig: "img_min, img_max", desc: "Normalize an image to full [0,1] range using stats.", example: "@OUT = (@A - img_min(@A)) / max(img_max(@A) - img_min(@A), 0.001);" },
         ]
     },

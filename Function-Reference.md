@@ -149,6 +149,8 @@
 | `img_mean` | `img_mean(img) → vec` | Per-channel mean (average) of the image. | non-local |
 | `img_sum` | `img_sum(img) → vec` | Per-channel sum of all pixel values. | non-local |
 | `img_median` | `img_median(img) → vec` | Per-channel median of the image. | non-local |
+| `img_width` | `img_width(img) → float` | Width in pixels of an image or mask (a uniform reads 1; iw is the cook grid). | non-local |
+| `img_height` | `img_height(img) → float` | Height in pixels of an image or mask (a uniform reads 1; ih is the cook grid). | non-local |
 
 ## Strings
 

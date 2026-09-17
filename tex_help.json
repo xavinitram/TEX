@@ -1308,6 +1308,26 @@
             "non-local"
           ],
           "aliases": []
+        },
+        {
+          "name": "img_width",
+          "sig": "img_width(img) → float",
+          "desc": "Width in pixels of an image or mask (a uniform reads 1; iw is the cook grid).",
+          "example": "float kw = img_width(@kernel);",
+          "tags": [
+            "non-local"
+          ],
+          "aliases": []
+        },
+        {
+          "name": "img_height",
+          "sig": "img_height(img) → float",
+          "desc": "Height in pixels of an image or mask (a uniform reads 1; ih is the cook grid).",
+          "example": "float kh = img_height(@kernel);",
+          "tags": [
+            "non-local"
+          ],
+          "aliases": []
         }
       ]
     },
@@ -1327,5 +1347,5 @@
       ]
     }
   ],
-  "function_count": 147
+  "function_count": 149
 }

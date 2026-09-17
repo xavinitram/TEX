@@ -61,7 +61,11 @@ def _looks_spatial(n):
             or n in ("erode", "dilate", "convolve") or n.endswith("_filter")
             # ASK-13: patch_dist escapes all five prefixes above (as convolve did too,
             # before ASK-1 added it by name).
-            or n.startswith("patch_"))
+            or n.startswith("patch_")
+            # ASK-4: the whole-image family (img_sum/mean/min/max/median, now also
+            # img_width/img_height) reads the ENTIRE binding, not just a neighbourhood
+            # — still not 'point'. Pins the five existing names too.
+            or n.startswith("img_"))
 
 
 def test_tst3_taxonomy_consistency(r: SubTestResult):

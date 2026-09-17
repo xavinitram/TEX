@@ -2365,6 +2365,29 @@ class TEXStdlib:
             return torch.median(flat, dim=1).values.unsqueeze(1).unsqueeze(1)
         return img
 
+    @stdlib("img_width", sig='img_width(img) \\u2192 float', category='Image Stats', footprint='image',
+            doc='Width in pixels of an image or mask (a uniform reads 1; iw is the cook grid).', ex='float kw = img_width(@kernel);')
+    @staticmethod
+    def fn_img_width(image) -> torch.Tensor:
+        """Width (shape[2]) of a binding's own tensor, as a 0-dim fp32 tensor on its
+        device — built exactly as `iw` is (invariant #4: forced fp32, never the cook
+        dtype). Rank < 3 (a uniform) reads 1.0, not an error and not `iw`: a
+        non-terminal fusion stage's @OUT becomes a local that can be compact-shaped
+        (tex_fusion.py), so 'rank < 3 is 1' is the reading that agrees on every path —
+        raising would error a fused chain the unfused cook serves."""
+        img = _to_tensor(image)
+        w = float(img.shape[2]) if img.dim() >= 3 else 1.0
+        return torch.scalar_tensor(w, dtype=torch.float32, device=img.device)
+
+    @stdlib("img_height", sig='img_height(img) \\u2192 float', category='Image Stats', footprint='image',
+            doc='Height in pixels of an image or mask (a uniform reads 1; ih is the cook grid).', ex='float kh = img_height(@kernel);')
+    @staticmethod
+    def fn_img_height(image) -> torch.Tensor:
+        """Height (shape[1]) of a binding's own tensor — see fn_img_width."""
+        img = _to_tensor(image)
+        h = float(img.shape[1]) if img.dim() >= 3 else 1.0
+        return torch.scalar_tensor(h, dtype=torch.float32, device=img.device)
+
     @stdlib("debug_print", sig='debug_print(label, value[, x, y]) \\u2192 value', category='Debugging', sync=True,
             doc="Probe a value at a pixel — records it for the node's "
             "HUD and returns the value unchanged (a print-style debug tap). Interpreter"
