@@ -1525,6 +1525,8 @@ def main():
         test_control_flow_w7007_marks_control_flow_on_every_pixel,
         test_control_flow_advisories_spare_uniform_shapes,
         test_control_flow_advisories_are_invisible_to_check,
+        test_control_flow_per_pixel_loop_bound_semantics_both_tiers,
+        test_control_flow_language_md_states_the_loop_bound,
     )
     test_control_flow_per_pixel_condition_semantics_both_tiers(r)
     test_control_flow_language_md_states_the_rule(r)
@@ -1532,6 +1534,8 @@ def main():
     test_control_flow_w7007_marks_control_flow_on_every_pixel(r)
     test_control_flow_advisories_spare_uniform_shapes(r)
     test_control_flow_advisories_are_invisible_to_check(r)
+    test_control_flow_per_pixel_loop_bound_semantics_both_tiers(r)
+    test_control_flow_language_md_states_the_loop_bound(r)
 
     success = r.summary()
     return 0 if success else 1

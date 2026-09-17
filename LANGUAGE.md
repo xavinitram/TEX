@@ -256,8 +256,9 @@ function_def= type IDENT '(' [param (',' param)*] ')' block   // 'return' expr;
 ```
 
 Operators, in decreasing precedence: postfix (`.`, `[]`, calls) · unary (`- !`) ·
-`* / %` · `+ -` · comparisons · `&& ||` · ternary `?:` · assignment. Loops are bounded
-(static ranges for `for`; a guard for `while`) so a cook always terminates.
+`* / %` · `+ -` · comparisons · `&& ||` · ternary `?:` · assignment. Every loop is capped
+at 1024 iterations; a loop that needs more fails the cook with E6010, so a cook always
+terminates.
 
 ### 7.1 Uniform and per-pixel conditions
 
@@ -285,6 +286,10 @@ either way: the backends disagree on it today.)
   and the assignments before them in that branch land on every pixel too. To stop per pixel,
   keep a flag the body tests, `if (found < 0 && hit) { found = i; }`, and let the loop run a
   uniform bound.
+* A `for` or `while` whose condition is per-pixel runs **every** pixel for as many passes as
+  the pixel that needs the most, and does not mask the body: a pixel whose own condition is
+  already false keeps executing it. Bound the loop uniformly and guard or weight the per-pixel
+  work, for example `for (int i = 0; i < $max; i++) { if (i < n) { sum += tap; } }`.
 
 A host can ask for these as warnings with `tex_api.control_flow_advisories(source,
 binding_types)`: **W7006** marks a per-pixel `if` or `?:` with a gather (`sample`, `fetch`,

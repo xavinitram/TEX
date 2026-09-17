@@ -161,7 +161,7 @@ A `break`, `continue` or `return` inside a branch raises past the merge, so it a
 
 ## Loops
 
-For and while loops execute sequentially -- each iteration runs the body as vectorized tensor operations. The loop variable is a scalar (not a per-pixel tensor). Each iteration computes the body across all pixels simultaneously. The iteration limit is 1024 (`MAX_LOOP_ITERATIONS`). Both `break` and `continue` are supported.
+For and while loops execute sequentially -- each iteration runs the body as vectorized tensor operations. The loop variable is a scalar (not a per-pixel tensor). A per-pixel condition (`i < n` with a per-pixel `n`) keeps the loop running while any pixel's condition holds, and the body is not masked, so every pixel runs to the frame's maximum (`LANGUAGE.md` §7.1). Each iteration computes the body across all pixels simultaneously. The iteration limit is 1024 (`MAX_LOOP_ITERATIONS`). Both `break` and `continue` are supported.
 
 ## Type System
 

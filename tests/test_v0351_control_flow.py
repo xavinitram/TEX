@@ -431,3 +431,75 @@ def test_control_flow_advisories_are_invisible_to_check(r: SubTestResult):
         r.ok("total: parse failures and junk inputs return [], a missing map is {}")
     except Exception as e:
         r.fail("advisory totality", f"{type(e).__name__}: {e}")
+
+
+# ── loops whose condition is per-pixel ───────────────────────────────────────
+
+def test_control_flow_per_pixel_loop_bound_semantics_both_tiers(r: SubTestResult):
+    """A per-pixel loop condition keeps the loop going while ANY pixel's condition holds and
+    does not mask the body, so every pixel runs to the frame's maximum; a uniform bound with
+    a guarded body gives each pixel its own count. A pin: green at the base, red only if the
+    semantics move without LANGUAGE.md §7.1."""
+    print("\n--- control flow: a per-pixel loop bound runs every pixel to the frame's maximum ---")
+    A = torch.zeros(1, 2, 4, 3)
+    A[..., 0] = torch.tensor([1.0, 2.0, 4.0, 0.0])      # per-column counts n = 1, 2, 4, 0
+    rows = [
+        ("a per-pixel for bound",
+         "int n = int(@A.r);\nfloat acc = 0.0;\nfor (int i = 0; i < n; i++) { acc += 1.0; }\n"
+         "@OUT = vec3(acc);", [4.0, 4.0, 4.0, 4.0]),
+        ("a per-pixel while condition",
+         "int n = int(@A.r);\nfloat acc = 0.0;\nint i = 0;\nwhile (i < n) { acc += 1.0; i = i + 1; }\n"
+         "@OUT = vec3(acc);", [4.0, 4.0, 4.0, 4.0]),
+        ("a uniform bound with a guarded body",
+         "int n = int(@A.r);\nfloat acc = 0.0;\nfor (int i = 0; i < 4; i++) { if (i < n) { acc += 1.0; } }\n"
+         "@OUT = vec3(acc);", [1.0, 2.0, 4.0, 0.0]),
+        ("a uniform bound with a weighted body",
+         "int n = int(@A.r);\nfloat acc = 0.0;\nfor (int i = 0; i < 4; i++) { acc += (i < n) ? 1.0 : 0.0; }\n"
+         "@OUT = vec3(acc);", [1.0, 2.0, 4.0, 0.0]),
+    ]
+    for label, code, want in rows:
+        try:
+            oi, oc = _both_tiers(code, {"A": A})
+            for tier, out in (("interp", oi), ("codegen", oc)):
+                got = [round(x, 4) for x in out[0, 0, :, 0].tolist()]
+                assert got == want, f"{tier}: {got}, expected {want}"
+            r.ok(f"{label} -> {want}, both tiers")
+        except Exception as e:
+            r.fail(f"loop bound: {label}", f"{type(e).__name__}: {e}")
+    try:
+        from TEX_Wrangle.tex_compiler.diagnostics import TEXCompileError  # noqa: F401
+        from TEX_Wrangle.tex_runtime.interpreter import InterpreterError
+        for code in ("float a = 0.0; for (int i = 0; i < 1025; i++) { a += 1.0; } @OUT = vec3(a) + @A;",
+                     "float a = 0.0; while (a < 5000.0) { a += 1.0; } @OUT = vec3(a) + @A;"):
+            prog = tex_api.compile(code, {"A": TEXType.VEC3})
+            try:
+                tex_api.execute(prog, {"A": A})
+            except InterpreterError as e:
+                assert e._code == "E6010", (e._code, e)
+            else:
+                raise AssertionError(f"no E6010 for {code!r}")
+        ok = tex_api.compile("float a = 0.0; for (int i = 0; i < 1024; i++) { a += 1.0; } "
+                             "@OUT = vec3(a) + @A * 0.0;", {"A": TEXType.VEC3})
+        assert tex_api.execute(ok, {"A": A})["OUT"][0, 0, 0, 0].item() == 1024.0
+        r.ok("a loop that needs more than 1024 iterations fails with E6010; 1024 runs")
+    except Exception as e:
+        r.fail("loop cap E6010", f"{type(e).__name__}: {e}")
+
+
+def test_control_flow_language_md_states_the_loop_bound(r: SubTestResult):
+    print("\n--- control flow: LANGUAGE.md says what a per-pixel loop bound does ---")
+    try:
+        lang = _read("LANGUAGE.md")
+        assert "static ranges for" not in lang, "LANGUAGE.md still claims static `for` ranges"
+        assert "Every loop is capped\nat 1024 iterations" in lang.replace("\r\n", "\n")
+        sec = lang[lang.index("### 7.1 Uniform and per-pixel conditions"):]
+        sec = sec[:sec.index("\n---")]
+        for needle in ("whose condition is per-pixel runs **every** pixel for as many passes as",
+                       "does not mask the body",
+                       "for (int i = 0; i < $max; i++) { if (i < n) { sum += tap; } }"):
+            assert needle in sec.replace("\r\n", "\n").replace("\n  ", " "), f"§7.1 lacks {needle!r}"
+        dev = _read("DEVELOPMENT.md")
+        assert "keeps the loop running while any pixel's condition holds" in dev
+        r.ok("LANGUAGE.md states the 1024 cap and the per-pixel loop bullet; DEVELOPMENT.md agrees")
+    except Exception as e:
+        r.fail("loop-bound docs", f"{type(e).__name__}: {e}")
