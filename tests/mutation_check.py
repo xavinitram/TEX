@@ -396,6 +396,31 @@ MUTATIONS = [
      '        self._emit_body_with_flow(stmt.body)\n'
      '        self._use_native_flow_control = saved_flow',
      '        self._emit_body_with_flow(stmt.body)'),
+    # ── codegen value parity (the two wrong-rank reads) ────────────────────────────────
+    # Both directions of the _SPATIAL_BUILTINS derivation are mutated: `fi` dropped from the
+    # set (the defect as it shipped) and a genuinely 0-dim builtin added to it.
+    ('_SPATIAL_BUILTINS forgets fi again (a loop reading it compiles scalar)',
+     'tex_runtime/codegen.py',
+     '_SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy", "fi"))',
+     '_SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy"))'),
+    ('_SPATIAL_BUILTINS gains a 0-dim builtin (the fast path is lost)',
+     'tex_runtime/codegen.py',
+     '_SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy", "fi"))',
+     '_SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy", "fi", "iw"))'),
+    ('the invocation seam stops staging vec params (rank-1 $tint.r again)',
+     'tex_runtime/codegen.py',
+     '    _stage_vec_params(bindings, device, dtype)\n'
+     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype)',
+     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype)'),
+    ('the vec-param staging drops the [1,1,1,C] reshape', 'tex_runtime/interpreter.py',
+     '    if t.dim() == 1 and t.shape[0] in (2, 3, 4):\n'
+     '        t = t.view(1, 1, 1, -1)',
+     '    if False:\n'
+     '        t = t.view(1, 1, 1, -1)'),
+    ('_params_on_device overwrites a staged vec param with a rank-1 one',
+     'tex_runtime/compiled.py',
+     '        if value is None or isinstance(value, (torch.Tensor, str)) or is_vec_param_list(value):',
+     '        if value is None or isinstance(value, (torch.Tensor, str)):'),
 ]
 
 RUNNER = """
@@ -409,9 +434,9 @@ import test_v033_precision as D, test_v033_cache8 as E, test_v033_xpu2 as F
 import test_v033_phase0 as G, test_v0331_audit as H, test_v0332_audit as I
 import test_v034_data7 as J, test_v034_io1 as K, test_v0341_audit as L
 import test_v035_hygiene as M, test_v030_phase1 as N
-import test_codegen_flow_scope as O
+import test_codegen_flow_scope as O, test_codegen_value_parity as P
 r = SubTestResult()
-for m in (A, B, C, D, E, F, G, H, I, J, K, L, M, N, O):
+for m in (A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P):
     for n in sorted(x for x in dir(m) if x.startswith("test_")):
         try:
             getattr(m, n)(r)

@@ -340,6 +340,22 @@ def main():
     test_flow_scope_t15_nested_general_loop_terminates(r)
     test_flow_scope_nested_loop_matrix(r)
     test_flow_scope_deeper_and_per_pixel_shapes(r)
+    # The two values codegen read at the wrong RANK — a vec/colour $param component and
+    # `fi` inside a loop — which made per-pixel control flow act uniformly on that tier.
+    from test_codegen_value_parity import (
+        test_codegen_vec_param_component_matches_interpreter,
+        test_codegen_fi_in_loop_matches_interpreter,
+        test_codegen_value_parity_on_every_device_and_precision,
+        test_codegen_spatial_builtins_match_interpreter_ranks,
+        test_codegen_vec_param_staging_is_narrow,
+        test_codegen_vec_param_staging_leaves_emitted_code_alone,
+    )
+    test_codegen_vec_param_component_matches_interpreter(r)
+    test_codegen_fi_in_loop_matches_interpreter(r)
+    test_codegen_value_parity_on_every_device_and_precision(r)
+    test_codegen_spatial_builtins_match_interpreter_ranks(r)
+    test_codegen_vec_param_staging_is_narrow(r)
+    test_codegen_vec_param_staging_leaves_emitted_code_alone(r)
     test_compiled_audit_fixes(r)
     test_fusion_memo(r)
     test_node_helpers(r)

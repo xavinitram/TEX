@@ -272,9 +272,10 @@ math functions of those.
 
 **Per-pixel** means anything that reads an `@` input, `u v ix iy` or `fi`, or a variable
 computed from one, **including a reduction such as `img_min(@A)`**, which holds one value per
-frame and is still per-pixel here. A variable declared before a per-pixel `if` and assigned
-inside it is per-pixel after it. (A component of a vector parameter, `$tint.r`, is not promised
-either way: the backends disagree on it today.)
+frame and is still per-pixel here — and a component of a vector or colour parameter, `$tint.r`,
+which like a reduction holds one value for the whole cook and is still per-pixel here (the
+parameter itself is bound channel-wise, not as a plain scalar). A variable declared before a
+per-pixel `if` and assigned inside it is per-pixel after it.
 
 * A uniform `if` runs only the branch it takes.
 * A per-pixel `if` runs **both** branches on every pixel and keeps each pixel's side, so a

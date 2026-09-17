@@ -311,6 +311,42 @@ def _gen_stencil(rng, i):
              f"{v} = sort({v});"], f"{v}[{n // 2}]")
 
 
+# Conditions that are FALSE on every pixel but per-pixel by the engine's rule
+# (LANGUAGE.md §7.1), so a `break`/`continue` under one acts on every pixel. The last two
+# are the grammar's blind spot made explicit: `fi` and a vec-param COMPONENT are the values
+# codegen read at a rank the interpreter never gives them, and the early-exit shape is what
+# turns that rank into a visible value divergence. `_ATOMS` holds no `$param` and no `fi`,
+# and the only loop the generator emitted had no `if` in it, so no seed could reach either.
+_EARLY_EXIT_CONDS = ["@A.r > 2.0", "@B.r > 2.0", "u > 2.0", "v > 2.0", "ix < 0.0",
+                     "fi > 5.0", "$pv.r > 2.0", "$pv.g > 2.0", "$pv.b > 2.0",
+                     "fi + $pv.r > 5.0"]
+# The param the conditions above read. Declared in the program only when one is drawn;
+# `_FUZZ_PARAM_BINDING` is the value the harness binds for it.
+_FUZZ_PARAM_DECL = "v3$pv = vec3(0.0, 0.0, 0.0);"
+_FUZZ_PARAM_BINDING = {"pv": [0.35, 0.6, 0.85]}
+
+
+def _gen_early_exit(rng, i, atoms):
+    """A bounded loop with a `break` or `continue` under a per-pixel `if`.
+
+    Returns (lines, atom). Half the bodies are SCALAR-ONLY (`acc + 1.0`): a body that
+    touches a binding forces codegen's tensor loop, which is exactly how the `fi` defect
+    stayed invisible to the hand-written per-pixel-control-flow pin. The other half draws
+    from the atom pool so the tensor-loop path is covered too.
+    """
+    v = f"eacc{i}"
+    n = rng.randint(2, 4)
+    cond = rng.choice(_EARLY_EXIT_CONDS)
+    scalar_body = rng.random() < 0.5
+    step = "1.0" if scalar_body else _gen_expr_over(rng, 1, atoms)
+    if rng.random() < 0.5:
+        body = f"if ({cond}) {{ break; }} {v} = {v} + {step};"
+    else:
+        body = f"{v} = {v} + {step}; if ({cond}) {{ continue; }} {v} = {v} + {step};"
+    return ([f"float {v} = 0.0; for (int k{i} = 0; k{i} < {n}; k{i} = k{i} + 1) {{ {body} }}"],
+            v)
+
+
 def _gen_program(rng, depth=3):
     """A1-1: a random VALID multi-statement program — widens the fuzzer beyond a
     single float expression to the shapes that shipped real bugs green (doc 33 §5):
@@ -359,6 +395,18 @@ def _gen_program(rng, depth=3):
         atoms.append(satom)
         stencil_atoms.append(satom)
 
+    # 0–2 early-exit loops — a `break`/`continue` under a per-pixel `if`. Like the stencil
+    # atoms these are folded into the tail explicitly below, because an early-exit loop
+    # whose accumulator never reaches @OUT is dead code the tier comparison cannot see.
+    exit_atoms = []
+    for i in range(rng.randint(0, 2) if rng.random() < 0.4 else 0):
+        elines, eatom = _gen_early_exit(rng, i, atoms)
+        lines.extend(elines)
+        atoms.append(eatom)
+        exit_atoms.append(eatom)
+    if any("$pv" in ln for ln in lines):
+        lines.insert(0, _FUZZ_PARAM_DECL)
+
     tail = _gen_expr_over(rng, edepth, atoms)
     # A generated stencil whose atom never reaches @OUT is DEAD CODE: the tier
     # comparison cannot see it, so it buys no coverage. Drawing the tail from the
@@ -367,6 +415,8 @@ def _gen_program(rng, depth=3):
     # its stencil.
     if stencil_atoms:
         tail = f"({tail} + {rng.choice(stencil_atoms)})"
+    if exit_atoms:
+        tail = f"({tail} + {rng.choice(exit_atoms)})"
 
     lines.append(f"@OUT = vec4({tail}, u, v, 1.0);")
     return " ".join(lines)
@@ -443,7 +493,11 @@ def test_tst1_differential_fuzzer(r: SubTestResult):
     seed = int(os.environ.get("TEX_FUZZ_SEED", "20260708"))
     N = int(os.environ.get("TEX_FUZZ_N", "300"))
     rng = _random.Random(seed)
-    binds = {"A": make_img(1, 32, 32, 3, seed=11), "B": make_img(1, 32, 32, 3, seed=22)}
+    # `pv` is the vec param `_gen_early_exit` may read a component of; binding it for every
+    # program is harmless (a program that never declares `$pv` never references it) and
+    # keeps one binding dict for the whole run.
+    binds = {"A": make_img(1, 32, 32, 3, seed=11), "B": make_img(1, 32, 32, 3, seed=22),
+             **_FUZZ_PARAM_BINDING}
 
     # SELF-TEST: the conditioning-aware comparison must still catch a REAL divergence
     # — a calibration that flags nothing is worthless. Inject a small, WIDESPREAD

@@ -32,7 +32,7 @@ from .interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPo
 from .interpreter import (Interpreter, _collect_identifiers, _consensus_extent,
                           _SCALAR_BUILTIN_DEFAULTS)
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
-                      _iter_child_nodes)
+                      _iter_child_nodes, is_vec_param_list)
 from .stdlib import TEXStdlib
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 
@@ -920,7 +920,12 @@ def _params_on_device(cg_fn, program, bindings: dict, device: "torch.device") ->
     passes the tensor through untouched. Python values only: a tensor binding is co-located by
     `_contiguous_bindings` already, a string stays a string, and a value `as_tensor` cannot
     convert is left for the preamble to raise on, as before. The names come from the program's
-    `$` references, walked once per generated function."""
+    `$` references, walked once per generated function.
+
+    A vec/color param is SKIPPED: `_invoke_cg` stages that class itself, with the `[1,1,1,C]`
+    rank the interpreter binds and in the cook's working dtype, and it stages on the cook
+    device already. Converting it here too would overwrite that with a rank-1 `as_tensor`
+    and put back the very interp↔codegen value divergence the staging exists to close."""
     names = getattr(cg_fn, "_tex_param_names", None)
     if names is None:
         found, stack = set(), list(program.statements)
@@ -933,7 +938,7 @@ def _params_on_device(cg_fn, program, bindings: dict, device: "torch.device") ->
     placed = {}
     for name in names:
         value = bindings.get(name)
-        if value is None or isinstance(value, (torch.Tensor, str)):
+        if value is None or isinstance(value, (torch.Tensor, str)) or is_vec_param_list(value):
             continue
         try:
             placed[name] = torch.as_tensor(value, device=device)

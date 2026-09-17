@@ -42,7 +42,7 @@ from .codegen_stencil import (
     _StencilInfo, _ast_equal, _is_ident, _try_detect_stencil, _try_detect_inline_stencil, detect_stencil_route,
 )
 from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
-                          _broadcast_pair, _ensure_spatial)
+                          _broadcast_pair, _ensure_spatial, vec_list_to_tensor)
 from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
                      set_cook_grid as _stdlib_set_cook_grid,
                      restore_cook_ctx as _stdlib_restore_cook_ctx)  # P0-D: cook grid
@@ -155,6 +155,48 @@ def try_compile(program: Program, type_map: dict[int, TEXType],
         return None
 
 
+def is_vec_param_list(value: Any) -> bool:
+    """True for a vec/color `$param` value — a list/tuple of 2-4 plain numbers.
+
+    Deliberately narrow: a ComfyUI batch list holds TENSORS (graphed `_list_to_static`
+    unwraps element 0) and an array param holds 5+ entries, and neither is the vecN
+    channel-last class. `bool` is excluded because it is an `int` subclass.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) not in (2, 3, 4):
+        return False
+    for c in value:
+        if isinstance(c, bool) or not isinstance(c, (int, float)):
+            return False
+    return True
+
+
+def _stage_vec_params(bindings: dict, device: Any, dtype) -> None:
+    """Bind each vec/color `$param` the way the interpreter binds it — the shared
+    `[1,1,1,C]` channel-last reshape (`vec_list_to_tensor`), on the cook device and in
+    the cook's working dtype — mutating *bindings* in place before the generated call.
+
+    The emitted preamble converts a `$param` with `as_tensor(value)`, which leaves a
+    vec3 widget rank-1 `[3]`, so `$tint.r` lowers to a **0-dim** value where the
+    interpreter's `[1,1,1,3]` gives a rank-3 per-pixel one. That rank is not cosmetic:
+    every runtime "is this per-pixel?" test reads it, so `if ($tint.r > 0.5) { break; }`
+    took the scalar branch on this tier and the per-pixel branch on the interpreter —
+    the same four-iteration loop accumulating 4 here and 0 there, a VALUE divergence of
+    invariant #2 (bit-exactness, not a tolerance), not a shape nicety. It is also why the
+    conversion belongs HERE and not in the emitter: staging at the one invocation seam
+    leaves the generated source byte-identical, so no program's emitted code moves.
+
+    The device is the cook device for the same reason the graph tier's UC-1 stager uses
+    it: once the value stops being 0-dim it no longer mixes with CUDA operands, and the
+    interpreter binds params on the cook device too. `vec_list_to_tensor` is the single
+    source of the reshape rule (interpreter + graph tier); this makes the third tier read
+    from it instead of keeping a drifted copy.
+    """
+    for name, value in bindings.items():
+        if is_vec_param_list(value):
+            bindings[name] = vec_list_to_tensor(
+                value, dtype if dtype is not None else torch.float32, device)
+
+
 def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
                device: Any, spatial_shape: tuple | None, dtype=None) -> None:
     """Invoke a codegen-generated function with the constant argument tail.
@@ -176,7 +218,14 @@ def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
     `_contiguous_bindings` casts only INTEGER bindings, so under `precision="fp16"` an
     fp32 binding would have told codegen "fp32" while the interpreter used
     `_PRECISION_DTYPES[precision]` — reintroducing an interp/codegen split of exactly the
-    class this publish exists to close. The callers all have `precision` already."""
+    class this publish exists to close. The callers all have `precision` already.
+
+    It is also where a vec/color `$param` is staged (`_stage_vec_params`), for the same
+    "one seam serves every tier" reason the cook grid is published here: the generated
+    preamble passes an already-staged tensor through untouched, so the rank the
+    interpreter binds is the rank every codegen tier sees — without a byte of emitted
+    code moving."""
+    _stage_vec_params(bindings, device, dtype)
     _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype)
     try:
         cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
@@ -264,11 +313,18 @@ _SCALAR_EMITTABLE_FNS: frozenset[str] = (
                  "lerp", "clamp", "smoothstep"})               # 3-arg specials
 )
 
-# Builtins that are spatially-varying tensors at runtime (shape [B,H,W] or
-# [1,1,W] etc.) despite being typed as FLOAT by the type checker.
+# Builtins the interpreter binds as NON-0-dim tensors at runtime (shape [B,H,W],
+# [1,1,W], [B,1,1] ...) despite being typed as FLOAT by the type checker.
 # Used to exclude loops from scalar mode.
-# NOTE: iw/ih/fi/fn are scalar (0-dim) so NOT included here.
-_SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy"))
+# `fi` belongs here: `_create_builtins` binds it `torch.arange(...).view(B,1,1)` — rank 3,
+# per-FRAME rather than per-pixel, but the classifier's question is "0-dim or not", and
+# the answer decides which branch a break/continue guard takes. While `fi` was missing, a
+# loop whose only tensor signal was `fi` compiled scalar, `.item()`-ed the frame index and
+# evaluated `if (fi > 5.0) { break; }` as a Python bool — four iterations where the
+# interpreter's rank-3 path took the per-pixel branch and ran none (invariant #2 is
+# bit-exactness: 4 vs 0 is not a tolerance). iw/ih/fn/px/py/PI/TAU/E/ic ARE 0-dim, so they
+# stay out; {u, v, ix, iy, fi} is the complete non-0-dim set `_create_builtins` can bind.
+_SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy", "fi"))
 
 # Stdlib functions that read/write spatial image data — incompatible with
 # the scalar loop fast path.
