@@ -1532,6 +1532,7 @@ def main():
         test_control_flow_custom_blend_matches_a_per_pixel_reference,
         test_control_flow_while_loop_matches_a_per_pixel_reference,
         test_control_flow_vector_blur_matches_a_per_pixel_reference,
+        test_control_flow_recursive_pattern_matches_a_per_pixel_reference,
         test_control_flow_fixed_examples_keep_their_surface,
     )
     test_control_flow_per_pixel_condition_semantics_both_tiers(r)
@@ -1547,6 +1548,7 @@ def main():
     test_control_flow_custom_blend_matches_a_per_pixel_reference(r)
     test_control_flow_while_loop_matches_a_per_pixel_reference(r)
     test_control_flow_vector_blur_matches_a_per_pixel_reference(r)
+    test_control_flow_recursive_pattern_matches_a_per_pixel_reference(r)
     test_control_flow_fixed_examples_keep_their_surface(r)
 
     success = r.summary()

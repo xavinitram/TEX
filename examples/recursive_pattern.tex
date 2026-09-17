@@ -5,6 +5,11 @@
 // Mandelbrot recurrence z = z^2 + c, and colors by escape time
 // using a smooth cosine palette.
 //
+// The escape test reads each pixel's own orbit, so a `return` under it would
+// return for EVERY pixel the first time the loop reached it (LANGUAGE.md §7.1).
+// Each pixel keeps a `done` flag instead: it records its own escape step and
+// stops iterating, while the loop runs max_iter passes, the same for every pixel.
+//
 // Inputs:  (none — purely procedural)
 // Outputs: @OUT (vec3)
 
@@ -12,17 +17,20 @@ float iterate(float zr, float zi, float cr, float ci, int max_iter) {
     float r = zr;
     float i = zi;
     float escape = 0.0;
+    float done = 0.0;              // 1.0 once this pixel's orbit has escaped
     for (int n = 0; n < max_iter; n++) {
-        float r2 = r * r - i * i + cr;
-        float i2 = 2.0 * r * i + ci;
-        r = r2;
-        i = i2;
-        if (r * r + i * i > 4.0) {
-            escape = float(n) / float(max_iter);
-            return escape;
+        if (done < 0.5) {
+            float r2 = r * r - i * i + cr;
+            float i2 = 2.0 * r * i + ci;
+            r = r2;
+            i = i2;
+            if (r * r + i * i > 4.0) {
+                escape = float(n) / float(max_iter);
+                done = 1.0;
+            }
         }
     }
-    return 0.0;
+    return escape;
 }
 
 vec3 palette(float t) {

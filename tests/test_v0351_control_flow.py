@@ -813,6 +813,55 @@ def test_control_flow_vector_blur_matches_a_per_pixel_reference(r: SubTestResult
     _check_example(r, "vector_blur.tex", _vector_blur_cases)
 
 
+def _ref_mandelbrot(H, W, zoom, cx, cy, iterations):
+    """The escape-time fractal, one pixel at a time, with an ordinary early `break`."""
+    out = []
+    for y in range(H):
+        orow = []
+        for x in range(W):
+            u, v = x / max(W - 1, 1), y / max(H - 1, 1)
+            cr = (u - 0.5) * 3.0 / zoom + cx
+            ci = (v - 0.5) * 2.0 / zoom + cy
+            r = i = 0.0
+            escape = 0.0
+            for n in range(iterations):
+                r, i = r * r - i * i + cr, 2.0 * r * i + ci
+                if r * r + i * i > 4.0:
+                    escape = n / iterations
+                    break
+            if escape > 0.0:            # as the example writes it: n = 0 stays black
+                orow.append([0.5 + 0.5 * math.cos(math.tau * (escape + k))
+                             for k in (0.0, 0.33, 0.67)])
+            else:
+                orow.append([0.0, 0.0, 0.0])
+        out.append(orow)
+    return out
+
+
+def _recursive_pattern_cases():
+    # Purely procedural: an unread image binding is what gives the cook its grid, the way a
+    # host wires one in (`_consensus_extent`), and it changes nothing the program computes.
+    H, W = 9, 14
+    torch.manual_seed(21)
+    grid = torch.rand(1, H, W, 3)
+    base = {"image": grid, "zoom_level": 1.0, "center_x": -0.5, "center_y": 0.0, "iterations": 50}
+    zoomed = dict(base, zoom_level=4.0, center_x=-0.75, center_y=0.1, iterations=30)
+    return [
+        ("the default view", base, _ref_mandelbrot(H, W, 1.0, -0.5, 0.0, 50), _EPS_FLOAT),
+        ("zoomed in on the seahorse valley, 30 iterations", zoomed,
+         _ref_mandelbrot(H, W, 4.0, -0.75, 0.1, 30), _EPS_FLOAT),
+    ]
+
+
+def test_control_flow_recursive_pattern_matches_a_per_pixel_reference(r: SubTestResult):
+    print("\n--- examples/recursive_pattern.tex against a per-pixel reference, both tiers ---")
+
+    def extra(label, oi, oc):
+        lit = int((oi[0].sum(-1) > 0).sum())
+        assert lit > 0, "every pixel is black: the escape step is not recorded per pixel"
+    _check_example(r, "recursive_pattern.tex", _recursive_pattern_cases, extra)
+
+
 # The snippet-menu line and the widget surface a user sees must not move with the fix.
 _EXAMPLE_SURFACE = {
     "fix_pixels.tex": ("// Fix Pixels — sanitize NaN and Inf values in images",
@@ -825,6 +874,12 @@ _EXAMPLE_SURFACE = {
                        {"tolerance": 0.0001, "max_iter": 20}, {"image"}),
     "vector_blur.tex": ("// Vector Blur — directional per-pixel motion blur driven by a vector map",
                         {"strength": 20.0, "max_samples": 32}, {"image", "vectors"}),
+    # `center_x`'s default reads None because a NEGATIVE literal default is not recorded by
+    # the type checker (`f$center_x = -0.5;`) — true at the base too, so this row pins the
+    # surface as UNCHANGED by the fix, not as correct.
+    "recursive_pattern.tex": ("// Mandelbrot Fractal — escape-time fractal with cosine palette",
+                              {"zoom_level": 1.0, "center_x": None, "center_y": 0.0,
+                               "iterations": 50}, set()),
 }
 
 
@@ -845,3 +900,17 @@ def test_control_flow_fixed_examples_keep_their_surface(r: SubTestResult):
             r.ok(f"examples/{name}: same menu line, params, inputs and outputs; no W7007")
         except Exception as e:
             r.fail(f"example surface {name}", f"{type(e).__name__}: {e}")
+    try:
+        # The curriculum as a whole: no shipped example may rely on control flow acting on
+        # every pixel. W7006 (a per-pixel branch that gathers) is a cost note, not a defect,
+        # and several examples keep it truthfully.
+        flagged = {}
+        for name in sorted(f for f in os.listdir(_EXAMPLES) if f.endswith(".tex")):
+            codes = sorted({d.code for d in tex_api.control_flow_advisories(_read("examples", name), {})})
+            if codes:
+                flagged[name] = codes
+        w7007 = {n: c for n, c in flagged.items() if "W7007" in c}
+        assert not w7007, f"shipped examples still exit or bound per pixel: {w7007}"
+        r.ok(f"no shipped example carries W7007; {len(flagged)} carry W7006 (a cost note)")
+    except Exception as e:
+        r.fail("shipped examples free of W7007", f"{type(e).__name__}: {e}")
