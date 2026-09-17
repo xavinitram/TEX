@@ -5,6 +5,27 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.2] - 2026-09-17
+
+**Say what it does, published.** `v0.35.1`'s tag was pushed but never published to the Comfy
+registry: its CI run failed the test step on Ubuntu/CPU/no-ComfyUI, because one new test called
+the node's v3 schema, which needs `comfy_api`, so CI's TST-8 release gate refused the publish and
+the registry still carried `v0.35.0`. `v0.35.2` is `v0.35.1` plus that one test correction — no
+product code changes.
+
+### Fixed
+
+- **CI lane assumed ComfyUI was importable.** `test_trk24_negative_param_defaults.py`'s
+  `test_tex_node_widget_defaults_unchanged` called `TEXWrangleNode.define_schema()`
+  unconditionally, which calls `IO.Schema(...)` straight through; `tex_node.IO` is `None`
+  whenever `comfy_api` is not importable (`_V3_AVAILABLE=False`), so the call raised on every CI
+  runner. The test now pins the same widget defaults by AST-parsing the literal `default=`
+  kwargs out of `define_schema()`'s source, a check that needs no `comfy_api` import, and only
+  additionally exercises the live `define_schema()` object when `_V3_AVAILABLE` is `True`. Every
+  other test file added since `v0.35.0` was audited for the same class of assumption; none
+  needed a change. ComfyUI-invisible because this is a test-only change — no file outside
+  `tests/` was touched.
+
 ## [0.35.1] - 2026-09-17
 
 **Say what it does** — the reference states the per-pixel control flow the engine has always had,
