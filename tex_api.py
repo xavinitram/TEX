@@ -261,14 +261,37 @@ def color_advisories(source: str, param_values: dict | None, binding_meta: dict 
 # count. The walk is flow-sensitive (a plain `x = …;` re-decides `x`) with each loop iterated
 # to a fixed point, and follows the engine's merge rule (`collect_assigned_vars`): a merged
 # name broadcasts only when it existed before the `if` or both branches define it.
+#
+# W7008 (TRK-25) is the subset of that the ENGINE now acts on: a loop whose condition can
+# differ per pixel, or a per-pixel `if` that assigns a string. Those two shapes make the
+# output depend on WHICH REGION is cooked (the loop runs to the region's maximum; the string
+# merge is a region-wide majority vote), so the planners decline to split the cook —
+# see `tex_roi.region_dependent`. W7007 also covers `break`/`continue`/`return` under a
+# per-pixel `if`, which is region-INDEPENDENT (the escape fires on first arrival, identically
+# in every region) and therefore draws no W7008.
 _PER_PIXEL_BUILTINS = frozenset(("u", "v", "ix", "iy", "fi"))
 _VEC_PARAM_HINTS = frozenset(("c", "v", "v2", "v3", "v4"))
 _CF_KEYWORD_LEN = {"IfElse": 2, "ForLoop": 3, "WhileLoop": 5, "BreakStmt": 5,
                    "ContinueStmt": 8, "ReturnStmt": 6, "TernaryOp": 1}
 
+_STRING_RET_CACHE: "frozenset | None" = None
+
+
+def _string_ret_fns() -> frozenset:
+    """Stdlib function names whose declared return type is STRING, from the compiler-side
+    signature table (the single source). Lazy, like `tex_roi._footmap`."""
+    global _STRING_RET_CACHE
+    if _STRING_RET_CACHE is None:
+        from .tex_compiler.stdlib_signatures import FUNCTION_SIGNATURES
+        from .tex_compiler.types import TEXType
+        _STRING_RET_CACHE = frozenset(
+            name for name, sig in FUNCTION_SIGNATURES.items()
+            if isinstance(sig, dict) and sig.get("return") is TEXType.STRING)
+    return _STRING_RET_CACHE
+
 
 def control_flow_advisories(source: str, binding_types: dict) -> list:
-    """W7006 / W7007 diagnostics — opt-in advisories for control flow on a condition that
+    """W7006 / W7007 / W7008 diagnostics — opt-in advisories for control flow on a condition that
     can differ from pixel to pixel (LANGUAGE.md §7.1). `binding_types` is the same
     `{name: TEXType}` map `check()` takes; only a STRING type changes the result (a string
     wire never differs per pixel).
@@ -279,6 +302,13 @@ def control_flow_advisories(source: str, binding_types: dict) -> list:
         Both branches run on every pixel, so the gather is never skipped.
       * **W7007** — control flow that acts on every pixel: `break` / `continue` / `return`
         under such an `if`, or a `for` / `while` whose condition can differ per pixel.
+      * **W7008** — control flow whose result depends on WHICH REGION is cooked, so the engine
+        declines to split the cook (`tex_roi.region_dependent`): a `for` / `while` whose
+        condition can differ per pixel (the loop runs to the region's maximum), or a per-pixel
+        `if` that assigns a string (the merge is a region-wide majority vote). Strictly the
+        subset of W7007 the engine ACTS on — a `break` / `continue` / `return` under a
+        per-pixel `if` draws W7007 and no W7008, because it fires on first arrival and so does
+        the same thing in every region.
 
     Never emitted by `check()`: a host calls this beside it. Pure AST analysis — no compile,
     no cook, no side effects — and total: a program that does not parse, or that the
@@ -360,6 +390,33 @@ class _ControlFlowLint:
         self.gathers = {name: False for name in self.fns}       # the body holds a gather
         self.all_vary = set()                                   # free names a body may inherit
         self.all_defined = set()
+        # TRK-25 clause (c): names that can hold a STRING. A per-pixel `if` that assigns one is
+        # resolved by a region-wide MAJORITY VOTE over the pixels being cooked, so its value
+        # depends on how the cook was split. Name-based and deliberately over-approximating (no
+        # scoping, no dataflow): a declared `string`, a STRING-typed wire, or any name assigned a
+        # string literal / a string-returning stdlib call anywhere in the program.
+        self.string_names = set(self.string_wires)
+        for n in self._walk(program):
+            cls = type(n)
+            if cls is A.VarDecl:
+                if (n.type_name or "").lower() == "string" or self._is_string_expr(n.initializer):
+                    self.string_names.add(n.name)
+            elif cls is A.ArrayDecl:
+                if (n.element_type_name or "").lower() == "string":
+                    self.string_names.add(n.name)
+            elif cls is A.Assignment and self._is_string_expr(n.value):
+                t = n.target
+                while type(t) is A.ChannelAccess:
+                    t = t.object
+                if type(t) is A.ArrayIndexAccess:
+                    t = t.array
+                if type(t) is A.Identifier or type(t) is A.BindingRef:
+                    self.string_names.add(t.name)
+        # TRK-25: which nodes made the program REGION-DEPENDENT, recorded on every pass (the
+        # facts only grow, and an id-keyed set makes the repetition idempotent) so the predicate
+        # can read them without asking for diagnostics. `tex_roi.region_dependent` reads these.
+        self.varying_loops = set()      # id(ForLoop/WhileLoop) — clauses (a) and (b)
+        self.string_ifs = set()         # id(IfElse) — clause (c)
         self.emit = False
         self.diags = {}
         self.budget = 200_000 + 200 * sum(1 for _ in self._walk(program))
@@ -376,6 +433,17 @@ class _ControlFlowLint:
         self.budget -= 1
         if self.budget < 0:
             raise _CFBudget()
+
+    def _is_string_expr(self, expr) -> bool:
+        """Does this expression obviously produce a STRING? (a literal, or a stdlib call whose
+        signature returns one). Syntactic — clause (c) over-approximates by construction."""
+        if expr is None:
+            return False
+        A = self.A
+        cls = type(expr)
+        if cls is A.StringLiteral:
+            return True
+        return cls is A.FunctionCall and expr.name in _string_ret_fns()
 
     def _varies(self, expr, st) -> bool:
         A = self.A
@@ -463,6 +531,19 @@ class _ControlFlowLint:
         self.emit = True
         self._pass()
         return sorted(self.diags.values(), key=lambda d: (d.loc.line, d.loc.col, d.code))
+
+    def region_clauses(self):
+        """TRK-25: run the same fixed point WITHOUT emitting anything, and return
+        `(varying_loops, string_ifs)` — the id sets behind clauses (a)/(b) and clause (c) of
+        `tex_roi.region_dependent`. No diagnostic is built, and the gather fixed point (which
+        only W7006 reads) is skipped. Raises `_CFBudget` past the work budget, which the
+        predicate turns into 'region-dependent' — it is a GATE, so it fails closed."""
+        while True:
+            before = self._facts()
+            self._pass()
+            if self._facts() == before:
+                break
+        return self.varying_loops, self.string_ifs
 
     def _facts(self):
         return (tuple(sorted((k, tuple(sorted(v))) for k, v in self.params_vary.items())),
@@ -608,10 +689,18 @@ class _ControlFlowLint:
             # The engine's merge: a name either branch assigns or declares is torch.where-d
             # to the condition's shape when it held a value before the `if` or both branches
             # define it; otherwise the one branch's value is kept as it is.
-            names = collect_assigned_vars(s.then_body)[0] | collect_assigned_vars(s.else_body)[0]
+            then_env, then_bind = collect_assigned_vars(s.then_body)
+            else_env, else_bind = collect_assigned_vars(s.else_body)
+            names = then_env | else_env
             for name in names:
                 if name in st.defined or (name in then_st.defined and name in else_st.defined):
                     self._set(out, name, True, strong=False)
+            # TRK-25 clause (c). A STRING has no per-pixel representation, so the merge resolves
+            # it by a majority vote over the pixels of the region being cooked — a different
+            # region can hold a different majority. `@bindings` are included alongside locals
+            # because a called function CAN write a caller-visible binding under this branch.
+            if self.string_names & (names | then_bind | else_bind):
+                self.string_ifs.add(id(s))
         return out
 
     def _loop(self, s, st, scope, outer_loop, pp_fn):
@@ -644,6 +733,9 @@ class _ControlFlowLint:
                        "Bound the loop by a value that is the same for every pixel and guard or "
                        "weight the per-pixel work, e.g. `for (int i = 0; i < $max; i++) "
                        "{ if (i < n) { ... } }` (LANGUAGE.md §7.1).")
+            # TRK-25 clauses (a)/(b): the pass count is the region's MAXIMUM, so the output
+            # depends on which region was cooked. This is the half of W7007 the engine acts on.
+            self.varying_loops.add(id(s))
         out = head.copy()
         for b in frame.breaks:
             out.join(b)

@@ -326,6 +326,94 @@ def _mark_whole(reads: dict, img_node, gather_node, state: dict) -> None:
     e.whole = _lub(e.whole, fp)
 
 
+# ── TRK-25: region dependence (the iteration axis) ────────────────────────────
+#
+# `roi_plan` asks "is this program safe to cook on a sub-region" on the SPATIAL axis and
+# `batch_sliceable` on the BATCH axis. This is the same question on the ITERATION axis: can the
+# output depend on WHICH REGION was cooked, rather than only on the pixel?
+#
+# It can, in exactly two ways, both of which REDUCE a per-pixel value over the cooked region:
+#   (a)/(b) a `for`/`while` whose condition is not uniform. The interpreter decides "keep
+#           looping" with `(cond > 0.5).any()` over the region and does not mask the body, so
+#           every pixel runs as many passes as the hungriest pixel IN ITS REGION. Split the
+#           frame and a pixel's pass count changes. A condition that is 0-dim but whose VALUE
+#           is region-derived (`img_mean(@A)`, `img_width`) is the same defect and needs no
+#           separate rule: the footprint rule below already calls those non-uniform.
+#   (c)     a per-pixel `if` that assigns a STRING. A string has no per-pixel representation,
+#           so the merge resolves it by a majority vote over the region's pixels, and a strip
+#           can hold a different majority than the frame.
+#
+# NOT region-dependent, and deliberately not declined: `break`/`continue`/`return` under a
+# per-pixel guard. Those fire on FIRST ARRIVAL at the statement — a structural fact, identical
+# in every region — so declining them would refuse a class that splits correctly.
+#
+# The rule set for "non-uniform" is NOT re-derived here. It is `tex_api._ControlFlowLint`, the
+# flow-sensitive, user-function-aware analysis that already backs the W7007 advisory a host
+# reads; a second definition of "per-pixel" would drift against it.
+
+#: The language version at which loops become pointwise (masked per-pixel control flow). From
+#: then on clauses (a)/(b) are moot — a split equals the whole frame — but clause (c) is NOT,
+#: because the majority-vote string merge is kept verbatim. Hence a PER-CLAUSE gate.
+MASKED_FLOW_SINCE = (0, 25)
+
+
+def _language_tuple(program, code) -> tuple:
+    """The language level this program targets, as `(major, minor)`. Reads a parser-set
+    `Program.language` when one exists and falls back to the source pragma, so the day the
+    parser carries the field no call site here has to move."""
+    from . import tex_api
+    lang = getattr(program, "language", None) or tex_api.language_pragma(code or "")
+    return tex_api._ver_tuple(lang) if lang else (0, 0)
+
+
+def region_dependent(program, binding_types=None, code=None) -> bool:
+    """True when this program's output can depend on WHICH REGION is cooked — so strips, an ROI
+    window and batch strips must all be declined and the cook run whole-frame.
+
+    A pure function of `(source, binding types)`: nothing about values, device, shape or
+    precision enters. `code` supplies the `//!tex X.Y` pragma for the sunset gate (§ the
+    comment above); passing None simply means "no pragma visible", which is the conservative
+    answer.
+
+    FAILS CLOSED. `control_flow_advisories` swallows an over-budget analysis into `[]`, which is
+    right for an advisory and wrong for a gate, so ANY exception here answers True (decline the
+    split) rather than silently re-opening a route that returns wrong pixels."""
+    try:
+        from . import tex_api
+        lint = tex_api._ControlFlowLint(
+            program, "", binding_types if isinstance(binding_types, dict) else {})
+        loops, strings = lint.region_clauses()
+        if strings:
+            return True                       # clause (c) never sunsets
+        return bool(loops) and _language_tuple(program, code) < MASKED_FLOW_SINCE
+    except Exception:
+        return True
+
+
+_REGION_DEP_MEMO_MAX = 256
+_region_dep_memo: "OrderedDict[str, bool]" = OrderedDict()
+
+
+def region_dependent_cached(program, fingerprint, binding_types=None, code=None) -> bool:
+    """`region_dependent` memoized per cook fingerprint — the mirror of
+    `tex_memory.is_tile_safe_cached`, cap included. The fingerprint is
+    `sha256(len(code) ‖ code ‖ binding_key)`, which encodes exactly the two things this
+    predicate is a function of. `fingerprint=None` (a fused chain, whose AST is spliced per
+    cook) falls through to the uncached walk — no splitter reaches that case. Stored values are
+    always bool, so `.get() is None` unambiguously means 'absent'."""
+    if fingerprint is None:
+        return region_dependent(program, binding_types, code)
+    v = _region_dep_memo.get(fingerprint)
+    if v is None:
+        v = region_dependent(program, binding_types, code)
+        _region_dep_memo[fingerprint] = v
+        while len(_region_dep_memo) > _REGION_DEP_MEMO_MAX:
+            _region_dep_memo.popitem(last=False)
+    else:
+        _region_dep_memo.move_to_end(fingerprint)
+    return v
+
+
 # ── Public analysis ───────────────────────────────────────────────────────────
 
 _MEMO_MAX = 256
@@ -922,3 +1010,4 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
 def clear_roi_memo() -> None:
     """Test hook (mirrors tex_lazy.clear_lazy_memo)."""
     _walk_memo.clear()
+    _region_dep_memo.clear()

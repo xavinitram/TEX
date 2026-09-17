@@ -1671,6 +1671,21 @@ def main():
     test_ask6c_reserved_name_e3011(r)
     test_ask6c_captures_where_uniform_if_would_not(r)
 
+    # TRK-25: a program whose control flow reduces a per-pixel value over the cooked region
+    # is cooked WHOLE — strips, windows and batch strips are all declined — and the shapes
+    # that split correctly (static/uniform loops, break/continue under a per-pixel guard)
+    # keep splitting.
+    from test_v036_region_dependence import (
+        test_t1_repro_is_region_dependent,
+        test_t7_predicate_is_not_a_blanket_disable,
+        test_t7_no_shipped_program_is_declined,
+        test_t11_analysis_failure_declines_the_split,
+    )
+    test_t1_repro_is_region_dependent(r)
+    test_t7_predicate_is_not_a_blanket_disable(r)
+    test_t7_no_shipped_program_is_declined(r)
+    test_t11_analysis_failure_declines_the_split(r)
+
     success = r.summary()
     return 0 if success else 1
 
