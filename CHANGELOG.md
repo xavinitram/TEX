@@ -5,6 +5,45 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Under GPU memory pressure, a program with a per-pixel loop bound could be cooked in
+  strips and return the wrong picture, silently.** The interpreter keeps a loop running while
+  *any* pixel's condition holds and does not mask the body, so every pixel runs as many passes
+  as the hungriest pixel — and "hungriest" is counted over the region actually being cooked.
+  Split the frame and the answer changes: measured 2.0 at two strips and 3.0 at four on an
+  8×2 repro, with no diagnostic and a plausible-looking result. A string assigned inside a
+  per-pixel `if` is a second case of the same defect: the merge resolves it by a majority vote
+  over the region's pixels, and a strip can hold a different majority than the frame. The
+  three planners that split a cook now decline such a program — horizontal strips
+  (`tex_engine._tile_plan`), windows and the halo strips and chain windowing built on them
+  (`tex_roi.roi_plan`), and batch strips (`tex_roi.batch_sliceable`) — and the OOM ladder
+  falls through both of its rungs rather than recovering a wrong picture. The executors are
+  unchanged. **The one deliberate behaviour change:** a pressured CUDA cook of such a program
+  now gets whole-frame-or-OOM where it used to get a wrong tiled picture, and the OOM it
+  raises is the original one, unwrapped, so the host's own memory handling still fires. A
+  `break`, `continue` or `return` under a per-pixel guard is *not* affected — it acts on first
+  arrival, identically in every region, so it still splits, which is asserted as a count over
+  all 116 shipped examples and all 6 stock tools: none of them is declined.
+  ComfyUI-invisible because the check sits after each planner's memory-pressure test, so an
+  unpressured cook never reaches it and a CPU cook returns earlier still.
+
+### Added
+
+- **`W7008`**, an opt-in advisory from `tex_api.control_flow_advisories`, naming exactly the
+  programs the engine will now refuse to split: a `for`/`while` whose condition can differ
+  from pixel to pixel, or a string assigned under a per-pixel `if`. It is the subset of
+  `W7007` the engine *acts on*, so a host keying on codes can tell "this is surprising" from
+  "this changes how your cook is scheduled". Like `W7005`–`W7007` it is never emitted by
+  `check()`, so the editor's live lint and `tex_lsp` are untouched.
+- `tex_roi.region_dependent(program, binding_types=None, code=None)` and its per-fingerprint
+  memo, for a host that wants the same verdict before choosing how to cook. A program
+  declaring `//!tex 0.25` or newer retires the loop clause (masked per-pixel control flow
+  makes a split equal the whole frame); the string clause is kept, because that rule does not
+  change.
+
 ## [0.35.3] - 2026-09-17
 
 **The first release actually published since `v0.35.0`.** `v0.35.1` ("Say what it does") and

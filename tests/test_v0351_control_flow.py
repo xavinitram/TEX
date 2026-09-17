@@ -25,7 +25,7 @@ from TEX_Wrangle.tex_compiler.types import TEXType
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _EXAMPLES = os.path.join(_ROOT, "examples")
-_ADVISORY_CODES = ("W7006", "W7007")
+_ADVISORY_CODES = ("W7006", "W7007", "W7008")
 
 
 def _read(*parts):
@@ -273,13 +273,15 @@ _W7007_SHAPES = [
      "float bad(vec3 c) {\n    if (isnan(c.r)) { return 1.0; }\n    return 0.0;\n}\n"
      "@OUT = vec3(bad(@A.rgb));",
      {2: ["W7007"]}),
+    # TRK-25: a per-pixel loop BOUND also draws W7008 — it is the half of W7007 whose answer
+    # depends on which region was cooked, so the engine declines to split the cook for it.
     ("a per-pixel for bound",
      "int n = int(@A.r * 8.0);\nvec3 s = vec3(0.0);\nfor (int i = 0; i < n; i++) {\n"
      "    s += @A.rgb;\n}\n@OUT = s;",
-     {3: ["W7007"]}),
+     {3: ["W7007", "W7008"]}),
     ("a per-pixel while condition",
      "float x = u;\nwhile (x < 1.0) {\n    x = x + 0.1;\n}\n@OUT = vec3(x);",
-     {2: ["W7007"]}),
+     {2: ["W7007", "W7008"]}),
     ("a continue under a per-pixel if",
      "float acc = 0.0;\nfor (int k = 0; k < 3; k++) {\n    if (v > 0.5) {\n        continue;\n"
      "    }\n    acc += 1.0;\n}\n@OUT = vec3(acc);",
@@ -295,7 +297,7 @@ _W7007_SHAPES = [
     ("a loop bound merged per pixel by an earlier pass",
      "int n = 2;\nint k = 0;\nwhile (k < n) {\n    if (@A.r > 0.5) { n = 4; }\n    k = k + 1;\n}\n"
      "@OUT = @A;",
-     {3: ["W7007"]}),
+     {3: ["W7007", "W7008"]}),
     ("a vector parameter's component",
      "v3$tint = vec3(0.0, 0.0, 0.0);\nfor (int k = 0; k < 3; k++) {\n"
      "    if ($tint.r > 0.5) { break; }\n}\n@OUT = @A;",

@@ -421,6 +421,26 @@ MUTATIONS = [
      'tex_runtime/compiled.py',
      '        if value is None or isinstance(value, (torch.Tensor, str)) or is_vec_param_list(value):',
      '        if value is None or isinstance(value, (torch.Tensor, str)):'),
+    # ── TRK-25 (region dependence) ────────────────────────────────────────────────────
+    # Each row closes a different route, so each gets its own: a mutant only one of them
+    # kills would otherwise hide behind the others.
+    ("TRK-25: roi_plan stops refusing a region-dependent program", "tex_roi.py",
+     "    if blocked or region_dep:",
+     "    if blocked:"),
+    ("TRK-25: the strip planner stops consulting the predicate", "tex_engine.py",
+     "        if tex_roi.region_dependent_cached(program, fingerprint, code=code):\n"
+     "            return None\n"
+     "        return n",
+     "        if False:\n"
+     "            return None\n"
+     "        return n"),
+    ("TRK-25: the predicate fails OPEN instead of closed", "tex_roi.py",
+     "        return bool(loops) and _language_tuple(program, code) < MASKED_FLOW_SINCE\n"
+     "    except Exception:\n"
+     "        return True",
+     "        return bool(loops) and _language_tuple(program, code) < MASKED_FLOW_SINCE\n"
+     "    except Exception:\n"
+     "        return False"),
 ]
 
 RUNNER = """

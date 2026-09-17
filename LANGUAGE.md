@@ -291,13 +291,24 @@ per-pixel `if` and assigned inside it is per-pixel after it.
   the pixel that needs the most, and does not mask the body: a pixel whose own condition is
   already false keeps executing it. Bound the loop uniformly and guard or weight the per-pixel
   work, for example `for (int i = 0; i < $max; i++) { if (i < n) { sum += tap; } }`.
+* A per-pixel loop bound also means **the cook is never split**. "As many passes as the pixel
+  that needs the most" is counted over the region actually being cooked, so a half-frame strip
+  and the whole frame give different answers; the same is true of a string assigned inside a
+  per-pixel `if`, which is resolved by a majority vote over the region's pixels. The engine
+  therefore cooks such a program as one whole region — no window, no strips, no batch strips.
+  That is always correct, and it costs one thing: on a GPU, a frame too large to cook whole
+  runs out of memory where a split would have fitted. A uniformly bounded loop splits again.
 
 A host can ask for these as warnings with `tex_api.control_flow_advisories(source,
 binding_types)`: **W7006** marks a per-pixel `if` or `?:` with a gather (`sample`, `fetch`,
-`@A(u, v)`, a blur, a reduction) in a branch, and **W7007** marks control flow that acts on
+`@A(u, v)`, a blur, a reduction) in a branch; **W7007** marks control flow that acts on
 every pixel, meaning a `break`, `continue` or `return` under a per-pixel `if`, or a loop whose
-condition is per-pixel. They are opt-in: `tex_api.check()`, and so the editor's live lint,
-never reports them.
+condition is per-pixel; and **W7008** marks the shapes whose result depends on which region is
+cooked, so the engine declines to split the cook — a per-pixel loop bound, or a string
+assigned under a per-pixel `if`. W7008 is the part of W7007 the engine acts on: a `break`
+under a per-pixel `if` draws W7007 and no W7008, because it fires on first arrival and so
+does the same thing in every region. All three are opt-in: `tex_api.check()`, and so the
+editor's live lint, never reports them.
 
 ---
 

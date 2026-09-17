@@ -701,6 +701,14 @@ class _ControlFlowLint:
             # because a called function CAN write a caller-visible binding under this branch.
             if self.string_names & (names | then_bind | else_bind):
                 self.string_ifs.add(id(s))
+                self._warn("W7008", s,
+                           "A string assigned inside an `if` whose condition can differ from "
+                           "pixel to pixel is resolved by a majority vote over the pixels of "
+                           "the region being cooked, so its value depends on how the cook was "
+                           "split. This program is therefore cooked as one whole region.",
+                           "Decide the string from a value that is the same for every pixel (a "
+                           "parameter, a literal, `iw`/`ih`), or carry the per-pixel decision "
+                           "in a number instead (LANGUAGE.md §7.1).")
         return out
 
     def _loop(self, s, st, scope, outer_loop, pp_fn):
@@ -736,6 +744,16 @@ class _ControlFlowLint:
             # TRK-25 clauses (a)/(b): the pass count is the region's MAXIMUM, so the output
             # depends on which region was cooked. This is the half of W7007 the engine acts on.
             self.varying_loops.add(id(s))
+            self._warn("W7008", s,
+                       "This loop's bound can differ from pixel to pixel, so the number of "
+                       "passes depends on which region is cooked. The engine therefore cooks "
+                       "this program as one whole region: windows, strips and batch strips are "
+                       "declined, and under memory pressure the cook can run out of memory "
+                       "where a split would have fitted.",
+                       "Bound the loop by a value that is the same for every pixel and guard or "
+                       "weight the per-pixel work, e.g. `for (int i = 0; i < $max; i++) "
+                       "{ if (i < n) { ... } }`. A uniformly bounded loop splits again "
+                       "(LANGUAGE.md §7.1).")
         out = head.copy()
         for b in frame.breaks:
             out.join(b)

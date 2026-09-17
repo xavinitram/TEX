@@ -133,6 +133,11 @@ def _maxdiff(a, b):
     return float((a - b).abs().max())
 
 
+def _read_repo(*parts):
+    with open(os.path.join(_ROOT, *parts), encoding="utf-8") as f:
+        return f.read()
+
+
 def _example_sources():
     for path in sorted(glob.glob(os.path.join(_ROOT, "examples", "*.tex"))):
         with open(path, encoding="utf-8") as f:
@@ -546,3 +551,159 @@ def test_t9_gate_is_never_reached_on_an_unpressured_cook(r: SubTestResult):
         r.ok("compiled.clear_compiled_cache() clears the memo, beside _tile_safe_memo")
     except Exception as e:
         r.fail("T9 memo clear", f"{type(e).__name__}: {e}")
+
+
+# ── T8: the pragma sunset, per clause ───────────────────────────────────────
+
+def test_t8_pragma_sunsets_the_loop_clause_only(r: SubTestResult):
+    print("\n--- T8: language 0.25 retires clauses (a)/(b), never clause (c) ---")
+    try:
+        assert tex_roi.MASKED_FLOW_SINCE == (0, 25)
+        r.ok("MASKED_FLOW_SINCE is the single (0, 25) constant")
+    except Exception as e:
+        r.fail("T8 constant", f"{type(e).__name__}: {e}")
+
+    masked = "//!tex 0.25\n" + REPRO
+    try:
+        assert tex_roi.region_dependent(_parse(masked), code=masked) is False, \
+            "a program declaring the masked-flow language is still declined"
+        assert tex_roi.roi_plan(masked, {}).executable is True, \
+            "roi_plan still refuses a masked-flow program"
+        r.ok("`//!tex 0.25` retires the loop clause and the window is executable again")
+    except Exception as e:
+        r.fail("T8 sunset", f"{type(e).__name__}: {e}")
+
+    for label, src in (("an older pragma", "//!tex 0.24\n" + REPRO),
+                       ("no pragma", REPRO),
+                       ("a pragma after real code", "@OUT = @A;\n//!tex 0.25\n" + REPRO)):
+        try:
+            assert tex_roi.region_dependent(_parse(src), code=src) is True
+            r.ok(f"still declined with {label}")
+        except Exception as e:
+            r.fail(f"T8 {label}", f"{type(e).__name__}: {e}")
+
+    try:
+        masked_string = "//!tex 0.25\n" + STRING_REPRO
+        assert tex_roi.region_dependent(_parse(masked_string), code=masked_string) is True, \
+            "clause (c) must NOT sunset: the masked-flow rules keep the majority vote verbatim"
+        r.ok("the string clause survives the pragma, which is why the gate is per-clause")
+    except Exception as e:
+        r.fail("T8 clause (c) does not sunset", f"{type(e).__name__}: {e}")
+
+
+# ── T10: the advisory ────────────────────────────────────────────────────────
+
+def _codes_by_line(source, binding_types=None):
+    out = {}
+    for d in tex_api.control_flow_advisories(source, binding_types or {}):
+        out.setdefault(d.loc.line, []).append(d.code)
+    return out
+
+
+def test_t10_w7008_names_what_the_engine_now_refuses(r: SubTestResult):
+    print("\n--- T10: W7008, opt-in, beside W7006/W7007 ---")
+    try:
+        got = _codes_by_line(REPRO)
+        assert got == {3: ["W7007", "W7008"]}, got
+        r.ok("W7008 lands on the loop line, beside W7007")
+    except Exception as e:
+        r.fail("T10 loop clause", f"{type(e).__name__}: {e}")
+
+    try:
+        got = _codes_by_line(STRING_REPRO)
+        assert got == {2: ["W7008"]}, got
+        diag = tex_api.control_flow_advisories(STRING_REPRO, {})[0]
+        assert "majority vote" in diag.message, diag.message
+        assert diag.severity == "warning", diag.severity
+        r.ok("W7008 alone marks the string merge — there is no W7007 for it")
+    except Exception as e:
+        r.fail("T10 string clause", f"{type(e).__name__}: {e}")
+
+    try:
+        # The asymmetry that makes a new code worth having: an escape under a per-pixel guard
+        # is W7007 (it acts on every pixel) but NOT W7008 (it still splits correctly). No
+        # SHIPPED example has that shape any more — v0.35.1 rewrote the six that did, so
+        # `examples/break_search.tex` now breaks on a uniform test and draws nothing — so the
+        # row states it on the shape itself and pins the example's silence beside it.
+        escape = ("float n = 0.0;\n"
+                  "for (int i = 0; i < 8; i++) { if (@A.r > 0.5) { break; } n = n + 1.0; }\n"
+                  "@OUT = vec4(n,n,n,1.0);\n")
+        codes = {d.code for d in tex_api.control_flow_advisories(escape, {})}
+        assert codes == {"W7007"}, codes
+        assert tex_roi.region_dependent(_parse(escape), code=escape) is False
+        shipped = {d.code for d in tex_api.control_flow_advisories(
+            _read_repo("examples", "break_search.tex"), {})}
+        assert shipped == set(), shipped
+        r.ok("a break under a per-pixel guard is W7007 and never W7008")
+    except Exception as e:
+        r.fail("T10 W7007 without W7008", f"{type(e).__name__}: {e}")
+
+    try:
+        # And no shipped example gains a code: an opt-in host reading the advisories sees
+        # exactly the five W7006 files it saw before.
+        by_file = {}
+        for name, src in _example_sources():
+            codes = sorted({d.code for d in tex_api.control_flow_advisories(src, {})})
+            if codes:
+                by_file[name] = codes
+        assert all(c == ["W7006"] for c in by_file.values()), by_file
+        assert len(by_file) == 5, by_file
+        r.ok(f"the shipped advisory surface is unchanged: {sorted(by_file)} carry W7006 only")
+    except Exception as e:
+        r.fail("T10 shipped advisory surface", f"{type(e).__name__}: {e}")
+
+    try:
+        from TEX_Wrangle import tex_lsp
+        leaked = []
+        for name, src in _example_sources():
+            for d in tex_api.check(src, {}):
+                if d.code in ("W7007", "W7008"):
+                    leaked.append((name, d.code))
+        for src in (REPRO, STRING_REPRO):
+            leaked += [(src[:12], d.code) for d in tex_api.check(src, {})
+                       if d.code in ("W7007", "W7008")]
+            leaked += [(src[:12], d.get("code")) for d in tex_lsp.diagnostics_for(src, {})
+                       if d.get("code") in ("W7007", "W7008")]
+        assert leaked == [], leaked
+        r.ok("check() and tex_lsp show neither code, for any shipped example or either repro")
+    except Exception as e:
+        r.fail("T10 invisibility", f"{type(e).__name__}: {e}")
+
+    try:
+        page = _read_repo("Error-Codes.md")
+        assert "### W7008" in page, "Error-Codes.md is stale — regenerate it"
+        assert "W7008" in _read_repo("LANGUAGE.md"), "LANGUAGE.md does not document the code"
+        r.ok("the generated error-code page and LANGUAGE.md both carry W7008")
+    except Exception as e:
+        r.fail("T10 documented surface", f"{type(e).__name__}: {e}")
+
+
+# ── T12: the frozen compat corpus ───────────────────────────────────────────
+
+def test_t12_corpus_neutrality(r: SubTestResult):
+    print("\n--- T12: the frozen corpus is unmoved, and declines exactly one program ---")
+    import compat_corpus
+    try:
+        declined = sorted(name for name, src in compat_corpus._corpus_programs()
+                          if tex_roi.region_dependent(_parse(src), code=src))
+        assert declined == ["adv_while_loop"], declined
+        r.ok("exactly one corpus program is region-dependent, by name: adv_while_loop")
+    except Exception as e:
+        r.fail("T12 declined set", f"{type(e).__name__}: {e}")
+
+    try:
+        # The goldens are WHOLE-FRAME cooks through the interpreter, which no planner gates,
+        # so a decline cannot move one. Pinned on the one program that is declined.
+        src = compat_corpus._ADVERSARIAL["adv_while_loop"]
+        got = compat_corpus._program_hash(src)
+        versions = compat_corpus.archived_versions()
+        assert versions, "no frozen corpus versions to check against"
+        for version in versions:
+            frozen = compat_corpus.load_version(version)
+            hashes = frozen.get("hashes", frozen)
+            want = hashes.get("adv_while_loop")
+            assert want is not None, f"{version} has no adv_while_loop golden"
+            assert got == want, f"{version}: golden moved ({got} != {want})"
+        r.ok(f"adv_while_loop hashes identically against {len(versions)} frozen version(s)")
+    except Exception as e:
+        r.fail("T12 golden unmoved", f"{type(e).__name__}: {e}")

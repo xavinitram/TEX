@@ -1686,6 +1686,9 @@ def main():
         test_t6_string_merge_is_region_dependent,
         test_t2_strip_planner_declines,
         test_t9_gate_is_never_reached_on_an_unpressured_cook,
+        test_t8_pragma_sunsets_the_loop_clause_only,
+        test_t10_w7008_names_what_the_engine_now_refuses,
+        test_t12_corpus_neutrality,
     )
     test_t1_repro_is_region_dependent(r)
     test_t7_predicate_is_not_a_blanket_disable(r)
@@ -1697,6 +1700,9 @@ def main():
     test_t6_string_merge_is_region_dependent(r)
     test_t2_strip_planner_declines(r)
     test_t9_gate_is_never_reached_on_an_unpressured_cook(r)
+    test_t8_pragma_sunsets_the_loop_clause_only(r)
+    test_t10_w7008_names_what_the_engine_now_refuses(r)
+    test_t12_corpus_neutrality(r)
 
     success = r.summary()
     return 0 if success else 1
