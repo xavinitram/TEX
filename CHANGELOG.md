@@ -5,6 +5,44 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.3] - 2026-09-17
+
+**The first release actually published since `v0.35.0`.** `v0.35.1` ("Say what it does") and
+`v0.35.2` ("The registry catches up") were both tagged and pushed, but neither reached the Comfy
+registry: CI's test step failed on the Ubuntu/CPU/no-ComfyUI runner both times, so CI's TST-8
+release gate refused the publish and the registry kept serving `v0.35.0`. `v0.35.3` is `v0.35.2`
+plus the fix for that second failure — no other product change — and it is the first tag whose
+publish workflow actually runs. **A registry user upgrading from `v0.35.0` gets everything below,
+plus everything in `[0.35.2]` and `[0.35.1]`, and should read both of those entries too.**
+
+No reserved built-in name is added, and `tex_api.LANGUAGE_VERSION` stays `0.23`, so no compat
+freeze is owed.
+
+### Fixed
+
+- **Codegen and the interpreter disagreed on two values under `compile_mode="auto"`/`"torch_compile"`.**
+  A vec/colour `$param`'s component read (`$tint.r`) and the builtin `fi` inside a loop condition
+  each reached codegen at a rank the interpreter never gives them, and rank is what every runtime
+  "is this value per-pixel?" test reads: the same four-iteration loop accumulated `0` on the
+  interpreter and `4` on codegen. The generated preamble now stages a vec/colour `$param` through
+  the same reshape rule (`vec_list_to_tensor`) the interpreter's binding setup and the CUDA-graph
+  stager already share, before the emitted code ever sees it, and the set of builtins that keep a
+  loop off the scalar fast path (`_SPATIAL_BUILTINS`) now includes `fi` alongside `u`/`v`/`ix`/`iy`,
+  completing exactly the set the interpreter binds non-0-dim. ComfyUI-invisible because the default
+  `compile_mode="none"` path never reaches either class, so nothing moves for a user who has not
+  touched the `compile_mode` widget, and the emitted code for every program that was already
+  correct compares byte-identical before and after, across all 129 shipped examples and
+  compat-corpus programs.
+- **Two tests pinned a platform-dependent hash (test-only).** `test_tool_manifest_byte_identity`
+  and `test_tool_no_feeds_is_pre_feeds_identical` hashed the bytes `write_tool` writes through a
+  text-mode file handle, which carries the platform's newline — CRLF on Windows, LF on Linux — and
+  the pins had been recorded on Windows. An unchanged manifest therefore read as drifted on every
+  Linux CI runner. The shared hashing helper now normalises CRLF to LF before hashing, and the
+  fourteen affected pins are re-recorded to their LF-normalised values; nothing the pins guard is
+  weakened, because `json.dump` escapes any CR or LF inside a string value, so key order,
+  indentation, separators and content stay pinned exactly. ComfyUI-invisible because no file
+  outside `tests/` was touched.
+
 ## [0.35.2] - 2026-09-17
 
 **Say what it does, published.** `v0.35.1`'s tag was pushed but never published to the Comfy
@@ -25,6 +63,11 @@ product code changes.
   other test file added since `v0.35.0` was audited for the same class of assumption; none
   needed a change. ComfyUI-invisible because this is a test-only change — no file outside
   `tests/` was touched.
+
+**2026-09-17 note:** this release was tagged and pushed but never published to the Comfy
+registry either — a second CI test-step failure (platform-newline-dependent manifest hashes,
+fixed in `v0.35.3`) refused the TST-8 publish gate again. `v0.35.3` is the first release of this
+line actually published; a registry user should adopt it and read its entry above.
 
 ## [0.35.1] - 2026-09-17
 
@@ -433,6 +476,12 @@ fixes, or the Security item.
   - ComfyUI-visible only as that one-time recompile after upgrading and the one key file in the
     user profile: the tag is a trailer `pickle` ignores, the HMAC runs at memcpy speed off the
     per-frame path, and no setting and no new error is added.
+
+**2026-09-17 note:** this release was tagged and pushed but never published to the Comfy
+registry — CI's test step failed on Ubuntu/CPU/no-ComfyUI, so TST-8 refused the publish and the
+registry kept serving `v0.35.0`. Neither did the next attempt, `v0.35.2`. `v0.35.3` is the first
+release of this line actually published; a registry user should adopt it and read its entry,
+which carries everything below unchanged.
 
 ## [0.35.0] - 2026-09-16
 
