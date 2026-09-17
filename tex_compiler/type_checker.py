@@ -1441,6 +1441,27 @@ class TypeChecker:
                         node.loc, code="E5003",
                         hint="Pass a vec2, vec3, or vec4.")
                     break
+        elif node.name == "select" and len(arg_types) == 3:
+            # select(cond, a, b): cond drives torch.where's mask, so it must be a
+            # scalar (int/float) — a vector/matrix cond has no single truth value,
+            # and a string cond can't compare > 0.5 at runtime. The arms (a, b) are
+            # the values being picked between: torch.where doesn't support string or
+            # matrix operands either (matching the ternary `?:`'s numeric-arm rule,
+            # E3400, but as E5003 since select is a function call, not an operator).
+            cond_t = arg_types[0]
+            if cond_t.is_vector or cond_t.is_matrix or cond_t.is_string:
+                self._error(
+                    f"select()'s condition needs a scalar (int or float), but got {cond_t.value}.",
+                    node.loc, code="E5003",
+                    hint="Compare to a scalar, or pick one component first (e.g. cond.r).")
+            for i, at in ((1, arg_types[1]), (2, arg_types[2])):
+                if at.is_string or at.is_matrix:
+                    self._error(
+                        f"select() argument {i + 1} can't be {at.value} — pass a numeric "
+                        f"or vector value.",
+                        node.loc, code="E5003",
+                        hint="select() picks between two numeric/vector values; strings "
+                             "and matrices aren't supported.")
 
         result_type = self._resolve_function_type(node.name, arg_types, node.loc)
         self._set_type(node, result_type)

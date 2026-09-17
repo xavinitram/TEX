@@ -28,7 +28,7 @@ from test_parser import (
     test_parser, test_parser_v11, test_parser_lvalue_clone,
     test_array_decl_no_hang,
 )
-from test_type_checker import test_type_checker, test_stdlib_promote_typing
+from test_type_checker import test_type_checker, test_stdlib_promote_typing, test_select_type_checking
 from test_interpreter import (
     test_interpreter, test_for_loops, test_break_continue,
     test_while_loops, test_compound_assignments,
@@ -203,6 +203,7 @@ def main():
     test_array_decl_no_hang(r)
     test_type_checker(r)
     test_stdlib_promote_typing(r)
+    test_select_type_checking(r)
     test_interpreter(r)
     test_for_loops(r)
     test_break_continue(r)
@@ -1655,6 +1656,20 @@ def main():
     test_bare_cook_omitted_negative_param_uses_default(r)
     test_bare_cook_omitted_param_matches_explicit_default(r)
     test_tex_node_widget_defaults_unchanged(r)
+
+    # ASK-6c: select(cond, a, b) — the NaN-isolation and CUDA-graph capturability rows
+    # plus the reserved-name row; the other rows land as edits to the existing test
+    # files wired above (test_codegen_optimizer's equivalence corpus, test_type_checker's
+    # promoted typing + E5003, test_v018_precision's C1 decline, test_lazy_cooking's
+    # never-sever row).
+    from test_v036_ask6c import (
+        test_ask6c_nan_untaken_arm_does_not_leak,
+        test_ask6c_reserved_name_e3011,
+        test_ask6c_captures_where_uniform_if_would_not,
+    )
+    test_ask6c_nan_untaken_arm_does_not_leak(r)
+    test_ask6c_reserved_name_e3011(r)
+    test_ask6c_captures_where_uniform_if_would_not(r)
 
     success = r.summary()
     return 0 if success else 1

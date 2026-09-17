@@ -639,6 +639,25 @@ class TEXStdlib:
             t_t = t_t.unsqueeze(-1)
         return _lerp_f32(a_t, b_t, t_t)
 
+    @stdlib("select", sig='select(cond, a, b) \\u2192 vec', category='Interpolation',
+            doc='Pick a or b by cond, without an if. Both a and b are always computed — '
+                'nothing is skipped — but this never syncs, so it stays capturable under '
+                'CUDA graphs where an equivalent if on a per-pixel or uniform cond may not.',
+            ex='@OUT = vec4(select(luma(@A.rgb) > 0.5, @A.rgb, @B.rgb), 1.0);')
+    @staticmethod
+    def fn_select(cond, a, b) -> torch.Tensor:
+        # A non-syncing selector: torch.where under _tensor_where's broadcast (the
+        # same merge the interpreter's per-pixel if/else and ?: use for their spatial
+        # path), never a Python branch or a `.item()` sync — so a program calling
+        # select stays CUDA-graph capturable where a uniform `if`/`?:` (which takes
+        # the scalar-shortcut branch via float(cond), a host sync) is not. Local
+        # import: interpreter.py imports stdlib.py, not the reverse, so this can only
+        # be resolved at call time, after both modules have finished loading.
+        from .interpreter import _tensor_where
+        cond_t = _to_tensor(cond)
+        cond_bool = (cond_t > 0.5) if cond_t.is_floating_point() else cond_t.bool()
+        return _tensor_where(cond_bool, _to_tensor(a), _to_tensor(b))
+
     @stdlib("fit", sig='fit(x, inLo, inHi, outLo, outHi) \\u2192 float', category='Interpolation', doc='Remap x from [inLo, inHi] to [outLo, outHi].', ex='float y = fit(u, 0.2, 0.8, 0.0, 1.0);')
     @staticmethod
     def fn_fit(val, old_min, old_max, new_min, new_max) -> torch.Tensor:

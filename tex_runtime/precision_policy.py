@@ -605,6 +605,14 @@ def _has_fp16_hazard(program, out_names) -> bool:
         if cls == "FunctionCall":
             if n.name in _FP16_FRAGILE_FNS:
                 return True
+            if n.name == "select":
+                # ASK-6c: select(cond, a, b) IS a per-pixel branch (torch.where), just
+                # spelled as a call instead of `if`/`?:` — an fp16 cond that rounds
+                # across the 0.5 threshold flips the entire pick, arm values included,
+                # not just a scalar quantum. Decline exactly like the IfElse/TernaryOp/
+                # WhileLoop branch below, unconditionally on sight (not gated on cond
+                # or arm lineage) for the same reason those are.
+                return True
             if n.name in ("pow", "spow") and not _pow_is_safe(n):
                 return True
             # F1 (doc 33): the gain forward-pass never enters user-function BODIES, so

@@ -2016,6 +2016,7 @@ const TEX_HELP_DATA = [
             { name: "clamp", sig: "clamp(x, lo, hi) \u2192 float", desc: "Clamp x to [lo, hi] range.", example: "float c = clamp(u * 2.0, 0.0, 1.0);" },
             { name: "lerp", sig: "lerp(a, b, t) \u2192 float", desc: "Linear interpolation from a to b by t.", example: "@OUT = lerp(@A, @B, 0.5);" },
             { name: "mix", sig: "mix(a, b, t) \u2192 float", desc: "Alias for lerp. Linear interpolation.", example: "@OUT = mix(@A, @B, $blend);" },
+            { name: "select", sig: "select(cond, a, b) \u2192 vec", desc: "Pick a or b by cond, without an if. Both a and b are always computed \u2014 nothing is skipped \u2014 but this never syncs, so it stays capturable under CUDA graphs where an equivalent if on a per-pixel or uniform cond may not.", example: "@OUT = vec4(select(luma(@A.rgb) > 0.5, @A.rgb, @B.rgb), 1.0);" },
             { name: "fit", sig: "fit(x, inLo, inHi, outLo, outHi) \u2192 float", desc: "Remap x from [inLo, inHi] to [outLo, outHi].", example: "float y = fit(u, 0.2, 0.8, 0.0, 1.0);" },
             { name: "step", sig: "step(edge, x) \u2192 float", desc: "Returns 0 if x < edge, 1 otherwise.", example: "float s = step(0.5, u);" },
             { name: "smoothstep", sig: "smoothstep(lo, hi, x) \u2192 float", desc: "Smooth Hermite interpolation between lo and hi.", example: "float s = smoothstep(0.3, 0.7, u);" },

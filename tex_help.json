@@ -344,6 +344,14 @@
           ]
         },
         {
+          "name": "select",
+          "sig": "select(cond, a, b) → vec",
+          "desc": "Pick a or b by cond, without an if. Both a and b are always computed — nothing is skipped — but this never syncs, so it stays capturable under CUDA graphs where an equivalent if on a per-pixel or uniform cond may not.",
+          "example": "@OUT = vec4(select(luma(@A.rgb) > 0.5, @A.rgb, @B.rgb), 1.0);",
+          "tags": [],
+          "aliases": []
+        },
+        {
           "name": "fit",
           "sig": "fit(x, inLo, inHi, outLo, outHi) → float",
           "desc": "Remap x from [inLo, inHi] to [outLo, outHi].",
@@ -1355,5 +1363,5 @@
       ]
     }
   ],
-  "function_count": 150
+  "function_count": 151
 }

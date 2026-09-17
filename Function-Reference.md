@@ -52,6 +52,7 @@
 | `clamp` | `clamp(x, lo, hi) → float` | Clamp x to [lo, hi] range. | — |
 | `lerp` | `lerp(a, b, t) → float` | Linear interpolation from a to b by t. | — |
 | `mix` | `mix(a, b, t) → float` | Linear interpolation from a to b by t. | — |
+| `select` | `select(cond, a, b) → vec` | Pick a or b by cond, without an if. Both a and b are always computed — nothing is skipped — but this never syncs, so it stays capturable under CUDA graphs where an equivalent if on a per-pixel or uniform cond may not. | — |
 | `fit` | `fit(x, inLo, inHi, outLo, outHi) → float` | Remap x from [inLo, inHi] to [outLo, outHi]. | — |
 | `step` | `step(edge, x) → float` | Returns 0 if x < edge, 1 otherwise. | — |
 | `smoothstep` | `smoothstep(lo, hi, x) → float` | Smooth Hermite interpolation between lo and hi. | — |

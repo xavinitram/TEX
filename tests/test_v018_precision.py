@@ -287,6 +287,10 @@ _C1_MUST_DECLINE = [
     # call graph has real cycles. This row is a decline; it is also the row that HANGS the
     # cook thread if the body-scan ever loses its `seen` guard.
     "float f(){ return f()*frame; } @OUT=vec4(vec3(@A.r*f()),1.0);",
+    # ASK-6c: select(cond, a, b) is a per-pixel branch spelled as a call — declined
+    # unconditionally, exactly like IfElse/TernaryOp/WhileLoop (invariant 10): an
+    # fp16 cond rounding across 0.5 flips the whole pick, not just a scalar quantum.
+    "@OUT = vec4(vec3(select(@A.r > 0.5, 1.0, 0.0)), 1.0);",
 ]
 # Smooth pointwise programs the gate MUST still accept (fp16) — the headline win region.
 _C1_MUST_ACCEPT = [

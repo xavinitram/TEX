@@ -44,6 +44,14 @@ def _promote_args(arg_types: list[TEXType]) -> TEXType:
     return result
 
 
+def _select_type(arg_types: list[TEXType]) -> TEXType:
+    """select(cond, a, b): the result is the promoted type of the two ARMS (a, b) —
+    arg 0 (cond) never enters the promotion, unlike lerp/clamp where every argument is
+    a value being blended. `select(u > 0.5, @A, @B)` returns @A/@B's promoted type;
+    a scalar cond never widens it."""
+    return _promote_args(arg_types[1:])
+
+
 def _float_type(arg_types: list[TEXType]) -> TEXType:
     """Always FLOAT. ASK-13: `patch_dist` is a per-pixel scalar field regardless of
     the image's channel count (the mean is taken over channels too) — a NAMED helper
@@ -101,6 +109,7 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "clamp":     {"args": (3, 3), "return": _promote_args},
     "lerp":      {"args": (3, 3), "return": _promote_args},
     "mix":       {"args": (3, 3), "return": _promote_args},     # alias for lerp
+    "select":    {"args": (3, 3), "return": _select_type},      # select(cond, a, b): promote a/b, not cond
     "fit":       {"args": (5, 5), "return": _promote_args},      # fit(val, old_min, old_max, new_min, new_max)
     "smoothstep": {"args": (3, 3), "return": _promote_args},
     "step":      {"args": (2, 2), "return": _promote_args},

@@ -70,6 +70,20 @@ def test_lazy_analysis(r: SubTestResult):
     except Exception as e:
         r.fail("*0 does not sever the dependency", str(e))
 
+    # ASK-6c: select(cond, a, b) is a plain FunctionCall, not IfElse/TernaryOp, so
+    # tex_lazy's generic call-argument walk visits both arms unconditionally — no
+    # folding, even when cond is a compile-time literal. This is the DELIBERATE
+    # trade select makes for its capturability (invariant 11: never sever): unlike
+    # `($t > 0.5) ? luma(@B) : 0.2` above, which prunes @B when $t=0.0 folds the
+    # ternary, the equivalent `select($t > 0.5, luma(@B), 0.2)` always keeps @B.
+    try:
+        s = lazy_required_bindings("@OUT = vec4(vec3(select($t > 0.5, luma(@B), 0.2)), 1.0);",
+                                    {"t": 0.0})
+        assert "B" in s
+        r.ok("select() never folds/severs — @B stays required even at $t=0.0")
+    except Exception as e:
+        r.fail("select() never folds/severs", str(e))
+
     # && with one symbolic side never folds -> both branches conservatively kept
     # (matches the interpreter, which evaluates both sides of &&).
     try:

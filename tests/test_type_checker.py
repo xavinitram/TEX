@@ -200,3 +200,56 @@ def test_stdlib_promote_typing(r: SubTestResult):
     except Exception as e:
         r.fail("promote typing: vec4(smoothstep(vec), 1.0) compiles and runs",
                f"{e}\n{traceback.format_exc()}")
+
+
+def test_select_type_checking(r: SubTestResult):
+    """ASK-6c: select(cond, a, b). The return type promotes across the ARMS (a, b)
+    only — cond (arg 0) never enters the promotion, unlike lerp/clamp/step where
+    every argument is a value being blended. A non-scalar cond, or a string/matrix
+    arm, is E5003 (matching the cross()/dot()/hsv2rgb() argument-validation pattern
+    above), not a silent runtime crash inside torch.where."""
+    print("\n--- select() Type Checking Tests ---")
+
+    promote_cases = [
+        ("scalar cond, scalar arms -> float", "select(0.5 > 0.5, 1.0, 0.0)", TEXType.FLOAT),
+        ("scalar cond, vec3 arms -> vec3", "select(0.5 > 0.5, @A, vec3(0.0))", TEXType.VEC3),
+        ("scalar cond, vec3/vec4 arms -> vec4", "select(0.5 > 0.5, @A, vec4(0.0))", TEXType.VEC4),
+        ("int cond, float arms -> float", "select(1, 1.0, 0.0)", TEXType.FLOAT),
+    ]
+    for name, expr, expected in promote_cases:
+        try:
+            _, checker = check_code(f"@OUT = {expr};", {"A": TEXType.VEC3})
+            got = checker.inferred_out_type
+            assert got == expected, f"inferred {got}, expected {expected}"
+            r.ok(f"select() promote typing: {name}")
+        except Exception as e:
+            r.fail(f"select() promote typing: {name}", f"{e}\n{traceback.format_exc()}")
+
+    # E5003 — cond has no single truth value: vector, matrix, or string.
+    bad_cond = [
+        ("vector cond", "select(@A, 1.0, 0.0); @OUT = vec4(0.0);", {"A": TEXType.VEC3}),
+        ("matrix cond", "mat3 m = mat3(1.0); select(m, 1.0, 0.0); @OUT = vec4(0.0);", None),
+        ("string cond", 'string s = "a"; select(s, 1.0, 0.0); @OUT = vec4(0.0);', None),
+    ]
+    for name, code, binds in bad_cond:
+        try:
+            check_code(code, binds)
+            r.fail(f"select() E5003: {name} rejected", "Should have raised TypeCheckError")
+        except (TypeCheckError, TEXMultiError):
+            r.ok(f"select() E5003: {name} rejected")
+        except Exception as e:
+            r.fail(f"select() E5003: {name} rejected", str(e))
+
+    # E5003 — an arm torch.where can't pick between: string or matrix.
+    bad_arms = [
+        ("string arm", 'string s = "a"; select(0.5 > 0.5, s, 1.0); @OUT = vec4(0.0);'),
+        ("matrix arm", "mat3 m = mat3(1.0); select(0.5 > 0.5, m, vec3(0.0)); @OUT = vec4(0.0);"),
+    ]
+    for name, code in bad_arms:
+        try:
+            check_code(code)
+            r.fail(f"select() E5003: {name} rejected", "Should have raised TypeCheckError")
+        except (TypeCheckError, TEXMultiError):
+            r.ok(f"select() E5003: {name} rejected")
+        except Exception as e:
+            r.fail(f"select() E5003: {name} rejected", str(e))

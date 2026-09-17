@@ -109,6 +109,14 @@ for (int i = 0; i < 5; i++) {
         ("clamp", "@OUT = clamp(@A, 0.2, 0.8);"),
         ("lerp", "@OUT = lerp(vec3(0,0,0), vec3(1,1,1), 0.5);"),
         ("lerp spatial", "@OUT = lerp(vec3(0,0,0), @A, 0.5);"),
+
+        # ASK-6c: select(cond, a, b) — a non-syncing per-pixel selector (codegen has
+        # no dedicated emitter for it, so the general fallback calls the interpreter's
+        # own callable; these rows pin that bit-exact by construction).
+        ("select uniform cond", "@OUT = select(1.0 > 0.5, vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0));"),
+        ("select per-pixel cond", "@OUT = select(@A.r > 0.5, vec3(1.0, 0.0, 0.0), @A);"),
+        ("select int cond", "@OUT = vec3(select(ix - iy, 1.0, 0.0), 0.0, 0.0);"),
+        ("select scalar arms", "float s = select(@A.r > 0.5, 1.0, 0.0); @OUT = vec3(s, s, s);"),
         ("step", "@OUT = vec3(step(0.5, @A.r), step(0.5, @A.g), step(0.5, @A.b));"),
         ("smoothstep", "@OUT = vec3(smoothstep(0.0, 1.0, @A.r), smoothstep(0.0, 1.0, @A.g), smoothstep(0.0, 1.0, @A.b));"),
         ("pow and sqrt", "@OUT = vec3(pow(@A.r, 2.0), sqrt(@A.g), @A.b);"),
@@ -297,6 +305,10 @@ c.r = 1.0;
         ("convolve", "@OUT = convolve(@A, @B);"),
         ("convolve normalize=0", "@OUT = convolve(@A, @B, 0);"),
         ("convolve mask", "m@OUT = convolve(@A.r, @B.r);"),
+        # ASK-6c: select's vec3/vec4-arm rows, both arms drawn from real bindings
+        # (not just literals) so the promote/broadcast path is exercised too.
+        ("select vec3 arms", "@OUT = select(@A.r > 0.5, @A, @B);"),
+        ("select vec4 arms", "@OUT = select(@A.r > 0.5, vec4(@A, 1.0), vec4(@B, 0.5));"),
     ]
 
     for name, code in programs:
