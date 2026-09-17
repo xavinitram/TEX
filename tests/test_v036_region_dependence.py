@@ -318,3 +318,130 @@ def test_t11_analysis_failure_declines_the_split(r: SubTestResult):
         r.ok("region_dependent declines on any analysis failure, not just the budget")
     except Exception as e:
         r.fail("T11 predicate declines on a broken input", f"{type(e).__name__}: {e}")
+
+
+# ── T3 / T5: the spatial routes (windows, and the halo strips behind them) ───
+
+def test_t3_roi_window_is_declined(r: SubTestResult):
+    print("\n--- T3: an ROI window, and the chain windowing built on it ---")
+    try:
+        plan = tex_roi.roi_plan(REPRO, {})
+        assert plan.executable is False, "roi_plan still narrows a region-dependent program"
+        assert plan.narrow == frozenset(), f"nothing may be narrowed: {sorted(plan.narrow)}"
+        r.ok("roi_plan(repro) is not executable and narrows nothing")
+    except Exception as e:
+        r.fail("T3 roi_plan", f"{type(e).__name__}: {e}")
+
+    try:
+        # `stage_halo`'s inversion: a non-executable plan means UNBOUNDED reach, so a host
+        # composing windows over a chain of stages grows every upstream window to the frame.
+        assert tex_roi.stage_halo(REPRO, {}) == tex_roi.WHOLE_FRAME
+        r.ok("stage_halo(repro) == WHOLE_FRAME, so chain_windows saturates")
+    except Exception as e:
+        r.fail("T3 stage_halo", f"{type(e).__name__}: {e}")
+
+    try:
+        # The evidence the decline exists for: driven directly — the executor stays dumb — a
+        # narrowed window over rows 4-7 cooks a DIFFERENT answer than the whole frame does.
+        _p, whole = _cook(REPRO)
+        _p2, windowed = _cook(REPRO, roi=(0, 4, 2, 4, 2, 8), narrow=frozenset({"A"}), halo=0)
+        assert _column(whole["OUT"])[4:] == [4.0, 4.0, 4.0, 4.0]
+        assert _column(windowed["OUT"]) == [2.0, 2.0, 2.0, 2.0], _column(windowed["OUT"])
+        r.ok("characterization: rows 4-7 cook as 2, not 4, when the window is narrowed")
+    except Exception as e:
+        r.fail("T3 characterization", f"{type(e).__name__}: {e}")
+
+
+def test_t5_halo_strip_route_is_declined(r: SubTestResult):
+    print("\n--- T5: the HALO strip route (the one is_tile_safe does not close) ---")
+    try:
+        prog = tex_api.compile(HALO_REPRO, {"A": TEXType.VEC4})
+        assert tex_memory.is_tile_safe(prog.ast) is False, \
+            "the blur makes this non-pointwise — halo tiling is the route that must be closed"
+        assert tex_roi.roi_plan(HALO_REPRO, {}).executable is False, \
+            "roi_plan still reports a halo plan, so _halo_tile_plan can still strip it"
+        r.ok("roi_plan refuses the blur + per-pixel-loop program, so _halo_tile_plan gets None")
+    except Exception as e:
+        r.fail("T5 halo repro", f"{type(e).__name__}: {e}")
+
+    try:
+        twin = tex_roi.roi_plan(HALO_UNIFORM_TWIN, {})
+        assert twin.executable is True, "the uniform twin must still halo-tile"
+        assert twin.halo == 6, f"halo moved: {twin.halo}"
+        assert twin.narrow == frozenset({"A"}), f"narrow moved: {sorted(twin.narrow)}"
+        r.ok("the uniform twin still gets halo=6, narrow={'A'}")
+    except Exception as e:
+        r.fail("T5 uniform twin", f"{type(e).__name__}: {e}")
+
+    try:
+        # F3's own measurement, driven straight at the executor: halo strips of a
+        # region-dependent program disagree with the whole frame.
+        prog = tex_api.compile(HALO_REPRO, {"A": TEXType.VEC4})
+        bindings = {"A": _img(1, 64, 64)}
+        names = sorted(prog.assigned.keys())
+        interp = Interpreter()
+        whole = interp.execute(prog.ast, bindings, prog.type_map, device="cpu",
+                               latent_channel_count=0, output_names=names,
+                               used_builtins=prog.used_builtins, precision="fp32")
+        striped = tex_memory.run_tiled_halo(
+            interp, prog.ast, bindings, prog.type_map, "cpu", 0, names,
+            prog.used_builtins, "fp32", 2, frozenset({"A"}), 6)
+        md = _maxdiff(whole["OUT"], striped["OUT"])
+        # The pass-count difference is exactly 1; the blur term adds fp32 slack, so this is a
+        # tolerance rather than an equality (never a hash of a float).
+        assert abs(md - 1.0) < 1e-5, f"expected the F3 divergence of 1.0, got {md}"
+        r.ok("characterization: halo strips disagree with the whole frame by 1.0")
+    except Exception as e:
+        r.fail("T5 characterization", f"{type(e).__name__}: {e}")
+
+
+# ── T4: the batch axis ───────────────────────────────────────────────────────
+
+def test_t4_batch_strips_are_declined(r: SubTestResult):
+    print("\n--- T4: batch strips (the host-only route nothing gated) ---")
+    for name, src in (("the spatial repro", REPRO),
+                      ("an fi-bounded loop (F4a)", FI_REPRO),
+                      ("an img_mean-bounded loop (F4b)", IMG_MEAN_REPRO)):
+        try:
+            assert tex_roi.batch_sliceable(src, {}) is False
+            r.ok(f"batch_sliceable is False for {name}")
+        except Exception as e:
+            r.fail(f"T4 {name}", f"{type(e).__name__}: {e}")
+
+    try:
+        # F4a's measurement: `fi` in the bound makes the pass count a property of the BATCH
+        # strip, and nothing looked at it before (there is no frame op to find).
+        _p, whole = _cook(FI_REPRO, shape=(4, 2, 4))
+        _p2, striped = _cook(FI_REPRO, shape=(4, 2, 4), batch=2)
+        per_frame_whole = [round(float(whole["OUT"][b, 0, 0, 0]), 4) for b in range(4)]
+        per_frame_striped = [round(float(striped["OUT"][b, 0, 0, 0]), 4) for b in range(4)]
+        assert per_frame_whole == [4.0, 4.0, 4.0, 4.0], per_frame_whole
+        assert per_frame_striped == [2.0, 2.0, 4.0, 4.0], per_frame_striped
+        r.ok(f"characterization: batch strips give {per_frame_striped}, not {per_frame_whole}")
+    except Exception as e:
+        r.fail("T4 characterization", f"{type(e).__name__}: {e}")
+
+
+# ── T6: clause (c) — the majority-vote string merge ─────────────────────────
+
+def test_t6_string_merge_is_region_dependent(r: SubTestResult):
+    print("\n--- T6: a string assigned under a per-pixel `if` (clause (c), F2) ---")
+    try:
+        assert tex_roi.region_dependent(_parse(STRING_REPRO), code=STRING_REPRO) is True
+        assert tex_roi.roi_plan(STRING_REPRO, {}).executable is False
+        assert tex_roi.batch_sliceable(STRING_REPRO, {}) is False
+        r.ok("the string program is region-dependent and all three routes decline it")
+    except Exception as e:
+        r.fail("T6 predicate and routes", f"{type(e).__name__}: {e}")
+
+    try:
+        # The evidence: 6 of 8 rows satisfy the condition whole-frame, but strip 0 holds only
+        # 2 of 4 — not a majority — and `run_tiled` takes a non-spatial output from whichever
+        # strip produced it first.
+        _p, whole = _cook(STRING_REPRO)
+        _p2, tiled = _cook(STRING_REPRO, tiles=2)
+        assert whole["TXT"] == "hi", repr(whole["TXT"])
+        assert tiled["TXT"] == "lo", repr(tiled["TXT"])
+        r.ok('characterization: whole frame votes "hi", two strips vote "lo"')
+    except Exception as e:
+        r.fail("T6 characterization", f"{type(e).__name__}: {e}")

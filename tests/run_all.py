@@ -1680,11 +1680,19 @@ def main():
         test_t7_predicate_is_not_a_blanket_disable,
         test_t7_no_shipped_program_is_declined,
         test_t11_analysis_failure_declines_the_split,
+        test_t3_roi_window_is_declined,
+        test_t5_halo_strip_route_is_declined,
+        test_t4_batch_strips_are_declined,
+        test_t6_string_merge_is_region_dependent,
     )
     test_t1_repro_is_region_dependent(r)
     test_t7_predicate_is_not_a_blanket_disable(r)
     test_t7_no_shipped_program_is_declined(r)
     test_t11_analysis_failure_declines_the_split(r)
+    test_t3_roi_window_is_declined(r)
+    test_t5_halo_strip_route_is_declined(r)
+    test_t4_batch_strips_are_declined(r)
+    test_t6_string_merge_is_region_dependent(r)
 
     success = r.summary()
     return 0 if success else 1

@@ -32,6 +32,9 @@ Two consumers:
     sub-region, which bindings narrow to `ROI ⊕ halo`, which pass whole, and the single
     uniform cook halo `H`. Whitelist posture: anything unresolved → not executable → the
     engine cooks whole-frame.
+  * `region_dependent(program, ...)` — the same question on the ITERATION axis (TRK-25): can
+    the output depend on WHICH REGION was cooked, because a control decision reduces a
+    per-pixel value over it? `roi_plan` and `batch_sliceable` both refuse when it is True.
 
 See docs/roi-spatial-laziness.md for the execution model and why narrow-cook-crop is
 bit-exact.
@@ -417,7 +420,8 @@ def region_dependent_cached(program, fingerprint, binding_types=None, code=None)
 # ── Public analysis ───────────────────────────────────────────────────────────
 
 _MEMO_MAX = 256
-_walk_memo: "OrderedDict[tuple, tuple | None]" = OrderedDict()  # key -> (reads, blocked, halo, erased)
+# key -> (reads, blocked, halo, erased, region_dep)
+_walk_memo: "OrderedDict[tuple, tuple | None]" = OrderedDict()
 
 
 def _is_halo_call(n, fm) -> bool:
@@ -584,11 +588,13 @@ def _referenced_at_bindings(code: str) -> frozenset:
 
 def _walk(code: str, param_values: dict):
     """Parse + `$param`-fold + accumulate, memoized on `(code-hash, param bits)`. Returns
-    `(reads, blocked, halo, fold_erased)` or None on ANY failure — the single shared engine behind
-    `binding_footprints` and `roi_plan`, so the parse+walk runs once. `blocked` is True when
-    the program cannot be cooked on a sub-region: a gather/reduction/scatter is present, a
-    halo op has a symbolic radius, or a halo op is ungrounded (behind a local var / function /
-    loop). The memo key is computed INSIDE the try, so a non-str code or an unsortable param
+    `(reads, blocked, halo, fold_erased, region_dep)` or None on ANY failure — the single shared
+    engine behind `binding_footprints` and `roi_plan`, so the parse+walk runs once. `blocked` is
+    True when the program cannot be cooked on a sub-region: a gather/reduction/scatter is
+    present, a halo op has a symbolic radius, or a halo op is ungrounded (behind a local var /
+    function / loop). `region_dep` is the separate ITERATION-axis verdict (TRK-25), kept beside
+    `blocked` rather than folded into it so `binding_footprints` — which reads only `reads` — is
+    demonstrably unmoved and the two refusals stay individually readable. The memo key is computed INSIDE the try, so a non-str code or an unsortable param
     dict falls to None (the 'never raises' contract) rather than escaping."""
     try:
         key = (hashlib.sha256(code.encode()).hexdigest(), _param_key(param_values))
@@ -611,8 +617,14 @@ def _walk(code: str, param_values: dict):
         written = {n for n in (_write_target_name(s.target, bindings_only=True)
                                for s in program.statements if isinstance(s, Assignment))
                    if n is not None}
+        # TRK-25: the ITERATION-axis verdict rides this walk's existing parse, fold and memo,
+        # so `roi_plan`'s consumers pay for it exactly once per (code, param values) — the same
+        # key the rest of the tuple already uses, and one a pragma edit invalidates by itself.
+        # Folding cannot change the answer: substituting a `$param` literal can only make a
+        # bound MORE uniform, never less.
         result = (reads, blocked, state["halo"],
-                  _referenced_at_bindings(code) - written - set(reads))
+                  _referenced_at_bindings(code) - written - set(reads),
+                  region_dependent(program, code=code))
     except Exception:
         result = None
     _walk_memo[key] = result
@@ -666,8 +678,10 @@ def roi_plan(code: str, param_values: dict | None = None) -> RoiPlan:
     """The ROI-3 plan for cooking this program on a sub-region. Not executable — cook
     whole-frame — when: the analysis fails; the program scatters (`@OUT[x,y]=`); a halo op
     has a symbolic radius; a halo op is ungrounded (behind a local var / function / loop, so
-    its reach can't compose); or ANY gather / reduction is present
-    (`sample`/`fetch`/`sample_*`/`img_*`/`@A[..]`/`@A(..)`).
+    its reach can't compose); ANY gather / reduction is present
+    (`sample`/`fetch`/`sample_*`/`img_*`/`@A[..]`/`@A(..)`); or the program is REGION-DEPENDENT
+    (TRK-25 — a per-pixel loop bound, or a majority-voted string merge, whose result depends on
+    which region was cooked rather than on the pixel).
 
     v1 scope (see docs/roi-spatial-laziness.md): the ROI cook narrows inputs to `ROI ⊕ halo`
     and cooks the cook-region grid. A gather sizes its output from the INPUT image, not the
@@ -681,8 +695,12 @@ def roi_plan(code: str, param_values: dict | None = None) -> RoiPlan:
     walked = _walk(code, param_values or {})
     if walked is None:
         return _NOT_EXECUTABLE
-    reads, blocked, halo, fold_erased = walked
-    if blocked:
+    reads, blocked, halo, fold_erased, region_dep = walked
+    if blocked or region_dep:
+        # TRK-25: a region-dependent program is refused for a reason orthogonal to the
+        # footprint — its ITERATION count, not its reach, is what the window would change.
+        # Closing it here closes the halo strip planner, the engine's ROI arming and
+        # `stage_halo`/`chain_windows` at the same time, because all four read this plan.
         return _NOT_EXECUTABLE
     narrow = frozenset(name for name, e in reads.items() if e.has_narrow)
     # …plus every binding `$param`-folding removed from `reads` entirely. The plan is EXECUTABLE
@@ -754,11 +772,20 @@ def batch_sliceable(code: str, param_values: dict | None = None) -> bool:
     wrong (clamped-to-strip) frame at EVERY offset — including offset 0 (the frozen-edge-frame
     the design doc warns of). So any frame op → whole-batch in v1 (the temporal analog of a
     spatial gather, deferred with the same absolute-index limitation). Spatial gathers/blurs
-    are per-frame and do NOT block batch-slicing. Never raises."""
+    are per-frame and do NOT block batch-slicing. Never raises.
+
+    TRK-25: a REGION-DEPENDENT program is refused too. The interpreter's `.any()` over a loop
+    condition reduces the BATCH axis along with H and W, so an `fi`-bounded (or `img_*`-bounded)
+    loop runs each strip to that strip's own maximum — a defect no frame-op scan can see,
+    because there is no frame op to find. A purely SPATIAL per-pixel bound is in fact
+    batch-safe; declining that too is an over-decline taken deliberately, so the engine has one
+    predicate to reason about rather than three."""
     param_values = param_values or {}
     try:
         program = _fold_program(code, param_values)
-        return not any(True for _ in _frame_ops(program))
+        if any(True for _ in _frame_ops(program)):
+            return False
+        return not region_dependent(program, code=code)
     except Exception:
         return False
 
