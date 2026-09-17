@@ -340,15 +340,19 @@ def _collect_sample_bindings(stmts: list[ASTNode]) -> set[str]:
     return names
 
 
-def _body_has_break_continue(stmts: list[ASTNode]) -> bool:
-    """Check if a list of statements contains break or continue (not in nested loops)."""
+def _body_has_break_continue(stmts: list[ASTNode], kinds=(BreakStmt, ContinueStmt)) -> bool:
+    """Check if a list of statements contains break or continue (not in nested loops).
+
+    `kinds` narrows the question to one of the two: the general-for emitter asks only about
+    `continue`, the one form whose native emission would skip that loop's update statement.
+    """
     for stmt in stmts:
-        if isinstance(stmt, (BreakStmt, ContinueStmt)):
+        if isinstance(stmt, kinds):
             return True
         if isinstance(stmt, IfElse):
-            if _body_has_break_continue(stmt.then_body):
+            if _body_has_break_continue(stmt.then_body, kinds):
                 return True
-            if stmt.else_body and _body_has_break_continue(stmt.else_body):
+            if stmt.else_body and _body_has_break_continue(stmt.else_body, kinds):
                 return True
         # Don't recurse into nested loops — their break/continue is local to them
     return False
@@ -509,8 +513,11 @@ class _CodeGen(_EmitStdFnsMixin):
         # execution instead of one per use site (and per loop iteration —
         # bare $param reads are below the optimizer's LICM/CSE depth cutoff).
         self._param_locals: dict[str, str] = {}
-        # When True, BreakStmt/ContinueStmt emit native Python break/continue
-        # instead of raising _CgBreak/_CgContinue. Set by static range for-loops.
+        # When True, BreakStmt/ContinueStmt emit native Python break/continue instead of
+        # raising _CgBreak/_CgContinue. Each loop emitter sets it for its OWN body and
+        # restores it: static-range for-loops and while-loops license the native form (no
+        # update statement for a `continue` to skip, and the while counter is incremented at
+        # the top of the body), a general for-loop revokes it for a body that continues.
         self._use_native_flow_control: bool = False
         # When True, emit Python float math instead of tensor ops.
         # Set by _emit_for_loop when the entire loop body is scalar-typed.
@@ -856,9 +863,10 @@ class _CodeGen(_EmitStdFnsMixin):
         self._owned.clear()
 
     def _stmt_break(self, stmt):
-        # Static range for-loops use native Python break/continue (no update to
-        # skip). Non-static for-loops and while-loops use exception-based flow
-        # because continue must not skip the update statement.
+        # Static range for-loops and while-loops use native Python break/continue (no update
+        # statement to skip). A general for-loop's body continues by signal instead, because
+        # its update and iteration counter sit below the body. The enclosing loop emitter
+        # sets the mode; see _use_native_flow_control.
         if self._use_native_flow_control:
             self._emit("break")
         else:
@@ -2270,7 +2278,20 @@ class _CodeGen(_EmitStdFnsMixin):
         else:
             self._emit_cond_break(stmt.condition)
 
+        # The flow mode belongs to THIS loop's body, not to whatever loop encloses it. A
+        # native `continue` emitted here would jump over both statements below — the user's
+        # update and the iteration counter — so the loop could never advance or trip its own
+        # limit: a hang, where the interpreter (whose `_exec_loop_body` catches `_Continue`
+        # and runs the update regardless) returns. A static or `while` emitter licenses
+        # native flow control for its own body; without this scoping that licence leaked into
+        # a general loop nested inside it. `break` needs no such care — native or signalled,
+        # it leaves the emitted `while` the same way — so it stays whatever the enclosing
+        # loop licensed and break-only bodies emit byte-identical code.
+        saved_flow = self._use_native_flow_control
+        if _body_has_break_continue(stmt.body, (ContinueStmt,)):
+            self._use_native_flow_control = False
         self._emit_body_with_flow(stmt.body)
+        self._use_native_flow_control = saved_flow
 
         # Update always executes (even after continue)
         self._emit_stmt(stmt.update)

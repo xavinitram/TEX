@@ -373,6 +373,29 @@ MUTATIONS = [
     ('in: membership is answered by a read (counts, restores, promotes)', 'tex_results.py',
      '            return key in self._ram',
      '            return self.get(key, copy=False) is not None'),
+    # Codegen flow-mode scoping. The first row is the defect verbatim: the general for-loop
+    # emitter stops pinning the mode for its own body, so a static/while loop's native flow
+    # control leaks in and a nested `continue` skips the update and the counter — the rows
+    # time out rather than fail, which run_tree scores as KILLED (hung). The second is the
+    # over-reach in the other direction (pin the native form instead), and the third drops the
+    # RESTORE, which strands the enclosing loop's own transfers in the wrong mode.
+    ('flow scope: the general for-loop stops pinning its body flow mode',
+     'tex_runtime/codegen.py',
+     '        if _body_has_break_continue(stmt.body, (ContinueStmt,)):\n'
+     '            self._use_native_flow_control = False',
+     '        if False:\n'
+     '            self._use_native_flow_control = False'),
+    ('flow scope: the general for-loop pins NATIVE flow for its body',
+     'tex_runtime/codegen.py',
+     '        if _body_has_break_continue(stmt.body, (ContinueStmt,)):\n'
+     '            self._use_native_flow_control = False',
+     '        if True:\n'
+     '            self._use_native_flow_control = True'),
+    ('flow scope: the general for-loop never restores the enclosing mode',
+     'tex_runtime/codegen.py',
+     '        self._emit_body_with_flow(stmt.body)\n'
+     '        self._use_native_flow_control = saved_flow',
+     '        self._emit_body_with_flow(stmt.body)'),
 ]
 
 RUNNER = """
@@ -386,8 +409,9 @@ import test_v033_precision as D, test_v033_cache8 as E, test_v033_xpu2 as F
 import test_v033_phase0 as G, test_v0331_audit as H, test_v0332_audit as I
 import test_v034_data7 as J, test_v034_io1 as K, test_v0341_audit as L
 import test_v035_hygiene as M, test_v030_phase1 as N
+import test_codegen_flow_scope as O
 r = SubTestResult()
-for m in (A, B, C, D, E, F, G, H, I, J, K, L, M, N):
+for m in (A, B, C, D, E, F, G, H, I, J, K, L, M, N, O):
     for n in sorted(x for x in dir(m) if x.startswith("test_")):
         try:
             getattr(m, n)(r)
@@ -402,6 +426,10 @@ def run_tree(root):
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONIOENCODING"] = "utf-8"
     env["TEX_CACHE_DIR"] = tempfile.mkdtemp(prefix="mutcache_")
+    # The flow-scope rows cook 2x2 scalar-loop programs in child processes, so their verdict is
+    # a timeout when a mutant reintroduces a non-terminating loop. Shorten the per-program
+    # budget: at the 30 s default a single hang mutant would sit here for twenty minutes.
+    env["TEX_FLOW_TIMEOUT"] = "8"
     try:
         out = subprocess.run(
             [VENV, "-c", RUNNER.format(tests=str(root / "tests"), parent=str(root.parent))],

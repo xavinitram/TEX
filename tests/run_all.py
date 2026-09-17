@@ -327,6 +327,19 @@ def main():
     test_codegen_param_precision_requests(r)
     test_codegen_param_placement_learned_once(r)
     test_codegen_param_default_route_unmoved(r)
+    # Native break/continue stays inside the loop that licensed it: a general for-loop's body
+    # continues by signal, so the update and the iteration counter below it still run. Each row
+    # runs its program in a child process with a timeout, because the defect it pins is a hang.
+    from test_codegen_flow_scope import (
+        test_flow_scope_emission,
+        test_flow_scope_t15_nested_general_loop_terminates,
+        test_flow_scope_nested_loop_matrix,
+        test_flow_scope_deeper_and_per_pixel_shapes,
+    )
+    test_flow_scope_emission(r)
+    test_flow_scope_t15_nested_general_loop_terminates(r)
+    test_flow_scope_nested_loop_matrix(r)
+    test_flow_scope_deeper_and_per_pixel_shapes(r)
     test_compiled_audit_fixes(r)
     test_fusion_memo(r)
     test_node_helpers(r)
