@@ -5,6 +5,414 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.1] - 2026-09-17
+
+**Say what it does** — the reference states the per-pixel control flow the engine has always had,
+six shipped examples stop claiming an early exit they never made, the help text stops promising a
+`format()` syntax that was never filled, and the on-disk caches authenticate a file before
+unpickling it. The rest is the opt-in surface an embedding host asked for, each seam off the
+default path.
+
+No reserved built-in name is added, and `tex_api.LANGUAGE_VERSION` stays `0.23`, so no compat
+freeze is owed. Everything below is an opt-in host surface, documentation, a test, one of nine
+fixes, or the Security item.
+
+### Added
+
+- **Per-pixel control flow, documented, with two opt-in advisories (ASK-6).** `LANGUAGE.md` gains
+  §7.1, "Uniform and per-pixel conditions". A condition that varies per pixel runs **both** branches
+  on every pixel and merges them; a reduction such as `img_min(@A)` counts as per-pixel, because its
+  result keeps `[B,1,1,C]`; `?:` is to be assumed to evaluate both operands; and a `break`,
+  `continue` or `return` written under a per-pixel `if` acts on every pixel, because it leaves
+  before the merge runs. `DEVELOPMENT.md` names the uniform short-circuit and that escape.
+  `examples/zdefocus.tex` no longer claims to skip the blur for in-focus pixels. This is what the
+  engine has always done, on both tiers and at `v0.34.0` alike; masking it would change what
+  programs that cook today compute, so masked semantics are designed for a release that moves the
+  language version, and this release documents the semantics instead.
+
+  `tex_api.control_flow_advisories(source, binding_types)` is a new opt-in analysis returning
+  warnings. `W7006` marks a per-pixel `if` or `?:` with a gather in a branch — work that is paid
+  for on every pixel. `W7007` marks control flow that acts on every pixel: a `break`, `continue` or
+  `return` under a per-pixel `if`, or a loop whose condition is per-pixel. `Error-Codes.md` is
+  regenerated with both codes, and its W7 family text says these come only from an analysis a host
+  calls. It is a pure AST pass with no cook path of its own: over all 116 shipped examples it runs
+  in 0.11 s and reports five `W7006` sites and — after the example fixes below — no `W7007` at all.
+  ComfyUI-invisible because only text and comments change and the analysis is reached from no call
+  path but a host's own call, so `check()`, `/tex_wrangle/check` and `tex_lsp` report exactly what
+  they reported before and no program's pixels, tier or cache identity move.
+- **Which noise tier served a cook, on request (BRIEF-6).** A tiered noise builtin swaps its
+  jit.trace callable for a `torch.compile`d one on a key's fourth call. The swap happens on the
+  default cook path wherever Triton or a working host C++ compiler is present, whatever
+  `compile_mode` says. The two tiers agree only to the envelope recorded under *Changed*, so a
+  region recooked on one tier and laid over a frame cooked on the other can carry a seam. For some
+  programs no band bounds that seam: worley at large coordinates, or anything that thresholds its
+  noise. `prepare()`/`cook(..., want_noise_tiers=True)` fills `CookResult.noise_tiers` with
+  `{label: tier}` for every tiered noise key the cook called. Labels look like `simplex@cuda:0` or
+  `fbm/6@cpu`. The tier is `"trace"`, `"promoted"`, `"eager"`, or `"promotion_failed"` for the
+  cook whose promotion attempt raised. The record is `{}` when no tiered builtin ran. It is `None`
+  when not asked, when a label served two tiers inside one cook, or under a tier strategy other
+  than `"default"`, and `tier_trace.last_noise_tiers()` says which. A host patches a frame only
+  when both records are dicts and equal, and cooks whole otherwise. Not provided:
+  - a record that travels with a spilled frame (treat a restored frame as unknown and cook whole);
+  - records from `cook_stage_list` / `cook_checkpointed`, which return plain dicts;
+  - a promotion hold, which would forfeit the compiled speed and still could not mark a frame
+    cooked in another process.
+
+  ComfyUI-invisible because the node never passes `want_noise_tiers`, the field defaults to
+  `None`, and no tier decision, promotion or pixel changes; unasked, the added cost is one
+  thread-local attribute read per tiered noise call and one flag test per cook, which read as
+  neutral in a quiet-box A/B against the previous head on CUDA and CPU.
+- **`tex_doctor.capabilities()` and `tex doctor [--json]`: which tiers have worked here, and why
+  not (BRIEF-4).** A read-only report of eight rows: `none@cpu`, `none@cuda`,
+  `torch_compile:inductor@cuda`, `torch_compile:cudagraphs@cuda`, `torch_compile:inductor@cpu`,
+  `cuda_graph@cuda`, `noise_promotion@cpu` and `noise_promotion@cuda`. Each row has a `status`
+  (`works` / `unknown` / `unavailable`), its `evidence` (`static` / `measured`), a `why_not` when
+  unavailable, and a `note`. The report reads only state the process already holds. It never
+  compiles or shells out, and a probe that raises degrades its own row to `unknown` without
+  taking another row down. A fresh process reads `unknown` wherever the prerequisites hold and
+  nothing has run yet: the report describes this box and never pins a ladder.
+  `python -m TEX_Wrangle.tex_cli doctor` prints it, and `--json` adds the existing doctor facts.
+  The schema is `1`, with a Tier 2 row in `DEVELOPMENT.md`'s ENG-5 table.
+  `_TieredCache.try_upgrade` now records the exception its `except` already swallowed (once per
+  key), so the noise row can name a failed promotion. `README.md`'s `tex doctor` row now says the
+  route reports tier *routing*, and points at the CLI for availability. ComfyUI-invisible because
+  neither the cook path nor the `/tex_wrangle/doctor` route calls `capabilities()` (the route's
+  payload is byte-identical), and recording an exception that was already swallowed changes no
+  output, error, default or cook-path cost.
+- **`ResultCache.touch(key)` and `key in cache`: a residency hint that is not a read
+  (BRIEF-13).** `touch` ranks a RAM-resident entry just below the most recent one and does
+  nothing else. It counts no hit or miss, promotes no demoted frame, restores no spilled one,
+  unpacks nothing and queues no work. It counts itself separately in `stats()["touches"]`, and for
+  a key that is not RAM-resident it returns `False` and changes nothing. `key in cache` answers
+  RAM-tier residency and changes nothing: a demoted frame is resident, while a spilled-only frame
+  reads `False` although `get` may still restore it. The most recent entry stays on top, so every
+  victim walk's eligible set stays as it was. A touch therefore changes which entry `evict_bytes`,
+  the RAM budget or residency demotion takes first, but never how many bytes they free or the
+  shortfall arbitration hands the next pool. The reorder and its read of the top entry are one
+  critical section. Left out on purpose, with the reasons beside the methods: promotion on a hint,
+  a keep-set on `evict_bytes`, and victim-order introspection. ComfyUI-invisible because the node
+  never references `tex_results`, no existing behaviour or default moved (`stats()` only gains a
+  key), and `key in cache` raised `TypeError` until now, so no caller could exist.
+- **A host may opt a MASK into preview-tier storage, one put at a time (BRIEF-12).**
+  `ResultCache.put(..., mask_eligible=False)` and `tex_packing.choose_storage(...,
+  mask_eligible=False)` gain a keyword. When it is set, `kind="MASK"` gets past the kind gate: for
+  MASK only, and only when the checks an IMAGE already meets agree. Those checks are the
+  `PREVIEW` tag, no `storage="fp32"` pin, and the fp16/uint16 range test, which declines rather
+  than clips. `COLOR_KINDS` stays `("IMAGE",)`, and LATENT/INT/STRING/ARRAY stay refused with the
+  keyword set. `patch_region` needs no knob of its own: it ratchets on the base's stored
+  representation, so a patched knob-packed mask stays fp16 and tagged `preview`. Measured: a
+  packed mask reads back within 2.45e-4, half an fp16 ulp on `[0.5, 1)`. ComfyUI-invisible
+  because the keyword defaults to `False` (every existing caller stores exactly the bytes it
+  stored before), and `tex_packing`/`tex_results` sit outside the ComfyUI cook path.
+- **`.textool` manifests accept `tooltip`, `options` and `optional` (ASK-10).** A promoted param's
+  metadata may carry `tooltip`, a string of at most `MAX_TOOLTIP_CHARS` = 1024. On an `i` param
+  only, it may also carry `options`: 1 to `MAX_OPTIONS` = 256 non-empty strings, each at most
+  `MAX_OPTION_CHARS` = 128. A `min`/`max`/`step` given beside `options` must read
+  `0`/`len-1`/`1`, and a `default` must be an integer index into the list. An input may carry
+  `optional`, a JSON bool that is host UI advice only: TEX binds nothing for an absent input
+  either way. A fused tool's source input may not be optional, because the engine needs it to
+  splice the chain. `tooltip` and `options` are capped literals and never compiled, so a host that
+  renders them owns escaping (`docs/tools.md` §6). `extent` stays an unrecognised input key,
+  dropped as before. `TEXTOOL_SCHEMA` does not move: v0.35.0 already refuses `tooltip`/`options`
+  loudly rather than misreading them. **Two manifest shapes that v0.35.0 loaded by silently
+  dropping the key now refuse at load:** `optional` that is not a JSON bool, and `optional: true`
+  on a fused tool's source input. ComfyUI-invisible because the ComfyUI publish menu still
+  forwards only the original five metadata keys, and every existing `.textool`, stock or not,
+  loads, serialises and cooks byte-identically.
+- **A fused `.textool` may take more than one external input, routed with `feeds` (BRIEF-11a).**
+  `inputs[*].feeds` lists the stage bindings, as `[stage | "terminal", binding]` pairs, that an
+  extra IMAGE or MASK input is written into. Those are the places promoted values already go, so
+  the fused program cooks through the unchanged GraphSpec path. `validate_manifest` checks `feeds`
+  before any parse: its shape, the stage range, the type, and no collision with a binding the
+  stage already binds. On a DAG it also checks that every stage is anchored to a chain, the source
+  or a feed. `cook_tool` refuses an input whose `[B,H,W]` differs from the source's, because once
+  fused, a broadcast axis silently moves an upstream stage's pixels. The fused-input refusals gain
+  `.input` and stable `TEXToolError.code` values: `fused-input-count`, `fused-input-unrouted`,
+  `fused-feed-invalid`, `fused-feed-collision`, `fused-stage-unanchored`, `fused-input-missing`
+  and `fused-input-extent`. Their messages and types are unchanged, and every other
+  `TEXToolError` has `code=None`. Graph fusion keeps its one-producer rule, which is recorded with
+  its gate in `DEVELOPMENT.md` §"Rejected design decisions"; the 16-stage cap is untouched. Tests
+  pin that a Blur → Merge tool, an upstream feed and a DAG feed each cook equal to their stages
+  cooked one by one on CPU and CUDA, with interpreter == codegen. **One manifest shape that
+  v0.35.0 loaded by silently dropping the key now refuses at load:** a `feeds` key on a
+  single-stage tool. ComfyUI-invisible because every new branch runs only for a manifest that
+  declares `feeds`, which no ComfyUI path emits, and every existing refusal keeps its text and
+  type.
+- **The language server type-checks against the bindings a client wired (HOOK-2).**
+  `textDocument/didOpen` and `didChange` params may carry an optional `bindingTypes` object beside
+  `textDocument`. It is `{name: type-string}`, the wire form of the `{name: TEXType}` map that
+  `tex_api.check(source, binding_types)` already takes, so the editor flags a narrower-typed
+  input's out-of-range channel read before the cook fails on it. Type strings are
+  `tex_compiler.types.TYPE_NAME_MAP`'s own keys (`float`, `int`, `vec2`, `vec3`, `vec4`, `mat3`,
+  `mat4`, `string`), matched case-sensitively. An entry that does not resolve (a typo, the wrong
+  case, `array`) is dropped, never raised or diagnosed. The map persists per document across
+  `didChange` the way the text does, a bindings-only change republishes, and `didClose` discards
+  the map. ComfyUI-invisible because a client that never sends `bindingTypes` gets byte-for-byte
+  the diagnostics it got before, and the ComfyUI editor's live lint (`/tex_wrangle/check`) does
+  not go through `tex_lsp` at all.
+- **`TEX_Wrangle.tex_testkit`: the suite's state-isolation helpers, importable (HOOK-4).**
+  `make_img`, `cold_engine_state` and `armed_profiler` move from `tests/helpers.py` to a
+  package-root module that imports only the standard library and torch, with no pytest and no
+  compiler stack. An embedding host's own suite can use them without putting TEX's `tests/`
+  directory on its path. `tests/helpers.py` re-exports the same objects, and
+  `from helpers import *` binds exactly the 59 names it bound before (pinned as a literal set).
+  The module docstring places the surface closest to ENG-5 Tier 2: additive-only, with its name
+  set canary-pinned. ComfyUI-invisible because nothing on the ComfyUI path (`tex_node.py`,
+  `__init__.py`, `tex_runtime/host.py`) imports it.
+- **Uniform outputs, documented and pinned (BRIEF-9).** `LANGUAGE.md` §5.2 states the contract.
+  An `f@`/`i@` output written only from literals, scalar `f$`/`i$` params and the 0-dim builtins
+  `iw ih px py fn ic PI TAU E frame fps time` is one 0-dim value per cook. It is identical on
+  every tier and route, and exact at fp32. The section states the exclusions: a `v2@`–`v4@`
+  output, anything reading `u v ix iy fi` or an image, and a vec `$param` read into a scalar.
+  Seven tests pin the contract across:
+  - interpreter and codegen, and every `compile_mode`;
+  - the tiled, batch-strip and ROI assemblers, and a fused terminal stage.
+
+  The tests also show that a host sweeping a `$param` never recompiles, while the output's lineage
+  key moves. Two builtins were declined, each recorded with its reopen condition in
+  `DEVELOPMENT.md` §"Rejected design decisions":
+  - `data_window(@A)`: nothing carries a binding's extent, so a fused and an unfused cook would
+    read different windows;
+  - `declare_window(x0, y0, w, h);`: §5.2's plain outputs already declare a window, without
+    reserving a name.
+
+  ComfyUI-invisible because no engine file changed: the tests pin what every tier and route
+  already cooked.
+- **Embedding TEX in a host: the bring-up, documented and exercised (BRIEF-5).** A new
+  `DEVELOPMENT.md` section covers:
+  - the bring-up sequence: `default_session().set_host(NullHostServices())`,
+    `set_egress_profile("engine")`, one `CookQueue` owning every cook, lifecycle operations fenced
+    through the queue, then `close()` in order;
+  - the queue token's four rules: a cook takes the queue's own token; a preempt returns a job to
+    the head of its class, while a shed is terminal; a cancellation the queue did not raise is
+    also terminal; a cook that returned is never discarded;
+  - the process-global state a host shares, including the noise tier promotions that `reset()`
+    does not clear;
+  - one pointer to each opt-in host surface on the tree, with its ENG-5 tier.
+
+  A new test runs the section's code block verbatim in a fresh subprocess with ComfyUI
+  unimportable, so a rename fails a test instead of silently going stale for a host.
+  `EngineSession.reset`'s docstring now says it clears noise *offsets* only. ComfyUI-invisible
+  because the change is a documentation section, one docstring clause and one test: no engine
+  module, call path or default moves.
+
+### Changed
+
+- **The noise tier promotion is held to a recorded envelope, and each tier alone stays exact
+  (BRIEF-6).** Three `test_v031_noise_tiers.py` rows went red on the first box where Inductor
+  engages. `_TieredCache` promotes a key from jit.trace to an Inductor kernel on its fourth call,
+  and on CUDA that swap moves simplex by up to 6.56e-07. Each tier on its own still renders one
+  image per signature, so the two rows that reported a reopened profiling window had misread the
+  swap. The rows now split at the promotion:
+  - Cold-frame parity, the resolution dance and the stride-aware signature stay bit-exact on each
+    tier. The dance and stride legs run with the tier held at jit.trace, then again promoted.
+  - The cold-frame row checks the swap itself: one promotion, on cook #4, reported by
+    `tier_trace.noise_compiles()`, within the simplex band of cook #1. On CPU the swap measured
+    bit-exact, so the CPU band is 0.0.
+  - A new `promotion_envelope` row pins one band per builtin against the fp32 interpreter control
+    (the default cook on the incumbent jit.trace tier): simplex 2e-6, fbm 5e-7, and worley four
+    ulps of its coordinate. Worley moves the coordinate's last ulp: 6.07e-05 at scale 512.
+  - The same band bounds a window cooked on one tier laid over a frame cooked on the other, both
+    ways. A window on its own tier stays bit-exact against the crop.
+
+  Both envelope judgements carry an in-test mutation installed through `try_upgrade` itself: on
+  any CUDA box, twice the band must judge red and a quarter of it green. No global tolerance
+  moved. ComfyUI-invisible because the change is test-only and no shipped code path moves.
+
+### Fixed
+
+- **Five shipped examples computed something other than what their names and comments say (ASK-6,
+  ASK-11).** Each relied on control flow acting per pixel, which §7.1 now says it does not.
+  **Their outputs change, because they were wrong.** Each now matches an independent per-pixel
+  reference — an ordinary Python loop with a real early `break` — on the interpreter and on
+  codegen alike, to 3.4e-07 or better:
+  - `fix_pixels.tex`: `is_bad()` returned `1.0` from inside a per-pixel `if`, so every pixel
+    counted as bad and a clean image came out black (mean `0.0000` where the image's own `0.4818`
+    should pass through). It now computes one expression: a clean image passes through unchanged,
+    and a NaN/Inf pixel takes its valid neighbours' mean or the fallback colour. Neighbours are
+    read as `@image[x, y]`, the same clamped nearest read as `fetch()`, which codegen lowers
+    correctly at batch 1.
+  - `break_search.tex`: the `break` under the brightness test ended the scan for every pixel, so
+    the green line was always drawn at column 0 rather than at the first bright column (5 in the
+    pinned case). Each pixel now records its own first hit, and the remaining `break` stops the
+    scan at the image edge, a test that is the same for every pixel.
+  - `custom_blend.tex`: `my_overlay()` returned `2ab` for every pixel — `1.1200` on the right half
+    where overlay gives `0.8800`. It and `my_soft_light()` now assign inside the `if` and return
+    once.
+  - `while_loop.tex`: the convergence `break` stopped Newton's method after one step for every
+    pixel, so the displayed error ×100 read `8.0000` on luma 0.36 instead of `0.0000`. Each pixel
+    now keeps a `done` flag, and the loop runs `$max_iter` passes.
+  - `vector_blur.tex`: the per-pixel tap count ran every pixel to the frame's largest count and
+    divided by its own — `3.6667` on a zero-motion pixel of a constant-1 image instead of
+    `1.0000`. The loop now runs `$max_samples` taps and gives weight 0 to those past a pixel's own
+    count. Two trade-offs the header now states: every pixel pays `$max_samples` taps, and a
+    `$max_samples` above 1024 meets the loop cap (E6010) whatever the motion.
+
+  Parameters, inputs, outputs and every snippet-menu first line are unchanged, and
+  `examples/INDEX.md` regenerates byte-identical. **Three frozen compat-corpus rows were refrozen,
+  deliberately.** The corpus hashes these programs' outputs, so
+  `tests/compat_corpus_goldens/0.23.json` was deleted and frozen again the way
+  `tests/compat_corpus.py` documents. Exactly three rows moved — `break_search`, `custom_blend`
+  and `fix_pixels` — each because its example now computes what it claims on the corpus's dummy
+  inputs; the other 126 rows are byte-identical, and the archive stays at language `0.23`.
+  `while_loop` and `vector_blur` keep their hashes, because the corpus's dummy parameters
+  (`max_iter = 1`, `max_samples = 1`) never reach the early exit or the per-pixel bound.
+  ComfyUI-invisible because no engine, compiler, node or default changes and every other program
+  cooks exactly as before, while these five example programs' outputs change deliberately because
+  they were wrong.
+- **`examples/recursive_pattern.tex` rendered solid black (ASK-6).** The Mandelbrot example
+  returned its escape step from inside `if (r*r + i*i > 4.0)`. That condition reads each pixel's
+  own orbit, so the branch ran on every pixel and the `return` fired on the first pass for all of
+  them, handing back escape `= 0.0`; `val > 0.0` was then false everywhere. **Its output changes
+  because it was wrong:** on a 9×14 cook of the default view, mean `0.0000` with 0 of 126 pixels
+  lit becomes mean `0.3448` with 86 lit, matching a per-pixel reference to 2.8e-07 on the
+  interpreter and on codegen, and a zoomed view at 30 iterations matches to 3.9e-07. `iterate()`
+  now keeps a `done` flag, the same idiom as `while_loop.tex`: each pixel records its own escape
+  step, stops iterating so its orbit stays finite, and the loop runs `$max_iter` passes, the same
+  count for every pixel. Parameters, inputs, outputs and the snippet-menu first line are
+  unchanged, and `examples/INDEX.md` regenerates byte-identical. **No frozen corpus row moves**:
+  the corpus cooks this program with no bindings, so it has no grid, `u`/`v` are 0-dim there,
+  every condition is uniform, and the golden always recorded the value the fix now computes per
+  pixel. With this example fixed, `control_flow_advisories` reports `W7007` for no shipped example
+  at all, which a new test row asserts. ComfyUI-invisible because no engine, compiler, node or
+  default changes and every other program cooks exactly as before, while this example program's
+  output changes deliberately because it was wrong.
+- **`LANGUAGE.md` §7 said a `for` loop takes "static ranges" and a `while` takes "a guard"
+  (ASK-11).** A per-pixel bound is accepted, and neither phrase said what happens then. The line
+  now says what actually bounds a loop: every loop is capped at 1024 iterations, and one that
+  needs more fails with E6010. §7.1 gains the loop bullet: a `for` or `while` whose condition is
+  per-pixel runs every pixel for as many passes as the pixel that needs the most and does not mask
+  the body, so bound it uniformly and guard or weight the per-pixel work. `DEVELOPMENT.md`'s loop
+  section says the same. Tests pin it on the interpreter and codegen: a per-pixel `for` bound and
+  `while` condition give every pixel the frame's maximum, a uniform bound with a guarded or
+  weighted body gives each pixel its own count, and the 1024 cap raises E6010. ComfyUI-invisible
+  because only documentation and tests change, so no program's pixels, tier or cache identity
+  move.
+- **A `continue` inside a nested general `for` loop emitted code that never terminated.** A
+  static-range `for` and a `while` may emit a TEX `break`/`continue` as the Python statement:
+  neither has an update below its body for a native `continue` to skip. A general `for` is emitted
+  as a counted `while` with the user's update *and* that counter below the body, so a `continue`
+  there must be signalled and caught under the body instead. The emitter tracked this licence in
+  one flag that only the static and while emitters set, so it leaked into a general loop nested
+  inside them: that loop's `continue` was emitted natively and jumped over both the update and the
+  counter, leaving a loop that could neither advance nor trip its own iteration limit.
+  `for(int i=0;i<3;i++){if(i==2){break;} for(j=0;j<3;j=j+1){if(j==1){continue;} acc+=1.0;}}` never
+  terminated under codegen, on CPU or CUDA, where the interpreter returns `4.0`; a body that
+  advanced the counter itself terminated with the wrong answer instead. Each loop emitter now pins
+  the mode for its own body and restores it afterwards. A `break` is deliberately left as it was —
+  native or signalled, it leaves the emitted `while` the same way — so a body that only breaks
+  still emits byte-identical code, as do all 116 shipped examples, the 13 adversarial corpus
+  programs and the 6 stock tool programs, on the raw and the optimized compile path alike.
+  ComfyUI-invisible because only programs that hung or diverged under codegen change: they now
+  finish with the interpreter's result.
+- **A `$param` declared with a negative literal default had no default at all.** `f$k = -0.3;`
+  parses as a unary minus over a number literal, a shape the type checker's default-extraction
+  chain did not handle, so the declared `default_value` silently stayed `None` and a caller that
+  omitted the param hit E6003 instead of the value the source states. Three shipped examples
+  declare one: `barrel_distortion.tex` and `lens_distortion.tex` (`k1 = -0.3`) and
+  `recursive_pattern.tex` (`center_x = -0.5`). Each now reports its declared default, and cooking
+  it with the param omitted is bit-identical to supplying the same value explicitly.
+  ComfyUI-invisible because the editor's widget builder parses each `$param` default from the raw
+  source text, independently of the type checker, so every existing ComfyUI workflow already
+  showed this value; the fix only helps a bare `cook()`, CLI or API caller that omits the param.
+- **Under `compile_mode="auto"` on CUDA, codegen fell back to the interpreter for every program
+  that broadcast a scalar or vec `$param`.** The generated preamble converts a param with
+  `as_tensor(value)`, which lands on the CPU, so the first broadcast against a CUDA operand raised
+  a cross-device error. The fix applies on the opt-in routes into codegen: `run_auto`, and
+  `torch_compile`'s deep-loop route. A call that raises on a non-CPU device is now retried once
+  with those bindings on the device, and the generated function remembers the verdict and places
+  them up front from then on. The emitted code is unchanged. Placement is learned rather than
+  applied to every cook, because a device param costs a host-to-device copy per cook and a sync
+  wherever the code reads it back:
+  - programs codegen already served with CPU params, such as `blur.tex` and `sharpen.tex`, never
+    place;
+  - a program that needs placement pays one failed call per generated function, per process.
+
+  Quiet box, interleaved, 9 rounds: a 1024² `@image * $gain` cook was 1.34× faster, and `blur.tex`
+  and `sharpen.tex` stayed within the A/A control's noise. The default fetch-stencil route never
+  places, and a test pins it. ComfyUI-invisible on the default path because the node's default
+  `compile_mode` is `none`, whose route is unchanged and pinned; a user who opts into `auto` on
+  CUDA sees these programs served by codegen, faster, and bit-identical to the interpreter that
+  served them before.
+- **`patch_dist` padded its shift by the raw offset (ASK-13).** A uniform `dx`/`dy` far past the
+  image asked the replicate pad for `extent + 2·|offset|` on that axis, so a large enough offset
+  could exhaust memory before the patch radius entered the picture. With replicate edges, a shift
+  beyond `extent - 1 + radius` reads only the edge-replicated border, however far past it goes.
+  The offset used for the shift and its padding is now clamped to that bound per axis, sign
+  preserved; `radius`'s own `[0, 32]` clamp is unchanged. Tests pin the result bit-exact against
+  the unclamped computation just below, at, just above and far beyond the bound, on both tiers,
+  CPU and CUDA. ComfyUI-invisible because every cook that completed before returns the same bytes;
+  the one observable difference is an out-of-memory failure that no longer happens.
+- **`format()`'s help promised printf-style `%d`/`%f`/`%s` placeholders that it has never filled
+  (ASK-9).** `format()` has substituted `{}` placeholders since v0.4.0. Its registry `doc=`/`ex=`,
+  and the editor help mirrored from them, claimed printf-style and showed an example that returned
+  its own template unchanged. The entry now says what `format()` does: `{}` filled in order, specs
+  such as `{:04d}` and `{:.2f}`, a whole number formatted as an int, and `%` left literal.
+  `Function-Reference.md` and `tex_help.json` are regenerated from it. Teaching `format()`
+  `%`-style substitution was declined: it would change the output of existing programs whose
+  strings contain `%`, `examples/string_format.tex` among them. ComfyUI-invisible in behaviour
+  because `format()`'s signature, body and tag are untouched: the corrected help text is the only
+  change a user sees, and every program cooks byte-identically.
+- **`px`/`py` were documented as the UV step to a neighbouring pixel (ASK-12).** They are `1/iw`
+  and `1/ih`: one pixel's width as a fraction of the frame. Neighbouring `u`/`v` centres sit
+  `1/(iw-1)` apart, so `u + px` lands `1/iw` of a pixel short. The editor's "Pixel Step" and
+  "Built-in Variables" help, `README.md`'s table, and the hint shown when a variable shadows `px`
+  or `py` now say so. `LANGUAGE.md` §6 defines `u`, `v`, `px` and `py` exactly, with the exact
+  k-pixel step `u + k / max(iw - 1.0, 1.0)`. Tests pin the stated values, and that the exact step
+  matches `fetch` at the neighbouring pixel, on both tiers, CPU and CUDA. Declined:
+  - moving `px` to `1/(iw-1)`, which would change the output of nine of the twelve shipped
+    examples that read it;
+  - a built-in step variable, which would collide with shipped examples' own `du`/`dv` locals;
+  - a `pixel(k)` helper, which would only spell what the exact step already spells.
+
+  ComfyUI-invisible in behaviour because `px`/`py`'s values and every example's code are
+  untouched: the corrected help and hint text is the only change a user sees.
+
+### Security
+
+- **The on-disk caches authenticate a file before unpickling it (BRIEF-10).** The program cache
+  (`.pkl`), the codegen cache (`.cg`) and the frame spill tier (`.frame`) reload with `pickle`,
+  whose `__reduce__` runs during the load. A cache directory is writable by more than one process
+  by design, so anyone able to write into it could run code the next time a cook hit that file.
+  The checks that already existed ran after the load. A digest kept beside the file does not help:
+  whoever plants the file can recompute it, so it hardens against corruption but not against a
+  crafted file (recorded in `DEVELOPMENT.md` §"Rejected design decisions"). Every persisted pickle
+  now carries a 37-byte HMAC-SHA256 trailer under a per-user key kept outside the cache directory.
+  `_load_from_disk`, `_load_codegen_from_disk` and `ResultCache._restore` verify it before any
+  deserialise, reading each file once and unpickling the exact bytes the MAC checked. A missing or
+  wrong tag is a silent miss that recompiles or recooks, never an error and never a served frame.
+  A trailer written by a newer TEX (`TEXm2` onward) is declined without being deleted.
+  - **What it does not cover.** TEX points torch's own compile cache (`TORCHINDUCTOR_CACHE_DIR`)
+    at a `torch_compile/` directory inside its cache directory, and torch reads that cache with
+    its own unauthenticated pickle and generated code. That path is reached on the default path
+    when a noise tier promotes, and under `compile_mode="torch_compile"`, so a shared cache
+    directory stays unsafe while `torch.compile` runs. On the default layout, with `.tex_cache`
+    inside the package directory, the MAC protects nothing: whoever can plant a pickle there can
+    edit the source beside it. It earns its keep when `TEX_CACHE_DIR` points somewhere more
+    exposed than the code.
+  - **The key.** It is 32 random bytes, minted on first use:
+    - on Windows, at `%LOCALAPPDATA%\TEX_Wrangle\cache_mac.key` (`%APPDATA%` when `LOCALAPPDATA`
+      is unset);
+    - elsewhere, at `$XDG_STATE_HOME/TEX_Wrangle/cache_mac.key` or
+      `~/.local/state/TEX_Wrangle/cache_mac.key` (directory `0700`, file `0600`).
+
+    Creation is create-only and atomic, so concurrent first cooks converge on one key, and a
+    truncated or empty key is repaired. Where no per-user directory is writable, the process uses
+    an ephemeral key, and its disk cache neither persists across a restart nor mixes with another
+    instance's. **The file lives outside the ComfyUI tree and outlives an uninstall**; deleting it
+    costs one recompile and recook. Instances run by one user share the key and each other's
+    entries. Two users pointing at one `TEX_CACHE_DIR` no longer share entries: each one's load
+    refuses, and removes, the other's.
+  - **After upgrading: one recompile and one recook.** Every `.pkl` and `.cg` written before the
+    upgrade recompiles once. **Every spilled `.frame` written before the upgrade is a miss and
+    recooks once:** unsigned records of every earlier format, v0 through v2, are no longer served,
+    because an unsigned file and a crafted one are byte-indistinguishable. Restoring a spilled
+    frame now reads it whole once to verify it, which is one transient copy. On the measuring box,
+    restoring a 1080p fp32 frame takes about 2.4× as long, and writing one about 1.3×.
+  - ComfyUI-visible only as that one-time recompile after upgrading and the one key file in the
+    user profile: the tag is a trailer `pickle` ignores, the HMAC runs at memcpy speed off the
+    per-frame path, and no setting and no new error is added.
+
 ## [0.35.0] - 2026-09-16
 
 **Common ground** — one cook grid whatever order the bindings arrive in, two native builtins,
