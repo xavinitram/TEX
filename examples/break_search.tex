@@ -5,6 +5,12 @@
 // first pixel whose luminance exceeds the threshold. Outputs a
 // visualization: pixels left of the found position are tinted red,
 // and the found column is drawn as a bright green line.
+//
+// The brightness test reads the image, so it is per-pixel: a `break` under
+// it would end the scan for EVERY pixel the first time the loop reached it
+// (LANGUAGE.md §7.1). Each pixel records its own first hit in found_x
+// instead, and `break` is kept for a test that is the same for every pixel:
+// the scan stops at the right edge of the image.
 
 f$threshold = 0.5;    // luminance threshold to search for
 i$scan_width = 0;     // pixels to scan (0 = full width)
@@ -17,11 +23,15 @@ int width = ($scan_width > 0) ? $scan_width : int(iw);
 // Scan this row from the left to find the first bright pixel
 int found_x = -1;
 for (int sx = 0; sx < width; sx = sx + 1) {
+    // Uniform: past the last column there is nothing left to find
+    if (sx >= int(iw)) {
+        break;
+    }
     vec3 s = fetch(@image, sx, iy);
     float lum = luma(s);
-    if (lum > $threshold) {
+    // Per-pixel: a pixel that already found its hit keeps it
+    if (found_x < 0 && lum > $threshold) {
         found_x = sx;
-        break;
     }
 }
 

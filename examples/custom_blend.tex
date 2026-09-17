@@ -9,23 +9,30 @@
 // its own my_overlay()/my_soft_light() to show how to write a CUSTOM blend —
 // user functions may NOT reuse a built-in's name, so we prefix them with my_.
 //
+// Each function tests a pixel value, so its `if` is per-pixel: both branches
+// run on every pixel and the result is merged pixel by pixel. A `return`
+// inside such an `if` would return for EVERY pixel (LANGUAGE.md §7.1), so each
+// function assigns its result inside the `if` and returns once at the end.
+//
 // Connect @base and @overlay to RGB images.
 
 float my_overlay(float a, float b) {
+    float res = 1.0 - 2.0 * (1.0 - a) * (1.0 - b);
     if (a < 0.5) {
-        return 2.0 * a * b;
+        res = 2.0 * a * b;
     }
-    return 1.0 - 2.0 * (1.0 - a) * (1.0 - b);
+    return res;
 }
 
 float my_soft_light(float a, float b) {
-    if (b < 0.5) {
-        return a - (1.0 - 2.0 * b) * a * (1.0 - a);
-    }
     float d = a;
     if (a < 0.25) { d = ((16.0 * a - 12.0) * a + 4.0) * a; }
     else { d = sqrt(a); }
-    return a + (2.0 * b - 1.0) * (d - a);
+    float res = a + (2.0 * b - 1.0) * (d - a);
+    if (b < 0.5) {
+        res = a - (1.0 - 2.0 * b) * a * (1.0 - a);
+    }
+    return res;
 }
 
 f$blend_amount = 0.5;   // mix strength (0 = base only, 1 = full overlay blend)

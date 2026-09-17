@@ -9,6 +9,13 @@
 //   2. If any channel is bad, replace with average of valid neighbors
 //   3. If all neighbors are also bad, fall back to black
 //
+// Every test here reads a pixel value, so each `if` is per-pixel: both
+// branches run on every pixel and each pixel keeps its own side
+// (LANGUAGE.md §7.1). So is_bad() computes one expression instead of
+// returning from inside an `if` (that `return` would fire for every pixel),
+// and the neighbor gather runs for every pixel while only bad pixels keep
+// its result.
+//
 // Connect @image to a potentially corrupted RGB input.
 
 f$fallback_r = 0.0;     // fallback red if neighborhood is all bad
@@ -20,9 +27,8 @@ vec3 col = @image;
 // ── Check if current pixel is bad ───────────────────────────────────
 // A pixel is "bad" if any channel is NaN or infinite.
 float is_bad(vec3 c) {
-    if (isnan(c.r) || isnan(c.g) || isnan(c.b)) { return 1.0; }
-    if (isinf(c.r) || isinf(c.g) || isinf(c.b)) { return 1.0; }
-    return 0.0;
+    return (isnan(c.r) || isnan(c.g) || isnan(c.b)
+            || isinf(c.r) || isinf(c.g) || isinf(c.b)) ? 1.0 : 0.0;
 }
 
 if (is_bad(col) > 0.5) {
@@ -32,8 +38,10 @@ if (is_bad(col) > 0.5) {
 
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
+            // The loop counters are the same for every pixel, so this
+            // `continue` skips the center tap for all of them, as meant.
             if (dx == 0 && dy == 0) { continue; }
-            vec3 neighbor = fetch(@image, ix + dx, iy + dy);
+            vec3 neighbor = @image[ix + dx, iy + dy];   // nearest, clamped to the edge
             if (is_bad(neighbor) < 0.5) {
                 acc += neighbor;
                 count += 1.0;

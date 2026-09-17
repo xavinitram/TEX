@@ -6,8 +6,15 @@
 //
 // Uses uniform weighting (box filter along the vector) to match real
 // motion blur, where all positions in the shutter interval contribute
-// equally. Adaptive sample count scales with displacement length.
+// equally. Each pixel averages its own sample count, which grows with its
+// displacement length (minimum 3, at most $max_samples).
 // Bilinear sampling (appropriate for the continuous line of a motion streak).
+//
+// The loop runs $max_samples taps for every pixel: a loop bounded by the
+// per-pixel count would run every pixel to the frame's largest count and keep
+// adding taps past a pixel's own (LANGUAGE.md §7.1). Taps past a pixel's own
+// count get weight 0 instead. Lower $max_samples for speed; above 1024 the
+// loop exceeds TEX's iteration cap and the cook fails with E6010.
 //
 // For best results, connect 32-bit float motion vectors from an
 // optical flow node or render pass.
@@ -21,7 +28,7 @@ vec3 mv = @vectors;
 float dx = (mv.r - 0.5) * 2.0 * $strength;
 float dy = (mv.g - 0.5) * 2.0 * $strength;
 
-// Adaptive sample count: more samples for longer vectors, minimum 3
+// Per-pixel sample count: more samples for longer vectors, minimum 3
 float motion_len = hypot(dx, dy);
 int num_samples = clamp(int(motion_len * 0.5 + 1.0), 3, $max_samples);
 
@@ -32,12 +39,14 @@ float step_v = sdiv(dy / ih, steps);
 float half_steps = steps * 0.5;
 
 vec3 sum = vec3(0.0);
-for (int i = 0; i < num_samples; i++) {
+for (int i = 0; i < $max_samples; i++) {
     // Sample position along the motion vector, centered on current pixel
     float t = float(i) - half_steps;
     float su = u + step_u * t;
     float sv = v + step_v * t;
-    sum += sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0)).rgb;
+    // Taps past this pixel's own count weigh nothing
+    float w = (i < num_samples) ? 1.0 : 0.0;
+    sum += sample(@image, clamp(su, 0.0, 1.0), clamp(sv, 0.0, 1.0)).rgb * w;
 }
 
 @OUT = sum / float(num_samples);

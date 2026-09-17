@@ -1,10 +1,15 @@
 // While Loop — Newton's method for square root
 //
-// Educational example demonstrating while loops and break.
+// Educational example demonstrating while loops with a per-pixel stop.
 // Uses Newton-Raphson iteration to compute the square root of the
 // pixel luminance: guess = (guess + x / guess) / 2
 // Iterates until the error is below a tolerance, then compares the
 // result with the built-in sqrt() function.
+//
+// The error differs from pixel to pixel, so a `break` on it would end the
+// loop for EVERY pixel on the first pass (LANGUAGE.md §7.1). Each pixel keeps
+// a `done` flag instead and stops updating its guess once it has converged,
+// while the loop itself runs $max_iter passes, the same for every pixel.
 //
 // Output: left half shows Newton's result, right half shows the
 // difference (error) magnified 100x. Should be near-black.
@@ -17,16 +22,19 @@ float x = luma(src);
 
 // Newton's method for sqrt(x)
 float guess = max(x, 0.001);   // initial guess (avoid zero)
+float done = 0.0;              // 1.0 once this pixel has converged
 int iter = 0;
 
 while (iter < $max_iter) {
     float next = (guess + x / max(guess, 0.0001)) * 0.5;
     float err = abs(next - guess);
-    guess = next;
-    iter = iter + 1;
-    if (err < $tolerance) {
-        break;
+    if (done < 0.5) {
+        guess = next;          // a converged pixel keeps its guess
     }
+    if (err < $tolerance) {
+        done = 1.0;
+    }
+    iter = iter + 1;
 }
 
 float newton_sqrt = guess;

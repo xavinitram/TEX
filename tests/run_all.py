@@ -1527,6 +1527,12 @@ def main():
         test_control_flow_advisories_are_invisible_to_check,
         test_control_flow_per_pixel_loop_bound_semantics_both_tiers,
         test_control_flow_language_md_states_the_loop_bound,
+        test_control_flow_fix_pixels_matches_a_per_pixel_reference,
+        test_control_flow_break_search_matches_a_per_pixel_reference,
+        test_control_flow_custom_blend_matches_a_per_pixel_reference,
+        test_control_flow_while_loop_matches_a_per_pixel_reference,
+        test_control_flow_vector_blur_matches_a_per_pixel_reference,
+        test_control_flow_fixed_examples_keep_their_surface,
     )
     test_control_flow_per_pixel_condition_semantics_both_tiers(r)
     test_control_flow_language_md_states_the_rule(r)
@@ -1536,6 +1542,12 @@ def main():
     test_control_flow_advisories_are_invisible_to_check(r)
     test_control_flow_per_pixel_loop_bound_semantics_both_tiers(r)
     test_control_flow_language_md_states_the_loop_bound(r)
+    test_control_flow_fix_pixels_matches_a_per_pixel_reference(r)
+    test_control_flow_break_search_matches_a_per_pixel_reference(r)
+    test_control_flow_custom_blend_matches_a_per_pixel_reference(r)
+    test_control_flow_while_loop_matches_a_per_pixel_reference(r)
+    test_control_flow_vector_blur_matches_a_per_pixel_reference(r)
+    test_control_flow_fixed_examples_keep_their_surface(r)
 
     success = r.summary()
     return 0 if success else 1

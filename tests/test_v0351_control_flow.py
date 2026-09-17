@@ -503,3 +503,345 @@ def test_control_flow_language_md_states_the_loop_bound(r: SubTestResult):
         r.ok("LANGUAGE.md states the 1024 cap and the per-pixel loop bullet; DEVELOPMENT.md agrees")
     except Exception as e:
         r.fail("loop-bound docs", f"{type(e).__name__}: {e}")
+
+
+# ── the shipped examples that used to exit or bound per pixel ────────────────
+#
+# Each example is measured against a per-pixel reference computed here in plain Python —
+# one pixel at a time, with an ordinary early `break`/`return` — so the reference cannot
+# share the engine's control flow. Both tiers must match it.
+
+import math  # noqa: E402
+
+_EPS_FLOAT = 1e-5
+
+
+def _grid(t):
+    """Batch 0 of a [1,H,W,C] tensor as nested Python floats [H][W][C]."""
+    return t[0].tolist()
+
+
+def _clamped(img, y, x):
+    return img[min(max(y, 0), len(img) - 1)][min(max(x, 0), len(img[0]) - 1)]
+
+
+def _luma(c):
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def _lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def _max_abs_diff(out, ref):
+    """Largest |out - ref| over the reference's channels (a NaN anywhere counts as inf)."""
+    got = out[0, ..., :len(ref[0][0])]
+    d = (got.double() - torch.tensor(ref, dtype=torch.float64)).abs()
+    return float("inf") if torch.isnan(d).any() else d.max().item()
+
+
+def _measure(src, bindings, ref):
+    """(interp maxdiff, codegen maxdiff, interp OUT, codegen OUT) against the reference."""
+    oi, oc = _both_tiers(src, bindings)
+    return _max_abs_diff(oi, ref), _max_abs_diff(oc, ref), oi, oc
+
+
+def _ref_fix_pixels(img, fallback):
+    def bad(c):
+        return any(math.isnan(x) or math.isinf(x) for x in c)
+    out = []
+    for y, row in enumerate(img):
+        orow = []
+        for x, c in enumerate(row):
+            if not bad(c[:3]):
+                orow.append(c[:3])
+                continue
+            acc, n = [0.0, 0.0, 0.0], 0
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nb = _clamped(img, y + dy, x + dx)[:3]
+                    if not bad(nb):
+                        acc = [a + b for a, b in zip(acc, nb)]
+                        n += 1
+            orow.append([a / n for a in acc] if n else list(fallback))
+        out.append(orow)
+    return out
+
+
+def _ref_break_search(img, threshold, scan_width):
+    H, W = len(img), len(img[0])
+    width = scan_width if scan_width > 0 else W
+    out = []
+    for y in range(H):
+        found = -1
+        for sx in range(min(width, W)):
+            if _luma(img[y][sx]) > threshold:
+                found = sx
+                break
+        orow = []
+        for x in range(W):
+            s = img[y][x]
+            if found >= 0 and x < found:
+                orow.append([s[0] * 0.5 + 0.3, s[1] * 0.3, s[2] * 0.3])
+            elif found >= 0 and x == found:
+                orow.append([0.0, 1.0, 0.0])
+            else:
+                orow.append(s[:3])
+        out.append(orow)
+    return out
+
+
+def _ref_overlay(a, b):
+    if a < 0.5:
+        return 2.0 * a * b
+    return 1.0 - 2.0 * (1.0 - a) * (1.0 - b)
+
+
+def _ref_soft_light(a, b):
+    if b < 0.5:
+        return a - (1.0 - 2.0 * b) * a * (1.0 - a)
+    d = ((16.0 * a - 12.0) * a + 4.0) * a if a < 0.25 else math.sqrt(a)
+    return a + (2.0 * b - 1.0) * (d - a)
+
+
+def _ref_blend(base, over, fn, t):
+    return [[[_lerp(a, fn(a, b), t) if t is not None else fn(a, b) for a, b in zip(ca, cb)]
+             for ca, cb in zip(ra, rb)] for ra, rb in zip(base, over)]
+
+
+def _ref_newton(img, tolerance, max_iter):
+    H, W = len(img), len(img[0])
+    out = []
+    for y in range(H):
+        orow = []
+        for xi in range(W):
+            x = _luma(img[y][xi])
+            guess = max(x, 0.001)
+            for _ in range(max_iter):
+                nxt = (guess + x / max(guess, 0.0001)) * 0.5
+                err = abs(nxt - guess)
+                guess = nxt
+                if err < tolerance:
+                    break
+            if xi / max(W - 1, 1) < 0.5:
+                orow.append([guess] * 3)
+            else:
+                orow.append([abs(guess - math.sqrt(x)) * 100.0, 0.0, 0.0])
+        out.append(orow)
+    return out
+
+
+def _bilinear(img, u, v):
+    """sample(): bilinear, pixel centres at u = ix / (W - 1), clamped to the border."""
+    H, W = len(img), len(img[0])
+    fx, fy = u * (W - 1), v * (H - 1)
+    x0, y0 = min(int(math.floor(fx)), W - 1), min(int(math.floor(fy)), H - 1)
+    x1, y1 = min(x0 + 1, W - 1), min(y0 + 1, H - 1)
+    ax, ay = fx - x0, fy - y0
+    return [_lerp(_lerp(img[y0][x0][c], img[y0][x1][c], ax),
+                  _lerp(img[y1][x0][c], img[y1][x1][c], ax), ay) for c in range(3)]
+
+
+def _ref_vector_blur(img, vec, strength, max_samples):
+    H, W = len(img), len(img[0])
+    out = []
+    for y in range(H):
+        orow = []
+        for x in range(W):
+            u, v = x / max(W - 1, 1), y / max(H - 1, 1)
+            dx = (vec[y][x][0] - 0.5) * 2.0 * strength
+            dy = (vec[y][x][1] - 0.5) * 2.0 * strength
+            n = min(max(int(math.floor(math.hypot(dx, dy) * 0.5 + 1.0)), 3), max_samples)
+            steps = float(n - 1)
+            step_u = (dx / W) / steps if abs(steps) >= 1e-8 else 0.0
+            step_v = (dy / H) / steps if abs(steps) >= 1e-8 else 0.0
+            acc = [0.0, 0.0, 0.0]
+            for i in range(n):                     # this pixel's own count, and no more
+                t = i - steps * 0.5
+                su = min(max(u + step_u * t, 0.0), 1.0)
+                sv = min(max(v + step_v * t, 0.0), 1.0)
+                acc = [a + b for a, b in zip(acc, _bilinear(img, su, sv))]
+            orow.append([a / n for a in acc])
+        out.append(orow)
+    return out
+
+
+# Every case: (label, bindings, reference, tolerance). The same tables drive a measurement
+# of any version of an example's source, so a before/after reading uses identical inputs.
+
+def _fix_pixels_cases():
+    torch.manual_seed(42)
+    clean = torch.rand(1, 8, 8, 3)
+    zero = (0.0, 0.0, 0.0)
+    torch.manual_seed(3)
+    img = torch.rand(1, 7, 9, 3)
+    img[0, 0, 0, 1] = float("nan")                  # a corner, clamped neighbours
+    img[0, 3, 6, 0] = float("inf")
+    img[0, 5, 2, 2] = float("-inf")
+    img[0, 1:4, 2:5, :] = float("nan")              # a 3x3 block: its centre has no valid neighbour
+    fb = (0.25, 0.5, 0.75)
+    return [
+        ("a clean image passes through",
+         {"image": clean, "fallback_r": 0.0, "fallback_g": 0.0, "fallback_b": 0.0},
+         _ref_fix_pixels(_grid(clean), zero), _EPS_FLOAT),
+        ("NaN/Inf pixels take their valid neighbours' mean, a fully-bad neighbourhood the fallback",
+         {"image": img, "fallback_r": fb[0], "fallback_g": fb[1], "fallback_b": fb[2]},
+         _ref_fix_pixels(_grid(img), fb), _EPS_FLOAT),
+    ]
+
+
+def _break_search_cases():
+    one = torch.full((1, 8, 8, 3), 0.3)
+    one[0, 3, 5, :] = 1.0                           # the one bright pixel: row 3, column 5
+    torch.manual_seed(11)
+    img = torch.rand(1, 6, 10, 3)
+    margin = min(abs(_luma(c) - 0.6) for row in _grid(img) for c in row)
+    assert margin > 1e-4, f"a luma sits on the threshold ({margin}): pick another seed"
+    return [("one bright pixel at column 5", {"image": one, "threshold": 0.5, "scan_width": 0},
+             _ref_break_search(_grid(one), 0.5, 0), _EPS_FLOAT)] + [
+        (f"a random image, scan_width={w}", {"image": img, "threshold": 0.6, "scan_width": w},
+         _ref_break_search(_grid(img), 0.6, w), _EPS_FLOAT) for w in (0, 4, 25)]
+
+
+def _custom_blend_cases():
+    halves = torch.zeros(1, 4, 8, 3)
+    halves[..., :4, :] = 0.2
+    halves[..., 4:, :] = 0.8
+    over9 = torch.full((1, 4, 8, 3), 0.9)
+    torch.manual_seed(5)
+    base, over = torch.rand(1, 5, 7, 3), torch.rand(1, 5, 7, 3)
+    return [
+        ("base 0.2 | 0.8 under overlay 0.9, blend 0.5",
+         {"base": halves, "overlay": over9, "blend_amount": 0.5},
+         _ref_blend(_grid(halves), _grid(over9), _ref_overlay, 0.5), _EPS_FLOAT),
+        ("random base and overlay, blend 0.7", {"base": base, "overlay": over, "blend_amount": 0.7},
+         _ref_blend(_grid(base), _grid(over), _ref_overlay, 0.7), _EPS_FLOAT),
+    ]
+
+
+def _while_loop_cases():
+    const = torch.full((1, 4, 8, 3), 0.36)
+    vals = torch.tensor([0.0, 0.0004, 0.02, 0.15, 0.36, 0.5, 0.81, 1.0])
+    ramp = vals.view(1, 1, 8, 1).expand(1, 3, 8, 3).contiguous()
+    ramp = torch.cat([ramp, ramp.flip(2)], dim=1)   # each luma lands in both halves
+    # The right half is |error| x 100, so a float32-vs-float64 rounding of 1e-7 reads 1e-5.
+    return [
+        ("luma 0.36", {"image": const, "tolerance": 0.0001, "max_iter": 20},
+         _ref_newton(_grid(const), 0.0001, 20), 1e-4),
+        ("lumas that converge after different step counts",
+         {"image": ramp, "tolerance": 0.0001, "max_iter": 20},
+         _ref_newton(_grid(ramp), 0.0001, 20), 1e-4),
+    ]
+
+
+def _vector_blur_cases():
+    ones = torch.ones(1, 4, 8, 3)
+    one_vec = torch.full((1, 4, 8, 3), 0.5)
+    one_vec[0, 2, 5, 0] = 1.0                       # one 11-tap vector among zero motion (3 taps)
+    torch.manual_seed(9)
+    img = torch.rand(1, 6, 9, 3)
+    vec = 0.5 + (torch.rand(1, 6, 9, 3) - 0.5) * 0.9
+    vec[0, :2, :3, :2] = 0.5                        # a still patch among streaks
+    counts = [math.hypot((c[0] - 0.5) * 30.0, (c[1] - 0.5) * 30.0) * 0.5 + 1.0
+              for row in _grid(vec) for c in row]
+    assert all(abs(f - round(f)) > 1e-3 or abs(f - 1.0) < 1e-9 for f in counts), \
+        "a tap count sits on an integer boundary: pick another seed"
+    return [
+        ("a constant image with one long vector",
+         {"image": ones, "vectors": one_vec, "strength": 20.0, "max_samples": 32},
+         _ref_vector_blur(_grid(ones), _grid(one_vec), 20.0, 32), _EPS_FLOAT),
+        ("random streaks of 3 to 12 taps",
+         {"image": img, "vectors": vec, "strength": 15.0, "max_samples": 12},
+         _ref_vector_blur(_grid(img), _grid(vec), 15.0, 12), _EPS_FLOAT),
+    ]
+
+
+def _check_example(r, name, cases, extra=None):
+    src = _read("examples", name)
+    for label, bindings, ref, tol in cases():
+        try:
+            di, dc, oi, oc = _measure(src, bindings, ref)
+            assert di <= tol and dc <= tol, f"maxdiff interp {di:.3g}, codegen {dc:.3g} > {tol}"
+            if extra is not None:
+                extra(label, oi, oc)
+            r.ok(f"examples/{name}: {label} (maxdiff interp {di:.1e}, codegen {dc:.1e})")
+        except Exception as e:
+            r.fail(f"{name}: {label}", f"{type(e).__name__}: {e}")
+
+
+def test_control_flow_fix_pixels_matches_a_per_pixel_reference(r: SubTestResult):
+    print("\n--- examples/fix_pixels.tex against a per-pixel reference, both tiers ---")
+
+    def extra(label, oi, oc):
+        assert torch.isfinite(oi).all() and torch.isfinite(oc).all(), "a NaN/Inf survived"
+    _check_example(r, "fix_pixels.tex", _fix_pixels_cases, extra)
+
+
+def test_control_flow_break_search_matches_a_per_pixel_reference(r: SubTestResult):
+    print("\n--- examples/break_search.tex against a per-pixel reference, both tiers ---")
+    _check_example(r, "break_search.tex", _break_search_cases)
+
+
+def test_control_flow_custom_blend_matches_a_per_pixel_reference(r: SubTestResult):
+    print("\n--- examples/custom_blend.tex against a per-pixel reference, both tiers ---")
+    _check_example(r, "custom_blend.tex", _custom_blend_cases)
+    try:
+        # my_soft_light is shown but not wired: call it per channel, the way a reader would.
+        src = _read("examples", "custom_blend.tex")
+        soft = src[:src.index("vec3 result = vec3(")] + (
+            "@OUT = vec3(my_soft_light(base.r, over.r), my_soft_light(base.g, over.g),"
+            " my_soft_light(base.b, over.b));\n")
+        _label, bindings, _ref, _tol = _custom_blend_cases()[1]
+        ref = _ref_blend(_grid(bindings["base"]), _grid(bindings["overlay"]), _ref_soft_light, None)
+        di, dc, _oi, _oc = _measure(soft, bindings, ref)
+        assert di <= _EPS_FLOAT and dc <= _EPS_FLOAT, (di, dc)
+        r.ok(f"examples/custom_blend.tex: my_soft_light called per channel "
+             f"(maxdiff interp {di:.1e}, codegen {dc:.1e})")
+    except Exception as e:
+        r.fail("custom_blend my_soft_light", f"{type(e).__name__}: {e}")
+
+
+def test_control_flow_while_loop_matches_a_per_pixel_reference(r: SubTestResult):
+    print("\n--- examples/while_loop.tex against a per-pixel reference, both tiers ---")
+    _check_example(r, "while_loop.tex", _while_loop_cases)
+
+
+def test_control_flow_vector_blur_matches_a_per_pixel_reference(r: SubTestResult):
+    print("\n--- examples/vector_blur.tex against a per-pixel reference, both tiers ---")
+    _check_example(r, "vector_blur.tex", _vector_blur_cases)
+
+
+# The snippet-menu line and the widget surface a user sees must not move with the fix.
+_EXAMPLE_SURFACE = {
+    "fix_pixels.tex": ("// Fix Pixels — sanitize NaN and Inf values in images",
+                       {"fallback_r": 0.0, "fallback_g": 0.0, "fallback_b": 0.0}, {"image"}),
+    "break_search.tex": ("// Break Search — scan for the first bright pixel using for + break",
+                         {"threshold": 0.5, "scan_width": 0}, {"image"}),
+    "custom_blend.tex": ("// Custom Blend — overlay blend mode using user-defined functions",
+                         {"blend_amount": 0.5}, {"base", "overlay"}),
+    "while_loop.tex": ("// While Loop — Newton's method for square root",
+                       {"tolerance": 0.0001, "max_iter": 20}, {"image"}),
+    "vector_blur.tex": ("// Vector Blur — directional per-pixel motion blur driven by a vector map",
+                        {"strength": 20.0, "max_samples": 32}, {"image", "vectors"}),
+}
+
+
+def test_control_flow_fixed_examples_keep_their_surface(r: SubTestResult):
+    print("\n--- the fixed examples keep their menu line, parameters, inputs and outputs ---")
+    for name, (line1, params, inputs) in _EXAMPLE_SURFACE.items():
+        try:
+            src = _read("examples", name)
+            assert src.splitlines()[0] == line1, src.splitlines()[0]
+            prog = tex_api.compile(src, {n: TEXType.VEC3 for n in inputs})
+            got = {n: p.get("default_value") for n, p in prog.params.items()}
+            assert got == params, got
+            assert set(prog.assigned) == {"OUT"}, prog.assigned
+            assert set(prog.referenced) - set(prog.params) - set(prog.assigned) == inputs, \
+                prog.referenced
+            codes = [d.code for d in tex_api.control_flow_advisories(src, {})]
+            assert "W7007" not in codes, codes
+            r.ok(f"examples/{name}: same menu line, params, inputs and outputs; no W7007")
+        except Exception as e:
+            r.fail(f"example surface {name}", f"{type(e).__name__}: {e}")
