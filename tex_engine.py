@@ -243,6 +243,9 @@ class ExecContext:
     # never-keyed channel (a tag does not move a pixel, unlike time_context). None unless a
     # host supplied it; the merged output tags surface on CookResult.out_meta.
     binding_meta: Any = None
+    # TRK-25: the `{name: TEXType}` map this cook compiled against. The source alone cannot
+    # say a wire holds a STRING, and a string merged per pixel is voted on over the region.
+    binding_types: Any = None
 
 
 @dataclass(frozen=True)
@@ -681,7 +684,7 @@ def _run_default(ctx: ExecContext):
     # (peak transient ~1/n). Falls back to the whole-image cook on any strip error.
     n_strips = (_tile_plan(ctx.program, ctx.bindings, ctx.device, ctx.latent_channel_count,
                            2 if ctx.eff_precision == "fp16" else 4, ctx.fp,
-                           free_hint=ctx.free_hint, code=ctx.code)
+                           free_hint=ctx.free_hint, code=ctx.code, binding_types=ctx.binding_types)
                 if not ctx.fused_chain else None)
     if n_strips:
         try:
@@ -702,7 +705,7 @@ def _run_default(ctx: ExecContext):
         halo_plan = _halo_tile_plan(ctx.program, ctx.code, ctx.bindings, ctx.device,
                                     ctx.latent_channel_count,
                                     2 if ctx.eff_precision == "fp16" else 4, ctx.fp,
-                                    ctx.free_hint, ctx.eff_precision)
+                                    ctx.free_hint, ctx.eff_precision, ctx.binding_types)
         if halo_plan:
             n_h, narrow_names, halo = halo_plan
             try:
@@ -786,7 +789,7 @@ def _tile_plan(program, bindings: dict[str, Any], device,
                latent_channel_count: int = 0, dtype_bytes: int = 4,
                fingerprint: str | None = None,
                free_hint: float | None = None,
-               code: str | None = None) -> int | None:
+               code: str | None = None, binding_types: dict | None = None) -> int | None:
     """M-4: strip count if the cook should be tiled (tile-safe + under memory
     pressure), else None. cuda only; needs the host's free-memory query.
     MEM-3: dtype_bytes=2 in fp16 mode halves the peak estimate (a fp16 cook that
@@ -807,7 +810,8 @@ def _tile_plan(program, bindings: dict[str, Any], device,
     only ~6% of the cost.
 
     TRK-25: `code` is the raw source, carried only so the region-dependence gate at the end
-    can see a `//!tex X.Y` pragma; `None` means "no pragma visible", the conservative read."""
+    can see a `//!tex X.Y` pragma; `None` means "no pragma visible", the conservative read.
+    `binding_types` is that same gate's other input, and is conservative when absent too."""
     if not str(device).startswith("cuda"):
         return None  # host.get_free_memory returns None off a host → no tiling
     # M-4 safety: never tile a LATENT ([B,C,H,W] — dim 1 is channels, not
@@ -848,7 +852,7 @@ def _tile_plan(program, bindings: dict[str, Any], device,
         # OOM is the correct answer and a wrong picture is not. Asking it HERE rather than
         # beside `is_tile_safe_cached` is invariant 7 — an unpressured cook never gets here.
         from . import tex_roi
-        if tex_roi.region_dependent_cached(program, fingerprint, code=code):
+        if tex_roi.region_dependent_cached(program, fingerprint, binding_types, code):
             return None
         return n
     except Exception:
@@ -886,7 +890,7 @@ def _scalar_params(bindings) -> dict:
 
 
 def _halo_tile_plan(program, code, bindings, device, latent_channel_count, dtype_bytes,
-                    fingerprint, free_hint, precision):
+                    fingerprint, free_hint, precision, binding_types=None):
     """ROI-5: `(n_strips, narrow_names, halo)` when a NON-tile-safe program is HALO-tileable — a
     bounded direct-tensor neighbourhood op (blur / erode / dilate), which `tex_roi.roi_plan`
     reports executable with a positive cook halo — and either memory pressure OR the TDR time cap
@@ -929,7 +933,7 @@ def _halo_tile_plan(program, code, bindings, device, latent_channel_count, dtype
         if tdr_floor < 2 and total and 0 < est < total // 8:
             return None    # not big enough for memory pressure, not TDR-risky → skip (no free query)
         from . import tex_roi
-        plan = tex_roi.roi_plan(code, _scalar_params(bindings))
+        plan = tex_roi.roi_plan(code, _scalar_params(bindings), binding_types)
         if not plan.executable or plan.halo <= 0 or not plan.narrow:
             return None
         halo = plan.halo
@@ -943,10 +947,10 @@ def _halo_tile_plan(program, code, bindings, device, latent_channel_count, dtype
         n = min(max(n_mem, tdr_floor), max_strips)
         if n < 2:
             return None
-        # TRK-25, at the same late point `_tile_plan` uses. `roi_plan` above already refuses a
-        # region-dependent program; this is the planner saying so in its own voice, because the
-        # halo route is the one `is_tile_safe` does NOT close.
-        if tex_roi.region_dependent_cached(program, fingerprint, code=code):
+        # TRK-25, at the same late point `_tile_plan` uses. What CLOSED this route is the
+        # `roi_plan` call above: a region-dependent program is not executable, so the plan was
+        # already refused. This is kept as a local guard, stating the refusal where it returns.
+        if tex_roi.region_dependent_cached(program, fingerprint, binding_types, code):
             return None
         return (n, plan.narrow, halo)
     except Exception:
@@ -1135,7 +1139,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
         fused_fp = _fused_fingerprint(spec, code, bindings, _infer_binding_type)
         (program, type_map, referenced, assigned_bindings, param_info,
          used_builtins, bindings) = _prepare_fused(spec, code, bindings, _infer_binding_type)
-        fused_chain = True
+        binding_types, fused_chain = {}, True   # TRK-25: a spliced chain has no single map
     else:
         # Infer binding types for inputs — the WHOLE map, params included, because that is what
         # the TypeChecker wants. ANIM-1's exclusion happens inside `TEXCache.fingerprint`, so a
@@ -1335,7 +1339,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
                 # clamp below, dropping an fp16-eligible cook out of fp16 for byte-identical
                 # output. A zoom-to-fit viewport frame hits this every time.
                 _roi_why = "roi covers the whole frame (nothing to narrow)"
-            elif (_plan := _tex_roi.roi_plan(code, _scalar_params(bindings))).executable:
+            elif (_plan := _tex_roi.roi_plan(code, _scalar_params(bindings), binding_types)).executable:
                 roi_out, roi_plan_obj = roi, _plan
                 # An fp16 cook does not get a window. ROI is oracle-validated at fp32 ONLY, and
                 # the ~1-ulp conv slack narrow-cook-crop leaves would scale up at fp16 — so the
@@ -1373,7 +1377,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
                       eff_precision, fp, fused_chain, fused_fp, time_context,
                       free_hint, roi_out, roi_plan_obj,  # ROI-3 window + plan (None unless armed)
                       cancel, on_progress,               # SCHED-3 (None unless a host passed them)
-                      binding_meta)                      # DATA-1 tags (None unless a host passed them)
+                      binding_meta, binding_types)       # DATA-1 tags; TRK-25's {name: TEXType} map
     return CookPlan(ctx=ctx, tier_id=tier_id, assigned=assigned_bindings,
                     auto_fp16=auto_fp16, debug_nan_highlight=debug_nan_highlight,
                     cook_px=cook_px, auto_ckey=auto_ckey, disown=disown,
@@ -1457,14 +1461,14 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
         # closed by `roi_plan`) and the original OOM propagates unwrapped, so the host's own
         # handling takes its turn. A recovered-but-WRONG picture is what must not happen.
         if (is_tile_safe_cached(ctx.program, ctx.fp)
-                and not tex_roi.region_dependent_cached(ctx.program, ctx.fp, code=ctx.code)):
+                and not tex_roi.region_dependent_cached(ctx.program, ctx.fp, ctx.binding_types, ctx.code)):
             logger.warning("[TEX] retrying the cook in %d strips.", n_strips)
             return run_tiled(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
                              ctx.device, ctx.latent_channel_count, ctx.output_names,
                              ctx.used_builtins, ctx.eff_precision, n_strips, ctx.time_context,
                              cancel=ctx.cancel, on_progress=ctx.on_progress)
         # ROI-5: not pixel-local, but a bounded blur/morphology can still HALO-tile out of an OOM.
-        rplan = tex_roi.roi_plan(ctx.code, _scalar_params(ctx.bindings))
+        rplan = tex_roi.roi_plan(ctx.code, _scalar_params(ctx.bindings), ctx.binding_types)
         if (rplan.executable and rplan.halo > 0 and rplan.narrow
                 and shared_tile_width(ctx.bindings) is not None):
             n_h = max(2, min(H // max(64, 4 * rplan.halo), 16))

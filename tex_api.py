@@ -263,8 +263,8 @@ def color_advisories(source: str, param_values: dict | None, binding_meta: dict 
 # name broadcasts only when it existed before the `if` or both branches define it.
 #
 # W7008 (TRK-25) is the subset of that the ENGINE now acts on: a loop whose condition can
-# differ per pixel, or a per-pixel `if` that assigns a string. Those two shapes make the
-# output depend on WHICH REGION is cooked (the loop runs to the region's maximum; the string
+# differ per pixel, or a string chosen per pixel by an `if` or a `?:`. Those shapes make the
+# output depend on WHICH REGION is cooked (the loop runs to the region's maximum; each string
 # merge is a region-wide majority vote), so the planners decline to split the cook —
 # see `tex_roi.region_dependent`. W7007 also covers `break`/`continue`/`return` under a
 # per-pixel `if`, which is region-INDEPENDENT (the escape fires on first arrival, identically
@@ -304,8 +304,9 @@ def control_flow_advisories(source: str, binding_types: dict) -> list:
         under such an `if`, or a `for` / `while` whose condition can differ per pixel.
       * **W7008** — control flow whose result depends on WHICH REGION is cooked, so the engine
         declines to split the cook (`tex_roi.region_dependent`): a `for` / `while` whose
-        condition can differ per pixel (the loop runs to the region's maximum), or a per-pixel
-        `if` that assigns a string (the merge is a region-wide majority vote). Strictly the
+        condition can differ per pixel (the loop runs to the region's maximum), or a string
+        chosen per pixel by an `if` or a `?:` (either is a region-wide majority vote; a string
+        arriving on a wire needs `binding_types` to be seen at all). Strictly the
         subset of W7007 the engine ACTS on — a `break` / `continue` / `return` under a
         per-pixel `if` draws W7007 and no W7008, because it fires on first arrival and so does
         the same thing in every region.
@@ -390,36 +391,67 @@ class _ControlFlowLint:
         self.gathers = {name: False for name in self.fns}       # the body holds a gather
         self.all_vary = set()                                   # free names a body may inherit
         self.all_defined = set()
-        # TRK-25 clause (c): names that can hold a STRING. A per-pixel `if` that assigns one is
-        # resolved by a region-wide MAJORITY VOTE over the pixels being cooked, so its value
-        # depends on how the cook was split. Name-based and deliberately over-approximating (no
-        # scoping, no dataflow): a declared `string`, a STRING-typed wire, or any name assigned a
-        # string literal / a string-returning stdlib call anywhere in the program.
-        self.string_names = set(self.string_wires)
-        for n in self._walk(program):
-            cls = type(n)
-            if cls is A.VarDecl:
-                if (n.type_name or "").lower() == "string" or self._is_string_expr(n.initializer):
-                    self.string_names.add(n.name)
-            elif cls is A.ArrayDecl:
-                if (n.element_type_name or "").lower() == "string":
-                    self.string_names.add(n.name)
-            elif cls is A.Assignment and self._is_string_expr(n.value):
-                t = n.target
-                while type(t) is A.ChannelAccess:
-                    t = t.object
-                if type(t) is A.ArrayIndexAccess:
-                    t = t.array
-                if type(t) is A.Identifier or type(t) is A.BindingRef:
-                    self.string_names.add(t.name)
         # TRK-25: which nodes made the program REGION-DEPENDENT, recorded on every pass (the
         # facts only grow, and an id-keyed set makes the repetition idempotent) so the predicate
         # can read them without asking for diagnostics. `tex_roi.region_dependent` reads these.
         self.varying_loops = set()      # id(ForLoop/WhileLoop) — clauses (a) and (b)
-        self.string_ifs = set()         # id(IfElse) — clause (c)
+        self.string_ifs = set()         # id(IfElse / TernaryOp) — clause (c)
         self.emit = False
         self.diags = {}
         self.budget = 200_000 + 200 * sum(1 for _ in self._walk(program))
+        # TRK-25 clause (c): names that can hold a STRING. A per-pixel `if` that assigns one —
+        # or a per-pixel `?:` that selects one — is resolved by a region-wide MAJORITY VOTE over
+        # the pixels being cooked, so its value depends on how the cook was split. Name-based
+        # and deliberately over-approximating (no scoping, no shadowing, no dataflow): a
+        # declared `string`, a `s$param`, a STRING-typed wire, a string-typed function parameter
+        # or return, or any name assigned a string-producing expression anywhere in the program.
+        self.string_names = set(self.string_wires)
+        self.string_fns = {n for n, fd in self.fns.items()
+                           if (fd.return_type or "").lower() == "string"}
+        for n in self._walk(program):
+            cls = type(n)
+            if cls is A.ParamDecl:
+                if n.type_hint == "s":
+                    self.string_names.add(n.name)
+            elif cls is A.FunctionDef:
+                self.string_names.update(p for t, p in n.params
+                                         if (t or "").lower() == "string")
+        # A FIXED POINT, because string-ness flows along names and returns: `s = @S; t = s;`.
+        # Both sets only grow, so it terminates — in at most one round per link of the longest
+        # chain — and `_tick` keeps a pathological chain inside the same work budget as the rest
+        # of the analysis (over budget → `_CFBudget` → the predicate's fail-closed True).
+        grew = True
+        while grew:
+            grew = False
+            for n in self._walk(program):
+                self._tick()
+                cls = type(n)
+                name = None
+                if cls is A.VarDecl:
+                    if (n.type_name or "").lower() == "string" \
+                            or self._is_string_expr(n.initializer):
+                        name = n.name
+                elif cls is A.ArrayDecl:
+                    if (n.element_type_name or "").lower() == "string":
+                        name = n.name
+                elif cls is A.Assignment and self._is_string_expr(n.value):
+                    t = n.target
+                    while type(t) is A.ChannelAccess:
+                        t = t.object
+                    if type(t) is A.ArrayIndexAccess:
+                        t = t.array
+                    if type(t) is A.Identifier or type(t) is A.BindingRef:
+                        name = t.name
+                if name is not None and name not in self.string_names:
+                    self.string_names.add(name)
+                    grew = True
+            for fname, fd in self.fns.items():
+                if fname in self.string_fns:
+                    continue
+                if any(type(s) is A.ReturnStmt and self._is_string_expr(s.value)
+                       for s in self._walk(fd)):
+                    self.string_fns.add(fname)
+                    grew = True
 
     # ── traversal helpers ────────────────────────────────────────────────────
     def _walk(self, node):
@@ -435,15 +467,45 @@ class _ControlFlowLint:
             raise _CFBudget()
 
     def _is_string_expr(self, expr) -> bool:
-        """Does this expression obviously produce a STRING? (a literal, or a stdlib call whose
-        signature returns one). Syntactic — clause (c) over-approximates by construction."""
+        """Can this expression produce a STRING? Every construct that can carry one is
+        enumerated: a literal; a `string(...)` cast; a name already known to hold a string (a
+        declared `string`, an `s$param`, a STRING-typed wire, a string-typed function
+        parameter, or a name the fixed point above has already learned); a stdlib call or a
+        user function whose declared/derived return is STRING; and — recursively — a `?:`, a
+        `+` concatenation, or an element of a string array.
+
+        POSITIVE and syntactic. Clause (c) over-approximates by NAME (no scoping, no
+        shadowing, no dataflow), which is the §1.5 whitelist posture pointed at the place it
+        belongs: an unknown NAME is treated as a string the moment anything in the program can
+        make it one. It deliberately does NOT read an unknown VALUE as a string — doing that
+        would decline every per-pixel `?:` over floats, which is the commonest shape there is
+        and one that splits perfectly."""
         if expr is None:
             return False
         A = self.A
         cls = type(expr)
         if cls is A.StringLiteral:
             return True
-        return cls is A.FunctionCall and expr.name in _string_ret_fns()
+        if cls is A.Identifier:
+            return expr.name in self.string_names
+        if cls is A.BindingRef:
+            return expr.type_hint == "s" or expr.name in self.string_names
+        if cls is A.CastExpr:
+            return (expr.target_type or "").lower() == "string"
+        if cls is A.TernaryOp:
+            return (self._is_string_expr(expr.true_expr)
+                    or self._is_string_expr(expr.false_expr))
+        if cls is A.BinOp:                     # `+` is the only string operator, but `==`/`!=`
+            return (self._is_string_expr(expr.left)     # over strings is numeric — answering
+                    or self._is_string_expr(expr.right))  # True there only over-approximates
+        if cls is A.ArrayIndexAccess:
+            return self._is_string_expr(expr.array)
+        if cls is A.ChannelAccess:
+            return False                       # a swizzle is numeric by construction
+        if cls is A.FunctionCall:
+            return (expr.name in self.string_fns if expr.name in self.fns
+                    else expr.name in _string_ret_fns())
+        return False
 
     def _varies(self, expr, st) -> bool:
         A = self.A
@@ -658,6 +720,25 @@ class _ControlFlowLint:
                                "whichever operand a pixel keeps.",
                                "Nothing is skipped per pixel. To skip work for the whole frame, "
                                "test a value that is the same for every pixel (LANGUAGE.md §7.1).")
+                # TRK-25 clause (c), the OTHER spelling of the same merge. `if` resolves a
+                # string through `_merge_branch_vars`; a `?:` runs its own region-wide vote on
+                # the condition (`Interpreter._eval_ternary`, and the same arithmetic in the
+                # codegen tier), so it diverges whole-frame vs tiled in exactly the same way.
+                # Recorded wherever the `?:` sits, not only where it reaches a name: a string
+                # `?:` handed straight to a call is the same vote. The string test is first
+                # because it is a shallow syntactic walk and `_varies` is not.
+                if (self._is_string_expr(n.true_expr) or self._is_string_expr(n.false_expr)) \
+                        and self._varies(n.condition, st):
+                    self.string_ifs.add(id(n))
+                    self._warn("W7008", n,
+                               "A string chosen by a `?:` whose condition can differ from "
+                               "pixel to pixel is resolved by a majority vote over the pixels "
+                               "of the region being cooked, so which operand wins depends on "
+                               "how the cook was split. This program is therefore cooked as "
+                               "one whole region.",
+                               "Choose the string from a value that is the same for every "
+                               "pixel (a parameter, a literal, `iw`/`ih`), or carry the "
+                               "per-pixel decision in a number instead (LANGUAGE.md §7.1).")
             elif cls is A.FunctionCall and scope.record_calls and n.name in self.fns:
                 fed = self.params_vary[n.name]
                 for (_ptype, pname), arg in zip(self.fns[n.name].params, n.args):

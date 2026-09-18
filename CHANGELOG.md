@@ -14,9 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *any* pixel's condition holds and does not mask the body, so every pixel runs as many passes
   as the hungriest pixel — and "hungriest" is counted over the region actually being cooked.
   Split the frame and the answer changes: measured 2.0 at two strips and 3.0 at four on an
-  8×2 repro, with no diagnostic and a plausible-looking result. A string assigned inside a
-  per-pixel `if` is a second case of the same defect: the merge resolves it by a majority vote
-  over the region's pixels, and a strip can hold a different majority than the frame. The
+  8×2 repro, with no diagnostic and a plausible-looking result. A string chosen per pixel is a
+  second case of the same defect, in both of its spellings — assigned inside a per-pixel `if`,
+  or picked by a per-pixel `?:` — because a string has no per-pixel form and so is resolved by
+  a majority vote over the region's pixels, and a strip can hold a different majority than the
+  frame. That includes a string that arrives as a *wire* rather than a literal, which is why
+  the check now reads the cook's binding types as well as its source: nothing in a program's
+  text says an input holds a string. The
   three planners that split a cook now decline such a program — horizontal strips
   (`tex_engine._tile_plan`), windows and the halo strips and chain windowing built on them
   (`tex_roi.roi_plan`), and batch strips (`tex_roi.batch_sliceable`) — and the OOM ladder
@@ -34,12 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`W7008`**, an opt-in advisory from `tex_api.control_flow_advisories`, naming exactly the
   programs the engine will now refuse to split: a `for`/`while` whose condition can differ
-  from pixel to pixel, or a string assigned under a per-pixel `if`. It is the subset of
+  from pixel to pixel, or a string chosen per pixel by an `if` or a `?:`. It is the subset of
   `W7007` the engine *acts on*, so a host keying on codes can tell "this is surprising" from
   "this changes how your cook is scheduled". Like `W7005`–`W7007` it is never emitted by
   `check()`, so the editor's live lint and `tex_lsp` are untouched.
 - `tex_roi.region_dependent(program, binding_types=None, code=None)` and its per-fingerprint
-  memo, for a host that wants the same verdict before choosing how to cook. The loop clause
+  memo, for a host that wants the same verdict before choosing how to cook. `roi_plan`,
+  `batch_sliceable` and `stage_halo` take an optional `binding_types` beside their existing
+  arguments and pass it through; omitting it is still the conservative read for everything
+  those plans decide, but a caller that has the map should supply it, or a string arriving on
+  a wire is invisible to the check. The loop clause
   retires once a program declares `//!tex 0.25` or newer **and** `tex_api.LANGUAGE_VERSION`
   has reached that level — masked per-pixel control flow makes a split equal the whole frame,
   but only when the engine actually implements it, and a pragma ahead of the engine is only a

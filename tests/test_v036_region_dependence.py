@@ -97,7 +97,7 @@ def _img(b, h, w):
 
 
 def _cook(src, *, shape=(1, 8, 2), tiles=None, batch=None, roi=None,
-          narrow=None, halo=0, params=None):
+          narrow=None, halo=0, params=None, strings=None):
     """Cook `src` whole-frame, or through one executor directly. Returns (program, outputs)."""
     b, h, w = shape
     bindings = {"A": _img(b, h, w)}
@@ -105,6 +105,9 @@ def _cook(src, *, shape=(1, 8, 2), tiles=None, batch=None, roi=None,
     for name, value in (params or {}).items():
         bindings[name] = value
         btypes[name] = TEXType.FLOAT
+    for name, value in (strings or {}).items():
+        bindings[name] = value
+        btypes[name] = TEXType.STRING
     prog = tex_api.compile(src, btypes)
     names = sorted(prog.assigned.keys())
     interp = Interpreter()
@@ -450,6 +453,155 @@ def test_t6_string_merge_is_region_dependent(r: SubTestResult):
         r.ok('characterization: whole frame votes "hi", two strips vote "lo"')
     except Exception as e:
         r.fail("T6 characterization", f"{type(e).__name__}: {e}")
+
+
+# Clause (c) is about the MERGE, not about one keyword. The `if` merge
+# (`_merge_branch_vars`) is one spelling of it; a per-pixel `?:` whose arms are strings is the
+# other, and it runs its OWN region-wide vote (`Interpreter._eval_ternary`, and the same
+# arithmetic in the codegen tier). Both divergences are pinned here as characterization, so
+# the rows below are a gate against something that really happens.
+TERNARY_REPRO = ('@TXT = v > 0.2 ? "hi" : "lo";\n'
+                 '@OUT = @A;\n')
+
+NESTED_TERNARY_REPRO = ('@TXT = v > 0.2 ? (v > 0.9 ? "hi" : "mid") : "lo";\n'
+                        '@OUT = @A;\n')
+
+# The same vote, but the arms arrive as STRING WIRES rather than literals — so the verdict is
+# only reachable when the binding types are known. `_ControlFlowLint` has always been able to
+# see this class; before this row nothing in the cook path fed it the types.
+WIRE_TERNARY_REPRO = ('@TXT = v > 0.2 ? @S : @T;\n'
+                      '@OUT = @A;\n')
+
+# The `if` spelling of the same thing: a STRING BINDING assigned under a per-pixel `if`, from
+# string wires. `collect_assigned_vars`' binding half sees `TXT`; knowing that `@S` is a string
+# is what puts `TXT` in the string-name set.
+WIRE_IF_REPRO = ('if (v > 0.2) { @TXT = @S; } else { @TXT = @T; }\n'
+                 '@OUT = @A;\n')
+
+_STRING_WIRES = {"S": TEXType.STRING, "T": TEXType.STRING}
+_WIRE_VALUES = {"S": "hi", "T": "lo"}
+
+
+def test_t6_string_ternary_is_region_dependent(r: SubTestResult):
+    print("\n--- T6: a string `?:` on a per-pixel condition (clause (c), the other spelling) ---")
+    for name, src in (("ternary", TERNARY_REPRO), ("nested ternary", NESTED_TERNARY_REPRO)):
+        try:
+            assert tex_roi.region_dependent(_parse(src), code=src) is True, "not declined"
+            assert tex_roi.roi_plan(src, {}).executable is False, "roi_plan still executable"
+            assert tex_roi.batch_sliceable(src, {}) is False, "batch_sliceable still True"
+            r.ok(f"{name}: region-dependent, and all three routes decline it")
+        except Exception as e:
+            r.fail(f"T6 {name} routes", f"{type(e).__name__}: {e}")
+
+    try:
+        # The evidence the gate exists for, driven through the executor directly.
+        _p, whole = _cook(TERNARY_REPRO)
+        _p2, tiled = _cook(TERNARY_REPRO, tiles=2)
+        assert whole["TXT"] == "hi", repr(whole["TXT"])
+        assert tiled["TXT"] == "lo", repr(tiled["TXT"])
+        _p3, nwhole = _cook(NESTED_TERNARY_REPRO)
+        _p4, ntiled = _cook(NESTED_TERNARY_REPRO, tiles=2)
+        assert nwhole["TXT"] != ntiled["TXT"], (nwhole["TXT"], ntiled["TXT"])
+        r.ok(f'characterization: `?:` votes "hi" whole-frame and "lo" at two strips; '
+             f'nested votes {nwhole["TXT"]!r} vs {ntiled["TXT"]!r}')
+    except Exception as e:
+        r.fail("T6 ternary characterization", f"{type(e).__name__}: {e}")
+
+
+def test_t6_string_wires_need_the_binding_types(r: SubTestResult):
+    print("\n--- T6: a string WIRE merged per pixel — only visible with the binding types ---")
+    for name, src in (("`?:` over two string wires", WIRE_TERNARY_REPRO),
+                      ("`if` assigns a string binding", WIRE_IF_REPRO)):
+        try:
+            assert tex_roi.region_dependent(
+                _parse(src), _STRING_WIRES, code=src) is True, "not declined"
+            assert tex_roi.roi_plan(
+                src, {}, binding_types=_STRING_WIRES).executable is False, "roi_plan executable"
+            assert tex_roi.batch_sliceable(
+                src, {}, binding_types=_STRING_WIRES) is False, "batch_sliceable True"
+            r.ok(f"{name}: region-dependent once the binding types are supplied")
+        except Exception as e:
+            r.fail(f"T6 {name}", f"{type(e).__name__}: {e}")
+
+    try:
+        _p, whole = _cook(WIRE_IF_REPRO, strings=_WIRE_VALUES)
+        _p2, tiled = _cook(WIRE_IF_REPRO, tiles=2, strings=_WIRE_VALUES)
+        assert whole["TXT"] == "hi", repr(whole["TXT"])
+        assert tiled["TXT"] == "lo", repr(tiled["TXT"])
+        r.ok('characterization: the string-binding `if` votes "hi" whole, "lo" at two strips')
+    except Exception as e:
+        r.fail("T6 wire characterization", f"{type(e).__name__}: {e}")
+
+
+def test_t6_binding_types_move_the_verdict_and_the_memo(r: SubTestResult):
+    print("\n--- T6: the binding types are part of the question, so part of every key ---")
+    src = WIRE_TERNARY_REPRO
+    try:
+        # Identical source, different binding types: the answer MUST differ. Nothing about the
+        # source says `@S` holds a string, so without the types there is no string merge to see.
+        assert tex_roi.region_dependent(_parse(src), None, code=src) is False, (
+            "a program whose string-ness is unknowable from the source alone was declined")
+        assert tex_roi.region_dependent(_parse(src), _STRING_WIRES, code=src) is True, (
+            "supplying the binding types did not reach the predicate")
+        r.ok("the verdict is a function of (source, binding types), not of the source alone")
+    except Exception as e:
+        r.fail("T6 verdict follows the types", f"{type(e).__name__}: {e}")
+
+    try:
+        # …and therefore every memo that can serve the verdict has to key on them. Ask the
+        # UNTYPED question first, so a key that ignores the types would answer it again.
+        tex_roi.clear_roi_memo()
+        assert tex_roi.roi_plan(src, {}).executable is True, "the untyped baseline moved"
+        assert tex_roi.roi_plan(src, {}, binding_types=_STRING_WIRES).executable is False, (
+            "roi_plan served the untyped verdict for a typed question — `_walk`'s memo key "
+            "does not include the binding types")
+        assert tex_roi.batch_sliceable(src, {}) is True, "the untyped baseline moved"
+        assert tex_roi.batch_sliceable(src, {}, binding_types=_STRING_WIRES) is False, (
+            "batch_sliceable served the untyped verdict for a typed question")
+        r.ok("`_walk`'s memo distinguishes the two questions rather than serving a stale False")
+    except Exception as e:
+        r.fail("T6 memo key", f"{type(e).__name__}: {e}")
+    finally:
+        tex_roi.clear_roi_memo()
+
+
+# Negative controls for clause (c)'s second spelling — these must STAY False, or the ternary
+# rule has become a blanket disable on `?:` (T7's corpus count is the other half of that
+# guard: a per-pixel `?:` is one of the commonest shapes in `examples/*.tex`).
+_TERNARY_MUST_STILL_SPLIT = [
+    ("`?:` over floats on a per-pixel condition",
+     "@OUT = v > 0.2 ? @A : vec4(0.0, 0.0, 0.0, 1.0);\n", None),
+    ("`?:` over floats, nested",
+     "@OUT = v > 0.2 ? (u > 0.5 ? @A : @A * 0.5) : vec4(0.0, 0.0, 0.0, 1.0);\n", None),
+    ("a string `?:` on a UNIFORM ($param) condition",
+     '@TXT = $k > 0.2 ? "hi" : "lo";\n@OUT = @A;\n', {"k": 0.5}),
+    ("a string `?:` on a UNIFORM (iw) condition",
+     '@TXT = iw > 4.0 ? "hi" : "lo";\n@OUT = @A;\n', None),
+]
+
+
+def test_t6_ternary_rule_is_not_a_blanket_disable(r: SubTestResult):
+    print("\n--- T6: the `?:` shapes that MUST keep splitting ---")
+    for name, src, params in _TERNARY_MUST_STILL_SPLIT:
+        try:
+            scalars = dict(params or {})
+            assert tex_roi.region_dependent(
+                _parse(src), _STRING_WIRES, code=src) is False, "declined"
+            assert tex_roi.roi_plan(
+                src, scalars, binding_types=_STRING_WIRES).executable is True, "roi_plan refused"
+            assert tex_roi.batch_sliceable(
+                src, scalars, binding_types=_STRING_WIRES) is True, "batch_sliceable refused"
+            _p, whole = _cook(src, params=params)
+            _p2, tiled = _cook(src, tiles=2, params=params)
+            for key in whole:
+                if isinstance(whole[key], torch.Tensor):
+                    md = _maxdiff(whole[key], tiled[key])
+                    assert md == 0.0, f"tiled != whole on @{key} (maxdiff {md})"
+                else:
+                    assert whole[key] == tiled[key], (whole[key], tiled[key])
+            r.ok(f"still splits: {name}")
+        except Exception as e:
+            r.fail(f"T6 negative {name}", f"{type(e).__name__}: {e}")
 
 
 # ── T2 / T9: the strip planner, and where the gate SITS ─────────────────────

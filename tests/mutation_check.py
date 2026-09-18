@@ -428,7 +428,7 @@ MUTATIONS = [
      "    if blocked or region_dep:",
      "    if blocked:"),
     ("TRK-25: the strip planner stops consulting the predicate", "tex_engine.py",
-     "        if tex_roi.region_dependent_cached(program, fingerprint, code=code):\n"
+     "        if tex_roi.region_dependent_cached(program, fingerprint, binding_types, code):\n"
      "            return None\n"
      "        return n",
      "        if False:\n"

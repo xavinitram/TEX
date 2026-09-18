@@ -342,9 +342,14 @@ def _mark_whole(reads: dict, img_node, gather_node, state: dict) -> None:
 #           frame and a pixel's pass count changes. A condition that is 0-dim but whose VALUE
 #           is region-derived (`img_mean(@A)`, `img_width`) is the same defect and needs no
 #           separate rule: the footprint rule below already calls those non-uniform.
-#   (c)     a per-pixel `if` that assigns a STRING. A string has no per-pixel representation,
-#           so the merge resolves it by a majority vote over the region's pixels, and a strip
-#           can hold a different majority than the frame.
+#   (c)     a STRING chosen per pixel — assigned under a per-pixel `if`, or picked by a
+#           per-pixel `?:`. A string has no per-pixel representation, so BOTH spellings resolve
+#           it by a majority vote over the region's pixels, and a strip can hold a different
+#           majority than the frame. The two votes are separate pieces of interpreter code
+#           (`_merge_branch_vars` and `_eval_ternary`), so both spellings need naming here.
+#           A string that arrives on a WIRE is invisible without the cook's `binding_types` —
+#           nothing in the source says an input holds a string — which is why every caller
+#           threads them and why they are part of every memo key that can serve the verdict.
 #
 # NOT region-dependent, and deliberately not declined: `break`/`continue`/`return` under a
 # per-pixel guard. Those fire on FIRST ARRIVAL at the statement — a structural fact, identical
@@ -404,6 +409,25 @@ def region_dependent(program, binding_types=None, code=None) -> bool:
         return True
 
 
+def _string_wire_key(binding_types) -> tuple:
+    """The part of a binding-type map this predicate can see: WHICH NAMES ARE STRINGS.
+
+    A verdict that depends on the binding types must be MEMOIZED on them too, or a cook that
+    changes a wire's type is served the previous type's answer — and a stale `False` is a
+    silently wrong picture, which is the whole thing this gate exists to prevent. Only the
+    STRING names go in the key, so the overwhelmingly common map (no string wire anywhere)
+    produces the same empty tuple a caller that passes nothing does, and shares its entry
+    rather than doubling the walk.
+
+    If the predicate's dependence on binding types ever widens beyond "which names are
+    STRING" — `_ControlFlowLint.string_wires` is its single reader — this key must widen with
+    it, or the new dependence is memoized on a key that cannot see it."""
+    if not isinstance(binding_types, dict) or not binding_types:
+        return ()
+    from . import tex_api
+    return tuple(sorted(n for n, t in binding_types.items() if tex_api._is_string_type(t)))
+
+
 _REGION_DEP_MEMO_MAX = 256
 _region_dep_memo: "OrderedDict[str, bool]" = OrderedDict()
 
@@ -414,7 +438,12 @@ def region_dependent_cached(program, fingerprint, binding_types=None, code=None)
     `sha256(len(code) ‖ code ‖ binding_key)`, which encodes exactly the two things this
     predicate is a function of. `fingerprint=None` (a fused chain, whose AST is spliced per
     cook) falls through to the uncached walk — no splitter reaches that case. Stored values are
-    always bool, so `.get() is None` unambiguously means 'absent'."""
+    always bool, so `.get() is None` unambiguously means 'absent'.
+
+    The fingerprint already folds the binding TYPES (`tex_cache.fingerprint` hashes a sorted
+    `(name, type)` tuple beside the source), so this key needs nothing added for them — the one
+    exception being names the key drops as param-only, whose type comes from their declaration
+    in the source and is therefore hashed anyway."""
     if fingerprint is None:
         return region_dependent(program, binding_types, code)
     v = _region_dep_memo.get(fingerprint)
@@ -597,18 +626,25 @@ def _referenced_at_bindings(code: str) -> frozenset:
     return sigil_names(code)[0]
 
 
-def _walk(code: str, param_values: dict):
-    """Parse + `$param`-fold + accumulate, memoized on `(code-hash, param bits)`. Returns
-    `(reads, blocked, halo, fold_erased, region_dep)` or None on ANY failure — the single shared
+def _walk(code: str, param_values: dict, binding_types: dict | None = None):
+    """Parse + `$param`-fold + accumulate, memoized on `(code-hash, param bits, string wires)`.
+    Returns `(reads, blocked, halo, fold_erased, region_dep)` or None on ANY failure — the shared
     engine behind `binding_footprints` and `roi_plan`, so the parse+walk runs once. `blocked` is
     True when the program cannot be cooked on a sub-region: a gather/reduction/scatter is
     present, a halo op has a symbolic radius, or a halo op is ungrounded (behind a local var /
     function / loop). `region_dep` is the separate ITERATION-axis verdict (TRK-25), kept beside
     `blocked` rather than folded into it so `binding_footprints` — which reads only `reads` — is
-    demonstrably unmoved and the two refusals stay individually readable. The memo key is computed INSIDE the try, so a non-str code or an unsortable param
+    demonstrably unmoved and the two refusals stay individually readable.
+
+    `binding_types` is the `{name: TEXType}` map the cook already built. The region verdict
+    needs it because a STRING wire merged under a per-pixel branch is not visible in the source
+    alone — and it is in the memo KEY for exactly that reason.
+
+    The memo key is computed INSIDE the try, so a non-str code or an unsortable param
     dict falls to None (the 'never raises' contract) rather than escaping."""
     try:
-        key = (hashlib.sha256(code.encode()).hexdigest(), _param_key(param_values))
+        key = (hashlib.sha256(code.encode()).hexdigest(), _param_key(param_values),
+               _string_wire_key(binding_types))
     except Exception:
         return None
     hit = _walk_memo.get(key)
@@ -635,7 +671,7 @@ def _walk(code: str, param_values: dict):
         # bound MORE uniform, never less.
         result = (reads, blocked, state["halo"],
                   _referenced_at_bindings(code) - written - set(reads),
-                  region_dependent(program, code=code))
+                  region_dependent(program, binding_types, code))
     except Exception:
         result = None
     _walk_memo[key] = result
@@ -685,7 +721,8 @@ class RoiPlan:
 _NOT_EXECUTABLE = RoiPlan(False)
 
 
-def roi_plan(code: str, param_values: dict | None = None) -> RoiPlan:
+def roi_plan(code: str, param_values: dict | None = None,
+             binding_types: dict | None = None) -> RoiPlan:
     """The ROI-3 plan for cooking this program on a sub-region. Not executable — cook
     whole-frame — when: the analysis fails; the program scatters (`@OUT[x,y]=`); a halo op
     has a symbolic radius; a halo op is ungrounded (behind a local var / function / loop, so
@@ -702,8 +739,13 @@ def roi_plan(code: str, param_values: dict | None = None) -> RoiPlan:
     the point + top-level-grounded direct-tensor halo (blur / morphology) class — the
     dominant compositing ops (grade, blur, vignette, mask shrink/grow) — and everything else
     falls back to a whole-frame cook (correct, just not sub-region-lazy). `binding_footprints`
-    still reports gather footprints as ROI-5 substrate. Never raises."""
-    walked = _walk(code, param_values or {})
+    still reports gather footprints as ROI-5 substrate. Never raises.
+
+    `binding_types` is the cook's `{name: TEXType}` map. It is optional and defaults to "not
+    supplied", which is the CONSERVATIVE read for everything the plan decides — but a caller
+    that has the map should pass it, because a STRING wire merged under a per-pixel branch is
+    region-dependent and nothing in the source says a wire holds a string."""
+    walked = _walk(code, param_values or {}, binding_types)
     if walked is None:
         return _NOT_EXECUTABLE
     reads, blocked, halo, fold_erased, region_dep = walked
@@ -774,7 +816,8 @@ def frame_window(code: str, param_values: dict | None = None):
         return None
 
 
-def batch_sliceable(code: str, param_values: dict | None = None) -> bool:
+def batch_sliceable(code: str, param_values: dict | None = None,
+                    binding_types: dict | None = None) -> bool:
     """ROI-6: True if the program has NO frame op at all, so its batch can be cooked in frame
     strips (`tex_memory.run_batch_strips`) and stitched — the batch-axis twin of ROI-3's
     whitelist posture. ANY `fetch_frame`/`sample_frame` (or 3-arg `@A[x,y,f]`/`@A(u,v,f)`
@@ -790,13 +833,15 @@ def batch_sliceable(code: str, param_values: dict | None = None) -> bool:
     loop runs each strip to that strip's own maximum — a defect no frame-op scan can see,
     because there is no frame op to find. A purely SPATIAL per-pixel bound is in fact
     batch-safe; declining that too is an over-decline taken deliberately, so the engine has one
-    predicate to reason about rather than three."""
+    predicate to reason about rather than three. `binding_types` is the cook's
+    `{name: TEXType}` map — optional, and without it a STRING wire merged under a per-pixel
+    branch is invisible (nothing in the source says a wire holds a string)."""
     param_values = param_values or {}
     try:
         program = _fold_program(code, param_values)
         if any(True for _ in _frame_ops(program)):
             return False
-        return not region_dependent(program, code=code)
+        return not region_dependent(program, binding_types, code)
     except Exception:
         return False
 
@@ -918,7 +963,8 @@ def validate_roi(roi) -> str | None:
 WHOLE_FRAME = 1 << 30
 
 
-def stage_halo(code: str, param_values: dict | None = None) -> int:
+def stage_halo(code: str, param_values: dict | None = None,
+               binding_types: dict | None = None) -> int:
     """The neighbour reach one stage reads, as a margin in pixels.
 
     THE INVERSION, and the whole reason this is a function rather than `roi_plan(...).halo`:
@@ -929,8 +975,8 @@ def stage_halo(code: str, param_values: dict | None = None) -> int:
     inverts the whitelist posture (unknown → whole image) into its most dangerous form.
 
     Never raises: `roi_plan` doesn't, and a reach question must always have a conservative
-    answer."""
-    plan = roi_plan(code, param_values or {})
+    answer. `binding_types` rides through to `roi_plan` for the same reason it exists there."""
+    plan = roi_plan(code, param_values or {}, binding_types)
     return int(plan.halo) if plan.executable else WHOLE_FRAME
 
 
