@@ -5,7 +5,107 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.36.0] - 2026-09-18
+
+**Cook it whole** — a program whose answer depends on *which region* is cooked is no longer split
+into strips behind your back, and three native builtins say what a program could not say before:
+a binding's own extent, which worley cell a pixel is in, and a per-pixel pick that never syncs.
+
+**The Planes release (DATA-6's implementation + EXR layers/parts + PM-10) moves to `v0.37.0`,**
+and every later row one place with it (`docs/roadmap.md` §9) — the same move `v0.35.0` made when
+it displaced Planes the first time. `v0.36.0` was penciled for Planes; Planes is not implemented,
+and this is what is ready. Linear light (COLOR-1 + PM-11) is now `v0.38.0`, and the masked
+per-pixel control flow that `v0.35.1` deferred to "a release that moves `LANGUAGE_VERSION`" now
+has a slot of its own, language `0.25` at `v0.39.0` — which is the release the loop half of the
+gate below sunsets on.
+
+**Four new reserved built-in names: `img_width`, `img_height`, `worley_id` and `select`.** Per
+`AGENTS.md` and `DEVELOPMENT.md`'s Tier 2 row, reserving a name is a minor breaking change. A
+program that defines a function of one of these names no longer compiles — it fails **E3011** —
+and the fix is to rename the user function. Nothing else about such a program moves, and a
+program that does not define one of those four names compiles to the same AST, cooks through the
+same tiers and produces the same pixels as before.
+
+`tex_api.LANGUAGE_VERSION` stays `0.23`, and **no compat freeze is owed.** All four names are
+function additions on unchanged grammar, which do not bump the language
+(`docs/plane-bindings.md` §9), and `v0.35.0` set the precedent by reserving `convolve` and
+`patch_dist` without one; `tests/compat_corpus_goldens/` still holds only `0.23.json`, and
+freeze #2 (`0.24`) still comes with the plane grammar.
+
+### Added
+
+- **`img_width(img) → float` and `img_height(img) → float` — a binding's OWN extent (ASK-4).**
+  `shape[2]` and `shape[1]` of the tensor a binding actually carries, returned as a 0-dim fp32
+  tensor on that binding's device — built exactly as `iw`/`ih` are, forced fp32 and never the
+  cook dtype (invariant #4). **Native because there was no spelling for the question:** `iw`/`ih`
+  are the *cook grid*, which since `v0.35.0`'s CF-6 is the broadcast consensus over every binding
+  a program reads, so a second binding whose extent differs from that consensus — a convolution
+  kernel, a mask at another resolution — could not be measured from inside the language at all.
+  A rank < 3 argument (a uniform) reads `1.0` rather than raising or falling back to `iw`,
+  because a non-terminal fusion stage's `@OUT` becomes a local that can be compact-shaped, and
+  "rank < 3 is 1" is the reading that agrees on every path — raising would error a fused chain
+  that the unfused cook serves. Footprint `'image'`, since a shape read is a whole-image
+  question; a non-numeric argument is refused as `E5003` through the same arm the `img_*`
+  reductions use. Both are classified `FP16_FRAGILE` by hand: neither the fragile name stems nor
+  the impl markers read a shape builtin, and a `FunctionCall`'s gain is scored from its args
+  rather than its own magnitude, so `img_width(@K)` would otherwise read magnitude 1 and launder
+  exactly the fp16 amplification `_BUILTIN_MAG` already closes for `iw`. **`img_width` and
+  `img_height` are now reserved built-in names:** a program defining a function of either name
+  fails E3011, so rename it. ComfyUI-invisible because this is two registry entries and two
+  signature rows: no module removed, no call path changed, no default moved.
+- **`worley_id(x, y[, z]) → float` — which cell, not how far (ASK-5).** A stable value in
+  `[0, 1]` per cell of `worley_f1`'s nearest feature point: the same 3×3 / 3×3×3 neighbour
+  search, re-hashing the winning cell's own hash instead of returning its distance. **Native
+  because the registry already claimed to offer it and did not:** `voronoi` is an alias of
+  `worley_f1` — a distance — while its help text said it "returns a unique value per cell". That
+  text now points at `worley_id`; `voronoi`'s own output is unchanged and still bit-identical to
+  `worley_f1`. **Tiers:** `_worley2d_id`/`_worley3d_id` duplicate the neighbour search rather
+  than calling `_worley2d`/`_worley3d`, so the body never reaches `_TieredCache`'s entry point
+  and can never acquire a trace/compile key or be promoted — it runs eager on every tier by
+  construction, and the tiered noise builtins are still exactly `worley_f1`/`worley_f2`/
+  `simplex`/`fbm`. No stencil emitter, so codegen falls through to the general dispatch and calls
+  this same object. Classified `FP16_FRAGILE` by hand: it is the `floor`/`step` class — a
+  half-ULP coordinate nudge can flip which cell wins and *relocate* the id rather than perturb
+  it — and `"worley_id"` matches neither the fragile name stems nor the impl markers.
+  **`worley_id` is now a reserved built-in name:** E3011 on a user function of that name; the
+  same minor breaking change. ComfyUI-invisible because it is one new `@stdlib` entry plus one
+  signature row.
+- **`select(cond, a, b) → vec` — a per-pixel pick that never syncs (ASK-6).** `torch.where` under
+  the same broadcast the interpreter's per-pixel `if`/`?:` merge already uses. **Native because
+  of the one thing an `if` cannot be:** it performs no host sync, so a program calling it stays
+  CUDA-graph capturable where a *uniform* `if`/`?:` on the same condition is not — the uniform
+  scalar shortcut calls `float(cond)`, which capture forbids outright. Both arms always compute;
+  nothing is skipped. An untaken arm's NaN/Inf does not leak, because `torch.where` discards it
+  rather than multiplying it by a zero weight. The result type is the promotion of the two ARMS
+  — `cond` never widens it — and `cond` must be a scalar, with a string or matrix arm refused
+  (`E5003`, the function-call counterpart of the ternary's `E3400`). `precision="auto"` declines
+  any program calling it, exactly as it declines an `if`/`?:`: `select` *is* a per-pixel branch,
+  spelled as a call. That classification lives in the registry's `FP16_FRAGILE` table with the
+  rest, not as a second copy in `precision_policy` — the duplicated branch the first cut added
+  beside it is deleted, so there is one owner and `unclassified_fragile_candidates()` stays
+  empty. **Tiers:** no dedicated codegen emitter; the general fallback calls the same stdlib
+  callable, bit-exact by construction. **`select` is now a reserved built-in name:** a program
+  defining its own `select()` fails E3011. ComfyUI-invisible because it is one registry entry and
+  one signature row, with no call path changed and no default moved.
+- **`W7008`**, an opt-in advisory from `tex_api.control_flow_advisories`, naming exactly the
+  programs the engine will now refuse to split: a `for`/`while` whose condition can differ
+  from pixel to pixel, or a string chosen per pixel by an `if` or a `?:`. It is the subset of
+  `W7007` the engine *acts on*, so a host keying on codes can tell "this is surprising" from
+  "this changes how your cook is scheduled". Like `W7005`–`W7007` it is never emitted by
+  `check()`, so the editor's live lint and `tex_lsp` are untouched.
+- `tex_roi.region_dependent(program, binding_types=None, code=None)` and its per-fingerprint
+  memo, for a host that wants the same verdict before choosing how to cook. `roi_plan`,
+  `batch_sliceable` and `stage_halo` take an optional `binding_types` beside their existing
+  arguments and pass it through. Omitting the map is the conservative read of the *loop* clause
+  — an untyped binding is assumed to vary per pixel — but it is not conservative for the string
+  clause, because nothing in a program's text says an input holds a string: with no map, a
+  string arriving on a wire is invisible to the check. A caller that has the map should supply
+  it. The loop clause
+  retires once a program declares `//!tex 0.25` or newer **and** `tex_api.LANGUAGE_VERSION`
+  has reached that level — masked per-pixel control flow makes a split equal the whole frame,
+  but only when the engine actually implements it, and a pragma ahead of the engine is only a
+  request. At `0.23` that means every program is still gated. The string clause is kept either
+  way, because that rule does not change.
 
 ### Fixed
 
@@ -30,29 +130,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raises is the original one, unwrapped, so the host's own memory handling still fires. A
   `break`, `continue` or `return` under a per-pixel guard is *not* affected — it acts on first
   arrival, identically in every region, so it still splits, which is asserted as a count over
-  all 116 shipped examples and all 6 stock tools: none of them is declined.
-  ComfyUI-invisible because the check sits after each planner's memory-pressure test, so an
-  unpressured cook never reaches it and a CPU cook returns earlier still.
-
-### Added
-
-- **`W7008`**, an opt-in advisory from `tex_api.control_flow_advisories`, naming exactly the
-  programs the engine will now refuse to split: a `for`/`while` whose condition can differ
-  from pixel to pixel, or a string chosen per pixel by an `if` or a `?:`. It is the subset of
-  `W7007` the engine *acts on*, so a host keying on codes can tell "this is surprising" from
-  "this changes how your cook is scheduled". Like `W7005`–`W7007` it is never emitted by
-  `check()`, so the editor's live lint and `tex_lsp` are untouched.
-- `tex_roi.region_dependent(program, binding_types=None, code=None)` and its per-fingerprint
-  memo, for a host that wants the same verdict before choosing how to cook. `roi_plan`,
-  `batch_sliceable` and `stage_halo` take an optional `binding_types` beside their existing
-  arguments and pass it through; omitting it is still the conservative read for everything
-  those plans decide, but a caller that has the map should supply it, or a string arriving on
-  a wire is invisible to the check. The loop clause
-  retires once a program declares `//!tex 0.25` or newer **and** `tex_api.LANGUAGE_VERSION`
-  has reached that level — masked per-pixel control flow makes a split equal the whole frame,
-  but only when the engine actually implements it, and a pragma ahead of the engine is only a
-  request. At `0.23` that means every program is still gated. The string clause is kept either
-  way, because that rule does not change.
+  all 116 shipped examples and all 6 programs in the 5 stock tool bundles: none of them is
+  declined. ComfyUI-invisible because the check sits after each planner's memory-pressure test,
+  so an unpressured cook never reaches it and a CPU cook returns earlier still.
 
 ## [0.35.3] - 2026-09-17
 

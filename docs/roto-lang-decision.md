@@ -1,7 +1,7 @@
 # ROTO-lang — decided on a measurement: **not shipped**
 
 *Doc 42 §2.5 / doc 40 §4.6. Four releases overdue, and this is the last window before DATA-5's
-design doc opens at v0.37 — the gate was "before, not after". Either verdict closes the item;
+design doc opens at v0.38 — the gate was "before, not after". Either verdict closes the item;
 this one is a no-go, recorded with the number that produced it.*
 
 ---
@@ -80,7 +80,7 @@ still recomputes per cook.
   stroke capture, AI assists and the rasterizer itself were never engine items; this measurement
   says the *evaluation* belongs there too.
 * **Not closed: whether TEX should read a mask more cheaply.** `apply` is 0.75–15.58 ms, most of
-  it the ordinary cost of a full-frame multiply. DATA-6's plane bindings (v0.36) are the
+  it the ordinary cost of a full-frame multiply. DATA-6's plane bindings (v0.37) are the
   relevant lever — a mask arriving as a named plane rather than a separate wire — and that is
   already scheduled.
 

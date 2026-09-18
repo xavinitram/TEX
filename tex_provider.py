@@ -505,7 +505,7 @@ def _normalize(frame, source_key: str, t: float) -> torch.Tensor:
     # `stdlib_signatures`, and unlike `sample(@A,…)` there is no wire to take a channel
     # count from — so either the type checker states a truth or it states a hope. The host
     # owns decoding, which makes expanding a mono/RGB source to RGBA its job, and this
-    # refusal names that. Per-source declared channel counts arrive with DATA-6 (v0.36).
+    # refusal names that. Per-source declared channel counts arrive with DATA-6 (v0.37).
     if frame.dim() != 4 or frame.shape[0] != 1 or frame.shape[-1] != 4:
         _raise(E_BAD_FRAME,
                f"the frame provider returned shape {tuple(frame.shape)} for `{source_key}` "

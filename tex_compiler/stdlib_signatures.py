@@ -189,7 +189,7 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     # always VEC4, and `tex_provider._normalize` REQUIRES a 4-channel frame so that
     # declaration is true rather than hopeful — a host owns decoding, so expanding a mono
     # or RGB source to RGBA is its job, and a type the checker states must not be a guess.
-    # (Per-source declared channel counts arrive with DATA-6's plane classes in v0.36.)
+    # (Per-source declared channel counts arrive with DATA-6's plane classes in v0.37.)
     "fetch_time":     {"args": (4, 4), "return": lambda _: TEXType.VEC4},
     "sample_time":    {"args": (4, 4), "return": lambda _: TEXType.VEC4},
 
