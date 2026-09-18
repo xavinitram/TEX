@@ -53,8 +53,10 @@ def _select_type(arg_types: list[TEXType]) -> TEXType:
 
 
 def _float_type(arg_types: list[TEXType]) -> TEXType:
-    """Always FLOAT. ASK-13: `patch_dist` is a per-pixel scalar field regardless of
-    the image's channel count (the mean is taken over channels too) — a NAMED helper
+    """Always FLOAT, whatever the arguments are. Its rows: `patch_dist` (ASK-13, a per-pixel
+    scalar field regardless of the image's channel count — the mean is taken over channels
+    too), `worley_id` (a per-cell hash id), and `img_width` / `img_height` (one number for the
+    image, not one per channel). A NAMED helper
     per AGENTS.md's stdlib recipe ("a named helper, not a lambda"), even though the
     table's other FLOAT-returning rows below (dot/length/distance/luma/determinant)
     are still lambdas; not touched here, since a REG-1 mechanical move is a different

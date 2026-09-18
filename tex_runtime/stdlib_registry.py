@@ -231,6 +231,12 @@ FP16_FRAGILE = frozenset({
     # (its body has no `_safe_div`/`sdiv`), so neither loud guard below catches it.
     # Classified here by hand, same as `patch_dist` above.
     "worley_id",
+    # ASK-6c: select(cond, a, b) IS a per-pixel branch (torch.where), just spelled as a call
+    # instead of `if` / `?:` — an fp16 cond that rounds across the 0.5 threshold flips the
+    # entire pick, arm values included, not a scalar quantum. It is declined unconditionally
+    # on sight, exactly like the IfElse/TernaryOp/WhileLoop branch in `precision_policy`, and
+    # this set is how a fn is declined on sight; neither guard below reads "select".
+    "select",
 })
 FP16_BOUNDED = frozenset({"sin", "cos", "tanh", "atan"})
 
