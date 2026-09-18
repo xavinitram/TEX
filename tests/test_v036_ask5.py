@@ -284,6 +284,9 @@ def test_ask5_voronoi_unchanged(r: SubTestResult):
         _settle_worley_tier(u, v)
         vor = TEXStdlib.fn_voronoi(u, v)
         f1 = TEXStdlib.fn_worley_f1(u, v)
+        # lnt2-ok: both sides settled to the same tier before comparing — the
+        # _settle_worley_tier call above fixes the (return_f2=False, device) key's callable
+        # for the rest of this process, so neither side can take the one-shot promotion.
         assert torch.equal(vor, f1), "voronoi(x, y) no longer bit-identical to worley_f1(x, y)"
         r.ok("voronoi(x, y) == worley_f1(x, y), torch.equal, at 48x32")
 
@@ -292,6 +295,8 @@ def test_ask5_voronoi_unchanged(r: SubTestResult):
         # quietly diverge them either.
         vor3 = TEXStdlib.fn_voronoi(u, v, torch.tensor(1.7))
         f13 = TEXStdlib.fn_worley_f1(u, v, torch.tensor(1.7))
+        # lnt2-ok: the 3D pair routes to `_worley3d`, which has no tiered cache at all — it
+        # is eager on every call, so no tier exists that could move under this equality.
         assert torch.equal(vor3, f13), "voronoi(x, y, z) no longer bit-identical to worley_f1(x, y, z)"
         r.ok("voronoi(x, y, z) == worley_f1(x, y, z), torch.equal")
 
@@ -301,6 +306,9 @@ def test_ask5_voronoi_unchanged(r: SubTestResult):
             ov = run_tier(code_v, {}, tier)
             of1 = run_tier(code_f1, {}, tier)
             md = max_diff(ov, of1)
+            # lnt2-ok: both sides settled to the same tier before comparing — the key the
+            # cooked programs dispatch on carries no shape, so _settle_worley_tier above
+            # pinned the callable for these cooks too; and both legs run the same tier.
             assert md == 0.0, f"[{tier}] whole-program voronoi vs worley_f1 maxdiff {md}"
         r.ok("whole-program voronoi == worley_f1 on both tiers")
     except Exception as e:

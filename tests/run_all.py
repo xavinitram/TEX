@@ -127,6 +127,9 @@ from test_v016_phase4 import (
     test_sl2_fp16_divide_guard,
 )
 from test_no_numpy_ban import test_no_numpy_ban
+from test_no_unportable_equality_ban import (
+    test_no_unportable_equality_ban, test_lnt2_catches_the_three_historical_instances,
+)
 from test_release_gate import test_version_consistency, test_codegen_determinism, test_scatter_determinism_band
 from test_v017_phase1 import (
     test_tst5_tier_trace,
@@ -396,6 +399,8 @@ def main():
     test_lx9_self_swizzle_write(r)
     test_sl2_fp16_divide_guard(r)
     test_no_numpy_ban(r)
+    test_no_unportable_equality_ban(r)
+    test_lnt2_catches_the_three_historical_instances(r)
     test_version_consistency(r)
     test_codegen_determinism(r)
     test_tst5_tier_trace(r)

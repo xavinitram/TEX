@@ -537,6 +537,10 @@ def test_v031_noise_stride_signature(r: SubTestResult):
             outs = [noise._simplex2d(t, t) for _ in range(4)]
             if _tier_of(c, key) != tier:
                 bad.append(f"{label}: the leg left its tier ({tier} -> {_tier_of(c, key)})")
+            # lnt2-ok: the arm above is the guard — this elif is only reached once the cache
+            # has been read and found still on `tier`, so all four `outs` came off ONE
+            # callable. That is what this row asserts: the profiling window closes WITHIN a
+            # tier. Cross-tier agreement is never asserted here, only banded (see _envelope_*).
             elif not all(torch.equal(outs[0], o) for o in outs[1:]):
                 bad.append(f"{label} stride={t.stride()} "
                            f"maxdiff={float((outs[0] - outs[-1]).abs().max()):.2e}")
