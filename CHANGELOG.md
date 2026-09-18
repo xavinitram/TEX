@@ -5,6 +5,49 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.1] - 2026-09-18
+
+**The envelope, not the equality.** `v0.36.0` ("Cook it whole") was tagged and pushed but never
+reached the Comfy registry: CI's test step failed on the Ubuntu/CPU/no-ComfyUI runner, so CI's
+TST-8 release gate refused the publish and the registry kept serving `v0.35.3` — the third
+release in a row stopped exactly this way, after `v0.35.1` and `v0.35.2`. `v0.36.1` is `v0.36.0`
+plus the fix for that failure — no other change, and no product file touched at all — and it is
+the tag whose publish workflow actually runs. **A registry user upgrading from `v0.35.3` gets
+everything in `[0.36.0]` too, and should read that entry**: in particular the four newly RESERVED
+built-in names (`img_width`, `img_height`, `worley_id` and `select`), each of which makes a
+program that defines a function of that name fail **E3011**, and the one deliberate behaviour
+change, where a pressured CUDA cook of a region-dependent program now gets whole-frame-or-OOM
+rather than a wrong tiled picture. Both are stated there in full and neither is re-argued here.
+
+**No reserved built-in name is added by this release** — all four arrived in `v0.36.0` — and
+`tex_api.LANGUAGE_VERSION` stays `0.23`, so no compat freeze is owed.
+
+### Fixed
+
+- **A test asserted bit-equality across two noise tiers (test-only).**
+  `test_ask5_matches_worley_f1_winner` compared `noise._worley2d_f1(...)`, called directly and
+  eagerly, against `noise._worley2d(..., return_f2=False)`, which dispatches through
+  `_worley_cache` (eager → `torch.jit.trace` → Inductor) — and asserted the two bit-identical.
+  Those are two different computations of the same function, so the row was a claim about which
+  operations the host's toolchain declines to fuse, not a claim about TEX: it held on a toolchain
+  whose traced tier reassociates nothing, and differed by `5.960464e-08` — `2**-24`, one fp32 ulp
+  of an output near 1.0 — on the Linux runner. **Cross-tier agreement is governed by the recorded
+  promotion envelope (`tests/test_v031_noise_tiers.py`), never by an equality**, and
+  `_worley2d`'s own comment already said the parity was incidental. The row now checks what its
+  name always claimed and nothing did — that `worley_id`'s argmin picks the same candidate
+  `worley_f1` reports the distance to, and that the id is constant across a winning cell — with
+  both sides eager off one shared distance stack, so bit-equality means something again; the
+  cross-tier fact it had been measuring by accident is kept as
+  `test_ask5_worley_f1_tier_envelope`, which names the tier the dispatched side took and holds
+  the difference to a band recorded with its own measurements. **The sweep that followed found
+  and fixed a second row of the same class before it could fail:** `test_ask5_voronoi_unchanged`
+  compares two *dispatched* `worley_f1` calls, and the one-shot promotion was measured landing on
+  worley call 4 when that file runs alone — one call away from splitting the row's own pairs. It
+  now settles the tier before comparing, and its `torch.equal`s are kept unweakened.
+  ComfyUI-invisible because no file outside `tests/` was touched — no node, schema, widget,
+  default, registry entry or runtime path moves, so a cook produces exactly the pixels it
+  produced before.
+
 ## [0.36.0] - 2026-09-18
 
 **Cook it whole** — a program whose answer depends on *which region* is cooked is no longer split
@@ -133,6 +176,12 @@ freeze #2 (`0.24`) still comes with the plane grammar.
   all 116 shipped examples and all 6 programs in the 5 stock tool bundles: none of them is
   declined. ComfyUI-invisible because the check sits after each planner's memory-pressure test,
   so an unpressured cook never reaches it and a CPU cook returns earlier still.
+
+**2026-09-18 note:** this release was tagged and pushed but never published to the Comfy
+registry — CI's test step failed on Ubuntu/CPU/no-ComfyUI, so TST-8 refused the publish and the
+registry kept serving `v0.35.3`, the third refusal in a row. `v0.36.1` is the release that
+carries everything below to the registry unchanged; a registry user should adopt it and read its
+entry above.
 
 ## [0.35.3] - 2026-09-17
 
