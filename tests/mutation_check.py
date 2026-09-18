@@ -427,7 +427,8 @@ MUTATIONS = [
     ("TRK-25: roi_plan stops refusing a region-dependent program", "tex_roi.py",
      "    if blocked or region_dep:",
      "    if blocked:"),
-    ("TRK-25: the strip planner stops consulting the predicate", "tex_engine.py",
+    # ENG-14 moved the planners out of tex_engine.py; the anchor text is unchanged.
+    ("TRK-25: the strip planner stops consulting the predicate", "tex_tiling.py",
      "        if tex_roi.region_dependent_cached(program, fingerprint, binding_types, code):\n"
      "            return None\n"
      "        return n",

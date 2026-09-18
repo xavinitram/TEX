@@ -1719,6 +1719,22 @@ def main():
     test_t10_w7008_names_what_the_engine_now_refuses(r)
     test_t12_corpus_neutrality(r)
 
+    # ENG-14: the two leaves split out of tex_engine.py (the frame-handoff/ownership
+    # contract and the cook-fit planners), and the properties that keep them split —
+    # the modules exist, every moved name defines in its new home and re-exports as a
+    # real tex_engine global, both new modules stay leaves, and the tex_engine <->
+    # tex_memory edge is still function-local.
+    from test_eng14_split import (
+        test_eng14_the_two_leaves_exist,
+        test_eng14_the_moved_names_live_in_their_new_homes,
+        test_eng14_the_new_modules_stay_leaves,
+        test_eng14_tex_engine_still_imports_tex_memory_lazily,
+    )
+    test_eng14_the_two_leaves_exist(r)
+    test_eng14_the_moved_names_live_in_their_new_homes(r)
+    test_eng14_the_new_modules_stay_leaves(r)
+    test_eng14_tex_engine_still_imports_tex_memory_lazily(r)
+
     success = r.summary()
     return 0 if success else 1
 

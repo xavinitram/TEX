@@ -915,7 +915,15 @@ def test_eng1_node_is_a_marshaller(r: SubTestResult):
     moved = ("select_tier", "_run_tier", "_interp_fallback", "_fp16_finiteness_net",
              "_tile_plan", "_preflight_memory", "_run_default", "_run_torch_compile",
              "_run_auto", "_run_cuda_graph", "_TIER_METHOD", "ExecContext",
-             "_AUTO_DECISION", "_get_interpreter", "_apply_cpu_threads_env")
+             "_AUTO_DECISION", "_get_interpreter", "_apply_cpu_threads_env",
+             # ENG-14 — the names that now live in tex_buffers/tex_tiling and are
+             # re-exported here. This tuple is the DEFINITION of what tex_engine still
+             # promises to expose, so a re-exported name that is not pinned here is a
+             # name a later cleanup silently deletes. Delete a re-export line from
+             # tex_engine.py and this test must go red.
+             "_owned_copy", "to_dlpack", "from_dlpack", "is_frozen", "frame_version",
+             "verify_unmutated", "frozen_copy", "freeze", "_disown_inputs",
+             "_TDR_BUDGET_MS", "_tdr_strip_floor", "_scalar_params", "_halo_tile_plan")
     for name in moved:
         if hasattr(TN, name) or hasattr(getattr(TN, "TEXWrangleNode", object), name):
             fails.append(f"tex_node still exposes {name} (should be engine-only)")

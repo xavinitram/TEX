@@ -235,6 +235,14 @@ _OVER_HARD_BASELINE = frozenset({
     "tex_runtime/codegen.py", "tex_runtime/stdlib.py", "tex_runtime/interpreter.py",
 })
 
+# ENG-14 — a named module's HEADROOM floor, asserted separately from the ratchet.
+# The ratchet only reds ABOVE the hard budget, which is too late for a module that a
+# planned feature has to grow: `tex_engine.py` sat at exactly 2000/2000, so the next
+# line added to it was a red test and the split had to be done under that pressure.
+# A floor is the ratchet run early — it reds while there is still room to act.
+# The floor MOVES DOWN, never up: raising it is how a budget becomes decoration.
+_HEADROOM_FLOOR = {"tex_engine.py": 1700}
+
 
 def test_reg2_loc_budget(r: SubTestResult):
     print("\n--- REG-2: module LOC budget (soft policy + ratchet) ---")
@@ -268,3 +276,15 @@ def test_reg2_loc_budget(r: SubTestResult):
         r.ok(f"ratchet holds — no new module crossed the hard LOC budget{note}")
     except Exception as e:
         r.fail("REG-2 ratchet", f"{type(e).__name__}: {e}")
+
+    # HEADROOM FLOOR (ENG-14) — a named module must keep room for its next feature.
+    try:
+        over_floor = sorted((m, loc[m], f) for m, f in _HEADROOM_FLOOR.items()
+                            if m in loc and loc[m] > f)
+        assert not over_floor, (
+            "module(s) over their ENG-14 headroom floor — split by domain rather than "
+            f"raising the floor: {over_floor}")
+        r.ok("headroom floors hold: "
+             + ", ".join(f"{m} {loc.get(m, '?')}/{f}" for m, f in sorted(_HEADROOM_FLOOR.items())))
+    except Exception as e:
+        r.fail("REG-2 headroom floor", f"{type(e).__name__}: {e}")
