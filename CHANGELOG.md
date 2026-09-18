@@ -5,6 +5,81 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.2] - 2026-09-18
+
+**Make room.** `tex_engine.py` had reached **exactly 2000 lines against REG-2's 2000-line hard
+budget**, and — unlike `codegen.py`, `stdlib.py` and `interpreter.py` — it was never
+grandfathered into the known-over baseline. The next line of the next feature would have reddened
+the ratchet, which is a bad moment to discover you owe a refactor. This release is that refactor
+and nothing else: **two leaf domains move out of the engine into modules of their own, and not one
+line of behaviour changes.** `tex_engine.py` ends at **1628** lines.
+
+**Nothing a caller reads moves.** Every relocated name is re-exported from `tex_engine`, so
+`tex_engine.freeze`, `tex_engine.to_dlpack`, `tex_engine._tile_plan` and the rest still resolve
+exactly as before; no symbol is renamed, and no call path, default or public signature changes.
+A host that imports from `tex_engine` needs no edit. A host that vendors a *file list* gains two
+filenames.
+
+**No reserved built-in name is added**, `tex_api.LANGUAGE_VERSION` stays `0.23`, and no compat
+freeze is owed.
+
+### Changed
+
+- **`tex_buffers.py` (new, 199 LOC) — the frame handoff and buffer-ownership contract.** The
+  ENG-6 DLPack pair (`to_dlpack` / `from_dlpack`) and the ENG-12 immutability set (`freeze`,
+  `frozen_copy`, `is_frozen`, `frame_version`, `verify_unmutated`, `_owned_copy`,
+  `_disown_inputs`). These are *publicly promised* names whose contract has been canary-pinned
+  since `v0.23`, yet while they were nine functions in the middle of a 2000-line engine they had
+  no row in `DEVELOPMENT.md`'s API-tier table to stand in — the Tier-1 rows named only
+  `cook`/`prepare`/`run`, and the Tier-3 catch-all covered `tex_engine._*`. A module can take a
+  table row, and now does; the row *describes the canary that already existed* rather than
+  promoting anything.
+- **`tex_tiling.py` (new, 258 LOC) — the cook-fit planners.** `_tile_plan`, `_halo_tile_plan`,
+  `_preflight_memory`, `_tdr_strip_floor`, `_scalar_params` and the TDR budget. This puts the
+  strip planner on the analysis side of a line the tree already draws: `tex_roi.batch_sliceable`
+  decides and `tex_memory.run_batch_strips` executes, `tex_roi.roi_plan` decides and
+  `tex_memory.run_roi` executes — and now the third planner sits with the other two instead of
+  inside the engine. `tex_memory.py` is **not touched**.
+- **The planners did NOT move into `tex_memory.py`**, which would have reunited each plan with
+  its executor and was the more attractive shape on paper. `tex_engine` may not import
+  `tex_memory` at load time — `ARCHITECTURE.md` and `AGENTS.md` both name that exact edge as a
+  logical cycle broken by hand, and forbid hoisting it — so the re-export would have had to be a
+  function-local import at 3-4 sites per cook, measured at **0.286 us per site**, or roughly
+  **+1 us/cook**. The whole ENG-1 engine lift cost +1.3 us; a refactor release that spends most of
+  a feature release's perf allowance to buy nothing is a bad trade. A new leaf module is
+  top-level-importable, so the moved names stay `tex_engine` globals and the per-cook cost is zero
+  structurally, not merely small.
+- **REG-2 grows a `_HEADROOM_FLOOR` (`tex_engine.py`: 1700).** A budget that only speaks at the
+  wall gives no warning; this one reds while a split is still cheap to plan. It moves down when a
+  split lands, never up.
+
+### How this was proven invisible
+
+Invariant 7 says a refactor release must be undetectable, and the honest gate here is **not** a
+benchmark. This box's cook-path CV is 16-26 %, so a 1 us difference on a 263 us cook is 0.3 % —
+a timing gate could not have resolved the question either way, and presenting one as evidence
+would be the same dishonesty this changelog called out about `eight_config_bench` at `v0.22`.
+
+Instead the move is proven **mechanically**: every relocated function is compiled in isolation
+from its pre-move source and compared against its post-move self on ten code-object fields
+(`co_code`, `co_consts`, `co_names`, `co_varnames`, `co_flags`, `co_argcount`, `co_kwonlyargcount`,
+`co_nlocals`, `co_freevars`, `co_cellvars`), recursively into nested code objects. **14/14 moved
+functions are byte-identical with no mismatch on any field**, and the 34 functions that stayed
+behind are identical too. The engine's diff is exactly three deletions and one insertion. Timing
+ran anyway and is reported as **non-gating**: `-1.2 us/cook` (CV 1.8 %/0.6 %, quiet box) and
+`+271.6 us` **once** at package import.
+
+### Known — not fixed here
+
+- **Three `mutation_check.py` rows have been inert since `v0.36.0`.** The TRK-25 rows that guard
+  the region-dependence gate survive their mutants — not because the gate is wrong, but because
+  the mutation runner's suite list is hand-maintained and never grew a `test_v036_*` import, so
+  the tests that would kill those mutants are never loaded. Verified pre-existing by running the
+  rows against `v0.36.1`'s own tree. It is the third release in which that hand-kept list has
+  drifted, and the fix is to derive it the way `_NON_LOCAL_FNS` is derived from the stdlib
+  registry rather than to re-hand-edit it. Tracked; deliberately not bundled into a release whose
+  diff is meant to stay mechanically reviewable.
+
 ## [0.36.1] - 2026-09-18
 
 **The envelope, not the equality.** `v0.36.0` ("Cook it whole") was tagged and pushed but never

@@ -155,16 +155,27 @@ grown a second responsibility. This is a policy, not a gate: `test_reg2_loc_budg
 *reports* over-budget modules and **ratchets** (a **new** module crossing 2000 is a
 red test; the known-over baseline below is grandfathered pending its planned split).
 
-Currently over the hard budget — status as of v0.18.0 (drift-checked by
+**A module may also carry a `_HEADROOM_FLOOR` (ENG-14).** `tex_engine.py` reached *exactly*
+2000/2000 and was not grandfathered, so the next line of the next feature would have reddened
+the ratchet — a budget that only speaks at the wall gives no warning and no time. The floor is
+a per-module ceiling *below* the hard line (`tex_engine.py`: 1700) that reds early, while a
+split is still cheap to plan. **It moves down when a split lands, never up**: raising a floor to
+fit the change that tripped it converts the gate into decoration, which is exactly what the
+grandfathered baseline above already cost us. If a planned feature does not fit under the floor,
+the answer is the next domain split, not a bigger number — and the design note for the split
+that bought the current headroom records where the following cut is (`tex_engine.py`'s chain /
+lineage group becomes a leaf once `run()`'s call into `_compute_lineage` is inverted).
+
+Currently over the hard budget — status as of v0.36.2 (drift-checked by
 `test_doc7b_map_drift`, which reds if any `~LOC` here diverges >20% from `wc -l`):
 
 | Module | LOC | Status |
 |--------|-----|--------|
-| `tex_runtime/codegen.py` | ~2730 | STR-7 split **shipped** (4092→2731: `codegen_stdfns.py` / `codegen_stencil.py` / `codegen_persist.py` extracted). Docs 27/28 verdict: **stop here** — the remainder is one cohesive emitter; further splitting is aesthetic, not domain-driven |
-| `tex_runtime/stdlib.py` | ~2330 | per-domain `stdlib_*.py` still planned — unblocked by REG-1 (registration is per-decorator, not one central dict) |
+| `tex_runtime/codegen.py` | ~3080 | STR-7 split **shipped** (4092→2731: `codegen_stdfns.py` / `codegen_stencil.py` / `codegen_persist.py` extracted). Docs 27/28 verdict: **stop here** — the remainder is one cohesive emitter; further splitting is aesthetic, not domain-driven |
+| `tex_runtime/stdlib.py` | ~2810 | per-domain `stdlib_*.py` still planned — unblocked by REG-1 (registration is per-decorator, not one central dict) |
 | `tex_runtime/interpreter.py` | ~2700 | STR-3/STR-4 **shipped** (`ExecContext` + shared `NodeVisitor` extracted); the residual is the core tree-walk, plus CF-6's `_consensus_extent` — the single owner of the cook-grid rule, which the codegen tier, `run_roi` and the test oracle all call |
 
-`tex_compiler/optimizer.py` (~1520) is over *soft*; STR-5 (the `PASSES` list) **shipped**.
+`tex_compiler/optimizer.py` (~1540) is over *soft*; STR-5 (the `PASSES` list) **shipped**.
 
 ## Doc-layering policy (DOC-6)
 
