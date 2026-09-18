@@ -1523,6 +1523,7 @@ def main():
         test_ask5_reserved_name_e3011,
         test_ask5_determinism_and_cell_count,
         test_ask5_matches_worley_f1_winner,
+        test_ask5_worley_f1_tier_envelope,
         test_ask5_voronoi_unchanged,
         test_ask5_help_text_corrected,
         test_ask5_taxonomy_pin,
@@ -1534,6 +1535,7 @@ def main():
     test_ask5_reserved_name_e3011(r)
     test_ask5_determinism_and_cell_count(r)
     test_ask5_matches_worley_f1_winner(r)
+    test_ask5_worley_f1_tier_envelope(r)
     test_ask5_voronoi_unchanged(r)
     test_ask5_help_text_corrected(r)
     test_ask5_taxonomy_pin(r)
