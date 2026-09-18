@@ -657,13 +657,13 @@ compiled tier is promoted starting its 4th call (`tex_runtime/noise.py:423-425`)
 (`tex_memory.py:1257-1261`). An isolated, per-tenant session is phase 2 and unbuilt today
 (`tex_session.py:18-21`).
 
-A host reads a cook back through `CookResult` (`tex_engine.py:287-316`, Tier 1 below): `cooked_roi`,
+A host reads a cook back through `CookResult` (`tex_engine.py:318-346`, Tier 1 below): `cooked_roi`,
 `lineage` under `prepare(want_lineage=True)`, and `out_meta` always ride along; the rest are opt-in,
 and everything below is a pointer, one sentence each, to what exists on this tree today:
 
 - `CookResult.noise_tiers`, filled by `prepare`/`cook(want_noise_tiers=True)`, names which tier
   served each tiered noise builtin so a host can decline to composite frames cooked across a
-  promotion (`tex_engine.py:277`, `:1614-1616`) — Tier 1, the same row as `CookResult` itself.
+  promotion (`tex_engine.py:346`, `:1269-1271`) — Tier 1, the same row as `CookResult` itself.
 - `tex_doctor.capabilities()`, also `tex doctor --json`, is a read-only per-tier report: did this
   process's box actually run each execution tier, is it known unavailable and why, or simply
   unmeasured (`tex_doctor.py:284-310`, `tex_cli.py:303-318`) — Tier 2, its own row below.
@@ -720,11 +720,12 @@ breaks a host.
 | **1 — Public** | `tex_marshalling.BufferMeta` fields + `merge_buffer_meta` + `CookResult.out_meta` (DATA-1) | The colour/alpha/frame tag vocabularies + the merge-to-`unknown` policy; a value channel, never keyed | `test_v028_phase1` |
 | **1 — Public** | `tex_io.BufferDesc` + `tex_io.exr` / `tex_io.png` (DATA-2) | Storage dtypes; EXR is the OpenEXR format (NONE/ZIP scanline, HALF/FLOAT) — the file bytes are the standard's contract | `test_v028_phase1` |
 | **1 — Public** | `tex_session.EngineSession` / `default_session` (DATA-4) | The session handle; phase-1 `.cache`/`.registry`/`.host` view the module singletons | `test_v028_phase1` |
+| **1 — Public** | `tex_engine.freeze` / `frozen_copy` / `is_frozen` / `frame_version` / `verify_unmutated` / `to_dlpack` / `from_dlpack` — the ENG-6/ENG-12 frame-handoff and buffer-ownership contract (since ENG-14 these live in `tex_buffers` and are re-exported off `tex_engine`, which is where every consumer reads them) | Describes what these canaries ALREADY pin, and is not a promotion: the DLPack export shape (fp32, on-device, BHWC, `layout='bchw'` a zero-copy permute) and the `copy=True` ownership default | `test_v023_phase1`, `test_v025_phase1` |
 | **2 — Semi** | `a@name` ARRAY wire + array outputs (DATA-3) | Engine-profile only; `a` is now a RESERVED binding prefix; comfy rejects array outputs (E3203 + egress guard) | `test_v028_phase1` |
 | **2 — Semi** | TEX the language | Additive; new builtin/function names are RESERVED, so adding one is a minor breaking change — note it in the CHANGELOG (v0.22 reserved `frame`/`fps`/`time`) | the compat corpus (LANG-3, planned) |
 | **2 — Semi** | Error codes (E1xxx–E6xxx) | Codes are stable; message TEXT is not | `test_c3ux_error_codes_resolve` |
 | **2 — Semi** | `tex_doctor.capabilities()` row names, its 4 keys, and the `status`/`evidence` vocabularies (BRIEF-4) | A read-only per-tier capability REPORT, never a fixed ladder — values are whatever a box measures; a row/key/vocabulary rename or removal bumps `schema` | `test_dbg4_capabilities_shape` |
-| **3 — Internal** | Everything else — `tex_runtime.*`, `tex_compiler.*`, `tex_fusion` internals, `tex_engine._*` | No promise. Import at your own risk | — |
+| **3 — Internal** | Everything else — `tex_runtime.*`, `tex_compiler.*`, `tex_fusion` internals, `tex_engine._*`, and the underscored names of the modules split out of it (`tex_buffers._*`, `tex_tiling.*` — the cook-fit planners are all private) | No promise. Import at your own risk | — |
 
 **Fingerprints are NOT stable — never persist one.** `TEXCache.fingerprint` /
 `fused_fingerprint` are value-independent keys for TEX's own caches, deliberately derived

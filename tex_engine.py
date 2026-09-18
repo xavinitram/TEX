@@ -2,7 +2,7 @@
 ENG-1 / PORT-2b — `tex_engine`: the host-agnostic cook engine.
 
 Until v0.22 the full engine — tier selection, the interpreter fallbacks, the OOM
-ladder, strip tiling, the `precision="auto"` gate — was reachable ONLY through
+ladder, cook-fit planning, the `precision="auto"` gate — was reachable ONLY through
 `TEXWrangleNode.execute`, a ComfyUI v3 node classmethod. Even `tex run` (PORT-3, the
 CLI whose whole job is proving TEX is host-agnostic) had to import the node facade to
 cook a frame. This module is that engine, lifted out whole.
@@ -27,6 +27,19 @@ running stage to blame).
 intact, re-homed. Behaviour is byte-identical and the benchmark is the gate (invariant
 #7: a refactor release must be invisible) — measured at +1.3 us/cook, O(1), which is
 +0.19% of a 1024² CUDA cook and under the jitter.
+
+**ENG-14 — two leaves moved out, for headroom.** This file sat at exactly 2000 lines,
+REG-2's hard budget, with no room for the next feature at the marshalling seam. Two
+self-contained domains moved to their own modules, bodies verbatim: `tex_buffers` (the
+ENG-6/ENG-12 frame-handoff and buffer-ownership contract) and `tex_tiling` (the cook-fit
+planners — `tex_tiling` plans, `tex_memory` runs, `tex_roi` decides what may be
+narrowed). Both are leaves, imported at load and re-exported just below, so every
+`tex_engine.NAME` reader and every caller that stayed here is untouched. Unlike v0.22
+this one is not gated on a measurement, because it adds no work to measure: all 15 moved
+bodies compile to byte-identical bytecode and no surviving line of this file changed, so
+the per-cook cost is **0 us** by construction. The only measurable cost is package import,
++0.4 ms once, against this module's own ~22 ms — and it is smaller than that, since this
+file lost 400 lines in the same change.
 """
 from __future__ import annotations
 

@@ -64,8 +64,8 @@ The rest of the substrate:
 |---|---|---|
 | Stage-list surgery | `tex_fusion.is_linear_stage_list` / `prefix_fingerprint` / `suffix_stage_list` (`:895`–`:924`) | The linear-chain test, a value-independent fingerprint per cut, and the rebind of stage `k`'s `chain_input` to an injected boundary |
 | Multi-tap export | `compile_fused` `tap:` (`tex_fusion.py:520`) | Every checkpoint from one cook |
-| The tap key | `tex_engine.boundary_lineage_key` (`:1723`) | Already namespaced by the cut (`flags=['tap:s{k-1}']`), so N cuts mint N keys with no key-scheme change |
-| The single-tap driver | `tex_engine.cook_fused_cached` (`:1754`) | The gate, the `FusionError` fallback, and the "correct-but-not-incremental full cook" posture |
+| The tap key | `tex_engine.boundary_lineage_key` (`:1456`) | Already namespaced by the cut (`flags=['tap:s{k-1}']`), so N cuts mint N keys with no key-scheme change |
+| The single-tap driver | `tex_engine.cook_fused_cached` (`:1551`) | The gate, the `FusionError` fallback, and the "correct-but-not-incremental full cook" posture |
 | The store | `tex_results.ResultCache.put/get` (`:239`/`:269`) | Freeze, slice compaction, byte accounting, LRU + disk spill |
 | Per-stage cost | `tex_runtime.profile.stage_costs(key, spatial)` (`:284`) | `{stage_index: EWMA ms}` — CACHE-7's declared input |
 | Idle time | `tex_cookqueue.CookQueue.submit(..., klass=SPECULATIVE)` (`:274`) | A single worker thread that yields to interactive work |
@@ -206,7 +206,7 @@ Three consequences stated plainly:
 
 ## 6. Identity: the resolution hole the single-tap key had
 
-`cook_fused_cached` mints the boundary key **without** `canvas=` (`tex_engine.py:1787`), so a
+`cook_fused_cached` mints the boundary key **without** `canvas=` (`tex_engine.py:1604`), so a
 tap's identity carries no shape. `ResultCache.get` validates neither shape nor device — its
 `canvas` field is write-only metadata. Resolution identity therefore rides entirely on the
 host's `upstream` string, and nothing documents that it must encode one.
@@ -373,7 +373,7 @@ steady state only and missed a +44% cold-compile regression).
   so a relaunch's disk read is cheaper than a re-cook.
 - **Half-precision checkpoint storage.** A tap costs fp32 bytes even for an fp16 cook (§5).
   *Gate:* CACHE-8/PREC-1 in v0.33, which own storage precision as a decision.
-- **Checkpoints under ROI.** `roi=` is refused on a fused chain (`tex_engine.py:1261`), so
+- **Checkpoints under ROI.** `roi=` is refused on a fused chain (`tex_engine.py:987`), so
   CACHE-7 (fused) and CACHE-9 (per-stage ROI) serve two different host shapes and do not
   compose. *Gate:* ROI execution on a fused program, which needs the reach analysis to see
   through fusion's local variables — a LANG/ROI item, not a caching one.

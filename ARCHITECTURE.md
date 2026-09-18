@@ -77,8 +77,8 @@ Three layers; **imports point downward only**. The `tex_compiler` package has
 |-------|---------|-----------|
 | **Types** (leaf vocabulary) | `types` (`TEXType`, `CHANNEL_MAP`, `TYPE_NAME_MAP`, swizzles) | nothing (stdlib `enum`/`dataclasses` only) |
 | **Compiler** (IR + front end) | `ast_nodes`, `lexer`, `parser`, `type_checker`, `optimizer`, `stdlib_signatures`, `diagnostics` | types + itself |
-| **Runtime** (execution tiers) | `interpreter`, `codegen` (+ `codegen_stdfns`/`codegen_stencil`/`codegen_persist`, STR-7), `compiled`, `graphed`, `stdlib` (+ `stdlib_registry`), `precision_policy` (PR-LP2 `auto` gate), `tier_trace`, `profile` (PROF-1 cost store + the thread-local stage sink), `noise`, `autotier`, `xfer` (ENG-8 transfer-cost probe), `tex_cache`, `tex_marshalling` (+ DATA-1 `BufferMeta`), `tex_memory`, `tex_recovery` (ENG-13 durable write + journal), `tex_io` (DATA-2 `BufferDesc` + EXR/PNG storage), `host` (PORT-1 seam — the ONLY `comfy.model_management` consumer) | types + compiler + itself |
-| **Engine** (host-agnostic cook) | `tex_engine` (`cook`/`prepare`/`run`, tier selection, OOM ladder, tiling, precision-auto — ENG-1), `tex_fusion` (splice + the FUS-1 detector), `tex_lazy`, `tex_scheduler` (SCHED-2 placement), `tex_cookqueue` (SCHED-4 preemptive queue + PRED-1 admission), `tex_checkpoint` (CACHE-7 effort-based checkpoint placement) | runtime + compiler |
+| **Runtime** (execution tiers) | `interpreter`, `codegen` (+ `codegen_stdfns`/`codegen_stencil`/`codegen_persist`, STR-7), `compiled`, `graphed`, `stdlib` (+ `stdlib_registry`), `precision_policy` (PR-LP2 `auto` gate), `tier_trace`, `profile` (PROF-1 cost store + the thread-local stage sink), `noise`, `autotier`, `xfer` (ENG-8 transfer-cost probe), `tex_cache`, `tex_marshalling` (+ DATA-1 `BufferMeta`), `tex_memory`, `tex_recovery` (ENG-13 durable write + journal), `tex_io` (DATA-2 `BufferDesc` + EXR/PNG storage), `host` (PORT-1 seam — the ONLY `comfy.model_management` consumer), `tex_buffers` (ENG-14 — the ENG-6/ENG-12 frame-handoff + buffer-ownership contract; a torch-only leaf) | types + compiler + itself |
+| **Engine** (host-agnostic cook) | `tex_engine` (`cook`/`prepare`/`run`, tier selection, OOM ladder, precision-auto — ENG-1), `tex_tiling` (ENG-14 — the cook-fit planners: `tex_tiling` plans, `tex_memory` runs, `tex_roi` decides what may be narrowed), `tex_fusion` (splice + the FUS-1 detector), `tex_lazy`, `tex_scheduler` (SCHED-2 placement), `tex_cookqueue` (SCHED-4 preemptive queue + PRED-1 admission), `tex_checkpoint` (CACHE-7 effort-based checkpoint placement) | runtime + compiler |
 | **Public API** (host-agnostic) | `tex_api` (`compile`/`execute`/`Program`/`TEXCompileError` + DATA-1 `color_advisories` + the opt-in `control_flow_advisories` + DATA-4 `EngineSession`, PORT-2/ENG-4), `tex_session` (DATA-4 — one handle over the cook singletons, views in phase 1), `tex_cli` (`tex run`/`tex build`, PORT-3/TOOL-4), `tex_tool` (the `.textool` loader/publish/cook, TOOL-1..5), `tex_lsp` (the stdio LSP, LANG-7) | engine + runtime + compiler |
 | **ComfyUI adapter** | `tex_node` (marshalling + schema + `ui=` payload only, S-1), `__init__` (routes), `tex_runtime/host` | all of the above |
 
@@ -128,6 +128,12 @@ never the checker). `type_checker` re-imports them for its own use, so legacy
 (`codegen/graphed/compiled/noise/stdlib/interpreter/tex_cache`); `tex_engine ↔ tex_memory`
 (ENG-1 moved this one off `tex_node` — the interpreter singleton and the tiling/budget
 calls are the engine's; it did NOT remove it, the count is still 2).
+(ENG-14 added `tex_buffers` and `tex_tiling`; both are **leaves** — `tex_buffers` imports
+only `torch`, `tex_tiling` only the PORT-1 host seam — so `tex_engine` imports both at load,
+no edge points back, and the count is **still 2**. The planners' `tex_memory`/`tex_roi`
+imports travelled with them as function-local imports and were NOT hoisted; moving the
+planners INTO `tex_memory` would have required exactly that hoist, which is why they went
+to a new leaf instead.)
 (STR-1 removed the third — `stdlib_signatures ↔ type_checker` — by moving `TEXType` to the
 leaf; `type_checker`'s lazy `FUNCTION_SIGNATURES` bind is now defensive, not cycle-breaking.)
 Do **not** hoist the remaining two to top-level imports — the cycles are logical; the fix is
