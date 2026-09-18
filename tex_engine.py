@@ -37,9 +37,10 @@ narrowed). Both are leaves, imported at load and re-exported just below, so ever
 `tex_engine.NAME` reader and every caller that stayed here is untouched. Unlike v0.22
 this one is not gated on a measurement, because it adds no work to measure: all 15 moved
 bodies compile to byte-identical bytecode and no surviving line of this file changed, so
-the per-cook cost is **0 us** by construction. The only measurable cost is package import,
-+0.4 ms once, against this module's own ~22 ms — and it is smaller than that, since this
-file lost 400 lines in the same change.
+the per-cook cost is **0 us** by construction. The only measurable cost is import: importing
+this module now also imports the two new ones, measured (interleaved, medians of 9, caches
+purged identically) at **+0.27 ms once**, against this module's own ~20 ms import — and the
+package import itself is unaffected, since it does not load this module at all.
 """
 from __future__ import annotations
 
