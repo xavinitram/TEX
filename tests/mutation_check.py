@@ -302,7 +302,8 @@ MUTATIONS = [
      '    if roi is not None:\n'
      '        return (b, roi[3], roi[2])\n'
      '    if b_split or hw_split:'),
-    ('CF-6: the peak-bytes preflight sizes itself first-wins again', 'tex_engine.py',
+    # ENG-14 moved _preflight_memory out of tex_engine.py; the anchor text is unchanged.
+    ('CF-6: the peak-bytes preflight sizes itself first-wins again', 'tex_tiling.py',
      '        spatial = _consensus_extent(bindings, program)',
      '        spatial = next(((v.shape[0], v.shape[1], v.shape[2]) for v in bindings.values()\n'
      '                        if isinstance(v, torch.Tensor) and v.dim() >= 3), None)'),
