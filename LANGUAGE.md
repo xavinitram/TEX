@@ -15,7 +15,7 @@ the CPU interpreter and the GPU codegen backend and must produce the same result
 ## 1. Language version & compatibility
 
 The **language** is versioned separately from the package. `tex_api.LANGUAGE_VERSION`
-(currently **`0.23`**) names the grammar + semantics this engine implements; the
+(currently **`0.24`**) names the grammar + semantics this engine implements; the
 package `__version__` tracks the release. They move independently — a release that
 only fixes a bug or refactors internals does not bump the language version.
 
@@ -23,7 +23,7 @@ only fixes a bug or refactors internals does not bump the language version.
 own comment line:
 
 ```tex
-//!tex 0.23
+//!tex 0.24
 @OUT = vec4(@A.rgb * 1.2, 1.0);
 ```
 
@@ -46,6 +46,10 @@ the latest. `compat_corpus.freeze(version)` may only ADD a version and refuses t
 one — so "old goldens are immutable" is machinery rather than a convention. A frozen
 program whose pixels genuinely must move requires deleting that archive file in a commit
 that argues the change.
+
+The archive holds `0.23.json` (129 programs) and, since language `0.24`, `0.24.json`
+(130: the same 129, unchanged, plus the first plane program — §5.3). Every current
+program is checked against both.
 
 New grammar is added **additively** (v0.23 added the optional parameter-metadata block,
 below) so old programs keep parsing. A genuinely breaking change is called out in the
@@ -70,7 +74,9 @@ Two consequences worth stating outright:
 * **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`.
 * **Bindings** carry a sigil: `@name` (a wire — an image/mask/latent input or output)
   and `$name` (a parameter — a scalar/vector/string widget value). Either may carry a
-  one-token type prefix: `f@x`, `img@src`, `f$gain`, `v3$tint`.
+  one-token type prefix: `f@x`, `img@src`, `f$gain`, `v3$tint`. A wire name may be
+  followed by exactly one dotted segment, `@beauty.diffuse` — a plane on a PLANES wire
+  (§5.3), or the swizzle it always was on any other wire.
 * Statements end with `;`. Blocks are `{ … }`.
 
 ---
@@ -85,6 +91,7 @@ Two consequences worth stating outright:
 | `string` | a separate domain — no numeric promotion to/from it |
 | `float[N]` | fixed-size arrays of any element type |
 | `IMAGE`/`MASK`/`LATENT` | wire (`@`) binding types at the host boundary |
+| `PLANES` | a wire-only binding type (engine hosts): one `@` wire carrying named planes, each read as `@wire.plane` (§5.3); never an expression type |
 
 Swizzles read components by name (`c.x`, `c.rgb`, `p.xy`); a component set must use one
 naming family. Reverse/arbitrary reorders are not all supported — read components you
@@ -206,6 +213,60 @@ result identity but never recompiles the program.
 
 Pinned by `tests/test_v035_hygiene.py`, across the interpreter, codegen, every
 `compile_mode`, the tiled/batch-strip/ROI assemblers, and a fused chain's terminal stage.
+
+### 5.3 Plane reads (language 0.24)
+
+One `@` wire may carry many **named planes** — an EXR's layers (`diffuse`, `specular`, `Z`,
+`N`), a render's AOVs — and a program reads one by name with the dotted form `@wire.plane`:
+
+```tex
+vec3 lit = p@beauty.diffuse + @beauty.specular * $spec;   // two three-channel planes
+float depth = @beauty.Z;                                  // a one-channel plane is a float
+@OUT = vec4(mix(lit, $fog, smoothstep($near, $far, depth)), 1.0);
+```
+
+* **One segment names the plane; what follows is an ordinary swizzle.** `@beauty.diffuse.rgb`
+  is the plane `diffuse` swizzled `.rgb`. The lexer takes exactly one dotted segment after a
+  wire name. On a wire that is not PLANES the segment is the swizzle it always was — `@image.b`
+  still means the blue channel — so no `0.23` program changes meaning; the whole `0.23` archive
+  is still checked, unchanged (§1).
+* **The `p@` prefix declares the wire PLANES** (`p@beauty.diffuse`), the same one-token type
+  prefix as `f@` or `img@` (§2). A host that binds the wire as a plane set needs no prefix. The
+  wire itself is not a value — `@beauty` alone cannot appear in an expression — and a plane
+  read is typed by the plane it names: a three-channel plane is a `vec3`, a four-channel one a
+  `vec4`, and a **one-channel plane is a `float`**, handed over in the `[B,H,W]` shape a MASK
+  uses, so it composes wherever a mask does.
+* **The collision rule.** A PLANES wire may not declare a plane named after one of the 38
+  lowercase channel and swizzle names (`r g b a x y z w`; `rg` … `rgba`, `xyz`, `xyzw`, `bgr`,
+  `abgr`): `@src.rgb` could not mean both "the plane called `rgb`" and "the rgb of something".
+  The engine refuses the wire at binding time with **E3304** — *plane `rgb` on `@src` collides
+  with the swizzle `.rgb` — rename the plane* — whether or not the program reads that plane.
+  Never a silent guess.
+* **`Z` does not collide.** The rule is case-sensitive and lowercase-only, and the conventional
+  EXR data-layer names are uppercase: `Z`, `N`, `RGBA`. `@beauty.Z` is a plane read on day one,
+  with no rename and no escape hatch. What collides is a plane spelled `z`, and the error says
+  to rename it.
+* **Reading a plane the wire does not carry** draws the advisory **W7009** with a did-you-mean
+  (`@beauty.diffues` → *Did you mean `@beauty.diffuse`?*), followed by the ordinary E6003
+  "not connected" refusal naming the slot, because no cook can satisfy the read. Planes a
+  program never mentions are never marshalled: a program reading only `@beauty.N` ingests
+  only `N`.
+
+**Not in `0.24`** — planes are read-only and engine-only, and each limit has the gate that
+reopens it:
+
+* **Plane writes.** `@OUT.diffuse = …` is a compile error whose hint names the deferral;
+  `@OUT` is one whole image. Reopens with a host wire type that can carry a plane set.
+* **A ComfyUI wire type.** The ComfyUI node has no PLANES socket. A plane set reaches a program
+  through the engine API under the engine egress profile, exactly as ARRAY wires do; under the
+  ComfyUI profile the type does not exist and nothing about the node changes. Reopens with a
+  host wire that carries one.
+* **A fused chain carries whole wires.** A `.textool` input cannot feed one plane, and a fused
+  stage cannot export one (the refusal names the export). Reopens on a measured graph where a
+  plane edge inside a fused region is the bottleneck.
+* **UINT planes** (cryptomatte ids) are not read — the named future customer is cryptomatte.
+  **Multipart** and deep EXR are not read — multi-*layer* files are; multipart reopens with a
+  fixture that needs it.
 
 ---
 

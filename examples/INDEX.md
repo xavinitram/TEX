@@ -1,11 +1,12 @@
 # TEX Examples Index
 
 > **Generated** by `tools/gen_examples_index.py` from the `// Name — desc`
-> header of each `examples/*.tex`. 116 examples. Do not edit by hand.
+> header of each `examples/*.tex`. 117 examples. Do not edit by hand.
 
 | Example | Description |
 |---------|-------------|
 | [Alpha Over](examples/alpha_over.tex) | composite foreground over background using a mask |
+| [AOV Relight](examples/aov_relight.tex) | rebalance a render's diffuse and specular planes, then fog it by depth |
 | [Array Reduce](examples/array_reduce.tex) | demonstrate array aggregation functions |
 | [Auto Levels](examples/auto_levels.tex) | normalize image channels to the full [0,1] range |
 | [Barrel Distortion](examples/barrel_distortion.tex) | polynomial radial lens distortion |

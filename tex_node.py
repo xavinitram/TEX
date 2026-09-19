@@ -145,7 +145,7 @@ class TEXWrangleNode(_BaseClass):
                         "// TEX Wrangle\n"
                         "// Read inputs with @A, @B, etc.\n"
                         "// Write output to @OUT\n"
-                        "// Right-click → TEX Snippets for 116 examples\n\n"
+                        "// Right-click → TEX Snippets for 117 examples\n\n"
                         "float gray = luma(@IN);\n"
                         "@OUT = vec3(gray);\n"
                     ),

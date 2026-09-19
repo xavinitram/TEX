@@ -2,7 +2,7 @@
   "manifest_schema": 1,
   "name": "Vignette",
   "tool_version": "1.0.0",
-  "tex_language": "0.23",
+  "tex_language": "0.24",
   "min_engine": "0.26.0",
   "category": "Effects",
   "context": "filter",

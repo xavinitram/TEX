@@ -251,7 +251,7 @@ def test_t7_no_shipped_program_is_declined(r: SubTestResult):
     examples = list(_example_sources())
     stock = list(_stock_sources())
     try:
-        assert len(examples) == 116, f"expected 116 examples/*.tex, found {len(examples)}"
+        assert len(examples) == 117, f"expected 117 examples/*.tex, found {len(examples)}"
         assert len(stock) == 6, f"expected 6 stock programs, found {len(stock)}"
         r.ok(f"corpus size pinned: {len(examples)} examples + {len(stock)} stock programs")
     except Exception as e:

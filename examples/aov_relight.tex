@@ -1,0 +1,36 @@
+// AOV Relight — rebalance a render's diffuse and specular planes, then fog it by depth
+//
+// The first plane program (language 0.24). One wire, p@beauty, carries a
+// render's named planes — an EXR's layers, here diffuse, specular and Z —
+// and the program reads each by name with the dotted form @wire.plane.
+// The p@ prefix declares the wire PLANES; a plane read then behaves as an
+// ordinary vector or float value.
+//
+//   * p@beauty.diffuse.rgb — a plane read followed by an ordinary swizzle:
+//     exactly one dotted segment names the plane, and anything after it is
+//     the usual .rgba / .xyzw component access.
+//   * p@beauty.Z — uppercase on purpose. The conventional EXR data-layer
+//     names (Z, N, RGBA) do not collide with the lowercase channel and
+//     swizzle names, so a depth plane needs no rename. A one-channel plane
+//     reads as a FLOAT, like a MASK.
+//   * Planes are read-only: @OUT is one whole image. A plane may not be
+//     named after a channel or swizzle (rgb, z, ...) — that is E3304.
+//
+// Connect @beauty to a multi-plane (PLANES) wire on an engine host; the
+// ComfyUI node has no PLANES wire type in this release.
+
+f$diffuse_gain = 1.0;
+f$spec_gain = 0.5;
+f$fog_near = 0.2;
+f$fog_range = 0.6;
+f$fog_amount = 0.5;
+
+// Relight: rebalance the two lighting planes.
+vec3 lit = p@beauty.diffuse.rgb * $diffuse_gain + p@beauty.specular * $spec_gain;
+
+// Depth fog: the Z plane is a FLOAT, so it drives smoothstep directly.
+float depth = p@beauty.Z;
+float fog = smoothstep($fog_near, $fog_near + $fog_range, depth) * $fog_amount;
+vec3 haze = vec3(0.62, 0.70, 0.80);
+
+@OUT = vec4(mix(lit, haze, fog), 1.0);

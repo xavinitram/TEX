@@ -3420,7 +3420,7 @@ app.registerExtension({
                         }
                         const manifest = {
                             manifest_schema: 1, name, tool_version: "1.0.0",
-                            tex_language: "0.23", min_engine: "0.26.0",
+                            tex_language: "0.24", min_engine: "0.26.0",
                             category: "User", context: "filter", author: "", doc: "",
                             code,
                             inputs: [...inputs].map(n => ({ name: n, type: socketTypes.get(n) || "IMAGE" })),

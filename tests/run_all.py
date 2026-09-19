@@ -1871,6 +1871,12 @@ def main():
     test_harness_prepares_a_plane_program(r)
     test_expansion_mutations(r)
 
+    # DATA-6 (freeze #2): the language-version satellites a machine can read track
+    # `tex_api.LANGUAGE_VERSION` — CF-7's JS pin generalised to the five stock manifests
+    # and the generator that writes them.
+    from test_v037_satellites import test_v037_language_version_satellites
+    test_v037_language_version_satellites(r)
+
     success = r.summary()
     return 0 if success else 1
 

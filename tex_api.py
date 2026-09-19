@@ -72,7 +72,7 @@ from .tex_session import EngineSession, default_session  # noqa: F401
 # `//!tex X.Y` pragma; `check()` advises (W7004) when a program targets a NEWER language
 # than this engine implements. The frozen compat corpus (tests/) pins that a program keeps
 # computing the same pixels across versions. See LANGUAGE.md for the compatibility policy.
-LANGUAGE_VERSION = "0.23"
+LANGUAGE_VERSION = "0.24"
 
 # A `//!tex X.Y` pragma on its own comment line (the lexer discards comments, so this is
 # recovered from the raw source, not from tokens).
