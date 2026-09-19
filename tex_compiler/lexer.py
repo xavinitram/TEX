@@ -228,12 +228,27 @@ class LexerError(Exception):
 
 
 class Lexer:
-    """Tokenizes TEX source code."""
+    """Tokenizes TEX source code.
 
-    def __init__(self, source: str):
+    `dotted_bindings` (DATA-6): when True, a `@` binding reads EXACTLY ONE adjacent dotted
+    segment as part of its name (`@beauty.diffuse` is one AT_BINDING), which is the language
+    rule for plane reads — see `_read_binding_name`. It is OFF by default, deliberately: the
+    tree has many consumers that tokenize or parse source outside the production compile seam
+    (the lazy-input analysis, the ROI walk, the fused-chain splicer, the editor lint, the test
+    harnesses), and every one of them reads a binding's name as the WIRE it is connected to.
+    Handing them `image.r` where they expect `image` changes what an existing program means
+    on each of those paths at once. So the production seam (`TEXCache.compile_tex`, whose
+    `compile_ast` owns the splitback that resolves a dotted name against the binding types)
+    turns it on, and each other consumer is converged onto the seam — or opts in with its own
+    handling of the dotted name — as a deliberate, reviewable one-line change. With the flag
+    off the token stream is byte-identical to the pre-planes lexer.
+    """
+
+    def __init__(self, source: str, *, dotted_bindings: bool = False):
         self.source = source
         self.pos = 0  # CT-2: the byte offset is the sole cursor (no line/col)
         self.tokens: list[Token] = []
+        self.dotted_bindings = bool(dotted_bindings)
 
     def _error(self, message: str, loc: SourceLoc, *,
                code: str = "E1000", hint: str = "", end_col: int | None = None) -> LexerError:
@@ -361,7 +376,8 @@ class Lexer:
                 sigil = self.advance()  # consume @ or $
                 name = self._read_binding_name(
                     text, sigil, start_loc,
-                    greedy_dot=(sigil == "@" and text in _GREEDY_DOT_PREFIXES))
+                    greedy_dot=(self.dotted_bindings and sigil == "@"
+                                and text in _GREEDY_DOT_PREFIXES))
                 tok_type = (TokenType.TYPED_AT_BINDING if sigil == "@"
                             else TokenType.TYPED_DOLLAR_BINDING)
                 return Token(tok_type, name, start_loc, prefix=text)
@@ -419,10 +435,11 @@ class Lexer:
         Used by both read_at_binding/read_dollar_binding and typed binding
         detection in read_identifier.
 
-        DATA-6 (`greedy_dot`): a `@` binding also consumes EXACTLY ONE dotted segment when
-        one immediately follows — `@beauty.diffuse` is one AT_BINDING whose value is the
-        verbatim `beauty.diffuse`, so a plane is addressed by the name the file gives it
-        and `sigil_names` reports per-plane demand with no second scan. One segment, never
+        DATA-6 (`greedy_dot`, on when the Lexer was built with `dotted_bindings=True`): a `@`
+        binding also consumes EXACTLY ONE dotted segment when one immediately follows —
+        `@beauty.diffuse` is one AT_BINDING whose value is the verbatim `beauty.diffuse`, so a
+        plane is addressed by the name the file gives it and a sigil scan built with the flag
+        reports per-plane demand with no second pass. One segment, never
         more, is the greed at which a plane read and a swizzle fall out of a single rule:
         `@beauty.diffuse.rgb` is `AT_BINDING("beauty.diffuse") . IDENT("rgb")` — a plane
         read followed by an ordinary ChannelAccess — while `@A.rgb` is `AT_BINDING("A.rgb")`,
@@ -452,7 +469,7 @@ class Lexer:
     def read_at_binding(self) -> Token:
         start_loc = self.loc()
         self.advance()  # skip @
-        name = self._read_binding_name("", "@", start_loc, greedy_dot=True)
+        name = self._read_binding_name("", "@", start_loc, greedy_dot=self.dotted_bindings)
         return Token(TokenType.AT_BINDING, name, start_loc)
 
     def read_dollar_binding(self) -> Token:

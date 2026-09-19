@@ -1797,6 +1797,8 @@ def main():
     # engine profile, and the collision set is the 38 lowercase channel/swizzle names.
     from test_v037_planes_lexer import (
         test_dotted_at_binding_is_one_token,
+        test_default_lexer_is_unchanged,
+        test_the_production_seam_lexes_greedily,
         test_one_segment_rule,
         test_p_prefix_declares_a_planes_wire,
         test_collision_set_is_38_lowercase_names,
@@ -1808,6 +1810,8 @@ def main():
         test_tripwire_is_portable,
     )
     test_dotted_at_binding_is_one_token(r)
+    test_default_lexer_is_unchanged(r)
+    test_the_production_seam_lexes_greedily(r)
     test_one_segment_rule(r)
     test_p_prefix_declares_a_planes_wire(r)
     test_collision_set_is_38_lowercase_names(r)

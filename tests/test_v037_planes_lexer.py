@@ -15,6 +15,13 @@ PLANES is a WIRE-ONLY type, added exactly as ARRAY was: inert in every expressio
 gated on the engine egress profile through the same switch, so under ComfyUI (the default) the
 plane row never fires and every dotted `@` means what it always meant.
 
+THE GREED IS OPT-IN (`Lexer(src, dotted_bindings=True)`), and only the production seam
+(`TEXCache.compile_tex`) opts in. Every other tokenizer in the tree — the lazy-input analysis,
+the ROI walk, the fused-chain splicer, the editor lint, the test harnesses — reads a binding's
+name as the wire it is connected to, and keeps the pre-planes token stream byte for byte until
+it is converged onto the seam deliberately. That default is pinned here; flipping it is a
+decision, not a side effect.
+
 Every row runs on the CPU interpreter or on the compiler alone. No ComfyUI, no CUDA, no
 compiler toolchain, no Windows path, no embedded interpreter, no numpy — and no row asserts a
 time. The one bit-exact comparison is same tier, same device, same bytes (see its marker).
@@ -42,12 +49,13 @@ def _splitback(program, binding_types, *, source=""):
     return splitback_dotted_bindings(program, binding_types, source=source)
 
 
-def _toks(src):
-    return [(t.type, t.value) for t in Lexer(src).tokenize()[:-1]]   # drop EOF
+def _toks(src, **kw):
+    kw.setdefault("dotted_bindings", True)
+    return [(t.type, t.value) for t in Lexer(src, **kw).tokenize()[:-1]]   # drop EOF
 
 
 def _parse(src):
-    return Parser(Lexer(src).tokenize(), source=src).parse()
+    return Parser(Lexer(src, dotted_bindings=True).tokenize(), source=src).parse()
 
 
 class _planes_enabled:
@@ -97,6 +105,62 @@ def test_dotted_at_binding_is_one_token(r: SubTestResult):
         r.fail("@A.rgb -> one token", str(e))
 
 
+def test_default_lexer_is_unchanged(r: SubTestResult):
+    print("\n--- DATA-6 L-B: without the flag the token stream is the pre-planes one ---")
+    cases = [
+        ("@beauty.diffuse", [(TokenType.AT_BINDING, "beauty"), (TokenType.DOT, "."),
+                             (TokenType.IDENT, "diffuse")]),
+        ("@A.rgb", [(TokenType.AT_BINDING, "A"), (TokenType.DOT, "."), (TokenType.IDENT, "rgb")]),
+        ("p@beauty.diffuse", [(TokenType.TYPED_AT_BINDING, "beauty"), (TokenType.DOT, "."),
+                              (TokenType.IDENT, "diffuse")]),
+        ("@a.b.c", [(TokenType.AT_BINDING, "a"), (TokenType.DOT, "."), (TokenType.IDENT, "b"),
+                    (TokenType.DOT, "."), (TokenType.IDENT, "c")]),
+    ]
+    for src, want in cases:
+        try:
+            got = _toks(src, dotted_bindings=False)
+            assert got == want, f"{src!r}: {got}"
+            assert _toks(src, dotted_bindings=False) == \
+                [(t.type, t.value) for t in Lexer(src).tokenize()[:-1]]    # the DEFAULT
+            r.ok(f"default lexer: {src!r} -> pre-planes tokens")
+        except Exception as e:
+            r.fail(f"default lexer: {src!r}", str(e))
+    try:
+        assert Lexer("x").dotted_bindings is False
+        r.ok("Lexer(...).dotted_bindings defaults to False")
+    except Exception as e:
+        r.fail("default is False", str(e))
+
+
+def test_the_production_seam_lexes_greedily(r: SubTestResult):
+    print("\n--- DATA-6 L-B: compile_tex is the seam that reads a dotted binding ---")
+    src = "@OUT = @beauty.diffuse;"
+    try:
+        # With plane wires on and the base typed PLANES, a plane read survives compile_tex as
+        # the dotted binding `beauty.diffuse` — only a greedy lexer can produce that name. (A
+        # non-greedy lexer would build ChannelAccess(beauty, diffuse) and E3302 on `.diffuse`.)
+        # Until the wire lane adds the per-plane rows, the read types by the VEC4 fallback.
+        with _planes_enabled(True):
+            program, type_map, referenced, *_ = get_cache().compile_tex(
+                src, {"beauty": TEXType.PLANES})
+        assert "beauty.diffuse" in referenced, referenced
+        r.ok("compile_tex + planes on + PLANES base: `beauty.diffuse` is the referenced name")
+    except Exception as e:
+        r.fail("seam is greedy", str(e))
+    try:
+        # …and with plane wires OFF the same source through the same seam is the swizzle it
+        # always was: `.diffuse` is not a swizzle pattern, E3302.
+        try:
+            get_cache().compile_tex(src + "// off\n", {"beauty": TEXType.PLANES})
+            raise AssertionError("compiled")
+        except TEXMultiError as e:                 # two swizzle errors accumulate (E3302 + E3303)
+            codes = {d.code for d in e.diagnostics}
+            assert "E3302" in codes, codes
+        r.ok("compile_tex + planes off: the same read is a swizzle (E3302 on `.diffuse`)")
+    except Exception as e:
+        r.fail("seam splits back when off", str(e))
+
+
 def test_one_segment_rule(r: SubTestResult):
     print("\n--- DATA-6 L-B: exactly ONE dotted segment, immediately adjacent ---")
     cases = [
@@ -126,12 +190,13 @@ def test_one_segment_rule(r: SubTestResult):
             r.fail(f"one-segment rule: {src!r}", str(e))
     try:
         # E1007 is unchanged: a sigil with no name after it
-        try:
-            Lexer("@ + 1").tokenize()
-            raise AssertionError("lexed")
-        except LexerError:
-            pass
-        r.ok("E1007 (no name after the sigil) still raises")
+        for kw in ({}, {"dotted_bindings": True}):
+            try:
+                Lexer("@ + 1", **kw).tokenize()
+                raise AssertionError("lexed")
+            except LexerError:
+                pass
+        r.ok("E1007 (no name after the sigil) still raises, flag or no flag")
     except Exception as e:
         r.fail("E1007 still raises", str(e))
 
@@ -145,7 +210,7 @@ def test_p_prefix_declares_a_planes_wire(r: SubTestResult):
     except Exception as e:
         r.fail("`p` prefix row", str(e))
     try:
-        toks = Lexer("p@beauty.diffuse").tokenize()[:-1]
+        toks = Lexer("p@beauty.diffuse", dotted_bindings=True).tokenize()[:-1]
         assert len(toks) == 1 and toks[0].type is TokenType.TYPED_AT_BINDING, toks
         assert toks[0].value == "beauty.diffuse" and toks[0].prefix == "p", toks
         r.ok("p@beauty.diffuse -> one TYPED_AT_BINDING (prefix p, value verbatim)")
@@ -403,10 +468,11 @@ def test_splitback_rows_and_their_mutations(r: SubTestResult):
 
 def test_splitback_is_an_identity_on_the_cook(r: SubTestResult):
     print("\n--- DATA-6 L-B: the split-back program cooks the SAME pixels ---")
-    # `@image.rgb` (greedy -> one token -> split back) versus `@image .rgb` (a space: the
-    # lexer never fuses it, so the parser builds the ChannelAccess itself). Both go through
-    # compile_tex and the CPU interpreter: same tier, same device, same bindings, so the
-    # outputs must be bit-identical -- the splitback is a rewrite to the SAME AST.
+    # `@image.rgb` (compile_tex lexes greedily -> one token -> split back) versus
+    # `@image .rgb` (a space: no lexer fuses it, so the parser builds the ChannelAccess
+    # itself). Both go through compile_tex and the CPU interpreter: same tier, same device,
+    # same bindings, so the outputs must be bit-identical -- the splitback is a rewrite to
+    # the SAME AST.
     greedy = ("vec3 c = @image.rgb * 0.5 + vec3(@image.r, @image.g, @image.b) * 0.25;\n"
               "@OUT = vec4(c, @image.a);\n")
     spaced = greedy.replace("@image.", "@image .")

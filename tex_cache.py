@@ -418,7 +418,10 @@ class TEXCache:
 
         # Full compilation pipeline: lex + parse, then the shared post-parse
         # orchestration (STR-8: identical to the fusion path's).
-        tokens = Lexer(code).tokenize()
+        # DATA-6: THIS is the seam that reads `@name.seg` as one binding — `compile_ast`
+        # below owns the splitback that resolves it against the binding types. Every other
+        # tokenizer in the tree keeps the pre-planes stream until it is converged here.
+        tokens = Lexer(code, dotted_bindings=True).tokenize()
         program = Parser(tokens, source=code).parse()
         program, type_map, referenced, assigned, params, used_builtins = \
             self.compile_ast(program, binding_types, source=code)
