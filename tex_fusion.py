@@ -534,6 +534,14 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
                                        initializer=_seed_initializer(ot.value), is_const=False))
             # Extra exported outputs (Q-3 multi-@OUT): always seeded handoff locals.
             for name in declared_exports:
+                if "." in name:
+                    # DATA-6: an export becomes a handoff LOCAL named after it, and a dotted
+                    # name is not an identifier — the emitted program would not be Python.
+                    # Plane writes are a deferred surface; a fused chain carries whole wires.
+                    raise FusionError(
+                        f"stage {i} declares export @{name}, a plane write; a fused chain "
+                        f"carries whole wires across a stage boundary, not planes. Export "
+                        f"the wire, or break the chain there.")
                 et = checker.assigned_bindings.get(name)
                 if et is None:
                     raise FusionError(

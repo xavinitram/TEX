@@ -326,6 +326,12 @@ class TypeChecker:
         # W7002 unused input: a wired @input the code never reads (and never writes).
         for name in self.binding_types:
             if name not in self.referenced_bindings and name not in self.assigned_bindings:
+                # DATA-6: a PLANES wire is read THROUGH its planes (`@beauty.diffuse`), never
+                # under its own name; a host lint that types the base PLANES must not hear
+                # "beauty is unused" for a program that reads one of its planes.
+                if self.binding_types[name] is TEXType.PLANES and any(
+                        ref.startswith(name + ".") for ref in self.referenced_bindings):
+                    continue
                 self._warn("W7002", f"Input '@{name}' is connected but never used.",
                            SourceLoc(1, 1),
                            hint=f"Reference it with @{name}, or disconnect the wire.")
@@ -680,6 +686,19 @@ class TypeChecker:
                     )
                     self._set_type(node, TEXType.VOID)
                     return
+                # DATA-6: a PLANES wire is a SET of planes, not a pixel value — `@OUT = @beauty`
+                # has no meaning on either profile. Plane WRITES (`@OUT.diffuse = ...`) are a
+                # deferred surface, so the hint names the read that does exist.
+                if value_type.is_planes:
+                    self._error(
+                        f"Assigning a planes wire to @{name} isn't supported "
+                        f"(a PLANES value is a set of named planes, not a pixel value).",
+                        node.loc,
+                        code="E3203",
+                        hint="Read one plane by name — @beauty.diffuse — and assign that.",
+                    )
+                    self._set_type(node, TEXType.VOID)
+                    return
 
                 # Infer output type from assignment
                 if isinstance(node.target, ChannelAccess):
@@ -963,6 +982,12 @@ class TypeChecker:
         # 3. Type hint from code (e.g. f@threshold → FLOAT)
         if node.type_hint:
             t = BINDING_HINT_TYPES.get(node.type_hint, TEXType.VEC4)
+            # DATA-6: `p@beauty.diffuse` declares the WIRE `beauty` PLANES; the READ types as
+            # the plane's own value — the per-plane row (rule 1) once the wire is bound, the
+            # vec4 fallback when it is not, so an unbound plane read reaches the E6003 gate
+            # (which names the slot) instead of failing as "a PLANES value in an expression".
+            if t is TEXType.PLANES and "." in node.name:
+                t = TEXType.VEC4
             self._set_type(node, t)
             return t
 
@@ -1021,6 +1046,16 @@ class TypeChecker:
                             node.loc, code="E3300", hint=hint)
                 self._set_type(node, TEXType.FLOAT)
                 return TEXType.FLOAT
+        if obj_type.is_planes:
+            # DATA-6: a PLANES wire has planes, not channels — `@beauty.r` on a PLANES base
+            # under the ComfyUI profile (where no plane read exists) lands here rather than
+            # crashing, and the hint says what the dot means on the engine profile. Recorded
+            # and NOT returned: the swizzle rules below still speak, so the segment's own
+            # diagnostic (E3302 on `.diffuse`) stands beside this one, as it did before the arm.
+            self._error("Channel access (.rgb, .x, etc.) doesn't work on a planes wire.",
+                        node.loc, code="E3300",
+                        hint="Name a plane first: @beauty.diffuse.rgb swizzles the plane, not "
+                             "the wire (plane reads need the engine profile).")
 
         if len(channels) == 1:
             # Single channel -> float
@@ -1046,9 +1081,17 @@ class TypeChecker:
 
         # Multi-channel swizzle
         if channels not in VALID_SWIZZLES:
+            hint = "Try common swizzles like .rgb, .xyz, .rgba, or .xyzw."
+            if isinstance(node.object, BindingRef) and node.object.kind == "wire":
+                # DATA-6: a dotted name on an ordinary wire is a swizzle, and this is not one.
+                # Name the two things the user may have meant, and the one that is deferred:
+                # a plane READ needs a PLANES wire; a plane WRITE (`@OUT.diffuse = ...`) is
+                # not a surface of this version — plane wires are read-only.
+                hint += (" A plane read (@src.<plane>) needs a PLANES wire on the engine "
+                         "profile; a plane write (@OUT.<plane> = ...) is not supported in "
+                         "this version — plane wires are read-only, so write the whole @OUT.")
             self._error(f"'.{channels}' isn't a recognized swizzle pattern.",
-                        node.loc, code="E3302",
-                        hint="Try common swizzles like .rgb, .xyz, .rgba, or .xyzw.")
+                        node.loc, code="E3302", hint=hint)
         elif (obj_type.is_vector or obj_type.is_scalar) and any(
             CHANNEL_MAP[ch] >= obj_type.channels for ch in channels if ch in CHANNEL_MAP
         ):
