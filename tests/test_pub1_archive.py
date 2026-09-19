@@ -111,8 +111,10 @@ _JS_ONLY = {
 # The pin moves DOWN freely and reds until it does; it moves UP only as a release decision that
 # names the new finding — every shipped finding is justified to the registry reviewer in
 # writing, so a new one is a new paragraph there, never a reflex here.
+# env_read 25→24 (PUB-3): SECURITY.md's read row had still quoted the matched spelling and the
+# registry flagged it on 0.36.4 (SECURITY.md:31); reworded to describe, pin re-measured.
 _SURFACE_PINS = {
-    "env_read": 25,
+    "env_read": 24,
     "subprocess": 1,
     "os_system": 0,
     "exec": 11,
