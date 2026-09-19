@@ -1735,6 +1735,22 @@ def main():
     test_eng14_the_new_modules_stay_leaves(r)
     test_eng14_tex_engine_still_imports_tex_memory_lazily(r)
 
+    # MUT-1: the mutation harness's curated suite list is DERIVED from its rows (each row
+    # carries the suite that kills it) instead of hand-kept, so it cannot drift past a
+    # release again — the drift that made all three TRK-25 rows assert nothing.
+    from test_mut1_harness import (
+        test_mut1_the_harness_imports_without_running_the_sweep,
+        test_mut1_every_row_names_an_existing_killing_suite,
+        test_mut1_a_row_without_a_usable_suite_is_refused_by_name,
+        test_mut1_the_runner_import_list_is_derived_not_hand_written,
+        test_mut1_every_rows_suite_is_loaded_by_the_runner,
+    )
+    test_mut1_the_harness_imports_without_running_the_sweep(r)
+    test_mut1_every_row_names_an_existing_killing_suite(r)
+    test_mut1_a_row_without_a_usable_suite_is_refused_by_name(r)
+    test_mut1_the_runner_import_list_is_derived_not_hand_written(r)
+    test_mut1_every_rows_suite_is_loaded_by_the_runner(r)
+
     success = r.summary()
     return 0 if success else 1
 

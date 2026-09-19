@@ -1151,11 +1151,22 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   also removes the job from its deque under the same lock, so the branch is unreachable today;
   it stays in the source as documented belt-and-braces because the flag and the removal are set
   by different call sites). Reasons are recorded in `tests/mutation_check.py` beside the rows.
-- **The mutation harness was blind to v0.34 (v0.34.1)** — its RUNNER imported a hardcoded test
-  module list ending at v0.33, so any v0.34 row would have reported SURVIVED with "0 failing
-  rows" whatever the guard did. That, not simple omission, is why v0.34 shipped with none. The
-  list now reaches v0.34.1, and a new release's modules must be added to it or its rows are
-  decorative — the same trap `test_v0331_audit`'s A5 row fell into a different way.
+- **The mutation harness was blind to v0.34 (v0.34.1), and then to v0.36 — so the list is now
+  DERIVED (MUT-1).** Its RUNNER imported a hardcoded test module list ending at v0.33, so any
+  v0.34 row would have reported SURVIVED with "0 failing rows" whatever the guard did. That,
+  not simple omission, is why v0.34 shipped with none. **Extending the list was the wrong fix,
+  and it failed the same way one release later**: the list then ended at v0.35, and all three
+  v0.36.0 TRK-25 rows reported SURVIVED for three releases because
+  `test_v036_region_dependence` — the only file with a test that could kill them — was never
+  imported. A hand-kept parallel list is the defect, not its length. Each mutation row now
+  carries the suite(s) that kill it and the runner's import list is the union over the rows
+  being swept, the same single-source discipline invariant 5 uses for
+  `tex_memory._NON_LOCAL_FNS`. Adding a row therefore loads its own suite; a row naming no
+  suite, or a suite that is not on disk, stops the sweep with a message naming the row, and a
+  row killed only by suites it did NOT declare is reported as MISATTRIBUTED. Do not replace
+  this with "import every test module": the subprocess runs once per row, so the import cost is
+  multiplied by the row count, and a sweep too slow to run is a sweep that stops being run.
+  Pinned by `tests/test_mut1_harness.py`.
 - **PROF-1 `snapshot()` cross-launch persistence: DECIDED — persist, via the `reload()`
   protocol, and let placement re-derive (CF-5b, v0.35).** The question doc 41 left open was
   whether CACHE-7 placement should be stable across launches. It should not be *pinned*: a
