@@ -1791,6 +1791,33 @@ def main():
     test_multipart_deep_tiled_still_refused(r)
     test_write_layers_input_contract(r)
 
+    # DATA-6 (compiler half): the lexer reads `@name.seg` as one token (one segment), the
+    # splitback pass in `compile_ast` puts every non-plane dotted binding back to the swizzle
+    # it always was, PLANES is a wire-only type inert in every expression rule and gated on the
+    # engine profile, and the collision set is the 38 lowercase channel/swizzle names.
+    from test_v037_planes_lexer import (
+        test_dotted_at_binding_is_one_token,
+        test_one_segment_rule,
+        test_p_prefix_declares_a_planes_wire,
+        test_collision_set_is_38_lowercase_names,
+        test_planes_is_inert_in_every_expression_rule,
+        test_untyped_base_splits_back_to_a_swizzle,
+        test_splitback_rows_and_their_mutations,
+        test_splitback_is_an_identity_on_the_cook,
+        test_swizzle_sugar_stays_refused,
+        test_tripwire_is_portable,
+    )
+    test_dotted_at_binding_is_one_token(r)
+    test_one_segment_rule(r)
+    test_p_prefix_declares_a_planes_wire(r)
+    test_collision_set_is_38_lowercase_names(r)
+    test_planes_is_inert_in_every_expression_rule(r)
+    test_untyped_base_splits_back_to_a_swizzle(r)
+    test_splitback_rows_and_their_mutations(r)
+    test_splitback_is_an_identity_on_the_cook(r)
+    test_swizzle_sugar_stays_refused(r)
+    test_tripwire_is_portable(r)
+
     success = r.summary()
     return 0 if success else 1
 
