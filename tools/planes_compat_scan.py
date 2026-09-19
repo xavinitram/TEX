@@ -11,8 +11,11 @@ import os
 import re
 import sys
 
-sys.path.insert(0, r"G:\ComfyUI_Menu\comfyUI\custom_nodes")
-sys.path.insert(0, r"G:\ComfyUI_Menu\comfyUI\custom_nodes\TEX_Wrangle\tests")
+# Portable: the package root is derived from this file, so the scan runs from any checkout
+# (its parent makes `TEX_Wrangle` importable; `tests/` makes `compat_corpus` importable).
+_PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(_PKG))
+sys.path.insert(0, os.path.join(_PKG, "tests"))
 
 from TEX_Wrangle.tex_compiler.lexer import Lexer, TokenType
 from TEX_Wrangle.tex_compiler.types import CHANNEL_MAP, VALID_SWIZZLES
@@ -29,7 +32,7 @@ sources = []
 for name, src in compat_corpus._corpus_programs():
     sources.append((f"corpus:{name}", src))
 
-exdir = r"G:\ComfyUI_Menu\comfyUI\custom_nodes\TEX_Wrangle\examples"
+exdir = os.path.join(_PKG, "examples")
 for fn in sorted(os.listdir(exdir)):
     if fn.endswith(".tex"):
         with open(os.path.join(exdir, fn), encoding="utf-8") as f:
@@ -49,12 +52,19 @@ for name, src in sources:
     except Exception as e:
         lexfail.append((name, f"{type(e).__name__}: {e}"))
         continue
-    # Token-level: an AT_BINDING immediately followed by DOT then IDENT is what the greedy
-    # lexer would fuse. This is the exact set the change alters.
+    # Token-level, in BOTH lexer generations so the tripwire keeps counting the same set:
+    #   * pre-greed: an AT_BINDING immediately followed by DOT then IDENT — the sequence the
+    #     greedy lexer fuses;
+    #   * greedy (DATA-6 shipped): one AT_BINDING whose value carries the dot — the fused form.
+    # Either way the segment is what follows the LAST dot, which is what the splitback splits on.
     for i, t in enumerate(toks):
         if t.type is not TokenType.AT_BINDING:
             continue
-        if i + 2 < len(toks) and toks[i + 1].type is TokenType.DOT \
+        if "." in t.value:
+            seg = t.value.rsplit(".", 1)[1]
+            hits.append((name, f"@{t.value}", seg,
+                         "SWIZZLE" if seg in COLLISION else "NOT-A-SWIZZLE"))
+        elif i + 2 < len(toks) and toks[i + 1].type is TokenType.DOT \
                 and toks[i + 2].type is TokenType.IDENT:
             seg = toks[i + 2].value
             hits.append((name, f"@{t.value}.{seg}", seg,
