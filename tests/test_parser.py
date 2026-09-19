@@ -1,5 +1,6 @@
 """Parser tests."""
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 
 
 def test_parser(r: SubTestResult):
@@ -79,13 +80,20 @@ def test_parser(r: SubTestResult):
     except Exception as e:
         r.fail("vec3 constructor", str(e))
 
-    # Channel access
+    # Channel access — DATA-6: the lexer hands the parser ONE token `A.r`, so the raw parse is a
+    # dotted BindingRef; the front end (`parse_and_split`, the splitback against the binding
+    # types — `{}` here: an untyped base is a swizzle) restores the ChannelAccess the parser
+    # built before planes. The raw `dotted_bindings=False` stream still parses to it directly.
     try:
-        tokens = Lexer("float r = @A.r;").tokenize()
-        prog = Parser(tokens).parse()
-        init = prog.statements[0].initializer
+        src = "float r = @A.r;"
+        raw = Parser(Lexer(src).tokenize()).parse().statements[0].initializer
+        assert raw.__class__.__name__ == "BindingRef" and raw.name == "A.r", raw
+        init = parse_and_split(src, {}).statements[0].initializer
         assert init.__class__.__name__ == "ChannelAccess"
         assert init.channels == "r"
+        assert init.object.__class__.__name__ == "BindingRef" and init.object.name == "A"
+        pre = Parser(Lexer(src, dotted_bindings=False).tokenize()).parse().statements[0].initializer
+        assert pre.__class__.__name__ == "ChannelAccess" and pre.channels == "r"
         r.ok("channel access")
     except Exception as e:
         r.fail("channel access", str(e))
@@ -122,11 +130,12 @@ def test_parser(r: SubTestResult):
     except Exception as e:
         r.fail("missing semicolon error", str(e))
 
-    # Nested expressions
+    # Nested expressions (through the front end: `@A.r` inside the call is a swizzle of @A)
     try:
-        tokens = Lexer("float x = sin(clamp(@A.r * 2.0 - 1.0, -1.0, 1.0));").tokenize()
-        prog = Parser(tokens).parse()
+        prog = parse_and_split("float x = sin(clamp(@A.r * 2.0 - 1.0, -1.0, 1.0));", {})
         assert len(prog.statements) == 1
+        inner = prog.statements[0].initializer.args[0].args[0].left.left
+        assert inner.__class__.__name__ == "ChannelAccess" and inner.object.name == "A", inner
         r.ok("nested expressions")
     except Exception as e:
         r.fail("nested expressions", str(e))

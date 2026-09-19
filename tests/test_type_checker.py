@@ -18,12 +18,17 @@ def test_type_checker(r: SubTestResult):
     except Exception as e:
         r.fail("vec4 variable", str(e))
 
-    # Channel access type
+    # Channel access type — DATA-6: `check_code` reaches the checker through the one front
+    # end (`parse_and_split`), so the checker sees `ChannelAccess(BindingRef(A), r)` and
+    # references the WIRE `A`, never a binding named `A.r` (which a private parse of the
+    # greedy token stream would hand it, mistyping `float r = @A.r` as E3200).
     try:
         type_map, checker = check_code(
             "float r = @A.r;",
             {"A": TEXType.VEC4}
         )
+        assert "A" in checker.referenced_bindings, checker.referenced_bindings
+        assert not any("." in n for n in checker.referenced_bindings), checker.referenced_bindings
         r.ok("channel access type")
     except Exception as e:
         r.fail("channel access type", str(e))

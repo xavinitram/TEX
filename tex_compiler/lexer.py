@@ -230,21 +230,20 @@ class LexerError(Exception):
 class Lexer:
     """Tokenizes TEX source code.
 
-    `dotted_bindings` (DATA-6): when True, a `@` binding reads EXACTLY ONE adjacent dotted
-    segment as part of its name (`@beauty.diffuse` is one AT_BINDING), which is the language
-    rule for plane reads — see `_read_binding_name`. It is OFF by default, deliberately: the
-    tree has many consumers that tokenize or parse source outside the production compile seam
-    (the lazy-input analysis, the ROI walk, the fused-chain splicer, the editor lint, the test
-    harnesses), and every one of them reads a binding's name as the WIRE it is connected to.
-    Handing them `image.r` where they expect `image` changes what an existing program means
-    on each of those paths at once. So the production seam (`TEXCache.compile_tex`, whose
-    `compile_ast` owns the splitback that resolves a dotted name against the binding types)
-    turns it on, and each other consumer is converged onto the seam — or opts in with its own
-    handling of the dotted name — as a deliberate, reviewable one-line change. With the flag
-    off the token stream is byte-identical to the pre-planes lexer.
+    `dotted_bindings` (DATA-6): a `@` binding reads EXACTLY ONE adjacent dotted segment as
+    part of its name (`@beauty.diffuse` is one AT_BINDING) — the language rule for plane
+    reads, see `_read_binding_name` — and it is ON by default: that IS the token stream of the
+    language now. It is safe as a default only because no consumer parses privately: every
+    reader of a binding's name as the WIRE it is connected to (the production compile seam,
+    the editor lint, the fused-chain splicer, the ROI walk, the lazy-input analysis, the test
+    harnesses) goes through `tex_cache.parse_and_split`, whose splitback puts every dotted
+    binding that is not a plane read back to the `ChannelAccess` swizzle the parser built
+    before planes — so the AST every consumer sees for an existing program is unchanged.
+    `dotted_bindings=False` is kept for a caller that wants the RAW pre-planes stream (a
+    token-level pin, a tool comparing the two generations); the flag documents the seam.
     """
 
-    def __init__(self, source: str, *, dotted_bindings: bool = False):
+    def __init__(self, source: str, *, dotted_bindings: bool = True):
         self.source = source
         self.pos = 0  # CT-2: the byte offset is the sole cursor (no line/col)
         self.tokens: list[Token] = []

@@ -1797,7 +1797,7 @@ def main():
     # engine profile, and the collision set is the 38 lowercase channel/swizzle names.
     from test_v037_planes_lexer import (
         test_dotted_at_binding_is_one_token,
-        test_default_lexer_is_unchanged,
+        test_default_is_greedy_and_the_splitback_restores_the_ast,
         test_the_production_seam_lexes_greedily,
         test_one_segment_rule,
         test_p_prefix_declares_a_planes_wire,
@@ -1810,7 +1810,7 @@ def main():
         test_tripwire_is_portable,
     )
     test_dotted_at_binding_is_one_token(r)
-    test_default_lexer_is_unchanged(r)
+    test_default_is_greedy_and_the_splitback_restores_the_ast(r)
     test_the_production_seam_lexes_greedily(r)
     test_one_segment_rule(r)
     test_p_prefix_declares_a_planes_wire(r)
@@ -1821,6 +1821,19 @@ def main():
     test_splitback_is_an_identity_on_the_cook(r)
     test_swizzle_sugar_stays_refused(r)
     test_tripwire_is_portable(r)
+
+    # DATA-6 (one front end): every consumer that reads a binding's name as the wire it is
+    # connected to parses through `tex_cache.parse_and_split`; these pin that they all agree
+    # on the wires a program reads, that a `p@` hint resolves to the same base everywhere, and
+    # that the sigil scan is greedy while the identity map keeps the dotted base.
+    from test_v037_frontend_parity import (
+        test_every_front_end_agrees_on_the_wires_a_program_reads,
+        test_hinted_plane_reads_resolve_the_same_base_everywhere,
+        test_sigil_names_is_greedy_and_the_wire_keyed_consumers_keep_the_base,
+    )
+    test_every_front_end_agrees_on_the_wires_a_program_reads(r)
+    test_hinted_plane_reads_resolve_the_same_base_everywhere(r)
+    test_sigil_names_is_greedy_and_the_wire_keyed_consumers_keep_the_base(r)
 
     success = r.summary()
     return 0 if success else 1

@@ -15,12 +15,16 @@ PLANES is a WIRE-ONLY type, added exactly as ARRAY was: inert in every expressio
 gated on the engine egress profile through the same switch, so under ComfyUI (the default) the
 plane row never fires and every dotted `@` means what it always meant.
 
-THE GREED IS OPT-IN (`Lexer(src, dotted_bindings=True)`), and only the production seam
-(`TEXCache.compile_tex`) opts in. Every other tokenizer in the tree — the lazy-input analysis,
-the ROI walk, the fused-chain splicer, the editor lint, the test harnesses — reads a binding's
-name as the wire it is connected to, and keeps the pre-planes token stream byte for byte until
-it is converged onto the seam deliberately. That default is pinned here; flipping it is a
-decision, not a side effect.
+THE GREED IS THE DEFAULT (`Lexer(src)` reads `@A.r` as one token), and it is safe as a default
+because there is ONE front end: every consumer that reads a binding's name as the wire it is
+connected to — the production seam (`TEXCache.compile_tex`), the editor lint, the fused-chain
+splicer, the ROI walk, the lazy-input analysis, the test harnesses — parses through
+`tex_cache.parse_and_split`, which lexes, parses and runs the splitback, so the AST each of
+them sees for an existing program is byte-for-byte the pre-planes one. That guarantee is
+pinned here one level up from the token stream: the DEFAULT stream is the greedy one, and the
+split-back AST is identical to the AST the raw `dotted_bindings=False` stream parses to. The
+flag is kept for a caller that wants the raw stream. `tests/test_v037_frontend_parity.py` pins
+that every consumer agrees on the wires a program reads.
 
 Every row runs on the CPU interpreter or on the compiler alone. No ComfyUI, no CUDA, no
 compiler toolchain, no Windows path, no embedded interpreter, no numpy — and no row asserts a
@@ -105,31 +109,84 @@ def test_dotted_at_binding_is_one_token(r: SubTestResult):
         r.fail("@A.rgb -> one token", str(e))
 
 
-def test_default_lexer_is_unchanged(r: SubTestResult):
-    print("\n--- DATA-6 L-B: without the flag the token stream is the pre-planes one ---")
-    cases = [
-        ("@beauty.diffuse", [(TokenType.AT_BINDING, "beauty"), (TokenType.DOT, "."),
-                             (TokenType.IDENT, "diffuse")]),
-        ("@A.rgb", [(TokenType.AT_BINDING, "A"), (TokenType.DOT, "."), (TokenType.IDENT, "rgb")]),
-        ("p@beauty.diffuse", [(TokenType.TYPED_AT_BINDING, "beauty"), (TokenType.DOT, "."),
-                              (TokenType.IDENT, "diffuse")]),
-        ("@a.b.c", [(TokenType.AT_BINDING, "a"), (TokenType.DOT, "."), (TokenType.IDENT, "b"),
-                    (TokenType.DOT, "."), (TokenType.IDENT, "c")]),
-    ]
-    for src, want in cases:
+def _ast_shape(node):
+    """A loc-insensitive structural dump (class name + every field but `loc`, recursively),
+    so two ASTs can be compared for IDENTITY without comparing SourceLoc objects."""
+    import dataclasses
+    if isinstance(node, list):
+        return [_ast_shape(x) for x in node]
+    if dataclasses.is_dataclass(node) and not isinstance(node, type):
+        return (type(node).__name__,
+                tuple((f.name, _ast_shape(getattr(node, f.name)))
+                      for f in dataclasses.fields(node) if f.name != "loc"))
+    return node
+
+
+def test_default_is_greedy_and_the_splitback_restores_the_ast(r: SubTestResult):
+    print("\n--- DATA-6: the DEFAULT stream is greedy; the split-back AST is the pre-planes one ---")
+    from TEX_Wrangle.tex_cache import parse_and_split
+    pre = {
+        "@beauty.diffuse": [(TokenType.AT_BINDING, "beauty"), (TokenType.DOT, "."),
+                            (TokenType.IDENT, "diffuse")],
+        "@A.rgb": [(TokenType.AT_BINDING, "A"), (TokenType.DOT, "."), (TokenType.IDENT, "rgb")],
+        "p@beauty.diffuse": [(TokenType.TYPED_AT_BINDING, "beauty"), (TokenType.DOT, "."),
+                             (TokenType.IDENT, "diffuse")],
+        "@a.b.c": [(TokenType.AT_BINDING, "a"), (TokenType.DOT, "."), (TokenType.IDENT, "b"),
+                   (TokenType.DOT, "."), (TokenType.IDENT, "c")],
+    }
+    greedy = {
+        "@beauty.diffuse": [(TokenType.AT_BINDING, "beauty.diffuse")],
+        "@A.rgb": [(TokenType.AT_BINDING, "A.rgb")],
+        "p@beauty.diffuse": [(TokenType.TYPED_AT_BINDING, "beauty.diffuse")],
+        "@a.b.c": [(TokenType.AT_BINDING, "a.b"), (TokenType.DOT, "."), (TokenType.IDENT, "c")],
+    }
+    for src in pre:
         try:
-            got = _toks(src, dotted_bindings=False)
-            assert got == want, f"{src!r}: {got}"
-            assert _toks(src, dotted_bindings=False) == \
-                [(t.type, t.value) for t in Lexer(src).tokenize()[:-1]]    # the DEFAULT
-            r.ok(f"default lexer: {src!r} -> pre-planes tokens")
+            default = [(t.type, t.value) for t in Lexer(src).tokenize()[:-1]]
+            assert default == greedy[src], f"{src!r}: default stream {default}"
+            assert default == _toks(src, dotted_bindings=True)
+            assert _toks(src, dotted_bindings=False) == pre[src], "the raw stream is kept"
+            r.ok(f"default lexer: {src!r} -> the greedy stream; dotted_bindings=False -> pre-planes")
         except Exception as e:
             r.fail(f"default lexer: {src!r}", str(e))
     try:
-        assert Lexer("x").dotted_bindings is False
-        r.ok("Lexer(...).dotted_bindings defaults to False")
+        assert Lexer("x").dotted_bindings is True
+        r.ok("Lexer(...).dotted_bindings defaults to True")
     except Exception as e:
-        r.fail("default is False", str(e))
+        r.fail("default is True", str(e))
+    # The guarantee, one level up: for every program with a dotted `@` — the inline shapes and
+    # every shipped example — the front end's AST is IDENTICAL (loc aside) to the AST the raw
+    # pre-planes stream parses to. This is what makes the default flip invisible.
+    programs = {
+        "swizzle read": "vec3 c = @image.rgb; float g = @image.g; @OUT = vec4(c, g);",
+        "swizzle write + compound": "@OUT.rgb = @A.rgb * 2.0; @OUT.a = 1.0; @OUT.r += 0.5;",
+        "nested + call": "float x = sin(clamp(@A.r * 2.0 - 1.0, -1.0, 1.0)); @OUT = vec4(x);",
+        "double dot on a vector base": "@OUT = vec4(@A.rgb.r);",
+        "typed prefix (never greedy)": "vec4 c = v@A.rgba; @OUT = c;",
+        "sample/fetch then swizzle": "@OUT = vec4(@A[ix, iy].rgb, @A(u, v).a);",
+    }
+    exdir = os.path.join(_ROOT, "examples")
+    for fn in sorted(os.listdir(exdir)):
+        if fn.endswith(".tex"):
+            with open(os.path.join(exdir, fn), encoding="utf-8") as f:
+                src = f.read()
+            if any(t.type in (TokenType.AT_BINDING, TokenType.TYPED_AT_BINDING) and "." in t.value
+                   for t in Lexer(src).tokenize()):
+                programs[f"examples/{fn}"] = src
+    n_examples = sum(1 for k in programs if k.startswith("examples/"))
+    for label, src in programs.items():
+        try:
+            raw = Parser(Lexer(src, dotted_bindings=False).tokenize(), source=src).parse()
+            split = parse_and_split(src, {})
+            assert _ast_shape(split) == _ast_shape(raw), label
+            r.ok(f"split-back AST == pre-planes AST: {label}")
+        except Exception as e:
+            r.fail(f"split-back AST == pre-planes AST: {label}", str(e))
+    try:
+        assert n_examples >= 12, n_examples      # the twelve dotted examples enter by derivation
+        r.ok(f"corpus derived from examples/: {n_examples} dotted programs")
+    except Exception as e:
+        r.fail("corpus derived from examples/", str(e))
 
 
 def test_the_production_seam_lexes_greedily(r: SubTestResult):

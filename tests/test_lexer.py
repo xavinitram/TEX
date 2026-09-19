@@ -14,14 +14,20 @@ def test_lexer(r: SubTestResult):
     except Exception as e:
         r.fail("basic tokens", str(e))
 
-    # @ binding
+    # @ binding — DATA-6: the lexer reads `@A.r` as ONE binding token, value verbatim (the
+    # splitback in `tex_cache.parse_and_split` puts a swizzle back from the binding types;
+    # the lexer never sees them). `dotted_bindings=False` still yields the pre-planes stream.
     try:
         tokens = Lexer("@A.r + @B").tokenize()
         types = [t.type for t in tokens[:-1]]
         assert TokenType.AT_BINDING in types
         binding_tokens = [t for t in tokens if t.type == TokenType.AT_BINDING]
-        assert binding_tokens[0].value == "A"
+        assert binding_tokens[0].value == "A.r", binding_tokens[0].value
         assert binding_tokens[1].value == "B"
+        assert TokenType.DOT not in types, types
+        raw = Lexer("@A.r + @B", dotted_bindings=False).tokenize()
+        assert [t.value for t in raw if t.type == TokenType.AT_BINDING] == ["A", "B"]
+        assert TokenType.DOT in [t.type for t in raw]
         r.ok("@ bindings")
     except Exception as e:
         r.fail("@ bindings", str(e))
