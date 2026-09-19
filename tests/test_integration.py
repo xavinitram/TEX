@@ -122,6 +122,16 @@ def _make_dummy_binding(tex_type, B=1, H=16, W=16, seed=42):
         return torch.rand(B, H, W, 3)
     if tex_type == TEXType.VEC4:
         return torch.rand(B, H, W, 4)
+    if tex_type == TEXType.PLANES:
+        # DATA-6: a deterministic three-plane wire, named for what a render actually emits.
+        # `Z` is uppercase on purpose — the design's finding is that the conventional EXR
+        # data-layer names do NOT collide with the lowercase swizzle set, and the corpus
+        # should prove it. Built UNEXPANDED, as a host hands it to the engine; the caller
+        # (`_prepare_example`) holds the engine profile, the only one a PLANES wire exists in.
+        from TEX_Wrangle.tex_marshalling import PlanesValue
+        return PlanesValue(planes={"diffuse": torch.rand(B, H, W, 3),
+                                   "specular": torch.rand(B, H, W, 3),
+                                   "Z": torch.rand(B, H, W, 1)}, descs={})
     # Fallback
     return torch.rand(B, H, W, 3)
 
@@ -167,7 +177,10 @@ def _collect_binding_hints(program) -> dict:
         node = stack.pop()
         if isinstance(node, BindingRef):
             if node.type_hint and node.kind == "wire":
-                hints[node.name] = BINDING_HINT_TYPES.get(node.type_hint, TEXType.VEC4)
+                # DATA-6: a PLANES hint (`p@beauty.diffuse`) declares the WIRE, which is the
+                # base of the dotted name — the hint is filed under `beauty`, never the plane.
+                nm = node.name.rsplit(".", 1)[0] if node.type_hint == "p" else node.name
+                hints[nm] = BINDING_HINT_TYPES.get(node.type_hint, TEXType.VEC4)
             continue
         # Detect .a channel access on a binding or sample(@binding, ...)
         if isinstance(node, ChannelAccess):
@@ -260,32 +273,63 @@ def _prepare_example(code, B, H, W):
     Returns (program, bindings, type_map, output_names) ready for execution.
     Raises on compile failure so the caller can catch and report.
     """
-    # Pass 1: front end (with NO binding types — the untyped-base row splits every dotted
-    # `@image.b` back to a swizzle of `image`, so the wire is discovered under its own name),
-    # collect type hints, type-check to discover bindings. Both passes go through
-    # `tex_cache.parse_and_split`, the production seam's front end, so the program the corpus
-    # freezes is the program the cook runs.
-    program = parse_and_split(code, {})
-    binding_hints, has_vec4_context = _collect_binding_hints(program)
+    from TEX_Wrangle.tex_compiler.lexer import Lexer
+    from TEX_Wrangle.tex_compiler.parser import Parser
+    from TEX_Wrangle.tex_compiler.types import array_wires_enabled, set_array_wires
+    from TEX_Wrangle.tex_marshalling import expand_plane_bindings, infer_binding_type
 
-    checker = TypeChecker(binding_types={}, source=code)
-    checker.check(program)
+    # DATA-6: a `p@beauty.<plane>` read declares the WIRE `beauty` PLANES. The hint is lexical,
+    # so it is read off the RAW parse, before any splitback. The dummy for such a wire is a
+    # PlanesValue built UNEXPANDED — the value a host hands the engine — and
+    # `expand_plane_bindings`, the seam `prepare()` calls, turns it into the per-plane rows
+    # (`beauty.diffuse: VEC3`, mentioned planes only) that both passes type against; a plane
+    # program cannot be discovered with `{}` because a PLANES base is not a value. A PLANES
+    # wire exists only on the engine profile, so the two passes run with plane wires ON when,
+    # and only when, a plane wire is declared; the bindings returned are ordinary tensors, so
+    # the cook needs no profile. A program without a `p@` hint takes exactly the path it always
+    # took (`plane_types` is `{}`).
+    raw = Parser(Lexer(code).tokenize(), source=code).parse()
+    plane_bases = sorted(n for n, t in _collect_binding_hints(raw)[0].items()
+                         if t == TEXType.PLANES)
+    plane_rows, plane_types = {}, {}
+    prev_profile = array_wires_enabled()
+    if plane_bases:
+        set_array_wires(True)
+    try:
+        if plane_bases:
+            planes = {b: _make_dummy_binding(TEXType.PLANES, B=B, H=H, W=W) for b in plane_bases}
+            plane_rows = expand_plane_bindings(planes, code)
+            plane_types = {n: infer_binding_type(v) for n, v in plane_rows.items()}
 
-    output_names = sorted(checker.assigned_bindings.keys())
-    param_names = set(checker.param_declarations.keys())
-    input_names = checker.referenced_bindings - set(output_names) - param_names
+        # Pass 1: front end (with NO binding types — the untyped-base row splits every dotted
+        # `@image.b` back to a swizzle of `image`, so the wire is discovered under its own name),
+        # collect type hints, type-check to discover bindings. Both passes go through
+        # `tex_cache.parse_and_split`, the production seam's front end, so the program the corpus
+        # freezes is the program the cook runs.
+        program = parse_and_split(code, plane_types)
+        binding_hints, has_vec4_context = _collect_binding_hints(program)
 
-    # Build binding_types from hints, default to VEC3 (or VEC4 if program uses vec4)
-    default_img_type = TEXType.VEC4 if has_vec4_context else TEXType.VEC3
-    binding_types = {}
-    for bname in input_names:
-        binding_types[bname] = binding_hints.get(bname, default_img_type)
+        checker = TypeChecker(binding_types=plane_types, source=code)
+        checker.check(program)
 
-    # Pass 2: Re-parse (type checker mutates AST), type-check with correct types
-    program = parse_and_split(code, binding_types)
-    checker = TypeChecker(binding_types=binding_types, source=code)
-    type_map = checker.check(program)
-    output_names = sorted(checker.assigned_bindings.keys())
+        output_names = sorted(checker.assigned_bindings.keys())
+        param_names = set(checker.param_declarations.keys())
+        input_names = (checker.referenced_bindings - set(output_names) - param_names
+                       - set(plane_rows))
+
+        # Build binding_types from hints, default to VEC3 (or VEC4 if program uses vec4)
+        default_img_type = TEXType.VEC4 if has_vec4_context else TEXType.VEC3
+        binding_types = dict(plane_types)
+        for bname in input_names:
+            binding_types[bname] = binding_hints.get(bname, default_img_type)
+
+        # Pass 2: Re-parse (type checker mutates AST), type-check with correct types
+        program = parse_and_split(code, binding_types)
+        checker = TypeChecker(binding_types=binding_types, source=code)
+        type_map = checker.check(program)
+        output_names = sorted(checker.assigned_bindings.keys())
+    finally:
+        set_array_wires(prev_profile)
 
     # Optimize
     program = optimize(program)
@@ -295,6 +339,7 @@ def _prepare_example(code, B, H, W):
     for bname in input_names:
         bt = binding_types.get(bname, default_img_type)
         bindings[bname] = _make_dummy_binding(bt, B=B, H=H, W=W)
+    bindings.update(plane_rows)
 
     for pname, pinfo in checker.param_declarations.items():
         if pname not in bindings:

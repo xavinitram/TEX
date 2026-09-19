@@ -1835,6 +1835,42 @@ def main():
     test_hinted_plane_reads_resolve_the_same_base_everywhere(r)
     test_sigil_names_is_greedy_and_the_wire_keyed_consumers_keep_the_base(r)
 
+    # DATA-6 (the wire): `PlanesValue`, demand-driven expansion at the engine seam, the
+    # CACHE-6 key arms, the W7009 / E3304 / E7005 / E6003 refusals, the DATA-1 fan-out, the
+    # fusion export refusal, the ComfyUI-profile invisibility and the deferred plane write.
+    from test_v037_planes_wire import (
+        test_a_planes_wire_expands_only_the_mentioned_planes,
+        test_boundary_key_moves_when_an_unread_plane_changes,
+        test_plane_cook_is_bit_exact_across_tiers,
+        test_pm10_laziness_an_unread_plane_is_never_marshalled,
+        test_undeclared_plane_is_w7009_with_a_did_you_mean,
+        test_collision_is_e3304_and_Z_does_not_collide,
+        test_unread_declared_plane_is_silent_and_w7002_stays_quiet,
+        test_raw_dict_stays_e7005_with_a_planesvalue_hint,
+        test_meta_fans_out_to_expanded_planes,
+        test_e6003_names_the_slot_for_a_plane_read,
+        test_fusion_refuses_a_dotted_export,
+        test_planes_are_invisible_under_the_comfy_profile,
+        test_plane_write_is_a_compile_error_naming_the_deferral,
+        test_harness_prepares_a_plane_program,
+        test_expansion_mutations,
+    )
+    test_a_planes_wire_expands_only_the_mentioned_planes(r)
+    test_boundary_key_moves_when_an_unread_plane_changes(r)
+    test_plane_cook_is_bit_exact_across_tiers(r)
+    test_pm10_laziness_an_unread_plane_is_never_marshalled(r)
+    test_undeclared_plane_is_w7009_with_a_did_you_mean(r)
+    test_collision_is_e3304_and_Z_does_not_collide(r)
+    test_unread_declared_plane_is_silent_and_w7002_stays_quiet(r)
+    test_raw_dict_stays_e7005_with_a_planesvalue_hint(r)
+    test_meta_fans_out_to_expanded_planes(r)
+    test_e6003_names_the_slot_for_a_plane_read(r)
+    test_fusion_refuses_a_dotted_export(r)
+    test_planes_are_invisible_under_the_comfy_profile(r)
+    test_plane_write_is_a_compile_error_naming_the_deferral(r)
+    test_harness_prepares_a_plane_program(r)
+    test_expansion_mutations(r)
+
     success = r.summary()
     return 0 if success else 1
 
