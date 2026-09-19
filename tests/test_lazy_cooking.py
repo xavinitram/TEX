@@ -136,6 +136,25 @@ def test_lazy_analysis(r: SubTestResult):
     except Exception as e:
         r.fail("dead VarDecl conservatively kept", str(e))
 
+    # Invariant 11 under the dotted-binding lexer (DATA-6): a wire whose ONLY reads are
+    # swizzles is still requested by its WIRE name. The lexer reads `@image.r` as one
+    # binding token, so a lazy set built from a private parse would hold `image.r` and never
+    # `image` — the host looks up `image`, the wire is skipped, and the cook fails E6003
+    # (loud, but invariant 11 says it must never ship). The analysis parses through the one
+    # front end, whose untyped-base row splits every dotted read back to its base.
+    try:
+        s = lazy_required_bindings(
+            "float g = @image.g; vec3 c = @image.rgb; @OUT = vec4(c * g, @image.a);", {})
+        assert "image" in s, s
+        assert not any("." in n for n in s), s
+        # ...and the same when the dotted read is the SECOND spatial wire (R1's shape-anchor
+        # fallback cannot mask it there — this is the under-approximating case).
+        s2 = lazy_required_bindings("@OUT = @A * 0.5 + vec4(@B.r);", {})
+        assert "A" in s2 and "B" in s2 and "B.r" not in s2, s2
+        r.ok("dotted-only reads request the BASE wire (invariant 11 under the greedy lexer)")
+    except Exception as e:
+        r.fail("dotted-only reads request the BASE wire", str(e))
+
     # Analysis failure -> None (caller keeps everything); memo is idempotent.
     try:
         assert lazy_required_bindings("this is not tex", {}) is None

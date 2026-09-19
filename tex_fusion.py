@@ -54,8 +54,6 @@ _MAX_FUSED_REGION_STAGES = 16
 
 logger = logging.getLogger("TEX.fusion")
 
-from .tex_compiler.lexer import Lexer
-from .tex_compiler.parser import Parser
 from .tex_compiler.type_checker import TypeChecker, TypeCheckError
 # ENG-4: the shared per-phase tuple + translator (compile_fused is the SECOND compile
 # implementation — it validates each stage directly, not through the cache). TEXMultiError is
@@ -383,8 +381,17 @@ def _transform(node, prefix, user_fns, wire_map, redirect_map, passthrough):
     return node
 
 
-def _parse(code: str) -> A.Program:
-    return Parser(Lexer(code).tokenize(), source=code).parse()
+def _parse(code: str, binding_types: dict) -> A.Program:
+    """One stage's source -> AST, through the one front end (`tex_cache.parse_and_split`).
+
+    DATA-6: the splitback runs HERE, against this stage's own (un-prefixed) binding types, so
+    every name `_transform` / `_out_target_binding` key on — `wire_map`, `redirect_map`,
+    `passthrough`, `assigned_bindings` — is the wire's BASE name: `@in.rgb` reads the wire
+    `in` and `@b.rgb = ...` writes the export `b`, exactly as they always did. Design §6
+    refuses PLANES edges in v1, so a fused stage never keeps a dotted binding: with the
+    per-stage map carrying no PLANES row, every dotted `@` here is a swizzle."""
+    from .tex_cache import parse_and_split
+    return parse_and_split(code, binding_types)
 
 
 def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
@@ -479,7 +486,7 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
         # TEX_DIAG the frontend parses. (A genuine FUSION problem — a missing @OUT, a bad wire — is
         # a FusionError, raised elsewhere; this is only the per-stage standalone compile.)
         try:
-            prog = _parse(st["code"])
+            prog = _parse(st["code"], bt)
             # Standalone type-check: validates the stage (good error attribution) and
             # gives each exported binding's concrete type for its handoff local.
             checker = TypeChecker(binding_types=bt, source=st["code"])

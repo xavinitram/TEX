@@ -48,8 +48,6 @@ import os
 from collections import OrderedDict
 from dataclasses import dataclass
 
-from .tex_compiler.lexer import Lexer
-from .tex_compiler.parser import Parser
 from .tex_compiler.ast_nodes import (
     BindingRef, NumberLiteral, ChannelAccess, FunctionCall, Assignment, Identifier,
     BindingIndexAccess, BindingSampleAccess, ArrayIndexAccess, VarDecl, FunctionDef,
@@ -585,8 +583,16 @@ def _has_ungrounded_halo(program) -> bool:
 def _fold_program(code: str, param_values: dict):
     """Parse + `$param`-fold, reusing tex_lazy's substitution and the optimizer's
     fold/propagate so halo radii resolve to literals. Returns the folded Program (fresh
-    parse — the analysis mutates its AST). Raises on a parse error (caller catches)."""
-    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    parse — the analysis mutates its AST). Raises on a parse error (caller catches).
+
+    DATA-6: through the one front end (`tex_cache.parse_and_split`) with NO binding types, on
+    purpose: `_walk`'s memo is keyed on the source, the param values and the string wires, so
+    the AST must be a function of the source alone. The untyped-base row splits every dotted
+    `@` back to a swizzle of its BASE wire, which is the name `reads` is keyed on and the name
+    the cook narrows; for a kept plane read that over-approximates benignly (the base is read,
+    whole)."""
+    from .tex_cache import parse_and_split
+    program = parse_and_split(code, {})
     subs = {
         name: NumberLiteral(value=_fp32(v), is_int=isinstance(v, (bool, int)))
         for name, v in param_values.items()
@@ -621,9 +627,17 @@ def _referenced_at_bindings(code: str) -> frozenset:
     ONE SCAN, shared: `tex_marshalling.sigil_names` does the tokenize for both this and ANIM-1's
     param-only set, memoized on the SOURCE. That matters here beyond tidiness — `_walk`'s memo
     is keyed on code + param VALUES, so before this an ROI param scrub re-tokenized the program
-    on every frame."""
+    on every frame.
+
+    DATA-6: `sigil_names` reports a dotted `@image.rgb` verbatim (per-plane demand is its
+    contract), so the BASE of every dotted name is added back here: `@OUT = mix(@A, @B.rgb, $k)`
+    with `k = 0` folds `@B.rgb` away, and the name that must reach `narrow` is `B` — the wire —
+    not `B.rgb`, which no bindings dict holds. Keeping the dotted name too costs nothing (a
+    name that is not a binding is never narrowed) and stays right for a plane read once the
+    wire lane expands the map."""
     from .tex_marshalling import sigil_names
-    return sigil_names(code)[0]
+    ats = sigil_names(code)[0]
+    return ats | frozenset(n.rsplit(".", 1)[0] for n in ats if "." in n)
 
 
 def _walk(code: str, param_values: dict, binding_types: dict | None = None):

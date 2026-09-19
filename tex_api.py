@@ -166,9 +166,10 @@ def check(source: str, binding_types: dict) -> list:
 
     Unlike `compile()`, which raises `TEXCompileError`, `check()` is total: it always
     returns a list, empty when the program is clean."""
-    from .tex_compiler.lexer import Lexer, LexerError
-    from .tex_compiler.parser import Parser, ParseError
-    from .tex_compiler.type_checker import TypeChecker
+    from .tex_cache import parse_and_split
+    from .tex_compiler.lexer import LexerError
+    from .tex_compiler.parser import ParseError
+    from .tex_compiler.type_checker import TypeChecker, TypeCheckError
     from .tex_compiler.diagnostics import make_diagnostic, TEXMultiError
 
     # LANG-3: a program targeting a NEWER language than we implement gets an up-front
@@ -184,15 +185,18 @@ def check(source: str, binding_types: dict) -> list:
             loc=None, source=source, phase="compile", severity="warning"))
 
     try:
+        # DATA-6: the one front end (`tex_cache.parse_and_split`) — lex, parse and resolve
+        # every dotted `@name.seg` against `binding_types` — so the lint reads a swizzle's BASE
+        # as the wire, exactly as the cook does. A private lexer here would report `@image.g`
+        # as an unconnected vec4 binding (a false E3200) and `image` as never used (a false
+        # W7002). The splitback's own refusals (E2000 / E2002, the swizzle sugar) are
+        # TypeCheckErrors raised BEFORE the checker and are returned as the single fatal
+        # diagnostic a parse error would be.
         try:
-            tokens = Lexer(source).tokenize()
-        except LexerError as e:
-            return pragma_diags + [_diag_from_exc(e, source)]
-        try:
-            program = Parser(tokens, source=source).parse()
+            program = parse_and_split(source, binding_types)
         except TEXMultiError as e:
             return pragma_diags + list(e.diagnostics)
-        except ParseError as e:
+        except (LexerError, ParseError, TypeCheckError) as e:
             return pragma_diags + [_diag_from_exc(e, source)]
         errors, warnings = TypeChecker(
             binding_types=binding_types, source=source).check_collect(program)
@@ -315,9 +319,10 @@ def control_flow_advisories(source: str, binding_types: dict) -> list:
     no cook, no side effects — and total: a program that does not parse, or that the
     analysis cannot finish within its work budget, returns []."""
     try:
-        from .tex_compiler.lexer import Lexer
-        from .tex_compiler.parser import Parser
-        program = Parser(Lexer(source).tokenize(), source=source).parse()
+        # DATA-6: through the one front end, so a swizzled wire is seen by its BASE name —
+        # the name `binding_types` (and `string_wires` below) key on.
+        from .tex_cache import parse_and_split
+        program = parse_and_split(source, binding_types)
     except Exception:
         return []
     try:

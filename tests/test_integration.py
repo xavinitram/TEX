@@ -1,5 +1,6 @@
 """Integration tests — examples, cache, device, inference, batching, latent, matrices."""
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 
 
 def test_examples(r: SubTestResult):
@@ -259,8 +260,12 @@ def _prepare_example(code, B, H, W):
     Returns (program, bindings, type_map, output_names) ready for execution.
     Raises on compile failure so the caller can catch and report.
     """
-    # Pass 1: Parse, collect type hints, type-check to discover bindings
-    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    # Pass 1: front end (with NO binding types — the untyped-base row splits every dotted
+    # `@image.b` back to a swizzle of `image`, so the wire is discovered under its own name),
+    # collect type hints, type-check to discover bindings. Both passes go through
+    # `tex_cache.parse_and_split`, the production seam's front end, so the program the corpus
+    # freezes is the program the cook runs.
+    program = parse_and_split(code, {})
     binding_hints, has_vec4_context = _collect_binding_hints(program)
 
     checker = TypeChecker(binding_types={}, source=code)
@@ -277,7 +282,7 @@ def _prepare_example(code, B, H, W):
         binding_types[bname] = binding_hints.get(bname, default_img_type)
 
     # Pass 2: Re-parse (type checker mutates AST), type-check with correct types
-    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    program = parse_and_split(code, binding_types)
     checker = TypeChecker(binding_types=binding_types, source=code)
     type_map = checker.check(program)
     output_names = sorted(checker.assigned_bindings.keys())
@@ -1028,9 +1033,8 @@ def test_batch_temporal(r: SubTestResult):
     # Test 14: fi and fn recognized as FLOAT
     try:
         code = "@OUT = vec4(fi, fn, 0.0, 1.0);"
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
         bt = {"A": TEXType.VEC4, "OUT": TEXType.VEC4}
+        program = parse_and_split(code, bt)
         checker = TypeChecker(binding_types=bt)
         checker.check(program)
         # No error = fi and fn are valid FLOAT builtins
@@ -1041,9 +1045,8 @@ def test_batch_temporal(r: SubTestResult):
     # Test 15: fetch_frame and sample_frame accept 4 args, return VEC4
     try:
         code = "vec4 a = fetch_frame(@A, 0, ix, iy); vec4 b = sample_frame(@A, 0, u, v); @OUT = a + b;"
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
         bt = {"A": TEXType.VEC4, "OUT": TEXType.VEC4}
+        program = parse_and_split(code, bt)
         checker = TypeChecker(binding_types=bt)
         checker.check(program)
         r.ok("fetch_frame/sample_frame type-check OK (4 args, VEC4 return)")
@@ -1333,8 +1336,7 @@ def test_auto_inference(r: SubTestResult):
     try:
         binding_types = {"A": TEXType.VEC4}
         checker = TypeChecker(binding_types=binding_types)
-        tokens = Lexer("@OUT.r = @A.r; @OUT.g = @A.g; @OUT.b = @A.b;").tokenize()
-        program = Parser(tokens).parse()
+        program = parse_and_split("@OUT.r = @A.r; @OUT.g = @A.g; @OUT.b = @A.b;", binding_types)
         checker.check(program)
         assert checker.inferred_out_type == TEXType.VEC3, f"Expected VEC3, got {checker.inferred_out_type}"
         r.ok("auto: channel-only -> VEC3")
@@ -1367,8 +1369,7 @@ def test_auto_inference(r: SubTestResult):
     try:
         binding_types = {"A": TEXType.VEC4}
         checker = TypeChecker(binding_types=binding_types)
-        tokens = Lexer('if (luma(@A) > 0.5) { @OUT = "yes"; } else { @OUT = vec3(0.0, 0.0, 1.0); }').tokenize()
-        program = Parser(tokens).parse()
+        program = parse_and_split('if (luma(@A) > 0.5) { @OUT = "yes"; } else { @OUT = vec3(0.0, 0.0, 1.0); }', binding_types)
         try:
             checker.check(program)
             r.fail("auto: string/numeric conflict", "Expected TypeCheckError")
@@ -1507,9 +1508,8 @@ def test_v03_features(r: SubTestResult):
     # ── Type checker: multi-output ──
     try:
         code = "@result = @A * 0.5;\n@mask = luma(@A);"
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
         img = torch.rand(1, 4, 4, 3)
+        program = parse_and_split(code, {"A": TEXType.VEC3})
         checker = TypeChecker(binding_types={"A": TEXType.VEC3})
         checker.check(program)
         assert "result" in checker.assigned_bindings, "Missing 'result' in assigned_bindings"
@@ -1523,8 +1523,7 @@ def test_v03_features(r: SubTestResult):
     # ── Type checker: output type inference ──
     try:
         code = "@OUT = luma(@A);"
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
+        program = parse_and_split(code, {"A": TEXType.VEC3})
         checker = TypeChecker(binding_types={"A": TEXType.VEC3})
         checker.check(program)
         assert checker.assigned_bindings["OUT"] == TEXType.FLOAT
@@ -1537,8 +1536,7 @@ def test_v03_features(r: SubTestResult):
     # ── Type checker: param declaration ──
     try:
         code = "f$strength = 0.5;\n@OUT = @A * $strength;"
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
+        program = parse_and_split(code, {"A": TEXType.VEC3, "strength": TEXType.FLOAT})
         checker = TypeChecker(binding_types={"A": TEXType.VEC3, "strength": TEXType.FLOAT})
         checker.check(program)
         assert "strength" in checker.param_declarations
@@ -1550,8 +1548,7 @@ def test_v03_features(r: SubTestResult):
     # ── Type checker: param type mismatch ──
     try:
         code = 'f$x = "hello";'
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
+        program = parse_and_split(code, {})
         checker = TypeChecker(binding_types={})
         try:
             checker.check(program)
@@ -1564,9 +1561,8 @@ def test_v03_features(r: SubTestResult):
     # ── Interpreter: multi-output ──
     try:
         code = "@result = @A * 0.5;\n@mask = luma(@A);"
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
         img = torch.rand(1, 4, 4, 3)
+        program = parse_and_split(code, {"A": TEXType.VEC3})
         checker = TypeChecker(binding_types={"A": TEXType.VEC3})
         type_map = checker.check(program)
         interp = Interpreter()
@@ -1584,9 +1580,8 @@ def test_v03_features(r: SubTestResult):
     # ── Interpreter: param as binding ──
     try:
         code = "f$strength = 0.5;\n@OUT = @A * $strength;"
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
         img = torch.ones(1, 2, 2, 3)
+        program = parse_and_split(code, {"A": TEXType.VEC3, "strength": TEXType.FLOAT})
         checker = TypeChecker(binding_types={"A": TEXType.VEC3, "strength": TEXType.FLOAT})
         type_map = checker.check(program)
         interp = Interpreter()
@@ -2130,8 +2125,7 @@ mat3 prod = m * inv;
     # 17. vec3 * mat3 -> type error
     try:
         code = "@OUT = @A.rgb * mat3(1.0);"
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
+        program = parse_and_split(code, {"A": TEXType.VEC4, "OUT": TEXType.VEC3})
         tc = TypeChecker(binding_types={"A": TEXType.VEC4, "OUT": TEXType.VEC3})
         tc.check(program)
         r.fail("vec * mat type error", "Expected TypeCheckError")
@@ -2144,8 +2138,7 @@ mat3 prod = m * inv;
     # 18. mat3 channel access -> type error
     try:
         code = "mat3 m = mat3(1.0); float x = m.r; @OUT = vec4(x);"
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
+        program = parse_and_split(code, {"OUT": TEXType.VEC4})
         tc = TypeChecker(binding_types={"OUT": TEXType.VEC4})
         tc.check(program)
         r.fail("mat3 channel access error", "Expected TypeCheckError")
@@ -2157,8 +2150,7 @@ mat3 prod = m * inv;
     # 19. mat3 as @OUT -> type error
     try:
         code = "mat3 m = mat3(1.0); @OUT = m;"
-        tokens = Lexer(code).tokenize()
-        program = Parser(tokens).parse()
+        program = parse_and_split(code, {"A": TEXType.VEC4, "OUT": TEXType.VEC4})
         tc = TypeChecker(binding_types={"A": TEXType.VEC4, "OUT": TEXType.VEC4})
         tc.check(program)
         r.fail("mat3 as @OUT error", "Expected TypeCheckError")
@@ -3204,9 +3196,9 @@ def test_fusion_memo(r: SubTestResult):
     calls = {"n": 0}
     orig_parse = tex_fusion._parse
 
-    def counting_parse(code):
+    def counting_parse(code, binding_types):
         calls["n"] += 1
-        return orig_parse(code)
+        return orig_parse(code, binding_types)
 
     # Repeat execution of the same chain must not re-parse/re-check.
     try:

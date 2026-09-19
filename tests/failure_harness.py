@@ -28,6 +28,7 @@ Every helper reports into the standard SubTestResult and reuses helpers.py, so
 these compose with the existing runner (run_all.py) and pytest unchanged.
 """
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime.compiled import _codegen_only_execute
 
 
@@ -41,9 +42,13 @@ class TierUnavailable(Exception):
 
 # ── shared compile + binding utilities ────────────────────────────────
 def compile_program(code, bindings):
-    """Lex → parse → type-check. Returns (program, type_map, output_names)."""
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
+    """Front end → type-check. Returns (program, type_map, output_names).
+
+    The front end is `tex_cache.parse_and_split` — the production seam's own lex + parse +
+    dotted-binding splitback — so every tier this harness drives sees the AST the cook sees
+    (a swizzle names its BASE wire), never a private lexer's reading of it."""
     bt = {n: _infer_binding_type(v) for n, v in bindings.items()}
+    prog = parse_and_split(code, bt)
     checker = TypeChecker(binding_types=bt, source=code)
     tm = checker.check(prog)
     outs = sorted(checker.assigned_bindings.keys())

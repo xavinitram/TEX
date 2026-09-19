@@ -179,6 +179,34 @@ def splitback_dotted_bindings(program, binding_types: dict, *, source: str = "")
     return _DottedBindingSplitback(binding_types, source).visit(program)
 
 
+def parse_and_split(source: str, binding_types: dict | None = None):
+    """DATA-6: THE front end — `source` -> `Program` with every dotted binding resolved.
+
+    Lexes (the lexer reads `@name.seg` as ONE binding token — the language rule since planes),
+    parses, and runs `splitback_dotted_bindings` against `binding_types`, so the returned AST
+    names a swizzle's BASE wire exactly as the parser did before planes existed. A caller that
+    has no binding types passes `{}` (or nothing): the untyped-base row then splits every
+    dotted binding back, which is the pre-planes AST for every program written before planes.
+
+    ONE OWNER, deliberately. Every consumer that reads a binding's name as the wire it is
+    connected to — the production seam (`TEXCache.compile_tex`), the editor lint
+    (`tex_api.check`), the fused-chain splicer (`tex_fusion`), the ROI walk (`tex_roi`), the
+    lazy-input analysis (`tex_lazy`), and the test harnesses — parses through THIS function.
+    A private `Lexer(...)` / `Parser(...)` pair in a consumer would read `image.r` where the
+    cook reads `image`, and the drift would be silent on every program without a dot; the
+    front-end parity test (`tests/test_v037_frontend_parity.py`) pins that they all agree.
+
+    Raises `LexerError` / `ParseError` (or `TEXMultiError`) from the phase that found the
+    problem, and `TypeCheckError` (E2000 / E2002) for the swizzle sugar the splitback refuses.
+    """
+    # The flag is spelled even though it is the lexer's default: this is the one place the
+    # greed is REQUIRED (the splitback below is what makes it safe), and it keeps the seam
+    # independent of the default should a caller ever want the raw pre-planes stream.
+    tokens = Lexer(source, dotted_bindings=True).tokenize()
+    program = Parser(tokens, source=source).parse()
+    return splitback_dotted_bindings(program, binding_types or {}, source=source)
+
+
 def _hash_files(files, *extra: bytes) -> str:
     """SHA-256 (16 hex) over a set of source files (missing → hash the name) plus any extra
     byte fragments. The building block of every epoch and the mono-hash tripwire."""
@@ -416,13 +444,13 @@ class TEXCache:
         if cached is not None:
             return cached
 
-        # Full compilation pipeline: lex + parse, then the shared post-parse
-        # orchestration (STR-8: identical to the fusion path's).
-        # DATA-6: THIS is the seam that reads `@name.seg` as one binding — `compile_ast`
-        # below owns the splitback that resolves it against the binding types. Every other
-        # tokenizer in the tree keeps the pre-planes stream until it is converged here.
-        tokens = Lexer(code, dotted_bindings=True).tokenize()
-        program = Parser(tokens, source=code).parse()
+        # Full compilation pipeline: the one front end (lex + parse + splitback), then the
+        # shared post-parse orchestration (STR-8: identical to the fusion path's).
+        # DATA-6: the AST arriving at `compile_ast` is already split against THIS map; the
+        # splitback there is an identity on it (a kept plane read is kept again, a swizzle
+        # has no dot left to split) and is the hook the expansion step will re-read once it
+        # adds per-plane rows.
+        program = parse_and_split(code, binding_types)
         program, type_map, referenced, assigned, params, used_builtins = \
             self.compile_ast(program, binding_types, source=code)
 

@@ -45,8 +45,6 @@ import hashlib
 import struct
 from collections import OrderedDict
 
-from .tex_compiler.lexer import Lexer
-from .tex_compiler.parser import Parser
 from .tex_compiler.ast_nodes import (
     ASTNode, BindingRef, NumberLiteral, IfElse, WhileLoop, ForLoop,
     FunctionDef, iter_child_nodes,
@@ -179,7 +177,15 @@ def lazy_required_bindings(code: str,
     try:
         # Fresh parse: the analysis mutates its AST, and no type info is
         # needed (references are syntactic).
-        program = Parser(Lexer(code).tokenize(), source=code).parse()
+        # DATA-6, invariant 11: through the one front end with NO binding types, so every
+        # dotted `@image.r` is split back to a swizzle of its BASE wire before the set is
+        # collected. A program whose only reads of a wire are dotted must still REQUEST that
+        # wire — a set holding `image.r` where the host looks up `image` would under-
+        # approximate (the wire skipped, the cook loud-failing E6003), and R1 only masks it
+        # when the wire happens to be the first spatial one. Splitting everything is the
+        # over-approximating side: a kept plane read would resolve to its base wire, whole.
+        from .tex_cache import parse_and_split
+        program = parse_and_split(code, {})
         subs = {
             name: NumberLiteral(value=_fp32(v), is_int=isinstance(v, (bool, int)))
             for name, v in param_values.items()

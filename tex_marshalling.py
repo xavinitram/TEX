@@ -620,7 +620,12 @@ def sigil_names(code: str) -> tuple:
         try:
             from .tex_compiler.lexer import Lexer, TokenType
             a, d = set(), set()
-            for tok in Lexer(code).tokenize():
+            # DATA-6: lexed with the dotted-binding greed (the flag is spelled because it is
+            # this scan's CONTRACT, not an accident of the default): `@beauty.diffuse` is
+            # reported verbatim, which IS the per-plane demand set the wire lane expands from,
+            # with no second scan. The two consumers that key on the WIRE add the dotted
+            # bases back themselves (`param_only_names`, `tex_roi._referenced_at_bindings`).
+            for tok in Lexer(code, dotted_bindings=True).tokenize():
                 if tok.type in (TokenType.AT_BINDING, TokenType.TYPED_AT_BINDING):
                     a.add(tok.value)
                 elif tok.type in (TokenType.DOLLAR_BINDING, TokenType.TYPED_DOLLAR_BINDING):
@@ -651,9 +656,15 @@ def param_only_names(code: str) -> frozenset:
     binding was int/float/bool/list, which re-admitted the very failure mode it was avoiding:
     `$k` sent as `"2.0"` (string) on one cook and `2.0` on the next has the same binding NAMES,
     so the gate flipped and the string-typed params entered and left the key between cooks. The
-    memo is the performance story — one tokenize per unique source, a dict hit thereafter."""
+    memo is the performance story — one tokenize per unique source, a dict hit thereafter.
+
+    DATA-6: `sigil_names` reports a dotted `@` verbatim, so the BASE of every dotted name is
+    added to the subtracted set — `$beauty` beside `@beauty.x` uses `beauty` both ways, and
+    dropping it from the identity map would let a real wire's type stop identifying the
+    program (the exact failure the subtraction exists to prevent)."""
     ats, dollars = sigil_names(code)
-    return dollars - ats
+    bases = frozenset(n.rsplit(".", 1)[0] for n in ats if "." in n)
+    return dollars - ats - bases
 
 
 def identity_binding_types(code: str, bindings: dict) -> dict:

@@ -99,15 +99,16 @@ def test_v035_cf6_the_grid_is_a_consensus_not_first_wins(r):
         # codegen derivation was never reached and mutating it back to first-wins left this
         # test green — a decorative pin on exactly the defect it was written for. Asking the
         # builder for its spatial shape is unambiguous and cannot be routed away from.
-        from TEX_Wrangle.tex_compiler.lexer import Lexer
-        from TEX_Wrangle.tex_compiler.parser import Parser
+        from TEX_Wrangle.tex_cache import parse_and_split
         from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
         from TEX_Wrangle.tex_compiler.types import TEXType
         from TEX_Wrangle.tex_runtime.compiled import _build_codegen_env
+        # The read set the consensus keys on (`_collect_binding_reads`) is built from THIS
+        # AST, so it is built through the one front end: `@A.rgb` must name the wire `A`.
         mixed = "@OUT = vec4(vec3(v) * @A.rgb + @S.rgb, 1.0);"
-        prog = Parser(Lexer(mixed).tokenize()).parse()
-        TypeChecker(binding_types={"S": TEXType.VEC4, "A": TEXType.VEC4,
-                                   "OUT": TEXType.VEC4}).check(prog)
+        bt = {"S": TEXType.VEC4, "A": TEXType.VEC4, "OUT": TEXType.VEC4}
+        prog = parse_and_split(mixed, bt)
+        TypeChecker(binding_types=bt).check(prog)
         _env, sp, _used = _build_codegen_env(prog, {"S": strip, "A": frame},
                                              torch.device("cpu"), 0)
         assert sp == (1, 16, 16), f"codegen derived {sp}, not the consensus (1, 16, 16)"
@@ -216,15 +217,14 @@ def test_v035_cf6_the_roi_grid_uses_the_same_participants(r):
     is still decided by the bindings — and it is decided by the same participants."""
     import torch
     from TEX_Wrangle.tex_runtime.interpreter import _consensus_extent
-    from TEX_Wrangle.tex_compiler.lexer import Lexer
-    from TEX_Wrangle.tex_compiler.parser import Parser
+    from TEX_Wrangle.tex_cache import parse_and_split
     from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
     from TEX_Wrangle.tex_compiler.types import TEXType
     try:
         code = "@OUT = vec4(@A.rgb, 1.0);"          # @B is wired and never read
-        prog = Parser(Lexer(code).tokenize()).parse()
-        TypeChecker(binding_types={"A": TEXType.VEC4, "B": TEXType.VEC4,
-                                   "OUT": TEXType.VEC4}).check(prog)
+        bt = {"A": TEXType.VEC4, "B": TEXType.VEC4, "OUT": TEXType.VEC4}
+        prog = parse_and_split(code, bt)           # the participants are read off this AST
+        TypeChecker(binding_types=bt).check(prog)
         b = {"A": torch.rand(1, 32, 32, 4), "B": torch.rand(8, 32, 32, 4)}
         whole = _consensus_extent(b, prog)
         window = _consensus_extent(b, prog, roi=(0, 0, 8, 8, 32, 32))
@@ -253,17 +253,16 @@ def test_v035_cf6_the_peak_estimate_describes_the_grid_the_cook_uses(r):
     memory pressure."""
     import torch
     from TEX_Wrangle import tex_engine, tex_memory
-    from TEX_Wrangle.tex_compiler.lexer import Lexer
-    from TEX_Wrangle.tex_compiler.parser import Parser
+    from TEX_Wrangle.tex_cache import parse_and_split
     from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
     from TEX_Wrangle.tex_compiler.types import TEXType
     seen = []
     real = tex_memory.estimate_peak_bytes
     try:
         code = "@OUT = vec4(@S.rgb + @A.rgb, 1.0);"
-        prog = Parser(Lexer(code).tokenize()).parse()
-        TypeChecker(binding_types={"S": TEXType.VEC4, "A": TEXType.VEC4,
-                                   "OUT": TEXType.VEC4}).check(prog)
+        bt = {"S": TEXType.VEC4, "A": TEXType.VEC4, "OUT": TEXType.VEC4}
+        prog = parse_and_split(code, bt)
+        TypeChecker(binding_types=bt).check(prog)
         bindings = {"S": torch.rand(1, 1, 64, 4), "A": torch.rand(1, 64, 64, 4)}
 
         def spy(program, spatial, dtype_bytes, fingerprint=None, *a, **k):
@@ -678,17 +677,16 @@ def test_brief9_t3_uniform_output_survives_tiled_batch_roi_assemblers(r):
     deciding to tile at all — so a silent whole-frame fallback (which would make this test
     pass without ever exercising a strip) is caught here rather than trusted."""
     import torch
-    from TEX_Wrangle.tex_compiler.lexer import Lexer
-    from TEX_Wrangle.tex_compiler.parser import Parser
+    from TEX_Wrangle.tex_cache import parse_and_split
     from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
     from TEX_Wrangle.tex_compiler.types import TEXType
     from TEX_Wrangle.tex_runtime.interpreter import Interpreter
     from TEX_Wrangle import tex_memory
     try:
         def _build():
-            prog = Parser(Lexer(_U_CODE).tokenize()).parse()
-            checker = TypeChecker(binding_types={"A": TEXType.VEC4, "cx": TEXType.FLOAT,
-                                                 "OUT": TEXType.VEC4})
+            bt = {"A": TEXType.VEC4, "cx": TEXType.FLOAT, "OUT": TEXType.VEC4}
+            prog = parse_and_split(_U_CODE, bt)
+            checker = TypeChecker(binding_types=bt)
             tm = checker.check(prog)
             outs = sorted(checker.assigned_bindings.keys())
             return prog, tm, outs
