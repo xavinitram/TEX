@@ -186,6 +186,10 @@ Type checker. See the message shown with the code for the specific cause and fix
 
 Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
 
+### E3304
+
+Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
+
 ### E3400
 
 Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
@@ -383,5 +387,9 @@ Warnings. See the message shown with the code for the specific cause and fix; th
 Warnings. See the message shown with the code for the specific cause and fix; the class is described above.
 
 ### W7008
+
+Warnings. See the message shown with the code for the specific cause and fix; the class is described above.
+
+### W7009
 
 Warnings. See the message shown with the code for the specific cause and fix; the class is described above.

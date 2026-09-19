@@ -18,7 +18,9 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .tex_compiler.types import TEXType, set_array_wires, array_wires_enabled, _VEC_SIZE_TYPE
+from .tex_compiler.types import (TEXType, set_array_wires, array_wires_enabled,
+                                 planes_wires_enabled, _VEC_SIZE_TYPE, CHANNEL_MAP,
+                                 VALID_SWIZZLES)
 from .tex_runtime.stdlib import LUMA_R, LUMA_G, LUMA_B
 
 logger = logging.getLogger("TEX")
@@ -467,6 +469,177 @@ def resolve_promise_bindings(bindings: dict) -> dict:
     return out
 
 
+# ── DATA-6: the PLANES wire value, and its demand-driven expansion ───────────
+#
+# A host wires ONE input carrying many named planes — an EXR's `diffuse`/`specular`/`Z`, a
+# render's AOVs — and a program reads them by name (`@beauty.diffuse`). The wire value is the
+# class below; the expansion turns it into ordinary per-plane tensor bindings at the ONE seam
+# the Promise precedent already uses (`tex_engine.prepare`, beside `resolve_promise_bindings`),
+# so no tier, no emitter and no cache ever learns what a plane is.
+#
+# PLANES is gated on the engine egress profile exactly as ARRAY is (`planes_wires_enabled`
+# reads the same switch `set_egress_profile` flips): under the ComfyUI profile no PlanesValue
+# can be constructed, `infer_binding_type` never returns PLANES, and `expand_plane_bindings`
+# returns every existing program's bindings untouched.
+
+class PlanesValue:
+    """A binding value carrying NAMED PLANES: `{name: tensor [B,H,W,C<=4]}` plus an optional
+    per-plane `descs` map (`{name: BufferDesc}` — the file's storage/transfer hint, DATA-2).
+
+        pv = PlanesValue({"diffuse": d, "specular": s, "Z": z})
+        res = tex_engine.cook("@OUT = vec4(@beauty.diffuse * @beauty.Z, 1.0);", {"beauty": pv})
+
+    Deliberately NOT a tensor subclass: a subclass would be silently accepted by every
+    `isinstance(v, torch.Tensor)` test in the tree — the cook-grid derivation included — and
+    would size a cook off whichever plane happened to be first. A distinct class fails loudly
+    instead, and every consumer that must know it uses `v.__class__ is PlanesValue` (the
+    Promise idiom, so a subclass cannot count here and miss elsewhere).
+
+    The DECLARED plane set is `planes.keys()`. It is what lets the expansion tell a typo
+    (`@beauty.diffues`, W7009 with a did-you-mean) from a plane the program simply does not
+    read (silent — an unread AOV must never draw a warning, or a 12-AOV file draws eleven).
+    """
+
+    __slots__ = ("planes", "descs")
+
+    def __init__(self, planes: dict, descs: dict | None = None):
+        if not planes_wires_enabled():
+            raise ValueError(
+                "a PlanesValue needs the engine egress profile: call "
+                "tex_marshalling.set_egress_profile('engine') first. The ComfyUI profile "
+                "carries no PLANES wire, exactly as it carries no ARRAY wire.")
+        if not isinstance(planes, dict) or not planes:
+            raise ValueError("PlanesValue needs a non-empty {name: tensor} dict of planes.")
+        for name, t in planes.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"plane names must be non-empty strings, got {name!r}.")
+            if not isinstance(t, torch.Tensor) or t.dim() != 4 or not 1 <= t.shape[-1] <= 4:
+                raise ValueError(
+                    f"plane {name!r} must be a [B,H,W,C<=4] tensor, got "
+                    f"{tuple(t.shape) if isinstance(t, torch.Tensor) else type(t).__name__}.")
+        self.planes = dict(planes)
+        self.descs = dict(descs) if descs else {}
+
+    def __repr__(self) -> str:
+        return "PlanesValue({" + ", ".join(
+            f"{n!r}: {tuple(t.shape)}" for n, t in self.planes.items()) + "})"
+
+
+# The names a plane may NOT take: `@src.rgb` could mean the plane called `rgb` or the rgb of
+# something, and once a plane can itself be swizzled (`@beauty.diffuse.rgb`) the ambiguity is
+# real. Refused at expansion, never guessed. Lowercase-only, so the conventional uppercase EXR
+# data-layer names (`Z`, `N`, `RGBA`) never collide.
+_PLANE_COLLISION = frozenset(CHANNEL_MAP) | frozenset(VALID_SWIZZLES)
+
+
+def _plane_demand(code: str, base: str) -> list:
+    """The planes of `base` the SOURCE mentions, from the lexed sigil scan (a comment or a
+    string literal cannot spoof one): `@beauty.diffuse` -> `diffuse`. Sorted for determinism."""
+    prefix = base + "."
+    return sorted(n[len(prefix):] for n in sigil_names(code)[0] if n.startswith(prefix))
+
+
+def expand_plane_bindings(bindings: dict, code: str, *, on_warning=None) -> dict:
+    """Replace every `PlanesValue` binding `base` with per-plane tensor bindings — ONLY for the
+    planes `code` mentions — under the VERBATIM dotted name (`beauty.diffuse`). Returns the same
+    dict object, allocating nothing, when no PlanesValue is present (invariant #7: one
+    `__class__ is` check per binding inside an `any()`).
+
+    DEMAND-DRIVEN, and that is the laziness proof: an unmentioned plane never enters the
+    returned dict, so the interpreter's ingest loop — which marshals exactly what is in the
+    dict — never touches it, never moves it to the device, never casts it. The `base` row is
+    REMOVED (the type map the caller derives then names only the mentioned planes, which is
+    what keeps W7002 silent on an unread plane).
+
+    Refusals, in order, per wire:
+      * a declared plane whose name is a channel or swizzle name (`rgb`, `z`, ...) — E3304,
+        "rename the plane" — even when the program never reads it, because the ambiguity is a
+        property of the wire, not of one program;
+      * a mentioned plane the wire does not declare — a W7009 advisory with a did-you-mean over
+        the declared set (delivered to `on_warning(diagnostic)` when given, else logged), then
+        E6003 naming the slot and the plane, because no cook can satisfy that read.
+
+    Under the ComfyUI profile a PlanesValue cannot exist, so this returns `bindings` untouched
+    for every program a ComfyUI user can write.
+    """
+    if not planes_wires_enabled() or \
+            not any(v.__class__ is PlanesValue for v in bindings.values()):
+        return bindings
+    from .tex_runtime.interpreter import InterpreterError
+    from .tex_compiler.diagnostics import make_diagnostic, suggest_similar
+    out = dict(bindings)
+    for base, v in bindings.items():
+        if v.__class__ is not PlanesValue:
+            continue
+        del out[base]
+        declared = v.planes
+        for pname in declared:
+            if pname in _PLANE_COLLISION:
+                raise InterpreterError(
+                    f"plane `{pname}` on `@{base}` collides with the swizzle `.{pname}` — "
+                    f"rename the plane.", None, code="E3304",
+                    hint="A plane may not be named after a channel or swizzle (r g b a x y z w "
+                         "and their combinations, lowercase). The conventional uppercase EXR "
+                         "names — Z, N, RGBA — never collide.")
+        for pname in _plane_demand(code, base):
+            if pname in declared:
+                t = declared[pname]
+                # A 1-channel plane (`Z`, a matte) is handed over in the [B,H,W] MASK shape —
+                # the FLOAT-binding convention every consumer expects (`vec4(rgb, @beauty.Z)`
+                # composes; a [B,H,W,1] FLOAT binding does not, at head, in a constructor). A
+                # view: same storage, nothing allocated, so the laziness spy sees one pointer.
+                out[f"{base}.{pname}"] = t.squeeze(-1) if t.shape[-1] == 1 else t
+                continue
+            near = suggest_similar(pname, declared.keys())
+            listed = ", ".join(sorted(declared))
+            diag = make_diagnostic(
+                code="W7009",
+                message=f"@{base}.{pname} reads a plane that `@{base}` does not declare "
+                        f"(declared: {listed}).",
+                loc=None, source=code, suggestions=near, phase="marshalling",
+                severity="warning",
+                hint=(f"Did you mean @{base}.{near[0]}?" if near else
+                      f"Read one of the declared planes of @{base}."))
+            if on_warning is not None:
+                on_warning(diag)
+            else:
+                logger.warning("[TEX] %s", diag)
+            raise InterpreterError(
+                f"TEX code references @{base}.{pname} but slot '{base}' carries no plane "
+                f"'{pname}' (declared: {listed}).", None, source=code, code="E6003",
+                hint=(f"Did you mean @{base}.{near[0]}?" if near else
+                      f"Read one of the declared planes of @{base}."))
+    return out
+
+
+def _expand_plane_meta(binding_meta: dict, bindings: dict) -> dict:
+    """DATA-1 x DATA-6: fan a PLANES wire's host tag out to every EXPANDED plane name, so the
+    egress-meta filter — which matches ORIGINAL tensor-binding names — sees `beauty.diffuse`
+    against a tag it would otherwise only find under `beauty`. A per-plane `descs` entry on the
+    PlanesValue wins where it carries one: its `transfer` hint becomes the plane's colorspace
+    when the host's tag does not already say. Called by the engine with the ORIGINAL
+    (unexpanded) bindings; returns the same dict object when no PlanesValue is present."""
+    if not any(v.__class__ is PlanesValue for v in bindings.values()):
+        return binding_meta
+    out = dict(binding_meta)
+    for base, v in bindings.items():
+        if v.__class__ is not PlanesValue:
+            continue
+        tag = binding_meta.get(base)
+        for pname in v.planes:
+            key = f"{base}.{pname}"
+            if key in binding_meta:
+                continue                      # the host tagged the plane itself: it wins
+            desc = v.descs.get(pname)
+            transfer = getattr(desc, "transfer", None)
+            if transfer in COLORSPACES and (tag is None or tag.colorspace == "unknown"):
+                out[key] = BufferMeta(transfer, tag.premult if tag else "unknown",
+                                      tag.frame if tag else None, tag.extra if tag else None)
+            elif tag is not None:
+                out[key] = tag
+    return out
+
+
 # ── Type inference ──
 
 def _spatial_channels_to_type(c: int) -> TEXType:
@@ -506,6 +679,10 @@ def infer_binding_type(value: Any) -> TEXType:
     if value.__class__ is Promise:
         # The whole point: identity is computable before the pixels land.
         return value.declared_type
+    if value.__class__ is PlanesValue and planes_wires_enabled():
+        # DATA-6: a PLANES wire, engine profile only (the ARRAY precedent). A PlanesValue that
+        # reaches a cook unexpanded, or under the ComfyUI profile, falls to the E7005 terminal.
+        return TEXType.PLANES
     # Image/latent lists — use first element for type inference
     if isinstance(value, list):
         if len(value) > 0:
@@ -553,12 +730,22 @@ def infer_binding_type(value: Any) -> TEXType:
         # downstream is the one that reports it, and it names the slot, which this cannot.
         return TEXType.FLOAT
     from .tex_runtime.interpreter import InterpreterError
+    # DATA-6: the hint only. A raw `{name: tensor}` dict stays refused — re-admitting dicts at
+    # the wire would reopen the identity class this terminal closed — but the message says what
+    # the host meant; and a PlanesValue arriving under the ComfyUI profile names the switch.
+    planes_hint = ""
+    if isinstance(value, dict) and value and all(isinstance(t, torch.Tensor)
+                                                 for t in value.values()):
+        planes_hint = " A {name: tensor} dict of planes — did you mean tex_marshalling.PlanesValue?"
+    elif value.__class__ is PlanesValue:
+        planes_hint = (" A PlanesValue needs the engine egress profile "
+                       "(tex_marshalling.set_egress_profile('engine')).")
     raise InterpreterError(
         f"a binding of type {type(value).__name__} cannot be typed by TEX.", None,
         code="E7005",
         hint="Wire a tensor, a number, a string, or a tex_marshalling.Promise. A program's "
              "cache identity is derived from binding TYPES, so guessing here would compile "
-             "one program and cook another.")
+             "one program and cook another." + planes_hint)
 
 
 # ── ANIM-1: which bindings actually IDENTIFY a program ───────────────────────
