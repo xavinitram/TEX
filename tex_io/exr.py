@@ -367,6 +367,32 @@ def _exr_header(W: int, H: int, names, ptype: int, comp: int) -> bytes:
 
 _ROOT_PLANE = "beauty"                 # the implicit root layer's colour group, as a plane
 _ROOT_COLOUR = ("R", "G", "B", "A")    # its channels — and the per-position letters on write
+_LONG_COLOUR = ("red", "green", "blue", "alpha")   # the long spelling (a Nuke-written layer)
+
+
+def _plane_order(chans):
+    """Channel order within one plane: R,G,B,A when the set is a subset of the short spelling,
+    red,green,blue,alpha when it is a subset of the long one (a Nuke-written `beauty.red`
+    layer — the sorted fallback would hand it back blue, green, red, a silent BGR), else the
+    file's own sorted order. Case-sensitive, and ONLY those two spellings: a mixed set
+    (`R` beside `green`), a lowercase `r`, or any other convention takes the sorted fallback."""
+    for spelling in (_ROOT_COLOUR, _LONG_COLOUR):
+        if set(chans) <= set(spelling):
+            return [c for c in spelling if c in chans]
+    return list(chans)
+
+
+class ExrLayers(dict):
+    """What `read_layers` returns: a plain ``{plane: (pixels, BufferDesc)}`` dict, plus
+    `channels` — each plane's verbatim file channel names in the plane's channel order — so
+    `write_layers` can put back the exact spelling it read (a `beauty.red` layer is written
+    `beauty.red`, never renamed to `beauty.R`). The attribute is metadata a host may ignore;
+    the dict contract is the whole value."""
+    __slots__ = ("channels",)
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.channels = {}
 
 
 def _split_layer(name: str):
@@ -387,8 +413,10 @@ def read_layers(src) -> dict:
       the root group no name of its own (its layer name is the empty string), and a plane no
       program can address would vanish silently;
     * any other bare name (`Z`, `N`, `id`) is a single-channel plane of its own name, [H,W,1];
-    * within a plane, channels come R,G,B,A when they are a subset of those, else in the
-      file's own sorted order (the file stores `B,G,R`; the plane comes back `R,G,B`);
+    * within a plane, channels come R,G,B,A when they are a subset of that spelling, or
+      red,green,blue,alpha when they are a subset of the long one (case-sensitive; a
+      Nuke-written layer), else in the file's own sorted order (the file stores `B,G,R`;
+      the plane comes back `R,G,B`). No other spelling is recognised (`_plane_order`);
     * a layer with more than four channels, or with a UINT channel (an integer id plane —
       cryptomatte), raises `EXRError` naming the layer rather than yielding a wrong plane.
 
@@ -396,8 +424,9 @@ def read_layers(src) -> dict:
     else `float32`; `transfer` is `linear` as for `read_exr`. A plane name that collides with
     a swizzle (`rgb`, `z`, …) is reported as-is — refusing it is the compiler's job, at the
     point a program reads the plane; the reader's job is to report the file. Tiled /
-    multipart / deep files raise exactly as `read_exr` does. Returns a plain dict so this
-    module stays a leaf: the host wraps it in its own plane carrier."""
+    multipart / deep files raise exactly as `read_exr` does. Returns an `ExrLayers` — a
+    plain dict (so this module stays a leaf and the host wraps it in its own plane carrier)
+    whose `.channels` records each plane's verbatim file channel names for `write_layers`."""
     img = read_exr(src)
     ptypes = img.pixel_types or (_PT_FLOAT,) * len(img.channels)
     ptype = dict(zip(img.channels, ptypes))
@@ -422,7 +451,7 @@ def read_layers(src) -> dict:
                            f"'{plane}' channel beside a '{plane}.*' layer)")
         members.setdefault(plane, []).append((chan, col))
 
-    out = {}
+    out = ExrLayers()
     for plane, rows in members.items():
         chans = [c for c, _ in rows]
         if len(chans) > 4:
@@ -435,34 +464,46 @@ def read_layers(src) -> dict:
                            f"integer id plane (cryptomatte) is out of scope, and a float plane "
                            f"in its place would be silently wrong")
         column = dict(rows)
-        cols = [column[c] for c in _canonical_order(chans)]
+        cols = [column[c] for c in _plane_order(chans)]
         storage = ("float16" if all(ptype[img.channels[col]] == _PT_HALF for _, col in rows)
                    else "float32")
         out[plane] = (img.pixels[:, :, cols], BufferDesc(storage=storage, transfer="linear"))
+        out.channels[plane] = [img.channels[col] for col in cols]
     return out
 
 
-def write_layers(path, planes: dict, *, root=_ROOT_PLANE, half: bool = False,
+def write_layers(path, planes: dict, *, channels=None, root=_ROOT_PLANE, half: bool = False,
                  compression: str = "zip") -> None:
     """The inverse of `read_layers`: flatten ``{plane: pixels [H,W,C<=4]}`` into `layer.channel`
-    names and write ONE scanline part through `write_exr`. Per plane: the plane named `root`
-    (default `beauty`, `read_layers`' name for the root colour group) is written as the bare
-    root `R,G,B,A`; any other single-channel plane whose name has no dot is written as that
-    bare name (`Z` → `Z`); everything else is `name.R`, `name.G`, `name.B`, `name.A` by
-    position. `root=None` writes every plane as an explicit layer. Each plane takes the shapes
-    `write_exr` takes; all planes must share one H×W.
+    names and write ONE scanline part through `write_exr`. A plane's value may also be the
+    `(pixels, BufferDesc)` pair `read_layers` returns, so ``write_layers(p, read_layers(f))``
+    is the whole round-trip (the desc is informational here; `half` picks the storage).
+
+    Channel names, per plane, in this order of precedence: (1) `channels[plane]` — a list
+    of the C full file channel names, verbatim; defaults to the `.channels` an `ExrLayers`
+    carries, which is how a read file is written back with the SAME spelling it had (a
+    Nuke `beauty.red` layer stays `beauty.red`, never renamed). Otherwise (2) the plane
+    named `root` (default `beauty`, `read_layers`' name for the root colour group) is
+    written as the bare root `R,G,B,A`; (3) any other single-channel plane whose name has
+    no dot is written as that bare name (`Z` → `Z`); (4) everything else is `name.R`,
+    `name.G`, `name.B`, `name.A` by position. `root=None` disables (2). Each plane takes
+    the shapes `write_exr` takes; all planes must share one H×W.
 
     Round-trip contract: `read_layers` of what `write_layers` wrote from a `read_layers`
-    result is bitwise equal per plane (half-rounded under `half=True`). The file's channel
-    SPELLINGS are normalised to the rule above (`N.X` reads back as plane `N` and is
-    re-written `N.R`): the grouped view is what round-trips, and the grouping rule — not the
-    file — owns channel order."""
+    result is bitwise equal per plane (half-rounded under `half=True`) AND names every
+    channel as the source file did. Only a plane written WITHOUT names — a host-built
+    tensor — takes the (2)-(4) spelling; the grouping rule, not the file, owns channel
+    order either way."""
     if not planes:
         raise EXRError("write_layers needs at least one plane")
+    if channels is None:
+        channels = getattr(planes, "channels", None) or {}
     names, cols, extent = [], [], None
     for plane, pixels in planes.items():
         if not isinstance(plane, str) or not plane:
             raise EXRError(f"plane names must be non-empty strings (got {plane!r})")
+        if isinstance(pixels, tuple):              # a `read_layers` (pixels, desc) pair
+            pixels = pixels[0]
         t = _as_hwc(pixels)
         if extent is None:
             extent = tuple(t.shape[:2])
@@ -472,7 +513,12 @@ def write_layers(path, planes: dict, *, root=_ROOT_PLANE, half: bool = False,
         C = t.shape[2]
         if not 1 <= C <= 4:
             raise EXRError(f"plane '{plane}' has {C} channels; a plane is 1 to 4 (VEC4)")
-        if plane == root:
+        if plane in channels:
+            chans = [str(c) for c in channels[plane]]
+            if len(chans) != C:
+                raise EXRError(f"plane '{plane}' has {C} channels but {len(chans)} channel "
+                               f"name(s) were given ({', '.join(chans)})")
+        elif plane == root:
             chans = list(_ROOT_COLOUR[:C])
         elif C == 1 and "." not in plane:
             chans = [plane]

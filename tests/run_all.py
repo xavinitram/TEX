@@ -1773,6 +1773,7 @@ def main():
     from test_v037_exr_layers import (
         test_two_layers_and_a_bare_Z_round_trip_bitwise,
         test_grouping_splits_on_the_last_dot_and_orders_rgba,
+        test_nuke_long_spelling_orders_rgb_and_round_trips_its_own_names,
         test_bare_names_are_own_planes_and_root_rgba_is_beauty,
         test_beauty_layer_vs_root_precedence,
         test_more_than_four_channels_is_refused_naming_the_layer,
@@ -1782,6 +1783,7 @@ def main():
     )
     test_two_layers_and_a_bare_Z_round_trip_bitwise(r)
     test_grouping_splits_on_the_last_dot_and_orders_rgba(r)
+    test_nuke_long_spelling_orders_rgb_and_round_trips_its_own_names(r)
     test_bare_names_are_own_planes_and_root_rgba_is_beauty(r)
     test_beauty_layer_vs_root_precedence(r)
     test_more_than_four_channels_is_refused_naming_the_layer(r)

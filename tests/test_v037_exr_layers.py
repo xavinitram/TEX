@@ -179,6 +179,56 @@ def test_grouping_splits_on_the_last_dot_and_orders_rgba(r: SubTestResult):
             r.fail("DATA-6 L-D grouping rule", f"{type(e).__name__}: {e}")
 
 
+def test_nuke_long_spelling_orders_rgb_and_round_trips_its_own_names(r: SubTestResult):
+    print("\n--- DATA-6 L-D: a Nuke-spelled layer (`beauty.red`) orders R,G,B and keeps its names ---")
+    names = ["beauty.red", "beauty.green", "beauty.blue",
+             "specular.red", "specular.green", "specular.blue", "depth.Z"]
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            p, src = _raw(td, "nuke.exr", names)
+            layers = tex_exr.read_layers(p)
+            assert set(layers) == {"beauty", "specular", "depth"}, sorted(layers)
+            # The sorted fallback would hand back blue, green, red — a silent BGR.
+            for plane in ("beauty", "specular"):
+                t = layers[plane][0]
+                assert torch.equal(t[..., 0], src[f"{plane}.red"]), plane  # lnt2-ok: same-process torch round-trip, no dispatcher, no file-text hash
+                assert torch.equal(t[..., 1], src[f"{plane}.green"]), plane  # lnt2-ok: same-process torch round-trip, no dispatcher, no file-text hash
+                assert torch.equal(t[..., 2], src[f"{plane}.blue"]), plane  # lnt2-ok: same-process torch round-trip, no dispatcher, no file-text hash
+                assert layers.channels[plane] == [f"{plane}.red", f"{plane}.green", f"{plane}.blue"], \
+                    (plane, layers.channels[plane])
+            assert layers.channels["depth"] == ["depth.Z"]
+            r.ok("`red,green,blue` groups in that order; `.channels` carries the verbatim names per plane")
+
+            # read -> write -> read: bitwise per plane AND every channel name preserved.
+            p2 = os.path.join(td, "nuke_rt.exr")
+            tex_exr.write_layers(p2, layers)              # the (pixels, desc) pairs, names carried
+            assert tex_exr.read_exr(p2).channels == sorted(names), tex_exr.read_exr(p2).channels
+            back = tex_exr.read_layers(p2)
+            for k in layers:
+                assert torch.equal(back[k][0], layers[k][0]), k  # lnt2-ok: same-process torch round-trip, no dispatcher, no file-text hash
+                assert back.channels[k] == layers.channels[k], k
+            r.ok("read_layers -> write_layers -> read_layers: bitwise per plane, channel names identical")
+
+            # Explicit `channels=` does the same for a plain tensor dict; a count mismatch is loud.
+            p3 = os.path.join(td, "nuke_named.exr")
+            tex_exr.write_layers(p3, {"beauty": layers["beauty"][0]},
+                                 channels={"beauty": ["beauty.red", "beauty.green", "beauty.blue"]})
+            assert tex_exr.read_exr(p3).channels == ["beauty.blue", "beauty.green", "beauty.red"]
+            _expect_exr_error(lambda: tex_exr.write_layers(p3, {"beauty": layers["beauty"][0]},
+                                                           channels={"beauty": ["beauty.red"]}),
+                              "'beauty'", "3 channels", "1 channel")
+            r.ok("write_layers(channels=...) names a plain tensor's channels verbatim; a count mismatch is an EXRError")
+
+            # Only the two case-sensitive spellings: a mixed or lowercase-short set stays sorted.
+            p4, src4 = _raw(td, "mixed.exr", ["m.R", "m.green", "m.B", "s.r", "s.g", "s.b"])
+            mixed = tex_exr.read_layers(p4)
+            assert mixed.channels["m"] == ["m.B", "m.R", "m.green"], mixed.channels["m"]   # sorted
+            assert mixed.channels["s"] == ["s.b", "s.g", "s.r"], mixed.channels["s"]       # sorted
+            r.ok("a mixed set (`R` beside `green`) or a lowercase `r,g,b` takes the sorted fallback, as documented")
+        except Exception as e:
+            r.fail("DATA-6 L-D Nuke spelling", f"{type(e).__name__}: {e}")
+
+
 def test_bare_names_are_own_planes_and_root_rgba_is_beauty(r: SubTestResult):
     print("\n--- DATA-6 L-D: root R/G/B/A -> `beauty`; any other bare name -> its own plane ---")
     names = ["R", "G", "B", "A", "Z", "N", "id"]
