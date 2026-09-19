@@ -75,6 +75,9 @@ from .tex_marshalling import (
     egress_meta as _egress_meta,
     resolve_promise_bindings as _resolve_promise_bindings,
     Promise as _Promise,
+    expand_plane_bindings as _expand_plane_bindings,
+    _expand_plane_meta,
+    PlanesValue as _PlanesValue,
 )
 from .tex_runtime.host import (get_host_services, CookCancelled,
                                _cancel_check, _report_progress)
@@ -776,6 +779,21 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     # INVARIANT #7: the call returns `bindings` unchanged, having allocated nothing, unless a
     # promise is actually present — the guard is one class check per binding inside a `any()`.
     bindings = _resolve_promise_bindings(bindings)
+    # DATA-1 x DATA-6: a PLANES wire's host tag fans out to each expanded plane name, with a
+    # per-plane `descs` entry on the PlanesValue winning where it carries one. Without this
+    # the egress-meta filter — which matches ORIGINAL tensor-binding names — sees
+    # `beauty.diffuse` against a tag filed under `beauty` and silently drops every colour tag.
+    if binding_meta:
+        binding_meta = _expand_plane_meta(binding_meta, bindings)
+    # DATA-6: a PLANES wire becomes its per-plane tensors HERE, on the same line as the IO-1
+    # resolution above and for the same reason — no tier, no emitter and no cache learns what
+    # a plane is. DEMAND-DRIVEN: only the planes `sigil_names(code)` says the source mentions
+    # are expanded, so an unmentioned AOV never enters `bindings`, never reaches the ingest
+    # loop, never moves to the device. That is the PM-10 laziness guarantee, structural.
+    #
+    # INVARIANT #7: returns `bindings` unchanged, having allocated nothing, unless a
+    # PlanesValue is actually present — one `__class__ is` check per binding inside an `any()`.
+    bindings = _expand_plane_bindings(bindings, code)
     fused_chain = False
     fused_fp = None
     # LAT-2: the program fingerprint, hoisted above the M-1 preflight so it can memoize its
@@ -890,8 +908,10 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             # (_s0_u_amt — see tex_fusion._user_prefix); show the
             # user's original name, not the synthetic one.
             disp = _strip_user_prefix(ref_name) if fused_chain else ref_name
+            slot = disp.rsplit(".", 1)[0]      # DATA-6: a plane read's SLOT is its wire (A18)
             raise InterpreterError(
-                f"TEX code references {sigil}{disp} but no input is connected to slot '{disp}'.",
+                f"TEX code references {sigil}{disp} but no input is connected to slot '{slot}'"
+                + (f" (read as {sigil}{disp})." if slot != disp else "."),
                 loc=SourceLoc(1, 1), source=code, code="E6003",
             )
 
@@ -1396,6 +1416,15 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
            for st in stages for v in (st.get("bindings") or {}).values()):
         stages = [dict(st, bindings=_resolve_promise_bindings(st.get("bindings") or {}))
                   for st in stages]
+    # DATA-6: the same expansion the single-program path does at prepare(), for the same
+    # reason cook_stage_list resolves promises — a sub-chain must cook identically to those
+    # stages inside the full fused program. Guarded on the same shape, so a plane-free chain
+    # (every chain today) pays one class check per binding and copies nothing.
+    if any(v.__class__ is _PlanesValue
+           for st in stages for v in (st.get("bindings") or {}).values()):
+        stages = [dict(st, bindings=_expand_plane_bindings(st.get("bindings") or {},
+                                                           st.get("code") or ""))
+                  for st in stages]
     if len(stages) == 1:
         st = stages[0]
         bindings = dict(st.get("bindings") or {})
@@ -1436,7 +1465,12 @@ def _is_tensor_binding(v) -> bool:
     # binding here, then miss resolution in both of those (they test exact class) and
     # surface as an E7005 out of `prefix_fingerprint` — a disagreement between three
     # predicates that are supposed to describe one thing.
-    return isinstance(v, torch.Tensor) or v.__class__ is _Promise
+    # DATA-6: a PlanesValue is a TENSOR binding for keying purposes — it carries pixels, and
+    # the P0-H lesson is that a pixel-carrier left on the `params` side is folded by `repr`,
+    # which for a `__slots__` object is its ADDRESS. `_binding_shape` below supplies the
+    # composite shape that keeps the boundary's identity content-derived.
+    return (isinstance(v, torch.Tensor) or v.__class__ is _Promise
+            or v.__class__ is _PlanesValue)
 
 
 def _binding_shape(v):
@@ -1445,6 +1479,13 @@ def _binding_shape(v):
     A landed Promise reports its value's real shape; an unlanded one reports its declaration.
     None means "an unlanded promise that declared no shape" — un-keyable, because the
     boundary's resolution is part of its identity."""
+    if v.__class__ is _PlanesValue:
+        # DATA-6: a PLANES wire's identity is EVERY declared plane's name and shape, never the
+        # first plane's — two wires whose `diffuse` matches and whose `Z` does not are
+        # different boundaries, and keying on one plane would serve one for the other. The
+        # names ride the key because a plane SET is part of what the boundary resolved to.
+        return tuple(x for n in sorted(v.planes)
+                     for x in (n, *(int(d) for d in v.planes[n].shape)))
     if isinstance(v, torch.Tensor):
         return tuple(v.shape)
     val = getattr(v, "value", None)
@@ -1524,7 +1565,7 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
                             f"it is an unlanded Promise that declared no shape, and the "
                             f"boundary's RESOLUTION is part of its identity. Declare "
                             f"`shape=` on the promise, or pass `canvas=` explicitly.")
-                    out.append([f"s{i + off}:{n}", *[int(d) for d in shape]])
+                    out.append([f"s{i + off}:{n}", *shape])
             return out
 
         canvas = {"in": _shapes(stages[:k])}
