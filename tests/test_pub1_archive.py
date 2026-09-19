@@ -10,9 +10,10 @@ the generators. This file keeps the archive honest from the tree side:
   (a) every top-level tracked directory is either ignored or named in the SHIP allowlist, so a
       new directory reds by name instead of shipping by accident; and `.comfyignore` holds only
       plain directory-prefix patterns, the one subset this file can mirror provably;
-  (b) a surface ratchet over the SHIPPED files for the scanner's families, pinned at the
-      measured counts: a new site reds with file:line, a decrease reds until the pin follows it
-      down (the REG-2 headroom-floor discipline — a pin that only ever rises is decoration);
+  (b) a surface ratchet over the SHIPPED `.py`/`.js` files for the scanner's families, pinned
+      at the measured counts: a new site reds with file:line, a decrease reds until the pin
+      follows it down (the REG-2 headroom-floor discipline — a pin that only ever rises is
+      decoration); prose (`.md`) is out of scope because the scanner demonstrably does not read it;
   (c) no shipped module imports from an ignored directory (an AST scan, not a grep).
 
 Plus the one runtime seam the split exposed: `tex_validate_hw`'s triton lane delegated to
@@ -53,8 +54,13 @@ _MUST_SHIP = (
 # `name/` = "a directory called `name`, at any depth" (no leading slash, no glob, no negation).
 _DIR_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]+/$")
 
-# The scanner's families, as line regexes over RAW text — comments and prose included, because
-# the scanner reads bytes, not ASTs (a docstring that says `exec()` is a finding to it). Each
+# The scanner's families, as line regexes over the RAW text of every shipped `.py`/`.js` file —
+# docstrings and comments included, because the scanner reads bytes, not ASTs (0.36.1 was flagged
+# on two DOCSTRINGS in tex_runtime/compiled.py). Root `.md` prose is NOT censused: of 0.36.1's 92
+# registry findings (read 2026-09-19 via /versions?include_status_reason=true) ZERO were in any
+# `.md` file although SECURITY.md and DEVELOPMENT.md spell `exec()` / `pickle.load` in prose, and
+# the only non-`.py` finding was editor_build/package-lock.json (`vendored_known`, a family this
+# file does not census). So a release note may name a builtin; a source file may not grow one. Each
 # call-shaped family is anchored so an identifier that merely contains the word does not count:
 # `compile(` must not match `compile_program(` / `recompile(` / `re.compile(`, and
 # `marshal.loads(` is spelled out so `tex_marshalling` does not match.
@@ -70,19 +76,19 @@ _FAMILIES = {
     "network":       re.compile(r"urlopen\(|\brequests\.[a-z_]+\(|http\.client|\bsocket\.[a-z_]+\("),
 }
 
-# Measured over the shipped set (git-tracked minus .comfyignore) at the commit that introduced
-# this file. The pin moves DOWN freely and reds until it does; it moves UP only as a release
+# Measured over the shipped `.py`/`.js` set (git-tracked minus .comfyignore, scanner-read files
+# only — see _CENSUS_SUFFIXES). The pin moves DOWN freely and reds until it does; it moves UP only as a release
 # decision that names the new finding — every shipped finding is justified to the registry
 # reviewer in writing, so a new one is a new paragraph there, never a reflex here.
 _SURFACE_PINS = {
     "env_read": 24,
     "subprocess": 1,
     "os_system": 0,
-    "exec": 7,
+    "exec": 5,
     "eval": 0,
     "compile": 11,
     "marshal_loads": 1,
-    "pickle_load": 6,
+    "pickle_load": 4,
     "network": 0,
 }
 
@@ -167,9 +173,15 @@ def test_pub1_every_top_level_directory_is_ignored_or_allowlisted(r: SubTestResu
 
 # ── (b) the surface ratchet ──────────────────────────────────────────────────
 
+# What the scanner's rules for these families read: source, not documentation (measured above).
+_CENSUS_SUFFIXES = (".py", ".js")
+
+
 def _census(paths: list[str]) -> dict[str, list[str]]:
     sites = collections.defaultdict(list)
     for rel in paths:
+        if not rel.endswith(_CENSUS_SUFFIXES):
+            continue
         try:
             text = (_PKG / rel).read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
@@ -182,7 +194,7 @@ def _census(paths: list[str]) -> dict[str, list[str]]:
 
 
 def test_pub1_shipped_surface_ratchet(r: SubTestResult):
-    print("\n--- PUB-1 (b): scanner-family sites over the SHIPPED files stay at their pins ---")
+    print("\n--- PUB-1 (b): scanner-family sites over the SHIPPED .py/.js files stay at their pins ---")
     try:
         names, bad = _parse_comfyignore() if _COMFYIGNORE.is_file() else ([], [])
         if bad:
