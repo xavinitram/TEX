@@ -17,6 +17,7 @@ ENG-7  host time context: frame/fps/time enter as BUILTINS (never $params) and m
 SCHED-1 the _tex_chain spec is a schema-versioned GraphSpec.
 """
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 import torch
 
 _PKG = Path(__file__).resolve().parent.parent
@@ -26,7 +27,7 @@ def _resolve_auto(code, px=2048 * 2048, dev="cuda"):
     """The C1 auto-precision gate's verdict for `code` at the fp16 region (CUDA, >=2048²).
     Pure static analysis — no GPU needed, so this pins the gate on any box."""
     from TEX_Wrangle.tex_runtime.precision_policy import resolve_auto_precision
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
+    prog = parse_and_split(code, {})
     return resolve_auto_precision(prog, px, dev)
 
 
@@ -389,7 +390,7 @@ def test_eng7_time_barred_from_frozen_tiers(r: SubTestResult):
     bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
 
     def _prog(code):
-        p = Parser(Lexer(code).tokenize(), source=code).parse()
+        p = parse_and_split(code, bt)
         return p, TypeChecker(binding_types=bt, source=code).check(p)
 
     pt, tmt = _prog(timed)
@@ -462,7 +463,7 @@ def test_eng7_time_barred_from_frozen_tiers(r: SubTestResult):
     # unroller or DCE change could flatten it, sending the cook down a route that was never
     # broken while the assertion still passed. A green test that stopped testing anything
     # is how this bug survived a suite with seven ENG-7 routes already pinned.
-    _dp = Parser(Lexer(deep).tokenize(), source=deep).parse()
+    _dp = parse_and_split(deep, bt)
     _dtm = TypeChecker(binding_types=bt, source=deep).check(_dp)
     _dopt = optimize(_dp, _dtm)
     from TEX_Wrangle.tex_runtime.compiled import (

@@ -10,6 +10,7 @@ import re
 import glob
 
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 from failure_harness import run_tier, max_diff
 from TEX_Wrangle.tex_runtime import tier_trace
 
@@ -642,7 +643,7 @@ def test_a1_1_auto_precision_fuzz(r: SubTestResult):
 
     # SELF-TEST: an fp16-forced amplifier must trip the accuracy check (engine live).
     amp = "@OUT = vec4(vec3(@A.r*80.0 - @A.g*79.5), 1.0);"
-    prog = Parser(Lexer(amp).tokenize(), source=amp).parse()
+    prog = parse_and_split(amp, bt)
     tm = TypeChecker(binding_types=bt, source=amp).check(prog)
     o16 = Interpreter().execute(prog, binds, tm, device="cuda", output_names=["OUT"], precision="fp16")["OUT"]
     o32 = Interpreter().execute(prog, binds, tm, device="cuda", output_names=["OUT"], precision="fp32")["OUT"]
@@ -655,7 +656,7 @@ def test_a1_1_auto_precision_fuzz(r: SubTestResult):
     for _ in range(N):
         code = _gen_program(rng, 3)
         try:
-            prog = Parser(Lexer(code).tokenize(), source=code).parse()
+            prog = parse_and_split(code, bt)
             tm = TypeChecker(binding_types=bt, source=code).check(prog)
             prog = optimize(prog, tm)
             tm = TypeChecker(binding_types=bt, source=code).check(prog)

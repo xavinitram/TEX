@@ -15,6 +15,7 @@ FUS-2  fused_required_bindings: terminal-first lazy composition over a fused cha
        The mechanism ships tested and ready for that follow-up.
 """
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 import torch
 
 from TEX_Wrangle import tex_fusion as F
@@ -35,8 +36,8 @@ def _E(f, fs, t, tb, ftype=None):
 
 def _run(code, binds, device="cpu"):
     """Interpret one node's code with the given bindings; return @OUT."""
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
     bt = {k: _ibt(v) for k, v in binds.items()}
+    prog = parse_and_split(code, bt)          # the one front end (DATA-6)
     ck = TypeChecker(binding_types=bt, source=code)
     tm = ck.check(prog)
     return Interpreter().execute(prog, binds, tm, device=device,

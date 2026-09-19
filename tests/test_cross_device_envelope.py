@@ -15,6 +15,7 @@ loud, recorded decision instead of silent drift. Bands are ~10x the measured max
 CUDA-gated: skips clean on a CPU-only box.
 """
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 
 
 # (label, code, band, structural) — structural=True compares total energy (img_sum
@@ -66,12 +67,12 @@ _PROBES = [
 
 
 def _run_on(code, device, img):
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
     binds = {}
     bt = {}
     if "@A" in code:
         binds["A"] = img.to(device)
         bt["A"] = TEXType.VEC3
+    prog = parse_and_split(code, bt)
     tm = TypeChecker(binding_types=bt, source=code).check(prog)
     out = Interpreter().execute(prog, binds, tm, device=device,
                                 output_names=["OUT"], precision="fp32")

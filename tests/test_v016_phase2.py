@@ -6,6 +6,7 @@ as UnaryOp('-', NumberLiteral), and the propagation pass runs before folding, so
 the negative-tuning-constant class was previously missed.
 """
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.optimizer import optimize, _const_literal_value
 import TEX_Wrangle.tex_compiler.ast_nodes as A
 
@@ -36,8 +37,8 @@ def test_uc4_neg_const_prop(r: SubTestResult):
     # optimize() the locals are substituted and DCE'd, leaving no residual refs.
     try:
         code = "float k = -0.5; float g = -2.0; @OUT = vec4(@A.rgb * g + vec3(k), 1.0);"
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         optimize(prog, tm)
         names = set()

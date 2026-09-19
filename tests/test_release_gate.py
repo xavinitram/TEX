@@ -45,16 +45,15 @@ def test_version_consistency(r: SubTestResult):
 _PROBE = f'''
 import sys
 sys.path.insert(0, r"{_CUSTOM_NODES}")
-from TEX_Wrangle.tex_compiler.lexer import Lexer
-from TEX_Wrangle.tex_compiler.parser import Parser
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
 from TEX_Wrangle.tex_compiler.types import TEXType
 from TEX_Wrangle.tex_runtime.codegen import try_compile
 code = ("float a = @A.r * u + @B.g * v; float b = @A.b + float(ix) * py; "
         "@OUT = vec4(a, b, u * v, 1.0);")
-prog = Parser(Lexer(code).tokenize(), source=code).parse()
-tm = TypeChecker(binding_types={{"A": TEXType.VEC3, "B": TEXType.VEC3, "OUT": TEXType.VEC4}},
-                 source=code).check(prog)
+bt = {{"A": TEXType.VEC3, "B": TEXType.VEC3, "OUT": TEXType.VEC4}}
+prog = parse_and_split(code, bt)          # the one front end (DATA-6)
+tm = TypeChecker(binding_types=bt, source=code).check(prog)
 fn = try_compile(prog, tm, fingerprint="det")
 sys.stdout.write(getattr(fn, "_tex_src", "NONE") if fn is not None else "NONE")
 '''

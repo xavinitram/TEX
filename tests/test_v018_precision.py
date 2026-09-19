@@ -2,6 +2,7 @@
 v0.18.0 precision core (PR-LP4 fp16-safe reductions; PR-LP2 auto mode lands here too).
 """
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 import random as _random
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib as _S
 from TEX_Wrangle.tex_runtime.codegen import try_compile
@@ -12,7 +13,7 @@ _FP16_BAR = 3.9e-3  # the 8-bit quantum (doc 22)
 
 
 def _codegen_src(code, bt):
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
+    prog = parse_and_split(code, bt)
     tm = TypeChecker(binding_types=bt, source=code).check(prog)
     fn = try_compile(prog, tm, fingerprint="lp4probe")
     return getattr(fn, "_tex_src", "") if fn is not None else ""
@@ -121,7 +122,7 @@ def test_prlp2_node_path_perf(r: SubTestResult):
 
 
 def _resolve(code, px=2048 * 2048, dev="cuda"):
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
+    prog = parse_and_split(code, {})
     return resolve_auto_precision(prog, px, dev)
 
 
@@ -200,7 +201,7 @@ def test_prlp2_fp16_accuracy_fuzzer(r: SubTestResult):
     for _ in range(N):
         code = f"@OUT = vec4(vec3({_gen(rng, 3)}), 1.0);"
         try:
-            prog = Parser(Lexer(code).tokenize(), source=code).parse()
+            prog = parse_and_split(code, {})
         except Exception:
             continue
         prec, _why = resolve_auto_precision(prog, 2048 * 2048, "cuda")

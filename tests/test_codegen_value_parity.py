@@ -30,6 +30,7 @@ emitted source for every program that was already correct is byte-identical.
 import torch
 
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 from failure_harness import run_tier
 
 from TEX_Wrangle.tex_runtime.codegen import _SPATIAL_BUILTINS, _invoke_cg, is_vec_param_list
@@ -194,7 +195,7 @@ def test_codegen_spatial_builtins_match_interpreter_ranks(r: SubTestResult):
         # missing from it for exactly as long as the comment beside it said `fi` was 0-dim.
         names = sorted(n for n in _BUILTIN_NAMES if n not in ("frame", "fps", "time"))
         code = "@OUT = vec3(" + " + ".join(names) + ") * 0.0 + @A * 0.0;"
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, {"A": TEXType.VEC3, "OUT": TEXType.VEC3})
         tm = TypeChecker(binding_types={"A": TEXType.VEC3, "OUT": TEXType.VEC3},
                          source=code).check(prog)
         interp = Interpreter()
@@ -242,7 +243,7 @@ def test_codegen_vec_param_staging_is_narrow(r: SubTestResult):
             what = f"[{dev}/{dtype}] _invoke_cg stages a vec3 param like the interpreter"
             try:
                 code = "v3$tint = vec3(0.0, 0.0, 0.0);\n@OUT = @A.rgb * $tint;"
-                prog = Parser(Lexer(code).tokenize(), source=code).parse()
+                prog = parse_and_split(code, {"A": TEXType.VEC3, "tint": TEXType.VEC3, "OUT": TEXType.VEC3})
                 tm = TypeChecker(binding_types={"A": TEXType.VEC3, "tint": TEXType.VEC3,
                                                 "OUT": TEXType.VEC3}, source=code).check(prog)
                 cg = try_compile(prog, tm)
@@ -272,7 +273,7 @@ def test_codegen_vec_param_staging_is_narrow(r: SubTestResult):
     try:
         code = ("f$gain = 1.0;\nv3$tint = vec3(0.0, 0.0, 0.0);\n"
                 "@OUT = @A.rgb * $tint * $gain;")
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, {"A": TEXType.VEC3, "tint": TEXType.VEC3, "gain": TEXType.FLOAT, "OUT": TEXType.VEC3})
         tm = TypeChecker(binding_types={"A": TEXType.VEC3, "tint": TEXType.VEC3,
                                         "gain": TEXType.FLOAT, "OUT": TEXType.VEC3},
                          source=code).check(prog)
@@ -296,7 +297,7 @@ def test_codegen_vec_param_staging_leaves_emitted_code_alone(r: SubTestResult):
         code = ("v3$tint = vec3(0.0, 0.0, 0.0);\nfloat acc = 0.0;\n"
                 "for (int k = 0; k < 4; k++) { if ($tint.r > 0.5) { break; } acc = acc + 1.0; }\n"
                 "@OUT = vec3(acc) + @A * 0.0;")
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, {"A": TEXType.VEC3, "tint": TEXType.VEC3, "OUT": TEXType.VEC3})
         tm = TypeChecker(binding_types={"A": TEXType.VEC3, "tint": TEXType.VEC3,
                                         "OUT": TEXType.VEC3}, source=code).check(prog)
         src = try_compile(prog, tm, fingerprint="parity-probe")._tex_src

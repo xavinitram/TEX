@@ -2,6 +2,7 @@
 v0.15.0 Phase 5 regression tests — CC-2 measured auto-tier + Q-3 fusion widening.
 """
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime import autotier as AT
 import TEX_Wrangle.tex_fusion as _FUS
 from TEX_Wrangle.tex_marshalling import infer_binding_type as _infer_binding_type  # ENG-1: not via the node
@@ -30,7 +31,7 @@ def _run_unfused(stages):
         for b, (s, o) in ci.items():
             binds[b] = outs[(s, o)]
         bt = {k: _infer_binding_type(v) for k, v in binds.items()}
-        prog = Parser(Lexer(st["code"]).tokenize(), source=st["code"]).parse()
+        prog = parse_and_split(st["code"], bt)
         checker = TypeChecker(binding_types=bt, source=st["code"])
         tm = checker.check(prog)
         res = Interpreter().execute(prog, binds, tm, device="cpu",
@@ -197,7 +198,7 @@ def test_cc2_end_to_end(r: SubTestResult):
         AT.reset()
         code = "vec3 c=@A.rgb; c = c*1.3 - 0.1; c = clamp(c, 0.0, 1.0); @OUT=vec4(c,1.0);"
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         used = _collect_identifiers(prog)
         torch.manual_seed(3)

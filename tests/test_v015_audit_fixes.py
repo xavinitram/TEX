@@ -3,11 +3,12 @@ Regression tests for the v0.15.0 pre-push audit fixes (doc 21).
 Each test pins a confirmed defect so it cannot silently return.
 """
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter
 
 
 def _run(code, bt, binds, precision="fp32", device="cpu"):
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
+    prog = parse_and_split(code, bt)
     tm = TypeChecker(binding_types=bt, source=code).check(prog)
     return Interpreter().execute(prog, binds, tm, device=device,
                                  output_names=["OUT"], precision=precision)["OUT"]
@@ -33,7 +34,7 @@ def test_uc3_fractional_and_bindingmut(r: SubTestResult):
         vi = _r0(_run(lit, {"OUT": TEXType.VEC3}, {}))
         assert vi == 4.5, f"fractional LITERAL start floored (interp): got {vi}, want 4.5"
         from TEX_Wrangle.tex_runtime.compiled import _codegen_only_execute
-        pl = Parser(Lexer(lit).tokenize(), source=lit).parse()
+        pl = parse_and_split(lit, {"OUT": TEXType.VEC3})
         tml = TypeChecker(binding_types={"OUT": TEXType.VEC3}, source=lit).check(pl)
         vc = _r0(_codegen_only_execute(pl, {}, tml, "cpu", output_names=["OUT"], fingerprint="uc3lit", time_context=None)["OUT"])
         assert vc == 4.5, f"fractional LITERAL start floored (codegen): got {vc}, want 4.5"
@@ -63,7 +64,7 @@ def test_uc3_fractional_and_bindingmut(r: SubTestResult):
         # Confirm the fast path actually still engages for integer bounds.
         from TEX_Wrangle.tex_compiler.parser import Parser as P
         code = "float s=0.0; for(int i=0;i<5;i=i+1){s=s+1.0;} @OUT=vec3(s,0,0);"
-        prog = P(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, {"OUT": TEXType.VEC3})
         tm = TypeChecker(binding_types={"OUT": TEXType.VEC3}, source=code).check(prog)
         interp = Interpreter()
         interp.execute(prog, {}, tm, device="cpu", output_names=["OUT"])
@@ -81,7 +82,7 @@ def test_uc4_array_shadow_constprop(r: SubTestResult):
             "@OUT = vec3(g[1],0,0); } else { @OUT = vec3(g,0,0); }")
     bt = {"OUT": TEXType.VEC3}
     try:
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         prog2 = optimize(prog, tm)
         TypeChecker(binding_types=bt, source=code).check(prog2)  # mandatory re-typecheck
@@ -92,7 +93,7 @@ def test_uc4_array_shadow_constprop(r: SubTestResult):
     try:
         # Normal (non-shadowed) literal local still const-propagates + runs.
         code2 = "float k = 2.0; @OUT = vec3(u*k, v, 0.0);"
-        prog = Parser(Lexer(code2).tokenize(), source=code2).parse()
+        prog = parse_and_split(code2, bt)
         tm = TypeChecker(binding_types=bt, source=code2).check(prog)
         out = Interpreter().execute(optimize(prog, tm), {}, tm, device="cpu", output_names=["OUT"])["OUT"]
         assert out.shape[-1] == 3
@@ -200,7 +201,7 @@ def test_m3_fp16_reconcile(r: SubTestResult):
     torch.manual_seed(0)
     img = torch.rand(1, 48, 48, 3)
     def run(code, precision):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         return Interpreter().execute(prog, {"A": img}, tm, device="cpu",
                                      output_names=["OUT"], precision=precision,
@@ -233,7 +234,7 @@ def test_uc2_stencil_exact_only(r: SubTestResult):
     from TEX_Wrangle.tex_runtime.compiled import _codegen_only_execute
     from TEX_Wrangle.tex_runtime.codegen import detect_stencil_route
     def diff(code, fp):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, {"A": TEXType.VEC4, "OUT": TEXType.VEC4})
         tm = TypeChecker(binding_types={"A": TEXType.VEC4, "OUT": TEXType.VEC4}, source=code).check(prog)
         img = torch.rand(1, 64, 64, 4)
         ref = Interpreter().execute(prog, {"A": img}, tm, device="cpu", output_names=["OUT"])["OUT"]
@@ -257,7 +258,7 @@ def test_m4_tiling_guards(r: SubTestResult):
     print("\n--- P1: M-4 tiling safety guards ---")
     from TEX_Wrangle.tex_memory import run_tiled
     def compile_full(code, bt):
-        p = Parser(Lexer(code).tokenize(), source=code).parse()
+        p = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(p)
         return p, tm, _collect_identifiers(p)
     interp = Interpreter()
@@ -295,7 +296,7 @@ def test_uc1_graph_vec_param(r: SubTestResult):
     try:
         code = "@OUT = vec4(@A.rgb * $tint, 1.0);"
         bt = {"A": TEXType.VEC3, "tint": TEXType.VEC3, "OUT": TEXType.VEC4}
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         A = torch.rand(1, 64, 64, 3, device="cuda")
         tint = [1.0, 0.5, 0.25]
@@ -377,7 +378,7 @@ def test_cc1_triton_hint(r: SubTestResult):
         # through the torch.compile path, whose first call raises → the handler.
         code = ("vec3 c=@A.rgb; c=c*1.2-0.1; c=c*0.9+0.05; c=(c-0.5)*1.3+0.5; "
                 "c=sin(c*3.0)*0.5+0.5; c=c*c+c*0.3; c=c*1.05+0.02; @OUT=vec4(c,1.0);")
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, {"A": TEXType.VEC3, "OUT": TEXType.VEC4})
         tm = TypeChecker(binding_types={"A": TEXType.VEC3, "OUT": TEXType.VEC4}, source=code).check(prog)
         img = torch.rand(1, 32, 32, 3)
         try:
@@ -533,7 +534,7 @@ def test_mem1_evict_preserves_graphs(r: SubTestResult):
         G.clear_graph_cache()
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
         code = "vec3 c=@A.rgb; float g=luma(c); @OUT=vec4(mix(c,vec3(g),0.4)*1.1,1.0);"
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         used = _collect_identifiers(prog)
         img = torch.rand(1, 64, 64, 3, device="cuda")

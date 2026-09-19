@@ -3,6 +3,7 @@ v0.15.0 Phase 2 regression tests — cook speed.
 Q-2 phase 1: purity-aware DCE + post-CSE re-run (optimizer).
 """
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.ast_nodes import FunctionCall
 from TEX_Wrangle.tex_runtime.codegen import _iter_child_nodes
 
@@ -18,7 +19,7 @@ def _count_calls(prog):
 
 
 def _optimize(code, bt):
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
+    prog = parse_and_split(code, bt)
     tm = TypeChecker(binding_types=bt, source=code).check(prog)
     before = _count_calls(prog)
     prog2 = optimize(prog, tm)
@@ -94,7 +95,7 @@ def test_uc4_const_prop(r: SubTestResult):
     # be corrupted by propagation.
     try:
         code = "float g = 2.0; float f(float g) { return g * 3.0; } @OUT = vec4(vec3(f(4.0) * 0.1), 1.0);"
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         prog = optimize(prog, tm)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
@@ -108,7 +109,7 @@ def test_uc4_const_prop(r: SubTestResult):
     # A reassigned local is NOT propagated.
     try:
         code = "float k = 1.0; k = k + luma(@A); @OUT = vec4(@A * k, 1.0);"
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         img = make_img(1, 4, 4, 3)
         # bit-exact vs interpreter after optimize (correctness under reassignment)
@@ -126,7 +127,7 @@ def test_uc1_cuda_graph(r: SubTestResult):
     from TEX_Wrangle.tex_runtime.compiled import _plain_execute
 
     def _compile(code, bt):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         used = _collect_identifiers(prog)
         return prog, tm, used
@@ -250,7 +251,7 @@ def test_uc2_stencil_routing(r: SubTestResult):
     from TEX_Wrangle.tex_runtime.compiled import _codegen_only_execute, _plain_execute
 
     def _prog(code, bt):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         return prog, tm
 
@@ -403,7 +404,7 @@ def test_uc3_uniform_loop(r: SubTestResult):
     @OUT = vec4(acc / cnt, 1.0);
     """
     def _run(radius):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, {"A": TEXType.VEC3, "radius": TEXType.INT, "OUT": TEXType.VEC4})
         tm = TypeChecker(binding_types={"A": TEXType.VEC3, "radius": TEXType.INT,
                                         "OUT": TEXType.VEC4}, source=code).check(prog)
         it = Interpreter()
@@ -436,7 +437,7 @@ def test_uc3_uniform_loop(r: SubTestResult):
         }
         @OUT = vec4(@A * (s * 0.1), 1.0);
         """
-        prog = Parser(Lexer(code2).tokenize(), source=code2).parse()
+        prog = parse_and_split(code2, {"A": TEXType.VEC3, "OUT": TEXType.VEC4})
         tm = TypeChecker(binding_types={"A": TEXType.VEC3, "OUT": TEXType.VEC4},
                          source=code2).check(prog)
         it = Interpreter()

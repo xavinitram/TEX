@@ -3,6 +3,7 @@ v0.15.0 Phase 3 regression tests — memory.
 M-1: peak estimator + free_tensor_caches.
 """
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_memory import (
     estimate_peak_bytes, free_tensor_caches, enforce_cache_budget,
     cache_budget_bytes,
@@ -11,7 +12,7 @@ import os
 
 
 def _compile(code, bt):
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
+    prog = parse_and_split(code, bt)
     tm = TypeChecker(binding_types=bt, source=code).check(prog)
     return prog
 
@@ -113,7 +114,7 @@ def test_m3_fp16_mode(r: SubTestResult):
     bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
 
     def _run(code, bindings, precision, H, W):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         used = _collect_identifiers(prog)
         return Interpreter().execute(prog, bindings, tm, device="cpu",
@@ -167,7 +168,7 @@ def test_m4_tiling(r: SubTestResult):
     from TEX_Wrangle.tex_memory import is_tile_safe, run_tiled
 
     def _compile_full(code, bt):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         return prog, tm, _collect_identifiers(prog)
 
@@ -227,7 +228,7 @@ def test_m5_out_reuse(r: SubTestResult):
     bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
 
     def _emit_src(code, enabled):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         prog = optimize(prog, tm)
         saved = cgmod._OUT_REUSE_ENABLED
@@ -240,7 +241,7 @@ def test_m5_out_reuse(r: SubTestResult):
             cgmod._OUT_REUSE_ENABLED = saved
 
     def _run(code, img, enabled, fp):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         saved = cgmod._OUT_REUSE_ENABLED
         cgmod._OUT_REUSE_ENABLED = enabled
@@ -269,7 +270,7 @@ def test_m5_out_reuse(r: SubTestResult):
         img = torch.rand(1, 64, 48, 3)
         on = _run(grade, img, True, "m5_on")
         off = _run(grade, img, False, "m5_off")
-        prog = Parser(Lexer(grade).tokenize(), source=grade).parse()
+        prog = parse_and_split(grade, bt)
         tm = TypeChecker(binding_types=bt, source=grade).check(prog)
         ref = Interpreter().execute(prog, {"A": img}, tm, device="cpu",
                                     output_names=["OUT"])["OUT"]
@@ -289,7 +290,7 @@ def test_m5_out_reuse(r: SubTestResult):
         code = ("vec3 c=@A.rgb; float m = luma(c); m = m*2.0 - 0.3; "
                 "c = c + vec3(m)*0.1; @OUT=vec4(c,1.0);")
         b2 = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, b2)
         tm = TypeChecker(binding_types=b2, source=code).check(prog)
         saved = cgmod._OUT_REUSE_ENABLED
         cgmod._OUT_REUSE_ENABLED = True

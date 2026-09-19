@@ -20,6 +20,7 @@ CACHE-4  layered cache epochs (AST ⊑ CODEGEN ⊑ VERDICT) so a codegen-only ed
 CPU-pinned for determinism; CUDA looped when present.
 """
 from helpers import *  # noqa: F401,F403  (SubTestResult, torch, compile_and_run, make_img)
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib  # noqa: F401  (populates REGISTRY)
 from TEX_Wrangle import tex_engine
 
@@ -593,7 +594,7 @@ def test_cache4_failsafe_oracle(r: SubTestResult):
         bt = {"A": TEXType.VEC4}
         A = torch.rand(1, 8, 8, 4)
         # GROUND TRUTH — from source, no get_cache(), no .pkl.
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         truth = Interpreter().execute(prog, {"A": A.clone()}, tm, output_names=["OUT"],
                                       device="cpu")["OUT"]

@@ -1,5 +1,6 @@
 """Codegen equivalence and optimizer tests."""
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 
 
 def test_codegen_equivalence(r: SubTestResult):
@@ -1019,17 +1020,15 @@ color = color * 2.0;
         interp = Interpreter()
         # Run two different programs on the same interpreter
         code1 = "@OUT = @A + 0.1;"
-        tokens1 = Lexer(code1).tokenize()
-        prog1 = Parser(tokens1).parse()
         bt1 = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        prog1 = parse_and_split(code1, bt1)
         tc1 = TypeChecker(binding_types=bt1)
         tm1 = tc1.check(prog1)
         r1 = interp.execute(prog1, {"A": img}, tm1)
 
         code2 = "@OUT = @A * 0.5;"
-        tokens2 = Lexer(code2).tokenize()
-        prog2 = Parser(tokens2).parse()
         bt2 = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        prog2 = parse_and_split(code2, bt2)
         tc2 = TypeChecker(binding_types=bt2)
         tm2 = tc2.check(prog2)
         r2 = interp.execute(prog2, {"A": img}, tm2)
@@ -1064,9 +1063,8 @@ color = color * 2.0;
 
         # Program using u, v, PI
         code = "@OUT = vec3(sin(u * PI) * cos(v));"
-        tokens = Lexer(code).tokenize()
-        prog = Parser(tokens).parse()
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        prog = parse_and_split(code, bt)
         tc = TypeChecker(binding_types=bt)
         tc.check(prog)
         from TEX_Wrangle.tex_compiler.optimizer import optimize
@@ -1084,9 +1082,8 @@ color = color * 2.0;
     # Program using NO builtins
     try:
         code = "@OUT = @A;"
-        tokens = Lexer(code).tokenize()
-        prog = Parser(tokens).parse()
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        prog = parse_and_split(code, bt)
         tc = TypeChecker(binding_types=bt)
         tc.check(prog)
         prog = optimize(prog)
@@ -1120,9 +1117,8 @@ for (int i = 0; i < 20; i = i + 1) {
 
     try:
         code = "@OUT = @A * 0.5;"
-        tokens = Lexer(code).tokenize()
-        prog = Parser(tokens).parse()
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC3}
+        prog = parse_and_split(code, bt)
         tc = TypeChecker(binding_types=bt)
         tm = tc.check(prog)
         prog = optimize(prog)
@@ -1313,8 +1309,7 @@ for (int i = 0; i < 10; i = i + 1) {
 }
 @OUT = vec3(total);
 """
-        tokens = Lexer(code).tokenize()
-        prog = Parser(tokens, source="test").parse()
+        prog = parse_and_split(code, {"A": TEXType.VEC3})
         tc = TypeChecker(binding_types={"A": TEXType.VEC3}, source="test")
         tc.check(prog)
         prog = optimize(prog)
@@ -1367,9 +1362,8 @@ def test_optimizer_passes(r: SubTestResult):
     )
 
     def _parse(code):
-        tokens = Lexer(code).tokenize()
-        prog = Parser(tokens).parse()
         bt = {"OUT": TEXType.VEC3}
+        prog = parse_and_split(code, bt)
         tc = TypeChecker(binding_types=bt)
         tc.check(prog)
         return prog
@@ -1746,7 +1740,7 @@ for (int dy = -2; dy <= 2; dy = dy + 1) {
 }
 @OUT = acc + @A * (k * 0.0);
 """
-        prog = Parser(Lexer(src).tokenize(), source=src).parse()
+        prog = parse_and_split(src, {})
 
         def _walk(n):
             yield n
@@ -1839,8 +1833,7 @@ for (int dy = -1; dy <= 1; dy = dy + 1) {
         from TEX_Wrangle.tex_compiler.optimizer import _opt_expr
         code = ("int x = -3;\nfloat y = -3.5;\nfloat z = !1.0;\n"
                 "@OUT = vec3(float(x), y, z);")
-        tokens = Lexer(code).tokenize()
-        prog = Parser(tokens, source=code).parse()
+        prog = parse_and_split(code, {})
         x_init = _opt_expr(prog.statements[0].initializer)
         assert isinstance(x_init, NumberLiteral) and x_init.is_int \
             and x_init.value == -3.0, f"int fold: {x_init!r}"
@@ -1869,10 +1862,9 @@ def test_optimizer_pure_fn_cse_licm(r: SubTestResult):
     img = torch.rand(1, 8, 8, 3)
 
     def _parse_checked(code, bindings=None):
-        tokens = Lexer(code).tokenize()
-        prog = Parser(tokens, source=code).parse()
         bt = dict(bindings or {})
         bt.setdefault("OUT", TEXType.VEC3)
+        prog = parse_and_split(code, bt)
         tc = TypeChecker(binding_types=bt, source=code)
         tm = tc.check(prog)
         return prog, tm
@@ -2013,10 +2005,9 @@ def test_optimizer_dce_side_effects(r: SubTestResult):
     from TEX_Wrangle.tex_compiler.ast_nodes import VarDecl
 
     def _optimized_var_names(code, bindings=None):
-        tokens = Lexer(code).tokenize()
-        prog = Parser(tokens, source=code).parse()
         bt = dict(bindings or {})
         bt.setdefault("OUT", TEXType.VEC3)
+        prog = parse_and_split(code, bt)
         tc = TypeChecker(binding_types=bt, source=code)
         tm = tc.check(prog)
         prog = optimize(prog, tm)
@@ -2063,8 +2054,8 @@ def test_optimizer_dce_side_effects(r: SubTestResult):
 def _codegen_source(code: str, bindings: dict) -> str:
     """Generated Python source (preamble + body) for a program, unoptimized."""
     from TEX_Wrangle.tex_runtime.codegen import _CodeGen
-    program = Parser(Lexer(code).tokenize(), source=code).parse()
     binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
+    program = parse_and_split(code, binding_types)
     type_map = TypeChecker(binding_types=binding_types, source=code).check(program)
     gen = _CodeGen(type_map)
     gen.emit_program(program)

@@ -10,6 +10,7 @@ under fusion (the documented v1 "fusion requests everything" rule) — pinning i
 import json
 from pathlib import Path
 from helpers import *
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_node import TEXWrangleNode as _N
 
 _PKG = Path(__file__).resolve().parent.parent
@@ -170,7 +171,7 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
         from TEX_Wrangle.tex_runtime import precision_policy as pp
         bt = {"A": TEXType.VEC3, "K": TEXType.VEC3, "OUT": TEXType.VEC4}
         code = "@OUT = vec4(convolve(@A, @K), 1.0);"
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         got = pp.resolve_auto_precision(prog, pp._MIN_FP16_PX, "cuda")[0]
         assert got == "fp32", f"convolve under precision='auto' resolved {got!r}, want 'fp32'"
@@ -184,7 +185,7 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
     try:
         bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
         code = "@OUT = vec4(patch_dist(@A, 3, -2, 1), 0.0, 0.0, 1.0);"
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         got = pp.resolve_auto_precision(prog, pp._MIN_FP16_PX, "cuda")[0]
         assert got == "fp32", f"patch_dist under precision='auto' resolved {got!r}, want 'fp32'"
@@ -201,7 +202,7 @@ def test_c2st_fp16_taxonomy_federated(r: SubTestResult):
     try:
         bt = {"A": TEXType.VEC3, "K": TEXType.VEC3, "OUT": TEXType.VEC4}
         code = "@OUT = vec4(@A.rgb * img_width(@K), 1.0);"
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         got = pp.resolve_auto_precision(prog, pp._MIN_FP16_PX, "cuda")[0]
         assert got == "fp32", f"img_width under precision='auto' resolved {got!r}, want 'fp32'"
@@ -216,7 +217,7 @@ def test_c3st_gm_rules(r: SubTestResult):
     bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
 
     def gate(code):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         # px sits AT the per-arch fp16 floor (S-5) — this test exercises the
         # amplify/fragile/bounded RULES, not the resolution gate, so it must
@@ -263,7 +264,7 @@ def test_a1_2_fusion_lazy_precision_tiers(r: SubTestResult):
 
     # Reference: the SAME math unfused, fp32 interpreter (stage0 then terminal).
     def _run(code, bt, binds, prec="fp32"):
-        prog = Parser(Lexer(code).tokenize(), source=code).parse()
+        prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         return Interpreter().execute(prog, binds, tm, device="cpu",
                                      output_names=["OUT"], precision=prec)["OUT"]

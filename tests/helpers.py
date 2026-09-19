@@ -40,7 +40,7 @@ from TEX_Wrangle.tex_runtime.interpreter import (_ensure_spatial, _broadcast_pai
                                                  _collect_identifiers, _consensus_extent)
 from TEX_Wrangle.tex_compiler.optimizer import optimize
 from TEX_Wrangle.tex_compiler.type_checker import BINDING_HINT_TYPES
-from TEX_Wrangle.tex_cache import TEXCache
+from TEX_Wrangle.tex_cache import TEXCache, parse_and_split
 from TEX_Wrangle.tex_runtime.compiled import execute_compiled, _plain_execute, clear_compiled_cache
 from TEX_Wrangle.tex_runtime.codegen import try_compile, _CgBreak, _CgContinue, _invoke_cg
 from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib, SAFE_EPSILON
@@ -128,13 +128,13 @@ class SubTestResult:
 def compile_and_run(code: str, bindings: dict, device: str = "cpu",
                     latent_channel_count: int = 0,
                     out_type: TEXType = TEXType.VEC4) -> torch.Tensor | str | dict:
-    """Full pipeline: Lex -> Parse -> TypeCheck -> Interpret. Returns @OUT or multi-output dict."""
-    lexer = Lexer(code)
-    tokens = lexer.tokenize()
-    parser = Parser(tokens, source=code)
-    program = parser.parse()
+    """Full pipeline: front end -> TypeCheck -> Interpret. Returns @OUT or multi-output dict.
 
+    The front end is `tex_cache.parse_and_split` (lex + parse + the dotted-binding
+    splitback), the SAME one the production seam uses, so this harness reads a swizzle's
+    base wire exactly as the cook does."""
     binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
+    program = parse_and_split(code, binding_types)
 
     checker = TypeChecker(binding_types=binding_types, source=code)
     type_map = checker.check(program)
@@ -159,12 +159,8 @@ def compile_and_run(code: str, bindings: dict, device: str = "cpu",
 def compile_and_infer(code: str, bindings: dict, device: str = "cpu",
                       latent_channel_count: int = 0) -> tuple:
     """Like compile_and_run but also returns checker.inferred_out_type."""
-    lexer = Lexer(code)
-    tokens = lexer.tokenize()
-    parser = Parser(tokens, source=code)
-    program = parser.parse()
-
     binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
+    program = parse_and_split(code, binding_types)
 
     checker = TypeChecker(binding_types=binding_types, source=code)
     type_map = checker.check(program)
@@ -179,11 +175,10 @@ def compile_and_infer(code: str, bindings: dict, device: str = "cpu",
 
 
 def check_code(code: str, bindings: dict[str, TEXType] | None = None):
-    """Lex/parse/type-check only (no execution). For testing errors and diagnostics."""
-    tokens = Lexer(code).tokenize()
-    prog = Parser(tokens, source=code).parse()
+    """Front end + type-check only (no execution). For testing errors and diagnostics."""
     bt = dict(bindings) if bindings else {}
     bt.setdefault("OUT", TEXType.VEC4)
+    prog = parse_and_split(code, bt)
     checker = TypeChecker(binding_types=bt, source=code)
     return checker.check(prog), checker
 
@@ -195,11 +190,8 @@ _CPU_DEVICE = torch.device("cpu")
 
 def run_both(code, bindings, B=1, H=4, W=4):
     """Run through BOTH interpreter and codegen paths. Returns (interp_result, cg_result_or_None)."""
-    lexer = Lexer(code)
-    tokens = lexer.tokenize()
-    parser = Parser(tokens, source=code)
-    program = parser.parse()
     binding_types = {name: _infer_binding_type(val) for name, val in bindings.items()}
+    program = parse_and_split(code, binding_types)
     checker = TypeChecker(binding_types=binding_types, source=code)
     type_map = checker.check(program)
     output_names = sorted(checker.assigned_bindings.keys())
