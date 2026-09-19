@@ -153,7 +153,9 @@ def _parse_binding_types(raw: object) -> dict | None:
     a name that resolves to no known `TEXType` (`array` included: ARRAY needs element/size
     metadata this map doesn't carry) — is dropped: that one binding is treated as not yet
     known, exactly like an absent key, rather than raising or poisoning every other,
-    well-formed entry in the same map."""
+    well-formed entry in the same map. `planes` IS accepted (DATA-6): a host that carries a
+    named-plane wire declares it as `{"beauty": "planes"}` and the program reads
+    `@beauty.diffuse`; the type needs no metadata beyond the name, so it rides this map."""
     if not isinstance(raw, dict):
         return None
     from .tex_compiler.types import TYPE_NAME_MAP

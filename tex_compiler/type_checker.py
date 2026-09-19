@@ -82,6 +82,7 @@ BINDING_HINT_TYPES = {
     "c": TEXType.VEC3,     # Color → RGB vec3 (hex string in widget)
     "b": TEXType.INT,      # Boolean → 0/1 checkbox
     "a": TEXType.ARRAY,    # DATA-3: an ARRAY wire (curve / palette / histogram; engine profile)
+    "p": TEXType.PLANES,   # DATA-6: a PLANES wire (`p@beauty.diffuse` reads its plane; engine profile)
 }
 
 

@@ -27,6 +27,12 @@ class TEXType(Enum):
     MAT4 = "mat4"
     STRING = "string"
     ARRAY = "array"  # fixed-size array; metadata in TEXArrayType
+    # DATA-6: a WIRE carrying named planes (`@beauty.diffuse`). Wire-only, exactly as ARRAY
+    # is: inert in every expression rule (`is_vector`/`is_scalar`/`is_numeric` are all False,
+    # so a PLANES value cannot enter an expression), reachable only through a host's binding
+    # map or the `p@` hint, and gated on the engine egress profile (`planes_wires_enabled`).
+    # A plane READ types as the plane's own value type — never as PLANES.
+    PLANES = "planes"
     VOID = "void"    # for statements
 
     @property
@@ -48,6 +54,10 @@ class TEXType(Enum):
     @property
     def is_array(self) -> bool:
         return self == TEXType.ARRAY
+
+    @property
+    def is_planes(self) -> bool:
+        return self == TEXType.PLANES
 
     @property
     def is_numeric(self) -> bool:
@@ -110,6 +120,15 @@ def array_wires_enabled() -> bool:
     return _ARRAY_WIRES
 
 
+def planes_wires_enabled() -> bool:
+    """True when a PLANES wire may be read by plane name (DATA-6). False under ComfyUI
+    (default). Deliberately the SAME switch as `array_wires_enabled` — arrays and planes are
+    both engine-profile capabilities (a ComfyUI wire carries neither), so the one host-level
+    egress-profile flag governs both and a host cannot enable one without the other. While
+    it is off, every dotted `@name.seg` is a swizzle — exactly what it meant before planes."""
+    return _ARRAY_WIRES
+
+
 TYPE_NAME_MAP = {
     "float": TEXType.FLOAT,
     "int": TEXType.INT,
@@ -119,6 +138,9 @@ TYPE_NAME_MAP = {
     "mat3": TEXType.MAT3,
     "mat4": TEXType.MAT4,
     "string": TEXType.STRING,
+    # DATA-6: a host declares a PLANES wire through its binding map (`tex_lsp` / `tex_api.check`);
+    # the parser never reaches this row — declared type names are keyword-gated (TYPE_KEYWORDS).
+    "planes": TEXType.PLANES,
 }
 
 _VEC_RANK = {TEXType.VEC2: 0, TEXType.VEC3: 1, TEXType.VEC4: 2}
