@@ -4,6 +4,36 @@
 code. Verified read-only against the phase-0 tree; every file:line below was checked, not
 recalled.*
 
+> **Shipped in v0.37.0 on language `0.24`** — as designed, with these deviations, recorded so
+> the anchors below are not a trap for the next reader (the CHANGELOG entry and the
+> `tests/test_v037_*` files are the record of what landed):
+>
+> 1. **The splitback is not in the TypeChecker** (§1's "TypeChecker splitback"):
+>    `_check_binding_ref` returns a type and cannot replace its own AST node, so §1.1's table is
+>    a pre-typecheck rewrite pass in `tex_cache.compile_ast`, ahead of the first `TypeChecker`
+>    — where §7 puts expansion, so splitback and expansion have one owner.
+> 2. **Expansion is value-level**, not type-level: `tex_marshalling.expand_plane_bindings`
+>    runs in `tex_engine.prepare` right after promise resolution, and the engine derives
+>    `binding_types` from the expanded dict; `tex_cache` needed no edit for it.
+> 3. **The codes** are E3304 (§1.2's collision, refused whether or not the plane is read) and
+>    W7009 (§3's undeclared plane, followed by E6003 naming the slot).
+> 4. **A one-channel plane is handed to the cook as `[B,H,W]`** (a view), the tree's
+>    FLOAT-binding convention, so `vec4(lit, @beauty.Z)` composes; the `PlanesValue` keeps the
+>    wire's own `[B,H,W,1]`, which is what the boundary key and `_binding_shape` report.
+> 5. **`TEXType` gained `PLANES`** as a wire-only member exactly as `ARRAY` — the sentence
+>    below is amended to say so, not re-litigated.
+> 6. **Ten satellites in nine files, not six** (§9): the missing one was
+>    `tools/gen_stock_tools.py`, the generator behind the five stock manifests;
+>    `tests/test_v037_satellites.py` pins the eight that had no test.
+> 7. **§5's audit candidates were false at head**: codegen never names a local after a binding
+>    and graph-capture keys are string-keyed tuples; the one real site was fusion's export
+>    local, which now refuses a dotted export loudly.
+> 8. **Not shipped**, each with its reopen gate in the CHANGELOG: plane writes (§4), fusion
+>    over a PLANES edge (§6, still refused), UINT planes and multipart EXR (§10), a `.textool`
+>    feed into one plane. The ComfyUI node has no PLANES wire type; planes are engine/API-only.
+> 9. **§1.2's collision set measured 38 names, lowercase-only**, as written; `Z` does not
+>    collide, and the corpus example `examples/aov_relight.tex` reads `Z` to prove it.
+
 **The item.** A host wires ONE image input carrying many named planes — an EXR's
 `diffuse`/`specular`/`Z`/`N`, a render's AOVs — and a program reads them by name:
 
@@ -14,8 +44,10 @@ float depth = @beauty.Z;
 ```
 
 The alternative is one wire per plane, which is what a compositor's node graph looks like when
-it has lost the argument. TEXType stays ≤ VEC4 (doc 42 §0.2): **planes exist precisely so the
-type system does not have to grow.** A plane is a binding; a set of planes is a wire.
+it has lost the argument. TEXType's *expression* types stay ≤ VEC4 (doc 42 §0.2): **planes
+exist precisely so the type system does not have to grow** — `PLANES` is a wire-only member,
+exactly as `ARRAY` is, inert in every expression rule and gated on the engine profile. A plane
+is a binding; a set of planes is a wire.
 
 ---
 

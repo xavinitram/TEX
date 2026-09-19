@@ -126,6 +126,10 @@ Rules:
   exactly where a promoted value goes (§4), so the fused program is the ordinary GraphSpec one.
   Once any input declares `feeds`, every input except the source (`terminal_image_input`) must
   declare it and the source may not. A fed input is `IMAGE` or `MASK` and never `optional`. A
+  feed targets a **whole wire**: `binding` is a bare identifier, so a fused tool cannot feed one
+  plane of a PLANES wire (`beauty.diffuse`) in this release — the manifest validator refuses the
+  dot rather than binding a port no host can wire; it reopens with a host wire type that carries
+  a plane set (v0.37.0, language 0.24, `LANGUAGE.md` §5.3). A
   feed may not target a binding its stage already binds — its chain input, a source injection
   point, a baked param, a promoted param's `internal`, or another feed — because one of the two
   writes would silently win. On a DAG spec every stage must read a chain, the source or a feed:
