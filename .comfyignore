@@ -1,0 +1,20 @@
+# .comfyignore — what the registry archive leaves out (PUB-1: the archive is the product).
+#
+# `comfy node publish` zips `git ls-files` minus these patterns (comfy-cli 1.20.0,
+# comfy_cli/file_utils.py::zip_files, gitwildmatch via pathspec). The registry scans the
+# uploaded archive and holds a version out of `Active` on ANY finding, so the archive must
+# carry only what the node needs at runtime. Everything listed here is development
+# material: the suite (whose negative security tests carry the literal strings the scanner
+# is looking for), benchmarks, generators, design notes, the editor's build tree, CI, and
+# the icon/banner that pyproject.toml fetches by URL.
+#
+# RESTRICTION: plain directory-prefix patterns ONLY (`name/`, one per line, no globs, no
+# negation, no leading slash). tests/test_pub1_archive.py mirrors exactly this subset so its
+# verdict is provably the tool's; a pattern of any other form fails that test on purpose.
+tests/
+benchmarks/
+tools/
+docs/
+editor_build/
+.github/
+assets/

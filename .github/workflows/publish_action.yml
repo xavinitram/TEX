@@ -45,3 +45,99 @@ jobs:
         uses: Comfy-Org/publish-node-action@main
         with:
           personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }} ## Add your own personal access token to your Github Repository secrets and reference it here.
+      # PUB-1: the served-version check. A green publish step means the registry ACCEPTED the
+      # upload for review, not that users receive it: every archive is scanned, a version is
+      # held out of `Active` on any finding until an admin approves it, and users only ever
+      # receive `Active` versions. Three publishes were declared live on this job's exit code
+      # while the registry kept serving a version from August. This step runs only after a
+      # successful publish (deliberately NOT `if: always()`), polls the public API every 60 s
+      # for up to 15 min with nothing but curl and the Python stdlib, prints what the registry
+      # says about the version just pushed — its status, and the scan's findings bucketed by
+      # top-level directory and by issue_type once they exist — and which version users
+      # actually receive. It NEVER fails the job: Pending is the normal exit. Read the last line.
+      - name: Registry served-version check (never fails; read the last line)
+        # `shell: bash` + `python3`: the publish action above runs its own setup-python and
+        # exports that interpreter (3.10 at the last publish) to every later step, so this
+        # script uses nothing newer than 3.8 — no tomllib — and names the interpreter it runs on.
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import collections, json, re, subprocess, sys, time
+
+          NODE = "comfyui-tex-wrangle"
+          API = f"https://api.comfy.org/nodes/{NODE}"
+          POLL_S, BUDGET_S = 60, 15 * 60
+
+          def fetch(url):
+              out = subprocess.run(["curl", "-fsS", "--max-time", "30", url],
+                                   capture_output=True, text=True, timeout=60)
+              if out.returncode != 0:
+                  raise RuntimeError(f"curl rc={out.returncode}: {out.stderr.strip()[:200]}")
+              return json.loads(out.stdout)
+
+          def short(status):
+              return status.replace("NodeVersionStatus", "") if isinstance(status, str) else str(status)
+
+          def main():
+              with open("pyproject.toml", encoding="utf-8") as f:
+                  ver = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M).group(1)
+              print(f"published version per pyproject.toml: {ver}")
+              status, findings, served, listed = None, None, None, False
+              deadline = time.monotonic() + BUDGET_S
+              while True:
+                  stamp = time.strftime("%H:%M:%S")
+                  try:
+                      versions = fetch(f"{API}/versions?include_status_reason=true")
+                      node = fetch(API)
+                      served = (node.get("latest_version") or {}).get("version")
+                      row = next((v for v in versions if v.get("version") == ver), None)
+                      if row is None:
+                          print(f"[{stamp}] {ver}: not listed by the registry yet; served = {served}")
+                      else:
+                          listed = True
+                          status = short(row.get("status"))
+                          reason = row.get("status_reason")
+                          if isinstance(reason, str):
+                              try:
+                                  reason = json.loads(reason)
+                              except ValueError:
+                                  pass
+                          findings = reason if isinstance(reason, list) else None
+                          detail = (f"findings = {len(findings)}" if findings is not None
+                                    else f"status_reason = {str(reason)[:80]!r}")
+                          print(f"[{stamp}] {ver}: {status}; served = {served}; {detail}")
+                          if status != "Pending":
+                              break
+                  except Exception as e:
+                      print(f"[{stamp}] registry query failed: {type(e).__name__}: {e}")
+                  if time.monotonic() >= deadline:
+                      print(f"[{stamp}] polling budget ({BUDGET_S // 60} min) spent")
+                      break
+                  time.sleep(POLL_S)
+              if findings:
+                  by_dir, by_type = collections.Counter(), collections.Counter()
+                  for f in findings:
+                      p = str(f.get("file_path", "")).replace("\\", "/")
+                      by_dir[p.split("/", 1)[0] if "/" in p else "<root>"] += 1
+                      by_type[str(f.get("issue_type", "?"))] += 1
+                  print(f"scan findings for {ver}: {len(findings)}")
+                  print("  by top-level directory: " + ", ".join(f"{k}={n}" for k, n in by_dir.most_common()))
+                  print("  by issue_type:          " + ", ".join(f"{k}={n}" for k, n in by_type.most_common()))
+              print("=" * 78)
+              if not listed:
+                  print(f"REGISTRY: {ver} = NOT LISTED after {BUDGET_S // 60} min; served = {served} "
+                        "— a green workflow is NOT a live release")
+              elif status == "Active" and served == ver:
+                  print(f"REGISTRY: {ver} = Active; served = {served} — LIVE, users receive this version")
+              else:
+                  print(f"REGISTRY: {ver} = {status}; served = {served} "
+                        "— a green workflow is NOT a live release")
+              print("=" * 78)
+
+          try:
+              main()
+          except Exception as e:
+              print(f"REGISTRY: check could not complete ({type(e).__name__}: {e}) "
+                    "— the publish step's exit code says nothing about what users receive")
+          sys.exit(0)
+          PY

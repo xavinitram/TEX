@@ -1751,6 +1751,21 @@ def main():
     test_mut1_the_runner_import_list_is_derived_not_hand_written(r)
     test_mut1_every_rows_suite_is_loaded_by_the_runner(r)
 
+    # PUB-1: the archive is the product — `.comfyignore` keeps development material out of
+    # the registry upload; every top-level directory is ignored or allowlisted by name; the
+    # scanner-family sites over the SHIPPED files are pinned; no shipped module imports from
+    # an ignored directory; validate-hw's triton lane SKIPs without benchmarks/.
+    from test_pub1_archive import (
+        test_pub1_every_top_level_directory_is_ignored_or_allowlisted,
+        test_pub1_shipped_surface_ratchet,
+        test_pub1_no_shipped_module_imports_an_ignored_directory,
+        test_pub1_validate_hw_triton_lane_skips_without_benchmarks,
+    )
+    test_pub1_every_top_level_directory_is_ignored_or_allowlisted(r)
+    test_pub1_shipped_surface_ratchet(r)
+    test_pub1_no_shipped_module_imports_an_ignored_directory(r)
+    test_pub1_validate_hw_triton_lane_skips_without_benchmarks(r)
+
     success = r.summary()
     return 0 if success else 1
 

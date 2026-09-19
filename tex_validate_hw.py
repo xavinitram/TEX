@@ -186,7 +186,14 @@ def _lane_tf32(torch, device) -> dict:
 
 def _lane_triton() -> dict:
     import sys
-    sys.path.insert(0, str(_ROOT / "benchmarks"))
+    bench_dir = _ROOT / "benchmarks"
+    if not bench_dir.is_dir():
+        # PUB-1: benchmarks/ is development material and is not in the registry archive, so
+        # an installed node has no triton_validation to delegate to. Not applicable, not an
+        # error — the same SKIP shape the GPU-only lanes use.
+        return {"status": "skipped",
+                "reason": "benchmarks/ is not part of an installed node (development checkout only)"}
+    sys.path.insert(0, str(bench_dir))
     import triton_validation   # self-gating: SKIPs cleanly when Triton is absent
     return triton_validation.main()
 
