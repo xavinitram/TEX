@@ -1766,6 +1766,29 @@ def main():
     test_pub1_no_shipped_module_imports_an_ignored_directory(r)
     test_pub1_validate_hw_triton_lane_skips_without_benchmarks(r)
 
+    # DATA-6 L-D: EXR layer grouping — `read_layers` / `write_layers` over the DATA-2 reader,
+    # the file half of PM-10. The grouping rule (last-dot split, root R/G/B/A -> `beauty`,
+    # bare names -> own planes, R,G,B,A order, >4 / UINT refused) and the bitwise per-plane
+    # round-trip; multipart / deep / tiled stay refused.
+    from test_v037_exr_layers import (
+        test_two_layers_and_a_bare_Z_round_trip_bitwise,
+        test_grouping_splits_on_the_last_dot_and_orders_rgba,
+        test_bare_names_are_own_planes_and_root_rgba_is_beauty,
+        test_beauty_layer_vs_root_precedence,
+        test_more_than_four_channels_is_refused_naming_the_layer,
+        test_uint_channel_is_refused_loudly,
+        test_multipart_deep_tiled_still_refused,
+        test_write_layers_input_contract,
+    )
+    test_two_layers_and_a_bare_Z_round_trip_bitwise(r)
+    test_grouping_splits_on_the_last_dot_and_orders_rgba(r)
+    test_bare_names_are_own_planes_and_root_rgba_is_beauty(r)
+    test_beauty_layer_vs_root_precedence(r)
+    test_more_than_four_channels_is_refused_naming_the_layer(r)
+    test_uint_channel_is_refused_loudly(r)
+    test_multipart_deep_tiled_still_refused(r)
+    test_write_layers_input_contract(r)
+
     success = r.summary()
     return 0 if success else 1
 

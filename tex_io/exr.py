@@ -7,9 +7,11 @@ header, zlib for ZIP, and torch for the pixel plumbing (`.view(dtype)` reinterpr
 `struct.pack` on write — verified bit-identical to torch's own half/float encoding).
 
 SCOPE (honest, roadmap): scanline images only — single-part, NONE / ZIPS / ZIP compression,
-HALF or FLOAT (UINT read-only). Tiled, multipart, deep, and the lossy codecs (PIZ, PXR24, B44,
-DWA) are out of scope and raise a clear error rather than mis-decode. Little-endian hosts only
-(every target; EXR is LE and torch reinterpret uses native order).
+HALF or FLOAT (UINT read-only). Layers — `layer.channel` channel names inside that one part —
+are in (`read_layers` / `write_layers`, DATA-6); parts, deep and tiled remain out. Tiled,
+multipart, deep, and the lossy codecs (PIZ, PXR24, B44, DWA) raise a clear error rather than
+mis-decode. Little-endian hosts only (every target; EXR is LE and torch reinterpret uses
+native order).
 
 The value contract: a written buffer read back is bit-exact for FLOAT and half-rounded for
 HALF (the storage dtype's own precision, nothing lost beyond it).
@@ -44,10 +46,13 @@ class ExrImage:
     """A decoded EXR: `pixels` is [H, W, C] fp32 with channels in `channels` order (canonical
     R,G,B,A when the file's channels are a subset of those, else the file's sorted order).
     `desc` carries the file's storage dtype (float16/float32) so a host that re-saves keeps the
-    precision it read."""
+    precision it read. `pixel_types` is the file's pixelType per channel (0 UINT, 1 HALF,
+    2 FLOAT) in `channels` order — `desc` records the FIRST channel's storage only, and a
+    layered read (`read_layers`) needs the per-channel truth to refuse a UINT id plane."""
     pixels: torch.Tensor
     channels: list
     desc: BufferDesc
+    pixel_types: tuple = ()
 
 
 # ── ZIP codec (EXR's interleave + delta predictor, vectorized) ────────────────
@@ -225,7 +230,9 @@ def _decode_exr(buf: memoryview) -> ExrImage:
     # the field a producer (it was declared-but-dead before); full read→BufferMeta.colorspace
     # wiring is a DATA-1↔DATA-2 host-integration follow-up.
     desc = BufferDesc(storage=_PT_STORAGE.get(channels[0][1], "float32"), transfer="linear")
-    return ExrImage(pixels=pixels, channels=ordered, desc=desc)
+    ptype = {name: pt for name, pt, _ in channels}
+    return ExrImage(pixels=pixels, channels=ordered, desc=desc,
+                    pixel_types=tuple(ptype[n] for n in ordered))
 
 
 def _canonical_order(names):
@@ -242,6 +249,24 @@ def _canonical_order(names):
 _DEFAULT_NAMES = {1: ["Y"], 2: ["R", "G"], 3: ["R", "G", "B"], 4: ["R", "G", "B", "A"]}
 
 
+def _as_hwc(pixels: torch.Tensor) -> torch.Tensor:
+    """The writer's shape rule, shared by `write_exr` and `write_layers`: [H,W,C] passes,
+    [H,W] is a mask → [H,W,1], [1,H,W,C] drops the batch, and a dim-3 [1,H,W] is a BATCHED
+    mask → [H,W,1] — NOT a [H=1,W,C] image (see `write_exr`). Anything else is an `EXRError`.
+    Returns fp32 on the CPU."""
+    t = pixels.detach().to(torch.float32).cpu()
+    if t.dim() == 4 and t.shape[0] == 1:
+        t = t[0]                              # [1,H,W,C] -> [H,W,C]
+    elif t.dim() == 3 and t.shape[0] == 1:    # [1,H,W] batched mask/scalar -> [H,W,1]
+        t = t[0].unsqueeze(-1)                #   (NOT slice the width axis into channels)
+    if t.dim() == 2:
+        t = t.unsqueeze(-1)                   # [H,W] mask -> [H,W,1]
+    if t.dim() != 3:
+        raise EXRError(f"cannot write a tensor of shape {tuple(pixels.shape)} as EXR "
+                       f"(expected [H,W,C], [H,W], or [1,H,W,C])")
+    return t
+
+
 def write_exr(path, pixels: torch.Tensor, *, channels=None, half: bool = False,
               compression: str = "zip") -> None:
     """Write [H,W,C] (or [H,W] / [1,H,W,C] / [1,H,W]) fp32 pixels to an EXR. `half=True` stores
@@ -256,16 +281,7 @@ def write_exr(path, pixels: torch.Tensor, *, channels=None, half: bool = False,
     if compression not in _SUPPORTED_COMPRESSION:
         raise EXRError(f"unsupported compression {compression!r} "
                        f"(only {', '.join(_SUPPORTED_COMPRESSION)})")
-    t = pixels.detach().to(torch.float32).cpu()
-    if t.dim() == 4 and t.shape[0] == 1:
-        t = t[0]                              # [1,H,W,C] -> [H,W,C]
-    elif t.dim() == 3 and t.shape[0] == 1:    # [1,H,W] batched mask/scalar -> [H,W,1]
-        t = t[0].unsqueeze(-1)                #   (NOT slice the width axis into channels)
-    if t.dim() == 2:
-        t = t.unsqueeze(-1)                   # [H,W] mask -> [H,W,1]
-    if t.dim() != 3:
-        raise EXRError(f"cannot write a tensor of shape {tuple(pixels.shape)} as EXR "
-                       f"(expected [H,W,C], [H,W], or [1,H,W,C])")
+    t = _as_hwc(pixels)
     H, W, C = t.shape
     names = list(channels) if channels is not None else _DEFAULT_NAMES.get(C)
     if names is None or len(names) != C:
@@ -339,3 +355,133 @@ def _exr_header(W: int, H: int, names, ptype: int, comp: int) -> bytes:
     out += attr("screenWindowWidth", "float", struct.pack("<f", 1.0))
     out += b"\x00"                                  # end of header
     return bytes(out)
+
+
+# ── Layers (DATA-6): `layer.channel` names grouped into per-plane tensors ─────
+#
+# An EXR "layer" is a NAMING convention inside one part's channel list (`beauty.R`,
+# `specular.G`, a bare `Z`), not the multipart container. The reader above already returns
+# every such channel verbatim, and a write→read round-trip through it is bitwise — so this
+# section is a grouping over `ExrImage` plus its inverse flattener, never a decoder change.
+# Multipart / deep / tiled stay refused exactly where `_decode_exr` refuses them.
+
+_ROOT_PLANE = "beauty"                 # the implicit root layer's colour group, as a plane
+_ROOT_COLOUR = ("R", "G", "B", "A")    # its channels — and the per-position letters on write
+
+
+def _split_layer(name: str):
+    """`layer.channel` split on the LAST dot — the same split the compiler applies to a dotted
+    `@src.plane` read, so one rule governs both ends. No dot → the implicit root layer, ``""``."""
+    layer, dot, chan = name.rpartition(".")
+    return (layer, chan) if dot else ("", name)
+
+
+def read_layers(src) -> dict:
+    """Decode an EXR (path or bytes) and group its channels into named planes:
+    ``{plane: (pixels [H,W,C<=4] fp32, BufferDesc)}``. The grouping rule:
+
+    * a channel name splits on its LAST dot into `layer` and `channel`; a layered channel
+      belongs to the plane named `layer` (`beauty.diffuse.R` → plane `beauty.diffuse`);
+    * the root layer's `R`/`G`/`B`/`A` group into a plane named `beauty` — only when the file
+      has no explicit `beauty` layer. A file carrying BOTH is refused: the container gives
+      the root group no name of its own (its layer name is the empty string), and a plane no
+      program can address would vanish silently;
+    * any other bare name (`Z`, `N`, `id`) is a single-channel plane of its own name, [H,W,1];
+    * within a plane, channels come R,G,B,A when they are a subset of those, else in the
+      file's own sorted order (the file stores `B,G,R`; the plane comes back `R,G,B`);
+    * a layer with more than four channels, or with a UINT channel (an integer id plane —
+      cryptomatte), raises `EXRError` naming the layer rather than yielding a wrong plane.
+
+    Per-plane `BufferDesc.storage` is `float16` when every channel of that plane is HALF,
+    else `float32`; `transfer` is `linear` as for `read_exr`. A plane name that collides with
+    a swizzle (`rgb`, `z`, …) is reported as-is — refusing it is the compiler's job, at the
+    point a program reads the plane; the reader's job is to report the file. Tiled /
+    multipart / deep files raise exactly as `read_exr` does. Returns a plain dict so this
+    module stays a leaf: the host wraps it in its own plane carrier."""
+    img = read_exr(src)
+    ptypes = img.pixel_types or (_PT_FLOAT,) * len(img.channels)
+    ptype = dict(zip(img.channels, ptypes))
+    members = {}                                   # plane -> [(channel, column)]
+    origin = {}                                    # plane -> "root" | "layer" | "bare"
+    for col, name in enumerate(img.channels):
+        layer, chan = _split_layer(name)
+        if layer:
+            plane, kind = layer, "layer"
+        elif chan in _ROOT_COLOUR:
+            plane, kind = _ROOT_PLANE, "root"
+        else:
+            plane, kind = chan, "bare"
+        prev = origin.setdefault(plane, kind)
+        if prev != kind:
+            if plane == _ROOT_PLANE and {prev, kind} == {"root", "layer"}:
+                raise EXRError(f"EXR has both root R/G/B/A channels and an explicit "
+                               f"'{_ROOT_PLANE}' layer: the root colour group has no name of "
+                               f"its own in the container, so the two cannot both be planes "
+                               f"— rename the '{_ROOT_PLANE}' layer")
+            raise EXRError(f"EXR channel groups collide on plane '{plane}' (a bare "
+                           f"'{plane}' channel beside a '{plane}.*' layer)")
+        members.setdefault(plane, []).append((chan, col))
+
+    out = {}
+    for plane, rows in members.items():
+        chans = [c for c, _ in rows]
+        if len(chans) > 4:
+            raise EXRError(f"EXR layer '{plane}' has {len(chans)} channels "
+                           f"({', '.join(chans)}); a plane is at most 4 (VEC4) — split the "
+                           f"layer, or read the raw channels with read_exr")
+        uint = [c for c, col in rows if ptype[img.channels[col]] == _PT_UINT]
+        if uint:
+            raise EXRError(f"EXR layer '{plane}' has UINT channel(s) {', '.join(uint)}: an "
+                           f"integer id plane (cryptomatte) is out of scope, and a float plane "
+                           f"in its place would be silently wrong")
+        column = dict(rows)
+        cols = [column[c] for c in _canonical_order(chans)]
+        storage = ("float16" if all(ptype[img.channels[col]] == _PT_HALF for _, col in rows)
+                   else "float32")
+        out[plane] = (img.pixels[:, :, cols], BufferDesc(storage=storage, transfer="linear"))
+    return out
+
+
+def write_layers(path, planes: dict, *, root=_ROOT_PLANE, half: bool = False,
+                 compression: str = "zip") -> None:
+    """The inverse of `read_layers`: flatten ``{plane: pixels [H,W,C<=4]}`` into `layer.channel`
+    names and write ONE scanline part through `write_exr`. Per plane: the plane named `root`
+    (default `beauty`, `read_layers`' name for the root colour group) is written as the bare
+    root `R,G,B,A`; any other single-channel plane whose name has no dot is written as that
+    bare name (`Z` → `Z`); everything else is `name.R`, `name.G`, `name.B`, `name.A` by
+    position. `root=None` writes every plane as an explicit layer. Each plane takes the shapes
+    `write_exr` takes; all planes must share one H×W.
+
+    Round-trip contract: `read_layers` of what `write_layers` wrote from a `read_layers`
+    result is bitwise equal per plane (half-rounded under `half=True`). The file's channel
+    SPELLINGS are normalised to the rule above (`N.X` reads back as plane `N` and is
+    re-written `N.R`): the grouped view is what round-trips, and the grouping rule — not the
+    file — owns channel order."""
+    if not planes:
+        raise EXRError("write_layers needs at least one plane")
+    names, cols, extent = [], [], None
+    for plane, pixels in planes.items():
+        if not isinstance(plane, str) or not plane:
+            raise EXRError(f"plane names must be non-empty strings (got {plane!r})")
+        t = _as_hwc(pixels)
+        if extent is None:
+            extent = tuple(t.shape[:2])
+        elif tuple(t.shape[:2]) != extent:
+            raise EXRError(f"plane '{plane}' is {tuple(t.shape[:2])} but the first plane is "
+                           f"{extent}: every plane in one EXR part shares one extent")
+        C = t.shape[2]
+        if not 1 <= C <= 4:
+            raise EXRError(f"plane '{plane}' has {C} channels; a plane is 1 to 4 (VEC4)")
+        if plane == root:
+            chans = list(_ROOT_COLOUR[:C])
+        elif C == 1 and "." not in plane:
+            chans = [plane]
+        else:
+            chans = [f"{plane}.{c}" for c in _ROOT_COLOUR[:C]]
+        names += chans
+        cols.append(t)
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise EXRError(f"planes flatten to duplicate EXR channel name(s) {', '.join(dup)} — "
+                       f"rename a plane")
+    write_exr(path, torch.cat(cols, dim=-1), channels=names, half=half, compression=compression)
