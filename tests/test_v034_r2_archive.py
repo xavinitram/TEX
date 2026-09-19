@@ -88,26 +88,35 @@ def test_v034_r2_versions_sort_numerically(r):
 
 
 def test_v034_r2_neutrality(r):
-    """The shipped archive holds exactly ONE version, and it is the language's own.
+    """The shipped archive holds every frozen version, and the NEWEST is the language's own.
 
-    This is the neutrality proof doc 41 §3.4 asks for: with one archived version the corpus
-    test runs the same single comparison it ran before R2-archive, so the mechanism changed
-    the machinery and nothing else. When v0.37 freezes 0.24 this row's count becomes 2 and
-    the assertion below is what makes someone update it deliberately."""
+    This is the neutrality proof doc 41 §3.4 asks for. At v0.34 the archive held exactly one
+    version (0.23) and this row asserted that; v0.37 froze 0.24 (DATA-6, the first grammar bump
+    since R2-archive) and the count became 2, as the row foresaw. The shape now: the versions
+    are derived from the directory, the newest equals `LANGUAGE_VERSION` (the archive's newest
+    file is always the language the engine implements), every earlier one is still present
+    (`test_lang3_compat_corpus` checks each), and today the set is exactly {0.23, 0.24} — the
+    next freeze updates that set deliberately, here."""
     try:
         from TEX_Wrangle.tex_api import LANGUAGE_VERSION
         versions = compat_corpus.archived_versions()
-        assert versions == [LANGUAGE_VERSION], \
-            f"archived={versions}, LANGUAGE_VERSION={LANGUAGE_VERSION}"
+        assert versions, "no frozen language versions in the archive"
+        assert versions[-1] == LANGUAGE_VERSION, \
+            f"newest archived={versions[-1]}, LANGUAGE_VERSION={LANGUAGE_VERSION}"
+        assert versions == ["0.23", "0.24"], f"archived={versions}"
         payload = compat_corpus.load_goldens()
         assert payload["language_version"] == LANGUAGE_VERSION, payload["language_version"]
         n = len(payload["hashes"])
         assert n >= 100, f"only {n} goldens"
+        for older in versions[:-1]:
+            m = len(compat_corpus.load_version(older)["hashes"])
+            assert m >= 100, f"only {m} goldens in {older}"
         # The flat file the archive replaced must be GONE, not shadowed: two sources of
         # goldens is how one of them silently stops being read.
         legacy = os.path.join(compat_corpus._HERE, "compat_corpus_goldens.json")
         assert not os.path.exists(legacy), f"the pre-R2 flat golden file is still there: {legacy}"
-        r.ok(f"R2: one frozen version ({LANGUAGE_VERSION}, {n} programs), flat file retired")
+        r.ok(f"R2: {len(versions)} frozen version(s) {versions}, newest = {LANGUAGE_VERSION} "
+             f"({n} programs), flat file retired")
     except Exception as e:
         r.fail("R2 neutrality", f"{type(e).__name__}: {e}")
 

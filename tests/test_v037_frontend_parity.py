@@ -30,6 +30,7 @@ dotted `@` form (the twelve the compat scan reports), plus inline programs with 
 Every row runs on the compiler and the CPU interpreter alone. No ComfyUI, no CUDA, no
 compiler toolchain, no Windows path, no embedded interpreter, no numpy, no timing.
 """
+import contextlib
 import os
 import re
 
@@ -66,6 +67,13 @@ def _dotted_examples() -> list:
 
 def _base(name: str) -> str:
     return name.rsplit(".", 1)[0] if "." in name else name
+
+
+def _has_planes_hint(src: str) -> bool:
+    """True when the program carries a `p@` hint — a PLANES wire exists only on the engine
+    profile, so such a program is read there; every other program keeps the default profile."""
+    return any(t.type is TokenType.TYPED_AT_BINDING and t.prefix == "p"
+               for t in Lexer(src).tokenize())
 
 
 class _planes_enabled:
@@ -179,25 +187,34 @@ def test_every_front_end_agrees_on_the_wires_a_program_reads(r: SubTestResult):
     except Exception as e:
         r.fail("corpus derived from examples/", str(e))
     for name, src in corpus:
-        try:
-            bt, bindings, wires, assigned, params = _reference(src)
-            assert wires and not any("." in w for w in wires), (name, wires)
-            assert wires == frozenset(bindings) - params, \
-                f"seam {sorted(wires)} vs corpus harness {sorted(frozenset(bindings) - params)}"
-        except Exception as e:
-            r.fail(f"{name}: reference reading", str(e))
-            continue
-        disagree = []
-        # Each consumer is asked in its own try, so the one that RAISES on a swizzle it read
-        # as a binding (a false type error from a private parse) is named, not just the row.
-        for consumer, read in _consumers(src, bt, bindings, wires, assigned, params):
+        # DATA-6 L-E: a program with a `p@` hint reads a PLANES wire, which exists only on the
+        # engine profile (`test_v037_planes_wire` holds the same switch); it is read there, and
+        # its reads are compared at the WIRE level — the seam reads the per-plane rows
+        # (`beauty.diffuse`), `sigil_names` reports bases by design, and "the wires a program
+        # reads" is the base either way. Every other program keeps the default profile and the
+        # exact comparison, so the parity claim for the twelve swizzle programs is unchanged.
+        hinted = _has_planes_hint(src)
+        norm = (lambda names: frozenset(_base(n) for n in names)) if hinted else (lambda names: names)
+        with (_planes_enabled(True) if hinted else contextlib.nullcontext()):
             try:
-                got = read()
-            except Exception as e:                    # noqa: BLE001 — the name is the point
-                disagree.append(f"{consumer}: raised {type(e).__name__}: {str(e).splitlines()[0]}")
+                bt, bindings, wires, assigned, params = _reference(src)
+                assert wires and not any("." in w for w in norm(wires)), (name, wires)
+                assert wires == frozenset(bindings) - params, \
+                    f"seam {sorted(wires)} vs corpus harness {sorted(frozenset(bindings) - params)}"
+            except Exception as e:
+                r.fail(f"{name}: reference reading", str(e))
                 continue
-            if got != wires:
-                disagree.append(f"{consumer}: reads {sorted(got)}, seam reads {sorted(wires)}")
+            disagree = []
+            # Each consumer is asked in its own try, so the one that RAISES on a swizzle it read
+            # as a binding (a false type error from a private parse) is named, not just the row.
+            for consumer, read in _consumers(src, bt, bindings, wires, assigned, params):
+                try:
+                    got = read()
+                except Exception as e:                    # noqa: BLE001 — the name is the point
+                    disagree.append(f"{consumer}: raised {type(e).__name__}: {str(e).splitlines()[0]}")
+                    continue
+                if norm(got) != norm(wires):
+                    disagree.append(f"{consumer}: reads {sorted(got)}, seam reads {sorted(wires)}")
         try:
             assert not disagree, "\n      ".join(disagree)
             r.ok(f"{name}: {len(wires)} wire(s) {sorted(wires)} — every consumer agrees")

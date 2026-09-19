@@ -453,31 +453,32 @@ def test_tool_schema_rejects(r: SubTestResult):
 # any CR or LF inside a string value, so the only CRLFs in the file are the ones the handle
 # wrote between lines, and every other byte (key order, indentation, separators, UTF-8
 # content, the trailing newline or its absence) is still pinned exactly.
+# re-pinned at language 0.24 (DATA-6 L-E); a bump moves these on purpose — regenerate, then re-pin
 _MANIFEST_BASELINE_SHA256 = {
     "blur.textool": {
-        "to_dict": "cc8d30cbf3d31a33dd7bb684dcae94561b4da9827fd459b4fd91c5f812135da4",
+        "to_dict": "8e0d9ab97e747a7453bfd4eb767b819b1c63c75e5a10aea85916326ae896b762",
         "tool_summary": "37497076f938e2b7086c86f5f807d4658a8388594fbf06bd18bf8c999c22ca1b",
-        "written_bytes": "e7ffcbc8017bcb6c409d4958ffe85ac995df8e16d6c7f90999cc800be20d5507",
+        "written_bytes": "8b61aa6dfb59805e54532b8c01350acb5353fa0e6d6a01d3b0fa84b1e81cc31f",
     },
     "grade.textool": {
-        "to_dict": "108748f0c2c3ceb926551a9188a4cc50096756f000ea098900a78f4a1733b07e",
+        "to_dict": "b1118c66c6a6620f9815aa534296ccb00e4e4efd84cccbe9d3a07337db97d88e",
         "tool_summary": "040db66ad91572cfe1d2557a02f7260fb0a45af714864fbb9599a45987573802",
-        "written_bytes": "0ea64dc0227e4489a6eb5f67f811f452ee664750ffed3b616b0aa0158b2f48bd",
+        "written_bytes": "133a8eb81a06be1f732bf8583f960462651fab222fd880834858e276158d58a9",
     },
     "grade_vignette.textool": {
-        "to_dict": "cfd407ab512b35d0fdca53b1cd0fb29f31a487699210910c182e44d756a4f9db",
+        "to_dict": "e92c3bf6289b558304d01a48480768abf12c84c09a861590f894cb7ec3da7d89",
         "tool_summary": "783d1a2d1afa0cca7ac2937c4ded691beff331174ce95b155327e72616c3dc5e",
-        "written_bytes": "d23dd4d7065b5ede02fb441faeaee46d3dcbd2144d1ad6a29bd7318e34b89ea6",
+        "written_bytes": "01f0b2882046b379260ce4d7c3cce9358ed8860ca214871a3bc14793c597eeb1",
     },
     "merge.textool": {
-        "to_dict": "52ebde0e7eda07b52b4c9fcec17820a525d24923208ab7666f795aff1879331d",
+        "to_dict": "9a18df84938c51873e66e50e4080b5d706326265c4460060ba8d5a1c107fd6b9",
         "tool_summary": "f7e68d2ca334ac03e60d46b3f7096c562f7dfc2ded7f9a369219b1b1d5b261b0",
-        "written_bytes": "a86aba76b00e2acc9efc148aa6cdba87ae8c5d27bf60b2894e6019a61e07f3d4",
+        "written_bytes": "45d455caf6cfa3971dc010a9dab8c6c5b38770f535afcbdec2a8dd7200309ec8",
     },
     "vignette.textool": {
-        "to_dict": "74a8b0b0b8660dbee20989f3614a7294fb46e2fd9762517ee1a43a2c53430f34",
+        "to_dict": "c1f3933c0798673081a59fc4c34c5955465ee4278d5dad40500a0c34c80ab2f7",
         "tool_summary": "11f9fb5e822646fd0e37d6352b2e7ffe4f871e9d300318864b26ea9694bab3f7",
-        "written_bytes": "c69ab8e7746fdbcc3fe4ed8b8e5b1d09f653473d82d326d0ed00d65e4a6e4692",
+        "written_bytes": "07b90bb1444a158ce5af800951539c924f13433efb749b502fa7f6bb32a80468",
     },
 }
 # Two representative pre-existing manifest shapes (single-stage / fused) -- neither uses any

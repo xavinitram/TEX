@@ -45,6 +45,19 @@ print(f"scanning {len(sources)} programs "
 # A dotted `@` form is `@ident . ident` with no intervening space, per the greedy lexer's rule.
 DOTTED = re.compile(r"@[A-Za-z_][A-Za-z_0-9]*\.[A-Za-z_][A-Za-z_0-9]*")
 
+
+
+def _kind(seg, base, hinted):
+    """SWIZZLE (the segment is a channel/swizzle name — the pre-0.24 meaning, on any wire);
+    PLANE (a non-swizzle segment on a wire that carries a `p@` hint somewhere in the program —
+    a plane read, legal since language 0.24); NOT-A-SWIZZLE (a non-swizzle segment on a wire
+    with NO `p@` hint — the form the tripwire exists to catch, because the greedy lexer would
+    change its meaning)."""
+    if seg in COLLISION:
+        return "SWIZZLE"
+    return "PLANE" if base in hinted else "NOT-A-SWIZZLE"
+
+
 hits, lexfail = [], []
 for name, src in sources:
     try:
@@ -52,23 +65,27 @@ for name, src in sources:
     except Exception as e:
         lexfail.append((name, f"{type(e).__name__}: {e}"))
         continue
+    # The wires this program declares PLANES: the base of every `p@` hint (dotted or not).
+    hinted = {t.value.rsplit(".", 1)[0]
+              for t in toks if t.type is TokenType.TYPED_AT_BINDING and t.prefix == "p"}
     # Token-level, in BOTH lexer generations so the tripwire keeps counting the same set:
     #   * pre-greed: an AT_BINDING immediately followed by DOT then IDENT — the sequence the
     #     greedy lexer fuses;
     #   * greedy (DATA-6 shipped): one AT_BINDING whose value carries the dot — the fused form.
     # Either way the segment is what follows the LAST dot, which is what the splitback splits on.
     for i, t in enumerate(toks):
-        if t.type is not TokenType.AT_BINDING:
+        if t.type not in (TokenType.AT_BINDING, TokenType.TYPED_AT_BINDING):
             continue
+        sigil = f"{t.prefix}@" if t.type is TokenType.TYPED_AT_BINDING else "@"
         if "." in t.value:
-            seg = t.value.rsplit(".", 1)[1]
-            hits.append((name, f"@{t.value}", seg,
-                         "SWIZZLE" if seg in COLLISION else "NOT-A-SWIZZLE"))
+            base, seg = t.value.rsplit(".", 1)
+            hits.append((name, f"{sigil}{t.value}", seg, _kind(seg, base, hinted)))
         elif i + 2 < len(toks) and toks[i + 1].type is TokenType.DOT \
                 and toks[i + 2].type is TokenType.IDENT:
+            # A typed non-`p` prefix never lexes greedily, so `f@x.y` is `TYPED_AT_BINDING . IDENT`
+            # — the splitback's own output, and a swizzle by construction; counted for the record.
             seg = toks[i + 2].value
-            hits.append((name, f"@{t.value}.{seg}", seg,
-                         "SWIZZLE" if seg in COLLISION else "NOT-A-SWIZZLE"))
+            hits.append((name, f"{sigil}{t.value}.{seg}", seg, _kind(seg, t.value, hinted)))
 
 print(f"dotted @ forms found: {len(hits)}")
 by_kind = {}
@@ -93,8 +110,11 @@ print("\n" + "=" * 78)
 if odd:
     print("VERDICT: DIRTY — at least one dotted form is not a swizzle. Design must handle it.")
 elif hits:
+    planes = sum(1 for h in hits if h[3] == "PLANE")
     print("VERDICT: CLEAN-WITH-SWIZZLES — every dotted form is an ordinary swizzle, so the")
-    print("  splitback rule's row 2/4 covers them all. Phase 2 must show these bit-exact.")
+    print("  splitback rule's row 2/4 covers them all. Phase 2 must show these bit-exact."
+          + (f" ({planes} plane read(s) on p@-hinted wires, legal since 0.24, counted apart.)"
+             if planes else ""))
 else:
     print("VERDICT: CLEAN — no frozen or shipped program contains a dotted @ form at all.")
     print("  The greedy lexer cannot alter any existing token stream.")
