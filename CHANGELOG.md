@@ -5,6 +5,18 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.5] - 2026-09-19
+
+**The last cell.** `v0.36.4` scanned at **20 findings** — the 19 structural sites its
+`SECURITY.md` table documents, plus one more cell of that same table: the *read* row still quoted
+the environment-read call spelling while the write row beside it had been reworded. One cell, one finding, one
+release, because the review request will cite a version whose findings are exactly the structural
+set and whose `SECURITY.md` obeys its own rule. The row now says "environment reads"; the
+surface ratchet's `env_read` pin moves 25 → 24 with the measurement recorded above the pins.
+
+**No product behaviour changes.** `tex_api.LANGUAGE_VERSION` stays `0.23`; no reserved name is
+added; no compat freeze is owed. The registry archive is the same 215 files.
+
 ## [0.36.4] - 2026-09-19
 
 **Describe it, don't quote it.** `v0.36.3` reached the registry with **23 findings instead of 92**
