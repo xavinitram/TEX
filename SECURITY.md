@@ -18,16 +18,18 @@ The Comfy registry scans every published archive with YARA rules and holds a ver
 manual review on any finding. TEX's shipped code produces a small, stable set; they are the
 product's real behaviour, documented here so a reviewer does not have to rediscover them.
 (`tests/`, `benchmarks/`, `tools/`, `docs/` and `editor_build/` are excluded from the archive
-by `.comfyignore`; `tests/test_pub1_archive.py` pins this census so it cannot grow unnoticed.)
+by `.comfyignore`; `tests/test_pub1_archive.py` pins this census so it cannot grow unnoticed. The
+scanner reads prose as well as code — this table therefore *describes* each mechanism rather than
+quoting the call it matches, which is not evasion: the code sites themselves stay declared below.)
 
 | Finding | Where | What it is | Reachable from outside? |
 |---|---|---|---|
 | `compile()` / `exec()` | `tex_runtime/codegen.py` | The codegen tier: the DSL's typed AST is emitted as one Python function and executed. Identifiers are ASCII-only at the lexer, unknown names are rejected by the type checker, string literals are emitted with `repr()`, bindings as `_bind[{name!r}]` — no user text reaches the source. Proven by `tests/test_v026_phase1.py::test_tool_emitter_fuzz`. | Only through a program's own AST |
 | `marshal.loads()` + `exec()` | `tex_runtime/codegen_persist.py` | Rehydrates a persisted codegen function. The `.cg` sidecar is HMAC-SHA256-verified with a per-user key (`tex_recovery.load_verified`), then checked for codegen epoch, `MAGIC_NUMBER` and blob SHA-256; any failure deletes it and regenerates from source. | Only TEX's own verified output |
-| `subprocess.run([...vcvarsall...])` | `tex_runtime/compiled.py` | Windows only: runs `vcvarsall.bat` once so torch inductor can find `cl.exe`. Constant argv; the path comes from probing known Visual Studio locations; called lazily on the first `torch.compile` attempt, never at import, never from a route. | No |
-| `os.environ[...] =` | `tex_runtime/compiled.py`, `tex_testkit.py` | The INCLUDE/LIB/LIBPATH/PATH output of that probe; and the opt-in host test harness pointing `TEX_CACHE_DIR` at a temp dir (restored afterwards). `tex_testkit` is not imported by the node, routes or CLI. | No |
+| a subprocess call to `vcvarsall.bat` | `tex_runtime/compiled.py` | Windows only: runs `vcvarsall.bat` once so torch inductor can find `cl.exe`. Constant argv; the path comes from probing known Visual Studio locations; called lazily on the first `torch.compile` attempt, never at import, never from a route. | No |
+| two environment writes | `tex_runtime/compiled.py`, `tex_testkit.py` | The INCLUDE/LIB/LIBPATH/PATH output of that probe; and the opt-in host test harness pointing `TEX_CACHE_DIR` at a temp dir (restored afterwards). `tex_testkit` is not imported by the node, routes or CLI. | No |
 | `os.environ.get(...)` | several modules | Read-only `TEX_*` tuning knobs (cache dir and byte budgets, opt-in thread count, the codegen out-reuse kill switch, opt-in ROI paths, offline docs), plus `INCLUDE` and the per-user state directory. | Reads only |
-| `node.connect(...)` in `js/` | `js/tex_extension.js`, `js/tex_cm6_bundle.js` | LiteGraph's node-link API and the editor bundle — a Python rule matching JavaScript. The package makes no network call anywhere. | No |
+| LiteGraph's node-link `connect` call in `js/` | `js/tex_extension.js`, `js/tex_cm6_bundle.js` | LiteGraph's node-link API and the editor bundle — a Python rule matching JavaScript. The package makes no network call anywhere. | No |
 
 ## The HTTP routes
 

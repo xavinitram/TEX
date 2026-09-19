@@ -197,9 +197,15 @@ not ship. Three rules, each pinned by `tests/test_pub1_archive.py`:
   genuinely needs a new site, it lands with the pin AND a row in `SECURITY.md`'s finding table
   saying what it is and why it is not attacker-reachable, because that table is what the
   registry's reviewer reads.
-- **Do NOT dodge the scanner.** Splitting `"ex" + "ec"`, aliasing builtins, rewording a docstring
-  so a regex misses it — the registry's standards ban obfuscation outright and it would deserve
-  the ban. TEX's compiled tier IS `compile()`/`exec()` of AST-derived source; that is declared, not
+- **Do NOT dodge the scanner in CODE.** Splitting `"ex" + "ec"`, aliasing builtins, rewording a
+  docstring beside a real call so a regex misses it — the registry's standards ban obfuscation
+  outright and it would deserve the ban. **Prose is different, and the scanner reads it** (measured
+  2026-09-19: v0.36.3 was flagged on `CHANGELOG.md` for quoting a destructive shell command and on
+  three `SECURITY.md` table cells for quoting call shapes). Documentation DESCRIBES a mechanism —
+  "a subprocess call to vcvarsall", "an environment write" — and never reproduces an attack string
+  or a matched call spelling; the code site itself stays declared, so nothing is hidden. The ratchet
+  censuses every shipped text file (`.py`, `.js`, `.md`, `.json`, `.toml`, …), not just code, for
+  exactly this reason. TEX's compiled tier IS `compile()`/`exec()` of AST-derived source; that is declared, not
   hidden, and every TEX version needs an admin approval because of it. The job is to keep that
   review short and the answer obvious.
 

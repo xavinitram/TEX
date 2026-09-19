@@ -5,6 +5,33 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.4] - 2026-09-19
+
+**Describe it, don't quote it.** `v0.36.3` reached the registry with **23 findings instead of 92**
+— the 19 structural ones its `SECURITY.md` table documents, plus **four the release's own
+documentation introduced**: the CHANGELOG sentence that quoted the hostile test literals verbatim,
+and three `SECURITY.md` table cells that quoted the exact call shapes they were explaining. The
+scanner reads prose as well as code; `v0.36.1`'s Markdown had been clean only because it never
+contained those exact byte patterns. This release rewords the four sites to *describe* each
+mechanism rather than reproduce the string a rule matches — the code sites themselves stay
+declared, so nothing is hidden — and corrects the shipped-surface ratchet, which had been
+narrowed to `.py`/`.js` on that wrong inference: it now censuses every shipped text file, adds
+the two rule families the registry has since matched, and re-pins to the measured counts.
+
+**No product behaviour changes.** `tex_api.LANGUAGE_VERSION` stays `0.23`; no reserved name is
+added; no compat freeze is owed. The registry archive is the same 215 files.
+
+### Changed
+
+- **`CHANGELOG.md` (the `0.36.3` entry) and `SECURITY.md`** — four prose sites reworded as above.
+  `SECURITY.md` now says why its table describes rather than quotes.
+- **`AGENTS.md`** — the archive rule distinguishes code from prose: code is never reworded to
+  dodge a rule; documentation never reproduces an attack string or a matched call spelling.
+- **`tests/test_pub1_archive.py`** — the ratchet censuses every shipped text file (`.py`, `.js`,
+  `.md`, `.json`, `.toml`, …) and gains `rm_rf` and `dunder_import` families; pins re-measured.
+  The pins are higher than in `v0.36.3` because Markdown is back in scope — a scope correction
+  with the measurement written above the pins, not a raised bar.
+
 ## [0.36.3] - 2026-09-19
 
 **The archive is the product.** Since late August the Comfy registry has held every uploaded
@@ -13,8 +40,8 @@ by asking the API with an undocumented parameter. `v0.35.0`, `v0.35.3` and `v0.3
 `Flagged` on 92 `severity: info` findings apiece, and **registry installs have received
 `v0.34.2` — the build from 4 August — the whole time**, through four green publish workflows.
 75 of those 92 findings were in directories that do not ship a node: `tests/` (including TEX's
-own negative security tests, whose literal `system("rm -rf /")` and `__import__("os")` strings
-gave the archive its scariest tags), `benchmarks/`, `editor_build/` and two Python rules
+own negative security tests, whose deliberately hostile literals — a destructive shell command, a
+dunder import — gave the archive its scariest tags), `benchmarks/`, `editor_build/` and two Python rules
 matching JavaScript in `js/`. This release stops shipping the first three.
 
 **No product behaviour changes.** Nothing a program computes, no default, no signature, no
