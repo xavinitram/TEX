@@ -157,7 +157,14 @@ _STRING_ESCAPE_MAP = {"\\": "\\", '"': '"', "n": "\n", "t": "\t", "r": "\r"}
 # e.g. f@threshold → TYPED_AT_BINDING with prefix="f"
 # e.g. img@result → TYPED_AT_BINDING with prefix="img"
 # e.g. a@palette → an ARRAY wire (DATA-3; only reachable under the engine profile)
-BINDING_TYPE_PREFIXES = {"f", "i", "v", "v2", "v3", "v4", "s", "img", "m", "l", "c", "b", "a"}
+# e.g. p@beauty.diffuse → a PLANES wire (DATA-6; only reachable under the engine profile)
+BINDING_TYPE_PREFIXES = {"f", "i", "v", "v2", "v3", "v4", "s", "img", "m", "l", "c", "b", "a", "p"}
+
+# DATA-6: the typed prefixes whose `@` reads one dotted segment (see `_read_binding_name`).
+# Only `p` — a PLANES hint declares the WIRE, and its planes are read by name. Every other
+# prefix declares a non-PLANES wire, so a dot after it can only be a swizzle, and lexing it
+# as `TYPED_AT_BINDING . IDENT` is exactly what the splitback would produce anyway.
+_GREEDY_DOT_PREFIXES = frozenset({"p"})
 
 
 def _is_ascii_digit(c: str) -> bool:
@@ -352,7 +359,9 @@ class Lexer:
         if self.pos < len(self.source) and self.source[self.pos] in ("@", "$"):
             if text in BINDING_TYPE_PREFIXES:
                 sigil = self.advance()  # consume @ or $
-                name = self._read_binding_name(text, sigil, start_loc)
+                name = self._read_binding_name(
+                    text, sigil, start_loc,
+                    greedy_dot=(sigil == "@" and text in _GREEDY_DOT_PREFIXES))
                 tok_type = (TokenType.TYPED_AT_BINDING if sigil == "@"
                             else TokenType.TYPED_DOLLAR_BINDING)
                 return Token(tok_type, name, start_loc, prefix=text)
@@ -404,11 +413,23 @@ class Lexer:
                           start_loc, code="E1006")
 
     def _read_binding_name(self, prefix_or_sigil: str, sigil: str,
-                            start_loc: SourceLoc) -> str:
+                            start_loc: SourceLoc, *, greedy_dot: bool = False) -> str:
         """Read the identifier part after a binding sigil (@ or $).
 
         Used by both read_at_binding/read_dollar_binding and typed binding
         detection in read_identifier.
+
+        DATA-6 (`greedy_dot`): a `@` binding also consumes EXACTLY ONE dotted segment when
+        one immediately follows — `@beauty.diffuse` is one AT_BINDING whose value is the
+        verbatim `beauty.diffuse`, so a plane is addressed by the name the file gives it
+        and `sigil_names` reports per-plane demand with no second scan. One segment, never
+        more, is the greed at which a plane read and a swizzle fall out of a single rule:
+        `@beauty.diffuse.rgb` is `AT_BINDING("beauty.diffuse") . IDENT("rgb")` — a plane
+        read followed by an ordinary ChannelAccess — while `@A.rgb` is `AT_BINDING("A.rgb")`,
+        a swizzle the lexer cannot tell from a plane (it never sees binding types), which
+        `tex_cache.splitback_dotted_bindings` puts back from the binding types before the
+        TypeChecker runs. The segment must start an identifier (`@A.5`, `@A..r` and `@A .r`
+        are untouched) and never applies to `$` (a dotted param stays two tokens).
         """
         name_start = self.pos
         src = self.source
@@ -421,13 +442,17 @@ class Lexer:
         i = name_start
         while i < n and _is_ident_continue(src[i]):
             i += 1
+        if greedy_dot and i + 1 < n and src[i] == "." and _is_ident_start(src[i + 1]):
+            i += 1
+            while i < n and _is_ident_continue(src[i]):
+                i += 1
         self.pos = i
         return src[name_start:i]
 
     def read_at_binding(self) -> Token:
         start_loc = self.loc()
         self.advance()  # skip @
-        name = self._read_binding_name("", "@", start_loc)
+        name = self._read_binding_name("", "@", start_loc, greedy_dot=True)
         return Token(TokenType.AT_BINDING, name, start_loc)
 
     def read_dollar_binding(self) -> Token:

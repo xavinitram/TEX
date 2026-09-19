@@ -25,8 +25,9 @@ from typing import Any
 
 from .tex_compiler.lexer import Lexer
 from .tex_compiler.parser import Parser
-from .tex_compiler.type_checker import TypeChecker
-from .tex_compiler.types import TEXType
+from .tex_compiler.ast_nodes import (BindingRef, ChannelAccess, NodeTransformer, SourceLoc)
+from .tex_compiler.type_checker import TypeChecker, TypeCheckError, BINDING_HINT_TYPES
+from .tex_compiler.types import TEXType, planes_wires_enabled
 from .tex_compiler.optimizer import optimize
 from .tex_runtime.interpreter import _collect_identifiers
 
@@ -64,6 +65,118 @@ _CODEGEN_FILES = [_R_DIR / "interpreter.py", _R_DIR / "codegen.py", _R_DIR / "co
 # NEW under CACHE-4: previously a compiled.py tiering change kept stale verdicts.
 _VERDICT_FILES = [_R_DIR / "precision_policy.py", _R_DIR / "autotier.py",
                   _R_DIR / "compiled.py", _R_DIR / "graphed.py"]
+
+
+# ── DATA-6: the plane seam ────────────────────────────────────────────────────
+#
+# The lexer reads `@name.seg` as ONE binding token (one dotted segment, verbatim) so a plane is
+# addressed by the name its file gives it and `sigil_names` reports per-plane demand. The
+# lexer never sees binding types, so it cannot tell `@beauty.diffuse` (a plane read on a PLANES
+# wire) from `@A.rgb` (a swizzle of an ordinary wire) — the pass below does, from the binding
+# types, BEFORE the first TypeChecker runs. It lives here and not in the checker because
+# `_check_binding_ref` returns a type and cannot replace its own node, and `compile_ast` is the
+# one post-parse pipeline both production entries (`compile_tex`, `compile_fused`) share.
+#
+# It is legal for a resolution to depend on binding types because the compile cache is keyed on
+# `(code, binding_types)` (`TEXCache.fingerprint`): a differently-typed compile of the same
+# source can never alias this one.
+class _DottedBindingSplitback(NodeTransformer):
+    """The swizzle-splitback rule, one row per binding-type case (`docs/plane-bindings.md` §1.1).
+
+    For every wire `BindingRef` whose name carries a dot, split on the LAST dot into `base` and
+    `seg`, then:
+
+      * the dotted name is itself declared in `binding_types` — a plane the host has already
+        expanded (`beauty.diffuse: VEC3`) — or `base` is typed PLANES (by the map or by the
+        node's own `p@` hint), AND plane wires are enabled: a PLANE READ. Keep the dotted
+        `BindingRef`; the checker types it from the per-plane row.
+      * `base` is a vector type: SPLIT BACK to `ChannelAccess(BindingRef(base), seg)` — the
+        exact AST the parser built before planes existed. `seg` is then validated by the
+        existing swizzle rules (E3301), unchanged.
+      * `base` is a non-vector type (FLOAT / INT / MASK / STRING / ARRAY …): split back the
+        same way; the existing rules already own what `.r` means on a channel-less value.
+      * `base` is ABSENT (an untyped base): split back. This is the compat guarantee in one
+        line — an untyped base is a swizzle, so no program that compiled before planes can be
+        re-read as a plane access.
+
+    While plane wires are disabled (the ComfyUI default) the first row never fires, so every
+    dotted `@` is a swizzle — exactly what it always meant — and PLANES is inert end to end.
+
+    A dotted non-plane binding in a `@X[..]` / `@X(..)` slot is refused with the parse errors
+    those spellings drew before (E2000 / E2002): the parser guarantees that slot holds a bare
+    `BindingRef`, and `@A.rgb[ix, iy]` was never a program.
+
+    The split node carries the SEGMENT's source location, as the parser's `ChannelAccess` did,
+    so an unknown-channel diagnostic lands on the same column it always has.
+    """
+
+    def __init__(self, binding_types: dict, source: str):
+        self._bt = binding_types or {}
+        self._source = source
+        self._planes_on = planes_wires_enabled()
+
+    def _is_plane_read(self, node: BindingRef) -> bool:
+        if not self._planes_on:
+            return False
+        bt = self._bt
+        if node.name in bt:                       # an already-expanded plane row
+            return True
+        t = bt.get(node.name.rsplit(".", 1)[0])
+        if t is None and node.type_hint:
+            t = BINDING_HINT_TYPES.get(node.type_hint)
+        return t is TEXType.PLANES
+
+    @staticmethod
+    def _is_dotted_wire(node) -> bool:
+        return node.__class__ is BindingRef and node.kind == "wire" and "." in node.name
+
+    def _split(self, node: BindingRef) -> ChannelAccess:
+        base, seg = node.name.rsplit(".", 1)
+        loc = node.loc
+        seg_loc = loc
+        off = loc._offset
+        if off is not None and off >= 0:
+            # `[prefix]@base.seg` — the segment starts after the sigil, the base and the dot.
+            seg_loc = SourceLoc.from_offset(off + len(node.type_hint) + 1 + len(base) + 1,
+                                            loc._source, stage=loc.stage)
+        return ChannelAccess(loc=seg_loc, channels=seg,
+                             object=BindingRef(loc=loc, name=base, kind=node.kind,
+                                               type_hint=node.type_hint))
+
+    def visit_BindingRef(self, node):
+        if not self._is_dotted_wire(node) or self._is_plane_read(node):
+            return node
+        return self._split(node)
+
+    def _refuse_swizzle_sugar(self, node, *, code: str, message: str, hint: str):
+        b = node.binding
+        if self._is_dotted_wire(b) and not self._is_plane_read(b):
+            raise TypeCheckError(message, node.loc, source=self._source, code=code, hint=hint)
+
+    def visit_BindingIndexAccess(self, node):
+        self._refuse_swizzle_sugar(
+            node, code="E2000",
+            message="A swizzle can't be indexed like a binding.",
+            hint="`@A.rgb` is a swizzle of @A — fetch first, then swizzle: `@A[ix, iy].rgb`.")
+        return self.generic_visit(node)
+
+    def visit_BindingSampleAccess(self, node):
+        self._refuse_swizzle_sugar(
+            node, code="E2002",
+            message="This value can't be called like a function.",
+            hint="Only function names and @bindings can be followed by `(...)`. `@A.rgb` is a "
+                 "swizzle of @A — sample first, then swizzle: `@A(u, v).rgb`.")
+        return self.generic_visit(node)
+
+
+def splitback_dotted_bindings(program, binding_types: dict, *, source: str = ""):
+    """DATA-6: resolve every dotted `@name.seg` in `program` — a plane read stays a dotted
+    `BindingRef`, everything else is put back to the `ChannelAccess` swizzle it always was.
+    In place; returns `program`. Runs in `compile_ast` ahead of the first `TypeChecker`, and is
+    THE SEAM the plane-expansion step shares: expansion rewrites `binding_types` (per-plane rows
+    for the planes the source mentions) immediately before this call, and this pass reads the
+    expanded map. Rules: `_DottedBindingSplitback`."""
+    return _DottedBindingSplitback(binding_types, source).visit(program)
 
 
 def _hash_files(files, *extra: bytes) -> str:
@@ -321,7 +434,16 @@ class TEXCache:
         spliced AST). Returns the same 6-tuple as `compile_tex`. Error-agnostic: a
         `TypeCheckError` propagates so each caller translates it as it sees fit
         (fusion wraps it as `FusionError`).
+
+        DATA-6: the plane seam sits at the top, BEFORE the first TypeChecker — the parser
+        never sees binding types, and the checker cannot replace a node it is typing. Two
+        steps, one owner, in this order: (1) [expansion — lands with the wire value] a PLANES
+        wire's per-plane rows are added to `binding_types` for the planes the source mentions;
+        (2) the splitback below resolves every dotted `@name.seg` against that map. Both
+        production entries and the test harnesses converge here, so nothing compiles an
+        unresolved dotted binding.
         """
+        program = splitback_dotted_bindings(program, binding_types, source=source)
         checker = TypeChecker(binding_types=binding_types, source=source)
         type_map = checker.check(program)
         # Pass type_map so optimizer-created nodes (CSE/LICM temps + their
