@@ -71,10 +71,13 @@ _DIR_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]+/$")
 # word does not count: `compile(` must not match `compile_program(` / `recompile(` /
 # `re.compile(`, and `marshal.loads(` is spelled out so `tex_marshalling` does not match.
 # `rm_rf` and `dunder_import` are the two families the registry matched (`contains_rm_rf`,
-# `$import_func_direct`) that this census did not cover before PUB-2. Known, deliberate gap:
-# `network` does not census the scanner's bare `.connect(` / `.bind(` strings (`$socket3` /
-# `$socket4`), which match LiteGraph's link API in js/ on every version — those are answered in
-# SECURITY.md's table, not by a pin.
+# `$import_func_direct`) that this census did not cover before PUB-2. `network` has a second,
+# `.js`-only pattern (`_JS_ONLY`, below): the registry's python_network_operations rule fires on
+# JS `.connect(`/`.bind(` (`$socket3`/`$socket4`); measured 2026-09-19 on 0.36.3
+# (js/tex_extension.js:854 + the CM6 bundle); counted in .js only so the pin mirrors what the
+# scanner reports — in `.py` those are legitimate socket-free method names and would drown the
+# family. The census counts LINES, so the minified bundle's one line is one site however many
+# hits it carries.
 _FAMILIES = {
     "env_read":      re.compile(r"os\.environ\.get\(|os\.environ\[|os\.getenv\("),
     "subprocess":    re.compile(r"subprocess\."),
@@ -89,28 +92,37 @@ _FAMILIES = {
     "dunder_import": re.compile(r"__import__\("),
 }
 
+# Patterns applied ONLY to `.js` files, folded into the named family (a Python rule matching
+# JavaScript — see the `network` note above). Every key must also be in _FAMILIES.
+_JS_ONLY = {
+    "network": re.compile(r"\.connect\(|\.bind\("),
+}
+
 # Measured over EVERY shipped UTF-8 text file (git-tracked minus .comfyignore; binaries skipped).
 # These pins are HIGHER than the `.py`/`.js`-only pins that preceded them (env_read 24→26,
 # subprocess 1→2, exec 5→11, compile 11→15, marshal_loads 1→2, pickle_load 4→8; `rm_rf` and
 # `dunder_import` are new) because Markdown came back into scope — every added count is a prose
 # site in AGENTS.md, CHANGELOG.md, DEVELOPMENT.md or SECURITY.md, and NO code site was added. That
 # is a scope correction with the 0.36.3 measurement behind it (see `_FAMILIES`), not a raised bar:
-# the pins were re-measured, not copied. The pin moves DOWN freely and reds until it does; it
-# moves UP only as a release decision that names the new finding — every shipped finding is
-# justified to the registry reviewer in writing, so a new one is a new paragraph there, never a
-# reflex here.
+# the pins were re-measured, not copied. These values are measured against v0.36.4's docs — the
+# three reworded root files (CHANGELOG.md, SECURITY.md, AGENTS.md) that describe each mechanism
+# instead of spelling a matched string, which is why env_read/subprocess/rm_rf/dunder_import sit
+# below the 0.36.3 tree's counts (26/2/1/1). `network` = the two `.js` lines the scanner flags.
+# The pin moves DOWN freely and reds until it does; it moves UP only as a release decision that
+# names the new finding — every shipped finding is justified to the registry reviewer in
+# writing, so a new one is a new paragraph there, never a reflex here.
 _SURFACE_PINS = {
-    "env_read": 26,
-    "subprocess": 2,
+    "env_read": 25,
+    "subprocess": 1,
     "os_system": 0,
     "exec": 11,
     "eval": 0,
     "compile": 15,
     "marshal_loads": 2,
     "pickle_load": 8,
-    "network": 0,
-    "rm_rf": 1,
-    "dunder_import": 1,
+    "network": 2,
+    "rm_rf": 0,
+    "dunder_import": 0,
 }
 
 # Arm (c)'s one allowed reach into an ignored directory: the triton lane's optional delegate,
@@ -204,9 +216,11 @@ def _census(paths: list[str]) -> dict[str, list[str]]:
             text = (_PKG / rel).read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue   # binary (fonts, images) or gone
+        is_js = rel.endswith(".js")
         for i, line in enumerate(text.splitlines(), 1):
             for fam, rx in _FAMILIES.items():
-                if rx.search(line):
+                hit = rx.search(line) or (is_js and fam in _JS_ONLY and _JS_ONLY[fam].search(line))
+                if hit:
                     sites[fam].append(f"{rel}:{i}: {line.strip()[:100]}")
     return sites
 
@@ -219,8 +233,9 @@ def test_pub1_shipped_surface_ratchet(r: SubTestResult):
             r.fail("PUB-1 ratchet", "cannot census: .comfyignore is not mirrorable (see arm a)")
             return
         sites = _census(_shipped(names))
-        if set(_SURFACE_PINS) != set(_FAMILIES):
-            r.fail("PUB-1 ratchet", "every family needs a pin and every pin a family")
+        if set(_SURFACE_PINS) != set(_FAMILIES) or not set(_JS_ONLY) <= set(_FAMILIES):
+            r.fail("PUB-1 ratchet", "every family needs a pin and every pin a family; every "
+                   "_JS_ONLY key must name a family")
             return
         up, down = [], []
         for fam, pin in _SURFACE_PINS.items():
