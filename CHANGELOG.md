@@ -5,6 +5,55 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.3] - 2026-09-19
+
+**The archive is the product.** Since late August the Comfy registry has held every uploaded
+version for manual review on *any* automated-scanner finding, and a publisher only learns this
+by asking the API with an undocumented parameter. `v0.35.0`, `v0.35.3` and `v0.36.1` have sat
+`Flagged` on 92 `severity: info` findings apiece, and **registry installs have received
+`v0.34.2` — the build from 4 August — the whole time**, through four green publish workflows.
+75 of those 92 findings were in directories that do not ship a node: `tests/` (including TEX's
+own negative security tests, whose literal `system("rm -rf /")` and `__import__("os")` strings
+gave the archive its scariest tags), `benchmarks/`, `editor_build/` and two Python rules
+matching JavaScript in `js/`. This release stops shipping the first three.
+
+**No product behaviour changes.** Nothing a program computes, no default, no signature, no
+call path moves. `tex_api.LANGUAGE_VERSION` stays `0.23`; no reserved name is added; no compat
+freeze is owed.
+
+### Changed
+
+- **`.comfyignore`** — `tests/`, `benchmarks/`, `tools/`, `docs/`, `editor_build/`, `.github/`
+  and `assets/` are no longer in the registry archive: **389 files / 2,471 KB → 215 / 1,348 KB**,
+  175 files gone, and the scanner-family sites the archive carries (`os.environ`, `subprocess`,
+  `exec`/`compile`, `marshal.loads`, `pickle.load`, network) **170 → 50**, every one of them in
+  product code. Measured with the real tool (`comfy node pack`, comfy-cli 1.20.0), not
+  estimated. `examples/` (served by the snippets route), `stock/`, `js/` and the three root
+  reference documents the docs route serves all still ship. Users who want the test suite
+  have it in the repository, as before.
+- **`tests/test_pub1_archive.py`** — pins which top-level directories ship (a new directory
+  reds until it is placed), and pins a census of the shipped files for each scanner family
+  (`os.environ`, `subprocess`, `exec`/`compile`, `marshal.loads`, network) so the surface a
+  reviewer sees cannot grow without a test going red. The census may only move down.
+- **`SECURITY.md`** now carries the mapping a reviewer needs: every finding TEX's shipped code
+  produces, what it is, and why it is not attacker-reachable — the codegen tier's
+  `compile()`/`exec()` of AST-derived source, the HMAC-verified `marshal.loads`, the
+  Windows-only `vcvarsall` probe with its constant argv, and the read-only `TEX_*` knobs — plus
+  what each of the twelve HTTP routes touches.
+- **The publish workflow prints the served version.** After upload it polls the registry and
+  ends with an unmistakable line naming the new version's status and the version users
+  actually receive. A green run had been read as "live" three releases running; it never was.
+- **`tex validate-hw`** skips its Triton lane cleanly when `benchmarks/` is absent (a registry
+  install) instead of raising.
+
+### What this does NOT do
+
+It does not make TEX pass the scanner. The remaining findings are the compiled tier itself and
+cannot be removed without removing the feature; hiding them from a text scanner by splitting
+strings would be obfuscation, which the registry bans and which would deserve the ban. **Every
+TEX version will need an admin approval**, as the other nodes with a compiled tier already do.
+This release makes that review short and the answer obvious.
+
 ## [0.36.2] - 2026-09-18
 
 **Make room.** `tex_engine.py` had reached **exactly 2000 lines against REG-2's 2000-line hard

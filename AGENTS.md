@@ -177,6 +177,37 @@ Currently over the hard budget — status as of v0.36.2 (drift-checked by
 
 `tex_compiler/optimizer.py` (~1540) is over *soft*; STR-5 (the `PASSES` list) **shipped**.
 
+## The registry archive (PUB-1 — the archive is the product)
+
+`comfy node publish` uploads `git ls-files` minus the root `.comfyignore`, and the Comfy registry
+holds a version out of `Active` on **any** automated-scanner finding until an admin approves it —
+users only ever receive `Active` versions. So the archive carries only what the node needs at
+runtime: `tests/`, `benchmarks/`, `tools/`, `docs/`, `editor_build/`, `.github/` and `assets/` do
+not ship. Three rules, each pinned by `tests/test_pub1_archive.py`:
+
+- **A new top-level directory does not ship by accident, and does not vanish by accident.** Every
+  tracked top-level directory must be named in `.comfyignore` XOR in the test's `_SHIP_DIRS`; a
+  directory in neither reds with its name. `.comfyignore` takes plain `name/` patterns ONLY (no
+  globs, no negation) so the test's mirror is provably the tool's — a pattern of any other form
+  reds on purpose.
+- **The shipped surface is a ratchet that only moves down.** The test censuses the shipped files
+  for the scanner's families (`os.environ`, `subprocess`, `os.system`, `exec`, `eval`, `compile(`,
+  `marshal.loads`, `pickle.load`, network) and pins each count. A new site reds with its
+  `file:line`; a removed site reds "re-pin DOWN". Never raise a pin to fit a change: if a feature
+  genuinely needs a new site, it lands with the pin AND a row in `SECURITY.md`'s finding table
+  saying what it is and why it is not attacker-reachable, because that table is what the
+  registry's reviewer reads.
+- **Do NOT dodge the scanner.** Splitting `"ex" + "ec"`, aliasing builtins, rewording a docstring
+  so a regex misses it — the registry's standards ban obfuscation outright and it would deserve
+  the ban. TEX's compiled tier IS `compile()`/`exec()` of AST-derived source; that is declared, not
+  hidden, and every TEX version needs an admin approval because of it. The job is to keep that
+  review short and the answer obvious.
+
+A green "Publish to Comfy registry" workflow means the upload was ACCEPTED FOR REVIEW, nothing
+more. The workflow's last step prints `REGISTRY: <ver> = <status>; served = <ver>` — read that
+line, not the exit code. The served version is also one query away:
+`https://api.comfy.org/nodes/comfyui-tex-wrangle/versions?include_status_reason=true`.
+
 ## Doc-layering policy (DOC-6)
 
 Three layers, each with one audience — put a doc where its reader looks:
