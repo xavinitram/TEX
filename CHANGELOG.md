@@ -5,6 +5,126 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-09-19
+
+**Planes.** A host wires ONE image input carrying many named planes — an EXR's `diffuse` /
+`specular` / `Z`, a render's AOVs — and a program reads them by name:
+
+```tex
+vec3 lit = @beauty.diffuse + @beauty.specular * $spec;
+float depth = @beauty.Z;
+@OUT = vec4(mix(lit, $fog, smoothstep($near, $far, depth)), 1.0);
+```
+
+A plane is a binding; a set of planes is a wire. `TEXType` gains one WIRE-ONLY member, `PLANES`,
+exactly as `ARRAY` was added — inert in every expression rule — so the expression type system does
+not grow. Planes are **engine/API-only in this release**: they are gated on the engine egress
+profile by the same switch that governs `ARRAY`, so under the ComfyUI profile no `PlanesValue` can
+be constructed or expanded and the node is untouched.
+
+**This release moves `tex_api.LANGUAGE_VERSION` from `0.23` to `0.24`, and a compat freeze IS
+owed and paid.** The rule, stated here because `fetch_time`/`sample_time` shipped on `0.23` and
+the distinction will otherwise be re-derived: *a stdlib function addition does not bump the
+language version; a grammar-visible surface does.* `@wire.plane` is grammar-visible — the lexer
+changes — so it bumps. **Compat freeze #2:** `tests/compat_corpus_goldens/0.24.json`,
+130 goldens (the 129 of `0.23` plus `aov_relight`), snapshots the post-planes truth. `0.23.json` is unchanged and is still
+checked; every one of its 129 programs computes what it computed.
+
+**No existing program changes.** The design's additivity claim was proven, not asserted, four
+times over: the twelve shipped examples that use a dotted swizzle (`@image.rgb`, fifty forms in
+all) were cooked at the base and at the head of every lane on the CPU interpreter with
+byte-identical inputs and compared bit-for-bit — 12/12 identical after the lexer change, after
+the front-end convergence, after the wire, and after the freeze.
+
+**One new reserved surface, no new reserved built-in name.** No function is added. The dotted
+`@name.segment` form is now grammar, and one constraint comes with it: **a PLANES wire may not
+declare a plane whose name is one of the 38 lowercase channel/swizzle names** (`r g b a x y z w`
+and the 30 swizzles) — refused at expansion with **E3304**, *"plane `rgb` on `@src` collides with
+the swizzle `.rgb` — rename the plane"*. The conventional EXR data-layer names are uppercase —
+`Z`, `N`, `RGBA` — and **none of them collide**: `@beauty.Z` is a plane read on day one, with no
+rename. `LANGUAGE.md` carries the user-facing section.
+
+### Added
+
+- **The dotted binding form, one segment.** `@beauty.diffuse` lexes as one binding token;
+  `@beauty.diffuse.rgb` is that plane read followed by an ordinary swizzle, which is why swizzling
+  a plane works the day planes ship. `@A.rgb` on an ordinary wire is put back to the swizzle it
+  always was by a **pre-typecheck splitback pass** keyed on binding types — and an UNTYPED base
+  always splits back, which is the compat guarantee in one line: no program that compiled
+  yesterday can be re-read as a plane access today.
+- **One front end.** Every consumer that lexes or type-checks TEX source — the editor lint, fusion,
+  the ROI read set, the lazy-input analysis, the cook-grid consensus, and the two test harnesses —
+  now goes through `tex_cache.parse_and_split`, the same lex + parse + splitback the production
+  cook uses. The design assumed three copies of that front end; the tree had nine, and a greedy
+  lexer with nine private copies reddened 115 tests in 51 files. One owner, or it drifts. A parity
+  test pins that every consumer names the same wires for a dotted program, and each of six
+  mutations that hand one consumer a private lexer reds naming that consumer.
+- **`PlanesValue`** (`tex_marshalling`): the wire value, `{plane: [B,H,W,C≤4]}` plus per-plane
+  `BufferDesc`s. Deliberately NOT a tensor subclass, so nothing that tests for a tensor can size a
+  cook grid off whichever plane came first. A raw `{name: tensor}` dict stays E7005-refused and the
+  message now suggests `PlanesValue`.
+- **Demand-driven expansion at the engine seam.** A `PlanesValue` becomes its per-plane tensor
+  bindings — under the VERBATIM dotted name, so `beauty.diffuse` is what an error message says and
+  what an EXR channel is called — at the same point promises land, and only the planes the source
+  mentions are expanded. An unmentioned plane never enters the bindings, never reaches ingest,
+  never moves to the device. That is PM-10's laziness guarantee, structural rather than measured,
+  and pinned by an ingest spy. A boundary/lineage key sees a PLANES wire as its sorted plane
+  set — every name and shape — never as an object address (the P0-H lesson, applied before it
+  could recur).
+- **W7009** — reading a plane the wire does not declare (`@src.diffues`), with a did-you-mean over
+  the declared set, followed by an E6003 that names the SLOT (`beauty`), not the plane, so it
+  never lies. A declared plane the program does not read is silent by construction: W7002 reads
+  the post-expansion types, so a twelve-AOV EXR read for one plane emits nothing.
+- **EXR layers** (`tex_io.exr.read_layers` / `write_layers`): a layered single-part EXR groups
+  into per-layer planes by the same last-dot rule the language uses — root `R/G/B/A` become
+  `beauty` unless an explicit `beauty` layer exists (then a loud refusal naming both), a bare `Z`
+  becomes a one-channel plane `Z`, more than four channels or a UINT channel in a layer is refused
+  naming the layer. Both channel spellings that real writers use — `R,G,B,A` and
+  `red,green,blue,alpha` (Nuke) — keep R,G,B order and round-trip with their names preserved;
+  anything else takes the file's sorted order, as documented. A two-layer-plus-`Z` file
+  round-trips bit-for-bit. `tex_io` stays a leaf. **PM-10 is met** on both halves.
+- **The `p@` binding hint** (`p@beauty`) declares a PLANES wire in a program header, so an example
+  can be cooked by the harness with a synthetic three-plane wire; the first such example is
+  `examples/aov_relight.tex`.
+
+### Changed
+
+- `tex_engine.py` 1628 → 1669 lines, against a budgeted +38 and the 1700 headroom floor; the
+  pre-specified chain/lineage split was armed on a 1680-line trigger and did not fire. The
+  per-plane lineage keys cost zero lines — they fall out of the existing machinery, exactly as the
+  roadmap promised.
+- A fused chain refuses a dotted export name with a `FusionError` (the one place a binding name
+  became a Python identifier), and the frontend chain detector keeps refusing PLANES edges.
+- The language-version satellites — ten sites in nine files — move together, and a new pin
+  asserts the stock tools and their generator agree with `tex_api.LANGUAGE_VERSION`, so the next
+  bump cannot leave one behind.
+
+### Not in this release, each with its reopen gate
+
+- **Plane writes (`@OUT.N = …`).** `MAX_OUTPUTS` caps a program's outputs and may not be raised
+  (a recorded decision), the frontend resolves `@OUT.N` to one slot, and a `.textool` would mint a
+  port no host can bind. Reopens when a host can carry a PLANES output wire.
+- **A ComfyUI wire type.** The adapter never names a slot after a binding and needs no change for
+  reads; what is missing is a wire that carries a `PlanesValue`. Reopens with that wire.
+- **UINT planes** (cryptomatte). Refused loudly at read, not silently floated.
+- **Multipart and deep EXR.** PM-10 says multi-LAYER; multipart is a container, deferred.
+- **A one-channel plane arrives as `[B,H,W]`** (it composes as a FLOAT, like a MASK) because a
+  `[B,H,W,1]` FLOAT binding does not compose in a constructor at head — a pre-existing gap,
+  filed, not a plane rule.
+
+### Release engineering
+
+- `tools/planes_compat_scan.py` — the design's compat tripwire — now counts a plane read on a
+  `p@`-hinted wire as its own category; a non-swizzle segment on an un-hinted wire still fails the
+  scan, which is the tripwire's purpose. At this release it reports the 50 swizzle forms across 12
+  programs plus `aov_relight`'s plane reads, and exits clean.
+- The stock-manifest byte pins were re-pinned: a language bump moves every `.textool`'s
+  `tex_language`, on purpose, and the pin is there to notice exactly that. The archive-neutrality
+  test now derives the frozen-version set from the directory and requires the newest to equal
+  `tex_api.LANGUAGE_VERSION`, the shape its own docstring foresaw.
+- The chain/lineage split named in the ENG-14 design stays pre-specified and armed; it did not
+  fire. The next module to reach REG-2's wall is `tex_results.py`, still 114 lines short.
+
 ## [0.36.5] - 2026-09-19
 
 **The last cell.** `v0.36.4` scanned at **20 findings** — the 19 structural sites its
