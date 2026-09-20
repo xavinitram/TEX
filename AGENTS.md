@@ -138,7 +138,23 @@ silent-wrong result.
 **Config escape hatches (keep even though never set normally):**
 `TEX_CODEGEN_NO_OUT_REUSE` / `_OUT_REUSE_ENABLED`, `TEX_CACHE_BUDGET_MB`, the
 `TORCHINDUCTOR_CACHE_DIR` ownership-check, the `_tex_any` phantom search-panel slot,
-the `bf16` bench plumbing (deliberately dev/bench-only, not user-exposed).
+the `bf16` bench plumbing (deliberately dev/bench-only, not user-exposed), and the six
+host-facing switches below. Every one of them is listed in `README.md` §"Environment
+switches", and `tests/test_neg3_env_switches.py` reds on a product switch that is not.
+
+- `TEX_CPU_THREADS` (`tex_engine`) — torch intra-op thread count. Both states pinned by
+  `tests/test_v018_portability.py`.
+- `TEX_NO_POOL_TRIM` (`tex_memory`) — skip `trim_reserved_pool`. One state pinned
+  (`tests/test_v018_memory.py`); the unset state is untested.
+- `TEX_RESULTS_BUDGET_MB` (`tex_results._budget_bytes`) — frame-cache RAM budget. Documented in
+  `docs/results-caching.md`; hardened and pinned by NEG-3.
+- `TEX_RESULTS_DISK_MB` (`tex_results._budget_bytes`) — frame-cache spill budget. Hardened and
+  pinned by NEG-3.
+- `TEX_GOVERNOR_BUDGET_MB` (`tex_memory.governor_budget`) — the ONE coordinated CACHE-5 budget.
+  Hardened and pinned by NEG-3; a non-positive value is refused, because zero here evicts
+  every arbitrated pool.
+- `TEX_DOCS_LOCAL` (`tex_compiler/diagnostics.py`) — LANG-7's air-gapped docs link. Not dead
+  UI: an LSP host consumes `docs_url` into a code description. Both states pinned by NEG-3.
 
 **The 19 caches are non-redundant** — each keys on a different thing with a distinct
 lifecycle. Do not consolidate them. (See ARCHITECTURE.md for the enumerated inventory;
