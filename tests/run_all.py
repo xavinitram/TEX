@@ -1877,6 +1877,20 @@ def main():
     from test_v037_satellites import test_v037_language_version_satellites
     test_v037_language_version_satellites(r)
 
+    # BENCH-2: the per-tick STRUCTURAL counts of the interactive host paths, pinned as exact
+    # integers (timing cannot gate — see docs/host-path-counts.md and roadmap §10 item 3).
+    # The CUDA row skips without a device; the mutation guard proves the counters can fire.
+    from test_bench2_counts import (
+        test_bench2_interactive_per_tick_counts,
+        test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick,
+        test_bench2_cuda_per_tick_counts,
+        test_bench2_counters_are_not_inert,
+    )
+    test_bench2_interactive_per_tick_counts(r)
+    test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r)
+    test_bench2_cuda_per_tick_counts(r)
+    test_bench2_counters_are_not_inert(r)
+
     success = r.summary()
     return 0 if success else 1
 

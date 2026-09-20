@@ -1,0 +1,351 @@
+"""BENCH-2 — the per-tick structural counts of the interactive host paths, pinned.
+
+`benchmarks/host_path_counts.py` measures how many times each seam on the cook path is
+entered per interactive tick, driving TEX's own `examples/host_demo.py::RoiComp` (the ten-
+stage comp, a host-armed CACHE-2 results cache, CACHE-1 lineage keys carrying the upstream
+chain). This file turns those counts into a gate.
+
+WHY COUNTS AND NOT TIMES. `docs/roadmap.md` §10 item 3 records the null controls measured on
+the dev box: `eight_config_bench` run against a BYTE-IDENTICAL tree returns per-config geomeans
+from 0.949 to 1.105, with individual rows spanning 0.70-2.32, and `cpu_off_warm` has tripped
+the 0.95 stop-ship threshold against itself. No timing assertion can live in a suite that runs
+on shared CI hardware. The counts below are exact integers that repeat tick after tick and
+process after process — so they can.
+
+WHAT MOVES A PIN. Every row carries a comment naming what legitimately changes it. A pin is
+not a wish: when the engine genuinely does one more (or one fewer) of something per tick, the
+pin is RE-DERIVED with the harness and the change is explained in the CHANGELOG. The failure
+message says which row moved, from what to what, and prints the command that re-derives it.
+The pin also fails on a DECREASE, for the REG-2 reason — a bound that only ever loosens is
+decoration, and a count that silently drops usually means a spy stopped seeing its target.
+
+SHAPE (roadmap §10.4): CANARY over the per-tick contract, with the cold-scenario MUTATION
+GUARD (`test_bench2_counters_are_not_inert`) as its never-vacuous half — the ANIM-1 lesson,
+where thirteen rows asserting "this counter is 0" all passed with the counters zeroed out.
+
+PORTABILITY. CPU, no ComfyUI, no compiler, no CUDA. The CUDA row SKIPs (it does not pass)
+without a device. Runs at 96^2 with a 48^2 window and four ticks to stay inside a few seconds.
+"""
+from helpers import *
+
+import importlib.util
+
+
+_ROOT = Path(__file__).resolve().parents[1]
+
+# The harness shape these pins were measured in. Changing any of these re-derives every pin:
+# the window position walk depends on `TICKS` (see `Scenario._pan_roi`), and a resolution that
+# crossed a tiling threshold would change the cook counts.
+RES, WINDOW, TICKS = 96, 48, 4
+REDERIVE = (f"python benchmarks/host_path_counts.py --device cpu --res {RES} "
+            f"--window {WINDOW} --ticks {TICKS} --prof1 off")
+
+
+def _bench():
+    """Load `benchmarks/host_path_counts.py` by path.
+
+    `benchmarks/` is `.comfyignore`d and is not a package, so there is no import name to use;
+    a path load also keeps this test honest about measuring the harness the design note names
+    rather than a copy of its logic."""
+    mod = sys.modules.get("_bench2_host_path_counts")
+    if mod is not None:
+        return mod
+    path = _ROOT / "benchmarks" / "host_path_counts.py"
+    spec = importlib.util.spec_from_file_location("_bench2_host_path_counts", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_bench2_host_path_counts"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _api_counts(scenario_name: str) -> dict:
+    """Run ONE scenario's API pass on CPU and return `row -> (min, max)` per steady tick."""
+    b = _bench()
+    cls = next(c for c in b.SCENARIOS if c.name == scenario_name)
+    scn = cls(RES, WINDOW, "cpu", ticks=TICKS)
+    try:
+        folded = b.pass_api(scn, TICKS)
+    finally:
+        scn.teardown()
+    return {row: (s["min"], s["max"]) for row, s in folded.items()}
+
+
+def _check(r: SubTestResult, label: str, got: dict, pins: dict):
+    bad = []
+    for row, want in pins.items():
+        lo, hi = got.get(row, (None, None))
+        if lo is None:
+            bad.append(f"{row}: MISSING from the harness's rows (a spy target was renamed "
+                       f"or removed — the pin cannot be checked, which is a failure)")
+        elif lo != hi:
+            bad.append(f"{row}: UNSTABLE across the {TICKS} steady ticks ({lo}..{hi}); a row "
+                       f"that disagrees with itself cannot gate — re-derive with: {REDERIVE}")
+        elif lo != want:
+            bad.append(f"{row}: {want} -> {lo} per tick")
+    if bad:
+        r.fail(f"BENCH-2 {label}",
+               "; ".join(bad) + f" || re-derive with `{REDERIVE}` and explain the move in "
+               f"CHANGELOG.md (a count that changed in either direction is a change to what "
+               f"an embedding host pays per interactive tick)")
+    else:
+        r.ok(f"{label}: {len(pins)} per-tick rows hold at their pins")
+
+
+# ── the pins ────────────────────────────────────────────────────────────────
+# Measured with the command in REDERIVE at v0.37.0. Device-INDEPENDENT rows only: each of
+# these reads the same on CPU and on CUDA (verified at 1024^2/512 on an sm_120 box), which is
+# what makes them CI-gateable. Device-dependent counts (kernels, memcpys, allocations) are in
+# `test_bench2_cuda_per_tick_counts` and skip without a device.
+
+_TERMINAL = {
+    # The terminal-knob scrub: viewport window open, `dirty_from` = the last stage, so nine
+    # canvases stand and one stage cooks its window.
+    "tex_engine.cook":         1,    # one dirty stage. Moves if the host's dirty-suffix walk
+                                     # or `chain_windows`' decline logic changes.
+    "TEXCache.compile_ast":    0,    # ANIM-1: a $param is a cook-time binding. A non-zero here
+                                     # means a scrub recompiles — the bug ANIM-1 freezes out.
+    "TEXCache.compile_tex":    1,    # one cached-compile lookup per cook.
+    "Lexer.tokenize":          1,    # the re-lex under `roi_plan -> _walk -> _fold_program`,
+    "Parser.parse":            1,    # whose memo keys on the param VALUES (`tex_roi._param_key`).
+                                     # Memoizing on names instead would take both to 0.
+    "TypeChecker.check_collect": 0,  # lint only; a cook must never run the collecting checker.
+    "tex_roi._fold_program":   1,    # the fold behind that re-lex. 0 once the memo stops
+                                     # keying on values.
+    "tex_roi.roi_plan":        2,    # 1 per engine cook + 1 for the host's own halo question
+                                     # (`RoiComp._halo_of` misses its memo when params move).
+    "tex_roi.chain_windows":   1,    # one plan per tick, whatever the dirty suffix.
+    "tex_results.lineage_key": 11,   # 10 whole-frame chain keys + 1 windowed key for the
+                                     # cooked stage. Host policy: minting the nine clean-prefix
+                                     # keys every tick is what makes this 11 and not 2.
+    "TEXCache.fingerprint":    2,    # 2 per cook: `param_only_names` + the compile probe.
+    "ResultCache.get":         1,    # one probe for the one dirty stage,
+    "ResultCache.put":         1,    # one store. Growth per tick is host retention policy.
+    "tex_memory.run_roi":      1,    # the cook took the ROI path. 0 would mean a whole-frame
+                                     # fallback — a correctness-shaped regression, not a perf one.
+    "Interpreter._exec_stmt":  2,    # the vignette stage's two statements, on the CPU
+                                     # interpreter tier. Device-dependent ONLY in the sense
+                                     # that a compiled tier would bypass it; on CPU at this
+                                     # size the interpreter is the tier.
+}
+
+_MIDGRAPH = {
+    # The same drag five nodes up: the dirty suffix is five stages, so every per-cook fixed
+    # cost is paid five times. The difference from _TERMINAL is what one extra stage costs.
+    "tex_engine.cook":         5,    # stages 5..9.
+    "TEXCache.compile_ast":    0,    # ANIM-1 again, over five programs.
+    "TEXCache.compile_tex":    5,
+    "Lexer.tokenize":          1,    # ONE, not five: only the scrubbed stage's params moved,
+    "Parser.parse":            1,    # so only its fold memo misses.
+    "tex_roi._fold_program":   1,
+    "tex_roi.roi_plan":        6,    # 5 engine plans + 1 host halo question.
+    "tex_roi.chain_windows":   1,
+    "tex_results.lineage_key": 15,   # 10 chain keys + 5 windowed keys.
+    "TEXCache.fingerprint":   10,    # 2 per cook.
+    "ResultCache.get":         5,
+    "ResultCache.put":         5,
+    "tex_memory.run_roi":      5,    # all five stages stayed on the ROI path.
+    "Interpreter._exec_stmt":  6,
+}
+
+_PAN = {
+    # The window MOVES and no parameter changes. Every memo a scrub misses is a hit here, so
+    # what is left is what moving the window itself costs.
+    "tex_engine.cook":         1,
+    "TEXCache.compile_ast":    0,
+    "TEXCache.compile_tex":    1,
+    "Lexer.tokenize":          0,    # params constant => the fold memo hits. This 0 is the
+    "Parser.parse":            0,    # control that proves the terminal scrub's 1/1 is the
+    "tex_roi._fold_program":   0,    # memo key and not the cook.
+    "tex_roi.roi_plan":        1,    # the engine's, only: the host's halo memo hits.
+    "tex_roi.chain_windows":   1,
+    "tex_results.lineage_key": 11,
+    "TEXCache.fingerprint":    2,
+    "ResultCache.get":         1,
+    "ResultCache.put":         1,    # 1, not 0: the window is in the key, so a moved window
+                                     # is always a miss. A 0 would mean the walk revisited a
+                                     # position and the scenario stopped being a pan.
+    "tex_memory.run_roi":      1,
+    "Interpreter._exec_stmt":  2,
+}
+
+_ALL_DIRTY = {
+    # A knob on the FIRST stage with no window: every lineage key changes, so the results
+    # cache misses all ten and the whole frame recooks.
+    "tex_engine.cook":        10,
+    "TEXCache.compile_ast":    0,    # ten cooks, zero compiles — ANIM-1 across the chain.
+    "TEXCache.compile_tex":   10,
+    "Lexer.tokenize":          0,    # no window => no ROI analysis at all,
+    "Parser.parse":            0,
+    "tex_roi._fold_program":   0,
+    "tex_roi.roi_plan":        0,    # which is why a whole-frame recook never re-parses.
+    "tex_roi.chain_windows":   0,
+    "tex_results.lineage_key":10,    # one whole-frame key per stage; no windowed keys.
+    "TEXCache.fingerprint":   20,    # 2 per cook.
+    "ResultCache.get":        10,
+    "ResultCache.put":        10,
+    "tex_memory.run_roi":      0,    # no roi => the whole-frame path, by construction.
+    "Interpreter._exec_stmt": 12,    # 12 statements across the ten stage programs.
+}
+
+_LINT = {
+    # `tex_api.check` on a one-character edit — the editor's live-lint path, on the UI thread
+    # between keystrokes. Everything cook-shaped must be 0 here.
+    "tex_engine.cook":         0,
+    "TEXCache.compile_ast":    0,    # LANG-2: check() is compile-ONLY diagnostics.
+    "TEXCache.compile_tex":    0,
+    "Lexer.tokenize":          1,    # exactly one lex + one parse per keystroke,
+    "Parser.parse":            1,
+    "TypeChecker.check_collect": 1,  # and one collecting type-check (check() is total).
+    "TypeChecker.check":       0,    # NOT the raising `check()` — a lint must not raise.
+    "tex_roi._fold_program":   0,
+    "tex_roi.roi_plan":        0,
+    "tex_results.lineage_key": 0,
+    "TEXCache.fingerprint":    0,    # a lint never touches the program cache.
+    "ResultCache.get":         0,
+    "ResultCache.put":         0,
+    "tex_memory.run_roi":      0,
+    "Interpreter._exec_stmt":  0,
+}
+
+
+def test_bench2_interactive_per_tick_counts(r: SubTestResult):
+    """The gate: the device-independent per-tick counts of the five interactive paths."""
+    print("\n--- BENCH-2: per-tick structural counts (CPU, PROF-1 disarmed) ---")
+    for label, pins in (("terminal", _TERMINAL), ("midgraph", _MIDGRAPH), ("pan", _PAN),
+                        ("all_dirty", _ALL_DIRTY), ("lint", _LINT)):
+        try:
+            _check(r, label, _api_counts(label), pins)
+        except Exception as e:
+            r.fail(f"BENCH-2 {label}", f"{type(e).__name__}: {e}")
+
+
+def test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r: SubTestResult):
+    """With PROF-1 DISARMED, TEX itself issues no `torch.cuda.synchronize` on an interactive
+    tick. A sync the host did not ask for is a pipeline stall charged to somebody else's
+    frame, and PROF-1's own four-per-sampled-cook syncs are the reason the profiler is
+    disarmed by default (`tex_runtime/profile.py`, invariant #7).
+
+    Counted with the CALLER's file, so the demo host's own end-of-frame barrier
+    (`RoiComp.cook`, which is host policy) is a different row and does not mask this one.
+    The row is zero on CPU too — nothing calls it — so the assertion is portable; the CUDA
+    reading that gives it teeth is in the CUDA test below."""
+    print("\n--- BENCH-2: zero engine-side CUDA syncs per interactive tick ---")
+    for label in ("terminal", "midgraph", "pan", "all_dirty"):
+        try:
+            got = _api_counts(label)
+            lo, hi = got.get("torch.cuda.synchronize[engine]", (None, None))
+            if lo is None:
+                r.fail("BENCH-2 sync row", "the harness stopped reporting "
+                       "torch.cuda.synchronize[engine]")
+            elif (lo, hi) != (0, 0):
+                r.fail("BENCH-2 sync", f"{label}: TEX issued {lo}..{hi} torch.cuda.synchronize "
+                       f"call(s) per tick with PROF-1 disarmed (expected 0) — re-derive with "
+                       f"`{REDERIVE}` and explain in CHANGELOG.md")
+            else:
+                r.ok(f"{label}: 0 engine-side torch.cuda.synchronize per tick")
+        except Exception as e:
+            r.fail(f"BENCH-2 sync {label}", f"{type(e).__name__}: {e}")
+
+
+# ── CUDA-only: the device rows ──────────────────────────────────────────────
+# Kernel launches, 4-byte `.item()` drains and allocator allocations per tick, measured at
+# 1024^2 with a 512^2 window on an sm_120 device. These are DEVICE-DEPENDENT by nature (a
+# different fuser or a different tier emits a different number of kernels), so they SKIP
+# rather than pass without CUDA — a skipped row is visible, a passed one is a lie.
+_CUDA_RES, _CUDA_WINDOW, _CUDA_TICKS = 1024, 512, 4
+_CUDA_PINS = {
+    #                    kernels   D2H memcpys   allocations
+    "terminal":         (22,       0,            18),
+    "midgraph":         (74,       2,            56),   # 2 D2H = the two `gauss_blur` stages
+    "pan":              (26,       0,            22),   #   reading $sigma back with .item()
+    "all_dirty":        (112,      3,            86),   # 3 blurs on the whole-frame chain
+}
+_CUDA_REDERIVE = (f"python benchmarks/host_path_counts.py --device cuda --res {_CUDA_RES} "
+                  f"--window {_CUDA_WINDOW} --ticks {_CUDA_TICKS} --prof1 off")
+
+
+def test_bench2_cuda_per_tick_counts(r: SubTestResult):
+    print("\n--- BENCH-2: per-tick CUDA kernels / D2H drains / allocations ---")
+    if not torch.cuda.is_available():
+        r.skip("BENCH-2 CUDA counts", "no CUDA device — device rows are not measurable here")
+        return
+    b = _bench()
+    for label, (kern, d2h, allocs) in _CUDA_PINS.items():
+        try:
+            cls = next(c for c in b.SCENARIOS if c.name == label)
+            scn = cls(_CUDA_RES, _CUDA_WINDOW, "cuda", ticks=_CUDA_TICKS)
+            try:
+                scn.epoch = 0
+                api = b.pass_api(scn, _CUDA_TICKS)
+                scn.epoch = 2
+                cuda = b.pass_cuda(scn, _CUDA_TICKS)
+            finally:
+                scn.teardown()
+            got = {"cuda.kernels": cuda.get("cuda.kernels", {}),
+                   "cuda.memcpy_DtoH": cuda.get("cuda.memcpy_DtoH", {}),
+                   "alloc.allocated": api.get("alloc.allocated", {})}
+            want = {"cuda.kernels": kern, "cuda.memcpy_DtoH": d2h, "alloc.allocated": allocs}
+            bad = []
+            for row, exp in want.items():
+                s = got[row]
+                if not s:
+                    bad.append(f"{row}: MISSING")
+                elif not s["stable"]:
+                    bad.append(f"{row}: unstable {s['min']}..{s['max']} (not gateable here)")
+                elif s["min"] != exp:
+                    bad.append(f"{row}: {exp} -> {s['min']} per tick")
+            if bad:
+                r.fail(f"BENCH-2 cuda {label}", "; ".join(bad) +
+                       f" || re-derive with `{_CUDA_REDERIVE}`; a kernel-count move on the same "
+                       f"source is a fuser/tier change and belongs in the CHANGELOG")
+            else:
+                r.ok(f"{label}: {kern} kernels / {d2h} D2H / {allocs} allocations per tick")
+        except Exception as e:
+            r.fail(f"BENCH-2 cuda {label}", f"{type(e).__name__}: {e}")
+
+
+def test_bench2_counters_are_not_inert(r: SubTestResult):
+    """MUTATION GUARD — the ANIM-1 lesson applied to this file.
+
+    Most of the pins above are of the form "this row is exactly N", and several of the most
+    load-bearing N are ZERO (`compile_ast` on every scrub, the whole of `lint`). A spy list
+    that silently failed to install — a renamed target, a `@staticmethod` patched as a plain
+    function, a module imported under a second name — would satisfy every one of them, and
+    the suite would report a contract it was no longer measuring.
+
+    So a COLD scenario is driven and the same counters are required to be NON-ZERO, and the
+    frame counter is required to see TEX frames at all. A harness that cannot fail does not
+    protect the contract it is pointed at."""
+    print("\n--- BENCH-2 mutation guard: the counters fire on a cold tick ---")
+    b = _bench()
+    scn = b.PrewarmScenario(RES, WINDOW, "cpu", ticks=1)
+    try:
+        cold = b.pass_api(scn, 1)
+    finally:
+        scn.teardown()
+    for row in ("TEXCache.compile_ast", "TEXCache.compile_tex", "Lexer.tokenize",
+                "Parser.parse", "TEXCache.fingerprint", "TypeChecker.check"):
+        n = cold.get(row, {}).get("min", 0)
+        r.ok(f"cold prewarm tick: {row} = {n} (> 0, so the spy is live)") if n > 0 else \
+            r.fail("BENCH-2 inert spy", f"{row} counted 0 on a COLD tick — the spy is not "
+                   f"installed, so every zero-valued pin in this file is vacuous")
+
+    scn = b.TerminalKnobScenario(RES, WINDOW, "cpu", ticks=1)
+    scn.epoch = 9
+    try:
+        frames = b.pass_frames(scn, 1, 3)
+    finally:
+        scn.teardown()
+    tot = frames.get("frames.total", {}).get("min", 0)
+    r.ok(f"terminal tick: {tot} TEX python frames counted (> 0, so the profiler hook is live)") \
+        if tot > 0 else \
+        r.fail("BENCH-2 inert frames", "the sys.setprofile frame counter saw no TEX frames")
+
+    # And the negative half of the mutation guard: a cook-shaped scenario must NOT look like
+    # the lint one. If these two ever agreed, one of them is not running what it says.
+    term = _api_counts("terminal")
+    lint = _api_counts("lint")
+    r.ok("terminal and lint disagree on tex_engine.cook (the scenarios are distinct)") \
+        if term.get("tex_engine.cook") != lint.get("tex_engine.cook") else \
+        r.fail("BENCH-2 scenarios", "terminal and lint report the same cook count — one of "
+               "the two scenarios is not driving what its name says")

@@ -20,6 +20,33 @@ python benchmarks/run_benchmarks.py --full --cold
 python benchmarks/run_benchmarks.py --compare benchmarks/results/v0.10.0.json
 ```
 
+## Structural counts, not times: `host_path_counts.py`
+
+Everything else in this directory measures **milliseconds**. `host_path_counts.py` measures
+**integers**: how many times each seam on the cook path is entered per interactive tick, for
+the paths an embedding host drives. It exists because wall-clock on a development laptop cannot
+gate a regression — `docs/roadmap.md` §10 item 3 records a byte-identical tree tripping the 0.95
+stop-ship threshold against itself — while the per-tick counts are exact and repeat run after
+run. `tests/test_bench2_counts.py` pins them, so an interactive-path regression reds in CI on a
+machine with no GPU.
+
+```bash
+python benchmarks/host_path_counts.py                         # both devices if present
+python benchmarks/host_path_counts.py --device cpu --res 96 --window 48 --ticks 4
+python benchmarks/host_path_counts.py --save results/counts_head.json
+python benchmarks/host_path_counts.py --compare results/counts_head.json   # rc 1 on drift
+python benchmarks/host_path_counts.py --selftest              # prove the spies are not inert
+```
+
+It drives `examples/host_demo.py::RoiComp` through seven scenarios (`prewarm`, `source_edit`,
+`terminal`, `midgraph`, `pan`, `all_dirty`, `lint`) and reports, per tick, API call counts, TEX
+Python frames per `module:function`, and — on CUDA — kernel launches, memcpys and allocator
+statistics. Each row carries a `stable` flag (`min == max` over the steady ticks); only stable
+rows are compared, because a row that disagrees with itself cannot gate anything.
+
+The design note, the measured signature at head and the deferred timing tier are in
+`docs/host-path-counts.md`.
+
 ## What It Measures
 
 Each TEX program is measured with adaptive run counts (10-50 runs, stopping
