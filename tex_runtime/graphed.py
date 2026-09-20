@@ -53,8 +53,16 @@ def is_capturing() -> bool:
 
 # stdlib calls that .item()/sync internally — capturing a program that calls
 # them is doomed, so gate them out statically (never attempt the capture).
+#
+# PERF-2 made several of these syncs CONDITIONAL: a scalar minted from a literal or a
+# `$param` is now resolved from the host value carried on the tensor, and only a value
+# genuinely computed on the device is read back. The gate stays as it is, on purpose —
+# it is a STATIC gate over the AST, and whether a given cook's sigma is host-resolvable
+# is a property of the binding values, not of the program. Narrowing it would mean
+# arming a capture that a later cook's computed sigma would blow, which is the doomed
+# capture plus RNG-poison recovery this set exists to avoid.
 _SYNC_STDLIB = frozenset({
-    # sample-space sync: blur sigma / mip lod / bilateral read a scalar via .item()
+    # sample-space sync: blur sigma / mip lod / bilateral can read a scalar via .item()
     "blur", "gauss_blur", "bilateral_filter",
     "sample_mip", "sample_mip_gauss", "sample_lod",
     # P1-UC1-STATIC-GATE: the octave/iteration-count noise family resolves its

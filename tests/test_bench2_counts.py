@@ -268,10 +268,20 @@ _CUDA_RES, _CUDA_WINDOW, _CUDA_TICKS = 1024, 512, 4
 _CUDA_PINS = {
     #                    kernels   D2H memcpys   allocations
     "terminal":         (22,       0,            18),
-    "midgraph":         (74,       2,            56),   # 2 D2H = the two `gauss_blur` stages
-    "pan":              (26,       0,            22),   #   reading $sigma back with .item()
-    "all_dirty":        (112,      3,            86),   # 3 blurs on the whole-frame chain
+    "midgraph":         (74,       0,            56),   # PERF-2 re-pin (was 2 — the two
+    "pan":              (26,       0,            22),   #   `gauss_blur` stages reading their
+    "all_dirty":        (112,      0,            86),   #   sigma back; was 3 with `glow`).
 }
+# WHY THE D2H COLUMN IS NOW ZERO EVERYWHERE, AND WHAT WOULD MAKE IT NON-ZERO AGAIN.
+# `gauss_blur` needs a Python number for its kernel radius and used to get it with
+# `sigma_t.item()` — a 4-byte device->host copy plus the stream synchronisation it implies,
+# once per blur stage per cook. PERF-2 carries the host reading of a literal / `$param` /
+# folded constant ON the 0-dim tensor it is minted into, so the number is resolved on the
+# host. A sigma genuinely COMPUTED on the device still reads back, and correctly so — the
+# comp these scenarios drive has no such stage, which is why this column reads 0 rather than
+# "fewer". A future stage whose sigma is an expression over a binding would legitimately put
+# it back; that is a comp change, not a regression, and belongs in this comment when it
+# happens.
 _CUDA_REDERIVE = (f"python benchmarks/host_path_counts.py --device cuda --res {_CUDA_RES} "
                   f"--window {_CUDA_WINDOW} --ticks {_CUDA_TICKS} --prof1 off")
 

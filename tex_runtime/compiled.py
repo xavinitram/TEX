@@ -33,7 +33,7 @@ from .interpreter import (Interpreter, _collect_identifiers, _consensus_extent,
                           _SCALAR_BUILTIN_DEFAULTS)
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
                       _iter_child_nodes, is_vec_param_list)
-from .stdlib import TEXStdlib
+from .stdlib import TEXStdlib, _tag_host_scalar
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 
 logger = logging.getLogger("TEX")
@@ -941,7 +941,11 @@ def _params_on_device(cg_fn, program, bindings: dict, device: "torch.device") ->
         if value is None or isinstance(value, (torch.Tensor, str)) or is_vec_param_list(value):
             continue
         try:
-            placed[name] = torch.as_tensor(value, device=device)
+            # PERF-2: this route is the one place a codegen `$param` becomes a DEVICE
+            # scalar, so it is also the one place the Python number it came from would
+            # otherwise be lost — carry the host reading on the tensor (the preamble's
+            # `as_tensor` passes the same object through untouched).
+            placed[name] = _tag_host_scalar(torch.as_tensor(value, device=device), value)
         except Exception:
             pass
     return placed

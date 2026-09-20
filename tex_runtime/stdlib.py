@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import struct as _struct
 import threading as _threading
 from collections import OrderedDict as _OrderedDict
 import torch
@@ -47,6 +48,93 @@ def _has_channel_axis(t) -> bool:
     return (t.dim() >= 1 and t.shape[-1] in VEC_CHANNELS) or (t.dim() >= 4 and t.shape[-1] > 1)
 
 
+# ── Host-resolved scalars (PERF-2) ────────────────────────────────────
+# A few builtins need a PYTHON number rather than a tensor: a kernel radius sizes an
+# allocation, an iteration count drives a `range`, a flag picks a branch. Reading one
+# off a CUDA tensor costs a 4-byte device->host copy AND the stream synchronisation
+# that copy implies, which drains a launch-bound pipeline — once per call, per cook.
+#
+# Most of those numbers never needed the device at all: a literal, a `$param` float/int
+# and a folded constant all begin life as a Python number and are only turned into a
+# 0-dim device tensor on the way in. `_tag_host_scalar` records the number ON the tensor
+# at the moment that tensor is minted and `_host_scalar` hands it back, so the readback
+# is skipped for exactly the value it would have returned. A tensor carrying no tag is a
+# genuinely computed value (`gauss_blur(@A, $s * 2.0)`); reading THAT back is legitimate
+# and stays.
+#
+# Two rules keep this behaviour-preserving rather than merely faster:
+#   * The tag is the value `.item()` WOULD have returned — the number after the tensor's
+#     dtype has rounded it (fp32 by default, fp16 under precision="fp16") — never the
+#     un-rounded Python double. Kernel weights are computed from it, so skipping the
+#     rounding would be a silent value divergence between the tiers (invariant #2).
+#   * Only a mint site tags, and only with a value it is holding, so a tag can never go
+#     stale: every tensor operation returns a NEW (untagged) object, and the tagged
+#     populations (the interpreter's literal cache, its per-cook scalar bindings) are
+#     never written in place. Every reader falls back to the readback it replaced, so a
+#     missing tag is slower, never wrong.
+_HOST_SCALAR_ATTR = "_tex_host_scalar"
+
+
+def _dtype_rounded(value, dtype):
+    """`value` as the Python double a 0-dim `dtype` tensor holding it would yield from
+    `.item()`, computed entirely on the host. fp32 (the default working dtype) goes
+    through `struct` — invariant #1 bans numpy and this is the same round-trip
+    `tex_marshalling` uses for its fingerprint; any other dtype rounds through a CPU
+    scalar tensor, which is a host allocation and still never touches the device.
+    Returns None when the rounding cannot be established, which simply leaves the
+    caller un-tagged."""
+    if dtype is None or dtype is torch.float32:
+        try:
+            return _struct.unpack("<f", _struct.pack("<f", value))[0]
+        except (OverflowError, ValueError, TypeError):
+            return None
+    try:
+        return torch.scalar_tensor(value, dtype=dtype).item()
+    except Exception:
+        return None
+
+
+def _tag_host_scalar(t: torch.Tensor, value, dtype=None) -> torch.Tensor:
+    """Record `value`'s host reading on a freshly minted 0-dim tensor; returns `t`.
+
+    The fp32 rounding is spelled out here rather than delegated because this runs once
+    per scalar binding per cook: the mint sites are hot enough that the extra Python
+    frame showed in the host-path frame counts."""
+    dt = t.dtype if dtype is None else dtype
+    if dt is None or dt is torch.float32:
+        try:
+            rounded = _struct.unpack("<f", _struct.pack("<f", value))[0]
+        except (OverflowError, ValueError, TypeError):
+            return t
+    else:
+        rounded = _dtype_rounded(value, dt)
+    if rounded is not None:
+        try:
+            setattr(t, _HOST_SCALAR_ATTR, rounded)
+        except AttributeError:            # a tensor class that refuses attributes
+            pass
+    return t
+
+
+def _host_scalar(x):
+    """What `.item()` would return for `x`, obtained WITHOUT a device->host copy, or
+    None when the value genuinely only exists on the device (the caller then reads it
+    back as before).
+
+    A non-tensor answers None deliberately: each call site already has its own number
+    conversion and they do NOT agree — `gauss_blur` routes a Python float through
+    `_to_tensor` (so fp32-rounded), `bilateral_filter` through `float()` (so not) —
+    and answering for them here would silently change one of them."""
+    if x.__class__ is not torch.Tensor:
+        return None
+    v = getattr(x, _HOST_SCALAR_ATTR, None)
+    if v is not None:
+        return v
+    if x.device.type == "cpu" and x.numel() == 1:
+        return x.item()                   # host memory: no copy, no stream sync
+    return None
+
+
 _scalar_avg_warned = False
 
 
@@ -62,7 +150,8 @@ def _scalar_from_tensor(t: torch.Tensor, fn_name: str) -> float:
     explicitly (avg/min/max) or index one element to get a defined value.
     """
     if t.numel() == 1:
-        return t.reshape(()).item()
+        v = _host_scalar(t)
+        return v if v is not None else t.reshape(()).item()
     flat = t.reshape(-1)
     if bool(torch.all(flat == flat[0])):
         return flat[0].item()
@@ -1463,11 +1552,15 @@ class TEXStdlib:
         Returns blurred [B, H, W, C] tensor with replicate border handling.
         """
         img = image if image.__class__ is torch.Tensor else _to_tensor(image)
-        sigma_t = sigma if sigma.__class__ is torch.Tensor else _to_tensor(sigma)
-        # .item() forces a GPU->CPU sync, but the Gaussian kernel radius is a
-        # host-side Python int (radius ~= 3*sigma), so a scalar is unavoidable.
-        # Prefer a constant sigma so this fires once rather than per element.
-        sigma_val = max(sigma_t.item(), 0.0)
+        # The Gaussian kernel radius is a host-side Python int (radius ~= 3*sigma), so
+        # a SCALAR is unavoidable here — a device round trip is not. `_host_scalar`
+        # answers from the number a literal / `$param` / folded constant was minted
+        # from; only a sigma genuinely computed on the device is read back (PERF-2).
+        sigma_val = _host_scalar(sigma)
+        if sigma_val is None:
+            sigma_t = sigma if sigma.__class__ is torch.Tensor else _to_tensor(sigma)
+            sigma_val = sigma_t.item()
+        sigma_val = max(sigma_val, 0.0)
         if sigma_val < 0.3 or img.dim() < 4:
             return img
         bchw = _get_bchw(img)
@@ -1490,8 +1583,15 @@ class TEXStdlib:
             sigma_r: float -- range sigma (color similarity, 0.01-0.5 typical)
         """
         img = image if image.__class__ is torch.Tensor else _to_tensor(image)
-        ss = sigma_s.item() if torch.is_tensor(sigma_s) else float(sigma_s)
-        sr = sigma_r.item() if torch.is_tensor(sigma_r) else float(sigma_r)
+        # Both sigmas size the window / the weights host-side; PERF-2 resolves them
+        # from the minted host value where there is one, and reads back where there
+        # is not (see `_host_scalar`).
+        ss = _host_scalar(sigma_s)
+        if ss is None:
+            ss = sigma_s.item() if torch.is_tensor(sigma_s) else float(sigma_s)
+        sr = _host_scalar(sigma_r)
+        if sr is None:
+            sr = sigma_r.item() if torch.is_tensor(sigma_r) else float(sigma_r)
 
         if img.dim() < 4 or ss < 0.3:
             return img
@@ -1610,8 +1710,11 @@ class TEXStdlib:
         padded = _pad_replicate_chunked(x, pad_l, pad_r, pad_t, pad_b)
         out = torch.nn.functional.conv2d(padded, w, groups=C)
 
-        norm_t = normalize if normalize.__class__ is torch.Tensor else _to_tensor(normalize)
-        if norm_t.item() != 0:
+        norm_val = _host_scalar(normalize)
+        if norm_val is None:
+            norm_t = normalize if normalize.__class__ is torch.Tensor else _to_tensor(normalize)
+            norm_val = norm_t.item()
+        if norm_val != 0:
             ksum = w.sum(dim=(1, 2, 3)).view(1, C, 1, 1)      # per-channel kernel sum
             out = TEXStdlib._safe_div(out, ksum)
 
@@ -1639,7 +1742,8 @@ class TEXStdlib:
         if not isinstance(x, torch.Tensor):
             return int(x)
         if x.numel() == 1:
-            return int(x.reshape(()).item())
+            v = _host_scalar(x)
+            return int(v if v is not None else x.reshape(()).item())
         flat = x.reshape(-1)
         if bool(torch.all(flat == flat[0])):
             return int(flat[0].item())
@@ -2795,9 +2899,11 @@ def _to_tensor(x) -> torch.Tensor:
 
 
 def _to_float(x) -> float:
-    """Extract a Python float from a scalar."""
+    """Extract a Python float from a scalar (PERF-2: from the minted host value when
+    the tensor carries one, so a radius / iteration count costs no device round trip)."""
     if isinstance(x, torch.Tensor):
-        return x.item()
+        v = _host_scalar(x)
+        return v if v is not None else x.item()
     return float(x)
 
 

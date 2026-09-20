@@ -44,6 +44,7 @@ from .codegen_stencil import (
 from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
                           _broadcast_pair, _ensure_spatial, vec_list_to_tensor)
 from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
+                     _HOST_SCALAR_ATTR, _dtype_rounded,
                      set_cook_grid as _stdlib_set_cook_grid,
                      restore_cook_ctx as _stdlib_restore_cook_ctx)  # P0-D: cook grid
 
@@ -168,6 +169,25 @@ def is_vec_param_list(value: Any) -> bool:
         if isinstance(c, bool) or not isinstance(c, (int, float)):
             return False
     return True
+
+
+_host_scalar_readers_memo: frozenset | None = None
+
+
+def _host_scalar_readers() -> frozenset:
+    """Builtin names whose impl resolves an argument to a PYTHON number on the host —
+    a kernel radius, an iteration count, a flag (PERF-2).
+
+    Derived from the registry's `sync` tag, which is exactly the property "this impl
+    reads a scalar back", and the same tag `graphed._SYNC_STDLIB` derives from (TST-3
+    machine-checks that derivation), so a new syncing builtin is covered the day it is
+    registered rather than when someone remembers a second list."""
+    global _host_scalar_readers_memo
+    if _host_scalar_readers_memo is None:
+        from .stdlib_registry import REGISTRY
+        _host_scalar_readers_memo = frozenset(
+            n for e in REGISTRY if e.sync for n in e.names)
+    return _host_scalar_readers_memo
 
 
 def _stage_vec_params(bindings: dict, device: Any, dtype) -> None:
@@ -500,6 +520,10 @@ class _CodeGen(_EmitStdFnsMixin):
         self._preamble: list[str] = []  # hoisted constant assignments
         self._indent = 1  # Start at 1 (inside function body)
         self._const_cache: dict[float, str] = {}  # value → variable name
+        # PERF-2: set when the program calls a builtin that resolves an argument to a
+        # host number, which is the only case where tagging the hoisted constants buys
+        # anything. Every other program's emitted source stays byte-identical.
+        self._tag_consts = False
         self._vec_const_cache: dict[tuple, str] = {}  # (v1, v2, ...) → variable name
         self._range_cache: dict[tuple, str] = {}  # (start, stop, step) → variable name
         self._kernel_const_cache: dict[tuple, str] = {}  # (kvals, kH, kW) → base kernel var
@@ -842,7 +866,21 @@ class _CodeGen(_EmitStdFnsMixin):
         the compiled module code object (and its marshalled blob) is
         reproducible across processes — the basis for PC-3 disk persistence.
         """
-        preamble = "\n".join(self._preamble)
+        preamble_lines = list(self._preamble)
+        if self._tag_consts:
+            # PERF-2: this program calls a builtin that needs a Python number, and a
+            # hoisted constant IS one — it is minted into a 0-dim device tensor purely
+            # so the surrounding tensor expressions can use it. Record the host reading
+            # on it (the fp32 value the tensor actually holds, never the un-rounded
+            # Python double), so the builtin resolves a literal sigma / radius / flag
+            # without a 4-byte D2H and the stream sync it implies. `_host_scalar` reads
+            # the tag; an untagged operand still reads back, so a constant whose
+            # rounding cannot be established simply keeps the old cost.
+            for value, var in self._const_cache.items():
+                rounded = _dtype_rounded(value, torch.float32)
+                if rounded is not None:
+                    preamble_lines.append(f"    {var}.{_HOST_SCALAR_ATTR} = {rounded!r}")
+        preamble = "\n".join(preamble_lines)
         body = "\n".join(self._lines)
         # Hoisted constants go before the main body so they're available
         # inside loops without per-iteration tensor creation.
@@ -2794,6 +2832,8 @@ class _CodeGen(_EmitStdFnsMixin):
 
     def _emit_function_call(self, node: FunctionCall) -> str:
         name = node.name
+        if name in _host_scalar_readers():
+            self._tag_consts = True
 
         # LX-5: debug_print is an interpreter-only value probe (a thread-local
         # side-effect). Refuse to codegen it — _Unsupported forces the whole program

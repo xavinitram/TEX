@@ -35,7 +35,7 @@ from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_ve
 from .host import _cancel_check, _report_progress   # SCHED-3 seam (no cycle: host imports torch only)
 from . import profile as _prof                      # PROF-1 seam (pure stdlib; disarmed by default)
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
-                     _scalar_from_tensor, _get_flat_batch_index)
+                     _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar)
 from . import stdlib as _stdlib_mod    # P0-D: publishes the cook grid for const-coord reads
 
 # Hard limit on for-loop iterations to prevent infinite loops
@@ -368,7 +368,17 @@ class Interpreter:
                 # Vec param defaults / converted widget values (e.g. [0.5, 0.3, 0.1]).
                 self.bindings[name] = vec_list_to_tensor(value, target_dtype, target_device)
             else:
-                self.bindings[name] = torch.scalar_tensor(float(value), dtype=target_dtype, device=target_device)
+                # PERF-2: a scalar `$param` arrives as a Python number and is minted into
+                # a 0-dim DEVICE tensor here, which is where its host reading was being
+                # thrown away — a builtin that needs a kernel radius then paid a 4-byte
+                # D2H plus a stream sync to get it back, every cook. Carry the reading on
+                # the tensor instead (`_host_scalar` reads it; a computed value has no tag
+                # and still reads back). Fresh tensor per cook, never written in place, so
+                # the tag cannot go stale.
+                fv = float(value)
+                self.bindings[name] = _tag_host_scalar(
+                    torch.scalar_tensor(fv, dtype=target_dtype, device=target_device),
+                    fv, target_dtype)
 
         # Determine spatial context from image inputs. Under an ROI cook the grid is the
         # cook-region (w,h) from `roi`, NOT a binding's shape — a whole-passed gather input
@@ -1599,7 +1609,12 @@ class Interpreter:
         dt = self._dtype
         if dt is not torch.float32 and not (-_FP16_MAX <= node.value <= _FP16_MAX):
             dt = torch.float32
-        t = torch.scalar_tensor(node.value, dtype=dt, device=self.device)
+        # PERF-2: carry the literal's host reading on the tensor, so a builtin that
+        # needs a Python number (a kernel radius, an iteration count) reads it off the
+        # host instead of draining the device. Cache entries are never mutated, so the
+        # tag stays true for the entry's whole life.
+        t = _tag_host_scalar(
+            torch.scalar_tensor(node.value, dtype=dt, device=self.device), node.value, dt)
         # The cache persists across executions; entries are 0-dim (a few hundred
         # bytes each) but distinct literals accumulate over a session of code
         # edits — wholesale-clear on overflow (entries are trivially recreated).

@@ -136,8 +136,9 @@ holds the edited sources; it is reported and not pinned for that reason.
 | per tick | prewarm | source_edit | terminal | midgraph | pan | all_dirty | lint |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | CUDA kernel launches | 0 | 0..86~ | **22** | **74** | **26** | **112** | 0 |
-| memcpy D2H | 0 | 0..3~ | **0** | **2** | **0** | **3** | 0 |
-| memcpy D2H bytes | 0 | 0..12~ | 0 | 8 | 0 | 12 | 0 |
+| memcpy D2H | 0 | 0 | **0** | **0** | **0** | **0** | 0 |
+| memcpy D2H bytes | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| memcpy D2H at `v0.37.0`, before PERF-2 | 0 | 0..3~ | 0 | 2 | 0 | 3 | 0 |
 | memcpy D2D | 0 | 4..10~ | 0 | 2 | 0 | 1 | 0 |
 | memcpy H2D | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | allocator allocations | 0 | 72 | **18** | **56** | **22** | **86** | 0 |
@@ -147,16 +148,26 @@ holds the edited sources; it is reported and not pinned for that reason.
 | `_preflight_memory` | 0 | 7 | 1 | 5 | 1 | 10 | 0 |
 | host's own end-of-frame sync | 0 | 1 | 1 | 1 | 1 | 1 | 0 |
 
-Every D2H is **4 bytes** (8 bytes over two blur stages, 12 over three): these are `.item()`
-drains, not image traffic. There is no H2D on any interactive tick — the canvases stay resident.
+Before PERF-2 every D2H was **4 bytes** (8 over two blur stages, 12 over three): they were
+`.item()` drains, not image traffic — `gauss_blur` resolving its kernel radius. PERF-2 carries
+the host reading of a literal / `$param` / folded constant on the 0-dim tensor it is minted
+into, so the whole column is 0 and the `source_edit` row became stable at 0 with it. A sigma
+genuinely computed on the device still drains, correctly: this comp has no such stage. There is
+no H2D on any interactive tick either — the canvases stay resident.
 
 ### 4.3 TEX Python frames
 
 | frames per tick | prewarm | source_edit | terminal | midgraph | pan | all_dirty | lint |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| CPU leg | 13277 | 301..1341~ | 1551 | 2204 | 433 | 1747 | 1371 |
-| CUDA leg | 13572 | 301..1530~ | 1564 | 2269 | 446 | 2005 | 1371 |
+| CPU leg | 13292 | 301..1351~ | 1552 | 2211 | 434 | 1760 | 1371 |
+| CUDA leg | 13587 | 301..1505~ | 1560 | 2251 | 442 | 1968 | 1371 |
 | CPU leg at `v0.37.0`, before PERF-1 | 13277 | 301..1341~ | 2744 | 3271 | 433 | 1747 | 1371 |
+
+PERF-2 moved the frame rows UP by 1 to 13 per tick (one `_host_scalar` call per blur, one
+`_tag_host_scalar` per scalar binding per cook) while taking the D2H column to zero. That is
+the trade this note exists to make legible: a Python frame is host work that pipelines, a
+`cudaStreamSynchronize` is host work that stops the pipeline, and the counts are not
+interchangeable. §7's timing tier is where the trade is priced.
 
 The terminal tick's 1551 frames break down (CPU leg, per-module subtotals), with the
 `v0.37.0` column beside them so what moved is readable without a second document:
@@ -232,12 +243,24 @@ test before it starts, and cannot claim a win the instrument would not see.
    engine offers no "the prefix did not change" handle, which is what a follow-up would design.
    *Shows fixed as:* `tex_results.lineage_key` going **11 → 2** on `terminal`, **15 → 6** on
    `midgraph`, with `ResultCache.get/put` unchanged.
-3. **`gauss_blur` reads `sigma` back with `.item()`.** `tex_runtime/stdlib.py:1470` —
-   `sigma_val = max(sigma_t.item(), 0.0)`, one 4-byte D2H plus a stream sync per blur stage per
-   cook. The comment there already says a constant sigma makes it fire once; it does not, because
-   the value arrives as a tensor binding each cook.
-   *Shows fixed as:* `cuda.memcpy_DtoH` going **2 → 0** on `midgraph` and **3 → 0** on
-   `all_dirty`, with `cuda.memcpy_DtoH_bytes` following.
+3. **`gauss_blur` reads `sigma` back with `.item()`.** **FIXED (PERF-2).** It was
+   `sigma_val = max(sigma_t.item(), 0.0)` — one 4-byte D2H plus the stream synchronisation that
+   copy implies, per blur stage per cook. The old comment claimed a constant sigma made it fire
+   once; it fired once per COOK, because the value arrived as a tensor every time: a literal is
+   minted into a 0-dim device tensor by the interpreter's literal cache and by codegen's hoisted
+   constants, and a `$param` float by the interpreter's binding setup. Those mint sites now
+   record the host reading ON the tensor (`stdlib._tag_host_scalar`) and the builtins take it
+   from there (`stdlib._host_scalar`); a sigma genuinely computed on the device carries no tag
+   and still reads back, which is correct and stays. The same reader serves `bilateral_filter`'s
+   two sigmas, `convolve`'s `normalize` flag, `erode`/`dilate`'s radius (through `_to_float`) and
+   `patch_dist`'s uniform-or-raise check. `cuda.memcpy_DtoH` is **2 → 0** on `midgraph`, **3 → 0**
+   on `all_dirty` and stable-0 on `source_edit`, with `cuda.memcpy_DtoH_bytes` following and the
+   kernel / allocation / engine-sync rows unmoved; the price is 1 to 13 more TEX Python frames
+   per tick (§4.3).
+   *What is still avoidable, and shows fixed as:* `sample_mip`'s LOD is read back from a tensor
+   that has already been through `.clamp(0, max_level)`, so the tag is gone by the time it is
+   read — hoisting that clamp to the host would take `cuda.memcpy_DtoH` to 0 on a comp that
+   mip-samples, which this one does not, so no row here would move.
 4. **PROF-1 costs four device syncs per sampled cook.** `tex_runtime/profile.py:408`
    (`measure._sync`), called at `:421` and `:433` — twice per `measure` block, and the engine
    arms a nested one. Measured with `--prof1 on` on a terminal tick: the **sampled** tick reads

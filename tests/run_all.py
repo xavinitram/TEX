@@ -1911,6 +1911,27 @@ def main():
     test_perf1_clone_tree_is_a_faithful_copy(r)
     test_perf1_nan_and_inf_do_not_become_a_radius(r)
 
+    # PERF-2: a builtin that needs a Python number (a kernel radius, an iteration count, a
+    # flag) takes it from the host value the literal / `$param` was minted from, instead of
+    # draining it off the device — bit-exact on both tiers, both devices, every sigma shape,
+    # with the readback kept for a scalar that only exists on the device.
+    from test_perf2_host_scalar import (
+        test_perf2_outputs_are_bit_exact_on_both_tiers,
+        test_perf2_convolve_and_patch_dist_are_bit_exact,
+        test_perf2_the_two_tiers_still_agree,
+        test_perf2_a_host_scalar_costs_no_readback,
+        test_perf2_a_computed_scalar_still_reads_back,
+        test_perf2_the_tag_carries_the_rounded_value,
+        test_perf2_a_tag_never_survives_an_operation,
+    )
+    test_perf2_outputs_are_bit_exact_on_both_tiers(r)
+    test_perf2_convolve_and_patch_dist_are_bit_exact(r)
+    test_perf2_the_two_tiers_still_agree(r)
+    test_perf2_a_host_scalar_costs_no_readback(r)
+    test_perf2_a_computed_scalar_still_reads_back(r)
+    test_perf2_the_tag_carries_the_rounded_value(r)
+    test_perf2_a_tag_never_survives_an_operation(r)
+
     success = r.summary()
     return 0 if success else 1
 
