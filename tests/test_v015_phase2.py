@@ -121,7 +121,7 @@ def test_uc4_const_prop(r: SubTestResult):
 def test_uc1_cuda_graph(r: SubTestResult):
     print("\n--- UC-1: CUDA-graph replay engine ---")
     if not torch.cuda.is_available():
-        r.ok("UC-1 cuda_graph (no GPU, SKIPPED)")
+        r.skip("UC-1 cuda_graph replay engine", "no CUDA on this box")
         return
     import TEX_Wrangle.tex_runtime.graphed as G
     from TEX_Wrangle.tex_runtime.compiled import _plain_execute
@@ -200,7 +200,7 @@ def test_uc1_cuda_graph(r: SubTestResult):
 def test_q1_fused_capture(r: SubTestResult):
     print("\n--- Q-1: fused chain as CUDA-graph capture unit ---")
     if not torch.cuda.is_available():
-        r.ok("Q-1 fused capture (no GPU, SKIPPED)")
+        r.skip("Q-1 fused chain as a capture unit", "no CUDA on this box")
         return
     import TEX_Wrangle.tex_fusion as FUS
     import TEX_Wrangle.tex_runtime.graphed as G

@@ -529,7 +529,7 @@ def test_v035_port6_routes_still_register_under_comfyui(r):
             return
         text = proc.stdout.strip()
         if "SKIP" in text:
-            r.ok("PORT-6 routes: skipped (aiohttp absent in this environment)")
+            r.skip("PORT-6 routes under ComfyUI", "aiohttp is not installed in this interpreter")
             return
         out = dict(line.split(" ", 1) for line in text.splitlines() if " " in line)
         assert int(out.get("ROUTES", "0")) > 0, \

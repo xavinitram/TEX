@@ -595,7 +595,7 @@ def test_lat3_deferred_timing(r: SubTestResult):
             C._deferred_ev.clear()
             r.ok("deferred read fires positive ms after completion; cross-res isolated")
         else:
-            r.ok("sync _timed ok (no CUDA to defer)")
+            r.skip("LAT-3 deferred read", "no CUDA on this box - there is nothing to defer")
     except Exception as e:
         r.fail("LAT-3", f"{type(e).__name__}: {e}")
 

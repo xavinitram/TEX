@@ -55,7 +55,7 @@ def test_v033_xpu2_handle_metadata_never_fences(r):
     copy is ISSUED, so a consumer that only needs to know how big a frame is — the byte
     accounting a cache does on every eviction — never waits for one."""
     if not _has_cuda():
-        r.ok("XPU-2: metadata SKIPPED (no CUDA)")
+        r.skip("XPU-2 metadata", "no CUDA on this box")
         return
     src = _big()
     torch.cuda.synchronize()
@@ -92,7 +92,8 @@ def test_v033_xpu2_the_fence_is_load_bearing(r):
     pre-copy contents; reading it after `wait()` must show the frame. A missing fence collapses
     the two, which is precisely the silent wrong-frame this handle exists to prevent."""
     if not _has_cuda():
-        r.ok("XPU-2: fence stress SKIPPED (no CUDA — the copy is synchronous by definition)")
+        r.skip("XPU-2 fence stress",
+               "no CUDA on this box - the copy is synchronous by definition")
         return
     def _behind_ballast(tag):
         """Issue an egress that provably cannot have started: heavy GPU work is enqueued on the
@@ -157,7 +158,7 @@ def test_v033_xpu2_wait_is_idempotent_and_releases_the_source(r):
     another stream with no ordering relationship. After the fence that reason is gone, so the
     reference is dropped: a handle held for a while must not keep a VRAM frame alive."""
     if not _has_cuda():
-        r.ok("XPU-2: source release SKIPPED (no CUDA)")
+        r.skip("XPU-2 source release", "no CUDA on this box")
         return
     src = _big(mb=8)
     torch.cuda.synchronize()

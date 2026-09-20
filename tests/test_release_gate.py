@@ -97,7 +97,8 @@ def test_scatter_determinism_band(r: SubTestResult):
         if val is None:
             # No CUDA on this runner (the CPU CI lane) — can't gate what wasn't measured.
             # This is the honest hardware limitation S-4 (validate-hw) exists to close.
-            r.ok("scatter-determinism band: not measured (no CUDA on this runner) — SKIPPED")
+            r.skip("scatter-determinism release band",
+                   "no CUDA on this runner, so PR-LP5 recorded no value to gate")
         elif val <= pin._CUDA_DET_BAND:
             r.ok(f"scatter-determinism within release band ({val:.1e} <= {pin._CUDA_DET_BAND:.0e})")
         else:

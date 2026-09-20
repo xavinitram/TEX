@@ -152,7 +152,7 @@ def test_port3_cli(r: SubTestResult):
         import torchvision  # noqa: F401
         from torchvision.io import decode_image  # noqa: F401
     except Exception:
-        r.ok("PORT-3 CLI (no torchvision, SKIPPED)")
+        r.skip("PORT-3 CLI", "torchvision is not installed in this interpreter")
         return
     from TEX_Wrangle import tex_cli, tex_api
     from TEX_Wrangle.tex_node import _V3_AVAILABLE
@@ -213,7 +213,7 @@ def test_port3_cli_edges(r: SubTestResult):
     try:
         from torchvision.io import decode_image  # noqa: F401
     except Exception:
-        r.ok("PORT-3 CLI edges (no torchvision, SKIPPED)")
+        r.skip("PORT-3 CLI edges", "torchvision is not installed in this interpreter")
         return
     from torchvision.io import decode_image
     from TEX_Wrangle import tex_cli
@@ -317,7 +317,7 @@ def test_port3_16bit_png(r: SubTestResult):
     try:
         import torchvision.io as tvio
     except Exception:
-        r.ok("PORT-3 16-bit (no torchvision, SKIPPED)")
+        r.skip("PORT-3 16-bit", "torchvision is not installed in this interpreter")
         return
     from TEX_Wrangle import tex_cli
     saved_read, saved_decode = tvio.read_file, tvio.decode_image

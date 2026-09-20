@@ -236,7 +236,7 @@ def test_data2_storage_exr(r: SubTestResult):
         r.ok("16-bit PNG round-trips bit-exact (torchvision decode)") if good \
             else r.fail("DATA-2 png16", f"dtype={dec.dtype}")
     except ImportError:
-        r.ok("16-bit PNG test skipped (no torchvision)")
+        r.skip("DATA-2 png16", "torchvision is not installed in this interpreter")
 
     # the EXR reader is wired into the CLI ingest seam: `tex run --in a.exr` reads scene-linear
     # fp32 with HDR + all channels kept (no [0,1] normalize, no 3-channel force) — the DATA-2

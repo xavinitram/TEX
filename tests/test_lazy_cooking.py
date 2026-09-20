@@ -346,7 +346,8 @@ def test_lazy_execute_path(r: SubTestResult):
             assert all(lazy_flags)
             r.ok(f"schema declares {N.MAX_LAZY_INPUTS} lazy pool slots")
         else:
-            r.ok("schema pool check skipped (v3 API absent in test venv)")
+            r.skip("schema declares lazy pool slots",
+                   "the v3 node API is absent in this interpreter")
     except Exception as e:
         r.fail("schema declares lazy pool", str(e))
 

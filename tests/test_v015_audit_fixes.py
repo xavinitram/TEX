@@ -155,7 +155,7 @@ def test_m1_oom_unwrap(r: SubTestResult):
     from TEX_Wrangle.tex_runtime.interpreter import InterpreterError
     oom_t = getattr(torch.cuda, "OutOfMemoryError", None)
     if oom_t is None:
-        r.ok("no torch OOM type (skipped)"); return
+        r.skip("M-1 OOM unwrap", "this torch build has no cuda.OutOfMemoryError type"); return
     try:
         oom = oom_t("CUDA out of memory")
         try:
@@ -291,7 +291,7 @@ def test_m4_tiling_guards(r: SubTestResult):
 def test_uc1_graph_vec_param(r: SubTestResult):
     print("\n--- P1: UC-1 cuda_graph vec-param staging ---")
     if not torch.cuda.is_available():
-        r.ok("no CUDA (skipped)"); return
+        r.skip("UC-1 cuda_graph vec-param staging", "no CUDA on this box"); return
     from TEX_Wrangle.tex_runtime.graphed import run_graphed, clear_graph_cache
     try:
         code = "@OUT = vec4(@A.rgb * $tint, 1.0);"
@@ -525,7 +525,7 @@ def test_mem1_evict_preserves_graphs(r: SubTestResult):
     # (3) CUDA: a real captured graph survives an unpinned eviction and still
     #     replays bit-exact (zero recapture — same GraphedProgram identity).
     if not torch.cuda.is_available():
-        r.ok("MEM-1 CUDA graph-survival (no GPU, SKIPPED)")
+        r.skip("MEM-1 CUDA graph-survival", "no CUDA on this box")
         return
     try:
         from TEX_Wrangle.tex_runtime.interpreter import _collect_identifiers

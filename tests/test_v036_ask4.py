@@ -102,7 +102,7 @@ def test_ask4_t4_fp16_precision_exact_at_4095(r: SubTestResult):
 def test_ask4_t5_graph_tier(r: SubTestResult):
     print("\n--- ASK-4 T5: the graph tier captures (not declined) and matches interp ---")
     if not _CUDA:
-        r.ok("ASK-4 T5 graph tier SKIPPED (no CUDA)")
+        r.skip("ASK-4 T5 graph tier", "no CUDA on this box")
         return
     K = make_img(1, 17, 33, 3, seed=3).cuda()
     A = make_img(1, 48, 64, 3, seed=4).cuda()

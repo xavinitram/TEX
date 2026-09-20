@@ -115,7 +115,7 @@ def test_fm_class_d_cross_tier(r: SubTestResult):
             assert_tier_equiv(r, f"{nm}@cuda", code, g, tiers=("graph",),
                               device="cuda", tol=1e-4)
     else:
-        r.ok("[D] graph tier skipped (no CUDA)")
+        r.skip("[D] graph tier", "no CUDA on this box")
 
 
 # ── Class E — full-surface sweep (fp16 dtype-reconcile family) ─────────

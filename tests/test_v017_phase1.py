@@ -65,7 +65,7 @@ def test_tst5_tier_trace(r: SubTestResult):
         except Exception as e:
             r.fail("TST-5 graph record", f"{type(e).__name__}: {e}")
     else:
-        r.ok("TST-5 graph record skipped (no CUDA)")
+        r.skip("TST-5 graph record", "no CUDA on this box")
 
 
 def test_tst6_registry_parity(r: SubTestResult):
@@ -628,7 +628,7 @@ def test_a1_1_auto_precision_fuzz(r: SubTestResult):
     # rediscovered by the generator, not a hand string). On the current tree the gate
     # declines user-fn image lineage, so accepted programs stay accurate.
     if not torch.cuda.is_available():
-        r.ok("A1-1 auto fuzz (no CUDA — auto gate is CUDA-only, SKIPPED)")
+        r.skip("A1-1 auto fuzz", "no CUDA on this box - the auto gate is CUDA-only")
         return
     from TEX_Wrangle.tex_compiler.optimizer import optimize
     from TEX_Wrangle.tex_runtime import precision_policy as pp

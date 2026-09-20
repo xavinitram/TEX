@@ -62,7 +62,7 @@ def test_v033_cache8_demote_frees_vram_and_keeps_the_frame(r):
     servable, and the pixels are unchanged. Measured against the alternative it replaces —
     a disk spill at 77.9-78.8 ms versus 5.7-5.9 ms to demote (2048^2, two runs)."""
     if "cuda" not in _devices():
-        r.ok("CACHE-8: demote SKIPPED (no CUDA — nothing to demote from)")
+        r.skip("CACHE-8 demote", "no CUDA on this box - nothing to demote from")
         return
     with tempfile.TemporaryDirectory() as d:
         # 256² x4 fp32 = exactly 1 MB, so a budget expressed in whole MB can actually name a
@@ -93,7 +93,7 @@ def test_v033_cache8_demoted_frame_is_bit_exact(r):
     """A demotion is a device move, not a representation change. If this row ever fails, the
     residency tier has become a lossy tier without anyone deciding that it should."""
     if "cuda" not in _devices():
-        r.ok("CACHE-8: demote bit-exactness SKIPPED (no CUDA)")
+        r.skip("CACHE-8 demote bit-exactness", "no CUDA on this box")
         return
     with tempfile.TemporaryDirectory() as d:
         src = _frame(res=64, device="cuda")
@@ -113,7 +113,7 @@ def test_v033_cache8_promote_on_reuse_returns_it_home(r):
     on, and the accounting follows. Serving a CUDA frame from the CPU forever would be a
     correctness-preserving performance bug — the worst kind to find later."""
     if "cuda" not in _devices():
-        r.ok("CACHE-8: promote SKIPPED (no CUDA)")
+        r.skip("CACHE-8 promote", "no CUDA on this box")
         return
     with tempfile.TemporaryDirectory() as d:
         c = tex_results.ResultCache(cache_dir=d)
@@ -138,7 +138,7 @@ def test_v033_cache8_a_spilled_demoted_frame_comes_back_to_its_home(r):
     Writing slot 3 (where it is) instead of slot 6 (where it belongs) would turn the residency
     tier into a one-way trip to the CPU, discovered only under memory pressure."""
     if "cuda" not in _devices():
-        r.ok("CACHE-8: demote+spill SKIPPED (no CUDA)")
+        r.skip("CACHE-8 demote+spill", "no CUDA on this box")
         return
     with tempfile.TemporaryDirectory() as d:
         f = _frame(res=64, device="cuda")
@@ -178,7 +178,7 @@ def test_v033_cache8_governor_prefers_demotion_over_eviction(r):
     armed, the bytes come back by MOVING frames, not by dropping them — so the eviction that
     used to cost the cache its contents now costs it a device hop, and the hit rate survives."""
     if "cuda" not in _devices():
-        r.ok("CACHE-8: governor preference SKIPPED (no CUDA)")
+        r.skip("CACHE-8 governor preference", "no CUDA on this box")
         return
     with tempfile.TemporaryDirectory() as d:
         f = _frame(res=64, device="cuda")
@@ -202,7 +202,7 @@ def test_v033_cache8_unarmed_governor_evicts_exactly_as_before(r):
     """The other side of that integration, and the row that keeps the previous one honest:
     with the tier disarmed the governor hook must behave exactly as v0.32 — spill, don't move."""
     if "cuda" not in _devices():
-        r.ok("CACHE-8: unarmed governor SKIPPED (no CUDA)")
+        r.skip("CACHE-8 unarmed governor", "no CUDA on this box")
         return
     with tempfile.TemporaryDirectory() as d:
         f = _frame(res=64, device="cuda")

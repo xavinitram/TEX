@@ -47,7 +47,7 @@ def test_v0331_a1_double_demotion_cannot_skew_the_byte_totals(r):
     `_promote`, which checks both), and a victim popped off `_pending_demotes` was invisible to
     `_queue_demotions`, so it could be re-queued while its copy was still in flight."""
     if "cuda" not in _devices():
-        r.ok("A1: double-demotion SKIPPED (no CUDA — nothing to demote)")
+        r.skip("A1 double-demotion", "no CUDA on this box - nothing to demote")
         return
     from TEX_Wrangle.tex_runtime import streams
     with tempfile.TemporaryDirectory() as d:
@@ -100,7 +100,7 @@ def test_v0331_a1_a_demoting_frame_is_not_requeued(r):
     must be invisible to the victim walk. Without it the same frame is queued twice and two
     drains commit one transfer."""
     if "cuda" not in _devices():
-        r.ok("A1: in-flight visibility SKIPPED (no CUDA)")
+        r.skip("A1 in-flight visibility", "no CUDA on this box")
         return
     with tempfile.TemporaryDirectory() as d:
         c = tex_results.ResultCache(cache_dir=d)
@@ -362,7 +362,7 @@ def test_v0331_a7_the_mru_frame_is_never_demoted(r):
     `set_vram_budget(0)` that is fully deterministic — the frame whose `put` had just returned
     was demoted, then promoted back on its next hit: ~22 ms of pointless copies per cook at 4K."""
     if "cuda" not in _devices():
-        r.ok("A7: MRU guard SKIPPED (no CUDA)")
+        r.skip("A7 MRU guard", "no CUDA on this box")
         return
     with tempfile.TemporaryDirectory() as d:
         c = tex_results.ResultCache(cache_dir=d)
@@ -406,7 +406,7 @@ def test_v0331_a1_a_duplicate_queue_entry_commits_once(r):
     are the same object — and only re-reading the device (which the transfer itself mutates)
     says the move already happened."""
     if "cuda" not in _devices():
-        r.ok("A1: duplicate-commit SKIPPED (no CUDA)")
+        r.skip("A1 duplicate-commit", "no CUDA on this box")
         return
     with tempfile.TemporaryDirectory() as d:
         c = tex_results.ResultCache(cache_dir=d)

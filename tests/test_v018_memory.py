@@ -101,7 +101,7 @@ def test_mem4_per_device_budget(r: SubTestResult):
     import os
     fails = []
     if not torch.cuda.is_available():
-        r.ok("MEM-4 cross-device (no GPU, SKIPPED)")
+        r.skip("MEM-4 cross-device", "no CUDA on this box")
         return
     try:
         MEM.free_tensor_caches()

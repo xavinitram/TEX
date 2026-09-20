@@ -155,7 +155,8 @@ def test_s4_validate_hw_runs(r: SubTestResult):
     if torch.cuda.is_available():
         # The heavy CUDA lanes were exercised live this session; re-running ~40s of A/B
         # timing inside the suite every run isn't worth it. Assert the driver is callable.
-        r.ok("validate-hw CUDA lanes validated live this session (skipped in-suite for speed)")
+        r.skip("S-4 validate-hw run",
+               "CUDA is present, and the heavy lanes are ~40s of A/B timing per run")
         return
     try:
         v = vh.run_validation_hw()   # CPU/CI: GPU lanes SKIP cleanly, runs in <1s

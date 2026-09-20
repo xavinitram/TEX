@@ -80,7 +80,7 @@ def test_prlp5_determinism_pin(r: SubTestResult):
         r.fail("PR-LP5 CPU variance", f"{type(e).__name__}: {e}")
 
     if not torch.cuda.is_available():
-        r.ok("PR-LP5 CUDA bitwise determinism (no GPU, SKIPPED)")
+        r.skip("PR-LP5 CUDA bitwise determinism", "no CUDA on this box")
         return
 
     worst_all = 0.0

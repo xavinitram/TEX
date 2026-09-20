@@ -165,7 +165,7 @@ def test_str2_select_tier_matrix(r: SubTestResult):
         except Exception as e:
             r.fail("STR-2 cuda_graph e2e", f"{type(e).__name__}: {e}")
     else:
-        r.ok("STR-2 cuda_graph e2e skipped (no CUDA)")
+        r.skip("STR-2 cuda_graph e2e", "no CUDA on this box")
 
 
 def test_c2_clamp_mixed_bounds(r: SubTestResult):

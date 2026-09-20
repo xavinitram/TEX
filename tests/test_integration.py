@@ -708,7 +708,7 @@ def test_device_selection(r: SubTestResult):
         except Exception as e:
             r.fail("device: explicit cuda", f"{e}\n{traceback.format_exc()}")
     else:
-        r.ok("device: cuda skipped (no GPU)")
+        r.skip("device: explicit cuda", "no CUDA on this box")
 
 
 # ── torch.compile Tests ───────────────────────────────────────────────

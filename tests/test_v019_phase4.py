@@ -58,7 +58,8 @@ def test_p3_matvec_interp_codegen_bit_exact(r: SubTestResult):
 def test_p3_cuda_matches_matmul_within_ulp(r: SubTestResult):
     print("\n--- P3: CUDA broadcast form stays within 1 fp32 ULP of matmul (envelope) ---")
     if not torch.cuda.is_available():
-        r.ok("no CUDA - broadcast path is CUDA-only; CPU keeps matmul (bit-exact)")
+        r.skip("P3 broadcast-form envelope",
+               "no CUDA on this box - the broadcast path is CUDA-only, CPU keeps matmul")
         return
     from TEX_Wrangle.tex_runtime.interpreter import _matvec
     M = torch.rand(1, 512, 512, 3, 3, device="cuda")

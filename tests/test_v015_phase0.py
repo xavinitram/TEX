@@ -88,7 +88,7 @@ def test_sample_mip_inference_tensor(r: SubTestResult):
             assert torch.isfinite(result).all()
             r.ok("sample_mip CUDA with CPU-resident binding")
         else:
-            r.ok("sample_mip CUDA with CPU-resident binding (no GPU, SKIPPED)")
+            r.skip("sample_mip CUDA with CPU-resident binding", "no CUDA on this box")
     except Exception as e:
         r.fail("sample_mip CUDA with CPU-resident binding", str(e))
 

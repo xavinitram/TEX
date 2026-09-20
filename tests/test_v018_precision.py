@@ -93,7 +93,7 @@ def test_prlp4_arr_reductions_fp16_safe(r: SubTestResult):
 def test_prlp2_node_path_perf(r: SubTestResult):
     print("\n--- PR-LP2: precision node-path perf (H7 / doc 32 honesty) ---")
     if not torch.cuda.is_available():
-        r.ok("PR-LP2 node-path perf (no GPU, SKIPPED)")
+        r.skip("PR-LP2 node-path perf", "no CUDA on this box")
         return
     import importlib.util
     bench = Path(__file__).resolve().parent.parent / "benchmarks" / "prlp2_node_path.py"
@@ -190,7 +190,7 @@ def _gen(rng, depth):
 def test_prlp2_fp16_accuracy_fuzzer(r: SubTestResult):
     print("\n--- PR-LP2: fp16-auto accuracy fuzzer (gate-filtered; band 3.9e-3) ---")
     if not torch.cuda.is_available():
-        r.ok("PR-LP2 fp16 fuzzer (no GPU, SKIPPED)")
+        r.skip("PR-LP2 fp16-auto accuracy fuzzer", "no CUDA on this box")
         return
     from failure_harness import run_tier
     N = int(os.environ.get("TEX_FP16_FUZZ_N", "500"))

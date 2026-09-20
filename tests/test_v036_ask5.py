@@ -469,7 +469,7 @@ def test_ask5_graph_tier_bit_exact(r: SubTestResult):
     surface (invariant: single-eval noise "stays capturable")."""
     print("\n--- ASK-5: worley_id under the graph tier equals interp (CUDA) ---")
     if not torch.cuda.is_available():
-        r.ok("ASK-5 graph tier (no GPU, SKIPPED)")
+        r.skip("ASK-5 worley_id graph tier", "no CUDA on this box")
         return
     codes = [
         ("2D", "@OUT = vec4(vec3(worley_id(u * 8.0, v * 8.0)), 1.0);"),

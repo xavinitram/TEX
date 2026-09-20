@@ -30,7 +30,7 @@ def test_a1_6_cli_argv(r: SubTestResult):
     try:
         import torchvision.io as tvio
     except Exception:
-        r.ok("A1-6 CLI argv (torchvision absent, SKIPPED)")
+        r.skip("A1-6 CLI argv", "torchvision is not installed in this interpreter")
         return
     d = tempfile.mkdtemp()
     try:

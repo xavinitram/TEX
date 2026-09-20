@@ -82,7 +82,8 @@ def _run_on(code, device, img):
 def test_prlp1_cross_device_envelope(r: SubTestResult):
     print("\n--- PR-LP1: cross-device parity envelope (same-device is the real contract) ---")
     if not torch.cuda.is_available():
-        r.ok("PR-LP1 cross-device envelope (no GPU, SKIPPED)")
+        r.skip("PR-LP1 cross-device envelope",
+               "no CUDA on this box - the envelope needs both devices")
         return
     scale = float(os.environ.get("TEX_ENVELOPE_SCALE", "1.0"))
     img = make_img(1, 128, 128, 3, seed=7)  # identical bits on both devices via .to()

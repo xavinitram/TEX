@@ -345,7 +345,7 @@ def test_clamp_and_gridbuf(r: SubTestResult):
                 _stdlib_mod._to_float = orig
             r.ok("clamp: no .item() sync for tensor bounds on CUDA")
         else:
-            r.ok("clamp: no .item() sync for tensor bounds on CUDA (no GPU, SKIPPED)")
+            r.skip("clamp: no .item() sync for tensor bounds on CUDA", "no CUDA on this box")
     except Exception as e:
         r.fail("clamp: no .item() sync for tensor bounds on CUDA", str(e))
 
@@ -403,7 +403,7 @@ def test_noise_backend_gate(r: SubTestResult):
             assert torch.isfinite(out).all()
             r.ok("fbm runs on CUDA without Triton (tier fallback)")
         else:
-            r.ok("fbm runs on CUDA without Triton (no GPU, SKIPPED)")
+            r.skip("fbm runs on CUDA without Triton", "no CUDA on this box")
     except Exception as e:
         r.fail("fbm runs on CUDA without Triton (tier fallback)", str(e))
 

@@ -153,7 +153,7 @@ def test_m2cpu_and_m1_freeretry(r: SubTestResult):
     import TEX_Wrangle.tex_node as NODE
     oom_t = getattr(torch.cuda, "OutOfMemoryError", None)
     if oom_t is None:
-        r.ok("M-1-FREERETRY skipped (no OutOfMemoryError type)")
+        r.skip("M-1-FREERETRY", "this torch build has no cuda.OutOfMemoryError type")
         return
     calls = {"n": 0}
     orig_free = M.free_tensor_caches

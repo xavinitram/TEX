@@ -38,7 +38,7 @@ def test_pf1_pf2_graph_gate(r: SubTestResult):
         r.fail("PF-1/PF-2 predicate", str(e))
 
     if not torch.cuda.is_available():
-        r.ok("PF-1/PF-2 end-to-end skipped (no CUDA)")
+        r.skip("PF-1/PF-2 end-to-end", "no CUDA on this box")
         return
 
     # End-to-end: the gate actually declines losing configs and still captures
@@ -103,7 +103,7 @@ def test_static_gate_noise(r: SubTestResult):
         r.fail("static-gate noise classification", str(e))
 
     if not torch.cuda.is_available():
-        r.ok("static-gate end-to-end skipped (no CUDA)")
+        r.skip("static-gate end-to-end", "no CUDA on this box")
         return
 
     # End-to-end: an fbm program declines via the static gate WITHOUT recording a
