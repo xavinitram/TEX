@@ -2062,6 +2062,14 @@ def main():
     test_neg3_results_budget_envs_are_hardened(r)
     test_neg3_every_product_env_switch_is_documented(r)
 
+    # NEG-3 (LANG-7): the offline-docs switch and the route it points at. Neither state of
+    # `TEX_DOCS_LOCAL` was exercised, and the route's whitelist — the only thing between a
+    # `{page}` from the request and a file read — had no caller in the tree at all.
+    from test_neg3_env_switches import test_neg3_docs_local_switch_both_states
+    from test_v035_hygiene import test_neg3_docs_route_whitelist_serves_and_refuses
+    test_neg3_docs_local_switch_both_states(r)
+    test_neg3_docs_route_whitelist_serves_and_refuses(r)
+
     success = r.summary()
     return 0 if success else 1
 

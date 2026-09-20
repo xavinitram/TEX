@@ -152,6 +152,53 @@ def test_neg3_results_budget_envs_are_hardened(r: SubTestResult):
         r.fail("ResultCache budgets", f"{type(e).__name__}: {e}")
 
 
+def test_neg3_docs_local_switch_both_states(r: SubTestResult):
+    """`TEX_DOCS_LOCAL`: the LANG-7 air-gapped-docs switch, both states.
+
+    Off (the default, and the ComfyUI path) every error code links to the remote wiki. On, a
+    code whose page is SHIPPED links to the local route instead — and a code whose page is not
+    shipped still links to the wiki, because turning the flag on must never convert a working
+    remote link into a dead local 404. That last clause is the whole design and nothing
+    exercised it; the flag had no test at all, and the route it points at had no caller."""
+    from TEX_Wrangle.tex_compiler.diagnostics import wiki_url_for_code, TEX_WIKI_URL
+
+    shipped = (_PKG / "Error-Codes.md").exists()
+    try:
+        with _env("TEX_DOCS_LOCAL", None):
+            for code in ("E3001", "W7007", "E0000"):
+                url = wiki_url_for_code(code)
+                assert url == f"{TEX_WIKI_URL}/Error-Codes#{code.lower()}", url
+        r.ok("off (default): every code links to the remote wiki")
+    except Exception as e:
+        r.fail("TEX_DOCS_LOCAL off", f"{type(e).__name__}: {e}")
+
+    try:
+        for v in ("1", "yes", "0"):   # any non-empty value arms it; "0" is a STRING, not False
+            with _env("TEX_DOCS_LOCAL", v):
+                url = wiki_url_for_code("E3001")
+            if shipped:
+                assert url == "/tex_wrangle/docs/Error-Codes#e3001", (v, url)
+            else:
+                assert url.startswith(TEX_WIKI_URL), (v, url)
+        state = "local route" if shipped else "wiki (the page is not shipped here)"
+        r.ok(f"on: links point at the {state}")
+    except Exception as e:
+        r.fail("TEX_DOCS_LOCAL on", f"{type(e).__name__}: {e}")
+
+    try:
+        # Empty string is not "on" — the reader tests truthiness, and an empty variable is how
+        # a shell unsets one in practice.
+        with _env("TEX_DOCS_LOCAL", ""):
+            assert wiki_url_for_code("E3001").startswith(TEX_WIKI_URL)
+        # The page the flag points at must be one the docs route will actually serve, or the
+        # flag ships a 404 by construction.
+        assert "Error-Codes" in (_PKG / "__init__.py").read_text(encoding="utf-8"), \
+            "the docs route no longer whitelists the page TEX_DOCS_LOCAL links to"
+        r.ok("empty is off, and the page the switch links to is on the route's whitelist")
+    except Exception as e:
+        r.fail("TEX_DOCS_LOCAL edges", f"{type(e).__name__}: {e}")
+
+
 # ── the drift gate ────────────────────────────────────────────────────────────────────
 
 # Directories under the package that are NOT the shipped product (tests, benchmarks, tools and

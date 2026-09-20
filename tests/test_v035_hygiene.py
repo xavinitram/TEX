@@ -5,6 +5,7 @@ copies together. None has drifted yet; all three are one edit away, and two of t
 SILENTLY (a missing builtin types as an undefined variable; a stale publish manifest ships a
 tool declaring the wrong language version).
 """
+import json
 import pathlib
 import re
 
@@ -537,6 +538,169 @@ def test_v035_port6_routes_still_register_under_comfyui(r):
         r.ok(f"PORT-6: {out['ROUTES']} routes still register when ComfyUI is the host")
     except Exception as e:
         r.fail("PORT-6 routes under ComfyUI", f"{type(e).__name__}: {e}")
+
+
+# ── NEG-3: driving the routes the shipped frontend never calls ────────────────────────
+#
+# The PORT-6 test above pins that the routes REGISTER. It does not call one, and three of the
+# ten registered paths have no caller in `js/tex_extension.js` at all — `free_caches`,
+# `list_tools` and `docs/{page}` (the frontend drives the other seven). A registered handler
+# nobody drives and no test calls is a handler that rots in silence: its failure branch can
+# stop compiling and every suite stays green.
+#
+# These rows drive them. The shim is the PORT-6 one plus a STUB `aiohttp`, which is why they
+# run everywhere instead of skipping where aiohttp is absent (it is absent on the CPU CI
+# lane, which is precisely where an unexercised endpoint would rot unseen). The stub means
+# the handler's own logic is under test — the whitelist, the swallowed exceptions, the status
+# code — and not aiohttp's router: the `{page}` value is handed to the handler directly, so a
+# traversal string reaches the whitelist rather than being filtered by URL matching first.
+
+_ROUTE_SHIM = '''
+import sys, types, json, asyncio
+sys.path.insert(0, {custom_nodes!r})
+
+class _Resp:
+    def __init__(self, body=None, text=None, status=200, content_type=None):
+        self.body, self.text, self.status, self.content_type = body, text, status, content_type
+
+def _json_response(data, status=200):
+    return _Resp(body=data, status=status, content_type="application/json")
+
+def _response(text="", content_type=None, status=200):
+    return _Resp(text=text, status=status, content_type=content_type)
+
+_web = types.ModuleType("aiohttp.web")
+_web.json_response = _json_response
+_web.Response = _response
+_aiohttp = types.ModuleType("aiohttp")
+_aiohttp.web = _web
+sys.modules["aiohttp"] = _aiohttp
+sys.modules["aiohttp.web"] = _web
+
+REG = {{}}
+
+class _Routes:
+    def get(self, p):
+        def d(f):
+            REG[("GET", p)] = f
+            return f
+        return d
+
+    def post(self, p):
+        def d(f):
+            REG[("POST", p)] = f
+            return f
+        return d
+
+_stub = types.ModuleType("server")
+_stub.PromptServer = type("PS", (), {{"instance": types.SimpleNamespace(routes=_Routes())}})
+sys.modules["server"] = _stub
+
+import TEX_Wrangle
+
+class _Req:
+    def __init__(self, match_info=None, body=None):
+        self.match_info = match_info or {{}}
+        self._body = body
+
+    async def json(self):
+        if self._body is None:
+            raise ValueError("no body")
+        return self._body
+
+def drive(method, path, **kw):
+    return asyncio.run(REG[(method, path)](_Req(**kw)))
+
+OUT = {{"paths": sorted("%s %s" % k for k in REG)}}
+'''
+
+
+def _route_probe(body: str) -> dict:
+    """Run `body` under the route shim in a fresh interpreter; return its OUT dict."""
+    import subprocess
+    import sys as _sys
+    import TEX_Wrangle
+
+    custom_nodes = str(pathlib.Path(TEX_Wrangle.__file__).resolve().parent.parent)
+    code = _ROUTE_SHIM.format(custom_nodes=custom_nodes) + body + "\nprint('OUT=' + json.dumps(OUT))\n"
+    proc = subprocess.run([_sys.executable, "-X", "utf8", "-c", code],
+                          capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        raise AssertionError(f"route probe exit {proc.returncode}: {(proc.stderr or '')[-800:]}")
+    for line in proc.stdout.splitlines():
+        if line.startswith("OUT="):
+            return json.loads(line[4:])
+    raise AssertionError(f"route probe printed no OUT: {proc.stdout[-400:]}")
+
+
+_DOCS_BODY = '''
+res = drive("GET", "/tex_wrangle/docs/{page}", match_info={"page": "Function-Reference"})
+OUT["ok_status"] = res.status
+OUT["ok_type"] = res.content_type
+OUT["ok_len"] = len(res.text or "")
+OUT["ok_head"] = (res.text or "")[:40]
+
+# `.md` is stripped before the whitelist lookup, so both spellings serve the same page.
+res2 = drive("GET", "/tex_wrangle/docs/{page}", match_info={"page": "Function-Reference.md"})
+OUT["md_status"] = res2.status
+OUT["md_same"] = (res2.text == res.text)
+
+# The mtime cache: a second serve must not re-read, and the cache is keyed by resolved path.
+OUT["cache_keys"] = len(TEX_Wrangle._DOCS_CACHE)
+
+refused = {}
+for page in ("../__init__", "../../custom_nodes", "..\\\\__init__.py", "/etc/passwd",
+             "Function-Reference/../__init__", "%2e%2e%2f__init__", "", "README",
+             "Function-Reference\\x00", "tex_node",
+             # These four EXIST on disk, so a handler that joined the name onto the package
+             # directory instead of consulting the whitelist would serve every one of them.
+             "pyproject.toml", "tex_node.py", "../TEX_Wrangle/SECURITY.md",
+             "Function-Reference.md/../pyproject.toml"):
+    res3 = drive("GET", "/tex_wrangle/docs/{page}", match_info={"page": page})
+    refused[page] = [res3.status, (res3.body or {}).get("error", "")[:40], res3.text is None]
+OUT["refused"] = refused
+OUT["cache_keys_after_refusals"] = len(TEX_Wrangle._DOCS_CACHE)
+'''
+
+
+def test_neg3_docs_route_whitelist_serves_and_refuses(r):
+    """LANG-7's `/tex_wrangle/docs/{page}`: a whitelisted page serves, everything else 404s.
+
+    The route builds a filesystem path from `request.match_info`, and the three-entry
+    whitelist is the only thing between the handler and an arbitrary read. Nothing in the
+    tree exercised either side of it. Both sides are driven here, with the traversal strings
+    handed straight to the handler."""
+    try:
+        out = _route_probe(_DOCS_BODY)
+    except Exception as e:
+        r.fail("docs route probe", f"{type(e).__name__}: {e}")
+        return
+
+    try:
+        assert "GET /tex_wrangle/docs/{page}" in out["paths"], out["paths"]
+        assert out["ok_status"] == 200, out["ok_status"]
+        assert out["ok_type"] == "text/markdown", out["ok_type"]
+        assert out["ok_len"] > 1000, out["ok_len"]
+        assert "TEX" in out["ok_head"], out["ok_head"]
+        r.ok(f"whitelisted page serves: 200 text/markdown, {out['ok_len']} chars")
+    except Exception as e:
+        r.fail("docs route serves a whitelisted page", f"{type(e).__name__}: {e}")
+
+    try:
+        assert out["md_status"] == 200 and out["md_same"], out
+        assert out["cache_keys"] == 1, out["cache_keys"]
+        r.ok("the `.md` spelling serves the same page from one _DOCS_CACHE entry")
+    except Exception as e:
+        r.fail("docs route .md spelling", f"{type(e).__name__}: {e}")
+
+    try:
+        wrong = {p: v for p, v in out["refused"].items() if v[0] != 404 or not v[2]}
+        assert not wrong, f"served (or did not 404) a non-whitelisted page: {wrong}"
+        assert out["cache_keys_after_refusals"] == out["cache_keys"], \
+            "a refused page reached the file read and cached something"
+        r.ok(f"all {len(out['refused'])} traversal / off-whitelist pages refused with 404")
+    except Exception as e:
+        r.fail("docs route refuses everything else", f"{type(e).__name__}: {e}")
 
 
 # ── Uniform outputs (LANGUAGE.md §5.2) ────────────────────────────────────────────────
