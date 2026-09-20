@@ -174,13 +174,17 @@ red test; the known-over baseline below is grandfathered pending its planned spl
 **A module may also carry a `_HEADROOM_FLOOR` (ENG-14).** `tex_engine.py` reached *exactly*
 2000/2000 and was not grandfathered, so the next line of the next feature would have reddened
 the ratchet — a budget that only speaks at the wall gives no warning and no time. The floor is
-a per-module ceiling *below* the hard line (`tex_engine.py`: 1700) that reds early, while a
+a per-module ceiling *below* the hard line (`tex_engine.py`: 1400) that reds early, while a
 split is still cheap to plan. **It moves down when a split lands, never up**: raising a floor to
 fit the change that tripped it converts the gate into decoration, which is exactly what the
 grandfathered baseline above already cost us. If a planned feature does not fit under the floor,
-the answer is the next domain split, not a bigger number — and the design note for the split
-that bought the current headroom records where the following cut is (`tex_engine.py`'s chain /
-lineage group becomes a leaf once `run()`'s call into `_compute_lineage` is inverted).
+the answer is the next domain split, not a bigger number. The floor has now moved twice:
+2000 → 1700 (ENG-14, `tex_buffers` + `tex_tiling`) and 1700 → 1400 (NEG-2, `tex_chain` — the
+CACHE-6 stage-list cook and CACHE-1's lineage keys, the cut ENG-14's design note had already
+named). `tex_results.py` now carries the register's second floor (1958, NEG-1) and its own
+pre-specified cut — the CACHE-1 key-minting leaf out to `tex_results_keys.py` — so the
+register's rule is now the house pattern rather than one module's exception: a module gets
+its floor and the design note for its next cut BEFORE the wall, never at it.
 
 Currently over the hard budget — status as of v0.36.2 (drift-checked by
 `test_doc7b_map_drift`, which reds if any `~LOC` here diverges >20% from `wc -l`):
