@@ -72,7 +72,19 @@ from TEX_Wrangle.tex_runtime import compiled as _compiled
 from TEX_Wrangle.tex_runtime.compiled import execute_compiled, clear_compiled_cache
 
 
-_PKG = os.path.normcase(str(Path(__file__).resolve().parents[1])) + os.sep
+#: Every spelling `co_filename` can carry for a file in this package, from the ONE
+#: implementation the counts harness owns. This used to be
+#: `normcase(Path(__file__).resolve().parents[1]) + os.sep` — a single RESOLVED
+#: spelling — and `resolve()` follows the `custom_nodes\TEX_Wrangle -> TEX` junction
+#: while imported modules keep the junction spelling in `co_filename`. Run from
+#: `custom_nodes` (the canonical location) the filter therefore matched NOTHING and
+#: every row below read zero, so the two tests errored there and were green in any
+#: worktree. A second, hand-spelled copy of the harness's filter is what made that
+#: possible, so there is no second copy any more.
+_counts = load_counts_harness()
+_PKG_PREFIXES = _counts.path_prefixes(str(Path(__file__).parents[1]))
+#: Bound once: `_hook` runs on every call event, so it may not do a lookup per frame.
+_package_relpath = _counts.package_relpath
 
 #: Two programs that reach the compiled tier on CPU and take the codegen-only adapter
 #: (they call stdlib functions, so `_has_fn_calls` is set and `torch.compile` is never
@@ -143,8 +155,10 @@ class _Frames:
     """Count `call` events in files under the package, keyed `module/path:qualname`.
 
     `sys.setprofile`, not `settrace`: one event per call instead of one per line. The same
-    hook `benchmarks/host_path_counts.py::FrameCounter` installs, spelled here so the file
-    does not import a `.comfyignore`d directory."""
+    hook `benchmarks/host_path_counts.py::FrameCounter` installs, and now the same FILTER
+    too: the row keys differ (`module/path:qualname` here, dotted there) but deciding
+    whether a frame belongs to the package is one rule, in one place, because two copies
+    of it is exactly how this hook came to count zero without failing."""
 
     def __init__(self):
         self.counts = {}
@@ -153,10 +167,9 @@ class _Frames:
         if event != "call":
             return
         code = frame.f_code
-        fn = os.path.normcase(code.co_filename)
-        if not fn.startswith(_PKG):
+        rel = _package_relpath(code.co_filename, _PKG_PREFIXES)
+        if rel is None:
             return
-        rel = os.path.relpath(code.co_filename, _PKG).replace(os.sep, "/")
         mod = rel[:-3] if rel.endswith(".py") else rel
         # co_qualname is 3.11+; CI runs 3.10 too, so fall back to the bare name.
         key = mod + ":" + (getattr(code, "co_qualname", None) or code.co_name)
@@ -169,6 +182,27 @@ class _Frames:
     def __exit__(self, *exc):
         sys.setprofile(None)
         return False
+
+
+class _FakeCode:
+    """The three attributes a profile hook reads, with a `co_filename` the caller chooses."""
+
+    co_firstlineno = 1
+    co_name = "probe"
+    co_qualname = "probe"
+
+    def __init__(self, filename):
+        self.co_filename = filename
+
+
+class _FakeFrame:
+    def __init__(self, filename):
+        self.f_code = _FakeCode(filename)
+
+
+def _fake_frame(filename):
+    """A frame the counter's filter must decide about, without running anything real."""
+    return _FakeFrame(filename)
 
 
 class _InlinePool:
@@ -376,6 +410,27 @@ def test_perf7_the_counter_is_not_inert(r: SubTestResult):
     Half two: defeat the codegen cache and require the cold-cook pin to notice — the
     mutation that stands in for the regression this lane was sent to find."""
     print("\n--- PERF-7 mutation guard: the counter sees what it forbids ---")
+
+    # Half zero: the FILTER itself. Every row in this file is "X ran N times", and the filter
+    # decides which frames are even looked at — so a filter that accepts one spelling of this
+    # package's path and not another zeroes every row at once, silently, and every "must not
+    # run" row then passes vacuously. It did: run from `custom_nodes`, through the
+    # `TEX_Wrangle -> TEX` junction, this file read `4 passed, 2 errors` while any worktree
+    # read green. Drive a synthetic frame under EACH accepted spelling and require it counted,
+    # and one from outside the package and require it ignored.
+    bad = []
+    for pref in _PKG_PREFIXES:
+        probe = _Frames()
+        probe._hook(_fake_frame(pref + "tex_engine.py"), "call", None)
+        if probe.counts.get("tex_engine:probe") != 1:
+            bad.append(f"a frame spelled {pref!r} was NOT counted ({probe.counts})")
+    outside = _Frames()
+    outside._hook(_fake_frame(os.path.join(tempfile.gettempdir(), "not_tex.py")), "call", None)
+    if outside.counts:
+        bad.append(f"a frame OUTSIDE the package was counted: {outside.counts}")
+    r.fail("PERF-7 frame filter", "; ".join(bad)) if bad else \
+        r.ok(f"the frame filter accepts all {len(_PKG_PREFIXES)} spelling(s) of this package "
+             f"and nothing outside it: {', '.join(_PKG_PREFIXES)}")
 
     from TEX_Wrangle.tex_cache import get_cache, parse_and_split
     from TEX_Wrangle.tex_compiler import ast_nodes as _ast

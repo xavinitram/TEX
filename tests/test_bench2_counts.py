@@ -28,10 +28,6 @@ without a device. Runs at 96^2 with a 48^2 window and four ticks to stay inside 
 """
 from helpers import *
 
-import importlib.util
-
-
-_ROOT = Path(__file__).resolve().parents[1]
 
 # The harness shape these pins were measured in. Changing any of these re-derives every pin:
 # the window position walk depends on `TICKS` (see `Scenario._pan_roi`), and a resolution that
@@ -42,20 +38,14 @@ REDERIVE = (f"python benchmarks/host_path_counts.py --device cpu --res {RES} "
 
 
 def _bench():
-    """Load `benchmarks/host_path_counts.py` by path.
+    """The harness itself, loaded by path — see `helpers.load_counts_harness`.
 
     `benchmarks/` is `.comfyignore`d and is not a package, so there is no import name to use;
     a path load also keeps this test honest about measuring the harness the design note names
-    rather than a copy of its logic."""
-    mod = sys.modules.get("_bench2_host_path_counts")
-    if mod is not None:
-        return mod
-    path = _ROOT / "benchmarks" / "host_path_counts.py"
-    spec = importlib.util.spec_from_file_location("_bench2_host_path_counts", str(path))
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["_bench2_host_path_counts"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    rather than a copy of its logic. The loader moved to `helpers` when a SECOND copy of the
+    harness's frame filter (in `tests/test_perf7_compiled_cold.py`) was found reading zero:
+    one loader, one filter, no copies to drift."""
+    return load_counts_harness()
 
 
 def _api_counts(scenario_name: str, device: str = "cpu") -> dict:
@@ -508,6 +498,40 @@ def test_bench2_counters_are_not_inert(r: SubTestResult):
     protect the contract it is pointed at."""
     print("\n--- BENCH-2 mutation guard: the counters fire on a cold tick ---")
     b = _bench()
+
+    # The frame counter's FILTER, before any scenario runs. `frames.*` is a whole family of
+    # rows, and the filter decides which frames are looked at — so a filter that accepts one
+    # spelling of this package's path and not another zeroes the entire family at once,
+    # without failing. That is not hypothetical: `Path.resolve()` follows the
+    # `custom_nodes\TEX_Wrangle -> TEX` junction while imported modules keep the junction
+    # spelling in `co_filename`, and a hook comparing one against the other matched nothing.
+    # Drive a synthetic frame under EACH accepted spelling, and one from outside.
+    class _Code:
+        co_firstlineno, co_name, co_qualname = 1, "probe", "probe"
+
+        def __init__(self, fn):
+            self.co_filename = fn
+
+    class _Frame:
+        def __init__(self, fn):
+            self.f_code = _Code(fn)
+
+    bad = []
+    for pref in b._PKG_PREFIXES:
+        fc = b.FrameCounter()
+        fc._hook(_Frame(pref + "tex_engine.py"), "call", None)
+        if fc.counts.get("tex_engine:probe") != 1:
+            bad.append(f"a frame spelled {pref!r} was NOT counted ({dict(fc.counts)})")
+    for fn in (os.path.join(tempfile.gettempdir(), "not_tex.py"),
+               os.path.join(b._BENCH_PREFIXES[0], "host_path_counts.py")):
+        fc = b.FrameCounter()
+        fc._hook(_Frame(fn), "call", None)
+        if fc.counts:
+            bad.append(f"{fn!r} must not be counted, got {dict(fc.counts)}")
+    r.fail("BENCH-2 frame filter", "; ".join(bad)) if bad else \
+        r.ok(f"the frame filter accepts all {len(b._PKG_PREFIXES)} spelling(s) of the package "
+             f"and neither the harness's own frames nor anything outside it")
+
     scn = b.PrewarmScenario(RES, WINDOW, "cpu", ticks=1)
     try:
         cold = b.pass_api(scn, 1)

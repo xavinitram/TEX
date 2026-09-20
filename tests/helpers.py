@@ -72,6 +72,7 @@ __all__ = [
     "run_both", "assert_equiv", "check_val", "make_img", "make_latent",
     "make_gradient_frame", "devices",
     "cold_engine_state", "lint_sources", "armed_profiler",
+    "load_counts_harness",
     "_MAX_LOOP_ITERATIONS",
 ]
 
@@ -362,3 +363,28 @@ def lint_sources(pattern, *, allow=(), flags=0) -> list:
         for m in rx.finditer(text):
             out.append(f"{rel}:{text[:m.start()].count(chr(10)) + 1}")
     return out
+
+
+def load_counts_harness():
+    """Load `benchmarks/host_path_counts.py` by path, once per process.
+
+    `benchmarks/` is not a package (it is `.comfyignore`d, like `tests/`), so there is no
+    import name to use. It lives here rather than in each caller because the module owns the
+    ONE implementation of the `sys.setprofile` frame filter — `path_prefixes` and
+    `package_relpath` — and a second, hand-spelled copy of that filter is precisely what once
+    made a counter read ZERO for every row without failing: the copy compared a `resolve()`d
+    package directory against `co_filename`s that kept the junction spelling the modules were
+    imported under. One implementation, loaded, cannot drift from itself.
+
+    Loaded from the UNRESOLVED package directory on purpose, so the harness's own idea of
+    where it lives matches the spelling the suite was invoked under."""
+    import importlib.util
+    mod = sys.modules.get("_bench2_host_path_counts")
+    if mod is not None:
+        return mod
+    path = os.path.join(_pkg_dir, "benchmarks", "host_path_counts.py")
+    spec = importlib.util.spec_from_file_location("_bench2_host_path_counts", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_bench2_host_path_counts"] = mod
+    spec.loader.exec_module(mod)
+    return mod

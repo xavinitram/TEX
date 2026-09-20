@@ -130,15 +130,56 @@ from TEX_Wrangle import tex_api                               # noqa: E402
 from TEX_Wrangle.tex_compiler.types import TEXType            # noqa: E402
 from TEX_Wrangle.tex_testkit import cold_engine_state, armed_profiler   # noqa: E402  HOOK-4
 
-_PKG_PREFIX = os.path.normcase(_PKG + os.sep)
+
+def path_prefixes(directory: str) -> tuple:
+    """Every spelling a `co_filename` under `directory` can legitimately carry.
+
+    THE BUG THIS EXISTS FOR. On Windows this tree is commonly reached through a junction —
+    `custom_nodes\\TEX_Wrangle` -> `custom_nodes\\TEX` — because the package must be importable
+    under its import name while the checkout keeps its own. `Path.resolve()` and
+    `os.path.realpath()` FOLLOW that junction; an imported module keeps in `code.co_filename`
+    the spelling it was imported under. So a profile hook that computes one spelling and
+    compares it against the other matches nothing and reports ZERO for every row — silently,
+    which is the worst way a counter can fail, because every "this must not run" assertion it
+    feeds then passes vacuously. Measured: `tests/test_perf7_compiled_cold.py` read
+    `4 passed, 2 errors` when the suite ran from `custom_nodes` (the canonical location) and
+    green from any worktree. Accept both spellings and the question does not arise.
+
+    Returned normcased and `os.sep`-terminated, so a prefix match cannot straddle a name
+    (`.../tex` must not match `.../tex_wrangle`)."""
+    out = []
+    for p in (os.path.abspath(directory), os.path.realpath(directory)):
+        pref = os.path.normcase(p + os.sep)
+        if pref not in out:
+            out.append(pref)
+    return tuple(out)
+
+
+def package_relpath(fn: str, prefixes, exclude=()) -> str | None:
+    """`co_filename` -> its `/`-separated path under the package, or None if it is outside.
+
+    `exclude` wins over `prefixes` (a directory nested inside the package that must not be
+    counted). The slice is taken from the ORIGINAL string, not the normcased one, so the row
+    name keeps the file's real spelling; `os.path.normcase` never changes a path's length."""
+    norm = os.path.normcase(fn)
+    for pref in exclude:
+        if norm.startswith(pref):
+            return None
+    for pref in prefixes:
+        if norm.startswith(pref):
+            return fn[len(pref):].replace(os.sep, "/").replace("\\", "/")
+    return None
+
+
+_PKG_PREFIXES = path_prefixes(_PKG)
 #: `examples/` ships the demo HOST, not the engine. A sync called from there is the host's own
 #: frame-completion barrier (`RoiComp.cook`'s trailing `torch.cuda.synchronize()`), which is a
 #: host policy decision and not a stall TEX imposed — counting it as engine-side would make the
 #: "zero engine syncs per interactive tick" row unpinnable and, worse, wrong.
-_EXAMPLES_PREFIX = os.path.normcase(os.path.join(_PKG, "examples") + os.sep)
+_EXAMPLES_PREFIXES = path_prefixes(os.path.join(_PKG, "examples"))
 #: `benchmarks/` lives under the package too, so the frame filter would otherwise charge every
 #: tick for this harness's own sampling closures — measurement counting itself.
-_BENCH_PREFIX = os.path.normcase(_HERE + os.sep)
+_BENCH_PREFIXES = path_prefixes(_HERE)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -327,9 +368,9 @@ class CallSpies:
                     f = os.path.normcase(os.path.abspath(sys._getframe(1).f_code.co_filename))
                 except Exception:
                     f = ""
-                if f.startswith(_EXAMPLES_PREFIX):
+                if f.startswith(_EXAMPLES_PREFIXES):
                     counts[SYNC_ROWS[1]] += 1
-                elif f.startswith(_PKG_PREFIX):
+                elif f.startswith(_PKG_PREFIXES):
                     counts[SYNC_ROWS[0]] += 1
                 else:
                     counts[SYNC_ROWS[2]] += 1
@@ -370,10 +411,11 @@ class FrameCounter:
         if event != "call":
             return
         code = frame.f_code
-        fn = os.path.normcase(code.co_filename)
-        if not fn.startswith(_PKG_PREFIX) or fn.startswith(_BENCH_PREFIX):
+        rel = package_relpath(code.co_filename, _PKG_PREFIXES,
+                              exclude=_BENCH_PREFIXES)
+        if rel is None:
             return
-        self.counts[_frame_key(code.co_filename, code)] += 1
+        self.counts[_frame_key(rel, code)] += 1
 
     def __enter__(self):
         self._on = True
@@ -392,11 +434,11 @@ class FrameCounter:
 _FRAME_KEY_MEMO: dict = {}
 
 
-def _frame_key(fn: str, code) -> str:
-    key = (fn, code.co_firstlineno, code.co_name)
+def _frame_key(rel: str, code) -> str:
+    """`rel` is already the package-relative, `/`-separated path (package_relpath)."""
+    key = (rel, code.co_firstlineno, code.co_name)
     hit = _FRAME_KEY_MEMO.get(key)
     if hit is None:
-        rel = os.path.relpath(fn, _PKG).replace(os.sep, "/")
         mod = rel[:-3] if rel.endswith(".py") else rel
         # co_qualname is 3.11+; CI runs 3.10 too, so fall back to the bare name.
         qual = getattr(code, "co_qualname", None) or code.co_name
