@@ -271,6 +271,29 @@ Each program is compiled to PyTorch and cached (in-memory LRU + disk), so a warm
 
 Benchmark harnesses live in `benchmarks/` — `eight_config_bench.py` (device × cache × compile matrix) and `gpu_profile.py` (resolution-scaling), both `torch.cuda.synchronize()`-bracketed. Every performance change is proven with same-session interleaved A/B (see `CHANGELOG.md`).
 
+## Environment switches
+
+Every switch below is **optional** — TEX's defaults are what a ComfyUI user gets, and nothing
+here needs to be set for a normal install. They exist for embedding hosts, air-gapped boxes and
+A/B measurement. A size switch is read once, when the thing it sizes is first built; a value
+that does not parse, or that is not a strictly positive size, is **ignored** (the default stands)
+and a warning is logged, so a typo can never turn a cache off silently.
+
+| Switch | What it does | Default when unset |
+|--------|--------------|--------------------|
+| `TEX_CACHE_DIR` | Where the compiled-program / codegen / spill caches live | A per-user cache directory, else a folder inside the package |
+| `TEX_CACHE_BUDGET_MB` | Byte budget for the stdlib tensor caches (mip pyramids, grid buffers) | min(1 GiB, 12.5 % VRAM) on CUDA; 512 MiB on CPU |
+| `TEX_GOVERNOR_BUDGET_MB` | The single coordinated budget the cache governor holds the stdlib / graph / frame pools under | ~40 % of free VRAM on CUDA; 1 GiB on CPU |
+| `TEX_RESULTS_BUDGET_MB` | RAM budget for the engine's frame cache | Derived from device memory |
+| `TEX_RESULTS_DISK_MB` | Disk budget for that cache's spill tier | 4 GiB |
+| `TEX_CPU_THREADS` | Torch intra-op thread count for a cook | Torch's own default |
+| `TEX_NO_POOL_TRIM` | Set to skip trimming the CUDA reserved pool after a cook | Trimming is on |
+| `TEX_ROI_EXEC` | Arm the ROI sub-window cook from the environment (the `roi_exec=` host argument is the real arm) | Off |
+| `TEX_ROI_CODEGEN` | Run an ROI cook through the codegen tier — an A/B lever | Off |
+| `TEX_CODEGEN_NO_OUT_REUSE` | Disable codegen's `out=` buffer reuse — an A/B lever | Reuse is on |
+| `TEX_DOCS_LOCAL` | Point error-code links at the offline reference TEX serves from its own package instead of the GitHub wiki — for an air-gapped box or a standalone editor | Links point at the wiki |
+| `TORCHINDUCTOR_CACHE_DIR` | Honoured (not set) when TEX did not create the inductor cache itself | Torch's own default |
+
 ## Development
 
 See **[LANGUAGE.md](LANGUAGE.md)** for the language reference — grammar, type-promotion

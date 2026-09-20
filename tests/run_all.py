@@ -2049,6 +2049,19 @@ def main():
     test_perf8_dropping_the_flag_from_the_key_brings_the_hazard_back(r)
     test_perf8_one_shared_body_bounded_and_clearable(r)
 
+    # NEG-3: the size switches nobody was watching. `TEX_GOVERNOR_BUDGET_MB` and
+    # `TEX_RESULTS_DISK_MB` shipped with no test and no user-facing document, and read a
+    # zero or negative value as a SIZE — which is a silent cache-off switch. Set / unset /
+    # garbage for each, plus a drift gate binding the product's switches to README.md.
+    from test_neg3_env_switches import (
+        test_neg3_governor_budget_env_is_hardened,
+        test_neg3_results_budget_envs_are_hardened,
+        test_neg3_every_product_env_switch_is_documented,
+    )
+    test_neg3_governor_budget_env_is_hardened(r)
+    test_neg3_results_budget_envs_are_hardened(r)
+    test_neg3_every_product_env_switch_is_documented(r)
+
     success = r.summary()
     return 0 if success else 1
 

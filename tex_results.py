@@ -286,12 +286,29 @@ def _dev_bucket(device) -> str:
 
 
 def _budget_bytes(env_name: str, default: int) -> int:
+    """`env_name` read as MiB, else `default` bytes. The one reader of both
+    `TEX_RESULTS_BUDGET_MB` (RAM tier) and `TEX_RESULTS_DISK_MB` (spill tier).
+
+    The env value must parse AND be strictly positive. `max(0, …)` used to clamp "-1" — and
+    accept "0" — to a ZERO-byte budget, which is neither "unbounded" nor "off": it is "every
+    entry is over budget", so the RAM tier evicts each frame the moment it is put and the spill
+    tier drops what it just wrote. That is a silent cache-off switch wearing the spelling of a
+    size. A value that does not parse, or that is not strictly positive, is refused: the
+    caller's default stands and the refusal is logged."""
     v = os.environ.get(env_name)
     if v:
         try:
-            return max(0, int(float(v) * (1 << 20)))
+            n = int(float(v) * (1 << 20))
         except Exception:
-            pass
+            n = 0
+        if n > 0:
+            return n
+        # Local import: this branch is cold (a misconfigured host, once per cache construction)
+        # and the module deliberately carries no logging import for the hot path.
+        import logging
+        logging.getLogger("TEX").warning(
+            "[TEX] %s=%r is not a positive size in MiB; ignoring it and using the default "
+            "budget.", env_name, v)
     return default
 
 

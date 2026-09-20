@@ -380,14 +380,28 @@ def enforce_cache_budget(device) -> None:
 def governor_budget(device) -> int:
     """The ONE coordinated VRAM/RAM budget the governor holds all arbitrated pools under — set
     BELOW the sum of the pools' independent caps (the point of CACHE-5). Env override
-    TEX_GOVERNOR_BUDGET_MB; else ~40% of free VRAM on CUDA (a single pressure-responsive cap
-    the stdlib/graph/frame pools share), 1 GB on CPU."""
+    TEX_GOVERNOR_BUDGET_MB (whole MiB, strictly positive — anything else is refused, see below);
+    else ~40% of free VRAM on CUDA (a single pressure-responsive cap the stdlib/graph/frame
+    pools share), 1 GB on CPU."""
     override = os.environ.get("TEX_GOVERNOR_BUDGET_MB")
     if override:
+        # A FLOOR, not just a parse guard. `int(override)` accepts "0" and "-8" as happily as
+        # "512", and this is THE coordinated budget: a non-positive value tells the governor
+        # every arbitrated pool is over budget on every check, so the stdlib cache, the graph
+        # pool and the frame cache are evicted to nothing on the next cook — a knob that reads
+        # like "no limit" and means "keep nothing". A value that does not parse, or that is not
+        # strictly positive, is REFUSED (the computed default below stands) and said out loud.
+        # A profile's `governor_frac=0.0` stays the in-process way to say "arbitrate nothing to
+        # this pool"; a typo in an environment variable is not the same statement.
         try:
-            return int(override) * 1024 * 1024
+            mb = int(override)
         except ValueError:
-            pass
+            mb = 0
+        if mb > 0:
+            return mb * 1024 * 1024
+        logger.warning(
+            "[TEX] TEX_GOVERNOR_BUDGET_MB=%r is not a positive whole number of MiB; "
+            "ignoring it and using the computed governor budget.", override)
     # GOV-1: the profile's fraction, or the shipped 0.4. An explicit env override still wins —
     # a preset is a convenience, not a way to stop a host saying exactly what it wants.
     # `is None`, not `or`: a future preset declaring governor_frac=0.0 ("arbitrate nothing to
