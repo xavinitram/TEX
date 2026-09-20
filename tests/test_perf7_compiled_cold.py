@@ -550,12 +550,13 @@ def test_perf7_the_row_keys_survive_a_missing_co_qualname(r: SubTestResult):
     name from, and two things are asserted: that the three rows are counted at all with the
     fallback taken (the half that was red), and that the key it derives is the SAME string
     the native path produces on this interpreter (the half that stops the fallback drifting
-    away from 3.11+ unnoticed). The real proof is the Linux 3.10 leg of CI."""
+    away from 3.11+ unnoticed). The real proof is the Linux 3.10 leg of CI.
+
+    ON a 3.10 interpreter both legs take the fallback and the comparison degenerates into the
+    measurement itself — the three rows are still required to be counted, which is precisely
+    the thing that was red there. So this row is not guarded by an interpreter check and does
+    not skip: a row that cannot run on the interpreter it was written for is not a witness."""
     print("\n--- PERF-7: the row keys survive a missing co_qualname (Python 3.10) ---")
-    if not hasattr((lambda: 0).__code__, "co_qualname"):
-        r.skip("PERF-7 qualname fallback", "this interpreter has no `co_qualname`, so the "
-               "native leg IS the fallback and the comparison would be vacuous")
-        return
     try:
         native = _drive_qualname_rows("native", forced=False)
         forced = _drive_qualname_rows("forced", forced=True)

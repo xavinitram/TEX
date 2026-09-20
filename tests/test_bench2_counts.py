@@ -521,13 +521,14 @@ def test_bench2_frame_rows_survive_a_missing_co_qualname(r: SubTestResult):
 
     Neither development box has a 3.10, so the fallback is forced through the harness's one
     seam and required to produce the SAME key the native path produces here. Real proof is
-    the Linux 3.10 leg of CI."""
+    the Linux 3.10 leg of CI.
+
+    ON a 3.10 interpreter both legs take the fallback and the comparison degenerates into the
+    measurement itself — the rows are still required to be counted under their qualified
+    names, which is the thing that was red there. So this row is not guarded by an interpreter
+    check and does not skip."""
     print("\n--- BENCH-2: frame row names survive a missing co_qualname (Python 3.10) ---")
     b = _bench()
-    if not hasattr((lambda: 0).__code__, "co_qualname"):
-        r.skip("BENCH-2 qualname fallback", "this interpreter has no `co_qualname`, so the "
-               "native leg IS the fallback and the comparison would be vacuous")
-        return
     try:
         native = _frame_rows(b, False, "native")
         forced = _frame_rows(b, True, "forced")
