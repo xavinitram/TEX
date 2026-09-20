@@ -44,7 +44,7 @@ Supporting files:
 |------|------|
 | `helpers.py` | Shared imports, `SubTestResult` accumulator, compilation helpers, test fixtures |
 | `conftest.py` | pytest fixture wiring — provides the `r` fixture |
-| `run_all.py` | Standalone runner that imports and calls all 77 test functions |
+| `run_all.py` | Standalone runner. Discovers every `test_*(r, ...)` in `test_*.py` and calls them in a deterministic order — it names no test, so adding one needs no edit here |
 
 ## Sub-Test Pattern
 
@@ -78,7 +78,9 @@ The `conftest.py` fixture creates the `SubTestResult`, passes it to the test fun
    - `assert_equiv(r, name, code, bindings)` — verify interpreter/codegen match
    - `make_img(B, H, W, C, seed)` — deterministic test image
    - `make_latent(B, C, H, W, seed)` — fake LATENT dict
-4. Add the function to `run_all.py`: import it at the top, call it in `main()`.
+4. That is the whole wiring: `run_all.py` derives its call list from the tree, and
+   `test_v017_phase1.py::test_tst7_runner_coverage` (TST-7) reds if a row it can see is one
+   the runner cannot reach.
 5. Run `python -m pytest tests/ -v` to verify.
 
 ## Pytest Markers

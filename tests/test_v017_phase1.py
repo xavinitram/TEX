@@ -706,24 +706,57 @@ def _rtest_fns_in_file(path):
 
 def test_tst7_runner_coverage(r: SubTestResult):
     print("\n--- TST-7: no test drifts out of the runner (auto-discover) ---")
-    # A test_*(r) function defined in a file but never called in run_all.py silently
-    # never runs — the coverage gap that let regressions ship green. Discover every
-    # such function and assert run_all.py imports AND calls it.
+    # A test_*(r) function defined in a file but never run by run_all.py silently never
+    # runs — the coverage gap that let regressions ship green. run_all.py no longer names
+    # its rows (it derives them), so this row is the guard on the DERIVATION: census the
+    # tree independently, here, and assert run_all.discover() found every row, invented
+    # none, and carries no stale exclusion.
     here = os.path.dirname(os.path.abspath(__file__))
     try:
-        with open(os.path.join(here, "run_all.py"), encoding="utf-8") as f:
-            runner_src = f.read()
-        called = set(re.findall(r"(\w+)\(r\)", runner_src))
-        orphans = []
+        import run_all
+
+        census = set()
+        nested = []
         for path in sorted(glob.glob(os.path.join(here, "test_*.py"))):
-            for fn in _rtest_fns_in_file(path):
-                if fn not in called:
-                    orphans.append(f"{os.path.basename(path)}::{fn}")
-        if orphans:
-            r.fail("TST-7 runner drift",
-                   f"{len(orphans)} test(s) defined but never called in run_all.py:\n  "
-                   + "\n  ".join(orphans))
+            module = os.path.basename(path)[:-3]
+            for fn in _rtest_fns_in_file(path):          # any depth
+                census.add((module, fn))
+            with open(path, encoding="utf-8") as f:
+                tree = ast.parse(f.read(), path)
+            top = {n.name for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")
+                   and n.args.args and n.args.args[0].arg == "r"}
+            nested += [f"{module}::{fn}" for fn in sorted(_rtest_fns_in_file(path) - top)]
+
+        discovered = [(m, fn) for m, fn, _ln in run_all.discover()]
+        seen = set(discovered)
+        excluded = {tuple(e.split("::", 1)) for e in run_all._EXCLUDE}
+
+        problems = []
+        if nested:
+            # Not reachable as a module attribute, so no runner could call it.
+            problems.append("defined inside another function (unreachable): "
+                            + ", ".join(nested))
+        missing = sorted(census - seen - excluded)
+        if missing:
+            problems.append(f"{len(missing)} test(s) the runner does not reach: "
+                            + ", ".join(f"{m}::{fn}" for m, fn in missing))
+        invented = sorted(seen - census)
+        if invented:
+            problems.append(f"{len(invented)} row(s) the runner runs that no file defines: "
+                            + ", ".join(f"{m}::{fn}" for m, fn in invented))
+        stale = sorted(excluded - census)
+        if stale:
+            problems.append(f"{len(stale)} stale _EXCLUDE entr(ies) naming nothing: "
+                            + ", ".join(f"{m}::{fn}" for m, fn in stale))
+        if len(seen) != len(discovered):
+            problems.append("the runner would call the same row twice")
+
+        if problems:
+            r.fail("TST-7 runner drift", "\n  ".join(problems))
         else:
-            r.ok(f"all {len(called)} runner-convention tests are wired into run_all.py")
+            note = f"; {len(excluded)} excluded" if excluded else ""
+            r.ok(f"all {len(discovered)} runner-convention tests are derived "
+                 f"into run_all.py{note}")
     except Exception as e:
         r.fail("TST-7 runner coverage", f"{type(e).__name__}: {e}")
