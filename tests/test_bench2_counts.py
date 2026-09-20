@@ -345,12 +345,19 @@ def test_bench2_cuda_per_tick_counts(r: SubTestResult):
 # second 1024^2 matrix.
 _FREE_MEM_CPU = 0       # every scenario: the planners return before the query off CUDA
 _FREE_MEM_CUDA = {
-    # A whole-frame recook: ten cooks, of which the seven POINTWISE stages reach
-    # `_tile_plan`'s free-VRAM query (the three blur/morphology stages are not tile-safe,
-    # so they leave through `is_tile_safe_cached` and `_halo_tile_plan`'s cheap gate).
-    "all_dirty":   7,
-    # The first whole frame after a source edit: seven cooks, four of them pointwise.
-    "source_edit": 4,
+    # PERF-6 re-pin (was 7). A whole-frame recook is ten cooks, of which the seven POINTWISE
+    # stages reach `_tile_plan`'s free-VRAM question (the three blur/morphology stages are not
+    # tile-safe, so they leave through `is_tile_safe_cached` and `_halo_tile_plan`'s cheap
+    # gate). All seven are now answered from the last live reading, because a cook this far
+    # under the budget cannot be the cook that needs the number: `tex_tiling._free_foreign`
+    # holds only the bytes torch's allocator does not own, and re-reads `torch_allocated` on
+    # every call. A NON-ZERO here means a stage got close enough to the budget for the margin
+    # to fail — which is the design working, not a regression — or that the decomposition
+    # stopped resolving (no `device_total_mem`, no allocator statistics).
+    "all_dirty":   0,
+    # PERF-6 re-pin (was 4). The first whole frame after a source edit: seven cooks, four of
+    # them pointwise, same reasoning.
+    "source_edit": 0,
     # The interactive ticks pay NOTHING: `_preflight_memory` fires (1 / 5 / 1 per tick) and
     # LAT-2's cheap path returns before the query, and the ROI route never reaches a tile plan.
     "terminal":    0,

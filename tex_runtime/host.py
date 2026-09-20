@@ -257,6 +257,13 @@ class ComfyHostServices:
 
 _cached = None
 
+#: PERF-6: bumped whenever the resolved services object is SWAPPED. A consumer that memoizes
+#: something a host told it — `tex_tiling`'s free-VRAM decomposition is the only one today —
+#: records this generation beside the answer and drops it when the number changes, so a host
+#: swapped out from under a warm memo can never leave the previous host's answer in service.
+#: An int read at a dict lookup, rather than an observer list this seam would have to own.
+_services_generation = 0
+
 
 def get_host_services():
     """The process-wide host services (cached): ComfyUI if importable, else Null."""
@@ -270,13 +277,24 @@ def get_host_services():
     return _cached
 
 
+def services_generation() -> int:
+    """PERF-6: how many times the resolved services object has been swapped.
+
+    A function rather than a bare global read so a consumer imports a NAME from this seam
+    (`tex_tiling` is a leaf whose module-level imports are pinned to `.tex_runtime.host`), and
+    so the counter can never be written from outside."""
+    return _services_generation
+
+
 def set_host_services(services) -> None:
     """Override the host services (tests, or a non-ComfyUI host wiring itself in)."""
-    global _cached
+    global _cached, _services_generation
     _cached = services
+    _services_generation += 1
 
 
 def reset_host_services() -> None:
     """Drop the cached resolution (tests)."""
-    global _cached
+    global _cached, _services_generation
     _cached = None
+    _services_generation += 1

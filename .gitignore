@@ -41,6 +41,11 @@ tests/*.json
 # change to them. Whitelisted as a directory, so a row cannot be silently uncommitted.
 !tests/perf5_goldens/
 !tests/perf5_goldens/*.json
+# PERF-6's tile-plan golden, likewise: it records what the cook-fit planners answer for the
+# whole example corpus at a known sha, which is the only way a change to how the free-VRAM
+# reading is SOURCED can be shown not to have moved a plan.
+!tests/perf6_goldens/
+!tests/perf6_goldens/*.json
 
 wiki/
 .coverage

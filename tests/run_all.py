@@ -1998,6 +1998,27 @@ def main():
     test_perf5_the_token_handoff_is_consumed(r)
     test_perf5_a_lex_failure_offers_nothing(r)
 
+    # PERF-6: the free-VRAM reading the cook-fit planners divide. One live host query per
+    # unpressured frame instead of one per cook, guarded by a base-sha golden over the whole
+    # example corpus's tile plans — the mechanism is only allowed to change what the engine
+    # PAYS, never what it plans.
+    from test_perf6_free_memory_once import (
+        test_perf6_the_tile_plans_are_identical,
+        test_perf6_the_golden_catches_a_planner_change,
+        test_perf6_an_unpressured_frame_asks_the_host_once,
+        test_perf6_a_pressured_cook_always_reads_live,
+        test_perf6_the_memo_margin_is_load_bearing,
+        test_perf6_the_bound_tracks_the_allocator,
+        test_perf6_a_swapped_host_is_asked_afresh,
+    )
+    test_perf6_the_tile_plans_are_identical(r)
+    test_perf6_the_golden_catches_a_planner_change(r)
+    test_perf6_an_unpressured_frame_asks_the_host_once(r)
+    test_perf6_a_pressured_cook_always_reads_live(r)
+    test_perf6_the_memo_margin_is_load_bearing(r)
+    test_perf6_the_bound_tracks_the_allocator(r)
+    test_perf6_a_swapped_host_is_asked_afresh(r)
+
     success = r.summary()
     return 0 if success else 1
 
