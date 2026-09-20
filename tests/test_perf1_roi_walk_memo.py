@@ -41,6 +41,13 @@ from TEX_Wrangle.tex_marshalling import sigil_names
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _drop_token_offer(code: str) -> None:
+    """PERF-5: consume the token stream `sigil_names` offers to the next parse of `code`, so a
+    priming call in this file donates no lex to a row that is counting lexes."""
+    from TEX_Wrangle.tex_compiler.lexer import claim_tokens
+    claim_tokens(code, dotted_bindings=True)
+
+
 # ── the pre-change implementation, kept as the oracle ────────────────────────
 
 def _base_fold_program(code: str, param_values: dict):
@@ -190,7 +197,12 @@ def test_perf1_a_source_is_parsed_once(r: SubTestResult):
     tex_roi.clear_roi_memo()
     # `_referenced_at_bindings` lexes through `sigil_names`, which memoizes per source: prime
     # it, so what is counted below is the ROI fold's own front-end work and nothing else.
+    # PERF-5: that scan now also OFFERS its token stream to the next `parse_and_split` of the
+    # same source, so priming it would donate this row's one lex and the count would read 0.
+    # Drop the offer — the ROI fold's own lex is what this row is about, and leaving it would
+    # make PERF-1's gate depend on PERF-5's mechanism.
     sigil_names(code)
+    _drop_token_offer(code)
     n = {"lex": 0, "parse": 0}
     lex0, parse0 = _lx.Lexer.tokenize, _ps.Parser.parse
 
@@ -218,6 +230,7 @@ def test_perf1_a_source_is_parsed_once(r: SubTestResult):
     n["lex"] = n["parse"] = 0
     other = "@OUT = vec4(@IN.rgb + vec3($lift), 1.0);"
     sigil_names(other)
+    _drop_token_offer(other)
     _lx.Lexer.tokenize, _ps.Parser.parse = lex, parse
     try:
         tex_roi._walk(other, {"lift": 0.1})

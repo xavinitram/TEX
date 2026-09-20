@@ -1982,11 +1982,19 @@ def main():
         test_perf5_the_golden_catches_a_one_character_recipe_change,
         test_perf5_one_fingerprint_per_cook,
         test_perf5_the_shared_fingerprint_is_the_cache_key,
+        test_perf5_one_lex_per_never_seen_program,
+        test_perf5_a_claimed_stream_parses_to_the_same_program,
+        test_perf5_the_token_handoff_is_consumed,
+        test_perf5_a_lex_failure_offers_nothing,
     )
     test_perf5_fingerprint_and_param_only_names_are_byte_stable(r)
     test_perf5_the_golden_catches_a_one_character_recipe_change(r)
     test_perf5_one_fingerprint_per_cook(r)
     test_perf5_the_shared_fingerprint_is_the_cache_key(r)
+    test_perf5_one_lex_per_never_seen_program(r)
+    test_perf5_a_claimed_stream_parses_to_the_same_program(r)
+    test_perf5_the_token_handoff_is_consumed(r)
+    test_perf5_a_lex_failure_offers_nothing(r)
 
     success = r.summary()
     return 0 if success else 1

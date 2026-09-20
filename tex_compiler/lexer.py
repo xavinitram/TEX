@@ -10,6 +10,7 @@ Supports:
   - Dot-access for channel swizzling
 """
 from __future__ import annotations
+from collections import OrderedDict
 from enum import Enum, auto
 from dataclasses import dataclass
 from .ast_nodes import SourceLoc
@@ -559,3 +560,55 @@ class Lexer:
 
         self.tokens.append(Token(TokenType.EOF, "", self.loc()))
         return self.tokens
+
+
+# ── PERF-5: the one-shot token handoff ───────────────────────────────────────
+#
+# A never-seen program used to be lexed TWICE on its way through a cook. `TEXCache.fingerprint`
+# asks `tex_marshalling.param_only_names` which names the source uses with which sigil, and that
+# scan tokenizes; the compile that follows immediately tokenizes the same source again for the
+# parse. The two lexes read the same characters with the same flag and build the same tokens.
+#
+# THIS IS A HANDOFF, NOT A CACHE, and the distinction is the whole safety argument. An entry is
+# CLAIMED — removed by the reader — so a token list is handed to at most ONE parse. It has to
+# be: `Parser` stores `tok.loc` (the Token's own `SourceLoc` OBJECT) directly into the AST nodes
+# it builds, and `SourceLoc.stage` is WRITTEN later by the fused-chain tagger. Two ASTs sharing
+# one token list would share those locs, and one chain's stage tags would appear on another
+# tree's nodes. (It is the same hazard `ast_nodes.clone_tree` copies `SourceLoc` to avoid.)
+# A second parse of the same source finds nothing to claim and lexes, exactly as before.
+#
+# Everything about it degrades to today's behaviour: an offer nobody claims is evicted, an offer
+# made for a source that is never parsed costs one small list, and a claim that misses lexes.
+# So an eviction, a lost race or a reordering can cost a lex — never a wrong token stream.
+#
+# The FLAG IS IN THE KEY on purpose. `dotted_bindings` decides whether `@beauty.diffuse` is one
+# token or three, so a claimer asking for the other stream must not be handed this one; keying
+# on it makes that structural rather than a convention two modules share by comment.
+_TOKEN_HANDOFF: "OrderedDict[tuple[str, bool], list[Token]]" = OrderedDict()
+#: The window is one cook: a source is fingerprinted and then compiled with nothing in between.
+#: A handful of slots covers a chain that fingerprints several stages before compiling any of
+#: them; overflow is a no-op, so this bound trades a lex for memory and never correctness.
+_TOKEN_HANDOFF_MAX = 16
+
+
+def offer_tokens(source: str, tokens: "list[Token]", *, dotted_bindings: bool) -> None:
+    """Offer a freshly-lexed token stream for ONE later `claim_tokens` of the same source."""
+    key = (source, dotted_bindings)
+    _TOKEN_HANDOFF[key] = tokens
+    try:
+        _TOKEN_HANDOFF.move_to_end(key)
+        while len(_TOKEN_HANDOFF) > _TOKEN_HANDOFF_MAX:
+            _TOKEN_HANDOFF.popitem(last=False)          # LRU, matching every memo in the engine
+    except KeyError:
+        pass                    # lost a race to a concurrent evict; a missed offer costs a lex
+
+
+def claim_tokens(source: str, *, dotted_bindings: bool) -> "list[Token] | None":
+    """Take the offered token stream for `source`, or None. CONSUMES it: the next caller
+    lexes. `dict.pop` is atomic under the GIL, so at most one claimant can win."""
+    return _TOKEN_HANDOFF.pop((source, dotted_bindings), None)
+
+
+def clear_token_handoff() -> None:
+    """Drop every outstanding offer (tests; a host resetting engine state)."""
+    _TOKEN_HANDOFF.clear()

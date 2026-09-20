@@ -41,8 +41,10 @@ import os
 
 from helpers import *
 
-from TEX_Wrangle import tex_cache, tex_engine
-from TEX_Wrangle.tex_cache import get_cache
+from TEX_Wrangle import tex_api, tex_cache, tex_engine, tex_marshalling as _marshalling
+from TEX_Wrangle.tex_cache import get_cache, parse_and_split
+from TEX_Wrangle.tex_compiler import lexer as _lexer
+from TEX_Wrangle.tex_compiler.ast_nodes import iter_child_nodes
 from TEX_Wrangle.tex_marshalling import param_only_names
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -83,6 +85,12 @@ def _sources() -> dict:
 
 def _types(m: dict) -> dict:
     return {k: TEXType(v) for k, v in m.items()}
+
+
+def _comp_stage_sources() -> list:
+    """The ten `examples/host_demo.py::_COMP_STAGES` programs — the comp the counts harness
+    drives, and the set `tex_api.prewarm` warms at project load."""
+    return [code for key, code in _sources().items() if key.startswith("_COMP_STAGES/")]
 
 
 # ── the golden ──────────────────────────────────────────────────────────────
@@ -259,3 +267,204 @@ def test_perf5_the_shared_fingerprint_is_the_cache_key(r: SubTestResult):
             r.fail("PERF-5 fingerprint key",
                    f"no {fp[:12]}….pkl after a cold cook; the dir holds "
                    f"{[n[:12] for n in on_disk]} — the compile stored under a different key")
+
+
+# ── the shared lex ──────────────────────────────────────────────────────────
+
+class _LexSpy:
+    """Count entries to `Lexer.tokenize` — the real call count, not the work done. A memo
+    INSIDE `tokenize` would leave this reading 2 per never-seen program and save nothing an
+    embedding host could see in a profile."""
+
+    def __init__(self):
+        self.n = 0
+
+    def __enter__(self):
+        self._orig = Lexer.tokenize
+        spy = self
+
+        def wrapper(lexer_self, *a, **k):
+            spy.n += 1
+            return spy._orig(lexer_self, *a, **k)
+        Lexer.tokenize = wrapper
+        return self
+
+    def __exit__(self, *e):
+        Lexer.tokenize = self._orig
+        return False
+
+
+def _clear_front_end_memos():
+    """A never-seen program means never seen by THIS process: `sigil_names`' per-source memo
+    and the handoff are module-global and outlive a cold cache dir, so a test that only made a
+    fresh cache dir would be measuring a second sighting and reading the wrong number."""
+    _marshalling._SIGIL_MEMO.clear()
+    _lexer.clear_token_handoff()
+    tex_cache._FINGERPRINT_MEMO.clear()
+
+
+def _dump(node):
+    """A structural rendering of an AST: class name + every non-child field + the loc's
+    line/col/stage + the children, recursively. Two parses of one source must agree on it."""
+    import dataclasses
+    if isinstance(node, list):
+        return [_dump(x) for x in node]
+    if not dataclasses.is_dataclass(node) or isinstance(node, type):
+        return node
+    out = [type(node).__name__]
+    for f in dataclasses.fields(node):
+        v = getattr(node, f.name)
+        if f.name == "loc":
+            out.append(("loc", None if v is None else (v.line, v.col, v.stage)))
+        else:
+            out.append((f.name, _dump(v)))
+    return tuple(out)
+
+
+def _locs(node) -> set:
+    """The `id()` of every `SourceLoc` object reachable from an AST. Two ASTs that share one
+    can have a stage tag written on one appear on the other."""
+    seen = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        loc = getattr(n, "loc", None)
+        if loc is not None:
+            seen.add(id(loc))
+        stack.extend(iter_child_nodes(n))
+    return seen
+
+
+def test_perf5_one_lex_per_never_seen_program(r: SubTestResult):
+    """`tex_api.prewarm` over the ten demo comp programs enters `Lexer.tokenize` TEN times.
+
+    At the base it entered it twenty: `TEXCache.fingerprint` asks `param_only_names` which
+    names are param-only and that scan tokenizes, then the compile immediately behind it
+    tokenizes the same source again for the parse — same characters, same `dotted_bindings`
+    flag, same tokens. The first scan now OFFERS its stream and `parse_and_split` claims it.
+
+    Project load is exactly where this is paid: `prewarm` exists so the first scrub after a
+    project opens replays instead of trialling, and every program it warms is never-seen by
+    construction."""
+    progs = [(code, {"IN": TEXType.VEC4}) for code in _comp_stage_sources()]
+    with cold_engine_state():
+        _clear_front_end_memos()
+        with _LexSpy() as s:
+            tex_api.prewarm(progs, device="cpu", compile_mode="none")
+        got = s.n
+    _clear_front_end_memos()
+    r.ok(f"prewarm over {len(progs)} never-seen programs: {got} Lexer.tokenize "
+         f"(one per program)") if got == len(progs) else \
+        r.fail("PERF-5 lex count",
+               f"{got} Lexer.tokenize for {len(progs)} never-seen programs, expected "
+               f"{len(progs)} — one lex per program. Twenty means the fingerprint scan's "
+               f"stream is no longer reaching `parse_and_split`")
+
+
+def test_perf5_a_claimed_stream_parses_to_the_same_program(r: SubTestResult):
+    """The claimed tokens build the SAME AST as a private lex would, over the whole corpus.
+
+    The handoff is sound only because both sides lex with `dotted_bindings=True`; were they
+    ever to disagree, `@beauty.diffuse` would arrive as one token on one path and three on the
+    other and the splitback would read a different wire. So each source is parsed twice — once
+    from a private lex, once from a standing offer — and the two programs are compared
+    structurally, each node's `SourceLoc` line/col/stage included."""
+    src = _sources()
+    bad, n, offered = [], 0, 0
+    for key, code in src.items():
+        _clear_front_end_memos()
+        try:
+            plain = _dump(parse_and_split(code, {}))
+        except Exception:
+            continue                      # a source that does not parse is not this row's case
+        _clear_front_end_memos()
+        param_only_names(code)             # mints the offer, exactly as `fingerprint` does
+        if (code, True) in _lexer._TOKEN_HANDOFF:
+            offered += 1
+        claimed = _dump(parse_and_split(code, {}))
+        n += 1
+        if claimed != plain:
+            bad.append(f"{key}: the claimed parse differs from a private lex's")
+    _clear_front_end_memos()
+    if bad:
+        r.fail("PERF-5 claimed stream", "; ".join(bad[:6]) +
+               (f" (+{len(bad) - 6} more)" if len(bad) > 6 else ""))
+    elif offered < n:
+        r.fail("PERF-5 claimed stream",
+               f"only {offered} of {n} corpus programs left an offer for the parse to claim — "
+               f"the rows that did not are passing vacuously")
+    else:
+        r.ok(f"{n} corpus programs parse identically from a claimed stream and a private lex")
+
+
+def test_perf5_the_token_handoff_is_consumed(r: SubTestResult):
+    """A token list reaches AT MOST ONE parse, so no two ASTs share a `SourceLoc`.
+
+    This is the handoff's whole safety argument. `Parser` puts `tok.loc` — the Token's own
+    `SourceLoc` OBJECT — straight into the nodes it builds, and `SourceLoc.stage` is WRITTEN
+    later by the fused-chain tagger (Q-4); it is the same hazard `ast_nodes.clone_tree` copies
+    `SourceLoc` to avoid. So `claim_tokens` REMOVES the entry and a second parse of the same
+    source lexes for itself.
+
+    The mutation is the other half: a non-consuming handoff must make this row FAIL, or the
+    row asserts a property nothing could break."""
+    code = _PROG
+
+    def two_parses(claim):
+        _clear_front_end_memos()
+        param_only_names(code)                              # mint the offer
+        saved = tex_cache.claim_tokens
+        tex_cache.claim_tokens = claim
+        try:
+            # BOTH trees are held alive before either id() set is taken. Taking them one at a
+            # time frees the first tree's `SourceLoc` objects and CPython hands their addresses
+            # straight back to the second parse — which reads as sharing and is not (this row
+            # failed that way first).
+            one, two = parse_and_split(code, {}), parse_and_split(code, {})
+            return _locs(one), _locs(two)
+        finally:
+            tex_cache.claim_tokens = saved
+            _clear_front_end_memos()
+
+    a, b = two_parses(_lexer.claim_tokens)
+    shared = a & b
+    r.ok(f"two parses of one source share 0 of {len(a)} SourceLoc objects") if not shared \
+        else r.fail("PERF-5 handoff consumption",
+                    f"{len(shared)} SourceLoc object(s) are in BOTH ASTs — the handoff is no "
+                    f"longer one-shot, so a fused-chain stage tag written on one tree's loc "
+                    f"would appear on the other's")
+
+    def _peek(source, *, dotted_bindings):
+        return _lexer._TOKEN_HANDOFF.get((source, dotted_bindings))   # does NOT consume
+
+    ma, mb = two_parses(_peek)
+    r.ok(f"a non-consuming handoff is caught: the mutant shares {len(ma & mb)} SourceLoc "
+         f"objects across two ASTs") if (ma & mb) else \
+        r.fail("PERF-5 handoff mutation",
+               "a handoff that does NOT consume its entry produced two ASTs with no shared "
+               "SourceLoc — this row cannot detect the defect it exists to detect")
+
+
+def test_perf5_a_lex_failure_offers_nothing(r: SubTestResult):
+    """A source the lexer refuses leaves no offer behind.
+
+    `sigil_names` swallows a `LexerError` and answers "no sigils" (keeping every binding in the
+    key — the documented pre-v0.31 behaviour for a program that is about to fail to compile
+    anyway). It must not ALSO deposit a half-built stream for the parse to claim: the parse has
+    to reach the lexer itself, or the user loses the E1xxx diagnostic and its location."""
+    bad_src = "@OUT = vec4(@IN.rgb, 1.0) §;\n"      # U+00A7 is not a TEX character
+    _clear_front_end_memos()
+    ats, dollars = _marshalling.sigil_names(bad_src)
+    left = _lexer.claim_tokens(bad_src, dotted_bindings=True)
+    raised = ""
+    try:
+        parse_and_split(bad_src, {})
+    except Exception as e:
+        raised = type(e).__name__
+    _clear_front_end_memos()
+    ok = (ats, dollars) == (frozenset(), frozenset()) and left is None and bool(raised)
+    r.ok(f"an unlexable source: the sigil scan answers empty, offers nothing, and the parse "
+         f"still raises {raised}") if ok else \
+        r.fail("PERF-5 lex failure",
+               f"sigils={(sorted(ats), sorted(dollars))}, offer_left={left is not None}, "
+               f"parse raised {raised or 'nothing'} — expected empty / no offer / a raise")

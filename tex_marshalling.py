@@ -805,19 +805,26 @@ def sigil_names(code: str) -> tuple:
     ats, dollars = frozenset(), frozenset()
     if "@" in code or "$" in code:
         try:
-            from .tex_compiler.lexer import Lexer, TokenType
+            from .tex_compiler.lexer import Lexer, TokenType, offer_tokens
             a, d = set(), set()
             # DATA-6: lexed with the dotted-binding greed (the flag is spelled because it is
             # this scan's CONTRACT, not an accident of the default): `@beauty.diffuse` is
             # reported verbatim, which IS the per-plane demand set the wire lane expands from,
             # with no second scan. The two consumers that key on the WIRE add the dotted
             # bases back themselves (`param_only_names`, `tex_roi._referenced_at_bindings`).
-            for tok in Lexer(code, dotted_bindings=True).tokenize():
+            toks = Lexer(code, dotted_bindings=True).tokenize()
+            for tok in toks:
                 if tok.type in (TokenType.AT_BINDING, TokenType.TYPED_AT_BINDING):
                     a.add(tok.value)
                 elif tok.type in (TokenType.DOLLAR_BINDING, TokenType.TYPED_DOLLAR_BINDING):
                     d.add(tok.value)
             ats, dollars = frozenset(a), frozenset(d)
+            # PERF-5: this scan sits under `TEXCache.fingerprint`, and the compile that follows
+            # it on a never-seen program used to lex the same source a second time for the
+            # parse. Offer the stream so `tex_cache.parse_and_split` can take it instead. The
+            # offer is CONSUMED by its one claimant and is a pure optimisation either way (see
+            # `lexer.offer_tokens`); this scan itself never parses, so it keeps nothing.
+            offer_tokens(code, toks, dotted_bindings=True)
         except Exception:
             pass
     out = (ats, dollars)

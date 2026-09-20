@@ -23,7 +23,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
-from .tex_compiler.lexer import Lexer
+from .tex_compiler.lexer import Lexer, claim_tokens
 from .tex_compiler.parser import Parser
 from .tex_compiler.ast_nodes import (BindingRef, ChannelAccess, NodeTransformer, SourceLoc)
 from .tex_compiler.type_checker import TypeChecker, TypeCheckError, BINDING_HINT_TYPES
@@ -202,7 +202,15 @@ def parse_and_split(source: str, binding_types: dict | None = None):
     # The flag is spelled even though it is the lexer's default: this is the one place the
     # greed is REQUIRED (the splitback below is what makes it safe), and it keeps the seam
     # independent of the default should a caller ever want the raw pre-planes stream.
-    tokens = Lexer(source, dotted_bindings=True).tokenize()
+    # PERF-5: `TEXCache.fingerprint` asks `tex_marshalling.param_only_names` which names the
+    # source uses with which sigil, and that scan lexes — immediately before this one, with the
+    # same flag, over the same characters. It OFFERS its stream; claiming it is what makes a
+    # never-seen program cost one lex instead of two. The claim consumes the offer, so no two
+    # parses ever share a token (and so no two ASTs ever share a `SourceLoc`); a miss — no
+    # offer, an evicted one, a second parse of the same source — lexes here exactly as before.
+    tokens = claim_tokens(source, dotted_bindings=True)
+    if tokens is None:
+        tokens = Lexer(source, dotted_bindings=True).tokenize()
     program = Parser(tokens, source=source).parse()
     return splitback_dotted_bindings(program, binding_types or {}, source=source)
 
