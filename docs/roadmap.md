@@ -113,9 +113,10 @@ Four workstreams. Effort tags: S/M/L.
 ### Workstream A — finish fusion (pillar 1)
 
 - **FUS-0 (S, v0.20.1 bug).** Fused chains cannot reach `torch_compile`/`auto` in
-  production: `select_tier` requires `fused_fp_present` (tex_node.py:571-574) but
-  `execute()` computes `fused_fp` only under `cuda_graph` (tex_node.py:808, stale
-  comment). One-line gate fix + a node-path regression test (the existing F-1 test
+  production: `select_tier` requires `fused_fp_present` (today `tex_engine.select_tier`,
+  `tex_engine.py:419-435`) but the node's `execute()` computed `fused_fp` only under
+  `cuda_graph` (that computation now lives in `tex_engine.prepare`, `tex_engine.py:793-803`,
+  and runs for every mode). One-line gate fix + a node-path regression test (the existing F-1 test
   bypasses the gate with a synthetic fingerprint).
 - **FUS-1 (M).** DAG-region fusion producer. The Q-3 splicer already accepts arbitrary
   DAG edges (`chain_inputs`), multi-output (`exports`), and observed intermediates
@@ -130,8 +131,8 @@ Four workstreams. Effort tags: S/M/L.
   nothing; this is pillar 1's core promise.
 - **FUS-2 (M).** Fused-chain lazy composition: `fused_required_bindings(spec, params)`
   walking stages terminal-first with per-stage folded params, so dead upstream
-  branches of a fused chain stop cooking (today fusion requests everything —
-  tex_node.py:493-494). One memoized analysis must feed **both**
+  branches of a fused chain stop cooking (today `check_lazy_status` short-circuits a fused
+  chain to every pending slot — tex_node.py:362-363). One memoized analysis must feed **both**
   `check_lazy_status` and execute()'s E6003 gate for fused chains — the same
   dual-consumer discipline invariant #11 already mandates for tex_lazy._memo —
   and the never-sever rows extend to fused chains as the gate.

@@ -56,7 +56,8 @@ is a binding; a set of planes is a wire.
 This is the release's compat tripwire and the reason this phase gets its own session.
 
 **The constraint that decides it:** the parser provably never sees binding types.
-`TEXCache.compile_tex` calls `Parser(tokens, source=code).parse()` (`tex_cache.py:310`) and
+`TEXCache.compile_tex` reaches `Parser(tokens, source=source).parse()` through
+`parse_and_split` (`tex_cache.py:214`) and
 types enter one call later, at `TypeChecker(binding_types=..., source=source)`
 (`tex_cache.py:326`, inside the shared `compile_ast`). So doc 40's "`.name` means a plane *on a
 PLANES-typed wire*" cannot live in the grammar. Something upstream of types must tokenize the
@@ -214,7 +215,7 @@ assigned binding `OUT.diffuse` on a `PLANES` output.
   both would make the output type depend on statement order, which is the class of bug phase 0
   spent its whole budget removing.
 * Egress grows the inverse repack into a `PlanesValue`, and `map_inferred_type`
-  (`tex_marshalling.py:670`) gains the PLANES arm.
+  (`tex_marshalling.py:875`) gains the PLANES arm.
 
 ---
 

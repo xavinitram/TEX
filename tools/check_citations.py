@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""check_citations.py — make a doc's `file.py:NNN` pointers answerable by a machine.
+
+WHY THIS EXISTS
+---------------
+A document is the map a reader plans against, and a line number is the one claim in it
+that no test could ever catch: the line moves, the sentence does not, and the next reader
+plans against a pointer that now lands in a different function. Measured on this tree, in
+one release round: four of four spot-checked pointers in a document written *that round*
+were already wrong, and three pointers in shipped docs landed on a blank line or past the
+end of the file.
+
+So the rule this tool enforces is not "the line number is right" — it cannot know that.
+It is the weaker, checkable, and actually useful rule:
+
+    the cited line must exist, and the SYMBOL that encloses it must be named
+    in the sentence that cites it.
+
+A pointer that names its symbol survives every edit that moves the line, because the name
+is what the reader searches for. That is the whole point: **point at symbols, not lines.**
+
+WHAT IS CHECKED
+---------------
+ERROR (always fails the run):
+  * the cited file does not exist, or a bare basename resolves to more than one file
+    (with no root-level file to break the tie);
+  * the cited start line, or the end line of a `NNN-MMM` range, is past the end of file;
+  * the cited start line is blank.
+  These are *dead* pointers. A dead pointer is not a style problem; it is a claim about
+  code that is not there.
+
+WARNING (fails only against the pinned budget, below):
+  * the line resolves, but the name of the `def`/`class` enclosing it — or of any of its
+    enclosing ancestors, or of any symbol the cited RANGE overlaps — does not appear in
+    the sentence that cites it.
+  This one over-counts by construction: prose legitimately describes a private helper by
+  the public behaviour it implements. It is a ratchet, not a verdict on any single line.
+
+NOT CHECKED (counted and reported, never a warning):
+  * a line at module scope — imports, module constants, a module docstring. There is no
+    enclosing symbol to name, so there is nothing to require.
+
+THE SCOPE, AND WHAT WAS MEASURED TO PICK IT
+-------------------------------------------
+"Named in the citing sentence" is a judgement call between a window so narrow that every
+honest pointer warns and one so wide that a wrong pointer hides behind a neighbouring
+sentence. Six rules were run over the same 82 citations, before any repair:
+
+    window     symbol set                      warnings   of 63 checkable
+    line       innermost def/class, exact          51          81 %
+    sentence   innermost def/class, exact          38          60 %
+    paragraph  innermost def/class, exact          35          56 %
+    paragraph  any symbol the range overlaps       32          51 %
+    paragraph  ... + short English suffix          31          49 %
+    sentence   any symbol the range overlaps,
+               ancestors, + short suffix           34          54 %   <-- chosen
+
+The last two differ by exactly three citations, and **all three are wrong pointers** that
+the paragraph window hid behind an adjacent sentence: `tex_engine.py:1238-1242` and
+`tex_cache.py:618` (both in `docs/host-path-counts.md`, both independently confirmed wrong)
+and `tex_node.py:493-494` in `docs/roadmap.md` (cited for "fusion requests everything"; the
+lines are LATENT unwrapping). Three extra warnings for three real finds is the best ratio on
+the table, so the sentence window wins despite being the noisier of the two.
+
+Widening the symbol set — ancestors, plus every symbol a `NNN-MMM` range overlaps rather
+than only the one covering its first line, plus a ≤3-letter English suffix so "submitted"
+names `submit` — costs no signal at all: it only ever turns a warning into a pass when the
+prose really does name a symbol the citation really does cover.
+
+THE BUDGET IS A RATCHET (the PUB-1 discipline, applied to docs)
+---------------------------------------------------------------
+`WARNING_BUDGET` is pinned at the count measured when this tool landed. More warnings than
+the pin fails; FEWER warnings than the pin also fails, asking for the pin to be moved DOWN.
+Never raise the pin to fit a change: a new pointer arrives naming its symbol, or the
+document says which symbol it means.
+
+THE DOCUMENT SET, AND WHY IT IS THIS SET
+----------------------------------------
+Scanned:
+  * `docs/*.md`      — the internal design/planning layer (AGENTS.md §"Doc-layering policy").
+                       This is the layer a change's plan is built from, so a rotten pointer
+                       here is a wrong premise handed to whoever implements it.
+  * `README.md`, `AGENTS.md`, `ARCHITECTURE.md`, `DEVELOPMENT.md`, `CONTRIBUTING.md`,
+    `CHANGELOG.md` — the repo-root agent/developer layer: the map, the architecture, the
+                       rejected-decision register, the release record.
+Deliberately NOT scanned, each for a reason:
+  * `Function-Reference.md` — generated by `tools/gen_function_reference.py`; a repair here
+    belongs in the generator, not the file.
+  * `Error-Codes.md`, `LANGUAGE.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`,
+    `learn_tex_in_5_minutes.md`, `wiki/` — end-user facing (DOC-6 layer 2) and carrying
+    zero `file.py:NNN` citations when this tool landed. They are excluded so the scanned
+    set stays "the documents a change is planned against", not "every .md in the tree".
+
+Both sides are restricted to files **git tracks**, asked of git rather than guessed from a
+skip list. A checkout may carry untracked scratch beside the repository: an untracked note is
+not a shipped document, and an untracked scratch script must never shadow a product module's
+basename in the citation index. Where git cannot answer, the tool falls back to
+walking the tree and prints which source it used, so a changed count is never a mystery.
+
+Citations inside fenced code blocks are skipped: a traceback pasted into a ``` block is
+output, not a claim. (Measured when this landed: zero citations sat inside a fence, so the
+skip costs nothing today and stops a future paste from being read as a pointer.)
+
+USAGE
+-----
+    python tools/check_citations.py                  # check the repo this file lives in
+    python tools/check_citations.py --root <tree>    # check another checkout
+    python tools/check_citations.py --list           # dump every citation and its verdict
+    python tools/check_citations.py --budget N       # override the pinned budget
+
+Exit code 0 = clean; 1 = a dead pointer, or the warning count is not exactly the budget.
+`tools/` is excluded from the registry archive by `.comfyignore`, so nothing here ships.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import os
+import re
+import subprocess
+import sys
+
+# ── The pinned warning budget (see "THE BUDGET IS A RATCHET" above). Moves DOWN only. ──
+WARNING_BUDGET = 28
+
+# ── The document set (see "THE DOCUMENT SET" above). ──
+DOC_DIR_GLOB = "docs"
+ROOT_DOCS = (
+    "README.md",
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+    "DEVELOPMENT.md",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md",
+)
+
+# Directories that never contribute a citation TARGET, for the no-git fallback only:
+# build output and caches.
+INDEX_SKIP_DIRS = {
+    "__pycache__",
+    ".git",
+    ".github",
+    "editor_build",
+    "node_modules",
+    ".pytest_cache",
+}
+
+# `path.py:NNN` or `path.py:NNN-MMM`, with or without surrounding backticks. The lookbehind
+# keeps `tex_roi.py` from matching inside `my_tex_roi.py`; the lookahead keeps `:12` from
+# matching the first half of `:123`.
+CITATION_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_][A-Za-z0-9_./-]*\.py):(\d+)(?:-(\d+))?(?![0-9])"
+)
+
+# A name "appears" if it appears as a whole word, optionally with a short English suffix
+# (`submit` in "submitted", `fetch` in "fetches"). Three letters is enough for -ed/-es/-ing
+# without letting `run` match `runtime`.
+_SUFFIX = r"[A-Za-z]{0,3}"
+
+
+class Citation:
+    """One `file.py:NNN` pointer found in a document."""
+
+    __slots__ = ("doc", "doc_line", "text", "path", "start", "end", "verdict", "detail")
+
+    def __init__(self, doc, doc_line, text, path, start, end):
+        self.doc = doc
+        self.doc_line = doc_line
+        self.text = text
+        self.path = path
+        self.start = start
+        self.end = end
+        self.verdict = "ok"          # ok | error | warning | module-level
+        self.detail = ""
+
+    def where(self):
+        return f"{self.doc}:{self.doc_line}"
+
+
+def read_text(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def tracked_files(root):
+    """Repo-relative paths git tracks under `root`, or None when git cannot answer.
+
+    Asked of git rather than inferred, because a working tree may carry untracked scratch
+    beside the repository and neither side of this check should see it (see THE DOCUMENT
+    SET, above). `None` means "fall back to walking the tree", never "nothing is tracked".
+    """
+    try:
+        top = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--show-toplevel"],
+            capture_output=True, timeout=60,
+        )
+        # `root` must BE the work tree's top, not a directory inside someone else's
+        # repository — otherwise a temporary tree under a checked-out parent would
+        # inherit that parent's file list and this check would judge the wrong tree.
+        if top.returncode != 0:
+            return None
+        said = top.stdout.decode("utf-8", "replace").strip()
+        if not said or os.path.normcase(os.path.abspath(said)) != os.path.normcase(
+                os.path.abspath(root)):
+            return None
+        out = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z"],
+            capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    names = out.stdout.decode("utf-8", "replace").split("\0")
+    files = {n.replace("\\", "/") for n in names if n}
+    return files or None
+
+
+def build_index(root, tracked=None):
+    """basename and repo-relative path -> [repo-relative paths] for every .py in the tree."""
+    index = {}
+
+    def add(rel):
+        index.setdefault(rel.rsplit("/", 1)[-1], []).append(rel)
+        index.setdefault(rel, []).append(rel)
+
+    if tracked is not None:
+        for rel in sorted(tracked):
+            if rel.endswith(".py") and os.path.isfile(os.path.join(root, rel)):
+                add(rel)
+        return index
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in INDEX_SKIP_DIRS]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            add(os.path.relpath(os.path.join(dirpath, name), root).replace("\\", "/"))
+    return index
+
+
+def resolve(index, cited):
+    """Resolve a cited path to one repo-relative path, or return (None, reason)."""
+    cited = cited.replace("\\", "/")
+    for key in (cited, cited.rsplit("/", 1)[-1]):
+        hits = sorted(set(index.get(key, ())))
+        if not hits:
+            continue
+        if len(hits) == 1:
+            return hits[0], ""
+        # A bare basename with several matches means the root-level module unless the
+        # citation said otherwise (`tex_runtime/noise.py` resolves exactly).
+        at_root = [h for h in hits if "/" not in h]
+        if len(at_root) == 1:
+            return at_root[0], ""
+        return None, "ambiguous: " + ", ".join(hits)
+    return None, "no such file in this tree"
+
+
+_SPAN_CACHE = {}
+
+
+def symbol_spans(root, rel):
+    """[(lineno, end_lineno, name, (ancestor names...))] for every def/class in a module."""
+    if rel in _SPAN_CACHE:
+        return _SPAN_CACHE[rel]
+    spans = []
+    try:
+        tree = ast.parse(read_text(os.path.join(root, rel)))
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        _SPAN_CACHE[rel] = spans
+        return spans
+
+    stack = []
+
+    def walk(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                stack.append(child.name)
+                spans.append(
+                    (child.lineno, child.end_lineno or child.lineno, child.name, tuple(stack))
+                )
+                walk(child)
+                stack.pop()
+            else:
+                walk(child)
+
+    walk(tree)
+    _SPAN_CACHE[rel] = spans
+    return spans
+
+
+def innermost(spans, line):
+    """The tightest def/class covering `line`, or None when the line is at module scope."""
+    best = None
+    for lo, hi, name, chain in spans:
+        if lo <= line <= hi and (best is None or (hi - lo) < (best[1] - best[0])):
+            best = (lo, hi, name, chain)
+    return best
+
+
+def overlapping_names(spans, start, end):
+    """Every symbol name any part of the cited range touches, ancestors included."""
+    names = set()
+    for lo, hi, _name, chain in spans:
+        if not (hi < start or lo > end):
+            names.update(chain)
+    return names
+
+
+def sentence_at(text, start, end):
+    """The citing SENTENCE: out to the nearest `.`/`!`/`?` that is followed by whitespace,
+    or to a blank line, whichever is nearer. Run-on is the permissive direction, so an
+    abbreviation that fails to split only widens the window.
+
+    Sentence beat paragraph on measurement (see THE SCOPE, in the module docstring): it
+    costs three more warnings on this tree and all three are genuinely wrong pointers the
+    paragraph window hid behind a neighbouring sentence."""
+    lo = start
+    while lo > 0:
+        ch = text[lo - 1]
+        if ch in ".!?" and text[lo:lo + 1] in (" ", "\n", ""):
+            break
+        if ch == "\n" and lo > 1 and text[lo - 2] == "\n":
+            break
+        lo -= 1
+    hi = end
+    while hi < len(text):
+        if text[hi] in ".!?" and text[hi + 1:hi + 2] in (" ", "\n", ""):
+            hi += 1
+            break
+        if text[hi] == "\n" and text[hi + 1:hi + 2] == "\n":
+            break
+        hi += 1
+    return text[lo:hi]
+
+
+def names_a_symbol(context, names):
+    """True when the citing sentence names any of `names` (whole word, short suffix ok)."""
+    for name in names:
+        if name.startswith("__"):
+            continue  # `__init__` is named by its class, not by itself
+        pattern = r"(?<![A-Za-z0-9_])" + re.escape(name) + _SUFFIX + r"(?![A-Za-z0-9_])"
+        if re.search(pattern, context):
+            return True
+    return False
+
+
+def document_set(root, tracked=None):
+    """The scanned documents, in a deterministic order."""
+    if tracked is None:
+        tracked = tracked_files(root)
+    docs = []
+    doc_dir = os.path.join(root, DOC_DIR_GLOB)
+    if os.path.isdir(doc_dir):
+        for name in sorted(os.listdir(doc_dir)):
+            rel = f"{DOC_DIR_GLOB}/{name}"
+            if not name.endswith(".md"):
+                continue
+            if tracked is not None and rel not in tracked:
+                continue
+            docs.append(rel)
+    for name in ROOT_DOCS:
+        if not os.path.isfile(os.path.join(root, name)):
+            continue
+        if tracked is not None and name not in tracked:
+            continue
+        docs.append(name)
+    return docs
+
+
+def iter_citations(root, rel_doc):
+    """Every citation in one document, skipping fenced code blocks."""
+    text = read_text(os.path.join(root, rel_doc))
+    fence_spans = []
+    offset = 0
+    open_at = None
+    for line in text.split("\n"):
+        if line.strip().startswith("```"):
+            if open_at is None:
+                open_at = offset
+            else:
+                fence_spans.append((open_at, offset + len(line)))
+                open_at = None
+        offset += len(line) + 1
+    if open_at is not None:
+        fence_spans.append((open_at, len(text)))
+
+    for match in CITATION_RE.finditer(text):
+        if any(lo <= match.start() < hi for lo, hi in fence_spans):
+            continue
+        end = int(match.group(3)) if match.group(3) else int(match.group(2))
+        yield (
+            Citation(
+                rel_doc,
+                text.count("\n", 0, match.start()) + 1,
+                match.group(0),
+                match.group(1),
+                int(match.group(2)),
+                end,
+            ),
+            text,
+            match,
+        )
+
+
+def check(root):
+    """Judge every citation in the scanned set. Returns (citations, stats)."""
+    tracked = tracked_files(root)
+    index = build_index(root, tracked)
+    out = []
+    stats = {"total": 0, "ok": 0, "error": 0, "warning": 0, "module-level": 0,
+             "source": "git" if tracked is not None else "walk"}
+    for rel_doc in document_set(root, tracked):
+        for cit, text, match in iter_citations(root, rel_doc):
+            stats["total"] += 1
+            out.append(cit)
+
+            target, reason = resolve(index, cit.path)
+            if target is None:
+                cit.verdict, cit.detail = "error", reason
+                stats["error"] += 1
+                continue
+
+            source = read_text(os.path.join(root, target)).splitlines()
+            n = len(source)
+            if cit.start > n:
+                cit.verdict = "error"
+                cit.detail = f"line {cit.start} is past EOF ({target} is {n} lines)"
+                stats["error"] += 1
+                continue
+            if cit.end > n:
+                cit.verdict = "error"
+                cit.detail = f"range ends at {cit.end}, past EOF ({target} is {n} lines)"
+                stats["error"] += 1
+                continue
+            if not source[cit.start - 1].strip():
+                cit.verdict = "error"
+                cit.detail = f"line {cit.start} of {target} is blank"
+                stats["error"] += 1
+                continue
+
+            spans = symbol_spans(root, target)
+            enclosing = innermost(spans, cit.start)
+            if enclosing is None:
+                cit.verdict = "module-level"
+                cit.detail = f"{target}:{cit.start} is at module scope — no symbol to name"
+                stats["module-level"] += 1
+                continue
+
+            candidates = overlapping_names(spans, cit.start, cit.end)
+            if not [c for c in candidates if not c.startswith("__")]:
+                cit.verdict = "module-level"
+                cit.detail = "only dunder symbols cover this line"
+                stats["module-level"] += 1
+                continue
+
+            if names_a_symbol(sentence_at(text, match.start(), match.end()), candidates):
+                cit.verdict = "ok"
+                cit.detail = enclosing[2]
+                stats["ok"] += 1
+            else:
+                cit.verdict = "warning"
+                cit.detail = (
+                    f"encloses `{'.'.join(enclosing[3])}` in {target}, "
+                    f"and no covering symbol is named in the citing sentence"
+                )
+                stats["warning"] += 1
+    return out, stats
+
+
+def main(argv=None):
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ap = argparse.ArgumentParser(description="Check `file.py:NNN` citations in the shipped docs.")
+    ap.add_argument("--root", default=here, help="repository checkout to check (default: this one)")
+    ap.add_argument("--budget", type=int, default=WARNING_BUDGET, help="pinned warning budget")
+    ap.add_argument("--list", action="store_true", help="print every citation and its verdict")
+    args = ap.parse_args(argv)
+
+    root = os.path.abspath(args.root)
+    citations, stats = check(root)
+
+    if args.list:
+        for cit in citations:
+            print(f"{cit.verdict:12s} {cit.where():44s} {cit.text:34s} {cit.detail}")
+        print()
+
+    errors = [c for c in citations if c.verdict == "error"]
+    warnings = [c for c in citations if c.verdict == "warning"]
+
+    if errors:
+        print(f"DEAD CITATIONS ({len(errors)}) — each one is a claim about code that is not there:")
+        for cit in errors:
+            print(f"  {cit.where():44s} `{cit.text}` — {cit.detail}")
+        print()
+    # The warning list is printed only when it is actionable — over the budget, or under it
+    # and owed a re-pin. At the pin it is the ratchet's standing debt, not news; `--list`
+    # shows it on demand. A gate that prints 28 lines on a green run trains its reader to
+    # scroll past them, which is how the dead citations got there in the first place.
+    if warnings and not args.list and len(warnings) != args.budget:
+        print(f"UNANCHORED CITATIONS ({len(warnings)}, budget {args.budget}):")
+        for cit in warnings:
+            print(f"  {cit.where():44s} `{cit.text}` — {cit.detail}")
+        print()
+
+    print(
+        f"CITATIONS {stats['total']} in {len(document_set(root))} docs "
+        f"({stats['source']}) | anchored {stats['ok']} | "
+        f"module-level {stats['module-level']} | "
+        f"warnings {len(warnings)}/{args.budget} | dead {len(errors)}"
+    )
+
+    if errors:
+        print("VERDICT RED — repair a dead citation by re-pointing it at the symbol "
+              "(name the function, fix the line). Never by deleting the claim.")
+        return 1
+    if len(warnings) > args.budget:
+        print(f"VERDICT RED — {len(warnings) - args.budget} unanchored citation(s) over the "
+              f"budget of {args.budget}. Name the enclosing symbol in the citing sentence; "
+              f"do not raise the budget.")
+        return 1
+    if len(warnings) < args.budget:
+        print(f"VERDICT RED — re-pin DOWN: WARNING_BUDGET is {args.budget}, the tree now "
+              f"has {len(warnings)}. The budget only moves down; move it.")
+        return 1
+    print("VERDICT GREEN")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

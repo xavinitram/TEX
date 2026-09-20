@@ -388,9 +388,9 @@ test before it starts, and cannot claim a win the instrument would not see.
 6. **The per-cook fixed pipeline, paid ten times on a whole-frame cook.** Per cook, at head:
    two tile plans (`tex_tiling._tile_plan:38` and `_halo_tile_plan:142`, both re-exported into
    `tex_engine` at `tex_engine.py:113`), `enforce_cache_budget` (`tex_memory.py:327`),
-   `trim_reserved_pool` (`tex_memory.py:766`) and `_disown_inputs` (`tex_buffers.py:158`) —
-   called from `tex_engine.py:1238-1242` — plus `fingerprint`, **once** since the per-cook key
-   became one string handed down from `prepare`.
+   `trim_reserved_pool` (`tex_memory.py:780`) and `_disown_inputs` (`tex_buffers.py:158`) —
+   all called from `tex_engine.run` (`tex_engine.py:1243-1253`) — plus `fingerprint`, **once**
+   since the per-cook key became one string handed down from `prepare`.
 
    **Who buys the free-VRAM reading, corrected.** An earlier reading of this item attributed
    the **7 of 10** stages that issue `torch.cuda.mem_get_info` on an `all_dirty` frame to the
@@ -419,16 +419,17 @@ test before it starts, and cannot claim a win the instrument would not see.
    *Shows fixed as:* `cuda.kernels` on `pan` going **26 → 22** and `alloc.allocated`
    **22 → 18**.
 8. **Two lexes for a never-seen program.** `TEXCache.fingerprint` (`tex_cache.py:344`) calls
-   `param_only_names` (`tex_marshalling.py:830`), which tokenizes; the compile then tokenizes
+   `param_only_names` (`tex_marshalling.py:837`), which tokenizes; the compile then tokenizes
    again. The counts track exactly — `param_only_names` equals `fingerprint` in every column of
    §4.1 — and `fingerprint` itself is called **twice per cook**.
    *Shows fixed as:* `TEXCache.fingerprint` and `param_only_names` both going **2 → 1** per
    cook, and the `prewarm` warm-up tick's `Lexer.tokenize` falling from **20 to 10** (one lex
    per never-seen program instead of two — the steady prewarm ticks already read 10 because
    `param_only_names` memoizes on the source after first sight).
-9. **A full `TypeChecker.check` on every disk-cache reload.** `tex_cache.py:618` re-runs the
-   checker to regenerate a `type_map` with valid `id()` keys after unpickling an already
-   optimized program. `prewarm` reads **20** checks for ten programs.
+9. **A full `TypeChecker.check` on every disk-cache reload.** `TEXCache._load_from_disk`
+   (`tex_cache.py:643-649`) re-runs the checker to regenerate a `type_map` with valid `id()`
+   keys after unpickling an already optimized program. `prewarm` reads **20** checks for ten
+   programs.
    *Shows fixed as:* `TypeChecker.check` on `prewarm` going **20 → 10**.
 
 ## 7. The deferred tier: timing, at a release sitting
