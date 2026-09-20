@@ -1948,6 +1948,31 @@ def main():
     test_perf3_the_rounded_key_is_detected(r)
     test_perf3_the_radius_rule_is_the_one_the_key_assumes(r)
 
+    # PERF-4: the two remaining front-end re-scans. The lazy analysis parses a source ONCE
+    # (its fold works on an `ast_nodes.clone_tree` copy of a memoized parse) and the ROI
+    # halo scan traverses the program once instead of twice-plus-a-re-descent — both proved
+    # against the pre-change implementations over every shipped example and the comp.
+    from test_perf4_front_end_rescans import (
+        test_perf4_lazy_answers_are_identical,
+        test_perf4_a_lazy_source_is_parsed_once,
+        test_perf4_the_lazy_clone_is_load_bearing,
+        test_perf4_the_lazy_memo_hands_out_no_shared_ast,
+        test_perf4_lazy_oracle_sensitive_rows,
+        test_perf4_halo_answers_are_identical,
+        test_perf4_halo_corpus_is_not_vacuous,
+        test_perf4_the_halo_scan_visits_each_node_once,
+        test_perf4_halo_mutants_are_caught,
+    )
+    test_perf4_lazy_answers_are_identical(r)
+    test_perf4_a_lazy_source_is_parsed_once(r)
+    test_perf4_the_lazy_clone_is_load_bearing(r)
+    test_perf4_the_lazy_memo_hands_out_no_shared_ast(r)
+    test_perf4_lazy_oracle_sensitive_rows(r)
+    test_perf4_halo_answers_are_identical(r)
+    test_perf4_halo_corpus_is_not_vacuous(r)
+    test_perf4_the_halo_scan_visits_each_node_once(r)
+    test_perf4_halo_mutants_are_caught(r)
+
     success = r.summary()
     return 0 if success else 1
 

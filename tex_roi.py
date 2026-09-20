@@ -469,16 +469,6 @@ def _is_halo_call(n, fm) -> bool:
     return isinstance(fp, tuple) and len(fp) >= 1 and fp[0] in ("halo", "halo_arg")
 
 
-def _subtree_has_halo(node, fm) -> bool:
-    stack = [node]
-    while stack:
-        n = stack.pop()
-        if _is_halo_call(n, fm):
-            return True
-        stack.extend(iter_child_nodes(n))
-    return False
-
-
 def _write_target_name(tgt, bindings_only: bool = False):
     """The base binding/variable name an assignment writes, or None if un-nameable.
 
@@ -537,41 +527,74 @@ def _has_ungrounded_halo(program) -> bool:
         ROI-5."""
     fm = _footmap()
 
-    def _scan(node, ungrounded: bool) -> bool:
-        if ungrounded and _is_halo_call(node, fm):
-            return True
+    # PERF-4: ONE traversal answers both cases. It used to take two (a recursive `_scan` for
+    # case (1), then a stack walk for case (2)) plus a `_subtree_has_halo` that re-descended
+    # every initializer/value the outer walk was already descending — so a halo call deep in
+    # an expression was visited once per ancestor statement. `_visit` returns "this subtree
+    # contains a halo call" to its parent, which is the same question `_subtree_has_halo`
+    # answered, computed on the way back up instead of by a second descent. The posture is
+    # unchanged: same over-approximation, same order of decision (case (1) first, then the
+    # un-nameable target, then the name intersection).
+    #
+    # `ungrounded` is case (1)'s flag, exactly as `_scan` carried it. `scanned` records
+    # whether `_scan` would have REACHED this node at all: it descended only a VarDecl's
+    # initializer, while the case-(2) walk descends every child, so a halo under some other
+    # VarDecl field must not be allowed to answer case (1) that `_scan` never asked about.
+    state = {"case1": False, "unnameable": False}
+    halo_named: set = set()
+
+    def _visit(node, ungrounded: bool, scanned: bool) -> bool:
         cls = node.__class__
+        has = cls is FunctionCall and _is_halo_call(node, fm)
+        if has and ungrounded and scanned:
+            state["case1"] = True
         if cls is VarDecl:
-            return node.initializer is not None and _scan(node.initializer, True)
-        if cls in (FunctionDef, ForLoop, WhileLoop):
-            return any(_scan(ch, True) for ch in iter_child_nodes(node))
-        return any(_scan(ch, ungrounded) for ch in iter_child_nodes(node))
+            init = node.initializer
+            init_has = False
+            for ch in iter_child_nodes(node):
+                if init is not None and ch is init:
+                    if _visit(ch, True, scanned):
+                        init_has = has = True
+                elif _visit(ch, ungrounded, False):
+                    has = True
+            if init_has:
+                halo_named.add(node.name)
+            return has
+        inner = True if cls in (FunctionDef, ForLoop, WhileLoop) else ungrounded
+        if cls is Assignment:
+            value_has = False
+            for ch in iter_child_nodes(node):
+                if _visit(ch, inner, scanned):
+                    has = True
+                    if ch is node.value:
+                        value_has = True
+            if value_has:
+                # (2) a halo result assigned to a NAME that is read elsewhere — collected over
+                # the WHOLE tree, not just top-level statements. An `if` body is NOT a case-(1)
+                # reach boundary (a single grounded blur in a branch composes its reach fine),
+                # so a halo assigned to a name *inside* an `if`/loop/function body — `if (c) {
+                # @T = gauss_blur(@A,2); @OUT = gauss_blur(@T,2); }` — escapes case (1), yet
+                # still crosses the @T name boundary that the single-expression walk can't
+                # compose across (true reach ±12, walk infers ±6). The read side
+                # (`_collect_read_names`) already recurses into blocks, so the write side must
+                # too, or the intersection misses the nested producer and the cook halo
+                # under-sizes (ROI-edge contamination). A name carrying a mere INPUT (no halo)
+                # still never blocks.
+                tn = _write_target_name(node.target)
+                if tn is None:
+                    state["unnameable"] = True   # un-nameable halo target → block conservatively
+                else:
+                    halo_named.add(tn)
+            return has
+        for ch in iter_child_nodes(node):
+            if _visit(ch, inner, scanned):
+                has = True
+        return has
 
-    if any(_scan(s, False) for s in program.statements):
+    for s in program.statements:
+        _visit(s, False, True)
+    if state["case1"] or state["unnameable"]:
         return True
-
-    # (2) a halo result assigned to a NAME that is read elsewhere — collected over the WHOLE
-    # tree, not just top-level statements. An `if` body is NOT a case-(1) reach boundary (a
-    # single grounded blur in a branch composes its reach fine), so a halo assigned to a name
-    # *inside* an `if`/loop/function body — `if (c) { @T = gauss_blur(@A,2); @OUT =
-    # gauss_blur(@T,2); }` — escapes case (1), yet still crosses the @T name boundary that the
-    # single-expression walk can't compose across (true reach ±12, walk infers ±6). The read
-    # side (`_collect_read_names`) already recurses into blocks, so the write side must too, or
-    # the intersection misses the nested producer and the cook halo under-sizes (ROI-edge
-    # contamination). A name carrying a mere INPUT (no halo) still never blocks.
-    halo_named = set()
-    stack = list(program.statements)
-    while stack:
-        n = stack.pop()
-        cls = n.__class__
-        if cls is VarDecl and n.initializer is not None and _subtree_has_halo(n.initializer, fm):
-            halo_named.add(n.name)
-        elif cls is Assignment and _subtree_has_halo(n.value, fm):
-            tn = _write_target_name(n.target)
-            if tn is None:
-                return True   # un-nameable halo target → block conservatively
-            halo_named.add(tn)
-        stack.extend(iter_child_nodes(n))
     if not halo_named:
         return False
     reads = set()

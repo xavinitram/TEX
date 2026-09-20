@@ -47,7 +47,7 @@ from collections import OrderedDict
 
 from .tex_compiler.ast_nodes import (
     ASTNode, BindingRef, NumberLiteral, IfElse, WhileLoop, ForLoop,
-    FunctionDef, iter_child_nodes,
+    FunctionDef, clone_tree, iter_child_nodes,
 )
 from .tex_compiler.optimizer import _propagate_literal_locals, _fold_all
 
@@ -61,6 +61,40 @@ SCALAR_WIRE_TYPES = frozenset({"INT", "FLOAT", "BOOLEAN"})
 
 _MEMO_MAX = 256
 _memo: "OrderedDict[tuple, frozenset | None]" = OrderedDict()
+
+_PARSE_MEMO_MAX = 64
+#: source -> the UNFOLDED `parse_and_split` AST. Handed out only as `clone_tree` copies.
+_parse_memo: "OrderedDict[str, object]" = OrderedDict()
+
+
+def _pristine_program(code: str):
+    """The unfolded front-end AST for `code`, lexed and parsed AT MOST ONCE per source.
+
+    `_memo` above is keyed on the parameter VALUES because the analysis genuinely depends on
+    them (that is the whole of tier T3), so a moving widget misses it on every evaluation and
+    paid a full `Lexer.tokenize` + `Parser.parse` for a program whose SOURCE had not changed.
+    The parse is a function of the source alone, so it is cached here and each caller folds
+    its own `clone_tree` copy. The substitution and the optimizer's fold both rewrite in
+    place, which is why the entry is never handed out directly: a caller that mutated it
+    would poison every later evaluation of that source with the previous value's literals.
+
+    Same bounded-LRU discipline as `_memo`, with a smaller cap because an entry is a whole
+    AST rather than a frozenset; `clear_lazy_memo` drops it with the rest. A parse ERROR is
+    not cached — `lazy_required_bindings` catches it and answers None (keep everything).
+
+    DATA-6, invariant 11: through the one front end (`tex_cache.parse_and_split`) with NO
+    binding types — see `lazy_required_bindings` for why every dotted read must split back
+    to its base wire."""
+    hit = _parse_memo.get(code)
+    if hit is None:
+        from .tex_cache import parse_and_split
+        hit = parse_and_split(code, {})
+        _parse_memo[code] = hit
+        while len(_parse_memo) > _PARSE_MEMO_MAX:
+            _parse_memo.popitem(last=False)
+    else:
+        _parse_memo.move_to_end(code)
+    return hit
 
 
 def _fp32(v: float) -> float:
@@ -175,8 +209,9 @@ def lazy_required_bindings(code: str,
         _memo.move_to_end(key)
         return hit
     try:
-        # Fresh parse: the analysis mutates its AST, and no type info is
-        # needed (references are syntactic).
+        # A private copy of the source's ONE parse: the analysis mutates its AST, and no
+        # type info is needed (references are syntactic). The copy is what makes reusing
+        # the parse safe — see `_pristine_program`.
         # DATA-6, invariant 11: through the one front end with NO binding types, so every
         # dotted `@image.r` is split back to a swizzle of its BASE wire before the set is
         # collected. A program whose only reads of a wire are dotted must still REQUEST that
@@ -184,8 +219,7 @@ def lazy_required_bindings(code: str,
         # approximate (the wire skipped, the cook loud-failing E6003), and R1 only masks it
         # when the wire happens to be the first spatial one. Splitting everything is the
         # over-approximating side: a kept plane read would resolve to its base wire, whole.
-        from .tex_cache import parse_and_split
-        program = parse_and_split(code, {})
+        program = clone_tree(_pristine_program(code))
         subs = {
             name: NumberLiteral(value=_fp32(v), is_int=isinstance(v, (bool, int)))
             for name, v in param_values.items()
@@ -212,5 +246,6 @@ def lazy_required_bindings(code: str,
 
 
 def clear_lazy_memo() -> None:
-    """Test hook."""
+    """Test hook. Drops the answer memo AND the source-keyed parse memo behind it."""
     _memo.clear()
+    _parse_memo.clear()
