@@ -487,6 +487,75 @@ def test_bench2_free_memory_queries_per_tick(r: SubTestResult):
             r.fail(f"BENCH-2 free-memory {label} (cuda)", f"{type(e).__name__}: {e}")
 
 
+#: An attribute name no code object carries on any interpreter. Setting the harness's
+#: `_QUALNAME_ATTR` to it makes `frame_qualname` take the branch Python 3.10 takes.
+_FORCED_QUALNAME_ATTR = "co_qualname_absent_before_python_3_11"
+
+
+def _frame_rows(b, forced: bool, tag: str) -> dict:
+    """One real front-end call under the harness's OWN `FrameCounter`, so the row names the
+    `frames.*` family is built from are the thing measured — not a copy of its keying."""
+    from TEX_Wrangle.tex_cache import parse_and_split
+    src = "@OUT = vec4(@A.rgb * 1.25, 1.0);\n// " + tag + "\n"
+    saved = b._QUALNAME_ATTR
+    if forced:
+        b._QUALNAME_ATTR = _FORCED_QUALNAME_ATTR
+    try:
+        fc = b.FrameCounter()
+        with fc:
+            parse_and_split(src, {})
+        return dict(fc.counts)
+    finally:
+        b._QUALNAME_ATTR = saved
+
+
+def test_bench2_frame_rows_survive_a_missing_co_qualname(r: SubTestResult):
+    """PY-3.10 — a `frames.*` row name may not depend on `co_qualname`, which is 3.11+.
+
+    CI runs 3.10, 3.11 and 3.12. Below 3.11 a code object carries only `co_name`, so a method
+    frame would key `tex_compiler.lexer:tokenize` where every reader of this census — and
+    every pin spelled against it in `tests/test_perf7_compiled_cold.py` — reads
+    `tex_compiler.lexer:Lexer.tokenize`. A row that is spelled two ways depending on the
+    interpreter is a row that counts zero on one of them, which is the silent-zero failure
+    the filter probe above already exists for, one layer down.
+
+    Neither development box has a 3.10, so the fallback is forced through the harness's one
+    seam and required to produce the SAME key the native path produces here. Real proof is
+    the Linux 3.10 leg of CI."""
+    print("\n--- BENCH-2: frame row names survive a missing co_qualname (Python 3.10) ---")
+    b = _bench()
+    if not hasattr((lambda: 0).__code__, "co_qualname"):
+        r.skip("BENCH-2 qualname fallback", "this interpreter has no `co_qualname`, so the "
+               "native leg IS the fallback and the comparison would be vacuous")
+        return
+    try:
+        native = _frame_rows(b, False, "native")
+        forced = _frame_rows(b, True, "forced")
+    except Exception as e:
+        r.fail("BENCH-2 qualname fallback", f"{type(e).__name__}: {e}")
+        return
+    if b._QUALNAME_ATTR != "co_qualname":
+        r.fail("BENCH-2 qualname seam", f"the seam was left at {b._QUALNAME_ATTR!r}: every "
+               f"later row in this process would be measured through the fallback")
+        return
+    for row, bare in (("tex_compiler.lexer:Lexer.tokenize", "tex_compiler.lexer:tokenize"),
+                      ("tex_compiler.parser:Parser.parse", "tex_compiler.parser:parse")):
+        n, fb = native.get(row, 0), forced.get(row, 0)
+        if n < 1:
+            r.fail("BENCH-2 qualname drive", f"{row} counted 0 under the NATIVE resolver — "
+                   f"the drive does not reach it, so this row proves nothing about 3.10")
+        elif fb < 1:
+            r.fail("BENCH-2 qualname fallback", f"{row} counted {fb} with `co_qualname` "
+                   f"forced missing ({bare!r} read {forced.get(bare, 0)} instead): on Python "
+                   f"3.10 this census row is spelled differently from every pin against it")
+        elif forced.get(bare, 0):
+            r.fail("BENCH-2 qualname fallback", f"the fallback also wrote the bare-name row "
+                   f"{bare!r} ({forced[bare]}): two spellings of one function is the drift "
+                   f"this row exists to catch")
+        else:
+            r.ok(f"{row}: {n} native / {fb} with the pre-3.11 fallback forced, same key")
+
+
 def test_bench2_counters_are_not_inert(r: SubTestResult):
     """MUTATION GUARD — the ANIM-1 lesson applied to this file.
 

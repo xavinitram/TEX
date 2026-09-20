@@ -415,7 +415,7 @@ class FrameCounter:
                               exclude=_BENCH_PREFIXES)
         if rel is None:
             return
-        self.counts[_frame_key(rel, code)] += 1
+        self.counts[_frame_key(rel, code, frame)] += 1
 
     def __enter__(self):
         self._on = True
@@ -431,18 +431,92 @@ class FrameCounter:
         return dict(self.counts)
 
 
+#: The attribute a code object carries its QUALIFIED name in, read through this name and
+#: never spelled inline, so one test can force the pre-3.11 path on any interpreter. CI runs
+#: Python 3.10, 3.11 and 3.12; neither development box has a 3.10, so the seam is the only
+#: way the fallback below can be exercised before CI sees it.
+_QUALNAME_ATTR = "co_qualname"
+
+#: `(attr, id(code)) -> (code, qualname)`. The code object is held in the VALUE deliberately:
+#: `id()` is unique only among LIVE objects, so a memo that stored the address alone would
+#: hand a freed code object's answer to whatever was allocated at the same address next. The
+#: reference makes that impossible, at the cost of pinning the code objects a measured run
+#: touched — a harness-lifetime cost, paid once per function, which is what keeps the profile
+#: hook from doing an attribute derivation per FRAME.
+_QUALNAME_MEMO: dict = {}
+
+
+def _derive_qualname(code, frame) -> str:
+    """The 3.10 fallback: `Class.method` from the running frame, or the bare `co_name`.
+
+    A method frame binds its instance as `self` (a classmethod its class as `cls`), and the
+    class that actually DEFINES the running code is found through the MRO — `type(self)`
+    alone would label a method inherited by a subclass with the subclass's name, which is a
+    different row from the one the pins spell. The candidate is confirmed by identity against
+    the code object (`__code__ is code`), so a closure that merely closes over an enclosing
+    method's `self` — `f_locals` carries free variables too — is not mislabelled as a method
+    of that class; it keeps its bare name, which is what it had before this existed."""
+    name = code.co_name
+    locs = getattr(frame, "f_locals", None) if frame is not None else None
+    if not locs:
+        return name
+    for slot in ("self", "cls"):
+        obj = locs.get(slot)
+        if obj is None:
+            continue
+        owner = obj if isinstance(obj, type) else type(obj)
+        for klass in getattr(owner, "__mro__", ()):
+            fn = klass.__dict__.get(name)
+            if fn is None:
+                continue
+            target = getattr(fn, "__func__", fn)     # classmethod / staticmethod wrapper
+            if getattr(target, "__code__", None) is code:
+                return klass.__qualname__ + "." + name
+    return name
+
+
+def frame_qualname(code, frame=None) -> str:
+    """`code` -> the qualified name a row is keyed by, on every Python this project runs on.
+
+    THE BUG THIS EXISTS FOR. `co_qualname` is 3.11+. On 3.10 — which CI still runs, and which
+    neither box here has — a method's code object carries only `co_name`, so a hook keying
+    `module:co_name` spells `tex_compiler/lexer:tokenize` where every pin in the suite reads
+    `tex_compiler/lexer:Lexer.tokenize`. The pinned row then counts ZERO for ever: the
+    "this must not run" assertions pass vacuously and only the mutation guard notices, which
+    is precisely how it was found (the 3.10 leg red, 3.11 and 3.12 green). It is the same
+    silent-zero failure this harness already has one scar from — see `path_prefixes`.
+
+    On 3.11+ this returns `co_qualname` unchanged, so every key and every pin is
+    byte-identical to what it was before the fallback existed. Below that it derives the name
+    from the frame (`_derive_qualname`).
+
+    NOT derived, deliberately: a nested function's `<outer>.<locals>.<inner>`, and the name
+    of a method reached through a wrapper that does not expose `__func__`. Nothing in the
+    suite pins either by name, so on 3.10 such a frame keys by its bare name — a difference
+    in the `frames.*` CENSUS between interpreter versions, never in a pinned row. Build it
+    the day a pin needs it, not before."""
+    attr = _QUALNAME_ATTR
+    memo_key = (attr, id(code))
+    hit = _QUALNAME_MEMO.get(memo_key)
+    if hit is not None and hit[0] is code:
+        return hit[1]
+    qual = getattr(code, attr, None) or _derive_qualname(code, frame)
+    _QUALNAME_MEMO[memo_key] = (code, qual)
+    return qual
+
+
 _FRAME_KEY_MEMO: dict = {}
 
 
-def _frame_key(rel: str, code) -> str:
+def _frame_key(rel: str, code, frame=None) -> str:
     """`rel` is already the package-relative, `/`-separated path (package_relpath)."""
-    key = (rel, code.co_firstlineno, code.co_name)
+    # `_QUALNAME_ATTR` is part of the key, not read past it: a test that forces the pre-3.11
+    # path must not be served the native answer this memo warmed a moment earlier.
+    key = (_QUALNAME_ATTR, rel, code.co_firstlineno, code.co_name)
     hit = _FRAME_KEY_MEMO.get(key)
     if hit is None:
         mod = rel[:-3] if rel.endswith(".py") else rel
-        # co_qualname is 3.11+; CI runs 3.10 too, so fall back to the bare name.
-        qual = getattr(code, "co_qualname", None) or code.co_name
-        hit = _FRAME_KEY_MEMO[key] = f"{mod.replace('/', '.')}:{qual}"
+        hit = _FRAME_KEY_MEMO[key] = f"{mod.replace('/', '.')}:{frame_qualname(code, frame)}"
     return hit
 
 

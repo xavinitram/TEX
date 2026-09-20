@@ -88,6 +88,10 @@ _counts = load_counts_harness()
 _PKG_PREFIXES = _counts.path_prefixes(str(Path(__file__).parents[1]))
 #: Bound once: `_hook` runs on every call event, so it may not do a lookup per frame.
 _package_relpath = _counts.package_relpath
+#: And the ONE qualified-name resolver, for the same reason a second copy of the path filter
+#: is not allowed here: `co_qualname` is 3.11+, so below that a method has to be NAMED from
+#: its frame or every `Class.method` row in this file counts zero (see `frame_qualname`).
+_frame_qualname = _counts.frame_qualname
 
 #: Two programs that reach the compiled tier on CPU and take the codegen-only adapter
 #: (they call stdlib functions, so `_has_fn_calls` is set and `torch.compile` is never
@@ -174,8 +178,7 @@ class _Frames:
         if rel is None:
             return
         mod = rel[:-3] if rel.endswith(".py") else rel
-        # co_qualname is 3.11+; CI runs 3.10 too, so fall back to the bare name.
-        key = mod + ":" + (getattr(code, "co_qualname", None) or code.co_name)
+        key = mod + ":" + _frame_qualname(code, frame)
         self.counts[key] = self.counts.get(key, 0) + 1
 
     def __enter__(self):
@@ -188,7 +191,12 @@ class _Frames:
 
 
 class _FakeCode:
-    """The three attributes a profile hook reads, with a `co_filename` the caller chooses."""
+    """The three attributes a profile hook reads, with a `co_filename` the caller chooses.
+
+    `co_name` and `co_qualname` are spelled the SAME on purpose: the filter probes below run
+    under the native resolver and under the forced pre-3.11 fallback, and a synthetic frame
+    carries no `self`, so both paths must land on one row name for the probe to mean the same
+    thing on either. It is also what a module-level function looks like on 3.10."""
 
     co_firstlineno = 1
     co_name = "probe"
@@ -484,6 +492,97 @@ def test_perf7_the_counter_is_not_inert(r: SubTestResult):
         r.fail("PERF-7 mutation", f"defeating the codegen cache did not move the pin "
                f"(_CodeGen.build = {emitted}, {total} frames vs ceiling "
                f"{_FRAME_CEILING['blur_chain']}): the cold-cook rows cannot fail")
+
+
+#: An attribute name no code object carries, on any interpreter. Setting the harness's
+#: `_QUALNAME_ATTR` to it makes `frame_qualname` take the branch Python 3.10 takes, so the
+#: pre-3.11 keying can be measured on a box that has no 3.10 — which is every box here.
+_FORCED_ATTR = "co_qualname_absent_before_python_3_11"
+
+#: `(the row this file pins, the bare-name spelling a naive 3.10 hook would write instead)`.
+#: These three are the only `Class.method` rows in `_MUST_NOT_RUN`; every other row there and
+#: in `_EXACTLY_ONCE` is a module-level function, whose `co_name` IS its qualified name.
+_QUALNAME_ROWS = (
+    ("tex_compiler/lexer:Lexer.tokenize", "tex_compiler/lexer:tokenize"),
+    ("tex_compiler/parser:Parser.parse", "tex_compiler/parser:parse"),
+    ("tex_runtime/codegen:_CodeGen.build", "tex_runtime/codegen:build"),
+)
+
+
+def _drive_qualname_rows(tag: str, forced: bool) -> dict:
+    """Call the three pinned METHODS under the counter and return its rows.
+
+    Two distinct sources, both unique to `tag`: the program `try_compile` is handed is lexed
+    and parsed OUTSIDE the counted region (that is what `_front_end` is for), and PERF-5's
+    token offer would otherwise let the counted `parse_and_split` claim the stream that lex
+    produced — `Lexer.tokenize` would then legitimately not run and the row would read zero
+    for a reason that has nothing to do with the keying this row is about."""
+    from TEX_Wrangle.tex_cache import parse_and_split
+    from TEX_Wrangle.tex_runtime import codegen as _codegen
+
+    program, type_map, _bt, _fp = _front_end(_PROGRAMS["blur_chain"] + f"// prepared {tag}\n")
+    counted_src = _PROGRAMS["blur_chain"] + f"// counted {tag}\n"
+    saved = _counts._QUALNAME_ATTR
+    if forced:
+        _counts._QUALNAME_ATTR = _FORCED_ATTR
+    try:
+        f = _Frames()
+        with f:
+            parse_and_split(counted_src, {})
+            _codegen.try_compile(program, type_map)
+        return f.counts
+    finally:
+        _counts._QUALNAME_ATTR = saved
+
+
+def test_perf7_the_row_keys_survive_a_missing_co_qualname(r: SubTestResult):
+    """PY-3.10 — the row keys may not depend on `co_qualname`, which is 3.11+.
+
+    CI runs 3.10, 3.11 and 3.12. `co_qualname` arrived in 3.11, so on the 3.10 leg a method
+    frame used to key `tex_compiler/lexer:tokenize` while every pin in this file reads
+    `tex_compiler/lexer:Lexer.tokenize`. Those rows then counted ZERO whatever the tree did:
+    the three `Class.method` entries in `_MUST_NOT_RUN` passed vacuously and the mutation
+    guard above reported them "counted 0 while being called directly" — 3.10 red, 3.11 and
+    3.12 green, which is the shape of the run this row was written for.
+
+    NEITHER development box has a 3.10 interpreter, so the fallback cannot be run here by
+    running it. It is forced instead, through the one seam the resolver reads its attribute
+    name from, and two things are asserted: that the three rows are counted at all with the
+    fallback taken (the half that was red), and that the key it derives is the SAME string
+    the native path produces on this interpreter (the half that stops the fallback drifting
+    away from 3.11+ unnoticed). The real proof is the Linux 3.10 leg of CI."""
+    print("\n--- PERF-7: the row keys survive a missing co_qualname (Python 3.10) ---")
+    if not hasattr((lambda: 0).__code__, "co_qualname"):
+        r.skip("PERF-7 qualname fallback", "this interpreter has no `co_qualname`, so the "
+               "native leg IS the fallback and the comparison would be vacuous")
+        return
+    try:
+        native = _drive_qualname_rows("native", forced=False)
+        forced = _drive_qualname_rows("forced", forced=True)
+    except Exception as e:
+        r.fail("PERF-7 qualname fallback", f"{type(e).__name__}: {e}")
+        return
+    if _counts._QUALNAME_ATTR != "co_qualname":
+        r.fail("PERF-7 qualname seam", f"the seam was left at {_counts._QUALNAME_ATTR!r}: "
+               f"every later row in this process would be measured through the fallback")
+        return
+    for row, bare in _QUALNAME_ROWS:
+        n, fb = native.get(row, 0), forced.get(row, 0)
+        if n < 1:
+            r.fail("PERF-7 qualname drive", f"{row} counted 0 under the NATIVE resolver — "
+                   f"the drive does not reach it, so this row proves nothing about 3.10")
+        elif fb < 1:
+            r.fail("PERF-7 qualname fallback", f"{row} counted {fb} with `co_qualname` forced "
+                   f"missing while being called directly ({bare!r} read "
+                   f"{forced.get(bare, 0)} instead): on Python 3.10 this row's zero above is "
+                   f"vacuous")
+        elif forced.get(bare, 0):
+            r.fail("PERF-7 qualname fallback", f"the fallback also wrote the bare-name row "
+                   f"{bare!r} ({forced[bare]}): two spellings of one function is the drift "
+                   f"this row exists to catch")
+        else:
+            r.ok(f"{row}: {n} native / {fb} with the pre-3.11 fallback forced, same key, and "
+                 f"no bare-name {bare!r} row")
 
 
 if __name__ == "__main__":   # derivation helper: print the readings this file pins
