@@ -45,13 +45,33 @@ def _run(code, device):
                                  output_names=["OUT"], precision="fp32")["OUT"]
 
 
-def _max_run_to_run(code, device, runs=5):
-    ref = _run(code, device)
+def worst_diff(ref, repeats):
+    """The largest elementwise |a - b| between `ref` and any tensor in `repeats`, in fp32.
+
+    Lifted out of `_max_run_to_run` so a fabricated pair can drive it: what the pin decides is
+    a function of the tensors, never of the device that produced them.
+    """
     worst = 0.0
-    for _ in range(runs - 1):
-        cur = _run(code, device)
+    for cur in repeats:
         worst = max(worst, (cur.float() - ref.float()).abs().max().item())
     return worst
+
+
+def band_verdict(worst, band, soft):
+    """`"within"`, `"warn"` or `"out"` — the decision the CUDA half makes on a measurement.
+
+    `soft` is `TEX_DETERMINISM_SOFT=1`: it downgrades an out-of-band reading to a warning so a
+    torch upgrade that reorders atomic-add can be triaged instead of blocking, and it must
+    never turn an IN-band reading into anything other than `"within"`.
+    """
+    if worst <= band:
+        return "within"
+    return "warn" if soft else "out"
+
+
+def _max_run_to_run(code, device, runs=5):
+    ref = _run(code, device)
+    return worst_diff(ref, [_run(code, device) for _ in range(runs - 1)])
 
 
 # A1-4: CUDA scatter determinism is now GATED on a band (was WARN-first). Measured
@@ -88,10 +108,11 @@ def test_prlp5_determinism_pin(r: SubTestResult):
         try:
             worst = _max_run_to_run(code, "cuda")
             worst_all = max(worst_all, worst)
-            if worst <= _CUDA_DET_BAND:
+            verdict = band_verdict(worst, _CUDA_DET_BAND, soft)
+            if verdict == "within":
                 r.ok(f"CUDA {label}: run-to-run {worst:.1e} within gated band "
                      f"(<= {_CUDA_DET_BAND:.0e})")
-            elif soft:
+            elif verdict == "warn":
                 r.ok(f"[WARN] CUDA {label} run-to-run {worst:.2e} > band — torch atomic-add "
                      "ordering changed (soft mode; suite stays green). Decide: scoped "
                      "use_deterministic_algorithms (~1.48x) vs re-band.")
@@ -103,3 +124,49 @@ def test_prlp5_determinism_pin(r: SubTestResult):
         except Exception as e:
             r.fail(f"PR-LP5 CUDA {label}", f"{type(e).__name__}: {e}")
     LAST_CUDA_DET_VAR = worst_all  # release gate (TST-8) reads this
+
+
+def test_prlp5_the_determinism_comparator_is_not_inert(r: SubTestResult):
+    """The CUDA half is invariant 9's named enforcer and it only runs on a box with a GPU, so
+    on the one automated lane the row above skips and nothing here is asserted at all. These
+    witnesses are fabricated fp32 pairs, so they run everywhere and prove the mutation shape:
+    a bitwise-identical pair reads 0.0 and passes, a pair that differs by a discrete jump reads
+    that jump and REDS, and `TEX_DETERMINISM_SOFT` downgrades exactly the out-of-band case and
+    nothing else. They also pin the CPU caveat's own bound, which is the half that does run
+    here: 1e-5 has to be a number the comparator can exceed.
+    """
+    print("\n--- PR-LP5: the determinism comparator fires (no GPU needed) ---")
+    ref = torch.zeros(1, 8, 8, 3)
+    ref[0, 3, 3] = 0.25
+    same = ref.clone()
+    reordered = ref.clone()
+    reordered[0, 3, 3] += 1e-3        # the discrete jump an atomic-add reorder looks like
+    a_ulp = ref.clone()
+    a_ulp[0, 3, 3, 0] = torch.nextafter(a_ulp[0, 3, 3, 0], torch.tensor(1.0))
+
+    checks = [
+        # (label, repeats, band, soft, expected worst-is-zero, expected verdict)
+        ("bitwise-identical runs", [same, same], _CUDA_DET_BAND, False, True, "within"),
+        ("a reordered accumulation", [same, reordered], _CUDA_DET_BAND, False, False, "out"),
+        ("soft mode downgrades it", [same, reordered], _CUDA_DET_BAND, True, False, "warn"),
+        ("soft mode leaves a clean run alone", [same], _CUDA_DET_BAND, True, True, "within"),
+        # One fp32 ulp at 0.25 is ~1.5e-8, comfortably above the 1e-9 band: the band is tight
+        # enough that a single-ulp drift is a decision, which is the claim the pin makes.
+        ("one fp32 ulp is already out of band", [a_ulp], _CUDA_DET_BAND, False, False, "out"),
+        # The CPU caveat's loose bound is the half that runs on every box.
+        ("the CPU caveat bound can be exceeded", [reordered], 1e-5, False, False, "out"),
+    ]
+    bad = []
+    for label, repeats, band, soft, want_zero, want in checks:
+        worst = worst_diff(ref, repeats)
+        verdict = band_verdict(worst, band, soft)
+        if (worst == 0.0) is not want_zero:
+            bad.append(f"{label}: worst {worst:.3e}, expected {'0.0' if want_zero else 'non-zero'}")
+        elif verdict != want:
+            bad.append(f"{label}: verdict {verdict!r}, expected {want!r} "
+                       f"(worst {worst:.3e}, band {band:.0e}, soft={soft})")
+    if bad:
+        r.fail("PR-LP5 comparator witness", "\n  ".join(bad))
+    else:
+        r.ok(f"the determinism comparator decides all {len(checks)} fabricated cases "
+             f"correctly, with no CUDA in the room")

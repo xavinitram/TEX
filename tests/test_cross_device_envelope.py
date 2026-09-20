@@ -79,6 +79,27 @@ def _run_on(code, device, img):
     return out["OUT"]
 
 
+def envelope_verdict(cpu, gpu, band, structural, scale=1.0):
+    """`(within, metric, limit, note)` for one probe's fp32 device pair.
+
+    The comparator, lifted out of the loop so something that is not a GPU can drive it. Both
+    tensors are already fp32 and on the CPU; nothing here is device-aware, which is the point —
+    the decision was never about CUDA, only its inputs were.
+
+    `structural` picks total-energy relative error over pointwise maxdiff, because scatter's
+    coordinate rounding legally RELOCATES a quantum to a neighbouring pixel: a large pointwise
+    difference that the sum conserves. The two arms therefore disagree on exactly that shape,
+    and `test_prlp1_the_envelope_comparator_is_not_inert` drives the disagreement.
+    """
+    limit = band * scale
+    if structural:
+        s_cpu, s_gpu = cpu.sum().item(), gpu.sum().item()
+        rel = abs(s_cpu - s_gpu) / (abs(s_cpu) + 1e-8)
+        return rel <= limit, rel, limit, f"sum cpu {s_cpu:.4f} vs gpu {s_gpu:.4f}"
+    md = (cpu - gpu).abs().max().item()
+    return md <= limit, md, limit, ""
+
+
 def test_prlp1_cross_device_envelope(r: SubTestResult):
     print("\n--- PR-LP1: cross-device parity envelope (same-device is the real contract) ---")
     if not torch.cuda.is_available():
@@ -91,23 +112,64 @@ def test_prlp1_cross_device_envelope(r: SubTestResult):
         try:
             cpu = _run_on(code, "cpu", img).float()
             gpu = _run_on(code, "cuda", img).float().cpu()
-            limit = band * scale
+            within, metric, limit, note = envelope_verdict(cpu, gpu, band, structural, scale)
             if structural:
-                s_cpu, s_gpu = cpu.sum().item(), gpu.sum().item()
-                rel = abs(s_cpu - s_gpu) / (abs(s_cpu) + 1e-8)
-                if rel > limit:
+                if not within:
                     r.fail(f"PR-LP1 {label}",
-                           f"total-energy rel {rel:.2e} > band {limit:.1e} "
-                           f"(sum cpu {s_cpu:.4f} vs gpu {s_gpu:.4f})")
+                           f"total-energy rel {metric:.2e} > band {limit:.1e} ({note})")
                 else:
-                    r.ok(f"{label}: energy-conserving across devices (rel {rel:.1e} <= {limit:.1e})")
+                    r.ok(f"{label}: energy-conserving across devices "
+                         f"(rel {metric:.1e} <= {limit:.1e})")
             else:
-                md = (cpu - gpu).abs().max().item()
-                if md > limit:
+                if not within:
                     r.fail(f"PR-LP1 {label}",
-                           f"cross-device maxdiff {md:.2e} > band {limit:.1e} "
+                           f"cross-device maxdiff {metric:.2e} > band {limit:.1e} "
                            f"— a driver/torch change blew the envelope; re-band deliberately")
                 else:
-                    r.ok(f"{label}: within envelope (maxdiff {md:.1e} <= band {limit:.1e})")
+                    r.ok(f"{label}: within envelope (maxdiff {metric:.1e} <= band {limit:.1e})")
         except Exception as e:
             r.fail(f"PR-LP1 {label}", f"{type(e).__name__}: {e}")
+
+
+def test_prlp1_the_envelope_comparator_is_not_inert(r: SubTestResult):
+    """Invariant 9's enforcer runs only on a box with a GPU, so on the one automated lane the
+    row above is a skip and this file asserts nothing about the comparator at all. These
+    witnesses are fabricated fp32 pairs, so they run everywhere and prove the mutation shape:
+    a pair outside its band must RED, a pair inside it must not, the two arms must disagree on
+    the relocation shape `structural` exists for, and `TEX_ENVELOPE_SCALE` must actually widen
+    the band rather than be read and dropped.
+    """
+    print("\n--- PR-LP1: the envelope comparator fires (no GPU needed) ---")
+    base = torch.zeros(1, 8, 8, 3)
+    base[0, 2, 2] = 1.0
+
+    drifted = base.clone()
+    drifted[0, 2, 2] += 1e-3                       # a magnitude drift: both arms should see it
+    moved = base.clone()
+    moved[0, 2, 2] = 0.0
+    moved[0, 2, 3] = 1.0                           # a relocation: pointwise-huge, sum-conserved
+
+    checks = [
+        ("pointwise, inside the band", base, base, 1e-5, False, 1.0, True),
+        ("pointwise, outside the band", base, drifted, 1e-5, False, 1.0, False),
+        ("structural, inside the band", base, base, 1e-6, True, 1.0, True),
+        ("structural, outside the band", base, drifted, 1e-6, True, 1.0, False),
+        # The arms must disagree here, or `structural` is decoration: a relocated quantum is a
+        # 1.0 pointwise diff and a perfectly conserved sum.
+        ("pointwise sees a relocation", base, moved, 1e-3, False, 1.0, False),
+        ("structural forgives a relocation", base, moved, 1e-6, True, 1.0, True),
+        # TEX_ENVELOPE_SCALE is the deliberate re-band lever; a scale that does not widen the
+        # limit is a knob that reads as working and is not.
+        ("a scale of 1000 widens the band", base, drifted, 1e-5, False, 1000.0, True),
+    ]
+    bad = []
+    for label, a, b, band, structural, scale, want in checks:
+        within, metric, limit, _note = envelope_verdict(a, b, band, structural, scale)
+        if within is not want:
+            bad.append(f"{label}: within={within}, expected {want} "
+                       f"(metric {metric:.2e}, limit {limit:.1e})")
+    if bad:
+        r.fail("PR-LP1 comparator witness", "\n  ".join(bad))
+    else:
+        r.ok(f"the envelope comparator decides all {len(checks)} fabricated cases correctly, "
+             f"with no CUDA in the room")
