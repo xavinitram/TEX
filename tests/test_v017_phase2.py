@@ -244,18 +244,69 @@ _OVER_HARD_BASELINE = frozenset({
 _HEADROOM_FLOOR = {"tex_engine.py": 1700}
 
 
+def _product_packages(root) -> list:
+    """The package directories the REG-2 ratchet scans — DERIVED from the tree.
+
+    This list used to be the literal `("tex_compiler", "tex_runtime", "")`, and a literal is
+    a gate that cannot fire on a package nobody remembered to add to it: `tex_io/` was
+    invisible to the ratchet from the day it was created, so a new module there could cross
+    the hard budget without a word. Derived instead, from two facts already in the tree:
+
+      * a product package is a top-level directory carrying an `__init__.py` (it is importable
+        as part of the node), and
+      * it is not one of the development directories `.comfyignore` keeps out of the shipped
+        archive (PUB-1 restricts that file to plain `name/` patterns, so reading it is exact).
+
+    A package added tomorrow is scanned tomorrow, with no edit here. The empty string is the
+    package root itself.
+    """
+    import os
+    ignored = set()
+    try:
+        with open(os.path.join(root, ".comfyignore"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    ignored.add(line.rstrip("/"))
+    except OSError:
+        pass
+    subs = [""]
+    for name in sorted(os.listdir(root)):
+        if name.startswith((".", "_")) or name in ignored:
+            continue
+        d = os.path.join(root, name)
+        if os.path.isdir(d) and os.path.isfile(os.path.join(d, "__init__.py")):
+            subs.append(name)
+    return subs
+
+
 def test_reg2_loc_budget(r: SubTestResult):
     print("\n--- REG-2: module LOC budget (soft policy + ratchet) ---")
     import os
     root = _repo_root()
+    subs = _product_packages(root)
     loc = {}
-    for sub in ("tex_compiler", "tex_runtime", ""):
+    for sub in subs:
         d = os.path.join(root, sub)
         for fn in sorted(os.listdir(d)):
             if fn.endswith(".py") and not fn.startswith("__"):
                 rel = f"{sub}/{fn}" if sub else fn
                 with open(os.path.join(d, fn), encoding="utf-8") as f:
                     loc[rel] = sum(1 for _ in f)
+    r.ok(f"scanned {len(loc)} module(s) across "
+         + ", ".join(repr(s) if s else "<root>" for s in subs))
+
+    # The derivation must not silently scan NOTHING: every module this file pins by name has
+    # to be one the scan can see, or the pin is decoration and the derivation is broken.
+    try:
+        blind = sorted(m for m in (set(_OVER_HARD_BASELINE) | set(_HEADROOM_FLOOR))
+                       if m not in loc)
+        assert not blind, (
+            "module(s) pinned by this file are outside the scanned packages — either the "
+            "package derivation broke or the module moved/was renamed: " + str(blind))
+        r.ok("every pinned module is inside the scanned set")
+    except Exception as e:
+        r.fail("REG-2 scan coverage", f"{type(e).__name__}: {e}")
 
     over_hard = {m for m, n in loc.items() if n > _LOC_HARD}
     over_soft = {m for m, n in loc.items() if _LOC_SOFT < n <= _LOC_HARD}
