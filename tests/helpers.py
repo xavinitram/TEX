@@ -72,9 +72,13 @@ __all__ = [
     "run_both", "assert_equiv", "check_val", "make_img", "make_latent",
     "make_gradient_frame", "devices",
     "cold_engine_state", "lint_sources", "armed_profiler",
-    "load_counts_harness",
     "_MAX_LOOP_ITERATIONS",
 ]
+# `load_counts_harness` is deliberately NOT in `__all__`. HOOK-4 pins this list to the set it
+# held at v0.35.0 (`tests/test_hook4_testkit.py::test_hook4_bare_star_import_yields_the_base
+# _sha_set`) because `from helpers import *` is a surface an embedding host's own suite binds,
+# and a name added here changes what that star yields for everyone. Its two callers import it
+# by name, which needs no entry and asks nothing of anybody else.
 
 
 # ── Test Result Accumulator ───────────────────────────────────────────

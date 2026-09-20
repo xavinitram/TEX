@@ -67,6 +67,9 @@ import os
 import sys
 
 from helpers import *
+# By name, not by star: `helpers.__all__` is pinned to its v0.35.0 set (HOOK-4), because
+# `from helpers import *` is a surface a host's own suite binds.
+from helpers import load_counts_harness
 
 from TEX_Wrangle.tex_runtime import compiled as _compiled
 from TEX_Wrangle.tex_runtime.compiled import execute_compiled, clear_compiled_cache

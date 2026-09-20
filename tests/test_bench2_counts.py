@@ -27,6 +27,9 @@ PORTABILITY. CPU, no ComfyUI, no compiler, no CUDA. The CUDA row SKIPs (it does 
 without a device. Runs at 96^2 with a 48^2 window and four ticks to stay inside a few seconds.
 """
 from helpers import *
+# By name, not by star: `helpers.__all__` is pinned to its v0.35.0 set (HOOK-4), because
+# `from helpers import *` is a surface a host's own suite binds.
+from helpers import load_counts_harness
 
 
 # The harness shape these pins were measured in. Changing any of these re-derives every pin:
