@@ -291,3 +291,60 @@ ONE `governor_budget`, evicting cheapest-to-rebuild first. Keys and lifecycles s
 eviction **arbitration** centralizes, so the count stays 19. It preserves the stale-graph-address
 safety by pin-and-skip / `free_graphs_only` (NOT `clear_graph_cache`), and the per-cook
 `enforce_cache_budget` is unchanged — the governor is a separate opt-in layer an engine host drives.
+
+### The enumerated register (DOC-7d)
+
+The number in this section's title counts the *architectural* caches as the register stood when
+CACHE-2 closed it; the table below is the complete machine-checked census and is larger, because
+several memo stores have landed since without the count sentence moving. `test_doc7d_cache_store_enumeration`
+in `tests/test_v018_docs.py` takes an AST census of every module-level mutable container in the
+product packages and requires each one to be named here or excused in that test's `_NOT_A_CACHE`
+list with a reason. **A new module-level store lands with its row below, or the suite reds with
+its `file:line`.** (Reconciling the title's count with this table is a paired edit to this file
+and `AGENTS.md`, which are checked against each other.)
+
+Bounds below are entry counts, and every store is process-lifetime unless stated otherwise.
+
+| Store | Keyed on | Lifecycle / bound |
+|---|---|---|
+| `tex_cache._FINGERPRINT_MEMO` | source x binding types x profile key | program fingerprint; 256 |
+| `lexer._TOKEN_HANDOFF` | source x `dotted_bindings` flag | token list offered by the fingerprint lex and claimed by the compile behind it; 16, and a miss costs one re-lex, never a wrong stream |
+| `tex_lazy._memo` | code-hash x fp32 param bits | required-binding set; shared by `check_lazy_status` and `execute()`; 256 |
+| `tex_lazy._parse_memo` | source x profile key | the UNFOLDED front-end AST, handed out only as `clone_tree` copies; 64 |
+| `tex_roi._walk_memo` | code-hash x fp32 param bits | the ROI-2 footprint walk `(reads, blocked, halo)`; keyed like `tex_lazy._memo` but a distinct analysis |
+| `tex_roi._parse_memo` | source x profile key | `tex_roi`'s own copy of the unfolded AST (the fold mutates its tree, so the memo is never handed out directly); 64 |
+| `tex_roi._region_dep_memo` | fingerprint x string-binding names | the region-dependence verdict the cook splitters gate on; 256 |
+| `tex_marshalling._SIGIL_MEMO` | source | the names used only with the `$` sigil; 512 |
+| `tex_fusion._FUSED_MEMO` | chain key (every stage's source + wiring) | the spliced program |
+| `tex_fusion._FUSED_FP_MEMO` | the same chain key | the fused fingerprint, memoized because `prepare()` now asks for it on every cook; 256 |
+| `interpreter._READS_MEMO` | `id(program)`, re-checked with `is` | the binding names a program reads; holding the program pins the AST alive; 128 |
+| `tex_engine._AUTO_DECISION` | fingerprint x resolution bucket x device | the `precision="auto"` fp16/fp32 gate DECISION; cleared at 512 |
+| `compiled._compiled_cache` | fingerprint x device x precision | compiled callable + backend; 16, because each entry can hold 30-60 MB of kernels |
+| `compiled._compile_blacklist` | fingerprint | programs that crashed `torch.compile`; session-scoped on purpose (never persisted); 256 |
+| `compiled._backend_status` | backend x device type | tested / works / failed, per device |
+| `compiled._verify_state` | committed cache key | the post-commit verification window (v0.20 G); px-scoped, reset by a size change; 256 |
+| `compiled._route_memo` | fingerprint | the route facts from the two full AST walks (`has_spatial` is deliberately NOT here: it depends on binding values); 256 |
+| `compiled._stencil_route_memo` | fingerprint | the UC-2 stencil-route verdict |
+| `compiled._deferred_ev` | slot | the LAT-3 pending CUDA event pair for the deferred timing readback; cleared with the compiled cache |
+| `compiled._ENV_TENSOR_CACHE` | constant-env tensor identity | the per-cook constant tensors, registered in `graphed._build_keepalive` so MEM-1 holds; 256 |
+| `graphed._graph_cache` | fingerprint-signature | `GraphedProgram`; LRU, bytes-aware, pin-and-skip on eviction |
+| `graphed._blacklist` | signature | captures that failed; never retried this session |
+| `graphed._capturable_memo` | fingerprint | static capturability + op count, so a cache-hit replay does not re-walk the program |
+| `autotier._STATE` | program x device x precision | the measuring/committed tier state machine (mutated in place; single-cook-thread) |
+| `noise._inductor_available` | device type | whether TorchInductor can compile there |
+| `noise._worley_offsets_cache` | device x dtype | the 2D Worley cell offsets |
+| `noise._worley3d_offsets_cache` | device x dtype | the 3D Worley cell offsets |
+| `stdlib._sampler_cache` | B x H x W x device | batch index tensors and Lanczos tap offsets; 32 |
+| `stdlib._grid_buf` | B x H x W x device | the coordinate grid, **allocate-and-hold**; reuse measured ~30% SLOWER on CPU (PERF TRAP) |
+| `stdlib._mip_cache` | `id(src)` x source version | the mip pyramid, holding a reference to the source so its id cannot be recycled |
+| `stdlib._gauss_mip_cache` | the same, per blur parameters | the gaussian mip pyramid |
+| `stdlib._gauss_kernel_cache` | sigma x radius x dtype x device | the separable kernel pair (tiny GPU tensors); 64 |
+| `tex_memory._tile_safe_memo` | program x plan | the tile-safety verdict |
+| `tex_memory._peak_static_memo` | program x plan | the peak-static-memory estimate |
+| `tex_memory._last_trim_px` | device | last-seen spatial pixel count, so the allocator is queried only after a downshift (MEM-2) |
+| `tex_memory._total_mem_cache` | device | total VRAM (MEM-2) |
+| `tex_tiling._free_foreign` | host generation | `(generation, foreign bytes)` from the last free-memory reading; answered only when it grants DOUBLE the room the live number would have, and invalidated by a host swap |
+| `tex_results._ENV_EPOCH_CACHE` | active CUDA device index (-1 for CPU) | the env epoch folded into every result key |
+| `tex_results.ResultCache` | CACHE-1 lineage key | the cooked frame; RAM byte-budget LRU + disk spill, host-instantiated |
+| `tex_tool._SUMMARY_CACHE` | tool path | `((mtime_ns, size), summary)` for the TOOL-2 palette |
+| `xfer._MODEL` | device x torch build | the fitted transfer latency+bandwidth model; persisted to `xfer.json` |

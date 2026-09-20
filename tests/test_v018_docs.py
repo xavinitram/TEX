@@ -228,6 +228,215 @@ def test_c6st_cache_count_agree(r: SubTestResult):
         r.ok(f"cache count agrees across both docs ({a})")
 
 
+#: DOC-7d — module-level mutable containers that are NOT caches, each with the reason.
+#:
+#: The census below is deliberately an OVER-approximation: it flags every module-level
+#: dict/set/list/deque/OrderedDict that is written to, aliased, passed onward or otherwise
+#: escapes a provably read-only use. That sweeps in frozen tables and bookkeeping ledgers
+#: along with the real stores, which is the right direction for a gate — a census that
+#: under-approximates is a census that misses the next `_TOKEN_HANDOFF`. This list is where
+#: a non-cache is excused, one line of reason each, and it is a ratchet: an entry whose
+#: store no longer exists reds so the list cannot outlive its subject.
+_NOT_A_CACHE = {
+    # ── Frozen tables: built once at import from literals, never written again. ──
+    "parser.TYPE_KEYWORDS": "frozen grammar table (the type-keyword token set)",
+    "exr._SUPPORTED_COMPRESSION": "frozen EXR compression-name -> code table",
+    "tex_results._DTYPE_NAME": "frozen dtype <-> stored-name spelling table (PREC-1)",
+    "tex_results._NAME_DTYPE": "frozen stored-name -> dtype spelling table (PREC-1)",
+    "tex_validate_hw._BINDING": "frozen binding shape every validate-hw probe compiles to",
+    "stdlib._POW_NAN_STATE": "a two-field process-wide counter for the pow() NaN warning, "
+                             "not a keyed store",
+    "tex_cache._AST_FILES": "CACHE-4 epoch INPUT list: the watched source files, fixed at "
+                            "import; holds no computed value",
+    "tex_cache._CODEGEN_FILES": "CACHE-4 epoch INPUT list (see _AST_FILES)",
+    "tex_cache._VERDICT_FILES": "CACHE-4 epoch INPUT list (see _AST_FILES)",
+    # ── Import-time dispatch/reflection tables: one entry per CLASS, not per cook. ──
+    "codegen_stdfns._EMIT_DISPATCH": "STR-6 stdlib-name -> handler-attribute dispatch table, "
+                                     "filled at import by the emit decorators",
+    "ast_nodes._CHILD_FIELDS": "reflection over a closed set of AST node classes: one entry "
+                               "per node type, no key derived from user data, never evicted",
+    "ast_nodes._CLONE_FIELDS": "reflection over the same closed set (see _CHILD_FIELDS)",
+    "stdlib_registry.REGISTRY": "the REG-1 stdlib registry itself -- the declaration of what "
+                                "exists, populated by @stdlib at import",
+    # ── Registries and ledgers: they hold keys or references, never a computed value. ──
+    "tex_memory._armed_caches": "CACHE-5 governor's registry OF caches (saved profile knobs "
+                                "per armed cache), so that it is not itself one",
+    "tex_provider._versions": "DATA-5 per-source generation counters -- the INVALIDATION "
+                              "source a cache key reads, not a cached value",
+    "codegen_persist._LINECACHE_KEYS": "bounded ledger of registered pseudo-filenames so "
+                                       "linecache can be pruned; holds keys, no values",
+    "graphed._keepalive": "MEM-1 strong references that keep a captured graph's baked "
+                          "addresses alive; an unkeyed liveness anchor",
+    "graphed._last_capture_error": "a one-slot diagnostics box holding the last capture error",
+    "compiled._warnings_shown": "one-shot log de-duplication set (message text only)",
+    "compiled._bg_futures": "in-flight background-compile futures, owned by the single "
+                            "max_workers=1 worker and drained, not looked up",
+    # ── Observability: bounded rings and accumulators of MEASUREMENTS. ──
+    "tier_trace._ring": "bounded tier-decision trace ring (diagnostics; oldest dropped)",
+    "tier_trace._noise_ring": "bounded noise-tier trace ring (diagnostics)",
+    "tier_trace._noise_failure_ring": "bounded noise-failure trace ring (diagnostics)",
+    "profile._STATE": "PROF-1's measured cost accumulator -- its entries are observations, "
+                      "so dropping one loses data rather than costing a recompute",
+}
+
+
+def _census_module_stores(root) -> dict:
+    """{`module.name`: `pkgpath:lineno`} for every module-level mutable container.
+
+    Pure AST, no import: a container declared at module level is a store unless every one
+    of its uses is provably a read (subscript load, membership, iteration, `.get`/`.keys`/
+    `.items`/`.copy`, or a read-only builtin). Anything else -- a subscript store, a
+    mutating method, an alias, a hand-off as an argument -- makes it writable, and a
+    writable module-level container outlives every cook.
+    """
+    import os
+    import importlib
+    phase2 = importlib.import_module("test_v017_phase2")
+    containers = {"dict", "set", "list", "ordereddict", "defaultdict", "counter", "deque",
+                  "weakvaluedictionary", "weakkeydictionary"}
+    read_methods = {"get", "keys", "values", "items", "copy", "index", "count"}
+    read_builtins = {"len", "bool", "str", "repr", "sorted", "list", "tuple", "set",
+                     "frozenset", "dict", "iter", "reversed", "next", "any", "all",
+                     "max", "min", "sum"}
+
+    def _kind(node):
+        if isinstance(node, (ast.Dict, ast.Set, ast.List)):
+            return type(node).__name__
+        if isinstance(node, ast.Call):
+            f = node.func
+            n = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute)
+                                                      else None)
+            if n and n.lstrip("_").lower() in containers:
+                return n
+        return None
+
+    found = {}
+    for sub in phase2._product_packages(str(root)):
+        d = os.path.join(str(root), sub)
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".py") or fn.startswith("__"):
+                continue
+            rel = f"{sub}/{fn}" if sub else fn
+            with open(os.path.join(d, fn), encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+            decl = {}
+            for node in tree.body:
+                if isinstance(node, ast.Assign):
+                    targets, value = node.targets, node.value
+                elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                    targets, value = [node.target], node.value
+                else:
+                    continue
+                if not _kind(value):
+                    continue
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        decl[t.id] = node.lineno
+            if not decl:
+                continue
+            parent = {}
+            for n in ast.walk(tree):
+                for c in ast.iter_child_nodes(n):
+                    parent[c] = n
+            writable = set()
+            for n in ast.walk(tree):
+                if not (isinstance(n, ast.Name) and n.id in decl):
+                    continue
+                if isinstance(n.ctx, (ast.Store, ast.Del)):
+                    p = parent.get(n)
+                    if isinstance(p, (ast.Assign, ast.AnnAssign)) and \
+                            getattr(p, "lineno", None) == decl[n.id]:
+                        continue            # the declaration itself
+                    writable.add(n.id)
+                    continue
+                p = parent.get(n)
+                if isinstance(p, ast.Subscript) and p.value is n and isinstance(p.ctx, ast.Load):
+                    continue
+                if isinstance(p, ast.Compare):
+                    continue
+                if isinstance(p, (ast.For, ast.AsyncFor, ast.comprehension)) and p.iter is n:
+                    continue
+                if isinstance(p, (ast.UnaryOp, ast.BoolOp, ast.IfExp)):
+                    continue
+                if isinstance(p, ast.Attribute) and p.attr in read_methods:
+                    continue
+                if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) \
+                        and p.func.id in read_builtins and n in p.args:
+                    continue
+                writable.add(n.id)
+            mod = fn[:-3]
+            for name, lineno in decl.items():
+                if name in writable:
+                    found[f"{mod}.{name}"] = f"{rel}:{lineno}"
+    return found
+
+
+def test_doc7d_cache_store_enumeration(r: SubTestResult):
+    print("\n--- DOC-7d: every module-level store is in the register or excused ---")
+    # C6-st proves AGENTS.md and ARCHITECTURE.md quote the same integer. That is not a check
+    # of the register, it is a check of two integers: five module-level memo stores landed
+    # in one round with zero mentions in any of the three maps while C6-st stayed green, each
+    # argued individually as "not a twentieth cache" and each argument correct in isolation.
+    # Enumerate instead. A store is either named in ARCHITECTURE.md's register or it carries
+    # a row in _NOT_A_CACHE saying why it is not one; there is no third answer, so the next
+    # store lands with its row or reds here.
+    try:
+        arch = (_PKG / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    except Exception as e:
+        r.fail("DOC-7d read ARCHITECTURE.md", str(e))
+        return
+    try:
+        stores = _census_module_stores(_PKG)
+    except Exception as e:
+        r.fail("DOC-7d census", f"{type(e).__name__}: {e}")
+        return
+    if len(stores) < 40:
+        r.fail("DOC-7d census reach",
+               f"the census found only {len(stores)} store(s) -- it has stopped seeing the "
+               "tree; fix the derivation rather than the expectation")
+        return
+    r.ok(f"censused {len(stores)} module-level store(s) across the product packages")
+
+    # A register row names its store as `module._name`, which is unambiguous about WHICH
+    # module owns it -- three modules carry a `_parse_memo` and two carry a `_STATE`.
+    registered = set(re.findall(r"`([A-Za-z_]\w*)\.(_?\w+)`", arch))
+    registered = {f"{m}.{n}" for m, n in registered}
+
+    undocumented = sorted(k for k in stores if k not in registered and k not in _NOT_A_CACHE)
+    if undocumented:
+        r.fail("DOC-7d unregistered store",
+               "module-level store(s) named neither in ARCHITECTURE.md's cache register nor "
+               "in _NOT_A_CACHE -- add the register row, or the exemption with its reason: "
+               + ", ".join(f"{k} ({stores[k]})" for k in undocumented))
+    else:
+        named = sum(1 for k in stores if k in registered)
+        r.ok(f"every store is accounted for: {named} in ARCHITECTURE.md's register, "
+             f"{len(stores) - named} excused in _NOT_A_CACHE")
+
+    # The exemption list is a ratchet, not a drawer: an entry whose store is gone has to be
+    # removed, or the list keeps excusing something nobody can find (the PUB-1 "re-pin DOWN"
+    # rule, which exists because a bound that only ever loosens is decoration).
+    stale = sorted(k for k in _NOT_A_CACHE if k not in stores)
+    thin = sorted(k for k, why in _NOT_A_CACHE.items() if len(why.strip()) < 20)
+    if stale:
+        r.fail("DOC-7d stale exemption",
+               "_NOT_A_CACHE excuses store(s) the census can no longer find -- re-pin DOWN by "
+               "deleting the row(s): " + ", ".join(stale))
+    elif thin:
+        r.fail("DOC-7d exemption reason", "_NOT_A_CACHE row(s) with no usable reason: "
+               + ", ".join(thin))
+    else:
+        r.ok(f"all {len(_NOT_A_CACHE)} exemption(s) still name a live store and carry a reason")
+
+    both = sorted(k for k in _NOT_A_CACHE if k in registered)
+    if both:
+        r.fail("DOC-7d contradiction",
+               "store(s) both registered as a cache in ARCHITECTURE.md and excused in "
+               "_NOT_A_CACHE -- the two documents disagree: " + ", ".join(both))
+    else:
+        r.ok("no store is both registered and excused")
+
+
 def test_c5ux_no_render_overstatement(r: SubTestResult):
     print("\n--- C5-ux: docs don't overstate what actually renders on-node ---")
     # v0.18 shipped CHANGELOG/README claims that debug_print "surface[s] on the node"
