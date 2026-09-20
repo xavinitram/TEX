@@ -105,12 +105,20 @@ _TERMINAL = {
     "TEXCache.compile_ast":    0,    # ANIM-1: a $param is a cook-time binding. A non-zero here
                                      # means a scrub recompiles — the bug ANIM-1 freezes out.
     "TEXCache.compile_tex":    1,    # one cached-compile lookup per cook.
-    "Lexer.tokenize":          1,    # the re-lex under `roi_plan -> _walk -> _fold_program`,
-    "Parser.parse":            1,    # whose memo keys on the param VALUES (`tex_roi._param_key`).
-                                     # Memoizing on names instead would take both to 0.
+    "Lexer.tokenize":          0,    # PERF-1 re-pin (was 1/1). `roi_plan -> _walk` still
+    "Parser.parse":            0,    # misses its memo every tick — the walk's answer really
+                                     # does depend on the param VALUES — but the front end
+                                     # behind it now runs at most ONCE per source
+                                     # (`tex_roi._pristine_program` + `ast_nodes.clone_tree`),
+                                     # so a scrub re-folds a reused parse instead of
+                                     # re-lexing one. A 1 here again means the parse memo
+                                     # stopped being reached.
     "TypeChecker.check_collect": 0,  # lint only; a cook must never run the collecting checker.
-    "tex_roi._fold_program":   1,    # the fold behind that re-lex. 0 once the memo stops
-                                     # keying on values.
+    "tex_roi._fold_program":   1,    # STAYS 1, by design: the fold is what is value-dependent
+                                     # (a `$sigma` in a halo radius, a `mix(@A,@B,$k)` arm
+                                     # that `k = 0` erases), so it is the parse that was
+                                     # memoized and not the fold. Only a proven
+                                     # value-independent walk would take this to 0.
     "tex_roi.roi_plan":        2,    # 1 per engine cook + 1 for the host's own halo question
                                      # (`RoiComp._halo_of` misses its memo when params move).
     "tex_roi.chain_windows":   1,    # one plan per tick, whatever the dirty suffix.
@@ -134,9 +142,11 @@ _MIDGRAPH = {
     "tex_engine.cook":         5,    # stages 5..9.
     "TEXCache.compile_ast":    0,    # ANIM-1 again, over five programs.
     "TEXCache.compile_tex":    5,
-    "Lexer.tokenize":          1,    # ONE, not five: only the scrubbed stage's params moved,
-    "Parser.parse":            1,    # so only its fold memo misses.
-    "tex_roi._fold_program":   1,
+    "Lexer.tokenize":          0,    # PERF-1 re-pin (was 1/1 — ONE, not five, because only
+    "Parser.parse":            0,    # the scrubbed stage's params moved). Now zero for the
+                                     # same reason as `terminal`: five sources, five parses,
+                                     # all of them already done.
+    "tex_roi._fold_program":   1,    # still one fold, for the one stage whose params moved.
     "tex_roi.roi_plan":        6,    # 5 engine plans + 1 host halo question.
     "tex_roi.chain_windows":   1,
     "tex_results.lineage_key": 15,   # 10 chain keys + 5 windowed keys.
@@ -153,9 +163,11 @@ _PAN = {
     "tex_engine.cook":         1,
     "TEXCache.compile_ast":    0,
     "TEXCache.compile_tex":    1,
-    "Lexer.tokenize":          0,    # params constant => the fold memo hits. This 0 is the
-    "Parser.parse":            0,    # control that proves the terminal scrub's 1/1 is the
-    "tex_roi._fold_program":   0,    # memo key and not the cook.
+    "Lexer.tokenize":          0,    # params constant => the WALK memo hits, so not even the
+    "Parser.parse":            0,    # fold runs. This scenario was the control that showed
+    "tex_roi._fold_program":   0,    # the terminal scrub's pre-PERF-1 1/1 to be the memo key
+                                     # and not the cook; it still separates "the walk memo
+                                     # hit" (here) from "the parse memo hit" (terminal).
     "tex_roi.roi_plan":        1,    # the engine's, only: the host's halo memo hits.
     "tex_roi.chain_windows":   1,
     "tex_results.lineage_key": 11,

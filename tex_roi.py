@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from .tex_compiler.ast_nodes import (
     BindingRef, NumberLiteral, ChannelAccess, FunctionCall, Assignment, Identifier,
     BindingIndexAccess, BindingSampleAccess, ArrayIndexAccess, VarDecl, FunctionDef,
-    ForLoop, WhileLoop, iter_child_nodes,
+    ForLoop, WhileLoop, clone_tree, iter_child_nodes,
 )
 from .tex_compiler.optimizer import _propagate_literal_locals, _fold_all
 from .tex_lazy import _substitute_params, _fp32, _param_key
@@ -580,10 +580,45 @@ def _has_ungrounded_halo(program) -> bool:
     return bool(halo_named & reads)
 
 
+_PARSE_MEMO_MAX = 64
+#: source -> the UNFOLDED `parse_and_split` AST. Handed out only as `clone_tree` copies.
+_parse_memo: "OrderedDict[str, object]" = OrderedDict()
+
+
+def _pristine_program(code: str):
+    """The unfolded front-end AST for `code`, lexed and parsed AT MOST ONCE per source.
+
+    PERF-1. `_fold_program` needs a *mutable* AST (the substitution and the optimizer's fold
+    both rewrite in place), and `_walk`'s memo is keyed on the parameter VALUES because the
+    analysis genuinely depends on them — so a slider missed that memo every tick and paid a
+    full `Lexer.tokenize` + `Parser.parse` for a program whose SOURCE had not changed. The
+    parse is a function of the source alone, so it is cached here and each caller gets its
+    own `clone_tree` copy to mutate; the fold still runs per value, on a reused parse.
+
+    The entry is the PRISTINE parse and is never handed out directly — a caller that mutated
+    it would poison every later fold of that source with the previous call's literals. Same
+    bounded-LRU discipline as `_walk_memo`, with a smaller cap because an entry is a whole
+    AST rather than a five-tuple, and `clear_roi_memo` drops it with the rest.
+
+    DATA-6: through the one front end (`tex_cache.parse_and_split`) with NO binding types, on
+    purpose — see `_fold_program`."""
+    hit = _parse_memo.get(code)
+    if hit is None:
+        from .tex_cache import parse_and_split
+        hit = parse_and_split(code, {})
+        _parse_memo[code] = hit
+        while len(_parse_memo) > _PARSE_MEMO_MAX:
+            _parse_memo.popitem(last=False)
+    else:
+        _parse_memo.move_to_end(code)
+    return hit
+
+
 def _fold_program(code: str, param_values: dict):
     """Parse + `$param`-fold, reusing tex_lazy's substitution and the optimizer's
-    fold/propagate so halo radii resolve to literals. Returns the folded Program (fresh
-    parse — the analysis mutates its AST). Raises on a parse error (caller catches).
+    fold/propagate so halo radii resolve to literals. Returns the folded Program — a private
+    copy of the memoized parse (`_pristine_program`), because the fold mutates its AST.
+    Raises on a parse error (caller catches).
 
     DATA-6: through the one front end (`tex_cache.parse_and_split`) with NO binding types, on
     purpose: `_walk`'s memo is keyed on the source, the param values and the string wires, so
@@ -591,8 +626,7 @@ def _fold_program(code: str, param_values: dict):
     `@` back to a swizzle of its BASE wire, which is the name `reads` is keyed on and the name
     the cook narrows; for a kept plane read that over-approximates benignly (the base is read,
     whole)."""
-    from .tex_cache import parse_and_split
-    program = parse_and_split(code, {})
+    program = clone_tree(_pristine_program(code))
     subs = {
         name: NumberLiteral(value=_fp32(v), is_int=isinstance(v, (bool, int)))
         for name, v in param_values.items()
@@ -1109,3 +1143,4 @@ def clear_roi_memo() -> None:
     """Test hook (mirrors tex_lazy.clear_lazy_memo)."""
     _walk_memo.clear()
     _region_dep_memo.clear()
+    _parse_memo.clear()

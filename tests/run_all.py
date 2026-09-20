@@ -1891,6 +1891,26 @@ def main():
     test_bench2_cuda_per_tick_counts(r)
     test_bench2_counters_are_not_inert(r)
 
+    # PERF-1: the ROI walk parses a source ONCE (the fold works on an `ast_nodes.clone_tree`
+    # copy of a memoized parse) and answers exactly what the pre-change walk answered — the
+    # oracle runs both over every shipped example and a corpus of value-sensitive shapes.
+    from test_perf1_roi_walk_memo import (
+        test_perf1_walk_answers_are_identical,
+        test_perf1_a_source_is_parsed_once,
+        test_perf1_the_clone_is_load_bearing,
+        test_perf1_oracle_sensitive_rows,
+        test_perf1_the_memo_hands_out_no_shared_ast,
+        test_perf1_clone_tree_is_a_faithful_copy,
+        test_perf1_nan_and_inf_do_not_become_a_radius,
+    )
+    test_perf1_walk_answers_are_identical(r)
+    test_perf1_a_source_is_parsed_once(r)
+    test_perf1_the_clone_is_load_bearing(r)
+    test_perf1_oracle_sensitive_rows(r)
+    test_perf1_the_memo_hands_out_no_shared_ast(r)
+    test_perf1_clone_tree_is_a_faithful_copy(r)
+    test_perf1_nan_and_inf_do_not_become_a_radius(r)
+
     success = r.summary()
     return 0 if success else 1
 

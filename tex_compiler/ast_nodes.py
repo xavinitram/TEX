@@ -397,6 +397,63 @@ def iter_child_nodes(node):
                     yield x
 
 
+def clone_tree(node):
+    """A deep copy of an AST subtree, indistinguishable from re-parsing the same source.
+
+    Exists so a consumer that must MUTATE an AST — the `$param` substitution plus the
+    optimizer's fold behind `tex_roi`'s spatial analysis — can work from a source parsed
+    ONCE instead of re-lexing and re-parsing for every parameter value. `copy.deepcopy`
+    reaches every object through `__reduce_ex__`; this walk is field-driven off
+    `dataclasses.fields` and memoized per node type exactly like `iter_child_nodes`, so a
+    node type that grows a field is copied without an edit here.
+
+    Faithful, not clever — each rule is a thing a cheaper copy would get wrong:
+    * **`SourceLoc` is COPIED, never shared.** `tex_fusion._tag_stage` writes `loc.stage`
+      over a spliced chain, so a shared loc would let one consumer's stamp appear in
+      another consumer's tree (and in whatever tree the copy was made from).
+    * **Aliasing inside the subtree is preserved** (an id-keyed memo, `copy.deepcopy`'s
+      discipline): if the parser or the dotted-binding splitback left one node reachable
+      twice, the copy keeps it one node rather than silently unsharing it — which would
+      make a later in-place rewrite land on one occurrence and not the other.
+    * A `list` field is rebuilt, because the substitution pass assigns into it in place; a
+      `dict` field (`ParamDecl.metadata`, literal scalars only) is shallow-copied; every
+      other field is a str/number/bool/None and is shared.
+    """
+    return _clone_node(node, {})
+
+
+# Per-node-type field names for `clone_tree`, memoized like `_CHILD_FIELDS`.
+_CLONE_FIELDS: dict[type, tuple] = {}
+
+
+def _clone_node(node, memo: dict):
+    hit = memo.get(id(node))
+    if hit is not None:
+        return hit
+    cls = type(node)
+    names = _CLONE_FIELDS.get(cls)
+    if names is None:
+        names = tuple(f.name for f in _fields(cls))
+        _CLONE_FIELDS[cls] = names
+    new = cls.__new__(cls)
+    memo[id(node)] = new
+    for name in names:
+        v = getattr(node, name)
+        vc = v.__class__
+        if isinstance(v, ASTNode):
+            v = _clone_node(v, memo)
+        elif vc is list:
+            v = [_clone_node(x, memo) if isinstance(x, ASTNode) else x for x in v]
+        elif vc is SourceLoc:
+            src, v = v, SourceLoc.__new__(SourceLoc)
+            v._line, v._col, v._offset = src._line, src._col, src._offset
+            v._source, v.stage, v._end_line = src._source, src.stage, src._end_line
+        elif vc is dict:
+            v = dict(v)
+        setattr(new, name, v)
+    return new
+
+
 class NodeVisitor:
     """CPython-`ast`-style visitor over `iter_child_nodes` (STR-4).
 

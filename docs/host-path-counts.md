@@ -80,10 +80,11 @@ LAT-4 builtin LRU and reported 22 CUDA kernels for a pan tick that really costs 
 
 ## 4. The per-tick signature at head
 
-Measured at `v0.37.0` by `benchmarks/host_path_counts.py --res 1024 --window 512 --ticks 6`,
-CPU and CUDA legs, on the dev laptop. **These are counts. Box noise is irrelevant to them** —
-that is the entire point of the instrument, and the null run in §5 is the proof. A cell reading
-`a..b~` is an unstable row (reported, never gated).
+Measured by `benchmarks/host_path_counts.py --res 1024 --window 512 --ticks 6`, CPU and CUDA
+legs, on the dev laptop — first at `v0.37.0`, then re-derived after PERF-1 took the ROI
+planner's re-lex out of the interactive tick (§6 item 1). **These are counts. Box noise is
+irrelevant to them** — that is the entire point of the instrument, and the null run in §5 is
+the proof. A cell reading `a..b~` is an unstable row (reported, never gated).
 
 ### 4.1 Rows that read the same on both devices
 
@@ -96,8 +97,8 @@ makes it CI-gateable on a machine with no GPU.
 | `tex_engine.prepare` / `run` | 0 | 7 | 1 | 5 | 1 | 10 | 0 |
 | `TEXCache.compile_ast` | 10 | 0 | **0** | **0** | **0** | **0** | **0** |
 | `TEXCache.compile_tex` | 10 | 7 | **1** | **5** | **1** | **10** | **0** |
-| `Lexer.tokenize` | 10 | 1 | **1** | **1** | **0** | **0** | **1** |
-| `Parser.parse` | 10 | 0 | **1** | **1** | **0** | **0** | **1** |
+| `Lexer.tokenize` | 10 | 1 | **0** | **0** | **0** | **0** | **1** |
+| `Parser.parse` | 10 | 0 | **0** | **0** | **0** | **0** | **1** |
 | `TypeChecker.check` | 20 | 1 | 0 | 0 | 0 | 0 | **0** |
 | `TypeChecker.check_collect` | 0 | 0 | **0** | 0 | 0 | 0 | **1** |
 | `tex_roi._fold_program` | 0 | 0 | **1** | **1** | **0** | **0** | **0** |
@@ -121,6 +122,11 @@ makes it CI-gateable on a machine with no GPU.
 
 The **bold** cells are the ones `tests/test_bench2_counts.py` pins as exact integer literals
 (measured there at 96²/48²/4 ticks, where every one of them reads the same).
+
+`Lexer.tokenize` and `Parser.parse` read **1** on `terminal` and `midgraph` at `v0.37.0`; PERF-1
+took both to 0 by memoizing the ROI fold's parse per SOURCE and handing each fold its own
+`ast_nodes.clone_tree` copy. `tex_roi._fold_program` stays at 1: the fold is the part that
+genuinely depends on the parameter values, so it is the parse that was cached and not the walk.
 
 `source_edit`'s `Lexer.tokenize` is 1 on a cold leg and 0 on a leg whose program cache already
 holds the edited sources; it is reported and not pinned for that reason.
@@ -148,27 +154,37 @@ drains, not image traffic. There is no H2D on any interactive tick — the canva
 
 | frames per tick | prewarm | source_edit | terminal | midgraph | pan | all_dirty | lint |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| CPU leg | 13277 | 301..1341~ | 2744 | 3271 | 433 | 1747 | 1371 |
-| CUDA leg | 13572 | 301..1530~ | 2757 | 3336 | 446 | 2005 | 1371 |
+| CPU leg | 13277 | 301..1341~ | 1551 | 2204 | 433 | 1747 | 1371 |
+| CUDA leg | 13572 | 301..1530~ | 1564 | 2269 | 446 | 2005 | 1371 |
+| CPU leg at `v0.37.0`, before PERF-1 | 13277 | 301..1341~ | 2744 | 3271 | 433 | 1747 | 1371 |
 
-The terminal tick's 2744 frames break down (CPU leg, per-module subtotals):
+The terminal tick's 1551 frames break down (CPU leg, per-module subtotals), with the
+`v0.37.0` column beside them so what moved is readable without a second document:
 
-| module | frames | |
-|---|---:|---|
-| `tex_compiler.ast_nodes` | 656 | } |
-| `tex_compiler.parser` | 590 | } **1880 of 2744 — 69 %** — one re-lex, |
-| `tex_compiler.lexer` | 528 | } one re-parse and one constant-fold of |
-| `tex_compiler.optimizer` | 106 | } the scrubbed stage's source |
-| `tex_api` (`_ControlFlowLint._walk`) | 255 | the region-dependence walk, on the same memo miss |
-| `tex_results` | 209 | the eleven lineage keys |
-| `tex_roi` | 158 | |
-| `tex_runtime.interpreter` | 61 | the actual cook |
-| `examples.host_demo` | 46 | the host |
-| everything else | 135 | |
+| module | frames | at `v0.37.0` | |
+|---|---:|---:|---|
+| `tex_compiler.ast_nodes` | 592 | 656 | 565 of these are `iter_child_nodes` — the analysis traversals, not the parse |
+| `tex_compiler.parser` | 0 | 590 | } the re-lex and re-parse PERF-1 removed: |
+| `tex_compiler.lexer` | 0 | 528 | } the source is parsed once and the fold copies it |
+| `tex_compiler.optimizer` | 106 | 106 | the constant-fold, which still runs per VALUE |
+| `tex_api` (`_ControlFlowLint._walk`) | 255 | 255 | the region-dependence walk, on the same memo miss |
+| `tex_results` | 209 | 209 | the eleven lineage keys |
+| `tex_roi` | 159 | 158 | |
+| `tex_runtime.interpreter` | 61 | 61 | the actual cook |
+| `examples.host_demo` | 46 | 46 | the host |
+| everything else | 123 | 135 | |
 
-**Two thirds of an interactive tick is the compiler re-reading a program that did not change.**
-`pan` — the same cook with the parameters held constant — costs 433 frames. That difference is
-the whole of §6 item 1.
+At `v0.37.0`, **two thirds of an interactive tick was the compiler re-reading a program that
+had not changed**; `pan` — the same cook with the parameters held constant, so the walk memo
+hits — costs 433 frames, and that difference was the whole of §6 item 1. PERF-1 closed the
+front-end half of it. What is left above `pan` is the part that is a function of the VALUES:
+the fold (`optimizer`), the region-dependence walk (`tex_api`, plus most of the
+`iter_child_nodes` frames) and the reach accumulation (`tex_roi`).
+
+Counted across ALL modules rather than only the package — the honest denominator, because a
+fix that moves work into `copy.deepcopy` or into torch would be invisible to the table above —
+a terminal tick went **3267 → 1897** Python frames and a mid-graph tick **4109 → 2896**, while
+`pan` stayed at 518. Nothing moved out of the package; it stopped being done.
 
 ## 5. The null run
 
@@ -191,15 +207,24 @@ the gate at 96²/48²/4 ticks runs in about 2.6 s.
 and, crucially, **the counter that would show it fixed** — so a future lane has its acceptance
 test before it starts, and cannot claim a win the instrument would not see.
 
-1. **`_walk`'s memo keys on the param VALUES.** `tex_roi.py:660` builds the key as
+1. **`_walk`'s memo keys on the param VALUES.** **The front-end half is FIXED (PERF-1); the
+   fold and the region-dependence walk are not.** `_walk`'s key is
    `(sha256(code), _param_key(param_values), _string_wire_key(binding_types))`, and
-   `_param_key` (`tex_lazy.py:140`) folds every scalar's fp32 bit pattern. A slider therefore
-   misses the memo on every tick and re-runs `_fold_program` (`tex_roi.py:583`) — a full re-lex,
-   re-parse, constant-fold and, on the same miss, a `region_dependent` walk (`tex_roi.py:688`).
-   *Shows fixed as:* `Lexer.tokenize`, `Parser.parse` and `tex_roi._fold_program` going
-   **1 → 0** on `terminal` and `midgraph` (they are already 0 on `pan`, which is the control
-   that proves the cost is the key and not the cook), and `frames.total` on `terminal` falling
-   from 2744 toward `pan`'s 433.
+   `_param_key` (`tex_lazy.py`) folds every scalar's fp32 bit pattern, so a slider misses the
+   memo on every tick. That key is right — the walk's answer really can depend on a value (a
+   `$sigma` in a halo radius; `mix(@A, @B, $k)` with `k = 0` folding `@B` away, which is what
+   `fold_erased` exists to report) — so what PERF-1 changed is not the key but what a miss
+   COSTS: the parse is memoized per source (`tex_roi._pristine_program`) and each fold works on
+   an `ast_nodes.clone_tree` copy of it, so a miss re-folds a reused parse instead of re-lexing
+   and re-parsing. `Lexer.tokenize` and `Parser.parse` read **0** on `terminal` and `midgraph`,
+   `tex_roi._fold_program` still reads 1, and `frames.total` on `terminal` fell 2744 → 1551.
+   *What is still avoidable, and shows fixed as:* `tex_roi._fold_program` **1 → 0** on
+   `terminal` and `midgraph`, with `frames.total` falling from 1551 toward `pan`'s 433. That
+   needs a value-INDEPENDENT key, which needs a proof that the walk cannot depend on a value —
+   and `mix(@A, @B, $k)` shows that the whole five-tuple has no such proof in general. The
+   region-dependence component alone plausibly does (`region_dependent`'s own docstring calls
+   it "a pure function of (source, binding types)", and `region_dependent_cached` already
+   memoizes it on exactly that), and it is worth roughly half of what a miss now costs.
 2. **The host mints every chain lineage key every tick.** `RoiComp.cook` carries the
    whole-frame key forward for the clean prefix so stage *i+1* can link to it
    (`examples/host_demo.py`, the `_key` docstring explains why the link is load-bearing). That
