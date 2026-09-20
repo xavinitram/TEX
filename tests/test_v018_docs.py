@@ -437,6 +437,81 @@ def test_doc7d_cache_store_enumeration(r: SubTestResult):
         r.ok("no store is both registered and excused")
 
 
+#: DOC-7e — switches README's table documents that are NOT escape hatches, with the reason.
+#:
+#: AGENTS.md's register is the DO-NOT-TOUCH list: code that looks dead, kept alive because a
+#: host needs it. A switch can be perfectly well documented and still not belong there.
+_NOT_AN_ESCAPE_HATCH = {
+    "TEX_CACHE_DIR": "ordinary installation configuration (where the on-disk caches live); "
+                     "every test run and CI lane sets it, so nothing about it looks dead",
+    "TEX_ROI_EXEC": "an arming convenience for the ROI cook; the `roi_exec=` host argument is "
+                    "the real arm, and the path is documented in docs/roi-spatial-laziness.md",
+    "TEX_ROI_CODEGEN": "an A/B lever for routing an ROI cook through the codegen tier, "
+                       "documented with the ROI notes rather than as a host-facing hatch",
+}
+
+
+def _switches_in(text: str, heading: str) -> set:
+    """Every environment switch named under *heading*, to the next `## ` heading."""
+    body = text.split(heading, 1)[-1].split("\n## ", 1)[0]
+    return set(re.findall(r"\b(?:TEX|TORCHINDUCTOR)_[A-Z][A-Z0-9_]*", body))
+
+
+def test_doc7e_escape_hatches_match_readme(r: SubTestResult):
+    print("\n--- DOC-7e: AGENTS.md's escape-hatch register <-> README's switch table ---")
+    # NEG-3 gated the half that can be derived from code (`test_neg3_env_switches`: every
+    # product switch is in README's table). The other half is doc-to-doc and was gated by
+    # nothing: AGENTS.md's register ASSERTS "Every one of them is listed in README.md
+    # §Environment switches" in prose, and a switch could be added to either document alone
+    # without a word. This closes the triangle -- product code -> README -> the law's register
+    # -- so a host-facing hatch cannot be documented in one place and forgotten in the other.
+    try:
+        agents = (_PKG / "AGENTS.md").read_text(encoding="utf-8")
+        readme = (_PKG / "README.md").read_text(encoding="utf-8")
+    except Exception as e:
+        r.fail("DOC-7e read docs", str(e))
+        return
+
+    hatches = _switches_in(agents, "Config escape hatches")
+    documented = _switches_in(readme, "## Environment switches")
+    if not hatches or not documented:
+        r.fail("DOC-7e section parse",
+               f"could not read both registers (AGENTS={len(hatches)}, README={len(documented)})"
+               " -- a heading was renamed and this check went quiet")
+        return
+    r.ok(f"read {len(hatches)} escape hatch(es) and {len(documented)} documented switch(es)")
+
+    undocumented = sorted(hatches - documented)
+    if undocumented:
+        r.fail("DOC-7e hatch not in README",
+               "AGENTS.md's escape-hatch register names switch(es) that README's "
+               "'Environment switches' table does not, which is the sentence that register "
+               "itself makes: " + ", ".join(undocumented))
+    else:
+        r.ok("every escape hatch AGENTS.md registers is in README's table")
+
+    unregistered = sorted(documented - hatches - set(_NOT_AN_ESCAPE_HATCH))
+    if unregistered:
+        r.fail("DOC-7e switch not in the register",
+               "README documents switch(es) that AGENTS.md's escape-hatch register does not "
+               "name -- register them, or excuse them in _NOT_AN_ESCAPE_HATCH with a reason: "
+               + ", ".join(unregistered))
+    else:
+        r.ok(f"every documented switch is registered or excused "
+             f"({len(_NOT_AN_ESCAPE_HATCH)} exemption(s))")
+
+    stale = sorted(k for k in _NOT_AN_ESCAPE_HATCH if k not in documented)
+    both = sorted(k for k in _NOT_AN_ESCAPE_HATCH if k in hatches)
+    thin = sorted(k for k, why in _NOT_AN_ESCAPE_HATCH.items() if len(why.strip()) < 20)
+    if stale or both or thin:
+        r.fail("DOC-7e exemption hygiene",
+               f"gone from README (re-pin DOWN): {stale}; now registered as a hatch, so the "
+               f"exemption contradicts AGENTS.md: {both}; no usable reason: {thin}")
+    else:
+        r.ok("every exemption still names a documented switch, is not registered, and gives "
+             "its reason")
+
+
 def test_c5ux_no_render_overstatement(r: SubTestResult):
     print("\n--- C5-ux: docs don't overstate what actually renders on-node ---")
     # v0.18 shipped CHANGELOG/README claims that debug_print "surface[s] on the node"
