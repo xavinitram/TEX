@@ -742,7 +742,7 @@ Proof milestones (each converts a claim into a regression test):
   program reading only `@src.N` provably never cooks or ingests the other planes: an ingest spy
   on `expand_plane_bindings` sees one plane's storage and no other
   (`tests/test_v037_planes_wire.py`, the `pm10_laziness` row).
-- **PM-11** (v0.38, pencil): the fused viewer transform (working → display,
+- **PM-11** (v0.39, pencil): the fused viewer transform (working → display,
   ACES RRT/ODT-class) cooks inside the same program as the comp — the proof that
   COLOR-1 landed as a codegen seam rather than as a linked library.
 
@@ -778,11 +778,12 @@ touching the frontend. FUS-0 ships as **v0.20.1** (hotfix, in flight).
 | v0.35.1 | **Say what it does** — the reference states the control flow the engine has, the examples stop claiming an exit they never made, and the caches authenticate before they unpickle | Per-pixel control flow documented (`LANGUAGE.md` §7.1) with opt-in `W7006`/`W7007` advisories and six example programs corrected, three compat-corpus rows refrozen at language 0.23; the on-disk `.pkl`/`.cg`/`.frame` caches verify a keyed HMAC before `pickle.load`; nine fixes (a codegen `continue` that never terminated, a dropped negative `$param` default, `$param` placement on the opt-in CUDA codegen routes, `patch_dist`'s pad bound, and the `format()`/`px`/`py` help text). Opt-in host seams: `CookResult.noise_tiers`, `tex_doctor.capabilities()` + `tex doctor`, `ResultCache.touch`/`__contains__`, per-put `mask_eligible`, `.textool` `tooltip`/`options`/`optional` and fused `feeds`, LSP `bindingTypes`, `tex_testkit`, the uniform-output and embedding sections. **Deferred, each on purpose:** masking per-pixel `break`/`continue`/`return` and per-pixel loop bounds, which changes what programs that cook today compute and so belongs to a release that moves `LANGUAGE_VERSION`; `select(cond, a, b)` (ASK-6c), a new reserved name, penciled for v0.36.0 | `tex_testkit.py` |
 | v0.36.0 | **Cook it whole** — the engine declines to split a cook whose answer depends on the region, and three native builtins | TRK-25 (`tex_roi.region_dependent` + a per-fingerprint memo: the three planners that split a cook — `tex_engine._tile_plan`, `roi_plan`/`stage_halo`, `batch_sliceable` — and both OOM rungs now decline a per-pixel loop bound, and a string merged per pixel in both of its spellings (`if` and `?:`) and through a string WIRE, which is why those three take `binding_types`; the loop clause sunsets at `min(pragma, LANGUAGE_VERSION) >= 0.25`, the string clause never; the executors are untouched, so the gate is the analysis), W7008 (the subset of W7007 the engine acts on), ASK-4 (`img_width`/`img_height`), ASK-5 (`worley_id`), ASK-6 (`select`). **Planes moved to v0.37.0 and every named row after it one place; the pencil's two spare slots absorbed the new language-0.25 row at v0.39.0, so v0.41.0 and v0.42+ do not move** | `tests/test_v036_region_dependence.py` |
 | v0.37.0 | **Planes** — the data model widens | DATA-6 **shipped** on language `0.24` (compat freeze #2: `tests/compat_corpus_goldens/0.24.json`, 130 goldens; `0.23.json` unchanged and still checked): the lexer takes one dotted segment and `tex_cache.compile_ast` splits a non-PLANES base back to the swizzle it always was (the twelve frozen programs carrying dotted swizzles proven bit-identical across the change); `tex_marshalling.PlanesValue` + demand-driven `expand_plane_bindings` at `tex_engine.prepare` (E3304 for a plane named after one of the 38 lowercase channel/swizzle names, W7009 with a did-you-mean for an undeclared plane, per-plane CACHE-6 keys — channel-level invalidation with no new mechanism); `TEXType.PLANES` a wire-only member exactly as `ARRAY`, gated on the engine egress profile, so the release is invisible under ComfyUI; `tex_io.exr.read_layers`/`write_layers` (multi-LAYER, `layer.channel` verbatim); one example, `examples/aov_relight.tex`; the ten language-version satellites moved together and pinned. **Deferred, each with its reopen gate:** plane writes `@OUT.N` (a host wire type that carries a plane set — raising `MAX_OUTPUTS` is a recorded NO), a ComfyUI PLANES wire type (the same gate), fusion over a PLANES edge (a measured host graph where such an edge is the bottleneck), a `.textool` feed into one plane (the same host wire), UINT planes (cryptomatte, the named customer), multipart/deep EXR (a fixture that needs it). PM-10 **met** | `docs/plane-bindings.md`, `tests/test_v037_planes_lexer.py`, `tests/test_v037_planes_wire.py`, `tests/test_v037_exr_layers.py`, `tests/test_v037_satellites.py` |
-| v0.38.0 | **Linear light** — colour becomes a language citizen | COLOR-1 (XL, design doc: OCIO v2 as a CODEGEN seam — GpuShaderDesc op lists / baked LUTs translated to TEX IR, 3D LUTs as `grid_sample`, matrices and curves as pointwise stages, so the viewer transform FUSES with the comp; exposure/gamma enter as uniforms so a viewer tweak never recompiles), PM-11 | — |
-| v0.39.0 | **Masked flow** — per-pixel control flow starts meaning what it looks like | Language `0.25`: masking a per-pixel `break`/`continue`/`return` and a per-pixel loop bound — deferred from v0.35.1 on the ground that it changes what programs that cook today compute, so it belongs to a release that moves `tex_api.LANGUAGE_VERSION` (to `0.25`, with compat freeze #3). It is also the release v0.36.0's region-dependence gate sunsets its LOOP clause on (`MASKED_FLOW_SINCE = (0, 25)`, `tex_roi.py`), because masked semantics make a strip's answer equal the whole frame's; the string clause does not sunset with it | — |
-| v0.40.0 | **The library compiles** — tools grow their version story | TOOL-6 (side-by-side installed versions, semver-range resolution, per-project pinning: `Blur@^1.2` gets the same pixels next year, with PM-4's compat corpus as the enforcement floor), TOOL-7 (install-time prewarm on the background pool persisting `.pkl`/`.cg`/warm verdicts — CACHE-3 mechanics, never shipped bytecode, and CONSENT-GATED because TOOL-5's shipped default is validate-only at install), tool manifest polish (S) | — |
-| v0.41.0 | **Batch honest** — headless throughput | SCHED-5 (the throughput profile: preemption off, Tier-B admission replaced by frame-pipeline lookahead, governor switched to write-and-evict — a scheduling profile on the same engine and queue, exactly as the report insists), BATCH-1 (L, design doc: time-invariance classification from `used_builtins` plus the host's animated-param set, so a frame-invariant stage's lineage key is frame-INDEPENDENT and CACHE-2 serves it across the whole range for free; the work is the classifier API, lifetime hints, and cost-aware skip) | — |
-| v0.42+ → v1.0 | **Engine era** | the remaining §4 programs (GRAPH/XPU-1/DATA-5/STOCK/ML/ROTO), each behind its own design doc | `tex_graph.py` |
+| v0.38.0 | **Count, don't time** — the interactive path gets cheaper, and the claim gets checkable | No language change (`LANGUAGE_VERSION` stays `0.24`, no compat freeze owed). BENCH-2 (a structural counts harness: per-tick call / Python-frame / kernel / copy / free-VRAM counts over seven interactive scenarios, pinned in CI and identical on two GPU generations), BENCH-3 (the eighth scenario — the ComfyUI node's own tick — plus the oracle order-pollution fix and the results-cache cliff, measured). Eight performance fixes, each landing with the counter that proves it: PERF-1 (parse once per ROI-analysed source), PERF-2 (blur radius from the host value, `cuda.memcpy_DtoH` → 0), PERF-3 (the Gaussian kernel cache keyed on the sigma it builds from — the one user-visible fix, a blur that depended on what the process blurred first), PERF-4 (the lazy analysis and the halo scan read a program once), PERF-5 (one fingerprint per cook, one lex per never-seen program), PERF-6 (one free-VRAM query per frame, not per stage), PERF-7 (**no regression found** — a compiled-cold counts pin shipped in its place), PERF-8 (analysis memos keyed on the egress profile). NEG-1/2/3 (honest gates, the pre-specified `tex_chain` split — `tex_engine.py` 1673 → 1318, floor 1700 → 1400, bytecode-identical — hardened budget switches, pinned routes, a lint that says so when it crashes; **no standing reds**, `tests/known_reds.json` empty). SIMP-1/2/3/4/5/6 (one gate command and one verdict, the map's registers enumerated rather than counted, honest pins — mutation anchors, skips reported as skips under a ratcheted budget, CPU witnesses for invariant 9's comparators, two consumer registries and a private-root lint as the sixth cheap ratchet — a derived test runner, machine-checked citations, and an error-code coverage ratchet that took the untested set from 46 of 88 to 16). Timing moved from a gate to a **sitting**: the reference-box record is `benchmarks/results/sitting_2026-09-20_sm75/` (ten legs, closing three-leg read base_a4 → after3_e → base_a5) — default cook path neutral (the closing null leg's eight-config spread, 1.003–1.047, is WIDER than the release's 0.996–1.027), ROI pan+param scrub **1.215×** against a null of 1.013, and 23 counter rows moved against the null leg's 0. **Linear light (COLOR-1) moves to v0.39.0 and every named row after it one place down, exactly as v0.35.0 and v0.36.0 each did for Planes; the pencil has no spare slot left to absorb this one, so v0.40.0 through v0.43+ all move** | `tex_chain.py`, `benchmarks/host_path_counts.py`, `tools/gate.py`, `tools/canonical_harness.py`, `tools/check_citations.py`, `tests/known_reds.json`, `docs/host-path-counts.md`, `docs/brief-conventions.md` |
+| v0.39.0 | **Linear light** — colour becomes a language citizen | COLOR-1 (XL, design doc: OCIO v2 as a CODEGEN seam — GpuShaderDesc op lists / baked LUTs translated to TEX IR, 3D LUTs as `grid_sample`, matrices and curves as pointwise stages, so the viewer transform FUSES with the comp; exposure/gamma enter as uniforms so a viewer tweak never recompiles), PM-11 | — |
+| v0.40.0 | **Masked flow** — per-pixel control flow starts meaning what it looks like | Language `0.25`: masking a per-pixel `break`/`continue`/`return` and a per-pixel loop bound — deferred from v0.35.1 on the ground that it changes what programs that cook today compute, so it belongs to a release that moves `tex_api.LANGUAGE_VERSION` (to `0.25`, with compat freeze #3). It is also the release v0.36.0's region-dependence gate sunsets its LOOP clause on (`MASKED_FLOW_SINCE = (0, 25)`, `tex_roi.py`), because masked semantics make a strip's answer equal the whole frame's; the string clause does not sunset with it | — |
+| v0.41.0 | **The library compiles** — tools grow their version story | TOOL-6 (side-by-side installed versions, semver-range resolution, per-project pinning: `Blur@^1.2` gets the same pixels next year, with PM-4's compat corpus as the enforcement floor), TOOL-7 (install-time prewarm on the background pool persisting `.pkl`/`.cg`/warm verdicts — CACHE-3 mechanics, never shipped bytecode, and CONSENT-GATED because TOOL-5's shipped default is validate-only at install), tool manifest polish (S) | — |
+| v0.42.0 | **Batch honest** — headless throughput | SCHED-5 (the throughput profile: preemption off, Tier-B admission replaced by frame-pipeline lookahead, governor switched to write-and-evict — a scheduling profile on the same engine and queue, exactly as the report insists), BATCH-1 (L, design doc: time-invariance classification from `used_builtins` plus the host's animated-param set, so a frame-invariant stage's lineage key is frame-INDEPENDENT and CACHE-2 serves it across the whole range for free; the work is the classifier API, lifetime hints, and cost-aware skip) | — |
+| v0.43+ → v1.0 | **Engine era** | the remaining §4 programs (GRAPH/XPU-1/DATA-5/STOCK/ML/ROTO), each behind its own design doc | `tex_graph.py` |
 
 Per-release notes:
 
@@ -1219,6 +1220,56 @@ method made explicit:
     against a real v0.33-vs-v0.32 comparison of 0.989 / 1.000 / 0.992 / 0.999 / 1.003 / 1.001 /
     1.010 / 1.002 — i.e. the real result sits *inside* the noise the control measures. Before
     starting a timing run: check for background tasks and subagents, not just other windows.
+  - **COUNTS ARE THE CI GATE; TIMING IS A SITTING (v0.38.0, and this supersedes "compare before
+    tagging" as the gate).** Everything above says the same thing from six directions: a
+    wall-clock comparison on this hardware cannot decide anything by itself. So the release gate
+    is now **structural counts** — `benchmarks/host_path_counts.py` counts the calls, Python
+    frames, kernel launches, device-to-host copies and free-VRAM queries an interactive tick
+    costs; the integers are exact across steady ticks (min == max) where wall-clock over the same
+    ticks varies 16–26 %, and they read identically on two GPU generations, which is what lets
+    `tests/test_bench2_counts.py` pin them in CI. A change that claims a saving names the counter
+    row that proves it **before** it names a ratio, and the design note is
+    `docs/host-path-counts.md`. Timing did not go away: it is measured once per release at a
+    sitting, and a sitting has rules.
+    - **One command is the verdict.** `tools/gate.py --tier full` runs the ratchets, the CI shape
+      and the canonical suite and returns `0` GREEN / `1` RED with the failing node ids / `2`
+      GREEN-but-stale-allowlist. What a run is allowed to forgive lives in
+      `tests/known_reds.json`, which is data and is empty. Do not reconstruct a verdict from
+      prose or from scrolled output.
+    - **A counts comparison's verdict counts the call and device rows ONLY.** The `frames.*`
+      census moves for every lawful change that adds a call, renames a helper, splits a module
+      or adds a scenario — the v0.38.0 chain split moved thirteen frame rows per device with
+      `frames.total` and the per-module sum conserved to the unit — so a gate that counted them
+      returned 1 for every such change and said nothing. The frame rows print under their own
+      heading with both sums beside them; the sums are the check. `--counters-only` names the
+      rule for a caller.
+    - **Give every leg its own COLD cache directory, and discard the first leg per tree.** Two
+      separate lanes lost a measurement to a shared artifact cache, each producing a handful of
+      rows that looked structural and were a warm cache. Beyond that there is a
+      **first-run-per-tree artefact** with a measured signature: in the v0.38.0 sitting, the
+      first leg against a freshly materialised tree read `region_recook cpu/n50/2048/whole_all` at
+      **1996.74 ms** against ~900 ms on every other leg of the same sitting — a 2.2× phantom on
+      one row, from one tree's first run, with the same tree reading 909 ms immediately
+      afterwards. So each new tree gets a discard leg that is run and thrown away before any
+      reported leg. `--save` records the cache directory, whether it started empty, and a
+      `-dirty` suffix when the measured tree is not the commit it names.
+    - **A same-tree null control, in the same sequence as the claim — and the CLOSING leg is
+      that control.** The v0.38.0 sitting's closing read was base → after → base, and the third
+      leg returned per-config geomeans of **1.003–1.047** against the first, while the after leg
+      returned **0.996–1.027**. The null leg's spread is *wider than the claim's*, which is the
+      only honest way to say "the default whole-frame cook path is neutral", and it is not a
+      reading any two-leg comparison could have produced. The same closing leg moved **zero**
+      structural counter rows where the after leg moved 23 — a null control is owed to the
+      counts as well as to the times, and it is nearly free.
+    - **Read the benches that isolate an interactive cost, not only the corpus.** The same
+      sitting that could say nothing about the eight-config corpus read the ROI scrub's
+      pan-plus-parameter row at **1.215×** against a null-leg 1.013, the fixed and panning
+      windows at 1.041×/1.040× against 1.000/1.001, the CUDA region recook at 1.028× against
+      0.999, and the parameter recook at 1.030× against 1.009 — all of them rows the counters had
+      already predicted would move. Those four benches sit at 0.99–1.01 on a null leg, so they
+      are a far tighter instrument than the corpus and are where an interactive claim belongs.
+      The whole record, legs and comparisons, is archived under
+      `benchmarks/results/sitting_2026-09-20_sm75/` with a README that says how to reproduce it.
 4. **Every mechanism ships with its pinning test** — the repo's four proven shapes:
   *canary* (contract key-sets: ENG-4/5/6), *derivation* (registry tags → consumer
   sets, TST-3 style: ROI-1), *differential oracle* (new execution path vs the
@@ -1228,8 +1279,11 @@ method made explicit:
 5. **Adversarial verify before release** — the multi-agent review workflow (the
   v0.20 pattern that caught the scatter-COW bug) runs on the release diff; findings
   triage into fix-now vs roadmap.
-6. **Release exit** — full suite green (1823+ on the dev box, CI green), benchmark
-  compare clean, live-session checklist for frontend-touching releases
+6. **Release exit** — `tools/gate.py --tier full --no-cache` prints `VERDICT GREEN` (it runs the
+  ratchets, the CI shape and the canonical suite, and its exit code is the verdict; CI green on
+  the pushed sha as well), the structural counts comparison clean on the call and device rows,
+  the release sitting's timing record archived under `benchmarks/results/`,
+  live-session checklist for frontend-touching releases
   (screenshots into the build log), CHANGELOG entry, version bump in
   `pyproject.toml` + `__init__.py`, and any new rejected decision recorded in
   DEVELOPMENT.md the same day it is decided (§7's lists are the queue).

@@ -266,9 +266,9 @@ Insert-thrice-with-a-parity-pin was the alternative and is rejected: a parity pi
 three copies agree *today*, which is the same bet phase 0 lost six times over on the cook-grid
 derivation. One owner, or it drifts.
 
-**COLOR-1 (v0.38) inherits this decision rather than remaking it** — its expansion pass needs
-the same three insertions one release later, and this is the whole reason the convergence is
-decided in the DATA-6 doc instead of being split across two.
+**COLOR-1 (v0.39, re-pencilled at v0.38.0) inherits this decision rather than remaking it** —
+its expansion pass needs the same three insertions two releases later, and this is the whole
+reason the convergence is decided in the DATA-6 doc instead of being split across two.
 
 `_prepare_example` additionally needs PLANES dummy synthesis **before** any plane program can
 enter the corpus, or freeze #2 cannot contain one.

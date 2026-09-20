@@ -914,7 +914,7 @@ Settled calls, kept here so they're not re-derived:
 - **Pruning `_spill_seq` / `_spill_locks`** (v0.33.2 A1) — DEFERRED, quantified rather than
   waved at. Both dicts gain an entry per distinct key ever spilled and lose it never: ~240 B
   per key (a `threading.Lock`, its OS mutex block, the dict entry, and the retained 64-hex key
-  string). A 50-node comp scrubbed over 200 frames is ~10k keys / ~2.4 MB; the v0.41 headless
+  string). A 50-node comp scrubbed over 200 frames is ~10k keys / ~2.4 MB; the v0.42 headless
   shape (10k frames x 12 stages) is ~120k keys / ~29 MB and 120k live lock objects. Small
   against a 512 MB-2 GB frame budget, and the tier is opt-in, so it does not gate this release.
   **Do not "fix" it by clearing `_spill_locks` in `clear()`** — the comment there explains why
@@ -1102,7 +1102,7 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   string expression, or a loop variable. An AST derivation would close the common case and
   silently miss the rest, which is worse than a stated obligation with a helper. Reopens if
   the compiler ever grows a "constant string arguments to fn X" analysis for another reason
-  (COLOR-1's space names are the likely one, v0.38).
+  (COLOR-1's space names are the likely one, v0.39).
 - **Per-device residency for the DATA-7 media pool (v0.34)** — the pool caches whatever
   device the provider returned, and `_provider_read` moves the frame to the cook's device on
   every call. A CPU provider feeding a CUDA cook therefore pays one H2D per CALL rather than

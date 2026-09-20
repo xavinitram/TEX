@@ -22,8 +22,18 @@ build/
 editor_build/node_modules/
 
 # Benchmark results (machine-specific; not committed)
-benchmarks/results/
+benchmarks/results/*
 results/
+# ...but a RELEASE SITTING is a committed artifact, for the same reason the compat-corpus and
+# cache-key goldens are: `docs/roadmap.md` §10 item 3 makes the sitting the release's ONLY
+# timing evidence, and a timing record that is not in the repository cannot be re-read,
+# re-compared or argued with. One directory per sitting, whitelisted as a directory rather than
+# a file list so a leg cannot be silently uncommitted. `.comfyignore` excludes `benchmarks/`,
+# so none of it reaches the published archive. (`!benchmarks/results/` restores the parent that
+# the `results/` line above would otherwise exclude, which would stop git descending into it at
+# all; its OTHER children stay ignored by the `benchmarks/results/*` line.)
+!benchmarks/results/
+!benchmarks/results/sitting_2026-09-20_sm75/
 
 # Internal reports (not shipped)
 optimization_reports/

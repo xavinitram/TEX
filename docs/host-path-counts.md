@@ -1,8 +1,9 @@
-# Host-path counts — design note (BENCH-2, v0.37.0 shipped / timing tier deferred)
+# Host-path counts — design note (BENCH-2, shipped v0.37.0 / timing tier sat v0.38.0)
 
 *What an embedding host pays per interactive tick, measured as integers rather than as
 milliseconds. The harness is `benchmarks/host_path_counts.py`; the gate is
-`tests/test_bench2_counts.py`; the timing tier that this note DEFERS is §7.*
+`tests/test_bench2_counts.py`; the timing tier this note used to DEFER is §7, and it is no
+longer deferred — the first sitting happened, and §7 records it.*
 
 ## 1. Why counts, and not times
 
@@ -432,7 +433,7 @@ test before it starts, and cannot claim a win the instrument would not see.
    programs.
    *Shows fixed as:* `TypeChecker.check` on `prewarm` going **20 → 10**.
 
-## 7. The deferred tier: timing, at a release sitting
+## 7. The timing tier: a release sitting, and the first one
 
 Timing is not deleted, it is **scheduled**. The existing benches stay the instrument; what this
 note fixes is when and how they are run:
@@ -462,6 +463,79 @@ item 3):
   resolves, not by which worktree's bench you launched** — a naive `git worktree add` plus
   run-its-bench benchmarks the same build twice. Point a fresh `TEX_Wrangle` name at the other
   checkout instead. The counts harness has the same property and says so in `load_host_demo`.
+
+### 7.1 The first sitting: 2026-09-20, the sm_75 reference box (v0.38.0)
+
+**The tier is no longer deferred.** It sat, on a quiet **sm_75 desktop** — deliberately not the
+sm_120 development laptop, which is shared with other work. Ten legs, each running all five
+benches above plus the counts harness, each with its own cache directory emptied before the leg
+started. The whole record — every leg's JSON, every leg-to-leg comparison, the per-program
+breakdown and the reproduction commands — is archived at
+`benchmarks/results/sitting_2026-09-20_sm75/`, with its own README. What follows is the reading.
+
+**The closing read is the one to quote**, because it is the only one with its null control in
+the same sequence: `base_a4` → `after3_e` (the round-3 tree, `8f38f82`, on its second run) →
+`base_a5`. Ratios below are `base_a4 / leg`, so >1 means the leg is faster, and the **third
+column is identical code**:
+
+| measurement | `after3_e` | `base_a5` (the null) |
+|---|---|---|
+| eight-config corpus, per-config geomean, all eight | 0.996 – 1.027 | **1.003 – 1.047** |
+| `roi_scrub`, panning window **plus** a moving parameter | **1.215** | 1.013 |
+| `roi_scrub`, fixed window / panning window | 1.041 / 1.040 | 1.000 / 1.001 |
+| `roi_scrub`, whole frame | 1.014 | 0.998 |
+| `region_recook`, CUDA 2048², mid region | 1.028 | 0.999 |
+| `region_recook`, CUDA 2048², whole frame | 1.008 | 1.002 |
+| `param_scrub`, recook median | 1.030 | 1.009 |
+| `param_scrub`, scrub / static median | 1.022 / 1.023 | 1.005 / 1.008 |
+| `param_scrub`, worst tick after warm-up | 1.334 | 0.988 |
+| structural counter rows moved | **23**, every one predicted | **0** |
+
+**Read the first row and the last row together; they are the whole argument.** On the
+eight-config corpus the null leg's spread (1.003–1.047) is **wider than the claim's**
+(0.996–1.027), so the default whole-frame cook path is **neutral** — which is what invariant 7
+asks for, and is not a speedup claim. On the four benches that isolate an interactive cost the
+null leg sits at 0.99–1.01 and the release does not; that gap is what makes a 1.04 mean
+something there when a 1.04 on the corpus would mean nothing. And the counters — which are not
+a timing instrument at all — moved 23 rows for the release and **zero** for identical code.
+
+An earlier null pairing in the same sitting agrees: two `v0.37.0` base legs returned per-config
+geomeans of 0.967 – 1.033 with individual rows from 0.40 to 2.49. The per-row spread is why §1
+says what it says.
+
+Every moved counter row was predicted before it was timed — `Lexer.tokenize` and `Parser.parse`
+1 → 0 on `terminal` and `midgraph` (PERF-1/4), `TEXCache.fingerprint` and `param_only_names`
+halved or better on every scenario (PERF-5), `cuda.memcpy_DtoH` 2 → 0 and 3 → 0 (PERF-2),
+`torch.cuda.mem_get_info` 7 → 0 on `all_dirty` and 4 → 0 on `source_edit` (PERF-6) — and the
+timing rows that moved are the ones those counters sit on. That correspondence, not either
+number alone, is what this note exists to make routine.
+
+### 7.2 Two artefacts the first sitting measured, and the protocol they bought
+
+**A tree's FIRST run is not a measurement.** One leg read
+`region_recook cpu/n50/2048/whole_all` at **1996.74 ms** where every other leg of the same
+sitting — including the same tree run immediately afterwards — read ~900 ms. A 2.2× phantom, on
+one row, from one tree's first run. Nothing in the diff explains it and nothing needed to: it is
+the first-touch cost of a freshly materialised tree. **So each newly materialised tree gets a
+discard leg**: run it, throw it away, report from the second. The discarded leg is archived
+beside the reported one so the protocol is visible rather than described.
+
+**A shared artifact cache is not a comparison.** Each leg gets its own cache directory, emptied
+before it starts, because a second leg sharing one reads what the first wrote and produces rows
+that look structural. Two lanes lost a measurement to exactly this before it became a rule.
+
+Both are now standing law in `docs/brief-conventions.md` §"Two measurement rules that are not
+negotiable", and `--save` records the cache directory, whether it started empty, and a `-dirty`
+suffix when the measured tree is not the commit it names — so a leg that broke either rule says
+so in its own header instead of being reconstructed from memory afterwards.
+
+**One more thing the sitting settled, and it is the reason this note exists.** A regression
+reported against the cold compiled path did not survive its own null control: three of five legs
+agreed to within 0.7 %, the other two agreed with each other and were ~8 % faster, and it was an
+accident of which of them was used as the denominator. Pick the other base leg and the same
+after legs read 0.999 and 0.993. The null pairing — the same tree against itself — read **1.082**
+on that config, i.e. **larger than the claim**. A counts pin shipped instead of a fix, because
+there was nothing to fix (`tests/test_perf7_compiled_cold.py`).
 
 ## 8. What is NOT claimed
 

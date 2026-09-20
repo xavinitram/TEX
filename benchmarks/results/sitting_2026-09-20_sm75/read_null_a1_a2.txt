@@ -1,0 +1,39 @@
+legs: ['base_a1', 'base_a2']   (ratio = base_a1/leg; >1 = leg faster)
+
+eight_config @512^2 — per-config geomean |   base_a2   [row min..max for last leg]
+  cpu_off_cold   |  0.986 n=111   [0.61..1.35]
+  cpu_off_warm   |  0.967 n=111   [0.40..1.47]
+  cuda_off_cold  |  0.984 n=111   [0.93..1.01]
+  cuda_off_warm  |  0.985 n=111   [0.94..1.02]
+  cpu_on_cold    |  1.033 n=133   [0.65..2.27]
+  cpu_on_warm    |  1.008 n=133   [0.87..2.49]
+  cuda_on_cold   |  0.996 n=133   [0.77..1.11]
+  cuda_on_warm   |  0.992 n=133   [0.77..1.17]
+
+roi_scrub |    base_a1 |    base_a2  ratios vs base_a1
+  whole                        |     1.7852 |     1.7907   0.997
+  roi_fixed                    |     0.6738 |     0.6717   1.003
+  roi_panning                  |     0.6719 |     0.6727   0.999
+  roi_pan_param                |     1.0313 |     1.0280   1.003
+
+param_scrub |    base_a1 |    base_a2  ratios vs base_a1
+  cold_ms                      |    48.0815 |    47.6364   1.009
+  scrub_median_ms              |     0.3706 |     0.3718   0.997
+  static_median_ms             |     0.3697 |     0.3721   0.994
+  recook_median_ms             |     1.6008 |     1.5954   1.003
+  scrub_max_after_warmup_ms    |     0.6433 |     0.6328   1.017
+
+region_recook |    base_a1 |    base_a2  ratios vs base_a1
+  cuda/n50/2048/whole_all      |   173.1350 |   171.8320   1.008
+  cuda/n50/2048/region_mid     |    17.4990 |    17.4260   1.004
+  cpu/n50/2048/whole_all       |   904.0370 |   899.9870   1.005
+  cpu/n50/2048/region_mid      |   154.1330 |   156.4220   0.985
+
+cookqueue |    base_a1 |    base_a2  ratios vs base_a1
+  solo_ms                      |     0.3650 |     0.3670   0.995
+  queued_idle_ms               |     0.4430 |     0.4080   1.086
+  preempt_to_first_stmt_ms     |     1.0090 |     1.0070   1.002
+  queued_under_load_ms         |     1.1520 |     1.1390   1.011
+
+counts_cuda - stable rows that differ from base_a1
+  moved api/cuda rows: 0; moved frame rows (not listed): 0

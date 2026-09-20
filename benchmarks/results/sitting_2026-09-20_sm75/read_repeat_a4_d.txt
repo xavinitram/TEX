@@ -1,0 +1,60 @@
+legs: ['base_a4', 'after2_d']   (ratio = base_a4/leg; >1 = leg faster)
+
+eight_config @512^2 — per-config geomean |  after2_d   [row min..max for last leg]
+  cpu_off_cold   |  1.019 n=111   [0.64..1.38]
+  cpu_off_warm   |  1.048 n=111   [0.57..1.71]
+  cuda_off_cold  |  1.013 n=111   [0.97..1.15]
+  cuda_off_warm  |  1.016 n=111   [0.96..1.19]
+  cpu_on_cold    |  1.013 n=133   [0.77..2.11]
+  cpu_on_warm    |  1.008 n=133   [0.84..1.27]
+  cuda_on_cold   |  1.005 n=133   [0.84..1.21]
+  cuda_on_warm   |  1.008 n=133   [0.79..1.37]
+
+roi_scrub |    base_a4 |   after2_d  ratios vs base_a4
+  whole                        |     1.7891 |     1.7634   1.015
+  roi_fixed                    |     0.6715 |     0.6439   1.043
+  roi_panning                  |     0.6713 |     0.6452   1.040
+  roi_pan_param                |     1.0367 |     0.8505   1.219
+
+param_scrub |    base_a4 |   after2_d  ratios vs base_a4
+  cold_ms                      |    48.9154 |    47.4442   1.031
+  scrub_median_ms              |     0.3701 |     0.3674   1.007
+  static_median_ms             |     0.3695 |     0.3656   1.011
+  recook_median_ms             |     1.5908 |     1.5291   1.040
+  scrub_max_after_warmup_ms    |     0.6028 |     0.6335   0.952
+
+region_recook |    base_a4 |   after2_d  ratios vs base_a4
+  cuda/n50/2048/whole_all      |   172.2640 |   171.2740   1.006
+  cuda/n50/2048/region_mid     |    17.4460 |    16.9840   1.027
+  cpu/n50/2048/whole_all       |   909.1290 |   898.2270   1.012
+  cpu/n50/2048/region_mid      |   155.0670 |   155.4930   0.997
+
+cookqueue |    base_a4 |   after2_d  ratios vs base_a4
+  solo_ms                      |     0.3670 |     0.3580   1.025
+  queued_idle_ms               |     0.4340 |     0.4420   0.982
+  preempt_to_first_stmt_ms     |     1.0100 |     1.0240   0.986
+  queued_under_load_ms         |     1.1470 |     1.1580   0.991
+
+counts_cuda - stable rows that differ from base_a4
+  after2_d   prewarm      TEXCache.fingerprint                 30 -> 20
+  after2_d   prewarm      param_only_names                     30 -> 20
+  after2_d   source_edit  Lexer.tokenize                       2 -> 1
+  after2_d   source_edit  TEXCache.fingerprint                 15 -> 7
+  after2_d   source_edit  param_only_names                     15 -> 7
+  after2_d   terminal     Lexer.tokenize                       1 -> 0
+  after2_d   terminal     Parser.parse                         1 -> 0
+  after2_d   terminal     TEXCache.fingerprint                 2 -> 1
+  after2_d   terminal     param_only_names                     2 -> 1
+  after2_d   midgraph     Lexer.tokenize                       1 -> 0
+  after2_d   midgraph     Parser.parse                         1 -> 0
+  after2_d   midgraph     TEXCache.fingerprint                 10 -> 5
+  after2_d   midgraph     param_only_names                     10 -> 5
+  after2_d   midgraph     cuda.memcpy_DtoH                     2 -> 0
+  after2_d   midgraph     cuda.memcpy_DtoH_bytes               8 -> 0
+  after2_d   pan          TEXCache.fingerprint                 2 -> 1
+  after2_d   pan          param_only_names                     2 -> 1
+  after2_d   all_dirty    TEXCache.fingerprint                 20 -> 10
+  after2_d   all_dirty    param_only_names                     20 -> 10
+  after2_d   all_dirty    cuda.memcpy_DtoH                     3 -> 0
+  after2_d   all_dirty    cuda.memcpy_DtoH_bytes               12 -> 0
+  moved api/cuda rows: 21; moved frame rows (not listed): 31

@@ -5,6 +5,379 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-09-20
+
+**Count, don't time.** No new language surface, no new builtin, no reserved name: this release
+makes the interactive path cheaper, and — the part that outlasts the speedups — it makes the
+claim *checkable*. Wall-clock cannot gate anything on this class of machine. A byte-identical
+tree has tripped the 0.95 stop-ship threshold against itself and single rows span 0.70× to
+2.32×, so the unit of evidence moved from milliseconds to **integers**. A structural counts
+harness drives seven — now eight — interactive scenarios through the engine and counts the
+calls, the Python frames, the kernel launches, the device-to-host copies and the free-VRAM
+queries a host pays **per tick**. Those integers are exact across steady ticks, identical on two
+GPU generations, and pinned in CI. Every performance fix below names the counter that proves it
+before it names a ratio.
+
+**`tex_api.LANGUAGE_VERSION` stays `0.24`.** Nothing grammar-visible moved, no compat freeze is
+owed, and `tests/compat_corpus_goldens/` is unchanged — `0.23.json` and `0.24.json` are both
+still checked and every one of their programs computes what it computed.
+
+**Every change here is ComfyUI-invisible** in the sense `AGENTS.md` invariant 7 means it: no
+module removed, no call path changed, no default moved, and every analysis answer, diagnostic,
+fingerprint string, tile plan and cooked tensor is the one the previous release produced. There
+is exactly one exception and it is stated as one, under *Performance*: a Gaussian blur no longer
+returns different pixels depending on what the process blurred first.
+
+**What a tick costs now** — per-tick counts on the CUDA leg at 1024² with a 512² window,
+`v0.37.0` → this release:
+
+| per tick | scenario | was | now |
+|---|---|---:|---:|
+| `Lexer.tokenize` / `Parser.parse` | `terminal`, `midgraph` | 1 / 1 | **0 / 0** |
+| `Lexer.tokenize` | `source_edit` | 2 | **1** |
+| `TEXCache.fingerprint` and `param_only_names` | `terminal`, `pan` | 2 | **1** |
+| ″ | `midgraph` | 10 | **5** |
+| ″ | `all_dirty` | 20 | **10** |
+| ″ | `source_edit` | 15 | **7** |
+| ″ | `prewarm` (the warm-up tick) | 30 | **20** |
+| `cuda.memcpy_DtoH` (4-byte host drains) | `midgraph` / `all_dirty` | 2 / 3 | **0 / 0** |
+| `torch.cuda.mem_get_info` | `source_edit` / `all_dirty` | 4 / 7 | **0 / 0** |
+| TEX Python frames, total | `terminal` | 2803 | **1462** |
+| TEX Python frames, total | `midgraph` | 3395 | **2194** |
+
+Twenty-three counter rows moved, each one predicted by the lane that moved it, and no row moved
+that no lane claimed. The device-independent subset of the same table is what
+`tests/test_bench2_counts.py` pins, and it reads the same on the sm_75 reference box and the
+sm_120 development laptop.
+
+**What it is worth in seconds.** Timing is no longer a gate; it is a **sitting** — one quiet
+box, three legs (base → after → base), a same-tree null control in the same sequence, and a
+discard leg the first time any new tree is measured. This release's sitting ran on the reference
+box (an sm_75 desktop, not the development laptop), ten legs, five timing benches plus the
+counts harness per leg, each leg with its own cold cache directory. The legs, the leg-to-leg
+comparisons and the reproduction commands are archived under
+`benchmarks/results/sitting_2026-09-20_sm75/`. The closing three-leg read is base → after →
+base, and the **third leg is the null control**:
+
+| measurement | after leg | closing base leg (the null) |
+|---|---|---|
+| ROI scrub, panning window **plus** a moving parameter | **1.215×** | 1.013 |
+| ROI scrub, fixed window / panning window | 1.041× / 1.040× | 1.000 / 1.001 |
+| ROI scrub, whole frame | 1.014× | 0.998 |
+| region recook, CUDA 2048², mid region | 1.028× | 0.999 |
+| parameter scrub, recook median | 1.030× | 1.009 |
+| parameter scrub, scrub / static median | 1.022× / 1.023× | 1.005 / 1.008 |
+| parameter scrub, worst tick after warm-up | 1.334× | 0.988 |
+| eight-config corpus, per-config geomean, all eight | 0.996 – 1.027 | **1.003 – 1.047** |
+| structural counter rows moved | **23**, every one predicted | **0** |
+
+Read the last two rows together, because they are the whole argument. On the eight-config
+corpus the **null leg's spread is wider than the claim's** — identical code returned 1.003 to
+1.047 while the release returned 0.996 to 1.027 — so the default whole-frame cook path is
+**neutral**, which is what invariant 7 requires, and no speedup is claimed there. On the benches
+that isolate an interactive cost the null leg sits at 0.99–1.01 and the release does not, which
+is what makes 1.04 and 1.215 mean something. And the counters, which are not a timing
+instrument at all, moved 23 rows for the release and **zero** for the null leg.
+
+### Performance
+
+- **An ROI plan parses its stage once, not once per parameter value (PERF-1).** `tex_roi`'s
+  constant-fold re-lexed and re-parsed the source on every slider tick, because the walk memo
+  keys on the parameter values and a miss paid a whole front end. The unfolded AST is now a
+  bounded source-keyed store (`tex_roi._pristine_program`) and each fold works on
+  `tex_compiler.ast_nodes.clone_tree` of it — a field-driven deep copy that copies `SourceLoc`
+  rather than sharing it, so the copy is indistinguishable from a second parse. Pinned by
+  `Lexer.tokenize` and `Parser.parse` reading **0** on `terminal` and `midgraph` in
+  `tests/test_bench2_counts.py`, with `tex_roi._fold_program` still 1 so the fold is not merely
+  relocated; the walk's answers are unchanged. A `terminal` tick fell from 2744 to 1551 TEX
+  Python frames on the gate's CPU shape.
+- **A blur resolves its radius from the host value, not from the device (PERF-2).** `gauss_blur`,
+  `bilateral_filter` and `convolve` drained a scalar argument to the host with `.item()` on every
+  cook, synchronising the stream to read a number the interpreter already had. Scalars now carry
+  their host value from the four places they are minted (`Interpreter.execute`'s bindings and
+  number literals, codegen's hoisted constants, and the compiled tier's parameter placement) and
+  the readers take it. Pinned by `cuda.memcpy_DtoH` reading **0** on every scenario — it was 2 on
+  `midgraph` and 3 on `all_dirty` — with kernel launches and allocator allocations unmoved at
+  22·74·26·112 and 18·56·22·86, so nothing was traded for it.
+- **The Gaussian kernel cache is keyed on the sigma it builds from (PERF-3) — the one visible
+  fix in this release.** The cache keyed on `round(sigma, 3)` and then built the kernel from the
+  full-precision sigma, so two sigmas agreeing to three decimals shared whichever kernel arrived
+  first: the same program, same bindings, same device returned different pixels depending on what
+  that process had blurred earlier. Measured, both tiers and both devices, at `9.1e-05` between
+  the two blur orders for a same-radius pair and `5.3e-04` for a pair that straddles a tap-count
+  step. The key is now the exact sigma. **Exact keying was chosen over quantising precisely
+  because it moves nothing**: a cold cache always built from the full sigma, so every sigma keeps
+  the answer it had cold and no golden, example or compat-corpus row is re-blessed. Only the
+  stale cross-sigma hit disappears. Pinned by
+  `tests/test_perf3_gauss_kernel_key.py::test_perf3_a_blur_does_not_depend_on_what_was_blurred_first`
+  — both orders, both tiers, both devices — plus a row asserting the radius rule the key assumes.
+  A repeated sigma still hits, which is the hit the interactive path depends on.
+- **The lazy-input analysis and the halo scan read a program once (PERF-4).** `tex_lazy`'s
+  required-bindings analysis carried PERF-1's defect exactly, and got PERF-1's fix in its own
+  module (`tex_roi` imports `tex_lazy`, so reusing the other store would have inverted that edge);
+  `tex_roi._has_ungrounded_halo`'s two traversals plus a re-descent became one, with the
+  re-descent's question answered on the way back up. Pinned two ways: the node's own twelve
+  slider ticks through both lazy rounds and the E6003 gate read `Lexer.tokenize` and
+  `Parser.parse` **1** each where they read 24 and 24, and the harness reads
+  `frames.mod.tex_roi` 159 → 87 with `frames.total` 1552 → 1400 on `terminal` and every API pin
+  unmoved. Both analyses return the same answers.
+- **A cook fingerprints once, and a never-seen program is lexed once (PERF-5).** `prepare`
+  computed `TEXCache.fingerprint` for its memory preflight, `TEXCache.get` computed the same
+  string again and `put` a third time on a cold miss; the fingerprint's own sigil scan then
+  lexed a source that `parse_and_split` was about to lex again. The key now travels down from
+  `prepare`, and the sigil scan **hands** its token stream to the parse through
+  `tex_compiler.lexer.offer_tokens` / `claim_tokens`. It is a handoff, not a cache, and that is
+  the safety argument: claiming removes the entry, so a token list reaches at most one parse and
+  two ASTs can never share the `SourceLoc` objects the fused-chain tagger writes to. Every
+  degradation — an eviction, a lost race, an unclaimed offer, an unlexable source — costs a lex
+  and never a wrong token stream. Pinned by `TEXCache.fingerprint` and `param_only_names` reading
+  1 / 5 / 10 per tick where they read 2 / 10 / 20, by `source_edit`'s lex going 2 → 1, and by a
+  committed fingerprint golden minted at the base sha, so every key string is provably unchanged.
+- **A frame asks the host for free VRAM once, not once per stage (PERF-6).** On a default
+  whole-frame CUDA cook the memory preflight's cheap path returns before it queries anything, so
+  the tile planner's "reuse the preflight's reading" hint was `None` on every stage and each
+  stage bought its own 90–112 µs query — seven per ten-stage 1024² frame. What is remembered
+  between cooks is **not the reading** but the one term of it no cook can move: the bytes on the
+  device TEX's allocator does not own. The bytes it does own are re-read on every call from a
+  single allocator snapshot, and a figure is served only when the estimate is under half the
+  budget, so every strip count is still planned on a number bought inside that same call — no tile
+  plan moves, and that is pinned against a committed tile-plan golden over the whole example
+  corpus. A host swapped under a warm memo is invalidated by a generation counter
+  (`tex_runtime.host.services_generation`), a hole this lane's own probe fell into before the hook
+  existed. Pinned by `host.get_free_memory` reading **0** on `all_dirty` (was 7) and `source_edit`
+  (was 4), with `prewarm`'s 10 unmoved because that is a different caller asking a different
+  question. `tex_tiling.forget_free_memory` is the escape hatch for a caller that knows VRAM moved
+  behind the allocator's back; nothing a cook does needs it.
+- **The cold compiled path is pinned, and the regression it was opened on does not exist
+  (PERF-7).** A reported slowdown on the cold compiled tier was investigated and **not
+  reproduced**: the counts are identical at every sha in the round, and the sitting's own base
+  legs say the same thing once they are read with their null control — three of five legs agreed
+  to within 0.7 %, the other two agreed with each other, and the whole appearance of a regression
+  was which of them was used as the denominator. What shipped in its
+  place is `tests/test_perf7_compiled_cold.py`: eleven named front-end seams read **0** per cold
+  compiled cook, four route seams read exactly **1** so the zeros cannot be satisfied by a cook
+  that never happened, and the total frame count sits under a ceiling with its `v0.37.0` reading
+  written beside it (`blur_chain` 276 → 277 against a ceiling of 340). The named rows are
+  equalities and the total is a ceiling on purpose — a per-frame total is partly a claim about
+  CPython, and three releases in a row were blocked by tests that pinned something whose contract
+  was never exact. A mutation guard defeats the codegen cache and requires the pin to red (279
+  frames → 659).
+- **The analysis memos are keyed on the egress profile, not on the source alone (PERF-8).** Four
+  memos behind `tex_lazy` and `tex_roi` cached a whole AST or answer under the source text while
+  their value depended on the process-global plane-wire flag, so a host that flipped the egress
+  profile mid-process would have read a stale answer across cooks. The five keys now carry a
+  profile term. Pinned by `tests/test_perf8_memo_flag_key.py`: mint a parse with plane wires off,
+  flip them on, ask again without clearing anything, and get the plane parse — then flip back and
+  get the swizzle parse. Unreachable under the ComfyUI profile, which sets the flag once; fixed
+  because the next host will not.
+
+### Negative engineering
+
+- **The chain cook moves out of `tex_engine` (NEG-2).** The pre-specified L-A split named in the
+  ENG-14 design fired: `cook_stage_list`, `boundary_lineage_key`, `cook_fused_cached`, the lineage
+  computation and the ENG-9 interpreter pool moved to a new `tex_chain.py` (429 LOC), taking
+  `tex_engine.py` from **1673 to 1318** lines and its `_HEADROOM_FLOOR` from 1700 to **1400** — a
+  floor that only ever moves down. Every moved name is re-exported, to the same objects, so a host
+  that vendors a file list gains one filename and loses no imported symbol; `run()`'s bytecode is
+  unchanged because the re-export binds into the module's own global slot, and the split was
+  proved by **bytecode identity** rather than by re-measuring. `tex_chain` is a leaf: it imports
+  the plan types only under `TYPE_CHECKING`, verified by importing it in a fresh process and
+  finding `tex_engine` absent from the module table.
+- **Six host-facing environment switches get a floor, a test and a documented table (NEG-3).**
+  The two budget switches behind the memory governor and the results cache were hardened rather
+  than frozen — set, unset and garbage are each an exercised arm — and every product `TEX_*`
+  switch is now bound in both directions to README's *Environment switches* table by a drift gate,
+  so a switch cannot be added without being documented or documented without existing.
+- **Two routes no shipped caller reaches are driven, both ways (NEG-3).** The offline-docs route
+  and its whitelist, and the cache-freeing and tool-listing entry points, are exercised in both
+  states of their switch — pinned, not frozen, because an embedding host outside ComfyUI reaches
+  them even though nothing in this tree does.
+- **An advisory lint that crashes now says so (NEG-3).** `tex_api.control_flow_advisories`
+  returned an empty list when its own analysis raised, which reads as "no problems". It returns a
+  synthetic `E0000` instead; the return type is unchanged.
+- **Seven gates that were not gating, now gate (NEG-1).** The REG-2 line-count ratchet scanned one
+  package and now scans every product package, printing the scanned set in its own pass line; its
+  stale arm asserts instead of printing, so an under-budget module in the baseline reds asking to
+  be re-pinned **down**; `tex_results.py` gains an ENG-14 headroom floor of 1958 (it is 1903) with
+  its next cut pre-specified; the free-VRAM counter row gains a real CPU witness, so mis-targeting
+  either spy reds while the five CPU pins still pass; the two documentation-drift guards stopped
+  skipping their own bodies and are mutation-proved; all ten benchmark front ends converge on
+  `tex_cache.parse_and_split`, with the eight-config statuses identical either side; and the 2D
+  noise family owns its dynamo recompile budget, which removes the last order-dependent red from
+  the canonical run.
+- **Six more pins that were not pinning (SIMP-3).** The same defect class as NEG-1's, found in
+  the suite rather than in the ratchets, and closed row by row without touching product code.
+  *The mutation harness* now asserts that each of its **71** anchors still matches the file it
+  names **exactly once**: an anchor that has drifted mutates nothing, so the harness sweeps an
+  unmutated tree and reports a verdict about a bug it never introduced. *Forty-seven sites in
+  twenty-eight test files* that answered an absent CUDA device, an absent torchvision, an absent
+  aiohttp or an absent v3 node API with a **pass** now report `r.skip(name, reason)`, and two
+  rows keep them honest — a census of the skip-as-pass shape pinned at **0**, and a skip budget
+  pinned at **95** by AST census that reds in both directions, because a skip is a row the
+  automated lane cannot run and that is a debt figure, ratcheted the PUB-1 way. The budget is a
+  census of the sources, deliberately not of a run: a run's skip count is a fact about the box,
+  and the same tree would pin two different numbers on the two lanes. *Invariant 9's two
+  enforcers* had CUDA as their only path, so on the one automated lane they asserted nothing;
+  each comparator is now a function of its tensors (`envelope_verdict`, `band_verdict`) with a
+  CPU witness that drives it on fabricated pairs, including the case where the envelope's two
+  arms must disagree — the CUDA behaviour is byte-identical. *Two consumer registries* in the
+  PORT-1 shape name every consumer with its reason: the plane-wire flag (13 consumers across 4
+  modules, 5 memos behind 4 key sites, plus a definer pin) and the HTTP route table (11
+  decorators, 10 paths, checked both directions). And *a tree-wide lint over `git ls-files`*
+  reds on a tracked file that names a home, profile or project root — the **sixth** cheap-tier
+  ratchet, with an empty allowlist. It caught the thing it was written for: a benchmark's
+  `sys.path` bootstrap had ended with an absolute path into one machine's host install since
+  v0.16, as an unreachable last resort nobody ever saw. The directory is now derived from the
+  file's own location, with an environment override that raises **naming itself** when nothing
+  resolves. The broad "any drive-letter path" rule was measured and **not** landed: at this tree
+  it reds on eight legitimate lines per real leak, so it would have arrived with an allowlist on
+  its first day.
+- **There are no standing reds.** The last one — a console-encoding test — was a harness bug, not
+  an environment fact: its child interpreter was given a working directory and nothing else, so it
+  died on an import error before printing anything and the test reported a console crash that had
+  not happened. `tests/known_reds.json` ships **empty**, which is the state to keep it in.
+
+### Tooling and gates
+
+- **The structural counts harness (BENCH-2).** `benchmarks/host_path_counts.py` drives the
+  interactive scenarios a host produces — a terminal-node scrub, a mid-graph scrub, a window pan,
+  an all-dirty frame, a source edit, a prewarm and the editor lint — and counts three tiers:
+  named call sites, TEX Python frames by module, and device work (kernel launches, copies,
+  allocations). `tests/test_bench2_counts.py` pins the device-independent rows, which read
+  identically on the CPU leg at 96²/48² and the CUDA leg at 1024²/512² — that identity is what
+  makes them CI-gateable — and the CUDA rows skip, rather than pass, without a device. A
+  counters-are-not-inert row drives each counted mechanism directly and requires the counter to
+  see it, so no zero is vacuous. A same-tree null run of the whole matrix moves **zero** rows.
+- **An eighth scenario, and the order pollution it found (BENCH-3).** `node_scrub` drives the
+  ComfyUI node's own interactive tick — both lazy rounds plus the execute — and pins nineteen
+  device-independent rows, including the lazy-analysis row that no other scenario can see. Adding
+  it moved **0** rows of the seven that were already there, proved with the scenario filter rather
+  than asserted. The lane also found and fixed a test-order dependency: two analysis memos keyed
+  on source text alone while their value depended on the plane-wire flag, so a file that parsed a
+  plane example poisoned later oracles. Fixed on the test side here, and on the product side by
+  PERF-8. Third item, **measured and written up rather than fixed**: the results cache has a
+  cliff, and the interactive scenario is not exempt from it. At 1024² with the default frame
+  budget a terminal-node scrub reaches the budget on tick **471** and a ten-stage all-dirty
+  scrub on tick **11**, after which the median tick costs 5.9× and 25–31× respectively. The cost
+  is the **spill**, not the eviction bookkeeping: neutering the spill takes a 20-tick all-dirty
+  run from 26.4× back to 0.96×, flat. The counter that would gate it already exists in the
+  cache's own statistics; it is not a harness row because at the gate's shape the knee is some
+  fourteen thousand ticks away and the row could only ever read 0 in CI. Written up in
+  `docs/host-path-counts.md` for whoever takes the retention policy, with its acceptance test.
+- **One gate command, one verdict (SIMP-1).** `tools/gate.py --tier cheap|full` replaces a page
+  of remembered invocations: cheap runs the six ratchets in about 8 s, full adds the CI-shaped
+  run and the canonical whole-suite run, and every leg prints a machine-readable `proves:` line so
+  a reader of one tier knows what it did not run. **The exit code is the verdict** — `0` green,
+  `1` red with the failing node ids taken from the JUnit report rather than scraped from stdout,
+  and `2` green-but-the-allowlist-is-stale, because a stale allowlist is the same lie as a missing
+  one. The known-red list is `tests/known_reds.json`, data rather than prose, with a closed
+  vocabulary in which an unknown token forgives **nothing**. A verdict is cached under a hash of
+  the tree and the tier, so re-running an unchanged tree returns a 785-second full-tier answer in
+  under a second; `--no-cache` forces. The cache key also carries **each interpreter's resolved
+  path and `sys.version`**, not its basename: every interpreter on a Windows box is called
+  `python.exe`, so a basename key once served one interpreter's verdict for a run made with
+  another, and a cache that answers for the wrong interpreter is the same class of lie as a
+  stale known-red list. The cached-verdict line now names the interpreters the answer belongs to.
+- **`--compare` returns a verdict you can read (SIMP-1).** The comparison's exit code now counts
+  the call and device rows only. The frame census moves for every lawful change that adds a call,
+  renames a helper or splits a module — the chain split alone moved thirteen frame rows per device
+  with the totals conserved to the unit — so a gate that counted them said nothing and had to be
+  reasoned past by hand. Frame rows print under their own heading with both totals beside them,
+  which is the check. Each save now records its cache directory, whether that directory started
+  empty, and a `-dirty` suffix on the sha when the measured tree is not the commit it names, so a
+  comparison between legs that were not both cold says so in its own header.
+- **The test runner's wiring is derived, not typed (SIMP-4).** `tests/run_all.py` went from 2109
+  hand-written lines to **154** and names no test: it discovers every top-level `test_*(r)` by
+  AST, in a deterministic order with a five-entry ordering register that carries its reason beside
+  each entry. Modules are imported when their first row is reached rather than up front, so one
+  unimportable module no longer produces a run with no rows and no summary. TST-7 was re-pointed
+  rather than dropped — it censuses the tree and asserts the runner reaches every row, invents
+  none, excludes nothing stale, and that no test is defined where no runner could call it.
+- **Error codes get a coverage ratchet, and thirty of them get a trigger (SIMP-6).** Nothing
+  told anyone which diagnostics no test had ever drawn, and the answer was **46 of 88**. There
+  is no registry of codes in the tree, so the set is *derived* rather than typed: one walk finds
+  every `E####`/`W####` the product constructs, a second finds every code a test names, and the
+  difference is pinned as both a count and a set — a code that arrives without a test reds and
+  is named, and a code that gains one reds asking for the pin to move **down**. The counting
+  file excludes itself from the tests-side scan, because a code written down as debt is
+  bookkeeping and not coverage. **Thirty one-row-per-code trigger tests** drive the smallest TEX
+  program that draws each code through `tex_api.check` — the call an editor's live lint makes —
+  with one row tying the compile surface to it, taking the untested set from 46 to **16**, each
+  of the 16 listed beside the pin with the reason it has no trigger. Four families are declared
+  with a written reason and checked against the tree (`E2010` 16 construction sites, `E5003` 13,
+  `E3402` 8, `E3200` 6), and three codes built in more than one place (`E0000`, `E2000`,
+  `E2002`) get a row asserting every site agrees on the severity a consumer branches on, on
+  whether there is a hint to draw, and that every site builds a message — deliberately not on
+  the full field set, because those sites go through three different builders and "same fields"
+  can only honestly mean the fields a consumer reads. Rows assert that the code appears, as an
+  error, with a message; they do not pin message text or caret column.
+- **Citations are machine-checked (SIMP-5).** `tools/check_citations.py` resolves every
+  `file:line` citation in the shipped documents and fails on a dead one, a blank one or one past
+  end-of-file; a citation whose sentence names no covering symbol is a warning counted against a
+  budget pinned at 28 that fails in **both** directions. The rule was chosen by measurement — six
+  windows were run over the same 82 citations, and the sentence window won because its three extra
+  warnings over the quieter paragraph window were three genuinely wrong pointers the paragraph
+  window hid. Both sides are restricted to files git tracks, asked of git rather than guessed, with
+  a documented fallback that names which source it used. Gated by `tests/test_simp5_citations.py`,
+  whose witness tree is wrong in each of the four ways that matter plus the same line cited twice —
+  once naming its symbol, once not — so the symbol rule can be made neither vacuous nor
+  unconditional without breaking the pair. **Eleven dead or misdirected pointers were repaired**,
+  every one by re-pointing at the symbol rather than dropping the claim.
+
+- **The frame counters key a method by its class on Python 3.10 too (FIX-1).** `co_qualname`
+  exists from 3.11; below that the counters' fallback keyed a method frame by its bare name, so
+  the compiled-cold pins' inertness guard fired on the 3.10 CI leg alone while 3.11 and 3.12
+  were green. One resolver (`benchmarks/host_path_counts.py::frame_qualname`) now derives
+  `Class.method` from the frame's `self`/`cls` through the MRO, memoised per code object, with a
+  forced-fallback seam and two rows proving the derived key equals the native one. Found by
+  pushing the round's commits ahead of the version bump, which is what that sequence is for.
+
+### Docs
+
+- **`docs/host-path-counts.md`** is the design note for the counts tier: why counts and not times,
+  what is counted, the eight scenarios, the per-tick signature at head, the null run, the
+  candidate follow-ups each with **the counter that would show it fixed**, and §7's sitting — which
+  in this release stops being a deferred tier and records its first result.
+- **`docs/brief-conventions.md`** (new) writes down the form a work brief takes here, from a
+  measurement rather than a preference: across thirteen consecutive lanes every lane landed and
+  fourteen separate incidents were caused by something a brief said that was not true at head.
+  Nine conventions, each naming the incidents it prevents; two non-negotiable measurement rules
+  (give every leg of a comparison its own artifact cache and discard the first; measure in a
+  worktree, never in a directory an embedding host loads); and the fixed hand-back skeleton, in
+  which an empty section is an answer and a missing section is a silence.
+- **The map cannot lie (SIMP-2).** Three documentation gates were widened from checks of integers
+  into checks of registers. Every line-count figure `AGENTS.md` states — table row, parenthesised
+  prose aside and inline spelling alike — is now checked within 10 % of the file, where the old
+  band was 20 % of a 3000-line module and one prose figure was read by nothing; every headroom
+  floor and over-budget baseline must be a module the map names, with its value. The cache
+  register is **enumerated** rather than counted: an AST census finds 64 module-level stores, 40
+  named in the architecture register and 24 excused with a reason each, and the exemption list is
+  itself a ratchet — a stale excuse, a too-short reason, or a store both registered and excused
+  all red. Five memo stores had landed in one round with no mention anywhere while the old
+  two-integer check stayed green. The escape-hatch register is bound to README's switch table in
+  both directions, which is the sentence that register already made in prose.
+- **`docs/roadmap.md` §10** records what this round learned about measuring: counts are the CI
+  gate, timing is a sitting on a quiet box with a discard leg per new tree and a same-tree null
+  control in the same sequence, `tools/gate.py` is the verdict, and a counts comparison's verdict
+  excludes the frame subtotals.
+
+### Release engineering
+
+- `.comfyignore` already excludes `benchmarks/`, so the sitting archive added under
+  `benchmarks/results/` does not reach the published archive and the PUB-1 surface ratchet is
+  unmoved.
+- `.gitignore` gains one whitelist. `benchmarks/results/` was ignored wholesale, which would
+  have made the release's own timing evidence silently uncommittable while `docs/roadmap.md` §10
+  was being amended to point at it. One sitting directory is now tracked, in the shape the
+  compat-corpus and cache-key goldens already use and for the same stated reason: a record that
+  is not in the repository cannot be re-read, re-compared or argued with.
+- The version pencil in `docs/roadmap.md` §9 gains this release and moves **Linear light**
+  (COLOR-1) and every later row one place down, the way v0.35.0 and v0.36.0 each did for Planes.
+  The pencil had no spare slot left to absorb this one, so every row through the engine era
+  moves. The stale-pointer sweep a re-pencil owes found four forward references to a version
+  that had moved under them — two in `DEVELOPMENT.md`, one in `docs/plane-bindings.md`, one in
+  `docs/roadmap.md`'s own proof-milestone list — and all four are repaired here.
+
 ## [0.37.0] - 2026-09-19
 
 **Planes.** A host wires ONE image input carrying many named planes — an EXR's `diffuse` /
