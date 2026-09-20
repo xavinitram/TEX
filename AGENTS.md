@@ -156,9 +156,9 @@ switches", and `tests/test_neg3_env_switches.py` reds on a product switch that i
 - `TEX_DOCS_LOCAL` (`tex_compiler/diagnostics.py`) — LANG-7's air-gapped docs link. Not dead
   UI: an LSP host consumes `docs_url` into a code description. Both states pinned by NEG-3.
 
-**The 19 caches are non-redundant** — each keys on a different thing with a distinct
+**The 41 caches are non-redundant** — each keys on a different thing with a distinct
 lifecycle. Do not consolidate them. (See ARCHITECTURE.md for the enumerated inventory;
-the count there and here must match — a DOC-7b check enforces it.) #19 (v0.25 CACHE-2) is
+the count there and here must match, and every module-level store must appear in that register or be excused by name — `test_doc7d_cache_store_enumeration` reds with the `file:line` of one that is not.) #19 (v0.25 CACHE-2) is
 `tex_results.ResultCache`, the engine frame cache — the first HOST-instantiated store in the
 register (keyed by CACHE-1 lineage keys, RAM byte-budget + disk spill); CACHE-5's governor
 will arbitrate it against the per-device pools.
@@ -186,8 +186,8 @@ pre-specified cut — the CACHE-1 key-minting leaf out to `tex_results_keys.py` 
 register's rule is now the house pattern rather than one module's exception: a module gets
 its floor and the design note for its next cut BEFORE the wall, never at it.
 
-Currently over the hard budget — status as of v0.36.2 (drift-checked by
-`test_doc7b_map_drift`, which reds if any `~LOC` here diverges >20% from `wc -l`):
+Currently over the hard budget — status as of v0.37.0 (drift-checked by
+`test_doc7b_map_drift`, which reds if any `~LOC` here — in this table or in prose — diverges >10% from `wc -l`):
 
 | Module | LOC | Status |
 |--------|-----|--------|

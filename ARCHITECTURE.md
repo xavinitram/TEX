@@ -255,7 +255,7 @@ the raw fp16 win (~1.35–1.45×) is available, without the safety net, via expe
 (`img_*`, `arr_*`) accumulate in fp32 (an fp16 sum overflows to inf at ≥1024²); an
 out-of-fp16-range literal / a large-value `vec()` also stays fp32 (interp==codegen).
 
-## The 19-cache architecture
+## The 41-cache architecture
 
 Non-redundant by design — each store keys on a different thing (source-hash vs
 `id()`-type_map vs device/precision tuple vs AST-fingerprint vs resolution-bucket)
