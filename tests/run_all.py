@@ -1884,11 +1884,13 @@ def main():
         test_bench2_interactive_per_tick_counts,
         test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick,
         test_bench2_cuda_per_tick_counts,
+        test_bench2_free_memory_queries_per_tick,
         test_bench2_counters_are_not_inert,
     )
     test_bench2_interactive_per_tick_counts(r)
     test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r)
     test_bench2_cuda_per_tick_counts(r)
+    test_bench2_free_memory_queries_per_tick(r)
     test_bench2_counters_are_not_inert(r)
 
     # PERF-1: the ROI walk parses a source ONCE (the fold works on an `ast_nodes.clone_tree`

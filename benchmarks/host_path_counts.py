@@ -172,6 +172,14 @@ SPY_TARGETS: "dict[str, tuple[str, ...]]" = {
     "trim_reserved_pool":         ("TEX_Wrangle.tex_memory.trim_reserved_pool",),
     "_disown_inputs":             ("TEX_Wrangle.tex_buffers._disown_inputs",
                                    "TEX_Wrangle.tex_engine._disown_inputs"),
+    # PERF-6: the free-VRAM question, counted at the seam that COSTS the money. The driver
+    # call below is only the inner 13-17 us of a 90-112 us host call (the host's own
+    # `get_free_memory` also folds in allocator stats), so a `mem_get_info` reading alone
+    # under-reports this per-cook cost ~7x. BOTH implementations are patched: which one a run
+    # uses depends on whether ComfyUI is importable, and patching one reports a confident zero
+    # in the other shape.
+    "host.get_free_memory":       ("TEX_Wrangle.tex_runtime.host.NullHostServices.get_free_memory",
+                                   "TEX_Wrangle.tex_runtime.host.ComfyHostServices.get_free_memory"),
     "torch.cuda.mem_get_info":    ("torch.cuda.mem_get_info",),
 }
 

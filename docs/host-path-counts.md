@@ -281,12 +281,27 @@ test before it starts, and cannot claim a win the instrument would not see.
    two tile plans (`tex_tiling._tile_plan:38` and `_halo_tile_plan:142`, both re-exported into
    `tex_engine` at `tex_engine.py:101`), `enforce_cache_budget` (`tex_memory.py:327`),
    `trim_reserved_pool` (`tex_memory.py:766`) and `_disown_inputs` (`tex_buffers.py:158`) —
-   called from `tex_engine.py:1318-1322` — plus `fingerprint` **twice**. On CUDA,
-   `torch.cuda.mem_get_info` fires on **7 of the 10** stages of an `all_dirty` frame and on
-   **none** of the interactive ticks.
-   *Shows fixed as:* `TEXCache.fingerprint` going **20 → 10** on `all_dirty` (one fingerprint
-   per cook instead of two), `_halo_tile_plan` going **10 → 0** on the stages whose pixel-local
-   plan already answered, and `torch.cuda.mem_get_info` going **7 → 1** per whole frame.
+   called from `tex_engine.py:1318-1322` — plus `fingerprint`, **once** since the per-cook key
+   became one string handed down from `prepare`.
+
+   **Who buys the free-VRAM reading, corrected.** An earlier reading of this item attributed
+   the **7 of 10** stages that issue `torch.cuda.mem_get_info` on an `all_dirty` frame to the
+   M-1 preflight. They are the **TILE PLANNER's**: on those stages LAT-2's cheap path fires,
+   `_preflight_memory` returns `free_hint = None` without querying, and `_tile_plan` then buys
+   its own reading — so the `free_hint` hand-off is inert on exactly the cook it was written
+   for. The other three stages are the blur/morphology ones, which are not tile-safe and leave
+   through `is_tile_safe_cached` before any query. The interactive ticks issue **none**.
+
+   **Measure it at the seam that costs the money, not at the driver.** The `host.get_free_memory`
+   row is the one to read: the driver call is only the inner **13-17 µs** of a **90-112 µs**
+   host call (the host folds allocator statistics in on top of `mem_get_info`), so a fix
+   measured on `torch.cuda.mem_get_info` alone would claim a seventh of what it actually saved.
+   Both rows read 7 on `all_dirty`, 4 on `source_edit`, 0 on every interactive tick; `prewarm`'s
+   10 are a different caller entirely (`tex_runtime/compiled.py::_cuda_headroom_ok`, once per
+   program before a background compile is submitted).
+   *Shows fixed as:* `host.get_free_memory` **and** `torch.cuda.mem_get_info` going **7 → 1 or
+   0** per `all_dirty` frame with `prewarm`'s 10 unmoved, and `_halo_tile_plan` going
+   **10 → 0** on the stages whose pixel-local plan already answered.
 7. **A window move rebuilds the coordinate builtins.** `pan` costs **26** CUDA kernels and
    **22** allocations against `terminal`'s 22 and 18 — exactly +4 and +4 for the same cook with
    a moved window. (This is also the LAT-4 LRU the harness had to defeat to measure the row

@@ -58,11 +58,11 @@ def _bench():
     return mod
 
 
-def _api_counts(scenario_name: str) -> dict:
-    """Run ONE scenario's API pass on CPU and return `row -> (min, max)` per steady tick."""
+def _api_counts(scenario_name: str, device: str = "cpu") -> dict:
+    """Run ONE scenario's API pass and return `row -> (min, max)` per steady tick."""
     b = _bench()
     cls = next(c for c in b.SCENARIOS if c.name == scenario_name)
-    scn = cls(RES, WINDOW, "cpu", ticks=TICKS)
+    scn = cls(RES, WINDOW, device, ticks=TICKS)
     try:
         folded = b.pass_api(scn, TICKS)
     finally:
@@ -331,6 +331,61 @@ def test_bench2_cuda_per_tick_counts(r: SubTestResult):
                 r.ok(f"{label}: {kern} kernels / {d2h} D2H / {allocs} allocations per tick")
         except Exception as e:
             r.fail(f"BENCH-2 cuda {label}", f"{type(e).__name__}: {e}")
+
+
+# ── PERF-6: how often a tick asks the host how much VRAM is free ────────────
+# `host.get_free_memory` is the seam that COSTS the money, and it is NOT the same
+# measurement as the `torch.cuda.mem_get_info` row beside it: the driver call is the inner
+# ~13-17 us of a ~90-112 us host call (the host folds allocator statistics in on top), so a
+# fix measured on `mem_get_info` alone would claim a seventh of what it saved.
+#
+# The counts are RESOLUTION-INDEPENDENT (verified: identical at 96^2 and at 1024^2 on an
+# sm_120 box), because the query sits before the budget arithmetic that resolution moves —
+# so this test runs at the cheap CPU shape with the device flipped, rather than paying for a
+# second 1024^2 matrix.
+_FREE_MEM_CPU = 0       # every scenario: the planners return before the query off CUDA
+_FREE_MEM_CUDA = {
+    # A whole-frame recook: ten cooks, of which the seven POINTWISE stages reach
+    # `_tile_plan`'s free-VRAM query (the three blur/morphology stages are not tile-safe,
+    # so they leave through `is_tile_safe_cached` and `_halo_tile_plan`'s cheap gate).
+    "all_dirty":   7,
+    # The first whole frame after a source edit: seven cooks, four of them pointwise.
+    "source_edit": 4,
+    # The interactive ticks pay NOTHING: `_preflight_memory` fires (1 / 5 / 1 per tick) and
+    # LAT-2's cheap path returns before the query, and the ROI route never reaches a tile plan.
+    "terminal":    0,
+    "midgraph":    0,
+    "pan":         0,
+    # `tex_api.check` never cooks, so nothing asks.
+    "lint":        0,
+    # NOT the tile planner's, and the reason this row cannot be read as "the planner's
+    # queries": a prewarm asks `_cuda_headroom_ok` (tex_runtime/compiled.py) once per program
+    # before submitting a background compile. It is also this row's NON-INERT witness — a pin
+    # of 0 on five of the seven scenarios above would otherwise be satisfied by a dead spy.
+    "prewarm":    10,
+}
+
+
+def test_bench2_free_memory_queries_per_tick(r: SubTestResult):
+    """PERF-6: the number of live host free-VRAM queries an interactive tick pays."""
+    print("\n--- BENCH-2: host free-VRAM queries per tick ---")
+    for label in ("terminal", "midgraph", "pan", "all_dirty", "lint"):
+        try:
+            _check(r, f"{label} (cpu)", _api_counts(label),
+                   {"host.get_free_memory": _FREE_MEM_CPU})
+        except Exception as e:
+            r.fail(f"BENCH-2 free-memory {label} (cpu)", f"{type(e).__name__}: {e}")
+
+    if not torch.cuda.is_available():
+        r.skip("BENCH-2 free-memory (cuda)", "no CUDA device — the planners return off CUDA, "
+               "so the only readings that can move are not measurable here")
+        return
+    for label, want in _FREE_MEM_CUDA.items():
+        try:
+            _check(r, f"{label} (cuda)", _api_counts(label, "cuda"),
+                   {"host.get_free_memory": want})
+        except Exception as e:
+            r.fail(f"BENCH-2 free-memory {label} (cuda)", f"{type(e).__name__}: {e}")
 
 
 def test_bench2_counters_are_not_inert(r: SubTestResult):
