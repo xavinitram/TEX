@@ -51,6 +51,18 @@ how a gate becomes decoration. Read the frame rows as a census — the sums are 
 let the counter rows carry the verdict. `--counters-only` asserts that rule explicitly for a
 caller that depends on it (`tools/gate.py` passes it).
 
+**The gate that consumes this.** `tools/gate.py` runs the ratchets, the CI shape and the
+canonical suite and prints one verdict; `--counts-baseline PATH` adds this harness as a leg,
+at the gate shape (`--device cpu --res 96 --window 48 --ticks 4 --prof1 off`, about 3 s), with
+`--counters-only`. It reads two environment variables of its own, neither of which the product
+ever reads: **`TEX_CI_PYTHON`**, the interpreter for the CI-shape leg — ideally the Python
+version CI uses, on an installation with no embedding host — which the gate falls back to the
+current interpreter without, saying so in that leg's `proves:` line; and **`TEX_GATE_CACHE`**,
+where the tree-hash verdict cache is kept (default: a file in the system temp directory, which
+must stay outside the repository or it would change the hash it is keyed on). They are
+documented here and in `tools/gate.py` rather than in README's environment-switch table,
+because that table is the product's host-facing surface and these two are development tooling.
+
 **Provenance a comparison needs.** `--save` records the `TEX_CACHE_DIR` in force and whether
 it was empty before the run, and appends `-dirty` to the git sha when the worktree carries
 uncommitted changes. `--compare` prints both and warns above the diff when the two legs shared

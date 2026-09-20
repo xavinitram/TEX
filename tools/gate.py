@@ -33,10 +33,19 @@ latency, not for coverage, and this tool says so out loud.
 `--tier full` runs cheap first (cheapest first, and it aborts there if cheap is red unless
 `--keep-going`), then the two whole-suite legs that are NOT subsets of each other:
 
-  * **ci-shape** — the interpreter CI uses, from the package ROOT so the embedding host is off
-    `sys.path`, `CUDA_VISIBLE_DEVICES=-1`, `-m "not slow"`, `-p no:cacheprovider`. It is the
-    only leg that can catch a test which assumes a host or a GPU. It runs on Windows, so it
+  * **ci-shape** — a second interpreter, ideally the Python version CI uses and one with no
+    embedding host installed, run from the package ROOT so the host is off `sys.path`, with
+    `CUDA_VISIBLE_DEVICES=-1`, `-m "not slow"`, `-p no:cacheprovider`. It is the only leg that
+    can catch a test which assumes a host or a GPU. It runs on whatever OS you are on, so it
     cannot catch a line-ending or toolchain difference — say that when quoting it.
+
+    Which interpreter, in order: `--ci-python`, then the `TEX_CI_PYTHON` environment variable,
+    then the interpreter running this script. **No path is hard-coded here**: where a second
+    Python lives is a property of a particular machine, and this file is published. The last
+    resort still runs the leg — the shape alone is worth something — but it is neither a second
+    version nor a host-free installation, so the leg's `proves:` line says which interpreter it
+    used and, when it fell back, that it proves less. Set `TEX_CI_PYTHON` once per box and the
+    question stops arising. This tool only ever RUNS that interpreter; it never installs into it.
   * **canonical** — the embedded interpreter, from the package's PARENT, through
     `tools/canonical_harness.py` (the v3 NodeOutput wrapper disarmed), `-X utf8`. It is the
     only leg that exercises CUDA and the host-present path.
@@ -86,8 +95,8 @@ _CHEAP = [
     ("TST-7 runner drift", "tests/test_v017_phase1.py"),
 ]
 
-#: The interpreter CLAUDE.md names for the CI shape. Overridable; never installed into.
-_DEFAULT_CI_PYTHON = r"C:\Projects\TEX_compositor\.venv\Scripts\python.exe"
+#: Where the CI-shape interpreter is named, so this file names no machine's private layout.
+_CI_PYTHON_ENV = "TEX_CI_PYTHON"
 
 _SUMMARY_RE = re.compile(
     r"^[=\s]*\d+ (?:passed|failed|error|deselected|skipped)|"
@@ -295,10 +304,33 @@ def run_cheap(python: str, scratch: str, verbose: bool) -> Leg:
     return _run(leg, argv, _PARENT, {}, scratch, verbose)
 
 
-def run_ci_shape(ci_python: str, scratch: str, verbose: bool) -> Leg:
+def resolve_ci_python(explicit: str | None) -> tuple:
+    """`(interpreter, where it came from)` for the CI-shape leg.
+
+    In order: `--ci-python`, then `$TEX_CI_PYTHON`, then the interpreter running this script.
+    No default path is written down here on purpose — a hard-coded one would name a particular
+    machine's private layout, and this file is published. The last resort still RUNS the leg,
+    because the shape is worth something even from one interpreter (it puts the package root on
+    `sys.path` instead of its parent and hides the GPU), but it proves less: it cannot show that
+    the suite passes on the Python version CI uses or without the embedding host installed. So
+    it says which interpreter it used, every time, in the leg's `proves:` line."""
+    if explicit:
+        return explicit, "--ci-python"
+    from_env = os.environ.get(_CI_PYTHON_ENV)
+    if from_env:
+        return from_env, f"${_CI_PYTHON_ENV}"
+    return sys.executable, "fallback"
+
+
+def run_ci_shape(ci_python: str, scratch: str, verbose: bool, source: str = "--ci-python") -> Leg:
     leg = Leg("ci-shape", "CPU-only, the embedding host off sys.path, the CI interpreter — "
                           "the only leg that catches a host or CUDA assumption; runs on this "
                           "OS, so it cannot see a line-ending or toolchain difference")
+    leg.proves += f" [interpreter: {ci_python} (from {source})]"
+    if source == "fallback":
+        leg.proves += (f" — NOTE: no --ci-python and no ${_CI_PYTHON_ENV}, so the CI shape is "
+                       f"being run by the CURRENT interpreter; it is not a second Python "
+                       f"version and not a host-free installation, so it proves less")
     if not os.path.isfile(ci_python):
         leg.rc, leg.summary = 127, f"interpreter not found: {ci_python}"
         leg.failures = ["<ci-shape interpreter missing>"]
@@ -410,8 +442,10 @@ def main(argv=None) -> int:
                         "canonical whole-suite run (default: cheap)")
     p.add_argument("--no-cache", action="store_true",
                    help="ignore any cached verdict for this tree and tier, and refresh it")
-    p.add_argument("--ci-python", default=_DEFAULT_CI_PYTHON,
-                   help="the interpreter for the CI shape (RUN only; never installed into)")
+    p.add_argument("--ci-python", default=None,
+                   help=f"the interpreter for the CI shape (RUN only; never installed into). "
+                        f"Falls back to ${_CI_PYTHON_ENV}, then to the interpreter running "
+                        f"this script, which is said out loud because it proves less")
     p.add_argument("--python", default=sys.executable,
                    help="the interpreter for the cheap and canonical legs "
                         "(default: the one running this script)")
@@ -427,7 +461,8 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
 
     head, th = head_label(), tree_hash()
-    key = f"{th}:{a.tier}:{os.path.basename(a.ci_python)}:{bool(a.counts_baseline)}"
+    ci_python, ci_source = resolve_ci_python(a.ci_python)
+    key = f"{th}:{a.tier}:{os.path.basename(ci_python)}:{bool(a.counts_baseline)}"
     if not a.no_cache:
         hit = _cache_read(key)
         if hit:
@@ -455,7 +490,7 @@ def main(argv=None) -> int:
                   f"cheap row re-runs inside the full tier) | VERDICT RED")
             print(f"GATE {head} | OVERALL RED")
             return 1
-        full = [run_ci_shape(a.ci_python, scratch, a.verbose),
+        full = [run_ci_shape(ci_python, scratch, a.verbose, ci_source),
                 run_canonical(a.python, scratch, a.verbose)]
         if a.counts_baseline:
             full.append(run_counts(a.python, a.counts_baseline, scratch, a.verbose))
