@@ -22,7 +22,11 @@ swept. These rows pin that it stays that way:
     the row — not swept with a verdict printed beside it;
   * the runner template contains no literal `import test_...`, so the list cannot be
     hand-written back in;
-  * every row's declared suite is in the list the runner actually imports.
+  * every row's declared suite is in the list the runner actually imports;
+  * every row's ANCHOR still matches the file it names exactly once, so `source.replace(old,
+    new)` actually introduces the bug — a row whose anchor has drifted to 0 matches sweeps
+    the unmutated tree and prints a verdict about a bug that was never there, which is the
+    same lie as a missing import list and went unseen for three releases.
 
 The harness is exercised in a subprocess on purpose: importing it in-process would couple this
 file's collection to whatever the harness does at import time, which is the failure being
@@ -50,7 +54,20 @@ _missing = [("a row naming a suite that is not there", "tex_roi.py", "old", "new
              ("test_this_module_does_not_exist",))]
 _none = [("a row naming no suite at all", "tex_roi.py", "old", "new")]
 
+# Anchor liveness: how many times each row's `old` text occurs in the file it names, at the
+# tree the harness would copy. `None` means the file itself is gone. Sources are read once.
+_src = {{}}
+_anchors = []
+for _row in mc.MUTATIONS:
+    _rel = _row[1]
+    if _rel not in _src:
+        _p = pathlib.Path(mc.SRC) / _rel
+        _src[_rel] = _p.read_text(encoding="utf-8") if _p.is_file() else None
+    _text = _src[_rel]
+    _anchors.append([_row[0], _rel, None if _text is None else _text.count(_row[2])])
+
 print("PROBE" + json.dumps({{
+    "anchors": _anchors,
     "rows": [[row[0], row[1], list(row[4])] for row in mc.MUTATIONS],
     "modules": list(mc.suite_modules(mc.MUTATIONS)),
     "synthetic_modules": list(mc.suite_modules(_synthetic)),
@@ -205,3 +222,31 @@ def test_mut1_every_rows_suite_is_loaded_by_the_runner(r: SubTestResult):
                "nothing:\n  " + "\n  ".join(missing))
         return
     r.ok(f"all {len(data['rows'])} rows' suites are in the runner's {len(modules)}-module list")
+
+
+def test_mut1_every_mutation_anchor_matches_exactly_once(r: SubTestResult):
+    """Every row's `old` text is findable, and findable ONCE, in the file it names.
+
+    The sweep applies a row by `source.replace(old, new)`. Zero matches replaces nothing, so
+    the row runs the UNMUTATED tree and prints a verdict about a bug that was never
+    introduced — a pass that asserted nothing, in the voice of a measurement. Two or more
+    matches mutate a site the row never meant, so a KILLED verdict may belong to a different
+    bug. Both are silent: the sweep lives outside the standalone runner, so only a hand-run
+    over the whole file would see them, and one row had anchored 0x for three releases before
+    anybody did. This row makes the anchors a pin the suite holds, in milliseconds and with
+    no torch: it is a substring count over the sources the harness already names.
+    """
+    print("\n--- MUT-1: every mutation anchor still matches its file exactly once ---")
+    data = _probe()
+    if data is None:
+        r.fail("MUT-1 anchor liveness", _probe_error)
+        return
+    stale = [f"{label} ({rel}): "
+             + ("the file is gone" if n is None else f"{n} matches, expected exactly 1")
+             for label, rel, n in data["anchors"] if n != 1]
+    if stale:
+        r.fail("MUT-1 anchor liveness",
+               f"{len(stale)} of {len(data['anchors'])} row(s) cannot be applied, so the "
+               f"sweep reports a guarantee it never tested:\n  " + "\n  ".join(stale))
+        return
+    r.ok(f"all {len(data['anchors'])} mutation anchors match their file exactly once")
