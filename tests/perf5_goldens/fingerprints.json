@@ -1,0 +1,3368 @@
+{
+ "corpus": [
+  {
+   "key": "examples/alpha_over.tex",
+   "param_only_names": [
+    "mix"
+   ],
+   "sha256_source": "cc8028c1c7df1c1321ffa388d1bac22f6d2de8a21d9c9d908c30173d491a4210",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "bg": "float",
+     "fg": "int",
+     "mask": "int",
+     "mix": "vec3"
+    },
+    "fingerprint": "b0701e6d6e980f74100451d5a6490aee646299e29655ff08efb9a2590daeb1d0"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "bg": "vec4",
+     "fg": "vec4",
+     "mask": "vec4",
+     "mix": "float"
+    },
+    "fingerprint": "ca2a298730429b864c95ee2e06925a05912a0a57c1f389fc5e9624e9fcfe5b1e"
+   }
+  },
+  {
+   "key": "examples/aov_relight.tex",
+   "param_only_names": [
+    "diffuse_gain",
+    "fog_amount",
+    "fog_near",
+    "fog_range",
+    "spec_gain"
+   ],
+   "sha256_source": "2691d6ef5261fb1b72e153eae309290576bf92b820800c58ca2627dba909bf58",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "beauty": "vec3",
+     "diffuse_gain": "float",
+     "fog_amount": "int",
+     "fog_near": "vec4",
+     "fog_range": "int",
+     "spec_gain": "int"
+    },
+    "fingerprint": "e7043bb479182131a33c07bee1894c5c029902e0c57705164d396899cae4b1f1"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "beauty": "vec4",
+     "diffuse_gain": "float",
+     "fog_amount": "float",
+     "fog_near": "float",
+     "fog_range": "float",
+     "spec_gain": "float"
+    },
+    "fingerprint": "0dd5e0321432bf8596d98dd836f0b8f22b8d848b54afca67a832ee3daa682323"
+   }
+  },
+  {
+   "key": "examples/array_reduce.tex",
+   "param_only_names": [],
+   "sha256_source": "05ba4fa2029d0fd2b8f54d0f75ade8a1be4efa35bfe6d77346ed2b7351957712",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "674fd6685067785c4ceb4e28045e6f6560430f6cce41c5a88473d0c451fc7170"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "e728fec62724f5eda4b46995029d361e9f97ef8755bee97201f2ff8c3316d5d3"
+   }
+  },
+  {
+   "key": "examples/auto_levels.tex",
+   "param_only_names": [],
+   "sha256_source": "a5e353360548495b34beb0a0ef25877fb280bc8d7fa41b40e15b1eb857002eb8",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "20e4a1613f2884c125919a43425b7bad4ffd01735fd6369b3ae900b93e0e9b38"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "3701f3ec66249af9bd5e18d0775b2a5733ccb47963c04e80d459e5a780f496d4"
+   }
+  },
+  {
+   "key": "examples/barrel_distortion.tex",
+   "param_only_names": [
+    "k1",
+    "k2"
+   ],
+   "sha256_source": "448e0488174c07cd1cece64adbe2f86d5f9d3e2ce8fb1e42ea2849f31779096b",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "k1": "int",
+     "k2": "int"
+    },
+    "fingerprint": "46a79142562394cff01210c43818cdbd06663691b95c650d71196fc03777f321"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "k1": "float",
+     "k2": "float"
+    },
+    "fingerprint": "375443533bde3531e301511da7d977ea259d1173497a23d195b0744690e761b4"
+   }
+  },
+  {
+   "key": "examples/bilateral_approx.tex",
+   "param_only_names": [],
+   "sha256_source": "3600b465b8e32d77c5325ad496e6decb5e93d8d6d28541a8608733aac6ac5257",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "7c5c651f38b1eac70a8490b33abdd4d66f807a3bbcd26ed29441de1a64ff3017"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "460e21575358b46578e3d06284bafe760168b0a8917eebe3d0b1bad7ef1df223"
+   }
+  },
+  {
+   "key": "examples/billow_texture.tex",
+   "param_only_names": [
+    "detail",
+    "scale"
+   ],
+   "sha256_source": "58b1a1908805ab55946d3003a4c234a95ed425b72a6f32f3181c5455c544aa99",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "detail": "vec3",
+     "scale": "float"
+    },
+    "fingerprint": "d2091504631143662cbaf9736415ff479abdf7ceccd4f3c7c4db6eb6d1e2cee4"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "detail": "float",
+     "scale": "float"
+    },
+    "fingerprint": "12b7dd4070e150d7edcc7abea0f58ddda65d804f17b550a9d0d0fe1c2b029ddf"
+   }
+  },
+  {
+   "key": "examples/binding_access.tex",
+   "param_only_names": [
+    "cx",
+    "cy",
+    "zoom"
+   ],
+   "sha256_source": "c3a38c319a06182822d9c478b24c19d60d73c009fda242ef748d46af823159c9",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "cx": "float",
+     "cy": "vec3",
+     "image": "vec4",
+     "zoom": "int"
+    },
+    "fingerprint": "65b49825ddd819bcb21f0b12170920e0be4547163d304e5126c248d19737c0c5"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "cx": "float",
+     "cy": "float",
+     "image": "vec4",
+     "zoom": "float"
+    },
+    "fingerprint": "0e6007feb26d5815c7727b0a0a76fe7a678a1819437e601f95fa44bd4226112e"
+   }
+  },
+  {
+   "key": "examples/blur.tex",
+   "param_only_names": [
+    "radius"
+   ],
+   "sha256_source": "f63ede595ebb35bed795029241e92333cb776db559b3b44d0be389e9c997beea",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "320084c53071a77a687c1fc627f88b553c780a7c4a493d0b51d622bba365a2e6"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "30fd0a010e01a0209eea666bea284cfecaceed3a51c00300c201c991b79bf03d"
+   }
+  },
+  {
+   "key": "examples/box_blur.tex",
+   "param_only_names": [
+    "radius"
+   ],
+   "sha256_source": "72b8a25dca8d9af0d2b7e94ad6c78c3a9cb323fe984b17de35cd213ab890ae7f",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "dde1cde38e7326fc631ec50a39b7173725d6820def47e4ca41494273a11780e9"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "810d7ff5339f6d116407407f4c68c6ab851c24f6c1e3f39b75337985204d6ba0"
+   }
+  },
+  {
+   "key": "examples/break_search.tex",
+   "param_only_names": [
+    "scan_width",
+    "threshold"
+   ],
+   "sha256_source": "bb25c584f4c006f86c68ad729785d08c7f73aaf2a54853e24d2855549ec38e8b",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "scan_width": "vec4",
+     "threshold": "float"
+    },
+    "fingerprint": "2b839428c4f0a913524e322f6a07e367801f9548735c0b102e3a943c391f5956"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "scan_width": "float",
+     "threshold": "float"
+    },
+    "fingerprint": "10fac6e09a856eee8d2e3c110a555051f40499cf4d2e5c539fff89ac247d0731"
+   }
+  },
+  {
+   "key": "examples/brightness_contrast.tex",
+   "param_only_names": [
+    "contrast",
+    "exposure"
+   ],
+   "sha256_source": "289aa48a08a27923965fc53b0fcd21a80730c7982c2465bc3170ebf8a226bde2",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "contrast": "int",
+     "exposure": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "54bdc65c034d2a13585eebfac7674d736a06bcf6833e1216015117d2fcb5a4fc"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "contrast": "float",
+     "exposure": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "941a23ddb6037e066ada556acec2d04d8ffe15fc7d14c69caf809b0ef5410c46"
+   }
+  },
+  {
+   "key": "examples/caustics.tex",
+   "param_only_names": [
+    "amplitude",
+    "energy",
+    "frequency",
+    "time",
+    "warmth"
+   ],
+   "sha256_source": "bc5ab6a76cdd1ba25b3a00619f5f721e6760fc3a8ec4278d04a61b479c0fce9f",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "amplitude": "float",
+     "energy": "float",
+     "frequency": "float",
+     "time": "vec4",
+     "warmth": "vec4"
+    },
+    "fingerprint": "cc07ceb46fb581d81e0d9d29a683efde356503ae84d5c715cf42c1b3f6d8f52b"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "amplitude": "float",
+     "energy": "float",
+     "frequency": "float",
+     "time": "float",
+     "warmth": "float"
+    },
+    "fingerprint": "db15494930834183c6bffc40ddd68678590f5989d645ed56c302ed13f39ff069"
+   }
+  },
+  {
+   "key": "examples/channel_shuffle.tex",
+   "param_only_names": [
+    "out_b",
+    "out_g",
+    "out_r"
+   ],
+   "sha256_source": "a07af7270ce8adc5341084f4b1506204957aab659fdb500d28651151520a4e7d",
+   "typed": {
+    "binding_types": {
+     "A": "vec4",
+     "B": "vec3",
+     "OUT": "vec3",
+     "out_b": "float",
+     "out_g": "vec3",
+     "out_r": "vec3"
+    },
+    "fingerprint": "dbe191c4a294b4af94626c34bd781824d272befd3b4f218f7be1bb8a4527e445"
+   },
+   "wires": {
+    "binding_types": {
+     "A": "vec4",
+     "B": "vec4",
+     "OUT": "vec4",
+     "out_b": "float",
+     "out_g": "float",
+     "out_r": "float"
+    },
+    "fingerprint": "46eff2e0ff0ea119bb12cb816211b82cdcd7b45441446a54e57a5bf6047286b1"
+   }
+  },
+  {
+   "key": "examples/channel_swap.tex",
+   "param_only_names": [],
+   "sha256_source": "b344d6485a8ea463203a426ec562bfb58dd30a414469a25b86cc3845d2bb2e28",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "52241013cad107ef6b268e830357f20b7fe268c90d6c55a70963be960c063d35"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "7f34f5c098fff77585f3c2fdab6dca9790d5127f773360045fa9c03108d76b26"
+   }
+  },
+  {
+   "key": "examples/chroma_keyer.tex",
+   "param_only_names": [
+    "clip_black",
+    "clip_white",
+    "core_erode",
+    "despill_strength",
+    "edge_tolerance",
+    "screen_b",
+    "screen_balance",
+    "screen_g",
+    "screen_r"
+   ],
+   "sha256_source": "9e2813ba4151f275332d772aff4a818b5f4d6c08957865629b246ad101ee92c8",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "clip_black": "float",
+     "clip_white": "vec4",
+     "core_erode": "float",
+     "despill_strength": "vec3",
+     "edge_tolerance": "float",
+     "image": "vec4",
+     "screen_b": "int",
+     "screen_balance": "float",
+     "screen_g": "float",
+     "screen_r": "float"
+    },
+    "fingerprint": "56f1c522d92d59ca560a21dbd7c8bca50b52a04c442b7d01a3d4478cfe07f988"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "clip_black": "float",
+     "clip_white": "float",
+     "core_erode": "float",
+     "despill_strength": "float",
+     "edge_tolerance": "float",
+     "image": "vec4",
+     "screen_b": "float",
+     "screen_balance": "float",
+     "screen_g": "float",
+     "screen_r": "float"
+    },
+    "fingerprint": "440c2c315e44413959bf099ffc2df0a7297c3dd94f6fa5bdb284d1d85d4304d1"
+   }
+  },
+  {
+   "key": "examples/chromatic_aberration.tex",
+   "param_only_names": [
+    "strength"
+   ],
+   "sha256_source": "003bce4198e0075a9d1201df458b9cc9054114ea4eb8ed8baedf7c816289b8d9",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "strength": "int"
+    },
+    "fingerprint": "dd8e67cfe18a92d49699b9b928f0be1c330aea4cd658ebc327fcf0a1e493a11c"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "strength": "float"
+    },
+    "fingerprint": "c7db2e199477b7d7810c571aafece88b6597c3e1d42a8cc5e533da90eb348850"
+   }
+  },
+  {
+   "key": "examples/color_functions.tex",
+   "param_only_names": [
+    "gain_val",
+    "gamma_val",
+    "saturation"
+   ],
+   "sha256_source": "4cb8823b9e8a632b70a96d2f138cafc7394112d59882d74cf9924030645621f1",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "gain_val": "vec3",
+     "gamma_val": "int",
+     "image": "vec4",
+     "saturation": "vec4"
+    },
+    "fingerprint": "891eb22d44abd0778ae40c9c4863d0c5393202894cece1bd5b68f0bc1c551886"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "gain_val": "float",
+     "gamma_val": "float",
+     "image": "vec4",
+     "saturation": "float"
+    },
+    "fingerprint": "c78f78a9143125f14cd0d2e4c2658a108578749281c30ae7a2dcdfa2d0bd4877"
+   }
+  },
+  {
+   "key": "examples/color_grade.tex",
+   "param_only_names": [],
+   "sha256_source": "a2b161b2ce4cf36493b85bc0704d19536b413ca9d1b0483c3b2cca806249ebb1",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "4dc8a1ea677dc630d706e6a766c3b4b1f9a18ac096205f32b701dd755bb05bbb"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "d35e5fc4b978d3cf203791c4f46da4acc64f4b83968cb550c6fc3aa9c54eac44"
+   }
+  },
+  {
+   "key": "examples/color_mix.tex",
+   "param_only_names": [],
+   "sha256_source": "adebc4f0cb2b02f680395f326e6376540090cbfcb966838c2d27e57aa446c456",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "base": "int",
+     "blend": "vec3",
+     "overlay": "vec4"
+    },
+    "fingerprint": "fe5995e5da81618032b46ea2e5ead675499e14d028477b3ece7354d0844f86b8"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "base": "vec4",
+     "blend": "vec4",
+     "overlay": "vec4"
+    },
+    "fingerprint": "0e98afd7d8f274f75de764b9b18ba28003fb2888ca8f09826fa4fd19aca9da46"
+   }
+  },
+  {
+   "key": "examples/composite.tex",
+   "param_only_names": [
+    "opacity",
+    "premultiplied"
+   ],
+   "sha256_source": "ea706151e1fc8e7a5c811cea376622335c6f4f26860b5289990ac8da6ebd838f",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "bg": "float",
+     "fg": "int",
+     "mask": "int",
+     "opacity": "float",
+     "premultiplied": "float"
+    },
+    "fingerprint": "ebb744a1daf9e70a4d5c9fa90a7d0dd937c05723a191d727ccea529a7ede2755"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "bg": "vec4",
+     "fg": "vec4",
+     "mask": "vec4",
+     "opacity": "float",
+     "premultiplied": "float"
+    },
+    "fingerprint": "a4c2e398010d2a01954633ddb6aa480c44d991a8009413a89cc54c5dd403d442"
+   }
+  },
+  {
+   "key": "examples/conditional.tex",
+   "param_only_names": [],
+   "sha256_source": "d788df0f45d9f8f56e4a67f7a49e62d8ace24fa89498d0a0c08af27c27ae168a",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "d2130e64e3f12b849deef07f54e267c284fc3181a86dc8e5847ad7a3b3d901ec"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "f9654acc99dbdef414acb82d7afd85245b6a90a7de282ad53172e8b9c3242651"
+   }
+  },
+  {
+   "key": "examples/const_values.tex",
+   "param_only_names": [
+    "high_thresh",
+    "shadow_thresh"
+   ],
+   "sha256_source": "f8f7da6300f6bdc0cc0b19d146f34e48175f18fb12b1c610a92c263d95bbb117",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "high_thresh": "vec4",
+     "image": "vec4",
+     "shadow_thresh": "int"
+    },
+    "fingerprint": "194c56a70006c34d541f84791edacba98aaf546fc79ad83f516ce693d20353e3"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "high_thresh": "float",
+     "image": "vec4",
+     "shadow_thresh": "float"
+    },
+    "fingerprint": "e8ca34eeddbad4679b88086a101aa794e33f87b67b76a8b364708246e061b563"
+   }
+  },
+  {
+   "key": "examples/convolve.tex",
+   "param_only_names": [
+    "radius"
+   ],
+   "sha256_source": "2e3318a02ecdd3c2824117a52f1aebd159eb39203dfcd4b249b54aebfab4ed64",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "kernel": "int",
+     "radius": "float"
+    },
+    "fingerprint": "e40eae023ab473dfeb224e33733c6df81ce91fbb9ce06216c6651b8924d10500"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "kernel": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "09e427bb14e9f28354b9fc2f4d911552cf0be37a7efb682e4122748f7eaa11d9"
+   }
+  },
+  {
+   "key": "examples/corner_pin.tex",
+   "param_only_names": [
+    "bl_x",
+    "bl_y",
+    "br_x",
+    "br_y",
+    "tl_x",
+    "tl_y",
+    "tr_x",
+    "tr_y"
+   ],
+   "sha256_source": "1024261ee05848930751288b74ac2c7bb3cb740a8b2e2014f674325523a9890f",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "bl_x": "int",
+     "bl_y": "vec3",
+     "br_x": "vec3",
+     "br_y": "vec4",
+     "image": "vec4",
+     "tl_x": "int",
+     "tl_y": "float",
+     "tr_x": "float",
+     "tr_y": "float"
+    },
+    "fingerprint": "b23fb8d48432908750ab9e1b980774cdae69d4197dd1dd3182ff9210b38285bd"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "bl_x": "float",
+     "bl_y": "float",
+     "br_x": "float",
+     "br_y": "float",
+     "image": "vec4",
+     "tl_x": "float",
+     "tl_y": "float",
+     "tr_x": "float",
+     "tr_y": "float"
+    },
+    "fingerprint": "8290ba81b8f189d3886f4f6002fc99a4e5ade3c42910fecd191f8d2cd0906362"
+   }
+  },
+  {
+   "key": "examples/curl_distortion.tex",
+   "param_only_names": [
+    "curl_scale",
+    "curl_strength",
+    "noise_scale"
+   ],
+   "sha256_source": "ce70651bc32499a07cf6971a7a9cac131cbb360fb25bfc943c895018732edf48",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "curl_scale": "int",
+     "curl_strength": "int",
+     "noise_scale": "int"
+    },
+    "fingerprint": "d6b5748b31ed75c55cc607b6a821f63ca460ac7c97659577cfc068f3d1c67665"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "curl_scale": "float",
+     "curl_strength": "float",
+     "noise_scale": "float"
+    },
+    "fingerprint": "6c2a09df1efce4dd2f90de2aa34d269a4ee20afdaa71b90f0ae6471ee357bab3"
+   }
+  },
+  {
+   "key": "examples/custom_blend.tex",
+   "param_only_names": [
+    "blend_amount"
+   ],
+   "sha256_source": "dace8e8c5cba8ddb599ba0985acd0734af11eab6ec247b4aa5bdc54c8cbc3731",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "base": "int",
+     "blend_amount": "vec3",
+     "overlay": "vec4"
+    },
+    "fingerprint": "30dd31f4c927e71ef5a52697194d66b23a9f413246ce883891b3072d305dd851"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "base": "vec4",
+     "blend_amount": "float",
+     "overlay": "vec4"
+    },
+    "fingerprint": "8b21ad1d2b41f9a2cb754542e67b23ac37b9b898ebba5b743fc2ced2a0e262cd"
+   }
+  },
+  {
+   "key": "examples/denoise.tex",
+   "param_only_names": [
+    "chroma_weight",
+    "luma_weight",
+    "patch_radius",
+    "search_radius",
+    "strength"
+   ],
+   "sha256_source": "b6493ec3fddf44f439db35938bcb26e1da89068e4558da50e8ad218a2ac9cd90",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "chroma_weight": "vec3",
+     "image": "vec4",
+     "luma_weight": "vec3",
+     "patch_radius": "int",
+     "search_radius": "vec3",
+     "strength": "int"
+    },
+    "fingerprint": "50dd9cff8148efaa5195c314a69cb0fb236dad40e5a54aa56b4c6cbbc308a8a6"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "chroma_weight": "float",
+     "image": "vec4",
+     "luma_weight": "float",
+     "patch_radius": "float",
+     "search_radius": "float",
+     "strength": "float"
+    },
+    "fingerprint": "da4933e06b0e37f4731b7d0f46fe64478b1b4fe75b060f3e9f9518686aa581a3"
+   }
+  },
+  {
+   "key": "examples/difference_key.tex",
+   "param_only_names": [
+    "gain",
+    "invert",
+    "softness",
+    "threshold"
+   ],
+   "sha256_source": "3b5ef650c8024299a036b1d1e88ab8e50f47aa63a0ffddd99d7f0da24f3ff996",
+   "typed": {
+    "binding_types": {
+     "A": "vec4",
+     "B": "vec3",
+     "OUT": "vec3",
+     "gain": "int",
+     "invert": "float",
+     "softness": "float",
+     "threshold": "float"
+    },
+    "fingerprint": "d88a077cc41836d079bad8cdd06742d7a9c9ae6fb7725c88842f744b5933279b"
+   },
+   "wires": {
+    "binding_types": {
+     "A": "vec4",
+     "B": "vec4",
+     "OUT": "vec4",
+     "gain": "float",
+     "invert": "float",
+     "softness": "float",
+     "threshold": "float"
+    },
+    "fingerprint": "fba7031cbb7f9e895f27d9c29a9b60928cd6dd142d6352094a4f508f8a51a164"
+   }
+  },
+  {
+   "key": "examples/directional_blur.tex",
+   "param_only_names": [
+    "angle",
+    "distance",
+    "samples"
+   ],
+   "sha256_source": "b5d1f5300200a1a7cf27e95ebac5eb6101f31ad791bc68d301b6327a6c7a2415",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "angle": "int",
+     "distance": "int",
+     "image": "vec4",
+     "samples": "int"
+    },
+    "fingerprint": "43143f74a6e98d89467784b330be8cc0000deed3f2e68654269f1d3ed45dea14"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "angle": "float",
+     "distance": "float",
+     "image": "vec4",
+     "samples": "float"
+    },
+    "fingerprint": "3963404334bcab1f38674f21924165209f88498811e83476e471d6c849686b7f"
+   }
+  },
+  {
+   "key": "examples/distortion_map.tex",
+   "param_only_names": [
+    "strength"
+   ],
+   "sha256_source": "b6608b9df0cfc4967514957fbd0fdf3aa06c45d2b3503da444952dbdbe314862",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "map": "vec3",
+     "strength": "int"
+    },
+    "fingerprint": "0b6558f9f311282ba7df4f71b044fd352b4db92a0553f9a995498dceb95fe1eb"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "map": "vec4",
+     "strength": "float"
+    },
+    "fingerprint": "e35a4875941cec0f0a7aaba5a0af1d9f40024d1b636276397cc3d7f833dddc1b"
+   }
+  },
+  {
+   "key": "examples/edge_detect.tex",
+   "param_only_names": [],
+   "sha256_source": "4869dfece1c94ae14f291d6390bcb7142be0bea4b661162b965141da0be31f88",
+   "typed": {
+    "binding_types": {
+     "edge_mask": "float",
+     "edges": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "b1ddf4e887cda45ad0cfbd525cedea2db03da60afa0dc94b080433de716e0d25"
+   },
+   "wires": {
+    "binding_types": {
+     "edge_mask": "vec4",
+     "edges": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "f623df25a0a255c3292b039a7f01fa865c541cf967f0d8c80383b5cec62badfb"
+   }
+  },
+  {
+   "key": "examples/emboss.tex",
+   "param_only_names": [
+    "angle",
+    "blend",
+    "distance",
+    "strength"
+   ],
+   "sha256_source": "b6901b271720fef2d8f2f443fe42b6f3e94656070f3262620640d571cc0957aa",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "angle": "int",
+     "blend": "vec3",
+     "distance": "int",
+     "image": "vec4",
+     "strength": "int"
+    },
+    "fingerprint": "25bfd69baded7b445fb394cd7e43eed328a35d9b298078b8e50876ec123bf99f"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "angle": "float",
+     "blend": "float",
+     "distance": "float",
+     "image": "vec4",
+     "strength": "float"
+    },
+    "fingerprint": "3f7626ed8409aceec9bf09228f355937e647e7445a17ba019a622aadaaa32bb1"
+   }
+  },
+  {
+   "key": "examples/erode_dilate.tex",
+   "param_only_names": [
+    "radius"
+   ],
+   "sha256_source": "52b3857f8aedee0252e636d704af0203f1fd6635e3510de336aa67552fd439ed",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "b1a7b3aa2ff4e198f9b7a70e8b81c862b61adf424a470d8bc0b7fc091ec73bb1"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "919ff14e3920df87e418b95649492e02dd141bf6876c536ad958649ad89c7a37"
+   }
+  },
+  {
+   "key": "examples/fast_blur.tex",
+   "param_only_names": [
+    "radius"
+   ],
+   "sha256_source": "7ce0e8f8d60b6402546c906ac06f8d76de17b5b10db5144be0a935b3a0951d58",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "849d19d69f51626d6da0a32fb3400982a081d5a44749ee8efe9e925a30a61581"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "64897f9b5baca79aca547ee3ae6be17ce849552a1f425cc0f7161f9ede067156"
+   }
+  },
+  {
+   "key": "examples/fast_defocus.tex",
+   "param_only_names": [
+    "blades",
+    "highlight",
+    "radius",
+    "rotation",
+    "samples"
+   ],
+   "sha256_source": "332aee4eb4fa0ee2add4695546f569c3ab63f4f843b13c6aa0407fe880810fd1",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "blades": "vec4",
+     "highlight": "vec3",
+     "image": "vec4",
+     "radius": "float",
+     "rotation": "vec3",
+     "samples": "int"
+    },
+    "fingerprint": "727356865e04d4af98b2ed1d6c42acb814dc6aaba5df62b8fd6e67e77d921dab"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "blades": "float",
+     "highlight": "float",
+     "image": "vec4",
+     "radius": "float",
+     "rotation": "float",
+     "samples": "float"
+    },
+    "fingerprint": "cac0bfca4b765623efa6842153bb847c2d422454aee8bfc63520e53fdc713c3c"
+   }
+  },
+  {
+   "key": "examples/fast_gaussian.tex",
+   "param_only_names": [
+    "radius"
+   ],
+   "sha256_source": "8d0d84e9f6db28ee10187d28fe274be5ab32a9ec7691fd8ec7960edb7c52ae92",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "0fb282d89b0e6f96ee7de1a30706407b9271aaddcc354ff85d4144a3ee8eb56b"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "361395c3e64ed2b4c556d15b5a17ed9562a98d8e4afc8fd3219ee3ed1724015a"
+   }
+  },
+  {
+   "key": "examples/film_chromatic_aberration.tex",
+   "param_only_names": [
+    "bands",
+    "center_x",
+    "center_y",
+    "falloff",
+    "strength"
+   ],
+   "sha256_source": "ee3310fe60ae1ce8ac16f9f2b1ca706c102c08bbe8c5b785d089d5533588870b",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "bands": "int",
+     "center_x": "vec4",
+     "center_y": "float",
+     "falloff": "int",
+     "image": "vec4",
+     "strength": "int"
+    },
+    "fingerprint": "b05fdfc4ab5b50ce2a74d37a25c7ceb765682f24e4ba5adf83f373c2d33e3980"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "bands": "float",
+     "center_x": "float",
+     "center_y": "float",
+     "falloff": "float",
+     "image": "vec4",
+     "strength": "float"
+    },
+    "fingerprint": "c40610d07fef57fcb9da6ae8ba2dd8646a2fc50c3a9d051e77e984d402a1f057"
+   }
+  },
+  {
+   "key": "examples/film_exponential_blur.tex",
+   "param_only_names": [
+    "radius"
+   ],
+   "sha256_source": "02465eae3b858ea7792666c276e4c314701e150f1ec97c283746a25fc29f2a8d",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "e48a9baf8eed02b426b01ad5c137f7aa622a0ecf2e003b7ee1cc6a1ae041e02f"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "fdc55e8e54c9a945113e40c20bbe18416941142a7908fddcd795cdb98f7899bf"
+   }
+  },
+  {
+   "key": "examples/film_grain.tex",
+   "param_only_names": [
+    "color_variance",
+    "highlight_response",
+    "mid_response",
+    "roughness",
+    "shadow_response",
+    "size",
+    "strength"
+   ],
+   "sha256_source": "25018ddd67f924b0514a71aa497eaf19c38aa3230cb1f9f0d002e118b9948e17",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "color_variance": "vec3",
+     "highlight_response": "float",
+     "image": "vec4",
+     "mid_response": "float",
+     "roughness": "int",
+     "shadow_response": "float",
+     "size": "vec4",
+     "strength": "int"
+    },
+    "fingerprint": "9315a38b5838e5b16b57f82a49a61dad0997ad9b48d070c83a624c3056772973"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "color_variance": "float",
+     "highlight_response": "float",
+     "image": "vec4",
+     "mid_response": "float",
+     "roughness": "float",
+     "shadow_response": "float",
+     "size": "float",
+     "strength": "float"
+    },
+    "fingerprint": "9a0cf66f189939038e68a67064c19a12002d68593ebba8c6ce3cdd0b4b8f6e1c"
+   }
+  },
+  {
+   "key": "examples/film_lens_distortion.tex",
+   "param_only_names": [
+    "center_x",
+    "center_y",
+    "k1",
+    "k2",
+    "scale",
+    "squeeze"
+   ],
+   "sha256_source": "73bbb199fc5e6329fc7519afab3bee1150263921920432360052a15acf136c1b",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "center_x": "vec4",
+     "center_y": "float",
+     "image": "vec4",
+     "k1": "int",
+     "k2": "int",
+     "scale": "float",
+     "squeeze": "vec4"
+    },
+    "fingerprint": "ccaa6f56cfb399ad8223642dfd930544684fb152bec496ec2a330f99f7a84a5c"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "center_x": "float",
+     "center_y": "float",
+     "image": "vec4",
+     "k1": "float",
+     "k2": "float",
+     "scale": "float",
+     "squeeze": "float"
+    },
+    "fingerprint": "f1d10936ccc0ed3c0f07ef081145dfe865966ef87f95b64382267f8203e97fc0"
+   }
+  },
+  {
+   "key": "examples/film_optical_glow.tex",
+   "param_only_names": [
+    "falloff",
+    "intensity",
+    "radius",
+    "threshold"
+   ],
+   "sha256_source": "f4aeec93e5093b259073485f97544dae23f9f8fe5f3821ca55ae0b096769c5cc",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "falloff": "int",
+     "image": "vec4",
+     "intensity": "vec3",
+     "radius": "float",
+     "threshold": "float"
+    },
+    "fingerprint": "a1648a1b4b89ce3d080e3124871c833ececc4b7b862358fc02504630be81f507"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "falloff": "float",
+     "image": "vec4",
+     "intensity": "float",
+     "radius": "float",
+     "threshold": "float"
+    },
+    "fingerprint": "4e036a70026bf19a1e9a3733cd0ca604087ad6228198cf54f045803817e1d103"
+   }
+  },
+  {
+   "key": "examples/film_sharpen.tex",
+   "param_only_names": [
+    "amount",
+    "edge_protect",
+    "luma_only",
+    "radius"
+   ],
+   "sha256_source": "d32c913767f0060960beaba780af96114672520f090a82c4b0b9d268f1ba929a",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "amount": "vec4",
+     "edge_protect": "vec4",
+     "image": "vec4",
+     "luma_only": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "e6a9863d1922935bbfe7a1cccdeb0694c7956a3fe68d674838103227aec46a5a"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "amount": "float",
+     "edge_protect": "float",
+     "image": "vec4",
+     "luma_only": "float",
+     "radius": "float"
+    },
+    "fingerprint": "ae639c8f6b7a470e3d7abb5fd095227bdc30fc8abec845b9e9c37ef1f87b12d6"
+   }
+  },
+  {
+   "key": "examples/film_soften.tex",
+   "param_only_names": [
+    "edge_preserve",
+    "luma_only",
+    "radius"
+   ],
+   "sha256_source": "b8b0c2b5c6d24643343bb9a3d73bff49a7f65955b20105c266915bcda49ca808",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "edge_preserve": "int",
+     "image": "vec4",
+     "luma_only": "vec4",
+     "radius": "float"
+    },
+    "fingerprint": "d7e1e4595a8d0a367340e67ed56de91115cac2f3b1ea24ded52f354818d98c9b"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "edge_preserve": "float",
+     "image": "vec4",
+     "luma_only": "float",
+     "radius": "float"
+    },
+    "fingerprint": "82a7912d617d73d325ccbf1eac06f86ddfbacefa27056ed8502fedd79e4389c3"
+   }
+  },
+  {
+   "key": "examples/film_vignette.tex",
+   "param_only_names": [
+    "aperture",
+    "center_x",
+    "center_y",
+    "focal_length",
+    "mech_radius",
+    "mech_softness",
+    "natural_gain",
+    "sensor_size"
+   ],
+   "sha256_source": "488288b9e1be24bed835472cf5b1fbc95e67bf5302834c72ab63aa75d78754ed",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "aperture": "int",
+     "center_x": "vec4",
+     "center_y": "float",
+     "focal_length": "vec4",
+     "image": "vec4",
+     "mech_radius": "int",
+     "mech_softness": "vec3",
+     "natural_gain": "int",
+     "sensor_size": "int"
+    },
+    "fingerprint": "76a78bc9fd0878e58243d0672aea337b9015f1d30eaefd50ab18b0534613a687"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "aperture": "float",
+     "center_x": "float",
+     "center_y": "float",
+     "focal_length": "float",
+     "image": "vec4",
+     "mech_radius": "float",
+     "mech_softness": "float",
+     "natural_gain": "float",
+     "sensor_size": "float"
+    },
+    "fingerprint": "953fb86506a1fb80104c528f78aa0ca218f0e2a01e19e7ea9df9025c20555212"
+   }
+  },
+  {
+   "key": "examples/fix_pixels.tex",
+   "param_only_names": [
+    "fallback_b",
+    "fallback_g",
+    "fallback_r"
+   ],
+   "sha256_source": "330b5bfdc3f1d3294e34978b974e27216c3c6be7a16cd7239dc518c8cffe1921",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "fallback_b": "float",
+     "fallback_g": "float",
+     "fallback_r": "int",
+     "image": "vec4"
+    },
+    "fingerprint": "42debd5da5d6697ca8b609b6a6a043f37eced3fa8a40fc5f8b3b562083b7acac"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "fallback_b": "float",
+     "fallback_g": "float",
+     "fallback_r": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "c0d31d06939998a1e4371889bd51b7af320d2deed3edae66c26ab83ba4e112db"
+   }
+  },
+  {
+   "key": "examples/flow_noise.tex",
+   "param_only_names": [
+    "mode",
+    "scale"
+   ],
+   "sha256_source": "9038ef6aae072b09553ea97fa8e6615a50827c391918a6df95f0863a8782afaa",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "mode": "vec3",
+     "scale": "float"
+    },
+    "fingerprint": "2d67c7dfb6f9e6949749ce0a9b0fadd9a0a6715e8ec0b5c5ac54318dda31ad81"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "mode": "float",
+     "scale": "float"
+    },
+    "fingerprint": "a18ced19074becf45d220417dd0f62fad06ee31dd77c9df8643edca1d9e129c2"
+   }
+  },
+  {
+   "key": "examples/frame_blend.tex",
+   "param_only_names": [],
+   "sha256_source": "154c7c2be200488cea30a46274927a1ce686876829fafb311d4db96ed299a9d2",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "frames": "float"
+    },
+    "fingerprint": "ddee3fb3295c89b968afbc79f739b1b964219a875ddf2accc7663b55d112d62f"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "frames": "vec4"
+    },
+    "fingerprint": "d062282bab164cba434236c1091916c262a8bdaa932988259e2f36faa0bc43b4"
+   }
+  },
+  {
+   "key": "examples/frame_blend_weighted.tex",
+   "param_only_names": [
+    "falloff",
+    "window"
+   ],
+   "sha256_source": "e4350b42bd7df920ad2b9d6119f06e51efb175e1446e12fad7f6db44f294ceb7",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "falloff": "int",
+     "frames": "float",
+     "window": "float"
+    },
+    "fingerprint": "2ad5214f2081af9a2a122b26e692f70febef999dbafb74c54e4142e579511564"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "falloff": "float",
+     "frames": "vec4",
+     "window": "float"
+    },
+    "fingerprint": "fd14ddb9c3abbd2df2a01d011894394d7ba8fdb70a61e12dcc526e655af63539"
+   }
+  },
+  {
+   "key": "examples/gaussian_blur.tex",
+   "param_only_names": [
+    "sigma"
+   ],
+   "sha256_source": "cd4547d39ca30715d3be4d4024534e4b3418fbbe155605e69d6eff946b99aecf",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "sigma": "int"
+    },
+    "fingerprint": "ad98405d283b785b1f6d8e54e740f0d4da4480af4a090ac6437a212c885b961e"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "sigma": "float"
+    },
+    "fingerprint": "cce72db3f5c0ee517caaec12c5d235deb0fd32f394d7b60d856d02af99ecbec4"
+   }
+  },
+  {
+   "key": "examples/godrays.tex",
+   "param_only_names": [
+    "brightness",
+    "center_x",
+    "center_y",
+    "decay",
+    "length",
+    "samples",
+    "softness"
+   ],
+   "sha256_source": "d1319f4266df789c19e1163dace64b8c93c180cac2d3d0e4bef4ee74b53dbe38",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "brightness": "vec3",
+     "center_x": "vec4",
+     "center_y": "float",
+     "decay": "int",
+     "image": "vec4",
+     "length": "float",
+     "samples": "int",
+     "softness": "float"
+    },
+    "fingerprint": "94fdbe55bf9143520a6e52eea9c779ad232e48238ea4f5838670f7177447bbaf"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "brightness": "float",
+     "center_x": "float",
+     "center_y": "float",
+     "decay": "float",
+     "image": "vec4",
+     "length": "float",
+     "samples": "float",
+     "softness": "float"
+    },
+    "fingerprint": "f3ad8fcac24ac266bd4297de2efa341d1cb689bd92f4dbeedbf57f8bde5fd3f4"
+   }
+  },
+  {
+   "key": "examples/grade.tex",
+   "param_only_names": [
+    "black",
+    "blackpoint",
+    "gamma",
+    "mix",
+    "multiply",
+    "offset",
+    "saturation",
+    "white",
+    "whitepoint"
+   ],
+   "sha256_source": "7c9b3c09c5cfd80faea9fc9d802f90b7c2bd813eefa35b09d17226b1a8d1a19d",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "black": "int",
+     "blackpoint": "vec4",
+     "gamma": "vec3",
+     "image": "vec4",
+     "mix": "vec3",
+     "multiply": "vec3",
+     "offset": "vec3",
+     "saturation": "vec4",
+     "white": "float",
+     "whitepoint": "int"
+    },
+    "fingerprint": "f09c49c27cfa7462cd8537625d8a849d96315061ae70fbfd775aa77144dbdbc7"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "black": "float",
+     "blackpoint": "float",
+     "gamma": "float",
+     "image": "vec4",
+     "mix": "float",
+     "multiply": "float",
+     "offset": "float",
+     "saturation": "float",
+     "white": "float",
+     "whitepoint": "float"
+    },
+    "fingerprint": "952800d2d1d01eea8df1ab7f40383a4d64d206b3eb2edbf1ba41990417b15370"
+   }
+  },
+  {
+   "key": "examples/gradient.tex",
+   "param_only_names": [],
+   "sha256_source": "1c78c55e2e4212af40655e00567dcb9bab50dd76c7a2db5ff6f4097dfaf6b10a",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "ref": "int"
+    },
+    "fingerprint": "7c18c796ba47a5aeebc1a571bbf388c0e94385e7a6d4247da3ef52637496c6a5"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "ref": "vec4"
+    },
+    "fingerprint": "577fd1568534c5c2349914fc3dc2466085b426f947927fdf4647d9cf93ad2c1c"
+   }
+  },
+  {
+   "key": "examples/grain.tex",
+   "param_only_names": [
+    "size",
+    "strength"
+   ],
+   "sha256_source": "fcf4c94a90a7685840fa14d344abc4568fe53d390c6b771a26a703ba549f61a3",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "size": "vec4",
+     "strength": "int"
+    },
+    "fingerprint": "48e1dc613fe1ba0db6f8dc1e3f6417b16fd2b76d2a89c3063ec13ca73b500d80"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "size": "float",
+     "strength": "float"
+    },
+    "fingerprint": "7e32edb05fb2d486e831ff482ca40df67b5235df6d5e2b32f9bb9770e2beffcd"
+   }
+  },
+  {
+   "key": "examples/grayscale.tex",
+   "param_only_names": [],
+   "sha256_source": "580ef0694d820f902348b5de53a4964c4b5808f2776523daafc17ecb8fe24a35",
+   "typed": {
+    "binding_types": {
+     "gray_image": "int",
+     "image": "vec4",
+     "luminance": "vec3"
+    },
+    "fingerprint": "63c2fd513323e1696247b2b7b98f533363ab9d250c13e9e667031d5c587ac73c"
+   },
+   "wires": {
+    "binding_types": {
+     "gray_image": "vec4",
+     "image": "vec4",
+     "luminance": "vec4"
+    },
+    "fingerprint": "f80ae6f014bc507a0a2dd0b73b6e27c3449b4c77b1830895e47592c9f890f75a"
+   }
+  },
+  {
+   "key": "examples/halftone.tex",
+   "param_only_names": [
+    "angle",
+    "dot_size",
+    "hardness",
+    "ink"
+   ],
+   "sha256_source": "e1482398370b9ffe886cdc818e4cb0870d462a758f228760856f694b8e953c73",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "angle": "int",
+     "dot_size": "vec3",
+     "hardness": "vec3",
+     "image": "vec4",
+     "ink": "int"
+    },
+    "fingerprint": "5be9bf16c7482c69889ee9a9d24163e0a1718323d9193f8b563875aacab8fca1"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "angle": "float",
+     "dot_size": "float",
+     "hardness": "float",
+     "image": "vec4",
+     "ink": "float"
+    },
+    "fingerprint": "b24e9d5cb23ef3dd80589427930f5fcb1d98ef5223d93c9db3261c8ac98ec861"
+   }
+  },
+  {
+   "key": "examples/hue_shift.tex",
+   "param_only_names": [
+    "shift"
+   ],
+   "sha256_source": "de20d4a1b7fc6d57c991991d3580a5e17468a8cf76366424c997d65525a79ed0",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "shift": "int"
+    },
+    "fingerprint": "5625193559393ff116cd7e3b983b919f326caf2e386d7ec4eb20fc489fac18df"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "shift": "float"
+    },
+    "fingerprint": "f98fe4d233d41551b5a3719a7c0190738c4d9fbc260b5bdac01f624e3818ad0e"
+   }
+  },
+  {
+   "key": "examples/image_gradient.tex",
+   "param_only_names": [],
+   "sha256_source": "120b9d51ad436656949039845f7e754b38c6059c6384f12e3a777239d6e44884",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "gradient_mag": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "15f07909a80a530b08770d9c62062abe14fdfd59505b24565e8905c061aa4d4b"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "gradient_mag": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "757aafb6ff6ec5fe64e34d7c6a48c453aa0ac1024d16ade3c13fcfb21030103c"
+   }
+  },
+  {
+   "key": "examples/invert.tex",
+   "param_only_names": [],
+   "sha256_source": "f39331d333bb5790c42cbba6d6be8987da6d6c8a3fb087bee509529a0cf86a0c",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "d3f7663cec18f25d45369d84d38a9a14681dac217dbc833fbe45145f76624319"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "805c0934fd23967aeda28e4fb0fd581e2ae399e45aa3edb7c3ee6211b14a1e04"
+   }
+  },
+  {
+   "key": "examples/kaleidoscope.tex",
+   "param_only_names": [
+    "rotation",
+    "segments"
+   ],
+   "sha256_source": "1609d06b3d04fa08d1c531c86de776f2e2656fe57f5e67f90fdd465e108423fb",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "rotation": "vec3",
+     "segments": "vec4"
+    },
+    "fingerprint": "4437283fff8b3ead944804f7ba8b46049526cd16d8f8fd449162307ffcdb5317"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "rotation": "float",
+     "segments": "float"
+    },
+    "fingerprint": "53a31371db209439a7992ff95c16b33939914d46b11e776d7010a371f59ad792"
+   }
+  },
+  {
+   "key": "examples/latent_blend.tex",
+   "param_only_names": [
+    "blend"
+   ],
+   "sha256_source": "ea4b0e249a65c81bb7bd595cdce947dbfcb040717e8d3691f7913afaea1ec547",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "blend": "vec3",
+     "latent_a": "vec3",
+     "latent_b": "vec4"
+    },
+    "fingerprint": "53ab81bec5c7164476449296f18c7f0d40f8df0a852a2fe9b6cbf744f8cd54c1"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "blend": "float",
+     "latent_a": "vec4",
+     "latent_b": "vec4"
+    },
+    "fingerprint": "a93880b8197de572899987b7f4a8026173febe9727b0a283947dc625e86c3bd0"
+   }
+  },
+  {
+   "key": "examples/latent_scale.tex",
+   "param_only_names": [
+    "scale"
+   ],
+   "sha256_source": "32c8d087684ea2f01e5baee346798f1a36a29b07e4151b8ea022235553a17cdc",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "latent": "vec3",
+     "scale": "float"
+    },
+    "fingerprint": "6b0236802ac9a81ff60c5c18798c15a600c543a13ff94e3ecedb0e0bdb2f6ccd"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "latent": "vec4",
+     "scale": "float"
+    },
+    "fingerprint": "33b7c4d69805dd233c6de48ed1f855fea48ae9a22eb96d264aab9b5c640ba04a"
+   }
+  },
+  {
+   "key": "examples/lens_distortion.tex",
+   "param_only_names": [
+    "center_x",
+    "center_y",
+    "k1",
+    "k2"
+   ],
+   "sha256_source": "77df5acfc7d38db03a74d19e69afdcb0092f01b5cb1e8a93fa7e13ad1c8b3748",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "center_x": "vec4",
+     "center_y": "float",
+     "image": "vec4",
+     "k1": "int",
+     "k2": "int"
+    },
+    "fingerprint": "3e974fee3107debc00fbcea4dada8ba58530f746b90f2170a6eed8d327212670"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "center_x": "float",
+     "center_y": "float",
+     "image": "vec4",
+     "k1": "float",
+     "k2": "float"
+    },
+    "fingerprint": "72407b3fad654448ea640ff7e70aa03673bf9e5c178b02fb117e4cb2bc00c843"
+   }
+  },
+  {
+   "key": "examples/lens_distortion_simple.tex",
+   "param_only_names": [
+    "fov"
+   ],
+   "sha256_source": "7ccd1d32b96c8d49e23a62ce4fc75b43f624b9167f36c6e0148b7877781fd64b",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "fov": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "d397e180b6e72325a1a8f8011b4a2fae9cee593fd2c91ad576a7b2a42767f82e"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "fov": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "8ce64fc1b457e3790fb9e83b73f0f5285923df9f7eb4519c901903b86a1eeef2"
+   }
+  },
+  {
+   "key": "examples/levels.tex",
+   "param_only_names": [
+    "gamma",
+    "in_black",
+    "in_white",
+    "out_black",
+    "out_white"
+   ],
+   "sha256_source": "029a031ebeef7863b74491035098ff9e035c6a5d57b4fd63178f3381279c3da0",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "gamma": "vec3",
+     "image": "vec4",
+     "in_black": "int",
+     "in_white": "float",
+     "out_black": "int",
+     "out_white": "vec4"
+    },
+    "fingerprint": "d81fd3a753ac8566f1da7543dafa9003bfe55736dbfa8ad5e5f665c24006aa8c"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "gamma": "float",
+     "image": "vec4",
+     "in_black": "float",
+     "in_white": "float",
+     "out_black": "float",
+     "out_white": "float"
+    },
+    "fingerprint": "6469da2f91852341bcf0503820ec7681335c17dfb306ef900e4413030642d6de"
+   }
+  },
+  {
+   "key": "examples/luma_keyer.tex",
+   "param_only_names": [
+    "high",
+    "low",
+    "softness"
+   ],
+   "sha256_source": "4186693d53ee6d07699de66334397d5735ecc5e2285bf51bf5a8b9072bce3a3b",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "high": "vec3",
+     "image": "vec4",
+     "low": "vec3",
+     "softness": "float"
+    },
+    "fingerprint": "18dc04d7795c46794d5ceb55c3850d8099a2c4b80361bcdd730835e834fca6f0"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "high": "float",
+     "image": "vec4",
+     "low": "float",
+     "softness": "float"
+    },
+    "fingerprint": "98c32ce7a0a6b939fab5c32488c88973175e207f5479523438a93c2043c3c8a8"
+   }
+  },
+  {
+   "key": "examples/luminance_key.tex",
+   "param_only_names": [
+    "gain",
+    "high",
+    "high_soft",
+    "invert",
+    "low",
+    "low_soft",
+    "preview"
+   ],
+   "sha256_source": "dcd7c4c5a44b9ef2393b07d69e63fd4fadfdfda63d97e328888d7ca4162eed6b",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "gain": "int",
+     "high": "vec3",
+     "high_soft": "vec3",
+     "image": "vec4",
+     "invert": "float",
+     "low": "vec3",
+     "low_soft": "vec3",
+     "preview": "int"
+    },
+    "fingerprint": "25e4ff3db2526d308bb4401f8b8a2590a92f36b2429141b41877968517bb513d"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "gain": "float",
+     "high": "float",
+     "high_soft": "float",
+     "image": "vec4",
+     "invert": "float",
+     "low": "float",
+     "low_soft": "float",
+     "preview": "float"
+    },
+    "fingerprint": "8e44580f3adf92e15db91b8c33b7193fae563ae4f95f48eb793ae81ffc6f88ed"
+   }
+  },
+  {
+   "key": "examples/marble.tex",
+   "param_only_names": [
+    "amplitude",
+    "frequency",
+    "scale"
+   ],
+   "sha256_source": "ec242739995030ff6a644f38dad013134b3973b2415c939e1683e4581c524d7c",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "amplitude": "float",
+     "frequency": "float",
+     "scale": "float"
+    },
+    "fingerprint": "d71acd61ff45a11a15e9023988ae8b54a67a4c1f6d93740f9902eaac51801db9"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "amplitude": "float",
+     "frequency": "float",
+     "scale": "float"
+    },
+    "fingerprint": "dcd4c8860baf9bb2c2667caf2ad4e950be1d7136d495b3a8fdbb802eba3fcba9"
+   }
+  },
+  {
+   "key": "examples/mask_from_color.tex",
+   "param_only_names": [
+    "tolerance"
+   ],
+   "sha256_source": "c9af3077b08ccb9038659538b59af30982a21f323e0c0dc4c0fd898f589451d6",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "tolerance": "vec3"
+    },
+    "fingerprint": "395dfbd07c036adf8a9c47f328edbca73381fd5dc437576b6a94233072ee9b89"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "tolerance": "float"
+    },
+    "fingerprint": "80472850dd4da956872fc29ca21992b959cf636b086f9879c842a07d8c56581f"
+   }
+  },
+  {
+   "key": "examples/matrix_transform.tex",
+   "param_only_names": [
+    "angle",
+    "center_x",
+    "center_y",
+    "scale"
+   ],
+   "sha256_source": "41360df26f2647039346246e9fbb517fa675ea1e1777b5b5d5b4d1c2733fb62e",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "angle": "int",
+     "center_x": "vec4",
+     "center_y": "float",
+     "image": "vec4",
+     "scale": "float"
+    },
+    "fingerprint": "3c523cdb861deffd0675d1ad880b65f84f7bfef6c9b6f7152a0d8e1b0348237f"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "angle": "float",
+     "center_x": "float",
+     "center_y": "float",
+     "image": "vec4",
+     "scale": "float"
+    },
+    "fingerprint": "a8d9c05805786a51c3ed7bf09af4c25382419f2f2314558e0c1698e012b4c84a"
+   }
+  },
+  {
+   "key": "examples/median_filter.tex",
+   "param_only_names": [],
+   "sha256_source": "3d8d11abd2f5bafff02a332fdea1022e49972e13667d1f439bc1995516f214b7",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "764fbb2d6c9dc582d9e6832c0dc47750c81258cd2c224a0b34d8ee25197b9198"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "34c36fbf97b4c9d16008d2dd7968cf93b2c391428953f2acaf551c1dacd97f37"
+   }
+  },
+  {
+   "key": "examples/merge.tex",
+   "param_only_names": [
+    "mix",
+    "operation"
+   ],
+   "sha256_source": "47b2a27e141fde01629dda7a90dd3a34df6384a9306b58a5d699666a88e782fa",
+   "typed": {
+    "binding_types": {
+     "A": "vec4",
+     "B": "vec3",
+     "OUT": "vec3",
+     "mix": "vec3",
+     "operation": "float"
+    },
+    "fingerprint": "208c5db458b82b3d790001fa1c7a84a0094f2bc92133fac07923af62f71e7c4c"
+   },
+   "wires": {
+    "binding_types": {
+     "A": "vec4",
+     "B": "vec4",
+     "OUT": "vec4",
+     "mix": "float",
+     "operation": "float"
+    },
+    "fingerprint": "5f680994a11deeaa1ff6f971636224848846baf894afaf731cf5aae8eb95abfd"
+   }
+  },
+  {
+   "key": "examples/mipmap_blur.tex",
+   "param_only_names": [
+    "strength"
+   ],
+   "sha256_source": "683650a9801de8cfaf003a404182d90135ee009885ce4effc9f9695ee2e39c3f",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "strength": "int"
+    },
+    "fingerprint": "42d3959874fdabc67eaefc5749c785a1358854ee444cbaa27fa32baa604a805c"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "strength": "float"
+    },
+    "fingerprint": "4a0a41a1cc7fc678f84dd8d26075c252070e91633de6ab077d7b61ead7cae148"
+   }
+  },
+  {
+   "key": "examples/motion_detect.tex",
+   "param_only_names": [],
+   "sha256_source": "9a7092ccdc6325673a261da909d951c252d4963e9ecb2a6f0b625e427f6b3632",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "frames": "float"
+    },
+    "fingerprint": "9ab1a938461d566a74107758255c9d14e395710a740eeed7128c37b5a3b37afe"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "frames": "vec4"
+    },
+    "fingerprint": "7628e3220baf6ba036d7d832dae7acb015127ff6de0e3681ffa9d2f762b9f0a1"
+   }
+  },
+  {
+   "key": "examples/multi_output.tex",
+   "param_only_names": [],
+   "sha256_source": "993396135a805ecacd14125bfac675ce3a6560fbd5d1c1a54efc8af72be97343",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "OUT_blue": "vec3",
+     "OUT_green": "float",
+     "OUT_red": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "8de22cd176d78568f8d72668cf29d8765967799ccd38c1e054d530cc4f55a97b"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "OUT_blue": "vec4",
+     "OUT_green": "vec4",
+     "OUT_red": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "59cb6cc7d305ddef64fc611c307b674e4d796baef9647cda43a0176c7d97a25b"
+   }
+  },
+  {
+   "key": "examples/multi_sample.tex",
+   "param_only_names": [],
+   "sha256_source": "4770a7703804ab693a38eac68e3f2cc95292f2a9e81499fcdef3684b081ba7a9",
+   "typed": {
+    "binding_types": {
+     "A": "vec4",
+     "B": "vec3",
+     "OUT": "vec3",
+     "mask": "int"
+    },
+    "fingerprint": "539119a3c2917d558e4af0e49719e669f6c0149240f07397cc5a76801852b8dc"
+   },
+   "wires": {
+    "binding_types": {
+     "A": "vec4",
+     "B": "vec4",
+     "OUT": "vec4",
+     "mask": "vec4"
+    },
+    "fingerprint": "33883dfde2374aafd725d651baf121d82559b359a447979c6b0a626f4cdf5e3f"
+   }
+  },
+  {
+   "key": "examples/normal_map.tex",
+   "param_only_names": [
+    "strength"
+   ],
+   "sha256_source": "a82f39156d2d23b393c7d6976adb5156085fc5fff7ddc53ea1deaa4ae5139716",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "strength": "int"
+    },
+    "fingerprint": "67364b9ddb744e95d0f3fbd05e713ea60e0b19ffbae5a0d1a3b54a18bed97d26"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "strength": "float"
+    },
+    "fingerprint": "432d5f4f9c0cb641bf43e47a1a9c87a65e6ba70275929d39517ec9d5a722eca1"
+   }
+  },
+  {
+   "key": "examples/normalize_mask.tex",
+   "param_only_names": [],
+   "sha256_source": "23f5df11e50ab88e6f246d26ba7c438a584e96efcfa309611a8df8250b3976aa",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "mask": "int"
+    },
+    "fingerprint": "7c9e06e0aea12d76dd879831460c550d0240491ac72f2cfd025d528030ee1934"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "mask": "vec4"
+    },
+    "fingerprint": "4c2dd02568a8d77f65fc3fcde3078d71d6fa301f75c6289fc4f61b57703f83b8"
+   }
+  },
+  {
+   "key": "examples/optical_flow.tex",
+   "param_only_names": [
+    "confidence_threshold",
+    "window_radius"
+   ],
+   "sha256_source": "f83642aaf275d2f25983f1349f07a0355b2c08143540934ed9e6e946b80febee",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "confidence_threshold": "int",
+     "current": "float",
+     "previous": "vec3",
+     "window_radius": "int"
+    },
+    "fingerprint": "8f7864b1bf4cc6357b54e4041191f0368418cc6a474c94eafc70d401bfe9af11"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "confidence_threshold": "float",
+     "current": "vec4",
+     "previous": "vec4",
+     "window_radius": "float"
+    },
+    "fingerprint": "7a2a06d8568bc9a7fd056194e2f73a60c422fcde1dd972dd181b2860b7f41294"
+   }
+  },
+  {
+   "key": "examples/perlin_clouds.tex",
+   "param_only_names": [
+    "frequency"
+   ],
+   "sha256_source": "6dfd96c74364ad05656c8cfa655446cbb686269e919b7c2780d349125072e8fe",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "frequency": "float"
+    },
+    "fingerprint": "24b1c625d7b294c010d2cb18cd37c1428f9243817059dbf4fa28f26c17235609"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "frequency": "float"
+    },
+    "fingerprint": "7a8218e088ad2eb6bbc7ce8c11ba922db8209c83ab2857f29b64cc575d3fd156"
+   }
+  },
+  {
+   "key": "examples/pixelate.tex",
+   "param_only_names": [
+    "block_size"
+   ],
+   "sha256_source": "5768bb053edbc6f451441dea79e2683d1b5d3f80d804ec29a4580d9ccfacae5b",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "block_size": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "4133106fdc12dd1804865bc16e1b4a3ebea05c503d44c36d8067ee9524563da7"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "block_size": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "000e82a1b0f82acb1dae9312d208f4af5357240eb484cf86477a46ada58606f2"
+   }
+  },
+  {
+   "key": "examples/posterize.tex",
+   "param_only_names": [
+    "levels"
+   ],
+   "sha256_source": "c0a7eea62bd12a91ec82606a04a49cbe0920655d9da48d8bfd5a0ce1df6fae79",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "levels": "vec4"
+    },
+    "fingerprint": "b134205b494f1aebf6812895797e0d74d2417ba405798630b561ce418c838ede"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "levels": "float"
+    },
+    "fingerprint": "158c6380c45cc5c6a8ca278ca9f194944c4489e1cff22a49214b9c1000e88e1f"
+   }
+  },
+  {
+   "key": "examples/premultiply.tex",
+   "param_only_names": [
+    "mode"
+   ],
+   "sha256_source": "383ce7374e4dbf492cf0c6b38534be55b0d116c1a536276ede5a39e63d7c7045",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "alpha": "vec3",
+     "image": "vec4",
+     "mode": "vec3"
+    },
+    "fingerprint": "13ab3bc0bba9d410c50a214f8c7c62d06cd3e98f58e02a1e7b59f9c33b1aead3"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "alpha": "vec4",
+     "image": "vec4",
+     "mode": "float"
+    },
+    "fingerprint": "a0313ca70a71311ad6b517edc0a507387299317e5d2007545bc3b85ab862defd"
+   }
+  },
+  {
+   "key": "examples/radial_gradient.tex",
+   "param_only_names": [],
+   "sha256_source": "942cdc96a4f59503db3802f3733c46bfdae5e78c1c4eb48b2df84a1155eba986",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3"
+    },
+    "fingerprint": "4145a55e95e8156fcc194def2155c893a9dc136bacc4180174c3f4d2fca1dda9"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4"
+    },
+    "fingerprint": "54db54272f990a8bcfa0b9cee598711ff3063f57e7deea5dd6a9ddf529f7238b"
+   }
+  },
+  {
+   "key": "examples/recursive_fractal.tex",
+   "param_only_names": [],
+   "sha256_source": "305f11d97af1f104640a014598bdec7ba382c61f797b0606218f369fc250ee5b",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3"
+    },
+    "fingerprint": "85c81373d38017b6eedc1b264cfcdb0f37e1baf00d2dea9fd2ea67d2db9de6df"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4"
+    },
+    "fingerprint": "21f4bfe5d6c7a5d53cc10f5a724df96575642b2ae07515abf9f114e247ab562d"
+   }
+  },
+  {
+   "key": "examples/recursive_pattern.tex",
+   "param_only_names": [
+    "center_x",
+    "center_y",
+    "iterations",
+    "zoom_level"
+   ],
+   "sha256_source": "5b943a225c86189cfb7e719606901354ca2abd5248a10f0331d86672cc8c6f40",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "center_x": "vec4",
+     "center_y": "float",
+     "iterations": "float",
+     "zoom_level": "int"
+    },
+    "fingerprint": "ec50f4428d05d88a18e05193a2b2800e1fd5fef72cf35886b895b6ea5649465a"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "center_x": "float",
+     "center_y": "float",
+     "iterations": "float",
+     "zoom_level": "float"
+    },
+    "fingerprint": "ecdec9eb20d5f52baf956d7663caa9b5baf7679b6cd36ffd9717f2ce5418d09a"
+   }
+  },
+  {
+   "key": "examples/recursive_subdivision.tex",
+   "param_only_names": [],
+   "sha256_source": "aeadd9209fc1840a34953f0f04ea12177edd0c9e33ad3336234d008eea611bc2",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3"
+    },
+    "fingerprint": "c74b4ca0ef06fe455375c376864c32df7f71212452d8185103a78d0cd7a0d2ee"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4"
+    },
+    "fingerprint": "01c0742eaa6a7cca639b9a92f5b185558c7dd76303deaf05a66ec7beca1b319d"
+   }
+  },
+  {
+   "key": "examples/sample_comparison.tex",
+   "param_only_names": [
+    "mode",
+    "scale"
+   ],
+   "sha256_source": "dd2399f7eba1729257b936595e65579def7e325a60a0865da5cb1b962a0aa5fc",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "mode": "vec3",
+     "scale": "float"
+    },
+    "fingerprint": "5318e6d8b8d59fb9d8cac6ce336bf4f3ff6c2001f0f18c495e870822b0704949"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "mode": "float",
+     "scale": "float"
+    },
+    "fingerprint": "beb1580281fcb76244992e9f831ea4809f57a9bce200b26362ae015aaf4b64c4"
+   }
+  },
+  {
+   "key": "examples/sdf_shapes.tex",
+   "param_only_names": [
+    "edge_soft"
+   ],
+   "sha256_source": "36d05747e00722293979b29a4d53fbaf2fe55786d5ac76e3ef131b58e7c57993",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "edge_soft": "vec4"
+    },
+    "fingerprint": "5e4bd43c7c89d0c2a619f8600ad6703f46bf68c051328668dc298b6c34addce8"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "edge_soft": "float"
+    },
+    "fingerprint": "e000957cbcf230195384e51980d97c04fe381dbc5a4f19b68035c2801e73d0d0"
+   }
+  },
+  {
+   "key": "examples/sharpen.tex",
+   "param_only_names": [
+    "amount"
+   ],
+   "sha256_source": "b77067d2c89ff8cb8d0271fc6c8a807d32abb2dbf0ed02aa081c1d8577da720e",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "amount": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "3200aa747600e123f1c439975fd5a43b916c34669cbd9ecafe677b412ba013fe"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "amount": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "bb050b19168ed0daadfc13711d003903337bb407389488c64e6e420c98af168a"
+   }
+  },
+  {
+   "key": "examples/simplex_terrain.tex",
+   "param_only_names": [
+    "frequency"
+   ],
+   "sha256_source": "2bd6e9e663a0a92e352e1b0673e5474196e599a5a10e31a67060ba0fe40196ca",
+   "typed": {
+    "binding_types": {
+     "frequency": "float",
+     "heightmap": "float",
+     "terrain": "vec3"
+    },
+    "fingerprint": "341dbe1f7bb789f0333daaf943c55a1b820a8786284184c016529a058a2c1df9"
+   },
+   "wires": {
+    "binding_types": {
+     "frequency": "float",
+     "heightmap": "vec4",
+     "terrain": "vec4"
+    },
+    "fingerprint": "78967509b6d061f4e7498aedbbe385458eb38bc242b9350deeb3e549e4165e6c"
+   }
+  },
+  {
+   "key": "examples/soft_clamp.tex",
+   "param_only_names": [
+    "max",
+    "min",
+    "softness"
+   ],
+   "sha256_source": "5896634bc4dcc94b59f78227b1e24d1ecb05f3952cee1aa2811594f25cafbe7c",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "max": "vec4",
+     "min": "float",
+     "softness": "float"
+    },
+    "fingerprint": "23a2ec89c66751b43c2e1c234acd0eb85331bda2ff08d424241ed5906338659b"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "max": "float",
+     "min": "float",
+     "softness": "float"
+    },
+    "fingerprint": "77313330818e25371e8c1b50c0286ee3a326bab6807d5b3cea7ba3bf45f41849"
+   }
+  },
+  {
+   "key": "examples/stmap.tex",
+   "param_only_names": [],
+   "sha256_source": "b85e5721cd7386eedde0a7fd56c0df26edeb5aceac081b9cf265ead883151397",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "map": "vec3"
+    },
+    "fingerprint": "5fa4a472258398602918794a049b4273bd4ce5132af669c59385483d255eb436"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "map": "vec4"
+    },
+    "fingerprint": "1bd31c1d6ddf8931da418f1044fd98a81d91f1d736c1bede1b1eca1364a3dc51"
+   }
+  },
+  {
+   "key": "examples/string_build.tex",
+   "param_only_names": [
+    "prefix",
+    "suffix"
+   ],
+   "sha256_source": "336ef4d8296e3ce0fedd8c578d06735230f1486d77996798d549d907b661fbb9",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "prefix": "float",
+     "suffix": "vec3"
+    },
+    "fingerprint": "e7fa1bbe2fb0871d315dbcaf3a419fb3f5e1533be65c48a9b6055026e4ea2d3a"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "prefix": "float",
+     "suffix": "float"
+    },
+    "fingerprint": "9888ff735c603c71bba872da34fd0d251a14de706fc8a40edf48a99824c1b527"
+   }
+  },
+  {
+   "key": "examples/string_case.tex",
+   "param_only_names": [],
+   "sha256_source": "566e5795708000cc18a3eacc872aa9df88dc4ca85bc634cb38f279a8c1400c7f",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "text": "float"
+    },
+    "fingerprint": "250575e4da4de0435be16d1f54ce2632801b2e71d2ffbad908dd0105e750dc5b"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "text": "vec4"
+    },
+    "fingerprint": "0c3e98fa44d1199e9abe512454d5e65ffa76b2c65e07848c4ad107fa77854ab5"
+   }
+  },
+  {
+   "key": "examples/string_format.tex",
+   "param_only_names": [
+    "label"
+   ],
+   "sha256_source": "214dcee60a6569e385716feed38caf10cf0615d3ea85ff1ab9d1c80bc697bbaf",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "label": "vec4"
+    },
+    "fingerprint": "e782110776a684051b03fbe6f65144539be0420c1f62c89b8af98977525b93bb"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "label": "float"
+    },
+    "fingerprint": "bd1654a72f5d8c51f92e076111810004b97e2321c6463f210843fe9074812858"
+   }
+  },
+  {
+   "key": "examples/swirl.tex",
+   "param_only_names": [
+    "strength"
+   ],
+   "sha256_source": "4f6443527347d34fec239de7d13c5525aeefc9a3c3785ffe28dc8b5de8eed7ad",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "strength": "int"
+    },
+    "fingerprint": "84e0ebb519c5592314c2bfd42e0fef9207a9a8a69680a88127f3b569a4fd91f9"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "strength": "float"
+    },
+    "fingerprint": "07fcbc6268e1854df50b4fbb1ca60adfa1dcbc5b724546c9d008119f65b5cf23"
+   }
+  },
+  {
+   "key": "examples/temporal_functions.tex",
+   "param_only_names": [],
+   "sha256_source": "a3d99181020b4850cbc597adf06f1212c8a862eba51e39568471591d214dc5cc",
+   "typed": {
+    "binding_types": {
+     "frames": "float",
+     "motion_mask": "float",
+     "stabilized": "vec3"
+    },
+    "fingerprint": "48a62f83f8629ae085890be021ce147bb669a1bcab836906c6bccca610313e5b"
+   },
+   "wires": {
+    "binding_types": {
+     "frames": "vec4",
+     "motion_mask": "vec4",
+     "stabilized": "vec4"
+    },
+    "fingerprint": "e8307555ecfa5ef24c9be94d995da13bb63ceaf1b81710f67f4bccc643ec8096"
+   }
+  },
+  {
+   "key": "examples/temporal_median.tex",
+   "param_only_names": [],
+   "sha256_source": "01c4446dbff74cdbd6e4ac5bb3ff4a1a1970db68c05bd5cc237ae58a1eaacc26",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "frames": "float"
+    },
+    "fingerprint": "5a108b279362abac71a05b14c5c5561f0f4eafb483bb0ae764b4fdb4226f2370"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "frames": "vec4"
+    },
+    "fingerprint": "238a59c3bc846d7e79cba23eb7540a8be84998ad04777568321f7720d8d20c84"
+   }
+  },
+  {
+   "key": "examples/temporal_ramp.tex",
+   "param_only_names": [
+    "color_b",
+    "color_g",
+    "color_r",
+    "fade_in",
+    "fade_out"
+   ],
+   "sha256_source": "bed48f2081825587a7387e355f18b1adc6cad1d6a844ddadfaf533a0d79f4690",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "color_b": "int",
+     "color_g": "vec3",
+     "color_r": "vec4",
+     "fade_in": "vec3",
+     "fade_out": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "5eacde00b404fc8537e8c6971284d487a1a3e65ec19ff36b6653e66920e98e52"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "color_b": "float",
+     "color_g": "float",
+     "color_r": "float",
+     "fade_in": "float",
+     "fade_out": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "12ea67d6456a412f73de11cb9fe6ae8d3b2782f92791aff8dbe6fdda70ab98c6"
+   }
+  },
+  {
+   "key": "examples/ternary_chain.tex",
+   "param_only_names": [
+    "hi_thresh",
+    "intensity",
+    "mid_thresh",
+    "shadow_thresh"
+   ],
+   "sha256_source": "3c6addde7a85cb31e2b8b32aab2c2d62c09201ec639e3e93e654328716174e60",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "hi_thresh": "vec3",
+     "image": "vec4",
+     "intensity": "vec3",
+     "mid_thresh": "vec4",
+     "shadow_thresh": "int"
+    },
+    "fingerprint": "a23c11f8ec5d092921bcab216d8aff6cd39138156a875e6309a06aec1db74da5"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "hi_thresh": "float",
+     "image": "vec4",
+     "intensity": "float",
+     "mid_thresh": "float",
+     "shadow_thresh": "float"
+    },
+    "fingerprint": "b15584dea0eb117df35d6895ef6de172f91b0cff2edec68a05e7cec709735843"
+   }
+  },
+  {
+   "key": "examples/threshold_mask.tex",
+   "param_only_names": [
+    "threshold"
+   ],
+   "sha256_source": "6e292275d7f0af6fea72c8c8e1dac2f2034d9f8da5c080862e2e2ee580a0d172",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "threshold": "float"
+    },
+    "fingerprint": "824f4be718eed373d7cb28786ca55a2ad0bc666931b9b19224d5f425cb7ec1b3"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "threshold": "float"
+    },
+    "fingerprint": "e9ae4b0d3057cb3268a88b27a21109f695a76556a9ef067133f7ac7831617871"
+   }
+  },
+  {
+   "key": "examples/tilt_shift.tex",
+   "param_only_names": [
+    "band",
+    "focus",
+    "strength"
+   ],
+   "sha256_source": "96df6062b36cd408f650721362fbfceef15f6f21d9217e411e943b936099d3c3",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "band": "vec4",
+     "focus": "vec4",
+     "image": "vec4",
+     "strength": "int"
+    },
+    "fingerprint": "ac8530b0c0e70119932122fe73102096910204af823bddfc8b51c53c487a3e5b"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "band": "float",
+     "focus": "float",
+     "image": "vec4",
+     "strength": "float"
+    },
+    "fingerprint": "e6e2b2f3fa6fa8a66f7bc1e87c662b18363e0c4792147aac3ec87c177f5bacd1"
+   }
+  },
+  {
+   "key": "examples/time_echo.tex",
+   "param_only_names": [
+    "decay",
+    "echoes",
+    "mode",
+    "offset"
+   ],
+   "sha256_source": "dbbd67d9db873503657588b26077da881feae1363ae1445a6806e4b09678e864",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "decay": "int",
+     "echoes": "int",
+     "frames": "float",
+     "mode": "vec3",
+     "offset": "vec3"
+    },
+    "fingerprint": "215062af4e5d4296dd632c58b864a1cfc2d6910167769e7e1c2f5020b01116f6"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "decay": "float",
+     "echoes": "float",
+     "frames": "vec4",
+     "mode": "float",
+     "offset": "float"
+    },
+    "fingerprint": "ff24553d6799309b9e75e9c062dbdecdc9d18f0f9244b8936ed8aa64bf9d411c"
+   }
+  },
+  {
+   "key": "examples/tone_map.tex",
+   "param_only_names": [
+    "exposure"
+   ],
+   "sha256_source": "7da3083a6ca6feeb0968c0bcce202450d143be03807dbda33f86c4e0076dbd20",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "exposure": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "4072a9291620261e2b5f78c5ee56ef231a3862ff5b39a48e68e6c2892f0f2430"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "exposure": "float",
+     "image": "vec4"
+    },
+    "fingerprint": "97d3b87fe2702fd8df16d04d1f50d880c6b8f445d589f2bd6b5d73a11ab03341"
+   }
+  },
+  {
+   "key": "examples/transform_2d.tex",
+   "param_only_names": [
+    "pivot_x",
+    "pivot_y",
+    "rotate",
+    "scale_x",
+    "scale_y",
+    "translate_x",
+    "translate_y"
+   ],
+   "sha256_source": "dedf81595af9c0398cbe11a9a7bfff2060c06b864f24a9e6a26851f271274080",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "pivot_x": "vec4",
+     "pivot_y": "vec3",
+     "rotate": "vec4",
+     "scale_x": "vec3",
+     "scale_y": "int",
+     "translate_x": "int",
+     "translate_y": "vec3"
+    },
+    "fingerprint": "37d9af19488dabdcb300170edce9bf6d4b6faba8bee4b98bc15e07ef9961632e"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "pivot_x": "float",
+     "pivot_y": "float",
+     "rotate": "float",
+     "scale_x": "float",
+     "scale_y": "float",
+     "translate_x": "float",
+     "translate_y": "float"
+    },
+    "fingerprint": "6f3af56ae54e99ea05416958131fa088ea67dace2c662e09bde64b4fb4c74cc7"
+   }
+  },
+  {
+   "key": "examples/turbulent_displace.tex",
+   "param_only_names": [
+    "amount",
+    "complexity",
+    "evolution",
+    "size"
+   ],
+   "sha256_source": "9ecf993d3383e12f2f844614597542be331db80c93148df257c94485cb304363",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "amount": "vec4",
+     "complexity": "vec3",
+     "evolution": "vec3",
+     "image": "vec4",
+     "size": "vec4"
+    },
+    "fingerprint": "4390e751ca7fc398ca843b5378c0b4fa7987f1c832e7e513596cbb245a31ce7b"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "amount": "float",
+     "complexity": "float",
+     "evolution": "float",
+     "image": "vec4",
+     "size": "float"
+    },
+    "fingerprint": "0a93307dc03c2e80253d29fc87934fa3f7f2a1f12ae3c2bc7f88146b1be4bc48"
+   }
+  },
+  {
+   "key": "examples/unsharp_mask.tex",
+   "param_only_names": [
+    "amount",
+    "threshold"
+   ],
+   "sha256_source": "abf4f6b1e705fc60bef76778d034b4260e392e2b3b5f0f3f3d2bdd05c68f6e65",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "amount": "vec4",
+     "image": "vec4",
+     "threshold": "float"
+    },
+    "fingerprint": "5dadfec8948db2bba8587ded611703298f60473f02f5c3ef47cfb62b8dd635bd"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "amount": "float",
+     "image": "vec4",
+     "threshold": "float"
+    },
+    "fingerprint": "ce1caa2c7b955164a210a12e9c7e817d36bb9bbd46caa60be03ce56f00811191"
+   }
+  },
+  {
+   "key": "examples/user_function_lib.tex",
+   "param_only_names": [
+    "contrast",
+    "pivot",
+    "saturation"
+   ],
+   "sha256_source": "b9d85601b7f513dec62228108397f02e3943ceb810a69f620f67a05c6eb84501",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "contrast": "int",
+     "image": "vec4",
+     "pivot": "vec3",
+     "saturation": "vec4"
+    },
+    "fingerprint": "14adacf694a5d80f84f74c46247f39062e14b5be754ba7aa63154f3a07587520"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "contrast": "float",
+     "image": "vec4",
+     "pivot": "float",
+     "saturation": "float"
+    },
+    "fingerprint": "91d6510af8aa8b862dc9d2d54065625c8a56f9dd96a1d7025d5fdd8548640d26"
+   }
+  },
+  {
+   "key": "examples/vec4_median.tex",
+   "param_only_names": [],
+   "sha256_source": "a0638bef9a1bfd3049124e5044eaec367cb6c3ec7349ec885f54d8c40119ebcc",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4"
+    },
+    "fingerprint": "15e5b8abd1d6f631fa4d00aab3e21a2e07fb80f5e63239cd92836a5da6a0b4fb"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4"
+    },
+    "fingerprint": "ce5e8f9f86fd51d2f60f5163bfd6caeaf1822855ffb001c5294210cff9a6ab16"
+   }
+  },
+  {
+   "key": "examples/vector_blur.tex",
+   "param_only_names": [
+    "max_samples",
+    "strength"
+   ],
+   "sha256_source": "f71b51fb7d50718abd0b053d3c984d28d1212d1fea49c048bd537e22b404bc98",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "max_samples": "vec3",
+     "strength": "int",
+     "vectors": "int"
+    },
+    "fingerprint": "e03080cde236e82d61e5ef0e1d7fbb5a8b6ce8f709cd982499536b8b131cafd6"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "max_samples": "float",
+     "strength": "float",
+     "vectors": "vec4"
+    },
+    "fingerprint": "d294ffb164ee1436b63fadd4281c204447c17cf67bf5f523d4cc5510a888bef3"
+   }
+  },
+  {
+   "key": "examples/vignette.tex",
+   "param_only_names": [
+    "strength"
+   ],
+   "sha256_source": "8ed61b812ab9ec3f2130eccb7a8fdc03398728ea52f5dd8b1fdfec2ccb8a16d5",
+   "typed": {
+    "binding_types": {
+     "darkened": "int",
+     "image": "vec4",
+     "strength": "int",
+     "vignette_mask": "vec4"
+    },
+    "fingerprint": "1c73e54615d2478701db5c7f5205f427a2c9a3b931d63adf69651b38c993407b"
+   },
+   "wires": {
+    "binding_types": {
+     "darkened": "vec4",
+     "image": "vec4",
+     "strength": "float",
+     "vignette_mask": "vec4"
+    },
+    "fingerprint": "f58ccce7f04715755284aa8192653523fcf5f5df6bcbf4e3d95e8ab22e1b2e06"
+   }
+  },
+  {
+   "key": "examples/voronoi_cells.tex",
+   "param_only_names": [
+    "edge_width",
+    "scale"
+   ],
+   "sha256_source": "ef4c8a907cfc6596f12ff5472c57e57b445b806296bd5dc481a5bd0a976acfae",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "edge_width": "vec4",
+     "scale": "float"
+    },
+    "fingerprint": "0aff26fa4b698f11a44979035cd344ee875ccbca2e080ca2a023296f226a9259"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "edge_width": "float",
+     "scale": "float"
+    },
+    "fingerprint": "c27ae8cf0da9246a6c06c4c1489f1ed50ccc528632694be2c42b82dbb970009c"
+   }
+  },
+  {
+   "key": "examples/while_loop.tex",
+   "param_only_names": [
+    "max_iter",
+    "tolerance"
+   ],
+   "sha256_source": "1f5765265c29e65e80fe61fd70643ccd3c1a26e375d2e96652f28fda24a60756",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "max_iter": "vec4",
+     "tolerance": "vec3"
+    },
+    "fingerprint": "d3b9ba32ce3463312e4fe563b23d611ff80b653bbcaa4ba40118a5ddce4c4af7"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "max_iter": "float",
+     "tolerance": "float"
+    },
+    "fingerprint": "96b5588b2476cd0b0cc27612c5aa57f28ffdb3e10f4d9184ce1f9807bc984523"
+   }
+  },
+  {
+   "key": "examples/white_balance.tex",
+   "param_only_names": [
+    "temperature",
+    "tint"
+   ],
+   "sha256_source": "5eda80142a00afd5cfa44bc83e15756daf77924afa443cd88d4aec48f25d20f6",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "image": "vec4",
+     "temperature": "vec4",
+     "tint": "vec3"
+    },
+    "fingerprint": "5b5342a9dd4eb94618db028529db1c496b21c07748c87829033e120f4a2bd75f"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "image": "vec4",
+     "temperature": "float",
+     "tint": "float"
+    },
+    "fingerprint": "4d208f96fec3b0ce609b944f777d6ed9df636e7c844c411bcab3aafcd4ebdb95"
+   }
+  },
+  {
+   "key": "examples/wood_grain.tex",
+   "param_only_names": [
+    "center_x",
+    "center_y",
+    "noise_amp",
+    "noise_scale",
+    "ring_freq"
+   ],
+   "sha256_source": "f2cbe0ab727f18ec7d6173839606db27ad3f115918d19d7d9a174d1753385dc0",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "center_x": "vec4",
+     "center_y": "float",
+     "noise_amp": "vec4",
+     "noise_scale": "int",
+     "ring_freq": "float"
+    },
+    "fingerprint": "fa2dc896cd5215289e93499efcba4407c8cdd44261c60b9df73164dbeb59d0e0"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "center_x": "float",
+     "center_y": "float",
+     "noise_amp": "float",
+     "noise_scale": "float",
+     "ring_freq": "float"
+    },
+    "fingerprint": "e83db1a0561e1c88f18c11b6d37190c716938c8f4f9edd2016fe256d4a27268e"
+   }
+  },
+  {
+   "key": "examples/zdefocus.tex",
+   "param_only_names": [
+    "focal_length",
+    "focus_depth",
+    "fstop",
+    "highlight_boost",
+    "highlight_threshold",
+    "max_blur",
+    "samples"
+   ],
+   "sha256_source": "2dee7e5b7c7d5d157db1ead6392ed19dda7a59b784d25f875a85e751c516ed75",
+   "typed": {
+    "binding_types": {
+     "OUT": "vec3",
+     "depth": "vec3",
+     "focal_length": "vec4",
+     "focus_depth": "float",
+     "fstop": "vec4",
+     "highlight_boost": "int",
+     "highlight_threshold": "float",
+     "image": "vec4",
+     "max_blur": "float",
+     "samples": "int"
+    },
+    "fingerprint": "b3f868334ea9857930d19f2bdc4a65c85660110af223aaadbe8f29488fd02745"
+   },
+   "wires": {
+    "binding_types": {
+     "OUT": "vec4",
+     "depth": "vec4",
+     "focal_length": "float",
+     "focus_depth": "float",
+     "fstop": "float",
+     "highlight_boost": "float",
+     "highlight_threshold": "float",
+     "image": "vec4",
+     "max_blur": "float",
+     "samples": "float"
+    },
+    "fingerprint": "ab8c611d25d5f33d3e33ff422fe7fedc911c5977e005162531e23c04ef86905b"
+   }
+  },
+  {
+   "key": "_COMP_STAGES/exposure",
+   "param_only_names": [
+    "exposure"
+   ],
+   "sha256_source": "a29b59aeb8fabf8f7760cba6d0473d8c01fa2ebdf473fef8397fa22a0aa7bc7a",
+   "typed": {
+    "binding_types": {
+     "IN": "float",
+     "OUT": "vec3",
+     "exposure": "float"
+    },
+    "fingerprint": "2d38e4c343a4e222b343bd2c069755bb0fa6e8513ed7661f22fbecd21dc208fc"
+   },
+   "wires": {
+    "binding_types": {
+     "IN": "vec4",
+     "OUT": "vec4",
+     "exposure": "float"
+    },
+    "fingerprint": "014a5b01d5a3970736d52476734717ee1f37d0e52daf6cf70970ea08122f9a89"
+   }
+  },
+  {
+   "key": "_COMP_STAGES/blackpoint",
+   "param_only_names": [
+    "black"
+   ],
+   "sha256_source": "c2b5dd01f5086c50b0510381b78b41ae3a7cb0f3e5bddd18e57f29eb588d9b3e",
+   "typed": {
+    "binding_types": {
+     "IN": "float",
+     "OUT": "vec3",
+     "black": "int"
+    },
+    "fingerprint": "59dee36302067704e4fc4eb34283848827aedcfa9dd19be28d9630abd7b0a35e"
+   },
+   "wires": {
+    "binding_types": {
+     "IN": "vec4",
+     "OUT": "vec4",
+     "black": "float"
+    },
+    "fingerprint": "9b4ffa2bdbb9fd18b3380e387e7a7496ddfe6debd498015b907fbb74ac064d19"
+   }
+  },
+  {
+   "key": "_COMP_STAGES/gamma",
+   "param_only_names": [
+    "gamma"
+   ],
+   "sha256_source": "ebe0c9c12943b3afb1e96f9a61ef5b9b866769af2f9587cf59ffd462b90d2dcb",
+   "typed": {
+    "binding_types": {
+     "IN": "float",
+     "OUT": "vec3",
+     "gamma": "vec3"
+    },
+    "fingerprint": "613c6dc708c0d40b3b68078234da6be88c87de0ba2ef19f546883644bb7c53e8"
+   },
+   "wires": {
+    "binding_types": {
+     "IN": "vec4",
+     "OUT": "vec4",
+     "gamma": "float"
+    },
+    "fingerprint": "97c1da1e599353b6ef400dd34740069d94f05826ee027d2bc46060aa22dfe6ce"
+   }
+  },
+  {
+   "key": "_COMP_STAGES/saturation",
+   "param_only_names": [
+    "sat"
+   ],
+   "sha256_source": "c00a4f975d551e1540719375b3c863d86004359dcb39458892226593ef822314",
+   "typed": {
+    "binding_types": {
+     "IN": "float",
+     "OUT": "vec3",
+     "sat": "int"
+    },
+    "fingerprint": "1c12819c96fa9c43e56009ec707761bd008a4d16adff203777a2d075a6d380f0"
+   },
+   "wires": {
+    "binding_types": {
+     "IN": "vec4",
+     "OUT": "vec4",
+     "sat": "float"
+    },
+    "fingerprint": "0b6d6b1544376255acd59ead13639d98908754b26aeb94c4419aef1336fc75ff"
+   }
+  },
+  {
+   "key": "_COMP_STAGES/blur",
+   "param_only_names": [
+    "sigma"
+   ],
+   "sha256_source": "6cacb3b536cbbdd722e4446b76690c827d66090e3ef4b6d5b545f14a25d131d2",
+   "typed": {
+    "binding_types": {
+     "IN": "float",
+     "OUT": "vec3",
+     "sigma": "int"
+    },
+    "fingerprint": "ad426714d7fd423298658f0e1718590167df7a46a1ba92c33d281b38f16c03cc"
+   },
+   "wires": {
+    "binding_types": {
+     "IN": "vec4",
+     "OUT": "vec4",
+     "sigma": "float"
+    },
+    "fingerprint": "fa5b11f122dfee97d2b94014ed55a2e20b47d5299cce1d784f8912a6a5a2d991"
+   }
+  },
+  {
+   "key": "_COMP_STAGES/sharpen",
+   "param_only_names": [
+    "amount"
+   ],
+   "sha256_source": "519deeb7bbf3f07db75ace6d75216dd02a30d3efeb42367d5a5038aca65fd21c",
+   "typed": {
+    "binding_types": {
+     "IN": "float",
+     "OUT": "vec3",
+     "amount": "vec4"
+    },
+    "fingerprint": "50e0899e16aa0e55812b571522b7438614d60beea2a4bd3f775e4b5f91315137"
+   },
+   "wires": {
+    "binding_types": {
+     "IN": "vec4",
+     "OUT": "vec4",
+     "amount": "float"
+    },
+    "fingerprint": "a7988fdb7ca6f9a87154f8c6e9b21b2bbcd86aba6884ea5c68dde7f52ffc99c7"
+   }
+  },
+  {
+   "key": "_COMP_STAGES/tint",
+   "param_only_names": [
+    "tint"
+   ],
+   "sha256_source": "dcbae777bea5cd9bfa26d4f4db6abd10273adad90668d4b1f11238453ec7eed0",
+   "typed": {
+    "binding_types": {
+     "IN": "float",
+     "OUT": "vec3",
+     "tint": "vec3"
+    },
+    "fingerprint": "43c0e37656a6858bf01b67822e65cbbf81c0ac688db5c9d13609d9d4d9978da2"
+   },
+   "wires": {
+    "binding_types": {
+     "IN": "vec4",
+     "OUT": "vec4",
+     "tint": "float"
+    },
+    "fingerprint": "bc64ae93087cdb0d065c14020da4ea61a12e4361d8fe11c81a42d0de2e719a81"
+   }
+  },
+  {
+   "key": "_COMP_STAGES/contrast",
+   "param_only_names": [
+    "contrast"
+   ],
+   "sha256_source": "72d2c651a38918b0e6e5145f3b950f684aec3bb80b3b276724de684440fd39f2",
+   "typed": {
+    "binding_types": {
+     "IN": "float",
+     "OUT": "vec3",
+     "contrast": "int"
+    },
+    "fingerprint": "a366b803a6d0ecca4fa116b3a56c1d1940ce9f5a7c4864022f49bce3b24efa9f"
+   },
+   "wires": {
+    "binding_types": {
+     "IN": "vec4",
+     "OUT": "vec4",
+     "contrast": "float"
+    },
+    "fingerprint": "d93f683f5a5e580febd2cade42c7de08f4398dd646b0ee3a0acfd11513ddb0c9"
+   }
+  },
+  {
+   "key": "_COMP_STAGES/glow",
+   "param_only_names": [
+    "glow"
+   ],
+   "sha256_source": "044f32a9a70e8d12eda8947b1f664bc546ed681b886eb1dea744a88b9318d3f2",
+   "typed": {
+    "binding_types": {
+     "IN": "float",
+     "OUT": "vec3",
+     "glow": "vec4"
+    },
+    "fingerprint": "35eb0934929b11ab3400aa33bc7ea0d17227e6eefa5892863951e0e9fa2b2d88"
+   },
+   "wires": {
+    "binding_types": {
+     "IN": "vec4",
+     "OUT": "vec4",
+     "glow": "float"
+    },
+    "fingerprint": "df4589e6f662b7266c338c7da093dd9eb7fdeee97a0c107d37e1724ba2a04f8b"
+   }
+  },
+  {
+   "key": "_COMP_STAGES/vignette",
+   "param_only_names": [
+    "strength"
+   ],
+   "sha256_source": "fa395ab1c7d11435ed455cef265fa1e30cda4bb70f09c1142ced48449d05e052",
+   "typed": {
+    "binding_types": {
+     "IN": "float",
+     "OUT": "vec3",
+     "strength": "int"
+    },
+    "fingerprint": "5828b3b5b7fe29dfd73c2488ce738528a2f63abd400b2d396318d74516cfd219"
+   },
+   "wires": {
+    "binding_types": {
+     "IN": "vec4",
+     "OUT": "vec4",
+     "strength": "float"
+    },
+    "fingerprint": "436fa96586f6836de665a66ba33ab7e95f5b6aa6b99169058f75d006efbbae35"
+   }
+  }
+ ]
+}

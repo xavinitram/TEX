@@ -125,7 +125,12 @@ _TERMINAL = {
     "tex_results.lineage_key": 11,   # 10 whole-frame chain keys + 1 windowed key for the
                                      # cooked stage. Host policy: minting the nine clean-prefix
                                      # keys every tick is what makes this 11 and not 2.
-    "TEXCache.fingerprint":    2,    # 2 per cook: `param_only_names` + the compile probe.
+    "TEXCache.fingerprint":    1,    # PERF-5 re-pin (was 2). ONE per cook: `prepare` computes
+                                     # the key for `_preflight_memory`'s memo and hands the
+                                     # same string to the compile, which uses it for the cache
+                                     # probe AND the store. A 2 here means a caller went back
+                                     # to computing its own; a 0 means the spy stopped seeing a
+                                     # `@staticmethod` (see the mutation guard below).
     "ResultCache.get":         1,    # one probe for the one dirty stage,
     "ResultCache.put":         1,    # one store. Growth per tick is host retention policy.
     "tex_memory.run_roi":      1,    # the cook took the ROI path. 0 would mean a whole-frame
@@ -150,7 +155,7 @@ _MIDGRAPH = {
     "tex_roi.roi_plan":        6,    # 5 engine plans + 1 host halo question.
     "tex_roi.chain_windows":   1,
     "tex_results.lineage_key": 15,   # 10 chain keys + 5 windowed keys.
-    "TEXCache.fingerprint":   10,    # 2 per cook.
+    "TEXCache.fingerprint":    5,    # PERF-5 re-pin (was 10): 1 per cook, five cooks.
     "ResultCache.get":         5,
     "ResultCache.put":         5,
     "tex_memory.run_roi":      5,    # all five stages stayed on the ROI path.
@@ -171,7 +176,7 @@ _PAN = {
     "tex_roi.roi_plan":        1,    # the engine's, only: the host's halo memo hits.
     "tex_roi.chain_windows":   1,
     "tex_results.lineage_key": 11,
-    "TEXCache.fingerprint":    2,
+    "TEXCache.fingerprint":    1,    # PERF-5 re-pin (was 2): 1 per cook.
     "ResultCache.get":         1,
     "ResultCache.put":         1,    # 1, not 0: the window is in the key, so a moved window
                                      # is always a miss. A 0 would mean the walk revisited a
@@ -192,7 +197,9 @@ _ALL_DIRTY = {
     "tex_roi.roi_plan":        0,    # which is why a whole-frame recook never re-parses.
     "tex_roi.chain_windows":   0,
     "tex_results.lineage_key":10,    # one whole-frame key per stage; no windowed keys.
-    "TEXCache.fingerprint":   20,    # 2 per cook.
+    "TEXCache.fingerprint":   10,    # PERF-5 re-pin (was 20): 1 per cook, ten cooks —
+                                     # the clearest reading of the change, and the one
+                                     # `docs/host-path-counts.md` §6 item 6 named.
     "ResultCache.get":        10,
     "ResultCache.put":        10,
     "tex_memory.run_roi":      0,    # no roi => the whole-frame path, by construction.

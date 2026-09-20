@@ -1973,6 +1973,21 @@ def main():
     test_perf4_the_halo_scan_visits_each_node_once(r)
     test_perf4_halo_mutants_are_caught(r)
 
+    # PERF-5: the fixed per-cook front end. One `TEXCache.fingerprint` per cook (the key
+    # `prepare` needs anyway is handed to the compile, which uses it for the probe AND the
+    # store), guarded by a base-sha golden over every shipped example's fingerprint string —
+    # the string names an on-disk cache file, so it may not move.
+    from test_perf5_fixed_pipeline import (
+        test_perf5_fingerprint_and_param_only_names_are_byte_stable,
+        test_perf5_the_golden_catches_a_one_character_recipe_change,
+        test_perf5_one_fingerprint_per_cook,
+        test_perf5_the_shared_fingerprint_is_the_cache_key,
+    )
+    test_perf5_fingerprint_and_param_only_names_are_byte_stable(r)
+    test_perf5_the_golden_catches_a_one_character_recipe_change(r)
+    test_perf5_one_fingerprint_per_cook(r)
+    test_perf5_the_shared_fingerprint_is_the_cache_key(r)
+
     success = r.summary()
     return 0 if success else 1
 

@@ -384,15 +384,22 @@ class TEXCache:
         memo[cache_key] = fp
         return fp
 
-    def get(self, code: str, binding_types: dict[str, TEXType]) -> tuple | None:
+    def get(self, code: str, binding_types: dict[str, TEXType],
+            *, fp: str | None = None) -> tuple | None:
         """
         Look up a cached compilation result.
 
         Returns (program, type_map, referenced_bindings,
                  assigned_bindings, param_declarations, used_builtins) or None.
         Checks memory first, then disk.
+
+        `fp` is an already-computed `fingerprint(code, binding_types)` for THIS pair — the
+        caller's, when it needed the value for something else anyway (PERF-5). It is a pure
+        function of the arguments, so passing it is an optimisation and never a semantic
+        choice; omit it and it is computed here exactly as before.
         """
-        fp = self.fingerprint(code, binding_types)
+        if fp is None:
+            fp = self.fingerprint(code, binding_types)
 
         # Tier 1: memory
         if fp in self._memory:
@@ -417,9 +424,16 @@ class TEXCache:
         assigned_bindings: dict[str, TEXType] | None = None,
         param_declarations: dict[str, dict] | None = None,
         used_builtins: frozenset[str] | None = None,
+        fp: str | None = None,
     ):
-        """Store a compilation result in both memory and disk caches."""
-        fp = self.fingerprint(code, binding_types)
+        """Store a compilation result in both memory and disk caches.
+
+        `fp`: see `get` — an already-computed fingerprint for this exact `(code,
+        binding_types)` pair. Nothing between the probe and the store mutates
+        `binding_types` (the splitback and both TypeChecker passes only read it), so the
+        value a caller probed with is the value this would recompute."""
+        if fp is None:
+            fp = self.fingerprint(code, binding_types)
         result = (program, type_map, referenced_bindings,
                   assigned_bindings or {}, param_declarations or {},
                   used_builtins or frozenset())
@@ -427,7 +441,7 @@ class TEXCache:
         self._save_to_disk(fp, program, binding_types)
 
     def compile_tex(
-        self, code: str, binding_types: dict[str, TEXType]
+        self, code: str, binding_types: dict[str, TEXType], *, fp: str | None = None
     ) -> tuple:
         """
         Compile TEX source: lex -> parse -> type-check, with caching.
@@ -439,8 +453,15 @@ class TEXCache:
         param_declarations: dict mapping parameter names to {type, type_hint}.
         used_builtins: frozenset of builtin names referenced by the program.
         Raises LexerError, ParseError, or TypeCheckError on invalid code.
+
+        PERF-5: the probe and the store share ONE fingerprint. `fp` lets the caller share
+        it too — `tex_engine.prepare` needs the value for `_preflight_memory`'s memo and
+        used to compute it a second time beside this call, which is why a warm cook read
+        two `fingerprint` calls per cook and a cold one read three.
         """
-        cached = self.get(code, binding_types)
+        if fp is None:
+            fp = self.fingerprint(code, binding_types)
+        cached = self.get(code, binding_types, fp=fp)
         if cached is not None:
             return cached
 
@@ -455,7 +476,7 @@ class TEXCache:
             self.compile_ast(program, binding_types, source=code)
 
         self.put(code, binding_types, program, type_map,
-                 referenced, assigned, params, used_builtins)
+                 referenced, assigned, params, used_builtins, fp=fp)
         return (program, type_map, referenced, assigned, params, used_builtins)
 
     def compile_ast(self, program, binding_types, *, source: str):

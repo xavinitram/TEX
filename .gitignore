@@ -36,6 +36,11 @@ tests/*.json
 # whitelisted rather than a single filename, so a freeze cannot be silently uncommitted.
 !tests/compat_corpus_goldens/
 !tests/compat_corpus_goldens/*.json
+# PERF-5's fingerprint golden is a committed artifact for the same reason: it records the
+# cache-key strings at a known sha, and a golden that is not in the repo cannot gate a
+# change to them. Whitelisted as a directory, so a row cannot be silently uncommitted.
+!tests/perf5_goldens/
+!tests/perf5_goldens/*.json
 
 wiki/
 .coverage

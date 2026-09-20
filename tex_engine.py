@@ -106,7 +106,7 @@ from .tex_tiling import (                         # noqa: F401  (re-export)
 
 # ── ENG-4: the single compile raiser ─────────────────────────────────────────
 
-def _compile_or_raise(code: str, binding_types: dict):
+def _compile_or_raise(code: str, binding_types: dict, *, fp: str | None = None):
     """Compile `code` to the cache's 6-tuple, or raise the PUBLIC `TEXCompileError`
     (carrying `[.diagnostics]`) on failure.
 
@@ -117,9 +117,12 @@ def _compile_or_raise(code: str, binding_types: dict):
     stage directly, never through the cache) and raises the same public type via the same shared
     translator — so the exception TAXONOMY lives in one place even though there are two compile
     sites. `check()` (LANG-2) keeps its own collect-don't-raise path.
+
+    PERF-5: `fp` forwards an already-computed `TEXCache.fingerprint(code, binding_types)` so a
+    caller that needs the value anyway pays for it once.
     """
     try:
-        return get_cache().compile_tex(code, binding_types)
+        return get_cache().compile_tex(code, binding_types, fp=fp)
     except raw_compile_errors() as e:
         raise compile_error_from(e, code) from e
 
@@ -839,14 +842,15 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
         # Compile (uses two-tier Mega-Cache: memory LRU + disk persistence). ENG-4: the
         # compile failure surfaces as the public TEXCompileError from this single raiser —
         # the node/cli catch that, not the raw per-phase types.
-        cache = get_cache()
+        # LAT-2: the fingerprint is computed here (rather than below the preflight) so
+        # _preflight_memory can memoize its peak-estimate AST walk on it; it is
+        # value-identical either way, since binding_types is snapshotted before param
+        # injection. PERF-5: it is computed ONCE and handed to the compile, which uses it
+        # for both the cache probe and the store — a warm cook used to enter `fingerprint`
+        # twice per cook (here and in `get`) and a cold one three times.
+        fp = get_cache().fingerprint(code, binding_types)
         program, type_map, referenced, assigned_bindings, param_info, used_builtins = \
-            _compile_or_raise(code, binding_types)
-        # LAT-2: compute the fingerprint here (memoized in TEXCache, so this is the SAME
-        # single call that used to sit below the preflight — value-identical, since
-        # binding_types is snapshotted before param injection) so _preflight_memory can
-        # memoize its peak-estimate AST walk on it.
-        fp = cache.fingerprint(code, binding_types)
+            _compile_or_raise(code, binding_types, fp=fp)
 
     # Resolve target device (from the effective bindings — merged for a chain)
     device = resolve_device(device_mode, bindings)
