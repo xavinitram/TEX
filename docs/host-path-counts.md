@@ -66,7 +66,7 @@ ordinal (`_pan_seq`), for the same reason in the other direction: a repeated win
 hit, not a pan, and reusing pass A's positions in pass C served the coordinate tensors from the
 LAT-4 builtin LRU and reported 22 CUDA kernels for a pan tick that really costs 26.
 
-## 3. The seven scenarios
+## 3. The seven scenarios, and the eighth
 
 | scenario | what a host is doing |
 |---|---|
@@ -77,6 +77,34 @@ LAT-4 builtin LRU and reported 22 CUDA kernels for a pan tick that really costs 
 | `pan` | the window moves 16 px per tick, parameters constant |
 | `all_dirty` | a source-side knob each tick, whole frame, so the results cache misses all ten |
 | `lint` | `tex_api.check` with a one-character edit per tick — no cook at all |
+| `node_scrub` | the ComfyUI **node**: two `check_lazy_status` rounds then `execute`, one `$param` moving |
+
+**Why the eighth is not a comp scenario (BENCH-3).** The seven above drive `tex_api` /
+`tex_engine` directly, and `tex_engine.prepare` consults the lazy analysis only when its caller
+passes `forgive_dead_refs`, which defaults to `False`. The one caller that passes it is
+`tex_node.execute` (`forgive_dead_refs=bool(slot_entries)` — the ComfyUI lazy input pool), so
+`tex_lazy.lazy_required_bindings` reads **0 per tick on all seven**, `all_dirty` included, which
+enters `prepare` ten times a tick. The first-class host's own per-tick cost was therefore
+invisible to this instrument: PERF-4 measured a slider tick at **2 lexes and 2 parses** before
+its fix and **0** after (one lex and one parse in total, paid by the first tick), and no row
+here moved either way. `node_scrub` drives what a user's slider drives — round 1 of
+`check_lazy_status` with the wired scalar still `None`, round 2 once it has cooked (the T4-lite
+round), then `execute`, whose E6003 gate is the analysis's third consumer — and its
+device-independent rows, measured on both legs at 96²/48²/4 ticks and identical on each:
+
+| per tick, `node_scrub` | | | |
+|---|---:|---|---:|
+| `lazy_required_bindings` | **3** | `TEXCache.compile_tex` / `fingerprint` | **1** / **1** |
+| `Lexer.tokenize` / `Parser.parse` | **0** / **0** | `tex_engine.prepare` / `run` | **1** / **1** |
+| `TEXCache.compile_ast` | **0** | `tex_engine.cook` | **0** |
+| `Interpreter._exec_stmt` | **2** | every `tex_roi` / `tex_results` / `ResultCache` row | **0** |
+
+`tex_engine.cook` reads 0 and `prepare`/`run` read 1 because the node calls the two halves
+itself — it needs the plan between them for the Q-4 stage attribution — and the whole ROI /
+results-cache tier reads 0 because ComfyUI has no viewport window to cook. That is the point
+of the scenario: it is the other half of what an embedding host pays, not a second reading of
+the half the comp already covers. `tests/test_bench2_counts.py` pins the rows above, so the
+PERF-4 class is gated from now on.
 
 ## 4. The per-tick signature at head
 
@@ -144,7 +172,9 @@ holds the edited sources; it is reported and not pinned for that reason.
 | allocator allocations | 0 | 72 | **18** | **56** | **22** | **86** | 0 |
 | `num_device_alloc` | 0 | 7 | 0 | 0 | 0 | 0..10~ | 0 |
 | `num_alloc_retries` | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| `torch.cuda.mem_get_info` | 10 | 4 | 0 | 0 | 0 | 7 | 0 |
+| `torch.cuda.mem_get_info` at `v0.37.0`, before PERF-6 | 10 | 4 | 0 | 0 | 0 | 7 | 0 |
+| `host.get_free_memory` | **10** | 0 | 0 | 0 | 0 | 0 | 0 |
+| `torch.cuda.mem_get_info` | **10** | 0 | 0 | 0 | 0 | 0 | 0 |
 | `_preflight_memory` | 0 | 7 | 1 | 5 | 1 | 10 | 0 |
 | host's own end-of-frame sync | 0 | 1 | 1 | 1 | 1 | 1 | 0 |
 
@@ -154,6 +184,21 @@ the host reading of a literal / `$param` / folded constant on the 0-dim tensor i
 into, so the whole column is 0 and the `source_edit` row became stable at 0 with it. A sigma
 genuinely computed on the device still drains, correctly: this comp has no such stage. There is
 no H2D on any interactive tick either — the canvases stay resident.
+
+**The two free-VRAM rows, and whose queries the `prewarm` 10 are (PERF-6, F1).** Both rows
+read the same integers here, but they are not the same measurement: the driver call is the
+inner 13–17 µs of a 90–112 µs host call, which is why the seam is counted as well as the
+driver (§6 item 6). PERF-6 took the tile planner's queries to **0** on every cooking scenario
+by sharing one live reading across a frame — and left `prewarm`'s **10** exactly where they
+were, because they are a DIFFERENT CALLER asking a different question:
+`tex_runtime/compiled.py::_cuda_headroom_ok` (`compiled.py:1006`), once per program, deciding
+whether there is comfortable VRAM headroom (`free > 2 GB`) to submit a BACKGROUND compile. It
+wants a live reading precisely because it is about to start something that allocates, and a
+prewarm is a once-per-project cost rather than a per-frame one — so this row is 10 by design,
+not by omission. It is also the NON-INERT witness for `tests/test_bench2_counts.py`'s
+free-memory pins: five of the seven scenarios pin it at 0, and a lane that takes the
+`_cuda_headroom_ok` query (10 → 1, with `TEXCache.compile_ast` unmoved at 10) owes that test
+another non-zero row first.
 
 ### 4.3 TEX Python frames
 
@@ -211,6 +256,13 @@ scenarios, `--compare` between them:
 
 Compare that with the timing null controls in §1, taken on the same laptop. The CPU pass of
 the gate at 96²/48²/4 ticks runs in about 2.6 s.
+
+The same check is what an added scenario owes the ones already there: BENCH-3 saved the seven
+at the gate shape (96²/48²/4, both devices) before adding `node_scrub` and `--compare`d the
+same seven after, reading **0 stable rows moved** — a new scenario must not move an old row,
+and the `--scenario` filter makes that provable rather than asserted. Give each leg its own
+cold `TEX_CACHE_DIR`: a warm one reports six `source_edit` rows moving that are the scenario's
+own cold/warm program cache and not the change (PERF-4 hit exactly that).
 
 ## 6. Avoidable per tick — the candidate follow-ups
 
@@ -277,6 +329,45 @@ test before it starts, and cannot claim a win the instrument would not see.
    policy** — a scrub visits values it will never revisit, and nothing tells the cache so.
    *Shows fixed as:* `results_cache.entries_added` going to **0** on `terminal` and `pan` while
    `ResultCache.get`'s hit behaviour on a revisited value is unchanged.
+
+   **What it costs when the budget is reached, measured (BENCH-3, from PERF-6's F3).** The row
+   reads a tidy integer the whole way down the cliff, so here is the cliff. Driven at 1024²
+   on a quiet box (GPU 0 %, 0 MiB either side), timing each tick and reading `ResultCache.stats()`
+   beside it (drive a scenario's `tick` in a loop and print `comp.cache.stats()` each time —
+   the harness's own scenario classes are importable, so this is a dozen lines):
+
+   | | `terminal` (4 MB/tick) | `all_dirty` (10 × 16 MB/tick) |
+   |---|---:|---:|
+   | RAM budget (default, this box) | 2048 MB | 2048 MB |
+   | tick the budget is reached on | **471** | **11** |
+   | median before / after | 1.09 ms / 6.47 ms | 6.5 ms / 165 ms |
+   | ratio | **5.9×** | **25–31×** |
+   | per tick past the knee | 1 eviction + 1 spill | 10 evictions + 10 spills |
+   | `restores` over the whole run | **0** | 10 (all from priming) |
+
+   So an interactive scrub does reach it, and a `terminal` drag is not exempt — it is 470 ticks
+   away rather than 11, which is seconds of dragging one slider, and `pan` fills at the same
+   rate. **The 40-tick run PERF-6 saw the cliff on was `all_dirty`; `terminal` at 40 ticks is
+   flat** (48 ticks: median 0.87 ms, 0 evictions, 356 MB held) and only turns over at ~471.
+
+   **Where the time goes: the SPILL, not the eviction and not the copy-on-read.** Neutering
+   `ResultCache._spill` and re-running the same twenty `all_dirty` ticks interleaved between two
+   shipped legs (interleaved, per §7's rule) leaves the same **92 evictions**
+   and takes the ratio from 26.4× / 35.0× to **0.96×** — flat. Eviction itself is bookkeeping
+   under the lock; what costs is `_drain_spills` writing each victim out (a D2H for a CUDA
+   frame plus a pickle), ~14.6 ms per 16 MB frame ≈ 1 GB/s. Copy-on-read is not in it at all:
+   a scrub never revisits a value, so `hits` stays 0 and `get`'s copy never runs. Those frames
+   are written and never read — `restores` is 0 over 620 `terminal` ticks and 119 spills.
+
+   **Which counter would show it, and why the gate cannot.** `ResultCache.stats()` already
+   counts `evictions`, `spills` and `restores`; a harness row over `spills` is the honest
+   instrument (it is 0 on every short run and non-zero exactly at the knee, while
+   `entries_added` is 1 either side). It is NOT added here, because at the gate's 96²/4-tick
+   shape a canvas is 147 KB and `all_dirty` would need ~14 000 ticks to reach the knee — a row
+   that can only ever read 0 in CI is decoration. What would make it gateable is a scenario
+   that arms the cache with a small explicit budget (`ResultCache(budget_mb=…)`), which crosses
+   the knee in a handful of ticks at any resolution; that is a scenario design decision and
+   belongs with whoever takes item 5's retention policy, since the two share an acceptance test.
 6. **The per-cook fixed pipeline, paid ten times on a whole-frame cook.** Per cook, at head:
    two tile plans (`tex_tiling._tile_plan:38` and `_halo_tile_plan:142`, both re-exported into
    `tex_engine` at `tex_engine.py:101`), `enforce_cache_budget` (`tex_memory.py:327`),
