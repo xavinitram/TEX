@@ -241,7 +241,13 @@ _OVER_HARD_BASELINE = frozenset({
 # line added to it was a red test and the split had to be done under that pressure.
 # A floor is the ratchet run early — it reds while there is still room to act.
 # The floor MOVES DOWN, never up: raising it is how a budget becomes decoration.
-_HEADROOM_FLOOR = {"tex_engine.py": 1700}
+# `tex_results.py` joins the register at 1886/2000: 114 lines from the wall, NOT
+# grandfathered, and with the CACHE family still live work — exactly the situation ENG-14
+# was created to prevent, one release later and in a different module. 1958 is the smallest
+# floor that passes today while keeping the 72 lines of room ENG-14 gave `tex_engine.py`
+# (1628 under 1700). It buys 42 lines of warning before the hard budget, which is where a
+# split gets planned instead of improvised. Same rule: it moves DOWN when the split lands.
+_HEADROOM_FLOOR = {"tex_engine.py": 1700, "tex_results.py": 1958}
 
 
 def _product_packages(root) -> list:
