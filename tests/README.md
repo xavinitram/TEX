@@ -88,3 +88,47 @@ The `conftest.py` fixture creates the `SubTestResult`, passes it to the test fun
 | Marker | Usage | Command |
 |--------|-------|---------|
 | `@pytest.mark.slow` | Timing-sensitive tests | `pytest -m 'not slow'` to skip |
+
+## The known-red allowlist (`known_reds.json`)
+
+`tools/gate.py` runs the suite and prints one verdict. A verdict can only be honest if the
+failures it forgives are written down, so the reds a run is allowed to show live in
+`tests/known_reds.json` as **data** rather than in a paragraph somebody reads and agrees with.
+
+**The file is empty, and empty is the correct state.** Each entry is a failure somebody has
+agreed to live with; a register that is never emptied trains the next reader to wave the list
+through, which is exactly how the one standing red in this suite survived thirteen rounds.
+
+```json
+{
+  "schema": 1,
+  "entries": [
+    {
+      "id": "tests/test_example.py::test_something",
+      "reason": "one sentence: what is actually failing, and why it is not a tree defect",
+      "when": ["cuda"],
+      "condition": "the human sentence for `when` — the environment this red is expected in",
+      "owner": "who removes this entry, and what event lets them"
+    }
+  ]
+}
+```
+
+| field | meaning |
+|---|---|
+| `id` | the pytest node id as the gate normalises it: `tests/<file>.py::<test>` |
+| `reason` | why it is red. A reason that is really "nobody has looked" is a bug report, not an entry |
+| `when` | machine-readable applicability, ANDed. Vocabulary: `always`, `cuda`, `no_cuda`, `leg:cheap`, `leg:ci-shape`, `leg:canonical`. An unknown token makes the entry apply to nothing — deliberately, so a typo cannot silently forgive a failure |
+| `condition` | the same condition in words, for the reader |
+| `owner` | who owns REMOVING it. Every entry has an exit |
+
+Two rules the gate enforces by itself:
+
+* an entry that does not fire, on a leg that actually collected the test it names, is
+  reported as a **stale allowlist entry** and the run exits `2` — a list that claims a red
+  the tree no longer has is a lie in the opposite direction, and costs the same;
+* a failure with no matching entry is `RED`, named by node id.
+
+Adding an entry is therefore a decision with an owner on it, and removing one is how a lane
+finishes. If a red turns out to be a test bug rather than an environment fact, fix the test —
+that is what emptied this file.

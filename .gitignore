@@ -46,6 +46,11 @@ tests/*.json
 # reading is SOURCED can be shown not to have moved a plan.
 !tests/perf6_goldens/
 !tests/perf6_goldens/*.json
+# The known-red allowlist is a committed artifact for the same reason the goldens are: it is
+# what `tools/gate.py` forgives, and a debt register that is not in the repo cannot be read,
+# reviewed or emptied. It is a single file, whitelisted by name, so it cannot be mistaken for
+# a development JSON that happened to land in this directory.
+!tests/known_reds.json
 
 wiki/
 .coverage

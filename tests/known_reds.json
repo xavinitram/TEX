@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "note": "The known-red allowlist tools/gate.py applies. EMPTY IS THE CORRECT STATE: every entry is a failure somebody has agreed to live with, so the file is a debt register, not a configuration. The schema, the 'when' vocabulary and the rules for adding or removing an entry are in tests/README.md, section 'The known-red allowlist'.",
+  "entries": []
+}

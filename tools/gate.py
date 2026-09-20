@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""One command, one verdict: the gate an implementer runs before handing work back.
+
+WHY THIS FILE EXISTS
+--------------------
+The gate set used to be prose spread over three documents: a cheap list, a CI shape, a
+whole-suite run through a six-line wrapper that every reader retyped, and a known-red
+allowlist applied by eye. Two consequences, both measured over thirteen lanes:
+
+  * the whole-suite run returned a non-zero exit code on **every one of them**, because one
+    standing red was a test bug nobody owned — so its exit code carried no information and
+    "green" meant "read the error list and agree it is the expected one"; and
+  * the same pair of whole-suite runs was re-run after a rebase for information the second
+    run superseded, about 15 % of all the suite time spent.
+
+So: one entry point, two tiers, the allowlist held as DATA next to the tests it names, and a
+verdict keyed on the tree so an unchanged tree is not re-measured. The exit code is the
+verdict:
+
+    0   GREEN
+    1   RED       — at least one failure that the allowlist does not name
+    2   GREEN, but the allowlist is STALE — it names a red that did not fire. A stale
+                    allowlist is the failure mode this tool exists to remove, so it is
+                    reported in the exit code rather than in a paragraph.
+
+TIERS — and what each one actually proves
+-----------------------------------------
+`--tier cheap` runs the five ratchets that answer in seconds: the no-numpy ban, the LOC and
+headroom ratchets, the archive-surface ratchet, the host-path counts pins, and TST-7's runner
+drift check. Every one of them is a strict SUBSET of the full tier; they are kept for feedback
+latency, not for coverage, and this tool says so out loud.
+
+`--tier full` runs cheap first (cheapest first, and it aborts there if cheap is red unless
+`--keep-going`), then the two whole-suite legs that are NOT subsets of each other:
+
+  * **ci-shape** — the interpreter CI uses, from the package ROOT so the embedding host is off
+    `sys.path`, `CUDA_VISIBLE_DEVICES=-1`, `-m "not slow"`, `-p no:cacheprovider`. It is the
+    only leg that can catch a test which assumes a host or a GPU. It runs on Windows, so it
+    cannot catch a line-ending or toolchain difference — say that when quoting it.
+  * **canonical** — the embedded interpreter, from the package's PARENT, through
+    `tools/canonical_harness.py` (the v3 NodeOutput wrapper disarmed), `-X utf8`. It is the
+    only leg that exercises CUDA and the host-present path.
+
+Optionally `--counts-baseline PATH` adds the structural counts leg, run at the gate shape
+(96^2 / 48^2 / 4 ticks, CPU) with `--counters-only`: its verdict counts API rows and reports
+the frame census outside the exit code, because the frame rows move for every lawful change
+that adds a call or moves a module. The baseline must be a `--save` taken at that same shape.
+
+CACHE
+-----
+A verdict is stored under (sha256 over every tracked and untracked-not-ignored file's bytes)
++ the tier. A re-run on an unchanged tree prints the cached verdict with the timestamp of the
+run that produced it and exits with the same code; `--no-cache` forces a real run and
+refreshes the entry. The cache lives OUTSIDE the repository on purpose — a cache file inside
+it would change the very hash it is keyed on.
+
+`tools/` is excluded from the published archive (`.comfyignore`), so nothing here ships.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PKG = os.path.dirname(_HERE)                        # .../TEX_Wrangle
+_PARENT = os.path.dirname(_PKG)
+_HARNESS = os.path.join(_HERE, "canonical_harness.py")
+_ALLOWLIST = os.path.join(_PKG, "tests", "known_reds.json")
+
+#: The ratchets that answer in seconds. Each is a strict subset of both whole-suite legs.
+_CHEAP = [
+    ("no-numpy ban", "tests/test_no_numpy_ban.py"),
+    ("LOC + headroom ratchets", "tests/test_v017_phase2.py"),
+    ("archive surface ratchet", "tests/test_pub1_archive.py"),
+    ("host-path counts pins", "tests/test_bench2_counts.py"),
+    ("TST-7 runner drift", "tests/test_v017_phase1.py"),
+]
+
+#: The interpreter CLAUDE.md names for the CI shape. Overridable; never installed into.
+_DEFAULT_CI_PYTHON = r"C:\Projects\TEX_compositor\.venv\Scripts\python.exe"
+
+_SUMMARY_RE = re.compile(
+    r"^[=\s]*\d+ (?:passed|failed|error|deselected|skipped)|"
+    r"^\s*(?:\d+ \w+,? ?)+ in [\d.]+s", re.I)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tree identity
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _git(*args, cwd=_PKG) -> str:
+    try:
+        return subprocess.run(["git", "-C", cwd, *args], capture_output=True,
+                              text=True, timeout=120).stdout
+    except Exception:
+        return ""
+
+
+def tree_hash() -> str:
+    """sha256 over the bytes of every file git would show you, path included.
+
+    Tracked files AND untracked-not-ignored ones: a lane that adds a test file has not
+    committed it yet, and a cache that could not see it would hand that lane a stale GREEN.
+    Ignored paths (the orchestration material in `.git/info/exclude`) are deliberately
+    invisible, so writing a hand-back does not invalidate a verdict."""
+    out = _git("ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    paths = sorted(p for p in out.split("\0") if p)
+    h = hashlib.sha256()
+    for rel in paths:
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        try:
+            with open(os.path.join(_PKG, rel), "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+        except OSError:
+            h.update(b"<unreadable>")
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def head_label() -> str:
+    sha = _git("rev-parse", "--short", "HEAD").strip() or "?"
+    return sha + ("-dirty" if _git("status", "--porcelain").strip() else "")
+
+
+def _cache_path() -> str:
+    env = os.environ.get("TEX_GATE_CACHE")
+    if env:
+        return env
+    return os.path.join(tempfile.gettempdir(), "tex-gate-verdicts.json")
+
+
+def _cache_read(key: str) -> dict | None:
+    try:
+        with open(_cache_path(), "r", encoding="utf-8") as fh:
+            return json.load(fh).get(key)
+    except Exception:
+        return None
+
+
+def _cache_write(key: str, record: dict) -> None:
+    path = _cache_path()
+    try:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            data = {}
+        data[key] = record
+        # Keep the file from growing without bound; verdicts are cheap to recompute.
+        if len(data) > 64:
+            for k in sorted(data, key=lambda k: data[k].get("at", ""))[:len(data) - 64]:
+                data.pop(k, None)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1)
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# The allowlist, as data
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_allowlist() -> list:
+    """`tests/known_reds.json` -> the entries, validated. A missing file is an empty list."""
+    try:
+        with open(_ALLOWLIST, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return []
+    entries = doc.get("entries", [])
+    for i, e in enumerate(entries):
+        missing = [k for k in ("id", "reason", "when", "condition", "owner") if k not in e]
+        if missing:
+            raise SystemExit(f"{_ALLOWLIST}: entry {i} is missing {missing}; every entry "
+                             f"states the test id, why it is red, the machine-readable "
+                             f"condition it is expected under, the human sentence for that "
+                             f"condition, and who removes it")
+    return entries
+
+
+def _applies(entry: dict, ctx: dict) -> bool:
+    """AND over a closed vocabulary — an entry that cannot be evaluated does not apply."""
+    for tok in entry.get("when", []):
+        if tok == "always":
+            continue
+        elif tok == "cuda" and not ctx["cuda"]:
+            return False
+        elif tok == "no_cuda" and ctx["cuda"]:
+            return False
+        elif tok.startswith("leg:") and tok[4:] != ctx["leg"]:
+            return False
+        elif tok not in ("always", "cuda", "no_cuda") and not tok.startswith("leg:"):
+            return False
+    return True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Running a leg
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Leg:
+    def __init__(self, name: str, proves: str):
+        self.name, self.proves = name, proves
+        self.rc = None
+        self.summary = "not run"
+        self.failures: list = []
+        self.collected: set = set()
+        self.seconds = 0.0
+
+
+def _parse_junit(path: str) -> tuple:
+    """`(failing ids, every collected id)`, as `tests/<file>.py::<test>`.
+
+    Exact, from the report pytest writes, not scraped from stdout. The COLLECTED set matters
+    as much as the failing one: an allowlist entry is only stale if the leg actually ran the
+    test it names, otherwise the cheap tier — which collects five files — would call every
+    entry for a sixth file stale."""
+    failing, seen = [], set()
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:
+        return failing, seen
+    for case in root.iter("testcase"):
+        nodeid = _nodeid_of(case)
+        seen.add(nodeid)
+        if any(case.find(t) is not None for t in ("failure", "error")):
+            failing.append(nodeid)
+    return sorted(set(failing)), seen
+
+
+def _nodeid_of(case) -> str:
+    """A junit `<testcase>` -> the node id the allowlist is written in.
+
+    The `file` attribute is optional and this box's pytest does not emit it, so the path is
+    recovered from the dotted `classname` by asking the DISK which prefix of it is a file —
+    which also splits a class-based id correctly without guessing at capitalisation."""
+    name = str(case.get("name"))
+    f = (case.get("file") or "").replace("\\", "/")
+    if f:
+        return f"{'tests/' + f.split('/tests/', 1)[1] if '/tests/' in f else f}::{name}"
+    parts = [p for p in (case.get("classname") or "").split(".") if p]
+    for i in range(len(parts), 0, -1):
+        rel = "/".join(parts[:i]) + ".py"
+        if os.path.isfile(os.path.join(_PKG, rel)):
+            return "::".join([rel, *parts[i:], name])
+    return "::".join([*parts, name]) if parts else name
+
+
+def _summary_of(stdout: str) -> str:
+    for line in reversed([ln.strip() for ln in stdout.splitlines() if ln.strip()]):
+        bare = line.strip("= ").strip()
+        if _SUMMARY_RE.match(bare) or (" in " in bare and bare[0].isdigit()):
+            return bare
+    return "(no pytest summary line)"
+
+
+def _run(leg: Leg, argv: list, cwd: str, env_extra: dict, scratch: str, verbose: bool) -> Leg:
+    cache = os.path.join(scratch, f"cache-{leg.name}")
+    shutil.rmtree(cache, ignore_errors=True)
+    os.makedirs(cache, exist_ok=True)
+    junit = os.path.join(scratch, f"junit-{leg.name}.xml")
+    env = dict(os.environ, TEX_CACHE_DIR=cache, **env_extra)
+    t0 = time.time()
+    proc = subprocess.run(argv + [f"--junit-xml={junit}"], cwd=cwd, env=env,
+                          capture_output=True, text=True, errors="replace")
+    leg.seconds = time.time() - t0
+    leg.rc = proc.returncode
+    leg.summary = _summary_of(proc.stdout)
+    leg.failures, leg.collected = _parse_junit(junit)
+    if verbose:
+        print(f"\n--- {leg.name}: {' '.join(argv)} (cwd={cwd}) ---")
+        print(proc.stdout[-8000:])
+        if proc.stderr.strip():
+            print(proc.stderr[-2000:])
+    return leg
+
+
+def run_cheap(python: str, scratch: str, verbose: bool) -> Leg:
+    leg = Leg("cheap", "the five ratchets only — no whole-suite collection, "
+                       "no host-absent lane, CUDA present")
+    files = [f"TEX_Wrangle/{p}" for _, p in _CHEAP]
+    argv = [python, "-X", "utf8", _HARNESS, *files, "-q", "-p", "no:cacheprovider"]
+    return _run(leg, argv, _PARENT, {}, scratch, verbose)
+
+
+def run_ci_shape(ci_python: str, scratch: str, verbose: bool) -> Leg:
+    leg = Leg("ci-shape", "CPU-only, the embedding host off sys.path, the CI interpreter — "
+                          "the only leg that catches a host or CUDA assumption; runs on this "
+                          "OS, so it cannot see a line-ending or toolchain difference")
+    if not os.path.isfile(ci_python):
+        leg.rc, leg.summary = 127, f"interpreter not found: {ci_python}"
+        leg.failures = ["<ci-shape interpreter missing>"]
+        return leg
+    argv = [ci_python, "-m", "pytest", "tests/", "-q", "-m", "not slow",
+            "-p", "no:cacheprovider"]
+    return _run(leg, argv, _PKG, {"CUDA_VISIBLE_DEVICES": "-1"}, scratch, verbose)
+
+
+def run_canonical(python: str, scratch: str, verbose: bool) -> Leg:
+    leg = Leg("canonical", "the embedded interpreter with CUDA and the host present, the v3 "
+                           "NodeOutput wrapper disarmed — the only leg that runs the GPU rows")
+    argv = [python, "-X", "utf8", _HARNESS, "TEX_Wrangle/tests", "-q", "-m", "not slow",
+            "-p", "no:cacheprovider"]
+    return _run(leg, argv, _PARENT, {}, scratch, verbose)
+
+
+#: The shape the counts harness is a GATE in — the same one `tests/test_bench2_counts.py`
+#: pins and `docs/host-path-counts.md` §5 calls the gate shape. It runs in seconds, where the
+#: reporting shape (1024^2, 8 ticks, both devices) runs in minutes, and a gate nobody can
+#: afford to run is not a gate. `--counts-baseline` must therefore be a `--save` taken at
+#: exactly this shape; a baseline taken at another one reports every row as new.
+_COUNTS_SHAPE = ["--device", "cpu", "--res", "96", "--window", "48", "--ticks", "4",
+                 "--prof1", "off"]
+
+
+def run_counts(python: str, baseline: str, scratch: str, verbose: bool) -> Leg:
+    leg = Leg("counts", "API per-tick counts at the gate shape (96^2/48^2/4 ticks, CPU) "
+                        "against a saved baseline; the frame census is reported outside the "
+                        "verdict, and no CUDA row is measured at this shape")
+    cache = os.path.join(scratch, "cache-counts")
+    shutil.rmtree(cache, ignore_errors=True)
+    os.makedirs(cache, exist_ok=True)
+    argv = [python, "-X", "utf8", "TEX_Wrangle/benchmarks/host_path_counts.py",
+            *_COUNTS_SHAPE, "--counters-only", "--compare", baseline]
+    t0 = time.time()
+    proc = subprocess.run(argv, cwd=_PARENT, env=dict(os.environ, TEX_CACHE_DIR=cache),
+                          capture_output=True, text=True, errors="replace")
+    leg.seconds, leg.rc = time.time() - t0, proc.returncode
+    tail = [ln.strip() for ln in proc.stdout.splitlines() if "counter row(s) moved" in ln]
+    leg.summary = tail[-1] if tail else "(no compare summary line)"
+    if leg.rc:
+        leg.failures = [ln.strip() for ln in proc.stdout.splitlines()
+                        if ln.strip().startswith(("CHANGED", "NEW ROW", "GONE"))]
+    if verbose:
+        print(f"\n--- counts: {' '.join(argv)} ---\n{proc.stdout[-8000:]}")
+    return leg
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Verdict
+# ──────────────────────────────────────────────────────────────────────────────
+
+def judge(legs: list, allowlist: list, cuda: bool) -> dict:
+    """Apply the allowlist EXPLICITLY: what it excused, and what it claimed and did not get."""
+    real, excused, fired = [], [], set()
+    for leg in legs:
+        for nodeid in leg.failures:
+            hit = next((e for e in allowlist
+                        if e["id"] == nodeid and _applies(e, {"cuda": cuda, "leg": leg.name})),
+                       None)
+            if hit is None:
+                real.append(f"{leg.name}:{nodeid}")
+            else:
+                excused.append(f"{leg.name}:{nodeid}  ({hit['reason']})")
+                fired.add(id(hit))
+    stale = [e for e in allowlist
+             if id(e) not in fired
+             and any(_applies(e, {"cuda": cuda, "leg": leg.name}) and e["id"] in leg.collected
+                     for leg in legs)]
+    if real:
+        verdict, code = "RED", 1
+    elif stale:
+        verdict, code = "GREEN+STALE", 2
+    else:
+        verdict, code = "GREEN", 0
+    return {"verdict": verdict, "code": code, "real": real,
+            "excused": excused, "stale": stale}
+
+
+def _line(label: str, legs: list, j: dict, head: str) -> str:
+    parts = [f"GATE {head}", f"tier {label}"]
+    for leg in legs:
+        parts.append(f"{leg.name} {leg.summary} rc{leg.rc} ({leg.seconds:.0f}s)")
+    parts.append(f"known-reds {len(j['excused'])}/{len(j['excused']) + len(j['stale'])}")
+    parts.append(f"VERDICT {j['verdict']}")
+    return " | ".join(parts)
+
+
+def _report(label: str, legs: list, j: dict, head: str) -> None:
+    for leg in legs:
+        print(f"  proves: {leg.name} = {leg.proves}")
+    for row in j["excused"]:
+        print(f"  known red (allowed): {row}")
+    for e in j["stale"]:
+        print(f"  STALE ALLOWLIST ENTRY: {e['id']} — allowed because {e['reason']!r} under "
+              f"{e['condition']!r}, but it did not fire. {e['owner']} removes it.")
+    for row in j["real"]:
+        print(f"  RED: {row}")
+    print(_line(label, legs, j, head))
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(
+        description="Run TEX's gates and print one verdict. Exit 0 GREEN, 1 RED, "
+                    "2 GREEN but the known-red allowlist is stale.")
+    p.add_argument("--tier", choices=("cheap", "full"), default="cheap",
+                   help="cheap = the five ratchets; full = cheap, then the CI shape and the "
+                        "canonical whole-suite run (default: cheap)")
+    p.add_argument("--no-cache", action="store_true",
+                   help="ignore any cached verdict for this tree and tier, and refresh it")
+    p.add_argument("--ci-python", default=_DEFAULT_CI_PYTHON,
+                   help="the interpreter for the CI shape (RUN only; never installed into)")
+    p.add_argument("--python", default=sys.executable,
+                   help="the interpreter for the cheap and canonical legs "
+                        "(default: the one running this script)")
+    p.add_argument("--counts-baseline", metavar="PATH",
+                   help="add the structural-counts leg against this --save file, which must "
+                        "have been taken at the gate shape: `host_path_counts.py --device cpu "
+                        "--res 96 --window 48 --ticks 4 --prof1 off --save PATH`")
+    p.add_argument("--keep-going", action="store_true",
+                   help="run the full tier even when the cheap tier is red")
+    p.add_argument("--scratch", metavar="DIR",
+                   help="where per-leg TEX_CACHE_DIRs and junit files go (default: a temp dir)")
+    p.add_argument("-v", "--verbose", action="store_true", help="echo each leg's output")
+    a = p.parse_args(argv)
+
+    head, th = head_label(), tree_hash()
+    key = f"{th}:{a.tier}:{os.path.basename(a.ci_python)}:{bool(a.counts_baseline)}"
+    if not a.no_cache:
+        hit = _cache_read(key)
+        if hit:
+            print(f"GATE {head} | tier {a.tier} | CACHED from {hit['at']} "
+                  f"(tree unchanged; --no-cache to re-run) | VERDICT {hit['verdict']}")
+            for ln in hit.get("lines", []):
+                print("  " + ln)
+            return int(hit["code"])
+
+    allowlist = load_allowlist()
+    cuda = os.environ.get("CUDA_VISIBLE_DEVICES") != "-1"
+    scratch = a.scratch or tempfile.mkdtemp(prefix="tex-gate-")
+    os.makedirs(scratch, exist_ok=True)
+
+    lines, codes = [], []
+    cheap = run_cheap(a.python, scratch, a.verbose)
+    jc = judge([cheap], allowlist, cuda)
+    _report("cheap", [cheap], jc, head)
+    lines.append(_line("cheap", [cheap], jc, head))
+    codes.append(jc["code"])
+
+    if a.tier == "full":
+        if jc["code"] == 1 and not a.keep_going:
+            print(f"GATE {head} | tier full | SKIPPED (the cheap tier is red, and every "
+                  f"cheap row re-runs inside the full tier) | VERDICT RED")
+            print(f"GATE {head} | OVERALL RED")
+            return 1
+        full = [run_ci_shape(a.ci_python, scratch, a.verbose),
+                run_canonical(a.python, scratch, a.verbose)]
+        if a.counts_baseline:
+            full.append(run_counts(a.python, a.counts_baseline, scratch, a.verbose))
+        jf = judge(full, allowlist, cuda)
+        _report("full", full, jf, head)
+        lines.append(_line("full", full, jf, head))
+        codes.append(jf["code"])
+
+    code = 1 if 1 in codes else (2 if 2 in codes else 0)
+    overall = {0: "GREEN", 1: "RED", 2: "GREEN+STALE"}[code]
+    at = datetime.datetime.now().replace(microsecond=0).isoformat(" ")
+    final = f"GATE {head} | OVERALL {overall} | tree {th[:12]} | {at}"
+    print(final)
+    _cache_write(key, {"at": at, "verdict": overall, "code": code,
+                       "lines": lines + [final]})
+    if not a.scratch:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
