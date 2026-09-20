@@ -387,9 +387,11 @@ test before it starts, and cannot claim a win the instrument would not see.
    row is the one to read: the driver call is only the inner **13-17 µs** of a **90-112 µs**
    host call (the host folds allocator statistics in on top of `mem_get_info`), so a fix
    measured on `torch.cuda.mem_get_info` alone would claim a seventh of what it actually saved.
-   Both rows read 7 on `all_dirty`, 4 on `source_edit`, 0 on every interactive tick; `prewarm`'s
-   10 are a different caller entirely (`tex_runtime/compiled.py::_cuda_headroom_ok`, once per
-   program before a background compile is submitted).
+   Both rows read 7 on `all_dirty`, 4 on `source_edit` and 0 on every interactive tick **when
+   this item was written; PERF-6 has since landed it and at head both read 0 on all three**
+   (`tests/test_bench2_counts.py` pins them there and §4.2 carries the current readings), while
+   `prewarm`'s 10 are a different caller entirely (`tex_runtime/compiled.py::_cuda_headroom_ok`,
+   once per program before a background compile is submitted) and stayed at 10.
    *Shows fixed as:* `host.get_free_memory` **and** `torch.cuda.mem_get_info` going **7 → 1 or
    0** per `all_dirty` frame with `prewarm`'s 10 unmoved, and `_halo_tile_plan` going
    **10 → 0** on the stages whose pixel-local plan already answered.
