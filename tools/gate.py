@@ -27,8 +27,9 @@ TIERS — and what each one actually proves
 -----------------------------------------
 `--tier cheap` runs the six ratchets that answer in seconds: the no-numpy ban, the LOC and
 headroom ratchets, the archive-surface ratchet, the host-path counts pins, TST-7's runner
-drift check, and the private-root lint over the tracked set. Every one of them is a strict SUBSET of the full tier; they are kept for feedback
-latency, not for coverage, and this tool says so out loud.
+drift check, and the private-root lint over the tracked set. Every one of them is a strict
+SUBSET of the full tier; they are kept for feedback latency, not for coverage, and this tool
+says so out loud.
 
 `--tier full` runs cheap first (cheapest first, and it aborts there if cheap is red unless
 `--keep-going`), then the two whole-suite legs that are NOT subsets of each other:
@@ -57,11 +58,25 @@ that adds a call or moves a module. The baseline must be a `--save` taken at tha
 
 CACHE
 -----
-A verdict is stored under (sha256 over every tracked and untracked-not-ignored file's bytes)
-+ the tier. A re-run on an unchanged tree prints the cached verdict with the timestamp of the
-run that produced it and exits with the same code; `--no-cache` forces a real run and
-refreshes the entry. The cache lives OUTSIDE the repository on purpose — a cache file inside
-it would change the very hash it is keyed on.
+A verdict is a claim about a tree **as read by a particular set of interpreters**, so all of
+that is in the key: a sha256 over every tracked and untracked-not-ignored file's bytes, the
+tier, and, for every interpreter that tier runs, its RESOLVED absolute path *and* its
+`sys.version`. A re-run under the same conditions prints the cached verdict with the timestamp
+of the run that produced it, and the interpreters it belonged to, and exits with the same code;
+`--no-cache` forces a real run and refreshes the entry. The cache lives OUTSIDE the repository
+on purpose — a cache file inside it would change the very hash it is keyed on.
+
+The interpreter half is not decoration. The key used to carry `os.path.basename(ci_python)`,
+which on Windows is `python.exe` for every interpreter there has ever been, so a verdict
+measured with one was served for another — it handed back a RED that belonged to a different
+Python, and only `--no-cache` got past it. The version is in there too, for the path whose
+interpreter was upgraded underneath it.
+
+Note which interpreters a tier actually uses. `--tier cheap` runs only `--python`, so that is
+all its key carries. `--tier full` also runs the CI-shape interpreter — and with `TEX_CI_PYTHON`
+unset and no `--ci-python`, **that leg runs under `sys.executable`**: the same interpreter as
+the other legs, proving less, and the key and the printed line say exactly that by naming the
+same path twice.
 
 `tools/` is excluded from the published archive (`.comfyignore`), so nothing here ships.
 """
@@ -141,6 +156,63 @@ def tree_hash() -> str:
             h.update(b"<unreadable>")
         h.update(b"\0")
     return h.hexdigest()
+
+
+_VERSION_PROBE = "import sys;print(sys.version)"
+_IDENTITY_MEMO: dict = {}
+
+
+def interpreter_identity(path: str) -> tuple:
+    """`(resolved absolute path, sys.version)` for an interpreter, queried once per process.
+
+    Both halves are needed and neither is enough. The PATH distinguishes two interpreters that
+    happen to be named the same thing — on Windows every one of them is called `python.exe`,
+    which is how a verdict measured with one came to be served for another. The VERSION
+    distinguishes one path whose interpreter was upgraded underneath it, which no amount of
+    path comparison can see.
+
+    A path that cannot be run still yields an identity: its resolved path plus a note saying
+    the version is unknown. That is deliberate — an interpreter this tool cannot query is one
+    whose verdict should not be shared with any other, and returning something unique keeps the
+    cache honest rather than collapsing every unqueryable path onto one key."""
+    memo_key = os.path.normcase(os.path.abspath(path))
+    hit = _IDENTITY_MEMO.get(memo_key)
+    if hit is not None:
+        return hit
+    real = os.path.normcase(os.path.realpath(path))
+    try:
+        proc = subprocess.run([path, "-c", _VERSION_PROBE], capture_output=True,
+                              text=True, timeout=120)
+        version = (" ".join(proc.stdout.split()) if proc.returncode == 0 and proc.stdout.strip()
+                   else f"<unqueryable: rc {proc.returncode}>")
+    except Exception as e:
+        version = f"<unqueryable: {type(e).__name__}>"
+    hit = _IDENTITY_MEMO[memo_key] = (real, version)
+    return hit
+
+
+def cache_key(tree: str, tier: str, interpreters, with_counts: bool) -> str:
+    """The key a verdict is stored under: the tree, the tier, and WHO measured it.
+
+    `interpreters` is `[(role, path), …]` — every interpreter this tier will run. A verdict is
+    a claim about a tree *as read by a particular set of interpreters*, so all of them belong
+    in the key; the basename alone does not distinguish them (see `interpreter_identity`).
+    Hashed, so the cache file's keys stay one line whatever the paths look like — the readable
+    identities travel in the record and are printed with the cached verdict."""
+    parts = [f"tree={tree}", f"tier={tier}", f"counts={int(bool(with_counts))}"]
+    for role, path in interpreters:
+        real, version = interpreter_identity(path)
+        parts.append(f"{role}={real}|{version}")
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
+
+
+def describe_interpreters(interpreters) -> str:
+    """The readable half of `cache_key` — what a reader needs to trust a cached verdict."""
+    out = []
+    for role, path in interpreters:
+        real, version = interpreter_identity(path)
+        out.append(f"{role} {real} ({version.split(' ')[0]})")
+    return " | ".join(out)
 
 
 def head_label() -> str:
@@ -467,12 +539,20 @@ def main(argv=None) -> int:
 
     head, th = head_label(), tree_hash()
     ci_python, ci_source = resolve_ci_python(a.ci_python)
-    key = f"{th}:{a.tier}:{os.path.basename(ci_python)}:{bool(a.counts_baseline)}"
+    # Every interpreter THIS tier will run, in the key and on the line. The cheap tier never
+    # touches the CI interpreter, so including it there would miss a cache hit for a question
+    # that interpreter had no part in answering.
+    interpreters = [("python", a.python)]
+    if a.tier == "full":
+        interpreters.append(("ci-python", ci_python))
+    key = cache_key(th, a.tier, interpreters, bool(a.counts_baseline))
+    who = describe_interpreters(interpreters)
     if not a.no_cache:
         hit = _cache_read(key)
         if hit:
             print(f"GATE {head} | tier {a.tier} | CACHED from {hit['at']} "
-                  f"(tree unchanged; --no-cache to re-run) | VERDICT {hit['verdict']}")
+                  f"(tree and interpreters unchanged; --no-cache to re-run) | "
+                  f"{hit.get('who', who)} | VERDICT {hit['verdict']}")
             for ln in hit.get("lines", []):
                 print("  " + ln)
             return int(hit["code"])
@@ -483,6 +563,7 @@ def main(argv=None) -> int:
     os.makedirs(scratch, exist_ok=True)
 
     lines, codes = [], []
+    print(f"  interpreters: {who}")
     cheap = run_cheap(a.python, scratch, a.verbose)
     jc = judge([cheap], allowlist, cuda)
     _report("cheap", [cheap], jc, head)
@@ -509,7 +590,7 @@ def main(argv=None) -> int:
     at = datetime.datetime.now().replace(microsecond=0).isoformat(" ")
     final = f"GATE {head} | OVERALL {overall} | tree {th[:12]} | {at}"
     print(final)
-    _cache_write(key, {"at": at, "verdict": overall, "code": code,
+    _cache_write(key, {"at": at, "verdict": overall, "code": code, "who": who,
                        "lines": lines + [final]})
     if not a.scratch:
         shutil.rmtree(scratch, ignore_errors=True)
