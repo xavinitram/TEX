@@ -63,6 +63,64 @@ _K = 0.5        # the constant coordinate under test
 _H, _W = 24, 32
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _own_dynamo_state(headroom: int = 64):
+    """Give a row its OWN dynamo recompile budget, and hand the next file a fresh one.
+
+    Dynamo's state is PROCESS-GLOBAL (`AGENTS.md`'s `compiled.py` note), and its recompile
+    limit — 8 by default — counts per code object across the whole run. `_worley2d_f1` is
+    promoted through `noise._TieredCache` into a `fullgraph=True` compile, where hitting the
+    limit is a HARD error, not a fallback to eager. So whether the 2D-family row below is
+    green depended on how many distinct ranks the files collected BEFORE it had already fed
+    that one function: it passed alone, passed on the CPU-only CI lane (no promotion without
+    a device), and failed in the canonical whole-suite order on a CUDA box. A red that is a
+    property of collection order teaches every reader to wave the known-red list through.
+
+    The row is exactly the feature that manufactures recompiles — it hands the same compiled
+    function a rank-0 coordinate after rank-3 ones, twice per form and once per device — so
+    it should pay for its own budget rather than spend what it inherited. Reset on entry
+    (this is the calling thread, which is where `compiled.py` resets too), a generous limit
+    while it runs, and a reset on exit so the row does not bill the files after it either.
+
+    Test-only: nothing here changes what the product computes, and the config is restored.
+    """
+    try:
+        import torch._dynamo as _dynamo
+    except Exception:
+        yield
+        return
+    cfg = getattr(_dynamo, "config", None)
+    saved = {}
+    # `recompile_limit` is the current spelling; `cache_size_limit` is the older one. Set
+    # whichever exists (both, on a torch that carries the alias) and restore exactly.
+    for name in ("recompile_limit", "cache_size_limit"):
+        if cfg is not None and hasattr(cfg, name):
+            saved[name] = getattr(cfg, name)
+            try:
+                setattr(cfg, name, max(int(saved[name]), headroom))
+            except Exception:
+                saved.pop(name, None)
+    try:
+        _dynamo.reset()
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            try:
+                setattr(cfg, name, value)
+            except Exception:
+                pass
+        try:
+            _dynamo.reset()
+        except Exception:
+            pass
+
+
 # name -> the TEX expression, with {z} the slot the constant goes in.
 # vec3-valued forms (curl) are wrapped separately so @OUT stays a vec4.
 _FORMS_3D = [
@@ -291,29 +349,35 @@ def test_v031_noise_scalar_coord_2d_family(r: SubTestResult):
     tol = 1e-6
     bad = []
     checked = 0
-    for dev in devices:
-        gen = torch.Generator().manual_seed(11)
-        base = (torch.rand((1, _H, _W), generator=gen) * 8.0).to(dev)
-        konst = torch.scalar_tensor(_K, dtype=torch.float32, device=dev)
-        grid = torch.full_like(base, _K)
-        for name, fn in cases:
-            for slot, s_args, g_args in (("x", (konst, base), (grid, base)),
-                                         ("y", (base, konst), (base, grid))):
-                try:
-                    a = fn(*s_args)
-                    b = fn(*g_args)
-                except Exception as e:
-                    bad.append("%s %s@%s raised %s: %s"
-                               % (name, slot, dev, type(e).__name__, e))
-                    continue
-                checked += 1
-                if a.shape != b.shape:
-                    bad.append("%s %s@%s: shape %s vs %s"
-                               % (name, slot, dev, tuple(a.shape), tuple(b.shape)))
-                    continue
-                d = float((a - b).abs().max())
-                if not (d <= tol):
-                    bad.append("%s %s@%s: maxdiff=%.3e > %.0e" % (name, slot, dev, d, tol))
+    # The row owns its dynamo recompile budget — see `_own_dynamo_state`. Without it this
+    # row is green alone and red in the canonical whole-suite order on a CUDA box, because
+    # `_worley2d_f1`'s process-global recompile limit has already been spent by the ranks
+    # earlier files fed it.
+    with _own_dynamo_state():
+        for dev in devices:
+            gen = torch.Generator().manual_seed(11)
+            base = (torch.rand((1, _H, _W), generator=gen) * 8.0).to(dev)
+            konst = torch.scalar_tensor(_K, dtype=torch.float32, device=dev)
+            grid = torch.full_like(base, _K)
+            for name, fn in cases:
+                for slot, s_args, g_args in (("x", (konst, base), (grid, base)),
+                                             ("y", (base, konst), (base, grid))):
+                    try:
+                        a = fn(*s_args)
+                        b = fn(*g_args)
+                    except Exception as e:
+                        bad.append("%s %s@%s raised %s: %s"
+                                   % (name, slot, dev, type(e).__name__, e))
+                        continue
+                    checked += 1
+                    if a.shape != b.shape:
+                        bad.append("%s %s@%s: shape %s vs %s"
+                                   % (name, slot, dev, tuple(a.shape), tuple(b.shape)))
+                        continue
+                    d = float((a - b).abs().max())
+                    if not (d <= tol):
+                        bad.append("%s %s@%s: maxdiff=%.3e > %.0e"
+                                   % (name, slot, dev, d, tol))
     if bad:
         r.fail("2D constant coord", "\n  " + "\n  ".join(bad[:12]))
     else:
