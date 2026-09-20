@@ -64,7 +64,13 @@ Usage
     python benchmarks/host_path_counts.py --device cuda --res 1024 --window 512 --prof1 on
     python benchmarks/host_path_counts.py --save results/counts_head.json
     python benchmarks/host_path_counts.py --compare results/counts_head.json   # rc 1 on drift
+    python benchmarks/host_path_counts.py --counters-only --compare results/counts_head.json
     python benchmarks/host_path_counts.py --selftest            # the spies are not inert
+
+`--compare`'s verdict counts the **api** and **cuda** rows only. The `frames.*` census moves
+for every lawful change that adds a call or moves a module, so it is reported under its own
+heading with the per-scenario sums and never enters the exit code (`--counters-only` names
+that rule explicitly for a caller that depends on it).
 
 Portability: runs with no CUDA (pass C is skipped and the cuda rows are absent), no ComfyUI
 and no compiler. `--res 96 --window 48 --ticks 4 --device cpu --prof1 off` is the shape
@@ -87,6 +93,34 @@ from collections import Counter
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG = os.path.dirname(_HERE)                                # .../TEX_Wrangle
+
+
+def _cache_warmth(path: str | None) -> str:
+    """How full the program/result cache directory was BEFORE anything here ran.
+
+    Two separate lanes lost a comparison to a shared warm cache and read its cold/warm
+    difference as a structural change (six `source_edit` rows that looked exactly like one).
+    The directory and its warmth therefore travel in the saved provenance, so a comparison
+    between two legs that did not both start cold is visible in the file rather than
+    reconstructed from memory afterwards.
+    """
+    if not path:
+        return "unset"
+    if not os.path.isdir(path):
+        return "cold (absent)"
+    n = 0
+    for _root, _dirs, files in os.walk(path):
+        n += len(files)
+        if n > 9999:
+            break
+    return "cold (empty)" if n == 0 else f"warm ({n} file(s))"
+
+
+#: Captured at IMPORT, before torch or any TEX module can create or fill the directory.
+_CACHE_DIR_AT_START = os.environ.get("TEX_CACHE_DIR")
+_CACHE_WARMTH_AT_START = _cache_warmth(_CACHE_DIR_AT_START)
+
+
 if os.path.dirname(_PKG) not in sys.path:
     sys.path.insert(0, os.path.dirname(_PKG))                # .../<package parent>
 
@@ -951,11 +985,25 @@ def run_all(res: int, window: int, ticks: int, device: str, *, prof1: bool = Fal
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _git_sha() -> str:
+    """`HEAD`, with a `-dirty` suffix when the worktree carries uncommitted changes.
+
+    Without the suffix an edited tree saves under the baseline's own sha, so a `--compare`
+    header prints the same twelve characters on both sides and the reader has no way to see
+    that the two legs are not the two commits they name.
+    """
     try:
-        return subprocess.run(["git", "-C", _PKG, "rev-parse", "HEAD"],
-                              capture_output=True, text=True, timeout=10).stdout.strip() or "?"
+        sha = subprocess.run(["git", "-C", _PKG, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
     except Exception:
         return "?"
+    if not sha:
+        return "?"
+    try:
+        porcelain = subprocess.run(["git", "-C", _PKG, "status", "--porcelain"],
+                                   capture_output=True, text=True, timeout=30).stdout
+    except Exception:
+        return sha + "-dirty?"
+    return sha + "-dirty" if porcelain.strip() else sha
 
 
 def environment() -> dict:
@@ -965,7 +1013,9 @@ def environment() -> dict:
             "platform": platform.platform(), "machine": platform.machine(),
             "cuda": torch.cuda.is_available(),
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-            "package_dir": _PKG}
+            "package_dir": _PKG,
+            "tex_cache_dir": _CACHE_DIR_AT_START,
+            "tex_cache_warmth": _CACHE_WARMTH_AT_START}
 
 
 def _print_block(title: str, rows: dict, *, hide_zero: bool = True):
@@ -1002,13 +1052,57 @@ def _flatten(result: dict) -> dict:
     return flat
 
 
+#: Blocks whose rows carry the verdict. `frames` is deliberately absent — see `compare`.
+_COUNTER_BLOCKS = ("api", "cuda")
+
+
+def _block_of(key: str) -> str:
+    """`(device, scenario, block, row)` is the flat key's shape; return the block."""
+    parts = key.split("/")
+    return parts[2] if len(parts) > 3 else ""
+
+
+def _frames_totals(flat: dict) -> dict:
+    """Per `(device, scenario)`: the census total and the sum of the per-module subtotals.
+
+    A module split moves every `frames.mod.*` row it touches while conserving both of these,
+    which is what makes the frame rows a census rather than a gate: the only honest reading
+    of thirteen moved subtotals is "the same work, attributed differently", and that claim is
+    only checkable if the sums travel beside the rows."""
+    out = {}
+    for key, s in flat.items():
+        parts = key.split("/")
+        if len(parts) < 4 or parts[2] != "frames":
+            continue
+        scope = f"{parts[0]}/{parts[1]}"
+        tot, mod = out.setdefault(scope, [0, 0])
+        row = "/".join(parts[3:])
+        if row == "frames.total":
+            tot += s["min"]
+        elif row.startswith("frames.mod."):
+            mod += s["min"]
+        out[scope] = [tot, mod]
+    return out
+
+
 def compare(current: dict, baseline_path: str) -> int:
     """Row-by-row EXACT diff over the rows that are STABLE on both sides.
 
     An unstable row cannot gate: its own reading disagrees with itself, so a difference
     against a baseline says nothing. It is reported as `unstable` and excluded from the
     verdict rather than silently compared — the failure mode this harness exists to avoid is
-    a gate that fires on noise."""
+    a gate that fires on noise.
+
+    The **frame census is excluded from the verdict for the same reason, one level up.** The
+    `frames.*` rows count Python frames per `module:function`, so every lawful change that
+    adds a call, renames a helper or moves code between modules moves them by construction —
+    a module split moved thirteen `frames.mod.*` rows with the sums conserved to the unit,
+    and a scenario ADDITION moves them too. A verdict that counted those rows returned 1 for
+    every such change, which made the exit code carry no information and forced the reader to
+    reason past it by hand; that is how a gate becomes decoration. The API and CUDA rows are
+    the ones that state a structural claim ("this seam is entered exactly N times per tick"),
+    so they alone are counted. The frame rows are reported in full, with their sums, under
+    their own heading."""
     with open(baseline_path, "r", encoding="utf-8") as fh:
         base = json.load(fh)
     base_runs = base.get("runs", [])
@@ -1035,22 +1129,77 @@ def compare(current: dict, baseline_path: str) -> int:
             continue
         if b["min"] != c["min"]:
             changed.append((k, b["min"], c["min"]))
+    benv, cenv = base.get("env", {}) or {}, current.get("env", {}) or {}
     print(f"\n{'=' * 78}\ncompare vs {baseline_path}\n{'=' * 78}")
-    print(f"  baseline: TEX {base.get('env', {}).get('tex_version')} "
-          f"@ {str(base.get('env', {}).get('tex_sha'))[:12]}")
-    print(f"  current : TEX {current.get('env', {}).get('tex_version')} "
-          f"@ {str(current.get('env', {}).get('tex_sha'))[:12]}")
-    for k, b, c in changed:
+    print(f"  baseline: TEX {benv.get('tex_version')} @ {str(benv.get('tex_sha'))[:19]}"
+          f"  cache {benv.get('tex_cache_dir') or '<unset>'} [{benv.get('tex_cache_warmth', '?')}]")
+    print(f"  current : TEX {cenv.get('tex_version')} @ {str(cenv.get('tex_sha'))[:19]}"
+          f"  cache {cenv.get('tex_cache_dir') or '<unset>'} [{cenv.get('tex_cache_warmth', '?')}]")
+    for note in _provenance_warnings(benv, cenv):
+        print(f"  ! {note}")
+
+    def _counters(rows):
+        return [t for t in rows if _block_of(t[0]) in _COUNTER_BLOCKS]
+
+    def _frames(rows):
+        return [t for t in rows if _block_of(t[0]) == "frames"]
+
+    for k, b, c in _counters(changed):
         print(f"  CHANGED   {k}: {b} -> {c}  (per tick, stable both sides)")
-    for k, s in appeared:
+    for k, s in _counters(appeared):
         print(f"  NEW ROW   {k}: {s['min']}..{s['max']} per tick")
-    for k, s in vanished:
+    for k, s in _counters(vanished):
         print(f"  GONE      {k}: was {s['min']}..{s['max']} per tick")
     for k, b, c in unstable:
         print(f"  unstable  {k}: median {b} -> {c} (not gated)")
-    n = len(changed) + len(appeared) + len(vanished)
-    print(f"\n  {n} stable row(s) moved; {len(unstable)} unstable row(s) differ (ignored).")
+
+    fch, fap, fvn = _frames(changed), _frames(appeared), _frames(vanished)
+    nframes = len(fch) + len(fap) + len(fvn)
+    print(f"\n  --- frames census: {nframes} row(s) moved (REPORTED, never gated) ---")
+    if nframes:
+        for k, b, c in fch:
+            print(f"    frames    {k}: {b} -> {c}")
+        for k, s in fap:
+            print(f"    frames +  {k}: {s['min']}..{s['max']} per tick")
+        for k, s in fvn:
+            print(f"    frames -  {k}: was {s['min']}..{s['max']} per tick")
+        btot, ctot = _frames_totals(bflat), _frames_totals(cflat)
+        touched = sorted({"/".join(k.split("/")[:2]) for k, *_ in (fch + fap + fvn)})
+        print(f"    {'sums (per tick)':44s} {'base':>10s} {'current':>10s}")
+        for scope in touched:
+            bt, bm = btot.get(scope, [0, 0])
+            ct, cm = ctot.get(scope, [0, 0])
+            mark = "=" if (bt, bm) == (ct, cm) else "~"
+            print(f"    {scope + '  frames.total':44s} {bt:10d} {ct:10d}  {mark}")
+            print(f"    {scope + '  sum(frames.mod.*)':44s} {bm:10d} {cm:10d}  {mark}")
+
+    n = len(_counters(changed)) + len(_counters(appeared)) + len(_counters(vanished))
+    print(f"\n  {n} stable counter row(s) moved; {nframes} frame row(s) moved (not gated); "
+          f"{len(unstable)} unstable row(s) differ (ignored).")
     return 1 if n else 0
+
+
+def _provenance_warnings(benv: dict, cenv: dict) -> list:
+    """What the two saved environments say about whether the comparison is meaningful."""
+    out = []
+    bs, cs = str(benv.get("tex_sha")), str(cenv.get("tex_sha"))
+    if bs.endswith("-dirty") or cs.endswith("-dirty"):
+        out.append("one side was measured on a DIRTY worktree — the sha names a commit the "
+                   "measured tree is not")
+    if bs != "None" and bs == cs:
+        out.append("both sides carry the SAME sha — this is a null control, not a change")
+    bd, cd = benv.get("tex_cache_dir"), cenv.get("tex_cache_dir")
+    if bd and cd and os.path.normcase(str(bd)) == os.path.normcase(str(cd)):
+        out.append("both legs used the SAME TEX_CACHE_DIR — the second leg cannot have been "
+                   "cold; give each leg its own directory")
+    for side, env in (("baseline", benv), ("current", cenv)):
+        w = str(env.get("tex_cache_warmth", ""))
+        if w.startswith("warm"):
+            out.append(f"the {side} leg started with a WARM cache [{w}] — cold/warm program "
+                       "cache rows will read as a structural change")
+        elif w == "unset":
+            out.append(f"the {side} leg ran with TEX_CACHE_DIR unset — its warmth is unknown")
+    return out
 
 
 def selftest(device: str) -> int:
@@ -1113,6 +1262,11 @@ def main(argv=None) -> int:
                    help="arm PROF-1 (the cost profiler) for the run")
     p.add_argument("--save", metavar="PATH", help="write the counts as JSON")
     p.add_argument("--compare", metavar="PATH", help="exact row diff against a saved JSON")
+    p.add_argument("--counters-only", action="store_true",
+                   help="state explicitly that --compare's verdict counts the API and CUDA "
+                        "rows only and reports the frame census outside it; this is the "
+                        "default and the flag is an assertion of it, so a caller (tools/"
+                        "gate.py) can name the rule it relies on instead of inheriting it")
     p.add_argument("--selftest", action="store_true",
                    help="prove the spies fire, then exit")
     a = p.parse_args(argv)
@@ -1139,7 +1293,12 @@ def main(argv=None) -> int:
             json.dump(payload, fh, indent=2)
         print(f"\nsaved -> {a.save}")
     if a.compare:
+        if a.counters_only:
+            print("\n  --counters-only: the verdict counts api + cuda rows; the frame census "
+                  "is reported below it and never in the exit code.")
         return compare(payload, a.compare)
+    if a.counters_only and not a.compare:
+        print("\n  --counters-only has no effect without --compare (it names a verdict rule).")
     return 0
 
 

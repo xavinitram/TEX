@@ -35,8 +35,28 @@ python benchmarks/host_path_counts.py                         # both devices if 
 python benchmarks/host_path_counts.py --device cpu --res 96 --window 48 --ticks 4
 python benchmarks/host_path_counts.py --save results/counts_head.json
 python benchmarks/host_path_counts.py --compare results/counts_head.json   # rc 1 on drift
+python benchmarks/host_path_counts.py --counters-only --compare results/counts_head.json
 python benchmarks/host_path_counts.py --selftest              # prove the spies are not inert
 ```
+
+**What `--compare`'s exit code means.** The verdict counts the **api** and **cuda** rows: the
+ones that state a structural claim — *this seam is entered exactly N times per tick*. The
+`frames.*` census is reported under its own heading, with the per-scenario `frames.total` and
+`sum(frames.mod.*)` beside the moved rows, and it **never enters the exit code**. Those rows
+count Python frames per `module:function`, so a module split, a renamed helper or an added
+scenario moves them by construction while the work itself is unchanged: a split once moved
+thirteen `frames.mod.*` rows with every sum conserved to the unit, and an rc 1 that means
+"something was attributed differently" has to be reasoned past by hand every time, which is
+how a gate becomes decoration. Read the frame rows as a census — the sums are the check — and
+let the counter rows carry the verdict. `--counters-only` asserts that rule explicitly for a
+caller that depends on it (`tools/gate.py` passes it).
+
+**Provenance a comparison needs.** `--save` records the `TEX_CACHE_DIR` in force and whether
+it was empty before the run, and appends `-dirty` to the git sha when the worktree carries
+uncommitted changes. `--compare` prints both and warns above the diff when the two legs shared
+a cache directory, when either started warm, or when a side is dirty — two separate lanes lost
+a comparison to a shared warm cache and read its cold/warm rows as a structural change. **Give
+each leg its own cold directory.**
 
 It drives `examples/host_demo.py::RoiComp` through seven scenarios (`prewarm`, `source_edit`,
 `terminal`, `midgraph`, `pan`, `all_dirty`, `lint`) plus an eighth, `node_scrub`, which drives

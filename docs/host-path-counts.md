@@ -251,8 +251,21 @@ scenarios, `--compare` between them:
   baseline: TEX 0.37.0 @ dfe7c3890c71
   current : TEX 0.37.0 @ dfe7c3890c71
 
-  0 stable row(s) moved; 0 unstable row(s) differ (ignored).
+  0 stable counter row(s) moved; 0 frame row(s) moved (not gated); 0 unstable row(s) differ (ignored).
 ```
+
+**What the verdict counts, and what it only reports.** `--compare` returns rc 1 on a moved
+**api** or **cuda** row and never on a `frames.*` row. The frame census counts Python frames
+per `module:function`, so it moves for every lawful change that adds a call, renames a helper,
+splits a module or adds a scenario: the chain split moved thirteen `frames.mod.*` rows on each
+device with `frames.total` and `sum(frames.mod.*)` conserved to the unit on all seven
+scenarios, and a scenario ADDITION moves them too. A gate that counted them returned 1 for
+every such change, so its exit code said nothing and the reader had to reason past it by hand.
+The frame rows are therefore printed under their own heading with those two sums beside them —
+the sums are the check — and `--counters-only` names the rule for a caller that relies on it
+(`tools/gate.py --tier full --counts-baseline …` passes it). The gate in `tools/gate.py` is the
+single entry point: one command, one verdict line, the known-red allowlist applied from
+`tests/known_reds.json` rather than by eye.
 
 Compare that with the timing null controls in §1, taken on the same laptop. The CPU pass of
 the gate at 96²/48²/4 ticks runs in about 2.6 s.
@@ -262,7 +275,11 @@ at the gate shape (96²/48²/4, both devices) before adding `node_scrub` and `--
 same seven after, reading **0 stable rows moved** — a new scenario must not move an old row,
 and the `--scenario` filter makes that provable rather than asserted. Give each leg its own
 cold `TEX_CACHE_DIR`: a warm one reports six `source_edit` rows moving that are the scenario's
-own cold/warm program cache and not the change (PERF-4 hit exactly that).
+own cold/warm program cache and not the change (PERF-4 hit exactly that). `--save` now records
+the directory and whether it was empty at start, and the sha carries a `-dirty` suffix when the
+measured tree is not the commit it names, so a comparison between two legs that were not both
+cold — or between a commit and an edited copy of it — says so in its own header instead of
+being reconstructed from memory afterwards.
 
 ## 6. Avoidable per tick — the candidate follow-ups
 
