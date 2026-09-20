@@ -294,9 +294,7 @@ safety by pin-and-skip / `free_graphs_only` (NOT `clear_graph_cache`), and the p
 
 ### The enumerated register (DOC-7d)
 
-The number in this section's title counts the *architectural* caches as the register stood when
-CACHE-2 closed it; the table below is the complete machine-checked census and is larger, because
-several memo stores have landed since without the count sentence moving. `test_doc7d_cache_store_enumeration`
+The table below is the complete machine-checked census behind this section's count. `test_doc7d_cache_store_enumeration`
 in `tests/test_v018_docs.py` takes an AST census of every module-level mutable container in the
 product packages and requires each one to be named here or excused in that test's `_NOT_A_CACHE`
 list with a reason. **A new module-level store lands with its row below, or the suite reds with
