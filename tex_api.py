@@ -316,19 +316,46 @@ def control_flow_advisories(source: str, binding_types: dict) -> list:
         the same thing in every region.
 
     Never emitted by `check()`: a host calls this beside it. Pure AST analysis — no compile,
-    no cook, no side effects — and total: a program that does not parse, or that the
-    analysis cannot finish within its work budget, returns []."""
+    no cook, no side effects — and total: a program that does not parse, a non-string source,
+    or an analysis that cannot finish within its work budget, returns [].
+
+    A lint that CRASHES is a different thing from a lint that declines, and it used to be
+    spelled the same way. `except Exception: return []` answered "no problems" for an
+    internal failure, so an editor drew a clean gutter and the node then cooked the program
+    the editor had called clean — the one failure mode a lint must not have. The three
+    DECLINE cases above still return [] (they are answers, and the parse error is already on
+    its way to the same editor from `check()`). Anything else now comes back as ONE synthetic
+    `E0000` naming the exception type, exactly the code and shape `check()` uses for its own
+    internal failure, so the return TYPE is unchanged and a host needs no new branch."""
+    if not isinstance(source, str):
+        return []
+    from .tex_compiler.lexer import LexerError
+    from .tex_compiler.parser import ParseError
+    from .tex_compiler.type_checker import TypeCheckError
+    from .tex_compiler.diagnostics import make_diagnostic, TEXMultiError
+
+    def _internal(e, where):
+        return [make_diagnostic(
+            code="E0000",
+            message=(f"internal error during control_flow_advisories() {where}: "
+                     f"{type(e).__name__}: {e}"),
+            loc=None, source=source, phase="compile")]
+
     try:
         # DATA-6: through the one front end, so a swizzled wire is seen by its BASE name —
         # the name `binding_types` (and `string_wires` below) key on.
         from .tex_cache import parse_and_split
         program = parse_and_split(source, binding_types)
-    except Exception:
-        return []
+    except (TEXMultiError, LexerError, ParseError, TypeCheckError):
+        return []          # a program that does not parse has no advisories to give
+    except Exception as e:
+        return _internal(e, "parse")
     try:
         return _ControlFlowLint(program, source, binding_types).run()
-    except Exception:  # the contract is absolute, as for check(): never raise
-        return []
+    except _CFBudget:
+        return []          # over budget is a DECLINE; the analysis stays total by refusing
+    except Exception as e:  # the contract is absolute, as for check(): never raise
+        return _internal(e, "analysis")
 
 
 class _CFBudget(Exception):

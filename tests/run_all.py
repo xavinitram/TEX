@@ -2076,6 +2076,16 @@ def main():
     from test_v035_hygiene import test_neg3_uncalled_routes_are_driven_both_ways
     test_neg3_uncalled_routes_are_driven_both_ways(r)
 
+    # NEG-3: a lint that crashes reported "no problems" and the node then cooked a program the
+    # editor had called clean. An internal failure now comes back as ONE synthetic E0000 —
+    # the code and shape `check()` already used — while the three DECLINE cases still return [].
+    from test_neg3_lint_visibility import (
+        test_neg3_a_crashed_advisory_lint_says_so,
+        test_neg3_the_declines_still_return_empty,
+    )
+    test_neg3_a_crashed_advisory_lint_says_so(r)
+    test_neg3_the_declines_still_return_empty(r)
+
     success = r.summary()
     return 0 if success else 1
 
