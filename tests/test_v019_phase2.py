@@ -177,7 +177,13 @@ def test_s4_validate_hw_console_cp1252_safe(r: SubTestResult):
     import os
     import subprocess
     import sys
+    # The child must import the package the way any consumer does. Some interpreters this
+    # suite runs under isolate `sys.path` (no cwd entry, PYTHONPATH ignored), so `cwd=` alone
+    # does not make the package importable and the child dies on ModuleNotFoundError BEFORE
+    # printing anything — the test would then report a console crash that never happened.
+    # Put the package's parent on the child's path explicitly so this measures the print.
     script = (
+        "import sys; sys.path.insert(0, r'" + str(_PKG.parent) + "')\n"
         "from TEX_Wrangle import tex_validate_hw as vh\n"
         "v={'report':'x','env':{'gpu':'G','torch':'2','cuda':True,'compute_capability':[7,5],"
         "'arch':{'arch':'sm_75','verified':False,'note':'calibrated on Turing; run validate-hw'}},"
