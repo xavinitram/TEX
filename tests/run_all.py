@@ -2019,6 +2019,23 @@ def main():
     test_perf6_the_bound_tracks_the_allocator(r)
     test_perf6_a_swapped_host_is_asked_afresh(r)
 
+    # PERF-7: what a COLD cook on the compiled tier is allowed to do, as counts. The
+    # bench's `cpu_on_cold` config times exactly `clear_compiled_cache()` +
+    # `execute_compiled`, and its geomean is inside this box's noise floor
+    # (docs/roadmap.md §10 item 3), so the contract is pinned as frames instead: no
+    # re-lex, no re-parse, no re-fold, no re-emit, no re-tag, and the compile route
+    # entered exactly once.
+    from test_perf7_compiled_cold import (
+        test_perf7_cold_compiled_cook_does_no_front_end_work,
+        test_perf7_cold_compiled_cook_runs_the_route_once,
+        test_perf7_cold_compiled_cook_frame_ceiling,
+        test_perf7_the_counter_is_not_inert,
+    )
+    test_perf7_cold_compiled_cook_does_no_front_end_work(r)
+    test_perf7_cold_compiled_cook_runs_the_route_once(r)
+    test_perf7_cold_compiled_cook_frame_ceiling(r)
+    test_perf7_the_counter_is_not_inert(r)
+
     success = r.summary()
     return 0 if success else 1
 
