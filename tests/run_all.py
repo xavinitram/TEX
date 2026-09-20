@@ -2086,6 +2086,20 @@ def main():
     test_neg3_a_crashed_advisory_lint_says_so(r)
     test_neg3_the_declines_still_return_empty(r)
 
+    # NEG-2: the chain cook + CACHE-1's lineage keys split out of tex_engine.py into
+    # tex_chain.py, and the properties that keep them split — the module exists and is
+    # not a stub, every moved name is the SAME object on tex_chain and on tex_engine
+    # (identity, not equality, because a second ENG-9 interpreter pool is a correctness
+    # bug), and tex_chain never reaches back to tex_engine at import time.
+    from test_neg2_chain_split import (
+        test_neg2_tex_chain_exists_and_carries_the_move,
+        test_neg2_the_moved_names_are_the_same_objects,
+        test_neg2_tex_chain_never_imports_tex_engine_at_runtime,
+    )
+    test_neg2_tex_chain_exists_and_carries_the_move(r)
+    test_neg2_the_moved_names_are_the_same_objects(r)
+    test_neg2_tex_chain_never_imports_tex_engine_at_runtime(r)
+
     success = r.summary()
     return 0 if success else 1
 

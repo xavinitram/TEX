@@ -924,7 +924,14 @@ def test_eng1_node_is_a_marshaller(r: SubTestResult):
              # tex_engine.py and this test must go red.
              "_owned_copy", "to_dlpack", "from_dlpack", "is_frozen", "frame_version",
              "verify_unmutated", "frozen_copy", "freeze", "_disown_inputs",
-             "_TDR_BUDGET_MS", "_tdr_strip_floor", "_scalar_params", "_halo_tile_plan")
+             "_TDR_BUDGET_MS", "_tdr_strip_floor", "_scalar_params", "_halo_tile_plan",
+             # NEG-2 — the chain cook, the lineage keys and the two engine primitives
+             # that travelled with them now live in tex_chain and are re-exported here.
+             # Same rule: a re-exported name this tuple does not pin is a name a later
+             # cleanup silently deletes.
+             "cook_stage_list", "boundary_lineage_key", "cook_fused_cached",
+             "_is_tensor_binding", "_binding_shape", "_compute_lineage",
+             "_compile_or_raise", "_interp_pool", "_clear_all_interpreter_caches")
     for name in moved:
         if hasattr(TN, name) or hasattr(getattr(TN, "TEXWrangleNode", object), name):
             fails.append(f"tex_node still exposes {name} (should be engine-only)")

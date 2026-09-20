@@ -340,9 +340,15 @@ MUTATIONS = [
      '        if exc is None:\n            from .tex_runtime.interpreter import InterpreterError',
      '        if False:\n            from .tex_runtime.interpreter import InterpreterError',
      ("test_v0341_audit",)),
-    ('v0.34.1 H: a Promise is not a tensor binding again', 'tex_engine.py',
-     '    return isinstance(v, torch.Tensor) or v.__class__ is _Promise',
-     '    return isinstance(v, torch.Tensor)',
+    # NEG-2 moved _is_tensor_binding out of tex_engine.py. The anchor text also had to be
+    # rewritten: DATA-6 added the PlanesValue arm and re-flowed the return into two lines, so
+    # this row had matched 0x and asserted NOTHING since. It went unseen because the harness
+    # is not part of run_all.py - the same class the suite column (MUT-1) was added for.
+    ('v0.34.1 H: a Promise is not a tensor binding again', 'tex_chain.py',
+     '    return (isinstance(v, torch.Tensor) or v.__class__ is _Promise\n'
+     '            or v.__class__ is _PlanesValue)',
+     '    return (isinstance(v, torch.Tensor)\n'
+     '            or v.__class__ is _PlanesValue)',
      ("test_v0341_audit",)),
     ('v0.34.1 I: a >=5-D tensor types FLOAT again', 'tex_marshalling.py',
      '        elif value.dim() >= 5:',

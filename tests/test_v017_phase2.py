@@ -247,7 +247,11 @@ _OVER_HARD_BASELINE = frozenset({
 # floor that passes today while keeping the 72 lines of room ENG-14 gave `tex_engine.py`
 # (1628 under 1700). It buys 42 lines of warning before the hard budget, which is where a
 # split gets planned instead of improvised. Same rule: it moves DOWN when the split lands.
-_HEADROOM_FLOOR = {"tex_engine.py": 1700, "tex_results.py": 1958}
+# NEG-2 moved tex_engine.py's floor down for the second time: the CHAIN split took the
+# file from 1673 to 1318, so its floor goes 1700 -> 1400 — the same ~85-line margin
+# ENG-14 chose over its own post-split size (1613 under 1700), which is one median
+# release of growth. Two floors now, moving down independently as their splits land.
+_HEADROOM_FLOOR = {"tex_engine.py": 1400, "tex_results.py": 1958}
 
 
 def _product_packages(root) -> list:
