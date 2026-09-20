@@ -6,19 +6,32 @@ change is free to re-spell, re-severity or quietly stop emitting, and the only r
 notices is the one whose editor stopped underlining. A census of the tree when this landed
 found **88** distinct codes and **46** of them named by no test at all.
 
-The ratchet below counts the codes no test names, pins the count, and lets it move DOWN
-only. A code that gains a test lowers the pin (the row says so, by name); a NEW code that
-arrives without a test pushes the count above the pin and reds, naming it.
+This file holds three derivations, none of them a typed list of codes:
 
-The population is every `E####`/`W####` token the product's own source names —
+1. **The ratchet** — count the codes no test names, pin the count, let it move DOWN only.
+   A code that gains a test lowers the pin (the row says so, by name); a NEW code that
+   arrives without a test pushes the count above the pin and reds, naming it.
+2. **Family declarations** — one code raised from several positions with several messages
+   is a family, not a duplicate: `E2010` is "missing semicolon" from sixteen parser
+   positions. Nothing in the tree recorded which codes are families, so a reviewer had no
+   way to tell a legitimate family from a code that was copy-pasted. They are declared
+   here, each with the reason it is one, and the declaration is checked against the tree.
+3. **Cross-file agreement** — three codes are emitted from more than one MODULE with
+   different message text. Those are the ones that can drift into two different editor
+   experiences under one code, so each gets a row asserting the sites agree on severity
+   and on hint shape.
+
+The population for (1) is every `E####`/`W####` token the product's own source names —
 deliberately WIDER than "every site that constructs a diagnostic". A code named only in a
 constructor default or in a comment describing a contract is still a code the product
 knows and a host may receive, and a wider population cannot be shrunk by moving a code
-into a different syntactic position.
+into a different syntactic position. (2) and (3) need the construction itself, so they
+read the AST instead.
 
 No product code is imported here: the file reads the tree as text. It needs no host, no
 CUDA and no compiler.
 """
+import ast
 import collections
 import os
 import re
@@ -73,9 +86,10 @@ def _codes_named_by_product():
 def _codes_named_by_tests():
     """code -> set of test file names that name it.
 
-    THIS file is excluded from the population on purpose: the pinned backlog below spells
-    out the codes it is counting, and a code written down as debt is bookkeeping, not
-    coverage — counting it would let the ratchet be moved by writing a comment.
+    THIS file is excluded from the population on purpose. The pinned backlog below spells
+    out the codes it counts, and the family and cross-file rows have to spell four more to
+    declare them; both are bookkeeping, not coverage — counting them would let the ratchet
+    be moved by writing a comment.
     """
     hits = collections.defaultdict(set)
     for fn in sorted(os.listdir(_TESTS_DIR)):
@@ -88,7 +102,80 @@ def _codes_named_by_tests():
     return hits
 
 
-# ── The ratchet ────────────────────────────────────────────────────
+# ── Diagnostic construction sites, from the AST ───────────────────────
+
+_Site = collections.namedtuple("_Site", "file line callee message hint severity")
+
+
+def _const_str(node):
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _callee_name(node):
+    f = node.func
+    parts = []
+    while isinstance(f, ast.Attribute):
+        parts.append(f.attr)
+        f = f.value
+    if isinstance(f, ast.Name):
+        parts.append(f.id)
+    return ".".join(reversed(parts)) or "<call>"
+
+
+def _populated(node):
+    """A message expression counts as populated when it is there at all; `hint` counts
+    only when it is not an empty literal, because `hint=""` is how a site says "no hint"."""
+    if node is None:
+        return None
+    if _const_str(node) == "":
+        return None
+    return ast.dump(node)
+
+
+def _emission_sites():
+    """code -> [_Site], for every construction that names a code as a literal.
+
+    Two shapes carry a code at head: a CALL with a `code="E…"` keyword (`make_diagnostic`,
+    the per-phase `_error`/`_make_error` builders, `TypeCheckError(...)`) and a DICT
+    literal with a `"code"` key (the JSON diagnostics a tool hands a host). A function
+    PARAMETER default (`def _error(..., code: str = "E1000")`) is neither, so it is not a
+    site — which is the right answer: a default is the code a caller gets when it asks for
+    none, not a place the product decided to emit one.
+    """
+    out = collections.defaultdict(list)
+    for path, rel in _product_files():
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:               # pragma: no cover - product code parses
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                kw = {k.arg: k.value for k in node.keywords if k.arg}
+                code = _const_str(kw.get("code"))
+                if code is None or not _CODE.fullmatch(code):
+                    continue
+                msg = kw.get("message")
+                if msg is None and node.args:
+                    msg = node.args[0]    # the builders take the message positionally
+                out[code].append(_Site(rel, node.lineno, _callee_name(node),
+                                       _populated(msg), _populated(kw.get("hint")),
+                                       _const_str(kw.get("severity"))))
+            elif isinstance(node, ast.Dict):
+                d = {_const_str(k): v for k, v in zip(node.keys, node.values)
+                     if _const_str(k) is not None}
+                code = _const_str(d.get("code"))
+                if code is None or not _CODE.fullmatch(code):
+                    continue
+                out[code].append(_Site(rel, node.lineno, "<dict>",
+                                       _populated(d.get("message")),
+                                       _populated(d.get("hint")),
+                                       _const_str(d.get("severity"))))
+    return out
+
+
+# ── 1. The ratchet ────────────────────────────────────────────────────
 
 # The codes that had no test when this pin was last moved — the debt, written down. The
 # count is pinned beside it because the count is what the ratchet promises: it may go DOWN
@@ -146,3 +233,139 @@ def test_simp6_untested_error_codes_only_go_down(r: SubTestResult):
 
     r.ok(f"{len(untested)} of {len(product)} error codes have no test naming them, exactly "
          f"the pinned backlog: {' '.join(untested)}")
+
+
+# ── 2. Families ───────────────────────────────────────────────────────
+
+# One code raised from several positions, each with its own message, is a FAMILY: the code
+# names a CLASS of mistake and the message names the instance. That is a design, not a
+# duplication — but it is indistinguishable from copy-paste unless somebody writes down
+# which codes are meant to be families. These are, with the reason and the modules the
+# sites live in; a family that stops being one (a site removed, or a site moved to another
+# module) reds here rather than being noticed by nobody.
+_FAMILIES = {
+    "E2010": (
+        "The parser's 'a statement ends with `;`' code. Every position where a statement "
+        "can end is a separate raise, because the message names WHAT ended (an assignment, "
+        "a declaration, an expression) and the caret points at that statement's last token.",
+        ("tex_compiler/parser.py",),
+    ),
+    "E5003": (
+        "A call whose ARGUMENTS are wrong — raised once per rule a call can break, and "
+        "per function that has its own rule (`len` on a number, `cross` on a vec2, "
+        "`select` on a vector condition, a user function's arity and per-argument types). "
+        "One shared message could only say 'bad argument', which is the one thing the "
+        "caller already knows.",
+        ("tex_compiler/type_checker.py",),
+    ),
+    "E3402": (
+        "Matrix arithmetic that does not typecheck. Each site names the shape rule that "
+        "was broken (mismatched matrix sizes, a mat3 without a vec3/vec4, the operands in "
+        "the wrong order) and suggests the fix for THAT rule.",
+        ("tex_compiler/type_checker.py",),
+    ),
+    "E3200": (
+        "'This value is not that type' — the type checker's assignability failure, raised "
+        "wherever a value meets a declared type: a variable's initializer, a parameter's "
+        "default, an assignment, an output binding inferred as string in one branch and "
+        "numeric in another. Each site knows which two types it had and says so.",
+        ("tex_compiler/type_checker.py",),
+    ),
+}
+
+
+def test_simp6_declared_families_are_families(r: SubTestResult):
+    """Each declared family really is several sites, in the declared modules, with
+    several distinct messages — the three things that make it a family and not a copy."""
+    sites = _emission_sites()
+    for code in sorted(_FAMILIES):
+        reason, modules = _FAMILIES[code]
+        got = sites.get(code, [])
+        if len(got) < 2:
+            r.fail(f"{code} is declared a family",
+                   f"but the tree has {len(got)} construction site(s): "
+                   f"{[f'{s.file}:{s.line}' for s in got]}. A one-site code is not a family — "
+                   f"remove the declaration, or restore the sites.")
+            continue
+        files = sorted({s.file for s in got})
+        if files != sorted(modules):
+            r.fail(f"{code}'s family declaration names the wrong modules",
+                   f"declared {sorted(modules)}, tree has {files} "
+                   f"({[f'{s.file}:{s.line}' for s in got]}). Update the declaration, and "
+                   f"say in the reason why the code now crosses that module.")
+            continue
+        messages = {s.message for s in got}
+        if len(messages) < 2:
+            r.fail(f"{code} is declared a family",
+                   f"but all {len(got)} sites build the SAME message expression: "
+                   f"{[f'{s.file}:{s.line}' for s in got]}. Sites that say the same thing "
+                   f"are a duplicate to collapse, not a family to declare.")
+            continue
+        assert reason                     # a family without a written reason is a guess
+        r.ok(f"{code}: a family of {len(got)} sites in {files}, "
+             f"{len(messages)} distinct message expressions")
+
+
+# ── 3. Cross-file codes ───────────────────────────────────────────────
+
+# Codes emitted from more than one MODULE with different message text. A family inside one
+# module is read by whoever edits that module; a code that crosses modules is not, and the
+# two halves can drift into two different editor experiences under one code. `E0000` is the
+# clearest case: it is TEX's "internal error" contract and it is built by a public API, by
+# the compiler's fallback translator and by a tool's JSON reply, three authors who never
+# read each other. What every site must agree on is the part a consumer BRANCHES on.
+_CROSS_FILE = ("E0000", "E2000", "E2002")
+
+
+def _implied_severity(code):
+    """A code's letter IS its severity: `E` errors, `W` advisories. A site may spell it
+    out, and then it must spell out the same thing."""
+    return "error" if code.startswith("E") else "warning"
+
+
+def test_simp6_cross_file_codes_agree_on_severity_and_hint_shape(r: SubTestResult):
+    """For each code emitted from more than one module: same severity at every site, and
+    the same answer at every site to "does this diagnostic carry a hint?".
+
+    The full field set is NOT compared. The sites go through different builders — one
+    takes `loc`/`phase`, one is a raw dict for a JSON reply — so "same fields populated"
+    can only honestly mean the fields a consumer reads: the severity it branches on, the
+    message it shows, and whether there is a hint to draw under it.
+    """
+    sites = _emission_sites()
+    for code in _CROSS_FILE:
+        got = sites.get(code, [])
+        where = [f"{s.file}:{s.line}" for s in got]
+        files = sorted({s.file for s in got})
+        if len(files) < 2:
+            r.fail(f"{code} is listed as a cross-file code",
+                   f"but the tree builds it in {files or '[]'} ({where}). Either a site "
+                   f"moved and the list is stale, or the code stopped crossing modules — "
+                   f"drop it from _CROSS_FILE with a line saying which.")
+            continue
+
+        want = _implied_severity(code)
+        spelled = {s.severity for s in got if s.severity is not None}
+        if spelled - {want}:
+            r.fail(f"{code} sites disagree on severity",
+                   f"{sorted(spelled)} across {where}; the code's letter says '{want}'. "
+                   f"A consumer branches on severity, so two sites under one code must not "
+                   f"disagree about whether it is an error.")
+            continue
+
+        hinted = {s.file + ":" + str(s.line) for s in got if s.hint is not None}
+        if hinted and len(hinted) != len(got):
+            r.fail(f"{code} sites disagree on hint shape",
+                   f"{sorted(hinted)} carry a hint, {sorted(set(where) - hinted)} do not. "
+                   f"One code that sometimes has a help line and sometimes does not is two "
+                   f"different editor experiences under one contract.")
+            continue
+
+        missing = [f"{s.file}:{s.line}" for s in got if s.message is None]
+        if missing:
+            r.fail(f"{code} sites disagree on message",
+                   f"{missing} build no message. Every diagnostic leads with its message.")
+            continue
+
+        r.ok(f"{code}: {len(got)} sites across {files} agree — severity '{want}', "
+             f"hint {'at every site' if hinted else 'at no site'}")
