@@ -4,7 +4,9 @@ An `E####`/`W####` is the public contract between TEX and whatever draws its dia
 an editor gutter, a host's error panel, a CLI. A code nobody tests is a code the next
 change is free to re-spell, re-severity or quietly stop emitting, and the only reader who
 notices is the one whose editor stopped underlining. A census of the tree when this landed
-found **88** distinct codes and **46** of them named by no test at all.
+found **88** distinct codes and **46** of them named by no test at all; the rows in
+`tests/test_simp6_error_code_rows.py` retired thirty of those, and the sixteen that
+remain are listed beside the pin with the reason each has no trigger.
 
 This file holds three derivations, none of them a typed list of codes:
 
@@ -27,6 +29,13 @@ constructor default or in a comment describing a contract is still a code the pr
 knows and a host may receive, and a wider population cannot be shrunk by moving a code
 into a different syntactic position. (2) and (3) need the construction itself, so they
 read the AST instead.
+
+A code counts as TESTED when a file under `tests/` names it, which is wide in the same
+direction: of the 42 codes that counted as tested when this landed, 27 were named only
+inside a comment or a docstring. Tightening that to "named in code" would be a truer
+ratchet over a much larger backlog (73 untested rather than 46) and is a separate
+decision; the rule here is the blunt one. Its cost is that naming a code in a comment
+under `tests/` retires it without testing anything. Do not.
 
 No product code is imported here: the file reads the tree as text. It needs no host, no
 CUDA and no compiler.
@@ -184,17 +193,31 @@ def _emission_sites():
 #
 # Moving the pin is a two-line edit in ONE direction: drop the code that gained a test from
 # the set, and lower the number to match. The row tells you both numbers when it reds.
-_UNTESTED_PIN = 46
+_UNTESTED_PIN = 16
 _UNTESTED_AT_PIN = frozenset("""
-    E1000 E1002 E1006 E1008
-    E2001 E2003 E2004 E2005 E2006 E2010 E2011 E2020
-    E3000 E3002 E3010 E3012 E3013 E3014
-    E3100 E3101 E3102 E3103 E3201 E3202 E3204
-    E3400 E3401 E3402 E3500 E3600 E3700 E3800 E3900
-    E4000
+    E1000 E3000
+    E3100 E3900
     E6000 E6001 E6002 E6004 E6005 E6006 E6030 E6040 E6050 E6051 E6060
     E9001
 """.split())
+
+# Why each of the sixteen is still here, so the next reader does not re-derive it:
+#
+# * `E1000` / `E3000` are the `code=` DEFAULT of `LexerError` / `TypeCheckError`. No call
+#   site omits `code=`, so nothing in the product constructs either. A test could only
+#   build the exception itself, which would test the test.
+# * `E3100` ("unknown type name") cannot fire from source: a declared type must be a type
+#   KEYWORD, and every keyword is a key of `TYPE_NAME_MAP`. The guard covers a caller that
+#   builds the AST directly.
+# * `E3900` ("an array literal outside a declaration") likewise: `{...}` is parsed only as
+#   a declaration's initializer, so the expression handler has no path from source.
+# * `E6xxx` are the interpreter's. They need an EXECUTION — a compiled program and real
+#   tensors — not a `check` or a `compile`, and most of them are defensive branches the
+#   type checker forecloses before the interpreter is reached.
+# * `E9001` comes from a fused tool's preflight, which needs a host's tool manifest.
+#
+# Four of those are worth an issue rather than a test: a documented code the product
+# cannot emit is a promise to a host that nothing keeps.
 
 
 def test_simp6_untested_error_codes_only_go_down(r: SubTestResult):
@@ -216,9 +239,10 @@ def test_simp6_untested_error_codes_only_go_down(r: SubTestResult):
             f"{len(fresh)} code(s) have no test naming them and are not in the pinned "
             f"backlog: {' '.join(fresh)}. "
             f"(All {len(untested)} untested now: {' '.join(untested)}.) "
-            f"Add a test that triggers the code through the public surface and asserts "
-            f"it. If the code genuinely cannot be triggered, say so where the lane's "
-            f"evidence lives; do NOT widen the pin.")
+            f"Add a row that triggers the code through the public surface and asserts "
+            f"it — tests/test_simp6_error_code_rows.py groups them the way the codes are "
+            f"grouped. If the code genuinely cannot be triggered, widen the pin ONLY with "
+            f"the reason written beside it.")
         return
 
     retired = sorted(_UNTESTED_AT_PIN - set(untested))
