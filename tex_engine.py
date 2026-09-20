@@ -41,6 +41,18 @@ the per-cook cost is **0 us** by construction. The only measurable cost is impor
 this module now also imports the two new ones, measured (interleaved, medians of 9, caches
 purged identically) at **+0.27 ms once**, against this module's own ~20 ms import — and the
 package import itself is unaffected, since it does not load this module at all.
+
+**NEG-2 — the chain cook follows, for the same reason.** ENG-14 left this file at 1628 under
+a headroom floor of 1700 and four perf lanes then spent 45 of the 72 remaining lines, which
+is less than one median release. So the cut ENG-14's design note had already named — the
+CACHE-6 stage-list family (`cook_stage_list`, `boundary_lineage_key`, `cook_fused_cached`,
+`_is_tensor_binding`, `_binding_shape`) plus CACHE-1's `_compute_lineage` — moved to
+`tex_chain`, bodies verbatim. `tex_engine` plans and dispatches ONE program; `tex_chain`
+cooks a chain of them and names what came out. The ENG-4 raiser (`_compile_or_raise`) and
+the ENG-9 interpreter pool travelled with it so `tex_chain` could stay a leaf, and all four
+are re-exported below beside ENG-14's, so `tex_engine.NAME` still answers for every one of
+them. Zero us/cook again, and by the same proof: 9 of 9 moved bodies compile to
+byte-identical bytecode and no surviving line of this file changed.
 """
 from __future__ import annotations
 
