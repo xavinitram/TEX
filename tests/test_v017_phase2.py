@@ -321,10 +321,18 @@ def test_reg2_loc_budget(r: SubTestResult):
         assert not new_over, (f"module(s) newly over the {_LOC_HARD}-LOC hard budget "
                               f"(split by domain, or update the baseline with a plan): "
                               f"{[(m, loc[m]) for m in new_over]}")
-        # also flag if a baseline module was split away (keep the baseline honest)
+        # STALE — a grandfathered module that has been split back under the wall. This is
+        # the PUB-1 ratchet's "re-pin DOWN" rule (tests/test_pub1_archive.py): a bound that
+        # only ever loosens is decoration. Printing it, as this arm used to, left the
+        # baseline free to keep claiming a module is over budget years after its split
+        # landed — and the next reader grants that module a licence it no longer has.
         stale = sorted(m for m in _OVER_HARD_BASELINE if m in loc and loc[m] <= _LOC_HARD)
-        note = f" (baseline modules now under budget — prune them: {stale})" if stale else ""
-        r.ok(f"ratchet holds — no new module crossed the hard LOC budget{note}")
+        assert not stale, (
+            "baseline module(s) are now UNDER the hard budget — re-pin DOWN by removing "
+            "the literal(s) from _OVER_HARD_BASELINE in this file: "
+            + ", ".join(f"{m!r} ({loc[m]} <= {_LOC_HARD})" for m in stale))
+        r.ok("ratchet holds — no new module crossed the hard LOC budget, "
+             "and every grandfathered module is still over it")
     except Exception as e:
         r.fail("REG-2 ratchet", f"{type(e).__name__}: {e}")
 
