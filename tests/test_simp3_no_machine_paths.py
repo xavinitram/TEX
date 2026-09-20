@@ -20,18 +20,21 @@ when this landed, so any entry ever added here is a decision somebody makes out 
 
 **What it matches, and what it deliberately does not.** A path is flagged when its ROOT is a
 per-person one: a drive-letter path into a user-profile or project root, a home directory under
-the POSIX home or user root, or either of those reached through a single-letter drive directory
-at the shell's root, with or without an `/mnt` prefix. Those roots differ per machine by
-construction, which is what makes the match a fact rather than a guess.
+the POSIX home or user root, either of those reached through a single-letter drive directory at
+the shell's root (with or without an `/mnt` prefix), or a drive-letter path into an embedding
+host's install directory. Those roots differ per machine by construction, which is what makes
+the match a fact rather than a guess — nothing fixes where somebody unpacked a host, any more
+than it fixes what their username is.
 
 It does NOT flag every drive-letter path, because absolute is not the same as machine-specific:
 a search pattern under `Program Files` names a location every Windows box has, and a synthetic
-drive in a test fixture names no box at all. A rule that reddened on those would arrive with an
-allowlist on its first day, and an allowlist written to make a new gate go green teaches the
-next reader to add to it. It also does not flag a bare directory NAME that happens to be one
-machine's install folder — a name is only a leak once it sits inside an absolute path, which the
-patterns above already catch. The gap that leaves is real and is filed as a finding, with the
-one tracked site that falls in it.
+drive in a test fixture names no box at all. Measured at head, the broad "any drive letter" rule
+reds on eight legitimate lines and one escape sequence for every one real leak, so it would
+arrive with an allowlist on its first day — and an allowlist written to make a new gate go green
+teaches the next reader to add to it. It also does not flag a bare directory NAME: a host's
+install folder is named in a comment and in a usage line at head, and a name is only a leak once
+it sits inside an absolute path, which the patterns above already catch. Both of those tracked
+lines are witnesses in the row below, so the carve-out cannot quietly widen either.
 
 A URL is not a path: the drive-letter patterns require the letter to stand alone, so `https://`
 cannot match. This file is inside its own scan set, so every pattern is written to describe the
@@ -56,6 +59,12 @@ _PATTERNS = [
      re.compile(r"/(?:home|Users)/[A-Za-z0-9._-]+/")),
     ("a POSIX spelling of a Windows user-profile root",
      re.compile(r"(?<![A-Za-z0-9_])(?:/mnt)?/[a-z]/Users/", re.I)),
+    # An embedding host's install directory is a per-machine root for the same reason a
+    # profile directory is: nothing fixes where somebody unpacked it. This is the pattern
+    # that would have caught the benchmark fallback fixed alongside it - a literal
+    # `G:\<somebody>\comfyUI\custom_nodes` sitting in a tracked file since v0.16.
+    ("a drive-letter path into an embedding host's install",
+     re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]{1,2}[^\s\"'<>|]*[Cc]omfy", re.I)),
 ]
 
 #: Tracked paths that may carry one anyway, each with the reason it is not a leak. EMPTY is the
@@ -137,12 +146,15 @@ def test_simp3_the_private_root_lint_is_not_inert(r: SubTestResult):
     is as good a demonstration that it works as any planted probe.)
     """
     print("\n--- SIMP-3: the private-root patterns fire, and only on a private root ---")
+    host = "Comfy" + "UI_windows_portable"
     must_red = [
         "PY = '" + _spell("\\", "C:", "Users", "someone", "python.exe") + "'",
         "PY = '" + _spell("/", "D:", "Projects", "a_tree", ".venv", "python.exe") + "'",
         "run('" + _spell("/", "", "home", "someone", "build.sh") + "')",
         "PY = '" + _spell("/", "", "c", "Users", "someone", "python.exe") + "'",
         "PY = '" + _spell("/", "", "mnt", "d", "Users", "someone", "tool") + "'",
+        "PY = r'" + _spell("\\", "C:", host, "python_embeded", "python.exe") + "'",
+        "_CN = r'" + _spell("\\", "G:", "Somebody_Menu", "comfyUI", "custom_nodes") + "'",
     ]
     must_stay_green = [
         "url = 'https://example.invalid/a'",
@@ -150,6 +162,10 @@ def test_simp3_the_private_root_lint_is_not_inert(r: SubTestResult):
         "pattern = r'C" + ":" + "\\\\Program Files\\\\Vendor\\\\**\\\\tool.bat'",
         "os.environ['CACHE_DIR'] = 'Z" + ":" + "/a_fixture_value'",
         "See tools/gate.py for the tier list.",
+        # The host's directory NAME is not a private root; only an absolute path into it
+        # is. Both of these are tracked lines at head and both must stay green.
+        "Run:  python_embeded/python.exe -X utf8 benchmarks/lat4_ab.py",
+        '# named "' + host + '" too, so a naive filter would take torch out with it).',
     ]
     missed = [w for w in must_red if not scan("w", w)]
     tripped = [f"{w}  ->  {scan('w', w)[0][2]!r}" for w in must_stay_green if scan("w", w)]

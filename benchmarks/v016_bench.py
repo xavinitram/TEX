@@ -17,7 +17,19 @@ import argparse, math, os, statistics, sys, time
 _HERE = os.path.dirname(os.path.abspath(__file__))
 # Locate the custom_nodes dir so `import TEX_Wrangle...` resolves, whether this
 # lives in benchmarks/ (…/TEX_Wrangle/benchmarks) or an external scratch dir.
+# In the shipped layout the answer is DERIVED, not searched: this file sits at
+# <custom_nodes>/TEX_Wrangle/benchmarks/, so two levels up is the directory — the
+# same derivation eight_config_bench.py uses. The walk covers a copy run from a
+# scratch dir, and TEX_CUSTOM_NODES overrides both.
+#
+# There is deliberately NO literal fallback. This line used to end in an absolute
+# path to one machine's ComfyUI install, which is a private layout in a file that
+# gets pushed; a benchmark that cannot find the package must SAY so and name the
+# variable that fixes it, not guess a directory that exists on somebody else's box.
+_custom_nodes_dir = os.path.dirname(os.path.dirname(_HERE))
 _CN = os.environ.get("TEX_CUSTOM_NODES")
+if not _CN and os.path.isdir(os.path.join(_custom_nodes_dir, "TEX_Wrangle")):
+    _CN = _custom_nodes_dir
 if not _CN:
     _p = _HERE
     for _ in range(4):
@@ -25,7 +37,11 @@ if not _CN:
         if os.path.isdir(os.path.join(_p, "TEX_Wrangle")):
             _CN = _p
             break
-    _CN = _CN or r"G:\ComfyUI_Menu\comfyUI\custom_nodes"
+if not _CN:
+    raise SystemExit(
+        "v016_bench: no directory containing TEX_Wrangle was found above "
+        f"{_HERE!r}. Run this from the package's own benchmarks/ directory, or set "
+        "TEX_CUSTOM_NODES to the directory that holds TEX_Wrangle.")
 if _CN not in sys.path:
     sys.path.insert(0, _CN)
 
