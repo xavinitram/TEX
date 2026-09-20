@@ -26,8 +26,12 @@ persistent per-stage canvas, a CACHE-2 `ResultCache` armed by the host, and CACH
 keys that carry the upstream chain. That is the pattern an embedding host ports, so a count
 that moves here is a count that moves in the host.
 
-Seven scenarios
+Eight scenarios
 ---------------
+Seven of them drive the comp above. The eighth drives the ComfyUI NODE, because the other
+seven structurally cannot: they enter `tex_engine.prepare` with `forgive_dead_refs` off, and
+the whole lazy tier hangs off that flag (BENCH-3, from PERF-4's finding F5).
+
     prewarm          `tex_api.prewarm` over the comp's ten programs, each tick in its OWN
                      cold cache dir (the project-load path; the only cold scenario)
     source_edit      the first WHOLE-FRAME cook after a source edit of one stage
@@ -36,6 +40,8 @@ Seven scenarios
     pan              the window MOVES 16 px per tick, params constant
     all_dirty        a SOURCE-side knob each tick, whole frame, so the cache misses
     lint             `tex_api.check` with a one-character edit per tick (no cook at all)
+    node_scrub       a slider drag on a WIRED ComfyUI node: two `check_lazy_status` rounds
+                     (the T4-lite protocol) and then the node's own `execute`
 
 Three measurement passes per scenario, each from a freshly built comp, so a counter never
 perturbs another counter's reading:
@@ -153,6 +159,12 @@ SPY_TARGETS: "dict[str, tuple[str, ...]]" = {
     "ResultCache.get":            ("TEX_Wrangle.tex_results.ResultCache.get",),
     "ResultCache.put":            ("TEX_Wrangle.tex_results.ResultCache.put",),
     "tex_memory.run_roi":         ("TEX_Wrangle.tex_memory.run_roi",),
+    # BENCH-3: the lazy tier, which only the NODE path enters. `tex_engine.prepare` consults
+    # the analysis solely when its caller passes `forgive_dead_refs`, and the only caller that
+    # does is `tex_node` (the ComfyUI lazy input pool) — so this row reads 0 on all seven
+    # engine-driven scenarios and non-zero only on `node_scrub`, which is exactly what makes
+    # it that scenario's non-inert witness.
+    "lazy_required_bindings":     ("TEX_Wrangle.tex_lazy.lazy_required_bindings",),
     "Interpreter._exec_stmt":     ("TEX_Wrangle.tex_runtime.interpreter.Interpreter._exec_stmt",),
     "profile.record":             ("TEX_Wrangle.tex_runtime.profile.record",),
 
@@ -692,8 +704,85 @@ class LintScenario(Scenario):
         tex_api.check(edited, {"IN": TEXType.VEC4})
 
 
+class NodeScrubScenario(Scenario):
+    """The ComfyUI NODE's own tick: a slider drag on a wired `TEX Wrangle` node.
+
+    THE SEVEN SCENARIOS ABOVE CANNOT SEE THIS PATH, and that is structural rather than an
+    oversight. They drive `tex_api` / `tex_engine` directly, where `forgive_dead_refs` defaults
+    to False — and `tex_engine.prepare` consults the lazy analysis only when a caller passes
+    it. The only caller that does is `tex_node.execute` (`forgive_dead_refs=bool(slot_entries)`,
+    the lazy input pool), so `tex_lazy.lazy_required_bindings` reads 0 per tick on every one of
+    the seven, including `all_dirty`, which enters `prepare` ten times. A regression on the
+    FIRST-CLASS host's per-tick cost could therefore not move a single counts row. It moved
+    24 lexes and 24 parses per 12 slider ticks before PERF-4 and 1 and 1 after, and nothing in
+    this harness noticed either number.
+
+    So this scenario drives what a user's slider drives, in order:
+
+      round 1  `TEXWrangleNode.check_lazy_status` with the wired scalar still uncooked (it
+               arrives None) — ComfyUI's lazy protocol, which names the `in_N` pool slots this
+               cook needs;
+      round 2  the same call re-invoked once that scalar HAS cooked (the T4-lite round, which
+               is what lets a wired scalar fold like a widget value);
+      execute  the node's own cook, which reaches the analysis a third time through
+               `prepare`'s E6003 forgiveness gate.
+
+    Off ComfyUI exactly as on it: `tex_node` falls back to a plain-`object` base when
+    `comfy_api` is absent (`_V3_AVAILABLE`), `execute` then returns a tuple instead of a
+    `NodeOutput`, and the slot map is the same JSON-shaped list of dicts the frontend sends.
+    `tests/test_lazy_cooking.py` drives the node the same way.
+
+    ONE `$param` MOVES PER TICK and nothing else, so what is counted is a scrub and not a
+    re-wire. The value walks in 1e-6 steps from 0.25 and never repeats in a process (`_seq` is
+    injective across ticks, passes and scenarios, and fp32 resolves 1e-6 at 0.25 thirty times
+    over), so no tick is served a lazy answer another tick minted — the same first-sight
+    discipline `_seq` exists for. It also stays strictly inside `(0, 1)`: a `mix` weight that
+    reached an endpoint would fold an arm away and change the required set, which is a
+    different tick shape and would make every row unstable."""
+    name = "node_scrub"
+
+    #: Two image wires, one wired FLOAT scalar (so round 2 exists), one widget `$param`.
+    CODE = ("float g = $gain;\n"
+            "@OUT = mix(@A, @B, $k) * g;\n")
+    SLOTS = ({"name": "A", "slot": "in_0", "type": "IMAGE"},
+             {"name": "B", "slot": "in_1", "type": "IMAGE"},
+             {"name": "gain", "slot": "in_2", "type": "FLOAT"})
+
+    def build(self):
+        import TEX_Wrangle.tex_node as tex_node
+        self._node = tex_node.TEXWrangleNode
+        # The frontend sends the slot map as a JSON STRING constant in the queued prompt, so
+        # the scenario sends one too: `_parse_slot_map` decodes it on every one of the three
+        # calls, which is part of what a tick costs and would be missed by handing it a list.
+        self._slots = json.dumps([dict(e) for e in self.SLOTS])
+        dev = "cuda" if (self.device == "cuda" and torch.cuda.is_available()) else "cpu"
+        torch.manual_seed(7)
+        self._a = torch.rand(1, self.res, self.res, 3, device=dev)
+        self._b = torch.rand(1, self.res, self.res, 3, device=dev)
+        return None
+
+    def prime(self, comp):
+        pass                                   # `build` primes; the warm-up tick does the rest
+
+    def _kwargs(self, i: int) -> dict:
+        # The same `$k` for all three calls of one tick: the node hands `check_lazy_status` the
+        # widget values and the already-cooked wired scalars, and `execute` the same set once
+        # they have all arrived. A tick where the two disagreed would be a different bug.
+        return {"code": self.CODE, "_tex_slot_map": self._slots,
+                "k": 0.25 + self._seq(i) * 1e-6, "device": self.device,
+                "compile_mode": "none", "precision": "fp32"}
+
+    def tick(self, comp, i):
+        base = self._kwargs(i)
+        node = self._node
+        node.check_lazy_status(**dict(base, in_0=None, in_1=None, in_2=None))
+        node.check_lazy_status(**dict(base, in_0=None, in_1=None, in_2=2.0))
+        node.execute(**dict(base, in_0=self._a, in_1=self._b, in_2=2.0))
+
+
 SCENARIOS = (PrewarmScenario, SourceEditScenario, TerminalKnobScenario,
-             MidGraphKnobScenario, PanScenario, AllDirtyScenario, LintScenario)
+             MidGraphKnobScenario, PanScenario, AllDirtyScenario, LintScenario,
+             NodeScrubScenario)
 SCENARIO_NAMES = tuple(s.name for s in SCENARIOS)
 
 

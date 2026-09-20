@@ -39,7 +39,10 @@ python benchmarks/host_path_counts.py --selftest              # prove the spies 
 ```
 
 It drives `examples/host_demo.py::RoiComp` through seven scenarios (`prewarm`, `source_edit`,
-`terminal`, `midgraph`, `pan`, `all_dirty`, `lint`) and reports, per tick, API call counts, TEX
+`terminal`, `midgraph`, `pan`, `all_dirty`, `lint`) plus an eighth, `node_scrub`, which drives
+the ComfyUI node instead of the comp — two `check_lazy_status` rounds and the node's own
+`execute` per tick, because the lazy tier hangs off a `forgive_dead_refs` flag only that node
+passes, and the other seven therefore cannot see it. It reports, per tick, API call counts, TEX
 Python frames per `module:function`, and — on CUDA — kernel launches, memcpys and allocator
 statistics. Each row carries a `stable` flag (`min == max` over the steady ticks); only stable
 rows are compared, because a row that disagrees with itself cannot gate anything.

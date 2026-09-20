@@ -227,11 +227,58 @@ _LINT = {
 }
 
 
+_NODE_SCRUB = {
+    # BENCH-3, from PERF-4's finding F5. The seven scenarios above drive `tex_api` /
+    # `tex_engine` directly, where `forgive_dead_refs` is False — and that flag is the ONLY
+    # door to the lazy tier, so a regression on the ComfyUI node's own per-tick cost could not
+    # move any row above. This scenario drives what a user's slider drives: two
+    # `check_lazy_status` rounds (ComfyUI's lazy protocol, re-invoked as the wired scalar
+    # cooks) and then the node's `execute`.
+    "lazy_required_bindings":  3,    # 2 lazy rounds + `prepare`'s E6003 forgiveness gate,
+                                     # which the node reaches with `forgive_dead_refs=True`
+                                     # whenever a slot map exists. THE row this scenario
+                                     # exists for, and the only non-zero reading of it in the
+                                     # whole file — every other scenario pins it at 0 by
+                                     # never reaching the tier at all.
+    "Lexer.tokenize":          0,    # PERF-4's class, gated from here on. A slider tick cost
+    "Parser.parse":            0,    # TWO of each before PERF-4 (24 lexes and 24 parses per
+                                     # 12 ticks: one per lazy round, the E6003 gate sharing
+                                     # the second round's memo key) and ONE in total after,
+                                     # paid by the first tick, because `tex_lazy` now
+                                     # memoizes the parse per SOURCE and folds a
+                                     # `clone_tree` copy per value. A non-zero here means a
+                                     # scrub re-reads a program that did not change.
+    "TEXCache.compile_ast":    0,    # ANIM-1 on the node path: a moving $param is a cook-time
+                                     # binding, never a recompile.
+    "TEXCache.compile_tex":    1,    # one cached-compile lookup per execute,
+    "TEXCache.fingerprint":    1,    # and one key for it (PERF-5's one-per-cook shape).
+    "TypeChecker.check":       0,
+    "TypeChecker.check_collect": 0,
+    "tex_engine.cook":         0,    # 0, NOT a miscount: `tex_node.execute` calls `prepare`
+    "tex_engine.prepare":      1,    # and `run` itself, because it needs the plan between
+    "tex_engine.run":          1,    # them (`fused_chain` for the Q-4 stage attribution).
+                                     # `cook` is the one-call convenience the other scenarios
+                                     # use. A 1 in the cook row would mean the node stopped
+                                     # being able to see its own plan.
+    "tex_roi._fold_program":   0,    # no ROI on this path at all: ComfyUI has no viewport
+    "tex_roi.roi_plan":        0,    # window to cook, so the whole ROI/results-cache tier
+    "tex_roi.chain_windows":   0,    # the other six scenarios exercise is absent here. That
+    "tex_results.lineage_key": 0,    # is the POINT of the scenario — it is the other half of
+    "ResultCache.get":         0,    # what an embedding host pays, not a second reading of
+    "ResultCache.put":         0,    # the same half.
+    "tex_memory.run_roi":      0,
+    "Interpreter._exec_stmt":  2,    # the program's two statements, on the CPU interpreter
+                                     # tier (see `_TERMINAL`'s note: a compiled tier is a
+                                     # tier change and a CHANGELOG entry).
+}
+
+
 def test_bench2_interactive_per_tick_counts(r: SubTestResult):
-    """The gate: the device-independent per-tick counts of the five interactive paths."""
+    """The gate: the device-independent per-tick counts of the six interactive paths."""
     print("\n--- BENCH-2: per-tick structural counts (CPU, PROF-1 disarmed) ---")
     for label, pins in (("terminal", _TERMINAL), ("midgraph", _MIDGRAPH), ("pan", _PAN),
-                        ("all_dirty", _ALL_DIRTY), ("lint", _LINT)):
+                        ("all_dirty", _ALL_DIRTY), ("lint", _LINT),
+                        ("node_scrub", _NODE_SCRUB)):
         try:
             _check(r, label, _api_counts(label), pins)
         except Exception as e:
@@ -249,7 +296,7 @@ def test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r: SubTestResult
     The row is zero on CPU too — nothing calls it — so the assertion is portable; the CUDA
     reading that gives it teeth is in the CUDA test below."""
     print("\n--- BENCH-2: zero engine-side CUDA syncs per interactive tick ---")
-    for label in ("terminal", "midgraph", "pan", "all_dirty"):
+    for label in ("terminal", "midgraph", "pan", "all_dirty", "node_scrub"):
         try:
             got = _api_counts(label)
             lo, hi = got.get("torch.cuda.synchronize[engine]", (None, None))
