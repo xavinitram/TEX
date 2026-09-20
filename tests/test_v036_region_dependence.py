@@ -690,14 +690,16 @@ def test_t9_gate_is_never_reached_on_an_unpressured_cook(r: SubTestResult):
             tex_roi.region_dependent_cached(program, f"trk25-cap-{i}", code=UNIFORM_TWIN)
         assert len(tex_roi._region_dep_memo) <= tex_roi._REGION_DEP_MEMO_MAX, \
             f"memo grew past its cap: {len(tex_roi._region_dep_memo)}"
-        assert "trk25-cap-0" not in tex_roi._region_dep_memo, "the LRU never evicted"
+        # PERF-8: the key is `(fingerprint, profile)`, so the eviction check names both.
+        assert (("trk25-cap-0", tex_roi._profile_key())
+                not in tex_roi._region_dep_memo), "the LRU never evicted"
         r.ok(f"the memo caps at {tex_roi._REGION_DEP_MEMO_MAX} and evicts least-recently-used")
     except Exception as e:
         r.fail("T9 memo cap", f"{type(e).__name__}: {e}")
 
     try:
         tex_roi.region_dependent_cached(_parse(REPRO), "trk25-clear", code=REPRO)
-        assert "trk25-clear" in tex_roi._region_dep_memo
+        assert ("trk25-clear", tex_roi._profile_key()) in tex_roi._region_dep_memo
         compiled.clear_compiled_cache()
         assert len(tex_roi._region_dep_memo) == 0, "the memo survived the test-isolation reset"
         r.ok("compiled.clear_compiled_cache() clears the memo, beside _tile_safe_memo")

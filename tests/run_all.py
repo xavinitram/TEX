@@ -2036,6 +2036,19 @@ def main():
     test_perf7_cold_compiled_cook_frame_ceiling(r)
     test_perf7_the_counter_is_not_inert(r)
 
+    # PERF-8: the five analysis memos carry the egress profile, because the front end they
+    # derive from parses `p@beauty.diffuse` as a plane read or a swizzle depending on it.
+    from test_perf8_memo_flag_key import (
+        test_perf8_a_parse_memo_entry_is_not_served_across_a_profile_flip,
+        test_perf8_the_analysis_answers_follow_the_profile,
+        test_perf8_dropping_the_flag_from_the_key_brings_the_hazard_back,
+        test_perf8_one_shared_body_bounded_and_clearable,
+    )
+    test_perf8_a_parse_memo_entry_is_not_served_across_a_profile_flip(r)
+    test_perf8_the_analysis_answers_follow_the_profile(r)
+    test_perf8_dropping_the_flag_from_the_key_brings_the_hazard_back(r)
+    test_perf8_one_shared_body_bounded_and_clearable(r)
+
     success = r.summary()
     return 0 if success else 1
 

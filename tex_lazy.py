@@ -35,7 +35,8 @@ fp32 tensors. Substituted params are pre-rounded to fp32 to close that gap;
 the residual window (a literal-vs-param straddling one fp32 ulp inside a
 comparison) fails loud per the above, not silently.
 
-Cache #14: a module-level LRU keyed on (code-hash, folded-param fp32 bits).
+Cache #14: a module-level LRU keyed on (code-hash, folded-param fp32 bits,
+egress-profile key — see `_profile_key`).
 Distinct key + lifecycle from the 13 existing caches (ARCHITECTURE.md), and
 shared by check_lazy_status and execute() so the per-cook cost is a dict hit.
 """
@@ -50,6 +51,7 @@ from .tex_compiler.ast_nodes import (
     FunctionDef, clone_tree, iter_child_nodes,
 )
 from .tex_compiler.optimizer import _propagate_literal_locals, _fold_all
+from .tex_compiler.types import planes_wires_enabled
 
 # Wire types that can carry a spatial tensor (participate in CF-6 consensus shape
 # derivation). STRING/INT/FLOAT/BOOLEAN wires marshal to non-spatial values.
@@ -63,8 +65,63 @@ _MEMO_MAX = 256
 _memo: "OrderedDict[tuple, frozenset | None]" = OrderedDict()
 
 _PARSE_MEMO_MAX = 64
-#: source -> the UNFOLDED `parse_and_split` AST. Handed out only as `clone_tree` copies.
-_parse_memo: "OrderedDict[str, object]" = OrderedDict()
+#: (source, profile key) -> the UNFOLDED `parse_and_split` AST. Handed out only as
+#: `clone_tree` copies.
+_parse_memo: "OrderedDict[tuple, object]" = OrderedDict()
+
+
+# ── PERF-8: the egress-profile component of EVERY analysis memo key ───────────
+#
+# `tex_cache.parse_and_split` is a function of three things: the source, the binding types
+# (every analysis caller here passes `{}`, and a caller passing a real map would have to key
+# it), and ONE piece of process-global state — `planes_wires_enabled()`. While plane wires are
+# on, `p@beauty.diffuse` stays a single dotted `BindingRef`, a plane read; while they are off
+# the splitback puts it back to `ChannelAccess(@beauty, "diffuse")`, the swizzle it meant
+# before planes existed. So one source has TWO parses, and every memo holding a value derived
+# from one of them — the two parse memos, and the three answer memos above them (`_memo` here,
+# `tex_roi._walk_memo` and `tex_roi._region_dep_memo`) — has to carry the flag or it serves one
+# profile's answer under the other. The lexer mode is NOT in the key because the seam
+# hard-codes it (`dotted_bindings=True`); if that ever becomes a caller's choice it belongs
+# here beside the flag.
+#
+# ONE name for all five key sites, deliberately, and an ALIAS rather than a wrapper so the key
+# costs exactly the one unavoidable read: a `planes_wires_enabled()` spelled per site is a
+# per-site opportunity to forget one, which is how the blindness reached five keys at once.
+#
+# Under either shipped host this is a CONSTANT — the flag is set once before the first cook
+# (the set-once posture documented in `tex_compiler/types.py`) and is deliberately absent from
+# the program fingerprint — so every key gains a constant element, no hit rate moves and no
+# answer moves. What it buys is a host that changes profile mid-process (an engine toggling a
+# planes capability, an editor previewing both), which today is served a previous profile's
+# reach for as long as the entry survives.
+_profile_key = planes_wires_enabled
+
+
+def _pristine_parse(code: str, memo: "OrderedDict", cap: int):
+    """The `parse_and_split(code, {})` AST for `code` under the CURRENT egress profile, lexed
+    and parsed at most once per `(source, profile)`.
+
+    The body behind BOTH `_pristine_program`s — this module's and `tex_roi`'s — so the two
+    memos cannot drift in key, in eviction order or in the "never hand out the entry" rule.
+    They keep their own `memo`/`cap` so `clear_lazy_memo` and `clear_roi_memo` stay independent
+    test hooks and the two caps stay separately tunable.
+
+    The entry is the PRISTINE parse and is never handed out directly: every caller mutates
+    (the `$param` substitution and the optimizer's fold both rewrite in place), so each takes
+    its own `clone_tree` copy. Bounded LRU, oldest evicted first. A parse ERROR is not cached —
+    the callers catch it and answer "keep everything".
+    """
+    key = (code, _profile_key())
+    hit = memo.get(key)
+    if hit is None:
+        from .tex_cache import parse_and_split
+        hit = parse_and_split(code, {})
+        memo[key] = hit
+        while len(memo) > cap:
+            memo.popitem(last=False)
+    else:
+        memo.move_to_end(key)
+    return hit
 
 
 def _pristine_program(code: str):
@@ -82,19 +139,13 @@ def _pristine_program(code: str):
     AST rather than a frozenset; `clear_lazy_memo` drops it with the rest. A parse ERROR is
     not cached — `lazy_required_bindings` catches it and answers None (keep everything).
 
+    PERF-8: "per source" is per `(source, profile)` — the mechanics, and why the profile is in
+    the key, live in `_pristine_parse` / `_profile_key`.
+
     DATA-6, invariant 11: through the one front end (`tex_cache.parse_and_split`) with NO
     binding types — see `lazy_required_bindings` for why every dotted read must split back
     to its base wire."""
-    hit = _parse_memo.get(code)
-    if hit is None:
-        from .tex_cache import parse_and_split
-        hit = parse_and_split(code, {})
-        _parse_memo[code] = hit
-        while len(_parse_memo) > _PARSE_MEMO_MAX:
-            _parse_memo.popitem(last=False)
-    else:
-        _parse_memo.move_to_end(code)
-    return hit
+    return _pristine_parse(code, _parse_memo, _PARSE_MEMO_MAX)
 
 
 def _fp32(v: float) -> float:
@@ -203,7 +254,10 @@ def lazy_required_bindings(code: str,
     so conditions gated on them conservatively keep both branches.
     """
     param_values = param_values or {}
-    key = (hashlib.sha256(code.encode()).hexdigest(), _param_key(param_values))
+    # PERF-8: the profile is in the key because the ANSWER moves with it — `p@beauty.diffuse`
+    # is one plane name under the engine profile and the wire `beauty` under ComfyUI's.
+    key = (hashlib.sha256(code.encode()).hexdigest(), _param_key(param_values),
+           _profile_key())
     hit = _memo.get(key)
     if hit is not None or key in _memo:
         _memo.move_to_end(key)

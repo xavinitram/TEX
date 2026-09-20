@@ -54,7 +54,7 @@ from .tex_compiler.ast_nodes import (
     ForLoop, WhileLoop, clone_tree, iter_child_nodes,
 )
 from .tex_compiler.optimizer import _propagate_literal_locals, _fold_all
-from .tex_lazy import _substitute_params, _fp32, _param_key
+from .tex_lazy import _substitute_params, _fp32, _param_key, _pristine_parse, _profile_key
 from .tex_runtime import codegen_stencil as _st
 
 
@@ -427,7 +427,7 @@ def _string_wire_key(binding_types) -> tuple:
 
 
 _REGION_DEP_MEMO_MAX = 256
-_region_dep_memo: "OrderedDict[str, bool]" = OrderedDict()
+_region_dep_memo: "OrderedDict[tuple, bool]" = OrderedDict()
 
 
 def region_dependent_cached(program, fingerprint, binding_types=None, code=None) -> bool:
@@ -441,17 +441,22 @@ def region_dependent_cached(program, fingerprint, binding_types=None, code=None)
     The fingerprint already folds the binding TYPES (`tex_cache.fingerprint` hashes a sorted
     `(name, type)` tuple beside the source), so this key needs nothing added for them — the one
     exception being names the key drops as param-only, whose type comes from their declaration
-    in the source and is therefore hashed anyway."""
+    in the source and is therefore hashed anyway.
+
+    What the fingerprint does NOT fold is the egress profile (`tex_compiler/types.py` says why
+    it is out of the program fingerprint), and the `program` this predicate walks was parsed
+    under it — so PERF-8 pairs `_profile_key()` with the fingerprint here."""
     if fingerprint is None:
         return region_dependent(program, binding_types, code)
-    v = _region_dep_memo.get(fingerprint)
+    key = (fingerprint, _profile_key())
+    v = _region_dep_memo.get(key)
     if v is None:
         v = region_dependent(program, binding_types, code)
-        _region_dep_memo[fingerprint] = v
+        _region_dep_memo[key] = v
         while len(_region_dep_memo) > _REGION_DEP_MEMO_MAX:
             _region_dep_memo.popitem(last=False)
     else:
-        _region_dep_memo.move_to_end(fingerprint)
+        _region_dep_memo.move_to_end(key)
     return v
 
 
@@ -604,8 +609,9 @@ def _has_ungrounded_halo(program) -> bool:
 
 
 _PARSE_MEMO_MAX = 64
-#: source -> the UNFOLDED `parse_and_split` AST. Handed out only as `clone_tree` copies.
-_parse_memo: "OrderedDict[str, object]" = OrderedDict()
+#: (source, profile key) -> the UNFOLDED `parse_and_split` AST. Handed out only as
+#: `clone_tree` copies.
+_parse_memo: "OrderedDict[tuple, object]" = OrderedDict()
 
 
 def _pristine_program(code: str):
@@ -623,18 +629,13 @@ def _pristine_program(code: str):
     bounded-LRU discipline as `_walk_memo`, with a smaller cap because an entry is a whole
     AST rather than a five-tuple, and `clear_roi_memo` drops it with the rest.
 
+    PERF-8: "per source" is per `(source, profile)`, and the body is `tex_lazy._pristine_parse`
+    — shared with `tex_lazy._pristine_program` so the two memos cannot drift. `_profile_key`
+    says which state the parse depends on and why it is in the key.
+
     DATA-6: through the one front end (`tex_cache.parse_and_split`) with NO binding types, on
     purpose — see `_fold_program`."""
-    hit = _parse_memo.get(code)
-    if hit is None:
-        from .tex_cache import parse_and_split
-        hit = parse_and_split(code, {})
-        _parse_memo[code] = hit
-        while len(_parse_memo) > _PARSE_MEMO_MAX:
-            _parse_memo.popitem(last=False)
-    else:
-        _parse_memo.move_to_end(code)
-    return hit
+    return _pristine_parse(code, _parse_memo, _PARSE_MEMO_MAX)
 
 
 def _fold_program(code: str, param_values: dict):
@@ -698,7 +699,8 @@ def _referenced_at_bindings(code: str) -> frozenset:
 
 
 def _walk(code: str, param_values: dict, binding_types: dict | None = None):
-    """Parse + `$param`-fold + accumulate, memoized on `(code-hash, param bits, string wires)`.
+    """Parse + `$param`-fold + accumulate, memoized on `(code-hash, param bits, string wires,
+    egress profile)`.
     Returns `(reads, blocked, halo, fold_erased, region_dep)` or None on ANY failure — the shared
     engine behind `binding_footprints` and `roi_plan`, so the parse+walk runs once. `blocked` is
     True when the program cannot be cooked on a sub-region: a gather/reduction/scatter is
@@ -714,8 +716,10 @@ def _walk(code: str, param_values: dict, binding_types: dict | None = None):
     The memo key is computed INSIDE the try, so a non-str code or an unsortable param
     dict falls to None (the 'never raises' contract) rather than escaping."""
     try:
+        # PERF-8: `_profile_key()` last — the walk's answer is derived from a parse that is a
+        # function of the egress profile too, so the key carries it (see `tex_lazy`).
         key = (hashlib.sha256(code.encode()).hexdigest(), _param_key(param_values),
-               _string_wire_key(binding_types))
+               _string_wire_key(binding_types), _profile_key())
     except Exception:
         return None
     hit = _walk_memo.get(key)

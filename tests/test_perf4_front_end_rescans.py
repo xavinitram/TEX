@@ -430,7 +430,7 @@ def test_perf4_the_lazy_memo_hands_out_no_shared_ast(r: SubTestResult):
     broken = "@OUT = ;;;"
     r.ok("an unparseable source answers None and caches no entry") \
         if tex_lazy.lazy_required_bindings(broken, {}) is None \
-        and broken not in tex_lazy._parse_memo else \
+        and (broken, tex_lazy._profile_key()) not in tex_lazy._parse_memo else \
         r.fail("PERF-4 lazy parse error",
                "a source that does not parse either answered something or was cached")
 
