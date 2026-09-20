@@ -703,6 +703,89 @@ def test_neg3_docs_route_whitelist_serves_and_refuses(r):
         r.fail("docs route refuses everything else", f"{type(e).__name__}: {e}")
 
 
+_UNCALLED_BODY = '''
+import TEX_Wrangle.tex_cache, TEX_Wrangle.tex_memory, TEX_Wrangle.tex_tool
+import TEX_Wrangle.tex_runtime.host
+
+def _boom(*a, **k):
+    raise RuntimeError("probe: this subsystem is unavailable")
+
+res = drive("POST", "/tex_wrangle/free_caches")
+OUT["free_ok"] = [res.status, res.body]
+
+res = drive("GET", "/tex_wrangle/list_tools")
+OUT["tools_ok"] = [res.status, sorted(res.body.keys()), isinstance(res.body.get("tools"), list)]
+
+# The documented total failure: all three subsystems raise, the route still answers 200 and
+# says so in the payload instead of 500-ing.
+_real_free = TEX_Wrangle.tex_memory.free_tensor_caches
+_real_cache = TEX_Wrangle.tex_cache.get_cache
+_real_host = TEX_Wrangle.tex_runtime.host.get_host_services
+TEX_Wrangle.tex_memory.free_tensor_caches = _boom
+TEX_Wrangle.tex_cache.get_cache = _boom
+TEX_Wrangle.tex_runtime.host.get_host_services = _boom
+res = drive("POST", "/tex_wrangle/free_caches")
+OUT["free_dead"] = [res.status, res.body]
+
+# ...and the partial one: `ok` reports the TENSOR-cache drop only, so a live tensor cache with
+# two dead neighbours still answers true. That is the payload's actual meaning.
+TEX_Wrangle.tex_memory.free_tensor_caches = _real_free
+res = drive("POST", "/tex_wrangle/free_caches")
+OUT["free_partial"] = [res.status, res.body]
+TEX_Wrangle.tex_cache.get_cache = _real_cache
+TEX_Wrangle.tex_runtime.host.get_host_services = _real_host
+
+TEX_Wrangle.tex_tool.load_all_tools = _boom
+res = drive("GET", "/tex_wrangle/list_tools")
+OUT["tools_dead"] = [res.status, res.body.get("tools"), res.body.get("error", "")]
+'''
+
+
+def test_neg3_uncalled_routes_are_driven_both_ways(r):
+    """`free_caches` and `list_tools`: the success path and the documented failure path.
+
+    Neither has a caller in the shipped frontend, and only one has a test — of the function
+    behind it (`test_m1_free_caches` calls `free_tensor_caches`), never of the route. So the
+    handler's own shape was unwitnessed: `free_caches` swallows three exceptions and reports
+    the outcome as `{"ok": false}`, which nothing read, and `list_tools` answers 503 with an
+    empty list, which nothing read either. Both are driven here, on both paths."""
+    try:
+        out = _route_probe(_UNCALLED_BODY)
+    except Exception as e:
+        r.fail("uncalled-route probe", f"{type(e).__name__}: {e}")
+        return
+
+    try:
+        for path in ("POST /tex_wrangle/free_caches", "GET /tex_wrangle/list_tools"):
+            assert path in out["paths"], (path, out["paths"])
+        status, body = out["free_ok"]
+        assert status == 200 and body == {"ok": True}, out["free_ok"]
+        r.ok("free_caches: 200 {'ok': true} when the caches drop")
+    except Exception as e:
+        r.fail("free_caches success path", f"{type(e).__name__}: {e}")
+
+    try:
+        status, body = out["free_dead"]
+        assert status == 200, f"a dead subsystem must not 500 the route: {status}"
+        assert body == {"ok": False}, body
+        status, body = out["free_partial"]
+        assert status == 200 and body == {"ok": True}, out["free_partial"]
+        r.ok("free_caches: 200 {'ok': false} on total failure, true on a partial one")
+    except Exception as e:
+        r.fail("free_caches failure path", f"{type(e).__name__}: {e}")
+
+    try:
+        status, keys, is_list = out["tools_ok"]
+        assert status == 200 and keys == ["tools"] and is_list, out["tools_ok"]
+        status, tools, err = out["tools_dead"]
+        assert status == 503, f"a broken tool loader must say so: {status}"
+        assert tools == [], tools
+        assert err.startswith("RuntimeError:"), err
+        r.ok("list_tools: 200 {'tools': [...]}, and 503 with an empty list when it breaks")
+    except Exception as e:
+        r.fail("list_tools both paths", f"{type(e).__name__}: {e}")
+
+
 # ── Uniform outputs (LANGUAGE.md §5.2) ────────────────────────────────────────────────
 #
 # A once-per-cook scalar `@` output — an `f@`/`i@` binding computed only from literals,

@@ -2070,6 +2070,12 @@ def main():
     test_neg3_docs_local_switch_both_states(r)
     test_neg3_docs_route_whitelist_serves_and_refuses(r)
 
+    # NEG-3: the other two registered routes the shipped frontend never calls. Driven on the
+    # success path and on the documented failure path, so a handler nobody reaches cannot rot
+    # behind a green suite.
+    from test_v035_hygiene import test_neg3_uncalled_routes_are_driven_both_ways
+    test_neg3_uncalled_routes_are_driven_both_ways(r)
+
     success = r.summary()
     return 0 if success else 1
 
