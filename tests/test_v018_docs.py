@@ -77,12 +77,16 @@ def test_c3ux_error_codes_resolve(r: SubTestResult):
     except Exception as e:
         r.fail("C3-ux import generator", f"{type(e).__name__}: {e}")
         return
-    page = _PKG / "wiki" / "Error-Codes.md"
+    # The page this checks is the PACKAGE-ROOT copy (LANG-7), which ships with the node and
+    # is what `tools/gen_error_codes.py --check` reads. It used to check `wiki/Error-Codes.md`
+    # instead — a separate, gitignored checkout that is on no machine and in no CI clone, so
+    # the check skipped everywhere and the drift it names was verified nowhere. The wiki copy
+    # is the same bytes from the same generator, so it is checked too WHEN PRESENT rather than
+    # being the only thing that can be checked.
+    page = _PKG / "Error-Codes.md"
     if not page.exists():
-        # wiki/ is a separate (gitignored) repo checkout — absent on a fresh CI
-        # clone. The drift check is a dev-time guard; skip when the page isn't here
-        # rather than failing CI for a file this repo intentionally doesn't track.
-        r.skip("C3-ux Error-Codes.md", "wiki/ checkout absent (separate wiki repo); run tools/gen_error_codes.py in a wiki checkout")
+        r.fail("C3-ux Error-Codes.md", "the shipped package-root Error-Codes.md is missing — "
+                                       "run tools/gen_error_codes.py")
         return
     text = page.read_text(encoding="utf-8").lower()
     codes = gen.harvest_codes()
@@ -91,7 +95,14 @@ def test_c3ux_error_codes_resolve(r: SubTestResult):
         r.fail("C3-ux anchors", f"{len(missing)} source codes have no anchor: {missing[:10]}")
         return
     # in-process staleness check (no subprocess): the rendered content must match the file
-    if gen.render(codes) != page.read_text(encoding="utf-8"):
+    rendered = gen.render(codes)
+    wiki = _PKG / "wiki" / "Error-Codes.md"
+    if wiki.exists() and wiki.read_text(encoding="utf-8") != rendered:
+        r.fail("C3-ux wiki drift", "wiki/Error-Codes.md is stale against the shipped copy — "
+                                   "regenerate (tools/gen_error_codes.py)")
+    elif wiki.exists():
+        r.ok("wiki/Error-Codes.md is present and matches the shipped copy")
+    if rendered != page.read_text(encoding="utf-8"):
         r.fail("C3-ux drift", "Error-Codes.md is stale — regenerate (tools/gen_error_codes.py)")
     else:
         r.ok(f"all {len(codes)} source error codes resolve to an anchor; page in sync")

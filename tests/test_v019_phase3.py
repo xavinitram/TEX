@@ -57,16 +57,47 @@ def _find_code_default(schema):
 # ── S-3: LLM authoring cheatsheet ────────────────────────────────────────────
 
 def test_s3_cheatsheet_drift(r: SubTestResult):
+    """The cheatsheet is a VIEW of the registry; check the view here, the file if it exists.
+
+    Unlike `Error-Codes.md`, this page has no package-root copy — `wiki/LLM-Cheatsheet.md`
+    is its only sink, and `wiki/` is a separate gitignored checkout that is on no machine
+    and in no CI clone. So the byte-drift arm skipped everywhere and the guard checked
+    nothing at all.
+
+    What IS in the tree is the thing the page is generated FROM: the REG-1 registry plus the
+    editor help entries. The drift that matters — a function the registry gained or renamed
+    while the cheatsheet's category/help join quietly dropped it, so an LLM handed this page
+    is taught a stdlib that is missing names — is measurable against those, and that arm runs
+    everywhere. The byte comparison still runs when a wiki checkout is present.
+    """
     print("\n--- S-3: LLM cheatsheet regenerates identically (drift guard) ---")
     import gen_llm_cheatsheet as G
+    import gen_function_reference as GF
+
+    # (1) COVERAGE — runs on every machine. Every registered function name must reach the
+    #     rendered page; `_signature_block` joins the registry against the editor help
+    #     entries and drops silently on either side of that join.
+    try:
+        page = G.render()
+        reg_names = {n for e in GF.R.REGISTRY for n in e.names}
+        missing = sorted(n for n in reg_names if f"`{n}(" not in page and f"`{n} " not in page)
+        assert not missing, (
+            f"{len(missing)} registered function(s) never reach the cheatsheet's signature "
+            f"block — the registry/help join dropped them: {missing[:12]}")
+        r.ok(f"cheatsheet renders from the registry and carries all {len(reg_names)} "
+             f"registered names")
+    except Exception as e:
+        r.fail("S-3 cheatsheet coverage", f"{type(e).__name__}: {e}")
+        return
+
+    # (2) BYTE DRIFT — only checkable where the page exists, because the wiki is its only
+    #     sink. Reported as a skip (not a pass) so a green run never reads as "checked".
     out = _PKG / "wiki" / "LLM-Cheatsheet.md"
     if not out.exists():
-        # wiki/ is a separate (gitignored) repo checkout — absent on a fresh CI
-        # clone. Skip the drift guard when the page isn't present rather than
-        # failing CI for a file this repo intentionally doesn't track.
-        r.skip("S-3 cheatsheet drift", "wiki/ checkout absent (separate wiki repo); run tools/gen_llm_cheatsheet.py in a wiki checkout")
-        return
-    if out.read_text(encoding="utf-8") != G.render():
+        r.skip("S-3 byte drift", "wiki/LLM-Cheatsheet.md is the page's only sink and the "
+                                 "wiki is a separate checkout; the registry-coverage arm "
+                                 "above is what runs here")
+    elif out.read_text(encoding="utf-8") != page:
         r.fail("S-3 drift", "LLM-Cheatsheet.md is stale — run tools/gen_llm_cheatsheet.py")
     else:
         r.ok("LLM-Cheatsheet.md is current (regenerates byte-identical from the registry)")
