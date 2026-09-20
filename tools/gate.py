@@ -25,9 +25,9 @@ verdict:
 
 TIERS — and what each one actually proves
 -----------------------------------------
-`--tier cheap` runs the five ratchets that answer in seconds: the no-numpy ban, the LOC and
-headroom ratchets, the archive-surface ratchet, the host-path counts pins, and TST-7's runner
-drift check. Every one of them is a strict SUBSET of the full tier; they are kept for feedback
+`--tier cheap` runs the six ratchets that answer in seconds: the no-numpy ban, the LOC and
+headroom ratchets, the archive-surface ratchet, the host-path counts pins, TST-7's runner
+drift check, and the private-root lint over the tracked set. Every one of them is a strict SUBSET of the full tier; they are kept for feedback
 latency, not for coverage, and this tool says so out loud.
 
 `--tier full` runs cheap first (cheapest first, and it aborts there if cheap is red unless
@@ -93,6 +93,11 @@ _CHEAP = [
     ("archive surface ratchet", "tests/test_pub1_archive.py"),
     ("host-path counts pins", "tests/test_bench2_counts.py"),
     ("TST-7 runner drift", "tests/test_v017_phase1.py"),
+    # Here because of what it guards: this file once shipped an absolute path into one
+    # machine's project root and every gate below passed, because the shipped-surface
+    # ratchets skip `tools/` on purpose. The lint scans the TRACKED set instead, and it
+    # belongs in the tier a change is read against rather than three minutes downstream.
+    ("private-root lint", "tests/test_simp3_no_machine_paths.py"),
 ]
 
 #: Where the CI-shape interpreter is named, so this file names no machine's private layout.
@@ -297,7 +302,7 @@ def _run(leg: Leg, argv: list, cwd: str, env_extra: dict, scratch: str, verbose:
 
 
 def run_cheap(python: str, scratch: str, verbose: bool) -> Leg:
-    leg = Leg("cheap", "the five ratchets only — no whole-suite collection, "
+    leg = Leg("cheap", "the six ratchets only — no whole-suite collection, "
                        "no host-absent lane, CUDA present")
     files = [f"TEX_Wrangle/{p}" for _, p in _CHEAP]
     argv = [python, "-X", "utf8", _HARNESS, *files, "-q", "-p", "no:cacheprovider"]
@@ -438,7 +443,7 @@ def main(argv=None) -> int:
         description="Run TEX's gates and print one verdict. Exit 0 GREEN, 1 RED, "
                     "2 GREEN but the known-red allowlist is stale.")
     p.add_argument("--tier", choices=("cheap", "full"), default="cheap",
-                   help="cheap = the five ratchets; full = cheap, then the CI shape and the "
+                   help="cheap = the six ratchets; full = cheap, then the CI shape and the "
                         "canonical whole-suite run (default: cheap)")
     p.add_argument("--no-cache", action="store_true",
                    help="ignore any cached verdict for this tree and tier, and refresh it")

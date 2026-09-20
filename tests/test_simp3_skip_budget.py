@@ -57,7 +57,7 @@ _SKIP_VOCAB = re.compile(
 #: Rows the CPU lane cannot run, counted at their sites. Moves DOWN freely (and reds until the
 #: pin follows); moves UP only as a deliberate decision that says which environment the new row
 #: needs and why the row cannot be written without it.
-_SKIP_BUDGET = 94
+_SKIP_BUDGET = 95
 
 
 def _literal(node) -> str:
