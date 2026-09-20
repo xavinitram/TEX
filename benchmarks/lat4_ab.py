@@ -43,13 +43,15 @@ sys.path.insert(0, str(_bench_dir.parent.parent))   # custom_nodes/ -> import TE
 import torch
 from TEX_Wrangle.tex_runtime import interpreter as I
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter
-from TEX_Wrangle.tex_compiler.lexer import Lexer
-from TEX_Wrangle.tex_compiler.parser import Parser
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
 from TEX_Wrangle.tex_marshalling import infer_binding_type as _ibt
 
 CODE = "@OUT = vec4(u, v, 0.0, 1.0);"   # pure coordinate builtins: worst case for
-PROG = Parser(Lexer(CODE).tokenize(), source=CODE).parse()   # cache-mechanism overhead
+# DATA-6: the production front end, so the AST timed here is the AST a cook gets. Parsed
+# once at import, outside every timed region — this bench measures cache-mechanism
+# overhead, never the front end.
+PROG = parse_and_split(CODE)
 random.seed(1234)
 
 

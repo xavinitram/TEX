@@ -31,8 +31,7 @@ _pkg_dir = _bench_dir.parent
 sys.path.insert(0, str(_pkg_dir.parent))
 
 import torch
-from TEX_Wrangle.tex_compiler.lexer import Lexer
-from TEX_Wrangle.tex_compiler.parser import Parser
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
 from TEX_Wrangle.tex_compiler.types import TEXType, CHANNEL_MAP
 from TEX_Wrangle.tex_compiler.optimizer import optimize
@@ -169,8 +168,13 @@ def generate_bindings(code: str, B: int, H: int, W: int,
 
     b = {}
 
-    # Pass 1: Parse and type-check to discover all referenced bindings
-    program = Parser(Lexer(code).tokenize(), source=code).parse()
+    # Pass 1: Parse and type-check to discover all referenced bindings.
+    # Through the production front end (DATA-6): a private Lexer/Parser pair skips
+    # `splitback_dotted_bindings`, so a program containing a dotted binding would be
+    # discovered against a DIFFERENT AST than the cook runs. No binding types are known
+    # yet — that is what this pass is for — so the untyped-base row splits every dotted
+    # binding back, which is the AST the cook gets for the same input.
+    program = parse_and_split(code)
     checker = TypeChecker(binding_types={}, source=code)
     checker.check(program)
     output_names = set(checker.assigned_bindings.keys())
@@ -280,8 +284,10 @@ def load_examples() -> list[tuple[str, str, str]]:
 # ── Compilation & execution ──────────────────────────────────────────────────
 
 def compile_program(code: str, btypes: dict):
-    tokens = Lexer(code).tokenize()
-    program = Parser(tokens, source=code).parse()
+    # DATA-6: the cook's own front end, not a private copy of it. This function is inside
+    # the timed region of every COLD configuration, so what it measures has to be the work
+    # a cold cook actually does — `parse_and_split` is that work.
+    program = parse_and_split(code, btypes)
     checker = TypeChecker(binding_types=btypes, source=code)
     type_map = checker.check(program)
     program = optimize(program)

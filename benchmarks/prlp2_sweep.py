@@ -15,8 +15,7 @@ _bench = Path(__file__).resolve().parent
 sys.path.insert(0, str(_bench.parents[1]))
 sys.path.insert(0, str(_bench))
 import torch
-from TEX_Wrangle.tex_compiler.lexer import Lexer
-from TEX_Wrangle.tex_compiler.parser import Parser
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter
 from TEX_Wrangle.tex_runtime.precision_policy import resolve_auto_precision
@@ -39,7 +38,9 @@ def main():
         name = fn[:-4]
         code = (EX / fn).read_text(encoding="utf-8")
         try:
-            prog = Parser(Lexer(code).tokenize(), source=code).parse()
+            # DATA-6: the production front end. Untimed setup — this sweep measures the
+            # auto-precision VERDICT and the cook's accuracy, never the parse.
+            prog = parse_and_split(code)
         except Exception:
             continue  # non-compiling snippet (rare); skip
         prec, reason = resolve_auto_precision(prog, 2048 * 2048, "cuda")

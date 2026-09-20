@@ -19,8 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
-from TEX_Wrangle.tex_compiler.lexer import Lexer
-from TEX_Wrangle.tex_compiler.parser import Parser
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
 from TEX_Wrangle.tex_compiler.types import TEXType
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter
@@ -31,8 +30,11 @@ GRADE = ("vec3 c = @A.rgb; c = pow(c, vec3(1.0/2.2));"
 
 
 def _prep(code):
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
-    tm = TypeChecker(binding_types={"A": TEXType.VEC3}, source=code).check(prog)
+    # DATA-6: the production front end. Untimed setup — the timed region is the
+    # interpreter run, never the parse.
+    bt = {"A": TEXType.VEC3}
+    prog = parse_and_split(code, bt)
+    tm = TypeChecker(binding_types=bt, source=code).check(prog)
     return prog, tm
 
 

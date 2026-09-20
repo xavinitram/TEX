@@ -25,8 +25,7 @@ _b = Path(__file__).resolve().parent
 sys.path.insert(0, str(_b.parent.parent))
 sys.path.insert(0, str(_b))
 import torch
-from TEX_Wrangle.tex_compiler.lexer import Lexer
-from TEX_Wrangle.tex_compiler.parser import Parser
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
 from TEX_Wrangle.tex_compiler.types import TEXType
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter, _collect_identifiers
@@ -41,8 +40,11 @@ _CAP_OPS = (2, 64)                   # autocal clamp on op thresholds
 
 
 def _compile(code):
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
-    tm = TypeChecker(binding_types={"A": TEXType.VEC3}, source=code).check(prog)
+    # DATA-6: the production front end (setup for the timed graph/tier calls below, which
+    # is what this bench measures — never the parse).
+    bt = {"A": TEXType.VEC3}
+    prog = parse_and_split(code, bt)
+    tm = TypeChecker(binding_types=bt, source=code).check(prog)
     return prog, tm, _collect_identifiers(prog)
 
 

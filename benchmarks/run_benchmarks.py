@@ -54,8 +54,7 @@ _custom_nodes_dir = _pkg_dir.parent
 sys.path.insert(0, str(_custom_nodes_dir))
 
 import torch
-from TEX_Wrangle.tex_compiler.lexer import Lexer
-from TEX_Wrangle.tex_compiler.parser import Parser
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
 from TEX_Wrangle.tex_compiler.types import TEXType
 
@@ -521,8 +520,11 @@ def gpu_time_ms(fn, runs: int = 40, warmup: int = 8) -> float:
 
 
 def compile_program(code: str, binding_types: dict):
-    tokens = Lexer(code).tokenize()
-    program = Parser(tokens).parse()
+    # DATA-6: the cook's own front end. This runs inside the timed region of every COLD
+    # configuration, so the work measured has to be the work a cold cook does — and a
+    # private Lexer/Parser pair would also measure a different AST for any program with a
+    # dotted binding, which is silent on every program that has none.
+    program = parse_and_split(code, binding_types)
     checker = TypeChecker(binding_types=binding_types)
     type_map = checker.check(program)
     if optimize is not None:

@@ -30,8 +30,7 @@ if _CN not in sys.path:
     sys.path.insert(0, _CN)
 
 import torch
-from TEX_Wrangle.tex_compiler.lexer import Lexer
-from TEX_Wrangle.tex_compiler.parser import Parser
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.type_checker import TypeChecker
 from TEX_Wrangle.tex_runtime.interpreter import Interpreter
 from TEX_Wrangle.tex_runtime.compiled import _codegen_only_execute
@@ -61,8 +60,10 @@ PROGRAMS = {
 
 
 def compile_prog(code, bindings):
-    prog = Parser(Lexer(code).tokenize(), source=code).parse()
+    # DATA-6: the production front end, given the same binding types the checker gets, so
+    # the AST measured is the AST a cook of these bindings would run.
     bt = {n: _ibt(v) for n, v in bindings.items()}
+    prog = parse_and_split(code, bt)
     ck = TypeChecker(binding_types=bt, source=code)
     tm = ck.check(prog)
     outs = sorted(ck.assigned_bindings.keys())
