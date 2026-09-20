@@ -58,6 +58,15 @@ from TEX_Wrangle.tex_compiler.optimizer import _fold_all, _propagate_literal_loc
 from TEX_Wrangle.tex_lazy import _fp32, _substitute_params
 from TEX_Wrangle.tex_marshalling import sigil_names
 
+# The isolation every oracle row in BOTH front-end files needs, defined once beside PERF-1's
+# rows and imported here (the suite already imports one test module from another —
+# `tests/compat_corpus.py` takes `test_integration._prepare_example`). Its docstring carries
+# the whole diagnosis: the analysis parse memos key a whole AST on the source text while the
+# tree they hold depends on the process-global plane-wire flag, so an earlier file that parsed
+# a dotted example with plane wires ON makes `test_perf4_lazy_answers_are_identical` below
+# report `examples/aov_relight.tex`'s plane reads as moved answers.
+from test_perf1_roi_walk_memo import isolated_analysis
+
 # Bound HERE, at import, so the oracles below keep calling the real helpers while a test
 # monkeypatches `tex_roi.<name>` to mutate the shipped side. An oracle that read the module
 # attribute at call time would move with the mutation and prove nothing.
@@ -290,6 +299,7 @@ def _folded(code: str, params: dict):
 
 # ── F2: the lazy analysis ────────────────────────────────────────────────────
 
+@isolated_analysis
 def test_perf4_lazy_answers_are_identical(r: SubTestResult):
     """Every `(source, valuation)` answers what the pre-change analysis answered."""
     print("\n--- PERF-4 F2: the memoized-parse lazy analysis vs the pre-change one ---")
@@ -309,6 +319,7 @@ def test_perf4_lazy_answers_are_identical(r: SubTestResult):
         r.ok(f"{checked} lazy answers over {len(rows)} sources are unchanged")
 
 
+@isolated_analysis
 def test_perf4_a_lazy_source_is_parsed_once(r: SubTestResult):
     """RED-FIRST. Many parameter values over one source cost ONE lex and ONE parse.
 
@@ -357,6 +368,7 @@ def test_perf4_a_lazy_source_is_parsed_once(r: SubTestResult):
                f"is answering for the wrong source")
 
 
+@isolated_analysis
 def test_perf4_the_lazy_clone_is_load_bearing(r: SubTestResult):
     """MUTATION. Hand the analysis the memoized parse ITSELF and the oracle must notice.
 
@@ -388,6 +400,7 @@ def test_perf4_the_lazy_clone_is_load_bearing(r: SubTestResult):
         r.fail("PERF-4 lazy mutation", f"restored analysis still disagrees: {want!r} -> {fixed!r}")
 
 
+@isolated_analysis
 def test_perf4_the_lazy_memo_hands_out_no_shared_ast(r: SubTestResult):
     """The memoized parse is never handed to a caller, and survives an analysis unchanged."""
     print("\n--- PERF-4 F2: the cached parse is pristine and stays pristine ---")
@@ -422,6 +435,7 @@ def test_perf4_the_lazy_memo_hands_out_no_shared_ast(r: SubTestResult):
                "a source that does not parse either answered something or was cached")
 
 
+@isolated_analysis
 def test_perf4_lazy_oracle_sensitive_rows(r: SubTestResult):
     """NOT VACUOUS. Each `_LAZY_SENSITIVE` source really does answer differently per value,
     except the one chosen to prove the never-sever rule, which must answer the SAME."""
@@ -444,6 +458,7 @@ def test_perf4_lazy_oracle_sensitive_rows(r: SubTestResult):
 
 # ── F4: the halo scan ────────────────────────────────────────────────────────
 
+@isolated_analysis
 def test_perf4_halo_answers_are_identical(r: SubTestResult):
     """Every folded program answers what the pre-change two-pass scan answered."""
     print("\n--- PERF-4 F4: the single-traversal halo scan vs the pre-change one ---")
@@ -465,6 +480,7 @@ def test_perf4_halo_answers_are_identical(r: SubTestResult):
         r.ok(f"{checked} halo verdicts over {len(rows)} sources are unchanged")
 
 
+@isolated_analysis
 def test_perf4_halo_corpus_is_not_vacuous(r: SubTestResult):
     """NOT VACUOUS. The halo corpus contains both verdicts, and each shape answers what its
     name claims — otherwise "identical over the corpus" would be a statement about nothing."""
@@ -488,6 +504,7 @@ def test_perf4_halo_corpus_is_not_vacuous(r: SubTestResult):
              f"({sum(expect.values())} blocked, {len(expect) - sum(expect.values())} not)")
 
 
+@isolated_analysis
 def test_perf4_the_halo_scan_visits_each_node_once(r: SubTestResult):
     """RED-FIRST, the structural gate. One descent per AST node per scan, not two.
 
@@ -541,6 +558,7 @@ def test_perf4_the_halo_scan_visits_each_node_once(r: SubTestResult):
         r.ok(f"{expected} nodes, {total} descents, no node descended twice")
 
 
+@isolated_analysis
 def test_perf4_halo_mutants_are_caught(r: SubTestResult):
     """MUTATION, both rules. Break the merged scan's bottom-up halo propagation, then case
     (1)'s grounded/ungrounded distinction, and require the corpus to catch each — then require

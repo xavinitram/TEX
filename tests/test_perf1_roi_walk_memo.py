@@ -24,21 +24,78 @@ where N values cost N lexes.
 
 PORTABILITY: CPU, no ComfyUI, no CUDA, no compiler, no numpy, no timing assertion.
 """
+import functools
 import glob
 import math
 import os
 
 from helpers import *
 
-from TEX_Wrangle import tex_roi
+from TEX_Wrangle import tex_lazy, tex_roi
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler import ast_nodes
 from TEX_Wrangle.tex_compiler.ast_nodes import Assignment, NumberLiteral
 from TEX_Wrangle.tex_compiler.optimizer import _fold_all, _propagate_literal_locals
+from TEX_Wrangle.tex_compiler.types import array_wires_enabled, set_array_wires
 from TEX_Wrangle.tex_lazy import _fp32, _substitute_params
 from TEX_Wrangle.tex_marshalling import sigil_names
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def isolated_analysis(fn):
+    """Run one oracle row against memos NOTHING EARLIER FILLED, under the profile it assumes.
+
+    ORDER-DEPENDENCE, AND WHY IT IS THIS FILE'S PROBLEM TO SOLVE. `tex_roi._parse_memo` and
+    `tex_lazy._parse_memo` key a whole AST on the SOURCE TEXT alone, but what
+    `tex_cache.parse_and_split` builds from that text also depends on a process-global flag:
+    `planes_wires_enabled()` (`tex_compiler.types._ARRAY_WIRES`, which the engine egress
+    profile sets). With plane wires ON, `p@beauty.diffuse` stays ONE dotted binding — a plane
+    read; with them OFF the splitback puts it back to a swizzle of `@beauty`, which is what it
+    meant before planes existed. So a parse cached while some earlier test file had the flag on
+    is served to a later one that does not, and the rows below then compare a planes-shaped
+    MEMO HIT against a freshly-parsed swizzle tree: `examples/aov_relight.tex` reports
+    `('beauty',)` on one side and the three expanded plane names on the other, and the identity
+    row fails with answers that moved for a reason that is not about the change under test.
+
+    Reproduced at this file's base sha (it is not a regression — alphabetical collection hides
+    it, because `test_perf*` sorts before `test_v037_*`):
+
+        pytest -p no:randomly tests/test_v037_frontend_parity.py \\
+                              tests/test_perf1_roi_walk_memo.py \\
+                              tests/test_perf4_front_end_rescans.py
+
+    — that file walks every dotted `examples/*.tex` inside its own `_planes_enabled(True)`,
+    which is exactly the pollution. It restores the FLAG faithfully; what outlives it is the
+    memo entry the flag's value produced.
+
+    An oracle that answers differently depending on what ran before it is not an oracle, and
+    being one is this file's entire reason to exist. So: pin the flag at the ComfyUI default
+    for the row, and drop the flag-blind memos BOTH ways — on the way in, so nothing earlier
+    reaches these rows, and on the way out, so these rows reach nothing later. A fixture would
+    not do: `tests/run_all.py` calls these functions directly, so the isolation has to travel
+    with the function.
+    """
+    @functools.wraps(fn)
+    def wrapper(r):
+        prev = array_wires_enabled()
+        set_array_wires(False)
+        _drop_analysis_memos()
+        try:
+            return fn(r)
+        finally:
+            set_array_wires(prev)
+            _drop_analysis_memos()
+    return wrapper
+
+
+def _drop_analysis_memos() -> None:
+    """Every memo whose VALUE depends on the plane-wire flag while its KEY does not."""
+    from TEX_Wrangle.tex_compiler.lexer import clear_token_handoff
+    tex_roi.clear_roi_memo()        # _walk_memo + _region_dep_memo + _parse_memo
+    tex_lazy.clear_lazy_memo()      # _memo + _parse_memo
+    clear_token_handoff()           # an unclaimed offer is keyed on (source, flag), but a
+    #                                 stale one would still donate a lex to a counting row.
 
 
 def _drop_token_offer(code: str) -> None:
@@ -164,6 +221,7 @@ _STRING_WIRES = ({}, {"S": TEXType.STRING}, {"A": TEXType.STRING, "S": TEXType.S
 
 # ── the rows ─────────────────────────────────────────────────────────────────
 
+@isolated_analysis
 def test_perf1_walk_answers_are_identical(r: SubTestResult):
     """Every `(source, valuation, string-wire map)` answers what the pre-change walk answers."""
     print("\n--- PERF-1: the memoized-parse walk vs the pre-change walk ---")
@@ -185,6 +243,7 @@ def test_perf1_walk_answers_are_identical(r: SubTestResult):
         r.ok(f"{checked} walk answers over {len(rows)} sources are unchanged")
 
 
+@isolated_analysis
 def test_perf1_a_source_is_parsed_once(r: SubTestResult):
     """RED-FIRST. Many parameter values over one source cost ONE lex and ONE parse.
 
@@ -242,6 +301,7 @@ def test_perf1_a_source_is_parsed_once(r: SubTestResult):
                                     f"expected 1/1 — the memo is answering for the wrong source")
 
 
+@isolated_analysis
 def test_perf1_the_clone_is_load_bearing(r: SubTestResult):
     """MUTATION. Hand the fold the memoized parse ITSELF and the oracle must notice.
 
@@ -273,6 +333,7 @@ def test_perf1_the_clone_is_load_bearing(r: SubTestResult):
         r.fail("PERF-1 mutation", f"restored walk still disagrees: {want!r} -> {fixed!r}")
 
 
+@isolated_analysis
 def test_perf1_oracle_sensitive_rows(r: SubTestResult):
     """NOT VACUOUS. Each `_SENSITIVE` source really does answer differently per value.
 
@@ -287,6 +348,7 @@ def test_perf1_oracle_sensitive_rows(r: SubTestResult):
                                          f"not exercising the value dependence it was chosen for")
 
 
+@isolated_analysis
 def test_perf1_the_memo_hands_out_no_shared_ast(r: SubTestResult):
     """The memoized parse is never handed to a caller, and survives a fold unchanged.
 
@@ -321,6 +383,7 @@ def test_perf1_the_memo_hands_out_no_shared_ast(r: SubTestResult):
                                     f"{len(tex_roi._parse_memo)} left after clear_roi_memo()")
 
 
+@isolated_analysis
 def test_perf1_clone_tree_is_a_faithful_copy(r: SubTestResult):
     """`ast_nodes.clone_tree` reproduces a parse: same shape, no shared mutable state.
 
@@ -392,6 +455,7 @@ def test_perf1_clone_tree_is_a_faithful_copy(r: SubTestResult):
                                         "rewrite would land on one occurrence and not the other")
 
 
+@isolated_analysis
 def test_perf1_nan_and_inf_do_not_become_a_radius(r: SubTestResult):
     """A non-finite parameter in a halo position stays unresolved, before and after.
 
