@@ -2592,8 +2592,16 @@ def _get_gauss_kernels(sigma: float, device: torch.device) -> tuple[torch.Tensor
 
     Returns (kernel_h, kernel_v) as contiguous [1, 1, 1, K] and [1, 1, K, 1] tensors,
     ready for depthwise conv2d (expand to [C, 1, ...] before use).
+
+    PERF-3: the key is the sigma the kernel is BUILT from, exactly. It used to be
+    `round(sigma, 3)` while the build used the full value, so two sigmas agreeing to
+    three decimals shared whichever kernel arrived first — including across a `ceil`
+    step (1.9996 gives 6 taps either side, 2.0001 gives 7), which made the same program
+    with the same bindings depend on what the process had blurred earlier. Quantising
+    before the build agrees with itself too, but moves every un-quantised sigma's
+    output; keying exactly moves none. The LRU below still bounds the entries.
     """
-    key = (round(sigma, 3), device)
+    key = (sigma, device)
     cached = _gauss_kernel_cache.get(key)
     if cached is not None:
         _gauss_kernel_cache.move_to_end(key)
@@ -2753,8 +2761,10 @@ def _get_mip_pyramid(img: torch.Tensor) -> list[torch.Tensor]:
 
 def _get_mip_pyramid_gauss(img: torch.Tensor, sigma: float = 1.13) -> list[torch.Tensor]:
     """Gaussian-prefiltered mipmap pyramid (sigma=1.13, SIGMA_C ≈ 0.825, cached)."""
-    sigma_q = round(sigma, 3)
-    key = (id(img), _safe_version(img), sigma_q)
+    # PERF-3, same rule as `_get_gauss_kernels`: key on the sigma the pyramid is BUILT
+    # from. Today's only caller passes the default, so nothing moves — but a second
+    # caller at a nearby sigma would have been served this one's pyramid.
+    key = (id(img), _safe_version(img), sigma)
     return _build_mip_pyramid(
         img, _gauss_mip_cache, key,
         pre_blur_fn=lambda bchw: _gauss_blur_bchw(bchw, sigma),

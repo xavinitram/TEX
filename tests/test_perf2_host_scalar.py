@@ -339,9 +339,11 @@ def test_perf2_the_tag_carries_the_rounded_value(r: SubTestResult):
     #
     # The sigma has to be chosen, not picked: most differences hide. Torch treats a Python
     # float operand as a WEAK scalar, so `exp(-0.5*(x/sigma)**2)` rounds the double to fp32
-    # anyway and the kernel WEIGHTS come out identical; and `_get_gauss_kernels` keys its
-    # cache on `round(sigma, 3)`, so a second run at the same slider would be served the
-    # first run's kernel regardless. What does NOT hide is the arithmetic done in PYTHON:
+    # anyway and the kernel WEIGHTS come out identical; and `_get_gauss_kernels` keyed its
+    # cache on `round(sigma, 3)` until PERF-3, so a second run at the same slider was served
+    # the first run's kernel regardless — which is why the cache is CLEARED either side of
+    # the mutation below, and stays cleared now that it is keyed exactly (a module-level memo
+    # outlives a cook either way). What does NOT hide is the arithmetic done in PYTHON:
     # `radius = ceil(3*sigma)`. 2/3 is exactly 2.0 there and 2.0000000596 in fp32, so the
     # rounding decides between a 5-tap and a 7-tap kernel.
     try:

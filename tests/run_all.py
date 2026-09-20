@@ -1932,6 +1932,22 @@ def main():
     test_perf2_the_tag_carries_the_rounded_value(r)
     test_perf2_a_tag_never_survives_an_operation(r)
 
+    # PERF-3: the Gaussian kernel cache keys on the sigma the kernel is BUILT from, so the
+    # same program with the same bindings answers the same whatever the process blurred
+    # earlier — it used to key on `round(sigma, 3)` and build from the full value.
+    from test_perf3_gauss_kernel_key import (
+        test_perf3_a_blur_does_not_depend_on_what_was_blurred_first,
+        test_perf3_the_cache_is_keyed_on_the_sigma_it_builds_from,
+        test_perf3_a_repeated_sigma_still_hits_the_cache,
+        test_perf3_the_rounded_key_is_detected,
+        test_perf3_the_radius_rule_is_the_one_the_key_assumes,
+    )
+    test_perf3_a_blur_does_not_depend_on_what_was_blurred_first(r)
+    test_perf3_the_cache_is_keyed_on_the_sigma_it_builds_from(r)
+    test_perf3_a_repeated_sigma_still_hits_the_cache(r)
+    test_perf3_the_rounded_key_is_detected(r)
+    test_perf3_the_radius_rule_is_the_one_the_key_assumes(r)
+
     success = r.summary()
     return 0 if success else 1
 
