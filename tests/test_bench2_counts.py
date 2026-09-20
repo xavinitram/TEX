@@ -420,9 +420,61 @@ _FREE_MEM_CUDA = {
 }
 
 
+class _FakeModelManagement:
+    """The whole of `comfy.model_management` that `ComfyHostServices` needs to answer
+    "how much is free?" — a fake host the harness drives, so the CUDA-only implementation
+    is witnessed on a CPU-only box without a device and without importing ComfyUI."""
+    def get_free_memory(self, device):
+        return 1234.0
+
+    def processing_interrupted(self):
+        return False
+
+
+def _witness_free_memory_spy(r: SubTestResult) -> bool:
+    """CPU NON-INERT WITNESS for the five `_FREE_MEM_CPU` zeros below.
+
+    `_FREE_MEM_CUDA["prewarm"] = 10` is this row's only non-zero reading, and it exists on
+    the CUDA leg — which CI, being CPU-only, never runs. So on CI the pins below asserted
+    `0 == 0` five times with nothing showing that the `host.get_free_memory` spy had been
+    installed at all: a renamed target, a moved class or a module imported under a second
+    name would have satisfied every one of them. That is the ANIM-1 failure this file's
+    mutation guard exists to prevent, surviving in the one row the guard does not cover
+    (its cold prewarm tick reads 0 here for the same device reason).
+
+    The witness drives the SEAM rather than a scenario, because off CUDA the planners
+    legitimately return before ever asking — the honest thing to prove on CPU is not "a tick
+    queries" but "if a tick queried, this row would count it". BOTH patched implementations
+    are driven, since which one a run uses depends on whether ComfyUI is importable and
+    patching only one reports a confident zero in the other shape.
+    """
+    b = _bench()
+    from TEX_Wrangle.tex_runtime import host as _host
+    row = "host.get_free_memory"
+    try:
+        with b.CallSpies({row: b.SPY_TARGETS[row]}, sync_caller_attribution=False) as spies:
+            dev = torch.device("cpu")
+            _host.NullHostServices().get_free_memory(dev)
+            _host.ComfyHostServices(_FakeModelManagement()).get_free_memory(dev)
+            n = spies.snapshot().get(row, 0)
+    except Exception as e:
+        r.fail("BENCH-2 free-memory witness (cpu)", f"{type(e).__name__}: {e}")
+        return False
+    if n == len(b.SPY_TARGETS[row]):
+        r.ok(f"cpu witness: {row} counted {n} direct calls (one per patched implementation) "
+             f"— the zeros below are measured, not vacuous")
+        return True
+    r.fail("BENCH-2 inert free-memory spy",
+           f"{row} counted {n} of {len(b.SPY_TARGETS[row])} direct calls through the very "
+           f"attributes the harness patches — the spy is not installed, so every 0 pinned "
+           f"for this row is vacuous")
+    return False
+
+
 def test_bench2_free_memory_queries_per_tick(r: SubTestResult):
     """PERF-6: the number of live host free-VRAM queries an interactive tick pays."""
     print("\n--- BENCH-2: host free-VRAM queries per tick ---")
+    _witness_free_memory_spy(r)
     for label in ("terminal", "midgraph", "pan", "all_dirty", "lint"):
         try:
             _check(r, f"{label} (cpu)", _api_counts(label),
