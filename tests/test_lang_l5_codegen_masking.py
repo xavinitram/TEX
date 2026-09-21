@@ -223,10 +223,10 @@ def test_atom_moves_on_the_codegen_tier_too(name):
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # The DIGEST acceptance (§8's `L5` row: "the emitted `_tex_src` digest for every corpus
-# program without a pragma is unchanged from the base sha") needs two checkouts of the tree
-# at once, so it is taken out-of-band — `docs/worklog/lang-l5/probe_digest_pin.py`, against
-# `9460091`, 130 programs, all identical. What can live in a test is the structural property
-# that MAKES it hold, checked over the same 130 programs.
+# program without a pragma is unchanged from the base sha") compares two checkouts of the
+# tree, so it cannot live in a test at all; it was taken separately against the commit that
+# precedes the language work, over all 130 corpus programs, and every digest was identical.
+# What CAN live here is the structural property that makes it hold, over the same 130.
 
 def _corpus_compiles():
     for name, src in cc._corpus_programs():

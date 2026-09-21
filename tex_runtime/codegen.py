@@ -1352,9 +1352,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # by `@S[x, y] += v;` reaches `_sb.shape[2]` on a 0-dim buffer and raises a raw
         # IndexError where the interpreter returns a picture. That is a pre-existing
         # interp/codegen divergence, reproduced at this lane's base sha with no language
-        # feature involved, and it is filed rather than fixed here: widening the `0.23`
-        # guard would move the emitted bytes of every scattering program, which is exactly
-        # what this lane's digest acceptance forbids. See `bug_reports/pending/lang-l5.md`.
+        # feature involved. It is recorded rather than fixed here: widening the `0.23` guard
+        # would move the emitted bytes of every program containing a scatter, and the
+        # release that introduced this masked path owes those bytes as unchanged.
         if self._mf_on:
             need_buf = (f"{name!r} not in _bind or not _torch.is_tensor(_bind[{name!r}]) "
                         f"or _bind[{name!r}].dim() < 3")
