@@ -104,6 +104,15 @@ class ASTNode:
 @dataclass(slots=True)
 class Program(ASTNode):
     statements: list[ASTNode] = field(default_factory=list)
+    # LANG-L1: the language level this program's header REQUESTS, as the string "X.Y"
+    # (e.g. "0.25"), or None when no leading `//!tex X.Y` pragma is present. Set exactly
+    # once, by `Parser.parse`, from the raw source text (`tex_compiler.parser.language_pragma`)
+    # — nothing else re-derives it from a buried comment. A request, not a capability: the
+    # level a program is actually COOKED under is `min(language, tex_api.LANGUAGE_VERSION)`
+    # (see `tex_roi._language_tuple`), never this field alone. Purely additive — nothing
+    # reads this field yet, and Tier 3 (`DEVELOPMENT.md` §"API stability tiers"): this AST
+    # node carries no external contract, unlike the pinned `tex_api.Program` facade.
+    language: str | None = None
 
 
 # ---------------------------------------------------------------------------

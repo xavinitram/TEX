@@ -35,6 +35,7 @@ Grammar (simplified):
 """
 from __future__ import annotations
 import copy
+import re as _re
 
 from .lexer import Token, TokenType
 from .ast_nodes import (
@@ -56,6 +57,31 @@ COMPOUND_ASSIGN_OPS = {
     TokenType.STAR_ASSIGN: "*",
     TokenType.SLASH_ASSIGN: "/",
 }
+
+# LANG-L1: a `//!tex X.Y` pragma on its own comment line. Moved here (from `tex_api`, which
+# now delegates) so `Parser.parse` and the editor's advisory lint share ONE definition of
+# "the program's declared language" rather than two regexes that could drift — the lexer
+# discards comments, so this is recovered from the raw source, not from tokens.
+_PRAGMA_RE = _re.compile(r"//!tex\s+(\d+)\.(\d+)\b")
+
+
+def language_pragma(source: str):
+    """Return the language version a program targets via a LEADING `//!tex X.Y` pragma (as
+    the string 'X.Y'), or None. Only a pragma in the header run of blank / `//` line-comment
+    lines is recognized — one buried after real code or inside a `/* … */` block comment is
+    ignored (it would otherwise raise a spurious W7004). `Parser.parse` calls this directly
+    to set `Program.language`; `tex_api.language_pragma` delegates to this same function."""
+    for raw in (source or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue                      # blank line — keep scanning the header
+        m = _PRAGMA_RE.match(line)
+        if m:
+            return f"{m.group(1)}.{m.group(2)}"
+        if line.startswith("//"):
+            continue                      # an ordinary leading line comment — keep scanning
+        break                             # first real code (or a block comment): no pragma
+    return None
 
 
 class ParseError(Exception):
@@ -238,7 +264,9 @@ class Parser:
             diagnostics = [e.diagnostic for e in self._errors if e.diagnostic]
             raise TEXMultiError(diagnostics)
 
-        return Program(loc=loc, statements=stmts)
+        # LANG-L1: carry the header pragma onto the compiled program as its declared
+        # language LEVEL, a request rather than a capability — nothing reads it yet.
+        return Program(loc=loc, statements=stmts, language=language_pragma(self._source))
 
     # -- Statements -----------------------------------------------------
 

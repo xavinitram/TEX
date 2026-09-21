@@ -74,27 +74,20 @@ from .tex_session import EngineSession, default_session  # noqa: F401
 # computing the same pixels across versions. See LANGUAGE.md for the compatibility policy.
 LANGUAGE_VERSION = "0.24"
 
-# A `//!tex X.Y` pragma on its own comment line (the lexer discards comments, so this is
-# recovered from the raw source, not from tokens).
-_PRAGMA_RE = _re.compile(r"//!tex\s+(\d+)\.(\d+)\b")
-
 
 def language_pragma(source: str):
     """Return the language version a program targets via a LEADING `//!tex X.Y` pragma (as
     the string 'X.Y'), or None. Only a pragma in the header run of blank / `//` line-comment
     lines is recognized — one buried after real code or inside a `/* … */` block comment is
-    ignored (it would otherwise raise a spurious W7004)."""
-    for raw in (source or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue                      # blank line — keep scanning the header
-        m = _PRAGMA_RE.match(line)
-        if m:
-            return f"{m.group(1)}.{m.group(2)}"
-        if line.startswith("//"):
-            continue                      # an ordinary leading line comment — keep scanning
-        break                             # first real code (or a block comment): no pragma
-    return None
+    ignored (it would otherwise raise a spurious W7004).
+
+    LANG-L1: the scan itself now lives in `tex_compiler.parser` (what `Parser.parse` calls
+    to set `Program.language`); this delegates so there is exactly one implementation. Kept
+    here, rather than moved outright, because `check()` needs the pragma before a parse is
+    even attempted (a lexer/parser error must not suppress the W7004 advisory below), and
+    because this name is documented public API a host may already import from `tex_api`."""
+    from .tex_compiler.parser import language_pragma as _parser_language_pragma
+    return _parser_language_pragma(source)
 
 
 def _ver_tuple(v):
