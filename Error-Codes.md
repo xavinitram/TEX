@@ -18,6 +18,8 @@ Tokenization errors — a character or literal the scanner can't read (bad numbe
 
 Lexer. See the message shown with the code for the specific cause and fix; the class is described above.
 
+**Reachable only through the API-level AST, not from TEX source.** the `code=` default of `LexerError.__init__`; every call site in the tree passes an explicit `code=`, so nothing constructs the default.
+
 ### E1001
 
 Lexer. See the message shown with the code for the specific cause and fix; the class is described above.
@@ -102,6 +104,8 @@ Type errors — an operation on the wrong type (vec/scalar/matrix/string/array m
 
 Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
 
+**Reachable only through the API-level AST, not from TEX source.** the `code=` default of `TypeCheckError.__init__`; every call site in the tree passes an explicit `code=`, so nothing constructs the default.
+
 ### E3001
 
 Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
@@ -137,6 +141,8 @@ Type checker. See the message shown with the code for the specific cause and fix
 ### E3100
 
 Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
+
+**Reachable only through the API-level AST, not from TEX source.** "unknown type name" — a declared type is grammar-gated to the parser's type keywords, and every one of those keywords is a key of the type-name table, so parsed source can never reach the unknown-type branch.
 
 ### E3101
 
@@ -225,6 +231,8 @@ Type checker. See the message shown with the code for the specific cause and fix
 ### E3900
 
 Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
+
+**Reachable only through the API-level AST, not from TEX source.** "array literal outside a declaration" — `{...}` is parsed only as an array declaration's initializer, so parsed source can never produce a standalone array literal for this branch to see.
 
 ## Optimizer (`E4xxx`)
 

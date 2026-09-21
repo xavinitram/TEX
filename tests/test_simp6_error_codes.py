@@ -38,7 +38,9 @@ decision; the rule here is the blunt one. Its cost is that naming a code in a co
 under `tests/` retires it without testing anything. Do not.
 
 No product code is imported here: the file reads the tree as text. It needs no host, no
-CUDA and no compiler.
+CUDA and no compiler. (SIMP-7's drift check imports `tools/gen_error_codes.py` — the docs
+generator, excluded from "product" by `_NOT_PRODUCT` below same as every other file under
+`tools/` — so this still holds; it needs no host, no CUDA and no compiler either.)
 """
 import ast
 import collections
@@ -203,21 +205,22 @@ _UNTESTED_AT_PIN = frozenset("""
 
 # Why each of the sixteen is still here, so the next reader does not re-derive it:
 #
-# * `E1000` / `E3000` are the `code=` DEFAULT of `LexerError` / `TypeCheckError`. No call
-#   site omits `code=`, so nothing in the product constructs either. A test could only
-#   build the exception itself, which would test the test.
-# * `E3100` ("unknown type name") cannot fire from source: a declared type must be a type
-#   KEYWORD, and every keyword is a key of `TYPE_NAME_MAP`. The guard covers a caller that
-#   builds the AST directly.
-# * `E3900` ("an array literal outside a declaration") likewise: `{...}` is parsed only as
-#   a declaration's initializer, so the expression handler has no path from source.
+# * `E1000` / `E3000` / `E3100` / `E3900` cannot fire from parsed TEX source at all — the
+#   first two are `code=` DEFAULTs no call site omits, the other two are branches the
+#   parser structurally never feeds. SIMP-7 gave that fact ONE home rather than a second
+#   copy here: `tools/gen_error_codes.py::_UNREACHABLE_FROM_SOURCE` states the reason for
+#   each and the generator renders it onto the code's row on the page. This file only
+#   checks the two facts still agree (below) — see that dict for the current reasons rather
+#   than re-deriving or re-typing them here, where a future edit to one copy could leave
+#   the other stale.
 # * `E6xxx` are the interpreter's. They need an EXECUTION — a compiled program and real
 #   tensors — not a `check` or a `compile`, and most of them are defensive branches the
 #   type checker forecloses before the interpreter is reached.
 # * `E9001` comes from a fused tool's preflight, which needs a host's tool manifest.
 #
-# Four of those are worth an issue rather than a test: a documented code the product
-# cannot emit is a promise to a host that nothing keeps.
+# The first four are worth marking on the page rather than testing: a documented code the
+# product cannot emit is a promise to a host that nothing keeps, and marking it does not
+# move this pin — it stays untested, honestly.
 
 
 def test_simp6_untested_error_codes_only_go_down(r: SubTestResult):
@@ -257,6 +260,39 @@ def test_simp6_untested_error_codes_only_go_down(r: SubTestResult):
 
     r.ok(f"{len(untested)} of {len(product)} error codes have no test naming them, exactly "
          f"the pinned backlog: {' '.join(untested)}")
+
+
+def test_simp7_unreachable_codes_stay_in_the_untested_backlog(r: SubTestResult):
+    """SIMP-7: the generated page marks some codes reachable only through the API-level
+    AST, never from TEX source — `tools/gen_error_codes.py::_UNREACHABLE_FROM_SOURCE` is
+    the ONE place that set and its reasons are declared. This test asserts against that
+    set rather than carrying a second copy of it, so the two facts — "unreachable" and
+    "untested" — cannot silently disagree: a code that is truly unreachable from source can
+    never have a test triggering it, so it must always be inside the pinned backlog above.
+    """
+    import sys as _sys
+    if _PKG_DIR not in _sys.path:
+        _sys.path.insert(0, _PKG_DIR)
+    try:
+        from tools import gen_error_codes as gen
+    except Exception as e:
+        r.fail("SIMP-7 import generator", f"{type(e).__name__}: {e}")
+        return
+
+    unreachable = set(gen._UNREACHABLE_FROM_SOURCE)
+    drifted = sorted(unreachable - _UNTESTED_AT_PIN)
+    if drifted:
+        r.fail(
+            "SIMP-7 unreachable-code drift",
+            f"{drifted} are marked unreachable-from-source on the generated page "
+            f"(tools/gen_error_codes.py::_UNREACHABLE_FROM_SOURCE) but are not in "
+            f"_UNTESTED_AT_PIN above. A code cannot be both unreachable-from-source and "
+            f"tested; whichever fact is stale, fix it there — not by adding a second list "
+            f"here.")
+        return
+
+    r.ok(f"{len(unreachable)} code(s) marked unreachable-from-source on the generated "
+         f"page ({' '.join(sorted(unreachable))}) are all inside the untested backlog")
 
 
 # ── 2. Families ───────────────────────────────────────────────────────

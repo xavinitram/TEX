@@ -9,6 +9,10 @@ Before v0.19 that page did not exist, so every error linked to a 404. This harve
 complete, never-404 reference. Run: python tools/gen_error_codes.py [--check].
 
 The companion drift test (test_v019_docs) asserts every source code has a heading here.
+
+SIMP-7: a handful of documented codes are `code=` defaults or dead branches that parsed TEX
+source cannot reach (`_UNREACHABLE_FROM_SOURCE` below); their row says so rather than
+promising a trigger nothing can supply.
 """
 import os
 import re
@@ -54,6 +58,27 @@ _FAMILIES = [
      "never from the editor's live lint."),
 ]
 
+# SIMP-7: codes this page documents that parsed TEX source structurally cannot raise — each
+# is reachable only by constructing the AST directly at the API level (a tool that builds
+# nodes without going through the parser), never by a program a user writes. This is the ONE
+# place the fact is declared; `tests/test_simp6_error_codes.py` asserts against this dict
+# rather than carrying its own copy of it, so the reason and the reachability claim cannot
+# drift into two different answers. Marking a code here does not test it and must not move
+# `tests/test_simp6_error_codes.py::_UNTESTED_PIN` — it only makes an honest promise about
+# what the page's row means, for a reader who cannot build one to check.
+_UNREACHABLE_FROM_SOURCE = {
+    "E1000": "the `code=` default of `LexerError.__init__`; every call site in the tree "
+             "passes an explicit `code=`, so nothing constructs the default.",
+    "E3000": "the `code=` default of `TypeCheckError.__init__`; every call site in the tree "
+             "passes an explicit `code=`, so nothing constructs the default.",
+    "E3100": "\"unknown type name\" — a declared type is grammar-gated to the parser's type "
+             "keywords, and every one of those keywords is a key of the type-name table, so "
+             "parsed source can never reach the unknown-type branch.",
+    "E3900": "\"array literal outside a declaration\" — `{...}` is parsed only as an array "
+             "declaration's initializer, so parsed source can never produce a standalone "
+             "array literal for this branch to see.",
+}
+
 
 def harvest_codes():
     """Return the sorted set of ENNNN/WNNNN codes used across the source (excluding tests)."""
@@ -98,6 +123,11 @@ def render(codes):
             out.append("")
             out.append(f"{name}. See the message shown with the code for the specific cause "
                        "and fix; the class is described above.")
+            unreachable = _UNREACHABLE_FROM_SOURCE.get(c)
+            if unreachable:
+                out.append("")
+                out.append("**Reachable only through the API-level AST, not from TEX "
+                           f"source.** {unreachable}")
             out.append("")
     return "\n".join(out).rstrip() + "\n"
 
