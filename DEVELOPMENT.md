@@ -994,10 +994,19 @@ Settled calls, kept here so they're not re-derived:
   exceeds host RAM. See `docs/compressed-cache-tiers.md` §4.
 - **Inferring a colour-vs-data plane role from pixels** (v0.33 PREC-1) — rejected on S-5. The
   roadmap's shape is "colour planes half / data planes fp32", and TEX cannot tell them apart:
-  DATA-1's vocabulary has no role field and named planes are DATA-6 (v0.37). Sniffing content to
+  DATA-1's vocabulary has no role field. Sniffing content to
   guess is exactly the silent auto-tuning the discipline forbids. Shipped instead: an explicit
-  `storage="fp32"` pin, and an *exact* value-range gate — both failing toward fp32. When DATA-6
-  lands, `choose_storage` grows a role arm and no caller changes.
+  `storage="fp32"` pin, and an *exact* value-range gate — both failing toward fp32.
+  **The old gate here named DATA-6 and was wrong: DATA-6 shipped at v0.37.0 and a plane still
+  carries no role** (PREC-2, 2026-09-21). A plane's descriptor holds a storage dtype and a
+  colour-*transfer* curve hint, and that hint is the file container's convention rather than the
+  layer's semantics — `tex_io.exr.read_layers` tags every decoded plane `linear` whether it holds
+  diffuse colour or depth. The planes design proposes no role field, including in its own
+  not-decided section, and a plane's NAME is a host-chosen string with no engine vocabulary, so
+  keying on it would be a naming-convention guess as unreviewable as pixel-sniffing and wrong in
+  the direction that silently reduces precision on data. *Real reopen condition:* an explicit,
+  host-supplied role that is never inferred — from pixels or from names. See
+  `docs/preview-tier-precision.md` §4 for the argument.
 - **Doc 41 §2.4's three CACHE-7/9 hardening items** (v0.33) — DEFERRED, not built, recorded the
   same day per §10.6. Each has a measured trigger already on record, which is what makes the
   deferral checkable rather than open-ended:
