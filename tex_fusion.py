@@ -454,6 +454,10 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
     # for an extra export.
     produced: dict[tuple, tuple[str, Any]] = {}
     tap_exports: list[tuple[int, str]] = []  # (stage_idx, handoff_local) for @_tap_s{i}
+    # LANG-L3: every stage's declared `//!tex` language level (LANG-L1's `Program.language`,
+    # set at the SAME `_parse` below), tracked so a mixed chain can be refused at the point
+    # where each stage is still its own Program — see the check inside the loop.
+    chain_language = None
 
     for i, st in enumerate(stages):
         prefix = f"_s{i}_"
@@ -493,6 +497,29 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
             checker.check(prog)
         except raw_compile_errors() as e:
             raise compile_error_from(e, st["code"]) from e
+
+        # LANG-L3: every stage of a fused chain must target the SAME `//!tex` language
+        # level. The splice below builds ONE Program with ONE `.language`; fusing stages
+        # that disagree would have to pick one stage's pragma and silently discard the
+        # rest — the same silent-wrong shape this codebase declines rather than resolves
+        # (docs/masked-control-flow.md §3's refusal precedent for the analogous function-
+        # scope case: refuse the unrepresentable program, don't guess an answer for it).
+        # `None` (no pragma) is its own value here, exactly as everywhere
+        # else `Program.language` is compared — a chain of all-`None` stages agrees
+        # trivially, which is every fused chain shipped today (no shipped program carries
+        # a `0.25`+ pragma — docs/masked-control-flow.md §2), so this refusal is invisible
+        # on that population (invariant 7).
+        if i == 0:
+            chain_language = prog.language
+        elif prog.language != chain_language:
+            def _lang_name(v):
+                return repr(v) if v else "none (no //!tex pragma)"
+            raise FusionError(
+                f"stage {i} targets TEX language {_lang_name(prog.language)}, but an "
+                f"earlier stage targets {_lang_name(chain_language)}. Every stage of a "
+                f"fused chain must declare the same //!tex language level (or none), so "
+                f"the fused program has one unambiguous rule set. Break the chain at that "
+                f"node, or make every stage's pragma agree.")
 
         # Which of this stage's assigned bindings are exported downstream.
         # Non-terminal: @OUT always (the primary handoff) + any declared extras
@@ -618,7 +645,10 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
                        "slots; dropped %d tap(s) beyond MAX_OUTPUTS=%d.",
                        _dropped, _MAX_FUSED_OUTPUTS)
 
-    fused = A.Program(statements=fused_stmts)
+    # LANG-L3: every stage agreed on `chain_language` above (or the loop already raised),
+    # so the fused program carries that ONE value — the fused chain is a single Program and
+    # `Program.language` is a per-Program fact, not a per-stage one.
+    fused = A.Program(statements=fused_stmts, language=chain_language)
     # The WHOLE merged map, params included — this feeds the TypeChecker (via compile_ast), not
     # the chain's identity. Identity is `_fused_memo_key`, which does the ANIM-1 filtering.
     #
@@ -638,6 +668,10 @@ def compile_fused(stages: list[dict], infer_binding_type: Callable[[Any], Any]):
         from .tex_cache import get_cache
         fused, type_map, refs, asg, params, used_builtins = get_cache().compile_ast(
             fused, binding_types, source="<fused chain>")
+        # `compile_ast` re-typechecks and optimizes, which may hand back a Program the
+        # optimizer rebuilt rather than the one instance passed in — re-stamp rather than
+        # trust an unrelated field survived a pipeline this lane does not own.
+        fused.language = chain_language
     except (TypeCheckError, TEXMultiError) as e:
         # A fused chain that doesn't type-check as one program is unfusable — surface it as a
         # clean FusionError (the node's contract) instead of an uncaught crash. TEXMultiError

@@ -407,6 +407,8 @@ class _ControlFlowLint:
         self.A = A
         self.source = source
         self.footmap = tex_roi._footmap()
+        self._tex_roi = tex_roi   # LANG-L3: reuse tex_roi's own scatter-target unwrap below
+                                   # rather than re-deriving it (one definition, not two).
         self.fns = {}
         for n in self._walk(program):
             if type(n) is A.FunctionDef:
@@ -421,6 +423,11 @@ class _ControlFlowLint:
         self.params_vary = {name: set() for name in self.fns}   # fed a varying argument
         self.ret_vary = {name: False for name in self.fns}      # varies with uniform arguments
         self.gathers = {name: False for name in self.fns}       # the body holds a gather
+        # LANG-L3 (M4/M6): has ANY call site to this function been seen under a per-pixel
+        # `if`? Over-approximated per FUNCTION, not per call site -- the same granularity
+        # `ret_vary`/`gathers` already use for this class of question. Grows monotonically
+        # (like them), so folding it into `_facts()` below is enough to fixed-point it.
+        self.pp_called = {name: False for name in self.fns}
         self.all_vary = set()                                   # free names a body may inherit
         self.all_defined = set()
         # TRK-25: which nodes made the program REGION-DEPENDENT, recorded on every pass (the
@@ -429,6 +436,20 @@ class _ControlFlowLint:
         self.varying_loops = set()      # id(ForLoop/WhileLoop) — clauses (a) and (b)
         self.string_ifs = set()         # id(IfElse / TernaryOp) — clause (c)
         self.scalar_casts = set()       # id(CastExpr / FunctionCall) — TRK-32 clause (d)
+        # LANG-L3: the flow-plan sites `flow_plan()` reports (docs/masked-control-flow.md
+        # §8's L3 row), computed on this SAME walk rather than a second one -- a caller that
+        # only wants `region_clauses()` or `run()`'s diagnostics simply leaves these unread.
+        self.transfer_sites = set()       # id(BreakStmt/ContinueStmt/ReturnStmt) under a
+                                          # per-pixel `if` (M1/M4)
+        self.scatter_sites = set()        # id(Assignment) — a computed-coordinate write
+                                          # (`@T[x,y] op= v`) under one (M5)
+        self.probe_sites = set()          # id(FunctionCall) — `debug_print` under one (M7)
+        self.binding_write_sites = set()  # id(Assignment) — a plain `@binding` write inside a
+                                          # CALLED function, under one (M6)
+        self.sync_points = set()          # id(ForLoop/WhileLoop) needing a per-pass live check
+                                          # under masking: its own condition is per-pixel (==
+                                          # varying_loops), or it directly encloses a transfer
+                                          # gated by one (R-BREAK/R-CONT's shape)
         self.emit = False
         self.diags = {}
         self.budget = 200_000 + 200 * sum(1 for _ in self._walk(program))
@@ -680,58 +701,89 @@ class _ControlFlowLint:
 
     def _facts(self):
         return (tuple(sorted((k, tuple(sorted(v))) for k, v in self.params_vary.items())),
-                tuple(sorted(self.ret_vary.items())), len(self.all_vary), len(self.all_defined))
+                tuple(sorted(self.ret_vary.items())), len(self.all_vary), len(self.all_defined),
+                tuple(sorted(self.pp_called.items())))
 
     def _pass(self):
-        self._block(self.main, _CFState(), _CFScope(True), None, False, False)
+        self._in_function = False
+        self._block(self.main, _CFState(), _CFScope(True), None, False, False, False, None)
         for name, fd in self.fns.items():
             params = {p for _t, p in fd.params}
             inherited = self.all_vary - params
             defined = self.all_defined | params
+            # M4/M6: a call inherits the caller's live mask, over-approximated per function
+            # (as True the moment ANY call site has been seen under a per-pixel `if`) rather
+            # than per call site — the same whole-function granularity `ret_vary` already
+            # uses for "what does this function do".
+            self._in_function = True
+            called_pp = self.pp_called[name]
             # What the result does with uniform arguments (per call site, a varying argument
             # is added on top) — no emission, no call-site recording.
             emit, self.emit = self.emit, False
             scope = _CFScope(False)
-            self._block(fd.body, _CFState(inherited, defined), scope, None, False, False)
+            self._block(fd.body, _CFState(inherited, defined), scope, None, False, False,
+                        called_pp, None)
             self.emit = emit
             if scope.returns_vary:
                 self.ret_vary[name] = True
             # The body as its call sites actually feed it: this is the pass that warns.
             self._block(fd.body, _CFState(inherited | self.params_vary[name], defined),
-                        _CFScope(True), None, False, False)
+                        _CFScope(True), None, False, False, called_pp, None)
+        self._in_function = False
 
-    def _block(self, stmts, st, scope, loop, pp_loop, pp_fn):
+    def _block(self, stmts, st, scope, loop, pp_loop, pp_fn, pp=False, loop_node=None):
         for s in stmts:
-            st = self._stmt(s, st, scope, loop, pp_loop, pp_fn)
+            st = self._stmt(s, st, scope, loop, pp_loop, pp_fn, pp, loop_node)
         return st
 
-    def _stmt(self, s, st, scope, loop, pp_loop, pp_fn):
+    def _stmt(self, s, st, scope, loop, pp_loop, pp_fn, pp=False, loop_node=None):
         A = self.A
         self._tick()
         cls = type(s)
         if cls is A.VarDecl or cls is A.ArrayDecl:
             init = s.initializer
-            v = init is not None and self._expr(init, st, scope)
+            v = init is not None and self._expr(init, st, scope, pp)
             self._set(st, s.name, v, strong=True)
         elif cls is A.Assignment:
-            v = self._expr(s.value, st, scope)
+            v = self._expr(s.value, st, scope, pp)
             t = s.target
             if type(t) is A.Identifier:
                 self._set(st, t.name, v, strong=s.op is None)
             elif type(t) is A.ChannelAccess and type(t.object) is A.Identifier:
                 self._set(st, t.object.name, v, strong=False)
             elif type(t) is A.ArrayIndexAccess and type(t.array) is A.Identifier:
-                v = self._expr(t.index, st, scope) or v
+                v = self._expr(t.index, st, scope, pp) or v
                 self._set(st, t.array.name, v, strong=False)
             elif type(t) is A.BindingIndexAccess:
                 for a in t.args:
-                    self._expr(a, st, scope)
+                    self._expr(a, st, scope, pp)
+            # LANG-L3 M5/M6: a write to an `@binding`, under a per-pixel condition.
+            # `_scatter_target_base` (reused from `tex_roi`, not re-derived) finds a
+            # COMPUTED-COORDINATE target (`@T[x,y]=`/`@T(u,v)=`, however wrapped in a
+            # channel/array-index suffix) — that is M5's scatter, gated by SOURCE regardless
+            # of whether it sits in a function. Anything else that bottoms out at a plain
+            # `@binding` (a bare BindingRef, through any ChannelAccess wrapper — `@OUT.r=`)
+            # is M6's plain binding write, which only needs recording here INSIDE a called
+            # function — a top-level plain `@` write under a per-pixel `if` is already
+            # handled by the engine's ordinary per-pixel-if write masking (M1) once that
+            # lands, so M6 is specifically the merge gap `collect_assigned_vars` leaves by
+            # not descending into calls.
+            if pp:
+                scatter_base = self._tex_roi._scatter_target_base(t)
+                if scatter_base is not None:
+                    self.scatter_sites.add(id(s))
+                elif self._in_function:
+                    tt = t
+                    while type(tt) is A.ChannelAccess:
+                        tt = tt.object
+                    if type(tt) is A.BindingRef and tt.kind == "wire":
+                        self.binding_write_sites.add(id(s))
         elif cls is A.ExprStatement:
-            self._expr(s.expr, st, scope)
+            self._expr(s.expr, st, scope, pp)
         elif cls is A.IfElse:
-            return self._if(s, st, scope, loop, pp_loop, pp_fn)
+            return self._if(s, st, scope, loop, pp_loop, pp_fn, pp, loop_node)
         elif cls is A.ForLoop or cls is A.WhileLoop:
-            return self._loop(s, st, scope, loop, pp_fn)
+            return self._loop(s, st, scope, loop, pp_fn, pp)
         elif cls is A.BreakStmt or cls is A.ContinueStmt:
             if loop is not None:
                 (loop.breaks if cls is A.BreakStmt else loop.continues).append(st.copy())
@@ -748,8 +800,16 @@ class _ControlFlowLint:
                            "Keep a per-pixel flag the loop body tests instead, e.g. "
                            "`if (found < 0 && hit) { found = i; }`, and let the loop run a "
                            "bound that is the same for every pixel (LANGUAGE.md §7.1).")
+                # LANG-L3 (M1/M3): the site itself, plus the loop it clears bits IN — a
+                # break/continue gated by a per-pixel `if` makes THAT loop's own live mask
+                # able to narrow mid-loop even when the loop's bound is uniform (R-BREAK's
+                # and R-CONT's shape), so it needs the same per-pass live check as a loop
+                # whose bound is itself per-pixel (`varying_loops`).
+                self.transfer_sites.add(id(s))
+                if loop_node is not None:
+                    self.sync_points.add(id(loop_node))
         elif cls is A.ReturnStmt:
-            if s.value is not None and self._expr(s.value, st, scope):
+            if s.value is not None and self._expr(s.value, st, scope, pp):
                 scope.returns_vary = True
             if pp_fn:
                 self._warn("W7007", s,
@@ -759,8 +819,9 @@ class _ControlFlowLint:
                            "the `return`, whatever the condition says.",
                            "Assign the result to a local inside the `if` and return it once at "
                            "the end, or select with `cond ? a : b` (LANGUAGE.md §7.1).")
+                self.transfer_sites.add(id(s))
         elif cls is A.ParamDecl and s.default_expr is not None:
-            self._expr(s.default_expr, st, scope)
+            self._expr(s.default_expr, st, scope, pp)
         return st
 
     def _set(self, st, name, varies, strong):
@@ -772,7 +833,7 @@ class _ControlFlowLint:
         st.defined.add(name)
         self.all_defined.add(name)
 
-    def _expr(self, expr, st, scope) -> bool:
+    def _expr(self, expr, st, scope, pp=False) -> bool:
         """Scan an expression — W7006 on a per-pixel `?:` holding a gather, and the call-site
         facts for user functions — and return whether its value can differ per pixel."""
         A = self.A
@@ -781,6 +842,15 @@ class _ControlFlowLint:
             n = stack.pop()
             self._tick()
             cls = type(n)
+            if pp and cls is A.FunctionCall:
+                # LANG-L3 M7/M4: independent of the elif chain below (which decides whether
+                # THIS call feeds `params_vary` / falls to `_scalar_cast_varies`) — a call can
+                # be a probe, feed a user function's pp_called, AND be one of those, all at
+                # once, and none of them should suppress another.
+                if n.name == "debug_print":
+                    self.probe_sites.add(id(n))
+                if n.name in self.fns:
+                    self.pp_called[n.name] = True
             if cls is A.TernaryOp:
                 if self.emit and self._varies(n.condition, st) and (
                         self._has_gather(n.true_expr) or self._has_gather(n.false_expr)):
@@ -836,9 +906,9 @@ class _ControlFlowLint:
             stack.extend(A.iter_child_nodes(n))
         return self._varies(expr, st)
 
-    def _if(self, s, st, scope, loop, pp_loop, pp_fn):
+    def _if(self, s, st, scope, loop, pp_loop, pp_fn, pp=False, loop_node=None):
         from .tex_compiler.ast_nodes import collect_assigned_vars
-        per_pixel = self._expr(s.condition, st, scope)
+        per_pixel = self._expr(s.condition, st, scope, pp)
         if per_pixel and self.emit and (any(self._has_gather(x) for x in s.then_body)
                                         or any(self._has_gather(x) for x in s.else_body)):
             self._warn("W7006", s,
@@ -850,8 +920,14 @@ class _ControlFlowLint:
                        "value that is the same for every pixel: a parameter, a literal, "
                        "`iw`/`ih` or a loop counter (LANGUAGE.md §7.1).")
         inner_loop, inner_fn = pp_loop or per_pixel, pp_fn or per_pixel
-        then_st = self._block(s.then_body, st.copy(), scope, loop, inner_loop, inner_fn)
-        else_st = (self._block(s.else_body, st.copy(), scope, loop, inner_loop, inner_fn)
+        # LANG-L3 (M2): unlike `pp_loop` (loop-scoped — reset by `_loop` for its OWN body),
+        # `pp` never resets on the way down: an `@`/scatter/probe under a per-pixel `if`
+        # stays under it however many loops or nested `if`s sit between them.
+        inner_pp = pp or per_pixel
+        then_st = self._block(s.then_body, st.copy(), scope, loop, inner_loop, inner_fn,
+                              inner_pp, loop_node)
+        else_st = (self._block(s.else_body, st.copy(), scope, loop, inner_loop, inner_fn,
+                               inner_pp, loop_node)
                    if s.else_body else st.copy())
         out = then_st.copy()
         out.join(else_st)
@@ -881,21 +957,25 @@ class _ControlFlowLint:
                            "in a number instead (LANGUAGE.md §7.1).")
         return out
 
-    def _loop(self, s, st, scope, outer_loop, pp_fn):
+    def _loop(self, s, st, scope, outer_loop, pp_fn, pp=False):
         A = self.A
         is_for = type(s) is A.ForLoop
         if is_for and s.init is not None:
-            st = self._stmt(s.init, st, scope, outer_loop, False, pp_fn)
+            st = self._stmt(s.init, st, scope, outer_loop, False, pp_fn, pp, None)
         head = st
         while True:                               # the head state, to a fixed point
             frame = _CFLoop()
             if s.condition is not None:
-                self._expr(s.condition, head, scope)
-            body = self._block(s.body, head.copy(), scope, frame, False, pp_fn)
+                self._expr(s.condition, head, scope, pp)
+            # LANG-L3: `s` itself is THIS loop's `loop_node` for everything inside its own
+            # body — a break/continue in here narrows THIS loop's live mask (sync_points),
+            # never an outer one (that is exactly why `pp_loop` also resets to False here,
+            # unchanged from before this lane).
+            body = self._block(s.body, head.copy(), scope, frame, False, pp_fn, pp, s)
             for c in frame.continues:
                 body.join(c)
             if is_for and s.update is not None:
-                body = self._stmt(s.update, body, scope, frame, False, pp_fn)
+                body = self._stmt(s.update, body, scope, frame, False, pp_fn, pp, s)
             nxt = head.copy()
             nxt.join(body)
             if nxt.same(head):
@@ -928,6 +1008,120 @@ class _ControlFlowLint:
         for b in frame.breaks:
             out.join(b)
         return out
+
+
+# ── LANG-L3: the shared structural flow-plan walk ─────────────────────────────
+#
+# `docs/masked-control-flow.md` §8's L3 row: "the shared structural walk that flags
+# per-pixel loops, transfer-bearing regions, scatter/probe/binding-write sites under a
+# per-pixel `if`, and the sync points." Later stages (L4's interpreter masking, L5's
+# codegen mirror, L6's graph-capture/ROI consumers) all consult ONE `FlowPlan` rather than
+# each re-deriving "is this per-pixel" — the same discipline `tex_roi.region_dependent`
+# already documents for W7007/W7008 ("a second definition of 'per-pixel' would drift
+# against it"), extended to a second question asked of the identical walk.
+#
+# UNCONDITIONAL by design — NOT gated on `Program.language` or `LANGUAGE_VERSION`. The
+# sites named are a structural fact about the program; a caller combines this plan with
+# the language gate (`Program.language`, and — once `LANGUAGE_VERSION` reaches `0.25` —
+# `tex_roi._language_tuple`) to decide whether to actually mask. Gating the WALK itself on
+# the pragma would make `flow_plan` permanently empty for every program until `LANGUAGE_
+# VERSION` bumps at L7 — including the very repro programs L4/L5 need it to name sites for
+# while they are still being built, before that bump exists.
+@dataclass(frozen=True)
+class FlowPlan:
+    """Every site a masking implementation (L4/L5) or a masking-aware consumer (L6) needs
+    to know about, computed ONCE per program by `_ControlFlowLint`'s existing per-pixel
+    walk. Nothing here masks anything — the plan only NAMES sites; L4/L5 decide what to do
+    with them.
+
+    Every field except `complete` is a frozenset of `id()` of an AST node — the same
+    identity-keyed spelling `region_dependent`'s `varying_loops`/`string_ifs`/`scalar_casts`
+    already use, so a caller holding the Program can look a site up by walking it once
+    (`ast_nodes.iter_child_nodes`) and testing `id(node) in plan.<field>`. Because the ids
+    are the program's OWN node identities, a plan is only meaningful against the EXACT
+    `Program` instance `flow_plan()` was called with — never against a re-parse of the
+    same source, whose nodes get fresh ids.
+
+      * `per_pixel_loops`   — a `for`/`while` whose condition can differ per pixel (M3;
+                              IDENTICAL to `region_dependent`'s clauses (a)/(b) — the same
+                              set, not a second definition. R-BOUND / R-WBOUND).
+      * `transfer_sites`    — a `break`/`continue`/`return` under a per-pixel `if` (M1/M4;
+                              R-BREAK / R-CONT / R-RET).
+      * `scatter_sites`     — a computed-coordinate write (`@T[x,y] op= v` / `@T(u,v) op= v`,
+                              however wrapped in a channel/array-index suffix) under a
+                              per-pixel `if` (M5), gated by SOURCE.
+      * `probe_sites`       — a `debug_print(...)` call under a per-pixel `if` (M7).
+      * `binding_write_sites` — a plain `@binding = v` write (not a scatter) inside a
+                              user-defined function, under a per-pixel `if` — either
+                              directly in that function's own body, or because the function
+                              is called from one anywhere in the program (M6; the latter is
+                              over-approximated per FUNCTION, not per call site — the same
+                              granularity `ret_vary`/`gathers` already use for this class).
+      * `sync_points`       — a `for`/`while` that needs a per-pass live-mask check under
+                              masking: its own condition is per-pixel (⊇ `per_pixel_loops`),
+                              or it directly encloses a `break`/`continue` gated by a
+                              per-pixel `if` (so the loop's OWN live mask can narrow
+                              mid-loop even though its bound is uniform — R-BREAK/R-CONT's
+                              shape).
+      * `complete`          — False when the walk could not finish (the work budget was
+                              exceeded, or it raised) — the FAIL-CLOSED half of "over-
+                              approximate by name, not by value": a caller that sees
+                              `complete=False` cannot say WHERE the sites are, so it must
+                              treat the program as needing masking everywhere, never as
+                              needing none. `is_empty()` enforces this — it is never True
+                              on an incomplete walk, even when every set above is empty."""
+    per_pixel_loops: frozenset = frozenset()
+    transfer_sites: frozenset = frozenset()
+    scatter_sites: frozenset = frozenset()
+    probe_sites: frozenset = frozenset()
+    binding_write_sites: frozenset = frozenset()
+    sync_points: frozenset = frozenset()
+    complete: bool = True
+
+    def is_empty(self) -> bool:
+        """No masking-relevant site anywhere, AND the walk that says so finished normally.
+        A non-empty plan on a program that does not need masking would make a later stage
+        decline or mask work that is fine today (docs/masked-control-flow.md §8) — the
+        reason every set above is a NAME-level over-approximation, never a guess."""
+        return self.complete and not (self.per_pixel_loops or self.transfer_sites
+                                       or self.scatter_sites or self.probe_sites
+                                       or self.binding_write_sites or self.sync_points)
+
+
+_INCOMPLETE_FLOW_PLAN = FlowPlan(complete=False)
+
+
+def flow_plan(program, binding_types: dict | None = None) -> FlowPlan:
+    """LANG-L3: the structural per-pixel-control-flow sites `FlowPlan` describes, for
+    `program`. Pure and total — an exception or a blown work budget answers the
+    INCOMPLETE plan (`complete=False`), never the empty one; see `FlowPlan.complete`.
+
+    `binding_types` is the cook's `{name: TEXType}` map, exactly as `region_dependent`
+    takes it — optional, and a STRING-typed `@` wire is the one thing that changes a
+    verdict here (a string can never be "per-pixel" in the numeric sense this walk tests).
+
+    One walk, reused rather than duplicated: this constructs the SAME `_ControlFlowLint`
+    `region_dependent` already trusts for W7007/W7008 and runs its identical fixed-point
+    loop, so `per_pixel_loops` here is `region_dependent`'s `varying_loops` by
+    construction, not a second computation that could drift from it."""
+    try:
+        lint = _ControlFlowLint(
+            program, "", binding_types if isinstance(binding_types, dict) else {})
+        while True:
+            before = lint._facts()
+            lint._pass()
+            if lint._facts() == before:
+                break
+    except Exception:
+        return _INCOMPLETE_FLOW_PLAN
+    return FlowPlan(
+        per_pixel_loops=frozenset(lint.varying_loops),
+        transfer_sites=frozenset(lint.transfer_sites),
+        scatter_sites=frozenset(lint.scatter_sites),
+        probe_sites=frozenset(lint.probe_sites),
+        binding_write_sites=frozenset(lint.binding_write_sites),
+        sync_points=frozenset(lint.sync_points | lint.varying_loops),
+    )
 
 
 def _is_string_type(t) -> bool:

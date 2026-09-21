@@ -682,7 +682,7 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   unmeasured (`tex_doctor.py:284-310`, `tex_cli.py:303-318`) — Tier 2, its own row below.
 - `tex_fusion.collapse_linear(stages)` rewrites a DAG-shaped fused region to the legacy linear shape
   when the region genuinely is one, or returns `None` rather than force a mis-wired collapse
-  (`tex_fusion.py:970-990`); `tex_checkpoint.gate_refusal(...)` is the structured reason — a stable
+  (`tex_fusion.py:1018-1038`); `tex_checkpoint.gate_refusal(...)` is the structured reason — a stable
   code, the offending stage, a human message — that a checkpointed cook ran whole instead of
   incrementally (`tex_checkpoint.py:487-500`). Neither is a row below; both are `tex_fusion`
   internals, Tier 3, by the catch-all's own example. `tex_roi.region_advisory(...)` (CACHE-10,
