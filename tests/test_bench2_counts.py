@@ -266,16 +266,107 @@ _NODE_SCRUB = {
 }
 
 
+_CHECKPOINT_SERVE = {
+    # BENCH-4. `docs/host-path-counts.md` §3 named this gap: no scenario drove
+    # `tex_checkpoint.cook_checkpointed`, the CACHE-7 checkpoint-serve path a second
+    # embedding host's router sends its commonest interactive edit to. This scenario settles
+    # a PROF-1 cost table on its own two-stage chain (a heavy triple-blur, then the ONE stage
+    # a slider drags), materializes the one checkpoint that chain can ever have, then drives
+    # steady ticks that edit the terminal stage and call the checkpointed cook for real —
+    # the planner runs every tick, off the now-frozen table, rather than a hand-fed `cuts=`.
+    "tex_checkpoint.cook_checkpointed": 1,  # THE row this scenario exists for: one served
+                                     # cook per tick. 0 on every other scenario in this file —
+                                     # none of them ever build a ResultCache-backed linear
+                                     # chain with a settled cost table.
+    "tex_engine.boundary_lineage_key": 1,   # one probe. A two-stage chain has exactly one
+                                     # possible cut, which is therefore also the DEEPEST, so
+                                     # `cook_checkpointed`'s deepest-first loop hits on the
+                                     # FIRST probe every tick — never more than one per
+                                     # planned cut, and this chain plans exactly one.
+    "lazy_required_bindings":  1,   # the host's OWN planner calling the analysis DIRECTLY,
+                                     # never through `prepare()` — a second, independent door
+                                     # onto this tier besides `node_scrub`'s
+                                     # `forgive_dead_refs` one. A 0 here would mean the
+                                     # planner stopped asking; a value > 1 would mean it
+                                     # asks more than once per tick for no new information.
+    "ResultCache.get":          1,  # one boundary read, and it HITS — `materialize()` ran in
+                                     # `build()`, outside the counted region, so a steady tick
+                                     # is a served checkpoint, never a first-cook fallback.
+    "ResultCache.put":          0,  # the checkpoint was materialized ONCE, before any tick
+                                     # was counted; a non-zero here means a tick re-harvested
+                                     # a boundary it already has.
+    "TEXCache.compile_ast":     0,  # ANIM-1: the terminal stage's $knob is a cook-time
+                                     # binding, never a recompile.
+    "TEXCache.compile_tex":     1,  # one cached-compile lookup for the served suffix (the
+                                     # terminal stage alone — the blur is never re-cooked).
+    "TEXCache.fingerprint":     1,
+    "TypeChecker.check":        0,
+    "TypeChecker.check_collect": 0,
+    "Lexer.tokenize":           0,  # the suffix's program was already compiled during
+    "Parser.parse":             0,  # `build()`'s settling loop; a steady tick re-reads
+                                     # nothing.
+    "tex_engine.cook":          0,  # `cook_checkpointed` never calls `tex_engine.cook` /
+    "tex_engine.prepare":       0,  # `.prepare` / `.run` — it dispatches straight to
+    "tex_engine.run":           0,  # `cook_stage_list`'s interpreter, same as `node_scrub`'s
+                                     # `execute` does NOT (contrast `_NODE_SCRUB`'s prepare=1/
+                                     # run=1): this is a THIRD shape, not a repeat of the
+                                     # second.
+    "tex_roi._fold_program":    0,  # no ROI tier at all: `cook_checkpointed` takes no window,
+    "tex_roi.roi_plan":         0,  # by construction — it always cooks the whole (served)
+    "tex_roi.chain_windows":    0,  # frame. The comp's ROI/results-cache tier the first seven
+                                     # scenarios exercise is simply absent from this path.
+    "tex_memory.run_roi":       0,
+    "Interpreter._exec_stmt":   1,  # the terminal stage's one statement — the served suffix
+                                     # is that stage ALONE, never the blur (see the class
+                                     # docstring's deepest-first argument).
+}
+
+
 def test_bench2_interactive_per_tick_counts(r: SubTestResult):
-    """The gate: the device-independent per-tick counts of the six interactive paths."""
+    """The gate: the device-independent per-tick counts of the seven interactive paths."""
     print("\n--- BENCH-2: per-tick structural counts (CPU, PROF-1 disarmed) ---")
     for label, pins in (("terminal", _TERMINAL), ("midgraph", _MIDGRAPH), ("pan", _PAN),
                         ("all_dirty", _ALL_DIRTY), ("lint", _LINT),
-                        ("node_scrub", _NODE_SCRUB)):
+                        ("node_scrub", _NODE_SCRUB),
+                        ("checkpoint_serve", _CHECKPOINT_SERVE)):
         try:
             _check(r, label, _api_counts(label), pins)
         except Exception as e:
             r.fail(f"BENCH-2 {label}", f"{type(e).__name__}: {e}")
+
+
+def test_bench4_checkpoint_serve_settles_in_147_cooks(r: SubTestResult):
+    """BENCH-4's precondition, pinned rather than assumed.
+
+    `plan_checkpoints` returns `[]` (cook exactly as today) until PROF-1 has
+    `tex_checkpoint.MIN_SAMPLES` (12) samples of a key, and the sampling rule is every cook of
+    an UNSEEN key for the first `_WARMUP_SAMPLES` (3), then one in `_SAMPLE_EVERY` (16) after
+    that — `tex_runtime/profile.py`'s own private schedule. Reaching 12 costs
+    `3 + (12 - 3) * 16` = **147** cooks, and this is that arithmetic's canary: it moves the
+    moment any of the three private constants above move, which is the point — a sampling-
+    schedule change is real news for a host whose router waits on this table (see
+    `docs/host-path-counts.md` §6 item 4's PROF-1 note), not a silent drift this file should
+    absorb. `CheckpointServeScenario.build()` measures the real count rather than asserting it
+    (`self.cooks_to_settle`); this test reads the same number back."""
+    print("\n--- BENCH-4: the checkpoint-serve cost table settles in 147 cooks ---")
+    b = _bench()
+    cls = next(c for c in b.SCENARIOS if c.name == "checkpoint_serve")
+    scn = cls(RES, WINDOW, "cpu", ticks=TICKS)
+    try:
+        b.pass_api(scn, TICKS)
+        warm, cuts = scn.cooks_to_settle, scn.cuts_planned
+    finally:
+        scn.teardown()
+    if warm != 147:
+        r.fail("BENCH-4 settling cost", f"cooks_to_settle: 147 -> {warm} — PROF-1's warmup/"
+               f"sample-every/MIN_SAMPLES schedule moved; re-derive the arithmetic in this "
+               f"test's docstring and explain the move in CHANGELOG.md")
+    elif cuts != [1]:
+        r.fail("BENCH-4 cut plan", f"cuts_planned: [1] -> {cuts} — the two-stage chain's "
+               f"margin over the materialization floor (see the scenario's class docstring) "
+               f"did not hold on this box")
+    else:
+        r.ok(f"checkpoint_serve: settled in {warm} cooks, cuts={cuts}")
 
 
 def test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r: SubTestResult):
@@ -289,7 +380,8 @@ def test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r: SubTestResult
     The row is zero on CPU too — nothing calls it — so the assertion is portable; the CUDA
     reading that gives it teeth is in the CUDA test below."""
     print("\n--- BENCH-2: zero engine-side CUDA syncs per interactive tick ---")
-    for label in ("terminal", "midgraph", "pan", "all_dirty", "node_scrub"):
+    for label in ("terminal", "midgraph", "pan", "all_dirty", "node_scrub",
+                 "checkpoint_serve"):
         try:
             got = _api_counts(label)
             lo, hi = got.get("torch.cuda.synchronize[engine]", (None, None))
@@ -318,6 +410,10 @@ _CUDA_PINS = {
     "midgraph":         (74,       0,            56),   # PERF-2 re-pin (was 2 — the two
     "pan":              (26,       0,            22),   #   `gauss_blur` stages reading their
     "all_dirty":        (112,      0,            86),   #   sigma back; was 3 with `glow`).
+    # BENCH-4: measured identically at this shape (1024^2/512^2) and at the gate shape
+    # (96^2/48^2) — the served suffix is the terminal stage alone, resolution-independent in
+    # KIND if not in exact device work, and both shapes agreed on this box.
+    "checkpoint_serve": (6,        0,            4),
 }
 # WHY THE D2H COLUMN IS NOW ZERO EVERYWHERE, AND WHAT WOULD MAKE IT NON-ZERO AGAIN.
 # `gauss_blur` needs a Python number for its kernel radius and used to get it with

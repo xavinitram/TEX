@@ -242,6 +242,12 @@ SPY_TARGETS: "dict[str, tuple[str, ...]]" = {
     "lazy_required_bindings":     ("TEX_Wrangle.tex_lazy.lazy_required_bindings",),
     "Interpreter._exec_stmt":     ("TEX_Wrangle.tex_runtime.interpreter.Interpreter._exec_stmt",),
     "profile.record":             ("TEX_Wrangle.tex_runtime.profile.record",),
+    # BENCH-4: the checkpoint-serve tier, which only `checkpoint_serve` enters. Neither the
+    # seven comp scenarios nor `node_scrub` ever reach `tex_checkpoint` — the comp has no
+    # `ResultCache`-backed linear chain to checkpoint and the node's own chain is never
+    # multi-tap — so both rows read 0 everywhere else in this file.
+    "tex_checkpoint.cook_checkpointed": ("TEX_Wrangle.tex_checkpoint.cook_checkpointed",),
+    "tex_engine.boundary_lineage_key":  ("TEX_Wrangle.tex_engine.boundary_lineage_key",),
 
     # ── the per-cook FIXED pipeline, and the memo keys that make a scrub re-parse ──────
     # Not part of the gate: these are the rows a follow-up would move, each named in
@@ -930,9 +936,173 @@ class NodeScrubScenario(Scenario):
         node.execute(**dict(base, in_0=self._a, in_1=self._b, in_2=2.0))
 
 
+class CheckpointServeScenario(Scenario):
+    """BENCH-4 — the ninth scenario, and the gap `docs/host-path-counts.md` §3 named and left
+    unbuilt: a checkpoint-SERVE tick on `tex_checkpoint.cook_checkpointed`.
+
+    A second embedding host reports (2026-09-21) that on its tree this is the INTERACTIVE
+    path, not the render path: its router sends the commonest interactive edit — a linear
+    fused chain with a SETTLED cost table and a NON-EMPTY cut plan, asking for no window —
+    to `cook_checkpointed` for the whole frame. That route also takes one
+    `boundary_lineage_key` probe per planned cut, and calls the lazy-binding analysis
+    DIRECTLY from its own planner rather than through `prepare()` — a second, independent
+    door onto the lazy tier, beside the `forgive_dead_refs` one `node_scrub` already covers.
+
+    None of the eight scenarios above can reach `cook_checkpointed`: it needs a `ResultCache`,
+    a LINEAR stage list and a SETTLED PROF-1 table, and neither the ROI/results-cache comp nor
+    the ComfyUI node supplies any of the three. So this scenario builds its own tiny fixture —
+    a two-stage chain, a triple-blur then the one stage a slider actually drags — and does the
+    two things a host must do before a tick can ever reach the served path, both OUTSIDE the
+    counted region (in `build()`, exactly where `PrewarmScenario`'s cold state and every other
+    scenario's `prime()` already sit — see `Scenario._seq`'s note on why a build never pollutes
+    a tick):
+
+      1. SETTLE the cost table. `plan_checkpoints` returns `[]` — cook exactly as today — until
+         PROF-1 has `MIN_SAMPLES` (12) samples of this key, and the sampling rule is every cook
+         of an unseen key for the first `_WARMUP_SAMPLES` (3), then one in `_SAMPLE_EVERY` (16):
+         reaching 12 costs `3 + (12 - 3) * 16` = **147 cooks**, measured here rather than
+         assumed (`self.cooks_to_settle`, and `--selftest`-shaped: a scenario that settled by
+         assumption would silently pin the UNSETTLED shape the moment the sampling rule moved).
+      2. MATERIALIZE the plan once (phase 2), so every steady tick is a genuine cache HIT and
+         not a first-cook fallback — `cook_checkpointed` degrades to a whole-chain
+         `cook_stage_list` on a miss, and a scenario that measured the fallback would be pinning
+         that shape under a checkpoint's name.
+
+    PROF-1 is armed ONLY for the settling loop and disarmed again before the first counted
+    tick (`self._profile.disable()` in `build()`), so a steady tick here costs no engine-side
+    `torch.cuda.synchronize` — same contract every other interactive scenario in this file
+    holds, and `tests/test_bench2_counts.py` pins it the same way.
+
+    Each tick edits the terminal stage's `$knob` — the slider a user actually drags — calls
+    the lazy-binding analysis DIRECTLY (never through `prepare()`), then calls
+    `cook_checkpointed` with `cuts=None`, so the placement planner runs for real every tick,
+    reading the now-frozen table rather than a hand-fed answer. A two-stage chain has exactly
+    ONE possible cut (`k=1`, between the blur and the terminal stage), which is therefore also
+    its DEEPEST — so `cook_checkpointed`'s deepest-first probe hits on the FIRST
+    `boundary_lineage_key` call: one probe, one cache read, one cheap suffix cook of the single
+    terminal stage, never the blur.
+
+    THE THRESHOLD (`_THRESHOLD_MS`) is deliberately far below the blur's own cost, so which
+    side of the boundary wins is decided by the MATERIALIZATION FLOOR
+    (`tex_checkpoint.put_cost_ms(...) * _FLOOR_FACTOR`), never by a knife-edge comparison
+    between two similar numbers. Measured at this file's gate shape (96^2, CPU, three
+    independent settlings): stage 0 costs 0.37-0.46 ms against a 0.0785 ms floor — a >=4.6x
+    margin, which is what makes `cuts == [1]` reproduce identically run after run. That margin
+    is NOT claimed at every shape: a from-scratch CPU run at 1024^2 puts the same floor at
+    ~8.9 ms, inside the blur's own run-to-run noise there (measured 7.6-11.5 ms over three
+    settlings) — so this scenario is driven ONLY at the gate shape and the CUDA report shape
+    (96^2 and 1024^2 both margin >=2.7x on the CUDA leg), never at a CPU 1024^2 shape, and nothing
+    in this file pins one.
+    """
+    name = "checkpoint_serve"
+    needs_comp = False
+
+    #: Three chained blurs, not one: comfortably clear of the materialization floor at every
+    #: shape this file measures (see the class docstring's margin numbers). A single blur's
+    #: margin at 96^2 was only ~1.6-2.7x — closer to the noise floor than this file's other
+    #: pins, all of which are pure call-count structure and pay no such margin at all.
+    _BLUR_CODE = "@OUT = gauss_blur(gauss_blur(gauss_blur(@IN, 8.0), 8.0), 8.0);"
+    _EDITED_CODE = "@OUT = vec4(@IN.rgb * $knob, 1.0);"
+    #: Far below every measured stage-0 cost in the class docstring's margin table. Kept
+    #: explicit — never the GOV-1 default (`tex_checkpoint.default_threshold_ms`) — so this
+    #: scenario's plan cannot move because an earlier test in the same process changed the
+    #: active memory profile; the MATERIALIZATION FLOOR is what actually gates the cut at
+    #: every shape this file drives (see `put_cost_ms`).
+    _THRESHOLD_MS = 0.05
+    #: CACHE-1's content-sensitive source identity. A fixed string is fine: this scenario never
+    #: swaps the source tensor underneath a served boundary.
+    _UPSTREAM = ("bench4-checkpoint-src-v1",)
+    #: `tex_checkpoint.MIN_SAMPLES` plus generous slack, so a sampling-rule change that pushes
+    #: the settling point out (rather than removing it) fails LOUD in `build()` instead of
+    #: silently pinning the unsettled shape.
+    _MAX_WARMUP_COOKS = 400
+
+    def _stages(self, src, knob):
+        """The two-stage linear chain: `chain_input` spelling (CACHE-6's linear shape), never
+        the `chain_inputs` DAG one `gate_refusal` requires `collapse_linear` for first."""
+        return [{"code": self._BLUR_CODE, "chain_input": None, "bindings": {"IN": src}},
+                {"code": self._EDITED_CODE, "chain_input": "IN", "bindings": {"knob": knob}}]
+
+    def build(self):
+        from TEX_Wrangle import tex_checkpoint, tex_engine, tex_results
+        from TEX_Wrangle.tex_runtime import profile as _profile
+        self._checkpoint, self._engine, self._profile = tex_checkpoint, tex_engine, _profile
+        dev = "cuda" if (self.device == "cuda" and torch.cuda.is_available()) else "cpu"
+        torch.manual_seed(11)
+        src = torch.rand(1, self.res, self.res, 3, device=dev)
+        cache = tex_results.ResultCache()
+        # Salted so pass B (frames) and pass C (cuda) each settle their OWN bucket rather than
+        # inheriting pass A's — the exact global-memo trap `Scenario._seq`'s docstring names.
+        pkey = _profile.make_key(f"bench4-checkpoint-serve-{self._salt}-{self.epoch}",
+                                 dev, "fp32")
+        spatial = (1, self.res, self.res)
+        _profile.reset()
+        _profile.enable()
+        warm = 0
+        try:
+            while warm < self._MAX_WARMUP_COOKS and not _profile.settled(
+                    pkey, spatial, need=tex_checkpoint.MIN_SAMPLES):
+                with _profile.measure(pkey, spatial, device=dev, stages=True):
+                    tex_engine.cook_stage_list(
+                        self._stages(src, 0.5 + (warm % 17) * 0.01),
+                        device=dev, precision="fp32")
+                warm += 1
+        finally:
+            _profile.disable()          # OFF before the first counted tick — see the docstring
+        self.cooks_to_settle = warm
+        costs, is_settled = _profile.stage_snapshot(pkey, spatial, need=tex_checkpoint.MIN_SAMPLES)
+        cuts = tex_checkpoint.plan_checkpoints(
+            self._stages(src, 0.5), costs=costs, threshold_ms=self._THRESHOLD_MS,
+            px=self.res * self.res, settled=is_settled, device=dev)
+        if not cuts:
+            # The scenario's whole premise is a NON-EMPTY plan (§3's gap is specifically about
+            # the checkpointed cook being reached). Failing loud here, rather than silently
+            # falling through to a whole-chain cook, is what makes an unmet margin a build
+            # error instead of a scenario that quietly stopped testing what it claims to.
+            raise RuntimeError(
+                f"CheckpointServeScenario: no checkpoint planned at res={self.res} device={dev} "
+                f"(costs={costs}, settled={is_settled}) — the margin the class docstring "
+                f"measures did not hold on this box/shape")
+        self.cuts_planned = cuts
+        tex_checkpoint.materialize(self._stages(src, 0.5), cache, device=dev, precision="fp32",
+                                   upstream=self._UPSTREAM, cuts=cuts)
+        return _CheckpointComp(cache=cache, pkey=pkey, spatial=spatial, device=dev, src=src)
+
+    def prime(self, comp):
+        pass                                   # `build` primes; there is no separate warm-up
+
+    def tick(self, comp, i):
+        knob = 0.5 + self._seq(i) * 1e-6        # never repeats — node_scrub's discipline
+        # The host's own planner call — DIRECT, never through `prepare()`'s
+        # `forgive_dead_refs` gate (that is node_scrub's door onto this tier; this is the
+        # OTHER one, per the class docstring).
+        from TEX_Wrangle import tex_lazy
+        tex_lazy.lazy_required_bindings(self._EDITED_CODE, {"knob": knob})
+        stages = self._stages(comp.src, knob)
+        self._checkpoint.cook_checkpointed(
+            stages, comp.cache, device=comp.device, precision="fp32",
+            upstream=self._UPSTREAM, cuts=None, threshold_ms=self._THRESHOLD_MS,
+            profile_key=comp.pkey, spatial=comp.spatial)
+
+
+class _CheckpointComp:
+    """The tiny fixture `CheckpointServeScenario.build()` hands to `tick()` — not a `RoiComp`,
+    because the comp's ten-stage ROI/results-cache pattern has no checkpoint concept at all
+    (BENCH-4's whole reason for existing is that none of the other scenarios can reach this
+    tier). Deliberately not a dict: `comp.cache.stats()` is read by nothing here, but keeping
+    the same attribute-access shape as `RoiComp` is what lets `_cache_entries` in this file
+    stay one function instead of branching on scenario type."""
+
+    __slots__ = ("cache", "pkey", "spatial", "device", "src")
+
+    def __init__(self, cache, pkey, spatial, device, src):
+        self.cache, self.pkey, self.spatial = cache, pkey, spatial
+        self.device, self.src = device, src
+
+
 SCENARIOS = (PrewarmScenario, SourceEditScenario, TerminalKnobScenario,
              MidGraphKnobScenario, PanScenario, AllDirtyScenario, LintScenario,
-             NodeScrubScenario)
+             NodeScrubScenario, CheckpointServeScenario)
 SCENARIO_NAMES = tuple(s.name for s in SCENARIOS)
 
 

@@ -67,7 +67,7 @@ ordinal (`_pan_seq`), for the same reason in the other direction: a repeated win
 hit, not a pan, and reusing pass A's positions in pass C served the coordinate tensors from the
 LAT-4 builtin LRU and reported 22 CUDA kernels for a pan tick that really costs 26.
 
-## 3. The seven scenarios, and the eighth
+## 3. The seven scenarios, the eighth, and the ninth
 
 | scenario | what a host is doing |
 |---|---|
@@ -79,6 +79,7 @@ LAT-4 builtin LRU and reported 22 CUDA kernels for a pan tick that really costs 
 | `all_dirty` | a source-side knob each tick, whole frame, so the results cache misses all ten |
 | `lint` | `tex_api.check` with a one-character edit per tick — no cook at all |
 | `node_scrub` | the ComfyUI **node**: two `check_lazy_status` rounds then `execute`, one `$param` moving |
+| `checkpoint_serve` | a checkpoint-serve tick on `tex_checkpoint.cook_checkpointed`: a linear chain with a settled cost table and a non-empty cut plan, the terminal stage's `$knob` moving, no window |
 
 **Why the eighth is not a comp scenario (BENCH-3).** The seven above drive `tex_api` /
 `tex_engine` directly, and `tex_engine.prepare` consults the lazy analysis only when its caller
@@ -115,17 +116,74 @@ of the scenario: it is the other half of what an embedding host pays, not a seco
 the half the comp already covers. `tests/test_bench2_counts.py` pins the rows above, so the
 PERF-4 class is gated from now on.
 
-**The ninth, named and not built.** No scenario here drives `tex_checkpoint.cook_checkpointed`.
-The eight above reach the ROI, node and whole-frame shapes, and the checkpointed cook is reached by
-none of them. An embedding host reports (2026-09-21) that on its tree the checkpointed cook is on
-the **interactive** path, not the render path: its router sends the commonest interactive edit — a
-linear fused chain with a settled cost table and a non-empty cut plan, asking for no window — to
-`cook_checkpointed` for the whole frame, and that route also takes one `boundary_lineage_key` probe
-per planned cut. `tex_engine.cook_fused_cached` and `cook_stage_list` sit on that host's render
-route instead. So a checkpoint-serve tick is an interactive shape this instrument cannot see, and
-saying so is the honest form: it is a gap in the harness, not a claim that the route costs nothing.
-The host that runs it has undertaken to contribute the scenario once it re-pins to a tree carrying
-the harness, on the ground that a scenario it cannot run against its own pin is a guess.
+**The ninth: a checkpoint-serve tick (BENCH-4).** `checkpoint_serve` drives
+`tex_checkpoint.cook_checkpointed` — the shape a second embedding host's router sends its
+commonest interactive edit to: a linear fused chain with a settled cost table and a non-empty
+cut plan, asking for no window, cooked for the whole frame. `tex_engine.cook_fused_cached` and
+`cook_stage_list` sit on that host's render route instead, and none of the eight scenarios above
+can reach `cook_checkpointed` at all — it needs a `ResultCache`, a linear stage list and a
+settled PROF-1 table, and neither the ROI/results-cache comp nor the ComfyUI node supplies any
+of the three.
+
+So this scenario builds its own two-stage fixture (a heavy triple-blur, then the one stage a
+slider actually drags) and pays, in `build()` and OUTSIDE the counted region, the two costs a
+host pays before a tick can ever reach the served path: **settling** the cost table — PROF-1
+samples every cook of an unseen key for its first `_WARMUP_SAMPLES` (3), then one in
+`_SAMPLE_EVERY` (16), so reaching `MIN_SAMPLES` (12) costs `3 + (12 - 3) * 16` = **147 cooks**,
+measured rather than assumed and pinned by `tests/test_bench2_counts.py::test_bench4_checkpoint_serve_settles_in_147_cooks`
+— and **materializing** the one checkpoint that a two-stage chain can ever have, once, so every
+steady tick is a genuine cache hit and not a first-cook fallback. Each tick then edits the
+terminal stage's `$knob`, calls the lazy-binding analysis **directly** — the host's own planner
+door onto that tier, independent of `node_scrub`'s `forgive_dead_refs` one — and calls
+`cook_checkpointed` with `cuts=None`, so the placement planner runs for real off the now-frozen
+table. A two-stage chain has exactly one possible cut, which is therefore also the DEEPEST, so
+the deepest-first serve loop hits on the first `boundary_lineage_key` probe every tick: one
+probe per planned cut, because this chain plans exactly one.
+
+Device-independent rows, measured at 96²/48²/4 ticks (the gate shape) and identical at
+1024²/512²/4 on the CUDA leg:
+
+| per tick, `checkpoint_serve` | | | |
+|---|---:|---|---:|
+| `tex_checkpoint.cook_checkpointed` | **1** | `tex_engine.boundary_lineage_key` | **1** |
+| `lazy_required_bindings` | **1** | `ResultCache.get` / `.put` | **1** / **0** |
+| `TEXCache.compile_tex` / `fingerprint` | **1** / **1** | `TEXCache.compile_ast` | **0** |
+| `Lexer.tokenize` / `Parser.parse` | **0** / **0** | `tex_engine.cook` / `prepare` / `run` | **0** / **0** / **0** |
+| `Interpreter._exec_stmt` | **1** | every `tex_roi` row | **0** |
+
+`Interpreter._exec_stmt` reads 1 because the served suffix is the terminal stage ALONE — the
+blur is never re-cooked on a steady tick — and `tex_engine.cook`/`prepare`/`run` all read 0
+because, like `cook_stage_list` everywhere else in this file, `cook_checkpointed` dispatches
+straight to the interpreter: a THIRD shape, neither the comp's engine-level cook nor
+`node_scrub`'s `prepare`/`run` pair. The CUDA leg (measured at both shapes) reads 6 kernel
+launches, 0 D2H memcpys and 4 allocator allocations per tick, pinned in
+`tests/test_bench2_counts.py`'s `_CUDA_PINS`.
+
+**The margin this scenario's stability rests on, named rather than assumed.** Which side of the
+placement threshold a tick lands on is a wall-clock comparison, and PROF-1's own worked example
+(`tex_checkpoint.py`) already shows a settled ranking can still invert relative op costs on a
+different box. This scenario avoids a knife-edge comparison by setting `_THRESHOLD_MS` far below
+the blur's own cost, so the **materialization floor**
+(`tex_checkpoint.put_cost_ms(...) * _FLOOR_FACTOR`) is what actually gates the cut: measured at
+the gate shape (96², CPU, three independent settlings) the blur cost 0.37-0.46 ms against a
+0.0785 ms floor, a >=4.6x margin, which is what makes `cuts == [1]` reproduce identically run
+after run. That margin is **not** claimed at every shape — a from-scratch CPU run at 1024² puts
+the same floor at ~8.9 ms, inside the blur's own run-to-run noise there (7.6-11.5 ms over three
+settlings) — so this scenario is driven only at the gate shape and the CUDA report shape, and
+nothing in this file pins a CPU-1024² reading of it.
+
+**A bare `--compare` against a pre-BENCH-4 baseline returns rc 1, and that is not a bug to
+fix.** Verified the same way BENCH-3 verified `node_scrub`'s addition (§5): the eight scenarios
+above read identically before and after, filtered with `--scenario` to exclude the ninth. Run
+WITHOUT that filter — the default, every scenario — against a baseline saved before this
+lane, `checkpoint_serve`'s nine non-zero API rows arrive as `appeared` and the verdict counts
+them, same as any other genuinely new structural row would. A `--counts-baseline` taken before
+this landed is therefore stale for a bare compare the moment this scenario exists; re-save it at
+the gate shape (§5's command) to pick up the ninth, or pass `--scenario` naming only the
+scenarios the stored baseline actually has. Neither is new machinery — it is the same discipline
+§5 already names for a scenario addition — but the failure mode (a landing-blocking red for a
+change that regressed nothing) is real enough that whoever next takes `--counts-baseline`
+against an older file should read this paragraph before trusting the exit code.
 
 ## 4. The per-tick signature at head
 
