@@ -257,7 +257,7 @@ _OVER_HARD_BASELINE = frozenset({
 # pre-specified CACHE-1 key-minting cut (`tex_results_keys.py`) then took it from 1944 to
 # 1815, so its floor goes 1958 -> 1887 — the same 72-line margin this module's own NEG-1
 # precedent chose, kept rather than re-picked, so the register's margins stay comparable
-# across modules instead of drifting per lane. 143 lines of room again, not 14.
+# across modules instead of drifting per lane. 72 lines of room again, not 14.
 _HEADROOM_FLOOR = {"tex_engine.py": 1400, "tex_results.py": 1887}
 
 
