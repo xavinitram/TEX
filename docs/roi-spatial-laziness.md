@@ -293,6 +293,27 @@ launch-bound and codegen only adds per-cook env/dispatch work. It therefore ship
 `TEX_ROI_CODEGEN=0`. Re-measure on a box with different launch/kernel economics before
 flipping; the switch exists so that needs no code change.
 
+**Re-measured, 2026-09-21, and the answer is the same: it stays off.** The condition above has
+been satisfiable since the sm_75 figures were taken, and nobody had run it. Four interleaved
+sittings on a quiet **sm_120** box (RTX 5070 Ti Laptop, Blackwell — a genuinely different launch
+economy), each leg in its own cache directory with the first discarded, and a split-half null
+control per flag per shape:
+
+| shape | interp / codegen | null spread | reading |
+|---|---|---|---|
+| 256²-of-1024², the original shape | 0.963–0.978× | 0.3–2.1 % | codegen ~3 % **slower**, the same direction and magnitude as sm_75 |
+| 1024²-of-2048² | 1.010–1.012× | 0.1–0.8 % | codegen ~1 % faster — a real crossover sm_75 did not show, and outside the null, but a rounding error |
+
+So the realistic viewport-scrub shape agrees across two architectures, and the one shape that
+crosses over does so by an amount not worth a default change. **The decision now rests on two
+boxes rather than one**, which is the useful outcome: this stops being an open reopen condition
+and becomes a settled no, revisited only if the crossover grows on a third architecture.
+
+*One finding the re-measurement turned up:* **no committed script reproduces the original
+0.94–0.96×.** Only the prose survives in three documents. The figure was almost certainly real —
+this run agrees with it — but it was not reproducible from the tree, which is the thing the three
+measurement rules in `docs/brief-conventions.md` exist to prevent.
+
 The ROI-5 reopen items, named here so they are not re-derived:
 
 - **Correctness/coverage extensions**: compiled-tier ROI (ROI-bucketed graph/compile keys so
