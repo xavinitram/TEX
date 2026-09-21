@@ -326,18 +326,40 @@ _EARLY_EXIT_CONDS = ["@A.r > 2.0", "@B.r > 2.0", "u > 2.0", "v > 2.0", "ix < 0.0
 _FUZZ_PARAM_DECL = "v3$pv = vec3(0.0, 0.0, 0.0);"
 _FUZZ_PARAM_BINDING = {"pv": [0.35, 0.6, 0.85]}
 
+# LANG-L5 (closing LANG-L4's finding `L4-F2`): a SECOND pool, whose conditions are TRUE on
+# some pixels and FALSE on others.
+#
+# Why a second pool and not a wider first one. Every entry of `_EARLY_EXIT_CONDS` above is
+# false on every pixel by design — that pool exists to reach `0.23`'s defect, where a
+# transfer under a per-pixel `if` fires region-wide whatever the condition says, and the two
+# rank defects its last four entries were written for. Widening it would change what every
+# existing TST-1 seed generates and retire that coverage silently. This pool is drawn ONLY
+# when a caller asks (`live_conds=True`), so the shipped seeds keep their meaning exactly.
+#
+# What it buys. Masked per-pixel control flow (language `0.25`) is about the case where SOME
+# pixels leave a region and others stay, and no condition in the first pool can produce it —
+# so a green run over the shipped pool proves nothing at all about masking. Measured at
+# LANG-L4's base sha and recorded there: all ten entries above are false at every pixel of
+# the fuzz grid.
+_LIVE_EARLY_EXIT_CONDS = ["@A.r > 0.5", "@B.r > 0.45", "u > 0.4", "v > 0.4",
+                          "@A.g < 0.5", "@B.g > 0.5", "(u + v) > 0.9", "@A.b > 0.35",
+                          "fi + @A.r > 0.6", "(@A.r + @B.r) > 0.8"]
 
-def _gen_early_exit(rng, i, atoms):
+
+def _gen_early_exit(rng, i, atoms, live_conds=False):
     """A bounded loop with a `break` or `continue` under a per-pixel `if`.
 
     Returns (lines, atom). Half the bodies are SCALAR-ONLY (`acc + 1.0`): a body that
     touches a binding forces codegen's tensor loop, which is exactly how the `fi` defect
     stayed invisible to the hand-written per-pixel-control-flow pin. The other half draws
     from the atom pool so the tensor-loop path is covered too.
+
+    *live_conds* draws the condition from `_LIVE_EARLY_EXIT_CONDS` instead — conditions that
+    are true on some pixels and false on others. Off by default so no shipped seed moves.
     """
     v = f"eacc{i}"
     n = rng.randint(2, 4)
-    cond = rng.choice(_EARLY_EXIT_CONDS)
+    cond = rng.choice(_LIVE_EARLY_EXIT_CONDS if live_conds else _EARLY_EXIT_CONDS)
     scalar_body = rng.random() < 0.5
     step = "1.0" if scalar_body else _gen_expr_over(rng, 1, atoms)
     if rng.random() < 0.5:
@@ -348,13 +370,18 @@ def _gen_early_exit(rng, i, atoms):
             v)
 
 
-def _gen_program(rng, depth=3):
+def _gen_program(rng, depth=3, live_conds=False):
     """A1-1: a random VALID multi-statement program — widens the fuzzer beyond a
     single float expression to the shapes that shipped real bugs green (doc 33 §5):
     user-function defs + calls (the F1 blind spot), bounded accumulator loops, and
     multi-statement locals. Type-checks by construction (all float). Depth/loop caps
     stay small so this doesn't build the near-singular towers the comparator warns
-    about (doc audit #2). Returns the program source `@OUT = vec4(...)`-terminated."""
+    about (doc audit #2). Returns the program source `@OUT = vec4(...)`-terminated.
+
+    *live_conds* is passed through to `_gen_early_exit`: it makes the generated early-exit
+    conditions vary PER PIXEL, which is the only way a generated program can exercise masked
+    control flow at all (LANG-L5). Default False, so an existing seed generates exactly the
+    program it generated before."""
     lines, atoms = [], list(_ATOMS)
     # Sub-expressions are built SHALLOWER than the single-expr baseline: the multi-
     # statement structure (locals feeding locals, fn bodies, loop accumulation) already
@@ -401,7 +428,7 @@ def _gen_program(rng, depth=3):
     # whose accumulator never reaches @OUT is dead code the tier comparison cannot see.
     exit_atoms = []
     for i in range(rng.randint(0, 2) if rng.random() < 0.4 else 0):
-        elines, eatom = _gen_early_exit(rng, i, atoms)
+        elines, eatom = _gen_early_exit(rng, i, atoms, live_conds=live_conds)
         lines.extend(elines)
         atoms.append(eatom)
         exit_atoms.append(eatom)

@@ -46,10 +46,15 @@ def materialize_codegen(blob: bytes, src: str, has_fn_calls: bool,
     calling this — marshal.loads on corrupted bytes can hard-crash the process.
     """
     import marshal
+    from . import masked_flow as _masked_flow_mod
     code_obj = marshal.loads(blob)
     filename = _cg_filename(fingerprint)
     _register_codegen_linecache(filename, src)
-    namespace: dict[str, Any] = {}
+    # LANG-L5: the same global `_CodeGen.build` seeds. A persisted `0.25` program's code
+    # object references `_MF`, so a rematerialized one must find it or the sidecar would
+    # be a NameError instead of a cook — and it must be the SAME module object, not a
+    # re-import with its own state, which the function-local import here guarantees.
+    namespace: dict[str, Any] = {"_MF": _masked_flow_mod}
     exec(code_obj, namespace)
     fn = namespace["_tex_fn"]
     fn._has_fn_calls = has_fn_calls

@@ -37,7 +37,8 @@ from . import profile as _prof                      # PROF-1 seam (pure stdlib; 
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
                      _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar)
 from . import stdlib as _stdlib_mod    # P0-D: publishes the cook grid for const-coord reads
-from .masked_flow import MaskedFlowMixin, enabled_for as _masked_flow_enabled_for
+from .masked_flow import (MaskedFlowMixin, enabled_for as _masked_flow_enabled_for,
+                          scatter_keep as _masked_flow_scatter_keep)
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
@@ -1290,10 +1291,11 @@ class Interpreter(MaskedFlowMixin):
         # collision resolves the same way on both tiers). Boolean indexing over the
         # already-flattened row-major arrays is that order by construction.
         if live is not None and live is not True:
-            keep = live if isinstance(live, torch.Tensor) else torch.tensor(bool(live))
-            keep = keep.expand(B, H, W) if keep.dim() < 3 else keep
-            keep = keep.contiguous().reshape(-1)
-            if not bool(keep.any().item()):
+            # LANG-L5: the compaction itself lives in `masked_flow.scatter_keep`, so the
+            # codegen tier's emitted scatter selects the same sources in the same order
+            # rather than in an equivalent one.
+            keep = _masked_flow_scatter_keep(live, B, H, W)
+            if keep is False:
                 return
             flat_b = flat_b[keep]
             flat_y = flat_y[keep]

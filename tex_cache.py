@@ -59,8 +59,14 @@ _AST_FILES = [_C_DIR / "ast_nodes.py", _C_DIR / "lexer.py", _C_DIR / "parser.py"
               _C_DIR / "stdlib_signatures.py"]
 # Codegen / interpreter — a change alters emitted code or interpreter semantics (the .cg).
 # CT-1: tex_fusion is here — a splicer change must invalidate fused .cg entries too.
+# LANG-L5: `masked_flow.py` and `codegen_masked.py` are here for the same reason the two
+# above them are — they are the language-0.25 halves of the interpreter's semantics and of
+# the emitter, so an edit to either changes what a flagged program computes and must not
+# leave a stale `.cg` behind. They are added now, while no program can reach them, rather
+# than at the release that makes them reachable.
 _CODEGEN_FILES = [_R_DIR / "interpreter.py", _R_DIR / "codegen.py", _R_DIR / "codegen_stdfns.py",
-                  _R_DIR / "stdlib.py", _R_DIR / "noise.py", Path(__file__).parent / "tex_fusion.py"]
+                  _R_DIR / "stdlib.py", _R_DIR / "noise.py", Path(__file__).parent / "tex_fusion.py",
+                  _R_DIR / "masked_flow.py", _R_DIR / "codegen_masked.py"]
 # Tier-policy — a change moves a measured win/lose verdict (autotier.json / warm_state.json).
 # NEW under CACHE-4: previously a compiled.py tiering change kept stale verdicts.
 _VERDICT_FILES = [_R_DIR / "precision_policy.py", _R_DIR / "autotier.py",

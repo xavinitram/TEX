@@ -494,6 +494,10 @@ _WATCHED = {
     "ast_nodes.py", "lexer.py", "parser.py", "type_checker.py", "optimizer.py",
     "stdlib_signatures.py", "interpreter.py", "codegen.py", "codegen_stdfns.py",
     "stdlib.py", "noise.py", "tex_fusion.py",
+    # LANG-L5: the language-0.25 semantics (`masked_flow.py`) and their emitter
+    # (`codegen_masked.py`). Watched from the commit that adds them rather than from the
+    # release that makes them reachable, so an edit to either cannot leave a stale `.cg`.
+    "masked_flow.py", "codegen_masked.py",
 }
 
 

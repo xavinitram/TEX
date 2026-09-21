@@ -37,12 +37,14 @@ from ..tex_compiler.ast_nodes import (
     iter_child_nodes as _ast_iter_child_nodes,
 )
 from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
+from .codegen_masked import MaskedEmitMixin
 from .codegen_stdfns import _EMIT_DISPATCH, _EmitStdFnsMixin
 from .codegen_stencil import (
     _StencilInfo, _ast_equal, _is_ident, _try_detect_stencil, _try_detect_inline_stencil, detect_stencil_route,
 )
 from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
                           _broadcast_pair, _ensure_spatial, vec_list_to_tensor)
+from . import masked_flow as _masked_flow_mod
 from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
                      _HOST_SCALAR_ATTR, _dtype_rounded, _tag_host_scalar,
                      set_cook_grid as _stdlib_set_cook_grid,
@@ -106,7 +108,8 @@ def _reads_time_builtin(program: Program) -> bool:
 
 
 def try_compile(program: Program, type_map: dict[int, TEXType],
-                fingerprint: str | None = None) -> Any | None:
+                fingerprint: str | None = None, *,
+                _masked_flow: bool | None = None) -> Any | None:
     """Try to compile a TEX program AST to a Python function.
 
     Returns a callable with signature:
@@ -135,11 +138,35 @@ def try_compile(program: Program, type_map: dict[int, TEXType],
     Lifting this means feeding the playhead as a per-replay static input buffer — the
     same mechanism the graph tier needs — and belongs with the first host that has a
     real playhead (roadmap PORT-5 / GRAPH-1), not ahead of it.
+
+    LANG-L5: *_masked_flow* is a test seam and NOT a host-facing switch — the mirror of
+    `Interpreter.execute`'s parameter of the same name, spelled the same way for the same
+    reason. `None` (every production caller) means "ask the engine's own language gate",
+    which is False for every program that can exist while `tex_api.LANGUAGE_VERSION` is
+    below `0.25`. Passing True compiles under the `0.25` rules regardless, so the two
+    tiers can be compared before the version moves (that is L7's).
     """
     try:
         if _reads_time_builtin(program):
             return None
         gen = _CodeGen(type_map)
+        # LANG-L5: the language-`0.25` gate, asked exactly the way the interpreter asks it
+        # (`masked_flow.enabled_for`), so the two tiers cannot disagree about WHETHER a
+        # program masks before they get to disagree about HOW. The fast-out is the same
+        # one and is load-bearing for invariant 7: a program with no `//!tex` pragma has
+        # `Program.language is None`, which answers the gate on an attribute read, and
+        # nothing in `codegen_masked.py` is reached — so its emitted source is byte-for-byte
+        # what this head emitted before the language work began.
+        #
+        # `enabled_for`'s second argument is the source, used ONLY as a fallback when
+        # `Program.language` is unset — and an unset field has already answered False — so
+        # passing the empty string here cannot change an answer (LANG-L1 is what makes that
+        # true: the pragma round-trips onto the field through every source->AST path).
+        if _masked_flow is None:
+            _masked_flow = (getattr(program, "language", None) is not None
+                            and _masked_flow_mod.enabled_for(program, ""))
+        if _masked_flow:
+            gen._mf_begin()
         gen.emit_program(program)
         fn = gen.build(fingerprint)
         # Attach metadata: whether the generated code has stdlib function calls.
@@ -586,7 +613,7 @@ def _extract_uv_offset_expr(expr: ASTNode, base: str) -> ASTNode | bool | None:
 
 
 
-class _CodeGen(_EmitStdFnsMixin):
+class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
     """Generates Python source code from a TEX AST."""
 
     _codegen_counter: int = 0  # class-level counter for unique (no-fingerprint) filenames
@@ -689,6 +716,15 @@ class _CodeGen(_EmitStdFnsMixin):
         self._fn_dispatch: dict[str, object] = {
             name: getattr(self, attr) for name, attr in _EMIT_DISPATCH.items()
         }
+        # LANG-L5: the language-`0.25` masking state. `_mf_on` is False for every compile
+        # the language gate does not flag — `_mf_begin` is the ONLY thing that sets it —
+        # so the three attributes below cost one `__init__` store each and change not a
+        # byte of what a program without a `0.25` pragma emits. `_mf_depth` is the region
+        # depth of the statement being emitted and `_mf_decl_depth` the emit-time shadow
+        # of the interpreter's per-cook `_decl_depth`; see `codegen_masked.py`.
+        self._mf_on: bool = False
+        self._mf_depth: int = 0
+        self._mf_decl_depth: dict[str, int] = {}
 
     def _tmp(self) -> str:
         """Generate a unique temporary variable name."""
@@ -900,11 +936,12 @@ class _CodeGen(_EmitStdFnsMixin):
         # code runs, so emitting it at the top of the function would read the
         # binding BEFORE a preceding statement (e.g. `@A = @A * 0.5;`) mutates
         # it — silently diverging from the interpreter's textual order.
+        inline_stencils_ok = not self._mf_on
         inline_skip: set[int] = set()
         pending_stencils: dict[int, _StencilInfo] = {}
         stmts = program.statements
         idx = 0
-        while idx < len(stmts):
+        while inline_stencils_ok and idx < len(stmts):
             # Fast path: inline stencils start with VarDecl fetch taps
             if idx not in inline_skip and isinstance(stmts[idx], VarDecl):
                 inline = _try_detect_inline_stencil(stmts, idx)
@@ -974,7 +1011,12 @@ class _CodeGen(_EmitStdFnsMixin):
         else:
             _CodeGen._codegen_counter += 1
             filename = f"<tex_codegen_{_CodeGen._codegen_counter}>"
-        namespace: dict[str, Any] = {}
+        # LANG-L5: `_MF` is the masked-flow helper module, reachable as a GLOBAL of the
+        # generated module rather than as a parameter. A parameter would have moved the
+        # `_tex_fn` signature, which is a line of emitted source in EVERY program — the one
+        # thing the invariant-7 digest acceptance forbids. Seeding it unconditionally costs
+        # one dict store per build and is never looked up by a program that does not mask.
+        namespace: dict[str, Any] = {"_MF": _masked_flow_mod}
         code_obj = compile(func_src, filename, "exec")
         _register_codegen_linecache(filename, func_src)
         exec(code_obj, namespace)
@@ -1302,9 +1344,26 @@ class _CodeGen(_EmitStdFnsMixin):
         px, py = arg_exprs[0], arg_exprs[1]
         has_frame = len(arg_exprs) == 3
 
-        # Get or create output buffer
-        self._emit(f"if {name!r} not in _bind or not _torch.is_tensor(_bind[{name!r}]):")
+        # Get or create output buffer.
+        #
+        # LANG-L5: the masked tier widens a buffer that is a tensor of RANK < 3 as well,
+        # which is `Interpreter._exec_scatter_write`'s own `needs_new_buf` condition. The
+        # `0.23` emission below asks only whether a tensor is there, so `@S = 0.0;` followed
+        # by `@S[x, y] += v;` reaches `_sb.shape[2]` on a 0-dim buffer and raises a raw
+        # IndexError where the interpreter returns a picture. That is a pre-existing
+        # interp/codegen divergence, reproduced at this lane's base sha with no language
+        # feature involved, and it is filed rather than fixed here: widening the `0.23`
+        # guard would move the emitted bytes of every scattering program, which is exactly
+        # what this lane's digest acceptance forbids. See `bug_reports/pending/lang-l5.md`.
+        if self._mf_on:
+            need_buf = (f"{name!r} not in _bind or not _torch.is_tensor(_bind[{name!r}]) "
+                        f"or _bind[{name!r}].dim() < 3")
+        else:
+            need_buf = f"{name!r} not in _bind or not _torch.is_tensor(_bind[{name!r}])"
+        self._emit(f"if {need_buf}:")
         self._indent += 1
+        if self._mf_on:
+            self._emit(f"_sold = _bind.get({name!r})")
         self._emit(f"_sv = {value_expr}")
         self._emit(f"_sc = _sv.shape[-1] if _torch.is_tensor(_sv) and _sv.dim() >= 1 and _sv.shape[-1] in (2,3,4) else 1")
         self._emit(f"if _sp:")
@@ -1315,6 +1374,10 @@ class _CodeGen(_EmitStdFnsMixin):
         self._indent += 1
         self._emit(f"_bind[{name!r}] = _torch.zeros(1, 1, 1, _sc, dtype=_torch.float32, device=_dev) if _sc > 1 else _torch.zeros(1, 1, 1, dtype=_torch.float32, device=_dev)")
         self._indent -= 1
+        if self._mf_on:
+            # The interpreter preserves the old value into the widened buffer
+            # (`new_buf[...] = buf`); so does this.
+            self._emit(f"if _torch.is_tensor(_sold): _bind[{name!r}][...] = _sold")
         self._emit(f"_scat_owned.add({name!r})")  # freshly allocated → owned
         self._indent -= 1
         self._emit(f"else:")
@@ -1358,6 +1421,26 @@ class _CodeGen(_EmitStdFnsMixin):
         self._emit(f"_fv = _sval.reshape(-1) if _torch.is_tensor(_sval) and _sval.dim() > 0 else _sval")
         self._indent -= 1
 
+        # LANG-L5 (M5): gate the scatter BY SOURCE — a source pixel contributes iff it is
+        # live on the path to this statement. `masked_flow.scatter_keep` is the single
+        # owner of the compaction, so both tiers select the same sources in the same
+        # row-major order and an unspecified collision resolves the same way
+        # (`docs/masked-control-flow.md` §5, divergence site 4). `None` means "nothing to
+        # compact"; `False` means no source is live, and the write is skipped entirely.
+        masked_scatter = self._mf_on
+        if masked_scatter:
+            keep = self._tmp()
+            self._emit(f"{keep} = _MF.scatter_keep(_mf.live, _sB, _sH, _sW)")
+            self._emit(f"if {keep} is not False:")
+            self._indent += 1
+            self._emit(f"if {keep} is not None:")
+            self._indent += 1
+            self._emit(f"_fb = _fb[{keep}]")
+            self._emit(f"_fy = _fy[{keep}]")
+            self._emit(f"_fx = _fx[{keep}]")
+            self._emit(f"if _torch.is_tensor(_fv) and _fv.dim() > 0: _fv = _fv[{keep}]")
+            self._indent -= 1
+
         # Apply scatter operation
         if op is None:
             self._emit(f"_sb[_fb, _fy, _fx] = _fv")
@@ -1369,6 +1452,9 @@ class _CodeGen(_EmitStdFnsMixin):
             self._emit(f"_sb[_fb, _fy, _fx] = _sb[_fb, _fy, _fx] * _fv")
         elif op == "/":
             self._emit(f"_sb[_fb, _fy, _fx] = _sb[_fb, _fy, _fx] / _tw(_fv == 0, _SAFE_EPS, _fv)")
+
+        if masked_scatter:
+            self._indent -= 1
 
     def _emit_function_def(self, stmt: FunctionDef):
         """Emit a user-defined function as a nested Python def."""
@@ -2939,6 +3025,12 @@ class _CodeGen(_EmitStdFnsMixin):
         # to the interpreter so the probe ALWAYS records, never silently no-ops.
         if name == "debug_print":
             raise _Unsupported("debug_print is interpreter-only (LX-5)")
+
+        # LANG-L5 (M4): a call with no live pixel is skipped entirely, and its ARGUMENTS
+        # with it — so the interception has to happen before the arguments below are
+        # emitted, not at the user-function branch further down.
+        if self._mf_on and name in self._user_functions:
+            return self._mf_emit_user_call(node)
 
         # Fast path: convert sample(@img, u+expr*px, v+expr*py) → direct fetch
         # Resolves through local variable definitions (e.g. off_u = float(px2) * px)

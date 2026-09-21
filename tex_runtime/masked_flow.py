@@ -39,7 +39,7 @@ from ..tex_compiler.ast_nodes import (
     ArrayIndexAccess, ParamDecl, ReturnStmt, VarDecl, WhileLoop,
 )
 
-__all__ = ["cond_mask", "enabled_for", "MaskedFlowMixin"]
+__all__ = ["cond_mask", "enabled_for", "MaskedFlowMixin", "CgFlow"]
 
 
 # ── the mask algebra ────────────────────────────────────────────────────────────
@@ -128,6 +128,214 @@ class _Frame:
         self.kind = kind
         self.dead = None
         self.ret = None
+
+
+# ── the frame algebra, shared by BOTH tiers ─────────────────────────────────────
+#
+# LANG-L5. Everything below was `MaskedFlowMixin`'s own body until codegen needed the
+# same answers. It is module-level rather than duplicated because `docs/masked-control-flow.md`
+# §5's divergence sites 2–5 are all of the form "the two tiers must do THIS one thing the
+# same way": the cheapest way to guarantee that is for there to be one piece of code, called
+# by an interpreter method and by a line of emitted source. Nothing here runs for a program
+# below `0.25` on either tier.
+
+def frames_dead(frames) -> object:
+    """Every pixel that has left a region enclosing the current statement, up to and
+    including the innermost call. Stops at the call because a callee's `return` bits belong
+    to the callee: the caller's pixels are live again the moment the call returns."""
+    dead = None
+    for f in reversed(frames):
+        if f.dead is not None:
+            dead = f.dead if dead is None else (dead | f.dead)
+        if f.kind == "call":
+            break
+    return dead
+
+
+def frames_find(frames, kind: str):
+    """The innermost frame of *kind*, never looking past a call boundary."""
+    for f in reversed(frames):
+        if f.kind == kind:
+            return f
+        if f.kind == "call" and kind != "call":
+            return None          # E3015 makes this unreachable; answer honestly anyway
+    return None
+
+
+def apply_transfer(frame, live):
+    """A `break`/`continue`/`return` taken under *live*: record the departing pixels on
+    *frame* and answer the mask the statements after it run under."""
+    frame.dead = m_or(frame.dead, live)
+    return m_sub(live, frame.dead)
+
+
+def record_return(frame, value, live):
+    """M4: record *value* for the pixels live at this `return`, and answer the mask the
+    remainder of the call body runs under.
+
+    The no-return default is built as a zero of the RETURNED VALUE's shape and dtype
+    (`zeros_like`), never a 0-dim scalar: masking needs one tensor covering every pixel, and
+    for a `vec4`-returning function a scalar zero differs in rank (`L4-F5`)."""
+    if isinstance(value, str) or not isinstance(value, torch.Tensor):
+        # M7: no per-pixel representation for a string — first writer wins, which is what
+        # `0.23` gives for the same source with a uniform condition.
+        if frame.ret is None:
+            frame.ret = value
+    elif live is True:
+        frame.ret = value
+    else:
+        from .interpreter import _tensor_where
+        base = frame.ret
+        if base is None or not isinstance(base, torch.Tensor):
+            base = torch.zeros_like(value)
+        frame.ret = _tensor_where(live, value, base)
+    return apply_transfer(frame, live)
+
+
+def merge_write(live, after, before):
+    """M1: `target := where(live, new_value, target)`.
+
+    The three early answers are not shortcuts — they are the rule. A uniformly-live region
+    writes unmasked; a name that held no tensor (a string, or a name that does not exist
+    yet) has nothing for a departed pixel to keep, so `0.23`'s write stands."""
+    if live is True:
+        return after
+    if not isinstance(before, torch.Tensor) or not isinstance(after, torch.Tensor):
+        return after
+    from .interpreter import _tensor_where
+    return _tensor_where(live, after, before)
+
+
+def scatter_keep(live, B: int, H: int, W: int):
+    """M5's source compaction, as a flat row-major boolean — the one definition of
+    `docs/masked-control-flow.md` §5's divergence site 4.
+
+    Answers `None` when there is nothing to compact (`live` is `True`/absent) and `False`
+    when no source pixel is live at all, so a caller can tell "write everything" from
+    "write nothing" without a second reading of the mask."""
+    if live is None or live is True:
+        return None
+    keep = live if isinstance(live, torch.Tensor) else torch.tensor(bool(live))
+    keep = keep.expand(B, H, W) if keep.dim() < 3 else keep
+    keep = keep.contiguous().reshape(-1)
+    if not bool(keep.any().item()):
+        return False
+    return keep
+
+
+def probe_is_live(live, x, y) -> bool:
+    """M7: does `debug_print`'s probe pixel lie in the live set?"""
+    if live is True:
+        return True
+    try:
+        xi = int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+        yi = int(y.item()) if isinstance(y, torch.Tensor) else int(y)
+        if live is False:
+            return False
+        m = live
+        if m.dim() >= 3:
+            h, w = m.shape[-2], m.shape[-1]
+            return bool(m[..., min(max(yi, 0), h - 1),
+                          min(max(xi, 0), w - 1)].reshape(-1)[0].item())
+        return bool(m.reshape(-1)[0].item())
+    except Exception:
+        return True
+
+
+# ── the codegen tier's runtime carrier ──────────────────────────────────────────
+
+class CgFlow:
+    """The mask state a codegen-emitted `0.25` program carries at run time.
+
+    The emitted source holds the region stack in ONE object rather than in emitted
+    locals, so every mask edit is a call into the functions above — the same functions
+    `MaskedFlowMixin` calls. That is what makes §5's "one shared helper, imported by both
+    tiers" true of the whole algebra and not only of the predicate: there is no second
+    spelling of `m_and`, of the loop-exit test, or of the frame walk for the two tiers to
+    drift apart on.
+
+    It exists only inside a cook of a flagged program: `codegen.try_compile` emits the
+    line that constructs it only when the language gate is open, so a program below `0.25`
+    emits byte-identical source that never mentions it."""
+
+    __slots__ = ("live", "frames")
+
+    def __init__(self):
+        self.live = True
+        self.frames = []
+
+    def push(self, kind: str) -> _Frame:
+        frame = _Frame(kind)
+        self.frames.append(frame)
+        return frame
+
+    def pop(self) -> None:
+        self.frames.pop()
+
+    def dead_now(self):
+        return frames_dead(self.frames)
+
+    def restore(self, saved) -> None:
+        """Leave a nested region: go back to *saved*, minus whatever left while inside."""
+        self.live = m_sub(saved, frames_dead(self.frames))
+
+
+def cg_break(state: CgFlow) -> None:
+    frame = frames_find(state.frames, "loop")
+    if frame is None:
+        raise RuntimeError("'break' outside a loop")
+    state.live = apply_transfer(frame, state.live)
+
+
+def cg_continue(state: CgFlow) -> None:
+    frame = frames_find(state.frames, "pass")
+    if frame is None:
+        raise RuntimeError("'continue' outside a loop")
+    state.live = apply_transfer(frame, state.live)
+
+
+def cg_return(state: CgFlow, value) -> None:
+    frame = frames_find(state.frames, "call")
+    if frame is None:
+        raise RuntimeError("'return' outside a function")
+    state.live = record_return(frame, value, state.live)
+
+
+def cg_call_result(frame: _Frame, dev):
+    """M4's answer for a call that ran: whatever the `return`s recorded, or `0.23`'s
+    default for a body that never returned on any pixel."""
+    result = frame.ret
+    if result is None:
+        result = torch.scalar_tensor(0.0, dtype=torch.float32, device=dev)
+    return result
+
+
+def cg_skip_call(dev):
+    """M4's answer for a call with NO live pixel — skipped entirely, which is what lets a
+    per-pixel recursion terminate."""
+    return torch.scalar_tensor(0.0, dtype=torch.float32, device=dev)
+
+
+def cg_merge_branch(cond_bool, box, target, keys, then_vals, else_vals) -> None:
+    """M2's merge, run by `Interpreter._merge_branch_vars` itself.
+
+    The emitted code round-trips its branch values through dicts purely so this call can
+    be the interpreter's own method rather than a second implementation of the string
+    majority vote and the `torch.where` merge. It costs two dict builds per spatial `if`,
+    on `0.25` programs only."""
+    from .interpreter import Interpreter
+    Interpreter._merge_branch_vars(cond_bool, box, target, keys, then_vals, else_vals)
+
+
+def cg_debug_print(state: CgFlow, impl):
+    """M7's probe gate for the codegen tier. Unreachable today — `codegen` refuses
+    `debug_print` outright (LX-5) so the probe always records on the interpreter — and
+    present so that the gate exists the day that refusal is lifted."""
+    def _probe(label, value, x=0.0, y=0.0):
+        if not probe_is_live(state.live, x, y):
+            return value
+        return impl(label, value, x, y)
+    return _probe
 
 
 # ── the language gate ───────────────────────────────────────────────────────────
@@ -222,30 +430,17 @@ class MaskedFlowMixin:
     # ── mask plumbing ───────────────────────────────────────────────────────
     def _mf_dead_now(self):
         """Every pixel that has left a region enclosing the current statement, up to and
-        including the innermost call. Stops at the call because a callee's `return` bits
-        belong to the callee: the caller's pixels are live again the moment the call
-        returns."""
-        dead = None
-        for f in reversed(self._frames):
-            if f.dead is not None:
-                dead = f.dead if dead is None else (dead | f.dead)
-            if f.kind == "call":
-                break
-        return dead
+        including the innermost call. See `frames_dead`, which both tiers call."""
+        return frames_dead(self._frames)
 
     def _mf_restore(self, saved):
         """Leave a nested region: go back to `saved`, minus whatever left while inside.
         Subtracting bits already absent from `saved` is a no-op, so this is correct
         however many transfers fired at whatever depth."""
-        self._live = m_sub(saved, self._mf_dead_now())
+        self._live = m_sub(saved, frames_dead(self._frames))
 
     def _mf_frame(self, kind):
-        for f in reversed(self._frames):
-            if f.kind == kind:
-                return f
-            if f.kind == "call" and kind != "call":
-                return None          # E3015 makes this unreachable; answer honestly anyway
-        return None
+        return frames_find(self._frames, kind)
 
     # ── declarations (M1's "declared inside this region") ───────────────────
     def _mf_var_decl(self, node):
@@ -314,8 +509,7 @@ class MaskedFlowMixin:
         self._exec_assignment(node)
         after = store.get(root)
         if isinstance(after, torch.Tensor):
-            from .interpreter import _tensor_where
-            store[root] = _tensor_where(live, after, before)
+            store[root] = merge_write(live, after, before)
             self._inplace_ready.discard(root)
         return None
 
@@ -512,8 +706,7 @@ class MaskedFlowMixin:
         if frame is None:
             from .interpreter import _Break
             raise _Break()
-        frame.dead = m_or(frame.dead, self._live)
-        self._live = m_sub(self._live, frame.dead)
+        self._live = apply_transfer(frame, self._live)
         return None
 
     def _mf_continue(self, node):
@@ -521,8 +714,7 @@ class MaskedFlowMixin:
         if frame is None:
             from .interpreter import _Continue
             raise _Continue()
-        frame.dead = m_or(frame.dead, self._live)
-        self._live = m_sub(self._live, frame.dead)
+        self._live = apply_transfer(frame, self._live)
         return None
 
     def _mf_return(self, node):
@@ -533,22 +725,7 @@ class MaskedFlowMixin:
         if frame is None:
             from .interpreter import _ReturnSignal
             raise _ReturnSignal(value)
-        live = self._live
-        if isinstance(value, str) or not isinstance(value, torch.Tensor):
-            # M7: no per-pixel representation for a string — first writer wins, which is
-            # what `0.23` gives for the same source with a uniform condition.
-            if frame.ret is None:
-                frame.ret = value
-        elif live is True:
-            frame.ret = value
-        else:
-            from .interpreter import _tensor_where
-            base = frame.ret
-            if base is None or not isinstance(base, torch.Tensor):
-                base = torch.zeros_like(value)
-            frame.ret = _tensor_where(live, value, base)
-        frame.dead = m_or(frame.dead, live)
-        self._live = m_sub(self._live, frame.dead)
+        self._live = record_return(frame, value, self._live)
         return None
 
     # ── M4: calls ───────────────────────────────────────────────────────────
@@ -611,22 +788,6 @@ class MaskedFlowMixin:
     # ── M7: probes ──────────────────────────────────────────────────────────
     def _mf_debug_print(self, label, value, x=0.0, y=0.0):
         """`debug_print` records only if its probe pixel is live."""
-        live = self._live
-        if live is not True:
-            try:
-                xi = int(x.item()) if isinstance(x, torch.Tensor) else int(x)
-                yi = int(y.item()) if isinstance(y, torch.Tensor) else int(y)
-                if live is False:
-                    return value
-                m = live
-                if m.dim() >= 3:
-                    h, w = m.shape[-2], m.shape[-1]
-                    ok = bool(m[..., min(max(yi, 0), h - 1),
-                                min(max(xi, 0), w - 1)].reshape(-1)[0].item())
-                else:
-                    ok = bool(m.reshape(-1)[0].item())
-            except Exception:
-                ok = True
-            if not ok:
-                return value
+        if not probe_is_live(self._live, x, y):
+            return value
         return self._get_stdlib()["debug_print"](label, value, x, y)
