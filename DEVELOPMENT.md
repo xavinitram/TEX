@@ -638,6 +638,15 @@ table, and that has to be said, not left to a `profile_key` the caller happened 
 (`tex_cookqueue.py:179-184`). One fact `close()` does NOT undo: it leaves the egress profile exactly
 where the host last set it (`tex_session.py:100-106`).
 
+**The egress profile is set once, by the host, before the first cook.** That is the normative
+shape, not merely the one the block above happens to use: the setter is process-global, so the
+profile is not per document, per thread, per cook or per output, and a host that means `engine`
+sets it during bring-up, leaves it, and — if it is a guest in a process it does not own — restores
+what it found in `close()`. A second embedding host does exactly that, passing `"engine"` and no
+other value for the life of the process. The rule has a cost behind it: TEX's own analysis memos
+are keyed on the profile (PERF-8, `tex_lazy._profile_key`), so a mid-session flip is *correct* but
+throws away the memo, and a flip between cooks is not a shape any canary covers.
+
 **The queue's token, four rules** (`docs/cook-queue-scheduling.md` §3-§6 has the argument): a
 submitted cook must take the queue's OWN token — chained with a host's own reason to abort, never
 substituted for it (`examples/host_demo.py:61-73`, `:503-507`), because that token is the only
@@ -686,7 +695,15 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   `key in cache` are non-read residency operations — a hint that reorders the eviction walk, and a
   resident-now check — and neither counts as a hit or promotes a demoted frame
   (`tex_results.py:1614-1662`). Not a row below; `touch`/`in` pin their own Tier 2 in their
-  docstrings, and `put`'s new keyword travels with them.
+  docstrings, and `put`'s new keyword travels with them. **Unruled, and narrower than what was
+  declined** (an embedding host, 2026-09-21): that host cannot move its residency hint from
+  `get(copy=False)` to `touch` as `touch` stands, because the hint's value is the **promotion**
+  `get` performs — a demoted RAM-tier frame returning to resident — and not the read. A
+  spilled-only frame it counts absent and reads nothing from, so it wants **no restore**, and
+  agrees a restore belongs behind a separately counted, named door if anyone ever asks for one.
+  Its request is reorder-plus-promote-if-demoted, with no keep-set and no pinning — strictly less
+  than the promotion-on-hint that `touch`'s docstring declines. Until it is ruled that host keeps
+  `get(copy=False)` and pays the hit that call counts.
 - A `.textool` manifest's `inputs[]` entries may carry `feeds` (routes an extra input of a fused tool
   into named stage bindings) and `optional` (host UI advice only); `promoted_params[i].metadata` may
   carry `tooltip` and `options` (a labelled-choice list) — all four validated, all four opt-in, under
@@ -721,9 +738,10 @@ breaks a host.
 | **1 — Public** | `tex_io.BufferDesc` + `tex_io.exr` / `tex_io.png` (DATA-2) | Storage dtypes; EXR is the OpenEXR format (NONE/ZIP scanline, HALF/FLOAT) — the file bytes are the standard's contract | `test_v028_phase1` |
 | **1 — Public** | `tex_session.EngineSession` / `default_session` (DATA-4) | The session handle; phase-1 `.cache`/`.registry`/`.host` view the module singletons | `test_v028_phase1` |
 | **1 — Public** | `tex_engine.freeze` / `frozen_copy` / `is_frozen` / `frame_version` / `verify_unmutated` / `to_dlpack` / `from_dlpack` — the ENG-6/ENG-12 frame-handoff and buffer-ownership contract (since ENG-14 these live in `tex_buffers` and are re-exported off `tex_engine`, which is where every consumer reads them) | Describes what these canaries ALREADY pin, and is not a promotion: the DLPack export shape (fp32, on-device, BHWC, `layout='bchw'` a zero-copy permute) and the `copy=True` ownership default | `test_v023_phase1`, `test_v025_phase1` |
+| **1 — Public** | `tex_engine.cook_fused_cached` / `cook_stage_list` and `tex_checkpoint.cook_checkpointed` / `materialize` / `boundary_lineage_key` — the CACHE-7 checkpointed and fused cook entry points a host calls directly (they carry no leading underscore, so Tier 3's catch-all never covered them and they fell through this table entirely) | Describes what these canaries ALREADY pin, and is not a promotion: the five names and their call shapes, with `boundary_lineage_key` a `get`-only probe a host may call once per planned cut. What is NOT pinned is where the planner puts the cuts — the cut CHOICE is free to change, and a host that has cached a plan re-derives it | `test_v027_phase1`, `test_v032_checkpoint`, `test_v033_phase0`, `test_v0341_audit` |
 | **2 — Semi** | `a@name` ARRAY wire + array outputs (DATA-3) | Engine-profile only; `a` is now a RESERVED binding prefix; comfy rejects array outputs (E3203 + egress guard) | `test_v028_phase1` |
 | **2 — Semi** | TEX the language | Additive; new builtin/function names are RESERVED, so adding one is a minor breaking change — note it in the CHANGELOG (v0.22 reserved `frame`/`fps`/`time`) | the compat corpus (LANG-3, planned) |
-| **2 — Semi** | Error codes (E1xxx–E6xxx) | Codes are stable; message TEXT is not | `test_c3ux_error_codes_resolve` |
+| **2 — Semi** | Error codes (E1xxx–E6xxx) | Codes are stable; message TEXT is not. **Stability is the part a host depends on** — one folds its diagnostic notifications on `(speaker, code)` — so a retired code is never reused for a different meaning, and removing one from the documented set is a minor bump that rides a tag, never a patch | `test_c3ux_error_codes_resolve` |
 | **2 — Semi** | `tex_doctor.capabilities()` row names, its 4 keys, and the `status`/`evidence` vocabularies (BRIEF-4) | A read-only per-tier capability REPORT, never a fixed ladder — values are whatever a box measures; a row/key/vocabulary rename or removal bumps `schema` | `test_dbg4_capabilities_shape` |
 | **3 — Internal** | Everything else — `tex_runtime.*`, `tex_compiler.*`, `tex_fusion` internals, `tex_engine._*`, and the underscored names of the modules split out of it (`tex_buffers._*`, `tex_tiling.*` — the cook-fit planners are all private — and `tex_chain._*`) | No promise. Import at your own risk | — |
 

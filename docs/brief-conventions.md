@@ -148,10 +148,10 @@ still unlanded a round later, because nothing collected them.
 
 ---
 
-## Two measurement rules that are not negotiable
+## Three measurement rules that are not negotiable
 
 These are not conventions — they are how a number on this box is allowed to be produced at
-all. A brief that asks for a measurement states both.
+all. A brief that asks for a measurement states all three.
 
 **Discard the first leg.** A comparison whose two legs share a compiled-artifact cache
 directory is not a comparison: the second leg reads what the first one wrote. Two separate
@@ -166,6 +166,18 @@ may be importing the very tree being measured. Lanes run in their own worktree, 
 directory a host scans, and measurements are taken from that worktree's parent so the
 package resolves to the lane's copy and not to the installed one. A timing taken from the
 installed tree is not a timing of the branch.
+
+**Name the box beside the figure, every time the figure is republished.** Not once in a
+standing caveat — beside the number, wherever the number is quoted. This rule was bought by
+getting it wrong. A hand-back to a vendoring host asserted that *every* published TEX timing
+figure came from the development laptop; that host read it against TEX's own documents, which
+label the figures it had cited as an older Turing box, and said so. Both could not be true. The
+document was wrong and the labels were right: this engine was calibrated on one card, most
+published figures are that card's, several roadmap *targets* name the later laptop, and the
+v0.38.0 sitting is the older box again. Nobody was misled, because the per-figure labels held —
+which is the whole argument for the rule. A sweeping claim about a set of figures is a claim
+about every member of the set, and it will be checked by the one reader who has the set in
+front of them. Quote the number, name its box, or do not republish it.
 
 ---
 
@@ -217,6 +229,31 @@ and the section named. Empty is a valid answer — write "none".
 ## Findings outside this ask
 Filed separately; listed here by id and one line each.
 ```
+
+## What a release note owes a vendoring host
+
+A second host vendors a pinned subset of this tree and adopts upstream work only by re-pinning
+whole commits, so it reads release notes the way a compiler reads a header. Asked what maximum
+drift it wanted, it declined to name one: not a commit count and not a minor count, because the
+number is not what makes a re-pin plannable. Four things are, and each is named **before the
+tag**, in the release entry rather than only in the diff:
+
+1. **Any newly reserved name.** Defining a function of a reserved name fails `E3011`, so
+   reserving one can break source a host already ships. A host cannot scan for a name it has
+   not been told about.
+2. **Any grammar-visible change, and any move of `LANGUAGE_VERSION`.** A host's on-disk tool
+   manifests carry the language version as a literal, and a host may hash that literal into a
+   tool's trust digest — in which case moving it re-signs every tool that host ships, and the
+   failure direction is a demoted tool rather than a stale grant.
+3. **Any default that moves**, engine-side or host-facing.
+4. **Any new module filename.** A vendoring step is typically a directory copy, so a new file
+   arrives in a host's tree whether or not that host imports it.
+
+Two rules of form travel with them. State the delta **from the host's actual pin** as well as
+from the previous release: a host several minors behind cannot compose four changelogs into an
+answer, and the composition is exactly where a reserved name gets lost. And mark anything that
+exists only at head as **head-only since vX.Y**, so a host can plan against it without mistaking
+it for something it can call at its pin.
 
 ## The brief skeleton, in one paragraph
 

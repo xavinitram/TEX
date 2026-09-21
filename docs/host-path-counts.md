@@ -85,7 +85,15 @@ LAT-4 builtin LRU and reported 22 CUDA kernels for a pan tick that really costs 
 passes `forgive_dead_refs`, which defaults to `False`. The one caller that passes it is
 `tex_node.execute` (`forgive_dead_refs=bool(slot_entries)` — the ComfyUI lazy input pool), so
 `tex_lazy.lazy_required_bindings` reads **0 per tick on all seven**, `all_dirty` included, which
-enters `prepare` ten times a tick. The first-class host's own per-tick cost was therefore
+enters `prepare` ten times a tick.
+
+**That 0 is a property of this harness, not of every host.** A second embedding host calls
+`tex_lazy.lazy_required_bindings` **directly** from its own planner, outside `prepare()`, to drop
+image bindings a program cannot read at the current parameter values (reported 2026-09-21). PERF-4's
+and PERF-8's fixes reach that host through that call, and nothing in the table below would have
+shown it. Read a 0 here as *this harness does not reach the code*, never as *no host pays for it*.
+
+The first-class host's own per-tick cost was therefore
 invisible to this instrument: PERF-4 measured a slider tick at **2 lexes and 2 parses** before
 its fix and **0** after (one lex and one parse in total, paid by the first tick), and no row
 here moved either way. `node_scrub` drives what a user's slider drives — round 1 of
@@ -106,6 +114,18 @@ results-cache tier reads 0 because ComfyUI has no viewport window to cook. That 
 of the scenario: it is the other half of what an embedding host pays, not a second reading of
 the half the comp already covers. `tests/test_bench2_counts.py` pins the rows above, so the
 PERF-4 class is gated from now on.
+
+**The ninth, named and not built.** No scenario here drives `tex_checkpoint.cook_checkpointed`.
+The eight above reach the ROI, node and whole-frame shapes, and the checkpointed cook is reached by
+none of them. An embedding host reports (2026-09-21) that on its tree the checkpointed cook is on
+the **interactive** path, not the render path: its router sends the commonest interactive edit — a
+linear fused chain with a settled cost table and a non-empty cut plan, asking for no window — to
+`cook_checkpointed` for the whole frame, and that route also takes one `boundary_lineage_key` probe
+per planned cut. `tex_engine.cook_fused_cached` and `cook_stage_list` sit on that host's render
+route instead. So a checkpoint-serve tick is an interactive shape this instrument cannot see, and
+saying so is the honest form: it is a gap in the harness, not a claim that the route costs nothing.
+The host that runs it has undertaken to contribute the scenario once it re-pins to a tree carrying
+the harness, on the ground that a scenario it cannot run against its own pin is a guess.
 
 ## 4. The per-tick signature at head
 
@@ -313,6 +333,13 @@ test before it starts, and cannot claim a win the instrument would not see.
    engine offers no "the prefix did not change" handle, which is what a follow-up would design.
    *Shows fixed as:* `tex_results.lineage_key` going **11 → 2** on `terminal`, **15 → 6** on
    `midgraph`, with `ResultCache.get/put` unchanged.
+
+   **An embedding host has confirmed the pattern and wants the handle** (2026-09-21): it carries
+   the whole-frame key forward across the clean prefix exactly as `RoiComp` does, with its own
+   refusal of the quadratic alternative measured beside it, and it asks for the counter above to
+   be the handle's acceptance test. It is a **hook, not a defect**, and it is not urgent on that
+   host's account: that host also mints one key per non-routing node over its **whole graph** every
+   tick, in addition to the chain's, which is the larger count and is its own to fix first.
 3. **`gauss_blur` reads `sigma` back with `.item()`.** **FIXED (PERF-2).** It was
    `sigma_val = max(sigma_t.item(), 0.0)` — one 4-byte D2H plus the stream synchronisation that
    copy implies, per blur stage per cook. The old comment claimed a constant sigma made it fire
@@ -342,11 +369,33 @@ test before it starts, and cannot claim a win the instrument would not see.
    *Shows fixed as:* `torch.cuda.synchronize[engine]` going **4 → 2** (or 0) on a sampled tick
    under `--prof1 on`, with `profile.record` unchanged at 1 — i.e. the same sample taken with
    fewer barriers, not fewer samples.
+
+   **This is a work item, not a curiosity: PROF-1 is ARMED in an embedding host's shipped
+   default** (reported 2026-09-21), deliberately, with the sync cost named and budgeted. That
+   host's checkpoint planner returns an empty plan forever without the per-stage breakdown, so
+   it arms the profiler at bring-up, re-arms it after a reset, and drops a stored *off* from an
+   older settings file on upgrade. Two consequences. First, *"the profiler is disarmed by
+   default"* above is **TEX's** default and not the deployed state, so the four syncs are on a
+   real interactive tick today. Second, any fix inherits a contract: the per-stage breakdown must
+   survive, and `should_sample`'s shape — every cook of an unseen key until three samples, then
+   one in sixteen — is load-bearing for that host's cost table. Changing the sampling rule is a
+   contract change that is named in a hand-back before the tag, never a tuning.
 5. **The results cache grows by one entry per cook, forever, on interactive ticks.** The
    `results_cache.entries_added` row tracks `ResultCache.put` exactly on every scenario. **Host
    policy** — a scrub visits values it will never revisit, and nothing tells the cache so.
    *Shows fixed as:* `results_cache.entries_added` going to **0** on `terminal` and `pan` while
    `ResultCache.get`'s hit behaviour on a revisited value is unchanged.
+
+   **Answered, and closed on the engine's side** (2026-09-21). An embedding host already withholds
+   every interactive write at its own door: it stamps each routing decision with a spill flag that
+   is false for the interactive quality class, and its cache arm returns early from both the write
+   and the patch, counting the withheld write. Reads stay ungated, so a scrub still hits what a
+   render or an export left behind — which is why `restores` reads 0 on this harness and is the
+   same fact seen from the other side. That host measured this cliff independently, on its own box
+   and for the same reason, and asks for **no engine change**: not a `transient=True` entry class,
+   not a host-bumped generation, because one boolean at one host-side door is already counted and a
+   second mechanism upstream would be a second place to get it wrong. So retention is **host
+   policy**; what was owed here is this paragraph, not a new row.
 
    **What it costs when the budget is reached, measured (BENCH-3, from PERF-6's F3).** The row
    reads a tidy integer the whole way down the cliff, so here is the cliff. Driven at 1024²
