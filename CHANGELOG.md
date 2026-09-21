@@ -5,6 +5,147 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+No version is cut for this work yet. Everything below is on `main` above the `v0.38.0` tag and
+carries no release date; the entries move under a version heading when one is named.
+
+### Added
+
+- **`noise_tiers_compatible(a, b)` — the tier-compositing rule as one callable (ENG-16).**
+  `CookResult.noise_tiers` records which noise tier served each key; deciding whether two such
+  records may be composited (a base cook and a region recook that straddle the one-time promotion
+  must not be mixed) was a rule each host wrote for itself. `tex_runtime.tier_trace` now answers
+  it: `True` only when both arguments are dicts and equal (both empty included), `False` for
+  `None` on either side, for a disagreeing or asymmetric label set, and for an argument that is
+  not a dict. It never raises. No `.frame` format changed, and "record unknown" still means "cook
+  whole".
+- **`tex_roi.region_advisory` — a priced verdict on the all-dirty cliff (CACHE-10).**
+  `chain_windows` already refuses an edit it cannot serve correctly; it never priced whether a
+  *servable* region recook is worth taking. The new call prices both sides from `chain_windows`'s
+  own inputs plus caller-supplied per-stage costs, and returns a `RegionAdvisory` — mirroring
+  `GateRefusal`'s stable-code shape — only when the region path is expected to lose to cooking
+  the dirty suffix whole-frame. It never changes what `chain_windows` returns, so correctness and
+  cost stay separate answers. A host with the profiler disarmed gets `None`, which is the correct
+  silence rather than a guessed verdict.
+- **`tex_doctor.mac_key_path()` — where the cache signing key lives (SEC-2).** A public,
+  read-only accessor beside `capabilities()`, returning the path or `None`. An embedding host that
+  rewrites directory permissions on the roots it owns needs the location of the key the integrity
+  check uses; it was derivable only by reading private code.
+- **A checkpoint-serve scenario for the structural counts harness (BENCH-4).** The harness drove
+  eight interactive scenarios and none of them reached the checkpointed cook path, which is where
+  one host's commonest interactive edit routes. A ninth scenario now drives a settled cost table,
+  a materialised single-cut checkpoint and a per-tick scrub of the terminal stage served from it,
+  with its device-independent and CUDA rows pinned like the rest.
+
+### Fixed
+
+- TRK-32: a per-pixel value cast straight to a string — `string(x)`, `str(x)`, or a
+  `format()` call that actually fills a `{}`/`{:spec}` placeholder — silently gave a
+  different STRING output depending on whether the cook was split into strips, an ROI
+  window, or batch strips, because the cast falls back to the MEAN of the region's pixels
+  when the value is not already uniform, and a strip's mean differs from the whole frame's.
+  `tex_roi.region_dependent` now declines all three splitters for this class, the same way
+  it already declines for a per-pixel loop bound or a per-pixel string merge. The picture
+  itself was never wrong; only a STRING output could be. `format("%f", x)` is unaffected —
+  `%f` is not a real placeholder, so the value never reached the output either way.
+- **An `@`-bound Python scalar sent every cook back to the interpreter (FIX-3, TRK-18).** A host
+  binding an `@` name to a plain Python number — a ComfyUI FLOAT/INT primitive wired into an `@`
+  slot is exactly this shape — reached the generated preamble unconverted, so the first tensor
+  method a generated expression called on it raised and the whole cook fell back to the
+  interpreter, on every device. The value is now staged into the same tagged 0-dim device tensor
+  the interpreter already hands a Python-scalar binding, at the single invocation seam every
+  codegen-derived tier shares, and only for `@` names, so a `$param` scalar's own staging is
+  untouched. ComfyUI-invisible: a real ComfyUI `@` binding already arrives as a tensor, and the
+  new step's value-only pre-check returns before touching the AST or the generated function.
+- **`fetch()`'s codegen fast path dropped the batch dimension at batch size one (FIX-4).** The
+  hoisted path reachable from inside a loop body indexed the batch axis with a bare `0`, which
+  removes that axis, where the interpreter's own `fetch` always returns `[B,H,W,C]` — so a
+  fetch-and-accumulate loop crashed inside the generated code and fell back silently, paying for
+  a wasted build. The coordinates are now expanded to the full grid before indexing and the axis
+  restored afterwards, mirroring the interpreter's own scalar-coordinate case, so every
+  combination of scalar and spatial coordinates lands on the identical rank-4 shape at every batch
+  size. A first attempt that widened the index in place fixed one shape and broke a shipped
+  example that fetches with one scalar coordinate; the shipped fix is the one that matches the
+  oracle bit-exactly in both.
+- **`examples/string_format.tex` computed six statistics and printed none of them (DOC-8).**
+  Its `format()` calls used printf-style `%s`/`%f` sequences that `format()` has never
+  filled (see the ASK-9 entry below), so the example returned its own templates unchanged on
+  every route. The six calls now use the `{}` placeholders the language actually implements,
+  so the example prints the mean luma and the min/max of luma and each colour channel it
+  computes. `tests/compat_corpus_goldens/0.23.json` and `0.24.json` correct the one entry
+  this moves (`string_format`); every other frozen hash in both files is unchanged. The fixed
+  example's five numeric `format()` calls now genuinely cast a per-region-varying value to a
+  string, so `tex_roi.region_dependent` (TRK-32) correctly declines splitting it and it
+  carries `W7008`; `tests/test_v036_region_dependence.py`'s characterization rows are updated
+  to match. `tests/perf5_goldens/fingerprints.json` and `tests/perf6_goldens/tile_plans.json`
+  are re-minted for this one program's row (the author's release decision): any user who had
+  cooked this exact example pays one recompile. ComfyUI-invisible because `format()`'s
+  signature, body and tag are untouched: the corrected example text is the only change a
+  user who opens it sees, and every other program cooks byte-identically.
+
+### Tooling and gates
+
+- **The citation checker gave opposite verdicts for one tree depending on which path named it
+  (NEG-4).** Its document set comes from git when the root it is given is that work tree's top,
+  and from a directory walk otherwise. Git resolves a directory link before it answers and the
+  tool did not, so reaching the same tree through a link disagreed with itself: the walk then read
+  whatever untracked scratch sits beside the repository as though it were a shipped document.
+  Both sides now resolve links before the comparison, and the guard still refuses a root that is
+  merely a directory inside someone else's repository — proved by a row that reaches a throwaway
+  repository through a link. The existing rows could not see the class because each resolved its
+  own root first.
+- **The shipped JavaScript's network-token ratchet counts occurrences per file, not lines
+  (NEG-5).** A minified single-line bundle makes a line count able to say only "at least one", so
+  a second call of the same shape could be added without moving the number. The family is now a
+  per-file occurrence census over a wider token vocabulary, and the existing counts are baselined
+  as what they are: handler-binding calls on DOM events and editor measure pairs, with no socket
+  semantics — the registry scanner's false positives, pinned honestly rather than argued away. A
+  new network-shaped call in a shipped `.js` file reds with its file and count.
+
+### Docs
+
+- **Four documented error codes are marked as unreachable from TEX source (SIMP-7).** `E1000`,
+  `E3000`, `E3100` and `E3900` cannot be raised by any parsed program — they are constructor
+  defaults and guards on paths only an API-level AST can reach. The generated `Error-Codes.md`
+  now says so on each of the four rows, from one declared set in the generator that the test
+  asserts against rather than duplicating, so a host cannot mistake them for the 84 codes its
+  error UI can actually observe. The codes themselves are unchanged: removing them would be a
+  documented-set change and would ride a minor bump.
+- **The plane role arm's reopen gate named an event that had already happened (PREC-2).** Three
+  copies of the same sentence promised that `choose_storage` would grow a colour-versus-data role
+  arm "when DATA-6 lands". DATA-6 landed at 0.37.0 and supplies no role: a plane's descriptor
+  carries a storage dtype and a colour-transfer curve hint, and that hint is the file container's
+  convention rather than the layer's semantics — the layer reader tags every decoded plane linear
+  whether it holds diffuse colour or depth. A plane's name is host-chosen text with no engine
+  vocabulary, so keying on it would be a naming-convention guess, wrong in the direction that
+  silently reduces precision on data. All three copies now state the real condition: an explicit,
+  host-supplied role, never inferred. The refusal is unchanged and this strengthens it.
+- **The codegen ROI route is settled on a second architecture: it stays off.** The route has
+  shipped built, correct and switched off since it measured slower on the Turing box, and its own
+  reopen condition asked for a re-measurement on a box with different launch and kernel economics.
+  Re-measured on a quiet Blackwell box, four interleaved sittings, each leg in its own cache
+  directory with the first discarded and a split-half null control per flag per shape: at the
+  realistic scrub shape codegen is about three per cent slower, the same direction and magnitude
+  as the original reading; at the larger shape it is about one per cent faster, a real crossover
+  the first box did not show but far too small to move a shipped default. The differential oracle
+  still pins the two tiers bit-exactly per window with the route on, so the path is correct, only
+  not faster.
+- **The profiler's four device barriers per sampled cook are declined, with the measurement
+  beside the decline (PERF-9).** Dropping the two inner barriers does not error and does not empty
+  the per-stage table; it fills it with plausible, badly wrong numbers — the heavy stage reading
+  under a millisecond against a true fifty — while the outer pair keeps the whole-cook total
+  roughly right, which is the failure mode that would mislead a planner rather than alert it. Zero
+  is structurally unavailable, because some tier routes never reach the inner barriers at all.
+  What would reopen it is device events read once per cook: a different mechanism, not a tuning of
+  this one.
+- **An embedding host's answers on the counts, the tiers and the hand-back form are recorded.**
+  The lazy-analysis zero is a property of that harness rather than of every host; the egress
+  profile is set once, by the host, before the first cook; the error-code row says stability, not
+  reachability, is the part a host depends on; and the measurement rules gain a third
+  non-negotiable: name the box beside the figure every time the figure is republished, never once
+  in a standing caveat.
+
 ## [0.38.0] - 2026-09-20
 
 **Count, don't time.** No new language surface, no new builtin, no reserved name: this release
