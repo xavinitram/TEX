@@ -21,6 +21,12 @@ the generators. This file keeps the archive honest from the tree side:
 Plus the one runtime seam the split exposed: `tex_validate_hw`'s triton lane delegated to
 `benchmarks/`, which an installed node no longer has, so it now SKIPs like its GPU-only
 siblings instead of raising.
+
+Plus (NEG-5) a dedicated ratchet over the shipped `.js` files' network-shaped tokens,
+OCCURRENCE-counted rather than line-counted (arm (b)'s line census is meaningless over a
+minified single-line bundle) — this REPLACES the `_JS_ONLY` line-fold that used to live inside
+`network` above (PUB-2) and widens the watched vocabulary past `.connect(`/`.bind(`; see the
+comment above `_NETWORK_JS_RE`.
 """
 import ast
 import collections
@@ -71,13 +77,16 @@ _DIR_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]+/$")
 # word does not count: `compile(` must not match `compile_program(` / `recompile(` /
 # `re.compile(`, and `marshal.loads(` is spelled out so `tex_marshalling` does not match.
 # `rm_rf` and `dunder_import` are the two families the registry matched (`contains_rm_rf`,
-# `$import_func_direct`) that this census did not cover before PUB-2. `network` has a second,
-# `.js`-only pattern (`_JS_ONLY`, below): the registry's python_network_operations rule fires on
-# JS `.connect(`/`.bind(` (`$socket3`/`$socket4`); measured 2026-09-19 on 0.36.3
-# (js/tex_extension.js:854 + the CM6 bundle); counted in .js only so the pin mirrors what the
-# scanner reports — in `.py` those are legitimate socket-free method names and would drown the
-# family. The census counts LINES, so the minified bundle's one line is one site however many
-# hits it carries.
+# `$import_func_direct`) that this census did not cover before PUB-2. `network`'s Python-shaped
+# patterns below measure 0 across the whole shipped surface — the registry's actual JS finding
+# (`.connect(`/`.bind(` — `python_network_operations`, `$socket3`/`$socket4`) used to be folded
+# into this LINE census via a `_JS_ONLY` pattern (PUB-2, 2026-09-19); that fold is GONE (NEG-5):
+# a line count over a 405 KB single-line minified bundle can only ever say "at least one", never
+# how many, so it could not see an added call move at all. JS network-token coverage now lives
+# in its own occurrence-counted-per-file ratchet, below `_ALLOWED_IGNORED_IMPORTS` — see
+# `_NETWORK_JS_RE`. `network` keeps its Python-shaped regex here for `.py`/other non-JS sources
+# only, pinned at 0 (there are none), so a stray `socket.connect(`/`requests.get(` etc. anywhere
+# in the shipped surface still reds.
 _FAMILIES = {
     "env_read":      re.compile(r"os\.environ\.get\(|os\.environ\[|os\.getenv\("),
     "subprocess":    re.compile(r"subprocess\."),
@@ -92,12 +101,6 @@ _FAMILIES = {
     "dunder_import": re.compile(r"__import__\("),
 }
 
-# Patterns applied ONLY to `.js` files, folded into the named family (a Python rule matching
-# JavaScript — see the `network` note above). Every key must also be in _FAMILIES.
-_JS_ONLY = {
-    "network": re.compile(r"\.connect\(|\.bind\("),
-}
-
 # Measured over EVERY shipped UTF-8 text file (git-tracked minus .comfyignore; binaries skipped).
 # These pins are HIGHER than the `.py`/`.js`-only pins that preceded them (env_read 24→26,
 # subprocess 1→2, exec 5→11, compile 11→15, marshal_loads 1→2, pickle_load 4→8; `rm_rf` and
@@ -107,7 +110,9 @@ _JS_ONLY = {
 # the pins were re-measured, not copied. These values are measured against v0.36.4's docs — the
 # three reworded root files (CHANGELOG.md, SECURITY.md, AGENTS.md) that describe each mechanism
 # instead of spelling a matched string, which is why env_read/subprocess/rm_rf/dunder_import sit
-# below the 0.36.3 tree's counts (26/2/1/1). `network` = the two `.js` lines the scanner flags.
+# below the 0.36.3 tree's counts (26/2/1/1). `network` re-pins 2→0 at NEG-5: those two sites were
+# always the `.js` lines, never a Python one, and JS network-token coverage moved to its own
+# occurrence-counted ratchet (`_NETWORK_JS_RE`) — see the note above `_FAMILIES`.
 # The pin moves DOWN freely and reds until it does; it moves UP only as a release decision that
 # names the new finding — every shipped finding is justified to the registry reviewer in
 # writing, so a new one is a new paragraph there, never a reflex here.
@@ -122,9 +127,61 @@ _SURFACE_PINS = {
     "compile": 15,
     "marshal_loads": 2,
     "pickle_load": 8,
-    "network": 2,
+    "network": 0,
     "rm_rf": 0,
     "dunder_import": 0,
+}
+
+# NEG-5 — CONVERSION, not an addition: `network` used to fold `.connect(`/`.bind(` into the
+# all-files LINE census via `_JS_ONLY` (PUB-2). That instrument was uninformative by
+# construction over one of the two shipped `.js` files: `tex_cm6_bundle.js` is a 405 KB
+# minified bundle on a SINGLE line, so a line count over it can only ever say "at least one",
+# never how many — an added call would not move the number at all. `_JS_ONLY` and its fold are
+# now GONE (see the notes above `_FAMILIES` and `_SURFACE_PINS`); this is the one and only
+# place `js/`'s network-token surface is watched. It counts OCCURRENCES per file (a `findall`
+# over the whole file, never one entry per matching line), and its watched vocabulary is wider
+# than `.connect(`/`.bind(`: `fetch(`, `WebSocket`, `XMLHttpRequest`, `EventSource`,
+# `sendBeacon`, `importScripts` — network-shaped tokens the scanner does not currently need to
+# fire on for this archive to be watched, so a first one reds here rather than shipping unseen.
+#
+# A second embedding host redistributes `js/tex_cm6_bundle.js`, `js/MonaspaceNeon.woff2` and its
+# licence inside its own application; `js/tex_extension.js` is the ComfyUI frontend proper and
+# is NOT part of that redistribution — but both files are still censused here, because the
+# registry scans both.
+#
+# Every occurrence measured at v0.38.0 (`5db1bbd`), read individually rather than pinned blind:
+#   `js/tex_extension.js` — 1 `.connect(`: a LiteGraph node-graph call,
+#     `node.connect(newIdx, targetNode, conn.targetSlot)`, restoring a canvas link after an
+#     output slot moves. No socket (also the existing `network`/SECURITY.md row's finding).
+#   `js/tex_extension.js` — 6 `fetch(`: 4 are prose — a comment about a ComfyUI helper's
+#     option-spreading ("fetchApi spreads these options into fetch()...") and the TEX stdlib
+#     `fetch()` pixel/image builtin's own help text (one comment mention, plus its `sig` and
+#     `example` strings on one `TEX_HELP_DATA` line) — and 2 are the node's own same-origin
+#     `fetch()` calls to its ComfyUI backend routes (`/tex_wrangle/detect_regions`,
+#     `/tex_wrangle/chain_preflight`: region-fusion and chain-preflight probes, each with an
+#     abort/short-timeout or a `.catch()` that treats an absent route as "unfused"/"offline").
+#   `js/tex_extension.js` — 1 `WebSocket`: a comment ("Error Cache (per-node, from WebSocket
+#     events)") naming where ComfyUI's OWN execution socket delivers node errors from; there is
+#     no `new WebSocket(` in this file.
+#   `js/tex_cm6_bundle.js` — 22 `.bind(`: all `Function.prototype.bind` (21 `.bind(this)`, one
+#     `.bind(e)`), each a DOM event handler (mousemove/mouseup/mouseleave/resize/scroll/print/
+#     selection-change) or an editor measure-request `read`/`write` pair, inside the vendored
+#     CodeMirror editor. None has socket semantics — read individually so a future reader does
+#     not re-derive this or try to "fix" them.
+#   Zero occurrences, either file, of `XMLHttpRequest`, `EventSource`, `sendBeacon`,
+#   `importScripts` — watched anyway so a first one reds instead of shipping unseen.
+_NETWORK_JS_RE = re.compile(
+    r"\.connect\(|\.bind\(|fetch\(|WebSocket|XMLHttpRequest|EventSource|sendBeacon|importScripts"
+)
+
+# Per shipped `.js` file, not per family: a `.js` file with no row here is one the census has
+# not seen before, and any occurrence in it reds by name (`.get(rel, 0)` below) rather than
+# being silently absorbed into another file's budget. Moves DOWN freely, reds until a decrease
+# is re-pinned, and rises only as a release decision that names the new finding (PUB-1's rule,
+# unchanged here).
+_NETWORK_JS_PINS = {
+    "js/tex_extension.js": 8,    # 1 .connect( + 6 fetch( + 1 WebSocket — all accounted above
+    "js/tex_cm6_bundle.js": 22,  # .bind( only — all Function.prototype.bind, see above
 }
 
 # Arm (c)'s one allowed reach into an ignored directory: the triton lane's optional delegate,
@@ -218,11 +275,9 @@ def _census(paths: list[str]) -> dict[str, list[str]]:
             text = (_PKG / rel).read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue   # binary (fonts, images) or gone
-        is_js = rel.endswith(".js")
         for i, line in enumerate(text.splitlines(), 1):
             for fam, rx in _FAMILIES.items():
-                hit = rx.search(line) or (is_js and fam in _JS_ONLY and _JS_ONLY[fam].search(line))
-                if hit:
+                if rx.search(line):
                     sites[fam].append(f"{rel}:{i}: {line.strip()[:100]}")
     return sites
 
@@ -235,9 +290,8 @@ def test_pub1_shipped_surface_ratchet(r: SubTestResult):
             r.fail("PUB-1 ratchet", "cannot census: .comfyignore is not mirrorable (see arm a)")
             return
         sites = _census(_shipped(names))
-        if set(_SURFACE_PINS) != set(_FAMILIES) or not set(_JS_ONLY) <= set(_FAMILIES):
-            r.fail("PUB-1 ratchet", "every family needs a pin and every pin a family; every "
-                   "_JS_ONLY key must name a family")
+        if set(_SURFACE_PINS) != set(_FAMILIES):
+            r.fail("PUB-1 ratchet", "every family needs a pin and every pin a family")
             return
         up, down = [], []
         for fam, pin in _SURFACE_PINS.items():
@@ -256,6 +310,54 @@ def test_pub1_shipped_surface_ratchet(r: SubTestResult):
                  + ", ".join(f"{k}={v}" for k, v in _SURFACE_PINS.items()))
     except Exception as e:
         r.fail("PUB-1 (b)", f"{type(e).__name__}: {e}")
+
+
+# ── NEG-5: the occurrence-counted JS network-token ratchet ───────────────────
+
+def _network_js_census(paths: list[str]) -> dict[str, int]:
+    """Occurrence count (never a line count — see `_NETWORK_JS_RE`'s comment) of the widened
+    network-token vocabulary, per shipped `.js` file. A binary that fails to decode is a font
+    and is skipped, same as the main census."""
+    counts = {}
+    for rel in paths:
+        if not rel.endswith(".js"):
+            continue
+        try:
+            text = (_PKG / rel).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        counts[rel] = len(_NETWORK_JS_RE.findall(text))
+    return counts
+
+
+def test_pub1_network_js_surface_ratchet(r: SubTestResult):
+    print("\n--- NEG-5: occurrence-counted network-token ratchet over the shipped js/ files ---")
+    try:
+        names, bad = _parse_comfyignore() if _COMFYIGNORE.is_file() else ([], [])
+        if bad:
+            r.fail("NEG-5 ratchet", "cannot census: .comfyignore is not mirrorable (see arm a)")
+            return
+        counts = _network_js_census(_shipped(names))
+        up, down = [], []
+        for rel, n in counts.items():
+            pin = _NETWORK_JS_PINS.get(rel, 0)
+            if n > pin:
+                up.append(f"{rel}: {n} occurrences, pinned {pin} — a NEW network-shaped JS "
+                           "token in the shipped archive")
+            elif n < pin:
+                down.append(f"{rel}: {n} occurrences, pinned {pin} — re-pin DOWN to {n}")
+        for rel, pin in _NETWORK_JS_PINS.items():
+            if rel not in counts:
+                down.append(f"{rel}: pinned {pin} but no longer ships as a `.js` file — "
+                             "re-pin DOWN to 0 (or drop the row)")
+        if up:
+            r.fail("NEG-5 network_js ratchet (new site)", "\n  ".join(up))
+        elif down:
+            r.fail("NEG-5 network_js ratchet (stale pin)", "\n  ".join(down))
+        else:
+            r.ok("network_js at its pins: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    except Exception as e:
+        r.fail("NEG-5 (network_js)", f"{type(e).__name__}: {e}")
 
 
 # ── (c) no shipped module imports from an ignored directory ──────────────────
