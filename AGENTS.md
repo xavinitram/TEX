@@ -181,10 +181,18 @@ grandfathered baseline above already cost us. If a planned feature does not fit 
 the answer is the next domain split, not a bigger number. The floor has now moved twice:
 2000 → 1700 (ENG-14, `tex_buffers` + `tex_tiling`) and 1700 → 1400 (NEG-2, `tex_chain` — the
 CACHE-6 stage-list cook and CACHE-1's lineage keys, the cut ENG-14's design note had already
-named). `tex_results.py` now carries the register's second floor (1958, NEG-1) and its own
-pre-specified cut — the CACHE-1 key-minting leaf out to `tex_results_keys.py` — so the
-register's rule is now the house pattern rather than one module's exception: a module gets
-its floor and the design note for its next cut BEFORE the wall, never at it.
+named). `tex_results.py` carries the register's second floor and **has now taken its own
+pre-specified cut**: the CACHE-1 key-minting leaf moved out to `tex_results_keys.py` (NEG-6),
+proved bytecode-identical by NEG-2's own technique, and the floor moved 1958 → **1887**. So the
+register's rule is the house pattern rather than one module's exception: a module gets its floor
+and the design note for its next cut BEFORE the wall, never at it.
+
+**That cut was spent almost the moment it was minted, which is the argument for the pattern.**
+NEG-1 set the 1958 floor with 55 lines of headroom. One later lane (CACHE-11, the residency
+promotion) took the module to 1944 — **14 lines** — before the split had been taken. Had the cut
+not already been specified, that lane would have met the wall with no plan and the pressure would
+have been to raise the number. The split restored a 72-line margin. **A floor without a named next
+cut is a countdown, not a budget.**
 
 Currently over the hard budget — status as of v0.37.0 (drift-checked by
 `test_doc7b_map_drift`, which reds if any `~LOC` here — in this table or in prose — diverges >10% from `wc -l`):
