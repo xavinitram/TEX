@@ -249,7 +249,15 @@ tag**, in the release entry rather than only in the diff:
 4. **Any new module filename.** A vendoring step is typically a directory copy, so a new file
    arrives in a host's tree whether or not that host imports it.
 
-Two rules of form travel with them. State the delta **from the host's actual pin** as well as
+**Every commit id in a host-facing document must be reachable from the published branch.** A host
+that pins by commit cannot use an id that only ever existed on an integration branch, and it finds
+out by the pin failing rather than by reading. This was written after three such ids went out in a
+hand-back: the work had genuinely landed, but the ids named were the pre-merge ones and none is an
+ancestor of the published head. Check them, with `git merge-base --is-ancestor <sha> origin/main`
+for each, before the document leaves. Citing the merge commit is always safe; citing the commit a
+lane happened to make is only safe once history says so.
+
+Two further rules of form travel with them. State the delta **from the host's actual pin** as well as
 from the previous release: a host several minors behind cannot compose four changelogs into an
 answer, and the composition is exactly where a reserved name gets lost. And mark anything that
 exists only at head as **head-only since vX.Y**, so a host can plan against it without mistaking

@@ -380,6 +380,33 @@ test before it starts, and cannot claim a win the instrument would not see.
    survive, and `should_sample`'s shape — every cook of an unseen key until three samples, then
    one in sixteen — is load-bearing for that host's cost table. Changing the sampling rule is a
    contract change that is named in a hand-back before the tag, never a tuning.
+
+   **Attempted, measured, and DECLINED (PERF-9, 2026-09-21). The four syncs stay.** The obvious
+   fix is to drop the two inner barriers on the ground that the outer pair already serialises.
+   Built and interleaved against its own base, it does not error and does not empty the per-stage
+   table — it fills the table with plausible, badly wrong numbers while the whole-cook total, still
+   bracketed by the untouched outer pair, stays roughly right:
+
+   | | stage 0 | the heavy stage | stage 2 | sum of stages | whole cook |
+   |---|---:|---:|---:|---:|---:|
+   | base | 6.32 ms | **50.51 ms** | 11.91 ms | 68.74 ms, tracks the total | 68.9 ms |
+   | inner barriers removed | 0.21 | **0.68** | 0.22 | ~1.12 ms, **1.6 % of the total** | 64.8–84.8 |
+
+   A checkpoint planner fed the second row would never place a tap on that 50 ms stage. That is the
+   *present but wrong* failure this item's constraint exists to prevent, and it is worse than the
+   barriers. **4 → 0 is structurally unavailable** as well: some tier routes never reach the
+   interpreter's inner syncs at all, so the outer bracket is their only barrier. Even 4 → 3 fails —
+   merging the outer enter with the inner pre-loop is falsified by real GPU dispatch in the
+   binding-cast and coordinate-builtin preamble, and merging the inner close with the outer exit is
+   safe only at fp32.
+
+   **One premise died usefully.** The cook queue's own completion bracket does *not* provide a
+   barrier that would make any of the four redundant: it feeds the profiler from a bare wall-clock
+   delta with no device synchronisation, pricing job admission rather than the cook.
+
+   *What would reopen it:* a per-stage timing that does not need a barrier at all — device events
+   recorded into the stream and read once at the end of the cook, rather than a synchronise per
+   stage boundary. That is a different mechanism, not a tuning of this one.
 5. **The results cache grows by one entry per cook, forever, on interactive ticks.** The
    `results_cache.entries_added` row tracks `ResultCache.put` exactly on every scenario. **Host
    policy** — a scrub visits values it will never revisit, and nothing tells the cache so.
