@@ -516,7 +516,11 @@ MUTATIONS = [
     ('the invocation seam stops staging vec params (rank-1 $tint.r again)',
      'tex_runtime/codegen.py',
      '    _stage_vec_params(bindings, device, dtype)\n'
+     '    if program is not None:\n'
+     '        _stage_wire_scalars(bindings, device, dtype, cg_fn, program)\n'
      '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype)',
+     '    if program is not None:\n'
+     '        _stage_wire_scalars(bindings, device, dtype, cg_fn, program)\n'
      '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype)',
      ("test_codegen_value_parity",)),
     ('the vec-param staging drops the [1,1,1,C] reshape', 'tex_runtime/interpreter.py',
