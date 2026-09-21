@@ -100,6 +100,12 @@ where `live` is the conjunction of the live masks of every region enclosing the 
 **not** enclosing the target's declaration. A write to a variable declared *inside* the region
 is unmasked: a loop-header counter stays uniform, and a body-local temporary is dead on exit.
 
+An `if` is **not** a region for declaration purposes: only a loop pass and a call bump the
+region depth. A variable declared before a per-pixel `if` and written inside it is selected by
+that branch's live mask (M2) and nothing else — which at top level is `0.23`'s own `cond`, so the
+commonest shape stays on `0.23`'s exact code path. (Settled under L4; both tiers read it this
+way.)
+
 *A pixel that has left keeps the value it left with.* That one sentence is the whole of M1 and
 every worked example below is an instance of it.
 
@@ -449,8 +455,8 @@ not change that. A host that drives an executor itself is exactly the caller tha
 already do — masking adds exact selections (`torch.where`) and boolean algebra over a mask that
 broadcasts through the same pair-broadcast helper both tiers share. There is no approximation
 anywhere in §1, so invariant 2's `tol=1e-5` is not being spent; the answer should be bitwise.
-Two preconditions and six divergence sites, each named so an implementer can test it rather than
-hope.
+Two preconditions and seven divergence sites, each named so an implementer can test it rather
+than hope.
 
 **Interpreter (the oracle; lands first).** A second statement-dispatch table bound per cook only
 for a flagged `0.25` program and restored in `finally` — the shape `_cancel` already uses — so a
@@ -502,6 +508,12 @@ the bug; `return` still needs the scoping.
 6. **A shared error is invisible to parity.** Two tiers agreeing on the wrong answer is exactly
    what §0's table shows today. Parity testing alone cannot catch it, so the oracle below is
    not optional.
+7. **Where the call frame is pushed.** The interpreter pushes a call's frame at the *call
+   site* (a tree-walk has nowhere else to put it); codegen pushes it *inside the emitted
+   `def`*, because a function body is emitted once and called from many sites. The two are
+   equivalent — the frame's lifetime is the call's either way, and the caller's live mask is
+   inherited untouched — but this is the one place the mirror is not positional, and a reader
+   expecting it to be should not take the difference for a defect. (Found under L5.)
 
 **The oracle that settles it.** The `0.23` interpreter **in scalar mode already computes §1's
 answer**: seed one pixel's coordinates into the scalar-builtin defaults, slice the bindings to

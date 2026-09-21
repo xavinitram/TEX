@@ -668,10 +668,58 @@ def apply_tf32_profile(enable: bool = True):
     return restore
 
 
-def resolve_auto_precision(program, spatial_px: int, device_type: str):
+def _masked_per_pixel_for(program, _masked_flow: "bool | None" = None) -> bool:
+    """LANG-L6: under the language-`0.25` rules a `for` whose bound differs per pixel is a
+    per-pixel DATA BRANCH, and `precision="auto"` declines those.
+
+    `docs/masked-control-flow.md` §1 M3 — each pass "evaluate[s] the condition;
+    `live := live & (cond > 0.5)`" — so every pixel's OWN comparison decides that pixel's
+    pass count. That is the class `_has_fp16_hazard` already declines for `if`/`?:`/`while`
+    ("a fp16 value steering control flow -> unstable output"): an fp16 rounding of the
+    bound moves a pixel across an integer and its answer jumps by a whole pass. Under
+    `0.23` the same loop runs the REGION's maximum pass count on every pixel — the bound
+    steers no pixel individually, which is why the `ForLoop` clause below only ever asked
+    about accumulation — and a bound read from image lineage is already caught by the
+    comparison clause. So the shape this adds is a bound derived from a coordinate or frame
+    builtin (`u`, `v`, `ix`, `fi`, …): fp16-eligible today, unstable only once the pragma
+    makes it per-pixel. `flow_plan.per_pixel_loops` is `region_dependent`'s own clause
+    (a)/(b) set, so "per-pixel" means here exactly what it means to the region gate.
+
+    Asked ONLY of a flagged program (invariant 7): `masked_flow.enabled_for` decides on
+    `Program.language is None` alone for every program without a pragma, and is shut for
+    every pragma while `LANGUAGE_VERSION` is below `0.25`, so no default-path verdict
+    moves and no `_AUTO_DECISION` entry is minted differently. An INCOMPLETE plan declines
+    (fp32 is always correct); an EMPTY one does not, so a `0.25` program with a static
+    `for` keeps the fp16 it has today. *_masked_flow* is the LANG-L4/L5 test seam and NOT
+    a host-facing switch: `None` asks the engine's gate; True/False name the answer."""
+    if _masked_flow is None:
+        if getattr(program, "language", None) is None:
+            return False
+        from .masked_flow import enabled_for   # lazy: masked_flow imports the front end
+        _masked_flow = enabled_for(program, "")
+    if not _masked_flow:
+        return False
+    from ..tex_api import flow_plan            # lazy: tex_api imports this package
+    plan = flow_plan(program)
+    if not plan.complete:
+        return True
+    if not plan.per_pixel_loops:
+        return False
+    # Only a `for` is new here: a per-pixel `while` is a data branch `_has_fp16_hazard`
+    # already declines at every language level.
+    return any(n.__class__.__name__ == "ForLoop" and id(n) in plan.per_pixel_loops
+               for n in _walk(program))
+
+
+def resolve_auto_precision(program, spatial_px: int, device_type: str, *,
+                           _masked_flow: "bool | None" = None):
     """Return (precision, reason) for `precision="auto"`. precision is "fp16" only when the
     condition-number gate proves the program accurate in fp16; "fp32" (with the declining
-    reason) otherwise — the gate over-declines rather than risk accuracy."""
+    reason) otherwise — the gate over-declines rather than risk accuracy.
+
+    *_masked_flow* is LANG-L6's test seam for `_masked_per_pixel_for` (NOT host-facing):
+    `None` asks the engine's language gate, shut for every program that can exist while
+    `LANGUAGE_VERSION` is below `0.25`."""
     if device_type != "cuda":
         return "fp32", "auto->fp32: CPU (fp16 is slower on CPU)"
     if spatial_px < _MIN_FP16_PX:
@@ -682,4 +730,7 @@ def resolve_auto_precision(program, spatial_px: int, device_type: str):
         return "fp32", "auto->fp32: sampling/fetch/reduction/scatter (fp16-unsafe)"
     if _has_fp16_hazard(program, _output_names(program)):
         return "fp32", "auto->fp32: fp16-fragile fn, data branch, or image-lineage amplification"
+    # LANG-L6: asked LAST, so every program declined today keeps today's reason string.
+    if _masked_per_pixel_for(program, _masked_flow):
+        return "fp32", "auto->fp32: per-pixel `for` bound under language 0.25 (a fp16 value steers control flow)"
     return "fp16", "auto->fp16: gate-verified accurate (smooth, bounded condition number)"

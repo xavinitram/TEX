@@ -201,7 +201,48 @@ def free_graphs_only() -> None:
 
 # ── Static capturability gate ─────────────────────────────────────────
 
-def _capturable(program: Program) -> tuple[bool, int]:
+def _masked_flow_syncs(program: Program, _masked_flow: "bool | None" = None) -> bool:
+    """LANG-L6: does the language-`0.25` masked path sync on this program?
+
+    `docs/masked-control-flow.md` §5, divergence site 2: under `0.25` a loop's exit test is
+    `live.any()` — taken once per pass, on the device, and READ BACK — for every loop
+    `tex_api.flow_plan` names a SYNC POINT (its own bound is per-pixel, or it directly
+    encloses a `break`/`continue` under a per-pixel `if`). A `0.23` cook of the same
+    static-range `for` with a per-pixel `break` never syncs (the transfer simply unwinds),
+    which is why `_capturable`'s walk lets that shape through and why this has to be a
+    second question rather than a new case in the walk. M5's source-gated scatter
+    compaction (`masked_flow.scatter_keep`) reads the mask back the same way, so a scatter
+    site under a per-pixel `if` is a sync too. Either would fail capture LOUDLY — never
+    silently — so this is exactly the trade `_SYNC_STDLIB` makes: skip the doomed capture
+    and its RNG-poison recovery instead of paying them once per new key. (A user-function
+    call reached under a per-pixel live mask also syncs — M4's empty-call skip — and the
+    plan has no set that names those call sites; that capture still fails loudly and is
+    blacklisted, the pre-existing net, rather than served wrong.)
+
+    Asked ONLY of a flagged program, and that is what keeps every existing verdict where it
+    is (invariant 7): `masked_flow.enabled_for` decides on `Program.language is None` alone
+    for every program without a pragma, and answers False for every pragma a source can
+    spell while `LANGUAGE_VERSION` is below `0.25`, so no corpus program reaches `flow_plan`
+    here and nothing `_capturable_memo` already holds moves. A transfer-free `0.25` program
+    (an empty plan), and a flagged one whose only sites are `return`s or masked writes (no
+    per-pass live test anywhere), stay capturable. An INCOMPLETE plan declines: the walk
+    could not say where the syncs are.
+
+    *_masked_flow* is the LANG-L4/L5 test seam and NOT a host-facing switch: `None` asks
+    the engine's own gate; True/False name the answer outright."""
+    if _masked_flow is None:
+        if getattr(program, "language", None) is None:
+            return False
+        from .masked_flow import enabled_for   # lazy: masked_flow imports the front end
+        _masked_flow = enabled_for(program, "")
+    if not _masked_flow:
+        return False
+    from ..tex_api import flow_plan            # lazy: tex_api imports this package
+    plan = flow_plan(program)
+    return (not plan.complete) or bool(plan.sync_points or plan.scatter_sites)
+
+
+def _capturable(program: Program, *, _masked_flow: "bool | None" = None) -> tuple[bool, int]:
     """(capturable, op_count) from a single AST walk.
 
     capturable = no statically-detectable sync: excludes while loops, non-static
@@ -211,6 +252,13 @@ def _capturable(program: Program) -> tuple[bool, int]:
     tensor-op count (the launch proxy for the PF-1/PF-2 gate), counted in the
     same walk so the graph tier never traverses the AST twice; it is 0 (unused)
     on a non-capturable early-out.
+
+    LANG-L6: a program cooked under the language-`0.25` rules syncs where a `0.23` cook of
+    the same source does not, so a flagged program is asked one more question AFTER the
+    walk — `_masked_flow_syncs` — and only after it, so a program the walk already declines
+    never pays the plan. *_masked_flow* is that helper's test seam (`None` = the engine's
+    gate, which is shut for every program that can exist while `LANGUAGE_VERSION` is
+    below `0.25`); the default path's verdicts are unmoved.
 
     ENG-7 also bars the host-time builtins, and for a DIFFERENT reason than everything
     else here: they do not sync, they *change*. Every other builtin is derived from the
@@ -239,6 +287,8 @@ def _capturable(program: Program) -> tuple[bool, int]:
         if isinstance(n, _OP_TYPES):
             ops += 1
         stack.extend(_iter_child_nodes(n))
+    if _masked_flow_syncs(program, _masked_flow):
+        return (False, 0)
     return (True, ops)
 
 

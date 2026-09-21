@@ -583,6 +583,27 @@ MUTATIONS = [
      "        self._loop_depth = 0\n",
      "        saved_loop_depth = self._loop_depth\n",
      ("test_lang_l2_e3015",)),
+    # ── LANG-L6 (the satellite tiers under language 0.25) ──────────────────────────────
+    # Both directions for each gate: the check REMOVED (a flagged program with a per-pass
+    # live test would be handed to CUDA-graph capture / fp16 again) and the check WIDENED to
+    # every flagged program (a transfer-free 0.25 program would lose the tier it has today).
+    ("LANG-L6: the capture gate stops asking whether the masked path syncs",
+     "tex_runtime/graphed.py",
+     "    if _masked_flow_syncs(program, _masked_flow):\n        return (False, 0)\n",
+     "    if False:\n        return (False, 0)\n",
+     ("test_lang_l6_satellites",)),
+    ("LANG-L6: the capture gate declines EVERY flagged program", "tex_runtime/graphed.py",
+     "    return (not plan.complete) or bool(plan.sync_points or plan.scatter_sites)\n",
+     "    return True\n",
+     ("test_lang_l6_satellites",)),
+    ("LANG-L6: auto stops declining a 0.25 per-pixel for", "tex_runtime/precision_policy.py",
+     "    if _masked_per_pixel_for(program, _masked_flow):\n",
+     "    if False:\n",
+     ("test_lang_l6_satellites",)),
+    ("LANG-L6: auto declines EVERY flagged program", "tex_runtime/precision_policy.py",
+     "    if not plan.per_pixel_loops:\n        return False\n",
+     "    if not plan.per_pixel_loops:\n        return True\n",
+     ("test_lang_l6_satellites",)),
 ]
 
 
