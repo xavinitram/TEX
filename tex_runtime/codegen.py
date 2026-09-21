@@ -107,6 +107,43 @@ def _reads_time_builtin(program: Program) -> bool:
     return not _TIME_BUILTIN_NAMES.isdisjoint(_collect_identifiers(program))
 
 
+def _live_type_map(program: Program, type_map: dict[int, TEXType]) -> dict[int, TEXType]:
+    """The type map the emitter may consult: entries only for nodes `program` reaches, and —
+    when the map is the checker's `TypeMap` — only where the entry was recorded for THAT node.
+
+    CG-1. `type_map` is keyed by `id()`, and an id names an object only while it lives. The
+    map the emitter is handed can carry entries for nodes that are dead by emission time (a
+    front end builds and drops nodes; the optimizer replaces them), so a live node whose `id()`
+    was recycled onto one reads a type that is not its own. That collision is decided by the
+    allocator, not the program: measured before this narrowing, 3–6 of 130 corpus programs
+    emitted different source from one process to the next, the runtime-broadcast branch of
+    `_emit_binop` appearing and disappearing — and the matrix branch reads the same lookup, so
+    nothing bounded the failure to a broadcast decision. Every `self.type_map.get(id(...))`
+    site in the emitter, including `base_is_vector` and the stdlib-emitter mixin, reads the
+    map this function builds, so all of them are covered by one narrowing at construction.
+
+    Two guards, because a walk alone is not enough (measured: restricting the map to the ids
+    the walk reaches, with no lifetime pin, left the sweep exactly as irreproducible — the
+    stale entry usually sits UNDER a live id, an optimizer-synthesized node allocated onto a
+    dead typed node's address, and no walk can see that). `TypeMap.is_own` is the identity
+    check that can; for a bare dict a caller built by hand, reachability is all there is to
+    check and the answer is what it always was. The caller holds `program` for the whole
+    emission, so no reachable id can recycle while the narrowed map is in use, and a node
+    the emitter synthesizes itself is never in it — it reads `None`, the answer a map that
+    knows only the checked tree gives. Compile-path only (fingerprint-cached), so the walk
+    is paid once per program, never per cook."""
+    is_own = getattr(type_map, "is_own", None)
+    live: dict[int, TEXType] = {}
+    stack: list[ASTNode] = [program]
+    while stack:
+        node = stack.pop()
+        t = type_map.get(id(node))
+        if t is not None and (is_own is None or is_own(node)):
+            live[id(node)] = t
+        stack.extend(_ast_iter_child_nodes(node))
+    return live
+
+
 def try_compile(program: Program, type_map: dict[int, TEXType],
                 fingerprint: str | None = None, *,
                 _masked_flow: bool | None = None) -> Any | None:
@@ -149,7 +186,9 @@ def try_compile(program: Program, type_map: dict[int, TEXType],
     try:
         if _reads_time_builtin(program):
             return None
-        gen = _CodeGen(type_map)
+        # CG-1: the emitter consults only the entries of nodes it is emitting — see
+        # `_live_type_map` for why the map it was handed cannot be read directly.
+        gen = _CodeGen(_live_type_map(program, type_map))
         # LANG-L5: the language-`0.25` gate, asked exactly the way the interpreter asks it
         # (`masked_flow.enabled_for`), so the two tiers cannot disagree about WHETHER a
         # program masks before they get to disagree about HOW. The fast-out is the same

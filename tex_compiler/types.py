@@ -153,6 +153,49 @@ CHANNEL_MAP = {
 }
 
 
+class TypeMap(dict):
+    """The checker's `id(node) -> TEXType` map, which keeps every node it types ALIVE.
+
+    An `id()` names an object only for as long as that object lives: CPython hands a freed
+    object's address to the next allocation of the same size, so a plain dict keyed by `id()`
+    that outlives a node it typed will answer a lookup for a DIFFERENT node that later lands
+    on the same address — with the dead node's type. A front end builds and drops nodes and
+    the optimizer replaces them, so the map routinely outlives some of its keys, and whether a
+    later node collides with one is a property of the allocator, not of the program. Measured
+    (CG-1): 3–6 of 130 corpus programs emitted different codegen source from one PROCESS to
+    the next — the runtime-broadcast branch appearing and disappearing — and the matrix
+    branch reads the same lookup, so the failure was not bounded to a broadcast decision.
+
+    `record` pins the node beside its type, so a key of this map can never be recycled while
+    the map exists, and `get(id(node))` answers the question it always meant: "was THIS node
+    typed, and as what". `is_own` is the identity form of the same question for a caller that
+    cannot rule out a plain-dict write (`type_map[id(x)] = t`, which this class deliberately
+    still accepts — it is a dict, and every existing consumer reads it as one).
+
+    A dict subclass, not a wrapper, so `get` stays the C `dict.get` on the interpreter's hot
+    path and every `dict`-typed consumer (`tex_api.Program.type_map`, the memory cache tuple)
+    is unchanged. Nodes pinned here are, on the production path, exactly the nodes of the
+    program the map was built for — held by the cache alongside it — so the pin costs no
+    memory there; it costs only the dead nodes a harness or a non-re-checking caller would
+    otherwise have freed, which is the memory that makes the map truthful.
+    """
+    __slots__ = ("_pins",)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pins: dict[int, object] = {}
+
+    def record(self, node, t: TEXType) -> None:
+        """Type `node` as `t` and pin it for the life of this map."""
+        self[id(node)] = t
+        self._pins[id(node)] = node
+
+    def is_own(self, node) -> bool:
+        """True when the entry under `id(node)` was recorded for THIS object (not merely for
+        an object that once had this address, and not by a bare dict write)."""
+        return self._pins.get(id(node)) is node
+
+
 def base_is_vector(type_map: dict, node) -> bool:
     """The ONE signal the interpreter and codegen must agree on for a single-channel access:
     does the base carry a CHANNEL axis (a vector), or is it a channel-less scalar/mask whose

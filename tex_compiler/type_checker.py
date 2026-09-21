@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 # here so `type_checker`'s own logic — and any legacy `from .type_checker import
 # TEXType` — keep working, but the pipeline's other modules now depend on `.types`.
 from .types import (
-    TEXType, TEXArrayType, TYPE_NAME_MAP, CHANNEL_MAP, VALID_SWIZZLES,
+    TEXType, TEXArrayType, TypeMap, TYPE_NAME_MAP, CHANNEL_MAP, VALID_SWIZZLES,
     _VEC_RANK, _VEC_SIZE_TYPE, array_wires_enabled,
 )
 from .ast_nodes import (
@@ -205,7 +205,9 @@ class TypeChecker:
         returns. (`_error` never raises, so there is no exception to catch here.)"""
         self._scopes = [{}]
         self._array_scopes = [{}]
-        self._types = {}
+        # CG-1: a `TypeMap`, not a bare dict — it pins every node it types so an `id()` key
+        # cannot be recycled onto a later node while the map lives (see `TypeMap`).
+        self._types = TypeMap()
         self.referenced_bindings = set()
         self.errors = []
         self.assigned_bindings = {}
@@ -243,7 +245,7 @@ class TypeChecker:
         return types
 
     def _set_type(self, node: ASTNode, t: TEXType):
-        self._types[id(node)] = t
+        self._types.record(node, t)
 
     def _lookup_var(self, name: str) -> TEXType | None:
         for scope in reversed(self._scopes):

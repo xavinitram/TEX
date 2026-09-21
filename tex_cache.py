@@ -66,7 +66,13 @@ _AST_FILES = [_C_DIR / "ast_nodes.py", _C_DIR / "lexer.py", _C_DIR / "parser.py"
 # than at the release that makes them reachable.
 _CODEGEN_FILES = [_R_DIR / "interpreter.py", _R_DIR / "codegen.py", _R_DIR / "codegen_stdfns.py",
                   _R_DIR / "stdlib.py", _R_DIR / "noise.py", Path(__file__).parent / "tex_fusion.py",
-                  _R_DIR / "masked_flow.py", _R_DIR / "codegen_masked.py"]
+                  _R_DIR / "masked_flow.py", _R_DIR / "codegen_masked.py",
+                  # CG-1: the STR-7 split's other two emitters. `codegen_stencil.py` owns the whole
+                  # stencil detection-and-lowering route, so an edit there changes emitted code.
+                  _R_DIR / "codegen_stencil.py",
+                  # `codegen_persist.py` writes and authenticates the `.cg` bytes themselves;
+                  # watched defensively so a format change can never be read by the old reader.
+                  _R_DIR / "codegen_persist.py"]
 # Tier-policy — a change moves a measured win/lose verdict (autotier.json / warm_state.json).
 # NEW under CACHE-4: previously a compiled.py tiering change kept stale verdicts.
 _VERDICT_FILES = [_R_DIR / "precision_policy.py", _R_DIR / "autotier.py",

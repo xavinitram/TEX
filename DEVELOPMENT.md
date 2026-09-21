@@ -836,6 +836,19 @@ against the slow leaks a days-long compositor process would otherwise hide.
 ## Rejected design decisions (don't re-propose)
 
 Settled calls, kept here so they're not re-derived:
+- **Narrowing the emitter's `id()`-keyed type map by an AST walk ALONE (CG-1)** — rejected on
+  measurement. The walk-only shape ("keep the entries whose id the walk reached") was the
+  cheapest fix proposed for the cross-process emitted-source drift, and it was tried first:
+  three sweeps of the 130-program corpus with that narrowing and no lifetime pin were exactly
+  as irreproducible as three sweeps without it (5–7 programs moving per sitting). The stale
+  entry usually sits UNDER a live id — an optimizer-synthesized node allocated onto the address
+  of a dead node the checker had typed — and no walk can see that from the outside. What
+  shipped is `TypeMap` (the checker's map pins every node it types, so a key cannot be
+  recycled while the map lives) plus `codegen._live_type_map` (reachability AND `is_own`,
+  the identity check the pin makes exact). Carrying the type on the node was the other
+  truthful shape and was not taken: it adds a field to every `ASTNode` (the `.pkl` tier's
+  pickled IR) and leaves the interpreter, the optimizer and every host reading two sources of
+  truth, for a bug that lives entirely in the map's lifetime.
 - **Raising `MAX_OUTPUTS` so a fused chain can carry more CACHE-7 taps** (v0.32) — rejected.
   It is a *host output-slot count* (`tex_node.py` binds its node outputs to it), so raising it
   changes the node's published surface to buy an engine convenience. `materialize` batches the

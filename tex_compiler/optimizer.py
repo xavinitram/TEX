@@ -107,6 +107,19 @@ PASSES = [
 ]
 
 
+def _register_type(type_map: dict, node: ASTNode, t: TEXType) -> None:
+    """Register an optimizer-synthesized node in the checker's map.
+
+    CG-1: through `TypeMap.record` when the map is the checker's (so the node is pinned and its
+    `id()` cannot be recycled onto a later node while the map lives), and as the plain write it
+    always was for a bare dict a caller built by hand."""
+    record = getattr(type_map, "record", None)
+    if record is not None:
+        record(node, t)
+    else:
+        type_map[id(node)] = t
+
+
 def optimize(program: Program, type_map: dict | None = None) -> Program:
     """Run the `PASSES` pipeline on a program AST (in-place). See `PASSES` for the
     passes and their load-bearing order.
@@ -891,7 +904,7 @@ def _replace_expr(expr: ASTNode, replacements: dict[int, str],
         # hash_to_type is only populated when type_map is not None, so a truthy
         # hash_to_type already implies type_map is available.
         if hash_to_type and h in hash_to_type:
-            type_map[id(ident)] = hash_to_type[h]
+            _register_type(type_map, ident, hash_to_type[h])
         return ident
 
     if isinstance(expr, BinOp):
@@ -1054,7 +1067,7 @@ def _eliminate_common_subexpressions(stmts: list[ASTNode],
             initializer=expr_node,
         )
         if type_map is not None and t is not None:
-            type_map[id(decl)] = t
+            _register_type(type_map, decl, t)
             hash_to_type[h] = t
         insert_before.setdefault(stmt_idx, []).append(decl)
 
@@ -1234,7 +1247,7 @@ def _extract_invariant_subexpr(expr: ASTNode, modified: set[str],
             counter[0] += 1
             ident = Identifier(loc=expr.loc, name=temp_name)
             if t is not None:
-                type_map[id(ident)] = t
+                _register_type(type_map, ident, t)
             hoisted.append((temp_name, expr, t))
             return ident
 
@@ -1323,7 +1336,7 @@ def _licm_loop(loop: ForLoop | WhileLoop, counter: list[int],
             initializer=expr_node,
         )
         if type_map is not None and t is not None:
-            type_map[id(decl)] = t
+            _register_type(type_map, decl, t)
         pre_loop.append(decl)
 
     return pre_loop + [loop]

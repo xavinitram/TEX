@@ -260,7 +260,8 @@ can affect:
 ```
 AST_EPOCH      = H(ast_nodes, lexer, parser, type_checker, optimizer, stdlib_signatures)
                  → gates the compiled-program .pkl tier
-CODEGEN_EPOCH  = H(AST_EPOCH, codegen, codegen_stdfns, interpreter, stdlib, noise, tex_fusion,
+CODEGEN_EPOCH  = H(AST_EPOCH, codegen, codegen_stdfns, codegen_stencil, codegen_persist,
+                   interpreter, stdlib, noise, tex_fusion, masked_flow, codegen_masked,
                    <cgreuse env>)                     → gates .cg sidecars + the inductor dir
 VERDICT_EPOCH  = H(CODEGEN_EPOCH, precision_policy, autotier, compiled, graphed)
                  → gates autotier.json + warm_state.json

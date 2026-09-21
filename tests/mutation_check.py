@@ -604,6 +604,29 @@ MUTATIONS = [
      "    if not plan.per_pixel_loops:\n        return False\n",
      "    if not plan.per_pixel_loops:\n        return True\n",
      ("test_lang_l6_satellites",)),
+    # ── CG-1 (the emitter's `id()`-keyed type map is only truthful while its keys live) ──
+    # Four rows, one per half of the fix and one per guard of the narrowing. The first is the
+    # bug as it shipped: the emitter reading the map it was handed, dead entries and all.
+    ("CG-1: the emitter reads the unnarrowed map again", "tex_runtime/codegen.py",
+     "        gen = _CodeGen(_live_type_map(program, type_map))",
+     "        gen = _CodeGen(type_map)",
+     ("test_cg1_typemap_liveness",)),
+    ("CG-1: narrowing keeps an entry the map did not record for THIS node", "tex_runtime/codegen.py",
+     "        if t is not None and (is_own is None or is_own(node)):",
+     "        if t is not None:",
+     ("test_cg1_typemap_liveness",)),
+    ("CG-1: the checker stops pinning the nodes it types", "tex_compiler/type_checker.py",
+     "        self._types.record(node, t)",
+     "        self._types[id(node)] = t",
+     ("test_cg1_typemap_liveness",)),
+    ("CG-1: the optimizer registers a temp without its pin", "tex_compiler/optimizer.py",
+     "    record = getattr(type_map, \"record\", None)\n"
+     "    if record is not None:\n"
+     "        record(node, t)\n"
+     "    else:\n"
+     "        type_map[id(node)] = t",
+     "    type_map[id(node)] = t",
+     ("test_cg1_typemap_liveness",)),
 ]
 
 

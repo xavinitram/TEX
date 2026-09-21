@@ -498,6 +498,9 @@ _WATCHED = {
     # (`codegen_masked.py`). Watched from the commit that adds them rather than from the
     # release that makes them reachable, so an edit to either cannot leave a stale `.cg`.
     "masked_flow.py", "codegen_masked.py",
+    # CG-1: the STR-7 split's stencil-lowering route and the `.cg` writer/reader. Neither was
+    # watched, so a stencil edit left every existing `.cg` sidecar passing its version check.
+    "codegen_stencil.py", "codegen_persist.py",
 }
 
 
