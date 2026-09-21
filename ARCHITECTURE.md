@@ -138,6 +138,10 @@ to a new leaf instead.)
 `tex_cache`, `tex_marshalling`, the diagnostics taxonomy and the interpreter — all below the
 engine — and names `tex_engine` only inside an `if TYPE_CHECKING:` block, which never runs.
 Its `tex_fusion` and `tex_results` imports stayed function-local, exactly as they were.)
+(NEG-6 added `tex_results_keys` below `tex_results` — the CACHE-1 lineage-key leaf — and the
+count is **still 2**: it is a leaf importing only `hashlib`/`json` at module level, plus the
+same function-local `tex_cache` import `_code_epoch` already made before the move; nothing
+imports back up to `tex_results` or `tex_chain`.)
 (STR-1 removed the third — `stdlib_signatures ↔ type_checker` — by moving `TEXType` to the
 leaf; `type_checker`'s lazy `FUNCTION_SIGNATURES` bind is now defensive, not cycle-breaking.)
 Do **not** hoist the remaining two to top-level imports — the cycles are logical; the fix is
@@ -342,7 +346,7 @@ Bounds below are entry counts, and every store is process-lifetime unless stated
 | `tex_memory._last_trim_px` | device | last-seen spatial pixel count, so the allocator is queried only after a downshift (MEM-2) |
 | `tex_memory._total_mem_cache` | device | total VRAM (MEM-2) |
 | `tex_tiling._free_foreign` | host generation | `(generation, foreign bytes)` from the last free-memory reading; answered only when it grants DOUBLE the room the live number would have, and invalidated by a host swap |
-| `tex_results._ENV_EPOCH_CACHE` | active CUDA device index (-1 for CPU) | the env epoch folded into every result key |
+| `tex_results_keys._ENV_EPOCH_CACHE` | active CUDA device index (-1 for CPU) | the env epoch folded into every result key (NEG-6: split out of `tex_results.py`; `tex_results.lineage_key` and friends still resolve, re-exported) |
 | `tex_results.ResultCache` | CACHE-1 lineage key | the cooked frame; RAM byte-budget LRU + disk spill, host-instantiated |
 | `tex_tool._SUMMARY_CACHE` | tool path | `((mtime_ns, size), summary)` for the TOOL-2 palette |
 | `xfer._MODEL` | device x torch build | the fitted transfer latency+bandwidth model; persisted to `xfer.json` |

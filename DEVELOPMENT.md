@@ -699,15 +699,15 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   (`tex_testkit.py:1-38`). Deliberately not a row below; its own docstring pins it at Tier 2 anyway
   (`tex_testkit.py:15-22`).
 - `ResultCache.put(..., mask_eligible=True)` opts a MASK output into half-precision preview storage
-  (LATENT stays refused regardless, `tex_results.py:504-517`); `ResultCache.touch(key)` and
+  (LATENT stays refused regardless, `tex_results.py:406-408`); `ResultCache.touch(key)` and
   `key in cache` are non-read residency operations — a hint that reorders the eviction walk, and a
   resident-now check — and neither counts as a hit or promotes a demoted frame
-  (`tex_results.py:1634-1717`, the `touch`/`__contains__` docstrings). Not a row below; `touch`/`in`
+  (`tex_results.py:1528-1588`, the `touch`/`__contains__` docstrings). Not a row below; `touch`/`in`
   pin their own Tier 2 in their docstrings, and `put`'s new keyword travels with them. **RULED**
   (the author, 2026-09-21, CACHE-11): the narrowed ask beside them was granted, not the wider one —
   reorder-plus-promote-if-demoted, nothing else, no keep-set, no pinning, no restore of a
   spilled-only frame. It shipped as its own call, `ResultCache.touch_promote(key)`
-  (`tex_results.py:1719-1751`), rather than as a new default for `touch`: a product test
+  (`tex_results.py:1590-1623`), rather than as a new default for `touch`: a product test
   (`test_v033_cache8_touch_never_moves_a_frame_between_devices`) already depended on the bare
   `touch(key)` call never promoting, so `touch` keeps its exact contract and its docstring's "does
   NOT promote" stays unconditionally true. `touch_promote` reuses `_promote` verbatim — the same

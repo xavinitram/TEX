@@ -246,7 +246,7 @@ cost caching exists to avoid. The contract is the host's to keep, and it is docu
 ## 7. Threading: the phase-2 cook is a second writer
 
 `ResultCache` is documented as not thread-safe: "a host that shares one across threads guards
-it" (`ResultCache`'s class docstring, `tex_results.py:346` — which now records that the class
+it" (`ResultCache`'s class docstring, `tex_results.py:217` — which now records that the class
 became thread-safe in CACHE-7, after this note was written). Until now that was a host's
 problem, because every writer was the
 host's own cook. Phase 2 makes the **engine** a writer, on the SCHED-4 worker thread, while
