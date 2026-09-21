@@ -627,6 +627,27 @@ MUTATIONS = [
      "        type_map[id(node)] = t",
      "    type_map[id(node)] = t",
      ("test_cg1_typemap_liveness",)),
+    # ── CG-2 (L5-F1: a scatter into a rank-<3 `@` buffer; L4-F1: the fuzz seed's width) ──
+    # The codegen scatter emission widens a buffer of rank < 3 on the interpreter's own
+    # `needs_new_buf` condition and preserves the old value into it. Each half of that is
+    # a separate mutant, because a row that only checks "no IndexError" would pass with the
+    # seed silently zeroed.
+    ("CG-2: scatter emission stops widening a rank-<3 buffer", "tex_runtime/codegen.py",
+     '        need_buf = (f"{name!r} not in _bind or not _torch.is_tensor(_bind[{name!r}]) "\n'
+     '                    f"or _bind[{name!r}].dim() < 3")',
+     '        need_buf = (f"{name!r} not in _bind or not _torch.is_tensor(_bind[{name!r}]) "\n'
+     '                    f"or False")',
+     ("test_codegen_optimizer",)),
+    ("CG-2: scatter emission forgets the old value when it widens", "tex_runtime/codegen.py",
+     '        self._emit(f"if _torch.is_tensor(_sold): _bind[{name!r}][...] = _sold")',
+     '        pass',
+     ("test_codegen_optimizer",)),
+    # The generator half: a stencil accumulator seeded `vec3` whatever the wire carries is
+    # exactly L4-F1, and the row that pins the rate at zero must red on it.
+    ("CG-2: the fuzz generator seeds vec3 whatever the wire carries", "tests/test_v017_phase1.py",
+     '    vt = f"vec{channels}"',
+     '    vt = "vec3"',
+     ("test_v017_phase1",)),
 ]
 
 

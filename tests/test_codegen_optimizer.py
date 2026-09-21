@@ -18,6 +18,9 @@ def test_codegen_equivalence(r: SubTestResult):
         ("subtraction", "@OUT = @A - 0.5;"),
         ("division", "@OUT = @A / 2.0;"),
         ("modulo", "@OUT = vec3(fract(@A.r * 3.0), fract(@A.g * 3.0), fract(@A.b * 3.0));"),
+        # CG-2: a scatter into an `@` binding seeded with a 0-dim tensor — the codegen
+        # tier widens it to [B,H,W] as the interpreter does (it used to raise IndexError).
+        ("scatter into a 0-dim-seeded @ buffer", "@S = 0.0; @S[ix, iy] += 1.0; @OUT = @A;"),
 
         # Constructors
         ("vec3 constructor", "@OUT = vec3(0.5, 0.25, 0.75);"),
@@ -2892,3 +2895,68 @@ if (@A.r > 0.5) {
     @OUT = acc * 0.25;
 }
 """, {"A": torch.rand(1, 8, 8, 4)})
+
+
+# ── CG-2: scatter into an `@` buffer of rank < 3 ─────────────────────────
+
+def test_cg2_scatter_widens_rank_below_3(r: SubTestResult):
+    """CG-2 (closing L5-F1): a scatter write into an `@` binding that already holds a
+    tensor of RANK < 3 — `@S = 0.0;` then `@S[ix, iy] += 1.0;` — widens it to a
+    [B,H,W(,C)] buffer on the codegen tier exactly as `Interpreter._exec_scatter_write`
+    does, and preserves the old value into it. Before the fix the `0.23` emission asked
+    only whether a tensor was there, cloned the 0-dim tensor and raised a raw IndexError
+    at `_sb.shape[2]` where the interpreter returned a picture: an interp/codegen
+    divergence (invariant 2) on a program with no language feature in it.
+
+    Bitwise (`torch.equal`), not a tolerance: both tiers run the same torch ops on the
+    same widened buffer, so any difference is a logic difference. Each row also checks
+    the value against a hand-computed expectation, so the two tiers cannot pass by
+    agreeing on a wrong picture."""
+    print("\n--- CG-2: scatter widens a rank-<3 @ buffer on both tiers ---")
+    B, H, W = 1, 3, 5
+    torch.manual_seed(2)
+    img = torch.rand(B, H, W, 3)
+
+    def _row(name, code, expect):
+        try:
+            interp_res, cg_res = run_both(code, {"A": img.clone()}, B=B, H=H, W=W)
+            assert cg_res is not None, "codegen declined the program"
+            for k in interp_res:
+                it, ct = interp_res[k], cg_res[k]
+                assert isinstance(it, torch.Tensor) and isinstance(ct, torch.Tensor), \
+                    f"@{k}: {type(it).__name__} vs {type(ct).__name__}"
+                assert it.shape == ct.shape, \
+                    f"@{k}: shape {tuple(it.shape)} (interp) vs {tuple(ct.shape)} (codegen)"
+                assert torch.equal(it, ct), (f"@{k}: max |interp - codegen| = "
+                                             f"{(it.float() - ct.float()).abs().max().item()}")
+            got = interp_res["S"]
+            assert got.shape == expect.shape, \
+                f"@S: shape {tuple(got.shape)}, expected {tuple(expect.shape)}"
+            assert torch.equal(got, expect), \
+                f"@S: max |got - expected| = {(got - expect).abs().max().item()}"
+            r.ok(name)
+        except Exception as e:
+            r.fail(name, f"{e}\n{traceback.format_exc()}")
+
+    ones = torch.ones(B, H, W)
+    red = img[..., 0]
+    # The repro: a 0-dim seed, accumulated into. Every pixel scatters onto itself once.
+    _row("scatter: 0-dim @S seeded 0.0, += 1.0", "@S = 0.0; @S[ix, iy] += 1.0;", ones)
+    # The old value survives the widening (the interpreter's `new_buf[...] = buf`).
+    _row("scatter: 0-dim @S seeded 0.25, += 1.0 keeps the seed",
+         "@S = 0.25; @S[ix, iy] += 1.0;", ones * 1.25)
+    # Plain assignment and the other compound ops, all through the widening.
+    _row("scatter: 0-dim @S, = @A.r", "@S = 0.0; @S[ix, iy] = @A.r;", red)
+    _row("scatter: 0-dim @S seeded 2.0, -= @A.r", "@S = 2.0; @S[ix, iy] -= @A.r;", 2.0 - red)
+    _row("scatter: 0-dim @S seeded 2.0, *= @A.r", "@S = 2.0; @S[ix, iy] *= @A.r;", 2.0 * red)
+    # A vec value widens the 0-dim seed to [B,H,W,C], the seed broadcast per channel.
+    _row("scatter: 0-dim @S seeded 0.25, += @A widens to 3 channels",
+         "@S = 0.25; @S[ix, iy] += @A;", img + 0.25)
+    # A rank-3 / rank-4 buffer is NOT widened — the clone path, unchanged by CG-2.
+    _row("scatter: rank-3 @S (mask) is cloned, not widened",
+         "@S = @A.r; @S[ix, iy] += 1.0;", red + 1.0)
+    _row("scatter: rank-4 @S is cloned, not widened", "@S = @A; @S[ix, iy] += @A;", img * 2.0)
+    # The same emitter inside a user function, where the scope is not the top level.
+    _row("scatter: 0-dim @S widened inside a user function",
+         "float put(float v) { @S[ix, iy] += v; return v; } @S = 0.5; float d = put(1.0);",
+         ones * 1.5)

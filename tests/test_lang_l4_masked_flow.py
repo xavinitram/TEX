@@ -721,10 +721,12 @@ def _generate(count, conds=None, require=None):
     """`count` COOKABLE programs from the SHIPPED generator, optionally with its early-exit
     condition pool swapped. Restores the pool whatever happens.
 
-    Programs the interpreter refuses are dropped here, and separately counted and reported
-    by `test_shipped_generator_emits_programs_that_do_not_cook` — that refusal predates
-    this lane (measured on `main` at the base sha) and is filed as a finding, not absorbed
-    silently."""
+    Every generated program must cook. The generator is asked for the 4-channel wires
+    `_fuzz_bindings` binds (`channels=4` — CG-2, closing L4-F1: the seed used to be `vec3`
+    whatever the wire carried, and the refused programs were dropped here), and a refusal
+    now propagates instead of being skipped: `test_v017_phase1.test_cg2_generated_programs_all_cook`
+    pins the rate at zero, so a program refused here is a generator bug this sweep must not
+    hide."""
     import random
     import test_v017_phase1 as t17
     saved = t17._EARLY_EXIT_CONDS
@@ -737,13 +739,10 @@ def _generate(count, conds=None, require=None):
         tries = 0
         while len(out) < count and tries < count * 80:
             tries += 1
-            src = t17._gen_program(rng, 3)
+            src = t17._gen_program(rng, 3, channels=4)
             if require is not None and not any(k in src for k in require):
                 continue
-            try:
-                _cook(src, b, None)
-            except Exception:
-                continue
+            _cook(src, b, None)              # a refusal is a generator bug: let it raise
             out.append(src)
     finally:
         t17._EARLY_EXIT_CONDS = saved
@@ -832,25 +831,3 @@ def test_shipped_generator_conditions_are_false_on_every_pixel():
             live_somewhere.append(cond)
     assert live_somewhere == [], \
         f"the shipped pool is no longer all-false: {live_somewhere}"
-
-
-def test_shipped_generator_emits_programs_that_do_not_cook():
-    """Filed as a finding rather than absorbed: the shipped generator emits programs the
-    interpreter refuses — `_gen_stencil`'s min/max variant seeds a `vec3` accumulator and
-    folds a 4-channel tap into it, so `max(vec3, vec4)` raises E6051. Measured on `main`
-    at this lane's base sha, so it predates the lane; pinned here so the rate is a number
-    somebody can watch rather than a surprise inside a sweep."""
-    import random
-    import test_v017_phase1 as t17
-    b = _fuzz_bindings()
-    rng = random.Random(4242)
-    bad = 0
-    for _ in range(60):
-        src = t17._gen_program(rng, 3)
-        try:
-            _cook(src, b, None)
-        except Exception:
-            bad += 1
-    assert bad > 0, ("the generator no longer emits uncookable programs — drop this row "
-                     "and the finding it pins")
-    assert bad < 30, f"the uncookable rate jumped to {bad}/60"

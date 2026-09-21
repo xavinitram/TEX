@@ -1385,24 +1385,21 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
 
         # Get or create output buffer.
         #
-        # LANG-L5: the masked tier widens a buffer that is a tensor of RANK < 3 as well,
-        # which is `Interpreter._exec_scatter_write`'s own `needs_new_buf` condition. The
-        # `0.23` emission below asks only whether a tensor is there, so `@S = 0.0;` followed
-        # by `@S[x, y] += v;` reaches `_sb.shape[2]` on a 0-dim buffer and raises a raw
-        # IndexError where the interpreter returns a picture. That is a pre-existing
-        # interp/codegen divergence, reproduced at this lane's base sha with no language
-        # feature involved. It is recorded rather than fixed here: widening the `0.23` guard
-        # would move the emitted bytes of every program containing a scatter, and the
-        # release that introduced this masked path owes those bytes as unchanged.
-        if self._mf_on:
-            need_buf = (f"{name!r} not in _bind or not _torch.is_tensor(_bind[{name!r}]) "
-                        f"or _bind[{name!r}].dim() < 3")
-        else:
-            need_buf = f"{name!r} not in _bind or not _torch.is_tensor(_bind[{name!r}])"
+        # The condition is `Interpreter._exec_scatter_write`'s own `needs_new_buf`: a
+        # binding that is absent, not a tensor, or a tensor of RANK < 3 gets a fresh
+        # [B,H,W(,C)] buffer with the old value preserved into it. ONE spelling for both
+        # the `0.23` and the masked (LANG-L5) emission. CG-2: the `0.23` emission used to
+        # ask only the first two clauses, so `@S = 0.0;` followed by `@S[x, y] += v;` cloned
+        # the 0-dim tensor and raised a raw IndexError at `_sb.shape[2]` where the
+        # interpreter returns a picture — an interp/codegen divergence (invariant 2) on a
+        # program with no language feature involved. Widening the guard moves the emitted
+        # bytes of every program containing a scatter write (and only those), so it lands
+        # in a release that can absorb a codegen-epoch move.
+        need_buf = (f"{name!r} not in _bind or not _torch.is_tensor(_bind[{name!r}]) "
+                    f"or _bind[{name!r}].dim() < 3")
         self._emit(f"if {need_buf}:")
         self._indent += 1
-        if self._mf_on:
-            self._emit(f"_sold = _bind.get({name!r})")
+        self._emit(f"_sold = _bind.get({name!r})")
         self._emit(f"_sv = {value_expr}")
         self._emit(f"_sc = _sv.shape[-1] if _torch.is_tensor(_sv) and _sv.dim() >= 1 and _sv.shape[-1] in (2,3,4) else 1")
         self._emit(f"if _sp:")
@@ -1413,10 +1410,9 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._indent += 1
         self._emit(f"_bind[{name!r}] = _torch.zeros(1, 1, 1, _sc, dtype=_torch.float32, device=_dev) if _sc > 1 else _torch.zeros(1, 1, 1, dtype=_torch.float32, device=_dev)")
         self._indent -= 1
-        if self._mf_on:
-            # The interpreter preserves the old value into the widened buffer
-            # (`new_buf[...] = buf`); so does this.
-            self._emit(f"if _torch.is_tensor(_sold): _bind[{name!r}][...] = _sold")
+        # The interpreter preserves the old value into the widened buffer
+        # (`new_buf[...] = buf`); so does this.
+        self._emit(f"if _torch.is_tensor(_sold): _bind[{name!r}][...] = _sold")
         self._emit(f"_scat_owned.add({name!r})")  # freshly allocated → owned
         self._indent -= 1
         self._emit(f"else:")

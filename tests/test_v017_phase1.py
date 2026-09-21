@@ -227,9 +227,17 @@ def _gen_expr(rng, depth):
             f"{_gen_expr(rng, depth-1)}, {_gen_expr(rng, depth-1)})")
 
 
-def _gen_stencil(rng, i):
+def _gen_stencil(rng, i, channels=3):
     """A1-2: a random EXACT (fetch-based) stencil nest — the shape the loop-stencil
     lowerings claim (avg_pool2d / max_pool2d / unfold).
+
+    *channels* is the channel count of the `@A`/`@B` wires the caller will bind. A
+    whole-vector tap carries the wire's channels, so the accumulator it is folded into —
+    the seed's declared type and the `+ vec(0.1)` composed term — is spelled `vec{channels}`
+    to match (CG-2, closing L4-F1: the seed used to be `vec3` whatever the wire carried,
+    and `max(vec3, vec4)` / `vec3 + vec4` refused ~15-30% of the programs generated for a
+    4-channel wire before either tier was compared). The default is TST-1's own 3-channel
+    wires, so every shipped seed generates byte-for-byte what it generated before.
 
     TST-1 could not reach this class at all before: `_ATOMS` holds no tap (no
     fetch/sample/@A[...]) and the only loop it emitted was a flat `0..n`, never the
@@ -267,9 +275,10 @@ def _gen_stencil(rng, i):
     # disclosed as robustness debt, but never a parity failure. Generate both, and
     # keep vec taps the majority so the silent class stays well covered.
     vec_tap = rng.random() < 0.6
+    vt = f"vec{channels}"                        # the whole-vector tap's own width
     if vec_tap:
         tap = (f"fetch(@{b}, {idx})" if rng.random() < 0.5 else f"@{b}[{idx}]")
-        ty, mx_seed, mn_seed = "vec3", "vec3(0.0)", "vec3(1.0)"
+        ty, mx_seed, mn_seed = vt, f"{vt}(0.0)", f"{vt}(1.0)"
         pick = "." + rng.choice(["r", "g", "b"])   # collapse to float for the pool
     else:
         ch = rng.choice(["r", "g", "b"])
@@ -286,7 +295,7 @@ def _gen_stencil(rng, i):
     elif w < 0.80:
         term = f"{tap} / 2.0"
     else:
-        term = f"({tap} + {'vec3(0.1)' if vec_tap else '0.1'})"
+        term = f"({tap} + {f'{vt}(0.1)' if vec_tap else '0.1'})"
 
     hdr = (f"for (int dy = -{R}; dy <= {R}; dy = dy + 1) {{ "
            f"for (int dx = -{R}; dx <= {R}; dx = dx + 1) {{ ")
@@ -370,7 +379,7 @@ def _gen_early_exit(rng, i, atoms, live_conds=False):
             v)
 
 
-def _gen_program(rng, depth=3, live_conds=False):
+def _gen_program(rng, depth=3, live_conds=False, channels=3):
     """A1-1: a random VALID multi-statement program — widens the fuzzer beyond a
     single float expression to the shapes that shipped real bugs green (doc 33 §5):
     user-function defs + calls (the F1 blind spot), bounded accumulator loops, and
@@ -381,7 +390,11 @@ def _gen_program(rng, depth=3, live_conds=False):
     *live_conds* is passed through to `_gen_early_exit`: it makes the generated early-exit
     conditions vary PER PIXEL, which is the only way a generated program can exercise masked
     control flow at all (LANG-L5). Default False, so an existing seed generates exactly the
-    program it generated before."""
+    program it generated before.
+
+    *channels* is passed through to `_gen_stencil`: the channel count of the `@A`/`@B`
+    wires the caller binds, so a stencil accumulator is seeded at the tap's own width
+    (CG-2). Default 3 — TST-1's wires — so the shipped stream does not move."""
     lines, atoms = [], list(_ATOMS)
     # Sub-expressions are built SHALLOWER than the single-expr baseline: the multi-
     # statement structure (locals feeding locals, fn bodies, loop accumulation) already
@@ -418,7 +431,7 @@ def _gen_program(rng, depth=3, live_conds=False):
     # lowering's "replace the whole nest" behaviour can drop statements.
     stencil_atoms = []
     for i in range(rng.randint(0, 2)):
-        slines, satom = _gen_stencil(rng, i)
+        slines, satom = _gen_stencil(rng, i, channels=channels)
         lines.extend(slines)
         atoms.append(satom)
         stencil_atoms.append(satom)
@@ -586,6 +599,44 @@ def test_tst1_differential_fuzzer(r: SubTestResult):
                     f"interp; robustness debt): e.g. {cg_crashes[0]}")
         r.ok(f"{tested} random programs: interp == codegen parity holds "
              f"({cg_ran} actually ran codegen, {cg_declined} declined-unsupported){note}")
+
+
+def _fuzz_wire(channels, seed, B=1, H=2, W=4):
+    """A small deterministic [B,H,W,channels] wire (the shape the language sweeps bind):
+    channel 0 is a rational ramp, the rest are shifted copies, channel 3 is opaque."""
+    n = B * H * W
+    t = torch.tensor([(((i * 5 + seed) % 13) / 13.0) for i in range(n)],
+                     dtype=torch.float32).reshape(B, H, W, 1)
+    planes = [t, (t + 0.29) % 1.0, (t + 0.61) % 1.0, torch.ones_like(t)]
+    return torch.cat(planes[:channels], -1)
+
+
+def test_cg2_generated_programs_all_cook(r: SubTestResult):
+    """CG-2 (closing L4-F1): every program the generator emits for a 4-channel wire cooks,
+    on BOTH tiers. `_gen_stencil` used to seed its accumulator `vec3` whatever the wire
+    carried, so `max(vec3, vec4)` (E6051) and `vec3 + vec4` refused a share of every fuzz
+    seed before any tier was compared — measured 62/200 at this row's base sha with the
+    seed below — and the language sweeps had to filter them out. Zero is the only
+    acceptable number: a refusal here is a generator bug, not a gate result."""
+    print("\n--- CG-2: the generator emits only cookable programs (4-channel wires) ---")
+    seed = 4242
+    N = 200
+    rng = _random.Random(seed)
+    binds = {"A": _fuzz_wire(4, 1), "B": _fuzz_wire(4, 7), **_FUZZ_PARAM_BINDING}
+    refused = []
+    for _ in range(N):
+        code = _gen_program(rng, 3, channels=4)
+        try:
+            run_both(code, binds, B=1, H=2, W=4)
+        except Exception as e:                                   # noqa: BLE001
+            refused.append(f"{type(e).__name__}: {str(e)[:60]} :: {code[:70]}")
+    if refused:
+        r.fail("CG-2 generator cookability",
+               f"{len(refused)}/{N} generated programs do not cook:\n  "
+               + "\n  ".join(refused[:8]))
+    else:
+        r.ok(f"{N}/{N} generated programs cook on both tiers against 4-channel wires "
+             f"(seed {seed})")
 
 
 def test_ask1_convolve_fuzzer_scope(r: SubTestResult):

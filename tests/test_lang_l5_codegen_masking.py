@@ -470,22 +470,21 @@ def _fz_bindings():
 def _fz_generate(count, live_conds, require=("break", "continue", "return")):
     """*count* COOKABLE programs carrying a transfer, from the SHIPPED generator.
 
-    Programs the interpreter refuses are dropped here and counted separately by
-    `test_the_generator_still_emits_programs_that_do_not_cook`: that refusal predates this
-    lane (LANG-L4 measured 30/200 on `main` at its base sha, `L4-F1`) and is reported rather
-    than absorbed."""
+    Every generated program must cook. The generator is asked for the 4-channel wires
+    `_fz_bindings` binds (`channels=4` — CG-2, closing L4-F1: the seed used to be `vec3`
+    whatever the wire carried, and the refused programs were dropped here), and a refusal
+    now propagates instead of being skipped: `test_v017_phase1.test_cg2_generated_programs_all_cook`
+    pins the rate at zero, so a program refused here is a generator bug this sweep must not
+    hide."""
     b = _fz_bindings()
     rng = random.Random(20260921)
     out, tries = [], 0
     while len(out) < count and tries < count * 80:
         tries += 1
-        src = T17._gen_program(rng, 3, live_conds=live_conds)
+        src = T17._gen_program(rng, 3, live_conds=live_conds, channels=4)
         if not any(k in src for k in require):
             continue
-        try:
-            cook_both(src, b, masked=None)
-        except Exception:                                   # noqa: BLE001
-            continue
+        cook_both(src, b, masked=None)       # a refusal is a generator bug: let it raise
         out.append(src)
     return out
 
@@ -547,23 +546,6 @@ def test_fuzz_live_codegen_equals_oracle(src):
     for n in names:
         diff = (cout[n].float() - ref[n].float()).abs().max().item()
         assert diff <= 1e-5, f"{n}: max |cg - oracle| = {diff}"
-
-
-def test_the_generator_still_emits_programs_that_do_not_cook():
-    """`L4-F1`, still open and still watched: `_gen_stencil`'s min/max variant seeds a
-    `vec3` accumulator and folds a 4-channel tap into it, so a share of generated programs
-    raise `E6051` before any tier is compared. Fixing it changes what every existing TST-1
-    seed generates, which is a fuzz-coverage decision and not this lane's."""
-    b = _fz_bindings()
-    rng = random.Random(4242)
-    refused = 0
-    for _ in range(60):
-        src = T17._gen_program(rng, 3)
-        try:
-            cook_both(src, b, masked=None)
-        except Exception:                                   # noqa: BLE001
-            refused += 1
-    assert 0 < refused < 30, f"{refused}/60 — the rate moved; re-read L4-F1"
 
 
 def test_the_shipped_condition_pool_is_still_false_everywhere():
