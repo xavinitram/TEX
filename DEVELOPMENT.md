@@ -685,7 +685,11 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   (`tex_fusion.py:970-990`); `tex_checkpoint.gate_refusal(...)` is the structured reason — a stable
   code, the offending stage, a human message — that a checkpointed cook ran whole instead of
   incrementally (`tex_checkpoint.py:487-500`). Neither is a row below; both are `tex_fusion`
-  internals, Tier 3, by the catch-all's own example.
+  internals, Tier 3, by the catch-all's own example. `tex_roi.region_advisory(...)` (CACHE-10,
+  arrived after v0.38.0) mirrors `gate_refusal`'s shape for a different question — not whether
+  `chain_windows` will serve a region at all, but whether the region it would serve is expected
+  to cost more than cooking the same dirty suffix whole-frame, priced off PROF-1-shaped costs
+  the caller supplies. Also not a row below; `tex_roi` internals, Tier 3.
 - The language server accepts a per-document `bindingTypes` map on `didOpen`/`didChange` — the wire
   form of the `{name: TEXType}` map `tex_api.check` already takes — so diagnostics check against the
   bindings a host actually wired, not an empty guess (`tex_lsp.py:16-23`, `:195-210`). Not a row
@@ -1007,13 +1011,19 @@ Settled calls, kept here so they're not re-derived:
   the direction that silently reduces precision on data. *Real reopen condition:* an explicit,
   host-supplied role that is never inferred — from pixels or from names. See
   `docs/preview-tier-precision.md` §4 for the argument.
-- **Doc 41 §2.4's three CACHE-7/9 hardening items** (v0.33) — DEFERRED, not built, recorded the
-  same day per §10.6. Each has a measured trigger already on record, which is what makes the
-  deferral checkable rather than open-ended:
-  (a) *all-dirty routing as an engine answer* — the 0.21×/0.04× cliff is still fenced by prose
-  ("a host must route an all-dirty recook whole-frame") instead of by a `not-worth-it` return
-  from the serviceability API. **Reopen gate:** a host that actually drives region recooks at
-  scale, i.e. the compositor; PROF-1 already prices both sides, so this is wiring, not research.
+- **Doc 41 §2.4's three CACHE-7/9 hardening items** (v0.33) — recorded the same day per §10.6.
+  Each has a measured trigger already on record, which is what makes the deferral checkable
+  rather than open-ended. (a) is now LANDED (CACHE-10); (b) and (c) remain DEFERRED, not built:
+  (a) *all-dirty routing as an engine answer* — **LANDED (CACHE-10)**, its reopen gate having
+  fired: the compositor is now a host that drives region recooks at scale. The 0.21×/0.04×
+  cliff was fenced only by a paragraph ("a host must route an all-dirty recook whole-frame");
+  `tex_roi.region_advisory(halos, roi, dirty_from, costs=..., px=..., device=...)` prices both
+  sides off exactly `chain_windows`'s own inputs plus PROF-1-shaped per-stage costs, and returns
+  a `RegionAdvisory` — mirroring `tex_checkpoint.GateRefusal`'s shape and stability promise —
+  only when the region path is expected to lose. Shipped as an ADVISORY rather than the
+  `not-worth-it` return this item originally proposed from the serviceability API itself:
+  `chain_windows` keeps deciding correctness and nothing else; a host that never calls
+  `region_advisory` sees no behaviour change. Additive; head-only since this landing.
   (b) *fast-settle for placement* — 147 cooks to settle (3 warmup + 1-in-16 to `MIN_SAMPLES=12`)
   is the recorded adoption tax. **Reopen gate:** any host reporting that checkpoints never
   appear; the burst mode is ~10 lines in `profile.py` and cuts it to ~12 cooks.

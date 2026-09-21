@@ -1166,6 +1166,108 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
     return out
 
 
+# ── CACHE-10: is a region recook worth it? ────────────────────────────────────
+
+#: Stable reason code (mirrors `tex_checkpoint.REFUSE_*`: the code is the stable part a host
+#: keys on; the message beside it is free to be reworded, the code is not).
+ADVISE_REGION_SLOWER = "region-path-slower"
+
+
+@dataclass(frozen=True)
+class RegionAdvisory:
+    """Why the region path is expected to lose to cooking the dirty suffix whole-frame —
+    additional DATA, never a decision (mirrors `tex_checkpoint.GateRefusal`'s shape and
+    stability promise: one stable `code`, a `message` that carries no contract). `region_ms`
+    and `whole_ms` are the two priced sides, so a host can log the margin without re-deriving
+    it. Returning this never changes what `chain_windows` plans — a host that ignores the
+    advisory and cooks the region anyway gets exactly the plan it would have gotten unasked."""
+
+    code: str
+    region_ms: float
+    whole_ms: float
+    message: str
+
+
+def region_advisory(halos, roi, dirty_from: int = 0, *, costs, px: int, device: str = "cpu",
+                    settled: bool = False, valid=None, declined=()) -> "RegionAdvisory | None":
+    """Is the region path `chain_windows` would plan for this edit expected to lose to cooking
+    the dirty suffix whole-frame instead (reusing the same clean prefix either way)? `None`
+    means no objection — EITHER the region path is expected to win, OR there is not enough
+    priced information to say, which fails toward silence rather than a guessed verdict.
+
+    This is an ADVISORY, not a gate: it never touches what `chain_windows` returns, and a host
+    that never calls it sees no behaviour change (invariant #7). It exists because the
+    all-dirty cliff `docs/region-granular-recook.md` §4 measured — region recook **0.21×/0.04×**
+    against whole-frame at 2048², all 50 stages dirty — was fenced only by a paragraph telling a
+    host to route that case around the mechanism itself. A host driving region recooks at scale
+    has no way to ask the engine whether ITS edit is the cheap shape or the catastrophic one.
+
+    `halos`, `roi`, `dirty_from`, `valid`, `declined` are exactly `chain_windows`'s own
+    parameters — the same inputs a region-recook planner already has, priced rather than
+    re-derived. `costs` is PROF-1's per-stage EWMA in milliseconds at the FULL-FRAME resolution
+    (`profile.stage_snapshot(key, spatial)[0]` — the same table `tex_checkpoint`'s placement
+    reads off of; string or int keys, matching `snapshot()`'s JSON form). `px` is the full
+    frame's pixel count (`H*W`); `device` selects `tex_checkpoint.put_cost_ms`'s per-device
+    clone constant. `settled` is the caller's own verdict on `costs` — the same one
+    `profile.stage_snapshot`/`plan_checkpoints` require, and for the same reason: PROF-1's first
+    few samples of a key are dominated by the cold cook and can rank stages backwards
+    (`tex_checkpoint.MIN_SAMPLES`'s docstring). Defaults to `False` so a caller must say so
+    rather than this function assuming it.
+
+    **The two sides, priced from what is already computed and nothing invented:**
+      * *whole* sums each DIRTY stage's own full-frame cost straight out of `costs` — no
+        scaling, because cooking the suffix whole-frame runs every one of those stages at that
+        resolution by definition.
+      * *region* sums each dirty stage's cost SCALED to its `chain_windows` window by the same
+        linear-in-pixels ratio `tex_runtime.profile._resolve_bucket` already uses to answer an
+        unmeasured bucket (an "honest approximation" already living in the codebase, not a new
+        model here), **plus one `put_cost_ms(px, device)` per dirty stage** — the full-frame
+        clone `patch_region` pays on every windowed write, which §4 names as the dominant term
+        ("50 full-frame clones ... AND cooks windows that have grown back to near the frame").
+
+    Never fabricates a verdict: no costs, `settled=False`, or nothing left dirty all return
+    `None` rather than a guessed number.
+    """
+    windows = chain_windows(halos, roi, dirty_from, valid=valid, declined=declined)
+    if windows is None:
+        return None            # chain_windows already refused this edit; nothing left to price
+    if not costs or not settled:
+        return None            # disarmed, unmeasured, or still cold — never guess a verdict
+    by_index: dict[int, float] = {}
+    for key, ms in costs.items():
+        try:
+            by_index[int(key)] = float(ms)
+        except (TypeError, ValueError):
+            continue           # PROF-1's own non-fused key spelling — not a stage cost
+    if not by_index:
+        return None
+    n = len(halos)
+    dirty = range(max(0, dirty_from), n)
+    if not dirty:
+        return None            # nothing to recook either way
+    from .tex_checkpoint import put_cost_ms
+    clone_ms = put_cost_ms(px, device)
+    whole_ms = 0.0
+    region_ms = 0.0
+    for i in dirty:
+        stage_ms = by_index.get(i, 0.0)
+        whole_ms += stage_ms
+        win = windows[i]
+        ratio = 1.0
+        if win is not None and px:
+            _, _, w, h, W, H = win
+            if W and H:
+                ratio = (w * h) / float(W * H)
+        region_ms += stage_ms * ratio + clone_ms
+    if region_ms <= whole_ms:
+        return None
+    return RegionAdvisory(
+        ADVISE_REGION_SLOWER, region_ms, whole_ms,
+        f"region recook priced at {region_ms:.3f} ms vs {whole_ms:.3f} ms whole-frame over "
+        f"{len(dirty)} dirty stage(s): the per-stage clone tax and near-frame windows outweigh "
+        "cooking the suffix directly")
+
+
 def clear_roi_memo() -> None:
     """Test hook (mirrors tex_lazy.clear_lazy_memo)."""
     _walk_memo.clear()

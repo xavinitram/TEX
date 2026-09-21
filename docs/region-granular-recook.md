@@ -156,6 +156,18 @@ decides whether this mechanism helps or hurts. The demo's `_owned` flag exists b
 the same wall from the other side — it clones **once** per stage per session and writes in
 place thereafter, which v0.32 does not do (see §7).
 
+**CACHE-10 (after v0.38.0): the rule above is now also a queryable, not only a paragraph.**
+`tex_roi.region_advisory(halos, roi, dirty_from, costs=..., px=..., device=...)` prices this
+exact cliff off the same inputs `chain_windows` already takes plus PROF-1-shaped per-stage
+costs — a full-frame `chain_windows` window (the all-dirty shape above) always loses by at
+least one `tex_checkpoint.put_cost_ms` clone per dirty stage, and the function says so with a
+`RegionAdvisory` (mirroring `tex_checkpoint.GateRefusal`'s shape) rather than a host having to
+re-derive the rule. It is deliberately an ADVISORY beside `chain_windows`, not a change to
+`chain_windows`'s own return contract: the serviceability question (can this be served
+incrementally at all) and the cost question (should it be) stay two different answers, and a
+host that never asks the second sees no behaviour change. See `tex_roi.region_advisory`'s
+docstring and `tests/test_cache10_region_advisory.py`.
+
 ---
 
 ## 5. Threading: read `CookResult.cooked_roi`, never the trace
