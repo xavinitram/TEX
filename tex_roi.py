@@ -333,7 +333,7 @@ def _mark_whole(reads: dict, img_node, gather_node, state: dict) -> None:
 # `batch_sliceable` on the BATCH axis. This is the same question on the ITERATION axis: can the
 # output depend on WHICH REGION was cooked, rather than only on the pixel?
 #
-# It can, in exactly two ways, both of which REDUCE a per-pixel value over the cooked region:
+# It can, in exactly four ways, all of which REDUCE a per-pixel value over the cooked region:
 #   (a)/(b) a `for`/`while` whose condition is not uniform. The interpreter decides "keep
 #           looping" with `(cond > 0.5).any()` over the region and does not mask the body, so
 #           every pixel runs as many passes as the hungriest pixel IN ITS REGION. Split the
@@ -348,6 +348,12 @@ def _mark_whole(reads: dict, img_node, gather_node, state: dict) -> None:
 #           A string that arrives on a WIRE is invisible without the cook's `binding_types` —
 #           nothing in the source says an input holds a string — which is why every caller
 #           threads them and why they are part of every memo key that can serve the verdict.
+#   (d)     a per-pixel value cast STRAIGHT to a STRING — `string(x)`, `str(x)`, or a `format()`
+#           call that actually fills a placeholder — with NO condition/merge involved at all
+#           (TRK-32). `stdlib._scalar_from_tensor` has no per-pixel representation to fall back
+#           on either, so it reduces the tensor by taking the MEAN of every pixel in the region
+#           being cooked, and a strip's mean differs from the whole frame's. A sibling of (c),
+#           not the same defect: nothing is conditioned per pixel, so it is not a vote.
 #
 # NOT region-dependent, and deliberately not declined: `break`/`continue`/`return` under a
 # per-pixel guard. Those fire on FIRST ARRIVAL at the statement — a structural fact, identical
@@ -399,9 +405,9 @@ def region_dependent(program, binding_types=None, code=None) -> bool:
         from . import tex_api
         lint = tex_api._ControlFlowLint(
             program, "", binding_types if isinstance(binding_types, dict) else {})
-        loops, strings = lint.region_clauses()
-        if strings:
-            return True                       # clause (c) never sunsets
+        loops, strings, casts = lint.region_clauses()
+        if strings or casts:
+            return True                       # clauses (c) and (d) never sunset
         return bool(loops) and _language_tuple(program, code) < MASKED_FLOW_SINCE
     except Exception:
         return True

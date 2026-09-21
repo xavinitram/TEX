@@ -356,7 +356,12 @@ per-pixel `if` and assigned inside it is per-pixel after it.
   that needs the most" is counted over the region actually being cooked, so a half-frame strip
   and the whole frame give different answers; the same is true of a string chosen per pixel —
   assigned inside a per-pixel `if`, or picked by a per-pixel `?:` — because a string has no
-  per-pixel form and is resolved by a majority vote over the region's pixels. The engine
+  per-pixel form and is resolved by a majority vote over the region's pixels. A per-pixel value
+  cast STRAIGHT to a string — `string(x)`, `str(x)`, or a `format()` call that actually fills a
+  placeholder — is the same defect with no condition involved at all: the cast has no per-pixel
+  form either, so it falls back to the MEAN of the region's pixels, and a strip's mean differs
+  from the whole frame's (`format("%f", x)` is not affected — `%f` is not a placeholder, so the
+  template comes back unchanged and the value never reaches the output). The engine
   therefore cooks such a program as one whole region — no window, no strips, no batch strips.
   That is always correct, and it costs one thing: on a GPU, a frame too large to cook whole
   runs out of memory where a split would have fitted. A uniformly bounded loop splits again.
@@ -366,8 +371,9 @@ binding_types)`: **W7006** marks a per-pixel `if` or `?:` with a gather (`sample
 `@A(u, v)`, a blur, a reduction) in a branch; **W7007** marks control flow that acts on
 every pixel, meaning a `break`, `continue` or `return` under a per-pixel `if`, or a loop whose
 condition is per-pixel; and **W7008** marks the shapes whose result depends on which region is
-cooked, so the engine declines to split the cook — a per-pixel loop bound, or a string chosen
-per pixel by an `if` or a `?:`. W7008 is the part of W7007 the engine acts on: a `break`
+cooked, so the engine declines to split the cook — a per-pixel loop bound, a string chosen
+per pixel by an `if` or a `?:`, or a per-pixel value cast straight to a string. W7008 is the
+part of W7007 the engine acts on: a `break`
 under a per-pixel `if` draws W7007 and no W7008, because it fires on first arrival and so
 does the same thing in every region. All three are opt-in: `tex_api.check()`, and so the
 editor's live lint, never reports them.

@@ -278,6 +278,13 @@ _VEC_PARAM_HINTS = frozenset(("c", "v", "v2", "v3", "v4"))
 _CF_KEYWORD_LEN = {"IfElse": 2, "ForLoop": 3, "WhileLoop": 5, "BreakStmt": 5,
                    "ContinueStmt": 8, "ReturnStmt": 6, "TernaryOp": 1}
 
+#: TRK-32 clause (d): a `format()` template only actually substitutes a Python-style
+#: `{}` / `{:spec}` placeholder (`stdlib.fn_format`'s own contract) — `%f`/`%s` are not
+#: placeholders and pass through literally, so a template without one never lets a
+#: reduced argument reach the output. Deliberately over-inclusive (a literal `{{}}`
+#: escape would still match) rather than under: the safe direction is to decline.
+_FORMAT_PLACEHOLDER_RE = _re.compile(r"\{[^{}]*\}")
+
 _STRING_RET_CACHE: "frozenset | None" = None
 
 
@@ -428,6 +435,7 @@ class _ControlFlowLint:
         # can read them without asking for diagnostics. `tex_roi.region_dependent` reads these.
         self.varying_loops = set()      # id(ForLoop/WhileLoop) — clauses (a) and (b)
         self.string_ifs = set()         # id(IfElse / TernaryOp) — clause (c)
+        self.scalar_casts = set()       # id(CastExpr / FunctionCall) — TRK-32 clause (d)
         self.emit = False
         self.diags = {}
         self.budget = 200_000 + 200 * sum(1 for _ in self._walk(program))
@@ -539,6 +547,43 @@ class _ControlFlowLint:
                     else expr.name in _string_ret_fns())
         return False
 
+    def _scalar_cast_varies(self, node, st) -> bool:
+        """TRK-32 clause (d): does `node` reduce a per-pixel value to a STRING through
+        `stdlib._scalar_from_tensor`'s region MEAN — `string(x)`, `str(x)`, or a `format()`
+        call whose template actually fills a `{}`/`{:spec}` placeholder with an argument?
+
+        Four sites implement that same reduction — `interpreter.py`'s cast calls
+        `stdlib._scalar_from_tensor` directly, as do `stdlib.fn_str` and `stdlib.fn_format`;
+        `codegen.py`'s cast inlines the identical `.item()`/`.float().mean().item()` rather
+        than calling the shared helper — and this predicate does not re-derive
+        which VALUES are per-pixel — it reuses `_varies`, the same rule clauses (a)/(b) and
+        the `?:` half of clause (c) already trust (over-approximate by NAME: a call whose
+        registry footprint is not `'point'` is treated as non-uniform, never by guessing an
+        unresolved VALUE).
+
+        `format("%f", x)` is deliberately NOT in this class: `fn_format` only substitutes a
+        Python-style `{}`/`{:spec}` placeholder (its own documented contract), so a literal
+        template with none returns itself unchanged on every route and `x`'s reduced value
+        never reaches the output — declining it would cost the corpus for nothing. A
+        NON-literal template cannot be checked for a placeholder, so — the same whitelist
+        posture as everywhere else in this class — it is assumed to carry one."""
+        A = self.A
+        cls = type(node)
+        if cls is A.CastExpr:
+            return node.target_type == "string" and self._varies(node.expr, st)
+        if cls is not A.FunctionCall:
+            return False
+        if node.name == "str":
+            return bool(node.args) and self._varies(node.args[0], st)
+        if node.name == "format":
+            if not node.args:
+                return False
+            template = node.args[0]
+            has_placeholder = (type(template) is not A.StringLiteral
+                               or _FORMAT_PLACEHOLDER_RE.search(template.value or "") is not None)
+            return has_placeholder and any(self._varies(a, st) for a in node.args[1:])
+        return False
+
     def _varies(self, expr, st) -> bool:
         A = self.A
         stack = [expr]
@@ -627,17 +672,18 @@ class _ControlFlowLint:
         return sorted(self.diags.values(), key=lambda d: (d.loc.line, d.loc.col, d.code))
 
     def region_clauses(self):
-        """TRK-25: run the same fixed point WITHOUT emitting anything, and return
-        `(varying_loops, string_ifs)` — the id sets behind clauses (a)/(b) and clause (c) of
-        `tex_roi.region_dependent`. No diagnostic is built, and the gather fixed point (which
-        only W7006 reads) is skipped. Raises `_CFBudget` past the work budget, which the
-        predicate turns into 'region-dependent' — it is a GATE, so it fails closed."""
+        """TRK-25/TRK-32: run the same fixed point WITHOUT emitting anything, and return
+        `(varying_loops, string_ifs, scalar_casts)` — the id sets behind clauses (a)/(b),
+        clause (c) and clause (d) of `tex_roi.region_dependent`. No diagnostic is built, and
+        the gather fixed point (which only W7006 reads) is skipped. Raises `_CFBudget` past
+        the work budget, which the predicate turns into 'region-dependent' — it is a GATE,
+        so it fails closed."""
         while True:
             before = self._facts()
             self._pass()
             if self._facts() == before:
                 break
-        return self.varying_loops, self.string_ifs
+        return self.varying_loops, self.string_ifs, self.scalar_casts
 
     def _facts(self):
         return (tuple(sorted((k, tuple(sorted(v))) for k, v in self.params_vary.items())),
@@ -776,6 +822,24 @@ class _ControlFlowLint:
                 for (_ptype, pname), arg in zip(self.fns[n.name].params, n.args):
                     if pname not in fed and self._varies(arg, st):
                         fed.add(pname)
+            elif self._scalar_cast_varies(n, st):
+                # TRK-32 clause (d): `string(x)` / `str(x)` / `format("{}", x)` on a
+                # per-pixel value has no conditioned MERGE (that is clause (c)) — the
+                # cast itself reduces the tensor to one number by taking a MEAN over the
+                # cooked region (`stdlib._scalar_from_tensor`, and its interpreter/codegen
+                # cast twins), and a strip's mean differs from the whole frame's.
+                self.scalar_casts.add(id(n))
+                self._warn("W7008", n,
+                           "This converts a value that can differ from pixel to pixel "
+                           "directly to a STRING. A string has no per-pixel representation, "
+                           "so the engine reduces it by taking the MEAN of every pixel in "
+                           "the region being cooked, and a strip's mean differs from the "
+                           "whole frame's — so this string depends on how the cook was "
+                           "split. This program is therefore cooked as one whole region.",
+                           "Reduce the value to one number first (an average/min/max over "
+                           "the whole image, e.g. `img_mean`), or index one pixel to make "
+                           "the choice explicit, before converting it to a string "
+                           "(LANGUAGE.md §7.1).")
             stack.extend(A.iter_child_nodes(n))
         return self._varies(expr, st)
 

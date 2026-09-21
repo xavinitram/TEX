@@ -1,8 +1,8 @@
-"""Region-dependent programs: the engine declines to split the cook (TRK-25).
+"""Region-dependent programs: the engine declines to split the cook (TRK-25, TRK-32).
 
 THE RULE. A program is *region-dependent* when its output can depend on WHICH REGION was
 cooked rather than only on the pixel — because some control decision REDUCES a per-pixel
-value over the cooked region. Two shapes do that:
+value over the cooked region. Four shapes do that:
 
   (a)/(b) a `for` / `while` whose condition is not uniform. The interpreter keeps looping
           while `(cond > 0.5).any()` over the region holds, and does not mask the body, so
@@ -10,9 +10,17 @@ value over the cooked region. Two shapes do that:
           frame into strips and a pixel's pass count changes. A 0-dim condition whose VALUE
           is region-derived (`img_mean(@A)`, `img_width(@A)`) is the same defect and is
           covered by the same non-uniformity rule (a reduction's footprint is not a point).
-  (c)     a per-pixel `if` that assigns a STRING. A string has no per-pixel representation,
-          so the merge resolves it by a MAJORITY VOTE over the region's pixels, and a strip
-          can hold a different majority than the whole frame.
+  (c)     a per-pixel `if` that assigns a STRING, or a per-pixel `?:` that picks one. A
+          string has no per-pixel representation, so the merge resolves it by a MAJORITY
+          VOTE over the region's pixels, and a strip can hold a different majority than the
+          whole frame.
+  (d)     a per-pixel value cast STRAIGHT to a STRING — `string(x)`, `str(x)`, or a
+          `format()` call that actually fills a placeholder — with no condition or merge
+          at all (TRK-32, a sibling of (c) and NOT the same defect). `_scalar_from_tensor`
+          has no per-pixel representation either, so it falls back to the MEAN of every
+          pixel in the region being cooked, and a strip's mean differs from the frame's.
+          `format("%f", x)` is NOT in this class: `%f` is not a `{}`/`{:spec}` placeholder,
+          so the template returns unchanged and the reduced value never reaches the output.
 
 For those, `tex_roi.region_dependent` is True and the three planners that split a cook —
 `_tile_plan` (strips), `roi_plan` (windows, and through it the halo strips and the chain
@@ -59,6 +67,23 @@ STRING_REPRO = ('string s = "lo";\n'
                 'if (v > 0.2) { s = "hi"; }\n'
                 '@TXT = s;\n'
                 '@OUT = @A;\n')
+
+# TRK-32 clause (d): a per-pixel value cast STRAIGHT to a STRING, no condition/merge at all —
+# a sibling of F2, not the same defect. `stdlib._scalar_from_tensor` has no per-pixel
+# representation either, so it falls back to the MEAN of every pixel in the region being
+# cooked, and a strip's mean differs from the whole frame's.
+CAST_REPRO = "@TXT = string(@A.r * 10.0);\n@OUT = @A;\n"
+STR_REPRO = "@TXT = str(@A.r * 10.0);\n@OUT = @A;\n"
+FORMAT_REPRO = ('float x = @A.r * 10.0;\n'
+               '@TXT = format("{}", x);\n'
+               '@OUT = @A;\n')
+
+# The documented correction: `format()` only substitutes a Python-style `{}`/`{:spec}`
+# placeholder — `%f` is not one and passes through literally, so the reduced value never
+# reaches the output. NOT in this class, and the negative control that proves it.
+FORMAT_PERCENT_REPRO = ('float x = @A.r * 10.0;\n'
+                        '@TXT = format("%f", x);\n'
+                        '@OUT = @A;\n')
 
 # F3: the same per-pixel loop plus a TOP-LEVEL grounded blur, so `is_tile_safe` is False and
 # the HALO strip route (the one that exists precisely for the programs `is_tile_safe` refuses)
@@ -224,6 +249,9 @@ _MUST_STILL_SPLIT = [
      None),
     ("select(cond, a, b) — pointwise, no loop",
      "@OUT = select(@A.r > 0.5, @A, vec4(0.0, 0.0, 0.0, 1.0));\n",
+     None),
+    ("format('%f', x) — not a real placeholder, TRK-32 clause (d) negative control",
+     FORMAT_PERCENT_REPRO,
      None),
 ]
 
@@ -897,3 +925,123 @@ def test_t12_corpus_neutrality(r: SubTestResult):
         r.ok(f"adv_while_loop hashes identically against {len(versions)} frozen version(s)")
     except Exception as e:
         r.fail("T12 golden unmoved", f"{type(e).__name__}: {e}")
+
+
+# ── T13: clause (d) — a per-pixel value cast straight to a STRING (TRK-32) ──────────────────
+
+def test_t13_scalar_cast_is_region_dependent(r: SubTestResult):
+    print("\n--- T13: string(x) / str(x) / format('{}', x) on a per-pixel value ---")
+    for name, src in (("string(x) cast", CAST_REPRO),
+                      ("str(x)", STR_REPRO),
+                      ("format('{}', x)", FORMAT_REPRO)):
+        try:
+            assert tex_roi.region_dependent(_parse(src), code=src) is True
+            assert tex_roi.roi_plan(src, {}).executable is False
+            assert tex_roi.batch_sliceable(src, {}) is False
+            r.ok(f"{name} is region-dependent and all three routes decline it")
+        except Exception as e:
+            r.fail(f"T13 predicate and routes ({name})", f"{type(e).__name__}: {e}")
+
+    for name, src in (("string(x) cast", CAST_REPRO),
+                      ("str(x)", STR_REPRO),
+                      ("format('{}', x)", FORMAT_REPRO)):
+        try:
+            # The evidence: `_scalar_from_tensor` takes the MEAN of whatever region it is
+            # handed. The whole frame and a 2-strip split hand it different pixel sets, so
+            # the averaged string differs — bit-identical to TRK-32's own measurement.
+            _p, whole = _cook(src)
+            _p2, tiled = _cook(src, tiles=2)
+            assert whole["TXT"] != tiled["TXT"], (
+                f"{name}: whole ({whole['TXT']!r}) and tiled ({tiled['TXT']!r}) must differ "
+                "for this to be evidence of anything")
+            r.ok(f"{name}: whole={whole['TXT']!r} tiled={tiled['TXT']!r}")
+        except Exception as e:
+            r.fail(f"T13 characterization ({name})", f"{type(e).__name__}: {e}")
+
+    try:
+        _p, whole = _cook(CAST_REPRO)
+        _p2, tiled = _cook(CAST_REPRO, tiles=2)
+        assert whole["TXT"] == "4.761904716491699", whole["TXT"]
+        assert tiled["TXT"] == "2.222222328186035", tiled["TXT"]
+        r.ok("string(x): pinned to TRK-32's own two numbers")
+    except Exception as e:
+        r.fail("T13 pinned numbers", f"{type(e).__name__}: {e}")
+
+
+def test_t13_percent_style_format_is_not_in_the_class(r: SubTestResult):
+    print("\n--- T13: format('%f', x) is NOT in this class (the documented correction) ---")
+    try:
+        assert tex_roi.region_dependent(_parse(FORMAT_PERCENT_REPRO),
+                                        code=FORMAT_PERCENT_REPRO) is False
+        assert tex_roi.roi_plan(FORMAT_PERCENT_REPRO, {}).executable is True
+        assert tex_roi.batch_sliceable(FORMAT_PERCENT_REPRO, {}) is True
+        r.ok("format('%f', x) is not declined by any route")
+    except Exception as e:
+        r.fail("T13 percent-style predicate", f"{type(e).__name__}: {e}")
+
+    try:
+        # `%f` is not a `{}`/`{:spec}` placeholder, so fn_format returns the template
+        # UNCHANGED on every route — the reduced value never reaches the output, whole or
+        # tiled, so there is genuinely nothing to decline.
+        _p, whole = _cook(FORMAT_PERCENT_REPRO)
+        _p2, tiled = _cook(FORMAT_PERCENT_REPRO, tiles=2)
+        assert whole["TXT"] == tiled["TXT"] == "%f", (whole["TXT"], tiled["TXT"])
+        r.ok(f"characterization: whole and tiled both give {whole['TXT']!r}")
+    except Exception as e:
+        r.fail("T13 percent-style characterization", f"{type(e).__name__}: {e}")
+
+
+def test_t13_pragma_never_sunsets_clause_d(r: SubTestResult):
+    print("\n--- T13: clause (d) survives the masked-flow pragma, like clause (c) ---")
+    masked_cast = "//!tex 0.25\n" + CAST_REPRO
+    try:
+        assert tex_api._ver_tuple(tex_api.LANGUAGE_VERSION) < tex_roi.MASKED_FLOW_SINCE, (
+            f"this row only means something while the engine "
+            f"({tex_api.LANGUAGE_VERSION}) predates masked flow")
+        assert tex_roi.region_dependent(_parse(masked_cast), code=masked_cast) is True
+        r.ok(f"engine at {tex_api.LANGUAGE_VERSION}: `//!tex 0.25` alone retires nothing")
+    except Exception as e:
+        r.fail("T13 pragma alone does not sunset", f"{type(e).__name__}: {e}")
+
+    # Masked per-pixel control flow (0.25) changes how a LOOP runs its body — it says nothing
+    # about how `_scalar_from_tensor` reduces a tensor to a string, so clause (d) must still
+    # fire even once the ENGINE implements 0.25, exactly like clause (c) (§1.5: "the majority
+    # rule verbatim"). This is why region_dependent gates clause (d) beside (c), never with
+    # the loop clauses (a)/(b) that DO sunset at MASKED_FLOW_SINCE.
+    _real_version = tex_api.LANGUAGE_VERSION
+    try:
+        tex_api.LANGUAGE_VERSION = "0.25"
+        tex_roi.clear_roi_memo()
+        assert tex_roi.region_dependent(_parse(masked_cast), code=masked_cast) is True, \
+            "clause (d) must NOT sunset: masked flow says nothing about the string reduction"
+        r.ok("clause (d) survives an engine that implements masked flow too")
+    except Exception as e:
+        r.fail("T13 sunset once the engine implements it", f"{type(e).__name__}: {e}")
+    finally:
+        tex_api.LANGUAGE_VERSION = _real_version
+        tex_roi.clear_roi_memo()
+
+
+def test_t13_advisory_and_corpus_are_unaffected(r: SubTestResult):
+    print("\n--- T13: W7008 on the cast line; the shipped surface is unmoved ---")
+    try:
+        got = _codes_by_line(CAST_REPRO)
+        assert got == {1: ["W7008"]}, got
+        diag = tex_api.control_flow_advisories(CAST_REPRO, {})[0]
+        assert "MEAN" in diag.message, diag.message
+        assert diag.severity == "warning", diag.severity
+        r.ok("W7008 marks the cast line")
+    except Exception as e:
+        r.fail("T13 advisory", f"{type(e).__name__}: {e}")
+
+    try:
+        # `examples/string_format.tex` is the ONLY shipped program that even mentions
+        # string(/str(/format( — and every one of its format() calls is `%f`/`%s`-style, so
+        # clause (d) must not touch it: 0 new declines, 0 new codes, exactly as measured
+        # before this clause existed.
+        src = _read_repo("examples", "string_format.tex")
+        assert tex_roi.region_dependent(_parse(src), code=src) is False
+        assert tex_api.control_flow_advisories(src, {}) == []
+        r.ok("string_format.tex: still not declined, still draws nothing")
+    except Exception as e:
+        r.fail("T13 string_format.tex", f"{type(e).__name__}: {e}")

@@ -559,6 +559,15 @@ MUTATIONS = [
      "    except Exception:\n"
      "        return False",
      ("test_v036_region_dependence",)),
+    # TRK-32: a per-pixel value cast straight to a STRING. Its own row, same reasoning as the
+    # three above — clause (d) is a distinct id-set from clause (c), so a mutant that drops
+    # only `casts` from the never-sunset check must be caught by a row that fails without it.
+    ("TRK-32: clause (d) stops being treated as never-sunsetting", "tex_roi.py",
+     "        if strings or casts:\n"
+     "            return True                       # clauses (c) and (d) never sunset",
+     "        if strings:\n"
+     "            return True                       # clauses (c) and (d) never sunset",
+     ("test_v036_region_dependence",)),
 ]
 
 
