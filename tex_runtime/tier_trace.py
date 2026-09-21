@@ -19,7 +19,8 @@ for the life of the process, and the two agree only to a recorded envelope. A re
 recooked after the swap and composited over a frame cooked before it can carry a
 seam no band bounds (worley's follows its coordinates; a threshold amplifies any).
 So a host composites a patch onto a base only when BOTH records are dicts and EQUAL,
-and cooks whole otherwise — which is always correct. The record:
+and cooks whole otherwise — which is always correct. ENG-16's `noise_tiers_compatible(a, b)`
+below is that rule as one callable, so a host writes it once. The record:
 
   None  not requested; a tier strategy other than "default" (a compiled or captured
         tier runs noise where this thread's record cannot see it); or some label
@@ -177,6 +178,73 @@ def last_noise_tiers():
     a cook that did not ask leaves it alone — where the reason says why that record is None.
     `(None, None)` before any cook asked, and while an asking cook is still running."""
     return _noise_tiers.last
+
+
+def noise_tiers_compatible(a, b):
+    """ENG-16: may a host composite a patch cooked with `noise_tiers` record `a` onto a base
+    cooked with record `b` (or the reverse — the question is symmetric) without risking the
+    promotion seam the module docstring describes?
+
+    Each argument is one cook's `CookResult.noise_tiers`: `None`, `{}`, or `{label: tier}` (the
+    three shapes `take_noise_tiers` produces — see the module docstring). This function makes
+    no call and reads no cache; it only compares the two records already in hand, and it never
+    raises — an argument that is not `None` and not a `dict` reads as "refuse", the same verdict
+    as every other case it cannot prove safe. **A wrong `True` costs wrong pixels; a wrong
+    `False` costs a redundant cook** — every arm below is decided in that direction:
+
+      * both `None`                    -> False. "Record unknown" is not a licence to composite
+                                          (the module docstring's rule) — it applies to a record
+                                          that is unknown on BOTH sides exactly as it applies to
+                                          one that is unknown on one side.
+      * one `None`, one a `dict`       -> False. Same rule: the `None` side named no tier at
+                                          all, so nothing on the `dict` side can be confirmed
+                                          against it, however empty or however unanimous.
+      * both `{}`                      -> True. Neither cook called a tiered noise builtin, so
+                                          there is no tier for the two cooks to disagree about —
+                                          compositing them raises exactly the risk compositing
+                                          any two noise-free frames does, which this record does
+                                          not gate.
+      * both non-empty, every label
+        they share maps to the same
+        tier, and neither has a label
+        the other lacks             -> True. Every builtin either cook called was served by the
+                                          same tier in both, so no call in the composited region
+                                          crosses a promotion.
+      * both non-empty, a label they
+        share maps to different tiers -> False. A direct disagreement: that builtin was served
+                                          by two different tiers across the two cooks, which is
+                                          the seam this record exists to catch.
+      * both non-empty, a label named
+        in only one of them          -> False, decided rather than left for the caller. Read
+                                          literally, an unshared label is not a *disagreement*
+                                          about a tier — there is no second value to disagree
+                                          with. But this function has no way to confirm what
+                                          tier that label WOULD have been served by in the cook
+                                          that never named it (a device mismatch reads this way
+                                          too: every label carries its device, so a CPU record
+                                          and a CUDA record for the very same builtins share no
+                                          labels at all), and "cannot confirm" is exactly the
+                                          case the both-`None` and one-`None` arms above already
+                                          resolve toward refusal. Extending the same rule to a
+                                          single unconfirmed label keeps the function's one
+                                          principle in one piece: every arm that is not a
+                                          confirmed, symmetric agreement is False.
+
+    Unrequested (a host that never calls this), the cost is zero — it runs no cook, touches no
+    cache and is not on any cook's path.
+    """
+    try:
+        if a is None or b is None:
+            return False
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            return False
+        if not a and not b:
+            return True
+        if set(a) != set(b):
+            return False
+        return all(a[label] == b[label] for label in a)
+    except Exception:
+        return False
 
 
 def last():

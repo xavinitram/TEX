@@ -1304,3 +1304,83 @@ def test_v031_noise_tier_record_default_path(r: SubTestResult):
         r.ok("want_noise_tiers defaults False and noise_tiers None; unasked/False read None, asked "
              "with no noise {} — identical pixels; a raising cook leaves nothing armed; tex_node "
              "never asks")
+
+
+def test_eng16_noise_tiers_compatible(r: SubTestResult):
+    """CANARY: `tier_trace.noise_tiers_compatible(a, b)` — the callable form of the module
+    docstring's compositing rule — pins all six arms named in the ENG-16 ask, plus the "never
+    raise on a malformed record" clause. A shape change to `CookResult.noise_tiers` (see
+    `tex_engine.CookResult.noise_tiers`, `take_noise_tiers`) that this function stops covering
+    reds one of the rows below rather than surfacing as a silent wrong-pixel composite downstream.
+    """
+    print("\n--- ENG-16: noise_tiers_compatible pins the compositing rule as one callable ---")
+    from TEX_Wrangle.tex_runtime import tier_trace
+    compat = tier_trace.noise_tiers_compatible
+
+    cases = [
+        # (label, a, b, want)
+        ("both None -> refuse (record unknown on both sides)", None, None, False),
+        ("one None, one empty dict -> refuse (record unknown on one side)",
+         None, {}, False),
+        ("one None, one non-empty dict -> refuse (record unknown on one side)",
+         {"simplex@cpu": "trace"}, None, False),
+        ("both empty dicts -> compatible (neither cook used a tiered builtin)",
+         {}, {}, True),
+        ("both non-empty, fully agreeing -> compatible",
+         {"simplex@cpu": "trace", "fbm/6@cpu": "trace"},
+         {"simplex@cpu": "trace", "fbm/6@cpu": "trace"}, True),
+        ("both non-empty, a shared label disagrees -> refuse",
+         {"simplex@cuda:0": "trace"}, {"simplex@cuda:0": "promoted"}, False),
+        ("both non-empty, a label named in only one -> refuse",
+         {"simplex@cpu": "trace", "fbm/6@cpu": "trace"},
+         {"simplex@cpu": "trace"}, False),
+        ("asymmetric in the other direction -> refuse (the question is symmetric)",
+         {"simplex@cpu": "trace"},
+         {"simplex@cpu": "trace", "fbm/6@cpu": "trace"}, False),
+        ("same label, different device suffix -> refuse (no shared label at all)",
+         {"simplex@cpu": "trace"}, {"simplex@cuda:0": "trace"}, False),
+        ("both cooks recorded promotion_failed on the same label -> compatible "
+         "(tier words are compared for equality only, never parsed)",
+         {"simplex@cpu": "promotion_failed"}, {"simplex@cpu": "promotion_failed"}, True),
+    ]
+    wrong = []
+    for label, a, b, want in cases:
+        got = compat(a, b)
+        if got is not want:
+            wrong.append(f"{label}: compat(a, b)={got!r}, want {want!r}")
+        got_rev = compat(b, a)
+        if got_rev is not want:
+            wrong.append(f"{label}: compat(b, a)={got_rev!r} disagrees with compat(a, b) — "
+                         f"the rule is supposed to be symmetric")
+
+    # Never raise: the wrong type entirely reads as refuse, and so does a dict whose own
+    # comparison misbehaves — a shape this function has never been handed but must not crash
+    # a host's compositing decision over.
+    class _RaisingEq:
+        def __eq__(self, other):
+            raise RuntimeError("a value type from a future record shape that compares unsafely")
+        __hash__ = object.__hash__
+
+    malformed = [
+        ("a list, not a dict", ["simplex@cpu", "trace"], {}),
+        ("a bare string", "simplex@cpu", {}),
+        ("an int", 0, {}),
+        ("a dict whose value's __eq__ raises", {"simplex@cpu": _RaisingEq()},
+         {"simplex@cpu": _RaisingEq()}),
+    ]
+    for label, a, b in malformed:
+        try:
+            got = compat(a, b)
+        except Exception as e:
+            wrong.append(f"malformed input {label} raised {type(e).__name__}: {e} — "
+                         f"must return False, never raise")
+            continue
+        if got is not False:
+            wrong.append(f"malformed input {label}: compat returned {got!r}, want False "
+                         f"(a value it cannot prove safe)")
+
+    if wrong:
+        r.fail("noise_tiers_compatible", "; ".join(wrong))
+    else:
+        r.ok(f"noise_tiers_compatible judged all {len(cases)} record-shape arms (both "
+             f"directions) and {len(malformed)} malformed inputs correctly, never raising")

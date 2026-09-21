@@ -673,6 +673,10 @@ and everything below is a pointer, one sentence each, to what exists on this tre
 - `CookResult.noise_tiers`, filled by `prepare`/`cook(want_noise_tiers=True)`, names which tier
   served each tiered noise builtin so a host can decline to composite frames cooked across a
   promotion (`tex_engine.py:328`, `:1189-1191`) — Tier 1, the same row as `CookResult` itself.
+  `tier_trace.noise_tiers_compatible(a, b)` (ENG-16, arrived after v0.38.0) is that compositing
+  decision as one callable — `True` only when both records are dicts and equal (including both
+  `{}`), `False` for `None` on either side, a disagreeing or asymmetric label set, or an
+  argument that is not a dict — so a host writes the comparison once — its own Tier 1 row below.
 - `tex_doctor.capabilities()`, also `tex doctor --json`, is a read-only per-tier report: did this
   process's box actually run each execution tier, is it known unavailable and why, or simply
   unmeasured (`tex_doctor.py:284-310`, `tex_cli.py:303-318`) — Tier 2, its own row below.
@@ -729,6 +733,7 @@ breaks a host.
 | **1 — Public** | `tex_api.TEXCompileError` + `.diagnostics` (ENG-4) | The ONE exception type a host catches for a bad compile | `test_eng4_structured_compile_error` |
 | **1 — Public** | `TEXDiagnostic.to_dict()` key set | A de-facto frontend contract since v0.15 | `test_eng5_embedding_canaries` |
 | **1 — Public** | `tex_engine.cook` / `prepare` / `run`, `CookResult` fields (ENG-1) | The host-agnostic cook entry point | `test_eng1_engine_cooks_without_the_node` |
+| **1 — Public** | `tex_runtime.tier_trace.noise_tiers_compatible(a, b)` (ENG-16, additive to the `CookResult.noise_tiers` row above, arrived after v0.38.0) | `True` only when both `noise_tiers` records are dicts and equal (both `{}` included); `False` for `None` on either side, a disagreeing or asymmetric label set, or an argument that is not a dict — never raises | `test_eng16_noise_tiers_compatible` |
 | **1 — Public** | The `ui=` HUD payload (`tex_perf` / `tex_probes` keys) | Read by the shipped JS | `test_eng5_embedding_canaries` |
 | **1 — Public** | `HostServices` method set (PORT-1) | What a host must implement | `test_port1_host_services`, `test_eng5_embedding_canaries` |
 | **1 — Public** | GraphSpec (`_tex_chain`) + `GRAPHSPEC_SCHEMA` (SCHED-1) | Versioned; absent == 1; a newer schema is REFUSED, never guessed | `test_eng5_embedding_canaries` |
