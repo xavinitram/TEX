@@ -263,7 +263,9 @@ def run_both(code, bindings, B=1, H=4, W=4):
 
     # Route through _invoke_cg (the single owner of the positional calling
     # convention) so new codegen runtime helpers don't need updating here too.
-    _invoke_cg(cg_fn, env, cg_bindings, stdlib_fns, dev, sp)
+    # `program=program`: FIX-3's wire-scalar staging needs the AST to know which
+    # binding names are `@`-bound (tests/test_codegen_value_parity.py exercises it).
+    _invoke_cg(cg_fn, env, cg_bindings, stdlib_fns, dev, sp, program=program)
 
     cg_result = {name: cg_bindings[name] for name in output_names}
     return interp_result, cg_result

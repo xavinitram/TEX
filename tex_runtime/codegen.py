@@ -44,7 +44,7 @@ from .codegen_stencil import (
 from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
                           _broadcast_pair, _ensure_spatial, vec_list_to_tensor)
 from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
-                     _HOST_SCALAR_ATTR, _dtype_rounded,
+                     _HOST_SCALAR_ATTR, _dtype_rounded, _tag_host_scalar,
                      set_cook_grid as _stdlib_set_cook_grid,
                      restore_cook_ctx as _stdlib_restore_cook_ctx)  # P0-D: cook grid
 
@@ -217,8 +217,78 @@ def _stage_vec_params(bindings: dict, device: Any, dtype) -> None:
                 value, dtype if dtype is not None else torch.float32, device)
 
 
+def _wire_names(program: Any) -> frozenset:
+    """`@`-bound (``kind == "wire"``) `BindingRef` names anywhere in *program* — the
+    complement of `compiled.py`'s `_params_on_device` walk, which collects `kind ==
+    "param"` names the same way. Generic `_iter_child_nodes` walk (dataclass-field
+    driven), so a new statement/expression kind is covered without an edit here."""
+    found: set[str] = set()
+    stack: list[ASTNode] = list(program.statements)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, BindingRef) and node.kind == "wire":
+            found.add(node.name)
+        stack.extend(_iter_child_nodes(node))
+    return frozenset(found)
+
+
+def _stage_wire_scalars(bindings: dict, device: Any, dtype, cg_fn: Any, program: Any) -> None:
+    """TRK-18/FIX-3: an `@`-bound value may arrive as a plain Python number rather than a
+    device tensor — nothing in the language requires a host to wire an image there, and a
+    ComfyUI FLOAT/INT primitive plugged into an `@` slot is exactly this shape. The
+    interpreter already copes: its binding-prep loop mints ANY non-tensor/str/list-or-tuple
+    value into a tagged 0-dim device tensor (PERF-2, `interpreter.py`'s per-cook binding
+    loop) before the program ever runs. Codegen's emitted preamble instead reads a wire
+    binding raw (`_bind[name]`, no `as_tensor` guard — unlike a `$param`'s
+    `_get_param_local`), so the first tensor method a generated expression calls on it
+    (`_broadcast_pair`'s `.dim()`, reached from `@image * @k`'s runtime-broadcast path)
+    raises `'<type>' object has no attribute 'dim'` and the whole cook falls back to the
+    interpreter — on every device, because nothing here is CUDA-specific.
+
+    Mirrors the interpreter's conversion exactly — same `_tag_host_scalar` call, same
+    rounding — so the two tiers agree bit-for-bit on the value a wire scalar resolves to.
+    Deliberately scoped to `wire` ('@') names ONLY, never `param` ('$') ones: a `$param`
+    Python scalar already has its own CPU-tensor `as_tensor` staging
+    (`_get_param_local`) and its own tracked cross-device story (TRK-15/TRK-17); touching
+    it here would change what device a `$param` lands on by default, which is exactly the
+    default-path move invariant #7 forbids for this ask.
+
+    PERF-7 (`tests/test_perf7_compiled_cold.py`) pins the exact Python-frame count a COLD
+    compiled cook is allowed to spend, and a first cut of this function blew that ceiling:
+    `_wire_names`'s AST walk (one `_iter_child_nodes` call per node) is real per-node work,
+    and running it unconditionally — even to discover there is nothing to stage — landed on
+    every cook, not just one with a wire scalar. So the walk is gated behind a value-only
+    pre-check with NO AST and NO `cg_fn` attribute access: every ordinary ComfyUI cook binds
+    only tensors (`@`) and strings, so that scan finds nothing and returns having touched
+    neither `_wire_names` nor the cache on `cg_fn` at all — the cost PERF-7 measures stays at
+    its pre-fix reading. The walk (cached on `cg_fn`, the `_params_on_device` pattern) runs
+    only for the genuinely rare cook that has a non-tensor binding, and even then only once
+    per generated function, never once per cook."""
+    has_candidate = False
+    for v in bindings.values():
+        if not isinstance(v, (torch.Tensor, str, list, tuple)):
+            has_candidate = True
+            break
+    if not has_candidate:
+        return
+    names = getattr(cg_fn, "_tex_wire_names", None)
+    if names is None:
+        names = cg_fn._tex_wire_names = _wire_names(program)
+    if not names:
+        return
+    target_dtype = dtype if dtype is not None else torch.float32
+    for name in names:
+        value = bindings.get(name)
+        if value is None or isinstance(value, (torch.Tensor, str, list, tuple)):
+            continue
+        fv = float(value)
+        bindings[name] = _tag_host_scalar(
+            torch.scalar_tensor(fv, dtype=target_dtype, device=device), fv, target_dtype)
+
+
 def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
-               device: Any, spatial_shape: tuple | None, dtype=None) -> None:
+               device: Any, spatial_shape: tuple | None, dtype=None,
+               program: Any = None) -> None:
     """Invoke a codegen-generated function with the constant argument tail.
 
     Single owner of the positional calling convention — it must match the
@@ -244,8 +314,16 @@ def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
     "one seam serves every tier" reason the cook grid is published here: the generated
     preamble passes an already-staged tensor through untouched, so the rank the
     interpreter binds is the rank every codegen tier sees — without a byte of emitted
-    code moving."""
+    code moving.
+
+    `program` (optional) is FIX-3's seam for the same reason: `_stage_wire_scalars` needs
+    the AST once, to know which binding names are `@`-bound, so it can mint a raw Python
+    wire scalar into the tagged device tensor the interpreter already hands the same
+    program. `None` (a caller that predates this ask) skips the staging exactly as before —
+    additive, no existing call site's behaviour moves."""
     _stage_vec_params(bindings, device, dtype)
+    if program is not None:
+        _stage_wire_scalars(bindings, device, dtype, cg_fn, program)
     _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype)
     try:
         cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
