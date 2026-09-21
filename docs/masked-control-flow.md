@@ -627,9 +627,23 @@ sort key, and `W7004`.
    prose copies. `tests/test_v037_satellites.py` pins eight of the ten.
 3. **Defaults that move:** *none*. A program without a `0.25` pragma computes exactly what it
    computes today, and the region-dependence gate declines exactly what it declines today.
-4. **New module filenames:** *none* expected; `L4`'s test rows land in a new
-   `tests/test_v0xx_masked_flow.py`, which does not ship (`tests/` is not in the registry
-   archive).
+4. **New module filenames: TWO, and this entry predicted zero.** Both ship, so both arrive in a
+   vendoring host's tree on a directory copy:
+
+   | module | stage | why |
+   |---|---|---|
+   | `tex_runtime/masked_flow.py` | L4 | the masking rules, which wanted a leaf rather than edits to the interpreter's existing flow control |
+   | `tex_runtime/codegen_masked.py` | L5 | the masked-emission leaf, kept out of the emitter to honour the standing "stop splitting here" verdict on that module |
+
+   Neither adds a scanner site to the published archive and no host imports either, but a
+   filename is a re-pin delta and is named before the tag regardless — a host is told about a new
+   file whether or not it uses it.
+
+   *Corrected twice, by L4 and then by L5, each discovering the prediction was wrong by shipping
+   a module.* The design reasoned about the work as edits to existing files, and twice it turned
+   out to want a leaf of its own. **The lesson is not to predict harder.** A design's re-pin delta
+   is a forecast; the ledger's is a measurement, and only the second is handed to a host. Derive
+   that section from `git diff --name-status <pin> HEAD` before the tag.
 
 Plus two breaking changes that are **not** gated on the pragma and must be named as such:
 **`E3015`** (§3), and **`W7007`/`W7008` becoming conditional** (§7), which a host that asserts on
