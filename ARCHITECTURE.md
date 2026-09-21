@@ -13,6 +13,9 @@ source text
   → optimizer      (tex_compiler/optimizer.py)  const-fold/DCE/CSE/LICM/unroll  (re-typechecks the result)
   → EXECUTION TIER (one of):
        interpreter  (tex_runtime/interpreter.py)   tree-walking tensor eval — the ORACLE
+                    (+ tex_runtime/masked_flow.py  a SECOND statement dispatch, bound per
+                     cook only for a program the language gate flags, holding the masked
+                     per-pixel control-flow rules; see docs/masked-control-flow.md)
        codegen      (tex_runtime/codegen.py)        AST → flat Python fn (no torch.compile)
        compiled     (tex_runtime/compiled.py)       codegen + torch.compile lifecycle, in a disposable thread
        graphed      (tex_runtime/graphed.py)         CUDA-graph replay of the interpreter

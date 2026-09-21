@@ -158,10 +158,10 @@ Four workstreams. Effort tags: S/M/L.
   force a CUDA event sync per cook; record the event pair, read `elapsed_time` on the
   *next* cook (stream-ordered; medians don't care), cap measurement frequency.
   Invariant #6 intact — deferral changes *when* the sync happens, never whether.
-- **LAT-4 (S).** Interpreter coordinate-builtins cache is single-entry
-  (interpreter.py:141-142); proxy/full-res alternation rebuilds ~64 MB of u/v tensors
-  every flip. Small LRU (4–8), registered in `_build_keepalive` + the tex_memory
-  budget, mirroring codegen's `_ENV_TENSOR_CACHE`.
+- **LAT-4 (S).** Interpreter coordinate-builtins cache was single-entry — the slot
+  `Interpreter.__init__` now fills as `_builtins_lru`; proxy/full-res alternation rebuilt
+  ~64 MB of u/v tensors every flip. Small LRU (4–8), registered in `_build_keepalive` +
+  the tex_memory budget, mirroring codegen's `_ENV_TENSOR_CACHE`.
 
 ### Workstream C — engine-seam hardening (pillars 2, 5, 7 + embedding)
 

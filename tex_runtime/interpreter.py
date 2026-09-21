@@ -37,6 +37,7 @@ from . import profile as _prof                      # PROF-1 seam (pure stdlib; 
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
                      _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar)
 from . import stdlib as _stdlib_mod    # P0-D: publishes the cook grid for const-coord reads
+from .masked_flow import MaskedFlowMixin, enabled_for as _masked_flow_enabled_for
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
@@ -116,7 +117,7 @@ class _ReturnSignal(Exception):
         self.value = value
 
 
-class Interpreter:
+class Interpreter(MaskedFlowMixin):
     """
     Evaluates a TEX AST against concrete tensor inputs.
 
@@ -167,6 +168,15 @@ class Interpreter:
         self._scatter_owned: set[str] = set()  # bindings whose buffer this run owns (safe to scatter into)
         self._user_functions: dict[str, FunctionDef] = {}
         self._call_depth: int = 0
+        # LANG-L4: masked per-pixel control flow (language 0.25, `masked_flow.py`). Declared
+        # here so a direct `_create_builtins`/`_exec_stmt` caller never trips over a missing
+        # attribute; `_masked` is False for every cook the language gate does not flag, and
+        # while `tex_api.LANGUAGE_VERSION` is below 0.25 that is every cook there is.
+        self._masked: bool = False
+        self._live = True                     # the current region's per-pixel live mask
+        self._frames: list = []               # loop / pass / call regions a transfer exits
+        self._decl_depth: dict[str, int] = {}  # name -> region depth it was declared at
+        self._region_depth: int = 0
         # LAT-4: bounded LRU of coordinate-builtin env sets, keyed by the
         # (spatial_shape, device, dtype, used, latent_channels, tile, roi, batch_slice) tuple
         # (ROI-3/ROI-6 added roi/batch_slice; `tile` is normalized into `roi` only after a
@@ -225,6 +235,7 @@ class Interpreter:
         time_context: dict | None = None,
         cancel=None,
         on_progress=None,
+        _masked_flow: bool | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Execute a TEX program.
@@ -258,6 +269,14 @@ class Interpreter:
             precision: "fp32" (default), "fp16", or "bf16" for reduced precision
             used_builtins: Pre-computed frozenset of builtin names (from cache).
                 If None, will be computed by walking the AST.
+            _masked_flow: LANG-L4 test seam, and NOT a host-facing switch. `None` (the
+                default, and the only value any engine call site passes) derives the
+                answer from `masked_flow.enabled_for` — the engine's own language gate,
+                `min(pragma, LANGUAGE_VERSION) >= MASKED_FLOW_SINCE`, which is False for
+                every program while `LANGUAGE_VERSION` is below `0.25`. It exists because
+                the masking rules and the oracle that proves them land before the version
+                moves (`docs/masked-control-flow.md` §8, stages L4/L5 vs L7), so the
+                harness needs a way to ask for the rules the engine already implements.
 
         Returns:
             If output_names is None: the value of @OUT (backward compat)
@@ -272,7 +291,8 @@ class Interpreter:
                                        precision, used_builtins=used_builtins,
                                        tile=tile, roi=roi, batch_slice=batch_slice,
                                        time_context=time_context,
-                                       cancel=cancel, on_progress=on_progress)
+                                       cancel=cancel, on_progress=on_progress,
+                                       _masked_flow=_masked_flow)
 
 
 
@@ -303,6 +323,7 @@ class Interpreter:
         time_context: dict | None = None,
         cancel=None,
         on_progress=None,
+        _masked_flow: bool | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         # Canonicalize an index-less "cuda" so cache keys ("cuda" vs "cuda:0")
@@ -418,6 +439,19 @@ class Interpreter:
         # cook on a thread-local, restored in the `finally` because a tiled cook calls
         # `execute` once per strip and each strip's grid is its own.
         _grid_token = _stdlib_mod.set_cook_grid(self.spatial_shape, self._dtype)
+        # LANG-L4: bind the language-0.25 statement handlers for THIS cook, and only when
+        # the engine's own gate says so. The DEFAULT path pays one attribute read and one
+        # `is None` test: a program with no `//!tex` pragma has `Program.language is None`,
+        # which decides the gate on its own (see `masked_flow.enabled_for` for why that is
+        # the same answer and not an approximation), so the language-level comparison and
+        # the flow-plan walk are never reached, let alone the masked handlers.
+        _mf_token = None
+        _mf_on = _masked_flow
+        if _mf_on is None:
+            _mf_on = (getattr(program, "language", None) is not None
+                      and _masked_flow_enabled_for(program, self._source))
+        if _mf_on:
+            _mf_token = self._mf_enter(program)
         try:
             if sink is not None:
                 self._exec_stmts_profiled(stmts, sink, cancel, on_progress, dev)
@@ -439,6 +473,8 @@ class Interpreter:
                     _report_progress(on_progress, "stmt", (i + 1) / n)
         finally:
             _stdlib_mod.restore_cook_ctx(_grid_token)
+            if _mf_token is not None:
+                self._mf_leave(_mf_token)
 
         # XPU fence (see above): guarantee the ingest DMA has landed before the
         # cook returns, so a downstream host-side writer of the shared pinned
@@ -1162,8 +1198,14 @@ class Interpreter:
                 hint="Assign to a named array element, e.g. 'arr[i] = value;'.",
             )
 
-    def _exec_scatter_write(self, target: BindingIndexAccess, value, op=None):
-        """Handle @OUT[px, py] = value or @OUT[px, py] += value (scatter write)."""
+    def _exec_scatter_write(self, target: BindingIndexAccess, value, op=None, live=None):
+        """Handle @OUT[px, py] = value or @OUT[px, py] += value (scatter write).
+
+        LANG-L4 (M5): `live` is the masked path's per-pixel live mask, and it gates the
+        write **by SOURCE** — a source pixel contributes iff it is live on the path to
+        this statement. `0.23` gates by destination, which has no per-pixel meaning once a
+        transfer can leave a branch. `None` (every caller below `0.25`) is the unmasked
+        write, byte-identical to before."""
         name = target.binding.name
         args = [self._eval(a) for a in target.args]
         px, py = args[0], args[1]
@@ -1242,6 +1284,22 @@ class Interpreter:
                 f"{buf_c} channels per pixel.",
                 target.loc, source=self._source, code="E6006",
                 hint=f"Match the channel count — use a vec{buf_c} value, or .rgb / .r to convert.")
+
+        # M5: compact the SOURCES down to the live ones, in row-major order (the order
+        # `docs/masked-control-flow.md` §5's divergence site 4 names, so an unspecified
+        # collision resolves the same way on both tiers). Boolean indexing over the
+        # already-flattened row-major arrays is that order by construction.
+        if live is not None and live is not True:
+            keep = live if isinstance(live, torch.Tensor) else torch.tensor(bool(live))
+            keep = keep.expand(B, H, W) if keep.dim() < 3 else keep
+            keep = keep.contiguous().reshape(-1)
+            if not bool(keep.any().item()):
+                return
+            flat_b = flat_b[keep]
+            flat_y = flat_y[keep]
+            flat_x = flat_x[keep]
+            if isinstance(flat_v, torch.Tensor) and flat_v.dim() > 0:
+                flat_v = flat_v[keep]
 
         idx = (flat_b, flat_y, flat_x)
         if op is None:
@@ -1928,6 +1986,11 @@ class Interpreter:
         raise _ReturnSignal(value)
 
     def _call_user_function(self, func_def: FunctionDef, call_node: FunctionCall):
+        # LANG-L4 (M4): a call is a region — it inherits the caller's live mask, records a
+        # `return` for the pixels live at it, and is skipped entirely when no pixel is
+        # live. One attribute test per user-function call on the default path.
+        if self._masked:
+            return self._mf_call_user_function(func_def, call_node)
         self._call_depth += 1
         if self._call_depth > MAX_CALL_DEPTH:
             self._call_depth -= 1
