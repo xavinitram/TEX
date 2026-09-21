@@ -2527,14 +2527,14 @@
    "param_only_names": [
     "label"
    ],
-   "sha256_source": "214dcee60a6569e385716feed38caf10cf0615d3ea85ff1ab9d1c80bc697bbaf",
+   "sha256_source": "ab3def2ab9b4609e1ed0f1a065d78a3233b25efeedbf3864b0493bd1fbea4b1f",
    "typed": {
     "binding_types": {
      "OUT": "vec3",
      "image": "vec4",
      "label": "vec4"
     },
-    "fingerprint": "e782110776a684051b03fbe6f65144539be0420c1f62c89b8af98977525b93bb"
+    "fingerprint": "e11e98d95a59cbc6e45a99919e52177863d67ef06cdb92028f8103c18825e101"
    },
    "wires": {
     "binding_types": {
@@ -2542,7 +2542,7 @@
      "image": "vec4",
      "label": "float"
     },
-    "fingerprint": "bd1654a72f5d8c51f92e076111810004b97e2321c6463f210843fe9074812858"
+    "fingerprint": "1c57490db38b3436607c3251bf21dd1c8b6e2b36f70b6584757507dc9770b5ae"
    }
   },
   {
