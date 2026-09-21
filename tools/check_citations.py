@@ -198,11 +198,18 @@ def tracked_files(root):
         # `root` must BE the work tree's top, not a directory inside someone else's
         # repository — otherwise a temporary tree under a checked-out parent would
         # inherit that parent's file list and this check would judge the wrong tree.
+        # Compare REALPATHs, not abspaths: git resolves a symlink/junction on `root`
+        # before it answers (it reports the link's target), so `abspath(root)` — which
+        # only normalises `.`/`..` and never follows a link — disagreed with git's own
+        # answer for any root reached through one, and the guard fired on an identical
+        # tree. `realpath` follows the link on both sides, so the guard still refuses a
+        # `root` that is merely a directory INSIDE someone else's repository (its
+        # resolved path stays a strict descendant of that repository's resolved top).
         if top.returncode != 0:
             return None
         said = top.stdout.decode("utf-8", "replace").strip()
-        if not said or os.path.normcase(os.path.abspath(said)) != os.path.normcase(
-                os.path.abspath(root)):
+        if not said or os.path.normcase(os.path.realpath(said)) != os.path.normcase(
+                os.path.realpath(root)):
             return None
         out = subprocess.run(
             ["git", "-C", root, "ls-files", "-z"],

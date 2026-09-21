@@ -18,14 +18,34 @@ shipped docs landed on a blank line or past the end of a file.
      builds a throwaway tree whose citations are wrong in each of the four ways that matter
      and proves the checker reds on every one, and passes the one citation that is right.
 
+  3. `test_neg4_citation_root_through_a_link` — NEG-4. `tracked_files()` asks git for the
+     work tree's top and refuses to trust the answer unless it equals `root` under
+     `normcase(abspath(...))`. Git resolves a symlink/junction before it answers; `abspath`
+     never does — so a `root` that reaches the SAME tree through a link disagreed with
+     itself, the guard fired, and the tool fell back to walking the directory, which reads
+     whatever untracked scratch sits beside the repository as though it were a shipped
+     document. This row builds a throwaway repo, reaches it through a link, and asserts the
+     checker still reports `(git)`, not `(walk)` — and that the guard still refuses a `root`
+     that is merely a directory INSIDE the linked repo, which is its real job.
+
+     Why row 1 never caught this: `_PKG` below is built with `Path(__file__).resolve()`,
+     which resolves `TEX_Wrangle`'s own junction before the tool ever sees a path — so the
+     real tree is always read through its resolved form and the fallback path is never
+     exercised by the existing rows.
+
 The tool lives in `tools/`, which `.comfyignore` excludes from the registry archive, so
 nothing here moves PUB-1's shipped surface (`tests/test_pub1_archive.py` is the proof).
-Stdlib only: no torch, no ComfyUI, no CUDA, so it runs identically on the CI lane.
+Stdlib only: no torch, no ComfyUI, no CUDA, so it runs identically on the CI lane — except
+row 3's link creation, which is platform-dependent and reports a real `r.skip` rather than a
+pass when a platform can create neither a junction nor a symlink.
 """
 import importlib.util
+import io
 import os
+import subprocess
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from helpers import SubTestResult
@@ -209,9 +229,135 @@ def test_simp5_the_checker_is_not_inert(r: SubTestResult):
         r.fail("SIMP-5 tool exit code", f"tools/check_citations.py exited {rc}, expected 0")
 
 
+def _make_link(link_path: Path, target_path: Path):
+    """Create a directory link at `link_path` pointing at `target_path` — a junction on
+    Windows (`mklink /J`, no privilege needed), `os.symlink` elsewhere. Returns None on
+    success, or a reason string on failure; never raises, so the caller can turn an
+    unsupported platform or a permission refusal into a real `r.skip` rather than a
+    silent pass. `mklink` needs backslash-style paths — a forward-slash path is misread as
+    a switch (`Invalid switch - "Users"`, measured against this box's temp path)."""
+    if sys.platform == "win32":
+        link_s = str(link_path).replace("/", "\\")
+        target_s = str(target_path).replace("/", "\\")
+        try:
+            proc = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", link_s, target_s],
+                capture_output=True, text=True, timeout=60,
+            )
+        except OSError as e:
+            return f"mklink subprocess failed: {e}"
+        if proc.returncode != 0:
+            return f"mklink /J exited {proc.returncode}: {proc.stdout.strip()} {proc.stderr.strip()}"
+        return None
+    try:
+        os.symlink(str(target_path), str(link_path), target_is_directory=True)
+    except OSError as e:
+        return f"os.symlink failed: {e}"
+    return None
+
+
+def test_neg4_citation_root_through_a_link(r: SubTestResult):
+    """NEG-4 — see the module docstring, row 3."""
+    print("\n--- NEG-4: check_citations resolves --root through a link the way its own "
+          "gate (tracked_files) does ---")
+    if not _TOOL.is_file():
+        r.fail("NEG-4 tool present", f"{_TOOL} is missing")
+        return
+    cc = _load_tool()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        real = Path(tmp) / "real_repo"
+        (real / "docs").mkdir(parents=True)
+        (real / "mod.py").write_text(
+            "import os\n"
+            "\n"
+            "\n"
+            "def widget_count(n):\n"
+            "    total = n + 1\n"
+            "    return total\n",
+            encoding="utf-8",
+        )
+        (real / "docs" / "note.md").write_text(
+            "# note\n\n`widget_count` adds one (`mod.py:5`).\n", encoding="utf-8",
+        )
+
+        def _git(*args):
+            return subprocess.run(["git", *args], cwd=str(real), capture_output=True,
+                                   text=True, timeout=60)
+
+        _git("init", "-q")
+        _git("config", "user.email", "neg4@example.invalid")
+        _git("config", "user.name", "NEG-4")
+        _git("add", "mod.py", "docs/note.md")
+        commit = _git("commit", "-q", "-m", "init")
+        if commit.returncode != 0:
+            r.skip("NEG-4 through-a-link reproduction",
+                   f"could not commit the scratch repo (no git on this box?): "
+                   f"{commit.stderr.strip() or commit.stdout.strip()}")
+            return
+
+        # An UNTRACKED doc beside the repository, carrying a citation to a line that does
+        # not exist — the artefact the walk fallback reads and the git-backed set does not.
+        # This is what a `TEX/docs/shard-*.md`-shaped local scratch file looks like to the
+        # checker: real on disk, invisible to git, and never meant to be judged as shipped.
+        (real / "docs" / "untracked.md").write_text(
+            "# scratch (untracked on purpose)\n\nSee the ghost (`mod.py:999`).\n",
+            encoding="utf-8",
+        )
+
+        link = Path(tmp) / "link_repo"
+        reason = _make_link(link, real)
+        if reason is not None:
+            r.skip("NEG-4 through-a-link reproduction",
+                   f"this platform could create neither a junction nor a symlink: {reason}")
+            return
+
+        cc._SPAN_CACHE.clear()
+        citations, stats = cc.check(str(link))
+        if stats["source"] != "git":
+            r.fail("NEG-4 root resolves through a link",
+                   f"expected the document set to read (git) through the link; got "
+                   f"'{stats['source']}' — the untracked docs/untracked.md dead citation "
+                   f"would have leaked into the scanned set: {stats!r}")
+        else:
+            r.ok("NEG-4: --root through a link still resolves the document set via git")
+
+        dead = [c for c in citations if c.verdict == "error"]
+        if dead:
+            r.fail("NEG-4 no leaked untracked citation",
+                   "the untracked doc's dead citation was read even though the tree was "
+                   "reached through a link:\n  "
+                   + "\n  ".join(f"{c.where()} `{c.text}` — {c.detail}" for c in dead))
+        else:
+            r.ok("NEG-4: the untracked doc's dead citation did not leak through the link")
+
+        # The CLI wrapper's summary line is what a gate actually reads.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cc.main(["--root", str(link)])
+        printed = buf.getvalue()
+        if "(git)" in printed and "(walk)" not in printed:
+            r.ok("NEG-4: the summary line reports the document set as (git), not (walk)")
+        else:
+            r.fail("NEG-4 summary line",
+                   f"expected '(git)' and not '(walk)' in the summary line:\n{printed}")
+
+        # The guard's real job, which the fix must not undo: refuse a root that is a
+        # directory INSIDE someone else's repository, reached through the SAME link.
+        cc._SPAN_CACHE.clear()
+        inside = cc.tracked_files(str(link / "docs"))
+        if inside is None:
+            r.ok("NEG-4: the guard still refuses a non-top directory reached through a link")
+        else:
+            r.fail("NEG-4 guard regression",
+                   f"tracked_files() on a directory INSIDE the repo (reached through the "
+                   f"link) should return None (fall back to walk); got {inside!r}")
+
+
 if __name__ == "__main__":
     _r = SubTestResult()
     test_simp5_shipped_doc_citations(_r)
+    test_neg4_citation_root_through_a_link(_r)
     test_simp5_the_checker_is_not_inert(_r)
     print(f"\n{_r.passed} passed, {_r.failed} failed")
     sys.exit(1 if _r.failed else 0)

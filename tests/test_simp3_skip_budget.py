@@ -57,7 +57,12 @@ _SKIP_VOCAB = re.compile(
 #: Rows the CPU lane cannot run, counted at their sites. Moves DOWN freely (and reds until the
 #: pin follows); moves UP only as a deliberate decision that says which environment the new row
 #: needs and why the row cannot be written without it.
-_SKIP_BUDGET = 95
+#: NEG-4 raised this by 2: `test_neg4_citation_root_through_a_link` needs a working git
+#: binary (to build its throwaway repo) and a platform that can create a directory
+#: junction or symlink (to reproduce the root-through-a-link condition at all) — neither
+#: is guaranteed on every CI runner, and the row must report a real skip rather than a
+#: silent pass when either is absent (see `tests/test_simp5_citations.py`).
+_SKIP_BUDGET = 97
 
 
 def _literal(node) -> str:
