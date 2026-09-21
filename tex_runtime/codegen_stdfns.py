@@ -398,12 +398,39 @@ class _EmitStdFnsMixin:
             py = self._tmp()
             self._emit(f"{px} = {args[1]}.clamp(0, {img_var}.shape[2] - 1).long()")
             self._emit(f"{py} = {args[2]}.clamp(0, {img_var}.shape[1] - 1).long()")
-            # B=1 fast path: direct indexing without batch dim
+            # B=1 fast path: direct indexing, batch dim kept explicitly.
+            #
+            # TRK-5/FIX-4: the old form indexed the batch axis with a bare `0`
+            # (basic indexing, which REMOVES that axis) and left `px`/`py` as
+            # whatever rank the caller happened to hand in. That is only safe
+            # when both coordinates have already had their own leading batch
+            # dim stripped (the old `else` sub-case's `py[0]`/`px[0]`) — the
+            # advanced-index broadcast then rebuilds exactly the plain [H,W]
+            # grid, and reinserting one dim via a `0:1` slice (instead of the
+            # dim-removing `0`) correctly restores rank-4 [1,H,W,C], bit-exact
+            # with the interpreter's `fn_fetch`.
+            #
+            # The old `if px.dim() < 3` sub-case did NOT strip a leading dim
+            # first: when only `px` is scalar/degenerate (e.g. `sx` in a
+            # `for` loop, `iy` still `[1,H,1]`), `py` still carries its OWN
+            # leading singleton, and a `0:1` slice there would stack a
+            # SECOND leading dim on top of it (rank-5), not restore rank-4.
+            # `examples/break_search.tex` is exactly this shape.
+            #
+            # `.expand(1, H, W)` — mirroring `fn_fetch`'s own scalar-coordinate
+            # sub-case (`stdlib.py`'s `px_i.expand(1, H, W)` /
+            # `img[0, py_i[0], px_i[0]].unsqueeze(0)`) — sidesteps both
+            # failure modes at once: it is a no-op broadcast view (not a
+            # copy) on an already-correct [1,H,W]-or-narrower coordinate
+            # tensor, so it changes no value, only makes both sub-cases use
+            # the identical, always-rank-correct shape before indexing.
             self._emit(f"if {img_var}.shape[0] == 1:")
             self._indent += 1
-            self._emit(f"{tmp} = {img_var}[0, {py}, {px}]"
-                       f" if {px}.dim() < 3"
-                       f" else {img_var}[0, {py}[0], {px}[0]]")
+            px_full = self._tmp()
+            py_full = self._tmp()
+            self._emit(f"{px_full} = {px}.expand(1, {img_var}.shape[1], {img_var}.shape[2])")
+            self._emit(f"{py_full} = {py}.expand(1, {img_var}.shape[1], {img_var}.shape[2])")
+            self._emit(f"{tmp} = {img_var}[0, {py_full}[0], {px_full}[0]].unsqueeze(0)")
             self._indent -= 1
             self._emit(f"else:")
             self._indent += 1

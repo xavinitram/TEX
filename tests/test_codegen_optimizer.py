@@ -2680,6 +2680,103 @@ for (int dy = -1; dy <= 1; dy = dy + 1) {
         r.fail("stencil seed: routing (non-zero box declines; zero box + min/max lower)", f"{e}")
 
 
+def test_fix4_fetch_batch_one(r: SubTestResult):
+    """FIX-4/TRK-5: `_emit_fn_fetch`'s B=1 fast path must keep the batch dim.
+
+    The hoisted `fetch(@img, px, py)` fast path (only reachable from inside a
+    for/while loop body — `_hoist_sample_setup` is called from `_emit_for`/
+    `_emit_while`) indexed `{img_var}[0, py, px]` at B=1, which drops the
+    leading batch axis to rank-3 `[H,W,C]` where the oracle's `fn_fetch`
+    (`tex_runtime/stdlib.py`) always returns rank-4 `[B,H,W,C]`. A downstream
+    binop against another rank-4 operand (e.g. `.r * @A.r`, the design doc's
+    own minimal repro) then raises a tensor-size mismatch instead of cooking —
+    a wasted codegen attempt, a crash, and a silent fallback to the
+    interpreter (`compiled.py::_codegen_only_execute`'s `except Exception`).
+    The fix expands `px`/`py` to the full `[1, H, W]` grid (mirroring
+    `fn_fetch`'s own scalar-coordinate sub-case) before indexing with the
+    batch axis stripped, then restores it with `.unsqueeze(0)` — matching
+    the oracle's own expand-index-unsqueeze shape at every combination of
+    scalar vs. spatial coordinates, not just B=2 (which this bug never hit:
+    the `else` branch already used `_torch.arange(...).view(-1,1,1)`, whose
+    result is rank-4 by construction). A first attempt patched the old
+    `[0, ...]` indexing with a `0:1` slice in place, which fixed the
+    TRK-5 shape (both coordinates already spatial) but stacked a SECOND
+    leading dim onto `examples/break_search.tex`'s shape (one coordinate a
+    scalar loop counter, the other still carrying its own `[1,H,1]`), so the
+    expand-based rewrite replaced it rather than patching around it.
+    """
+    print("\n--- FIX-4: fetch() batch-size-one codegen/interp parity ---")
+
+    torch.manual_seed(11)
+
+    # The design doc's own program: a 3x3 fetch-and-accumulate loop, then a
+    # binop against another per-pixel operand — the shape exactly the tracker
+    # cites as raising `RuntimeError: The size of tensor a (3) must match the
+    # size of tensor b (6) ...` pre-fix.
+    loop_code = """
+vec3 acc = vec3(0.0);
+for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+        acc = acc + fetch(@A, ix + dx, iy + dy).rgb * @A.r;
+    }
+}
+@OUT = acc;
+"""
+    _equiv_strict(r, "fetch-in-loop batch=1 (TRK-5 minimal repro)",
+                  loop_code, {"A": torch.rand(1, 6, 6, 4)})
+    _equiv_strict(r, "fetch-in-loop batch=2 (was already correct)",
+                  loop_code, {"A": torch.rand(2, 6, 6, 4)})
+
+    # Both coordinates scalar (non-spatial constants) — the fast path's other
+    # historical sub-case, same batch-dropping bug under the old `[0, ...]` form.
+    scalar_code = """
+vec3 acc = vec3(0.0);
+for (int dy = 0; dy <= 1; dy++) {
+    acc = acc + fetch(@A, 2.0, 3.0).rgb;
+}
+@OUT = acc;
+"""
+    _equiv_strict(r, "fetch-in-loop scalar coords, batch=1",
+                  scalar_code, {"A": torch.rand(1, 6, 6, 4)})
+    _equiv_strict(r, "fetch-in-loop scalar coords, batch=2",
+                  scalar_code, {"A": torch.rand(2, 6, 6, 4)})
+
+    # Structural guard: the B==1 branch must always restore the batch axis
+    # via `.expand(...)` + `.unsqueeze(0)` before handing the result on —
+    # `_equiv_strict` alone can't see a regression that happens to still
+    # broadcast correctly by luck (as the tracker's neighbouring "F4" row
+    # does, via addition into a rank-4 accumulator, and as this fast path's
+    # OWN first-attempt fix did on the TRK-5 shape while still reddening
+    # `examples/break_search.tex`'s mixed scalar/spatial-coordinate shape).
+    try:
+        src = _codegen_source(loop_code, {"A": torch.rand(1, 6, 6, 4)})
+        assert ".unsqueeze(0)" in src, (
+            "fetch B=1 fast path no longer restores the batch dim via "
+            "unsqueeze(0) (TRK-5 regression)"
+        )
+        assert ".expand(1, " in src, (
+            "fetch B=1 fast path no longer broadcasts px/py to the full "
+            "[1,H,W] grid before indexing — a scalar coordinate (e.g. a "
+            "loop counter) paired with a spatial one would misshape again"
+        )
+        r.ok("fetch B=1 fast path: batch axis is expanded and restored, not dropped")
+    except Exception as e:
+        r.fail("fetch B=1 fast path: batch axis is expanded and restored, not dropped", f"{e}")
+
+    # examples/break_search.tex: px = a scalar for-loop counter (sx), py =
+    # the full per-row builtin (iy, `[1,H,1]`) — the mixed scalar/spatial
+    # shape the first-attempt `0:1`-slice fix mishandled (it stacked a
+    # second leading dim onto py's own, producing rank-5 and a downstream
+    # merge crash two statements away from the fetch call itself).
+    _equiv_strict(r, "fetch scalar px + spatial py (break_search.tex shape)", """
+vec3 acc = vec3(0.0);
+for (int sx = 0; sx <= 1; sx++) {
+    acc = acc + fetch(@A, sx, iy).rgb;
+}
+@OUT = acc;
+""", {"A": torch.rand(1, 6, 6, 4)})
+
+
 def test_codegen_sample_hoist_in_branches(r: SubTestResult):
     """CG-B3: a hoisted sample() setup inside an if/else branch is BRANCH-LOCAL.
 
