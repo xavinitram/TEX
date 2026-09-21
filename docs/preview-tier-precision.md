@@ -124,18 +124,24 @@ already solved.
 
 ## 4. The honest gaps
 
-**The colour/data plane split is not implemented as stated.** The roadmap's shape is "colour
-planes half / data planes fp32". TEX cannot tell them apart today: DATA-1's vocabulary is
-`colorspace / premult / frame / extra` with **no role field**, and named planes are DATA-6
-(v0.37). Pretending otherwise would mean inferring a role from pixels, which is exactly the
-kind of silent auto-tuning S-5 forbids. So the split is expressed with the two instruments
-that do exist, and both fail toward fp32:
+**The colour/data plane split is not implemented.** The roadmap's shape is "colour planes half
+/ data planes fp32". Named planes shipped at v0.37.0 (DATA-6), and TEX still cannot tell colour
+from data apart: a plane's `BufferDesc` (`tex_io`) carries a storage dtype and a colour-transfer
+CURVE hint (linear vs. sRGB) — a file-container convention, not a per-layer semantic. Proof: the
+EXR layer reader tags every decoded plane `transfer="linear"` (`tex_io/exr.py::read_layers`), a
+colour AOV (`diffuse`) and a data AOV (`Z`, depth) alike, so the hint cannot separate them even
+informally. DATA-6's own design (`docs/plane-bindings.md`) never proposed a role field. Inferring
+one from pixels — or from a plane's bare name, which is just as much an unreviewed guess — is
+exactly the silent auto-tuning S-5 forbids. So the split still leans on the two instruments that
+predate planes, and both fail toward fp32:
 
 * an explicit `storage="fp32"` pin, for a host that knows a binding is depth/normals/motion;
 * a value-range gate — anything above `FP16_MAX` declines, because overflow to `inf` is not
   "less precise", it is a different number.
 
-When DATA-6 lands, `choose_storage` grows a role arm and no caller changes.
+**Reopen condition: an explicit, host-supplied plane role, never inferred.** The trigger was
+never "when planes land" — planes have landed and supply no role — it is "when a plane declares
+one." The moment that exists, `choose_storage` grows a role arm and no caller changes.
 
 **LATENT is not auto-excluded.** A latent is a data plane by any reading, but `ResultCache`
 receives a tensor, not a wire type, and cannot see it. A host caching latents at preview

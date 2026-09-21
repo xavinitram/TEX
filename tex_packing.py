@@ -71,8 +71,9 @@ WHAT IS NOT DECIDED HERE, and must not be:
 
     So `choose_storage` takes `kind=`, and the caller that knows passes it. It stays a PURE
     function of its arguments — the cache never sniffs a tensor to guess a role, which is the
-    S-5 line. When DATA-6 lands, a real plane role supersedes `kind` and the signature does not
-    change.
+    S-5 line. Planes (DATA-6) shipped without one; see `docs/preview-tier-precision.md` §4 for
+    why and the real reopen condition. A declared plane role, once one exists, supersedes
+    `kind` and the signature does not change.
 
     `storage="fp32"` remains as the explicit host pin, and one honest caveat about it: it is
     doing double duty as a *role assertion* rather than a codec choice. A caller passing it to
