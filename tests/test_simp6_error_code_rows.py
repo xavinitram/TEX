@@ -105,6 +105,11 @@ _DECLARATIONS = (
      "a return whose type is not the declared one"),
     ("E3014", 'float f() { float g() { return 1.0; } return 1.0; } @OUT = vec4(f());',
      "a function defined inside a function"),
+    ("E3015",
+     'float total = 0.0; for (int i = 0; i < 2; i = i + 1) { '
+     'float f(float x) { if (x > 0.5) { break; } return x; } total = total + f(1.0); } '
+     '@OUT = vec4(total);',
+     "a bare `break` inside a function defined inside a loop"),
 )
 
 

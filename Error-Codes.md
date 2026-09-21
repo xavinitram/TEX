@@ -138,6 +138,10 @@ Type checker. See the message shown with the code for the specific cause and fix
 
 Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
 
+### E3015
+
+Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
+
 ### E3100
 
 Type checker. See the message shown with the code for the specific cause and fix; the class is described above.

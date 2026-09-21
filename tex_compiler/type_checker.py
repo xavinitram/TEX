@@ -169,6 +169,13 @@ class TypeChecker:
     # Track loop nesting depth for break/continue validation
     _loop_depth: int = 0
 
+    # LANG-L2: True while checking a function body (any function body, at any nesting of
+    # loops around the *definition*). `_check_function_def` saves and resets `_loop_depth`
+    # to 0 for the body, so a `break`/`continue` written directly in a function body never
+    # sees a nonzero depth borrowed from a loop the definition happens to sit inside — see
+    # `_check_break_continue`'s E3015 branch.
+    _in_function_body: bool = False
+
     # User-defined function signatures: name -> {return_type, params, node}
     _user_functions: dict[str, dict] = field(default_factory=dict)
 
@@ -397,8 +404,22 @@ class TypeChecker:
         """Validate that break/continue appears inside a loop."""
         kind = "break" if node.__class__ is BreakStmt else "continue"
         if self._loop_depth <= 0:
-            self._error(f"'{kind}' statement outside of a loop.", node.loc, code="E3002",
-                        hint=f"'{kind}' can only be used inside for or while loops.")
+            if self._in_function_body:
+                # LANG-L2 / E3015: a loop lexically wrapped around the function's
+                # DEFINITION is not a loop this CALL is inside of — every call runs the
+                # body fresh, so `_loop_depth` is reset to 0 on function entry regardless
+                # of how many loops the definition sits inside (see `_check_function_def`).
+                # E3002's text ("outside of a loop") would be false here whenever such a
+                # loop is visible around the definition, so this gets its own code.
+                self._error(f"'{kind}' cannot leave a loop that is outside this function.",
+                            node.loc, code="E3015",
+                            hint="A function body is its own loop scope — the loop around "
+                            "the function's definition is not this statement's to leave. "
+                            "Return a value the caller tests, and put the "
+                            f"'{kind}' in the caller's own loop.")
+            else:
+                self._error(f"'{kind}' statement outside of a loop.", node.loc, code="E3002",
+                            hint=f"'{kind}' can only be used inside for or while loops.")
 
     def _check_var_decl(self, node: VarDecl):
         """Type-check a variable declaration: the initializer must be assignable to the declared type."""
@@ -865,10 +886,24 @@ class TypeChecker:
         self._push_scope()
         saved_return_type = self._current_function_return_type
         self._current_function_return_type = return_type
+        # LANG-L2: a function body is its own loop scope, checked fresh on every call —
+        # NOT the scope of whatever loop happens to lexically wrap the `FunctionDef`
+        # itself. Save and reset `_loop_depth` (and mark `_in_function_body`) around the
+        # body regardless of the depth outside, or a `break`/`continue` written directly
+        # in the body inherits the *definition's* enclosing loop and the E3002/E3015 guard
+        # below never fires — the defect `_check_break_continue`'s E3015 branch exists to
+        # close. A later stage (masked per-pixel control flow) depends on this reset being
+        # correct even where E3015 does not fire, so it is fixed here, not patched around.
+        saved_loop_depth = self._loop_depth
+        self._loop_depth = 0
+        saved_in_function_body = self._in_function_body
+        self._in_function_body = True
         for ptype, pname in param_types:
             self._declare_var(pname, ptype, node.loc)
         for stmt in node.body:
             self._check_stmt(stmt)
+        self._in_function_body = saved_in_function_body
+        self._loop_depth = saved_loop_depth
         self._current_function_return_type = saved_return_type
         self._pop_scope()
 

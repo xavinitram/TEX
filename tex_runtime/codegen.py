@@ -1395,11 +1395,32 @@ class _CodeGen(_EmitStdFnsMixin):
         saved_in_fn = self._in_user_function
         self._in_user_function = True
 
+        # LANG-L2: a function body is emitted fresh on every call — NOT inside whatever
+        # loop lexically wraps the `FunctionDef` itself. `_use_native_flow_control` and
+        # `_scalar_loop` are per-emission-context flags an ENCLOSING loop sets for its OWN
+        # body (native break/continue vs `_CgBreak`/`_CgContinue`; Python-float math vs
+        # tensor ops) and every loop emitter that sets them already saves/restores around
+        # itself — except this one, which left a nested `def` to inherit whatever the
+        # outer loop last set. `break`/`continue` written directly in a function body are
+        # now refused at type-check (E3015 / E3002), which closes the one spelling this
+        # bug had a visible symptom for; `return` stays legal and unconditionally native
+        # (`_emit_return_stmt` does not consult either flag), and a nested loop INSIDE the
+        # body sets its own flags correctly regardless — but leaving the leak in place
+        # means every statement emitted for this body starts from whatever the ambient
+        # loop last left behind rather than the function's own fresh state, which the
+        # masked-control-flow codegen work (§5 of the design note) depends on being right.
+        saved_native_flow = self._use_native_flow_control
+        self._use_native_flow_control = False
+        saved_scalar_loop = self._scalar_loop
+        self._scalar_loop = False
+
         for s in stmt.body:
             self._emit_stmt(s)
 
         # Default return if no explicit return
         self._emit(f"return _torch.scalar_tensor(0.0, dtype=_torch.float32, device=_dev)")
+        self._scalar_loop = saved_scalar_loop
+        self._use_native_flow_control = saved_native_flow
         self._in_user_function = saved_in_fn
         self._local_vars = saved_locals
         self._indent -= 1

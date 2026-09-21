@@ -572,6 +572,17 @@ MUTATIONS = [
      "        if strings:\n"
      "            return True                       # clauses (c) and (d) never sunset",
      ("test_v036_region_dependence",)),
+    # ── LANG-L2 (E3015: break/continue inside a function defined inside a loop) ────────
+    # TRK-28's underlying scope defect: `_check_function_def` must reset `_loop_depth` to 0
+    # for the body, or a function defined inside a loop inherits that loop's depth and the
+    # E3002/E3015 guard in `_check_break_continue` never fires (the exact bug that let the
+    # two tiers disagree — see docs/masked-control-flow.md §3). Removing just the reset
+    # (leaving `_in_function_body` alone) reproduces it precisely.
+    ("LANG-L2: function-def stops resetting _loop_depth for its body", "tex_compiler/type_checker.py",
+     "        saved_loop_depth = self._loop_depth\n"
+     "        self._loop_depth = 0\n",
+     "        saved_loop_depth = self._loop_depth\n",
+     ("test_lang_l2_e3015",)),
 ]
 
 
