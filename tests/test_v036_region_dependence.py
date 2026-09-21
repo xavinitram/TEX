@@ -297,10 +297,16 @@ def test_t7_no_shipped_program_is_declined(r: SubTestResult):
             declined.append(name)
     try:
         assert not unparsed, f"shipped programs failed to parse: {unparsed}"
-        assert declined == [], (
+        # DOC-8 corrected `examples/string_format.tex`'s format() calls from dead `%f`/`%s`
+        # sequences (never filled — see the CHANGELOG's ASK-9 entry) to real `{}`
+        # placeholders. Its five numeric calls now genuinely cast a per-region-varying value
+        # straight to a string, so clause (d) correctly declines it — the one legitimate
+        # entry the count below should ever gain from a documentation fix.
+        assert declined == ["string_format.tex"], (
             "the predicate declines shipped programs, so it is no longer only about the "
             f"region-dependent class: {declined}")
-        r.ok(f"0 of {len(examples) + len(stock)} shipped programs are region-dependent")
+        r.ok(f"1 of {len(examples) + len(stock)} shipped programs is region-dependent "
+             f"(string_format.tex)")
     except Exception as e:
         r.fail("T7 shipped-program count", f"{type(e).__name__}: {e}")
 
@@ -857,16 +863,20 @@ def test_t10_w7008_names_what_the_engine_now_refuses(r: SubTestResult):
         r.fail("T10 W7007 without W7008", f"{type(e).__name__}: {e}")
 
     try:
-        # And no shipped example gains a code: an opt-in host reading the advisories sees
-        # exactly the five W7006 files it saw before.
+        # DOC-8 gave `string_format.tex` real `{}` placeholders (they were `%f`/`%s`, never
+        # filled), so it now correctly carries W7008 beside the five W7006 files that were
+        # already here: an opt-in host reading the advisories sees exactly that surface.
         by_file = {}
         for name, src in _example_sources():
             codes = sorted({d.code for d in tex_api.control_flow_advisories(src, {})})
             if codes:
                 by_file[name] = codes
-        assert all(c == ["W7006"] for c in by_file.values()), by_file
-        assert len(by_file) == 5, by_file
-        r.ok(f"the shipped advisory surface is unchanged: {sorted(by_file)} carry W7006 only")
+        w7006_files = {k: v for k, v in by_file.items() if k != "string_format.tex"}
+        assert all(c == ["W7006"] for c in w7006_files.values()), w7006_files
+        assert len(w7006_files) == 5, w7006_files
+        assert by_file.get("string_format.tex") == ["W7008"], by_file
+        r.ok(f"the shipped advisory surface: {sorted(w7006_files)} carry W7006 only, plus "
+             f"string_format.tex carrying W7008")
     except Exception as e:
         r.fail("T10 shipped advisory surface", f"{type(e).__name__}: {e}")
 
@@ -899,13 +909,17 @@ def test_t10_w7008_names_what_the_engine_now_refuses(r: SubTestResult):
 # ── T12: the frozen compat corpus ───────────────────────────────────────────
 
 def test_t12_corpus_neutrality(r: SubTestResult):
-    print("\n--- T12: the frozen corpus is unmoved, and declines exactly one program ---")
+    print("\n--- T12: the frozen corpus is unmoved, and declines exactly two programs ---")
     import compat_corpus
     try:
+        # DOC-8 added `string_format` to this set: its format() calls now fill `{}`
+        # placeholders instead of leaving dead `%f`/`%s` sequences unfilled, so its five
+        # numeric calls genuinely cast a per-region-varying value to a string.
         declined = sorted(name for name, src in compat_corpus._corpus_programs()
                           if tex_roi.region_dependent(_parse(src), code=src))
-        assert declined == ["adv_while_loop"], declined
-        r.ok("exactly one corpus program is region-dependent, by name: adv_while_loop")
+        assert declined == ["adv_while_loop", "string_format"], declined
+        r.ok("exactly two corpus programs are region-dependent, by name: "
+             "adv_while_loop, string_format")
     except Exception as e:
         r.fail("T12 declined set", f"{type(e).__name__}: {e}")
 
@@ -1036,12 +1050,19 @@ def test_t13_advisory_and_corpus_are_unaffected(r: SubTestResult):
 
     try:
         # `examples/string_format.tex` is the ONLY shipped program that even mentions
-        # string(/str(/format( — and every one of its format() calls is `%f`/`%s`-style, so
-        # clause (d) must not touch it: 0 new declines, 0 new codes, exactly as measured
-        # before this clause existed.
+        # string(/str(/format(. Before DOC-8 every one of its format() calls was
+        # `%f`/`%s`-style — dead sequences `format()` has never filled (CHANGELOG's ASK-9
+        # entry) — so clause (d) never touched it. DOC-8 corrected them to real `{}`
+        # placeholders so the statistics the example computes actually reach its output,
+        # and that means its five numeric calls now genuinely cast a per-region-varying
+        # value straight to a string: clause (d) correctly fires, one W7008 per line. The
+        # `[{}]`-around-`$label` line does not — a string parameter is not per-pixel-varying.
         src = _read_repo("examples", "string_format.tex")
-        assert tex_roi.region_dependent(_parse(src), code=src) is False
-        assert tex_api.control_flow_advisories(src, {}) == []
-        r.ok("string_format.tex: still not declined, still draws nothing")
+        assert tex_roi.region_dependent(_parse(src), code=src) is True
+        codes = _codes_by_line(src)
+        assert codes == {54: ["W7008"], 55: ["W7008"], 56: ["W7008"],
+                          57: ["W7008"], 58: ["W7008"]}, codes
+        r.ok("string_format.tex: now correctly declined, W7008 on its five numeric "
+             "format() lines")
     except Exception as e:
         r.fail("T13 string_format.tex", f"{type(e).__name__}: {e}")

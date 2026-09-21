@@ -48,12 +48,14 @@ for (int sy = 0; sy < 5; sy++) {
 float mean_lum = total_lum / float(count);
 
 // ── Build formatted output string ───────────────────────────────────
-string header = format("[%s]", $label);
-string lum_info = format("Mean Luma: %f", mean_lum);
-string range_info = format("Range: [%f, %f]", min_val, max_val);
-string r_info = format("R: [%f, %f]", min_r, max_r);
-string g_info = format("G: [%f, %f]", min_g, max_g);
-string b_info = format("B: [%f, %f]", min_b, max_b);
+// format() fills {} placeholders in order (specs like {:.2f} work too) —
+// it does not substitute % sequences.
+string header = format("[{}]", $label);
+string lum_info = format("Mean Luma: {}", mean_lum);
+string range_info = format("Range: [{}, {}]", min_val, max_val);
+string r_info = format("R: [{}, {}]", min_r, max_r);
+string g_info = format("G: [{}, {}]", min_g, max_g);
+string b_info = format("B: [{}, {}]", min_b, max_b);
 
 // Build the report by concatenating lines
 string nl = "\n";
