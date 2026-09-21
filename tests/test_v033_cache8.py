@@ -22,6 +22,11 @@ The item as written asks for two things and this file defends both, plus the neg
               anything but the one entry, or change what an arbitration frees — beside what
               they do, and race both against every other door into the table.
 
+              `touch_promote(key)` (CACHE-11) is `touch` plus ONE addition, ruled narrower than
+              the promotion-on-a-hint `touch` still declines: if the entry is demoted, it comes
+              home on the hint, counted in `promotions` and never in `hits`. Its rows are the
+              same picture with one column changed.
+
 Every row is CPU-safe: `_devices()` adds the CUDA rows when there is a GPU, and the residency
 ladder degenerates honestly to one rung without one (there is nothing to demote FROM).
 """
@@ -312,12 +317,13 @@ def test_v033_cache8_profile_reaches_and_restores_the_ceiling(r):
 def test_v033_cache8_is_absent_from_the_default_comfyui_path(r):
     """Invariant #7 as a source canary. Residency moves frames between devices; the default
     ComfyUI cook must be unable to reach the code that does it, which a grep can decide and a
-    timing cannot. `touch` steers that code's victim choice, so it is on the list too."""
+    timing cannot. `touch` steers that code's victim choice, so it is on the list too, and so is
+    `touch_promote` (CACHE-11), the one hint that can actually promote."""
     import pathlib
     node = (pathlib.Path(__file__).resolve().parent.parent / "tex_node.py").read_text(
         encoding="utf-8")
-    hits = [n for n in ("set_vram_budget", "residency", "_demote", "_promote", "touch")
-            if n in node]
+    hits = [n for n in ("set_vram_budget", "residency", "_demote", "_promote", "touch",
+                        "touch_promote") if n in node]
     r.ok("CACHE-8: tex_node.py cannot reach the residency ladder") if not hits else \
         r.fail("CACHE-8 invariant#7", f"tex_node.py mentions {hits}")
 
@@ -546,6 +552,107 @@ def test_v033_cache8_touch_never_moves_a_frame_between_devices(r):
     r.ok("touch: a demoted frame stays demoted through a hint, and its next get promotes it") \
         if ok else r.fail("touch residency", f"before={was} after touch={still} "
                                              f"touch returned {hinted}; get promoted it={home}")
+
+
+# ── CACHE-11: `touch_promote` — reorder plus promote-if-demoted, nothing else ─────
+#
+# The ruled narrower grant beside `touch` above: an embedding host that predicts demand wants
+# the reorder AND the promotion a `get` hit performs on a demoted frame, but not the hit itself
+# (`get`'s hit is the thing it is trying to avoid paying for). Every row below is a rewrite of a
+# `touch` row above it, changed only where the grant differs: a demoted frame now comes home.
+
+def test_v033_cache11_touch_promote_matches_touch_when_nothing_is_demoted(r):
+    """When there is nothing to promote, `touch_promote` must be `touch` under another name —
+    same reorder, same `touches` count, same `False` for an absent/spilled/empty-cache key, and
+    NO door reached (not even `_promote`, which has nothing demoted to act on). This is the
+    negative half; the positive half (an actually-demoted frame) gets its own CUDA-only row
+    below, because a resident-only box can never exercise it."""
+    empty_ok = tex_results.ResultCache(
+        cache_dir=tempfile.mkdtemp()).touch_promote("anything") is False
+    with tempfile.TemporaryDirectory() as d:
+        c = tex_results.ResultCache(cache_dir=d, budget_mb=64)
+        gone = _frame(res=32, scale=0.25)
+        c.put("gone", gone)
+        for i, k in enumerate("abc"):
+            c.put(k, _frame(res=32, scale=1.0 + i * 0.01))
+        c.put("prev", _frame(res=32, scale=0.5), quality=tex_packing.PREVIEW)
+        c.put("d", _frame(res=32, scale=0.75))
+        spilled = _spill_oldest(c)
+        before, t0 = _hint_state(c), c.stats().get("touches")
+        with _doors_spied(c) as calls:
+            got = {k: c.touch_promote(k) for k in ("a", "prev", "gone", "nobody")}
+        after, t1 = _hint_state(c), c.stats().get("touches")
+        order = list(c._ram)
+        back = c.get("gone")                  # the spill tier is untouched by the hint
+        served = back is not None and torch.equal(back, gone) and c.restores == 1
+    changed = _changed(before, after)
+    ok = (empty_ok and spilled and served and not calls and not changed
+          and got == {"a": True, "prev": True, "gone": False, "nobody": False}
+          and (t0, t1) == (0, 2) and order == ["b", "c", "a", "prev", "d"])
+    r.ok("touch_promote: with nothing demoted it is touch — same reorder, same counts, "
+         "no door reached, spilled and absent keys untouched") \
+        if ok else r.fail("touch_promote non-demoted parity",
+                          f"returned={got} doors={calls} changed={changed} "
+                          f"touches {t0}->{t1} order={order} empty_ok={empty_ok} "
+                          f"spilled={spilled} served={served}")
+
+
+def test_v033_cache11_touch_promote_brings_a_demoted_frame_home(r):
+    """The grant itself: a demoted frame's NEXT hint — not its next read — brings it home. Same
+    residency picture as `test_v033_cache8_touch_never_moves_a_frame_between_devices`, except
+    `promotions` moves on the hint instead of waiting for a `get`, `hits` does not move at all
+    (the whole reason the host wants this instead of a `get`), and a plain read afterward finds
+    the frame already on its home device — no second promotion, no second H2D."""
+    if "cuda" not in _devices():
+        r.skip("touch_promote residency", "no CUDA on this box — nothing to demote")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = _frame(res=64, device="cuda")
+        c = tex_results.ResultCache(cache_dir=d)
+        c.set_vram_budget(0)
+        c.put("a", src)
+        c.put("b", _frame(res=64, device="cuda", scale=0.5))
+        entry = c._ram["a"]
+
+        def residency():
+            return (entry.device, entry.home, c.promotions, c.hits, dict(c._bytes_by_dev))
+
+        was = residency()
+        hinted = c.touch_promote("a")
+        home_now = residency()
+        got = c.get("a")                       # a plain read afterward: no second promotion
+        after_get = residency()
+    ok = (was[0] == "cpu" and was[1].startswith("cuda") and hinted is True
+          and home_now[0] == home_now[1] and home_now[2] == was[2] + 1 and home_now[3] == was[3]
+          and after_get[2] == home_now[2] and after_get[3] == was[3] + 1
+          and got is not None and got.device.type == "cuda" and torch.equal(got, src))
+    r.ok("touch_promote: a demoted frame comes home on the hint, counted in `promotions` and "
+         "never in `hits`; the next real read finds it home already and costs no promotion") \
+        if ok else r.fail("touch_promote residency",
+                           f"before={was} after hint={home_now} touch_promote={hinted} "
+                           f"after get={after_get}")
+
+
+def test_v033_cache11_touch_promote_a_spilled_only_frame_still_does_nothing(r):
+    """A frame that is ONLY on disk is not in `_ram` at all, so it is exactly as absent to
+    `touch_promote` as to `touch`: no stat, no restore, no promotion attempted — `_promote`
+    isn't even a candidate, because there is no RAM entry to hand it. The frame is still
+    reachable through an ordinary `get` afterward, proving the hint left the spill tier alone."""
+    with tempfile.TemporaryDirectory() as d:
+        c = tex_results.ResultCache(cache_dir=d, budget_mb=64)
+        spilled_frame = _frame(res=32, scale=0.75)
+        c.put("s", spilled_frame)
+        for i, k in enumerate("abc"):
+            c.put(k, _frame(res=32, scale=1.0 + i * 0.01))
+        assert _spill_oldest(c) and "s" not in c._ram          # sanity: genuinely spilled-only
+        with _doors_spied(c) as calls:
+            hinted = c.touch_promote("s")
+        served = c.get("s")
+    ok = (hinted is False and not calls
+          and served is not None and torch.equal(served, spilled_frame) and c.restores == 1)
+    r.ok("touch_promote: a spilled-only frame reaches no door and stays exactly as absent as "
+         "it is to `touch`") if ok else \
+        r.fail("touch_promote spilled-only", f"hinted={hinted} doors={calls} served={served}")
 
 
 def test_v033_cache8_a_touched_frame_serves_bit_exact(r):

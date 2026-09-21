@@ -1037,7 +1037,8 @@ class ResultCache:
         """Move a demoted frame back to its home device and return the promoted master, or the
         entry's current tensor if it cannot be moved.
 
-        Called from `get` on a hit, OUTSIDE the lock — it is an H2D copy (11.1 ms at 4K),
+        Called from `get` on a hit, and from `touch_promote` on a hint (CACHE-11) that is never
+        counted as one — both OUTSIDE the lock, since this is an H2D copy (11.1 ms at 4K),
         exactly the class of work the lock rule excludes. The re-entry check under the lock is
         what makes that safe: if the entry changed while we copied, the copy is discarded."""
         # A5(d) WITHDRAWN in v0.33.2 — the lock-depth early-out that stood here is deferred, not
@@ -1640,11 +1641,13 @@ class ResultCache:
     # are the non-read half: one reorders, one asks, and neither does anything else.
     #
     # Deliberately NOT offered beside them, each for a reason that lives in this file:
-    #   * Promotion on a hint. A hint typically runs right before an arbitration, so promoting
-    #     allocates on the very device the arbitration is about to reclaim, and `_promote`
-    #     commits without re-checking the VRAM ceiling — the arbitration then frees those bytes
-    #     again, from other frames or, past this pool, from the CUDA-graph pool. Demand already
-    #     promotes: the next `get` brings a frame home.
+    #   * Promotion on a hint, UNCONDITIONALLY. The reason stood: a hint typically runs right
+    #     before an arbitration, so promoting allocates on the very device that arbitration is
+    #     about to reclaim, and `_promote` commits without re-checking the VRAM ceiling. Ruled
+    #     NARROWER at CACHE-11 (2026-09-21): `touch_promote(key)` below grants exactly
+    #     reorder-plus-promote-if-demoted — no keep-set, no pinning, no restore of a
+    #     spilled-only frame. `touch` itself keeps declining it: a caller already depends on
+    #     that (`test_v033_cache8_touch_never_moves_a_frame_between_devices`).
     #   * A keep-set on `evict_bytes`. A pool that declines to free what it is asked for passes
     #     the shortfall on in `arbitrate`, and the pool after this one is the all-or-nothing
     #     `free_graphs_only()` (MEM-1): one protected frame could cost every captured graph.
@@ -1699,7 +1702,10 @@ class ResultCache:
         touch yields is policy (victim choice may change — see `_enforce_residency`). Advice the
         cache takes, never a pin. Thread-safe and O(1): reading the top entry and both moves are
         one critical section, so a concurrent `put` cannot land between them and end up beneath
-        a stale top."""
+        a stale top.
+
+        See `touch_promote` for the narrower grant of promotion-on-a-hint (CACHE-11); this
+        method's contract above is unchanged by its existence."""
         with self._lock:
             if key not in self._ram:
                 return False
@@ -1709,6 +1715,41 @@ class ResultCache:
                 self._ram.move_to_end(mru)       # the most recent demand keeps the top slot
             self.touches += 1
             return True
+
+    def touch_promote(self, key: str) -> bool:
+        """CACHE-11: `touch`'s reorder, PLUS promote `key` home if it is currently demoted — the
+        narrower grant of "promotion on a hint" declined above `touch`. Returns exactly what
+        `touch` returns: True for a resident key that was ranked, False for one that is not,
+        which is a no-op — a spilled-only frame is not in `_ram` at all, so it costs no syscall
+        and nothing is restored. Ranks and counts in `touches` identically to `touch`; the one
+        addition is that a DEMOTED entry (`device != home`) is handed to `_promote` exactly as
+        a `get` hit hands it — OUTSIDE the lock, the same H2D copy, the same re-entry guard
+        against a concurrent change, and the same `promotions` counter. It never counts a hit:
+        `hits` stays about reads, and `promotions` is what actually moved.
+
+        Still no keep-set and no pinning: a victim a walk has already chosen is not rescued,
+        and nothing here changes `evict_bytes` or the RAM/VRAM budgets — only which entry those
+        walks reach first (via the reorder) and whether it is on its home device when a caller
+        next reads it.
+
+        Tier 2 — Semi, head-only since v0.38.0: the name, the return value and the non-effects
+        (no hit/miss, no restore, no keep-set, no pinning) are stable; the reorder is `touch`'s
+        own policy. Thread-safe: O(1) plus the promotion's H2D when one is actually due."""
+        demoted = None
+        with self._lock:
+            entry = self._ram.get(key)
+            if entry is None:
+                return False
+            mru = next(reversed(self._ram))
+            if key != mru:
+                self._ram.move_to_end(key)
+                self._ram.move_to_end(mru)       # the most recent demand keeps the top slot
+            self.touches += 1
+            if entry.device != entry.home:
+                demoted = entry
+        if demoted is not None:
+            self._promote(key, demoted)          # same H2D `get` uses; re-checks identity itself
+        return True
 
     # ── PREC-1 / CF-4: requalify-on-idle ──────────────────────────────────────
     #

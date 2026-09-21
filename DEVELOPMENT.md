@@ -702,16 +702,18 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   (LATENT stays refused regardless, `tex_results.py:504-517`); `ResultCache.touch(key)` and
   `key in cache` are non-read residency operations — a hint that reorders the eviction walk, and a
   resident-now check — and neither counts as a hit or promotes a demoted frame
-  (`tex_results.py:1614-1662`). Not a row below; `touch`/`in` pin their own Tier 2 in their
-  docstrings, and `put`'s new keyword travels with them. **Unruled, and narrower than what was
-  declined** (an embedding host, 2026-09-21): that host cannot move its residency hint from
-  `get(copy=False)` to `touch` as `touch` stands, because the hint's value is the **promotion**
-  `get` performs — a demoted RAM-tier frame returning to resident — and not the read. A
-  spilled-only frame it counts absent and reads nothing from, so it wants **no restore**, and
-  agrees a restore belongs behind a separately counted, named door if anyone ever asks for one.
-  Its request is reorder-plus-promote-if-demoted, with no keep-set and no pinning — strictly less
-  than the promotion-on-hint that `touch`'s docstring declines. Until it is ruled that host keeps
-  `get(copy=False)` and pays the hit that call counts.
+  (`tex_results.py:1634-1717`, the `touch`/`__contains__` docstrings). Not a row below; `touch`/`in`
+  pin their own Tier 2 in their docstrings, and `put`'s new keyword travels with them. **RULED**
+  (the author, 2026-09-21, CACHE-11): the narrowed ask beside them was granted, not the wider one —
+  reorder-plus-promote-if-demoted, nothing else, no keep-set, no pinning, no restore of a
+  spilled-only frame. It shipped as its own call, `ResultCache.touch_promote(key)`
+  (`tex_results.py:1719-1751`), rather than as a new default for `touch`: a product test
+  (`test_v033_cache8_touch_never_moves_a_frame_between_devices`) already depended on the bare
+  `touch(key)` call never promoting, so `touch` keeps its exact contract and its docstring's "does
+  NOT promote" stays unconditionally true. `touch_promote` reuses `_promote` verbatim — the same
+  H2D copy and re-entry guard `get`'s hit takes — so a promotion it triggers is counted in
+  `promotions`, never in `hits`; a key that is not RAM-resident (including a spilled-only frame)
+  is a no-op exactly as it is for `touch`. Additive; head-only since v0.38.0.
 - A `.textool` manifest's `inputs[]` entries may carry `feeds` (routes an extra input of a fused tool
   into named stage bindings) and `optional` (host UI advice only); `promoted_params[i].metadata` may
   carry `tooltip` and `options` (a labelled-choice list) — all four validated, all four opt-in, under
