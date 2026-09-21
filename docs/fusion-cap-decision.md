@@ -8,7 +8,7 @@
 ## 1. The question
 
 `_MAX_FUSED_REGION_STAGES = 16`, and `_grow_region` returns `None` the moment a region
-exceeds it (`tex_fusion.py:1221-1228`). So a 17-stage linear graph gets **zero** fusion, not a
+exceeds it (`tex_fusion.py:1222-1229`). So a 17-stage linear graph gets **zero** fusion, not a
 partial one: N=16 → 1 region, N=17 → 0, N=50 → 0. A cliff, not a taper.
 
 Nothing had ever measured it. The comment justifying the cap offered two reasons, and by
