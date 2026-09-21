@@ -59,7 +59,7 @@ This is the release's compat tripwire and the reason this phase gets its own ses
 `TEXCache.compile_tex` reaches `Parser(tokens, source=source).parse()` through
 `parse_and_split` (`tex_cache.py:214`) and
 types enter one call later, at `TypeChecker(binding_types=..., source=source)`
-(`tex_cache.py:326`, inside the shared `compile_ast`). So doc 40's "`.name` means a plane *on a
+(`tex_cache.py:513`, inside the shared `TEXCache.compile_ast`). So doc 40's "`.name` means a plane *on a
 PLANES-typed wire*" cannot live in the grammar. Something upstream of types must tokenize the
 dot, and something downstream of types must decide what it meant.
 
@@ -100,7 +100,7 @@ reason: **everything that matters is keyed on token value, not on AST shape.**
   parses as `ArrayIndexAccess` and dies in the TypeChecker. Both are unreachable as plane
   sugar under (b), and both fall out for free under (a).
 * `identity_binding_types` (`tex_marshalling.py:659`) and `TEXCache.fingerprint`
-  (`tex_cache.py:204`) hash `(name, type)` pairs. `("beauty.diffuse", "vec3")` is just another
+  (`tex_cache.py:358`) hash `(name, type)` pairs. `("beauty.diffuse", "vec3")` is just another
   tuple; no identity machinery changes.
 
 The cost of (a) is exactly one thing, and it is the next section.
@@ -109,7 +109,7 @@ The cost of (a) is exactly one thing, and it is the next section.
 
 Under (a), `@A.r` on an ordinary VEC4 wire lexes as a binding named `A.r`. The TypeChecker must
 put it back. This is legal — not a hack — because **the compile cache is keyed on
-`(code, binding_types)`** (`tex_cache.fingerprint`, `tex_cache.py:204`), so a resolution that
+`(code, binding_types)`** (`TEXCache.fingerprint`, `tex_cache.py:358`), so a resolution that
 depends on binding types can never alias a differently-typed compile of the same source.
 
 For an `AT_BINDING` token whose value contains a dot, split on the **last** dot into
@@ -257,7 +257,7 @@ does not reach all three, the R1/R2 lanes silently test *unexpanded* programs �
 over a surface that is not the shipped one.
 
 **Decision: converge, and the seam already exists.** `TEXCache.compile_ast(program,
-binding_types, *, source)` (`tex_cache.py:318`) is STR-8's shared post-parse pipeline, already
+binding_types, *, source)` (`tex_cache.py:496`) is STR-8's shared post-parse pipeline, already
 used by both production entries (`compile_tex` and fusion's `compile_fused`). **Expansion lands
 inside `compile_ast`, ahead of the first `TypeChecker` call**, and the two test harnesses are
 migrated onto it.

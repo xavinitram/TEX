@@ -122,7 +122,13 @@ import subprocess
 import sys
 
 # ── The pinned warning budget (see "THE BUDGET IS A RATCHET" above). Moves DOWN only. ──
-WARNING_BUDGET = 28
+# 28 → 26 (LANG-L5). Four `tex_cache.py:NNN` citations in `docs/plane-bindings.md` went dead
+# when a five-line insertion shifted the file, and repairing them the way this tool's own
+# message prescribes — re-pointing at the SYMBOL rather than at a line that happened to be
+# non-blank — anchored two that had never named their covering symbol. They had in fact been
+# pointing at the wrong symbols all along: the warning class was masking three wrong pointers,
+# which is the case for reading the warning list and not only the exit code.
+WARNING_BUDGET = 26
 
 # ── The document set (see "THE DOCUMENT SET" above). ──
 DOC_DIR_GLOB = "docs"
