@@ -64,8 +64,15 @@ _AST_FILES = [_C_DIR / "ast_nodes.py", _C_DIR / "lexer.py", _C_DIR / "parser.py"
 # the emitter, so an edit to either changes what a flagged program computes and must not
 # leave a stale `.cg` behind. They are added now, while no program can reach them, rather
 # than at the release that makes them reachable.
+# LIB-1: `stdlib.py`'s per-domain split. The facade still carries the module-level caches
+# and helpers (now re-exported from `stdlib_core.py`), and every `fn_*` impl moved onto one
+# of the seven domain leaves — a change to any of them alters emitted code or interpreter
+# semantics exactly as a `stdlib.py` edit used to, so each leaf is watched here too.
 _CODEGEN_FILES = [_R_DIR / "interpreter.py", _R_DIR / "codegen.py", _R_DIR / "codegen_stdfns.py",
-                  _R_DIR / "stdlib.py", _R_DIR / "noise.py", Path(__file__).parent / "tex_fusion.py",
+                  _R_DIR / "stdlib.py", _R_DIR / "stdlib_core.py", _R_DIR / "stdlib_math.py",
+                  _R_DIR / "stdlib_color.py", _R_DIR / "stdlib_sample.py", _R_DIR / "stdlib_noise.py",
+                  _R_DIR / "stdlib_sdf.py", _R_DIR / "stdlib_string.py", _R_DIR / "stdlib_array.py",
+                  _R_DIR / "noise.py", Path(__file__).parent / "tex_fusion.py",
                   _R_DIR / "masked_flow.py", _R_DIR / "codegen_masked.py",
                   # CG-1: the STR-7 split's other two emitters. `codegen_stencil.py` owns the whole
                   # stencil detection-and-lowering route, so an edit there changes emitted code.

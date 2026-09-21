@@ -156,8 +156,10 @@ to remove the *reason* (REG-1), not to move the import.
 ## The stdlib taxonomy tables (why an LLM edit here is dangerous)
 
 A stdlib function is classified along several axes. **REG-1 single-sourced the
-classification into one `@stdlib(...)` decorator** co-located with each impl in
-`tex_runtime/stdlib.py`; `get_functions()` is now a view of that registry, and the
+classification into one `@stdlib(...)` decorator** co-located with each impl (LIB-1: the
+impls now live on `tex_runtime/stdlib_*.py`, the per-domain leaves `stdlib.py` composes into
+`TEXStdlib`; the decorator co-location is unchanged, only which file each impl sits in);
+`get_functions()` is now a view of that registry, and the
 `spatial`/`sync`/`non_local` tags let **TST-3 derive and machine-check** the tables
 below, so they can no longer silently drift.
 
@@ -342,11 +344,11 @@ Bounds below are entry counts, and every store is process-lifetime unless stated
 | `noise._inductor_available` | device type | whether TorchInductor can compile there |
 | `noise._worley_offsets_cache` | device x dtype | the 2D Worley cell offsets |
 | `noise._worley3d_offsets_cache` | device x dtype | the 3D Worley cell offsets |
-| `stdlib._sampler_cache` | B x H x W x device | batch index tensors and Lanczos tap offsets; 32 |
-| `stdlib._grid_buf` | B x H x W x device | the coordinate grid, **allocate-and-hold**; reuse measured ~30% SLOWER on CPU (PERF TRAP) |
-| `stdlib._mip_cache` | `id(src)` x source version | the mip pyramid, holding a reference to the source so its id cannot be recycled |
-| `stdlib._gauss_mip_cache` | the same, per blur parameters | the gaussian mip pyramid |
-| `stdlib._gauss_kernel_cache` | sigma x radius x dtype x device | the separable kernel pair (tiny GPU tensors); 64 |
+| `stdlib_core._sampler_cache` | B x H x W x device | batch index tensors and Lanczos tap offsets; 32 |
+| `stdlib_core._grid_buf` | B x H x W x device | the coordinate grid, **allocate-and-hold**; reuse measured ~30% SLOWER on CPU (PERF TRAP) |
+| `stdlib_core._mip_cache` | `id(src)` x source version | the mip pyramid, holding a reference to the source so its id cannot be recycled |
+| `stdlib_core._gauss_mip_cache` | the same, per blur parameters | the gaussian mip pyramid |
+| `stdlib_core._gauss_kernel_cache` | sigma x radius x dtype x device | the separable kernel pair (tiny GPU tensors); 64 |
 | `tex_memory._tile_safe_memo` | program x plan | the tile-safety verdict |
 | `tex_memory._peak_static_memo` | program x plan | the peak-static-memory estimate |
 | `tex_memory._last_trim_px` | device | last-seen spatial pixel count, so the allocator is queried only after a downshift (MEM-2) |
