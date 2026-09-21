@@ -230,9 +230,12 @@ def test_doc5_examples_index(r: SubTestResult):
 
 # Modules already over the 2000 hard budget, each with a Phase-3 split planned
 # (see AGENTS.md). Grandfathered — the ratchet fails only on a NEW crossing.
+# LIB-1 took `tex_runtime/stdlib.py`'s planned split — it is now the facade (126 LOC) over
+# seven domain leaves, none of which is anywhere near the hard budget, so it is re-pinned
+# DOWN out of this baseline per the ratchet's own stale-baseline rule below.
 _LOC_HARD, _LOC_SOFT = 2000, 1500
 _OVER_HARD_BASELINE = frozenset({
-    "tex_runtime/codegen.py", "tex_runtime/stdlib.py", "tex_runtime/interpreter.py",
+    "tex_runtime/codegen.py", "tex_runtime/interpreter.py",
 })
 
 # ENG-14 — a named module's HEADROOM floor, asserted separately from the ratchet.

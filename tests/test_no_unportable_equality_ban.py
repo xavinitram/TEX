@@ -165,8 +165,15 @@ def _derive_tiered_entry_points(pkg=_PKG):
             "tex_runtime/noise.py — the dispatch entry point was renamed. Re-derive it.")
     runtime_fns = _closure(noise_funcs, seeds)
 
-    std_tree = _parse_file(os.path.join(pkg, "tex_runtime", "stdlib.py"))
-    std_funcs = _functions_of(std_tree)
+    # LIB-1: the `fn_*` impls (and their private helpers) no longer live in `stdlib.py`
+    # itself — that file is now the facade over seven per-domain leaves plus the shared
+    # substrate `stdlib_core.py`. Parse all of them and merge, or this derivation silently
+    # empties out (the exact failure mode the docstring above says is worse than a loud one).
+    std_funcs = {}
+    for _fname in ("stdlib.py", "stdlib_core.py", "stdlib_math.py", "stdlib_color.py",
+                   "stdlib_sample.py", "stdlib_noise.py", "stdlib_sdf.py",
+                   "stdlib_string.py", "stdlib_array.py"):
+        std_funcs.update(_functions_of(_parse_file(os.path.join(pkg, "tex_runtime", _fname))))
     stdlib_fns = _closure(std_funcs, runtime_fns) - runtime_fns
 
     language = set()

@@ -501,6 +501,10 @@ _WATCHED = {
     # CG-1: the STR-7 split's stencil-lowering route and the `.cg` writer/reader. Neither was
     # watched, so a stencil edit left every existing `.cg` sidecar passing its version check.
     "codegen_stencil.py", "codegen_persist.py",
+    # LIB-1: the seven domain leaves `stdlib.py` was split into (the facade itself, and
+    # `noise.py`, were already watched above).
+    "stdlib_core.py", "stdlib_math.py", "stdlib_color.py", "stdlib_sample.py",
+    "stdlib_noise.py", "stdlib_sdf.py", "stdlib_string.py", "stdlib_array.py",
 }
 
 

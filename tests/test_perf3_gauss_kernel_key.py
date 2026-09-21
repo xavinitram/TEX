@@ -41,6 +41,13 @@ from helpers import *
 
 from failure_harness import run_tier
 from TEX_Wrangle.tex_runtime import stdlib as _stdlib
+# LIB-1: `_get_gauss_kernels` and `_gauss_blur_bchw` both moved onto `stdlib_core.py`, and
+# `_gauss_blur_bchw` (the real blur path's caller) reads `_get_gauss_kernels` as ITS OWN
+# global — a name bound in `stdlib_core`'s namespace, not a live proxy through the facade's
+# re-export. Patching `_stdlib._get_gauss_kernels` (below, pre-LIB-1) only rebinds the
+# facade's copy of the name and never reaches that call site, so the mutation guard has to
+# patch the module the function is actually defined in.
+from TEX_Wrangle.tex_runtime import stdlib_core as _stdlib_core
 
 
 #: (label, sigma). Each row is blurred at `s` and at `s + 5e-4` — a pair that the old
@@ -92,7 +99,7 @@ class _rounded_key_cache:
     still clears everything this file builds."""
 
     def __enter__(self):
-        real = _stdlib._get_gauss_kernels
+        real = _stdlib_core._get_gauss_kernels
 
         def _rounded(sigma, device):
             key = (round(sigma, 3), device)
@@ -103,11 +110,13 @@ class _rounded_key_cache:
             _stdlib._gauss_kernel_cache[key] = pair
             return pair
         self._real = real
-        _stdlib._get_gauss_kernels = _rounded
+        # Patch the DEFINING module (`stdlib_core`), not the facade's re-export — see the
+        # LIB-1 note beside the import above; `_gauss_blur_bchw`'s own global lives there.
+        _stdlib_core._get_gauss_kernels = _rounded
         return self
 
     def __exit__(self, *exc):
-        _stdlib._get_gauss_kernels = self._real
+        _stdlib_core._get_gauss_kernels = self._real
         _fresh()
         return False
 

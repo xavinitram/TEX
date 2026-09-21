@@ -38,7 +38,9 @@ shipped nearby, not a hypothetical:
   * `codegen._CodeGen.build` / `codegen.try_compile` — a re-EMIT per cold cook. This is
     the expensive one, and the one a change that defeated the codegen cache would show:
     the sidecar is what makes a cold cook cost milliseconds instead of tens of them.
-  * `stdlib._tag_host_scalar` — PERF-2's host-scalar tag. The tag is paid once per tensor
+  * `stdlib_core._tag_host_scalar` (LIB-1: moved off `stdlib.py` onto its per-domain leaf,
+    still reached through `stdlib._tag_host_scalar` — the facade re-export) — PERF-2's
+    host-scalar tag. The tag is paid once per tensor
     MINTED, and a hoisted constant is minted by the generated preamble's own assignment
     (the emitter writes `_t1._tex_host_scalar = 2.0` as a literal store), so no call
     reaches this function on a cook. A count here means the tag became per-cook work.
@@ -131,7 +133,7 @@ _MUST_NOT_RUN = (
     "tex_roi:_walk",
     "tex_runtime/codegen:_CodeGen.build",
     "tex_runtime/codegen:try_compile",
-    "tex_runtime/stdlib:_tag_host_scalar",
+    "tex_runtime/stdlib_core:_tag_host_scalar",  # LIB-1: `_tag_host_scalar` now lives on this leaf
     "tex_runtime/compiled:_params_on_device",
 )
 

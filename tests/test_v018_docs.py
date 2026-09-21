@@ -244,8 +244,6 @@ _NOT_A_CACHE = {
     "tex_results._DTYPE_NAME": "frozen dtype <-> stored-name spelling table (PREC-1)",
     "tex_results._NAME_DTYPE": "frozen stored-name -> dtype spelling table (PREC-1)",
     "tex_validate_hw._BINDING": "frozen binding shape every validate-hw probe compiles to",
-    "stdlib._POW_NAN_STATE": "a two-field process-wide counter for the pow() NaN warning, "
-                             "not a keyed store",
     "tex_cache._AST_FILES": "CACHE-4 epoch INPUT list: the watched source files, fixed at "
                             "import; holds no computed value",
     "tex_cache._CODEGEN_FILES": "CACHE-4 epoch INPUT list (see _AST_FILES)",

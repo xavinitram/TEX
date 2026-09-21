@@ -184,7 +184,12 @@ def test_ask13_reserved_name_e3011(r: SubTestResult):
 def test_ask13_patch_dist_offset_clamp_pad_bound(r: SubTestResult):
     print("\n--- ASK-13 follow-up: patch_dist's shift pad is bounded by (extent-1+radius), "
           "independent of the raw offset magnitude ---")
-    from TEX_Wrangle.tex_runtime import stdlib as SL
+    # LIB-1: `fn_patch_dist` moved onto the `stdlib_sample.py` leaf, and its call to
+    # `_pad_replicate_chunked` reads ITS OWN global — a name that leaf imported for
+    # itself from `stdlib_core`, not a live proxy through the facade's re-export.
+    # Patching `tex_runtime.stdlib._pad_replicate_chunked` never reaches that call site;
+    # the module actually defining `fn_patch_dist` has to be the one patched.
+    from TEX_Wrangle.tex_runtime import stdlib_sample as SL
 
     def _check(dx, dy, label):
         img = make_img(1, 8, 8, 3, seed=101)
