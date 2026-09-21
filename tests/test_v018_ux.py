@@ -549,6 +549,115 @@ def test_dbg4_doctor(r: SubTestResult):
              "is isolated (all keys stay, others intact); payload is strict JSON — never 500s")
 
 
+def test_sec2_mac_key_path_matches_documented_scheme(r: SubTestResult):
+    print("\n--- SEC-2: mac_key_path() reports the CHANGELOG-documented location ---")
+    import TEX_Wrangle.tex_recovery as R
+    from TEX_Wrangle.tex_doctor import mac_key_path
+    fails = []
+
+    home = R._mac_key_home()
+    got = mac_key_path()
+    if home is None:
+        if got is not None:
+            fails.append(f"no per-user home resolves on this box; expected None, got {got!r}")
+    else:
+        expect = os.path.join(home, R._MAC_KEY_FILE)
+        if got != expect:
+            fails.append(f"mac_key_path() == {got!r}, expected {expect!r}")
+        if os.path.basename(got) != "cache_mac.key":
+            fails.append(f"basename {os.path.basename(got)!r} != "
+                          "'cache_mac.key' (the CHANGELOG's documented name)")
+
+    if fails:
+        r.fail("SEC-2 documented path", "; ".join(fails))
+    else:
+        r.ok(f"mac_key_path() == {got!r}, exactly _mac_key_home() joined with cache_mac.key")
+
+
+def test_sec2_mac_key_path_never_creates_anything(r: SubTestResult):
+    print("\n--- SEC-2: a path QUERY mints nothing — no dir, no file, no key ---")
+    import TEX_Wrangle.tex_recovery as R
+    from TEX_Wrangle.tex_doctor import mac_key_path
+    fails = []
+
+    root = Path(tempfile.mkdtemp())
+    scratch = root / "never_touched"          # deliberately does not exist yet
+    orig_home, orig_cache = R._mac_key_home, R._mac_key_cache
+    R._mac_key_home = lambda: str(scratch)
+    try:
+        got = mac_key_path()
+        expect = str(scratch / R._MAC_KEY_FILE)
+        if got != expect:
+            fails.append(f"mac_key_path() == {got!r}, expected {expect!r}")
+        if scratch.exists():
+            fails.append("the key's home directory was CREATED by a path query")
+        if R._mac_key_cache != orig_cache:
+            fails.append("the process-memoised key was minted by a path query")
+    finally:
+        R._mac_key_home, R._mac_key_cache = orig_home, orig_cache
+        shutil.rmtree(root, ignore_errors=True)
+
+    if fails:
+        r.fail("SEC-2 no side effect", "; ".join(fails))
+    else:
+        r.ok("directory absent, file absent, in-process key cache untouched — a query is "
+             "not a reason to generate a secret")
+
+
+def test_sec2_mac_key_path_none_means_ephemeral_only(r: SubTestResult):
+    print("\n--- SEC-2: no per-user home -> None, the documented 'no key' case ---")
+    import TEX_Wrangle.tex_recovery as R
+    from TEX_Wrangle.tex_doctor import mac_key_path
+    fails = []
+
+    orig_home = R._mac_key_home
+    R._mac_key_home = lambda: None
+    try:
+        got = mac_key_path()
+        if got is not None:
+            fails.append(f"expected None with no per-user home, got {got!r}")
+    finally:
+        R._mac_key_home = orig_home
+
+    if fails:
+        r.fail("SEC-2 none case", "; ".join(fails))
+    else:
+        r.ok("mac_key_path() returns None exactly when _mac_key_home() does — the "
+             "process-ephemeral-key case, never a fabricated or default path")
+
+
+def test_sec2_mac_key_path_leaks_no_key_material(r: SubTestResult):
+    print("\n--- SEC-2: the return value is a location, never the key or a derivative ---")
+    import TEX_Wrangle.tex_recovery as R
+    from TEX_Wrangle.tex_doctor import mac_key_path
+    fails = []
+
+    home = Path(tempfile.mkdtemp())
+    orig_home, orig_cache = R._mac_key_home, R._mac_key_cache
+    R._mac_key_home = lambda: str(home)
+    R._mac_key_cache = None
+    try:
+        real_key = R._mac_key()             # mint a real key on disk, once, for this probe
+        got = mac_key_path()
+        if not isinstance(got, str):
+            fails.append(f"return type {type(got).__name__}, expected str")
+        else:
+            got_bytes = got.encode("utf-8", "surrogatepass")
+            if real_key in got_bytes or real_key.hex() in got:
+                fails.append("the returned path embeds the key's own bytes")
+            if got.encode() == real_key:
+                fails.append("mac_key_path() returned the key itself")
+    finally:
+        R._mac_key_home, R._mac_key_cache = orig_home, orig_cache
+        shutil.rmtree(home, ignore_errors=True)
+
+    if fails:
+        r.fail("SEC-2 no key material", "; ".join(fails))
+    else:
+        r.ok("mac_key_path() returns a plain path string sharing no bytes with the "
+             "32-byte key it points at")
+
+
 def test_lx5_json_nan_safe(r: SubTestResult):
     print("\n--- LX-5: debug_print of NaN/Inf serializes as valid JSON (audit) ---")
     import json

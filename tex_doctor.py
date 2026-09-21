@@ -308,3 +308,38 @@ def capabilities() -> dict:
         "noise_promotion@cuda": _row(lambda: _row_noise_promotion("cuda")),
     }
     return {"schema": 1, "rows": rows}
+
+
+# ── SEC-2 — mac_key_path(): where the cache's signing key lives, queryable from Python ──
+#
+# An embedding host that rewrites directory ACLs on the roots it owns (for roaming user
+# profiles) asked for one thing: a way to find out where BRIEF-10's per-user cache-signing
+# key lives, so its ACL rewrite does not break or expose it. Deliberately placed HERE, next
+# to `capabilities()`, rather than added AS a row inside it: that report's row names, key set
+# and vocabularies are pinned (DEVELOPMENT.md ENG-5 Tier 2 — a row/key/vocabulary change bumps
+# `schema`, which a vendoring host must be told about before a tag). A separate, additive
+# function costs nothing and forces no re-pin, so that is the one built.
+
+
+def mac_key_path() -> str | None:
+    """Where BRIEF-10's per-user cache-signing key lives on disk, or would live once minted —
+    NEVER the key, its bytes, or any derivative of it. Pure path arithmetic: reads only the
+    environment TEX's own key-homing logic already reads (`tex_recovery._mac_key_home`, which
+    does no filesystem I/O itself) and never touches disk — so asking this question can never
+    create the key, its directory, or the file as a side effect.
+
+    Returns `None` when no per-user writable home resolves on this box/OS (`_mac_key_home()`
+    returns `None`): the process then falls back to a per-process EPHEMERAL key that is never
+    written to disk at all, so there IS no path to report. That is the "no key" case this
+    function can represent, and `None` is how it represents it.
+
+    A non-`None` return is a *location*, not a claim that a file sits there: the key is minted
+    lazily, on this process's first `sign_pickle`/`load_verified` call (see
+    `tex_recovery._mac_key`/`_resolve_or_create_key`), so the path this returns may not exist
+    on disk yet. Calling this function never advances that moment — it may be called before
+    TEX has cooked anything at all, and it never mints, reads, or repairs the key file."""
+    from .tex_recovery import _MAC_KEY_FILE, _mac_key_home
+    home = _mac_key_home()
+    if home is None:
+        return None
+    return os.path.join(home, _MAC_KEY_FILE)
