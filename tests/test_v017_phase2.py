@@ -251,12 +251,14 @@ _OVER_HARD_BASELINE = frozenset({
 # file from 1673 to 1318, so its floor goes 1700 -> 1400 — the same ~85-line margin
 # ENG-14 chose over its own post-split size (1613 under 1700), which is one median
 # release of growth. Two floors now, moving down independently as their splits land.
-# NEG-6 moved tex_results.py's floor down for the first time since NEG-1 set it: the
-# pre-specified CACHE-1 key-minting cut (`tex_results_keys.py`) took the file from 1903 to
-# 1774, so its floor goes 1958 -> 1846 — the same 72-line margin this module's own NEG-1
+# NEG-6 moved tex_results.py's floor down for the first time since NEG-1 set it. CACHE-11
+# landed on `main` first and grew the file from NEG-1's 1903 to 1944 — 14 lines under the
+# 1958 floor, the closest this register has come to a wall since ENG-14's own. The
+# pre-specified CACHE-1 key-minting cut (`tex_results_keys.py`) then took it from 1944 to
+# 1815, so its floor goes 1958 -> 1887 — the same 72-line margin this module's own NEG-1
 # precedent chose, kept rather than re-picked, so the register's margins stay comparable
-# across modules instead of drifting per lane.
-_HEADROOM_FLOOR = {"tex_engine.py": 1400, "tex_results.py": 1846}
+# across modules instead of drifting per lane. 143 lines of room again, not 14.
+_HEADROOM_FLOOR = {"tex_engine.py": 1400, "tex_results.py": 1887}
 
 
 def _product_packages(root) -> list:
