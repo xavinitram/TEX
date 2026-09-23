@@ -150,6 +150,10 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "linear_to_rec709": {"args": (1, 1), "return": _passthrough_type},
     "acescg_to_linear": {"args": (1, 1), "return": _passthrough_type},
     "linear_to_acescg": {"args": (1, 1), "return": _passthrough_type},
+    # COLOR-1 (v0.40) lane B: 3D LUT lookup. arg 0 (rgb) alone decides the result type —
+    # arg 1 (lut) is a bound tensor, not a value being blended (unlike _promote_args's use
+    # for e.g. `over`), so passthrough is correct here, not promotion.
+    "apply_lut3d":    {"args": (2, 2), "return": _passthrough_type},
     # SL-1 compositing (Porter-Duff, straight-alpha vec4)
     "premultiply":   {"args": (1, 1), "return": _passthrough_type},
     "unpremultiply": {"args": (1, 1), "return": _passthrough_type},

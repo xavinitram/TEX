@@ -2049,6 +2049,7 @@ const TEX_HELP_DATA = [
             { name: "linear_to_rec709", sig: "linear_to_rec709(c) \u2192 vec", desc: "Linear-light \u2192 gamma-encoded Rec.709 (inverse of rec709_to_linear).", example: "@OUT = vec4(linear_to_rec709(lin), 1.0);" },
             { name: "acescg_to_linear", sig: "acescg_to_linear(c) \u2192 vec3", desc: "ACEScg (AP1, linear) \u2192 linear Rec.709/sRGB (D65) via a fixed 3\u00d73 primary change.", example: "vec3 lin709 = acescg_to_linear(@aces_plate.rgb);" },
             { name: "linear_to_acescg", sig: "linear_to_acescg(c) \u2192 vec3", desc: "Linear Rec.709/sRGB (D65) \u2192 ACEScg (AP1, linear) (inverse of acescg_to_linear).", example: "vec3 acescg = linear_to_acescg(srgb_to_linear(@image.rgb));" },
+            { name: "apply_lut3d", sig: "apply_lut3d(rgb, lut) \u2192 vec3", desc: "Trilinear 3D LUT lookup. `lut` is a bound [N,N,N,3] tensor (tex_io.lut.read_cube).", example: "@OUT = vec4(apply_lut3d(@image.rgb, @lut), 1.0);" },
             { name: "premultiply", sig: "premultiply(rgba) \u2192 vec4", desc: "Straight \u2192 premultiplied alpha (rgb *= a).", example: "vec4 p = premultiply(@image);" },
             { name: "unpremultiply", sig: "unpremultiply(rgba) \u2192 vec4", desc: "Premultiplied \u2192 straight alpha (rgb /= a).", example: "vec4 s = unpremultiply(p);" },
             { name: "over", sig: "over(fg, bg) \u2192 vec4", desc: "Porter-Duff 'over': composite fg atop bg (straight-alpha RGBA).", example: "@OUT = over(@A, @B);" },

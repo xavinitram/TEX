@@ -2429,6 +2429,52 @@ def _binding_reads_cached(program: Program) -> frozenset[str]:
     return reads
 
 
+def _lut3d_binding_names(program: Program) -> frozenset[str]:
+    """COLOR-1 (v0.40): wire-binding names used as `apply_lut3d`'s SECOND (LUT) argument.
+
+    A LUT is a plain bound tensor (ruling 5 — no new TEXType), commonly shaped
+    `[N,N,N,3]` — structurally indistinguishable from an ordinary `[B,H,W,C]` image
+    binding to `_consensus_extent`'s shape scan below. Without this exclusion, binding
+    a LUT alongside a differently-shaped image lets the LUT's own N leak into the
+    cook's (B,H,W) grid via the `max()` consensus rule, corrupting an UNRELATED
+    output's shape the moment `apply_lut3d` is called — the exact silent-wrong class
+    `_consensus_extent`'s own docstring already exists to close for ordinary images.
+    Detected structurally (the call shape), not by binding name, so any name works."""
+    found: set[str] = set()
+    stack: list[ASTNode] = [program]
+    while stack:
+        node = stack.pop()
+        if (type(node) is FunctionCall and node.name == "apply_lut3d"
+                and len(node.args) == 2):
+            lut_arg = node.args[1]
+            if type(lut_arg) is BindingRef and lut_arg.kind == "wire":
+                found.add(lut_arg.name)
+        stack.extend(iter_child_nodes(node))
+    return frozenset(found)
+
+
+#: Memo for the walk above, mirroring `_READS_MEMO` exactly (same id()-keyed, bounded-LRU
+#: shape) — a program that never calls `apply_lut3d` (every program before v0.40, and most
+#: after) pays one dict `.get()` per cook for an empty frozenset, not a fresh AST walk.
+_LUT3D_NAMES_MEMO: "OrderedDict[int, tuple[Program, frozenset[str]]]" = OrderedDict()
+_LUT3D_NAMES_MEMO_MAX = 128
+
+
+def _lut3d_names_cached(program: Program) -> frozenset[str]:
+    """`_lut3d_binding_names`, memoized per program object (mirrors `_binding_reads_cached`)."""
+    key = id(program)
+    hit = _LUT3D_NAMES_MEMO.get(key)
+    if hit is not None and hit[0] is program:
+        _LUT3D_NAMES_MEMO.move_to_end(key)
+        return hit[1]
+    names = _lut3d_binding_names(program)
+    _LUT3D_NAMES_MEMO[key] = (program, names)
+    _LUT3D_NAMES_MEMO.move_to_end(key)
+    while len(_LUT3D_NAMES_MEMO) > _LUT3D_NAMES_MEMO_MAX:
+        _LUT3D_NAMES_MEMO.popitem(last=False)
+    return names
+
+
 def _consensus_extent(bindings: dict, program: Program,
                       roi: tuple | None = None) -> tuple[int, int, int] | None:
     """CF-6 (v0.35): the (B, H, W) cook grid — the CONSENSUS extent, not first-wins.
@@ -2485,10 +2531,17 @@ def _consensus_extent(bindings: dict, program: Program,
     # other two callers all run per cook on the default path, where the old code was a `for`
     # with an early `break`; the comprehension-plus-`all()` this replaced cost ~1.5-2 us of
     # tuple building for an answer that is three integers.
+    #
+    # `lut_names` (COLOR-1, v0.40) is one memoized dict `.get()` — see `_lut3d_names_cached` —
+    # returning an empty frozenset for every program that never calls `apply_lut3d` (every
+    # program before v0.40, and most after), so the default path pays a cheap-and-constant
+    # lookup, never a fresh walk.
+    lut_names = _lut3d_names_cached(program)
     b = h = w = None
     b_split = hw_split = False
     for name, v in bindings.items():
-        if name == "OUT" or not isinstance(v, torch.Tensor) or v.dim() < 3:
+        if (name == "OUT" or name in lut_names
+                or not isinstance(v, torch.Tensor) or v.dim() < 3):
             continue
         shp = v.shape                      # bind once: three `.shape` hits build three Sizes
         sb, sh, sw = shp[0], shp[1], shp[2]
@@ -2512,7 +2565,7 @@ def _consensus_extent(bindings: dict, program: Program,
         read = _binding_reads_cached(program)
         rb = rh = rw = None
         for name, v in bindings.items():
-            if (name == "OUT" or name not in read
+            if (name == "OUT" or name not in read or name in lut_names
                     or not isinstance(v, torch.Tensor) or v.dim() < 3):
                 continue
             shp = v.shape

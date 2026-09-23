@@ -77,6 +77,11 @@ def _call_and_kind(name, lo):
     if name == "bilateral_filter": return "bilateral_filter(@A, 1.5, 0.2)", "vec3"
     if name in ("erode", "dilate"): return f"{name}(@A.rgb, 2)", "vec3"
     if name == "convolve":   return "convolve(@A, @B, 1)", "vec3"
+    # COLOR-1 (v0.40) lane B: @B stands in for the LUT arg (same "reuse the other image
+    # wire for a non-image argument" shape `convolve`'s kernel already uses above) — the
+    # implementation places no cubic-size requirement on it, so a [1,8,8,3] wire is a
+    # legal (if not meaningful) [N,N,N,3]-shaped LUT for parity/edge-matrix purposes.
+    if name == "apply_lut3d": return "apply_lut3d(@A.rgb, @B)", "vec3"
     if name == "patch_dist": return "patch_dist(@A.rgb, 2, -1, 1)", "float"
     if name in _IMG_REDUCE:   return f"{name}(@A.rgb)", "vec3"
     if name in ("img_width", "img_height"): return f"{name}(@A)", "float"

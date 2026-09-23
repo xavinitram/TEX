@@ -83,6 +83,7 @@
 | `linear_to_rec709` | `linear_to_rec709(c) → vec` | Linear-light → gamma-encoded Rec.709 (inverse of rec709_to_linear). | — |
 | `acescg_to_linear` | `acescg_to_linear(c) → vec3` | ACEScg (AP1, linear) → linear Rec.709/sRGB (D65) via a fixed 3×3 primary change. | — |
 | `linear_to_acescg` | `linear_to_acescg(c) → vec3` | Linear Rec.709/sRGB (D65) → ACEScg (AP1, linear) (inverse of acescg_to_linear). | — |
+| `apply_lut3d` | `apply_lut3d(rgb, lut) → vec3` | Trilinear 3D LUT lookup. `lut` is a bound [N,N,N,3] tensor (tex_io.lut.read_cube). | — |
 | `premultiply` | `premultiply(rgba) → vec4` | Straight → premultiplied alpha (rgb *= a). | — |
 | `unpremultiply` | `unpremultiply(rgba) → vec4` | Premultiplied → straight alpha (rgb /= a). | — |
 | `over` | `over(fg, bg) → vec4` | Porter-Duff 'over': composite fg atop bg (straight-alpha RGBA). | — |

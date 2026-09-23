@@ -251,6 +251,45 @@ class _StdlibColor:
         acescg = torch.cat([r2, g2, b2], dim=-1)
         return torch.cat([acescg, c[..., 3:4]], dim=-1) if has_alpha else acescg
 
+    # -- 3D LUT (COLOR-1, v0.40) -----------------------------------------
+    # `lut` is a plain bound tensor (ruling 5 — no new TEXType), the shape
+    # `tex_io.lut.read_cube` produces: [N,N,N,3] indexed [b_idx,g_idx,r_idx]. footprint
+    # stays 'point' (the design's call): the LUT is a small fixed-size resource bound
+    # once per cook, not a neighbourhood read of the cook's own tiled image, so it needs
+    # no ROI halo. No new codegen: this falls through to the generic `_fns[name]`
+    # dispatch (codegen.py's pre-resolved-local fallback) exactly like every other
+    # Color-domain function above, so interp<->codegen stays bit-exact by construction.
+
+    @stdlib("apply_lut3d", sig='apply_lut3d(rgb, lut) \\u2192 vec3', category='Color', footprint='point', doc='Trilinear 3D LUT lookup. `lut` is a bound [N,N,N,3] tensor (tex_io.lut.read_cube).', ex='@OUT = vec4(apply_lut3d(@image.rgb, @lut), 1.0);')
+    @staticmethod
+    def fn_apply_lut3d(rgb, lut) -> torch.Tensor:
+        """Trilinear 3D LUT lookup via `grid_sample`'s volumetric (5D) form. `rgb` is
+        the [0,1]-domain colour to transform (its own dtype is preserved in the
+        output — the grid_sample itself always runs in fp32, mirroring invariant #4's
+        treatment of a value used as a SAMPLING COORDINATE regardless of its origin);
+        `lut` is a plain bound [N,N,N,3] tensor, axis order [b_idx,g_idx,r_idx] (see
+        tex_io/lut.py). vec4 alpha passes through unchanged."""
+        c = _to_tensor(rgb)
+        L = _to_tensor(lut)
+        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        rgb3 = c[..., 0:3] if has_alpha else c
+        in_dtype = rgb3.dtype
+        # [N(b),N(g),N(r),3] -> [1,3,N(b),N(g),N(r)] (BCDHW). grid_sample's grid axes
+        # (x,y,z) address (W,H,D) respectively, so W<-r, H<-g, D<-b — which is exactly
+        # rgb3's own (r,g,b) channel order, so the grid below needs no channel reorder.
+        vol = L.permute(3, 0, 1, 2).unsqueeze(0)
+        if vol.dtype != torch.float32:
+            vol = vol.to(torch.float32)
+        orig_shape = rgb3.shape
+        grid = rgb3.reshape(1, 1, 1, -1, 3).to(torch.float32) * 2.0 - 1.0
+        out = torch.nn.functional.grid_sample(
+            vol, grid, mode='bilinear', padding_mode='border', align_corners=True,
+        )                                              # [1, 3, 1, 1, P]
+        out = out.reshape(3, -1).permute(1, 0).reshape(orig_shape)
+        if out.dtype != in_dtype:
+            out = out.to(in_dtype)
+        return torch.cat([out, c[..., 3:4]], dim=-1) if has_alpha else out
+
     # -- Compositing (SL-1): Porter-Duff on straight (un-premultiplied) vec4 --
     # ComfyUI IMAGE/MASK are un-premultiplied; over/under/atop take & return
     # straight-alpha vec4. premultiply/unpremultiply convert between conventions.

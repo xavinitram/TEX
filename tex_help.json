@@ -522,6 +522,14 @@
           "aliases": []
         },
         {
+          "name": "apply_lut3d",
+          "sig": "apply_lut3d(rgb, lut) → vec3",
+          "desc": "Trilinear 3D LUT lookup. `lut` is a bound [N,N,N,3] tensor (tex_io.lut.read_cube).",
+          "example": "@OUT = vec4(apply_lut3d(@image.rgb, @lut), 1.0);",
+          "tags": [],
+          "aliases": []
+        },
+        {
           "name": "premultiply",
           "sig": "premultiply(rgba) → vec4",
           "desc": "Straight → premultiplied alpha (rgb *= a).",
@@ -1395,5 +1403,5 @@
       ]
     }
   ],
-  "function_count": 155
+  "function_count": 156
 }
