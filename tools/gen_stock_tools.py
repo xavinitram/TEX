@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(ROOT))  # custom_nodes on path
 from TEX_Wrangle import tex_tool  # noqa: E402
 
 _OUT_DIR = os.path.join(ROOT, "stock")
-_LANG = "0.24"
+_LANG = "0.25"
 # `min_engine` is a COMPATIBILITY FLOOR — the oldest engine that can cook these tools — not a
 # stamp of the engine that generated them. It was `__version__`, which re-stamped all five
 # manifests on every release and made `--check` fail from v0.27 onward for no substantive

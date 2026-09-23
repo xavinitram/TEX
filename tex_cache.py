@@ -248,7 +248,23 @@ def _hash_files(files, *extra: bytes) -> str:
     return h.hexdigest()[:16]
 
 
-_AST_EPOCH = _hash_files(_AST_FILES)
+# LANG-L7 (L6-F1): `tex_api.py` — the file holding `LANGUAGE_VERSION` — is not, and should not
+# become, a member of `_AST_FILES`: it is the language-satellite bump's OWN file, not a
+# parser/typechecker/optimizer file, and adding it would fold in every unrelated tex_api.py
+# edit (a docstring, a new host-facing helper) as a spurious AST-epoch bump. `Program.language`
+# IS parser-set output, though, and a `//!tex 0.25` program's masked-vs-unmasked reading depends
+# on `LANGUAGE_VERSION` at COOK time, not at compile time of the untouched AST/codegen files —
+# so without this line, a `.cg` sidecar for a `//!tex 0.25` program compiled while the engine
+# was still below 0.25 would be served, UNMASKED, after the bump, under the SAME fingerprint and
+# the SAME (unmoved) epoch: a silently wrong picture through the cache, not the language gate
+# (`docs/masked-control-flow.md` §4's failure class, arriving a different way). Folding the
+# version STRING directly into the AST epoch's hash input — the same "extra byte fragment"
+# mechanism `_CODEGEN_EPOCH` already uses for `TEX_CODEGEN_NO_OUT_REUSE` below — moves every
+# epoch (AST ⊑ CODEGEN ⊑ VERDICT all nest it) exactly when, and only when, the version moves;
+# every cache tier goes cold once on adoption, the same one-time cost any `codegen.py` edit
+# already causes on a release.
+from .tex_api import LANGUAGE_VERSION as _LANGUAGE_VERSION_AT_IMPORT  # noqa: E402
+_AST_EPOCH = _hash_files(_AST_FILES, b"lang:" + _LANGUAGE_VERSION_AT_IMPORT.encode())
 # M-5: the out= reuse kill switch changes emitted code without touching a file, so fold it into
 # the codegen epoch — else a persisted .cg emitted with reuse ON is served after it toggles OFF.
 _CODEGEN_EPOCH = _hash_files(

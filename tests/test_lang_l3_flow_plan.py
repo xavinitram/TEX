@@ -23,8 +23,19 @@ n < 8){...}` — `x` starts from the per-pixel builtin `u`). `flow_plan` reuses 
 walk, so it structurally flags the SAME program the SAME way — it would be inconsistent for
 `flow_plan` to call this loop per-pixel while `region_dependent`/W7007 call it uniform, and
 the "one walk" hard constraint rules out giving `flow_plan` its own, different rule for what
-"per-pixel" means. So the corpus's empty-plan property is 129/130, with the sole exception
-named, reasoned about, and matching the design note's own census — not silently carved out.
+"per-pixel" means. So the corpus's empty-plan property was 129/130 at this head, with the sole
+exception named, reasoned about, and matching the design note's own census — not silently
+carved out.
+
+LANG-L7 (§6 of the design note) added eleven more non-empty rows on purpose: the five
+`//!tex 0.25` adversarial programs, their five no-pragma twins, and the shipped example
+`per_pixel_control_flow`. `flow_plan` is UNCONDITIONAL — "NOT gated on `Program.language` or
+`LANGUAGE_VERSION`" by the walk's own docstring in `tex_api.py` — so a no-pragma twin draws
+exactly the same non-empty plan as its pragma sibling; whether the engine actually MASKS is a
+question L4/L5/L6 answer downstream of this plan, never this file's. The corpus's empty-plan
+property is therefore 129/141 as of this head (141 − 1 old exception − 11 new ones), and the
+new set is named below rather than silently carved out, the same discipline the old exception
+got.
 """
 import os
 
@@ -36,8 +47,19 @@ from TEX_Wrangle import tex_api, tex_fusion
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # The one corpus program the design note's own §0/§2 census already names as the sole
-# class-B (per-pixel loop bound) member of the 130-program corpus.
+# class-B (per-pixel loop bound) member of the (then) 130-program corpus.
 _KNOWN_NONEMPTY = "adv_while_loop"
+
+# LANG-L7 (§6): the eleven rows added on purpose, all structurally non-empty regardless of
+# pragma — see the module docstring.
+_L7_KNOWN_NONEMPTY = frozenset({
+    "adv025_break", "adv025_break_nopragma",
+    "adv025_continue", "adv025_continue_nopragma",
+    "adv025_return", "adv025_return_nopragma",
+    "adv025_for_bound", "adv025_for_bound_nopragma",
+    "adv025_while_bound", "adv025_while_bound_nopragma",
+    "per_pixel_control_flow",
+})
 
 
 def _parse(src: str):
@@ -107,10 +129,12 @@ def test_l3_empty_plan_for_every_corpus_program_but_one(r: SubTestResult):
             if not plan.is_empty():
                 non_empty.append(name)
         assert total >= 130, f"corpus census reach dropped: only {total} program(s)"
-        assert non_empty == [_KNOWN_NONEMPTY], (
-            f"expected only {_KNOWN_NONEMPTY!r} to draw a non-empty plan, got {non_empty!r}")
-        r.ok(f"{total - 1}/{total} corpus program(s) get an empty plan; the one exception "
-             f"({_KNOWN_NONEMPTY}) is the design note's own named class-B case")
+        want = sorted([_KNOWN_NONEMPTY, *_L7_KNOWN_NONEMPTY])
+        assert sorted(non_empty) == want, (
+            f"expected exactly {want!r} to draw a non-empty plan, got {sorted(non_empty)!r}")
+        r.ok(f"{total - len(want)}/{total} corpus program(s) get an empty plan; the "
+             f"{len(want)} exceptions are {_KNOWN_NONEMPTY} (the design note's own class-B "
+             f"case) plus LANG-L7's own eleven")
     except Exception as e:
         r.fail("LANG-L3 corpus empty-plan census", str(e))
 

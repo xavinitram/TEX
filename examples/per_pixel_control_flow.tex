@@ -1,0 +1,36 @@
+// Per-Pixel Control Flow — visualize each pixel's own pass count under a masked loop bound
+//
+// Educational example for language 0.25's masked per-pixel control flow
+// (docs/masked-control-flow.md; LANGUAGE.md §7.1). Reads @image, turns its
+// luminance into a per-pixel target pass count `n`, then loops while `i`
+// is below it — a per-pixel loop bound (LANGUAGE.md §7.1's `for`/`while`
+// bullet).
+//
+// Under 0.23/0.24 rules the loop is NOT masked: it still runs for as many
+// passes as the brightest pixel needs, but every pixel accumulates once
+// per pass regardless of its OWN `n` — so every pixel ends up with the
+// same count, the frame's maximum, unmasked. Under this file's
+// `//!tex 0.25` pragma the loop still runs for the SAME number of passes
+// (it still runs while ANY pixel's own condition holds — the pass COUNT
+// is still the region's maximum, which is what keeps the whole frame in
+// one kernel), but each pixel's own `passes` stops incrementing the
+// moment its own `i < n` goes false, so the VALUE this program computes
+// is each pixel's own count, not the frame's maximum repeated everywhere.
+// Delete the pragma line below and the shading goes flat — every pixel
+// reads the same "before" picture LANGUAGE.md §7.1 describes.
+//
+// `min(pragma, LANGUAGE_VERSION)` decides which rule set actually runs
+// (LANGUAGE.md §1); `tex_api.control_flow_advisories`'s W7007/W7008 name
+// this shape and are conditional since language 0.25.
+//!tex 0.25
+
+vec3 src = @image;
+float n = luma(src) * 10.0;   // per-pixel target: 0 (black) .. 10 (white)
+float passes = 0.0;
+
+for (int i = 0; float(i) < n; i = i + 1) {
+    passes = passes + 1.0;
+}
+
+float shade = passes / 10.0;
+@OUT = vec3(shade, shade, shade);

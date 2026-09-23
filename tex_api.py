@@ -72,7 +72,7 @@ from .tex_session import EngineSession, default_session  # noqa: F401
 # `//!tex X.Y` pragma; `check()` advises (W7004) when a program targets a NEWER language
 # than this engine implements. The frozen compat corpus (tests/) pins that a program keeps
 # computing the same pixels across versions. See LANGUAGE.md for the compatibility policy.
-LANGUAGE_VERSION = "0.24"
+LANGUAGE_VERSION = "0.25"
 
 
 def language_pragma(source: str):
@@ -174,7 +174,8 @@ def check(source: str, binding_types: dict) -> list:
         pragma_diags.append(make_diagnostic(
             code="W7004",
             message=f"This program targets TEX language {pragma}, newer than this "
-                    f"engine's {LANGUAGE_VERSION}; newer features may not compile.",
+                    f"engine's {LANGUAGE_VERSION}; newer features may not compile, and "
+                    f"will be cooked under the older rules and may compute differently.",
             loc=None, source=source, phase="compile", severity="warning"))
 
     try:
@@ -306,6 +307,10 @@ def control_flow_advisories(source: str, binding_types: dict) -> list:
         Both branches run on every pixel, so the gather is never skipped.
       * **W7007** — control flow that acts on every pixel: `break` / `continue` / `return`
         under such an `if`, or a `for` / `while` whose condition can differ per pixel.
+        CONDITIONAL since `0.25` (LANG-L7): false, and never fires, for a program actually
+        cooked under `0.25`'s masked per-pixel control flow (`min(pragma,
+        LANGUAGE_VERSION) >= (0, 25)`) — such a program masks rather than acts on every
+        pixel. Still fires exactly as before for a program cooked below `0.25`.
       * **W7008** — control flow whose result depends on WHICH REGION is cooked, so the engine
         declines to split the cook (`tex_roi.region_dependent`): a `for` / `while` whose
         condition can differ per pixel (the loop runs to the region's maximum), or a string
@@ -313,7 +318,10 @@ def control_flow_advisories(source: str, binding_types: dict) -> list:
         arriving on a wire needs `binding_types` to be seen at all). Strictly the
         subset of W7007 the engine ACTS on — a `break` / `continue` / `return` under a
         per-pixel `if` draws W7007 and no W7008, because it fires on first arrival and so does
-        the same thing in every region.
+        the same thing in every region. The LOOP half sunsets in lockstep with W7007 above
+        (a masked loop's pass count is each pixel's own, not the region's maximum); the
+        STRING halves (a per-pixel string choice, or a per-pixel value cast straight to a
+        string) never sunset at any language level — a string has no per-pixel form.
 
     Never emitted by `check()`: a host calls this beside it. Pure AST analysis — no compile,
     no cook, no side effects — and total: a program that does not parse, a non-string source,
@@ -406,6 +414,7 @@ class _ControlFlowLint:
         from . import tex_roi
         self.A = A
         self.source = source
+        self.program = program   # LANG-L7: needed for the W7007/W7008 masked-flow sunset
         self.footmap = tex_roi._footmap()
         self._tex_roi = tex_roi   # LANG-L3: reuse tex_roi's own scatter-target unwrap below
                                    # rather than re-deriving it (one definition, not two).
@@ -506,6 +515,20 @@ class _ControlFlowLint:
                        for s in self._walk(fd)):
                     self.string_fns.add(fname)
                     grew = True
+
+    # ── LANG-L7: the W7007/W7008 masked-flow sunset ──────────────────────────
+    def _effective_masked(self) -> bool:
+        """True when this program is actually COOKED under `0.25`'s masked per-pixel control
+        flow — `min(pragma, LANGUAGE_VERSION) >= MASKED_FLOW_SINCE` (the identical rule
+        `tex_roi.region_dependent`'s clause (a)/(b) sunset already keys on; a second
+        definition here would drift against it). When True, `break`/`continue`/`return`
+        under a per-pixel `if` and a per-pixel loop bound no longer act on every pixel, so
+        W7007 (all three sites) and W7008's loop half are FALSE and must not fire. W7008's
+        string halves (a per-pixel `if`/`?:` choosing a string, or a per-pixel value cast
+        straight to a string) never sunset — a string has no per-pixel representation at
+        any language level — so they are not gated by this."""
+        return self._tex_roi._language_tuple(
+            self.program, self.source) >= self._tex_roi.MASKED_FLOW_SINCE
 
     # ── traversal helpers ────────────────────────────────────────────────────
     def _walk(self, node):
@@ -791,15 +814,21 @@ class _ControlFlowLint:
                 kw = "break" if cls is A.BreakStmt else "continue"
                 what = ("ends the loop" if cls is A.BreakStmt
                         else "skips the rest of the pass")
-                self._warn("W7007", s,
-                           f"This `{kw}` sits under an `if` whose condition can differ from pixel "
-                           f"to pixel. Such an `if` runs its branches on every pixel, so the "
-                           f"`{kw}` {what} for ALL pixels the first time the loop reaches it, "
-                           f"whatever the condition says, and the assignments before it in "
-                           f"that branch land on every pixel too.",
-                           "Keep a per-pixel flag the loop body tests instead, e.g. "
-                           "`if (found < 0 && hit) { found = i; }`, and let the loop run a "
-                           "bound that is the same for every pixel (LANGUAGE.md §7.1).")
+                # LANG-L7: under `0.25` masked flow this `{kw}` no longer acts on every
+                # pixel — it clears only the pixels live at this branch — so the warning
+                # would be false and must not fire (`_effective_masked`).
+                if not self._effective_masked():
+                    self._warn("W7007", s,
+                               f"This `{kw}` sits under an `if` whose condition can differ from pixel "
+                               f"to pixel. Such an `if` runs its branches on every pixel, so the "
+                               f"`{kw}` {what} for ALL pixels the first time the loop reaches it, "
+                               f"whatever the condition says, and the assignments before it in "
+                               f"that branch land on every pixel too, unless this program "
+                               f"declares `//!tex 0.25`.",
+                               "Keep a per-pixel flag the loop body tests instead, e.g. "
+                               "`if (found < 0 && hit) { found = i; }`, and let the loop run a "
+                               "bound that is the same for every pixel, or declare "
+                               "`//!tex 0.25` (LANGUAGE.md §7.1).")
                 # LANG-L3 (M1/M3): the site itself, plus the loop it clears bits IN — a
                 # break/continue gated by a per-pixel `if` makes THAT loop's own live mask
                 # able to narrow mid-loop even when the loop's bound is uniform (R-BREAK's
@@ -812,13 +841,19 @@ class _ControlFlowLint:
             if s.value is not None and self._expr(s.value, st, scope, pp):
                 scope.returns_vary = True
             if pp_fn:
-                self._warn("W7007", s,
-                           "This `return` sits under an `if` whose condition can differ from "
-                           "pixel to pixel. Such an `if` runs its branches on every pixel, so the "
-                           "function returns this value for ALL pixels the first time it reaches "
-                           "the `return`, whatever the condition says.",
-                           "Assign the result to a local inside the `if` and return it once at "
-                           "the end, or select with `cond ? a : b` (LANGUAGE.md §7.1).")
+                # LANG-L7: under `0.25` masked flow this `return` only records and clears
+                # the pixels live at this branch, so the warning would be false below
+                # `MASKED_FLOW_SINCE` only (`_effective_masked`).
+                if not self._effective_masked():
+                    self._warn("W7007", s,
+                               "This `return` sits under an `if` whose condition can differ from "
+                               "pixel to pixel. Such an `if` runs its branches on every pixel, so the "
+                               "function returns this value for ALL pixels the first time it reaches "
+                               "the `return`, whatever the condition says, unless this program "
+                               "declares `//!tex 0.25`.",
+                               "Assign the result to a local inside the `if` and return it once at "
+                               "the end, or select with `cond ? a : b`, or declare `//!tex 0.25` "
+                               "(LANGUAGE.md §7.1).")
                 self.transfer_sites.add(id(s))
         elif cls is A.ParamDecl and s.default_expr is not None:
             self._expr(s.default_expr, st, scope, pp)
@@ -983,27 +1018,41 @@ class _ControlFlowLint:
             head = nxt
         if s.condition is not None and self._varies(s.condition, head):
             kw = "for" if is_for else "while"
-            self._warn("W7007", s,
-                       f"This `{kw}` loop's condition can differ from pixel to pixel. The loop "
-                       f"keeps running while ANY pixel's condition holds and its body is not "
-                       f"masked, so every pixel runs as many passes as the pixel that needs the "
-                       f"most, including pixels whose own condition is already false.",
-                       "Bound the loop by a value that is the same for every pixel and guard or "
-                       "weight the per-pixel work, e.g. `for (int i = 0; i < $max; i++) "
-                       "{ if (i < n) { ... } }` (LANGUAGE.md §7.1).")
-            # TRK-25 clauses (a)/(b): the pass count is the region's MAXIMUM, so the output
-            # depends on which region was cooked. This is the half of W7007 the engine acts on.
+            # LANG-L7: `varying_loops` is the structural FACT `tex_roi.region_dependent`'s
+            # own sunset test reads (clauses a/b) — it is recorded unconditionally, at every
+            # language level, regardless of whether the WARNING below fires. Only the two
+            # diagnostics are gated on `_effective_masked`: under `0.25` this loop no longer
+            # runs every pixel to the frame's maximum (each pixel's own live mask exits the
+            # loop on its own pass), so W7007 is false; and the pass count is each pixel's
+            # own rather than the region's, so W7008's loop half is also false — but a
+            # per-pixel STRING choice (clauses c/d, gated elsewhere) never sunsets, which is
+            # why only the loop-bound W7008 site is gated here.
             self.varying_loops.add(id(s))
-            self._warn("W7008", s,
-                       "This loop's bound can differ from pixel to pixel, so the number of "
-                       "passes depends on which region is cooked. The engine therefore cooks "
-                       "this program as one whole region: windows, strips and batch strips are "
-                       "declined, and under memory pressure the cook can run out of memory "
-                       "where a split would have fitted.",
-                       "Bound the loop by a value that is the same for every pixel and guard or "
-                       "weight the per-pixel work, e.g. `for (int i = 0; i < $max; i++) "
-                       "{ if (i < n) { ... } }`. A uniformly bounded loop splits again "
-                       "(LANGUAGE.md §7.1).")
+            if not self._effective_masked():
+                self._warn("W7007", s,
+                           f"This `{kw}` loop's condition can differ from pixel to pixel. The loop "
+                           f"keeps running while ANY pixel's condition holds and its body is not "
+                           f"masked, so every pixel runs as many passes as the pixel that needs the "
+                           f"most, including pixels whose own condition is already false, unless "
+                           f"this program declares `//!tex 0.25`.",
+                           "Bound the loop by a value that is the same for every pixel and guard or "
+                           "weight the per-pixel work, e.g. `for (int i = 0; i < $max; i++) "
+                           "{ if (i < n) { ... } }`, or declare `//!tex 0.25` (LANGUAGE.md §7.1).")
+                # TRK-25 clauses (a)/(b): the pass count is the region's MAXIMUM, so the output
+                # depends on which region was cooked. This is the half of W7007 the engine
+                # acts on, and it sunsets in lockstep with W7007 above (both are false once
+                # the loop is masked, since a masked loop's pass count is per-pixel, not the
+                # region's maximum).
+                self._warn("W7008", s,
+                           "This loop's bound can differ from pixel to pixel, so the number of "
+                           "passes depends on which region is cooked. The engine therefore cooks "
+                           "this program as one whole region: windows, strips and batch strips are "
+                           "declined, and under memory pressure the cook can run out of memory "
+                           "where a split would have fitted.",
+                           "Bound the loop by a value that is the same for every pixel and guard or "
+                           "weight the per-pixel work, e.g. `for (int i = 0; i < $max; i++) "
+                           "{ if (i < n) { ... } }`. A uniformly bounded loop splits again "
+                           "(LANGUAGE.md §7.1).")
         out = head.copy()
         for b in frame.breaks:
             out.join(b)

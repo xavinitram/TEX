@@ -2,7 +2,7 @@
   "manifest_schema": 1,
   "name": "GradeVignette",
   "tool_version": "1.0.0",
-  "tex_language": "0.24",
+  "tex_language": "0.25",
   "min_engine": "0.26.0",
   "category": "Look",
   "context": "filter",

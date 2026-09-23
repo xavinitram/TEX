@@ -128,7 +128,7 @@ import sys
 # non-blank — anchored two that had never named their covering symbol. They had in fact been
 # pointing at the wrong symbols all along: the warning class was masking three wrong pointers,
 # which is the case for reading the warning list and not only the exit code.
-WARNING_BUDGET = 25
+WARNING_BUDGET = 24
 
 # ── The document set (see "THE DOCUMENT SET" above). ──
 DOC_DIR_GLOB = "docs"

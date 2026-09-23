@@ -2197,12 +2197,12 @@ const TEX_HELP_DATA = [
         title: "Control Flow",
         icon: "\u{1F501}",
         entries: [
-            { name: "if / else", sig: "if (cond) { ... } else { ... }", desc: "Conditional branching. Vectorized via torch.where for images.", example: "if (u > 0.5) {\n  @OUT = @A;\n} else {\n  @OUT = @B;\n}" },
-            { name: "for loop", sig: "for (int i = 0; i < n; i++) { ... }", desc: "Bounded loop. The loop count must be deterministic.", example: "float sum = 0.0;\nfor (int i = 0; i < 10; i++) {\n  sum += i;\n}" },
-            { name: "while loop", sig: "while (cond) { ... }", desc: "Loop while condition is true.", example: "int i = 0;\nwhile (i < 10) {\n  i++;\n}" },
-            { name: "break", sig: "break;", desc: "Exit the current loop early.", example: "for (int i=0; i<100; i++) {\n  if (arr[i] < 0) break;\n}" },
-            { name: "continue", sig: "continue;", desc: "Skip to the next loop iteration.", example: "for (int i=0; i<10; i++) {\n  if (i == 5) continue;\n}" },
-            { name: "User Functions", sig: "type name(args) { return expr; }", desc: "Define reusable functions. Must be declared before use.", example: "float remap(float x, float lo, float hi) {\n  return (x - lo) / (hi - lo);\n}" },
+            { name: "if / else", sig: "if (cond) { ... } else { ... }", desc: "Conditional branching. A uniform cond takes only the matching branch. A per-pixel cond runs BOTH branches on every pixel and merges with torch.where — unchanged by //!tex 0.25.", example: "if (u > 0.5) {\n  @OUT = @A;\n} else {\n  @OUT = @B;\n}" },
+            { name: "for loop", sig: "for (int i = 0; i < n; i++) { ... }", desc: "Bounded loop (max 1024 passes). A per-pixel bound: under 0.23/0.24 rules every pixel runs to the frame's maximum, unmasked; under //!tex 0.25 the pass count is still the region's max, but each pixel's own value stops updating once its condition is false.", example: "float sum = 0.0;\nfor (int i = 0; i < 10; i++) {\n  sum += i;\n}" },
+            { name: "while loop", sig: "while (cond) { ... }", desc: "Loop while condition is true (max 1024 passes). Same per-pixel rule as for-loops: unmasked under 0.23/0.24, masked per pixel under //!tex 0.25.", example: "int i = 0;\nwhile (i < 10) {\n  i++;\n}" },
+            { name: "break", sig: "break;", desc: "Exit the current loop early. Under a per-pixel if, 0.23/0.24 rules end the loop for ALL pixels on first arrival; under //!tex 0.25 it clears only the pixels live at that if.", example: "for (int i=0; i<100; i++) {\n  if (arr[i] < 0) break;\n}" },
+            { name: "continue", sig: "continue;", desc: "Skip to the next loop iteration. Under a per-pixel if, 0.23/0.24 rules skip the rest of the pass for ALL pixels; under //!tex 0.25 only the pixels live at that if are skipped.", example: "for (int i=0; i<10; i++) {\n  if (i == 5) continue;\n}" },
+            { name: "User Functions", sig: "type name(args) { return expr; }", desc: "Define reusable functions. Must be declared before use. A `return` under a per-pixel if: 0.23/0.24 rules return that value for ALL pixels on first arrival; //!tex 0.25 records it only for the pixels live there and keeps evaluating for the rest.", example: "float remap(float x, float lo, float hi) {\n  return (x - lo) / (hi - lo);\n}" },
             { name: "const", sig: "const type name = value;", desc: "Compile-time constant. Must be initialized with a literal.", example: "const float GOLDEN = 1.618034;" },
         ]
     },
@@ -3420,7 +3420,7 @@ app.registerExtension({
                         }
                         const manifest = {
                             manifest_schema: 1, name, tool_version: "1.0.0",
-                            tex_language: "0.24", min_engine: "0.26.0",
+                            tex_language: "0.25", min_engine: "0.26.0",
                             category: "User", context: "filter", author: "", doc: "",
                             code,
                             inputs: [...inputs].map(n => ({ name: n, type: socketTypes.get(n) || "IMAGE" })),

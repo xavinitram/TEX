@@ -15,7 +15,7 @@ the CPU interpreter and the GPU codegen backend and must produce the same result
 ## 1. Language version & compatibility
 
 The **language** is versioned separately from the package. `tex_api.LANGUAGE_VERSION`
-(currently **`0.24`**) names the grammar + semantics this engine implements; the
+(currently **`0.25`**) names the grammar + semantics this engine implements; the
 package `__version__` tracks the release. They move independently — a release that
 only fixes a bug or refactors internals does not bump the language version.
 
@@ -23,7 +23,7 @@ only fixes a bug or refactors internals does not bump the language version.
 own comment line:
 
 ```tex
-//!tex 0.24
+//!tex 0.25
 @OUT = vec4(@A.rgb * 1.2, 1.0);
 ```
 
@@ -47,9 +47,11 @@ one — so "old goldens are immutable" is machinery rather than a convention. A 
 program whose pixels genuinely must move requires deleting that archive file in a commit
 that argues the change.
 
-The archive holds `0.23.json` (129 programs) and, since language `0.24`, `0.24.json`
-(130: the same 129, unchanged, plus the first plane program — §5.3). Every current
-program is checked against both.
+The archive holds `0.23.json` (129 programs), `0.24.json` (130: the same 129, unchanged,
+plus the first plane program — §5.3), and, since language `0.25`, `0.25.json` (141: the
+same 130, unchanged, plus ten new adversarial rows and one new example exercising masked
+per-pixel control flow under `//!tex 0.25` — §7.1). Every current program is checked
+against all three.
 
 New grammar is added **additively** (v0.23 added the optional parameter-metadata block,
 below) so old programs keep parsing. A genuinely breaking change is called out in the
@@ -341,8 +343,20 @@ per-pixel `if` and assigned inside it is per-pixel after it.
 * A uniform `if` runs only the branch it takes.
 * A per-pixel `if` runs **both** branches on every pixel and keeps each pixel's side, so a
   branch costs the same whether a pixel takes it or not: putting a `sample`, a blur or a gather
-  loop behind a per-pixel `if` skips nothing.
-* Assume `?:` evaluates both operands.
+  loop behind a per-pixel `if` skips nothing. **Unchanged by `//!tex 0.25`** — both branches
+  still run either way; only what `break`/`continue`/`return`/writes do inside them changes,
+  below.
+* Assume `?:` evaluates both operands, at every language level.
+
+**Two rule sets, keyed on the pragma.** What `break`, `continue`, `return` and a per-pixel loop
+bound do under a per-pixel `if` depends on whether the program declares `//!tex 0.25` or later
+*and* the engine implements it (`min(what the program asks for, what the engine implements) >=
+0.25` — a program that asks for `0.25` on an older engine still runs the older rules, and
+`W7004` says so). No pragma, or an older one, keeps the `0.23` rules forever: a program that
+compiled and ran on an earlier version keeps computing the same pixels.
+
+**Under `0.23`/`0.24` rules** (no pragma, or `//!tex 0.23`/`0.24`):
+
 * `break`, `continue` and `return` under a per-pixel `if` act on **every** pixel. The first time
   the loop or function reaches that `if`, they fire for all pixels whatever the condition says,
   and the assignments before them in that branch land on every pixel too. To stop per pixel,
@@ -354,28 +368,63 @@ per-pixel `if` and assigned inside it is per-pixel after it.
   work, for example `for (int i = 0; i < $max; i++) { if (i < n) { sum += tap; } }`.
 * A per-pixel loop bound also means **the cook is never split**. "As many passes as the pixel
   that needs the most" is counted over the region actually being cooked, so a half-frame strip
-  and the whole frame give different answers; the same is true of a string chosen per pixel —
-  assigned inside a per-pixel `if`, or picked by a per-pixel `?:` — because a string has no
-  per-pixel form and is resolved by a majority vote over the region's pixels. A per-pixel value
-  cast STRAIGHT to a string — `string(x)`, `str(x)`, or a `format()` call that actually fills a
-  placeholder — is the same defect with no condition involved at all: the cast has no per-pixel
-  form either, so it falls back to the MEAN of the region's pixels, and a strip's mean differs
-  from the whole frame's (`format("%f", x)` is not affected — `%f` is not a placeholder, so the
-  template comes back unchanged and the value never reaches the output). The engine
-  therefore cooks such a program as one whole region — no window, no strips, no batch strips.
-  That is always correct, and it costs one thing: on a GPU, a frame too large to cook whole
-  runs out of memory where a split would have fitted. A uniformly bounded loop splits again.
+  and the whole frame give different answers.
+
+**Under `//!tex 0.25`** (masked per-pixel control flow; `docs/masked-control-flow.md` has the
+full rules): each active region — a loop, one pass of a loop, a user-function call — carries a
+per-pixel **live** mask. A pixel is live in a region when it has entered that region and has not
+left it; a pixel that has left keeps the value it left with. An `if` is **not** a region for
+this purpose (a loop pass and a call are); a variable written inside a per-pixel `if` is
+selected by that branch's live mask exactly as `0.23` already merges it.
+
+* `break` clears the pixel's bit for the **rest of the loop**; `continue` clears it for the
+  rest of *this pass only*. Neither one acts on a pixel that is not live at that `if` — the
+  assignments before them in that branch, and everything after the loop, no longer land on
+  every pixel.
+* `return` **records** its value for the pixels live at that statement and clears their bits for
+  the remainder of the function body; a pixel that reaches the end without returning gets the
+  same default `0.23` always gave it.
+* A per-pixel loop bound still runs to the region's maximum pass count — that part is unchanged,
+  because the loop keeps running while *any* pixel is live, which is what keeps the whole frame
+  in one kernel — but from the first masked pass onward, each pixel's own value stops updating
+  once its own condition goes false. **The pass count is still the region's maximum; only the
+  values stop being.** A worked example (TRK-25): a 4-strip cook and the whole frame both take
+  the same number of passes, `[4, 4, 3, 3, 2, 2, 1, 1]` read off row-by-row — but that row is the
+  *strip's* maximum in each strip, not the per-pixel answer, which under `0.25` is each pixel's
+  own: `[4, 4, 3, 3, 2, 2, 1, 0]` (the last pixel's own condition is already false and it never
+  runs a fourth pass). This is exactly why the sunset below is sound: the pass *count* a region
+  reports can still depend on the region, but the *values* it returns no longer do.
+* A **string** written on a per-pixel path, and a per-pixel value cast straight to a string,
+  keep `0.23`'s whole-frame behaviour verbatim at every language level — see the next bullet.
+* `debug_print` (a probe) records only if its probe pixel is live.
+
+Two things never sunset, at any language level, because neither has a per-pixel
+representation: a string chosen per pixel — assigned inside a per-pixel `if`, or picked by a
+per-pixel `?:` — is resolved by a majority vote over the region's pixels, and a per-pixel value
+cast STRAIGHT to a string — `string(x)`, `str(x)`, or a `format()` call that actually fills a
+placeholder — falls back to the MEAN of the region's pixels (`format("%f", x)` is not affected —
+`%f` is not a placeholder, so the template comes back unchanged and the value never reaches the
+output). Either way a strip's vote or mean differs from the whole frame's, so the engine cooks
+such a program as one whole region — no window, no strips, no batch strips — regardless of
+pragma. That is always correct, and it costs one thing: on a GPU, a frame too large to cook
+whole runs out of memory where a split would have fitted. A uniformly bounded loop, and a
+`//!tex 0.25` program whose only per-pixel loop bounds are the kind above, both split again.
 
 A host can ask for these as warnings with `tex_api.control_flow_advisories(source,
 binding_types)`: **W7006** marks a per-pixel `if` or `?:` with a gather (`sample`, `fetch`,
-`@A(u, v)`, a blur, a reduction) in a branch; **W7007** marks control flow that acts on
-every pixel, meaning a `break`, `continue` or `return` under a per-pixel `if`, or a loop whose
-condition is per-pixel; and **W7008** marks the shapes whose result depends on which region is
-cooked, so the engine declines to split the cook — a per-pixel loop bound, a string chosen
-per pixel by an `if` or a `?:`, or a per-pixel value cast straight to a string. W7008 is the
-part of W7007 the engine acts on: a `break`
-under a per-pixel `if` draws W7007 and no W7008, because it fires on first arrival and so
-does the same thing in every region. All three are opt-in: `tex_api.check()`, and so the
+`@A(u, v)`, a blur, a reduction) in a branch — unaffected by `0.25`, since both branches still
+run either way. **W7007** marks control flow that acts on every pixel, meaning a `break`,
+`continue` or `return` under a per-pixel `if`, or a loop whose condition is per-pixel — **since
+`0.25`, conditional**: false, and never fires, for a program actually cooked under the masked
+rules above, because such a program no longer acts on every pixel; still fires exactly as before
+for a program cooked under `0.23`/`0.24` rules. **W7008** marks the shapes whose result depends
+on which region is cooked, so the engine declines to split the cook — a per-pixel loop bound, a
+string chosen per pixel by an `if` or a `?:`, or a per-pixel value cast straight to a string.
+W7008 is the part of W7007 the engine acts on: a `break` under a per-pixel `if` draws W7007 and
+no W7008, because it fires on first arrival and so does the same thing in every region. Its LOOP
+half sunsets in lockstep with W7007 above (a masked loop's pass count is each pixel's own, not
+the region's maximum); its STRING halves — a per-pixel string choice, or a per-pixel value cast
+straight to a string — never sunset, at any language level. All three are opt-in: `tex_api.check()`, and so the
 editor's live lint, never reports them.
 
 ---

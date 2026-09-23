@@ -1,7 +1,7 @@
 # TEX Examples Index
 
 > **Generated** by `tools/gen_examples_index.py` from the `// Name — desc`
-> header of each `examples/*.tex`. 117 examples. Do not edit by hand.
+> header of each `examples/*.tex`. 118 examples. Do not edit by hand.
 
 | Example | Description |
 |---------|-------------|
@@ -84,6 +84,7 @@
 | [Normal Map](examples/normal_map.tex) | generate a tangent-space normal map from a height map |
 | [Normalize Mask](examples/normalize_mask.tex) | remap mask values to fill the full 0-1 range |
 | [Optical Flow](examples/optical_flow.tex) | Lucas-Kanade motion estimation |
+| [Per-Pixel Control Flow](examples/per_pixel_control_flow.tex) | visualize each pixel's own pass count under a masked loop bound |
 | [Perlin Clouds](examples/perlin_clouds.tex) | procedural cloud pattern using FBM noise |
 | [Pixelate](examples/pixelate.tex) | mosaic / block effect |
 | [Posterize](examples/posterize.tex) | Quantise pixel values to a limited number of discrete levels |

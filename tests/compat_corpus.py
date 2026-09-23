@@ -90,6 +90,93 @@ _ADVERSARIAL = {
         "const float k = 0.3; float a = u; a += k; a *= 2.0;\n@OUT = vec4(a, a-k, a*0.5, 1.0);",
     "adv_pragma_current":   # LANG-3: a language pragma is an inert comment to the compiler
         "//!tex 0.23\n@OUT = vec4(u, v, u*v, 1.0);",
+
+    # LANG-L7 (docs/masked-control-flow.md §6): five `//!tex 0.25` rows -- the design note's
+    # own §1 worked examples (R-BREAK / R-CONT / R-RET / R-BOUND / R-WBOUND) -- and their five
+    # no-pragma twins, so the archive records BOTH answers for the same source and a future
+    # engine can never quietly converge them. Copied verbatim from
+    # `tests/test_lang_l4_masked_flow.py::_WORKED` (not imported, to keep this module free of
+    # a pytest-file dependency) -- one AUTHORED program per pair, not two.
+    #
+    # Each row deliberately reads an `@` binding (`@A.r`), breaking the "builtin coords only,
+    # no @inputs" convention every row above this one follows. That convention is broken ON
+    # PURPOSE here: a program with no `@` wire cooks at a 1x1 grid
+    # (`test_integration._prepare_example` has nothing to size a binding from), where the
+    # masked and unmasked readings agree BY CONSTRUCTION -- which is exactly how
+    # `adv_while_loop` above has sat in this corpus since `0.23` proving nothing about the
+    # ANY-pixel rule. Measured at this head: `@A.r`-bounded, `B=2,H=16,W=16`, the pre-`0.25`
+    # engine gives `n = 8` on every pixel while the masked reading gives `n in {1,2,7,8}` --
+    # every pixel moves a whole 8-bit level, so the pragma row and its no-pragma twin are
+    # required to hash differently.
+    "adv025_break":
+        "//!tex 0.25\n"
+        "float a = @A.r;\n"
+        "float hit = -1.0;\n"
+        "for (int i = 0; i < 3; i = i + 1) {\n"
+        "  if (a > 0.5) { hit = float(i) + 10.0; break; }\n"
+        "  hit = hit - 1.0;\n"
+        "}\n"
+        "@OUT = vec4(hit, hit, hit, 1.0);",
+    "adv025_break_nopragma":
+        "float a = @A.r;\n"
+        "float hit = -1.0;\n"
+        "for (int i = 0; i < 3; i = i + 1) {\n"
+        "  if (a > 0.5) { hit = float(i) + 10.0; break; }\n"
+        "  hit = hit - 1.0;\n"
+        "}\n"
+        "@OUT = vec4(hit, hit, hit, 1.0);",
+    "adv025_continue":
+        "//!tex 0.25\n"
+        "float a = @A.r;\n"
+        "float acc = 0.0;\n"
+        "for (int i = 0; i < 3; i = i + 1) {\n"
+        "  if (a > 0.5) { continue; }\n"
+        "  acc = acc + 1.0;\n"
+        "}\n"
+        "@OUT = vec4(acc, acc, acc, 1.0);",
+    "adv025_continue_nopragma":
+        "float a = @A.r;\n"
+        "float acc = 0.0;\n"
+        "for (int i = 0; i < 3; i = i + 1) {\n"
+        "  if (a > 0.5) { continue; }\n"
+        "  acc = acc + 1.0;\n"
+        "}\n"
+        "@OUT = vec4(acc, acc, acc, 1.0);",
+    "adv025_return":
+        "//!tex 0.25\n"
+        "float pick(float a) {\n"
+        "  if (a > 0.5) { return a * 10.0; }\n"
+        "  return a * 100.0;\n"
+        "}\n"
+        "float r = pick(@A.r);\n"
+        "@OUT = vec4(r, r, r, 1.0);",
+    "adv025_return_nopragma":
+        "float pick(float a) {\n"
+        "  if (a > 0.5) { return a * 10.0; }\n"
+        "  return a * 100.0;\n"
+        "}\n"
+        "float r = pick(@A.r);\n"
+        "@OUT = vec4(r, r, r, 1.0);",
+    "adv025_for_bound":
+        "//!tex 0.25\n"
+        "float n = @A.r * 10.0;\n"
+        "float c = 0.0;\n"
+        "for (int i = 0; float(i) < n; i = i + 1) { c = c + 1.0; }\n"
+        "@OUT = vec4(c, c, c, 1.0);",
+    "adv025_for_bound_nopragma":
+        "float n = @A.r * 10.0;\n"
+        "float c = 0.0;\n"
+        "for (int i = 0; float(i) < n; i = i + 1) { c = c + 1.0; }\n"
+        "@OUT = vec4(c, c, c, 1.0);",
+    "adv025_while_bound":
+        "//!tex 0.25\n"
+        "float x = @A.r; float c = 0.0;\n"
+        "while (x < 0.8) { x = x + 0.25; c = c + 1.0; }\n"
+        "@OUT = vec4(c, c, c, 1.0);",
+    "adv025_while_bound_nopragma":
+        "float x = @A.r; float c = 0.0;\n"
+        "while (x < 0.8) { x = x + 0.25; c = c + 1.0; }\n"
+        "@OUT = vec4(c, c, c, 1.0);",
 }
 
 

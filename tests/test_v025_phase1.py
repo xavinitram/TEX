@@ -622,6 +622,60 @@ def test_cache4_failsafe_oracle(r: SubTestResult):
         r.fail("CACHE-4 fail-safe oracle", f"{type(e).__name__}: {e}")
 
 
+def test_cache4_ast_epoch_folds_language_version(r: SubTestResult):
+    """LANG-L7 (L6-F1): the AST epoch's hash input folds `tex_api.LANGUAGE_VERSION`, so the
+    language bump moves every epoch (AST is nested into CODEGEN into VERDICT) exactly when the
+    version moves. Before this fix `tex_api.py` was in none of `_AST_FILES` / `_CODEGEN_FILES`
+    / `_VERDICT_FILES`, so a `.cg` sidecar minted for a `//!tex 0.25` program while the ENGINE
+    was still below `0.25` would be served UNMASKED after the bump, under the identical
+    fingerprint and the identical (unmoved) epoch — a silently wrong picture through the cache,
+    the exact failure class `docs/masked-control-flow.md` §4 exists to prevent, arriving a
+    different way. Red-first: reverting the `b"lang:" + ...` fragment in `tex_cache._AST_EPOCH`
+    reds both assertions below."""
+    print("\n--- CACHE-4 / LANG-L7: the AST epoch moves when LANGUAGE_VERSION does ---")
+    import os as _os
+    from TEX_Wrangle import tex_cache as C
+    from TEX_Wrangle.tex_compiler.types import TEXType
+    try:
+        # 1. The hash function itself: two different version strings, same file set, must
+        #    disagree — and the LIVE epoch must be the one hashed with the LIVE version.
+        h24 = C._hash_files(C._AST_FILES, b"lang:0.24")
+        h25 = C._hash_files(C._AST_FILES, b"lang:0.25")
+        assert h24 != h25, "_AST_EPOCH's hash does not depend on the language-version fragment"
+        from TEX_Wrangle.tex_api import LANGUAGE_VERSION as _live
+        assert C._AST_EPOCH == C._hash_files(C._AST_FILES, b"lang:" + _live.encode()), \
+            "the live AST epoch was not computed with the live LANGUAGE_VERSION"
+
+        # 2. The end-to-end proof: mint a `.cg` sidecar for a `//!tex 0.25` program under the
+        #    epoch as it would have hashed BEFORE the bump (LANGUAGE_VERSION == "0.24"), the
+        #    way an installation that cooked this program the week before a release upgrade
+        #    would have one sitting on disk. After "the bump" (this process's real, current
+        #    epoch — LANGUAGE_VERSION == "0.25" at this head) that pre-bump sidecar must NOT
+        #    be served: `_load_codegen_from_disk` must see a version mismatch and miss.
+        cache = C.get_cache()
+        code = "//!tex 0.25\n@OUT = @A * 0.6 + 0.1;"
+        bt = {"A": TEXType.VEC4}
+        fp = cache.fingerprint(code, bt)
+        for ext in (".pkl", ".cg"):
+            (cache._cache_dir / f"{fp}{ext}").unlink(missing_ok=True)
+        old_ast = C._hash_files(C._AST_FILES, b"lang:0.24")
+        old_cg = C._hash_files(
+            C._CODEGEN_FILES, b"ast:" + old_ast.encode(),
+            b"cgreuse:" + _os.environ.get("TEX_CODEGEN_NO_OUT_REUSE", "").encode())
+        real_ast, real_cg = C._AST_EPOCH, C._CODEGEN_EPOCH
+        assert old_ast != real_ast, "the fixture's 'pre-bump' epoch coincides with the real one"
+        try:
+            C._AST_EPOCH, C._CODEGEN_EPOCH = old_ast, old_cg
+            cache._persist_codegen(fp, unsupported=True)   # writes version=old_cg (pre-bump)
+        finally:
+            C._AST_EPOCH, C._CODEGEN_EPOCH = real_ast, real_cg   # "the bump" — restore reality
+        assert cache._load_codegen_from_disk(fp) is None, \
+            "a .cg sidecar minted before the LANGUAGE_VERSION bump was served after it"
+        r.ok("AST epoch folds LANGUAGE_VERSION; a pre-bump .cg sidecar is not served post-bump")
+    except Exception as e:
+        r.fail("CACHE-4 AST-epoch language-version fold", f"{type(e).__name__}: {e}")
+
+
 def test_cache1_playhead_keys(r: SubTestResult):
     print("\n--- CACHE-1: every playhead builtin (frame/fps/time) re-keys; no stale serve ---")
     # Regression for the review's CRITICAL: keying only `frame` (and int()-truncating it) let a

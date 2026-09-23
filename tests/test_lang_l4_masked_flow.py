@@ -179,25 +179,38 @@ def test_no_pragma_or_pinned_keeps_the_before_column(name, header):
     assert interp._masked is False
 
 
-def test_pragma_025_alone_changes_nothing_at_this_head():
-    """Even a `//!tex 0.25` program still cooks under `0.23`'s rules, because the ENGINE's
-    level is what the gate keys on and `LANGUAGE_VERSION` has not moved. This is
-    `docs/masked-control-flow.md` §4's `min(...)` rule, which is also what keeps the
-    region-dependence sunset shut until L7."""
-    for name, (src, before, _after) in _WORKED.items():
-        out, interp = _cook(PRAGMA + src, _TABLE_BINDINGS, None)
-        got = [round(float(x), 4) for x in _chan0(out).reshape(-1).tolist()]
-        assert got == before, name
-        assert interp._masked is False, name
+def test_pragma_025_alone_does_not_mask_below_masked_flow():
+    """A `//!tex 0.25` pragma alone does not open the masked path while the ENGINE is below
+    `MASKED_FLOW_SINCE` — `docs/masked-control-flow.md` §4's `min(...)` rule, the same one
+    that keeps the region-dependence sunset shut below `0.25`. LANG-L7 moved the REAL engine
+    to `0.25` (`test_worked_table_after_column` above is the proof that this exact pragma, at
+    THIS head, now takes effect), so the live engine can no longer reach this case on its own
+    — monkeypatched DOWN to `0.24` for exactly this check, restored in `finally`."""
+    real = tex_api.LANGUAGE_VERSION
+    try:
+        tex_api.LANGUAGE_VERSION = "0.24"
+        for name, (src, before, _after) in _WORKED.items():
+            out, interp = _cook(PRAGMA + src, _TABLE_BINDINGS, None)
+            got = [round(float(x), 4) for x in _chan0(out).reshape(-1).tolist()]
+            assert got == before, name
+            assert interp._masked is False, name
+    finally:
+        tex_api.LANGUAGE_VERSION = real
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Below 0.25 cannot reach the masked path — by construction, proved over the corpus
+# LANG-L7: the real engine now implements 0.25 — the gate opens for exactly the rows
+# that ask for it, and stays shut below 0.25 for every other corpus program.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_below_025_gate_is_shut_for_every_corpus_program():
-    """`masked_flow.enabled_for` is False for all 130 frozen corpus programs, including
-    the one that carries a pragma. Proved by running the gate, not by reading it."""
+def test_masked_gate_is_open_only_for_this_lanes_pragma_rows():
+    """`masked_flow.enabled_for` is True for exactly LANG-L7's five `//!tex 0.25` adversarial
+    rows (`adv025_break`/`continue`/`return`/`for_bound`/`while_bound`), the new shipped example
+    (`per_pixel_control_flow`, which carries the same pragma and a real per-pixel loop bound),
+    and False for every other of the 141 frozen corpus programs — including the five no-pragma
+    twins and the pre-existing `adv_pragma_current` (`//!tex 0.23`). Proved by running the gate
+    over the live corpus, not by reading it; this is the real-engine successor to L4's own
+    `test_below_025_gate_is_shut_for_every_corpus_program`, which this lane's bump retires."""
     programs = dict(cc._corpus_programs())
     assert len(programs) >= 100, f"corpus unexpectedly small: {len(programs)}"
     on = []
@@ -208,24 +221,36 @@ def test_below_025_gate_is_shut_for_every_corpus_program():
             continue
         if masked_flow.enabled_for(prog, src):
             on.append(name)
-    assert on == [], f"the masked path is reachable for {on} at LANGUAGE_VERSION " \
-                     f"{tex_api.LANGUAGE_VERSION}"
+    want = sorted(f"adv025_{n}" for n in
+                  ("break", "continue", "return", "for_bound", "while_bound"))
+    want = sorted(want + ["per_pixel_control_flow"])
+    assert sorted(on) == want, f"the masked path is reachable for {sorted(on)} at " \
+                              f"LANGUAGE_VERSION {tex_api.LANGUAGE_VERSION}, want {want}"
 
 
 def test_below_025_gate_is_shut_for_every_declarable_pragma():
-    """The gate is `min(pragma, LANGUAGE_VERSION)`, so no pragma a source can spell opens
-    it while the engine is below 0.25 — including one far in the future."""
+    """The gate is `min(pragma, LANGUAGE_VERSION)`, so no pragma a source can spell opens it
+    while the engine is below 0.25 — including one far in the future. LANG-L7 moved the real
+    engine to `0.25`, so this is monkeypatched DOWN to `0.24` for exactly this check
+    (restored in `finally`) to keep exercising the case a live engine can no longer reach."""
     src = _WORKED["break"][0]
-    for header in ["", "//!tex 0.23\n", "//!tex 0.24\n", "//!tex 0.25\n",
-                   "//!tex 0.99\n", "//!tex 1.0\n"]:
-        prog = Parser(Lexer(header + src).tokenize(), source=header + src).parse()
-        assert masked_flow.enabled_for(prog, header + src) is False, header
+    real = tex_api.LANGUAGE_VERSION
+    try:
+        tex_api.LANGUAGE_VERSION = "0.24"
+        for header in ["", "//!tex 0.23\n", "//!tex 0.24\n", "//!tex 0.25\n",
+                       "//!tex 0.99\n", "//!tex 1.0\n"]:
+            prog = Parser(Lexer(header + src).tokenize(), source=header + src).parse()
+            assert masked_flow.enabled_for(prog, header + src) is False, header
+    finally:
+        tex_api.LANGUAGE_VERSION = real
 
 
-def test_language_version_has_not_moved():
-    """`LANGUAGE_VERSION` is L7's to move. If this row ever reds in THIS lane, the gate
-    above stopped being a proof and became a coincidence."""
-    assert tex_api.LANGUAGE_VERSION == "0.24"
+def test_language_version_reached_masked_flow():
+    """LANG-L7 moved `LANGUAGE_VERSION` to `0.25` — the constant every test above that reads
+    the AMBIENT (not monkeypatched) value now assumes. Retired from `test_below_025_*` naming:
+    this file's earlier `test_language_version_has_not_moved` documented the OPPOSITE fact,
+    true only before this lane."""
+    assert tex_api.LANGUAGE_VERSION == "0.25"
     assert tex_roi.MASKED_FLOW_SINCE == (0, 25)
 
 

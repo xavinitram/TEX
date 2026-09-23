@@ -234,15 +234,34 @@ def _corpus_compiles():
         yield name, program, cg_mod.try_compile(program, type_map)
 
 
+# LANG-L7: the corpus now carries programs that ASK for `0.25` on purpose — five adversarial
+# rows plus the shipped example, all `docs/masked-control-flow.md` §6 additions — and the real
+# engine now implements it, so these are the ONLY corpus entries the two sweeps below must
+# find masked. `test_masked_gate_is_open_only_for_this_lanes_pragma_rows`
+# (test_lang_l4_masked_flow.py) is the corpus-wide proof that it is exactly these and no
+# others; `test_the_masked_and_unmasked_emissions_actually_differ` below is this file's own
+# proof that emission actually differs for one of them.
+_LANG_L7_MASKED_CORPUS_NAMES = frozenset({
+    "adv025_break", "adv025_continue", "adv025_return",
+    "adv025_for_bound", "adv025_while_bound", "per_pixel_control_flow",
+})
+
+
 def test_no_pragma_emits_no_masked_runtime():
-    """No corpus program's emitted source contains one character of the masked runtime.
+    """No corpus program OUTSIDE LANG-L7's own masked set has one character of the masked
+    runtime in its emitted source.
 
     This is the whole ComfyUI-invisibility argument in one assertion: `_MF` is the only name
     the masked emission introduces, and `_mf` the only local it binds, so a source free of
-    both is a source `codegen_masked.py` never touched."""
+    both is a source `codegen_masked.py` never touched. LANG-L7's five `//!tex 0.25`
+    adversarial rows and the shipped example are excluded — they ASK for masking and are
+    proved masked elsewhere (`test_the_masked_and_unmasked_emissions_actually_differ` below;
+    the corpus-wide gate census in `test_lang_l4_masked_flow.py`)."""
     offenders = []
     checked = 0
     for name, _program, fn in _corpus_compiles():
+        if name in _LANG_L7_MASKED_CORPUS_NAMES:
+            continue
         if fn is None:
             continue
         checked += 1
@@ -254,9 +273,11 @@ def test_no_pragma_emits_no_masked_runtime():
 
 
 def test_corpus_programs_do_not_open_the_language_gate():
-    """…and the reason they do not is the gate, not luck."""
+    """…and the reason the REST of the corpus does not is the gate, not luck. LANG-L7's own
+    five pragma rows and the shipped example are excluded — they are designed to open it."""
     opened = [name for name, program, _fn in _corpus_compiles()
-              if masked_flow.enabled_for(program, "")]
+              if name not in _LANG_L7_MASKED_CORPUS_NAMES
+              and masked_flow.enabled_for(program, "")]
     assert opened == [], f"the 0.25 gate opened for: {opened}"
 
 
@@ -666,19 +687,43 @@ def test_the_emitted_source_never_spells_the_predicate_itself():
 # 7. The seam, and the version that has not moved
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_language_version_has_not_moved():
-    """L5 does not bump it; L7 does. Every claim above about the gate being shut for real
-    programs rests on this."""
-    assert tex_api.LANGUAGE_VERSION == "0.24"
+def test_language_version_reached_masked_flow():
+    """LANG-L7 moved `LANGUAGE_VERSION` to `0.25`. Every claim ABOVE this point in the file
+    that reads the ambient (not monkeypatched) value keys on this; the below-`0.25` claims
+    below monkeypatch down to `0.24` for exactly the assertion that needs it."""
+    assert tex_api.LANGUAGE_VERSION == "0.25"
 
 
-def test_try_compile_default_never_masks_at_this_head():
-    """With no explicit seam, no program that can exist reaches the masked emitter —
-    `min(pragma, LANGUAGE_VERSION)` is at most `(0, 24)` for every string a pragma can
-    spell."""
+def test_try_compile_default_masks_only_a_025_pragma_at_the_real_engine():
+    """With no explicit seam, the default seam reads the real engine: a program below `0.25`
+    (no pragma, or an older one) never reaches the masked emitter, and a `//!tex 0.25` (or
+    later) program now does — the real-engine successor to this file's earlier
+    `test_try_compile_default_never_masks_at_this_head`, which this lane's bump retires."""
     b = L4._bindings()
-    for header in ("", "//!tex 0.23\n", "//!tex 0.24\n", "//!tex 0.25\n", "//!tex 1.0\n"):
+    for header in ("", "//!tex 0.23\n", "//!tex 0.24\n"):
         program, type_map, _n = _compile(header + L4._ATOM_PROGRAMS["break_basic"], b)
         fn = cg_mod.try_compile(program, type_map)
         assert fn is not None
         assert "_MF" not in fn._tex_src, header
+    for header in ("//!tex 0.25\n", "//!tex 1.0\n"):
+        program, type_map, _n = _compile(header + L4._ATOM_PROGRAMS["break_basic"], b)
+        fn = cg_mod.try_compile(program, type_map)
+        assert fn is not None
+        assert "_MF" in fn._tex_src, header
+
+
+def test_try_compile_default_never_masks_below_masked_flow():
+    """The below-`0.25` half of the old claim, kept alive by monkeypatching the engine DOWN
+    to `0.24` (restored in `finally`) — a live engine can no longer reach this case on its
+    own now that LANG-L7 has landed."""
+    b = L4._bindings()
+    real = tex_api.LANGUAGE_VERSION
+    try:
+        tex_api.LANGUAGE_VERSION = "0.24"
+        for header in ("", "//!tex 0.23\n", "//!tex 0.24\n", "//!tex 0.25\n", "//!tex 1.0\n"):
+            program, type_map, _n = _compile(header + L4._ATOM_PROGRAMS["break_basic"], b)
+            fn = cg_mod.try_compile(program, type_map)
+            assert fn is not None
+            assert "_MF" not in fn._tex_src, header
+    finally:
+        tex_api.LANGUAGE_VERSION = real

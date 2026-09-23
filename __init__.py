@@ -196,6 +196,7 @@ _EXAMPLE_CATEGORIES = {
     "matrix_transform":     "Educational/Matrix Transform",
     "multi_output":         "Educational/Multi Output",
     "multi_sample":         "Educational/Multi Sample",
+    "per_pixel_control_flow": "Educational/Per Pixel Control Flow",
     "recursive_pattern":    "Educational/Recursive Pattern",
     "sample_comparison":    "Educational/Sample Comparison",
     "temporal_functions":   "Educational/Temporal Functions",

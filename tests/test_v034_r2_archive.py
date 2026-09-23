@@ -92,18 +92,19 @@ def test_v034_r2_neutrality(r):
 
     This is the neutrality proof doc 41 §3.4 asks for. At v0.34 the archive held exactly one
     version (0.23) and this row asserted that; v0.37 froze 0.24 (DATA-6, the first grammar bump
-    since R2-archive) and the count became 2, as the row foresaw. The shape now: the versions
-    are derived from the directory, the newest equals `LANGUAGE_VERSION` (the archive's newest
-    file is always the language the engine implements), every earlier one is still present
-    (`test_lang3_compat_corpus` checks each), and today the set is exactly {0.23, 0.24} — the
-    next freeze updates that set deliberately, here."""
+    since R2-archive) and the count became 2, as the row foresaw; LANG-L7 froze 0.25 (masked
+    per-pixel control flow) and the count became 3, exactly the same way. The shape now: the
+    versions are derived from the directory, the newest equals `LANGUAGE_VERSION` (the
+    archive's newest file is always the language the engine implements), every earlier one is
+    still present (`test_lang3_compat_corpus` checks each), and today the set is exactly
+    {0.23, 0.24, 0.25} — the next freeze updates that set deliberately, here."""
     try:
         from TEX_Wrangle.tex_api import LANGUAGE_VERSION
         versions = compat_corpus.archived_versions()
         assert versions, "no frozen language versions in the archive"
         assert versions[-1] == LANGUAGE_VERSION, \
             f"newest archived={versions[-1]}, LANGUAGE_VERSION={LANGUAGE_VERSION}"
-        assert versions == ["0.23", "0.24"], f"archived={versions}"
+        assert versions == ["0.23", "0.24", "0.25"], f"archived={versions}"
         payload = compat_corpus.load_goldens()
         assert payload["language_version"] == LANGUAGE_VERSION, payload["language_version"]
         n = len(payload["hashes"])

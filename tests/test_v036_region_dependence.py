@@ -200,6 +200,12 @@ def test_t1_repro_is_region_dependent(r: SubTestResult):
                                    _column(tiled4["OUT"]))
         assert got_whole == [4.0] * 8, got_whole
         assert got_2 == [4.0, 4.0, 4.0, 4.0, 2.0, 2.0, 2.0, 2.0], got_2
+        # LANG-L7 (L6-F4): `got_4` is a characterization of the 4-STRIP result, not the
+        # per-pixel answer — do not mistake one for the other. Under `//!tex 0.25` masked
+        # rules the pass count is each pixel's OWN, not the smallest region's: this repro's
+        # per-pixel answer is `[4, 4, 3, 3, 2, 2, 1, 0]` (the last pixel's own condition is
+        # already false and it never runs a fourth pass), which the 4-strip cook's own
+        # maximum-per-strip reading, `[4, 4, 3, 3, 2, 2, 1, 1]` below, one-off's at the tail.
         assert got_4 == [4.0, 4.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0], got_4
         assert _maxdiff(whole["OUT"], tiled["OUT"]) == 2.0
         assert _maxdiff(whole["OUT"], tiled4["OUT"]) == 3.0
@@ -279,7 +285,11 @@ def test_t7_no_shipped_program_is_declined(r: SubTestResult):
     examples = list(_example_sources())
     stock = list(_stock_sources())
     try:
-        assert len(examples) == 117, f"expected 117 examples/*.tex, found {len(examples)}"
+        # LANG-L7 added `examples/per_pixel_control_flow.tex` (118th): it carries a `//!tex
+        # 0.25` pragma and the engine now implements 0.25, so its per-pixel loop bound sunsets
+        # (clause a) and it is NOT region-dependent — the count below moves; the declined set
+        # asserted after this block does not.
+        assert len(examples) == 118, f"expected 118 examples/*.tex, found {len(examples)}"
         assert len(stock) == 6, f"expected 6 stock programs, found {len(stock)}"
         r.ok(f"corpus size pinned: {len(examples)} examples + {len(stock)} stock programs")
     except Exception as e:
@@ -752,13 +762,18 @@ def test_t8_pragma_sunsets_the_loop_clause_only(r: SubTestResult):
         r.fail("T8 constant", f"{type(e).__name__}: {e}")
 
     masked = "//!tex 0.25\n" + REPRO
+    _real_version = tex_api.LANGUAGE_VERSION
 
     # A pragma is a REQUEST, not a capability. One naming a language newer than the engine
     # implements does not block (it is advisory only), so the program still cooks under the
-    # rules this engine actually has — and must therefore keep the gate. Asserted against the
-    # real `LANGUAGE_VERSION` rather than a hardcoded string, so the row documents the
-    # coupling instead of quietly going vacuous when that constant moves.
+    # rules the engine actually has — and must therefore keep the gate. LANG-L7 moved the
+    # real engine TO masked flow, so a live engine can no longer reach this case on its own;
+    # monkeypatched DOWN to `0.24` for exactly this one block, restored in `finally`, so the
+    # row still documents the coupling instead of going vacuous now that the ambient version
+    # itself sits at `MASKED_FLOW_SINCE`.
     try:
+        tex_api.LANGUAGE_VERSION = "0.24"
+        tex_roi.clear_roi_memo()
         assert tex_api._ver_tuple(tex_api.LANGUAGE_VERSION) < tex_roi.MASKED_FLOW_SINCE, \
             (f"this row only means something while the engine "
              f"({tex_api.LANGUAGE_VERSION}) predates masked flow")
@@ -769,13 +784,16 @@ def test_t8_pragma_sunsets_the_loop_clause_only(r: SubTestResult):
         r.ok(f"engine at {tex_api.LANGUAGE_VERSION}: `//!tex 0.25` alone retires nothing")
     except Exception as e:
         r.fail("T8 a pragma alone does not sunset", f"{type(e).__name__}: {e}")
-
-    # …and the day `LANGUAGE_VERSION` reaches masked flow, the sunset starts working exactly
-    # as designed, with no further edit here.
-    _real_version = tex_api.LANGUAGE_VERSION
-    try:
-        tex_api.LANGUAGE_VERSION = "0.25"
+    finally:
+        tex_api.LANGUAGE_VERSION = _real_version
         tex_roi.clear_roi_memo()
+
+    # …and at the real engine — LANGUAGE_VERSION reached masked flow at LANG-L7 — the sunset
+    # fires exactly as designed, with no monkeypatch and no further edit here.
+    try:
+        assert tex_api._ver_tuple(tex_api.LANGUAGE_VERSION) >= tex_roi.MASKED_FLOW_SINCE, \
+            (f"LANG-L7 was supposed to move the engine to masked flow "
+             f"({tex_api.LANGUAGE_VERSION})")
         assert tex_roi.region_dependent(_parse(masked), code=masked) is False, \
             "engine and program both at masked flow: clauses (a)/(b) must retire"
         assert tex_roi.roi_plan(masked, {}).executable is True, \
@@ -793,9 +811,6 @@ def test_t8_pragma_sunsets_the_loop_clause_only(r: SubTestResult):
         r.ok("clause (c) survives both halves, which is why the gate is per-clause")
     except Exception as e:
         r.fail("T8 sunset once the engine implements it", f"{type(e).__name__}: {e}")
-    finally:
-        tex_api.LANGUAGE_VERSION = _real_version
-        tex_roi.clear_roi_memo()
 
     for label, src in (("an older pragma", "//!tex 0.24\n" + REPRO),
                        ("no pragma", REPRO),
@@ -906,20 +921,86 @@ def test_t10_w7008_names_what_the_engine_now_refuses(r: SubTestResult):
         r.fail("T10 documented surface", f"{type(e).__name__}: {e}")
 
 
+# ── LANG-L7 §7: W7007's testable consequence ────────────────────────────────
+
+_PRAGMA_LINE_RE = re.compile(r"^\s*//!tex\b.*$\n?", re.M)
+
+
+def _strip_pragma(src: str) -> str:
+    """Remove every `//!tex ...` line from `src`, so what remains carries none — the "bare"
+    reading `test_w7007_conditional_no_warning_means_no_pixel_move` below checks for
+    structural per-pixel control flow before deciding whether a program is allowed to move."""
+    return _PRAGMA_LINE_RE.sub("", src)
+
+
+def test_w7007_conditional_no_warning_means_no_pixel_move(r: SubTestResult):
+    """`docs/masked-control-flow.md` §7's testable consequence: once W7007 is conditional,
+    "no W7007 (bare of any pragma) ⇒ the `//!tex 0.25` pragma moves no pixel" is a property a
+    test can assert over the WHOLE corpus, stronger than §2's by-hand census re-run each
+    release. For every one of the 141 frozen corpus programs that draws no W7007 once
+    stripped of whatever pragma it carries, cooking it bare and cooking it with a fresh
+    `//!tex 0.25` header must hash identically — proving the header alone moved nothing."""
+    import compat_corpus as cc
+    try:
+        checked, moved, excluded = 0, [], []
+        for name, src in cc._corpus_programs():
+            bare = _strip_pragma(src)
+            try:
+                codes = {d.code for d in tex_api.control_flow_advisories(bare, {})}
+            except Exception:
+                continue
+            if "W7007" in codes:
+                excluded.append(name)
+                continue
+            try:
+                h_bare = cc._program_hash(bare)
+                h_025 = cc._program_hash("//!tex 0.25\n" + bare)
+            except Exception:
+                continue          # a program this repro cannot cook at all: not this test's claim
+            checked += 1
+            if h_bare != h_025:
+                moved.append(name)
+        assert checked >= 100, f"too few programs checked: {checked} (excluded {len(excluded)})"
+        # LANG-L7's own five pragma rows (and their twins), the shipped example, and
+        # `adv_while_loop` (§2's pre-existing class-B program, a W7007 carrier since 0.23) —
+        # exactly the corpus's W7007 carriers, the census this excluded set should reduce to.
+        want_excluded = {"adv025_break", "adv025_break_nopragma", "adv025_continue",
+                         "adv025_continue_nopragma", "adv025_return", "adv025_return_nopragma",
+                         "adv025_for_bound", "adv025_for_bound_nopragma", "adv025_while_bound",
+                         "adv025_while_bound_nopragma", "per_pixel_control_flow",
+                         "adv_while_loop"}
+        assert set(excluded) == want_excluded, sorted(excluded)
+        assert not moved, f"the //!tex 0.25 header moved pixels without drawing W7007: {moved}"
+        r.ok(f"{checked} corpus programs draw no bare W7007; the //!tex 0.25 header moves none "
+             f"of them ({len(excluded)} W7007 carriers correctly excluded)")
+    except Exception as e:
+        r.fail("LANG-L7 W7007 testable consequence", f"{type(e).__name__}: {e}")
+
+
 # ── T12: the frozen compat corpus ───────────────────────────────────────────
 
 def test_t12_corpus_neutrality(r: SubTestResult):
-    print("\n--- T12: the frozen corpus is unmoved, and declines exactly two programs ---")
+    print("\n--- T12: the frozen corpus is unmoved, plus LANG-L7's two new no-pragma twins ---")
     import compat_corpus
     try:
         # DOC-8 added `string_format` to this set: its format() calls now fill `{}`
         # placeholders instead of leaving dead `%f`/`%s` sequences unfilled, so its five
         # numeric calls genuinely cast a per-region-varying value to a string.
+        #
+        # LANG-L7 added `adv025_for_bound_nopragma` / `adv025_while_bound_nopragma`: real
+        # per-pixel loop bounds with NO pragma, so `_language_tuple` is `(0, 0)` regardless of
+        # the engine and clause (a)/(b) never sunsets for them -- correctly region-dependent,
+        # same as `adv_while_loop`. Their `//!tex 0.25` twins (`adv025_for_bound` /
+        # `adv025_while_bound`) are NOT in this set: the engine now implements 0.25, so the
+        # sunset retires clause (a)/(b) for them. `adv025_break`/`continue`/`return` (either
+        # pragma) never join this set either -- their own loop bound (`i < 3`) is a static
+        # range; clause (a)/(b) was never about them.
         declined = sorted(name for name, src in compat_corpus._corpus_programs()
                           if tex_roi.region_dependent(_parse(src), code=src))
-        assert declined == ["adv_while_loop", "string_format"], declined
-        r.ok("exactly two corpus programs are region-dependent, by name: "
-             "adv_while_loop, string_format")
+        assert declined == ["adv025_for_bound_nopragma", "adv025_while_bound_nopragma",
+                            "adv_while_loop", "string_format"], declined
+        r.ok("region-dependent, by name: adv025_for_bound_nopragma, "
+             "adv025_while_bound_nopragma, adv_while_loop, string_format")
     except Exception as e:
         r.fail("T12 declined set", f"{type(e).__name__}: {e}")
 
@@ -1008,7 +1089,14 @@ def test_t13_percent_style_format_is_not_in_the_class(r: SubTestResult):
 def test_t13_pragma_never_sunsets_clause_d(r: SubTestResult):
     print("\n--- T13: clause (d) survives the masked-flow pragma, like clause (c) ---")
     masked_cast = "//!tex 0.25\n" + CAST_REPRO
+    _real_version = tex_api.LANGUAGE_VERSION
+
+    # LANG-L7 moved the real engine TO masked flow, so this half — "a pragma the engine does
+    # not implement retires nothing" — is monkeypatched DOWN to `0.24` for exactly this one
+    # block (restored in `finally`), the same technique T8 uses above.
     try:
+        tex_api.LANGUAGE_VERSION = "0.24"
+        tex_roi.clear_roi_memo()
         assert tex_api._ver_tuple(tex_api.LANGUAGE_VERSION) < tex_roi.MASKED_FLOW_SINCE, (
             f"this row only means something while the engine "
             f"({tex_api.LANGUAGE_VERSION}) predates masked flow")
@@ -1016,24 +1104,25 @@ def test_t13_pragma_never_sunsets_clause_d(r: SubTestResult):
         r.ok(f"engine at {tex_api.LANGUAGE_VERSION}: `//!tex 0.25` alone retires nothing")
     except Exception as e:
         r.fail("T13 pragma alone does not sunset", f"{type(e).__name__}: {e}")
+    finally:
+        tex_api.LANGUAGE_VERSION = _real_version
+        tex_roi.clear_roi_memo()
 
     # Masked per-pixel control flow (0.25) changes how a LOOP runs its body — it says nothing
     # about how `_scalar_from_tensor` reduces a tensor to a string, so clause (d) must still
     # fire even once the ENGINE implements 0.25, exactly like clause (c) (§1.5: "the majority
     # rule verbatim"). This is why region_dependent gates clause (d) beside (c), never with
-    # the loop clauses (a)/(b) that DO sunset at MASKED_FLOW_SINCE.
-    _real_version = tex_api.LANGUAGE_VERSION
+    # the loop clauses (a)/(b) that DO sunset at MASKED_FLOW_SINCE. No monkeypatch needed here
+    # any more — the real engine reached masked flow at LANG-L7.
     try:
-        tex_api.LANGUAGE_VERSION = "0.25"
-        tex_roi.clear_roi_memo()
+        assert tex_api._ver_tuple(tex_api.LANGUAGE_VERSION) >= tex_roi.MASKED_FLOW_SINCE, (
+            f"LANG-L7 was supposed to move the engine to masked flow "
+            f"({tex_api.LANGUAGE_VERSION})")
         assert tex_roi.region_dependent(_parse(masked_cast), code=masked_cast) is True, \
             "clause (d) must NOT sunset: masked flow says nothing about the string reduction"
         r.ok("clause (d) survives an engine that implements masked flow too")
     except Exception as e:
         r.fail("T13 sunset once the engine implements it", f"{type(e).__name__}: {e}")
-    finally:
-        tex_api.LANGUAGE_VERSION = _real_version
-        tex_roi.clear_roi_memo()
 
 
 def test_t13_advisory_and_corpus_are_unaffected(r: SubTestResult):

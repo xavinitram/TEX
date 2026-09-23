@@ -107,6 +107,16 @@ _ATOMS = L4._ATOM_PROGRAMS
 _WORKED = {name: src for name, (src, _b, _a) in L4._WORKED.items()}
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# LANG-L7: the corpus rows (and the shipped example) that ASK for `0.25` on purpose — the real
+# engine now grants it, so every OTHER invariant-7 "nothing moved" sweep in this file excludes
+# exactly these. Kept as its own local constant (not imported from
+# test_lang_l5_codegen_masking) so this file's corpus sweeps do not depend on that file's
+# import order.
+_LANG_L7_MASKED_CORPUS_NAMES = frozenset({
+    "adv025_break", "adv025_continue", "adv025_return",
+    "adv025_for_bound", "adv025_while_bound", "per_pixel_control_flow",
+})
+
 
 def _parse(src):
     return Parser(Lexer(src).tokenize(), source=src).parse()
@@ -172,11 +182,13 @@ def test_l6_capture_gate_declines_a_flagged_program_with_sync_points(r: SubTestR
         r.fail("L6 capture declines the sync-bearing atoms", f"{type(e).__name__}: {e}")
 
     # The ENGINE's gate, not the seam: with `_masked_flow=None` the verdict follows the
-    # language level — shut at this head, open when the engine implements 0.25.
+    # language level — shut below 0.25, open when the engine implements it. LANG-L7 moved
+    # the real engine TO 0.25, so the "shut" half is exercised via `_engine_at("0.24")`.
     try:
-        prog = _parse(PRAGMA + BREAK_IN_STATIC_FOR)
-        assert graphed._capturable(prog) == graphed._capturable(prog, _masked_flow=False), \
-            "a 0.25 pragma alone moved the verdict while the engine is below 0.25"
+        with _engine_at("0.24"):
+            prog = _parse(PRAGMA + BREAK_IN_STATIC_FOR)
+            assert graphed._capturable(prog) == graphed._capturable(prog, _masked_flow=False), \
+                "a 0.25 pragma alone moved the verdict while the engine is below 0.25"
         with _engine_at("0.25"):
             assert graphed._capturable(_parse(PRAGMA + BREAK_IN_STATIC_FOR)) == (False, 0), \
                 "engine and program both at 0.25: the gate did not open"
@@ -289,10 +301,11 @@ def test_l6_auto_declines_a_025_per_pixel_for(r: SubTestResult):
             r.fail(f"L6 auto declines {label}", f"{type(e).__name__}: {e}")
 
     try:
-        prog = _parse(PRAGMA + U_BOUNDED_FOR)
-        assert resolve_auto_precision(prog, _PX, "cuda") == \
-            resolve_auto_precision(prog, _PX, "cuda", _masked_flow=False), \
-            "a 0.25 pragma alone moved the verdict while the engine is below 0.25"
+        with _engine_at("0.24"):
+            prog = _parse(PRAGMA + U_BOUNDED_FOR)
+            assert resolve_auto_precision(prog, _PX, "cuda") == \
+                resolve_auto_precision(prog, _PX, "cuda", _masked_flow=False), \
+                "a 0.25 pragma alone moved the verdict while the engine is below 0.25"
         with _engine_at("0.25"):
             assert resolve_auto_precision(_parse(PRAGMA + U_BOUNDED_FOR), _PX, "cuda")[0] == "fp32"
             assert resolve_auto_precision(_parse(U_BOUNDED_FOR), _PX, "cuda")[0] == "fp16", \
@@ -599,6 +612,12 @@ def test_l6_corpus_satellite_verdicts_are_unmoved(r: SubTestResult):
         assert len(programs) >= 100, len(programs)
         moved, checked = [], 0
         for name, src in sorted(programs.items()):
+            if name in _LANG_L7_MASKED_CORPUS_NAMES:
+                continue    # LANG-L7's own rows ASK for 0.25 and the real engine now grants
+                            # it — excluded here, proved masked-and-unmoved-in-VALUE by
+                            # test_masked_gate_is_open_only_for_this_lanes_pragma_rows
+                            # (test_lang_l4_masked_flow.py) and this file's own §3 split-triple
+                            # characterization, not by this invariant-7 sweep.
             try:
                 prog = _parse(src)
             except Exception:
@@ -616,11 +635,11 @@ def test_l6_corpus_satellite_verdicts_are_unmoved(r: SubTestResult):
         r.fail("L6 corpus verdicts", f"{type(e).__name__}: {e}")
 
 
-def test_l6_language_version_has_not_moved(r: SubTestResult):
-    print("\n--- L6: LANGUAGE_VERSION is L7's to move ---")
+def test_l6_language_version_reached_masked_flow(r: SubTestResult):
+    print("\n--- L6->L7: LANGUAGE_VERSION reached masked flow ---")
     try:
-        assert tex_api.LANGUAGE_VERSION == "0.24"
+        assert tex_api.LANGUAGE_VERSION == "0.25"
         assert tex_roi.MASKED_FLOW_SINCE == (0, 25)
-        r.ok("LANGUAGE_VERSION 0.24, MASKED_FLOW_SINCE (0, 25)")
+        r.ok("LANGUAGE_VERSION 0.25, MASKED_FLOW_SINCE (0, 25)")
     except Exception as e:
-        r.fail("L6 version pin", f"{type(e).__name__}: {e}")
+        r.fail("L6->L7 version pin", f"{type(e).__name__}: {e}")
