@@ -36,7 +36,7 @@ import torch
 
 from .tex_cache import get_cache
 from .tex_compiler.diagnostics import raw_compile_errors, compile_error_from
-from .tex_runtime.interpreter import Interpreter
+from .tex_runtime.interpreter import Interpreter, _reads_viewer_builtin, _VIEWER_BUILTIN_NAMES
 from .tex_runtime.interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
 from .tex_marshalling import (
     convert_param_value as _convert_param_value,
@@ -118,6 +118,12 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
         # SAME way the interpreter does (prepare() already normalizes to a dict, but a directly
         # built ExecContext must not slip a Mapping-but-not-dict playhead past the key).
         tc = dict(ctx.time_context) if hasattr(ctx.time_context, "items") else None
+        # PM-11: viewer_context keys ONLY when the program actually calls a viewer builtin —
+        # unlike `tc` above, every program can read frame/fps/time as bare identifiers with
+        # no call, so there is no "before" key shape for that one to preserve. A program that
+        # never calls viewer_exposure()/viewer_gamma() must key IDENTICALLY to a pre-PM-11
+        # build (invariant #7); `lineage_key` itself omits the byte entirely for `None`.
+        vc = ctx.viewer_context if _reads_viewer_builtin(ctx.program) else None
         roi_rect = list(ctx.roi) if ctx.roi is not None else None
         # Cook-invariant flags that MOVE PIXELS but are neither bindings nor shape — so they
         # would otherwise fall out of the key and silent-serve a stale frame across a toggle:
@@ -148,7 +154,7 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
             out[name] = tex_results.lineage_key(
                 program_fp=program_fp, device=dev, precision=eff_precision,
                 params=params, upstream=plan.upstream_keys, time_context=tc,
-                canvas=canvas, flags=(*base_flags, f"out:{name}"))
+                canvas=canvas, flags=(*base_flags, f"out:{name}"), viewer_context=vc)
         return out
     except Exception:
         return None
@@ -263,8 +269,23 @@ def _binding_shape(v):
     return tuple(declared) if declared else None
 
 
+def _stages_read_viewer_builtin(stages) -> bool:
+    """PM-11: does any of these RAW stage dicts' source call a viewer builtin?
+
+    `boundary_lineage_key` keys a PREFIX (`stages[:k]`) before it is ever compiled — there
+    is no `Program` AST here the way `_reads_viewer_builtin` wants, and re-parsing just to
+    ask would duplicate `prefix_fingerprint`'s own compile a few lines below for no reason
+    a substring scan can't answer just as safely. `viewer_exposure`/`viewer_gamma` are
+    RESERVED names (E3011), so a plain substring match cannot miss a real call; the only
+    way it can be wrong is a false POSITIVE (the name sitting inside a string literal or a
+    comment), which over-keys rather than under-keys — the safe direction, same as the
+    name-prefix heuristics elsewhere in this codebase."""
+    return any(name in (st.get("code") or "") for st in stages for name in _VIEWER_BUILTIN_NAMES)
+
+
 def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context=None,
-                         canvas=None, latent_channel_count=0) -> str:
+                         canvas=None, latent_channel_count=0,
+                         viewer_context: dict | None = None) -> str:
     """CACHE-6: the lineage key a stage-(k-1) boundary tap is cached under — the upstream
     SUB-CHAIN fingerprint (`tex_fusion.prefix_fingerprint`) × the prefix stages' param VALUES ×
     the SOURCE identity `upstream` × device × precision × playhead × canvas, namespaced by the cut
@@ -353,9 +374,16 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
     flags = [f"tap:s{k - 1}"]
     if latent_channel_count:
         flags.append(f"ic:{int(latent_channel_count)}")
+    # PM-11: key the boundary TAP on viewer_context too, when the PREFIX (stages[:k], the
+    # portion this tap actually covers) calls a viewer builtin — the cached boundary pixels
+    # are viewer-dependent then, and the key must say so or a later cook at a different
+    # viewer value would hit this tap and silently serve the wrong exposure/gamma. Scoped to
+    # the prefix, not the whole chain: a viewer stage only in the SUFFIX never touches this
+    # tap's own cached pixels, so keying it in would only cost cache hits for nothing.
+    vc = viewer_context if _stages_read_viewer_builtin(stages[:k]) else None
     return tex_results.lineage_key(program_fp=fp, device=str(device), precision=precision,
                                    params=params, upstream=tuple(upstream), time_context=time_context,
-                                   canvas=canvas, flags=flags)
+                                   canvas=canvas, flags=flags, viewer_context=vc)
 
 
 def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32",
@@ -413,7 +441,8 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     if unservable_prefix_taps(stages, k):
         return _full()
     key = boundary_lineage_key(stages, k, device, "fp32", time_context=time_context,
-                               latent_channel_count=latent_channel_count, upstream=upstream)
+                               latent_channel_count=latent_channel_count, upstream=upstream,
+                               viewer_context=viewer_context)
     boundary = result_cache.get(key)
     if boundary is None:
         b = cook_stage_list(stages[:k], device=device, precision="fp32",

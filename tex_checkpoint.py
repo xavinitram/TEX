@@ -290,7 +290,7 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
             continue
         key = tex_engine.boundary_lineage_key(
             stages, k, device, precision, upstream=upstream, time_context=time_context,
-            latent_channel_count=latent_channel_count)
+            latent_channel_count=latent_channel_count, viewer_context=viewer_context)
         boundary = result_cache.get(key)
         if boundary is None:
             continue
@@ -358,7 +358,7 @@ def materialize(stages: list[dict], result_cache, *, device="cpu", precision="fp
                 continue
             key = tex_engine.boundary_lineage_key(
                 stages, k, device, precision, upstream=upstream, time_context=time_context,
-                latent_channel_count=latent_channel_count)
+                latent_channel_count=latent_channel_count, viewer_context=viewer_context)
             result_cache.put(key, b, canvas={"shape": list(b.shape)})
             harvested.append(k)
         done.extend(harvested)

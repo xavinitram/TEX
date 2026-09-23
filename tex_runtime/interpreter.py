@@ -2370,6 +2370,27 @@ _TIME_BUILTIN_NAMES = frozenset({"frame", "fps", "time"})
 # through the ordinary `_fns[name]` dispatch, so only the graph tier needs the bar.
 _VIEWER_BUILTIN_NAMES = frozenset({"viewer_exposure", "viewer_gamma"})
 
+
+def _reads_viewer_builtin(program: Program) -> bool:
+    """PM-11 (result-cache audit): does this program CALL a viewer builtin?
+
+    The `_reads_time_builtin` twin (codegen.py) answers the identifier question via
+    `_collect_identifiers`; these are `FunctionCall` nodes, not `Identifier`s (see
+    `_VIEWER_BUILTIN_NAMES`'s own docstring), so they need their own walk — the same
+    distinction `graphed._capturable` already draws inline. Used to CONDITION whether a
+    result-cache key folds in `viewer_context` at all: a program that never calls either
+    name must key IDENTICALLY to a pre-PM-11 build (no new byte enters the hash), so the
+    fix that makes a viewer tweak invalidate a served frame does not itself invalidate
+    every frame ever cached by every program that has nothing to do with it."""
+    stack = [program]
+    while stack:
+        n = stack.pop()
+        if n.__class__ is FunctionCall and n.name in _VIEWER_BUILTIN_NAMES:
+            return True
+        stack.extend(iter_child_nodes(n))
+    return False
+
+
 # Names that are built-in variables (not user-defined)
 _BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", "fn",
                             "PI", "TAU", "E", "ic"}) | _TIME_BUILTIN_NAMES

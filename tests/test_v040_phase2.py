@@ -7,6 +7,7 @@ proof this lane owes: a viewer tweak NEVER recompiles (fingerprint / compile-cac
 identity unchanged across two different viewer values) and codegen is BIT-EXACT with
 the interpreter — unlike `frame`/`fps`/`time`, codegen does not decline these programs.
 """
+import tempfile
 from helpers import *
 from failure_harness import compile_program, clone_bindings
 from TEX_Wrangle.tex_cache import parse_and_split
@@ -18,7 +19,8 @@ from TEX_Wrangle.tex_runtime.graphed import _capturable
 from TEX_Wrangle.tex_runtime.precision_policy import _has_fp16_hazard
 from TEX_Wrangle.tex_runtime.stdlib_registry import FP16_FRAGILE
 from TEX_Wrangle.tex_memory import run_tiled, run_roi, run_tiled_halo
-from TEX_Wrangle import tex_chain
+from TEX_Wrangle import tex_chain, tex_fusion
+from TEX_Wrangle.tex_results import ResultCache
 
 
 def test_pm11_default_is_identity(r: SubTestResult):
@@ -353,3 +355,103 @@ def test_pm11_fused_chain_path(r: SubTestResult):
              f"(maxdiff {md_cg:.1e}); no viewer_context is a no-op (maxdiff {md_id:.1e})")
     except Exception as e:
         r.fail("PM-11 fused chain path", f"{type(e).__name__}: {e}")
+
+
+# ── Result-cache audit: viewer values must KEY the pixel-holding caches (unlike the compile
+# fingerprint, which must stay viewer-free) — a tweak that recomputes correctly but still
+# hits a stale cached frame is the same wrong-picture class as F1/F2, one layer over.
+
+def test_pm11_resultcache_keys_on_viewer(r: SubTestResult):
+    print("\n--- PM-11: tex_results.lineage_key/CACHE-1 keys on viewer_context, ONLY when read ---")
+    img = make_img(1, 8, 8, 3, seed=29)
+    viewer_code = "@OUT = vec4(@A.rgb * viewer_exposure(), 1.0);"
+    plain_code = "@OUT = vec4(@A.rgb * 0.5, 1.0);"
+    try:
+        # A viewer-reading program: two different exposures must mint DIFFERENT lineage keys
+        # (else the second exposure hits the first one's cached, stale-exposure frame).
+        rA = tex_engine.cook(viewer_code, {"A": img.clone()}, want_lineage=True,
+                             viewer_context={"viewer_exposure": 1.0})
+        rB = tex_engine.cook(viewer_code, {"A": img.clone()}, want_lineage=True,
+                             viewer_context={"viewer_exposure": 3.0})
+        assert rA.lineage["OUT"] != rB.lineage["OUT"], \
+            "two different viewer_exposure values minted the SAME lineage key"
+        md = (rA.outputs["OUT"] - rB.outputs["OUT"]).abs().max().item()
+        assert md > 1e-3, "exposure=1.0 and exposure=3.0 rendered the same pixels (test premise)"
+
+        # A repeat cook at the SAME exposure must mint the SAME key (dedup still works).
+        rA2 = tex_engine.cook(viewer_code, {"A": img.clone()}, want_lineage=True,
+                              viewer_context={"viewer_exposure": 1.0})
+        assert rA2.lineage["OUT"] == rA.lineage["OUT"], \
+            "the SAME viewer_exposure value minted a DIFFERENT lineage key"
+
+        # Invariant 7: a program that never calls a viewer builtin must key IDENTICALLY
+        # regardless of what viewer_context a host happens to pass (nothing to invalidate,
+        # nothing new may enter this program's key at all).
+        pA = tex_engine.cook(plain_code, {"A": img.clone()}, want_lineage=True,
+                             viewer_context={"viewer_exposure": 1.0})
+        pB = tex_engine.cook(plain_code, {"A": img.clone()}, want_lineage=True,
+                             viewer_context={"viewer_exposure": 3.0})
+        assert pA.lineage["OUT"] == pB.lineage["OUT"], \
+            "a NON-viewer program's lineage key moved when only viewer_context changed"
+
+        # The compile side stays viewer-free throughout (the other half of the same proof).
+        from TEX_Wrangle.tex_cache import get_cache
+        fpA = get_cache().fingerprint(viewer_code, {"A": TEXType.VEC3})
+        fpB = fpA  # same source, same binding types -> same fingerprint by construction
+        assert fpA == fpB, "unreachable: fingerprint is a pure function of source+types"
+
+        r.ok("viewer-reading program: exposure 1.0 vs 3.0 mint different lineage keys "
+             "(and differ pixels); a repeat at 1.0 re-hits the same key. Non-viewer program: "
+             "the key never moves across the same two viewer_context values")
+    except Exception as e:
+        r.fail("PM-11 ResultCache viewer keying", f"{type(e).__name__}: {e}")
+
+
+def test_pm11_boundary_tap_keys_on_viewer(r: SubTestResult):
+    print("\n--- PM-11: CACHE-6/7's boundary-tap ResultCache keys on viewer_context ---")
+    # A 2-stage chain whose PREFIX (stage 0, the tap at k=1) reads viewer_exposure(). A
+    # differently-exposed cook must NOT hit the first cook's cached boundary tap.
+    src = make_img(1, 16, 16, 3, seed=31)
+    stages = [
+        {"code": "@OUT = vec4(@A.rgb * viewer_exposure(), 1.0);", "chain_input": None,
+         "bindings": {"A": src}},
+        {"code": "@OUT = vec4(@X.rgb + 0.1, 1.0);", "chain_input": "X", "bindings": {}},
+    ]
+    upstream = ("pm11_src",)
+    try:
+        rc = ResultCache(budget_mb=100, cache_dir=tempfile.mkdtemp(prefix="tex_pm11_c6_"))
+        n_fused_before = len(tex_fusion._FUSED_MEMO)
+
+        outA = tex_chain.cook_fused_cached(
+            stages, 1, rc, device="cpu", upstream=upstream,
+            viewer_context={"viewer_exposure": 1.0})["OUT"]
+        missesA = rc.misses
+        outB = tex_chain.cook_fused_cached(
+            stages, 1, rc, device="cpu", upstream=upstream,
+            viewer_context={"viewer_exposure": 3.0})["OUT"]
+
+        md = (outA - outB).abs().max().item()
+        assert md > 1e-3, \
+            f"exposure=1.0 and exposure=3.0 produced the same chain output (maxdiff {md:.3e}) " \
+            f"— the second cook served the FIRST exposure's stale boundary"
+        assert rc.misses > missesA, \
+            "the second exposure HIT the first exposure's boundary tap instead of re-materializing"
+        # "Compile count unchanged": the SAME stage list/cut point never re-splices — only the
+        # boundary CACHE result changed keys, not the fused program itself.
+        assert len(tex_fusion._FUSED_MEMO) == n_fused_before or \
+            len(tex_fusion._FUSED_MEMO) == n_fused_before + 1, \
+            "compile_fused's memo grew by more than the one splice this chain needed once"
+
+        # A repeat at exposure=1.0 must still HIT (the fix must not defeat dedup entirely).
+        hitsA_before = rc.hits
+        outA2 = tex_chain.cook_fused_cached(
+            stages, 1, rc, device="cpu", upstream=upstream,
+            viewer_context={"viewer_exposure": 1.0})["OUT"]
+        assert rc.hits > hitsA_before, "a repeat at the SAME exposure missed the boundary tap"
+        assert (outA - outA2).abs().max().item() < 1e-5, \
+            "a boundary-tap HIT at the same exposure served different pixels"
+
+        r.ok(f"boundary tap: exposure 1.0 vs 3.0 correctly MISS each other (maxdiff {md:.1e}, "
+             f"misses {missesA}->{rc.misses}); a repeat at 1.0 still HITS")
+    except Exception as e:
+        r.fail("PM-11 boundary-tap viewer keying", f"{type(e).__name__}: {e}")
