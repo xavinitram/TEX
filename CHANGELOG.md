@@ -5,10 +5,7 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-No version is cut for this work yet. Everything below is on `main` above the `v0.38.0` tag and
-carries no release date; the entries move under a version heading when one is named.
+## [0.39.0] - 2026-09-23 — "Every pixel its own way"
 
 ### Added
 
@@ -37,6 +34,102 @@ carries no release date; the entries move under a version heading when one is na
   one host's commonest interactive edit routes. A ninth scenario now drives a settled cost table,
   a materialised single-cut checkpoint and a per-tick scrub of the terminal stage served from it,
   with its device-independent and CUDA rows pinned like the rest.
+- **Masked per-pixel control flow — language `0.25`, opted into by a `//!tex 0.25` header
+  (LANG-1 … LANG-L7).** A per-pixel `break`, `continue` or `return`, and a per-pixel loop bound,
+  now have a masked meaning implemented end to end: each active region — a loop, one pass of a
+  loop, a user-function call — carries a per-pixel live mask; a write to anything declared outside
+  the innermost region lands only on live pixels; a per-pixel transfer clears mask bits rather
+  than unwinding, so the statements after it in the same block still run for the pixels that
+  stayed; a loop runs while any pixel is live and the 1024-pass cap still fails the cook for a
+  pixel that never terminates; a scatter is gated by its source pixel; a call with no live pixel
+  is skipped, which is what lets a per-pixel recursion terminate. A program without the pragma —
+  or with the pragma but at a lower effective level — computes exactly what it computed under
+  `0.24`: the emitted codegen source of all 130 frozen corpus programs is byte-identical to the
+  pre-language tree, proved by digest, not argued. `LANGUAGE_VERSION` moves `"0.24"` → `"0.25"`
+  (LANG-L7, the last lane, sequenced after every other language lane); compat freeze #3 mints
+  `tests/compat_corpus_goldens/0.25.json` (141 hashes), and `0.23.json`/`0.24.json` stay
+  byte-unchanged. Two advisories change shape with the bump: `W7007` (all three sites) and
+  `W7008`'s loop half become conditional on the program's effective language level — `false` for
+  a program cooked under `0.25` rules; `W7008`'s string half is unchanged. In detail:
+  - **The pragma rides on the program.** The `//!tex X.Y` header is parsed once, by the parser,
+    and carried as a field on the compiled program (`ast_nodes.Program.language`,
+    `parser.language_pragma`); the one site that derives the effective level reads the field with
+    no call-site change.
+  - **One structural walk for the whole feature.** `tex_api.flow_plan(program, binding_types=None)
+    -> FlowPlan` returns, for a program, the per-pixel loops, transfer sites, scatter sites, probe
+    sites, binding-write sites and sync points that masking has to know about, plus a `complete`
+    flag that keeps a failed walk from ever reading as "nothing to mask" — an extension of the
+    existing control-flow lint's fixed point, not a second traversal. Fusion refuses a chain whose
+    stages declare disagreeing language levels, at the per-stage parse, and stamps the fused
+    program with the stages' shared level.
+  - **The interpreter's rules, and the oracle that proves them.** The `0.25` rules live in a new
+    module, `tex_runtime/masked_flow.py`, as a second statement-dispatch table bound per cook only
+    for a flagged program and restored afterwards, so every existing handler is byte-identical and
+    an un-pragma'd program pays an attribute read and nothing else. An independent per-pixel
+    scalar oracle, written before any masking existed, evaluates a program one pixel at a time and
+    agrees with the masked cook on the control-flow atoms and on the fuzz generator's programs.
+  - **The codegen mirror, bitwise.** A new module, `tex_runtime/codegen_masked.py`, emits the same
+    rules by calling into the interpreter's own algebra, so the two tiers share one implementation
+    called from two places. Interpreter and codegen answer bitwise-equal on every corpus row and
+    on 40/40 fuzz-generated programs exercising the case a shipped seed could never reach — some
+    pixels leaving a region while others stay. Two deliberate declines, `0.25`-only and costing
+    performance not answers: the scalar-loop fast path and stencil specialisation both decline a
+    flagged program.
+  - **The satellite tiers.** `tex_runtime/graphed.py`'s CUDA-graph capture gate and
+    `tex_runtime/precision_policy.py`'s fp16 auto-precision decision each ask `flow_plan` a second
+    question before doing what they already did: capture declines on a plan naming a sync point or
+    scatter site (never serving a wrong picture — the pre-existing net catches anything this misses
+    too, only more loudly); auto-precision declines fp32 for a per-pixel `for` bound with a new
+    reason string. The region-dependence sunset (v0.36.0) and `tex_lazy.lazy_required_bindings`
+    are both proven to stay syntactic — neither reads the language level at all.
+  - **Three new shipping module filenames:** `tex_runtime/masked_flow.py`,
+    `tex_runtime/codegen_masked.py`, and `tex_results_keys.py` (a same-run, unrelated cache-key
+    split, described under Changed below). None is imported by anything that does not opt in; a
+    vendoring host receives all three on a directory copy regardless. No name is reserved by this
+    release, no default moves, and every cache tier — `.pkl`, `.cg`, tier verdicts, the inductor
+    directory — goes cold once on adoption (the codegen and verdict epochs each move at least
+    once across this release's lanes, and the version bump itself is now folded into the AST
+    epoch's hash input, closing a gap where a `.cg` sidecar cooked before the bump could otherwise
+    have survived it and served a stale, unmasked emission for a `//!tex 0.25` program).
+  - **One new refusal, ungated on the pragma: `E3015`.** Described under Changed below — it ships
+    with this release but applies at every language level, not only `0.25`.
+- **`ResultCache.touch_promote(key)` — the residency hint, granted in the narrowed form
+  (CACHE-11).** An embedding host that predicts which frames it will read next asked for `touch`'s
+  reorder plus one thing `touch` deliberately refuses: bringing a *demoted* frame home on the hint
+  instead of on the next real read. The new call does everything `touch` does and, when the entry
+  is currently demoted, hands it to the exact promotion path a read uses — same copy, same
+  placement outside the lock, same re-entry guard — counted as a promotion and never as a hit.
+  `touch` itself is byte-for-byte unchanged (a shipped test pins that the bare call never
+  promotes); a spilled-only frame is still a no-op, and the keep-set, pinning and victim-order
+  introspection stay declined. ComfyUI never calls either.
+
+### Changed
+
+- **`E3015` is a new refusal, not gated on the `//!tex` pragma.** A `break` or `continue` written
+  directly in a function's body — not inside a loop the function itself declares — now fails to
+  compile even under `0.23`/`0.24` rules, if a loop happens to be lexically wrapped around the
+  function's *definition*. This closes a defect (`TRK-28`) where the interpreter and codegen tiers
+  disagreed about which loop such a `break` would leave (and codegen could raise an internal
+  exception rather than a diagnostic). Measured reach at landing: zero across every shipped
+  example, stock `.textool`, and corpus program — this is a breaking change that breaks nothing
+  shipped. No name is reserved, no default moves, `LANGUAGE_VERSION` does not move with this entry.
+  The underlying scope defect is fixed with it: a function body now type-checks as its own loop
+  scope regardless of how many loops surround its definition, so the existing "outside of a loop"
+  message stays true where it fires and the new code carries the message that is true here. The
+  generated error-code reference gains the row.
+- **The results cache's key-minting leaf moves to its own module (NEG-6).** The code and
+  environment epochs, the parameter and time canonicalisers and the lineage-key minting move
+  verbatim out of `tex_results.py` into a new `tex_results_keys.py`, re-exported from
+  `tex_results` by a single import so no call path changes; every moved body compiles to
+  byte-identical bytecode. The module's headroom floor moves down, 1958 → 1887. A new shipping
+  module filename, named here for a vendoring host: `tex_results_keys.py`.
+- **`tex_runtime/stdlib.py` splits into a facade over seven per-domain leaves (LIB-1).** The
+  2810-line module becomes a 126-line facade over `stdlib_core.py` and `stdlib_math.py`,
+  `stdlib_color.py`, `stdlib_sample.py`, `stdlib_noise.py`, `stdlib_sdf.py`, `stdlib_string.py`,
+  `stdlib_array.py`; every existing `from tex_runtime.stdlib import ...` keeps resolving through
+  the facade, and every moved body compiles to byte-identical bytecode (proved by a
+  disassembly-diff gate over all 189 base definitions). Emitted codegen source is byte-identical
+  over the full corpus. Seven new shipping module filenames, named here for a vendoring host.
 
 ### Fixed
 
@@ -83,6 +176,24 @@ carries no release date; the entries move under a version heading when one is na
   cooked this exact example pays one recompile. ComfyUI-invisible because `format()`'s
   signature, body and tag are untouched: the corrected example text is the only change a
   user who opens it sees, and every other program cooks byte-identically.
+- **Codegen's emitted source was not reproducible across processes (CG-1).** The emitter's
+  `type_map.get(id(node))` read stale entries once a node's `id()` was recycled onto a different,
+  already-dead node — compiling the same corpus program twice, in separate processes, could give
+  different emitted source for 3–6 of the 130 corpus programs per sitting. `tex_compiler
+  /types.py:TypeMap` now pins a checked node's type alongside the node object itself, so a
+  recycled id cannot answer for a node that never owned the entry; `tex_runtime
+  /codegen.py:_live_type_map` narrows the map to nodes the emitter actually reaches before
+  building from it. Three independent digest sweeps of the full corpus are now identical.
+  `tex_cache._CODEGEN_FILES` also gains `codegen_stencil.py` and `codegen_persist.py`, which could
+  change emitted code or the `.cg` bytes themselves without invalidating a stale sidecar.
+- **A `0.23` scatter write into a narrow `@` buffer crashed on codegen only (CG-2).** `@S = 0.0;
+  @S[ix, iy] += 1.0;` cooked to a picture on the interpreter and raised a raw `IndexError` on
+  codegen, because the codegen emission's buffer-widening test carried only two of the
+  interpreter's three conditions. Both tiers now widen on the identical condition. Separately, the
+  shipped fuzz generator's stencil min/max variant hardcoded a 3-channel accumulator against a
+  4-channel tap, so roughly 15% of generated programs could not cook; the generator's default
+  stream is unchanged (pinned by digest), and a new opt-in `channels=` argument lets a caller
+  generate wider taps without hitting the defect.
 
 ### Tooling and gates
 
@@ -102,6 +213,13 @@ carries no release date; the entries move under a version heading when one is na
   as what they are: handler-binding calls on DOM events and editor measure pairs, with no socket
   semantics — the registry scanner's false positives, pinned honestly rather than argued away. A
   new network-shaped call in a shipped `.js` file reds with its file and count.
+- **Six ratchet-test causes repaired (GATE-1).** Three anchors in `tests/mutation_check.py` had
+  drifted under this release's own module moves (a moved function, a duplicated anchor after
+  `touch_promote` was added beside `touch`); three `pytest.skip` calls elsewhere carried no
+  reason, failing the skip-budget ratchet's own reasonless-skip check. All six repaired in place,
+  and `tests/test_simp3_skip_budget.py`'s pin moves 97 → 101 to count this release's own honest
+  skips (an oracle-unsupported filter in each of two masked-flow test files, plus one converted
+  skip vocabulary). No product code touched.
 
 ### Docs
 
@@ -145,6 +263,43 @@ carries no release date; the entries move under a version heading when one is na
   reachability, is the part a host depends on; and the measurement rules gain a third
   non-negotiable: name the box beside the figure every time the figure is republished, never once
   in a standing caveat.
+- **Masked per-pixel control flow — the design** (`docs/masked-control-flow.md`). Language
+  `0.25`'s semantics settled before any code: a per-pixel `break`, `continue`, `return` and a
+  per-pixel loop bound each get a masked rule with a worked example; a census says no shipped
+  example, stock tool or frozen corpus program changes what it computes; a bare `break` in a
+  function defined inside a loop becomes the compile-time refusal described under Changed; and
+  the region-dependence gate's loop clause is confirmed to sunset on what the engine implements,
+  not on what a program asks for. `LANGUAGE.md` §7.1 and `DEVELOPMENT.md`'s control-flow/loop
+  paragraphs are rewritten around the two rule sets keyed on the `//!tex` pragma; a new example,
+  `examples/per_pixel_control_flow.tex`, ships alongside the rewrite.
+- **The results-cache floor is on the map, with the reason the cut was already spent.**
+  `AGENTS.md`'s module-size-budget section names the new 1887 floor for `tex_results.py` and
+  records the sequence as the argument for the rule: the previous floor was set with 55 lines of
+  headroom, one later landing took the module to fourteen lines under it before the split had
+  been taken, and only a cut named in advance kept the answer from being a bigger number. The same
+  table drops its `tex_runtime/stdlib.py` row now that LIB-1 has shipped the split it was
+  planning against, and gains a codegen.py margin note after CG-1 spent most of a 10% drift band
+  in a single lane.
+
+### For anyone vendoring this tree
+
+Four things this release moves, named here rather than only in the diff, per
+`docs/brief-conventions.md`'s "what a release note owes a vendoring host": **(1) newly reserved
+names — none.** Six remain reserved from prior releases (`convolve`, `patch_dist`, `img_width`,
+`img_height`, `worley_id`, `select`); this release adds no seventh. **(2) `LANGUAGE_VERSION`
+moves `"0.24"` → `"0.25"`** — see Added, above; a manifest or trust hash that includes the
+language-version literal moves once. **(3) no default moves** anywhere in this release, engine-
+side or host-facing. **(4) eleven new shipping module filenames**: `tex_results_keys.py`,
+`tex_runtime/masked_flow.py`, `tex_runtime/codegen_masked.py`, and the eight `tex_runtime
+/stdlib_*.py` leaves (`stdlib_core.py`, `stdlib_math.py`, `stdlib_color.py`, `stdlib_sample.py`,
+`stdlib_noise.py`, `stdlib_sdf.py`, `stdlib_string.py`, `stdlib_array.py`) — a vendoring step is
+typically a directory copy, so all eleven arrive in a host's tree whether or not it imports them.
+Every cache tier (`.pkl`, `.cg`, tier verdicts, the inductor directory) goes cold once on
+adoption of this release: a one-time recompile, no pixel changes.
+
+**No timing sitting was taken for this release.** The sm_75 reference box this project's timing
+figures are calibrated against was offline for the whole attempt. The default cook path's
+structural counts are pinned in CI as before; no timing figure is quoted anywhere in this entry.
 
 ## [0.38.0] - 2026-09-20
 
