@@ -1507,6 +1507,23 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         for _, pname in stmt.params:
             self._local_vars[pname] = f"_p_{pname}"
 
+        # TRK-142: a parameter's spatial-ness depends on how the function is CALLED,
+        # not on anything `_is_scalar_node`/`_init_is_spatial` can see walking the body —
+        # neither `_spatial_vars` nor `_var_initializers` ever gets an entry for a plain
+        # parameter name, so both fell through to their scalar-favouring default (a
+        # loop-local's own default is the OPPOSITE: unknown falls to non-scalar via a
+        # missing `_var_initializers` entry there too, but a bare Identifier read with no
+        # local-var trail at all read as scalar in `_is_scalar_node`). Seed every
+        # parameter into `_spatial_vars` — the SAME "possibly spatial" set a reassigned
+        # local already uses — so a downstream scalar-loop analysis over the body treats
+        # a parameter, and anything assigned from it, as spatial: the safe over-
+        # approximation invariant 2 requires (a false positive costs the tensor path;
+        # a false negative crashes or serves a wrong value). Scoped to this function's own
+        # body and restored after, so it never leaks into a sibling function or the
+        # enclosing loop's own scalar analysis.
+        saved_spatial_vars = self._spatial_vars
+        self._spatial_vars = set(self._spatial_vars) | {pname for _, pname in stmt.params}
+
         # Collect all vars declared anywhere in function body (including nested blocks)
         body_vars, _ = self._collect_modified_vars(stmt.body)
         for vname in sorted(body_vars):  # sorted → deterministic local naming order
@@ -1544,6 +1561,7 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._use_native_flow_control = saved_native_flow
         self._in_user_function = saved_in_fn
         self._local_vars = saved_locals
+        self._spatial_vars = saved_spatial_vars
         self._indent -= 1
 
     def _emit_return_stmt(self, stmt: ReturnStmt):
