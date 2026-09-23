@@ -142,7 +142,7 @@ spatial=True, sync=True, footprint='image'
 ```
 
 `spatial=True, footprint='image'` is copied verbatim from `fetch`/`sample`
-(`stdlib.py:962,1013`) — an arbitrary-coordinate gather is precisely what `'image'` means.
+(the `@stdlib` decorators over `TEXStdlib.fn_fetch` and `TEXStdlib.fn_sample` in `tex_runtime/stdlib_sample.py`) — an arbitrary-coordinate gather is precisely what `'image'` means.
 `sync=True` puts both names in `graphed._SYNC_STDLIB`, so the CUDA-graph tier refuses to
 capture a program that calls them (a host callback inside a capture is not a sync, it is a
 foreign call, and it would be baked once and replayed forever).

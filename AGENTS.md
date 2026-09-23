@@ -199,8 +199,7 @@ Currently over the hard budget — status as of v0.37.0 (drift-checked by
 
 | Module | LOC | Status |
 |--------|-----|--------|
-| `tex_runtime/codegen.py` | ~3310 | STR-7 split **shipped** (4092→2731: `codegen_stdfns.py` / `codegen_stencil.py` / `codegen_persist.py` extracted). Docs 27/28 verdict: **stop here** — the remainder is one cohesive emitter; further splitting is aesthetic, not domain-driven. **Language 0.25 (L5) took it to 3312**, and it kept that verdict: the masked-emission leaf went to a new `codegen_masked.py` rather than into the emitter, which is the domain-driven cut the verdict asks for |
-| `tex_runtime/stdlib.py` | ~2810 | per-domain `stdlib_*.py` still planned — unblocked by REG-1 (registration is per-decorator, not one central dict) |
+| `tex_runtime/codegen.py` | ~3350 | STR-7 split **shipped** (4092→2731: `codegen_stdfns.py` / `codegen_stencil.py` / `codegen_persist.py` extracted). Docs 27/28 verdict: **stop here** — the remainder is one cohesive emitter; further splitting is aesthetic, not domain-driven. **Language 0.25 (L5) took it to 3312**, and it kept that verdict: the masked-emission leaf went to a new `codegen_masked.py` rather than into the emitter, which is the domain-driven cut the verdict asks for. CG-1's type-map liveness fix took it to ~3350. `tex_runtime/stdlib.py`'s planned split shipped as LIB-1: it is now a 126-line facade over `stdlib_core.py` and seven per-domain `stdlib_*.py` leaves, none near either budget |
 | `tex_runtime/interpreter.py` | ~2700 | STR-3/STR-4 **shipped** (`ExecContext` + shared `NodeVisitor` extracted); the residual is the core tree-walk, plus CF-6's `_consensus_extent` — the single owner of the cook-grid rule, which the codegen tier, `run_roi` and the test oracle all call |
 
 `tex_compiler/optimizer.py` (~1540) is over *soft*; STR-5 (the `PASSES` list) **shipped**.
