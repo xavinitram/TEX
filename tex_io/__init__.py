@@ -23,6 +23,20 @@ from dataclasses import dataclass
 import torch
 
 
+def _read_source(src) -> bytes:
+    """`src` -> its raw bytes: unchanged if already `bytes`/`bytearray` (content already
+    read), else read in BINARY mode from the path it names. The one place a `tex_io`
+    reader turns `src` into bytes (COLOR-1 simplify: `exr.py` and `tex_io/lut.py` shared
+    this exact dispatch, once each) — a path is always read in binary, never text mode,
+    so the platform's universal-newline translation never touches a byte a binary format
+    (EXR) must see verbatim. `tex_io/lut.py`'s text formats don't need that translation
+    either: `str.splitlines()` already treats `\\r\\n` as one line break."""
+    if isinstance(src, (bytes, bytearray)):
+        return bytes(src)
+    with open(src, "rb") as f:
+        return f.read()
+
+
 def _raw_bytes(t: torch.Tensor) -> bytes:
     """Reinterpret a tensor's storage as raw bytes in native (little-endian) order, numpy-free —
     the fast path the EXR/PNG writers hand to zlib/disk instead of `struct.pack(*tensor.tolist())`.

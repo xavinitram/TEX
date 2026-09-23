@@ -28,6 +28,8 @@ from dataclasses import dataclass
 
 import torch
 
+from . import _read_source
+
 
 class LutError(ValueError):
     """A malformed, truncated, or out-of-scope LUT file (non-default domain, a 1D table in
@@ -57,12 +59,12 @@ def _strip_comment(line: str) -> str:
 
 
 def _to_text(src) -> str:
-    """`src` -> decoded text, mirroring `read_exr`'s `(bytes | path str)` contract: raw
-    bytes/bytearray are decoded as UTF-8 text; any other str is a path to open and read."""
-    if isinstance(src, (bytes, bytearray)):
-        return bytes(src).decode("utf-8")
-    with open(src, "r", encoding="utf-8") as f:
-        return f.read()
+    """`src` -> decoded text, via the shared `tex_io._read_source` (COLOR-1 simplify) that
+    `exr.py`'s `read_exr` also uses: a path is read in BINARY mode, like every other
+    `tex_io` format, then decoded as UTF-8 text here. Not text-mode-open + its universal-
+    newline translation — this module's parser doesn't need it (`str.splitlines()` already
+    treats `\\r\\n` as one line break, so a CRLF file parses identically either way)."""
+    return _read_source(src).decode("utf-8")
 
 
 def _decode_guarded(fn, text: str, kind: str):

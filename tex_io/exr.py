@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import torch
 
-from . import BufferDesc, _raw_bytes
+from . import BufferDesc, _raw_bytes, _read_source
 
 # EXR magic + the pixel-type / compression / lineOrder enums.
 _MAGIC = 20000630                      # 0x76 0x2f 0x31 0x01 as LE int32
@@ -149,11 +149,7 @@ def _build_channels(names, ptype: int) -> bytes:
 def read_exr(src) -> ExrImage:
     """Decode an EXR file (path str or raw bytes) → an `ExrImage` with [H,W,C] fp32 pixels. A
     malformed / truncated / out-of-scope file raises `EXRError`, never a raw struct/zlib error."""
-    if isinstance(src, (bytes, bytearray)):
-        data = bytes(src)
-    else:
-        with open(src, "rb") as f:
-            data = f.read()
+    data = _read_source(src)
     try:
         return _decode_exr(memoryview(data))
     except EXRError:
