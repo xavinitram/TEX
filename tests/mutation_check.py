@@ -368,11 +368,16 @@ MUTATIONS = [
      '    if roi is not None and sp is not None:\n'
      '        sp = (sp[0], roi[3], roi[2])',
      ("test_v035_hygiene",)),
+    # COLOR-1 (v0.40) re-pointed this anchor: the line grew a third disjunct
+    # (`or name in lut_names`, the apply_lut3d LUT-binding exclusion) between
+    # `name not in read` and the isinstance/dim guard. The mutation still removes only
+    # `or name not in read` — the same "an unread binding re-enters the consensus" bug —
+    # and leaves `or name in lut_names` alone, since that clause is unrelated to this row.
     ('CF-6: an unread binding is a consensus participant again',
      'tex_runtime/interpreter.py',
-     '            if (name == "OUT" or name not in read\n'
+     '            if (name == "OUT" or name not in read or name in lut_names\n'
      '                    or not isinstance(v, torch.Tensor) or v.dim() < 3):',
-     '            if (name == "OUT"\n'
+     '            if (name == "OUT" or name in lut_names\n'
      '                    or not isinstance(v, torch.Tensor) or v.dim() < 3):',
      ("test_v035_hygiene",)),
     ('CF-6: the interpreter goes back to first-wins', 'tex_runtime/interpreter.py',
