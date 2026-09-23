@@ -5,10 +5,17 @@ this project's CI gate (`docs/host-path-counts.md` §1): wall-clock on the devel
 cannot decide anything by itself — a byte-identical tree has tripped the 0.95 stop-ship
 threshold against itself, and single rows span 0.70× to 2.32×. Timing is therefore measured
 **once per release, at a sitting, on a quiet box**, under the rules in `docs/roadmap.md` §10
-item 3. This directory is that sitting: every leg it produced, every comparison read off it, and
+item 3. This directory is that sitting: every comparison read off it, and
 the commands that reproduce it.
 
 `.comfyignore` excludes `benchmarks/`, so nothing here reaches the published registry archive.
+
+**The raw per-leg result files are no longer in the repository.** The sixty `<tag>_<bench>.json`
+files this sitting produced (about 106,000 lines of pretty-printed samples) were removed from the
+repository's history on 2026-09-23, under the rule in `docs/roadmap.md` §10 item 3 that a sitting
+commits its reading, not its raw legs. The maintainer keeps them outside the repository. Every
+read and verdict below was taken from them and is reproduced here in full, and the `read_*.txt`
+files are the comparator's own output.
 
 ## The box
 
