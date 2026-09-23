@@ -2372,7 +2372,7 @@ _BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", 
 _CACHEABLE_BUILTIN_NAMES = _BUILTIN_NAMES - _TIME_BUILTIN_NAMES
 
 
-def _collect_binding_reads(program: Program) -> tuple[frozenset[str], frozenset[str]]:
+def _collect_binding_reads_and_non_spatial(program: Program) -> tuple[frozenset[str], frozenset[str]]:
     """`(reads, non_spatial)` — wire-binding (`@A`) names the program mentions anywhere,
     and the subset of those names bound at a registered NON-SPATIAL argument position
     (`stdlib_registry.non_spatial_args_by_name`, e.g. `apply_lut3d`'s LUT argument).
@@ -2392,12 +2392,14 @@ def _collect_binding_reads(program: Program) -> tuple[frozenset[str], frozenset[
     OWN declared `non_spatial_args`), not by binding name, so any name works and any future
     function gets the same protection by declaring the field, no engine-side edit.
 
-    ONE walk for both answers (folded together so there is one memo, `_READS_MEMO`, and one
-    lookup per cook — see `_binding_reads_cached`). Walked with the generic
-    `iter_child_nodes` rather than a hand-written per-class dispatch like
-    `_collect_identifiers`'. That walk is field-driven, so a new ASTNode field is traversed
-    instead of silently escaping — and the speed the hand-written version buys is not needed
-    here, because `_consensus_extent` only pays for a MISS here when a program is first seen.
+    ONE walk for both answers (`_collect_binding_reads` and `_non_spatial_names_cached`
+    are the two PUBLIC-shaped accessors over it, each preserving its own pre-existing
+    return type — see `_reads_and_non_spatial_cached`, which is the ONE memo, `_READS_MEMO`,
+    both go through). Walked with the generic `iter_child_nodes` rather than a hand-written
+    per-class dispatch like `_collect_identifiers`'. That walk is field-driven, so a new
+    ASTNode field is traversed instead of silently escaping — and the speed the hand-written
+    version buys is not needed here, because `_consensus_extent` only pays for a MISS here
+    when a program is first seen.
     """
     from .stdlib_registry import non_spatial_args_by_name
     non_spatial_positions = non_spatial_args_by_name()   # {fn name: (arg idx, ...)}
@@ -2422,6 +2424,17 @@ def _collect_binding_reads(program: Program) -> tuple[frozenset[str], frozenset[
     return frozenset(reads), frozenset(non_spatial)
 
 
+def _collect_binding_reads(program: Program) -> frozenset[str]:
+    """Wire-binding (`@A`) names the program mentions anywhere — the ORIGINAL, pre-COLOR-1
+    public contract (a bare `frozenset[str]`), restored: `tests/test_v037_frontend_parity.py`
+    calls this directly and subtracts other frozensets from its result, so its return type
+    is load-bearing outside this module, not just an internal convenience. Delegates to
+    `_collect_binding_reads_and_non_spatial` (the one AST walk) and returns only `reads`;
+    `_non_spatial_names_cached` is the other half's own accessor."""
+    reads, _ = _collect_binding_reads_and_non_spatial(program)
+    return reads
+
+
 #: Memo for the walk above, mirroring `tex_memory._tile_safe_memo` (whose comment prices the
 #: same shape of walk at ~22 us per CUDA cook — worth memoizing, and this one is worse: no
 #: early exit, every node visited). The read/non-spatial sets are a pure function of the AST,
@@ -2438,19 +2451,39 @@ _READS_MEMO: "OrderedDict[int, tuple[Program, frozenset[str], frozenset[str]]]" 
 _READS_MEMO_MAX = 128
 
 
-def _binding_reads_cached(program: Program) -> tuple[frozenset[str], frozenset[str]]:
-    """`_collect_binding_reads`, memoized per program object — returns `(reads, non_spatial)`."""
+def _reads_and_non_spatial_cached(program: Program) -> tuple[frozenset[str], frozenset[str]]:
+    """`_collect_binding_reads_and_non_spatial`, memoized per program object — the ONE
+    memo entry `_binding_reads_cached` and `_non_spatial_names_cached` both read, so a
+    program pays for one walk regardless of which (or both) accessor a caller uses.
+    Internal: callers outside this module use one of those two, each of which preserves
+    its OWN pre-existing return type (a bare `frozenset[str]`, never this tuple)."""
     key = id(program)
     hit = _READS_MEMO.get(key)
     if hit is not None and hit[0] is program:
         _READS_MEMO.move_to_end(key)
         return hit[1], hit[2]
-    reads, non_spatial = _collect_binding_reads(program)
+    reads, non_spatial = _collect_binding_reads_and_non_spatial(program)
     _READS_MEMO[key] = (program, reads, non_spatial)
     _READS_MEMO.move_to_end(key)
     while len(_READS_MEMO) > _READS_MEMO_MAX:
         _READS_MEMO.popitem(last=False)
     return reads, non_spatial
+
+
+def _binding_reads_cached(program: Program) -> frozenset[str]:
+    """`_collect_binding_reads`, memoized per program object — the ORIGINAL, pre-COLOR-1
+    public contract (a bare `frozenset[str]`), restored: this predates the non-spatial
+    exclusion and callers outside this module may still expect exactly this shape."""
+    return _reads_and_non_spatial_cached(program)[0]
+
+
+def _non_spatial_names_cached(program: Program) -> frozenset[str]:
+    """The COLOR-1 non-spatial-argument exclusion set (e.g. `apply_lut3d`'s LUT-binding
+    name), memoized per program object — its own accessor over the SAME `_READS_MEMO`
+    entry `_binding_reads_cached` populates, so `graphed._spatial_px` and
+    `_consensus_extent` share one walk/one memo with `_collect_binding_reads`'s callers
+    without either side's return type depending on the other's existence."""
+    return _reads_and_non_spatial_cached(program)[1]
 
 
 def _consensus_extent(bindings: dict, program: Program,
@@ -2511,11 +2544,13 @@ def _consensus_extent(bindings: dict, program: Program,
     # tuple building for an answer that is three integers.
     #
     # `non_spatial` (COLOR-1, v0.40) is one memoized `_READS_MEMO` lookup (the SAME one the
-    # narrowing branch below already pays for `read` — folded into a single walk/memo, see
-    # `_collect_binding_reads`), returning an empty frozenset for every program that never
-    # calls a `non_spatial_args`-declaring function (every program before v0.40, and most
-    # after), so the default path pays one cheap-and-constant lookup, never a fresh walk.
-    read, non_spatial = _binding_reads_cached(program)
+    # narrowing branch below already pays for `read` — folded into a single walk/memo via
+    # `_reads_and_non_spatial_cached`, the private accessor `_binding_reads_cached`/
+    # `_non_spatial_names_cached` both wrap), returning an empty frozenset for every program
+    # that never calls a `non_spatial_args`-declaring function (every program before v0.40,
+    # and most after), so the default path pays one cheap-and-constant lookup, never a
+    # fresh walk.
+    read, non_spatial = _reads_and_non_spatial_cached(program)
     b = h = w = None
     b_split = hw_split = False
     for name, v in bindings.items():

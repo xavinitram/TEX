@@ -370,8 +370,10 @@ MUTATIONS = [
      ("test_v035_hygiene",)),
     # COLOR-1 (v0.40) re-pointed this anchor twice: it first grew a third disjunct
     # (`or name in lut_names`), then the v0.40 simplify round folded that exclusion's own
-    # walk into the same memo/variable `_binding_reads_cached` already returns, renaming it
-    # `non_spatial` (generic over any `non_spatial_args`-declaring stdlib function, not just
+    # walk into the same memo entry `_reads_and_non_spatial_cached` reads (the private
+    # accessor `_binding_reads_cached`/`_non_spatial_names_cached` each wrap, preserving
+    # their own pre-existing frozenset-only return types), renaming the local `non_spatial`
+    # (generic over any `non_spatial_args`-declaring stdlib function, not just
     # `apply_lut3d`). The mutation still removes only `or name not in read` — the same "an
     # unread binding re-enters the consensus" bug — and leaves `or name in non_spatial`
     # alone, since that clause is unrelated to this row.

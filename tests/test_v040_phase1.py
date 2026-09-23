@@ -352,6 +352,50 @@ def test_color1_colorspaces_extended(r: SubTestResult):
         r.fail("COLOR-1 choose_storage boundary", f"{type(e).__name__}: {e}")
 
 
+def test_color1_binding_reads_return_types_unchanged(r: SubTestResult):
+    print("\n--- COLOR-1 simplify-fix: _collect_binding_reads/_binding_reads_cached "
+          "return types stay the ORIGINAL frozenset[str] ---")
+    from TEX_Wrangle.tex_runtime.interpreter import (
+        _collect_binding_reads, _binding_reads_cached, _non_spatial_names_cached,
+    )
+    prog, tm, outs = compile_program(
+        "@OUT = vec4(apply_lut3d(@A.rgb, @LUT), 1.0);",
+        {"A": make_img(1, 4, 4, 3), "LUT": _identity_lut(4)})
+
+    # The exact regression this row exists for: tests/test_v037_frontend_parity.py calls
+    # _collect_binding_reads(...) directly and subtracts other frozensets from the result
+    # (`_collect_binding_reads(prog) - assigned - params`) -- a tuple return broke that with
+    # "unsupported operand type(s) for -: 'tuple' and 'frozenset'". Both public accessors
+    # must therefore return a bare frozenset[str], not a tuple, and must support `-`.
+    try:
+        reads = _collect_binding_reads(prog)
+        assert isinstance(reads, frozenset), f"_collect_binding_reads returned {type(reads)}, not frozenset"
+        reads - frozenset({"A"})           # must not raise
+        # over-inclusive by design (an assignment TARGET counts too, so @OUT is in here).
+        assert reads == {"A", "LUT", "OUT"}, f"unexpected reads: {reads}"
+        r.ok(f"_collect_binding_reads(prog) is a bare frozenset[str]: {reads}")
+    except Exception as e:
+        r.fail("COLOR-1 _collect_binding_reads return type", f"{type(e).__name__}: {e}")
+
+    try:
+        cached = _binding_reads_cached(prog)
+        assert isinstance(cached, frozenset), f"_binding_reads_cached returned {type(cached)}, not frozenset"
+        cached - frozenset({"A"})          # must not raise
+        assert cached == reads, "cached and uncached reads disagree"
+        r.ok(f"_binding_reads_cached(prog) is a bare frozenset[str]: {cached}")
+    except Exception as e:
+        r.fail("COLOR-1 _binding_reads_cached return type", f"{type(e).__name__}: {e}")
+
+    # The non-spatial half is exposed through its OWN accessor, over the same memo entry.
+    try:
+        non_spatial = _non_spatial_names_cached(prog)
+        assert isinstance(non_spatial, frozenset), f"got {type(non_spatial)}, not frozenset"
+        assert non_spatial == {"LUT"}, f"expected {{'LUT'}}, got {non_spatial}"
+        r.ok(f"_non_spatial_names_cached(prog) is its own frozenset[str] accessor: {non_spatial}")
+    except Exception as e:
+        r.fail("COLOR-1 _non_spatial_names_cached", f"{type(e).__name__}: {e}")
+
+
 def test_color1_reserved_names_e3011(r: SubTestResult):
     print("\n--- COLOR-1: the five new names are RESERVED (E3011) ---")
     for name in ("rec709_to_linear", "linear_to_rec709", "acescg_to_linear", "linear_to_acescg",
