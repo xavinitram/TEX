@@ -877,6 +877,14 @@ Settled calls, kept here so they're not re-derived:
   is *width* (PREC-1's fp16, exactly 2×) and *residency*, both of which shipped. A test greps
   `tex_results.py` for codec names so a future addition has to argue with the number.
   Reopen only for a storage medium under that bandwidth, and only for the disk tier.
+  **Re-measured 2026-09-23 with blosc2 4.13.1** (laptop, 24 threads; every row bit-exact). The
+  stdlib verdict holds, but a fast shuffle codec does not lose: lossless fp32 at 1.6–4.7× decodes
+  a 4K frame in 16–20 ms, under this box's raw disk read, and fp16 plus byte-shuffle and zstd-1
+  reaches 4–11× at ~10 ms. The win needs blosc2's own threads (single-threaded it does not beat
+  disk), and blosc2 is a compiled dependency. **The NO stands for TEX, now on ownership rather than
+  cost** (the author, 2026-09-23): TEX cooks, the embedding host displays and caches, so a codec
+  belongs in the host's cache, which can take a dependency TEX cannot. TEX's own tiers stay
+  uncompressed; width and residency remain its capacity levers.
 - **`_learn_spilled` can re-walk the spill dir once per miss while spilling continues**
   (v0.33.2 H4) — DEFERRED, and it is a REGRESSION this release knowingly ships. Before H4 the
   scan always ended in a definite set, so it ran once; now a scan that raced a spill correctly
