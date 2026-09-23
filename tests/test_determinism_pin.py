@@ -22,8 +22,12 @@ CUDA-gated: the CUDA half skips clean on a CPU-only box.
 """
 from helpers import *
 
-# plain displacement scatter, and a collision-stress variant (128^2 sources folded
-# into a 4x4 target grid => ~1024-way atomic-add collisions per cell).
+# plain displacement scatter, and a collision-stress variant. `_run()` below cooks with NO
+# bindings, so the grid is the interpreter's no-binding default rather than a bound 128^2
+# image folded into a 4x4 target — the "~1024-way atomic-add collisions per cell" this
+# comment used to describe. The pin still catches the same atomic-add-reorder class of
+# regression within that smaller default shape; widening the grid to match (TRK-11) is a
+# separate, unmeasured change and is not made here.
 _SCATTER = (
     "@OUT[ix, iy] = vec3(0.0);"
     "float dx = simplex(u * 3.0, v * 3.0) * 8.0;"

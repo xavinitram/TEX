@@ -552,8 +552,10 @@ def _run_default(ctx: ExecContext):
     # narrow-cook-crop is bit-exact for pointwise/morphology, ~1 ulp for conv — and on CPU also
     # ~1 ulp for NOISE, whose kernels are shape-dependent at the last ulp, which a noise
     # derivative (`curl`) then amplifies by its 1/(2*eps) factor to ~3e-5 (measured; CUDA is
-    # exact for every class). See the table in CHANGELOG 0.30.0. Whole-frame on any run_roi
-    # error (never hard-fail the cook).
+    # exact for every class WITHIN a settled noise-cache tier — the one-time jit-trace->
+    # Inductor promotion, `tex_runtime.noise._TieredCache.try_upgrade`, is bounded by its own
+    # pinned envelope instead, see `tests/test_v031_noise_tiers.py`). See the table in
+    # CHANGELOG 0.30.0. Whole-frame on any run_roi error (never hard-fail the cook).
     if ctx.roi is not None and ctx.roi_plan is not None:
         # Bind tier_trace OUTSIDE the try: it is imported function-locally per the SCC
         # convention (see the F1 note below), and an import inside the try would leave the

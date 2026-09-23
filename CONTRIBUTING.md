@@ -15,7 +15,9 @@ Thanks for your interest in contributing to TEX Wrangle. This guide covers the e
    cd TEX_Wrangle/tests
    python run_all.py
    ```
-   `run_all.py` is the canonical runner (~1358 sub-tests, no extra dependencies). `python -m pytest tests/ -v` also works if you have pytest installed.
+   `run_all.py` is the canonical runner (no extra dependencies; it prints its own sub-test
+   count on each run rather than a number pinned here, which drifts as rows are added).
+   `python -m pytest tests/ -v` also works if you have pytest installed.
 
 No additional packages or build steps are needed for the core compiler and runtime.
 

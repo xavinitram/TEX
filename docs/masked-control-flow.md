@@ -140,9 +140,11 @@ outer live mask and its transfers touch only itself. The 1024-pass cap raises **
 
 A call inherits the caller's live mask. `return e` records `e` for the pixels live at that
 statement and clears their bits for the remainder of the call body; a pixel that reaches the
-end of the body without returning gets `0.23`'s default (a zero scalar tensor,
-`interpreter._exec_function_call`'s tail / `codegen._emit_function_def`'s trailing
-`return _torch.scalar_tensor(0.0, ...)`). **A call with no live pixel is skipped entirely** —
+end of the body without returning gets `0.23`'s default reading, but under masking the
+function's answer is one tensor covering every pixel, so that default has to be a **shape**,
+not a value: a zero of the returned value's shape and dtype (`zeros_like`), built once by
+`masked_flow.record_return` and used by both tiers, not literally `scalar_tensor(0.0)`. **A
+call with no live pixel is skipped entirely** —
 that skip is what lets a per-pixel recursion terminate, and it is observable only through M6/M7
 side effects, never through the returned value.
 

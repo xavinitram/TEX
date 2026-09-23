@@ -424,17 +424,21 @@ class _TieredCache:
         Inductor tier is not bit-identical to the traced tier, cook #4 onward can
         differ from cooks #1-3 — the same shape of defect first_call() closes for
         tier 1 vs tier 2. It is left open deliberately, on two grounds: unlike the
-        tier-1 swap (which bought nothing) this one is worth a measured 13-18x, and
-        it could not be characterized on the box where this was fixed — neither
-        backend compiles there (CUDA has no Triton; the CPU Inductor build fails
-        with a CppCompileError), so tier 3 never engages and a bit-equality
-        adoption gate could not be tested. Gating adoption on
+        tier-1 swap (which bought nothing) this one is worth a measured 13-18x. It
+        could not be characterized on the box this was FIXED on — neither backend
+        compiles there (CUDA has no Triton; the CPU Inductor build fails with a
+        CppCompileError), so tier 3 never engaged there and a bit-equality adoption
+        gate could not be tested on that box. It has since been characterized on a
+        Triton-capable box and bounded rather than left open: the promotion moves
+        pixels by amounts the per-builtin `promotion_envelope` band pins
+        (`tests/test_v031_noise_tiers.py`), so a build that blows the band is a
+        recorded decision to re-band, never a silent drift. Gating adoption on
         `torch.equal(compiled(*probe), incumbent(*probe))` using the dummy
-        compile_fn already warms with would close it for ~one 64x64 call on a path
-        that already costs ~28s — but on a Triton box that gate would silently
-        forfeit the speedup whenever the tiers disagree, so it wants a measurement
-        first, not a guess. Nothing here is a *new* regression: this path predates
-        the cold-frame fix and is unchanged by it.
+        compile_fn already warms with would close the gap for ~one 64x64 call on a
+        path that already costs ~28s — but on a Triton box that gate would silently
+        forfeit the speedup whenever the tiers disagree within the pinned band, so
+        it stays an open option, not a requirement. Nothing here is a *new*
+        regression: this path predates the cold-frame fix and is unchanged by it.
         """
         if key in self._compile_attempted or not _can_inductor_compile(device):
             return

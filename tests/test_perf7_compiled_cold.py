@@ -151,9 +151,11 @@ _EXACTLY_ONCE = (
 #: difference and far too small to absorb a re-emit, which the mutation guard below
 #: measures at roughly five times the pinned reading.
 _FRAME_CEILING = {"blur_chain": 340, "fetch_stencil": 400}
-#: v0.37.0 (`dfe7c38`) read 276 / 321; head reads 277 / 321. The one extra frame on
-#: `blur_chain` is PERF-2's `_host_scalar` call inside `fn_gauss_blur` — one Python frame
-#: in place of a device readback, which is the trade that lane recorded.
+#: v0.37.0 (`dfe7c38`) read 276 / 321; head reads 280 / 324 (RTX 5070 Ti Laptop, this box,
+#: `python tests/test_perf7_compiled_cold.py -q -s`, each row prints its own). One extra
+#: frame on `blur_chain` is PERF-2's `_host_scalar` call inside `fn_gauss_blur` — one Python
+#: frame in place of a device readback, which is the trade that lane recorded; the rest of
+#: the drift is later, unrelated frame growth the ceiling (340/400) already has room for.
 _MEASURED_AT_V0370 = {"blur_chain": 276, "fetch_stencil": 321}
 
 REDERIVE = ("python -m pytest tests/test_perf7_compiled_cold.py -q  "

@@ -237,10 +237,13 @@ pixel — structurally benign, numerically large). Instead a **characterization 
 so a torch/driver bump that blows a band is a loud, recorded decision, not silent drift.
 
 **Determinism is a free, marketed property**: TEX is bitwise run-to-run deterministic on
-CUDA across every class incl. scatter atomics under collision stress; forcing strict
-determinism would *cost* 1.48× on scatter, so TEX already rides the fast path
-(`tests/test_determinism_pin.py`). The CPU is the honest caveat (~5.5e-6 threaded-accumulation
-variance).
+CUDA within a settled noise-cache tier, across every class incl. scatter atomics under
+collision stress; forcing strict determinism would *cost* 1.48× on scatter, so TEX already
+rides the fast path (`tests/test_determinism_pin.py`). The CPU is the honest caveat (~5.5e-6
+threaded-accumulation variance). The one exception is the one-time jit-trace→Inductor
+promotion (`tex_runtime.noise._TieredCache.try_upgrade`): crossing it can move pixels, bounded
+by the per-builtin band this repository pins (`tests/test_v031_noise_tiers.py`'s
+`promotion_envelope` row) rather than left as an open question.
 
 **`precision="auto"`** (PR-LP2, `tex_runtime/precision_policy.py`) is an **experimental,
 conservative fp16 gate**. It resolves to fp16 only on CUDA, ≥1024², for a smooth pointwise
