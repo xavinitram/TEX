@@ -114,8 +114,8 @@ Four workstreams. Effort tags: S/M/L.
 
 - **FUS-0 (S, shipped v0.20.1).** Fused chains cannot reach `torch_compile`/`auto` in
   production: `select_tier` requires `fused_fp_present` (today `tex_engine.select_tier`,
-  `tex_engine.py:419-435`) but the node's `execute()` computed `fused_fp` only under
-  `cuda_graph` (that computation now lives in `tex_engine.prepare`, `tex_engine.py:793-803`,
+  `tex_engine.py:443-460`) but the node's `execute()` computed `fused_fp` only under
+  `cuda_graph` (that computation now lives in `tex_engine.prepare`, `tex_engine.py:822-832`,
   and runs for every mode). One-line gate fix + a node-path regression test (the existing F-1 test
   bypasses the gate with a synthetic fingerprint).
 - **FUS-1 (M).** DAG-region fusion producer. The Q-3 splicer already accepts arbitrary
