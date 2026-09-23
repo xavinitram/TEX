@@ -490,7 +490,12 @@ def test_v035_port6_routes_still_register_under_comfyui(r):
     imported and `PromptServer.instance` exists long before `nodes.init_extra_nodes()`), so
     the routes register exactly as before. This drives a fresh interpreter with a STUB
     `server` in `sys.modules` and asserts the TEX routes were actually registered — the
-    guard against 'made it lazy, silently lost the API surface'."""
+    guard against 'made it lazy, silently lost the API surface'.
+
+    TRK-97: `aiohttp` is stubbed (the same minimal `aiohttp.web` module the `_ROUTE_SHIM`
+    below builds) rather than probed and skipped when absent — `aiohttp` is missing from the
+    CI-shape interpreter and very likely the CPU CI lane, which is exactly where this route
+    block going unexercised would matter most."""
     import subprocess
     import sys as _sys
     import TEX_Wrangle
@@ -499,10 +504,11 @@ def test_v035_port6_routes_still_register_under_comfyui(r):
     code = (
         "import sys, types\n"
         f"sys.path.insert(0, {custom_nodes!r})\n"
-        "try:\n"
-        "    import aiohttp  # the route block needs it; skip cleanly if absent\n"
-        "except Exception:\n"
-        "    print('SKIP no-aiohttp'); raise SystemExit(0)\n"
+        "_web = types.ModuleType('aiohttp.web')\n"
+        "_aiohttp = types.ModuleType('aiohttp')\n"
+        "_aiohttp.web = _web\n"
+        "sys.modules['aiohttp'] = _aiohttp\n"
+        "sys.modules['aiohttp.web'] = _web\n"
         "reg = []\n"
         "class _R:\n"
         "    def get(self, p):\n"
@@ -528,9 +534,6 @@ def test_v035_port6_routes_still_register_under_comfyui(r):
                    f"subprocess exit {proc.returncode}: {(proc.stderr or '')[-400:]}")
             return
         text = proc.stdout.strip()
-        if "SKIP" in text:
-            r.skip("PORT-6 routes under ComfyUI", "aiohttp is not installed in this interpreter")
-            return
         out = dict(line.split(" ", 1) for line in text.splitlines() if " " in line)
         assert int(out.get("ROUTES", "0")) > 0, \
             "no TEX routes registered with a ComfyUI-like host present (the gate is too tight)"
