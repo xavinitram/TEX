@@ -173,10 +173,12 @@ def test_no_pragma_or_pinned_keeps_the_before_column(name, header):
     """A program with no pragma, and one pinned at the previous level, still produce §0's
     `before` column — the invariant-7 proof for this stage."""
     src, before, _after = _WORKED[name]
-    out, interp = _cook(header + src, _TABLE_BINDINGS, None)
+    # TRK-155: `interp._masked` is restored to `False` in a `finally` on every cook, masked
+    # or not, so asserting it here proves nothing on its own — the `before`-column value
+    # comparison below is what actually distinguishes the masked/unmasked answer.
+    out, _interp = _cook(header + src, _TABLE_BINDINGS, None)
     got = [round(float(x), 4) for x in _chan0(out).reshape(-1).tolist()]
     assert got == before
-    assert interp._masked is False
 
 
 def test_pragma_025_alone_does_not_mask_below_masked_flow():
@@ -189,11 +191,13 @@ def test_pragma_025_alone_does_not_mask_below_masked_flow():
     real = tex_api.LANGUAGE_VERSION
     try:
         tex_api.LANGUAGE_VERSION = "0.24"
+        # TRK-155: no `interp._masked is False` check here either, for the same reason as
+        # `test_no_pragma_or_pinned_keeps_the_before_column` — it is restored to `False` by a
+        # `finally` on every cook and would pass whether this pragma masked or not.
         for name, (src, before, _after) in _WORKED.items():
-            out, interp = _cook(PRAGMA + src, _TABLE_BINDINGS, None)
+            out, _interp = _cook(PRAGMA + src, _TABLE_BINDINGS, None)
             got = [round(float(x), 4) for x in _chan0(out).reshape(-1).tolist()]
             assert got == before, name
-            assert interp._masked is False, name
     finally:
         tex_api.LANGUAGE_VERSION = real
 
