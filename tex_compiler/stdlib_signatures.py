@@ -145,6 +145,11 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     "linear_to_srgb": {"args": (1, 1), "return": _passthrough_type},
     "oklab_from_rgb": {"args": (1, 1), "return": _passthrough_type},   # linear RGB <-> OKLab (Ottosson)
     "oklab_to_rgb":   {"args": (1, 1), "return": _passthrough_type},
+    # COLOR-1 (v0.40): Rec.709 transfer (distinct curve from sRGB) + ACEScg<->linear matrix
+    "rec709_to_linear": {"args": (1, 1), "return": _passthrough_type},
+    "linear_to_rec709": {"args": (1, 1), "return": _passthrough_type},
+    "acescg_to_linear": {"args": (1, 1), "return": _passthrough_type},
+    "linear_to_acescg": {"args": (1, 1), "return": _passthrough_type},
     # SL-1 compositing (Porter-Duff, straight-alpha vec4)
     "premultiply":   {"args": (1, 1), "return": _passthrough_type},
     "unpremultiply": {"args": (1, 1), "return": _passthrough_type},

@@ -187,6 +187,70 @@ class _StdlibColor:
         rgb = torch.cat([r, g, b], dim=-1)
         return torch.cat([rgb, c[..., 3:4]], dim=-1) if has_alpha else rgb
 
+    # -- Rec.709 transfer + ACEScg<->linear matrix (COLOR-1, v0.40) -----
+    # Rec.709 (BT.709) has its own OETF/EOTF — numerically distinct from sRGB's (a
+    # different linear-segment slope and a different power), so it is its own pair, not
+    # an alias. ACEScg (AP1 primaries, linear) <-> linear Rec.709/sRGB (D65) is a fixed
+    # 3x3 change of primaries, inlined as scalar-coefficient sums — the SAME code shape
+    # as fn_oklab_from_rgb above (constant-matrix x vec, elementwise), not torch.matmul:
+    # a compile-time-known constant needs no device branch to already be the fast form
+    # on both CPU and CUDA (unlike a RUNTIME matrix, which is what `_matvec`'s CPU/CUDA
+    # gate in interpreter.py is for).
+
+    @stdlib("rec709_to_linear", sig='rec709_to_linear(c) \\u2192 vec', category='Color', doc='Gamma-encoded Rec.709 → linear-light (BT.709 EOTF; distinct curve from sRGB).', ex='vec3 lin = rec709_to_linear(@image.rgb);')
+    @staticmethod
+    def fn_rec709_to_linear(color) -> torch.Tensor:
+        """BT.709 EOTF: gamma-encoded Rec.709 -> linear-light (piecewise; distinct
+        constants from sRGB's). vec4 alpha passes through unchanged."""
+        c = _to_tensor(color)
+        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        rgb = c[..., 0:3] if has_alpha else c
+        lin = torch.where(rgb < 0.081, rgb / 4.5,
+                          ((rgb + 0.099) / 1.099).clamp(min=0.0) ** (1.0 / 0.45))
+        return torch.cat([lin, c[..., 3:4]], dim=-1) if has_alpha else lin
+
+    @stdlib("linear_to_rec709", sig='linear_to_rec709(c) \\u2192 vec', category='Color', doc='Linear-light → gamma-encoded Rec.709 (inverse of rec709_to_linear).', ex='@OUT = vec4(linear_to_rec709(lin), 1.0);')
+    @staticmethod
+    def fn_linear_to_rec709(color) -> torch.Tensor:
+        """BT.709 OETF: linear-light -> gamma-encoded Rec.709 (inverse of
+        rec709_to_linear). vec4 alpha passes through unchanged."""
+        c = _to_tensor(color)
+        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        rgb = c[..., 0:3] if has_alpha else c
+        gam = torch.where(rgb < 0.018, rgb * 4.5,
+                          1.099 * rgb.clamp(min=0.0) ** 0.45 - 0.099)
+        return torch.cat([gam, c[..., 3:4]], dim=-1) if has_alpha else gam
+
+    @stdlib("acescg_to_linear", sig='acescg_to_linear(c) \\u2192 vec3', category='Color', doc='ACEScg (AP1, linear) → linear Rec.709/sRGB (D65) via a fixed 3×3 primary change.', ex='vec3 lin709 = acescg_to_linear(@aces_plate.rgb);')
+    @staticmethod
+    def fn_acescg_to_linear(color) -> torch.Tensor:
+        """ACEScg (AP1 primaries, linear) -> linear Rec.709/sRGB (D65). Fixed 3x3
+        matrix (ACES 1.0.3-class AP1->Rec.709 D65), inlined as scalar-coefficient
+        sums (P3 shape). vec4 alpha passes through unchanged."""
+        c = _to_tensor(color)
+        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        r, g, b = c[..., 0:1], c[..., 1:2], c[..., 2:3]
+        r2 = 1.70505 * r - 0.62179 * g - 0.08316 * b
+        g2 = -0.13026 * r + 1.14080 * g - 0.01055 * b
+        b2 = -0.02400 * r - 0.12897 * g + 1.15297 * b
+        lin = torch.cat([r2, g2, b2], dim=-1)
+        return torch.cat([lin, c[..., 3:4]], dim=-1) if has_alpha else lin
+
+    @stdlib("linear_to_acescg", sig='linear_to_acescg(c) \\u2192 vec3', category='Color', doc='Linear Rec.709/sRGB (D65) → ACEScg (AP1, linear) (inverse of acescg_to_linear).', ex='vec3 acescg = linear_to_acescg(srgb_to_linear(@image.rgb));')
+    @staticmethod
+    def fn_linear_to_acescg(color) -> torch.Tensor:
+        """Linear Rec.709/sRGB (D65) -> ACEScg (AP1 primaries, linear) — the EXACT
+        matrix inverse of acescg_to_linear's, so the round trip is float-precision
+        clean. vec4 alpha passes through unchanged."""
+        c = _to_tensor(color)
+        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        r, g, b = c[..., 0:1], c[..., 1:2], c[..., 2:3]
+        r2 = 0.61309721 * r + 0.33951747 * g + 0.04732740 * b
+        g2 = 0.07019593 * r + 0.91635827 * g + 0.01344794 * b
+        b2 = 0.02061416 * r + 0.10957019 * g + 0.86981469 * b
+        acescg = torch.cat([r2, g2, b2], dim=-1)
+        return torch.cat([acescg, c[..., 3:4]], dim=-1) if has_alpha else acescg
+
     # -- Compositing (SL-1): Porter-Duff on straight (un-premultiplied) vec4 --
     # ComfyUI IMAGE/MASK are un-premultiplied; over/under/atop take & return
     # straight-alpha vec4. premultiply/unpremultiply convert between conventions.

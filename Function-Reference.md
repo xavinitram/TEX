@@ -79,6 +79,10 @@
 | `linear_to_srgb` | `linear_to_srgb(c) → vec` | Linear-light → gamma-encoded sRGB (inverse of srgb_to_linear). | — |
 | `oklab_from_rgb` | `oklab_from_rgb(c) → vec3` | Linear RGB → OKLab. Mix/interpolate in OKLab for perceptually-even gradients. | — |
 | `oklab_to_rgb` | `oklab_to_rgb(lab) → vec3` | OKLab → linear RGB (inverse of oklab_from_rgb). | — |
+| `rec709_to_linear` | `rec709_to_linear(c) → vec` | Gamma-encoded Rec.709 → linear-light (BT.709 EOTF; distinct curve from sRGB). | — |
+| `linear_to_rec709` | `linear_to_rec709(c) → vec` | Linear-light → gamma-encoded Rec.709 (inverse of rec709_to_linear). | — |
+| `acescg_to_linear` | `acescg_to_linear(c) → vec3` | ACEScg (AP1, linear) → linear Rec.709/sRGB (D65) via a fixed 3×3 primary change. | — |
+| `linear_to_acescg` | `linear_to_acescg(c) → vec3` | Linear Rec.709/sRGB (D65) → ACEScg (AP1, linear) (inverse of acescg_to_linear). | — |
 | `premultiply` | `premultiply(rgba) → vec4` | Straight → premultiplied alpha (rgb *= a). | — |
 | `unpremultiply` | `unpremultiply(rgba) → vec4` | Premultiplied → straight alpha (rgb /= a). | — |
 | `over` | `over(fg, bg) → vec4` | Porter-Duff 'over': composite fg atop bg (straight-alpha RGBA). | — |

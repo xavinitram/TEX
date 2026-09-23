@@ -490,6 +490,38 @@
           "aliases": []
         },
         {
+          "name": "rec709_to_linear",
+          "sig": "rec709_to_linear(c) → vec",
+          "desc": "Gamma-encoded Rec.709 → linear-light (BT.709 EOTF; distinct curve from sRGB).",
+          "example": "vec3 lin = rec709_to_linear(@image.rgb);",
+          "tags": [],
+          "aliases": []
+        },
+        {
+          "name": "linear_to_rec709",
+          "sig": "linear_to_rec709(c) → vec",
+          "desc": "Linear-light → gamma-encoded Rec.709 (inverse of rec709_to_linear).",
+          "example": "@OUT = vec4(linear_to_rec709(lin), 1.0);",
+          "tags": [],
+          "aliases": []
+        },
+        {
+          "name": "acescg_to_linear",
+          "sig": "acescg_to_linear(c) → vec3",
+          "desc": "ACEScg (AP1, linear) → linear Rec.709/sRGB (D65) via a fixed 3×3 primary change.",
+          "example": "vec3 lin709 = acescg_to_linear(@aces_plate.rgb);",
+          "tags": [],
+          "aliases": []
+        },
+        {
+          "name": "linear_to_acescg",
+          "sig": "linear_to_acescg(c) → vec3",
+          "desc": "Linear Rec.709/sRGB (D65) → ACEScg (AP1, linear) (inverse of acescg_to_linear).",
+          "example": "vec3 acescg = linear_to_acescg(srgb_to_linear(@image.rgb));",
+          "tags": [],
+          "aliases": []
+        },
+        {
           "name": "premultiply",
           "sig": "premultiply(rgba) → vec4",
           "desc": "Straight → premultiplied alpha (rgb *= a).",
@@ -1363,5 +1395,5 @@
       ]
     }
   ],
-  "function_count": 151
+  "function_count": 155
 }

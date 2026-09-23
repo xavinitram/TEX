@@ -40,7 +40,11 @@ _UNARY_VEC4 = {"premultiply", "unpremultiply"}
 _BLEND = {"screen", "overlay", "hard_light", "soft_light", "color_dodge",
           "color_burn", "linear_light", "vivid_light"}
 _COLOR_VEC = {"hsv2rgb", "rgb2hsv", "srgb_to_linear", "linear_to_srgb",
-              "oklab_from_rgb", "oklab_to_rgb", "normalize"}
+              "oklab_from_rgb", "oklab_to_rgb", "normalize",
+              # COLOR-1 (v0.40): Rec.709 transfer + ACEScg<->linear matrix — same
+              # (img.rgb) -> vec3 shape as the sRGB/OKLab pair above.
+              "rec709_to_linear", "linear_to_rec709",
+              "acescg_to_linear", "linear_to_acescg"}
 _IMG_REDUCE = {"img_sum", "img_mean", "img_min", "img_max", "img_median"}
 
 # Functions that may LEGITIMATELY produce non-finite output on the edge matrix
