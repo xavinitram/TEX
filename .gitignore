@@ -33,7 +33,14 @@ results/
 # the `results/` line above would otherwise exclude, which would stop git descending into it at
 # all; its OTHER children stay ignored by the `benchmarks/results/*` line.)
 !benchmarks/results/
-!benchmarks/results/sitting_2026-09-20_sm75/
+!benchmarks/results/sitting_*/
+# What a sitting COMMITS is its README (the legs, the reads, the verdict) and the comparison
+# readouts, which are small text. The raw per-leg result JSON is NOT committed: the v0.38.0
+# sitting committed all sixty of them (~106,000 lines of pretty-printed samples in one commit,
+# more than the rest of the repository's history), which buried the release in a line count
+# that measured nothing. The raw legs are attached to the GitHub release instead, and the
+# README names the attachment. (The v0.38.0 files stay tracked: an ignore rule never untracks.)
+benchmarks/results/sitting_*/*.json
 
 # Internal reports (not shipped)
 optimization_reports/

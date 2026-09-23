@@ -1253,6 +1253,12 @@ method made explicit:
       afterwards. So each new tree gets a discard leg that is run and thrown away before any
       reported leg. `--save` records the cache directory, whether it started empty, and a
       `-dirty` suffix when the measured tree is not the commit it names.
+    - **A sitting commits its reading, not its raw legs.** The sitting's directory under
+      `benchmarks/results/` carries a README (the box, the legs, each read against its null
+      control, the verdict) and the comparison readouts as text. The raw per-leg result JSON is
+      attached to the GitHub release and named in the README, never committed: the v0.38.0
+      sitting committed sixty raw files, about 106,000 lines of samples in one commit, and the
+      repository's history was dominated by data nobody diffs. `.gitignore` enforces it.
     - **A same-tree null control, in the same sequence as the claim — and the CLOSING leg is
       that control.** The v0.38.0 sitting's closing read was base → after → base, and the third
       leg returned per-config geomeans of **1.003–1.047** against the first, while the after leg
