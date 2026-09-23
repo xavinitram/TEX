@@ -168,12 +168,13 @@ def test_trk9_linear_manifests_unaffected(r: SubTestResult):
     must be completely unaffected by this fix (they never had `dag: True`,
     so `_check_dag_stages_anchored` no-ops on them)."""
     print("\n--- TRK-9 control: stock linear-fused tools still load ---")
+    # `stock/` ships with every checkout (AGENTS.md's registry-archive rules do not
+    # exclude it, and other suites — test_v026_phase1.py's `_STOCK` — already load
+    # from it unconditionally), so there is no absent-environment case to skip here.
     stock_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "stock")
     try:
         m = tex_tool.load_tool(os.path.join(stock_dir, "grade_vignette.textool"))
         assert m.graphspec is not None
         r.ok("stock fused tool 'grade_vignette' still loads")
-    except FileNotFoundError:
-        r.ok("stock tool directory not present in this checkout (SKIPPED, not a failure)")
     except Exception as e:
         r.fail("a stock linear-fused tool still loads unaffected", f"{type(e).__name__}: {e}")
