@@ -271,6 +271,9 @@ def test_v033_prec1_choose_storage_is_the_only_decision_point(r):
         (dict(quality=tex_packing.PREVIEW), tex_packing.FP16),
         (dict(quality=tex_packing.PREVIEW, storage="fp32"), None),
         (dict(quality="PREVIEW"), None),            # tags are exact strings, not case-folded
+        # TRK-90: a storage hint with NO quality tag must not reduce on its own — `storage=`
+        # selects WHICH representation, it never grants permission (the gate is `quality`).
+        (dict(quality=None, storage="fp16"), None),
         # mask_eligible is just another argument: pure and exact-match like the rest.
         (dict(quality=tex_packing.PREVIEW, kind="MASK", mask_eligible=True), tex_packing.FP16),
     ]

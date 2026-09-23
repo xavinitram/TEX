@@ -97,16 +97,15 @@ MUTATIONS = [
      "            default = None",
      ("test_v032_governor",)),
     # ── v0.33 ──────────────────────────────────────────────────────────────────────────
-    # MEASURED, not assumed: the suite named after this guard does NOT kill it. The killer is
-    # `test_v033_cache8` (1 row); `test_v033_precision` contributes 0. PREC-1's own rows check
-    # what a PREVIEW put stores, and a storage hint alone reducing is a case they never
-    # construct. Filed as a finding — the column records who kills it, not who should.
+    # TRK-90: PREC-1's own suite (`test_v033_precision`) now constructs the case directly
+    # (`test_v033_prec1_choose_storage_is_the_only_decision_point`'s `storage="fp16"`, no
+    # `quality` row) instead of relying solely on `test_v033_cache8` to notice.
     ("PREC-1: the quality tag stops gating (a storage hint alone reduces)", "tex_packing.py",
      "    if quality != PREVIEW:\n"
      "        return None                           # the default path, byte-identical to pre-v0.33",
      "    if quality != PREVIEW and storage is None:\n"
      "        return None",
-     ("test_v033_cache8",)),
+     ("test_v033_cache8", "test_v033_precision")),
     ("PREC-1: get stops unpacking (storage precision leaks to the consumer)", "tex_results.py",
      "        if orig_dtype is not None:\n"
      "            from . import tex_packing",
@@ -128,15 +127,15 @@ MUTATIONS = [
     # The guard is REMOVED, not neutered. A first attempt kept the `return` and only changed
     # the arithmetic below it, which is a no-op — the mutation "survived" because it was not a
     # mutation. A row that cannot change behaviour tests nothing.
-    # MEASURED: CACHE-8's own suite contributes 0 here. The only killer is `test_v0332_audit`
-    # (1 row) — the A5 disarm row, written a release later. `test_v033_cache8` arms residency
-    # before it looks, so the disarmed path is one it never exercises.
+    # TRK-90: CACHE-8's own suite now constructs its own disarmed-with-residents case too
+    # (`test_v033_cache8_disarmed_residency_never_enforces`), alongside the pre-existing killer
+    # `test_v0332_audit`'s A5 disarm row (written a release later).
     ("CACHE-8: residency runs even when disarmed", "tex_results.py",
      "        if self._vram_budget is None:\n"
      "            return\n"
      "        over = self._bytes_by_dev[\"cuda\"] - self._vram_budget",
      "        over = self._bytes_by_dev[\"cuda\"] - (self._vram_budget or 0)",
-     ("test_v0332_audit",)),
+     ("test_v0332_audit", "test_v033_cache8")),
     ("CACHE-8: a demoted frame is never promoted home", "tex_results.py",
      "        if demoted is not None:\n"
      "            frame = self._promote(key, demoted)",

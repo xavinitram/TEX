@@ -61,6 +61,29 @@ def test_v033_cache8_residency_is_off_until_armed(r):
             r.fail("CACHE-8 off", f"{st2}")
 
 
+def test_v033_cache8_disarmed_residency_never_enforces(r):
+    """TRK-90 (CACHE-8 F-2): the row above never puts a frame on CUDA, so it cannot tell
+    `_enforce_residency`'s early `_vram_budget is None: return` apart from a version that
+    computed `over` as zero anyway. Put real CUDA residents, leave the budget at its
+    ComfyUI-default `None`, and call it directly — it must still be a no-op."""
+    if "cuda" not in _devices():
+        r.skip("CACHE-8 disarmed residency never enforces", "no CUDA on this box")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        c = tex_results.ResultCache(cache_dir=d)
+        c.put("a", _frame(res=64, device="cuda"))
+        c.put("b", _frame(res=64, device="cuda", scale=0.5))
+        assert c._vram_budget is None, "setup: residency must start disarmed"
+        with c._lock:
+            c._enforce_residency()
+        resident = all(tex_results._dev_bucket(e.device) == "cuda" for e in c._ram.values())
+        ok = not c._pending_demotes and c.demotions == 0 and resident
+    r.ok("CACHE-8: _enforce_residency is a no-op while disarmed, even with CUDA residents") \
+        if ok else r.fail("CACHE-8 disarmed residency",
+                           f"pending={len(c._pending_demotes)} demotions={c.demotions} "
+                           f"resident={resident}")
+
+
 def test_v033_cache8_demote_frees_vram_and_keeps_the_frame(r):
     """The headline. Over the VRAM ceiling, the coldest frame moves to host RAM: the cuda byte
     bucket drops by exactly its size, the cpu bucket gains exactly the same, the entry stays
