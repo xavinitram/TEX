@@ -2681,11 +2681,32 @@ def _int_valued_scalar(value) -> int | None:
 
 
 def _ensure_spatial(tensor: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:
-    """Expand a tensor to match a spatial shape [B, H, W] if needed."""
+    """Expand a tensor to match a spatial shape [B, H, W] if needed.
+
+    TRK-115: a `[B,H,W,1]` scalar-field binding (a 1-channel image — `C == 1` has no
+    vec1 type, so `infer_binding_type` maps it to FLOAT the same as a `[B,H,W]` mask)
+    passed the `shape[:len(spatial_shape)] == spatial_shape` check vacuously — its
+    first 3 dims DO match — so it was handed back UNCHANGED, at rank 4, straight into a
+    caller that assigns it into a `spatial_shape`-ranked slot (a vec-constructor
+    component, an array element, a channel/index write). PyTorch then aligned the
+    trailing dims of the mismatched ranks, lining `H` up against `W`, and raised.
+    Every caller here wants exactly `spatial_shape`'s OWN rank back — none of them
+    keeps a trailing extra axis — so squeezing it is within this function's existing
+    contract, not a widening of it.
+
+    Fixed HERE, at the point of use, rather than at ingest: an ingest-side squeeze
+    would also change a plain passthrough's (`@OUT = @A;`) OUTPUT shape — that
+    assignment never calls `_ensure_spatial` at all, so a `[B,H,W,1]` binding must
+    keep egressing at rank 4 exactly as it always has (invariant 7). Codegen's
+    generated code calls this SAME function (imported as `_es`), so both tiers pick
+    this fix up identically (invariant 2) with no codegen-side change needed."""
     if not spatial_shape:
         return tensor
     if tensor.dim() == 0:
         return tensor.expand(spatial_shape)
+    if tensor.dim() == len(spatial_shape) + 1 and tensor.shape[-1] == 1 \
+            and tensor.shape[:len(spatial_shape)] == spatial_shape:
+        return tensor.squeeze(-1)
     if tensor.shape[:len(spatial_shape)] == spatial_shape:
         return tensor
     # Try broadcasting
