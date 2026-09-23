@@ -220,6 +220,44 @@ def test_color1_lut_io(r: SubTestResult):
         r.fail("COLOR-1 read_cube path", f"{type(e).__name__}: {e}")
 
 
+def test_color1_colorspaces_extended(r: SubTestResult):
+    print("\n--- COLOR-1 lane D: COLORSPACES grows alongside lane A's functions ---")
+    from TEX_Wrangle.tex_marshalling import COLORSPACES, BufferMeta
+    from TEX_Wrangle import tex_packing
+
+    # The tag vocabulary grew by exactly the two spaces lane A's new functions produce/
+    # consume (PREC-2's rule: never a speculative tag with nothing to set it).
+    try:
+        assert set(COLORSPACES) == {"srgb", "linear", "oklab", "rec709", "acescg", "unknown"}, \
+            f"unexpected COLORSPACES: {COLORSPACES}"
+        BufferMeta(colorspace="rec709")     # validates without raising
+        BufferMeta(colorspace="acescg")
+        try:
+            BufferMeta(colorspace="aces2065-1")
+            raise AssertionError("an unrelated ACES space was silently accepted")
+        except ValueError:
+            pass
+        r.ok("COLORSPACES == {srgb, linear, oklab, rec709, acescg, unknown}; both new "
+             "tags validate, an unrelated one still doesn't")
+    except Exception as e:
+        r.fail("COLOR-1 COLORSPACES", f"{type(e).__name__}: {e}")
+
+    # The boundary this lane must NOT cross: choose_storage's kind-based colour/data split
+    # is unaffected by a colorspace tag — it isn't even a parameter, so there's nothing to
+    # pass. A colorspace tag stays advisory (DATA-1's "tags only, never transforms" rule).
+    try:
+        t = torch.rand(1, 4, 4, 3, dtype=torch.float32)
+        same = (tex_packing.choose_storage(t, quality=tex_packing.PREVIEW, kind="IMAGE")
+                == tex_packing.choose_storage(t, quality=tex_packing.PREVIEW, kind="IMAGE"))
+        assert same, "choose_storage isn't even pure across identical calls"
+        import inspect
+        assert "colorspace" not in inspect.signature(tex_packing.choose_storage).parameters, \
+            "choose_storage grew a colorspace parameter — DATA-1's tag must stay advisory-only"
+        r.ok("choose_storage takes no colorspace parameter (kind alone decides eligibility)")
+    except Exception as e:
+        r.fail("COLOR-1 choose_storage boundary", f"{type(e).__name__}: {e}")
+
+
 def test_color1_reserved_names_e3011(r: SubTestResult):
     print("\n--- COLOR-1: the five new names are RESERVED (E3011) ---")
     for name in ("rec709_to_linear", "linear_to_rec709", "acescg_to_linear", "linear_to_acescg",

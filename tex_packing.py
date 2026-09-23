@@ -180,6 +180,11 @@ def q8(t):
 def choose_storage(t, *, quality=None, storage=None, kind=None, mask_eligible=False):
     """The storage representation `t` should be kept as, or None for "store as cooked".
 
+    COLOR-1 (v0.40) boundary: `tex_marshalling.BufferMeta.colorspace` (COLORSPACES —
+    `srgb`/`linear`/`oklab`/`rec709`/`acescg`/`unknown`) is a DATA-1 advisory tag, never
+    read here. This function's colour-vs-data split is `kind` alone (IMAGE/MASK/LATENT/...,
+    below); a colorspace tag never widens or narrows storage eligibility.
+
     Returns one of `REDUCED` (a `tex_io.STORAGE_DTYPES` name) or None.
 
     `quality`  the caller's tier tag — `PREVIEW` opts in, anything else (including None,

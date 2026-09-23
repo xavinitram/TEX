@@ -1166,7 +1166,15 @@ _EGRESS = {"comfy": _prepare_output_comfy, "engine": _prepare_output_engine}
 #     `linear` produce an output tagged `unknown` — the honest answer, not whichever came
 #     first. Losing the tag is safe; asserting the wrong one corrupts a downstream transform.
 
-COLORSPACES = ("srgb", "linear", "oklab", "unknown")
+COLORSPACES = ("srgb", "linear", "oklab", "rec709", "acescg", "unknown")
+# `rec709`/`acescg` (COLOR-1, v0.40): added alongside the functions that produce/consume
+# them — `rec709_to_linear`/`linear_to_rec709`/`acescg_to_linear`/`linear_to_acescg`
+# (stdlib_color.py) — never speculatively (the same rule PREC-2 already established for
+# a plane's colour-vs-data role: no tag value exists with nothing that can legitimately
+# set it). Advisory only, exactly like `srgb`/`linear`/`oklab` above: nothing in this
+# module reads a BufferMeta.colorspace to CHOOSE a storage representation (see
+# `tex_packing.choose_storage`'s own boundary note), and nothing here transforms a buffer
+# because of its tag.
 PREMULT = ("premultiplied", "unassociated", "opaque", "unknown")
 
 

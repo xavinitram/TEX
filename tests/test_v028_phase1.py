@@ -39,8 +39,12 @@ _DEVICES = ["cpu", "cuda"] if _CUDA else ["cpu"]
 def test_data1_metadata(r: SubTestResult):
     print("\n--- DATA-1: buffer metadata sidecar ---")
 
-    # canary: the tag vocabularies are a pinned contract
-    if set(COLORSPACES) == {"srgb", "linear", "oklab", "unknown"} and \
+    # canary: the tag vocabularies are a pinned contract. COLORSPACES grew by two in
+    # v0.40 (COLOR-1) alongside the functions that produce/consume them
+    # (rec709_to_linear/linear_to_rec709/acescg_to_linear/linear_to_acescg) — moved
+    # deliberately, never speculatively (PREC-2's rule: no tag value with nothing that
+    # can legitimately set it).
+    if set(COLORSPACES) == {"srgb", "linear", "oklab", "rec709", "acescg", "unknown"} and \
        set(PREMULT) == {"premultiplied", "unassociated", "opaque", "unknown"}:
         r.ok("colorspace/premult vocabularies pinned")
     else:
