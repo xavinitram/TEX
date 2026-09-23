@@ -298,7 +298,7 @@ def test_neg4_citation_root_through_a_link(r: SubTestResult):
 
         # An UNTRACKED doc beside the repository, carrying a citation to a line that does
         # not exist — the artefact the walk fallback reads and the git-backed set does not.
-        # This is what a `TEX/docs/shard-*.md`-shaped local scratch file looks like to the
+        # This is what a git-excluded local scratch file under `docs/` looks like to the
         # checker: real on disk, invisible to git, and never meant to be judged as shipped.
         (real / "docs" / "untracked.md").write_text(
             "# scratch (untracked on purpose)\n\nSee the ghost (`mod.py:999`).\n",
