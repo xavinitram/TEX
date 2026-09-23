@@ -106,6 +106,10 @@ def to_fp32_if_int_image(t, device=None):
     otherwise the tiers diverge for FLOAT/LATENT outputs (or int64 values > 2^24).
     Scalar int params / int index arrays (dim<3) and bool masks pass through.
 
+    TRK-115: a rank-4 [B,H,W,1] tensor is squeezed to [B,H,W] first (its canonical
+    FLOAT-type shape — see the inline comment below), so the M5-INT cast decision
+    above ends up sizing off the SAME rank a genuine mask binding already has.
+
     `device` (optional) additionally co-locates the tensor on the compute device,
     FUSED with the cast when both apply — one copy instead of two. This makes a
     cross-device handoff (e.g. a CPU-cooked TEX node feeding a CUDA-forced one)
@@ -116,6 +120,20 @@ def to_fp32_if_int_image(t, device=None):
     codegen's `_contiguous_bindings`); guarded by the M5-INT bit-exactness test."""
     if not isinstance(t, torch.Tensor):
         return t
+    # TRK-115: a [B,H,W,1] tensor (a 1-channel image binding, e.g. a decoded EXR
+    # channel) types FLOAT under `_spatial_channels_to_type` (the SAME policy
+    # `infer_binding_type` uses) — TEX has no vec1 type, so C==1 is a scalar field,
+    # and every FLOAT consumer that stacks components (the vec-constructor's
+    # flatten path, `_ensure_spatial`) assumes the [B,H,W] rank a MASK binding
+    # already carries. Left at rank 4, stacking it alongside genuinely [B,H,W]
+    # components (e.g. `vec4(@A.rgb, @M)`) broadcasts [B,H,W,1] against a [B,H,W]
+    # slot and raises (trailing-dim alignment lines H up against W). Squeezed
+    # HERE — the single ingestion point both tiers call (the interpreter binding
+    # loop and codegen's `_contiguous_bindings`) — a [B,H,W,1] and a [B,H,W]
+    # binding of the same field cook identically on every tier. The ComfyUI MASK
+    # wire is already rank 3, so this never fires for a ComfyUI cook.
+    if t.dim() == 4 and t.shape[-1] == 1:
+        t = t.squeeze(-1)
     needs_cast = (t.dim() >= 3 and not t.is_floating_point()
                   and t.dtype != torch.bool)
     needs_move = device is not None and t.device != device
