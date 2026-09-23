@@ -5,6 +5,108 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.0] - 2026-09-24 — "Linear light"
+
+Colour becomes a language citizen: five native builtins for Rec.709 and ACEScg linearisation and
+a trilinear 3D LUT lookup, backed by a new `.cube`/`.spi1d` reader (COLOR-1, lanes A/B/D/E). The
+fused viewer-transform seam (COLOR-1 lane C / PM-11) is deferred to `v0.40.1` (`docs/roadmap.md`
+§9) — nothing in this release touches how or when a viewer exposure/gamma tweak reaches a cook.
+`tex_api.LANGUAGE_VERSION` stays `"0.25"`; **no compat freeze is owed** — all five names are
+function additions on unchanged grammar, the same shape `v0.36.0`'s four builtins and ENG-7's
+`frame`/`fps`/`time` each took.
+
+**Two breaking changes ship in this release, both minor per `AGENTS.md`'s Tier 2 row.**
+
+1. **Five newly reserved built-in names**: `rec709_to_linear`, `linear_to_rec709`,
+   `acescg_to_linear`, `linear_to_acescg`, `apply_lut3d`. A program that defines a function of one
+   of these names no longer compiles — it fails **E3011** — and the fix is to rename the user
+   function; a program that does not define one of the five is unaffected: same AST, same tiers,
+   same pixels. Eleven names are now reserved in total (six carried from `v0.35.0`/`v0.36.0`:
+   `convolve`, `patch_dist`, `img_width`, `img_height`, `worley_id`, `select`).
+2. **TRK-9: a hand-authored DAG manifest with an unanchored generator stage is now refused at
+   load, on both the feeds-DAG and no-feeds paths.** `tex_tool.py`'s `validate_manifest` exempted
+   a stage from needing `image_input` whenever it read a chain instead, with no substitute check
+   that it actually did — the manifest-side twin of `tex_fusion.py` rule ③'s ComfyUI graph-node
+   enforcement was simply missing. Such a manifest previously cooked fused (its generator stage
+   silently inheriting the fused splice's shared grid) but had no stage-by-stage meaning at all,
+   raising a bare `RuntimeError` the moment anyone tried to reconstruct it one stage at a time. It
+   now fails `validate_manifest` with a named diagnostic instead of a crash three layers into
+   execution. No ComfyUI-visible manifest is affected — the ComfyUI graph-node detector already
+   enforces the equivalent rule for every live workflow graph; only a hand-authored `.textool` DAG
+   could ever have been unanchored.
+
+### Added
+
+- **`rec709_to_linear(c)` / `linear_to_rec709(c)` — the BT.709 transfer curve, distinct from
+  sRGB's.** `tex_runtime/stdlib_color.py`; ComfyUI-invisible (two registry entries, no call path
+  changed).
+- **`acescg_to_linear(c)` / `linear_to_acescg(c)` — ACEScg (AP1) primaries.** A fixed 3×3
+  AP1↔linear-Rec.709 matrix change, inlined as scalar-coefficient sums beside the existing
+  `oklab_from_rgb` shape; the exact matrix inverse round-trips float-clean.
+- **`apply_lut3d(rgb, lut) → vec3` — trilinear 3D LUT lookup.** Routes through the same
+  `_grid_sample_f32` helper every other sampler uses, so a non-fp32 LUT gets the same protection.
+  `lut` is a plain bound `[N,N,N,3]` tensor, not a new `TEXType`. Backed by a new reader,
+  `tex_io/lut.py` (`read_cube`/`read_spi1d`, pure Python, no numpy).
+- **A declared `non_spatial_args` field on `@stdlib`.** Any function can now exempt one of its own
+  arguments from the whole-image cook-grid consensus (`_consensus_extent`) by declaring which
+  positions are non-spatial — `apply_lut3d` declares its LUT argument. Replaces a one-off,
+  function-specific memo with a general mechanism any future function can reuse by declaring the
+  field, in the same traversal that already builds binding reads.
+- `tex_marshalling.COLORSPACES` grows two advisory tag values, `"rec709"` and `"acescg"` — a
+  data-shape addition to a documented tuple, not a new reserved name.
+
+### Fixed
+
+- **TRK-6** — `sample_mip`'s (and `sample_mip_gauss`'s) grid buffer kept the UV's own dtype
+  instead of reconciling to fp32, an undocumented CPU-only `precision="fp16"` correctness gap
+  (measured max abs diff 0.332 against fp32; `sample()` was always immune). The buffer is now
+  forced to fp32 unconditionally, matching `sample()`'s own contract.
+- **TRK-115** — a `[B,H,W,1]` scalar-field binding raised where the `[B,H,W]` spelling of the same
+  mask cooked, and egressed an inconsistent output rank when it didn't. Fixed at the point of use
+  (`interpreter._ensure_spatial`), not at ingest, so a plain passthrough's ComfyUI-visible output
+  shape is provably unmoved (invariant 7); codegen shares the same helper.
+- **TRK-141** — every compile tier's broad `except Exception` swallowed a codegen-internal
+  control-flow escape (a bare `_CgBreak`/`_CgContinue`) as an ordinary silent interpreter fallback,
+  reported only by a `logger.warning` nobody reads. Such an escape is now named and recorded in
+  `tier_trace` as a fallback with a reason; an ordinary decline is unchanged.
+- **TRK-142** — a user function's own parameter was fast-pathed as scalar in codegen by omission
+  (neither `_spatial_vars` nor `_var_initializers` has an entry for a parameter), crashing codegen
+  when the function was called with a spatial argument. Parameters are now seeded into
+  `_spatial_vars` at definition time.
+- Ten pre-existing tracker rows closed as docs/tests hygiene, no behaviour change: `TRK-10`,
+  `TRK-11`, `TRK-12` (a determinism claim and two test comments re-qualified against the pinned
+  noise-tier promotion envelope), `TRK-90` (two mutation-coverage gaps given their own case),
+  `TRK-97` (a host-surface test stubs `aiohttp` instead of skipping when it's absent), `TRK-107`
+  (a stale sub-test count claim replaced with a derivable description), `TRK-110` (a roadmap
+  bullet's stale "open bug" framing corrected to "shipped"), `TRK-120` (a stale timing comment
+  re-measured and re-pointed), `TRK-140` (a masked-flow doc rule corrected from "a zero scalar" to
+  "a zero of the returned value's shape and dtype"), `TRK-155` (two vacuous test assertions
+  dropped), `TRK-157` (a module-size margin note already correct, confirmed rather than stale).
+- `TRK-143` (a latent `0.23`-path tier-disagreement hazard in the pre-masking spatial-`if`
+  predicate) was investigated fresh and still not reproduced against the current engine; stays
+  open, advisory.
+
+### Changed
+
+- **CACHE-8's rejected-decision entry (`DEVELOPMENT.md`) re-measured with blosc2 4.13.1**
+  (BRIEF-8): lossless fp32 reaches 1.6–4.7×, fp16+shuffle+zstd-1 4–11×, both decoding under this
+  box's raw disk read. The stdlib verdict still holds — TEX takes no new dependency — but the
+  reason moves from cost to ownership: a codec belongs in the embedding host's own cache, which
+  can take a dependency TEX, being torch-only, cannot. TEX's own cache tiers stay uncompressed;
+  width and residency remain its capacity levers.
+
+### For anyone vendoring this tree
+
+Four things this release moves, per `docs/brief-conventions.md`'s "what a release note owes a
+vendoring host": **(1) five newly reserved names** — `rec709_to_linear`, `linear_to_rec709`,
+`acescg_to_linear`, `linear_to_acescg`, `apply_lut3d` (eleven now reserved in total; see Breaking,
+above). **(2) `LANGUAGE_VERSION` does not move** — stays `"0.25"`, no compat freeze owed.
+**(3) no default moves** anywhere in this release, engine-side or host-facing; the one new gate
+(`TRK-9`) only refuses a manifest shape that already crashed. **(4) one new shipping module
+filename**: `tex_io/lut.py` — a vendoring step is typically a directory copy, so it arrives in a
+host's tree whether or not it imports it. Every cache tier goes cold once on adoption of this
+release: a one-time recompile, no pixel changes.
+
 ## [0.39.0] - 2026-09-23 — "Every pixel its own way"
 
 ### Added
