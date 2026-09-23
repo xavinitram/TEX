@@ -17,6 +17,7 @@ from TEX_Wrangle.tex_runtime.codegen import try_compile, _reads_time_builtin
 from TEX_Wrangle.tex_runtime.graphed import _capturable
 from TEX_Wrangle.tex_runtime.precision_policy import _has_fp16_hazard
 from TEX_Wrangle.tex_runtime.stdlib_registry import FP16_FRAGILE
+from TEX_Wrangle.tex_memory import run_tiled, run_roi, run_tiled_halo
 
 
 def test_pm11_default_is_identity(r: SubTestResult):
@@ -187,3 +188,120 @@ def test_pm11_engine_plumbing(r: SubTestResult):
     else:
         r.ok("tex_engine.prepare() takes viewer_context=None (mirrors time_context=); "
              "ExecContext carries it through to the tier strategies")
+
+
+# ── Memory-pressure paths: PM-11-F1's fix. A viewer tweak reaching only the DEFAULT
+# untiled cook and going silent under memory pressure would be a wrong-but-plausible
+# picture on exactly the large cooks most likely to need one — not deferrable, per
+# ENG-7's own history with `time_context` (the tiled path froze `frame` at 0 until
+# fixed; the same shape of bug, the same fix shape). Each test drives the pressure
+# path DIRECTLY (the forcing hook `test_eng7_time_builtins_advance`'s "TILED path"
+# assertion and `test_color1_apply_lut3d_pressure_paths` already use) rather than
+# provoking real memory pressure, and compares against the unpressured whole-frame
+# cook at the SAME viewer value.
+
+def test_pm11_tiled_pressure_path(r: SubTestResult):
+    print("\n--- PM-11-F1: viewer_context reaches tex_memory.run_tiled (M-4 memory pressure) ---")
+    img = make_img(1, 64, 64, 3, seed=11)
+    code = "@OUT = vec4(@A.rgb * viewer_exposure(), 1.0);"
+    prog, tm, outs = compile_program(code, {"A": img})
+    vc = {"viewer_exposure": 3.0}
+    try:
+        interp = Interpreter()
+        whole = interp.execute(prog, clone_bindings({"A": img}), tm, device="cpu",
+                               output_names=outs, precision="fp32", viewer_context=vc)
+        tiled = run_tiled(interp, prog, clone_bindings({"A": img}), tm, "cpu", 0,
+                          outs, None, "fp32", 4, time_context=None, viewer_context=vc)
+        md = (whole["OUT"] - tiled["OUT"]).abs().max().item()
+        assert md < 1e-6, f"run_tiled lost viewer_context under memory pressure (maxdiff {md:.3e})"
+        # Prove the value genuinely reached the strips, not that the comparison is trivial:
+        # the identity-default tiled cook must read DIFFERENT pixels from the forced one.
+        identity = run_tiled(interp, prog, clone_bindings({"A": img}), tm, "cpu", 0,
+                             outs, None, "fp32", 4, time_context=None, viewer_context=None)
+        moved = (tiled["OUT"] - identity["OUT"]).abs().max().item()
+        assert moved > 1e-3, "run_tiled read the same pixels regardless of viewer_context"
+        r.ok(f"run_tiled(n=4) with viewer_exposure=3.0 matches the untiled cook exactly "
+             f"(maxdiff {md:.1e}); moved {moved:.2f} vs the identity-default tiled cook")
+    except Exception as e:
+        r.fail("PM-11 tiled pressure path", f"{type(e).__name__}: {e}")
+
+
+def test_pm11_roi_pressure_path(r: SubTestResult):
+    print("\n--- PM-11-F1: viewer_context reaches tex_memory.run_roi, interp AND codegen exec_fn ---")
+    img = make_img(1, 16, 16, 3, seed=13)
+    code = "@OUT = vec4(@A.rgb * viewer_exposure(), 1.0);"
+    prog, tm, outs = compile_program(code, {"A": img})
+    vc = {"viewer_exposure": 2.0}
+    roi_window = (2, 2, 6, 6, 16, 16)   # x0, y0, w, h, W, H
+    x0, y0, w, h, _W, _H = roi_window
+    try:
+        interp = Interpreter()
+        whole = interp.execute(prog, clone_bindings({"A": img}), tm, device="cpu",
+                               output_names=outs, precision="fp32", viewer_context=vc)
+        ref_crop = whole["OUT"][:, y0:y0 + h, x0:x0 + w]
+
+        roi_out = run_roi(interp, prog, clone_bindings({"A": img}), tm, "cpu", 0, outs, None,
+                          "fp32", roi_window, {"A"}, 0, time_context=None, viewer_context=vc,
+                          record_trace=False)
+        md = (ref_crop - roi_out["OUT"]).abs().max().item()
+        assert md < 1e-5, f"run_roi (interpreter exec_fn) lost viewer_context (maxdiff {md:.3e})"
+
+        cg_exec = tex_engine._roi_codegen_exec("pm11_roi_cg")
+        roi_out_cg = run_roi(interp, prog, clone_bindings({"A": img}), tm, "cpu", 0, outs, None,
+                             "fp32", roi_window, {"A"}, 0, time_context=None, viewer_context=vc,
+                             exec_fn=cg_exec, record_trace=False)
+        md_cg = (ref_crop - roi_out_cg["OUT"]).abs().max().item()
+        assert md_cg < 1e-5, f"run_roi (codegen exec_fn) lost viewer_context (maxdiff {md_cg:.3e})"
+        r.ok(f"run_roi carries viewer_exposure=2.0 into the cropped window on both the "
+             f"interpreter exec_fn (maxdiff {md:.1e}) and the codegen exec_fn (maxdiff {md_cg:.1e})")
+    except Exception as e:
+        r.fail("PM-11 roi pressure path", f"{type(e).__name__}: {e}")
+
+
+def test_pm11_halo_pressure_path(r: SubTestResult):
+    print("\n--- PM-11-F1: viewer_context reaches tex_memory.run_tiled_halo (ROI-5 grown strips) ---")
+    img = make_img(1, 32, 32, 3, seed=17)
+    code = "@OUT = vec4(gauss_blur(@A.rgb, 1.0) * viewer_exposure(), 1.0);"
+    prog, tm, outs = compile_program(code, {"A": img})
+    vc = {"viewer_exposure": 1.7}
+    try:
+        interp = Interpreter()
+        whole = interp.execute(prog, clone_bindings({"A": img}), tm, device="cpu",
+                               output_names=outs, precision="fp32", viewer_context=vc)
+        halo_out = run_tiled_halo(interp, prog, clone_bindings({"A": img}), tm, "cpu", 0,
+                                  outs, None, "fp32", 4, {"A"}, 4, time_context=None,
+                                  viewer_context=vc)
+        md = (whole["OUT"] - halo_out["OUT"]).abs().max().item()
+        assert md < 1e-4, f"run_tiled_halo lost viewer_context under grown-strip tiling (maxdiff {md:.3e})"
+        r.ok(f"run_tiled_halo(n=4, halo=4) with viewer_exposure=1.7 matches the whole-frame "
+             f"cook exactly (maxdiff {md:.1e})")
+    except Exception as e:
+        r.fail("PM-11 halo pressure path", f"{type(e).__name__}: {e}")
+
+
+def test_pm11_oom_rung_path(r: SubTestResult):
+    print("\n--- PM-11-F1: viewer_context reaches tex_engine._oom_retry's tiled rung ---")
+    if not torch.cuda.is_available():
+        r.ok("no CUDA on this box — _oom_retry's rung 2 requires str(ctx.device).startswith"
+             "('cuda') and cannot be exercised; skipped honestly rather than faked on CPU")
+        return
+    try:
+        img = make_img(1, 128, 128, 3, seed=19)
+        code = "@OUT = vec4(@A.rgb * viewer_exposure(), 1.0);"
+        vc = {"viewer_exposure": 2.3}
+        plan = tex_engine.prepare(code, {"A": img.clone()}, device_mode="cuda",
+                                  viewer_context=vc)
+        ctx = plan.ctx
+        assert str(ctx.device).startswith("cuda"), f"prepare() did not resolve cuda: {ctx.device}"
+        whole = Interpreter().execute(
+            ctx.program, clone_bindings(ctx.bindings), ctx.type_map, device=ctx.device,
+            output_names=ctx.output_names, precision=ctx.eff_precision, viewer_context=vc)
+        fake = RuntimeError("CUDA out of memory (forced by PM-11-F1's regression test)")
+        recovered = tex_engine._oom_retry(ctx, fake, fake)
+        assert recovered is not None, "_oom_retry declined to recover a tile-safe CUDA program"
+        md = (whole["OUT"] - recovered["OUT"]).abs().max().item()
+        assert md < 1e-4, f"the OOM ladder's tiled retry lost viewer_context (maxdiff {md:.3e})"
+        r.ok(f"tex_engine._oom_retry's tiled rung carries viewer_exposure=2.3 through "
+             f"(maxdiff vs the unpressured cook {md:.1e})")
+    except Exception as e:
+        r.fail("PM-11 OOM rung path", f"{type(e).__name__}: {e}")

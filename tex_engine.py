@@ -534,11 +534,12 @@ def _roi_codegen_exec(fp):
     `cancel`/`on_progress` are accepted and dropped (the compiled tiers have no yield points —
     a cancel is honoured between region cooks, not inside one)."""
     def _exec(program, bindings, type_map, *, device, latent_channel_count, output_names,
-              used_builtins, precision, roi, time_context, cancel=None, on_progress=None):
+              used_builtins, precision, roi, time_context, cancel=None, on_progress=None,
+              viewer_context=None):
         return _codegen_only_execute(
             program, bindings, type_map, device, latent_channel_count, output_names,
             used_builtins=used_builtins, precision=precision, fingerprint=fp,
-            time_context=time_context, roi=roi)
+            time_context=time_context, viewer_context=viewer_context, roi=roi)
     return _exec
 
 
@@ -573,7 +574,8 @@ def _run_default(ctx: ExecContext):
                            ctx.used_builtins, ctx.eff_precision, ctx.roi,
                            ctx.roi_plan.narrow, ctx.roi_plan.halo, ctx.time_context,
                            cancel=ctx.cancel, on_progress=ctx.on_progress,
-                           exec_fn=(_roi_codegen_exec(ctx.fp) if _roi_codegen_enabled() else None))
+                           exec_fn=(_roi_codegen_exec(ctx.fp) if _roi_codegen_enabled() else None),
+                           viewer_context=ctx.viewer_context)
         except CookCancelled:
             raise                       # SCHED-3: a cancel aborts — never fall back to whole-frame
         except Exception as _roi_exc:
@@ -611,7 +613,8 @@ def _run_default(ctx: ExecContext):
             return run_tiled(interp, ctx.program, ctx.bindings, ctx.type_map, ctx.device,
                              ctx.latent_channel_count, ctx.output_names, ctx.used_builtins,
                              ctx.eff_precision, n_strips, ctx.time_context,
-                             cancel=ctx.cancel, on_progress=ctx.on_progress)
+                             cancel=ctx.cancel, on_progress=ctx.on_progress,
+                             viewer_context=ctx.viewer_context)
         except CookCancelled:
             raise                       # SCHED-3: a cancel aborts — never fall back to untiled
         except Exception as _tile_exc:
@@ -632,7 +635,8 @@ def _run_default(ctx: ExecContext):
                 return run_tiled_halo(interp, ctx.program, ctx.bindings, ctx.type_map, ctx.device,
                                       ctx.latent_channel_count, ctx.output_names, ctx.used_builtins,
                                       ctx.eff_precision, n_h, narrow_names, halo, ctx.time_context,
-                                      cancel=ctx.cancel, on_progress=ctx.on_progress)
+                                      cancel=ctx.cancel, on_progress=ctx.on_progress,
+                                      viewer_context=ctx.viewer_context)
             except CookCancelled:
                 raise                   # SCHED-3: a cancel aborts — never fall back to untiled
             except Exception as _halo_exc:
@@ -1181,7 +1185,8 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
             return run_tiled(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
                              ctx.device, ctx.latent_channel_count, ctx.output_names,
                              ctx.used_builtins, ctx.eff_precision, n_strips, ctx.time_context,
-                             cancel=ctx.cancel, on_progress=ctx.on_progress)
+                             cancel=ctx.cancel, on_progress=ctx.on_progress,
+                             viewer_context=ctx.viewer_context)
         # ROI-5: not pixel-local, but a bounded blur/morphology can still HALO-tile out of an OOM.
         rplan = tex_roi.roi_plan(ctx.code, _scalar_params(ctx.bindings), ctx.binding_types)
         if (rplan.executable and rplan.halo > 0 and rplan.narrow
@@ -1193,7 +1198,8 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
                                       ctx.device, ctx.latent_channel_count, ctx.output_names,
                                       ctx.used_builtins, ctx.eff_precision, n_h, rplan.narrow,
                                       rplan.halo, ctx.time_context,
-                                      cancel=ctx.cancel, on_progress=ctx.on_progress)
+                                      cancel=ctx.cancel, on_progress=ctx.on_progress,
+                                      viewer_context=ctx.viewer_context)
         return None
     except CookCancelled:
         raise                       # SCHED-3: a cancel at yield E (or inside the tiled/halo OOM

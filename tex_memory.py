@@ -825,14 +825,18 @@ def _shared_dim_size(bindings, dim: int, min_ndim: int) -> int | None:
 
 def _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
                 output_names, used_builtins, precision, time_context,
-                cancel=None, on_progress=None) -> dict:
+                cancel=None, on_progress=None, viewer_context: dict | None = None) -> dict:
     """The whole-frame (untiled / un-ROI'd / un-strided) cook — the shared fallback body for
     `run_tiled` / `run_roi` / `run_batch_strips`. SCHED-3: forwards the cancel token / progress
-    sink so a whole-frame fallback stays as abortable as the tiled path it replaced."""
+    sink so a whole-frame fallback stays as abortable as the tiled path it replaced.
+
+    `viewer_context` (PM-11) rides beside `time_context` — a VALUE, never part of any key —
+    so every fallback into this shared body stays fingerprint-neutral the same way."""
     return interp.execute(program, bindings, type_map, device=device,
                           latent_channel_count=latent_channel_count,
                           output_names=output_names, used_builtins=used_builtins,
                           precision=precision, time_context=time_context,
+                          viewer_context=viewer_context,
                           cancel=cancel, on_progress=on_progress)
 
 
@@ -846,7 +850,8 @@ def shared_tile_height(bindings) -> int | None:
 
 def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
               output_names, used_builtins, precision, n_strips: int,
-              time_context: dict | None = None, cancel=None, on_progress=None) -> dict:
+              time_context: dict | None = None, cancel=None, on_progress=None,
+              viewer_context: dict | None = None) -> dict:
     """M-4: execute a tile-safe program in `n_strips` horizontal strips, keeping
     peak transient to ~1/n_strips of the full-image cook. Spatial bindings are
     narrowed (zero-copy views); outputs are preallocated once and strips copy_'d
@@ -863,7 +868,7 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
     def _untiled():
         return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
                            output_names, used_builtins, precision, time_context,
-                           cancel, on_progress)
+                           cancel, on_progress, viewer_context=viewer_context)
 
     # M-4 safety: tiling narrows dim 1 (the image HEIGHT for [B,H,W,C] IMAGE /
     # [B,H,W] MASK). Refuse — and cook untiled — when that axis isn't a shared
@@ -896,7 +901,8 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
                              latent_channel_count=latent_channel_count,
                              output_names=output_names, used_builtins=used_builtins,
                              precision=precision, tile=(y0, H_total),
-                             time_context=time_context, cancel=cancel)
+                             time_context=time_context, viewer_context=viewer_context,
+                             cancel=cancel)
         for name, strip_out in res.items():
             if isinstance(strip_out, torch.Tensor) and strip_out.dim() >= 3:
                 buf = outputs.get(name)
@@ -923,7 +929,8 @@ def shared_batch_size(bindings) -> int | None:
 
 def run_batch_strips(interp, program, bindings, type_map, device, latent_channel_count,
                      output_names, used_builtins, precision, n_strips: int,
-                     time_context: dict | None = None, cancel=None, on_progress=None) -> dict:
+                     time_context: dict | None = None, cancel=None, on_progress=None,
+                     viewer_context: dict | None = None) -> dict:
     """ROI-6: cook a PER-FRAME-INDEPENDENT program's batch in `n_strips` frame-strips (narrow
     dim 0), bounding peak transient to ~1/n_strips of the full-batch cook, and stitch — the
     batch-axis twin of `run_tiled`. The caller guarantees `tex_roi.batch_sliceable` (no
@@ -938,7 +945,7 @@ def run_batch_strips(interp, program, bindings, type_map, device, latent_channel
     def _whole():
         return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
                            output_names, used_builtins, precision, time_context,
-                           cancel, on_progress)
+                           cancel, on_progress, viewer_context=viewer_context)
 
     B_total = shared_batch_size(bindings)
     if B_total is None or B_total < 2:
@@ -974,7 +981,8 @@ def run_batch_strips(interp, program, bindings, type_map, device, latent_channel
                              latent_channel_count=latent_channel_count,
                              output_names=output_names, used_builtins=used_builtins,
                              precision=precision, batch_slice=(f0, B_total),
-                             time_context=time_context, cancel=cancel)
+                             time_context=time_context, viewer_context=viewer_context,
+                             cancel=cancel)
         for name, so in res.items():
             if isinstance(so, torch.Tensor) and so.dim() >= 1 and so.shape[0] == (f1 - f0):
                 batched.setdefault(name, []).append((f0, f1, so))
@@ -999,7 +1007,8 @@ def run_batch_strips(interp, program, bindings, type_map, device, latent_channel
 def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
             output_names, used_builtins, precision, roi, narrow_names, halo: int,
             time_context: dict | None = None, cancel=None, on_progress=None,
-            exec_fn=None, record_trace: bool = True) -> dict:
+            exec_fn=None, record_trace: bool = True,
+            viewer_context: dict | None = None) -> dict:
     """ROI-3: cook only the output window `roi=(x0, y0, w, h, W, H)` of a full W×H image
     (the 2-D generalization of `run_tiled`'s strip). The cook region is `ROI ⊕ halo`, clamped
     to the image; `narrow_names` bindings are sliced to it (a zero-copy view, per spatial dim
@@ -1036,7 +1045,7 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
         _mark(None, reason)
         return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
                            output_names, used_builtins, precision, time_context,
-                           cancel, on_progress)
+                           cancel, on_progress, viewer_context=viewer_context)
 
     if latent_channel_count:
         return _whole("roi declined: LATENT narrows the wrong axis")
@@ -1127,7 +1136,7 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
                 latent_channel_count=latent_channel_count,
                 output_names=output_names, used_builtins=used_builtins,
                 precision=precision, roi=(cx0, cy0, cw, ch, W, H),
-                time_context=time_context,
+                time_context=time_context, viewer_context=viewer_context,
                 cancel=cancel, on_progress=on_progress)
     # …and again after. The interpreter honours `cancel` at every top-level statement, but an
     # `exec_fn` need not: the codegen adapter compiles the whole program to one flat function,
@@ -1189,7 +1198,8 @@ def shared_tile_width(bindings) -> int | None:
 def run_tiled_halo(interp, program, bindings, type_map, device, latent_channel_count,
                    output_names, used_builtins, precision, n_strips: int,
                    narrow_names, halo: int, time_context: dict | None = None,
-                   cancel=None, on_progress=None) -> dict:
+                   cancel=None, on_progress=None,
+                   viewer_context: dict | None = None) -> dict:
     """ROI-5: cook a HALO program (a bounded direct-tensor neighbourhood op — blur / erode /
     dilate) in `n_strips` horizontal strips, each grown by `halo` rows so an interior pixel
     reads the SAME neighbours it would in the whole-image cook. This is the seam-exact
@@ -1207,7 +1217,7 @@ def run_tiled_halo(interp, program, bindings, type_map, device, latent_channel_c
     def _untiled():
         return _cook_whole(interp, program, bindings, type_map, device, latent_channel_count,
                            output_names, used_builtins, precision, time_context,
-                           cancel, on_progress)
+                           cancel, on_progress, viewer_context=viewer_context)
 
     if latent_channel_count:
         return _untiled()
@@ -1233,7 +1243,7 @@ def run_tiled_halo(interp, program, bindings, type_map, device, latent_channel_c
                         # These strips assemble a WHOLE frame; they are not the host's window.
                         # Recording them would leave the last strip's rect on the trace and
                         # make `CookResult.cooked_roi` claim a window never requested.
-                        record_trace=False)
+                        record_trace=False, viewer_context=viewer_context)
         for name, so in strip.items():
             if isinstance(so, torch.Tensor) and so.dim() >= 3 and so.shape[1] == (y1 - y0):
                 buf = outputs.get(name)
