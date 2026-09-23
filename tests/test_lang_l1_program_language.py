@@ -15,9 +15,12 @@ the field yet." This file is that acceptance test, one row per clause:
   * the field is already wired to its one anticipated reader, `tex_roi._language_tuple`
     (its `getattr(program, "language", None)` fallback predates this lane), with NO call-site
     edit in `tex_roi.py` — this row is the proof, not an assumption;
-  * codegen emission never reads the field — proven by toggling it and diffing `_tex_src`
-    (the invariant-7 shape: nothing behaves differently because of an added, unread fact) —
-    over every shipped `examples/*.tex` program that this harness can prepare.
+  * codegen emission reads the field ONLY through the LANG-L7 masked-flow gate: toggling it
+    and diffing `_tex_src` over every shipped `examples/*.tex` program this harness can
+    prepare moves emission for exactly the programs that declare `//!tex 0.25` or later (one,
+    since LANG-L7: `per_pixel_control_flow.tex`) and none of the rest — the invariant-7 shape
+    for everything BELOW `MASKED_FLOW_SINCE`, and the intended, gated exception at and above
+    it.
 
 Every row runs on the compiler and the CPU interpreter/codegen alone. No ComfyUI, no CUDA,
 no compiler toolchain, no Windows path, no embedded interpreter, no numpy, no timing.
@@ -139,8 +142,17 @@ def test_l1_language_tuple_reads_the_real_field_with_no_callsite_edit(r: SubTest
 
 
 def test_l1_codegen_emission_is_language_field_invariant(r: SubTestResult):
-    print("\n--- LANG-L1: codegen emission does not depend on Program.language (invariant 7) ---")
-    fails = []
+    print("\n--- LANG-L1: codegen emission moves with Program.language ONLY for a masked "
+          "(>= 0.25) program — invariant 7 below the gate, the intended exception at it ---")
+    # LANG-L7 opened the gate `masked_flow.enabled_for` reads: a program whose OWN declared
+    # language is >= MASKED_FLOW_SINCE now legitimately emits different codegen source when
+    # that field changes (the whole point of the masked emitter). "Emission never reads the
+    # field" was only ever true BELOW the gate; this row now asserts the sharper, still-total
+    # claim: the set of examples whose emission moves is EXACTLY the set that declares
+    # `//!tex 0.25` or later — no more, no fewer — so a future accidental move anywhere else
+    # is still caught.
+    moved = []
+    declared_masked = []
     checked = 0
     skipped = 0
     exdir = os.path.join(_ROOT, "examples")
@@ -161,23 +173,27 @@ def test_l1_codegen_emission_is_language_field_invariant(r: SubTestResult):
             continue  # codegen declines this program (unsupported feature) — nothing to compare
         src_a = fn_a._tex_src
         before = program.language
+        if before is not None and tex_api._ver_tuple(before) >= tex_roi.MASKED_FLOW_SINCE:
+            declared_masked.append(fn)
         try:
-            program.language = "9.9"          # any value: emission must not move
+            program.language = "9.9"          # still >= MASKED_FLOW_SINCE: masked stays masked
             fn_b = try_compile(program, type_map)
             src_b = fn_b._tex_src if fn_b is not None else None
-            program.language = None
+            program.language = None           # unmasks a program that was masked via `before`
             fn_c = try_compile(program, type_map)
             src_c = fn_c._tex_src if fn_c is not None else None
         finally:
             program.language = before
         checked += 1
         if src_b != src_a or src_c != src_a:
-            fails.append(fn)
+            moved.append(fn)
     if checked == 0:
         r.fail("LANG-L1 codegen invariance", "no example compiled through codegen — harness broken")
-    elif fails:
+    elif sorted(moved) != sorted(declared_masked):
         r.fail("LANG-L1 codegen invariance",
-               f"{len(fails)}/{checked} example(s) moved when Program.language changed: {fails[:5]}")
+               f"moved set {sorted(moved)} != examples declaring >= 0.25 {sorted(declared_masked)}")
     else:
-        r.ok(f"codegen emission byte-identical across {checked} example(s) regardless of "
-             f"Program.language ({skipped} skipped: codegen-declined or harness-unpreparable)")
+        r.ok(f"codegen emission byte-identical across {checked - len(moved)}/{checked} "
+             f"example(s) regardless of Program.language; moves ONLY for the "
+             f"{len(declared_masked)} declaring >= 0.25 masked flow ({sorted(declared_masked)}), "
+             f"exactly as expected ({skipped} skipped: codegen-declined or harness-unpreparable)")

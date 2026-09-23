@@ -453,32 +453,35 @@ def test_tool_schema_rejects(r: SubTestResult):
 # any CR or LF inside a string value, so the only CRLFs in the file are the ones the handle
 # wrote between lines, and every other byte (key order, indentation, separators, UTF-8
 # content, the trailing newline or its absence) is still pinned exactly.
-# re-pinned at language 0.24 (DATA-6 L-E); a bump moves these on purpose — regenerate, then re-pin
+# re-pinned at language 0.25 (LANG-L7); a bump moves these on purpose — regenerate, then re-pin.
+# Only `to_dict`/`written_bytes` moved from the 0.24 pins — `tool_summary` did not, for all
+# five, because tex_tool.tool_summary()'s view never carries `tex_language`; diffing to_dict()
+# at 0.24 vs 0.25 for all five shows exactly one key differs, `tex_language` itself.
 _MANIFEST_BASELINE_SHA256 = {
     "blur.textool": {
-        "to_dict": "8e0d9ab97e747a7453bfd4eb767b819b1c63c75e5a10aea85916326ae896b762",
+        "to_dict": "7c946799a4bf0197c610c727592f626f608c1d4827ba54053a3de28b5ad46a43",
         "tool_summary": "37497076f938e2b7086c86f5f807d4658a8388594fbf06bd18bf8c999c22ca1b",
-        "written_bytes": "8b61aa6dfb59805e54532b8c01350acb5353fa0e6d6a01d3b0fa84b1e81cc31f",
+        "written_bytes": "c14697592467e3a94b693a011f9f83e08497787066e83dd790677242580eb14e",
     },
     "grade.textool": {
-        "to_dict": "b1118c66c6a6620f9815aa534296ccb00e4e4efd84cccbe9d3a07337db97d88e",
+        "to_dict": "b6173b82178cbfe3511db2116ef610d70c58d536056b7c5a011cdcc1b8e61fae",
         "tool_summary": "040db66ad91572cfe1d2557a02f7260fb0a45af714864fbb9599a45987573802",
-        "written_bytes": "133a8eb81a06be1f732bf8583f960462651fab222fd880834858e276158d58a9",
+        "written_bytes": "907f5b61db96eb721f7013cb84e0b294d105cb32686d3db0c8ab116191e09250",
     },
     "grade_vignette.textool": {
-        "to_dict": "e92c3bf6289b558304d01a48480768abf12c84c09a861590f894cb7ec3da7d89",
+        "to_dict": "d8cb5e27567cf60931abf193d09a2a4428330f92ebfaabd8e1ef5a0cfa0ee212",
         "tool_summary": "783d1a2d1afa0cca7ac2937c4ded691beff331174ce95b155327e72616c3dc5e",
-        "written_bytes": "01f0b2882046b379260ce4d7c3cce9358ed8860ca214871a3bc14793c597eeb1",
+        "written_bytes": "98243488e8aed7e6a316924016000ad4d0571e6ad1afa41c56f1b794595d7fa6",
     },
     "merge.textool": {
-        "to_dict": "9a18df84938c51873e66e50e4080b5d706326265c4460060ba8d5a1c107fd6b9",
+        "to_dict": "e27d3e9814e9351cbd87570c7570b192a4ac5f6a1bf88bf75e90e3b694a68d63",
         "tool_summary": "f7e68d2ca334ac03e60d46b3f7096c562f7dfc2ded7f9a369219b1b1d5b261b0",
-        "written_bytes": "45d455caf6cfa3971dc010a9dab8c6c5b38770f535afcbdec2a8dd7200309ec8",
+        "written_bytes": "1d2e105e888b8e55323b3b4226d770855a5a9957d403bc4e18c83c7dcedaf905",
     },
     "vignette.textool": {
-        "to_dict": "c1f3933c0798673081a59fc4c34c5955465ee4278d5dad40500a0c34c80ab2f7",
+        "to_dict": "c3b4b3a6e70803562c40c321492d7fb649c9f79e32318d193f7e40a1016f18dd",
         "tool_summary": "11f9fb5e822646fd0e37d6352b2e7ffe4f871e9d300318864b26ea9694bab3f7",
-        "written_bytes": "07b90bb1444a158ce5af800951539c924f13433efb749b502fa7f6bb32a80468",
+        "written_bytes": "df431161670d2a938c015bc3004c8a8e067a30e772451d4bcdef3fcabd623bfd",
     },
 }
 # Two representative pre-existing manifest shapes (single-stage / fused) -- neither uses any
