@@ -65,6 +65,19 @@ def _to_text(src) -> str:
         return f.read()
 
 
+def _decode_guarded(fn, text: str, kind: str):
+    """Call `fn(text)`, converting a bare `ValueError`/`IndexError` into a `LutError`
+    tagged `kind` (`"cube"`/`"spi1d"`) — `read_cube`/`read_spi1d`'s identical try/except,
+    factored once. A `LutError` `fn` already raised passes through unchanged (it already
+    carries the right out-of-scope message)."""
+    try:
+        return fn(text)
+    except LutError:
+        raise
+    except (ValueError, IndexError) as e:
+        raise LutError(f"malformed .{kind} file: {e}") from e
+
+
 def read_cube(src) -> CubeLut:
     """Decode a `.cube` file (path str, or its raw bytes/text already read — mirroring
     `read_exr`'s `src` contract) into a `CubeLut`.
@@ -73,13 +86,7 @@ def read_cube(src) -> CubeLut:
     a `LUT_1D_SIZE` table, a non-default `DOMAIN_MIN`/`DOMAIN_MAX`, a malformed size, or a
     body whose row count doesn't match `size**3`.
     """
-    text = _to_text(src)
-    try:
-        return _decode_cube(text)
-    except LutError:
-        raise
-    except (ValueError, IndexError) as e:
-        raise LutError(f"malformed .cube file: {e}") from e
+    return _decode_guarded(_decode_cube, _to_text(src), "cube")
 
 
 def _decode_cube(text: str) -> CubeLut:
@@ -136,13 +143,7 @@ def read_spi1d(src) -> Spi1D:
     Raises `LutError` for a missing `Version`/`Length`/`{ }` data block, a `Components` other
     than 1 or 3, or a row count that doesn't match the declared `Length`.
     """
-    text = _to_text(src)
-    try:
-        return _decode_spi1d(text)
-    except LutError:
-        raise
-    except (ValueError, IndexError) as e:
-        raise LutError(f"malformed .spi1d file: {e}") from e
+    return _decode_guarded(_decode_spi1d, _to_text(src), "spi1d")
 
 
 def _decode_spi1d(text: str) -> Spi1D:
