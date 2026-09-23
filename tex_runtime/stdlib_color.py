@@ -16,6 +16,7 @@ from .stdlib_core import (
     LUMA_R,
     LUMA_G,
     LUMA_B,
+    _grid_sample_f32,
     _to_tensor,
 )
 # ZERO_GUARD_EPS is bound by attribute lookup, not folded into the `from` import above: a
@@ -282,11 +283,16 @@ class _StdlibColor:
         # (x,y,z) address (W,H,D) respectively, so W<-r, H<-g, D<-b — which is exactly
         # rgb3's own (r,g,b) channel order, so the grid below needs no channel reorder.
         vol = L.permute(3, 0, 1, 2).unsqueeze(0)
-        if vol.dtype != torch.float32:
-            vol = vol.to(torch.float32)
         orig_shape = rgb3.shape
         grid = rgb3.reshape(1, 1, 1, -1, 3).to(torch.float32) * 2.0 - 1.0
-        out = torch.nn.functional.grid_sample(
+        # M-3 (_grid_sample_f32): the grid is always fp32 (a coordinate use, forced fp32
+        # above regardless of rgb3's own dtype, mirroring invariant #4); if `vol` (the LUT)
+        # is ever not fp32, this samples in fp32 and casts back to vol's own dtype -- the
+        # SAME dtype-reconciliation every other sampling builtin uses, not a hand-rolled
+        # cast. `vol` is fp32 today (tex_io.lut's loader), so this is presently a no-op
+        # fast path; the final in_dtype cast below is COLOR-1's own choice (match rgb's
+        # dtype, not the LUT's), a separate concern M-3 doesn't own.
+        out = _grid_sample_f32(
             vol, grid, mode='bilinear', padding_mode='border', align_corners=True,
         )                                              # [1, 3, 1, 1, P]
         out = out.reshape(3, -1).permute(1, 0).reshape(orig_shape)
