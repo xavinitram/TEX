@@ -416,6 +416,30 @@ def _interp_fallback(ctx: ExecContext, *, reset_dynamo: bool, pass_precision: bo
                           device=ctx.device, **kw)
 
 
+def _record_codegen_defect_fallback(tier: str, exc: Exception) -> None:
+    """TRK-141: a bare `_CgBreak`/`_CgContinue` (codegen's internal control-flow
+    signal, meant to be consumed by the loop emitter that raises it) escaping all
+    the way out to a tier strategy's own `except Exception` is a CODEGEN DEFECT,
+    not an ordinary compile decline — every other reason this catch fires (a
+    missing backend, an unsupported construct, a genuine runtime error in the
+    generated code) is a legitimate reason to fall back quietly. Before this fix
+    the fallback was recorded nowhere: `tier_trace.record` is never called on this
+    path, so `tier_trace.last()` still read the PRIOR cook's record (or None,
+    right after `prepare()`'s `tier_trace.reset()`) — indistinguishable from "no
+    fallback happened", and the only log line was a `logger.warning` with the
+    bare `str(exc)`, which is empty for these two classes. This does not touch the
+    warning already logged by the caller for the ordinary case; it only adds an
+    ERROR-level line naming the class and a tier_trace record for THIS class."""
+    from .tex_runtime.codegen import _CgBreak, _CgContinue
+    if not isinstance(exc, (_CgBreak, _CgContinue)):
+        return
+    from .tex_runtime import tier_trace
+    reason = f"codegen defect: {type(exc).__name__} escaped generated code"
+    logger.error("[TEX] %s tier fell back to interpreter on a codegen defect (%s).",
+                 tier, reason)
+    tier_trace.record("interpreter", fallback_from=tier, reason=reason)
+
+
 def select_tier(compile_mode, device, fused_chain: bool, fused_fp_present: bool) -> str:
     """STR-2: PURE tier SELECTION — which acceleration strategy `(mode, device,
     fused)` picks, WITHOUT executing it. The branch ORDER and every guard mirror
@@ -449,6 +473,7 @@ def _run_torch_compile(ctx: ExecContext):
                                 output_names=ctx.output_names, used_builtins=ctx.used_builtins,
                                 time_context=ctx.time_context)
     except Exception as compile_exc:
+        _record_codegen_defect_fallback("torch_compile", compile_exc)
         # Defense in depth: torch_compile must NEVER hard-fail the node.
         logger.warning("[TEX] torch_compile path failed (%s); using interpreter.",
                        compile_exc)
@@ -465,6 +490,7 @@ def _run_auto(ctx: ExecContext):
                         output_names=ctx.output_names, used_builtins=ctx.used_builtins,
                         precision=ctx.eff_precision, time_context=ctx.time_context)
     except Exception as auto_exc:
+        _record_codegen_defect_fallback("auto", auto_exc)
         logger.warning("[TEX] auto tier failed (%s); using interpreter.", auto_exc)
         return _interp_fallback(ctx, reset_dynamo=True, pass_precision=True)
 
@@ -481,6 +507,7 @@ def _run_cuda_graph(ctx: ExecContext):
                           latent_channel_count=ctx.latent_channel_count,
                           output_names=ctx.output_names, used_builtins=ctx.used_builtins)
     except Exception as _g_exc:
+        _record_codegen_defect_fallback("cuda_graph", _g_exc)
         logger.warning("[TEX] cuda_graph path failed (%s); using interpreter.", _g_exc)
         out = None
     if out is None:
