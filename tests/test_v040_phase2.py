@@ -18,6 +18,7 @@ from TEX_Wrangle.tex_runtime.graphed import _capturable
 from TEX_Wrangle.tex_runtime.precision_policy import _has_fp16_hazard
 from TEX_Wrangle.tex_runtime.stdlib_registry import FP16_FRAGILE
 from TEX_Wrangle.tex_memory import run_tiled, run_roi, run_tiled_halo
+from TEX_Wrangle import tex_chain
 
 
 def test_pm11_default_is_identity(r: SubTestResult):
@@ -305,3 +306,50 @@ def test_pm11_oom_rung_path(r: SubTestResult):
              f"(maxdiff vs the unpressured cook {md:.1e})")
     except Exception as e:
         r.fail("PM-11 OOM rung path", f"{type(e).__name__}: {e}")
+
+
+def test_pm11_fused_chain_path(r: SubTestResult):
+    print("\n--- PM-11-F2: viewer_context reaches tex_chain.cook_stage_list (the FUSED chain) ---")
+    # PM-11's own design doc names this the primary use case: a viewer transform expressed
+    # as an ordinary trailing TEX stage, fused with the comp by tex_fusion.compile_fused. A
+    # fused 2-stage chain must read viewer_exposure() exactly as the same two stages cooked
+    # unfused, stage-by-stage, do — on both the interpreter (cook_stage_list's own tier) AND
+    # codegen (proving the fused PROGRAM itself, not just cook_stage_list's plumbing, is
+    # bit-exact — a fused program is an ordinary TEX program the moment compile_fused hands
+    # it back).
+    img = make_img(1, 8, 8, 3, seed=23)
+    stage0 = {"code": "@OUT = @A.rgb * 1.5;", "bindings": {"A": img.clone()}}
+    stage1 = {"code": "@OUT = @X.rgb * viewer_exposure();", "chain_input": "X", "bindings": {}}
+    vc = {"viewer_exposure": 2.2}
+    try:
+        fused = tex_chain.cook_stage_list([stage0, stage1], viewer_context=vc)
+
+        # Unfused, stage-by-stage, through the SAME cook_stage_list (interpreter) tier.
+        s0 = tex_chain.cook_stage_list([stage0], viewer_context=vc)
+        s1_interp = tex_chain.cook_stage_list(
+            [{"code": stage1["code"], "bindings": {"X": s0["OUT"].clone()}}], viewer_context=vc)
+        md_interp = (fused["OUT"] - s1_interp["OUT"]).abs().max().item()
+        assert md_interp < 1e-5, \
+            f"fused chain lost viewer_context vs the unfused interpreter cook (maxdiff {md_interp:.3e})"
+
+        # Unfused, stage-by-stage, second stage through CODEGEN instead — proving the fused
+        # program's own bit-exactness carries the value the same way an unfused one does.
+        prog1, tm1, outs1 = compile_program(stage1["code"], {"X": s0["OUT"].clone()})
+        s1_cg = _codegen_only_execute(prog1, {"X": s0["OUT"].clone()}, tm1, "cpu",
+                                      output_names=outs1, precision="fp32",
+                                      fingerprint="pm11_chain_cg", time_context=None,
+                                      viewer_context=vc)
+        md_cg = (fused["OUT"] - s1_cg["OUT"]).abs().max().item()
+        assert md_cg < 1e-5, \
+            f"fused chain diverges from the unfused CODEGEN cook (maxdiff {md_cg:.3e})"
+
+        # Identity default: no viewer_context anywhere must read viewer_exposure()==1.0.
+        identity = tex_chain.cook_stage_list([stage0, stage1])
+        md_id = (identity["OUT"] - img * 1.5).abs().max().item()
+        assert md_id < 1e-5, f"fused chain with no viewer_context was not a no-op ({md_id:.3e})"
+
+        r.ok(f"a fused 2-stage chain (viewer_exposure=2.2) matches the unfused stage-by-stage "
+             f"cook on both the interpreter (maxdiff {md_interp:.1e}) and codegen "
+             f"(maxdiff {md_cg:.1e}); no viewer_context is a no-op (maxdiff {md_id:.1e})")
+    except Exception as e:
+        r.fail("PM-11 fused chain path", f"{type(e).__name__}: {e}")

@@ -157,12 +157,19 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
 # ── CACHE-6: fusion ↔ caching reconciliation (the cook side) ──────────────────
 
 def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_count=0,
-                    time_context=None, cancel=None, on_progress=None) -> dict:
+                    time_context=None, cancel=None, on_progress=None,
+                    viewer_context: dict | None = None) -> dict:
     """Cook a raw fusion stage list (≥1) and return the interpreter's RAW {output: tensor}. One
     stage cooks as a plain program; ≥2 splice through `compile_fused`. It replicates prepare()'s
     param default-inject + widget-value conversion so a SUB-chain (a CACHE-6 prefix or suffix)
     cooks BIT-IDENTICALLY to those same stages inside the full fused program — the equivalence
-    the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does."""
+    the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does.
+
+    `viewer_context` (PM-11) rides beside `time_context` — a VALUE, never part of any lineage
+    key (contrast `boundary_lineage_key`'s own `time_context=`, which DOES key: a different
+    frame is a different correct result; a different viewer setting is not a different key,
+    by this ask's own ruling), so a fused chain reads a viewer tweak exactly like an unfused
+    one does."""
     # P0-H: the stage-list family is a public engine entry point that never learned about
     # promises — a Promise in a stage's bindings produced a raw TypeError out of the
     # marshalling seam whether or not it had landed. Resolving here (and refusing an unlanded
@@ -211,7 +218,8 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
                           latent_channel_count=latent_channel_count,
                           output_names=sorted(assigned.keys()), used_builtins=used_builtins,
                           precision=("fp32" if latent_channel_count else precision),
-                          time_context=time_context, cancel=cancel, on_progress=on_progress)
+                          time_context=time_context, viewer_context=viewer_context,
+                          cancel=cancel, on_progress=on_progress)
 
 
 def _is_tensor_binding(v) -> bool:
@@ -352,7 +360,7 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
 
 def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32",
                       time_context=None, latent_channel_count=0, upstream=(), cancel=None,
-                      on_progress=None) -> dict:
+                      on_progress=None, viewer_context: dict | None = None) -> dict:
     """CACHE-6: cook a fused chain with a stage-(k-1) boundary TAP + SUFFIX SPLICE. On a cache
     HIT (the hot downstream param didn't touch the prefix) only stages k..N recook, reading the
     cached fp32 boundary; on a MISS the prefix is materialized, cached, and the suffix cooked.
@@ -369,7 +377,8 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     def _full():
         return cook_stage_list(stages, device=device, precision=precision,
                                latent_channel_count=latent_channel_count,
-                               time_context=time_context, cancel=cancel, on_progress=on_progress)
+                               time_context=time_context, cancel=cancel, on_progress=on_progress,
+                               viewer_context=viewer_context)
 
     # `upstream` must key EVERY tensor input of the prefix — the source, and any EXTRA image a
     # prefix stage reads — not just be non-empty (a partial cover could stale-serve when only an
@@ -408,7 +417,8 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     boundary = result_cache.get(key)
     if boundary is None:
         b = cook_stage_list(stages[:k], device=device, precision="fp32",
-                            time_context=time_context, cancel=cancel).get("OUT")
+                            time_context=time_context, cancel=cancel,
+                            viewer_context=viewer_context).get("OUT")
         if b is None:            # a chain always assigns @OUT; if not, cook whole (correct)
             return _full()
         result_cache.put(key, b, canvas={"shape": list(b.shape)})
@@ -423,7 +433,8 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     # this single return.
     out = remap_suffix_taps(
         cook_stage_list(suffix, device=device, precision="fp32", time_context=time_context,
-                        cancel=cancel, on_progress=on_progress), k)
+                        cancel=cancel, on_progress=on_progress,
+                        viewer_context=viewer_context), k)
     if stages[k - 1].get("tap"):
         out.setdefault(f"_tap_s{k - 1}", boundary)   # the boundary IS that stage's output
     return out

@@ -684,7 +684,7 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   when the region genuinely is one, or returns `None` rather than force a mis-wired collapse
   (`tex_fusion.py:1019-1039`); `tex_checkpoint.gate_refusal(...)` is the structured reason — a stable
   code, the offending stage, a human message — that a checkpointed cook ran whole instead of
-  incrementally (`tex_checkpoint.py:487-500`). Neither is a row below; both are `tex_fusion`
+  incrementally (`tex_checkpoint.py:501`). Neither is a row below; both are `tex_fusion`
   internals, Tier 3, by the catch-all's own example. `tex_roi.region_advisory(...)` (CACHE-10,
   arrived after v0.38.0) mirrors `gate_refusal`'s shape for a different question — not whether
   `chain_windows` will serve a region at all, but whether the region it would serve is expected
