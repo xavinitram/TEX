@@ -331,6 +331,7 @@ Bounds below are entry counts, and every store is process-lifetime unless stated
 | `tex_fusion._FUSED_MEMO` | chain key (every stage's source + wiring) | the spliced program |
 | `tex_fusion._FUSED_FP_MEMO` | the same chain key | the fused fingerprint, memoized because `prepare()` now asks for it on every cook; 256 |
 | `interpreter._READS_MEMO` | `id(program)`, re-checked with `is` | the binding names a program reads; holding the program pins the AST alive; 128 |
+| `interpreter._LUT3D_NAMES_MEMO` | `id(program)`, re-checked with `is` (mirrors `_READS_MEMO`) | COLOR-1 (v0.40): binding names used as `apply_lut3d`'s LUT argument, excluded from `_consensus_extent`'s (B,H,W) shape scan; empty for every program that never calls `apply_lut3d`; 128 |
 | `tex_engine._AUTO_DECISION` | fingerprint x resolution bucket x device | the `precision="auto"` fp16/fp32 gate DECISION; cleared at 512 |
 | `compiled._compiled_cache` | fingerprint x device x precision | compiled callable + backend; 16, because each entry can hold 30-60 MB of kernels |
 | `compiled._compile_blacklist` | fingerprint | programs that crashed `torch.compile`; session-scoped on purpose (never persisted); 256 |
