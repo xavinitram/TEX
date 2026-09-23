@@ -260,7 +260,7 @@ class _StdlibColor:
     # dispatch (codegen.py's pre-resolved-local fallback) exactly like every other
     # Color-domain function above, so interp<->codegen stays bit-exact by construction.
 
-    @stdlib("apply_lut3d", sig='apply_lut3d(rgb, lut) \\u2192 vec3', category='Color', footprint='point', doc='Trilinear 3D LUT lookup. `lut` is a bound [N,N,N,3] tensor (tex_io.lut.read_cube).', ex='@OUT = vec4(apply_lut3d(@image.rgb, @lut), 1.0);')
+    @stdlib("apply_lut3d", sig='apply_lut3d(rgb, lut) \\u2192 vec3', category='Color', footprint='point', non_spatial_args=(1,), doc='Trilinear 3D LUT lookup. `lut` is a bound [N,N,N,3] tensor (tex_io.lut.read_cube).', ex='@OUT = vec4(apply_lut3d(@image.rgb, @lut), 1.0);')
     @staticmethod
     def fn_apply_lut3d(rgb, lut) -> torch.Tensor:
         """Trilinear 3D LUT lookup via `grid_sample`'s volumetric (5D) form. `rgb` is

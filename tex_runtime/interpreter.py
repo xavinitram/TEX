@@ -2372,107 +2372,85 @@ _BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", 
 _CACHEABLE_BUILTIN_NAMES = _BUILTIN_NAMES - _TIME_BUILTIN_NAMES
 
 
-def _collect_binding_reads(program: Program) -> frozenset[str]:
-    """Wire-binding (`@A`) names the program mentions anywhere.
+def _collect_binding_reads(program: Program) -> tuple[frozenset[str], frozenset[str]]:
+    """`(reads, non_spatial)` — wire-binding (`@A`) names the program mentions anywhere,
+    and the subset of those names bound at a registered NON-SPATIAL argument position
+    (`stdlib_registry.non_spatial_args_by_name`, e.g. `apply_lut3d`'s LUT argument).
 
-    Over-inclusive on purpose: an assignment TARGET counts as a mention. Narrowing that
-    would buy nothing — the only consumer is `_consensus_extent`, which looks these names
-    up in the INPUT binding dict, and a name that is only ever written is an output, which
-    is not in that dict when the grid is decided.
+    `reads` is over-inclusive on purpose: an assignment TARGET counts as a mention.
+    Narrowing that would buy nothing — the only consumer is `_consensus_extent`, which
+    looks these names up in the INPUT binding dict, and a name that is only ever written
+    is an output, which is not in that dict when the grid is decided.
 
-    Walked with the generic `iter_child_nodes` rather than a hand-written per-class dispatch
-    like `_collect_identifiers`'. That walk is field-driven, so a new ASTNode field is
-    traversed instead of silently escaping — and the speed the hand-written version buys is
-    not needed here, because `_consensus_extent` only calls this when the bindings actually
-    disagree about the frame's size.
+    `non_spatial` exists because a plain bound tensor RESOURCE (COLOR-1 ruling 5 — no new
+    TEXType for it) can be structurally indistinguishable, by shape alone, from an ordinary
+    `[B,H,W,C]` image binding to `_consensus_extent`'s shape scan: without this exclusion,
+    binding one alongside a differently-shaped image lets its own leading dims leak into the
+    cook's (B,H,W) grid via the `max()` consensus rule, corrupting an UNRELATED output's
+    shape — the exact silent-wrong class `_consensus_extent`'s own docstring already exists
+    to close for ordinary images. Detected structurally (the call shape, via the callee's
+    OWN declared `non_spatial_args`), not by binding name, so any name works and any future
+    function gets the same protection by declaring the field, no engine-side edit.
+
+    ONE walk for both answers (folded together so there is one memo, `_READS_MEMO`, and one
+    lookup per cook — see `_binding_reads_cached`). Walked with the generic
+    `iter_child_nodes` rather than a hand-written per-class dispatch like
+    `_collect_identifiers`'. That walk is field-driven, so a new ASTNode field is traversed
+    instead of silently escaping — and the speed the hand-written version buys is not needed
+    here, because `_consensus_extent` only pays for a MISS here when a program is first seen.
     """
-    found: set[str] = set()
+    from .stdlib_registry import non_spatial_args_by_name
+    non_spatial_positions = non_spatial_args_by_name()   # {fn name: (arg idx, ...)}
+    reads: set[str] = set()
+    non_spatial: set[str] = set()
     stack: list[ASTNode] = [program]
     while stack:
         node = stack.pop()
         if type(node) is BindingRef:
             if node.kind == "wire":
-                found.add(node.name)
+                reads.add(node.name)
             continue
+        if type(node) is FunctionCall:
+            positions = non_spatial_positions.get(node.name)
+            if positions:
+                for i in positions:
+                    if i < len(node.args):
+                        arg = node.args[i]
+                        if type(arg) is BindingRef and arg.kind == "wire":
+                            non_spatial.add(arg.name)
         stack.extend(iter_child_nodes(node))
-    return frozenset(found)
+    return frozenset(reads), frozenset(non_spatial)
 
 
 #: Memo for the walk above, mirroring `tex_memory._tile_safe_memo` (whose comment prices the
 #: same shape of walk at ~22 us per CUDA cook — worth memoizing, and this one is worse: no
-#: early exit, every node visited). The read set is a pure function of the AST, so it belongs
-#: per PROGRAM, not per cook. Without this, the axis-disagreement gate keeps the walk off most
-#: cooks but not all: an IMAGE `[4,H,W,3]` batch beside a single `[1,H,W]` MASK disagrees on
-#: batch every cook, and that is an ordinary ComfyUI graph, not a corner.
+#: early exit, every node visited). The read/non-spatial sets are a pure function of the AST,
+#: so they belong per PROGRAM, not per cook. Without this, the axis-disagreement gate keeps
+#: the walk off most cooks but not all: an IMAGE `[4,H,W,3]` batch beside a single `[1,H,W]`
+#: MASK disagrees on batch every cook, and that is an ordinary ComfyUI graph, not a corner.
 #:
 #: Keyed by `id()` because `Program` is a slotted dataclass — no `__dict__` to hang an
 #: attribute on and no `__weakref__` to key a WeakKeyDictionary with. The program itself is
 #: held beside the answer and re-checked with `is`, which is what makes `id()` safe: a
 #: recycled id belongs to a different object and misses. Holding it also pins the AST alive,
 #: bounded here to the same order as `tex_cache`'s own program LRU.
-_READS_MEMO: "OrderedDict[int, tuple[Program, frozenset[str]]]" = OrderedDict()
+_READS_MEMO: "OrderedDict[int, tuple[Program, frozenset[str], frozenset[str]]]" = OrderedDict()
 _READS_MEMO_MAX = 128
 
 
-def _binding_reads_cached(program: Program) -> frozenset[str]:
-    """`_collect_binding_reads`, memoized per program object."""
+def _binding_reads_cached(program: Program) -> tuple[frozenset[str], frozenset[str]]:
+    """`_collect_binding_reads`, memoized per program object — returns `(reads, non_spatial)`."""
     key = id(program)
     hit = _READS_MEMO.get(key)
     if hit is not None and hit[0] is program:
         _READS_MEMO.move_to_end(key)
-        return hit[1]
-    reads = _collect_binding_reads(program)
-    _READS_MEMO[key] = (program, reads)
+        return hit[1], hit[2]
+    reads, non_spatial = _collect_binding_reads(program)
+    _READS_MEMO[key] = (program, reads, non_spatial)
     _READS_MEMO.move_to_end(key)
     while len(_READS_MEMO) > _READS_MEMO_MAX:
         _READS_MEMO.popitem(last=False)
-    return reads
-
-
-def _lut3d_binding_names(program: Program) -> frozenset[str]:
-    """COLOR-1 (v0.40): wire-binding names used as `apply_lut3d`'s SECOND (LUT) argument.
-
-    A LUT is a plain bound tensor (ruling 5 — no new TEXType), commonly shaped
-    `[N,N,N,3]` — structurally indistinguishable from an ordinary `[B,H,W,C]` image
-    binding to `_consensus_extent`'s shape scan below. Without this exclusion, binding
-    a LUT alongside a differently-shaped image lets the LUT's own N leak into the
-    cook's (B,H,W) grid via the `max()` consensus rule, corrupting an UNRELATED
-    output's shape the moment `apply_lut3d` is called — the exact silent-wrong class
-    `_consensus_extent`'s own docstring already exists to close for ordinary images.
-    Detected structurally (the call shape), not by binding name, so any name works."""
-    found: set[str] = set()
-    stack: list[ASTNode] = [program]
-    while stack:
-        node = stack.pop()
-        if (type(node) is FunctionCall and node.name == "apply_lut3d"
-                and len(node.args) == 2):
-            lut_arg = node.args[1]
-            if type(lut_arg) is BindingRef and lut_arg.kind == "wire":
-                found.add(lut_arg.name)
-        stack.extend(iter_child_nodes(node))
-    return frozenset(found)
-
-
-#: Memo for the walk above, mirroring `_READS_MEMO` exactly (same id()-keyed, bounded-LRU
-#: shape) — a program that never calls `apply_lut3d` (every program before v0.40, and most
-#: after) pays one dict `.get()` per cook for an empty frozenset, not a fresh AST walk.
-_LUT3D_NAMES_MEMO: "OrderedDict[int, tuple[Program, frozenset[str]]]" = OrderedDict()
-_LUT3D_NAMES_MEMO_MAX = 128
-
-
-def _lut3d_names_cached(program: Program) -> frozenset[str]:
-    """`_lut3d_binding_names`, memoized per program object (mirrors `_binding_reads_cached`)."""
-    key = id(program)
-    hit = _LUT3D_NAMES_MEMO.get(key)
-    if hit is not None and hit[0] is program:
-        _LUT3D_NAMES_MEMO.move_to_end(key)
-        return hit[1]
-    names = _lut3d_binding_names(program)
-    _LUT3D_NAMES_MEMO[key] = (program, names)
-    _LUT3D_NAMES_MEMO.move_to_end(key)
-    while len(_LUT3D_NAMES_MEMO) > _LUT3D_NAMES_MEMO_MAX:
-        _LUT3D_NAMES_MEMO.popitem(last=False)
-    return names
+    return reads, non_spatial
 
 
 def _consensus_extent(bindings: dict, program: Program,
@@ -2532,15 +2510,16 @@ def _consensus_extent(bindings: dict, program: Program,
     # with an early `break`; the comprehension-plus-`all()` this replaced cost ~1.5-2 us of
     # tuple building for an answer that is three integers.
     #
-    # `lut_names` (COLOR-1, v0.40) is one memoized dict `.get()` — see `_lut3d_names_cached` —
-    # returning an empty frozenset for every program that never calls `apply_lut3d` (every
-    # program before v0.40, and most after), so the default path pays a cheap-and-constant
-    # lookup, never a fresh walk.
-    lut_names = _lut3d_names_cached(program)
+    # `non_spatial` (COLOR-1, v0.40) is one memoized `_READS_MEMO` lookup (the SAME one the
+    # narrowing branch below already pays for `read` — folded into a single walk/memo, see
+    # `_collect_binding_reads`), returning an empty frozenset for every program that never
+    # calls a `non_spatial_args`-declaring function (every program before v0.40, and most
+    # after), so the default path pays one cheap-and-constant lookup, never a fresh walk.
+    read, non_spatial = _binding_reads_cached(program)
     b = h = w = None
     b_split = hw_split = False
     for name, v in bindings.items():
-        if (name == "OUT" or name in lut_names
+        if (name == "OUT" or name in non_spatial
                 or not isinstance(v, torch.Tensor) or v.dim() < 3):
             continue
         shp = v.shape                      # bind once: three `.shape` hits build three Sizes
@@ -2562,10 +2541,9 @@ def _consensus_extent(bindings: dict, program: Program,
     if b is None:
         return None
     if b_split or (hw_split and roi is None):
-        read = _binding_reads_cached(program)
         rb = rh = rw = None
         for name, v in bindings.items():
-            if (name == "OUT" or name not in read or name in lut_names
+            if (name == "OUT" or name not in read or name in non_spatial
                     or not isinstance(v, torch.Tensor) or v.dim() < 3):
                 continue
             shp = v.shape

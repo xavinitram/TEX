@@ -368,16 +368,18 @@ MUTATIONS = [
      '    if roi is not None and sp is not None:\n'
      '        sp = (sp[0], roi[3], roi[2])',
      ("test_v035_hygiene",)),
-    # COLOR-1 (v0.40) re-pointed this anchor: the line grew a third disjunct
-    # (`or name in lut_names`, the apply_lut3d LUT-binding exclusion) between
-    # `name not in read` and the isinstance/dim guard. The mutation still removes only
-    # `or name not in read` — the same "an unread binding re-enters the consensus" bug —
-    # and leaves `or name in lut_names` alone, since that clause is unrelated to this row.
+    # COLOR-1 (v0.40) re-pointed this anchor twice: it first grew a third disjunct
+    # (`or name in lut_names`), then the v0.40 simplify round folded that exclusion's own
+    # walk into the same memo/variable `_binding_reads_cached` already returns, renaming it
+    # `non_spatial` (generic over any `non_spatial_args`-declaring stdlib function, not just
+    # `apply_lut3d`). The mutation still removes only `or name not in read` — the same "an
+    # unread binding re-enters the consensus" bug — and leaves `or name in non_spatial`
+    # alone, since that clause is unrelated to this row.
     ('CF-6: an unread binding is a consensus participant again',
      'tex_runtime/interpreter.py',
-     '            if (name == "OUT" or name not in read or name in lut_names\n'
+     '            if (name == "OUT" or name not in read or name in non_spatial\n'
      '                    or not isinstance(v, torch.Tensor) or v.dim() < 3):',
-     '            if (name == "OUT" or name in lut_names\n'
+     '            if (name == "OUT" or name in non_spatial\n'
      '                    or not isinstance(v, torch.Tensor) or v.dim() < 3):',
      ("test_v035_hygiene",)),
     ('CF-6: the interpreter goes back to first-wins', 'tex_runtime/interpreter.py',

@@ -44,6 +44,15 @@ class StdlibEntry:
     # is the help-panel grouping ("Math"). Empty on entries with no help (none, today).
     sig: str = ""
     category: str = ""
+    # COLOR-1 (v0.40 simplify): 0-based positions of arguments that are a non-spatial
+    # RESOURCE (a plain bound tensor read by the function but never a per-pixel driving
+    # wire) rather than an ordinary spatial/image argument — `apply_lut3d`'s LUT
+    # (`non_spatial_args=(1,)`) is the first case. `_consensus_extent`'s (B,H,W) shape
+    # scan and `graphed._spatial_px`'s capture-worthiness estimate both exclude a wire
+    # bound at one of these positions, generically, from `_collect_binding_reads`'s walk
+    # (interpreter.py) — a function need only declare the field, no engine-side edit.
+    # Empty (the default) for every function whose arguments are all ordinary.
+    non_spatial_args: tuple = ()
 
     @property
     def names(self) -> tuple:
@@ -95,12 +104,14 @@ def _valid_footprint(fp) -> bool:
 
 
 def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
-           doc="", ex="", sig="", category=""):
+           doc="", ex="", sig="", category="", non_spatial_args=()):
     """Record one StdlibEntry and return the decorated object UNCHANGED (so an
     inner `@staticmethod` still applies). Pure data attachment — the name is
     explicit; nothing is inferred or discovered. `footprint` (ROI-1) is validated
     here so a malformed descriptor can never reach the registry. `sig`/`category`
-    (LANG-4) carry the help data that used to live only in the JS."""
+    (LANG-4) carry the help data that used to live only in the JS. `non_spatial_args`
+    (COLOR-1) names which 0-based argument positions are a non-spatial resource, not
+    an ordinary image/coordinate argument — see `StdlibEntry.non_spatial_args`."""
     if not _valid_footprint(footprint):
         raise ValueError(
             f"stdlib({name!r}): invalid footprint {footprint!r}. Expected 'point', "
@@ -109,9 +120,19 @@ def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
     def deco(obj):
         fn = obj.__func__ if isinstance(obj, staticmethod) else obj
         REGISTRY.append(StdlibEntry(name, fn, tuple(aliases), spatial, sync,
-                                    footprint, doc, ex, sig, category))
+                                    footprint, doc, ex, sig, category,
+                                    tuple(non_spatial_args)))
         return obj
     return deco
+
+
+def non_spatial_args_by_name() -> dict:
+    """{name: non_spatial_args} for every registered name (aliases expanded) whose
+    `non_spatial_args` is non-empty — the single source `_collect_binding_reads`
+    (interpreter.py) and `graphed._spatial_px` derive their LUT-class exclusion from.
+    Function form (evaluated AFTER `TEXStdlib`'s class body has populated `REGISTRY`),
+    mirroring `spatial_names()`/`non_local_names()` above."""
+    return {n: e.non_spatial_args for e in REGISTRY if e.non_spatial_args for n in e.names}
 
 
 def functions() -> dict:

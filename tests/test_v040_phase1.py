@@ -132,8 +132,9 @@ def test_color1_apply_lut3d(r: SubTestResult):
         r.fail("COLOR-1 apply_lut3d alpha", f"{type(e).__name__}: {e}")
 
     # CF-6 regression: binding a LUT shaped differently from the driving image must NOT
-    # perturb the cook's (B,H,W) grid (the _consensus_extent fix this lane needed —
-    # see interpreter.py's _lut3d_binding_names). Before the fix this raised inside
+    # perturb the cook's (B,H,W) grid (the _consensus_extent fix this lane needed — see
+    # interpreter.py's _collect_binding_reads / apply_lut3d's non_spatial_args=(1,)).
+    # Before the fix this raised inside
     # codegen (a torch.stack shape mismatch) and silently fell back to the interpreter;
     # both tiers are checked here so a regression can't hide behind the fallback again.
     try:

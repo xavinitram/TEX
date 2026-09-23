@@ -37,7 +37,7 @@ from ..tex_compiler.ast_nodes import (
     try_extract_static_range,
     iter_child_nodes as _iter_child_nodes,
 )
-from .interpreter import Interpreter, _collect_identifiers, _lut3d_names_cached
+from .interpreter import Interpreter, _collect_identifiers, _binding_reads_cached
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 
 logger = logging.getLogger("TEX.graphed")
@@ -295,15 +295,17 @@ def _capturable(program: Program, *, _masked_flow: "bool | None" = None) -> tupl
 def _spatial_px(bindings, program=None) -> int:
     """Pixels per frame (H*W) of the program's spatial input, or 0 if none.
 
-    COLOR-1 (v0.40): `program` (optional, but every live caller has one) lets this skip a
-    name bound as `apply_lut3d`'s LUT argument — a `[N,N,N,3]` LUT is dim>=3 like an image,
-    so the FIRST-tensor-found scan below could return the LUT's own small N*N instead of the
-    real frame's H*W purely from dict iteration order, feeding `_graph_capture_worthwhile` a
+    COLOR-1 (v0.40 simplify): `program` (optional, but every live caller has one) lets this
+    skip a name bound at a registered NON-SPATIAL argument position (e.g. `apply_lut3d`'s
+    LUT argument — `interpreter._binding_reads_cached`'s second element, the same source
+    `_consensus_extent` uses). A `[N,N,N,3]` LUT is dim>=3 like an image, so the
+    FIRST-tensor-found scan below could return the LUT's own small N*N instead of the real
+    frame's H*W purely from dict iteration order, feeding `_graph_capture_worthwhile` a
     wrong (tiny) estimate for what may be a huge frame. This is a worthiness-GATE input only
-    — the actual capture buffers still size from `_consensus_extent`, already LUT-safe — so
-    the failure mode was a wrong perf decision, never a wrong pixel; excluded anyway so the
-    gate reads the real frame."""
-    skip = _lut3d_names_cached(program) if program is not None else frozenset()
+    — the actual capture buffers still size from `_consensus_extent`, already safe — so the
+    failure mode was a wrong perf decision, never a wrong pixel; excluded anyway so the gate
+    reads the real frame."""
+    skip = _binding_reads_cached(program)[1] if program is not None else frozenset()
     for name, v in bindings.items():
         if name in skip:
             continue
