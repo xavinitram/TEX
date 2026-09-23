@@ -542,7 +542,7 @@ def test_fuzz_live_codegen_equals_oracle(src):
     try:
         ref, _p = sweep(program, dict(b), _FZ_B, _FZ_H, _FZ_W, names)
     except scalar_oracle.OracleUnsupported as e:
-        pytest.skip(f"oracle does not implement: {e}")
+        pytest.skip(reason=f"oracle does not implement: {e}")
     for n in names:
         diff = (cout[n].float() - ref[n].float()).abs().max().item()
         assert diff <= 1e-5, f"{n}: max |cg - oracle| = {diff}"

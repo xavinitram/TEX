@@ -195,11 +195,11 @@ def _emission_sites():
 #
 # Moving the pin is a two-line edit in ONE direction: drop the code that gained a test from
 # the set, and lower the number to match. The row tells you both numbers when it reds.
-_UNTESTED_PIN = 16
+_UNTESTED_PIN = 14
 _UNTESTED_AT_PIN = frozenset("""
     E1000 E3000
     E3100 E3900
-    E6000 E6001 E6002 E6004 E6005 E6006 E6030 E6040 E6050 E6051 E6060
+    E6000 E6001 E6002 E6004 E6005 E6006 E6030 E6040 E6050
     E9001
 """.split())
 

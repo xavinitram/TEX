@@ -316,7 +316,7 @@ MUTATIONS = [
      '    if frame.dtype == torch.float64:\n        frame = frame.to(torch.float32)',
      '    if False:\n        frame = frame.to(torch.float32)',
      ("test_v0341_audit",)),
-    ('v0.34.1 D: the const-coord grid falls back to (1,1,1) again', 'tex_runtime/stdlib.py',
+    ('v0.34.1 D: the const-coord grid falls back to (1,1,1) again', 'tex_runtime/stdlib_core.py',
      'def _uniform_grid():\n    return getattr(_cook_ctx, "grid", None)',
      'def _uniform_grid():\n    return None',
      ("test_v0341_audit",)),
@@ -443,12 +443,22 @@ MUTATIONS = [
     # Each puts back one way a hint turns into a read, outranks demand, or stops being atomic.
     ('touch: a hint counts as a hit (speculation folded into the read counters)',
      'tex_results.py',
-     '            self.touches += 1',
-     '            self.hits += 1',
+     '            self.touches += 1\n'
+     '            return True',
+     '            self.hits += 1\n'
+     '            return True',
      ("test_v033_cache8",)),
     ('touch: the hint takes the top slot from the most recent demand', 'tex_results.py',
+     '            if key not in self._ram:\n'
+     '                return False\n'
+     '            mru = next(reversed(self._ram))\n'
+     '            if key != mru:\n'
      '                self._ram.move_to_end(key)\n'
      '                self._ram.move_to_end(mru)',
+     '            if key not in self._ram:\n'
+     '                return False\n'
+     '            mru = next(reversed(self._ram))\n'
+     '            if key != mru:\n'
      '                self._ram.move_to_end(key)\n'
      '                pass',
      ("test_v033_cache8",)),

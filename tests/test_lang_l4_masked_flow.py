@@ -762,7 +762,7 @@ def _assert_matches_oracle(src, b, B, H, W):
     try:
         ref, _ = sweep(program, dict(b), B, H, W, names)
     except OracleUnsupported as exc:
-        pytest.skip(f"oracle does not implement: {exc}")
+        pytest.skip(reason=f"oracle does not implement: {exc}")
     out, _ = _cook(PRAGMA + src, b, True)
     for k in names:
         got, want = out[k].float(), ref[k].float()

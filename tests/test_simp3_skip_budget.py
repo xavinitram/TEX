@@ -62,7 +62,14 @@ _SKIP_VOCAB = re.compile(
 #: junction or symlink (to reproduce the root-through-a-link condition at all) — neither
 #: is guaranteed on every CI runner, and the row must report a real skip rather than a
 #: silent pass when either is absent (see `tests/test_simp5_citations.py`).
-_SKIP_BUDGET = 97
+#: Re-pinned from 97 to 101: `census_skips` already counted 100 sites on the unrepaired
+#: tree (a 3-row gap the pin had not caught up to), and repairing arm (a) above — the
+#: return-in-function-in-loop codegen-unsupported arm that used to report its skip through
+#: `r.ok`'s vocabulary — turns it into a genuine 101st site: it was always a skip, just
+#: never counted as one. None of the newly-counted sites has a witness that runs without the
+#: missing capability (an oracle/codegen path for the case in question), so raising the pin
+#: is the honest move rather than inventing one.
+_SKIP_BUDGET = 101
 
 
 def _literal(node) -> str:

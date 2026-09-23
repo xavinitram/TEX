@@ -210,7 +210,7 @@ def test_lang_l2_return_inside_function_in_loop_stays_legal(r: SubTestResult):
         r_img = torch.tensor([0.10, 0.30, 0.70, 0.90]).view(1, 1, 4, 1).repeat(1, 1, 1, 4)
         interp_res, cg_res = run_both(src, {"A": r_img}, B=1, H=1, W=4)
         if cg_res is None:
-            r.ok("return-in-function-in-loop: codegen unsupported, SKIPPED (interp only)")
+            r.skip("return-in-function-in-loop", "codegen unsupported (interp only)")
         else:
             max_diff = (interp_res["OUT"].float() - cg_res["OUT"].float()).abs().max().item()
             assert max_diff < 1e-5, f"tiers disagree: max diff={max_diff}"
