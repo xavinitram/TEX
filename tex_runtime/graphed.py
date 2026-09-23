@@ -37,7 +37,7 @@ from ..tex_compiler.ast_nodes import (
     try_extract_static_range,
     iter_child_nodes as _iter_child_nodes,
 )
-from .interpreter import Interpreter, _collect_identifiers
+from .interpreter import Interpreter, _collect_identifiers, _lut3d_names_cached
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 
 logger = logging.getLogger("TEX.graphed")
@@ -292,9 +292,21 @@ def _capturable(program: Program, *, _masked_flow: "bool | None" = None) -> tupl
     return (True, ops)
 
 
-def _spatial_px(bindings) -> int:
-    """Pixels per frame (H*W) of the program's spatial input, or 0 if none."""
-    for v in bindings.values():
+def _spatial_px(bindings, program=None) -> int:
+    """Pixels per frame (H*W) of the program's spatial input, or 0 if none.
+
+    COLOR-1 (v0.40): `program` (optional, but every live caller has one) lets this skip a
+    name bound as `apply_lut3d`'s LUT argument — a `[N,N,N,3]` LUT is dim>=3 like an image,
+    so the FIRST-tensor-found scan below could return the LUT's own small N*N instead of the
+    real frame's H*W purely from dict iteration order, feeding `_graph_capture_worthwhile` a
+    wrong (tiny) estimate for what may be a huge frame. This is a worthiness-GATE input only
+    — the actual capture buffers still size from `_consensus_extent`, already LUT-safe — so
+    the failure mode was a wrong perf decision, never a wrong pixel; excluded anyway so the
+    gate reads the real frame."""
+    skip = _lut3d_names_cached(program) if program is not None else frozenset()
+    for name, v in bindings.items():
+        if name in skip:
+            continue
         if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
             v = v[0]
         if isinstance(v, torch.Tensor) and v.dim() >= 3:
@@ -575,7 +587,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
     # programs at any resolution; low-kernel programs above ~512²) so cuda_graph
     # is never slower than eager. Each resolution is its own capture key, so this
     # decides per (program, resolution); below-region → fall to the interpreter.
-    if not _graph_capture_worthwhile(est_ops, _spatial_px(bindings)):
+    if not _graph_capture_worthwhile(est_ops, _spatial_px(bindings, program)):
         return None
     if used_builtins is None:
         used_builtins = _collect_identifiers(program)

@@ -11,7 +11,7 @@ Lanes B/D append their own rows to this same phase file as they land.
 import os
 
 from helpers import *
-from failure_harness import run_tier, max_diff, assert_tier_equiv
+from failure_harness import run_tier, max_diff, assert_tier_equiv, compile_program
 from TEX_Wrangle.tex_io import lut as lutio
 
 
@@ -154,6 +154,99 @@ def test_color1_apply_lut3d(r: SubTestResult):
 
     assert_tier_equiv(r, "apply_lut3d", "@OUT = vec4(apply_lut3d(@A.rgb, @LUT), 1.0);",
                       {"A": img, "LUT": lut}, tiers=("codegen",), tol=1e-5)
+
+
+def test_color1_apply_lut3d_pressure_paths(r: SubTestResult):
+    print("\n--- COLOR-1 lane B: apply_lut3d under tiling/batch-strip/graph-worthiness pressure ---")
+    # A LUT whose N (33, a real .cube size) matches NEITHER the image's H/W (2160/3840) nor
+    # its batch (2) — so a shape-collision would be visible immediately, not by luck.
+    from TEX_Wrangle.tex_runtime.interpreter import Interpreter
+    from TEX_Wrangle.tex_memory import run_tiled, run_batch_strips, shared_tile_height, shared_batch_size
+    from TEX_Wrangle.tex_runtime.graphed import _spatial_px
+
+    lut = _identity_lut(33)
+    img = make_img(2, 2160, 3840, 3, seed=1)
+    code = "@OUT = vec4(apply_lut3d(@A.rgb, @LUT), 1.0);"
+    bindings = {"A": img, "LUT": lut}
+    prog, tm, outs = compile_program(code, bindings)
+    interp = Interpreter()
+    baseline = interp.execute(prog, dict(bindings), tm, device="cpu",
+                              output_names=outs, precision="fp32")
+
+    # (1) M-4 tiling (tex_engine._tile_plan's executor, run_tiled): shared_tile_height must
+    # see the 2160 vs 33 disagreement and DECLINE — never silently narrow the LUT's own N as
+    # if it were image rows. Forcing n_strips=4 bypasses the VRAM-pressure gate directly.
+    try:
+        # The LUT's own N (33) disagrees with the image's H (2160): shared_tile_height must
+        # DECLINE (return None) — same "heterogeneous inputs can't be co-tiled" refusal it
+        # already gives two differently-sized images — never silently narrow the LUT's own
+        # axis 1 as if it were image rows.
+        assert shared_tile_height(bindings) is None, \
+            "shared_tile_height saw past the LUT/image height mismatch instead of declining"
+        tiled = run_tiled(interp, prog, dict(bindings), tm, "cpu", 0, outs, None, "fp32", 4)
+        md = (tiled["OUT"] - baseline["OUT"]).abs().max().item()
+        assert md < 1e-6, f"run_tiled diverged from the untiled cook (maxdiff {md:.3e})"
+        assert tiled["OUT"].shape == baseline["OUT"].shape
+        r.ok(f"run_tiled(n=4) with a 33^3 LUT beside a 2160x3840 image declines to tile "
+             f"(shared_tile_height=None) and matches the untiled cook exactly "
+             f"(maxdiff {md:.1e})")
+    except Exception as e:
+        r.fail("COLOR-1 apply_lut3d tiling", f"{type(e).__name__}: {e}")
+
+    # (2) ROI-6 batch-strip executor (dormant — "no engine caller yet" per its own docstring,
+    # but callable directly and worth pinning before it gets one): shared_batch_size must see
+    # B=2 vs the LUT's 33 disagree and decline.
+    try:
+        # Same refusal on the batch axis: the image's B=2 disagrees with the LUT's own
+        # leading dim (33), so shared_batch_size must decline too.
+        assert shared_batch_size(bindings) is None, \
+            "shared_batch_size saw past the LUT/image batch mismatch instead of declining"
+        bstrips = run_batch_strips(interp, prog, dict(bindings), tm, "cpu", 0, outs, None,
+                                   "fp32", 2)
+        md = (bstrips["OUT"] - baseline["OUT"]).abs().max().item()
+        assert md < 1e-6, f"run_batch_strips diverged from the untiled cook (maxdiff {md:.3e})"
+        r.ok(f"run_batch_strips(n=2) declines (shared_batch_size=None) and matches the "
+             f"untiled cook exactly (maxdiff {md:.1e})")
+    except Exception as e:
+        r.fail("COLOR-1 apply_lut3d batch-strip", f"{type(e).__name__}: {e}")
+
+    # (3) roi_plan/stage_halo/batch_sliceable (tex_roi.py) take `code: str` only — no tensor
+    # shapes ever reach them, so a LUT binding cannot perturb them. Confirmed by signature,
+    # not by a runtime probe (there is nothing shape-shaped to probe).
+    import inspect
+    from TEX_Wrangle import tex_roi
+    for fname in ("roi_plan", "stage_halo", "batch_sliceable"):
+        params = list(inspect.signature(getattr(tex_roi, fname)).parameters)
+        assert params[0] == "code", f"{fname}'s first parameter is {params[0]!r}, not 'code'"
+    r.ok("roi_plan/stage_halo/batch_sliceable take source code only — no binding shapes, "
+         "so no LUT-shape exposure is possible there")
+
+    # (4) graph-capture worthiness (graphed._spatial_px): before this lane's fix, dict
+    # ITERATION ORDER decided whether the gate saw the LUT's tiny N*N or the real frame's
+    # H*W — a wrong (order-dependent) PERF decision, never a wrong pixel (the actual capture
+    # buffers size from _consensus_extent, already LUT-safe). Pin both orders now agreeing.
+    try:
+        a_first = _spatial_px({"A": img, "LUT": lut}, prog)
+        lut_first = _spatial_px({"LUT": lut, "A": img}, prog)
+        assert a_first == lut_first == img.shape[1] * img.shape[2], \
+            f"order-dependent: A-first={a_first}, LUT-first={lut_first}, expected {img.shape[1]*img.shape[2]}"
+        r.ok(f"graphed._spatial_px reads the real frame's H*W ({a_first}) regardless of "
+             f"binding dict order")
+    except Exception as e:
+        r.fail("COLOR-1 apply_lut3d graph worthiness", f"{type(e).__name__}: {e}")
+
+    # (5) fingerprint / precision: no runtime probe needed — read, not measured. fingerprint()
+    # keys on `binding_types` (TEXType, e.g. IMAGE-shaped VEC3), never on tensor shape, so a
+    # LUT's size cannot perturb PROGRAM-fingerprint/graph-cache-key reuse (tex_cache.py:387).
+    # No engine site casts a raw tensor BINDING to fp16 wholesale for precision="fp16"/"auto"
+    # (checked: interpreter._PRECISION_DTYPES sets only the INTERNAL compute dtype;
+    # compiled._contiguous_bindings casts only an anomalous INTEGER dim>=3 tensor to fp32,
+    # never float->float16) — fn_apply_lut3d forces its OWN grid_sample compute to fp32
+    # regardless, so a LUT's storage precision is exactly as protected as any other function's
+    # own inputs, by the same mechanism every other Color function already relies on.
+    r.ok("fingerprint keys on binding TYPES not shapes; no engine-wide fp16 binding cast "
+         "exists for apply_lut3d's LUT argument to be caught by (read, not measured — see "
+         "the hand-back's Premises-verified section for the exact lines checked)")
 
 
 def test_color1_lut_io(r: SubTestResult):
