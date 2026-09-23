@@ -530,6 +530,22 @@
           "aliases": []
         },
         {
+          "name": "viewer_exposure",
+          "sig": "viewer_exposure() → float",
+          "desc": "The host viewer's exposure gain for THIS cook (default 1.0 = no-op). Fed by tex_engine.cook(viewer_context={\"viewer_exposure\": ...}); never baked into the compile fingerprint (PM-11).",
+          "example": "@OUT = vec4(@A.rgb * viewer_exposure(), 1.0);",
+          "tags": [],
+          "aliases": []
+        },
+        {
+          "name": "viewer_gamma",
+          "sig": "viewer_gamma() → float",
+          "desc": "The host viewer's gamma for THIS cook (default 1.0 = no-op). Fed by tex_engine.cook(viewer_context={\"viewer_gamma\": ...}); never baked into the compile fingerprint (PM-11).",
+          "example": "@OUT = vec4(pow(@A.rgb, vec3(1.0 / viewer_gamma())), 1.0);",
+          "tags": [],
+          "aliases": []
+        },
+        {
           "name": "premultiply",
           "sig": "premultiply(rgba) → vec4",
           "desc": "Straight → premultiplied alpha (rgb *= a).",
@@ -1403,5 +1419,5 @@
       ]
     }
   ],
-  "function_count": 156
+  "function_count": 158
 }

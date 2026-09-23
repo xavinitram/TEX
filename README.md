@@ -182,7 +182,7 @@ while (val < 100.0) { val = val * 2.0; }
 
 **Vector & Matrix:** `dot` `length` `distance` `normalize` `cross` `reflect` `transpose` `determinant` `inverse`
 
-**Color:** `luma` `hsv2rgb` `rgb2hsv` `srgb_to_linear` `linear_to_srgb` `oklab_from_rgb` `oklab_to_rgb` `rec709_to_linear` `linear_to_rec709` `acescg_to_linear` `linear_to_acescg` `apply_lut3d`
+**Color:** `luma` `hsv2rgb` `rgb2hsv` `srgb_to_linear` `linear_to_srgb` `oklab_from_rgb` `oklab_to_rgb` `rec709_to_linear` `linear_to_rec709` `acescg_to_linear` `linear_to_acescg` `apply_lut3d` `viewer_exposure` `viewer_gamma`
 
 **Compositing & blend:** `over` `under` `atop` `premultiply` `unpremultiply` · `screen` `overlay` `hard_light` `soft_light` `color_dodge` `color_burn` `linear_light` `vivid_light`
 
