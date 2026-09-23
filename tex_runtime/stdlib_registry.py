@@ -258,6 +258,14 @@ FP16_FRAGILE = frozenset({
     # on sight, exactly like the IfElse/TernaryOp/WhileLoop branch in `precision_policy`, and
     # this set is how a fn is declined on sight; neither guard below reads "select".
     "select",
+    # PM-11 (v0.40.1): viewer_exposure/viewer_gamma are host-supplied VALUES bounded by
+    # nothing — the same "frame"/"time" reasoning `precision_policy._BUILTIN_MAG` pins at
+    # `inf`, but that dict only scores IDENTIFIER nodes; these are zero-arg FunctionCalls,
+    # so `_gm`'s call branch would score them from their (empty) args and launder the
+    # hazard the same way `img_width(@K)` would have (see that entry above). Classified
+    # here by hand: any program calling either name declines fp16 unconditionally,
+    # regardless of how the result is combined with image lineage.
+    "viewer_exposure", "viewer_gamma",
 })
 FP16_BOUNDED = frozenset({"sin", "cos", "tanh", "atan"})
 

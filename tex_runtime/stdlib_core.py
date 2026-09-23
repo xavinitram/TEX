@@ -285,24 +285,35 @@ def _provider_read(source, t, mode: str, a, b):
 _cook_ctx = _threading.local()
 
 
-def set_cook_grid(grid, dtype=None):
-    """Publish the cook's `(B,H,W)` grid and working dtype. Returns an opaque token.
+def set_cook_grid(grid, dtype=None, device=None, viewer=None):
+    """Publish the cook's `(B,H,W)` grid, working dtype, device and (PM-11) viewer context.
+    Returns an opaque token.
 
     Pass the token to `restore_cook_ctx` when the cook ends. Two functions rather than one
     that also accepts its own return value: cooks nest (a codegen invocation inside an
     interpreted fallback, a tiled strip loop), so the save/restore pair is real, and a single
     function would have to SNIFF whether its argument is a grid or a saved pair — which is
     guesswork in exactly the place P0-D was already caused by a type test standing in for an
-    intent test."""
-    token = (getattr(_cook_ctx, "grid", None), getattr(_cook_ctx, "dtype", None))
+    intent test.
+
+    `device`/`viewer` ride the SAME seam (both `Interpreter.execute` and codegen's
+    `_invoke_cg` already call this at the one place each tier publishes its cook state) rather
+    than opening a second thread-local: `viewer_exposure`/`viewer_gamma` are the first stdlib
+    builtins with no tensor argument to size a device from, and `viewer` (the host's
+    `{"viewer_exposure": ..., "viewer_gamma": ...}` dict, or None) is the PM-11 VALUE — never
+    part of any key, same discipline as ENG-7's `time_context`."""
+    token = (getattr(_cook_ctx, "grid", None), getattr(_cook_ctx, "dtype", None),
+             getattr(_cook_ctx, "device", None), getattr(_cook_ctx, "viewer", None))
     _cook_ctx.grid = grid
     _cook_ctx.dtype = dtype
+    _cook_ctx.device = device
+    _cook_ctx.viewer = viewer
     return token
 
 
 def restore_cook_ctx(token) -> None:
     """Undo one `set_cook_grid`."""
-    _cook_ctx.grid, _cook_ctx.dtype = token
+    _cook_ctx.grid, _cook_ctx.dtype, _cook_ctx.device, _cook_ctx.viewer = token
 
 
 def _uniform_grid():
@@ -311,6 +322,22 @@ def _uniform_grid():
 
 def _uniform_dtype():
     return getattr(_cook_ctx, "dtype", None)
+
+
+def _cook_device():
+    """PM-11: the cook device published at `set_cook_grid`, or None outside a cook."""
+    return getattr(_cook_ctx, "device", None)
+
+
+def _viewer_value(name: str, default: float) -> float:
+    """PM-11: the host's viewer value for builtin `name` (e.g. "viewer_exposure"), or
+    `default` when no `viewer_context` was supplied — the same no-op-by-absence contract
+    `time_context.get(name, 0.0)` uses for `frame`/`fps`/`time` (invariant #7: a ComfyUI
+    cook that never sets viewer_context sees the identity value, never a KeyError)."""
+    ctx = getattr(_cook_ctx, "viewer", None)
+    if ctx is None:
+        return default
+    return float(ctx.get(name, default))
 
 
 # Pre-allocated grid buffer for sample() — avoids torch.stack allocation per call.

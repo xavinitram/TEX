@@ -370,7 +370,7 @@ def test_cc1_triton_hint(r: SubTestResult):
 
         class _TritonMissing(RuntimeError):
             pass
-        def _boom_fn(program, binds, tm_, device, lcc, onames):
+        def _boom_fn(program, binds, tm_, device, lcc, onames, viewer_context=None):
             raise _TritonMissing("Cannot find a working triton installation")
         orig = C._try_compile
         C._try_compile = lambda *a, **k: (_boom_fn, "inductor")

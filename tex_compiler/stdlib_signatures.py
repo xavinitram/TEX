@@ -154,6 +154,10 @@ FUNCTION_SIGNATURES: dict[str, dict] = {
     # arg 1 (lut) is a bound tensor, not a value being blended (unlike _promote_args's use
     # for e.g. `over`), so passthrough is correct here, not promotion.
     "apply_lut3d":    {"args": (2, 2), "return": _passthrough_type},
+    # PM-11 (v0.40.1): the fused viewer transform's two reserved, zero-arg host VALUES —
+    # never `$param`s (a `$param` would move the compile fingerprint on every slider drag).
+    "viewer_exposure": {"args": (0, 0), "return": _float_type},
+    "viewer_gamma":    {"args": (0, 0), "return": _float_type},
     # SL-1 compositing (Porter-Duff, straight-alpha vec4)
     "premultiply":   {"args": (1, 1), "return": _passthrough_type},
     "unpremultiply": {"args": (1, 1), "return": _passthrough_type},

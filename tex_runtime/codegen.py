@@ -354,7 +354,7 @@ def _stage_wire_scalars(bindings: dict, device: Any, dtype, cg_fn: Any, program:
 
 def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
                device: Any, spatial_shape: tuple | None, dtype=None,
-               program: Any = None) -> None:
+               program: Any = None, viewer_context: dict | None = None) -> None:
     """Invoke a codegen-generated function with the constant argument tail.
 
     Single owner of the positional calling convention — it must match the
@@ -386,11 +386,15 @@ def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
     the AST once, to know which binding names are `@`-bound, so it can mint a raw Python
     wire scalar into the tagged device tensor the interpreter already hands the same
     program. `None` (a caller that predates this ask) skips the staging exactly as before —
-    additive, no existing call site's behaviour moves."""
+    additive, no existing call site's behaviour moves.
+
+    `viewer_context` (PM-11) rides the same publish: it is a VALUE, never part of any
+    cache key, so it is published here exactly like the cook grid rather than threaded
+    into the generated source — a viewer tweak alone can never move `cg_fn`'s own identity."""
     _stage_vec_params(bindings, device, dtype)
     if program is not None:
         _stage_wire_scalars(bindings, device, dtype, cg_fn, program)
-    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype)
+    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device, viewer=viewer_context)
     try:
         cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
               torch, _broadcast_pair, _ensure_spatial, torch.where,

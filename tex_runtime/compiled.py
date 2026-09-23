@@ -499,6 +499,7 @@ def execute_compiled(
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
     time_context: dict | None = None,
+    viewer_context: dict | None = None,
 ) -> torch.Tensor | dict:
     """
     Execute a TEX program with optional torch.compile acceleration.
@@ -535,7 +536,7 @@ def execute_compiled(
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision,
-                              time_context=time_context)
+                              time_context=time_context, viewer_context=viewer_context)
 
     # ── Program analysis gates (only on first compile, not cached reruns).
     # op_count/loop_depth are memoized per fingerprint so routes that never
@@ -556,7 +557,7 @@ def execute_compiled(
             return _plain_execute(program, bindings, type_map, device,
                                   latent_channel_count, output_names,
                                   used_builtins=used_builtins, precision=precision,
-                                  time_context=time_context)
+                                  time_context=time_context, viewer_context=viewer_context)
         # Use codegen WITHOUT torch.compile for deeply nested loops
         # (graph breaks and recompilation make torch.compile slower)
         if loop_depth > _COMPILE_MAX_LOOP_DEPTH:
@@ -565,6 +566,7 @@ def execute_compiled(
                                          used_builtins=used_builtins, precision=precision,
                                          fingerprint=fingerprint,
                                          time_context=time_context,   # ENG-7
+                                         viewer_context=viewer_context,   # PM-11
                                          place_params=True)           # opt-in route
         # Use plain interpreter for programs without spatial tensor context
         # (procedural noise, etc.) — codegen env setup overhead exceeds
@@ -575,7 +577,7 @@ def execute_compiled(
             return _plain_execute(program, bindings, type_map, device,
                                   latent_channel_count, output_names,
                                   used_builtins=used_builtins, precision=precision,
-                                  time_context=time_context)
+                                  time_context=time_context, viewer_context=viewer_context)
 
     # Ensure tensor bindings are contiguous — Inductor's codegen can
     # fail on non-contiguous strides (e.g. BHWC images loaded with
@@ -615,7 +617,7 @@ def execute_compiled(
                         return _plain_execute(program, contiguous_bindings, type_map,
                                               device, latent_channel_count, output_names,
                                               used_builtins=used_builtins, precision=precision,
-                                              time_context=time_context)
+                                              time_context=time_context, viewer_context=viewer_context)
                     _compiled_cache[cache_key] = entry
                     # G: arm post-commit verification for this fresh artifact
                     # (samples collect on the NEXT cooks — the commit cook itself
@@ -636,7 +638,8 @@ def execute_compiled(
                         _compiled_cache.popitem(last=False)
                     compiled_fn, _entry_backend = _compiled_cache[cache_key]
                     return compiled_fn(program, contiguous_bindings, type_map, device,
-                                       latent_channel_count, output_names)
+                                       latent_channel_count, output_names,
+                                       viewer_context=viewer_context)
 
                 compiled_fn, _entry_backend = _compiled_cache[cache_key]
                 _compiled_cache.move_to_end(cache_key)
@@ -656,12 +659,14 @@ def execute_compiled(
                     # path is deferred.
                     out, ms = _timed(
                         lambda: compiled_fn(program, contiguous_bindings, type_map, device,
-                                            latent_channel_count, output_names),
+                                            latent_channel_count, output_names,
+                                            viewer_context=viewer_context),
                         device_type)
                     verify["samples"].append(ms)
                     return out
                 return compiled_fn(program, contiguous_bindings, type_map, device,
-                                   latent_channel_count, output_names)
+                                   latent_channel_count, output_names,
+                                   viewer_context=viewer_context)
         except Exception as e:
             compile_error = e
             return None
@@ -743,7 +748,7 @@ def execute_compiled(
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision,
-                              time_context=time_context)
+                              time_context=time_context, viewer_context=viewer_context)
 
     # G (v0.20): post-commit verification verdict. Once the window is full,
     # time ONE interpreter cook of the same program and demote the compiled
@@ -760,7 +765,7 @@ def execute_compiled(
                 lambda: _plain_execute(program, dict(bindings), type_map, device,
                                        latent_channel_count, output_names,
                                        used_builtins=used_builtins, precision=precision,
-                                       time_context=time_context),
+                                       time_context=time_context, viewer_context=viewer_context),
                 device_type)
             # min(), not median: the first post-commit cooks can include cudagraph
             # recording (reduce-overhead), which would overstate a good artifact.
@@ -952,7 +957,8 @@ def _params_on_device(cg_fn, program, bindings: dict, device: "torch.device") ->
 
 
 def _codegen_with_params_on_device(cg_fn, program, bindings: dict, dev, latent_channel_count,
-                                   used_builtins, precision, roi, stdlib_fns):
+                                   used_builtins, precision, roi, stdlib_fns,
+                                   viewer_context: dict | None = None):
     """An opt-in route's one-time placement decision, taken when a generated function's call
     has just raised on a non-CPU device (see `_codegen_only_execute`).
 
@@ -984,7 +990,8 @@ def _codegen_with_params_on_device(cg_fn, program, bindings: dict, dev, latent_c
     try:
         with torch.inference_mode():
             _invoke_cg(cg_fn, env, retry_bindings, stdlib_fns, dev, sp,
-                       Interpreter._PRECISION_DTYPES.get(precision), program=program)
+                       Interpreter._PRECISION_DTYPES.get(precision), program=program,
+                       viewer_context=viewer_context)
     except Exception:
         cg_fn._tex_params_on_device = False
         return None
@@ -1075,7 +1082,7 @@ def _bg_status(cache_key) -> str:
 
 def _run_cached_compiled(cache_key, program, bindings, type_map, device,
                          latent_channel_count, output_names, device_type,
-                         timed):
+                         timed, viewer_context=None):
     """Run the cached compiled fn on the worker thread (dynamo-TLS isolation is
     load-bearing even for an already-built artifact — a guard failure can retrace
     and corrupt the calling thread's TLS). Returns (result, ms) when *timed*, or
@@ -1087,7 +1094,8 @@ def _run_cached_compiled(cache_key, program, bindings, type_map, device,
         with torch.inference_mode():
             compiled_fn, _b = _compiled_cache[cache_key]
             call = lambda: compiled_fn(program, contiguous, type_map, device,
-                                       latent_channel_count, output_names)
+                                       latent_channel_count, output_names,
+                                       viewer_context=viewer_context)
             return _timed(call, device_type) if timed else (call(), None)
 
     try:
@@ -1106,7 +1114,8 @@ def _run_cached_compiled(cache_key, program, bindings, type_map, device,
 def run_auto(program, bindings, type_map, device, fingerprint,
              latent_channel_count: int = 0, output_names=None,
              used_builtins=None, precision: str = "fp32",
-             time_context: dict | None = None):
+             time_context: dict | None = None,
+             viewer_context: dict | None = None):
     """CC-2 entry: measure the always-safe codegen baseline, background-compile,
     trial the compiled fn, and commit only on a measured win. Never blocks on
     the compile; never routes to a slower tier than codegen-only."""
@@ -1131,6 +1140,7 @@ def run_auto(program, bindings, type_map, device, fingerprint,
                                      used_builtins=used_builtins,
                                      precision=precision, fingerprint=fingerprint,
                                      time_context=time_context,   # ENG-7
+                                     viewer_context=viewer_context,   # PM-11
                                      place_params=True)           # opt-in route
 
     # Terminal: rejected → always-safe codegen; committed → cached compiled.
@@ -1140,7 +1150,8 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         # Terminal — skip timing (no per-cook CUDA sync; the verdict is frozen).
         res, _ = _run_cached_compiled(cache_key, program, bindings, type_map,
                                       device, latent_channel_count,
-                                      output_names, device_type, timed=False)
+                                      output_names, device_type, timed=False,
+                                      viewer_context=viewer_context)
         if res is None:
             autotier.record_trial(key, None)  # demote to rejected
             return _codegen(bindings)
@@ -1154,7 +1165,8 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     if state == autotier.TRIAL and cache_key in _compiled_cache:
         res, ms = _run_cached_compiled(cache_key, program, bindings, type_map,
                                        device, latent_channel_count,
-                                       output_names, device_type, timed=True)
+                                       output_names, device_type, timed=True,
+                                       viewer_context=viewer_context)
         if res is None:
             autotier.record_trial(key, None)
             return _codegen(bindings)
@@ -1201,6 +1213,7 @@ def _plain_execute(
     precision: str = "fp32",
     *,
     time_context: dict | None,
+    viewer_context: dict | None = None,
     roi: tuple[int, int, int, int, int, int] | None = None,
 ) -> torch.Tensor | dict:
     """Execute without torch.compile (standard tree-walking interpreter). Reuses ONE
@@ -1236,6 +1249,7 @@ def _plain_execute(
         program, bindings, type_map, device=device,
         latent_channel_count=latent_channel_count, output_names=output_names,
         precision=precision, used_builtins=used_builtins, time_context=time_context,
+        viewer_context=viewer_context,
         # ROI-3 / v0.30: MUST forward — the bindings may already be narrowed to a cook region,
         # and without the window the interpreter would derive coordinates from the narrowed
         # tensor's own shape (wrong pixels, silently). Same class of forgotten-forward bug as
@@ -1414,6 +1428,7 @@ def _codegen_only_execute(
     fingerprint: str | None = None,
     *,
     time_context: dict | None,
+    viewer_context: dict | None = None,
     roi: tuple[int, int, int, int, int, int] | None = None,
     place_params: bool = False,
 ) -> torch.Tensor | dict:
@@ -1435,6 +1450,12 @@ def _codegen_only_execute(
     `$param` bindings on the device, and a generated function that needed it place them up
     front afterwards (`_codegen_with_params_on_device`). The opt-in routes pass it; the
     default route does not. The interpreter fallback always receives the caller's own bindings.
+
+    `viewer_context` (PM-11) is an ordinary, DEFAULTED kwarg — unlike `time_context` above,
+    a forgotten forward here degrades to the documented no-op identity (1.0/1.0), never a
+    plausible-but-wrong picture, so it carries none of `time_context`'s keyword-only/no-
+    default discipline. Forwarded to `_invoke_cg`, which publishes it for `viewer_exposure`/
+    `viewer_gamma` to read — never baked into `cg_fn`'s own identity.
     """
     cg_fn = _get_or_make_codegen_fn(program, type_map, fingerprint)
 
@@ -1452,7 +1473,7 @@ def _codegen_only_execute(
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision,
-                              time_context=time_context, roi=roi)
+                              time_context=time_context, viewer_context=viewer_context, roi=roi)
 
     dev = _canon_device(device)
     # The placement verdict recorded on this generated function: None until one of its calls
@@ -1474,11 +1495,13 @@ def _codegen_only_execute(
     try:
         with torch.inference_mode():
             _invoke_cg(cg_fn, env, contiguous_bindings, stdlib_fns, dev, sp,
-                       Interpreter._PRECISION_DTYPES.get(precision), program=program)
+                       Interpreter._PRECISION_DTYPES.get(precision), program=program,
+                       viewer_context=viewer_context)
     except Exception as e:
         served = (_codegen_with_params_on_device(cg_fn, program, bindings, dev,
                                                  latent_channel_count, used_builtins,
-                                                 precision, roi, stdlib_fns)
+                                                 precision, roi, stdlib_fns,
+                                                 viewer_context=viewer_context)
                   if placing is None else None)
         if served is None:
             _show_once(
@@ -1490,7 +1513,8 @@ def _codegen_only_execute(
             return _plain_execute(program, bindings, type_map, device,
                                   latent_channel_count, output_names,
                                   used_builtins=used_builtins, precision=precision,
-                                  time_context=time_context, roi=roi)   # ROI-3: see _plain_execute
+                                  time_context=time_context, viewer_context=viewer_context,
+                                  roi=roi)   # ROI-3: see _plain_execute
         contiguous_bindings, ingest_event = served
 
     tier_trace.record("codegen")
@@ -1577,12 +1601,14 @@ def _try_compile(
     # and return the codegen adapter directly — torch.compile overhead exceeds benefit
     if getattr(cg_fn, '_has_fn_calls', False):
         def _codegen_exec_eager(program, bindings, type_map, device,
-                                latent_channel_count=0, output_names=None):
+                                latent_channel_count=0, output_names=None,
+                                viewer_context=None):
             dev = _canon_device(device)
             env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
                                             used_builtins=used_builtins, precision=precision)
             _invoke_cg(cg_fn, env, bindings, stdlib_fns, dev, sp,
-                       Interpreter._PRECISION_DTYPES.get(precision), program=program)
+                       Interpreter._PRECISION_DTYPES.get(precision), program=program,
+                       viewer_context=viewer_context)
             if output_names is not None:
                 return {name: bindings[name] for name in output_names}
             return bindings.get("OUT")
@@ -1620,12 +1646,14 @@ def _try_compile(
         _clone_out = device_type == "cuda"
 
         def _codegen_exec(program, bindings, type_map, device,
-                          latent_channel_count=0, output_names=None):
+                          latent_channel_count=0, output_names=None,
+                          viewer_context=None):
             dev = _canon_device(device)
             env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
                                             used_builtins=used_builtins, precision=precision)
             _invoke_cg(compiled_flat, env, bindings, stdlib_fns, dev, sp,
-                       Interpreter._PRECISION_DTYPES.get(precision), program=program)
+                       Interpreter._PRECISION_DTYPES.get(precision), program=program,
+                       viewer_context=viewer_context)
             if output_names is not None:
                 if _clone_out:
                     return {name: bindings[name].clone()

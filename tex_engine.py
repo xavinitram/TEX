@@ -262,6 +262,10 @@ class ExecContext:
     # TRK-25: the `{name: TEXType}` map this cook compiled against. The source alone cannot
     # say a wire holds a STRING, and a string merged per pixel is voted on over the region.
     binding_types: Any = None
+    # PM-11: the host's viewer values for this cook — {"viewer_exposure": ..., "viewer_gamma":
+    # ...} or None. A VALUE on the same never-keyed channel as `time_context` above: a viewer
+    # tweak must never move `fp` or reopen a compile cache.
+    viewer_context: Any = None
 
 
 @dataclass(frozen=True)
@@ -408,7 +412,7 @@ def _interp_fallback(ctx: ExecContext, *, reset_dynamo: bool, pass_precision: bo
     interp = _get_interpreter()
     kw = dict(source=ctx.code, latent_channel_count=ctx.latent_channel_count,
               output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-              time_context=ctx.time_context,
+              time_context=ctx.time_context, viewer_context=ctx.viewer_context,
               cancel=ctx.cancel, on_progress=ctx.on_progress)  # SCHED-3: token survives the fallback
     if pass_precision:
         kw["precision"] = ctx.eff_precision
@@ -471,7 +475,7 @@ def _run_torch_compile(ctx: ExecContext):
         return execute_compiled(ctx.program, ctx.bindings, ctx.type_map, ctx.device,
                                 _fp, latent_channel_count=ctx.latent_channel_count,
                                 output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                                time_context=ctx.time_context)
+                                time_context=ctx.time_context, viewer_context=ctx.viewer_context)
     except Exception as compile_exc:
         _record_codegen_defect_fallback("torch_compile", compile_exc)
         # Defense in depth: torch_compile must NEVER hard-fail the node.
@@ -488,7 +492,8 @@ def _run_auto(ctx: ExecContext):
         return run_auto(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
                         latent_channel_count=ctx.latent_channel_count,
                         output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                        precision=ctx.eff_precision, time_context=ctx.time_context)
+                        precision=ctx.eff_precision, time_context=ctx.time_context,
+                        viewer_context=ctx.viewer_context)
     except Exception as auto_exc:
         _record_codegen_defect_fallback("auto", auto_exc)
         logger.warning("[TEX] auto tier failed (%s); using interpreter.", auto_exc)
@@ -589,7 +594,7 @@ def _run_default(ctx: ExecContext):
                     latent_channel_count=ctx.latent_channel_count,
                     output_names=ctx.output_names,
                     used_builtins=ctx.used_builtins, fingerprint=ctx.fp,
-                    time_context=ctx.time_context)
+                    time_context=ctx.time_context, viewer_context=ctx.viewer_context)
         except Exception as _stencil_exc:
             logger.warning("[TEX] stencil codegen route failed (%s); using "
                            "interpreter.", _stencil_exc)
@@ -639,6 +644,7 @@ def _run_default(ctx: ExecContext):
                           latent_channel_count=ctx.latent_channel_count,
                           output_names=ctx.output_names, used_builtins=ctx.used_builtins,
                           precision=ctx.eff_precision, time_context=ctx.time_context,
+                          viewer_context=ctx.viewer_context,
                           cancel=ctx.cancel, on_progress=ctx.on_progress)
 
 
@@ -734,6 +740,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             precision: str = "fp32", has_latent_input: bool = False,
             latent_channel_count: int = 0, forgive_dead_refs: bool = False,
             debug_nan_highlight: bool = False, time_context: dict | None = None,
+            viewer_context: dict | None = None,
             max_outputs: int = MAX_OUTPUTS, disown: bool = True,
             roi: tuple | None = None, roi_exec: bool | None = None,
             want_lineage: bool = False, want_noise_tiers: bool = False,
@@ -1084,7 +1091,8 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
                       eff_precision, fp, fused_chain, fused_fp, time_context,
                       free_hint, roi_out, roi_plan_obj,  # ROI-3 window + plan (None unless armed)
                       cancel, on_progress,               # SCHED-3 (None unless a host passed them)
-                      binding_meta, binding_types)       # DATA-1 tags; TRK-25's {name: TEXType} map
+                      binding_meta, binding_types,       # DATA-1 tags; TRK-25's {name: TEXType} map
+                      viewer_context=viewer_context)      # PM-11
     return CookPlan(ctx=ctx, tier_id=tier_id, assigned=assigned_bindings,
                     auto_fp16=auto_fp16, debug_nan_highlight=debug_nan_highlight,
                     cook_px=cook_px, auto_ckey=auto_ckey, disown=disown,

@@ -37,7 +37,8 @@ from ..tex_compiler.ast_nodes import (
     try_extract_static_range,
     iter_child_nodes as _iter_child_nodes,
 )
-from .interpreter import Interpreter, _collect_identifiers, _non_spatial_names_cached
+from .interpreter import (Interpreter, _collect_identifiers, _non_spatial_names_cached,
+                          _VIEWER_BUILTIN_NAMES)
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 
 logger = logging.getLogger("TEX.graphed")
@@ -283,6 +284,12 @@ def _capturable(program: Program, *, _masked_flow: "bool | None" = None) -> tupl
         if cls is FunctionCall and n.name in _SYNC_STDLIB:
             return (False, 0)
         if cls is Identifier and n.name in _TIME_BUILTIN_NAMES:
+            return (False, 0)
+        # PM-11: viewer_exposure()/viewer_gamma() are FunctionCalls, not Identifiers (see
+        # `_VIEWER_BUILTIN_NAMES`'s own docstring) — same bar, same reason: a captured
+        # replay would re-serve whatever value was read at capture time, and this pair is
+        # EXPECTED to change (a dragged slider), unlike every shape/coordinate builtin.
+        if cls is FunctionCall and n.name in _VIEWER_BUILTIN_NAMES:
             return (False, 0)
         if isinstance(n, _OP_TYPES):
             ops += 1

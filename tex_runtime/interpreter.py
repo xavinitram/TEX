@@ -234,6 +234,7 @@ class Interpreter(MaskedFlowMixin):
         roi: tuple[int, int, int, int, int, int] | None = None,
         batch_slice: tuple[int, int] | None = None,
         time_context: dict | None = None,
+        viewer_context: dict | None = None,
         cancel=None,
         on_progress=None,
         _masked_flow: bool | None = None,
@@ -292,6 +293,7 @@ class Interpreter(MaskedFlowMixin):
                                        precision, used_builtins=used_builtins,
                                        tile=tile, roi=roi, batch_slice=batch_slice,
                                        time_context=time_context,
+                                       viewer_context=viewer_context,
                                        cancel=cancel, on_progress=on_progress,
                                        _masked_flow=_masked_flow)
 
@@ -322,6 +324,7 @@ class Interpreter(MaskedFlowMixin):
         roi: tuple[int, int, int, int, int, int] | None = None,
         batch_slice: tuple[int, int] | None = None,
         time_context: dict | None = None,
+        viewer_context: dict | None = None,
         cancel=None,
         on_progress=None,
         _masked_flow: bool | None = None,
@@ -337,6 +340,7 @@ class Interpreter(MaskedFlowMixin):
         self.latent_channel_count = latent_channel_count
         self._dtype = self._PRECISION_DTYPES.get(precision, torch.float32)
         self.time_context = time_context   # ENG-7: host playhead for THIS cook (or None)
+        self.viewer_context = viewer_context   # PM-11: host viewer values for THIS cook (or None)
         # SCHED-3: bind the cook's cancel token + progress callback for THIS execute. Set
         # unconditionally every run (the interpreter is a per-thread REUSED singleton — a
         # token left on self would abort a later, unrelated cook). Pure values, never keyed.
@@ -439,7 +443,8 @@ class Interpreter(MaskedFlowMixin):
         # image argument to size from the way `fetch`/`sample` do. Two attribute writes per
         # cook on a thread-local, restored in the `finally` because a tiled cook calls
         # `execute` once per strip and each strip's grid is its own.
-        _grid_token = _stdlib_mod.set_cook_grid(self.spatial_shape, self._dtype)
+        _grid_token = _stdlib_mod.set_cook_grid(self.spatial_shape, self._dtype,
+                                                device=self.device, viewer=self.viewer_context)
         # LANG-L4: bind the language-0.25 statement handlers for THIS cook, and only when
         # the engine's own gate says so. The DEFAULT path pays one attribute read and one
         # `is None` test: a program with no `//!tex` pragma has `Program.language is None`,
@@ -2354,6 +2359,16 @@ class Interpreter(MaskedFlowMixin):
 # question to ask is "does this re-enter execute(), or reuse anything keyed by the
 # fingerprint?", and then to go and cook one.
 _TIME_BUILTIN_NAMES = frozenset({"frame", "fps", "time"})
+
+# PM-11: the fused viewer transform's two reserved builtins. Unlike `_TIME_BUILTIN_NAMES`
+# these are FunctionCall nodes, not bare Identifiers (see `stdlib_color.fn_viewer_exposure`),
+# so they are never added to `_BUILTIN_NAMES` — that set drives Identifier resolution only.
+# `graphed._capturable` still bars them from CUDA-graph capture for the same reason it bars
+# `_TIME_BUILTIN_NAMES`: a captured replay re-serves whatever value was read at capture time,
+# and unlike frame/time this pair is EXPECTED to change every cook (a dragged slider). Every
+# other tier (interpreter, default codegen, torch_compile, auto) reads them fresh per call
+# through the ordinary `_fns[name]` dispatch, so only the graph tier needs the bar.
+_VIEWER_BUILTIN_NAMES = frozenset({"viewer_exposure", "viewer_gamma"})
 
 # Names that are built-in variables (not user-defined)
 _BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", "fn",
