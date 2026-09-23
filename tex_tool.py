@@ -425,13 +425,34 @@ def _validate_fused_feeds(raw: dict, inputs: list, promoted: list) -> None:
     # tex_fusion's region detector never folds a node with no image input into a region: such a
     # stage would adopt the fused program's extent instead of cooking at its own. A DAG spec can
     # still spell one, so on this branch it is refused here; the terminal always reads a chain.
-    if gs.get("dag") and injections is not None:
-        read = {s for s, _ in injections} | {s for s, _ in targets}
-        for j, st in enumerate(stages):
-            if not st.get("chain_inputs") and j not in read:
-                raise TEXToolError(f"graphspec.stages[{j}] reads no chain, no source and no fed "
-                                   f"input, so it would adopt the fused program's extent instead "
-                                   f"of cooking at its own", code=REFUSE_FUSED_STAGE_UNANCHORED)
+    _check_dag_stages_anchored(gs, stages, injections, targets)
+
+
+def _check_dag_stages_anchored(gs: dict, stages: list, injections, fed_targets) -> None:
+    """TRK-9: refuse a DAG stage that reads no chain, no source injection and no fed input.
+
+    `tex_fusion`'s region detector (`_grow_region`) never folds a node with no image input
+    into a region — rule ③ — so a LIVE ComfyUI graph can never produce this shape. A
+    hand-authored DAG manifest can still spell one (nothing stopped it): standalone, such a
+    stage has no shared grid to size its output by, so its spatial builtins default to 0-dim
+    and it cooks to a bare rank-1 vector instead of `[B,H,W,C]`; spliced into the terminal
+    alongside a real image, that vector hits a plain torch broadcast `RuntimeError` — not a
+    named TEX check. Originally only reachable from `_validate_fused_feeds` (the multi-input
+    `feeds` path), so a single-source manifest (schema-1 `source_stage`/`source_binding`, or
+    `source_injections`, with no OTHER input feeding anything) skipped it entirely — exactly
+    the shape this row's own minimal repro used. `fed_targets` iterates `(stage, binding)`
+    pairs, exactly like `injections` — a dict's keys (`_validate_fused_feeds`'s `targets`) or an
+    empty container (the no-`feeds` path) both work. `injections` is `None` when
+    `_source_injection_points` could not read them, in which case cook raises on that shape
+    anyway and this check stands down rather than guess."""
+    if not gs.get("dag") or injections is None:
+        return
+    read = {s for s, _ in injections} | {s for s, _ in fed_targets}
+    for j, st in enumerate(stages):
+        if not st.get("chain_inputs") and j not in read:
+            raise TEXToolError(f"graphspec.stages[{j}] reads no chain, no source and no fed "
+                               f"input, so it would adopt the fused program's extent instead "
+                               f"of cooking at its own", code=REFUSE_FUSED_STAGE_UNANCHORED)
 
 
 def validate_manifest(raw: dict) -> dict:
@@ -541,6 +562,12 @@ def validate_manifest(raw: dict) -> dict:
             if raw["terminal_image_input"] not in input_names:
                 raise TEXToolError(f"terminal_image_input '{raw['terminal_image_input']}' is not a "
                                    f"declared input")
+            # TRK-9: a DAG spec's OTHER route to this same check — no `feeds`-declared input
+            # exists on this branch (that's what put us here), so `_validate_fused_feeds`
+            # (the only caller of `_check_dag_stages_anchored` before this row) never runs;
+            # a hand-authored single-source DAG manifest with an unanchored stage sailed
+            # through validation uncaught.
+            _check_dag_stages_anchored(gs, stages, _source_injection_points(gs, n_stages), set())
         else:
             _validate_fused_feeds(raw, inputs, promoted)
         gs_tii = raw["graphspec"].get("terminal_image_input")
