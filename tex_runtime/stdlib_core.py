@@ -409,7 +409,18 @@ def _build_sample_grid(u: torch.Tensor, v: torch.Tensor,
     For scalar inputs the grid is expanded to (B, H, W); pass H=1, W=1
     to get a single-point grid (useful for mip sampling).
     Returns a ``[B, H_out, W_out, 2]`` tensor suitable for ``grid_sample``.
-    """
+
+    TRK-6: forced fp32 (invariant 4 — coordinate/spatial math is never
+    `self._dtype`), never inherited from `u`/`v`. `.to(torch.float32)` is a
+    no-op (returns the same tensor) when they already are, so the default
+    fp32 path pays nothing. Under `precision="fp16"` a UV literal/variable
+    takes the cook's own dtype (fp16), and without this the grid this
+    function returns would too — `_grid_sample_f32`'s reconciliation only
+    fires on a dtype MISMATCH between the image buffer and the grid, so a
+    fp16 mip level sampled with a fp16 grid skipped it silently and sampled
+    (and mis-addressed large-H rows on) raw fp16 coordinates."""
+    u = u.to(torch.float32)
+    v = v.to(torch.float32)
     grid_x = u * 2.0 - 1.0
     grid_y = v * 2.0 - 1.0
 
