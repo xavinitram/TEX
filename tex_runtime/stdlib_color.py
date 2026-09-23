@@ -124,29 +124,43 @@ class _StdlibColor:
     # linear-light first. OKLab gives perceptually-uniform gradients/mixes.
     # Each is elementwise and preserves a vec4 alpha unchanged.
 
+    @staticmethod
+    def _split_alpha(c):
+        """(rgb, alpha) for a vec3/vec4 colour tensor: `alpha` is `c[..., 3:4]` when
+        `c` is vec4, else `None`. Every colour function's "vec4 alpha passes through
+        unchanged" is exactly this split plus `_join_alpha`'s re-attach at the end —
+        factored out here because both halves are the SAME slice/cat ops the
+        hand-written form already used, so converting a caller changes no tensor op,
+        only where it's spelled (bit-identical, not merely equivalent)."""
+        if c.dim() >= 1 and c.shape[-1] == 4:
+            return c[..., 0:3], c[..., 3:4]
+        return c, None
+
+    @staticmethod
+    def _join_alpha(rgb, alpha):
+        """Inverse of `_split_alpha`: re-attach `alpha` (`torch.cat`) if present,
+        else return `rgb` unchanged."""
+        return torch.cat([rgb, alpha], dim=-1) if alpha is not None else rgb
+
     @stdlib("srgb_to_linear", sig='srgb_to_linear(c) \\u2192 vec', category='Color', doc='Gamma-encoded sRGB → linear-light. Blur/blend in linear to avoid halos.', ex='vec3 lin = srgb_to_linear(@image.rgb);')
     @staticmethod
     def fn_srgb_to_linear(color) -> torch.Tensor:
         """sRGB EOTF: gamma-encoded sRGB -> linear-light (piecewise). vec4 alpha
         passes through. Compose before blur/blend, then linear_to_srgb after."""
-        c = _to_tensor(color)
-        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
-        rgb = c[..., 0:3] if has_alpha else c
+        rgb, alpha = TEXStdlib._split_alpha(_to_tensor(color))
         lin = torch.where(rgb <= 0.04045, rgb / 12.92,
                           ((rgb + 0.055) / 1.055).clamp(min=0.0) ** 2.4)
-        return torch.cat([lin, c[..., 3:4]], dim=-1) if has_alpha else lin
+        return TEXStdlib._join_alpha(lin, alpha)
 
     @stdlib("linear_to_srgb", sig='linear_to_srgb(c) \\u2192 vec', category='Color', doc='Linear-light → gamma-encoded sRGB (inverse of srgb_to_linear).', ex='@OUT = vec4(linear_to_srgb(lin), 1.0);')
     @staticmethod
     def fn_linear_to_srgb(color) -> torch.Tensor:
         """sRGB OETF: linear-light -> gamma-encoded sRGB (inverse of
         srgb_to_linear). vec4 alpha passes through."""
-        c = _to_tensor(color)
-        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
-        rgb = c[..., 0:3] if has_alpha else c
+        rgb, alpha = TEXStdlib._split_alpha(_to_tensor(color))
         srgb = torch.where(rgb <= 0.0031308, rgb * 12.92,
                            1.055 * rgb.clamp(min=0.0) ** (1.0 / 2.4) - 0.055)
-        return torch.cat([srgb, c[..., 3:4]], dim=-1) if has_alpha else srgb
+        return TEXStdlib._join_alpha(srgb, alpha)
 
     @stdlib("oklab_from_rgb", sig='oklab_from_rgb(c) \\u2192 vec3', category='Color', doc='Linear RGB → OKLab. Mix/interpolate in OKLab for perceptually-even gradients.', ex='vec3 lab = oklab_from_rgb(srgb_to_linear(@image.rgb));')
     @staticmethod
@@ -154,8 +168,7 @@ class _StdlibColor:
         """Linear-light RGB -> OKLab (Ottosson). Mix/interpolate in OKLab then
         convert back for perceptually-even gradients. Expects LINEAR RGB — compose
         with srgb_to_linear for gamma-encoded images. vec4 alpha passes through."""
-        c = _to_tensor(color)
-        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        c, alpha = TEXStdlib._split_alpha(_to_tensor(color))
         r, g, b = c[..., 0:1], c[..., 1:2], c[..., 2:3]
         l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
         m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
@@ -167,15 +180,14 @@ class _StdlibColor:
         A = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
         B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
         lab = torch.cat([L, A, B], dim=-1)
-        return torch.cat([lab, c[..., 3:4]], dim=-1) if has_alpha else lab
+        return TEXStdlib._join_alpha(lab, alpha)
 
     @stdlib("oklab_to_rgb", sig='oklab_to_rgb(lab) \\u2192 vec3', category='Color', doc='OKLab → linear RGB (inverse of oklab_from_rgb).', ex='vec3 rgb = oklab_to_rgb(lab);')
     @staticmethod
     def fn_oklab_to_rgb(color) -> torch.Tensor:
         """OKLab -> linear-light RGB (inverse Ottosson). Compose with
         linear_to_srgb for a gamma-encoded result. vec4 alpha passes through."""
-        c = _to_tensor(color)
-        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        c, alpha = TEXStdlib._split_alpha(_to_tensor(color))
         L, A, B = c[..., 0:1], c[..., 1:2], c[..., 2:3]
         l_ = L + 0.3963377774 * A + 0.2158037573 * B
         m_ = L - 0.1055613458 * A - 0.0638541728 * B
@@ -185,7 +197,7 @@ class _StdlibColor:
         g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s
         b = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
         rgb = torch.cat([r, g, b], dim=-1)
-        return torch.cat([rgb, c[..., 3:4]], dim=-1) if has_alpha else rgb
+        return TEXStdlib._join_alpha(rgb, alpha)
 
     # -- Rec.709 transfer + ACEScg<->linear matrix (COLOR-1, v0.40) -----
     # Rec.709 (BT.709) has its own OETF/EOTF — numerically distinct from sRGB's (a
@@ -202,24 +214,20 @@ class _StdlibColor:
     def fn_rec709_to_linear(color) -> torch.Tensor:
         """BT.709 EOTF: gamma-encoded Rec.709 -> linear-light (piecewise; distinct
         constants from sRGB's). vec4 alpha passes through unchanged."""
-        c = _to_tensor(color)
-        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
-        rgb = c[..., 0:3] if has_alpha else c
+        rgb, alpha = TEXStdlib._split_alpha(_to_tensor(color))
         lin = torch.where(rgb < 0.081, rgb / 4.5,
                           ((rgb + 0.099) / 1.099).clamp(min=0.0) ** (1.0 / 0.45))
-        return torch.cat([lin, c[..., 3:4]], dim=-1) if has_alpha else lin
+        return TEXStdlib._join_alpha(lin, alpha)
 
     @stdlib("linear_to_rec709", sig='linear_to_rec709(c) \\u2192 vec', category='Color', doc='Linear-light → gamma-encoded Rec.709 (inverse of rec709_to_linear).', ex='@OUT = vec4(linear_to_rec709(lin), 1.0);')
     @staticmethod
     def fn_linear_to_rec709(color) -> torch.Tensor:
         """BT.709 OETF: linear-light -> gamma-encoded Rec.709 (inverse of
         rec709_to_linear). vec4 alpha passes through unchanged."""
-        c = _to_tensor(color)
-        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
-        rgb = c[..., 0:3] if has_alpha else c
+        rgb, alpha = TEXStdlib._split_alpha(_to_tensor(color))
         gam = torch.where(rgb < 0.018, rgb * 4.5,
                           1.099 * rgb.clamp(min=0.0) ** 0.45 - 0.099)
-        return torch.cat([gam, c[..., 3:4]], dim=-1) if has_alpha else gam
+        return TEXStdlib._join_alpha(gam, alpha)
 
     @stdlib("acescg_to_linear", sig='acescg_to_linear(c) \\u2192 vec3', category='Color', doc='ACEScg (AP1, linear) → linear Rec.709/sRGB (D65) via a fixed 3×3 primary change.', ex='vec3 lin709 = acescg_to_linear(@aces_plate.rgb);')
     @staticmethod
@@ -227,14 +235,13 @@ class _StdlibColor:
         """ACEScg (AP1 primaries, linear) -> linear Rec.709/sRGB (D65). Fixed 3x3
         matrix (ACES 1.0.3-class AP1->Rec.709 D65), inlined as scalar-coefficient
         sums (P3 shape). vec4 alpha passes through unchanged."""
-        c = _to_tensor(color)
-        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        c, alpha = TEXStdlib._split_alpha(_to_tensor(color))
         r, g, b = c[..., 0:1], c[..., 1:2], c[..., 2:3]
         r2 = 1.70505 * r - 0.62179 * g - 0.08316 * b
         g2 = -0.13026 * r + 1.14080 * g - 0.01055 * b
         b2 = -0.02400 * r - 0.12897 * g + 1.15297 * b
         lin = torch.cat([r2, g2, b2], dim=-1)
-        return torch.cat([lin, c[..., 3:4]], dim=-1) if has_alpha else lin
+        return TEXStdlib._join_alpha(lin, alpha)
 
     @stdlib("linear_to_acescg", sig='linear_to_acescg(c) \\u2192 vec3', category='Color', doc='Linear Rec.709/sRGB (D65) → ACEScg (AP1, linear) (inverse of acescg_to_linear).', ex='vec3 acescg = linear_to_acescg(srgb_to_linear(@image.rgb));')
     @staticmethod
@@ -242,14 +249,13 @@ class _StdlibColor:
         """Linear Rec.709/sRGB (D65) -> ACEScg (AP1 primaries, linear) — the EXACT
         matrix inverse of acescg_to_linear's, so the round trip is float-precision
         clean. vec4 alpha passes through unchanged."""
-        c = _to_tensor(color)
-        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
+        c, alpha = TEXStdlib._split_alpha(_to_tensor(color))
         r, g, b = c[..., 0:1], c[..., 1:2], c[..., 2:3]
         r2 = 0.61309721 * r + 0.33951747 * g + 0.04732740 * b
         g2 = 0.07019593 * r + 0.91635827 * g + 0.01344794 * b
         b2 = 0.02061416 * r + 0.10957019 * g + 0.86981469 * b
         acescg = torch.cat([r2, g2, b2], dim=-1)
-        return torch.cat([acescg, c[..., 3:4]], dim=-1) if has_alpha else acescg
+        return TEXStdlib._join_alpha(acescg, alpha)
 
     # -- 3D LUT (COLOR-1, v0.40) -----------------------------------------
     # `lut` is a plain bound tensor (ruling 5 — no new TEXType), the shape
@@ -269,10 +275,8 @@ class _StdlibColor:
         treatment of a value used as a SAMPLING COORDINATE regardless of its origin);
         `lut` is a plain bound [N,N,N,3] tensor, axis order [b_idx,g_idx,r_idx] (see
         tex_io/lut.py). vec4 alpha passes through unchanged."""
-        c = _to_tensor(rgb)
         L = _to_tensor(lut)
-        has_alpha = c.dim() >= 1 and c.shape[-1] == 4
-        rgb3 = c[..., 0:3] if has_alpha else c
+        rgb3, alpha = TEXStdlib._split_alpha(_to_tensor(rgb))
         in_dtype = rgb3.dtype
         # [N(b),N(g),N(r),3] -> [1,3,N(b),N(g),N(r)] (BCDHW). grid_sample's grid axes
         # (x,y,z) address (W,H,D) respectively, so W<-r, H<-g, D<-b — which is exactly
@@ -288,7 +292,7 @@ class _StdlibColor:
         out = out.reshape(3, -1).permute(1, 0).reshape(orig_shape)
         if out.dtype != in_dtype:
             out = out.to(in_dtype)
-        return torch.cat([out, c[..., 3:4]], dim=-1) if has_alpha else out
+        return TEXStdlib._join_alpha(out, alpha)
 
     # -- Compositing (SL-1): Porter-Duff on straight (un-premultiplied) vec4 --
     # ComfyUI IMAGE/MASK are un-premultiplied; over/under/atop take & return
