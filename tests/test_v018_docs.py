@@ -256,6 +256,12 @@ _NOT_A_CACHE = {
     "ast_nodes._CLONE_FIELDS": "reflection over the same closed set (see _CHILD_FIELDS)",
     "stdlib_registry.REGISTRY": "the REG-1 stdlib registry itself -- the declaration of what "
                                 "exists, populated by @stdlib at import",
+    "stdlib_registry._NON_SPATIAL_CACHE": "REG-1c: a single memoized VIEW derived from "
+                                          "REGISTRY (see the row above), not an independent "
+                                          "per-key store -- one whole-registry snapshot, no "
+                                          "cook-time key, rebuilt on demand and invalidated "
+                                          "only by a new @stdlib registration, same relationship "
+                                          "to REGISTRY that a cached len() or sorted() would have",
     # ── Registries and ledgers: they hold keys or references, never a computed value. ──
     "tex_memory._armed_caches": "CACHE-5 governor's registry OF caches (saved profile knobs "
                                 "per armed cache), so that it is not itself one",

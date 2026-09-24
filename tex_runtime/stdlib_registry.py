@@ -122,17 +122,44 @@ def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
         REGISTRY.append(StdlibEntry(name, fn, tuple(aliases), spatial, sync,
                                     footprint, doc, ex, sig, category,
                                     tuple(non_spatial_args)))
+        # REG-1c: a registration changes what `non_spatial_args_by_name()` must answer, so
+        # its cache (below) is invalidated here — the ONLY place `REGISTRY` grows. This
+        # also covers late registration (a decorator running after the first lookup): the
+        # next call rebuilds from the now-longer `REGISTRY` instead of answering from a
+        # stale snapshot.
+        global _NON_SPATIAL_CACHE_READY
+        _NON_SPATIAL_CACHE_READY = False
         return obj
     return deco
+
+
+# REG-1c: built lazily by `non_spatial_args_by_name()` and invalidated by `stdlib()`'s
+# `deco` above on every new registration — the pair keeps this a correct
+# O(1)-after-first-use cache rather than a stale snapshot. A plain dict (not a `None`
+# sentinel) so the cache-store census in `tests/test_v018_docs.py` sees it: see its
+# ARCHITECTURE.md row.
+_NON_SPATIAL_CACHE: dict = {}
+_NON_SPATIAL_CACHE_READY = False
 
 
 def non_spatial_args_by_name() -> dict:
     """{name: non_spatial_args} for every registered name (aliases expanded) whose
     `non_spatial_args` is non-empty — the single source `_collect_binding_reads`
     (interpreter.py) and `graphed._spatial_px` derive their LUT-class exclusion from.
-    Function form (evaluated AFTER `TEXStdlib`'s class body has populated `REGISTRY`),
-    mirroring `spatial_names()`/`non_local_names()` above."""
-    return {n: e.non_spatial_args for e in REGISTRY if e.non_spatial_args for n in e.names}
+
+    REG-1c: cached here (not just at `interpreter._READS_MEMO`, which is keyed per
+    PROGRAM object): a cold compile builds a fresh `Program` every call, so that
+    per-program memo never hits and this whole-registry scan used to re-pay on every
+    single cold compile — the ONE-TIME cost `_collect_binding_reads_and_non_spatial`'s
+    docstring assumed. Rebuilt once per process (or once per new registration, via
+    `stdlib()`'s `deco`) instead."""
+    global _NON_SPATIAL_CACHE_READY
+    if not _NON_SPATIAL_CACHE_READY:
+        _NON_SPATIAL_CACHE.clear()
+        _NON_SPATIAL_CACHE.update(
+            (n, e.non_spatial_args) for e in REGISTRY if e.non_spatial_args for n in e.names)
+        _NON_SPATIAL_CACHE_READY = True
+    return _NON_SPATIAL_CACHE
 
 
 def functions() -> dict:
