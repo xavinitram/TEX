@@ -181,6 +181,19 @@ def test_trk154_the_flip_was_never_a_working_capture(r: SubTestResult):
                                        output_names=outs, precision="fp32")
         finally:
             graphed._masked_flow_syncs = saved
+            # Defensive hardening, not a fix for a proven leak (see the investigation this
+            # commit's message links): a real cudaErrorStreamCaptureInvalidated is exactly
+            # the class of error a later test in the SAME process could be sensitive to if
+            # anything here left the device mid-operation. Investigated directly (see
+            # commit message) and found NOT to leak — run_graphed's own except already
+            # restores is_capturing()/the blacklist correctly, and a probing CUDA op plus a
+            # second, unrelated graph capture+replay both succeed immediately afterward.
+            # Synchronizing here anyway costs nothing and removes any doubt for whichever
+            # test pytest schedules next in this process.
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
         assert out1 is None and out2 is None, (
             "the pre-fix 'capturable' verdict led to a WORKING capture "
             f"(out1={out1!r}, out2={out2!r}) — this fix would wrongly decline it")
