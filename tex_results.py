@@ -214,6 +214,19 @@ def _default_ram_budget() -> int:
     return val
 
 
+#: v0.42 HOSTAUDIT-4b: `put(..., kind=None)` — "the caller did not say" — stays ELIGIBLE for
+#: PREVIEW packing (`tex_packing.choose_storage`'s docstring: "None means the caller did not
+#: say, which stays eligible"). That is the documented default and this flag does not change
+#: it. What it closes is the SILENT half: a caller storing a 1-channel (mask-shaped) tensor at
+#: `quality=PREVIEW` without `kind="MASK"` gets it packed to reduced precision exactly as if it
+#: were colour data, with nothing said. `kind="MASK"` would have REFUSED packing by default
+#: (`choose_storage` declines every non-`COLOR_KINDS` kind unless `mask_eligible=True`), so the
+#: missing kind is the one spelling of this call that silently gets the OPPOSITE of that
+#: default. One warning per process (this is a per-key put on a scrub/video path — a
+#: per-call warning would be a log flood, not a diagnostic).
+_warned_put_kind_none_for_mask_shape = False
+
+
 class ResultCache:
     """CACHE-2: a keyed store of cooked frames — RAM-tier byte-budgeted with a disk-spill
     tail, every entry frozen (ENG-12) and keyed by a CACHE-1 lineage key.
@@ -412,11 +425,30 @@ class ResultCache:
         tune of 4.9e-4 — 8x under the 8-bit display quantum and 125x under the CPU-vs-GPU
         envelope invariant #9 already ships. See tex_packing for the argument and
         `benchmarks/storage_precision_bench.py` for the measurements.
+
+        HOSTAUDIT-4b: `kind=None` on a 1-channel (mask-shaped) tensor stored at
+        `quality=PREVIEW` logs one process-lifetime warning — see the module-level comment
+        above `_warned_put_kind_none_for_mask_shape`. It does not change what gets stored:
+        the packing decision below is identical with or without the warning firing.
         """
         import torch
         if not isinstance(tensor, torch.Tensor):
             return
         from . import tex_packing
+        if (kind is None and quality == tex_packing.PREVIEW and tensor.dim() >= 1
+                and tensor.shape[-1] == 1):
+            global _warned_put_kind_none_for_mask_shape
+            if not _warned_put_kind_none_for_mask_shape:
+                _warned_put_kind_none_for_mask_shape = True
+                import logging
+                logging.getLogger("TEX").warning(
+                    "[TEX] ResultCache.put(%r, ...) stored a 1-channel tensor at "
+                    "quality=PREVIEW with kind=None. A MASK is refused preview packing by "
+                    "default (kind='MASK' without mask_eligible=True) — passing no kind at "
+                    "all instead leaves it ELIGIBLE, so if this is a mask it is about to be "
+                    "packed to reduced precision as if it were colour data. Pass "
+                    "kind='MASK' (and mask_eligible=True if that is what you want) to say "
+                    "so explicitly. This warning fires once per process.", key)
         want = tex_packing.choose_storage(tensor, quality=quality, storage=storage, kind=kind,
                                            mask_eligible=mask_eligible)
         # CF-1: `home=` forwards the caller's statement of where this frame BELONGS. Only
