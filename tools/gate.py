@@ -303,27 +303,47 @@ class Leg:
         self.summary = "not run"
         self.failures: list = []
         self.collected: set = set()
+        #: `{nodeid: assertion text}` for every id in `failures`, from the junit report's own
+        #: `<failure>`/`<error>` element -- so a red is diagnosable from this leg's own printed
+        #: log without a rerun. Two whole-suite reds went undiagnosable before this: the log
+        #: named only the id, and the process that could explain it had already exited.
+        self.failure_text: dict = {}
         self.seconds = 0.0
 
 
 def _parse_junit(path: str) -> tuple:
-    """`(failing ids, every collected id)`, as `tests/<file>.py::<test>`.
+    """`(failing ids, every collected id, {failing id: assertion text})`, as
+    `tests/<file>.py::<test>`.
 
     Exact, from the report pytest writes, not scraped from stdout. The COLLECTED set matters
     as much as the failing one: an allowlist entry is only stale if the leg actually ran the
     test it names, otherwise the cheap tier — which collects five files — would call every
-    entry for a sixth file stale."""
-    failing, seen = [], set()
+    entry for a sixth file stale.
+
+    The TEXT half exists so a red is diagnosable from THIS report alone: two whole-suite reds
+    on the canonical leg went undiagnosable because the log recorded only the node id and the
+    process had already exited by the time anyone looked. `message` is pytest's one-line
+    summary of the assertion; when it is empty (some `error` nodes carry the text only in the
+    body) the last non-blank line of the body is used instead — usually the assertion itself,
+    never the whole traceback."""
+    failing, seen, text = [], set(), {}
     try:
         root = ET.parse(path).getroot()
     except Exception:
-        return failing, seen
+        return failing, seen, text
     for case in root.iter("testcase"):
         nodeid = _nodeid_of(case)
         seen.add(nodeid)
-        if any(case.find(t) is not None for t in ("failure", "error")):
+        node = next((case.find(t) for t in ("failure", "error")
+                    if case.find(t) is not None), None)
+        if node is not None:
             failing.append(nodeid)
-    return sorted(set(failing)), seen
+            msg = (node.get("message") or "").strip()
+            body = (node.text or "").strip()
+            snippet = msg or next((ln.strip() for ln in reversed(body.splitlines())
+                                   if ln.strip()), "")
+            text[nodeid] = snippet[:300]
+    return sorted(set(failing)), seen, text
 
 
 def _nodeid_of(case) -> str:
@@ -364,7 +384,7 @@ def _run(leg: Leg, argv: list, cwd: str, env_extra: dict, scratch: str, verbose:
     leg.seconds = time.time() - t0
     leg.rc = proc.returncode
     leg.summary = _summary_of(proc.stdout)
-    leg.failures, leg.collected = _parse_junit(junit)
+    leg.failures, leg.collected, leg.failure_text = _parse_junit(junit)
     if verbose:
         print(f"\n--- {leg.name}: {' '.join(argv)} (cwd={cwd}) ---")
         print(proc.stdout[-8000:])
@@ -452,6 +472,17 @@ def run_counts(python: str, baseline: str, scratch: str, verbose: bool) -> Leg:
     if leg.rc:
         leg.failures = [ln.strip() for ln in proc.stdout.splitlines()
                         if ln.strip().startswith(("CHANGED", "NEW ROW", "GONE"))]
+        if not leg.failures:
+            # A nonzero rc with no parsed row diff is not a clean pass -- e.g. `compare()`'s
+            # own shape-mismatch REFUSED (TRK-100), which prints neither CHANGED/NEW ROW/GONE.
+            # `judge()` only ever looks at `leg.failures`, never `leg.rc`, so a leg like this
+            # used to fall through to GREEN with nothing to red on. Give it a synthetic id no
+            # allowlist entry can name, so it always lands in `real` instead.
+            infra_id = f"<counts:infra-rc{leg.rc}>"
+            leg.failures = [infra_id]
+            leg.failure_text[infra_id] = (tail[-1] if tail else
+                                          proc.stdout.strip().splitlines()[-1]
+                                          if proc.stdout.strip() else "(no output)")
     if verbose:
         print(f"\n--- counts: {' '.join(argv)} ---\n{proc.stdout[-8000:]}")
     return leg
@@ -498,6 +529,7 @@ def _line(label: str, legs: list, j: dict, head: str) -> str:
 
 
 def _report(label: str, legs: list, j: dict, head: str) -> None:
+    text_by_leg = {leg.name: leg.failure_text for leg in legs}
     for leg in legs:
         print(f"  proves: {leg.name} = {leg.proves}")
     for row in j["excused"]:
@@ -506,7 +538,15 @@ def _report(label: str, legs: list, j: dict, head: str) -> None:
         print(f"  STALE ALLOWLIST ENTRY: {e['id']} — allowed because {e['reason']!r} under "
               f"{e['condition']!r}, but it did not fire. {e['owner']} removes it.")
     for row in j["real"]:
+        # `row` is "<leg name>:<nodeid>" (Leg names carry no ':'; a nodeid's own '::' is past
+        # the first one), so split on the first ':' only. The assertion text travels here so
+        # a red is diagnosable straight from this line, without opening the junit file or
+        # re-running the test to find out what failed.
+        leg_name, _, nodeid = row.partition(":")
+        snippet = text_by_leg.get(leg_name, {}).get(nodeid)
         print(f"  RED: {row}")
+        if snippet:
+            print(f"        {snippet}")
     print(_line(label, legs, j, head))
 
 
