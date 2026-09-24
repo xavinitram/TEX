@@ -387,14 +387,23 @@ class Interpreter(MaskedFlowMixin):
         # codegen's _contiguous_bindings — see tex_marshalling). Imported once per
         # execute (cold path), not per binding.
         from ..tex_marshalling import to_fp32_if_int_image
+        # XPU: cheap inline flag (unchanged from before the RT-b merge) — a pinned CPU
+        # source headed to CUDA rides an async DMA inside the copy below. Tracking it in
+        # this loop, which the cook already pays for, means the shared
+        # `_record_ingest_event` helper's own scan (see the ingest-event sync below) only
+        # runs on the rare cook that actually has something to find, instead of re-walking
+        # every binding on every CUDA cook regardless.
+        async_ingest = False
         for name, value in bindings.items():
             if isinstance(value, str):
                 self.bindings[name] = value  # strings pass through as Python str
             elif isinstance(value, torch.Tensor):
-                # XPU: a pinned CPU source headed to CUDA rides an async DMA inside the
-                # helper below — RT-b's shared `_record_ingest_event` re-scans the original
-                # `bindings` for this AFTER this loop (see the ingest-event sync below), so
-                # nothing is tracked here any more.
+                if (not async_ingest and target_device.type == "cuda"
+                        and value.device.type == "cpu"):
+                    try:
+                        async_ingest = value.is_pinned()
+                    except Exception:
+                        pass
                 # Device move + M5-INT cast fused into one copy (single source
                 # in tex_marshalling); same-device fp inputs pass through untouched.
                 t = to_fp32_if_int_image(value, device=target_device)
@@ -429,10 +438,11 @@ class Interpreter(MaskedFlowMixin):
         # XPU fence: the async pinned→CUDA ingest DMA is stream-ordered ahead of
         # every kernel this cook launched — record its completion point NOW so
         # the pre-return sync waits only for the copy, not the compute. RT-b: the
-        # detection (was tracked inline above) and the record are now both inside the
-        # one shared helper, given the ORIGINAL `bindings` (unmutated by the loop above,
-        # which only ever wrote into `self.bindings`) — same stream, same fence.
-        ingest_event = _record_ingest_event(bindings, target_device)
+        # record is inside the one shared helper, given the ORIGINAL `bindings`
+        # (unmutated by the loop above, which only ever wrote into `self.bindings`) —
+        # same stream, same fence. Gated on `async_ingest` so the helper's scan runs
+        # only when the loop above actually found a candidate, not on every CUDA cook.
+        ingest_event = _record_ingest_event(bindings, target_device) if async_ingest else None
 
         # Execute statements via tree-walking interpreter.
         # SCHED-3: when a host supplied a cancel token or progress sink, check/report per
@@ -2991,13 +3001,16 @@ def _tensor_where(cond: torch.Tensor, then_val: torch.Tensor, else_val: torch.Te
 # `compiled.py`, and an inline hand-rolled equivalent (detect-during-the-binding-loop,
 # record-after-builtins) right here in `_execute_inner`. Moved here (compiled.py already
 # imports names from this module, so this introduces no new import cycle) and both call
-# shapes now call this one function. Mechanical move only: same record-on-H2D detection,
-# same `.synchronize()` fence, same stream — `compiled.py` calls it immediately after its
-# own bindings are made contiguous (unchanged), and `_execute_inner` below calls it once
-# the binding loop has already enqueued every H2D copy (also unchanged) — recording an
-# event any time after those copies are enqueued correctly bounds their completion, since a
-# CUDA stream is FIFO; only recording BEFORE they are all enqueued would be wrong, and
-# neither call site does that.
+# shapes now call this one function. Same record-on-H2D detection, same `.synchronize()`
+# fence, same stream — `compiled.py` calls it immediately after its own bindings are made
+# contiguous (unchanged), and `_execute_inner` calls it once the binding loop has already
+# enqueued every H2D copy (also unchanged) — recording an event any time after those
+# copies are enqueued correctly bounds their completion, since a CUDA stream is FIFO; only
+# recording BEFORE they are all enqueued would be wrong, and neither call site does that.
+# `_execute_inner` keeps its own cheap `async_ingest` flag (the detect half of the old
+# inline code) purely to GATE this call, so a cook with nothing pinned skips this helper's
+# scan instead of re-walking every binding a second time; the helper itself is still the
+# only place that does the detecting+recording, so there is one implementation, not two.
 def _record_ingest_event(orig_bindings, dev) -> "torch.cuda.Event | None":
     """XPU (v0.20): when ingestion issued a non_blocking pinned→CUDA copy, record
     an event AT THE COPY POINT on the stream. The caller synchronizes it before

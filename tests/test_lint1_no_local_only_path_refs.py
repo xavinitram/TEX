@@ -41,15 +41,12 @@ against every tracked line before this landed and matched none.
 import hashlib
 import pathlib
 import re
-import subprocess
 
 from helpers import SubTestResult
+from test_simp3_no_machine_paths import tracked_paths   # same PUSHED-set walk SIMP-3 already
+                                                          # does; no second implementation here.
 
 _PKG = pathlib.Path(__file__).resolve().parent.parent
-
-#: `git ls-files` on this tree lists a few thousand paths; a much larger count means the
-#: command answered about the wrong directory, worth a red rather than a long scan.
-_MAX_TRACKED = 20000
 
 #: Every "word" token, underscore included -- which is what lets an underscore-joined
 #: identifier (the second host's project directory name) tokenise as ONE piece, matching how
@@ -105,18 +102,6 @@ def _fragments():
         ("an upstream hand-over document", _frag("docs/", "upstream")),
         ("a second host's project directory name", _frag("TEX_", "compositor")),
     ]
-
-
-def tracked_paths():
-    """Every tracked path, or `None` when this tree is not a git checkout."""
-    try:
-        out = subprocess.run(["git", "ls-files", "-z"], cwd=str(_PKG), capture_output=True,
-                             text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    return [p for p in out.stdout.split("\0") if p][:_MAX_TRACKED]
 
 
 #: Tracked paths that may carry a fragment anyway, each with the reason it is not a leak.
