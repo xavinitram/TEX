@@ -625,10 +625,19 @@ def _run_default(ctx: ExecContext):
         # BOUNDED-halo op can still tile with a grown strip. Under memory pressure OR the TDR
         # time cap, cook it in halo strips (an 8K gauss_blur that could not tile at all before).
         # `_halo_tile_plan` cheap-gates so a small default cook returns before any real work.
-        halo_plan = _halo_tile_plan(ctx.program, ctx.code, ctx.bindings, ctx.device,
+        #
+        # TRK-83: `n_strips` above is also falsy on a program `is_tile_safe_cached` — the same
+        # memo `_halo_tile_plan` itself would consult FIRST — already answered True on: no
+        # pressure, not a halo case. `_tile_plan` just warmed that exact fingerprint's entry
+        # (it is the first thing it checks), so this is a memo hit, not a second AST walk, and
+        # it skips a call guaranteed to no-op on every unpressured tile-safe stage — the "10
+        # calls/cook" residue named in `docs/host-path-counts.md` §6 item 6 / TRK-83.
+        from .tex_memory import is_tile_safe_cached
+        halo_plan = (None if is_tile_safe_cached(ctx.program, ctx.fp) else
+                    _halo_tile_plan(ctx.program, ctx.code, ctx.bindings, ctx.device,
                                     ctx.latent_channel_count,
                                     2 if ctx.eff_precision == "fp16" else 4, ctx.fp,
-                                    ctx.free_hint, ctx.eff_precision, ctx.binding_types)
+                                    ctx.free_hint, ctx.eff_precision, ctx.binding_types))
         if halo_plan:
             n_h, narrow_names, halo = halo_plan
             try:
