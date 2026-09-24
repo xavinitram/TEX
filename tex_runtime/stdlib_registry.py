@@ -53,6 +53,14 @@ class StdlibEntry:
     # (interpreter.py) — a function need only declare the field, no engine-side edit.
     # Empty (the default) for every function whose arguments are all ordinary.
     non_spatial_args: tuple = ()
+    # PM-11 (simplify): True for a zero-arg builtin whose VALUE comes from a per-cook host
+    # context rather than its (nonexistent) arguments — `viewer_exposure`/`viewer_gamma`
+    # today. `interpreter._reads_and_non_spatial_and_host_context_cached`'s FunctionCall
+    # branch derives "does this program call one" from this field, and
+    # `stdlib_registry.host_context_names()` derives the name SET the same way
+    # `non_spatial_args_by_name()` derives its own — declare the field, no engine-side edit
+    # for the next one of these. Default False for every function that isn't one.
+    reads_host_context: bool = False
 
     @property
     def names(self) -> tuple:
@@ -104,14 +112,17 @@ def _valid_footprint(fp) -> bool:
 
 
 def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
-           doc="", ex="", sig="", category="", non_spatial_args=()):
+           doc="", ex="", sig="", category="", non_spatial_args=(),
+           reads_host_context=False):
     """Record one StdlibEntry and return the decorated object UNCHANGED (so an
     inner `@staticmethod` still applies). Pure data attachment — the name is
     explicit; nothing is inferred or discovered. `footprint` (ROI-1) is validated
     here so a malformed descriptor can never reach the registry. `sig`/`category`
     (LANG-4) carry the help data that used to live only in the JS. `non_spatial_args`
     (COLOR-1) names which 0-based argument positions are a non-spatial resource, not
-    an ordinary image/coordinate argument — see `StdlibEntry.non_spatial_args`."""
+    an ordinary image/coordinate argument — see `StdlibEntry.non_spatial_args`.
+    `reads_host_context` (PM-11) declares a zero-arg builtin fed by a per-cook host
+    VALUE — see `StdlibEntry.reads_host_context`."""
     if not _valid_footprint(footprint):
         raise ValueError(
             f"stdlib({name!r}): invalid footprint {footprint!r}. Expected 'point', "
@@ -121,7 +132,7 @@ def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
         fn = obj.__func__ if isinstance(obj, staticmethod) else obj
         REGISTRY.append(StdlibEntry(name, fn, tuple(aliases), spatial, sync,
                                     footprint, doc, ex, sig, category,
-                                    tuple(non_spatial_args)))
+                                    tuple(non_spatial_args), bool(reads_host_context)))
         return obj
     return deco
 
@@ -152,6 +163,16 @@ def spatial_names() -> frozenset:
     class body has populated `REGISTRY` — TST-3 already proves this derivation equals
     the old literal exactly."""
     return frozenset(n for e in REGISTRY for n in e.names if e.spatial)
+
+
+def host_context_names() -> frozenset:
+    """The registry-derived set of zero-arg, host-context-fed builtin names (PM-11):
+    single source for `interpreter._collect_binding_reads_and_non_spatial`'s FunctionCall
+    branch and `graphed._capturable`'s capture bar, replacing the hand-maintained
+    `_VIEWER_BUILTIN_NAMES` literal the same way `spatial_names()` replaced codegen's.
+    Function form (evaluated AFTER `TEXStdlib`'s class body has populated `REGISTRY`),
+    mirroring `spatial_names()`/`non_local_names()`."""
+    return frozenset(n for e in REGISTRY for n in e.names if e.reads_host_context)
 
 
 def non_local_names() -> frozenset:

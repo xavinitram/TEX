@@ -36,7 +36,7 @@ import torch
 
 from .tex_cache import get_cache
 from .tex_compiler.diagnostics import raw_compile_errors, compile_error_from
-from .tex_runtime.interpreter import Interpreter, _reads_viewer_builtin, _VIEWER_BUILTIN_NAMES
+from .tex_runtime.interpreter import Interpreter, _reads_host_context_cached
 from .tex_runtime.interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
 from .tex_marshalling import (
     convert_param_value as _convert_param_value,
@@ -123,7 +123,7 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
         # no call, so there is no "before" key shape for that one to preserve. A program that
         # never calls viewer_exposure()/viewer_gamma() must key IDENTICALLY to a pre-PM-11
         # build (invariant #7); `lineage_key` itself omits the byte entirely for `None`.
-        vc = ctx.viewer_context if _reads_viewer_builtin(ctx.program) else None
+        vc = ctx.viewer_context if _reads_host_context_cached(ctx.program) else None
         roi_rect = list(ctx.roi) if ctx.roi is not None else None
         # Cook-invariant flags that MOVE PIXELS but are neither bindings nor shape — so they
         # would otherwise fall out of the key and silent-serve a stale frame across a toggle:
@@ -273,14 +273,18 @@ def _stages_read_viewer_builtin(stages) -> bool:
     """PM-11: does any of these RAW stage dicts' source call a viewer builtin?
 
     `boundary_lineage_key` keys a PREFIX (`stages[:k]`) before it is ever compiled — there
-    is no `Program` AST here the way `_reads_viewer_builtin` wants, and re-parsing just to
-    ask would duplicate `prefix_fingerprint`'s own compile a few lines below for no reason
+    is no `Program` AST here the way `_reads_host_context_cached` wants, and re-parsing just
+    to ask would duplicate `prefix_fingerprint`'s own compile a few lines below for no reason
     a substring scan can't answer just as safely. `viewer_exposure`/`viewer_gamma` are
     RESERVED names (E3011), so a plain substring match cannot miss a real call; the only
     way it can be wrong is a false POSITIVE (the name sitting inside a string literal or a
     comment), which over-keys rather than under-keys — the safe direction, same as the
-    name-prefix heuristics elsewhere in this codebase."""
-    return any(name in (st.get("code") or "") for st in stages for name in _VIEWER_BUILTIN_NAMES)
+    name-prefix heuristics elsewhere in this codebase. Names come from the SAME registry
+    `_reads_host_context_cached` derives its set from (`stdlib_registry.host_context_names()`),
+    never a second hand-kept literal."""
+    from .tex_runtime.stdlib_registry import host_context_names
+    return any(name in (st.get("code") or "")
+              for st in stages for name in host_context_names())
 
 
 def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context=None,

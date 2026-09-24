@@ -38,7 +38,7 @@ from ..tex_compiler.ast_nodes import (
     iter_child_nodes as _iter_child_nodes,
 )
 from .interpreter import (Interpreter, _collect_identifiers, _non_spatial_names_cached,
-                          _VIEWER_BUILTIN_NAMES)
+                          _reads_host_context_cached)
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 
 logger = logging.getLogger("TEX.graphed")
@@ -269,7 +269,17 @@ def _capturable(program: Program, *, _masked_flow: "bool | None" = None) -> tupl
     one frame, with no error. Unlike a sync, capture would SUCCEED and be wrong, so this
     is the one blocker that has to be caught statically or not at all. (Feeding them as
     static input buffers copied per replay is the real fix; it needs the capture plumbing
-    to own the buffer, so it waits for a host that has a playhead at all.)"""
+    to own the buffer, so it waits for a host that has a playhead at all.)
+
+    PM-11 (simplify): `viewer_exposure()`/`viewer_gamma()` are the FunctionCall-shaped twin
+    of that same bar — checked up front via `_reads_host_context_cached` (one memoized
+    `_READS_MEMO` lookup, the same registry-derived answer `stdlib_registry.
+    host_context_names()` backs) rather than inline per-node in the walk below: the
+    question is whole-program ("does it call ANY registered host-context builtin
+    anywhere"), not incremental, so asking it once up front is both cheaper on a repeat
+    capture attempt (memo hit) and reads as the single-owner check it is."""
+    if _reads_host_context_cached(program):
+        return (False, 0)
     from .compiled import _OP_TYPES   # lazy: canonical op-type set, avoids import cycle
     from .interpreter import _TIME_BUILTIN_NAMES
     ops = 0
@@ -284,12 +294,6 @@ def _capturable(program: Program, *, _masked_flow: "bool | None" = None) -> tupl
         if cls is FunctionCall and n.name in _SYNC_STDLIB:
             return (False, 0)
         if cls is Identifier and n.name in _TIME_BUILTIN_NAMES:
-            return (False, 0)
-        # PM-11: viewer_exposure()/viewer_gamma() are FunctionCalls, not Identifiers (see
-        # `_VIEWER_BUILTIN_NAMES`'s own docstring) — same bar, same reason: a captured
-        # replay would re-serve whatever value was read at capture time, and this pair is
-        # EXPECTED to change (a dragged slider), unlike every shape/coordinate builtin.
-        if cls is FunctionCall and n.name in _VIEWER_BUILTIN_NAMES:
             return (False, 0)
         if isinstance(n, _OP_TYPES):
             ops += 1

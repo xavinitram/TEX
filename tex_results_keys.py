@@ -127,7 +127,7 @@ def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
                  calls `viewer_exposure()`/`viewer_gamma()` must key IDENTICALLY to a build
                  that predates PM-11 (invariant #7: this ask cannot invalidate every frame any
                  other program ever cached). The caller decides: pass the real dict only when
-                 `interpreter._reads_viewer_builtin(program)` is True, `None` otherwise — never
+                 `interpreter._reads_host_context_cached(program)` is True, `None` otherwise — never
                  pass it unconditionally the way the engine passes `time_context` (every
                  program can read `frame`/`fps`/`time` as bare identifiers with no call, so
                  there was never a "before" key shape to preserve for that one).

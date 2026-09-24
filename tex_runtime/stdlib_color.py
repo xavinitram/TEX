@@ -327,12 +327,14 @@ class _StdlibColor:
     # value and a viewer tweak alone cannot move the compile fingerprint or reopen a
     # `_compiled_cache`/dynamo entry. CUDA-graph capture is the one tier that DOES bake a
     # value into a replay buffer (the class ENG-7's own comment names), so `graphed._capturable`
-    # bars it — same bar, same reason, `_VIEWER_BUILTIN_NAMES` beside `_TIME_BUILTIN_NAMES`.
+    # bars it — same bar, same reason, via the registry's `reads_host_context` field below
+    # (declared once here, derived everywhere: `stdlib_registry.host_context_names()`).
     # `viewer_gamma()`'s own value is a POW exponent once composed downstream and the
     # exposure a multiplicative gain — both host-supplied and bounded by nothing (frame/
     # time's own reasoning), so both are registered in `stdlib_registry.FP16_FRAGILE`.
 
     @stdlib("viewer_exposure", sig='viewer_exposure() \\u2192 float', category='Color', footprint='point',
+            reads_host_context=True,
             doc="The host viewer's exposure gain for THIS cook (default 1.0 = no-op). Fed by "
                 "tex_engine.cook(viewer_context={\"viewer_exposure\": ...}); never baked into "
                 "the compile fingerprint (PM-11).",
@@ -348,6 +350,7 @@ class _StdlibColor:
                                    dtype=dt, device=_cook_device() or "cpu")
 
     @stdlib("viewer_gamma", sig='viewer_gamma() \\u2192 float', category='Color', footprint='point',
+            reads_host_context=True,
             doc="The host viewer's gamma for THIS cook (default 1.0 = no-op). Fed by "
                 "tex_engine.cook(viewer_context={\"viewer_gamma\": ...}); never baked into "
                 "the compile fingerprint (PM-11).",
