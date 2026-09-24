@@ -1226,7 +1226,7 @@ def _is_string_type(t) -> bool:
 
 
 def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp32",
-            compile_mode: str = "auto") -> dict:
+            compile_mode: str = "auto", cancel: "CancelToken | None" = None) -> dict:
     """CACHE-3: warm the compile/codegen tiers for a set of programs so the first scrub after
     a project load / relaunch replays instead of trialling ("first scrub doesn't jank").
 
@@ -1239,14 +1239,30 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
     graph-capturability verdict. CUDA graphs cannot be pre-captured (capture must be on the hot
     path), so their *verdict* is persisted via warm_state and the graph re-captures off the hot
     path on first cook. Loads and re-persists `warm_state.json` around the run. Best-effort per
-    program (a bad program is skipped, never fatal). Returns a summary of what was warmed."""
+    program (a bad program is skipped, never fatal). Returns a summary of what was warmed.
+
+    `cancel` (v0.42 HOSTAUDIT-2): an optional `CancelToken`, checked once PER PROGRAM — this
+    loop had no yield point at all, so a project-load prewarm over many programs used to be one
+    un-interruptible span from the first program to the last. Unlike a cook's yield points,
+    a cancelled prewarm never raises: every program already warmed keeps its (already-persisted)
+    verdict, warming is pure best-effort optimization by contract, and the caller gets its usual
+    summary dict back with `summary["cancelled"]` set to how many programs were skipped — never
+    `CookCancelled`, which would break every existing caller that does not expect one."""
     import torch
     from .tex_cache import get_cache
     from .tex_runtime import compiled, graphed, warm_state
+    from .tex_runtime.host import _cancel_check, CookCancelled as _CookCancelled
     warm_state.ensure_loaded()
     dev_type = "cuda" if (str(device).startswith("cuda") and torch.cuda.is_available()) else "cpu"
-    summary = {"programs": 0, "codegen": 0, "bg_compile": 0, "capturable": 0, "errors": 0}
-    for source, binding_types in programs:
+    summary = {"programs": 0, "codegen": 0, "bg_compile": 0, "capturable": 0, "errors": 0,
+               "cancelled": 0}
+    programs = list(programs)
+    for i, (source, binding_types) in enumerate(programs):
+        try:
+            _cancel_check(cancel)   # HOSTAUDIT-2 yield: abort a stale prewarm between programs
+        except _CookCancelled:
+            summary["cancelled"] = len(programs) - i
+            break
         try:
             # TRK-73: compute the fingerprint ONCE and hand it into `_compile_impl`, which
             # forwards it to `compile_tex` instead of that call recomputing its own — `compile()`
