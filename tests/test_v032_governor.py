@@ -245,6 +245,66 @@ def test_v032_gov1_balanced_restores_the_shipped_budget(r: SubTestResult):
     _fresh()
 
 
+def test_trk16_balanced_restores_a_fractional_mb_budget(r: SubTestResult):
+    """TRK-16. The whole-MiB row above (`budget_mb=1536`) round-trips clean by construction —
+    `1536 * (1 << 20) / (1 << 20)` is exactly `1536.0`, and `int()` of a whole float loses
+    nothing. A sub-MiB or fractional-MiB remembered default is a different story:
+    `_apply_profile_to_cache` used to restore it by dividing the remembered BYTE count by
+    `1 << 20` and handing the resulting float to `set_budget`, whose own `int(mb)` floors it —
+    `0.75 MiB -> 0.75 -> int(0.75) == 0`. Arming under `balanced` (a no-op preset) therefore
+    evicted a sub-MiB frame cache to its one-entry floor on the spot, and switching back to
+    `balanced` from `efficient` did the same to any fractional-MiB default. Fixed by restoring
+    the remembered bytes through `ResultCache.set_budget_bytes` instead of round-tripping
+    through the whole-MiB `mb` parameter."""
+    print("\n--- TRK-16: balanced restores a fractional-MiB budget without truncating it ---")
+    _fresh()
+
+    # The filer's own reproduction: 0.75 MiB survives construction (786432 bytes) but the
+    # bug zeroed it the moment the cache was armed under the (no-op, default-restoring) profile.
+    cache = tex_results.ResultCache(budget_mb=0.75)
+    shipped = cache._budget
+    if shipped == 786432:
+        r.ok(f"fractional-MiB constructor budget is exact ({shipped} bytes)")
+    else:
+        r.fail("fractional-MiB constructor budget", f"expected 786432 bytes, got {shipped}")
+
+    tex_memory.register_result_cache(cache, name="trk16-fractional")
+    if cache._budget == shipped:
+        r.ok(f"GOV-1: arming under `balanced` leaves a fractional-MiB budget alone "
+             f"({shipped} bytes)")
+    else:
+        r.fail("TRK-16 arm", f"arming zeroed the budget: {cache._budget} bytes "
+               f"(expected {shipped})")
+
+    # A whole-MiB budget alongside it must be unaffected by the fix (no behaviour change on
+    # the path that was already correct).
+    whole = tex_results.ResultCache(budget_mb=64)
+    tex_memory.register_result_cache(whole, name="trk16-whole")
+    if whole._budget == 64 << 20:
+        r.ok("GOV-1: a whole-MiB budget is unaffected by the fractional-MiB fix")
+    else:
+        r.fail("TRK-16 whole-MB control", f"expected {64 << 20} bytes, got {whole._budget}")
+
+    # The round trip through a real preset switch: efficient -> balanced must restore the
+    # exact fractional-MiB default, not just decline to change it.
+    tex_memory.set_profile("efficient")
+    tight = tex_memory.profile_knobs("efficient")["frame_mb"] * (1 << 20)
+    if cache._budget == tight:
+        r.ok(f"GOV-1: efficient applied to the fractional-MiB cache ({tight >> 20} MB)")
+    else:
+        r.fail("TRK-16 round-trip", f"efficient left {cache._budget} bytes, expected {tight}")
+
+    tex_memory.set_profile("balanced")
+    if cache._budget == shipped:
+        r.ok(f"GOV-1: balanced RESTORED the exact fractional-MiB default "
+             f"({shipped} bytes), not 0")
+    else:
+        r.fail("TRK-16 round-trip",
+               f"back on balanced the budget is {cache._budget} bytes, "
+               f"expected the shipped {shipped}")
+    _fresh()
+
+
 def test_v032_gov1_governed_bytes_never_drifts(r: SubTestResult):
     """BLOCKER. `_bytes_by_dev` was maintained at three removal sites and one — the eviction
     loop — decremented `_ram_bytes` and forgot it. `governed_bytes(dev_type)` is what

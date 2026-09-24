@@ -674,7 +674,8 @@ _active_profile: str = "balanced"
 _armed_caches: "dict" = {}
 
 #: How a profile knob reaches a `ResultCache`:
-#:   knob name -> (setter method, attribute holding the current value, restorable-as-None)
+#:   knob name -> (setter method, attribute holding the current value, restorable-as-None,
+#:                  exact-bytes setter or None)
 #:
 #: The third element is what keeps the apply loop free of knob NAMES. `vram_mb`'s shipped
 #: default IS None (residency off), so `balanced` restores it by setting None; `frame_mb`'s
@@ -682,9 +683,17 @@ _armed_caches: "dict" = {}
 #: "leave it alone". Spelling that difference as a `knob == "frame_mb"` test inside the loop
 #: made the table's own promise false — "adding a third is one row here and one row in every
 #: `_PROFILES` entry, not an edit to the apply logic".
+#:
+#: The fourth element is TRK-16's fix: restoring a remembered default means converting a BYTE
+#: count to the whole-MiB `mb` the ordinary setter takes, and that conversion floors a sub-MiB
+#: or fractional-MiB default to 0 (`int(0.5) == 0`). Where the cache offers an exact-bytes seam
+#: (`set_budget_bytes`), the restore path uses it and skips the lossy round trip; `None` here
+#: means there is no such seam and the knob keeps the pre-existing (lossy-on-fractional-MiB)
+#: restore, which is unchanged for `vram_mb` — its remembered default is only ever `None` or a
+#: whole-MiB preset literal, never a value this bug can reach.
 _CACHE_KNOBS = {
-    "frame_mb": ("set_budget", "_budget", False),
-    "vram_mb": ("set_vram_budget", "_vram_budget", True),
+    "frame_mb": ("set_budget", "_budget", False, "set_budget_bytes"),
+    "vram_mb": ("set_vram_budget", "_vram_budget", True, None),
 }
 
 
@@ -737,10 +746,10 @@ def _apply_profile_to_cache(cache) -> None:
         # Remember the shipped defaults the FIRST time we see this cache, before any preset has
         # touched it — that is the only moment they are still knowable.
         _armed_caches[cache] = {knob: getattr(cache, attr, None)
-                                for knob, (_setter, attr, _n) in _CACHE_KNOBS.items()}
+                                for knob, (_setter, attr, _n, _bs) in _CACHE_KNOBS.items()}
     defaults = _armed_caches[cache]
     knobs = _PROFILES[_active_profile]
-    for knob, (setter_name, _attr, none_restorable) in _CACHE_KNOBS.items():
+    for knob, (setter_name, _attr, none_restorable, bytes_setter_name) in _CACHE_KNOBS.items():
         setter = getattr(cache, setter_name, None)
         if setter is None:
             continue                # an older duck-typed cache: skip the knob, keep the rest
@@ -751,6 +760,18 @@ def _apply_profile_to_cache(cache) -> None:
             default = defaults.get(knob)
             if default is None and not none_restorable:
                 continue            # no remembered byte budget to restore; leave it alone
+            if default is not None and bytes_setter_name is not None:
+                # TRK-16: restore the remembered BYTE value directly. Converting it to the
+                # whole-MiB `mb` the ordinary setter takes and back (`default / (1 << 20)`,
+                # then that setter's own `int(mb)`) floors any sub-MiB or fractional-MiB
+                # default to 0 — "restore the default" would silently zero it instead.
+                bytes_setter = getattr(cache, bytes_setter_name, None)
+                if bytes_setter is not None:
+                    try:
+                        bytes_setter(default)
+                    except Exception:
+                        pass
+                    continue
             mb = None if default is None else default / (1 << 20)
         try:
             setter(mb)              # public seam: takes the cache's own lock, enforces now

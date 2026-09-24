@@ -570,7 +570,7 @@ class ResultCache:
         return frame.clone() if copy else frame
 
     def set_budget(self, mb) -> None:
-        """Change the RAM byte budget and enforce it NOW.
+        """Change the RAM byte budget, in WHOLE MEBIBYTES, and enforce it NOW.
 
         The public seam GOV-1's profiles set a frame budget through. `_budget` is otherwise a
         constructor argument, which would mean a preset could only reach caches created after
@@ -578,9 +578,25 @@ class ResultCache:
         the user pick a profile afterwards. Enforcing immediately matters because the tightening
         direction is the one with a consequence: a shrunk budget that waits for the next `put`
         leaves the cache over its stated cap for as long as the session is idle, which is
-        exactly when a user switches to `efficient` to get memory back."""
+        exactly when a user switches to `efficient` to get memory back.
+
+        `mb` is truncated to a whole MiB (`int(mb)`) — a sub-MiB or fractional-MiB value floors
+        to 0 here, deliberately unchanged (a host calling this directly keeps today's contract).
+        A caller that already holds an exact BYTE count wants `set_budget_bytes` instead."""
+        self.set_budget_bytes(int(mb) * (1 << 20))
+
+    def set_budget_bytes(self, nbytes) -> None:
+        """`set_budget`'s twin for a caller that already has an exact byte count, with no
+        whole-MiB rounding (TRK-16). GOV-1's profile-apply loop (`tex_memory._apply_profile_to_cache`)
+        remembers a cache's shipped default in bytes (`getattr(cache, "_budget")`) and restores
+        it when a host switches back to `balanced`; routing that restore through `set_budget`'s
+        `mb` parameter means `default / (1 << 20)` then `int(...)` — a 0.5 MiB remembered budget
+        (524288 bytes) survives the division as `0.5` but floors back to `0` on the very next
+        line, so "restore the default" silently zeroed a sub-MiB or fractional-MiB budget
+        instead. This seam restores the same bytes it was handed, with the same immediate
+        enforcement `set_budget` gives a whole-MiB value."""
         with self._lock:
-            self._budget = max(0, int(mb) * (1 << 20))
+            self._budget = max(0, int(nbytes))
             self._enforce_ram_budget()
         self._drain_spills()      # `_enforce_ram_budget` only QUEUES the victims (see it)
 
