@@ -5,6 +5,118 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.0] - 2026-09-24 — "The interactive floor"
+
+Per-cook fixed overhead on the interpreter scrub path, plus host-facing audits, ordered by an embedding
+host's stated interactive priorities. `tex_api.LANGUAGE_VERSION`
+stays `"0.25"`; no compat freeze is owed. **Every default-path pixel this release ships is
+unchanged** except where "Removed" below says otherwise, and that exception is a program calling
+a function that no longer exists — never a pixel moving under an existing program.
+
+### Added
+
+- **`interp_chain_scrub` — a new `BENCH-2` counts scenario.** A ten-stage interpreter-tier,
+  unfused, ROI-windowed, fp32 chain scrubbed one param at a time — the exact shape an
+  interactive host runs (`compile_mode="none"`, never `torch.compile`). Landed
+  first so every other item in this release could measure itself against it, before and after.
+- **`cancel=` on `tex_api.prewarm`.** A `CancelToken` is now polled between programs during
+  prewarm's own loop — previously unbounded (N programs, zero polls). Optional, defaults to
+  `None` (unpolled, byte-identical to before for a caller that doesn't pass one).
+- **A structured refusal for an unrecoverable out-of-memory condition.** A bare
+  `tex_engine.cook()`/`run()` call that hits an OOM it cannot recover from now attaches
+  `.tex_refusal = EngineRefusal(code="out-of-memory", stage=None, message=...)` to the raised
+  exception — the same object, type and message `tex_node.py`'s existing ComfyUI-facing
+  re-raise-unwrapped contract already depends on, mirroring `tex_checkpoint.GateRefusal`'s shape.
+  A caller that never reads `.tex_refusal` sees no change at all.
+- **A public, read-only `.code` property on `LexerError`, `ParseError`, `TypeCheckError` and
+  `InterpreterError`.** Mirrors each class's existing private `_code` — a caller can now read the
+  diagnostic code straight off a raised exception instead of parsing the message or re-deriving
+  it, for folding notifications on `(speaker, code)`.
+- **A one-time warning when `ResultCache.put(kind=None, ...)` stores a 1-channel tensor at
+  preview quality.** `kind=None` is silently the OPPOSITE of `kind="MASK"`'s documented
+  refuse-by-default, and a caller that meant to pass `kind="MASK"` and didn't gets a warning
+  instead of silence. No stored key or packing decision changes.
+- **A cold-import module-count ratchet.** `tests/test_v042_hostaudit1_cold_import.py` pins that
+  `import TEX_Wrangle` alone loads 0 torch modules (PORT-6's lazy `__init__.py`, re-confirmed
+  still in effect) and that `from TEX_Wrangle import tex_engine` loads 44 TEX modules — a
+  regression in either number now reds a cheap-tier test instead of drifting unnoticed.
+
+### Changed / Performance
+
+- **`TRK-65` — the region-dependence walk short-circuits on an unfolded-source proof, most of
+  the time.** `tex_roi._walk` used to re-run the expensive `region_dependent` check on the
+  per-tick FOLDED program on every param-value miss. It now first asks
+  `_unfolded_region_independent` — a value-independent, cacheable proof over the UNFOLDED
+  source — and only falls through to the per-valuation check when that proof can't clear it.
+  Behaviour-identical by construction: folding a `$param` can only ERASE a clause the unfolded
+  check already saw, never invent one, so a proof of independence on the unfolded program is
+  safe for every folded valuation of it.
+- **`TRK-84` — a bit-exact fix for the `pan`-scenario coordinate-builtin LRU cost.** The
+  redundant `torch.arange`+divide `u`/`v` rebuild on every window-origin miss is now served from
+  a per-`(device, size)` cached normalized ramp plus a per-tick offset add — **bit-identical** to
+  the old formula (`torch.equal`, not `allclose`, across nine shapes including a near-8K extent
+  and four tiled-strip positions). `pan`: **−4 CUDA kernels, −4 allocations per tick.** No pixel
+  moves for any program, at any origin, ever — this is the bit-exact version the pixel-changing
+  alternative was declined in favour of.
+
+### Removed
+
+- **`viewer_exposure()` / `viewer_gamma()` — the two reserved, zero-arg colour builtins.**
+  Neither ever had a consumer: the ComfyUI node exposes no viewer input (both always read
+  identity there), and the embedding host grades exposure/gamma/LUT in its own display shader
+  after the cook, never through either builtin. Removed outright, per the author's "drop work
+  with no consumer in ComfyUI or the host" ruling. **Both names are un-reserved** — `E3011` no
+  longer fires for either, and a program MAY now define a function of either name. A program that
+  still calls one gets the ordinary "I can't find a function named '…'" diagnostic (`E5001`), not
+  a reserved-name conflict.
+- **`viewer_context=` on `tex_engine.cook`/`prepare`, and every internal tier runner and
+  memory-pressure path that threaded it.** A caller that still passes the kwarg gets a
+  `TypeError` — it is gone, not defaulted to `None`.
+- **Viewer keying in every result cache.** `tex_results_keys.lineage_key` and the checkpoint/
+  fused-chain boundary taps no longer have a `view` component to fold in. **Every non-viewer
+  program's lineage key is byte-identical to before this release** — proved by reimplementing the
+  documented key-feed sequence independently and checking it against three representative rows,
+  not by a base-vs-head hash comparison (the codegen epoch moves for an unrelated, legitimate
+  reason this release, so a raw hash comparison would not isolate this claim).
+- **The CUDA-graph host-context static-input buffer machinery.** `GraphedProgram`'s per-replay
+  buffer mechanism existed only to make the two removed builtins capturable; with no
+  `reads_host_context` builtin left in the registry, the mechanism is dead by construction and is
+  removed with it. `_capturable`'s bar returns to its pre-`v0.40.1` shape (`frame`/`fps`/`time`
+  only) — capture decisions for every other program are structurally unaffected, not merely
+  spot-checked, because the host-context bar could previously fire ONLY for a program calling one
+  of the two now-unknown functions.
+
+### Fixed
+
+- **`TRK-170` — `test_perf2_host_scalar.py`'s `_host_scalar_off` no longer patches a binding
+  nothing reads.** The two bit-exact comparisons that use it now genuinely exercise the `PERF-2`
+  fallback path instead of comparing the optimized path against itself; proven with a scratch
+  probe that a deliberately-broken `_host_scalar` leaf binding is now CAUGHT (was: silently
+  MISSED). Test-only; no product code changed.
+- **`TRK-96` — `test_mem2_pool_trim_gating` now witnesses `TEX_NO_POOL_TRIM`'s UNSET state**, the
+  state every ComfyUI user actually runs under, not only the one state the test exercised before.
+  Test-only.
+- **`TRK-104` — `test_prlp2_node_path_perf` gets its own quiet-box guard.** Reproduced red under
+  real GPU contention; now skips (named, via `_gpu_busy_reason`) rather than failing when
+  `nvidia-smi` reports significant GPU utilization. `known_reds.json` stays empty. Test-only.
+
+### For anyone vendoring this tree
+
+Four things this release moves, per `docs/brief-conventions.md`: **(1) two names UN-reserved**
+(`viewer_exposure`, `viewer_gamma` — a program may now define either; this is additive for any
+caller, never breaking). **(2) `LANGUAGE_VERSION` does not move** — stays `"0.25"`. **(3) no
+default moves.** **(4) no new shipping module filenames** — every change lands in an existing
+module (`tex_roi.py`, `tex_runtime/interpreter.py`, `tex_runtime/host.py`, `tex_engine.py`,
+`tex_api.py`, `tex_results.py`, `tex_compiler/lexer.py`, `tex_compiler/parser.py`,
+`tex_compiler/type_checker.py`, `tex_runtime/interpreter.py` (`InterpreterError`),
+`tex_runtime/stdlib_color.py`, `tex_memory.py`, `tex_chain.py`, `tex_checkpoint.py`,
+`tex_results_keys.py`, `tex_runtime/compiled.py`, `tex_runtime/codegen.py`,
+`tex_runtime/graphed.py`, `tex_runtime/stdlib_registry.py`) or in `benchmarks/`/`tests/`/docs.
+**No user-visible behaviour change beyond what is named above:** every default-path pixel is
+unchanged; the only way to observe this release from a program's own text is calling one of the
+two removed builtins (a new, ordinary unknown-function error) or reading the two new public
+surfaces (`.tex_refusal`, `.code`) this release adds.
+
 ## [0.41.0] - 2026-09-24 — "Fewer round trips"
 
 The counts round's open debt, paid down: most of what ships here removes a host↔device
