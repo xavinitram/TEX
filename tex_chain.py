@@ -270,21 +270,37 @@ def _binding_shape(v):
 
 
 def _stages_read_viewer_builtin(stages) -> bool:
-    """PM-11: does any of these RAW stage dicts' source call a viewer builtin?
+    """PM-11 (simplify, point B): does this PREFIX (`stages[:k]`, raw stage dicts) call a
+    viewer builtin?
 
-    `boundary_lineage_key` keys a PREFIX (`stages[:k]`) before it is ever compiled — there
-    is no `Program` AST here the way `_reads_host_context_cached` wants, and re-parsing just
-    to ask would duplicate `prefix_fingerprint`'s own compile a few lines below for no reason
-    a substring scan can't answer just as safely. `viewer_exposure`/`viewer_gamma` are
-    RESERVED names (E3011), so a plain substring match cannot miss a real call; the only
-    way it can be wrong is a false POSITIVE (the name sitting inside a string literal or a
-    comment), which over-keys rather than under-keys — the safe direction, same as the
-    name-prefix heuristics elsewhere in this codebase. Names come from the SAME registry
-    `_reads_host_context_cached` derives its set from (`stdlib_registry.host_context_names()`),
-    never a second hand-kept literal."""
-    from .tex_runtime.stdlib_registry import host_context_names
-    return any(name in (st.get("code") or "")
-              for st in stages for name in host_context_names())
+    `boundary_lineage_key` keys a prefix before it is ever fused/compiled as one program,
+    so there is no single `Program` AST covering it the way `_reads_host_context_cached`
+    wants — but each STAGE's own source is an ordinary TEX program on its own, and
+    `tex_lazy._pristine_program` already lexes/parses (and CACHES, per-source, no binding
+    types needed — the question is purely syntactic) every source this engine sees for the
+    ROI-2 lazy analysis. Reusing that memo — rather than a fresh parse, and rather than a
+    second hand-rolled memo of this module's own — means a hot loop that scrubs a
+    downstream param while the prefix's CODE stays fixed pays the parse once per stage
+    source, not once per cook: the second and every later call is a `tex_lazy._parse_memo`
+    hit. The walk itself is read-only (no mutation), so the pristine AST is used directly,
+    unlike `tex_lazy.lazy_required_bindings`'s own caller, which clones because IT mutates.
+    A stage that fails to parse here is treated as a HIT (over-key, never under-key, the
+    same safe direction the substring scan it replaces already took on a false positive) —
+    same "never raise out of a keying path" contract every lineage-key helper keeps; in
+    practice this path is unreachable anyway, since `cook_fused_cached`/`cook_checkpointed`
+    only reach `boundary_lineage_key` after the chain has already been validated fusable."""
+    from .tex_lazy import _pristine_program
+    for st in stages:
+        code = st.get("code") or ""
+        if not code:
+            continue
+        try:
+            prog = _pristine_program(code)
+        except Exception:
+            return True
+        if _reads_host_context_cached(prog):
+            return True
+    return False
 
 
 def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context=None,
