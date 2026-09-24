@@ -245,6 +245,32 @@ validate-only default), drives the LAT-1a machinery via `tex_api.prewarm` at the
 signature: materialise + persist the codegen fn, submit a background `torch.compile`, seed the
 capturability verdict. Warm-compile lives entirely off the cook hot path.
 
+**Cancellation (TOOL-7a).** `install_tool`/`warm_tool`/`_warm_compiled` all take an optional
+`cancel:` `CancelToken | None`, threaded straight through — the same best-effort, never-raise
+contract `tex_api.prewarm`'s `cancel=` has (v0.42 HOSTAUDIT-2). `warm_tool` polls it once per
+IMAGE channel variant (the same grain `prewarm` polls once per program); `_warm_compiled`
+polls it again once per internal warm step (codegen, then — on CUDA — the background-compile
+submit, then the capturability verdict). A cancel keeps every verdict already persisted
+(codegen's materialized fn is written the moment it is produced, independent of the steps
+after it), skips the rest, and reports how many variants it skipped as
+`result["warmed"]["cancelled"]` — it never raises out of `install_tool`, because warming is
+opt-in best-effort by contract and every existing caller expects a plain dict back. `cancel`
+defaults to `None` (a no-op poll), so the default warm path is unchanged.
+
+**Read-only status (TOOL-7b).** `tex_tool.tool_warm_status(manifest) -> {"codegen": bool,
+"capturable": bool | None}` answers "is this tool already warm?" without doing any warming
+itself: no `_COMPILE_POOL` submission, no `warm_state.json` write, no codegen emission. It
+re-derives the same value-independent warm keys `tool_warm_keys` does (a fingerprint hash, not
+a compile) and only looks each one up in the tables `warm_tool` would have populated —
+`TEXCache`'s codegen memo (memory tier, falling back to its already-persisted disk sidecar —
+a load into an in-process read cache, never a write) and `graphed._capturable_memo`.
+`"codegen"` is `True` only once EVERY derivable warm key is materialized (an IMAGE tool has an
+RGB and an RGBA key; reporting `True` on a partial warm would tell a host it can skip warming
+when one channel variant still has work to do). `"capturable"` is `None` until at least one
+key's graph-capturability verdict has been memoized, else the AND of whichever verdicts ARE
+known. A host can use this to decide whether `install_tool(warm=True)` is worth triggering at
+all before it asks for it.
+
 ---
 
 ## 6. Threat model for shared tools (TOOL-5) — gates the install flow

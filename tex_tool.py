@@ -1177,21 +1177,46 @@ def _compile_tool_program(manifest: ToolManifest, image_channels: int = 3):
 
 
 def _warm_compiled(prog_ast, type_map, fp, used_builtins, *, device: str = "cuda",
-                   precision: str = "fp32") -> dict:
+                   precision: str = "fp32", cancel=None) -> dict:
     """Warm the compile/codegen tiers for an ALREADY-COMPILED program (the same three steps
     tex_api.prewarm runs per program, but for a program object rather than a source string, so a
-    fused tool can be warmed by its real spliced program). Best-effort; off the hot path."""
+    fused tool can be warmed by its real spliced program). Best-effort; off the hot path.
+
+    `cancel` (v0.43 TOOL-7a): an optional CancelToken, polled once per warm-step here (before
+    codegen; then, on CUDA, before the background-compile submit and again before the
+    capturability verdict) — the same best-effort, never-raise contract `tex_api.prewarm`'s
+    `cancel=` has (v0.42 HOSTAUDIT-2). A cancelled warm keeps every step already run (codegen's
+    materialized fn is persisted the moment it is produced, independent of anything below it),
+    skips the remaining steps, and reports how many it skipped via `summary["cancelled"]` —
+    it never raises `CookCancelled` out of here, because `warm_tool`/`install_tool` call this
+    off the hot path and neither expects one back."""
     import torch
     from .tex_runtime import compiled, graphed, warm_state
+    from .tex_runtime.host import _cancel_check, CookCancelled
     warm_state.ensure_loaded()
     dev_type = "cuda" if (str(device).startswith("cuda") and torch.cuda.is_available()) else "cpu"
-    summary = {"codegen": 0, "bg_compile": 0, "capturable": 0}
+    summary = {"codegen": 0, "bg_compile": 0, "capturable": 0, "cancelled": 0}
+    steps_total = 3 if dev_type == "cuda" else 1
+
+    def _cancelled(remaining: int) -> bool:
+        try:
+            _cancel_check(cancel)
+            return False
+        except CookCancelled:
+            summary["cancelled"] = remaining
+            return True
+
+    if _cancelled(steps_total):
+        return summary
     try:
         if compiled._get_or_make_codegen_fn(prog_ast, type_map, fp) is not None:
             summary["codegen"] = 1
     except Exception:
         pass
     if dev_type == "cuda":
+        if _cancelled(2):
+            warm_state.persist(force=True)
+            return summary
         try:
             if compiled._cuda_headroom_ok(device) and not compiled._capture_in_flight():
                 if compiled._submit_bg_compile((fp, dev_type, precision), prog_ast, type_map,
@@ -1199,6 +1224,9 @@ def _warm_compiled(prog_ast, type_map, fp, used_builtins, *, device: str = "cuda
                     summary["bg_compile"] = 1
         except Exception:
             pass
+        if _cancelled(1):
+            warm_state.persist(force=True)
+            return summary
         try:
             graphed._capturable_memo[fp] = graphed._capturable(prog_ast)
             summary["capturable"] = 1
@@ -1208,31 +1236,57 @@ def _warm_compiled(prog_ast, type_map, fp, used_builtins, *, device: str = "cuda
     return summary
 
 
-def warm_tool(manifest: ToolManifest, *, device: str = "cuda", precision: str = "fp32") -> dict:
+def warm_tool(manifest: ToolManifest, *, device: str = "cuda", precision: str = "fp32",
+             cancel=None) -> dict:
     """TOOL-3: warm-compile a tool at its promoted-param signature -- single-stage OR the real
     fused program, for each IMAGE channel-count variant (so both an RGB and an RGBA cook find a
     warmed artifact). Off the cook hot path; raises only on a genuine compile error (callers
-    treat it best-effort). Returns a {codegen, bg_compile, capturable, variants} summary."""
-    summary = {"codegen": 0, "bg_compile": 0, "capturable": 0, "variants": 0}
+    treat it best-effort). Returns a {codegen, bg_compile, capturable, variants, cancelled}
+    summary.
+
+    `cancel` (v0.43 TOOL-7a): an optional CancelToken, polled once per channel variant here (in
+    addition to `_warm_compiled`'s own per-warm-step polls) — the same best-effort, never-raise
+    contract `tex_api.prewarm`'s `cancel=` has. A cancelled warm stops before starting any
+    further variant, keeps every verdict already persisted (this variant's and every prior
+    one's), and reports how many variants it skipped in `summary["cancelled"]` — never
+    `CookCancelled` out of `warm_tool`."""
+    from .tex_runtime.host import _cancel_check, CookCancelled
+    summary = {"codegen": 0, "bg_compile": 0, "capturable": 0, "variants": 0, "cancelled": 0}
     seen: set[str] = set()
-    for ch in _image_channel_variants(manifest):
+    variants = _image_channel_variants(manifest)
+    for idx, ch in enumerate(variants):
+        try:
+            _cancel_check(cancel)          # TOOL-7a yield: abort a stale warm between variants
+        except CookCancelled:
+            summary["cancelled"] += len(variants) - idx
+            break
         prog_ast, type_map, used_builtins, fp = _compile_tool_program(manifest, ch)
         if fp in seen:          # a tool that doesn't depend on channel count keys identically → warm once
             continue
         seen.add(fp)
-        s = _warm_compiled(prog_ast, type_map, fp, used_builtins, device=device, precision=precision)
+        s = _warm_compiled(prog_ast, type_map, fp, used_builtins, device=device, precision=precision,
+                           cancel=cancel)
         for k in ("codegen", "bg_compile", "capturable"):
             summary[k] += s.get(k, 0)
+        if s.get("cancelled"):             # cancelled mid-variant: this variant + all remaining
+            summary["cancelled"] += len(variants) - idx
+            break
         summary["variants"] += 1
     return summary
 
 
 def install_tool(manifest_or_path, dest_dir: str | None = None, *, warm: bool = False,
-                 device: str = "cuda", precision: str = "fp32") -> dict:
+                 device: str = "cuda", precision: str = "fp32", cancel=None) -> dict:
     """Install a tool into the store. VALIDATE-ONLY by default (TOOL-5-A): parses, schema-
     checks, type-checks, writes the manifest. Compiles NOTHING unless warm=True (explicit
     consent), in which case it re-derives warm keys and drives tex_api.prewarm off the hot
-    path. Returns {path, ok, warnings, warm_keys, preflight}."""
+    path. Returns {path, ok, warnings, warm_keys, preflight}.
+
+    `cancel` (v0.43 TOOL-7a): an optional CancelToken, threaded straight through to
+    `warm_tool` when `warm=True` (ignored otherwise) — the same best-effort, never-raise
+    contract `tex_api.prewarm`'s `cancel=` has: a cancel mid-warm keeps whatever was already
+    persisted and is reported inside `result["warmed"]["cancelled"]`, never as an exception
+    out of `install_tool`."""
     manifest = manifest_or_path if isinstance(manifest_or_path, ToolManifest) else load_tool(manifest_or_path)
     pf = preflight_tool(manifest)
     if not pf["ok"]:
@@ -1245,7 +1299,46 @@ def install_tool(manifest_or_path, dest_dir: str | None = None, *, warm: bool = 
     if warm:                                     # TOOL-3, opt-in only
         result["warm_keys"] = tool_warm_keys(manifest)
         try:
-            result["warmed"] = warm_tool(manifest, device=device, precision=precision)
+            result["warmed"] = warm_tool(manifest, device=device, precision=precision, cancel=cancel)
         except Exception as e:                   # warming is best-effort, never fatal
             result["warnings"].append(f"warm-compile skipped: {e}")
     return result
+
+
+def tool_warm_status(manifest: ToolManifest) -> dict:
+    """TOOL-7b: read-only query -- "is this tool's warm artifact already in place?" -- with
+    NO side effect: no `_COMPILE_POOL` submission, no `warm_state.json` write, no codegen
+    emission or CUDA-graph capture. It re-derives the tool's warm KEYS the same
+    value-independent way `tool_warm_keys` already does (a fingerprint hash, not a compile —
+    the fused path's `fused_fingerprint` and the single-stage path's `TEXCache.fingerprint`
+    are both pure derivations, never a full parse+typecheck+emit pass), then only LOOKS UP each key in the
+    read-only tables `warm_tool` itself would have populated: `TEXCache.get_codegen_fn`
+    (memory tier, falling back to its already-persisted disk sidecar -- a load into an
+    in-process read cache, never a write) and `graphed._capturable_memo` (a plain dict read).
+    Lets a host decide whether `install_tool(warm=True)` is worth triggering at all before it
+    asks (the compass's "state the host needs is queryable" pattern).
+
+    Returns `{"codegen": bool, "capturable": bool | None}`. `"codegen"` is True only when
+    EVERY derivable warm key already has a materialized codegen fn -- an IMAGE tool warms an
+    RGB and an RGBA key, and reporting True on a partial warm would tell a host it can skip
+    warming when one channel variant still has work to do. `"capturable"` is `None` when no
+    warm key's graph-capturability verdict has been memoized yet (nothing to report), else the
+    AND of whichever verdicts ARE memoized (one "not capturable" key wins -- the same
+    conservative reading `_capturable_memo` gets everywhere else it is consulted)."""
+    from .tex_cache import get_cache, _CG_UNSUPPORTED
+    from .tex_runtime import graphed
+    keys = tool_warm_keys(manifest)
+    if not keys:
+        return {"codegen": False, "capturable": None}
+    cache = get_cache()
+    codegen_all = True
+    capturable: "bool | None" = None
+    for fp in keys:
+        cg = cache.get_codegen_fn(fp)
+        if cg is None or cg is _CG_UNSUPPORTED:
+            codegen_all = False
+        cap = graphed._capturable_memo.get(fp)
+        if cap is not None:
+            v = bool(cap[0])
+            capturable = v if capturable is None else (capturable and v)
+    return {"codegen": codegen_all, "capturable": capturable}
