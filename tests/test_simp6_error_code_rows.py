@@ -162,6 +162,8 @@ _EXPRESSIONS = (
      "an operator strings do not have"),
     ("E3402", '@OUT = vec4(1.0) * mat3(1.0);', "a matrix multiplied in the wrong order"),
     ("E3500", 'if (vec3(1.0)) { } @OUT = vec4(1.0);', "a vector used as a condition"),
+    ("E3501", 'float arr[3] = {1.0, 2.0, 3.0}; if (arr) { } @OUT = vec4(1.0);',
+     "an array used as a condition"),
     ("E3600", '@OUT = vec4("a", 1.0, 1.0, 1.0);', "a string handed to a vector constructor"),
     ("E3700", 'string s = string(vec3(1.0)); @OUT = vec4(1.0);', "casting a vector to a string"),
     ("E4000", 'vec3(1.0) = vec3(2.0); @OUT = vec4(1.0);', "an expression used as an assignment target"),

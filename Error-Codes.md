@@ -216,6 +216,10 @@ Type checker. See the message shown with the code for the specific cause and fix
 
 Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
 
+### E3501
+
+Type checker. See the message shown with the code for the specific cause and fix; the class is described above.
+
 ### E3600
 
 Type checker. See the message shown with the code for the specific cause and fix; the class is described above.

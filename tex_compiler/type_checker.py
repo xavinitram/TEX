@@ -784,11 +784,25 @@ class TypeChecker:
         self._set_type(node, TEXType.VOID)
 
     def _check_scalar_condition(self, cond_type: TEXType, keyword: str, loc):
-        """Require a condition expression to be a scalar (float/int) value."""
+        """Require a condition expression to be a scalar (float/int) value.
+
+        TRK-162: an ARRAY-typed condition — reachable with a plain LOCAL array
+        declaration on the default ComfyUI profile (`float arr[3] = {...};`), no engine
+        profile needed; a WIRED array binding additionally needs
+        `tex_compiler.types.set_array_wires(True)` — used to type-check clean here
+        (`TEXType.ARRAY.is_vector` is `False`) and crash three layers into execution instead, inside
+        `_merge_branch_vars`'s `_tensor_where` — a per-pixel branch merge broadcasting the
+        condition's own length against the branch values' vector width. Refused here
+        instead, the same class of fix `TRK-9`/`TRK-28` each made for their own crash
+        shapes: a named diagnostic at type-check time, never a bare `RuntimeError`."""
         if cond_type.is_vector:
             self._error(f"This '{keyword}' condition needs a scalar expression (int or float), but found a vector.",
                         loc, code="E3500",
                         hint="Try using a single component like .r or .x, or compare with length().")
+        elif cond_type.is_array:
+            self._error(f"This '{keyword}' condition needs a scalar expression (int or float), but found an array.",
+                        loc, code="E3501",
+                        hint="Try indexing into the array (e.g. arr[0]) to get a single value.")
 
     def _check_if_else(self, node: IfElse):
         """Type-check an if/else: a scalar condition plus both branch bodies."""
