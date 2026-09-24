@@ -228,15 +228,21 @@ def _corpus_programs():
         yield name, src
 
 
-def compute_all() -> dict:
-    """Name → output hash for every corpus program. Pins single-threaded CPU for
-    determinism (and restores the prior thread count so the rest of the suite is
-    unaffected). A program that fails to compile is recorded as ERROR:<type>."""
+def _hash_corpus(select) -> dict:
+    """SIMPLIFY (post-v043-rt): the single-threaded-CPU-pin try/finally + hash-or-ERROR
+    loop `compute_all()` and `_compute_selected()` each ran independently. `select(name)`
+    decides whether a corpus program is included; every included program's hash (or
+    `"ERROR:<type>"` for one that fails to compile/run) lands in the returned dict, in
+    `_corpus_programs()`'s own order. Pins single-threaded CPU for determinism (and
+    restores the prior thread count so the rest of the suite is unaffected) around the
+    WHOLE loop, exactly as both callers did before this was one function."""
     prev_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
         out = {}
         for name, src in _corpus_programs():
+            if not select(name):
+                continue
             try:
                 out[name] = _program_hash(src)
             except Exception as e:
@@ -244,6 +250,13 @@ def compute_all() -> dict:
         return out
     finally:
         torch.set_num_threads(prev_threads)
+
+
+def compute_all() -> dict:
+    """Name → output hash for every corpus program. Pins single-threaded CPU for
+    determinism (and restores the prior thread count so the rest of the suite is
+    unaffected). A program that fails to compile is recorded as ERROR:<type>."""
+    return _hash_corpus(lambda _name: True)
 
 
 def _ver_key(v: str) -> tuple:
@@ -299,25 +312,20 @@ def _compute_selected(names) -> dict:
     Raises if a name is not present in the CURRENT tree: correcting a golden for a
     program that no longer exists is not a case this tries to paper over."""
     remaining = set(names)
-    prev_threads = torch.get_num_threads()
-    torch.set_num_threads(1)
-    try:
-        found = {}
-        for name, src in _corpus_programs():
-            if name in remaining:
-                try:
-                    found[name] = _program_hash(src)
-                except Exception as e:
-                    found[name] = f"ERROR:{type(e).__name__}"
-                remaining.discard(name)
-        if remaining:
-            raise KeyError(
-                f"only={sorted(remaining)} name program(s) not found in the current "
-                f"corpus (examples/*.tex + the adversarial set) -- cannot correct a "
-                f"golden for a program that no longer exists")
-        return found
-    finally:
-        torch.set_num_threads(prev_threads)
+
+    def select(name):
+        if name in remaining:
+            remaining.discard(name)
+            return True
+        return False
+
+    found = _hash_corpus(select)
+    if remaining:
+        raise KeyError(
+            f"only={sorted(remaining)} name program(s) not found in the current "
+            f"corpus (examples/*.tex + the adversarial set) -- cannot correct a "
+            f"golden for a program that no longer exists")
+    return found
 
 
 def freeze(version: str | None = None, only=None) -> dict:
