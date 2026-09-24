@@ -23,9 +23,15 @@ It lands in v0.34 rather than v0.35 (where the first new freeze is due) precisel
 lands while it is neutral: there is exactly ONE archived version (0.23), so the test does
 exactly what it did before, and that is the proof the mechanism changed nothing.
 
-Correcting an archived version is deliberately awkward and deliberately possible: delete
-the file and `freeze()` it again, in a commit whose message argues the pixel change. The
-awkwardness is the review gate.
+Correcting an archived version is deliberately possible, in a commit whose message argues
+the pixel change: `freeze(version, only={name, ...})` rewrites those specific EXISTING rows
+in place and carries every other row over byte-for-byte (TRK-126) — the recommended path,
+on any archived version, not only the newest. The older procedure (delete the file, then
+`freeze()` it again with no `only=`) is no longer the documented one: followed on any
+version but the newest it silently recomputed the WHOLE corpus against today's tree rather
+than the tree that version was frozen against — which is exactly how one correction once
+added a key (`aov_relight`) that did not exist when that version was genuinely frozen, and
+exactly what `only=` exists to make impossible instead of merely inadvisable.
 
 Determinism / portability:
   * single-threaded CPU + the example harness's per-binding fixed seed makes each run
@@ -284,23 +290,93 @@ def load_goldens(version: str | None = None) -> dict:
     return load_version(version or versions[-1])
 
 
-def freeze(version: str | None = None) -> dict:
+def _compute_selected(names) -> dict:
+    """Hash only the NAMED corpus programs, not the whole corpus.
+
+    A scoped correction (`freeze(..., only=...)`) must never walk programs it was not
+    asked about — that is exactly the silent-widening class TRK-126 closes, so this
+    stays a targeted lookup rather than a filter over `compute_all()`'s full result.
+    Raises if a name is not present in the CURRENT tree: correcting a golden for a
+    program that no longer exists is not a case this tries to paper over."""
+    remaining = set(names)
+    prev_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        found = {}
+        for name, src in _corpus_programs():
+            if name in remaining:
+                try:
+                    found[name] = _program_hash(src)
+                except Exception as e:
+                    found[name] = f"ERROR:{type(e).__name__}"
+                remaining.discard(name)
+        if remaining:
+            raise KeyError(
+                f"only={sorted(remaining)} name program(s) not found in the current "
+                f"corpus (examples/*.tex + the adversarial set) -- cannot correct a "
+                f"golden for a program that no longer exists")
+        return found
+    finally:
+        torch.set_num_threads(prev_threads)
+
+
+def freeze(version: str | None = None, only=None) -> dict:
     """Freeze current behavior as a NEW archived version. Defaults to `LANGUAGE_VERSION`.
 
-    **May only ADD.** Re-freezing an existing version raises, because that is the single
-    action the archive exists to prevent: a real pixel regression on a frozen program is
-    also, from the suite's point of view, one overwrite away from green. Correcting an
-    archived version means deleting the file in a commit that argues the change — visible
-    in review, which a silent rewrite was not.
+    **May only ADD** a version that is not frozen yet — re-freezing one from scratch
+    raises, because that is the action the archive exists to prevent: a real pixel
+    regression on a frozen program is also, from the suite's point of view, one
+    overwrite away from green.
+
+    `only` (TRK-126) is the OTHER way to correct an existing archived version, and the
+    only one that stays honest about scope. The documented correction procedure —
+    delete the file, then `freeze()` it again — recomputes hashes for **every** program
+    currently in `examples/*.tex`, which is today's tree, not the tree that version was
+    frozen against: tried on an old archive it silently ADDED a key for a program that
+    did not exist when that version was genuinely frozen, widening a historical
+    snapshot with nobody arguing for it in review. `only={name, ...}` instead corrects
+    those EXISTING rows in place — the file is never deleted, every name in `only` must
+    already be a key in it, and every other row is carried over byte-for-byte from the
+    current archive, so a one-row fix cannot pull in unrelated corpus growth. Use it in
+    a commit whose message argues the pixel change, on any archived version — not only
+    the newest — the same way the old procedure was always meant to be used.
     """
     from TEX_Wrangle.tex_api import LANGUAGE_VERSION
     version = str(version or LANGUAGE_VERSION)
     path = archive_path(version)
+
+    if only:
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"only={sorted(set(only))} names a correction, but {path} does not "
+                f"exist yet -- freeze(only=...) corrects an EXISTING archived version; "
+                f"freeze a version for the first time with only=None.")
+        with open(path, encoding="utf-8") as f:
+            existing = json.load(f)
+        existing_hashes = existing.get("hashes", {})
+        only = set(only)
+        missing = only - set(existing_hashes)
+        if missing:
+            raise KeyError(
+                f"only={sorted(missing)} row(s) not present in {path} -- freeze(only=...) "
+                f"corrects existing rows, never adds new ones (that would be exactly the "
+                f"silent widening this filter exists to prevent).")
+        new_hashes = dict(existing_hashes)
+        new_hashes.update(_compute_selected(only))
+        data = {"language_version": existing.get("language_version", version),
+                "hashes": new_hashes}
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print(f"corrected {len(only)} golden(s) {sorted(only)} in language version "
+              f"{version} -> {path}; {len(new_hashes) - len(only)} row(s) unchanged")
+        return data
+
     if os.path.exists(path):
         raise FileExistsError(
             f"language version {version} is already frozen at {path}. The archive is "
-            f"append-only: bump tex_api.LANGUAGE_VERSION for a new surface, or delete "
-            f"that file deliberately if a frozen golden is genuinely wrong.")
+            f"append-only: bump tex_api.LANGUAGE_VERSION for a new surface, or correct "
+            f"a specific row deliberately with freeze(version, only={{'name', ...}}).")
     os.makedirs(_ARCHIVE, exist_ok=True)
     data = {"language_version": version, "hashes": compute_all()}
     with open(path, "w", encoding="utf-8", newline="\n") as f:
