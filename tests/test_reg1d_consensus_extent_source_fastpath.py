@@ -33,6 +33,36 @@ once (the narrowing branch's lazy fetch) and reaches the SAME grid as the always
 so the fast path changes nothing about WHAT is computed, only how many times; (3) a program
 that DOES call `apply_lut3d` is unaffected -- the walk still runs and the LUT exclusion
 still applies, so nothing here reopens the corruption COLOR-1 fixed.
+
+SOUNDNESS AUDIT (every path that reaches `_consensus_extent` with a non-empty `source`).
+The fast path is sound only if `source` names every call the EXECUTED `Program` can make --
+a fused chain splices MULTIPLE stages' code into one `Program`, so a caller that passes only
+ONE stage's source text (incomplete) could wrongly report `apply_lut3d` absent when an
+upstream, non-terminal stage calls it. Audited every `Interpreter.execute` call site in the
+product tree:
+  - `tex_engine._run_default`'s interpreter call (`source=("" if ctx.fused_chain else
+    ctx.code)`) already blanked correctly.
+  - `tex_engine._interp_fallback` (the torch_compile/auto/cuda_graph recovery path, reachable
+    for a fused chain too -- `select_tier` admits one when `fused_fp_present`) did NOT: it
+    passed `source=ctx.code` unconditionally, where `ctx.code` is the TERMINAL stage's own
+    source only. FIXED here to the same guard. `test_reg1d_fused_fallback_source_is_blank`
+    proves the real function now computes `""`, not the incomplete terminal source.
+  - `.textool` fused-tool manifest cooks (`tex_tool.py`) route through `tex_engine.cook(...,
+    chain_payload=...)`, i.e. the SAME `ExecContext`/`_interp_fallback` machinery above --
+    covered by the same fix, no separate call site.
+  - `tex_api.execute()` (a Tier-3 pinned public surface) never passes `source=` at all, so
+    `Interpreter.execute`'s own default (`source=""`) applies -- "unknown", never "skip".
+    `test_reg1d_tex_api_execute_omits_source` pins this by reading the call.
+  - The checkpoint/boundary cook (`tex_checkpoint.py` -> `tex_engine.cook_stage_list` ->
+    `tex_chain.cook_stage_list`) and every M-4 tiled/ROI/batch-strip call in `tex_memory.py`
+    (`_cook_whole`/`run_tiled`/`run_roi`/`run_batch_strips`) never pass `source=` either --
+    same safe-by-omission default. `test_reg1d_boundary_and_tiling_paths_omit_source` pins
+    both call sites by source inspection (grep-shaped, not string-literal-brittle).
+  - `test_reg1d_fused_chain_lut_nonterminal_end_to_end` builds a REAL 2-stage fused chain
+    (`tex_fusion.compile_fused`) with `apply_lut3d` in the NON-terminal stage 0 and an image
+    whose H equals the LUT's N (the collision shape) -- proving the fused, spliced Program's
+    grid is the image's, not the LUT's, when walked (`source=""`, the value the real fixed
+    `_interp_fallback` now computes), matching the unpressured (non-colliding) cook.
 """
 from helpers import *
 from TEX_Wrangle.tex_cache import parse_and_split
@@ -159,3 +189,166 @@ def test_reg1d_apply_lut3d_program_unaffected(r: SubTestResult):
                f"leaked into the cook grid")
     else:
         r.ok(f"grid {got} is the image's, not the LUT's -- COLOR-1's exclusion still holds")
+
+
+# ── Soundness audit: every path that can reach `_consensus_extent` with a non-empty
+#    `source` must have that source name every call the EXECUTED Program can make. ──
+
+def test_reg1d_fused_fallback_source_is_blank(r: SubTestResult):
+    print("\n--- REG-1d: _interp_fallback blanks source for a fused chain (was ctx.code) ---")
+    from TEX_Wrangle import tex_engine as E
+
+    class _SpyInterp:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, program, bindings, type_map, **kw):
+            self.calls.append(kw)
+            return {"OUT": torch.zeros(1, 1, 1, 1)}
+
+    spy = _SpyInterp()
+    orig_get_interp = E._get_interpreter
+    E._get_interpreter = lambda: spy
+    try:
+        # A fused-chain ExecContext: ctx.code stands for "the terminal stage's OWN source",
+        # deliberately NOT the string the fused Program was actually built from -- exactly
+        # the shape a real fused cook has (see tex_fusion.py: only the terminal calls
+        # compile_fused with its own code; the spec carries the other stages separately).
+        ctx = E.ExecContext(program=None, bindings={}, type_map={}, device="cpu",
+                            code="@OUT = @X;", latent_channel_count=0,
+                            output_names=["OUT"], used_builtins=None,
+                            eff_precision="fp32", fused_chain=True)
+        E._interp_fallback(ctx, reset_dynamo=False, pass_precision=False)
+    finally:
+        E._get_interpreter = orig_get_interp
+
+    got = spy.calls[0].get("source") if spy.calls else "<not called>"
+    if got != "":
+        r.fail("REG-1d fused fallback source",
+               f"_interp_fallback passed source={got!r} for a fused chain -- expected '' "
+               f"(unknown), never the terminal-only ctx.code, which cannot name a call an "
+               f"upstream non-terminal stage makes")
+    else:
+        r.ok("_interp_fallback blanks source to '' for a fused chain")
+
+    # Control: a NON-fused cook's fallback still forwards the real (complete) source --
+    # this fix must not blank it for the ordinary case.
+    spy2 = _SpyInterp()
+    E._get_interpreter = lambda: spy2
+    try:
+        ctx2 = E.ExecContext(program=None, bindings={}, type_map={}, device="cpu",
+                             code="@OUT = @A * 2.0;", latent_channel_count=0,
+                             output_names=["OUT"], used_builtins=None,
+                             eff_precision="fp32", fused_chain=False)
+        E._interp_fallback(ctx2, reset_dynamo=False, pass_precision=False)
+    finally:
+        E._get_interpreter = orig_get_interp
+
+    got2 = spy2.calls[0].get("source") if spy2.calls else "<not called>"
+    if got2 != "@OUT = @A * 2.0;":
+        r.fail("REG-1d non-fused fallback source",
+               f"expected the real source forwarded for a non-fused cook, got {got2!r}")
+    else:
+        r.ok("a non-fused cook's fallback still forwards its real, complete source")
+
+
+def test_reg1d_tex_api_execute_omits_source(r: SubTestResult):
+    print("\n--- REG-1d: tex_api.execute() never passes source -- defaults to '' (walk) ---")
+    from TEX_Wrangle import tex_api
+
+    captured = {}
+    orig_execute = Interpreter.execute
+
+    def spy_execute(self, program, bindings, type_map, **kw):
+        captured.update(kw)
+        return orig_execute(self, program, bindings, type_map, **kw)
+
+    Interpreter.execute = spy_execute
+    try:
+        code = "@OUT = @A * 2.0;"
+        img = make_img(1, 4, 4, 4)
+        prog = tex_api.compile(code, {"A": TEXType.VEC4})
+        tex_api.execute(prog, {"A": img})
+    finally:
+        Interpreter.execute = orig_execute
+
+    # Either the kwarg is absent (Interpreter.execute's own default "" then applies) or it
+    # is explicitly "" -- both mean "unknown, always walk", never a partial source.
+    got = captured.get("source", "")
+    if got:
+        r.fail("REG-1d tex_api.execute source",
+               f"tex_api.execute() passed a non-empty source ({got!r}) -- if this ever "
+               f"becomes a PARTIAL source (e.g. a future fused surface), the fast path "
+               f"would need it blanked the same way _interp_fallback now is")
+    else:
+        r.ok("tex_api.execute() passes no (or empty) source -- the fast path always "
+             "falls back to the walk on this surface")
+
+
+def test_reg1d_boundary_and_tiling_paths_omit_source(r: SubTestResult):
+    print("\n--- REG-1d: the checkpoint/boundary cook and M-4 tiling never pass source ---")
+    import inspect
+    from TEX_Wrangle import tex_chain, tex_memory
+
+    # `cook_stage_list` (tex_checkpoint.py's real cook path, re-exported as
+    # tex_engine.cook_stage_list) and every M-4 tiled/ROI/batch-strip execute() call in
+    # tex_memory.py must never spell `source=` -- Interpreter.execute's own default ("")
+    # then means "unknown, always walk", the same safe answer as an explicit "".
+    sources = {
+        "tex_chain.cook_stage_list": inspect.getsource(tex_chain.cook_stage_list),
+        "tex_memory._cook_whole": inspect.getsource(tex_memory._cook_whole),
+        "tex_memory.run_tiled": inspect.getsource(tex_memory.run_tiled),
+        "tex_memory.run_roi": inspect.getsource(tex_memory.run_roi),
+        "tex_memory.run_batch_strips": inspect.getsource(tex_memory.run_batch_strips),
+    }
+    bad = sorted(name for name, src in sources.items() if "source=" in src)
+    if bad:
+        r.fail("REG-1d boundary/tiling source audit",
+               f"function(s) now spell `source=` in an execute() call and must be audited "
+               f"for completeness before this fast path can trust it: {', '.join(bad)}")
+    else:
+        r.ok(f"none of {len(sources)} checkpoint/boundary/tiling call sites pass `source=` "
+             f"-- all fall back to the walk")
+
+
+def test_reg1d_fused_chain_lut_nonterminal_end_to_end(r: SubTestResult):
+    print("\n--- REG-1d: LUT in a non-terminal fused stage + a size collision under the fix ---")
+    from TEX_Wrangle import tex_fusion as FUS
+
+    N = 8
+    img = make_img(1, N, N, 4)                     # H equals the LUT's N -- the collision shape
+    lut = torch.rand(N, N, N, 3)
+    terminal_code = "@OUT = @X;"                    # never mentions apply_lut3d
+    stages = [
+        {"code": "@OUT = vec4(apply_lut3d(@IMG.rgb, @LUT), 1.0);",
+         "chain_input": None, "bindings": {"IMG": img, "LUT": lut}},
+        {"code": terminal_code, "chain_input": "X", "bindings": {}},
+    ]
+    try:
+        prog, tm, refs, asg, params, used, merged = FUS.compile_fused(stages, _infer_binding_type)
+    except Exception as e:
+        r.fail("REG-1d fused chain setup", f"{type(e).__name__}: {e}")
+        return
+
+    # The value the REAL, fixed _interp_fallback now computes for this shape is "" (proved
+    # directly above) -- exercise `_consensus_extent` with exactly that, never the
+    # incomplete terminal-only source, and confirm the grid is the image's.
+    got = I._consensus_extent(dict(merged), prog, source="")
+    if got != (1, N, N):
+        r.fail("REG-1d fused chain grid",
+               f"expected the image's grid (1, {N}, {N}), got {got} -- the LUT's own shape "
+               f"leaked into a fused-chain cook")
+        return
+    r.ok(f"fused chain grid {got} is the image's, not the LUT's, under the collision shape")
+
+    # And the terminal-only source (what the OLD, buggy _interp_fallback passed) really is
+    # incapable of proving the exclusion unnecessary -- confirms the bug this fix closes was
+    # real, not hypothetical: it names no non_spatial-arg function at all.
+    from TEX_Wrangle.tex_runtime.stdlib_registry import non_spatial_args_by_name
+    if any(n in terminal_code for n in non_spatial_args_by_name()):
+        r.fail("REG-1d fused chain terminal source",
+               "the terminal stage's own source unexpectedly mentions a non-spatial-arg "
+               "function -- this test's premise (an incomplete source) no longer holds")
+    else:
+        r.ok("the terminal-only source names no non-spatial-arg function -- confirms the "
+             "pre-fix bug was reachable, not merely hypothetical")

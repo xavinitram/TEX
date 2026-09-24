@@ -408,7 +408,16 @@ def _interp_fallback(ctx: ExecContext, *, reset_dynamo: bool, pass_precision: bo
         except Exception:
             pass
     interp = _get_interpreter()
-    kw = dict(source=ctx.code, latent_channel_count=ctx.latent_channel_count,
+    # REG-1d: `ctx.code` is the TERMINAL stage's own source only -- on a fused chain
+    # (`ctx.fused_chain`) the executed `ctx.program` is the multi-stage SPLICE, and an
+    # upstream (non-terminal) stage's call is invisible to `ctx.code`. `_consensus_extent`
+    # trusts `source` to name every call the executed Program can make (its non-spatial-
+    # exclusion fast path), so a partial source here is not a cosmetic risk the way it is
+    # for error-line rendering -- it can wrongly skip the walk. Blank it exactly like the
+    # OTHER interpreter call site below (`source=("" if ctx.fused_chain else ctx.code)`),
+    # so every route to the interpreter agrees on what "unknown" means.
+    kw = dict(source=("" if ctx.fused_chain else ctx.code),
+              latent_channel_count=ctx.latent_channel_count,
               output_names=ctx.output_names, used_builtins=ctx.used_builtins,
               time_context=ctx.time_context,
               cancel=ctx.cancel, on_progress=ctx.on_progress)  # SCHED-3: token survives the fallback
