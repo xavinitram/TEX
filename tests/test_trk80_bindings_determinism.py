@@ -54,9 +54,10 @@ def rb():
 
 @pytest.fixture(scope="module")
 def ex_denoise(rb):
+    # examples/denoise.tex is a checked-in, shipped example (Function-Reference.md's own
+    # corpus), so an assertion here is a real regression, never an absent-environment skip.
     progs = [p for p in rb.load_example_programs() if p.name == "ex_denoise"]
-    if not progs:
-        pytest.skip("examples/denoise.tex not present in this tree")
+    assert progs, "examples/denoise.tex missing from load_example_programs()"
     return progs[0]
 
 
@@ -122,10 +123,9 @@ def test_trk80_a_different_shape_still_draws_different_data(rb, ex_denoise):
 
 def test_trk80_tier_classification_probe_not_gated(rb, ex_denoise):
     """Informational probe for the tracker's second half (NOT a gate: no assertion on WHICH
-    tier is chosen, and skipped outright if this box cannot cook the program at all). With the
-    data now deterministic, cooking `ex_denoise` twice in one process with
-    `clear_compiled_cache()` between currently reads the same tier both times here — recorded
-    for whoever next investigates `tex_runtime/compiled.py`'s `_route_memo` /
+    tier is chosen). With the data now deterministic, cooking `ex_denoise` twice in one
+    process with `clear_compiled_cache()` between currently reads the same tier both times
+    here — recorded for whoever next investigates `tex_runtime/compiled.py`'s `_route_memo` /
     `_compile_blacklist` / `has_spatial`, not asserted as a fixed contract by this file."""
     from TEX_Wrangle import tex_engine
     from TEX_Wrangle.tex_runtime import tier_trace, compiled
@@ -134,11 +134,8 @@ def test_trk80_tier_classification_probe_not_gated(rb, ex_denoise):
     tiers = []
     for _ in range(2):
         b = rb.generate_bindings(ex_denoise, 1, 64, 64, device=device)
-        try:
-            tex_engine.cook(ex_denoise.code, b, device_mode=device,
-                            compile_mode="auto", precision="fp32")
-        except Exception as e:
-            pytest.skip(f"ex_denoise did not cook on this box: {type(e).__name__}: {e}")
+        tex_engine.cook(ex_denoise.code, b, device_mode=device,
+                        compile_mode="auto", precision="fp32")
         tr = tier_trace.last()
         tiers.append(tr.tier if tr is not None else None)
         compiled.clear_compiled_cache()
