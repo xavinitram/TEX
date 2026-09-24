@@ -437,33 +437,60 @@ def _detect_channels(code: str) -> int:
     return 3
 
 
+def _bindings_seed(name: str, B: int, H: int, W: int) -> int:
+    """TRK-80: a deterministic seed derived from the program's name and the requested shape
+    ONLY — never from process state (PID, time, an ambient RNG position) — so the same
+    `(program, shape)` always maps to the same seed, in this process or a fresh one."""
+    digest = hashlib.sha256(f"{name}|{B}|{H}|{W}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+
 def generate_bindings(prog: BenchmarkProgram, B: int, H: int, W: int,
                       device: str = "cpu") -> dict:
-    """Create synthetic input tensors for a program."""
+    """Create synthetic input tensors for a program.
+
+    TRK-80: drawn from a `torch.Generator` seeded by `_bindings_seed`, not the ambient global
+    RNG. Before this, every call minted a genuinely fresh image (`torch.rand` with no
+    generator), so a program whose cook cost is DATA-dependent (ex_denoise's early exits on
+    the actual pixel values) measured a different cost every run — and, worse, could measure a
+    different cost from ONE call to the next within the same run (a "plain" leg and a
+    "compiled" leg of the same program see two different images). `generate_bindings(prog, B,
+    H, W)` is now a pure function of its arguments: the same call, anywhere, reproduces the
+    bit-identical tensors, so a cost delta between two legs is never data the benchmark itself
+    introduced. Generated on CPU and moved to `device` — a CUDA generator's own stream is a
+    second thing to keep in sync across devices, and this is one-time setup, not the measured
+    region."""
     b = {}
     C = _detect_channels(prog.code)
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(_bindings_seed(prog.name, B, H, W))
+
+    def _rand(*shape):
+        t = torch.rand(*shape, dtype=torch.float32, generator=gen)
+        return t if device == "cpu" else t.to(device)
+
     if prog.needs_image:
-        t = torch.rand(B, H, W, C, dtype=torch.float32, device=device)
+        t = _rand(B, H, W, C)
         b["A"] = t; b["image"] = t
     if prog.needs_ref:
-        b["ref"] = torch.rand(B, H, W, 4, dtype=torch.float32, device=device)
+        b["ref"] = _rand(B, H, W, 4)
     if prog.needs_frames:
-        b["frames"] = torch.rand(max(B, 4), H, W, 4, dtype=torch.float32, device=device)
+        b["frames"] = _rand(max(B, 4), H, W, 4)
     if prog.needs_latent_ab:
         lH, lW = max(1, H // 8), max(1, W // 8)
-        b["latent_a"] = torch.rand(B, lH, lW, 4, dtype=torch.float32, device=device)
-        b["latent_b"] = torch.rand(B, lH, lW, 4, dtype=torch.float32, device=device)
+        b["latent_a"] = _rand(B, lH, lW, 4)
+        b["latent_b"] = _rand(B, lH, lW, 4)
     if prog.needs_latent:
         lH, lW = max(1, H // 8), max(1, W // 8)
-        b["latent"] = torch.rand(B, lH, lW, 4, dtype=torch.float32, device=device)
+        b["latent"] = _rand(B, lH, lW, 4)
     if prog.needs_base_overlay_blend:
-        b["base"] = torch.rand(B, H, W, 3, dtype=torch.float32, device=device)
-        b["overlay"] = torch.rand(B, H, W, 3, dtype=torch.float32, device=device)
-        b["blend"] = torch.rand(B, H, W, dtype=torch.float32, device=device) * 0.5 + 0.25
+        b["base"] = _rand(B, H, W, 3)
+        b["overlay"] = _rand(B, H, W, 3)
+        b["blend"] = _rand(B, H, W) * 0.5 + 0.25
     if prog.needs_text:
         b["text"] = "  Hello World  "
     if prog.needs_mask:
-        b["mask"] = torch.rand(B, H, W, dtype=torch.float32, device=device)
+        b["mask"] = _rand(B, H, W)
     for pname, pval in prog.param_defaults.items():
         b[pname] = pval
     return b
