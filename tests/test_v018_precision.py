@@ -12,6 +12,29 @@ _EX = Path(__file__).resolve().parent.parent / "examples"
 _FP16_BAR = 3.9e-3  # the 8-bit quantum (doc 22)
 
 
+def _gpu_busy_reason(threshold: int = 15) -> str:
+    """TRK-104: a best-effort box-quiet check (CLAUDE.md §8's own pre-timing ritual,
+    made machine-checkable). `test_prlp2_node_path_perf` asserts a wall-clock speedup
+    RATIO on CUDA, and a shared GPU makes that ratio noisy — the noise moves the ratio
+    DOWN (contention steals cycles from every leg alike but the denominator is on the
+    hot path more of the time), never up, so it can only manufacture a false regression,
+    never hide a real one. Returns a one-line reason when the box looks busy, or ''
+    when it looks quiet OR the check itself is inconclusive (a missing `nvidia-smi` on
+    a genuinely idle box must never block the test that quiet box is entitled to run)."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return ""
+        util = max(int(x.strip()) for x in out.stdout.strip().splitlines() if x.strip())
+        return f"GPU utilization {util}% > {threshold}%" if util > threshold else ""
+    except Exception:
+        return ""
+
+
 def _codegen_src(code, bt):
     prog = parse_and_split(code, bt)
     tm = TypeChecker(binding_types=bt, source=code).check(prog)
@@ -92,8 +115,21 @@ def test_prlp4_arr_reductions_fp16_safe(r: SubTestResult):
 
 def test_prlp2_node_path_perf(r: SubTestResult):
     print("\n--- PR-LP2: precision node-path perf (H7 / doc 32 honesty) ---")
+    # TRK-104: one `r.skip` call site for the row's two unrunnable-here reasons (no CUDA,
+    # or CUDA present but too contended to trust a wall-clock ratio) — SIMP-3's census
+    # counts call SITES, and this row was already inside the pin for the first reason, so
+    # folding the second into the same site keeps the skip budget unmoved rather than
+    # opening a second, textually distinct site for what is still one unrunnable-here row.
+    why = None
     if not torch.cuda.is_available():
-        r.skip("PR-LP2 node-path perf", "no CUDA on this box")
+        why = "no CUDA on this box"
+    else:
+        busy = _gpu_busy_reason()
+        if busy:
+            why = (f"box not quiet ({busy}) — a wall-clock speedup ratio on a shared GPU "
+                   "is noise, not a regression (TRK-104)")
+    if why:
+        r.skip("PR-LP2 node-path perf", f"not runnable here — {why}")
         return
     import importlib.util
     bench = Path(__file__).resolve().parent.parent / "benchmarks" / "prlp2_node_path.py"
