@@ -5,6 +5,79 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.1] - 2026-09-24 — "Every path sees the light"
+
+The fused viewer transform PM-11 pencilled for `v0.40.0` lands: two zero-arg builtins,
+`viewer_exposure()` / `viewer_gamma()`, and the `viewer_context=` kwarg that carries them
+through every cook path — the default tier, every memory-pressure route (`run_roi`/
+`run_tiled`/`run_tiled_halo`/the OOM ladder), and the fused-chain family
+(`cook_stage_list`/`cook_fused_cached`/`cook_checkpointed`/`materialize`) — so a viewer
+tweak reaches the same picture whichever route a cook takes. `tex_api.LANGUAGE_VERSION`
+stays `"0.25"`; **no compat freeze is owed** — both names are function additions on
+unchanged grammar.
+
+**Breaking (minor), per `AGENTS.md`'s Tier 2 row.** Two newly reserved built-in names:
+`viewer_exposure`, `viewer_gamma`. A program that defines a function of either name no
+longer compiles — it fails **E3011** — and the fix is to rename the user function; a
+program that does not is unaffected. Thirteen names are now reserved in total.
+
+### Added
+
+- **`viewer_exposure()` / `viewer_gamma() → float` — the working-to-display transform,
+  read fresh.** Zero-arg, mirroring `frame`/`fps`/`time`'s shape: published on the same
+  per-cook thread-local `set_cook_grid` already uses, read through the ordinary stdlib
+  dispatch every call, and never embedded in emitted source — so it cannot move a
+  fingerprint or a `_compiled_cache` entry. Unlike `frame`/`time`, codegen does **not**
+  decline a program that calls either (the design's mirror requirement: interpreter and
+  codegen agree bit-exactly). Classified `FP16_FRAGILE` by hand (an unbounded host value
+  multiplying/exponentiating image lineage, the same reasoning `img_width`/`img_height`
+  already use).
+- **`viewer_context=` on `tex_engine.cook`/`prepare` (`ExecContext`)**, threaded through
+  every tier strategy and, this release, the routes PM-11's first cut left unreached: the
+  five memory-pressure functions in `tex_memory.py` (`run_roi`/`run_tiled`/
+  `run_tiled_halo`/`_cook_whole`/`run_batch_strips`), both OOM-ladder rungs, and the
+  fused-chain/checkpoint family (`tex_chain.cook_stage_list`/`cook_fused_cached`,
+  `tex_checkpoint.cook_checkpointed`/`materialize`). A program that never calls a viewer
+  builtin is unaffected on every one of these paths (identity default, byte-identical to
+  before this release).
+- **Result caches now key on `viewer_context` — but only for a program that reads it.**
+  `tex_results_keys.lineage_key` (CACHE-1) and CACHE-6/7's boundary taps
+  (`boundary_lineage_key`, the same mechanism) fold `viewer_context` into the key only
+  when `interpreter._reads_host_context_cached(program)` says the program calls one of
+  the two builtins; a program that never does hashes byte-identically to a pre-this-
+  release build (invariant 7). The **compile** fingerprint and `_compiled_cache` stay
+  viewer-free on every path, deliberately — a viewer tweak never recompiles, which is the
+  asymmetry `time_context` does not share (every program can read `frame`/`time` as a
+  bare identifier, so there was never a "before" shape to preserve for that one).
+- **`reads_host_context`, a declared `@stdlib` registry field** — the same
+  "declare-on-the-registry, derive-everywhere" shape `v0.40.0`'s `non_spatial_args` used.
+  `viewer_exposure`/`viewer_gamma` declare it; `stdlib_registry.host_context_names()`
+  derives the name set once for every consumer (the CUDA-graph capture bar, the
+  result-cache keying decision, the fused-chain prefix scan) to read, replacing three
+  separate hand-kept copies of the same two-name literal.
+
+**Not yet supported: CUDA-graph capture of a program that calls either builtin.**
+`graphed._capturable` bars it, the same class as `frame`/`time` — a replay would re-serve
+whatever value was read at capture. This lands squarely on PM-11's own headline case (a
+viewer stage fused onto a comp, tweaked by a slider under active scrubbing), so it costs
+real tier-selection speed today rather than only a missing feature. A follow-up — feeding
+both values as static per-replay input buffers, the mechanism already named for the
+playhead — is pencilled; see `docs/roadmap.md` §9.
+
+### For anyone vendoring this tree
+
+Four things this release moves, per `docs/brief-conventions.md`'s "what a release note owes
+a vendoring host": **(1) two newly reserved names** — `viewer_exposure`, `viewer_gamma`
+(thirteen now reserved in total; see Breaking, above). **(2) `LANGUAGE_VERSION` does not
+move** — stays `"0.25"`, no compat freeze owed. **(3) no default moves** anywhere in this
+release, engine-side or host-facing. **(4) no new shipping module filenames** — every
+change lands in existing modules (`stdlib_color.py`, `stdlib_registry.py`,
+`tex_results_keys.py`, `tex_chain.py`, `tex_checkpoint.py`, `tex_memory.py`,
+`tex_engine.py`, `tex_runtime/graphed.py`, `tex_runtime/interpreter.py`,
+`tex_runtime/codegen.py`, `tex_runtime/compiled.py`). No cache tier needs a cold start
+for a program that never calls a viewer builtin; a program that does gets one new,
+correctly-scoped result-cache key, not a wider invalidation.
+
 ## [0.40.0] - 2026-09-24 — "Linear light"
 
 Colour becomes a language citizen: five native builtins for Rec.709 and ACEScg linearisation and
