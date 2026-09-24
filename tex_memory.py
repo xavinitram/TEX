@@ -1219,11 +1219,20 @@ def run_roi(interp, program, bindings, type_map, device, latent_channel_count,
     return outputs
 
 
-def shared_tile_width(bindings) -> int | None:
+def shared_tile_width(bindings, non_spatial: frozenset = frozenset()) -> int | None:
     """ROI-5: the single image width shared by every spatial (dim>=3) binding that isn't a
     broadcast singleton (shape[2]==1), or None otherwise — the width twin of
-    `shared_tile_height`, needed to size the full-image W a halo strip clamps against."""
-    return _shared_dim_size(bindings, 2, 3)
+    `shared_tile_height`, needed to size the full-image W a halo strip clamps against.
+
+    `non_spatial` (TRK-163, threaded here for TRK-165) — see `_shared_dim_size`. Unexploited
+    today: `shared_tile_width`'s only callers (`run_tiled_halo`, `tex_tiling._halo_tile_plan`)
+    only ever DECIDE off it, never slice a binding by shape match the way `run_tiled` does —
+    but the same coincidental-N collision `_shared_dim_size`'s docstring describes for height/
+    batch applies to width just as structurally, so the exclusion is threaded through for the
+    same reason TRK-163 threaded it into `shared_tile_height`/`shared_batch_size`: the default
+    empty set keeps every pre-existing caller's answer unchanged for a program that binds no
+    non-spatial argument."""
+    return _shared_dim_size(bindings, 2, 3, non_spatial)
 
 
 def run_tiled_halo(interp, program, bindings, type_map, device, latent_channel_count,
@@ -1252,8 +1261,15 @@ def run_tiled_halo(interp, program, bindings, type_map, device, latent_channel_c
 
     if latent_channel_count:
         return _untiled()
-    H_total = shared_tile_height(bindings)
-    W_total = shared_tile_width(bindings)
+    # TRK-165: the same exclusion TRK-163 threaded into shared_tile_height/shared_batch_size,
+    # now also fed to shared_tile_width — decision-only here (this function narrows nothing
+    # itself; run_roi's own narrow_names allowlist governs what each strip actually slices),
+    # so a registered non-spatial binding (a LUT) can no longer collide with a coincidentally
+    # equal H or W and skew the shared-size decision.
+    from .tex_runtime.interpreter import _non_spatial_names_cached
+    non_spatial = _non_spatial_names_cached(program) if program is not None else frozenset()
+    H_total = shared_tile_height(bindings, non_spatial)
+    W_total = shared_tile_width(bindings, non_spatial)
     if H_total is None or W_total is None:
         return _untiled()
     bounds = [(i * H_total) // n_strips for i in range(n_strips)] + [H_total]
