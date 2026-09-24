@@ -132,15 +132,20 @@ def test_v0331_a2_restore_returns_the_representation_atomically(r):
     patching, on the first iteration.
 
     The structural fix: `_restore` returns `(frame, orig_dtype)` from its own locked re-admit.
-    This row pins the shape; the race row below pins the behaviour."""
+    This row pins the shape; the race row below pins the behaviour.
+
+    TRK-178 widened the tuple to `(frame, orig_dtype, pending_event)` — the third slot is the
+    fence a caller on a foreign CUDA stream waits on before touching `frame` (see `get`); it is
+    still the SAME one-locked-re-admit answer this row was written to pin, so the shape check
+    below widens with it rather than needing a second row."""
     with tempfile.TemporaryDirectory() as d:
         c = tex_results.ResultCache(cache_dir=d, budget_mb=0)
         f = _frame(res=64)
         c.put("p", f, quality=tex_packing.PREVIEW)
         c.put("evictor", f)                            # forces "p" to disk
         got = c._restore("p")
-        pair = isinstance(got, tuple) and len(got) == 2
-        ok = pair and got[0] is not None and got[1] is torch.float32
+        triple = isinstance(got, tuple) and len(got) == 3
+        ok = triple and got[0] is not None and got[1] is torch.float32
         r.ok("A2: _restore hands back (frame, orig_dtype) as one answer") if ok else \
             r.fail("A2 restore shape", f"returned {type(got).__name__}: {got!r}")
         c.clear(disk=True)

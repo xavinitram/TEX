@@ -177,8 +177,8 @@ MUTATIONS = [
      ("test_v0331_audit",)),
     ("A2: get() re-looks-up orig_dtype after _restore (the two-acquisition read)",
      "tex_results.py",
-     "            frame, orig_dtype = self._restore(key)",
-     "            frame, _discard = self._restore(key)\n"
+     "            frame, orig_dtype, fence = self._restore(key)",
+     "            frame, _discard, fence = self._restore(key)\n"
      "            with self._lock:\n"
      "                _e = self._ram.get(key)\n"
      "                orig_dtype = _e.orig_dtype if _e is not None else None",

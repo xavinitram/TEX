@@ -121,6 +121,8 @@ class _Entry:
                 base into a final-shaped result, and a requalify-on-idle pass has to be able to
                 ENUMERATE preview entries. `orig_dtype` is not a substitute — an unpackable
                 preview frame (out of fp16 range, or a MASK) stores full and would read as final.
+    pending_event  (TRK-178) `_restore`'s still-in-flight H2D `torch.cuda.Event`, or `None`;
+                `get` GPU-side `wait_event`s a foreign-stream caller against it, then clears it.
     """
     tensor: object
     stamp: int
@@ -130,6 +132,7 @@ class _Entry:
     orig_dtype: object
     home: str
     quality: object = None
+    pending_event: object = None
 
 
 #: torch dtype -> the `tex_io.STORAGE_DTYPES` name a spill record persists it under. Built from
@@ -459,7 +462,7 @@ class ResultCache:
                     tensor.dtype if want is not None else None, home=home, quality=quality)
 
     def _admit(self, key: str, tensor, canvas, orig_dtype, home=None,
-               gen=None, quality=None) -> "_Entry | None":
+               gen=None, quality=None, pending_event=None) -> "_Entry | None":
         """Insert an ALREADY-REPRESENTED frame: freeze it, account it, enforce the budgets.
 
         The shared body of `put` (which decides the representation first) and `_restore`
@@ -506,7 +509,7 @@ class ResultCache:
             dev = str(frozen.device)
             prev_home = home if home is not None else (old.home if old is not None else dev)
             admitted = _Entry(frozen, stamp, storage_bytes, dev, canvas,
-                              orig_dtype, prev_home, quality)
+                              orig_dtype, prev_home, quality, pending_event)
             self._ram[key] = admitted
             self._bytes_by_dev[_dev_bucket(dev)] += storage_bytes
             # Residency first, then the total budget. The order is the point of having two
@@ -547,6 +550,7 @@ class ResultCache:
         from . import tex_engine
         orig_dtype = None
         demoted = None
+        fence = None            # TRK-178: a still-in-flight `_restore` H2D, or None (see below)
         with self._lock:
             frame = None
             entry = self._ram.get(key)
@@ -556,14 +560,15 @@ class ResultCache:
                     self._remove(key)                  # a mutable entry written through: never serve it
                 else:
                     self._ram.move_to_end(key)
-                    frame, orig_dtype = tensor, entry.orig_dtype
+                    frame, orig_dtype, fence = tensor, entry.orig_dtype, entry.pending_event
                     # CACHE-8: a hit on a demoted frame IS the reuse signal the residency
                     # policy promotes on. Noted here, acted on below — the H2D copy is exactly
                     # the full-frame work the lock rule keeps outside.
                     if entry.device != entry.home:
                         demoted = entry
         if demoted is not None:
-            frame = self._promote(key, demoted)
+            frame = self._promote(key, demoted)   # blocking copy_: needs no fence
+            fence = None
         if frame is None:
             # OUTSIDE the lock: `_restore` is a file read plus an H2D copy — measured at
             # hundreds of ms for a large frame, and holding the lock across it stalls every
@@ -571,13 +576,26 @@ class ResultCache:
             # takes the lock itself, so the insert is still serialized. Two threads racing the
             # same key both read and the second `put` simply replaces the first: a duplicated
             # read, never a corrupted table.
-            # Returns (master, orig_dtype) together — see A2 on `_restore`. Never re-look-up.
-            frame, orig_dtype = self._restore(key)
+            # Returns (master, orig_dtype, fence) together — see A2 on `_restore`. Never re-look-up.
+            frame, orig_dtype, fence = self._restore(key)
         with self._lock:
             if frame is None:
                 self.misses += 1
                 return None
             self.hits += 1
+        if fence is not None:   # TRK-178: a foreign stream has no ordering with a live restore
+            try:
+                import torch
+                if fence.query():          # done: drop it, but only from THIS fence's entry
+                    entry_now = self._ram.get(key)
+                    if entry_now is not None and entry_now.pending_event is fence:
+                        entry_now.pending_event = None
+                else:
+                    cur_stream = torch.cuda.current_stream(frame.device)
+                    cur_stream.wait_event(fence)
+                    frame.record_stream(cur_stream)   # keep the block alive past this stream's use
+            except Exception:
+                pass          # a wedged/absent event: fall through rather than fail the read
         # The clone is OUTSIDE the lock, deliberately. It is the expensive part of a hit (~3 ms
         # for a 1024²×4 frame), and holding the lock across it would make an interactive `get`
         # wait behind a CACHE-7 phase-2 `put` for the length of a memcpy. Safe because `frame`
@@ -950,6 +968,7 @@ class ResultCache:
                 self._bytes_by_dev["cpu"] += entry.nbytes
                 cur.tensor = host
                 cur.device = "cpu"
+                cur.pending_event = None   # TRK-178: described the replaced tensor, not `host`
                 self.demotions += 1
 
     def _promote(self, key: str, entry):
@@ -1226,7 +1245,8 @@ class ResultCache:
 
     def _restore(self, key: str):
         """Load a spilled frame back to its cook device and re-admit it to the RAM tier. The H2D
-        restore rides the DMA engine (non_blocking) when the staged host copy is pinned."""
+        restore rides the DMA engine (non_blocking) when the staged host copy is pinned. Returns
+        `(tensor, orig_dtype, pending_event)` (see `_Entry.pending_event`) or all-`None`."""
         try:
             import torch
             if self._spilled is None:
@@ -1237,10 +1257,10 @@ class ResultCache:
                 # deferral (DEVELOPMENT.md) with `_spilled_since` as the way out.
                 self._learn_spilled()
             if self._spilled is not None and key not in self._spilled:
-                return None, None          # not on the tier — no syscall needed
+                return None, None, None  # not on the tier — no syscall needed
             path = self._disk_path(key)
             if not os.path.exists(path):
-                return None, None
+                return None, None, None
             with self._lock:
                 if self._purge_depth:
                     # H2: a destructive walk is in progress over this directory. `clear(disk=
@@ -1257,7 +1277,7 @@ class ResultCache:
                     # saves the doomed unpickle and H2D, and it makes the `_admit` clause
                     # unreachable — so that clause is deleted rather than left as a guard nothing
                     # can exercise.
-                    return None, None
+                    return None, None, None
                 # A2 (v0.33.2): the generation this READ belongs to. `clear(disk=True)` can run
                 # while the file read below is in flight, and without this the restore re-admits
                 # the cleared frame to RAM — and a later eviction re-SPILLS it to disk, so the
@@ -1283,7 +1303,7 @@ class ResultCache:
             from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER
             rec = load_verified(path)
             if rec is _FUTURE_TRAILER:
-                return None, None                    # a newer TEX's frame — leave it, just miss
+                return None, None, None            # a newer TEX's frame — leave it, just miss
             if rec is _UNVERIFIED:
                 try:
                     os.remove(path)
@@ -1294,14 +1314,14 @@ class ResultCache:
                         self._disk_bytes = None      # out-of-band removal: invalidate the total
                         if self._spilled is not None:
                             self._spilled.discard(key)
-                return None, None
+                return None, None, None
             if int(rec.get("fmt", 0) or 0) > _FRAME_FORMAT:
                 # A5/PROBE-8: the `fmt` field was write-only — a record from a NEWER TEX was
                 # decoded best-effort and served as pixels. A forward-compatible reader cannot
                 # know what a future field means, so the only safe read of "newer than me" is
                 # to decline. (Absence still reads as v0; that is the backward direction, which
                 # IS decodable.) Left on disk, not deleted: the newer TEX that wrote it can.
-                return None, None
+                return None, None, None
             if rec.get("epoch") != env_epoch():     # a prior-environment frame: discard
                 try:
                     os.remove(path)
@@ -1318,7 +1338,7 @@ class ResultCache:
                         self._disk_bytes = None      # out-of-band removal: invalidate the total
                         if self._spilled is not None:
                             self._spilled.discard(key)
-                return None, None
+                return None, None, None
             host = rec["t"]
             if rec.get("viewed") == "uint16":       # A4: undo the int16 storage view
                 host = host.view(torch.uint16)
@@ -1326,6 +1346,7 @@ class ResultCache:
             # Restore UNDER inference_mode so the device tensor is born frozen — then put()'s
             # freeze() is a no-op instead of a full-frame VRAM re-clone (which would also force a
             # sync of the non_blocking H2D, negating the pinned-DMA win this path exists for).
+            pending_event = None
             with torch.inference_mode():
                 if str(dev).startswith("cuda") and torch.cuda.is_available():
                     # Stage the pageable pickle tensor into a page-locked buffer (when worthwhile)
@@ -1336,7 +1357,10 @@ class ResultCache:
                         try:
                             pinned = torch.empty(host.shape, dtype=host.dtype, pin_memory=True)
                             pinned.copy_(host)
+                            copy_stream = torch.cuda.current_stream(dev)  # TRK-178: fenced below
                             tensor = pinned.to(dev, non_blocking=True)
+                            pending_event = torch.cuda.Event()
+                            pending_event.record(copy_stream)
                         except Exception:
                             tensor = host.to(dev)
                     else:
@@ -1356,9 +1380,9 @@ class ResultCache:
             # the correct answer.
             entry = self._admit(key, tensor, rec.get("canvas"),  # already frozen: no-op-freezes
                                 _dtype_tables()[1].get(orig), home=dev, gen=gen,
-                                quality=rec.get("quality"))
+                                quality=rec.get("quality"), pending_event=pending_event)
             if entry is None:
-                return None, None
+                return None, None, None
             # A2: the frame AND its representation, from the ONE locked re-admit. This used to
             # return only the tensor and let `get` re-look-up `orig_dtype` in a second lock
             # acquisition — a window in which a concurrent `clear()` or eviction drops the entry,
@@ -1366,10 +1390,10 @@ class ResultCache:
             # caller owed fp32. Reproduced without any patching, on the first iteration.
             # A2: the frame AND its representation, from the ONE locked re-admit. Re-looking
             # the entry up in a second acquisition is what let a `clear()` in between make
-            # `orig_dtype` read None and serve fp16 to a caller owed fp32.
-            return entry.tensor, entry.orig_dtype
+            # `orig_dtype` read None and serve fp16 to a caller owed fp32 (TRK-178: same for fence).
+            return entry.tensor, entry.orig_dtype, entry.pending_event
         except Exception:
-            return None, None
+            return None, None, None
 
     def _enforce_disk_budget(self) -> None:
         """Cap the spill directory's total bytes, deleting oldest-first (mtime). A separate cap

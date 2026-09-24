@@ -111,7 +111,7 @@ def test_brief10_frame_site_never_executes_crafted_reduce(r: SubTestResult):
         Path(c._disk_path(key)).write_bytes(_crafted(str(marker)))
         with c._lock:
             c._spilled = None                     # unknown → _restore stats and finds the file
-        frame, orig = c._restore(key)
+        frame, orig, _fence = c._restore(key)
         ok = (not marker.exists()) and frame is None
         r.ok("a crafted .frame is a miss; its __reduce__ never runs") if ok else \
             r.fail("BRIEF-10 .frame crafted",
@@ -169,7 +169,7 @@ def test_brief10_frame_site_rejects_a_forged_trailer(r: SubTestResult):
         Path(c._disk_path("k")).write_bytes(_forged(str(marker)))
         with c._lock:
             c._spilled = None
-        frame, _orig = c._restore("k")
+        frame, _orig, _fence = c._restore("k")
         ok = (not marker.exists()) and frame is None
         r.ok("a forged-tag .frame is refused; __reduce__ never runs (MAC compare is live)") if ok \
             else r.fail("BRIEF-10 .frame forged",

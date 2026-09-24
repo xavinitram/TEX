@@ -125,7 +125,11 @@ _SKIP_VOCAB = re.compile(
 #: device — the row stresses `ResultCache._restore`'s pinned non-blocking host-to-device copy,
 #: which only exists on the CUDA leg; there is no CPU-side witness for a DMA-engine copy that
 #: does not happen on CPU at all.
-_SKIP_BUDGET = 107
+#: Re-pinned from 107 to 108 (v0422-race, TRK-178): the coordinator's follow-up hardening added
+#: `test_v0422_race.py::test_v0422_race_restore_pinned_h2d_fences_a_foreign_stream`, which skips
+#: for the same CUDA-only reason as the row above — a foreign-CUDA-stream fence has no meaning
+#: without a CUDA device to fence on.
+_SKIP_BUDGET = 108
 
 
 def _literal(node) -> str:
