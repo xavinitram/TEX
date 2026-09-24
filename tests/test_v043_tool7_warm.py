@@ -75,7 +75,14 @@ def test_tool7_warm_cancel_mid_variant_loop(r: SubTestResult):
         m = _stock("grade")                       # an IMAGE input -> 2 channel variants (RGB/RGBA)
         variants = tex_tool._image_channel_variants(m)
         if len(variants) < 2:
-            r.skip("tool7 warm cancel mid-variant", "stock 'grade' no longer has 2 warm variants")
+            # A precondition guard, not an absent environment: stock 'grade' having an IMAGE
+            # input (-> 2 channel-variant warm keys) is a fact about a shipped exemplar, not
+            # about this box. If it ever stops holding, that is a real regression to see loudly
+            # -- SIMP-3's skip budget only counts rows an environment can make true again.
+            r.fail("tool7 warm cancel mid-variant",
+                   f"stock 'grade' has {len(variants)} channel variant(s), expected 2 -- this "
+                   f"test's cancel-grain arithmetic assumes an IMAGE-input tool warms both an "
+                   f"RGB and an RGBA key")
         else:
             # trips=2: variant 0's outer check (call#1) and _warm_compiled's single CPU-side
             # step check (call#2) both pass -> variant 0 warms fully; variant 1's outer check
@@ -192,7 +199,13 @@ def test_tool7_warm_status_partial_warm_reports_false(r: SubTestResult):
         m = _fresh_image_tool()                    # never-before-warmed fingerprint(s)
         keys = tex_tool.tool_warm_keys(m)
         if len(keys) < 2:
-            r.skip("tool7 warm_status partial warm", "fresh image tool no longer has 2+ warm keys")
+            # A precondition guard, not an absent environment: an IMAGE-input tool deriving
+            # >=2 warm keys (RGB + RGBA) is a fact about tool_warm_keys/_image_channel_variants,
+            # not about this box -- a real regression here belongs in front of the reader, not
+            # behind a skip SIMP-3's budget would otherwise have to keep re-pinning around.
+            r.fail("tool7 warm_status partial warm",
+                   f"a fresh IMAGE-input tool derived {len(keys)} warm key(s), expected >=2 -- "
+                   f"the partial-warm assertion below needs a genuine second, still-cold key")
             return
         # warm only the FIRST channel variant directly, bypassing warm_tool's loop, so exactly
         # one of the >=2 warm keys is codegen-warm.

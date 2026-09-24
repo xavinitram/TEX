@@ -129,7 +129,27 @@ _SKIP_VOCAB = re.compile(
 #: `test_v0422_race.py::test_v0422_race_restore_pinned_h2d_fences_a_foreign_stream`, which skips
 #: for the same CUDA-only reason as the row above — a foreign-CUDA-stream fence has no meaning
 #: without a CUDA device to fence on.
-_SKIP_BUDGET = 108
+#: Re-pinned from 108 to 111 (v0.43.0, TOOL-7 cleanup): five new rows landed with this release;
+#: two were precondition guards wearing a skip they never needed.
+#: `test_v043_tool7_warm.py`'s "stock 'grade' no longer has 2 warm variants" and "fresh image
+#: tool no longer has 2+ warm keys" rows are facts about a fixed stock exemplar and a freshly-
+#: built fixture, not about this box — if either ever stopped holding, that is a real
+#: regression that belongs in front of the reader, not behind a skip. Both are now `r.fail`,
+#: the witness shape this ratchet asks for, and neither counts here any more. The remaining
+#: three genuinely need an absent environment: `test_v043_tool7_warm.py::
+#: test_tool7_warm_status_capturable_field` and `test_v043_rider_b_ingest_merge.py`'s ingest
+#: row both need a real CUDA device — no CPU witness exists for a graph-capturability verdict
+#: or a pinned H2D leg, the same reason every other CUDA-only row already in this pin carries.
+#: `test_lint1_no_local_only_path_refs.py` needs a working git checkout: it enumerates the
+#: PUSHED set via `git ls-files` through `tracked_paths()` (the same helper
+#: `test_simp3_no_machine_paths.py` uses and skips the same way when it is absent). A
+#: filesystem-walk fallback was considered and rejected, not merely skipped over: without git
+#: there is no way to tell a TRACKED path from a local-only one — exactly the distinction this
+#: row exists to police — so walking the working tree instead would read the project's own
+#: excluded orchestration files, including prose that legitimately names the very fragments
+#: this row forbids (this hand-back among them), and manufacture the false positives the row
+#: exists to prevent rather than remove its need for git. 108 + 3 = 111.
+_SKIP_BUDGET = 111
 
 
 def _literal(node) -> str:
