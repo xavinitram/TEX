@@ -118,9 +118,19 @@ _CHEAP = [
 #: Where the CI-shape interpreter is named, so this file names no machine's private layout.
 _CI_PYTHON_ENV = "TEX_CI_PYTHON"
 
+#: The second alternative used to be `(?:\d+ \w+,? ?)+ in [\d.]+s`: `\d+` and `\w+` both
+#: accept digits, and the trailing `,? ?` was optional on both sides, so a tail that never
+#: reaches " in <secs>s" (e.g. many "000 " repeats with no letters) let the engine re-split
+#: the same run of digits between `\d+` and `\w+` in quadratically many ways before giving
+#: up — a CodeQL-flagged inefficient regex. Pytest's own count words are always alphabetic
+#: (`passed`, `failed`, `errors`, `warnings`, `deselected`, `skipped`, `xfailed`, `xpassed`),
+#: so `[a-z]+` (case-insensitive) already covers every real word and shares no characters
+#: with `\d+` — the ambiguity, not just this one exploit string, is gone. The repeated
+#: clauses are joined by a literal ", " (what every pytest summary actually uses), never an
+#: optional separator, so there is only one way to parse a match.
 _SUMMARY_RE = re.compile(
     r"^[=\s]*\d+ (?:passed|failed|error|deselected|skipped)|"
-    r"^\s*(?:\d+ \w+,? ?)+ in [\d.]+s", re.I)
+    r"^\s*\d+ [a-z]+(?:, \d+ [a-z]+)* in [\d.]+s", re.I)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
