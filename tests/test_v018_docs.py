@@ -286,6 +286,18 @@ def _census_module_stores(root) -> dict:
     `.items`/`.copy`, or a read-only builtin). Anything else -- a subscript store, a
     mutating method, an alias, a hand-off as an argument -- makes it writable, and a
     writable module-level container outlives every cook.
+
+    KNOWN BLIND SPOT: this walks one file's tree at a time, so it only sees a mutation
+    through an alias (`_st = _SOME_GLOBAL; _st["k"] += 1`) when the alias assignment lives
+    in the SAME file as the declaration. A container declared in one module and mutated
+    only through such an alias in a DIFFERENT module (e.g. after a module split moves the
+    function that holds the alias) is invisible to this census -- not a false
+    "undocumented store" (nothing wrongly reds), a blind spot that widens with every future
+    split of this shape. `stdlib_core._POW_NAN_STATE` is exactly this case: declared in
+    `stdlib_core.py`, mutated only via `_st = _POW_NAN_STATE` inside `stdlib_math.fn_pow`.
+    Teaching this function to follow a plain `x = <module_global>` alias would need to do
+    it cross-file to close this specific case, which is a bigger change than a per-file AST
+    walk; recorded here rather than silently carried.
     """
     import os
     import importlib
