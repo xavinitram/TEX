@@ -332,7 +332,16 @@ def _prepare_example(code, B, H, W):
         set_array_wires(prev_profile)
 
     # Optimize
-    program = optimize(program)
+    # Pass type_map so optimizer-synthesized nodes (CSE/LICM temps + their references)
+    # register during the pass, then re-check the OPTIMIZED ast to rebuild a complete,
+    # correct type_map — mirrors tex_cache.py TEXCache.compile_ast, whose type_map (the
+    # post-optimize one) is what a real cook hands the interpreter. Before this, the map
+    # returned here was the PRE-optimize one paired with the post-optimize program
+    # (TRK-29); measured to move zero corpus goldens, since the divergence is limited to
+    # optimizer-synthesized nodes the interpreter never looks up for any shipped program.
+    program = optimize(program, type_map)
+    type_map = TypeChecker(binding_types=binding_types, source=code,
+                           strict_redeclare=False).check(program)
 
     # Build dummy bindings matching the resolved types
     bindings = {}
