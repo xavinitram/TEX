@@ -62,8 +62,10 @@ stays `"0.25"`; no compat freeze is owed. No default-path pixel changes.
 A repeat-measurement patch: the interpreter's cold first cook had regressed on the reference GPU
 since v0.40.0, found and fixed by comparing every release since against the same corpus on the
 same box. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze is owed. No default-path
-pixel changes. **No cache tier goes cold on this update** — neither fix below touches a watched
-compile-pipeline file.
+pixel changes. **Corrected after release:** the compiled-program (`.pkl`) cache stays warm, but the
+codegen (`.cg`) and tier-verdict caches go cold once on this update — `tex_runtime/interpreter.py`,
+which both fixes touch, is one of the files the codegen epoch watches. The original text said no
+cache goes cold; that was wrong for those two tiers.
 
 ### Added
 
