@@ -14,6 +14,7 @@ from .stdlib_registry import stdlib
 from .stdlib_core import (
     SAFE_EPSILON,
     _build_sample_grid,
+    _dtype_rounded,
     _expand_to_bhw,
     _gauss_blur_bchw,
     _get_batch_index,
@@ -508,12 +509,32 @@ class _StdlibSample:
         # Both sigmas size the window / the weights host-side; PERF-2 resolves them
         # from the minted host value where there is one, and reads back where there
         # is not (see `_host_scalar`).
+        #
+        # TRK-69: a BARE Python float (never a shipped tier's own path — the
+        # interpreter and codegen both mint every scalar into a tensor first, so this
+        # branch is a direct-caller-only corner) used to keep the raw double here
+        # while `gauss_blur`'s equivalent fallback fp32-rounds through a minted
+        # tensor's `.item()`. fp32-rounding here too — via the same `_dtype_rounded`
+        # the mint sites use to compute a tag — makes the two agree on what a number
+        # means without minting a tensor just to round one. No default-path pixel
+        # moves: every value either tier ever hands this builtin already carries a
+        # host reading or is a real tensor, so `ss`/`sr` are unchanged on both.
         ss = _host_scalar(sigma_s)
         if ss is None:
-            ss = sigma_s.item() if torch.is_tensor(sigma_s) else float(sigma_s)
+            if torch.is_tensor(sigma_s):
+                ss = sigma_s.item()
+            else:
+                raw = float(sigma_s)
+                rounded = _dtype_rounded(raw, torch.float32)
+                ss = raw if rounded is None else rounded
         sr = _host_scalar(sigma_r)
         if sr is None:
-            sr = sigma_r.item() if torch.is_tensor(sigma_r) else float(sigma_r)
+            if torch.is_tensor(sigma_r):
+                sr = sigma_r.item()
+            else:
+                raw = float(sigma_r)
+                rounded = _dtype_rounded(raw, torch.float32)
+                sr = raw if rounded is None else rounded
 
         if img.dim() < 4 or ss < 0.3:
             return img

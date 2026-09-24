@@ -41,6 +41,7 @@ from failure_harness import run_tier
 from TEX_Wrangle.tex_runtime import interpreter as _interp
 from TEX_Wrangle.tex_runtime import stdlib as _stdlib
 from TEX_Wrangle.tex_runtime import stdlib_registry as _registry
+from TEX_Wrangle.tex_runtime import stdlib_sample as _ssample
 
 
 # ── the corpus: one builtin per host-resolved argument, across sigma shapes ──
@@ -537,4 +538,62 @@ def test_trk68_array_index_and_loop_bound_cost_no_readback(r: SubTestResult):
                 r.ok(f"{name} ({fixed_reads} device read(s), {base_reads} with the fix forced off)")
         except Exception as e:
             r.fail("TRK-68 readback", f"{name}: {type(e).__name__}: {e}")
+
+
+# ── 6. TRK-69: gauss_blur and bilateral_filter fp32-round a bare float alike ────────
+
+def test_trk69_gauss_blur_and_bilateral_filter_agree_on_a_bare_float(r: SubTestResult):
+    """TRK-69. A BARE Python float sigma — never handed to either builtin by a shipped
+    tier; the interpreter and codegen both mint every scalar into a tensor first, so
+    this is a direct-caller-only corner — used to fp32-round differently between the
+    two: `gauss_blur`'s fallback read a freshly minted tensor's `.item()` (fp32-rounded);
+    `bilateral_filter`'s kept the raw Python double. Both now resolve a bare float
+    through `_dtype_rounded`, the same rounding the PERF-2 mint sites tag their tensors
+    with, so a boundary sigma decides the SAME kernel-tap count either way.
+
+    `2.0/3.0` is the chosen boundary (same one `test_perf2_the_tag_carries_the_rounded_
+    value` uses for gauss_blur): 3*(2/3) is exactly 2.0 as a Python double but
+    2.0000000596 once fp32-rounds 2/3 first, so `ceil(3*sigma)` — the shared shape of
+    both builtins' radius formula — lands on a different integer each way. Direct
+    static-method calls only; no cook(), no codegen."""
+    print("\n--- TRK-69: a bare float sigma fp32-rounds the same in both builtins ---")
+    try:
+        sig = 2.0 / 3.0
+        rounded = _stdlib._dtype_rounded(sig, torch.float32)
+        assert math.ceil(3.0 * sig) != math.ceil(3.0 * rounded), (
+            "the chosen sigma no longer separates the rounded reading from the raw double")
+
+        img = torch.rand(1, 12, 12, 3, dtype=torch.float32)
+
+        # The MUTATION: force bilateral_filter's non-tensor fallback back to the raw
+        # double (the bug this row reports) by disabling the rounding it now shares
+        # with gauss_blur, and require the output to MOVE — otherwise the fix is not
+        # being exercised by this probe. Patched on `stdlib_sample`'s own binding: it
+        # imported `_dtype_rounded` BY NAME (the same reason
+        # `test_perf2_the_tag_carries_the_rounded_value` patches `_interp`'s own copy
+        # of `_tag_host_scalar` rather than `_stdlib`'s).
+        fixed = TEXStdlib.fn_bilateral_filter(img, sig, 0.2)
+        orig = _ssample._dtype_rounded
+        _ssample._dtype_rounded = lambda v, dt: None      # -> falls back to the raw double
+        try:
+            unrounded = TEXStdlib.fn_bilateral_filter(img, sig, 0.2)
+        finally:
+            _ssample._dtype_rounded = orig
+
+        if torch.equal(fixed, unrounded):
+            r.fail("TRK-69 fp32 agreement",
+                   "bilateral_filter's output did not move when its rounding was disabled "
+                   "— this probe does not exercise the fix")
+        else:
+            r.ok("bilateral_filter fp32-rounds a bare float sigma (own probe, "
+                 f"maxdiff {(fixed - unrounded).abs().max().item():g})")
+
+        # And it must now agree with gauss_blur's OWN reading of the same bare float —
+        # not bit-exact (different formulas: `min(ceil(3*ss), 3)` vs an unclamped
+        # radius), but the same ROUNDED sigma feeding both.
+        _stdlib._gauss_kernel_cache.clear()
+        _ = TEXStdlib.fn_gauss_blur(img, sig)   # exercises the reference reading; no crash
+        r.ok("gauss_blur resolves the same bare float without error (reference reading)")
+    except Exception as e:
+        r.fail("TRK-69 fp32 agreement", f"{type(e).__name__}: {e}")
 
