@@ -10,7 +10,7 @@ directly, unless registering only this domain is what you want.
 from __future__ import annotations
 import torch
 from . import guard_trace  # C4-ux: guarded-division near-singularity trace (leaf, no cycle)
-from .stdlib_registry import stdlib, host_context_defaults
+from .stdlib_registry import stdlib
 from .stdlib_core import (
     SAFE_EPSILON,
     LUMA_R,
@@ -18,10 +18,7 @@ from .stdlib_core import (
     LUMA_B,
     _grid_sample_f32,
     _to_tensor,
-    _cook_device,
-    _viewer_value,
     _uniform_dtype,
-    _host_context_buffer,
 )
 # ZERO_GUARD_EPS is bound by attribute lookup, not folded into the `from` import above: a
 # name bound by `from X import name` compiles a later `name.method(...)` call site WITHOUT
@@ -39,23 +36,6 @@ ZERO_GUARD_EPS = _stdlib_core.ZERO_GUARD_EPS
 # `stdlib_registry._impl_looks_fragile` reads the literal `TEXStdlib.fn_*(` from the source
 # to follow one level of delegation, so it must not be rewritten to the mixin's name.
 TEXStdlib = None
-
-
-def _host_context_value(name: str) -> torch.Tensor:
-    """v042-graph (simplify): the one shared body `fn_viewer_exposure`/`fn_viewer_gamma`
-    (and any future `reads_host_context=True` builtin) delegate to — the identical
-    stanza used to be written out twice. A CUDA-graph capture's own persistent buffer,
-    when one is installed, wins over building a fresh tensor (see
-    `_host_context_buffer`'s docstring); otherwise a 0-dim tensor built from the cook's
-    `viewer_context`, falling back to `name`'s OWN registered identity value
-    (`stdlib_registry.host_context_defaults()`) rather than a hand-written literal."""
-    buf = _host_context_buffer(name)
-    if buf is not None:
-        return buf
-    dt = _uniform_dtype() or torch.float32
-    default = host_context_defaults().get(name, 1.0)
-    return torch.scalar_tensor(_viewer_value(name, default),
-                               dtype=dt, device=_cook_device() or "cpu")
 
 
 class _StdlibColor:
@@ -320,74 +300,6 @@ class _StdlibColor:
         if out.dtype != in_dtype:
             out = out.to(in_dtype)
         return TEXStdlib._join_alpha(out, alpha)
-
-    # -- PM-11: the fused viewer transform's two reserved builtins --
-    #
-    # Zero-arg, host-fed VALUES (never `$param`s — a `$param` is baked into the compile
-    # fingerprint and would recompile/re-cache-miss on every drag of a viewer slider,
-    # ENG-7's own reason for rejecting a `$time` param). `tex_engine.cook`/`prepare` take a
-    # new `viewer_context=` kwarg mirroring `time_context=`; the ENGINE plumbs it to
-    # `Interpreter.execute`/codegen's `_invoke_cg`, both of which publish it on the SAME
-    # `stdlib_core._cook_ctx` thread-local `set_cook_grid` already uses (P0-D) — the one
-    # seam every tier (interpreter, default codegen, torch_compile, auto) already calls at
-    # the top of a cook, so no new subsystem is needed. `_cook_device()` is why: neither
-    # builtin has a tensor ARGUMENT to size a device from (the first stdlib pair that
-    # doesn't), so the device published at that same seam is the only way to build a
-    # correctly-placed tensor. Returning a tensor (not a bare float) matches every other
-    # FLOAT-returning builtin (`fn_img_width`) and skips codegen's generic float-wrap path,
-    # which only fires for an UNTYPED return.
-    #
-    # No new fusion logic (design doc §3): `@OUT = @A.rgb * viewer_exposure();` is ordinary
-    # trailing TEX reached by the existing `tex_fusion.py` splice, using the SAME two
-    # builtins any program uses. Never DECLINED by codegen (contrast ENG-7's `frame`/`fps`/
-    # `time`, which not `env`-cached because they ANIMATE): reads it fresh every call
-    # through this ordinary `_fns[name]` dispatch, so the emitted `_tex_src` never embeds a
-    # value and a viewer tweak alone cannot move the compile fingerprint or reopen a
-    # `_compiled_cache`/dynamo entry.
-    # v042-graph: CUDA-graph capture used to be barred outright for either name (the same
-    # class ENG-7's own comment names — a replay re-serves whatever value Python read at
-    # capture time). It is capturable now: `graphed.GraphedProgram` owns one persistent
-    # per-replay buffer per host-context name a captured program calls, and
-    # `_host_context_buffer` below returns THAT buffer (checked first) while a capture's
-    # warmup/record run is in flight, instead of building a fresh tensor from
-    # `_viewer_value`. Outside a capture it is always `None` and this is exactly the
-    # pre-v042-graph body. `stdlib_registry.host_context_names()` (declared once here via
-    # the registry's `reads_host_context` field, derived everywhere) is still what tells
-    # `graphed._host_context_calls` which buffer(s) a given program needs.
-    # `viewer_gamma()`'s own value is a POW exponent once composed downstream and the
-    # exposure a multiplicative gain — both host-supplied and bounded by nothing (frame/
-    # time's own reasoning), so both are registered in `stdlib_registry.FP16_FRAGILE`.
-
-    @stdlib("viewer_exposure", sig='viewer_exposure() \\u2192 float', category='Color', footprint='point',
-            reads_host_context=True, host_context_default=1.0,
-            doc="The host viewer's exposure gain for THIS cook (default 1.0 = no-op). Fed by "
-                "tex_engine.cook(viewer_context={\"viewer_exposure\": ...}); never baked into "
-                "the compile fingerprint (PM-11).",
-            ex='@OUT = vec4(@A.rgb * viewer_exposure(), 1.0);')
-    @staticmethod
-    def fn_viewer_exposure() -> torch.Tensor:
-        """PM-11: a 0-dim tensor on the cook's device, in the cook's working dtype (an
-        ordinary VALUE builtin, unlike the fp32-forced coordinate/shape builtins — this
-        multiplies image lineage directly, so it belongs in the same dtype as the pixels
-        it scales). 1.0 (identity) when no host supplied a viewer_context.
-
-        v042-graph (simplify): delegates to `_host_context_value`, the shared body
-        every host-context builtin uses (capture-buffer check + identity fallback)."""
-        return _host_context_value("viewer_exposure")
-
-    @stdlib("viewer_gamma", sig='viewer_gamma() \\u2192 float', category='Color', footprint='point',
-            reads_host_context=True, host_context_default=1.0,
-            doc="The host viewer's gamma for THIS cook (default 1.0 = no-op). Fed by "
-                "tex_engine.cook(viewer_context={\"viewer_gamma\": ...}); never baked into "
-                "the compile fingerprint (PM-11).",
-            ex='@OUT = vec4(pow(@A.rgb, vec3(1.0 / viewer_gamma())), 1.0);')
-    @staticmethod
-    def fn_viewer_gamma() -> torch.Tensor:
-        """PM-11: see fn_viewer_exposure — the same seam, the same no-op default.
-
-        v042-graph (simplify): delegates to `_host_context_value`, the shared body
-        every host-context builtin uses (capture-buffer check + identity fallback)."""
-        return _host_context_value("viewer_gamma")
 
     # -- Compositing (SL-1): Porter-Duff on straight (un-premultiplied) vec4 --
     # ComfyUI IMAGE/MASK are un-premultiplied; over/under/atop take & return

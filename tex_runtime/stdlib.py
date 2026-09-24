@@ -65,8 +65,6 @@ from .stdlib_core import (  # noqa: F401
     restore_cook_ctx,
     _uniform_grid,
     _uniform_dtype,
-    _cook_device,
-    _viewer_value,
     _get_grid_buf,
     _get_batch_index,
     _get_flat_batch_index,

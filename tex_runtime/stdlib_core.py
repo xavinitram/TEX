@@ -298,9 +298,9 @@ def _provider_read(source, t, mode: str, a, b):
 _cook_ctx = _threading.local()
 
 
-def set_cook_grid(grid, dtype=None, device=None, viewer=None):
-    """Publish the cook's `(B,H,W)` grid, working dtype, device and (PM-11) viewer context.
-    Returns an opaque token.
+def set_cook_grid(grid, dtype=None, device=None):
+    """Publish the cook's `(B,H,W)` grid, working dtype and device. Returns an opaque
+    token.
 
     Pass the token to `restore_cook_ctx` when the cook ends. Two functions rather than one
     that also accepts its own return value: cooks nest (a codegen invocation inside an
@@ -309,24 +309,20 @@ def set_cook_grid(grid, dtype=None, device=None, viewer=None):
     guesswork in exactly the place P0-D was already caused by a type test standing in for an
     intent test.
 
-    `device`/`viewer` ride the SAME seam (both `Interpreter.execute` and codegen's
-    `_invoke_cg` already call this at the one place each tier publishes its cook state) rather
-    than opening a second thread-local: `viewer_exposure`/`viewer_gamma` are the first stdlib
-    builtins with no tensor argument to size a device from, and `viewer` (the host's
-    `{"viewer_exposure": ..., "viewer_gamma": ...}` dict, or None) is the PM-11 VALUE — never
-    part of any key, same discipline as ENG-7's `time_context`."""
+    `device` rides the SAME seam (both `Interpreter.execute` and codegen's `_invoke_cg`
+    already call this at the one place each tier publishes its cook state) rather than
+    opening a second thread-local."""
     token = (getattr(_cook_ctx, "grid", None), getattr(_cook_ctx, "dtype", None),
-             getattr(_cook_ctx, "device", None), getattr(_cook_ctx, "viewer", None))
+             getattr(_cook_ctx, "device", None))
     _cook_ctx.grid = grid
     _cook_ctx.dtype = dtype
     _cook_ctx.device = device
-    _cook_ctx.viewer = viewer
     return token
 
 
 def restore_cook_ctx(token) -> None:
     """Undo one `set_cook_grid`."""
-    _cook_ctx.grid, _cook_ctx.dtype, _cook_ctx.device, _cook_ctx.viewer = token
+    _cook_ctx.grid, _cook_ctx.dtype, _cook_ctx.device = token
 
 
 def _uniform_grid():
@@ -335,65 +331,6 @@ def _uniform_grid():
 
 def _uniform_dtype():
     return getattr(_cook_ctx, "dtype", None)
-
-
-def _cook_device():
-    """PM-11: the cook device published at `set_cook_grid`, or None outside a cook."""
-    return getattr(_cook_ctx, "device", None)
-
-
-def _viewer_value(name: str, default: float) -> float:
-    """PM-11: the host's viewer value for builtin `name` (e.g. "viewer_exposure"), or
-    `default` when no `viewer_context` was supplied — the same no-op-by-absence contract
-    `time_context.get(name, 0.0)` uses for `frame`/`fps`/`time` (invariant #7: a ComfyUI
-    cook that never sets viewer_context sees the identity value, never a KeyError)."""
-    ctx = getattr(_cook_ctx, "viewer", None)
-    if ctx is None:
-        return default
-    return float(ctx.get(name, default))
-
-
-# v042-graph: the CUDA-graph capture's per-replay static input buffers for host-context
-# builtins (`viewer_exposure`/`viewer_gamma` today; any future `reads_host_context=True`
-# builtin the same way). A SEPARATE thread-local attribute from `.viewer` above — never
-# touched by `set_cook_grid`/`restore_cook_ctx` — because it names a buffer IDENTITY that
-# `graphed.GraphedProgram` owns across the whole life of a captured key, not a per-cook
-# VALUE: it is pushed once around the capture's warmup+record run (the only time the
-# interpreter, and so a builtin, actually runs) and popped when that run ends. A later
-# `.replay()` never re-enters the interpreter at all — it refreshes the SAME buffer
-# tensors with `copy_()`/`fill_()` and replays the captured kernels, which read that
-# memory directly, so nothing needs to be pushed again for a replay to see a new value.
-#
-# Absent (None) for every ordinary cook — including every codegen/interpreter tier cook
-# that runs INSIDE a capture's warmup for a program the buffer doesn't cover — so the
-# fallback in `fn_viewer_exposure`/`fn_viewer_gamma` (build a fresh tensor from
-# `_viewer_value`) is exactly the pre-v042-graph behaviour and invariant 7 holds by
-# construction: a program this mechanism never touches sees no new code path at all.
-def _push_host_context_buffers(buffers: dict) -> "dict | None":
-    """Install `buffers` ({name: persistent 0-dim tensor}) for the duration of one capture
-    warmup/record run. Returns the previous value (normally None; nesting is defensive,
-    not expected) for `_pop_host_context_buffers`."""
-    prev = getattr(_cook_ctx, "host_context_buffers", None)
-    _cook_ctx.host_context_buffers = buffers
-    return prev
-
-
-def _pop_host_context_buffers(prev) -> None:
-    """Undo one `_push_host_context_buffers`."""
-    _cook_ctx.host_context_buffers = prev
-
-
-def _host_context_buffer(name: str) -> "torch.Tensor | None":
-    """The GraphedProgram-owned persistent buffer for host-context builtin `name`, if one
-    is installed right now (a capture's warmup/record run), else `None`. A builtin checks
-    this FIRST and falls back to its ordinary per-call tensor construction — the same
-    tensor object every call while installed, at a stable address, so whatever the graph
-    tier bakes into a captured kernel launch is this buffer's memory, never a fresh
-    allocation that a later replay (which never calls Python again) could not refresh."""
-    buffers = getattr(_cook_ctx, "host_context_buffers", None)
-    if buffers is None:
-        return None
-    return buffers.get(name)
 
 
 # Pre-allocated grid buffer for sample() — avoids torch.stack allocation per call.
