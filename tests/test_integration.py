@@ -410,10 +410,16 @@ def test_example_files_compiled(r: SubTestResult):
     real-world programs. Falls back gracefully — the test verifies that
     execute_compiled never crashes, even if it degrades to the interpreter.
 
-    Each program has a 30-second timeout to prevent torch.compile from
-    blocking the entire test suite on pathological programs. A program that
-    exceeds it is reported as a named skip, so the sub-test count
-    (passed + failed + skipped) is invariant to machine load.
+    Each program has a per-program timeout to prevent torch.compile from
+    blocking the entire test suite on pathological programs (a hang guard, not a
+    performance claim). A program that exceeds it is reported as a named skip, so
+    the sub-test count (passed + failed + skipped) is invariant to machine load.
+
+    v0422-gatehyg / TRK-168: the bound used to be 30s, and that tripped on a QUIET
+    box, not only a loaded one -- `merge.tex` alone measured 49.9s standalone (this
+    box, python_embeded 3.13, CPU torch.compile, idle GPU, cold TEX_CACHE_DIR), so the
+    30s guard was reporting a skip for a program that simply finishes slowly and then
+    falls back, never for a real hang. Widened to >=10x that observed quiet reading.
     """
     import gc
     import concurrent.futures
@@ -424,7 +430,7 @@ def test_example_files_compiled(r: SubTestResult):
         return
 
     B, H, W = 1, 8, 8  # Smaller than interpreter test — torch.compile is slow
-    _PER_PROGRAM_TIMEOUT = 30  # seconds — torch.compile can take 10-20s per program
+    _PER_PROGRAM_TIMEOUT = 600  # seconds -- a hang guard, not a speed target (see above)
     start_failed = r.failed
     codegen_ok = 0
     codegen_fallback = 0

@@ -370,6 +370,11 @@ python -m pytest tests/ -v
 # Skip slow timing tests
 python -m pytest tests/ -v -m 'not slow'
 
+# Skip wall-clock/speedup/deadline claims too (tools/gate.py's own tiers do this;
+# run them deliberately, alone, on a quiet reference box)
+python -m pytest tests/ -v -m 'not slow and not timing'
+python -m pytest tests/ -v -m 'timing'
+
 # Single domain
 python -m pytest tests/test_stdlib.py -v
 

@@ -13,6 +13,11 @@ python -m pytest tests/ -v
 # Skip slow timing tests
 python -m pytest tests/ -v -m 'not slow'
 
+# Skip wall-clock/speedup/deadline claims too (what tools/gate.py's own tiers run);
+# run them deliberately, alone, on a quiet reference box
+python -m pytest tests/ -v -m 'not slow and not timing'
+python -m pytest tests/ -v -m 'timing'
+
 # Single file
 python -m pytest tests/test_stdlib.py -v
 
@@ -88,6 +93,7 @@ The `conftest.py` fixture creates the `SubTestResult`, passes it to the test fun
 | Marker | Usage | Command |
 |--------|-------|---------|
 | `@pytest.mark.slow` | Timing-sensitive tests | `pytest -m 'not slow'` to skip |
+| `@pytest.mark.timing` | A wall-clock ratio, speedup or deadline claim (e.g. `test_prlp2_node_path_perf`, `test_eng8_transfer_model`) | `pytest -m 'not timing'` to skip; `tools/gate.py`'s tiers always do. Run with `-m timing` deliberately, on a quiet, dedicated box -- not the box running everything else |
 
 ## The known-red allowlist (`known_reds.json`)
 

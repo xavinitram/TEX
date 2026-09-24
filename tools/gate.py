@@ -29,16 +29,29 @@ TIERS — and what each one actually proves
 headroom ratchets, the archive-surface ratchet, the host-path counts pins, TST-7's runner
 drift check, and the private-root lint over the tracked set. Every one of them is a strict
 SUBSET of the full tier; they are kept for feedback latency, not for coverage, and this tool
-says so out loud.
+says so out loud. It also excludes `timing` (below) — belt and braces, since none of the
+six ratchet files carries that marker today, but a future one might.
+
+**The `timing` marker** (v0422-gatehyg / TRK-168, TRK-14, TRK-75). A test asserting a
+wall-clock ratio, a speedup or a deadline belongs to a sitting on a quiet, dedicated
+reference box, not to a gate any lane's shared laptop runs unattended — the shared box is
+exactly what made those three tracker rows flake. Every tier therefore adds `and not timing`
+to its `-m` expression, and reports how many `timing` tests it deselected as its own number
+(`<leg>-timing-deselected N` on the leg's line) rather than folding it into pytest's own
+combined "N deselected" count, which mixes every active marker into one figure. Run them
+deliberately with `-m timing` on the box they are meant for. A per-program TIMEOUT used as a
+hang guard (e.g. `test_integration.py::test_example_files_compiled`) is a different thing —
+it stays in the gate, unmarked, with a bound wide enough not to trip on a merely slow box.
 
 `--tier full` runs cheap first (cheapest first, and it aborts there if cheap is red unless
 `--keep-going`), then the two whole-suite legs that are NOT subsets of each other:
 
   * **ci-shape** — a second interpreter, ideally the Python version CI uses and one with no
     embedding host installed, run from the package ROOT so the host is off `sys.path`, with
-    `CUDA_VISIBLE_DEVICES=-1`, `-m "not slow"`, `-p no:cacheprovider`. It is the only leg that
-    can catch a test which assumes a host or a GPU. It runs on whatever OS you are on, so it
-    cannot catch a line-ending or toolchain difference — say that when quoting it.
+    `CUDA_VISIBLE_DEVICES=-1`, `-m "not slow and not timing"`, `-p no:cacheprovider`. It is
+    the only leg that can catch a test which assumes a host or a GPU. It runs on whatever OS
+    you are on, so it cannot catch a line-ending or toolchain difference — say that when
+    quoting it.
 
     Which interpreter, in order: `--ci-python`, then the `TEX_CI_PYTHON` environment variable,
     then the interpreter running this script. **No path is hard-coded here**: where a second
@@ -319,6 +332,12 @@ class Leg:
         #: named only the id, and the process that could explain it had already exited.
         self.failure_text: dict = {}
         self.seconds = 0.0
+        #: How many `@pytest.mark.timing` tests this leg's own target excluded via
+        #: `not timing`, or None when a leg carries no marker filter at all / the count
+        #: itself could not be taken. Never silently folded into pytest's own combined
+        #: "N deselected" (which mixes every active marker into one number) -- reported
+        #: as its own figure so a timing test can never disappear unnoticed (v0422-gatehyg).
+        self.timing_deselected: int | None = None
 
 
 def _parse_junit(path: str) -> tuple:
@@ -403,12 +422,34 @@ def _run(leg: Leg, argv: list, cwd: str, env_extra: dict, scratch: str, verbose:
     return leg
 
 
+def _count_timing(run_argv: list, cwd: str, env_extra: dict) -> int | None:
+    """How many tests `-m timing` alone selects, for the exact interpreter/harness/target
+    a leg just ran with (its own argv, minus the tail after the target, with a collect-only
+    `-m timing` tail substituted in). Reported so a `not timing` deselection is a NUMBER on
+    the gate's own line, not folded into pytest's combined "N deselected" (which mixes every
+    active marker into one figure the moment more than one applies). Collect-only, so this
+    never executes a timing test itself. Returns None on any failure to collect -- never 0
+    by accident, which would misreport as "no timing tests exist" when the census broke."""
+    argv = run_argv + ["-q", "--collect-only", "-m", "timing", "-p", "no:cacheprovider"]
+    try:
+        proc = subprocess.run(argv, cwd=cwd, env=dict(os.environ, **env_extra),
+                              capture_output=True, text=True, timeout=120)
+    except Exception:
+        return None
+    if proc.returncode not in (0, 5):     # 5 = pytest's own "no tests collected"
+        return None
+    return sum(1 for ln in proc.stdout.splitlines() if "::" in ln)
+
+
 def run_cheap(python: str, scratch: str, verbose: bool) -> Leg:
     leg = Leg("cheap", "the six ratchets only — no whole-suite collection, "
                        "no host-absent lane, CUDA present")
     files = [f"TEX_Wrangle/{p}" for _, p in _CHEAP]
-    argv = [python, "-X", "utf8", _HARNESS, *files, "-q", "-p", "no:cacheprovider"]
-    return _run(leg, argv, _PARENT, {}, scratch, verbose)
+    base = [python, "-X", "utf8", _HARNESS, *files]
+    argv = [*base, "-q", "-m", "not timing", "-p", "no:cacheprovider"]
+    _run(leg, argv, _PARENT, {}, scratch, verbose)
+    leg.timing_deselected = _count_timing(base, _PARENT, {})
+    return leg
 
 
 def resolve_ci_python(explicit: str | None) -> tuple:
@@ -442,17 +483,22 @@ def run_ci_shape(ci_python: str, scratch: str, verbose: bool, source: str = "--c
         leg.rc, leg.summary = 127, f"interpreter not found: {ci_python}"
         leg.failures = ["<ci-shape interpreter missing>"]
         return leg
-    argv = [ci_python, "-m", "pytest", "tests/", "-q", "-m", "not slow",
-            "-p", "no:cacheprovider"]
-    return _run(leg, argv, _PKG, {"CUDA_VISIBLE_DEVICES": "-1"}, scratch, verbose)
+    base = [ci_python, "-m", "pytest", "tests/"]
+    argv = [*base, "-q", "-m", "not slow and not timing", "-p", "no:cacheprovider"]
+    env_extra = {"CUDA_VISIBLE_DEVICES": "-1"}
+    _run(leg, argv, _PKG, env_extra, scratch, verbose)
+    leg.timing_deselected = _count_timing(base, _PKG, env_extra)
+    return leg
 
 
 def run_canonical(python: str, scratch: str, verbose: bool) -> Leg:
     leg = Leg("canonical", "the embedded interpreter with CUDA and the host present, the v3 "
                            "NodeOutput wrapper disarmed — the only leg that runs the GPU rows")
-    argv = [python, "-X", "utf8", _HARNESS, "TEX_Wrangle/tests", "-q", "-m", "not slow",
-            "-p", "no:cacheprovider"]
-    return _run(leg, argv, _PARENT, {}, scratch, verbose)
+    base = [python, "-X", "utf8", _HARNESS, "TEX_Wrangle/tests"]
+    argv = [*base, "-q", "-m", "not slow and not timing", "-p", "no:cacheprovider"]
+    _run(leg, argv, _PARENT, {}, scratch, verbose)
+    leg.timing_deselected = _count_timing(base, _PARENT, {})
+    return leg
 
 
 #: The shape the counts harness is a GATE in — the same one `tests/test_bench2_counts.py`
@@ -533,6 +579,8 @@ def _line(label: str, legs: list, j: dict, head: str) -> str:
     parts = [f"GATE {head}", f"tier {label}"]
     for leg in legs:
         parts.append(f"{leg.name} {leg.summary} rc{leg.rc} ({leg.seconds:.0f}s)")
+        td = "?" if leg.timing_deselected is None else str(leg.timing_deselected)
+        parts.append(f"{leg.name}-timing-deselected {td}")
     parts.append(f"known-reds {len(j['excused'])}/{len(j['excused']) + len(j['stale'])}")
     parts.append(f"VERDICT {j['verdict']}")
     return " | ".join(parts)

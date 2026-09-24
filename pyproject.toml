@@ -16,6 +16,7 @@ Documentation = "https://github.com/xavinitram/TEX/wiki"
 [tool.pytest.ini_options]
 markers = [
     "slow: timing-dependent tests (deselect with -m 'not slow')",
+    "timing: a wall-clock ratio, speedup or deadline claim -- run only on a quiet, dedicated box (deselect with -m 'not timing'; run them alone with -m timing)",
 ]
 
 [tool.comfy]

@@ -1,6 +1,8 @@
 """
 v0.18.0 precision core (PR-LP4 fp16-safe reductions; PR-LP2 auto mode lands here too).
 """
+import pytest
+
 from helpers import *
 from TEX_Wrangle.tex_cache import parse_and_split
 import random as _random
@@ -113,8 +115,13 @@ def test_prlp4_arr_reductions_fp16_safe(r: SubTestResult):
         r.ok("all 5 arr_* reductions fp16-finite (interp+codegen) + fp32 bit-exact")
 
 
+@pytest.mark.timing
 def test_prlp2_node_path_perf(r: SubTestResult):
     print("\n--- PR-LP2: precision node-path perf (H7 / doc 32 honesty) ---")
+    # v0422-gatehyg: a wall-clock speedup RATIO assertion (see the fails.append() lines
+    # below) belongs behind `timing`, deselected by tools/gate.py's tiers -- TRK-104's
+    # own busy-box skip stays as a second, independent line of defense for whoever runs
+    # this marker deliberately on a shared box, not as the only guard.
     # TRK-104: one `r.skip` call site for the row's two unrunnable-here reasons (no CUDA,
     # or CUDA present but too contended to trust a wall-clock ratio) — SIMP-3's census
     # counts call SITES, and this row was already inside the pin for the first reason, so
