@@ -5,8 +5,10 @@ an editor gutter, a host's error panel, a CLI. A code nobody tests is a code the
 change is free to re-spell, re-severity or quietly stop emitting, and the only reader who
 notices is the one whose editor stopped underlining. A census of the tree when this landed
 found **88** distinct codes and **46** of them named by no test at all; the rows in
-`tests/test_simp6_error_code_rows.py` retired thirty of those, and the sixteen that
-remain are listed beside the pin with the reason each has no trigger.
+`tests/test_simp6_error_code_rows.py` retired thirty of those. TRK-112 then tightened what
+"tested" means (below) and paid down the larger backlog that tightening exposed with more
+rows in that file; the codes that remain are listed beside the pin with the reason each has
+no trigger.
 
 This file holds three derivations, none of them a typed list of codes:
 
@@ -30,12 +32,15 @@ knows and a host may receive, and a wider population cannot be shrunk by moving 
 into a different syntactic position. (2) and (3) need the construction itself, so they
 read the AST instead.
 
-A code counts as TESTED when a file under `tests/` names it, which is wide in the same
-direction: of the 42 codes that counted as tested when this landed, 27 were named only
-inside a comment or a docstring. Tightening that to "named in code" would be a truer
-ratchet over a much larger backlog (73 untested rather than 46) and is a separate
-decision; the rule here is the blunt one. Its cost is that naming a code in a comment
-under `tests/` retires it without testing anything. Do not.
+A code counts as TESTED when its literal appears in EXECUTABLE test code — a file under
+`tests/` names it outside of a comment and outside of a docstring (TRK-112). Before this,
+the rule was a literal-mention scan over the whole file, comments and docstrings included,
+and that blunter rule had a trap: writing a code into a comment under `tests/` retired it
+without testing anything. `_executable_source()` below strips both, using `tokenize` (for
+`#`-comments) and `ast` (for a module/class/function's leading docstring — the only string
+literal the language itself treats as inert prose); a plain string LITERAL used as data
+(e.g. one of `test_simp6_error_code_rows.py`'s table rows) still counts, because that is
+executable code naming the code, not prose about it.
 
 No product code is imported here: the file reads the tree as text. It needs no host, no
 CUDA and no compiler. (SIMP-7's drift check imports `tools/gen_error_codes.py` — the docs
@@ -44,8 +49,10 @@ generator, excluded from "product" by `_NOT_PRODUCT` below same as every other f
 """
 import ast
 import collections
+import io
 import os
 import re
+import tokenize
 
 from helpers import SubTestResult
 
@@ -94,8 +101,71 @@ def _codes_named_by_product():
     return seen
 
 
+def _docstring_lines(src):
+    """Line numbers (1-based, inclusive of every physical line the literal spans) that
+    belong to a module/class/function's leading docstring, at any nesting depth.
+
+    A docstring is, by the language's own definition, the first statement of a `Module`/
+    `ClassDef`/`FunctionDef`/`AsyncFunctionDef` body when that statement is a bare string
+    constant — nothing else qualifies, so this needs no heuristic beyond `ast.walk`. A
+    string literal assigned to a name, passed as an argument, or sitting mid-body is data,
+    not a docstring, and stays in the executable population below."""
+    lines = set()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return lines
+    candidates = [tree] + [n for n in ast.walk(tree)
+                            if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))]
+    for node in candidates:
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            start = first.value.lineno
+            end = getattr(first.value, "end_lineno", start)
+            lines.update(range(start, end + 1))
+    return lines
+
+
+def _executable_source(src):
+    """`src` with every `#`-comment and every docstring string literal blanked out (the
+    rest of each line/token is untouched, so a code sharing a line with a stripped comment
+    is still found by `_CODE`). Tightens "named under `tests/`" to "named in code the
+    interpreter actually runs" — TRK-112, see the module docstring.
+
+    `tokenize` sees comments as their own token type regardless of nesting, so dropping
+    `tokenize.COMMENT` tokens needs no docstring-vs-comment disambiguation; `ast` supplies
+    the docstring line set above. A file that fails to tokenize (shouldn't happen — these
+    are all parseable test modules) degrades to the unstripped source rather than raising,
+    so a transient tokenizer edge case fails safe toward the OLD (wider) rule, never toward
+    silently dropping a file from the population.
+    """
+    doc_lines = _docstring_lines(src)
+    src_lines = src.splitlines(keepends=True)
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return src
+    for tok in tokens:
+        if tok.type == tokenize.COMMENT:
+            start_row, start_col = tok.start
+            end_row, end_col = tok.end
+            line = src_lines[start_row - 1]
+            src_lines[start_row - 1] = line[:start_col] + " " * (end_col - start_col) + line[end_col:]
+        elif tok.type == tokenize.STRING:
+            start_row, end_row = tok.start[0], tok.end[0]
+            if any(ln in doc_lines for ln in range(start_row, end_row + 1)):
+                for ln in range(start_row, end_row + 1):
+                    src_lines[ln - 1] = _CODE.sub(lambda m: "_" * len(m.group()), src_lines[ln - 1])
+    return "".join(src_lines)
+
+
 def _codes_named_by_tests():
-    """code -> set of test file names that name it.
+    """code -> set of test file names that name it in EXECUTABLE code (TRK-112): comments
+    and docstrings are stripped first, so a code mentioned only in prose does not count.
 
     THIS file is excluded from the population on purpose. The pinned backlog below spells
     out the codes it counts, and the family and cross-file rows have to spell four more to
@@ -108,7 +178,8 @@ def _codes_named_by_tests():
             continue
         with open(os.path.join(_TESTS_DIR, fn), encoding="utf-8") as fh:
             src = fh.read()
-        for code in set(_CODE.findall(src)):
+        exe = _executable_source(src)
+        for code in set(_CODE.findall(exe)):
             hits[code].add(fn)
     return hits
 
@@ -195,11 +266,11 @@ def _emission_sites():
 #
 # Moving the pin is a two-line edit in ONE direction: drop the code that gained a test from
 # the set, and lower the number to match. The row tells you both numbers when it reds.
-_UNTESTED_PIN = 13
+_UNTESTED_PIN = 16
 _UNTESTED_AT_PIN = frozenset("""
     E1000 E3000
     E3100 E3900
-    E6001 E6002 E6004 E6005 E6006 E6030 E6040 E6050
+    E6001 E6002 E6004 E6005 E6006 E6020 E6021 E6030 E6040 E6050 E6051
     E9001
 """.split())
 
@@ -213,14 +284,19 @@ _UNTESTED_AT_PIN = frozenset("""
 #   checks the two facts still agree (below) — see that dict for the current reasons rather
 #   than re-deriving or re-typing them here, where a future edit to one copy could leave
 #   the other stale.
-# * `E6xxx` are the interpreter's. They need an EXECUTION — a compiled program and real
-#   tensors — not a `check` or a `compile`, and most of them are defensive branches the
-#   type checker forecloses before the interpreter is reached.
+# * `E6xxx` (eleven of the sixteen) are the interpreter's. They need an EXECUTION — a
+#   compiled program and real tensors, not a `check` or a `compile` — so a row for them
+#   does not belong in this file's sibling (`test_simp6_error_code_rows.py`, which only
+#   goes through `check`). TRK-112 tightened this file's "tested" rule; paying THIS part
+#   of the backlog down is TRK-113's execution-level suite, out of scope here on purpose —
+#   see that ask for which of the eleven are genuinely reachable and which are defensive
+#   branches a checker code already forecloses.
 # * `E9001` comes from a fused tool's preflight, which needs a host's tool manifest.
 #
-# The first four are worth marking on the page rather than testing: a documented code the
-# product cannot emit is a promise to a host that nothing keeps, and marking it does not
-# move this pin — it stays untested, honestly.
+# The first four (and, pending TRK-113, the eleven `E6xxx`) are worth marking on the page
+# rather than testing through `check`/`compile`: a documented code the product cannot emit
+# from source is a promise to a host that nothing keeps, and marking it does not move this
+# pin — it stays untested, honestly.
 
 
 def test_simp6_untested_error_codes_only_go_down(r: SubTestResult):

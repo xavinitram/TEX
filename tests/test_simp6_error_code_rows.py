@@ -98,6 +98,7 @@ def test_simp6_parser_code_rows(r: SubTestResult):
 
 _DECLARATIONS = (
     ("E3002", 'break; @OUT = vec4(1.0);', "`break` with no loop around it"),
+    ("E3003", '@OUT = vec4(nonexistent_var);', "a variable nothing declares"),
     ("E3010", 'float f() { return 1.0; } float f() { return 2.0; } @OUT = vec4(f());',
      "one function name defined twice"),
     ("E3012", 'return 1.0; @OUT = vec4(1.0);', "`return` outside any function"),
@@ -164,6 +165,8 @@ _EXPRESSIONS = (
     ("E3500", 'if (vec3(1.0)) { } @OUT = vec4(1.0);', "a vector used as a condition"),
     ("E3501", 'float arr[3] = {1.0, 2.0, 3.0}; if (arr) { } @OUT = vec4(1.0);',
      "an array used as a condition"),
+    ("E3303", 'vec4 cc = vec4(1.0); float x = cc.rrrrr; @OUT = vec4(x);',
+     "a swizzle with more than four components"),
     ("E3600", '@OUT = vec4("a", 1.0, 1.0, 1.0);', "a string handed to a vector constructor"),
     ("E3700", 'string s = string(vec3(1.0)); @OUT = vec4(1.0);', "casting a vector to a string"),
     ("E4000", 'vec3(1.0) = vec3(2.0); @OUT = vec4(1.0);', "an expression used as an assignment target"),
