@@ -51,6 +51,40 @@ def is_capturing() -> bool:
     return _CAPTURING
 
 
+def capture_pending(fingerprint: str, device) -> "bool | None":
+    """Rider (a), v0.43: a READ-ONLY peek at whether the next cook of *fingerprint* would
+    attempt a CUDA-graph capture — a static, mechanism-only surface (no policy about
+    whether/how a host warns a user; `docs/worklog/v043/design.md` §4(a)). Never triggers
+    the AST walk `_capturable` runs on a memo miss, never adopts a `warm_state`-persisted
+    verdict, and never writes `_capturable_memo` — a peek can only read what an earlier
+    cook (or an earlier `tex_api.prewarm`) already decided.
+
+    Returns `False` for a non-CUDA *device* WITHOUT consulting the memo: capture is
+    CUDA-only, exactly the precondition `run_graphed` checks (`dev.type != "cuda"`) before
+    it ever looks at `_capturable_memo`, so that answer is knowable and deterministic, not
+    "unknown". Otherwise: `True`/`False` once this fingerprint's static capturability gate
+    has been memoized (by a previous cook, or by a `tex_api.prewarm` call already adopted
+    into the memo), else `None` — not yet memoized.
+
+    DEVIATION from the rider's proposed shape: `_capturable_memo` is `dict[str, tuple[bool,
+    int]]`, keyed by `fingerprint` ALONE (capturability is a pure AST + arch property with
+    no device axis to index) — see `ARCHITECTURE.md`'s cache-inventory row for the same
+    memo. `device` therefore never selects a memo entry; it only gates the CUDA-only
+    precondition above. Recorded in the hand-back rather than silently reshaping the ask.
+
+    NOT modeled here (deliberately, to stay a peek at the ONE memo named in the rider):
+    `_graph_mode_disabled`, the per-(program, resolution) `_graph_capture_worthwhile` win
+    region, and the exact `_capture_key` blacklist — each needs bindings/shape a fingerprint
+    alone doesn't carry, and folding them in would turn "peek the memo" into "replicate
+    `run_graphed`'s whole ladder". A host that wants the ACTUAL next-cook verdict for a
+    concrete binding set already gets that by cooking; this answers only the static half."""
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type != "cuda":
+        return False
+    cap = _capturable_memo.get(fingerprint)
+    return None if cap is None else cap[0]
+
+
 # stdlib calls that .item()/sync internally — capturing a program that calls
 # them is doomed, so gate them out statically (never attempt the capture).
 #
