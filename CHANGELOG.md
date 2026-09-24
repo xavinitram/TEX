@@ -5,6 +5,95 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.0] - 2026-09-24 — "Fewer round trips"
+
+The counts round's open debt, paid down: most of what ships here removes a host↔device
+round trip a `BENCH-2`/`PERF-1..9` row already priced, on the interactive path those rows
+measured. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze is owed, no name is newly
+reserved, no default moves.
+
+### Performance
+
+- **TRK-166 — the tile planners pick their peak-bytes anchor by binding NAME, not by
+  coincidental shape.** `tex_tiling.py`'s `_tile_plan`/`_halo_tile_plan` anchor-selection loops
+  iterated `bindings.values()` and could pick a non-spatial binding whose own leading dimension
+  happened to equal the image height, mis-sizing the peak-bytes estimate and the TDR strip floor.
+  CUDA-only, and neither planner slices a binding by the anchor it picks — a memory/TDR estimate
+  could mis-size; no output pixel could move.
+- **TRK-66 / TRK-67 / TRK-68 — three more device readbacks removed from the interactive path,
+  all by the PERF-2 pattern (mint once, read on the host, reuse the tag).**
+  `sample_mip`/`sample_mip_gauss`/`sample_lod`'s scalar LOD now resolves on the host before the
+  clamp that used to force a 4-byte D2H copy plus a stream sync per call; the whole string/array
+  builtin family (`replace`, `substr`, `split`, `pad_left`/`pad_right`, `repeat`, `hash_int`,
+  `char_at`, `debug_print`) now resolves its size/index arguments the same way; and a `$param`
+  array index or loop bound no longer drains the device once per evaluation (a loop bound no
+  longer drains it on every entry). Every fix is behaviour-identical by construction — a literal,
+  `$param` or folded constant reads the same value either way, only where it is read from moves.
+- **TRK-71 — `tex_engine.py` and `tex_node.py` now build their scalar-param dict from one
+  shared function.** The two consumers invariant 11 requires to agree already agreed in every
+  case that could be constructed, but by arriving at the same answer independently rather than
+  by construction; now they call the same code. No defect reproduced, no behaviour change.
+- **TRK-73 — `prewarm` fingerprints each program once, not twice.** `TEXCache.fingerprint`
+  over ten never-seen demo programs: 20 calls → 10. `compile` alone is unmoved at one call.
+- **TRK-83 — `_halo_tile_plan` is no longer called on a stage `_tile_plan` already answered.**
+  A whole-frame cook's fixed pipeline called `_halo_tile_plan` once per stage even when the
+  stage was already known tile-safe with no pressure; `tex_engine.py`'s halo-tile call site now
+  skips it when `tex_memory.is_tile_safe_cached` already says so — the same memo the call would
+  have consulted first, so this removes a call, not a decision.
+
+### Fixed
+
+- **TRK-69 — the one potentially pixel-visible change in this release.** `fn_bilateral_filter`
+  now fp32-rounds a bare Python float `sigma_s` the same way `fn_gauss_blur` already rounds a
+  bare float sigma, instead of taking it at full Python `float` precision. **Stated plainly:**
+  this only moves a pixel for a *direct caller* that hands either builtin a bare Python float —
+  neither shipped tier ever does (both tiers mint every scalar into a tagged tensor first), and
+  the ComfyUI node never calls either builtin with one. **Every default-path pixel this release
+  ships is otherwise unchanged.**
+- **TRK-95 — `TEX_CACHE_BUDGET_MB` gets the same floor `NEG-3` already gave
+  `governor_budget`.** `0`, a negative value, or garbage now falls back to the computed default
+  instead of being accepted as a literal byte budget for the stdlib tensor cache.
+- **TRK-16 — a fractional-MiB frame budget now survives a profile round-trip.**
+  `ResultCache(budget_mb=0.75)` used to restore as `0` after cycling through the `balanced`
+  profile (`int(0.75) == 0`); it now restores from its exact remembered bytes. Whole-MiB
+  budgets are unmoved.
+- **TRK-103 — the `PORT-1` import lint now covers `comfy_api`, not only
+  `comfy.model_management`.** `tex_node.py`'s `from comfy_api.latest import IO` sat outside the
+  lint's alphabet, which is what let `_V3_AVAILABLE` diverge between this box and CI silently.
+  `docs/roadmap.md`'s "three adapter files" sentence is corrected to name both files the lint now
+  covers.
+
+### Tooling (`benchmarks/`, `tests/`, `tools/` only — no `tex_*` production module touched)
+
+- **TRK-80 (data half)** — `benchmarks/run_benchmarks.py::generate_bindings` is now seeded
+  (`_bindings_seed`), so a program's generated input data no longer changes between runs; the
+  companion classification question (does a cook's compiled-tier verdict depend on process
+  history?) is carried forward as a new finding, `TRK-169`, for whoever next owns
+  `tex_runtime/compiled.py`'s tier selection.
+- **TRK-167** — `tools/gate.py`'s counts leg now sees a `TRK-100`-style shape-mismatch
+  `REFUSED` result as a failure (`judge()` used to read it GREEN), and the gate's failure log
+  now carries each red's assertion text instead of only its node id.
+- **TRK-131** — `profile.py`/`interpreter.py` docstrings now name the `sync=True`-builtin
+  measurement trap directly, so a future "no difference" reading from a synced pool is read as
+  evidence of a masked test, not of safety.
+- **TRK-159** — `tests/test_v018_docs.py`'s module-store census now documents, rather than
+  silently absorbs, the blind spot a cross-file alias creates for a container declared in one
+  module and mutated through an alias in another.
+
+### For anyone vendoring this tree
+
+Four things this release moves, per `docs/brief-conventions.md`: **(1) no newly reserved
+names.** **(2) `LANGUAGE_VERSION` does not move** — stays `"0.25"`. **(3) no default moves.**
+**(4) no new shipping module filenames** — every change lands in an existing module
+(`tex_tiling.py`, `tex_runtime/stdlib_core.py`, `stdlib_string.py`, `stdlib_array.py`,
+`stdlib_sample.py`, `tex_runtime/interpreter.py`, `tex_engine.py`, `tex_node.py`, `tex_api.py`,
+`tex_memory.py`, `tex_results.py`, `profile.py`) or in `benchmarks/`/`tests/`/`tools/`/docs.
+**No user-visible behaviour change except what is named above, stated plainly:** `TRK-69` is the
+one row that can move a pixel, and only for a direct caller passing a bare Python float where
+both shipped tiers already pass a tagged tensor — every other fix in this release is a readback
+removed, a call skipped, or a doc/test correction, each confirmed, not assumed, invisible on the
+default ComfyUI cook path.
+
 ## [0.40.3] - 2026-09-24 — "Close the ledger"
 
 Six tracker rows and a citation-budget correction close, plus five benchmark-tooling rows —
@@ -67,7 +156,7 @@ freeze is owed.
 - **TRK-109 — the CHANGELOG's own dangling citation named its covering symbol.** The `roi=`/
   fused-chain sentence's citation named no enclosing symbol, so `tools/check_citations.py` had
   carried it as a standing warning since the citation tool shipped. Now reads
-  "`tex_engine.py:1261`, inside `run`"; the citation-warning budget re-pins 22→21.
+  "`tex_engine.py:1283`, inside `run`"; the citation-warning budget re-pins 22→21.
 
 ### Tooling (`benchmarks/`, `tests/` only — no `tex_*` production module touched)
 
@@ -2826,7 +2915,7 @@ is unlikely to get right:
   `frame_version` is a constant 0 for every frozen entry, and `put` always freezes.
 
 **Scope, decided in §1 of the note rather than deferred:** `roi=` is refused on a fused chain
-(`tex_engine.py:1261`, inside `run`), so CACHE-9 serves the *unfused* per-stage host and CACHE-7
+(`tex_engine.py:1283`, inside `run`), so CACHE-9 serves the *unfused* per-stage host and CACHE-7
 the fused one. They are complements, not layers.
 
 ### GOV-1 — memory/effort profiles on the governor (`tex_memory.py`)
