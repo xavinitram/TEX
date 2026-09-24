@@ -5,6 +5,63 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.2] - 2026-09-24 — "Fail early, replay freely"
+
+Closes the register on `v0.40.0`'s own leftovers (`TRK-162`, `TRK-163`) and lifts the one
+capture bar `v0.40.1` left standing. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat
+freeze is owed — nothing here changes grammar or adds a reserved name.
+
+### Fixed
+
+- **TRK-162 — an ARRAY-typed `if`/`for`/`while` condition is now refused at type-check,
+  as a new diagnostic, `E3501`.** `_check_scalar_condition` rejected only
+  `cond_type.is_vector`; an ARRAY-typed condition type-checked clean and crashed three
+  layers into execution with a bare `RuntimeError` the moment the branch values' shape
+  disagreed with the condition's own length. **This is the one behaviour change a user
+  can see in this release: a program that used to crash at cook now fails to compile,
+  with a named error instead of a stack trace.** Reachable on the default ComfyUI
+  profile too, via a plain local array declaration (`float arr[3] = {...}; if (arr)
+  {...}`) — no engine profile flag needed, correcting the finding's original "engine-
+  profile-only" framing.
+- **TRK-163 / `COLOR-1-R1` — a LUT is never sliced by tiling or batch-strip splitting.**
+  A `[N,N,N,3]` LUT bound beside an image whose H or B coincidentally equalled N was
+  silently sliced by `run_tiled`/`run_batch_strips`' shared-size candidate scan, the same
+  class of corruption two coincidentally same-shaped images already risked. Both
+  functions (via the shared `_shared_dim_size`) now exclude a registered non-spatial
+  binding (`apply_lut3d`'s LUT argument, via the same `non_spatial_args`-derived set
+  `v0.40.0` introduced) from the shared-size candidate set entirely, so it is always
+  passed through whole. `shared_tile_width`/`run_tiled_halo` and `tex_tiling.py`'s
+  planners carry the identical structural shape but are not exploitable today (neither
+  slices a binding by shape match); noted for symmetry, not fixed speculatively.
+
+### Changed
+
+- **Viewer builtins are now CUDA-graph captured, with per-replay inputs — a tweak no
+  longer forces a recapture or a recompile.** `v0.40.1` barred capture of any program
+  calling `viewer_exposure()`/`viewer_gamma()` outright, since a replay never re-enters
+  Python and would keep re-serving whatever value was read at capture. `GraphedProgram`
+  now owns one persistent buffer per host-context builtin a captured program actually
+  calls, seeded at capture and `fill_()`ed with a fresh value before every `.replay()` —
+  the same static-input-buffer mechanism `bindings` already uses. `viewer_context` is
+  still never part of the capture key (unchanged ruling: a value, not a key), so the SAME
+  captured graph serves every tweak. `frame`/`fps`/`time` remain barred, unchanged — no
+  host has a playhead to feed one yet.
+- **The host-context registry field gains a declared identity default.** `StdlibEntry`
+  grows `host_context_default` (float, default `1.0`); `viewer_exposure`/`viewer_gamma`
+  declare it explicitly rather than every call site (and now the graph-capture buffer
+  seed) hard-coding the same `1.0` literal separately. ComfyUI-invisible: both builtins
+  declare exactly the value every site already hard-coded, so no cook's output moves.
+
+### For anyone vendoring this tree
+
+Four things this release moves, per `docs/brief-conventions.md`: **(1) no newly reserved
+names.** **(2) `LANGUAGE_VERSION` does not move** — stays `"0.25"`. **(3) no default
+moves** — `host_context_default` is a new declared field whose value matches every
+existing hard-coded site exactly. **(4) no new shipping module filenames** — every change
+lands in existing modules (`tex_compiler/type_checker.py`, `tex_memory.py`,
+`tex_runtime/graphed.py`, `tex_runtime/stdlib_core.py`, `tex_runtime/stdlib_color.py`,
+`tex_runtime/stdlib_registry.py`).
+
 ## [0.40.1] - 2026-09-24 — "Every path sees the light"
 
 The fused viewer transform PM-11 pencilled for `v0.40.0` lands: two zero-arg builtins,
