@@ -83,6 +83,11 @@ The `conftest.py` fixture creates the `SubTestResult`, passes it to the test fun
    - `assert_equiv(r, name, code, bindings)` — verify interpreter/codegen match
    - `make_img(B, H, W, C, seed)` — deterministic test image
    - `make_latent(B, C, H, W, seed)` — fake LATENT dict
+   - **Adding a name to `helpers.__all__`?** That list is a pinned surface: an embedding
+     host's own suite binds `from helpers import *`, so `test_hook4_testkit.py::
+     test_hook4_bare_star_import_yields_the_base_sha_set` (HOOK-4) holds it to the v0.35.0
+     (`b7a92e5`) set on purpose and reds on any addition. Update that test's `_BASE_ALL` in
+     the same commit — otherwise the red only shows up at the full tier, not the cheap one.
 4. That is the whole wiring: `run_all.py` derives its call list from the tree, and
    `test_v017_phase1.py::test_tst7_runner_coverage` (TST-7) reds if a row it can see is one
    the runner cannot reach.
