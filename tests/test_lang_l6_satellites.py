@@ -163,19 +163,24 @@ def test_l6_capture_gate_declines_a_flagged_program_with_sync_points(r: SubTestR
         except Exception as e:
             r.fail(f"L6 capture declines {label}", f"{type(e).__name__}: {e}")
 
-    # Every L4 atom whose plan has a sync point and whose 0.23 verdict is True must flip.
+    # Every L4 atom whose plan has a sync point (TRK-154: including a masked call site) and
+    # whose 0.23 verdict is True must flip.
     try:
         flipped = []
         for name in sorted(_ATOMS):
             prog = _parse(PRAGMA + _ATOMS[name])
             plan = tex_api.flow_plan(prog)
-            if not (plan.sync_points or plan.scatter_sites):
+            if not (plan.sync_points or plan.scatter_sites or plan.call_sites):
                 continue
             if graphed._capturable(prog, _masked_flow=False)[0] is not True:
                 continue                                # declined at every level already
             assert graphed._capturable(prog, _masked_flow=True) == (False, 0), name
             flipped.append(name)
         assert len(flipped) >= 3, f"too few atoms exercise the decline: {flipped}"
+        assert "binding_write_in_call" in flipped, (
+            "TRK-154: a call reached under a per-pixel `if` syncs (M4's empty-call skip) "
+            "regardless of what its body does — this atom's plan must carry a call_sites "
+            "entry and its capturable verdict must flip under 0.25")
         r.ok(f"{len(flipped)} L4 atoms capturable under 0.23 decline under 0.25: "
              f"{', '.join(flipped)}")
     except Exception as e:
@@ -214,14 +219,15 @@ def test_l6_capture_gate_keeps_a_sync_free_025_program(r: SubTestResult):
         except Exception as e:
             r.fail(f"L6 capture keeps {label}", f"{type(e).__name__}: {e}")
 
-    # …and across every L4 atom: a plan with no sync/scatter site leaves the verdict AND
-    # the op count exactly where 0.23 put them.
+    # …and across every L4 atom: a plan with no sync/scatter/call site (TRK-154: the third
+    # is now part of "sync-free") leaves the verdict AND the op count exactly where 0.23
+    # put them.
     try:
         kept = 0
         for name in sorted(_ATOMS):
             prog = _parse(PRAGMA + _ATOMS[name])
             plan = tex_api.flow_plan(prog)
-            if plan.sync_points or plan.scatter_sites:
+            if plan.sync_points or plan.scatter_sites or plan.call_sites:
                 continue
             assert graphed._capturable(prog, _masked_flow=True) == \
                 graphed._capturable(prog, _masked_flow=False), name

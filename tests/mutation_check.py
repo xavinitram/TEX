@@ -611,8 +611,19 @@ MUTATIONS = [
      "    if False:\n        return (False, 0)\n",
      ("test_lang_l6_satellites",)),
     ("LANG-L6: the capture gate declines EVERY flagged program", "tex_runtime/graphed.py",
-     "    return (not plan.complete) or bool(plan.sync_points or plan.scatter_sites)\n",
+     "    return (not plan.complete) or bool(plan.sync_points or plan.scatter_sites\n"
+     "                                       or plan.call_sites)\n",
      "    return True\n",
+     ("test_lang_l6_satellites",)),
+    # TRK-154: the capture gate stops asking about masked call sites — a program whose ONLY
+    # sync is a user-function call reached under a per-pixel `if` (e.g. the `binding_write_
+    # in_call` L4 atom) would read statically capturable again and pay a doomed capture
+    # attempt (measured: a real `cudaErrorStreamCaptureInvalidated`) instead of declining
+    # up front.
+    ("TRK-154: the capture gate stops asking whether a masked call site syncs",
+     "tex_runtime/graphed.py",
+     "                                       or plan.call_sites)\n",
+     "                                       or False)\n",
      ("test_lang_l6_satellites",)),
     ("LANG-L6: auto stops declining a 0.25 per-pixel for", "tex_runtime/precision_policy.py",
      "    if _masked_per_pixel_for(program, _masked_flow):\n",

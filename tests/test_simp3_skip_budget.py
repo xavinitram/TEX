@@ -83,7 +83,12 @@ _SKIP_VOCAB = re.compile(
 #: for a `torch.cuda.CUDAGraph`, so an absent-CUDA run reports a genuine skip, not a
 #: reflex. The fourth new row (`test_v042_viewer_now_capturable`) needs no device — it
 #: drives the static AST gate (`graphed._capturable`) directly — and carries no `r.skip`.
-_SKIP_BUDGET = 105
+#: Re-pinned from 105 to 106 (TRK-154): `test_trk154_call_site_capture_decisions.py::
+#: test_trk154_the_flip_was_never_a_working_capture` drives a REAL `run_graphed` capture
+#: attempt on a program whose pre-fix static verdict was "capturable" — the same
+#: no-CPU-witness reason as the v042-graph rows above, since there is no CPU stand-in for
+#: a genuine `cudaErrorStreamCaptureInvalidated`.
+_SKIP_BUDGET = 106
 
 
 def _literal(node) -> str:

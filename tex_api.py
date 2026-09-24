@@ -466,6 +466,14 @@ class _ControlFlowLint:
         self.probe_sites = set()          # id(FunctionCall) — `debug_print` under one (M7)
         self.binding_write_sites = set()  # id(Assignment) — a plain `@binding` write inside a
                                           # CALLED function, under one (M6)
+        # TRK-154: id(FunctionCall) — a call to a user-defined function reached under a
+        # per-pixel `if` (or inside a loop already `pp`), the same condition `pp_called`
+        # already flags at function granularity below. `_mf_call_user_function`'s M4
+        # empty-call skip (`if not m_any(self._live))`) syncs (a `.item()`) exactly here —
+        # once the live mask can be a per-pixel TENSOR rather than always-True — and until
+        # now no set on this walk named that class of site for a CUDA-graph capture
+        # decision to see.
+        self.call_sites = set()
         self.sync_points = set()          # id(ForLoop/WhileLoop) needing a per-pass live check
                                           # under masking: its own condition is per-pixel (==
                                           # varying_loops), or it directly encloses a transfer
@@ -897,6 +905,7 @@ class _ControlFlowLint:
                     self.probe_sites.add(id(n))
                 if n.name in self.fns:
                     self.pp_called[n.name] = True
+                    self.call_sites.add(id(n))    # TRK-154: the call SITE, not just the callee
             if cls is A.TernaryOp:
                 if self.emit and self._varies(n.condition, st) and (
                         self._has_gather(n.true_expr) or self._has_gather(n.false_expr)):
@@ -1123,6 +1132,15 @@ class FlowPlan:
                               per-pixel `if` (so the loop's OWN live mask can narrow
                               mid-loop even though its bound is uniform — R-BREAK/R-CONT's
                               shape).
+      * `call_sites`        — a call to a user-defined function reached under a per-pixel
+                              `if` (or from inside a loop already `pp`; TRK-154). M4's
+                              empty-call skip (`if not m_any(self._live)`) syncs (a
+                              `.item()`) exactly here, once the live mask reaching the call
+                              can be a per-pixel TENSOR rather than always-True — the class
+                              of sync `sync_points`/`scatter_sites` did not name, so a
+                              CUDA-graph capture decision consulting only those two could
+                              not see it (it still failed capture loudly and blacklisted
+                              the key, the pre-existing net — never served silently wrong).
       * `complete`          — False when the walk could not finish (the work budget was
                               exceeded, or it raised) — the FAIL-CLOSED half of "over-
                               approximate by name, not by value": a caller that sees
@@ -1136,6 +1154,7 @@ class FlowPlan:
     probe_sites: frozenset = frozenset()
     binding_write_sites: frozenset = frozenset()
     sync_points: frozenset = frozenset()
+    call_sites: frozenset = frozenset()
     complete: bool = True
 
     def is_empty(self) -> bool:
@@ -1145,7 +1164,8 @@ class FlowPlan:
         reason every set above is a NAME-level over-approximation, never a guess."""
         return self.complete and not (self.per_pixel_loops or self.transfer_sites
                                        or self.scatter_sites or self.probe_sites
-                                       or self.binding_write_sites or self.sync_points)
+                                       or self.binding_write_sites or self.sync_points
+                                       or self.call_sites)
 
 
 _INCOMPLETE_FLOW_PLAN = FlowPlan(complete=False)
@@ -1181,6 +1201,7 @@ def flow_plan(program, binding_types: dict | None = None) -> FlowPlan:
         probe_sites=frozenset(lint.probe_sites),
         binding_write_sites=frozenset(lint.binding_write_sites),
         sync_points=frozenset(lint.sync_points | lint.varying_loops),
+        call_sites=frozenset(lint.call_sites),
     )
 
 

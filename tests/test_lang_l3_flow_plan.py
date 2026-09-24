@@ -61,6 +61,17 @@ _L7_KNOWN_NONEMPTY = frozenset({
     "per_pixel_control_flow",
 })
 
+# TRK-154: `FlowPlan.call_sites` now names a call to a user function reached under a
+# per-pixel `if` — a class of site the walk previously did not track at all, so it drew an
+# EMPTY plan for these two shipped examples even though each genuinely has one:
+# `examples/fix_pixels.tex` calls `is_bad(neighbor)` inside the per-pixel
+# `if (is_bad(col) > 0.5) { ... if (is_bad(neighbor) < 0.5) { ... } }` guard, and
+# `examples/recursive_pattern.tex` calls `palette(val)` inside `if (val > 0.0) { @OUT =
+# palette(val); }` — both real per-pixel-guarded calls, not new false positives. Neither
+# program's `is_bad(col)`/`iterate(...)` call sites count: a condition expression, and an
+# unconditional top-level call, are both evaluated at uniform (`pp=False`) live.
+_TRK154_KNOWN_NONEMPTY = frozenset({"fix_pixels", "recursive_pattern"})
+
 
 def _parse(src: str):
     return Parser(Lexer(src).tokenize(), source=src).parse()
@@ -129,12 +140,13 @@ def test_l3_empty_plan_for_every_corpus_program_but_one(r: SubTestResult):
             if not plan.is_empty():
                 non_empty.append(name)
         assert total >= 130, f"corpus census reach dropped: only {total} program(s)"
-        want = sorted([_KNOWN_NONEMPTY, *_L7_KNOWN_NONEMPTY])
+        want = sorted([_KNOWN_NONEMPTY, *_L7_KNOWN_NONEMPTY, *_TRK154_KNOWN_NONEMPTY])
         assert sorted(non_empty) == want, (
             f"expected exactly {want!r} to draw a non-empty plan, got {sorted(non_empty)!r}")
         r.ok(f"{total - len(want)}/{total} corpus program(s) get an empty plan; the "
              f"{len(want)} exceptions are {_KNOWN_NONEMPTY} (the design note's own class-B "
-             f"case) plus LANG-L7's own eleven")
+             f"case) plus LANG-L7's own eleven plus TRK-154's own two "
+             f"({', '.join(sorted(_TRK154_KNOWN_NONEMPTY))})")
     except Exception as e:
         r.fail("LANG-L3 corpus empty-plan census", str(e))
 
@@ -253,12 +265,22 @@ if (a > 0.5) {
 
         p_bw_local = tex_api.flow_plan(_parse(binding_write_local_src))
         assert len(p_bw_local.binding_write_sites) == 1, p_bw_local.binding_write_sites
+        # TRK-154: `writer(@A.r)` is called UNIFORMLY at top level — the per-pixel `if` is
+        # inside the function's own body — so this shape must draw NO call site.
+        assert not p_bw_local.call_sites, (
+            "a uniformly-called function must not draw a call_sites entry: "
+            f"{p_bw_local.call_sites}")
 
         p_bw_call = tex_api.flow_plan(_parse(binding_write_callsite_src))
         assert len(p_bw_call.binding_write_sites) == 1, p_bw_call.binding_write_sites
+        # TRK-154: `setter(a)` sits INSIDE the per-pixel `if` here — the call SITE itself
+        # inherits a per-pixel live mask (M4), so this is exactly the shape call_sites exists
+        # to name.
+        assert len(p_bw_call.call_sites) == 1, p_bw_call.call_sites
 
         r.ok("scatter/probe/binding-write (both the direct and the call-site-inherited "
-             "M6 shape) each name exactly one site")
+             "M6 shape) each name exactly one site; TRK-154's call_sites fires only for "
+             "the call-site-inherited shape")
     except Exception as e:
         r.fail("LANG-L3 M5/M6/M7 sites", str(e))
 

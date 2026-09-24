@@ -215,10 +215,13 @@ def _masked_flow_syncs(program: Program, _masked_flow: "bool | None" = None) -> 
     compaction (`masked_flow.scatter_keep`) reads the mask back the same way, so a scatter
     site under a per-pixel `if` is a sync too. Either would fail capture LOUDLY — never
     silently — so this is exactly the trade `_SYNC_STDLIB` makes: skip the doomed capture
-    and its RNG-poison recovery instead of paying them once per new key. (A user-function
-    call reached under a per-pixel live mask also syncs — M4's empty-call skip — and the
-    plan has no set that names those call sites; that capture still fails loudly and is
-    blacklisted, the pre-existing net, rather than served wrong.)
+    and its RNG-poison recovery instead of paying them once per new key. A user-function
+    call reached under a per-pixel live mask also syncs — M4's empty-call skip
+    (`if not m_any(self._live)`) — and TRK-154 gave `FlowPlan` the set that names those
+    call sites (`call_sites`), read below the same way as `sync_points`/`scatter_sites`;
+    before that, this capture still failed loudly and was blacklisted (the pre-existing
+    net), rather than served wrong — TRK-154 only makes the decline STATIC instead of
+    discovered by a failed capture.
 
     Asked ONLY of a flagged program, and that is what keeps every existing verdict where it
     is (invariant 7): `masked_flow.enabled_for` decides on `Program.language is None` alone
@@ -240,7 +243,8 @@ def _masked_flow_syncs(program: Program, _masked_flow: "bool | None" = None) -> 
         return False
     from ..tex_api import flow_plan            # lazy: tex_api imports this package
     plan = flow_plan(program)
-    return (not plan.complete) or bool(plan.sync_points or plan.scatter_sites)
+    return (not plan.complete) or bool(plan.sync_points or plan.scatter_sites
+                                       or plan.call_sites)
 
 
 def _capturable(program: Program, *, _masked_flow: "bool | None" = None) -> tuple[bool, int]:
