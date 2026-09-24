@@ -5,8 +5,8 @@ tens of rounds) — this file does not re-run that sitting. It pins the parts th
 cheap to check and load-bearing for the "commit the method, not the machine" goal
 `docs/brief-conventions.md` names: the box name is derived at runtime rather than
 hard-coded, the cache root defaults under the system temp dir rather than a private
-path, and the null-control math (the same split-half comparison
-`docs/worklog/roi-cg/measure_codegen_roi.py` used) is correct.
+path, and the null-control math (the same split-half comparison the maintainer's
+measurement script used) is correct.
 
 Loaded by path, like `helpers.load_counts_harness` loads `host_path_counts.py`:
 `benchmarks/` is `.comfyignore`d and not a package, so there is no import name.
@@ -87,7 +87,13 @@ def test_trk133_no_machine_or_host_path_literal_in_the_source(b):
     a worktree path, a cache directory and a box name that only existed on ONE machine
     (see the module docstring). Fail loudly here too if that regresses."""
     import inspect
+    from pathlib import Path
     src = inspect.getsource(b)
     assert "TEX_wt" not in src
-    assert "xavin" not in src.lower()
+    # Derived, not hard-coded (the same principle this whole test file checks the SCRIPT
+    # for): whatever this box's own username is must not appear in the script's source,
+    # but the username itself is never spelled out in this pushed file either.
+    username = Path.home().name.lower()
+    if username:
+        assert username not in src.lower()
     assert "comfyui_windows_portable" not in src.lower()
