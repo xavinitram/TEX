@@ -11,7 +11,7 @@ decisions it names, with the tension stated for each, and is the contract the te
 TEX can read any pixels a host hands it as a binding, and nothing else. Every temporal
 op in the language — `fetch_frame`, `sample_frame`, the 3-arg `@A[x,y,f]` sugar — indexes
 **inside the batch that was already marshalled**. ROI-6's `frame_window` analysis
-(`tex_roi.frame_window`, `tex_roi.py:931`) stops at the batch edge for exactly that reason:
+(`tex_roi.frame_window`, `tex_roi.py:939`) stops at the batch edge for exactly that reason:
 there is nothing past it to reach.
 
 Motion blur over a shutter, a temporal median over ±3 frames, a flow-warp from the

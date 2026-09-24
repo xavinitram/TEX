@@ -436,7 +436,7 @@ _REGION_DEP_MEMO_MAX = 256
 _region_dep_memo: "OrderedDict[tuple, bool]" = OrderedDict()
 
 
-def _unfolded_region_independent(code: str, binding_types) -> bool:
+def _unfolded_region_independent(code: str, binding_types, code_hash: str | None = None) -> bool:
     """True when `region_dependent` on the UNFOLDED (pristine) program is False — which
     makes it provably False for the FOLDED program too, at ANY `$param` valuation,
     without walking the per-tick fold at all.
@@ -472,11 +472,17 @@ def _unfolded_region_independent(code: str, binding_types) -> bool:
     never collide with a real `tex_cache.fingerprint()` hex string, so the two verdict
     populations share one bounded LRU safely. Fails toward "not provably independent"
     (False) on any exception, which sends the caller to the existing, already-safe
-    per-fold walk rather than to a claim this predicate could not verify."""
+    per-fold walk rather than to a claim this predicate could not verify.
+
+    `code_hash`, when the caller already has it, skips a second `sha256(code)` — `_walk`
+    computes this exact digest for its own memo key on EVERY call, so a caller-supplied
+    hash saves a full re-hash of `code` on every scrub tick (`interp_chain_scrub`'s own
+    proof: this predicate ran once per tick, same as `_walk`'s memo key). `None` (any
+    other caller) falls back to hashing here, unchanged."""
     try:
         program = _pristine_program(code)
-        fp = ("trk65-unfolded", hashlib.sha256(code.encode()).hexdigest(),
-              _string_wire_key(binding_types))
+        digest = code_hash if code_hash is not None else hashlib.sha256(code.encode()).hexdigest()
+        fp = ("trk65-unfolded", digest, _string_wire_key(binding_types))
     except Exception:
         return False
     return not region_dependent_cached(program, fp, binding_types, code)
@@ -770,7 +776,8 @@ def _walk(code: str, param_values: dict, binding_types: dict | None = None):
     try:
         # PERF-8: `_profile_key()` last — the walk's answer is derived from a parse that is a
         # function of the egress profile too, so the key carries it (see `tex_lazy`).
-        key = (hashlib.sha256(code.encode()).hexdigest(), _param_key(param_values),
+        code_hash = hashlib.sha256(code.encode()).hexdigest()
+        key = (code_hash, _param_key(param_values),
                _string_wire_key(binding_types), _profile_key())
     except Exception:
         return None
@@ -799,7 +806,8 @@ def _walk(code: str, param_values: dict, binding_types: dict | None = None):
         # TRK-65: skip the per-fold region-dependence walk entirely when the UNFOLDED source
         # already proves it independent of any $param value (see the helper's docstring for
         # why this direction, and only this direction, is safe to cache value-independently).
-        region_dep = (False if _unfolded_region_independent(code, binding_types)
+        # `code_hash` reuses the digest this walk's own memo key already computed above.
+        region_dep = (False if _unfolded_region_independent(code, binding_types, code_hash)
                       else region_dependent(program, binding_types, code))
         result = (reads, blocked, state["halo"],
                   _referenced_at_bindings(code) - written - set(reads),

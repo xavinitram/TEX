@@ -110,7 +110,7 @@ def test_trk65_mutation_a_wrongly_independent_verdict_is_visible(r: SubTestResul
     print("\n--- TRK-65 mutation guard: a broken fast path is CAUGHT, not silently trusted ---")
     tex_roi.clear_roi_memo()
     orig = tex_roi._unfolded_region_independent
-    tex_roi._unfolded_region_independent = lambda code, binding_types: True
+    tex_roi._unfolded_region_independent = lambda code, binding_types, code_hash=None: True
     try:
         walked = tex_roi._walk(_LOOP_REPRO, {})
     finally:
