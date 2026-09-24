@@ -35,7 +35,8 @@ from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_ve
 from .host import _cancel_check, _report_progress   # SCHED-3 seam (no cycle: host imports torch only)
 from . import profile as _prof                      # PROF-1 seam (pure stdlib; disarmed by default)
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
-                     _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar)
+                     _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar,
+                     _host_scalar)
 from . import stdlib as _stdlib_mod    # P0-D: publishes the cook grid for const-coord reads
 from .masked_flow import (MaskedFlowMixin, enabled_for as _masked_flow_enabled_for,
                           scatter_keep as _masked_flow_scatter_keep)
@@ -1154,6 +1155,8 @@ class Interpreter(MaskedFlowMixin):
                 spatial_shape = result.shape[:-2]  # [B, H, W]
                 ci = _const_index(target.index, arr_size)
                 if ci is None:
+                    ci = _host_index(index, arr_size)
+                if ci is None:
                     ci = int(idx.item())
                 result[..., ci, :] = _ensure_spatial(value, spatial_shape)
             else:
@@ -1177,6 +1180,8 @@ class Interpreter(MaskedFlowMixin):
             elif idx.dim() == 0:
                 spatial_shape = result.shape[:-1]
                 ci = _const_index(target.index, arr_size)
+                if ci is None:
+                    ci = _host_index(index, arr_size)
                 if ci is None:
                     ci = int(idx.item())
                 result[..., ci] = _ensure_spatial(value, spatial_shape)
@@ -1800,7 +1805,8 @@ class Interpreter(MaskedFlowMixin):
                 return array[idx]
             if idx.dim() == 0:
                 # Constant (runtime scalar) index: [..., N, C] → [..., C]
-                return array[..., idx.item(), :]
+                hi = _host_index(index, arr_size)
+                return array[..., hi if hi is not None else idx.item(), :]
 
             # Per-pixel index: gather on dim=-2
             C = array.shape[-1]
@@ -1820,7 +1826,8 @@ class Interpreter(MaskedFlowMixin):
         if array.dim() == 1:
             return array[idx]
         if idx.dim() == 0:
-            return array[..., idx.item()]
+            hi = _host_index(index, arr_size)
+            return array[..., hi if hi is not None else idx.item()]
 
         idx_expanded = idx.unsqueeze(-1)
         if idx_expanded.shape[:3] != array.shape[:3]:
@@ -2733,6 +2740,22 @@ def _const_index(index_node, size: int) -> int | None:
     return None
 
 
+def _host_index(index: torch.Tensor, size: int) -> int | None:
+    """Floor+clamp a RUNTIME index using the host reading it carries (TRK-68), or None
+    when it has none — the runtime-scalar counterpart to `_const_index`'s compile-time
+    literal, and the same floor+clamp `_safe_array_index` does on the device
+    (`torch.clamp(torch.floor(idx).long(), 0, size - 1)`), done on the host instead so a
+    `$param` index does not drain the device on every evaluation. A missing tag (a
+    genuinely per-cook computed index) answers None and the caller falls back to
+    `idx.item()` exactly as before."""
+    if index.__class__ is not torch.Tensor or index.dim() != 0:
+        return None
+    v = _host_scalar(index)
+    if v is None:
+        return None
+    return max(0, min(int(math.floor(v)), size - 1))
+
+
 def vec_list_to_tensor(value, dtype, device) -> torch.Tensor:
     """A vec/color param list (e.g. [r,g,b]) → a [1,1,1,C] channel-last tensor
     (len 2/3/4, for correct spatial broadcast) or a plain 1-D tensor otherwise.
@@ -2777,7 +2800,12 @@ def _int_valued_scalar(value) -> int | None:
     if isinstance(value, torch.Tensor):
         if value.dim() != 0:
             return None
-        value = value.item()
+        # TRK-68: a `$param` loop bound is minted with a host reading; take it from
+        # there instead of draining the device on every loop ENTRY (this runs once
+        # per entry, not per iteration — the general per-iteration path below is
+        # unaffected). A missing tag (a genuinely computed bound) still reads back.
+        hv = _host_scalar(value)
+        value = hv if hv is not None else value.item()
     try:
         f = float(value)
     except (TypeError, ValueError):

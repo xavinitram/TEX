@@ -471,3 +471,70 @@ def test_trk67_string_family_costs_no_readback(r: SubTestResult):
         except Exception as e:
             r.fail("TRK-67 readback", f"{name}: {type(e).__name__}: {e}")
 
+
+def test_trk68_array_index_and_loop_bound_cost_no_readback(r: SubTestResult):
+    """TRK-68 — RED-FIRST. A `$param` array index drains the device once per evaluation,
+    and a `$param` loop bound drains it once per loop ENTRY (UC-5's `_const_index`
+    already covers the compile-time-literal case one level earlier). `_host_index`
+    (`interpreter.py`) and `_int_valued_scalar`'s own `_host_scalar` read take both from
+    the host instead. CUDA-only.
+
+    Measured as a DELTA against the same program with `_host_scalar` forced to answer
+    None (the pre-fix path), rather than an absolute zero: the array rows below build a
+    SPATIAL array (`[B,H,W,N]`, from a per-pixel value — a host-constant array indexes
+    with a plain tensor index and never reaches `.item()` either side of this fix, so an
+    absolute-zero probe built on one would pass vacuously) via a small loop that itself
+    costs a few unrelated device reads. The one this row is about is the DIFFERENCE
+    `_host_scalar` being disabled makes, which must be a real, positive reduction —
+    interpreter.py imported `_host_scalar` BY NAME (same reason
+    `test_perf2_the_tag_carries_the_rounded_value` patches `_interp._tag_host_scalar`
+    rather than `_stdlib`'s copy of it), so the patch below targets that binding."""
+    print("\n--- TRK-68: array index / loop bound $param costs no device readback ---")
+    if not torch.cuda.is_available():
+        r.skip("TRK-68 device readback",
+               "no CUDA device — a CPU `.item()` is a host-memory read")
+        return
+    torch.manual_seed(20260924)
+    img = torch.rand(1, 4, 4, 4, dtype=torch.float32).to("cuda")
+    _spatial_field = (
+        "float field[4];\n"
+        "for (int k = 0; k < 4; k++) { field[k] = @A.r + float(k); }\n"
+    )
+    rows = (
+        ("read  field[$i]",  _spatial_field +
+                              "@OUT = vec4(field[$i], 0, 0, 1);",
+                              {"i": 2, "A": img}),
+        ("write field[$i]=", _spatial_field +
+                              "field[$i] = @A.g;\n"
+                              "@OUT = vec4(field[0] + field[1] + field[2] + field[3], 0, 0, 1);",
+                              {"i": 1, "A": img}),
+        ("loop  k<$n",       "float acc = 0.0;\n"
+                              "for (int k = 0; k < $n; k++) { acc = acc + 1.0; }\n"
+                              "@OUT = vec4(acc, 0, 0, 1);",
+                              {"n": 4}),
+    )
+    for label, code, extra in rows:
+        name = f"[cuda] {label}"
+        try:
+            with _count_all_item_calls() as fixed_probe:
+                compile_and_run(code, extra, device="cuda")
+            fixed_reads = fixed_probe.device_reads
+
+            orig = _interp._host_scalar
+            _interp._host_scalar = lambda x: None
+            try:
+                with _count_all_item_calls() as base_probe:
+                    compile_and_run(code, extra, device="cuda")
+            finally:
+                _interp._host_scalar = orig
+            base_reads = base_probe.device_reads
+
+            if base_reads <= fixed_reads:
+                r.fail("TRK-68 readback",
+                       f"{name}: forcing the pre-fix path read {base_reads}, not more than "
+                       f"the fixed path's {fixed_reads} — the probe does not exercise the fix")
+            else:
+                r.ok(f"{name} ({fixed_reads} device read(s), {base_reads} with the fix forced off)")
+        except Exception as e:
+            r.fail("TRK-68 readback", f"{name}: {type(e).__name__}: {e}")
+

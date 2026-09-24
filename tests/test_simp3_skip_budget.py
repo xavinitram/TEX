@@ -94,7 +94,10 @@ _SKIP_VOCAB = re.compile(
 #: `test_perf2_a_host_scalar_costs_no_readback` (already inside the pin) carries: a CPU
 #: `.item()` is a host-memory read, not a device round trip, so the row would pass
 #: without measuring anything off CUDA.
-_SKIP_BUDGET = 107
+#: Re-pinned from 107 to 108 (v041-p2, TRK-68): the same file's
+#: `test_trk68_array_index_and_loop_bound_cost_no_readback` carries the identical
+#: no-CPU-witness reason for a `$param` array index / loop bound's device-readback count.
+_SKIP_BUDGET = 108
 
 
 def _literal(node) -> str:
