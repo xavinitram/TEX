@@ -61,6 +61,15 @@ class StdlibEntry:
     # `non_spatial_args_by_name()` derives its own — declare the field, no engine-side edit
     # for the next one of these. Default False for every function that isn't one.
     reads_host_context: bool = False
+    # v042-graph (simplify): the IDENTITY value this host-context builtin returns when no
+    # host supplied it (`viewer_exposure`/`viewer_gamma` are both 1.0 = no-op today).
+    # Declared here so `host_context_defaults()` derives it, rather than the three call
+    # sites that used to hand-write the literal `1.0` (the uncaptured `fn_*` fallback in
+    # `stdlib_color.py`, and the graph tier's capture seed / per-replay refresh in
+    # `graphed.py`) risking three copies drifting apart the day a future host-context
+    # builtin's identity value is something other than 1.0. Meaningless (and ignored) when
+    # `reads_host_context` is False.
+    host_context_default: float = 1.0
 
     @property
     def names(self) -> tuple:
@@ -113,7 +122,7 @@ def _valid_footprint(fp) -> bool:
 
 def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
            doc="", ex="", sig="", category="", non_spatial_args=(),
-           reads_host_context=False):
+           reads_host_context=False, host_context_default=1.0):
     """Record one StdlibEntry and return the decorated object UNCHANGED (so an
     inner `@staticmethod` still applies). Pure data attachment — the name is
     explicit; nothing is inferred or discovered. `footprint` (ROI-1) is validated
@@ -122,7 +131,8 @@ def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
     (COLOR-1) names which 0-based argument positions are a non-spatial resource, not
     an ordinary image/coordinate argument — see `StdlibEntry.non_spatial_args`.
     `reads_host_context` (PM-11) declares a zero-arg builtin fed by a per-cook host
-    VALUE — see `StdlibEntry.reads_host_context`."""
+    VALUE — see `StdlibEntry.reads_host_context`. `host_context_default` (v042-graph)
+    is that builtin's identity value — see `StdlibEntry.host_context_default`."""
     if not _valid_footprint(footprint):
         raise ValueError(
             f"stdlib({name!r}): invalid footprint {footprint!r}. Expected 'point', "
@@ -132,7 +142,8 @@ def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
         fn = obj.__func__ if isinstance(obj, staticmethod) else obj
         REGISTRY.append(StdlibEntry(name, fn, tuple(aliases), spatial, sync,
                                     footprint, doc, ex, sig, category,
-                                    tuple(non_spatial_args), bool(reads_host_context)))
+                                    tuple(non_spatial_args), bool(reads_host_context),
+                                    float(host_context_default)))
         return obj
     return deco
 
@@ -173,6 +184,15 @@ def host_context_names() -> frozenset:
     Function form (evaluated AFTER `TEXStdlib`'s class body has populated `REGISTRY`),
     mirroring `spatial_names()`/`non_local_names()`."""
     return frozenset(n for e in REGISTRY for n in e.names if e.reads_host_context)
+
+
+def host_context_defaults() -> dict:
+    """{name: identity value} for every registered host-context builtin (PM-11/
+    v042-graph) — the single source `graphed.py`'s capture-seed/per-replay-refresh and
+    `stdlib_color._host_context_value`'s uncaptured fallback both read, replacing three
+    hand-written `1.0` literals that could drift apart. Function form (evaluated AFTER
+    `TEXStdlib`'s class body has populated `REGISTRY`), mirroring `host_context_names()`."""
+    return {n: e.host_context_default for e in REGISTRY if e.reads_host_context for n in e.names}
 
 
 def non_local_names() -> frozenset:

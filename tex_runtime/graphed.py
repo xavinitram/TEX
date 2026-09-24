@@ -414,6 +414,11 @@ class GraphedProgram:
         # program actually calls (empty for every program that calls none — the common
         # case, and exactly invariant 7: nothing below touches these when this is {}).
         self.static_host_context: dict[str, torch.Tensor] = {}
+        # v042-graph (simplify): each buffer's identity default (`stdlib_registry.
+        # host_context_defaults()`'s name->value, restricted to what this capture
+        # needs), set once in `_capture_inner`. `_stage()` (the replay hot path) reads
+        # this dict instead of re-scanning the registry on every replay.
+        self._host_context_defaults: dict[str, float] = {}
         self.static_outputs: Any = None      # tensor or dict of tensors
         self.output_names: list[str] | None = None
         self.bytes = 0
@@ -440,12 +445,13 @@ class GraphedProgram:
         # step that makes a captured viewer program correct. The graph's baked-in
         # kernels read this buffer's memory on every replay; nothing else ever changes
         # what is in it between one replay and the next. No-op (the common case) when
-        # this program calls no host-context builtin. The `1.0` fallback is today's
-        # identity default shared by both registered names (`_viewer_value`'s own
-        # default) — a future host-context builtin with a different identity default
-        # would need this generalized alongside it.
+        # this program calls no host-context builtin. The fallback is each name's OWN
+        # registered identity default (`self._host_context_defaults`, seeded in
+        # `_capture_inner` from `stdlib_registry.host_context_defaults()`) rather than a
+        # hand-written literal, so a future host-context builtin with a different
+        # identity default needs no edit here.
         for name, buf in self.static_host_context.items():
-            val = float((viewer_context or {}).get(name, 1.0))
+            val = float((viewer_context or {}).get(name, self._host_context_defaults.get(name, 1.0)))
             buf.fill_(val)
 
     @staticmethod
@@ -504,10 +510,18 @@ class GraphedProgram:
         # (empty for the common case — a program that calls none). Seeded with THIS
         # cook's value; `_stage()` overwrites it before every later replay, so the seed
         # only matters for the warmup/record run below, which never leaves this method.
+        # `self._host_context_defaults` caches each name's registered identity default
+        # (simplify: `stdlib_registry.host_context_defaults()`, not a hand-written `1.0`)
+        # so `_stage()`'s replay hot path never re-scans the registry.
+        from .stdlib_registry import host_context_defaults
+        names = _host_context_calls(program)
+        self._host_context_defaults = {n: v for n, v in host_context_defaults().items()
+                                       if n in names}
         self.static_host_context = {
-            name: torch.scalar_tensor(float((viewer_context or {}).get(name, 1.0)),
-                                      dtype=dtype, device=device)
-            for name in _host_context_calls(program)
+            name: torch.scalar_tensor(
+                float((viewer_context or {}).get(name, self._host_context_defaults.get(name, 1.0))),
+                dtype=dtype, device=device)
+            for name in names
         }
 
         def _run():
