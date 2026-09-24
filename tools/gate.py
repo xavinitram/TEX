@@ -126,6 +126,10 @@ _CHEAP = [
     # ratchets skip `tools/` on purpose. The lint scans the TRACKED set instead, and it
     # belongs in the tier a change is read against rather than three minutes downstream.
     ("private-root lint", "tests/test_simp3_no_machine_paths.py"),
+    # v0422-gatehyg / TRK-128: a stash in ANY worktree of this repository is live for
+    # every one of them (one shared `.git`), and the fast tier is the gate every lane
+    # actually runs before it acts -- the cheapest place to catch it before it matters.
+    ("shared-stash law", "tests/test_v0422_no_shared_stash.py"),
 ]
 
 #: Where the CI-shape interpreter is named, so this file names no machine's private layout.
