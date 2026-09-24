@@ -104,3 +104,98 @@ def test_v0422_race_restore_pinned_h2d_survives_concurrent_readers(r):
              f"mismatches") if ok else \
             r.fail("v0422 restore race",
                    f"errors={errors[:5]} (of {len(errors)}) restored={restored}")
+
+
+# ── the shape the six-way race and the row above CANNOT show: a foreign CUDA stream ─────────
+#
+# `ResultCache` is a public class; an embedding host is free to call `get()`/`put()` from its
+# own thread on its own `torch.cuda.Stream()` (background cache placement is the obvious
+# reason). Everything above stays on the one CUDA default stream every thread starts on, where
+# CUDA's own per-stream FIFO ordering makes `_restore`'s missing fence harmless BY CONSTRUCTION
+# (see the audit at the top of this file) — so it can never exercise the one interleaving that
+# genuinely has no ordering relationship: a reader on a stream that was never told about the
+# restore's copy at all. `_restore` now records a `torch.cuda.Event` on the stream that issues
+# the H2D and `get` makes every caller's current stream `wait_event` it (see `_Entry.pending_
+# event` and the TRK-178 comments in `tex_results.py::get`/`_restore`) before handing the tensor
+# back — a GPU-side wait that costs a settled entry one `Event.query()` and nothing else.
+#
+# HONEST RED-FIRST NOTE. `torch.cuda._sleep(cycles)` — the primitive torch's own test suite uses
+# for exactly this shape — reliably demonstrates the raw hazard in ISOLATION (a bare non-blocking
+# pinned H2D on the default stream, read via `.clone()` on a fresh `torch.cuda.Stream()` right
+# after, with no fence: verified wrong bytes every time in the scratch repro this row's audit
+# used). Threading the SAME technique through the actual `get()`/`_restore()` call path did NOT
+# go red across roughly a dozen attempts and structural variations (allocator pre-warming so the
+# restore's and the read's own allocations reuse cached blocks rather than a syncing fresh
+# `cudaMalloc`; `.clone()` instead of `torch.equal` so the read itself never forces a host sync
+# that would retroactively hide the race; jittered timing) before the fence below was applied —
+# the same resistance-to-reproduction TRK-178 itself has shown from the start (0/270 across the
+# six-way race). This row is therefore a CORRECTNESS GUARD for the fenced behavior, proven safe
+# by the audit and by the isolated demonstration that the mechanism it fences is real, not a
+# demonstrated red-first through this exact path.
+
+_SLEEP_CYCLES = 3_000_000_000   # ~1-3s of GPU busy-wait, depending on clock (idle laptop clocks
+                                # read low on this box per the workstation profile -- that only
+                                # WIDENS the window this test wants, never narrows it)
+
+
+def test_v0422_race_restore_pinned_h2d_fences_a_foreign_stream(r):
+    if "cuda" not in _devices():
+        r.skip("v0422 restore race (foreign stream)", "no CUDA on this box")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        c = tex_results.ResultCache(cache_dir=d, budget_mb=_RAM_BUDGET_MB)
+        key = "foreign-stream"
+        frame = _frame(res=_RES, device="cuda", scale=3.0)
+        c.set_vram_budget(0)
+        c.put(key, frame)
+        c.put(f"{key}-sentinel", _frame(res=32, device="cuda", scale=4.0))
+        c.set_budget(0)
+        c.set_vram_budget(None)
+        c.set_budget(_RAM_BUDGET_MB)
+
+        side_stream = torch.cuda.Stream()
+        outcome = {}
+        admitted = threading.Event()
+
+        def restorer():
+            # Queues on THIS thread's current stream -- the default, since nothing here has
+            # entered a stream context -- so `_restore`'s H2D (issued moments later, same
+            # thread, same stream) is enqueued behind it and cannot start moving bytes until
+            # this busy-wait clears. `_sleep` is an async kernel launch: it does not block this
+            # host thread, so the disk read + admit below still run right away.
+            torch.cuda._sleep(_SLEEP_CYCLES)
+            got = c.get(key, copy=False)
+            outcome["restorer_is_none"] = got is None
+            # Signal AFTER `get()` returns, i.e. after `_admit` has published the entry — not a
+            # fixed sleep, which would either race the admit (missing the point: a plain cache
+            # miss on the side stream just restores independently, on its own stream, and tells
+            # this test nothing) or run so late the copy is long done (no window left to catch).
+            admitted.set()
+
+        t = threading.Thread(target=restorer, daemon=True)
+        t.start()
+        if not admitted.wait(timeout=10.0):
+            r.fail("v0422 restore race (foreign stream)", "restorer never reached admit")
+            return
+        with torch.cuda.stream(side_stream):
+            foreign = c.get(key, copy=False)
+            # `.clone()`, not `torch.equal`, WHILE still inside `side_stream` — cloning is a
+            # plain device-to-device copy with no host-side scalar readback, so (unlike
+            # `torch.equal`, which returns a Python bool and therefore forces a blocking,
+            # implicitly cross-stream-synchronizing D2H of its result) it cannot retroactively
+            # paper over the very race this row exists to catch. The comparison against `frame`
+            # happens later, once ordering no longer matters.
+            snapshot = None if foreign is None else foreign.clone()
+        t.join(timeout=30.0)
+        hung = t.is_alive()
+        # Safe to fence everything now — the snapshot was already taken under the conditions
+        # (or lack of them) that matter; synchronizing here only makes the SNAPSHOT readable.
+        torch.cuda.synchronize()
+        matched = snapshot is not None and torch.equal(snapshot, frame)
+        ok = (not hung and not outcome.get("restorer_is_none", True) and snapshot is not None
+              and matched)
+        r.ok("[cuda] a foreign-stream get() right after a restore reads the fenced, "
+             "bit-exact frame") if ok else \
+            r.fail("v0422 restore race (foreign stream)",
+                   f"hung={hung} restorer_is_none={outcome.get('restorer_is_none')} "
+                   f"snapshot_is_none={snapshot is None} matched={matched}")
