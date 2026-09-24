@@ -107,7 +107,13 @@ _SKIP_VOCAB = re.compile(
 #: (proving the names are no longer reserved, the kwarg is rejected everywhere, and a
 #: non-viewer program's lineage-key byte format is unmoved), needs no CUDA witness — every
 #: row is AST-level or a pure-function check — so it adds 0. Net 108 − 4 = 104.
-_SKIP_BUDGET = 104
+#: Re-pinned from 104 to 105 (v042-hostaudit, rebased onto the removal above): `test_v042_hostaudit4a_oom_refusal.py::
+#: test_hostaudit4a_unrecoverable_oom_carries_a_refusal` skips when this torch build has no
+#: `cuda.OutOfMemoryError` type — the same no-witness reason `test_eng2_oom_ladder`'s own
+#: identical guard (already inside the pin) carries: without that type there is nothing to
+#: monkeypatch `_run_tier` into raising, so the row cannot exercise the OOM ladder at all,
+#: real device or not.
+_SKIP_BUDGET = 105
 
 
 def _literal(node) -> str:
