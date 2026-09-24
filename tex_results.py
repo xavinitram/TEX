@@ -583,19 +583,19 @@ class ResultCache:
                 self.misses += 1
                 return None
             self.hits += 1
-        if fence is not None:   # TRK-178: a foreign stream has no ordering with a live restore
+            if fence is not None:   # TRK-178: A2 -- clear on THIS acquisition, never a second
+                try:
+                    if fence.query():
+                        e = self._ram.get(key)
+                        if e is not None and e.pending_event is fence: e.pending_event = None
+                        fence = None
+                except Exception: fence = None
+        if fence is not None:   # still in flight: GPU-side wait, no host sync (or a wedged event)
             try:
                 import torch
-                if fence.query():          # done: drop it, but only from THIS fence's entry
-                    entry_now = self._ram.get(key)
-                    if entry_now is not None and entry_now.pending_event is fence:
-                        entry_now.pending_event = None
-                else:
-                    cur_stream = torch.cuda.current_stream(frame.device)
-                    cur_stream.wait_event(fence)
-                    frame.record_stream(cur_stream)   # keep the block alive past this stream's use
-            except Exception:
-                pass          # a wedged/absent event: fall through rather than fail the read
+                s = torch.cuda.current_stream(frame.device)
+                s.wait_event(fence); frame.record_stream(s)
+            except Exception: pass   # a wedged/absent event: fall through rather than fail the read
         # The clone is OUTSIDE the lock, deliberately. It is the expensive part of a hit (~3 ms
         # for a 1024²×4 frame), and holding the lock across it would make an interactive `get`
         # wait behind a CACHE-7 phase-2 `put` for the length of a memcpy. Safe because `frame`
