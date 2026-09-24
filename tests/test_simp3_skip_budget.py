@@ -120,7 +120,12 @@ _SKIP_VOCAB = re.compile(
 #: that cross-device reuse, so a CUDA-absent run reports a genuine skip. This lane's own
 #: delta has always been +1 (108→109 originally); rebased twice (v042-noviewer's 108→104,
 #: then v042-hostaudit's 104→105), the honest resolved value is 105+1 = 106.
-_SKIP_BUDGET = 106
+#: Re-pinned from 106 to 107 (v0422-race, TRK-178): `test_v0422_race.py::
+#: test_v0422_race_restore_pinned_h2d_survives_concurrent_readers` skips when there is no CUDA
+#: device — the row stresses `ResultCache._restore`'s pinned non-blocking host-to-device copy,
+#: which only exists on the CUDA leg; there is no CPU-side witness for a DMA-engine copy that
+#: does not happen on CPU at all.
+_SKIP_BUDGET = 107
 
 
 def _literal(node) -> str:
