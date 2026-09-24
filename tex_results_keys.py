@@ -78,22 +78,14 @@ def _canon_params(params) -> str:
 
 
 def _canon_float_dict(d) -> str:
-    """Deterministic, collision-free encoding of a `{name: float-like}` dict, shared by
-    `_canon_time` (the ENG-7 host playhead) and `_canon_viewer` (PM-11's host viewer
-    values) — both key a result by EXACT value (`repr(float(...))`, so a fractional
-    playhead or a sub-ULP exposure slider mints a distinct key rather than colliding onto
-    a stale frame), sorted so name order is irrelevant, and both read "nothing supplied"
-    (empty/falsy) the same way. Empty is `"n"` rather than `"{}"` so the two spellings of
-    "nothing here" can never collide with a dict that happens to serialize to `"{}"`."""
+    """Deterministic, collision-free encoding of a `{name: float-like}` dict — keys a result
+    by EXACT value (`repr(float(...))`, so a fractional playhead mints a distinct key rather
+    than colliding onto a stale frame), sorted so name order is irrelevant, and reads "nothing
+    supplied" (empty/falsy) as `"n"` rather than `"{}"`, so the two spellings of "nothing here"
+    can never collide with a dict that happens to serialize to `"{}"`."""
     if not d:
         return "n"
     return json.dumps({k: repr(float(v)) for k, v in d.items()}, sort_keys=True)
-
-
-def _canon_viewer(vc) -> str:
-    """PM-11: deterministic encoding of the host's viewer values — see `_canon_float_dict`,
-    which this and `_canon_time` both are now."""
-    return _canon_float_dict(vc)
 
 
 def _canon_time(tc) -> str:
@@ -101,13 +93,12 @@ def _canon_time(tc) -> str:
     pixels while being kept out of the program fingerprint (interpreter `_TIME_BUILTIN_NAMES` =
     frame/fps/time), so a result key must carry every one of them, by EXACT value — folding the
     whole normalized dict (not just `frame`) future-proofs a fourth builtin. See
-    `_canon_float_dict`, which this and `_canon_viewer` both are now."""
+    `_canon_float_dict`."""
     return _canon_float_dict(tc)
 
 
 def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
-                frame=None, time_context=None, quality=None, flags=(), canvas=None,
-                viewer_context=None) -> str:
+                frame=None, time_context=None, quality=None, flags=(), canvas=None) -> str:
     """CACHE-1: the content-addressable identity of a cooked RESULT (a hex SHA-256).
 
     Composes H(program_fp × params × upstream × frame × device × precision/quality ×
@@ -129,15 +120,6 @@ def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
     flags        any extra keying flags (e.g. an output name for a per-output key).
     canvas       a canvas / ROI descriptor (W,H[,x0,y0,w,h]); two cooks at different canvas
                  sizes or ROIs are distinct results (keys carry it from day one).
-    viewer_context  PM-11: the host's viewer values, or None. UNLIKE every component above,
-                 this one is OMITTED from the hash entirely when None — a program that never
-                 calls `viewer_exposure()`/`viewer_gamma()` must key IDENTICALLY to a build
-                 that predates PM-11 (invariant #7: this ask cannot invalidate every frame any
-                 other program ever cached). The caller decides: pass the real dict only when
-                 `interpreter._reads_host_context_cached(program)` is True, `None` otherwise — never
-                 pass it unconditionally the way the engine passes `time_context` (every
-                 program can read `frame`/`fps`/`time` as bare identifiers with no call, so
-                 there was never a "before" key shape to preserve for that one).
     """
     if program_fp is None:
         raise ValueError("lineage_key needs a program fingerprint (fp or fused_fp)")
@@ -165,9 +147,4 @@ def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
     # legacy (W,H) tuple) — the engine keys each output by its produced-frame shape, so a
     # different batch/canvas/ROI mints a distinct key.
     feed("cnv", "n" if canvas is None else json.dumps(canvas, sort_keys=True, default=list))
-    # PM-11: conditional, unlike every feed above it — see the docstring. Omitting the call
-    # entirely (not merely feeding "n") is load-bearing: inserting ANY new `feed` unconditionally
-    # would shift the byte stream for every existing key, viewer-using or not.
-    if viewer_context is not None:
-        feed("view", _canon_viewer(viewer_context))
     return h.hexdigest()

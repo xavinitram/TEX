@@ -36,7 +36,7 @@ import torch
 
 from .tex_cache import get_cache
 from .tex_compiler.diagnostics import raw_compile_errors, compile_error_from
-from .tex_runtime.interpreter import Interpreter, _reads_host_context_cached
+from .tex_runtime.interpreter import Interpreter
 from .tex_runtime.interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
 from .tex_marshalling import (
     convert_param_value as _convert_param_value,
@@ -118,12 +118,6 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
         # SAME way the interpreter does (prepare() already normalizes to a dict, but a directly
         # built ExecContext must not slip a Mapping-but-not-dict playhead past the key).
         tc = dict(ctx.time_context) if hasattr(ctx.time_context, "items") else None
-        # PM-11: viewer_context keys ONLY when the program actually calls a viewer builtin —
-        # unlike `tc` above, every program can read frame/fps/time as bare identifiers with
-        # no call, so there is no "before" key shape for that one to preserve. A program that
-        # never calls viewer_exposure()/viewer_gamma() must key IDENTICALLY to a pre-PM-11
-        # build (invariant #7); `lineage_key` itself omits the byte entirely for `None`.
-        vc = ctx.viewer_context if _reads_host_context_cached(ctx.program) else None
         roi_rect = list(ctx.roi) if ctx.roi is not None else None
         # Cook-invariant flags that MOVE PIXELS but are neither bindings nor shape — so they
         # would otherwise fall out of the key and silent-serve a stale frame across a toggle:
@@ -154,7 +148,7 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
             out[name] = tex_results.lineage_key(
                 program_fp=program_fp, device=dev, precision=eff_precision,
                 params=params, upstream=plan.upstream_keys, time_context=tc,
-                canvas=canvas, flags=(*base_flags, f"out:{name}"), viewer_context=vc)
+                canvas=canvas, flags=(*base_flags, f"out:{name}"))
         return out
     except Exception:
         return None
@@ -163,19 +157,12 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
 # ── CACHE-6: fusion ↔ caching reconciliation (the cook side) ──────────────────
 
 def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_count=0,
-                    time_context=None, cancel=None, on_progress=None,
-                    viewer_context: dict | None = None) -> dict:
+                    time_context=None, cancel=None, on_progress=None) -> dict:
     """Cook a raw fusion stage list (≥1) and return the interpreter's RAW {output: tensor}. One
     stage cooks as a plain program; ≥2 splice through `compile_fused`. It replicates prepare()'s
     param default-inject + widget-value conversion so a SUB-chain (a CACHE-6 prefix or suffix)
     cooks BIT-IDENTICALLY to those same stages inside the full fused program — the equivalence
-    the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does.
-
-    `viewer_context` (PM-11) rides beside `time_context` — a VALUE, never part of any lineage
-    key (contrast `boundary_lineage_key`'s own `time_context=`, which DOES key: a different
-    frame is a different correct result; a different viewer setting is not a different key,
-    by this ask's own ruling), so a fused chain reads a viewer tweak exactly like an unfused
-    one does."""
+    the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does."""
     # P0-H: the stage-list family is a public engine entry point that never learned about
     # promises — a Promise in a stage's bindings produced a raw TypeError out of the
     # marshalling seam whether or not it had landed. Resolving here (and refusing an unlanded
@@ -224,7 +211,7 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
                           latent_channel_count=latent_channel_count,
                           output_names=sorted(assigned.keys()), used_builtins=used_builtins,
                           precision=("fp32" if latent_channel_count else precision),
-                          time_context=time_context, viewer_context=viewer_context,
+                          time_context=time_context,
                           cancel=cancel, on_progress=on_progress)
 
 
@@ -269,43 +256,8 @@ def _binding_shape(v):
     return tuple(declared) if declared else None
 
 
-def _stages_read_viewer_builtin(stages) -> bool:
-    """PM-11 (simplify, point B): does this PREFIX (`stages[:k]`, raw stage dicts) call a
-    viewer builtin?
-
-    `boundary_lineage_key` keys a prefix before it is ever fused/compiled as one program,
-    so there is no single `Program` AST covering it the way `_reads_host_context_cached`
-    wants — but each STAGE's own source is an ordinary TEX program on its own, and
-    `tex_lazy._pristine_program` already lexes/parses (and CACHES, per-source, no binding
-    types needed — the question is purely syntactic) every source this engine sees for the
-    ROI-2 lazy analysis. Reusing that memo — rather than a fresh parse, and rather than a
-    second hand-rolled memo of this module's own — means a hot loop that scrubs a
-    downstream param while the prefix's CODE stays fixed pays the parse once per stage
-    source, not once per cook: the second and every later call is a `tex_lazy._parse_memo`
-    hit. The walk itself is read-only (no mutation), so the pristine AST is used directly,
-    unlike `tex_lazy.lazy_required_bindings`'s own caller, which clones because IT mutates.
-    A stage that fails to parse here is treated as a HIT (over-key, never under-key, the
-    same safe direction the substring scan it replaces already took on a false positive) —
-    same "never raise out of a keying path" contract every lineage-key helper keeps; in
-    practice this path is unreachable anyway, since `cook_fused_cached`/`cook_checkpointed`
-    only reach `boundary_lineage_key` after the chain has already been validated fusable."""
-    from .tex_lazy import _pristine_program
-    for st in stages:
-        code = st.get("code") or ""
-        if not code:
-            continue
-        try:
-            prog = _pristine_program(code)
-        except Exception:
-            return True
-        if _reads_host_context_cached(prog):
-            return True
-    return False
-
-
 def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context=None,
-                         canvas=None, latent_channel_count=0,
-                         viewer_context: dict | None = None) -> str:
+                         canvas=None, latent_channel_count=0) -> str:
     """CACHE-6: the lineage key a stage-(k-1) boundary tap is cached under — the upstream
     SUB-CHAIN fingerprint (`tex_fusion.prefix_fingerprint`) × the prefix stages' param VALUES ×
     the SOURCE identity `upstream` × device × precision × playhead × canvas, namespaced by the cut
@@ -394,21 +346,14 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
     flags = [f"tap:s{k - 1}"]
     if latent_channel_count:
         flags.append(f"ic:{int(latent_channel_count)}")
-    # PM-11: key the boundary TAP on viewer_context too, when the PREFIX (stages[:k], the
-    # portion this tap actually covers) calls a viewer builtin — the cached boundary pixels
-    # are viewer-dependent then, and the key must say so or a later cook at a different
-    # viewer value would hit this tap and silently serve the wrong exposure/gamma. Scoped to
-    # the prefix, not the whole chain: a viewer stage only in the SUFFIX never touches this
-    # tap's own cached pixels, so keying it in would only cost cache hits for nothing.
-    vc = viewer_context if _stages_read_viewer_builtin(stages[:k]) else None
     return tex_results.lineage_key(program_fp=fp, device=str(device), precision=precision,
                                    params=params, upstream=tuple(upstream), time_context=time_context,
-                                   canvas=canvas, flags=flags, viewer_context=vc)
+                                   canvas=canvas, flags=flags)
 
 
 def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32",
                       time_context=None, latent_channel_count=0, upstream=(), cancel=None,
-                      on_progress=None, viewer_context: dict | None = None) -> dict:
+                      on_progress=None) -> dict:
     """CACHE-6: cook a fused chain with a stage-(k-1) boundary TAP + SUFFIX SPLICE. On a cache
     HIT (the hot downstream param didn't touch the prefix) only stages k..N recook, reading the
     cached fp32 boundary; on a MISS the prefix is materialized, cached, and the suffix cooked.
@@ -425,8 +370,7 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     def _full():
         return cook_stage_list(stages, device=device, precision=precision,
                                latent_channel_count=latent_channel_count,
-                               time_context=time_context, cancel=cancel, on_progress=on_progress,
-                               viewer_context=viewer_context)
+                               time_context=time_context, cancel=cancel, on_progress=on_progress)
 
     # `upstream` must key EVERY tensor input of the prefix — the source, and any EXTRA image a
     # prefix stage reads — not just be non-empty (a partial cover could stale-serve when only an
@@ -461,13 +405,11 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     if unservable_prefix_taps(stages, k):
         return _full()
     key = boundary_lineage_key(stages, k, device, "fp32", time_context=time_context,
-                               latent_channel_count=latent_channel_count, upstream=upstream,
-                               viewer_context=viewer_context)
+                               latent_channel_count=latent_channel_count, upstream=upstream)
     boundary = result_cache.get(key)
     if boundary is None:
         b = cook_stage_list(stages[:k], device=device, precision="fp32",
-                            time_context=time_context, cancel=cancel,
-                            viewer_context=viewer_context).get("OUT")
+                            time_context=time_context, cancel=cancel).get("OUT")
         if b is None:            # a chain always assigns @OUT; if not, cook whole (correct)
             return _full()
         result_cache.put(key, b, canvas={"shape": list(b.shape)})
@@ -482,8 +424,7 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     # this single return.
     out = remap_suffix_taps(
         cook_stage_list(suffix, device=device, precision="fp32", time_context=time_context,
-                        cancel=cancel, on_progress=on_progress,
-                        viewer_context=viewer_context), k)
+                        cancel=cancel, on_progress=on_progress), k)
     if stages[k - 1].get("tap"):
         out.setdefault(f"_tap_s{k - 1}", boundary)   # the boundary IS that stage's output
     return out

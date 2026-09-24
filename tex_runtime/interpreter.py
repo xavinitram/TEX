@@ -235,7 +235,6 @@ class Interpreter(MaskedFlowMixin):
         roi: tuple[int, int, int, int, int, int] | None = None,
         batch_slice: tuple[int, int] | None = None,
         time_context: dict | None = None,
-        viewer_context: dict | None = None,
         cancel=None,
         on_progress=None,
         _masked_flow: bool | None = None,
@@ -294,7 +293,6 @@ class Interpreter(MaskedFlowMixin):
                                        precision, used_builtins=used_builtins,
                                        tile=tile, roi=roi, batch_slice=batch_slice,
                                        time_context=time_context,
-                                       viewer_context=viewer_context,
                                        cancel=cancel, on_progress=on_progress,
                                        _masked_flow=_masked_flow)
 
@@ -325,7 +323,6 @@ class Interpreter(MaskedFlowMixin):
         roi: tuple[int, int, int, int, int, int] | None = None,
         batch_slice: tuple[int, int] | None = None,
         time_context: dict | None = None,
-        viewer_context: dict | None = None,
         cancel=None,
         on_progress=None,
         _masked_flow: bool | None = None,
@@ -341,7 +338,6 @@ class Interpreter(MaskedFlowMixin):
         self.latent_channel_count = latent_channel_count
         self._dtype = self._PRECISION_DTYPES.get(precision, torch.float32)
         self.time_context = time_context   # ENG-7: host playhead for THIS cook (or None)
-        self.viewer_context = viewer_context   # PM-11: host viewer values for THIS cook (or None)
         # SCHED-3: bind the cook's cancel token + progress callback for THIS execute. Set
         # unconditionally every run (the interpreter is a per-thread REUSED singleton — a
         # token left on self would abort a later, unrelated cook). Pure values, never keyed.
@@ -445,7 +441,7 @@ class Interpreter(MaskedFlowMixin):
         # cook on a thread-local, restored in the `finally` because a tiled cook calls
         # `execute` once per strip and each strip's grid is its own.
         _grid_token = _stdlib_mod.set_cook_grid(self.spatial_shape, self._dtype,
-                                                device=self.device, viewer=self.viewer_context)
+                                                device=self.device)
         # LANG-L4: bind the language-0.25 statement handlers for THIS cook, and only when
         # the engine's own gate says so. The DEFAULT path pays one attribute read and one
         # `is None` test: a program with no `//!tex` pragma has `Program.language is None`,
@@ -2372,21 +2368,6 @@ class Interpreter(MaskedFlowMixin):
 # fingerprint?", and then to go and cook one.
 _TIME_BUILTIN_NAMES = frozenset({"frame", "fps", "time"})
 
-# PM-11 (simplify): the fused viewer transform's two reserved builtins are FunctionCall
-# nodes, not bare Identifiers (see `stdlib_color.fn_viewer_exposure`), so they are never
-# added to `_BUILTIN_NAMES` below — that set drives Identifier resolution only. Whether a
-# program CALLS one is answered by `_reads_host_context_cached` (folded into
-# `_collect_binding_reads_and_non_spatial`'s existing walk, one memoized `_READS_MEMO`
-# lookup — no second per-cook walk and no hand-maintained name literal here); the SET of
-# such names is `stdlib_registry.host_context_names()`, derived from each builtin's own
-# `@stdlib(..., reads_host_context=True)` declaration. `graphed._capturable` still bars a
-# CUDA-graph capture of a program that calls one, for the same reason it bars
-# `_TIME_BUILTIN_NAMES`: a captured replay re-serves whatever value was read at capture
-# time, and unlike frame/time this pair is EXPECTED to change every cook (a dragged
-# slider). Every other tier (interpreter, default codegen, torch_compile, auto) reads
-# them fresh per call through the ordinary `_fns[name]` dispatch, so only the graph tier
-# needs the bar.
-
 # Names that are built-in variables (not user-defined)
 _BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", "fn",
                             "PI", "TAU", "E", "ic"}) | _TIME_BUILTIN_NAMES
@@ -2404,14 +2385,10 @@ _BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", 
 _CACHEABLE_BUILTIN_NAMES = _BUILTIN_NAMES - _TIME_BUILTIN_NAMES
 
 
-def _collect_binding_reads_and_non_spatial(program: Program) -> tuple[frozenset[str], frozenset[str], bool]:
-    """`(reads, non_spatial, reads_host_context)` — wire-binding (`@A`) names the program
-    mentions anywhere, the subset of those names bound at a registered NON-SPATIAL argument
-    position (`stdlib_registry.non_spatial_args_by_name`, e.g. `apply_lut3d`'s LUT argument),
-    and (PM-11, simplify) whether the program calls any registered host-context builtin
-    (`stdlib_registry.host_context_names()`, e.g. `viewer_exposure`/`viewer_gamma`) — folded
-    into this walk's existing FunctionCall branch rather than a second per-cook walk, exactly
-    the same "declare it on the registry, derive the set here" move `non_spatial_args` made.
+def _collect_binding_reads_and_non_spatial(program: Program) -> tuple[frozenset[str], frozenset[str]]:
+    """`(reads, non_spatial)` — wire-binding (`@A`) names the program mentions anywhere, and
+    the subset of those names bound at a registered NON-SPATIAL argument position
+    (`stdlib_registry.non_spatial_args_by_name`, e.g. `apply_lut3d`'s LUT argument).
 
     `reads` is over-inclusive on purpose: an assignment TARGET counts as a mention.
     Narrowing that would buy nothing — the only consumer is `_consensus_extent`, which
@@ -2428,22 +2405,19 @@ def _collect_binding_reads_and_non_spatial(program: Program) -> tuple[frozenset[
     OWN declared `non_spatial_args`), not by binding name, so any name works and any future
     function gets the same protection by declaring the field, no engine-side edit.
 
-    ONE walk for all three answers (`_collect_binding_reads`, `_non_spatial_names_cached`
-    and `_reads_host_context_cached` are the PUBLIC-shaped accessors over it, each
-    preserving its own pre-existing return type — see `_reads_and_non_spatial_cached`,
-    which is the ONE memo, `_READS_MEMO`, all three go through). Walked with the generic
-    `iter_child_nodes` rather than a hand-written per-class dispatch like
-    `_collect_identifiers`'. That walk is field-driven, so a new ASTNode field is
-    traversed instead of silently escaping — and the speed the hand-written version buys
-    is not needed here, because `_consensus_extent` only pays for a MISS here when a
-    program is first seen.
+    ONE walk for both answers (`_collect_binding_reads` and `_non_spatial_names_cached` are
+    the PUBLIC-shaped accessors over it, each preserving its own pre-existing return type —
+    see `_reads_and_non_spatial_cached`, which is the ONE memo, `_READS_MEMO`, both go
+    through). Walked with the generic `iter_child_nodes` rather than a hand-written
+    per-class dispatch like `_collect_identifiers`'. That walk is field-driven, so a new
+    ASTNode field is traversed instead of silently escaping — and the speed the
+    hand-written version buys is not needed here, because `_consensus_extent` only pays
+    for a MISS here when a program is first seen.
     """
-    from .stdlib_registry import non_spatial_args_by_name, host_context_names
+    from .stdlib_registry import non_spatial_args_by_name
     non_spatial_positions = non_spatial_args_by_name()   # {fn name: (arg idx, ...)}
-    host_context_fns = host_context_names()              # {viewer_exposure, viewer_gamma, ...}
     reads: set[str] = set()
     non_spatial: set[str] = set()
-    reads_host_context = False
     stack: list[ASTNode] = [program]
     while stack:
         node = stack.pop()
@@ -2459,10 +2433,8 @@ def _collect_binding_reads_and_non_spatial(program: Program) -> tuple[frozenset[
                         arg = node.args[i]
                         if type(arg) is BindingRef and arg.kind == "wire":
                             non_spatial.add(arg.name)
-            if not reads_host_context and node.name in host_context_fns:
-                reads_host_context = True
         stack.extend(iter_child_nodes(node))
-    return frozenset(reads), frozenset(non_spatial), reads_host_context
+    return frozenset(reads), frozenset(non_spatial)
 
 
 def _collect_binding_reads(program: Program) -> frozenset[str]:
@@ -2471,46 +2443,45 @@ def _collect_binding_reads(program: Program) -> frozenset[str]:
     calls this directly and subtracts other frozensets from its result, so its return type
     is load-bearing outside this module, not just an internal convenience. Delegates to
     `_collect_binding_reads_and_non_spatial` (the one AST walk) and returns only `reads`;
-    `_non_spatial_names_cached`/`_reads_host_context_cached` are the other two accessors."""
-    reads, _, _ = _collect_binding_reads_and_non_spatial(program)
+    `_non_spatial_names_cached` is the other accessor."""
+    reads, _ = _collect_binding_reads_and_non_spatial(program)
     return reads
 
 
 #: Memo for the walk above, mirroring `tex_memory._tile_safe_memo` (whose comment prices the
 #: same shape of walk at ~22 us per CUDA cook — worth memoizing, and this one is worse: no
-#: early exit, every node visited). The read/non-spatial/host-context answers are a pure
-#: function of the AST, so they belong per PROGRAM, not per cook. Without this, the
-#: axis-disagreement gate keeps the walk off most cooks but not all: an IMAGE `[4,H,W,3]`
-#: batch beside a single `[1,H,W]` MASK disagrees on batch every cook, and that is an
-#: ordinary ComfyUI graph, not a corner.
+#: early exit, every node visited). The read/non-spatial answers are a pure function of the
+#: AST, so they belong per PROGRAM, not per cook. Without this, the axis-disagreement gate
+#: keeps the walk off most cooks but not all: an IMAGE `[4,H,W,3]` batch beside a single
+#: `[1,H,W]` MASK disagrees on batch every cook, and that is an ordinary ComfyUI graph, not
+#: a corner.
 #:
 #: Keyed by `id()` because `Program` is a slotted dataclass — no `__dict__` to hang an
 #: attribute on and no `__weakref__` to key a WeakKeyDictionary with. The program itself is
 #: held beside the answer and re-checked with `is`, which is what makes `id()` safe: a
 #: recycled id belongs to a different object and misses. Holding it also pins the AST alive,
 #: bounded here to the same order as `tex_cache`'s own program LRU.
-_READS_MEMO: "OrderedDict[int, tuple[Program, frozenset[str], frozenset[str], bool]]" = OrderedDict()
+_READS_MEMO: "OrderedDict[int, tuple[Program, frozenset[str], frozenset[str]]]" = OrderedDict()
 _READS_MEMO_MAX = 128
 
 
-def _reads_and_non_spatial_cached(program: Program) -> tuple[frozenset[str], frozenset[str], bool]:
+def _reads_and_non_spatial_cached(program: Program) -> tuple[frozenset[str], frozenset[str]]:
     """`_collect_binding_reads_and_non_spatial`, memoized per program object — the ONE
-    memo entry `_binding_reads_cached`, `_non_spatial_names_cached` and
-    `_reads_host_context_cached` all read, so a program pays for one walk regardless of
-    which (or how many) accessor a caller uses. Internal: callers outside this module use
-    one of those three, each of which preserves its OWN pre-existing return type (a bare
-    `frozenset[str]` or `bool`, never this tuple)."""
+    memo entry `_binding_reads_cached` and `_non_spatial_names_cached` both read, so a
+    program pays for one walk regardless of which (or how many) accessor a caller uses.
+    Internal: callers outside this module use one of those two, each of which preserves
+    its OWN pre-existing return type (a bare `frozenset[str]`, never this tuple)."""
     key = id(program)
     hit = _READS_MEMO.get(key)
     if hit is not None and hit[0] is program:
         _READS_MEMO.move_to_end(key)
-        return hit[1], hit[2], hit[3]
-    reads, non_spatial, reads_host_context = _collect_binding_reads_and_non_spatial(program)
-    _READS_MEMO[key] = (program, reads, non_spatial, reads_host_context)
+        return hit[1], hit[2]
+    reads, non_spatial = _collect_binding_reads_and_non_spatial(program)
+    _READS_MEMO[key] = (program, reads, non_spatial)
     _READS_MEMO.move_to_end(key)
     while len(_READS_MEMO) > _READS_MEMO_MAX:
         _READS_MEMO.popitem(last=False)
-    return reads, non_spatial, reads_host_context
+    return reads, non_spatial
 
 
 def _binding_reads_cached(program: Program) -> frozenset[str]:
@@ -2527,16 +2498,6 @@ def _non_spatial_names_cached(program: Program) -> frozenset[str]:
     `_consensus_extent` share one walk/one memo with `_collect_binding_reads`'s callers
     without either side's return type depending on the other's existence."""
     return _reads_and_non_spatial_cached(program)[1]
-
-
-def _reads_host_context_cached(program: Program) -> bool:
-    """PM-11 (simplify): does this program call a registered host-context builtin
-    (`viewer_exposure`/`viewer_gamma` today, `stdlib_registry.host_context_names()`'s set
-    in general)? Memoized per program object over the SAME `_READS_MEMO` entry the other
-    two accessors populate — replaces the hand-rolled per-cook `_reads_viewer_builtin`
-    walk and its hand-maintained `_VIEWER_BUILTIN_NAMES` literal; `graphed._capturable`'s
-    capture bar and `tex_chain`'s result-cache keying both read this instead now."""
-    return _reads_and_non_spatial_cached(program)[2]
 
 
 def _consensus_extent(bindings: dict, program: Program,
@@ -2603,7 +2564,7 @@ def _consensus_extent(bindings: dict, program: Program,
     # that never calls a `non_spatial_args`-declaring function (every program before v0.40,
     # and most after), so the default path pays one cheap-and-constant lookup, never a
     # fresh walk.
-    read, non_spatial, _ = _reads_and_non_spatial_cached(program)
+    read, non_spatial = _reads_and_non_spatial_cached(program)
     b = h = w = None
     b_split = hw_split = False
     for name, v in bindings.items():

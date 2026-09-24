@@ -262,10 +262,6 @@ class ExecContext:
     # TRK-25: the `{name: TEXType}` map this cook compiled against. The source alone cannot
     # say a wire holds a STRING, and a string merged per pixel is voted on over the region.
     binding_types: Any = None
-    # PM-11: the host's viewer values for this cook — {"viewer_exposure": ..., "viewer_gamma":
-    # ...} or None. A VALUE on the same never-keyed channel as `time_context` above: a viewer
-    # tweak must never move `fp` or reopen a compile cache.
-    viewer_context: Any = None
 
 
 @dataclass(frozen=True)
@@ -412,7 +408,7 @@ def _interp_fallback(ctx: ExecContext, *, reset_dynamo: bool, pass_precision: bo
     interp = _get_interpreter()
     kw = dict(source=ctx.code, latent_channel_count=ctx.latent_channel_count,
               output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-              time_context=ctx.time_context, viewer_context=ctx.viewer_context,
+              time_context=ctx.time_context,
               cancel=ctx.cancel, on_progress=ctx.on_progress)  # SCHED-3: token survives the fallback
     if pass_precision:
         kw["precision"] = ctx.eff_precision
@@ -475,7 +471,7 @@ def _run_torch_compile(ctx: ExecContext):
         return execute_compiled(ctx.program, ctx.bindings, ctx.type_map, ctx.device,
                                 _fp, latent_channel_count=ctx.latent_channel_count,
                                 output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                                time_context=ctx.time_context, viewer_context=ctx.viewer_context)
+                                time_context=ctx.time_context)
     except Exception as compile_exc:
         _record_codegen_defect_fallback("torch_compile", compile_exc)
         # Defense in depth: torch_compile must NEVER hard-fail the node.
@@ -492,8 +488,7 @@ def _run_auto(ctx: ExecContext):
         return run_auto(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
                         latent_channel_count=ctx.latent_channel_count,
                         output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                        precision=ctx.eff_precision, time_context=ctx.time_context,
-                        viewer_context=ctx.viewer_context)
+                        precision=ctx.eff_precision, time_context=ctx.time_context)
     except Exception as auto_exc:
         _record_codegen_defect_fallback("auto", auto_exc)
         logger.warning("[TEX] auto tier failed (%s); using interpreter.", auto_exc)
@@ -510,8 +505,7 @@ def _run_cuda_graph(ctx: ExecContext):
     try:
         out = run_graphed(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
                           latent_channel_count=ctx.latent_channel_count,
-                          output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                          viewer_context=ctx.viewer_context)  # v042-graph
+                          output_names=ctx.output_names, used_builtins=ctx.used_builtins)
     except Exception as _g_exc:
         _record_codegen_defect_fallback("cuda_graph", _g_exc)
         logger.warning("[TEX] cuda_graph path failed (%s); using interpreter.", _g_exc)
@@ -535,12 +529,11 @@ def _roi_codegen_exec(fp):
     `cancel`/`on_progress` are accepted and dropped (the compiled tiers have no yield points —
     a cancel is honoured between region cooks, not inside one)."""
     def _exec(program, bindings, type_map, *, device, latent_channel_count, output_names,
-              used_builtins, precision, roi, time_context, cancel=None, on_progress=None,
-              viewer_context=None):
+              used_builtins, precision, roi, time_context, cancel=None, on_progress=None):
         return _codegen_only_execute(
             program, bindings, type_map, device, latent_channel_count, output_names,
             used_builtins=used_builtins, precision=precision, fingerprint=fp,
-            time_context=time_context, viewer_context=viewer_context, roi=roi)
+            time_context=time_context, roi=roi)
     return _exec
 
 
@@ -575,8 +568,7 @@ def _run_default(ctx: ExecContext):
                            ctx.used_builtins, ctx.eff_precision, ctx.roi,
                            ctx.roi_plan.narrow, ctx.roi_plan.halo, ctx.time_context,
                            cancel=ctx.cancel, on_progress=ctx.on_progress,
-                           exec_fn=(_roi_codegen_exec(ctx.fp) if _roi_codegen_enabled() else None),
-                           viewer_context=ctx.viewer_context)
+                           exec_fn=(_roi_codegen_exec(ctx.fp) if _roi_codegen_enabled() else None))
         except CookCancelled:
             raise                       # SCHED-3: a cancel aborts — never fall back to whole-frame
         except Exception as _roi_exc:
@@ -597,7 +589,7 @@ def _run_default(ctx: ExecContext):
                     latent_channel_count=ctx.latent_channel_count,
                     output_names=ctx.output_names,
                     used_builtins=ctx.used_builtins, fingerprint=ctx.fp,
-                    time_context=ctx.time_context, viewer_context=ctx.viewer_context)
+                    time_context=ctx.time_context)
         except Exception as _stencil_exc:
             logger.warning("[TEX] stencil codegen route failed (%s); using "
                            "interpreter.", _stencil_exc)
@@ -614,8 +606,7 @@ def _run_default(ctx: ExecContext):
             return run_tiled(interp, ctx.program, ctx.bindings, ctx.type_map, ctx.device,
                              ctx.latent_channel_count, ctx.output_names, ctx.used_builtins,
                              ctx.eff_precision, n_strips, ctx.time_context,
-                             cancel=ctx.cancel, on_progress=ctx.on_progress,
-                             viewer_context=ctx.viewer_context)
+                             cancel=ctx.cancel, on_progress=ctx.on_progress)
         except CookCancelled:
             raise                       # SCHED-3: a cancel aborts — never fall back to untiled
         except Exception as _tile_exc:
@@ -645,8 +636,7 @@ def _run_default(ctx: ExecContext):
                 return run_tiled_halo(interp, ctx.program, ctx.bindings, ctx.type_map, ctx.device,
                                       ctx.latent_channel_count, ctx.output_names, ctx.used_builtins,
                                       ctx.eff_precision, n_h, narrow_names, halo, ctx.time_context,
-                                      cancel=ctx.cancel, on_progress=ctx.on_progress,
-                                      viewer_context=ctx.viewer_context)
+                                      cancel=ctx.cancel, on_progress=ctx.on_progress)
             except CookCancelled:
                 raise                   # SCHED-3: a cancel aborts — never fall back to untiled
             except Exception as _halo_exc:
@@ -658,7 +648,6 @@ def _run_default(ctx: ExecContext):
                           latent_channel_count=ctx.latent_channel_count,
                           output_names=ctx.output_names, used_builtins=ctx.used_builtins,
                           precision=ctx.eff_precision, time_context=ctx.time_context,
-                          viewer_context=ctx.viewer_context,
                           cancel=ctx.cancel, on_progress=ctx.on_progress)
 
 
@@ -768,7 +757,6 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             precision: str = "fp32", has_latent_input: bool = False,
             latent_channel_count: int = 0, forgive_dead_refs: bool = False,
             debug_nan_highlight: bool = False, time_context: dict | None = None,
-            viewer_context: dict | None = None,
             max_outputs: int = MAX_OUTPUTS, disown: bool = True,
             roi: tuple | None = None, roi_exec: bool | None = None,
             want_lineage: bool = False, want_noise_tiers: bool = False,
@@ -1118,8 +1106,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
                       eff_precision, fp, fused_chain, fused_fp, time_context,
                       free_hint, roi_out, roi_plan_obj,  # ROI-3 window + plan (None unless armed)
                       cancel, on_progress,               # SCHED-3 (None unless a host passed them)
-                      binding_meta, binding_types,       # DATA-1 tags; TRK-25's {name: TEXType} map
-                      viewer_context=viewer_context)      # PM-11
+                      binding_meta, binding_types)       # DATA-1 tags; TRK-25's {name: TEXType} map
     return CookPlan(ctx=ctx, tier_id=tier_id, assigned=assigned_bindings,
                     auto_fp16=auto_fp16, debug_nan_highlight=debug_nan_highlight,
                     cook_px=cook_px, auto_ckey=auto_ckey, disown=disown,
@@ -1208,8 +1195,7 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
             return run_tiled(_get_interpreter(), ctx.program, ctx.bindings, ctx.type_map,
                              ctx.device, ctx.latent_channel_count, ctx.output_names,
                              ctx.used_builtins, ctx.eff_precision, n_strips, ctx.time_context,
-                             cancel=ctx.cancel, on_progress=ctx.on_progress,
-                             viewer_context=ctx.viewer_context)
+                             cancel=ctx.cancel, on_progress=ctx.on_progress)
         # ROI-5: not pixel-local, but a bounded blur/morphology can still HALO-tile out of an OOM.
         rplan = tex_roi.roi_plan(ctx.code, _scalar_params(ctx.bindings), ctx.binding_types)
         if (rplan.executable and rplan.halo > 0 and rplan.narrow
@@ -1221,8 +1207,7 @@ def _oom_retry(ctx: ExecContext, caught: BaseException, oom: BaseException):
                                       ctx.device, ctx.latent_channel_count, ctx.output_names,
                                       ctx.used_builtins, ctx.eff_precision, n_h, rplan.narrow,
                                       rplan.halo, ctx.time_context,
-                                      cancel=ctx.cancel, on_progress=ctx.on_progress,
-                                      viewer_context=ctx.viewer_context)
+                                      cancel=ctx.cancel, on_progress=ctx.on_progress)
         return None
     except CookCancelled:
         raise                       # SCHED-3: a cancel at yield E (or inside the tiled/halo OOM
