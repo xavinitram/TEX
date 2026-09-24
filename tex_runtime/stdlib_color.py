@@ -10,7 +10,7 @@ directly, unless registering only this domain is what you want.
 from __future__ import annotations
 import torch
 from . import guard_trace  # C4-ux: guarded-division near-singularity trace (leaf, no cycle)
-from .stdlib_registry import stdlib
+from .stdlib_registry import stdlib, host_context_defaults
 from .stdlib_core import (
     SAFE_EPSILON,
     LUMA_R,
@@ -39,6 +39,23 @@ ZERO_GUARD_EPS = _stdlib_core.ZERO_GUARD_EPS
 # `stdlib_registry._impl_looks_fragile` reads the literal `TEXStdlib.fn_*(` from the source
 # to follow one level of delegation, so it must not be rewritten to the mixin's name.
 TEXStdlib = None
+
+
+def _host_context_value(name: str) -> torch.Tensor:
+    """v042-graph (simplify): the one shared body `fn_viewer_exposure`/`fn_viewer_gamma`
+    (and any future `reads_host_context=True` builtin) delegate to — the identical
+    stanza used to be written out twice. A CUDA-graph capture's own persistent buffer,
+    when one is installed, wins over building a fresh tensor (see
+    `_host_context_buffer`'s docstring); otherwise a 0-dim tensor built from the cook's
+    `viewer_context`, falling back to `name`'s OWN registered identity value
+    (`stdlib_registry.host_context_defaults()`) rather than a hand-written literal."""
+    buf = _host_context_buffer(name)
+    if buf is not None:
+        return buf
+    dt = _uniform_dtype() or torch.float32
+    default = host_context_defaults().get(name, 1.0)
+    return torch.scalar_tensor(_viewer_value(name, default),
+                               dtype=dt, device=_cook_device() or "cpu")
 
 
 class _StdlibColor:
@@ -354,14 +371,9 @@ class _StdlibColor:
         multiplies image lineage directly, so it belongs in the same dtype as the pixels
         it scales). 1.0 (identity) when no host supplied a viewer_context.
 
-        v042-graph: a CUDA-graph capture's own persistent buffer, when one is installed,
-        wins over building a fresh tensor — see `_host_context_buffer`'s docstring."""
-        buf = _host_context_buffer("viewer_exposure")
-        if buf is not None:
-            return buf
-        dt = _uniform_dtype() or torch.float32
-        return torch.scalar_tensor(_viewer_value("viewer_exposure", 1.0),
-                                   dtype=dt, device=_cook_device() or "cpu")
+        v042-graph (simplify): delegates to `_host_context_value`, the shared body
+        every host-context builtin uses (capture-buffer check + identity fallback)."""
+        return _host_context_value("viewer_exposure")
 
     @stdlib("viewer_gamma", sig='viewer_gamma() \\u2192 float', category='Color', footprint='point',
             reads_host_context=True, host_context_default=1.0,
@@ -371,14 +383,11 @@ class _StdlibColor:
             ex='@OUT = vec4(pow(@A.rgb, vec3(1.0 / viewer_gamma())), 1.0);')
     @staticmethod
     def fn_viewer_gamma() -> torch.Tensor:
-        """PM-11: see fn_viewer_exposure — the same seam, the same no-op default, and
-        (v042-graph) the same capture-buffer check."""
-        buf = _host_context_buffer("viewer_gamma")
-        if buf is not None:
-            return buf
-        dt = _uniform_dtype() or torch.float32
-        return torch.scalar_tensor(_viewer_value("viewer_gamma", 1.0),
-                                   dtype=dt, device=_cook_device() or "cpu")
+        """PM-11: see fn_viewer_exposure — the same seam, the same no-op default.
+
+        v042-graph (simplify): delegates to `_host_context_value`, the shared body
+        every host-context builtin uses (capture-buffer check + identity fallback)."""
+        return _host_context_value("viewer_gamma")
 
     # -- Compositing (SL-1): Porter-Duff on straight (un-premultiplied) vec4 --
     # ComfyUI IMAGE/MASK are un-premultiplied; over/under/atop take & return
