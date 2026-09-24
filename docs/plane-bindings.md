@@ -332,8 +332,9 @@ stdlib function on unchanged grammar, so it did not.
 
 Six satellite copies of the version string must move together, and CF-7's new JS pin makes the
 one with no Python coverage loud. `tex_api.LANGUAGE_VERSION` remains **strictly numeric**: a
-`"0.24-planes"` string would make `_ver_tuple` return `(0, 0)` and silently break every version
-comparison in the tree.
+`"0.24-planes"` string would make `_ver_tuple` silently drop the suffix and return `(0, 24)` —
+a plausible-looking tuple indistinguishable from the clean `"0.24"`, not an obvious zero — and
+break every version comparison in the tree without ever raising.
 
 ---
 

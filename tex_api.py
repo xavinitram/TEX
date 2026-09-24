@@ -90,12 +90,23 @@ def language_pragma(source: str):
     return _parser_language_pragma(source)
 
 
-def _ver_tuple(v):
-    try:
-        parts = str(v).split(".")
-        return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
-    except (ValueError, IndexError, AttributeError):
-        return (0, 0)
+def _ver_tuple(v: str) -> tuple:
+    """Parse a dotted version string into a tuple of ints, one per `.`-separated component,
+    for ordering comparisons (`>`/`<`/`min`/`max`) against another such tuple — never for
+    display. Tolerant per component rather than all-or-nothing: a component with no leading
+    digit degrades to `0` in place (`"1.abc"` -> `(1, 0)`) instead of collapsing the whole
+    result to a sentinel, so a comparison against a well-formed operand (every real call
+    site's other side: `LANGUAGE_VERSION`, a package version, a source pragma) still reads
+    the well-formed components correctly. TRK-144: this was `tex_tool.py`'s copy (the same
+    two use sites, `raw["tex_language"]`/LANGUAGE_VERSION and `min_engine`/the package
+    version, both unvalidated-format strings a manifest author writes by hand) folded in
+    here as the one definition; `tex_tool.load_tool` now imports it instead of redefining
+    it."""
+    parts = []
+    for chunk in str(v).split("."):
+        m = _re.match(r"\d+", chunk)
+        parts.append(int(m.group()) if m else 0)
+    return tuple(parts)
 
 
 @dataclass(frozen=True)

@@ -22,8 +22,9 @@ def test_v037_language_version_satellites(r):
     from TEX_Wrangle.tex_api import LANGUAGE_VERSION
 
     try:
-        # Strictly numeric: `tex_api._ver_tuple` int-parses each component, so a suffix such
-        # as "-planes" would compare as (0, 0) and silently break every version comparison.
+        # Strictly numeric: `tex_api._ver_tuple` int-parses each component (tolerant of a
+        # non-numeric suffix, TRK-144), so "0.24-planes" would silently parse as (0, 24) —
+        # indistinguishable from a clean "0.24" — and break every version comparison quietly.
         assert re.fullmatch(r"[0-9]+(\.[0-9]+)+", LANGUAGE_VERSION), LANGUAGE_VERSION
 
         stock = sorted(glob.glob(str(_PKG / "stock" / "*.textool")))

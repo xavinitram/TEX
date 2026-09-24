@@ -626,9 +626,10 @@ grammar is untouched here — no new token, no new statement form — but the **
 existing grammar** change, which is the same class of break for a host that pins by version and
 strictly larger than a lexer change for one that hashes programs. It bumps.
 
-The string stays **strictly numeric**: `tex_api._ver_tuple` int-parses each component, so
-`"0.25-masked"` would compare as `(0, 0)` and silently break §4's `min`, the corpus archive's
-sort key, and `W7004`.
+The string stays **strictly numeric**: `tex_api._ver_tuple` int-parses each component
+(tolerant of a non-numeric suffix, TRK-144), so `"0.25-masked"` would silently parse as
+`(0, 25)` — indistinguishable from a clean `"0.25"` — and break §4's `min`, the corpus
+archive's sort key, and `W7004` without ever raising.
 
 **Four things the release note must name before the tag**, per `brief-conventions.md`:
 

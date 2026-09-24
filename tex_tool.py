@@ -606,14 +606,6 @@ def _package_version() -> str:
         return "0.0.0"
 
 
-def _ver_tuple(v: str) -> tuple:
-    parts = []
-    for chunk in str(v).split("."):
-        m = re.match(r"\d+", chunk)
-        parts.append(int(m.group()) if m else 0)
-    return tuple(parts)
-
-
 def load_tool(path_or_dict) -> ToolManifest:
     """Load + validate a `.textool` into a ToolManifest. TOOL-5 order: parse -> schema
     validation -> language-pin advisory -> engine-version gate. NOTHING is compiled here."""
@@ -628,6 +620,10 @@ def load_tool(path_or_dict) -> ToolManifest:
 
     parsed = validate_manifest(raw)   # TOOL-5-B: before any TEX source is touched; returns the
                                       # already-parsed inputs/outputs/promoted (validated once).
+    from .tex_api import _ver_tuple   # TRK-144: the one definition, not a redefinition here;
+                                      # imported unconditionally (not inside the try below) so
+                                      # the engine-version gate past it still has a name bound
+                                      # even if the LANGUAGE_VERSION import in that try fails.
 
     warnings = []
     # LANG-3 language-pin advisory (mirrors W7004): does not block.
