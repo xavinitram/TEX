@@ -17,10 +17,18 @@ the field yet." This file is that acceptance test, one row per clause:
     edit in `tex_roi.py` — this row is the proof, not an assumption;
   * codegen emission reads the field ONLY through the LANG-L7 masked-flow gate: toggling it
     and diffing `_tex_src` over every shipped `examples/*.tex` program this harness can
-    prepare moves emission for exactly the programs that declare `//!tex 0.25` or later (one,
-    since LANG-L7: `per_pixel_control_flow.tex`) and none of the rest — the invariant-7 shape
-    for everything BELOW `MASKED_FLOW_SINCE`, and the intended, gated exception at and above
-    it.
+    prepare moves emission for exactly the programs whose `tex_api.flow_plan` names a
+    masking-relevant site (`not flow_plan(program).is_empty()`) — the SAME second half
+    `masked_flow.enabled_for` checks, after its language-gate half — and none of the rest.
+    `LANGUAGE_VERSION` is `0.25` at this head, so forcing ANY pragma `>= 0.25` passes that
+    gate's language half uniformly for every program; which ones actually move is decided
+    entirely by the flow_plan half. TRK-154 widened that predicate (a call to a user
+    function reached under a per-pixel `if`) to two more shipped examples that call a
+    helper that way without declaring the pragma themselves (`fix_pixels.tex`,
+    `recursive_pattern.tex`) — this row's own expectation is derived from that SAME
+    predicate, never a fixed name list, so it still catches a program moving for any OTHER,
+    unexpected reason. This is the invariant-7 shape for everything the predicate says is
+    NOT masking-relevant, and the intended, gated exception for everything it says is.
 
 Every row runs on the compiler and the CPU interpreter/codegen alone. No ComfyUI, no CUDA,
 no compiler toolchain, no Windows path, no embedded interpreter, no numpy, no timing.
@@ -142,17 +150,23 @@ def test_l1_language_tuple_reads_the_real_field_with_no_callsite_edit(r: SubTest
 
 
 def test_l1_codegen_emission_is_language_field_invariant(r: SubTestResult):
-    print("\n--- LANG-L1: codegen emission moves with Program.language ONLY for a masked "
-          "(>= 0.25) program — invariant 7 below the gate, the intended exception at it ---")
-    # LANG-L7 opened the gate `masked_flow.enabled_for` reads: a program whose OWN declared
-    # language is >= MASKED_FLOW_SINCE now legitimately emits different codegen source when
-    # that field changes (the whole point of the masked emitter). "Emission never reads the
-    # field" was only ever true BELOW the gate; this row now asserts the sharper, still-total
-    # claim: the set of examples whose emission moves is EXACTLY the set that declares
-    # `//!tex 0.25` or later — no more, no fewer — so a future accidental move anywhere else
-    # is still caught.
+    print("\n--- LANG-L1: codegen emission moves with Program.language ONLY for a "
+          "masking-relevant (flow_plan non-empty) program — invariant 7 for everything "
+          "else, the intended exception there ---")
+    # LANG-L7 opened the gate `masked_flow.enabled_for` reads, which is TWO conditions:
+    # the effective language level (>= MASKED_FLOW_SINCE) and `tex_api.flow_plan` naming a
+    # masking-relevant site. `LANGUAGE_VERSION` is `0.25` at this head, so forcing ANY
+    # pragma `>= 0.25` below passes the language half uniformly for every program — the
+    # flow_plan half is what actually decides whether emission can move. This row's
+    # expectation is derived from THAT predicate, not a fixed name list (TRK-154 widened
+    # it, correctly, to two more shipped examples — `fix_pixels.tex`/`recursive_pattern.tex`
+    # — that call a helper under a per-pixel `if` without declaring the pragma themselves;
+    # a name-list expectation would have gone stale exactly here). "Emission never reads
+    # the field" stays true for every program the predicate calls not masking-relevant; the
+    # intended, gated exception is everything it calls masking-relevant.
     moved = []
-    declared_masked = []
+    masking_relevant = []
+    declared_masked = []   # narrative only, not the expectation — see the docstring above
     checked = 0
     skipped = 0
     exdir = os.path.join(_ROOT, "examples")
@@ -175,6 +189,10 @@ def test_l1_codegen_emission_is_language_field_invariant(r: SubTestResult):
         before = program.language
         if before is not None and tex_api._ver_tuple(before) >= tex_roi.MASKED_FLOW_SINCE:
             declared_masked.append(fn)
+        # The flow_plan half of `enabled_for`'s gate — independent of `program.language`
+        # (a pure structural walk), so computed once, outside the mutate/restore below.
+        if not tex_api.flow_plan(program).is_empty():
+            masking_relevant.append(fn)
         try:
             program.language = "9.9"          # still >= MASKED_FLOW_SINCE: masked stays masked
             fn_b = try_compile(program, type_map)
@@ -189,11 +207,14 @@ def test_l1_codegen_emission_is_language_field_invariant(r: SubTestResult):
             moved.append(fn)
     if checked == 0:
         r.fail("LANG-L1 codegen invariance", "no example compiled through codegen — harness broken")
-    elif sorted(moved) != sorted(declared_masked):
+    elif sorted(moved) != sorted(masking_relevant):
         r.fail("LANG-L1 codegen invariance",
-               f"moved set {sorted(moved)} != examples declaring >= 0.25 {sorted(declared_masked)}")
+               f"moved set {sorted(moved)} != masking-relevant examples {sorted(masking_relevant)} "
+               f"(declaring >= 0.25: {sorted(declared_masked)})")
     else:
         r.ok(f"codegen emission byte-identical across {checked - len(moved)}/{checked} "
              f"example(s) regardless of Program.language; moves ONLY for the "
-             f"{len(declared_masked)} declaring >= 0.25 masked flow ({sorted(declared_masked)}), "
-             f"exactly as expected ({skipped} skipped: codegen-declined or harness-unpreparable)")
+             f"{len(masking_relevant)} masking-relevant example(s) ({sorted(masking_relevant)}), "
+             f"of which {len(declared_masked)} also declare >= 0.25 themselves "
+             f"({sorted(declared_masked)}), exactly as expected "
+             f"({skipped} skipped: codegen-declined or harness-unpreparable)")
