@@ -23,6 +23,9 @@ Usage:
     python benchmarks/eight_config_bench.py --save results/baseline.json
     python benchmarks/eight_config_bench.py --resolution 1024 --limit 4   # quick validate
     python benchmarks/eight_config_bench.py --save results/after.json --compare results/baseline.json
+    # 3+ legs: every pairing's geomean/range, same-tree NULL pairings labelled (TRK-81)
+    python benchmarks/eight_config_bench.py --save results/c.json \
+        --compare results/a.json --compare results/b.json --require-null-leg
 """
 from __future__ import annotations
 
@@ -315,7 +318,14 @@ def run_matrix(args):
     print(f"\nDone in {info['elapsed_sec']}s. Saved {save_path}")
     summarize(data)
     if args.compare:
-        compare(data, args.compare)
+        if len(args.compare) == 1:
+            compare(data, args.compare[0])          # unchanged 2-leg path (TRK-81)
+        else:
+            legs = [("current", data)]
+            for p in args.compare:
+                with open(p, encoding="utf-8") as f:
+                    legs.append((Path(p).stem, json.load(f)))
+            compare_multi(legs, require_null_leg=args.require_null_leg)
     return data
 
 
@@ -392,6 +402,95 @@ def compare(data, baseline_path):
     print(f"  {'No regressions detected.' if not any_reg else 'Regressions present - see per-config worst offenders.'}\n")
 
 
+# ── Multi-leg compare (TRK-81) ───────────────────────────────────────────────
+# A single `--compare BASELINE` reads one pairing and says nothing about the null
+# spread that number should be read against — the PERF-7 sitting reported 0.923
+# against one baseline leg while a SAME-TREE leg in the same sitting read 1.082, and
+# the 0.923 was never distinguishable from that noise floor. `--compare` accepts more
+# than one file for exactly this: with three or more legs on the table (the current
+# run plus two-or-more `--compare` files), print every pairing rather than just the
+# first, and name which pairings are a NULL control (both legs claim the same git
+# commit and dirtiness — the same tree, measured twice) so the reader has the noise
+# floor beside the numbers instead of having to go find it.
+
+def _same_tree(sys_a: dict, sys_b: dict) -> bool:
+    """Two legs are a same-tree NULL control when they name the same commit and the
+    same dirtiness. Either side missing a commit is never a null (nothing to match)."""
+    ca, cb = sys_a.get("git_commit"), sys_b.get("git_commit")
+    if not ca or not cb:
+        return False
+    return ca == cb and bool(sys_a.get("git_dirty")) == bool(sys_b.get("git_dirty"))
+
+
+def _pairing_rows(a_results: dict, b_results: dict) -> dict:
+    """Per-config geomean speedup (a/b) and the row range, for one pairing."""
+    out = {}
+    for cfg in CONFIGS:
+        amap = _valid_medians(a_results.get(cfg, {}))
+        bmap = _valid_medians(b_results.get(cfg, {}))
+        speedups = []
+        for name, acur in amap.items():
+            bcur = bmap.get(name)
+            if not bcur or bcur <= 0 or acur <= 0:
+                continue
+            speedups.append(acur / bcur)
+        out[cfg] = {
+            "geomean": _geomean(speedups),
+            "min": min(speedups) if speedups else None,
+            "max": max(speedups) if speedups else None,
+            "n": len(speedups),
+        }
+    return out
+
+
+def _leg_label(name: str, info: dict) -> str:
+    commit = info.get("git_commit") or "?"
+    dirty = "-dirty" if info.get("git_dirty") else ""
+    return f"{name} ({commit}{dirty})"
+
+
+def compare_multi(legs: list, require_null_leg: bool = False) -> None:
+    """`legs`: `[(name, {"system": ..., "results": ...}), ...]`, 3 or more (the current
+    run plus 2+ `--compare` files). Prints every pairing's per-config geomean and row
+    range, labels a same-tree pairing NULL, and — with `require_null_leg` — REFUSES to
+    flag a sub-threshold geomean as a verdict (reports it instead) unless at least one
+    NULL pairing exists somewhere in this sitting to calibrate the threshold against."""
+    n = len(legs)
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    null_pairs = {(i, j) for i, j in pairs
+                  if _same_tree(legs[i][1]["system"], legs[j][1]["system"])}
+    print(f"\n{'='*72}")
+    print(f"  MULTI-LEG COMPARE — {n} legs, {len(pairs)} pairing(s), "
+          f"{len(null_pairs)} same-tree NULL pairing(s)")
+    if require_null_leg and not null_pairs:
+        print(f"  NO same-tree NULL leg in this sitting — a sub-threshold geomean below "
+              f"is reported, not flagged, until one is added")
+    print(f"{'='*72}")
+    for i, j in pairs:
+        name_a, leg_a = legs[i]
+        name_b, leg_b = legs[j]
+        tag = "  [NULL: same tree]" if (i, j) in null_pairs else ""
+        print(f"\n  --- {_leg_label(name_a, leg_a['system'])} vs "
+              f"{_leg_label(name_b, leg_b['system'])}{tag} ---")
+        rows = _pairing_rows(leg_a["results"], leg_b["results"])
+        for cfg in CONFIGS:
+            s = rows[cfg]
+            if s["n"] == 0:
+                continue
+            gm_s = f"{s['geomean']:.3f}x" if s["geomean"] else "n/a"
+            rng_s = f"{s['min']:.2f}-{s['max']:.2f}x" if s["min"] is not None else "n/a"
+            sub_threshold = s["geomean"] is not None and s["geomean"] < 0.95
+            if sub_threshold and require_null_leg and not null_pairs:
+                verdict = "  <-- SUB-THRESHOLD, REFUSED (no same-tree null leg this sitting)"
+            elif sub_threshold:
+                verdict = "  <-- REGRESSION"
+            else:
+                verdict = ""
+            print(f"    {PRETTY[cfg]:<22} geomean {gm_s:>8}  range {rng_s:>13}  "
+                  f"n={s['n']:<3}{verdict}")
+    print(f"{'='*72}\n")
+
+
 def main():
     ap = argparse.ArgumentParser(description="TEX 8-config benchmark")
     ap.add_argument("--worker", type=str, default=None, help=argparse.SUPPRESS)
@@ -404,7 +503,14 @@ def main():
     ap.add_argument("--warm-runs", type=int, default=5)
     ap.add_argument("--timeout", type=int, default=200, help="per-program compiled subprocess timeout (s)")
     ap.add_argument("--save", type=str, default=None)
-    ap.add_argument("--compare", type=str, default=None)
+    ap.add_argument("--compare", action="append", default=None,
+                    help="baseline JSON to compare against; repeatable for 3+ legs, which "
+                         "prints every pairing's geomean/range and labels same-tree NULL "
+                         "pairings instead of diffing only the first (TRK-81)")
+    ap.add_argument("--require-null-leg", action="store_true",
+                    help="with 3+ legs, refuse (report, don't flag) a sub-threshold geomean "
+                         "as a verdict unless a same-tree NULL pairing is present in the "
+                         "sitting; no effect on a single-baseline --compare")
     args = ap.parse_args()
 
     if args.worker is not None:
