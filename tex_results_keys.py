@@ -77,25 +77,32 @@ def _canon_params(params) -> str:
     return json.dumps(params or {}, sort_keys=True, default=repr)
 
 
-def _canon_viewer(vc) -> str:
-    """PM-11: deterministic encoding of the host's viewer values, same shape as
-    `_canon_time` — sorted, `repr(float(...))` so a sub-ULP difference in an exposure
-    slider mints a distinct key rather than colliding onto a stale rendered frame."""
-    if not vc:
+def _canon_float_dict(d) -> str:
+    """Deterministic, collision-free encoding of a `{name: float-like}` dict, shared by
+    `_canon_time` (the ENG-7 host playhead) and `_canon_viewer` (PM-11's host viewer
+    values) — both key a result by EXACT value (`repr(float(...))`, so a fractional
+    playhead or a sub-ULP exposure slider mints a distinct key rather than colliding onto
+    a stale frame), sorted so name order is irrelevant, and both read "nothing supplied"
+    (empty/falsy) the same way. Empty is `"n"` rather than `"{}"` so the two spellings of
+    "nothing here" can never collide with a dict that happens to serialize to `"{}"`."""
+    if not d:
         return "n"
-    return json.dumps({k: repr(float(v)) for k, v in vc.items()}, sort_keys=True)
+    return json.dumps({k: repr(float(v)) for k, v in d.items()}, sort_keys=True)
+
+
+def _canon_viewer(vc) -> str:
+    """PM-11: deterministic encoding of the host's viewer values — see `_canon_float_dict`,
+    which this and `_canon_time` both are now."""
+    return _canon_float_dict(vc)
 
 
 def _canon_time(tc) -> str:
     """Deterministic encoding of the ENG-7 host playhead. ALL playhead builtins move output
     pixels while being kept out of the program fingerprint (interpreter `_TIME_BUILTIN_NAMES` =
     frame/fps/time), so a result key must carry every one of them, by EXACT value — folding the
-    whole normalized dict (not just `frame`) future-proofs a fourth builtin, and `repr(float)`
-    keeps fractional/sub-frame playheads (motion blur, retime) distinct where `int(frame)` would
-    collide them onto a stale frame."""
-    if not tc:
-        return "n"
-    return json.dumps({k: repr(float(v)) for k, v in tc.items()}, sort_keys=True)
+    whole normalized dict (not just `frame`) future-proofs a fourth builtin. See
+    `_canon_float_dict`, which this and `_canon_viewer` both are now."""
+    return _canon_float_dict(tc)
 
 
 def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
