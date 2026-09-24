@@ -13,6 +13,7 @@ import re
 import torch
 from .stdlib_registry import stdlib
 from .stdlib_core import (
+    _host_int,
     _scalar_from_tensor,
 )
 
@@ -55,7 +56,7 @@ class _StdlibString:
         if not all(isinstance(x, str) for x in (s, old, new)):
             raise ValueError("replace() expects string arguments for s, old, new")
         if max_count is not None:
-            n = int(max_count.item() if isinstance(max_count, torch.Tensor) else max_count)
+            n = _host_int(max_count)
             return s.replace(old, new, n)
         return s.replace(old, new)
 
@@ -121,9 +122,9 @@ class _StdlibString:
         """Extract substring. start is 0-based index."""
         if not isinstance(s, str):
             raise ValueError("substr() expects a string first argument")
-        start_i = int(start.item() if isinstance(start, torch.Tensor) else start)
+        start_i = _host_int(start)
         if length is not None:
-            len_i = int(length.item() if isinstance(length, torch.Tensor) else length)
+            len_i = _host_int(length)
             return s[start_i:start_i + len_i]
         return s[start_i:]
 
@@ -168,7 +169,7 @@ class _StdlibString:
         if not isinstance(delimiter, str):
             raise ValueError("split() delimiter must be a string")
         if max_splits is not None:
-            n = int(max_splits.item() if isinstance(max_splits, torch.Tensor) else max_splits)
+            n = _host_int(max_splits)
             return s.split(delimiter, n)
         return s.split(delimiter)
 
@@ -194,7 +195,7 @@ class _StdlibString:
         """Pad string on the left to reach target width. Default pad char is space."""
         if not isinstance(s, str):
             raise ValueError("pad_left() expects a string first argument")
-        w = int(width.item() if isinstance(width, torch.Tensor) else width)
+        w = _host_int(width)
         fill = " "
         if char is not None:
             if not isinstance(char, str) or len(char) != 1:
@@ -208,7 +209,7 @@ class _StdlibString:
         """Pad string on the right to reach target width. Default pad char is space."""
         if not isinstance(s, str):
             raise ValueError("pad_right() expects a string first argument")
-        w = int(width.item() if isinstance(width, torch.Tensor) else width)
+        w = _host_int(width)
         fill = " "
         if char is not None:
             if not isinstance(char, str) or len(char) != 1:
@@ -256,7 +257,7 @@ class _StdlibString:
         """Repeat a string N times."""
         if not isinstance(s, str):
             raise ValueError("repeat() expects a string first argument")
-        n = int(count.item() if isinstance(count, torch.Tensor) else count)
+        n = _host_int(count)
         if n < 0:
             n = 0
         return s * n
@@ -319,7 +320,7 @@ class _StdlibString:
         h = hashlib.sha256(s.encode("utf-8")).digest()
         value = int.from_bytes(h[:8], "big")
         if max_val is not None:
-            m = int(max_val.item() if isinstance(max_val, torch.Tensor) else max_val)
+            m = _host_int(max_val)
             if m > 0:
                 value = value % m
                 if m <= 2**24:
@@ -337,7 +338,7 @@ class _StdlibString:
         """Get character at index. Returns empty string if out of bounds."""
         if not isinstance(s, str):
             raise ValueError("char_at() expects a string first argument")
-        i = int(index.item() if isinstance(index, torch.Tensor) else index)
+        i = _host_int(index)
         if 0 <= i < len(s):
             return s[i]
         return ""

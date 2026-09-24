@@ -405,3 +405,69 @@ def test_perf2_a_tag_never_survives_an_operation(r: SubTestResult):
     except Exception as e:
         r.fail("PERF-2 tag staleness", f"{type(e).__name__}: {e}")
 
+
+# ── 5. TRK-67: the same mechanism, off the stdlib string family (v041-p2) ──────────
+#
+# The string family lives outside any single registered builtin's `fn` in the way
+# `_count_readbacks_inside` expects (which patches one registry entry) — `_host_int` is
+# a plain module-level helper several builtins call, not itself registered. This counts
+# every `Tensor.item()` call globally instead.
+
+class _count_all_item_calls:
+    """Counts every `Tensor.item()` call process-wide while active, split by device."""
+
+    def __enter__(self):
+        self.reads = 0
+        self.device_reads = 0
+        self._orig = torch.Tensor.item
+        probe = self
+
+        def _item(self_t):
+            probe.reads += 1
+            if self_t.device.type != "cpu":
+                probe.device_reads += 1
+            return probe._orig(self_t)
+        torch.Tensor.item = _item
+        return self
+
+    def __exit__(self, *exc):
+        torch.Tensor.item = self._orig
+        return False
+
+
+def test_trk67_string_family_costs_no_readback(r: SubTestResult):
+    """TRK-67 — RED-FIRST. `replace`, `substr`, `split`, `pad_left`, `pad_right`,
+    `repeat`, `hash_int` and `char_at` each resolved their size/index argument with
+    `int(x.item() if isinstance(x, torch.Tensor) else x)` — a device readback on every
+    call, even for a literal or `$param` value that a source program always mints with a
+    host reading. `_host_int` (`stdlib_core.py`) takes it from there instead, same
+    mechanism as `_host_scalar`. CUDA-only: a CPU `.item()` is a host-memory read and
+    would pass without measuring anything."""
+    print("\n--- TRK-67: string family size/index args cost no device readback ---")
+    if not torch.cuda.is_available():
+        r.skip("TRK-67 device readback",
+               "no CUDA device — a CPU `.item()` is a host-memory read")
+        return
+    rows = (
+        ("replace $n",   '@OUT = replace("aaaa","a","b",$n);',                  {"n": 2}),
+        ("substr $n",    '@OUT = substr("hello world",$n,3);',                  {"n": 2}),
+        ("split $n",     'string arr[] = split("a,b,c,d",",",$n);\n'
+                          '@OUT = arr[0];',                                     {"n": 1}),
+        ("pad_left $n",  '@OUT = pad_left("hi",$n);',                           {"n": 5}),
+        ("pad_right $n", '@OUT = pad_right("hi",$n);',                          {"n": 5}),
+        ("repeat $n",    '@OUT = repeat("ab",$n);',                             {"n": 3}),
+        ("hash_int $n",  'float h = hash_int("seed",$n);\n@OUT = vec4(h);',     {"n": 100}),
+        ("char_at $n",   '@OUT = char_at("hello",$n);',                        {"n": 1}),
+    )
+    for label, code, extra in rows:
+        name = f"[cuda] {label}"
+        try:
+            with _count_all_item_calls() as probe:
+                compile_and_run(code, extra, device="cuda")
+            if probe.device_reads:
+                r.fail("TRK-67 readback", f"{name}: {probe.device_reads} device readback(s)")
+            else:
+                r.ok(name)
+        except Exception as e:
+            r.fail("TRK-67 readback", f"{name}: {type(e).__name__}: {e}")
+

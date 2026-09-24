@@ -12,6 +12,7 @@ import math
 import torch
 from .stdlib_registry import stdlib
 from .stdlib_core import (
+    _host_int,
     _reduce_channels,
     _to_tensor,
 )
@@ -184,8 +185,11 @@ class _StdlibArray:
             return None if isinstance(v, float) and not math.isfinite(v) else v
 
         try:
-            xi = int(x.item()) if isinstance(x, torch.Tensor) else int(x)
-            yi = int(y.item()) if isinstance(y, torch.Tensor) else int(y)
+            # TRK-67: `_host_int` takes a literal/`$param` x/y from the host reading it
+            # was minted with, same as the string family; a device-computed x/y (rare
+            # for a debug-probe coordinate) still reads back.
+            xi = _host_int(x)
+            yi = _host_int(y)
             if isinstance(value, torch.Tensor) and value.dim() >= 3:
                 H, W = value.shape[1], value.shape[2]
                 pv = value[0, min(max(yi, 0), H - 1), min(max(xi, 0), W - 1)]

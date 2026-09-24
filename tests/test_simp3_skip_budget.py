@@ -88,7 +88,13 @@ _SKIP_VOCAB = re.compile(
 #: attempt on a program whose pre-fix static verdict was "capturable" — the same
 #: no-CPU-witness reason as the v042-graph rows above, since there is no CPU stand-in for
 #: a genuine `cudaErrorStreamCaptureInvalidated`.
-_SKIP_BUDGET = 106
+#: Re-pinned from 106 to 107 (v041-p2, TRK-67): `test_perf2_host_scalar.py`'s
+#: `test_trk67_string_family_costs_no_readback` counts real `torch.Tensor.item()` calls
+#: split by device — the same no-CPU-witness reason
+#: `test_perf2_a_host_scalar_costs_no_readback` (already inside the pin) carries: a CPU
+#: `.item()` is a host-memory read, not a device round trip, so the row would pass
+#: without measuring anything off CUDA.
+_SKIP_BUDGET = 107
 
 
 def _literal(node) -> str:

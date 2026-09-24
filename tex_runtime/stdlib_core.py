@@ -136,6 +136,19 @@ def _host_scalar(x):
     return None
 
 
+def _host_int(x) -> int:
+    """`int(x.item())` for a size/index/count argument, taking the host reading when `x`
+    carries one (TRK-67) — the string/array family's own callers of `_host_scalar`. Every
+    site this replaces was `int(x.item() if isinstance(x, torch.Tensor) else x)`; a
+    literal or `$param` argument is minted with a host reading in practice, so the common
+    call pays no device readback, and a genuinely computed argument still reads back
+    exactly as before."""
+    if not isinstance(x, torch.Tensor):
+        return int(x)
+    v = _host_scalar(x)
+    return int(v) if v is not None else int(x.item())
+
+
 _scalar_avg_warned = False
 
 
