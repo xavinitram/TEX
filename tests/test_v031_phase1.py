@@ -491,8 +491,16 @@ def test_v031_sched4_off_the_default_path(r: SubTestResult):
     # IMPORT forms only — the claim is "no engine module DEPENDS on the queue", and a prose
     # mention in a comment (profile.py explains which two threads its lock exists for) is not a
     # dependency; matching the bare token made this fire on documentation.
+    # The "from" branch used to lead with `\.*[\w.]*`: `[\w.]*` alone already
+    # matches any run of dots (a relative-import level) or dotted names, so the
+    # leading `\.*` was a redundant quantifier overlapping the one right after it --
+    # the same CodeQL-flagged shape as the gate's summary regex (v0422-redos), just
+    # adjacent rather than nested. On a line with many dots and no matching tail, the
+    # engine tried quadratically many splits of the same dot run between the two
+    # quantifiers before giving up. Dropping `\.*` matches exactly the same lines --
+    # it never accepted anything `[\w.]*` did not already accept -- and is linear.
     offenders = lint_sources(
-        r"^[ 	]*(?:from[ 	]+\.*[\w.]*tex_cookqueue|import[ 	]+[\w.]*tex_cookqueue)",
+        r"^[ 	]*(?:from[ 	]+[\w.]*tex_cookqueue|import[ 	]+[\w.]*tex_cookqueue)",
         allow={"tex_cookqueue.py"}, flags=_re.MULTILINE)
     r.ok("no engine or adapter module imports tex_cookqueue") if not offenders else         r.fail("SCHED-4 invariant #7", f"imported by {offenders}")
 
