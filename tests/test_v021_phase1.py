@@ -632,7 +632,7 @@ def test_lat4_builtins_lru(r: SubTestResult):
 @pytest.mark.timing
 def test_eng8_transfer_model(r: SubTestResult):
     # v0422-gatehyg / TRK-75: real measured H2D transfer_ms, asserted monotonic --
-    # "a timing test by nature" (bug_reports/TRACKER.md's own words for this row) even
+    # "a timing test by nature" (the finding's own words) even
     # though it deliberately never asserts the noisy pinned<=pageable comparison. Behind
     # `timing`, deselected by tools/gate.py's tiers; run deliberately with -m timing.
     print("\n--- ENG-8: xfer transfer_ms + persistence ---")

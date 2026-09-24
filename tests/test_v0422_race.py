@@ -1,7 +1,7 @@
 """v0422-race (TRK-178) — a targeted repro attempt for the one CUDA-leg `wrong=2` red the
 v0.42.0 release gate produced in `test_v033_cache8_touch_and_in_survive_a_threaded_race`, never
 reproduced since (0/270 attempts across four contention shapes, per
-`bug_reports/pending/v042-race.md`). That row races six kinds of traffic at once over 32x32
+the original finding). That row races six kinds of traffic at once over 32x32
 frames; this row isolates the ONE leg the audit named as leading suspect — `ResultCache._restore`'s
 non-blocking pinned host-to-device copy on the disk-spill/restore leg — and gives it everything
 that shape needs to show up: frames big enough that the DMA takes real time (`_pin_worthwhile`'s
@@ -10,7 +10,7 @@ microseconds), and several reader threads released together the instant the fram
 servable again, so some of them race straight into `_restore` (a fresh disk-tier miss) while
 others may catch the entry the instant it lands in `_ram`, mid-copy.
 
-THE AUDIT (docs/worklog/v0422-race/handback.md) traced why this has been so hard to reproduce.
+THE AUDIT traced why this has been so hard to reproduce.
 `_restore`'s H2D (`tex_results.py` around `pinned.to(dev, non_blocking=True)`) records no CUDA
 event and does not synchronize before handing the tensor to `_admit` and back through `get`. But
 nothing reachable from `get`/`put`/`_restore` ever pushes a non-default CUDA stream — grep the

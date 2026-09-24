@@ -2,7 +2,7 @@
 
 `refs/stash` lives in the ONE shared `.git` directory of a repository, so every
 `git worktree` checkout of this repository shares one stash stack. `TRK-128`
-(`bug_reports/TRACKER.md`): two lanes stashed at essentially the same moment and each
+(the project's findings record): two lanes stashed at essentially the same moment and each
 `pop` recovered the OTHER lane's entry, git reporting nothing wrong at either step in
 either worktree. The fix that landed was a positive instruction to every implementer
 ("NEVER `git stash`") -- correct, but an instruction is not a gate, and the fast tier
