@@ -10,7 +10,7 @@
   <img src="TEX_node.webp" alt="TEX Wrangle node" width="500">
 </p>
 
-A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 144 stdlib functions.
+A compact per-pixel DSL inspired by **Houdini VEX**, **VDB AX**, and **Nuke BlinkScript**. Write image, mask, latent, and string processing logic directly in a node — with static typing, GPU acceleration, and 156 stdlib functions.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://python.org)
@@ -79,10 +79,10 @@ Restart ComfyUI after installation. The node appears under the **TEX** category.
 | **Memory cooperation** | OOM preflight + byte-budgeted cache eviction; tile-safe programs run in strips under VRAM pressure |
 | **Cross-node fusion** | Compile a chain of linked TEX nodes into one program — only the last node cooks (opt-in via Settings → TEX Fusion). A live **preflight** flags an unfusable chain (red bubble) before you queue |
 | **Lazy input cooking** | Wired inputs the code can't use are **never cooked upstream** — including branches disabled by a `$param` (`if ($mode > 0.5) { @OUT = @B; } else { @OUT = @A; }` cooks only the taken side). Build cheap switches that prune dead branches from the workflow. Default on (Settings → TEX Lazy) |
-| **144 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions, `debug_print` |
+| **156 stdlib functions** | Math, color, noise, sampling, strings, arrays, image reductions, `debug_print` |
 | **Latent support** | Process latent tensors directly (SD1.5, SDXL, SD3) |
 | **Batch & temporal** | `fi`/`fn` for frame-aware effects, `fetch_frame`/`sample_frame` for cross-frame access |
-| **Snippets** | Right-click → Snippets for 116 built-in examples; save your own with folder organization |
+| **Snippets** | Right-click → Snippets for 118 built-in examples; save your own with folder organization |
 | **Nodes v3** | Built on ComfyUI's Nodes v3 API (`comfy_api.latest`) |
 
 ## Language Reference
@@ -174,7 +174,7 @@ while (val < 100.0) { val = val * 2.0; }
 | `frame`, `fps`, `time` | The **host timeline** (v0.22). ComfyUI has no playhead, so these read `0` there — use `fi`/`fn` for batch position. A standalone host feeds its own. Reserved names. |
 | `PI`, `TAU`, `E` | Math constants (`TAU` = 2·PI) |
 
-### Standard Library (144 functions)
+### Standard Library (156 functions)
 
 **Math:** `sin` `cos` `tan` `asin` `acos` `atan` `atan2` `sinh` `cosh` `tanh` `sqrt` `pow` `pow2` `pow10` `exp` `log` `log2` `log10` `abs` `sign` `floor` `ceil` `round` `fract` `mod` `hypot` `degrees` `radians` `spow` `sdiv` `isnan` `isinf`
 
@@ -219,7 +219,7 @@ while (val < 100.0) { val = val * 2.0; }
 
 ## Examples
 
-The `examples/` directory contains 116 ready-to-use snippets:
+The `examples/` directory contains 118 ready-to-use snippets:
 
 | Category | Examples |
 |----------|---------|
