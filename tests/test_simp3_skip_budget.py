@@ -97,7 +97,17 @@ _SKIP_VOCAB = re.compile(
 #: Re-pinned from 107 to 108 (v041-p2, TRK-68): the same file's
 #: `test_trk68_array_index_and_loop_bound_cost_no_readback` carries the identical
 #: no-CPU-witness reason for a `$param` array index / loop bound's device-readback count.
-_SKIP_BUDGET = 108
+#: Re-pinned from 108 to 104 (v042-noviewer): `viewer_exposure()`/`viewer_gamma()` and the
+#: whole `viewer_context=`/CUDA-graph host-context-buffer mechanism are removed outright —
+#: the ComfyUI node never exposed a viewer input and the embedding host grades in its own
+#: shader, so nothing ever consumed them (the author's ruling). Their two test files are
+#: deleted rather than repaired: `tests/test_v040_phase2.py` (PM-11, 1 site —
+#: `test_pm11_oom_rung_path`) and `tests/test_v042_graph.py` (v042-graph, the 3 sites the
+#: 102→105 re-pin above named) — 4 sites gone. The replacement, `tests/test_v042_noviewer.py`
+#: (proving the names are no longer reserved, the kwarg is rejected everywhere, and a
+#: non-viewer program's lineage-key byte format is unmoved), needs no CUDA witness — every
+#: row is AST-level or a pure-function check — so it adds 0. Net 108 − 4 = 104.
+_SKIP_BUDGET = 104
 
 
 def _literal(node) -> str:

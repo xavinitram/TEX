@@ -320,7 +320,7 @@ MUTATIONS = [
      'def _uniform_grid():\n    return None',
      ("test_v0341_audit",)),
     ('v0.34.1 D: the codegen tier stops publishing the grid', 'tex_runtime/codegen.py',
-     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device, viewer=viewer_context)',
+     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device)',
      '    _grid_token = _stdlib_set_cook_grid(None, None)',
      ("test_v0341_audit",)),
     ('v0.34.1 E: the pool stops copying at its boundary', 'tex_provider.py',
@@ -536,10 +536,10 @@ MUTATIONS = [
      '    _stage_vec_params(bindings, device, dtype)\n'
      '    if program is not None:\n'
      '        _stage_wire_scalars(bindings, device, dtype, cg_fn, program)\n'
-     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device, viewer=viewer_context)',
+     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device)',
      '    if program is not None:\n'
      '        _stage_wire_scalars(bindings, device, dtype, cg_fn, program)\n'
-     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device, viewer=viewer_context)',
+     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device)',
      ("test_codegen_value_parity",)),
     ('the vec-param staging drops the [1,1,1,C] reshape', 'tex_runtime/interpreter.py',
      '    if t.dim() == 1 and t.shape[0] in (2, 3, 4):\n'
