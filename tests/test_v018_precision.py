@@ -13,7 +13,7 @@ _FP16_BAR = 3.9e-3  # the 8-bit quantum (doc 22)
 
 
 def _gpu_busy_reason(threshold: int = 15) -> str:
-    """TRK-104: a best-effort box-quiet check (CLAUDE.md §8's own pre-timing ritual,
+    """TRK-104: a best-effort box-quiet check (the project's own pre-timing ritual,
     made machine-checkable). `test_prlp2_node_path_perf` asserts a wall-clock speedup
     RATIO on CUDA, and a shared GPU makes that ratio noisy — the noise moves the ratio
     DOWN (contention steals cycles from every leg alike but the denominator is on the

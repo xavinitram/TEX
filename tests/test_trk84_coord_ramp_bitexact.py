@@ -4,7 +4,7 @@ slice is bit-exact against the direct formula for every origin, including a tile
 THE ROW. Every LAT-4 coordinate-builtin LRU miss (a pan, an ROI window, a strip) rebuilt
 `ix`/`u`/`iy`/`v` from scratch: `torch.arange(x0, x0+W)` then a divide, per axis — 4 kernels
 and 4 allocations that a window move pays on EVERY tick, because the origin never repeats.
-The author's ruling (`docs/worklog/v041-decisions.md`): ship a bit-exact fix, or decline.
+The author's ruling: ship a bit-exact fix, or decline.
 
 THE FIX (`Interpreter._coord_ramps`, `tex_runtime/interpreter.py`) caches the FULL-EXTENT
 `[0, size)` ramp and its `/max(size-1,1)` normalization, keyed on size alone (never on the
