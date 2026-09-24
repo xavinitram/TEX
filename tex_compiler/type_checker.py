@@ -1091,22 +1091,30 @@ class TypeChecker:
             (obj_type.is_string, "strings", "Strings don't have channels. Try len() or substr() instead."),
             (obj_type.is_matrix, "matrix types", "Use matrix indexing or multiply by a vector instead."),
             (obj_type.is_array, "an array", "Index the array with arr[i], then swizzle the element."),
+            # DATA-6/TRK-116: a PLANES wire has planes, not channels — `@beauty.r` on a
+            # PLANES base under the ComfyUI profile (where no plane read exists) lands
+            # here rather than crashing, and the hint says what the dot means on the
+            # engine profile. Was its own `if obj_type.is_planes:` block below this loop
+            # that recorded E3300 and fell through into the swizzle rules further down,
+            # the one arm here that did not return — so a plane name that is not also a
+            # valid swizzle pattern (almost every real one: `.diffuse`, `.specular`, …)
+            # drew a REDUNDANT second diagnostic (E3302/E3303) beside E3300, and a plane
+            # name that coincidentally IS a valid swizzle (`.rgb`, `.xyz`) fell all the way
+            # through to the vector-swizzle return, propagating a VECn type for a value
+            # E3300 already says has no channels. Returning here like the other three arms
+            # never changes pass/fail — E3300 already makes `is_planes` unconditionally an
+            # error — it only drops that redundant diagnostic and stops the wrong VECn
+            # propagation. Verified against the shipped corpus + `stock/*.textool`: no
+            # program's overall pass/fail moves (see `tests/test_trk116_planes_arm_returns.py`).
+            (obj_type.is_planes, "a planes wire",
+             "Name a plane first: @beauty.diffuse.rgb swizzles the plane, not "
+             "the wire (plane reads need the engine profile)."),
         ):
             if has_no_channels:
                 self._error(f"Channel access (.rgb, .x, etc.) doesn't work on {noun}.",
                             node.loc, code="E3300", hint=hint)
                 self._set_type(node, TEXType.FLOAT)
                 return TEXType.FLOAT
-        if obj_type.is_planes:
-            # DATA-6: a PLANES wire has planes, not channels — `@beauty.r` on a PLANES base
-            # under the ComfyUI profile (where no plane read exists) lands here rather than
-            # crashing, and the hint says what the dot means on the engine profile. Recorded
-            # and NOT returned: the swizzle rules below still speak, so the segment's own
-            # diagnostic (E3302 on `.diffuse`) stands beside this one, as it did before the arm.
-            self._error("Channel access (.rgb, .x, etc.) doesn't work on a planes wire.",
-                        node.loc, code="E3300",
-                        hint="Name a plane first: @beauty.diffuse.rgb swizzles the plane, not "
-                             "the wire (plane reads need the engine profile).")
 
         if len(channels) == 1:
             # Single channel -> float

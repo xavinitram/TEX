@@ -206,14 +206,24 @@ def test_the_production_seam_lexes_greedily(r: SubTestResult):
         r.fail("seam is greedy", str(e))
     try:
         # …and with plane wires OFF the same source through the same seam is the swizzle it
-        # always was: `.diffuse` is not a swizzle pattern, E3302.
+        # always was: a PLANES base has no channels at all, E3300 (TRK-116) — the checker's
+        # PLANES arm now returns immediately like the string/matrix/array arms beside it,
+        # instead of also falling through into the swizzle-pattern rules and adding a
+        # redundant E3302/E3303 on top of the same E3300 the program already carries. Now
+        # exactly ONE diagnostic, so `check()`'s own contract (TypeCheckError.check,
+        # "raises on the first (or, for several, the aggregated TEXMultiError)") raises the
+        # single error directly, not a TEXMultiError of one.
         try:
             get_cache().compile_tex(src + "// off\n", {"beauty": TEXType.PLANES})
             raise AssertionError("compiled")
-        except TEXMultiError as e:                 # two swizzle errors accumulate (E3302 + E3303)
+        except TEXMultiError as e:
             codes = {d.code for d in e.diagnostics}
-            assert "E3302" in codes, codes
-        r.ok("compile_tex + planes off: the same read is a swizzle (E3302 on `.diffuse`)")
+            assert codes == {"E3300"}, codes
+        except Exception as e:
+            code = getattr(e, "_code", "") or getattr(getattr(e, "diagnostic", None), "code", "")
+            assert code == "E3300", (type(e).__name__, code, str(e))
+        r.ok("compile_tex + planes off: the same read is E3300 alone (a planes wire has no "
+             "channels), not a redundant swizzle-pattern diagnostic on top of it")
     except Exception as e:
         r.fail("seam splits back when off", str(e))
 
