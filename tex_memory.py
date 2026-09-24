@@ -272,13 +272,25 @@ def _total_cache_bytes(dev_type=None) -> int:
 
 def cache_budget_bytes(device) -> int:
     """VRAM/CPU byte budget for TEX's tensor caches. Env override
-    TEX_CACHE_BUDGET_MB; else min(1 GB, 12.5% VRAM) on CUDA, 512 MB on CPU."""
+    TEX_CACHE_BUDGET_MB (whole MiB, strictly positive — anything else is refused, same floor
+    NEG-3 gave `governor_budget`); else min(1 GB, 12.5% VRAM) on CUDA, 512 MB on CPU."""
     override = os.environ.get("TEX_CACHE_BUDGET_MB")
     if override:
+        # TRK-95: `int(override)` alone accepts "0" and "-8" as happily as "512", and this
+        # is the stdlib tensor-cache budget `enforce_cache_budget` compares live usage
+        # against every cook — a non-positive value reads like "no limit" and instead means
+        # "evict every entry on every cook", the same silent cache-off NEG-3 closed for
+        # `governor_budget` and `tex_results._budget_bytes`. Refuse it and fall through to
+        # the computed default, exactly as those two do.
         try:
-            return int(override) * 1024 * 1024
+            mb = int(override)
         except ValueError:
-            pass
+            mb = 0
+        if mb > 0:
+            return mb * 1024 * 1024
+        logger.warning(
+            "[TEX] TEX_CACHE_BUDGET_MB=%r is not a positive whole number of MiB; "
+            "ignoring it and using the computed cache budget.", override)
     dev = torch.device(device) if not isinstance(device, torch.device) else device
     if dev.type == "cuda":
         try:

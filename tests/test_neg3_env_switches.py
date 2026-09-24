@@ -102,6 +102,54 @@ def test_neg3_governor_budget_env_is_hardened(r: SubTestResult):
         r.fail("governor budget zero", f"{type(e).__name__}: {e}")
 
 
+def test_trk95_cache_budget_env_is_hardened(r: SubTestResult):
+    """TRK-95: `TEX_CACHE_BUDGET_MB` gets the same floor NEG-3 gave `governor_budget` one
+    function below — set / unset / garbage, all three states, mirroring
+    `test_neg3_governor_budget_env_is_hardened` exactly."""
+    from TEX_Wrangle.tex_memory import cache_budget_bytes
+    cpu = torch.device("cpu")
+
+    try:
+        with _env("TEX_CACHE_BUDGET_MB", None):
+            default = cache_budget_bytes(cpu)
+        assert isinstance(default, int) and default > 0, default
+        r.ok(f"unset: the computed CPU cache budget stands ({default >> 20} MiB)")
+    except Exception as e:
+        r.fail("cache budget unset", f"{type(e).__name__}: {e}")
+        return
+
+    try:
+        for mb in ("1", "512", "4096"):
+            with _env("TEX_CACHE_BUDGET_MB", mb):
+                got = cache_budget_bytes(cpu)
+            assert got == int(mb) * (1 << 20), (mb, got)
+        r.ok("set: a positive whole number of MiB is honoured exactly")
+    except Exception as e:
+        r.fail("cache budget set", f"{type(e).__name__}: {e}")
+
+    try:
+        bad = []
+        for v in _GARBAGE + ("1.5",):
+            with _env("TEX_CACHE_BUDGET_MB", v):
+                got = cache_budget_bytes(cpu)
+            if got != default:
+                bad.append((v, got))
+        assert not bad, f"accepted as a budget instead of falling back to {default}: {bad}"
+        r.ok("garbage: every non-positive / unparseable value is refused, default stands")
+    except Exception as e:
+        r.fail("cache budget garbage", f"{type(e).__name__}: {e}")
+
+    try:
+        # The hazard TRK-95 named: zero is not a size, and a zero stdlib-cache budget evicts
+        # every tensor-cache entry on the very next `enforce_cache_budget` call.
+        with _env("TEX_CACHE_BUDGET_MB", "0"):
+            assert cache_budget_bytes(cpu) != 0, \
+                "a zero cache budget evicts every stdlib tensor-cache entry on the next cook"
+        r.ok("zero is refused (the cache budget can never be 0 by typo)")
+    except Exception as e:
+        r.fail("cache budget zero", f"{type(e).__name__}: {e}")
+
+
 def test_neg3_results_budget_envs_are_hardened(r: SubTestResult):
     """`TEX_RESULTS_DISK_MB` and its RAM twin, through their one reader and end to end."""
     from TEX_Wrangle.tex_results import ResultCache, _budget_bytes
