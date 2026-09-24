@@ -68,6 +68,25 @@ def test_mem2_pool_trim_gating(r: SubTestResult):
         os.environ.pop("TEX_NO_POOL_TRIM", None)
         if q["empty"] != 0:
             fails.append("TEX_NO_POOL_TRIM=1 did not disable the trim")
+        # (6) TRK-96: the UNSET state — the one every ComfyUI user runs, since nobody
+        # sets this switch by default. Rows (1)-(5) never force it absent, so a change
+        # that made the trim path unconditional (or made it never run) on the UNSET
+        # reading specifically would not red anywhere above. Force it absent (never
+        # assume the ambient environment already lacks it) and require the same
+        # downshift-over-threshold scenario as row (3) to still trim.
+        saved_switch = os.environ.pop("TEX_NO_POOL_TRIM", None)
+        try:
+            MEM._last_trim_px[0] = 512 * 512
+            _set(1.7, 0.2)  # 1.5 GB stranded (> threshold) — same shape as row (3)
+            q["reserved"] = q["empty"] = 0
+            MEM.trim_reserved_pool(torch.device("cuda:0"), 256 * 256)
+            if q["reserved"] == 0:
+                fails.append("TEX_NO_POOL_TRIM unset did not query the allocator")
+            if q["empty"] != 1:
+                fails.append("TEX_NO_POOL_TRIM unset did not trim over threshold")
+        finally:
+            if saved_switch is not None:
+                os.environ["TEX_NO_POOL_TRIM"] = saved_switch
     finally:
         for k, v in real.items():
             if v is not None:
