@@ -123,7 +123,7 @@ class Program:
 
 
 def _compile_impl(source: str, binding_types: dict, *, fp: str | None = None):
-    """Shared body of `compile()` and `prewarm()`'s per-program compile (TRK-73): the caller
+    """Shared body of `compile` and `prewarm`'s per-program compile step (TRK-73): the caller
     may already hold `TEXCache.fingerprint(source, binding_types)` — `prewarm` needs the same
     string again for the codegen sidecar, the background-compile key and the capturability
     verdict — and handing it through here, exactly as `tex_engine.prepare` (LAT-2) already
