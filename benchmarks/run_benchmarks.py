@@ -563,7 +563,8 @@ def compile_program(code: str, binding_types: dict):
 _interp: Interpreter | None = None
 
 def run_interpreter(program, bindings, type_map, device="cpu",
-                    output_names=None, precision="fp32", used_builtins=None):
+                    output_names=None, precision="fp32", used_builtins=None,
+                    source=None):
     global _interp
     if _interp is None:
         _interp = Interpreter()
@@ -575,6 +576,12 @@ def run_interpreter(program, bindings, type_map, device="cpu",
         kwargs["precision"] = precision
     if "used_builtins" in sig.parameters:
         kwargs["used_builtins"] = used_builtins
+    # REG-1d: the production seam (tex_engine.py) always passes `source=` (the ComfyUI-
+    # invisible fast path in `interpreter._consensus_extent` reads it), so a harness that
+    # never does measures a path no real cook takes. `source=None` (the default) keeps
+    # every existing caller of this function byte-identical.
+    if source is not None and "source" in sig.parameters:
+        kwargs["source"] = source
     return _interp.execute(program, bindings, type_map, **kwargs)
 
 

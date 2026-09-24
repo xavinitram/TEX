@@ -555,7 +555,7 @@ class Interpreter(MaskedFlowMixin):
         moves and the fix needs no freeze-boundary argument. It lands before freeze #2 so the
         freeze snapshots the post-fix truth.
         """
-        sp = _consensus_extent(self.bindings, program, roi=roi)
+        sp = _consensus_extent(self.bindings, program, roi=roi, source=self._source)
         if sp is None and roi is not None:
             # An ROI cook with NO spatial binding at all. `run_roi` refuses this case before it
             # can arrive ("no spatial binding to anchor the window"), so this is unreachable
@@ -2530,6 +2530,10 @@ def _collect_binding_reads(program: Program) -> frozenset[str]:
 _READS_MEMO: "OrderedDict[int, tuple[Program, frozenset[str], frozenset[str]]]" = OrderedDict()
 _READS_MEMO_MAX = 128
 
+#: `_consensus_extent`'s `source`-provable-empty answer — one shared frozenset instead of a
+#: fresh `frozenset()` allocation on every fast-path hit.
+_EMPTY_NON_SPATIAL: frozenset[str] = frozenset()
+
 
 def _reads_and_non_spatial_cached(program: Program) -> tuple[frozenset[str], frozenset[str]]:
     """`_collect_binding_reads_and_non_spatial`, memoized per program object — the ONE
@@ -2567,7 +2571,7 @@ def _non_spatial_names_cached(program: Program) -> frozenset[str]:
 
 
 def _consensus_extent(bindings: dict, program: Program,
-                      roi: tuple | None = None) -> tuple[int, int, int] | None:
+                      roi: tuple | None = None, source: str = "") -> tuple[int, int, int] | None:
     """CF-6 (v0.35): the (B, H, W) cook grid — the CONSENSUS extent, not first-wins.
 
     THE SINGLE OWNER of the rule. The interpreter (`_determine_spatial_shape`) and codegen
@@ -2617,20 +2621,41 @@ def _consensus_extent(bindings: dict, program: Program,
     trigger the walk. That is what keeps the interactive path free of it — under an ROI the
     bindings are narrowed to the cook region while whole-passed gather inputs keep their full
     size, so H and W disagree BY CONSTRUCTION on every window while batches almost never do.
+
+    `source`, when the caller has it (the interpreter's real cook path always does via
+    `self._source`; a fused chain and a caller with no source text do not, and pass ""): a
+    FAST PATH that skips the `non_spatial` walk below entirely for a program PROVABLY
+    incapable of binding one — a program whose source text mentions NONE of the (small,
+    registry-derived) non-spatial-arg function names cannot possibly call one, since TEX has
+    no string-built calls: a real call always spells the name verbatim. A sound
+    over-approximation in the invariant #11 shape — source containing the name without
+    actually calling it (a comment, an unrelated identifier) only costs the walk this fast
+    path exists to skip, never a wrong answer, and `source=""` (unknown) always falls back to
+    computing it, exactly as before this fast path existed.
     """
     # ONE pass, and no list unless an axis splits. `_build_codegen_env` and this function's
     # other two callers all run per cook on the default path, where the old code was a `for`
     # with an early `break`; the comprehension-plus-`all()` this replaced cost ~1.5-2 us of
     # tuple building for an answer that is three integers.
     #
-    # `non_spatial` (COLOR-1, v0.40) is one memoized `_READS_MEMO` lookup (the SAME one the
-    # narrowing branch below already pays for `read` — folded into a single walk/memo via
-    # `_reads_and_non_spatial_cached`, the private accessor `_binding_reads_cached`/
-    # `_non_spatial_names_cached` both wrap), returning an empty frozenset for every program
-    # that never calls a `non_spatial_args`-declaring function (every program before v0.40,
-    # and most after), so the default path pays one cheap-and-constant lookup, never a
-    # fresh walk.
-    read, non_spatial = _reads_and_non_spatial_cached(program)
+    # `non_spatial` (COLOR-1, v0.40) used to be documented as "one cheap-and-constant lookup,
+    # never a fresh walk" on the default path -- true only while `program` reuses the SAME
+    # object across cooks (`_READS_MEMO` hits). A cold compile builds a fresh `Program` every
+    # time, so that memo always misses and the combined walk (`_reads_and_non_spatial_cached`,
+    # shared with the narrowing branch below) re-paid on every single cold first cook, unless
+    # `source` lets us skip it: see the docstring's `source` paragraph. `read` stays `None`
+    # (computed lazily, exactly like pre-COLOR-1 `_binding_reads_cached`) until the narrowing
+    # branch actually needs it, so a program provably free of a non-spatial call that ALSO
+    # never disagrees pays for neither.
+    if source:
+        from .stdlib_registry import non_spatial_args_by_name
+        provably_none = not any(n in source for n in non_spatial_args_by_name())
+    else:
+        provably_none = False
+    if provably_none:
+        read, non_spatial = None, _EMPTY_NON_SPATIAL
+    else:
+        read, non_spatial = _reads_and_non_spatial_cached(program)
     b = h = w = None
     b_split = hw_split = False
     for name, v in bindings.items():
@@ -2656,6 +2681,8 @@ def _consensus_extent(bindings: dict, program: Program,
     if b is None:
         return None
     if b_split or (hw_split and roi is None):
+        if read is None:                   # the fast path deferred this -- pay for it now
+            read, non_spatial = _reads_and_non_spatial_cached(program)
         rb = rh = rw = None
         for name, v in bindings.items():
             if (name == "OUT" or name not in read or name in non_spatial
