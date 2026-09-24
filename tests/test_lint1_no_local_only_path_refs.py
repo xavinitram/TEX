@@ -80,9 +80,9 @@ _HOST_NAME_HASHES = frozenset(
 
 def scan_host_name(text: str) -> list:
     """`[(lineno, token)]` for every EXACT-CASE word token whose sha256 lands in
-    `_HOST_NAME_HASHES`. No casefold: `"shard".capitalize()` and `.upper()` are the only two
-    spellings that can ever hit, so this project's own lowercase verb usage of the same word
-    never does."""
+    `_HOST_NAME_HASHES`. No casefold: the seed word's own two cased spellings (see
+    `_HOST_SEED`, above) are the only ones that can ever hit, so this project's own lowercase
+    verb usage of the same word never does."""
     found = []
     for n, line in enumerate(text.splitlines(), 1):
         for tok in _WORD_RE.findall(line):
@@ -98,7 +98,7 @@ def _fragments():
     return [
         ("an evidence/worklog path", _frag("docs", "/", "worklog")),
         ("the findings-tracker directory", _frag("bug", "_reports")),
-        ("a per-host asks/changelog document", _frag("docs/", "shard-")),
+        ("a per-host asks/changelog document", _frag("docs/", "sha", "rd-")),
         ("the orchestrator pointer file", _frag("CLA", "UDE", ".md")),
         ("the agent-definitions directory (forward slash)", _frag(".", "cla", "ude/")),
         ("the agent-definitions directory (backslash)", _frag(".", "cla", "ude\\")),
@@ -179,7 +179,7 @@ def test_lint1_the_lint_is_not_inert(r: SubTestResult):
     must_red_fragments = [
         "See " + _frag("docs", "/", "worklog") + "/lint-1/notes.md for the evidence.",
         "grep " + _frag("bug", "_reports") + "/pending for open items.",
-        _frag("docs/", "shard-") + "asks.md tracks status by ask id.",
+        _frag("docs/", "sha", "rd-") + "asks.md tracks status by ask id.",
         "Read " + _frag("CLA", "UDE", ".md") + " before touching anything.",
         "ls " + _frag(".", "cla", "ude/") + "agents",
         "dir " + _frag(".", "cla", "ude\\") + "agents",
@@ -197,7 +197,7 @@ def test_lint1_the_lint_is_not_inert(r: SubTestResult):
     must_stay_green = [
         "worklog rotation happens weekly.",                 # no leading "docs/"
         "the bugfix_reports queue is empty.",                # not "bug" + "_reports"
-        "shard-asks is a familiar SUFFIX, not this fragment.",  # no leading "docs/"
+        "sha" + "rd-asks is a familiar SUFFIX, not this fragment.",  # no leading "docs/"
         _frag("CLA", "UDE") + ".py is not a real module.",   # wrong extension
         "de" + _frag("cla", "ude") + "/ is not a real directory.",  # no leading dot
                                                                # before the directory word
