@@ -113,6 +113,19 @@ class Program(ASTNode):
     # reads this field yet, and Tier 3 (`DEVELOPMENT.md` §"API stability tiers"): this AST
     # node carries no external contract, unlike the pinned `tex_api.Program` facade.
     language: str | None = None
+    # REG-1e: whether this program calls ANY `stdlib_registry` `non_spatial_args`-declaring
+    # builtin (e.g. `apply_lut3d`) — computed ONCE where the program is built
+    # (`tex_cache.TEXCache.compile_ast`, the ONE shared post-parse pipeline both the normal
+    # path and `tex_fusion.compile_fused` go through, so a fused Program's flag is computed
+    # over the FULL spliced AST — sound by construction, never a single stage's partial
+    # view). `_consensus_extent` (`tex_runtime/interpreter.py`) is the sole reader: `False`
+    # skips its non-spatial-argument walk entirely, `True` walks (a real exclusion may
+    # apply), and `None` — the default, meaning "not computed": a `Program` built by a path
+    # that skips `compile_ast` (a hand-built test AST, or a disk pickle from before this
+    # field existed — though `tex_cache`'s AST-epoch gate already keeps such a pickle from
+    # ever reaching this code) — also walks, the safe default. Never set outside
+    # `compile_ast`.
+    non_spatial_calls: bool | None = None
 
 
 # ---------------------------------------------------------------------------

@@ -643,8 +643,13 @@ def test_cache4_ast_epoch_folds_language_version(r: SubTestResult):
         h25 = C._hash_files(C._AST_FILES, b"lang:0.25")
         assert h24 != h25, "_AST_EPOCH's hash does not depend on the language-version fragment"
         from TEX_Wrangle.tex_api import LANGUAGE_VERSION as _live
-        assert C._AST_EPOCH == C._hash_files(C._AST_FILES, b"lang:" + _live.encode()), \
-            "the live AST epoch was not computed with the live LANGUAGE_VERSION"
+        # REG-1e: the live epoch also folds the CURRENT non-spatial-arg builtin name set
+        # (tex_cache._non_spatial_args_by_name()) as its own extra fragment -- reproduce it
+        # here too, or this assertion compares against a formula the live epoch no longer is.
+        _live_ns = ",".join(sorted(C._non_spatial_args_by_name())).encode()
+        assert C._AST_EPOCH == C._hash_files(
+            C._AST_FILES, b"lang:" + _live.encode(), b"nonspatial:" + _live_ns), \
+            "the live AST epoch was not computed with the live LANGUAGE_VERSION + non-spatial set"
 
         # 2. The end-to-end proof: mint a `.cg` sidecar for a `//!tex 0.25` program under the
         #    epoch as it would have hashed BEFORE the bump (LANGUAGE_VERSION == "0.24"), the
@@ -658,7 +663,7 @@ def test_cache4_ast_epoch_folds_language_version(r: SubTestResult):
         fp = cache.fingerprint(code, bt)
         for ext in (".pkl", ".cg"):
             (cache._cache_dir / f"{fp}{ext}").unlink(missing_ok=True)
-        old_ast = C._hash_files(C._AST_FILES, b"lang:0.24")
+        old_ast = C._hash_files(C._AST_FILES, b"lang:0.24", b"nonspatial:" + _live_ns)
         old_cg = C._hash_files(
             C._CODEGEN_FILES, b"ast:" + old_ast.encode(),
             b"cgreuse:" + _os.environ.get("TEX_CODEGEN_NO_OUT_REUSE", "").encode())

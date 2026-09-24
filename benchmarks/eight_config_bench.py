@@ -107,8 +107,7 @@ def measure_interp(prog, B, H, W, device, cold,
         if cold:
             program, tm, assigned, used = compile_program(prog.code, btypes)
             out_names = list(assigned.keys()) if assigned and "OUT" not in assigned else None
-        run_interpreter(program, bindings, tm, device, out_names, used_builtins=used,
-                        source=prog.code)
+        run_interpreter(program, bindings, tm, device, out_names, used_builtins=used)
         if time.perf_counter() - prog_t0 > budget_sec * 0.5:
             break
     _sync(device)
@@ -123,8 +122,7 @@ def measure_interp(prog, B, H, W, device, cold,
         if cold:
             program, tm, assigned, used = compile_program(prog.code, btypes)
             out_names = list(assigned.keys()) if assigned and "OUT" not in assigned else None
-        run_interpreter(program, bindings, tm, device, out_names, used_builtins=used,
-                        source=prog.code)
+        run_interpreter(program, bindings, tm, device, out_names, used_builtins=used)
         _sync(device)
         times.append((time.perf_counter() - t0) * 1000)
         n += 1

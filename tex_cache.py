@@ -29,7 +29,7 @@ from .tex_compiler.ast_nodes import (BindingRef, ChannelAccess, NodeTransformer,
 from .tex_compiler.type_checker import TypeChecker, TypeCheckError, BINDING_HINT_TYPES
 from .tex_compiler.types import TEXType, planes_wires_enabled
 from .tex_compiler.optimizer import optimize
-from .tex_runtime.interpreter import _collect_identifiers
+from .tex_runtime.interpreter import _collect_identifiers, _collect_identifiers_and_calls
 
 logger = logging.getLogger("TEX")
 
@@ -264,7 +264,19 @@ def _hash_files(files, *extra: bytes) -> str:
 # every cache tier goes cold once on adoption, the same one-time cost any `codegen.py` edit
 # already causes on a release.
 from .tex_api import LANGUAGE_VERSION as _LANGUAGE_VERSION_AT_IMPORT  # noqa: E402
-_AST_EPOCH = _hash_files(_AST_FILES, b"lang:" + _LANGUAGE_VERSION_AT_IMPORT.encode())
+# REG-1e: `Program.non_spatial_calls` (set by `compile_ast` below) is baked into the SAME
+# .pkl this epoch gates, and its correctness depends on WHICH builtin names
+# `stdlib_registry.non_spatial_args_by_name()` currently reports -- a fact declared on
+# `@stdlib(...)` decorators in the stdlib_*.py leaves, none of which are (or should become)
+# `_AST_FILES` members: they are CODEGEN_FILES, and a file cannot sit in both partitions
+# (the AST/CODEGEN disjointness the completeness tripwire checks). Folding the CURRENT name
+# set into the hash, the same "extra byte fragment" mechanism the language version above
+# already uses, moves the AST epoch exactly when that set moves, without relocating any
+# file between partitions.
+from .tex_runtime.stdlib_registry import non_spatial_args_by_name as _non_spatial_args_by_name  # noqa: E402
+_AST_EPOCH = _hash_files(
+    _AST_FILES, b"lang:" + _LANGUAGE_VERSION_AT_IMPORT.encode(),
+    b"nonspatial:" + ",".join(sorted(_non_spatial_args_by_name())).encode())
 # M-5: the out= reuse kill switch changes emitted code without touching a file, so fold it into
 # the codegen epoch — else a persisted .cg emitted with reuse ON is served after it toggles OFF.
 _CODEGEN_EPOCH = _hash_files(
@@ -556,8 +568,14 @@ class TEXCache:
         # validated the user's original code, so tolerate benign redeclarations.
         type_map = TypeChecker(binding_types=binding_types, source=source,
                                strict_redeclare=False).check(program)
-        # Pre-compute builtin identifiers (avoids AST walk on every execution)
-        used_builtins = _collect_identifiers(program)
+        # Pre-compute builtin identifiers (avoids AST walk on every execution). REG-1e: the
+        # SAME pass also names every function CALLED, so `Program.non_spatial_calls` (the
+        # single source `_consensus_extent` reads, tex_runtime/interpreter.py) is set HERE,
+        # once per compile, never a second walk -- `compile_fused` reaches this same method
+        # with the FULL spliced AST, so a fused program's flag is sound by construction.
+        used_builtins, called_fns = _collect_identifiers_and_calls(program)
+        _ns_names = _non_spatial_args_by_name()
+        program.non_spatial_calls = bool(_ns_names) and not called_fns.isdisjoint(_ns_names)
         return (program, type_map, checker.referenced_bindings,
                 checker.assigned_bindings, checker.param_declarations, used_builtins)
 
