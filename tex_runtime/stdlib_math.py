@@ -26,7 +26,7 @@ from .stdlib_core import (
 # (even one whose RHS is an attribute lookup) keeps it — a compile-time instruction-selection
 # quirk this split's G1 bytecode-identity gate caught (`fn_pow`'s `_texlog.warning(...)`,
 # `fn_mod`'s `ZERO_GUARD_EPS.get(...)`), not a runtime difference; both bind the SAME object
-# either way. See docs/worklog/lib-1.
+# either way.
 from . import stdlib_core as _stdlib_core
 ZERO_GUARD_EPS = _stdlib_core.ZERO_GUARD_EPS
 _texlog = _stdlib_core._texlog

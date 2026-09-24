@@ -25,7 +25,7 @@ from .stdlib_core import (
 # CPython's LOAD_ATTR+PUSH_NULL fusion, while a name bound by a plain assignment (even one
 # whose RHS is an attribute lookup) keeps it — a compile-time instruction-selection quirk
 # this split's G1 bytecode-identity gate caught (`_safe_div`'s `ZERO_GUARD_EPS.get(...)`),
-# not a runtime difference; both bind the SAME object either way. See docs/worklog/lib-1.
+# not a runtime difference; both bind the SAME object either way.
 from . import stdlib_core as _stdlib_core
 ZERO_GUARD_EPS = _stdlib_core.ZERO_GUARD_EPS
 

@@ -18,8 +18,7 @@ exist there; their real job is to red on a FUTURE change that undoes the split, 
 re-export for a shim, or lets the two modules grow into a cycle.
 
 The G1 bytecode-identity proof for the five moved functions (NEG-2's own technique, reused
-verbatim) lives in `docs/worklog/neg-6/gate_bytecode_identity.py` and its logged PASS in
-`docs/worklog/neg-6/gate_bytecode_identity.txt` (local-only, never shipped) — this file checks
+verbatim) lives in the lane's own evidence, kept local and never shipped — this file checks
 identity and import direction, not bytecode; the two are complementary evidence, not the same
 claim.
 """

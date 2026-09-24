@@ -25,12 +25,13 @@ verdict:
 
 TIERS — and what each one actually proves
 -----------------------------------------
-`--tier cheap` runs the six ratchets that answer in seconds: the no-numpy ban, the LOC and
+`--tier cheap` runs the eight ratchets that answer in seconds: the no-numpy ban, the LOC and
 headroom ratchets, the archive-surface ratchet, the host-path counts pins, TST-7's runner
-drift check, and the private-root lint over the tracked set. Every one of them is a strict
+drift check, the private-root lint over the tracked set, the shared-stash law, and the
+local-only-path lint over the tracked set (LINT-1). Every one of them is a strict
 SUBSET of the full tier; they are kept for feedback latency, not for coverage, and this tool
 says so out loud. It also excludes `timing` (below) — belt and braces, since none of the
-six ratchet files carries that marker today, but a future one might.
+eight ratchet files carries that marker today, but a future one might.
 
 **The `timing` marker** (v0422-gatehyg / TRK-168, TRK-14, TRK-75). A test asserting a
 wall-clock ratio, a speedup or a deadline belongs to a sitting on a quiet, dedicated
@@ -130,6 +131,10 @@ _CHEAP = [
     # every one of them (one shared `.git`), and the fast tier is the gate every lane
     # actually runs before it acts -- the cheapest place to catch it before it matters.
     ("shared-stash law", "tests/test_v0422_no_shared_stash.py"),
+    # LINT-1 (v0.43.0 rider (c)): SIMP-3's sibling gap -- a path that is per-*repository-
+    # checkout* (this project's own local, unpushed working area) rather than per-person.
+    # Pure text scan, no compile, same cost class as the private-root lint beside it.
+    ("local-only-path lint", "tests/test_lint1_no_local_only_path_refs.py"),
 ]
 
 #: Where the CI-shape interpreter is named, so this file names no machine's private layout.
@@ -446,7 +451,7 @@ def _count_timing(run_argv: list, cwd: str, env_extra: dict) -> int | None:
 
 
 def run_cheap(python: str, scratch: str, verbose: bool) -> Leg:
-    leg = Leg("cheap", "the six ratchets only — no whole-suite collection, "
+    leg = Leg("cheap", "the eight ratchets only — no whole-suite collection, "
                        "no host-absent lane, CUDA present")
     files = [f"TEX_Wrangle/{p}" for _, p in _CHEAP]
     base = [python, "-X", "utf8", _HARNESS, *files]
@@ -617,7 +622,7 @@ def main(argv=None) -> int:
         description="Run TEX's gates and print one verdict. Exit 0 GREEN, 1 RED, "
                     "2 GREEN but the known-red allowlist is stale.")
     p.add_argument("--tier", choices=("cheap", "full"), default="cheap",
-                   help="cheap = the six ratchets; full = cheap, then the CI shape and the "
+                   help="cheap = the eight ratchets; full = cheap, then the CI shape and the "
                         "canonical whole-suite run (default: cheap)")
     p.add_argument("--no-cache", action="store_true",
                    help="ignore any cached verdict for this tree and tier, and refresh it")
