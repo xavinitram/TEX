@@ -459,16 +459,22 @@ _CUDA_PINS = {
     #                    kernels   D2H memcpys   allocations
     "terminal":         (22,       0,            18),
     "midgraph":         (74,       0,            56),   # PERF-2 re-pin (was 2 — the two
-    "pan":              (26,       0,            22),   #   `gauss_blur` stages reading their
+    "pan":              (22,       0,            18),   #   `gauss_blur` stages reading their
     "all_dirty":        (112,      0,            86),   #   sigma back; was 3 with `glow`).
+    # TRK-84 re-pin (was 26/0/22): the coordinate-builtin LRU miss on every window move
+    # (a fresh `torch.arange`+divide for `ix`/`u` and `iy`/`v`, 4 kernels/4 allocs) is gone —
+    # `Interpreter._coord_ramps` slices a cached full-extent ramp (a VIEW, bit-exact for any
+    # origin) instead of recomputing it, so `pan` now reads identically to `terminal`.
     # BENCH-4: measured identically at this shape (1024^2/512^2) and at the gate shape
     # (96^2/48^2) — the served suffix is the terminal stage alone, resolution-independent in
     # KIND if not in exact device work, and both shapes agreed on this box.
     "checkpoint_serve": (6,        0,            4),
-    # v0.42 ASK: ten uncached stages cook every tick (the `all_dirty`-shaped ten cooks) AND
-    # the window pans every tick (the `pan`-shaped LAT-4 coordinate-builtin miss) on the SAME
-    # tick — the shape TRK-84's fix (this file's own follow-up commit) is measured against.
-    "interp_chain_scrub": (125,    0,            88),
+    # v0.42 ASK, TRK-84's proof on the scenario it was written for: ten uncached stages cook
+    # every tick (the `all_dirty`-shaped ten cooks) AND the window pans every tick (the `pan`-
+    # shaped +4/+4 the coordinate-ramp cache removes) on the SAME tick. Measured before
+    # TRK-84's fix: 125 kernels / 88 allocations; after: 121 / 84 — the identical -4/-4 `pan`
+    # shows on its own, because only the terminal (vignette) stage reads `u`/`v` per tick.
+    "interp_chain_scrub": (121,    0,            84),
 }
 # WHY THE D2H COLUMN IS NOW ZERO EVERYWHERE, AND WHAT WOULD MAKE IT NON-ZERO AGAIN.
 # `gauss_blur` needs a Python number for its kernel radius and used to get it with

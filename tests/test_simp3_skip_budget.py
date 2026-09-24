@@ -107,13 +107,20 @@ _SKIP_VOCAB = re.compile(
 #: (proving the names are no longer reserved, the kwarg is rejected everywhere, and a
 #: non-viewer program's lineage-key byte format is unmoved), needs no CUDA witness — every
 #: row is AST-level or a pure-function check — so it adds 0. Net 108 − 4 = 104.
-#: Re-pinned from 104 to 105 (v042-hostaudit, rebased onto the removal above): `test_v042_hostaudit4a_oom_refusal.py::
+#: Re-pinned from 104 to 105 (v042-hostaudit): `test_v042_hostaudit4a_oom_refusal.py::
 #: test_hostaudit4a_unrecoverable_oom_carries_a_refusal` skips when this torch build has no
 #: `cuda.OutOfMemoryError` type — the same no-witness reason `test_eng2_oom_ladder`'s own
 #: identical guard (already inside the pin) carries: without that type there is nothing to
 #: monkeypatch `_run_tier` into raising, so the row cannot exercise the OOM ladder at all,
 #: real device or not.
-_SKIP_BUDGET = 105
+#: Re-pinned from 105 to 106 (v042-floor, TRK-84, rebased onto v042-hostaudit):
+#: `test_trk84_coord_ramp_bitexact.py::test_trk84_pooled_instance_across_devices_never_mixes_ramps`
+#: needs a real CUDA device to prove a pooled Interpreter's `_coord_ramps` cache never leaks
+#: a CPU-built ramp into a later CUDA cook on the same instance — no CPU stand-in exists for
+#: that cross-device reuse, so a CUDA-absent run reports a genuine skip. This lane's own
+#: delta has always been +1 (108→109 originally); rebased twice (v042-noviewer's 108→104,
+#: then v042-hostaudit's 104→105), the honest resolved value is 105+1 = 106.
+_SKIP_BUDGET = 106
 
 
 def _literal(node) -> str:

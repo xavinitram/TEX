@@ -63,6 +63,11 @@ _LITERAL_CACHE_MAX = 4096
 # (measured), ~0.5 MB across 8 entries — and free_tensor_caches sweeps it anyway.
 _BUILTINS_LRU_MAX = 8
 
+# TRK-84: shape-only coordinate-ramp cache, keyed by full extent (W_full or H_full) alone —
+# far fewer distinct sizes than `_builtins_lru`'s (shape, roi, ...) key sees under a pan, so
+# a small cap is plenty.
+_COORD_RAMP_LRU_MAX = 8
+
 # fp16's finite maximum. A literal beyond it realised in fp16 becomes +/-inf; such
 # literals are kept fp32 (doc 32 medium) so interp matches codegen (invariant #2) and a
 # large constant does not spuriously go non-finite under fp16.
@@ -195,6 +200,10 @@ class Interpreter(MaskedFlowMixin):
         # (ROI-3/ROI-6 added roi/batch_slice; `tile` is normalized into `roi` only after a
         # miss). Replaces a single (key, env) slot that thrashed under proxy/full-res alternation.
         self._builtins_lru: "OrderedDict[tuple, dict[str, torch.Tensor]]" = OrderedDict()
+        # TRK-84: full-extent (0..size-1) fp32 ramp + its /max(size-1,1) normalization,
+        # keyed on (device, size) — DEVICE, not just size, because a pooled instance's
+        # `self.device` changes per `execute()` call (see `_coord_ramps`).
+        self._coord_ramp_lru: "OrderedDict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
         self._assigned_vars_cache: dict[int, tuple[set[str], set[str]]] = {}
         # UC-3: per-loop-node structural eligibility for uniform-range resolution.
         self._uniform_range_cache: dict[int, tuple | bool] = {}
@@ -556,6 +565,37 @@ class Interpreter(MaskedFlowMixin):
             return (1, roi[3], roi[2])
         return sp
 
+    def _coord_ramps(self, size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """TRK-84: the full-extent `[0, size)` fp32 ramp and its `/max(size-1,1)`
+        normalization, cached per `(device, size)`. Coordinate dtype is always fp32
+        (invariant #4), so only device needs keying — and it does: a
+        `ThreadLocalInterpreterPool`-pooled instance's `self.device` is reassigned per
+        `execute()` call, so a CPU cook followed by a CUDA cook on the SAME instance is
+        ordinary, not an edge case. A window move (ROI/tile/pan) changes only the origin
+        `x0`/`y0`, never `W_full`/`H_full` or the device, so this hits on every pan tick
+        where `_builtins_lru`'s (…, roi, …) key cannot — the window slices this ramp as
+        a VIEW instead of paying a fresh `torch.arange` + divide.
+
+        BIT-EXACT for every origin, including a tiled cook's `y0`:
+        `torch.arange(0, size, dtype=fp32)[i] == float32(i)` exactly (TEX never nears
+        fp32's 2**24 exact-integer ceiling), so slicing at `[x0:x0+w]` reproduces
+        `torch.arange(x0, x0+w, dtype=fp32)` bit-for-bit — two exactly-representable
+        values whose exact sum is also exactly representable round to that sum, so there
+        is no "different rounding order" for a view to pick up. `u`/`v` are the SAME
+        `ramp / max(size-1,1)` division `_create_builtins` already applied to `ix`,
+        computed once over the full extent instead of once per window."""
+        key = (self._device_str, size)
+        hit = self._coord_ramp_lru.get(key)
+        if hit is not None:
+            self._coord_ramp_lru.move_to_end(key)
+            return hit
+        ramp = torch.arange(0, max(size, 0), dtype=torch.float32, device=self.device)
+        norm = ramp / max(size - 1, 1)
+        self._coord_ramp_lru[key] = (ramp, norm)
+        if len(self._coord_ramp_lru) > _COORD_RAMP_LRU_MAX:
+            self._coord_ramp_lru.popitem(last=False)
+        return ramp, norm
+
     def _create_builtins(self, program: Program,
                          used_builtins: frozenset[str] | None = None,
                          tile: tuple[int, int] | None = None,
@@ -608,19 +648,34 @@ class Interpreter(MaskedFlowMixin):
             # u/v use expand() which creates a view (no memory copy) at [B,H,W]
             # for compatibility with torch.stack in sampling functions.
             if "ix" in used or "u" in used:
-                ix = torch.arange(x0, x0 + W, dtype=cdt, device=self.device).view(1, 1, W)
+                # TRK-84: slice the cached full-extent ramp (bit-identical view, see
+                # `_coord_ramps`) instead of a fresh arange+divide. Fallback for an
+                # out-of-bounds window (should never occur) is the old direct math.
+                if 0 <= x0 and x0 + W <= W_full:
+                    full_ix, full_u = self._coord_ramps(W_full)
+                    ix = full_ix[x0:x0 + W].view(1, 1, W)
+                    u_flat = full_u[x0:x0 + W]
+                else:
+                    ix = torch.arange(x0, x0 + W, dtype=cdt, device=self.device).view(1, 1, W)
+                    u_flat = ix / max(W_full - 1, 1)
                 if "ix" in used:
                     self.env["ix"] = ix
                 if "u" in used:
-                    self.env["u"] = (ix / max(W_full - 1, 1)).expand(B, H, W)
+                    self.env["u"] = u_flat.view(1, 1, W).expand(B, H, W)
 
             # iy: pixel y-coordinate (offset by the ROI's top row)
             if "iy" in used or "v" in used:
-                iy = torch.arange(y0, y0 + H, dtype=cdt, device=self.device).view(1, H, 1)
+                if 0 <= y0 and y0 + H <= H_full:
+                    full_iy, full_v = self._coord_ramps(H_full)
+                    iy = full_iy[y0:y0 + H].view(1, H, 1)
+                    v_flat = full_v[y0:y0 + H]
+                else:
+                    iy = torch.arange(y0, y0 + H, dtype=cdt, device=self.device).view(1, H, 1)
+                    v_flat = iy / max(H_full - 1, 1)
                 if "iy" in used:
                     self.env["iy"] = iy
                 if "v" in used:
-                    self.env["v"] = (iy / max(H_full - 1, 1)).expand(B, H, W)
+                    self.env["v"] = v_flat.view(1, H, 1).expand(B, H, W)
 
             # iw, ih: image dimensions (the FULL image under an ROI/strip)
             if "iw" in used:

@@ -45,5 +45,6 @@ class ThreadLocalInterpreterPool:
             try:
                 it._literal_cache.clear()
                 it._builtins_lru.clear()
+                it._coord_ramp_lru.clear()   # TRK-84: same class of per-instance tensor cache
             except Exception:
                 pass

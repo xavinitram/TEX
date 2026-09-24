@@ -550,12 +550,20 @@ test before it starts, and cannot claim a win the instrument would not see.
    *Shows fixed as:* `host.get_free_memory` **and** `torch.cuda.mem_get_info` going **7 → 1 or
    0** per `all_dirty` frame with `prewarm`'s 10 unmoved, and `_halo_tile_plan` going
    **10 → 0** on the stages whose pixel-local plan already answered.
-7. **A window move rebuilds the coordinate builtins.** `pan` costs **26** CUDA kernels and
-   **22** allocations against `terminal`'s 22 and 18 — exactly +4 and +4 for the same cook with
-   a moved window. (This is also the LAT-4 LRU the harness had to defeat to measure the row
-   honestly; see §2.)
-   *Shows fixed as:* `cuda.kernels` on `pan` going **26 → 22** and `alloc.allocated`
-   **22 → 18**.
+7. **A window move rebuilds the coordinate builtins. FIXED (TRK-84).** `pan` used to cost
+   **26** CUDA kernels and **22** allocations against `terminal`'s 22 and 18 — exactly +4 and
+   +4 for the same cook with a moved window, because `_create_builtins`'s `ix`/`u`/`iy`/`v`
+   were a fresh `torch.arange` + divide on every LAT-4 LRU miss and a pan's origin never
+   repeats. `Interpreter._coord_ramps` now caches the full-extent `[0, size)` ramp and its
+   normalization per SIZE alone (never per origin), and a window slices it — a VIEW, no
+   kernel, no allocation. Bit-exact for every origin by construction: `torch.arange(0,
+   size)[i] == float32(i)` exactly under fp32's 2**24 integer ceiling (TEX never cooks an
+   image near it), so a slice at `[x0:x0+w]` reproduces `torch.arange(x0, x0+w)` bit-for-bit,
+   and the normalized ramp is the identical `ramp / max(size-1,1)` division computed once
+   instead of once per window. `cuda.kernels` on `pan` went **26 → 22** and `alloc.allocated`
+   **22 → 18**, both now reading identically to `terminal` (verified at the gate shape,
+   96²/48², and at 1024²/512², dev laptop). (This is also the LAT-4 LRU the harness had to
+   defeat to measure the row honestly; see §2.)
 8. **Two lexes for a never-seen program.** `TEXCache.fingerprint` (`tex_cache.py:344`) calls
    `param_only_names` (`tex_marshalling.py:837`), which tokenizes; the compile then tokenizes
    again. The counts track exactly — `param_only_names` equals `fingerprint` in every column of
