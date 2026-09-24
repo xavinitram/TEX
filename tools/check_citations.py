@@ -132,7 +132,15 @@ import sys
 # `DEVELOPMENT.md`) had drifted off their real targets; re-pointing them at the enclosing
 # symbol they actually meant (`run_tiled`/`run_batch_strips`/`run_tiled_halo`,
 # `free_tensor_caches`) turned both into anchored `ok` citations.
-WARNING_BUDGET = 21
+# 21 → 20 (v042-floor, TRK-65): a 53-line insertion in `tex_roi.py` (the region-dependence
+# fast path) shifted two `docs/frame-providers.md` citations off their targets --
+# `tex_roi.py:874` (meant `frame_window`, landed inside `_frame_ops`) and `tex_roi.py:617`
+# (meant `_frame_ops`, landed on `_PARSE_MEMO_MAX` -- MODULE SCOPE, so this one had been
+# WRONG since before this round and the module-level exemption hid it). Both were already
+# stale pointers, not merely shifted ones: `_frame_ops` moved to line 857 well before this
+# round. Re-pointed at the real lines (`tex_roi.py:931`, `tex_roi.py:916`) and the sentences
+# already named their symbols, so both anchored.
+WARNING_BUDGET = 20
 
 # ── The document set (see "THE DOCUMENT SET" above). ──
 DOC_DIR_GLOB = "docs"
