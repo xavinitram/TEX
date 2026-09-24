@@ -761,6 +761,18 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
 
     pyramid = pyramid_fn(img)
     max_level = len(pyramid) - 1
+    # TRK-66/PERF-2: read the host value BEFORE the clamp below — `.clamp()` returns a
+    # freshly computed tensor, so a `lod_t` minted from a literal / `$param` / folded
+    # constant would otherwise lose its `_host_scalar` tag right here and pay a device
+    # readback in the scalar fast path further down for no reason. The clamp itself is
+    # host-cheap (min/max against an exact integer bound), so doing it on the host first
+    # reproduces exactly what `lod_t.clamp(...).item()` would have returned. None when
+    # `lod_t` has no host reading (a genuinely per-cook computed LOD, or a per-pixel
+    # one) — the scalar fast path below then falls back to the tensor readback as before,
+    # and the per-pixel general path always uses the tensor clamp regardless.
+    lod_host = _host_scalar(lod_t) if lod_t.dim() == 0 else None
+    if lod_host is not None:
+        lod_host = min(max(lod_host, 0.0), float(max_level))
     lod_t = lod_t.clamp(0.0, float(max_level))
 
     B, H, W, C = img.shape
@@ -788,7 +800,7 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
 
     # Fast path: scalar integer LOD → sample single level, no interpolation
     if lod_t.dim() == 0:
-        lod_val = lod_t.item()
+        lod_val = lod_host if lod_host is not None else lod_t.item()
         lod_floor = int(lod_val)
         frac = lod_val - lod_floor
         if frac < 1e-6:
@@ -802,8 +814,12 @@ def _sample_mip_trilinear(image, u_coord, v_coord, lod, pyramid_fn):
     hi = (lo + 1).clamp(0, max_level)
 
     if lo.dim() == 0:
-        lo_i = lo.item()
-        hi_i = hi.item()
+        if lod_host is not None:
+            lo_i = min(max(int(math.floor(lod_host)), 0), max_level)
+            hi_i = min(lo_i + 1, max_level)
+        else:
+            lo_i = lo.item()
+            hi_i = hi.item()
         s_lo = _sample_mip_level(pyramid[lo_i], grid, out_size)
         if lo_i == hi_i:
             return s_lo

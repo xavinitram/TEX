@@ -51,6 +51,10 @@ _PROGRAMS = (
     ("bilateral_filter",  "@OUT = bilateral_filter(@A, {s}, 0.2);", {}),
     ("erode",             "@OUT = erode(@A, {s});", {}),
     ("dilate",            "@OUT = dilate(@A, {s});", {}),
+    # TRK-66: the LOD arg is read back AFTER `lod_t.clamp(0.0, max_level)` mints a fresh,
+    # untagged tensor — every shape below (including "literal 7.9", which clamps) exercises
+    # that clamp on a host-origin LOD.
+    ("sample_mip",         "@OUT = sample_mip(@A, u, v, {s});", {}),
 )
 
 #: (label, the text substituted for `{s}`, the bindings it needs, has_host_value).
@@ -400,3 +404,4 @@ def test_perf2_a_tag_never_survives_an_operation(r: SubTestResult):
         r.ok("a tag never reaches a value it was not minted from")
     except Exception as e:
         r.fail("PERF-2 tag staleness", f"{type(e).__name__}: {e}")
+
