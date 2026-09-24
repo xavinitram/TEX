@@ -1,0 +1,39 @@
+﻿legs: ['v39_base_a2', 'v39_after_b', 'v39_base_a3']   (ratio = v39_base_a2/leg; >1 = leg faster)
+
+eight_config @512^2 ù per-config geomean | v39_after_b | v39_base_a3   [row min..max for last leg]
+  cpu_off_cold   |  0.979 n=124 |  0.988 n=124   [0.69..1.43]
+  cpu_off_warm   |  0.991 n=124 |  0.984 n=124   [0.69..1.61]
+  cuda_off_cold  |  0.995 n=124 |  1.011 n=124   [0.97..1.05]
+  cuda_off_warm  |  1.000 n=124 |  1.010 n=124   [0.97..1.04]
+  cpu_on_cold    |  0.995 n=138 |  0.999 n=138   [0.61..1.36]
+  cpu_on_warm    |  0.988 n=138 |  1.000 n=138   [0.88..1.25]
+  cuda_on_cold   |  0.986 n=138 |  0.997 n=138   [0.77..1.23]
+  cuda_on_warm   |  0.990 n=138 |  0.998 n=138   [0.80..1.21]
+
+roi_scrub | v39_base_a2 | v39_after_b | v39_base_a3  ratios vs v39_base_a2
+  whole                        |     1.7591 |     1.7670 |     1.7589   0.996  1.000
+  roi_fixed                    |     0.6448 |     0.6454 |     0.6433   0.999  1.002
+  roi_panning                  |     0.6441 |     0.6441 |     0.6415   1.000  1.004
+  roi_pan_param                |     0.8515 |     0.8551 |     0.8508   0.996  1.001
+
+param_scrub | v39_base_a2 | v39_after_b | v39_base_a3  ratios vs v39_base_a2
+  cold_ms                      |    47.8509 |    48.2258 |    48.2670   0.992  0.991
+  scrub_median_ms              |     0.3618 |     0.3629 |     0.3614   0.997  1.001
+  static_median_ms             |     0.3609 |     0.3612 |     0.3583   0.999  1.007
+  recook_median_ms             |     1.5260 |     1.5241 |     1.5343   1.001  0.995
+  scrub_max_after_warmup_ms    |     0.6291 |     1.4048 |     0.9921   0.448  0.634
+
+region_recook | v39_base_a2 | v39_after_b | v39_base_a3  ratios vs v39_base_a2
+  cuda/n50/2048/whole_all      |   171.5170 |   170.9010 |   171.0480   1.004  1.003
+  cuda/n50/2048/region_mid     |    16.9660 |    16.9660 |    16.9690   1.000  1.000
+  cpu/n50/2048/whole_all       |   879.0270 |   901.6960 |   927.2810   0.975  0.948
+  cpu/n50/2048/region_mid      |   154.2990 |   155.5920 |   154.7600   0.992  0.997
+
+cookqueue | v39_base_a2 | v39_after_b | v39_base_a3  ratios vs v39_base_a2
+  solo_ms                      |     0.3560 |     0.3600 |     0.3550   0.989  1.003
+  queued_idle_ms               |     0.4250 |     0.4210 |     0.4230   1.010  1.005
+  preempt_to_first_stmt_ms     |     0.9480 |     0.9470 |     1.0010   1.001  0.947
+  queued_under_load_ms         |     1.1790 |     1.1670 |     1.2230   1.010  0.964
+
+counts_cuda - stable rows that differ from v39_base_a2
+  moved api/cuda rows: 0; moved frame rows (not listed): 18

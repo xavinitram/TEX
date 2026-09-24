@@ -1,0 +1,39 @@
+﻿legs: ['v39_base_a4', 'v39_base_a5']   (ratio = v39_base_a4/leg; >1 = leg faster)
+
+eight_config @512^2 ù per-config geomean | v39_base_a5   [row min..max for last leg]
+  cpu_off_cold   |  1.007 n=124   [0.71..1.80]
+  cpu_off_warm   |  0.995 n=124   [0.66..1.37]
+  cuda_off_cold  |  0.989 n=124   [0.93..1.02]
+  cuda_off_warm  |  1.006 n=124   [0.97..1.06]
+  cpu_on_cold    |  1.005 n=137   [0.81..3.46]
+  cpu_on_warm    |  1.015 n=137   [0.85..4.33]
+  cuda_on_cold   |  1.003 n=138   [0.80..1.29]
+  cuda_on_warm   |  0.998 n=138   [0.74..1.10]
+
+roi_scrub | v39_base_a4 | v39_base_a5  ratios vs v39_base_a4
+  whole                        |     1.7607 |     1.7610   1.000
+  roi_fixed                    |     0.6456 |     0.6458   1.000
+  roi_panning                  |     0.6445 |     0.6433   1.002
+  roi_pan_param                |     0.8492 |     0.8476   1.002
+
+param_scrub | v39_base_a4 | v39_base_a5  ratios vs v39_base_a4
+  cold_ms                      |    48.6014 |    47.9203   1.014
+  scrub_median_ms              |     0.3624 |     0.3596   1.008
+  static_median_ms             |     0.3580 |     0.3564   1.004
+  recook_median_ms             |     1.5224 |     1.5251   0.998
+  scrub_max_after_warmup_ms    |     0.6108 |     0.6978   0.875
+
+region_recook | v39_base_a4 | v39_base_a5  ratios vs v39_base_a4
+  cuda/n50/2048/whole_all      |   171.2470 |   171.1530   1.001
+  cuda/n50/2048/region_mid     |    16.9690 |    17.2890   0.981
+  cpu/n50/2048/whole_all       |   923.6070 |   869.8060   1.062
+  cpu/n50/2048/region_mid      |   154.7970 |   154.4040   1.003
+
+cookqueue | v39_base_a4 | v39_base_a5  ratios vs v39_base_a4
+  solo_ms                      |     0.3560 |     0.3600   0.989
+  queued_idle_ms               |     0.4370 |     0.4180   1.045
+  preempt_to_first_stmt_ms     |     1.0200 |     0.9620   1.060
+  queued_under_load_ms         |     1.2170 |     1.1630   1.046
+
+counts_cuda - stable rows that differ from v39_base_a4
+  moved api/cuda rows: 0; moved frame rows (not listed): 0
