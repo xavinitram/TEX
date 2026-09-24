@@ -180,10 +180,12 @@ lane, `checkpoint_serve`'s nine non-zero API rows arrive as `appeared` and the v
 them, same as any other genuinely new structural row would. A `--counts-baseline` taken before
 this landed is therefore stale for a bare compare the moment this scenario exists; re-save it at
 the gate shape (§5's command) to pick up the ninth, or pass `--scenario` naming only the
-scenarios the stored baseline actually has. Neither is new machinery — it is the same discipline
-§5 already names for a scenario addition — but the failure mode (a landing-blocking red for a
-change that regressed nothing) is real enough that whoever next takes `--counts-baseline`
-against an older file should read this paragraph before trusting the exit code.
+scenarios the stored baseline actually has. `--scenario` restricts BOTH legs of the comparison,
+not just the current run (`compare`'s `scenario` argument), so naming the scenarios the stored
+baseline has is enough on its own — a scenario the baseline lacks never enters the diff, on
+either side. The failure mode this paragraph exists for (a landing-blocking red for a change
+that regressed nothing) is real enough that whoever next takes `--counts-baseline` against an
+older file should read this paragraph before trusting the exit code.
 
 ## 4. The per-tick signature at head
 
