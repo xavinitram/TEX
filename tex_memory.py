@@ -813,6 +813,25 @@ def trim_reserved_pool(device, spatial_px: int = 0) -> None:
         pass
 
 
+def _non_spatial_for(program) -> frozenset:
+    """SIMPLIFY (post-v043-rt): the one-line `_non_spatial_names_cached(program) if program
+    is not None else frozenset()` six call sites derived independently (TRK-163/TRK-165) —
+    `tex_memory.py` (`run_tiled`, `run_batch_strips`, `run_tiled_halo`), `tex_tiling.py`
+    (`_tile_plan`, `_halo_tile_plan`) and `tex_runtime/graphed.py`'s own `_spatial_px`. The
+    `program is None` guard matters: `run_tiled`/`run_batch_strips`/`run_tiled_halo` can be
+    driven directly (the ROI-4 oracle, `test_v030_phase1.py`'s OOM-ladder rows) with no
+    `Program` at all, and `_non_spatial_names_cached` requires one.
+
+    The import stays FUNCTION-LOCAL (not hoisted to module load) — `tex_runtime.graphed`
+    already imports FROM `tex_memory` in several places (`pinned_storages`,
+    `free_graphs_only`), so this adds the identical edge in the other direction; both sides
+    stay function-local exactly the way `ARCHITECTURE.md`'s "two logical import cycles"
+    already documents, and hoisting either one to top-level would reintroduce the ordering
+    crash AGENTS.md's "Trades to REFUSE" warns against."""
+    from .tex_runtime.interpreter import _non_spatial_names_cached
+    return _non_spatial_names_cached(program) if program is not None else frozenset()
+
+
 def _shared_dim_size(bindings, dim: int, min_ndim: int,
                      non_spatial: frozenset = frozenset()) -> int | None:
     """The single size shared by every tensor binding on axis `dim` that isn't a broadcast
@@ -896,8 +915,7 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
     # an image, and a coincidental N == H (or N == B in run_batch_strips below) must not let
     # it enter the shared-height decision OR the per-strip narrow below — see
     # `_shared_dim_size`'s docstring for why the coincidence is otherwise invisible to it.
-    from .tex_runtime.interpreter import _non_spatial_names_cached
-    non_spatial = _non_spatial_names_cached(program) if program is not None else frozenset()
+    non_spatial = _non_spatial_for(program)
     H_total = shared_tile_height(bindings, non_spatial)
     if H_total is None:
         return _untiled()
@@ -974,8 +992,7 @@ def run_batch_strips(interp, program, bindings, type_map, device, latent_channel
     # TRK-163: see run_tiled's own comment above — a registered non-spatial binding (e.g. a
     # LUT) must not enter the shared-batch decision or the per-strip narrow below just
     # because its own leading dim coincidentally equals B_total.
-    from .tex_runtime.interpreter import _non_spatial_names_cached
-    non_spatial = _non_spatial_names_cached(program) if program is not None else frozenset()
+    non_spatial = _non_spatial_for(program)
     B_total = shared_batch_size(bindings, non_spatial)
     if B_total is None or B_total < 2:
         return _whole()
@@ -1266,8 +1283,7 @@ def run_tiled_halo(interp, program, bindings, type_map, device, latent_channel_c
     # itself; run_roi's own narrow_names allowlist governs what each strip actually slices),
     # so a registered non-spatial binding (a LUT) can no longer collide with a coincidentally
     # equal H or W and skew the shared-size decision.
-    from .tex_runtime.interpreter import _non_spatial_names_cached
-    non_spatial = _non_spatial_names_cached(program) if program is not None else frozenset()
+    non_spatial = _non_spatial_for(program)
     H_total = shared_tile_height(bindings, non_spatial)
     W_total = shared_tile_width(bindings, non_spatial)
     if H_total is None or W_total is None:

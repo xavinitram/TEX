@@ -37,8 +37,7 @@ from ..tex_compiler.ast_nodes import (
     try_extract_static_range,
     iter_child_nodes as _iter_child_nodes,
 )
-from .interpreter import (Interpreter, _collect_identifiers, _non_spatial_names_cached,
-                          _reads_host_context_cached)
+from .interpreter import (Interpreter, _collect_identifiers, _reads_host_context_cached)
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 
 logger = logging.getLogger("TEX.graphed")
@@ -348,16 +347,23 @@ def _spatial_px(bindings, program=None) -> int:
 
     COLOR-1 (v0.40 simplify): `program` (optional, but every live caller has one) lets this
     skip a name bound at a registered NON-SPATIAL argument position (e.g. `apply_lut3d`'s
-    LUT argument — `interpreter._non_spatial_names_cached`, the same source
-    `_consensus_extent` uses, over the SAME `_READS_MEMO` entry `_binding_reads_cached`
-    populates). A `[N,N,N,3]` LUT is dim>=3 like an image, so the FIRST-tensor-found scan
+    LUT argument — `tex_memory._non_spatial_for`, wrapping `interpreter.
+    _non_spatial_names_cached`, the same source `_consensus_extent` uses, over the SAME
+    `_READS_MEMO` entry `_binding_reads_cached` populates). A `[N,N,N,3]` LUT is dim>=3 like
+    an image, so the FIRST-tensor-found scan
     below could return the LUT's own small N*N instead of the real frame's H*W purely from
     dict iteration order, feeding `_graph_capture_worthwhile` a wrong (tiny) estimate for
     what may be a huge frame. This is a worthiness-GATE input only — the actual capture
     buffers still size from `_consensus_extent`, already safe — so the failure mode was a
     wrong perf decision, never a wrong pixel; excluded anyway so the gate reads the real
     frame."""
-    skip = _non_spatial_names_cached(program) if program is not None else frozenset()
+    from ..tex_memory import _non_spatial_for   # function-local: tex_memory imports FROM
+                                                # this module (pinned_storages,
+                                                # free_graphs_only) in several places, so
+                                                # this edge stays function-local too — the
+                                                # same "two logical import cycles" ARCHITECTURE.md
+                                                # already documents.
+    skip = _non_spatial_for(program)
     for name, v in bindings.items():
         if name in skip:
             continue

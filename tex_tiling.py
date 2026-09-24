@@ -240,7 +240,8 @@ def _tile_plan(program, bindings: dict[str, Any], device,
     if latent_channel_count:
         return None
     try:
-        from .tex_memory import is_tile_safe_cached, estimate_peak_bytes, shared_tile_height
+        from .tex_memory import (is_tile_safe_cached, estimate_peak_bytes, shared_tile_height,
+                                 _non_spatial_for)
         if not is_tile_safe_cached(program, fingerprint):  # P4: memoized per fingerprint
             return None
         # TRK-165: the same non_spatial exclusion TRK-163 threaded into shared_tile_height's
@@ -248,8 +249,7 @@ def _tile_plan(program, bindings: dict[str, Any], device,
         # registered non-spatial binding (a LUT) whose own leading dim coincidentally equals
         # H must not skew this decision either. Decision-only: this function never slices a
         # binding itself.
-        from .tex_runtime.interpreter import _non_spatial_names_cached
-        non_spatial = _non_spatial_names_cached(program) if program is not None else frozenset()
+        non_spatial = _non_spatial_for(program)
         H = shared_tile_height(bindings, non_spatial)
         if H is None:
             return None
@@ -341,11 +341,10 @@ def _halo_tile_plan(program, code, bindings, device, latent_channel_count, dtype
         if is_tile_safe_cached(program, fingerprint):
             return None
         from .tex_memory import (shared_tile_height, shared_tile_width, estimate_peak_bytes,
-                                 device_total_mem)
+                                 device_total_mem, _non_spatial_for)
         # TRK-165: same exclusion as `_tile_plan` above — decision-only, this planner never
         # slices a binding itself either.
-        from .tex_runtime.interpreter import _non_spatial_names_cached
-        non_spatial = _non_spatial_names_cached(program) if program is not None else frozenset()
+        non_spatial = _non_spatial_for(program)
         H = shared_tile_height(bindings, non_spatial)
         W = shared_tile_width(bindings, non_spatial)
         if H is None or W is None:
