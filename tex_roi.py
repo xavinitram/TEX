@@ -436,6 +436,52 @@ _REGION_DEP_MEMO_MAX = 256
 _region_dep_memo: "OrderedDict[tuple, bool]" = OrderedDict()
 
 
+def _unfolded_region_independent(code: str, binding_types) -> bool:
+    """True when `region_dependent` on the UNFOLDED (pristine) program is False — which
+    makes it provably False for the FOLDED program too, at ANY `$param` valuation,
+    without walking the per-tick fold at all.
+
+    Why this is safe where routing `_walk` through `region_dependent_cached` on the
+    FOLDED program (the tracker's "obvious" fix TRK-65 found unsafe) is not: that fix
+    would cache ONE valuation's verdict under a value-independent key, and folding a
+    `$param` can fold a present clause AWAY (a literal trip count collapsing a loop, a
+    literal condition picking one string arm) — so a cached False, minted from the
+    valuation that folded the clause away, could be served to a different valuation
+    that does NOT fold it away, which needs True. This predicate never caches a
+    per-valuation verdict at all — it reads `region_dependent` on the PRISTINE, unfolded
+    parse, which no `$param` can touch, and only trusts the direction that can never go
+    stale: `_fold_program` (`_substitute_params` + the optimizer's fold/propagate) only
+    EVALUATES literal-reachable expressions and PRUNES dead branches — it has no rewrite
+    that SYNTHESIZES a new `for`/`while`, a new `if`/`?:` choosing between two strings,
+    or a new cast/`str`/`format` call that was not already a node in the unfolded
+    source. So the folded program's `region_clauses()` triple is a SUBSET of the
+    unfolded one's, component-wise, never a superset, and `region_dependent`'s own
+    `_language_tuple` sunset test does not depend on the fold either (same pragma, same
+    engine version before and after). Working through both of `region_dependent`'s
+    branches: unfolded `strings=() and casts=()` forces folded `strings=() and casts=()`
+    too (subset), and unfolded `bool(loops) and SUNSET_OLD == False` forces the same
+    for folded (either `loops` was already empty and stays empty, or `SUNSET_OLD` is
+    False and cancels `loops` either way) — so "unfolded says False" implies "folded says
+    False", for every valuation, unconditionally. When the unfolded source says True,
+    this predicate is simply not useful — `_walk` still walks the actual fold per
+    valuation exactly as it does today, because folding CAN flip that True to False for
+    ONE valuation and not another, and only the per-value walk can tell which.
+
+    Reuses `region_dependent_cached` (and its existing `_region_dep_memo`, not a new
+    store) with a synthetic fingerprint namespaced `"trk65-unfolded"` — a 3-tuple can
+    never collide with a real `tex_cache.fingerprint()` hex string, so the two verdict
+    populations share one bounded LRU safely. Fails toward "not provably independent"
+    (False) on any exception, which sends the caller to the existing, already-safe
+    per-fold walk rather than to a claim this predicate could not verify."""
+    try:
+        program = _pristine_program(code)
+        fp = ("trk65-unfolded", hashlib.sha256(code.encode()).hexdigest(),
+              _string_wire_key(binding_types))
+    except Exception:
+        return False
+    return not region_dependent_cached(program, fp, binding_types, code)
+
+
 def region_dependent_cached(program, fingerprint, binding_types=None, code=None) -> bool:
     """`region_dependent` memoized per cook fingerprint — the mirror of
     `tex_memory.is_tile_safe_cached`, cap included. The fingerprint is
@@ -750,9 +796,14 @@ def _walk(code: str, param_values: dict, binding_types: dict | None = None):
         # key the rest of the tuple already uses, and one a pragma edit invalidates by itself.
         # Folding cannot change the answer: substituting a `$param` literal can only make a
         # bound MORE uniform, never less.
+        # TRK-65: skip the per-fold region-dependence walk entirely when the UNFOLDED source
+        # already proves it independent of any $param value (see the helper's docstring for
+        # why this direction, and only this direction, is safe to cache value-independently).
+        region_dep = (False if _unfolded_region_independent(code, binding_types)
+                      else region_dependent(program, binding_types, code))
         result = (reads, blocked, state["halo"],
                   _referenced_at_bindings(code) - written - set(reads),
-                  region_dependent(program, binding_types, code))
+                  region_dep)
     except Exception:
         result = None
     _walk_memo[key] = result
