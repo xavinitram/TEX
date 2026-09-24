@@ -108,7 +108,8 @@ produces them.
 ## 4. `patch_region` — the write the engine has never had
 
 There is **no partial-write path in the package today**. Verified: exactly three
-slice-assignments exist outside tests and examples (`tex_memory.py:799`, `:882`, `:1134`), and
+slice-assignments exist outside tests and examples — `run_tiled` (`tex_memory.py:937`),
+`run_batch_strips` (`tex_memory.py:1033`) and `run_tiled_halo` (`tex_memory.py:1286`) — and
 all three write into a `torch.empty()` allocated in the same call and fully filled before
 return. That is *assembly*, never a patch.
 

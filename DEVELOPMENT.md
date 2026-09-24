@@ -663,7 +663,7 @@ the program/codegen cache under `TEX_CACHE_DIR`, the CACHE-5 governor, and the p
 pool (ENG-9 above). The tiered noise caches are the one exception to `reset()`'s reach: a key's
 compiled tier is promoted starting its 4th call (`tex_runtime/noise.py:423-425`) and STAYS promoted —
 `session.reset()` clears only the worley-offset caches, not that promotion table
-(`tex_memory.py:1257-1261`). An isolated, per-tenant session is phase 2 and unbuilt today
+(`free_tensor_caches`, `tex_memory.py:1312-1316`). An isolated, per-tenant session is phase 2 and unbuilt today
 (`tex_session.py:18-21`).
 
 A host reads a cook back through `CookResult` (`tex_engine.py:300-328`, Tier 1 below): `cooked_roi`,
