@@ -69,7 +69,14 @@ _SKIP_VOCAB = re.compile(
 #: never counted as one. None of the newly-counted sites has a witness that runs without the
 #: missing capability (an oracle/codegen path for the case in question), so raising the pin
 #: is the honest move rather than inventing one.
-_SKIP_BUDGET = 101
+#: Re-pinned from 101 to 102 (PM-11): `test_v040_phase2.py::test_pm11_oom_rung_path` needs a
+#: real CUDA device — `tex_engine._oom_retry`'s rung 2 is gated on
+#: `str(ctx.device).startswith("cuda")` and cannot be exercised any other way — and the same
+#: arm (a) repair applies here too: this row used to report the absence through `r.ok`'s
+#: vocabulary (a pass that measured nothing), which is what surfaced it. CI's lane is CPU-only,
+#: so this row skips there; no witness exists that proves the OOM ladder's tiled rung without a
+#: CUDA device to be short of memory on, so raising the pin is the honest move, not writing one.
+_SKIP_BUDGET = 102
 
 
 def _literal(node) -> str:

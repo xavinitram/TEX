@@ -285,8 +285,9 @@ def test_pm11_halo_pressure_path(r: SubTestResult):
 def test_pm11_oom_rung_path(r: SubTestResult):
     print("\n--- PM-11-F1: viewer_context reaches tex_engine._oom_retry's tiled rung ---")
     if not torch.cuda.is_available():
-        r.ok("no CUDA on this box — _oom_retry's rung 2 requires str(ctx.device).startswith"
-             "('cuda') and cannot be exercised; skipped honestly rather than faked on CPU")
+        r.skip("PM-11 OOM rung path",
+               "no CUDA on this box — _oom_retry's rung 2 requires "
+               "str(ctx.device).startswith('cuda') and cannot be exercised here")
         return
     try:
         img = make_img(1, 128, 128, 3, seed=19)
