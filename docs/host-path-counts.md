@@ -524,9 +524,9 @@ test before it starts, and cannot claim a win the instrument would not see.
    belongs with whoever takes item 5's retention policy, since the two share an acceptance test.
 6. **The per-cook fixed pipeline, paid ten times on a whole-frame cook.** Per cook, at head:
    two tile plans (`tex_tiling._tile_plan:38` and `_halo_tile_plan:142`, both re-exported into
-   `tex_engine` at `tex_engine.py:113`), `enforce_cache_budget` (`tex_memory.py:327`),
-   `trim_reserved_pool` (`tex_memory.py:780`) and `_disown_inputs` (`tex_buffers.py:158`) —
-   all called from `tex_engine.run` (`tex_engine.py:1251`) — plus `fingerprint`, **once**
+   `tex_engine` at `tex_engine.py:113`), `enforce_cache_budget` (`tex_memory.py:339`),
+   `trim_reserved_pool` (`tex_memory.py:813`) and `_disown_inputs` (`tex_buffers.py:158`) —
+   all called from `tex_engine.run` (`tex_engine.py:1273`) — plus `fingerprint`, **once**
    since the per-cook key became one string handed down from `prepare`.
 
    **Who buys the free-VRAM reading, corrected.** An earlier reading of this item attributed
