@@ -253,8 +253,13 @@ def _tile_plan(program, bindings: dict[str, Any], device,
         H = shared_tile_height(bindings, non_spatial)
         if H is None:
             return None
+        # TRK-166: select the anchor by NAME, not by value — a registered non-spatial
+        # binding (a LUT) whose own leading dim coincidentally equals H must not be picked
+        # here either, mirroring `run_tiled`'s per-strip narrow loop (`tex_memory.py`).
         spatial = None
-        for v in bindings.values():
+        for name, v in bindings.items():
+            if name in non_spatial:
+                continue
             if isinstance(v, torch.Tensor) and v.dim() >= 3 and v.shape[1] == H:
                 spatial = (v.shape[0], v.shape[1], v.shape[2])
                 break
@@ -354,8 +359,10 @@ def _halo_tile_plan(program, code, bindings, device, latent_channel_count, dtype
         # the outer guard → None). The cook is sized off the SHARED height/width (both skip
         # broadcast singletons), never the anchor's own width — a [B,H,1] companion bound first
         # would otherwise under-size `est` by a factor of W and silently zero the TDR px-bucket.
-        batch = next(v.shape[0] for v in bindings.values()
-                     if isinstance(v, torch.Tensor) and v.dim() >= 3 and v.shape[1] == H)
+        # TRK-166: by NAME, not value — same exclusion as the anchor scan in `_tile_plan` above.
+        batch = next(v.shape[0] for name, v in bindings.items()
+                     if name not in non_spatial
+                     and isinstance(v, torch.Tensor) and v.dim() >= 3 and v.shape[1] == H)
         spatial = (batch, H, W)
         est = estimate_peak_bytes(program, spatial, dtype_bytes, fingerprint)   # memoized walk
         tdr_floor = _tdr_strip_floor(fingerprint, spatial, precision, device)   # dict lookup
