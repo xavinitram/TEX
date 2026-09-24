@@ -394,3 +394,57 @@ def test_lazy_schema_pool_ci(r: SubTestResult):
         r.fail("lazy schema pool (CI stub)", str(e))
     finally:
         tn.IO = saved
+
+
+def test_lazy_engine_scalar_param_parity(r: SubTestResult):
+    """TRK-71 / invariant 11: `check_lazy_status` and `prepare`'s own E6003-forgiveness gate
+    are the two consumers invariant 11 requires to agree, and they used to build their scalar
+    parameter dict from two hand-rolled loops that happened to arrive at the same keys — not
+    from one place. Both now call `tex_engine.scalar_lazy_params` on their respective pre-cook
+    mapping, so this pins agreement BY CONSTRUCTION rather than by coincidence: patch that one
+    function to record every call's argument, drive a scrub through both consumers (a wired
+    scalar that arrives across two T4-lite rounds, and a second $param with a CODE-DEFINED
+    default that is never a kwarg at all — the one case `prepare` injects a value
+    `check_lazy_status` never saw), and assert the two recorded dicts are equal.
+
+    RED at a base sha where `tex_engine.scalar_lazy_params` does not exist (AttributeError);
+    GREEN once both consumers are wired to it."""
+    print("\n--- lazy: check_lazy_status / prepare scalar-param parity (TRK-71) ---")
+    import TEX_Wrangle.tex_engine as _engine
+    N = TEXWrangleNode
+
+    # `gain` has a code-defined default and is NEVER passed as a kwarg by either round below
+    # (simulating a widget list that has not caught up with a source edit); `k` is a wired
+    # scalar that arrives only in round 2.
+    code = "f$gain = 2.0;\nf$k = 0.5;\n@OUT = @A * $gain * $k;"
+    SM = json.dumps([{"name": "A", "slot": "in_0", "type": "IMAGE"},
+                     {"name": "k", "slot": "in_1", "type": "FLOAT"}])
+    img = make_img(1, 4, 4, 3)
+
+    calls = []
+    orig = _engine.scalar_lazy_params
+
+    def _spy(mapping):
+        result = orig(mapping)
+        calls.append(dict(result))
+        return result
+
+    _engine.scalar_lazy_params = _spy
+    try:
+        N.check_lazy_status(code=code, _tex_slot_map=SM, in_0=None, in_1=None)
+        N.check_lazy_status(code=code, _tex_slot_map=SM, in_0=None, in_1=0.5)
+        assert len(calls) == 2, calls
+        check_lazy_final = calls[-1]
+
+        calls.clear()
+        N.execute(code=code, _tex_slot_map=SM, in_0=img, in_1=0.5)
+        assert len(calls) == 1, calls
+        engine_params = calls[-1]
+
+        assert check_lazy_final == engine_params == {"k": 0.5}, \
+            (check_lazy_final, engine_params)
+        r.ok("check_lazy_status and prepare build the identical scalar dict, by construction")
+    except Exception as e:
+        r.fail("check_lazy_status/prepare scalar-param parity", str(e))
+    finally:
+        _engine.scalar_lazy_params = orig

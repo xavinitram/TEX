@@ -362,22 +362,25 @@ class TEXWrangleNode(_BaseClass):
             if kwargs.get("_tex_chain"):
                 return _pending()
             code = kwargs.get("code", "")
-            # Foldable values: scalar widget constants + already-cooked wired
-            # scalars (bool/int/float). Pool-slot keys are never params.
-            params: dict[str, Any] = {}
-            for name, val in kwargs.items():
-                if name in cls._SYSTEM_KWARGS or _LAZY_SLOT_RE.match(name):
-                    continue
-                if isinstance(val, (bool, int, float)):
-                    params[name] = val
+            # TRK-71/invariant 11: assemble the same pre-cook mapping `execute()` would hand
+            # `prepare()` as `bindings` — kwargs minus system/pool-slot keys, with each wired
+            # pool value resolved to its bound NAME — then filter it through the ONE function
+            # (`_engine.scalar_lazy_params`) `prepare`'s own E6003-forgiveness gate calls on
+            # its `bindings`. The two consumers therefore build their scalar dict from the same
+            # place instead of merely arriving at the same keys today.
+            pre_bindings: dict[str, Any] = {
+                name: val for name, val in kwargs.items()
+                if name not in cls._SYSTEM_KWARGS and not _LAZY_SLOT_RE.match(name)
+            }
             scalar_pending = []
             for e in entries:
                 v = kwargs.get(e["slot"])
                 if v is None:
                     if e["type"] in _tex_lazy.SCALAR_WIRE_TYPES:
                         scalar_pending.append(e)
-                elif isinstance(v, (bool, int, float)):
-                    params[e["name"]] = v
+                else:
+                    pre_bindings[e["name"]] = v
+            params = _engine.scalar_lazy_params(pre_bindings)
             needed = _tex_lazy.lazy_required_bindings(code, params)
             if needed is None:
                 return _pending()  # R3

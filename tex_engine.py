@@ -740,6 +740,20 @@ def resolve_device(device_mode: str, bindings: dict[str, Any]) -> str:
 MAX_OUTPUTS = 8   # the engine's own ceiling; the ComfyUI node's socket count matches it
 
 
+def scalar_lazy_params(bindings: dict) -> dict:
+    """The one filter invariant 11 requires every caller of `tex_lazy.lazy_required_bindings`'s
+    pre-cook pass to share: a binding folds into the lazy analysis only when its value is a
+    bare Python `bool`/`int`/`float` (never a tensor, list or `None`) — exactly the test
+    `prepare`'s own E6003-forgiveness gate below applies to its `bindings`. `tex_node`'s
+    `check_lazy_status` builds the equivalent pre-cook mapping (kwargs, minus system/pool-slot
+    keys, with pool values already resolved to their bound name — the same shape `bindings`
+    has once `execute()` finishes assembling it) and calls this SAME function on it (TRK-71),
+    so the two consumers agree on the resulting dict by construction rather than by arriving
+    at the same keys today and drifting apart under some future edit to either side."""
+    return {name: val for name, val in bindings.items()
+            if isinstance(val, (bool, int, float))}
+
+
 def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             device_mode: str = "auto", compile_mode: str = "none",
             precision: str = "fp32", has_latent_input: bool = False,
@@ -917,8 +931,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     # behaviour (their lazy round requests everything).
     lazy_needed = None
     if not fused_chain and forgive_dead_refs:
-        scalar_params = {n: v for n, v in bindings.items()
-                         if isinstance(v, (bool, int, float))}
+        scalar_params = scalar_lazy_params(bindings)
         lazy_needed = _tex_lazy.lazy_required_bindings(code, scalar_params)
     for ref_name in referenced:
         if ref_name not in assigned_bindings and ref_name not in bindings:
