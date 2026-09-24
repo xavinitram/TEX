@@ -79,7 +79,7 @@ def _gate():
 
 
 # Real pytest summary-line TAILS `_summary_of` must still pick the right line out of --
-# collected from `tools/gate.py`'s own docstring, CLAUDE.md's "Last reading" table and real
+# collected from `tools/gate.py`'s own docstring, recorded gate readings and real
 # runs on this box (v0.35.0/v0.35.3/v0.36.1 readings) -- each paired with the exact line
 # `_summary_of` must return, UNCHANGED by this fix.
 _REAL_STDOUT_TAILS = [
