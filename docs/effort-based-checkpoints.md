@@ -245,22 +245,25 @@ cost caching exists to avoid. The contract is the host's to keep, and it is docu
 
 ## 7. Threading: the phase-2 cook is a second writer
 
-`ResultCache` is documented as not thread-safe: "a host that shares one across threads guards
-it" (`ResultCache`'s class docstring, `tex_results.py:217` — which now records that the class
-became thread-safe in CACHE-7, after this note was written). Until now that was a host's
-problem, because every writer was the
-host's own cook. Phase 2 makes the **engine** a writer, on the SCHED-4 worker thread, while
-the host's interactive cook may be `get`-ing on the main thread — a concurrent `move_to_end`
-and `popitem` on one `OrderedDict`, which is a corrupted LRU or a `RuntimeError`, not a stale
-read.
+`ResultCache` is **thread-safe as of CACHE-7** (v0.32) — that is the settled state, stated in
+`ResultCache`'s own class docstring, and everything below argues from it rather than around
+it. Before CACHE-7, that guarantee did not exist: every writer was the host's own cook, so the
+class documented itself as "not thread-safe by itself; a host that shares one across threads
+guards it," and that was a fair contract while it held. Phase 2 is what broke it: it makes the
+**engine itself** a writer, on the SCHED-4 worker thread, while the host's interactive cook may
+be `get`-ing on the main thread at the same time — a concurrent `move_to_end` and `popitem` on
+one `OrderedDict` is a corrupted LRU or a `RuntimeError`, not merely a stale read.
 
-Two options were weighed. Documenting "submit your cooks through the queue too" pushes a
-correctness precondition onto every host and is unenforceable. Instead `ResultCache` grows an
-internal `RLock` around its mutating sections. It is never on the default ComfyUI path
-(invariant #7 is untouched — `tex_node.py` has no reference to `tex_results`), an uncontended
-acquire measures 220 ns against a `put` of 1.13 ms — 0.02% — and it removes a whole class of
-bug from every host at once rather than from the one that read the docstring. Re-entrant
-because `get` → `_restore` → `put` is a real call chain.
+Two options were weighed to close that gap. Documenting "submit your cooks through the queue
+too" would push a correctness precondition onto every host, and an unenforceable one.
+`ResultCache` grew an internal `RLock` around its mutating sections instead — never on the
+default ComfyUI path (invariant #7 is untouched: `tex_node` has no reference to
+`tex_results`), an uncontended acquire measuring 220 ns against a `put` of 1.13 ms (0.02%),
+removing the whole class of bug from every host at once rather than from the one that happened
+to read the docstring. The lock is re-entrant because `ResultCache.get` → `ResultCache._restore`
+→ `ResultCache.put` is a real call chain, and it covers structure and byte accounting only —
+full-frame copies and disk I/O run outside it, the same scoping rule `ResultCache`'s own
+docstring gives as why the lock is affordable at all.
 
 ---
 
