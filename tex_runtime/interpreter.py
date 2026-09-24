@@ -387,20 +387,14 @@ class Interpreter(MaskedFlowMixin):
         # codegen's _contiguous_bindings — see tex_marshalling). Imported once per
         # execute (cold path), not per binding.
         from ..tex_marshalling import to_fp32_if_int_image
-        async_ingest = False
         for name, value in bindings.items():
             if isinstance(value, str):
                 self.bindings[name] = value  # strings pass through as Python str
             elif isinstance(value, torch.Tensor):
-                # XPU: a pinned CPU source headed to CUDA rides an async DMA
-                # inside the helper — note it so the cook can fence before
-                # returning (see the ingest-event sync below).
-                if (not async_ingest and target_device.type == "cuda"
-                        and value.device.type == "cpu"):
-                    try:
-                        async_ingest = value.is_pinned()
-                    except Exception:
-                        pass
+                # XPU: a pinned CPU source headed to CUDA rides an async DMA inside the
+                # helper below — RT-b's shared `_record_ingest_event` re-scans the original
+                # `bindings` for this AFTER this loop (see the ingest-event sync below), so
+                # nothing is tracked here any more.
                 # Device move + M5-INT cast fused into one copy (single source
                 # in tex_marshalling); same-device fp inputs pass through untouched.
                 t = to_fp32_if_int_image(value, device=target_device)
@@ -434,14 +428,11 @@ class Interpreter(MaskedFlowMixin):
 
         # XPU fence: the async pinned→CUDA ingest DMA is stream-ordered ahead of
         # every kernel this cook launched — record its completion point NOW so
-        # the pre-return sync waits only for the copy, not the compute.
-        ingest_event = None
-        if async_ingest:
-            try:
-                ingest_event = torch.cuda.Event()
-                ingest_event.record(torch.cuda.current_stream(target_device))
-            except Exception:
-                ingest_event = None
+        # the pre-return sync waits only for the copy, not the compute. RT-b: the
+        # detection (was tracked inline above) and the record are now both inside the
+        # one shared helper, given the ORIGINAL `bindings` (unmutated by the loop above,
+        # which only ever wrote into `self.bindings`) — same stream, same fence.
+        ingest_event = _record_ingest_event(bindings, target_device)
 
         # Execute statements via tree-walking interpreter.
         # SCHED-3: when a host supplied a cancel token or progress sink, check/report per
@@ -2994,3 +2985,35 @@ def _tensor_where(cond: torch.Tensor, then_val: torch.Tensor, else_val: torch.Te
             pass
 
     return torch.where(cond, then_val, else_val)
+
+
+# RT-b (v0.43): the single ingest-event fence helper. Was duplicated — this exact body in
+# `compiled.py`, and an inline hand-rolled equivalent (detect-during-the-binding-loop,
+# record-after-builtins) right here in `_execute_inner`. Moved here (compiled.py already
+# imports names from this module, so this introduces no new import cycle) and both call
+# shapes now call this one function. Mechanical move only: same record-on-H2D detection,
+# same `.synchronize()` fence, same stream — `compiled.py` calls it immediately after its
+# own bindings are made contiguous (unchanged), and `_execute_inner` below calls it once
+# the binding loop has already enqueued every H2D copy (also unchanged) — recording an
+# event any time after those copies are enqueued correctly bounds their completion, since a
+# CUDA stream is FIFO; only recording BEFORE they are all enqueued would be wrong, and
+# neither call site does that.
+def _record_ingest_event(orig_bindings, dev) -> "torch.cuda.Event | None":
+    """XPU (v0.20): when ingestion issued a non_blocking pinned→CUDA copy, record
+    an event AT THE COPY POINT on the stream. The caller synchronizes it before
+    returning the cook's output — closing the cross-node window where a
+    (convention-violating) downstream in-place write to the shared pinned source
+    could race the in-flight DMA. The wait covers only the copy (recorded before
+    compute kernels queue), so it's ~free once the cook's Python work has run."""
+    if getattr(dev, "type", None) != "cuda":
+        return None
+    try:
+        for v in orig_bindings.values():
+            if (isinstance(v, torch.Tensor) and v.device.type == "cpu"
+                    and v.device != dev and v.is_pinned()):
+                ev = torch.cuda.Event()
+                ev.record(torch.cuda.current_stream(dev))
+                return ev
+    except Exception:
+        return None
+    return None

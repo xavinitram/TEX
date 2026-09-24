@@ -30,7 +30,7 @@ from ..tex_compiler.ast_nodes import (BinOp, UnaryOp, TernaryOp, FunctionCall,
                                       IfElse, ForLoop, WhileLoop, BindingRef)
 from .interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
 from .interpreter import (Interpreter, _collect_identifiers, _consensus_extent,
-                          _SCALAR_BUILTIN_DEFAULTS)
+                          _SCALAR_BUILTIN_DEFAULTS, _record_ingest_event)
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
                       _iter_child_nodes, is_vec_param_list)
 from .stdlib import TEXStdlib, _tag_host_scalar
@@ -195,25 +195,9 @@ def _canon_device(device) -> "torch.device":
     return dev
 
 
-def _record_ingest_event(orig_bindings, dev) -> "torch.cuda.Event | None":
-    """XPU (v0.20): when ingestion issued a non_blocking pinned→CUDA copy, record
-    an event AT THE COPY POINT on the stream. The caller synchronizes it before
-    returning the cook's output — closing the cross-node window where a
-    (convention-violating) downstream in-place write to the shared pinned source
-    could race the in-flight DMA. The wait covers only the copy (recorded before
-    compute kernels queue), so it's ~free once the cook's Python work has run."""
-    if getattr(dev, "type", None) != "cuda":
-        return None
-    try:
-        for v in orig_bindings.values():
-            if (isinstance(v, torch.Tensor) and v.device.type == "cpu"
-                    and v.device != dev and v.is_pinned()):
-                ev = torch.cuda.Event()
-                ev.record(torch.cuda.current_stream(dev))
-                return ev
-    except Exception:
-        return None
-    return None
+# RT-b (v0.43): `_record_ingest_event` moved to `interpreter.py` and is imported above —
+# it was defined here identically before the merge; see that module for the body and the
+# mechanical-move note. Nothing at any of this module's three call sites changed.
 
 # Routing-gate memo: fingerprint -> (op_count, loop_depth). Both are pure
 # functions of the AST, which is keyed by the same (code, binding-types)

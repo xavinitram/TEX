@@ -1439,4 +1439,14 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   pickle beside `tex_cache.py` can also edit the source, so the same ACL covers both. The MAC
   earns its keep only when `TEX_CACHE_DIR` points somewhere more exposed than the code. Reopen
   only to REPLACE pickle outright (the format-level fix), a migration of its own.
+- **Folding `streams.FrameHandle` and `ResultCache`'s restore `pending_event` fence into the
+  merged H2D-ingest helper** (v0.43 RT-b) — examined and kept apart, on shape rather than
+  laziness. `FrameHandle` is host-pollable (a D2H egress a CPU consumer can poll or wait on
+  while doing other work) and the restore `pending_event` is GPU-side non-blocking (a foreign
+  stream fences it, built deliberately to avoid a host-blocking wait); the merged helper is a
+  THIRD shape, a host-blocking `.synchronize()`. Forcing one primitive over all three would need
+  a blocking/non-blocking/pollable mode flag — the shape `AGENTS.md`'s "config escape hatches"
+  guidance already warns can decay into decoration — or would strip the two hardened primitives
+  of the shape an embedding host's consumer specifically needed them to have. Reopen only
+  against a measured cost of keeping three shapes, not on aesthetics.
 
