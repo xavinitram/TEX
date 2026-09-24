@@ -266,15 +266,15 @@ def _emission_sites():
 #
 # Moving the pin is a two-line edit in ONE direction: drop the code that gained a test from
 # the set, and lower the number to match. The row tells you both numbers when it reds.
-_UNTESTED_PIN = 16
+_UNTESTED_PIN = 9
 _UNTESTED_AT_PIN = frozenset("""
     E1000 E3000
     E3100 E3900
-    E6001 E6002 E6004 E6005 E6006 E6020 E6021 E6030 E6040 E6050 E6051
+    E6002 E6030 E6040 E6050
     E9001
 """.split())
 
-# Why each of the sixteen is still here, so the next reader does not re-derive it:
+# Why each of the nine is still here, so the next reader does not re-derive it:
 #
 # * `E1000` / `E3000` / `E3100` / `E3900` cannot fire from parsed TEX source at all — the
 #   first two are `code=` DEFAULTs no call site omits, the other two are branches the
@@ -284,19 +284,21 @@ _UNTESTED_AT_PIN = frozenset("""
 #   checks the two facts still agree (below) — see that dict for the current reasons rather
 #   than re-deriving or re-typing them here, where a future edit to one copy could leave
 #   the other stale.
-# * `E6xxx` (eleven of the sixteen) are the interpreter's. They need an EXECUTION — a
-#   compiled program and real tensors, not a `check` or a `compile` — so a row for them
-#   does not belong in this file's sibling (`test_simp6_error_code_rows.py`, which only
-#   goes through `check`). TRK-112 tightened this file's "tested" rule; paying THIS part
-#   of the backlog down is TRK-113's execution-level suite, out of scope here on purpose —
-#   see that ask for which of the eleven are genuinely reachable and which are defensive
-#   branches a checker code already forecloses.
+# * `E6002` / `E6030` / `E6040` / `E6050` are four of the interpreter's eleven `E6xxx`
+#   codes (TRK-113 — reaching one needs an EXECUTION, not a `check`/`compile`, which is
+#   why none of the eleven could ever get a row in this file's sibling,
+#   `test_simp6_error_code_rows.py`). TRK-113's execution-level suite
+#   (`tests/test_trk113_interpreter_error_codes.py`) paid down the other seven with real
+#   trigger rows; these four are genuinely DEFENSIVE — a checker code forecloses the
+#   mistake from any parsed source before the interpreter's branch could run, so there is
+#   no program to compile that reaches them. That file's `test_defensive_codes_stay_shadowed`
+#   keeps each pairing (`E6002`↔`E4000`, `E6030`↔`E3301`, `E6040`↔`E3401`, `E6050`↔`E5001`)
+#   checked against a live program rather than asserted only in prose.
 # * `E9001` comes from a fused tool's preflight, which needs a host's tool manifest.
 #
-# The first four (and, pending TRK-113, the eleven `E6xxx`) are worth marking on the page
-# rather than testing through `check`/`compile`: a documented code the product cannot emit
-# from source is a promise to a host that nothing keeps, and marking it does not move this
-# pin — it stays untested, honestly.
+# All nine are worth marking on the page rather than testing: a documented code the
+# product cannot trigger through its own public surface is a promise to a host that
+# nothing keeps, and marking it does not move this pin — it stays untested, honestly.
 
 
 def test_simp6_untested_error_codes_only_go_down(r: SubTestResult):
