@@ -718,6 +718,11 @@ class Interpreter(MaskedFlowMixin):
         and attributes a stage's real work to whichever later stage happens to sync. That sync
         is the profiler's whole cost, and it is why `should_sample` exists.
 
+        TRK-131: timing a change to this sync count needs a pool with no `sync=True`
+        builtin — one of those does its own internal `.item()` readback, which is itself a
+        barrier, and can silently stand in for a sync this method stopped doing. See
+        `profile.measure`'s docstring for the repro method this costs.
+
         `stmt.loc.stage` is a plain attribute chain, not `getattr(..., None)`: `ASTNode.loc`
         has a `default_factory` and `stage` is in `SourceLoc.__slots__`, so neither can be
         absent, and the defensive form measured ~22 ns/stmt to say otherwise. `enumerate` is

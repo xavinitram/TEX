@@ -393,7 +393,19 @@ class measure:
 
     The sink is re-entrant by save/restore rather than by clearing: the OOM ladder and the
     tiled paths call `execute()` repeatedly inside one cook, and an inner block that reset the
-    sink to None would silently drop the outer cook's breakdown."""
+    sink to None would silently drop the outer cook's breakdown.
+
+    THE REPRO METHOD, for whoever next times a change to `_sync`'s count here or in
+    `Interpreter._exec_stmts_profiled` (TRK-131): a "no difference" reading is only evidence
+    of safety if the benchmarked program's stdlib pool contains NO `sync=True` builtin.
+    Such a builtin does its own internal host readback (an `.item()`), which is itself a
+    device-completion barrier — so a repro built on one (e.g. `gauss_blur`) can read nearly
+    identical per-stage numbers with a profiler sync removed not because removing it was
+    safe, but because the builtin's own readback was silently supplying the barrier the
+    profiler had stopped supplying. Check every member of a timing pool against
+    `stdlib_registry.REGISTRY`'s `.sync` field (`e.sync` per entry — the same tag
+    `graphed._SYNC_STDLIB` is hand-kept from) BEFORE quoting a "no difference" result from
+    it; a pool with a sync-tagged member proves nothing about this mechanism either way."""
     __slots__ = ("key", "spatial", "device", "sink", "_t0", "_on", "_prev")
 
     def __init__(self, key: tuple, spatial=None, *, device=None, stages: bool = False):
