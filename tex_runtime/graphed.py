@@ -52,12 +52,12 @@ def is_capturing() -> bool:
 
 
 def capture_pending(fingerprint: str, device) -> "bool | None":
-    """Rider (a), v0.43: a READ-ONLY peek at whether the next cook of *fingerprint* would
-    attempt a CUDA-graph capture — a static, mechanism-only surface (no policy about
-    whether/how a host warns a user; `docs/worklog/v043/design.md` §4(a)). Never triggers
-    the AST walk `_capturable` runs on a memo miss, never adopts a `warm_state`-persisted
-    verdict, and never writes `_capturable_memo` — a peek can only read what an earlier
-    cook (or an earlier `tex_api.prewarm`) already decided.
+    """A READ-ONLY peek at whether the next cook of *fingerprint* would attempt a
+    CUDA-graph capture — a static, mechanism-only surface with no policy about
+    whether/how a host warns a user. Never triggers the AST walk `_capturable` runs on a
+    memo miss, never adopts a `warm_state`-persisted verdict, and never writes
+    `_capturable_memo` — a peek can only read what an earlier cook (or an earlier
+    `tex_api.prewarm`) already decided.
 
     Returns `False` for a non-CUDA *device* WITHOUT consulting the memo: capture is
     CUDA-only, exactly the precondition `run_graphed` checks (`dev.type != "cuda"`) before

@@ -1,9 +1,10 @@
 """v0.43.0 rider (a) — `graphed.capture_pending(fingerprint, device) -> bool | None`.
 
 A read-only peek at `graphed._capturable_memo`, the static AST capturability verdict
-`run_graphed` memoizes per fingerprint (`docs/worklog/v043/design.md` §4(a)). Mechanism
-only: no pre-trigger (never calls `_capturable`, never adopts a `warm_state`-persisted
-verdict) and no side effect (never writes the memo).
+`run_graphed` memoizes per fingerprint. Mechanism only, by design: no pre-trigger (never
+calls `_capturable`, never adopts a `warm_state`-persisted verdict) and no side effect
+(never writes the memo) — a host asking "would this capture" must never be able to change
+the answer by asking.
 
 DEVIATION from the rider's proposed signature, recorded here and in the hand-back:
 `_capturable_memo` is `dict[str, tuple[bool, int]]` — keyed by `fingerprint` ALONE, because

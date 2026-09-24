@@ -2,10 +2,9 @@
 
 `interpreter.py`'s inline ingest-event block and `compiled.py`'s (former, separately
 defined) `_record_ingest_event` were two near-identical shapes of the same thing: record an
-event on H2D ingest, `.synchronize()` it, same stream. `docs/worklog/v043/design.md` §4(b)
-asks for exactly one merge and nothing else — `streams.FrameHandle` and
-`ResultCache.pending_event` stay untouched (see `DEVELOPMENT.md`'s rejected-decisions
-register for why).
+event on H2D ingest, then `.synchronize()` it, on the same stream. This merges exactly
+those two shapes and nothing else — `streams.FrameHandle` and `ResultCache.pending_event`
+stay untouched (see `DEVELOPMENT.md`'s rejected-decisions register for why).
 
 This file is the behavior-identity half the existing ingest-event tests (`test_v020_phase1.py`
 XPU-3/XPU-4, `test_v0422_race.py`, `test_codegen_param_device.py`, `test_perf7_compiled_cold.py`
