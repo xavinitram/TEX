@@ -5,6 +5,99 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.3] - 2026-09-24 — "Close the ledger"
+
+Six tracker rows and a citation-budget correction close, plus five benchmark-tooling rows —
+no new language surface, no default moved. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat
+freeze is owed.
+
+### Fixed
+
+- **TRK-116 — the PLANES arm of `_check_channel_access` now returns, like its string/matrix/
+  array siblings.** `tex_compiler/type_checker.py::_check_channel_access`'s four has-no-channels
+  arms shared one loop; the PLANES arm alone recorded `E3300` and fell through into the
+  swizzle-pattern rules below it instead of returning immediately, so a plane-typed channel
+  access could additionally raise `E3302`/`E3303` (a "not a valid swizzle" pair) or propagate a
+  phantom `VECn` type into an enclosing constructor. Every program that reached this arm was
+  already non-empty on `check()` before this fix (it always raised `E3300`); what changes is
+  which OTHER diagnostics ride alongside it — `E3302`/`E3303` disappear, and a coincidentally
+  swizzle-shaped plane name (`.rgb`, `.xyz`) can now surface a new, more honest `E3601` one level
+  up instead of a phantom vector type. **ComfyUI-invisible in practice**: planes are engine-only
+  on the default profile, and the one shipped example that types a wire PLANES from source
+  (`examples/aov_relight.tex`) reaches this arm only through the `p@`-hint expansion path, whose
+  own corpus hash is unchanged. The one profile where the diagnostic shape can differ is an
+  engine-profile build with plane wires explicitly on — not the default ComfyUI node.
+- **TRK-144 — `tex_tool.py`'s duplicate `_ver_tuple` is gone; `tex_api._ver_tuple` is now the
+  one, more general definition.** Two version-string parsers disagreed on malformed or
+  multi-component input (`tex_api`'s fixed-2-tuple, whole-string-exception-to-`(0,0)` version vs.
+  `tex_tool`'s per-chunk-tolerant, any-arity one) — moving `tex_tool`'s algorithm into `tex_api`,
+  not the reverse, keeps the `TOOL-4` `min_engine` gate patch-precise. Every real call site in
+  both modules always compared two well-formed, same-arity strings, so no shipped tool manifest's
+  gate verdict moves.
+- **TRK-154 — a masked user-function call under a per-pixel `if` is now named on `FlowPlan`, so
+  the CUDA-graph capture gate declines it up front instead of capturing into a stream-capture
+  error.** `MaskedFlowMixin._mf_call_user_function`'s `m_any(self._live)` check is a device
+  `.item()` sync unconditionally — the same shape a loop live-check or a scatter compaction
+  already makes `_masked_flow_syncs` decline for. Before this fix, that call site was invisible to
+  the gate, so a capture attempt on such a program ran into a genuine
+  `cudaErrorStreamCaptureInvalidated`, caught and blacklisted, with `run_graphed` returning `None`
+  — the SAME `None` the fixed gate now returns without ever trying. No output changes; a crash-
+  and-recover path becomes a decline.
+- **TRK-165 — the TRK-163 non-spatial exclusion now also covers `shared_tile_width` and
+  `tex_tiling.py`'s two planners.** `_halo_tile_plan` calls both `shared_tile_height` AND
+  `shared_tile_width` bare (only the height call was named in the original ask); `run_tiled_halo`
+  does too. All four call sites now pass the same `non_spatial` exclusion set `run_tiled`/
+  `run_batch_strips` already use. Confirmed unexploited today — neither planner slices a binding
+  by shape match, they only decide — the one thing this row does not cover (the anchor-selection
+  loops that pick a spatial binding by shape, not name) is carried forward as an advisory finding
+  for a later release.
+
+### Changed
+
+- **TRK-164 — two stale `tex_memory.py` doc citations re-pointed.**
+  `docs/region-granular-recook.md`'s three-slice-assignment citation and `DEVELOPMENT.md`'s
+  `free_tensor_caches` worley-cache citation had drifted off their real lines (both pre-dated this
+  round's own edits); re-pointed to their real symbols, and `tools/check_citations.py`'s
+  citation-warning ratchet re-pinned 24→22. Docs only.
+- **TRK-108 — `docs/effort-based-checkpoints.md` §7 rewritten for CACHE-7's thread-safety fix.**
+  §7's threading argument was built on `ResultCache` being NOT thread-safe; the class has been
+  thread-safe (an RLock) since CACHE-7 (v0.32), and an earlier fold re-pointed the citation without
+  redoing the argument itself. §7 now argues from the true premise, so the next checkpointing
+  lane (`docs/roadmap.md` §4 P2) starts from a correct document. Docs only.
+- **TRK-109 — the CHANGELOG's own dangling citation named its covering symbol.** The `roi=`/
+  fused-chain sentence's citation named no enclosing symbol, so `tools/check_citations.py` had
+  carried it as a standing warning since the citation tool shipped. Now reads
+  "`tex_engine.py:1261`, inside `run`"; the citation-warning budget re-pins 22→21.
+
+### Tooling (`benchmarks/`, `tests/` only — no `tex_*` production module touched)
+
+- **TRK-81** — `eight_config_bench.py --compare` is now repeatable; 3+ legs print every pairing's
+  geomean/range with same-tree NULL pairings labelled, and `--require-null-leg` refuses (reports,
+  doesn't silently flag) a sub-threshold geomean with no NULL pairing in the sitting.
+- **TRK-89** — `host_path_counts.py compare(current, baseline_path, scenario=...)` now restricts
+  BOTH legs to the named scenario before diffing, not just the current run.
+- **TRK-100** — `host_path_counts.py environment()` records `res`/`window`/`ticks`/`device`;
+  `compare()` refuses outright (names the mismatched field, rc 1, no row diff) when the two legs'
+  shapes disagree, rather than diffing two runs that were never comparable.
+- **TRK-126** — `compat_corpus.py freeze(version, only={name, ...})` corrects specific existing
+  rows of an already-archived version in place; the old delete-then-`freeze()` procedure is no
+  longer the documented correction path.
+- **TRK-133** — `benchmarks/roi_codegen_ab_bench.py` committed, modelled on the worklog script
+  that measured it (interleaved on/off, per-flag cache dir, split-half null control), with every
+  local path/box name removed.
+
+### For anyone vendoring this tree
+
+Four things this release moves, per `docs/brief-conventions.md`: **(1) no newly reserved names.**
+**(2) `LANGUAGE_VERSION` does not move** — stays `"0.25"`. **(3) no default moves.** **(4) no new
+shipping module filenames** — every change lands in existing modules
+(`tex_compiler/type_checker.py`, `tex_api.py`, `tex_tool.py`, `tex_memory.py`, `tex_tiling.py`,
+`tex_runtime/graphed.py`) or in `benchmarks/`/`tests/`/docs. **No user-visible behaviour change
+except what is named above, stated plainly:** two rows (`TRK-116`, `TRK-144`) touch diagnostic
+shape and version-string comparison respectively, and both are confirmed — not assumed —
+ComfyUI-invisible in the paragraphs above; everything else in this release is docs, tests or
+benchmarks only.
+
 ## [0.40.2] - 2026-09-24 — "Fail early, replay freely"
 
 Closes the register on `v0.40.0`'s own leftovers (`TRK-162`, `TRK-163`) and lifts the one
@@ -2733,8 +2826,8 @@ is unlikely to get right:
   `frame_version` is a constant 0 for every frozen entry, and `put` always freezes.
 
 **Scope, decided in §1 of the note rather than deferred:** `roi=` is refused on a fused chain
-(`tex_engine.py:1261`), so CACHE-9 serves the *unfused* per-stage host and CACHE-7 the fused
-one. They are complements, not layers.
+(`tex_engine.py:1261`, inside `run`), so CACHE-9 serves the *unfused* per-stage host and CACHE-7
+the fused one. They are complements, not layers.
 
 ### GOV-1 — memory/effort profiles on the governor (`tex_memory.py`)
 `performance` / `balanced` / `efficient`, in the `arch_support.gate_profile()` mould: named,

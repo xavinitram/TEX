@@ -132,7 +132,7 @@ import sys
 # `DEVELOPMENT.md`) had drifted off their real targets; re-pointing them at the enclosing
 # symbol they actually meant (`run_tiled`/`run_batch_strips`/`run_tiled_halo`,
 # `free_tensor_caches`) turned both into anchored `ok` citations.
-WARNING_BUDGET = 22
+WARNING_BUDGET = 21
 
 # ── The document set (see "THE DOCUMENT SET" above). ──
 DOC_DIR_GLOB = "docs"
