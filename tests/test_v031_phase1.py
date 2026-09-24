@@ -500,9 +500,43 @@ def test_v031_sched4_off_the_default_path(r: SubTestResult):
     # quantifiers before giving up. Dropping `\.*` matches exactly the same lines --
     # it never accepted anything `[\w.]*` did not already accept -- and is linear.
     offenders = lint_sources(
-        r"^[ 	]*(?:from[ 	]+[\w.]*tex_cookqueue|import[ 	]+[\w.]*tex_cookqueue)",
+        r"^[ 	]*(?:from[ 	]+[\w.]*\btex_cookqueue\b|import[ 	]+[\w.]*\btex_cookqueue\b)",
         allow={"tex_cookqueue.py"}, flags=_re.MULTILINE)
     r.ok("no engine or adapter module imports tex_cookqueue") if not offenders else         r.fail("SCHED-4 invariant #7", f"imported by {offenders}")
+
+    # v0422-gatehyg: this pattern used to bracket `tex_cookqueue` with a literal
+    # backspace BYTE on each side (an unescaped `\b` that had at some point been typed
+    # or transited through a non-raw string) instead of the regex word-boundary escape
+    # -- so it matched no real import line, ever, and the sweep above reported green
+    # having swept nothing. Proven directly here, on a small corpus, so a future edit
+    # that reintroduces the same corruption reds on THIS line rather than relying on
+    # the whole-package sweep going quiet again by coincidence. (A second copy of the
+    # pattern text, on purpose: `lint_sources()`'s own first argument above must stay
+    # an inline string literal, since `tests/test_v0422_redos.py`'s ReDoS regression
+    # test reads it live with `ast` and needs a literal to parse.)
+    _sched4_rx = _re.compile(
+        r"^[ \t]*(?:from[ \t]+[\w.]*\btex_cookqueue\b|import[ \t]+[\w.]*\btex_cookqueue\b)",
+        _re.MULTILINE)
+    _sched4_corpus = {
+        "from tex_cookqueue import CookQueue": True,
+        "from .tex_cookqueue import CookQueue": True,
+        "from ..tex_cookqueue import CookQueue": True,
+        "from pkg.tex_cookqueue import CookQueue": True,
+        "import tex_cookqueue": True,
+        "import pkg.tex_cookqueue": True,
+        "    from tex_cookqueue import CookQueue": True,
+        "# a comment that only mentions tex_cookqueue": False,
+        "from tex_engine import CookQueue": False,
+        "": False,
+    }
+    _sched4_bad = [line for line, want in _sched4_corpus.items()
+                   if bool(_sched4_rx.search(line)) != want]
+    if _sched4_bad:
+        r.fail("SCHED-4 invariant #7 canary corpus",
+               f"pattern disagrees with the expected shape on: {_sched4_bad!r}")
+    else:
+        r.ok(f"canary matches every real import-of-tex_cookqueue shape and rejects "
+             f"every allowed one ({len(_sched4_corpus)} corpus lines)")
 
     before = threading.active_count()
     q = Q.CookQueue()

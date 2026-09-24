@@ -22,8 +22,13 @@ quadratic, ~0.7s at a 16000-character dot run — but the same defect: two ways 
 same characters to the two quantifiers). Dropping `\\.*` there is a no-op for every string it
 used to match — provably, since `\\.*` subseteq `[\\w.]*` — so it removes the ambiguity
 without changing what the canary does or does not flag (a pre-existing, unrelated defect in
-that same pattern — literal backspace bytes bracketing `tex_cookqueue` that make it match no
-real import line at all — is reported separately; it is orthogonal to the regex's SHAPE).
+that same pattern — literal backspace bytes bracketing `tex_cookqueue` that made it match no
+real import line at all — was reported separately, orthogonal to the regex's SHAPE, and fixed
+by v0422-gatehyg: the bytes are now the regex word-boundary escape `\\b`, and the canary
+matches real import lines. `test_v0422_sched4_pattern_matching_is_unchanged` below derives
+its "before" pattern from the live "after" one rather than a frozen copy, exactly so a later
+content fix like that one cannot make ITS narrow claim — the quantifier alone was redundant —
+read as broken for an unrelated reason).
 
 Everything else `re.compile(` in the sweep (checked by hand, not re-typed here): single
 quantified classes (`\\d+`, `[A-Za-z_][A-Za-z0-9_]*`, `[^{}]*`, `[^']+`, lookaround-anchored
@@ -190,11 +195,10 @@ def test_v0422_gate_summary_redos_guard(r: SubTestResult):
 
 def _extract_sched4_pattern():
     """The SCHED-4 canary's own `lint_sources(...)` pattern and flags, read from the live
-    file with `ast` rather than re-typed here — a hand transcription would have to carry the
-    literal backspace bytes the source embeds around `tex_cookqueue` (a separate,
-    pre-existing defect, reported out of band; orthogonal to whether the regex's SHAPE is
-    ReDoS-safe), and reading it live means this row tracks the real pattern instead of a copy
-    that can silently drift from it."""
+    file with `ast` rather than re-typed here — a hand transcription is exactly how the
+    canary's own `\\btex_cookqueue\\b` boundary escapes drifted into literal backspace bytes
+    in the first place (fixed by v0422-gatehyg), and reading it live means this row tracks
+    the real pattern instead of a copy that can silently drift from it again."""
     source = _SCHED4_FILE.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(_SCHED4_FILE))
     for node in ast.walk(tree):
@@ -211,15 +215,6 @@ def _extract_sched4_pattern():
                     return pattern, flags
     raise AssertionError(f"{_SCHED4_FN} no longer calls lint_sources(...) in {_SCHED4_FILE}")
 
-
-#: The pattern's SHAPE before this ask's fix, spelled out with its real bytes (including the
-#: pre-existing backspace bytes around `tex_cookqueue`) so the row below can PROVE the fix
-#: changed nothing about what the pattern matches — only removing the leading `\.*` that
-#: overlapped the `[\w.]*` right after it.
-_SCHED4_PATTERN_BEFORE = (
-    "^[ \t]*(?:from[ \t]+\\.*[\\w.]*\x08tex_cookqueue\x08|"
-    "import[ \t]+[\\w.]*\x08tex_cookqueue\x08)"
-)
 
 #: A representative corpus, short enough to be safe to match in-process even under the OLD,
 #: ambiguous pattern (no pathological long runs here — those are exercised only in the
@@ -248,7 +243,21 @@ def test_v0422_sched4_pattern_matching_is_unchanged(r: SubTestResult):
     except Exception as e:
         r.fail("v0422 sched4 extraction", str(e))
         return
-    before = re.compile(_SCHED4_PATTERN_BEFORE, re.MULTILINE)
+    # Reintroduce the ONE thing this ask removed -- the redundant `\.*` right where the
+    # "from" branch used to carry it -- onto whatever the canary's LIVE pattern reads
+    # today, rather than a frozen historical copy of the pattern's old bytes. This ask's
+    # own claim was always narrow ("the quantifier was redundant"); a frozen copy tied
+    # that claim to the pattern's OTHER content too (the backspace bytes bracketing
+    # `tex_cookqueue`, a separate, pre-existing defect this ask explicitly left alone —
+    # see the module docstring), so a later, unrelated fix to that content (v0422-gatehyg)
+    # would have made this row go false-red for a reason that has nothing to do with the
+    # quantifier. Deriving "before" from "after" keeps the claim it was always about.
+    marker = "from[ \t]+"
+    assert pattern_after.count(marker) == 1, \
+        f"canary pattern's \"from\" branch marker not found exactly once: {pattern_after!r}"
+    pattern_before = pattern_after.replace(marker, marker + "\\.*", 1)
+
+    before = re.compile(pattern_before, flags_after)
     after = re.compile(pattern_after, flags_after)
 
     mismatches = []
@@ -261,7 +270,7 @@ def test_v0422_sched4_pattern_matching_is_unchanged(r: SubTestResult):
                f"{len(mismatches)} corpus line(s) differ (line, before, after): {mismatches}")
     else:
         r.ok(f"identical matches on {len(_SCHED4_IMPORT_CORPUS)} corpus lines "
-             f"(before={[bool(before.search(l)) for l in _SCHED4_IMPORT_CORPUS]})")
+             f"(after={[bool(after.search(l)) for l in _SCHED4_IMPORT_CORPUS]})")
 
 
 _SCHED4_PROBE = r"""
