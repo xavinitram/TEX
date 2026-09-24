@@ -309,10 +309,14 @@ crosses over does so by an amount not worth a default change. **The decision now
 boxes rather than one**, which is the useful outcome: this stops being an open reopen condition
 and becomes a settled no, revisited only if the crossover grows on a third architecture.
 
-*One finding the re-measurement turned up:* **no committed script reproduces the original
-0.94–0.96×.** Only the prose survives in three documents. The figure was almost certainly real —
-this run agrees with it — but it was not reproducible from the tree, which is the thing the three
-measurement rules in `docs/brief-conventions.md` exist to prevent.
+*One finding the re-measurement turned up, since closed (TRK-133):* at the time, no committed
+script reproduced the original 0.94–0.96× — only the prose survived in three documents. The
+figure was almost certainly real — the re-measurement agreed with it — but it was not
+reproducible from the tree, which is the thing the three measurement rules in
+`docs/brief-conventions.md` exist to prevent. `benchmarks/roi_codegen_ab_bench.py` now commits
+that method (interleaved on/off, a null control, a per-flag cache dir, the box named from
+`torch` at runtime) at the same two shapes, so a third box starts from a script instead of
+reconstructing the harness from prose.
 
 The ROI-5 reopen items, named here so they are not re-derived:
 
