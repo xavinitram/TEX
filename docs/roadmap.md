@@ -1159,7 +1159,8 @@ method made explicit:
   gate that would change the verdict). S/M items design in the PR/CHANGELOG entry.
 2. **Module placement is pre-decided** — the table above names the home module for
   each new mechanism; nothing lands in `tex_node.py` unless it is ComfyUI
-  adaptation (S-1), nothing imports comfy outside the three adapter files (PORT-1),
+  adaptation (S-1), nothing imports comfy outside the two adapter files
+  (PORT-1; `test_port1_import_lint` checks it),
   and new modules start under the 1500-LOC soft budget (REG-2).
 3. **Baseline before, compare after** — `eight_config_bench.py --save` before the
   first change of a release, `--compare` before tagging; per-config geomean < 0.95

@@ -5,19 +5,27 @@ from helpers import *
 import re
 
 _PKG = Path(__file__).resolve().parent.parent
+# The alphabet used to be `comfy.model_management` only, so `tex_node.py`'s own
+# `from comfy_api.latest import IO` (the v3 schema fallback) was invisible to it — a second,
+# unpinned adapter seam the roadmap already claimed was covered ("nothing imports comfy outside
+# the adapter files", docs/roadmap.md §10). Widened to any top-level `comfy`/`comfy_api` import
+# so a THIRD site re-scattering either family is caught the same way; the two adapter files below
+# are the only two such imports at this tree (confirmed by the same sweep this lint runs).
 _IMPORT_RE = re.compile(
-    r"^\s*(import\s+comfy\.model_management"        # import comfy.model_management [as mm]
-    r"|from\s+comfy\.model_management"              # from comfy.model_management import ...
-    r"|from\s+comfy\s+import\s+[^#\n]*\bmodel_management\b)",  # doc 33: from comfy import model_management [as mm]
+    r"^\s*(import\s+comfy(_api)?\b"                 # import comfy[_api][.sub] [as x]
+    r"|from\s+comfy(_api)?\b)",                      # from comfy[_api][.sub] import ...
     re.M)
+#: The two adapter files PORT-1 names: the ComfyUI-services seam (`comfy.model_management`,
+#: invariant 8) and the v3 node-schema fallback (`comfy_api.latest`, PORT-2).
+_ADAPTER_FILES = frozenset(("tex_runtime/host.py", "tex_node.py"))
 
 
 def test_port1_import_lint(r: SubTestResult):
-    print("\n--- PORT-1: comfy.model_management import is pinned to host.py ---")
+    print("\n--- PORT-1: comfy / comfy_api imports are pinned to the two adapter files ---")
     offenders = []
     for path in _PKG.rglob("*.py"):
         rel = path.relative_to(_PKG).as_posix()
-        if rel == "tex_runtime/host.py" or "/tests/" in f"/{rel}" or rel.startswith("tests/"):
+        if rel in _ADAPTER_FILES or "/tests/" in f"/{rel}" or rel.startswith("tests/"):
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -28,10 +36,11 @@ def test_port1_import_lint(r: SubTestResult):
             offenders.append(f"{rel}:{line}")
     if offenders:
         r.fail("PORT-1 import lint",
-               "comfy.model_management imported outside host.py (re-scatter): "
+               "comfy/comfy_api imported outside the two adapter files (re-scatter): "
                + ", ".join(offenders))
     else:
-        r.ok("comfy.model_management is imported ONLY in tex_runtime/host.py (seam intact)")
+        r.ok("comfy/comfy_api is imported ONLY in tex_runtime/host.py and tex_node.py "
+             "(both seams intact)")
 
 
 def test_port1_host_services(r: SubTestResult):
