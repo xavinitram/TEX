@@ -699,7 +699,7 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   (`tex_testkit.py:1-38`). Deliberately not a row below; its own docstring pins it at Tier 2 anyway
   (`tex_testkit.py:15-22`).
 - `ResultCache.put(..., mask_eligible=True)` opts a MASK output into half-precision preview storage
-  (LATENT stays refused regardless, `tex_results.py:406-408`); `ResultCache.touch(key)` and
+  (LATENT stays refused regardless, `tex_results.py:420-421`); `ResultCache.touch(key)` and
   `key in cache` are non-read residency operations — a hint that reorders the eviction walk, and a
   resident-now check — and neither counts as a hit or promotes a demoted frame
   (`tex_results.py:1528-1588`, the `touch`/`__contains__` docstrings). Not a row below; `touch`/`in`
