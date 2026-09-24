@@ -20,6 +20,7 @@ Shapes (roadmap §10.4): CANARY for the class table and the invariant-#7 contrac
 ROWS for the preempt/shed/cancel outcome matrix, and one real `tex_engine.cook` integration
 row so none of the above can pass vacuously against a synthetic callable.
 """
+import ast
 import threading
 
 from helpers import *
@@ -27,7 +28,57 @@ from helpers import *
 from TEX_Wrangle import tex_cookqueue as Q
 from TEX_Wrangle.tex_runtime.host import CookCancelled
 
+_PKG = Path(__file__).resolve().parent.parent
+
 _WAIT = 10.0          # generous: these are thread rendezvous, not timing assertions
+
+#: v0422-gatehyg (orchestrator ruling, 2026-09-24): the canary's intent is "the ComfyUI
+#: cook path must not import the queue". `tex_provider.declare_window`'s import does not
+#: violate that: it is an opt-in prefetch API (`queue` is a caller-supplied argument), the
+#: import is function-scoped (never runs at module-import time), and its only caller in
+#: the tree is a benchmark script -- unreachable from `tex_node.py`'s default cook path.
+#: Keyed by (file, ENCLOSING FUNCTION NAME), never a line number (lines rot; a function's
+#: name does not) -- and never by file alone, so a second, different tex_cookqueue import
+#: anywhere else in the same file still reds. See `_sched4_real_offenders` below.
+_SCHED4_ALLOW_BY_FUNCTION = {
+    ("tex_provider.py", "declare_window"): (
+        "opt-in prefetch API, function-scoped import, only caller is "
+        "benchmarks/io_playback_bench.py (not shipped, not on tex_node.py's cook path)"
+    ),
+}
+
+
+def _sched4_enclosing_function(source: str, lineno: int):
+    """The innermost `def`/`async def` whose body contains 1-based `lineno`, or None when
+    `lineno` sits at module scope. Ties resolve to the LATEST-starting containing function,
+    which is always the innermost one — a nested function's `def` line comes after its
+    parent's and its body ends before its parent's does."""
+    tree = ast.parse(source)
+    best = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            start, end = node.lineno, getattr(node, "end_lineno", node.lineno)
+            if start <= lineno <= end and (best is None or start > best.lineno):
+                best = node
+    return best.name if best else None
+
+
+def _sched4_real_offenders(offenders: list, pkg_root) -> list:
+    """`offenders` (`"rel:line"` strings from `lint_sources`) minus the ones covered by
+    `_SCHED4_ALLOW_BY_FUNCTION`, keyed by `(rel path, enclosing function name)` — so
+    exempting one function's import can never exempt the rest of its file, module-level
+    or a different function alike."""
+    real = []
+    for off in offenders:
+        rel, _, ln = off.rpartition(":")
+        try:
+            fn = _sched4_enclosing_function(
+                (pkg_root / rel).read_text(encoding="utf-8"), int(ln))
+        except Exception:
+            fn = None
+        if (rel, fn) not in _SCHED4_ALLOW_BY_FUNCTION:
+            real.append(off)
+    return real
 
 
 def _blocker(started: threading.Event, release: threading.Event):
@@ -502,7 +553,13 @@ def test_v031_sched4_off_the_default_path(r: SubTestResult):
     offenders = lint_sources(
         r"^[ 	]*(?:from[ 	]+[\w.]*\btex_cookqueue\b|import[ 	]+[\w.]*\btex_cookqueue\b)",
         allow={"tex_cookqueue.py"}, flags=_re.MULTILINE)
-    r.ok("no engine or adapter module imports tex_cookqueue") if not offenders else         r.fail("SCHED-4 invariant #7", f"imported by {offenders}")
+    real_offenders = _sched4_real_offenders(offenders, _PKG)
+    if real_offenders:
+        r.fail("SCHED-4 invariant #7", f"imported by {real_offenders}")
+    else:
+        r.ok("no engine or adapter module imports tex_cookqueue outside the named "
+             f"allow-list ({list(_SCHED4_ALLOW_BY_FUNCTION)})" if offenders else
+             "no engine or adapter module imports tex_cookqueue")
 
     # v0422-gatehyg: this pattern used to bracket `tex_cookqueue` with a literal
     # backspace BYTE on each side (an unescaped `\b` that had at some point been typed
@@ -537,6 +594,42 @@ def test_v031_sched4_off_the_default_path(r: SubTestResult):
     else:
         r.ok(f"canary matches every real import-of-tex_cookqueue shape and rejects "
              f"every allowed one ({len(_sched4_corpus)} corpus lines)")
+
+    # v0422-gatehyg (orchestrator ruling): prove the allow-list above is keyed by
+    # (file, ENCLOSING FUNCTION), not by file alone -- a hypothetical SECOND
+    # function-scoped tex_cookqueue import elsewhere in tex_provider.py must still be
+    # caught. A SYNTHETIC source string, written to a scratch temp file so
+    # `_sched4_real_offenders` exercises its real disk-reading path; product code is
+    # never touched.
+    _synthetic_src = (
+        "def declare_window(queue):\n"
+        "    from .tex_cookqueue import SPECULATIVE\n"
+        "    return queue\n"
+        "\n"
+        "def some_other_function():\n"
+        "    from .tex_cookqueue import PREFETCH\n"
+        "    return None\n"
+    )
+    _tmp_dir = tempfile.mkdtemp(prefix="tex-sched4-allow-check-")
+    try:
+        (Path(_tmp_dir) / "tex_provider.py").write_text(_synthetic_src, encoding="utf-8")
+        _synthetic_hits = [f"tex_provider.py:{i}" for i, line in
+                           enumerate(_synthetic_src.splitlines(), start=1)
+                           if _sched4_rx.search(line)]
+        _synthetic_kept = _sched4_real_offenders(_synthetic_hits, Path(_tmp_dir))
+    finally:
+        shutil.rmtree(_tmp_dir, ignore_errors=True)
+
+    if _synthetic_hits == ["tex_provider.py:2", "tex_provider.py:6"] and \
+            _synthetic_kept == ["tex_provider.py:6"]:
+        r.ok("allow-list matcher is keyed by function name: declare_window's import is "
+             "exempted, a second function-scoped import elsewhere in the same file "
+             "is still caught")
+    else:
+        r.fail("SCHED-4 allow-list matcher",
+               f"expected hits=['tex_provider.py:2', 'tex_provider.py:6'], "
+               f"kept=['tex_provider.py:6']; got hits={_synthetic_hits} "
+               f"kept={_synthetic_kept}")
 
     before = threading.active_count()
     q = Q.CookQueue()
