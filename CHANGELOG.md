@@ -5,6 +5,82 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.0] - 2026-09-25 — "Nothing unannounced"
+
+Tools grow part of their version story: install-time prewarm becomes cancellable and queryable.
+Side-by-side installed tool versions, semver-range resolution and the manifest-schema polish that
+would carry them are HELD this release and ship no code — see "Held" below. Two small riders land
+alongside, and a new cheap-tier lint keeps every pushed file honest about not naming a local-only
+path or the embedding host. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze is owed.
+No default-path pixel changes.
+
+### Added
+
+- **`install_tool(..., cancel=None)`.** Install-time warm (`warm=True`) now takes the same
+  best-effort `CancelToken | None` contract `tex_api.prewarm` already has (v0.42's HOSTAUDIT-2),
+  threaded through `warm_tool` and `_warm_compiled` and polled once per (channel-variant ×
+  warm-step). A cancel keeps every verdict already persisted, skips the rest, and reports how many
+  channel variants were skipped at every level (`_warm_compiled`, `warm_tool`,
+  `install_tool`'s `result["warmed"]["cancelled"]`) — it never raises out of `install_tool`.
+  `cancel=None` (the default) is an unpolled no-op, byte-identical to before this release for any
+  caller that doesn't pass one. The consent surface is unchanged: `warm=True` remains the single
+  consent point, and the shipped default stays validate-only.
+- **`tex_tool.tool_warm_status(manifest) -> {"codegen": bool, "capturable": bool | None}`.** A new
+  read-only query, re-deriving the tool's warm keys the same value-independent way
+  `tool_warm_keys` already does and only reading already-persisted state — no compile, no
+  background-pool submission, no `warm_state.json` write. Lets a host decide whether warming is
+  worth triggering before it asks. Both additions are documented in `docs/tools.md` §5.
+- **`graphed.capture_pending(fingerprint, device) -> bool | None`.** A read-only peek at the same
+  static, per-fingerprint CUDA-graph capturability memo `run_graphed` already consults (`None` =
+  not yet memoized). No pre-trigger of a real capture and no side effect; a non-CUDA `device`
+  answers `False` deterministically without touching the memo, mirroring `run_graphed`'s own gate.
+- **A cheap-tier lint against local-only path and host-name leakage.** `tools/gate.py --tier cheap`
+  gains an eighth ratchet scanning every tracked file's text for a set of local-only path
+  fragments plus a case-sensitive, word-bounded check naming the embedding host — every pattern
+  assembled from pieces at runtime, so no forbidden literal sits contiguously in the checker's own
+  source. Starts clean: fixed four pre-existing tracked lines it caught leaking a local-only
+  pointer (paraphrased host-neutrally, the same fix shape a same-day prior commit already used on
+  three other lines).
+
+### Changed
+
+- **The interpreter's and the compiled tier's H2D-ingest-event fences are now one function.**
+  `tex_runtime/interpreter.py`'s inline, hand-rolled ingest-event block and
+  `tex_runtime/compiled.py`'s standalone `_record_ingest_event` (three internal call sites) were
+  two independently-maintained copies of the same contract — record an event on H2D ingest,
+  host-block on `.synchronize()`, same stream. Both now call one shared `_record_ingest_event`,
+  living in `interpreter.py` and imported by `compiled.py`; every existing call site keeps its
+  exact behaviour (mechanical move only — no new fence shape, no new call site, no tuning). The
+  per-binding detection `_execute_inner` needs (is this a pinned CPU tensor moving to a different
+  device?) stays inline in the existing binding-copy loop it always shared, so the common case —
+  no pinned tensor, or a non-CUDA target — still pays no extra traversal; an early draft of the
+  merge added a second, unconditional walk of every binding, caught and fixed before release.
+  `tex_runtime/streams.FrameHandle` (host-pollable D2H egress) and `ResultCache`'s restore fence
+  (GPU-side, non-blocking, v0.42.2) were considered for the same merge and deliberately kept
+  apart — a third, host-blocking shape forced onto either would need a mode flag, or would strip
+  a hardened primitive of the shape its own consumer needs it to have (`DEVELOPMENT.md`'s
+  rejected-decisions register carries the reasoning). **`tex_runtime/interpreter.py` is a
+  codegen-epoch file, so this edit makes the `.cg` codegen-artifact cache and the graph-
+  capturability verdict cache go cold once on this upgrade** — a one-time cost, not a behaviour
+  change, stated here plainly (the `v0.42.1` entry needed a post-release correction for exactly
+  this kind of omission).
+
+### Held
+
+- **Side-by-side installed tool versions, semver-range resolution (`Blur@^1.2`), content-hash
+  identity, and the manifest-schema v2 fields that would carry them do not ship this release.**
+  Designed but not built: an open question about the range-syntax surface and where the content
+  hash should live is still with the author. Carried forward, not declined.
+
+### For anyone vendoring this tree
+
+No newly reserved names; `LANGUAGE_VERSION` unmoved at `"0.25"`, no compat freeze owed; no default
+moves; no new shipping module filenames — every change lands in an existing module (`tex_tool.py`,
+`tex_runtime/graphed.py`, `tex_runtime/interpreter.py`, `tex_runtime/compiled.py`) or in
+`tools/`/`tests/`/docs. **No user-visible behaviour change beyond what is named above:** every
+default-path pixel is unchanged; the only ways to observe this release from a program's own text
+are the two new read-only query surfaces, both off the default path.
+
 ## [0.42.2] - 2026-09-24 — "Fenced, not flaky"
 
 A hardening patch: one CUDA correctness guard, two CodeQL-flagged regex fixes, and gate-hygiene
