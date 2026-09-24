@@ -298,3 +298,55 @@ def reset_host_services() -> None:
     global _cached, _services_generation
     _cached = None
     _services_generation += 1
+
+
+# ── v0.42 HOSTAUDIT-4a: a structured OOM refusal ─────────────────────────────
+# Placed at the true end of the file, past every other symbol, so adding it shifts no line
+# number a doc already cites by number (`docs/brief-conventions.md` "Name symbols, never
+# lines" — this module is one of several a doc cites into).
+from dataclasses import dataclass as _dataclass
+
+#: Stable reason code for `EngineRefusal.code` below. A host keys on this string (the same
+#: discipline `tex_checkpoint.REFUSE_*` already documents for `GateRefusal`) — the human
+#: message beside it is free to be reworded, the code is not.
+REFUSE_OUT_OF_MEMORY = "out-of-memory"
+
+
+@_dataclass(frozen=True, slots=True)
+class EngineRefusal:
+    """Why a bare `tex_engine.cook()`/`run()` call raised, spelled out — additional DATA
+    attached to the SAME exception object, never a replacement for it (HOOK-3-style: mirrors
+    `tex_checkpoint.GateRefusal`'s `(code, stage, message)` shape so a host that already reads
+    one knows how to read the other).
+
+    `tex_node.py` (the ComfyUI adapter) has always re-raised an out-of-memory condition
+    UNWRAPPED so ComfyUI's own `is_oom` handling fires — that contract is unchanged and this
+    class changes nothing about it. The gap this closes is for the OTHER caller of
+    `tex_engine.cook()`/`run()` (ENG-1's host-agnostic entry point): until now, when
+    `tex_engine._dispatch_tier`'s ENG-2 OOM ladder gave up, the raw torch OOM exception
+    propagated with nothing TEX-specific on it, so a second host could only detect "this was
+    OOM" by re-implementing `_is_oom_error`'s own logic. Reading
+    `getattr(exc, "tex_refusal", None)` off the exception `_dispatch_tier` raises is the
+    additive alternative: the exception's type, message and identity are all unchanged, so
+    nothing that already catches it (including `tex_node.py`) sees any difference. Lives
+    here, not in `tex_engine.py` (which re-exports both names), because this is the shared
+    OOM-plumbing seam every consumer already imports, and `tex_engine.py` sits at its
+    ENG-14 headroom floor with no room for a new class."""
+
+    code: str
+    stage: int | None
+    message: str
+
+
+def _attach_refusal(exc: BaseException, oom: BaseException) -> None:
+    """Tag `exc` (and, if different, the OOM instance found in its `__cause__` chain) with an
+    `EngineRefusal` — best-effort: an exception object that refuses the attribute (some
+    C-extension types define `__slots__`) must not stop the OOM from propagating."""
+    refusal = EngineRefusal(REFUSE_OUT_OF_MEMORY, None,
+                            "TEX ran out of memory and its recovery ladder could not "
+                            "free enough to retry this cook.")
+    for target in {exc, oom}:   # a set of 1 when e IS the oom instance (the common case)
+        try:
+            target.tex_refusal = refusal
+        except Exception:
+            pass

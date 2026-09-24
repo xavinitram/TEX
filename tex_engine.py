@@ -92,7 +92,9 @@ from .tex_marshalling import (
     PlanesValue as _PlanesValue,
 )
 from .tex_runtime.host import (get_host_services, CookCancelled,
-                               _cancel_check, _report_progress)
+                               _cancel_check, _report_progress,
+                               _attach_refusal, EngineRefusal,  # v0.42 HOSTAUDIT-4a
+                               REFUSE_OUT_OF_MEMORY)             # noqa: F401 (re-export)
 # PROF-1: the cost profiler. Disarmed by default — the default cook path's whole cost is the
 # one `enabled()` call in run(). See tex_runtime/profile.py's invariant-#7 note.
 from .tex_runtime import profile as _profile
@@ -1373,48 +1375,3 @@ def cook(code: str, bindings: dict, **kwargs) -> CookResult:
     RAW (no clamp / alpha-drop / gray-expand — apply an egress profile for that; ENG-3).
     """
     return run(prepare(code, bindings, **kwargs))
-
-
-#: v0.42 HOSTAUDIT-4a: stable reason code for `EngineRefusal.code` below. A host keys on
-#: this string (the same discipline `tex_checkpoint.REFUSE_*` already documents for
-#: `GateRefusal`) — the human message beside it is free to be reworded, the code is not.
-REFUSE_OUT_OF_MEMORY = "out-of-memory"
-
-
-@dataclass(frozen=True, slots=True)
-class EngineRefusal:
-    """Why a bare `tex_engine.cook()`/`run()` call raised, spelled out — additional DATA
-    attached to the SAME exception object, never a replacement for it (HOOK-3-style: mirrors
-    `tex_checkpoint.GateRefusal`'s `(code, stage, message)` shape so a host that already reads
-    one knows how to read the other).
-
-    `tex_node.py` (the ComfyUI adapter) has always re-raised an out-of-memory condition
-    UNWRAPPED so ComfyUI's own `is_oom` handling fires — that contract is unchanged and this
-    class changes nothing about it. The gap this closes is for the OTHER caller of `cook()`/
-    `run()` above (ENG-1's host-agnostic entry point): until now, when `_dispatch_tier`'s
-    ENG-2 OOM ladder gave up, the raw torch OOM exception propagated with nothing TEX-specific
-    on it, so a second host could only detect "this was OOM" by re-implementing
-    `_is_oom_error`'s own logic. Reading `getattr(exc, "tex_refusal", None)` off the exception
-    `_dispatch_tier` raises is the additive alternative: the exception's type, message and
-    identity are all unchanged, so nothing that already catches it (including `tex_node.py`)
-    sees any difference. Defined at the bottom of the module, not beside `_dispatch_tier`,
-    purely to avoid shifting every line number below it that a doc cites (`docs/brief-
-    conventions.md` "Name symbols, never lines" — this module is cited by several)."""
-
-    code: str
-    stage: int | None
-    message: str
-
-
-def _attach_refusal(exc: BaseException, oom: BaseException) -> None:
-    """Tag `exc` (and, if different, the OOM instance found in its `__cause__` chain) with an
-    `EngineRefusal` — best-effort: an exception object that refuses the attribute (some
-    C-extension types define `__slots__`) must not stop the OOM from propagating."""
-    refusal = EngineRefusal(REFUSE_OUT_OF_MEMORY, None,
-                            "TEX ran out of memory and its recovery ladder could not "
-                            "free enough to retry this cook.")
-    for target in {exc, oom}:   # a set of 1 when e IS the oom instance (the common case)
-        try:
-            target.tex_refusal = refusal
-        except Exception:
-            pass
