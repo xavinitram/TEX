@@ -813,13 +813,25 @@ def trim_reserved_pool(device, spatial_px: int = 0) -> None:
         pass
 
 
-def _shared_dim_size(bindings, dim: int, min_ndim: int) -> int | None:
+def _shared_dim_size(bindings, dim: int, min_ndim: int,
+                     non_spatial: frozenset = frozenset()) -> int | None:
     """The single size shared by every tensor binding on axis `dim` that isn't a broadcast
     singleton (size 1), or None when zero or >1 distinct sizes qualify (heterogeneous inputs
     can't be co-strided). Backs both `shared_tile_height` (dim 1) and `shared_batch_size`
-    (dim 0)."""
-    sizes = {v.shape[dim] for v in bindings.values()
-             if isinstance(v, torch.Tensor) and v.dim() >= min_ndim and v.shape[dim] > 1}
+    (dim 0).
+
+    `non_spatial` (TRK-163) excludes a binding NAME from the size scan entirely — a
+    `[N,N,N,3]` LUT bound at a registered non-spatial argument position (`apply_lut3d`'s
+    `@LUT`) is dim>=3 like an image, and when its own N coincidentally equals a real
+    image's H (or B), the LUT's size collapses into the SAME candidate set instead of
+    adding a second one, so the "heterogeneous inputs can't be co-strided" refusal never
+    fires. Excluding it here is the same move `_consensus_extent` already makes for the
+    same reason (`tex_runtime/interpreter.py`); the default empty set keeps every
+    pre-existing caller's answer unchanged for a program that binds no non-spatial
+    argument."""
+    sizes = {v.shape[dim] for name, v in bindings.items()
+             if name not in non_spatial and isinstance(v, torch.Tensor)
+             and v.dim() >= min_ndim and v.shape[dim] > 1}
     return next(iter(sizes)) if len(sizes) == 1 else None
 
 
@@ -840,12 +852,14 @@ def _cook_whole(interp, program, bindings, type_map, device, latent_channel_coun
                           cancel=cancel, on_progress=on_progress)
 
 
-def shared_tile_height(bindings) -> int | None:
+def shared_tile_height(bindings, non_spatial: frozenset = frozenset()) -> int | None:
     """M-4: the single image height shared by every spatial (dim>=3) binding that
     isn't a broadcast singleton (shape[1]==1), or None when zero or >1 distinct
     heights qualify (heterogeneous inputs can't be co-tiled). One source of truth
-    for both the tile PLAN (`_tile_plan`) and the tile EXECUTOR (`run_tiled`)."""
-    return _shared_dim_size(bindings, 1, 3)
+    for both the tile PLAN (`_tile_plan`) and the tile EXECUTOR (`run_tiled`).
+
+    `non_spatial` (TRK-163) — see `_shared_dim_size`."""
+    return _shared_dim_size(bindings, 1, 3, non_spatial)
 
 
 def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
@@ -878,7 +892,13 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
     # through un-narrowed). Either would silently corrupt or shape-mismatch.
     if latent_channel_count:
         return _untiled()
-    H_total = shared_tile_height(bindings)
+    # TRK-163: a [N,N,N,3] LUT (or any other registered non-spatial binding) is dim>=3 like
+    # an image, and a coincidental N == H (or N == B in run_batch_strips below) must not let
+    # it enter the shared-height decision OR the per-strip narrow below — see
+    # `_shared_dim_size`'s docstring for why the coincidence is otherwise invisible to it.
+    from .tex_runtime.interpreter import _non_spatial_names_cached
+    non_spatial = _non_spatial_names_cached(program) if program is not None else frozenset()
+    H_total = shared_tile_height(bindings, non_spatial)
     if H_total is None:
         return _untiled()
     bounds = [(i * H_total) // n_strips for i in range(n_strips)] + [H_total]
@@ -890,7 +910,9 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
         _cancel_check(cancel)               # SCHED-3 yield F: abort a stale cook between strips
         strip_bindings = {}
         for name, v in bindings.items():
-            if isinstance(v, torch.Tensor) and v.dim() >= 3 and v.shape[1] == H_total:
+            if name in non_spatial:
+                strip_bindings[name] = v    # TRK-163: passed whole, never sliced
+            elif isinstance(v, torch.Tensor) and v.dim() >= 3 and v.shape[1] == H_total:
                 strip_bindings[name] = v.narrow(1, y0, y1 - y0)
             else:
                 strip_bindings[name] = v
@@ -920,11 +942,13 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
     return outputs
 
 
-def shared_batch_size(bindings) -> int | None:
+def shared_batch_size(bindings, non_spatial: frozenset = frozenset()) -> int | None:
     """ROI-6: the single batch size (dim 0) shared by every batched binding that isn't a
     broadcast singleton (shape[0]==1), or None when zero or >1 distinct sizes qualify. The
-    batch-axis twin of `shared_tile_height`."""
-    return _shared_dim_size(bindings, 0, 1)
+    batch-axis twin of `shared_tile_height`.
+
+    `non_spatial` (TRK-163) — see `_shared_dim_size`."""
+    return _shared_dim_size(bindings, 0, 1, non_spatial)
 
 
 def run_batch_strips(interp, program, bindings, type_map, device, latent_channel_count,
@@ -947,7 +971,12 @@ def run_batch_strips(interp, program, bindings, type_map, device, latent_channel
                            output_names, used_builtins, precision, time_context,
                            cancel, on_progress, viewer_context=viewer_context)
 
-    B_total = shared_batch_size(bindings)
+    # TRK-163: see run_tiled's own comment above — a registered non-spatial binding (e.g. a
+    # LUT) must not enter the shared-batch decision or the per-strip narrow below just
+    # because its own leading dim coincidentally equals B_total.
+    from .tex_runtime.interpreter import _non_spatial_names_cached
+    non_spatial = _non_spatial_names_cached(program) if program is not None else frozenset()
+    B_total = shared_batch_size(bindings, non_spatial)
     if B_total is None or B_total < 2:
         return _whole()
     n_strips = max(1, min(n_strips, B_total))
@@ -971,7 +1000,9 @@ def run_batch_strips(interp, program, bindings, type_map, device, latent_channel
         _cancel_check(cancel)               # SCHED-3 yield F: abort between batch strips
         strip_bindings = {}
         for name, v in bindings.items():
-            if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_total:
+            if name in non_spatial:
+                strip_bindings[name] = v          # TRK-163: passed whole, never sliced
+            elif isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_total:
                 strip_bindings[name] = v.narrow(0, f0, f1 - f0)
             else:
                 strip_bindings[name] = v          # broadcast singleton / scalar passes through
