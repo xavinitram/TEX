@@ -37,7 +37,8 @@ from ..tex_compiler.ast_nodes import (
     try_extract_static_range,
     iter_child_nodes as _iter_child_nodes,
 )
-from .interpreter import (Interpreter, _collect_identifiers, _non_spatial_names_cached)
+from .interpreter import (Interpreter, _collect_identifiers, _non_spatial_names_cached,
+                          _reads_host_context_cached)
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 
 logger = logging.getLogger("TEX.graphed")
@@ -316,7 +317,14 @@ def _host_context_calls(program: Program) -> frozenset[str]:
     accessor over `interpreter._READS_MEMO`: that memo's `_reads_host_context_cached`
     already gives `_capturable` the BOOL it needs, and adding the name set there would
     change a shared memo entry's shape for a caller only the capture path (once per new
-    key, never the replay hot path) has. Same walk shape as `_capturable`'s own."""
+    key, never the replay hot path) has. Same walk shape as `_capturable`'s own.
+
+    v042-graph (simplify): short-circuits on `_reads_host_context_cached(program)` — the
+    SAME per-program memo (`interpreter._READS_MEMO`), so the common case (a program that
+    calls no host-context builtin at all) costs one memo lookup instead of a second full
+    AST walk over a program this module already knows the answer for."""
+    if not _reads_host_context_cached(program):
+        return frozenset()
     from .stdlib_registry import host_context_names
     names = host_context_names()
     if not names:
