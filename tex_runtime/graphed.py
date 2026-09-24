@@ -37,8 +37,7 @@ from ..tex_compiler.ast_nodes import (
     try_extract_static_range,
     iter_child_nodes as _iter_child_nodes,
 )
-from .interpreter import (Interpreter, _collect_identifiers, _non_spatial_names_cached,
-                          _reads_host_context_cached)
+from .interpreter import (Interpreter, _collect_identifiers, _non_spatial_names_cached)
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 
 logger = logging.getLogger("TEX.graphed")
@@ -269,17 +268,23 @@ def _capturable(program: Program, *, _masked_flow: "bool | None" = None) -> tupl
     one frame, with no error. Unlike a sync, capture would SUCCEED and be wrong, so this
     is the one blocker that has to be caught statically or not at all. (Feeding them as
     static input buffers copied per replay is the real fix; it needs the capture plumbing
-    to own the buffer, so it waits for a host that has a playhead at all.)
+    to own the buffer, so it waits for a host that has a playhead at all — still true for
+    THESE names: no host has a playhead yet, so there is nothing to feed. See v042-graph
+    below for the pair that now has exactly that fix.)
 
-    PM-11 (simplify): `viewer_exposure()`/`viewer_gamma()` are the FunctionCall-shaped twin
-    of that same bar — checked up front via `_reads_host_context_cached` (one memoized
-    `_READS_MEMO` lookup, the same registry-derived answer `stdlib_registry.
-    host_context_names()` backs) rather than inline per-node in the walk below: the
-    question is whole-program ("does it call ANY registered host-context builtin
-    anywhere"), not incremental, so asking it once up front is both cheaper on a repeat
-    capture attempt (memo hit) and reads as the single-owner check it is."""
-    if _reads_host_context_cached(program):
-        return (False, 0)
+    v042-graph: `viewer_exposure()`/`viewer_gamma()` (registered host-context builtins,
+    `stdlib_registry.host_context_names()`) used to be barred here the same way, by the
+    SAME reasoning as `frame`/`fps`/`time` above — a captured replay never calls Python
+    again, so it would keep re-serving whatever value was read at capture. Unlike
+    frame/time, this pair now HAS the fix the paragraph above describes: `GraphedProgram`
+    owns one persistent per-replay buffer per host-context name the program calls
+    (`_host_context_calls` below), seeded at capture and refreshed with `copy_()`/
+    `fill_()` in `_stage()` before every later `.replay()` — exactly the static-input-
+    buffer mechanism `static_bindings` already uses for ordinary wire bindings, extended
+    to a builtin that has no wire binding at all. So this walk no longer bars a program
+    for calling one: a `FunctionCall` to `viewer_exposure`/`viewer_gamma` is not in
+    `_SYNC_STDLIB` and is not an `Identifier` in `_TIME_BUILTIN_NAMES`, so it falls
+    through to the ordinary op-counting branch below like any other stdlib call."""
     from .compiled import _OP_TYPES   # lazy: canonical op-type set, avoids import cycle
     from .interpreter import _TIME_BUILTIN_NAMES
     ops = 0
@@ -301,6 +306,29 @@ def _capturable(program: Program, *, _masked_flow: "bool | None" = None) -> tupl
     if _masked_flow_syncs(program, _masked_flow):
         return (False, 0)
     return (True, ops)
+
+
+def _host_context_calls(program: Program) -> frozenset[str]:
+    """v042-graph: the registered host-context builtin NAMES (`stdlib_registry.
+    host_context_names()`, e.g. `viewer_exposure`/`viewer_gamma`) this program actually
+    calls — only `GraphedProgram.capture` needs this (to size one persistent per-replay
+    buffer per name actually used), so it is its own small walk rather than a fourth
+    accessor over `interpreter._READS_MEMO`: that memo's `_reads_host_context_cached`
+    already gives `_capturable` the BOOL it needs, and adding the name set there would
+    change a shared memo entry's shape for a caller only the capture path (once per new
+    key, never the replay hot path) has. Same walk shape as `_capturable`'s own."""
+    from .stdlib_registry import host_context_names
+    names = host_context_names()
+    if not names:
+        return frozenset()
+    found: set[str] = set()
+    stack = list(program.statements)
+    while stack:
+        n = stack.pop()
+        if n.__class__ is FunctionCall and n.name in names:
+            found.add(n.name)
+        stack.extend(_iter_child_nodes(n))
+    return frozenset(found)
 
 
 def _spatial_px(bindings, program=None) -> int:
@@ -382,6 +410,10 @@ class GraphedProgram:
         self.graph: Any = None
         self.interp = Interpreter()          # dedicated (private builtins cache)
         self.static_bindings: dict[str, Any] = {}
+        # v042-graph: one persistent 0-dim buffer per host-context builtin name this
+        # program actually calls (empty for every program that calls none — the common
+        # case, and exactly invariant 7: nothing below touches these when this is {}).
+        self.static_host_context: dict[str, torch.Tensor] = {}
         self.static_outputs: Any = None      # tensor or dict of tensors
         self.output_names: list[str] | None = None
         self.bytes = 0
@@ -390,7 +422,7 @@ class GraphedProgram:
         # later budget eviction, so eviction stays surgical instead of nuking graphs.
         self.pinned_entries: list = []
 
-    def _stage(self, bindings: dict[str, Any]) -> None:
+    def _stage(self, bindings: dict[str, Any], viewer_context: dict | None = None) -> None:
         """Copy the current cook's inputs into the static staging buffers."""
         for name, buf in self.static_bindings.items():
             src = bindings.get(name)
@@ -404,6 +436,17 @@ class GraphedProgram:
                     buf.copy_(src, non_blocking=True)
                 else:
                     buf.fill_(float(src))
+        # v042-graph: refresh every host-context buffer with THIS replay's value — the
+        # step that makes a captured viewer program correct. The graph's baked-in
+        # kernels read this buffer's memory on every replay; nothing else ever changes
+        # what is in it between one replay and the next. No-op (the common case) when
+        # this program calls no host-context builtin. The `1.0` fallback is today's
+        # identity default shared by both registered names (`_viewer_value`'s own
+        # default) — a future host-context builtin with a different identity default
+        # would need this generalized alongside it.
+        for name, buf in self.static_host_context.items():
+            val = float((viewer_context or {}).get(name, 1.0))
+            buf.fill_(val)
 
     @staticmethod
     def _make_static(value, device, dtype):
@@ -424,11 +467,15 @@ class GraphedProgram:
         return torch.tensor(float(value), dtype=dtype, device=device)
 
     def capture(self, program, bindings, type_map, device, latent_channel_count,
-                output_names, precision, used_builtins) -> bool:
+                output_names, precision, used_builtins, viewer_context=None) -> bool:
         """Warm up, then capture. Returns True on success. HW-2: pin capture to the
         COOK's device — a cuda:1 cook must capture on cuda:1's stream, not whatever
         device happens to be current, else capture fails loudly and RNG-recovery runs
-        against the wrong generator (spuriously tripping the process-wide kill switch)."""
+        against the wrong generator (spuriously tripping the process-wide kill switch).
+
+        v042-graph: `viewer_context` seeds this capture's host-context buffer(s) — see
+        `_capture_inner`. Never part of `_capture_key` (the PM-11 ruling: a VALUE, not a
+        KEY), so it plays no part in whether an existing captured graph is reused."""
         global _CAPTURING
         _CAPTURING = True
         idx = _dev_index(device)
@@ -436,12 +483,12 @@ class GraphedProgram:
             with torch.cuda.device(idx):
                 return self._capture_inner(program, bindings, type_map, device,
                                            latent_channel_count, output_names,
-                                           precision, used_builtins)
+                                           precision, used_builtins, viewer_context)
         finally:
             _CAPTURING = False
 
     def _capture_inner(self, program, bindings, type_map, device, latent_channel_count,
-                       output_names, precision, used_builtins) -> bool:
+                       output_names, precision, used_builtins, viewer_context=None) -> bool:
         dtype = self.interp._PRECISION_DTYPES.get(precision, torch.float32) \
             if hasattr(self.interp, "_PRECISION_DTYPES") else torch.float32
         # Build static staging buffers for every binding.
@@ -453,12 +500,27 @@ class GraphedProgram:
             self.static_bindings[name] = b
         self.output_names = output_names
 
+        # v042-graph: one persistent buffer per host-context builtin this program calls
+        # (empty for the common case — a program that calls none). Seeded with THIS
+        # cook's value; `_stage()` overwrites it before every later replay, so the seed
+        # only matters for the warmup/record run below, which never leaves this method.
+        self.static_host_context = {
+            name: torch.scalar_tensor(float((viewer_context or {}).get(name, 1.0)),
+                                      dtype=dtype, device=device)
+            for name in _host_context_calls(program)
+        }
+
         def _run():
-            return self.interp.execute(
-                program, self.static_bindings, type_map, device=device,
-                latent_channel_count=latent_channel_count,
-                output_names=output_names, precision=precision,
-                used_builtins=used_builtins)
+            from . import stdlib_core as _stdlib_core
+            token = _stdlib_core._push_host_context_buffers(self.static_host_context)
+            try:
+                return self.interp.execute(
+                    program, self.static_bindings, type_map, device=device,
+                    latent_channel_count=latent_channel_count,
+                    output_names=output_names, precision=precision,
+                    used_builtins=used_builtins, viewer_context=viewer_context)
+            finally:
+                _stdlib_core._pop_host_context_buffers(token)
 
         # Warm up on a side stream (≥3 runs; UC-5 already gated fn_pow's probe).
         s = torch.cuda.Stream()
@@ -486,10 +548,10 @@ class GraphedProgram:
         self.pinned_entries = _snapshot_cache_tensors()
         return True
 
-    def replay(self, bindings: dict[str, Any]):
+    def replay(self, bindings: dict[str, Any], viewer_context: dict | None = None):
         """Stage inputs, replay, and clone outputs out (ComfyUI caches node
         outputs while the next replay overwrites the static buffer)."""
-        self._stage(bindings)
+        self._stage(bindings, viewer_context)
         with torch.cuda.device(self.key[1]):   # S5 (doc 33): replay on the COOK's device
             self.graph.replay()                #   index (key[1]), not the ambient current one
         out = self.static_outputs
@@ -569,9 +631,15 @@ def _under_memory_pressure(device=None) -> bool:
 
 def run_graphed(program, bindings, type_map, device, fingerprint,
                 latent_channel_count=0, output_names=None, precision="fp32",
-                used_builtins=None):
+                used_builtins=None, viewer_context=None):
     """Execute via a cached CUDA graph, or return None to fall back to the
-    interpreter. cuda-only; every failure path returns None."""
+    interpreter. cuda-only; every failure path returns None.
+
+    v042-graph: `viewer_context` is a VALUE (PM-11's ruling — never part of
+    `_capture_key`, so it plays no part in whether a captured graph is reused), fed to a
+    capturing/replaying `GraphedProgram` so a program calling `viewer_exposure()`/
+    `viewer_gamma()` can be captured at all; a caller with nothing to pass omits it and
+    every existing call site is unaffected."""
     global _graph_bytes
     if _graph_mode_disabled:
         return None
@@ -616,7 +684,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
     if gp is not None:
         _graph_cache.move_to_end(key)
         try:
-            out = gp.replay(bindings)
+            out = gp.replay(bindings, viewer_context)
             tier_trace.record("graph")
             return out
         except Exception as e:
@@ -635,7 +703,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
     gp = GraphedProgram(key)
     try:
         ok = gp.capture(program, bindings, type_map, dev, latent_channel_count,
-                        output_names, precision, used_builtins)
+                        output_names, precision, used_builtins, viewer_context)
     except Exception as e:
         ok = False
         logger.info("[TEX] CUDA-graph capture failed (%s); using interpreter.", e)
@@ -663,7 +731,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
         except Exception:
             pass
     try:
-        out = gp.replay(bindings)
+        out = gp.replay(bindings, viewer_context)
         tier_trace.record("graph")
         return out
     except Exception as e:

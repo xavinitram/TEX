@@ -21,6 +21,7 @@ from .stdlib_core import (
     _cook_device,
     _viewer_value,
     _uniform_dtype,
+    _host_context_buffer,
 )
 # ZERO_GUARD_EPS is bound by attribute lookup, not folded into the `from` import above: a
 # name bound by `from X import name` compiles a later `name.method(...)` call site WITHOUT
@@ -325,10 +326,17 @@ class _StdlibColor:
     # `time`, which not `env`-cached because they ANIMATE): reads it fresh every call
     # through this ordinary `_fns[name]` dispatch, so the emitted `_tex_src` never embeds a
     # value and a viewer tweak alone cannot move the compile fingerprint or reopen a
-    # `_compiled_cache`/dynamo entry. CUDA-graph capture is the one tier that DOES bake a
-    # value into a replay buffer (the class ENG-7's own comment names), so `graphed._capturable`
-    # bars it — same bar, same reason, via the registry's `reads_host_context` field below
-    # (declared once here, derived everywhere: `stdlib_registry.host_context_names()`).
+    # `_compiled_cache`/dynamo entry.
+    # v042-graph: CUDA-graph capture used to be barred outright for either name (the same
+    # class ENG-7's own comment names — a replay re-serves whatever value Python read at
+    # capture time). It is capturable now: `graphed.GraphedProgram` owns one persistent
+    # per-replay buffer per host-context name a captured program calls, and
+    # `_host_context_buffer` below returns THAT buffer (checked first) while a capture's
+    # warmup/record run is in flight, instead of building a fresh tensor from
+    # `_viewer_value`. Outside a capture it is always `None` and this is exactly the
+    # pre-v042-graph body. `stdlib_registry.host_context_names()` (declared once here via
+    # the registry's `reads_host_context` field, derived everywhere) is still what tells
+    # `graphed._host_context_calls` which buffer(s) a given program needs.
     # `viewer_gamma()`'s own value is a POW exponent once composed downstream and the
     # exposure a multiplicative gain — both host-supplied and bounded by nothing (frame/
     # time's own reasoning), so both are registered in `stdlib_registry.FP16_FRAGILE`.
@@ -344,7 +352,13 @@ class _StdlibColor:
         """PM-11: a 0-dim tensor on the cook's device, in the cook's working dtype (an
         ordinary VALUE builtin, unlike the fp32-forced coordinate/shape builtins — this
         multiplies image lineage directly, so it belongs in the same dtype as the pixels
-        it scales). 1.0 (identity) when no host supplied a viewer_context."""
+        it scales). 1.0 (identity) when no host supplied a viewer_context.
+
+        v042-graph: a CUDA-graph capture's own persistent buffer, when one is installed,
+        wins over building a fresh tensor — see `_host_context_buffer`'s docstring."""
+        buf = _host_context_buffer("viewer_exposure")
+        if buf is not None:
+            return buf
         dt = _uniform_dtype() or torch.float32
         return torch.scalar_tensor(_viewer_value("viewer_exposure", 1.0),
                                    dtype=dt, device=_cook_device() or "cpu")
@@ -357,7 +371,11 @@ class _StdlibColor:
             ex='@OUT = vec4(pow(@A.rgb, vec3(1.0 / viewer_gamma())), 1.0);')
     @staticmethod
     def fn_viewer_gamma() -> torch.Tensor:
-        """PM-11: see fn_viewer_exposure — the same seam, the same no-op default."""
+        """PM-11: see fn_viewer_exposure — the same seam, the same no-op default, and
+        (v042-graph) the same capture-buffer check."""
+        buf = _host_context_buffer("viewer_gamma")
+        if buf is not None:
+            return buf
         dt = _uniform_dtype() or torch.float32
         return torch.scalar_tensor(_viewer_value("viewer_gamma", 1.0),
                                    dtype=dt, device=_cook_device() or "cpu")

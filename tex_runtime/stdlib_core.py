@@ -340,6 +340,49 @@ def _viewer_value(name: str, default: float) -> float:
     return float(ctx.get(name, default))
 
 
+# v042-graph: the CUDA-graph capture's per-replay static input buffers for host-context
+# builtins (`viewer_exposure`/`viewer_gamma` today; any future `reads_host_context=True`
+# builtin the same way). A SEPARATE thread-local attribute from `.viewer` above — never
+# touched by `set_cook_grid`/`restore_cook_ctx` — because it names a buffer IDENTITY that
+# `graphed.GraphedProgram` owns across the whole life of a captured key, not a per-cook
+# VALUE: it is pushed once around the capture's warmup+record run (the only time the
+# interpreter, and so a builtin, actually runs) and popped when that run ends. A later
+# `.replay()` never re-enters the interpreter at all — it refreshes the SAME buffer
+# tensors with `copy_()`/`fill_()` and replays the captured kernels, which read that
+# memory directly, so nothing needs to be pushed again for a replay to see a new value.
+#
+# Absent (None) for every ordinary cook — including every codegen/interpreter tier cook
+# that runs INSIDE a capture's warmup for a program the buffer doesn't cover — so the
+# fallback in `fn_viewer_exposure`/`fn_viewer_gamma` (build a fresh tensor from
+# `_viewer_value`) is exactly the pre-v042-graph behaviour and invariant 7 holds by
+# construction: a program this mechanism never touches sees no new code path at all.
+def _push_host_context_buffers(buffers: dict) -> "dict | None":
+    """Install `buffers` ({name: persistent 0-dim tensor}) for the duration of one capture
+    warmup/record run. Returns the previous value (normally None; nesting is defensive,
+    not expected) for `_pop_host_context_buffers`."""
+    prev = getattr(_cook_ctx, "host_context_buffers", None)
+    _cook_ctx.host_context_buffers = buffers
+    return prev
+
+
+def _pop_host_context_buffers(prev) -> None:
+    """Undo one `_push_host_context_buffers`."""
+    _cook_ctx.host_context_buffers = prev
+
+
+def _host_context_buffer(name: str) -> "torch.Tensor | None":
+    """The GraphedProgram-owned persistent buffer for host-context builtin `name`, if one
+    is installed right now (a capture's warmup/record run), else `None`. A builtin checks
+    this FIRST and falls back to its ordinary per-call tensor construction — the same
+    tensor object every call while installed, at a stable address, so whatever the graph
+    tier bakes into a captured kernel launch is this buffer's memory, never a fresh
+    allocation that a later replay (which never calls Python again) could not refresh."""
+    buffers = getattr(_cook_ctx, "host_context_buffers", None)
+    if buffers is None:
+        return None
+    return buffers.get(name)
+
+
 # Pre-allocated grid buffer for sample() — avoids torch.stack allocation per call.
 # Keyed by (B, H, W, device) → [B, H, W, 2] tensor.
 # Bounded via LRU eviction (each entry is ~16 MB at 1080p).

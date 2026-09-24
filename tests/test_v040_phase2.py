@@ -117,21 +117,26 @@ def test_pm11_fingerprint_and_cache_neutral(r: SubTestResult):
 
 
 def test_pm11_cuda_graph_declines(r: SubTestResult):
-    print("\n--- PM-11: cuda_graph capture bars viewer_exposure()/viewer_gamma() (same class as frame/time) ---")
+    print("\n--- PM-11/v042-graph: cuda_graph capture of viewer_exposure()/viewer_gamma() ---")
+    # v042-graph LANDED the follow-up PM-11's own hand-back pencilled ("Graph-capture
+    # exclusion: what it costs, and whether to pencil the fix" — yes): a viewer program is
+    # capturable now, fed via a per-replay static buffer (`tests/test_v042_graph.py` has
+    # the capture/replay/no-recapture proofs; this row stays here only to keep PM-11's own
+    # "same class as frame/time" comparison in one place, updated to the new verdict).
     plain = "@OUT = vec4(@A.rgb * 0.5, 1.0);"
     timed = "@OUT = vec4(@A.rgb * viewer_exposure(), 1.0);"
     bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
     fails = []
-    for code, expect_capturable, label in ((plain, True, "plain"), (timed, False, "viewer_exposure")):
+    for code, expect_capturable, label in ((plain, True, "plain"), (timed, True, "viewer_exposure")):
         prog = parse_and_split(code, bt)
         tm = TypeChecker(binding_types=bt, source=code).check(prog)
         got = _capturable(prog)[0]
         if got != expect_capturable:
             fails.append(f"{label}: _capturable={got}, expected {expect_capturable}")
     if fails:
-        r.fail("PM-11 cuda_graph bar", "; ".join(fails))
+        r.fail("PM-11/v042-graph cuda_graph bar", "; ".join(fails))
     else:
-        r.ok("a viewer_exposure() program is barred from CUDA-graph capture; a plain "
+        r.ok("a viewer_exposure() program is capturable (v042-graph); a plain "
              "program is unaffected")
 
 

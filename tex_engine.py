@@ -510,7 +510,8 @@ def _run_cuda_graph(ctx: ExecContext):
     try:
         out = run_graphed(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
                           latent_channel_count=ctx.latent_channel_count,
-                          output_names=ctx.output_names, used_builtins=ctx.used_builtins)
+                          output_names=ctx.output_names, used_builtins=ctx.used_builtins,
+                          viewer_context=ctx.viewer_context)  # v042-graph
     except Exception as _g_exc:
         _record_codegen_defect_fallback("cuda_graph", _g_exc)
         logger.warning("[TEX] cuda_graph path failed (%s); using interpreter.", _g_exc)

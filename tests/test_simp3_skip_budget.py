@@ -76,7 +76,14 @@ _SKIP_VOCAB = re.compile(
 #: vocabulary (a pass that measured nothing), which is what surfaced it. CI's lane is CPU-only,
 #: so this row skips there; no witness exists that proves the OOM ladder's tiled rung without a
 #: CUDA device to be short of memory on, so raising the pin is the honest move, not writing one.
-_SKIP_BUDGET = 102
+#: Re-pinned from 102 to 105 (v042-graph): `tests/test_v042_graph.py`'s three CUDA-graph
+#: capture/replay rows (`test_v042_viewer_replay_correctness`,
+#: `test_v042_viewer_no_recapture`, `test_v042_plain_program_unaffected`'s replay half) each
+#: need a real CUDA device to capture and replay a graph at all — there is no CPU witness
+#: for a `torch.cuda.CUDAGraph`, so an absent-CUDA run reports a genuine skip, not a
+#: reflex. The fourth new row (`test_v042_viewer_now_capturable`) needs no device — it
+#: drives the static AST gate (`graphed._capturable`) directly — and carries no `r.skip`.
+_SKIP_BUDGET = 105
 
 
 def _literal(node) -> str:
