@@ -1100,9 +1100,38 @@ class _CheckpointComp:
         self.device, self.src = device, src
 
 
+class InterpChainScrubScenario(Scenario):
+    """v0.42's ASK-shaped scenario (`docs/host-path-counts.md`'s "the interactive floor"):
+    the path an embedding host's own interactive tick actually runs, end to end — the
+    interpreter tier (`compile_mode="none"`, TEX's own default, never touched by this
+    scenario), unfused (one `tex_engine.cook` per stage, exactly as every scenario in this
+    file already drives it — none of them ever route through a fused chain), ROI-windowed,
+    fp32, with EVERY stage treated as an uncached node between the nearest cache and the
+    viewer. That last part is the one no scenario above combines with a moving window: an
+    embedding host's own caching policy does not memoize a cheap node at all, so on a real
+    interactive tick it re-cooks every uncached stage between the nearest cache and the
+    viewer, and `RoiComp.cook(use_cache=False)` is the comp's own honest setting for exactly
+    that claim (see its docstring — "forces every dirty stage to actually cook").
+
+    Both axes a real scrub moves, together: the viewport window pans (`_pan_roi`, never
+    revisiting a position — `PanScenario`'s own discipline) AND the terminal stage's
+    `$param` changes (`TerminalKnobScenario`'s own discipline) — on the SAME tick. No
+    existing scenario combines them: `pan` holds every param constant so the walk memo
+    hits, and `terminal`/`midgraph` hold the window still so the LAT-4 coordinate-builtin
+    LRU hits. Here neither memo can hit, `dirty_from=0` so the clean-prefix skip never
+    fires, and `use_cache=False` so the results-cache probe never fires either — the whole
+    ten-stage chain's fixed per-cook overhead is paid once per stage, every tick, which is
+    the shape TRK-64/TRK-65/TRK-72/TRK-84 each proved themselves against."""
+    name = "interp_chain_scrub"
+
+    def tick(self, comp, i):
+        comp.params["vignette"]["strength"] = 0.30 + self._seq(i) * 0.001
+        comp.cook(self._pan_roi(i), 0, use_cache=False)
+
+
 SCENARIOS = (PrewarmScenario, SourceEditScenario, TerminalKnobScenario,
              MidGraphKnobScenario, PanScenario, AllDirtyScenario, LintScenario,
-             NodeScrubScenario, CheckpointServeScenario)
+             NodeScrubScenario, CheckpointServeScenario, InterpChainScrubScenario)
 SCENARIO_NAMES = tuple(s.name for s in SCENARIOS)
 
 

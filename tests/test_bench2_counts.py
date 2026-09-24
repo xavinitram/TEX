@@ -322,13 +322,64 @@ _CHECKPOINT_SERVE = {
 }
 
 
+_INTERP_CHAIN_SCRUB = {
+    # v0.42's ASK-shaped scenario: an embedding host's interactive floor. Every stage is
+    # uncached (`use_cache=False`), the window pans AND the terminal `$param` moves on the
+    # SAME tick — no memo above ever sees both misses together. This is the scenario
+    # TRK-64/TRK-65/TRK-72/TRK-84 each prove themselves against (see the CUDA table below
+    # for TRK-84's kernel/alloc delta).
+    "tex_engine.cook":          10,   # every stage is dirty AND uncached: all ten cook.
+    "TEXCache.compile_ast":      0,   # ANIM-1 across the whole chain.
+    "TEXCache.compile_tex":     10,
+    "TEXCache.fingerprint":     10,   # PERF-5 shape: 1 per cook, ten cooks.
+    "Lexer.tokenize":            0,   # PERF-1's parse memo: ten sources, all already parsed.
+    "Parser.parse":               0,
+    "tex_roi._fold_program":      1,  # PERF-1's memo, unmoved: nine stages' $param values are
+                                      # unchanged tick to tick, so their walk memo hits even
+                                      # though the WINDOW moved (`_walk`'s key carries param
+                                      # values, not the window); only the terminal stage's
+                                      # moved knob misses and re-folds. TRK-65's fix does not
+                                      # move THIS row — it makes that one miss's own
+                                      # region-dependence recheck a cached lookup
+                                      # (`_unfolded_region_independent`) instead of a fresh
+                                      # `_ControlFlowLint` fixed-point walk, visible in the
+                                      # frame counts, not this API row.
+    "tex_roi.roi_plan":          11,  # 10 engine plans (one per stage) + 1 host halo question.
+    "tex_roi.chain_windows":      1,  # one plan per tick, whatever the window.
+    "ResultCache.get":            0,  # `use_cache=False`: the cache tier is never probed —
+    "ResultCache.put":            0,  # the honest reading of "every node between the nearest
+    "results_cache.entries_added": 0, # cache and the viewer is uncached" (an embedding host's
+                                      # own caching policy, never TEX's to enforce).
+    "tex_memory.run_roi":         10, # every stage stayed on the ROI path.
+    "enforce_cache_budget":       10, # TRK-72: counted here, once per cook — ten times a
+                                      # tick, the largest per-tick multiplier any scenario in
+                                      # this file gives it. No cheaper implementation exists
+                                      # without changing eviction behaviour (see the tracker
+                                      # row); this is the count a future fix would move.
+    "_disown_inputs":            10,
+    "_tile_plan":                  0,  # 96^2/48^2 gate shape never crosses the tile threshold.
+    "_halo_tile_plan":             0,
+    "host.get_free_memory":       0,  # off CUDA the planners return before the query.
+    "lazy_required_bindings":     0,  # this path never reaches the lazy tier at all (RoiComp
+                                      # drives `tex_engine.cook` directly, like every other
+                                      # comp scenario — see `_NODE_SCRUB`'s own note on why
+                                      # that tier needs `forgive_dead_refs`).
+    "tex_checkpoint.cook_checkpointed": 0,
+    "tex_engine.boundary_lineage_key":   0,
+    "Interpreter._exec_stmt":    12,  # 12 statements across the ten stage programs — the
+                                      # same reading `_ALL_DIRTY` pins, for the same reason
+                                      # (all ten stages cook).
+}
+
+
 def test_bench2_interactive_per_tick_counts(r: SubTestResult):
     """The gate: the device-independent per-tick counts of the seven interactive paths."""
     print("\n--- BENCH-2: per-tick structural counts (CPU, PROF-1 disarmed) ---")
     for label, pins in (("terminal", _TERMINAL), ("midgraph", _MIDGRAPH), ("pan", _PAN),
                         ("all_dirty", _ALL_DIRTY), ("lint", _LINT),
                         ("node_scrub", _NODE_SCRUB),
-                        ("checkpoint_serve", _CHECKPOINT_SERVE)):
+                        ("checkpoint_serve", _CHECKPOINT_SERVE),
+                        ("interp_chain_scrub", _INTERP_CHAIN_SCRUB)):
         try:
             _check(r, label, _api_counts(label), pins)
         except Exception as e:
@@ -381,7 +432,7 @@ def test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r: SubTestResult
     reading that gives it teeth is in the CUDA test below."""
     print("\n--- BENCH-2: zero engine-side CUDA syncs per interactive tick ---")
     for label in ("terminal", "midgraph", "pan", "all_dirty", "node_scrub",
-                 "checkpoint_serve"):
+                 "checkpoint_serve", "interp_chain_scrub"):
         try:
             got = _api_counts(label)
             lo, hi = got.get("torch.cuda.synchronize[engine]", (None, None))
@@ -414,6 +465,10 @@ _CUDA_PINS = {
     # (96^2/48^2) — the served suffix is the terminal stage alone, resolution-independent in
     # KIND if not in exact device work, and both shapes agreed on this box.
     "checkpoint_serve": (6,        0,            4),
+    # v0.42 ASK: ten uncached stages cook every tick (the `all_dirty`-shaped ten cooks) AND
+    # the window pans every tick (the `pan`-shaped LAT-4 coordinate-builtin miss) on the SAME
+    # tick — the shape TRK-84's fix (this file's own follow-up commit) is measured against.
+    "interp_chain_scrub": (125,    0,            88),
 }
 # WHY THE D2H COLUMN IS NOW ZERO EVERYWHERE, AND WHAT WOULD MAKE IT NON-ZERO AGAIN.
 # `gauss_blur` needs a Python number for its kernel radius and used to get it with

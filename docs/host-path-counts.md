@@ -80,6 +80,7 @@ LAT-4 builtin LRU and reported 22 CUDA kernels for a pan tick that really costs 
 | `lint` | `tex_api.check` with a one-character edit per tick — no cook at all |
 | `node_scrub` | the ComfyUI **node**: two `check_lazy_status` rounds then `execute`, one `$param` moving |
 | `checkpoint_serve` | a checkpoint-serve tick on `tex_checkpoint.cook_checkpointed`: a linear chain with a settled cost table and a non-empty cut plan, the terminal stage's `$knob` moving, no window |
+| `interp_chain_scrub` | v0.42's "interactive floor": the window pans AND the terminal `$param` moves on the SAME tick, `use_cache=False` so every one of the ten stages is treated as uncached — the shape TRK-64/65/72/84 each prove themselves against |
 
 **Why the eighth is not a comp scenario (BENCH-3).** The seven above drive `tex_api` /
 `tex_engine` directly, and `tex_engine.prepare` consults the lazy analysis only when its caller
