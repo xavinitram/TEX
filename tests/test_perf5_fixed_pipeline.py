@@ -361,6 +361,48 @@ def test_perf5_one_lex_per_never_seen_program(r: SubTestResult):
                f"stream is no longer reaching `parse_and_split`")
 
 
+def test_trk73_one_fingerprint_per_program_in_prewarm(r: SubTestResult):
+    """TRK-73: `tex_api.prewarm` over the ten demo comp programs enters `TEXCache.fingerprint`
+    TEN times, not twenty.
+
+    At the base, `prewarm` computed the fingerprint itself (needed for the codegen sidecar key,
+    the background-compile key and the capturability verdict) and then called `compile()`,
+    which — same as any other caller with no `fp` to hand in — computed the identical string a
+    second time inside `compile_tex`. `compile()`'s own contract is unchanged (it still enters
+    `fingerprint` exactly once per call, whether or not the caller already had the value); only
+    `prewarm`'s redundant SECOND computation of its own already-known value is gone, via the
+    shared `tex_api._compile_impl(source, binding_types, fp=...)` both now go through."""
+    progs = [(code, {"IN": TEXType.VEC4}) for code in _comp_stage_sources()]
+    with cold_engine_state():
+        _clear_front_end_memos()
+        with _FpSpy() as s:
+            tex_api.prewarm(progs, device="cpu", compile_mode="none")
+        got = s.n
+    _clear_front_end_memos()
+    r.ok(f"prewarm over {len(progs)} never-seen programs: {got} TEXCache.fingerprint "
+         f"(one per program)") if got == len(progs) else \
+        r.fail("TRK-73 fingerprint count",
+               f"{got} TEXCache.fingerprint for {len(progs)} never-seen programs, expected "
+               f"{len(progs)} — one per program. Twenty means prewarm is computing it twice "
+               f"again (once itself, once inside compile()/compile_tex)")
+
+
+def test_trk73_compile_still_fingerprints_exactly_once(r: SubTestResult):
+    """The control for the row above: `tex_api.compile()` called directly (no `fp` in hand,
+    exactly like any other caller) must still enter `TEXCache.fingerprint` exactly once —
+    `prewarm`'s fix must not have been "stop computing it at all", only "stop computing it
+    TWICE"."""
+    with cold_engine_state():
+        _clear_front_end_memos()
+        with _FpSpy() as s:
+            tex_api.compile(_PROG, {"IN": TEXType.VEC4, "gain": TEXType.FLOAT})
+        got = s.n
+    _clear_front_end_memos()
+    r.ok("compile(): 1 TEXCache.fingerprint call") if got == 1 else \
+        r.fail("TRK-73 compile control",
+               f"tex_api.compile() entered TEXCache.fingerprint {got} times, expected 1")
+
+
 def test_perf5_a_claimed_stream_parses_to_the_same_program(r: SubTestResult):
     """The claimed tokens build the SAME AST as a private lex would, over the whole corpus.
 

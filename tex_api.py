@@ -122,6 +122,23 @@ class Program:
     source: str
 
 
+def _compile_impl(source: str, binding_types: dict, *, fp: str | None = None):
+    """Shared body of `compile()` and `prewarm()`'s per-program compile (TRK-73): the caller
+    may already hold `TEXCache.fingerprint(source, binding_types)` — `prewarm` needs the same
+    string again for the codegen sidecar, the background-compile key and the capturability
+    verdict — and handing it through here, exactly as `tex_engine.prepare` (LAT-2) already
+    forwards its own `fp` into `_compile_or_raise`, means the string is computed once and
+    passed down instead of once per caller. Returns `(Program, fp)` so a caller that did not
+    already have `fp` gets it back without a second `fingerprint()` call of its own."""
+    from . import tex_engine
+    from .tex_cache import get_cache
+    if fp is None:
+        fp = get_cache().fingerprint(source, binding_types)
+    ast, type_map, referenced, assigned, params, used_builtins = \
+        tex_engine._compile_or_raise(source, binding_types, fp=fp)
+    return Program(ast, type_map, referenced, assigned, params, used_builtins, source), fp
+
+
 def compile(source: str, binding_types: dict) -> Program:  # noqa: A001 (public name)
     """Compile TEX `source` to a `Program`. `binding_types` maps input binding names to
     their `TEXType`.
@@ -134,10 +151,8 @@ def compile(source: str, binding_types: dict) -> Program:  # noqa: A001 (public 
     raiser `prepare()` and the ComfyUI node also flow through) — so this delegates to it
     rather than re-knowing the tuple itself.
     """
-    from . import tex_engine
-    ast, type_map, referenced, assigned, params, used_builtins = \
-        tex_engine._compile_or_raise(source, binding_types)
-    return Program(ast, type_map, referenced, assigned, params, used_builtins, source)
+    program, _fp = _compile_impl(source, binding_types)
+    return program
 
 
 def execute(program: Program, bindings: dict, *, device: str = "cpu",
@@ -1233,8 +1248,12 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
     summary = {"programs": 0, "codegen": 0, "bg_compile": 0, "capturable": 0, "errors": 0}
     for source, binding_types in programs:
         try:
-            prog = compile(source, binding_types)
+            # TRK-73: compute the fingerprint ONCE and hand it into `_compile_impl`, which
+            # forwards it to `compile_tex` instead of that call recomputing its own — `compile()`
+            # itself still computes exactly one per call (via `_compile_impl(fp=None)`), so this
+            # moves the second of `prewarm`'s two calls, not just adds a third.
             fp = get_cache().fingerprint(source, binding_types)
+            prog, fp = _compile_impl(source, binding_types, fp=fp)
             summary["programs"] += 1
             try:                                   # 1. codegen fn → persisted .cg sidecar
                 if compiled._get_or_make_codegen_fn(prog.ast, prog.type_map, fp) is not None:
