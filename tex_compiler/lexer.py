@@ -213,6 +213,12 @@ class LexerError(Exception):
         self._end_col = end_col
         super().__init__(f"[{loc}] {message}")
 
+    @property
+    def code(self) -> str:
+        """The E-code string (e.g. "E1000") a host can key a notification on, without
+        reaching for the private `_code` this was built from (v0.42 HOSTAUDIT-4)."""
+        return self._code
+
     def _build_diagnostic(self):
         """Lazily build the diagnostic (only errors that surface need one)."""
         if self.diagnostic is not None:

@@ -88,6 +88,17 @@ class InterpreterError(Exception):
         prefix = f"[{loc}] " if loc else ""
         super().__init__(f"{prefix}{message}")
 
+    @property
+    def code(self) -> str:
+        """The E-code string (e.g. "E6000") a host can key a notification on, without
+        reaching for the private `_code` this was built from (v0.42 HOSTAUDIT-4). This is
+        the runtime error type the ComfyUI adapter and any embedding host already catch
+        (ENG-4's `TEXCompileError` covers the compile-time phases; each of ITS
+        `.diagnostics` entries already carries a public `.code` field, so only the four
+        exception TYPES — this one plus `LexerError`/`ParseError`/`TypeCheckError`, which
+        share this exact `_code` shape — lacked a public accessor)."""
+        return self._code
+
     def _build_diagnostic(self):
         if self.diagnostic is not None:
             return
