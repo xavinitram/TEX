@@ -5,6 +5,58 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.2] - 2026-09-24 — "Fenced, not flaky"
+
+A hardening patch: one CUDA correctness guard, two CodeQL-flagged regex fixes, and gate-hygiene
+cleanup so the fast tier stays honest about what it actually checks. `tex_api.LANGUAGE_VERSION`
+stays `"0.25"`; no compat freeze is owed. No default-path pixel changes.
+
+### Security
+
+- **An exponential-backtracking regular expression in the release gate's own summary parser is
+  fixed.** The pattern's count-word alternative could re-split the same digit run between two
+  overlapping character classes in exponentially many ways on an input that never reaches its
+  terminator, which CodeQL flagged. Restricted the count-word alternative to letters only (every
+  real count word is purely alphabetic) and removed the optional separator that let backtracking
+  re-try — there is now exactly one way to parse a match. `tools/gate.py` is not shipped surface;
+  every real summary shape it needs to parse is unchanged.
+- **A second, adjacent regex (a quadratic-backtracking redundant quantifier in a test's own
+  import-lint pattern) is fixed the same way** — dropping a quantifier that was already a strict
+  subset of the one beside it, a no-op on every string the pattern could ever match.
+
+### Fixed
+
+- **`ResultCache` now fences a restored (disk-spill → device) entry against a caller reading it
+  from a different CUDA stream.** The restore's non-blocking pinned host→device copy previously
+  carried no event; a caller on its own stream (an embedding host's own background thread, its
+  own `torch.cuda.Stream()`) had no ordering guarantee against it. `get()` now waits its own
+  current stream on a recorded CUDA event before handing back a just-restored tensor, entirely
+  GPU-side — never a host-blocking sync — and a resident (already-in-RAM) entry pays nothing
+  extra. **Stated plainly: this was not reproduced through `ResultCache` itself** — 0 mismatches
+  across 2080 stress trials, before and after. The hazard was demonstrated in an isolated
+  reproduction outside the class, and the fence closes a genuine gap in what `ResultCache` can
+  guarantee a multi-threaded caller, on the evidence available rather than on a live repro.
+- **The invariant-#7 import-lint canary is fixed and hardened.** Its pattern bracketed the name
+  it was checking for with literal control-byte characters instead of a word-boundary escape, so
+  it matched no real import line, ever, and had read as passing vacuously for an unknown time.
+  Fixed, plus one function-scoped, opt-in-only import the corrected canary now correctly flags
+  and a matching named allow-list entry (keyed by file and enclosing function, never a line
+  number) for the one call site confirmed unreachable from the default cook path.
+
+### Tooling (`tools/`, `tests/` only — no `tex_*` production module touched)
+
+- Wall-clock ratio/deadline assertions move behind a registered `timing` pytest marker and leave
+  every tier of the release gate — they measure something a reference-box sitting already owns,
+  not a correctness fact a fast tier should assert on a shared, variable-load box. Each gate leg
+  now prints how many `timing`-marked tests it deselected, so a silently-empty marker is visible
+  rather than assumed.
+- The fast tier now fails outright if a shared git stash exists, with a named rule and a way out
+  — the same shared-`refs/stash` hazard this project's own standing law already warns against,
+  now enforced mechanically rather than by discipline alone.
+- A per-program compile hang guard in the integration suite widened from 30s to 600s — the
+  slowest shipped example measured 49.9s standalone on a quiet box, so the old bound could trip
+  without any load at all, not only under contention.
+
 ## [0.42.1] - 2026-09-24 — "Paid once, not per cook"
 
 A repeat-measurement patch: the interpreter's cold first cook had regressed on the reference GPU
