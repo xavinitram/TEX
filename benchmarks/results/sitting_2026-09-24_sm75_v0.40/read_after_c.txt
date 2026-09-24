@@ -1,0 +1,39 @@
+﻿legs: ['v40_base_a3', 'v40_after_c', 'v40_base_a4']   (ratio = v40_base_a3/leg; >1 = leg faster)
+
+eight_config @512^2 ù per-config geomean | v40_after_c | v40_base_a4   [row min..max for last leg]
+  cpu_off_cold   |  0.979 n=125 |  1.003 n=125   [0.65..1.87]
+  cpu_off_warm   |  0.979 n=125 |  0.995 n=125   [0.65..1.51]
+  cuda_off_cold  |  0.950 n=125 |  1.008 n=125   [0.98..1.05]
+  cuda_off_warm  |  1.010 n=125 |  1.008 n=125   [0.95..1.04]
+  cpu_on_cold    |  0.995 n=139 |  0.993 n=139   [0.72..1.99]
+  cpu_on_warm    |  0.994 n=139 |  1.006 n=139   [0.73..2.45]
+  cuda_on_cold   |  0.993 n=139 |  0.998 n=139   [0.87..1.22]
+  cuda_on_warm   |  0.987 n=139 |  0.998 n=139   [0.87..1.29]
+
+roi_scrub | v40_base_a3 | v40_after_c | v40_base_a4  ratios vs v40_base_a3
+  whole                        |     1.7612 |     1.7681 |     1.7535   0.996  1.004
+  roi_fixed                    |     0.6496 |     0.6499 |     0.6454   1.000  1.007
+  roi_panning                  |     0.6466 |     0.6502 |     0.6447   0.994  1.003
+  roi_pan_param                |     0.8601 |     0.8688 |     0.8581   0.990  1.002
+
+param_scrub | v40_base_a3 | v40_after_c | v40_base_a4  ratios vs v40_base_a3
+  cold_ms                      |    46.9355 |    48.8544 |    49.2976   0.961  0.952
+  scrub_median_ms              |     0.3674 |     0.3736 |     0.3672   0.983  1.001
+  static_median_ms             |     0.3653 |     0.3720 |     0.3654   0.982  1.000
+  recook_median_ms             |     1.5503 |     1.5806 |     1.5474   0.981  1.002
+  scrub_max_after_warmup_ms    |     0.7606 |     0.7567 |     0.7288   1.005  1.044
+
+region_recook | v40_base_a3 | v40_after_c | v40_base_a4  ratios vs v40_base_a3
+  cuda/n50/2048/whole_all      |   171.2630 |   171.0310 |   170.9920   1.001  1.002
+  cuda/n50/2048/region_mid     |    16.9840 |    17.0330 |    16.9950   0.997  0.999
+  cpu/n50/2048/whole_all       |  1037.3400 |   900.8170 |   864.7910   1.152  1.200
+  cpu/n50/2048/region_mid      |   153.8580 |   157.7990 |   156.5270   0.975  0.983
+
+cookqueue | v40_base_a3 | v40_after_c | v40_base_a4  ratios vs v40_base_a3
+  solo_ms                      |     0.3680 |     0.3700 |     0.3590   0.995  1.025
+  queued_idle_ms               |     0.4270 |     0.4580 |     0.4240   0.932  1.007
+  preempt_to_first_stmt_ms     |     1.0130 |     0.9820 |     0.9920   1.032  1.021
+  queued_under_load_ms         |     1.2140 |     1.1960 |     1.2130   1.015  1.001
+
+counts_cuda - stable rows that differ from v40_base_a3
+  moved api/cuda rows: 0; moved frame rows (not listed): 23
