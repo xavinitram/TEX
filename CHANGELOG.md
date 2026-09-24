@@ -5,6 +5,40 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.1] - 2026-09-24 — "Paid once, not per cook"
+
+A repeat-measurement patch: the interpreter's cold first cook had regressed on the reference GPU
+since v0.40.0, found and fixed by comparing every release since against the same corpus on the
+same box. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze is owed. No default-path
+pixel changes. **No cache tier goes cold on this update** — neither fix below touches a watched
+compile-pipeline file.
+
+### Added
+
+- **A repeat-measurement sitting record on the reference GPU**, comparing the cold interpreter
+  first cook across v0.39.0 and v0.40.3, default whole-frame path. Verdict: neutral — the
+  default cook path shows no geomean or counts movement outside what an identical tree produces
+  against itself, and the counts re-prove on the same box. Its one finding, a cold-first-cook
+  regression, is fixed below.
+
+### Fixed
+
+- **The interpreter's cold first cook had regressed on the reference GPU since v0.40.0.** Two
+  costs were paid on every cold compile that should only ever be paid once: every program
+  re-walked its AST for non-spatial-argument bindings on its first execution, and that walk
+  itself rescanned the whole builtin registry to answer "does this call name a non-spatial
+  argument." The registry lookup is now cached (invalidated only when a new builtin is
+  registered, so a late registration is still seen). The AST walk itself is now skipped
+  entirely when the program's own source text names none of the (small, registry-derived)
+  non-spatial-argument builtin names — sound because TEX has no string-built calls, so a real
+  call to one of those builtins always spells its name verbatim in the source; a program that
+  does call one still walks, correctly, exactly as before. A fused, multi-stage chain's
+  interpreter-fallback path always passes no source (rather than one stage's source standing in
+  for the whole spliced program), so it always takes the safe, walking path — never skips
+  unsoundly. Measured on the reference GPU: cold first cook improves from 0.977 to 0.999 of
+  v0.39.0's baseline (two independent measurements). No `_AST_EPOCH` move, no default moved: no
+  cache tier goes cold on this update.
+
 ## [0.42.0] - 2026-09-24 — "The interactive floor"
 
 Per-cook fixed overhead on the interpreter scrub path, plus host-facing audits, ordered by an embedding
