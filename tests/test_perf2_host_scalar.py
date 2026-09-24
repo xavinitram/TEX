@@ -40,6 +40,7 @@ from helpers import *
 from failure_harness import run_tier
 from TEX_Wrangle.tex_runtime import interpreter as _interp
 from TEX_Wrangle.tex_runtime import stdlib as _stdlib
+from TEX_Wrangle.tex_runtime import stdlib_core as _stdlib_core
 from TEX_Wrangle.tex_runtime import stdlib_registry as _registry
 from TEX_Wrangle.tex_runtime import stdlib_sample as _ssample
 
@@ -91,15 +92,33 @@ def _devices():
 
 class _host_scalar_off:
     """Run the shipped code with `_host_scalar` answering None — which IS the base sha's
-    path, because every reader falls back to the exact expression it replaced."""
+    path, because every reader falls back to the exact expression it replaced.
+
+    TRK-170: `stdlib.py` re-exports `_host_scalar` (`from .stdlib_core import ...`), but
+    every builtin this file exercises resolves it through a DIFFERENT binding of the
+    same name, minted at each leaf module's own load time — `gauss_blur` /
+    `bilateral_filter` / `convolve` / `patch_dist` read `stdlib_sample.py`'s own
+    imported copy, and `erode` / `dilate` (via `_morph` -> `_to_float`) and
+    `sample_mip` (via `_sample_mip_trilinear`) read `stdlib_core.py`'s own defining
+    copy. Reassigning only `stdlib.<name>` leaves every one of those pointing at the
+    original function, so this now patches each leaf module's own binding by name —
+    the same fix `test_perf2_the_tag_carries_the_rounded_value` already applies to
+    `_tag_host_scalar` for one function, generalised to every module this file calls
+    into (grep `_host_scalar` across `tex_runtime/*.py` finds no third binding any
+    builtin in `_PROGRAMS` or `test_perf2_convolve_and_patch_dist_are_bit_exact`
+    reads)."""
+
+    _MODULES = (_stdlib, _ssample, _stdlib_core)
 
     def __enter__(self):
-        self._orig = _stdlib._host_scalar
-        _stdlib._host_scalar = lambda x: None
+        self._orig = {mod: mod._host_scalar for mod in self._MODULES}
+        for mod in self._MODULES:
+            mod._host_scalar = lambda x: None
         return self
 
     def __exit__(self, *exc):
-        _stdlib._host_scalar = self._orig
+        for mod, orig in self._orig.items():
+            mod._host_scalar = orig
         return False
 
 
