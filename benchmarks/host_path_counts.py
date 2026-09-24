@@ -1371,8 +1371,17 @@ def _frames_totals(flat: dict) -> dict:
     return out
 
 
-def compare(current: dict, baseline_path: str) -> int:
+def compare(current: dict, baseline_path: str, scenario=None) -> int:
     """Row-by-row EXACT diff over the rows that are STABLE on both sides.
+
+    `scenario`, when given (the CLI's `--scenario` names), restricts BOTH legs to
+    those scenario names before diffing — not just the current run. Without this, a
+    scenario ADDED since the baseline was saved arrives on the current side alone, its
+    rows read as `NEW ROW` and count toward the verdict, so a bare `--compare` against
+    a pre-change baseline returns rc 1 for a change that moved nothing on any EXISTING
+    scenario. `--scenario` already narrowed the current run (`run_all`'s `only=`); this
+    narrows the baseline the same way, so naming the scenarios the stored baseline
+    actually has is what the comparison is scoped to, on both sides, not just one.
 
     An unstable row cannot gate: its own reading disagrees with itself, so a difference
     against a baseline says nothing. It is reported as `unstable` and excluded from the
@@ -1398,6 +1407,10 @@ def compare(current: dict, baseline_path: str) -> int:
         bflat.update(_flatten(r))
     for r in cur_runs:
         cflat.update(_flatten(r))
+    if scenario:
+        scenario = set(scenario)
+        bflat = {k: v for k, v in bflat.items() if k.split("/")[1] in scenario}
+        cflat = {k: v for k, v in cflat.items() if k.split("/")[1] in scenario}
     changed, unstable, appeared, vanished = [], [], [], []
     for k in sorted(set(bflat) | set(cflat)):
         b, c = bflat.get(k), cflat.get(k)
@@ -1421,6 +1434,8 @@ def compare(current: dict, baseline_path: str) -> int:
           f"  cache {benv.get('tex_cache_dir') or '<unset>'} [{benv.get('tex_cache_warmth', '?')}]")
     print(f"  current : TEX {cenv.get('tex_version')} @ {str(cenv.get('tex_sha'))[:19]}"
           f"  cache {cenv.get('tex_cache_dir') or '<unset>'} [{cenv.get('tex_cache_warmth', '?')}]")
+    if scenario:
+        print(f"  --scenario filter applied to BOTH legs: {sorted(scenario)}")
     for note in _provenance_warnings(benv, cenv):
         print(f"  ! {note}")
 
@@ -1582,7 +1597,7 @@ def main(argv=None) -> int:
         if a.counters_only:
             print("\n  --counters-only: the verdict counts api + cuda rows; the frame census "
                   "is reported below it and never in the exit code.")
-        return compare(payload, a.compare)
+        return compare(payload, a.compare, scenario=set(a.scenario) if a.scenario else None)
     if a.counters_only and not a.compare:
         print("\n  --counters-only has no effect without --compare (it names a verdict rule).")
     return 0
