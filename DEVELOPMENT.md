@@ -22,7 +22,10 @@ TEX_Wrangle/
     diagnostics.py         # Structured error diagnostics (codes, carets, suggestions, hints)
     stdlib_signatures.py   # Function signatures for type checking
   tex_runtime/
-    interpreter.py         # Tree-walking tensor evaluator
+    interpreter.py         # Tree-walking tensor evaluator (core dispatch + hot eval path)
+    interpreter_spatial.py       # Spatial-context setup mixin (coord ramps, cached builtins)
+    interpreter_control_flow.py  # if/for/while execution mixin
+    interpreter_binding.py       # Variable/binding write execution mixin (assign, scatter write)
     stdlib.py              # Built-in function implementations (math, color, sampling, SDF, string, array)
     noise.py               # Procedural noise library (Perlin, Worley, FBM, curl, etc.)
     compiled.py            # torch.compile wrapper with backend cascade

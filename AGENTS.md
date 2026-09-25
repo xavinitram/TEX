@@ -204,9 +204,18 @@ Currently over the hard budget — status as of v0.37.0 (drift-checked by
 | Module | LOC | Status |
 |--------|-----|--------|
 | `tex_runtime/codegen.py` | ~3350 | STR-7 split **shipped** (4092→2731: `codegen_stdfns.py` / `codegen_stencil.py` / `codegen_persist.py` extracted). Docs 27/28 verdict: **stop here** — the remainder is one cohesive emitter; further splitting is aesthetic, not domain-driven. **Language 0.25 (L5) took it to 3312**, and it kept that verdict: the masked-emission leaf went to a new `codegen_masked.py` rather than into the emitter, which is the domain-driven cut the verdict asks for. CG-1's type-map liveness fix took it to ~3350. `tex_runtime/stdlib.py`'s planned split shipped as LIB-1: it is now a 126-line facade over `stdlib_core.py` and seven per-domain `stdlib_*.py` leaves, none near either budget |
-| `tex_runtime/interpreter.py` | ~3000 | STR-3/STR-4 **shipped** (`ExecContext` + shared `NodeVisitor` extracted); the residual is the core tree-walk, plus CF-6's `_consensus_extent` — the single owner of the cook-grid rule, which the codegen tier, `run_roi` and the test oracle all call |
 
-`tex_compiler/optimizer.py` (~1540) is over *soft*; STR-5 (the `PASSES` list) **shipped**.
+`tex_compiler/optimizer.py` (~1540) is over *soft*; STR-5 (the `PASSES` list) **shipped**. `tex_runtime/interpreter.py`
+(~1978, over *soft* only — SPLIT-I re-pinned it out of the hard-budget table above) had STR-3/STR-4's
+`ExecContext` + shared `NodeVisitor` extraction, then SPLIT-I (v0.44 Phase A1) took its planned split:
+the spatial-context setup (coordinate ramps, the LAT-4 cached builtins, ENG-7's time builtins) moved to
+`interpreter_spatial.py`, if/for/while execution to `interpreter_control_flow.py`, and variable/binding
+writes (assignment, channel/array-index writes, the scatter write) to `interpreter_binding.py` — each a
+mixin `Interpreter` still inherits (STR-7's pattern), so every call site keeps calling `self._method(...)`
+unchanged. The residual is the core tree-walk (`_eval`/`_exec_stmt` dispatch, the hot `_eval_binop` path,
+user-function calls) plus CF-6's `_consensus_extent` — the single owner of the cook-grid rule, which the
+codegen tier, `run_roi` and the test oracle all call — kept here because mutation rows anchor its exact
+text (`tests/mutation_check.py`).
 
 ## The registry archive (PUB-1 — the archive is the product)
 

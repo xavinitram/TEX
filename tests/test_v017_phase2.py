@@ -233,9 +233,14 @@ def test_doc5_examples_index(r: SubTestResult):
 # LIB-1 took `tex_runtime/stdlib.py`'s planned split — it is now the facade (126 LOC) over
 # seven domain leaves, none of which is anywhere near the hard budget, so it is re-pinned
 # DOWN out of this baseline per the ratchet's own stale-baseline rule below.
+# SPLIT-I (v0.44 Phase A1) took `tex_runtime/interpreter.py`'s planned split — the
+# spatial-context, control-flow and binding-write seams moved to
+# `interpreter_spatial.py` / `interpreter_control_flow.py` / `interpreter_binding.py`
+# (mixins `Interpreter` still inherits, STR-7's pattern), leaving it at 1978, so it is
+# re-pinned DOWN out of this baseline too.
 _LOC_HARD, _LOC_SOFT = 2000, 1500
 _OVER_HARD_BASELINE = frozenset({
-    "tex_runtime/codegen.py", "tex_runtime/interpreter.py",
+    "tex_runtime/codegen.py",
 })
 
 # ENG-14 — a named module's HEADROOM floor, asserted separately from the ratchet.

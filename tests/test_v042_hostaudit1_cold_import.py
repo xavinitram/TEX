@@ -32,9 +32,14 @@ import sys as _sys
 # Ratchets: TEX_MODS may only move DOWN (a future laziness win moves it), never up
 # (an eager import creeping back in). TORCH_MODS on the bare touch is the PORT-6
 # invariant itself and is pinned at the exact value, not a ceiling.
+# SPLIT-I (v0.44 Phase A1): `interpreter.py`'s mechanical split added three sibling
+# modules (`interpreter_spatial.py` / `interpreter_control_flow.py` /
+# `interpreter_binding.py`) that `Interpreter` composes as mixins, so all three must
+# still be imported eagerly at class-definition time — the same reason `masked_flow.py`
+# was already eager before this split. 44 -> 47, +1 per new module, nothing else moved.
 _BARE_TOUCH_TEX_MODULES_MAX = 1
 _BARE_TOUCH_TORCH_MODULES = 0
-_TEX_ENGINE_TEX_MODULES_MAX = 44
+_TEX_ENGINE_TEX_MODULES_MAX = 47
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:
