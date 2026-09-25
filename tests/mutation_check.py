@@ -319,9 +319,13 @@ MUTATIONS = [
      'def _uniform_grid():\n    return getattr(_cook_ctx, "grid", None)',
      'def _uniform_grid():\n    return None',
      ("test_v0341_audit",)),
+    # Re-anchored at v0.44 (SPLIT-I era, CANCEL-44): the seam grew a `cancel=cancel` kwarg,
+    # so the old anchor without it matched 0x and asserted nothing (MUT-1's own liveness
+    # check caught this). The mutation still drops the published grid to (None, None); the
+    # new `cancel` kwarg is preserved untouched, since it is not what this row pins.
     ('v0.34.1 D: the codegen tier stops publishing the grid', 'tex_runtime/codegen.py',
-     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device)',
-     '    _grid_token = _stdlib_set_cook_grid(None, None)',
+     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device, cancel=cancel)',
+     '    _grid_token = _stdlib_set_cook_grid(None, None, device=device, cancel=cancel)',
      ("test_v0341_audit",)),
     ('v0.34.1 E: the pool stops copying at its boundary', 'tex_provider.py',
      '    if not getattr(prov, "frames_are_owned", False):',
@@ -531,15 +535,17 @@ MUTATIONS = [
      '_SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy", "fi"))',
      '_SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy", "fi", "iw"))',
      ("test_codegen_value_parity",)),
+    # Re-anchored at v0.44 for the same reason as the D row above: the trailing call grew
+    # `cancel=cancel`. The mutation still drops the `_stage_vec_params` line alone.
     ('the invocation seam stops staging vec params (rank-1 $tint.r again)',
      'tex_runtime/codegen.py',
      '    _stage_vec_params(bindings, device, dtype)\n'
      '    if program is not None:\n'
      '        _stage_wire_scalars(bindings, device, dtype, cg_fn, program)\n'
-     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device)',
+     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device, cancel=cancel)',
      '    if program is not None:\n'
      '        _stage_wire_scalars(bindings, device, dtype, cg_fn, program)\n'
-     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device)',
+     '    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device, cancel=cancel)',
      ("test_codegen_value_parity",)),
     ('the vec-param staging drops the [1,1,1,C] reshape', 'tex_runtime/interpreter.py',
      '    if t.dim() == 1 and t.shape[0] in (2, 3, 4):\n'
