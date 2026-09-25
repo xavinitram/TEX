@@ -86,8 +86,18 @@ from TEX_Wrangle.tex_runtime.compiled import execute_compiled, clear_compiled_ca
 #: every row below read zero, so the two tests errored there and were green in any
 #: worktree. A second, hand-spelled copy of the harness's filter is what made that
 #: possible, so there is no second copy any more.
+#:
+#: GATE-DIR: the ARGUMENT above was still hand-spelled from THIS file's own `__file__`
+#: — a second guess at the package root, independent of the harness's own, and it goes
+#: wrong the same way: `Path(__file__).parents[1]` spells the checkout under whatever
+#: name pytest resolved THIS file through, which is not necessarily the `TEX_Wrangle`
+#: spelling every `from TEX_Wrangle.xxx import` statement actually resolves through
+#: (e.g. this file loaded from a checkout named `TEX`, profiled frames spelled via a
+#: `TEX_Wrangle` junction alongside it). The harness's own `_PKG_PREFIXES` is already
+#: anchored to the resolved `TEX_Wrangle` package, not to any file's load path — reuse
+#: it rather than re-derive a second, divergent guess.
 _counts = load_counts_harness()
-_PKG_PREFIXES = _counts.path_prefixes(str(Path(__file__).parents[1]))
+_PKG_PREFIXES = _counts._PKG_PREFIXES
 #: Bound once: `_hook` runs on every call event, so it may not do a lookup per frame.
 _package_relpath = _counts.package_relpath
 #: And the ONE qualified-name resolver, for the same reason a second copy of the path filter

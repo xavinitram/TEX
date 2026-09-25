@@ -130,6 +130,19 @@ from TEX_Wrangle import tex_api                               # noqa: E402
 from TEX_Wrangle.tex_compiler.types import TEXType            # noqa: E402
 from TEX_Wrangle.tex_testkit import cold_engine_state, armed_profiler   # noqa: E402  HOOK-4
 
+# GATE-DIR: `_PKG` above is THIS FILE's own directory, which can be spelled differently
+# from the one every `from TEX_Wrangle.xxx import` statement actually resolved through --
+# e.g. this file loaded by path from a checkout named `TEX` while `TEX_Wrangle` itself
+# resolves through a `TEX_Wrangle` junction alongside it (the ComfyUI `custom_nodes\`
+# layout). `path_prefixes(_PKG)` then covers the wrong two spellings (both `.../TEX/`,
+# since realpath of a plain directory that is not itself a junction is unchanged) and
+# every profiled frame -- spelled `.../TEX_Wrangle/...` -- reads as OUTSIDE the package:
+# a real assertion failure (every row counts 0), not a crash, so it went unnoticed until a
+# gate ran under the checkout's own name instead of through the junction. Re-anchor to
+# wherever `TEX_Wrangle` ACTUALLY resolved -- the one spelling every profiled module
+# shares, regardless of what this file's own loading path happened to spell.
+_PKG = os.path.dirname(os.path.abspath(tex_api.__file__))
+
 
 def path_prefixes(directory: str) -> tuple:
     """Every spelling a `co_filename` under `directory` can legitimately carry.
