@@ -176,9 +176,11 @@ def test_v033_xpu2_wait_is_idempotent_and_releases_the_source(r):
 # ── the two engine-owned consumers ────────────────────────────────────────────
 
 def test_v033_xpu2_spill_round_trips_through_the_handle(r):
-    """The spill path is one of exactly two consumers, and both are in `tex_results.py`. This
-    is the whole reason engine custody makes async egress admissible: the consumer list is
-    finite, in-repo, and reviewable — under ComfyUI it would be an arbitrary third-party node."""
+    """The spill path is one of exactly two consumers, and both live in the results engine's
+    own module family (`tex_results.py`, plus `tex_results_residency.py` — SPLIT-R's mixin
+    that `ResultCache` inherits, not a third-party file). This is the whole reason engine
+    custody makes async egress admissible: the consumer list is finite, in-repo, and
+    reviewable — under ComfyUI it would be an arbitrary third-party node."""
     devs = ["cpu"] + (["cuda"] if _has_cuda() else [])
     bad = []
     for dev in devs:
@@ -199,7 +201,18 @@ def test_v033_xpu2_spill_round_trips_through_the_handle(r):
 def test_v033_xpu2_is_engine_only(r):
     """Engine custody is the entire safety argument, so it is asserted as a source fact rather
     than a convention. The default ComfyUI path must be unable to reach a handle — and the
-    consumer list must stay short enough to review, which is why this counts them."""
+    consumer list must stay short enough to review, which is why this counts them.
+
+    SPLIT-R (v0.44) moved the CACHE-8 residency ladder out of `tex_results.py` into
+    `tex_results_residency.py` as a mixin (`_ResultCacheResidency`) that `ResultCache` still
+    inherits — the egress call that used to read `_spill`'s body now lives in the mixin file
+    instead, unchanged in every other respect. That is a file the split moved code OUT OF the
+    engine module, not a new consumer INTO it: `_ALLOWED_CONSUMERS` names it explicitly (not a
+    glob over `tex_results_*.py`, which would silently admit any future sibling — e.g.
+    `tex_results_keys.py`, NEG-6's key-minting leaf — the moment it happened to import
+    `streams`, with no one having decided that). Widening the allowed set is still the same
+    custody count (two, both engine-internal), never a loosening to "anything under
+    tex_results*"."""
     import pathlib
     root = pathlib.Path(__file__).resolve().parent.parent
     node = (root / "tex_node.py").read_text(encoding="utf-8")
@@ -208,10 +221,13 @@ def test_v033_xpu2_is_engine_only(r):
     # code. Match the names that only XPU-2 owns.
     leaked = [n for n in ("tex_runtime.streams", "FrameHandle", "streams.egress",
                           "unsafe_buffer") if n in node]
+    # The results engine's own module family: `tex_results.py` itself, plus SPLIT-R's
+    # `tex_results_residency.py` mixin. Named explicitly — see the docstring above.
+    _ALLOWED_CONSUMERS = ["tex_results.py", "tex_results_residency.py"]
     consumers = sorted(p.name for p in root.rglob("*.py")
                        if p.name not in ("streams.py",)
                        and "tests" not in p.parts and "benchmarks" not in p.parts
                        and "from .tex_runtime.streams import" in p.read_text(encoding="utf-8"))
-    ok = not leaked and consumers == ["tex_results.py"]
+    ok = not leaked and consumers == sorted(_ALLOWED_CONSUMERS)
     r.ok(f"XPU-2: engine-only — tex_node cannot reach it; consumers = {consumers}") if ok else \
         r.fail("XPU-2 custody", f"tex_node mentions {leaked}; consumers={consumers}")
