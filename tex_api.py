@@ -71,7 +71,26 @@ from .tex_session import EngineSession, default_session  # noqa: F401
 # `compile_mode="auto"` consults before it will even attempt a background compile (CC-4). Lives
 # in tex_runtime.compiled (the compiled tier's own module) and is re-exported here so a host
 # reads it off the one facade it already imports the rest of this surface from.
-from .tex_runtime.compiled import compile_capability  # noqa: F401
+#
+# LINT-46: NOT imported at module scope. `tex_runtime.compiled` imports torch (it's the
+# compiled-tier engine module), and `tex_api.py` is on `check()`'s import path — a
+# module-scope import here would force torch onto a pure-lint call that never compiles or
+# cooks anything. Resolved lazily instead (PEP 562 `__getattr__`, the PORT-6 / tex_runtime
+# pattern), so `tex_api.compile_capability` still resolves to the exact function
+# `tex_runtime.compiled` defines, on first access, and never before.
+_LAZY_NAMES = frozenset(("compile_capability",))
+
+
+def __getattr__(name):
+    if name in _LAZY_NAMES:
+        from .tex_runtime.compiled import compile_capability
+        globals()["compile_capability"] = compile_capability
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | _LAZY_NAMES)
 
 # LANG-3: the TEX LANGUAGE version — grammar + semantics — versioned SEPARATELY from the
 # package `__version__`. A program may declare the language level it targets with a leading
