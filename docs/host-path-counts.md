@@ -273,7 +273,7 @@ inner 13–17 µs of a 90–112 µs host call, which is why the seam is counted 
 driver (§6 item 6). PERF-6 took the tile planner's queries to **0** on every cooking scenario
 by sharing one live reading across a frame — and left `prewarm`'s **10** exactly where they
 were, because they are a DIFFERENT CALLER asking a different question:
-`tex_runtime/compiled.py::_cuda_headroom_ok` (`compiled.py:1020`), once per program, deciding
+`tex_runtime/compiled.py::_cuda_headroom_ok` (`compiled.py:1112`), once per program, deciding
 whether there is comfortable VRAM headroom (`free > 2 GB`) to submit a BACKGROUND compile. It
 wants a live reading precisely because it is about to start something that allocates, and a
 prewarm is a once-per-project cost rather than a per-frame one — so this row is 10 by design,

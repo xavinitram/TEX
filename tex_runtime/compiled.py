@@ -1297,6 +1297,18 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         autotier.record_trial(key, ms)
         return res
 
+    # CC-6: bounded trial convergence. A key that has been ELIGIBLE to compile (enough
+    # interpreter samples — should_submit_compile's own bar) for too long without reaching
+    # a terminal verdict is declined here rather than polled forever — whatever is holding
+    # it (the VRAM-headroom/capture-in-flight gate below still saying no every cook, or a
+    # backlog on the process-wide single-worker compile pool behind OTHER keys' own
+    # warm-ups/trials). See autotier.enforce_convergence_bound for the bound and its
+    # rationale. A best-effort reap of this key's own background future (if any) shrinks
+    # the window before it can be forgotten.
+    if autotier.enforce_convergence_bound(key):
+        _bg_status(cache_key)
+        return _codegen(bindings)
+
     # MEASURING or COMPILING (or TRIAL with a lost artifact): run the codegen
     # baseline, timed via the DEFERRED reader (LAT-3) so the measure window never
     # syncs on the interactive path; a None (prior sample not yet complete) just

@@ -293,3 +293,132 @@ def test_cc5_warm_call_failure_discards_the_artifact(r: SubTestResult):
         C._try_compile = orig_try_compile
         C._compiled_cache.pop(cache_key, None)
         C._bg_futures.pop(cache_key, None)
+
+
+# ── CC-6: bounded trial convergence ─────────────────────────────────────────
+
+def test_cc6_convergence_bound_state_machine(r: SubTestResult):
+    print("\n--- CC-6: enforce_convergence_bound state machine ---")
+    try:
+        AT.reset()
+        k = AT.make_key("cc6_fp", "cpu", "fp32", (1, 64, 64))
+        # Not yet eligible (no interp samples at all) -- the bound never applies.
+        assert AT.enforce_convergence_bound(k) is False
+        for _ in range(3):
+            AT.record_interp(k, 5.0)
+        assert AT.should_submit_compile(k) is True   # sets ready_wall, once
+        assert AT._get(k).ready_wall is not None
+        # Freshly eligible: nowhere near the bound yet.
+        assert AT.enforce_convergence_bound(k) is False
+        AT.mark_submitted(k)
+        assert AT.verdict(k) == AT.COMPILING
+        # Simulate elapsed wall time WITHOUT a real sleep.
+        AT._get(k).ready_wall -= (AT._CONVERGENCE_BOUND_S + 1.0)
+        assert AT.enforce_convergence_bound(k) is True
+        assert AT.verdict(k) == AT.REJECTED
+        # A terminal verdict is never re-touched by the bound (idempotent).
+        assert AT.enforce_convergence_bound(k) is False
+        r.ok("a key past the bound is forced REJECTED exactly once; terminal states are left alone")
+    except Exception as e:
+        r.fail("CC-6 state machine", str(e))
+
+
+def test_cc6_fast_key_never_bound_rejected(r: SubTestResult):
+    print("\n--- CC-6: a key that resolves fast is never touched by the bound ---")
+    try:
+        AT.reset()
+        k = AT.make_key("cc6_fast", "cpu", "fp32", (1, 64, 64))
+        for _ in range(3):
+            AT.record_interp(k, 10.0)
+        AT.should_submit_compile(k)
+        AT.mark_submitted(k)
+        AT.mark_ready(k)
+        AT.record_trial(k, 4.0)   # a fast, clear win
+        assert AT.verdict(k) == AT.COMMITTED
+        assert AT.enforce_convergence_bound(k) is False, (
+            "a terminal COMMITTED verdict must never be overturned by the bound")
+        r.ok("a fast-resolving key commits normally; the bound never fires for it")
+    except Exception as e:
+        r.fail("CC-6 fast key unaffected", str(e))
+
+
+def test_cc6_backlog_all_keys_eventually_terminal(r: SubTestResult):
+    """Models a multi-stage playback program in miniature: many keys become ELIGIBLE
+    (3 interp samples) but a gate (headroom/capture-in-flight, or a busy single-worker
+    queue) keeps saying no, so should_submit_compile never gets a successful submission
+    through for most of them. Without a bound those keys read "measuring" forever; with
+    it, every one of them reaches a terminal verdict once its own ready_wall clock runs
+    out -- proven here without any real sleep."""
+    print("\n--- CC-6: a whole backlog of keys reaches a terminal verdict, none stuck ---")
+    try:
+        AT.reset()
+        keys = [AT.make_key(f"cc6_stage{i}", "cpu", "fp32", (1, 2048, 2048)) for i in range(10)]
+        for k in keys:
+            for _ in range(3):
+                AT.record_interp(k, 5.0)
+            assert AT.should_submit_compile(k) is True   # eligible, but never actually submitted
+            assert AT.verdict(k) == AT.MEASURING, "still MEASURING until it is EITHER submitted or bounded"
+        # Time passes; the gate keeps saying no for all ten the whole time.
+        for k in keys:
+            AT._get(k).ready_wall -= (AT._CONVERGENCE_BOUND_S + 0.5)
+        fired = [AT.enforce_convergence_bound(k) for k in keys]
+        assert all(fired), fired
+        assert all(AT.verdict(k) == AT.REJECTED for k in keys)
+        r.ok("all ten backlogged keys reached a terminal verdict at the bound, none stuck 'measuring'")
+    except Exception as e:
+        r.fail("CC-6 backlog convergence", str(e))
+
+
+def test_cc6_wired_into_run_auto(r: SubTestResult):
+    """Integration: run_auto itself calls enforce_convergence_bound and routes to
+    codegen (never crashing, never re-entering the compile machinery) once a key's
+    ready_wall is stale -- exercised by rewinding time rather than by actually waiting
+    _CONVERGENCE_BOUND_S seconds. `_try_compile` is monkeypatched to an instant fake (no
+    sleep, no real torch.compile) so this stays a fast, deterministic test of the
+    WIRING, not a repeat of CC-5's own timing proof."""
+    print("\n--- CC-6: run_auto honours the convergence bound ---")
+    prog, tm, used = _tiny_program()
+    img = make_img(1, 10, 10, 3, seed=9)
+    fp = "cc6_run_auto_fp"
+    cache_key = (fp, "cpu", "fp32")
+
+    ref = Interpreter().execute(prog, {"A": img}, tm, device="cpu",
+                                output_names=["OUT"])["OUT"]
+
+    def fake_compiled_fn(program, bindings, type_map, device, latent_channel_count, output_names):
+        names = output_names or ["OUT"]
+        return {name: bindings["A"] for name in names}
+
+    def fake_try_compile(device_type, program, type_map, **kw):
+        return fake_compiled_fn, "inductor"
+
+    orig_try_compile = C._try_compile
+    orig_cap = C.compile_capability
+    C._try_compile = fake_try_compile
+    C.compile_capability = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
+    AT.reset()
+    C._compiled_cache.pop(cache_key, None)
+    C._bg_futures.pop(cache_key, None)
+    try:
+        for _ in range(3):
+            C.run_auto(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"], used_builtins=used)
+        sp = C._consensus_extent({"A": img}, prog)
+        key = AT.make_key(fp, "cpu", "fp32", sp)
+        assert AT.verdict(key) in (AT.COMPILING, AT.MEASURING, AT.TRIAL), AT.verdict(key)
+        st = AT._get(key)
+        assert st.ready_wall is not None
+        st.ready_wall -= (AT._CONVERGENCE_BOUND_S + 1.0)   # simulate elapsed time
+
+        out = C.run_auto(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"], used_builtins=used)
+        t = out["OUT"] if isinstance(out, dict) else out
+        assert (t - ref).abs().max().item() < 1e-4, "bound-rejected cook must still be codegen-correct"
+        assert AT.verdict(key) == AT.REJECTED, AT.verdict(key)
+        r.ok("run_auto forces REJECTED at the bound and keeps serving correct pixels")
+    except Exception as e:
+        r.fail("CC-6 run_auto wiring", str(e))
+    finally:
+        C._try_compile = orig_try_compile
+        C.compile_capability = orig_cap
+        C._compiled_cache.pop(cache_key, None)
+        C._bg_futures.pop(cache_key, None)
+        AT.reset()

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import time as _time
 from collections import OrderedDict, deque
 
 # Tunables ------------------------------------------------------------------
@@ -39,15 +40,34 @@ _COMMIT_RATIO = 0.9       # compiled must be <0.9x the interp median to commit
 _ROLL = 8                 # rolling window for medians (recent cooks only)
 _STATE_MAX = 512          # bound the in-memory table
 
+# CC-6: bounded trial convergence. A multi-stage program's keys were measured stuck at
+# "measuring" for well over a hundred wall-clock seconds at high resolution — several
+# keys becoming eligible to compile around the same time, all contending for the one
+# process-wide background-compile worker (`compiled.py`'s `_COMPILE_POOL`), so a key
+# whose OWN gate (VRAM headroom, no capture in flight) kept saying no, or whose own
+# submission sat queued behind others' warm-ups, never got a chance to even try. Past
+# this many wall-clock seconds since a key FIRST became eligible to compile
+# (should_submit_compile returning True — set once, in `ready_wall` below, and never
+# moved), whatever is blocking it, the key is declined rather than polled forever:
+# `enforce_convergence_bound` commits REJECTED itself, the same honest "couldn't reach
+# significance" a losing trial already gives. 30s comfortably covers ONE real
+# compile-then-verdict round trip (a dedicated measurement on a slower reference box
+# measured a genuine compile-then-reject round trip complete in ~27s wall) while
+# bounding the PER-KEY worst case to a small constant instead of the observed
+# multiplicative stall that scaled with how many other keys were ahead of it in the
+# same queue.
+_CONVERGENCE_BOUND_S = 30.0
+
 
 class _KeyState:
-    __slots__ = ("state", "interp_ms", "compiled_ms", "submitted")
+    __slots__ = ("state", "interp_ms", "compiled_ms", "submitted", "ready_wall")
 
     def __init__(self):
         self.state = MEASURING
         self.interp_ms: deque = deque(maxlen=_ROLL)
         self.compiled_ms: deque = deque(maxlen=_ROLL)
         self.submitted = False
+        self.ready_wall: float | None = None
 
 
 _STATE: "OrderedDict[tuple, _KeyState]" = OrderedDict()
@@ -114,8 +134,33 @@ def record_interp(key: tuple, ms: float) -> None:
 
 def should_submit_compile(key: tuple) -> bool:
     st = _get(key)
-    return (st.state == MEASURING and not st.submitted
-            and len(st.interp_ms) >= _MEASURE_COOKS)
+    ready = (st.state == MEASURING and not st.submitted
+             and len(st.interp_ms) >= _MEASURE_COOKS)
+    if ready and st.ready_wall is None:
+        # CC-6: the FIRST cook this key became eligible — never moved again, so the
+        # convergence bound below measures from "could have started", not from
+        # whichever cook actually got a submission through a busy gate.
+        st.ready_wall = _time.monotonic()
+    return ready
+
+
+def enforce_convergence_bound(key: tuple) -> bool:
+    """CC-6: force a terminal REJECTED verdict once `key` has been eligible to compile
+    (MEASURING/COMPILING/TRIAL, `ready_wall` set) for more than `_CONVERGENCE_BOUND_S`
+    wall-clock seconds without reaching one on its own. Returns True the one call that
+    fires the bound (the caller then routes to codegen, same as any other REJECTED key);
+    False every other call, including every call before a key is even eligible
+    (`ready_wall` stays `None` until `should_submit_compile` first returns True)."""
+    st = _get(key)
+    if st.state not in (MEASURING, COMPILING, TRIAL):
+        return False
+    if st.ready_wall is None:
+        return False
+    if _time.monotonic() - st.ready_wall < _CONVERGENCE_BOUND_S:
+        return False
+    st.state = REJECTED
+    _persist()
+    return True
 
 
 def mark_submitted(key: tuple) -> None:
