@@ -264,9 +264,10 @@ def test_port2_program_shape(r: SubTestResult):
     print("\n--- PORT-2: Program field-name stability (canary) ---")
     from TEX_Wrangle.tex_api import Program
     import dataclasses
-    # the CLI + future hosts depend on these names — a rename is a breaking change
+    # the CLI + future hosts depend on these names — a rename is a breaking change. TIMEREADS-45
+    # (v0.45) APPENDED time_reads, a derived read-only attribute — additive, not a rename.
     expected = ["ast", "type_map", "referenced", "assigned", "params",
-                "used_builtins", "source"]
+                "used_builtins", "source", "time_reads"]
     got = [f.name for f in dataclasses.fields(Program)]
     if got != expected:
         r.fail("PORT-2 Program shape",

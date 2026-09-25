@@ -111,8 +111,18 @@ def _ver_tuple(v: str) -> tuple:
 
 @dataclass(frozen=True)
 class Program:
-    """A compiled TEX program — a named view over the compiler's 6-tuple. The field
-    names are a public contract (`test_port2_program_shape` pins them)."""
+    """A compiled TEX program — a named view over the compiler's 6-tuple, plus one derived
+    attribute. The field names are a public contract (`test_port2_program_shape` pins them).
+
+    `time_reads` (TIMEREADS-45) is which of `frame`/`fps`/`time`/`fetch_time`/`sample_time`
+    this program reads, anywhere (a user function's body, a loop, a conditional branch — not
+    only the top level). It is DERIVED and read-only: computed once, at compile time, from
+    `ast` alone (`_collect_time_reads` below, the same two checks `codegen._reads_time_builtin`
+    and `graphed._capturable`'s time-decline branch already run), and it changes neither the
+    compile fingerprint nor any cache key, nor a single pixel a cook produces — it only ANSWERS
+    a question the AST could already be asked. `frame`/`fps`/`time` are `Identifier` reads;
+    `fetch_time`/`sample_time` are `FunctionCall` names, which `used_builtins` (built from
+    `_collect_identifiers`, an Identifier-only walk) can never see."""
     ast: Any
     type_map: dict
     referenced: Any
@@ -120,6 +130,48 @@ class Program:
     params: dict
     used_builtins: Any
     source: str
+    time_reads: Any = frozenset()
+
+
+#: TIMEREADS-45: `fetch_time`/`sample_time` read the host playhead exactly like `frame`/`fps`/
+#: `time`, but as a `FunctionCall`'s `.name`, never an `Identifier` — invisible to
+#: `_collect_identifiers` (and so to `used_builtins`), which only ever tests Identifier names.
+#: Kept here, beside `Program` and `_collect_time_reads`, rather than in `tex_runtime.interpreter`
+#: (where `_TIME_BUILTIN_NAMES` and `_collect_identifiers` live): that module sits at its
+#: REG-2 hard-budget line, and this ask is additive surface, not engine surface.
+_TIME_BUILTIN_CALL_NAMES = frozenset({"fetch_time", "sample_time"})
+
+
+def _collect_time_reads(program) -> frozenset:
+    """Which of `frame`/`fps`/`time`/`fetch_time`/`sample_time` `program` (the AST `Program`,
+    i.e. `Program.ast`, not this module's dataclass) reads, anywhere — inside a user function's
+    body, a loop, or a conditional branch exactly as at top level.
+
+    Built from the SAME two facts `tex_runtime.codegen._reads_time_builtin` and
+    `tex_runtime.graphed._capturable`'s time-decline branch already check —
+    `tex_runtime.interpreter._TIME_BUILTIN_NAMES` against an `Identifier`, and
+    `_TIME_BUILTIN_CALL_NAMES` (the same two names out of `graphed._SYNC_STDLIB`) against a
+    `FunctionCall`'s name — so this can't drift from either: it is not a third
+    re-implementation of "does this program read time", it is the same two checks run together
+    over one walk. Uses `iter_child_nodes` (field-driven — the generic walker codegen emission,
+    the optimizer and the memory estimator already share) rather than a hand-written per-class
+    dispatch, so a read reachable only through a node type none of those callers special-cased
+    is still found, and a future ASTNode field is traversed instead of silently escaping."""
+    from .tex_compiler.ast_nodes import Identifier, FunctionCall, iter_child_nodes
+    from .tex_runtime.interpreter import _TIME_BUILTIN_NAMES
+    found: set = set()
+    stack = [program]
+    while stack:
+        node = stack.pop()
+        cls = type(node)
+        if cls is Identifier:
+            if node.name in _TIME_BUILTIN_NAMES:
+                found.add(node.name)
+            continue
+        if cls is FunctionCall and node.name in _TIME_BUILTIN_CALL_NAMES:
+            found.add(node.name)
+        stack.extend(iter_child_nodes(node))
+    return frozenset(found)
 
 
 def _compile_impl(source: str, binding_types: dict, *, fp: str | None = None):
@@ -136,7 +188,12 @@ def _compile_impl(source: str, binding_types: dict, *, fp: str | None = None):
         fp = get_cache().fingerprint(source, binding_types)
     ast, type_map, referenced, assigned, params, used_builtins = \
         tex_engine._compile_or_raise(source, binding_types, fp=fp)
-    return Program(ast, type_map, referenced, assigned, params, used_builtins, source), fp
+    # TIMEREADS-45: computed once here (compile-path only, fingerprint-cached upstream — never
+    # per-cook) and cached on the frozen Program; see the class docstring for why this is safe
+    # to add without moving the fingerprint or any cache key.
+    time_reads = _collect_time_reads(ast)
+    return Program(ast, type_map, referenced, assigned, params, used_builtins, source,
+                   time_reads), fp
 
 
 def compile(source: str, binding_types: dict) -> Program:  # noqa: A001 (public name)
