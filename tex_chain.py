@@ -285,6 +285,23 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
     from . import tex_results
     from .tex_fusion import prefix_fingerprint
     fp = prefix_fingerprint(stages, k, _infer_binding_type)
+    # LINT-46 (MEASURE-44's isinstance sweep): `_is_tensor_binding(v)` was asked TWICE per
+    # `stages[:k]` binding on the `canvas is None` path below — once here (the params/tensor
+    # split) and again inside `_shapes` (the canvas enumeration), both walking the exact same
+    # bindings within this SAME call. id()-keyed memo (the same convention the checker's
+    # type_map already uses): a binding's tensor-or-not answer cannot change within one
+    # `boundary_lineage_key` call, so the second walk reuses the first walk's answer instead of
+    # re-deriving it. `_is_tensor_binding` always returns a bool (never None), so a plain
+    # `dict.get` miss unambiguously means "not computed yet" — no sentinel needed.
+    _tensor_memo: dict = {}
+
+    def _is_tensor_memo(v):
+        key = id(v)
+        cached = _tensor_memo.get(key)
+        if cached is None:
+            cached = _tensor_memo[key] = _is_tensor_binding(v)
+        return cached
+
     # P0-H: a Promise is a TENSOR binding that has not arrived yet, so it belongs on the
     # tensor side of this split — not in `params`. It landed there because the test asks
     # "is it a Tensor?", and `_canon_params` folds unknown objects via `repr`, which for a
@@ -302,7 +319,7 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
     params = {f"s{i}:{n}": v
               for i, st in enumerate(stages[:k])
               for n, v in (st.get("bindings") or {}).items()
-              if not _is_tensor_binding(v)}
+              if not _is_tensor_memo(v)}
     if canvas is None:
         # Every tensor the prefix reads, by stage-qualified name and shape. Derivable BEFORE
         # the cook: a TEX program's output canvas equals its input canvas until LANG-6's
@@ -317,7 +334,7 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
             out = []
             for i, st in enumerate(sts):
                 for n, v in sorted((st.get("bindings") or {}).items()):
-                    if not _is_tensor_binding(v):
+                    if not _is_tensor_memo(v):
                         continue
                     shape = _binding_shape(v)
                     if shape is None:
