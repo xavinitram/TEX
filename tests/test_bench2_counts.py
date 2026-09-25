@@ -468,15 +468,20 @@ _HOST_TICK_EXACT_D1 = {
     "tex_checkpoint.plan_checkpoints": 1,   # ONE checkpoint OFFER per tick, regardless of
                                      # `_DIRTY` — the offer reads the frozen cost table, not
                                      # which stages are dirty (Q5 step 4 is independent of the
-                                     # route decision at step 5). Re-derive with this file's
-                                     # `_check`'s message if PROF-1's settling schedule or the
-                                     # ten-stage chain's own per-stage costs move.
-    "tex_engine.boundary_lineage_key": 8,   # one PROBE per planned cut on this ten-stage chain
-                                     # at the gate shape (96^2) with `_THRESHOLD_MS`=0.05 — a
-                                     # probe, never a serve; this scenario's cook always takes
-                                     # the whole-frame route regardless of what the offer plans.
-    "tex_results.lineage_key": 18,   # 10 (`_mint_all_node_keys`, once per node in the WHOLE
-                                     # graph, Q5 step 3) + 8 (`boundary_lineage_key` mints one
+                                     # route decision at step 5).
+    "tex_engine.boundary_lineage_key": 9,   # one PROBE per planned cut on this ten-stage chain.
+                                     # PARITY-46: `HostTickExactScenario._STAGE_COST_MS` is a
+                                     # HAND-FED constant (100 ms), two orders of magnitude above
+                                     # the materialization floor at this shape, chosen so EVERY
+                                     # one of the 9 possible interior cuts (k=1..9 on a 10-stage
+                                     # chain) clears it — the cut set is `[1..9]` by
+                                     # construction, not a measurement, so this row cannot move
+                                     # with box load or cache warmth the way a settled-PROF-1
+                                     # reading could. A probe, never a serve; this scenario's
+                                     # cook always takes the whole-frame route regardless of
+                                     # what the offer plans.
+    "tex_results.lineage_key": 19,   # 10 (`_mint_all_node_keys`, once per node in the WHOLE
+                                     # graph, Q5 step 3) + 9 (`boundary_lineage_key` mints one
                                      # internally per probe, Q5 step 4) — the two doors this
                                      # scenario drives onto the same function, at once.
 }
@@ -509,8 +514,8 @@ _HOST_TICK_EXACT_D3 = {
     "lazy_required_bindings":   0,
     "Interpreter._exec_stmt":   4,    # contrast (1) + glow (1) + vignette (2).
     "tex_checkpoint.plan_checkpoints": 1,     # unchanged from D1 — see the class comment above.
-    "tex_engine.boundary_lineage_key": 8,     # unchanged from D1, same reason.
-    "tex_results.lineage_key": 18,            # unchanged from D1, same reason.
+    "tex_engine.boundary_lineage_key": 9,     # unchanged from D1, same reason (PARITY-46).
+    "tex_results.lineage_key": 19,            # unchanged from D1, same reason.
 }
 
 _PLAYBACK_FRAMES = {

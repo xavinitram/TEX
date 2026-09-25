@@ -1207,14 +1207,19 @@ class HostTickExactScenario(Scenario):
     split those scenarios use, so all three families are stage-for-stage comparable."""
     needs_comp = False
     _DIRTY = 1
-    #: Far below every measured stage cost at the gate shape — see `CheckpointServeScenario`'s
-    #: own note; the MATERIALIZATION FLOOR (`put_cost_ms * _FLOOR_FACTOR`), not this number,
-    #: is what actually gates a cut at every shape this file drives.
+    #: HAND-FED, never measured — see `build()`'s own note on why (PARITY-46's pin-flake fix).
+    #: Uniform and two orders of magnitude above the MATERIALIZATION FLOOR
+    #: (`put_cost_ms(px, device) * _FLOOR_FACTOR`) at every shape this file drives (worked out
+    #: in the docstring below), so `plan_checkpoints` cuts after EVERY stage, deterministically,
+    #: with no cost anywhere near the boundary for box noise to move.
+    _STAGE_COST_MS = 100.0
+    #: Also hand-fed rather than measured, and irrelevant to the outcome once every stage cost
+    #: clears the floor on its own — kept well below `_STAGE_COST_MS` only for documentation
+    #: honesty (a real GOV-1 threshold is meant to be smaller than a real stage cost).
     _THRESHOLD_MS = 0.05
     #: CACHE-6's content-sensitive source identity for the boundary probes. Fixed: this
     #: scenario never swaps the source tensor underneath a probed boundary.
     _UPSTREAM = ("host-tick-exact-src-v1",)
-    _MAX_WARMUP_COOKS = 600
 
     def build(self):
         from TEX_Wrangle import tex_checkpoint, tex_engine, tex_results
@@ -1232,6 +1237,7 @@ class HostTickExactScenario(Scenario):
         self._codes = [c for _nm, c, _d in stages_src]
         self._defaults = [dict(d) for _nm, _c, d in stages_src]
         self._src = torch.rand(1, self.res, self.res, 3, device=dev)
+        self._spatial = (1, self.res, self.res)          # used by `tick()`'s `profile.measure`
 
         # The linear stage-list FIXTURE `tex_checkpoint` reads: same 10 programs, `chain_input`
         # spelling (a `chain_inputs` DAG needs `collapse_linear` first — not this scenario's
@@ -1243,27 +1249,27 @@ class HostTickExactScenario(Scenario):
                           else dict(self._defaults[i]))}
             for i in range(n)]
 
-        # Settle a PROF-1 cost table for this exact 10-stage chain (outside the counted
-        # region — see `CheckpointServeScenario`'s own note on why: a settling loop pollutes
-        # a tick's frame/API counts if it runs inside them). Salted so passes A/B/C and every
-        # device each settle their OWN bucket rather than inheriting another's.
-        pkey = _profile.make_key(f"host-tick-exact-{self._salt}-{self.epoch}", dev, "fp32")
-        spatial = (1, self.res, self.res)
-        self._pkey, self._spatial = pkey, spatial
-        _profile.reset()
-        _profile.enable()
-        warm = 0
-        try:
-            while warm < self._MAX_WARMUP_COOKS and not _profile.settled(
-                    pkey, spatial, need=tex_checkpoint.MIN_SAMPLES):
-                with _profile.measure(pkey, spatial, device=dev, stages=True):
-                    tex_engine.cook_stage_list(self._stage_list, device=dev, precision="fp32")
-                warm += 1
-        finally:
-            _profile.disable()
-        self.cooks_to_settle = warm
-        costs, is_settled = _profile.stage_snapshot(pkey, spatial, need=tex_checkpoint.MIN_SAMPLES)
-        self._costs, self._settled = costs, is_settled
+        # PARITY-46 / the pin-flake fix: `plan_checkpoints`'s cut set used to be decided from a
+        # LIVE PROF-1 settling loop's real wall-clock measurements — every input the planner
+        # itself takes (`costs`, `threshold_ms`, `px`, `settled`, `device`) was already passed
+        # explicitly, but `costs` was filled by TIMING actual cooks, and actual timing is not
+        # reproducible: on this file's own gate shape the per-stage cost of the CHEAPEST stages
+        # (plain elementwise ops on a 96^2 tensor) sits within noise of the materialization
+        # floor (`put_cost_ms(px, device) * _FLOOR_FACTOR`, ~0.079 ms CPU / ~0.004 ms CUDA at
+        # this shape) — box load, disk-cache warmth (it changes how long a `compile_tex`/
+        # `fingerprint` lookup takes, which is IN the measured window) and simple run-to-run
+        # jitter tipped individual stages across that boundary, so the cut COUNT (hence
+        # `tex_engine.boundary_lineage_key`'s and `tex_results.lineage_key`'s per-tick counts)
+        # read 8 on some runs and 9 on others (a filed finding, PARITY-46). No disk state
+        # is actually read by `plan_checkpoints` — `put_cost_ms` is a pure function of
+        # `(px, device)` and `costs` came from THIS scenario's own in-memory PROF-1 table — so
+        # the fix is the coordinator's first option: make the one noisy input (`costs`)
+        # explicit and constant instead of measured. `_STAGE_COST_MS` is chosen far enough
+        # above the floor (100 ms against a <0.1 ms floor at every shape this file drives) that
+        # EVERY stage clears it on its own, so the cut set is `[1..n-1]` by construction and no
+        # longer a function of anything this box measures.
+        self._costs = {i: self._STAGE_COST_MS for i in range(n)}
+        self._settled = True
 
         # Cook the CLEAN prefix once (also outside the counted region — the host's own upstream
         # canvases already stand at tick time; a tick pays for the DIRTY suffix alone, exactly
