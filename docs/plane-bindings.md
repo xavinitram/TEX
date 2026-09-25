@@ -57,9 +57,9 @@ This is the release's compat tripwire and the reason this phase gets its own ses
 
 **The constraint that decides it:** the parser provably never sees binding types.
 `TEXCache.compile_tex` reaches `Parser(tokens, source=source).parse()` through
-`parse_and_split` (`tex_cache.py:214`) and
+`parse_and_split` (`tex_cache.py:206`) and
 types enter one call later, at `TypeChecker(binding_types=..., source=source)`
-(`tex_cache.py:513`, inside the shared `TEXCache.compile_ast`). So doc 40's "`.name` means a plane *on a
+(`tex_cache.py:570`, inside the shared `TEXCache.compile_ast`). So doc 40's "`.name` means a plane *on a
 PLANES-typed wire*" cannot live in the grammar. Something upstream of types must tokenize the
 dot, and something downstream of types must decide what it meant.
 

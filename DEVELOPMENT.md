@@ -643,7 +643,7 @@ it (`tex_cookqueue.py:17-34`); the submit is fenced through the queue because `r
 beside a live cook (`tex_session.py:79-80`) and the queue's single worker thread is the exclusion
 (`tex_cookqueue.py:17-22`); `feeds_profile=False` because a non-cook job must not reach PROF-1's cost
 table, and that has to be said, not left to a `profile_key` the caller happened not to pass
-(`tex_cookqueue.py:179-184`). One fact `close()` does NOT undo: it leaves the egress profile exactly
+(the `Job` dataclass's `feeds_profile` field, `tex_cookqueue.py:179-184`). One fact `close()` does NOT undo: it leaves the egress profile exactly
 where the host last set it (`tex_session.py:100-106`).
 
 **The egress profile is set once, by the host, before the first cook.** That is the normative
@@ -660,7 +660,7 @@ submitted cook must take the queue's OWN token — chained with a host's own rea
 substituted for it (`examples/host_demo.py:61-73`, `:503-507`), because that token is the only
 channel preemption, shedding and `close()` travel down. Preempt returns a job to the HEAD of its
 class, transient and never reported to the host; shed is terminal
-(`tex_cookqueue.py:36-40`; `tests/test_v031_phase1.py:127`, `:390`). A cancellation the queue did not
+(`tex_cookqueue.py:36-40`; `test_v031_sched4_priority_and_preemption`, `tests/test_v031_phase1.py:127`, `:390`). A cancellation the queue did not
 itself raise — a shed, a host's own supersede latch, a global Stop — is terminal by the same rule,
 never retried (`tex_cookqueue.py:703-707`). A cook that already returned is never discarded for a
 flag raised while it ran (`tex_cookqueue.py:42-47`, `:754-760`).
