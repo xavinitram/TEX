@@ -1,0 +1,39 @@
+legs: ['v44_base_a1', 'v44_base_a2']   (ratio = v44_base_a1/leg; >1 = leg faster)
+
+eight_config @512^2 — per-config geomean | v44_base_a2   [row min..max for last leg]
+  cpu_off_cold   |  0.997 n=125   [0.60..1.51]
+  cpu_off_warm   |  0.984 n=125   [0.52..1.58]
+  cuda_off_cold  |  1.002 n=125   [0.96..1.07]
+  cuda_off_warm  |  0.996 n=125   [0.97..1.03]
+  cpu_on_cold    |  1.058 n=139   [0.87..2.51]
+  cpu_on_warm    |  0.995 n=139   [0.39..1.28]
+  cuda_on_cold   |  1.002 n=139   [0.80..1.31]
+  cuda_on_warm   |  0.992 n=139   [0.79..1.27]
+
+roi_scrub | v44_base_a1 | v44_base_a2  ratios vs v44_base_a1
+  whole                        |     1.7744 |     1.7659   1.005
+  roi_fixed                    |     0.6544 |     0.6503   1.006
+  roi_panning                  |     0.6548 |     0.6502   1.007
+  roi_pan_param                |     0.7667 |     0.7640   1.004
+
+param_scrub | v44_base_a1 | v44_base_a2  ratios vs v44_base_a1
+  cold_ms                      |    49.1506 |    48.7953   1.007
+  scrub_median_ms              |     0.3756 |     0.3763   0.998
+  static_median_ms             |     0.3746 |     0.3755   0.998
+  recook_median_ms             |     1.5664 |     1.5747   0.995
+  scrub_max_after_warmup_ms    |     0.7323 |     0.7605   0.963
+
+region_recook | v44_base_a1 | v44_base_a2  ratios vs v44_base_a1
+  cuda/n50/2048/whole_all      |   172.2580 |   171.4710   1.005
+  cuda/n50/2048/region_mid     |    17.0510 |    16.9990   1.003
+  cpu/n50/2048/whole_all       |   865.8790 |   889.7260   0.973
+  cpu/n50/2048/region_mid      |   154.8610 |   156.2600   0.991
+
+cookqueue | v44_base_a1 | v44_base_a2  ratios vs v44_base_a1
+  solo_ms                      |     0.3690 |     0.3730   0.989
+  queued_idle_ms               |     0.4350 |     0.4340   1.002
+  preempt_to_first_stmt_ms     |     0.8820 |     0.8800   1.002
+  queued_under_load_ms         |     1.1150 |     1.0930   1.020
+
+counts_cuda - stable rows that differ from v44_base_a1
+  moved api/cuda rows: 0; moved frame rows (not listed): 0
