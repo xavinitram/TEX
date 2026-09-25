@@ -115,6 +115,19 @@ _PARENT = os.path.dirname(_PKG)
 _HARNESS = os.path.join(_HERE, "canonical_harness.py")
 _ALLOWLIST = os.path.join(_PKG, "tests", "known_reds.json")
 
+
+def _importable_as_tex_wrangle() -> bool:
+    """`tests/helpers.py` (every test file's own import path) does `from TEX_Wrangle.<mod>
+    import ...` literally, against a directory named exactly `TEX_Wrangle` under the
+    package's parent -- whether that is the package directory itself (this checkout's own
+    folder is named `TEX_Wrangle`) or a sibling that resolves to it (the ComfyUI layout: a
+    `TEX_Wrangle` junction next to a `TEX` checkout). A checkout with neither -- a plain
+    `git worktree add` into a scratch directory with no such sibling -- fails EVERY test at
+    collection with a bare `ModuleNotFoundError`, before any leg's process can produce a
+    diagnosable result. Checked once, up front, so that shape gets a clear refusal instead of
+    a wall of tracebacks with no verdict line."""
+    return os.path.isdir(os.path.join(_PARENT, "TEX_Wrangle"))
+
 #: The ratchets that answer in seconds. Each is a strict subset of both whole-suite legs.
 _CHEAP = [
     ("no-numpy ban", "tests/test_no_numpy_ban.py"),
@@ -349,6 +362,31 @@ class Leg:
         self.timing_deselected: int | None = None
 
 
+def _mark_infra_red(leg: "Leg", detail: str) -> None:
+    """Turn a leg with nothing to red on into a real, un-allowlistable red.
+
+    `judge()` reads only `leg.failures`, never `leg.rc` -- so a leg whose process died before
+    it ever produced a parseable result (a nonzero rc with no junit report at all, e.g. a
+    `conftest.py` import error that exits pytest before `pytest.main()` runs; or an rc-0 leg
+    that collected nothing, e.g. every requested file got deselected, or the junit it wrote
+    has zero `<testcase>` rows) used to fall through to `judge()` as a clean pass -- GREEN
+    with a nonzero exit code sitting right next to it. Shared by `_run` and `run_counts`, the
+    two places that discovered this independently (`run_counts`'s `<counts:infra-rc…>` id was
+    first): give the leg a synthetic id no allowlist entry can name, so it always lands in
+    `real` instead. Never fires on a leg that already parsed a real failure -- callers only
+    reach this when `leg.failures` is empty."""
+    infra_id = f"<{leg.name}:infra-rc{leg.rc}>"
+    leg.failures = [infra_id]
+    leg.failure_text[infra_id] = detail[:300]
+
+
+def _stdout_detail(stdout: str) -> str:
+    """The last non-blank line of a process's stdout, or a fixed note when there is none --
+    the one-line explanation `_mark_infra_red` attaches to its synthetic id."""
+    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+    return lines[-1] if lines else "(no output)"
+
+
 def _parse_junit(path: str) -> tuple:
     """`(failing ids, every collected id, {failing id: assertion text})`, as
     `tests/<file>.py::<test>`.
@@ -410,7 +448,14 @@ def _summary_of(stdout: str) -> str:
     return "(no pytest summary line)"
 
 
-def _run(leg: Leg, argv: list, cwd: str, env_extra: dict, scratch: str, verbose: bool) -> Leg:
+def _run(leg: Leg, argv: list, cwd: str, env_extra: dict, scratch: str, verbose: bool,
+         expect_collect: bool = True) -> Leg:
+    """Run one whole-suite/ratchet leg and fill in `leg` from its junit report.
+
+    `expect_collect` marks a leg where collecting zero tests is itself a failure rather than
+    a legitimate empty run -- true for every leg this file defines today (cheap, ci-shape,
+    canonical all expect to collect real tests every time), kept as a parameter rather than a
+    constant so a future leg that is allowed to collect nothing can opt out explicitly."""
     cache = os.path.join(scratch, f"cache-{leg.name}")
     shutil.rmtree(cache, ignore_errors=True)
     os.makedirs(cache, exist_ok=True)
@@ -423,6 +468,17 @@ def _run(leg: Leg, argv: list, cwd: str, env_extra: dict, scratch: str, verbose:
     leg.rc = proc.returncode
     leg.summary = _summary_of(proc.stdout)
     leg.failures, leg.collected, leg.failure_text = _parse_junit(junit)
+    if leg.rc and not leg.failures:
+        # The process died with nothing to red on -- e.g. a `conftest.py` import error, which
+        # exits pytest with a nonzero rc before `pytest.main()` ever runs and writes NO junit
+        # report at all, so `_parse_junit` sees a missing file and returns nothing. Without
+        # this, `judge()` (which reads only `leg.failures`) would print GREEN over a nonzero rc.
+        _mark_infra_red(leg, _stdout_detail(proc.stdout))
+    elif expect_collect and leg.rc == 0 and not leg.collected:
+        # rc 0 but the leg proved nothing: no junit file (a wrapper that swallowed a nonzero
+        # inner rc), or a junit with zero `<testcase>` rows (every target file deselected or
+        # skipped at collection). A silent, empty "pass" is not a clean one either.
+        _mark_infra_red(leg, _stdout_detail(proc.stdout))
     if verbose:
         print(f"\n--- {leg.name}: {' '.join(argv)} (cwd={cwd}) ---")
         print(proc.stdout[-8000:])
@@ -540,14 +596,9 @@ def run_counts(python: str, baseline: str, scratch: str, verbose: bool) -> Leg:
         if not leg.failures:
             # A nonzero rc with no parsed row diff is not a clean pass -- e.g. `compare()`'s
             # own shape-mismatch REFUSED (TRK-100), which prints neither CHANGED/NEW ROW/GONE.
-            # `judge()` only ever looks at `leg.failures`, never `leg.rc`, so a leg like this
-            # used to fall through to GREEN with nothing to red on. Give it a synthetic id no
-            # allowlist entry can name, so it always lands in `real` instead.
-            infra_id = f"<counts:infra-rc{leg.rc}>"
-            leg.failures = [infra_id]
-            leg.failure_text[infra_id] = (tail[-1] if tail else
-                                          proc.stdout.strip().splitlines()[-1]
-                                          if proc.stdout.strip() else "(no output)")
+            # See `_mark_infra_red` (shared with `_run`, which has the same class of bug on
+            # the pytest legs).
+            _mark_infra_red(leg, tail[-1] if tail else _stdout_detail(proc.stdout))
     if verbose:
         print(f"\n--- counts: {' '.join(argv)} ---\n{proc.stdout[-8000:]}")
     return leg
@@ -643,6 +694,11 @@ def main(argv=None) -> int:
                    help="where per-leg TEX_CACHE_DIRs and junit files go (default: a temp dir)")
     p.add_argument("-v", "--verbose", action="store_true", help="echo each leg's output")
     a = p.parse_args(argv)
+
+    if not _importable_as_tex_wrangle():
+        print("the package must be importable as TEX_Wrangle: run from a directory where it "
+              "resolves (e.g. a worktree whose package dir is named TEX_Wrangle)")
+        return 2
 
     head, th = head_label(), tree_hash()
     ci_python, ci_source = resolve_ci_python(a.ci_python)
