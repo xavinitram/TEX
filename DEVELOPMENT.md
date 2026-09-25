@@ -726,6 +726,31 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   into named stage bindings) and `optional` (host UI advice only); `promoted_params[i].metadata` may
   carry `tooltip` and `options` (a labelled-choice list) — all four validated, all four opt-in, under
   the manifest's EXISTING Tier 1 row below (TOOL-1) (`tex_tool.py:61-62`, `:254-268`).
+- `tex_engine._infer_binding_type` is an import alias for `tex_marshalling.infer_binding_type` —
+  the same function object under its public name, not a second copy. A reader who finds the
+  underscored name off `tex_engine` should read the public one off `tex_marshalling` instead;
+  `tex_engine`'s own alias is an artifact of how that module composes its imports. Not a row
+  below; the alias stays Tier 3, and its public replacement is free to earn a row of its own the
+  day something other than this note asks for one.
+- `tex_fusion._MAX_FUSED_REGION_STAGES` (today 16) is an internal planning constant, not a
+  promise of any particular value or of never changing — a host should not pre-size a plan
+  against the literal. `detect_fusable_regions` already returns regions capped at whatever this
+  constant currently is; read a returned region's own stage count instead. Not a row below; Tier
+  3 by the catch-all.
+- `tex_compiler.ast_nodes.iter_child_nodes` and the node dataclasses it walks (`Assignment`,
+  `BindingRef`, `FunctionCall`, `ParamDecl`, and every other `ASTNode` subclass) are the
+  compiler's own IR. `iter_child_nodes` is walkable today — it yields exactly the fields a node
+  dataclass types as `ASTNode` or a list/tuple of one, which is what an external generic
+  tree-walker leans on — but no field set or shape is promised across a minor the way a reserved
+  name or a grammar change is (see "What a release note owes a vendoring host" below). Not a row
+  below; Tier 3 by the catch-all, and this paragraph is the whole of what is currently true, not
+  an upgrade of the promise.
+- `tex_compiler.types.TEXType` (the enum), its members, `.channels`/`.is_numeric`/`.is_planes`,
+  and the derived tables `CHANNEL_MAP`/`VALID_SWIZZLES` are the compiler's type lattice. No new
+  member is promised never to arrive, but a SHIPPED member keeps its name and its `.value`
+  string — removing one is the same class of break as retiring an error code (the Error codes
+  row below). Not a row below; Tier 3 by the catch-all, described rather than promoted because
+  nothing here has ever had a canary of its own.
 
 None of this mints a new tier: each surface above keeps whatever this table already says about it,
 or does not — `tex_cookqueue` is not in the table at all. This section is descriptive of what is
@@ -758,11 +783,29 @@ breaks a host.
 | **1 — Public** | `tex_session.EngineSession` / `default_session` (DATA-4) | The session handle; phase-1 `.cache`/`.registry`/`.host` view the module singletons | `test_v028_phase1` |
 | **1 — Public** | `tex_engine.freeze` / `frozen_copy` / `is_frozen` / `frame_version` / `verify_unmutated` / `to_dlpack` / `from_dlpack` — the ENG-6/ENG-12 frame-handoff and buffer-ownership contract (since ENG-14 these live in `tex_buffers` and are re-exported off `tex_engine`, which is where every consumer reads them) | Describes what these canaries ALREADY pin, and is not a promotion: the DLPack export shape (fp32, on-device, BHWC, `layout='bchw'` a zero-copy permute) and the `copy=True` ownership default | `test_v023_phase1`, `test_v025_phase1` |
 | **1 — Public** | The CACHE-7 checkpointed and fused cook entry points a host calls directly: `cook_fused_cached`, `cook_stage_list` and `boundary_lineage_key` (since NEG-2 these live in `tex_chain` and are re-exported off both `tex_engine` and `tex_checkpoint`, which is where consumers read them — the ENG-14 shape), plus `tex_checkpoint.cook_checkpointed` and `tex_checkpoint.materialize` (that module's own; `materialize` is a name three modules use, so it is only ever this one qualified). They carry no leading underscore, so Tier 3's catch-all never covered them and they fell through this table entirely | Describes what these canaries ALREADY pin, and is not a promotion: the five names, their call shapes, and the re-export, with `boundary_lineage_key` a `get`-only probe a host may call once per planned cut. What is NOT pinned is where the planner puts the cuts — the cut CHOICE is free to change, and a host that cached a plan re-derives it | `test_v027_phase1`, `test_v032_checkpoint`, `test_v033_phase0`, `test_v0341_audit` |
+| **1 — Public** | `tex_results.lineage_key` (CACHE-1) | The content-addressable identity of a cooked result: `H(program_fp × params × upstream × frame/time_context × device × precision/quality × env_epoch × flags × canvas)`. `device` and `precision` are MANDATORY (invariant #9 — no cross-device/precision hit is ever served). See the PURITY note below the table | `test_seam45_embedding_host_seam` (SEAM-45, v0.45; no prior canary named this row) |
+| **1 — Public** | `tex_provider`'s host source protocol (DATA-7): the `FrameProvider` Protocol, `get_provider`/`set_provider`, `materialize`, `source_version`/`bump_source_version`, `stats`, `declare_window`, `set_media_budget_mb`, `source_flags` | What a host implements to hand TEX frames, and how TEX reads and governs them; a provider is a pure function of `(source_key, quantized_t)` for as long as its source version does not change — the host bumps the version, TEX never stats a file | `test_seam45_embedding_host_seam` (SEAM-45, v0.45) |
+| **1 — Public** | `tex_lazy.lazy_required_bindings` (invariant #11) | The `@`/`$` names a program can still reference given these widget values, or `None` meaning the analysis failed and the caller should keep every binding; never raises; over-approximates only, never under | `test_lazy_cooking.py`, `test_seam45_embedding_host_seam` (SEAM-45, v0.45) |
+| **1 — Public** | `tex_runtime.host.CookCancelled` / `NullHostServices` / `get_host_services` (PORT-1's own module, alongside the `HostServices` row above) | `CookCancelled` is the one exception type a cancelled cook raises at a yield point; `get_host_services()` returns the ComfyUI implementation when importable, else `NullHostServices` — a real host-agnostic implementation, not a stub, that still detects a torch OOM | `test_port1_host_services`, `test_seam45_embedding_host_seam` (SEAM-45, v0.45) |
 | **2 — Semi** | `a@name` ARRAY wire + array outputs (DATA-3) | Engine-profile only; `a` is now a RESERVED binding prefix; comfy rejects array outputs (E3203 + egress guard) | `test_v028_phase1` |
 | **2 — Semi** | TEX the language | Additive; new builtin/function names are RESERVED, so adding one is a minor breaking change — note it in the CHANGELOG (v0.22 reserved `frame`/`fps`/`time`) | the compat corpus (LANG-3, planned) |
 | **2 — Semi** | Error codes (E1xxx–E6xxx) | Codes are stable; message TEXT is not. **Stability is the part a host depends on** — one folds its diagnostic notifications on `(speaker, code)` — so a retired code is never reused for a different meaning, and removing one from the documented set is a minor bump that rides a tag, never a patch | `test_c3ux_error_codes_resolve` |
 | **2 — Semi** | `tex_doctor.capabilities()` row names, its 4 keys, and the `status`/`evidence` vocabularies (BRIEF-4) | A read-only per-tier capability REPORT, never a fixed ladder — values are whatever a box measures; a row/key/vocabulary rename or removal bumps `schema` | `test_dbg4_capabilities_shape` |
-| **3 — Internal** | Everything else — `tex_runtime.*`, `tex_compiler.*`, `tex_fusion` internals, `tex_engine._*`, and the underscored names of the modules split out of it (`tex_buffers._*`, `tex_tiling.*` — the cook-fit planners are all private — and `tex_chain._*`) | No promise. Import at your own risk | — |
+| **2 — Semi** | `tex_runtime.profile` (PROF-1): `enabled`/`enable`/`disable`/`reset`/`snapshot`/`record`/`measure`/`predict`/`samples`/`stage_snapshot`/`stage_costs`/`bucket_of`/`make_key`/`stage_sink` | OFF by default (invariant #7 — disabled, the whole cost is one boolean load and a branch); once armed with `enable()`, the names and call shapes are stable, but the EWMA VALUES a host reads back are a measurement of that box, never a cross-host or cross-release contract | `test_seam45_embedding_host_seam` (SEAM-45, v0.45; no prior canary named this row) |
+| **3 — Internal** | Everything else — `tex_runtime.*` and `tex_compiler.*` beyond the rows above, `tex_fusion` internals beyond `_MAX_FUSED_REGION_STAGES`'s own note below, `tex_engine._*`, and the underscored names of the modules split out of it (`tex_buffers._*`, `tex_tiling.*` — the cook-fit planners are all private — and `tex_chain._*`) | No promise. Import at your own risk | — |
+
+**PURITY, as contract: `lineage_key` and `boundary_lineage_key` are pure functions of their
+arguments plus a per-process, per-device `env_epoch()`.** `tex_results_keys.lineage_key` hashes
+only its own keyword arguments and `tex_results_keys.env_epoch()`; `tex_chain.boundary_lineage_key`
+derives everything else it feeds in — the prefix fingerprint, the prefix's non-tensor param
+values, the prefix's tensor shapes — deterministically from its own `stages`/`k` arguments, then
+calls `lineage_key` itself. `env_epoch()` is memoized per CUDA device index in-process
+(`tex_results_keys._ENV_EPOCH_CACHE`), built from the torch version, the device's compute
+capability, and `tex_cache.codegen_epoch()` — a mono-hash over the compiler's own source files,
+computed once at import and never recomputed. So for the life of one process on one device,
+calling either function twice with the same arguments returns the same string. That is what
+makes an embedding host's own memo — keyed on either function's output — sound for the life of
+a session, across as many calls as the host cares to make.
 
 **Fingerprints are NOT stable — never persist one.** `TEXCache.fingerprint` /
 `fused_fingerprint` are value-independent keys for TEX's own caches, deliberately derived
