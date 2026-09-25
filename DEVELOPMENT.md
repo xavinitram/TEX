@@ -685,6 +685,9 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   decision as one callable — `True` only when both records are dicts and equal (including both
   `{}`), `False` for `None` on either side, a disagreeing or asymmetric label set, or an
   argument that is not a dict — so a host writes the comparison once — its own Tier 1 row below.
+- `CookResult.done`, a `torch.cuda.Event | None` fenced after this cook's LAST launch (`None`
+  off CUDA) — PACE-45. Additive and costs nothing unless a caller reads or synchronizes it;
+  see `tex_runtime/pacing.py::cook_done_event` — Tier 1, the same row as `CookResult` itself.
 - `tex_doctor.capabilities()`, also `tex doctor --json`, is a read-only per-tier report: did this
   process's box actually run each execution tier, is it known unavailable and why, or simply
   unmeasured (`tex_doctor.py:284-310`, `tex_cli.py:303-318`) — Tier 2, its own row below.

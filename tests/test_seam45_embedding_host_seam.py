@@ -128,6 +128,15 @@ _TIER1_SPEC = {
     'tex_cookqueue:INTERACTIVE': ('int', None),
     'tex_cookqueue:SPECULATIVE': ('int', None),
     'tex_cookqueue:SpeculativePolicy': ('class', None),
+    # PACE-45: not a census row (the 2026-09-25 census never covered this class) -- added on
+    # its own, deliberately, the moment `done` landed as a new dataclass field on it. See
+    # this ask's hand-back for why: `run()`/`cook()`'s return TYPE is exactly as load-bearing
+    # for an embedding host as any function this table already pins, and freezing it now
+    # (rather than only from the next census onward) means an accidental rename of any of
+    # its EXISTING fields reds here immediately instead of at the next census's mercy.
+    'tex_engine:CookResult': ('class', ('dataclass_fields', (
+        'outputs', 'output_names', 'assigned', 'device', 'precision', 'binding_names',
+        'near_singularities', 'lineage', 'out_meta', 'cooked_roi', 'noise_tiers', 'done'))),
     'tex_engine:cook': ('function', (('code', 'POSITIONAL_OR_KEYWORD', False), ('bindings', 'POSITIONAL_OR_KEYWORD', False), ('kwargs', 'VAR_KEYWORD', False))),
     'tex_engine:cook_stage_list': ('function', (('stages', 'POSITIONAL_OR_KEYWORD', False), ('device', 'KEYWORD_ONLY', True), ('precision', 'KEYWORD_ONLY', True), ('latent_channel_count', 'KEYWORD_ONLY', True), ('time_context', 'KEYWORD_ONLY', True), ('cancel', 'KEYWORD_ONLY', True), ('on_progress', 'KEYWORD_ONLY', True))),
     'tex_engine:boundary_lineage_key': ('function', (('stages', 'POSITIONAL_OR_KEYWORD', False), ('k', 'POSITIONAL_OR_KEYWORD', False), ('device', 'POSITIONAL_OR_KEYWORD', False), ('precision', 'POSITIONAL_OR_KEYWORD', False), ('upstream', 'KEYWORD_ONLY', False), ('time_context', 'KEYWORD_ONLY', True), ('canvas', 'KEYWORD_ONLY', True), ('latent_channel_count', 'KEYWORD_ONLY', True))),

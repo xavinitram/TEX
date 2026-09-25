@@ -97,7 +97,7 @@ from .tex_runtime.host import (get_host_services, CookCancelled,
                                REFUSE_OUT_OF_MEMORY)             # noqa: F401 (re-export)
 # PROF-1: the cost profiler. Disarmed by default — the default cook path's whole cost is the
 # one `enabled()` call in run(). See tex_runtime/profile.py's invariant-#7 note.
-from .tex_runtime import profile as _profile
+from .tex_runtime import profile as _profile, pacing as _pace
 # ENG-4: the shared compile-error taxonomy + translator (lives beside TEXCompileError so the
 # per-phase tuple is spelled once, not once per compile implementation).
 from .tex_compiler.diagnostics import raw_compile_errors, compile_error_from
@@ -335,6 +335,9 @@ class CookResult:
     # composite frames cooked across the promotion; None unless prepare(want_noise_tiers=True).
     # Contract (and every reason it can be None): tex_runtime/tier_trace.py.
     noise_tiers: dict | None = None
+    # PACE-45: a CUDA event fenced after this cook's LAST launch, or None off CUDA. Additive;
+    # costs nothing unless a caller reads/synchronizes it (tex_runtime/pacing.py).
+    done: Any = None
 
 
 # ── Debug overlays (DBG-3 magenta NaN, C4-ux cyan near-singularity) ──────────
@@ -1369,6 +1372,7 @@ def run(plan: CookPlan) -> CookResult:
             if ctx.binding_meta else None),
         cooked_roi=cooked_roi,
         noise_tiers=tier_trace.take_noise_tiers(plan.tier_id) if plan.want_noise_tiers else None,
+        done=_pace.cook_done_event(ctx.device),   # PACE-45 (Q3): None off CUDA, no sync
     )
 
 

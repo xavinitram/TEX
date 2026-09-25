@@ -155,7 +155,10 @@ _SKIP_VOCAB = re.compile(
 #: witness exists for "the host queued ahead of the device", since a CPU cook has no such
 #: async queue to get ahead of at all. Every other row in that file (the opt-in gate's own
 #: unit test, the CPU bit-exactness check) needs no CUDA and carries no `r.skip`.
-_SKIP_BUDGET = 113
+#: Re-pinned from 113 to 114 (PACE-45(a)): `test_pace45_done_event.py::test_pace45_done_event_cuda`
+#: needs a real CUDA device too — there is no CPU `torch.cuda.Event` to witness. Its CPU
+#: sibling (`test_pace45_done_event_cpu`) needs none and carries no `r.skip`.
+_SKIP_BUDGET = 114
 
 
 def _literal(node) -> str:

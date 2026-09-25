@@ -105,3 +105,15 @@ def paced_check(token, device) -> None:
     new_event = torch.cuda.Event()
     new_event.record()
     _state.event = new_event
+
+
+def cook_done_event(device) -> "torch.cuda.Event | None":
+    """A "GPU work done" fence: a CUDA event recorded on *device*'s current stream, marking
+    this cook's LAST launch so far — `None` off CUDA. Recording an event is itself just
+    another stream-ordered enqueue (like any kernel launch), so this costs nothing unless a
+    caller later reads or synchronizes it."""
+    if not _is_cuda(device):
+        return None
+    ev = torch.cuda.Event()
+    ev.record()
+    return ev
