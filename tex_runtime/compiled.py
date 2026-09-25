@@ -33,9 +33,10 @@ from .interpreter import (Interpreter, _collect_identifiers, _consensus_extent,
                           _SCALAR_BUILTIN_DEFAULTS, _record_ingest_event)
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
                       _iter_child_nodes, is_vec_param_list)
-from .host import _cancel_check, CookCancelled  # SCHED-3 seam (no cycle: host imports torch only)
+from .host import CookCancelled  # SCHED-3 seam (no cycle: host imports torch only)
 from .stdlib import TEXStdlib, _tag_host_scalar
 from . import tier_trace  # leaf module (imports only threading) — no cycle
+from . import pacing as _pace   # PACE-45: bounds queue-ahead when a token opts in
 
 logger = logging.getLogger("TEX")
 
@@ -1474,7 +1475,12 @@ def _codegen_only_execute(
     # CANCEL-44 (Gap 2): poll at entry. Best-effort, same contract as every other
     # SCHED-3 yield point — a misbehaving token's non-CookCancelled exception is left to
     # propagate rather than swallowed.
-    _cancel_check(cancel)
+    # PACE-45: this is this route's OWN first poll, reached before `_invoke_cg` below
+    # publishes the cook state (and resets pacing) via `set_cook_grid` — reset explicitly
+    # so this poll never waits on a stale event left by an unrelated, already-returned
+    # cook on this thread.
+    _pace.reset()
+    _pace.paced_check(cancel, device)
 
     cg_fn = None
     if cancel is not None:

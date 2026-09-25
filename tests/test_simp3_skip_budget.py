@@ -149,7 +149,13 @@ _SKIP_VOCAB = re.compile(
 #: excluded orchestration files, including prose that legitimately names the very fragments
 #: this row forbids (this hand-back among them), and manufacture the false positives the row
 #: exists to prevent rather than remove its need for git. 108 + 3 = 111.
-_SKIP_BUDGET = 111
+#: Re-pinned from 111 to 113 (PACE-45(b)): two CUDA-only rows in `test_pace45_pacing.py`, the
+#: paced-cancellation repro's non-timing and timing halves
+#: (`test_pace45_cuda_pacing_bit_exact_and_repro`, `test_pace45_cuda_repro_latency`) — no CPU
+#: witness exists for "the host queued ahead of the device", since a CPU cook has no such
+#: async queue to get ahead of at all. Every other row in that file (the opt-in gate's own
+#: unit test, the CPU bit-exactness check) needs no CUDA and carries no `r.skip`.
+_SKIP_BUDGET = 113
 
 
 def _literal(node) -> str:

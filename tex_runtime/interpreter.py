@@ -32,8 +32,9 @@ from ..tex_compiler.ast_nodes import (
     iter_child_nodes,
 )
 from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
-from .host import _cancel_check, _report_progress, CookCancelled   # SCHED-3 seam (no cycle: host imports torch only)
+from .host import _report_progress, CookCancelled   # SCHED-3 seam (no cycle: host imports torch only)
 from . import profile as _prof                      # PROF-1 seam (pure stdlib; disarmed by default)
+from . import pacing as _pace                        # PACE-45: bounds queue-ahead when a token opts in
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
                      _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar,
                      _host_scalar)
@@ -502,12 +503,12 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                 # node passes an interrupt token. Poll cancel per statement, but skip the `(i+1)/n`
                 # progress arithmetic only a wired on_progress consumes (measured ~37 ns/stmt).
                 for stmt in stmts:
-                    _cancel_check(cancel)
+                    _pace.paced_check(cancel, self.device)   # PACE-45
                     self._exec_stmt(stmt)
             else:
                 n = len(stmts) or 1
                 for i, stmt in enumerate(stmts):
-                    _cancel_check(cancel)
+                    _pace.paced_check(cancel, self.device)   # PACE-45
                     self._exec_stmt(stmt)
                     _report_progress(on_progress, "stmt", (i + 1) / n)
         finally:
@@ -605,7 +606,7 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                     t0 = close(cur, t0)
                 cur = stage
             if cancel is not None:
-                _cancel_check(cancel)
+                _pace.paced_check(cancel, dev)   # PACE-45
             self._exec_stmt(stmt)
             if on_progress is not None:
                 i += 1

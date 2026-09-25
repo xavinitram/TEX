@@ -17,6 +17,8 @@ from collections import OrderedDict as _OrderedDict
 import torch
 import logging
 
+from . import pacing as _pace   # PACE-45: bounds host queue-ahead when a cancel token opts in
+
 _texlog = logging.getLogger("TEX")
 
 # pow() NaN detector state. A negative base with a fractional exponent has no
@@ -323,6 +325,7 @@ def set_cook_grid(grid, dtype=None, device=None, cancel=None):
     _cook_ctx.dtype = dtype
     _cook_ctx.device = device
     _cook_ctx.cancel = cancel
+    _pace.reset()   # PACE-45: a fresh cook starts with no pacing history to inherit
     return token
 
 
@@ -350,7 +353,7 @@ def poll_cook_cancel() -> None:
     token to check against."""
     tok = getattr(_cook_ctx, "cancel", None)
     if tok is not None:
-        tok.check()
+        _pace.paced_check(tok, getattr(_cook_ctx, "device", None))   # PACE-45
 
 
 def _uniform_grid():
