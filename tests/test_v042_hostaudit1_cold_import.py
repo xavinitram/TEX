@@ -37,9 +37,13 @@ import sys as _sys
 # `interpreter_binding.py`) that `Interpreter` composes as mixins, so all three must
 # still be imported eagerly at class-definition time — the same reason `masked_flow.py`
 # was already eager before this split. 44 -> 47, +1 per new module, nothing else moved.
+# PACE-45: `tex_engine.run()` reads `tex_runtime.pacing.cook_done_event` on every cook (the
+# `CookResult.done` fence), so `tex_engine.py` imports it eagerly at module scope alongside
+# `profile` — the same reason every other `tex_runtime` leaf it already used is eager, not
+# lazy. 47 -> 48, +1 for this one new module, nothing else moved.
 _BARE_TOUCH_TEX_MODULES_MAX = 1
 _BARE_TOUCH_TORCH_MODULES = 0
-_TEX_ENGINE_TEX_MODULES_MAX = 47
+_TEX_ENGINE_TEX_MODULES_MAX = 48
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:
