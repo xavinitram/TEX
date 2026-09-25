@@ -92,6 +92,12 @@ unset and no `--ci-python`, **that leg runs under `sys.executable`**: the same i
 the other legs, proving less, and the key and the printed line say exactly that by naming the
 same path twice.
 
+`TEX_CACHE_DIR` (a leg's TEX-side cache) is scratch and wiped fresh every run, on purpose — but
+`TORCHINDUCTOR_CACHE_DIR` (its torch.compile/Inductor kernel sub-cache) is pinned to a PERSISTENT
+per-leg directory instead (`_inductor_cache_dir`, next to the verdict cache above), reused across
+runs: fewer never-before-seen compiled DLLs per run is fewer chances for an OS reputation check
+(Windows Application/Smart App Control) to block one (V045-FIX; `GATE-SAC.md`).
+
 `tools/` is excluded from the published archive (`.comfyignore`), so nothing here ships.
 """
 from __future__ import annotations
@@ -270,6 +276,30 @@ def _cache_path() -> str:
     if env:
         return env
     return os.path.join(tempfile.gettempdir(), "tex-gate-verdicts.json")
+
+
+def _inductor_cache_dir(leg_name: str) -> str:
+    """PERSISTENT torch.compile/Inductor kernel cache for `leg_name` — deliberately NOT under
+    `scratch` (V045-FIX). `TEX_CACHE_DIR` (below) is wiped fresh every run on purpose, so it
+    doubled as a fresh `TORCHINDUCTOR_CACHE_DIR` too: every leg that forces a CPU/CUDA compile
+    (the tiered-noise promotion tests) therefore built and loaded a never-before-seen native
+    kernel on EVERY gate run, which is exactly the shape a Windows Application/Smart App
+    Control policy's reputation check can intermittently block (`GATE-SAC.md`; three
+    occurrences the same day). Reusing compiled kernels across runs means far fewer
+    never-seen DLLs for that check to see, so this lives next to the verdict cache above:
+    same convention (`TEX_GATE_CACHE`-style env override, else a fixed name under the OS temp
+    dir — portable, and outside both the repository and the per-run scratch dir), one
+    directory per LEG so no two legs' compiled artifacts collide. Never wiped by this file, by
+    `--no-cache` or by a `--scratch` change — only `TEX_CACHE_DIR`'s per-run freshness is about
+    the verdict; torch's own cache is content-addressed by the generated source, so a changed
+    kernel gets a new entry rather than serving a stale one. A test that must observe an
+    actually-cold Inductor compile gets its OWN fresh directory locally instead of relying on
+    this one being empty — see `tests/helpers.py` and its callers."""
+    root = os.environ.get("TEX_GATE_INDUCTOR_CACHE") or \
+        os.path.join(tempfile.gettempdir(), "tex-gate-inductor-cache")
+    d = os.path.join(root, leg_name)
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def _cache_read(key: str) -> dict | None:
@@ -460,7 +490,13 @@ def _run(leg: Leg, argv: list, cwd: str, env_extra: dict, scratch: str, verbose:
     shutil.rmtree(cache, ignore_errors=True)
     os.makedirs(cache, exist_ok=True)
     junit = os.path.join(scratch, f"junit-{leg.name}.xml")
-    env = dict(os.environ, TEX_CACHE_DIR=cache, **env_extra)
+    # V045-FIX: TEX_CACHE_DIR stays fresh every run (the verdict's cold-cache promise is
+    # unchanged) -- only TORCHINDUCTOR_CACHE_DIR is pinned to the PERSISTENT per-leg dir, so a
+    # tiered-noise test that forces a compile reuses last run's kernel instead of building and
+    # loading a never-before-seen one. `env_extra` can still override either, so an explicit
+    # per-call value always wins.
+    env = dict(os.environ, TEX_CACHE_DIR=cache, TORCHINDUCTOR_CACHE_DIR=_inductor_cache_dir(leg.name))
+    env.update(env_extra)
     t0 = time.time()
     proc = subprocess.run(argv + [f"--junit-xml={junit}"], cwd=cwd, env=env,
                           capture_output=True, text=True, errors="replace")
@@ -585,8 +621,11 @@ def run_counts(python: str, baseline: str, scratch: str, verbose: bool) -> Leg:
     argv = [python, "-X", "utf8", "TEX_Wrangle/benchmarks/host_path_counts.py",
             *_COUNTS_SHAPE, "--counters-only", "--compare", baseline]
     t0 = time.time()
-    proc = subprocess.run(argv, cwd=_PARENT, env=dict(os.environ, TEX_CACHE_DIR=cache),
-                          capture_output=True, text=True, errors="replace")
+    proc = subprocess.run(
+        argv, cwd=_PARENT,
+        env=dict(os.environ, TEX_CACHE_DIR=cache,
+                 TORCHINDUCTOR_CACHE_DIR=_inductor_cache_dir(leg.name)),
+        capture_output=True, text=True, errors="replace")
     leg.seconds, leg.rc = time.time() - t0, proc.returncode
     tail = [ln.strip() for ln in proc.stdout.splitlines() if "counter row(s) moved" in ln]
     leg.summary = tail[-1] if tail else "(no compare summary line)"
