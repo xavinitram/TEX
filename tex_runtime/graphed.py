@@ -385,28 +385,50 @@ def _recover_from_capture_failure(dev_index=None) -> bool:
     set_rng_state does NOT clear it; the working protocol is to run a trivial
     successful 1-op capture whose generator epilogue clears the flag. Returns
     True if torch.rand works afterward. Caps at 6 iterations. HW-2: recover on the
-    COOK's device — recovering on the wrong device leaves the real generator poisoned."""
+    COOK's device — recovering on the wrong device leaves the real generator poisoned.
+
+    RACE-43: this runs a capture of its own (the trivial 1-op one), which carries the
+    exact same `torch.cuda.graph.__exit__`/`capture_end()` hazard the caller reached
+    here BECAUSE OF — belt-and-braces against this recovery attempt itself leaving the
+    current stream on its own internal capture stream if one of the six tries errors
+    out from inside the `with torch.cuda.graph(g):` block. `capture()`'s own restore
+    already covers the caller's stream for the ORIGINAL failure; this covers the
+    recovery path's stream on top of that, independently."""
     if dev_index is None:
         dev_index = torch.cuda.current_device()
     dev = f"cuda:{dev_index}"
-    for _ in range(6):
-        try:
-            with torch.cuda.device(dev_index):
-                torch.cuda.synchronize()
-                _ = (torch.zeros(1, device=dev) + 1)  # swallow a sticky error
-                g = torch.cuda.CUDAGraph()
-                s = torch.cuda.Stream()
-                s.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(s):
-                    with torch.cuda.graph(g):
-                        _ = torch.zeros(1, device=dev) + 1
-                torch.cuda.current_stream().wait_stream(s)
-                torch.cuda.synchronize()
-                _ = torch.rand(1, device=dev)  # verify generator is clean
-            return True
-        except Exception:
-            continue
-    return False
+    # Guarded: `dev_index` reaches here from a caught capture exception, so it is
+    # whatever `capture()` was given — reading ITS current stream must not itself be
+    # the first real touch of a device index that turns out to be bad (a test drives
+    # exactly that: `torch.cuda.device` mocked to abort before any real CUDA op, which
+    # `current_stream(dev_index)` would otherwise reach a beat too early and abort the
+    # whole recovery before the loop below even starts).
+    try:
+        saved_stream = torch.cuda.current_stream(dev_index)
+    except Exception:
+        saved_stream = None
+    try:
+        for _ in range(6):
+            try:
+                with torch.cuda.device(dev_index):
+                    torch.cuda.synchronize()
+                    _ = (torch.zeros(1, device=dev) + 1)  # swallow a sticky error
+                    g = torch.cuda.CUDAGraph()
+                    s = torch.cuda.Stream()
+                    s.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(s):
+                        with torch.cuda.graph(g):
+                            _ = torch.zeros(1, device=dev) + 1
+                    torch.cuda.current_stream().wait_stream(s)
+                    torch.cuda.synchronize()
+                    _ = torch.rand(1, device=dev)  # verify generator is clean
+                return True
+            except Exception:
+                continue
+        return False
+    finally:
+        if saved_stream is not None:
+            torch.cuda.set_stream(saved_stream)
 
 
 # ── The captured program ──────────────────────────────────────────────
@@ -463,10 +485,23 @@ class GraphedProgram:
         """Warm up, then capture. Returns True on success. HW-2: pin capture to the
         COOK's device — a cuda:1 cook must capture on cuda:1's stream, not whatever
         device happens to be current, else capture fails loudly and RNG-recovery runs
-        against the wrong generator (spuriously tripping the process-wide kill switch)."""
+        against the wrong generator (spuriously tripping the process-wide kill switch).
+
+        RACE-43: `torch.cuda.graph.__exit__` calls `capture_end()` BEFORE restoring the
+        caller's current stream, and a capture that failed partway (exactly the case
+        `_recover_from_capture_failure` exists for) makes `capture_end()` itself raise —
+        skipping the restore. Left alone, the CALLING THREAD's current stream is then
+        permanently the graph module's internal capture stream, invisible until some
+        unrelated later caller reads pixels through it with no fence. Save/restore the
+        stream here so every exit path — success, a caught capture failure, an
+        uncaught one — leaves the caller exactly where it found it."""
         global _CAPTURING
         _CAPTURING = True
         idx = _dev_index(device)
+        try:                                    # a bad idx must not skip the capture below
+            saved_stream = torch.cuda.current_stream(idx)
+        except Exception:
+            saved_stream = None
         try:
             with torch.cuda.device(idx):
                 return self._capture_inner(program, bindings, type_map, device,
@@ -474,6 +509,8 @@ class GraphedProgram:
                                            precision, used_builtins)
         finally:
             _CAPTURING = False
+            if saved_stream is not None:
+                torch.cuda.set_stream(saved_stream)
 
     def _capture_inner(self, program, bindings, type_map, device, latent_channel_count,
                        output_names, precision, used_builtins) -> bool:
