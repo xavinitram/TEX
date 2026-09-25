@@ -5,6 +5,44 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.2] - 2026-09-25 — "The stream comes back"
+
+A real, host-facing correctness fix: a failed CUDA-graph capture could leave the calling
+thread's current CUDA stream permanently non-default, with no fence anywhere to catch the
+cross-stream hazard that follows. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze is
+owed. **ComfyUI's single-threaded default-stream path produced the same pixels before and after
+this fix** — the exposure is any caller whose capture fails and that then keeps working on the
+same thread, which is not a shape the ComfyUI node's own call path ever produces.
+
+### Fixed
+
+- **A failed CUDA-graph capture no longer leaves the caller's CUDA stream stuck.** PyTorch's own
+  `torch.cuda.graph()` context manager ends a capture and restores the caller's stream in two
+  separate steps with no `try`/`finally` between them; if ending the capture itself raises (the
+  normal outcome of a capture-illegal operation aborting it), the stream restore never runs, and
+  the calling thread is left on the graph module's private capture stream for the rest of the
+  process. Any later work on that thread then runs cross-stream against whatever else it reads
+  or writes, with no fence in place, because nothing expected a cross-stream tensor to begin
+  with. `GraphedProgram.capture()` and its capture-failure recovery path now save the caller's
+  stream up front and restore it unconditionally on every exit, covering the case PyTorch's own
+  context manager does not.
+- **A permanent regression guard.** The test suite now resets and fails, by name, any test that
+  leaves the current CUDA stream non-default — the leak can no longer cascade silently into a
+  later, unrelated test.
+
+### For anyone vendoring this tree
+
+No newly reserved names; `LANGUAGE_VERSION` unmoved at `"0.25"`, no compat freeze owed; no
+default moves; no new shipping module filenames — the fix lands entirely inside
+`tex_runtime/graphed.py`; everything else in this release is `tests/`-only.
+**Cache cold-start, stated plainly:** `tex_runtime/graphed.py` is a tier-verdict cache file, so
+this release moves the tier-verdict/warm-state cache once on upgrade — a one-time recompile
+cost, never a pixel change. Neither the codegen (`.cg`) nor the AST (`.pkl`) cache is touched;
+`tex_runtime/interpreter.py` itself is unchanged in this release. **No user-visible behaviour
+change of any kind on the default ComfyUI path**: every default-path pixel is unchanged, because
+that path never produces a failed capture followed by more work on the same thread in the first
+place.
+
 ## [0.43.1] - 2026-09-25 — "Every code tested"
 
 A test-only patch: two error-code coverage gaps closed, one corpus-harness fix mirroring
