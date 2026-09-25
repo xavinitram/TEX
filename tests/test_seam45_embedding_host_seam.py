@@ -50,6 +50,8 @@ on purpose from inside a test).
 """
 from __future__ import annotations
 
+import dataclasses
+import enum
 import importlib
 import inspect
 
@@ -64,21 +66,36 @@ from helpers import SubTestResult
 #
 # value: (kind, sig) where kind is one of "class" / "function" / "callable" / "module", or the
 # plain runtime type name of a non-callable value ("str", "int", "float", "dict", "set", or an
-# enum's own class name); sig is `None` for a non-callable, else a tuple of
-# (param_name, param_kind, has_default) triples in declaration order. For a class, sig describes
-# `__init__` with `self` dropped; for a function/method reached by walking the CLASS (not an
-# instance), `self` is left in, exactly as `inspect.signature` reports it that way.
+# enum's own class name).
 #
-# A "callable" row whose object is a builtin or other C-implemented callable (`inspect.isbuiltin`
-# / `inspect.ismethoddescriptor`, e.g. a bound `dict.items`) always pins `sig=None` -- EXISTENCE
-# and `kind` only, never the parameter tuple. `inspect.signature` on a C callable is not
-# version-stable: CPython 3.13 renders `dict.items` as `()` from its Argument Clinic text
-# signature, while 3.11 raises ValueError ("no signature found"), so the SAME live symbol
-# produces two different frozen shapes depending only on which interpreter generated the table.
-# A pure-Python callable (anything `inspect.isfunction`/`inspect.ismethod` catches, or a plain
-# object whose `__call__` is Python-defined) keeps its full signature pin -- `inspect.signature`
-# is stable for those across interpreter versions because it reads the real `__code__`, not a
-# docstring-derived text signature.
+# sig's shape depends on kind, and the split below is the version-proofing rule (SEAM-45b):
+# `inspect.signature` is stable across CPython versions ONLY when it reads a real `__code__` --
+# a pure-Python function or method (`inspect.isfunction` / `inspect.ismethod`; a `def` reached
+# by walking a class also lands here, staticmethod/classmethod already unwrapped by `getattr`).
+# Everything else asks `inspect.signature` to render a signature CPython synthesises rather than
+# reads, and that rendering has already been proven to change shape between versions (see the
+# CLASS case below) -- so the rule pins those by existence and kind only, never a signature:
+#
+#   * "function": a tuple of (param_name, param_kind, has_default) triples in declaration order.
+#     For a method reached by walking the CLASS (not an instance), `self` is left in, exactly as
+#     `inspect.signature` reports it that way; for a bound method it is dropped.
+#   * "class": `sig` is NEVER an `__init__` signature -- whether a class's `__init__` is its own
+#     pure-Python `def` or falls through to a C ancestor (`object.__init__`, `BaseException.__init__`,
+#     `Enum`'s machinery) is not something this test can tell apart robustly, and the one caught by
+#     CI (`TEXType`, an Enum with no `__init__` of its own) proved `inspect.signature` on that
+#     fallback renders a DIFFERENT parameter tuple per interpreter version for the exact same live
+#     symbol. So every class is pinned by existence and kind only (`sig=None`), with two additive
+#     exceptions whose extra pin is itself version-stable because it never touches a signature:
+#       - an Enum subclass pins `("enum_members", (name, ...))` -- `EnumClass.__members__`/
+#         iteration order, stable across versions;
+#       - a `@dataclass` pins `("dataclass_fields", (name, ...))` -- `dataclasses.fields()`'
+#         declaration order, stable across versions and more meaningful to a host than a
+#         constructor signature anyway.
+#   * "callable": always `sig=None`. Covers builtins and other C-implemented callables
+#     (`inspect.isbuiltin` / `inspect.ismethoddescriptor`, e.g. a bound `dict.items` -- CPython
+#     3.13 renders it as `()` from its Argument Clinic text signature, 3.11 raises ValueError,
+#     "no signature found", for the SAME live symbol) and any other non-function/method callable.
+#   * "module": always `sig=None`.
 
 _TIER1_SPEC = {
     'TEX_Wrangle:__version__': ('str', None),
@@ -96,21 +113,21 @@ _TIER1_SPEC = {
     'tex_checkpoint:DEFAULT_THRESHOLD_MS': ('float', None),
     'tex_checkpoint:MIN_SAMPLES': ('int', None),
     'tex_compiler.ast_nodes:iter_child_nodes': ('function', (('node', 'POSITIONAL_OR_KEYWORD', False),)),
-    'tex_compiler.ast_nodes:Assignment': ('class', (('loc', 'POSITIONAL_OR_KEYWORD', True), ('target', 'POSITIONAL_OR_KEYWORD', True), ('value', 'POSITIONAL_OR_KEYWORD', True), ('op', 'POSITIONAL_OR_KEYWORD', True))),
-    'tex_compiler.ast_nodes:BindingRef': ('class', (('loc', 'POSITIONAL_OR_KEYWORD', True), ('name', 'POSITIONAL_OR_KEYWORD', True), ('kind', 'POSITIONAL_OR_KEYWORD', True), ('type_hint', 'POSITIONAL_OR_KEYWORD', True))),
-    'tex_compiler.ast_nodes:FunctionCall': ('class', (('loc', 'POSITIONAL_OR_KEYWORD', True), ('name', 'POSITIONAL_OR_KEYWORD', True), ('args', 'POSITIONAL_OR_KEYWORD', True))),
-    'tex_compiler.ast_nodes:ParamDecl': ('class', (('loc', 'POSITIONAL_OR_KEYWORD', True), ('name', 'POSITIONAL_OR_KEYWORD', True), ('type_hint', 'POSITIONAL_OR_KEYWORD', True), ('default_expr', 'POSITIONAL_OR_KEYWORD', True), ('metadata', 'POSITIONAL_OR_KEYWORD', True))),
-    'tex_compiler.types:TEXType': ('class', (('args', 'VAR_POSITIONAL', False), ('kwds', 'VAR_KEYWORD', False))),
+    'tex_compiler.ast_nodes:Assignment': ('class', ('dataclass_fields', ('loc', 'target', 'value', 'op'))),
+    'tex_compiler.ast_nodes:BindingRef': ('class', ('dataclass_fields', ('loc', 'name', 'kind', 'type_hint'))),
+    'tex_compiler.ast_nodes:FunctionCall': ('class', ('dataclass_fields', ('loc', 'name', 'args'))),
+    'tex_compiler.ast_nodes:ParamDecl': ('class', ('dataclass_fields', ('loc', 'name', 'type_hint', 'default_expr', 'metadata'))),
+    'tex_compiler.types:TEXType': ('class', ('enum_members', ('INT', 'FLOAT', 'VEC2', 'VEC3', 'VEC4', 'MAT3', 'MAT4', 'STRING', 'ARRAY', 'PLANES', 'VOID'))),
     'tex_compiler.types:TEXType.FLOAT': ('TEXType', None),
     'tex_compiler.types:TEXType.VEC4': ('TEXType', None),
-    'tex_cookqueue:CookQueue': ('class', (('name', 'KEYWORD_ONLY', True), ('min_quantum_ms', 'KEYWORD_ONLY', True), ('max_preemptions', 'KEYWORD_ONLY', True))),
-    'tex_cookqueue:Job': ('class', (('id', 'POSITIONAL_OR_KEYWORD', False), ('klass', 'POSITIONAL_OR_KEYWORD', False), ('fn', 'POSITIONAL_OR_KEYWORD', False), ('reason', 'POSITIONAL_OR_KEYWORD', True), ('confidence', 'POSITIONAL_OR_KEYWORD', True), ('profile_key', 'POSITIONAL_OR_KEYWORD', True), ('px', 'POSITIONAL_OR_KEYWORD', True), ('cost_ms', 'POSITIONAL_OR_KEYWORD', True), ('score', 'POSITIONAL_OR_KEYWORD', True), ('feeds_profile', 'POSITIONAL_OR_KEYWORD', True), ('inputs', 'POSITIONAL_OR_KEYWORD', True), ('state', 'POSITIONAL_OR_KEYWORD', True), ('value', 'POSITIONAL_OR_KEYWORD', True), ('error', 'POSITIONAL_OR_KEYWORD', True), ('preempt_requested', 'POSITIONAL_OR_KEYWORD', True), ('shed_requested', 'POSITIONAL_OR_KEYWORD', True), ('resumed', 'POSITIONAL_OR_KEYWORD', True), ('attempts', 'POSITIONAL_OR_KEYWORD', True), ('preemptions', 'POSITIONAL_OR_KEYWORD', True), ('started_at', 'POSITIONAL_OR_KEYWORD', True), ('_done', 'POSITIONAL_OR_KEYWORD', True))),
+    'tex_cookqueue:CookQueue': ('class', None),
+    'tex_cookqueue:Job': ('class', ('dataclass_fields', ('id', 'klass', 'fn', 'reason', 'confidence', 'profile_key', 'px', 'cost_ms', 'score', 'feeds_profile', 'inputs', 'state', 'value', 'error', 'preempt_requested', 'shed_requested', 'resumed', 'attempts', 'preemptions', 'started_at', '_done'))),
     'tex_cookqueue:CLASS_NAMES': ('dict', None),
     'tex_cookqueue:COMMITTED': ('int', None),
     'tex_cookqueue:IDLE_CHECKPOINT': ('str', None),
     'tex_cookqueue:INTERACTIVE': ('int', None),
     'tex_cookqueue:SPECULATIVE': ('int', None),
-    'tex_cookqueue:SpeculativePolicy': ('class', (('min_value_ms', 'KEYWORD_ONLY', True), ('max_pending', 'KEYWORD_ONLY', True), ('min_confidence', 'KEYWORD_ONLY', True), ('max_cost_ms', 'KEYWORD_ONLY', True), ('unknown_cost_ms', 'KEYWORD_ONLY', True), ('unknown_min_confidence', 'KEYWORD_ONLY', True), ('predict', 'KEYWORD_ONLY', True))),
+    'tex_cookqueue:SpeculativePolicy': ('class', None),
     'tex_engine:cook': ('function', (('code', 'POSITIONAL_OR_KEYWORD', False), ('bindings', 'POSITIONAL_OR_KEYWORD', False), ('kwargs', 'VAR_KEYWORD', False))),
     'tex_engine:cook_stage_list': ('function', (('stages', 'POSITIONAL_OR_KEYWORD', False), ('device', 'KEYWORD_ONLY', True), ('precision', 'KEYWORD_ONLY', True), ('latent_channel_count', 'KEYWORD_ONLY', True), ('time_context', 'KEYWORD_ONLY', True), ('cancel', 'KEYWORD_ONLY', True), ('on_progress', 'KEYWORD_ONLY', True))),
     'tex_engine:boundary_lineage_key': ('function', (('stages', 'POSITIONAL_OR_KEYWORD', False), ('k', 'POSITIONAL_OR_KEYWORD', False), ('device', 'POSITIONAL_OR_KEYWORD', False), ('precision', 'POSITIONAL_OR_KEYWORD', False), ('upstream', 'KEYWORD_ONLY', False), ('time_context', 'KEYWORD_ONLY', True), ('canvas', 'KEYWORD_ONLY', True), ('latent_channel_count', 'KEYWORD_ONLY', True))),
@@ -125,18 +142,18 @@ _TIER1_SPEC = {
     'tex_fusion:is_linear_stage_list': ('function', (('stages', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_fusion:region_to_stages': ('function', (('region', 'POSITIONAL_OR_KEYWORD', False), ('node_code', 'POSITIONAL_OR_KEYWORD', False), ('node_params', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_fusion:_MAX_FUSED_REGION_STAGES': ('int', None),
-    'tex_io:BufferDesc': ('class', (('storage', 'POSITIONAL_OR_KEYWORD', True), ('transfer', 'POSITIONAL_OR_KEYWORD', True))),
+    'tex_io:BufferDesc': ('class', ('dataclass_fields', ('storage', 'transfer'))),
     'tex_io:decode_to_fp32': ('function', (('t', 'POSITIONAL_OR_KEYWORD', False), ('desc', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_io:__module_itself__': ('module', None),
     'tex_io.exr:read_exr': ('function', (('src', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_io.exr:write_exr': ('function', (('path', 'POSITIONAL_OR_KEYWORD', False), ('pixels', 'POSITIONAL_OR_KEYWORD', False), ('channels', 'KEYWORD_ONLY', True), ('half', 'KEYWORD_ONLY', True), ('compression', 'KEYWORD_ONLY', True))),
-    'tex_io.exr:EXRError': ('class', (('args', 'VAR_POSITIONAL', False), ('kwargs', 'VAR_KEYWORD', False))),
+    'tex_io.exr:EXRError': ('class', None),
     'tex_io.png:write_png16': ('function', (('path', 'POSITIONAL_OR_KEYWORD', False), ('u16', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_lazy:lazy_required_bindings': ('function', (('code', 'POSITIONAL_OR_KEYWORD', False), ('param_values', 'POSITIONAL_OR_KEYWORD', True))),
-    'tex_marshalling:BufferMeta': ('class', (('colorspace', 'POSITIONAL_OR_KEYWORD', True), ('premult', 'POSITIONAL_OR_KEYWORD', True), ('frame', 'POSITIONAL_OR_KEYWORD', True), ('extra', 'POSITIONAL_OR_KEYWORD', True))),
+    'tex_marshalling:BufferMeta': ('class', ('dataclass_fields', ('colorspace', 'premult', 'frame', 'extra'))),
     'tex_marshalling:get_egress_profile': ('function', ()),
     'tex_marshalling:set_egress_profile': ('function', (('name', 'POSITIONAL_OR_KEYWORD', False),)),
-    'tex_marshalling:Promise': ('class', (('name', 'POSITIONAL_OR_KEYWORD', False), ('type', 'KEYWORD_ONLY', True), ('shape', 'KEYWORD_ONLY', True), ('device', 'KEYWORD_ONLY', True))),
+    'tex_marshalling:Promise': ('class', None),
     'tex_marshalling:map_inferred_type': ('function', (('inferred', 'POSITIONAL_OR_KEYWORD', False), ('has_latent_input', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_marshalling:merge_buffer_meta': ('function', (('metas', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_marshalling:prepare_output': ('function', (('raw', 'POSITIONAL_OR_KEYWORD', False), ('output_type', 'POSITIONAL_OR_KEYWORD', False), ('profile', 'KEYWORD_ONLY', True))),
@@ -161,7 +178,7 @@ _TIER1_SPEC = {
     'tex_provider:source_flags': ('function', (('source_keys', 'VAR_POSITIONAL', False),)),
     'tex_recovery:atomic_write': ('function', (('path', 'POSITIONAL_OR_KEYWORD', False), ('write', 'POSITIONAL_OR_KEYWORD', False), ('fsync', 'KEYWORD_ONLY', True))),
     'tex_recovery:sweep_temps': ('function', (('directory', 'POSITIONAL_OR_KEYWORD', False),)),
-    'tex_results:ResultCache': ('class', (('budget_mb', 'KEYWORD_ONLY', True), ('disk_budget_mb', 'KEYWORD_ONLY', True), ('cache_dir', 'KEYWORD_ONLY', True))),
+    'tex_results:ResultCache': ('class', None),
     'tex_results:ResultCache.put': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('key', 'POSITIONAL_OR_KEYWORD', False), ('tensor', 'POSITIONAL_OR_KEYWORD', False), ('canvas', 'KEYWORD_ONLY', True), ('quality', 'KEYWORD_ONLY', True), ('storage', 'KEYWORD_ONLY', True), ('kind', 'KEYWORD_ONLY', True), ('home', 'KEYWORD_ONLY', True), ('mask_eligible', 'KEYWORD_ONLY', True))),
     'tex_results:ResultCache.stats': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_results:ResultCache.evict_bytes': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('need', 'POSITIONAL_OR_KEYWORD', False), ('dev_type', 'KEYWORD_ONLY', True), ('playhead', 'KEYWORD_ONLY', True))),
@@ -175,14 +192,14 @@ _TIER1_SPEC = {
     'tex_roi:covers': ('function', (('valid', 'POSITIONAL_OR_KEYWORD', False), ('needed', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_roi:canonical_roi': ('function', (('roi', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_roi:stage_halo': ('function', (('code', 'POSITIONAL_OR_KEYWORD', False), ('param_values', 'POSITIONAL_OR_KEYWORD', True), ('binding_types', 'POSITIONAL_OR_KEYWORD', True))),
-    'tex_runtime.host:CookCancelled': ('class', (('args', 'VAR_POSITIONAL', False), ('kwargs', 'VAR_KEYWORD', False))),
-    'tex_runtime.host:NullHostServices': ('class', (('args', 'VAR_POSITIONAL', False), ('kwargs', 'VAR_KEYWORD', False))),
+    'tex_runtime.host:CookCancelled': ('class', None),
+    'tex_runtime.host:NullHostServices': ('class', None),
     'tex_runtime.profile:enabled': ('function', ()),
     'tex_runtime.profile:make_key': ('function', (('program_fp', 'POSITIONAL_OR_KEYWORD', False), ('device_type', 'POSITIONAL_OR_KEYWORD', False), ('precision', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_runtime.profile:reset': ('function', ()),
     'tex_runtime.profile:snapshot': ('function', ()),
     'tex_runtime.profile:enable': ('function', ()),
-    'tex_runtime.profile:measure': ('class', (('key', 'POSITIONAL_OR_KEYWORD', False), ('spatial', 'POSITIONAL_OR_KEYWORD', True), ('device', 'KEYWORD_ONLY', True), ('stages', 'KEYWORD_ONLY', True))),
+    'tex_runtime.profile:measure': ('class', None),
     'tex_runtime.profile:predict': ('function', (('key', 'POSITIONAL_OR_KEYWORD', False), ('spatial', 'POSITIONAL_OR_KEYWORD', True))),
     'tex_runtime.profile:samples': ('function', (('key', 'POSITIONAL_OR_KEYWORD', False), ('spatial', 'POSITIONAL_OR_KEYWORD', True), ('need_stages', 'KEYWORD_ONLY', True))),
     'tex_runtime.profile:stage_snapshot': ('function', (('key', 'POSITIONAL_OR_KEYWORD', False), ('spatial', 'POSITIONAL_OR_KEYWORD', True), ('need', 'KEYWORD_ONLY', True))),
@@ -196,21 +213,21 @@ _TIER1_SPEC = {
     'tex_tool:validate_manifest': ('function', (('raw', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_tool:warm_tool': ('function', (('manifest', 'POSITIONAL_OR_KEYWORD', False), ('device', 'KEYWORD_ONLY', True), ('precision', 'KEYWORD_ONLY', True), ('cancel', 'KEYWORD_ONLY', True))),
     'tex_tool:write_tool': ('function', (('manifest_or_dict', 'POSITIONAL_OR_KEYWORD', False), ('dest_dir', 'POSITIONAL_OR_KEYWORD', True))),
-    'tex_tool:TEXToolError': ('class', (('args', 'VAR_POSITIONAL', False), ('code', 'KEYWORD_ONLY', True), ('input', 'KEYWORD_ONLY', True))),
+    'tex_tool:TEXToolError': ('class', None),
 }
 
 _TIER2_SPEC = {
     'TEX_Wrangle:__file__': ('str', None),
     'tex_api:execute': ('function', (('program', 'POSITIONAL_OR_KEYWORD', False), ('bindings', 'POSITIONAL_OR_KEYWORD', False), ('device', 'KEYWORD_ONLY', True), ('precision', 'KEYWORD_ONLY', True), ('output_names', 'KEYWORD_ONLY', True), ('cancel', 'KEYWORD_ONLY', True), ('on_progress', 'KEYWORD_ONLY', True))),
     'tex_api:__module_itself__': ('module', None),
-    'tex_cache:TEXCache': ('class', (('cache_dir', 'POSITIONAL_OR_KEYWORD', True),)),
+    'tex_cache:TEXCache': ('class', None),
     'tex_cache:TEXCache.compile_ast': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('program', 'POSITIONAL_OR_KEYWORD', False), ('binding_types', 'POSITIONAL_OR_KEYWORD', False), ('source', 'KEYWORD_ONLY', False))),
     'tex_cache:TEXCache.get': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('code', 'POSITIONAL_OR_KEYWORD', False), ('binding_types', 'POSITIONAL_OR_KEYWORD', False), ('fp', 'KEYWORD_ONLY', True))),
     'tex_cache:__file__': ('str', None),
     'tex_checkpoint:_resolve_cuts': ('function', (('stages', 'POSITIONAL_OR_KEYWORD', False), ('result_cache', 'POSITIONAL_OR_KEYWORD', False), ('cuts', 'POSITIONAL_OR_KEYWORD', False), ('latent_channel_count', 'KEYWORD_ONLY', False), ('upstream', 'KEYWORD_ONLY', False), ('precision', 'KEYWORD_ONLY', False), ('threshold_ms', 'KEYWORD_ONLY', False), ('profile_key', 'KEYWORD_ONLY', False), ('spatial', 'KEYWORD_ONLY', False), ('device', 'KEYWORD_ONLY', False))),
     'tex_cli:run_program': ('function', (('code', 'POSITIONAL_OR_KEYWORD', False), ('image', 'POSITIONAL_OR_KEYWORD', False), ('device', 'POSITIONAL_OR_KEYWORD', True), ('precision', 'POSITIONAL_OR_KEYWORD', True), ('compile_mode', 'POSITIONAL_OR_KEYWORD', True), ('profile', 'POSITIONAL_OR_KEYWORD', True))),
-    'tex_compiler.diagnostics:SourceLoc': ('class', (('line', 'POSITIONAL_OR_KEYWORD', True), ('col', 'POSITIONAL_OR_KEYWORD', True), ('stage', 'POSITIONAL_OR_KEYWORD', True), ('end_line', 'POSITIONAL_OR_KEYWORD', True))),
-    'tex_compiler.diagnostics:TEXDiagnostic': ('class', (('code', 'POSITIONAL_OR_KEYWORD', False), ('severity', 'POSITIONAL_OR_KEYWORD', False), ('message', 'POSITIONAL_OR_KEYWORD', False), ('loc', 'POSITIONAL_OR_KEYWORD', False), ('source_line', 'POSITIONAL_OR_KEYWORD', False), ('end_col', 'POSITIONAL_OR_KEYWORD', True), ('suggestions', 'POSITIONAL_OR_KEYWORD', True), ('hint', 'POSITIONAL_OR_KEYWORD', True), ('docs_url', 'POSITIONAL_OR_KEYWORD', True), ('phase', 'POSITIONAL_OR_KEYWORD', True))),
+    'tex_compiler.diagnostics:SourceLoc': ('class', None),
+    'tex_compiler.diagnostics:TEXDiagnostic': ('class', ('dataclass_fields', ('code', 'severity', 'message', 'loc', 'source_line', 'end_col', 'suggestions', 'hint', 'docs_url', 'phase'))),
     'tex_compiler.type_checker:BINDING_HINT_TYPES.items': ('callable', None),
     'tex_compiler.type_checker:BINDING_HINT_TYPES': ('dict', None),
     'tex_compiler.types:CHANNEL_MAP': ('dict', None),
@@ -219,7 +236,7 @@ _TIER2_SPEC = {
     'tex_compiler.types:TEXType.VEC3': ('TEXType', None),
     'tex_compiler.types:TEXType.VEC3.channels': ('int', None),
     'tex_compiler.types:VALID_SWIZZLES': ('set', None),
-    'tex_cookqueue:QueueStats': ('class', (('submitted', 'POSITIONAL_OR_KEYWORD', True), ('completed', 'POSITIONAL_OR_KEYWORD', True), ('failed', 'POSITIONAL_OR_KEYWORD', True), ('cancelled', 'POSITIONAL_OR_KEYWORD', True), ('preempted', 'POSITIONAL_OR_KEYWORD', True), ('requeued', 'POSITIONAL_OR_KEYWORD', True), ('refused', 'POSITIONAL_OR_KEYWORD', True), ('shed', 'POSITIONAL_OR_KEYWORD', True), ('preempt_denied', 'POSITIONAL_OR_KEYWORD', True), ('waiting', 'POSITIONAL_OR_KEYWORD', True))),
+    'tex_cookqueue:QueueStats': ('class', ('dataclass_fields', ('submitted', 'completed', 'failed', 'cancelled', 'preempted', 'requeued', 'refused', 'shed', 'preempt_denied', 'waiting'))),
     'tex_cookqueue:CANCELLED': ('str', None),
     'tex_cookqueue:CookQueue.__init__': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('name', 'KEYWORD_ONLY', True), ('min_quantum_ms', 'KEYWORD_ONLY', True), ('max_preemptions', 'KEYWORD_ONLY', True))),
     'tex_cookqueue:CookQueue.submit': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('fn', 'POSITIONAL_OR_KEYWORD', False), ('klass', 'KEYWORD_ONLY', True), ('reason', 'KEYWORD_ONLY', True), ('confidence', 'KEYWORD_ONLY', True), ('profile_key', 'KEYWORD_ONLY', True), ('px', 'KEYWORD_ONLY', True), ('cost_ms', 'KEYWORD_ONLY', True), ('feeds_profile', 'KEYWORD_ONLY', True), ('inputs', 'KEYWORD_ONLY', True))),
@@ -236,7 +253,7 @@ _TIER2_SPEC = {
     'tex_engine:__module_itself__': ('module', None),
     'tex_engine:MAX_OUTPUTS': ('int', None),
     'tex_fusion:detect_region_plans': ('function', (('graph', 'POSITIONAL_OR_KEYWORD', False),)),
-    'tex_fusion:FusionError': ('class', (('args', 'VAR_POSITIONAL', False), ('kwargs', 'VAR_KEYWORD', False))),
+    'tex_fusion:FusionError': ('class', None),
     'tex_fusion:compile_fused': ('function', (('stages', 'POSITIONAL_OR_KEYWORD', False), ('infer_binding_type', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_fusion:prepare_fused': ('function', (('spec', 'POSITIONAL_OR_KEYWORD', False), ('terminal_code', 'POSITIONAL_OR_KEYWORD', False), ('terminal_bindings', 'POSITIONAL_OR_KEYWORD', False), ('infer_binding_type', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_io:encode_from_fp32': ('function', (('t', 'POSITIONAL_OR_KEYWORD', False), ('desc', 'POSITIONAL_OR_KEYWORD', False))),
@@ -254,25 +271,25 @@ _TIER2_SPEC = {
     'tex_provider:provider_id': ('function', (('provider', 'POSITIONAL_OR_KEYWORD', True),)),
     'tex_provider:_normalize': ('function', (('frame', 'POSITIONAL_OR_KEYWORD', False), ('source_key', 'POSITIONAL_OR_KEYWORD', False), ('t', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_provider:quantize_at_rate': ('function', (('t', 'POSITIONAL_OR_KEYWORD', False), ('rate', 'POSITIONAL_OR_KEYWORD', False))),
-    'tex_provider:SyntheticFrameProvider': ('class', (('res', 'KEYWORD_ONLY', True), ('channels', 'KEYWORD_ONLY', True), ('rate', 'KEYWORD_ONLY', True), ('device', 'KEYWORD_ONLY', True), ('provider_id', 'KEYWORD_ONLY', True), ('latency_s', 'KEYWORD_ONLY', True))),
+    'tex_provider:SyntheticFrameProvider': ('class', None),
     'tex_provider:__module_itself__': ('module', None),
     'tex_provider:E_NO_PROVIDER': ('str', None),
-    'tex_provider:NullFrameProvider': ('class', (('args', 'VAR_POSITIONAL', False), ('kwargs', 'VAR_KEYWORD', False))),
-    'tex_recovery:Journal': ('class', (('snapshot_path', 'POSITIONAL_OR_KEYWORD', False),)),
+    'tex_provider:NullFrameProvider': ('class', None),
+    'tex_recovery:Journal': ('class', None),
     'tex_recovery:TMP_PREFIX': ('str', None),
     'tex_runtime.compiled:__module_itself__': ('module', None),
     'tex_runtime.compiled:_try_codegen': ('function', (('program', 'POSITIONAL_OR_KEYWORD', False), ('type_map', 'POSITIONAL_OR_KEYWORD', False), ('fingerprint', 'POSITIONAL_OR_KEYWORD', True), ('_masked_flow', 'KEYWORD_ONLY', True), ('emit_cancel_polls', 'KEYWORD_ONLY', True))),
     'tex_runtime.graphed:__module_itself__': ('module', None),
     'tex_runtime.graphed:GraphedProgram.capture': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('program', 'POSITIONAL_OR_KEYWORD', False), ('bindings', 'POSITIONAL_OR_KEYWORD', False), ('type_map', 'POSITIONAL_OR_KEYWORD', False), ('device', 'POSITIONAL_OR_KEYWORD', False), ('latent_channel_count', 'POSITIONAL_OR_KEYWORD', False), ('output_names', 'POSITIONAL_OR_KEYWORD', False), ('precision', 'POSITIONAL_OR_KEYWORD', False), ('used_builtins', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_runtime.host:get_host_services': ('function', ()),
-    'tex_runtime.interpreter:InterpreterError': ('class', (('message', 'POSITIONAL_OR_KEYWORD', False), ('loc', 'POSITIONAL_OR_KEYWORD', True), ('source', 'KEYWORD_ONLY', True), ('code', 'KEYWORD_ONLY', True), ('hint', 'KEYWORD_ONLY', True))),
+    'tex_runtime.interpreter:InterpreterError': ('class', None),
     'tex_runtime.profile:disable': ('function', ()),
     'tex_runtime.profile:record': ('function', (('key', 'POSITIONAL_OR_KEYWORD', False), ('ms', 'POSITIONAL_OR_KEYWORD', False), ('spatial', 'POSITIONAL_OR_KEYWORD', True))),
     'tex_runtime.profile:stage_costs': ('function', (('key', 'POSITIONAL_OR_KEYWORD', False), ('spatial', 'POSITIONAL_OR_KEYWORD', True))),
     'tex_runtime.profile:bucket_of': ('function', (('spatial', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_runtime.profile:stage_sink': ('function', ()),
     'tex_runtime.profile:_STATE_MAX': ('int', None),
-    'tex_scheduler:SchedNode': ('class', (('id', 'POSITIONAL_OR_KEYWORD', False), ('program_fp', 'POSITIONAL_OR_KEYWORD', True), ('spatial_shape', 'POSITIONAL_OR_KEYWORD', True), ('precision', 'POSITIONAL_OR_KEYWORD', True), ('out_nbytes', 'POSITIONAL_OR_KEYWORD', True), ('peak_bytes', 'POSITIONAL_OR_KEYWORD', True), ('inputs', 'POSITIONAL_OR_KEYWORD', True), ('pin', 'POSITIONAL_OR_KEYWORD', True))),
+    'tex_scheduler:SchedNode': ('class', ('dataclass_fields', ('id', 'program_fp', 'spatial_shape', 'precision', 'out_nbytes', 'peak_bytes', 'inputs', 'pin'))),
     'tex_scheduler:_candidates': ('function', (('node', 'POSITIONAL_OR_KEYWORD', False), ('devices', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_scheduler:_toposort': ('function', (('nodes', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_scheduler:plan_placement': ('function', (('nodes', 'POSITIONAL_OR_KEYWORD', False), ('devices', 'KEYWORD_ONLY', True), ('default_device', 'KEYWORD_ONLY', True), ('cook_cost', 'KEYWORD_ONLY', True), ('transfer_cost', 'KEYWORD_ONLY', True), ('previous', 'KEYWORD_ONLY', True), ('hysteresis_ms', 'KEYWORD_ONLY', True))),
@@ -338,13 +355,19 @@ def _sig_tuple(sig: inspect.Signature, skip_self: bool = False):
 
 
 def _describe(obj):
-    """(kind, sig) exactly in the frozen tables' shape -- see the module docstring."""
+    """(kind, sig) exactly in the frozen tables' shape -- see the module docstring.
+
+    SEAM-45b: a class is NEVER described by its `__init__` signature -- see the module-level
+    comment above `_TIER2_SPEC` for why (`inspect.signature` on a class's `__init__` is not
+    version-stable whenever that `__init__` is not the class's own pure-Python `def`, and this
+    function has no robust way to tell that apart from here). An Enum or a dataclass instead
+    pins the one thing about its shape that IS version-stable and does not touch a signature."""
     if inspect.isclass(obj):
-        try:
-            sig = inspect.signature(obj.__init__)
-        except (TypeError, ValueError):
-            return "class", None
-        return "class", _sig_tuple(sig, skip_self=True)
+        if issubclass(obj, enum.Enum):
+            return "class", ("enum_members", tuple(m.name for m in obj))
+        if dataclasses.is_dataclass(obj):
+            return "class", ("dataclass_fields", tuple(f.name for f in dataclasses.fields(obj)))
+        return "class", None
     if inspect.isfunction(obj) or inspect.ismethod(obj):
         try:
             sig = inspect.signature(obj)
@@ -354,16 +377,11 @@ def _describe(obj):
     if isinstance(obj, type(inspect)):   # a module object, of any module
         return "module", None
     if callable(obj) and not isinstance(obj, type):
-        if inspect.isbuiltin(obj) or inspect.ismethoddescriptor(obj):
-            # A builtin / C-implemented callable (e.g. a bound `dict.items`): its signature is
-            # not version-stable (see the module-level comment above `_TIER2_SPEC`) -- pin
-            # existence and kind only, never the parameter tuple.
-            return "callable", None
-        try:
-            sig = inspect.signature(obj)
-        except (TypeError, ValueError):
-            return "callable", None
-        return "callable", _sig_tuple(sig)
+        # Anything reaching here is not a pure-Python function/method (that branch is above):
+        # a builtin, a method descriptor, or any other C-implemented or non-`def`-backed
+        # callable. None of those have a version-stable `inspect.signature` (see the module
+        # docstring), so this is pinned by existence and kind only.
+        return "callable", None
     return type(obj).__name__, None
 
 
@@ -503,3 +521,41 @@ def test_seam45_mutation_proves_both_directions(r: SubTestResult):
                f"a removed symbol ({phantom_key}) did not red as 'no longer exists': {verdict!r}")
     else:
         r.ok(f"a removed symbol reds `_diff` -- {verdict}")
+
+
+def test_seam45b_class_pinning_mutation_proves_both_directions(r: SubTestResult):
+    """SEAM-45b's own mutation proof: a class is pinned by existence/kind plus, for an Enum or
+    a dataclass, its member/field NAMES (never an `__init__` signature -- see the module
+    docstring). This function proves that new pin still catches a rename in either direction,
+    the same way `test_seam45_mutation_proves_both_directions` proves it for a function's
+    keyword. Again: a COPY of a frozen row's expected shape is perturbed, never the real
+    symbol (invariant #7).
+
+    Direction 1 (a renamed Enum member): copy `TEXType`'s frozen `enum_members` tuple, rename
+    one member in the copy, and confirm `_diff` reds the live `TEXType` against it.
+    Direction 2 (a renamed dataclass field): copy `Job`'s frozen `dataclass_fields` tuple,
+    rename one field in the copy, and confirm `_diff` reds the live `Job` against it."""
+    print("\n--- SEAM-45b mutation: class pinning, both directions ---")
+
+    enum_key = "tex_compiler.types:TEXType"
+    enum_kind, (enum_tag, enum_members) = _TIER1_SPEC[enum_key]
+    renamed_members = tuple(
+        name + "_RENAMED" if name == "VOID" else name for name in enum_members)
+    verdict = _diff(enum_key, (enum_kind, (enum_tag, renamed_members)))
+    if verdict is None:
+        r.fail("SEAM-45b mutation (enum member rename)",
+               "a renamed Enum member in the frozen table did not red against the real symbol")
+    else:
+        r.ok("a renamed Enum member reds `_diff` -- " + verdict.splitlines()[0])
+
+    dc_key = "tex_cookqueue:Job"
+    dc_kind, (dc_tag, dc_fields) = _TIER1_SPEC[dc_key]
+    renamed_fields = tuple(
+        name + "_renamed" if name == "profile_key" else name for name in dc_fields)
+    verdict = _diff(dc_key, (dc_kind, (dc_tag, renamed_fields)))
+    if verdict is None:
+        r.fail("SEAM-45b mutation (dataclass field rename)",
+               "a renamed dataclass field in the frozen table did not red against the real "
+               "symbol")
+    else:
+        r.ok("a renamed dataclass field reds `_diff` -- " + verdict.splitlines()[0])
