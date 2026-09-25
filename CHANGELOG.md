@@ -5,6 +5,62 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.45.0] - 2026-09-25 — "The adoption point"
+
+Two small, additive host-facing surfaces; a frozen public seam for an embedding host, keyword
+parameters included; a purity contract for the two lineage-key functions; a full persisted-state
+and deserialization audit in `SECURITY.md`. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat
+freeze is owed. **ComfyUI's default-path pixels and call shape are unchanged** — every addition
+here is either read-only, opt-in, or documentation of behaviour that already existed.
+
+**From this release, TEX is patch-only until an embedding host that vendors it re-pins onto this
+release and reports back.** No new engine surface is planned before then.
+
+### Added
+
+- **`ResultCache.spill(key) -> bool`.** Spills one named, RAM-resident entry to the disk tier
+  immediately, reusing the exact mechanism `evict_bytes` already uses (`_remove`,
+  `_pending_spills`, `_claim_spill_ticket`, `_drain_spills`) rather than a second writer. This
+  reaches the one entry `evict_bytes`'s own oldest-first walk can never reach on its own — the
+  sole or most-recent entry, since the cache never drops below one resident entry on its own.
+  Returns `False` if the key is absent, already on disk, or no disk tier is reachable; a
+  caller that never calls it sees no change.
+- **`Program.time_reads: frozenset[str]`.** A new, derived, read-only field on the compiled
+  `Program`, naming which of `frame`, `fps`, `time`, `fetch_time` and `sample_time` a program
+  reads anywhere in its body — computed once at compile time from the AST alone, from the same
+  two checks the codegen tier and the CUDA-graph capturability gate already run internally.
+  Changes no fingerprint, cache key or pixel; answers a question a host previously had to
+  re-derive with its own AST walk.
+- **A frozen public seam for an embedding host.** A new test pins every symbol an embedding
+  host's own product code calls or references (116 rows, names and keyword parameters both —
+  a `**kwargs`-forwarding entry point is pinned by its forwarded signature, not just its own
+  name) plus every symbol only that host's own tests/scripts/benchmarks reach (87 rows, same
+  strictness, a softer promise). A renamed keyword or a removed symbol in either set now fails
+  a dedicated test instead of surfacing downstream as an unexplained break.
+- **A purity contract for `lineage_key` and `boundary_lineage_key`.** Both are now documented,
+  in terms precise enough for a host to build a memo on: pure functions of their own arguments
+  plus one per-process, per-device value (`env_epoch()`, itself fixed for the life of a
+  process). Calling either twice with the same arguments returns the same string for the life
+  of one process on one device.
+- **A full persisted-state and deserialization inventory in `SECURITY.md`.** Every file TEX
+  writes to disk, every site that reads one back, and the protection each carries. The three
+  raw unpickling sites a previous audit found are now confirmed to be one call site,
+  reached only after an HMAC-SHA256 trailer verifies. Five JSON-only sites (tier verdicts,
+  capturability warm state, a bandwidth model, user snippets, tool manifests) carry no
+  integrity check and are named as an open, data-poisoning-class-only advisory — `json.load`
+  cannot execute code, and each site already drops a foreign or malformed file to a cold
+  recompute rather than adopting it.
+
+### For anyone vendoring this tree
+
+No newly reserved names; `LANGUAGE_VERSION` unmoved at `"0.25"`; no default moves; no new
+shipping module filenames. **Cache cold-start, checked against `tex_cache.py` directly:**
+`tex_runtime/interpreter.py` (a `_CODEGEN_FILES` member) gained a few lines in this release's
+own simplify pass (consolidating where two time-builtin name sets are declared), so `.cg` and
+the tier-verdict/warm-state files go cold once on this upgrade; `.pkl` stays warm (no
+`_AST_FILES` member is touched). `tex_api.py` and `tex_results.py`, both edited for the two new
+surfaces above, are members of no cache-epoch watch-list, so neither adds a second cold start.
+
 ## [0.44.0] - 2026-09-25 — "The interactive path, measured"
 
 Two mechanical module splits regain size headroom; the interactive path gets measured against
