@@ -503,12 +503,12 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                 # node passes an interrupt token. Poll cancel per statement, but skip the `(i+1)/n`
                 # progress arithmetic only a wired on_progress consumes (measured ~37 ns/stmt).
                 for stmt in stmts:
-                    _pace.paced_check(cancel, self.device)   # PACE-45
+                    _pace.paced_check(cancel, dev)   # PACE-45: `dev` already resolved above
                     self._exec_stmt(stmt)
             else:
                 n = len(stmts) or 1
                 for i, stmt in enumerate(stmts):
-                    _pace.paced_check(cancel, self.device)   # PACE-45
+                    _pace.paced_check(cancel, dev)   # PACE-45: `dev` already resolved above
                     self._exec_stmt(stmt)
                     _report_progress(on_progress, "stmt", (i + 1) / n)
         finally:
