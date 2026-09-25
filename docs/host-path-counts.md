@@ -565,7 +565,7 @@ test before it starts, and cannot claim a win the instrument would not see.
    96²/48², and at 1024²/512², dev laptop). (This is also the LAT-4 LRU the harness had to
    defeat to measure the row honestly; see §2.)
 8. **Two lexes for a never-seen program.** `TEXCache.fingerprint` (`tex_cache.py:344`) calls
-   `param_only_names` (`tex_marshalling.py:837`), which tokenizes; the compile then tokenizes
+   `param_only_names` (`tex_marshalling.py:859`), which tokenizes; the compile then tokenizes
    again. The counts track exactly — `param_only_names` equals `fingerprint` in every column of
    §4.1 — and `fingerprint` itself is called **twice per cook**.
    *Shows fixed as:* `TEXCache.fingerprint` and `param_only_names` both going **2 → 1** per

@@ -206,7 +206,7 @@ Three consequences stated plainly:
 
 ## 6. Identity: the resolution hole the single-tap key had
 
-`cook_fused_cached` mints the boundary key **without** `canvas=` (`tex_chain.py:354`), so a
+`cook_fused_cached` mints the boundary key **without** `canvas=` (`tex_chain.py:371`), so a
 tap's identity carries no shape. `ResultCache.get` validates neither shape nor device — its
 `canvas` field is write-only metadata. Resolution identity therefore rides entirely on the
 host's `upstream` string, and nothing documents that it must encode one.

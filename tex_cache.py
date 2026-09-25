@@ -29,7 +29,10 @@ from .tex_compiler.ast_nodes import (BindingRef, ChannelAccess, NodeTransformer,
 from .tex_compiler.type_checker import TypeChecker, TypeCheckError, BINDING_HINT_TYPES
 from .tex_compiler.types import TEXType, planes_wires_enabled
 from .tex_compiler.optimizer import optimize
-from .tex_runtime.interpreter import _collect_identifiers
+# LINT-46: NOT imported at module scope. `.tex_runtime.interpreter` (a torch-module-scope
+# import, MEASURE-44 §3) is only reached from a real compile, at the two call sites below —
+# `check()`'s lint-only `parse_and_split` front end never calls `_collect_identifiers`, so a
+# module-scope import here forced torch onto that path for nothing.
 
 logger = logging.getLogger("TEX")
 
@@ -585,6 +588,7 @@ class TEXCache:
         type_map = TypeChecker(binding_types=binding_types, source=source,
                                strict_redeclare=False).check(program)
         # Pre-compute builtin identifiers (avoids AST walk on every execution)
+        from .tex_runtime.interpreter import _collect_identifiers
         used_builtins = _collect_identifiers(program)
         return (program, type_map, checker.referenced_bindings,
                 checker.assigned_bindings, checker.param_declarations, used_builtins)
@@ -714,6 +718,7 @@ class TEXCache:
             # Touch file to update access time for LRU eviction
             os.utime(path, None)
 
+            from .tex_runtime.interpreter import _collect_identifiers
             return (program, type_map, checker.referenced_bindings,
                     checker.assigned_bindings, checker.param_declarations,
                     _collect_identifiers(program))

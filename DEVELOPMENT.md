@@ -666,7 +666,7 @@ never retried (`tex_cookqueue.py:703-707`). A cook that already returned is neve
 flag raised while it ran (`tex_cookqueue.py:42-47`, `:754-760`).
 
 **Process-global, all of it** (one tenant per process today): host services
-(`tex_runtime/host.py:261-282`), the egress profile and ARRAY wires (`tex_marshalling.py:710-720`),
+(`tex_runtime/host.py:267-288`), the egress profile and ARRAY wires (`tex_marshalling.py:710-720`),
 the program/codegen cache under `TEX_CACHE_DIR`, the CACHE-5 governor, and the per-thread interpreter
 pool (ENG-9 above). The tiered noise caches are the one exception to `reset()`'s reach: a key's
 compiled tier is promoted starting its 4th call (`tex_runtime/noise.py:423-425`) and STAYS promoted —

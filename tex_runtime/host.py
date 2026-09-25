@@ -14,7 +14,10 @@ no-op `NullHostServices` (which still detects a torch OOM so standalone runs rec
 """
 from typing import Protocol
 
-import torch
+# PERF-44/IMPORT-44: NOT imported at module scope. This module's only torch users are
+# `_torch_oom`, `_allocator_slack` and `_cuda_free_memory` below (each imports it locally) —
+# unreachable on a pure-lint path (`tex_api.check()`). No annotation in this file names a
+# torch type, so nothing here needs a string annotation / TYPE_CHECKING guard to compensate.
 
 
 # ── SCHED-3: cancellation + progress ──────────────────────────────────────────
@@ -64,6 +67,7 @@ def _report_progress(cb, phase: str, frac: float) -> None:
 
 
 def _torch_oom(e) -> bool:
+    import torch
     oom_t = getattr(torch.cuda, "OutOfMemoryError", None)
     return isinstance(oom_t, type) and isinstance(e, oom_t)
 
@@ -94,6 +98,7 @@ def _allocator_slack(idx: int) -> int:
 
     Returns 0 on any shape surprise: slack is a refinement to the driver's number, and
     a wrong refinement is worse than none."""
+    import torch
     try:
         st = torch.cuda.memory_stats_as_nested_dict(device=idx)
         res = st["reserved_bytes"]["all"]["current"]
@@ -111,6 +116,7 @@ def _cuda_free_memory(device) -> "float | None":
     `reserved`, which the driver counts as used but torch will happily hand back out. So
     the cached-but-unallocated slack is added — otherwise a standalone cook would look
     starved and tile itself pointlessly. This is the same accounting a host does."""
+    import torch
     try:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         if dev.type != "cuda" or not torch.cuda.is_available():
