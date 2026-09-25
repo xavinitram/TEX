@@ -1,13 +1,5 @@
 {
   "schema": 1,
   "note": "The known-red allowlist tools/gate.py applies. EMPTY IS THE CORRECT STATE: every entry is a failure somebody has agreed to live with, so the file is a debt register, not a configuration. The schema, the 'when' vocabulary and the rules for adding or removing an entry are in tests/README.md, section 'The known-red allowlist'.",
-  "entries": [
-    {
-      "id": "tests/test_v018_docs.py::test_c6st_cache_count_agree",
-      "reason": "CANCEL-44 added a 42nd register row (compiled._cancel_codegen_memo, ARCHITECTURE.md) for a genuine new cache; AGENTS.md's own count ('The 41 caches are non-redundant') needs the matching one-word edit to '42', and AGENTS.md is a file this lane may never edit (tex-implementer.md's standing NEVER-edit list). The exact replacement text is in this ask's hand-back, 'Law edits owed'.",
-      "when": ["always"],
-      "condition": "always, until AGENTS.md's '41 caches' sentence is bumped to '42 caches'",
-      "owner": "the orchestrator, on landing -- applying the Law edit removes this entry in the same commit"
-    }
-  ]
+  "entries": []
 }
