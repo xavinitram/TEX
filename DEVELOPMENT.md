@@ -1452,4 +1452,15 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   guidance already warns can decay into decoration — or would strip the two hardened primitives
   of the shape an embedding host's consumer specifically needed them to have. Reopen only
   against a measured cost of keeping three shapes, not on aesthetics.
+- **TOOL-6 (side-by-side installed tool versions, semver-range resolution, a manifest content
+  hash), v0.44 — declined on ownership, not on difficulty.** An embedding host that already
+  owns a versioned tool store, its own resolution policy and its own trust hash over a tool's
+  canonical bytes has no use for a second, TEX-side copy of any of the three; asked directly,
+  the answer was that all three stay the host's. The one thing this closes permanently: **TEX
+  must never write a `content_hash`, or any other new field, into a tool manifest by default** —
+  doing so changes the manifest's own canonical bytes, which moves every trust hash a host has
+  already computed over that manifest, for every installed tool, on every host, silently. Any
+  future hash of a manifest's bytes lives BESIDE the manifest (a sidecar, or a value the caller
+  holds), never inside it, or is opt-in and off by default if a concrete consumer ever asks for
+  it. Reopen only against a named host asking for the opposite of what was asked here.
 

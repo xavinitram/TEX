@@ -5,6 +5,112 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.0] - 2026-09-25 — "The interactive path, measured"
+
+Two mechanical module splits regain size headroom; the interactive path gets measured against
+the embedding host's real tick shape (whole-frame, `compile_mode="none"`, unfused, fp32) rather
+than an assumed ROI-windowed one, and one measured cut lands; cancellation closes two real gaps.
+`tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze is owed. **Every default-path pixel
+and byte ComfyUI produces is unchanged** — every module move is byte-identical, every counts fix
+is pixel-identical (proven, not assumed), and cancellation is opt-in (`cancel=None` is the
+default and behaves exactly as before).
+
+### Added
+
+- **Two new `BENCH-2` counts scenarios matching the embedding host's real interactive tick**:
+  `whole_frame_chain_d1` and `whole_frame_chain_d3` — a ten-stage interpreter-tier chain cooked
+  whole-frame (`roi=None`), `compile_mode="none"`, fp32, unfused, `use_cache=False`, one cook per
+  dirty stage (D=1 or D=3 of ten). The existing `checkpoint_serve` scenario already drove
+  `cook_checkpointed` with `boundary_lineage_key`/`prefix_fingerprint` probes over the shape this
+  host actually uses, so it needed no change to become the second measuring stick.
+- **Cancellation now reaches two places it previously could not.** A program `_should_stencil_route`
+  reroutes to the compiled tier's stencil path — even under `compile_mode="none"` — now honours
+  `cancel=`, both at entry and, where the compiled variant supports it, between the stencil's own
+  emitted statements. Two builtins with a natural multi-pass shape (`gauss_blur`'s two separable
+  convolution passes; the mip-pyramid builder's per-level loop) now poll between passes instead of
+  running to completion uninterrupted. Every existing caller is unaffected: `cancel=None` remains
+  the default and is byte-identical to before this release.
+- **A permanent regression guard for the `.bool()`/`> 0.5` spatial-if formula pair.** A new pinned
+  test confirms the interpreter's and codegen's raw boolean formulas for "is this pixel on" agree
+  on NaN (they always did — both reduce to the same expression) but genuinely disagree on a raw,
+  unguarded negative integer condition. Confirmed **latent, not live**: both tiers' real ingestion
+  path casts any non-floating image-like binding to fp32 before either formula ever runs, so no
+  reachable program can trigger the disagreement today. The guard exists so this stays true.
+
+### Changed / Performance
+
+- **A `cook_checkpointed` serve is measured about 11.5% faster** (463 µs → 410 µs per tick, this
+  box, CPU, informational): `lazy_required_bindings`'s per-call source-hash is now memoized on a
+  cache hit instead of re-hashed every time, sharing the same source-digest memo `tex_roi._walk`
+  already uses for the identical reason. Pixel-identical — the memoized value is the same hash
+  that would have been recomputed.
+- **No measurable per-tick change on the ROI-windowed interactive scrub scenario.** Measured
+  directly (interleaved before/after legs, this box): mean per-tick time moved from about 5.21 ms
+  to 5.30 ms — within this scenario's own run-to-run spread (about 12%), not a real change. At
+  this gate shape the eliminated work (one avoided SHA-256 over a short program string; one
+  avoided attribute-resolution hook call) is microseconds against a tick dominated by the
+  interpreter's own tree-walk and autograd context management.
+- **A CUDA-graph-capturing program's cook path avoids re-hashing its own source on every
+  region-dependence check when the same source has already been seen.** Pixel- and
+  digest-identical; only a repeat SHA-256 over unchanged source is avoided.
+
+### Fixed
+
+- **A cook no longer fails outright when the OS blocks a freshly-compiled noise kernel from
+  loading.** On Windows, a policy such as Smart App Control (or any other load failure) could
+  prevent a just-compiled noise kernel `.pyd` from being imported. Before this fix, that made the
+  cook fail. Now, the cook falls back to the always-available, pixel-identical eager noise tier
+  and warns once instead of failing; further compilation attempts on the same process are skipped
+  once a block is seen, so the next cook does not pay the same failure again.
+- **`CookCancelled` raised from inside a stdlib builtin is no longer mis-wrapped as a generic
+  interpreter error.** A builtin polling for cancellation (the new gauss_blur/mip-pyramid mid-pass
+  polls) raised `CookCancelled` from inside a call the interpreter's function-call dispatcher
+  wraps in a catch-all; that catch-all now passes `CookCancelled` through unchanged, so a
+  cancelled cook surfaces as a clean cancellation instead of a generic function-call error. The
+  same guard was needed, and added, where the compiled tier falls back to the interpreter on any
+  failure.
+- **The release gate no longer prints a green verdict over a leg that never ran.** A leg whose
+  test process dies before writing a junit report at all (an import error before collection, for
+  example) is now a red, exactly like the counts leg's own existing guard for the same class of
+  failure — previously it parsed as zero failures and passed silently. The gate also now refuses
+  up front, loudly, when its own package is not importable as `TEX_Wrangle` from the directory it
+  is run from, rather than let every leg fail confusingly one at a time.
+- **The counts harness's frame filter no longer depends on the checkout directory being named
+  `TEX_Wrangle`.** It now anchors to the resolved package location instead of guessing from its
+  own file's directory name, so four counter tests no longer false-red from a differently-named
+  checkout (real CI is unaffected either way — it always checks out under that literal name).
+
+### For anyone vendoring this tree
+
+**Two mechanical splits, both additive, both regaining size headroom, neither changing any
+byte of behaviour:** `tex_results.py`'s CACHE-8 residency ladder (`set_vram_budget`,
+`_enforce_residency`, `_queue_demotions`, `_drain_demotes`, `_promote`) moved into a new
+`tex_results_residency.py`, inherited as a mixin — `tex_results.py` is not a member of any
+cache-epoch watch-list, so this split moves no epoch. `tex_runtime/interpreter.py`'s
+spatial-context setup, control-flow execution (if/for/while) and binding execution/assignment
+moved into three new sibling mixins, `interpreter_spatial.py`, `interpreter_control_flow.py`,
+`interpreter_binding.py` — inherited the same way, every `self._method(...)` call site
+unchanged. `interpreter.py` **is** a `_CODEGEN_FILES` member (`tex_cache.py`), so this edit
+moves the codegen/tier-verdict epoch once, as expected: `.cg` and the tier-verdict/warm-state
+files go cold once on this upgrade; `.pkl` stays warm (no `_AST_FILES` member is touched).
+**Stated exactly, checked against `tex_cache.py` directly rather than assumed: the three new
+sibling files are now themselves `_CODEGEN_FILES` members too**, beside `interpreter.py` —
+found missing during this release's own review and fixed before shipping, so an edit to any of
+the three moves the codegen epoch exactly as an `interpreter.py` edit does. `tex_results.py`
+is on no cache-epoch watch-list (checked the same way), so `tex_results_residency.py` needs
+none either. A new derivation test asserts every `interpreter_*.py`/`tex_results_*.py` sibling
+rides every watch-list its parent is on, so a future split of the same shape reds instead of
+silently going stale.
+
+No newly reserved names; `LANGUAGE_VERSION` unmoved at `"0.25"`; no default moves; no new
+top-level shipping module filenames beyond the two mixin-sibling sets named above. Every change
+lands in an existing module, a new sibling of one, or `tests/`/`benchmarks/`/`tools/`.
+
+Also in this release: three test/documentation-hygiene fixes with no behaviour change (a
+mutation-test anchor re-pointed after this release's own cancellation work, two dead
+documentation citations repaired, and an engine-custody test updated to recognise the new
+residency module).
+
 ## [0.43.2] - 2026-09-25 — "The stream comes back"
 
 A real, host-facing correctness fix: a failed CUDA-graph capture could leave the calling
