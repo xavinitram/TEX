@@ -68,6 +68,17 @@ from helpers import SubTestResult
 # (param_name, param_kind, has_default) triples in declaration order. For a class, sig describes
 # `__init__` with `self` dropped; for a function/method reached by walking the CLASS (not an
 # instance), `self` is left in, exactly as `inspect.signature` reports it that way.
+#
+# A "callable" row whose object is a builtin or other C-implemented callable (`inspect.isbuiltin`
+# / `inspect.ismethoddescriptor`, e.g. a bound `dict.items`) always pins `sig=None` -- EXISTENCE
+# and `kind` only, never the parameter tuple. `inspect.signature` on a C callable is not
+# version-stable: CPython 3.13 renders `dict.items` as `()` from its Argument Clinic text
+# signature, while 3.11 raises ValueError ("no signature found"), so the SAME live symbol
+# produces two different frozen shapes depending only on which interpreter generated the table.
+# A pure-Python callable (anything `inspect.isfunction`/`inspect.ismethod` catches, or a plain
+# object whose `__call__` is Python-defined) keeps its full signature pin -- `inspect.signature`
+# is stable for those across interpreter versions because it reads the real `__code__`, not a
+# docstring-derived text signature.
 
 _TIER1_SPEC = {
     'TEX_Wrangle:__version__': ('str', None),
@@ -200,7 +211,7 @@ _TIER2_SPEC = {
     'tex_cli:run_program': ('function', (('code', 'POSITIONAL_OR_KEYWORD', False), ('image', 'POSITIONAL_OR_KEYWORD', False), ('device', 'POSITIONAL_OR_KEYWORD', True), ('precision', 'POSITIONAL_OR_KEYWORD', True), ('compile_mode', 'POSITIONAL_OR_KEYWORD', True), ('profile', 'POSITIONAL_OR_KEYWORD', True))),
     'tex_compiler.diagnostics:SourceLoc': ('class', (('line', 'POSITIONAL_OR_KEYWORD', True), ('col', 'POSITIONAL_OR_KEYWORD', True), ('stage', 'POSITIONAL_OR_KEYWORD', True), ('end_line', 'POSITIONAL_OR_KEYWORD', True))),
     'tex_compiler.diagnostics:TEXDiagnostic': ('class', (('code', 'POSITIONAL_OR_KEYWORD', False), ('severity', 'POSITIONAL_OR_KEYWORD', False), ('message', 'POSITIONAL_OR_KEYWORD', False), ('loc', 'POSITIONAL_OR_KEYWORD', False), ('source_line', 'POSITIONAL_OR_KEYWORD', False), ('end_col', 'POSITIONAL_OR_KEYWORD', True), ('suggestions', 'POSITIONAL_OR_KEYWORD', True), ('hint', 'POSITIONAL_OR_KEYWORD', True), ('docs_url', 'POSITIONAL_OR_KEYWORD', True), ('phase', 'POSITIONAL_OR_KEYWORD', True))),
-    'tex_compiler.type_checker:BINDING_HINT_TYPES.items': ('callable', ()),
+    'tex_compiler.type_checker:BINDING_HINT_TYPES.items': ('callable', None),
     'tex_compiler.type_checker:BINDING_HINT_TYPES': ('dict', None),
     'tex_compiler.types:CHANNEL_MAP': ('dict', None),
     'tex_compiler.types:TEXType.STRING': ('TEXType', None),
@@ -343,6 +354,11 @@ def _describe(obj):
     if isinstance(obj, type(inspect)):   # a module object, of any module
         return "module", None
     if callable(obj) and not isinstance(obj, type):
+        if inspect.isbuiltin(obj) or inspect.ismethoddescriptor(obj):
+            # A builtin / C-implemented callable (e.g. a bound `dict.items`): its signature is
+            # not version-stable (see the module-level comment above `_TIER2_SPEC`) -- pin
+            # existence and kind only, never the parameter tuple.
+            return "callable", None
         try:
             sig = inspect.signature(obj)
         except (TypeError, ValueError):
