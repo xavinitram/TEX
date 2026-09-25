@@ -377,6 +377,46 @@ def _bitwise_same(a: torch.Tensor, b: torch.Tensor) -> bool:
                        b.contiguous().reshape(-1).view(torch.uint8))
 
 
+# TRK-193: TRK-182's fallback (below) was written against `except (ImportError, OSError)`
+# — the shape a missing/blocked native kernel raises on EVERY torch build this was measured
+# against, until this box's torch (2.12.0+cu130) did not: a load failure inside
+# `torch.compile(backend="inductor")` surfaces as `torch._inductor.exc.InductorError`, a
+# `RuntimeError` subclass (`InductorError -> BackendCompilerFailed -> ShortenTraceback ->
+# TorchDynamoException -> RuntimeError`), which a bare `isinstance(e, (ImportError,
+# OSError))` does not match. torch wraps it as
+# `raise InductorError(e, frame).with_traceback(e.__traceback__) from None` — the explicit
+# `from None` clears `__cause__` (it only suppresses the "During handling of the above
+# exception" note in a printed traceback) but Python still sets `__context__` to the
+# original exception regardless of `from`, and `InductorError` additionally stores it
+# directly as `.inner_exception`. This predicate walks all three so the same fallback
+# fires whichever layer a torch build chose to wrap at.
+def _is_kernel_load_failure(exc: BaseException) -> bool:
+    """True if `exc` IS, or WRAPS, a native-kernel LOAD failure (`ImportError`/`OSError`) —
+    the shape TRK-182's fallback exists to catch, and TRK-193 exists because an Inductor/
+    Dynamo backend-failure exception (itself a `RuntimeError`) can wrap one without being
+    one. Every call site that used to write `except (ImportError, OSError)` or
+    `isinstance(e, (ImportError, OSError))` routes through this instead.
+
+    Deliberately conservative: an exception that does NOT carry an `ImportError`/`OSError`
+    anywhere in its `.inner_exception` / `__cause__` / `__context__` chain returns False,
+    so a real compile bug (a genuine `InductorError` with no such cause) still surfaces
+    rather than being silently demoted to eager — the one thing this must never do.
+
+    Bounded to 10 hops (ordinary wrapping is 1-2 deep) so a contrived or accidentally
+    self-referential chain cannot spin; it simply stops looking and returns False.
+    """
+    current = exc
+    for _ in range(10):
+        if current is None:
+            return False
+        if isinstance(current, (ImportError, OSError)):
+            return True
+        current = (getattr(current, "inner_exception", None)
+                   or current.__cause__
+                   or current.__context__)
+    return False
+
+
 # ── 3-tier compilation cache helper ─────────────────────────────────────────
 #
 # Encapsulates the eager → jit.trace → torch.compile upgrade pattern used by
@@ -473,15 +513,16 @@ class _TieredCache:
                 _tt.record_noise_compile_failure(self.name, dt, e, key=key)
             except Exception:
                 pass
-            # TRK-182: an ImportError/OSError here is a native-kernel LOAD failure (e.g.
-            # Windows Application/Smart App Control blocking a freshly-compiled .pyd), not
-            # the toolchain-unavailable case (CppCompileError, missing MSVC/Triton) this
-            # except clause was written for. The warm-up call above already contained it —
-            # `self.cache[key]` is untouched, so this key keeps its jit.trace tier — but the
-            # box will block the NEXT freshly-compiled kernel too, so disable Inductor
-            # process-wide (every OTHER tiered cache would otherwise pay the same blocked
-            # compile) and tell the host once, rather than retrying silently forever.
-            if isinstance(e, (ImportError, OSError)):
+            # TRK-182/TRK-193: a native-kernel LOAD failure here (e.g. Windows Application/
+            # Smart App Control blocking a freshly-compiled .pyd, possibly wrapped in an
+            # InductorError — see `_is_kernel_load_failure`) is not the toolchain-unavailable
+            # case (CppCompileError, missing MSVC/Triton) this except clause was written
+            # for. The warm-up call above already contained it — `self.cache[key]` is
+            # untouched, so this key keeps its jit.trace tier — but the box will block the
+            # NEXT freshly-compiled kernel too, so disable Inductor process-wide (every
+            # OTHER tiered cache would otherwise pay the same blocked compile) and tell the
+            # host once, rather than retrying silently forever.
+            if _is_kernel_load_failure(e):
                 _disable_inductor_after_kernel_block(e)
         self._call_count.pop(key, None)
 
@@ -581,6 +622,12 @@ class _TieredCache:
         wrapped by `_run_or_fall_back`, which demotes `key` to eager (parity-guaranteed —
         `tests/test_v031_noise_tiers.py`'s cold-frame parity and `noise_tiers_compatible`)
         and returns the eager result instead of raising into the cook.
+
+        TRK-193: on this box's torch, that load failure can arrive wrapped in
+        `torch._inductor.exc.InductorError` (a `RuntimeError` subclass) rather than as a
+        bare `ImportError`/`OSError`, so the guard below is `_is_kernel_load_failure`, not
+        an exception-type catch — see that predicate's docstring. A match this predicate
+        REJECTS (a real compile bug) re-raises immediately rather than falling back.
         """
         sig = (key,) + tuple((tuple(a.shape), a.stride(), a.dtype)
                              for a in args if isinstance(a, torch.Tensor))
@@ -621,7 +668,9 @@ class _TieredCache:
                     self._settled.add(sig)
                     return nxt
                 out = nxt
-        except (ImportError, OSError) as e:
+        except Exception as e:
+            if not _is_kernel_load_failure(e):
+                raise
             return self._run_or_fall_back(key, fn, eager_fn, args, exc=e)
 
         # Never converged. Demote the key to eager for the rest of the process: store()
@@ -646,7 +695,10 @@ class _TieredCache:
         `exc` is None on the plain (no exception yet) call path — `sig in self._settled`
         still has to run `fn` for the first time under THIS signature's actual shape, and a
         kernel can be compiled here exactly as it can in the burn-in/settle loop below, so
-        this path gets the identical guard rather than a bare `fn(*args)`.
+        this path gets the identical guard rather than a bare `fn(*args)`. TRK-193: the
+        guard is `_is_kernel_load_failure`, not an exception-type catch, so a torch build
+        that wraps the load failure in `InductorError` is still caught; anything that
+        predicate rejects re-raises immediately rather than being treated as `exc`.
 
         Demoting to eager (never back to jit.trace) matches the "never converged" ending
         below: once a key's cached callable is known to raise on load, there is no cheap way
@@ -659,7 +711,9 @@ class _TieredCache:
         if exc is None:
             try:
                 return fn(*args)
-            except (ImportError, OSError) as e:
+            except Exception as e:
+                if not _is_kernel_load_failure(e):
+                    raise
                 exc = e
         self.cache[key] = False
         self.forget_settled(key)

@@ -1049,6 +1049,286 @@ def test_trk182_blocked_kernel_load_falls_back_to_eager(r: SubTestResult):
              "once")
 
 
+# ── TRK-193: the same block, but wrapped in InductorError ──────────────────────────────────
+#
+# TRK-182's fallback was written against `except (ImportError, OSError)`. On this box's
+# torch, a load failure inside `torch.compile(backend="inductor")` instead surfaces as
+# `torch._inductor.exc.InductorError` — a `RuntimeError` subclass — with the original
+# `ImportError` reachable via `.inner_exception` / `__context__` (torch raises it with
+# `from None`, which clears `__cause__` but NOT `__context__`). A bare exception-type catch
+# misses it; `_is_kernel_load_failure` (noise.py) is written to catch it anyway.
+
+def _make_wrapped_inductor_error(msg):
+    """Build the EXACT exception shape torch raises: `InductorError(e, frame)
+    .with_traceback(e.__traceback__) from None` — a real `torch._inductor.exc.InductorError`
+    (not a stand-in), so a test against it is a test against the real MRO and the real
+    `__context__`/`inner_exception` wiring, not an assumption about them."""
+    from inspect import currentframe
+    from torch._inductor.exc import InductorError
+    try:
+        raise ImportError(msg)
+    except ImportError as e:
+        try:
+            raise InductorError(e, currentframe()).with_traceback(e.__traceback__) from None
+        except InductorError as wrapped:
+            return wrapped
+
+
+_INDUCTOR_ERROR_CHILD = _CHILD_HEAD + r'''
+import warnings
+dev = "cpu"
+key, cache = device_key(dev), noise._simplex_cache
+noise._inductor_available["cpu"] = True
+
+_MSG = ("DLL load failed while importing kernel: An Application "
+        "Control policy has blocked this file.")
+
+def _make_wrapped(msg):
+    from inspect import currentframe
+    from torch._inductor.exc import InductorError
+    try:
+        raise ImportError(msg)
+    except ImportError as e:
+        try:
+            raise InductorError(e, currentframe()).with_traceback(e.__traceback__) from None
+        except InductorError as wrapped:
+            return wrapped
+
+# Same shape as TRK-182's own child: the warm-up dummy (64x64) succeeds, so the promotion
+# installs cleanly; the block hits the cook's own (24x32) shape — the same "warm-up
+# contained it, the real call was not" gap — except this time wrapped in InductorError,
+# not raised bare, which is exactly what TRK-193 says escapes TRK-182's own except clause.
+def _factory(device):
+    def _kernel(x, y):
+        if tuple(x.shape[-2:]) == (64, 64):
+            return x + y
+        raise _make_wrapped(_MSG)
+    dummy = torch.rand(1, 64, 64, device=device)
+    _kernel(dummy, dummy)
+    return _kernel
+noise._compile_simplex = _factory
+
+torch.manual_seed(5)
+img = torch.rand(1, 24, 32, 4, device=dev)
+prog = ''' + repr(_SIMPLEX_PROG) + r'''
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    digests = []
+    tiers = []
+    for _ in range(5):                       # > _COMPILE_AFTER_CALLS: crosses the promotion
+        out = tex_engine.cook(prog, {"A": img}, device_mode=dev, precision="fp32").outputs["OUT"]
+        digests.append(digest(out))
+        tiers.append(_tier_of(cache, key))
+
+kernel_warnings = [str(w.message) for w in caught
+                   if "compiled noise kernel failed to load" in str(w.message)]
+
+print(json.dumps({
+    "digests": digests,
+    "tiers": tiers,
+    "inductor_cpu_available": noise._inductor_available.get("cpu"),
+    "inductor_cuda_available": noise._inductor_available.get("cuda"),
+    "kernel_warnings": kernel_warnings,
+}))
+'''
+
+
+def test_trk193_wrapped_inductor_error_falls_back_to_eager(r: SubTestResult):
+    """TRK-193 — the SAME block as TRK-182, but raised the way THIS torch build actually
+    raises it: `torch._inductor.exc.InductorError` (a `RuntimeError` subclass) wrapping the
+    original `ImportError`, not a bare `ImportError`. `_TieredCache._settle`'s and
+    `_run_or_fall_back`'s old `except (ImportError, OSError)` does not match a `RuntimeError`
+    subclass by type — this row is RED against that shape and GREEN once the fallback goes
+    through `_is_kernel_load_failure` instead.
+
+    Same assertions as `test_trk182_...`: identical pixels across all 5 cooks (eager/
+    jit.trace parity on CPU), the key settles on "eager" (not stuck on a raising "promoted"
+    tier), Inductor disabled process-wide for BOTH device types, and the kernel-block
+    warning fires exactly once despite 5 cooks.
+    """
+    print("\n--- TRK-193: a blocked compiled-kernel load wrapped in InductorError falls "
+          "back to eager, never fails the cook ---")
+    with cold_engine_state() as cold:
+        out, err = _run_child(_INDUCTOR_ERROR_CHILD, [cold.dir])
+    if err:
+        r.fail("TRK-193 wrapped InductorError", err)
+        return
+    try:
+        result = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError) as e:
+        r.fail("TRK-193 wrapped InductorError", f"child printed no parseable JSON: {e}\n{out}")
+        return
+
+    fails = []
+    digests = result["digests"]
+    if len(digests) != 5:
+        fails.append(f"expected 5 cooks, got {len(digests)}")
+    elif len(set(digests)) != 1:
+        fails.append(f"pixels changed across the blocked promotion (not eager-parity): "
+                     f"{result['tiers']} -> {digests}")
+    if result["tiers"] and result["tiers"][-1] != "eager":
+        fails.append(f"the key did not settle on the eager tier after the block: "
+                     f"{result['tiers']}")
+    if result["inductor_cpu_available"] is not False:
+        fails.append(f"Inductor was not disabled process-wide on CPU after the block: "
+                     f"{result['inductor_cpu_available']!r}")
+    if result["inductor_cuda_available"] is not False:
+        fails.append(f"Inductor was not disabled process-wide on CUDA after the block: "
+                     f"{result['inductor_cuda_available']!r}")
+    if len(result["kernel_warnings"]) != 1:
+        fails.append(f"expected exactly one kernel-block warning across 5 cooks, got "
+                     f"{len(result['kernel_warnings'])}: {result['kernel_warnings']}")
+
+    if fails:
+        r.fail("TRK-193 wrapped InductorError", "; ".join(fails))
+    else:
+        r.ok("a compiled-kernel load blocked and wrapped in InductorError still falls back "
+             "to the eager tier with no pixel change, demotes the key, disables Inductor "
+             "process-wide, and warns exactly once")
+
+
+def test_trk193_is_kernel_load_failure_predicate(r: SubTestResult):
+    """`_is_kernel_load_failure` (noise.py) is the predicate every TRK-182/193 fallback site
+    now shares. Direct unit coverage, no subprocess needed (pure function, no shared state):
+
+      * a bare ImportError / OSError -> True (the original TRK-182 shape, unchanged)
+      * a REAL `torch._inductor.exc.InductorError` wrapping an ImportError -> True (TRK-193's
+        own gap — reachable via `__context__` even though torch raises it `from None`, which
+        clears `__cause__` but not `__context__`, and via `.inner_exception` either way)
+      * an unrelated RuntimeError with nothing ImportError/OSError-shaped in its chain ->
+        False — the one thing this predicate must never do is swallow a real compile bug
+      * an unrelated RuntimeError explicitly wrapping an unrelated ValueError (`raise ... from
+        ValueError(...)`) -> False — a wrapped-but-irrelevant chain must not false-positive
+        just because SOMETHING is chained
+    """
+    print("\n--- TRK-193: _is_kernel_load_failure predicate ---")
+    from TEX_Wrangle.tex_runtime.noise import _is_kernel_load_failure
+
+    checks = []
+    checks.append(("bare ImportError", _is_kernel_load_failure(ImportError("x")), True))
+    checks.append(("bare OSError", _is_kernel_load_failure(OSError("x")), True))
+    wrapped = _make_wrapped_inductor_error(
+        "DLL load failed while importing kernel: An Application Control policy has "
+        "blocked this file.")
+    checks.append(("wrapped InductorError", _is_kernel_load_failure(wrapped), True))
+    checks.append(("unrelated RuntimeError",
+                   _is_kernel_load_failure(RuntimeError("a genuine compile bug")), False))
+    try:
+        raise ValueError("unrelated cause")
+    except ValueError as vexc:
+        try:
+            raise RuntimeError("wrapper") from vexc
+        except RuntimeError as wrapped_unrelated:
+            checks.append(("RuntimeError wrapping an unrelated ValueError",
+                           _is_kernel_load_failure(wrapped_unrelated), False))
+
+    wrong = [f"{label}: got {got!r}, want {want!r}" for label, got, want in checks
+             if got is not want]
+    if wrong:
+        r.fail("_is_kernel_load_failure predicate", "; ".join(wrong))
+    else:
+        r.ok("_is_kernel_load_failure: bare ImportError/OSError and a wrapped real "
+             "InductorError all True; an unrelated RuntimeError (chained or not) False")
+
+
+def test_trk193_unrelated_runtime_error_not_swallowed(r: SubTestResult):
+    """The widened `except Exception` in `_settle` and `_run_or_fall_back` (TRK-193) must
+    still let a genuine, unrelated compile bug surface rather than demoting the key to
+    eager and hiding it — `_is_kernel_load_failure` is what keeps that promise. Direct
+    `_TieredCache` probes, mirroring `test_v031_noise_cold_path_shape`'s style; no shared
+    module-global state is touched because nothing here ever reaches
+    `_disable_inductor_after_kernel_block`."""
+    print("\n--- TRK-193: an unrelated RuntimeError is never swallowed as a kernel-load "
+          "failure ---")
+    from TEX_Wrangle.tex_runtime import noise
+
+    fails = []
+
+    def _boom(*args):
+        raise RuntimeError("a genuine compile bug, unrelated to any kernel load")
+
+    probe = noise._TieredCache("probe-trk193-settle-unrelated")
+    probe.cache["k"] = _boom
+    try:
+        probe._settle("k", _boom, lambda a: a * 4.0, (torch.ones(3),))
+        fails.append("_settle swallowed an unrelated RuntimeError instead of re-raising it")
+    except RuntimeError as e:
+        if "genuine compile bug" not in str(e):
+            fails.append(f"_settle re-raised the wrong exception: {e!r}")
+    if probe.cache.get("k") is False:
+        fails.append("_settle demoted the key to eager for an unrelated RuntimeError")
+
+    probe2 = noise._TieredCache("probe-trk193-fallback-unrelated")
+    try:
+        probe2._run_or_fall_back("k2", _boom, lambda a: a * 5.0, (torch.ones(3),))
+        fails.append("_run_or_fall_back swallowed an unrelated RuntimeError")
+    except RuntimeError as e:
+        if "genuine compile bug" not in str(e):
+            fails.append(f"_run_or_fall_back re-raised the wrong exception: {e!r}")
+    if probe2.cache.get("k2") is False:
+        fails.append("_run_or_fall_back demoted the key to eager for an unrelated RuntimeError")
+
+    if fails:
+        r.fail("unrelated RuntimeError not swallowed", "; ".join(fails))
+    else:
+        r.ok("_settle and _run_or_fall_back both re-raise an unrelated RuntimeError instead "
+             "of demoting the key to eager")
+
+
+def test_trk193_try_upgrade_disables_on_wrapped_inductor_error(r: SubTestResult, monkeypatch):
+    """`try_upgrade`'s own except clause (noise.py) used to gate
+    `_disable_inductor_after_kernel_block` on `isinstance(e, (ImportError, OSError))` — the
+    same TRK-193 gap, at the WARM-UP call site rather than `_settle`'s. `noise
+    ._disable_inductor_after_kernel_block` is monkeypatched to a recorder so this never
+    touches the real process-wide `_inductor_available`/warning state (those are exercised,
+    for real, by the subprocess rows above and by `test_trk182_...`).
+
+    Asserts: a compile_fn raising a wrapped InductorError DOES call the disable hook (the
+    TRK-193 fix); a compile_fn raising an unrelated RuntimeError (the toolchain-unavailable
+    case this except clause was originally written for, e.g. a real CppCompileError-shaped
+    failure) does NOT — that path must keep recording-only, per BRIEF-4 C6."""
+    print("\n--- TRK-193: try_upgrade's warm-up guard catches a wrapped InductorError too ---")
+    from TEX_Wrangle.tex_runtime import noise
+
+    calls = []
+    monkeypatch.setattr(noise, "_disable_inductor_after_kernel_block",
+                        lambda exc: calls.append(exc))
+    monkeypatch.setattr(noise, "_can_inductor_compile", lambda device=None: True)
+
+    def _compile_wrapped():
+        raise _make_wrapped_inductor_error(
+            "DLL load failed while importing kernel: An Application Control policy has "
+            "blocked this file.")
+
+    probe = noise._TieredCache("probe-trk193-try-upgrade-wrapped")
+    probe._call_count["k"] = noise._COMPILE_AFTER_CALLS - 1
+    probe.try_upgrade("k", _compile_wrapped, device=torch.device("cpu"))
+
+    fails = []
+    if len(calls) != 1:
+        fails.append(f"expected the disable hook called once for a wrapped InductorError, "
+                     f"got {len(calls)} calls")
+
+    calls.clear()
+
+    def _compile_unrelated():
+        raise RuntimeError("C1083: cannot open compiler generated file")
+
+    probe2 = noise._TieredCache("probe-trk193-try-upgrade-unrelated")
+    probe2._call_count["k2"] = noise._COMPILE_AFTER_CALLS - 1
+    probe2.try_upgrade("k2", _compile_unrelated, device=torch.device("cpu"))
+
+    if calls:
+        fails.append(f"the disable hook fired for an unrelated RuntimeError: {calls}")
+
+    if fails:
+        r.fail("try_upgrade wrapped InductorError", "; ".join(fails))
+    else:
+        r.ok("try_upgrade's warm-up guard disables Inductor for a wrapped InductorError "
+             "but stays recording-only for an unrelated compile failure")
+
+
 # ── The per-cook tier record (`want_noise_tiers`) ───────────────────────────────────────────────
 #
 # A host compositing a region recook over a cached frame patches only when the two cooks' records
