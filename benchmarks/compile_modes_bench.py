@@ -89,13 +89,25 @@ else:
 import torch                                                   # noqa: E402
 
 from TEX_Wrangle import tex_engine                              # noqa: E402
+from TEX_Wrangle import tex_fusion                               # noqa: E402  COMPILE-M3 --fused
 from TEX_Wrangle.tex_cache import TEXCache, get_cache           # noqa: E402
-from TEX_Wrangle.tex_marshalling import identity_binding_types  # noqa: E402
+from TEX_Wrangle.tex_marshalling import (                        # noqa: E402
+    identity_binding_types, infer_binding_type)
 from TEX_Wrangle.tex_runtime import autotier                    # noqa: E402
 from TEX_Wrangle.tex_runtime import compiled as tex_compiled    # noqa: E402  observability only
 
 SHAPES = ("host_tick_exact", "playback_frames")
 MODES = ("none", "auto")
+# COMPILE-M3: the hypothesis under test is that compiling a FUSED region (one Inductor
+# program spanning the old node boundaries) wins where M2/M2b already showed per-node
+# compiles losing on every trial (docs/worklog/COMPILE-M2/handback.md). "torch_compile" is
+# the forced compiled tier (skips autotier's measure/trial loop and always compiles) — the
+# lever the brief asks to pick alongside "auto" so a fused program's compile cost and
+# adoption are visible even when the measured trial would reject it. Scoped to
+# playback_frames only (the brief's own scope: "on the playback shape") — host_tick_exact's
+# whole point is that only ONE stage is dirty per tick, so forcing all ten through one fused
+# program every tick would defeat the shape it is meant to measure.
+FUSED_MODES = ("none", "auto", "torch_compile")
 
 
 def _load_host_demo():
@@ -184,6 +196,40 @@ class Fixture:
                                   compile_mode=compile_mode, cancel=None, time_context=tc)
             src = out.outputs["OUT"]
         return src
+
+    # ── COMPILE-M3: the same ten stages spliced into ONE fused program ──────────
+    # (`tex_fusion.compile_fused`, reached through `tex_engine.cook(chain_payload=...)` —
+    # the same GraphSpec shape a real host's frontend hands the terminal node, per
+    # `tests/test_v020_phase1.py::test_f1b_fused_node_path_reaches_compile_tier`). A fresh
+    # spec is built every tick, matching `tex_fusion`'s own module docstring ("The frontend
+    # rebuilds the _tex_chain payload on every queue") rather than caching it across ticks,
+    # which would understate a real host's per-cook payload-assembly cost.
+
+    def build_fused_spec(self):
+        """(spec, terminal_code, terminal_bindings) for the WHOLE ten-stage chain, source-
+        first, terminal last — the shape `tex_fusion.prepare_fused` / `_stages_from_spec`
+        read (`image_input`/`terminal_image_input` both "IN", matching every stage's own
+        `@IN` binding name in `examples/host_demo.py::_COMP_STAGES`)."""
+        stages_payload = [
+            {"code": self.codes[j], "image_input": "IN", "params": dict(self.defaults[j])}
+            for j in range(self.n - 1)
+        ]
+        spec = {"stages": stages_payload, "terminal_image_input": "IN"}
+        terminal_code = self.codes[-1]
+        bindings = {"IN": self.src, **dict(self.defaults[-1])}
+        return spec, terminal_code, bindings
+
+    def fused_tick(self, i: int, compile_mode: str):
+        """Run ONE tick of the WHOLE chain as a single fused cook. `playback_frames`
+        only (see FUSED_MODES's comment) — every stage is dirty every tick there anyway,
+        so fusing changes nothing about which pixels are produced, only how they're
+        computed (invariant #2: the two must stay bit-identical)."""
+        tc = {"frame": float(i), "fps": 24.0, "time": i / 24.0}
+        spec, terminal_code, bindings = self.build_fused_spec()
+        out = tex_engine.cook(terminal_code, bindings, chain_payload=spec,
+                              device_mode=self.device, precision="fp32",
+                              compile_mode=compile_mode, cancel=None, time_context=tc)
+        return out.outputs["OUT"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -363,6 +409,182 @@ def run_leg(shape: str, device: str, res: int, compile_mode: str, ticks: int,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# COMPILE-M3: one fused-region leg — (playback_frames, device, res, fused compile_mode)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_AUTOTIER_VERDICT_REASON = {
+    autotier.COMMITTED: ("the fused program's compiled trial beat the codegen/interpreter "
+                        "median by the commit ratio (autotier._COMMIT_RATIO)"),
+    autotier.REJECTED: ("the fused program's compiled trial did NOT beat the codegen median "
+                        "(or the trial/compile itself failed) — routed to codegen/interpreter"),
+    autotier.MEASURING: ("still sampling the codegen baseline; not yet eligible to submit a "
+                        "background compile within this run's tick budget"),
+    autotier.COMPILING: ("a background compile was submitted but had not resolved (ready or "
+                        "failed) within this run's wall time"),
+    autotier.TRIAL: ("a compiled artifact became ready but was not re-cooked to a verdict "
+                    "within this run"),
+}
+
+
+def run_fused_leg(device: str, res: int, compile_mode: str, ticks: int, warmup: int,
+                  baseline_first_ms: float | None = None) -> dict:
+    """One (playback_frames, device, res, fused compile_mode) leg — the fused-region twin
+    of `run_leg`. `compile_mode="none"` is (ii) in the ask (fusion alone, no compile tier);
+    `"auto"` and `"torch_compile"` are the two levers `select_tier` exposes for a fused
+    chain (ENG-... `select_tier`'s `fused_fp_present` branch) — "auto" measures-then-trials
+    exactly as the unfused path does, keyed by the ONE fused fingerprint instead of ten
+    per-stage ones; "torch_compile" is the forced tier, skipping the measure/trial loop, so
+    its own compile cost and adoption are visible even on a shape too small to win the
+    measured trial. `baseline_first_ms` (the "none"/unfused leg's own first_cook_ms) lets
+    "torch_compile"'s leg report a compile-time ESTIMATE (see below) — never asserted as
+    exact, since the two first ticks pay different codegen-setup costs too."""
+    shape = "playback_frames"
+    out: dict = {"shape": shape, "device": device, "res": res,
+                "compile_mode": f"fused:{compile_mode}", "ticks": ticks, "warmup": warmup,
+                "fused": True}
+    try:
+        if compile_mode == "auto":
+            autotier.reset()
+        if compile_mode == "torch_compile":
+            tex_compiled.clear_compiled_cache()
+        fx = Fixture(shape, res, device)
+        vram_before = _vram_snapshot(device)
+        device_type = torch.device(device).type
+
+        spec0, term_code0, bind0 = fx.build_fused_spec()
+        fused_fp = tex_fusion.fused_fingerprint(spec0, term_code0, dict(bind0),
+                                                infer_binding_type)
+        out["fused_fp"] = fused_fp
+        autotier_key = (autotier.make_key(fused_fp, device_type, "fp32", (1, res, res))
+                        if fused_fp else None)
+        compiled_cache_key = (fused_fp, device_type, "fp32") if fused_fp else None
+
+        def _adopted() -> bool:
+            if compile_mode == "auto":
+                return autotier_key is not None and autotier.verdict(autotier_key) == \
+                    autotier.COMMITTED
+            if compile_mode == "torch_compile":
+                return (compiled_cache_key is not None
+                       and compiled_cache_key in tex_compiled._compiled_cache)
+            return False   # "none" never adopts anything — there is no compile tier
+
+        adopt_tick = None
+        submitted_tick = None   # first tick autotier leaves MEASURING (auto only; a proxy
+                                # for "compile submitted", per COMPILE-M2's own admission
+                                # that a clean compile-wall-time number isn't resolvable
+                                # from outside autotier's state machine)
+
+        # -- tick 0: first-cook, uncounted toward steady stats.
+        _sync(device)
+        t0 = time.perf_counter()
+        fx.fused_tick(0, compile_mode)  # first-cook, timed above; output unused (see steady loop)
+        _sync(device)
+        out["first_cook_ms"] = round((time.perf_counter() - t0) * 1000.0, 4)
+        if compile_mode == "auto" and autotier_key is not None and \
+                autotier.verdict(autotier_key) != autotier.MEASURING:
+            submitted_tick = 0
+        if _adopted():
+            adopt_tick = 0
+
+        # -- warm-up (uncounted).
+        for i in range(1, 1 + warmup):
+            fx.fused_tick(i, compile_mode)
+            if submitted_tick is None and compile_mode == "auto" and autotier_key is not None \
+                    and autotier.verdict(autotier_key) != autotier.MEASURING:
+                submitted_tick = i
+            if adopt_tick is None and _adopted():
+                adopt_tick = i
+
+        # -- steady ticks (counted), split into before/after adoption (the ask's own
+        # before/after p50/p95/p99 request) — "after" stays empty for every leg that never
+        # adopts, which every "none" leg and most "auto"/"torch_compile" legs at these
+        # resolutions do (COMPILE-M2/M2b's own finding, unfused).
+        wall_ms, before_ms, after_ms, last_out = [], [], [], None
+        base_i = 1 + warmup
+        for k in range(ticks):
+            i = base_i + k
+            _sync(device)
+            t0 = time.perf_counter()
+            last_out = fx.fused_tick(i, compile_mode)
+            _sync(device)
+            w = (time.perf_counter() - t0) * 1000.0
+            wall_ms.append(w)
+            if submitted_tick is None and compile_mode == "auto" and autotier_key is not None \
+                    and autotier.verdict(autotier_key) != autotier.MEASURING:
+                submitted_tick = i
+            if adopt_tick is None and _adopted():
+                adopt_tick = i
+            (after_ms if adopt_tick is not None else before_ms).append(w)
+
+        out["wall_ms"] = _stats(wall_ms)
+        out["wall_ms_before_adoption"] = _stats(before_ms)
+        out["wall_ms_after_adoption"] = _stats(after_ms)
+        out["adopted_by_tick"] = adopt_tick
+        out["submitted_by_tick"] = submitted_tick
+
+        if compile_mode == "none":
+            out["verdict"] = "n/a"
+            out["verdict_reason"] = ("no compile tier is in play; this leg IS the fusion-"
+                                     "only comparison point for (ii) vs (i)/(iii)")
+        elif compile_mode == "auto":
+            v = autotier.verdict(autotier_key) if autotier_key is not None else None
+            out["verdict"] = v if v is not None else "unkeyable"
+            out["verdict_reason"] = _AUTOTIER_VERDICT_REASON.get(
+                v, "fused_fingerprint() could not assemble a key for this spec")
+            # A rough, clearly-labelled ESTIMATE only: the wall-clock span between the tick
+            # autotier left MEASURING and the tick it reached COMMITTED, at this run's own
+            # measured mean tick cost. Real compile latency is not separately timestamped by
+            # autotier/compiled.py (COMPILE-M2b's own gap, unfused) — a tighter number needs
+            # a wrapper that hooks `_submit_bg_compile`/`_bg_status` directly, not done here.
+            if adopt_tick is not None and submitted_tick is not None and wall_ms:
+                out["compile_wall_s_estimate"] = round(
+                    (adopt_tick - submitted_tick) * (statistics.fmean(wall_ms) / 1000.0), 4)
+        else:  # torch_compile — forced, no measure/trial loop
+            if compiled_cache_key is not None and compiled_cache_key in tex_compiled._compiled_cache:
+                out["verdict"] = "compiled"
+                out["verdict_reason"] = "the forced tier's compiled artifact is cached and serving"
+                if baseline_first_ms is not None:
+                    # First-tick delta vs the fused/"none" leg's own first tick — both pay the
+                    # same splice+codegen setup, so the delta is dominated by the compile
+                    # itself. Labelled an ESTIMATE, not a measured compile-only span.
+                    out["compile_time_ms_estimate"] = round(
+                        out["first_cook_ms"] - baseline_first_ms, 4)
+            elif fused_fp in tex_compiled._compile_blacklist:
+                out["verdict"] = "blacklisted"
+                out["verdict_reason"] = ("torch.compile crashed on this program earlier in "
+                                        "this process and the fingerprint is now blacklisted "
+                                        "— every tick ran the interpreter/codegen fallback")
+            else:
+                out["verdict"] = "fallback"
+                out["verdict_reason"] = ("never entered _compiled_cache — either below the "
+                                        "op-count/spatial gates in execute_compiled(), or "
+                                        "every attempt failed without being blacklisted")
+
+        vram_after = _vram_snapshot(device)
+        out["vram"] = _vram_delta(vram_before, vram_after)
+        out["disk"] = _cg_and_inductor_bytes()
+        out["_output"] = last_out
+        return out
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+
+def _print_fused_leg(leg: dict):
+    if "error" in leg:
+        print(f"  [fused {leg['shape']}/{leg['device']}/{leg['compile_mode']}] "
+             f"ERROR: {leg['error']}")
+        return
+    w = leg["wall_ms"]
+    print(f"  [fused {leg['shape']:16s} {leg['device']:4s} {leg['compile_mode']:18s}] "
+         f"first={leg['first_cook_ms']:8.3f} ms  "
+         f"p50={w.get('p50', float('nan')):7.3f}  p95={w.get('p95', float('nan')):7.3f}  "
+         f"p99={w.get('p99', float('nan')):7.3f} ms  n={w.get('n', 0)}  "
+         f"adopted_by_tick={leg.get('adopted_by_tick')}  "
+         f"verdict={leg.get('verdict')} ({leg.get('verdict_reason')})")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # (c) interference: an unrelated interactive workload while auto compiles in the background
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -513,10 +735,20 @@ def main(argv=None) -> int:
     p.add_argument("--interference-ticks", type=int, default=60)
     p.add_argument("--interference-cadence-ms", type=float, default=16.0)
     p.add_argument("--no-interference", action="store_true")
+    p.add_argument("--fused", action="store_true",
+                   help="COMPILE-M3: also cook the whole 10-stage playback_frames chain as "
+                        "ONE fused region, at each of none/auto/torch_compile, and compare "
+                        "against the unfused/none baseline (i)/(ii)/(iii) of the ask. Forces "
+                        "--shape playback_frames (fusing host_tick_exact's single dirty "
+                        "stage every tick would defeat that shape's own point).")
     p.add_argument("--smoke", action="store_true",
                    help="a handful of ticks (proves the script works; not a timing claim)")
     p.add_argument("--save", metavar="PATH")
     a = p.parse_args(argv)
+    if a.fused and a.shape not in ("playback_frames", "both"):
+        print(f"--fused only runs on playback_frames; overriding --shape {a.shape!r}")
+    if a.fused:
+        a.shape = "playback_frames"
 
     if a.smoke:
         a.ticks, a.warmup = 6, 2
@@ -538,6 +770,7 @@ def main(argv=None) -> int:
           f" (minted fresh: {env['tex_cache_dir_minted']})\n{'=' * 78}")
 
     legs, comparisons, interference = [], [], []
+    fused_legs, fused_comparisons = [], []
     for shape in shapes:
         for device in devices:
             outs = {}
@@ -557,6 +790,34 @@ def main(argv=None) -> int:
             else:
                 print(f"  [{shape}/{device}] auto vs none: max abs diff = "
                       f"{cmp['max_abs_diff']:.3e}")
+
+            # COMPILE-M3: (i) is `outs["none"]` above (unfused, compile_mode="none");
+            # (ii)/(iii) are the fused legs below, at "none"/"auto"/"torch_compile".
+            if a.fused and shape == "playback_frames":
+                print(f"  -- fused-region legs ({device}, res={a.res}) --")
+                fused_outs, first_none_ms = {}, None
+                for fmode in FUSED_MODES:
+                    fleg = run_fused_leg(device, a.res, fmode, a.ticks, a.warmup,
+                                         baseline_first_ms=first_none_ms)
+                    fused_outs[fmode] = fleg.pop("_output", None)
+                    if fmode == "none":
+                        first_none_ms = fleg.get("first_cook_ms")
+                    _print_fused_leg(fleg)
+                    fused_legs.append(fleg)
+                for fmode in FUSED_MODES:
+                    fcmp = _compare_outputs(outs.get("none"), fused_outs.get(fmode))
+                    fcmp.update({"shape": shape, "device": device,
+                                "compare": f"unfused:none vs fused:{fmode}"})
+                    fused_comparisons.append(fcmp)
+                    if not fcmp.get("comparable"):
+                        print(f"  [{fcmp['compare']}] NOT comparable: {fcmp.get('reason')}")
+                    elif fcmp["bit_identical"]:
+                        print(f"  [{fcmp['compare']}] BIT-IDENTICAL")
+                    else:
+                        print(f"  [{fcmp['compare']}] max abs diff = "
+                              f"{fcmp['max_abs_diff']:.3e}")
+                gc.collect()
+
             if not a.no_interference:
                 inter = run_interference(shape, device, a.res, a.interference_cadence_ms,
                                          a.interference_ticks)
@@ -573,7 +834,8 @@ def main(argv=None) -> int:
             gc.collect()
 
     payload = {"env": env, "legs": legs, "comparisons": comparisons,
-              "interference": interference}
+              "interference": interference, "fused_legs": fused_legs,
+              "fused_comparisons": fused_comparisons}
     if a.save:
         os.makedirs(os.path.dirname(os.path.abspath(a.save)) or ".", exist_ok=True)
         with open(a.save, "w", encoding="utf-8") as fh:
