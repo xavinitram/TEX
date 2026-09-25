@@ -1883,8 +1883,18 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         else_spatial = {k for k in all_env_mods if k in self._spatial_vars}
 
         # Merge with torch.where
+        # TRK-143: was `({cond_var} > 0.5)` unconditionally, which disagreed with the
+        # interpreter's `(cond > 0.5) if cond.is_floating_point() else cond.bool()` for
+        # a non-floating condition (a negative nonzero integer reads OFF here but ON
+        # there). Emits a call to `masked_flow.cond_mask` instead — the SAME shared
+        # helper the language-0.25 masked emitter already calls at codegen_masked.py's
+        # `_emit(f"{cm} = _MF.cond_mask({cond_var})")` — so there is exactly one
+        # formula for "is this pixel on", spelled once, reached by both the `0.23`
+        # unmasked path (here) and the `0.25` masked path. `_MF` is already seeded as
+        # a global of every generated function's namespace (see `build()` above), so
+        # this costs no signature change and no new import in the emitted source.
         cond_bool = self._tmp()
-        self._emit(f"{cond_bool} = ({cond_var} > 0.5)")
+        self._emit(f"{cond_bool} = _MF.cond_mask({cond_var})")
 
         for k in all_env_mods:
             tv = then_vars[k]

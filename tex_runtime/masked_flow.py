@@ -47,13 +47,17 @@ __all__ = ["cond_mask", "enabled_for", "MaskedFlowMixin", "CgFlow"]
 def cond_mask(cond: torch.Tensor) -> torch.Tensor:
     """THE single definition of "which pixels take this condition".
 
-    `docs/masked-control-flow.md` §5 names the predicate's spelling as the highest-risk
+    `docs/masked-control-flow.md` §5 named the predicate's spelling as the highest-risk
     line in the release: the interpreter's per-pixel `if` has always read
-    `(cond > 0.5) if cond.is_floating_point() else cond.bool()` while codegen emits
-    `(cond > 0.5)` unconditionally, and the two disagree for an integer condition whose
-    value is non-zero and below `1` (a negative int is the reachable case). The design's
-    fix is one shared helper imported by both tiers; this is it, and every mask in this
-    module is derived through it.
+    `(cond > 0.5) if cond.is_floating_point() else cond.bool()` while codegen's `0.23`
+    spatial-if emitter used to spell `(cond > 0.5)` unconditionally, and the two disagree
+    for an integer condition whose value is non-zero and below `1` (a negative int is the
+    reachable case) — TRK-143. The design's fix is one shared helper imported by both
+    tiers; this is it. Built for the `0.25` masked path first (every mask in THIS module
+    is derived through it), then PARITY-46 (TRK-143) pointed the unmasked `0.23` spatial-if
+    at it too, on both tiers (`interpreter_control_flow.py::_exec_spatial_if`,
+    `codegen.py::_emit_spatial_if_else`) — so there is exactly one formula for "is this
+    pixel on" now, not one per language tier.
 
     It adopts the INTERPRETER's existing spelling deliberately, for two reasons. The
     masked `if` uses one mask both to gate the branch and to select the merge, so a

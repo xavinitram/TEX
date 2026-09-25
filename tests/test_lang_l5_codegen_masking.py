@@ -30,6 +30,7 @@ budget that nothing in the rule needs.
 import hashlib
 import math
 import random
+import re
 
 import pytest
 import torch
@@ -51,6 +52,23 @@ from TEX_Wrangle.tex_runtime.interpreter import (Interpreter, _collect_identifie
 
 PRAGMA = L4.PRAGMA
 _STDLIB = TEXStdlib.get_functions()
+
+# PARITY-46 (TRK-143): `_MF.cond_mask` is no longer masked-runtime-exclusive — the UNMASKED
+# `0.23` spatial-if emitter now calls it too (codegen.py's `_emit_spatial_if_else`), so a
+# bare `"_MF" in src` search is no longer a clean proxy for "the masked runtime touched this
+# program". `_has_masked_runtime` keeps every row below's real intent — "no MASKED machinery
+# leaked into an unmasked/below-0.25 emission" — by allowing exactly the one shared call and
+# still catching any OTHER `_MF.*` reference (`CgFlow`, `cg_break`, `cg_continue`, `cg_return`,
+# `merge_write`, `m_and`, `m_sub`, `m_any`, `cg_merge_branch`, `cg_call_result`,
+# `cg_skip_call`, `scatter_keep`, ...) or the masked state local (`codegen_masked._STATE`,
+# `"_mf"`), which an unmasked emission still never binds.
+_MASKED_RUNTIME_CALL_RE = re.compile(r"_MF\.\w+")
+
+
+def _has_masked_runtime(src: str) -> bool:
+    calls = set(_MASKED_RUNTIME_CALL_RE.findall(src))
+    non_shared = calls - {"_MF.cond_mask"}
+    return bool(non_shared) or "_mf " in src or "_mf." in src
 
 
 # ── the two-tier harness ────────────────────────────────────────────────────────
@@ -248,12 +266,17 @@ _LANG_L7_MASKED_CORPUS_NAMES = frozenset({
 
 
 def test_no_pragma_emits_no_masked_runtime():
-    """No corpus program OUTSIDE LANG-L7's own masked set has one character of the masked
+    """No corpus program OUTSIDE LANG-L7's own masked set has one character of the MASKED
     runtime in its emitted source.
 
-    This is the whole ComfyUI-invisibility argument in one assertion: `_MF` is the only name
-    the masked emission introduces, and `_mf` the only local it binds, so a source free of
-    both is a source `codegen_masked.py` never touched. LANG-L7's five `//!tex 0.25`
+    Before PARITY-46 (TRK-143) this was "`_MF` is the only name the masked emission
+    introduces" — no longer true on its own, since the unmasked `0.23` spatial-if now emits
+    `_MF.cond_mask(...)` too (the fix for the interpreter/codegen "is this pixel on" hazard).
+    `_has_masked_runtime` keeps the real claim: `_mf`, the masked state local, is still the
+    only local the masked emission binds, and every OTHER `_MF.*` name (`CgFlow`, `cg_break`,
+    `cg_continue`, `cg_return`, `merge_write`, `m_and`, `m_sub`, `m_any`, `cg_merge_branch`,
+    `cg_call_result`, `cg_skip_call`, `scatter_keep`, ...) is still masked-emission-exclusive
+    — only the one shared predicate call is allowed through. LANG-L7's five `//!tex 0.25`
     adversarial rows and the shipped example are excluded — they ASK for masking and are
     proved masked elsewhere (`test_the_masked_and_unmasked_emissions_actually_differ` below;
     the corpus-wide gate census in `test_lang_l4_masked_flow.py`)."""
@@ -266,7 +289,7 @@ def test_no_pragma_emits_no_masked_runtime():
             continue
         checked += 1
         src = fn._tex_src
-        if "_MF" in src or "_mf " in src or "_mf." in src:
+        if _has_masked_runtime(src):
             offenders.append(name)
     assert checked >= 120, f"only {checked} corpus programs compiled — the sweep went blind"
     assert not offenders, f"masked runtime leaked into: {offenders}"
@@ -288,7 +311,7 @@ def test_the_masked_and_unmasked_emissions_actually_differ():
     plain = cg_mod.try_compile(program, type_map, _masked_flow=False)
     masked = cg_mod.try_compile(program, type_map, _masked_flow=True)
     assert plain is not None and masked is not None
-    assert "_MF" not in plain._tex_src
+    assert not _has_masked_runtime(plain._tex_src)
     assert "_MF.cg_break" in masked._tex_src
     assert plain._tex_src != masked._tex_src
 
@@ -704,7 +727,7 @@ def test_try_compile_default_masks_only_a_025_pragma_at_the_real_engine():
         program, type_map, _n = _compile(header + L4._ATOM_PROGRAMS["break_basic"], b)
         fn = cg_mod.try_compile(program, type_map)
         assert fn is not None
-        assert "_MF" not in fn._tex_src, header
+        assert not _has_masked_runtime(fn._tex_src), header
     for header in ("//!tex 0.25\n", "//!tex 1.0\n"):
         program, type_map, _n = _compile(header + L4._ATOM_PROGRAMS["break_basic"], b)
         fn = cg_mod.try_compile(program, type_map)
@@ -724,6 +747,6 @@ def test_try_compile_default_never_masks_below_masked_flow():
             program, type_map, _n = _compile(header + L4._ATOM_PROGRAMS["break_basic"], b)
             fn = cg_mod.try_compile(program, type_map)
             assert fn is not None
-            assert "_MF" not in fn._tex_src, header
+            assert not _has_masked_runtime(fn._tex_src), header
     finally:
         tex_api.LANGUAGE_VERSION = real

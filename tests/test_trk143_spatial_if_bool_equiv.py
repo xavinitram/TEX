@@ -1,37 +1,66 @@
-"""TRK-143 — pin the interpreter's `_exec_spatial_if` "is this pixel on" formula and
-codegen's `0.23` spatial-if emitter to the same answer, on integer and NaN conditions.
+"""TRK-143 — PARITY-46: the interpreter's `_exec_spatial_if` "is this pixel on" formula and
+codegen's `0.23` spatial-if emitter now compute the SAME answer on every condition, integer
+and NaN included, because they call the same shared function.
 
-THE TWO FORMULAS, quoted from the tracker row. The interpreter one was quoted from
-`tex_runtime/interpreter.py` when the row was written; SPLIT-I (`main`, after this row)
-moved if/for/while execution out to `tex_runtime/interpreter_control_flow.py` as a
-byte-identical, mechanical move — `Interpreter` still has the method through the mixin,
-and this file drives it only through `Interpreter.execute()`, never by importing the
-symbol directly, so the move needed no code change here, only this citation:
+THE FIX (PARITY-46, on top of the row's original finding). `masked_flow.cond_mask` already
+existed — TRK-152 built it for the language-0.25 masked `if`, and its own docstring already
+named this row's exact hazard as the reason for building one shared helper. What PARITY-46
+does is make the UNMASKED `0.23` path on BOTH tiers route through that same helper instead of
+each still spelling its own formula:
   * interpreter (`tex_runtime/interpreter_control_flow.py::Interpreter._exec_spatial_if`):
-      `cond_bool = (cond > 0.5) if cond.is_floating_point() else cond.bool()`
+      `cond_bool = _masked_flow_mod.cond_mask(cond)`
   * codegen (`tex_runtime/codegen.py::_CodeGen._emit_spatial_if_else`, the `0.23` path):
-      `{cond_bool} = ({cond_var} > 0.5)` — unconditionally, regardless of dtype.
+      emits `{cond_bool} = _MF.cond_mask({cond_var})` — the identical call the `0.25` masked
+      emitter already makes (`codegen_masked.py`'s `_emit(f"{cm} = _MF.cond_mask({cond_var})")`).
 
-For a FLOATING condition (including NaN) both formulas are the literal same expression
-(`cond > 0.5`), so they can never disagree there — verified below, not assumed.
+`cond_mask` itself is `(cond > 0.5) if cond.is_floating_point() else cond.bool()` (plus a
+`torch.bool`-dtype passthrough) — the INTERPRETER's original spelling, adopted deliberately
+(see `cond_mask`'s own docstring, and the TRK-152 row's ruling this row's tracker entry
+already cites): the spatial `if` uses one mask both to gate the branch and to select the
+merge, and the interpreter is the oracle, so changing ITS reading would move a `0.23`
+program's answer, which invariant 7 forbids. Codegen's old unconditional `> 0.5` is what
+moved instead.
 
-For a NON-floating condition they are NOT the same formula: `.bool()` is a nonzero test,
-`> 0.5` is a numeric-threshold test, and they disagree for a negative nonzero integer
-(`.bool()` → True, `> 0.5` → False). `test_trk143_raw_formula_disagreement_...` below
-proves this is a REAL disagreement at the raw-tensor level — a genuine invariant-2
-hazard — filed as a finding rather than fixed here (fixing the emitter moves emitted
-bytes and needs its own lane, per the ask).
+For a FLOATING condition (including NaN) this changes nothing: `cond_mask`'s floating branch
+is the literal `cond > 0.5`, the same expression both tiers already used, so NaN still reads
+OFF on both — verified below, not assumed.
 
-WHY IT IS LATENT, NOT LIVE, and pinned as a permanent guard here: a non-floating
-IMAGE-LIKE (dim>=3) binding never reaches either formula through any real entry point.
-Both tiers' own production ingestion — `Interpreter.execute`'s binding loop and
-`tex_runtime.compiled._contiguous_bindings` — call the ONE shared
-`tex_marshalling.to_fp32_if_int_image` (M5-INT) before a program ever runs, which casts
-exactly this shape to fp32. `test_trk143_integer_binding_never_reaches_spatial_if_...`
-below drives BOTH tiers through their real ingestion (the cast left ARMED) and confirms
-they agree — because by the time either formula runs, the condition is already float.
-That guard is what this row closes with evidence: if M5-INT is ever weakened or
-bypassed on one tier only, this test goes red.
+For a NON-floating condition this is the actual fix: before PARITY-46, `.bool()` (a nonzero
+test) and `> 0.5` (a numeric-threshold test) disagreed for a negative nonzero integer
+(`.bool()` → True, `> 0.5` → False) — `test_trk143_raw_formula_disagreement_...` used to prove
+that disagreement at the raw-tensor level. It now proves the opposite: with M5-INT
+deliberately disarmed on BOTH tiers' raw invocation, they still agree, because both paths
+reach the exact same `cond_mask` call regardless of M5-INT. The fix closes the hazard at its
+root rather than only behind the M5-INT guard.
+
+PIXEL-NEUTRALITY ON EVERY REAL INPUT PATH (M5-INT). Enumerating every path an integer
+condition can reach `_exec_spatial_if`/`_emit_spatial_if_else` through:
+  1. An integer-dtype IMAGE-LIKE (dim>=3) BINDING, fed straight into the condition
+     expression. Both tiers' production ingestion — `Interpreter.execute`'s own binding
+     loop, and `tex_runtime.compiled._contiguous_bindings` (the call `compiled.py`'s real
+     dispatch makes before a cook) — call `tex_marshalling.to_fp32_if_int_image` (M5-INT)
+     on exactly this shape before a program ever runs, so the condition is already float by
+     the time either formula runs. `test_trk143_integer_binding_never_reaches_spatial_if_
+     unguarded` drives both tiers through this real ingestion and confirms it.
+  2. A LOCAL variable derived from integer arithmetic on a binding (e.g. `int k = int(@A.r *
+     10.0) - 5;`), never itself a "binding" M5-INT would see. This is exactly the shape the
+     tracker row's own probe used (`float k = @A.r; if (k) {...}` — `k` carries through
+     whatever dtype the expression produced, unguarded by M5-INT). Before PARITY-46 this WAS
+     the live gap: M5-INT only ever normalises `bindings`, never an intermediate local. After
+     PARITY-46 it no longer matters whether M5-INT ran — `cond_mask` is now the ONLY formula
+     either tier calls, so an int64 local reaches the identical function on both sides and
+     both sides return the identical tensor. Proven directly by
+     `test_trk143_raw_formula_disagreement_is_now_agreement`, which disarms M5-INT and drives
+     an unguarded raw int64 condition through both tiers' bare invocation.
+  3. A CONSTANT integer literal folded to a condition (`if (-1) {...}`). The optimizer/
+     type-checker promote every numeric literal to a float TEX value before it reaches a
+     runtime condition (TEX has no integer literal type distinct from `int`-tagged floats at
+     the tensor level — `int` is a per-pixel float tensor with an integer-valued content, not
+     a distinct dtype), so this path is the same float-producing shape as case 1, not a
+     genuinely non-floating tensor; not a separate case.
+Since case 3 collapses into the float case and cases 1 and 2 both now agree unconditionally
+(case 1 already agreed before this fix, behind the M5-INT guard; case 2 is what this fix
+actually closes), every reachable path agrees after PARITY-46 — not merely the guarded one.
 
 PORTABILITY: CPU only, no ComfyUI, no CUDA, no compiler, no numpy, no timing.
 """
@@ -121,7 +150,11 @@ def test_trk143_integer_binding_never_reaches_spatial_if_unguarded(r: SubTestRes
     side, the same call `compiled.py`'s dispatch makes before a real cook), a
     non-floating image-like binding is cast to fp32 before either formula runs, so the
     two tiers agree in every reachable case — including the negative-nonzero-integer
-    input that the raw formulas (next test) do NOT agree on."""
+    input that, before PARITY-46, the raw formulas (below) did NOT agree on unguarded.
+    Since PARITY-46 the raw formulas agree too (one shared `cond_mask` call), so this
+    guard is now belt-and-suspenders rather than the only thing standing between the
+    hazard and a live program — kept anyway, because M5-INT casting the binding before
+    either formula runs is still the real production path and worth pinning on its own."""
     print("\n--- TRK-143: integer binding, real ingestion (M5-INT armed) — still agree ---")
     try:
         prog, type_map, cg_fn = _compile()
@@ -141,19 +174,19 @@ def test_trk143_integer_binding_never_reaches_spatial_if_unguarded(r: SubTestRes
         r.fail("TRK-143 integer bool equiv (guarded)", f"{type(e).__name__}: {e}")
 
 
-def test_trk143_raw_formula_disagreement_is_a_real_but_latent_invariant2_hazard(r: SubTestResult):
-    """NOT a permanent guard — the opposite: proves, with M5-INT deliberately disarmed
-    on BOTH tiers' raw invocation, that the two formulas themselves genuinely disagree
-    for a negative nonzero integer (`.bool()` is a nonzero test; `> 0.5` is a numeric
-    threshold). `-1`: `.bool()` -> True (interpreter selects the THEN branch); `-1 >
-    0.5` -> False (codegen selects the ELSE branch). This is the invariant-2 hazard
-    TRK-143's row exists to check for — reported separately, per the ask, rather than
-    fixed here (changing codegen's emitter moves emitted bytes and needs its own lane).
-    Kept as a pinned, monitored fact rather than an assumption: if this ever changes in
-    either direction
-    (the emitter changes, or the interpreter's formula changes), this test will notice
-    and the row's status needs re-deciding, not silently updating."""
-    print("\n--- TRK-143: raw formulas, M5-INT disarmed — a real, latent disagreement ---")
+def test_trk143_raw_formula_disagreement_is_now_agreement(r: SubTestResult):
+    """PERMANENT GUARD (was the opposite before PARITY-46): with M5-INT deliberately
+    disarmed on BOTH tiers' raw invocation — the shape that used to prove the two
+    formulas genuinely disagreed for a negative nonzero integer (`.bool()` is a nonzero
+    test; the old codegen `> 0.5` is a numeric threshold) — they now AGREE, because both
+    tiers reach the identical `masked_flow.cond_mask` call regardless of M5-INT.
+    `-1`: `cond_mask` reads it ON on both tiers (`.bool()` semantics, the interpreter's
+    original spelling, kept); `0`: OFF on both; `2`: ON on both. This asserts EQUALITY
+    where the row used to pin a documented disagreement — the fix closes the hazard at
+    its root (one shared formula), not only behind the M5-INT guard the previous test
+    already covers. If this ever reds, the shared-helper invariant itself broke — one
+    of the two call sites started spelling the formula itself again."""
+    print("\n--- TRK-143: raw formulas, M5-INT disarmed — now agree (PARITY-46) ---")
     saved = _marshalling.to_fp32_if_int_image
     _marshalling.to_fp32_if_int_image = lambda t, device=None: t
     try:
@@ -165,18 +198,12 @@ def test_trk143_raw_formula_disagreement_is_a_real_but_latent_invariant2_hazard(
         a[0, 0, 2, 0] = 2
         interp_vals = _run_interp_raw(prog, type_map, a)          # M5-INT disarmed
         cg_vals = _run_codegen_bypassed(prog, cg_fn, a)           # never armed on this path
-        assert interp_vals == [1.0, 0.0, 1.0], (
-            f"expected the interpreter's `.bool()` formula to read -1 as ON: {interp_vals}")
-        assert cg_vals == [0.0, 0.0, 1.0], (
-            f"expected codegen's `> 0.5` formula to read -1 as OFF: {cg_vals}")
-        assert interp_vals != cg_vals, (
-            "the two formulas stopped disagreeing on -1 — TRK-143's row needs "
-            "re-deciding (this would be GOOD news: re-check with M5-INT disarmed and "
-            "update the tracker row rather than silently accepting a green here)")
-        r.ok(f"[-1, 0, 2] (int64), M5-INT disarmed -> interp {interp_vals} != codegen "
-             f"{cg_vals}; confirmed latent, not fixed (invariant-2 hazard, reported "
-             f"separately)")
+        assert interp_vals == cg_vals == [1.0, 0.0, 1.0], (
+            f"interp={interp_vals} codegen={cg_vals}, expected [1.0, 0.0, 1.0] on both "
+            f"(-1 -> on, 0 -> off, 2 -> on, per cond_mask's nonzero-test reading)")
+        r.ok(f"[-1, 0, 2] (int64), M5-INT disarmed -> interp {interp_vals} == codegen "
+             f"{cg_vals} (PARITY-46: one shared cond_mask formula, not two)")
     except Exception as e:
-        r.fail("TRK-143 raw formula disagreement", f"{type(e).__name__}: {e}")
+        r.fail("TRK-143 raw formula agreement", f"{type(e).__name__}: {e}")
     finally:
         _marshalling.to_fp32_if_int_image = saved

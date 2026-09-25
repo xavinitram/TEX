@@ -28,6 +28,13 @@ from ..tex_compiler.ast_nodes import (
     collect_assigned_vars, try_extract_static_range,
 )
 from .interpreter import MAX_LOOP_ITERATIONS, InterpreterError, _Break, _Continue
+# TRK-143: `cond_mask` is masked_flow's (language-0.25, TRK-152) existing single
+# definition of "is this pixel on" — module-level, no cycle (masked_flow.py never
+# imports interpreter.py/interpreter_control_flow.py at load time, only lazily inside
+# its own methods). The UNMASKED `0.23` spatial-if below now calls it too, instead of
+# repeating the same formula inline, so there is exactly one spelling for both language
+# tiers and both runtime backends (see codegen.py's mirroring edit for the other half).
+from . import masked_flow as _masked_flow_mod
 
 
 class _ControlFlowMixin:
@@ -157,7 +164,13 @@ class _ControlFlowMixin:
             else_bindings = bindings_snapshot
 
         # Merge using torch.where (tensors) or scalar majority-vote (strings)
-        cond_bool = (cond > 0.5) if cond.is_floating_point() else cond.bool()
+        # TRK-143: was the inline `(cond > 0.5) if cond.is_floating_point() else
+        # cond.bool()` — now routed through the one shared `cond_mask` definition so
+        # this reading can never drift from what `masked_flow.cond_mask` (and codegen's
+        # mirror of it) computes. Byte-for-byte the same formula for every dtype this
+        # method has ever been called with — see `cond_mask`'s own docstring for why
+        # THIS spelling (the interpreter's) is the one both tiers now share.
+        cond_bool = _masked_flow_mod.cond_mask(cond)
         cond_scalar_box: list = []  # lazy cache for string merge
         self._merge_branch_vars(
             cond_bool, cond_scalar_box,
