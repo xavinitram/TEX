@@ -10,17 +10,32 @@ e.g. `gauss_blur`'s sigma, wants exactly that CPU scalar, never a device readbac
 `compiled.py::_params_on_device`'s own docstring records "always placing measured
 slower"). ATen lets a 0-dim CPU tensor mix with a CUDA operand ONLY while it stays 0-dim.
 Two call sites turn such a value into a REAL tensor at the image's shape without ever
-looking at its device: `_broadcast_pair`'s rank-mismatch expand (`interpreter.py`, shared
-by the interpreter and every codegen `_bp` call) and `_ensure_spatial`'s `dim() == 0`
-branch (the same file, codegen's `_es`) — the exact instant a genuinely-0-dim CPU tensor
-stops being exempt. Fixed at both, at the point of expansion (`_co_locate` /
-`_ensure_spatial`'s new `device=` kwarg), so nothing is moved unless it is about to be
-used incorrectly, and nothing on the already-correct path (same device, or a param that
-never reaches either function — `gauss_blur`'s sigma) pays anything beyond one `is`/`!=`
-check. NOT fusion-specific: the identical crash reproduces on a plain single-node cook
-whose codegen reaches either branch on CUDA (`test_fuseddev46_single_node_...` below) —
-today, a real ComfyUI user's `compile_mode="auto"` or `"torch_compile"` on such a program
-silently demotes to the interpreter, with no diagnostic reaching the node.
+looking at its device: `_broadcast_pair`'s rank-mismatch expand (the interpreter's own
+function, unchanged) and `_ensure_spatial`'s `dim() == 0` branch (also unchanged) — the
+exact instant a genuinely-0-dim CPU tensor stops being exempt.
+
+FIXED IN `codegen.py` ONLY, not in the shared interpreter functions themselves: `_invoke_cg`
+takes a `co_locate_params` flag. When it is set, `_bp`/`_es` (the callables baked into the
+generated function's own argument tail) are `_bp_co` (a plain module-level co-locating
+wrapper around `_broadcast_pair`) and a per-device-memoized wrapper around `_ensure_spatial`
+— so nothing is moved unless it is about to be used incorrectly, and the wrapper objects
+stay STABLE across cooks (torch.compile guards a callable argument's identity; a fresh
+closure every cook forced a full recompile every warm cook, not just the first — caught by
+`tests/test_codegen_param_device.py::test_codegen_param_placement_learned_once`'s own
+call-count pin during this ask's own review). `_codegen_only_execute` (the `auto` tier's
+dedicated codegen-only route) passes NOTHING here (defaults False): that route already has
+its own "learned once" placement net (`compiled.py::_params_on_device` /
+`_codegen_with_params_on_device`) whose pinned contract depends on the FIRST call still
+raising so it can learn — co-locating there too would make that net's trigger unreachable.
+`co_locate_params=True` is passed only by `_try_compile`'s two adapters (`_codegen_exec` /
+`_codegen_exec_eager`, reached from `execute_compiled` — the torch_compile/auto tier's OWN
+entry point, which has no such net at all and previously just blacklisted the program and
+fell back to the interpreter forever, silently).
+
+NOT fusion-specific: the identical crash reproduces on a plain single-node cook whose
+codegen reaches either branch on CUDA (`test_fuseddev46_single_node_...` below) — today, a
+real ComfyUI user's `compile_mode="auto"` or `"torch_compile"` on such a program silently
+demotes to the interpreter, with no diagnostic reaching the node.
 
 ComfyUI-invisible because: the DEFAULT path (`compile_mode="none"`) never reaches codegen
 here — the interpreter binds every value on the cook device already (PERF-2) — and every
@@ -31,6 +46,7 @@ that never hit the bug computes or how fast it runs.
 from helpers import *
 
 from TEX_Wrangle import tex_engine, tex_fusion
+from TEX_Wrangle.tex_runtime import codegen as tex_codegen
 from TEX_Wrangle.tex_runtime import compiled as tex_compiled
 
 _CUDA = torch.cuda.is_available()
@@ -133,15 +149,18 @@ def test_fuseddev46_single_node_torch_compile_cuda_stays_on_device(r: SubTestRes
         r.fail("FUSEDDEV-46 single-node crashed", f"{type(e).__name__}: {e}")
 
 
-def test_fuseddev46_broadcast_pair_and_ensure_spatial_co_locate(r: SubTestResult):
+def test_fuseddev46_bp_co_locates_without_compiling(r: SubTestResult):
     """Non-skip twin (helpers.devices()'s "a loop, not a skip" idiom): asserts, WITHOUT
-    compiling anything, that every constant `_broadcast_pair`/`_ensure_spatial` expand
-    lands on the SAME device as the tensor it's paired with. On a CPU-only box this is
-    the (still real, still worth pinning) same-device case; wherever CUDA is present it
-    also exercises the exact cross-device pairing that crashed (a bare, un-deviced 0-dim
-    tensor — precisely what `_get_param_local`'s `as_tensor(value)` produces — against a
-    device-resident image), never skipped."""
-    print("\n--- FUSEDDEV-46 twin: _broadcast_pair/_ensure_spatial always co-locate ---")
+    compiling or cooking anything, that `codegen._bp_co` — the plain module-level function
+    `_invoke_cg(co_locate_params=True)` hands the generated code as `_bp` — always returns
+    both operands on the same device. On a CPU-only box this is the (still real, still
+    worth pinning) same-device case; wherever CUDA is present it also exercises the exact
+    cross-device pairing that crashed (a bare, un-deviced 0-dim tensor — precisely what
+    `_get_param_local`'s `as_tensor(value)` produces — against a device-resident image),
+    never skipped. `_bp_co` takes no `device` argument (it derives the target from
+    whichever operand outranks the other), which is also why it can be a single stable
+    module-level function rather than a per-cook closure (see the module docstring)."""
+    print("\n--- FUSEDDEV-46 twin: codegen._bp_co co-locates on every device ---")
     try:
         for dev in devices():
             img = make_img(1, 4, 4, 3, seed=462).to(dev)
@@ -149,31 +168,23 @@ def test_fuseddev46_broadcast_pair_and_ensure_spatial_co_locate(r: SubTestResult
             # torch.as_tensor(value) with NO device, always CPU regardless of `dev`.
             const = torch.as_tensor(0.6)
 
-            a, b = _broadcast_pair(img, const)
+            a, b = tex_codegen._bp_co(img, const)
             if a.device != img.device or b.device != img.device:
-                r.fail(f"FUSEDDEV-46 twin _broadcast_pair ({dev})",
+                r.fail(f"FUSEDDEV-46 twin _bp_co ({dev})",
                       f"expanded pair landed on ({a.device}, {b.device}), expected "
                       f"both on {img.device}")
                 continue
             (a * b)   # must not raise "Expected all tensors to be on the same device"
 
-            spatial = tuple(img.shape[:-1])
-            es = _ensure_spatial(const, spatial, device=img.device)
-            if es.device != img.device:
-                r.fail(f"FUSEDDEV-46 twin _ensure_spatial ({dev})",
-                      f"expanded to {es.device}, expected {img.device}")
+            # The reverse operand order must land on the SAME device too.
+            b2, a2 = tex_codegen._bp_co(const, img)
+            if a2.device != img.device or b2.device != img.device:
+                r.fail(f"FUSEDDEV-46 twin _bp_co reversed ({dev})",
+                      f"expanded pair landed on ({b2.device}, {a2.device}), expected "
+                      f"both on {img.device}")
                 continue
-            (img[..., 0] * es)   # same check, the _es (channel-fill) shape
-
-            # Back-compat: device=None (every caller before this ask) must still return
-            # the value UNMOVED — additive, not a default-path behaviour change.
-            es_default = _ensure_spatial(torch.as_tensor(0.6), spatial)
-            if es_default.device != torch.device("cpu"):
-                r.fail(f"FUSEDDEV-46 twin _ensure_spatial default ({dev})",
-                      f"device=None moved a CPU tensor to {es_default.device} — "
-                      f"the pre-existing interpreter call sites must be untouched")
-                continue
-        r.ok(f"_broadcast_pair and _ensure_spatial co-locate their expanded operands "
-             f"on every available device ({devices()})")
+            (b2 * a2)
+        r.ok(f"codegen._bp_co co-locates its expanded operands on every available "
+             f"device ({devices()})")
     except Exception as e:
         r.fail("FUSEDDEV-46 twin crashed", f"{type(e).__name__}: {e}")

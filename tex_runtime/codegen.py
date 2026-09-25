@@ -369,9 +369,32 @@ def _stage_wire_scalars(bindings: dict, device: Any, dtype, cg_fn: Any, program:
             torch.scalar_tensor(fv, dtype=target_dtype, device=device), fv, target_dtype)
 
 
+def _bp_co(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """FUSEDDEV-46: `_broadcast_pair`, but co-locating a device-mismatched operand FIRST
+    — a rank-mismatch expand turns a 0-dim tensor real, ending the 0-dim CPU/CUDA mixing
+    exemption ATen otherwise allows. One plain module-level function (no `device` closed
+    over, so no per-cook closure identity to guard on): the lower-rank operand moves to the
+    higher-rank one's device, which is always the correctly-placed side in practice (an
+    image binding; a captured `$param` is the one that arrives off-device)."""
+    if a.device != b.device:
+        if a.dim() <= b.dim():
+            a = a.to(b.device)
+        else:
+            b = b.to(a.device)
+    return _broadcast_pair(a, b)
+
+
+#: FUSEDDEV-46: per-device `_es` wrappers (`_ensure_spatial` + a device co-location for its
+#: `dim() == 0` expand) — memoized so `_invoke_cg`'s `co_locate_params=True` callers hand
+#: torch.compile the SAME callable object every cook on a given device, not a fresh closure
+#: (see `_invoke_cg`'s own note on why identity matters here).
+_ES_CO_MEMO: dict = {}
+
+
 def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
                device: Any, spatial_shape: tuple | None, dtype=None,
-               program: Any = None, cancel: Any = None) -> None:
+               program: Any = None, cancel: Any = None,
+               co_locate_params: bool = False) -> None:
     """Invoke a codegen-generated function with the constant argument tail.
 
     Single owner of the positional calling convention — it must match the
@@ -411,25 +434,51 @@ def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
     `emit_cancel_polls=True`, Gap 2) poll between its own emitted top-level statements via
     the `_CK` global `build()` seeds into every generated module. `None` (every caller
     before this ask) costs one extra tuple slot on `set_cook_grid`'s save/restore and is
-    never read — the default path's behaviour and speed do not move."""
+    never read — the default path's behaviour and speed do not move.
+
+    `co_locate_params` (FUSEDDEV-46, additive, default False) is the ONE knob that decides
+    whether `_bp`/`_es` co-locate a captured `$param` before it stops being a 0-dim "wrapped
+    number" ATen otherwise lets mix devices freely. `_get_param_local`'s emitted preamble
+    stages a `$param` on the CPU by design (a sync-reading builtin's arg, e.g. `gauss_blur`'s
+    sigma, wants exactly that CPU scalar, never a device readback), so a param used in a
+    rank-mismatch broadcast (`_bp`) or a channel fill (`_es`'s `dim() == 0` branch) turns real
+    and raises "Expected all tensors to be on the same device" the instant a caller's
+    generated code touches it on CUDA — this is the crash the FUSED-CHAIN `torch_compile`
+    tier hit (COMPILE-M3) with no retry net of its own (`execute_compiled` just blacklists
+    and falls back forever). `_codegen_only_execute`'s OWN callers pass nothing here
+    (False): that route already has a retry net (`_params_on_device` / the "learned once"
+    placement, `compiled.py::_codegen_with_params_on_device`) whose own pinned performance
+    contract (`tests/test_codegen_param_device.py::test_codegen_param_placement_learned_once`)
+    depends on the FIRST call still raising so it can learn — co-locating there too would
+    make that net's crash-to-learn trigger unreachable and start paying a device check on
+    every cook forever instead of a placement decision made once. `True` is passed only by
+    `_try_compile`'s two adapters (`_codegen_exec`/`_codegen_exec_eager`, reached from
+    `execute_compiled` — the torch_compile/auto tier's OWN entry, which has no such net)."""
     _stage_vec_params(bindings, device, dtype)
     if program is not None:
         _stage_wire_scalars(bindings, device, dtype, cg_fn, program)
     _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device, cancel=cancel)
-    # FUSEDDEV-46: bind `_es` to THIS cook's device. `_get_param_local`'s emitted preamble
-    # stages a `$param` on the CPU by design (a sync-reading builtin's arg, e.g.
-    # `gauss_blur`'s sigma, wants exactly that CPU scalar, never a device readback — see
-    # `_params_on_device`'s "always placing measured slower" note). A param used only to
-    # fill a channel (`vec3($black)`) instead reached `_ensure_spatial`'s `dim() == 0`
-    # branch, which turns it into a real spatial tensor — the same "0-dim device-mixing
-    # exemption ends here" transition `_broadcast_pair` guards on the interpreter side.
-    # One closure per cook (not per call) is the entire added cost; every direct caller of
-    # `_ensure_spatial` (the interpreter) is unaffected, since it never binds through here.
-    def _es(tensor, spatial_shape_arg):
-        return _ensure_spatial(tensor, spatial_shape_arg, device=device)
+    bp, es = _broadcast_pair, _ensure_spatial
+    if co_locate_params:
+        # A per-device memo, not a fresh closure per cook: `bp`/`es` are baked into the
+        # compiled graph as ordinary callable ARGUMENTS (positional, alongside `torch`,
+        # `math`, ...), and torch.compile guards a callable argument's IDENTITY — a new
+        # closure object every cook (an earlier draft) reads as a changed input and forces
+        # a full recompile every warm cook, not just the first. `_bp_co` needs no `device`
+        # closed over (it reads both operands' own devices), so it is one plain module-level
+        # function, stable forever; `_es_co` needs `device`, so it is memoized per device
+        # (at most a couple of entries — the box's device set, not one per cook).
+        bp = _bp_co
+        es = _ES_CO_MEMO.get(device)
+        if es is None:
+            def es(tensor, spatial_shape_arg, _dev=device):
+                if tensor.dim() == 0 and tensor.device != _dev:
+                    tensor = tensor.to(_dev)
+                return _ensure_spatial(tensor, spatial_shape_arg)
+            _ES_CO_MEMO[device] = es
     try:
         cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
-              torch, _broadcast_pair, _es, torch.where,
+              torch, bp, es, torch.where,
               math, SAFE_EPSILON, CHANNEL_MAP, MAX_LOOP_ITERATIONS,
               _CgBreak, _CgContinue, _cg_lerp, _cg_lerpw)
     finally:
