@@ -5,6 +5,52 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.1] - 2026-09-25 — "Every code tested"
+
+A test-only patch: two error-code coverage gaps closed, one corpus-harness fix mirroring
+production's type-checking more faithfully, and a documentation pin for a test-suite contract.
+No product module changed. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze is owed.
+No default-path pixel changes.
+
+### Fixed
+
+- **The error-code "tested" ratchet no longer counts a code as tested when it only appears in a
+  comment or docstring.** The scan now strips both (via `tokenize`/`ast`, no regex heuristics)
+  before checking for a real trigger, closing a gap where writing a code into `tests/` prose
+  silently retired it without exercising anything.
+- **Nine previously-untested error codes now have real trigger tests**, seven of them reached
+  through the ordinary `check()` → `execute()` path with no bypass of anything, one through a
+  deliberate checker-bypass row, and one pair added at the type-checker layer. The remaining four
+  interpreter-level codes are confirmed genuinely defensive (unreachable from any source text
+  because the type checker already rejects it first) and are now pinned against a live program
+  each, so a future checker change that un-shadows one is caught.
+- **The corpus test harness's post-optimize type map now mirrors production's.** `_prepare_example`
+  used to hand the interpreter a pre-optimization type map paired with the post-optimization
+  program, unlike the real compile path (which re-derives the type map after optimizing, then
+  re-checks it). Fixed to match production exactly. Verified: this moves zero corpus goldens —
+  the mismatch was a bookkeeping gap for optimizer-synthesized nodes, never a wrong pixel. Test
+  harness only; no product code touched.
+- **A pinned test-suite contract is now documented where a contributor would look.** A note in
+  the test-authoring guide explains that `tests/helpers.py`'s `__all__` is pinned to its original
+  release set (enforced by an existing test) and must be updated in the same commit as any
+  addition.
+
+### Reviewed, no code change
+
+- A routine registry security-scan review found every current flagged finding inherent to what
+  this project is — documented, optional environment-variable reads, the codegen JIT's own
+  `compile`/`exec` of code it generated itself, one defended MSVC-toolchain-detection subprocess
+  call, and two scanner false-positives on non-Python shipped editor files — or a scanner rule
+  mismatch outside this project's control. None needed a code change.
+
+### For anyone vendoring this tree
+
+No newly reserved names; `LANGUAGE_VERSION` unmoved at `"0.25"`, no compat freeze owed; no
+default moves; no new shipping module filenames — every change in this release is test-only
+(`tests/`) or documentation (`tests/README.md`). **No user-visible behaviour change of any kind**:
+every default-path pixel is unchanged, and nothing in this release touches a shipped product
+module.
+
 ## [0.43.0] - 2026-09-25 — "Nothing unannounced"
 
 Tools grow part of their version story: install-time prewarm becomes cancellable and queryable.
