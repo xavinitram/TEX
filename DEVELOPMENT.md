@@ -744,7 +744,12 @@ and everything below is a pointer, one sentence each, to what exists on this tre
   tree-walker leans on — but no field set or shape is promised across a minor the way a reserved
   name or a grammar change is (see "What a release note owes a vendoring host" below). Not a row
   below; Tier 3 by the catch-all, and this paragraph is the whole of what is currently true, not
-  an upgrade of the promise.
+  an upgrade of the promise. **For the one thing a host was actually walking this IR to find —
+  does a program read `frame`/`fps`/`time`/`fetch_time`/`sample_time` — the public replacement
+  is `Program.time_reads` (TIMEREADS-45, its own Tier 1 row below), not a hand-written walk over
+  `iter_child_nodes`**: it is the same two checks `codegen._reads_time_builtin` and
+  `graphed._capturable` already run, computed once at compile time, so a host stops needing its
+  own AST walk (or a builtins classifier) to answer that one question.
 - `tex_compiler.types.TEXType` (the enum), its members, `.channels`/`.is_numeric`/`.is_planes`,
   and the derived tables `CHANNEL_MAP`/`VALID_SWIZZLES` are the compiler's type lattice. No new
   member is promised never to arrive, but a SHIPPED member keeps its name and its `.value`
@@ -787,6 +792,8 @@ breaks a host.
 | **1 — Public** | `tex_provider`'s host source protocol (DATA-7): the `FrameProvider` Protocol, `get_provider`/`set_provider`, `materialize`, `source_version`/`bump_source_version`, `stats`, `declare_window`, `set_media_budget_mb`, `source_flags` | What a host implements to hand TEX frames, and how TEX reads and governs them; a provider is a pure function of `(source_key, quantized_t)` for as long as its source version does not change — the host bumps the version, TEX never stats a file | `test_seam45_embedding_host_seam` (SEAM-45, v0.45) |
 | **1 — Public** | `tex_lazy.lazy_required_bindings` (invariant #11) | The `@`/`$` names a program can still reference given these widget values, or `None` meaning the analysis failed and the caller should keep every binding; never raises; over-approximates only, never under | `test_lazy_cooking.py`, `test_seam45_embedding_host_seam` (SEAM-45, v0.45) |
 | **1 — Public** | `tex_runtime.host.CookCancelled` / `NullHostServices` / `get_host_services` (PORT-1's own module, alongside the `HostServices` row above) | `CookCancelled` is the one exception type a cancelled cook raises at a yield point; `get_host_services()` returns the ComfyUI implementation when importable, else `NullHostServices` — a real host-agnostic implementation, not a stub, that still detects a torch OOM | `test_port1_host_services`, `test_seam45_embedding_host_seam` (SEAM-45, v0.45) |
+| **1 — Public** | `ResultCache.spill(key) -> bool` (SPILL-45) | Spills ONE named entry to the disk tier now, outside `evict_bytes`'s own LRU order — mechanism, not policy; `False` if `key` is absent, already on disk, or no disk tier is reachable | `test_v045_spill45.py`, `test_seam45_embedding_host_seam` (SEAM-45, v0.45) |
+| **1 — Public** | `tex_api.Program.time_reads: frozenset[str]` (TIMEREADS-45) | Which of `frame`/`fps`/`time`/`fetch_time`/`sample_time` the program reads, anywhere in its body; derived and read-only, computed once at compile time from the AST alone — changes no fingerprint, cache key or pixel | `test_v045_timereads45.py`, `test_seam45_embedding_host_seam` (SEAM-45, v0.45) |
 | **2 — Semi** | `a@name` ARRAY wire + array outputs (DATA-3) | Engine-profile only; `a` is now a RESERVED binding prefix; comfy rejects array outputs (E3203 + egress guard) | `test_v028_phase1` |
 | **2 — Semi** | TEX the language | Additive; new builtin/function names are RESERVED, so adding one is a minor breaking change — note it in the CHANGELOG (v0.22 reserved `frame`/`fps`/`time`) | the compat corpus (LANG-3, planned) |
 | **2 — Semi** | Error codes (E1xxx–E6xxx) | Codes are stable; message TEXT is not. **Stability is the part a host depends on** — one folds its diagnostic notifications on `(speaker, code)` — so a retired code is never reused for a different meaning, and removing one from the documented set is a minor bump that rides a tag, never a patch | `test_c3ux_error_codes_resolve` |

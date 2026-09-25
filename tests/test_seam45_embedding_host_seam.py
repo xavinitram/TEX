@@ -11,8 +11,10 @@ KINDS (positional-or-keyword / keyword-only / var-positional / var-keyword) and 
 (never the default VALUE, which is not part of this contract), every symbol a 2026-09-25 census
 of the embedding-host seam found:
 
-  * **Tier 1** (`_TIER1_SPEC`, 114 rows) — symbols that host's own PRODUCT code calls or
-    references. This is the harder promise: these are load-bearing for a running integration.
+  * **Tier 1** (`_TIER1_SPEC`, 116 rows: the census's 114 plus `ResultCache.spill` and
+    `Program.time_reads`, added the moment they landed on `main` — see below) — symbols that
+    host's own PRODUCT code calls or references. This is the harder promise: these are
+    load-bearing for a running integration.
   * **Tier 2** (`_TIER2_SPEC`, 87 rows) — symbols reached ONLY from that host's own tests,
     scripts and benchmarks, never its product code. Still pinned exactly (existence AND
     signature shape), but softer: nothing in the shipped product breaks if one of these moves,
@@ -32,6 +34,13 @@ against a moved symbol is exactly the "someone decides on purpose" step this tes
 force) that walked the census's own symbol list with `inspect.signature` at this ask's base sha
 (v0.44.0). Changing a row here is a deliberate edit to a checked-in file, not something a
 refactor does by accident.
+
+**Two rows arrived after the census.** `ResultCache.spill` and `Program.time_reads` were the
+ASKS lane's own additions, landed on `main` after this census was taken; they are folded
+straight into `_TIER1_SPEC` (added post-merge, not re-derived from the whole tree, since they
+are two rows and their shape is already known from the code) rather than left uncovered until
+the next census. `Program.time_reads` is a dataclass field, not a callable — pinned as a plain
+attribute (its default value's type), exactly like any other non-callable row.
 
 **Mutation, both directions**, in `test_seam45_mutation_proves_both_directions`: a renamed
 keyword and a removed symbol each red the exact comparator (`_diff`) the two tier tests call —
@@ -67,6 +76,7 @@ _TIER1_SPEC = {
     'tex_api:color_advisories': ('function', (('source', 'POSITIONAL_OR_KEYWORD', False), ('param_values', 'POSITIONAL_OR_KEYWORD', False), ('binding_meta', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_api:prewarm': ('function', (('programs', 'POSITIONAL_OR_KEYWORD', False), ('shapes', 'POSITIONAL_OR_KEYWORD', True), ('device', 'KEYWORD_ONLY', True), ('precision', 'KEYWORD_ONLY', True), ('compile_mode', 'KEYWORD_ONLY', True), ('cancel', 'KEYWORD_ONLY', True))),
     'tex_api:LANGUAGE_VERSION': ('str', None),
+    'tex_api:Program.time_reads': ('frozenset', None),
     'tex_cache:get_cache': ('function', ()),
     'tex_checkpoint:cook_checkpointed': ('function', (('stages', 'POSITIONAL_OR_KEYWORD', False), ('result_cache', 'POSITIONAL_OR_KEYWORD', False), ('device', 'KEYWORD_ONLY', True), ('precision', 'KEYWORD_ONLY', True), ('upstream', 'KEYWORD_ONLY', True), ('cuts', 'KEYWORD_ONLY', True), ('threshold_ms', 'KEYWORD_ONLY', True), ('profile_key', 'KEYWORD_ONLY', True), ('spatial', 'KEYWORD_ONLY', True), ('latent_channel_count', 'KEYWORD_ONLY', True), ('time_context', 'KEYWORD_ONLY', True), ('cancel', 'KEYWORD_ONLY', True), ('on_progress', 'KEYWORD_ONLY', True))),
     'tex_checkpoint:materialize': ('function', (('stages', 'POSITIONAL_OR_KEYWORD', False), ('result_cache', 'POSITIONAL_OR_KEYWORD', False), ('device', 'KEYWORD_ONLY', True), ('precision', 'KEYWORD_ONLY', True), ('upstream', 'KEYWORD_ONLY', True), ('cuts', 'KEYWORD_ONLY', True), ('threshold_ms', 'KEYWORD_ONLY', True), ('profile_key', 'KEYWORD_ONLY', True), ('spatial', 'KEYWORD_ONLY', True), ('latent_channel_count', 'KEYWORD_ONLY', True), ('time_context', 'KEYWORD_ONLY', True), ('cancel', 'KEYWORD_ONLY', True), ('on_progress', 'KEYWORD_ONLY', True))),
@@ -148,6 +158,7 @@ _TIER1_SPEC = {
     'tex_results:ResultCache.governed_bytes': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('dev_type', 'POSITIONAL_OR_KEYWORD', True))),
     'tex_results:ResultCache.patch_region': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('key', 'POSITIONAL_OR_KEYWORD', False), ('patch', 'POSITIONAL_OR_KEYWORD', False), ('window', 'POSITIONAL_OR_KEYWORD', False), ('base', 'KEYWORD_ONLY', True), ('base_key', 'KEYWORD_ONLY', True), ('canvas', 'KEYWORD_ONLY', True), ('quality', 'KEYWORD_ONLY', True), ('storage', 'KEYWORD_ONLY', True))),
     'tex_results:ResultCache.reindex_disk': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False),)),
+    'tex_results:ResultCache.spill': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('key', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_results:lineage_key': ('function', (('program_fp', 'KEYWORD_ONLY', False), ('device', 'KEYWORD_ONLY', False), ('precision', 'KEYWORD_ONLY', False), ('params', 'KEYWORD_ONLY', True), ('upstream', 'KEYWORD_ONLY', True), ('frame', 'KEYWORD_ONLY', True), ('time_context', 'KEYWORD_ONLY', True), ('quality', 'KEYWORD_ONLY', True), ('flags', 'KEYWORD_ONLY', True), ('canvas', 'KEYWORD_ONLY', True))),
     'tex_roi:chain_windows': ('function', (('halos', 'POSITIONAL_OR_KEYWORD', False), ('roi', 'POSITIONAL_OR_KEYWORD', False), ('dirty_from', 'POSITIONAL_OR_KEYWORD', True), ('valid', 'POSITIONAL_OR_KEYWORD', True), ('declined', 'POSITIONAL_OR_KEYWORD', True))),
     'tex_roi:covers': ('function', (('valid', 'POSITIONAL_OR_KEYWORD', False), ('needed', 'POSITIONAL_OR_KEYWORD', False))),
@@ -371,7 +382,8 @@ _COOK_DOCUMENTED_KWARGS = frozenset(
 
 def test_seam45_tier1_host_seam_pinned(r: SubTestResult):
     """Tier 1: every symbol the census found the embedding-host's PRODUCT code calling or
-    referencing (114 rows) exists at this head with exactly the frozen kind and signature
+    referencing (114 census rows plus 2 landed after it: `ResultCache.spill`,
+    `Program.time_reads`) exists at this head with exactly the frozen kind and signature
     shape. This is the harder promise -- a mismatch here is load-bearing for a running
     integration, not just its dev tooling."""
     print("\n--- SEAM-45: Tier 1 (the embedding-host product seam) ---")
