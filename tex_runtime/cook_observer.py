@@ -24,7 +24,7 @@ cut). None of that nesting is a second cook — it is one host-observed cook rec
 through some of the six functions underneath. `enter`/`leave` track a per-thread depth: the
 OUTERMOST call among the six on a thread notifies, every call nested inside it (by any of
 the six, in any combination) shares that single notification. This is the shape a
-count-once audit wants — Shard's own `compositor/engine/audit.py` enforces "one `CookQueue`
+count-once audit wants — an embedding host's audit that enforces "one cook-queue
 worker thread" by counting cooks, which is exactly the property a double-notified nested
 call would break. A host that wants the nesting depth instead of the collapsed count is not
 served by this seam as specified; nothing here prevents building that separately.
