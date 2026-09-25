@@ -15,6 +15,7 @@ from TEX_Wrangle.tex_runtime.stdlib import TEXStdlib, SAFE_EPSILON
 from TEX_Wrangle.tex_runtime.interpreter import _broadcast_pair, _ensure_spatial
 from TEX_Wrangle.tex_runtime.compiled import _build_codegen_env, _MAX_LOOP_ITERATIONS
 from TEX_Wrangle.tex_compiler.types import CHANNEL_MAP
+from TEX_Wrangle.tex_runtime.graphed import _restoring_cuda_stream
 
 assert torch.cuda.is_available()
 allp = {p.name: p for p in (list(SYNTHETIC_PROGRAMS) + list(load_example_programs()))}
@@ -71,8 +72,13 @@ def bench(name, H=1024, W=1024):
         torch.cuda.synchronize()
 
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            out_static = call_cg(cg_fn, env_s, bind_s, sp)
+        # TRK-184: same stream-restore hazard TRK-183 fixed in graphed.py's two production
+        # call sites (torch.cuda.graph.__exit__ can leave the current stream pointed at the
+        # graph module's internal capture stream if capture_end() itself raises) — reuse the
+        # helper rather than duplicate it, since this loop runs multiple PROGS in one process.
+        with _restoring_cuda_stream(DEV.index if DEV.index is not None else torch.cuda.current_device()):
+            with torch.cuda.graph(g):
+                out_static = call_cg(cg_fn, env_s, bind_s, sp)
 
         g.replay(); torch.cuda.synchronize()
         graph_out = out_static.clone()
