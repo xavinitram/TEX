@@ -826,6 +826,31 @@ has stored a number whose whole purpose is to become different. Key your own sto
 your own identity (the roadmap's CACHE-1 lineage key is the durable one); TEX's cache
 directory is TEX's business, and `TEX_CACHE_DIR` tells it where to live.
 
+## Per-tier bit-exactness (PARITY-46)
+
+Four things can execute a compiled TEX program: the interpreter (the oracle — invariant #2 is
+defined relative to it), codegen without `torch.compile` (a flat Python function), codegen
+wrapped in `torch.compile`/TorchInductor (the `compiled` tier), and a captured CUDA graph
+replay (the `graphed` tier, CUDA-only, replaying the interpreter's own op sequence). This table
+states each tier's exactness claim against the interpreter, what enforces that claim, and
+whether the tier may be trusted to serve an output that must stay byte-identical across a
+*relaunch* of the process — not merely within one run. Every claim below is derived from an
+existing test; a tier with no enforcing test for a row says **unenforced** rather than a
+bound nobody measured.
+
+| Tier | Bit-exact with the interpreter? | Enforced by | Export-safe (byte-identical across a relaunch)? |
+|------|----------------------------------|--------------|---------------------------------------------------|
+| **Interpreter** | Itself — it IS the oracle invariant #2 is stated relative to; there is nothing to compare it against. | N/A — it defines the standard the other three are held to. | **Yes, for the frozen compat-corpus program set, CPU, fp32.** The LANG-3 corpus (`tests/compat_corpus.py`, run only through the interpreter, CPU-only) hashes quantized output and checks it against `compat_corpus_goldens/<language_version>.json` — a file that is append-only and never rewritten wholesale (`tests/test_v023_phase1.py::test_lang3_compat_corpus`, `tests/test_trk126_compat_corpus_only_correction.py`). That is a literal claim of byte-identical output on every future run of the suite, forever, for that program set. Outside that corpus: **unenforced** — CPU threaded-accumulation programs (scatter) are measured run-to-run non-deterministic at ~5.5e-6 even within one process (`tests/test_determinism_pin.py`, PR-LP5's CPU caveat, documented not fixed), and no test restarts the process to check the general case. |
+| **Codegen** (no `torch.compile`) | **Bit-exact, tol 1e-5 fp32** (AGENTS.md invariant #2 verbatim). | `tests/test_codegen_optimizer.py::test_codegen_equivalence` + the differential fuzzer (`tests/test_v017_phase1.py::test_tst1_differential_fuzzer`, N=300 fixed seed on every run; `.github/workflows/nightly_fuzz.yml` widens to N=2000, date-seeded). | **Unenforced for pixel output.** The emitted Python source IS relied on to regenerate byte-for-byte across process relaunches — the `.cg` sidecar cache (CACHE-4) is keyed on `codegen_epoch()` and reused across runs, and `codegen.py` sorts its emission order specifically so that "cross-process byte-identity of cached codegen" holds — but no test restarts a process and diffs either the emitted source or the resulting pixels to prove it; the LANG-3 corpus above never runs codegen at all. Treat as depended-on, not proven. |
+| **Inductor** (`torch.compile`, the `compiled` tier) | **NOT bit-exact — a named, measured bound**, not a proof: `atol=1e-5` for a straight-line program, `atol=1e-4` once a for-loop is involved, against the plain/interpreter baseline. | `tests/test_integration.py::test_torch_compile` (`torch.allclose(result_compiled, expected, atol=1e-5)`, and `atol=1e-4` for the loop-program row). | **No.** The recorded doctrine (from the v0.36.0 incident) is that Inductor/fuser output must never be pinned bitwise across a toolchain or OS change: a bare fp32 ulp (`2**-24`) difference on Linux vs Windows already broke a bit-equality test that compared two DISPATCHED Inductor-tier calls. Cross-tier or cross-build agreement for anything that reaches Inductor belongs to a measured, deliberately re-bandable **envelope** (`tests/test_v031_noise_tiers.py`: *"a build that blows one is a decision to re-measure and re-band, never a tolerance"*), never a bit pin — and there is no test claiming relaunch byte-identity for this tier. |
+| **CUDA graphs** (`graphed`, capture + replay of the interpreter) | **Bit-exact, tol 1e-5**, against the interpreter it replays — CUDA-only, skips clean on a CPU-only box. | `tests/test_v015_phase2.py` ("Capture + bit-exact replay vs interpreter": `md = (gt.float() - itt.float()).abs().max().item(); assert md < 1e-5`). | **No — and not by design.** A captured graph is a live GPU-memory handle; only the boolean *capturability verdict* for a fingerprint is ever persisted (`warm_state`/CACHE-3), never the capture itself (`graphed._graph_cache` is an in-memory, session-scoped LRU — ARCHITECTURE.md's cache inventory). PR-LP5's run-to-run determinism pin (`tests/test_determinism_pin.py`, CUDA gated, band 1e-9) covers repeats *within one process*, never a relaunch, and nothing here claims otherwise. |
+
+Two invariant-9 tests sit beside this table rather than in it, because they answer a different
+question (same tier, different *device*, not different tier): `tests/test_cross_device_envelope.py`
+(PR-LP1, CPU vs CUDA on the interpreter) and `tests/test_determinism_pin.py` (PR-LP5, run-to-run
+on one device) are both **envelopes**, not bit-exactness claims — invariant #9 states plainly
+that cross-device parity was never a contract, only same-device interp<->codegen is.
+
 ## Concurrency & thread-safety (ENG-9)
 
 The written contract for TEX's module-level runtime state. It exists because a
