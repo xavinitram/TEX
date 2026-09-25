@@ -432,6 +432,131 @@ _WHOLE_FRAME_CHAIN_D3 = {
 }
 
 
+_HOST_TICK_EXACT_D1 = {
+    # COMPILE-M1 — the host-neutral pin of a real embedding host's EXACT tick, per that
+    # host's own reported call sequence ("Q5", local hand-back only): `time_context` always,
+    # `binding_meta` on some inputs, a CHAINED `CancelToken`, each cook bracketed by the PROF-1
+    # `profile.measure` (a no-op body here — PROF-1 is disarmed for this whole file), a
+    # per-node `lineage_key` mint over the WHOLE ten-stage graph, and a checkpoint OFFER
+    # (`plan_checkpoints` with an explicit `threshold_ms`, one `boundary_lineage_key` probe per
+    # planned cut) — while the cook itself still takes the whole-frame route, one
+    # `tex_engine.cook` per dirty node, same as `_WHOLE_FRAME_CHAIN_D1`. `_DIRTY=1`: the
+    # terminal (vignette) stage alone, whole-frame instead of windowed.
+    "tex_engine.cook":          1,
+    "tex_engine.prepare":       1,    # `cook()` = `run(prepare())`, once per dirty node.
+    "tex_engine.run":           1,
+    "TEXCache.compile_ast":     0,    # ANIM-1.
+    "TEXCache.compile_tex":     1,
+    "TEXCache.fingerprint":     1,    # PERF-5 shape: 1 per cook.
+    "Lexer.tokenize":           0,    # the source was already parsed by an earlier scenario's
+    "Parser.parse":             0,    # cook in this process; PERF-1's memo hits.
+    "tex_roi._fold_program":    0,    # `roi=None` throughout: no ROI/results-cache tier.
+    "tex_roi.roi_plan":         0,
+    "tex_roi.chain_windows":    0,
+    "ResultCache.get":          0,    # this scenario carries no `ResultCache` at all.
+    "ResultCache.put":          0,
+    "tex_memory.run_roi":       0,
+    "enforce_cache_budget":     1,    # once per cook.
+    "_disown_inputs":           1,
+    "_tile_plan":               1,    # the whole 96^2 frame is planned (no window).
+    "_halo_tile_plan":          0,    # the terminal (vignette) stage alone: pointwise, no
+                                     # blur-adjacent gate to reach (contrast D3 below).
+    "host.get_free_memory":     0,    # off CUDA the planners return before the query.
+    "lazy_required_bindings":   0,    # this path never reaches the lazy tier.
+    "Interpreter._exec_stmt":   2,    # the vignette stage's own two statements.
+    # ── the three rows THIS scenario exists to pin (0 on every scenario above it) ──────
+    "tex_checkpoint.plan_checkpoints": 1,   # ONE checkpoint OFFER per tick, regardless of
+                                     # `_DIRTY` — the offer reads the frozen cost table, not
+                                     # which stages are dirty (Q5 step 4 is independent of the
+                                     # route decision at step 5). Re-derive with this file's
+                                     # `_check`'s message if PROF-1's settling schedule or the
+                                     # ten-stage chain's own per-stage costs move.
+    "tex_engine.boundary_lineage_key": 8,   # one PROBE per planned cut on this ten-stage chain
+                                     # at the gate shape (96^2) with `_THRESHOLD_MS`=0.05 — a
+                                     # probe, never a serve; this scenario's cook always takes
+                                     # the whole-frame route regardless of what the offer plans.
+    "tex_results.lineage_key": 18,   # 10 (`_mint_all_node_keys`, once per node in the WHOLE
+                                     # graph, Q5 step 3) + 8 (`boundary_lineage_key` mints one
+                                     # internally per probe, Q5 step 4) — the two doors this
+                                     # scenario drives onto the same function, at once.
+}
+
+_HOST_TICK_EXACT_D3 = {
+    # The same tick, three stages dirty (contrast, glow, vignette) instead of one — what one
+    # extra dirty node costs ON TOP of the fixed per-tick overhead `_HOST_TICK_EXACT_D1` pins.
+    # The checkpoint offer's own two rows are UNCHANGED from D1: the offer is a function of the
+    # frozen cost table and the chain's structure, not of which suffix is dirty.
+    "tex_engine.cook":          3,
+    "tex_engine.prepare":       3,
+    "tex_engine.run":           3,
+    "TEXCache.compile_ast":     0,
+    "TEXCache.compile_tex":     3,
+    "TEXCache.fingerprint":     3,
+    "Lexer.tokenize":           0,
+    "Parser.parse":             0,
+    "tex_roi._fold_program":    0,
+    "tex_roi.roi_plan":         0,
+    "tex_roi.chain_windows":    0,
+    "ResultCache.get":          0,
+    "ResultCache.put":          0,
+    "tex_memory.run_roi":       0,
+    "enforce_cache_budget":     3,
+    "_disown_inputs":           3,
+    "_tile_plan":               3,
+    "_halo_tile_plan":          1,    # the blur-adjacent `glow` stage's cheap gate — same
+                                     # distinction `_WHOLE_FRAME_CHAIN_D3` draws against D1.
+    "host.get_free_memory":     0,
+    "lazy_required_bindings":   0,
+    "Interpreter._exec_stmt":   4,    # contrast (1) + glow (1) + vignette (2).
+    "tex_checkpoint.plan_checkpoints": 1,     # unchanged from D1 — see the class comment above.
+    "tex_engine.boundary_lineage_key": 8,     # unchanged from D1, same reason.
+    "tex_results.lineage_key": 18,            # unchanged from D1, same reason.
+}
+
+_PLAYBACK_FRAMES = {
+    # COMPILE-M1's PLAYBACK shape: the SAME ten-stage chain every tick — same source, same
+    # programs, same params — with ONLY `time_context`'s frame moving. Every stage cooks every
+    # tick (a played frame is not a partial edit, so there is no clean prefix), whole-frame,
+    # `compile_mode="none"`, no results cache at all. Contrast `_ALL_DIRTY`, which pays the
+    # same ten-cook shape for a PARAM edit through the comp's own ROI/results-cache tier: the
+    # two are expected to read identically on `tex_engine.cook`/`Interpreter._exec_stmt` (the
+    # same ten programs) and to DIFFER on `tex_results.lineage_key` and `ResultCache.get`/`put`
+    # (0 here — this scenario never touches a `ResultCache`, `_ALL_DIRTY`'s comp always does),
+    # which is exactly the axis the two scenarios isolate from each other.
+    "tex_engine.cook":         10,
+    "tex_engine.prepare":      10,
+    "tex_engine.run":          10,
+    "TEXCache.compile_ast":     0,
+    "TEXCache.compile_tex":    10,
+    "TEXCache.fingerprint":    10,
+    "Lexer.tokenize":           0,
+    "Parser.parse":             0,
+    "tex_roi._fold_program":    0,
+    "tex_roi.roi_plan":         0,
+    "tex_roi.chain_windows":    0,
+    "ResultCache.get":          0,   # no `ResultCache` on this path at all.
+    "ResultCache.put":          0,
+    "tex_memory.run_roi":       0,
+    "enforce_cache_budget":    10,
+    "_disown_inputs":          10,
+    "_tile_plan":              10,   # the whole 96^2 frame, ten times.
+    "_halo_tile_plan":          3,   # the blur/sharpen/glow stages' cheap gate (three of the
+                                     # ten are blur-adjacent — same reason `_INTERP_CHAIN_SCRUB`
+                                     # reads 0 here at this shape while a full ten-stage cook
+                                     # reaches every stage's own gate).
+    "host.get_free_memory":     0,
+    "lazy_required_bindings":   0,
+    "tex_checkpoint.plan_checkpoints": 0,   # this scenario never offers a checkpoint.
+    "tex_engine.boundary_lineage_key": 0,
+    "tex_results.lineage_key":  0,          # never minted directly on this path — contrast
+                                     # `_ALL_DIRTY`'s comp, whose own `_key` wrapper mints one
+                                     # per stage.
+    "Interpreter._exec_stmt":  12,   # 12 statements across the ten stage programs — the same
+                                     # reading `_ALL_DIRTY` pins, for the same reason (all ten
+                                     # stages cook, and it is the same ten programs).
+}
+
+
 def test_bench2_interactive_per_tick_counts(r: SubTestResult):
     """The gate: the device-independent per-tick counts of the seven interactive paths."""
     print("\n--- BENCH-2: per-tick structural counts (CPU, PROF-1 disarmed) ---")
@@ -441,7 +566,10 @@ def test_bench2_interactive_per_tick_counts(r: SubTestResult):
                         ("checkpoint_serve", _CHECKPOINT_SERVE),
                         ("interp_chain_scrub", _INTERP_CHAIN_SCRUB),
                         ("whole_frame_chain_d1", _WHOLE_FRAME_CHAIN_D1),
-                        ("whole_frame_chain_d3", _WHOLE_FRAME_CHAIN_D3)):
+                        ("whole_frame_chain_d3", _WHOLE_FRAME_CHAIN_D3),
+                        ("host_tick_exact_d1", _HOST_TICK_EXACT_D1),
+                        ("host_tick_exact_d3", _HOST_TICK_EXACT_D3),
+                        ("playback_frames", _PLAYBACK_FRAMES)):
         try:
             _check(r, label, _api_counts(label), pins)
         except Exception as e:
@@ -495,7 +623,8 @@ def test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r: SubTestResult
     print("\n--- BENCH-2: zero engine-side CUDA syncs per interactive tick ---")
     for label in ("terminal", "midgraph", "pan", "all_dirty", "node_scrub",
                  "checkpoint_serve", "interp_chain_scrub",
-                 "whole_frame_chain_d1", "whole_frame_chain_d3"):
+                 "whole_frame_chain_d1", "whole_frame_chain_d3",
+                 "host_tick_exact_d1", "host_tick_exact_d3", "playback_frames"):
         try:
             got = _api_counts(label)
             lo, hi = got.get("torch.cuda.synchronize[engine]", (None, None))

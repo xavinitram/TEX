@@ -261,6 +261,12 @@ SPY_TARGETS: "dict[str, tuple[str, ...]]" = {
     # multi-tap — so both rows read 0 everywhere else in this file.
     "tex_checkpoint.cook_checkpointed": ("TEX_Wrangle.tex_checkpoint.cook_checkpointed",),
     "tex_engine.boundary_lineage_key":  ("TEX_Wrangle.tex_engine.boundary_lineage_key",),
+    # COMPILE-M1: the checkpoint OFFER itself (Q5 step 4's `plan_checkpoints` call), separate
+    # from `cook_checkpointed` (the SERVE route, BENCH-4). `host_tick_exact` probes for a
+    # placement every tick while still taking the whole-frame cook route — the offer and the
+    # route decision are independent questions (Q5 steps 4 and 5) — so this row is 0 on every
+    # scenario above and non-zero only there.
+    "tex_checkpoint.plan_checkpoints": ("TEX_Wrangle.tex_checkpoint.plan_checkpoints",),
 
     # ── the per-cook FIXED pipeline, and the memo keys that make a scrub re-parse ──────
     # Not part of the gate: these are the rows a follow-up would move, each named in
@@ -1183,10 +1189,209 @@ class WholeFrameChainD3Scenario(WholeFrameChainScenario):
     _DIRTY = 3
 
 
+class HostTickExactScenario(Scenario):
+    """COMPILE-M1 — pins the host's EXACT tick, host-neutral, per a real embedding host's own
+    reported call sequence ("Q5", local hand-back only): every tick passes `time_context`,
+    `binding_meta` on SOME inputs (never all), a CHAINED `CancelToken` (never a bool), and
+    wraps each cook in the PROF-1 `profile.measure` bracket. Before the cook, it mints a
+    per-node `lineage_key` (all-keyword) over the WHOLE graph and offers a checkpoint —
+    `plan_checkpoints` with an explicit `threshold_ms`, one `boundary_lineage_key` probe per
+    planned cut — while the cook itself still takes the WHOLE-FRAME route (one
+    `tex_engine.cook` per dirty node, exactly `WholeFrameChainScenario`'s shape): Q5 step 4
+    (the checkpoint offer) and step 5 (the route decision) are independent questions, and a
+    host that always asks the checkpoint planner may still route whole-frame.
+
+    N=10 stages (the comp's own `_COMP_STAGES`, reused rather than a private fixture so the
+    per-stage `Interpreter._exec_stmt` counts stay comparable to `_ALL_DIRTY`'s and
+    `_WHOLE_FRAME_CHAIN_D*`'s); `_DIRTY` of them dirty per tick, `1` or `3` — the same D1/D3
+    split those scenarios use, so all three families are stage-for-stage comparable."""
+    needs_comp = False
+    _DIRTY = 1
+    #: Far below every measured stage cost at the gate shape — see `CheckpointServeScenario`'s
+    #: own note; the MATERIALIZATION FLOOR (`put_cost_ms * _FLOOR_FACTOR`), not this number,
+    #: is what actually gates a cut at every shape this file drives.
+    _THRESHOLD_MS = 0.05
+    #: CACHE-6's content-sensitive source identity for the boundary probes. Fixed: this
+    #: scenario never swaps the source tensor underneath a probed boundary.
+    _UPSTREAM = ("host-tick-exact-src-v1",)
+    _MAX_WARMUP_COOKS = 600
+
+    def build(self):
+        from TEX_Wrangle import tex_checkpoint, tex_engine, tex_results
+        from TEX_Wrangle.tex_marshalling import BufferMeta
+        from TEX_Wrangle.tex_runtime import profile as _profile
+        self._checkpoint, self._engine, self._results = tex_checkpoint, tex_engine, tex_results
+        self._profile, self._BufferMeta = _profile, BufferMeta
+        dev = "cuda" if (self.device == "cuda" and torch.cuda.is_available()) else "cpu"
+        self._dev = dev
+        torch.manual_seed(23)
+        stages_src = self.demo._COMP_STAGES
+        n = len(stages_src)
+        self._n = n
+        self._names = [nm for nm, _c, _d in stages_src]
+        self._codes = [c for _nm, c, _d in stages_src]
+        self._defaults = [dict(d) for _nm, _c, d in stages_src]
+        self._src = torch.rand(1, self.res, self.res, 3, device=dev)
+
+        # The linear stage-list FIXTURE `tex_checkpoint` reads: same 10 programs, `chain_input`
+        # spelling (a `chain_inputs` DAG needs `collapse_linear` first — not this scenario's
+        # question). `bindings` carries only each stage's OWN params; the chain wiring supplies
+        # `IN` from the previous stage's `OUT`, and stage 0 supplies it from `self._src`.
+        self._stage_list = [
+            {"code": self._codes[i], "chain_input": (None if i == 0 else "IN"),
+             "bindings": ({"IN": self._src, **self._defaults[0]} if i == 0
+                          else dict(self._defaults[i]))}
+            for i in range(n)]
+
+        # Settle a PROF-1 cost table for this exact 10-stage chain (outside the counted
+        # region — see `CheckpointServeScenario`'s own note on why: a settling loop pollutes
+        # a tick's frame/API counts if it runs inside them). Salted so passes A/B/C and every
+        # device each settle their OWN bucket rather than inheriting another's.
+        pkey = _profile.make_key(f"host-tick-exact-{self._salt}-{self.epoch}", dev, "fp32")
+        spatial = (1, self.res, self.res)
+        self._pkey, self._spatial = pkey, spatial
+        _profile.reset()
+        _profile.enable()
+        warm = 0
+        try:
+            while warm < self._MAX_WARMUP_COOKS and not _profile.settled(
+                    pkey, spatial, need=tex_checkpoint.MIN_SAMPLES):
+                with _profile.measure(pkey, spatial, device=dev, stages=True):
+                    tex_engine.cook_stage_list(self._stage_list, device=dev, precision="fp32")
+                warm += 1
+        finally:
+            _profile.disable()
+        self.cooks_to_settle = warm
+        costs, is_settled = _profile.stage_snapshot(pkey, spatial, need=tex_checkpoint.MIN_SAMPLES)
+        self._costs, self._settled = costs, is_settled
+
+        # Cook the CLEAN prefix once (also outside the counted region — the host's own upstream
+        # canvases already stand at tick time; a tick pays for the DIRTY suffix alone, exactly
+        # as `WholeFrameChainScenario`'s comp-backed canvases do).
+        clean = self._src
+        for i in range(n - self._DIRTY):
+            res = tex_engine.cook(self._codes[i], {"IN": clean, **self._defaults[i]},
+                                  device_mode=dev, precision="fp32", compile_mode="none",
+                                  time_context=None)
+            clean = res.outputs["OUT"]
+        self._clean_src = clean
+        return None
+
+    def prime(self, comp):
+        pass                                   # `build` primes; there is no separate warm-up
+
+    def _mint_all_node_keys(self, tc: dict) -> None:
+        """Q5 step 3: once per node in the WHOLE graph, all-keyword, chained through the prior
+        stage's own key exactly as an upstream-aware host would (CACHE-1's own contract — a
+        result's identity must be blind to nothing above it)."""
+        prev_key = None
+        for i in range(self._n):
+            up = () if prev_key is None else (prev_key,)
+            prev_key = self._results.lineage_key(
+                program_fp=f"host_tick_exact:{self._names[i]}", device=self._dev,
+                precision="fp32", params={k: round(float(v), 4)
+                                          for k, v in self._defaults[i].items()},
+                upstream=up, frame=None, time_context=tc, quality=None, flags=(),
+                canvas={"shape": [1, self.res, self.res, 4]})
+
+    def _offer_checkpoint(self, tc: dict) -> list:
+        """Q5 step 4: one `plan_checkpoints` offer (explicit `threshold_ms`), then one
+        `boundary_lineage_key` PROBE per planned cut — a probe, never a serve; this scenario's
+        cook always takes the whole-frame route regardless of what the offer returns."""
+        px = self.res * self.res
+        cuts = self._checkpoint.plan_checkpoints(
+            self._stage_list, costs=self._costs, threshold_ms=self._THRESHOLD_MS,
+            px=px, settled=self._settled, device=self._dev)
+        for k in cuts:
+            self._engine.boundary_lineage_key(
+                self._stage_list, k, self._dev, "fp32",
+                upstream=self._UPSTREAM, time_context=tc)
+        return cuts
+
+    def tick(self, comp, i):
+        tc = {"frame": float(self._seq(i)), "fps": 24.0, "time": self._seq(i) / 24.0}
+        self._mint_all_node_keys(tc)
+        self._offer_checkpoint(tc)
+
+        # Q5 step 6, whole-frame route: one `tex_engine.cook` per dirty node, a CHAINED
+        # CancelToken (never a bool), `time_context` ALWAYS, `binding_meta` on the FIRST dirty
+        # node's image input only ("some inputs", never all — and stable every tick, since an
+        # unstable presence would make this row unpinnable), each cook bracketed by PROF-1's
+        # `profile.measure` (a no-op body with PROF-1 disarmed, which is this pass's default —
+        # see `test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick`).
+        demo = self.demo
+        cancel = demo._Chain(demo._Cancel(), demo._Cancel())
+        first = self._n - self._DIRTY
+        src = self._clean_src
+        for j in range(first, self._n):
+            bindings = {"IN": src, **self._defaults[j]}
+            meta = ({"IN": self._BufferMeta("linear", "opaque")} if j == first else None)
+            key = self._profile.make_key(f"host_tick_exact:{self._names[j]}", self._dev, "fp32")
+            with self._profile.measure(key, self._spatial, device=self._dev, stages=False):
+                res = self._engine.cook(self._codes[j], bindings, device_mode=self._dev,
+                                        precision="fp32", compile_mode="none", cancel=cancel,
+                                        time_context=tc, binding_meta=meta)
+            src = res.outputs["OUT"]
+
+
+class HostTickExactD1Scenario(HostTickExactScenario):
+    name = "host_tick_exact_d1"
+    _DIRTY = 1
+
+
+class HostTickExactD3Scenario(HostTickExactScenario):
+    name = "host_tick_exact_d3"
+    _DIRTY = 3
+
+
+class PlaybackFramesScenario(Scenario):
+    """COMPILE-M1's PLAYBACK shape: the SAME graph every tick — same source, same programs,
+    same params — with ONLY `time_context` moving, one frame at a time. Isolates what a moving
+    playhead alone costs, with no edit and no window to confound it (contrast `_ALL_DIRTY`,
+    which pays the same ten-cook shape for a PARAM edit — the two rows are expected to read
+    identically on every seam that does not care whether `time_context` or a param moved,
+    which is itself the point of driving both).
+
+    N=10 stages, all ten cooked every frame (a played frame is not a partial edit — nothing
+    upstream is "clean" the way a scrub's untouched prefix is), `compile_mode="none"` (TEX's
+    own default, matching every other scenario in this file), whole-frame (`roi=None`), no
+    results cache (there is nothing to memoize across DISTINCT frame numbers)."""
+    name = "playback_frames"
+    needs_comp = False
+
+    def build(self):
+        from TEX_Wrangle import tex_engine
+        self._engine = tex_engine
+        dev = "cuda" if (self.device == "cuda" and torch.cuda.is_available()) else "cpu"
+        self._dev = dev
+        torch.manual_seed(29)
+        stages_src = self.demo._COMP_STAGES
+        self._n = len(stages_src)
+        self._codes = [c for _nm, c, _d in stages_src]
+        self._defaults = [dict(d) for _nm, _c, d in stages_src]
+        self._src = torch.rand(1, self.res, self.res, 3, device=dev)
+        return None
+
+    def prime(self, comp):
+        pass
+
+    def tick(self, comp, i):
+        frame_no = self._seq(i)                 # never repeats — the "no frame is revisited"
+        tc = {"frame": float(frame_no), "fps": 24.0, "time": frame_no / 24.0}
+        src = self._src
+        for j in range(self._n):
+            bindings = {"IN": src, **self._defaults[j]}
+            res = self._engine.cook(self._codes[j], bindings, device_mode=self._dev,
+                                    precision="fp32", compile_mode="none", cancel=None,
+                                    time_context=tc)
+            src = res.outputs["OUT"]
+
+
 SCENARIOS = (PrewarmScenario, SourceEditScenario, TerminalKnobScenario,
              MidGraphKnobScenario, PanScenario, AllDirtyScenario, LintScenario,
              NodeScrubScenario, CheckpointServeScenario, InterpChainScrubScenario,
-             WholeFrameChainD1Scenario, WholeFrameChainD3Scenario)
+             WholeFrameChainD1Scenario, WholeFrameChainD3Scenario,
+             HostTickExactD1Scenario, HostTickExactD3Scenario, PlaybackFramesScenario)
 SCENARIO_NAMES = tuple(s.name for s in SCENARIOS)
 
 
