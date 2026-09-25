@@ -48,7 +48,8 @@ from . import masked_flow as _masked_flow_mod
 from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
                      _HOST_SCALAR_ATTR, _dtype_rounded, _tag_host_scalar,
                      set_cook_grid as _stdlib_set_cook_grid,
-                     restore_cook_ctx as _stdlib_restore_cook_ctx)  # P0-D: cook grid
+                     restore_cook_ctx as _stdlib_restore_cook_ctx,  # P0-D: cook grid
+                     poll_cook_cancel as _stdlib_poll_cancel)  # CANCEL-44: Gap 2 in-body poll
 
 
 class _Unsupported(Exception):
@@ -146,7 +147,8 @@ def _live_type_map(program: Program, type_map: dict[int, TEXType]) -> dict[int, 
 
 def try_compile(program: Program, type_map: dict[int, TEXType],
                 fingerprint: str | None = None, *,
-                _masked_flow: bool | None = None) -> Any | None:
+                _masked_flow: bool | None = None,
+                emit_cancel_polls: bool = False) -> Any | None:
     """Try to compile a TEX program AST to a Python function.
 
     Returns a callable with signature:
@@ -182,6 +184,20 @@ def try_compile(program: Program, type_map: dict[int, TEXType],
     which is False for every program that can exist while `tex_api.LANGUAGE_VERSION` is
     below `0.25`. Passing True compiles under the `0.25` rules regardless, so the two
     tiers can be compared before the version moves (that is L7's).
+
+    *emit_cancel_polls* (CANCEL-44, Gap 2, default False) emits a call to the `_CK` global
+    (`poll_cook_cancel`, seeded into every build's namespace) BETWEEN each top-level
+    statement's emitted code — the same grain as the interpreter's own per-top-level-
+    statement `_cancel_check` — so cancel-aware generated code can abort between stencil
+    passes/stages instead of only at the ONE poll `_codegen_only_execute` makes at entry.
+    False (every caller before this ask) adds not one byte to the emitted source: the flag
+    only gates whether `emit_program`'s statement loop appends a poll LINE, never whether
+    `_CK` is seeded (seeding costs one namespace dict-store per BUILD, paid once per
+    fingerprint, and is dead weight a program that never polls simply never reads — the
+    same trade `_MF` already makes). Callers that want this MUST NOT reuse the plain
+    (non-cancel) fingerprint cache: the emitted bytes differ, so `compiled.py` keeps this
+    variant in its own process-local memo rather than PC-3's disk-persisted one (see
+    `compiled._get_or_make_cancel_codegen_fn`).
     """
     try:
         if _reads_time_builtin(program):
@@ -189,6 +205,7 @@ def try_compile(program: Program, type_map: dict[int, TEXType],
         # CG-1: the emitter consults only the entries of nodes it is emitting — see
         # `_live_type_map` for why the map it was handed cannot be read directly.
         gen = _CodeGen(_live_type_map(program, type_map))
+        gen._cancel_polls_on = emit_cancel_polls
         # LANG-L5: the language-`0.25` gate, asked exactly the way the interpreter asks it
         # (`masked_flow.enabled_for`), so the two tiers cannot disagree about WHETHER a
         # program masks before they get to disagree about HOW. The fast-out is the same
@@ -354,7 +371,7 @@ def _stage_wire_scalars(bindings: dict, device: Any, dtype, cg_fn: Any, program:
 
 def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
                device: Any, spatial_shape: tuple | None, dtype=None,
-               program: Any = None) -> None:
+               program: Any = None, cancel: Any = None) -> None:
     """Invoke a codegen-generated function with the constant argument tail.
 
     Single owner of the positional calling convention — it must match the
@@ -386,11 +403,19 @@ def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
     the AST once, to know which binding names are `@`-bound, so it can mint a raw Python
     wire scalar into the tagged device tensor the interpreter already hands the same
     program. `None` (a caller that predates this ask) skips the staging exactly as before —
-    additive, no existing call site's behaviour moves."""
+    additive, no existing call site's behaviour moves.
+
+    `cancel` (optional, CANCEL-44) rides the same cook-grid seam: publishing it here lets
+    a naturally multi-pass stdlib builtin poll BETWEEN its own passes (Gap 1) even under
+    the codegen tier, and lets a cancel-aware `cg_fn` (compiled with
+    `emit_cancel_polls=True`, Gap 2) poll between its own emitted top-level statements via
+    the `_CK` global `build()` seeds into every generated module. `None` (every caller
+    before this ask) costs one extra tuple slot on `set_cook_grid`'s save/restore and is
+    never read — the default path's behaviour and speed do not move."""
     _stage_vec_params(bindings, device, dtype)
     if program is not None:
         _stage_wire_scalars(bindings, device, dtype, cg_fn, program)
-    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device)
+    _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device, cancel=cancel)
     try:
         cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
               torch, _broadcast_pair, _ensure_spatial, torch.where,
@@ -764,6 +789,11 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         self._mf_on: bool = False
         self._mf_depth: int = 0
         self._mf_decl_depth: dict[str, int] = {}
+        # CANCEL-44 (Gap 2): set True only by a caller that asked `try_compile(...,
+        # emit_cancel_polls=True)`. False for every existing caller, which is what keeps
+        # their emitted source byte-identical — `emit_program`'s statement loop is the
+        # only reader.
+        self._cancel_polls_on: bool = False
 
     def _tmp(self) -> str:
         """Generate a unique temporary variable name."""
@@ -1003,9 +1033,16 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             # Emit deferred stencils BEFORE the skip check: the combo index is
             # always in inline_skip.
             if i in pending_stencils:
+                # CANCEL-44 (Gap 2): poll BEFORE this stencil pass, only for the
+                # cancel-aware variant (`_cancel_polls_on`) — the default build never
+                # emits this line, so its source is untouched.
+                if self._cancel_polls_on:
+                    self._emit("_CK()")
                 self._emit_conv2d_stencil(pending_stencils[i])
             if i in inline_skip:
                 continue
+            if self._cancel_polls_on:
+                self._emit("_CK()")
             self._emit_stmt(stmt)
 
         # No need to write locals back to _env: the caller only reads
@@ -1055,7 +1092,12 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # `_tex_fn` signature, which is a line of emitted source in EVERY program — the one
         # thing the invariant-7 digest acceptance forbids. Seeding it unconditionally costs
         # one dict store per build and is never looked up by a program that does not mask.
-        namespace: dict[str, Any] = {"_MF": _masked_flow_mod}
+        # CANCEL-44: `_CK` (poll_cook_cancel) is seeded the same way `_MF` is — a GLOBAL
+        # of the generated module, never a parameter (the `_tex_fn` signature is pinned by
+        # the invariant-7 digest). Seeding costs one dict-store per BUILD and is dead
+        # weight for every program `_cancel_polls_on` did not tell `emit_program` to poll
+        # in — no byte of THEIR emitted source changed.
+        namespace: dict[str, Any] = {"_MF": _masked_flow_mod, "_CK": _stdlib_poll_cancel}
         code_obj = compile(func_src, filename, "exec")
         _register_codegen_linecache(filename, func_src)
         exec(code_obj, namespace)

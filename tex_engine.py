@@ -600,7 +600,10 @@ def _run_default(ctx: ExecContext):
                     latent_channel_count=ctx.latent_channel_count,
                     output_names=ctx.output_names,
                     used_builtins=ctx.used_builtins, fingerprint=ctx.fp,
-                    time_context=ctx.time_context)
+                    time_context=ctx.time_context,
+                    cancel=ctx.cancel)  # CANCEL-44 (Gap 2): this route had no yield point
+        except CookCancelled:
+            raise                       # SCHED-3: a cancel aborts — never fall back to interp
         except Exception as _stencil_exc:
             logger.warning("[TEX] stencil codegen route failed (%s); using "
                            "interpreter.", _stencil_exc)

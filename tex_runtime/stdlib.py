@@ -63,6 +63,7 @@ from .stdlib_core import (  # noqa: F401
     _provider_read,
     set_cook_grid,
     restore_cook_ctx,
+    poll_cook_cancel,
     _uniform_grid,
     _uniform_dtype,
     _get_grid_buf,

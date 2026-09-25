@@ -33,6 +33,7 @@ from .interpreter import (Interpreter, _collect_identifiers, _consensus_extent,
                           _SCALAR_BUILTIN_DEFAULTS, _record_ingest_event)
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
                       _iter_child_nodes, is_vec_param_list)
+from .host import _cancel_check, CookCancelled  # SCHED-3 seam (no cycle: host imports torch only)
 from .stdlib import TEXStdlib, _tag_host_scalar
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 
@@ -210,6 +211,45 @@ _ROUTE_MEMO_MAX = 256
 
 # One-time log messages (avoid spamming the console)
 _warnings_shown: set[str] = set()
+
+# CANCEL-44 (Gap 2): the cancel-aware codegen variant's OWN memo — fingerprint ->
+# materialized fn (or _CANCEL_CG_UNSUPPORTED). Deliberately separate from PC-3's
+# disk-persisted, fingerprint-keyed `TEXCache.get_codegen_fn`/`store_codegen_fn`: that
+# store's on-disk filename (`codegen_persist._cg_filename`) is derived from the
+# fingerprint ALONE, so a cancel-aware build sharing it would either collide with the
+# plain build's persisted bytes under the same key or need a second axis threaded
+# through every PC-3 key/filename and a codegen-epoch bump to invalidate what is already
+# on disk — a change this ask does not make. Kept in-memory only and capped like the
+# other route memos; a process restart re-emits it once, the same cost as any other cold
+# codegen compile. Never read by `_try_compile`/`execute_compiled`'s `torch_compile`/
+# `auto` tiers — only `_codegen_only_execute` asks for this variant, and only when its
+# caller passed a real `cancel`.
+_cancel_codegen_memo: "_OrderedDict[str, Any]" = _OrderedDict()
+_CANCEL_CG_UNSUPPORTED = object()
+
+
+def _get_or_make_cancel_codegen_fn(program: Any, type_map: dict | None,
+                                   fingerprint: str | None):
+    """Cancel-aware twin of `_get_or_make_codegen_fn` (Gap 2): the same program compiled
+    with a poll emitted between each top-level statement (`emit_cancel_polls=True`), so a
+    cook that supplied a real token can abort between stencil passes/stages instead of
+    only at the one poll `_codegen_only_execute` makes at entry. `None` when codegen
+    cannot express the program at all (the caller falls back to the plain cg_fn, which
+    still gets the entry poll — never to the interpreter on THIS account alone)."""
+    key = fingerprint if fingerprint is not None else id(program)
+    cg_fn = _cancel_codegen_memo.get(key)
+    if cg_fn is None:
+        try:
+            cg_fn = _try_codegen(program, type_map, fingerprint, emit_cancel_polls=True)
+        except Exception:
+            cg_fn = None
+        _cancel_codegen_memo[key] = (cg_fn if cg_fn is not None
+                                     else _CANCEL_CG_UNSUPPORTED)
+        while len(_cancel_codegen_memo) > _ROUTE_MEMO_MAX:
+            _cancel_codegen_memo.popitem(last=False)
+    else:
+        _cancel_codegen_memo.move_to_end(key)
+    return None if cg_fn is _CANCEL_CG_UNSUPPORTED else cg_fn
 
 
 def _precompile_ctx():
@@ -1400,6 +1440,7 @@ def _codegen_only_execute(
     time_context: dict | None,
     roi: tuple[int, int, int, int, int, int] | None = None,
     place_params: bool = False,
+    cancel: Any = None,
 ) -> torch.Tensor | dict:
     """Execute via codegen flat function WITHOUT torch.compile.
 
@@ -1419,8 +1460,27 @@ def _codegen_only_execute(
     `$param` bindings on the device, and a generated function that needed it place them up
     front afterwards (`_codegen_with_params_on_device`). The opt-in routes pass it; the
     default route does not. The interpreter fallback always receives the caller's own bindings.
-    """
-    cg_fn = _get_or_make_codegen_fn(program, type_map, fingerprint)
+
+    `cancel` (CANCEL-44, Gap 2, default None — every caller before this ask) is the host's
+    `CancelToken`, best-effort like every other SCHED-3 yield point. `None` costs one
+    `is not None` test at entry and is otherwise inert: the plain (non-cancel) codegen fn
+    and its PC-3 disk-persisted cache are exactly what ran before this ask. A real token
+    gets TWO things this tier had neither of: a poll at entry (`_cancel_check`, mirroring
+    the interpreter's own per-statement discipline at the one yield point this tier had
+    none of), and — when codegen can compile the cancel-aware variant
+    (`_get_or_make_cancel_codegen_fn`) — a poll between each of the program's own top-level
+    statements, so a cook with more than one stencil pass/stage can abort between them
+    rather than only before the first."""
+    # CANCEL-44 (Gap 2): poll at entry. Best-effort, same contract as every other
+    # SCHED-3 yield point — a misbehaving token's non-CookCancelled exception is left to
+    # propagate rather than swallowed.
+    _cancel_check(cancel)
+
+    cg_fn = None
+    if cancel is not None:
+        cg_fn = _get_or_make_cancel_codegen_fn(program, type_map, fingerprint)
+    if cg_fn is None:
+        cg_fn = _get_or_make_codegen_fn(program, type_map, fingerprint)
 
     if cg_fn is None:
         # ENG-7: "unsupported" is a lie for a time-reading program — the emitter handles
@@ -1458,7 +1518,10 @@ def _codegen_only_execute(
     try:
         with torch.inference_mode():
             _invoke_cg(cg_fn, env, contiguous_bindings, stdlib_fns, dev, sp,
-                       Interpreter._PRECISION_DTYPES.get(precision), program=program)
+                       Interpreter._PRECISION_DTYPES.get(precision), program=program,
+                       cancel=cancel)
+    except CookCancelled:
+        raise   # CANCEL-44/SCHED-3: a cancel aborts — never mistaken for a codegen defect
     except Exception as e:
         served = (_codegen_with_params_on_device(cg_fn, program, bindings, dev,
                                                  latent_channel_count, used_builtins,

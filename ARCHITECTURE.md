@@ -270,7 +270,7 @@ the raw fp16 win (~1.35–1.45×) is available, without the safety net, via expe
 (`img_*`, `arr_*`) accumulate in fp32 (an fp16 sum overflows to inf at ≥1024²); an
 out-of-fp16-range literal / a large-value `vec()` also stays fp32 (interp==codegen).
 
-## The 41-cache architecture
+## The 42-cache architecture
 
 Non-redundant by design — each store keys on a different thing (source-hash vs
 `id()`-type_map vs device/precision tuple vs AST-fingerprint vs resolution-bucket)
@@ -338,6 +338,7 @@ Bounds below are entry counts, and every store is process-lifetime unless stated
 | `compiled._verify_state` | committed cache key | the post-commit verification window (v0.20 G); px-scoped, reset by a size change; 256 |
 | `compiled._route_memo` | fingerprint | the route facts from the two full AST walks (`has_spatial` is deliberately NOT here: it depends on binding values); 256 |
 | `compiled._stencil_route_memo` | fingerprint | the UC-2 stencil-route verdict |
+| `compiled._cancel_codegen_memo` | fingerprint | CANCEL-44's cancel-aware codegen variant (a poll emitted between top-level statements) or `_CANCEL_CG_UNSUPPORTED`; deliberately separate from PC-3's disk-persisted, fingerprint-only `tex_cache` codegen store, whose on-disk filename has no room for a second axis; 256 |
 | `compiled._deferred_ev` | slot | the LAT-3 pending CUDA event pair for the deferred timing readback; cleared with the compiled cache |
 | `compiled._ENV_TENSOR_CACHE` | constant-env tensor identity | the per-cook constant tensors, registered in `graphed._build_keepalive` so MEM-1 holds; 256 |
 | `graphed._graph_cache` | fingerprint-signature | `GraphedProgram`; LRU, bytes-aware, pin-and-skip on eviction |

@@ -32,7 +32,7 @@ from ..tex_compiler.ast_nodes import (
     iter_child_nodes,
 )
 from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
-from .host import _cancel_check, _report_progress   # SCHED-3 seam (no cycle: host imports torch only)
+from .host import _cancel_check, _report_progress, CookCancelled   # SCHED-3 seam (no cycle: host imports torch only)
 from . import profile as _prof                      # PROF-1 seam (pure stdlib; disarmed by default)
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
                      _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar,
@@ -472,8 +472,12 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         # image argument to size from the way `fetch`/`sample` do. Two attribute writes per
         # cook on a thread-local, restored in the `finally` because a tiled cook calls
         # `execute` once per strip and each strip's grid is its own.
+        # CANCEL-44: publish the cook's cancel token alongside its grid, so a naturally
+        # multi-pass builtin (separable blur, a mip chain) can poll BETWEEN its own
+        # internal passes via `poll_cook_cancel` — the per-top-level-statement poll below
+        # only ever runs BEFORE such a builtin starts, never during it (Gap 1).
         _grid_token = _stdlib_mod.set_cook_grid(self.spatial_shape, self._dtype,
-                                                device=self.device)
+                                                device=self.device, cancel=cancel)
         # LANG-L4: bind the language-0.25 statement handlers for THIS cook, and only when
         # the engine's own gate says so. The DEFAULT path pays one attribute read and one
         # `is None` test: a program with no `//!tex` pragma has `Program.language is None`,
@@ -1135,6 +1139,12 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                 e.loc = node.loc
                 if not e._source:
                     e._source = self._source
+            raise
+        except CookCancelled:
+            # CANCEL-44 (Gap 1): a multi-pass builtin (`_gauss_blur_bchw`, `_build_mip_pyramid`)
+            # polls `poll_cook_cancel` BETWEEN its own passes, so a cancel can now come from
+            # INSIDE `fn(...)` — never mistaken for a function error, exactly like the
+            # `InterpreterError` branch above and every other SCHED-3 yield point.
             raise
         except Exception as e:
             raise InterpreterError(

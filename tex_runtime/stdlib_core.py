@@ -298,9 +298,9 @@ def _provider_read(source, t, mode: str, a, b):
 _cook_ctx = _threading.local()
 
 
-def set_cook_grid(grid, dtype=None, device=None):
-    """Publish the cook's `(B,H,W)` grid, working dtype and device. Returns an opaque
-    token.
+def set_cook_grid(grid, dtype=None, device=None, cancel=None):
+    """Publish the cook's `(B,H,W)` grid, working dtype, device and cancel token. Returns
+    an opaque token.
 
     Pass the token to `restore_cook_ctx` when the cook ends. Two functions rather than one
     that also accepts its own return value: cooks nest (a codegen invocation inside an
@@ -311,18 +311,46 @@ def set_cook_grid(grid, dtype=None, device=None):
 
     `device` rides the SAME seam (both `Interpreter.execute` and codegen's `_invoke_cg`
     already call this at the one place each tier publishes its cook state) rather than
-    opening a second thread-local."""
+    opening a second thread-local. `cancel` (CANCEL-44) rides it for the same reason: it is
+    the host's `CancelToken` for THIS cook (or `None`), and publishing it here — rather than
+    opening a THIRD thread-local — is what lets `poll_cook_cancel` reach it from code with no
+    `cancel` parameter of its own: a naturally multi-pass builtin (separable blur, a mip
+    chain) or cancel-aware generated code. Never consulted, and costs one extra tuple slot
+    plus one attribute store, when a caller does not pass one."""
     token = (getattr(_cook_ctx, "grid", None), getattr(_cook_ctx, "dtype", None),
-             getattr(_cook_ctx, "device", None))
+             getattr(_cook_ctx, "device", None), getattr(_cook_ctx, "cancel", None))
     _cook_ctx.grid = grid
     _cook_ctx.dtype = dtype
     _cook_ctx.device = device
+    _cook_ctx.cancel = cancel
     return token
 
 
 def restore_cook_ctx(token) -> None:
     """Undo one `set_cook_grid`."""
-    _cook_ctx.grid, _cook_ctx.dtype, _cook_ctx.device = token
+    _cook_ctx.grid, _cook_ctx.dtype, _cook_ctx.device, _cook_ctx.cancel = token
+
+
+def poll_cook_cancel() -> None:
+    """CANCEL-44 (Gap 1 / Gap 2): best-effort poll of the ACTIVE cook's cancel token,
+    published alongside the cook grid by `set_cook_grid` — the one seam every tier already
+    uses to publish its cook state. Lets code with no `cancel` parameter of its own poll
+    between its own internal passes without threading a new parameter through every call
+    signature:
+
+      - a naturally multi-pass stdlib builtin (`_gauss_blur_bchw`'s two separable conv2d
+        passes, `_build_mip_pyramid`'s per-level loop) — Gap 1;
+      - cancel-aware generated code, emitted between top-level statements ONLY when the
+        codegen tier compiled a cancel-aware variant (`codegen.try_compile(...,
+        emit_cancel_polls=True)`) — Gap 2.
+
+    A single attribute read when no cook published a token (the default path — `None` is
+    the field's own default, same as `grid`/`dtype`/`device`). Raises `CookCancelled`
+    exactly like `host._cancel_check`, which this mirrors for a caller with no explicit
+    token to check against."""
+    tok = getattr(_cook_ctx, "cancel", None)
+    if tok is not None:
+        tok.check()
 
 
 def _uniform_grid():
@@ -575,6 +603,11 @@ def _gauss_blur_bchw(
     stride_h = 2 if downsample_2x else 1
     padded = torch.nn.functional.pad(img, (radius, radius, 0, 0), mode='replicate')
     result = torch.nn.functional.conv2d(padded, kh, stride=(1, stride_w), groups=C)
+    # CANCEL-44 (Gap 1): between the two separable passes — the horizontal pass is the
+    # half of a large blur (2048^2 measured at p95 130.5ms) a cancel fired mid-builtin
+    # could not reach before. Off the default path (no cook has published a token) this
+    # is one attribute read.
+    poll_cook_cancel()
     padded = torch.nn.functional.pad(result, (0, 0, radius, radius), mode='replicate')
     result = torch.nn.functional.conv2d(padded, kv, stride=(stride_h, 1), groups=C)
     return result
@@ -615,6 +648,8 @@ def _build_mip_pyramid(
     current = level0
     max_levels = min(_MIP_MAX_LEVELS, int(math.log2(max(min(H, W), 1))))
     for _ in range(max_levels):
+        # CANCEL-44 (Gap 1): between mip levels — the other naturally multi-pass shape.
+        poll_cook_cancel()
         _, _, ch, cw = current.shape
         if ch <= 1 or cw <= 1:
             break
