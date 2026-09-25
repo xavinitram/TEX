@@ -914,6 +914,111 @@ def test_v031_noise_promotion_failure_recorded(r: SubTestResult):
              "serving the key, and reads unavailable/measured in capabilities()")
 
 
+_KERNEL_BLOCK_CHILD = _CHILD_HEAD + r'''
+import warnings
+dev = "cpu"
+key, cache = device_key(dev), noise._simplex_cache
+noise._inductor_available["cpu"] = True
+
+# TRK-182: the warm-up dummy (64x64, the shape try_upgrade's compile_fn always warms with)
+# succeeds, matching a real Inductor build whose FIRST specialization compiles fine — the
+# block hits a LATER, differently-shaped kernel, exactly what production measured (a fresh
+# .pyd for the cook's own resolution, not the warm-up probe).
+def _factory(device):
+    def _kernel(x, y):
+        if tuple(x.shape[-2:]) == (64, 64):
+            return x + y
+        raise ImportError("DLL load failed while importing kernel: An Application "
+                           "Control policy has blocked this file.")
+    dummy = torch.rand(1, 64, 64, device=device)
+    _kernel(dummy, dummy)
+    return _kernel
+noise._compile_simplex = _factory
+
+torch.manual_seed(5)
+img = torch.rand(1, 24, 32, 4, device=dev)
+prog = ''' + repr(_SIMPLEX_PROG) + r'''
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    digests = []
+    tiers = []
+    for _ in range(5):                       # > _COMPILE_AFTER_CALLS: crosses the promotion
+        out = tex_engine.cook(prog, {"A": img}, device_mode=dev, precision="fp32").outputs["OUT"]
+        digests.append(digest(out))
+        tiers.append(_tier_of(cache, key))
+
+kernel_warnings = [str(w.message) for w in caught
+                   if "compiled noise kernel failed to load" in str(w.message)]
+
+print(json.dumps({
+    "digests": digests,
+    "tiers": tiers,
+    "inductor_cpu_available": noise._inductor_available.get("cpu"),
+    "inductor_cuda_available": noise._inductor_available.get("cuda"),
+    "kernel_warnings": kernel_warnings,
+}))
+'''
+
+
+def test_trk182_blocked_kernel_load_falls_back_to_eager(r: SubTestResult):
+    """TRK-182 — a Windows Application/Smart App Control policy (or any other cause) that
+    blocks a freshly-compiled noise kernel's `.pyd` from loading must never fail the cook.
+
+    Reproduces the real defect exactly: the warm-up call `try_upgrade` makes (a 64x64 dummy)
+    succeeds, so the promotion installs cleanly — the block hits the FIRST call at the
+    COOK's own shape, outside `try_upgrade`'s own try/except, which is where the tree
+    actually crashed (`InterpreterError: ... ImportError: DLL load failed while importing
+    kernel: An Application Control policy has blocked this file`).
+
+    Asserts: every one of 5 cooks in a fresh process returns the SAME pixels (the eager and
+    jit.trace tiers are bit-exact on CPU per `cold_frame_parity`, so a cook served by either
+    is indistinguishable here) — i.e. the blocked promotion is invisible to output; the key
+    ends up on the "eager" tier, not stuck retrying a broken "promoted" one; Inductor is
+    marked unavailable for BOTH device types afterward (the process-wide disable, so no
+    other tiered builtin pays for the same doomed compile); and the kernel-block warning
+    fired exactly ONCE despite 5 cooks."""
+    print("\n--- TRK-182: a blocked compiled-kernel load falls back to eager, never fails "
+          "the cook ---")
+    with cold_engine_state() as cold:
+        out, err = _run_child(_KERNEL_BLOCK_CHILD, [cold.dir])
+    if err:
+        r.fail("TRK-182 kernel block", err)
+        return
+    try:
+        result = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError) as e:
+        r.fail("TRK-182 kernel block", f"child printed no parseable JSON: {e}\n{out}")
+        return
+
+    fails = []
+    digests = result["digests"]
+    if len(digests) != 5:
+        fails.append(f"expected 5 cooks, got {len(digests)}")
+    elif len(set(digests)) != 1:
+        fails.append(f"pixels changed across the blocked promotion (not eager-parity): "
+                     f"{result['tiers']} -> {digests}")
+    if result["tiers"] and result["tiers"][-1] != "eager":
+        fails.append(f"the key did not settle on the eager tier after the block: "
+                     f"{result['tiers']}")
+    if result["inductor_cpu_available"] is not False:
+        fails.append(f"Inductor was not disabled process-wide on CPU after the block: "
+                     f"{result['inductor_cpu_available']!r}")
+    if result["inductor_cuda_available"] is not False:
+        fails.append(f"Inductor was not disabled process-wide on CUDA after the block: "
+                     f"{result['inductor_cuda_available']!r}")
+    if len(result["kernel_warnings"]) != 1:
+        fails.append(f"expected exactly one kernel-block warning across 5 cooks, got "
+                     f"{len(result['kernel_warnings'])}: {result['kernel_warnings']}")
+
+    if fails:
+        r.fail("TRK-182 kernel block", "; ".join(fails))
+    else:
+        r.ok("a blocked compiled-kernel load falls back to the eager tier with no pixel "
+             "change, demotes the key, disables Inductor process-wide, and warns exactly "
+             "once")
+
+
 # ── The per-cook tier record (`want_noise_tiers`) ───────────────────────────────────────────────
 #
 # A host compositing a region recook over a cached frame patches only when the two cooks' records

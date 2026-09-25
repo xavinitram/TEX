@@ -473,6 +473,16 @@ class _TieredCache:
                 _tt.record_noise_compile_failure(self.name, dt, e, key=key)
             except Exception:
                 pass
+            # TRK-182: an ImportError/OSError here is a native-kernel LOAD failure (e.g.
+            # Windows Application/Smart App Control blocking a freshly-compiled .pyd), not
+            # the toolchain-unavailable case (CppCompileError, missing MSVC/Triton) this
+            # except clause was written for. The warm-up call above already contained it —
+            # `self.cache[key]` is untouched, so this key keeps its jit.trace tier — but the
+            # box will block the NEXT freshly-compiled kernel too, so disable Inductor
+            # process-wide (every OTHER tiered cache would otherwise pay the same blocked
+            # compile) and tell the host once, rather than retrying silently forever.
+            if isinstance(e, (ImportError, OSError)):
+                _disable_inductor_after_kernel_block(e)
         self._call_count.pop(key, None)
 
     def store(self, key, trace_fn):
@@ -559,11 +569,23 @@ class _TieredCache:
             that ~2 s was always paid, just on call #2. Settling makes call #1 pay it
             instead (measured 1993.75 ms vs 1988.85 ms for the same three calls), so the
             delta is a single extra evaluation: ~0.65 ms at 640² CUDA, ~6 ms at 640² CPU.
+
+        TRK-182: a shape/stride/dtype signature this tier has never run before can make
+        torch compile and load a NEW native kernel on the very first call below — the trace
+        tier's own NNC fuser does this per the measurement above, and the promoted tier's
+        Inductor backend does it too whenever `dynamic=True` still needs a fresh
+        specialization. That load can fail with an ImportError/OSError that has nothing to
+        do with TEX (a Windows Application/Smart App Control policy blocking a freshly-
+        compiled `.pyd`, measured in production) — never inside `try_upgrade`'s own
+        try/except, which only guards the WARM-UP call. Every `fn(*args)` below is therefore
+        wrapped by `_run_or_fall_back`, which demotes `key` to eager (parity-guaranteed —
+        `tests/test_v031_noise_tiers.py`'s cold-frame parity and `noise_tiers_compatible`)
+        and returns the eager result instead of raising into the cook.
         """
         sig = (key,) + tuple((tuple(a.shape), a.stride(), a.dtype)
                              for a in args if isinstance(a, torch.Tensor))
         if sig in self._settled:
-            return fn(*args)
+            return self._run_or_fall_back(key, fn, eager_fn, args)
 
         # STRIDES are in the signature, not just shape+dtype, because torch's guards are.
         # Measured: after a contiguous 64x64 settled, a TRANSPOSED 64x64 view (same shape,
@@ -576,25 +598,31 @@ class _TieredCache:
         # RECORDED into the graph and re-executed on every replay, forever. This tests the
         # stream rather than graphed.is_capturing(), which is also set during the warm-up
         # that precedes capture — warm-up is exactly when we DO want to settle, so that by
-        # capture time the signature is already known and this guard never fires.
+        # capture time the signature is already known and this guard never fires. Not
+        # wrapped by `_run_or_fall_back`: warm-up (where a fresh kernel would compile) has
+        # already run by capture time, and swapping in an eager call mid-capture would
+        # record an eager op into the graph rather than fall back to anything.
         if args and isinstance(args[0], torch.Tensor) and args[0].is_cuda \
                 and torch.cuda.is_current_stream_capturing():
             return fn(*args)
 
-        # Burn the profiling passes explicitly rather than inferring them from the first
-        # two results agreeing. If a future torch profiles more than once, runs 1..N are
-        # ALL unoptimized and would agree with each other, so a bare last-two-agree rule
-        # would settle on the unfused value and silently reopen this hole.
-        for _ in range(_profiled_runs()):
-            fn(*args)
+        try:
+            # Burn the profiling passes explicitly rather than inferring them from the first
+            # two results agreeing. If a future torch profiles more than once, runs 1..N are
+            # ALL unoptimized and would agree with each other, so a bare last-two-agree rule
+            # would settle on the unfused value and silently reopen this hole.
+            for _ in range(_profiled_runs()):
+                fn(*args)
 
-        out = fn(*args)
-        for _ in range(_SETTLE_MAX_RUNS):
-            nxt = fn(*args)
-            if _bitwise_same(out, nxt):
-                self._settled.add(sig)
-                return nxt
-            out = nxt
+            out = fn(*args)
+            for _ in range(_SETTLE_MAX_RUNS):
+                nxt = fn(*args)
+                if _bitwise_same(out, nxt):
+                    self._settled.add(sig)
+                    return nxt
+                out = nxt
+        except (ImportError, OSError) as e:
+            return self._run_or_fall_back(key, fn, eager_fn, args, exc=e)
 
         # Never converged. Demote the key to eager for the rest of the process: store()
         # short-circuits on the False sentinel and get() maps it to None, so every later
@@ -610,6 +638,33 @@ class _TieredCache:
         unsettled, which is exactly the defect this class now exists to prevent.
         """
         self._settled = {s for s in self._settled if s[0] != key}
+
+    def _run_or_fall_back(self, key, fn, eager_fn, args, exc=None):
+        """TRK-182: call `fn` (the trace or promoted tier); on a native-kernel LOAD
+        failure, demote `key` to eager and answer from `eager_fn` instead of raising.
+
+        `exc` is None on the plain (no exception yet) call path — `sig in self._settled`
+        still has to run `fn` for the first time under THIS signature's actual shape, and a
+        kernel can be compiled here exactly as it can in the burn-in/settle loop below, so
+        this path gets the identical guard rather than a bare `fn(*args)`.
+
+        Demoting to eager (never back to jit.trace) matches the "never converged" ending
+        below: once a key's cached callable is known to raise on load, there is no cheap way
+        to tell whether ANOTHER new signature would too, and re-tracing to find out would
+        just risk hitting the same blocked compile again. Eager is always correct — it is
+        the fp32 interpreter control every tier is measured against (see the module
+        docstring's promotion envelope and `noise_tiers_compatible`) — so it is where every
+        signature of this key stays for the rest of the process.
+        """
+        if exc is None:
+            try:
+                return fn(*args)
+            except (ImportError, OSError) as e:
+                exc = e
+        self.cache[key] = False
+        self.forget_settled(key)
+        _disable_inductor_after_kernel_block(exc)
+        return eager_fn(*args)
 
 
 _simplex_cache = _TieredCache("simplex")
@@ -666,6 +721,42 @@ _fbm_cache = _TieredCache("fbm")
 
 
 _inductor_available: dict[str, bool] = {}  # device type -> backend availability
+
+# TRK-182: fires once per process, the first time a compiled/traced noise kernel fails to
+# LOAD (as opposed to failing to build — see `_disable_inductor_after_kernel_block` below).
+_kernel_block_warned = False
+
+
+def _disable_inductor_after_kernel_block(exc: BaseException) -> None:
+    """TRK-182: a compiled noise kernel raised ImportError/OSError while LOADING — measured
+    in production as Windows Application/Smart App Control blocking a freshly-compiled
+    `.pyd` ("DLL load failed... An Application Control policy has blocked this file"), not
+    a TEX defect and not the already-handled "no compiler available" case (that one raises
+    at BUILD time, inside `try_upgrade`'s own try, and never reaches this function).
+
+    Two things, both process-wide because the box that blocked one freshly-compiled kernel
+    will block the next: mark every device type as unable to use Inductor, so
+    `_can_inductor_compile` declines every future `try_upgrade` without paying for another
+    doomed compile-and-block; and warn the host exactly once (never per-call, never per-key
+    — a blocked policy fires identically every time and a warning per tiered noise builtin
+    would flood the log for one fact). The KEY that hit this is demoted to eager by the
+    caller (`_TieredCache._run_or_fall_back` / the `try_upgrade` except clause) — this
+    function only ever touches the process-wide Inductor gate and the one-shot warning.
+    """
+    global _kernel_block_warned
+    for _dev_type in ("cpu", "cuda"):
+        _inductor_available[_dev_type] = False
+    if not _kernel_block_warned:
+        _kernel_block_warned = True
+        import warnings
+        warnings.warn(
+            f"TEX: a compiled noise kernel failed to load ({type(exc).__name__}: {exc}); "
+            "falling back to TEX's eager noise tier for the rest of this process (pixel "
+            "output is unchanged — the eager tier is what every other tier is measured "
+            "against). This is commonly a Windows Application Control / Smart App Control "
+            "policy blocking a freshly-compiled native module.",
+            RuntimeWarning, stacklevel=3)
+
 
 def _can_inductor_compile(device=None) -> bool:
     """Check if TorchInductor can compile for *device* (default: CPU).
