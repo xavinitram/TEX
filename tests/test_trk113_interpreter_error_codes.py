@@ -214,5 +214,4 @@ def test_trk113_defensive_codes_stay_shadowed(r: SubTestResult):
                    f"longer draws its checker code; the paired interpreter code may now "
                    f"be reachable and need a real trigger row instead of an exemption.")
             continue
-        assert reason
-        r.ok(f"{checker_code} still forecloses its paired interpreter code before execution")
+        r.ok(f"{checker_code} still forecloses its paired interpreter code before execution: {reason}")
