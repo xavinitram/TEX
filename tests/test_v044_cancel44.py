@@ -1,8 +1,8 @@
 """
 v0.44 CANCEL-44 (Phase B) — bounded, prompt cancellation on paths that had none.
 
-MEASURE-44's findings (docs/worklog/MEASURE-44/findings.md §2) measured three gaps in the
-cook-cancellation contract SCHED-3 (v0.27) already built:
+A prior measurement pass (MEASURE-44) found three gaps in the cook-cancellation contract
+SCHED-3 (v0.27) already built:
 
   Gap 1 -- the interpreter polls once per TOP-LEVEL STATEMENT (`_cancel_check`), so a single
            heavy builtin (a separable blur, a mip chain) ran to completion before the next
