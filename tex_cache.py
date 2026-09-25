@@ -69,6 +69,11 @@ _AST_FILES = [_C_DIR / "ast_nodes.py", _C_DIR / "lexer.py", _C_DIR / "parser.py"
 # of the seven domain leaves — a change to any of them alters emitted code or interpreter
 # semantics exactly as a `stdlib.py` edit used to, so each leaf is watched here too.
 _CODEGEN_FILES = [_R_DIR / "interpreter.py", _R_DIR / "codegen.py", _R_DIR / "codegen_stdfns.py",
+                  # SPLIT-I: `interpreter.py`'s three mixins hold interpreter code the split
+                  # moved out of it, so an edit to any of them alters interpreter semantics
+                  # exactly as an `interpreter.py` edit does and must invalidate the same .cg.
+                  _R_DIR / "interpreter_spatial.py", _R_DIR / "interpreter_control_flow.py",
+                  _R_DIR / "interpreter_binding.py",
                   _R_DIR / "stdlib.py", _R_DIR / "stdlib_core.py", _R_DIR / "stdlib_math.py",
                   _R_DIR / "stdlib_color.py", _R_DIR / "stdlib_sample.py", _R_DIR / "stdlib_noise.py",
                   _R_DIR / "stdlib_sdf.py", _R_DIR / "stdlib_string.py", _R_DIR / "stdlib_array.py",
