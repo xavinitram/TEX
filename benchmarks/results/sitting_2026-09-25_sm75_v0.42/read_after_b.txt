@@ -1,0 +1,46 @@
+legs: ['v42_base_a2', 'v42_after_b', 'v42_base_a3']   (ratio = v42_base_a2/leg; >1 = leg faster)
+
+eight_config @512^2 — per-config geomean | v42_after_b | v42_base_a3   [row min..max for last leg]
+  cpu_off_cold   |  1.041 n=125 |  1.017 n=125   [0.63..1.47]
+  cpu_off_warm   |  0.972 n=125 |  1.004 n=125   [0.62..1.84]
+  cuda_off_cold  |  1.063 n=125 |  1.000 n=125   [0.90..1.03]
+  cuda_off_warm  |  1.000 n=125 |  0.991 n=125   [0.95..1.02]
+  cpu_on_cold    |  0.998 n=139 |  1.002 n=139   [0.84..1.21]
+  cpu_on_warm    |  0.990 n=139 |  1.005 n=139   [0.84..1.17]
+  cuda_on_cold   |  1.014 n=139 |  1.007 n=139   [0.77..1.22]
+  cuda_on_warm   |  1.010 n=139 |  1.008 n=139   [0.78..1.39]
+
+roi_scrub | v42_base_a2 | v42_after_b | v42_base_a3  ratios vs v42_base_a2
+  whole                        |     1.7710 |     1.7794 |     1.7668   0.995  1.002
+  roi_fixed                    |     0.6491 |     0.6521 |     0.6475   0.995  1.002
+  roi_panning                  |     0.6481 |     0.6501 |     0.6455   0.997  1.004
+  roi_pan_param                |     0.8632 |     0.7580 |     0.8647   1.139  0.998
+
+param_scrub | v42_base_a2 | v42_after_b | v42_base_a3  ratios vs v42_base_a2
+  cold_ms                      |    48.2197 |    48.5171 |    48.7223   0.994  0.990
+  scrub_median_ms              |     0.3703 |     0.3746 |     0.3709   0.989  0.998
+  static_median_ms             |     0.3689 |     0.3734 |     0.3702   0.988  0.996
+  recook_median_ms             |     1.5920 |     1.5547 |     1.5964   1.024  0.997
+  scrub_max_after_warmup_ms    |     0.7477 |     0.7265 |     0.8176   1.029  0.915
+
+region_recook | v42_base_a2 | v42_after_b | v42_base_a3  ratios vs v42_base_a2
+  cuda/n50/2048/whole_all      |   171.1660 |   171.2850 |   170.9840   0.999  1.001
+  cuda/n50/2048/region_mid     |    16.9800 |    16.9740 |    16.9840   1.000  1.000
+  cpu/n50/2048/whole_all       |   880.1270 |   887.2990 |   892.4700   0.992  0.986
+  cpu/n50/2048/region_mid      |   154.2750 |   153.7120 |   154.1040   1.004  1.001
+
+cookqueue | v42_base_a2 | v42_after_b | v42_base_a3  ratios vs v42_base_a2
+  solo_ms                      |     0.3670 |     0.3670 |     0.3660   1.000  1.003
+  queued_idle_ms               |     0.4340 |     0.4320 |     0.4800   1.005  0.904
+  preempt_to_first_stmt_ms     |     0.9010 |     0.9130 |     0.8990   0.987  1.002
+  queued_under_load_ms         |     1.1100 |     1.1240 |     1.0990   0.988  1.010
+
+counts_cuda - stable rows that differ from v42_base_a2
+  v42_after_b prewarm      TEXCache.fingerprint                 20 -> 10
+  v42_after_b prewarm      param_only_names                     20 -> 10
+  v42_after_b source_edit  _halo_tile_plan                      7 -> 3
+  v42_after_b pan          alloc.allocated                      22 -> 18
+  v42_after_b pan          cuda.kernels                         26 -> 22
+  v42_after_b all_dirty    _halo_tile_plan                      10 -> 3
+  v42_after_b node_scrub   _halo_tile_plan                      1 -> 0
+  moved api/cuda rows: 7; moved frame rows (not listed): 35
