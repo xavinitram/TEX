@@ -18,6 +18,7 @@ import glob
 import logging
 import math
 import os
+import shutil
 import subprocess
 import sys
 from collections import OrderedDict as _OrderedDict
@@ -509,6 +510,97 @@ def _select_backend(device_type: str) -> str | None:
         if _backend_status.get((backend, device_type)) is not False:
             return backend
     return None
+
+
+# ── CC-3: compile_capability() — toolchain probe, never by compiling ──────────
+#
+# `_backend_status` (above) answers "did backend B actually work THIS process" — it is
+# LEARNED, seeded only by a real compile attempt. `compile_capability()` answers the
+# question "auto"'s per-cook routing (`run_auto`, below) needs answered BEFORE it may even
+# try: is inductor's toolchain prerequisite present at all, for CUDA and for CPU
+# independently? It is static and cheap after its first call (see the two probes below),
+# computed ONCE per process and cached, so calling it every cook (as the toolchain-aware
+# "auto" path does) costs nothing after the first call.
+#
+# Deliberately NOT `tex_doctor._inductor_prereq`, which this mirrors: that function is
+# read-only by contract (never calls `_setup_msvc_env`, a <=30s subprocess) because a
+# doctor report must never have a side effect. `compile_capability()` is allowed the ONE
+# one-time cost `_setup_msvc_env` pays (idempotent, memoized by `_msvc_env_initialized`),
+# because its whole point is to convert "unknown" into a definite answer WITHOUT ever
+# entering `_try_compile` — the toolchain-aware "auto" gate (CC-4) has no other way to
+# tell "no compiler" from "haven't looked yet".
+_capability_cache: dict | None = None
+
+
+def _probe_cuda_inductor() -> tuple:
+    """(ok, reason). Static: torch.cuda availability + `find_spec("triton")` — the same
+    fact `_maybe_triton_hint` only ever surfaces AFTER a failed first call, read here
+    before any compile is attempted."""
+    import importlib.util
+    if not torch.cuda.is_available():
+        return False, "CUDA is not available (torch.cuda.is_available() is False)"
+    if importlib.util.find_spec("triton") is None:
+        return False, "Triton is not installed (torch.compile's inductor backend needs it on CUDA)"
+    return True, None
+
+
+def _probe_cpu_inductor() -> tuple:
+    """(ok, reason). Non-Windows: a C compiler on PATH — inductor's own prerequisite,
+    checked without invoking it. Windows: run the codebase's existing vcvarsall search
+    (`_setup_msvc_env`, idempotent) then check PATH for `cl.exe`. `_setup_msvc_env` is
+    what promotes INCLUDE/LIB/PATH into this process's own environment (or leaves them
+    exactly as a Developer Command Prompt already set them) — a PATH-only check after it
+    reads the definitive POST-search state via `shutil.which` alone, with no environment
+    read of this function's own (PUB-1: a new `os.environ` site in a shipped file moves a
+    pinned ratchet; `shutil.which`'s own internal PATH read is not one)."""
+    if sys.platform != "win32":
+        if shutil.which("cc") or shutil.which("gcc") or shutil.which("clang"):
+            return True, None
+        return False, "no C compiler (cc/gcc/clang) found on PATH"
+    _setup_msvc_env()
+    if shutil.which("cl") is not None:
+        return True, None
+    return False, ("no MSVC (cl.exe) found on PATH after the vcvarsall search (this "
+                   "process already ran it and found nothing)")
+
+
+def compile_capability() -> dict:
+    """Read-only, process-wide capability report for torch.compile's inductor backend —
+    the answer "auto" (`run_auto`, below) needs BEFORE deciding whether to even attempt a
+    background compile. Probed ONCE per process (cached; see
+    `_reset_capability_cache_for_test`) by `importlib.util.find_spec("triton")` (CUDA) and
+    the codebase's existing MSVC search (`_setup_msvc_env`, CPU on Windows) / a PATH check
+    (CPU elsewhere) — never by compiling, so calling this can never pay a failed-compile tax.
+
+    Returns::
+
+        {"cuda_inductor": bool, "cpu_inductor": bool,
+         "reason": {"<key>": str}}   # a "reason" entry exists only for a False key
+
+    A `True` reading means the PREREQUISITE holds, not that a compile will succeed or win a
+    trial — `_backend_status` (measured, this process) and autotier's own verdict (measured,
+    per program) can still say no afterward. This function only removes the one failure mode
+    that otherwise costs a real compile attempt to discover: no toolchain at all."""
+    global _capability_cache
+    if _capability_cache is None:
+        cuda_ok, cuda_why = _probe_cuda_inductor()
+        cpu_ok, cpu_why = _probe_cpu_inductor()
+        reason = {}
+        if not cuda_ok:
+            reason["cuda_inductor"] = cuda_why
+        if not cpu_ok:
+            reason["cpu_inductor"] = cpu_why
+        _capability_cache = {"cuda_inductor": cuda_ok, "cpu_inductor": cpu_ok, "reason": reason}
+    return {"cuda_inductor": _capability_cache["cuda_inductor"],
+            "cpu_inductor": _capability_cache["cpu_inductor"],
+            "reason": dict(_capability_cache["reason"])}
+
+
+def _reset_capability_cache_for_test() -> None:
+    """Test hook: forget the memoized probe so a test can force a re-probe under a
+    monkeypatched environment. Mirrors autotier's own `_reset_for_test` shape."""
+    global _capability_cache
+    _capability_cache = None
 
 
 # ── Public API ────────────────────────────────────────────────────────

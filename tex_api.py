@@ -67,6 +67,12 @@ from .tex_marshalling import (  # noqa: F401
 # Phase 1 is a view of the module singletons (ComfyUI byte-identical); see tex_session.
 from .tex_session import EngineSession, default_session  # noqa: F401
 
+# CC-3: the read-only, process-wide torch.compile-toolchain probe (never by compiling) that
+# `compile_mode="auto"` consults before it will even attempt a background compile (CC-4). Lives
+# in tex_runtime.compiled (the compiled tier's own module) and is re-exported here so a host
+# reads it off the one facade it already imports the rest of this surface from.
+from .tex_runtime.compiled import compile_capability  # noqa: F401
+
 # LANG-3: the TEX LANGUAGE version — grammar + semantics — versioned SEPARATELY from the
 # package `__version__`. A program may declare the language level it targets with a leading
 # `//!tex X.Y` pragma; `check()` advises (W7004) when a program targets a NEWER language
