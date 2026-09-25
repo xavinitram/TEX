@@ -394,3 +394,64 @@ def load_counts_harness():
     sys.modules["_bench2_host_path_counts"] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+# ── Windows Application/Smart App Control kernel-load block (V045-FIX) ──────
+
+#: The exact substring TRK-182's product-code fallback (`tex_runtime/noise.py`
+#: `_disable_inductor_after_kernel_block`) already recognises as an OS policy decision, not a
+#: TEX defect: a Windows Application Control / Smart App Control policy blocking a freshly
+#: compiled or freshly loaded native kernel (a `.pyd` Inductor artifact). A test that
+#: deliberately forces a fresh compile (past `_COMPILE_AFTER_CALLS`, or a fresh
+#: `TORCHINDUCTOR_CACHE_DIR`) hits the exact same OS decision but has no product-code fallback
+#: of its own to catch it — that is what the two helpers below are for. Kept as a tuple (one
+#: entry today) so a second observed phrasing of the same OS decision is one more string, not
+#: a rewritten predicate.
+_OS_POLICY_KERNEL_BLOCK_MARKERS = (
+    "Application Control policy has blocked",
+)
+
+
+def is_os_policy_kernel_block_text(text: str) -> bool:
+    """True if `text` — an exception's `str()`, or a subprocess's captured stdout/stderr —
+    names the Windows Application/Smart App Control kernel-load block. `text` is checked as
+    given: the caller decides whether that means `str(exc)` alone (which already carries a
+    wrapping exception's own message, e.g. torch's `InductorError: ImportError: DLL load
+    failed while importing kernel: An Application Control policy has blocked this file.` —
+    `InductorError` is a `BackendCompilerFailed`/`RuntimeError`, not an `ImportError`, so a
+    bare `except (ImportError, OSError)` does not catch it; matching the rendered TEXT instead
+    of the exception TYPE is what makes this recognise the block regardless of which layer
+    torch chose to wrap it at) or the full captured output of a child process."""
+    return any(marker in text for marker in _OS_POLICY_KERNEL_BLOCK_MARKERS)
+
+
+def retry_on_os_policy_kernel_block(fn, *args, **kwargs):
+    """Call `fn(*args, **kwargs)`; on an exception whose `str()` names the Windows
+    Application/Smart App Control kernel-load block (`is_os_policy_kernel_block_text`),
+    retry ONCE. Any OTHER exception — including a second occurrence of this same one — is
+    never swallowed: a non-matching exception is re-raised immediately (this helper
+    recognises exactly one failure shape and must never mask an unrelated bug as a flaky
+    one), and a second matching failure raises a clear `RuntimeError` naming the OS policy,
+    chained to the original, rather than the raw torch/DLL text a caller would otherwise have
+    to recognise again downstream. This is a REAL red on a second failure, not a skip — the
+    SIMP-3 skip budget is untouched by this helper either way.
+
+    NOT in `helpers.__all__` (checked against HOOK-4's pinned `_BASE_ALL` in
+    `test_hook4_testkit.py` before this was added) — a caller imports it by name, exactly
+    like `load_counts_harness` above.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        if not is_os_policy_kernel_block_text(str(e)):
+            raise
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e2:
+        if not is_os_policy_kernel_block_text(str(e2)):
+            raise
+        raise RuntimeError(
+            "a Windows Application/Smart App Control policy blocked a freshly-compiled or "
+            "freshly-loaded Inductor kernel twice in a row (retried once); this is an OS "
+            "policy decision on this box, not a TEX defect"
+        ) from e2

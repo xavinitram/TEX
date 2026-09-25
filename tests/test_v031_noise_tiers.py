@@ -127,6 +127,7 @@ import json
 import subprocess
 
 from helpers import *
+from helpers import is_os_policy_kernel_block_text
 
 from TEX_Wrangle.tex_runtime.noise import _COMPILE_AFTER_CALLS as _COMPILE_AFTER
 
@@ -229,17 +230,46 @@ for delta in mutants:
 '''
 
 
-def _run_child(script, args, stdin=None):
-    """(stdout, error) from a fresh interpreter — the defects here are per-process first-use."""
+def _run_child_once(script, args, stdin):
+    """(stdout, rc, stderr) — `rc` is None on a timeout, else the child's real exit code."""
     custom_nodes = str(Path(__file__).resolve().parents[2])
     try:
         proc = subprocess.run([sys.executable, "-c", script, custom_nodes] + [str(a) for a in args],
                               input=stdin, capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired:
+        return None, None, ""
+    return (proc.stdout, 0, "") if proc.returncode == 0 else (None, proc.returncode, proc.stderr or "")
+
+
+def _run_child(script, args, stdin=None):
+    """(stdout, error) from a fresh interpreter — the defects here are per-process first-use.
+
+    Several of these children cross `_COMPILE_AFTER_CALLS` with a REAL `torch.compile`, on
+    whichever kernel the target box's toolchain can build (MSVC on CPU, Triton on CUDA) — the
+    exact shape of compile a Windows Application/Smart App Control policy can block a
+    freshly-produced native artifact from loading (V045-FIX; TRK-182 is product code's own
+    fallback for the noise TIER, this is the test process's fallback for the CHILD it spawned
+    to force one). Retried once, here, rather than in each of the six callers: one shared
+    subprocess boundary, one shared retry. A timeout is never retried here (doubling a 600s
+    wait buys nothing for a genuine hang) and never matches the OS-policy text either."""
+    out, rc, stderr = _run_child_once(script, args, stdin)
+    if rc is None:
         return None, "the child never finished"
-    if proc.returncode != 0:
-        return None, f"child exited {proc.returncode}: {(proc.stderr or '')[-400:]}"
-    return proc.stdout, None
+    if rc == 0:
+        return out, None
+    if not is_os_policy_kernel_block_text(stderr):
+        return None, f"child exited {rc}: {stderr[-400:]}"
+    out2, rc2, stderr2 = _run_child_once(script, args, stdin)
+    if rc2 == 0:
+        return out2, None
+    if rc2 is not None and is_os_policy_kernel_block_text(stderr2):
+        return None, ("a Windows Application/Smart App Control policy blocked a freshly "
+                      "compiled/loaded kernel in the spawned child twice in a row (retried "
+                      f"once); this is an OS policy decision on this box, not a TEX defect: "
+                      f"{stderr2[-400:]}")
+    if rc2 is None:
+        return None, "the child never finished (on retry)"
+    return None, f"child exited {rc2}: {stderr2[-400:]}"
 
 
 def _cook_rows_in_fresh_process(dev, cache_dir, n=_N_COOKS, prog=_SIMPLEX_PROG, mutants=()):

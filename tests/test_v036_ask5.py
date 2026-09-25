@@ -10,6 +10,7 @@ loud-guard test, test_v023_phase1.py's `_NON_LOCAL_FNS` derivation, stdlib_probe
 not spatial, not sync.
 """
 from helpers import *
+from helpers import retry_on_os_policy_kernel_block
 from failure_harness import run_tier, max_diff
 import inspect
 
@@ -63,7 +64,13 @@ def _settle_worley_tier(x, y):
     """
     from TEX_Wrangle.tex_runtime import noise
     for _ in range(_COMPILE_AFTER_CALLS + 1):
-        noise._worley2d(x, y, return_f2=False)
+        # V045-FIX: the call that crosses `_COMPILE_AFTER_CALLS` can compile and load a brand
+        # new Inductor kernel (MSVC on this CPU box) -- exactly the freshly-produced native
+        # artifact a Windows Application/Smart App Control policy can intermittently block
+        # from loading (torch wraps the load failure in `InductorError`, not a bare
+        # `ImportError`/`OSError`, so product code's own TRK-182 fallback is a different
+        # layer than this). Retried once; a second failure of the same shape is a real red.
+        retry_on_os_policy_kernel_block(noise._worley2d, x, y, return_f2=False)
     return _worley_tier(noise._widest((x, y)).device)
 
 
