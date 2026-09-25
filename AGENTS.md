@@ -183,9 +183,13 @@ the answer is the next domain split, not a bigger number. The floor has now move
 CACHE-6 stage-list cook and CACHE-1's lineage keys, the cut ENG-14's design note had already
 named). `tex_results.py` carries the register's second floor and **has now taken its own
 pre-specified cut**: the CACHE-1 key-minting leaf moved out to `tex_results_keys.py` (NEG-6),
-proved bytecode-identical by NEG-2's own technique, and the floor moved 1958 → **1887**. So the
-register's rule is the house pattern rather than one module's exception: a module gets its floor
-and the design note for its next cut BEFORE the wall, never at it.
+proved bytecode-identical by NEG-2's own technique, and the floor moved 1958 → 1887. `tex_results.py`
+then sat AT that floor, so it took a second pre-specified cut (SPLIT-R, v0.44): the CACHE-8
+residency ladder (`set_vram_budget`/`_enforce_residency`/`_queue_demotions`/`_drain_demotes`/
+`_promote`) moved out to `tex_results_residency.py` as a mixin (`_ResultCacheResidency`) that
+`ResultCache` inherits, and the floor moved 1887 → **1810**. So the register's rule is the
+house pattern rather than one module's exception: a module gets its floor and the design note
+for its next cut BEFORE the wall, never at it.
 
 **That cut was spent almost the moment it was minted, which is the argument for the pattern.**
 NEG-1 set the 1958 floor with 55 lines of headroom. One later lane (CACHE-11, the residency

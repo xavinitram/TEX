@@ -130,7 +130,7 @@ MUTATIONS = [
     # TRK-90: CACHE-8's own suite now constructs its own disarmed-with-residents case too
     # (`test_v033_cache8_disarmed_residency_never_enforces`), alongside the pre-existing killer
     # `test_v0332_audit`'s A5 disarm row (written a release later).
-    ("CACHE-8: residency runs even when disarmed", "tex_results.py",
+    ("CACHE-8: residency runs even when disarmed", "tex_results_residency.py",
      "        if self._vram_budget is None:\n"
      "            return\n"
      "        over = self._bytes_by_dev[\"cuda\"] - self._vram_budget",
@@ -169,7 +169,7 @@ MUTATIONS = [
     # asserts nothing, and leaving it as permanent SURVIVED noise trains the reader to ignore
     # the word. Re-arm this if a second producer of `_pending_demotes` ever appears.
     #   ("A1: the demote commit stops re-checking the DEVICE", ...)
-    ("A1: an in-flight demotion is invisible to the victim walk again", "tex_results.py",
+    ("A1: an in-flight demotion is invisible to the victim walk again", "tex_results_residency.py",
      "        queued = {k for k, _e in self._pending_demotes} | self._demoting\n"
      "        got = 0",
      "        queued = {k for k, _e in self._pending_demotes}\n"
@@ -190,7 +190,7 @@ MUTATIONS = [
     # `_spilled` to None mid-scan, which was crashing the merge with a TypeError. That guard is
     # now explicit and the crash is fixed; the mutation still cannot be killed by a test.
     #   ("A3: reindex rebinds membership over a racing spill", ...)
-    ("A7: the victim walk reaches the MRU frame again", "tex_results.py",
+    ("A7: the victim walk reaches the MRU frame again", "tex_results_residency.py",
      "            if key == mru:\n"
      "                continue",
      "            if False:\n"
@@ -267,7 +267,7 @@ MUTATIONS = [
      "                self._spilled = None",
      ("test_v0332_audit",)),
     ("A5: the disarm commit-check goes, so an in-flight demote still lands",
-     "tex_results.py",
+     "tex_results_residency.py",
      "                if self._vram_budget is None:",
      "                if False:",
      ("test_v0332_audit",)),

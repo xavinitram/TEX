@@ -261,7 +261,15 @@ _OVER_HARD_BASELINE = frozenset({
 # 1815, so its floor goes 1958 -> 1887 — the same 72-line margin this module's own NEG-1
 # precedent chose, kept rather than re-picked, so the register's margins stay comparable
 # across modules instead of drifting per lane. 72 lines of room again, not 14.
-_HEADROOM_FLOOR = {"tex_engine.py": 1400, "tex_results.py": 1887}
+# SPLIT-R (v0.44) moved tex_results.py's floor down for the second time, sitting AT it —
+# `tex_results.py` was 1887/1887 when this landed, i.e. NEG-6's own 72-line margin had
+# already been spent by later work with no split of its own. The pre-specified CACHE-8
+# residency-ladder cut (`set_vram_budget`/`_enforce_residency`/`_queue_demotions`/
+# `_drain_demotes`/`_promote`, mixed back in via `_ResultCacheResidency`) took it from 1887
+# to 1651, so its floor goes 1887 -> 1810 — a 159-line margin, wider than NEG-6's 72: a
+# floor sitting exactly AT the wall is the situation ENG-14 was created to prevent, so this
+# cut buys more warning than the last one rather than the same amount again.
+_HEADROOM_FLOOR = {"tex_engine.py": 1400, "tex_results.py": 1810}
 
 
 def _product_packages(root) -> list:
