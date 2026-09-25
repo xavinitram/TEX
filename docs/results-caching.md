@@ -135,9 +135,21 @@ frozen per ENG-12 and keyed by CACHE-1.
 
 **API (host-facing):** `get(key) → tensor|None`, `put(key, tensor, *, canvas=None, quality=None,
 storage=None)`, `set_budget(mb)`, `set_vram_budget(mb)`, `touch(key) → bool`,
-`touch_promote(key) → bool`, `key in cache`, plus `stats()`. A host that has a
-`CookResult.lineage` calls `put(res.lineage[name], res.outputs[name])` and later `get(key)`. The
-ComfyUI node does not call any of it.
+`touch_promote(key) → bool`, `spill(key) → bool`, `key in cache`, plus `stats()`. A host that
+has a `CookResult.lineage` calls `put(res.lineage[name], res.outputs[name])` and later
+`get(key)`. The ComfyUI node does not call any of it.
+
+**`spill(key)` (v0.45)** moves one named, RAM-resident entry to the disk tier immediately,
+out of `evict_bytes`'s own oldest-first order — the mechanism `evict_bytes` already uses for
+every LRU victim, aimed at one key instead of walked to free `need` bytes. It exists because
+`evict_bytes` never drops below one entry, so the newest `put` (or the sole entry in a small
+cache) is the one frame it can structurally never reach; a host that knows a key is about to go
+idle spills it deliberately instead. Returns `False` if `key` is not RAM-resident (absent, or
+already spilled — moving it removes it from the RAM tier, so a second call sees exactly that) or
+if no disk tier can be reached; `True` means the write was queued and drained (a write that then
+fails on its own terms — a full disk, a race with a newer spill of the same key — is the ordinary
+`_spill` contract: a miss just recooks). Policy stays where it was: `spill` only ever moves the
+key it is given.
 
 **A hint is not a read.** `get` counts a hit or a miss, promotes a demoted frame, restores a
 spilled one and unpacks a preview one. A host that only *predicts* demand calls `touch(key)`

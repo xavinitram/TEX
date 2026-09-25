@@ -1255,6 +1255,46 @@ class ResultCache(_ResultCacheResidency):
         self._drain_spills()          # to disk (best-effort) — a miss just recooks
         return freed
 
+    def spill(self, key: str) -> bool:
+        """SPILL-45: spill ONE named entry to the disk tier now, out of `evict_bytes`'s own
+        LRU order. Mechanism, not policy — the caller names the key and this moves exactly
+        that one; victim CHOICE stays `evict_bytes`'s and the RAM/residency budgets' own. The
+        caller-visible reason this exists: `evict_bytes` walks `_ram` oldest-first and never
+        drops below one entry, so the entry a `put` just landed — the sole entry, or simply the
+        MRU — is the one `evict_bytes` can structurally never reach. That is exactly the entry
+        a host who knows it is about to go idle, or about to replace this key, wants durable
+        now rather than lost when the process exits.
+
+        Returns `False` if `key` is not resident in the RAM tier — absent, or already spilled
+        (spilling removes an entry from `_ram`, so a second `spill` of the same key sees
+        exactly this) — or if no disk tier is reachable (`_spill_dir` cannot resolve or create
+        its directory, e.g. a missing or read-only `cache_dir`): there is nothing to move it
+        FROM, or nowhere to move it TO. `True` means the write was queued and drained; a write
+        that then fails on its own terms (a full disk, a racing newer spill of the same key) is
+        the pre-existing `_spill` contract — a miss just recooks, exactly as an
+        `evict_bytes`-triggered spill already behaves.
+
+        Reuses `evict_bytes`'s own eviction-and-drain path verbatim (`_remove`,
+        `_claim_spill_ticket`, `_pending_spills`, `_drain_spills`) rather than a second writer;
+        the only new part is targeting one named key instead of walking the LRU order until
+        `need` bytes are freed. Deliberately does NOT bump `evictions`: that counter is the
+        budget-pressure signal `_enforce_ram_budget`/`evict_bytes` report, and a host-directed
+        spill is not budget pressure — `stats()["spills"]` (bumped inside `_spill` itself,
+        unconditionally on the write path) already counts this write exactly as it would count
+        an `evict_bytes`-triggered one."""
+        try:
+            self._spill_dir()      # cheap after the first call (memoized); may makedirs once
+        except OSError:
+            return False            # no disk tier reachable — nowhere to move this key to
+        with self._lock:
+            entry = self._ram.get(key)
+            if entry is None:
+                return False        # absent, or already on disk (see docstring)
+            self._remove(key)
+            self._pending_spills.append((key, entry, self._claim_spill_ticket(key)))
+        self._drain_spills()
+        return True
+
     # ── introspection / lifecycle ──
     def sweep_temps(self) -> int:
         """Drop crash-orphaned `tex_recovery` temps from the spill dir. Called from
