@@ -133,15 +133,6 @@ class Program:
     time_reads: Any = frozenset()
 
 
-#: TIMEREADS-45: `fetch_time`/`sample_time` read the host playhead exactly like `frame`/`fps`/
-#: `time`, but as a `FunctionCall`'s `.name`, never an `Identifier` — invisible to
-#: `_collect_identifiers` (and so to `used_builtins`), which only ever tests Identifier names.
-#: Kept here, beside `Program` and `_collect_time_reads`, rather than in `tex_runtime.interpreter`
-#: (where `_TIME_BUILTIN_NAMES` and `_collect_identifiers` live): that module sits at its
-#: REG-2 hard-budget line, and this ask is additive surface, not engine surface.
-_TIME_BUILTIN_CALL_NAMES = frozenset({"fetch_time", "sample_time"})
-
-
 def _collect_time_reads(program) -> frozenset:
     """Which of `frame`/`fps`/`time`/`fetch_time`/`sample_time` `program` (the AST `Program`,
     i.e. `Program.ast`, not this module's dataclass) reads, anywhere — inside a user function's
@@ -150,15 +141,19 @@ def _collect_time_reads(program) -> frozenset:
     Built from the SAME two facts `tex_runtime.codegen._reads_time_builtin` and
     `tex_runtime.graphed._capturable`'s time-decline branch already check —
     `tex_runtime.interpreter._TIME_BUILTIN_NAMES` against an `Identifier`, and
-    `_TIME_BUILTIN_CALL_NAMES` (the same two names out of `graphed._SYNC_STDLIB`) against a
-    `FunctionCall`'s name — so this can't drift from either: it is not a third
+    `tex_runtime.interpreter._TIME_BUILTIN_CALL_NAMES` (the same two names `graphed.
+    _SYNC_STDLIB` also carries, for an unrelated reason — see that constant's own comment)
+    against a `FunctionCall`'s name — so this can't drift from either: it is not a third
     re-implementation of "does this program read time", it is the same two checks run together
-    over one walk. Uses `iter_child_nodes` (field-driven — the generic walker codegen emission,
-    the optimizer and the memory estimator already share) rather than a hand-written per-class
-    dispatch, so a read reachable only through a node type none of those callers special-cased
-    is still found, and a future ASTNode field is traversed instead of silently escaping."""
+    over one walk, both halves imported from the ONE module that declares them (SIMP-45; a
+    prior draft hand-kept the call-name half here too, as a second literal that could only
+    ever be kept in step by hand, not derived). Uses `iter_child_nodes` (field-driven — the
+    generic walker codegen emission, the optimizer and the memory estimator already share)
+    rather than a hand-written per-class dispatch, so a read reachable only through a node type
+    none of those callers special-cased is still found, and a future ASTNode field is traversed
+    instead of silently escaping."""
     from .tex_compiler.ast_nodes import Identifier, FunctionCall, iter_child_nodes
-    from .tex_runtime.interpreter import _TIME_BUILTIN_NAMES
+    from .tex_runtime.interpreter import _TIME_BUILTIN_NAMES, _TIME_BUILTIN_CALL_NAMES
     found: set = set()
     stack = [program]
     while stack:

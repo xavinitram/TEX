@@ -1391,6 +1391,15 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
 # fingerprint?", and then to go and cook one.
 _TIME_BUILTIN_NAMES = frozenset({"frame", "fps", "time"})
 
+# SIMP-45: `fetch_time`/`sample_time` read the playhead like the three names above, but as
+# a `FunctionCall`'s `.name`, not an `Identifier` — kept OUT of `_BUILTIN_NAMES` below (that
+# set is Identifier-only) and declared beside `_TIME_BUILTIN_NAMES` so `tex_api.
+# _collect_time_reads` imports both halves from this one module instead of hand-keeping a
+# second copy. `graphed._SYNC_STDLIB` carries the same two strings for an unrelated reason
+# (it syncs for many reasons, with no marker for "syncs because it reads time"), so it is
+# not a safe derivation source either way.
+_TIME_BUILTIN_CALL_NAMES = frozenset({"fetch_time", "sample_time"})
+
 # Names that are built-in variables (not user-defined)
 _BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", "fn",
                             "PI", "TAU", "E", "ic"}) | _TIME_BUILTIN_NAMES
