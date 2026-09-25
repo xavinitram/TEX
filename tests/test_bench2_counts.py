@@ -372,6 +372,66 @@ _INTERP_CHAIN_SCRUB = {
 }
 
 
+_WHOLE_FRAME_CHAIN_D1 = {
+    # COUNTS-44. A second embedding host's correction to its own compass: its interactive
+    # tick is not ROI-windowed at all — it cooks node by node over the WHOLE frame
+    # (`roi=None`), one stage dirty out of ten (the terminal stage, same one `_TERMINAL`
+    # scrubs). Same row set as `_INTERP_CHAIN_SCRUB` (its closest analogue: also
+    # `use_cache=False`), because that is the axis this scenario isolates.
+    "tex_engine.cook":          1,
+    "TEXCache.compile_ast":     0,   # ANIM-1.
+    "TEXCache.compile_tex":     1,
+    "TEXCache.fingerprint":     1,   # PERF-5 shape: 1 per cook.
+    "Lexer.tokenize":           0,   # the source was already parsed by an earlier scenario's
+    "Parser.parse":             0,   # cook in this process; PERF-1's memo hits.
+    "tex_roi._fold_program":    0,   # `roi=None`: the ROI/results-cache tier is never
+    "tex_roi.roi_plan":         0,   # consulted at all — `_needed_windows` is only asked
+    "tex_roi.chain_windows":    0,   # when a caller passes a roi.
+    "ResultCache.get":          0,   # `use_cache=False`: never probed.
+    "ResultCache.put":          0,
+    "results_cache.entries_added": 0,
+    "tex_memory.run_roi":       0,   # no roi => the whole-frame path, by construction.
+    "enforce_cache_budget":     1,   # once per cook, one cook.
+    "_disown_inputs":           1,
+    "_tile_plan":               1,   # the WHOLE 96^2 frame is planned, unlike the 48^2
+    "_halo_tile_plan":          0,   # window `_TERMINAL`/`interp_chain_scrub` cook — a
+                                     # bigger extent this scenario is the first to drive.
+    "host.get_free_memory":     0,   # off CUDA the planners return before the query.
+    "lazy_required_bindings":   0,   # this path never reaches the lazy tier.
+    "tex_checkpoint.cook_checkpointed": 0,
+    "tex_engine.boundary_lineage_key":   0,
+    "Interpreter._exec_stmt":   2,   # the vignette stage's two statements.
+}
+
+_WHOLE_FRAME_CHAIN_D3 = {
+    # The same edit three nodes up (contrast, glow, vignette): every per-cook fixed cost
+    # is paid three times, which is what separates a per-cook cost from a per-tick one.
+    "tex_engine.cook":          3,
+    "TEXCache.compile_ast":     0,
+    "TEXCache.compile_tex":     3,
+    "TEXCache.fingerprint":     3,
+    "Lexer.tokenize":           0,
+    "Parser.parse":             0,
+    "tex_roi._fold_program":    0,
+    "tex_roi.roi_plan":         0,
+    "tex_roi.chain_windows":    0,
+    "ResultCache.get":          0,
+    "ResultCache.put":          0,
+    "results_cache.entries_added": 0,
+    "tex_memory.run_roi":       0,
+    "enforce_cache_budget":     3,
+    "_disown_inputs":           3,
+    "_tile_plan":               3,
+    "_halo_tile_plan":          1,   # the blur-adjacent `glow` stage's cheap gate, unlike
+                                     # D1 which never reaches a non-pointwise stage.
+    "host.get_free_memory":     0,
+    "lazy_required_bindings":   0,
+    "tex_checkpoint.cook_checkpointed": 0,
+    "tex_engine.boundary_lineage_key":   0,
+    "Interpreter._exec_stmt":   4,   # contrast (1) + glow (1) + vignette (2).
+}
+
+
 def test_bench2_interactive_per_tick_counts(r: SubTestResult):
     """The gate: the device-independent per-tick counts of the seven interactive paths."""
     print("\n--- BENCH-2: per-tick structural counts (CPU, PROF-1 disarmed) ---")
@@ -379,7 +439,9 @@ def test_bench2_interactive_per_tick_counts(r: SubTestResult):
                         ("all_dirty", _ALL_DIRTY), ("lint", _LINT),
                         ("node_scrub", _NODE_SCRUB),
                         ("checkpoint_serve", _CHECKPOINT_SERVE),
-                        ("interp_chain_scrub", _INTERP_CHAIN_SCRUB)):
+                        ("interp_chain_scrub", _INTERP_CHAIN_SCRUB),
+                        ("whole_frame_chain_d1", _WHOLE_FRAME_CHAIN_D1),
+                        ("whole_frame_chain_d3", _WHOLE_FRAME_CHAIN_D3)):
         try:
             _check(r, label, _api_counts(label), pins)
         except Exception as e:
@@ -432,7 +494,8 @@ def test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r: SubTestResult
     reading that gives it teeth is in the CUDA test below."""
     print("\n--- BENCH-2: zero engine-side CUDA syncs per interactive tick ---")
     for label in ("terminal", "midgraph", "pan", "all_dirty", "node_scrub",
-                 "checkpoint_serve", "interp_chain_scrub"):
+                 "checkpoint_serve", "interp_chain_scrub",
+                 "whole_frame_chain_d1", "whole_frame_chain_d3"):
         try:
             got = _api_counts(label)
             lo, hi = got.get("torch.cuda.synchronize[engine]", (None, None))
@@ -475,6 +538,11 @@ _CUDA_PINS = {
     # TRK-84's fix: 125 kernels / 88 allocations; after: 121 / 84 — the identical -4/-4 `pan`
     # shows on its own, because only the terminal (vignette) stage reads `u`/`v` per tick.
     "interp_chain_scrub": (121,    0,            84),
+    # COUNTS-44: the whole-frame (`roi=None`) chain, D of ten stages dirty, `use_cache=False`.
+    # Measured identically at the gate shape (96^2/48^2) and this report shape (verified on
+    # this box), so unlike `interp_chain_scrub` there is no window to change kernel count with.
+    "whole_frame_chain_d1": (21,     0,            18),
+    "whole_frame_chain_d3": (42,     0,            33),
 }
 # WHY THE D2H COLUMN IS NOW ZERO EVERYWHERE, AND WHAT WOULD MAKE IT NON-ZERO AGAIN.
 # `gauss_blur` needs a Python number for its kernel radius and used to get it with

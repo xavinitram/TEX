@@ -1142,9 +1142,51 @@ class InterpChainScrubScenario(Scenario):
         comp.cook(self._pan_roi(i), 0, use_cache=False)
 
 
+class WholeFrameChainScenario(Scenario):
+    """COUNTS-44 — a second embedding host's correction to its own compass: its interactive
+    tick is NOT ROI-windowed at all. It cooks node by node over the WHOLE frame
+    (`roi=None`), `compile_mode="none"` (the interpreter tier, TEX's own default),
+    unfused, fp32, `use_cache=False`, one `tex_engine.cook` per stage from `dirty_from`
+    to the end of the ten-stage chain — `_DIRTY` stages dirty out of ten.
+
+    `RoiComp.cook(None, dirty_from, use_cache=False)` gives exactly this shape: the
+    clean-prefix skip (`i < dirty_from`) fires on `dirty_from` alone, never on
+    `use_cache`, so stages `0 .. dirty_from-1` are not re-entered at all (the host's own
+    canvas stands) while stages `dirty_from ..9` — `_DIRTY` of them — each pay a real,
+    uncached, whole-frame `tex_engine.cook`. `roi=None` also means `_needed_windows` is
+    never consulted (it is only asked when a caller passes a roi), so this scenario
+    carries none of `interp_chain_scrub`'s window-plan cost — that is the axis the two
+    scenarios deliberately do not share; `interp_chain_scrub` stays untouched and keeps
+    proving the ROI-windowed floor for the host that does window.
+
+    Two concrete counts, not one: a per-cook fixed cost multiplies by `_DIRTY`, and a
+    single reading cannot show that it does. `_DIRTY=1` is the terminal-only edit
+    (`TerminalKnobScenario`'s own dirty stage, whole-frame instead of windowed);
+    `_DIRTY=3` is the same edit three nodes up."""
+    _DIRTY = 1
+
+    def tick(self, comp, i):
+        stage = len(self.demo._COMP_STAGES) - self._DIRTY
+        name = self.demo._COMP_STAGES[stage][0]
+        pname = next(iter(comp.params[name]))
+        comp.params[name][pname] = 0.40 + self._seq(i) * 0.001
+        comp.cook(None, stage, use_cache=False)
+
+
+class WholeFrameChainD1Scenario(WholeFrameChainScenario):
+    name = "whole_frame_chain_d1"
+    _DIRTY = 1
+
+
+class WholeFrameChainD3Scenario(WholeFrameChainScenario):
+    name = "whole_frame_chain_d3"
+    _DIRTY = 3
+
+
 SCENARIOS = (PrewarmScenario, SourceEditScenario, TerminalKnobScenario,
              MidGraphKnobScenario, PanScenario, AllDirtyScenario, LintScenario,
-             NodeScrubScenario, CheckpointServeScenario, InterpChainScrubScenario)
+             NodeScrubScenario, CheckpointServeScenario, InterpChainScrubScenario,
+             WholeFrameChainD1Scenario, WholeFrameChainD3Scenario)
 SCENARIO_NAMES = tuple(s.name for s in SCENARIOS)
 
 
