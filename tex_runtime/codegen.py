@@ -416,9 +416,20 @@ def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
     if program is not None:
         _stage_wire_scalars(bindings, device, dtype, cg_fn, program)
     _grid_token = _stdlib_set_cook_grid(spatial_shape, dtype, device=device, cancel=cancel)
+    # FUSEDDEV-46: bind `_es` to THIS cook's device. `_get_param_local`'s emitted preamble
+    # stages a `$param` on the CPU by design (a sync-reading builtin's arg, e.g.
+    # `gauss_blur`'s sigma, wants exactly that CPU scalar, never a device readback — see
+    # `_params_on_device`'s "always placing measured slower" note). A param used only to
+    # fill a channel (`vec3($black)`) instead reached `_ensure_spatial`'s `dim() == 0`
+    # branch, which turns it into a real spatial tensor — the same "0-dim device-mixing
+    # exemption ends here" transition `_broadcast_pair` guards on the interpreter side.
+    # One closure per cook (not per call) is the entire added cost; every direct caller of
+    # `_ensure_spatial` (the interpreter) is unaffected, since it never binds through here.
+    def _es(tensor, spatial_shape_arg):
+        return _ensure_spatial(tensor, spatial_shape_arg, device=device)
     try:
         cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
-              torch, _broadcast_pair, _ensure_spatial, torch.where,
+              torch, _broadcast_pair, _es, torch.where,
               math, SAFE_EPSILON, CHANNEL_MAP, MAX_LOOP_ITERATIONS,
               _CgBreak, _CgContinue, _cg_lerp, _cg_lerpw)
     finally:

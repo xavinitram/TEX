@@ -158,7 +158,16 @@ _SKIP_VOCAB = re.compile(
 #: Re-pinned from 113 to 114 (PACE-45(a)): `test_pace45_done_event.py::test_pace45_done_event_cuda`
 #: needs a real CUDA device too — there is no CPU `torch.cuda.Event` to witness. Its CPU
 #: sibling (`test_pace45_done_event_cpu`) needs none and carries no `r.skip`.
-_SKIP_BUDGET = 114
+#: Re-pinned from 114 to 116 (FUSEDDEV-46): `test_fuseddev46_device.py` adds two rows that
+#: each need a real CUDA device to have a SECOND device to mismatch against at all — a
+#: CPU-only cook has nothing to disagree with, so there is no CPU witness for
+#: "cuda:0 and cpu" (`test_fuseddev46_fused_torch_compile_cuda_stays_on_device`, the fused
+#: chain, and `test_fuseddev46_single_node_torch_compile_cuda_stays_on_device`, the same
+#: crash on a plain unfused node). The file's third row, the non-skip twin over
+#: `helpers.devices()`, needs no `r.skip` at all — it is the "loop, not a skip" idiom this
+#: budget's own header names, and runs the same-device case everywhere and the real
+#: cross-device case wherever CUDA happens to be present.
+_SKIP_BUDGET = 116
 
 
 def _literal(node) -> str:

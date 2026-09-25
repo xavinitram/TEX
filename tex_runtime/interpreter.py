@@ -1841,8 +1841,8 @@ def _int_valued_scalar(value) -> int | None:
     return int(f)
 
 
-def _ensure_spatial(tensor: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:
-    """Expand a tensor to match a spatial shape [B, H, W] if needed.
+def _ensure_spatial(tensor: torch.Tensor, spatial_shape: tuple, device=None) -> torch.Tensor:
+    """Expand a tensor to match a spatial shape [B, H, W] if needed. `device` (FUSEDDEV-46, additive; None for every pre-existing caller) co-locates a 0-dim constant before the expand turns it real — codegen's `_es` passes it; see `_broadcast_pair`.
 
     TRK-115: a `[B,H,W,1]` scalar-field binding (a 1-channel image — `C == 1` has no
     vec1 type, so `infer_binding_type` maps it to FLOAT the same as a `[B,H,W]` mask)
@@ -1864,7 +1864,7 @@ def _ensure_spatial(tensor: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:
     if not spatial_shape:
         return tensor
     if tensor.dim() == 0:
-        return tensor.expand(spatial_shape)
+        return (tensor.to(device) if device is not None and tensor.device != device else tensor).expand(spatial_shape)
     if tensor.dim() == len(spatial_shape) + 1 and tensor.shape[-1] == 1 \
             and tensor.shape[:len(spatial_shape)] == spatial_shape:
         return tensor.squeeze(-1)
@@ -1899,6 +1899,7 @@ def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, tor
     Handles the key case: scalar [B,H,W] op with vector [B,H,W,C]
     by expanding the scalar with unsqueeze(-1).
     Also pads channel dimensions when both are vectors with different channel counts.
+    Every rank-mismatch expand below co-locates devices first (FUSEDDEV-46: `.expand` ends the 0-dim CPU/CUDA mixing exemption ATen otherwise allows).
     """
     ad, bd = a.dim(), b.dim()
     if ad == bd:
@@ -1924,7 +1925,7 @@ def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, tor
 
     if _is_bare_mat(a) or _is_bare_mat(b):
         mat, other, mat_is_a = (a, b, True) if _is_bare_mat(a) else (b, a, False)
-        n = mat.shape[-1]
+        n = (mat := mat.to(other.device) if mat.device != other.device else mat).shape[-1]
         if (other.dim() >= 4 and other.shape[-1] in _MAT
                 and other.shape[-1] == other.shape[-2]):
             # bare matrix vs spatial matrix [...,N,N]: leading singletons on the bare one
@@ -1940,10 +1941,10 @@ def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, tor
     # a scalar field [B,H,W] -> [B,H,W,1] against a vector [B,H,W,C], and a spatial
     # matrix [B,H,W,N,N] vs a scalar field [B,H,W] both land here correctly.
     if ad > bd:
-        b = b.view(*b.shape, *((1,) * (ad - bd))).expand_as(a)
+        b = (b.to(a.device) if b.device != a.device else b).view(*b.shape, *((1,) * (ad - bd))).expand_as(a)
         return a, b
     else:
-        a = a.view(*a.shape, *((1,) * (bd - ad))).expand_as(b)
+        a = (a.to(b.device) if a.device != b.device else a).view(*a.shape, *((1,) * (bd - ad))).expand_as(b)
         return a, b
 
 
