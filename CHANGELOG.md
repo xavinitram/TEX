@@ -5,6 +5,41 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.45.1] - 2026-09-25 — "Blocked, not broken"
+
+A correctness patch to `v0.44.0`'s own fallback. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no
+compat freeze is owed. **ComfyUI's default-path pixels are unchanged** — the fallback this patch
+widens produces the same pixels the eager tier always has; nothing about a normal cook, on a box
+that never blocks a kernel load, changes at all.
+
+### Fixed
+
+- **A Windows security policy blocking a freshly-compiled noise kernel could still fail a cook,
+  even after `v0.44.0`'s fallback.** That fallback caught the block only when it arrived as a
+  bare `ImportError`/`OSError`. On this box's torch build, a blocked kernel load instead arrives
+  wrapped in torch's own compiler error (`InductorError`), which the bare check did not
+  recognize — so the cook could still fail with the block reported as a generic error instead of
+  falling back. Now, any kernel-load failure anywhere in the exception's chain (wrapped or bare)
+  triggers the same fallback: the eager noise tier, same pixels, one warning. A real compile bug
+  — anything that is not this specific class of load failure — still surfaces as a real error and
+  is not swallowed.
+
+### Tooling (`tests/` only — no `tex_*` production module touched)
+
+- The embedding-host seam test's frozen class rows no longer depend on which Python version ran
+  the suite — it pinned a class's `__init__` signature, which `inspect.signature` renders
+  differently across CPython versions for a class with no `__init__` of its own (e.g. an
+  `Enum`); a class row is now pinned by existence and kind, plus its `Enum` member names or
+  `@dataclass` field names where either applies. No user impact.
+
+### For anyone vendoring this tree
+
+No newly reserved names; `LANGUAGE_VERSION` unmoved at `"0.25"`; no default moves; no new
+shipping module filenames — the fix lands entirely inside `tex_runtime/noise.py`; everything
+else in this release is `tests/`-only. **Cache cold-start**: `tex_runtime/noise.py` is a
+`_CODEGEN_FILES` member (`tex_cache.py`), so this release moves the codegen/tier-verdict caches
+once; `.pkl` stays warm (no `_AST_FILES` member is touched).
+
 ## [0.45.0] - 2026-09-25 — "The adoption point"
 
 Two small, additive host-facing surfaces; a frozen public seam for an embedding host, keyword
