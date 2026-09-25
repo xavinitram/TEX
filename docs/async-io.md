@@ -14,7 +14,7 @@ that are not:
 
 **(a) A value-less binding in an engine that derives identity from binding *values*.**
 `prepare()` builds `binding_types` by calling `infer_binding_type` on every value
-(`tex_engine.py:800`), and `infer_binding_type` ends in `return TEXType.FLOAT`
+(`tex_engine.py:642`), and `infer_binding_type` ends in `return TEXType.FLOAT`
 (`tex_marshalling.py:330`) — a silent catch-all. A promise wired today does not fail; it
 types as FLOAT, mints a fingerprint for a program that does not exist, and compiles
 something wrong. Identity corruption, not an error.

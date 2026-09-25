@@ -55,7 +55,7 @@ behind.**
 The report's phrasing — "when an edit's downstream *footprint* (ROI-2) is a bounded region" —
 reads as if it applies to any graph. It does not, and the reason is structural:
 
-**`roi=` is refused on a fused chain** (`tex_engine.py:969`: `roi is not None and tier_id ==
+**`roi=` is refused on a fused chain** (`tex_engine.py:813`: `roi is not None and tier_id ==
 "default" and not fused_chain and not has_latent_input`). Fusion splices stages behind local
 variables, and the reach analysis cannot see through them — `_has_ungrounded_halo` blocks
 exactly that shape. So a region recook of a *fused region* is not a caching problem at all; it

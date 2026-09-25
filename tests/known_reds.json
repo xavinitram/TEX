@@ -1,5 +1,20 @@
 {
   "schema": 1,
   "note": "The known-red allowlist tools/gate.py applies. EMPTY IS THE CORRECT STATE: every entry is a failure somebody has agreed to live with, so the file is a debt register, not a configuration. The schema, the 'when' vocabulary and the rules for adding or removing an entry are in tests/README.md, section 'The known-red allowlist'.",
-  "entries": []
+  "entries": [
+    {
+      "id": "tests/test_simp5_citations.py::test_simp5_shipped_doc_citations",
+      "reason": "SPLIT-E (v0.46) moved tex_engine.py's tier-selection code out to tex_engine_tiers.py and shrank tex_engine.py from 1393 to 1144 lines, which pushed CHANGELOG.md:771 and CHANGELOG.md:3530 (both `tex_engine.py:1283`, inside `run`, the TRK-109 entry) past the new EOF. Every other citation this move broke (docs/async-io.md, docs/effort-based-checkpoints.md, docs/host-path-counts.md, docs/plane-bindings.md, docs/region-granular-recook.md, docs/roadmap.md, DEVELOPMENT.md) was repaired in the same commit; CHANGELOG.md is on the tex-implementer standing law's never-edit list (release-managed, single writer), so these two could not be.",
+      "when": ["always"],
+      "condition": "until the two CHANGELOG.md citations naming `tex_engine.py:1283` are re-pointed at `run`'s new line (1032 at SPLIT-E's head) or folded into a release commit that touches CHANGELOG.md anyway",
+      "owner": "the release deputy, at the next release commit that edits CHANGELOG.md"
+    },
+    {
+      "id": "tests/test_simp5_citations.py::test_simp5_the_checker_is_not_inert",
+      "reason": "Same root cause as the sibling entry above: `tools/check_citations.py` exits 1 (not the 0 this witness test expects on a clean tree) purely because of the two CHANGELOG.md dead citations SPLIT-E's line-shift created and cannot repair (CHANGELOG.md is implementer-restricted). This test's own witness assertions (constructed sample-module citations) all pass; only the tool's real exit code, taken over THIS tree, is affected.",
+      "when": ["always"],
+      "condition": "same as the sibling entry: until the two CHANGELOG.md citations are repointed or folded into a release commit",
+      "owner": "the release deputy, at the next release commit that edits CHANGELOG.md"
+    }
+  ]
 }

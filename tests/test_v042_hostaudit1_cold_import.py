@@ -41,9 +41,13 @@ import sys as _sys
 # `CookResult.done` fence), so `tex_engine.py` imports it eagerly at module scope alongside
 # `profile` — the same reason every other `tex_runtime` leaf it already used is eager, not
 # lazy. 47 -> 48, +1 for this one new module, nothing else moved.
+# SPLIT-E (v0.46): the STR-2 tier-selection-and-execution domain moved to
+# `tex_engine_tiers.py`, re-exported from `tex_engine.py` at module scope (same posture as
+# ENG-14/NEG-2's own re-exported leaves) — so importing `tex_engine` now also imports this
+# one new module. 48 -> 49, +1 for this one new module, nothing else moved.
 _BARE_TOUCH_TEX_MODULES_MAX = 1
 _BARE_TOUCH_TORCH_MODULES = 0
-_TEX_ENGINE_TEX_MODULES_MAX = 48
+_TEX_ENGINE_TEX_MODULES_MAX = 49
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:

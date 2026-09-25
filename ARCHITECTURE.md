@@ -84,7 +84,7 @@ Three layers; **imports point downward only**. The `tex_compiler` package has
 | **Types** (leaf vocabulary) | `types` (`TEXType`, `CHANNEL_MAP`, `TYPE_NAME_MAP`, swizzles) | nothing (stdlib `enum`/`dataclasses` only) |
 | **Compiler** (IR + front end) | `ast_nodes`, `lexer`, `parser`, `type_checker`, `optimizer`, `stdlib_signatures`, `diagnostics` | types + itself |
 | **Runtime** (execution tiers) | `interpreter`, `codegen` (+ `codegen_stdfns`/`codegen_stencil`/`codegen_persist`, STR-7; + `codegen_masked`, the language-0.25 emitters), `compiled`, `graphed`, `stdlib` (+ `stdlib_registry`), `precision_policy` (PR-LP2 `auto` gate), `tier_trace`, `profile` (PROF-1 cost store + the thread-local stage sink), `noise`, `autotier`, `xfer` (ENG-8 transfer-cost probe), `tex_cache`, `tex_marshalling` (+ DATA-1 `BufferMeta`), `tex_memory`, `tex_recovery` (ENG-13 durable write + journal), `tex_io` (DATA-2 `BufferDesc` + EXR/PNG storage), `host` (PORT-1 seam — the ONLY `comfy.model_management` consumer), `tex_buffers` (ENG-14 — the ENG-6/ENG-12 frame-handoff + buffer-ownership contract; a torch-only leaf) | types + compiler + itself |
-| **Engine** (host-agnostic cook) | `tex_engine` (`cook`/`prepare`/`run`, tier selection, OOM ladder, precision-auto — ENG-1), `tex_tiling` (ENG-14 — the cook-fit planners: `tex_tiling` plans, `tex_memory` runs, `tex_roi` decides what may be narrowed), `tex_chain` (NEG-2 — the CACHE-6 stage-list cook + CACHE-1's lineage keys; it also holds the ENG-4 compile raiser and the ENG-9 per-thread interpreter pool, which travelled with it so it could stay a leaf, and re-exports all of them onto `tex_engine`), `tex_fusion` (splice + the FUS-1 detector), `tex_lazy`, `tex_scheduler` (SCHED-2 placement), `tex_cookqueue` (SCHED-4 preemptive queue + PRED-1 admission), `tex_checkpoint` (CACHE-7 effort-based checkpoint placement) | runtime + compiler |
+| **Engine** (host-agnostic cook) | `tex_engine` (`cook`/`prepare`/`run`, OOM ladder, precision-auto — ENG-1), `tex_engine_tiers` (SPLIT-E — the STR-2 tier-selection-and-execution domain: `select_tier` + the four `_run_*` strategies + the shared `_interp_fallback` recovery path + `_run_tier`; re-exported onto `tex_engine`), `tex_tiling` (ENG-14 — the cook-fit planners: `tex_tiling` plans, `tex_memory` runs, `tex_roi` decides what may be narrowed), `tex_chain` (NEG-2 — the CACHE-6 stage-list cook + CACHE-1's lineage keys; it also holds the ENG-4 compile raiser and the ENG-9 per-thread interpreter pool, which travelled with it so it could stay a leaf, and re-exports all of them onto `tex_engine`), `tex_fusion` (splice + the FUS-1 detector), `tex_lazy`, `tex_scheduler` (SCHED-2 placement), `tex_cookqueue` (SCHED-4 preemptive queue + PRED-1 admission), `tex_checkpoint` (CACHE-7 effort-based checkpoint placement) | runtime + compiler |
 | **Public API** (host-agnostic) | `tex_api` (`compile`/`execute`/`Program`/`TEXCompileError` + DATA-1 `color_advisories` + the opt-in `control_flow_advisories` + DATA-4 `EngineSession`, PORT-2/ENG-4), `tex_session` (DATA-4 — one handle over the cook singletons, views in phase 1), `tex_cli` (`tex run`/`tex build`, PORT-3/TOOL-4), `tex_tool` (the `.textool` loader/publish/cook, TOOL-1..5), `tex_lsp` (the stdio LSP, LANG-7) | engine + runtime + compiler |
 | **ComfyUI adapter** | `tex_node` (marshalling + schema + `ui=` payload only, S-1), `__init__` (routes), `tex_runtime/host` | all of the above |
 
@@ -148,6 +148,16 @@ Its `tex_fusion` and `tex_results` imports stayed function-local, exactly as the
 count is **still 2**: it is a leaf importing only `hashlib`/`json` at module level, plus the
 same function-local `tex_cache` import `_code_epoch` already made before the move; nothing
 imports back up to `tex_results` or `tex_chain`.)
+(SPLIT-E added `tex_engine_tiers`, and the count is **still 2**: everything it needs from
+`tex_runtime.host`/`tex_runtime.compiled`/`tex_chain`/`tex_tiling` is read off a deferred
+`from . import tex_engine as _tex_engine` reference instead of an import of its own (ROUTE-45:
+routes every such call through `tex_engine`'s own attribute so a host wrap on
+`tex_engine._get_interpreter`, `tex_engine.execute_compiled`, etc. still sees them; see the
+module's docstring), plus a handful of function-local `tex_runtime`/`tex_memory` imports that
+resolve the same way `tex_engine.py`'s own did. That deferred reference is a bound module
+object read only inside function bodies, never at import time, so it does not create a THIRD
+load-order edge for this count — the two modules simply finish loading before either calls
+into the other.)
 (STR-1 removed the third — `stdlib_signatures ↔ type_checker` — by moving `TEXType` to the
 leaf; `type_checker`'s lazy `FUNCTION_SIGNATURES` bind is now defensive, not cycle-breaking.)
 Do **not** hoist the remaining two to top-level imports — the cycles are logical; the fix is

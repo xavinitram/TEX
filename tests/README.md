@@ -100,6 +100,35 @@ The `conftest.py` fixture creates the `SubTestResult`, passes it to the test fun
 | `@pytest.mark.slow` | Timing-sensitive tests | `pytest -m 'not slow'` to skip |
 | `@pytest.mark.timing` | A wall-clock ratio, speedup or deadline claim (e.g. `test_prlp2_node_path_perf`, `test_eng8_transfer_model`) | `pytest -m 'not timing'` to skip; `tools/gate.py`'s tiers always do. Run with `-m timing` deliberately, on a quiet, dedicated box -- not the box running everything else |
 
+## `tools/gate.py --tier touched` (SPLIT-E) — what a lane runs before handing back
+
+`--tier cheap` is fast but structurally narrow (the eight ratchets only); `--tier full` is
+thorough but is the orchestrator's landing gate, not a lane's. `--tier touched` sits between
+them: run it, on top of `--tier cheap`, before every hand-back. It selects, on the canonical
+harness, the full test files whose **names** or **imports** relate to what the branch
+touched, diffed against `--base` (default `origin/main`):
+
+- every touched file that is itself under `tests/` (its own name IS the relation — a test
+  you modified always re-runs);
+- every OTHER `tests/test_*.py` file whose own imports resolve to a product module the diff
+  touched (`_test_module_refs` against `_touched_module` in `tools/gate.py` — a simple, AST-
+  read mapping: `from TEX_Wrangle import X` and `from TEX_Wrangle.a.b import c` / `import
+  TEX_Wrangle.a.b`, no transitive import-graph closure);
+- and, unconditionally, six cheap ratchets a `--tier cheap` lane has no standing reason to
+  ever run and has kept missing as a result: docs (`test_v018_docs.py`), citation
+  (`test_simp5_citations.py`), mutation (`test_mut1_harness.py`), embedding-host seam
+  (`test_seam45_embedding_host_seam.py`), skip-budget (`test_simp3_skip_budget.py`) and LOC/
+  headroom floors (`test_v017_phase2.py`).
+
+It carries the same dead-leg guard every other leg does (a selection that collects zero
+tests is a RED, never a silent GREEN), and an unresolved `--base` (an unfetched ref, a typo)
+degrades to the ALWAYS set alone rather than to nothing — and says so in the leg's `proves:`
+line. The selection logic itself is pinned by `tests/test_splite_touched_selection.py`
+(`_touched_module`, `_test_module_refs`, `select_touched_tests`), independent of any real
+git history, so it is testable from a worktree that has never fetched.
+
+It is not a landing gate and never substitutes for `--tier full`.
+
 ## The known-red allowlist (`known_reds.json`)
 
 `tools/gate.py` runs the suite and prints one verdict. A verdict can only be honest if the
@@ -129,7 +158,7 @@ through, which is exactly how the one standing red in this suite survived thirte
 |---|---|
 | `id` | the pytest node id as the gate normalises it: `tests/<file>.py::<test>` |
 | `reason` | why it is red. A reason that is really "nobody has looked" is a bug report, not an entry |
-| `when` | machine-readable applicability, ANDed. Vocabulary: `always`, `cuda`, `no_cuda`, `leg:cheap`, `leg:ci-shape`, `leg:canonical`. An unknown token makes the entry apply to nothing — deliberately, so a typo cannot silently forgive a failure |
+| `when` | machine-readable applicability, ANDed. Vocabulary: `always`, `cuda`, `no_cuda`, `leg:cheap`, `leg:touched`, `leg:ci-shape`, `leg:canonical`. An unknown token makes the entry apply to nothing — deliberately, so a typo cannot silently forgive a failure |
 | `condition` | the same condition in words, for the reader |
 | `owner` | who owns REMOVING it. Every entry has an exit |
 

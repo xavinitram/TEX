@@ -156,7 +156,7 @@ fixture whose layer group is genuinely lowercase-swizzle-named.)*
 
 ## 2. The wire value: `PlanesValue`
 
-A dedicated wrapper class, following the `Promise` precedent (`tex_engine.py:806`'s
+A dedicated wrapper class, following the `Promise` precedent (`tex_engine.py:586`'s
 `_resolve_promise_bindings` is the shape to mirror):
 
 ```python

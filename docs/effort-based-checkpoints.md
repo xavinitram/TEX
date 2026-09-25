@@ -378,7 +378,7 @@ steady state only and missed a +44% cold-compile regression).
   so a relaunch's disk read is cheaper than a re-cook.
 - **Half-precision checkpoint storage.** A tap costs fp32 bytes even for an fp16 cook (§5).
   *Gate:* CACHE-8/PREC-1 in v0.33, which own storage precision as a decision.
-- **Checkpoints under ROI.** `roi=` is refused on a fused chain (`tex_engine.py:969`), so
+- **Checkpoints under ROI.** `roi=` is refused on a fused chain (`tex_engine.py:813`), so
   CACHE-7 (fused) and CACHE-9 (per-stage ROI) serve two different host shapes and do not
   compose. *Gate:* ROI execution on a fused program, which needs the reach analysis to see
   through fusion's local variables — a LANG/ROI item, not a caching one.

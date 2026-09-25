@@ -70,6 +70,24 @@ Optionally `--counts-baseline PATH` adds the structural counts leg, run at the g
 the frame census outside the exit code, because the frame rows move for every lawful change
 that adds a call or moves a module. The baseline must be a `--save` taken at that same shape.
 
+`--tier touched` (SPLIT-E) is a THIRD, standalone tier — a lane's own gate, run before handing
+back, in between `cheap`'s eight-ratchet feedback latency and `full`'s whole-suite landing
+cost. It selects, on the canonical harness, the full test files whose NAMES or IMPORTS relate
+to what this branch touched against `--base` (default `origin/main`): every file `git diff
+<base>..HEAD --name-only` names that is itself under `tests/` (its own name IS the relation —
+a modified test always re-runs), every OTHER test file whose own imports resolve to a product
+module the diff touched (`tools/gate.py`'s `_test_module_refs` against `_touched_module`, a
+simple, documented, AST-read mapping — no import-graph transitive closure, no test-name
+guessing), and, ALWAYS, six cheap ratchets a cheap-only lane has no standing reason to ever
+run and has kept missing as a result: the docs (`test_v018_docs.py`), citation
+(`test_simp5_citations.py`), mutation (`test_mut1_harness.py`), embedding-host seam
+(`test_seam45_embedding_host_seam.py`), skip-budget (`test_simp3_skip_budget.py`) and LOC/
+headroom-floor (`test_v017_phase2.py`) ratchets. It carries the same dead-leg guard as every
+other leg (`_run`'s `expect_collect`, on by default): a selection that collects zero tests is
+a RED, not a silent GREEN, and an unresolved `--base` (an unfetched ref, a typo) says so in
+the leg's `proves:` line rather than quietly degrading to the ALWAYS set with no explanation.
+It is not a landing gate and never substitutes for `full`.
+
 CACHE
 -----
 A verdict is a claim about a tree **as read by a particular set of interpreters**, so all of
@@ -103,6 +121,7 @@ runs: fewer never-before-seen compiled DLLs per run is fewer chances for an OS r
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime
 import hashlib
 import json
@@ -155,6 +174,119 @@ _CHEAP = [
     # Pure text scan, no compile, same cost class as the private-root lint beside it.
     ("local-only-path lint", "tests/test_lint1_no_local_only_path_refs.py"),
 ]
+
+#: SPLIT-E's `--tier touched`: the fixed ratchets a lane's own selection ALWAYS carries,
+#: because they are cheap and are exactly what a cheap-only lane kept missing (a lane briefed
+#: for `--tier cheap` plus "the files your change touches" has no standing reason to ever run
+#: the docs/citation/mutation/seam/skip-budget ratchets, so drift in any of them shipped
+#: undetected until the orchestrator's own `--tier full`). Each is a whole-file ratchet, not a
+#: per-module test, so "does this touch it" is not a question of imports -- it always applies.
+_ALWAYS_TOUCHED = [
+    ("docs map-drift + citation-adjacent doc checks (DOC-7)", "tests/test_v018_docs.py"),
+    ("citation budget (SIMP-5)", "tests/test_simp5_citations.py"),
+    ("mutation harness (MUT-1)", "tests/test_mut1_harness.py"),
+    ("embedding-host seam (SEAM-45)", "tests/test_seam45_embedding_host_seam.py"),
+    ("skip-budget ratchet (SIMP-3)", "tests/test_simp3_skip_budget.py"),
+    ("LOC + headroom floors (REG-2/ENG-14)", "tests/test_v017_phase2.py"),
+]
+
+#: Product source directories a touched path can resolve a dotted module name under (root-level
+#: `tex_*.py` needs no entry -- see `_touched_module`). `tests/`, `tools/`, `benchmarks/`,
+#: `docs/`, `.github/`, `examples/`, `assets/`, `editor_build/` and dotfiles/markdown are
+#: deliberately NOT product modules a test would import as `TEX_Wrangle.<dotted>`; a change
+#: confined to those is caught by the ALWAYS set above, never by the import-matching below.
+_PRODUCT_SUBDIRS = ("tex_compiler", "tex_runtime", "tex_io")
+
+
+def _touched_module(path: str) -> str | None:
+    """A touched repo-relative path -> the dotted module name a test file would import it as
+    (never carrying the `TEX_Wrangle.` package prefix — e.g. `tex_engine`,
+    `tex_runtime.compiled`), or `None` when the path is not an importable product module."""
+    p = path.replace("\\", "/")
+    if not p.endswith(".py") or p in ("__init__.py",):
+        return None
+    if "/" not in p:
+        return p[:-3]                      # root-level tex_*.py -> tex_*
+    top, rest = p.split("/", 1)
+    if top not in _PRODUCT_SUBDIRS:
+        return None                        # tests/, tools/, benchmarks/, docs/, ... -- not a module
+    return top + "." + rest[:-3].replace("/", ".")
+
+
+def _test_module_refs(path: str) -> set:
+    """Every `TEX_Wrangle.<dotted>` module a test FILE's own imports could resolve to, as
+    dotted paths with the `TEX_Wrangle.` prefix stripped (matching `_touched_module`'s
+    spelling) -- covers the two import shapes every file in `tests/` actually uses:
+    `from TEX_Wrangle import a[, b...]` (each name is a top-level submodule) and
+    `from TEX_Wrangle.a.b import c` / `import TEX_Wrangle.a.b` (the MODULE is `a.b`; `c` is
+    one of its attributes, not resolved any further -- a test importing a name out of a
+    module that touched still needs to re-run, so under-resolving here is the safe direction).
+    Returns the empty set on anything that fails to parse, never raises -- a selection helper
+    that could crash the gate on a stray test file is worse than one that just skips it."""
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except Exception:
+        return set()
+    refs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module == "TEX_Wrangle":
+                refs.update(alias.name for alias in node.names)
+            elif node.module.startswith("TEX_Wrangle."):
+                refs.add(node.module[len("TEX_Wrangle."):])
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("TEX_Wrangle."):
+                    refs.add(alias.name[len("TEX_Wrangle."):])
+    return refs
+
+
+def touched_files(base: str) -> list:
+    """`git diff <base>..HEAD --name-only`, repo-relative paths, empty list on any git error
+    (a bad or unfetched `base` ref) rather than a raised exception -- `select_touched_tests`
+    degrades to the ALWAYS set alone in that case, and `run_touched`'s `proves:` line says so
+    (never a silent, unexplained empty selection — the exact lie this file's docstring exists
+    to remove elsewhere)."""
+    out = _git("diff", f"{base}..HEAD", "--name-only")
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def select_touched_tests(base: str) -> tuple:
+    """The `--tier touched` selection. Returns `(files, touched_mods, base_resolved)`:
+    `files` is the sorted, de-duplicated list of `tests/*.py` relative paths to run;
+    `touched_mods` is the set of dotted module names the diff touched (for the report line);
+    `base_resolved` is False when `base` did not resolve (git error / unfetched ref), in which
+    case `files` is still the ALWAYS set (never empty) but the caller should say so out loud.
+
+    The rule, documented once here rather than re-derived per lane: a test file is selected
+    when (a) it is itself one of the files the diff touched (its own name IS the relation —
+    a modified test always re-runs itself), or (b) it imports a module the diff touched
+    (`_test_module_refs` ∩ the touched dotted-module set), or (c) it is in the fixed
+    `_ALWAYS_TOUCHED` list, unconditionally."""
+    base_resolved = _git("rev-parse", "--verify", "--quiet", base).strip() != ""
+    changed = touched_files(base) if base_resolved else []
+    selected = {p for _, p in _ALWAYS_TOUCHED}
+    touched_mods = set()
+    for path in changed:
+        p = path.replace("\\", "/")
+        if p.startswith("tests/") and p.endswith(".py"):
+            selected.add(p)
+            continue
+        mod = _touched_module(p)
+        if mod:
+            touched_mods.add(mod)
+    if touched_mods:
+        tests_dir = os.path.join(_PKG, "tests")
+        for fn in sorted(os.listdir(tests_dir)):
+            if not (fn.startswith("test_") and fn.endswith(".py")):
+                continue
+            rel = f"tests/{fn}"
+            if rel in selected:
+                continue
+            if _test_module_refs(os.path.join(tests_dir, fn)) & touched_mods:
+                selected.add(rel)
+    return sorted(selected), touched_mods, base_resolved
+
 
 #: Where the CI-shape interpreter is named, so this file names no machine's private layout.
 _CI_PYTHON_ENV = "TEX_CI_PYTHON"
@@ -553,6 +685,29 @@ def run_cheap(python: str, scratch: str, verbose: bool) -> Leg:
     return leg
 
 
+def run_touched(python: str, base_ref: str, scratch: str, verbose: bool) -> Leg:
+    """`--tier touched` (SPLIT-E): a lane's own gate, run on the canonical harness like
+    `cheap`/`canonical` above — the full test files whose names or imports relate to what
+    this branch touched (`select_touched_tests`), plus the ALWAYS ratchets. Not a landing
+    gate and not a substitute for `--tier cheap`/`full`; it exists for the coverage a
+    cheap-only lane structurally cannot have (a docs/citation/mutation/seam/skip-budget
+    drift, or a full-file regression in a module the lane's own change touched, that no
+    `_CHEAP` ratchet and no "run the files you touched" instruction ever caught on its own)."""
+    files, touched_mods, base_resolved = select_touched_tests(base_ref)
+    proves = (f"base={base_ref}; {len(files)} test file(s) selected "
+             f"({len(touched_mods)} touched module(s): {', '.join(sorted(touched_mods)) or '(none)'})")
+    if not base_resolved:
+        proves += (f" — WARNING: base ref {base_ref!r} did not resolve (unfetched? typo?); "
+                   f"selection fell back to the ALWAYS-only set, which under-selects")
+    leg = Leg("touched", proves)
+    target = [f"TEX_Wrangle/{p}" for p in files]
+    base = [python, "-X", "utf8", _HARNESS, *target]
+    argv = [*base, "-q", "-m", "not timing", "-p", "no:cacheprovider"]
+    _run(leg, argv, _PARENT, {}, scratch, verbose)
+    leg.timing_deselected = _count_timing(base, _PARENT, {})
+    return leg
+
+
 def resolve_ci_python(explicit: str | None) -> tuple:
     """`(interpreter, where it came from)` for the CI-shape leg.
 
@@ -711,9 +866,15 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         description="Run TEX's gates and print one verdict. Exit 0 GREEN, 1 RED, "
                     "2 GREEN but the known-red allowlist is stale.")
-    p.add_argument("--tier", choices=("cheap", "full"), default="cheap",
-                   help="cheap = the eight ratchets; full = cheap, then the CI shape and the "
-                        "canonical whole-suite run (default: cheap)")
+    p.add_argument("--tier", choices=("cheap", "touched", "full"), default="cheap",
+                   help="cheap = the eight ratchets; touched = the full test files that "
+                        "import a module this branch touched, plus the docs/citation/"
+                        "mutation/seam/skip-budget/floors ratchets, always -- a LANE's own "
+                        "gate, run before handing back; full = cheap, then the CI shape and "
+                        "the canonical whole-suite run (default: cheap)")
+    p.add_argument("--base", default=None, metavar="REF",
+                   help="`--tier touched` only: the ref to diff HEAD against when selecting "
+                        "touched modules (default: origin/main)")
     p.add_argument("--no-cache", action="store_true",
                    help="ignore any cached verdict for this tree and tier, and refresh it")
     p.add_argument("--ci-python", default=None,
@@ -741,13 +902,18 @@ def main(argv=None) -> int:
 
     head, th = head_label(), tree_hash()
     ci_python, ci_source = resolve_ci_python(a.ci_python)
+    base_ref = a.base or "origin/main"
     # Every interpreter THIS tier will run, in the key and on the line. The cheap tier never
     # touches the CI interpreter, so including it there would miss a cache hit for a question
     # that interpreter had no part in answering.
     interpreters = [("python", a.python)]
     if a.tier == "full":
         interpreters.append(("ci-python", ci_python))
-    key = cache_key(th, a.tier, interpreters, bool(a.counts_baseline))
+    # `touched`'s selection depends on `base_ref` too (a diff against a different ref can pick
+    # different files on an unchanged tree), so it rides the cache key -- folded into the tier
+    # string rather than a new cache_key parameter, since it is the only tier this applies to.
+    cache_tier = f"{a.tier}:{base_ref}" if a.tier == "touched" else a.tier
+    key = cache_key(th, cache_tier, interpreters, bool(a.counts_baseline))
     who = describe_interpreters(interpreters)
     if not a.no_cache:
         hit = _cache_read(key)
@@ -766,11 +932,22 @@ def main(argv=None) -> int:
 
     lines, codes = [], []
     print(f"  interpreters: {who}")
-    cheap = run_cheap(a.python, scratch, a.verbose)
-    jc = judge([cheap], allowlist, cuda)
-    _report("cheap", [cheap], jc, head)
-    lines.append(_line("cheap", [cheap], jc, head))
-    codes.append(jc["code"])
+
+    if a.tier == "touched":
+        # A standalone tier -- not layered on `cheap` (which the six ALWAYS ratchets already
+        # partly overlap via `test_v017_phase2.py`); it is a lane's OWN gate, run instead of
+        # (or beside) `cheap`, never a replacement for the orchestrator's landing `full`.
+        touched = run_touched(a.python, base_ref, scratch, a.verbose)
+        jt = judge([touched], allowlist, cuda)
+        _report("touched", [touched], jt, head)
+        lines.append(_line("touched", [touched], jt, head))
+        codes.append(jt["code"])
+    else:
+        cheap = run_cheap(a.python, scratch, a.verbose)
+        jc = judge([cheap], allowlist, cuda)
+        _report("cheap", [cheap], jc, head)
+        lines.append(_line("cheap", [cheap], jc, head))
+        codes.append(jc["code"])
 
     if a.tier == "full":
         if jc["code"] == 1 and not a.keep_going:

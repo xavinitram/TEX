@@ -274,7 +274,15 @@ _OVER_HARD_BASELINE = frozenset({
 # to 1651, so its floor goes 1887 -> 1810 — a 159-line margin, wider than NEG-6's 72: a
 # floor sitting exactly AT the wall is the situation ENG-14 was created to prevent, so this
 # cut buys more warning than the last one rather than the same amount again.
-_HEADROOM_FLOOR = {"tex_engine.py": 1400, "tex_results.py": 1810}
+# SPLIT-E (v0.46) moved tex_engine.py's floor down for the third time: this file sat at
+# 1393/1400 — 7 lines of room, the closest either module's floor has come to its wall — with
+# no split of its own spent (NEG-2's own ~85-line margin had long since been eaten by later
+# perf/cancel/pacing lanes). The STR-2 tier-selection-and-execution domain (`select_tier`,
+# the four `_run_*` strategies, `_interp_fallback`, `_record_codegen_defect_fallback`,
+# `_run_tier`) moved to `tex_engine_tiers.py`, taking the file to 1144, so its floor goes
+# 1400 -> 1300 — a 156-line margin, the widest of any cut in this register yet, precisely
+# because 7 lines of room is the ENG-14 situation recurring for real this time.
+_HEADROOM_FLOOR = {"tex_engine.py": 1300, "tex_results.py": 1810}
 
 
 def _product_packages(root) -> list:

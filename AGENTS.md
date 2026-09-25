@@ -174,15 +174,20 @@ red test; the known-over baseline below is grandfathered pending its planned spl
 **A module may also carry a `_HEADROOM_FLOOR` (ENG-14).** `tex_engine.py` reached *exactly*
 2000/2000 and was not grandfathered, so the next line of the next feature would have reddened
 the ratchet — a budget that only speaks at the wall gives no warning and no time. The floor is
-a per-module ceiling *below* the hard line (`tex_engine.py`: 1400) that reds early, while a
+a per-module ceiling *below* the hard line (`tex_engine.py`: 1300) that reds early, while a
 split is still cheap to plan. **It moves down when a split lands, never up**: raising a floor to
 fit the change that tripped it converts the gate into decoration, which is exactly what the
 grandfathered baseline above already cost us. If a planned feature does not fit under the floor,
-the answer is the next domain split, not a bigger number. The floor has now moved twice:
-2000 → 1700 (ENG-14, `tex_buffers` + `tex_tiling`) and 1700 → 1400 (NEG-2, `tex_chain` — the
+the answer is the next domain split, not a bigger number. The floor has now moved three times:
+2000 → 1700 (ENG-14, `tex_buffers` + `tex_tiling`), 1700 → 1400 (NEG-2, `tex_chain` — the
 CACHE-6 stage-list cook and CACHE-1's lineage keys, the cut ENG-14's design note had already
-named). `tex_results.py` carries the register's second floor and **has now taken its own
-pre-specified cut**: the CACHE-1 key-minting leaf moved out to `tex_results_keys.py` (NEG-6),
+named), and 1400 → **1300** (SPLIT-E, v0.46 — `tex_engine_tiers.py`: the STR-2 tier-selection-
+and-execution domain, `select_tier` plus the four `_run_*` strategies, the shared
+`_interp_fallback` recovery path and the `_run_tier` dispatcher). SPLIT-E landed with the file
+at 1393/1400 — 7 lines of room and no split of its own queued — so the cut buys a 156-line
+margin instead of re-picking a thin one. `tex_results.py` carries the register's second floor
+and **has now taken its own pre-specified cut**: the CACHE-1 key-minting leaf moved out to
+`tex_results_keys.py` (NEG-6),
 proved bytecode-identical by NEG-2's own technique, and the floor moved 1958 → 1887. `tex_results.py`
 then sat AT that floor, so it took a second pre-specified cut (SPLIT-R, v0.44): the CACHE-8
 residency ladder (`set_vram_budget`/`_enforce_residency`/`_queue_demotions`/`_drain_demotes`/

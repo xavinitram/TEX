@@ -93,3 +93,19 @@ def test_trk189_results_mixins_ride_every_watchlist_results_is_on(r: SubTestResu
         _check_family(r, "tex_results.py", pkg_dir, "SPLIT-R")
     except Exception as e:
         r.fail("TRK-189 results mixins", f"{type(e).__name__}: {e}")
+
+
+def test_trk189_engine_mixins_ride_every_watchlist_engine_is_on(r: SubTestResult):
+    print("\n--- TRK-189: tex_engine_*.py siblings ride every watch-list tex_engine.py "
+          "is on ---")
+    # SPLIT-E (v0.46) gave `tex_engine.py` its first `tex_engine_*.py` sibling
+    # (`tex_engine_tiers.py`). Neither is on any cache-invalidation watch-list today (they
+    # are the host-agnostic cook engine, not the AST/codegen/verdict pipeline), so this is
+    # currently a regression guard exactly like the `tex_results.py` row above: the day
+    # `tex_engine.py` (or a future `tex_engine_*.py` sibling) joins one, this is what reds
+    # if the siblings don't all join it too.
+    try:
+        pkg_dir = os.path.dirname(os.path.abspath(C.__file__))
+        _check_family(r, "tex_engine.py", pkg_dir, "SPLIT-E")
+    except Exception as e:
+        r.fail("TRK-189 engine mixins", f"{type(e).__name__}: {e}")

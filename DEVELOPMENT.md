@@ -674,13 +674,13 @@ compiled tier is promoted starting its 4th call (`tex_runtime/noise.py:423-425`)
 (`free_tensor_caches`, `tex_memory.py:1408-1412`). An isolated, per-tenant session is phase 2 and unbuilt today
 (`tex_session.py:18-21`).
 
-A host reads a cook back through `CookResult` (`tex_engine.py:300-328`, Tier 1 below): `cooked_roi`,
+A host reads a cook back through `CookResult` (`tex_engine.py:343-371`, Tier 1 below): `cooked_roi`,
 `lineage` under `prepare(want_lineage=True)`, and `out_meta` always ride along; the rest are opt-in,
 and everything below is a pointer, one sentence each, to what exists on this tree today:
 
 - `CookResult.noise_tiers`, filled by `prepare`/`cook(want_noise_tiers=True)`, names which tier
   served each tiered noise builtin so a host can decline to composite frames cooked across a
-  promotion (`tex_engine.py:328`, `:1189-1191`) — Tier 1, the same row as `CookResult` itself.
+  promotion (`tex_engine.py:371`, `:1189-1191`) — Tier 1, the same row as `CookResult` itself.
   `tier_trace.noise_tiers_compatible(a, b)` (ENG-16, arrived after v0.38.0) is that compositing
   decision as one callable — `True` only when both records are dicts and equal (including both
   `{}`), `False` for `None` on either side, a disagreeing or asymmetric label set, or an
