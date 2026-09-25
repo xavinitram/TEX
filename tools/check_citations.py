@@ -140,7 +140,9 @@ import sys
 # stale pointers, not merely shifted ones: `_frame_ops` moved to line 857 well before this
 # round. Re-pointed at the real lines (`tex_roi.py:931`, `tex_roi.py:916`) and the sentences
 # already named their symbols, so both anchored.
-WARNING_BUDGET = 20
+# 20 → 19 (v0.45.1): the v0.45 tier-table and SECURITY.md edits anchored one more citation to
+# its symbol, so the tree reads 19. The budget follows the count down, never up.
+WARNING_BUDGET = 19
 
 # ── The document set (see "THE DOCUMENT SET" above). ──
 DOC_DIR_GLOB = "docs"
