@@ -5,6 +5,61 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.45.2] - 2026-09-25 — "Cancel means stop"
+
+A correctness patch under the patch-only regime. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no
+compat freeze is owed. **No pixel changes on any default path** — every existing cook, with or
+without a cancel token, produces the exact same output as before; the new behaviour is opt-in.
+
+### Fixed
+
+- **On CUDA, a cancel token could no longer stop a GPU-heavy cook.** Host-side polling ran ahead
+  of the device: work kept being queued while the token was checked, so a cook could accept
+  cancellation and still make the GPU drain for seconds before the process actually stopped
+  doing anything. The cause was the removal of incidental device syncs across `v0.41`–`v0.44`,
+  which had been pacing the host to the GPU as an accident of an older design, not a documented
+  guarantee.
+
+### Added
+
+- **Opt-in paced cancellation.** A cancel token that carries a truthy `pace` attribute now keeps
+  the host at most one poll-interval ahead of the device at every existing cancel-poll point, and
+  trips promptly even while the device is still catching up. Measured on a GPU-heavy repro: 0 of
+  5 trials cancelled before this fix, 5 of 5 after, landing within about 11 ms of the poll that
+  caught it. A token without `pace`, and `cancel=None`, are byte-identical to before this
+  release — pacing never engages unless a host asks for it.
+- **`CookResult.done`**, a `torch.cuda.Event` recorded after the cook's last GPU launch, `None`
+  off CUDA. Purely additive: nothing on the default path reads it, so no existing cook pays any
+  cost beyond one event object per CUDA cook. A host can use it to gate admission of the next
+  cook on real GPU completion, rather than on enqueue returning.
+
+### Why opt-in, not default
+
+Pacing removes the CPU/GPU overlap that lets the host queue ahead of the device — that overlap is
+also where a normal cook's speed comes from. Measured on a cheap, uncancelled tick: about
+**+0.24 ms (19%)** with pacing on versus off. Given every ComfyUI cook and every one of the
+embedding host's own cooks already carries a real cancel token today, defaulting pacing on
+whenever a token is present would mean paying that cost on every cook, always — not a bound worth
+forcing on a host that did not ask for it.
+
+### For anyone vendoring this tree
+
+No newly reserved names; `LANGUAGE_VERSION` unmoved at `"0.25"`; no default moves; no new shipping
+module filenames outside `tex_runtime/pacing.py` (new, internal — not a public entry point; nothing
+imports it directly except `interpreter.py`/`compiled.py`/`stdlib_core.py`, all already-public
+surfaces). **The embedding-host seam-freeze test moved additively only**: it gains one new frozen
+row, `tex_engine:CookResult` (a `@dataclass`, now including the new `done` field, pinned as of
+this release — it was not pinned before). Every previously-pinned name, signature and field list
+is unchanged; nothing already frozen moved. Same answer for `v0.46.0`, still HELD: nothing
+currently pencilled for it moves anything the freeze test pins, either — the freeze's only
+movement across both releases is this one additive row. **Cache cold-start**: this release edits
+`tex_runtime/interpreter.py` and `tex_runtime/stdlib_core.py` (both `_CODEGEN_FILES` members) and
+`tex_runtime/compiled.py` (a `_VERDICT_FILES` member), so the codegen and tier-verdict caches move
+once; `.pkl` stays warm (no `_AST_FILES` member is touched). `tex_runtime/pacing.py` itself is a
+new file and is not yet listed on any of the three watch-lists — filed as an open finding, not
+fixed in this release, since every current caller into it is itself a listed file whose own edit
+already moves the right epoch.
+
 ## [0.45.1] - 2026-09-25 — "Blocked, not broken"
 
 A correctness patch to `v0.44.0`'s own fallback. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no
