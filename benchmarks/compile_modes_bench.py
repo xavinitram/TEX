@@ -100,7 +100,7 @@ SHAPES = ("host_tick_exact", "playback_frames")
 MODES = ("none", "auto")
 # COMPILE-M3: the hypothesis under test is that compiling a FUSED region (one Inductor
 # program spanning the old node boundaries) wins where M2/M2b already showed per-node
-# compiles losing on every trial (docs/worklog/COMPILE-M2/handback.md). "torch_compile" is
+# compiles losing on every trial (measured on the sm_75 reference box). "torch_compile" is
 # the forced compiled tier (skips autotier's measure/trial loop and always compiles) — the
 # lever the brief asks to pick alongside "auto" so a fused program's compile cost and
 # adoption are visible even when the measured trial would reject it. Scoped to
