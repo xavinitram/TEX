@@ -45,9 +45,17 @@ import sys as _sys
 # `tex_engine_tiers.py`, re-exported from `tex_engine.py` at module scope (same posture as
 # ENG-14/NEG-2's own re-exported leaves) — so importing `tex_engine` now also imports this
 # one new module. 48 -> 49, +1 for this one new module, nothing else moved.
+# OBSERVER-46 (v0.46): the cook-observer seam (`tex_runtime/cook_observer.py`) is imported
+# eagerly at `tex_engine.py` module scope, the same posture PROF-1's `profile` and PACE-45's
+# `pacing` already have — a top-level import plus a cheap `if _callbacks:` runtime check is
+# this codebase's established zero-cost-when-disabled shape, not a deviation from it. It is
+# a pure leaf (stdlib-only: `threading`, `warnings`, `typing`), so it adds no torch and no
+# transitive TEX module, and `tex_chain.py`/`tex_checkpoint.py` import the SAME module object
+# (sys.modules-cached, no second entry). 49 -> 50, +1 for this one new module, nothing else
+# moved.
 _BARE_TOUCH_TEX_MODULES_MAX = 1
 _BARE_TOUCH_TORCH_MODULES = 0
-_TEX_ENGINE_TEX_MODULES_MAX = 49
+_TEX_ENGINE_TEX_MODULES_MAX = 50
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:

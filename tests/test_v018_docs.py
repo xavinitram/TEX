@@ -269,6 +269,10 @@ _NOT_A_CACHE = {
                            "Holds no cooked value, is never evicted, and is bounded by "
                            "hardware devices, not by any program, binding or fingerprint.",
     # ── Registries and ledgers: they hold keys or references, never a computed value. ──
+    "cook_observer._callbacks": "OBSERVER-46's registered-callback list -- a handle -> "
+                                "callback registry with no cook-derived key and no eviction, "
+                                "the same relationship a listener list has to the event it "
+                                "reports, not a cache of anything",
     "tex_memory._armed_caches": "CACHE-5 governor's registry OF caches (saved profile knobs "
                                 "per armed cache), so that it is not itself one",
     "tex_provider._versions": "DATA-5 per-source generation counters -- the INVALIDATION "

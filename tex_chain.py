@@ -38,6 +38,9 @@ from .tex_cache import get_cache
 from .tex_compiler.diagnostics import raw_compile_errors, compile_error_from
 from .tex_runtime.interpreter import Interpreter
 from .tex_runtime.interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
+# OBSERVER-46: the supported cook-observer seam. A leaf itself (stdlib only), so importing
+# it here does not cost this module its own leaf status (see the module docstring above).
+from .tex_runtime import cook_observer as _cook_observer
 from .tex_marshalling import (
     convert_param_value as _convert_param_value,
     infer_binding_type as _infer_binding_type,
@@ -163,56 +166,66 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
     param default-inject + widget-value conversion so a SUB-chain (a CACHE-6 prefix or suffix)
     cooks BIT-IDENTICALLY to those same stages inside the full fused program — the equivalence
     the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does."""
-    # P0-H: the stage-list family is a public engine entry point that never learned about
-    # promises — a Promise in a stage's bindings produced a raw TypeError out of the
-    # marshalling seam whether or not it had landed. Resolving here (and refusing an unlanded
-    # one as E7007) makes every stage-list caller behave like `prepare()`, which is the whole
-    # point of the family: a sub-chain must cook identically to those stages inside the full
-    # program. Guarded: the rebuild allocates a list plus a dict per stage, and
-    # `cook_fused_cached` calls this up to three times per cook on the CACHE-6 hot path, so
-    # a no-promise chain (every chain today) must not pay for the feature — the scan is one
-    # class check per binding against ~15-25 us of copying on a 50-stage chain.
-    if any(v.__class__ is _Promise
-           for st in stages for v in (st.get("bindings") or {}).values()):
-        stages = [dict(st, bindings=_resolve_promise_bindings(st.get("bindings") or {}))
-                  for st in stages]
-    # DATA-6: the same expansion the single-program path does at prepare(), for the same
-    # reason cook_stage_list resolves promises — a sub-chain must cook identically to those
-    # stages inside the full fused program. Guarded on the same shape, so a plane-free chain
-    # (every chain today) pays one class check per binding and copies nothing.
-    if any(v.__class__ is _PlanesValue
-           for st in stages for v in (st.get("bindings") or {}).values()):
-        stages = [dict(st, bindings=_expand_plane_bindings(st.get("bindings") or {},
-                                                           st.get("code") or ""))
-                  for st in stages]
-    if len(stages) == 1:
-        st = stages[0]
-        bindings = dict(st.get("bindings") or {})
-        binding_types = {n: _infer_binding_type(v) for n, v in bindings.items()}
-        program, type_map, referenced, assigned, param_info, used_builtins = \
-            _compile_or_raise(st["code"], binding_types)
-    else:
-        from .tex_fusion import compile_fused
-        program, type_map, referenced, assigned, param_info, used_builtins, bindings = \
-            compile_fused(stages, _infer_binding_type)
-    # prepare()'s shared param handling: inject code-defined defaults for referenced-but-unbound
-    # params, then convert widget values (hex colour → RGB, comma vec → floats). Identical order
-    # to the full cook so the merged bindings — and thus the pixels — match.
-    for ref_name in referenced:
-        if ref_name not in assigned and ref_name not in bindings and ref_name in param_info:
-            dv = param_info[ref_name].get("default_value")
-            if dv is not None:
-                bindings[ref_name] = dv
-    for pname, pinfo in param_info.items():
-        if pname in bindings:
-            bindings[pname] = _convert_param_value(bindings[pname], pinfo, pname)
-    interp = _get_interpreter()
-    return interp.execute(program, bindings, type_map, device=device,
-                          latent_channel_count=latent_channel_count,
-                          output_names=sorted(assigned.keys()), used_builtins=used_builtins,
-                          precision=("fp32" if latent_channel_count else precision),
-                          time_context=time_context,
-                          cancel=cancel, on_progress=on_progress)
+    # OBSERVER-46: notify once for THIS entry point; a call nested under `cook_fused_cached`
+    # or `cook_checkpointed` (both call this internally, up to three times per cook) shares
+    # their outer notification instead of adding one — see tex_runtime/cook_observer.py.
+    _obs_active = bool(_cook_observer._callbacks)
+    if _obs_active:
+        _cook_observer.enter("cook_stage_list")
+    try:
+        # P0-H: the stage-list family is a public engine entry point that never learned about
+        # promises — a Promise in a stage's bindings produced a raw TypeError out of the
+        # marshalling seam whether or not it had landed. Resolving here (and refusing an unlanded
+        # one as E7007) makes every stage-list caller behave like `prepare()`, which is the whole
+        # point of the family: a sub-chain must cook identically to those stages inside the full
+        # program. Guarded: the rebuild allocates a list plus a dict per stage, and
+        # `cook_fused_cached` calls this up to three times per cook on the CACHE-6 hot path, so
+        # a no-promise chain (every chain today) must not pay for the feature — the scan is one
+        # class check per binding against ~15-25 us of copying on a 50-stage chain.
+        if any(v.__class__ is _Promise
+               for st in stages for v in (st.get("bindings") or {}).values()):
+            stages = [dict(st, bindings=_resolve_promise_bindings(st.get("bindings") or {}))
+                      for st in stages]
+        # DATA-6: the same expansion the single-program path does at prepare(), for the same
+        # reason cook_stage_list resolves promises — a sub-chain must cook identically to those
+        # stages inside the full fused program. Guarded on the same shape, so a plane-free chain
+        # (every chain today) pays one class check per binding and copies nothing.
+        if any(v.__class__ is _PlanesValue
+               for st in stages for v in (st.get("bindings") or {}).values()):
+            stages = [dict(st, bindings=_expand_plane_bindings(st.get("bindings") or {},
+                                                               st.get("code") or ""))
+                      for st in stages]
+        if len(stages) == 1:
+            st = stages[0]
+            bindings = dict(st.get("bindings") or {})
+            binding_types = {n: _infer_binding_type(v) for n, v in bindings.items()}
+            program, type_map, referenced, assigned, param_info, used_builtins = \
+                _compile_or_raise(st["code"], binding_types)
+        else:
+            from .tex_fusion import compile_fused
+            program, type_map, referenced, assigned, param_info, used_builtins, bindings = \
+                compile_fused(stages, _infer_binding_type)
+        # prepare()'s shared param handling: inject code-defined defaults for referenced-but-unbound
+        # params, then convert widget values (hex colour → RGB, comma vec → floats). Identical order
+        # to the full cook so the merged bindings — and thus the pixels — match.
+        for ref_name in referenced:
+            if ref_name not in assigned and ref_name not in bindings and ref_name in param_info:
+                dv = param_info[ref_name].get("default_value")
+                if dv is not None:
+                    bindings[ref_name] = dv
+        for pname, pinfo in param_info.items():
+            if pname in bindings:
+                bindings[pname] = _convert_param_value(bindings[pname], pinfo, pname)
+        interp = _get_interpreter()
+        return interp.execute(program, bindings, type_map, device=device,
+                              latent_channel_count=latent_channel_count,
+                              output_names=sorted(assigned.keys()), used_builtins=used_builtins,
+                              precision=("fp32" if latent_channel_count else precision),
+                              time_context=time_context,
+                              cancel=cancel, on_progress=on_progress)
+    finally:
+        if _obs_active:
+            _cook_observer.leave()
 
 
 def _is_tensor_binding(v) -> bool:
@@ -282,90 +295,101 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
     Defaulting HERE rather than at each call site is what closes it for `cook_fused_cached` and
     the CACHE-7 multi-tap path at once — the hole was in this function's contract, not in a
     caller's diligence. An explicit `canvas=` still wins, for a caller that knows better."""
-    from . import tex_results
-    from .tex_fusion import prefix_fingerprint
-    fp = prefix_fingerprint(stages, k, _infer_binding_type)
-    # LINT-46 (MEASURE-44's isinstance sweep): `_is_tensor_binding(v)` was asked TWICE per
-    # `stages[:k]` binding on the `canvas is None` path below — once here (the params/tensor
-    # split) and again inside `_shapes` (the canvas enumeration), both walking the exact same
-    # bindings within this SAME call. id()-keyed memo (the same convention the checker's
-    # type_map already uses): a binding's tensor-or-not answer cannot change within one
-    # `boundary_lineage_key` call, so the second walk reuses the first walk's answer instead of
-    # re-deriving it. `_is_tensor_binding` always returns a bool (never None), so a plain
-    # `dict.get` miss unambiguously means "not computed yet" — no sentinel needed.
-    _tensor_memo: dict = {}
+    # OBSERVER-46: notify once for THIS entry point; a call nested under `cook_fused_cached`
+    # or `cook_checkpointed` (both call this internally, once per cut) shares their outer
+    # notification instead of adding one — see tex_runtime/cook_observer.py. `leave()` is
+    # unconditional in `finally` so the un-keyable-Promise ValueError below still balances it.
+    _obs_active = bool(_cook_observer._callbacks)
+    if _obs_active:
+        _cook_observer.enter("boundary_lineage_key")
+    try:
+        from . import tex_results
+        from .tex_fusion import prefix_fingerprint
+        fp = prefix_fingerprint(stages, k, _infer_binding_type)
+        # LINT-46 (MEASURE-44's isinstance sweep): `_is_tensor_binding(v)` was asked TWICE per
+        # `stages[:k]` binding on the `canvas is None` path below — once here (the params/tensor
+        # split) and again inside `_shapes` (the canvas enumeration), both walking the exact same
+        # bindings within this SAME call. id()-keyed memo (the same convention the checker's
+        # type_map already uses): a binding's tensor-or-not answer cannot change within one
+        # `boundary_lineage_key` call, so the second walk reuses the first walk's answer instead of
+        # re-deriving it. `_is_tensor_binding` always returns a bool (never None), so a plain
+        # `dict.get` miss unambiguously means "not computed yet" — no sentinel needed.
+        _tensor_memo: dict = {}
 
-    def _is_tensor_memo(v):
-        key = id(v)
-        cached = _tensor_memo.get(key)
-        if cached is None:
-            cached = _tensor_memo[key] = _is_tensor_binding(v)
-        return cached
+        def _is_tensor_memo(v):
+            key = id(v)
+            cached = _tensor_memo.get(key)
+            if cached is None:
+                cached = _tensor_memo[key] = _is_tensor_binding(v)
+            return cached
 
-    # P0-H: a Promise is a TENSOR binding that has not arrived yet, so it belongs on the
-    # tensor side of this split — not in `params`. It landed there because the test asks
-    # "is it a Tensor?", and `_canon_params` folds unknown objects via `repr`, which for a
-    # `__slots__` object is its ADDRESS. That made checkpoint identity address-keyed: two
-    # equivalent promises minted different keys (spurious misses, verified), and CPython
-    # address reuse could alias two genuinely different ones onto the same key.
-    #
-    # THE HALF v0.34.1's FIRST DRAFT FORGOT, and it was worse than the defect it replaced:
-    # removing Promise from `params` without adding it to the tensor side made a promise-fed
-    # prefix invisible to BOTH halves. `_shapes()` skipped it, so the canvas enumeration came
-    # back empty, fell through to the `chain_in` branch, came back empty again — and every
-    # resolution minted the SAME key. Address-keying was merely wasteful (different keys,
-    # spurious misses, safe); one key for two resolutions is a wrong-size boundary served on a
-    # cache HIT, which is the exact failure the P0-3 comment below says it closed.
-    params = {f"s{i}:{n}": v
-              for i, st in enumerate(stages[:k])
-              for n, v in (st.get("bindings") or {}).items()
-              if not _is_tensor_memo(v)}
-    if canvas is None:
-        # Every tensor the prefix reads, by stage-qualified name and shape. Derivable BEFORE
-        # the cook: a TEX program's output canvas equals its input canvas until LANG-6's
-        # `canvas()` lands, at which point this becomes a derived shape rather than a copied one.
+        # P0-H: a Promise is a TENSOR binding that has not arrived yet, so it belongs on the
+        # tensor side of this split — not in `params`. It landed there because the test asks
+        # "is it a Tensor?", and `_canon_params` folds unknown objects via `repr`, which for a
+        # `__slots__` object is its ADDRESS. That made checkpoint identity address-keyed: two
+        # equivalent promises minted different keys (spurious misses, verified), and CPython
+        # address reuse could alias two genuinely different ones onto the same key.
         #
-        # A Promise contributes its DECLARED shape — declared up front for exactly this reason
-        # (identity computable before the pixels land). Per-binding device is deliberately not
-        # emitted here, for promises or tensors: `device` is already a mandatory top-level
-        # lineage_key component, so repeating it per binding would change the key shape for
-        # every existing caller to say something the key already says.
-        def _shapes(sts, off=0):
-            out = []
-            for i, st in enumerate(sts):
-                for n, v in sorted((st.get("bindings") or {}).items()):
-                    if not _is_tensor_memo(v):
-                        continue
-                    shape = _binding_shape(v)
-                    if shape is None:
-                        raise ValueError(
-                            f"boundary_lineage_key cannot key stage {i + off} binding '{n}': "
-                            f"it is an unlanded Promise that declared no shape, and the "
-                            f"boundary's RESOLUTION is part of its identity. Declare "
-                            f"`shape=` on the promise, or pass `canvas=` explicitly.")
-                    out.append([f"s{i + off}:{n}", *shape])
-            return out
-
-        canvas = {"in": _shapes(stages[:k])}
-        if not canvas["in"]:
-            # P0-3: a GENERATOR-HEAD prefix reads no tensors, so the enumeration above is empty
-            # and every resolution mints the SAME key — a 64² and a 128² cook of the same chain
-            # collide and the wrong-size boundary is served (reproduced end-to-end as an
-            # `InterpreterError` size mismatch; with a `sample()` suffix it would be silent
-            # wrong pixels instead of a raise).
+        # THE HALF v0.34.1's FIRST DRAFT FORGOT, and it was worse than the defect it replaced:
+        # removing Promise from `params` without adding it to the tensor side made a promise-fed
+        # prefix invisible to BOTH halves. `_shapes()` skipped it, so the canvas enumeration came
+        # back empty, fell through to the `chain_in` branch, came back empty again — and every
+        # resolution minted the SAME key. Address-keying was merely wasteful (different keys,
+        # spurious misses, safe); one key for two resolutions is a wrong-size boundary served on a
+        # cache HIT, which is the exact failure the P0-3 comment below says it closed.
+        params = {f"s{i}:{n}": v
+                  for i, st in enumerate(stages[:k])
+                  for n, v in (st.get("bindings") or {}).items()
+                  if not _is_tensor_memo(v)}
+        if canvas is None:
+            # Every tensor the prefix reads, by stage-qualified name and shape. Derivable BEFORE
+            # the cook: a TEX program's output canvas equals its input canvas until LANG-6's
+            # `canvas()` lands, at which point this becomes a derived shape rather than a copied one.
             #
-            # The boundary's resolution is the FUSED PROGRAM's grid, and that is set by whatever
-            # spatial binding exists anywhere in the chain — not only in the prefix. So when the
-            # prefix carries none, key on the whole chain's input shapes. A chain with no tensor
-            # bindings at all cooks scalar-mode, where there is genuinely one resolution and
-            # nothing to collide.
-            canvas = {"chain_in": _shapes(stages)}
-    flags = [f"tap:s{k - 1}"]
-    if latent_channel_count:
-        flags.append(f"ic:{int(latent_channel_count)}")
-    return tex_results.lineage_key(program_fp=fp, device=str(device), precision=precision,
-                                   params=params, upstream=tuple(upstream), time_context=time_context,
-                                   canvas=canvas, flags=flags)
+            # A Promise contributes its DECLARED shape — declared up front for exactly this reason
+            # (identity computable before the pixels land). Per-binding device is deliberately not
+            # emitted here, for promises or tensors: `device` is already a mandatory top-level
+            # lineage_key component, so repeating it per binding would change the key shape for
+            # every existing caller to say something the key already says.
+            def _shapes(sts, off=0):
+                out = []
+                for i, st in enumerate(sts):
+                    for n, v in sorted((st.get("bindings") or {}).items()):
+                        if not _is_tensor_memo(v):
+                            continue
+                        shape = _binding_shape(v)
+                        if shape is None:
+                            raise ValueError(
+                                f"boundary_lineage_key cannot key stage {i + off} binding '{n}': "
+                                f"it is an unlanded Promise that declared no shape, and the "
+                                f"boundary's RESOLUTION is part of its identity. Declare "
+                                f"`shape=` on the promise, or pass `canvas=` explicitly.")
+                        out.append([f"s{i + off}:{n}", *shape])
+                return out
+
+            canvas = {"in": _shapes(stages[:k])}
+            if not canvas["in"]:
+                # P0-3: a GENERATOR-HEAD prefix reads no tensors, so the enumeration above is empty
+                # and every resolution mints the SAME key — a 64² and a 128² cook of the same chain
+                # collide and the wrong-size boundary is served (reproduced end-to-end as an
+                # `InterpreterError` size mismatch; with a `sample()` suffix it would be silent
+                # wrong pixels instead of a raise).
+                #
+                # The boundary's resolution is the FUSED PROGRAM's grid, and that is set by whatever
+                # spatial binding exists anywhere in the chain — not only in the prefix. So when the
+                # prefix carries none, key on the whole chain's input shapes. A chain with no tensor
+                # bindings at all cooks scalar-mode, where there is genuinely one resolution and
+                # nothing to collide.
+                canvas = {"chain_in": _shapes(stages)}
+        flags = [f"tap:s{k - 1}"]
+        if latent_channel_count:
+            flags.append(f"ic:{int(latent_channel_count)}")
+        return tex_results.lineage_key(program_fp=fp, device=str(device), precision=precision,
+                                       params=params, upstream=tuple(upstream), time_context=time_context,
+                                       canvas=canvas, flags=flags)
+    finally:
+        if _obs_active:
+            _cook_observer.leave()
 
 
 def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32",
@@ -382,66 +406,76 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     the exact handoff), a LATENT, a DAG chain, a cut-point out of range, no cache, or NO `upstream`
     source key (without a content-sensitive source identity a cached boundary could be served for a
     different image — the safe default is a correct-but-not-incremental full cook)."""
-    from .tex_fusion import is_linear_stage_list, suffix_stage_list, FusionError
-
-    def _full():
-        return cook_stage_list(stages, device=device, precision=precision,
-                               latent_channel_count=latent_channel_count,
-                               time_context=time_context, cancel=cancel, on_progress=on_progress)
-
-    # `upstream` must key EVERY tensor input of the prefix — the source, and any EXTRA image a
-    # prefix stage reads — not just be non-empty (a partial cover could stale-serve when only an
-    # unkeyed prefix tensor changes; the count also subsumes the no-upstream `()` default, since a
-    # chain's prefix always has ≥1 source tensor → 0<1). The range check `not (1 <= k < len)` is
-    # ordered BEFORE the tensor-count term so an out-of-range (or non-int) `k` short-circuits to a
-    # full cook without ever slicing `stages[:k]`.
-    if (precision != "fp32" or latent_channel_count or result_cache is None
-            or not is_linear_stage_list(stages) or not (1 <= k < len(stages))
-            # P0-H: count PROMISED tensors too. A promise is a tensor input whose pixels have
-            # not arrived, so an uncovered one is exactly the partial cover this term exists to
-            # refuse — and skipping it let a promise-fed prefix through the gate with zero
-            # upstream keys naming it.
-            or len(upstream) < sum(1 for st in stages[:k]
-                                   for v in (st.get("bindings") or {}).values()
-                                   if _is_tensor_binding(v))
-            # ...and an unlanded promise with no declared shape cannot be keyed at all
-            # (`_binding_shape` -> None). Refuse to a full cook rather than let
-            # `boundary_lineage_key` raise out of a serve path whose contract is to fall back.
-            # `isinstance` first: `_binding_shape` returns `tuple(v.shape)` for any real
-            # tensor and can only be None for a promise, so without the guard this walks
-            # every prefix binding allocating a torch.Size->tuple purely to compare it to
-            # None — on the cache-HIT path whose whole point is to skip a prefix cook.
-            or any(isinstance(v, _Promise) and _binding_shape(v) is None
-                   for st in stages[:k]
-                   for v in (st.get("bindings") or {}).values())):
-        return _full()
-    # P0-5: a tap on a stage strictly below `k-1` is inside the served prefix and the suffix
-    # cook never produces it. Serving anyway drops a requested output and shifts the host's
-    # output slots — cook whole instead.
-    from .tex_fusion import remap_suffix_taps, unservable_prefix_taps
-    if unservable_prefix_taps(stages, k):
-        return _full()
-    key = boundary_lineage_key(stages, k, device, "fp32", time_context=time_context,
-                               latent_channel_count=latent_channel_count, upstream=upstream)
-    boundary = result_cache.get(key)
-    if boundary is None:
-        b = cook_stage_list(stages[:k], device=device, precision="fp32",
-                            time_context=time_context, cancel=cancel).get("OUT")
-        if b is None:            # a chain always assigns @OUT; if not, cook whole (correct)
-            return _full()
-        result_cache.put(key, b, canvas={"shape": list(b.shape)})
-        boundary = b     # the freshly-cooked, locally-owned prefix output — put stored its own
-        #                  frozen copy, so `b` is unaliased; feed it straight in (no re-get clone)
+    # OBSERVER-46: notify once for THIS entry point; every internal call below — `_full()`'s
+    # and the hit/miss paths' `cook_stage_list`, and `boundary_lineage_key` — shares this one
+    # notification rather than adding its own (see tex_runtime/cook_observer.py).
+    _obs_active = bool(_cook_observer._callbacks)
+    if _obs_active:
+        _cook_observer.enter("cook_fused_cached")
     try:
-        suffix = suffix_stage_list(stages, k, boundary)
-    except FusionError:          # a malformed cut (head stage lacks a chain_input to rebind) — the
-        return _full()           #   documented whole-chain fallback, not a crash after the put
-    # P0-5: the suffix renumbers stages, so `compile_fused` names its taps `_tap_s{j}` where the
-    # original was `k+j`. Remap at the serve seam — on BOTH the miss and the hit path, which is
-    # this single return.
-    out = remap_suffix_taps(
-        cook_stage_list(suffix, device=device, precision="fp32", time_context=time_context,
-                        cancel=cancel, on_progress=on_progress), k)
-    if stages[k - 1].get("tap"):
-        out.setdefault(f"_tap_s{k - 1}", boundary)   # the boundary IS that stage's output
-    return out
+        from .tex_fusion import is_linear_stage_list, suffix_stage_list, FusionError
+
+        def _full():
+            return cook_stage_list(stages, device=device, precision=precision,
+                                   latent_channel_count=latent_channel_count,
+                                   time_context=time_context, cancel=cancel, on_progress=on_progress)
+
+        # `upstream` must key EVERY tensor input of the prefix — the source, and any EXTRA image a
+        # prefix stage reads — not just be non-empty (a partial cover could stale-serve when only an
+        # unkeyed prefix tensor changes; the count also subsumes the no-upstream `()` default, since a
+        # chain's prefix always has ≥1 source tensor → 0<1). The range check `not (1 <= k < len)` is
+        # ordered BEFORE the tensor-count term so an out-of-range (or non-int) `k` short-circuits to a
+        # full cook without ever slicing `stages[:k]`.
+        if (precision != "fp32" or latent_channel_count or result_cache is None
+                or not is_linear_stage_list(stages) or not (1 <= k < len(stages))
+                # P0-H: count PROMISED tensors too. A promise is a tensor input whose pixels have
+                # not arrived, so an uncovered one is exactly the partial cover this term exists to
+                # refuse — and skipping it let a promise-fed prefix through the gate with zero
+                # upstream keys naming it.
+                or len(upstream) < sum(1 for st in stages[:k]
+                                       for v in (st.get("bindings") or {}).values()
+                                       if _is_tensor_binding(v))
+                # ...and an unlanded promise with no declared shape cannot be keyed at all
+                # (`_binding_shape` -> None). Refuse to a full cook rather than let
+                # `boundary_lineage_key` raise out of a serve path whose contract is to fall back.
+                # `isinstance` first: `_binding_shape` returns `tuple(v.shape)` for any real
+                # tensor and can only be None for a promise, so without the guard this walks
+                # every prefix binding allocating a torch.Size->tuple purely to compare it to
+                # None — on the cache-HIT path whose whole point is to skip a prefix cook.
+                or any(isinstance(v, _Promise) and _binding_shape(v) is None
+                       for st in stages[:k]
+                       for v in (st.get("bindings") or {}).values())):
+            return _full()
+        # P0-5: a tap on a stage strictly below `k-1` is inside the served prefix and the suffix
+        # cook never produces it. Serving anyway drops a requested output and shifts the host's
+        # output slots — cook whole instead.
+        from .tex_fusion import remap_suffix_taps, unservable_prefix_taps
+        if unservable_prefix_taps(stages, k):
+            return _full()
+        key = boundary_lineage_key(stages, k, device, "fp32", time_context=time_context,
+                                   latent_channel_count=latent_channel_count, upstream=upstream)
+        boundary = result_cache.get(key)
+        if boundary is None:
+            b = cook_stage_list(stages[:k], device=device, precision="fp32",
+                                time_context=time_context, cancel=cancel).get("OUT")
+            if b is None:            # a chain always assigns @OUT; if not, cook whole (correct)
+                return _full()
+            result_cache.put(key, b, canvas={"shape": list(b.shape)})
+            boundary = b     # the freshly-cooked, locally-owned prefix output — put stored its own
+            #                  frozen copy, so `b` is unaliased; feed it straight in (no re-get clone)
+        try:
+            suffix = suffix_stage_list(stages, k, boundary)
+        except FusionError:          # a malformed cut (head stage lacks a chain_input to rebind) — the
+            return _full()           #   documented whole-chain fallback, not a crash after the put
+        # P0-5: the suffix renumbers stages, so `compile_fused` names its taps `_tap_s{j}` where the
+        # original was `k+j`. Remap at the serve seam — on BOTH the miss and the hit path, which is
+        # this single return.
+        out = remap_suffix_taps(
+            cook_stage_list(suffix, device=device, precision="fp32", time_context=time_context,
+                            cancel=cancel, on_progress=on_progress), k)
+        if stages[k - 1].get("tap"):
+            out.setdefault(f"_tap_s{k - 1}", boundary)   # the boundary IS that stage's output
+        return out
+    finally:
+        if _obs_active:
+            _cook_observer.leave()

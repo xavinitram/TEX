@@ -28,6 +28,11 @@ from __future__ import annotations
 import dataclasses
 import logging
 
+# OBSERVER-46: the supported cook-observer seam (the alternative to a host monkey-patching
+# `cook_checkpointed`/`cook_stage_list`/etc. — see that module's docstring). A leaf itself
+# (stdlib only), so importing it at module load carries no cycle risk.
+from .tex_runtime import cook_observer as _cook_observer
+
 logger = logging.getLogger(__name__)
 
 # The report's default: "threshold a GOV-1 profile knob, default ~100 ms". GOV-1 OWNS it —
@@ -255,58 +260,70 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
     `cuts` may be supplied by a caller that already planned; otherwise placement runs here off
     PROF-1. Returns the interpreter's raw `{output: tensor}`, same as `cook_stage_list`.
     """
-    from . import tex_engine
+    # OBSERVER-46: notify once for THIS entry point; every internal call below — `_full()`'s
+    # and the per-cut `tex_engine.cook_stage_list`/`tex_engine.boundary_lineage_key` calls
+    # (module lookups that reach the SAME underlying functions the observer already wraps at
+    # their own definitions) — shares this one notification rather than adding its own. See
+    # tex_runtime/cook_observer.py.
+    _obs_active = bool(_cook_observer._callbacks)
+    if _obs_active:
+        _cook_observer.enter("cook_checkpointed")
+    try:
+        from . import tex_engine
 
-    def _full():
-        return tex_engine.cook_stage_list(
-            stages, device=device, precision=precision,
-            latent_channel_count=latent_channel_count, time_context=time_context,
-            cancel=cancel, on_progress=on_progress)
+        def _full():
+            return tex_engine.cook_stage_list(
+                stages, device=device, precision=precision,
+                latent_channel_count=latent_channel_count, time_context=time_context,
+                cancel=cancel, on_progress=on_progress)
 
-    cuts = _resolve_cuts(stages, result_cache, cuts,
-                         latent_channel_count=latent_channel_count, upstream=upstream,
-                         precision=precision, threshold_ms=threshold_ms,
-                         profile_key=profile_key, spatial=spatial, device=device)
-    if not cuts:
+        cuts = _resolve_cuts(stages, result_cache, cuts,
+                             latent_channel_count=latent_channel_count, upstream=upstream,
+                             precision=precision, threshold_ms=threshold_ms,
+                             profile_key=profile_key, spatial=spatial, device=device)
+        if not cuts:
+            return _full()
+
+        # P0-8: an EMPTY cache cannot serve any cut, so minting a key per cut and probing the disk
+        # tier for each is pure prologue on the exact cook that has the least to gain — the first
+        # one. `stats()` is O(1) for this question. A cache with RAM entries or an unknown/populated
+        # disk tier still walks the loop; only the provably-empty case short-circuits.
+        if _cache_is_provably_empty(result_cache):
+            return _full()
+
+        from .tex_fusion import (FusionError, remap_suffix_taps, suffix_stage_list,
+                                 unservable_prefix_taps)
+        for k in reversed(cuts):
+            # P0-5: a tap on a stage strictly below `k-1` lives inside the served prefix and is
+            # never cooked by the suffix. Serving the cut anyway DROPS a requested output — which
+            # shifts the host's output slots and breaks this function's "same as `cook_stage_list`"
+            # contract. Refuse the cut instead; a shallower one may still be servable, and the full
+            # cook is always correct.
+            if unservable_prefix_taps(stages, k):
+                continue
+            key = tex_engine.boundary_lineage_key(
+                stages, k, device, precision, upstream=upstream, time_context=time_context,
+                latent_channel_count=latent_channel_count)
+            boundary = result_cache.get(key)
+            if boundary is None:
+                continue
+            try:
+                suffix = suffix_stage_list(stages, k, boundary)
+            except FusionError:
+                continue          # a malformed cut (a headless head stage) — try a shallower one
+            out = remap_suffix_taps(tex_engine.cook_stage_list(
+                suffix, device=device, precision=precision,
+                latent_channel_count=latent_channel_count, time_context=time_context,
+                cancel=cancel, on_progress=on_progress), k)
+            # The boundary IS stage k-1's output, so a tap there is served for free rather than
+            # costing a refusal.
+            if k >= 1 and stages[k - 1].get("tap"):
+                out.setdefault(f"_tap_s{k - 1}", boundary)
+            return out
         return _full()
-
-    # P0-8: an EMPTY cache cannot serve any cut, so minting a key per cut and probing the disk
-    # tier for each is pure prologue on the exact cook that has the least to gain — the first
-    # one. `stats()` is O(1) for this question. A cache with RAM entries or an unknown/populated
-    # disk tier still walks the loop; only the provably-empty case short-circuits.
-    if _cache_is_provably_empty(result_cache):
-        return _full()
-
-    from .tex_fusion import (FusionError, remap_suffix_taps, suffix_stage_list,
-                             unservable_prefix_taps)
-    for k in reversed(cuts):
-        # P0-5: a tap on a stage strictly below `k-1` lives inside the served prefix and is
-        # never cooked by the suffix. Serving the cut anyway DROPS a requested output — which
-        # shifts the host's output slots and breaks this function's "same as `cook_stage_list`"
-        # contract. Refuse the cut instead; a shallower one may still be servable, and the full
-        # cook is always correct.
-        if unservable_prefix_taps(stages, k):
-            continue
-        key = tex_engine.boundary_lineage_key(
-            stages, k, device, precision, upstream=upstream, time_context=time_context,
-            latent_channel_count=latent_channel_count)
-        boundary = result_cache.get(key)
-        if boundary is None:
-            continue
-        try:
-            suffix = suffix_stage_list(stages, k, boundary)
-        except FusionError:
-            continue          # a malformed cut (a headless head stage) — try a shallower one
-        out = remap_suffix_taps(tex_engine.cook_stage_list(
-            suffix, device=device, precision=precision,
-            latent_channel_count=latent_channel_count, time_context=time_context,
-            cancel=cancel, on_progress=on_progress), k)
-        # The boundary IS stage k-1's output, so a tap there is served for free rather than
-        # costing a refusal.
-        if k >= 1 and stages[k - 1].get("tap"):
-            out.setdefault(f"_tap_s{k - 1}", boundary)
-        return out
-    return _full()
+    finally:
+        if _obs_active:
+            _cook_observer.leave()
 
 
 # ── phase 2: the idle harvest ────────────────────────────────────────────────

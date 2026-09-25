@@ -122,6 +122,11 @@ from .tex_runtime.host import (get_host_services, CookCancelled,
 # PROF-1: the cost profiler. Disarmed by default — the default cook path's whole cost is the
 # one `enabled()` call in run(). See tex_runtime/profile.py's invariant-#7 note.
 from .tex_runtime import profile as _profile, pacing as _pace
+# OBSERVER-46: the supported cook-observer seam (the alternative to a host monkey-patching
+# `run`/`cook`/`cook_stage_list`/etc. — see that module's docstring). Disarmed by default —
+# `run()`/`cook()`'s whole added cost, unregistered, is the one `if _cook_observer._callbacks:`
+# check each takes below.
+from .tex_runtime import cook_observer as _cook_observer
 # ENG-4: the shared compile-error taxonomy + translator (lives beside TEXCompileError so the
 # per-phase tuple is spelled once, not once per compile implementation).
 from .tex_compiler.diagnostics import raw_compile_errors, compile_error_from
@@ -1034,97 +1039,109 @@ def run(plan: CookPlan) -> CookResult:
     the debug overlays, enforce the cache budgets. Returns RAW outputs (no host egress
     formatting — that is ENG-3's profile, applied by the caller)."""
     ctx = plan.ctx
-    _cancel_check(ctx.cancel)                         # SCHED-3 yield A: abort a stale cook up front
-    _report_progress(ctx.on_progress, "tier", 0.0)
-    if plan.want_noise_tiers:                         # opt-in; the import stays off the default path
-        from .tex_runtime import tier_trace
-        tier_trace.arm_noise_tiers()
-    # PROF-1: when a host has armed the profiler, bracket the execution with the whole-cook
-    # timer and the per-stage sink — ONE object, so there is a single sampling decision (the
-    # rate limiter advances a counter, and two askers for one cook would double-count it).
-    # Disarmed (the default, and every ComfyUI cook) this is one function call, no timers.
-    if _profile.enabled():
-        _pkey = _profile.make_key(ctx.fused_fp or ctx.fp,
-                                  torch.device(ctx.device).type, ctx.eff_precision)
-        with _profile.measure(_pkey, plan.cook_px, device=ctx.device, stages=True):
-            raw_output = _dispatch_tier(plan)
-    else:
-        raw_output = _dispatch_tier(plan)
-
-    # PR-LP2 safety net (C2): re-cook fp32 (and pin the auto decision) if an
-    # auto->fp16 cook went non-finite. Extracted to a helper (C1-st) so the cook
-    # stays within its per-function line budget and can't silently re-inline.
-    raw_output, eff_precision = _fp16_finiteness_net(raw_output, plan.auto_fp16, ctx,
-                                                     plan.tier_id, plan.auto_ckey)
-
-    # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
-    # oldest mip/grid entries; allocate-and-hold semantics untouched).
-    # P1-M2-CPU: enforce on CPU cooks too — the mip/grid/sampler caches
-    # grow unbounded there otherwise. cache_budget_bytes returns a 512 MB
-    # CPU budget; the eviction is cheap (early-returns when under budget)
-    # and the graph-cache teardown on eviction is a no-op off CUDA.
+    # OBSERVER-46: notify the cook-observer seam once for this entry point — `enter`/`leave`
+    # collapse to the outermost call on this thread (see tex_runtime/cook_observer.py), so a
+    # call arriving here via `cook()` (below) shares that single notification rather than
+    # adding a second one. `_obs_active` is read ONCE so the matching `leave()` fires iff the
+    # `enter()` did, even if a callback un/registers mid-cook.
+    _obs_active = bool(_cook_observer._callbacks)
+    if _obs_active:
+        _cook_observer.enter("run")
     try:
-        from .tex_memory import enforce_cache_budget, trim_reserved_pool
-        enforce_cache_budget(ctx.device)
-        # MEM-2 (B2): the trim only queries the allocator after a resolution
-        # downshift (zero cost on same-size steady state). cook_px rides the plan.
-        trim_reserved_pool(ctx.device, plan.cook_px)
-    except Exception:
-        pass
+        _cancel_check(ctx.cancel)                         # SCHED-3 yield A: abort a stale cook up front
+        _report_progress(ctx.on_progress, "tier", 0.0)
+        if plan.want_noise_tiers:                         # opt-in; the import stays off the default path
+            from .tex_runtime import tier_trace
+            tier_trace.arm_noise_tiers()
+        # PROF-1: when a host has armed the profiler, bracket the execution with the whole-cook
+        # timer and the per-stage sink — ONE object, so there is a single sampling decision (the
+        # rate limiter advances a counter, and two askers for one cook would double-count it).
+        # Disarmed (the default, and every ComfyUI cook) this is one function call, no timers.
+        if _profile.enabled():
+            _pkey = _profile.make_key(ctx.fused_fp or ctx.fp,
+                                      torch.device(ctx.device).type, ctx.eff_precision)
+            with _profile.measure(_pkey, plan.cook_px, device=ctx.device, stages=True):
+                raw_output = _dispatch_tier(plan)
+        else:
+            raw_output = _dispatch_tier(plan)
 
-    # ENG-1/ENG-3: make good on the no-alias guarantee, unless this caller proved it does
-    # not need it (see prepare()'s `disown`).
-    if plan.disown:
-        raw_output = _disown_inputs(raw_output, ctx.bindings)
+        # PR-LP2 safety net (C2): re-cook fp32 (and pin the auto decision) if an
+        # auto->fp16 cook went non-finite. Extracted to a helper (C1-st) so the cook
+        # stays within its per-function line budget and can't silently re-inline.
+        raw_output, eff_precision = _fp16_finiteness_net(raw_output, plan.auto_fp16, ctx,
+                                                         plan.tier_id, plan.auto_ckey)
 
-    # DBG-3 magenta NaN + C4-ux cyan near-singularity. Applied to the RAW outputs, above
-    # every tier, before any host egress formatting — the same order the node applied
-    # them in when it owned the loop.
-    near_sing = None
-    if plan.debug_nan_highlight:
-        from .tex_runtime import guard_trace   # off the default path: only the toggle pays
-        mask = guard_trace.mask()              # hoisted out of the loop (was once/output)
-        raw_output = {name: _nan_highlight(_singularity_highlight(raw, mask))
-                      for name, raw in raw_output.items()}
-        near_sing = guard_trace.count()   # read BEFORE the disarm below
-        guard_trace.disarm()
+        # M-2: cap TEX's tensor-cache residency at a byte budget (evicts
+        # oldest mip/grid entries; allocate-and-hold semantics untouched).
+        # P1-M2-CPU: enforce on CPU cooks too — the mip/grid/sampler caches
+        # grow unbounded there otherwise. cache_budget_bytes returns a 512 MB
+        # CPU budget; the eviction is cheap (early-returns when under budget)
+        # and the graph-cache teardown on eviction is a no-op off CUDA.
+        try:
+            from .tex_memory import enforce_cache_budget, trim_reserved_pool
+            enforce_cache_budget(ctx.device)
+            # MEM-2 (B2): the trim only queries the allocator after a resolution
+            # downshift (zero cost on same-size steady state). cook_px rides the plan.
+            trim_reserved_pool(ctx.device, plan.cook_px)
+        except Exception:
+            pass
 
-    # CACHE-1: attach per-output lineage keys when the caller asked (a frame cache / graph
-    # host). Off the default path — computed only under plan.want_lineage. `eff_precision` is
-    # the precision the frame was ACTUALLY cooked at (fp32 if the finiteness net re-cooked), so
-    # the key and CookResult.precision match the pixels.
-    lineage = _compute_lineage(plan, ctx, eff_precision, raw_output) if plan.want_lineage else None
+        # ENG-1/ENG-3: make good on the no-alias guarantee, unless this caller proved it does
+        # not need it (see prepare()'s `disown`).
+        if plan.disown:
+            raw_output = _disown_inputs(raw_output, ctx.bindings)
 
-    # ROI-3 / v0.30: report what the cook actually narrowed to. Only an ARMED cook
-    # (`ctx.roi_plan is not None`) can have narrowed, so every declined path answers None
-    # without consulting anything; the armed path reads the window off the trace, where the
-    # decider wrote it (`run_roi` refuses → None; the ROI branch's failure → None). The import
-    # stays inside the guard so the default cook path pays nothing for this.
-    cooked_roi = None
-    if ctx.roi_plan is not None:
-        from .tex_runtime import tier_trace
-        cooked_roi = tier_trace.last_roi()[0]
+        # DBG-3 magenta NaN + C4-ux cyan near-singularity. Applied to the RAW outputs, above
+        # every tier, before any host egress formatting — the same order the node applied
+        # them in when it owned the loop.
+        near_sing = None
+        if plan.debug_nan_highlight:
+            from .tex_runtime import guard_trace   # off the default path: only the toggle pays
+            mask = guard_trace.mask()              # hoisted out of the loop (was once/output)
+            raw_output = {name: _nan_highlight(_singularity_highlight(raw, mask))
+                          for name, raw in raw_output.items()}
+            near_sing = guard_trace.count()   # read BEFORE the disarm below
+            guard_trace.disarm()
 
-    _report_progress(ctx.on_progress, "tier", 1.0)   # SCHED-3: the cook produced a frame
-    return CookResult(
-        outputs=raw_output, output_names=ctx.output_names, assigned=plan.assigned,
-        device=ctx.device, precision=eff_precision,
-        binding_names=list(ctx.bindings.keys()), near_singularities=near_sing,
-        lineage=lineage,
-        # DATA-1: merged TENSOR-input tags for every output, or None when the host passed no
-        # binding_meta (the default ComfyUI path) — value channel, never keyed. The engine
-        # resolves the ORIGINAL tensor-input names here (de-prefixing fused stage renames via
-        # tex_fusion.strip_user_prefix) so the host's tags match and marshalling stays free of
-        # fusion's naming; only tensor inputs contribute (a scalar param can't downgrade an output).
-        out_meta=_egress_meta(
-            ctx.binding_meta, ctx.output_names,
-            {(_strip_user_prefix(n) if ctx.fused_chain else n)   # de-prefix ONLY on a fused chain
-             for n, v in ctx.bindings.items() if isinstance(v, torch.Tensor)}  # (mirror the E6003 site)
-            if ctx.binding_meta else None),
-        cooked_roi=cooked_roi,
-        noise_tiers=tier_trace.take_noise_tiers(plan.tier_id) if plan.want_noise_tiers else None,
-        done=_pace.cook_done_event(ctx.device),   # PACE-45 (Q3): None off CUDA, no sync
-    )
+        # CACHE-1: attach per-output lineage keys when the caller asked (a frame cache / graph
+        # host). Off the default path — computed only under plan.want_lineage. `eff_precision` is
+        # the precision the frame was ACTUALLY cooked at (fp32 if the finiteness net re-cooked), so
+        # the key and CookResult.precision match the pixels.
+        lineage = _compute_lineage(plan, ctx, eff_precision, raw_output) if plan.want_lineage else None
+
+        # ROI-3 / v0.30: report what the cook actually narrowed to. Only an ARMED cook
+        # (`ctx.roi_plan is not None`) can have narrowed, so every declined path answers None
+        # without consulting anything; the armed path reads the window off the trace, where the
+        # decider wrote it (`run_roi` refuses → None; the ROI branch's failure → None). The import
+        # stays inside the guard so the default cook path pays nothing for this.
+        cooked_roi = None
+        if ctx.roi_plan is not None:
+            from .tex_runtime import tier_trace
+            cooked_roi = tier_trace.last_roi()[0]
+
+        _report_progress(ctx.on_progress, "tier", 1.0)   # SCHED-3: the cook produced a frame
+        return CookResult(
+            outputs=raw_output, output_names=ctx.output_names, assigned=plan.assigned,
+            device=ctx.device, precision=eff_precision,
+            binding_names=list(ctx.bindings.keys()), near_singularities=near_sing,
+            lineage=lineage,
+            # DATA-1: merged TENSOR-input tags for every output, or None when the host passed no
+            # binding_meta (the default ComfyUI path) — value channel, never keyed. The engine
+            # resolves the ORIGINAL tensor-input names here (de-prefixing fused stage renames via
+            # tex_fusion.strip_user_prefix) so the host's tags match and marshalling stays free of
+            # fusion's naming; only tensor inputs contribute (a scalar param can't downgrade an output).
+            out_meta=_egress_meta(
+                ctx.binding_meta, ctx.output_names,
+                {(_strip_user_prefix(n) if ctx.fused_chain else n)   # de-prefix ONLY on a fused chain
+                 for n, v in ctx.bindings.items() if isinstance(v, torch.Tensor)}  # (mirror the E6003 site)
+                if ctx.binding_meta else None),
+            cooked_roi=cooked_roi,
+            noise_tiers=tier_trace.take_noise_tiers(plan.tier_id) if plan.want_noise_tiers else None,
+            done=_pace.cook_done_event(ctx.device),   # PACE-45 (Q3): None off CUDA, no sync
+        )
+    finally:
+        if _obs_active:
+            _cook_observer.leave()
 
 
 def cook(code: str, bindings: dict, **kwargs) -> CookResult:
@@ -1141,4 +1158,14 @@ def cook(code: str, bindings: dict, **kwargs) -> CookResult:
     Accepts every keyword `prepare()` does. Returns a `CookResult` whose `outputs` are
     RAW (no clamp / alpha-drop / gray-expand — apply an egress profile for that; ENG-3).
     """
-    return run(prepare(code, bindings, **kwargs))
+    # OBSERVER-46: notify once for THIS entry point ("cook"); the nested `run()` call
+    # below shares it rather than notifying a second time (see tex_runtime/cook_observer.py
+    # and run()'s own comment, above).
+    _obs_active = bool(_cook_observer._callbacks)
+    if _obs_active:
+        _cook_observer.enter("cook")
+    try:
+        return run(prepare(code, bindings, **kwargs))
+    finally:
+        if _obs_active:
+            _cook_observer.leave()

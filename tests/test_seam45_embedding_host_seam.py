@@ -11,8 +11,9 @@ KINDS (positional-or-keyword / keyword-only / var-positional / var-keyword) and 
 (never the default VALUE, which is not part of this contract), every symbol a 2026-09-25 census
 of the embedding-host seam found:
 
-  * **Tier 1** (`_TIER1_SPEC`, 116 rows: the census's 114 plus `ResultCache.spill` and
-    `Program.time_reads`, added the moment they landed on `main` — see below) — symbols that
+  * **Tier 1** (`_TIER1_SPEC`, 118 rows: the census's 114 plus `ResultCache.spill` and
+    `Program.time_reads`, added the moment they landed on `main`, plus `cook_observer.register`
+    and `.unregister` (OBSERVER-46, v0.46) — see below) — symbols that
     host's own PRODUCT code calls or references. This is the harder promise: these are
     load-bearing for a running integration.
   * **Tier 2** (`_TIER2_SPEC`, 87 rows) — symbols reached ONLY from that host's own tests,
@@ -201,6 +202,13 @@ _TIER1_SPEC = {
     'tex_roi:covers': ('function', (('valid', 'POSITIONAL_OR_KEYWORD', False), ('needed', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_roi:canonical_roi': ('function', (('roi', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_roi:stage_halo': ('function', (('code', 'POSITIONAL_OR_KEYWORD', False), ('param_values', 'POSITIONAL_OR_KEYWORD', True), ('binding_types', 'POSITIONAL_OR_KEYWORD', True))),
+    # OBSERVER-46: the supported cook-observer seam (v0.46) — the alternative to a host
+    # monkey-patching `run`/`cook`/`cook_stage_list`/`cook_fused_cached`/`cook_checkpointed`/
+    # `boundary_lineage_key`, one of which ROUTE-45 found a re-export + internal self-call
+    # already defeats. Not a census row (the census predates this seam); added the moment it
+    # landed, same posture as `ResultCache.spill`/`Program.time_reads` above.
+    'tex_runtime.cook_observer:register': ('function', (('cb', 'POSITIONAL_OR_KEYWORD', False),)),
+    'tex_runtime.cook_observer:unregister': ('function', (('handle', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_runtime.host:CookCancelled': ('class', None),
     'tex_runtime.host:NullHostServices': ('class', None),
     'tex_runtime.profile:enabled': ('function', ()),
