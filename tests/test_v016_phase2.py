@@ -131,9 +131,10 @@ def test_m2cpu_and_m1_freeretry(r: SubTestResult):
     # P1-M2-CPU: enforce_cache_budget now evicts on a CPU device too.
     saved = dict(SL._grid_buf)
     try:
-        SL._grid_buf.clear()
+        SL._grid_buf_budget.clear(SL._grid_buf)
         for i in range(6):
-            SL._grid_buf[("m2cpu", i)] = torch.zeros(1, 256, 256, 4)  # ~1 MB each
+            SL._grid_buf_budget.put(SL._grid_buf, ("m2cpu", i),
+                                     torch.zeros(1, 256, 256, 4))  # ~1 MB each
         os.environ["TEX_CACHE_BUDGET_MB"] = "2"
         before = len(SL._grid_buf)
         M.enforce_cache_budget(torch.device("cpu"))   # CPU device, not cuda
@@ -145,8 +146,9 @@ def test_m2cpu_and_m1_freeretry(r: SubTestResult):
         r.fail("M-2-CPU eviction", f"{type(e).__name__}: {e}")
     finally:
         os.environ.pop("TEX_CACHE_BUDGET_MB", None)
-        SL._grid_buf.clear()
-        SL._grid_buf.update(saved)
+        SL._grid_buf_budget.clear(SL._grid_buf)
+        for _k, _v in saved.items():
+            SL._grid_buf_budget.put(SL._grid_buf, _k, _v)
 
     # P1-M1-FREERETRY: on OOM, TEX frees its own caches before re-raising the OOM
     # (so ComfyUI's unload_all_models + retry has that memory). Simulated OOM.

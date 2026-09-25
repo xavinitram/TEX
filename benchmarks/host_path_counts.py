@@ -281,6 +281,14 @@ SPY_TARGETS: "dict[str, tuple[str, ...]]" = {
     "_preflight_memory":          ("TEX_Wrangle.tex_tiling._preflight_memory",
                                    "TEX_Wrangle.tex_engine._preflight_memory"),
     "enforce_cache_budget":       ("TEX_Wrangle.tex_memory.enforce_cache_budget",),
+    # CACHESEAM-46: `_total_cache_bytes` is the pre-fix per-cook O(entries) walk
+    # `enforce_cache_budget` used on every over-budget check; it is now a debug-only full
+    # recount (`test_cacheseam46_budget_seam.py`'s drift check calls it, a real cook never
+    # does). This row is the counter-side proof that the walk left the per-cook hot path --
+    # every scenario below pins it at 0, where the OLD implementation would have read the
+    # same as `enforce_cache_budget`'s own row (one walk per over-budget check, at least
+    # once per call at this gate shape, since the caches are never empty by the tenth cook).
+    "tex_memory._total_cache_bytes": ("TEX_Wrangle.tex_memory._total_cache_bytes",),
     "trim_reserved_pool":         ("TEX_Wrangle.tex_memory.trim_reserved_pool",),
     "_disown_inputs":             ("TEX_Wrangle.tex_buffers._disown_inputs",
                                    "TEX_Wrangle.tex_engine._disown_inputs"),

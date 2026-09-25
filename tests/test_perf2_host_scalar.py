@@ -376,7 +376,7 @@ def test_perf2_the_tag_carries_the_rounded_value(r: SubTestResult):
         sig = 2.0 / 3.0
         assert math.ceil(3.0 * sig) != math.ceil(3.0 * _stdlib._dtype_rounded(sig, torch.float32)), (
             "the chosen sigma no longer separates the rounded reading from the raw double")
-        _stdlib._gauss_kernel_cache.clear()
+        _stdlib._gauss_kernel_cache_budget.clear(_stdlib._gauss_kernel_cache)
         good = run_tier(code, {"A": img, "sig": sig}, "interp")
         # The interpreter imported the tagger BY NAME, so the module attribute is not the
         # one the mint site calls — patch the binding that is actually read.
@@ -387,11 +387,11 @@ def test_perf2_the_tag_carries_the_rounded_value(r: SubTestResult):
             return t
         try:
             _interp._tag_host_scalar = _unrounded
-            _stdlib._gauss_kernel_cache.clear()
+            _stdlib._gauss_kernel_cache_budget.clear(_stdlib._gauss_kernel_cache)
             bad = run_tier(code, {"A": img, "sig": sig}, "interp")
         finally:
             _interp._tag_host_scalar = orig
-            _stdlib._gauss_kernel_cache.clear()
+            _stdlib._gauss_kernel_cache_budget.clear(_stdlib._gauss_kernel_cache)
         if _same(good, bad) is None:
             r.fail("PERF-2 tag mutation",
                    "an un-rounded tag produced the SAME output — the rounding is untested")
@@ -610,7 +610,7 @@ def test_trk69_gauss_blur_and_bilateral_filter_agree_on_a_bare_float(r: SubTestR
         # And it must now agree with gauss_blur's OWN reading of the same bare float —
         # not bit-exact (different formulas: `min(ceil(3*ss), 3)` vs an unclamped
         # radius), but the same ROUNDED sigma feeding both.
-        _stdlib._gauss_kernel_cache.clear()
+        _stdlib._gauss_kernel_cache_budget.clear(_stdlib._gauss_kernel_cache)
         _ = TEXStdlib.fn_gauss_blur(img, sig)   # exercises the reference reading; no crash
         r.ok("gauss_blur resolves the same bare float without error (reference reading)")
     except Exception as e:

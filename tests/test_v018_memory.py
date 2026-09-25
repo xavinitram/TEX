@@ -125,12 +125,14 @@ def test_mem4_per_device_budget(r: SubTestResult):
     try:
         MEM.free_tensor_caches()
         # one CUDA mip entry + several CPU mip entries
-        SL._mip_cache[("cuda", 0)] = ((1, 512, 512),
-                                      torch.zeros(512, 512, 3, device="cuda"),
-                                      [torch.zeros(256, 256, 3, device="cuda")])
+        SL._mip_cache_budget.put(SL._mip_cache, ("cuda", 0),
+                                  ((1, 512, 512),
+                                   torch.zeros(512, 512, 3, device="cuda"),
+                                   [torch.zeros(256, 256, 3, device="cuda")]))
         for s in range(4):
-            SL._mip_cache[("cpu", s)] = ((1, 512, 512), torch.zeros(512, 512, 3),
-                                         [torch.zeros(256, 256, 3)])
+            SL._mip_cache_budget.put(SL._mip_cache, ("cpu", s),
+                                      ((1, 512, 512), torch.zeros(512, 512, 3),
+                                       [torch.zeros(256, 256, 3)]))
         saved = os.environ.get("TEX_CACHE_BUDGET_MB")
         os.environ["TEX_CACHE_BUDGET_MB"] = "1"
         try:
@@ -149,11 +151,13 @@ def test_mem4_per_device_budget(r: SubTestResult):
         # global `newest` let it evict ("cpu", 3), defeating the isolation.
         MEM.free_tensor_caches()
         for s in range(4):
-            SL._mip_cache[("cpu", s)] = ((1, 512, 512), torch.zeros(512, 512, 3),
-                                         [torch.zeros(256, 256, 3)])
-        SL._mip_cache[("cuda_newest",)] = ((1, 512, 512),
-                                           torch.zeros(512, 512, 3, device="cuda"),
-                                           [torch.zeros(256, 256, 3, device="cuda")])
+            SL._mip_cache_budget.put(SL._mip_cache, ("cpu", s),
+                                      ((1, 512, 512), torch.zeros(512, 512, 3),
+                                       [torch.zeros(256, 256, 3)]))
+        SL._mip_cache_budget.put(SL._mip_cache, ("cuda_newest",),
+                                  ((1, 512, 512),
+                                   torch.zeros(512, 512, 3, device="cuda"),
+                                   [torch.zeros(256, 256, 3, device="cuda")]))
         os.environ["TEX_CACHE_BUDGET_MB"] = "1"
         try:
             MEM.enforce_cache_budget("cpu")

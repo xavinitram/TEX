@@ -353,9 +353,16 @@ _INTERP_CHAIN_SCRUB = {
     "tex_memory.run_roi":         10, # every stage stayed on the ROI path.
     "enforce_cache_budget":       10, # TRK-72: counted here, once per cook — ten times a
                                       # tick, the largest per-tick multiplier any scenario in
-                                      # this file gives it. No cheaper implementation exists
-                                      # without changing eviction behaviour (see the tracker
-                                      # row); this is the count a future fix would move.
+                                      # this file gives it. Re-pinned by CACHESEAM-46: the
+                                      # count of ENTRIES into the function is unchanged (still
+                                      # once per cook) — what moved is the row below, the walk
+                                      # INSIDE it.
+    "tex_memory._total_cache_bytes": 0,  # CACHESEAM-46: the pre-fix per-cook walk, now debug-
+                                      # only. Ten `enforce_cache_budget` calls at this gate
+                                      # shape used to mean ten walks of every budget-tracked
+                                      # cache; `enforce_cache_budget` now reads the seam's O(1)
+                                      # running total instead, so this reads 0 on every
+                                      # interactive scenario in this file.
     "_disown_inputs":            10,
     "_tile_plan":                  0,  # 96^2/48^2 gate shape never crosses the tile threshold.
     "_halo_tile_plan":             0,
@@ -392,6 +399,7 @@ _WHOLE_FRAME_CHAIN_D1 = {
     "results_cache.entries_added": 0,
     "tex_memory.run_roi":       0,   # no roi => the whole-frame path, by construction.
     "enforce_cache_budget":     1,   # once per cook, one cook.
+    "tex_memory._total_cache_bytes": 0,  # CACHESEAM-46: the walk left the hot path.
     "_disown_inputs":           1,
     "_tile_plan":               1,   # the WHOLE 96^2 frame is planned, unlike the 48^2
     "_halo_tile_plan":          0,   # window `_TERMINAL`/`interp_chain_scrub` cook — a
@@ -420,6 +428,7 @@ _WHOLE_FRAME_CHAIN_D3 = {
     "results_cache.entries_added": 0,
     "tex_memory.run_roi":       0,
     "enforce_cache_budget":     3,
+    "tex_memory._total_cache_bytes": 0,  # CACHESEAM-46: the walk left the hot path.
     "_disown_inputs":           3,
     "_tile_plan":               3,
     "_halo_tile_plan":          1,   # the blur-adjacent `glow` stage's cheap gate, unlike
@@ -457,6 +466,7 @@ _HOST_TICK_EXACT_D1 = {
     "ResultCache.put":          0,
     "tex_memory.run_roi":       0,
     "enforce_cache_budget":     1,    # once per cook.
+    "tex_memory._total_cache_bytes": 0,  # CACHESEAM-46: the walk left the hot path.
     "_disown_inputs":           1,
     "_tile_plan":               1,    # the whole 96^2 frame is planned (no window).
     "_halo_tile_plan":          0,    # the terminal (vignette) stage alone: pointwise, no
@@ -506,6 +516,7 @@ _HOST_TICK_EXACT_D3 = {
     "ResultCache.put":          0,
     "tex_memory.run_roi":       0,
     "enforce_cache_budget":     3,
+    "tex_memory._total_cache_bytes": 0,  # CACHESEAM-46: the walk left the hot path.
     "_disown_inputs":           3,
     "_tile_plan":               3,
     "_halo_tile_plan":          1,    # the blur-adjacent `glow` stage's cheap gate — same
@@ -543,6 +554,7 @@ _PLAYBACK_FRAMES = {
     "ResultCache.put":          0,
     "tex_memory.run_roi":       0,
     "enforce_cache_budget":    10,
+    "tex_memory._total_cache_bytes": 0,  # CACHESEAM-46: the walk left the hot path.
     "_disown_inputs":          10,
     "_tile_plan":              10,   # the whole 96^2 frame, ten times.
     "_halo_tile_plan":          3,   # the blur/sharpen/glow stages' cheap gate (three of the

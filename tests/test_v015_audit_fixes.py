@@ -486,8 +486,9 @@ def test_mem1_evict_preserves_graphs(r: SubTestResult):
         G._graph_bytes = 456
         G._graph_mode_disabled = True              # simulate a prior kill-switch trip
         for s in range(4):
-            SL._mip_cache[("junk", s)] = ((1, 512, 512), torch.zeros(512, 512, 3),
-                                          [torch.zeros(256, 256, 3)])
+            SL._mip_cache_budget.put(SL._mip_cache, ("junk", s),
+                                      ((1, 512, 512), torch.zeros(512, 512, 3),
+                                       [torch.zeros(256, 256, 3)]))
         _with_budget_1mb("cpu")
         assert "SENTINEL" in G._graph_cache, "eviction wrongly tore down the graph cache"
         assert G._graph_bytes == 456, "eviction wrongly touched the graph byte counter"
@@ -508,9 +509,10 @@ def test_mem1_evict_preserves_graphs(r: SubTestResult):
         MEM.free_tensor_caches()
         pinned_t = torch.zeros(512, 512, 3)
         G._graph_cache["PINNED_HOLDER"] = _FakeGP([pinned_t])
-        SL._grid_buf[("pinned",)] = pinned_t                 # baked into the graph
+        SL._grid_buf_budget.put(SL._grid_buf, ("pinned",), pinned_t)   # baked into the graph
         for s in range(4):
-            SL._grid_buf[("junk", s)] = torch.zeros(512, 512, 3)  # not baked
+            SL._grid_buf_budget.put(SL._grid_buf, ("junk", s),
+                                     torch.zeros(512, 512, 3))          # not baked
         assert pinned_t.untyped_storage().data_ptr() in G.pinned_storages()
         _with_budget_1mb("cpu")
         assert ("pinned",) in SL._grid_buf, "graph-pinned entry was wrongly evicted"
@@ -544,9 +546,10 @@ def test_mem1_evict_preserves_graphs(r: SubTestResult):
         gp_ids = {id(gp) for gp in G._graph_cache.values()}
         # junk unpinned entries + budget pressure → eviction pass
         for s in range(4):
-            SL._mip_cache[("junk", s)] = ((1, 512, 512),
-                                          torch.zeros(512, 512, 3, device="cuda"),
-                                          [torch.zeros(256, 256, 3, device="cuda")])
+            SL._mip_cache_budget.put(SL._mip_cache, ("junk", s),
+                                      ((1, 512, 512),
+                                       torch.zeros(512, 512, 3, device="cuda"),
+                                       [torch.zeros(256, 256, 3, device="cuda")]))
         _with_budget_1mb("cuda")
         assert {id(gp) for gp in G._graph_cache.values()} >= gp_ids, \
             "captured graph was evicted by an unrelated cache eviction"

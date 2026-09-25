@@ -356,7 +356,7 @@ def test_clamp_and_gridbuf(r: SubTestResult):
         img = make_img(1, 8, 8, 3)
         u = torch.rand(1, 8, 8)
         v = torch.rand(1, 8, 8)
-        _stdlib_mod._grid_buf.clear()
+        _stdlib_mod._grid_buf_budget.clear(_stdlib_mod._grid_buf)
         with torch.inference_mode():
             sample(img, u, v)
             sample(img, u, v)

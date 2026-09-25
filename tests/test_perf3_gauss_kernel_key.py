@@ -71,8 +71,12 @@ def _devices():
 
 
 def _fresh():
-    """Fresh kernel-cache state. Every sigma-varying comparison in this file starts here."""
-    _stdlib._gauss_kernel_cache.clear()
+    """Fresh kernel-cache state. Every sigma-varying comparison in this file starts here.
+
+    CACHESEAM-46: clears through the paired `_CacheBudget` seam so the running byte total
+    this file's `_rounded_key_cache` deliberately bypasses (see its own note) never leaks
+    stale bytes past this reset."""
+    _stdlib._gauss_kernel_cache_budget.clear(_stdlib._gauss_kernel_cache)
 
 
 def _blur(sigma, device, tier):
@@ -107,6 +111,12 @@ class _rounded_key_cache:
             if hit is not None:
                 return hit
             pair = real(sigma, device)            # built from the FULL sigma, as before
+            # CACHESEAM-46: a DELIBERATE raw dict write, not a missed seam call -- this
+            # class re-injects the exact pre-fix defect (the base sha's own code did a bare
+            # `[key] =`), so going through `_gauss_kernel_cache_budget.put` here would test
+            # a program that never shipped. `_fresh()` (via `__exit__`) still clears the
+            # budget object's bookkeeping along with the dict, so this bypass never leaks
+            # past this context manager.
             _stdlib._gauss_kernel_cache[key] = pair
             return pair
         self._real = real

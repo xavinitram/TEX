@@ -217,20 +217,20 @@ def estimate_peak_bytes(program, spatial_shape, dtype_bytes: int = 4,
 # semantics (a measured perf trap) are untouched; only the eviction *trigger*
 # changes from len>N to bytes>budget, and the most-recent entry is always kept.
 
-_BUDGET_CACHES = None  # lazily bound: list of (OrderedDict, entry->tensors)
+_BUDGET_CACHES = None  # lazily bound: `tex_runtime.stdlib_core.BUDGET_TRACKED_CACHES`
 
 
 def _budget_caches():
+    """The five budget-tracked (cache, `_CacheBudget`) pairs, read from `stdlib_core`
+    (CACHESEAM-46) rather than hand-carried here — this module no longer keeps its own
+    copy of "which five caches, which extractor" (the duplication TRK-187 named as part
+    of why a running total couldn't be trusted: nothing here saw a mutation made through
+    `stdlib_core.py`'s own call sites). `budget.extract` is the extractor every reader
+    below used to receive as a bare lambda."""
     global _BUDGET_CACHES
     if _BUDGET_CACHES is None:
-        from .tex_runtime import stdlib as sl
-        _BUDGET_CACHES = [
-            (sl._mip_cache, lambda e: [e[1], *e[2]]),         # (shape, img, pyramid)
-            (sl._gauss_mip_cache, lambda e: [e[1], *e[2]]),
-            (sl._grid_buf, lambda e: [e]),
-            (sl._sampler_cache, lambda e: [e]),
-            (sl._gauss_kernel_cache, lambda e: list(e)),
-        ]
+        from .tex_runtime import stdlib_core as _sc
+        _BUDGET_CACHES = _sc.BUDGET_TRACKED_CACHES
     return _BUDGET_CACHES
 
 
@@ -258,16 +258,34 @@ def _entry_dev_type(entry, extract):
 
 
 def _total_cache_bytes(dev_type=None) -> int:
-    """MEM-4: total tensor-cache bytes, optionally restricted to entries on `dev_type`.
+    """MEM-4: total tensor-cache bytes, optionally restricted to entries on `dev_type`,
+    by a FULL WALK of every entry in every budget-tracked cache.
+
+    CACHESEAM-46: this is now the DEBUG-ONLY full recount (kept per the ask's own bar —
+    a drift check needs a ground truth to check against) — `enforce_cache_budget`'s
+    per-cook hot path reads `_running_cache_bytes` instead, an O(1) running total the
+    `_CacheBudget` seam maintains incrementally. Same arithmetic as before this ask
+    (`_entry_bytes`/`_entry_dev_type` over `budget.extract`), so it stays the ground
+    truth `test_cacheseam46_drift_free` recomputes after every scripted mutation.
+
     A CPU cook's 512 MB budget must not count (or evict) CUDA-resident mip entries, and
     a CUDA cook must not be throttled by CPU-resident ones — each device is accounted
     against its own budget."""
     total = 0
-    for c, ex in _budget_caches():
+    for c, budget in _budget_caches():
+        ex = budget.extract
         for e in c.values():
             if dev_type is None or _entry_dev_type(e, ex) == dev_type:
                 total += _entry_bytes(e, ex)
     return total
+
+
+def _running_cache_bytes(dev_type=None) -> int:
+    """CACHESEAM-46: the O(1) twin of `_total_cache_bytes` -- five `_CacheBudget.total()`
+    reads (each a dict lookup, not a walk) instead of a walk of every entry in every
+    budget-tracked cache. This is what `enforce_cache_budget` calls on the per-cook hot
+    path; `_total_cache_bytes` stays the full-walk debug check."""
+    return sum(budget.total(dev_type) for _c, budget in _budget_caches())
 
 
 def cache_budget_bytes(device) -> int:
@@ -344,28 +362,46 @@ def enforce_cache_budget(device) -> None:
     pinning (graphed.pinned_storages) is what makes freeing the unpinned entries safe,
     so the old blunt clear_graph_cache() teardown — which also reset the RNG-poison
     kill switch and blacklist, silently re-arming doomed captures — is gone.
+
+    CACHESEAM-46: reads `_running_cache_bytes` (an O(1) running total the `_CacheBudget`
+    seam maintains) instead of `_total_cache_bytes`'s O(entries) walk — this was ~4.3% of
+    a tick's wall time (MEASURE-44 #1.6), the walk TRK-187 declined to remove because
+    nothing hooked these five caches' mutations. `stdlib_core.py` now routes every put,
+    evict, clear and LRU-touch on them through `_CacheBudget`, so the running total can be
+    trusted, and eviction still goes through `budget.delete` so it stays correct too.
     Best-effort; never raises."""
     try:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         dev_type = dev.type  # MEM-4: only account + evict entries on the cook's device
-        budget = cache_budget_bytes(device)
-        if _total_cache_bytes(dev_type) <= budget:
+        byte_budget = cache_budget_bytes(device)
+        if _running_cache_bytes(dev_type) <= byte_budget:
             return
         try:
             from .tex_runtime.graphed import pinned_storages
             pinned = pinned_storages()
         except Exception:
             pinned = set()
-        for cache, extract in _budget_caches():
-            while len(cache) > 1 and _total_cache_bytes(dev_type) > budget:
+        for cache, budget in _budget_caches():
+            extract = budget.extract
+            while len(cache) > 1 and _running_cache_bytes(dev_type) > byte_budget:
                 victim = _oldest_unpinned_key(cache, extract, pinned, dev_type)
                 if victim is None:
                     break  # every evictable same-device entry is pinned by a live graph
-                del cache[victim]
-            if _total_cache_bytes(dev_type) <= budget:
+                budget.delete(cache, victim)
+            if _running_cache_bytes(dev_type) <= byte_budget:
                 break
     except Exception:
         pass
+
+
+def cache_budget_status(device) -> dict:
+    """CACHESEAM-46 item 3: read-only query of the tensor-cache budget in force for
+    `device`'s dev_type -- the limit `enforce_cache_budget` enforces (`cache_budget_bytes`)
+    and the running usage it now maintains O(1) (`_running_cache_bytes`), so a host can ask
+    "what is the current tensor-cache budget/usage" without inferring it from
+    `enforce_cache_budget`'s side effects. Never mutates or evicts."""
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    return {"limit_bytes": cache_budget_bytes(dev), "usage_bytes": _running_cache_bytes(dev.type)}
 
 
 # ── CACHE-5: the global cache governor (CacheRegistry) ────────────────────────
@@ -449,13 +485,14 @@ def _evict_stdlib_bytes(dev_type, need: int, playhead=None) -> int:
     except Exception:
         pinned = set()
     freed = 0
-    for cache, extract in _budget_caches():
+    for cache, budget in _budget_caches():
+        extract = budget.extract
         while len(cache) > 1 and freed < need:
             victim = _oldest_unpinned_key(cache, extract, pinned, dev_type)
             if victim is None:
                 break
             freed += _entry_bytes(cache[victim], extract)
-            del cache[victim]
+            budget.delete(cache, victim)
     return freed
 
 
@@ -1360,10 +1397,12 @@ def free_tensor_caches() -> None:
     except Exception:
         pass
     try:
-        from .tex_runtime import stdlib as _sl
-        for c in (_sl._sampler_cache, _sl._grid_buf, _sl._mip_cache,
-                  _sl._gauss_mip_cache, _sl._gauss_kernel_cache):
-            c.clear()
+        # CACHESEAM-46: `.clear()` through each cache's own `_CacheBudget` seam, so the
+        # running byte total resets to a true zero along with the dict — a raw
+        # `c.clear()` here (the pre-CACHESEAM-46 form) would leave the budget object
+        # believing the freed bytes were still live.
+        for c, budget in _budget_caches():
+            budget.clear(c)
     except Exception:
         pass
     try:

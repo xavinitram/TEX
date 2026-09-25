@@ -389,9 +389,9 @@ def _get_grid_buf(B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
     if buf is not None and not buf.is_inference():
         return buf
     buf = torch.empty(B, H, W, 2, dtype=torch.float32, device=device)
-    _grid_buf[key] = buf
+    _grid_buf_budget.put(_grid_buf, key, buf)
     if len(_grid_buf) > _GRID_BUF_MAX:
-        _grid_buf.popitem(last=False)
+        _grid_buf_budget.evict_oldest(_grid_buf)
     return buf
 
 # ── Mipmap pyramid cache ─────────────────────────────────────────────
@@ -407,17 +407,140 @@ _MIP_MAX_ENTRIES = 8   # max cached pyramids (each holds multiple GPU tensors)
 _MIP_MAX_LEVELS = 12   # cap: 4096 → 1px in 12 halvings
 
 
+# ── CACHESEAM-46: the ONE mutation seam for the five budget-tracked caches ──────────
+# `tex_memory.enforce_cache_budget` (MEM-1/MEM-4) walks and evicts `_mip_cache`,
+# `_gauss_mip_cache`, `_grid_buf`, `_sampler_cache` and `_gauss_kernel_cache` against a
+# byte budget on every stage-cook -- a full walk of every entry, ~4.3% of a tick's wall
+# time (MEASURE-44 #1.6). TRK-187 declined an incrementally-maintained running total
+# for exactly this reason: the five caches were mutated by direct dict operations OUTSIDE
+# tex_memory.py (right here) with nothing to hook, plus about six test fixtures poking
+# the raw `OrderedDict`s directly. `_CacheBudget` is that hook now -- every put, evict,
+# clear and LRU-touch on any of the five goes through one of its methods below (grep finds
+# no other `[key] =`, `.popitem(`, `.clear()` or `.move_to_end(` against these five names in
+# this file); a test fixture that must poke a cache directly uses `reset_for_test` to keep
+# this object honest afterward (`tests/test_cacheseam46_*.py`).
+#
+# The caches themselves stay plain `OrderedDict`s -- DOC-7d's census keys off the module-
+# level declaration shape (`_kind()` in `test_v018_docs.py`), and this is bookkeeping
+# ALONGSIDE one, never a replacement for it.
+class _CacheBudget:
+    """Running tensor-byte total for one budget-tracked cache, bucketed by device type.
+
+    `extract(entry) -> [tensor, ...]` is the same per-cache shape `tex_memory._budget_caches`
+    used to hand-carry as a lambda; it lives here now, beside the cache it describes, so
+    `BUDGET_TRACKED_CACHES` below is the one place that pairs a cache with its extractor.
+    """
+    __slots__ = ("extract", "_per_key", "_by_dev")
+
+    def __init__(self, extract):
+        self.extract = extract
+        self._per_key: dict = {}   # key -> (nbytes, dev_type) for THAT entry
+        self._by_dev: dict = {}    # dev_type (incl. None, for a tensor-less entry) -> bytes
+
+    def _measure(self, entry) -> tuple:
+        total, dev = 0, None
+        try:
+            for t in self.extract(entry):
+                if isinstance(t, torch.Tensor):
+                    total += t.untyped_storage().nbytes()
+                    if dev is None:
+                        dev = t.device.type
+        except Exception:
+            pass
+        return total, dev
+
+    def _uncount(self, key) -> None:
+        nbytes, dev = self._per_key.pop(key, (0, None))
+        if nbytes:
+            self._by_dev[dev] = self._by_dev.get(dev, 0) - nbytes
+
+    def _count(self, key, entry) -> None:
+        nbytes, dev = self._measure(entry)
+        self._per_key[key] = (nbytes, dev)
+        if nbytes:
+            self._by_dev[dev] = self._by_dev.get(dev, 0) + nbytes
+
+    # ── the seam: every mutation of the paired cache goes through one of these ──────
+    def put(self, cache, key, value) -> None:
+        """`cache[key] = value`, keeping the running total in step (a replace of an
+        existing key is un-counted first, exactly like the fresh insert it becomes)."""
+        if key in cache:
+            self._uncount(key)
+        cache[key] = value
+        self._count(key, value)
+
+    def evict_oldest(self, cache) -> bool:
+        """`cache.popitem(last=False)`. Returns False if `cache` was already empty."""
+        if not cache:
+            return False
+        key, _ = cache.popitem(last=False)
+        self._uncount(key)
+        return True
+
+    def delete(self, cache, key) -> None:
+        """`del cache[key]` -- the victim-eviction seam `enforce_cache_budget` drives."""
+        del cache[key]
+        self._uncount(key)
+
+    def clear(self, cache) -> None:
+        """`cache.clear()`."""
+        cache.clear()
+        self._per_key.clear()
+        self._by_dev.clear()
+
+    def touch(self, cache, key) -> None:
+        """`cache.move_to_end(key)` -- LRU reorder only; the byte total is unaffected."""
+        cache.move_to_end(key)
+
+    # ── CACHESEAM-46 item 3: the read-only budget-status query surface ──────────────
+    def total(self, dev_type=None) -> int:
+        """O(1): the running byte total, optionally scoped to one tensor device type."""
+        if dev_type is None:
+            return sum(self._by_dev.values())
+        return self._by_dev.get(dev_type, 0)
+
+    # ── the documented test-fixture seam (item 1) ────────────────────────────────────
+    def reset_for_test(self, cache) -> None:
+        """Recompute the running total from `cache`'s CURRENT contents. A test fixture
+        that has to poke `cache` directly (a handful legitimately do, for setup shaped
+        differently than any production call) calls this once afterward, before anything
+        under test reads `total()` -- never trust a running total across a raw poke."""
+        self._per_key.clear()
+        self._by_dev.clear()
+        for key, entry in cache.items():
+            self._count(key, entry)
+
+
+_mip_cache_budget = _CacheBudget(lambda e: [e[1], *e[2]])         # (shape, img, pyramid)
+_gauss_mip_cache_budget = _CacheBudget(lambda e: [e[1], *e[2]])
+_grid_buf_budget = _CacheBudget(lambda e: [e])
+_sampler_cache_budget = _CacheBudget(lambda e: [e])
+_gauss_kernel_cache_budget = _CacheBudget(lambda e: list(e))
+
+#: CACHESEAM-46: the authoritative (cache, budget) pairs for every budget-tracked cache --
+#: `tex_memory.enforce_cache_budget` reads this directly instead of hard-coding its own copy
+#: of "which five caches, which extractor" (the duplication TRK-187 named). `budget.extract`
+#: is the same per-cache extractor `tex_memory._budget_caches` used to carry separately.
+BUDGET_TRACKED_CACHES = (
+    (_mip_cache, _mip_cache_budget),
+    (_gauss_mip_cache, _gauss_mip_cache_budget),
+    (_grid_buf, _grid_buf_budget),
+    (_sampler_cache, _sampler_cache_budget),
+    (_gauss_kernel_cache, _gauss_kernel_cache_budget),
+)
+
+
 def _get_batch_index(B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
     """Get or create cached batch index tensor [B, H, W] for advanced indexing."""
     key = ("bidx", B, H, W, device)
     cached = _sampler_cache.get(key)
     if cached is not None:
-        _sampler_cache.move_to_end(key)
+        _sampler_cache_budget.touch(_sampler_cache, key)
         return cached
     t = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)
-    _sampler_cache[key] = t
+    _sampler_cache_budget.put(_sampler_cache, key, t)
     if len(_sampler_cache) > _SAMPLER_CACHE_MAX:
-        _sampler_cache.popitem(last=False)
+        _sampler_cache_budget.evict_oldest(_sampler_cache)
     return t
 
 
@@ -429,12 +552,12 @@ def _get_flat_batch_index(B: int, H: int, W: int, device: torch.device) -> torch
     key = ("bidx_flat", B, H, W, device)
     cached = _sampler_cache.get(key)
     if cached is not None:
-        _sampler_cache.move_to_end(key)
+        _sampler_cache_budget.touch(_sampler_cache, key)
         return cached
     t = _get_batch_index(B, H, W, device).contiguous().reshape(-1)
-    _sampler_cache[key] = t
+    _sampler_cache_budget.put(_sampler_cache, key, t)
     if len(_sampler_cache) > _SAMPLER_CACHE_MAX:
-        _sampler_cache.popitem(last=False)
+        _sampler_cache_budget.evict_oldest(_sampler_cache)
     return t
 
 
@@ -443,12 +566,12 @@ def _get_lanczos_taps(device: torch.device) -> torch.Tensor:
     key = ("ltaps", device)
     cached = _sampler_cache.get(key)
     if cached is not None:
-        _sampler_cache.move_to_end(key)
+        _sampler_cache_budget.touch(_sampler_cache, key)
         return cached
     t = torch.arange(-2, 4, device=device, dtype=torch.float32)
-    _sampler_cache[key] = t
+    _sampler_cache_budget.put(_sampler_cache, key, t)
     if len(_sampler_cache) > _SAMPLER_CACHE_MAX:
-        _sampler_cache.popitem(last=False)
+        _sampler_cache_budget.evict_oldest(_sampler_cache)
     return t
 
 
@@ -534,7 +657,7 @@ def _get_gauss_kernels(sigma: float, device: torch.device) -> tuple[torch.Tensor
     key = (sigma, device)
     cached = _gauss_kernel_cache.get(key)
     if cached is not None:
-        _gauss_kernel_cache.move_to_end(key)
+        _gauss_kernel_cache_budget.touch(_gauss_kernel_cache, key)
         return cached
     radius = int(math.ceil(3.0 * sigma))
     size = 2 * radius + 1
@@ -544,9 +667,9 @@ def _get_gauss_kernels(sigma: float, device: torch.device) -> tuple[torch.Tensor
     kernel_h = kernel.view(1, 1, 1, size)
     kernel_v = kernel.view(1, 1, size, 1).contiguous()
     pair = (kernel_h, kernel_v)
-    _gauss_kernel_cache[key] = pair
+    _gauss_kernel_cache_budget.put(_gauss_kernel_cache, key, pair)
     if len(_gauss_kernel_cache) > _GAUSS_KERNEL_MAX_ENTRIES:
-        _gauss_kernel_cache.popitem(last=False)
+        _gauss_kernel_cache_budget.evict_oldest(_gauss_kernel_cache)
     return pair
 
 
@@ -622,6 +745,7 @@ def _build_mip_pyramid(
     img: torch.Tensor,
     cache: _OrderedDict,
     key,
+    budget: "_CacheBudget",
     pre_blur_fn=None,
     fused_blur_downsample_fn=None,
 ) -> list[torch.Tensor]:
@@ -631,8 +755,10 @@ def _build_mip_pyramid(
     Level 0 is full resolution, each subsequent level is half the size.
 
     Args:
-        cache: LRU OrderedDict to store the pyramid in.
+        cache: LRU OrderedDict to store the pyramid in (`_mip_cache` or `_gauss_mip_cache`).
         key: cache lookup key.
+        budget: the `_CacheBudget` paired with `cache` (CACHESEAM-46) -- every put/evict/
+            touch below goes through it, never a direct dict operation.
         pre_blur_fn: optional callable(bchw_tensor) → blurred bchw_tensor,
             applied before each downsample (e.g. Gaussian pre-blur).
         fused_blur_downsample_fn: optional callable(bchw_tensor) → blurred + 2× downsampled tensor.
@@ -641,7 +767,7 @@ def _build_mip_pyramid(
     """
     cached = cache.get(key)
     if cached is not None and cached[0] == img.shape:
-        cache.move_to_end(key)  # LRU touch
+        budget.touch(cache, key)  # LRU touch
         return cached[2]
 
     B, H, W, C = img.shape
@@ -672,9 +798,9 @@ def _build_mip_pyramid(
         pyramid.append(current)
 
     # Store tensor ref to prevent GC (keeps id() stable); evict LRU
-    cache[key] = (img.shape, img, pyramid)
+    budget.put(cache, key, (img.shape, img, pyramid))
     if len(cache) > _MIP_MAX_ENTRIES:
-        cache.popitem(last=False)
+        budget.evict_oldest(cache)
     return pyramid
 
 
@@ -693,7 +819,7 @@ def _safe_version(t: torch.Tensor) -> int:
 def _get_mip_pyramid(img: torch.Tensor) -> list[torch.Tensor]:
     """Area-downsample mipmap pyramid (cached)."""
     # Version-safe key: id() + version detects in-place mutations.
-    return _build_mip_pyramid(img, _mip_cache, (id(img), _safe_version(img)))
+    return _build_mip_pyramid(img, _mip_cache, (id(img), _safe_version(img)), _mip_cache_budget)
 
 
 def _get_mip_pyramid_gauss(img: torch.Tensor, sigma: float = 1.13) -> list[torch.Tensor]:
@@ -703,7 +829,7 @@ def _get_mip_pyramid_gauss(img: torch.Tensor, sigma: float = 1.13) -> list[torch
     # caller at a nearby sigma would have been served this one's pyramid.
     key = (id(img), _safe_version(img), sigma)
     return _build_mip_pyramid(
-        img, _gauss_mip_cache, key,
+        img, _gauss_mip_cache, key, _gauss_mip_cache_budget,
         pre_blur_fn=lambda bchw: _gauss_blur_bchw(bchw, sigma),
         fused_blur_downsample_fn=lambda bchw: _gauss_blur_bchw(bchw, sigma, downsample_2x=True),
     )
