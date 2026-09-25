@@ -340,6 +340,29 @@ _CG_UNSUPPORTED = object()
 _FINGERPRINT_MEMO: dict[tuple, str] = {}
 _FINGERPRINT_MEMO_MAX = 256
 
+# PERF-44: a bounded memo for the bare `sha256(code).hexdigest()` — the digest a caller
+# wants when it is NOT also folding binding types into the key (fingerprint() below always
+# does, so its own value can't serve this). Same bounded-dict-then-clear discipline as
+# _FINGERPRINT_MEMO, so a second hot-path caller shares one cache policy instead of
+# inventing another. First consumer: tex_roi._walk, whose per-call SHA-256 over the full
+# source ran on EVERY call (memo hits included) — 11 calls/tick on the interactive path.
+_CODE_DIGEST_MEMO: dict[str, str] = {}
+_CODE_DIGEST_MEMO_MAX = 256
+
+
+def code_digest(code: str) -> str:
+    """Memoized `hashlib.sha256(code.encode()).hexdigest()`. Pure function of `code` alone
+    (no binding types) — for a compile-cache key use `TEXCache.fingerprint` instead, which
+    folds binding types in and is memoized separately."""
+    cached = _CODE_DIGEST_MEMO.get(code)
+    if cached is not None:
+        return cached
+    digest = hashlib.sha256(code.encode()).hexdigest()
+    if len(_CODE_DIGEST_MEMO) >= _CODE_DIGEST_MEMO_MAX:
+        _CODE_DIGEST_MEMO.clear()
+    _CODE_DIGEST_MEMO[code] = digest
+    return digest
+
 
 class TEXCache:
     """

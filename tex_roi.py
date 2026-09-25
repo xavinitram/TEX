@@ -776,7 +776,13 @@ def _walk(code: str, param_values: dict, binding_types: dict | None = None):
     try:
         # PERF-8: `_profile_key()` last — the walk's answer is derived from a parse that is a
         # function of the egress profile too, so the key carries it (see `tex_lazy`).
-        code_hash = hashlib.sha256(code.encode()).hexdigest()
+        # PERF-44: the SHA-256 over the full source used to run on EVERY call, memo hits
+        # included (this key's own lookup needs it first) — `tex_cache.code_digest` is the
+        # same bounded memo `TEXCache.fingerprint` already keeps for its own digest, reused
+        # here rather than a second one, so a repeat call on the same source pays a dict
+        # lookup instead of re-hashing it.
+        from .tex_cache import code_digest as _code_digest
+        code_hash = _code_digest(code)
         key = (code_hash, _param_key(param_values),
                _string_wire_key(binding_types), _profile_key())
     except Exception:
