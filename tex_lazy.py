@@ -42,7 +42,6 @@ shared by check_lazy_status and execute() so the per-cook cost is a dict hit.
 """
 from __future__ import annotations
 
-import hashlib
 import struct
 from collections import OrderedDict
 
@@ -69,29 +68,14 @@ _PARSE_MEMO_MAX = 64
 #: `clone_tree` copies.
 _parse_memo: "OrderedDict[tuple, object]" = OrderedDict()
 
-_CODE_HASH_MEMO_MAX = 256
-#: COUNTS-44: `code` -> its SHA-256 hex digest, the value-INDEPENDENT half of `_memo`'s own
-#: key. `_memo` is keyed on `(code hash, param_values, profile)`, and `param_values` moves on
-#: every widget scrub by construction (T3 genuinely depends on the values) — so `_memo` itself
-#: misses every tick a scrub drives, same as it always has. But hashing the SAME source on
-#: every one of those misses is the identical pattern `tex_cache.TEXCache.fingerprint` already
-#: guards against (`_FINGERPRINT_MEMO`): a value-independent SHA-256 recomputed on a
-#: value-dependent cache's every miss. Bounded LRU, same discipline as `_memo`/`_parse_memo`.
-_code_hash_memo: "OrderedDict[str, str]" = OrderedDict()
-
-
-def _code_hash(code: str) -> str:
-    """SHA-256 hex digest of `code`, computed once per unique source and reused across every
-    later call regardless of what `param_values` does — the source itself did not change."""
-    hit = _code_hash_memo.get(code)
-    if hit is not None:
-        _code_hash_memo.move_to_end(code)
-        return hit
-    digest = hashlib.sha256(code.encode()).hexdigest()
-    _code_hash_memo[code] = digest
-    if len(_code_hash_memo) > _CODE_HASH_MEMO_MAX:
-        _code_hash_memo.popitem(last=False)
-    return digest
+#: COUNTS-44: `_memo` is keyed on `(code hash, param_values, profile)`, and `param_values`
+#: moves on every widget scrub by construction (T3 genuinely depends on the values) — so
+#: `_memo` itself misses every tick a scrub drives, same as it always has. But hashing the
+#: SAME source on every one of those misses is the identical pattern PERF-44 already solved
+#: for `tex_roi._walk` with `tex_cache.code_digest` — the value-INDEPENDENT SHA-256 memo
+#: `TEXCache.fingerprint` keeps for itself (`_FINGERPRINT_MEMO`), shared rather than a second
+#: one hand-rolled here. Imported where used (matches `tex_roi._walk`'s own call site) rather
+#: than at module scope, so this module carries no load-time opinion about `tex_cache`.
 
 
 # ── PERF-8: the egress-profile component of EVERY analysis memo key ───────────
@@ -280,7 +264,8 @@ def lazy_required_bindings(code: str,
     param_values = param_values or {}
     # PERF-8: the profile is in the key because the ANSWER moves with it — `p@beauty.diffuse`
     # is one plane name under the engine profile and the wire `beauty` under ComfyUI's.
-    key = (_code_hash(code), _param_key(param_values), _profile_key())
+    from .tex_cache import code_digest
+    key = (code_digest(code), _param_key(param_values), _profile_key())
     hit = _memo.get(key)
     if hit is not None or key in _memo:
         _memo.move_to_end(key)
@@ -323,8 +308,9 @@ def lazy_required_bindings(code: str,
 
 
 def clear_lazy_memo() -> None:
-    """Test hook. Drops the answer memo, the source-keyed parse memo behind it, and the
-    source-hash memo behind THAT."""
+    """Test hook. Drops the answer memo and the source-keyed parse memo behind it. The
+    source-digest memo behind THAT is `tex_cache`'s own (`code_digest`, shared with
+    `tex_roi._walk`) and is cleared there, not here — mirrors `tex_roi.clear_roi_memo`,
+    which draws the same line."""
     _memo.clear()
     _parse_memo.clear()
-    _code_hash_memo.clear()

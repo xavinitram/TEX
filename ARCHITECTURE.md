@@ -270,7 +270,7 @@ the raw fp16 win (~1.35–1.45×) is available, without the safety net, via expe
 (`img_*`, `arr_*`) accumulate in fp32 (an fp16 sum overflows to inf at ≥1024²); an
 out-of-fp16-range literal / a large-value `vec()` also stays fp32 (interp==codegen).
 
-## The 42-cache architecture
+## The 43-cache architecture
 
 Non-redundant by design — each store keys on a different thing (source-hash vs
 `id()`-type_map vs device/precision tuple vs AST-fingerprint vs resolution-bucket)
@@ -321,6 +321,7 @@ Bounds below are entry counts, and every store is process-lifetime unless stated
 | Store | Keyed on | Lifecycle / bound |
 |---|---|---|
 | `tex_cache._FINGERPRINT_MEMO` | source x binding types x profile key | program fingerprint; 256 |
+| `tex_cache._CODE_DIGEST_MEMO` | source | bare `sha256(source).hexdigest()`, folding in NO binding types or profile (use `TEXCache.fingerprint` / `_FINGERPRINT_MEMO` above for a compile-cache key); PERF-44, shared by `tex_roi._walk` and `tex_lazy.lazy_required_bindings` so a source already hashed once is a dict lookup on every later call, memo hits included; dict, cleared whole at 256 |
 | `lexer._TOKEN_HANDOFF` | source x `dotted_bindings` flag | token list offered by the fingerprint lex and claimed by the compile behind it; 16, and a miss costs one re-lex, never a wrong stream |
 | `tex_lazy._memo` | code-hash x fp32 param bits | required-binding set; shared by `check_lazy_status` and `execute()`; 256 |
 | `tex_lazy._parse_memo` | source x profile key | the UNFOLDED front-end AST, handed out only as `clone_tree` copies; 64 |

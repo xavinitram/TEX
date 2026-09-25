@@ -156,7 +156,7 @@ switches", and `tests/test_neg3_env_switches.py` reds on a product switch that i
 - `TEX_DOCS_LOCAL` (`tex_compiler/diagnostics.py`) — LANG-7's air-gapped docs link. Not dead
   UI: an LSP host consumes `docs_url` into a code description. Both states pinned by NEG-3.
 
-**The 42 caches are non-redundant** — each keys on a different thing with a distinct
+**The 43 caches are non-redundant** — each keys on a different thing with a distinct
 lifecycle. Do not consolidate them. (See ARCHITECTURE.md for the enumerated inventory;
 the count there and here must match, and every module-level store must appear in that register or be excused by name — `test_doc7d_cache_store_enumeration` reds with the `file:line` of one that is not.) #19 (v0.25 CACHE-2) is
 `tex_results.ResultCache`, the engine frame cache — the first HOST-instantiated store in the
