@@ -1294,7 +1294,16 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     if ms is not None:
         autotier.record_interp(key, ms)
     if state == autotier.MEASURING and autotier.should_submit_compile(key):
-        if _cuda_headroom_ok(device) and not _capture_in_flight():
+        cap = compile_capability()
+        cap_ok = cap["cuda_inductor"] if device_type == "cuda" else cap["cpu_inductor"]
+        if not cap_ok:
+            # CC-4: toolchain-aware "auto" — the prerequisite is known absent (probed
+            # once, never by compiling), so make NO compile attempt at all: no
+            # failed-compile tax, no trial. Reaches the same terminal outcome a real
+            # failed compile already gets (record_trial(key, None) -> REJECTED), just
+            # without ever entering _try_compile.
+            autotier.record_trial(key, None)
+        elif _cuda_headroom_ok(device) and not _capture_in_flight():
             if _submit_bg_compile(cache_key, program, type_map, device_type,
                                   used_builtins, precision, fingerprint):
                 autotier.mark_submitted(key)
