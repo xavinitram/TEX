@@ -262,6 +262,12 @@ _NOT_A_CACHE = {
                                           "cook-time key, rebuilt on demand and invalidated "
                                           "only by a new @stdlib registration, same relationship "
                                           "to REGISTRY that a cached len() or sorted() would have",
+    "codegen._ES_CO_MEMO": "FUSEDDEV-46: one wrapper-closure PER DEVICE (the box's cpu/cuda "
+                           "set, not a cook-time or program-derived key), memoized only so "
+                           "torch.compile sees a STABLE callable identity across cooks -- a "
+                           "fresh closure every cook forces a full recompile every warm cook. "
+                           "Holds no cooked value, is never evicted, and is bounded by "
+                           "hardware devices, not by any program, binding or fingerprint.",
     # ── Registries and ledgers: they hold keys or references, never a computed value. ──
     "tex_memory._armed_caches": "CACHE-5 governor's registry OF caches (saved profile knobs "
                                 "per armed cache), so that it is not itself one",
