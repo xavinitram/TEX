@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -380,6 +381,29 @@ def _graph_capture_worthwhile(est_ops: int, px: int) -> bool:
 
 # ── RNG-poison recovery (verified protocol V4) ────────────────────────
 
+@contextmanager
+def _restoring_cuda_stream(dev_index):
+    """RACE-43: `torch.cuda.graph.__exit__` calls `capture_end()` before restoring the
+    caller's current stream, so a capture that fails partway (the exact case both
+    `GraphedProgram.capture()` and `_recover_from_capture_failure()` guard) leaves this
+    thread's current stream pointed at the graph module's internal capture stream.
+    Read the caller's stream before the at-risk block and put it back in `finally`, so
+    every exit path — success, a caught failure, an uncaught one — restores it.
+
+    Guarded: `dev_index` may be whatever the caller was given, including a bad one (a
+    test drives `torch.cuda.device` mocked to abort before any real CUDA op) — reading
+    its current stream must not itself be the first touch that aborts the caller."""
+    try:
+        saved_stream = torch.cuda.current_stream(dev_index)
+    except Exception:
+        saved_stream = None
+    try:
+        yield
+    finally:
+        if saved_stream is not None:
+            torch.cuda.set_stream(saved_stream)
+
+
 def _recover_from_capture_failure(dev_index=None) -> bool:
     """A failed capture leaves the CUDA generator's capture flag stuck.
     set_rng_state does NOT clear it; the working protocol is to run a trivial
@@ -393,21 +417,11 @@ def _recover_from_capture_failure(dev_index=None) -> bool:
     current stream on its own internal capture stream if one of the six tries errors
     out from inside the `with torch.cuda.graph(g):` block. `capture()`'s own restore
     already covers the caller's stream for the ORIGINAL failure; this covers the
-    recovery path's stream on top of that, independently."""
+    recovery path's stream on top of that, independently (`_restoring_cuda_stream`)."""
     if dev_index is None:
         dev_index = torch.cuda.current_device()
     dev = f"cuda:{dev_index}"
-    # Guarded: `dev_index` reaches here from a caught capture exception, so it is
-    # whatever `capture()` was given — reading ITS current stream must not itself be
-    # the first real touch of a device index that turns out to be bad (a test drives
-    # exactly that: `torch.cuda.device` mocked to abort before any real CUDA op, which
-    # `current_stream(dev_index)` would otherwise reach a beat too early and abort the
-    # whole recovery before the loop below even starts).
-    try:
-        saved_stream = torch.cuda.current_stream(dev_index)
-    except Exception:
-        saved_stream = None
-    try:
+    with _restoring_cuda_stream(dev_index):
         for _ in range(6):
             try:
                 with torch.cuda.device(dev_index):
@@ -426,9 +440,6 @@ def _recover_from_capture_failure(dev_index=None) -> bool:
             except Exception:
                 continue
         return False
-    finally:
-        if saved_stream is not None:
-            torch.cuda.set_stream(saved_stream)
 
 
 # ── The captured program ──────────────────────────────────────────────
@@ -494,23 +505,18 @@ class GraphedProgram:
         permanently the graph module's internal capture stream, invisible until some
         unrelated later caller reads pixels through it with no fence. Save/restore the
         stream here so every exit path — success, a caught capture failure, an
-        uncaught one — leaves the caller exactly where it found it."""
+        uncaught one — leaves the caller exactly where it found it (`_restoring_cuda_stream`)."""
         global _CAPTURING
         _CAPTURING = True
         idx = _dev_index(device)
-        try:                                    # a bad idx must not skip the capture below
-            saved_stream = torch.cuda.current_stream(idx)
-        except Exception:
-            saved_stream = None
         try:
-            with torch.cuda.device(idx):
-                return self._capture_inner(program, bindings, type_map, device,
-                                           latent_channel_count, output_names,
-                                           precision, used_builtins)
+            with _restoring_cuda_stream(idx):
+                with torch.cuda.device(idx):
+                    return self._capture_inner(program, bindings, type_map, device,
+                                               latent_channel_count, output_names,
+                                               precision, used_builtins)
         finally:
             _CAPTURING = False
-            if saved_stream is not None:
-                torch.cuda.set_stream(saved_stream)
 
     def _capture_inner(self, program, bindings, type_map, device, latent_channel_count,
                        output_names, precision, used_builtins) -> bool:
