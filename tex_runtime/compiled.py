@@ -1142,9 +1142,23 @@ def _capture_in_flight() -> bool:
 
 
 def _submit_bg_compile(cache_key, program, type_map, device_type,
-                       used_builtins, precision, fingerprint) -> bool:
+                       used_builtins, precision, fingerprint, *,
+                       warm_call=None) -> bool:
     """Submit a compile-only job (populates _compiled_cache) without blocking.
-    Returns True if a job is now in flight (or already was)."""
+    Returns True if a job is now in flight (or already was).
+
+    `warm_call` (CC-5, optional, keyword-only): a zero-arg callable this background
+    worker invokes once, right after the artifact is cached, to force torch.compile's
+    LAZY first-call cost (Dynamo trace + Inductor/Triton lowering — `_try_compile` only
+    WRAPS the callable; nothing actually traces/lowers until the wrapped callable is
+    first invoked) to happen HERE instead of on the interactive TRIAL cook
+    (`_run_cached_compiled`). See `run_auto`'s call site for what it passes and why.
+    Absent for a caller with no representative bindings to warm with (`tex_api.prewarm`,
+    unchanged) — the artifact is then cached wrap-only, exactly as before, and its first
+    real call happens wherever the caller next invokes it. A `warm_call` that raises is
+    treated exactly like a wrap failure: the artifact is discarded and the job reports
+    "failed", so `run_auto` rejects the key (stays on codegen) instead of handing a
+    proven-broken callable to a later TRIAL."""
     if cache_key in _compiled_cache or cache_key in _bg_futures:
         return True
     if fingerprint in _compile_blacklist:
@@ -1162,8 +1176,13 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
                     _compiled_cache[cache_key] = entry
                     if len(_compiled_cache) > _COMPILED_CACHE_MAX:
                         _compiled_cache.popitem(last=False)
+                if warm_call is not None:
+                    # CC-5: pay the lazy first-call cost HERE, on this background
+                    # worker — never on the cook thread's TRIAL invocation.
+                    warm_call()
             return "ok"
         except Exception:
+            _compiled_cache.pop(cache_key, None)   # never hand a proven-broken artifact on
             return "failed"
 
     try:
@@ -1304,8 +1323,22 @@ def run_auto(program, bindings, type_map, device, fingerprint,
             # without ever entering _try_compile.
             autotier.record_trial(key, None)
         elif _cuda_headroom_ok(device) and not _capture_in_flight():
+            # CC-5: clone the REPRESENTATIVE bindings now, on the cook thread, so the
+            # background warm-up below (which runs later, off-thread) never races
+            # whatever the caller does to `bindings` after this cook returns (in-place
+            # `out=` reuse, a pooled tensor handed back to ComfyUI, ...).
+            warm_bindings = _contiguous_bindings(
+                {k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                 for k, v in bindings.items()}, device_obj)
+
+            def _warm_call(_key=cache_key, _wb=warm_bindings):
+                compiled_fn, _backend = _compiled_cache[_key]
+                compiled_fn(program, _wb, type_map, device,
+                           latent_channel_count, output_names)
+
             if _submit_bg_compile(cache_key, program, type_map, device_type,
-                                  used_builtins, precision, fingerprint):
+                                  used_builtins, precision, fingerprint,
+                                  warm_call=_warm_call):
                 autotier.mark_submitted(key)
     elif state == autotier.COMPILING:
         st = _bg_status(cache_key)

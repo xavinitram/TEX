@@ -193,3 +193,103 @@ def test_cc4_present_toolchain_still_submits(r: SubTestResult):
         C.compile_capability = orig_cap
         C._submit_bg_compile = orig_submit
         AT.reset()
+
+
+# ── CC-5: the lazy first-call cost lands on the background worker ──────────
+
+@pytest.mark.slow
+def test_cc5_lazy_first_call_never_stalls_the_cook_thread(r: SubTestResult):
+    """A monkeypatched fake compiled fn whose FIRST invocation sleeps 2s stands in for
+    torch.compile's own lazy first-call cost (Dynamo trace + Inductor/Triton lowering —
+    `_try_compile` only wraps; the trace/lowering only happens once the wrapped callable
+    is actually invoked). With CC-5's fix, `_submit_bg_compile`'s `warm_call` pays that
+    2s on the background pool worker, so every `run_auto()` call from here (each one a
+    cook tick) must complete fast -- none of them may be the thread that eats the sleep."""
+    print("\n--- CC-5: lazy first-call cost never lands on the cook thread ---")
+    prog, tm, used = _tiny_program()
+    img = make_img(1, 16, 16, 3, seed=11)
+    fp = "cc5_test_fp"
+    cache_key = (fp, "cpu", "fp32")
+
+    calls = {"n": 0}
+
+    def fake_compiled_fn(program, bindings, type_map, device, latent_channel_count, output_names):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            time.sleep(2.0)   # stands in for torch.compile's lazy first-call trace
+        names = output_names or ["OUT"]
+        return {name: bindings["A"] for name in names}
+
+    def fake_try_compile(device_type, program, type_map, **kw):
+        return fake_compiled_fn, "inductor"
+
+    orig_try_compile = C._try_compile
+    orig_cap = C.compile_capability
+    C._try_compile = fake_try_compile
+    C.compile_capability = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
+    AT.reset()
+    C._compiled_cache.pop(cache_key, None)
+    C._bg_futures.pop(cache_key, None)
+    try:
+        max_tick_ms = 0.0
+        v = None
+        for _ in range(120):
+            t0 = time.perf_counter()
+            C.run_auto(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"], used_builtins=used)
+            tick_ms = (time.perf_counter() - t0) * 1000.0
+            max_tick_ms = max(max_tick_ms, tick_ms)
+            sp = C._consensus_extent({"A": img}, prog)
+            v = AT.verdict(AT.make_key(fp, "cpu", "fp32", sp))
+            if v in (AT.COMMITTED, AT.REJECTED):
+                break
+            time.sleep(0.05)
+
+        assert v in (AT.COMMITTED, AT.REJECTED), f"never reached a terminal verdict (stuck at {v})"
+        assert max_tick_ms < 500.0, (
+            f"a cook tick took {max_tick_ms:.1f}ms -- the lazy compile leaked onto the cook thread")
+        assert calls["n"] >= 2, (
+            f"expected >=2 compiled-fn calls (1 background warm-up + >=1 trial/committed), got {calls['n']}")
+        r.ok(f"max cook tick {max_tick_ms:.1f}ms across {calls['n']} compiled-fn calls; verdict={v}")
+    except Exception as e:
+        r.fail("CC-5 no cook-thread stall", str(e))
+    finally:
+        C._try_compile = orig_try_compile
+        C.compile_capability = orig_cap
+        C._compiled_cache.pop(cache_key, None)
+        C._bg_futures.pop(cache_key, None)
+        AT.reset()
+
+
+def test_cc5_warm_call_failure_discards_the_artifact(r: SubTestResult):
+    """A warm_call that raises (the artifact's first real call crashes) must be treated
+    exactly like a wrap failure: _bg_status reports "failed" and the artifact is not left
+    in _compiled_cache for a later TRIAL to pick up broken."""
+    print("\n--- CC-5: a raising warm_call discards the artifact ---")
+    cache_key = ("cc5_fail_fp", "cpu", "fp32")
+    C._compiled_cache.pop(cache_key, None)
+    C._bg_futures.pop(cache_key, None)
+
+    def fake_try_compile(device_type, program, type_map, **kw):
+        return (lambda *a, **k: None), "inductor"
+
+    def _boom():
+        raise RuntimeError("simulated first-call compile failure")
+
+    orig_try_compile = C._try_compile
+    C._try_compile = fake_try_compile
+    try:
+        ok = C._submit_bg_compile(cache_key, object(), {}, "cpu", None, "fp32",
+                                  "cc5_fail_fp", warm_call=_boom)
+        assert ok, "submission itself (queuing the job) must still succeed"
+        fut = C._bg_futures[cache_key]
+        fut.result(timeout=10)
+        status = C._bg_status(cache_key)
+        assert status == "failed", status
+        assert cache_key not in C._compiled_cache, "a broken artifact must not be left cached"
+        r.ok("a raising warm_call reports 'failed' and never leaves a broken artifact cached")
+    except Exception as e:
+        r.fail("CC-5 warm_call failure handling", str(e))
+    finally:
+        C._try_compile = orig_try_compile
+        C._compiled_cache.pop(cache_key, None)
+        C._bg_futures.pop(cache_key, None)
