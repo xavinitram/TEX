@@ -51,6 +51,8 @@ import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 
+from . import pacing as _pacing   # F5: share pacing's device-context-skip discipline (P7)
+
 # ── policy constants (explicit numbers a test can feed, per autotier's discipline) ──
 _ALPHA = 0.35             # EWMA weight on the newest sample
 _WARMUP_SAMPLES = 3       # measure every cook of an unseen key until it has this many
@@ -174,9 +176,10 @@ def stage_sink() -> dict | None:
 
 def record_stage_boundary(events: list, stage, device) -> None:
     """Append one `(stage, event)` boundary to `events` (from `stage_event_sink()`), recording
-    a fresh timing-enabled CUDA event under `with torch.cuda.device(device):` (the O4
-    discipline `measure._new_event` also follows, matching `pacing.cook_done_event`) and never
-    blocking. Lives here, not inline in the interpreter, so `Interpreter._exec_stmts_profiled`
+    a fresh timing-enabled CUDA event via `pacing.record_on` (F5) — the same device-context-
+    skip discipline `measure._new_event` uses and `pacing.cook_done_event` originated (O4),
+    shared through the public seam rather than re-spelling `with torch.cuda.device(...):`
+    here. Lives here, not inline in the interpreter, so `Interpreter._exec_stmts_profiled`
     stays a few lines shorter — the only caller.
 
     On failure this appends `(stage, None)` rather than nothing. The fold walks `events`
@@ -188,9 +191,8 @@ def record_stage_boundary(events: list, stage, device) -> None:
     losing this one sample's stage split, never the cook, and never someone else's number."""
     try:
         import torch
-        with torch.cuda.device(device):
-            ev = torch.cuda.Event(enable_timing=True)
-            ev.record()
+        ev = torch.cuda.Event(enable_timing=True)
+        _pacing.record_on(ev, device)
         events.append((stage, ev))
     except Exception:
         events.append((stage, None))
@@ -639,7 +641,11 @@ class measure:
         self._prev_events = None
 
     def _sync(self) -> None:
-        if self.device.startswith("cuda"):
+        # F5: `pacing._is_cuda` (parses the device AND checks `torch.cuda.is_available()`)
+        # instead of a plain `startswith("cuda")` — the string check alone reads True for a
+        # "cuda"-spelled device on a CPU-only torch build, which used to fall through to a
+        # doomed `torch.cuda.synchronize()` caught only by the surrounding try/except.
+        if _pacing._is_cuda(self.device):
             try:
                 import torch
                 torch.cuda.synchronize()
@@ -647,17 +653,17 @@ class measure:
                 pass
 
     def _new_event(self):
-        """A `torch.cuda.Event(enable_timing=True)`, recorded now under `with torch.cuda.
-        device(self.device):` — the O4 discipline (`pacing.cook_done_event`) that makes the
-        event mark THIS measure's device rather than whatever happens to be ambient. None on
-        any failure (no CUDA context / bad device); the caller falls back to the sync form."""
-        if not self.device.startswith("cuda"):
+        """A `torch.cuda.Event(enable_timing=True)`, recorded now via `pacing.record_on` (F5)
+        — the O4 discipline (`pacing.cook_done_event`) that makes the event mark THIS
+        measure's device rather than whatever happens to be ambient, shared through the
+        public seam instead of re-spelling `with torch.cuda.device(...):` here. None on any
+        failure (no CUDA context / bad device); the caller falls back to the sync form."""
+        if not _pacing._is_cuda(self.device):
             return None
         try:
             import torch
-            with torch.cuda.device(self.device):
-                ev = torch.cuda.Event(enable_timing=True)
-                ev.record()
+            ev = torch.cuda.Event(enable_timing=True)
+            _pacing.record_on(ev, self.device)
             return ev
         except Exception:
             return None

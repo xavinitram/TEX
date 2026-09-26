@@ -40,6 +40,7 @@ import pytest
 from helpers import *  # noqa: F401,F403  (SubTestResult, torch, make_img)
 from TEX_Wrangle import tex_engine
 from TEX_Wrangle.tex_runtime import profile as P
+from TEX_Wrangle.tex_runtime import pacing as _pace
 from TEX_Wrangle.tex_testkit import armed_profiler
 
 
@@ -112,6 +113,56 @@ class _EventPatch:
         torch.cuda.device = self._real_device
         torch.cuda.is_available = self._real_avail
         _FakeEvent.DONE = True
+        return False
+
+
+class _DeviceSpy:
+    """FIX-PROF F5: the same mechanism scaffold `test_fixobsroute46_pacing.py::_DeviceSpy`
+    uses to drive `pacing.py`'s CUDA branch on ANY box, CUDA or not — patches
+    `torch.cuda.device`, `is_available`, `current_device` and `Event` well enough for
+    `pacing.record_on`'s own `_resolve_cuda_target` call to run for real. `current` is the
+    FIXED value `torch.cuda.current_device()` reports, so a test can put a genuinely
+    non-current index on one side and a genuinely current one on the other. `calls` records
+    every device `torch.cuda.device(...)` was actually entered with -- empty means the
+    OVERHEAD-462 skip fired (already-current device); non-empty means it did not."""
+
+    def __init__(self, current=0):
+        self.calls = []
+        self.current = current
+        self._real_available = torch.cuda.is_available
+        self._real_device_ctx = torch.cuda.device
+        self._real_event = torch.cuda.Event
+        self._real_current_device = torch.cuda.current_device
+
+    def __enter__(self):
+        spy = self
+
+        def _fake_current_device():
+            return spy.current
+
+        class _SpyDeviceCtx:
+            def __init__(self, dev):
+                spy.calls.append(dev)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        torch.cuda.is_available = lambda: True
+        torch.cuda.current_device = _fake_current_device
+        torch.cuda.device = _SpyDeviceCtx
+        torch.cuda.Event = _FakeEvent
+        _FakeEvent.DONE = True
+        _FakeEvent._next_tick[0] = 0
+        return self
+
+    def __exit__(self, *exc):
+        torch.cuda.is_available = self._real_available
+        torch.cuda.current_device = self._real_current_device
+        torch.cuda.device = self._real_device_ctx
+        torch.cuda.Event = self._real_event
         return False
 
 
@@ -438,3 +489,81 @@ def test_fixprof_f4_lock_is_plain_not_reentrant(r: SubTestResult):
         r.fail("FIX-PROF F4",
                f"reentrant_ok={reentrant_ok!r} predict()={ms!r} "
                f"(expected a non-reentrant lock and a working fold)")
+
+
+def test_fixprof_f5_record_stage_boundary_shares_pacing_record_on(r: SubTestResult):
+    """FIX-PROF F5: `record_stage_boundary` now records its event via `pacing.record_on`
+    instead of its own `with torch.cuda.device(...):` -- so it must show the SAME
+    device-context-skip mechanism `pacing.py`'s own poll points do: enter
+    `torch.cuda.device(...)` for a genuinely non-current device, skip it entirely for an
+    already-current one."""
+    print("\n--- FIX-PROF F5: record_stage_boundary shares pacing.record_on ---")
+    ok_noncurrent = ok_current = False
+    try:
+        with _DeviceSpy(current=0) as spy:
+            events = []
+            P.record_stage_boundary(events, 0, "cuda:1")
+        ok_noncurrent = (spy.calls == ["cuda:1"] and len(events) == 1
+                         and events[0][0] == 0 and events[0][1] is not None)
+    except Exception as e:
+        r.fail("FIX-PROF F5 record_stage_boundary (non-current)", str(e))
+        return
+    try:
+        with _DeviceSpy(current=0) as spy2:
+            events2 = []
+            P.record_stage_boundary(events2, 0, "cuda:0")
+        ok_current = (spy2.calls == [] and len(events2) == 1 and events2[0][1] is not None)
+    except Exception as e:
+        r.fail("FIX-PROF F5 record_stage_boundary (current)", str(e))
+        return
+
+    if ok_noncurrent and ok_current:
+        r.ok("record_stage_boundary entered torch.cuda.device('cuda:1') for a non-current "
+             "device and skipped it entirely for an already-current one -- via "
+             "pacing.record_on, not its own with torch.cuda.device(...)")
+    else:
+        r.fail("FIX-PROF F5 record_stage_boundary",
+               f"noncurrent_ok={ok_noncurrent!r} current_ok={ok_current!r}")
+
+
+def test_fixprof_f5_new_event_shares_pacing_record_on(r: SubTestResult):
+    """FIX-PROF F5: `measure._new_event` (entry + exit events) shares the same
+    `pacing.record_on` seam -- same mechanism check as above, driven through the public
+    `measure` object rather than calling the private helper directly."""
+    print("\n--- FIX-PROF F5: measure._new_event shares pacing.record_on ---")
+    ok_noncurrent = ok_current = False
+    try:
+        P.reset()
+        with armed_profiler() as Pmod:
+            with _DeviceSpy(current=0) as spy:
+                key = Pmod.make_key("fixprof-f5-noncurrent", "cuda", "fp32")
+                with Pmod.measure(key, 8 * 8, device="cuda:1", stages=False):
+                    pass
+            ok_noncurrent = (len(spy.calls) >= 1 and all(c == "cuda:1" for c in spy.calls))
+    except Exception as e:
+        r.fail("FIX-PROF F5 _new_event (non-current)", str(e))
+        return
+    finally:
+        P.reset()
+
+    try:
+        P.reset()
+        with armed_profiler() as Pmod:
+            with _DeviceSpy(current=0) as spy2:
+                key = Pmod.make_key("fixprof-f5-current", "cuda", "fp32")
+                with Pmod.measure(key, 8 * 8, device="cuda:0", stages=False):
+                    pass
+            ok_current = (spy2.calls == [])
+    except Exception as e:
+        r.fail("FIX-PROF F5 _new_event (current)", str(e))
+        return
+    finally:
+        P.reset()
+
+    if ok_noncurrent and ok_current:
+        r.ok("measure's entry/exit event recording entered torch.cuda.device('cuda:1') for "
+             "a non-current device and skipped it entirely for an already-current one -- "
+             "via pacing.record_on, not its own with torch.cuda.device(...)")
+    else:
+        r.fail("FIX-PROF F5 measure._new_event",
+               f"noncurrent_ok={ok_noncurrent!r} current_ok={ok_current!r}")
