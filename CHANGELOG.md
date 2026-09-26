@@ -5,6 +5,36 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.1] - 2026-09-26 — "Deterministic by design"
+
+A test-only fix. No product change, no pixel change, no `LANGUAGE_VERSION` move.
+
+**`v0.46.0` was tagged but never published to the registry.** Its CI test job failed,
+identically, on Python 3.10, 3.11 and 3.12, all on the same one test — a wall-clock
+microbenchmark asserting a cached module lookup is not slower than a fresh `import torch`.
+Because the test job failed, the publish job that follows it never ran. `v0.46.0`'s tag exists
+and its release commit is real, but no `v0.46.0` package ever reached the registry.
+**`v0.46.1` is the first published `v0.46`.**
+
+### Fixed
+
+- **The failing test compared the wrong thing under CI's own conditions.** CI runs every test
+  with coverage tracing always on; the workflow's `not slow` filter does not exclude the
+  `timing` marker, so this test ran there regardless. Coverage's line tracer taxes the extra
+  Python-level function call a cached lookup makes far more than it taxes a single bare
+  `import` bytecode, so the "not slower" claim inverts under tracing — confirmed by emulating
+  the tracer locally (`sys.settrace`) and reproducing the exact failure. Replaced with a
+  deterministic, box-independent contract test: it proves the actual claim (the cached path
+  imports `torch` zero times after warm-up), not a timing proxy for it. Two other wall-clock
+  assertions added since `v0.45.2` are now marked `@pytest.mark.timing` for consistency with
+  the rest of the tree, each independently re-verified safe under the same tracer emulation.
+
+### For anyone vendoring this tree
+
+No newly reserved names; `LANGUAGE_VERSION` unmoved at `"0.25"`; no default moves; no new
+shipping module filenames — the fix is entirely inside `tests/`. No cache cold-start: nothing
+in `tex_cache.py`'s three watch-lists is touched.
+
 ## [0.46.0] - 2026-09-26 — "Compiled, predictably"
 
 A minor release, author-approved. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze is
