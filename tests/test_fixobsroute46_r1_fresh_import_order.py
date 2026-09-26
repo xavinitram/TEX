@@ -43,8 +43,7 @@ def _custom_nodes_dir() -> str:
 #: specifically, not the SPLIT-I mixins, and they are internal `Interpreter`-composition
 #: pieces no product entry point or documented host seam imports standalone (unlike
 #: `tex_engine_tiers`, which SPLIT-E's re-export chain can genuinely reach first). Filed as
-#: a separate finding rather than fixed here — see
-#: `bug_reports/pending/PHASEC-OBSROUTE.md` — so this ratchet does not silently widen this
+#: a separate finding rather than fixed here, so this ratchet does not silently widen this
 #: ask's diff into three unrelated files.
 _OUT_OF_SCOPE = frozenset({
     "TEX_Wrangle.tex_runtime.interpreter_binding",
