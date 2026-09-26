@@ -396,3 +396,98 @@ def test_restore462_transient_open_failure_is_a_miss_not_a_deletion(r: SubTestRe
         shutil.rmtree(d, ignore_errors=True)
     except Exception as e:
         r.fail("RESTORE-462 transient open error", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+
+# ── RESTORE-462 §4: the per-user MAC key file itself is read in TEXT mode on Windows ───────────
+#
+# `_probe_key` reads the key with a raw `os.open(path, os.O_RDONLY)` / `os.read` — the low-level
+# fd path every OTHER writer in this module deliberately avoids by minting through
+# `tempfile.mkstemp` (which defaults to BINARY mode). With no `O_BINARY`, Windows opens the file
+# in TEXT mode: `os.read` stops at the first 0x1A (Ctrl-Z, the legacy text-mode EOF marker) and
+# folds every 0x0D 0x0A pair to 0x0A. A 32-byte random key contains a 0x1A byte with probability
+# 1-(255/256)**32 ~= 11.8% per mint (a CRLF-shaped byte pair is misread the same way), so roughly
+# one key in nine reads back SHORT, `_probe_key` classes it "malformed", `_resolve_or_create_key`
+# deletes it and mints a replacement — and every earlier process's signed spill / `.pkl` / `.cg`
+# then fails `load_verified` in every LATER process, with an intact trailer and a matching epoch:
+# the MAC verdict fires because the KEY changed under it, not because anything was tampered. This
+# is the actual cause behind the host's report; `_UNVERIFIED`-vs-`_UNREADABLE` above is a real,
+# separate defensive gap it does not explain.
+
+
+def test_restore462_probe_key_reads_the_key_file_in_binary_mode(r: SubTestResult):
+    print("\n--- RESTORE-462: _probe_key must not read the MAC key in text mode ---")
+    import TEX_Wrangle.tex_recovery as R
+    try:
+        home = Path(tempfile.mkdtemp())
+        keypath = home / R._MAC_KEY_FILE
+
+        # Two independent byte patterns, each well inside the ~11.8%-per-mint natural rate, not
+        # edge cases invented for the test: one trips the text-mode EOF byte, one trips CRLF
+        # folding.
+        key_ctrlz = bytes([0x1A]) + bytes(range(1, 32))                      # 32 bytes, has 0x1A
+        key_crlf = bytes(range(1, 15)) + b"\x0d\x0a" + bytes(range(15, 31))   # 32 bytes, has CRLF
+
+        for name, key in (("0x1A", key_ctrlz), ("CRLF", key_crlf)):
+            keypath.write_bytes(key)
+
+            # Test the read helper directly (meaningful on every platform: a persisted 32-byte
+            # key must always read back as the SAME 32 bytes).
+            kind, info = R._probe_key(str(keypath))
+            probe_ok = kind == "ok" and info == key
+            r.ok(f"_probe_key reads a {name}-containing key back unchanged") if probe_ok else \
+                r.fail(f"RESTORE-462 probe_key {name}", f"kind={kind} info={info!r}")
+
+            # A fresh-process-style reload: drop the memo, point the key home at this dir, and
+            # confirm the file comes back UNCHANGED (not replaced by a freshly minted key) and a
+            # signature made with it still verifies — the end-to-end shape of the host's report.
+            R._mac_key_cache = None
+            orig_home = R._mac_key_home
+            R._mac_key_home = lambda: str(home)
+            try:
+                reloaded = R._mac_key()
+            finally:
+                R._mac_key_home = orig_home
+            reload_ok = reloaded == key and keypath.read_bytes() == key
+
+            marker = home / f"sig_{name}"
+            signed = R.sign_pickle(str(marker), {"v": name})
+            verified = R.load_verified(str(marker)) if signed else None
+            sign_ok = signed and isinstance(verified, dict) and verified.get("v") == name
+
+            r.ok(f"a {name}-containing key survives a fresh-process reload and still signs/verifies") \
+                if (reload_ok and sign_ok) else r.fail(
+                    f"RESTORE-462 key reload {name}",
+                    f"probe_ok={probe_ok} reload_ok={reload_ok} sign_ok={sign_ok}")
+            R._mac_key_cache = None
+            keypath.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+
+        # Platform-portable lock, per the brief: assert the probe's os.open flags include
+        # O_BINARY WHERE the platform defines one — a real assertion on Windows, a harmless no-op
+        # (0 & 0 == 0) on a platform with none, but it still RUNS there, so this row is never
+        # skipped and still guards the exact call site against a future regression.
+        keypath.write_bytes(key_ctrlz)
+        captured = {}
+        real_open = R.os.open
+        target = os.path.abspath(str(keypath))
+
+        def capturing_open(path_, flags, *a, **kw):
+            if os.path.abspath(os.fspath(path_)) == target:
+                captured["flags"] = flags
+            return real_open(path_, flags, *a, **kw)
+
+        R.os.open = capturing_open
+        try:
+            R._probe_key(str(keypath))
+        finally:
+            R.os.open = real_open
+        want_bit = getattr(os, "O_BINARY", 0)
+        flags_ok = "flags" in captured and (captured["flags"] & want_bit) == want_bit
+        r.ok("the probe's os.open flags include O_BINARY on a platform that defines one") \
+            if flags_ok else r.fail("RESTORE-462 probe_key flags",
+                                     f"captured={captured} want_bit={want_bit}")
+
+        shutil.rmtree(home, ignore_errors=True)
+    except Exception as e:
+        r.fail("RESTORE-462 probe_key binary mode",
+               f"{type(e).__name__}: {e}\n{traceback.format_exc()}")

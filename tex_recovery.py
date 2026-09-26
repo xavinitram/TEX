@@ -406,9 +406,18 @@ def _probe_key(path: str):
                                              remove only this exact file (N1);
       ("absent", None)                     — it does not exist (go create);
       ("unreadable", None)                 — any other open/read error (never remove it).
-    """
+
+    RESTORE-462: BINARY, explicitly. Every OTHER writer in this module mints its fd through
+    `tempfile.mkstemp` (binary-mode by default) and never hits this; this is the one place a raw
+    `os.open` reads binary state, and with no `O_BINARY` Windows opens it in TEXT mode — `os.read`
+    then stops at the first 0x1A (Ctrl-Z, the legacy text-mode EOF marker) and folds every 0x0D
+    0x0A pair to 0x0A. A uniformly random 32-byte key contains a 0x1A byte on ~11.8% of mints
+    (1-(255/256)**32); such a key reads back SHORT here, `_probe_key` classes it "malformed" below,
+    and the caller deletes and re-mints it — silently invalidating every earlier process's signed
+    spill/`.pkl`/`.cg`, which then fail the MAC in every later process with an intact trailer and a
+    matching epoch (the key changed under them, nothing was tampered)."""
     try:
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except FileNotFoundError:
         return ("absent", None)
     except OSError:
