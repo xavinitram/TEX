@@ -867,8 +867,25 @@ class RoiPlan:
 _NOT_EXECUTABLE = RoiPlan(False)
 
 
+def _scale_halo(halo: int, scale: float) -> int:
+    """SCALE-47b: apply a cook's resolution scale to an already-composed pixel margin,
+    ceiling up -- never down (the same discipline `_call_reach`'s `mult` already
+    established at `tex_roi.py:151`). Applied HERE, after `_walk`'s memoized per-program
+    walk has already produced the scale-INDEPENDENT composed halo (the max narrowable
+    reach anywhere in the program), rather than threaded into the walk/memo itself: the
+    walk's answer does not depend on scale, so re-deriving it per scale value would only
+    add memo-key churn for no new information. `scale=1.0` (every caller that never
+    mentions scale) is a no-op multiply-then-ceil of an already-integer value, so it costs
+    nothing observable and changes nothing (invariant #7). `WHOLE_FRAME` (a non-executable
+    plan's sentinel) is a saturating pixel count, not a real reach -- scaling it down would
+    misrepresent "cook everything" as a bounded margin, so it is left untouched."""
+    if halo >= WHOLE_FRAME:
+        return halo
+    return int(math.ceil(halo * scale))
+
+
 def roi_plan(code: str, param_values: dict | None = None,
-             binding_types: dict | None = None) -> RoiPlan:
+             binding_types: dict | None = None, scale: float = 1.0) -> RoiPlan:
     """The ROI-3 plan for cooking this program on a sub-region. Not executable — cook
     whole-frame — when: the analysis fails; the program scatters (`@OUT[x,y]=`); a halo op
     has a symbolic radius; a halo op is ungrounded (behind a local var / function / loop, so
@@ -890,11 +907,16 @@ def roi_plan(code: str, param_values: dict | None = None,
     `binding_types` is the cook's `{name: TEXType}` map. It is optional and defaults to "not
     supplied", which is the CONSERVATIVE read for everything the plan decides — but a caller
     that has the map should pass it, because a STRING wire merged under a per-pixel branch is
-    region-dependent and nothing in the source says a wire holds a string."""
+    region-dependent and nothing in the source says a wire holds a string.
+
+    `scale` (SCALE-47b): the cook's resolution-scale multiplier, applied to the composed halo
+    margin AFTER the (scale-independent) walk, ceiling up. Default `1.0` is a no-op — the exact
+    pre-SCALE-47b value (invariant #7)."""
     walked = _walk(code, param_values or {}, binding_types)
     if walked is None:
         return _NOT_EXECUTABLE
     reads, blocked, halo, fold_erased, region_dep = walked
+    halo = _scale_halo(halo, scale)
     if blocked or region_dep:
         # TRK-25: a region-dependent program is refused for a reason orthogonal to the
         # footprint — its ITERATION count, not its reach, is what the window would change.
@@ -1110,7 +1132,7 @@ WHOLE_FRAME = 1 << 30
 
 
 def stage_halo(code: str, param_values: dict | None = None,
-               binding_types: dict | None = None) -> int:
+               binding_types: dict | None = None, scale: float = 1.0) -> int:
     """The neighbour reach one stage reads, as a margin in pixels.
 
     THE INVERSION, and the whole reason this is a function rather than `roi_plan(...).halo`:
@@ -1120,9 +1142,13 @@ def stage_halo(code: str, param_values: dict | None = None,
     window and leaves precisely the stale ring this composition exists to prevent, i.e. it
     inverts the whitelist posture (unknown → whole image) into its most dangerous form.
 
+    `scale` (SCALE-47b): the cook's resolution-scale multiplier — the margin shrinks with the
+    canvas the same way the pixel-unit VALUE fed to the kernel does (`gauss_blur`'s sigma etc,
+    `pixel_args=`), ceiling up. Default `1.0` is byte-identical to the pre-SCALE-47b answer.
+
     Never raises: `roi_plan` doesn't, and a reach question must always have a conservative
     answer. `binding_types` rides through to `roi_plan` for the same reason it exists there."""
-    plan = roi_plan(code, param_values or {}, binding_types)
+    plan = roi_plan(code, param_values or {}, binding_types, scale=scale)
     return int(plan.halo) if plan.executable else WHOLE_FRAME
 
 
@@ -1140,7 +1166,7 @@ def covers(valid, needed) -> bool:
 
 
 def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
-                  declined=()) -> "list | None":
+                  declined=(), scale: float = 1.0) -> "list | None":
     """The window each stage of a linear chain must cook so the FINAL window is correct.
 
     `halos[i]` is stage i's own reach (from `stage_halo`); `roi` is the 6-tuple window wanted
@@ -1191,7 +1217,15 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
     than by asking hosts to track something they do not control. A declined stage whose own input
     was not whole-frame-valid poisons validity downward, and this returns `None`.
 
+    `scale` (SCALE-47b): accepted for API symmetry with `stage_halo`/`roi_plan` (both of which
+    take the same kwarg) and validated (`scale > 0`), but performs no scaling of its own here —
+    `halos` is already the caller's `stage_halo(..., scale=...)` output, in whatever canvas's
+    pixels this call's `roi` is also expressed in, so re-scaling here would double-apply it.
+    Default `1.0` — the exact pre-SCALE-47b call shape.
+
     Pure arithmetic — this module stays torch-free."""
+    if scale <= 0:
+        raise ValueError(f"chain_windows: scale must be > 0, got {scale!r}")
     n = len(halos)
     # P0-4a: a stage that DECLINED its window cooked whole-frame from a possibly-stale input, so
     # its "valid everywhere" record is only true if its input really was whole-frame valid. Any
