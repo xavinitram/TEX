@@ -329,6 +329,41 @@ def test_p2_cook_done_event_caches_on_its_own_raw_value_not_resets(r):
     _ = spy
 
 
+# ── P7 (Phase C): the public record_on(event, device) seam ────────────────────────
+
+def test_p7_record_on_skips_device_ctx_when_current(r):
+    """P7: `pacing.record_on(event, device)` is the public seam a future caller elsewhere
+    in `tex_runtime` (FIX-PROF's `profile.py`, per the reuse/efficiency reviews) can use
+    instead of duplicating this module's own device-context-skip discipline. On an
+    already-current device it must record with no `torch.cuda.device(...)` entry, exactly
+    like `paced_check`'s own event-record step."""
+    print("\n--- P7: record_on skips torch.cuda.device(...) when the device is current ---")
+    with _DeviceSpy(current=0) as spy:
+        ev = _FakeEvent()
+        _pace.record_on(ev, "cuda:0")
+    if spy.calls:
+        r.fail("P7 record_on skip", f"torch.cuda.device(...) was entered {len(spy.calls)} "
+               f"time(s) for an already-current device: {spy.calls}")
+    else:
+        r.ok("record_on recorded on an already-current device with no context-manager entry")
+
+
+def test_p7_record_on_enters_device_ctx_when_not_current(r):
+    """P7: on a genuinely non-current device, `record_on` must enter
+    `torch.cuda.device(device)` before recording -- the same O4 correctness this module's
+    own poll points already carry, now available to a caller outside this module."""
+    print("\n--- P7: record_on enters torch.cuda.device(...) for a non-current device ---")
+    with _DeviceSpy(current=0) as spy:
+        ev = _FakeEvent()
+        _pace.record_on(ev, "cuda:1")
+    if spy.calls != ["cuda:1"]:
+        r.fail("P7 record_on non-current", f"expected one torch.cuda.device('cuda:1') entry, "
+               f"got {spy.calls}")
+    else:
+        r.ok("record_on entered torch.cuda.device('cuda:1') exactly once for a non-current "
+             "device")
+
+
 def test_o5_reset_with_no_args_still_reads_as_unpaced(r):
     """Backward-compat: a caller that still calls `reset()` with no arguments (there should
     be none left in this tree, but the contract matters) gets the same answer the old

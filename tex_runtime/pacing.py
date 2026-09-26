@@ -237,6 +237,28 @@ def _record_on(ev, device, is_current) -> None:
             ev.record()
 
 
+def record_on(event, device) -> None:
+    """P7 (Phase C): the public seam — record *event* on *device*'s current stream the same
+    way this module's own poll points do, skipping the `torch.cuda.device(...)` context
+    manager (OVERHEAD-462) when *device* is already the thread's ambient-current CUDA
+    device. For a caller elsewhere in `tex_runtime` that already knows its event belongs on
+    a CUDA device and wants this module's device-context-skip discipline without
+    duplicating it (`profile.py`'s own event-recording helpers are exactly this shape today
+    — R1#2/R3#4 in the Phase C simplification/efficiency reviews) — a future caller, not
+    this module's own `paced_check`/`cook_done_event`, which read `reset()`'s cached
+    `is_current` directly rather than paying this function's own fresh resolve.
+
+    Resolves *device*'s is-current answer FRESH, via `_resolve_cuda_target`, rather than
+    trusting any cache of this module's own: a caller reaching this function may not have
+    gone through `reset()` at all, or may be recording for a DIFFERENT device than the
+    active cook's, so nothing here assumes a prior call happened on this thread. Like
+    `_record_on` itself, this is for a CUDA event on a CUDA device — calling it for a
+    non-CUDA device is the caller's error to avoid, the same contract every other CUDA-only
+    call in this module already carries."""
+    _, _, is_current = _resolve_cuda_target(device)
+    _record_on(event, device, is_current)
+
+
 def reset(token=None, device=None) -> None:
     """Start a fresh poll sequence with no pacing history to inherit. Called once at the top
     of every cook via `stdlib_core.set_cook_grid` — the one seam every tier already uses to
