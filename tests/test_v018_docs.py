@@ -277,6 +277,12 @@ _NOT_A_CACHE = {
                                 "per armed cache), so that it is not itself one",
     "tex_provider._versions": "DATA-5 per-source generation counters -- the INVALIDATION "
                               "source a cache key reads, not a cached value",
+    "tex_recovery._unreadable_streak": "FIX-REC R4 per-path CONSECUTIVE open/read-failure "
+                                       "counter that decides when load_verified escalates a "
+                                       "transient-looking failure to give-up -- an "
+                                       "ESCALATION-DECISION input, not a cached value; holds "
+                                       "no file content, and is cleared the moment that exact "
+                                       "path is read successfully, or the moment it escalates",
     "codegen_persist._LINECACHE_KEYS": "bounded ledger of registered pseudo-filenames so "
                                        "linecache can be pruned; holds keys, no values",
     "graphed._keepalive": "MEM-1 strong references that keep a captured graph's baked "
