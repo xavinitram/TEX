@@ -217,15 +217,26 @@ def test_codegen_param_placement_learned_once(r: SubTestResult):
                                                   compile_mode="auto")
                             _served_by(f"[{dev}] {name} cook {i + 1}", "codegen")
                             same(ref, res.outputs["OUT"], f"[{dev}] {name} cook {i + 1}")
+                        # C2 (v0.46 Phase C): freeze the counted totals HERE, before anything
+                        # else. The last cook above may have submitted a background warm job
+                        # (CC-5); for a program with no real torch.compile cost (the
+                        # codegen-only eager adapter) that job can complete within
+                        # microseconds — possibly before `finally` below restores the real
+                        # `place`/`invoke` functions — so exactly WHEN it resolves must never
+                        # decide this assertion. Snapshot first, drain (flush this row's own
+                        # async work) second: the drain can still touch `calls` if it wins
+                        # that race, but `snapshot` no longer can.
+                        snapshot = dict(calls)
+                        C._drain_bg_for_test()
                     finally:
                         C._params_on_device, C._invoke_cg = real_place, real_invoke
                 learns = dev != "cpu" and name == "f$gain probe"
                 want = ({"placements": cooks, "codegen calls": cooks + 1} if learns
                         else {"placements": 0, "codegen calls": cooks})
-                assert calls == want, f"[{dev}] {name}: {calls}, expected {want}"
+                assert snapshot == want, f"[{dev}] {name}: {snapshot}, expected {want}"
                 r.ok(f"[{dev}] {name}: {cooks} cooks served by codegen "
                      f"({'bit-exact' if same is _assert_equal else 'within 1e-5'}), "
-                     f"{calls['placements']} placements, {calls['codegen calls']} codegen calls")
+                     f"{snapshot['placements']} placements, {snapshot['codegen calls']} codegen calls")
             except Exception as e:
                 r.fail(f"placement learned once [{dev}] {name}", f"{type(e).__name__}: {e}")
 

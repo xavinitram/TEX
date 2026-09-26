@@ -1247,6 +1247,20 @@ def _bg_status(cache_key) -> str:
     return "failed"
 
 
+def _drain_bg_for_test(timeout: float = 10.0) -> None:
+    """Test-only (C2, v0.46 Phase C): wait out and forget every in-flight background
+    compile/warm job, so a job started by an EARLIER `cold_engine_state` block cannot
+    reach a monkeypatched module-level seam (`_invoke_cg`/`_params_on_device`) during a
+    LATER block and inflate that block's own spy counts (B5#1). Never raises: a job that
+    errors or times out is still forgotten, leaving no artifact behind."""
+    for cache_key, fut in list(_bg_futures.items()):
+        try:
+            fut.result(timeout=timeout)
+        except Exception:
+            pass
+        _bg_futures.pop(cache_key, None)
+
+
 def _run_cached_compiled(cache_key, program, bindings, type_map, device,
                          latent_channel_count, output_names, device_type,
                          timed):

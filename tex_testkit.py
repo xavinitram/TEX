@@ -74,9 +74,9 @@ class cold_engine_state:
 
     def __enter__(self):
         from TEX_Wrangle import tex_cache
-        from TEX_Wrangle.tex_runtime import graphed, warm_state, profile, autotier
+        from TEX_Wrangle.tex_runtime import graphed, warm_state, profile, autotier, compiled
         self._cache_mod, self._graphed, self._ws = tex_cache, graphed, warm_state
-        self._prof, self._autotier = profile, autotier
+        self._prof, self._autotier, self._compiled = profile, autotier, compiled
         self.dir = tempfile.mkdtemp(prefix="tex_cold_")
         self._prev_env = os.environ.get("TEX_CACHE_DIR")
         self._prev_cache = tex_cache._cache_instance
@@ -91,6 +91,27 @@ class cold_engine_state:
         return self
 
     def __exit__(self, *exc):
+        if self.warm:
+            # C2 (v0.46 Phase C, B5#1): drain BEFORE restoring anything else, so a warm
+            # job still in flight when THIS block ends cannot fire its call into
+            # `_invoke_cg`/`_params_on_device` (or any other module-level seam a test
+            # inside this block monkeypatched) after the block's own patches are already
+            # gone — or, worse, during a LATER block's own `cold_engine_state`, where it
+            # would silently inflate that later block's own spy counts on the very same
+            # seams (measured: a 1-in-3 flake in
+            # `test_codegen_param_placement_learned_once`'s learned-once pin).
+            #
+            # Deliberately EXIT-side only, not also on __enter__: draining on entry too
+            # was tried and measured WORSE — it frees the (single-worker) background pool
+            # right before this block's OWN first submission, and for a program with no
+            # real torch.compile cost (the codegen-only eager adapter) that pool being
+            # instantly available let ITS OWN warm job complete and call the STILL-
+            # INSTALLED spy before this block's own `finally` restored it, turning an
+            # occasional cross-test leak into a deterministic same-block miscount. Exit
+            # already drains every block that used this fixture, so by the time the NEXT
+            # block's __enter__ runs there is nothing left over to catch anyway — the
+            # entry-side call bought no additional safety, only a new race.
+            self._compiled._drain_bg_for_test()
         if self._prev_env is None:
             os.environ.pop("TEX_CACHE_DIR", None)
         else:
