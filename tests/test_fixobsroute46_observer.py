@@ -21,6 +21,7 @@ import threading
 import time
 import warnings
 
+import pytest
 import torch
 
 from TEX_Wrangle import tex_engine
@@ -170,13 +171,22 @@ def test_o3_scope_context_manager_exists_and_behaves_like_enter_leave(r):
         r.fail("FIX-OBSROUTE O3 unregistered", f"expected no events, got {events}")
 
 
+@pytest.mark.timing
 def test_o3_scope_zero_cost_when_unregistered(r):
     """O3's zero-cost requirement, proved by microbenchmark rather than asserted: with
     nothing registered, `with cook_observer.scope(entry): pass` must be negligible next to a
     real cook — this codebase's own convention for "zero cost when disabled" claims
     (see pacing.py / cook_observer.py's own docstrings, and R3's ~35ns per-call measurement
     for the analogous `import torch` question). Generous bound (10 microseconds) so this
-    holds across box load; the point is "not a new bottleneck", not a tight pin."""
+    holds across box load; the point is "not a new bottleneck", not a tight pin.
+
+    Marked `timing` (CI-461 audit): a wall-clock deadline claim, same class as the R3
+    microbenchmark CI-461 replaced. Unlike R3's tight 2x ratio between two DIFFERENT code
+    shapes (a function call vs. a bare bytecode -- exactly what a line tracer taxes
+    unevenly), this is a single-shape absolute bound with over an order of magnitude of
+    headroom (measured ~700ns/call under a `sys.settrace` no-op tracer standing in for
+    coverage.py, against a 10,000ns bound), so it stays green under `--cov`; marked anyway
+    for consistency and because the gate's own cheap/full tiers exclude `timing`."""
     print("\n--- FIX-OBSROUTE O3: scope() overhead is negligible when unregistered ---")
     assert not cook_observer._callbacks, "test premise: nothing registered here"
     N = 200_000

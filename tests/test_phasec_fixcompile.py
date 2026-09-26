@@ -17,6 +17,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 from helpers import *  # noqa: F401,F403
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime import compiled as C
@@ -50,7 +52,15 @@ def _tiny_program():
 
 # ── C1: warm_call must never share a pool with a blocking trial/committed submit ────
 
+@pytest.mark.timing
 def test_c1_warm_never_stalls_a_different_keys_compile_pool_submit(r: SubTestResult):
+    """Marked `timing` (CI-461 audit): `elapsed_ms < 350.0` is a wall-clock deadline claim
+    against a real 0.5s background sleep, same class as the R3 microbenchmark CI-461
+    replaced. Verified safe under a `sys.settrace` no-op tracer standing in for coverage.py
+    (passed with the full 350ms margin intact — the assertion is about thread-pool
+    isolation, not a tight ratio between two differently-shaped code paths, so a line
+    tracer's per-call tax does not erode it the way it did R3's). Marked anyway for
+    consistency with the repo's convention for deadline-style assertions."""
     print("\n--- C1: another key's compile-wrap must not queue behind this key's warm ---")
     _prewarm_dynamo_import()
     key_a = ("c1_a_fp", "cpu", "fp32")

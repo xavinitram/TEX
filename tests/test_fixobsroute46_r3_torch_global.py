@@ -14,8 +14,8 @@ process reads the cached module object straight off the global — `check()`'s o
 never touches it, so LINT-46's contract is unaffected (re-checked here too, structurally).
 """
 import ast
+import builtins
 import pathlib
-import time
 
 import torch
 
@@ -145,31 +145,50 @@ def test_r3_check_still_never_imports_torch(r):
         tex_marshalling._torch = saved
 
 
-def test_r3_microbenchmark_cached_lookup_is_not_slower_than_a_fresh_import(r):
-    """Informational-but-gated microbenchmark: repeatedly calling `_torch_mod()` (module-
-    global cache, post-warm) must not be slower than a bare `import torch` statement
-    executed the same number of times — the whole point of caching a resolved reference
-    instead of re-running IMPORT_NAME every call. Generous (2x) bound so this holds across
-    box load; the claim is "not a regression", not a tight timing pin."""
-    print("\n--- FIX-OBSROUTE R3: cached lookup is not slower than a fresh import ---")
-    N = 200_000
+def test_r3_cached_lookup_performs_no_reimport(r):
+    """Deterministic replacement for a former wall-clock microbenchmark (CI-461): the old
+    version compared `_torch_mod()` post-warm against a bare `import torch` statement on a
+    generous 2x bound and went red in CI on Python 3.10/3.11/3.12 alike, all under
+    `pytest --cov` — coverage's line tracer taxes the extra Python-level function call
+    `_torch_mod()` makes far more than it taxes a single `IMPORT_NAME` bytecode, so the
+    "not slower" claim inverts under tracing (replayed locally with a no-op `sys.settrace`
+    tracer standing in for coverage.py: the cached path went from ~2x FASTER than a bare
+    import untraced to ~3x SLOWER than it while traced). A wall-clock bound can't tell
+    "the cache isn't paying for itself" apart from "a tracer is running"; the actual
+    contract can: after the first call warms the cache, later calls import nothing at all.
+    """
+    print("\n--- FIX-OBSROUTE R3: cached lookup performs no re-import ---")
+    saved = tex_marshalling._torch
+    try:
+        tex_marshalling._torch = None
+        tex_marshalling._torch_mod()   # warm the cache — the one call allowed to import
 
-    tex_marshalling._torch_mod()   # warm the cache
-    t0 = time.perf_counter()
-    for _ in range(N):
-        tex_marshalling._torch_mod()
-    cached_elapsed = time.perf_counter() - t0
+        real_import = builtins.__import__
+        import_count = 0
 
-    t0 = time.perf_counter()
-    for _ in range(N):
-        import torch as _t   # noqa: F401  (measuring the statement itself, not using _t)
-    fresh_elapsed = time.perf_counter() - t0
+        def _counting_import(name, *args, **kwargs):
+            nonlocal import_count
+            if name == "torch":
+                import_count += 1
+            return real_import(name, *args, **kwargs)
 
-    bound = fresh_elapsed * 2.0 + 1e-6
-    if cached_elapsed <= bound:
-        r.ok(f"cached _torch_mod(): {cached_elapsed*1e9/N:.1f} ns/call vs bare "
-             f"`import torch`: {fresh_elapsed*1e9/N:.1f} ns/call over {N} calls")
-    else:
-        r.fail("FIX-OBSROUTE R3 microbenchmark", f"cached _torch_mod() ({cached_elapsed:.4f}s) "
-               f"was more than 2x slower than a bare `import torch` ({fresh_elapsed:.4f}s) "
-               f"over {N} calls — the cache is not paying for itself")
+        last = None
+        builtins.__import__ = _counting_import
+        try:
+            for _ in range(500):
+                last = tex_marshalling._torch_mod()
+        finally:
+            builtins.__import__ = real_import
+
+        if import_count != 0:
+            r.fail("FIX-OBSROUTE R3 microbenchmark", f"_torch_mod() re-imported torch "
+                   f"{import_count} time(s) across 500 post-warm calls — the cache is not "
+                   f"doing its job")
+        elif last is not torch:
+            r.fail("FIX-OBSROUTE R3 microbenchmark", "a post-warm _torch_mod() call did not "
+                   "return the real torch module")
+        else:
+            r.ok("500 post-warm _torch_mod() calls performed 0 imports and returned the "
+                 "cached module")
+    finally:
+        tex_marshalling._torch = saved
