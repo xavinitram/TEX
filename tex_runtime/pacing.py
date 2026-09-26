@@ -78,8 +78,8 @@ float; `0` disables striding, recording at every poll exactly as depth-only paci
 The shape above — skip purely on HOST-elapsed time — was found to make `stride` leak into
 the correctness bound rather than staying a pure cost knob: measured (see the hand-back) that
 on a box whose host dispatch is fast relative to its own device compute (sm_75, paired with a
-fast desktop CPU), a chain of few,
-device-expensive statements (`medium`/`heavy`) can have SEVERAL statements' worth of host
+fast desktop CPU), a chain of few, device-expensive statements (`medium`/`heavy`) can have
+SEVERAL statements' worth of host
 dispatch complete inside one stride window — so the window's one record covers several
 statements' worth of enqueued device work, and the pool's "outstanding" count under-counts
 what is really queued. `depth` then bounds something smaller than `depth` poll-intervals of
