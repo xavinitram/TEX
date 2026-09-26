@@ -1071,9 +1071,11 @@ class ResultCache(_ResultCacheResidency):
             # miss left on disk exactly like FUTURE_TRAILER — never a deletion. Collapsing the two
             # deleted a perfectly valid, previously-spilled frame on a passing transient failure
             # to even open it (an own spill intermittently rejected on restore, across processes).
-            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER, _UNREADABLE
+            # R1: FUTURE_TRAILER/UNREADABLE's shared "leave it, just miss" action is one place
+            # (`tex_recovery._is_decline_quietly`), not spelled out at each of the three sites.
+            from .tex_recovery import load_verified, _UNVERIFIED, _is_decline_quietly
             rec = load_verified(path)
-            if rec is _FUTURE_TRAILER or rec is _UNREADABLE:
+            if _is_decline_quietly(rec):
                 return None, None, None            # leave it, just miss (never destroy on either)
             if rec is _UNVERIFIED:
                 try:

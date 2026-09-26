@@ -692,7 +692,9 @@ class TEXCache:
             # RESTORE-462: UNREADABLE (open/read itself failed — transient) is not UNVERIFIED
             # (opened fine, content bad) — it says nothing about the content, so it is a silent
             # miss that recompiles THIS time, left on disk for a retry to find good, not deleted.
-            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER, _UNREADABLE
+            # R1: FUTURE_TRAILER/UNREADABLE's shared "leave it, just miss" action is one place
+            # (`tex_recovery._is_decline_quietly`), not spelled out at each of the three sites.
+            from .tex_recovery import load_verified, _UNVERIFIED, _is_decline_quietly
             data = load_verified(path)
             if data is _UNVERIFIED:
                 try:
@@ -700,7 +702,7 @@ class TEXCache:
                 except OSError:
                     pass                             # F6: an undeletable file is a silent miss
                 return None
-            if data is _FUTURE_TRAILER or data is _UNREADABLE:
+            if _is_decline_quietly(data):
                 return None                          # leave it, just miss (never destroy on either)
 
             # Version check — stale entries are deleted (CACHE-4: AST epoch gates the .pkl)
@@ -878,7 +880,9 @@ class TEXCache:
             # re-read window — F1).
             # RESTORE-462: UNREADABLE (open/read itself failed — transient) is not UNVERIFIED
             # (opened fine, content bad) — a silent miss left on disk, never deleted.
-            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER, _UNREADABLE
+            # R1: FUTURE_TRAILER/UNREADABLE's shared "leave it, just miss" action is one place
+            # (`tex_recovery._is_decline_quietly`), not spelled out at each of the three sites.
+            from .tex_recovery import load_verified, _UNVERIFIED, _is_decline_quietly
             data = load_verified(path)
             if data is _UNVERIFIED:
                 try:
@@ -886,7 +890,7 @@ class TEXCache:
                 except OSError:
                     pass                             # F6: an undeletable file is a silent miss
                 return None
-            if data is _FUTURE_TRAILER or data is _UNREADABLE:
+            if _is_decline_quietly(data):
                 return None                          # leave it, just miss (never destroy on either)
             if (data.get("version") != _CODEGEN_EPOCH
                     or data.get("magic") != _BYTECODE_MAGIC):

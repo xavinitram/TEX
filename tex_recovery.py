@@ -263,6 +263,25 @@ _UNVERIFIED = object()
 _FUTURE_TRAILER = object()
 _UNREADABLE = object()
 
+
+def _is_decline_quietly(verdict) -> bool:
+    """True for a `load_verified` verdict that means "leave the file on disk — it is a miss,
+    never a delete": `_FUTURE_TRAILER` or `_UNREADABLE`. `_UNVERIFIED` is the odd one out (a
+    caller MAY delete it) and is deliberately not part of this.
+
+    R1 (v0.46.2 Phase C, altitude): before this, all three callers of `load_verified`
+    (`tex_cache._load_from_disk`, `tex_cache._load_codegen_from_disk`, `tex_results._restore`)
+    hand-spelled `is _FUTURE_TRAILER or is _UNREADABLE` — RESTORE-462's own diff already landed
+    the identical line twice, and a caller had no way to tell it was re-deriving a grouping this
+    module already owns. One place now owns the verdict→action mapping; each call site just
+    asks it and keeps its own return shape (`None`, or a wider tuple of `None`s).
+
+    Identity-only (`is`, never `==`), because `verdict` can be an arbitrary deserialised object
+    (a cache record dict, a tensor) and `==` against one of those is not guaranteed to be a
+    plain bool — a tensor's `__eq__` returns an elementwise tensor, which is exactly the
+    ambiguous-truth-value trap a membership test (`verdict in (...)`) would walk into."""
+    return verdict is _FUTURE_TRAILER or verdict is _UNREADABLE
+
 _mac_key_cache: bytes | None = None
 _mac_key_lock = threading.Lock()
 
