@@ -312,6 +312,12 @@ class ExecContext:
     # TRK-25: the `{name: TEXType}` map this cook compiled against. The source alone cannot
     # say a wire holds a STRING, and a string merged per pixel is voted on over the region.
     binding_types: Any = None
+    # SCALE-47b: the per-cook resolution-scale multiplier for pixel-unit stdlib arguments
+    # (SCALE-47-design.md), or None (the default — untouched, zero cost, invariant #7). Unlike
+    # `time_context`/`roi`, this VALUE also rides the lineage/checkpoint key (phase 5) — it is a
+    # value on the ExecContext because it is threaded to the interpreter/codegen call sites the
+    # same way `time_context` is, not because it shares that field's never-keyed contract.
+    scale: Any = None
 
 
 @dataclass(frozen=True)
@@ -534,7 +540,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             roi: tuple | None = None, roi_exec: bool | None = None,
             want_lineage: bool = False, want_noise_tiers: bool = False,
             upstream_keys: tuple = (), cancel=None, on_progress=None,
-            binding_meta: dict | None = None) -> CookPlan:
+            binding_meta: dict | None = None, scale: float | None = None) -> CookPlan:
     """Resolve everything a cook needs *without running it*: compile (or splice a fused
     chain), resolve the device, gate the outputs and references, fold params, resolve
     `precision="auto"`, and select the tier.
@@ -554,6 +560,16 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     result, and `cook()`'s own contract is to return RAW tensors with no profile applied at
     all. So it is a parameter, and the caller — which is the only party that knows —
     decides.
+
+    `scale` (SCALE-47b): a per-cook resolution-scale multiplier for pixel-unit stdlib arguments
+    (`gauss_blur`'s sigma, `erode`/`dilate`'s radius, `bilateral_filter`'s spatial_sigma) and the
+    halo margin they derive — the enabler for "cook a cheap proxy, same picture, downscaled".
+    `None` (the default — no ComfyUI caller passes this) is untouched and zero-cost: no runtime
+    multiply is emitted or evaluated, the tier selection is unaffected, and ROI/lineage/checkpoint
+    keys are exactly as they were (invariant #7). Non-None forces the cook onto the interpreter
+    tier (the only tier that currently honours it) and declines an ROI window (not yet reconciled
+    with scale). Only the stdlib functions tagged `pixel_args=` scale; a program that reads pixel
+    coordinates directly is unaffected and will not look like "the same picture, downscaled".
 
     Pass False ONLY if you can prove your own egress already materializes. `tex_node` can:
     its clamp allocates a fresh tensor on the way out, which is the accident that kept the
@@ -817,7 +833,13 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     _roi_why = None
     if roi is not None and tier_id == "default" and not fused_chain and not has_latent_input:
         from . import tex_roi as _tex_roi
-        if not _tex_roi.roi_exec_enabled(roi_exec):
+        if scale is not None:
+            # SCALE-47b: ROI narrowing and a scale-active cook are not yet reconciled (the
+            # narrow-cook-crop machinery has no notion of a resolution multiplier) — declined
+            # the same way every other ROI ineligibility is, whole-frame at the requested
+            # scale, never a wrong-shaped window.
+            _roi_why = "roi declined: scale is active (not yet reconciled with ROI narrowing)"
+        elif not _tex_roi.roi_exec_enabled(roi_exec):
             _roi_why = "roi not armed (pass roi_exec=True or set TEX_ROI_EXEC=1)"
         else:
             # Cheap ARITHMETIC validation only (no `image_wh`, so no binding scan): it rejects a
@@ -879,7 +901,8 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
                       eff_precision, fp, fused_chain, fused_fp, time_context,
                       free_hint, roi_out, roi_plan_obj,  # ROI-3 window + plan (None unless armed)
                       cancel, on_progress,               # SCHED-3 (None unless a host passed them)
-                      binding_meta, binding_types)       # DATA-1 tags; TRK-25's {name: TEXType} map
+                      binding_meta, binding_types,        # DATA-1 tags; TRK-25's {name: TEXType} map
+                      scale)                              # SCALE-47b (None unless a host passed it)
     return CookPlan(ctx=ctx, tier_id=tier_id, assigned=assigned_bindings,
                     auto_fp16=auto_fp16, debug_nan_highlight=debug_nan_highlight,
                     cook_px=cook_px, auto_ckey=auto_ckey, disown=disown,
