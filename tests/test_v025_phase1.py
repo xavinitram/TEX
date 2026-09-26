@@ -497,6 +497,10 @@ _WATCHED = {
     # TRK-189 / SPLIT-I: the three mixins `interpreter.py` was split into — moved
     # interpreter code, so they must gate the same .cg tier `interpreter.py` does.
     "interpreter_spatial.py", "interpreter_control_flow.py", "interpreter_binding.py",
+    # SPLIT-47 (TRK-210): the static-program-analysis leaf and the shared tensor-value
+    # helpers `interpreter.py` was split into — moved interpreter code, so they must gate
+    # the same .cg tier `interpreter.py` does, same reason as the SPLIT-I row above.
+    "interpreter_analysis.py", "interpreter_values.py",
     # LANG-L5: the language-0.25 semantics (`masked_flow.py`) and their emitter
     # (`codegen_masked.py`). Watched from the commit that adds them rather than from the
     # release that makes them reachable, so an edit to either cannot leave a stale `.cg`.
