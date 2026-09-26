@@ -73,14 +73,14 @@ class _StdlibSample:
         x = x.permute(0, 2, 3, 1)         # [B,H,W,C]
         return x.squeeze(-1) if squeeze else x
 
-    @stdlib("erode", sig='erode(img, radius) \\u2192 vec', category='Sampling', sync=True, footprint=('halo_arg', 1), doc='Morphological erosion (local min over a (2r+1)² square). Shrinks bright regions.', ex='@OUT = erode(@mask, 3);')
+    @stdlib("erode", sig='erode(img, radius) \\u2192 vec', category='Sampling', sync=True, footprint=('halo_arg', 1), pixel_args=(1,), doc='Morphological erosion (local min over a (2r+1)² square). Shrinks bright regions.', ex='@OUT = erode(@mask, 3);')
     @staticmethod
     def fn_erode(image, radius) -> torch.Tensor:
         """Grayscale erosion (local min over a (2r+1)² square). Shrinks bright
         regions; the classic mask-shrink op."""
         return TEXStdlib._morph(image, radius, grow=False)
 
-    @stdlib("dilate", sig='dilate(img, radius) \\u2192 vec', category='Sampling', sync=True, footprint=('halo_arg', 1), doc='Morphological dilation (local max). Grows bright regions.', ex='@OUT = dilate(@mask, 3);')
+    @stdlib("dilate", sig='dilate(img, radius) \\u2192 vec', category='Sampling', sync=True, footprint=('halo_arg', 1), pixel_args=(1,), doc='Morphological dilation (local max). Grows bright regions.', ex='@OUT = dilate(@mask, 3);')
     @staticmethod
     def fn_dilate(image, radius) -> torch.Tensor:
         """Grayscale dilation (local max over a (2r+1)² square). Grows bright
@@ -463,7 +463,7 @@ class _StdlibSample:
         """
         return _sample_mip_trilinear(image, u_coord, v_coord, lod, _get_mip_pyramid)
 
-    @stdlib("gauss_blur", sig='gauss_blur(img, sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0), doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.', ex='@OUT = gauss_blur(@A, 2.0);')
+    @stdlib("gauss_blur", sig='gauss_blur(img, sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0), pixel_args=(1,), doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.', ex='@OUT = gauss_blur(@A, 2.0);')
     @staticmethod
     def fn_gauss_blur(image, sigma) -> torch.Tensor:
         """Separable Gaussian blur.
@@ -490,7 +490,7 @@ class _StdlibSample:
         result = _gauss_blur_bchw(bchw, sigma_val)
         return result.permute(0, 2, 3, 1)
 
-    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo', 3), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Window capped at 7×7.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
+    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo', 3), pixel_args=(1,), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Window capped at 7×7.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
     @staticmethod
     def fn_bilateral_filter(image, sigma_s, sigma_r) -> torch.Tensor:
         """Edge-preserving bilateral filter using Tensor.unfold.

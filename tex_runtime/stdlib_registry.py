@@ -53,6 +53,19 @@ class StdlibEntry:
     # (interpreter.py) — a function need only declare the field, no engine-side edit.
     # Empty (the default) for every function whose arguments are all ordinary.
     non_spatial_args: tuple = ()
+    # SCALE-47b: 0-based positions of arguments whose CONTRACT is "a distance in pixels"
+    # (`gauss_blur`'s sigma, `erode`/`dilate`'s radius, `bilateral_filter`'s spatial_sigma) —
+    # a NEW, independent tag rather than reusing `footprint`'s `mult` (SCALE-47-design.md §3):
+    # `mult` answers "how far does this arg reach for ROI halo purposes", not "should this
+    # arg's VALUE scale with the cook's resolution" — `bilateral_filter` forces the split,
+    # since its footprint is a fixed `('halo', 3)` with no `halo_arg` at all, yet its
+    # spatial_sigma still needs scaling. Empty (the default) for every function with no
+    # pixel-unit argument. A cook's `scale=` multiplies the RESOLVED value at each of these
+    # positions before the call (interpreter) / references a runtime scalar at the same
+    # positions in the emitted call (codegen) — never an AST-level fold, so the emitted
+    # source stays identical across scale values (one compiled artifact per program, not
+    # one per scale).
+    pixel_args: tuple = ()
 
     @property
     def names(self) -> tuple:
@@ -103,32 +116,56 @@ def _valid_footprint(fp) -> bool:
     return False
 
 
+def _valid_pixel_args(pixel_args, footprint) -> bool:
+    """SCALE-47b: each position must be a non-negative int, arg 0 (the image) is never a
+    pixel-magnitude argument, and — the TST-3-style derivation check AGENTS.md invariant #5
+    asks for — a `halo_arg` footprint's OWN index is always itself a scalable magnitude (the
+    two tags describe the same argument for different questions), so declaring `pixel_args`
+    without it would silently under-scale that footprint's own halo derivation. `bilateral_filter`
+    is exactly the case that must NOT be forced this way (its footprint is `('halo', 3)`, no
+    `halo_arg`), so the rule only fires when a `halo_arg` footprint is actually present."""
+    if any((not isinstance(i, int)) or isinstance(i, bool) or i < 1 for i in pixel_args):
+        return False
+    if isinstance(footprint, tuple) and footprint and footprint[0] == "halo_arg":
+        if footprint[1] not in pixel_args:
+            return False
+    return True
+
+
 def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
-           doc="", ex="", sig="", category="", non_spatial_args=()):
+           doc="", ex="", sig="", category="", non_spatial_args=(), pixel_args=()):
     """Record one StdlibEntry and return the decorated object UNCHANGED (so an
     inner `@staticmethod` still applies). Pure data attachment — the name is
     explicit; nothing is inferred or discovered. `footprint` (ROI-1) is validated
     here so a malformed descriptor can never reach the registry. `sig`/`category`
     (LANG-4) carry the help data that used to live only in the JS. `non_spatial_args`
     (COLOR-1) names which 0-based argument positions are a non-spatial resource, not
-    an ordinary image/coordinate argument — see `StdlibEntry.non_spatial_args`."""
+    an ordinary image/coordinate argument — see `StdlibEntry.non_spatial_args`.
+    `pixel_args` (SCALE-47b) names which 0-based argument positions are a pixel-unit
+    magnitude a cook's `scale=` must multiply — see `StdlibEntry.pixel_args`."""
     if not _valid_footprint(footprint):
         raise ValueError(
             f"stdlib({name!r}): invalid footprint {footprint!r}. Expected 'point', "
             f"'image', ('halo', r>0), ('halo_arg', i>=0), or ('frame', i>=0).")
+    if not _valid_pixel_args(pixel_args, footprint):
+        raise ValueError(
+            f"stdlib({name!r}): invalid pixel_args {pixel_args!r}. Expected a tuple of "
+            f"positive ints (arg 0, the image, is never a pixel magnitude), and it must "
+            f"include a 'halo_arg' footprint's own index when one is declared.")
 
     def deco(obj):
         fn = obj.__func__ if isinstance(obj, staticmethod) else obj
         REGISTRY.append(StdlibEntry(name, fn, tuple(aliases), spatial, sync,
                                     footprint, doc, ex, sig, category,
-                                    tuple(non_spatial_args)))
-        # REG-1c: a registration changes what `non_spatial_args_by_name()` must answer, so
-        # its cache (below) is invalidated here — the ONLY place `REGISTRY` grows. This
-        # also covers late registration (a decorator running after the first lookup): the
-        # next call rebuilds from the now-longer `REGISTRY` instead of answering from a
-        # stale snapshot.
-        global _NON_SPATIAL_CACHE_READY
+                                    tuple(non_spatial_args), tuple(pixel_args)))
+        # REG-1c: a registration changes what `non_spatial_args_by_name()`/`pixel_args_by_name()`
+        # must answer, so their caches (below) are invalidated here — the ONLY place `REGISTRY`
+        # grows. This also covers late registration (a decorator running after the first
+        # lookup): the next call rebuilds from the now-longer `REGISTRY` instead of answering
+        # from a stale snapshot.
+        global _NON_SPATIAL_CACHE_READY, _PIXEL_ARGS_CACHE_READY
         _NON_SPATIAL_CACHE_READY = False
+        _PIXEL_ARGS_CACHE_READY = False
         return obj
     return deco
 
@@ -160,6 +197,26 @@ def non_spatial_args_by_name() -> dict:
             (n, e.non_spatial_args) for e in REGISTRY if e.non_spatial_args for n in e.names)
         _NON_SPATIAL_CACHE_READY = True
     return _NON_SPATIAL_CACHE
+
+
+# SCALE-47b: the mirror of REG-1c's non-spatial cache, same build-once-invalidate-on-register
+# discipline (see `stdlib()`'s `deco`, which flips both readiness flags on every new
+# registration — one `REGISTRY` growth site, two derived caches).
+_PIXEL_ARGS_CACHE: dict = {}
+_PIXEL_ARGS_CACHE_READY = False
+
+
+def pixel_args_by_name() -> dict:
+    """{name: pixel_args} for every registered name (aliases expanded) whose `pixel_args` is
+    non-empty — the single source the interpreter's scale-multiply dispatch and codegen's
+    emission both read. Same cache shape and invalidation rule as `non_spatial_args_by_name()`."""
+    global _PIXEL_ARGS_CACHE_READY
+    if not _PIXEL_ARGS_CACHE_READY:
+        _PIXEL_ARGS_CACHE.clear()
+        _PIXEL_ARGS_CACHE.update(
+            (n, e.pixel_args) for e in REGISTRY if e.pixel_args for n in e.names)
+        _PIXEL_ARGS_CACHE_READY = True
+    return _PIXEL_ARGS_CACHE
 
 
 def functions() -> dict:
