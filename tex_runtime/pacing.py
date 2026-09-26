@@ -262,8 +262,19 @@ def reset(token=None, device=None) -> None:
         _state.depth = _resolve_depth(token)
         _state.stride_s = _resolve_stride(token)
         ring = getattr(_state, "ring", None)
-        if ring is None:
+        ring_device_index = getattr(_state, "ring_device_index", None)
+        if ring is None or ring_device_index != idx:
+            # P1: the ring is thread-local, not (thread, device)-local. A warm slot holds an
+            # already-record()ed `torch.cuda.Event`, and a CUDA event binds to whichever
+            # device is ambient the first time it is recorded — re-record()ing it while a
+            # DIFFERENT device is ambient is a real `cudaEventRecord` device-mismatch crash,
+            # not a PyTorch-added restriction. A same-thread cook that targets a different
+            # CUDA device than the last paced cook on this thread must never reuse the old
+            # ring's slots, so drop it and start fresh — the overwhelmingly common
+            # single-GPU-host case takes this branch at most once (the thread's first paced
+            # cook), never again.
             ring = []
+            _state.ring_device_index = idx
         if len(ring) < _state.depth:
             ring = ring + [None] * (_state.depth - len(ring))
         _state.ring = ring

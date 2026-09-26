@@ -544,3 +544,123 @@ def test_pace_stride_ms_accepts_valid(good_stride, expected_s):
     tok.pace_stride_ms = good_stride
     resolved = _pace._resolve_stride(tok)  # noqa: SLF001
     assert abs(resolved - expected_s) < 1e-12
+
+
+# ── P1 (Phase C, B1#1): the ring is thread-local, not device-local ───────────────
+#
+# `_DeviceSpy` above fixes `torch.cuda.current_device()` to a constant -- none of its rows
+# depend on the ambient device actually MOVING. This one does: it needs a `torch.cuda.
+# device(...)` that genuinely changes what "ambient" means for its duration (the real
+# semantics), and an Event that raises the real `cudaEventRecord` device-mismatch error when
+# re-record()ed while a DIFFERENT device is ambient than the one it was first recorded on --
+# the exact mechanism a same-thread, sequential, cross-device cook pair can hit.
+
+class _DeviceRegistry:
+    def __init__(self, initial=0):
+        self.ambient = initial
+
+
+class _CrossDeviceEvent:
+    """Faithful to the real rule: a `torch.cuda.Event` binds to whichever device is ambient
+    the FIRST time it is `.record()`ed; recording it again while a DIFFERENT device is
+    ambient raises, exactly as real `cudaEventRecord` does (not a PyTorch-added check)."""
+
+    def __init__(self, blocking=False, registry=None):
+        self.blocking = blocking
+        self._registry = registry
+        self._bound_device = None
+        self.record_calls = 0
+        self.sync_calls = 0
+
+    def record(self):
+        self.record_calls += 1
+        if self._bound_device is None:
+            self._bound_device = self._registry.ambient
+        elif self._bound_device != self._registry.ambient:
+            raise RuntimeError(
+                f"CUDA error: event device {self._bound_device} does not match "
+                f"current device {self._registry.ambient}")
+
+    def synchronize(self):
+        self.sync_calls += 1
+
+    def query(self):
+        return True
+
+
+class _CrossDeviceSpy:
+    """Like `_DeviceSpy`, but `torch.cuda.device(dev)` genuinely moves a tracked ambient
+    index for its duration and `current_device()` reads that SAME tracked value (not a fixed
+    constant) -- so a test can prove/disprove a real device-mismatch crash across a
+    same-thread device switch."""
+
+    def __init__(self):
+        self.registry = _DeviceRegistry(initial=0)
+        self._real_available = None
+        self._real_device_ctx = None
+        self._real_event = None
+        self._real_current_device = None
+
+    def __enter__(self):
+        import torch
+        reg = self.registry
+
+        class _Ctx:
+            def __init__(self, dev):
+                s = str(dev)
+                self._idx = int(s.split(":")[1]) if ":" in s else reg.ambient
+                self._prev = None
+
+            def __enter__(self):
+                self._prev = reg.ambient
+                reg.ambient = self._idx
+                return self
+
+            def __exit__(self, *exc):
+                reg.ambient = self._prev
+                return False
+
+        def _fake_event(blocking=False):
+            return _CrossDeviceEvent(blocking=blocking, registry=reg)
+
+        self._real_available = torch.cuda.is_available
+        self._real_device_ctx = torch.cuda.device
+        self._real_event = torch.cuda.Event
+        self._real_current_device = torch.cuda.current_device
+        torch.cuda.is_available = lambda: True
+        torch.cuda.current_device = lambda: reg.ambient
+        torch.cuda.device = _Ctx
+        torch.cuda.Event = _fake_event
+        return self
+
+    def __exit__(self, *exc):
+        import torch
+        torch.cuda.is_available = self._real_available
+        torch.cuda.current_device = self._real_current_device
+        torch.cuda.device = self._real_device_ctx
+        torch.cuda.Event = self._real_event
+        return False
+
+
+def test_p1_ring_is_not_reused_across_a_same_thread_device_switch(r):
+    """B1#1: a cook on `cuda:0` that warms the ring, followed sequentially (same thread) by
+    a cook on `cuda:1`, must never re-record() a device-0-bound event while device 1 is
+    ambient. Pre-P1, the ring's only 'cold slot' test is `ev is None` -- a device switch
+    does not clear it, so the second cook's very first poll reuses the first cook's
+    device-0-bound event and crashes."""
+    print("\n--- P1: the ring must not survive a same-thread device switch ---")
+    with _CrossDeviceSpy():
+        tok_a = _Token(pace=True, pace_depth=1)
+        _pace.reset(tok_a, "cuda:0")
+        _pace.paced_check(tok_a, "cuda:0")   # warms a device-0-bound event
+
+        tok_b = _Token(pace=True, pace_depth=1)
+        _pace.reset(tok_b, "cuda:1")
+        try:
+            _pace.paced_check(tok_b, "cuda:1")
+        except RuntimeError as e:
+            r.fail("P1 cross-device ring reuse",
+                   f"a same-thread device switch crashed: {e}")
+            return
+    r.ok("cuda:1 cook after a cuda:0 cook on the same thread never touched a "
+         "device-0-bound event")
