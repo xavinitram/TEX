@@ -174,7 +174,14 @@ _SKIP_VOCAB = re.compile(
 #: reasoning, as `test_lint1_no_local_only_path_refs.py`'s row already inside this pin: there
 #: is no meaningful witness for "an untracked-not-ignored file is enumerated" without git to
 #: make a file actually untracked-not-ignored in the first place.
-_SKIP_BUDGET = 117
+#: Re-pinned from 117 to 118 (PACE-462): `test_pace462_bounded_lookahead.py::
+#: test_pace462_cuda_drained_bound` needs a real CUDA device — the same no-CPU-witness reason
+#: PACE-45(b)'s CUDA-only rows already carry: there is no CPU async queue for the host to get
+#: ahead of, so "how much device work is left behind after a pre-emption" has nothing to
+#: measure off CUDA. Every other row in that file drives the ring/depth mechanism through a
+#: mocked `torch.cuda` (the same `_DeviceSpy` shape `test_fixobsroute46_pacing.py` uses) and
+#: needs no `r.skip`.
+_SKIP_BUDGET = 118
 
 
 def _literal(node) -> str:
