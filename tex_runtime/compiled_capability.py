@@ -29,6 +29,8 @@ fresh process must not reach `compiled.py`'s own body mid-import).
 from __future__ import annotations
 
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
@@ -187,5 +189,66 @@ def compile_capability() -> dict:
 def _reset_capability_cache_for_test() -> None:
     """Test hook: forget the memoized probe so a test can force a re-probe under a
     monkeypatched environment. Mirrors autotier's own `_reset_for_test` shape."""
-    global _capability_cache
+    global _capability_cache, _capability_future
     _capability_cache = None
+    _capability_future = None
+
+
+# ── AUTO-47: a non-blocking counterpart, for the cook thread alone ────────────────
+#
+# Measured on an embedding host (a GPU box whose venv has no Triton): `compile_capability()`'s
+# ONE probe cost lands squarely on the cook thread: 1.4-1.8s on a quiet box, once 9.6s under
+# GPU contention (`_probe_cpu_inductor`'s Windows vcvarsall glob + a 30s-timeout
+# subprocess). `run_auto` (`compiled.py`) is the one caller for whom that is a real UI
+# stall — every OTHER caller (a host's own diagnostic, `tex_api.compile_capability`,
+# `tex doctor`) wants a definite answer now and may block for it, exactly as before;
+# `compile_capability()` itself is UNCHANGED. Only `run_auto`'s cook-thread call site
+# below switches to this.
+_capability_future: "object | None" = None
+_capability_pool: "ThreadPoolExecutor | None" = None
+# A plain Lock (not RLock): _get_capability_pool() takes this lock ITSELF to create the
+# pool, so compile_capability_async() below must never still be holding it when it calls
+# that function -- get the pool first, outside any `with`, THEN take the lock for the
+# future. Nesting the two acquisitions on one call stack was tried first and deadlocked
+# the very first caller; reaching for an RLock there would have hidden that call-order
+# bug instead of removing it, so the call is ordered to need only a plain Lock.
+_capability_pool_lock = threading.Lock()
+
+
+def _get_capability_pool() -> ThreadPoolExecutor:
+    global _capability_pool
+    if _capability_pool is None:
+        with _capability_pool_lock:
+            if _capability_pool is None:
+                _capability_pool = ThreadPoolExecutor(max_workers=1,
+                                                      thread_name_prefix="tex-cc-probe")
+    return _capability_pool
+
+
+def compile_capability_async() -> dict | None:
+    """Non-blocking counterpart to `compile_capability()`. Returns the same dict once the
+    probe has actually completed (by ANY caller, sync or async — one shared cache), else
+    `None`, immediately, every call before that — having made sure (the first such call)
+    that the probe is running on its OWN background thread rather than the caller's.
+
+    A caller that reads `None` back has learned nothing new; it leaves whatever state it
+    was already in (`run_auto`'s key stays MEASURING, not yet submitted) — the same
+    "try again next cook" shape a busy compile-pool or a failed VRAM-headroom check
+    already produce for other reasons, so a probe that never resolves is bounded the same
+    way any other stuck key already is (`autotier.enforce_convergence_bound`, CC-6)."""
+    if _capability_cache is not None:
+        return compile_capability()
+    global _capability_future
+    if _capability_future is None:
+        pool = _get_capability_pool()   # its own lock, taken and released before ours
+        with _capability_pool_lock:
+            if _capability_future is None:
+                _capability_future = pool.submit(compile_capability)
+    if _capability_future.done():
+        try:
+            _capability_future.result()
+        except Exception:
+            pass
+        if _capability_cache is not None:
+            return compile_capability()
+    return None

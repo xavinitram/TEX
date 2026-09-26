@@ -1,6 +1,18 @@
 """
 COMPILE-A (v0.46) — a toolchain-aware, non-stalling "auto" tier.
 
+AUTO-47 (v0.47) adds a fifth piece at the end, CC-7: the toolchain probe itself
+(`compile_capability()`) still ran ON THE COOK THREAD the instant a key first became
+eligible to compile — measured on an embedding host (a GPU box whose venv has no
+Triton) at 1.4-1.8s on a quiet box, once 9.6s under GPU contention. `compile_capability_async()`
+(`compiled_capability.py`) is the non-blocking counterpart `run_auto` now calls instead:
+it returns the same dict once the probe (running on its own background thread) has
+actually finished, else `None` immediately — a key that reads `None` just stays
+MEASURING for a later cook to re-check, bounded the same way CC-6 already bounds any
+other stuck key. `compile_capability()` itself is unchanged; every other caller
+(a host diagnostic, `tex_api.compile_capability`) still gets a blocking, definitive
+answer.
+
 Four pieces, each landed as its own commit and covered here in the same order:
 
 * **CC-3** — `compile_capability()`: a read-only, process-wide probe of whether
@@ -138,8 +150,8 @@ def test_cc4_no_toolchain_makes_no_compile_attempt(r: SubTestResult):
         submit_calls["n"] += 1
         return orig_submit(*a, **kw)
 
-    orig_cap = C.compile_capability
-    C.compile_capability = lambda: {"cuda_inductor": False, "cpu_inductor": False,
+    orig_cap = C.compile_capability_async
+    C.compile_capability_async = lambda: {"cuda_inductor": False, "cpu_inductor": False,
                                     "reason": {"cuda_inductor": "test", "cpu_inductor": "test"}}
     C._submit_bg_compile = spy_submit
     AT.reset()
@@ -163,7 +175,7 @@ def test_cc4_no_toolchain_makes_no_compile_attempt(r: SubTestResult):
     except Exception as e:
         r.fail("CC-4 no-toolchain gate", str(e))
     finally:
-        C.compile_capability = orig_cap
+        C.compile_capability_async = orig_cap
         C._submit_bg_compile = orig_submit
         AT.reset()
 
@@ -181,8 +193,8 @@ def test_cc4_present_toolchain_still_submits(r: SubTestResult):
         submit_calls["n"] += 1
         return True   # pretend it went in flight, without touching the real compile pool
 
-    orig_cap = C.compile_capability
-    C.compile_capability = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
+    orig_cap = C.compile_capability_async
+    C.compile_capability_async = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
     C._submit_bg_compile = spy_submit
     AT.reset()
     try:
@@ -197,7 +209,7 @@ def test_cc4_present_toolchain_still_submits(r: SubTestResult):
     except Exception as e:
         r.fail("CC-4 present-toolchain passthrough", str(e))
     finally:
-        C.compile_capability = orig_cap
+        C.compile_capability_async = orig_cap
         C._submit_bg_compile = orig_submit
         AT.reset()
 
@@ -231,9 +243,9 @@ def test_cc5_lazy_first_call_never_stalls_the_cook_thread(r: SubTestResult):
         return fake_compiled_fn, "inductor"
 
     orig_try_compile = C._try_compile
-    orig_cap = C.compile_capability
+    orig_cap = C.compile_capability_async
     C._try_compile = fake_try_compile
-    C.compile_capability = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
+    C.compile_capability_async = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
     AT.reset()
     C._compiled_cache.pop(cache_key, None)
     C._bg_futures.pop(cache_key, None)
@@ -261,7 +273,7 @@ def test_cc5_lazy_first_call_never_stalls_the_cook_thread(r: SubTestResult):
         r.fail("CC-5 no cook-thread stall", str(e))
     finally:
         C._try_compile = orig_try_compile
-        C.compile_capability = orig_cap
+        C.compile_capability_async = orig_cap
         C._compiled_cache.pop(cache_key, None)
         C._bg_futures.pop(cache_key, None)
         AT.reset()
@@ -400,9 +412,9 @@ def test_cc6_wired_into_run_auto(r: SubTestResult):
         return fake_compiled_fn, "inductor"
 
     orig_try_compile = C._try_compile
-    orig_cap = C.compile_capability
+    orig_cap = C.compile_capability_async
     C._try_compile = fake_try_compile
-    C.compile_capability = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
+    C.compile_capability_async = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
     AT.reset()
     C._compiled_cache.pop(cache_key, None)
     C._bg_futures.pop(cache_key, None)
@@ -425,7 +437,116 @@ def test_cc6_wired_into_run_auto(r: SubTestResult):
         r.fail("CC-6 run_auto wiring", str(e))
     finally:
         C._try_compile = orig_try_compile
-        C.compile_capability = orig_cap
+        C.compile_capability_async = orig_cap
         C._compiled_cache.pop(cache_key, None)
         C._bg_futures.pop(cache_key, None)
         AT.reset()
+
+
+# ── CC-7 (AUTO-47): the toolchain probe itself never blocks the cook thread ─────────
+
+@pytest.mark.slow
+def test_cc7_capability_probe_never_blocks_the_cook_thread(r: SubTestResult):
+    """Measured on an embedding host (a GPU box whose venv has no Triton):
+    `compile_capability()`'s CPU-toolchain probe (`_probe_cpu_inductor`'s Windows vcvarsall
+    glob + subprocess) measured 1.4-1.8s
+    on a quiet box, once 9.6s under GPU contention -- squarely on the cook thread, at the
+    exact moment a key first becomes eligible to compile (`should_submit_compile`).
+    Simulates that cost with a monkeypatched slow probe (no real vcvarsall search, so this
+    stays CPU-only and fast even when it passes) and proves every `run_auto` tick from
+    here stays fast regardless -- the probe now runs on its own background thread
+    (`compile_capability_async`); a tick that catches it still pending just leaves the key
+    MEASURING for the next tick to re-check, exactly like a busy compile-pool or a failed
+    headroom check already do for other reasons. Red at base: before AUTO-47's fix,
+    `run_auto` called the blocking `compile_capability()` inline here, so the one tick
+    that first reaches this branch took >=2s."""
+    print("\n--- CC-7: the capability probe never stalls a cook tick ---")
+    prog, tm, used = _tiny_program()
+    img = make_img(1, 12, 12, 3, seed=13)
+    fp = "cc7_test_fp"
+
+    def slow_cpu_probe():
+        time.sleep(2.0)
+        return False, "no compiler (test, slowed to simulate a real vcvarsall search)"
+
+    def fast_no_cuda_probe():
+        return False, "no cuda (test)"
+
+    orig_cpu = _CC._probe_cpu_inductor
+    orig_cuda = _CC._probe_cuda_inductor
+    _CC._probe_cpu_inductor = slow_cpu_probe
+    _CC._probe_cuda_inductor = fast_no_cuda_probe
+    _CC._reset_capability_cache_for_test()
+    AT.reset()
+    try:
+        max_tick_ms = 0.0
+        verdict = None
+        for _ in range(200):
+            t0 = time.perf_counter()
+            C.run_auto(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"], used_builtins=used)
+            tick_ms = (time.perf_counter() - t0) * 1000.0
+            max_tick_ms = max(max_tick_ms, tick_ms)
+            sp = C._consensus_extent({"A": img}, prog)
+            verdict = AT.verdict(AT.make_key(fp, "cpu", "fp32", sp))
+            if verdict == AT.REJECTED:
+                break
+            time.sleep(0.02)
+
+        assert verdict == AT.REJECTED, f"never reached a terminal verdict (stuck at {verdict})"
+        assert max_tick_ms < 500.0, (
+            f"a cook tick took {max_tick_ms:.1f}ms -- the capability probe leaked onto "
+            f"the cook thread")
+        r.ok(f"max cook tick {max_tick_ms:.1f}ms while a 2s probe ran in the background; "
+             f"verdict={verdict}")
+    except Exception as e:
+        r.fail("CC-7 capability probe never blocks the cook thread", str(e))
+    finally:
+        _CC._probe_cpu_inductor = orig_cpu
+        _CC._probe_cuda_inductor = orig_cuda
+        _CC._reset_capability_cache_for_test()
+        AT.reset()
+
+
+def test_cc7_async_returns_none_then_the_real_answer(r: SubTestResult):
+    """Unit-level (no run_auto): `compile_capability_async()` returns `None` on every call
+    before the background probe finishes, then the SAME dict `compile_capability()` would
+    give, and never re-probes once resolved -- direct coverage of the function CC-7's
+    integration test above exercises indirectly through run_auto."""
+    print("\n--- CC-7: compile_capability_async() unit contract ---")
+    calls = {"n": 0}
+
+    def slow_cpu_probe():
+        calls["n"] += 1
+        time.sleep(0.3)
+        return True, None
+
+    def fast_no_cuda_probe():
+        return False, "no cuda (test)"
+
+    orig_cpu = _CC._probe_cpu_inductor
+    orig_cuda = _CC._probe_cuda_inductor
+    _CC._probe_cpu_inductor = slow_cpu_probe
+    _CC._probe_cuda_inductor = fast_no_cuda_probe
+    _CC._reset_capability_cache_for_test()
+    try:
+        first = _CC.compile_capability_async()
+        assert first is None, f"expected None before the background probe finishes, got {first}"
+        deadline = time.perf_counter() + 5.0
+        result = None
+        while time.perf_counter() < deadline:
+            result = _CC.compile_capability_async()
+            if result is not None:
+                break
+            time.sleep(0.02)
+        assert result == {"cuda_inductor": False, "cpu_inductor": True, "reason":
+                          {"cuda_inductor": "no cuda (test)"}}, result
+        assert calls["n"] == 1, f"the probe must run exactly once, ran {calls['n']}"
+        again = _CC.compile_capability_async()
+        assert again == result and calls["n"] == 1, "a resolved probe must never re-run"
+        r.ok("compile_capability_async(): None until resolved, then the real (cached) answer")
+    except Exception as e:
+        r.fail("CC-7 compile_capability_async unit contract", str(e))
+    finally:
+        _CC._probe_cpu_inductor = orig_cpu
+        _CC._probe_cuda_inductor = orig_cuda
+        _CC._reset_capability_cache_for_test()

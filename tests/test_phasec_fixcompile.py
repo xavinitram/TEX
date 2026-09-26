@@ -220,7 +220,7 @@ def test_c3_warm_skipped_above_clone_cap(r: SubTestResult):
     C._bg_futures.pop(cache_key, None)
 
     orig_cap_bytes = C._WARM_CLONE_CAP_BYTES
-    orig_cap_fn = C.compile_capability
+    orig_cap_fn = C.compile_capability_async
     orig_submit = C._submit_bg_compile
     submit_calls = {"n": 0}
 
@@ -228,7 +228,7 @@ def test_c3_warm_skipped_above_clone_cap(r: SubTestResult):
         submit_calls["n"] += 1
         return True
 
-    C.compile_capability = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
+    C.compile_capability_async = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
     C._WARM_CLONE_CAP_BYTES = 8   # tiny -- this program's image binding blows past it
     C._submit_bg_compile = spy_submit
     AT.reset()
@@ -242,7 +242,7 @@ def test_c3_warm_skipped_above_clone_cap(r: SubTestResult):
         r.fail("C3 clone cap skip", str(e))
     finally:
         C._WARM_CLONE_CAP_BYTES = orig_cap_bytes
-        C.compile_capability = orig_cap_fn
+        C.compile_capability_async = orig_cap_fn
         C._submit_bg_compile = orig_submit
         C._compiled_cache.pop(cache_key, None)
         C._bg_futures.pop(cache_key, None)
@@ -257,8 +257,8 @@ def test_c4_toolchain_absent_rejection_not_persisted(r: SubTestResult):
         prog, tm, used = _tiny_program()
         img = make_img(1, 12, 12, 3, seed=22)
         fp = "c4_test_fp"
-        orig_cap = C.compile_capability
-        C.compile_capability = lambda: {"cuda_inductor": False, "cpu_inductor": False,
+        orig_cap = C.compile_capability_async
+        C.compile_capability_async = lambda: {"cuda_inductor": False, "cpu_inductor": False,
                                         "reason": {"cuda_inductor": "t", "cpu_inductor": "t"}}
         try:
             for _ in range(5):
@@ -277,7 +277,7 @@ def test_c4_toolchain_absent_rejection_not_persisted(r: SubTestResult):
         except Exception as e:
             r.fail("C4 toolchain-absent not persisted", str(e))
         finally:
-            C.compile_capability = orig_cap
+            C.compile_capability_async = orig_cap
 
 
 # ── C5: evict a bound-rejected key's artifact from _compiled_cache ──────────────────

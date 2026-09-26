@@ -45,7 +45,8 @@ from . import pacing as _pace   # PACE-45: bounds queue-ahead when a token opts 
 # reaches back to `compiled._backend_status` / `compiled._setup_msvc_env` — which stay HERE
 # — lazily, inside the one function that needs it.
 from .compiled_capability import (_count_tensor_ops, _max_loop_depth, _select_backend,
-                                  compile_capability, _reset_capability_cache_for_test,
+                                  compile_capability, compile_capability_async,
+                                  _reset_capability_cache_for_test,
                                   _probe_cuda_inductor, _probe_cpu_inductor, _OP_TYPES)
 from .compiled_exec_support import (_show_once, _maybe_triton_hint, _ensure_inductor_cache_dir,
                                     _timed, _timed_deferred, _deferred_ev,
@@ -1038,7 +1039,15 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     if ms is not None:
         autotier.record_interp(key, ms)
     if state == autotier.MEASURING and autotier.should_submit_compile(key):
-        cap = compile_capability()
+        # AUTO-47: compile_capability_async() never runs the toolchain probe on THIS
+        # (the cook) thread — measured on an embedding host at 1.4-9.6s inline here,
+        # once per process, the exact moment a key first reaches this branch. `None` means the
+        # probe is still running on its own background thread; leave the key MEASURING
+        # (not yet submitted) for a later cook to re-check, same as any other cook that
+        # finds should_submit_compile() true again next tick — bounded by CC-6 either way.
+        cap = compile_capability_async()
+        if cap is None:
+            return res
         cap_ok = cap["cuda_inductor"] if device_type == "cuda" else cap["cpu_inductor"]
         if not cap_ok:
             # CC-4: toolchain-aware "auto" — the prerequisite is known absent (probed
