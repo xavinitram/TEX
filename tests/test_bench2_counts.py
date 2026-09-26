@@ -441,6 +441,86 @@ _WHOLE_FRAME_CHAIN_D3 = {
 }
 
 
+_WHOLE_FRAME_CHAIN_D5 = {
+    # BENCH-47's midpoint (`WholeFrameChainD5Scenario`): five of ten stages dirty
+    # (sharpen/tint/contrast/glow/vignette), the sweep's THIRD point. D1 and D3 alone leave
+    # every per-cook multiplier's growth unproven between "one dirty stage" and "the whole
+    # chain" — a line drawn through two points close together (10%/30% of N) cannot show
+    # whether the cost stays linear in D out to D=N, only that it moved between them. This
+    # row and D10 below are what let wave 2's cut (TRK-211/TRK-212) be PROVEN linear in D
+    # rather than merely checked at two nearby samples.
+    "tex_engine.cook":          5,
+    "TEXCache.compile_ast":     0,
+    "TEXCache.compile_tex":     5,
+    "TEXCache.fingerprint":     5,
+    "Lexer.tokenize":           0,
+    "Parser.parse":             0,
+    "tex_roi._fold_program":    0,
+    "tex_roi.roi_plan":         0,
+    "tex_roi.chain_windows":    0,
+    "ResultCache.get":          0,
+    "ResultCache.put":          0,
+    "results_cache.entries_added": 0,
+    "tex_memory.run_roi":       0,
+    "enforce_cache_budget":     5,
+    "tex_memory._total_cache_bytes": 0,  # CACHESEAM-46: the walk left the hot path.
+    "_disown_inputs":           5,
+    "_tile_plan":               5,
+    "_halo_tile_plan":          2,   # sharpen (inline `gauss_blur(@IN, 2.0)`) + glow
+                                     # (inline `gauss_blur(@IN, 4.0)`) — two of the five dirty
+                                     # stages are blur-adjacent; tint/contrast/vignette are not.
+    "host.get_free_memory":     0,
+    "lazy_required_bindings":   0,
+    "tex_checkpoint.cook_checkpointed": 0,
+    "tex_engine.boundary_lineage_key":   0,
+    "Interpreter._exec_stmt":   6,   # sharpen(1) + tint(1) + contrast(1) + glow(1) +
+                                     # vignette(2).
+}
+
+_WHOLE_FRAME_CHAIN_D10 = {
+    # D = N (`WholeFrameChainD10Scenario`): every stage dirty, whole-frame, `use_cache=False`
+    # — the sweep's far end, and the shape wave 2's cut has to hold at without exception.
+    # `stage = N - D = 0`: `tick()` edits stage 0's OWN param and cooks the chain from the
+    # first stage, so unlike every `_DIRTY < N` row above there is no clean prefix left to
+    # stand on `_src` — the whole ten-stage chain re-cooks every tick, through the no-ROI
+    # (`roi=None`) route `_ALL_DIRTY` never takes (that scenario's ten-cook shape is
+    # ROI-windowed; this one is `_ALL_DIRTY`'s whole-frame twin, same cook count, different
+    # route — see `WholeFrameChainScenario`'s class docstring on why the two do not share the
+    # window-plan cost). Every row below reads exactly as `_PLAYBACK_FRAMES` reads on the
+    # rows the two scenarios share (same ten stages, same "all cook" shape). Unlike
+    # `_PLAYBACK_FRAMES`/`_HOST_TICK_EXACT_*` (which drive `tex_engine.cook` directly and so
+    # pin `tex_engine.prepare`/`run` too), this scenario goes through `RoiComp.cook` like every
+    # other comp-backed scenario in this file, so those two rows are not pinned here either
+    # (consistent with D1/D3/`_ALL_DIRTY` above).
+    "tex_engine.cook":          10,
+    "TEXCache.compile_ast":     0,
+    "TEXCache.compile_tex":     10,
+    "TEXCache.fingerprint":     10,
+    "Lexer.tokenize":           0,
+    "Parser.parse":             0,
+    "tex_roi._fold_program":    0,
+    "tex_roi.roi_plan":         0,
+    "tex_roi.chain_windows":    0,
+    "ResultCache.get":          0,
+    "ResultCache.put":          0,
+    "results_cache.entries_added": 0,
+    "tex_memory.run_roi":       0,
+    "enforce_cache_budget":     10,
+    "tex_memory._total_cache_bytes": 0,  # CACHESEAM-46: the walk left the hot path.
+    "_disown_inputs":           10,
+    "_tile_plan":               10,
+    "_halo_tile_plan":          3,   # blur/sharpen/glow, the same three blur-adjacent stages
+                                     # `_PLAYBACK_FRAMES` reaches at this same all-dirty shape.
+    "host.get_free_memory":     0,
+    "lazy_required_bindings":   0,
+    "tex_checkpoint.cook_checkpointed": 0,
+    "tex_engine.boundary_lineage_key":   0,
+    "Interpreter._exec_stmt":   12,  # every stage's own statement count, summed (same total
+                                     # `_PLAYBACK_FRAMES` and `_ALL_DIRTY` pin, same ten
+                                     # programs).
+}
+
+
 _HOST_TICK_EXACT_D1 = {
     # COMPILE-M1 — the host-neutral pin of a real embedding host's EXACT tick, per that
     # host's own reported call sequence ("Q5", local hand-back only): `time_context` always,
@@ -584,6 +664,8 @@ def test_bench2_interactive_per_tick_counts(r: SubTestResult):
                         ("interp_chain_scrub", _INTERP_CHAIN_SCRUB),
                         ("whole_frame_chain_d1", _WHOLE_FRAME_CHAIN_D1),
                         ("whole_frame_chain_d3", _WHOLE_FRAME_CHAIN_D3),
+                        ("whole_frame_chain_d5", _WHOLE_FRAME_CHAIN_D5),
+                        ("whole_frame_chain_d10", _WHOLE_FRAME_CHAIN_D10),
                         ("host_tick_exact_d1", _HOST_TICK_EXACT_D1),
                         ("host_tick_exact_d3", _HOST_TICK_EXACT_D3),
                         ("playback_frames", _PLAYBACK_FRAMES)):
@@ -641,6 +723,7 @@ def test_bench2_no_engine_side_cuda_sync_on_an_interactive_tick(r: SubTestResult
     for label in ("terminal", "midgraph", "pan", "all_dirty", "node_scrub",
                  "checkpoint_serve", "interp_chain_scrub",
                  "whole_frame_chain_d1", "whole_frame_chain_d3",
+                 "whole_frame_chain_d5", "whole_frame_chain_d10",
                  "host_tick_exact_d1", "host_tick_exact_d3", "playback_frames"):
         try:
             got = _api_counts(label)
