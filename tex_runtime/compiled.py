@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from collections import OrderedDict as _OrderedDict
 from typing import Any, Callable
 
@@ -48,6 +49,7 @@ _MAX_LOOP_ITERATIONS = 1024
 # ── MSVC environment setup (Windows) ─────────────────────────────────
 
 _msvc_env_initialized = False
+_msvc_env_lock = threading.Lock()
 
 
 def _setup_msvc_env():
@@ -58,12 +60,29 @@ def _setup_msvc_env():
 
     Called once before the first torch.compile attempt.  No-op on non-Windows
     or if the environment is already configured.
+
+    C6 (v0.46 Phase C): `compile_capability()` (cook thread) and `_try_compile` (the
+    compile-pool worker thread) can both call this. The flag used to flip True at the
+    top, before the search/subprocess/env-injection work ran; a second caller on either
+    thread could see "already configured" mid-vcvarsall and wrongly conclude "no MSVC"
+    off a stale PATH. The lock makes a concurrent caller WAIT for the first caller's full
+    body to finish; the flag is set only once that body has actually returned.
     """
     global _msvc_env_initialized
     if _msvc_env_initialized:
         return
-    _msvc_env_initialized = True
+    with _msvc_env_lock:
+        if _msvc_env_initialized:
+            return
+        try:
+            _do_setup_msvc_env()
+        finally:
+            _msvc_env_initialized = True
 
+
+def _do_setup_msvc_env() -> None:
+    """The actual search/subprocess/env-injection body, run under `_msvc_env_lock` by
+    `_setup_msvc_env` with the initialised flag set only after this returns (C6)."""
     if sys.platform != "win32":
         return
 
