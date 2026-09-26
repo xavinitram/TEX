@@ -41,129 +41,20 @@ from helpers import *  # noqa: F401,F403  (SubTestResult, torch, make_img)
 from TEX_Wrangle import tex_engine
 from TEX_Wrangle.tex_runtime import profile as P
 from TEX_Wrangle.tex_runtime import pacing as _pace
-from TEX_Wrangle.tex_testkit import armed_profiler
+from TEX_Wrangle.tex_testkit import armed_profiler, DeviceSpy, FakeCudaEvent
 
+#: F6: shared with `test_fixobsroute46_pacing.py`/`test_pace462_bounded_lookahead.py` via
+#: `tex_testkit` — this file's own former `_FakeEvent`/`_FakeDeviceCtx`/`_EventPatch`/
+#: `_DeviceSpy` are gone, replaced by `FakeCudaEvent`/`DeviceSpy` below (R1#1).
+_FakeEvent = FakeCudaEvent   # local alias: keeps every existing call site below unchanged
+_EventPatch = DeviceSpy      # `_EventPatch()` == `DeviceSpy()` (current=0, FakeCudaEvent) --
+                             # a strict superset (also mocks current_device, `_EventPatch`
+                             # never did), so every existing `with _EventPatch():` is unchanged
 
 #: A fake device tick is worth this many "device ms" — deliberately far from any real
 #: wall-clock duration this test could produce, so a reading equal to it (rather than to the
 #: host-side sleep) can only have come from the fake event's `elapsed_time`, never `perf_counter`.
-_TICK_MS = 250.0
-
-
-class _FakeEvent:
-    """A stand-in for `torch.cuda.Event(enable_timing=True)`. `record()` stamps a global,
-    monotonically increasing tick (mirroring real CUDA events completing, on one stream, in
-    the order they were recorded); `query()` answers a class-level flag so a test can hold a
-    sample "still running" and then flip it; `elapsed_time` is pure arithmetic on the ticks,
-    never a wall clock. No real CUDA context is touched anywhere below (`torch.cuda.Event` is
-    monkeypatched), the same discipline `test_fixobsroute46_pacing.py`'s `_DeviceSpy` uses."""
-    _next_tick = [0]
-    DONE = True   # class-level: every existing instance's query() reads this
-
-    def __init__(self, enable_timing=False):
-        self.enable_timing = enable_timing
-        self._tick = None
-
-    def record(self):
-        self._tick = _FakeEvent._next_tick[0]
-        _FakeEvent._next_tick[0] += 1
-
-    def query(self):
-        return _FakeEvent.DONE
-
-    def elapsed_time(self, other) -> float:
-        return (other._tick - self._tick) * _TICK_MS
-
-
-class _FakeDeviceCtx:
-    """A no-op stand-in for `torch.cuda.device(...)` (the O4 discipline `measure._new_event`
-    and `record_stage_boundary` both use). On a CI-shape interpreter with CPU-only torch, the
-    REAL `torch.cuda.device.__enter__` calls into CUDA-only C bindings and raises even with
-    `torch.cuda.Event` itself monkeypatched -- exactly the gap `test_fixobsroute46_pacing.py`'s
-    `_DeviceSpy` exists to close for `pacing.py`'s identical idiom. Needed here too."""
-
-    def __init__(self, dev):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-class _EventPatch:
-    """Swap `torch.cuda.Event`/`torch.cuda.device`/`torch.cuda.is_available` for fakes, for
-    the duration of a block, always restoring them — `tests/run_all.py` runs the whole suite
-    in one process, so a leaked patch would break every later test that touches CUDA."""
-
-    def __enter__(self):
-        self._real_event = torch.cuda.Event
-        self._real_device = torch.cuda.device
-        self._real_avail = torch.cuda.is_available
-        torch.cuda.Event = _FakeEvent
-        torch.cuda.device = _FakeDeviceCtx
-        torch.cuda.is_available = lambda: True
-        _FakeEvent.DONE = True
-        _FakeEvent._next_tick[0] = 0
-        return self
-
-    def __exit__(self, *exc):
-        torch.cuda.Event = self._real_event
-        torch.cuda.device = self._real_device
-        torch.cuda.is_available = self._real_avail
-        _FakeEvent.DONE = True
-        return False
-
-
-class _DeviceSpy:
-    """FIX-PROF F5: the same mechanism scaffold `test_fixobsroute46_pacing.py::_DeviceSpy`
-    uses to drive `pacing.py`'s CUDA branch on ANY box, CUDA or not — patches
-    `torch.cuda.device`, `is_available`, `current_device` and `Event` well enough for
-    `pacing.record_on`'s own `_resolve_cuda_target` call to run for real. `current` is the
-    FIXED value `torch.cuda.current_device()` reports, so a test can put a genuinely
-    non-current index on one side and a genuinely current one on the other. `calls` records
-    every device `torch.cuda.device(...)` was actually entered with -- empty means the
-    OVERHEAD-462 skip fired (already-current device); non-empty means it did not."""
-
-    def __init__(self, current=0):
-        self.calls = []
-        self.current = current
-        self._real_available = torch.cuda.is_available
-        self._real_device_ctx = torch.cuda.device
-        self._real_event = torch.cuda.Event
-        self._real_current_device = torch.cuda.current_device
-
-    def __enter__(self):
-        spy = self
-
-        def _fake_current_device():
-            return spy.current
-
-        class _SpyDeviceCtx:
-            def __init__(self, dev):
-                spy.calls.append(dev)
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        torch.cuda.is_available = lambda: True
-        torch.cuda.current_device = _fake_current_device
-        torch.cuda.device = _SpyDeviceCtx
-        torch.cuda.Event = _FakeEvent
-        _FakeEvent.DONE = True
-        _FakeEvent._next_tick[0] = 0
-        return self
-
-    def __exit__(self, *exc):
-        torch.cuda.is_available = self._real_available
-        torch.cuda.current_device = self._real_current_device
-        torch.cuda.device = self._real_device_ctx
-        torch.cuda.Event = self._real_event
-        return False
+_TICK_MS = FakeCudaEvent.TICK_MS
 
 
 def test_prof462_records_device_ms_not_host_ms(r: SubTestResult):
@@ -311,34 +202,32 @@ def test_fixprof_f1_capture_suspends_the_outer_stage_sink(r: SubTestResult):
         return True
 
     real_capture_inner = G.GraphedProgram._capture_inner
-    real_cuda_device = torch.cuda.device
     ok = restored_sink_ok = restored_events_ok = None
     try:
         G.GraphedProgram._capture_inner = _fake_capture_inner
-        torch.cuda.device = _FakeDeviceCtx
-        with armed_profiler() as Pmod:
-            key = Pmod.make_key("fixprof-f1-mocked", "cuda", "fp32")
-            with Pmod.measure(key, 8 * 8, device="cuda", stages=True):
-                # The OUTER cook's own sink/event-list, as a real nested execute() would
-                # see them right now, before capture() runs.
-                outer_sink = P.stage_sink()
-                outer_events = P.stage_event_sink()
+        with DeviceSpy():
+            with armed_profiler() as Pmod:
+                key = Pmod.make_key("fixprof-f1-mocked", "cuda", "fp32")
+                with Pmod.measure(key, 8 * 8, device="cuda", stages=True):
+                    # The OUTER cook's own sink/event-list, as a real nested execute() would
+                    # see them right now, before capture() runs.
+                    outer_sink = P.stage_sink()
+                    outer_events = P.stage_event_sink()
 
-                gp = G.GraphedProgram(("fixprof-f1-mocked-key", 0))
-                ok = gp.capture(program=None, bindings={}, type_map=None,
-                                device="cuda:0", latent_channel_count=0,
-                                output_names=None, precision="fp32", used_builtins=None)
+                    gp = G.GraphedProgram(("fixprof-f1-mocked-key", 0))
+                    ok = gp.capture(program=None, bindings={}, type_map=None,
+                                    device="cuda:0", latent_channel_count=0,
+                                    output_names=None, precision="fp32", used_builtins=None)
 
-                # Right after capture() returns (still inside the outer `with`): is the
-                # ambient sink/event-list back to these SAME outer objects?
-                restored_sink_ok = P.stage_sink() is outer_sink
-                restored_events_ok = P.stage_event_sink() is outer_events
+                    # Right after capture() returns (still inside the outer `with`): is the
+                    # ambient sink/event-list back to these SAME outer objects?
+                    restored_sink_ok = P.stage_sink() is outer_sink
+                    restored_events_ok = P.stage_event_sink() is outer_events
     except Exception as e:
         r.fail("FIX-PROF F1 (mocked)", f"setup/capture raised: {e!r}")
         return
     finally:
         G.GraphedProgram._capture_inner = real_capture_inner
-        torch.cuda.device = real_cuda_device
         P.reset()
 
     ok_all = (ok is True
@@ -377,32 +266,26 @@ def test_fixprof_f2_failed_boundary_drops_stage_split_not_a_neighbour(r: SubTest
                 raise RuntimeError("simulated CUDA event failure")
             super().record()
 
-    real_event, real_device, real_avail = torch.cuda.Event, torch.cuda.device, torch.cuda.is_available
     try:
         with armed_profiler() as Pmod:
-            torch.cuda.Event = _FlakyEvent
-            torch.cuda.device = _FakeDeviceCtx
-            torch.cuda.is_available = lambda: True
-            _FakeEvent.DONE = True
-            _FakeEvent._next_tick[0] = 0
-            _FlakyEvent._fail_next[0] = False
+            with DeviceSpy(event_cls=_FlakyEvent):
+                _FlakyEvent._fail_next[0] = False
 
-            key = Pmod.make_key("fixprof-f2", "cuda", "fp32")
-            events = []
-            start = _FlakyEvent(True)
-            start.record()
-            Pmod.record_stage_boundary(events, 0, "cuda")     # stage 0: ok
-            _FlakyEvent._fail_next[0] = True
-            Pmod.record_stage_boundary(events, 1, "cuda")     # stage 1: FAILS mid-cook
-            Pmod.record_stage_boundary(events, 2, "cuda")     # stage 2: ok
-            end = _FlakyEvent(True)
-            end.record()
-            Pmod._queue_pending(key, 8 * 8, start, end, events)
+                key = Pmod.make_key("fixprof-f2", "cuda", "fp32")
+                events = []
+                start = _FlakyEvent(True)
+                start.record()
+                Pmod.record_stage_boundary(events, 0, "cuda")     # stage 0: ok
+                _FlakyEvent._fail_next[0] = True
+                Pmod.record_stage_boundary(events, 1, "cuda")     # stage 1: FAILS mid-cook
+                Pmod.record_stage_boundary(events, 2, "cuda")     # stage 2: ok
+                end = _FlakyEvent(True)
+                end.record()
+                Pmod._queue_pending(key, 8 * 8, start, end, events)
 
-            whole = Pmod.predict(key, 8 * 8)
-            stages = Pmod.stage_costs(key, 8 * 8)
+                whole = Pmod.predict(key, 8 * 8)
+                stages = Pmod.stage_costs(key, 8 * 8)
     finally:
-        torch.cuda.Event, torch.cuda.device, torch.cuda.is_available = real_event, real_device, real_avail
         P.reset()
 
     ok = (whole is not None and whole > 0.0 and stages == {})
@@ -500,7 +383,7 @@ def test_fixprof_f5_record_stage_boundary_shares_pacing_record_on(r: SubTestResu
     print("\n--- FIX-PROF F5: record_stage_boundary shares pacing.record_on ---")
     ok_noncurrent = ok_current = False
     try:
-        with _DeviceSpy(current=0) as spy:
+        with DeviceSpy(current=0) as spy:
             events = []
             P.record_stage_boundary(events, 0, "cuda:1")
         ok_noncurrent = (spy.calls == ["cuda:1"] and len(events) == 1
@@ -509,7 +392,7 @@ def test_fixprof_f5_record_stage_boundary_shares_pacing_record_on(r: SubTestResu
         r.fail("FIX-PROF F5 record_stage_boundary (non-current)", str(e))
         return
     try:
-        with _DeviceSpy(current=0) as spy2:
+        with DeviceSpy(current=0) as spy2:
             events2 = []
             P.record_stage_boundary(events2, 0, "cuda:0")
         ok_current = (spy2.calls == [] and len(events2) == 1 and events2[0][1] is not None)
@@ -535,7 +418,7 @@ def test_fixprof_f5_new_event_shares_pacing_record_on(r: SubTestResult):
     try:
         P.reset()
         with armed_profiler() as Pmod:
-            with _DeviceSpy(current=0) as spy:
+            with DeviceSpy(current=0) as spy:
                 key = Pmod.make_key("fixprof-f5-noncurrent", "cuda", "fp32")
                 with Pmod.measure(key, 8 * 8, device="cuda:1", stages=False):
                     pass
@@ -549,7 +432,7 @@ def test_fixprof_f5_new_event_shares_pacing_record_on(r: SubTestResult):
     try:
         P.reset()
         with armed_profiler() as Pmod:
-            with _DeviceSpy(current=0) as spy2:
+            with DeviceSpy(current=0) as spy2:
                 key = Pmod.make_key("fixprof-f5-current", "cuda", "fp32")
                 with Pmod.measure(key, 8 * 8, device="cuda:0", stages=False):
                     pass

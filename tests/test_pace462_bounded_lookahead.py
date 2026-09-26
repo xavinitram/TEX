@@ -24,6 +24,13 @@ import pytest
 
 from TEX_Wrangle.tex_runtime import pacing as _pace
 from TEX_Wrangle.tex_runtime.host import CookCancelled as _CookCancelled
+from TEX_Wrangle.tex_testkit import DeviceSpy, FakeCudaEvent
+
+#: F6 (v0.46.2 Phase C reuse review, R1#1): this file's own `_FakeEvent`/`_DeviceSpy` are now
+#: `tex_testkit`'s shared scaffold. `spy.calls` replaces this file's own `spy.device_calls`
+#: (the very drift R1#1 named); everything else is unchanged.
+_FakeEvent = FakeCudaEvent
+_DeviceSpy = DeviceSpy
 
 
 @pytest.fixture(autouse=True)
@@ -58,83 +65,6 @@ class _Token:
 
     def check(self):
         self.checks += 1
-
-
-class _FakeEvent:
-    """Stands in for `torch.cuda.Event`: `record()`/`synchronize()` are both no-ops that
-    only count how many times they were called, so a test can assert on ORDER and COUNT
-    without any real device. `query()` is not exercised by the new mechanism (it uses a
-    blocking `synchronize()`, not a poll loop) but is kept for shape-compatibility."""
-
-    _live = 0  # class-wide construction counter, reset per test
-
-    def __init__(self, blocking=False):
-        self.blocking = blocking
-        self.record_calls = 0
-        self.sync_calls = 0
-        type(self)._live += 1
-        self._id = type(self)._live
-
-    def record(self):
-        self.record_calls += 1
-
-    def synchronize(self):
-        self.sync_calls += 1
-
-    def query(self):
-        return True
-
-
-class _DeviceSpy:
-    """Patches enough of `torch.cuda` to drive `pacing.py`'s CUDA branch on ANY box: a
-    context-manager stand-in for `torch.cuda.device`, `is_available() -> True`,
-    `current_device()` fixed to 0 (OVERHEAD-462: `reset()` now calls it unconditionally
-    whenever `is_available` reads True, so it MUST be mocked here too — otherwise this file
-    would raise on a genuinely CPU-only torch build despite the `is_available` mock), and
-    `Event` bound to `_FakeEvent`. Mirrors `test_fixobsroute46_pacing.py::_DeviceSpy`. None
-    of this file's rows depend on WHICH index reads current — they assert on `_FakeEvent`
-    construction/record/sync counts, not on whether the (now-optional) `torch.cuda.device(...)`
-    context manager was entered."""
-
-    def __init__(self):
-        self.device_calls = []
-        self._real_available = None
-        self._real_device_ctx = None
-        self._real_event = None
-        self._real_current_device = None
-
-    def __enter__(self):
-        import torch
-        spy = self
-        self._real_available = torch.cuda.is_available
-        self._real_device_ctx = torch.cuda.device
-        self._real_event = torch.cuda.Event
-        self._real_current_device = torch.cuda.current_device
-
-        class _Ctx:
-            def __init__(self, dev):
-                spy.device_calls.append(dev)
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        torch.cuda.is_available = lambda: True
-        torch.cuda.current_device = lambda: 0
-        torch.cuda.device = _Ctx
-        torch.cuda.Event = _FakeEvent
-        _FakeEvent._live = 0
-        return self
-
-    def __exit__(self, *exc):
-        import torch
-        torch.cuda.is_available = self._real_available
-        torch.cuda.current_device = self._real_current_device
-        torch.cuda.device = self._real_device_ctx
-        torch.cuda.Event = self._real_event
-        return False
 
 
 # ── Depth semantics: waits only once the pool is full, on the OLDEST event ───────
@@ -382,11 +312,11 @@ def test_unpaced_never_touches_cuda_state(r):
         _pace.reset(tok, "cpu")
         for _ in range(5):
             _pace.paced_check(tok, "cpu")
-    if tok.checks == 5 and spy.device_calls == []:
+    if tok.checks == 5 and spy.calls == []:
         r.ok("5 unpaced polls: 5 token.check() calls, 0 torch.cuda.device(...) entries")
     else:
         r.fail("PACE-462 unpaced path",
-               f"checks={tok.checks} (want 5), device_calls={spy.device_calls} (want [])")
+               f"checks={tok.checks} (want 5), calls={spy.calls} (want [])")
 
 
 def test_none_token_is_a_no_op(r):
@@ -394,10 +324,10 @@ def test_none_token_is_a_no_op(r):
     with _DeviceSpy() as spy:
         _pace.reset(None, "cuda")
         _pace.paced_check(None, "cuda")
-    if spy.device_calls == []:
+    if spy.calls == []:
         r.ok("paced_check(None, ...) touched no torch.cuda state")
     else:
-        r.fail("PACE-462 None token", f"expected no device calls, got {spy.device_calls}")
+        r.fail("PACE-462 None token", f"expected no device calls, got {spy.calls}")
 
 
 # ── One real-CUDA row: the drained-p95 bound, at a small pace_depth ───────────────

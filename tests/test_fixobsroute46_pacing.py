@@ -23,6 +23,12 @@ import pytest
 import torch
 
 from TEX_Wrangle.tex_runtime import pacing as _pace
+from TEX_Wrangle.tex_testkit import DeviceSpy, FakeCudaEvent
+
+#: F6 (v0.46.2 Phase C reuse review, R1#1): this file's own `_FakeEvent`/`_DeviceSpy` are now
+#: `tex_testkit`'s shared scaffold, aliased so every call site below is unchanged.
+_FakeEvent = FakeCudaEvent
+_DeviceSpy = DeviceSpy
 
 
 @pytest.fixture(autouse=True)
@@ -44,78 +50,6 @@ class _NeverTrips:
 
     def check(self):
         pass
-
-
-class _FakeEvent:
-    """A stand-in for `torch.cuda.Event` that needs no real CUDA context: `record()` is a
-    no-op and `query()` always reports done, so `paced_check`'s wait loop never blocks.
-    Accepts (and ignores) `blocking=` — PACE-462's ring creates its events with
-    `torch.cuda.Event(blocking=True)`, so a mock with no constructor args at all raises
-    `TypeError` the instant a real ring slot needs building, which is exactly what a
-    CI/canonical run caught here before this fix."""
-
-    def __init__(self, blocking=False):
-        self.blocking = blocking
-
-    def record(self):
-        pass
-
-    def query(self):
-        return True
-
-
-class _DeviceSpy:
-    """Patches `torch.cuda.device` (the context manager), `torch.cuda.is_available`,
-    `torch.cuda.current_device` and `torch.cuda.Event` well enough to drive `pacing.py`'s
-    CUDA branch on ANY box, CUDA or not — this test's whole point is the MECHANISM (does the
-    event get recorded inside `with torch.cuda.device(the cook's device):`, and is that
-    entry skipped when the cook's device is already ambient-current?), never a real kernel or
-    a real device mismatch, so it needs no `r.skip` and no real GPU (SIMP-3: "give the row a
-    witness that runs without it" beats spending a skip-budget slot on a mechanism a mock can
-    prove). `current` is the FIXED value `torch.cuda.current_device()` reports (default 0),
-    fixed rather than tracked so a test can put a genuinely non-current index (e.g. `"cuda:1"`)
-    on one side of the comparison and a genuinely current one (`"cuda:0"`/`"cuda"`) on the
-    other, deliberately."""
-
-    def __init__(self, current=0):
-        self.calls = []
-        self.current = current
-        self._real_available = torch.cuda.is_available
-        self._real_device_ctx = torch.cuda.device
-        self._real_event = torch.cuda.Event
-        self._real_current_device = torch.cuda.current_device
-
-    def __enter__(self):
-        spy = self
-
-        def _fake_available():
-            return True
-
-        def _fake_current_device():
-            return spy.current
-
-        class _FakeDeviceCtx:
-            def __init__(self, dev):
-                spy.calls.append(dev)
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        torch.cuda.is_available = _fake_available
-        torch.cuda.current_device = _fake_current_device
-        torch.cuda.device = _FakeDeviceCtx
-        torch.cuda.Event = _FakeEvent
-        return self
-
-    def __exit__(self, *exc):
-        torch.cuda.is_available = self._real_available
-        torch.cuda.current_device = self._real_current_device
-        torch.cuda.device = self._real_device_ctx
-        torch.cuda.Event = self._real_event
-        return False
 
 
 def test_o4_paced_check_records_the_event_on_the_cooks_device(r):

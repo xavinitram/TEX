@@ -26,6 +26,13 @@ Costs only what `tests/helpers.py` already costs to expose these three: stdlib (
 `tests/helpers.py` also carries belong to its OTHER helpers, never promoted here. No `pytest`
 import. Not reached from the ComfyUI adapter files (`tex_node.py`, `__init__.py`,
 `tex_runtime/host.py`).
+
+`FakeCudaEvent` and `DeviceSpy` (below) are deliberately NOT in `__all__` and not part of the
+"state-isolation kit" or its stability promise — the same reason `load_counts_harness` sits
+outside it in `tests/helpers.py`: their callers import them by name
+(`from TEX_Wrangle.tex_testkit import FakeCudaEvent, DeviceSpy`), which needs no entry here and
+asks nothing of the canary test that pins the kit's three names. F6 (v0.46.2 Phase C): one
+shared mocked-`torch.cuda` scaffold, replacing three that had already drifted apart (R1#1).
 """
 from __future__ import annotations
 
@@ -153,3 +160,123 @@ def armed_profiler():
             _P.reset()
 
     return _cm()
+
+
+class FakeCudaEvent:
+    """A stand-in for `torch.cuda.Event`, covering every shape this tree's mocked CUDA tests
+    needed before F6 in ONE class instead of three that had drifted apart (R1#1 of the
+    v0.46.2 Phase C reuse review): pacing's ring constructs events with `Event(blocking=True)`
+    and reads `record()`/`synchronize()` call counts and a live-construction counter; the
+    profiler constructs them with `Event(enable_timing=True)` and reads `elapsed_time()`
+    between two of them, plus `query()` to hold a sample "still running" and flip it later.
+    `elapsed_time` is pure arithmetic on a monotonically increasing tick stamped by `record()`
+    — never a wall clock — so no real CUDA context is touched anywhere.
+
+    Class state (`DONE`, the tick counter, the live counter) is process-wide on purpose —
+    `tests/run_all.py` runs the whole suite in one process — so every caller runs `reset()`
+    (done automatically by `DeviceSpy.__enter__`) rather than relying on whatever an earlier
+    test left behind. `_live` is read directly as a plain int by callers that want a
+    construction count (`FakeCudaEvent._live` after a block, matching the pre-F6 shape
+    `test_pace462_bounded_lookahead.py` read it in) — a class-level int works for this because
+    `type(self)._live += 1` rebinds the class attribute, not the instance's."""
+
+    _next_tick = 0
+    _live = 0
+    DONE = True
+    TICK_MS = 250.0   # a synthetic device-ms unit; harmless to share, no test asserts on it
+
+    def __init__(self, blocking=False, enable_timing=False):
+        self.blocking = blocking
+        self.enable_timing = enable_timing
+        self.record_calls = 0
+        self.sync_calls = 0
+        self._tick = None
+        type(self)._live += 1
+        self._id = type(self)._live
+
+    def record(self) -> None:
+        self.record_calls += 1
+        self._tick = type(self)._next_tick
+        type(self)._next_tick += 1
+
+    def synchronize(self) -> None:
+        self.sync_calls += 1
+
+    def query(self) -> bool:
+        return type(self).DONE
+
+    def elapsed_time(self, other) -> float:
+        return (other._tick - self._tick) * type(self).TICK_MS
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._next_tick = 0
+        cls._live = 0
+        cls.DONE = True
+
+
+class DeviceSpy:
+    """Patches `torch.cuda.device` (the context manager), `is_available`, `current_device`
+    and `Event` well enough to drive `tex_runtime/pacing.py` and `tex_runtime/profile.py`'s
+    CUDA branches on ANY box, CUDA or not (F6): one shared shape for what
+    `test_fixobsroute46_pacing.py`, `test_pace462_bounded_lookahead.py` and
+    `test_prof462_device_honest.py` each hand-rolled separately, and had already drifted —
+    one dropped the `current=` override, one renamed `calls` to `device_calls`, one skipped
+    `current_device` entirely and only survived because the code it drove never called it
+    (R1#1 of the v0.46.2 Phase C reuse review; the CI-shape gap it flagged already fired once).
+
+    `current` is the FIXED value `torch.cuda.current_device()` reports (default 0) — fixed
+    rather than tracked, so a test can put a genuinely non-current index (e.g. `"cuda:1"`) on
+    one side of a comparison and a genuinely current one (`"cuda:0"`/`"cuda"`) on the other.
+    `calls` records every device `torch.cuda.device(...)` was actually entered with — empty
+    means a device-context-skip fired (already-current device); non-empty means it did not.
+    `event_cls` defaults to `FakeCudaEvent` but accepts any drop-in replacement (e.g. a
+    subclass whose `record()` raises on demand) without this class needing to know about it.
+
+        with DeviceSpy(current=0) as spy:
+            ...
+        spy.calls   # -> [] (skipped) or [<device>, ...] (entered)
+    """
+
+    def __init__(self, current=0, event_cls=FakeCudaEvent):
+        self.calls = []
+        self.current = current
+        self.event_cls = event_cls
+        self._real_available = None
+        self._real_device_ctx = None
+        self._real_event = None
+        self._real_current_device = None
+
+    def __enter__(self) -> "DeviceSpy":
+        spy = self
+        self._real_available = torch.cuda.is_available
+        self._real_device_ctx = torch.cuda.device
+        self._real_event = torch.cuda.Event
+        self._real_current_device = torch.cuda.current_device
+
+        def _fake_current_device():
+            return spy.current
+
+        class _Ctx:
+            def __init__(self, dev):
+                spy.calls.append(dev)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        torch.cuda.is_available = lambda: True
+        torch.cuda.current_device = _fake_current_device
+        torch.cuda.device = _Ctx
+        torch.cuda.Event = self.event_cls
+        self.event_cls.reset()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        torch.cuda.is_available = self._real_available
+        torch.cuda.current_device = self._real_current_device
+        torch.cuda.device = self._real_device_ctx
+        torch.cuda.Event = self._real_event
+        return False
