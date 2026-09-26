@@ -368,6 +368,7 @@ Bounds below are entry counts, and every store is process-lifetime unless stated
 | `tex_memory._peak_static_memo` | program x plan | the peak-static-memory estimate |
 | `tex_memory._last_trim_px` | device | last-seen spatial pixel count, so the allocator is queried only after a downshift (MEM-2) |
 | `tex_memory._total_mem_cache` | device | total VRAM (MEM-2) |
+| `tex_memory._device_obj_cache` | raw `device` value (str or `torch.device`) | the parsed `torch.device`, so `cache_budget_bytes`/`enforce_cache_budget`/`governor_budget`/`free_memory_hint`/`device_total_mem`/`trim_reserved_pool`/`cache_budget_status` share ONE parse per distinct value instead of one each (OVH-47, TRK-211) |
 | `tex_tiling._free_foreign` | host generation | `(generation, foreign bytes)` from the last free-memory reading; answered only when it grants DOUBLE the room the live number would have, and invalidated by a host swap |
 | `tex_results_keys._ENV_EPOCH_CACHE` | active CUDA device index (-1 for CPU) | the env epoch folded into every result key (NEG-6: split out of `tex_results.py`; `tex_results.lineage_key` and friends still resolve, re-exported) |
 | `tex_results.ResultCache` | CACHE-1 lineage key | the cooked frame; RAM byte-budget LRU + disk spill, host-instantiated |

@@ -288,6 +288,33 @@ def _running_cache_bytes(dev_type=None) -> int:
     return sum(budget.total(dev_type) for _c, budget in _budget_caches())
 
 
+#: OVH-47 (TRK-211): a raw `device` value (almost always the SAME plain `str` --
+#: `tex_engine`'s `ctx.device`, from `resolve_device() -> str` -- across every call this
+#: module makes for one cook, and typically across EVERY cook on a fixed-device host) used
+#: to be re-parsed into a `torch.device` independently at each of seven call sites
+#: (`cache_budget_bytes`, `enforce_cache_budget`, `governor_budget`, `free_memory_hint`,
+#: `device_total_mem`, `trim_reserved_pool`, plus `enforce_cache_budget`'s own internal call
+#: into `cache_budget_bytes`) -- up to three re-parses of the identical string in one `run()`
+#: alone. `torch.device(...)` is already a `torch.device` in the common case (this dict's
+#: values ARE `torch.device` instances, so `isinstance` short-circuits on a repeat), so this
+#: mirrors `_total_mem_cache` below: bounded by the number of DISTINCT device values a
+#: process ever sees (a handful, never per-cook), never invalidated (a device string always
+#: parses to the same `torch.device`).
+_device_obj_cache: dict = {}
+
+
+def _as_device(device):
+    """Resolve *device* (a `str` or a `torch.device`) to a `torch.device`, memoized by the
+    raw input value. See `_device_obj_cache` above for why this is safe and bounded."""
+    if isinstance(device, torch.device):
+        return device
+    cached = _device_obj_cache.get(device)
+    if cached is None:
+        cached = torch.device(device)
+        _device_obj_cache[device] = cached
+    return cached
+
+
 def cache_budget_bytes(device) -> int:
     """VRAM/CPU byte budget for TEX's tensor caches. Env override
     TEX_CACHE_BUDGET_MB (whole MiB, strictly positive — anything else is refused, same floor
@@ -309,7 +336,7 @@ def cache_budget_bytes(device) -> int:
         logger.warning(
             "[TEX] TEX_CACHE_BUDGET_MB=%r is not a positive whole number of MiB; "
             "ignoring it and using the computed cache budget.", override)
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    dev = _as_device(device)
     if dev.type == "cuda":
         try:
             total = torch.cuda.get_device_properties(dev.index or 0).total_memory
@@ -371,7 +398,7 @@ def enforce_cache_budget(device) -> None:
     trusted, and eviction still goes through `budget.delete` so it stays correct too.
     Best-effort; never raises."""
     try:
-        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        dev = _as_device(device)
         dev_type = dev.type  # MEM-4: only account + evict entries on the cook's device
         byte_budget = cache_budget_bytes(device)
         if _running_cache_bytes(dev_type) <= byte_budget:
@@ -400,7 +427,7 @@ def cache_budget_status(device) -> dict:
     and the running usage it now maintains O(1) (`_running_cache_bytes`), so a host can ask
     "what is the current tensor-cache budget/usage" without inferring it from
     `enforce_cache_budget`'s side effects. Never mutates or evicts."""
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    dev = _as_device(device)
     return {"limit_bytes": cache_budget_bytes(dev), "usage_bytes": _running_cache_bytes(dev.type)}
 
 
@@ -457,7 +484,7 @@ def governor_budget(device) -> int:
     frac = _PROFILES[_active_profile].get("governor_frac")
     if frac is None:
         frac = 0.4
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    dev = _as_device(device)
     if dev.type == "cuda":
         try:
             from .tex_runtime.host import get_host_services
@@ -587,7 +614,7 @@ class CacheRegistry:
         not a separate hint arg; `playhead` is the one passed hint (far-from-playhead frames first,
         when a pool carries the frame). Best-effort; never raises. Returns bytes freed."""
         try:
-            dev = torch.device(device) if not isinstance(device, torch.device) else device
+            dev = _as_device(device)
             dev_type = dev.type
             budget = budget if budget is not None else governor_budget(dev)
             total = self.total_bytes(dev_type)
@@ -833,7 +860,7 @@ def device_total_mem(device) -> int | None:
     `_total_mem_cache` that `trim_reserved_pool` populates. None on CPU or if the device
     query fails. Lets the M-1 preflight size its skip-gate against total VRAM without paying
     a per-cook driver query (get_device_properties is hit once per device, then cached)."""
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    dev = _as_device(device)
     if dev.type != "cuda":
         return None
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
@@ -860,7 +887,7 @@ def trim_reserved_pool(device, spatial_px: int = 0) -> None:
     cached per device; `TEX_NO_POOL_TRIM=1` disables. Safe with live captured graphs."""
     if os.environ.get("TEX_NO_POOL_TRIM") == "1":
         return
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    dev = _as_device(device)
     if dev.type != "cuda":
         return
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
