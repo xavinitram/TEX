@@ -417,6 +417,29 @@ def _publish_new_key(home: str, path: str) -> bytes | None:
                 pass
 
 
+def _open_state_ro_binary(path: str) -> int:
+    """The ONE place in this tree a low-level fd opens on-disk state read-only. `os.open(path,
+    os.O_RDONLY)` ALONE opens in TEXT mode on Windows: `os.read` then stops at the first 0x1A
+    (Ctrl-Z, the legacy text-mode EOF marker) and folds every 0x0D 0x0A pair to 0x0A — the
+    RESTORE-462 defect (`564f674`), found because a uniformly random 32-byte MAC key contains a
+    0x1A byte on ~11.8% of mints, silently truncating it on read and invalidating every earlier
+    process's signed cache state.
+
+    R2 (v0.46.2 Phase C, altitude): the fix (`os.O_RDONLY | getattr(os, "O_BINARY", 0)`) landed
+    as a local flag at the one call site that needed it, with no routed-through helper — the
+    module already reaches for exactly this shape of "one place, so a second copy of the bug
+    can't recur" for `atomic_write` (fsync-before-rename) and `bounded_mkstemp` (the retry
+    bound); this closes the same gap for "read a raw fd in binary mode". Every OTHER reader in
+    this module already goes through `open(path, "rb")` (binary by construction) or
+    `tempfile.mkstemp`/`os.fdopen(fd, "wb")` (binary by the stdlib's own default), so this
+    helper exists for the one case neither of those covers, and
+    `tests/test_fixrec462_r2_o_binary_ratchet.py` ASTs the tracked tree so a second raw
+    `os.open(` added anywhere else — in this module or a sibling one — reds by construction
+    instead of waiting to be noticed on Windows (the only platform the bug can manifest on;
+    `O_BINARY` is an inert 0 on POSIX)."""
+    return os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+
+
 def _probe_key(path: str):
     """Classify the key file from a SINGLE descriptor (read and stamp the same open file, so a
     swap cannot slip between the read and the stat). Returns:
@@ -426,17 +449,11 @@ def _probe_key(path: str):
       ("absent", None)                     — it does not exist (go create);
       ("unreadable", None)                 — any other open/read error (never remove it).
 
-    RESTORE-462: BINARY, explicitly. Every OTHER writer in this module mints its fd through
-    `tempfile.mkstemp` (binary-mode by default) and never hits this; this is the one place a raw
-    `os.open` reads binary state, and with no `O_BINARY` Windows opens it in TEXT mode — `os.read`
-    then stops at the first 0x1A (Ctrl-Z, the legacy text-mode EOF marker) and folds every 0x0D
-    0x0A pair to 0x0A. A uniformly random 32-byte key contains a 0x1A byte on ~11.8% of mints
-    (1-(255/256)**32); such a key reads back SHORT here, `_probe_key` classes it "malformed" below,
-    and the caller deletes and re-mints it — silently invalidating every earlier process's signed
-    spill/`.pkl`/`.cg`, which then fail the MAC in every later process with an intact trailer and a
-    matching epoch (the key changed under them, nothing was tampered)."""
+    RESTORE-462: BINARY, explicitly, via `_open_state_ro_binary` (R2) — every OTHER writer in
+    this module mints its fd through `tempfile.mkstemp` (binary-mode by default) and never hits
+    this; `_probe_key` is the one caller of the one place a raw `os.open` reads binary state."""
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        fd = _open_state_ro_binary(path)
     except FileNotFoundError:
         return ("absent", None)
     except OSError:
