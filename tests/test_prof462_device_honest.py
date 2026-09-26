@@ -231,64 +231,77 @@ def test_prof462_real_cuda_cook_resolves_device_ms(r: SubTestResult):
         r.fail("PROF-462 real CUDA cook", f"predict() never resolved within 2s (got {ms!r})")
 
 
-def test_fixprof_f1_capture_does_not_pollute_outer_stage_sink(r: SubTestResult):
+def test_fixprof_f1_capture_suspends_the_outer_stage_sink(r: SubTestResult):
     """FIX-PROF F1: `GraphedProgram.capture()` runs its warmup (3x) and graph-capture (1x)
     passes through separate `Interpreter.execute()` calls on the SAME thread as the outer
     cook. If an outer `profile.measure(stages=True)` is open around the statement that
-    triggers capture (real shape: `tex_engine.run`'s dispatch, reproduced directly here via
-    `run_graphed` under a `measure` block with no outer statements of its own), those 4 nested
-    executions must record ZERO stage boundaries into the outer sample -- capture is not part
-    of the cook being timed. Before the fix each nested execute's own single-stage boundary
-    landed in the outer thread-local list (real GPU work, no mocks needed: the corruption is a
-    thread-local aliasing bug, not a timing artifact)."""
-    if not torch.cuda.is_available():
-        r.skip("FIX-PROF F1", "no CUDA on this box")
-        return
+    triggers capture, those nested executions must not see the outer cook's sink/event-list
+    as their own — `capture()` now wraps its whole body in `profile.suspend_stage_tracking()`.
+
+    No CUDA needed: the corruption (and the fix) is a THREAD-LOCAL aliasing question, not a
+    timing one, so this drives the real, unmodified `capture()` method and stubs only the two
+    things that are genuinely CUDA-hardware-shaped and orthogonal to the profiler bug --
+    `_capture_inner` (the actual warmup/graph-capture work) and `torch.cuda.device` (the O4
+    device-context guard `capture()` takes before calling it) -- the same style of stub
+    `_restoring_cuda_stream`'s own docstring names ("a test drives `torch.cuda.device` mocked
+    to abort before any real CUDA op"). `_restoring_cuda_stream` itself needs no stub: its
+    `try/except` already tolerates a CUDA-absent `current_stream()` by design. The stub
+    observes, from INSIDE the stand-in for the nested work, exactly what a real nested
+    `Interpreter.execute()` would ask `profile.stage_sink()`/`stage_event_sink()` for."""
     import TEX_Wrangle.tex_runtime.graphed as G
-    from TEX_Wrangle.tex_cache import parse_and_split
 
-    G.clear_graph_cache()
     P.reset()
+    observed = {}
+
+    def _fake_capture_inner(self, *a, **kw):
+        # What a nested Interpreter.execute() would see if it asked right now.
+        observed["stage_sink_during"] = P.stage_sink()
+        observed["stage_event_sink_during"] = P.stage_event_sink()
+        return True
+
+    real_capture_inner = G.GraphedProgram._capture_inner
+    real_cuda_device = torch.cuda.device
+    ok = restored_sink_ok = restored_events_ok = None
     try:
+        G.GraphedProgram._capture_inner = _fake_capture_inner
+        torch.cuda.device = _FakeDeviceCtx
         with armed_profiler() as Pmod:
-            bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
-            code = "@OUT = vec4(sin(@A) * 0.5 + 0.5, 1.0);"
-            prog = parse_and_split(code, bt)
-            tm = TypeChecker(binding_types=bt, source=code).check(prog)
-            used = _collect_identifiers(prog)
-            img = torch.rand(1, 32, 32, 3, device="cuda")
+            key = Pmod.make_key("fixprof-f1-mocked", "cuda", "fp32")
+            with Pmod.measure(key, 8 * 8, device="cuda", stages=True):
+                # The OUTER cook's own sink/event-list, as a real nested execute() would
+                # see them right now, before capture() runs.
+                outer_sink = P.stage_sink()
+                outer_events = P.stage_event_sink()
 
-            calls = []
-            real_boundary = Pmod.record_stage_boundary
+                gp = G.GraphedProgram(("fixprof-f1-mocked-key", 0))
+                ok = gp.capture(program=None, bindings={}, type_map=None,
+                                device="cuda:0", latent_channel_count=0,
+                                output_names=None, precision="fp32", used_builtins=None)
 
-            def _spy(events, stage, device):
-                calls.append(stage)
-                return real_boundary(events, stage, device)
-
-            Pmod.record_stage_boundary = _spy
-            try:
-                key = Pmod.make_key("fixprof-f1", "cuda", "fp32")
-                with Pmod.measure(key, 32 * 32, device="cuda", stages=True):
-                    out = G.run_graphed(prog, {"A": img}, tm, "cuda", "fixprof_f1_fp",
-                                        output_names=["OUT"], used_builtins=used)
-            finally:
-                Pmod.record_stage_boundary = real_boundary
-            torch.cuda.synchronize()   # invariant #6: settle the box before the next test times
-        assert out is not None, "program was not captured (capturability gate rejected it)"
+                # Right after capture() returns (still inside the outer `with`): is the
+                # ambient sink/event-list back to these SAME outer objects?
+                restored_sink_ok = P.stage_sink() is outer_sink
+                restored_events_ok = P.stage_event_sink() is outer_events
     except Exception as e:
-        r.fail("FIX-PROF F1", f"setup/capture raised: {e!r}")
+        r.fail("FIX-PROF F1 (mocked)", f"setup/capture raised: {e!r}")
         return
     finally:
-        G.clear_graph_cache()
+        G.GraphedProgram._capture_inner = real_capture_inner
+        torch.cuda.device = real_cuda_device
         P.reset()
 
-    if len(calls) == 0:
-        r.ok("capture's 3 warmup + 1 graph-capture passes recorded 0 stage boundaries into "
-             "the outer measure block (which itself ran no statements of its own)")
+    ok_all = (ok is True
+              and observed.get("stage_sink_during") is None
+              and observed.get("stage_event_sink_during") is None
+              and restored_sink_ok and restored_events_ok)
+    if ok_all:
+        r.ok(f"capture()'s (stubbed) body observed a SUSPENDED sink/event-list "
+             f"({observed!r}), and the outer measure block's own sink/event-list were "
+             f"restored afterward -- no CUDA device needed for this check")
     else:
-        r.fail("FIX-PROF F1",
-               f"expected 0 stage boundaries from capture's nested execute() calls landing "
-               f"in the outer sink, got {len(calls)}: {calls!r}")
+        r.fail("FIX-PROF F1 (mocked)",
+               f"ok={ok!r} observed={observed!r} restored_sink_ok={restored_sink_ok!r} "
+               f"restored_events_ok={restored_events_ok!r}")
 
 
 def test_fixprof_f2_failed_boundary_drops_stage_split_not_a_neighbour(r: SubTestResult):
