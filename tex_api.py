@@ -132,6 +132,17 @@ def scale_verdict(source: str, param_values: dict | None = None):
     return _roi_scale_verdict(source, param_values)
 
 
+def check_proxy_scale(bindings: dict, full_hw: tuple, scale: float, tolerance_px: int = 1):
+    """SCALE-47a §(b): offered, never enforced — a cheap arity check that a cook's bound
+    proxy images agree with the `scale` the caller claims for them (`round(full_H*scale)` /
+    `round(full_W*scale)`, within `tolerance_px`). `None` on agreement; else a message naming
+    the first mismatching binding. Proxy selection is the host's own (R5); the engine never
+    calls this itself, so a mismatch never blocks a cook — a host opts in explicitly.
+    Delegates to `tex_roi.check_proxy_scale` (one implementation, re-exported here)."""
+    from .tex_roi import check_proxy_scale as _roi_check_proxy_scale
+    return _roi_check_proxy_scale(bindings, full_hw, scale, tolerance_px)
+
+
 def _ver_tuple(v: str) -> tuple:
     """Parse a dotted version string into a tuple of ints, one per `.`-separated component,
     for ordering comparisons (`>`/`<`/`min`/`max`) against another such tuple — never for

@@ -1122,6 +1122,43 @@ def scale_verdict(code: str, param_values: dict | None = None) -> ScaleVerdict:
     return v
 
 
+def check_proxy_scale(bindings: dict, full_hw: tuple, scale: float, tolerance_px: int = 1):
+    """SCALE-47a §(b): a cheap, OFFERED-not-enforced sanity check that a cook's bound proxy
+    images actually match the `scale` the caller claims for them — an ARITY check (do the
+    pixel counts agree?), nothing about content. Proxy selection is the host's own (R5: the
+    engine never picks a scale, and by the same reasoning never picks or validates a proxy);
+    this exists only for a host that wants the belt-and-braces call, and the engine never
+    calls it itself — a mismatched proxy still cooks (whatever that produces).
+
+    `full_hw` is the FULL-resolution `(H, W)` the caller believes `scale` was taken relative
+    to. Every rank-4 tensor binding's own `(H, W)` (dims 1, 2 — BHWC, the engine's own layout)
+    is compared against `round(full_H * scale)` / `round(full_W * scale)`, within
+    `tolerance_px` (rounding a fractional scaled dimension is a legitimate host choice —
+    `ceil`, `floor` and `round` all differ by at most 1 px, and this check should not fail a
+    host for picking a different one). Returns `None` when every spatial binding agrees, else
+    a message naming the FIRST mismatching binding (not a list — one loud example is enough
+    to act on). Never raises: a non-tensor binding (a `$param`, a string) is silently skipped,
+    not mistaken for a spatial proxy."""
+    try:
+        full_h, full_w = int(full_hw[0]), int(full_hw[1])
+    except Exception:
+        return f"check_proxy_scale: full_hw={full_hw!r} is not a (H, W) pair"
+    want_h, want_w = round(full_h * scale), round(full_w * scale)
+    for name, v in (bindings or {}).items():
+        if not hasattr(v, "shape") or not hasattr(v, "dim"):
+            continue                          # not a tensor -- a $param/string, skip
+        try:
+            if v.dim() != 4:
+                continue                       # not a BHWC image binding
+            h, w = int(v.shape[1]), int(v.shape[2])
+        except Exception:
+            continue
+        if abs(h - want_h) > tolerance_px or abs(w - want_w) > tolerance_px:
+            return (f"binding '{name}' is {h}x{w}, expected ~{want_h}x{want_w} "
+                    f"(full_hw={full_hw!r} * scale={scale!r}, tolerance={tolerance_px}px)")
+    return None
+
+
 def scale_safe(code: str, param_values: dict | None = None) -> bool:
     """Is this program safe to cook at a non-1.0 `scale`? Thin wrapper over the memoized
     `scale_verdict()` — see its docstring for the override/classifier/fail-closed rules.
