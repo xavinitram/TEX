@@ -74,11 +74,26 @@ at all. `stride` defaults to a module constant (`_DEFAULT_STRIDE_S`, chosen by m
 and a token may override it with a `pace_stride_ms` attribute (non-negative, FINITE int or
 float; `0` disables striding, recording at every poll exactly as depth-only pacing did).
 **The pre-emption bound becomes approximately `depth * max(stride, one statement's own
-device time)`** for the common case of many poll points per unit of device work — see the
-module's `_DEFAULT_DEPTH` and the hand-back for where this bound is looser than
-that formula. The token is still polled (`token.check()`) at literally every poll point
-regardless of the stride gate, so cancellation latency is unaffected by striding; only the
-pool's record/wait bookkeeping is throttled.
+device time)`** for the common case of many poll points per unit of device work. The token
+is still polled (`token.check()`) at literally every poll point regardless of the stride
+gate, so cancellation latency is unaffected by striding; only the pool's record/wait
+bookkeeping is throttled.
+
+**The honest bound, stated plainly (Phase C, R4#3): look-ahead is counted in POLL POINTS,
+not in device time directly.** All four cancel-poll-point families this module rides (the
+interpreter's per-statement poll, the codegen tier's in-body polls, the stencil route's
+entry poll, and a multi-pass builtin's between-pass poll — named above) were placed to
+bound CANCELLATION latency, not queued device work, and those are different quantities — a
+"poll-interval" is not a fixed amount of device work. The `depth * max(stride, ...)` bound above holds well for a
+program with many poll points relative to its device work (the common shape this ask was
+measured against: an interpreted chain of many statements, or a multi-pass builtin that
+polls between its own passes). It is NOT a tight bound for a program with FEW, COARSE poll
+points relative to its device work — a single expensive builtin pass between two polls, or
+a codegen-tier cook compiled without `emit_cancel_polls` (whose only poll is at entry, before
+the whole compiled program's device work is even queued). For those shapes, the device can
+fall behind by however much work sits between two consecutive poll points, REGARDLESS of
+`depth`/`stride` — the guarantee is only ever as tight as whichever poll-point family the
+running program actually hits, not a property of this module alone.
 
 **P2 (Phase C) — the default (unpaced) path stays exactly as cheap as before PACE-462.**
 `reset()` short-circuits on `wants_pacing(token)` before touching CUDA/device state at all,
