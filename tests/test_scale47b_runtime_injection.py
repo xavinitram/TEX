@@ -15,6 +15,7 @@ never mentions scale at all).
 """
 from helpers import *
 from TEX_Wrangle import tex_engine
+from TEX_Wrangle import tex_engine_tiers as _tiers
 from TEX_Wrangle.tex_runtime import tier_trace as _tt
 
 
@@ -99,3 +100,33 @@ def test_scale47b_forces_interpreter_tier_and_records_it(r: SubTestResult):
         return
     r.ok(f"compile_mode='torch_compile' + scale=0.5 recorded tier={rec.tier!r} "
          f"reason={rec.reason!r} -- never a silent fallback")
+
+
+def test_scale47b_never_dispatches_to_cuda_graph_tier(r: SubTestResult):
+    print("\n--- SCALE-47b: a scale-active cook never reaches the cuda_graph tier strategy ---")
+    # The plan's own acceptance test: "capture at 1.0, replay at 0.5 must not replay 1.0".
+    # A CUDA-graph capture/replay needs an actual GPU to exercise end-to-end; what is provable
+    # CPU-only, and what actually GUARANTEES the acceptance criterion regardless of device, is
+    # that `_run_tier` never even calls the cuda_graph strategy function for a scale-active
+    # cook -- so there is no captured graph for a later replay to reuse in the first place.
+    A = make_img(1, 8, 8, 4)
+    code = "@OUT = gauss_blur(@A, 2.0);"
+    plan = tex_engine.prepare(code, {"A": A}, device_mode="cpu", scale=0.5)
+
+    def _boom(_ctx):
+        raise AssertionError("the cuda_graph tier strategy was called for a scale-active cook")
+
+    saved = _tiers._TIER_METHOD["cuda_graph"]
+    _tiers._TIER_METHOD["cuda_graph"] = _boom
+    try:
+        out = _tiers._run_tier(plan.ctx, "cuda_graph")
+    except AssertionError as e:
+        r.fail("scale bypasses cuda_graph", str(e))
+        return
+    finally:
+        _tiers._TIER_METHOD["cuda_graph"] = saved
+    if "OUT" not in out:
+        r.fail("scale bypass output", f"expected an 'OUT' key, got {list(out.keys())!r}")
+        return
+    r.ok("_run_tier(ctx, 'cuda_graph') with ctx.scale set never calls the cuda_graph "
+         "strategy -- it always runs the interpreter instead")
