@@ -151,15 +151,19 @@ def _inductor_prereq(dev_type: str):
     calling it (that function compiles a probe kernel and mutates env). Returns
     `(ok, why_not)`: `ok` is `True` (holds), `False` (fails — `why_not` names what's
     missing), or `None` (Windows CPU, before any inductor-CPU attempt this process —
-    not knowable without running the vcvarsall search this call must not perform)."""
-    import importlib.util
+    not knowable without running the vcvarsall search this call must not perform).
+
+    C8 (v0.46 Phase C, R1#3): the CUDA case is DELEGATED to `compiled._probe_cuda_inductor`
+    rather than reimplemented here — the two were byte-for-byte the same probe (CUDA
+    availability + `find_spec("triton")`), just copied into two modules, so a change to one
+    could silently drift from the other. `_probe_cuda_inductor` is itself read-only/static
+    (no `_setup_msvc_env`, no compile), so delegating costs this function nothing and keeps
+    its own read-only contract. The CPU case stays here: it is genuinely doctor-specific
+    (the `None` "haven't looked yet" reading, and the explicit refusal to call
+    `_setup_msvc_env` a report must never trigger), with no counterpart in `compiled.py`."""
     if dev_type == "cuda":
-        if not _cuda_available():
-            return False, "CUDA is not available (torch.cuda.is_available() is False)"
-        if importlib.util.find_spec("triton") is None:
-            return False, ("Triton is not installed (torch.compile's inductor backend "
-                           "needs it on CUDA)")
-        return True, None
+        from .tex_runtime import compiled as _compiled
+        return _compiled._probe_cuda_inductor()
     # cpu
     import sys
     if sys.platform != "win32":
