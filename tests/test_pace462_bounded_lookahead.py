@@ -23,11 +23,12 @@ count assertions below have nothing matching to read.
 import pytest
 
 from TEX_Wrangle.tex_runtime import pacing as _pace
+from TEX_Wrangle.tex_runtime.host import CookCancelled as _CookCancelled
 
 
 @pytest.fixture(autouse=True)
 def _fresh_pacing_state():
-    """`pacing._state` is thread-local and, by design (the ring persists across cooks to
+    """`pacing._state` is thread-local and, by design (the pool persists across cooks to
     amortize event construction — see `reset()`'s docstring), never clears itself between
     cooks on one thread. Tests run on this SAME thread, one after another, so without this
     fixture one test's ring/counters would leak into the next. Isolate here rather than
@@ -42,7 +43,7 @@ class _Token:
     predates the stride gate and asserts "every poll records" — mocked `_FakeEvent` calls
     execute in nanoseconds of real wall-clock time, so with the module's nonzero default
     stride, a mocked test's second-and-later polls would land inside the stride window and
-    never touch the ring at all, which is a real (and separately tested, see the STRIDE
+    never touch the pool at all, which is a real (and separately tested, see the STRIDE
     section below) behaviour, but not what these depth/ring rows are about. The two rows
     that ARE about striding construct their own `_Token` and override `pace_stride_ms`
     explicitly."""
@@ -136,46 +137,97 @@ class _DeviceSpy:
         return False
 
 
-# ── Depth semantics: waits only once the ring is full, on the OLDEST event ────────
+# ── Depth semantics: waits only once the pool is full, on the OLDEST event ───────
+
+def _pool_events(r=None):  # noqa: SLF001 (white-box by design)
+    """Every `_FakeEvent` this thread's CURRENT device pool has ever built (outstanding +
+    free), for summing e.g. `sync_calls` across the whole pool regardless of which list an
+    event currently sits in."""
+    pool = _pace._state.pool
+    return list(pool["outstanding"]) + pool["free"]
+
 
 def test_depth_gates_the_wait_not_every_poll(r):
-    """With `pace_depth=3`, the first 3 poll points must NOT wait (the device has fewer
-    than 3 poll-intervals queued so far); the 4th and 5th must each wait exactly once,
+    """With `pace_depth=3`, the first 3 poll points must NOT wait (the pool has fewer
+    than 3 poll-intervals outstanding so far); the 4th and 5th must each wait exactly once,
     on the OLDEST outstanding event, matching the bounded-look-ahead design."""
     print("\n--- PACE-462: depth gates the wait, not every poll ---")
     with _DeviceSpy():
         tok = _Token(pace=True, pace_depth=3)
         _pace.reset(tok, "cuda")
-        events_before = []
-        for i in range(5):
+        for _ in range(5):
             _pace.paced_check(tok, "cuda")
-            events_before.append(_pace._state.ring[:])  # noqa: SLF001 (white-box by design)
-        ring = _pace._state.ring  # noqa: SLF001
-        waits = [ev.sync_calls for ev in ring if ev is not None]
+        waits = [ev.sync_calls for ev in _pool_events()]
         total_waits = sum(waits)
     if total_waits == 2:
         r.ok(f"exactly 2 waits over 5 polls at depth 3 (calls 4 and 5), got sync counts {waits}")
     else:
         r.fail("PACE-462 depth gate", f"expected 2 total synchronize() calls, got {total_waits} "
-               f"(per-slot: {waits})")
+               f"(per-event: {waits})")
 
 
 def test_depth_one_waits_on_every_poll_after_the_first(r):
-    """`pace_depth=1` is the degenerate case: the ring holds at most one outstanding event,
+    """`pace_depth=1` is the degenerate case: the pool holds at most one outstanding event,
     so every poll after the first must wait -- the same shape the original PACE-45
-    one-poll-interval mechanism had, just expressed as depth 1 of the new ring."""
+    one-poll-interval mechanism had, just expressed as depth 1 of the new pool."""
     print("\n--- PACE-462: pace_depth=1 waits on every poll but the first ---")
     with _DeviceSpy():
         tok = _Token(pace=True, pace_depth=1)
         _pace.reset(tok, "cuda")
         for _ in range(4):
             _pace.paced_check(tok, "cuda")
-        ring = _pace._state.ring  # noqa: SLF001
-        total_waits = sum(ev.sync_calls for ev in ring if ev is not None)
+        total_waits = sum(ev.sync_calls for ev in _pool_events())
     if total_waits == 3:
         r.ok("4 polls at depth 1 produced exactly 3 waits (all but the first)")
     else:
         r.fail("PACE-462 depth=1", f"expected 3 waits, got {total_waits}")
+
+
+class _TripOnThirdCheck:
+    """B1#6: trips (raises `CookCancelled`) on the THIRD `token.check()` call across two
+    polls at `pace_depth=1` -- poll 1's lone top-of-poll check is call 1; poll 2's
+    top-of-poll check is call 2 (not tripped, so the wait branch is reached: poll 1 left
+    one event outstanding); poll 2's RE-check immediately after `oldest.synchronize()` is
+    call 3 -- exactly 'between the wait and the final bookkeeping writeback', the window
+    B1#6 is about."""
+    def __init__(self):
+        self.pace = True
+        self.pace_depth = 1
+        self.pace_stride_ms = 0   # disable striding: every poll must reach the ring/pool
+        self.n = 0
+
+    def check(self):
+        self.n += 1
+        if self.n == 3:
+            raise _CookCancelled("B1#6 repro: trip on the re-check after a wait")
+
+
+def test_b1_6_exception_between_wait_and_writeback_leaves_no_stale_bookkeeping(r):
+    """B1#6: pre-P5, `head`/`count` were only written back to `_state` at the very END of
+    `paced_check`, AFTER the wait branch's own re-check -- an exception raised by that
+    re-check (a trip caught while parked in the wait, the documented behaviour) skipped the
+    writeback entirely, leaving `_state.head`/`_state.count` describing the ring as if the
+    just-synchronized (freed) event were STILL outstanding. P5's deque form pops the oldest
+    event out of `outstanding` BEFORE calling `synchronize()`/re-`check()`, so there is no
+    later writeback to skip: the exception can only ever land after the bookkeeping is
+    already correct."""
+    print("\n--- B1#6: an exception between the wait and the writeback leaves no stale "
+          "bookkeeping ---")
+    with _DeviceSpy():
+        tok = _TripOnThirdCheck()
+        _pace.reset(tok, "cuda")
+        _pace.paced_check(tok, "cuda")   # poll 1: check #1, no wait (nothing outstanding yet)
+        try:
+            _pace.paced_check(tok, "cuda")   # poll 2: check #2 (top), wait, check #3 -> raises
+        except _CookCancelled:
+            pass
+        outstanding_len = len(_pace._state.pool["outstanding"])  # noqa: SLF001
+    if outstanding_len == 0:
+        r.ok("after the exception, the pool's outstanding count is 0 -- the just-waited "
+             "event was popped before the exception, never left stranded as 'outstanding'")
+    else:
+        r.fail("B1#6 exception safety", f"outstanding len={outstanding_len}, expected 0 "
+               f"(the waited event should have been popped before the exception, not after)")
 
 
 def test_wait_rechecks_token_immediately_after_synchronize(r):
@@ -199,13 +251,13 @@ def test_wait_rechecks_token_immediately_after_synchronize(r):
                f"poll1 checks={checks_after_1}, poll2 delta={checks_after_2 - checks_after_1}")
 
 
-# ── The cheap path: the ring is built once and re-record()ed, not rebuilt ─────────
+# ── The cheap path: the pool is built once and re-record()ed, not rebuilt ────────
 
 def test_ring_reuses_events_once_warm(r):
     """Over many polls at a fixed depth, the total number of `torch.cuda.Event` objects
     ever CONSTRUCTED must equal `depth`, not the number of polls -- the ask's 'cheap path'
     contract (event reuse via a re-record()ed ring, not fresh allocation every poll)."""
-    print("\n--- PACE-462: the ring constructs at most `depth` events total ---")
+    print("\n--- PACE-462: the pool constructs at most `depth` events total ---")
     with _DeviceSpy() as spy:
         tok = _Token(pace=True, pace_depth=4)
         _pace.reset(tok, "cuda")
@@ -219,45 +271,46 @@ def test_ring_reuses_events_once_warm(r):
                f"across 25 polls, got {constructed}")
 
 
-def test_ring_grows_across_cooks_and_never_shrinks(r):
-    """`reset()` between cooks on the same thread must GROW the ring when a later cook asks
-    for a bigger depth, reusing the events already built for the smaller depth (so the
-    first `k` slots are not reconstructed), and never shrink it when a later cook asks for
-    a smaller depth (so a subsequent bigger ask doesn't pay for those slots twice)."""
-    print("\n--- PACE-462: the ring grows across cooks on one thread, never shrinks ---")
+def test_pool_grows_across_cooks_and_never_discards_a_built_event(r):
+    """P5: `reset()` between cooks on the same thread must never DISCARD a built event when
+    a later cook asks for a bigger depth -- the events built for the smaller depth are
+    handed back to the pool's free list and reused, not reconstructed -- and a subsequent
+    SMALLER ask must not discard any either, so a later bigger ask doesn't pay for them
+    twice. Supersedes the old fixed-size-ring 'grows, never shrinks' framing: a pool has no
+    size to grow or shrink, only a set of built events it never throws away."""
+    print("\n--- P5: the per-device pool grows across cooks, never discards a built event ---")
     with _DeviceSpy():
         tok_small = _Token(pace=True, pace_depth=2)
         _pace.reset(tok_small, "cuda")
         for _ in range(2):
             _pace.paced_check(tok_small, "cuda")
-        ring_after_small = _pace._state.ring  # noqa: SLF001
         built_after_small = _FakeEvent._live
-        slot0, slot1 = ring_after_small[0], ring_after_small[1]
+        small_events = {id(ev) for ev in _pool_events()}
 
         tok_big = _Token(pace=True, pace_depth=5)
         _pace.reset(tok_big, "cuda")
         for _ in range(5):
             _pace.paced_check(tok_big, "cuda")
-        ring_after_big = _pace._state.ring  # noqa: SLF001
         built_after_big = _FakeEvent._live
+        big_events = {id(ev) for ev in _pool_events()}
 
         tok_small2 = _Token(pace=True, pace_depth=2)
         _pace.reset(tok_small2, "cuda")
-        ring_after_shrink_request = _pace._state.ring  # noqa: SLF001
         built_after_shrink_request = _FakeEvent._live
+        tracked_after_shrink_request = len(_pool_events())
 
     ok = (built_after_small == 2 and built_after_big == 5
-          and len(ring_after_shrink_request) == 5
-          and ring_after_big[0] is slot0 and ring_after_big[1] is slot1
-          and built_after_shrink_request == 5)
+          and small_events <= big_events   # both of cook1's events reused, never discarded
+          and built_after_shrink_request == 5
+          and tracked_after_shrink_request == 5)
     if ok:
-        r.ok("ring grew 2->5 events (reusing the first two), then held at 5 for a smaller ask")
+        r.ok("pool grew 2->5 events (reusing the first two), then held at 5 for a smaller ask")
     else:
-        r.fail("PACE-462 ring growth",
+        r.fail("P5 pool growth",
                f"built: small={built_after_small} big={built_after_big} "
                f"after_shrink_request={built_after_shrink_request}, "
-               f"ring len after shrink request={len(ring_after_shrink_request)}, "
-               f"slot reuse={ring_after_big[0] is slot0 and ring_after_big[1] is slot1}")
+               f"tracked after shrink request={tracked_after_shrink_request}, "
+               f"small events reused into big={small_events <= big_events}")
 
 
 # ── pace_depth validation ──────────────────────────────────────────────────────────
@@ -437,7 +490,7 @@ def test_pace462_cuda_drained_bound(r):
 
     drain_tail = t_drained - t_trip_seen
     # Generous, box-robust bound: a few poll-intervals' worth of device time, not the
-    # whole remaining queue. `depth + 2` intervals covers the ring's own bound plus slack
+    # whole remaining queue. `depth + 2` intervals covers the pool's own bound plus slack
     # for the statement straddling the trip and scheduling noise.
     bound = per_statement * (depth + 2)
     if drain_tail < max(bound, 0.05):
@@ -482,16 +535,16 @@ def test_stride_gates_the_ring_not_the_token_check(r):
 
             _pace.paced_check(tok, "cuda")             # t=0.0: no prior record -> records
             constructed_after_first = _FakeEvent._live
-            count_after_first = _pace._state.count  # noqa: SLF001
+            count_after_first = len(_pace._state.pool["outstanding"])  # noqa: SLF001
 
             clock.advance(0.001)                        # t=0.001: 1ms since last record
             _pace.paced_check(tok, "cuda")               # inside the 10ms stride -> skip
             constructed_after_inside = _FakeEvent._live
-            count_after_inside = _pace._state.count  # noqa: SLF001
+            count_after_inside = len(_pace._state.pool["outstanding"])  # noqa: SLF001
 
             clock.advance(0.019)                         # t=0.020: 19ms since last record
             _pace.paced_check(tok, "cuda")               # past the stride -> records
-            count_after_past = _pace._state.count  # noqa: SLF001
+            count_after_past = len(_pace._state.pool["outstanding"])  # noqa: SLF001
     finally:
         _pace._time.perf_counter = real_perf_counter
 
@@ -521,7 +574,7 @@ def test_stride_zero_disables_the_gate(r):
         _pace.reset(tok, "cuda")
         for _ in range(5):
             _pace.paced_check(tok, "cuda")
-        count = _pace._state.count  # noqa: SLF001
+        count = len(_pace._state.pool["outstanding"])  # noqa: SLF001
     if count == 5:
         r.ok("pace_stride_ms=0 recorded on all 5 polls (stride disabled)")
     else:

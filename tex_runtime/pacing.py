@@ -36,76 +36,66 @@ under `benchmarks/preempt_drain_bench.py`); a host that wants a different bound 
 itself, because `True == 1` in Python and reading a depth out of the opt-in flag would
 silently pin every caller to depth 1 the moment it opted in.
 
-The wait, when the ring is full, is a real blocking `event.synchronize()` on an event
-created with `blocking=True` — chosen over the original `event.query()` + sleep loop by
-measurement (see the hand-back): a blocking wait releases the GIL while parked (another
-Python thread keeps making progress) and costs nothing beyond the wait itself, where the
-poll loop paid a fixed sleep on every single poll regardless of whether the device was
-actually behind. `token.check()` is still called once per poll point BEFORE the ring is
-touched (so an already-tripped token is caught before any device interaction), and again
-immediately AFTER a wait completes (so a token that trips WHILE the host is parked in
-`synchronize()` is caught as soon as the wait returns, not only on the next ordinary poll).
+The wait, when `depth` events are already outstanding, is a real blocking
+`event.synchronize()` on an event created with `blocking=True` — chosen over the original
+`event.query()` + sleep loop by measurement (see the hand-back): a blocking wait releases
+the GIL while parked (another Python thread keeps making progress) and costs nothing beyond
+the wait itself, where the poll loop paid a fixed sleep on every single poll regardless of
+whether the device was actually behind. `token.check()` is still called once per poll point
+BEFORE the pool is touched (so an already-tripped token is caught before any device
+interaction), and again immediately AFTER a wait completes (so a token that trips WHILE the
+host is parked in `synchronize()` is caught as soon as the wait returns, not only on the
+next ordinary poll).
 
-**The cheap path.** The ring is a per-thread list of preallocated `torch.cuda.Event`
-objects, re-`record()`ed rather than recreated: once a cook has run long enough to fill the
-ring (`depth` polls), every later poll only calls `.record()` on an already-existing event —
-no allocation. `reset()` grows the ring if a later cook asks for a bigger `depth` than the
-thread has ever needed, and never shrinks it, so warm-thread cost trends toward "event
-recording only" the way the ask's target names it.
+**The cheap path (Phase C/P5: a FIFO of outstanding events plus a small free pool, per
+device — R2#1).** Each CUDA device index this thread has ever paced for gets its own pool:
+an `outstanding` FIFO (events genuinely in flight, from THIS cook's own poll sequence — a
+fresh cook always starts this empty, handing any prior cook's leftover outstanding events
+straight to `free`) and a `free` list of already-built, already-waited `torch.cuda.Event`
+objects ready to be re-`record()`ed. The event that gets waited-on is exactly the event
+that becomes free to reuse next, so there is no fixed-size array to size, no head/count
+pair, and no modulo arithmetic — `reset()` never has to "grow" anything; a pool simply
+accumulates events the first time a thread's depth for that device asks for more of them,
+and never discards one.
 
 **The STRIDE, added after measuring that depth alone does not help every program shape.**
 Depth bounds LOOK-AHEAD in units of poll-intervals, but a "poll-interval" is not a fixed
 amount of device work — a chain of many CHEAP per-pixel statements puts a `torch.cuda.Event`
 record/wait at EVERY one of them, and a real `event.synchronize()` call has a fixed cost
-that is not free next to a kernel that itself takes only microseconds: measured 10-44%
-overhead on such a chain (200+ statements of trivial arithmetic, 256-1024 px) at every depth
-swept, with `stride` disabled. (A program shaped like an embedding host's own background
-render — a `gauss_blur` chain, real per-statement device work, not the cheap-arithmetic
-shape above — already read within noise WITHOUT striding at all; the cheap-chain risk is a
-defensive bound against a class of programs, not evidence that any specific host workload
-needs it. See the hand-back for the full (stride x depth) table across three shapes.) The
-fix is to stop treating every poll as a candidate to record: a poll only touches the ring
-(records/waits) once at least `stride` seconds of HOST time have passed since the ring last
-recorded; every poll in between is `token.check()` alone, no CUDA call at all. `stride`
-defaults to a module constant (`_DEFAULT_STRIDE_S`, chosen by measurement) and a token may
-override it with a `pace_stride_ms` attribute (non-negative int or float; `0` disables
-striding, recording at every poll exactly as depth-only pacing did). **The pre-emption bound
-becomes approximately `depth * max(stride, one statement's own device time)`**: a
-poll-interval is now a stride WINDOW, which may contain many cheap statements or, on a heavy
-chain where one statement alone exceeds `stride`, exactly one — either way the device is
-never more than `depth` such windows behind the host. The token is still polled
-(`token.check()`) at literally every poll point regardless of the stride gate, so
-cancellation latency is unaffected by striding; only the ring's record/wait bookkeeping is
-throttled.
+that is not free next to a kernel that itself takes only microseconds. (A program shaped
+like an embedding host's own background render — a `gauss_blur` chain, real per-statement
+device work, not a cheap-arithmetic chain — already read within noise WITHOUT striding at
+all; the cheap-chain risk is a defensive bound against a class of programs, not evidence
+that any specific host workload needs it. See the hand-back for the full measured
+table across shapes.) The fix is to stop treating every poll as a candidate to record: a
+poll only touches the pool (records/waits) once at least `stride` seconds of HOST time have
+passed since it last recorded; every poll in between is `token.check()` alone, no CUDA call
+at all. `stride` defaults to a module constant (`_DEFAULT_STRIDE_S`, chosen by measurement)
+and a token may override it with a `pace_stride_ms` attribute (non-negative, FINITE int or
+float; `0` disables striding, recording at every poll exactly as depth-only pacing did).
+**The pre-emption bound becomes approximately `depth * max(stride, one statement's own
+device time)`** for the common case of many poll points per unit of device work — see the
+module's `_DEFAULT_DEPTH` and the hand-back for where this bound is looser than
+that formula. The token is still polled (`token.check()`) at literally every poll point
+regardless of the stride gate, so cancellation latency is unaffected by striding; only the
+pool's record/wait bookkeeping is throttled.
 
-**OVERHEAD-462's default-path finding, and the second cut here.** Every CUDA cook —
-paced or not — pays `reset()` + `cook_done_event()`, and the attribution pass measured
-~18us/cook on the default (unpaced) path, dominated by `with torch.cuda.device(device):`
-entry/exit (~5us, a `cudaGetDevice`/`cudaSetDevice` round trip) plus re-deriving "is this
-CUDA, and which device index" from scratch in `cook_done_event` even though `reset()` — the
-seam every cook already calls first — could answer it once. Fixed here by resolving
-"is-CUDA / device index / is-this-already-the-ambient-device" exactly ONCE per cook, in
-`reset()`, and having both `cook_done_event` and `paced_check`'s event-record step read
-that cached answer instead of re-deriving it: `torch.cuda.device(...)` is entered only when
-the cook's device is NOT already ambient-current (the overwhelming common case is a
-single-GPU host, or any cook already dispatched on its own device, where recording with no
-context switch at all produces a byte-identical event). A caller that reaches
-`cook_done_event`/`paced_check` without a prior `reset()` on this thread (none exist in this
-tree, but the contract matters — same spirit as O5's `reset()`-with-no-arguments fallback)
-recomputes fresh rather than trusting a stale or absent cache. Measured (this box, direct
-microbenchmark, quiet, see the hand-back): the old `cook_done_event()` alone cost ~7.4us/call;
-the new `reset()`+`cook_done_event()` pair — the actual per-cook cost, since every cook pays
-both — costs ~5.8us, a ~21% cut. Against a whole real cook (hundreds of us, end to end), that
-delta is within the whole-cook noise floor, the same LAT-4 lesson: a microsecond-class win is
-provable directly, never by timing the cook around it.
+**P2 (Phase C) — the default (unpaced) path stays exactly as cheap as before PACE-462.**
+`reset()` short-circuits on `wants_pacing(token)` before touching CUDA/device state at all,
+restoring the original PACE-45 shape Python's `and` gave for free; `cook_done_event` keeps
+its OWN tiny per-thread memo, keyed on the raw `device` value IT is actually called with,
+rather than trying (and, before this fix, failing — see the hand-back) to share a cache
+with `reset()`'s differently-shaped raw value.
 
 Thread-local (mirrors `stdlib_core._cook_ctx`): a second cook on another thread must not
-share, or wait on, this cook's event ring."""
+share, or wait on, this cook's event pools. `stdlib_core.set_cook_grid`/`restore_cook_ctx`
+save/restore this module's own state across a NESTED cook on the same thread (P3)."""
 from __future__ import annotations
 
 import math as _math
 import threading as _threading
 import time as _time
+from collections import deque as _deque
 
 import torch
 
@@ -113,26 +103,20 @@ _state = _threading.local()
 
 #: Bounded look-ahead depth used when a token opts into pacing (`pace=True`) without naming
 #: its own `pace_depth`. Chosen by the PACE-462 K-sweep (`benchmarks/preempt_drain_bench.py`,
-#: laptop sm_120, quiet box): depths 1-8 all read within noise of unpaced (-0.89%..+0.54%)
-#: on the ask's target shape (a 100+ms heavy background chain), so cost does not discriminate
-#: among them there -- the discriminator is the drained-p95 bound, which scales with depth
-#: (measured p50/p95 ms: depth1 8.9/10.8, depth2 14.1/18.6, depth4 23.7/29.6, depth8 45.3/50.6).
-#: Depth 2 keeps that bound tight (about 4-6% of the measured full runtime) while giving one
-#: level of look-ahead margin over depth 1, which the later stride sweep (see
-#: `_DEFAULT_STRIDE_S` below) also read as the worst case among depths tried on cheap-statement
-#: program shapes. See the hand-back for the full per-depth table and the sm_75 gap (unreachable
-#: this session).
+#: laptop sm_120, quiet box): depths 1-8 all read within noise of unpaced, so cost does not
+#: discriminate among them there — the discriminator is the drained-p95 bound, which scales
+#: with depth. Depth 2 keeps that bound tight while giving one level of look-ahead margin
+#: over depth 1. See the hand-back for the full measured per-depth table and the sm_75
+#: reading (DOC-6: a dated measurement table belongs in an evidence document, not in a
+#: module docstring a reader opens just for the contract — R2#7).
 _DEFAULT_DEPTH = 2
 
-#: Minimum HOST time (seconds) that must pass since the ring last recorded before a poll
+#: Minimum HOST time (seconds) that must pass since the pool last recorded before a poll
 #: point is allowed to touch it again. Chosen by measurement (laptop sm_120, quiet box)
-#: across four program shapes at depth 1-2: a heavy `gauss_blur` chain (this ask's own
-#: benchmark shape, cost within noise at every stride incl. 0); two chains of 220+ cheap
-#: per-pixel statements at 256^2 and 1024^2 (cost +40-44%/+1.7-10.5% with striding OFF,
-#: +/-3%/+/-5% at every nonzero stride tried); and a `gauss_blur(3.0)` chain calibrated to
-#: ~300ms at 1024^2 mirroring an embedding host's own background-render repro shape (already
-#: within noise, striding on or off). 0.5 ms keeps every shape within a few percent of
-#: unpaced. See the hand-back for the full (stride x depth) table.
+#: across several program shapes at depth 1-2, from a heavy real-device-work chain (cost
+#: within noise at every stride including 0) to chains of 200+ cheap per-pixel statements
+#: (cost +40-44% with striding OFF, within a few percent at every nonzero stride tried).
+#: See the hand-back for the full (stride x depth) table across shapes (R2#7).
 _DEFAULT_STRIDE_S = 0.0005
 
 
@@ -264,16 +248,20 @@ def reset(token=None, device=None) -> None:
 
     Only when `wants_pacing(token)` is true does this resolve is-CUDA/index/is-current (once,
     here — PACE-45's original short-circuit, restored), then, only if the device really is
-    CUDA, this cook's look-ahead `depth` and `stride`, and grows the per-(thread, device)
-    look-ahead ring if a bigger `depth` is asked for than this thread has ever needed for
-    THIS device index (P1: a different device index drops the ring rather than reusing a
-    foreign-device slot — see the comment at the drop below). The ring itself is a per-thread
-    resource that outlives any one cook — never shrunk, never recreated for the SAME device —
-    so a thread's Nth cook on a device it has already paced for pays for event allocation at
-    most once per ring slot, not once per cook. Only the ring's head/count (this cook's own
-    poll sequence) and `last_record_t` start fresh, so a fresh cook's first paced poll always
-    records/waits regardless of `stride`, exactly as its first `depth` polls always record
-    regardless of the ring being warm."""
+    CUDA, this cook's look-ahead `depth` and `stride`, and looks up (or creates) this
+    thread's event pool for THIS device index — never a different one (P1/P5: pools are
+    keyed by device index, so a same-thread cook that switches CUDA devices always gets a
+    fresh, empty pool for the new index; it can never reuse a slot still bound to the old
+    device's events, the cross-device crash B1 found). A pool is a per-(thread, device)
+    resource that outlives any one cook — its FREE list only grows, never shrinks, for the
+    SAME device index — so a thread's Nth cook on a device it has already paced for pays for
+    event allocation at most once per pool slot, not once per cook.
+
+    A fresh cook, even a REPEAT one on a warm pool, starts with zero OUTSTANDING events of
+    its own: whatever the previous cook on this pool left mid-flight is handed back to the
+    free list here (mirroring the old design's unconditional per-cook head=0/count=0 reset),
+    so a fresh cook's first paced poll always records/waits regardless of `stride`, exactly
+    as its first `depth` polls always record regardless of the pool being warm."""
     if not wants_pacing(token):
         _state.paced = False
         return
@@ -284,25 +272,25 @@ def reset(token=None, device=None) -> None:
     _state.is_current = is_current
     _state.depth = _resolve_depth(token)
     _state.stride_s = _resolve_stride(token)
-    ring = getattr(_state, "ring", None)
-    ring_device_index = getattr(_state, "ring_device_index", None)
-    if ring is None or ring_device_index != idx:
-        # P1: the ring is thread-local, not (thread, device)-local. A warm slot holds an
-        # already-record()ed `torch.cuda.Event`, and a CUDA event binds to whichever
-        # device is ambient the first time it is recorded — re-record()ing it while a
-        # DIFFERENT device is ambient is a real `cudaEventRecord` device-mismatch crash,
-        # not a PyTorch-added restriction. A same-thread cook that targets a different
-        # CUDA device than the last paced cook on this thread must never reuse the old
-        # ring's slots, so drop it and start fresh — the overwhelmingly common
-        # single-GPU-host case takes this branch at most once (the thread's first paced
-        # cook), never again.
-        ring = []
-        _state.ring_device_index = idx
-    if len(ring) < _state.depth:
-        ring = ring + [None] * (_state.depth - len(ring))
-    _state.ring = ring
-    _state.head = 0
-    _state.count = 0
+    pools = getattr(_state, "pools", None)
+    if pools is None:
+        pools = {}
+        _state.pools = pools
+    pool = pools.get(idx)
+    if pool is None:
+        # P1: a pool is per-(thread, DEVICE INDEX) — a same-thread cook that targets a
+        # different CUDA device than any prior paced cook on this thread always gets its
+        # own fresh pool, never a slot warmed for a foreign device.
+        pool = {"outstanding": _deque(), "free": []}
+        pools[idx] = pool
+    elif pool["outstanding"]:
+        # This cook owns none of the PREVIOUS cook's outstanding events (they were never
+        # this cook's poll sequence to wait on) — hand them all back to the free list so
+        # the underlying Event objects stay warm/reusable without carrying stale
+        # bookkeeping across the cook boundary.
+        pool["free"].extend(pool["outstanding"])
+        pool["outstanding"].clear()
+    _state.pool = pool
     _state.last_record_t = None
 
 
@@ -315,26 +303,36 @@ def paced_check(token, device) -> None:
     Paced (a CUDA cook, a token with a truthy `pace`): polls the token first (an
     already-tripped token is caught before any device interaction) — ALWAYS, regardless of
     what follows, so cancellation latency never depends on the stride gate below. Then, if
-    fewer than `stride` seconds of host time have passed since the ring last recorded, this
-    poll is DONE: no ring access, no CUDA call at all beyond the `token.check()` already
+    fewer than `stride` seconds of host time have passed since the pool last recorded, this
+    poll is DONE: no pool access, no CUDA call at all beyond the `token.check()` already
     paid. That is the stride gate a chain of many cheap statements needs — recording a CUDA
     event at every one of them costs more than the statements themselves, measured (see the
     hand-back).
 
-    Past the stride, the poll behaves exactly as depth-only PACE-462 did: only if the
-    look-ahead ring already holds `depth` outstanding events, blocks on the OLDEST one
+    Past the stride, the poll behaves exactly as depth-only PACE-462 did: only if this
+    cook's device pool already holds `depth` OUTSTANDING events, blocks on the OLDEST one
     (`event.synchronize()`, a real blocking wait — not a busy `query()` loop) and polls the
     token again immediately after, so a trip that lands WHILE the host is parked in the wait
-    is caught as soon as the wait returns rather than only on the next ordinary poll. Then
-    records (or, warm, re-records) the ring's next slot as the NEW outstanding event for a
-    future poll point to wait on — via `_record_on`, which skips the device context manager
-    when this cook's device is already ambient-current (OVERHEAD-462, resolved once by
-    `reset()` above).
+    is caught as soon as the wait returns rather than only on the next ordinary poll — then
+    hands that now-free event back to the pool's FREE list (P5: a plain FIFO of outstanding
+    events plus a small free pool, R2#1 — the event that gets waited-on is exactly the event
+    that becomes free to reuse next, so no fixed-size array, no head/count, no modulo, and
+    no `None`-hole cold-slot check are needed). Every bookkeeping mutation (the `popleft()`,
+    the `free.append`, the final `outstanding.append`) happens either BEFORE the operation
+    that could raise or strictly after it succeeds, so an exception between the wait and
+    this poll's own end (a trip caught by the re-check, or `_record_on` itself raising)
+    leaves `outstanding` describing exactly what is really outstanding — never a stale
+    count (B1#6; this falls out of the deque form rather than needing its own fix).
 
-    `_state.paced`/`_state.depth`/`_state.stride_s` are read off state resolved once by
-    `reset()` (above) rather than recomputed here every call — `getattr(..., False)` covers
-    a poll reached without a prior `reset()` on this thread (reads as unpaced, the old
-    default)."""
+    Records (or, warm, re-records from the free list) the new outstanding event via
+    `_record_on`, which skips the device context manager when this cook's device is already
+    ambient-current (OVERHEAD-462, resolved once by `reset()` above). `_state.stride_s`/
+    `depth`/`pool`/`is_current`/`last_record_t` are read directly, not via `getattr(...,
+    default)`: `reset()` is the sole writer of `_state.paced` and it always writes every one
+    of these fields in the SAME call whenever it writes `paced = True` (R2#2), so once past
+    the `getattr(_state, "paced", False)` check above — the one read that DOES need a
+    default, because it is the only one that must tolerate a poll reached with no prior
+    `reset()` on this thread — every field below is guaranteed present."""
     if token is None:
         return
     if not getattr(_state, "paced", False):
@@ -343,42 +341,30 @@ def paced_check(token, device) -> None:
 
     token.check()
 
-    stride = getattr(_state, "stride_s", _DEFAULT_STRIDE_S)
+    stride = _state.stride_s
     if stride > 0:
-        last = getattr(_state, "last_record_t", None)
+        last = _state.last_record_t
         if last is not None and (_time.perf_counter() - last) < stride:
             return  # inside the stride window: token already checked, nothing else to do
 
-    depth = getattr(_state, "depth", _DEFAULT_DEPTH)
-    ring = getattr(_state, "ring", None)
-    if ring is None or len(ring) < depth:
-        ring = (ring or []) + [None] * (depth - len(ring or []))
-        _state.ring = ring
-    head = getattr(_state, "head", 0)
-    count = getattr(_state, "count", 0)
+    pool = _state.pool
+    outstanding, free = pool["outstanding"], pool["free"]
+    depth = _state.depth
 
-    if count >= depth:
-        # The ring already holds `depth` outstanding events: the device is up to `depth`
+    if len(outstanding) >= depth:
+        # The pool already holds `depth` outstanding events: the device is up to `depth`
         # poll-intervals behind the host. Wait on the OLDEST before queuing anything newer,
         # so the host never gets more than `depth` intervals ahead.
-        oldest = ring[head]
+        oldest = outstanding.popleft()
         oldest.synchronize()
         token.check()
-        head = (head + 1) % depth
-        count -= 1
+        free.append(oldest)
 
-    tail = (head + count) % depth
-    ev = ring[tail]
-    is_current = getattr(_state, "is_current", False)
-    if ev is None:
-        # Cold ring slot: this thread has never needed this many outstanding events before.
-        # `blocking=True` so a wait on this event (above) releases the GIL.
-        ev = torch.cuda.Event(blocking=True)
-        ring[tail] = ev
-    _record_on(ev, device, is_current)
+    # `blocking=True` so a wait on this event (above, some FUTURE poll) releases the GIL.
+    ev = free.pop() if free else torch.cuda.Event(blocking=True)
+    _record_on(ev, device, _state.is_current)
+    outstanding.append(ev)
 
-    _state.head = head
-    _state.count = count + 1
     _state.last_record_t = _time.perf_counter()
 
 
@@ -436,12 +422,18 @@ def save_state() -> dict:
     own `finally: restore_cook_ctx` would permanently lose its own pacing bookkeeping to the
     inner cook's.
 
-    A shallow copy of `_state.__dict__` is enough: every value here is a plain scalar or the
-    ring list/the per-device pool, and neither is ever mutated by REPLACING the object a
-    caller's earlier snapshot points at — `reset()` only ever rebinds `_state.ring` to a NEW
-    list when it grows, never mutates an old one a snapshot still references, so an outer's
-    saved reference stays exactly what it was even if an inner cook's own `reset()` runs
-    after this snapshot is taken."""
+    A shallow copy of `_state.__dict__` is enough to restore every SCALAR field (`paced`,
+    `depth`, `stride_s`, `is_current`, `last_record_t`, which `_pace.pool` an outer cook is
+    using) exactly as it was — `reset()` never REPLACES `_state.pools` or any one device's
+    pool dict, only mutates one in place, so the reference itself survives an inner cook's
+    own `reset()` call unchanged. What this does NOT isolate: an inner cook that nests on
+    the SAME device index as the outer shares that ONE pool's `outstanding`/`free` split
+    with it (by the design's own "one warm pool per device" contract), so the inner cook's
+    `reset()` still hands the outer's then-outstanding events back to `free` before the
+    inner cook runs. The scalar bookkeeping this snapshot restores (depth/stride/etc.) is
+    exactly what B1#2 asked for; a same-device nested pacer sharing event tracking with its
+    parent is the "currently latent, no live caller reaches it" half of that finding, not
+    something this snapshot claims to solve."""
     return dict(_state.__dict__)
 
 
