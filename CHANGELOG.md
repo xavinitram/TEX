@@ -5,6 +5,96 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.2] - 2026-09-26 — "Bounded, not blocking"
+
+A patch release, answering an embedding host's own re-pin findings against `v0.46.1` — a
+background-render pre-emption cost, a profiler-cost question, an informational per-cook
+overhead measurement, and a Windows key-read bug it diagnosed and handed back — plus this
+release's own pre-handover audit. No `LANGUAGE_VERSION` move, no default moved, no new
+reserved name.
+
+### Fixed
+
+- **Bounded look-ahead pacing replaces the fixed one-poll-interval wait.** A cancel token with
+  `pace=True` used to make every poll point wait, via a busy `query()`+`sleep(0.001)` loop, on
+  the PREVIOUS poll's own device event — keeping the host at most one statement ahead of the
+  device at all times. That could cost a paced background render roughly its own run time
+  again on a heavy per-statement chain, and made the mechanism unusable on a chain of many
+  cheap per-pixel statements (10-44% overhead even at the cheapest setting). Replaced with a
+  per-thread pool of up to `pace_depth` outstanding CUDA events (default 2), gated by a
+  host-time stride (`pace_stride_ms`, default 0.5ms) so a poll point only touches the pool once
+  enough host time has passed since it last did. Every program shape measured now reads within
+  a few percent of unpaced, while still bounding a pre-empted background cook to at most
+  `pace_depth` poll-intervals of queued device work (down from an unbounded, ~140ms-observed
+  queue). A cancel token may set `pace_depth` (int, >= 1, capped at 64) and/or
+  `pace_stride_ms` (a non-negative int or float; 0 disables the stride; NaN/inf rejected) to
+  choose its own bounds. `cancel=None`, an unpaced token, a CPU cook and a default ComfyUI cook
+  are unaffected in behaviour and in cost.
+- **A cross-device crash in the paced-cancellation event pool is fixed.** A warm pool slot is
+  now kept per CUDA device index (dropped and rebuilt on a device switch) instead of being
+  re-recorded on whichever device happens to be current — the previous shape could hand a
+  device-A event to a `cudaEventRecord` call on device B.
+- **A per-cook cost regression on the default (unpaced) path is fixed, and the cost cut it was
+  supposed to carry now actually engages.** `reset()` now short-circuits for an unpaced token
+  exactly as it did before pacing existed, touching no other state; the per-CUDA-cook
+  device-completion event (`CookResult.done`) now memoizes on the *raw* device value each
+  caller actually passes, instead of comparing a `torch.device` to a plain string and missing
+  the cache on every single call. Measured against `v0.46.1`: the unpaced default path is now
+  faster on both CPU (-74%) and CUDA (-47%) per call, not merely no slower.
+- **A profiler a host explicitly arms (`tex_runtime.profile.enable()` — off by default, and
+  never called by this package itself) no longer blocks a sampled CUDA cook's thread on the
+  device while measuring it.** The measurement is exactly as accurate as before (the device's
+  own time, never the host's enqueue time) — previously enforced by four blocking
+  `torch.cuda.synchronize()` calls per sampled cook (one bracketing pair, plus one per
+  fused-chain stage boundary); now by a timing-enabled CUDA event at cook entry, one at exit,
+  and one per stage boundary, read back lazily through a small bounded queue once every earlier
+  boundary on that stream is confirmed complete. No effect on any cook while the profiler is
+  disarmed, which is every default ComfyUI cook.
+- **A CUDA-graph capture running on the same thread as an active profiler sample no longer
+  corrupts that sample.** `GraphedProgram.capture()`'s own nested statement execution used to
+  write its stage-boundary events into whatever profiler sample happened to be open on the
+  outer thread, seeding a brand-new fused-chain key's cost table with the wrong numbers at full
+  initial weight. This defect pre-dates this release — the previous, synchronize-based
+  recording had the identical hole — and is fixed by suspending the outer sample's stage
+  tracking for the duration of a nested capture.
+- **A failed stage-boundary timing no longer corrupts its neighbour's cost.** A boundary event
+  that fails to record now makes its sample fall back to whole-cook timing with no per-stage
+  split, instead of silently folding the lost stage's cost into whichever boundary comes next.
+- **A per-user Windows signing-key file could be misread about 12% of the time, sending every
+  spilled frame and the whole compiled-program cache cold on the next launch.** The key was
+  read through a raw file-descriptor open with no binary-mode flag; on Windows that is text
+  mode, which stops reading at the legacy Ctrl-Z end-of-file byte and folds CRLF to LF — a
+  uniformly random 32-byte key contains that byte on roughly one mint in eight. The next
+  process then read its own valid key back short, classed it malformed, and minted a new one in
+  its place, so everything the previous process had signed then failed verification under a key
+  that had silently changed out from under it. Never a wrong pixel — only an unnecessary recook
+  or recompile. Every other binary-state read in the tree already went through a helper that
+  gets this right; this was the one path that opened state directly. That read now goes through
+  the same helper, which a standing check now enforces as the only place permitted to open
+  binary state this way.
+- **A transient read failure on an otherwise-valid cache entry is no longer treated the same as
+  a genuinely bad one.** A share violation, a momentarily-full file handle table, or a flaky
+  cache directory used to make a valid, signed frame or program-cache entry indistinguishable
+  from a tampered one, and every caller deleted it outright; that case is now a distinct,
+  non-deleting miss, with the verdict-to-action decision made in one place instead of
+  separately at each caller. A genuinely bad file is still deleted as before. Bounded so a file
+  that is unreadable on every attempt, forever, still resolves to a deletion after a fixed
+  number of consecutive misses, instead of being retried on every restore indefinitely.
+- **A crash-orphaned key-mint temp file is no longer left behind forever.** A temp file from a
+  key mint that never completed (a crash mid-mint) is now swept on a later mint or probe,
+  age-gated so an in-progress mint on another process is never touched.
+
+### For anyone vendoring this tree
+
+No newly reserved names; `LANGUAGE_VERSION` unmoved at `"0.25"`; no default moved; no new
+shipping module filenames. **No ComfyUI pixel change** — every fix above changes timing,
+caching or an opt-in mechanism's own cost, never a cook's output. **Cache cold-start:** this
+patch edits `tex_runtime/interpreter.py`/`stdlib_core.py` (both `_CODEGEN_FILES` members) and
+`tex_runtime/graphed.py` (a `_VERDICT_FILES` member), so the codegen and tier-verdict caches
+each move once; `.pkl` stays warm. `tex_runtime/pacing.py` and `tex_runtime/profile.py`, both
+substantially reworked this patch, are on neither watch-list and cannot stale an on-disk cache
+by themselves.
+
 ## [0.46.1] - 2026-09-26 — "Deterministic by design"
 
 A test-only fix. No product change, no pixel change, no `LANGUAGE_VERSION` move.

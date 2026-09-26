@@ -463,8 +463,8 @@ test before it starts, and cannot claim a win the instrument would not see.
    timing-enabled `torch.cuda.Event` at entry and one at exit — never `CookResult.done`, which
    PACE-45 creates without `enable_timing` and which this leaves alone — and
    `Interpreter._exec_stmts_profiled` records one more per stage boundary the same way. None of
-   these block. They queue in a small bounded FIFO (`_drain_pending_locked`,
-   `tex_runtime/profile.py:324`) and fold into the tables the next time anything reads them, by
+   these block. They queue in a small bounded FIFO (`_drain_pending`,
+   `tex_runtime/profile.py:408`) and fold into the tables the next time anything reads them, by
    checking only the LAST event's `.query()` — CUDA completes events on one stream in the order
    recorded, so a signalled last event means every earlier boundary on that cook is already safe
    to read. **Measured** (this box, `--prof1 on`, a terminal tick, `27f260e` → head, three
