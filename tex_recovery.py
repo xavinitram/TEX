@@ -555,6 +555,52 @@ def sign_pickle(path, data, *, fsync: bool = False) -> bool:
     return atomic_write(str(path), _body, fsync=fsync)
 
 
+#: R4 (B3#2): how many CONSECUTIVE `_UNREADABLE` verdicts for the SAME path, within this
+#: process, before `load_verified` stops calling it transient and reports `_UNVERIFIED` instead
+#: — the exact action every caller already takes for "give up on this file" (delete + its own
+#: accounting). Below this, an open()/read() failure is exactly the transient case RESTORE-462
+#: (`ea8a1d6`) protects (a sharing violation, a momentary EMFILE, a network hiccup) and must
+#: leave the file for a retry to find good. Nothing distinguished that from a PERMANENT failure
+#: (a real disk I/O error, a permission grant that never returns): `_UNREADABLE` never deletes
+#: the file or clears its cache membership, so a permanently-unreadable entry was retried —
+#: one real syscall — on every single restore/load for that key, forever. Chosen well above any
+#: plausible transient retry count (the existing single-flaky-open regression test trips this
+#: exactly once) and finite, so the self-heal (a re-`put()` of the same key, which every caller
+#: already does after a miss) is reachable instead of permanently blocked by a dead entry.
+_UNREADABLE_STREAK_LIMIT = 8
+_unreadable_streak: dict[str, int] = {}
+_unreadable_streak_lock = threading.Lock()
+
+
+def _note_unreadable(path: str) -> bool:
+    """Record one `_UNREADABLE` verdict for `path`. Returns True once this is the
+    `_UNREADABLE_STREAK_LIMIT`-th CONSECUTIVE one for this exact path — the caller should
+    escalate to `_UNVERIFIED` (give up, let it be deleted) rather than decline quietly again.
+
+    HONEST COST: `_unreadable_streak` is keyed by path and never shrinks except on escalation
+    or a later successful open of that SAME path (`_clear_unreadable_streak`) — a process that
+    sees many DISTINCT paths go transiently unreadable at least once, and never again, carries
+    one small dict entry per such path for its lifetime. Bounded by the number of cache entries
+    that ever exist, not by call count, and each entry is a string key plus one int."""
+    with _unreadable_streak_lock:
+        n = _unreadable_streak.get(path, 0) + 1
+        if n >= _UNREADABLE_STREAK_LIMIT:
+            _unreadable_streak.pop(path, None)   # escalating now; a future write starts fresh
+            return True
+        _unreadable_streak[path] = n
+        return False
+
+
+def _clear_unreadable_streak(path: str) -> None:
+    """Any verdict OTHER than `_UNREADABLE` for `path` means the file was actually opened and
+    read this time (even if its content then judges unverified/future-trailer/valid) — so
+    whatever streak of "could not even open it" was accumulating for this path is over and must
+    not carry into a later, unrelated failure."""
+    if path in _unreadable_streak:
+        with _unreadable_streak_lock:
+            _unreadable_streak.pop(path, None)
+
+
 def load_verified(path):
     """Read `path` ONCE, authenticate the keyed-MAC trailer, and unpickle from the SAME in-memory
     buffer — so the bytes `pickle` deserialises are byte-for-byte the bytes the MAC verified, with
@@ -566,12 +612,19 @@ def load_verified(path):
     file), or `_FUTURE_TRAILER` (a newer `TEXm<n>` wrote it — decline WITHOUT deleting, so a
     downgrade never destroys a frame the newer build can still read), or `_UNREADABLE` (the file
     could not even be opened/read — a transient OS-level failure that says nothing about the
-    file's content — decline WITHOUT deleting, exactly like `_FUTURE_TRAILER`; RESTORE-462)."""
+    file's content — decline WITHOUT deleting, exactly like `_FUTURE_TRAILER`; RESTORE-462).
+
+    R4: `_UNREADABLE` is BOUNDED. `_UNREADABLE_STREAK_LIMIT` consecutive open/read failures on
+    the SAME path escalate this call's verdict to `_UNVERIFIED` instead — every caller already
+    treats that as license to delete the file, which is exactly what a permanently-unreadable
+    entry needs (a transient failure never reaches the limit; see the constant's docstring)."""
+    spath = str(path)
     try:
-        with open(str(path), "rb") as f:
+        with open(spath, "rb") as f:
             buf = f.read()
     except OSError:
-        return _UNREADABLE
+        return _UNVERIFIED if _note_unreadable(spath) else _UNREADABLE
+    _clear_unreadable_streak(spath)
     if len(buf) < _MAC_TRAILER_LEN:
         return _UNVERIFIED
     magic = buf[-_MAC_TRAILER_LEN:-_MAC_TAG_LEN]
@@ -580,7 +633,7 @@ def load_verified(path):
         return _FUTURE_TRAILER if magic[:len(_MAC_FAMILY)] == _MAC_FAMILY else _UNVERIFIED
     tag = buf[-_MAC_TAG_LEN:]
     payload = memoryview(buf)[:-_MAC_TRAILER_LEN]
-    name = os.path.basename(str(path)).encode("utf-8", "surrogatepass")
+    name = os.path.basename(spath).encode("utf-8", "surrogatepass")
     m = _mac_init(name)
     m.update(payload)
     if not hmac.compare_digest(m.digest(), tag):
