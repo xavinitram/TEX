@@ -77,14 +77,21 @@ class _FakeEvent:
 
 class _DeviceSpy:
     """Patches enough of `torch.cuda` to drive `pacing.py`'s CUDA branch on ANY box: a
-    context-manager stand-in for `torch.cuda.device`, `is_available() -> True`, and
-    `Event` bound to `_FakeEvent`. Mirrors `test_fixobsroute46_pacing.py::_DeviceSpy`."""
+    context-manager stand-in for `torch.cuda.device`, `is_available() -> True`,
+    `current_device()` fixed to 0 (OVERHEAD-462: `reset()` now calls it unconditionally
+    whenever `is_available` reads True, so it MUST be mocked here too — otherwise this file
+    would raise on a genuinely CPU-only torch build despite the `is_available` mock), and
+    `Event` bound to `_FakeEvent`. Mirrors `test_fixobsroute46_pacing.py::_DeviceSpy`. None
+    of this file's rows depend on WHICH index reads current — they assert on `_FakeEvent`
+    construction/record/sync counts, not on whether the (now-optional) `torch.cuda.device(...)`
+    context manager was entered."""
 
     def __init__(self):
         self.device_calls = []
         self._real_available = None
         self._real_device_ctx = None
         self._real_event = None
+        self._real_current_device = None
 
     def __enter__(self):
         import torch
@@ -92,6 +99,7 @@ class _DeviceSpy:
         self._real_available = torch.cuda.is_available
         self._real_device_ctx = torch.cuda.device
         self._real_event = torch.cuda.Event
+        self._real_current_device = torch.cuda.current_device
 
         class _Ctx:
             def __init__(self, dev):
@@ -104,6 +112,7 @@ class _DeviceSpy:
                 return False
 
         torch.cuda.is_available = lambda: True
+        torch.cuda.current_device = lambda: 0
         torch.cuda.device = _Ctx
         torch.cuda.Event = _FakeEvent
         _FakeEvent._live = 0
@@ -112,6 +121,7 @@ class _DeviceSpy:
     def __exit__(self, *exc):
         import torch
         torch.cuda.is_available = self._real_available
+        torch.cuda.current_device = self._real_current_device
         torch.cuda.device = self._real_device_ctx
         torch.cuda.Event = self._real_event
         return False
