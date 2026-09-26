@@ -113,12 +113,24 @@ _STATE: "OrderedDict[tuple, dict]" = OrderedDict()
 #: touches, and putting a lock acquisition there would tax every ComfyUI cook to protect a
 #: table that cook never writes (invariant #7). The critical sections below are all a few dict
 #: operations, so an uncontended acquire is the whole cost.
-#: PROF-462: an `RLock`, not a plain `Lock` — `_drain_pending_locked` calls the public
-#: `record`/`record_stages` (deliberately, so a host or benchmark counting calls to those two
-#: names — `docs/host-path-counts.md`'s BENCH-2 harness does exactly this — still sees a fold
-#: happen, however lazily) from inside a block that already holds this lock; a non-reentrant
-#: lock would deadlock the very first sampled cook.
-_LOCK = threading.RLock()
+#:
+#: A plain, NON-reentrant `Lock` — deliberately not an `RLock`. `_drain_pending` (below) folds
+#: through the PUBLIC `record`/`record_stages` (so a host or benchmark counting calls to those
+#: two names — `docs/host-path-counts.md`'s BENCH-2 harness does exactly this — still sees a
+#: fold happen, however lazily), and every caller that needs a drain calls `_drain_pending()`
+#: BEFORE taking this lock, never while holding it, so `record`/`record_stages`'s own
+#: `with _LOCK:` never nests. (An earlier version drained from inside this lock and widened it
+#: to `RLock` to tolerate the reentrancy that created — broader than the one call site needed,
+#: and it would have silently allowed a FUTURE addition under this lock to reenter instead of
+#: deadlocking and announcing itself. `_PENDING_LOCK` below guards `_pending` on its own, so
+#: nothing here ever needs to call back into code that takes `_LOCK`.)
+_LOCK = threading.Lock()
+
+#: Guards `_pending` ONLY — never taken together with `_LOCK` in the reverse order (this lock
+#: is only ever acquired standalone, by `_drain_pending`/`_queue_pending`/`_pending_count`, or
+#: nested INSIDE an already-held `_LOCK` by `should_sample`'s in-flight count; `_LOCK` is never
+#: acquired while this one is held, so there is no ordering cycle to deadlock on).
+_PENDING_LOCK = threading.Lock()
 
 
 # ── arming ───────────────────────────────────────────────────────────────────
@@ -284,16 +296,17 @@ def should_sample(key: tuple, spatial=None) -> bool:
     how many are already "spoken for"."""
     if not _enabled:
         return False                     # the default path never reaches the lock
+    _drain_pending()                     # PROF-462/F4: never called while holding _LOCK
     with _LOCK:
-        _drain_pending_locked()          # PROF-462: fold whatever device work has landed
         bkt, px = bucket_of(spatial)
         buckets = _buckets(key, create=True)
         st = buckets.get(bkt)
         if st is None:
             buckets[bkt] = _Bucket(px=px)
             return True
-        in_flight = sum(1 for p in _pending
-                        if p.key == key and bucket_of(p.spatial)[0] == bkt)
+        with _PENDING_LOCK:               # F4: `_pending` is guarded by its own lock now
+            in_flight = sum(1 for p in _pending
+                            if p.key == key and bucket_of(p.spatial)[0] == bkt)
         if st.samples + in_flight < _WARMUP_SAMPLES:
             return True
         st.skips += 1
@@ -369,26 +382,36 @@ class _Pending:
 _pending: "deque[_Pending]" = deque()
 
 
-def _drain_pending_locked() -> None:
-    """Fold every queued sample whose device work has completed into the tables. Caller
-    holds `_LOCK` (an `RLock` — see there): this calls the PUBLIC `record`/`record_stages`,
-    not `_bucket(...).feed(...)` directly, so a host or benchmark that counts calls to those
-    two names (`docs/host-path-counts.md`'s BENCH-2 harness) still sees the fold happen,
-    lazily, exactly once per sample — the same contract those functions have always kept,
-    just no longer paid for with a device barrier. NEVER calls `.synchronize()` — a sample
-    whose end event has not yet signalled is left queued for the next drain, exactly like
+def _pop_ready() -> list:
+    """Pop every queued sample whose device work has completed, under `_PENDING_LOCK` ONLY —
+    never `_LOCK`. F4: the caller folds the returned list by calling the PUBLIC `record`/
+    `record_stages` (each takes `_LOCK` itself) OUTSIDE this lock, so `_LOCK` never has to be
+    reentrant. Skips the lock entirely when nothing is queued — the common case once a key is
+    warm and sampling is idle."""
+    if not _pending:                     # F4: no lock at all when there is nothing to drain
+        return []
+    ready, keep = [], deque()
+    with _PENDING_LOCK:
+        for samp in _pending:
+            try:
+                done = samp.end.query()
+            except Exception:
+                done = True    # a dead/invalidated event can never complete; drop it, not wait
+            (ready if done else keep).append(samp)
+        _pending.clear()
+        _pending.extend(keep)
+    return ready
+
+
+def _drain_pending() -> None:
+    """Fold every queued sample whose device work has completed into the tables, via the
+    PUBLIC `record`/`record_stages` (so a host or benchmark counting calls to those two names —
+    `docs/host-path-counts.md`'s BENCH-2 harness does exactly this — still sees the fold happen,
+    lazily, exactly once per sample). F4: NEVER call this while already holding `_LOCK` — it
+    calls functions that take `_LOCK` themselves. NEVER calls `.synchronize()` — a sample whose
+    end event has not yet signalled stays queued for the next drain, exactly like
     `_timed_deferred`'s (LAT-3, `tex_runtime/compiled.py`) same-shaped deferral."""
-    if not _pending:
-        return
-    keep = deque()
-    for samp in _pending:
-        try:
-            done = samp.end.query()
-        except Exception:
-            done = True    # a dead/invalidated event can never complete; drop it, not wait
-        if not done:
-            keep.append(samp)
-            continue
+    for samp in _pop_ready():
         try:
             whole_ms = samp.start.elapsed_time(samp.end)
             record(samp.key, whole_ms, samp.spatial)
@@ -407,8 +430,6 @@ def _drain_pending_locked() -> None:
                     record_stages(samp.key, stages, samp.spatial)
         except Exception:
             pass            # a readback failure loses one sample; never raises to a caller
-    _pending.clear()
-    _pending.extend(keep)
 
 
 def _queue_pending(key: tuple, spatial, start, end, stage_events) -> None:
@@ -416,8 +437,8 @@ def _queue_pending(key: tuple, spatial, start, end, stage_events) -> None:
     the oldest entry is dropped, unresolved or not, once the queue would exceed
     `_PENDING_MAX` — a profiler that never blocks the cook path must also never grow
     without bound if a consumer stops reading the table."""
-    with _LOCK:
-        _drain_pending_locked()
+    _drain_pending()                     # F4: before, not under, _PENDING_LOCK
+    with _PENDING_LOCK:
         _pending.append(_Pending(key, spatial, start, end, stage_events))
         while len(_pending) > _PENDING_MAX:
             _pending.popleft()
@@ -425,7 +446,7 @@ def _queue_pending(key: tuple, spatial, start, end, stage_events) -> None:
 
 def _pending_count() -> int:
     """Test hook: how many samples are queued for lazy fold, without draining them."""
-    with _LOCK:
+    with _PENDING_LOCK:
         return len(_pending)
 
 
@@ -448,8 +469,10 @@ def _resolve_bucket(key: tuple, spatial, *, need_stages: bool = False):
     fixed cost (dispatch, binding marshalling, the Python walk) that does not shrink with the
     frame — at 64² a TEX cook is almost entirely that fixed part. For ORDERING work the bias
     cancels across candidates; against an ABSOLUTE threshold it does not, which is why CACHE-7
-    also checks a materialization floor. Caller holds `_LOCK`."""
-    _drain_pending_locked()   # PROF-462: every reader sees device-honest, already-folded data
+    also checks a materialization floor. Caller holds `_LOCK`; caller must have already
+    called `_drain_pending()` BEFORE taking `_LOCK` (F4: this function no longer drains
+    itself, so every reader sees device-honest, already-folded data without `_LOCK` ever
+    needing to be reentrant)."""
     buckets = _buckets(key, create=False)
     if not buckets:
         return None, 1.0
@@ -471,6 +494,7 @@ def predict(key: tuple, spatial=None) -> float | None:
     """Expected cook cost in ms, or None if this program has never been measured on that
     (device, precision). See `_resolve_bucket` for the cross-resolution fallback and its
     honest approximation."""
+    _drain_pending()          # F4: before, never under, _LOCK
     with _LOCK:
         best, scale = _resolve_bucket(key, spatial)
         return None if best is None else best.ewma_ms * scale
@@ -479,6 +503,7 @@ def predict(key: tuple, spatial=None) -> float | None:
 def stage_costs(key: tuple, spatial=None) -> dict:
     """{stage_index: EWMA ms} for a fused program, or {} if never measured per stage. This is
     CACHE-7's input: a checkpoint goes where the CUMULATIVE cost crosses its threshold."""
+    _drain_pending()
     with _LOCK:
         best, scale = _resolve_bucket(key, spatial, need_stages=True)
         return {} if best is None else {k: v * scale for k, v in best.stages.items()}
@@ -493,6 +518,7 @@ def samples(key: tuple, spatial=None, *, need_stages: bool = False) -> int:
     with no per-stage breakdown when it is True, so the two flags select DIFFERENT buckets on
     the same key: a resolution measured whole-cook-only but never per-stage answers `samples`
     generously while `stage_costs` falls back to a distant bucket. See `stage_snapshot`."""
+    _drain_pending()
     with _LOCK:
         best, _ = _resolve_bucket(key, spatial, need_stages=need_stages)
         return best.samples if best is not None else 0
@@ -526,6 +552,7 @@ def stage_snapshot(key: tuple, spatial=None, *, need: int = 12) -> tuple:
     count of zero and refused to place. Re-splitting it re-creates the same bug in the
     opposite direction: costs from a distant bucket, confidence from a near one, and a
     placement made on numbers whose trustworthiness was measured somewhere else."""
+    _drain_pending()
     with _LOCK:
         best, scale = _resolve_bucket(key, spatial, need_stages=True)
         if best is None:
@@ -539,15 +566,16 @@ def reset() -> None:
     """Forget everything (a test hook, and what a host calls between projects)."""
     with _LOCK:
         _STATE.clear()
-        _pending.clear()          # PROF-462: a stale pending sample must not outlive a reset
+    with _PENDING_LOCK:            # F4: `_pending` has its own lock now
+        _pending.clear()           # PROF-462: a stale pending sample must not outlive a reset
 
 
 def snapshot() -> dict:
     """A JSON-able view: {"fp|device|precision": {bucket: {...}}}. The seam CACHE-7 would
     persist through, and what a host HUD reads."""
     out = {}
+    _drain_pending()                     # F4: a snapshot reads whatever has folded, before _LOCK
     with _LOCK:                          # a concurrent insert would raise mid-iteration
-        _drain_pending_locked()          # PROF-462: a snapshot reads whatever has folded
         for (fp, dev, prec), buckets in _STATE.items():
             out[f"{fp}|{dev}|{prec}"] = {
                 str(bkt): {"px": b.px, "ms": round(b.ewma_ms, 4), "samples": b.samples,

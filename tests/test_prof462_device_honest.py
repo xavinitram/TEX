@@ -385,3 +385,43 @@ def test_fixprof_f3_warmup_gate_counts_inflight_pending(r: SubTestResult):
         r.fail("FIX-PROF F3",
                f"expected exactly {P._WARMUP_SAMPLES} warmup hits over a burst of "
                f"{burst}, got {warmup_hits}: {sampled}")
+
+
+def test_fixprof_f4_lock_is_plain_not_reentrant(r: SubTestResult):
+    """FIX-PROF F4: `profile._LOCK` went from a plain `Lock` to an `RLock` only because the
+    lazy-fold drain used to call the PUBLIC `record`/`record_stages` (each of which takes
+    `_LOCK` itself) from INSIDE a block that already held `_LOCK`. That reentrancy is removed
+    (the drain now runs before any caller takes `_LOCK`, never inside it), so `_LOCK` should be
+    a plain, non-reentrant `Lock` again -- the module's own comment calls it "a few dict
+    operations", a claim only true of a lock nothing ever has to reenter."""
+    P.reset()
+    reentrant_ok = None
+    ms = None
+    try:
+        P._LOCK.acquire()
+        try:
+            reentrant_ok = P._LOCK.acquire(blocking=False)
+            if reentrant_ok:
+                P._LOCK.release()
+        finally:
+            P._LOCK.release()
+
+        # Functional: the drain/fold path must still work correctly with a plain Lock -- a
+        # sampled cook that queues and resolves normally proves `_drain_pending` never calls
+        # `record`/`record_stages` while holding `_LOCK`.
+        with armed_profiler() as Pmod:
+            with _EventPatch():
+                key = Pmod.make_key("fixprof-f4", "cuda", "fp32")
+                with Pmod.measure(key, 8 * 8, device="cuda", stages=False):
+                    pass
+                ms = Pmod.predict(key, 8 * 8)
+    finally:
+        P.reset()
+
+    if (reentrant_ok is False) and ms is not None:
+        r.ok(f"_LOCK refuses re-entry (plain Lock, not RLock) and the fold path still "
+             f"resolves normally (predict()={ms!r})")
+    else:
+        r.fail("FIX-PROF F4",
+               f"reentrant_ok={reentrant_ok!r} predict()={ms!r} "
+               f"(expected a non-reentrant lock and a working fold)")
