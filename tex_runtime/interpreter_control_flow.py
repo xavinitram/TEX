@@ -27,7 +27,14 @@ from ..tex_compiler.ast_nodes import (
     ASTNode, Assignment, BinOp, ForLoop, Identifier, IfElse, VarDecl, WhileLoop,
     collect_assigned_vars, try_extract_static_range,
 )
-from .interpreter import MAX_LOOP_ITERATIONS, InterpreterError, _Break, _Continue
+# PHASEC-OBSROUTE follow-up: `MAX_LOOP_ITERATIONS`/`InterpreterError`/`_Break`/`_Continue`
+# used to sit in a top-level `from .interpreter import ...` here, contradicting this
+# docstring's own claim (above) that they are deferred — and, like R1's tex_engine_tiers
+# fix, importing THIS module first in a fresh process ImportErrored (`interpreter.py`
+# imports this module before `_ControlFlowMixin` exists, so the circular back-edge came
+# from THIS eager import, not from any attribute read). Deferred into each method that
+# uses them, below, matching the `_tensor_where`/`_collect_expr_names`/`_int_valued_scalar`
+# pattern this docstring already described correctly.
 # TRK-143: `cond_mask` is masked_flow's (language-0.25, TRK-152) existing single
 # definition of "is this pixel on" — module-level, no cycle (masked_flow.py never
 # imports interpreter.py/interpreter_control_flow.py at load time, only lazily inside
@@ -194,6 +201,7 @@ class _ControlFlowMixin:
 
     def _exec_loop_body(self, body: list[ASTNode]) -> bool:
         """Execute loop body statements. Returns True if break was hit."""
+        from .interpreter import _Break, _Continue
         try:
             for stmt in body:
                 self._exec_stmt(stmt)
@@ -204,6 +212,7 @@ class _ControlFlowMixin:
         return False
 
     def _raise_loop_limit(self, loop_type: str, loc):
+        from .interpreter import MAX_LOOP_ITERATIONS, InterpreterError
         raise InterpreterError(
             f"This {loop_type} loop ran {MAX_LOOP_ITERATIONS} iterations without finishing",
             loc, source=self._source, code="E6010",
@@ -223,6 +232,7 @@ class _ControlFlowMixin:
         where init, condition, and update are all literal-based, pre-compute
         the iteration range as Python range() — zero .item() GPU→CPU syncs.
         """
+        from .interpreter import MAX_LOOP_ITERATIONS, InterpreterError
         # Try fully static loop: pre-compute range() from init/cond/update literals
         static_range = self._try_extract_static_range(node)
         # UC-3: else try a *uniform* range — same shape but with scalar-expression
@@ -371,6 +381,7 @@ class _ControlFlowMixin:
 
     def _exec_while_loop(self, node: WhileLoop):
         """Execute a bounded while loop. Hard limit of MAX_LOOP_ITERATIONS."""
+        from .interpreter import MAX_LOOP_ITERATIONS
         iteration = 0
         while iteration < MAX_LOOP_ITERATIONS:
             if not self._loop_cond_true(node.condition):

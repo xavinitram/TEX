@@ -21,7 +21,13 @@ import math
 import torch
 
 from ..tex_compiler.ast_nodes import Program
-from .interpreter import _BUILTINS_LRU_MAX, _COORD_RAMP_LRU_MAX, _SCALAR_BUILTIN_DEFAULTS
+# PHASEC-OBSROUTE follow-up: `_BUILTINS_LRU_MAX`/`_COORD_RAMP_LRU_MAX`/
+# `_SCALAR_BUILTIN_DEFAULTS` used to sit in a top-level `from .interpreter import ...`
+# here, contradicting this docstring's own claim (above) that the names this module does
+# not own are deferred — and, like R1's tex_engine_tiers fix, importing THIS module first
+# in a fresh process ImportErrored the same way. Deferred into the two methods that use
+# them, below, alongside `_consensus_extent`/`_collect_identifiers`, which were already
+# correctly deferred.
 
 
 class _SpatialContextMixin:
@@ -75,6 +81,7 @@ class _SpatialContextMixin:
         is no "different rounding order" for a view to pick up. `u`/`v` are the SAME
         `ramp / max(size-1,1)` division `_create_builtins` already applied to `ix`,
         computed once over the full extent instead of once per window."""
+        from .interpreter import _COORD_RAMP_LRU_MAX
         key = (self._device_str, size)
         hit = self._coord_ramp_lru.get(key)
         if hit is not None:
@@ -103,7 +110,8 @@ class _SpatialContextMixin:
         1-D special case `roi=(0, y0, W, H, W, H_total)`; it is normalized to `roi` here so
         there is a SINGLE seam-exact coordinate path to reason about.
         """
-        from .interpreter import _collect_identifiers, _CACHEABLE_BUILTIN_NAMES
+        from .interpreter import (_collect_identifiers, _CACHEABLE_BUILTIN_NAMES,
+                                  _SCALAR_BUILTIN_DEFAULTS, _BUILTINS_LRU_MAX)
         used = used_builtins if used_builtins is not None else _collect_identifiers(program)
 
         # Cache builtins: reuse tensors when spatial config hasn't changed (LAT-4: small LRU,

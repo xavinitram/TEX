@@ -26,8 +26,13 @@ from ..tex_compiler.ast_nodes import (
 )
 from ..tex_compiler.types import CHANNEL_MAP, TEXType, TYPE_NAME_MAP, base_is_vector
 from .masked_flow import scatter_keep as _masked_flow_scatter_keep
+# PHASEC-OBSROUTE follow-up: `InterpreterError` used to sit in a top-level
+# `from .interpreter import InterpreterError` here, contradicting this docstring's own
+# claim (above) that it is deferred — and, like R1's tex_engine_tiers fix, importing THIS
+# module first in a fresh process ImportErrored the same way. Deferred into each of the
+# four methods that raise it, below, alongside the spatial/index helpers that were
+# already correctly deferred.
 from .stdlib import SAFE_EPSILON, VEC_CHANNELS, ZERO_GUARD_EPS, _get_flat_batch_index
-from .interpreter import InterpreterError
 
 
 class _BindingExecMixin:
@@ -169,6 +174,7 @@ class _BindingExecMixin:
         return current
 
     def _exec_assignment(self, node: Assignment):
+        from .interpreter import InterpreterError
         target = node.target
 
         # In-place optimization: x = x OP expr or x = expr OP x
@@ -270,7 +276,7 @@ class _BindingExecMixin:
 
     def _exec_channel_assign(self, target: ChannelAccess, value: torch.Tensor, rhs_node=None):
         """Handle assignment to a channel: `@A.r = expr;` or `color.rgb = expr;`"""
-        from .interpreter import _ensure_spatial
+        from .interpreter import _ensure_spatial, InterpreterError
         base = self._eval(target.object)
         channels = target.channels
         obj = target.object
@@ -351,7 +357,8 @@ class _BindingExecMixin:
 
     def _exec_array_index_assign(self, target: ArrayIndexAccess, value, rhs_node=None):
         """Handle: arr[i] = expr;"""
-        from .interpreter import _ensure_spatial, _safe_array_index, _const_index, _host_index
+        from .interpreter import (_ensure_spatial, _safe_array_index, _const_index,
+                                  _host_index, InterpreterError)
         array = self._eval(target.array)
         index = self._eval(target.index)
 
@@ -448,7 +455,7 @@ class _BindingExecMixin:
         this statement. `0.23` gates by destination, which has no per-pixel meaning once a
         transfer can leave a branch. `None` (every caller below `0.25`) is the unmasked
         write, byte-identical to before."""
-        from .interpreter import _ensure_spatial
+        from .interpreter import _ensure_spatial, InterpreterError
         name = target.binding.name
         args = [self._eval(a) for a in target.args]
         px, py = args[0], args[1]

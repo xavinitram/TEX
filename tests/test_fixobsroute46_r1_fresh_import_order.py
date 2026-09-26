@@ -15,14 +15,29 @@ Fixed by resolving `tex_engine_tiers`'s `_tex_engine` reference LAZILY (a proxy 
 `__getattr__` imports `tex_engine` on first attribute access, long after both modules have
 finished loading either way) instead of eagerly at import time.
 
+**Follow-up.** SPLIT-I's three interpreter mixin modules (`interpreter_binding.py` /
+`interpreter_control_flow.py` / `interpreter_spatial.py`) turned out to share the exact
+same defect class: each carried a top-level `from .interpreter import NAME, ...` for
+names `interpreter.py` imports THEM before defining (the mixin classes are composed by
+inheritance at `interpreter.py`'s own class-definition time), so importing any one of the
+three first, in a fresh process, ImportErrored the identical way `tex_engine_tiers` did.
+Each of those three modules' own docstring already claimed the names it does not own are
+"imported back lazily (inside the methods that need them)" — true for MOST of the names in
+each file, but not the ones that happened to be defined early enough in `interpreter.py`'s
+own body to work when `interpreter` is imported first. Fixed the same way those already-
+lazy names were done: moved into the methods that use them, no lazy-proxy class needed
+(unlike `tex_engine_tiers`, nothing here binds a whole module reference — each mixin only
+ever needs a handful of names, at call time, never at class-definition time). Checked
+`tex_results_residency.py` (SPLIT-R) and `tex_results_keys.py` (NEG-6), the other split-out
+mixin/leaf siblings in the tree, and the STR-7 codegen split's own siblings
+(`codegen_masked.py`, `codegen_stdfns.py`) — none of them import back from their "parent"
+module at module scope at all, so none of them share this defect.
+
 This test parametrizes over EVERY product module — every top-level `TEX_Wrangle/*.py` and
-every `TEX_Wrangle/tex_runtime/*.py` — imported ALONE, first, in its own fresh subprocess.
-The list is discovered from the actual file tree (not hand-enumerated) so it never goes
-stale as modules are added or split. `tex_engine_tiers` is the one row this ask names as
-red at base; every other module is expected to already import cleanly first (this test's
-job is to prove that FOR ALL of them, not just the one already known)."""
+every `TEX_Wrangle/tex_runtime/*.py` — imported ALONE, first, in its own fresh subprocess,
+with NO exclusions. The list is discovered from the actual file tree (not hand-enumerated)
+so it never goes stale as modules are added or split."""
 import glob as _glob
-import os
 import pathlib
 import subprocess
 import sys as _sys
@@ -35,30 +50,12 @@ def _custom_nodes_dir() -> str:
     return str(pathlib.Path(TEX_Wrangle.__file__).resolve().parent.parent)
 
 
-#: SPLIT-I's three interpreter mixin modules (`interpreter_binding.py` /
-#: `interpreter_control_flow.py` / `interpreter_spatial.py`) have the EXACT SAME
-#: import-order defect class R1 fixes for `tex_engine_tiers` — importing any one of them
-#: first, in a fresh process, ImportErrors the same way (confirmed while writing this test).
-#: They are OUT OF SCOPE for FIX-OBSROUTE: the ask's row list names `tex_engine_tiers.py`
-#: specifically, not the SPLIT-I mixins, and they are internal `Interpreter`-composition
-#: pieces no product entry point or documented host seam imports standalone (unlike
-#: `tex_engine_tiers`, which SPLIT-E's re-export chain can genuinely reach first). Filed as
-#: a separate finding rather than fixed here, so this ratchet does not silently widen this
-#: ask's diff into three unrelated files.
-_OUT_OF_SCOPE = frozenset({
-    "TEX_Wrangle.tex_runtime.interpreter_binding",
-    "TEX_Wrangle.tex_runtime.interpreter_control_flow",
-    "TEX_Wrangle.tex_runtime.interpreter_spatial",
-})
-
-
 def _discover_modules() -> list:
     """Every product module dotted name, `TEX_Wrangle.X` and `TEX_Wrangle.tex_runtime.X`,
     for every `*.py` file that is not a test, not `__init__.py`, and not a private/ignored
     helper. Excludes `tex_runtime/__init__.py` itself (that one is exercised by importing
-    the PACKAGE, not a leaf), this suite's own `tests/` tree, and `_OUT_OF_SCOPE` (see
-    above — a real, separately-filed defect, not something this ratchet should mask by
-    simply not looking, so it stays excluded WITH A NAME rather than by omission)."""
+    the PACKAGE, not a leaf) and this suite's own `tests/` tree. NO other exclusions — every
+    product module must import first, alone, in a fresh process."""
     pkg_root = pathlib.Path(__file__).resolve().parent.parent  # .../TEX_Wrangle
     names = []
     for f in sorted(_glob.glob(str(pkg_root / "*.py"))):
@@ -71,7 +68,7 @@ def _discover_modules() -> list:
         if stem in ("__init__",) or stem.startswith("test_"):
             continue
         names.append(f"TEX_Wrangle.tex_runtime.{stem}")
-    return [n for n in names if n not in _OUT_OF_SCOPE]
+    return names
 
 
 def _import_first_in_fresh_process(dotted: str, custom_nodes: str) -> tuple:
