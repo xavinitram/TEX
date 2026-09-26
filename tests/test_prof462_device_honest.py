@@ -349,3 +349,39 @@ def test_fixprof_f2_failed_boundary_drops_stage_split_not_a_neighbour(r: SubTest
     else:
         r.fail("FIX-PROF F2",
                f"whole={whole!r} stages={stages!r} (expected whole > 0 and stages == {{}})")
+
+
+def test_fixprof_f3_warmup_gate_counts_inflight_pending(r: SubTestResult):
+    """FIX-PROF F3: `should_sample`'s warmup check reads `.samples`, which only advances at
+    FOLD time (lazy since PROF-462). If several cooks of a brand-new key arrive faster than
+    their device events resolve -- exactly the interactive-host burst PACE-462/PROF-462 target
+    -- every one of them sees `.samples == 0` and gets sampled, because none of their
+    predecessors' folds have landed yet. A burst that never resolves must still be bounded at
+    `_WARMUP_SAMPLES`, not sample the whole burst."""
+    P.reset()
+    try:
+        with armed_profiler() as Pmod:
+            with _EventPatch():
+                _FakeEvent.DONE = False       # nothing in this burst ever resolves
+                key = Pmod.make_key("fixprof-f3", "cuda", "fp32")
+                burst = Pmod._WARMUP_SAMPLES + 5
+                sampled = []
+                for _ in range(burst):
+                    on = Pmod.should_sample(key, 16 * 16)
+                    sampled.append(on)
+                    if on:
+                        start, end = _FakeEvent(True), _FakeEvent(True)
+                        start.record()
+                        end.record()
+                        Pmod._queue_pending(key, 16 * 16, start, end, None)
+                warmup_hits = sum(sampled)
+    finally:
+        P.reset()
+
+    if warmup_hits == P._WARMUP_SAMPLES:
+        r.ok(f"a {burst}-cook burst with nothing ever resolving sampled exactly "
+             f"{warmup_hits} times (the warmup budget), not the whole burst")
+    else:
+        r.fail("FIX-PROF F3",
+               f"expected exactly {P._WARMUP_SAMPLES} warmup hits over a burst of "
+               f"{burst}, got {warmup_hits}: {sampled}")

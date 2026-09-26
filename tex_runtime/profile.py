@@ -272,7 +272,16 @@ def should_sample(key: tuple, spatial=None) -> bool:
 
     Mutates (it advances the skip counter), which is why it is `should_sample` and not a
     property: it is a rate limiter, and a caller that asks twice for one cook would double-count.
-    Returns False immediately when disarmed, so a caller can use it as the only gate."""
+    Returns False immediately when disarmed, so a caller can use it as the only gate.
+
+    The warmup check counts `.samples` (which only advances at FOLD time — lazy since
+    PROF-462) PLUS the still-in-flight `_pending` entries for this same (key, bucket): without
+    the latter, a burst of same-key cooks arriving faster than their device events resolve
+    would see `.samples == 0` on every one of them and sample the whole burst, since none of
+    their predecessors' folds have landed yet. Counting in-flight samples toward the budget
+    keeps warmup bounded at `_WARMUP_SAMPLES` regardless of how fast the burst outpaces the
+    device — it never inflates the recorded `.samples` count itself, only this gate's view of
+    how many are already "spoken for"."""
     if not _enabled:
         return False                     # the default path never reaches the lock
     with _LOCK:
@@ -283,7 +292,9 @@ def should_sample(key: tuple, spatial=None) -> bool:
         if st is None:
             buckets[bkt] = _Bucket(px=px)
             return True
-        if st.samples < _WARMUP_SAMPLES:
+        in_flight = sum(1 for p in _pending
+                        if p.key == key and bucket_of(p.spatial)[0] == bkt)
+        if st.samples + in_flight < _WARMUP_SAMPLES:
             return True
         st.skips += 1
         if st.skips >= _SAMPLE_EVERY:
