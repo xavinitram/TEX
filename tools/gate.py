@@ -114,7 +114,9 @@ same path twice.
 `TORCHINDUCTOR_CACHE_DIR` (its torch.compile/Inductor kernel sub-cache) is pinned to a PERSISTENT
 per-leg directory instead (`_inductor_cache_dir`, next to the verdict cache above), reused across
 runs: fewer never-before-seen compiled DLLs per run is fewer chances for an OS reputation check
-(Windows Application/Smart App Control) to block one (V045-FIX; `GATE-SAC.md`).
+(Windows Application/Smart App Control) to block one (V045-FIX; `GATE-SAC.md`). It is pruned to a
+size cap (`_prune_inductor_cache_root`, `--tier`-independent, once per invocation, oldest files
+first) rather than left to grow without bound (G5).
 
 `tools/` is excluded from the published archive (`.comfyignore`), so nothing here ships.
 """
@@ -213,6 +215,33 @@ def _touched_module(path: str) -> str | None:
     return top + "." + rest[:-3].replace("/", ".")
 
 
+#: G4/B6#4: a test that builds a CHILD-PROCESS import statement as a string (a subprocess
+#: harness assembling source text -- e.g. `test_v042_hostaudit1_cold_import.py::_measure`,
+#: called with `"from TEX_Wrangle import tex_engine"` as a plain string argument) never puts
+#: a real `ast.Import`/`ast.ImportFrom` node in ITS OWN file, so the walk below missed it
+#: entirely and that file was never selected when `tex_engine` changed. These mirror the same
+#: two shapes `_test_module_refs` already reads from real import nodes, applied instead to the
+#: text of every STRING LITERAL constant in the file (never a second parse of the file itself
+#: -- a string literal's content is not valid Python at that position, so nothing here asks
+#: `ast` to look inside it).
+_STR_FROM_BARE_RE = re.compile(r"from\s+TEX_Wrangle\s+import\s+([\w\s,]+)")
+_STR_FROM_DOTTED_RE = re.compile(r"from\s+TEX_Wrangle\.([\w.]+)\s+import\s+\w+")
+_STR_IMPORT_DOTTED_RE = re.compile(r"import\s+TEX_Wrangle\.([\w.]+)")
+
+
+def _string_module_refs(text: str) -> set:
+    """`_test_module_refs`'s two import shapes, matched against the raw text of ONE string
+    literal instead of a real AST import node (G4)."""
+    refs = set()
+    for m in _STR_FROM_BARE_RE.finditer(text):
+        refs.update(n.strip() for n in m.group(1).split(",") if n.strip())
+    for m in _STR_FROM_DOTTED_RE.finditer(text):
+        refs.add(m.group(1))
+    for m in _STR_IMPORT_DOTTED_RE.finditer(text):
+        refs.add(m.group(1))
+    return refs
+
+
 def _test_module_refs(path: str) -> set:
     """Every `TEX_Wrangle.<dotted>` module a test FILE's own imports could resolve to, as
     dotted paths with the `TEX_Wrangle.` prefix stripped (matching `_touched_module`'s
@@ -221,10 +250,14 @@ def _test_module_refs(path: str) -> set:
     `from TEX_Wrangle.a.b import c` / `import TEX_Wrangle.a.b` (the MODULE is `a.b`; `c` is
     one of its attributes, not resolved any further -- a test importing a name out of a
     module that touched still needs to re-run, so under-resolving here is the safe direction).
-    Returns the empty set on anything that fails to parse, never raises -- a selection helper
-    that could crash the gate on a stray test file is worse than one that just skips it."""
+    Also reads both shapes out of every STRING LITERAL constant in the file (`_string_module_
+    refs`, G4), so a subprocess harness that assembles an import statement as text -- never a
+    real `ast.Import` node in ITS OWN source -- still gets matched. Returns the empty set on
+    anything that fails to parse, never raises -- a selection helper that could crash the gate
+    on a stray test file is worse than one that just skips it."""
     try:
-        tree = ast.parse(open(path, encoding="utf-8").read())
+        source = open(path, encoding="utf-8").read()
+        tree = ast.parse(source)
     except Exception:
         return set()
     refs = set()
@@ -238,6 +271,8 @@ def _test_module_refs(path: str) -> set:
             for alias in node.names:
                 if alias.name.startswith("TEX_Wrangle."):
                     refs.add(alias.name[len("TEX_Wrangle."):])
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            refs |= _string_module_refs(node.value)
     return refs
 
 
@@ -318,15 +353,41 @@ def _git(*args, cwd=_PKG) -> str:
         return ""
 
 
+def enumerate_paths(cwd: str = _PKG) -> list | None:
+    """Every path `git ls-files` would show for `cwd` -- tracked (`--cached`) AND
+    untracked-not-ignored (`--others --exclude-standard`) -- as a sorted, de-duplicated list
+    of repo-relative paths, or `None` when `cwd` is not a git checkout (a nonzero rc, or the
+    subprocess itself could not launch).
+
+    G2: the ONE enumeration `tree_hash()` below and every lint that needs "every path this
+    checkout would ever push, including a file a lane has not committed yet" now share.
+    Before this, LINT-1 (`tests/test_lint1_no_local_only_path_refs.py`, via
+    `tests/test_simp3_no_machine_paths.py::tracked_paths`) walked `--cached` alone, so a
+    brand-new, uncommitted file naming a local-only path passed LINT-1 while `tree_hash()`
+    (and therefore the gate's own verdict-cache key) already saw its bytes -- a lane could
+    stage a leak, have the cheap tier read GREEN, and only have LINT-1 catch it once it was
+    actually committed. One walk, used everywhere a "what would this checkout ever push"
+    question is asked, closes that gap for good."""
+    try:
+        out = subprocess.run(["git", "-C", cwd, "ls-files", "-z", "--cached", "--others",
+                              "--exclude-standard"], capture_output=True, text=True,
+                             timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return sorted(p for p in out.stdout.split("\0") if p)
+
+
 def tree_hash() -> str:
     """sha256 over the bytes of every file git would show you, path included.
 
-    Tracked files AND untracked-not-ignored ones: a lane that adds a test file has not
-    committed it yet, and a cache that could not see it would hand that lane a stale GREEN.
-    Ignored paths (the orchestration material in `.git/info/exclude`) are deliberately
-    invisible, so writing a hand-back does not invalidate a verdict."""
-    out = _git("ls-files", "-z", "--cached", "--others", "--exclude-standard")
-    paths = sorted(p for p in out.split("\0") if p)
+    Tracked files AND untracked-not-ignored ones (`enumerate_paths`, shared with every lint
+    that needs the same set -- G2): a lane that adds a test file has not committed it yet,
+    and a cache that could not see it would hand that lane a stale GREEN. Ignored paths (the
+    orchestration material in `.git/info/exclude`) are deliberately invisible, so writing a
+    hand-back does not invalidate a verdict."""
+    paths = enumerate_paths(_PKG) or []
     h = hashlib.sha256()
     for rel in paths:
         h.update(rel.encode("utf-8"))
@@ -375,14 +436,22 @@ def interpreter_identity(path: str) -> tuple:
 
 
 def cache_key(tree: str, tier: str, interpreters, with_counts: bool) -> str:
-    """The key a verdict is stored under: the tree, the tier, and WHO measured it.
+    """The key a verdict is stored under: the tree, the tier, WHO measured it, and UNDER WHAT
+    CUDA VISIBILITY.
 
     `interpreters` is `[(role, path), …]` — every interpreter this tier will run. A verdict is
     a claim about a tree *as read by a particular set of interpreters*, so all of them belong
     in the key; the basename alone does not distinguish them (see `interpreter_identity`).
-    Hashed, so the cache file's keys stay one line whatever the paths look like — the readable
-    identities travel in the record and are printed with the cached verdict."""
-    parts = [f"tree={tree}", f"tier={tier}", f"counts={int(bool(with_counts))}"]
+    `CUDA_VISIBLE_DEVICES` belongs in it for the same reason (G3/B6#2): a GPU-present run and a
+    `-1` CPU-only run can red or green different rows of the same tree (a CUDA-only test on one
+    side, a host-absent assumption on the other), and `judge()`'s own allowlist evaluation reads
+    this exact variable (`cuda = os.environ.get("CUDA_VISIBLE_DEVICES") != "-1"`) to decide which
+    `when` entries apply — so a verdict taken under one setting is not just stale but a claim
+    about a DIFFERENT allowlist evaluation if served under another. Hashed, so the cache file's
+    keys stay one line whatever the paths look like — the readable identities travel in the
+    record and are printed with the cached verdict."""
+    parts = [f"tree={tree}", f"tier={tier}", f"counts={int(bool(with_counts))}",
+             f"cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}"]
     for role, path in interpreters:
         real, version = interpreter_identity(path)
         parts.append(f"{role}={real}|{version}")
@@ -427,11 +496,58 @@ def _inductor_cache_dir(leg_name: str) -> str:
     kernel gets a new entry rather than serving a stale one. A test that must observe an
     actually-cold Inductor compile gets its OWN fresh directory locally instead of relying on
     this one being empty — see `tests/helpers.py` and its callers."""
-    root = os.environ.get("TEX_GATE_INDUCTOR_CACHE") or \
-        os.path.join(tempfile.gettempdir(), "tex-gate-inductor-cache")
-    d = os.path.join(root, leg_name)
+    d = os.path.join(_inductor_cache_root(), leg_name)
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def _inductor_cache_root() -> str:
+    """The directory `_inductor_cache_dir` makes one per-leg subdirectory of, and the same
+    root `_prune_inductor_cache_root` (G5) sweeps -- factored out so both read the same
+    env-override convention from one place."""
+    return os.environ.get("TEX_GATE_INDUCTOR_CACHE") or \
+        os.path.join(tempfile.gettempdir(), "tex-gate-inductor-cache")
+
+
+#: G5/B6#8: the persistent Inductor cache above was never pruned, so a box that ran the full
+#: tier regularly grew it without bound. 2 GiB comfortably holds several legs' worth of
+#: compiled kernels while still bounding disk use; override with
+#: `TEX_GATE_INDUCTOR_CACHE_CAP_BYTES` for a box with different constraints.
+_INDUCTOR_CACHE_CAP_BYTES = 2 * 1024 ** 3
+
+
+def _prune_inductor_cache_root(root: str, cap_bytes: int) -> None:
+    """Keep `root`'s total file size under `cap_bytes` by deleting the OLDEST files first (by
+    mtime), across every leg's subdirectory (G5/B6#8) -- so a box that never prunes this on
+    its own does not grow it without bound. Never raises: a pruning pass that itself fails
+    (a locked file, a directory that vanishes mid-walk) must not block a gate run over a cache
+    directory it cannot fully read or write -- the cache is a performance aid, never load-
+    bearing for a verdict."""
+    try:
+        entries = []
+        total = 0
+        for dirpath, _dirs, filenames in os.walk(root):
+            for fn in filenames:
+                fp = os.path.join(dirpath, fn)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, st.st_size, fp))
+                total += st.st_size
+        if total <= cap_bytes:
+            return
+        entries.sort(key=lambda e: e[0])          # oldest mtime first
+        for _mtime, size, fp in entries:
+            if total <= cap_bytes:
+                break
+            try:
+                os.remove(fp)
+                total -= size
+            except OSError:
+                continue
+    except Exception:
+        pass
 
 
 def _cache_read(key: str) -> dict | None:
@@ -674,15 +790,29 @@ def _count_timing(run_argv: list, cwd: str, env_extra: dict) -> int | None:
     return sum(1 for ln in proc.stdout.splitlines() if "::" in ln)
 
 
+def _run_canonical_harness_leg(leg: Leg, python: str, targets: list, scratch: str,
+                               verbose: bool, marker: str = "not timing") -> Leg:
+    """Run ONE leg through the canonical harness (`_HARNESS`) against `targets` (repo-
+    relative, already `TEX_Wrangle/`-prefixed paths) from the package's PARENT, selecting
+    with `-m marker`, then fill in `leg.timing_deselected` the same way every caller already
+    did.
+
+    `run_cheap`/`run_canonical`/`run_touched` each built this exact five-line "argv, `_run`,
+    `_count_timing`" dance on their own (R1#1/G6) -- factored here so the shape is written
+    once. Mutates and returns `leg` so a caller can still set its own fields (e.g.
+    `run_touched`'s `proves` line) before calling this."""
+    base = [python, "-X", "utf8", _HARNESS, *targets]
+    argv = [*base, "-q", "-m", marker, "-p", "no:cacheprovider"]
+    _run(leg, argv, _PARENT, {}, scratch, verbose)
+    leg.timing_deselected = _count_timing(base, _PARENT, {})
+    return leg
+
+
 def run_cheap(python: str, scratch: str, verbose: bool) -> Leg:
     leg = Leg("cheap", "the eight ratchets only — no whole-suite collection, "
                        "no host-absent lane, CUDA present")
     files = [f"TEX_Wrangle/{p}" for _, p in _CHEAP]
-    base = [python, "-X", "utf8", _HARNESS, *files]
-    argv = [*base, "-q", "-m", "not timing", "-p", "no:cacheprovider"]
-    _run(leg, argv, _PARENT, {}, scratch, verbose)
-    leg.timing_deselected = _count_timing(base, _PARENT, {})
-    return leg
+    return _run_canonical_harness_leg(leg, python, files, scratch, verbose)
 
 
 def run_touched(python: str, base_ref: str, scratch: str, verbose: bool) -> Leg:
@@ -701,11 +831,7 @@ def run_touched(python: str, base_ref: str, scratch: str, verbose: bool) -> Leg:
                    f"selection fell back to the ALWAYS-only set, which under-selects")
     leg = Leg("touched", proves)
     target = [f"TEX_Wrangle/{p}" for p in files]
-    base = [python, "-X", "utf8", _HARNESS, *target]
-    argv = [*base, "-q", "-m", "not timing", "-p", "no:cacheprovider"]
-    _run(leg, argv, _PARENT, {}, scratch, verbose)
-    leg.timing_deselected = _count_timing(base, _PARENT, {})
-    return leg
+    return _run_canonical_harness_leg(leg, python, target, scratch, verbose)
 
 
 def resolve_ci_python(explicit: str | None) -> tuple:
@@ -726,6 +852,24 @@ def resolve_ci_python(explicit: str | None) -> tuple:
     return sys.executable, "fallback"
 
 
+def _ci_interpreter_can_import_comfy_api(ci_python: str) -> bool:
+    """True when `ci_python` can `import comfy_api` -- the ComfyUI-adapter path the ci-shape
+    leg exists to prove the suite does NOT need (G1/R4#1/B6#3). An interpreter that can import
+    it is not host-free: its `._pth` (the embedded interpreter's own shape) or its `sys.path`
+    puts the embedding host on the path, so a pass under it proves nothing the canonical leg
+    does not already prove, and a red under it can be a v3 `NodeOutput`/adapter-only failure
+    masquerading as a genuine host-absent one -- exactly the false reds the canonical harness
+    exists to remove from the OTHER leg. Any failure to even LAUNCH the probe reads as "cannot
+    import" (False), never as "can" -- the safer direction for a check that blocks a run
+    outright on a positive answer."""
+    try:
+        proc = subprocess.run([ci_python, "-c", "import comfy_api"],
+                              capture_output=True, text=True, timeout=60)
+    except Exception:
+        return False
+    return proc.returncode == 0
+
+
 def run_ci_shape(ci_python: str, scratch: str, verbose: bool, source: str = "--ci-python") -> Leg:
     leg = Leg("ci-shape", "CPU-only, the embedding host off sys.path, the CI interpreter — "
                           "the only leg that catches a host or CUDA assumption; runs on this "
@@ -739,6 +883,19 @@ def run_ci_shape(ci_python: str, scratch: str, verbose: bool, source: str = "--c
         leg.rc, leg.summary = 127, f"interpreter not found: {ci_python}"
         leg.failures = ["<ci-shape interpreter missing>"]
         return leg
+    if _ci_interpreter_can_import_comfy_api(ci_python):
+        # G1: never run this leg on an interpreter that can see the ComfyUI adapter --
+        # REFUSE with a clear message instead of running and reporting a shape it did not
+        # actually prove. Applies regardless of source (--ci-python, $TEX_CI_PYTHON or the
+        # fallback): the claim is about the INTERPRETER, not about how it was named.
+        leg.rc = 1
+        leg.summary = (f"REFUSED: {ci_python} can `import comfy_api`, so it is not "
+                       f"host-free and cannot prove the ci-shape leg's claim (G1) -- pass "
+                       f"--ci-python (or set ${_CI_PYTHON_ENV}) to an interpreter with no "
+                       f"embedding host installed")
+        leg.failures = ["<ci-shape:refused-comfy-api>"]
+        leg.failure_text["<ci-shape:refused-comfy-api>"] = leg.summary
+        return leg
     base = [ci_python, "-m", "pytest", "tests/"]
     argv = [*base, "-q", "-m", "not slow and not timing", "-p", "no:cacheprovider"]
     env_extra = {"CUDA_VISIBLE_DEVICES": "-1"}
@@ -750,11 +907,8 @@ def run_ci_shape(ci_python: str, scratch: str, verbose: bool, source: str = "--c
 def run_canonical(python: str, scratch: str, verbose: bool) -> Leg:
     leg = Leg("canonical", "the embedded interpreter with CUDA and the host present, the v3 "
                            "NodeOutput wrapper disarmed — the only leg that runs the GPU rows")
-    base = [python, "-X", "utf8", _HARNESS, "TEX_Wrangle/tests"]
-    argv = [*base, "-q", "-m", "not slow and not timing", "-p", "no:cacheprovider"]
-    _run(leg, argv, _PARENT, {}, scratch, verbose)
-    leg.timing_deselected = _count_timing(base, _PARENT, {})
-    return leg
+    return _run_canonical_harness_leg(leg, python, ["TEX_Wrangle/tests"], scratch, verbose,
+                                      marker="not slow and not timing")
 
 
 #: The shape the counts harness is a GATE in — the same one `tests/test_bench2_counts.py`
@@ -929,6 +1083,11 @@ def main(argv=None) -> int:
     cuda = os.environ.get("CUDA_VISIBLE_DEVICES") != "-1"
     scratch = a.scratch or tempfile.mkdtemp(prefix="tex-gate-")
     os.makedirs(scratch, exist_ok=True)
+    # G5: prune the persistent Inductor cache BEFORE this run can grow it further -- once per
+    # gate invocation (the root, not per-leg), never inside a hot path.
+    _prune_inductor_cache_root(
+        _inductor_cache_root(),
+        int(os.environ.get("TEX_GATE_INDUCTOR_CACHE_CAP_BYTES", _INDUCTOR_CACHE_CAP_BYTES)))
 
     lines, codes = [], []
     print(f"  interpreters: {who}")

@@ -26,18 +26,16 @@ has already imported torch, so only a fresh interpreter can see what a first tou
 PORTABILITY: CPU-only, no ComfyUI, no CUDA hardware, no compiler, no numpy.
 """
 import pathlib
-import subprocess
-import sys as _sys
 
 from helpers import *
+from helpers import run_python_kv   # G7/R1#4: the shared fresh-subprocess KV helper --
+                                     # not in __all__ (HOOK-4), so imported by name.
 
 
 def _run(code: str) -> dict:
-    proc = subprocess.run([_sys.executable, "-X", "utf8", "-c", code],
-                          capture_output=True, text=True, timeout=60)
-    if proc.returncode != 0:
-        raise RuntimeError(f"subprocess exit {proc.returncode}: {(proc.stderr or '')[-800:]}")
-    return dict(line.split(" ", 1) for line in proc.stdout.strip().splitlines() if " " in line)
+    """This file's own fresh-process-and-parse shape, now the shared `helpers.run_python_kv`
+    (G7) -- kept as a thin, same-signature wrapper so every call site below is unchanged."""
+    return run_python_kv(code, timeout=60)
 
 
 def _custom_nodes_dir() -> str:

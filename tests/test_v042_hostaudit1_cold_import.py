@@ -26,8 +26,9 @@ Both checks run in a SUBPROCESS: this suite has already imported everything, so 
 fresh interpreter can see what a first touch costs.
 """
 import pathlib
-import subprocess
-import sys as _sys
+
+from helpers import run_python_kv   # G7/R1#4: the shared fresh-subprocess KV helper --
+                                     # not in __all__ (HOOK-4), so imported by name.
 
 # Ratchets: TEX_MODS may only move DOWN (a future laziness win moves it), never up
 # (an eager import creeping back in). TORCH_MODS on the bare touch is the PORT-6
@@ -59,6 +60,8 @@ _TEX_ENGINE_TEX_MODULES_MAX = 50
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:
+    """G7/R1#4: the fresh-process launch-and-parse half is now the shared
+    `helpers.run_python_kv` -- only the code TEMPLATE (what to measure) stays here."""
     code = (
         "import sys\n"
         f"sys.path.insert(0, {custom_nodes!r})\n"
@@ -71,11 +74,7 @@ def _measure(import_stmt: str, custom_nodes: str) -> dict:
         "print('TEX', len(tex))\n"
         "print('TORCH', len(torchm))\n"
     )
-    proc = subprocess.run([_sys.executable, "-X", "utf8", "-c", code],
-                          capture_output=True, text=True, timeout=180)
-    if proc.returncode != 0:
-        raise RuntimeError(f"subprocess exit {proc.returncode}: {(proc.stderr or '')[-600:]}")
-    out = dict(line.split(" ", 1) for line in proc.stdout.strip().splitlines())
+    out = run_python_kv(code, timeout=180)
     return {"tex": int(out["TEX"]), "torch": int(out["TORCH"])}
 
 

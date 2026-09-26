@@ -13,7 +13,10 @@ Why every ratchet missed it is the part worth keeping: the leak lived in `tools/
 `.comfyignore` excludes, so the shipped-surface ratchets deliberately never look there. *Does
 not ship* and *is not pushed* are different sets, and they had drifted apart without anybody
 noticing. So this lint scans what `git ls-files` reports — the PUSHED set — and not the shipped
-one.
+one. `tracked_paths()` walks it through `tools/gate.py::enumerate_paths` (G2), the SAME helper
+`tree_hash()`'s verdict-cache key uses — tracked plus untracked-not-ignored, so a file a lane
+has written but not yet committed is scanned too, and this lint's view of "the pushed set" can
+never quietly diverge from the gate's own.
 
 **The allowlist is empty, and that is the whole point.** The tree was clean under these patterns
 when this landed, so any entry ever added here is a decision somebody makes out loud.
@@ -41,9 +44,10 @@ cannot match. This file is inside its own scan set, so every pattern is written 
 shape without containing an instance of it — a lint that had to exempt itself would have a hole
 exactly where the example lives.
 """
+import importlib.util
 import pathlib
 import re
-import subprocess
+import sys
 
 from helpers import SubTestResult
 
@@ -77,16 +81,29 @@ _ALLOWLIST: dict = {}
 _MAX_TRACKED = 20000
 
 
+def _gate():
+    """Load `tools/gate.py` by path once per process -- the ONE shared enumeration helper
+    (G2) this file's own `tracked_paths()` now delegates to, rather than re-walking git
+    itself. Mirrors `test_gateverdict_infra_red.py`/`test_splite_touched_selection.py`'s own
+    loader (`tools/` carries no `__init__.py`, so there is no import name for it)."""
+    mod = sys.modules.get("_simp3_gate")
+    if mod is not None:
+        return mod
+    path = _PKG / "tools" / "gate.py"
+    spec = importlib.util.spec_from_file_location("_simp3_gate", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_simp3_gate"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def tracked_paths():
-    """Every tracked path, or `None` when this tree is not a git checkout."""
-    try:
-        out = subprocess.run(["git", "ls-files", "-z"], cwd=str(_PKG), capture_output=True,
-                             text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    return [p for p in out.stdout.split("\0") if p][:_MAX_TRACKED]
+    """Every path this checkout would ever push -- tracked AND untracked-not-ignored, via
+    `tools/gate.py::enumerate_paths` (G2: the same walk `tree_hash()`'s verdict-cache key
+    uses, so a lint's view of "the pushed set" and the gate's own hash of it can no longer
+    quietly diverge) -- or `None` when this tree is not a git checkout."""
+    paths = _gate().enumerate_paths(str(_PKG))
+    return None if paths is None else paths[:_MAX_TRACKED]
 
 
 def _spell(sep: str, *segments) -> str:

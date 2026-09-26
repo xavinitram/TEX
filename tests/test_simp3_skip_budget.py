@@ -167,7 +167,14 @@ _SKIP_VOCAB = re.compile(
 #: `helpers.devices()`, needs no `r.skip` at all — it is the "loop, not a skip" idiom this
 #: budget's own header names, and runs the same-device case everywhere and the real
 #: cross-device case wherever CUDA happens to be present.
-_SKIP_BUDGET = 116
+#: Re-pinned from 116 to 117 (v046-c-gate, FIX-GATE/G2): `test_v046_fixgate.py::
+#: test_g2_enumerate_paths_sees_an_untracked_not_ignored_file` needs a working git checkout
+#: (to write a probe file and confirm `git status --porcelain` itself reports it untracked
+#: before trusting the enumeration under test) — the exact same dependency, and the same
+#: reasoning, as `test_lint1_no_local_only_path_refs.py`'s row already inside this pin: there
+#: is no meaningful witness for "an untracked-not-ignored file is enumerated" without git to
+#: make a file actually untracked-not-ignored in the first place.
+_SKIP_BUDGET = 117
 
 
 def _literal(node) -> str:

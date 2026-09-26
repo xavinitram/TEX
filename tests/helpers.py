@@ -13,6 +13,7 @@ before the move.
 from __future__ import annotations
 import sys
 import os
+import subprocess
 import traceback
 import math
 import re
@@ -394,6 +395,28 @@ def load_counts_harness():
     sys.modules["_bench2_host_path_counts"] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def run_python_kv(code: str, *, timeout: int = 60, python: str | None = None) -> dict:
+    """Run `<python> -X utf8 -c code` (default: this interpreter) in a FRESH subprocess and
+    parse its stdout as `KEY value` lines into a dict.
+
+    G7/R1#4: the fresh-process measurement shape `test_lint46_check_torch_free.py`'s
+    torch-free checks and `test_v042_hostaudit1_cold_import.py`'s cold-import ratchets each
+    hand-rolled on their own (`_run` / `_measure`) -- launch, raise on a nonzero exit with the
+    tail of stderr, parse `KEY value` lines. One implementation, so a fix to one caller's
+    launch shape (a timeout, an encoding flag) cannot silently miss the other.
+
+    Deliberately NOT in `__all__`: HOOK-4 pins that list to its base-sha set because `from
+    helpers import *` is a surface an embedding host's own suite binds, and both callers here
+    import this by name -- the same posture `load_counts_harness` above already has, and asks
+    nothing of anybody else's star-import."""
+    exe = python or sys.executable
+    proc = subprocess.run([exe, "-X", "utf8", "-c", code], capture_output=True, text=True,
+                          timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"subprocess exit {proc.returncode}: {(proc.stderr or '')[-800:]}")
+    return dict(line.split(" ", 1) for line in proc.stdout.strip().splitlines() if " " in line)
 
 
 # ── Windows Application/Smart App Control kernel-load block (V045-FIX) ──────
