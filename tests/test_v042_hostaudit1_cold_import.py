@@ -54,9 +54,15 @@ from helpers import run_python_kv   # G7/R1#4: the shared fresh-subprocess KV he
 # transitive TEX module, and `tex_chain.py`/`tex_checkpoint.py` import the SAME module object
 # (sys.modules-cached, no second entry). 49 -> 50, +1 for this one new module, nothing else
 # moved.
+#
+# 50 -> 52, SPLIT-47 (TRK-210) part 1: `interpreter.py` was at the 2000-line hard budget. Two
+# new eagerly-imported leaf modules were split out of it (each re-exported by `interpreter.py`
+# at module scope, so `tex_engine`'s cold-import closure reaches them the same way it already
+# reached `interpreter.py`): `interpreter_analysis.py` (static-program-analysis leaf) and
+# `interpreter_values.py` (shared tensor-value helpers). +1 per new module, nothing else moved.
 _BARE_TOUCH_TEX_MODULES_MAX = 1
 _BARE_TOUCH_TORCH_MODULES = 0
-_TEX_ENGINE_TEX_MODULES_MAX = 50
+_TEX_ENGINE_TEX_MODULES_MAX = 52
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:

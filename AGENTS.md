@@ -211,7 +211,7 @@ Currently over the hard budget — status as of v0.37.0 (drift-checked by
 | `tex_runtime/codegen.py` | ~3350 | STR-7 split **shipped** (4092→2731: `codegen_stdfns.py` / `codegen_stencil.py` / `codegen_persist.py` extracted). Docs 27/28 verdict: **stop here** — the remainder is one cohesive emitter; further splitting is aesthetic, not domain-driven. **Language 0.25 (L5) took it to 3312**, and it kept that verdict: the masked-emission leaf went to a new `codegen_masked.py` rather than into the emitter, which is the domain-driven cut the verdict asks for. CG-1's type-map liveness fix took it to ~3350. `tex_runtime/stdlib.py`'s planned split shipped as LIB-1: it is now a 126-line facade over `stdlib_core.py` and seven per-domain `stdlib_*.py` leaves, none near either budget |
 
 `tex_compiler/optimizer.py` (~1540) is over *soft*; STR-5 (the `PASSES` list) **shipped**. `tex_runtime/interpreter.py`
-(~1978, over *soft* only — SPLIT-I re-pinned it out of the hard-budget table above) had STR-3/STR-4's
+(~1593, back under *soft* — SPLIT-47 below took it further down) had STR-3/STR-4's
 `ExecContext` + shared `NodeVisitor` extraction, then SPLIT-I (v0.44 Phase A1) took its planned split:
 the spatial-context setup (coordinate ramps, the LAT-4 cached builtins, ENG-7's time builtins) moved to
 `interpreter_spatial.py`, if/for/while execution to `interpreter_control_flow.py`, and variable/binding
@@ -220,7 +220,15 @@ mixin `Interpreter` still inherits (STR-7's pattern), so every call site keeps c
 unchanged. The residual is the core tree-walk (`_eval`/`_exec_stmt` dispatch, the hot `_eval_binop` path,
 user-function calls) plus CF-6's `_consensus_extent` — the single owner of the cook-grid rule, which the
 codegen tier, `run_roi` and the test oracle all call — kept here because mutation rows anchor its exact
-text (`tests/mutation_check.py`).
+text (`tests/mutation_check.py`). SPLIT-47 (v0.47.0, TRK-210) then took the file — which had since grown
+back to the 2000-line hard budget — by pure moves of plain module-level functions (no class/mixin
+involved this time): the static-program-analysis leaf (`_collect_binding_reads`/
+`_non_spatial_names_cached`/`_collect_identifiers`/`_collect_expr_names`, each with its own memo) moved to
+`interpreter_analysis.py`, and the shared tensor-value helpers (`_ensure_spatial`/`_matvec`/
+`_broadcast_pair`/`_tensor_where`/`_record_ingest_event` and the array-index helpers) moved to
+`interpreter_values.py`. Both are re-exported by `interpreter.py` at its own top level (the ROUTE-45 shape
+SPLIT-E used), so no call site or external `from .interpreter import NAME` changed. `_consensus_extent`
+and `vec_list_to_tensor` stayed in `interpreter.py` for the same mutation-anchor reason as above.
 
 ## The registry archive (PUB-1 — the archive is the product)
 

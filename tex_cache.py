@@ -77,6 +77,12 @@ _CODEGEN_FILES = [_R_DIR / "interpreter.py", _R_DIR / "codegen.py", _R_DIR / "co
                   # exactly as an `interpreter.py` edit does and must invalidate the same .cg.
                   _R_DIR / "interpreter_spatial.py", _R_DIR / "interpreter_control_flow.py",
                   _R_DIR / "interpreter_binding.py",
+                  # SPLIT-47 (TRK-210): `interpreter.py`'s static-program-analysis leaf
+                  # (`interpreter_analysis.py`) and shared tensor-value helpers
+                  # (`interpreter_values.py`) — pure moves out of `interpreter.py`, so an
+                  # edit to either alters interpreter semantics exactly as before and must
+                  # invalidate the same `.cg` (TRK-189 derives and enforces this from disk).
+                  _R_DIR / "interpreter_analysis.py", _R_DIR / "interpreter_values.py",
                   _R_DIR / "stdlib.py", _R_DIR / "stdlib_core.py", _R_DIR / "stdlib_math.py",
                   _R_DIR / "stdlib_color.py", _R_DIR / "stdlib_sample.py", _R_DIR / "stdlib_noise.py",
                   _R_DIR / "stdlib_sdf.py", _R_DIR / "stdlib_string.py", _R_DIR / "stdlib_array.py",

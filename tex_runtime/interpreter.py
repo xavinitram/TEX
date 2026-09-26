@@ -15,11 +15,9 @@ Execution model:
 """
 from __future__ import annotations
 import torch
-import math
 import time
 from collections import OrderedDict
 from typing import Any
-from dataclasses import fields as _dc_fields
 from ..tex_compiler.ast_nodes import (
     ASTNode, Program, VarDecl, Assignment, IfElse, ForLoop, WhileLoop, ExprStatement,
     BreakStmt, ContinueStmt, FunctionDef, ReturnStmt,
@@ -29,18 +27,29 @@ from ..tex_compiler.ast_nodes import (
     BindingIndexAccess, BindingSampleAccess,
     try_extract_static_range,
     collect_assigned_vars,
-    iter_child_nodes,
 )
 from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_vector
 from .host import _report_progress, CookCancelled   # SCHED-3 seam (no cycle: host imports torch only)
 from . import profile as _prof                      # PROF-1 seam (pure stdlib; disarmed by default)
 from . import pacing as _pace                        # PACE-45: bounds queue-ahead when a token opts in
-from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS, VEC_CHANNELS,
-                     _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar,
-                     _host_scalar)
+from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS,
+                     _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar)
 from . import stdlib as _stdlib_mod    # P0-D: publishes the cook grid for const-coord reads
 from .masked_flow import (MaskedFlowMixin, enabled_for as _masked_flow_enabled_for,
                           scatter_keep as _masked_flow_scatter_keep)
+# SPLIT-47 (TRK-210): re-exported so `interpreter.NAME` and `from .interpreter import NAME`
+# keep resolving unchanged for every external caller, and so `Interpreter`'s own bare-name
+# calls below (e.g. `vec_list_to_tensor(...)`, `_ensure_spatial(...)`) still find these
+# names in THIS module's globals — the ROUTE-45 shape SPLIT-E used. Neither sibling module
+# imports `interpreter.py` at its own module scope (see each one's docstring), so this
+# import is not a load-time cycle in either direction.
+from .interpreter_analysis import (_collect_binding_reads_and_non_spatial,
+                                   _collect_binding_reads, _reads_and_non_spatial_cached,
+                                   _binding_reads_cached, _non_spatial_names_cached,
+                                   _collect_identifiers, _collect_expr_names)
+from .interpreter_values import (_safe_array_index, _const_index, _host_index,
+                                 _int_valued_scalar, _ensure_spatial, _matvec,
+                                 _broadcast_pair, _tensor_where, _record_ingest_event)
 
 # Hard limit on for-loop iterations to prevent infinite loops
 MAX_LOOP_ITERATIONS = 1024
@@ -1420,123 +1429,15 @@ _BUILTIN_NAMES = frozenset({"ix", "iy", "u", "v", "iw", "ih", "px", "py", "fi", 
 _CACHEABLE_BUILTIN_NAMES = _BUILTIN_NAMES - _TIME_BUILTIN_NAMES
 
 
-def _collect_binding_reads_and_non_spatial(program: Program) -> tuple[frozenset[str], frozenset[str]]:
-    """`(reads, non_spatial)` — wire-binding (`@A`) names the program mentions anywhere, and
-    the subset of those names bound at a registered NON-SPATIAL argument position
-    (`stdlib_registry.non_spatial_args_by_name`, e.g. `apply_lut3d`'s LUT argument).
-
-    `reads` is over-inclusive on purpose: an assignment TARGET counts as a mention.
-    Narrowing that would buy nothing — the only consumer is `_consensus_extent`, which
-    looks these names up in the INPUT binding dict, and a name that is only ever written
-    is an output, which is not in that dict when the grid is decided.
-
-    `non_spatial` exists because a plain bound tensor RESOURCE (COLOR-1 ruling 5 — no new
-    TEXType for it) can be structurally indistinguishable, by shape alone, from an ordinary
-    `[B,H,W,C]` image binding to `_consensus_extent`'s shape scan: without this exclusion,
-    binding one alongside a differently-shaped image lets its own leading dims leak into the
-    cook's (B,H,W) grid via the `max()` consensus rule, corrupting an UNRELATED output's
-    shape — the exact silent-wrong class `_consensus_extent`'s own docstring already exists
-    to close for ordinary images. Detected structurally (the call shape, via the callee's
-    OWN declared `non_spatial_args`), not by binding name, so any name works and any future
-    function gets the same protection by declaring the field, no engine-side edit.
-
-    ONE walk for both answers (`_collect_binding_reads` and `_non_spatial_names_cached` are
-    the PUBLIC-shaped accessors over it, each preserving its own pre-existing return type —
-    see `_reads_and_non_spatial_cached`, which is the ONE memo, `_READS_MEMO`, both go
-    through). Walked with the generic `iter_child_nodes` rather than a hand-written
-    per-class dispatch like `_collect_identifiers`'. That walk is field-driven, so a new
-    ASTNode field is traversed instead of silently escaping — and the speed the
-    hand-written version buys is not needed here, because `_consensus_extent` only pays
-    for a MISS here when a program is first seen.
-    """
-    from .stdlib_registry import non_spatial_args_by_name
-    non_spatial_positions = non_spatial_args_by_name()   # {fn name: (arg idx, ...)}
-    reads: set[str] = set()
-    non_spatial: set[str] = set()
-    stack: list[ASTNode] = [program]
-    while stack:
-        node = stack.pop()
-        if type(node) is BindingRef:
-            if node.kind == "wire":
-                reads.add(node.name)
-            continue
-        if type(node) is FunctionCall:
-            positions = non_spatial_positions.get(node.name)
-            if positions:
-                for i in positions:
-                    if i < len(node.args):
-                        arg = node.args[i]
-                        if type(arg) is BindingRef and arg.kind == "wire":
-                            non_spatial.add(arg.name)
-        stack.extend(iter_child_nodes(node))
-    return frozenset(reads), frozenset(non_spatial)
-
-
-def _collect_binding_reads(program: Program) -> frozenset[str]:
-    """Wire-binding (`@A`) names the program mentions anywhere — the ORIGINAL, pre-COLOR-1
-    public contract (a bare `frozenset[str]`), restored: `tests/test_v037_frontend_parity.py`
-    calls this directly and subtracts other frozensets from its result, so its return type
-    is load-bearing outside this module, not just an internal convenience. Delegates to
-    `_collect_binding_reads_and_non_spatial` (the one AST walk) and returns only `reads`;
-    `_non_spatial_names_cached` is the other accessor."""
-    reads, _ = _collect_binding_reads_and_non_spatial(program)
-    return reads
-
-
-#: Memo for the walk above, mirroring `tex_memory._tile_safe_memo` (whose comment prices the
-#: same shape of walk at ~22 us per CUDA cook — worth memoizing, and this one is worse: no
-#: early exit, every node visited). The read/non-spatial answers are a pure function of the
-#: AST, so they belong per PROGRAM, not per cook. Without this, the axis-disagreement gate
-#: keeps the walk off most cooks but not all: an IMAGE `[4,H,W,3]` batch beside a single
-#: `[1,H,W]` MASK disagrees on batch every cook, and that is an ordinary ComfyUI graph, not
-#: a corner.
-#:
-#: Keyed by `id()` because `Program` is a slotted dataclass — no `__dict__` to hang an
-#: attribute on and no `__weakref__` to key a WeakKeyDictionary with. The program itself is
-#: held beside the answer and re-checked with `is`, which is what makes `id()` safe: a
-#: recycled id belongs to a different object and misses. Holding it also pins the AST alive,
-#: bounded here to the same order as `tex_cache`'s own program LRU.
-_READS_MEMO: "OrderedDict[int, tuple[Program, frozenset[str], frozenset[str]]]" = OrderedDict()
-_READS_MEMO_MAX = 128
-
 #: `_consensus_extent`'s `source`-provable-empty answer — one shared frozenset instead of a
 #: fresh `frozenset()` allocation on every fast-path hit.
 _EMPTY_NON_SPATIAL: frozenset[str] = frozenset()
 
-
-def _reads_and_non_spatial_cached(program: Program) -> tuple[frozenset[str], frozenset[str]]:
-    """`_collect_binding_reads_and_non_spatial`, memoized per program object — the ONE
-    memo entry `_binding_reads_cached` and `_non_spatial_names_cached` both read, so a
-    program pays for one walk regardless of which (or how many) accessor a caller uses.
-    Internal: callers outside this module use one of those two, each of which preserves
-    its OWN pre-existing return type (a bare `frozenset[str]`, never this tuple)."""
-    key = id(program)
-    hit = _READS_MEMO.get(key)
-    if hit is not None and hit[0] is program:
-        _READS_MEMO.move_to_end(key)
-        return hit[1], hit[2]
-    reads, non_spatial = _collect_binding_reads_and_non_spatial(program)
-    _READS_MEMO[key] = (program, reads, non_spatial)
-    _READS_MEMO.move_to_end(key)
-    while len(_READS_MEMO) > _READS_MEMO_MAX:
-        _READS_MEMO.popitem(last=False)
-    return reads, non_spatial
-
-
-def _binding_reads_cached(program: Program) -> frozenset[str]:
-    """`_collect_binding_reads`, memoized per program object — the ORIGINAL, pre-COLOR-1
-    public contract (a bare `frozenset[str]`), restored: this predates the non-spatial
-    exclusion and callers outside this module may still expect exactly this shape."""
-    return _reads_and_non_spatial_cached(program)[0]
-
-
-def _non_spatial_names_cached(program: Program) -> frozenset[str]:
-    """The COLOR-1 non-spatial-argument exclusion set (e.g. `apply_lut3d`'s LUT-binding
-    name), memoized per program object — its own accessor over the SAME `_READS_MEMO`
-    entry `_binding_reads_cached` populates, so `graphed._spatial_px` and
-    `_consensus_extent` share one walk/one memo with `_collect_binding_reads`'s callers
-    without either side's return type depending on the other's existence."""
-    return _reads_and_non_spatial_cached(program)[1]
+# SPLIT-47 (TRK-210): `_collect_binding_reads_and_non_spatial` / `_collect_binding_reads` /
+# `_READS_MEMO` / `_reads_and_non_spatial_cached` / `_binding_reads_cached` /
+# `_non_spatial_names_cached` moved to `interpreter_analysis.py` (a pure static-AST-analysis
+# leaf) and are re-exported above, so every bare call below still resolves through this
+# module's own globals.
 
 
 def _consensus_extent(bindings: dict, program: Program,
@@ -1668,120 +1569,10 @@ def _consensus_extent(bindings: dict, program: Program,
     return (b, h, w)
 
 
-def _collect_identifiers(program: Program) -> frozenset[str]:
-    """Collect all Identifier names referenced in a program (fast single-pass scan).
-
-    Returns only names that match builtin variable names, for lazy construction.
-    """
-    found: set[str] = set()
-    # Use an explicit stack to avoid recursion overhead
-    stack: list[ASTNode] = list(program.statements)
-    while stack:
-        node = stack.pop()
-        cls = type(node)
-
-        if cls is Identifier:
-            if node.name in _BUILTIN_NAMES:
-                found.add(node.name)
-            continue
-
-        # Statements
-        if cls is VarDecl:
-            if node.initializer:
-                stack.append(node.initializer)
-        elif cls is Assignment:
-            stack.append(node.target)
-            stack.append(node.value)
-        elif cls is IfElse:
-            stack.append(node.condition)
-            stack.extend(node.then_body)
-            stack.extend(node.else_body)
-        elif cls is ForLoop:
-            stack.append(node.init)
-            stack.append(node.condition)
-            stack.append(node.update)
-            stack.extend(node.body)
-        elif cls is WhileLoop:
-            stack.append(node.condition)
-            stack.extend(node.body)
-        elif cls is ExprStatement:
-            stack.append(node.expr)
-        elif cls is ArrayDecl:
-            if node.initializer:
-                stack.append(node.initializer)
-        # Expressions
-        elif cls is BinOp:
-            stack.append(node.left)
-            stack.append(node.right)
-        elif cls is UnaryOp:
-            stack.append(node.operand)
-        elif cls is TernaryOp:
-            stack.append(node.condition)
-            stack.append(node.true_expr)
-            stack.append(node.false_expr)
-        elif cls is FunctionCall:
-            stack.extend(node.args)
-        elif cls is VecConstructor:
-            stack.extend(node.args)
-        elif cls is MatConstructor:
-            stack.extend(node.args)
-        elif cls is CastExpr:
-            stack.append(node.expr)
-        elif cls is ChannelAccess:
-            stack.append(node.object)
-        elif cls is ArrayIndexAccess:
-            stack.append(node.array)
-            stack.append(node.index)
-        elif cls is ArrayLiteral:
-            stack.extend(node.elements)
-        elif cls is BindingIndexAccess:
-            stack.extend(node.args)
-        elif cls is BindingSampleAccess:
-            stack.extend(node.args)
-        elif cls is FunctionDef:
-            stack.extend(node.body)
-        elif cls is ReturnStmt:
-            if node.value:
-                stack.append(node.value)
-        # NumberLiteral, StringLiteral, BindingRef, BreakStmt, ContinueStmt, ParamDecl — skip
-
-    return frozenset(found)
-
-
-# -- Module-level utility functions ------------------------------------
-
-def _safe_array_index(idx: torch.Tensor, size: int) -> torch.Tensor:
-    """Clamp a float index tensor to valid array bounds and convert to int64.
-
-    Equivalent to ``torch.clamp(torch.floor(idx).long(), 0, size - 1)``.
-    """
-    return torch.clamp(torch.floor(idx).long(), 0, size - 1)
-
-
-def _const_index(index_node, size: int) -> int | None:
-    """Resolve a compile-time literal array index to a floor+clamped Python int
-    (identical semantics to _safe_array_index), or None if the index isn't a
-    NumberLiteral. Computed without a 0-dim device tensor or the .item() sync
-    (a CUDA-graph capture blocker; UC-5)."""
-    if index_node.__class__ is NumberLiteral:
-        return max(0, min(int(math.floor(index_node.value)), size - 1))
-    return None
-
-
-def _host_index(index: torch.Tensor, size: int) -> int | None:
-    """Floor+clamp a RUNTIME index using the host reading it carries (TRK-68), or None
-    when it has none — the runtime-scalar counterpart to `_const_index`'s compile-time
-    literal, and the same floor+clamp `_safe_array_index` does on the device
-    (`torch.clamp(torch.floor(idx).long(), 0, size - 1)`), done on the host instead so a
-    `$param` index does not drain the device on every evaluation. A missing tag (a
-    genuinely per-cook computed index) answers None and the caller falls back to
-    `idx.item()` exactly as before."""
-    if index.__class__ is not torch.Tensor or index.dim() != 0:
-        return None
-    v = _host_scalar(index)
-    if v is None:
-        return None
-    return max(0, min(int(math.floor(v)), size - 1))
+# SPLIT-47 (TRK-210): `_collect_identifiers` moved to `interpreter_analysis.py` and is
+# re-exported above; `_safe_array_index` / `_const_index` / `_host_index` moved to
+# `interpreter_values.py` and are re-exported above. `vec_list_to_tensor` stays here — its
+# body is a mutation-check anchor (`tests/mutation_check.py`) pinned to this file.
 
 
 def vec_list_to_tensor(value, dtype, device) -> torch.Tensor:
@@ -1795,206 +1586,8 @@ def vec_list_to_tensor(value, dtype, device) -> torch.Tensor:
     return t
 
 
-def _collect_expr_names(expr, idents: set, bindings: set) -> None:
-    """Single-pass generic AST walk collecting both Identifier names (into
-    *idents*) and BindingRef names (into *bindings*) referenced in an expression.
-    Used by UC-3's uniform-range guard, which needs both to reject a bound that
-    reads a loop-var/env-var OR a binding the loop body reassigns."""
-    cls = expr.__class__
-    if cls is Identifier:
-        idents.add(expr.name)
-        return
-    if cls is BindingRef:
-        bindings.add(expr.name)
-        return
-    for f in _dc_fields(expr):
-        v = getattr(expr, f.name)
-        if isinstance(v, ASTNode):
-            _collect_expr_names(v, idents, bindings)
-        elif isinstance(v, list):
-            for x in v:
-                if isinstance(x, ASTNode):
-                    _collect_expr_names(x, idents, bindings)
-
-
-def _int_valued_scalar(value) -> int | None:
-    """The exact integer of a scalar bound when it is integer-valued; None for a
-    fractional bound, a non-finite value, or a spatial/multi-element tensor.
-
-    UC-3a: uniform-range resolution must only fire on integer-valued bounds —
-    for those, floor/int/truncate all agree and the resolved Python range()
-    matches the general per-iteration path for both int and float loop counters.
-    A fractional bound falls back to the general path (correct fractional loop)."""
-    if isinstance(value, torch.Tensor):
-        if value.dim() != 0:
-            return None
-        # TRK-68: a `$param` loop bound is minted with a host reading; take it from
-        # there instead of draining the device on every loop ENTRY (this runs once
-        # per entry, not per iteration — the general per-iteration path below is
-        # unaffected). A missing tag (a genuinely computed bound) still reads back.
-        hv = _host_scalar(value)
-        value = hv if hv is not None else value.item()
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(f) or f != math.floor(f):
-        return None
-    return int(f)
-
-
-def _ensure_spatial(tensor: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:
-    """Expand a tensor to match a spatial shape [B, H, W] if needed.
-
-    TRK-115: a `[B,H,W,1]` scalar-field binding (a 1-channel image — `C == 1` has no
-    vec1 type, so `infer_binding_type` maps it to FLOAT the same as a `[B,H,W]` mask)
-    passed the `shape[:len(spatial_shape)] == spatial_shape` check vacuously — its
-    first 3 dims DO match — so it was handed back UNCHANGED, at rank 4, straight into a
-    caller that assigns it into a `spatial_shape`-ranked slot (a vec-constructor
-    component, an array element, a channel/index write). PyTorch then aligned the
-    trailing dims of the mismatched ranks, lining `H` up against `W`, and raised.
-    Every caller here wants exactly `spatial_shape`'s OWN rank back — none of them
-    keeps a trailing extra axis — so squeezing it is within this function's existing
-    contract, not a widening of it.
-
-    Fixed HERE, at the point of use, rather than at ingest: an ingest-side squeeze
-    would also change a plain passthrough's (`@OUT = @A;`) OUTPUT shape — that
-    assignment never calls `_ensure_spatial` at all, so a `[B,H,W,1]` binding must
-    keep egressing at rank 4 exactly as it always has (invariant 7). Codegen's
-    generated code calls this SAME function (imported as `_es`), so both tiers pick
-    this fix up identically (invariant 2) with no codegen-side change needed."""
-    if not spatial_shape:
-        return tensor
-    if tensor.dim() == 0:
-        return tensor.expand(spatial_shape)
-    if tensor.dim() == len(spatial_shape) + 1 and tensor.shape[-1] == 1 \
-            and tensor.shape[:len(spatial_shape)] == spatial_shape:
-        return tensor.squeeze(-1)
-    if tensor.shape[:len(spatial_shape)] == spatial_shape:
-        return tensor
-    # Try broadcasting
-    try:
-        return tensor.expand(spatial_shape)
-    except RuntimeError:
-        return tensor
-
-
-def _matvec(m: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Batched matrix @ vector (last-dim contraction), device-tuned (P3).
-
-    For TEX's tiny-matrix / huge-per-pixel-batch shape, `torch.matmul` on a 3x3 (or 4x4)
-    against a [B,H,W] batch is launch/overhead-bound on CUDA -- the elementwise
-    `(m * v.unsqueeze(-2)).sum(-1)` is 3.4-3.9x faster (mat3) there. On CPU matmul is ~7x
-    faster, so keep it. Codegen emits the SAME device-gated expression (`_matvec_expr`),
-    so interp<->codegen stays bit-exact on each device. The CUDA broadcast form differs
-    from the CPU matmul form by <=1 fp32 ULP (2.4e-7) -- the identical cross-device class
-    matmul already has, and 16000x below the 8-bit output quantum."""
-    if m.is_cuda:
-        return (m * v.unsqueeze(-2)).sum(-1)
-    return torch.matmul(m, v.unsqueeze(-1)).squeeze(-1)
-
-
-def _broadcast_pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Broadcast two tensors to be compatible for element-wise operations.
-
-    Handles the key case: scalar [B,H,W] op with vector [B,H,W,C]
-    by expanding the scalar with unsqueeze(-1).
-    Also pads channel dimensions when both are vectors with different channel counts.
-    """
-    ad, bd = a.dim(), b.dim()
-    if ad == bd:
-        # Same rank — pad channel dim when both are vectors (e.g. vec2 [B,H,W,2] + vec3 [B,H,W,3])
-        if ad >= 1 and a.shape[-1] != b.shape[-1]:
-            ac, bc = a.shape[-1], b.shape[-1]
-            if not (ac in VEC_CHANNELS and bc in VEC_CHANNELS):
-                return a, b
-            if ac < bc:
-                a = torch.nn.functional.pad(a, (0, bc - ac))
-            else:
-                b = torch.nn.functional.pad(b, (0, ac - bc))
-        return a, b
-
-    # A bare [N,N] matrix's axes are TRAILING (right-aligned), unlike a scalar
-    # field whose spatial axes are LEADING. Handle every bare-matrix pairing
-    # explicitly, building a common [<spatial>, N, N] — appending trailing
-    # singletons to the matrix (as we do for a scalar) would mis-align it.
-    _MAT = (3, 4)
-
-    def _is_bare_mat(t: torch.Tensor) -> bool:
-        return t.dim() == 2 and t.shape[-1] in _MAT and t.shape[-1] == t.shape[-2]
-
-    if _is_bare_mat(a) or _is_bare_mat(b):
-        mat, other, mat_is_a = (a, b, True) if _is_bare_mat(a) else (b, a, False)
-        n = mat.shape[-1]
-        if (other.dim() >= 4 and other.shape[-1] in _MAT
-                and other.shape[-1] == other.shape[-2]):
-            # bare matrix vs spatial matrix [...,N,N]: leading singletons on the bare one
-            mat_e = mat.view(*((1,) * (other.dim() - 2)), n, n).expand_as(other)
-            return (mat_e, other) if mat_is_a else (other, mat_e)
-        # bare matrix vs scalar field [B,H,W]: matrix -> [1..,N,N], field -> [<sp>,1,1]
-        sp = tuple(other.shape)
-        mat_e = mat.view(*((1,) * len(sp)), n, n).expand(*sp, n, n)
-        field_e = other.reshape(*sp, 1, 1).expand(*sp, n, n)
-        return (mat_e, field_e) if mat_is_a else (field_e, mat_e)
-
-    # Otherwise pad the lower-rank operand with TRAILING singletons and expand:
-    # a scalar field [B,H,W] -> [B,H,W,1] against a vector [B,H,W,C], and a spatial
-    # matrix [B,H,W,N,N] vs a scalar field [B,H,W] both land here correctly.
-    if ad > bd:
-        b = b.view(*b.shape, *((1,) * (ad - bd))).expand_as(a)
-        return a, b
-    else:
-        a = a.view(*a.shape, *((1,) * (bd - ad))).expand_as(b)
-        return a, b
-
-
-def _tensor_where(cond: torch.Tensor, then_val: torch.Tensor, else_val: torch.Tensor) -> torch.Tensor:
-    """torch.where with broadcasting support for mixed scalar/vector cases."""
-    then_val, else_val = _broadcast_pair(then_val, else_val)
-
-    # Expand condition to match value shapes (single view instead of while loop)
-    cd, td = cond.dim(), then_val.dim()
-    if cd < td:
-        cond = cond.view(*cond.shape, *((1,) * (td - cd)))
-        try:
-            cond = cond.expand_as(then_val)
-        except RuntimeError:
-            pass
-
-    return torch.where(cond, then_val, else_val)
-
-
-# RT-b (v0.43): the single ingest-event fence helper. Was duplicated — this exact body in
-# `compiled.py`, and an inline hand-rolled equivalent (detect-during-the-binding-loop,
-# record-after-builtins) right here in `_execute_inner`. Moved here (compiled.py already
-# imports names from this module, so this introduces no new import cycle) and both call
-# shapes now call this one function. Same record-on-H2D detection, same `.synchronize()`
-# fence, same stream — `compiled.py` calls it immediately after its own bindings are made
-# contiguous (unchanged), and `_execute_inner` calls it once the binding loop has already
-# enqueued every H2D copy (also unchanged) — recording an event any time after those
-# copies are enqueued correctly bounds their completion, since a CUDA stream is FIFO; only
-# recording BEFORE they are all enqueued would be wrong, and neither call site does that.
-# `_execute_inner` keeps its own cheap `async_ingest` flag (the detect half of the old
-# inline code) purely to GATE this call, so a cook with nothing pinned skips this helper's
-# scan instead of re-walking every binding a second time; the helper itself is still the
-# only place that does the detecting+recording, so there is one implementation, not two.
-def _record_ingest_event(orig_bindings, dev) -> "torch.cuda.Event | None":
-    """XPU (v0.20): when ingestion issued a non_blocking pinned→CUDA copy, record
-    an event AT THE COPY POINT on the stream. The caller synchronizes it before
-    returning the cook's output — closing the cross-node window where a
-    (convention-violating) downstream in-place write to the shared pinned source
-    could race the in-flight DMA. The wait covers only the copy (recorded before
-    compute kernels queue), so it's ~free once the cook's Python work has run."""
-    if getattr(dev, "type", None) != "cuda":
-        return None
-    try:
-        for v in orig_bindings.values():
-            if (isinstance(v, torch.Tensor) and v.device.type == "cpu"
-                    and v.device != dev and v.is_pinned()):
-                ev = torch.cuda.Event()
-                ev.record(torch.cuda.current_stream(dev))
-                return ev
-    except Exception:
-        return None
-    return None
+# SPLIT-47 (TRK-210): `_collect_expr_names` moved to `interpreter_analysis.py`;
+# `_int_valued_scalar` / `_ensure_spatial` / `_matvec` / `_broadcast_pair` / `_tensor_where` /
+# `_record_ingest_event` moved to `interpreter_values.py`. All are re-exported above, so
+# every bare call within this module (and every external `from .interpreter import NAME`)
+# keeps resolving unchanged.
