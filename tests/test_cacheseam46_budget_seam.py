@@ -25,12 +25,36 @@ This file is the proof, not the mechanism (that lives in `tex_runtime/stdlib_cor
   * `test_cacheseam46_budget_status_query` — the new read-only `cache_budget_status`
     query reports an accurate (limit, usage) pair and never mutates or evicts.
 
+FIX-CACHE/K1: `_CacheBudget` above had no lock, so two threads mutating the SAME cache
+concurrently (COMPILE-A's warm_call thread vs. a cook thread; the aiohttp
+`/tex_wrangle/free_caches` route vs. either) could corrupt the underlying `OrderedDict`'s
+internal state — reproduced as a hard access-violation crash pinned at `evict_oldest`'s
+`cache.popitem` racing `clear`'s `cache.clear()` (B3 cache-seam finding K1). Every
+`_CacheBudget` compound operation (the dict mutation and the running-total update
+together) now runs under one `RLock` per cache.
+
+  * `test_cacheseam46_thread_stress` — several cook threads hammering put/evict/touch/
+    delete on ONE cache concurrently with a clearer thread, mirroring the two real
+    concurrency sources above. Must never crash and must leave the running total exactly
+    equal to a full recount (the same drift check `test_cacheseam46_drift_free` runs
+    single-threaded, now under real contention). Fixed thread counts and a fixed seed,
+    CPU only, a few seconds.
+  * `test_cacheseam46_seam_is_load_bearing` — FIX-CACHE/K2: an AST census of
+    `stdlib_core.py` proving no code OUTSIDE the `_CacheBudget` class body mutates one of
+    the five budget-tracked caches by a subscript store/delete or a `.popitem()`/
+    `.clear()`/`.move_to_end()`/`.pop()`/`.setdefault()`/`.update()` call — the seam is
+    the only path, and this ratchet catches a future bypass instead of relying on the
+    one-time grep the CACHESEAM-46 comment above records.
+
 PORTABILITY: pure torch, CPU only (the caches' own eviction logic is already exercised on
 CUDA by `test_v018_memory.py`/`test_v015_audit_fixes.py`; this file is about the
 bookkeeping, which is device-agnostic). No ComfyUI, no compiler, no numpy.
 """
+import ast
+import inspect
 import os
 import random
+import threading
 
 from helpers import *
 from TEX_Wrangle import tex_memory as MEM
@@ -197,3 +221,201 @@ def test_cacheseam46_budget_status_query(r: SubTestResult):
         else:
             os.environ["TEX_CACHE_BUDGET_MB"] = saved
         MEM.free_tensor_caches()
+
+
+def test_cacheseam46_thread_stress(r: SubTestResult):
+    """FIX-CACHE/K1 regression, adapted from the B3 audit's scratchpad stress scripts
+    (`cacheseam46_thread_stress*.py`). Fixed thread counts and a fixed seed: this is a
+    regression test, not a fuzzer, so a red must reproduce deterministically.
+
+    Several "cook" threads hammer put/evict_oldest/touch/delete on ONE budget-tracked
+    cache (`_grid_buf`/`_grid_buf_budget`) while a "clearer" thread concurrently calls
+    `budget.clear()` -- exactly the aiohttp `/tex_wrangle/free_caches` route racing a
+    queued cook. Before the K1 lock this crashed the whole interpreter with an access
+    violation inside a handful of iterations (reproduced against this same commit before
+    the fix landed); there is no way for a Python-level `try/except` to turn a native
+    access violation into a clean assertion failure, so the bar this test actually
+    enforces is "the process is still alive to check the total" -- if the lock regresses,
+    this test does not fail, it crashes the interpreter, which is a louder signal than
+    any assertion could be.
+    """
+    print("\n--- CACHESEAM-46/K1: concurrent put/evict/touch/delete/clear never drifts "
+          "or crashes ---")
+    MEM.free_tensor_caches()
+    cache, budget = SC._grid_buf, SC._grid_buf_budget
+    N_COOK_THREADS = 6
+    OPS_PER_THREAD = 1500
+    KEY_SPACE = 40
+    CLEAR_INTERVAL = 0.0005
+
+    errors = []
+    errors_lock = threading.Lock()
+    stop_flag = threading.Event()
+
+    def record_error(name, exc):
+        with errors_lock:
+            errors.append((name, type(exc).__name__, str(exc)))
+
+    def cook_worker(idx):
+        rng = random.Random(1000 + idx)  # deterministic per-thread op sequence
+        name = f"cook-{idx}"
+        for _ in range(OPS_PER_THREAD):
+            key = ("scr", rng.randrange(KEY_SPACE))
+            try:
+                op = rng.choice(("put", "put", "put", "get_touch", "evict", "delete"))
+                if op == "put":
+                    budget.put(cache, key, torch.empty(4, 8, 8, 2, dtype=torch.float32))
+                    if len(cache) > 16:
+                        budget.evict_oldest(cache)
+                elif op == "get_touch":
+                    # the exact get-then-touch TOCTOU shape _get_grid_buf-style builders
+                    # use: `cache.get` runs OUTSIDE the lock, so the key can legitimately
+                    # be gone by the time `touch` runs -- K1 made `touch` a no-op then,
+                    # not a KeyError.
+                    if cache.get(key) is not None:
+                        budget.touch(cache, key)
+                elif op == "evict":
+                    budget.evict_oldest(cache)
+                elif op == "delete":
+                    budget.delete(cache, key)  # K1: a no-op if already gone
+            except Exception as e:  # noqa: BLE001 -- any exception here is the failure
+                record_error(name, e)
+
+    def host_clearer():
+        while not stop_flag.is_set():
+            try:
+                budget.clear(cache)
+            except Exception as e:  # noqa: BLE001
+                record_error("host-clearer", e)
+            time.sleep(CLEAR_INTERVAL)
+
+    try:
+        threads = [threading.Thread(target=cook_worker, args=(i,), name=f"cook-{i}")
+                   for i in range(N_COOK_THREADS)]
+        clearer = threading.Thread(target=host_clearer, name="host-clearer", daemon=True)
+        clearer.start()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        stop_flag.set()
+        clearer.join(timeout=2)
+
+        if any(t.is_alive() for t in threads):
+            r.fail("CACHESEAM-46/K1 thread stress", "a cook thread did not finish (deadlock?)")
+            return
+        if errors:
+            by_type = {}
+            for _name, etype, _msg in errors:
+                by_type[etype] = by_type.get(etype, 0) + 1
+            r.fail("CACHESEAM-46/K1 thread stress",
+                   f"{len(errors)} exception(s) raised inside the seam: {by_type}; "
+                   f"first: {errors[0]}")
+            return
+
+        got = budget.total(None)
+        want = 0
+        for entry in cache.values():
+            for t in budget.extract(entry):
+                if isinstance(t, torch.Tensor):
+                    want += t.untyped_storage().nbytes()
+        cache_keys = set(cache.keys())
+        tracked_keys = set(budget._per_key.keys())
+        if got != want:
+            r.fail("CACHESEAM-46/K1 thread stress",
+                   f"post-run drift: running total={got} != full recount={want}")
+        elif cache_keys != tracked_keys:
+            r.fail("CACHESEAM-46/K1 thread stress",
+                   f"bookkeeping/dict key-set mismatch: "
+                   f"{len(cache_keys - tracked_keys)} untracked, "
+                   f"{len(tracked_keys - cache_keys)} tracked-but-absent")
+        else:
+            r.ok(f"{N_COOK_THREADS} cook threads x {OPS_PER_THREAD} ops, concurrent with a "
+                 f"clearer thread: no crash, no exception, total()={got} matches a full "
+                 f"recount, {len(cache_keys)} key(s) tracked exactly")
+    finally:
+        stop_flag.set()
+        MEM.free_tensor_caches()
+
+
+def test_cacheseam46_seam_is_load_bearing(r: SubTestResult):
+    """FIX-CACHE/K2: the seam is load-bearing -- automate the CACHESEAM-46 comment's own
+    claim ("grep finds no other `[key] =`, `.popitem(`, `.clear()` or `.move_to_end(`
+    against these five names in this file") as a ratchet instead of a one-time manual
+    grep, so a future direct dict mutation of a budget-tracked cache is CAUGHT here
+    rather than merely absent today.
+
+    An AST census of `stdlib_core.py`: every reference to one of the five budget-tracked
+    cache names that is a subscript store/delete (`cache[key] = ...` / `del cache[key]`)
+    or a mutating-method call (`.popitem(`/`.clear(`/`.move_to_end(`/`.pop(`/
+    `.setdefault(`/`.update(`) must fall inside the `_CacheBudget` class body's own line
+    span -- that is the one place `BUDGET_TRACKED_CACHES`' five instances live and the
+    only intended mutation path (K1's lock lives there too, so a bypass would also be an
+    unlocked mutation).
+
+    K2 was optional if K1's lock design already made a bypass safe; this row is the cheap
+    half of it -- catching a bypass in review is strictly better than merely surviving one
+    at runtime, and it costs one AST walk of one file. The caches themselves stay plain
+    `OrderedDict`s (DOC-7d's census in `test_v018_docs.py` keys off that declaration
+    shape), so this is a second, narrower census beside DOC-7d's, not a replacement --
+    DOC-7d asks "is every module-level store documented", this asks "does anything
+    outside the seam touch these five specifically"."""
+    print("\n--- CACHESEAM-46/K2: no direct mutation of a budget-tracked cache outside "
+          "_CacheBudget ---")
+    try:
+        source_path = inspect.getsourcefile(SC)
+        with open(source_path, encoding="utf-8") as fh:
+            source = fh.read()
+        tree = ast.parse(source, filename=source_path)
+
+        # The five names, read from the module itself (never hand-duplicated) by matching
+        # each cache object in BUDGET_TRACKED_CACHES back to its module-level attribute name.
+        by_id = {id(cache): attr for attr, cache in vars(SC).items()
+                 if any(cache is c for c, _b in SC.BUDGET_TRACKED_CACHES)}
+        cache_names = {by_id[id(c)] for c, _b in SC.BUDGET_TRACKED_CACHES if id(c) in by_id}
+        if len(cache_names) != len(SC.BUDGET_TRACKED_CACHES):
+            r.fail("CACHESEAM-46/K2 seam census",
+                   f"could not resolve all {len(SC.BUDGET_TRACKED_CACHES)} cache names by "
+                   f"identity (got {sorted(cache_names)}) -- fix the derivation")
+            return
+
+        span = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "_CacheBudget":
+                span = (node.lineno, node.end_lineno)
+                break
+        if span is None:
+            r.fail("CACHESEAM-46/K2 seam census", "_CacheBudget class not found by AST walk")
+            return
+        lo, hi = span
+
+        parent = {}
+        for n in ast.walk(tree):
+            for c in ast.iter_child_nodes(n):
+                parent[c] = n
+
+        mutating_methods = {"popitem", "clear", "move_to_end", "pop", "setdefault", "update"}
+        bypasses = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Name) and node.id in cache_names):
+                continue
+            if lo <= node.lineno <= hi:
+                continue  # inside the seam class itself
+            p = parent.get(node)
+            if isinstance(p, ast.Subscript) and p.value is node and isinstance(p.ctx, (ast.Store, ast.Del)):
+                bypasses.append(f"{source_path}:{node.lineno}: {node.id}[...] store/delete")
+                continue
+            if isinstance(p, ast.Attribute) and p.value is node and p.attr in mutating_methods:
+                gp = parent.get(p)
+                if isinstance(gp, ast.Call) and gp.func is p:
+                    bypasses.append(f"{source_path}:{node.lineno}: {node.id}.{p.attr}(...)")
+
+        if bypasses:
+            r.fail("CACHESEAM-46/K2 seam bypass",
+                   f"{len(bypasses)} direct mutation(s) of a budget-tracked cache outside "
+                   f"_CacheBudget: " + "; ".join(bypasses))
+        else:
+            r.ok(f"no direct mutation of any of {sorted(cache_names)} outside the "
+                 f"_CacheBudget class body (lines {lo}-{hi})")
+    except Exception as e:
+        r.fail("CACHESEAM-46/K2 seam census", f"{type(e).__name__}: {e}")

@@ -429,13 +429,28 @@ class _CacheBudget:
     `extract(entry) -> [tensor, ...]` is the same per-cache shape `tex_memory._budget_caches`
     used to hand-carry as a lambda; it lives here now, beside the cache it describes, so
     `BUDGET_TRACKED_CACHES` below is the one place that pairs a cache with its extractor.
+
+    FIX-CACHE/K1: `lock` is a `threading.RLock` (reentrant so a method below may call
+    another of its own methods, e.g. `put` calling `_uncount`, without deadlocking) that
+    serialises EVERY compound operation on this object's (cache, bookkeeping) pair --
+    the dict mutation and the running-total update together, never one without the
+    other. Without it, two threads racing `evict_oldest`/`clear`/`put` on the SAME
+    `OrderedDict` (COMPILE-A's warm_call thread vs. a cook thread, or the aiohttp
+    `/tex_wrangle/free_caches` route vs. either) corrupts the dict's internal state --
+    reproduced as a hard access-violation crash pinned at `evict_oldest`'s
+    `cache.popitem` racing `clear`'s `cache.clear()` (B3 cache-seam finding K1;
+    `tests/test_cacheseam46_thread_stress.py`). One lock per cache (not a single global
+    lock across all five) keeps an unrelated cache's traffic from ever blocking this
+    one's -- `BUDGET_TRACKED_CACHES` already pairs each cache with exactly one
+    `_CacheBudget`, so no other object ever mutates this dict.
     """
-    __slots__ = ("extract", "_per_key", "_by_dev")
+    __slots__ = ("extract", "_per_key", "_by_dev", "lock")
 
     def __init__(self, extract):
         self.extract = extract
         self._per_key: dict = {}   # key -> (nbytes, dev_type) for THAT entry
         self._by_dev: dict = {}    # dev_type (incl. None, for a tensor-less entry) -> bytes
+        self.lock = _threading.RLock()
 
     def _measure(self, entry) -> tuple:
         total, dev = 0, None
@@ -460,44 +475,69 @@ class _CacheBudget:
         if nbytes:
             self._by_dev[dev] = self._by_dev.get(dev, 0) + nbytes
 
-    # ── the seam: every mutation of the paired cache goes through one of these ──────
+    # ── the seam: every mutation of the paired cache goes through one of these,
+    # each holding `self.lock` for its entire body (dict mutation + bookkeeping as
+    # ONE atomic step) ───────────────────────────────────────────────────────────
     def put(self, cache, key, value) -> None:
         """`cache[key] = value`, keeping the running total in step (a replace of an
         existing key is un-counted first, exactly like the fresh insert it becomes)."""
-        if key in cache:
-            self._uncount(key)
-        cache[key] = value
-        self._count(key, value)
+        with self.lock:
+            if key in cache:
+                self._uncount(key)
+            cache[key] = value
+            self._count(key, value)
 
     def evict_oldest(self, cache) -> bool:
         """`cache.popitem(last=False)`. Returns False if `cache` was already empty."""
-        if not cache:
-            return False
-        key, _ = cache.popitem(last=False)
-        self._uncount(key)
-        return True
+        with self.lock:
+            if not cache:
+                return False
+            key, _ = cache.popitem(last=False)
+            self._uncount(key)
+            return True
 
     def delete(self, cache, key) -> None:
-        """`del cache[key]` -- the victim-eviction seam `enforce_cache_budget` drives."""
-        del cache[key]
-        self._uncount(key)
+        """`del cache[key]` -- the victim-eviction seam `enforce_cache_budget` drives.
+        FIX-CACHE/K1: a no-op if `key` is already gone (evicted/cleared/deleted by a
+        racing caller between the caller's own lookup and this call) -- a lost race
+        here must never raise into a cook."""
+        with self.lock:
+            if key not in cache:
+                return
+            del cache[key]
+            self._uncount(key)
 
     def clear(self, cache) -> None:
         """`cache.clear()`."""
-        cache.clear()
-        self._per_key.clear()
-        self._by_dev.clear()
+        with self.lock:
+            cache.clear()
+            self._per_key.clear()
+            self._by_dev.clear()
 
     def touch(self, cache, key) -> None:
-        """`cache.move_to_end(key)` -- LRU reorder only; the byte total is unaffected."""
-        cache.move_to_end(key)
+        """`cache.move_to_end(key)` -- LRU reorder only; the byte total is unaffected.
+        FIX-CACHE/K1: a no-op if `key` is already gone -- the caller's own `cache.get(key)`
+        (the builder functions' get-then-touch shape) runs OUTSIDE this lock, so the key
+        can legitimately vanish (evicted/cleared/deleted by another thread) in the window
+        between that get and this touch; the caller already has its own reference to the
+        value and only loses the LRU-freshness bump, never a KeyError."""
+        with self.lock:
+            try:
+                cache.move_to_end(key)
+            except KeyError:
+                pass
 
     # ── CACHESEAM-46 item 3: the read-only budget-status query surface ──────────────
     def total(self, dev_type=None) -> int:
-        """O(1): the running byte total, optionally scoped to one tensor device type."""
-        if dev_type is None:
-            return sum(self._by_dev.values())
-        return self._by_dev.get(dev_type, 0)
+        """O(1): the running byte total, optionally scoped to one tensor device type.
+        FIX-CACHE/K1: locked too -- `sum(self._by_dev.values())` iterates the dict, and a
+        concurrent put's first entry for a new dev_type inserts a key into `_by_dev`,
+        which without the lock is the same "mutated during iteration" hazard as the
+        cache dicts themselves."""
+        with self.lock:
+            if dev_type is None:
+                return sum(self._by_dev.values())
+            return self._by_dev.get(dev_type, 0)
 
     # ── the documented test-fixture seam (item 1) ────────────────────────────────────
     def reset_for_test(self, cache) -> None:
@@ -505,10 +545,11 @@ class _CacheBudget:
         that has to poke `cache` directly (a handful legitimately do, for setup shaped
         differently than any production call) calls this once afterward, before anything
         under test reads `total()` -- never trust a running total across a raw poke."""
-        self._per_key.clear()
-        self._by_dev.clear()
-        for key, entry in cache.items():
-            self._count(key, entry)
+        with self.lock:
+            self._per_key.clear()
+            self._by_dev.clear()
+            for key, entry in cache.items():
+                self._count(key, entry)
 
 
 _mip_cache_budget = _CacheBudget(lambda e: [e[1], *e[2]])         # (shape, img, pyramid)
