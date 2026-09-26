@@ -166,13 +166,11 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
     param default-inject + widget-value conversion so a SUB-chain (a CACHE-6 prefix or suffix)
     cooks BIT-IDENTICALLY to those same stages inside the full fused program — the equivalence
     the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does."""
-    # OBSERVER-46: notify once for THIS entry point; a call nested under `cook_fused_cached`
-    # or `cook_checkpointed` (both call this internally, up to three times per cook) shares
-    # their outer notification instead of adding one — see tex_runtime/cook_observer.py.
-    _obs_active = bool(_cook_observer._callbacks)
-    if _obs_active:
-        _cook_observer.enter("cook_stage_list")
-    try:
+    # OBSERVER-46/O3: notify once for THIS entry point; a call nested under
+    # `cook_fused_cached` or `cook_checkpointed` (both call this internally, up to three
+    # times per cook) shares their outer notification instead of adding one — see
+    # tex_runtime/cook_observer.py.
+    with _cook_observer.scope("cook_stage_list"):
         # P0-H: the stage-list family is a public engine entry point that never learned about
         # promises — a Promise in a stage's bindings produced a raw TypeError out of the
         # marshalling seam whether or not it had landed. Resolving here (and refusing an unlanded
@@ -223,9 +221,6 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
                               precision=("fp32" if latent_channel_count else precision),
                               time_context=time_context,
                               cancel=cancel, on_progress=on_progress)
-    finally:
-        if _obs_active:
-            _cook_observer.leave()
 
 
 def _is_tensor_binding(v) -> bool:
@@ -295,14 +290,12 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
     Defaulting HERE rather than at each call site is what closes it for `cook_fused_cached` and
     the CACHE-7 multi-tap path at once — the hole was in this function's contract, not in a
     caller's diligence. An explicit `canvas=` still wins, for a caller that knows better."""
-    # OBSERVER-46: notify once for THIS entry point; a call nested under `cook_fused_cached`
-    # or `cook_checkpointed` (both call this internally, once per cut) shares their outer
-    # notification instead of adding one — see tex_runtime/cook_observer.py. `leave()` is
-    # unconditional in `finally` so the un-keyable-Promise ValueError below still balances it.
-    _obs_active = bool(_cook_observer._callbacks)
-    if _obs_active:
-        _cook_observer.enter("boundary_lineage_key")
-    try:
+    # OBSERVER-46/O3: notify once for THIS entry point; a call nested under
+    # `cook_fused_cached` or `cook_checkpointed` (both call this internally, once per cut)
+    # shares their outer notification instead of adding one — see
+    # tex_runtime/cook_observer.py. `scope()`'s `__exit__` runs unconditionally, so the
+    # un-keyable-Promise ValueError below still balances it.
+    with _cook_observer.scope("boundary_lineage_key"):
         from . import tex_results
         from .tex_fusion import prefix_fingerprint
         fp = prefix_fingerprint(stages, k, _infer_binding_type)
@@ -387,9 +380,6 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
         return tex_results.lineage_key(program_fp=fp, device=str(device), precision=precision,
                                        params=params, upstream=tuple(upstream), time_context=time_context,
                                        canvas=canvas, flags=flags)
-    finally:
-        if _obs_active:
-            _cook_observer.leave()
 
 
 def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32",
@@ -406,17 +396,25 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     the exact handoff), a LATENT, a DAG chain, a cut-point out of range, no cache, or NO `upstream`
     source key (without a content-sensitive source identity a cached boundary could be served for a
     different image — the safe default is a correct-but-not-incremental full cook)."""
-    # OBSERVER-46: notify once for THIS entry point; every internal call below — `_full()`'s
-    # and the hit/miss paths' `cook_stage_list`, and `boundary_lineage_key` — shares this one
-    # notification rather than adding its own (see tex_runtime/cook_observer.py).
-    _obs_active = bool(_cook_observer._callbacks)
-    if _obs_active:
-        _cook_observer.enter("cook_fused_cached")
-    try:
+    # OBSERVER-46/O3: notify once for THIS entry point; every internal call below —
+    # `_full()`'s and the hit/miss paths' `cook_stage_list`, and `boundary_lineage_key` —
+    # shares this one notification rather than adding its own (see
+    # tex_runtime/cook_observer.py).
+    #
+    # R2 (v0.46, FIX-OBSROUTE): `_full()`, and the hit/miss branches below, call
+    # `cook_stage_list`/`boundary_lineage_key` through `_tex_engine`'s attribute (ROUTE-45's
+    # own routing convention — see tex_engine_tiers.py's module docstring for the general
+    # form), not this module's own local name. Before this fix they called the LOCAL name,
+    # so a host wrap on `tex_engine.cook_stage_list` (several already exist — see
+    # tex_engine_tiers.py's docstring) never saw these 3 of the 6 calls this function makes
+    # to them; the observer seam already covered it independently (that's what this `with`
+    # is), but a host's own direct wrap is a documented, older seam this restores.
+    with _cook_observer.scope("cook_fused_cached"):
+        from . import tex_engine as _tex_engine
         from .tex_fusion import is_linear_stage_list, suffix_stage_list, FusionError
 
         def _full():
-            return cook_stage_list(stages, device=device, precision=precision,
+            return _tex_engine.cook_stage_list(stages, device=device, precision=precision,
                                    latent_channel_count=latent_channel_count,
                                    time_context=time_context, cancel=cancel, on_progress=on_progress)
 
@@ -452,11 +450,11 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
         from .tex_fusion import remap_suffix_taps, unservable_prefix_taps
         if unservable_prefix_taps(stages, k):
             return _full()
-        key = boundary_lineage_key(stages, k, device, "fp32", time_context=time_context,
+        key = _tex_engine.boundary_lineage_key(stages, k, device, "fp32", time_context=time_context,
                                    latent_channel_count=latent_channel_count, upstream=upstream)
         boundary = result_cache.get(key)
         if boundary is None:
-            b = cook_stage_list(stages[:k], device=device, precision="fp32",
+            b = _tex_engine.cook_stage_list(stages[:k], device=device, precision="fp32",
                                 time_context=time_context, cancel=cancel).get("OUT")
             if b is None:            # a chain always assigns @OUT; if not, cook whole (correct)
                 return _full()
@@ -471,11 +469,8 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
         # original was `k+j`. Remap at the serve seam — on BOTH the miss and the hit path, which is
         # this single return.
         out = remap_suffix_taps(
-            cook_stage_list(suffix, device=device, precision="fp32", time_context=time_context,
+            _tex_engine.cook_stage_list(suffix, device=device, precision="fp32", time_context=time_context,
                             cancel=cancel, on_progress=on_progress), k)
         if stages[k - 1].get("tap"):
             out.setdefault(f"_tap_s{k - 1}", boundary)   # the boundary IS that stage's output
         return out
-    finally:
-        if _obs_active:
-            _cook_observer.leave()
