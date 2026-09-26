@@ -233,6 +233,7 @@ import hashlib     # noqa: E402  — co-located with the integrity code it serve
 import hmac        # noqa: E402
 import pickle      # noqa: E402
 import threading   # noqa: E402
+import time        # noqa: E402  — R3's age-gated orphan-temp sweep, below
 
 #: Trailer = MAGIC + tag. `_MAC_FAMILY` is the version-independent prefix: a trailer that starts
 #: with it but is not exactly `_MAC_MAGIC` was written by a NEWER TEX and is declined without
@@ -243,6 +244,15 @@ _MAC_MAGIC = b"TEXm1"
 _MAC_TAG_LEN = 32                       # SHA-256
 _MAC_TRAILER_LEN = len(_MAC_MAGIC) + _MAC_TAG_LEN
 _MAC_KEY_FILE = "cache_mac.key"
+#: `_publish_new_key`'s temp prefix, promoted to a constant (R3) so the mint site and the sweep
+#: below share one spelling instead of drifting.
+_MACGEN_PREFIX = ".macgen-"
+#: How long a `.macgen-*.tmp` may sit before the sweep below treats it as crash-orphaned rather
+#: than a peer's in-flight mint. The mint it guards is microseconds end to end (32 bytes, one
+#: write, one atomic publish) — this only needs to be safely longer than that, and matches the
+#: grace window `tex_cache._evict_orphan_cg` already uses for the same "same shape, different
+#: directory" reclaim (B3#1).
+_MACGEN_ORPHAN_GRACE_SEC = 600
 _MAC_KEY_LEN = 32
 
 #: `load_verified`'s three non-object verdicts. UNVERIFIED = the file OPENED and READ, but its
@@ -328,6 +338,39 @@ def _mac_key() -> bytes:
         return key
 
 
+def _sweep_stale_macgen_temps(home: str) -> int:
+    """Reclaim `.macgen-*.tmp` orphans in the key home (R3, B3#1) — the temp `_publish_new_key`
+    mints before its atomic publish, left behind if the process dies (crash, SIGKILL, power
+    loss) after the write but before the rename/link. `sweep_temps` (this module's OTHER
+    reclaim, above) never reaches this: it matches a different prefix (`TMP_PREFIX`) and is
+    only ever called against the CACHE-2 spill directory, never `_mac_key_home()` — so nothing
+    anywhere touched this one, and it leaked a ~32-byte file per crash, unbounded over the life
+    of the box, outside any cache dir a `clear(disk=True)` would reach.
+
+    Age-gated exactly like `tex_cache._evict_orphan_cg`'s grace window, for the same reason: a
+    mint here is microseconds end to end (one `bounded_mkstemp`, one 32-byte write, one atomic
+    publish), so a temp still present after `_MACGEN_ORPHAN_GRACE_SEC` is not a peer's in-flight
+    mint — it is orphaned, and removing it is safe. Best-effort: a concurrent removal or a mint
+    landing mid-sweep is one `OSError` that skips that entry, never aborts the sweep. Returns how
+    many were removed."""
+    n = 0
+    try:
+        now = time.time()
+        with os.scandir(home) as it:
+            for entry in it:
+                if not (entry.name.startswith(_MACGEN_PREFIX) and entry.name.endswith(".tmp")):
+                    continue
+                try:
+                    if now - entry.stat().st_mtime > _MACGEN_ORPHAN_GRACE_SEC:
+                        os.remove(entry.path)
+                        n += 1
+                except OSError:
+                    pass          # vanished / still being written by a peer — skip, don't abort
+    except OSError:
+        pass
+    return n
+
+
 def _resolve_or_create_key() -> bytes | None:
     """A persistent per-user key, or None to signal the ephemeral fallback. Converges under a
     race: read a well-formed key; else be the single atomic creator (or read the winner if a peer
@@ -348,6 +391,7 @@ def _resolve_or_create_key() -> bytes | None:
                 pass
     except OSError:
         return None
+    _sweep_stale_macgen_temps(home)          # R3: reclaim crash-orphaned mint temps, on the way in
     for _ in range(16):
         kind, info = _probe_key(path)
         if kind == "ok":
@@ -384,7 +428,7 @@ def _publish_new_key(home: str, path: str) -> bytes | None:
     new_key = os.urandom(_MAC_KEY_LEN)
     fd = tmp = None
     try:
-        fd, tmp = bounded_mkstemp(dir=home, prefix=".macgen-", suffix=".tmp")
+        fd, tmp = bounded_mkstemp(dir=home, prefix=_MACGEN_PREFIX, suffix=".tmp")
         with os.fdopen(fd, "wb") as f:
             fd = None
             f.write(new_key)
