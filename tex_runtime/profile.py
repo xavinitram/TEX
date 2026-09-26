@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 
 # ── policy constants (explicit numbers a test can feed, per autotier's discipline) ──
@@ -55,6 +55,7 @@ _ALPHA = 0.35             # EWMA weight on the newest sample
 _WARMUP_SAMPLES = 3       # measure every cook of an unseen key until it has this many
 _SAMPLE_EVERY = 16        # then measure one cook in N
 _STATE_MAX = 512          # bound the table (LRU), same order as autotier's
+_PENDING_MAX = 64         # PROF-462: bounded lazy-fold queue (below)
 
 _enabled = False
 
@@ -111,7 +112,12 @@ _STATE: "OrderedDict[tuple, dict]" = OrderedDict()
 #: touches, and putting a lock acquisition there would tax every ComfyUI cook to protect a
 #: table that cook never writes (invariant #7). The critical sections below are all a few dict
 #: operations, so an uncontended acquire is the whole cost.
-_LOCK = threading.Lock()
+#: PROF-462: an `RLock`, not a plain `Lock` — `_drain_pending_locked` calls the public
+#: `record`/`record_stages` (deliberately, so a host or benchmark counting calls to those two
+#: names — `docs/host-path-counts.md`'s BENCH-2 harness does exactly this — still sees a fold
+#: happen, however lazily) from inside a block that already holds this lock; a non-reentrant
+#: lock would deadlock the very first sampled cook.
+_LOCK = threading.RLock()
 
 
 # ── arming ───────────────────────────────────────────────────────────────────
@@ -144,8 +150,40 @@ _tls = threading.local()
 
 def stage_sink() -> dict | None:
     """The dict the interpreter accumulates per-stage ms into for THIS cook on THIS thread,
-    or None. Only ever read behind `enabled()`."""
+    or None. Only ever read behind `enabled()`.
+
+    CUDA sampled cooks do NOT feed ms into this dict (see `stage_event_sink` below) — it
+    stays the CPU path's own synchronous accumulator, and `measure.__exit__` only calls
+    `record_stages` from it when no event-mode start event exists (CPU, or CUDA event
+    creation failed and `measure` fell back to the old synchronize+perf_counter form)."""
     return getattr(_tls, "stages", None)
+
+
+def record_stage_boundary(events: list, stage, device) -> None:
+    """Append one `(stage, event)` boundary to `events` (from `stage_event_sink()`), recording
+    a fresh timing-enabled CUDA event under `with torch.cuda.device(device):` (the O4
+    discipline `measure._new_event` also follows, matching `pacing.cook_done_event`) and never
+    blocking. Lives here, not inline in the interpreter, so `Interpreter._exec_stmts_profiled`
+    stays a few lines shorter — the only caller. Losing one boundary's attribution (a
+    construction/`record()` failure) never loses the cook: swallowed, like every other
+    profiler failure mode in this module."""
+    try:
+        import torch
+        with torch.cuda.device(device):
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+        events.append((stage, ev))
+    except Exception:
+        pass
+
+
+def stage_event_sink() -> list | None:
+    """The list `Interpreter._exec_stmts_profiled` appends `(stage, event)` pairs into for a
+    CUDA-sampled cook with per-stage tracking, or None off that path (CPU, or the profiler is
+    not currently inside a `measure` block that got a start event). Populated by
+    `measure.__enter__` alongside `stage_sink`'s dict, on the same thread-local discipline
+    (ENG-9: one interpreter per cook thread). PROF-462."""
+    return getattr(_tls, "stage_events", None)
 
 
 # ── keys ─────────────────────────────────────────────────────────────────────
@@ -201,6 +239,7 @@ def should_sample(key: tuple, spatial=None) -> bool:
     if not _enabled:
         return False                     # the default path never reaches the lock
     with _LOCK:
+        _drain_pending_locked()          # PROF-462: fold whatever device work has landed
         bkt, px = bucket_of(spatial)
         buckets = _buckets(key, create=True)
         st = buckets.get(bkt)
@@ -251,6 +290,91 @@ def _bucket(key: tuple, spatial) -> _Bucket:
     return st
 
 
+# ── PROF-462: lazy, device-honest sampling for CUDA cooks ────────────────────
+# `measure` used to fence a sampled CUDA cook with `torch.cuda.synchronize()` at entry and
+# exit (plus two more inside `Interpreter._exec_stmts_profiled`, one per stage boundary) —
+# the "four device barriers" this reopens (CHANGELOG "The profiler's four device barriers
+# per sampled cook are declined ... What would reopen it is device events read once per
+# cook: a different mechanism, not a tuning of this one."). A `synchronize()` stalls the
+# calling thread until the device drains, which is exactly the cost an interactive host
+# cannot afford to put on a background cook's poll loop (see `tex_runtime/pacing.py`).
+#
+# The replacement: `measure` records one timing-enabled event at entry and one at exit
+# (never touching `CookResult.done`, which stays untimed — PACE-45's identity and cost are
+# unchanged), and the interpreter records one more per stage boundary (`profile.stage_event_
+# sink()`). None of these calls block. The pair is queued here and folded into the EWMA
+# tables the next time anything reads or samples the table — `should_sample`, `predict`,
+# `stage_costs`, `samples`, `settled`, `stage_snapshot` and `snapshot` all drain first — by
+# checking only the LAST event's `query()`: CUDA completes events on one stream in the order
+# they were recorded, so a signalled last event means every earlier event on that same cook
+# is safe to read with `elapsed_time` too (invariant #6 still holds — a reading is only ever
+# taken after its event has completed; deferring changes WHEN, never WHETHER).
+@dataclass
+class _Pending:
+    key: tuple
+    spatial: object
+    start: "object"                 # torch.cuda.Event, timing-enabled
+    end: "object"                   # torch.cuda.Event, timing-enabled
+    stage_events: "list | None"     # [(stage, event)] in recorded order, or None
+
+
+_pending: "deque[_Pending]" = deque()
+
+
+def _drain_pending_locked() -> None:
+    """Fold every queued sample whose device work has completed into the tables. Caller
+    holds `_LOCK` (an `RLock` — see there): this calls the PUBLIC `record`/`record_stages`,
+    not `_bucket(...).feed(...)` directly, so a host or benchmark that counts calls to those
+    two names (`docs/host-path-counts.md`'s BENCH-2 harness) still sees the fold happen,
+    lazily, exactly once per sample — the same contract those functions have always kept,
+    just no longer paid for with a device barrier. NEVER calls `.synchronize()` — a sample
+    whose end event has not yet signalled is left queued for the next drain, exactly like
+    `_timed_deferred`'s (LAT-3, `tex_runtime/compiled.py`) same-shaped deferral."""
+    if not _pending:
+        return
+    keep = deque()
+    for samp in _pending:
+        try:
+            done = samp.end.query()
+        except Exception:
+            done = True    # a dead/invalidated event can never complete; drop it, not wait
+        if not done:
+            keep.append(samp)
+            continue
+        try:
+            whole_ms = samp.start.elapsed_time(samp.end)
+            record(samp.key, whole_ms, samp.spatial)
+            if samp.stage_events:
+                prev = samp.start
+                stages = {}
+                for stage, ev in samp.stage_events:
+                    stages[stage] = prev.elapsed_time(ev)
+                    prev = ev
+                record_stages(samp.key, stages, samp.spatial)
+        except Exception:
+            pass            # a readback failure loses one sample; never raises to a caller
+    _pending.clear()
+    _pending.extend(keep)
+
+
+def _queue_pending(key: tuple, spatial, start, end, stage_events) -> None:
+    """Queue one sampled cook's device-timing events for lazy fold (see above). Bounded:
+    the oldest entry is dropped, unresolved or not, once the queue would exceed
+    `_PENDING_MAX` — a profiler that never blocks the cook path must also never grow
+    without bound if a consumer stops reading the table."""
+    with _LOCK:
+        _drain_pending_locked()
+        _pending.append(_Pending(key, spatial, start, end, stage_events))
+        while len(_pending) > _PENDING_MAX:
+            _pending.popleft()
+
+
+def _pending_count() -> int:
+    """Test hook: how many samples are queued for lazy fold, without draining them."""
+    with _LOCK:
+        return len(_pending)
+
+
 # ── prediction ───────────────────────────────────────────────────────────────
 def _resolve_bucket(key: tuple, spatial, *, need_stages: bool = False):
     """`(bucket, pixel_scale)` for this (key, resolution), or `(None, 1.0)`.
@@ -271,6 +395,7 @@ def _resolve_bucket(key: tuple, spatial, *, need_stages: bool = False):
     frame — at 64² a TEX cook is almost entirely that fixed part. For ORDERING work the bias
     cancels across candidates; against an ABSOLUTE threshold it does not, which is why CACHE-7
     also checks a materialization floor. Caller holds `_LOCK`."""
+    _drain_pending_locked()   # PROF-462: every reader sees device-honest, already-folded data
     buckets = _buckets(key, create=False)
     if not buckets:
         return None, 1.0
@@ -360,6 +485,7 @@ def reset() -> None:
     """Forget everything (a test hook, and what a host calls between projects)."""
     with _LOCK:
         _STATE.clear()
+        _pending.clear()          # PROF-462: a stale pending sample must not outlive a reset
 
 
 def snapshot() -> dict:
@@ -367,6 +493,7 @@ def snapshot() -> dict:
     persist through, and what a host HUD reads."""
     out = {}
     with _LOCK:                          # a concurrent insert would raise mid-iteration
+        _drain_pending_locked()          # PROF-462: a snapshot reads whatever has folded
         for (fp, dev, prec), buckets in _STATE.items():
             out[f"{fp}|{dev}|{prec}"] = {
                 str(bkt): {"px": b.px, "ms": round(b.ewma_ms, 4), "samples": b.samples,
@@ -405,8 +532,18 @@ class measure:
     profiler had stopped supplying. Check every member of a timing pool against
     `stdlib_registry.REGISTRY`'s `.sync` field (`e.sync` per entry — the same tag
     `graphed._SYNC_STDLIB` is hand-kept from) BEFORE quoting a "no difference" result from
-    it; a pool with a sync-tagged member proves nothing about this mechanism either way."""
-    __slots__ = ("key", "spatial", "device", "sink", "_t0", "_on", "_prev")
+    it; a pool with a sync-tagged member proves nothing about this mechanism either way.
+
+    PROF-462: on CUDA this no longer calls `torch.cuda.synchronize()` at all. A timing-
+    enabled event is recorded at entry and one more at exit (never `CookResult.done`, which
+    PACE-45 creates without `enable_timing` and which this leaves untouched in identity and
+    cost); the pair — plus, when `stages=True`, the per-stage boundary events
+    `Interpreter._exec_stmts_profiled` records via `stage_event_sink()` — is handed to
+    `_queue_pending` and read back lazily, never here. If event creation fails (no CUDA
+    context available despite `device` claiming one), this falls back to the old
+    synchronize-and-perf_counter form for that one cook, same as before PROF-462."""
+    __slots__ = ("key", "spatial", "device", "sink", "_t0", "_on", "_prev",
+                 "_start_ev", "_prev_events")
 
     def __init__(self, key: tuple, spatial=None, *, device=None, stages: bool = False):
         self.key = key
@@ -416,6 +553,8 @@ class measure:
         self.sink: dict | None = {} if (self._on and stages) else None
         self._prev = None
         self._t0 = 0.0
+        self._start_ev = None
+        self._prev_events = None
 
     def _sync(self) -> None:
         if self.device.startswith("cuda"):
@@ -425,12 +564,33 @@ class measure:
             except Exception:
                 pass
 
+    def _new_event(self):
+        """A `torch.cuda.Event(enable_timing=True)`, recorded now under `with torch.cuda.
+        device(self.device):` — the O4 discipline (`pacing.cook_done_event`) that makes the
+        event mark THIS measure's device rather than whatever happens to be ambient. None on
+        any failure (no CUDA context / bad device); the caller falls back to the sync form."""
+        if not self.device.startswith("cuda"):
+            return None
+        try:
+            import torch
+            with torch.cuda.device(self.device):
+                ev = torch.cuda.Event(enable_timing=True)
+                ev.record()
+            return ev
+        except Exception:
+            return None
+
     def __enter__(self) -> "measure":
         if self._on:
             if self.sink is not None:
                 self._prev = getattr(_tls, "stages", None)
                 _tls.stages = self.sink
-            self._sync()
+            self._start_ev = self._new_event()
+            if self._start_ev is not None and self.sink is not None:
+                self._prev_events = getattr(_tls, "stage_events", None)
+                _tls.stage_events = []
+            if self._start_ev is None:
+                self._sync()
             self._t0 = time.perf_counter()
         return self
 
@@ -439,9 +599,26 @@ class measure:
             return False
         if self.sink is not None:
             _tls.stages = self._prev
+        events = None
+        if self._start_ev is not None:
+            events = getattr(_tls, "stage_events", None)
+            _tls.stage_events = self._prev_events
         # A cook that raised (OOM, CookCancelled) took an unrepresentative amount of time —
         # recording it would poison the EWMA with a number no future cook will reproduce.
         if exc_type is None:
+            if self._start_ev is not None:
+                end_ev = self._new_event()
+                if end_ev is not None:
+                    try:
+                        _queue_pending(self.key, self.spatial, self._start_ev, end_ev, events)
+                        return False
+                    except Exception:
+                        pass
+                # The end event broke after a successful start (very rare — no CUDA context
+                # loss short of that). `self._t0` predates the entry sync this cook never
+                # paid, so a wall-clock fallback here would understate cost; losing this one
+                # sample is the honest choice, matching `_timed_deferred`'s own "skip it".
+                return False
             self._sync()
             record(self.key, (time.perf_counter() - self._t0) * 1000.0, self.spatial)
             if self.sink:

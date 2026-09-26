@@ -291,6 +291,10 @@ _NOT_A_CACHE = {
     "tier_trace._noise_failure_ring": "bounded noise-failure trace ring (diagnostics)",
     "profile._STATE": "PROF-1's measured cost accumulator -- its entries are observations, "
                       "so dropping one loses data rather than costing a recompute",
+    "profile._pending": "PROF-462's lazy CUDA-event fold queue -- bounded (oldest dropped), "
+                        "each entry a sample awaiting a non-blocking readback rather than a "
+                        "lookup; a dropped entry loses one sample's attribution, never a "
+                        "wrong number",
 }
 
 

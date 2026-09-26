@@ -419,55 +419,69 @@ test before it starts, and cannot claim a win the instrument would not see.
    that has already been through `.clamp(0, max_level)`, so the tag is gone by the time it is
    read — hoisting that clamp to the host would take `cuda.memcpy_DtoH` to 0 on a comp that
    mip-samples, which this one does not, so no row here would move.
-4. **PROF-1 costs four device syncs per sampled cook.** `tex_runtime/profile.py:408`
-   (`measure._sync`), called at `:421` and `:433` — twice per `measure` block, and the engine
-   arms a nested one. Measured with `--prof1 on` on a terminal tick: the **sampled** tick reads
-   `torch.cuda.synchronize[engine]` = **4** and `profile.record` = **1**, and the unsampled
-   ticks read 0 — the row is `~unstable` by construction, because `should_sample` measures
-   every cook of an unseen key until it has three samples and then one in sixteen. This is why
-   the profiler is disarmed by default (invariant #7) and why the gate asserts **0 engine-side
-   syncs per interactive tick** with it off.
-   *Shows fixed as:* `torch.cuda.synchronize[engine]` going **4 → 2** (or 0) on a sampled tick
-   under `--prof1 on`, with `profile.record` unchanged at 1 — i.e. the same sample taken with
-   fewer barriers, not fewer samples.
+4. **PROF-1 costs one lazy CUDA-event pair per sampled cook — LANDED (PROF-462, v0.46.2).
+   Previously it cost four device syncs.** History first, then the fix.
 
-   **This is a work item, not a curiosity: PROF-1 is ARMED in an embedding host's shipped
+   **What it cost through v0.46.1.** `measure.__enter__`/`__exit__` (`tex_runtime/profile.py`,
+   `class measure`) each called `torch.cuda.synchronize()` once, and
+   `Interpreter._exec_stmts_profiled` (`tex_runtime/interpreter.py`) synchronized once more at
+   entry and once per fused-chain stage boundary — four barriers on the common one-stage
+   (unfused) case. Measured with `--prof1 on` on a terminal tick at `27f260e`: the **sampled**
+   tick read `torch.cuda.synchronize[engine]` = **4** and `profile.record` = **1**, and the
+   unsampled ticks read 0 — the row was `~unstable` by construction, because `should_sample`
+   measures every cook of an unseen key until it has three samples and then one in sixteen.
+   This is why the profiler is disarmed by default (invariant #7) and why the gate asserts
+   **0 engine-side syncs per interactive tick** with it off.
+
+   **This was a work item, not a curiosity: PROF-1 is ARMED in an embedding host's shipped
    default** (reported 2026-09-21), deliberately, with the sync cost named and budgeted. That
    host's checkpoint planner returns an empty plan forever without the per-stage breakdown, so
    it arms the profiler at bring-up, re-arms it after a reset, and drops a stored *off* from an
-   older settings file on upgrade. Two consequences. First, *"the profiler is disarmed by
-   default"* above is **TEX's** default and not the deployed state, so the four syncs are on a
-   real interactive tick today. Second, any fix inherits a contract: the per-stage breakdown must
-   survive, and `should_sample`'s shape — every cook of an unseen key until three samples, then
-   one in sixteen — is load-bearing for that host's cost table. Changing the sampling rule is a
-   contract change that is named in a hand-back before the tag, never a tuning.
+   older settings file on upgrade. So *"the profiler is disarmed by default"* above was
+   **TEX's** default and not that host's deployed state — the four syncs were on a real
+   interactive tick there, until this item's fix.
 
-   **Attempted, measured, and DECLINED (PERF-9, 2026-09-21). The four syncs stay.** The obvious
-   fix is to drop the two inner barriers on the ground that the outer pair already serialises.
-   Built and interleaved against its own base, it does not error and does not empty the per-stage
-   table — it fills the table with plausible, badly wrong numbers while the whole-cook total, still
-   bracketed by the untouched outer pair, stays roughly right:
+   **Attempted, measured, and DECLINED first (PERF-9, 2026-09-21).** The obvious fix is to drop
+   the two inner barriers on the ground that the outer pair already serialises. Built and
+   interleaved against its own base, it did not error and did not empty the per-stage table —
+   it filled the table with plausible, badly wrong numbers while the whole-cook total, still
+   bracketed by the untouched outer pair, stayed roughly right:
 
    | | stage 0 | the heavy stage | stage 2 | sum of stages | whole cook |
    |---|---:|---:|---:|---:|---:|
    | base | 6.32 ms | **50.51 ms** | 11.91 ms | 68.74 ms, tracks the total | 68.9 ms |
    | inner barriers removed | 0.21 | **0.68** | 0.22 | ~1.12 ms, **1.6 % of the total** | 64.8–84.8 |
 
-   A checkpoint planner fed the second row would never place a tap on that 50 ms stage. That is the
-   *present but wrong* failure this item's constraint exists to prevent, and it is worse than the
-   barriers. **4 → 0 is structurally unavailable** as well: some tier routes never reach the
-   interpreter's inner syncs at all, so the outer bracket is their only barrier. Even 4 → 3 fails —
-   merging the outer enter with the inner pre-loop is falsified by real GPU dispatch in the
-   binding-cast and coordinate-builtin preamble, and merging the inner close with the outer exit is
-   safe only at fp32.
+   A checkpoint planner fed the second row would never place a tap on that 50 ms stage — the
+   *present but wrong* failure this item's constraint exists to prevent, worse than the
+   barriers it would have removed. **The reopen condition named at the time:** *"a per-stage
+   timing that does not need a barrier at all — device events recorded into the stream and read
+   once at the end of the cook, rather than a synchronise per stage boundary. That is a
+   different mechanism, not a tuning of this one."*
 
-   **One premise died usefully.** The cook queue's own completion bracket does *not* provide a
-   barrier that would make any of the four redundant: it feeds the profiler from a bare wall-clock
-   delta with no device synchronisation, pricing job admission rather than the cook.
+   **The landed mechanism (PROF-462).** `measure` (`tex_runtime/profile.py`) now records one
+   timing-enabled `torch.cuda.Event` at entry and one at exit — never `CookResult.done`, which
+   PACE-45 creates without `enable_timing` and which this leaves alone — and
+   `Interpreter._exec_stmts_profiled` records one more per stage boundary the same way. None of
+   these block. They queue in a small bounded FIFO (`_drain_pending_locked`,
+   `tex_runtime/profile.py:324`) and fold into the tables the next time anything reads them, by
+   checking only the LAST event's `.query()` — CUDA completes events on one stream in the order
+   recorded, so a signalled last event means every earlier boundary on that cook is already safe
+   to read. **Measured** (this box, `--prof1 on`, a terminal tick, `27f260e` → head, three
+   interleaved runs each): `torch.cuda.synchronize[engine]` reads **0** every time — the
+   predicted-but-unconfirmed *"(or 0)"* branch of the original fix prediction, now the measured
+   one. `profile.record` still fires exactly once per genuinely sampled cook, matching PRED-1's
+   contract and `should_sample`'s unchanged shape — but this row was already `~unstable by
+   construction` above, and lazy fold adds a SECOND source of the same instability: which
+   counted tick's window a fold lands in now depends on when a later profile-table touch
+   happens to occur, not on the sampled cook's own tick. A session's TOTAL sample count over
+   many ticks is unaffected; a single tick's own count is not a number this mechanism ever
+   promised to hold still, before or after this fix.
 
-   *What would reopen it:* a per-stage timing that does not need a barrier at all — device events
-   recorded into the stream and read once at the end of the cook, rather than a synchronise per
-   stage boundary. That is a different mechanism, not a tuning of this one.
+   **One premise died usefully, still true.** The cook queue's own completion bracket does
+   *not* provide a barrier that would make any of the four redundant: it feeds the profiler from
+   a bare wall-clock delta with no device synchronisation, pricing job admission rather than the
+   cook.
 5. **The results cache grows by one entry per cook, forever, on interactive ticks.** The
    `results_cache.entries_added` row tracks `ResultCache.put` exactly on every scenario. **Host
    policy** — a scrub visits values it will never revisit, and nothing tells the cache so.

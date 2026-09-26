@@ -570,11 +570,10 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         program has no tags at all and lands entirely in stage `None`, which is the honest
         answer: it IS one stage.
 
-        CUDA is synchronized at each boundary — without it the timer reads kernel-LAUNCH time
-        and attributes a stage's real work to whichever later stage happens to sync. That sync
-        is the profiler's whole cost, and it is why `should_sample` exists.
+        PROF-462: on CUDA a stage boundary records a lazy CUDA event when `profile.
+        stage_event_sink()` is armed; else sync+perf_counter, whose cost is why `should_sample` exists.
 
-        TRK-131: timing a change to this sync count needs a pool with no `sync=True`
+        TRK-131: timing the FALLBACK sync count needs a pool with no `sync=True`
         builtin — one of those does its own internal `.item()` readback, which is itself a
         barrier, and can silently stand in for a sync this method stopped doing. See
         `profile.measure`'s docstring for the repro method this costs.
@@ -586,17 +585,20 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         unprofiled loops above were split apart to keep."""
         cuda = dev.type == "cuda"
         n = len(stmts) or 1
+        events = _prof.stage_event_sink() if cuda else None  # PROF-462: lazy event mode
 
         def close(stage, t0):
-            """Bank the elapsed time against `stage`. One definition, so the final stage —
-            the one CACHE-7 reads to place a checkpoint — is attributed exactly like the rest."""
+            """Bank `stage`'s cost: an event in event-mode (see above), else sync+perf_counter."""
+            if events is not None:
+                _prof.record_stage_boundary(events, stage, dev)
+                return None
             if cuda:
                 torch.cuda.synchronize()
             now = time.perf_counter()
             sink[stage] = sink.get(stage, 0.0) + (now - t0) * 1000.0
             return now
 
-        if cuda:
+        if events is None and cuda:
             torch.cuda.synchronize()
         cur, t0, i = _MISSING, time.perf_counter(), 0
         for stmt in stmts:

@@ -181,7 +181,13 @@ _SKIP_VOCAB = re.compile(
 #: measure off CUDA. Every other row in that file drives the ring/depth mechanism through a
 #: mocked `torch.cuda` (the same `_DeviceSpy` shape `test_fixobsroute46_pacing.py` uses) and
 #: needs no `r.skip`.
-_SKIP_BUDGET = 118
+#: Re-pinned from 118 to 119 (PROF-462): `test_prof462_device_honest.py::
+#: test_prof462_real_cuda_cook_resolves_device_ms` needs a real CUDA device — it is the one
+#: row in that file that is NOT a fake-`torch.cuda.Event` mechanism test (those need no
+#: device at all and carry no `r.skip`), and there is no CPU witness for "a sampled cook's
+#: device time resolves via a real CUDA event", the same reason every other CUDA-only row in
+#: this pin carries.
+_SKIP_BUDGET = 119
 
 
 def _literal(node) -> str:
