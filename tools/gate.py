@@ -70,6 +70,14 @@ Optionally `--counts-baseline PATH` adds the structural counts leg, run at the g
 the frame census outside the exit code, because the frame rows move for every lawful change
 that adds a call or moves a module. The baseline must be a `--save` taken at that same shape.
 
+Optionally `--ci-exact` adds a further leg that runs `.github/workflows/tests.yml`'s own
+command VERBATIM (coverage tracing ON, `-m 'not slow'`, `timing` tests INCLUDED) on the
+CI-shape interpreter -- closing TRK-208's other half (a cheap AST ratchet,
+`tests/test_gate47_wallclock_ratchet.py`, is the first half: no NEW wall-clock comparison
+enters an assertion unmarked). It only runs for real when `coverage`/`pytest-cov` are
+importable on that interpreter; otherwise it reports precisely what is missing rather than
+failing the gate over an environment gap this tool does not install its way out of.
+
 `--tier touched` (SPLIT-E) is a THIRD, standalone tier — a lane's own gate, run before handing
 back, in between `cheap`'s eight-ratchet feedback latency and `full`'s whole-suite landing
 cost. It selects, on the canonical harness, the full test files whose NAMES or IMPORTS relate
@@ -175,6 +183,11 @@ _CHEAP = [
     # checkout* (this project's own local, unpushed working area) rather than per-person.
     # Pure text scan, no compile, same cost class as the private-root lint beside it.
     ("local-only-path lint", "tests/test_lint1_no_local_only_path_refs.py"),
+    # GATE-47/TRK-208: an AST scan forbidding a NEW wall-clock comparison inside an
+    # assertion unless it carries @pytest.mark.timing/.slow or a reviewed allowlist entry --
+    # the class of defect that broke v0.46.0's CI on every Python version while every local
+    # gate tier (this one included) stayed green, because none of them trace coverage.
+    ("wall-clock assertion ratchet", "tests/test_gate47_wallclock_ratchet.py"),
 ]
 
 #: SPLIT-E's `--tier touched`: the fixed ratchets a lane's own selection ALWAYS carries,
@@ -435,7 +448,7 @@ def interpreter_identity(path: str) -> tuple:
     return hit
 
 
-def cache_key(tree: str, tier: str, interpreters, with_counts: bool) -> str:
+def cache_key(tree: str, tier: str, interpreters, with_counts: bool, ci_exact: bool = False) -> str:
     """The key a verdict is stored under: the tree, the tier, WHO measured it, and UNDER WHAT
     CUDA VISIBILITY.
 
@@ -451,6 +464,7 @@ def cache_key(tree: str, tier: str, interpreters, with_counts: bool) -> str:
     keys stay one line whatever the paths look like — the readable identities travel in the
     record and are printed with the cached verdict."""
     parts = [f"tree={tree}", f"tier={tier}", f"counts={int(bool(with_counts))}",
+             f"ci_exact={int(bool(ci_exact))}",
              f"cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}"]
     for role, path in interpreters:
         real, version = interpreter_identity(path)
@@ -904,6 +918,77 @@ def run_ci_shape(ci_python: str, scratch: str, verbose: bool, source: str = "--c
     return leg
 
 
+def _ci_exact_missing_deps(ci_python: str) -> list:
+    """Which of `coverage`/`pytest_cov` (the two packages CI's own `pip install pytest
+    pytest-cov` step provides) `ci_python` cannot import, in the order checked. Empty means
+    both are importable there -- this tool only RUNS the CI command shape, never installs
+    into an interpreter (same rule `resolve_ci_python` states for the interpreter itself)."""
+    missing = []
+    for mod in ("coverage", "pytest_cov"):
+        try:
+            proc = subprocess.run([ci_python, "-c", f"import {mod}"],
+                                  capture_output=True, text=True, timeout=60)
+        except Exception:
+            missing.append(mod)
+            continue
+        if proc.returncode != 0:
+            missing.append(mod)
+    return missing
+
+
+def run_ci_exact(ci_python: str, scratch: str, verbose: bool, source: str = "--ci-python") -> Leg:
+    """GATE-47/TRK-208 shape (b): the CI workflow's OWN command, verbatim --
+    `python -m pytest tests/ -v -m 'not slow' --cov=TEX_Wrangle --cov-config=.coveragerc
+    --cov-report=term-missing` (`.github/workflows/tests.yml`) -- run from the package ROOT
+    on `ci_python`, `CUDA_VISIBLE_DEVICES=-1`. Unlike `run_ci_shape`, this leg does NOT add
+    `and not timing` to the `-m` expression: CI's own filter is exactly `not slow`, and the
+    whole point of this leg is to reproduce the shape that let a `timing`-shaped assertion
+    invert under coverage tracing while every other local leg (which all deselect `timing`)
+    stayed green. Coverage tracing is the other half of that shape and cannot be emulated by
+    this tool (this project takes no dependency on `coverage`/`pytest-cov` at runtime, and
+    won't add one just to run a gate leg) -- it either runs for REAL, on an interpreter that
+    already has both packages, or it reports precisely what is missing and does not fail the
+    gate over an environment gap this tool has no business closing (installing is not this
+    tool's job; see `resolve_ci_python`'s identical rule for the interpreter itself)."""
+    leg = Leg("ci-exact", "the CI workflow's OWN command shape verbatim -- coverage tracing "
+                          "ON, `-m 'not slow'` with `timing` INCLUDED (unlike every other "
+                          "leg here) -- the exact shape TRK-209 broke under and no other "
+                          "local leg reproduces")
+    leg.proves += f" [interpreter: {ci_python} (from {source})]"
+    if not os.path.isfile(ci_python):
+        leg.rc, leg.summary = 127, f"interpreter not found: {ci_python}"
+        leg.failures = ["<ci-exact interpreter missing>"]
+        return leg
+    if _ci_interpreter_can_import_comfy_api(ci_python):
+        # Same G1 reasoning as run_ci_shape: an interpreter that can see the embedding
+        # host's adapter is not host-free, so a red or green under it would not be a claim
+        # about the CI shape either. REFUSE rather than run and report something else.
+        leg.rc = 1
+        leg.summary = (f"REFUSED: {ci_python} can `import comfy_api` (G1) -- pass a "
+                       f"host-free --ci-python to run this leg for real")
+        leg.failures = ["<ci-exact:refused-comfy-api>"]
+        leg.failure_text["<ci-exact:refused-comfy-api>"] = leg.summary
+        return leg
+    missing = _ci_exact_missing_deps(ci_python)
+    if missing:
+        leg.rc, leg.summary = 0, (
+            f"SKIPPED (not a failure): {', '.join(missing)} not importable under "
+            f"{ci_python} -- CI's own \"Install dependencies\" step installs both with "
+            f"`pip install pytest pytest-cov`; this tool never installs into an "
+            f"interpreter it did not create, so this leg only proves something once both "
+            f"are already there")
+        return leg
+    argv = [ci_python, "-m", "pytest", "tests/", "-v", "-m", "not slow",
+            "--cov=TEX_Wrangle", "--cov-config=.coveragerc", "--cov-report=term-missing"]
+    env_extra = {"CUDA_VISIBLE_DEVICES": "-1"}
+    _run(leg, argv, _PKG, env_extra, scratch, verbose)
+    # This leg deliberately runs `timing` tests too (CI's own `-m` does not exclude them),
+    # so there is nothing to count as deselected -- 0, not None (None reads as "could not
+    # be counted", which is not what happened here).
+    leg.timing_deselected = 0
+    return leg
+
+
 def run_canonical(python: str, scratch: str, verbose: bool) -> Leg:
     leg = Leg("canonical", "the embedded interpreter with CUDA and the host present, the v3 "
                            "NodeOutput wrapper disarmed — the only leg that runs the GPU rows")
@@ -1042,6 +1127,16 @@ def main(argv=None) -> int:
                    help="add the structural-counts leg against this --save file, which must "
                         "have been taken at the gate shape: `host_path_counts.py --device cpu "
                         "--res 96 --window 48 --ticks 4 --prof1 off --save PATH`")
+    p.add_argument("--ci-exact", action="store_true",
+                   help="`--tier full` only: ALSO run the CI workflow's OWN command shape "
+                        "verbatim (coverage tracing ON, `-m 'not slow'` with `timing` "
+                        "INCLUDED -- unlike every other leg here) on --ci-python/"
+                        "$TEX_CI_PYTHON. Off by default: this leg is the whole suite again, "
+                        "under tracing, on top of ci-shape's own run. If `coverage`/"
+                        "`pytest-cov` are not importable on that interpreter it reports "
+                        "precisely which is missing and does not fail the gate over it -- "
+                        "this tool never installs into an interpreter it did not create "
+                        "(TRK-208/GATE-47)")
     p.add_argument("--keep-going", action="store_true",
                    help="run the full tier even when the cheap tier is red")
     p.add_argument("--scratch", metavar="DIR",
@@ -1067,7 +1162,7 @@ def main(argv=None) -> int:
     # different files on an unchanged tree), so it rides the cache key -- folded into the tier
     # string rather than a new cache_key parameter, since it is the only tier this applies to.
     cache_tier = f"{a.tier}:{base_ref}" if a.tier == "touched" else a.tier
-    key = cache_key(th, cache_tier, interpreters, bool(a.counts_baseline))
+    key = cache_key(th, cache_tier, interpreters, bool(a.counts_baseline), bool(a.ci_exact))
     who = describe_interpreters(interpreters)
     if not a.no_cache:
         hit = _cache_read(key)
@@ -1118,6 +1213,8 @@ def main(argv=None) -> int:
                 run_canonical(a.python, scratch, a.verbose)]
         if a.counts_baseline:
             full.append(run_counts(a.python, a.counts_baseline, scratch, a.verbose))
+        if a.ci_exact:
+            full.append(run_ci_exact(ci_python, scratch, a.verbose, ci_source))
         jf = judge(full, allowlist, cuda)
         _report("full", full, jf, head)
         lines.append(_line("full", full, jf, head))
