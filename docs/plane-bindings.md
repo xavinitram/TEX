@@ -57,7 +57,7 @@ This is the release's compat tripwire and the reason this phase gets its own ses
 
 **The constraint that decides it:** the parser provably never sees binding types.
 `TEXCache.compile_tex` reaches `Parser(tokens, source=source).parse()` through
-`parse_and_split` (`tex_cache.py:209`) and
+`parse_and_split` (`tex_cache.py:222`) and
 types enter one call later, at `TypeChecker(binding_types=..., source=source)`
 (`tex_cache.py:570`, inside the shared `TEXCache.compile_ast`). So doc 40's "`.name` means a plane *on a
 PLANES-typed wire*" cannot live in the grammar. Something upstream of types must tokenize the
@@ -101,7 +101,7 @@ reason: **everything that matters is keyed on token value, not on AST shape.**
   parses as `ArrayIndexAccess` and dies in the TypeChecker. Both are unreachable as plane
   sugar under (b), and both fall out for free under (a).
 * `identity_binding_types` (`tex_marshalling.py:906`) and `TEXCache.fingerprint`
-  (`tex_cache.py:387`) hash `(name, type)` pairs. `("beauty.diffuse", "vec3")` is just another
+  (`tex_cache.py:431`) hash `(name, type)` pairs. `("beauty.diffuse", "vec3")` is just another
   tuple; no identity machinery changes.
 
 The cost of (a) is exactly one thing, and it is the next section.
@@ -110,7 +110,7 @@ The cost of (a) is exactly one thing, and it is the next section.
 
 Under (a), `@A.r` on an ordinary VEC4 wire lexes as a binding named `A.r`. The TypeChecker must
 put it back. This is legal — not a hack — because **the compile cache is keyed on
-`(code, binding_types)`** (`TEXCache.fingerprint`, `tex_cache.py:387`), so a resolution that
+`(code, binding_types)`** (`TEXCache.fingerprint`, `tex_cache.py:431`), so a resolution that
 depends on binding types can never alias a differently-typed compile of the same source.
 
 For an `AT_BINDING` token whose value contains a dot, split on the **last** dot into

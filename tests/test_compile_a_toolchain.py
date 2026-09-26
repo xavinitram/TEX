@@ -32,6 +32,7 @@ import pytest
 from helpers import *  # noqa: F401,F403
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime import compiled as C
+from TEX_Wrangle.tex_runtime import compiled_capability as _CC
 from TEX_Wrangle.tex_runtime import autotier as AT
 
 
@@ -83,7 +84,13 @@ def test_cc3_compile_capability_shape(r: SubTestResult):
 
 def test_cc3_capability_probed_once_and_reflects_the_probes(r: SubTestResult):
     print("\n--- CC-3: probed ONCE per process, never by compiling ---")
-    orig_cuda, orig_cpu = C._probe_cuda_inductor, C._probe_cpu_inductor
+    # SPLIT-47 (TRK-210): `compile_capability`/`_probe_cuda_inductor`/`_probe_cpu_inductor`
+    # all moved together to `compiled_capability.py`, so `compile_capability`'s internal
+    # bare-name calls to the two probes now resolve through THAT module's own globals, not
+    # `compiled.py`'s re-exported copies (the ROUTE-45 hazard the split's own brief named:
+    # a moved function that is spied must still be looked up through the module the spy
+    # patches). Patch `_CC` (compiled_capability), not `C` (compiled), for exactly this row.
+    orig_cuda, orig_cpu = _CC._probe_cuda_inductor, _CC._probe_cpu_inductor
     calls = {"cuda": 0, "cpu": 0}
 
     def fake_cuda():
@@ -94,8 +101,8 @@ def test_cc3_capability_probed_once_and_reflects_the_probes(r: SubTestResult):
         calls["cpu"] += 1
         return True, None
 
-    C._probe_cuda_inductor = fake_cuda
-    C._probe_cpu_inductor = fake_cpu
+    _CC._probe_cuda_inductor = fake_cuda
+    _CC._probe_cpu_inductor = fake_cpu
     C._reset_capability_cache_for_test()
     try:
         cap = C.compile_capability()
@@ -109,7 +116,7 @@ def test_cc3_capability_probed_once_and_reflects_the_probes(r: SubTestResult):
     except Exception as e:
         r.fail("compile_capability probed-once contract", str(e))
     finally:
-        C._probe_cuda_inductor, C._probe_cpu_inductor = orig_cuda, orig_cpu
+        _CC._probe_cuda_inductor, _CC._probe_cpu_inductor = orig_cuda, orig_cpu
         C._reset_capability_cache_for_test()
 
 

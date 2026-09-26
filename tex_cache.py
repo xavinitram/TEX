@@ -97,7 +97,14 @@ _CODEGEN_FILES = [_R_DIR / "interpreter.py", _R_DIR / "codegen.py", _R_DIR / "co
 # Tier-policy — a change moves a measured win/lose verdict (autotier.json / warm_state.json).
 # NEW under CACHE-4: previously a compiled.py tiering change kept stale verdicts.
 _VERDICT_FILES = [_R_DIR / "precision_policy.py", _R_DIR / "autotier.py",
-                  _R_DIR / "compiled.py", _R_DIR / "graphed.py"]
+                  _R_DIR / "compiled.py", _R_DIR / "graphed.py",
+                  # SPLIT-47 (TRK-210): `compiled.py`'s toolchain-capability probe
+                  # (`compiled_capability.py`) and per-cook execution support — the timing
+                  # wrappers that MEASURE a verdict (`compiled_exec_support.py`) — are pure
+                  # moves out of `compiled.py`, so an edit to either can move a measured
+                  # win/lose verdict exactly as a `compiled.py` edit could (TRK-189 derives
+                  # and enforces this from disk).
+                  _R_DIR / "compiled_capability.py", _R_DIR / "compiled_exec_support.py"]
 
 
 # ── DATA-6: the plane seam ────────────────────────────────────────────────────

@@ -95,6 +95,20 @@ def test_trk189_results_mixins_ride_every_watchlist_results_is_on(r: SubTestResu
         r.fail("TRK-189 results mixins", f"{type(e).__name__}: {e}")
 
 
+def test_trk189_compiled_mixins_ride_every_watchlist_compiled_is_on(r: SubTestResult):
+    print("\n--- TRK-189: compiled_*.py siblings ride every watch-list compiled.py "
+          "is on ---")
+    # SPLIT-47 (v0.47.0, TRK-210) gave `compiled.py` its first `compiled_*.py` siblings
+    # (`compiled_capability.py`, `compiled_exec_support.py`). `compiled.py` sits on
+    # `tex_cache._VERDICT_FILES` (a change can move a measured win/lose verdict), so this
+    # closes the exact SPLIT-I-shaped gap the interpreter row above guards, one level over.
+    try:
+        runtime_dir = os.path.join(os.path.dirname(os.path.abspath(C.__file__)), "tex_runtime")
+        _check_family(r, "compiled.py", runtime_dir, "SPLIT-47")
+    except Exception as e:
+        r.fail("TRK-189 compiled mixins", f"{type(e).__name__}: {e}")
+
+
 def test_trk189_engine_mixins_ride_every_watchlist_engine_is_on(r: SubTestResult):
     print("\n--- TRK-189: tex_engine_*.py siblings ride every watch-list tex_engine.py "
           "is on ---")

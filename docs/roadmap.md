@@ -144,7 +144,7 @@ Four workstreams. Effort tags: S/M/L.
 
 - **LAT-1 (L).** Compile-latency masking everywhere, in two halves. **(a, M)** forced
   `torch_compile` currently blocks the cook on `future.result()`, inside
-  `execute_compiled` (~28 s cold — compiled.py:655); route it through the
+  `execute_compiled` (~28 s cold — compiled.py:426); route it through the
   background-compile machinery `auto` already
   uses (serve codegen/interpreter meanwhile, swap on ready), plus queue-time
   speculative warm: pre-materialize codegen fns and submit background compiles for

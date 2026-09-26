@@ -27,9 +27,7 @@ from typing import Any, Callable
 
 import torch
 
-from ..tex_compiler.ast_nodes import (BinOp, UnaryOp, TernaryOp, FunctionCall,
-                                      VecConstructor, MatConstructor, CastExpr,
-                                      IfElse, ForLoop, WhileLoop, BindingRef)
+from ..tex_compiler.ast_nodes import BindingRef
 from .interp_pool import ThreadLocalInterpreterPool as _ThreadLocalInterpreterPool
 from .interpreter import (Interpreter, _collect_identifiers, _consensus_extent,
                           _SCALAR_BUILTIN_DEFAULTS, _record_ingest_event)
@@ -39,6 +37,21 @@ from .host import CookCancelled  # SCHED-3 seam (no cycle: host imports torch on
 from .stdlib import TEXStdlib, _tag_host_scalar
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 from . import pacing as _pace   # PACE-45: bounds queue-ahead when a token opts in
+# SPLIT-47 (TRK-210): re-exported so `compiled.NAME` and `from .compiled import NAME` keep
+# resolving unchanged for every external caller, and so this module's own bare-name calls
+# below (e.g. `_select_backend(...)`, `_timed(...)`, `_contiguous_bindings(...)`) still find
+# these names in THIS module's globals — the ROUTE-45 shape SPLIT-E used. Neither sibling
+# module imports `compiled.py` at its own module scope (see each one's docstring); each
+# reaches back to `compiled._backend_status` / `compiled._setup_msvc_env` — which stay HERE
+# — lazily, inside the one function that needs it.
+from .compiled_capability import (_count_tensor_ops, _max_loop_depth, _select_backend,
+                                  compile_capability, _reset_capability_cache_for_test,
+                                  _probe_cuda_inductor, _probe_cpu_inductor, _OP_TYPES)
+from .compiled_exec_support import (_show_once, _maybe_triton_hint, _ensure_inductor_cache_dir,
+                                    _timed, _timed_deferred, _deferred_ev,
+                                    _contiguous_bindings, _WARM_CLONE_CAP_BYTES,
+                                    _bindings_nbytes, _cuda_headroom_ok, _capture_in_flight,
+                                    _warnings_shown)
 
 logger = logging.getLogger("TEX")
 
@@ -230,8 +243,9 @@ def _canon_device(device) -> "torch.device":
 _route_memo: "_OrderedDict[str, tuple[int, int]]" = _OrderedDict()
 _ROUTE_MEMO_MAX = 256
 
-# One-time log messages (avoid spamming the console)
-_warnings_shown: set[str] = set()
+# SPLIT-47 (TRK-210): `_warnings_shown` (the one-time log de-dup set) moved to
+# `compiled_exec_support.py` along with `_show_once`/`_maybe_triton_hint`/
+# `_ensure_inductor_cache_dir`, and is re-exported above.
 
 # CANCEL-44 (Gap 2): the cancel-aware codegen variant's OWN memo — fingerprint ->
 # materialized fn (or _CANCEL_CG_UNSUPPORTED). Deliberately separate from PC-3's
@@ -400,233 +414,11 @@ _COMPILE_OP_THRESHOLD = 8
 _COMPILE_MAX_LOOP_DEPTH = 2
 
 
-# ── Helpers ───────────────────────────────────────────────────────────
-
-_WARNINGS_SHOWN_CAP = 256
-
-def _show_once(key: str, msg: str, level: str = "info"):
-    """Log a message at most once per session."""
-    if key not in _warnings_shown and len(_warnings_shown) < _WARNINGS_SHOWN_CAP:
-        _warnings_shown.add(key)
-        getattr(logger, level)(msg)
-
-
-def _maybe_triton_hint(err_str_lower: str, device_type: str) -> None:
-    """CC-1: surface the Triton-on-Windows community-wheel pin when a CUDA
-    inductor compile fails for lack of Triton. Must be called from BOTH the
-    torch.compile() WRAP except AND the first-CALL execution except: on the target
-    config (torch 2.10, CUDA, no Triton) the wrap succeeds and TritonMissing only
-    surfaces at first invocation, so a hint living only at the wrap is dead code."""
-    if device_type == "cuda" and "triton" in err_str_lower:
-        _tv = torch.__version__.split("+")[0]
-        _pin = '"triton-windows<3.7"' if _tv.startswith("2.10") else "triton-windows"
-        _show_once(
-            "triton_hint",
-            f"[TEX] CUDA torch.compile needs Triton. On Windows install the "
-            f"community wheel matched to torch {_tv}:  pip install {_pin}  "
-            f"(enable the Windows LongPathsEnabled registry key too). Falling "
-            f"back to CUDA-graph / interpreter for now.",
-            level="warning",
-        )
-
-
-def _ensure_inductor_cache_dir() -> None:
-    """Point TorchInductor's on-disk cache at TEX's owned cache dir.
-
-    `torch._inductor.config.cache_dir` does NOT exist on torch 2.10 — assigning
-    it raises AttributeError, so the previous wiring silently left inductor
-    writing to %TEMP% (lost to cleanup, invisible to clear_all). The supported,
-    dynamically-read control is the TORCHINDUCTOR_CACHE_DIR env var; a pre-set
-    value (ours from an earlier call, or a user/ComfyUI override) is respected,
-    which also makes this idempotent.
-    """
-    if "TORCHINDUCTOR_CACHE_DIR" in os.environ:
-        return
-    try:
-        from ..tex_cache import get_cache, codegen_epoch
-        # Version the dir by the CACHE-4 codegen epoch + torch build so a codegen or torch upgrade
-        # starts from a clean inductor/dynamo store (PC-2). The codegen epoch nests the AST epoch,
-        # so an AST-file edit bumps it too — as it must, since emitted code changes when the AST
-        # does. The parent torch_compile/ is still what clear_all() removes.
-        ver = f"{codegen_epoch()}_{torch.__version__.split('+')[0].replace('.', '')}"
-        parent = get_cache().torch_compile_cache_dir
-        tc_dir = str(parent / ver)
-        os.makedirs(tc_dir, exist_ok=True)
-        # PC-1: a TEX or torch upgrade mints a new {ver} subdir; the old one
-        # (30–60 MB/program of inductor artifacts) would otherwise accumulate
-        # forever. Sweep sibling version dirs that don't match the current tag.
-        # Runs once per process (the env guard above makes this idempotent).
-        try:
-            import shutil
-            for child in parent.iterdir():
-                if child.is_dir() and child.name != ver:
-                    shutil.rmtree(child, ignore_errors=True)
-        except Exception:
-            pass
-        # cl.exe fails with C1083 (and torch.compile can escalate to an uncaught
-        # AssertionError during precompile attach) when the cache path approaches
-        # ~185 chars. Warn on deep installs so the user can enable Windows long
-        # paths (same registry fix triton-windows documents).
-        if os.name == "nt" and len(tc_dir) > 130:
-            _show_once("inductor_cache_longpath",
-                       f"[TEX] torch.compile cache path is {len(tc_dir)} chars deep; if "
-                       "compiles fail with 'fatal error C1083', enable Windows long-path "
-                       "support (LongPathsEnabled registry key).",
-                       level="warning")
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = tc_dir
-    except Exception:
-        pass  # Not critical — torch falls back to its default cache location.
-
-
-_OP_TYPES = (BinOp, UnaryOp, TernaryOp, FunctionCall,
-             VecConstructor, MatConstructor, CastExpr)
-
-
-def _count_tensor_ops(program: Any) -> int:
-    """Count tensor operations in an AST to estimate torch.compile benefit.
-
-    Counts BinOps, FunctionCalls, VecConstructors, TernaryOps, UnaryOps,
-    MatConstructors, and CastExprs — the operations that produce tensor work.
-    Traverses via the shared generic child iterator, so user-function bodies
-    and array/matrix constructs are all covered.
-    """
-    count = 0
-    stack = list(program.statements)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, _OP_TYPES):
-            count += 1
-        stack.extend(_iter_child_nodes(node))
-    return count
-
-
-def _max_loop_depth(program: Any) -> int:
-    """Return the maximum nesting depth of for/while loops in the AST."""
-    def _depth(stmts: list, current: int) -> int:
-        mx = current
-        for s in stmts:
-            if isinstance(s, (ForLoop, WhileLoop)):
-                mx = max(mx, _depth(s.body, current + 1))
-            elif isinstance(s, IfElse):
-                mx = max(mx, _depth(s.then_body, current))
-                if s.else_body:
-                    mx = max(mx, _depth(s.else_body, current))
-        return mx
-    return _depth(program.statements, 0)
-
-
-
-def _select_backend(device_type: str) -> str | None:
-    """
-    Pick the best available torch.compile backend.
-
-    Priority:
-      GPU → inductor > cudagraphs > None
-      CPU → inductor > None
-
-    Backends already marked as failed on this device type are skipped.
-    """
-    candidates = []
-    if device_type == "cuda":
-        candidates = ["inductor", "cudagraphs"]
-    else:
-        candidates = ["inductor"]
-
-    for backend in candidates:
-        if _backend_status.get((backend, device_type)) is not False:
-            return backend
-    return None
-
-
-# ── CC-3: compile_capability() — toolchain probe, never by compiling ──────────
-#
-# `_backend_status` (above) answers "did backend B actually work THIS process" — it is
-# LEARNED, seeded only by a real compile attempt. `compile_capability()` answers the
-# question "auto"'s per-cook routing (`run_auto`, below) needs answered BEFORE it may even
-# try: is inductor's toolchain prerequisite present at all, for CUDA and for CPU
-# independently? It is static and cheap after its first call (see the two probes below),
-# computed ONCE per process and cached, so calling it every cook (as the toolchain-aware
-# "auto" path does) costs nothing after the first call.
-#
-# Deliberately NOT `tex_doctor._inductor_prereq`, which this mirrors: that function is
-# read-only by contract (never calls `_setup_msvc_env`, a <=30s subprocess) because a
-# doctor report must never have a side effect. `compile_capability()` is allowed the ONE
-# one-time cost `_setup_msvc_env` pays (idempotent, memoized by `_msvc_env_initialized`),
-# because its whole point is to convert "unknown" into a definite answer WITHOUT ever
-# entering `_try_compile` — the toolchain-aware "auto" gate (CC-4) has no other way to
-# tell "no compiler" from "haven't looked yet".
-_capability_cache: dict | None = None
-
-
-def _probe_cuda_inductor() -> tuple:
-    """(ok, reason). Static: torch.cuda availability + `find_spec("triton")` — the same
-    fact `_maybe_triton_hint` only ever surfaces AFTER a failed first call, read here
-    before any compile is attempted."""
-    import importlib.util
-    if not torch.cuda.is_available():
-        return False, "CUDA is not available (torch.cuda.is_available() is False)"
-    if importlib.util.find_spec("triton") is None:
-        return False, "Triton is not installed (torch.compile's inductor backend needs it on CUDA)"
-    return True, None
-
-
-def _probe_cpu_inductor() -> tuple:
-    """(ok, reason). Non-Windows: a C compiler on PATH — inductor's own prerequisite,
-    checked without invoking it. Windows: run the codebase's existing vcvarsall search
-    (`_setup_msvc_env`, idempotent) then check PATH for `cl.exe`. `_setup_msvc_env` is
-    what promotes INCLUDE/LIB/PATH into this process's own environment (or leaves them
-    exactly as a Developer Command Prompt already set them) — a PATH-only check after it
-    reads the definitive POST-search state via `shutil.which` alone, with no environment
-    read of this function's own (PUB-1: a new `os.environ` site in a shipped file moves a
-    pinned ratchet; `shutil.which`'s own internal PATH read is not one)."""
-    if sys.platform != "win32":
-        if shutil.which("cc") or shutil.which("gcc") or shutil.which("clang"):
-            return True, None
-        return False, "no C compiler (cc/gcc/clang) found on PATH"
-    _setup_msvc_env()
-    if shutil.which("cl") is not None:
-        return True, None
-    return False, ("no MSVC (cl.exe) found on PATH after the vcvarsall search (this "
-                   "process already ran it and found nothing)")
-
-
-def compile_capability() -> dict:
-    """Read-only, process-wide capability report for torch.compile's inductor backend —
-    the answer "auto" (`run_auto`, below) needs BEFORE deciding whether to even attempt a
-    background compile. Probed ONCE per process (cached; see
-    `_reset_capability_cache_for_test`) by `importlib.util.find_spec("triton")` (CUDA) and
-    the codebase's existing MSVC search (`_setup_msvc_env`, CPU on Windows) / a PATH check
-    (CPU elsewhere) — never by compiling, so calling this can never pay a failed-compile tax.
-
-    Returns::
-
-        {"cuda_inductor": bool, "cpu_inductor": bool,
-         "reason": {"<key>": str}}   # a "reason" entry exists only for a False key
-
-    A `True` reading means the PREREQUISITE holds, not that a compile will succeed or win a
-    trial — `_backend_status` (measured, this process) and autotier's own verdict (measured,
-    per program) can still say no afterward. This function only removes the one failure mode
-    that otherwise costs a real compile attempt to discover: no toolchain at all."""
-    global _capability_cache
-    if _capability_cache is None:
-        cuda_ok, cuda_why = _probe_cuda_inductor()
-        cpu_ok, cpu_why = _probe_cpu_inductor()
-        reason = {}
-        if not cuda_ok:
-            reason["cuda_inductor"] = cuda_why
-        if not cpu_ok:
-            reason["cpu_inductor"] = cpu_why
-        _capability_cache = {"cuda_inductor": cuda_ok, "cpu_inductor": cpu_ok, "reason": reason}
-    return {"cuda_inductor": _capability_cache["cuda_inductor"],
-            "cpu_inductor": _capability_cache["cpu_inductor"],
-            "reason": dict(_capability_cache["reason"])}
-
-
-def _reset_capability_cache_for_test() -> None:
-    """Test hook: forget the memoized probe so a test can force a re-probe under a
-    monkeypatched environment. Mirrors autotier's own `_reset_for_test` shape."""
-    global _capability_cache
-    _capability_cache = None
+# SPLIT-47 (TRK-210): `_show_once` / `_maybe_triton_hint` / `_ensure_inductor_cache_dir`
+# moved to `compiled_exec_support.py`; `_count_tensor_ops` / `_max_loop_depth` /
+# `_select_backend` / `compile_capability` / `_probe_cuda_inductor` / `_probe_cpu_inductor` /
+# `_reset_capability_cache_for_test` (and `_OP_TYPES`/`_capability_cache`) moved to
+# `compiled_capability.py`. All are re-exported above.
 
 
 # ── Public API ────────────────────────────────────────────────────────
@@ -943,118 +735,10 @@ def execute_compiled(
 _bg_futures: dict = {}
 
 
-def _timed(fn, device_type: str):
-    """Run fn() and return (result, elapsed_ms). CUDA uses an event pair whose
-    end is synchronized (only that event, at the cook boundary — not a device
-    barrier); CPU uses perf_counter. The synchronous form — used where the caller
-    must have the ms THIS cook: the TRIAL cook (its ms decides commit/reject) and the
-    one-shot verify window. Only the FREQUENT MEASURING path uses _timed_deferred."""
-    import time as _time
-    if device_type == "cuda":
-        try:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-        except Exception:
-            start = None
-        if start is not None:
-            # fn() runs EXACTLY once: after it has run, a timing-readback failure
-            # falls back to the wall-clock captured at t0 rather than re-invoking the
-            # (side-effecting codegen) fn — the earlier "except -> fall through -> fn()
-            # again" shape double-executed it.
-            t0 = _time.perf_counter()
-            start.record()
-            out = fn()
-            end.record()
-            try:
-                end.synchronize()
-                return out, start.elapsed_time(end)
-            except Exception:
-                return out, (_time.perf_counter() - t0) * 1000.0
-    t0 = _time.perf_counter()
-    out = fn()
-    return out, (_time.perf_counter() - t0) * 1000.0
-
-
-# LAT-3: deferred CUDA-event readback. A per-cook `end.synchronize()` (as _timed
-# does) stalls the CPU on the GPU at EVERY measured cook — fine for a batch ComfyUI
-# render, hostile to an interactive viewport that re-enters MEASURING on each code
-# edit. The deferred form records this cook's event pair and reads back the PRIOR
-# cook's pair only if it is ALREADY complete (a non-blocking end.query()), so the
-# sync never lands on the interactive path. Median-based verdicts (autotier's deque)
-# tolerate the resulting stale-by-one / occasionally-skipped samples. Invariant #6
-# holds: a reading is still taken only after its event pair completes — deferral
-# changes WHEN the read happens, never WHETHER it is fenced.
-_deferred_ev: "_OrderedDict[Any, tuple]" = _OrderedDict()
-_DEFERRED_EV_MAX = 256
-
-
-def _timed_deferred(fn, device_type: str, slot):
-    """Run fn(), return (result, ms_or_None). ms is the prior same-slot cook's
-    elapsed time if its end event has completed (no sync), else None (skip this
-    sample). CPU path stays synchronous perf_counter (no GPU sync to avoid)."""
-    import time as _time
-    if device_type == "cuda":
-        try:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-        except Exception:
-            start = None
-        if start is not None:
-            start.record()
-            out = fn()                     # runs EXACTLY once (see _timed)
-            try:
-                end.record()
-                # Store THIS cook's pair BEFORE reading the prior one: if the
-                # readback below raises on a stale/invalidated prior pair, the fresh
-                # pair has already replaced it, so the slot self-heals next cook
-                # instead of re-reading the dead pair forever.
-                prev = _deferred_ev.get(slot)
-                _deferred_ev[slot] = (start, end)
-                _deferred_ev.move_to_end(slot)
-                while len(_deferred_ev) > _DEFERRED_EV_MAX:
-                    _deferred_ev.popitem(last=False)
-                ms = None
-                if prev is not None and prev[1].query():   # prior end done → free read
-                    ms = prev[0].elapsed_time(prev[1])
-                return out, ms
-            except Exception:
-                return out, None           # fn ran; deferral failed → skip the sample
-    t0 = _time.perf_counter()
-    out = fn()
-    return out, (_time.perf_counter() - t0) * 1000.0
-
-
-def _contiguous_bindings(bindings: dict, device: "torch.device | None" = None) -> dict:
-    """Normalize tensor bindings for the codegen path.
-
-    * Make non-contiguous tensors contiguous (inductor/codegen can fail on BHWC
-      stride patterns).
-    * M-5-INT: cast an anomalous INTEGER image-like tensor (dim>=3) to fp32. A
-      wired int tensor binding (e.g. torch.ones(1,H,W,3,dtype=long)) builds an int
-      fresh temp, and the M-5 `out=` reuse then emits torch.mul(int, fp32, out=int)
-      → "result type Float can't be cast to Long", silently dropping codegen to
-      the interpreter. Its TEX type is float (shape→VECn) and the output marshals
-      to fp32 regardless — at zero hot-path cost (a one-time ingestion cast, vs a
-      per-op runtime dtype branch on the dominant color-grade reuse pattern). The
-      interpreter applies the SAME cast (interpreter.py binding loop) so the two
-      tiers converge even for FLOAT/LATENT outputs and int64 values > 2^24. Scalar
-      int params and int index arrays (dim<3) are left intact.
-    * XPU co-location (when `device` is given): a binding on another device is
-      moved to the compute device here — fused with the M-5 cast when both apply.
-      Codegen assumes bindings sit on `_dev`; without this, a forced cross-device
-      cook raised at the first mixed op and burned a codegen attempt before the
-      interpreter fallback did the same move anyway. Same-device inputs are
-      untouched (the `!=` guard), so chained same-device nodes stay zero-copy.
-
-    Non-tensors pass through by reference.
-    """
-    from ..tex_marshalling import to_fp32_if_int_image
-    def _norm(v):
-        if not isinstance(v, torch.Tensor):
-            return v
-        v = to_fp32_if_int_image(v, device=device)   # M5-INT + co-location: single source
-        return v if v.is_contiguous() else v.contiguous()
-    return {k: _norm(v) for k, v in bindings.items()}
+# SPLIT-47 (TRK-210): `_timed` / `_timed_deferred` (+ `_deferred_ev`/`_DEFERRED_EV_MAX`) /
+# `_contiguous_bindings` moved to `compiled_exec_support.py` and are re-exported above.
+# `_params_on_device` stays here — its exact body is a mutation-check anchor
+# (`tests/mutation_check.py`) pinned to this file.
 
 
 def _params_on_device(cg_fn, program, bindings: dict, device: "torch.device") -> dict:
@@ -1135,57 +819,8 @@ def _codegen_with_params_on_device(cg_fn, program, bindings: dict, dev, latent_c
     return retry_bindings, ingest_event
 
 
-# C3 (v0.46 Phase C, R3#1 + B1#3): warm_call clones every binding at full resolution —
-# hundreds of MB at 4K — invisible to `_cuda_headroom_ok`, which ran BEFORE the clone and
-# checked only a flat 2 GB. A hard cap on top of folding the clone into the check below:
-# above this size the warm is skipped (the artifact still commits via an ordinary TRIAL).
-_WARM_CLONE_CAP_BYTES = 512 * 1024 * 1024  # 512 MB
-
-
-def _bindings_nbytes(bindings) -> int:
-    """Total byte size of every tensor binding — the projected cost of cloning ALL of
-    them at full resolution (C3), which is what `run_auto`'s warm path does."""
-    total = 0
-    for v in bindings.values():
-        if isinstance(v, torch.Tensor):
-            total += v.element_size() * v.nelement()
-    return total
-
-
-def _cuda_headroom_ok(device, extra_bytes: int = 0) -> bool:
-    """Only submit a background CUDA compile with comfortable VRAM headroom, so
-    a compile never allocates while another node's inference needs the memory.
-    HW-2 (audit): query the COOK's device index, not a bare "cuda" (device 0) —
-    a cuda:1 cook mis-reads GPU 0's headroom otherwise. Single-GPU unaffected.
-
-    `extra_bytes` (C3, default 0): a projected allocation about to be made (warm_call's
-    binding clone) that headroom must also cover."""
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
-    if dev.type != "cuda":
-        return True
-    idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    need = 2 * 1024 * 1024 * 1024 + max(0, extra_bytes)  # >2 GB, plus any projected clone
-    try:
-        from .host import get_host_services  # PORT-1 seam
-        free = get_host_services().get_free_memory(torch.device("cuda", idx))
-        if free is None:
-            raise RuntimeError("no host free-memory query")
-        return free > need
-    except Exception:
-        try:
-            with torch.cuda.device(idx):
-                free, _total = torch.cuda.mem_get_info()
-            return free > need
-        except Exception:
-            return True
-
-
-def _capture_in_flight() -> bool:
-    try:
-        from .graphed import is_capturing
-        return is_capturing()
-    except Exception:
-        return False
+# SPLIT-47 (TRK-210): `_WARM_CLONE_CAP_BYTES` / `_bindings_nbytes` / `_cuda_headroom_ok` /
+# `_capture_in_flight` moved to `compiled_exec_support.py` and are re-exported above.
 
 
 def _submit_bg_compile(cache_key, program, type_map, device_type,

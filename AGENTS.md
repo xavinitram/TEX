@@ -230,6 +230,17 @@ involved this time): the static-program-analysis leaf (`_collect_binding_reads`/
 SPLIT-E used), so no call site or external `from .interpreter import NAME` changed. `_consensus_extent`
 and `vec_list_to_tensor` stayed in `interpreter.py` for the same mutation-anchor reason as above.
 
+`tex_runtime/compiled.py` (~1635, back under the 2000-line hard budget it had also reached) took its own
+SPLIT-47 (TRK-210) split the same way: the toolchain-capability probe (`compile_capability`/
+`_select_backend`/the op-count-and-loop-depth routing gate) moved to `compiled_capability.py`, and the
+per-cook execution support (the timing wrappers, binding preparation, one-time diagnostics) moved to
+`compiled_exec_support.py` — both re-exported at `compiled.py`'s own top level, so `compiled.NAME` and
+every external `from .compiled import NAME` (`graphed.py`, `noise.py`, the benchmarks) kept resolving
+unchanged. `_params_on_device` stayed in `compiled.py` for the same mutation-anchor reason as above; so did
+`_setup_msvc_env`/`_msvc_env_initialized` — the latter is read directly by
+`tests/test_v018_ux.py` as `compiled._msvc_env_initialized` for change detection, so moving the flag
+without moving the reader would have made that check silently decorative.
+
 ## The registry archive (PUB-1 — the archive is the product)
 
 `comfy node publish` uploads `git ls-files` minus the root `.comfyignore`, and the Comfy registry

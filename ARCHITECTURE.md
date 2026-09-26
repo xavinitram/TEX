@@ -290,9 +290,9 @@ required-binding set; shared by `check_lazy_status` and `execute()`). #15 is
 `tex_engine._AUTO_DECISION` (v0.22 ENG-1 re-homed it from `tex_node`; fingerprint ×
 resolution-bucket × device → the `precision="auto"`
 fp16/fp32 gate decision — the *decision*, not the per-cook finiteness verdict; bounded LRU,
-cleared at 512 entries). #16 (v0.21 LAT-3) is `compiled._deferred_ev` (slot →
+cleared at 512 entries). #16 (v0.21 LAT-3) is `compiled_exec_support._deferred_ev` (slot →
 pending CUDA event pair for the deferred timing readback; bounded, cleared with the
-compiled cache). #17 (v0.21 ENG-8) is `xfer._MODEL` (transfer-lane → fitted
+compiled cache; SPLIT-47 moved it out of `compiled.py` alongside `_timed`/`_timed_deferred`). #17 (v0.21 ENG-8) is `xfer._MODEL` (transfer-lane → fitted
 latency+bandwidth; persisted to `xfer.json`, versioned by device+torch). #18 (v0.24
 ROI-2) is `tex_roi._walk_memo` (code-hash × fp32 param bits → the spatial footprint walk
 `(reads, blocked, halo)`; shared by `binding_footprints`/`roi_plan`, keyed exactly like
@@ -350,7 +350,7 @@ Bounds below are entry counts, and every store is process-lifetime unless stated
 | `compiled._route_memo` | fingerprint | the route facts from the two full AST walks (`has_spatial` is deliberately NOT here: it depends on binding values); 256 |
 | `compiled._stencil_route_memo` | fingerprint | the UC-2 stencil-route verdict |
 | `compiled._cancel_codegen_memo` | fingerprint | CANCEL-44's cancel-aware codegen variant (a poll emitted between top-level statements) or `_CANCEL_CG_UNSUPPORTED`; deliberately separate from PC-3's disk-persisted, fingerprint-only `tex_cache` codegen store, whose on-disk filename has no room for a second axis; 256 |
-| `compiled._deferred_ev` | slot | the LAT-3 pending CUDA event pair for the deferred timing readback; cleared with the compiled cache |
+| `compiled_exec_support._deferred_ev` | slot | the LAT-3 pending CUDA event pair for the deferred timing readback; cleared with the compiled cache (SPLIT-47 moved this out of `compiled.py`; re-exported as `compiled._deferred_ev`) |
 | `compiled._ENV_TENSOR_CACHE` | constant-env tensor identity | the per-cook constant tensors, registered in `graphed._build_keepalive` so MEM-1 holds; 256 |
 | `graphed._graph_cache` | fingerprint-signature | `GraphedProgram`; LRU, bytes-aware, pin-and-skip on eviction |
 | `graphed._blacklist` | signature | captures that failed; never retried this session |

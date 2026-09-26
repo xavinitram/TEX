@@ -60,9 +60,15 @@ from helpers import run_python_kv   # G7/R1#4: the shared fresh-subprocess KV he
 # at module scope, so `tex_engine`'s cold-import closure reaches them the same way it already
 # reached `interpreter.py`): `interpreter_analysis.py` (static-program-analysis leaf) and
 # `interpreter_values.py` (shared tensor-value helpers). +1 per new module, nothing else moved.
+#
+# 52 -> 54, SPLIT-47 (TRK-210) part 2: `compiled.py` was also at the 2000-line hard budget.
+# Two more new eagerly-imported leaf modules were split out of it, the same way: the
+# toolchain-capability probe (`compiled_capability.py`) and the per-cook execution support —
+# timing wrappers, binding preparation, one-time diagnostics (`compiled_exec_support.py`).
+# +1 per new module, nothing else moved.
 _BARE_TOUCH_TEX_MODULES_MAX = 1
 _BARE_TOUCH_TORCH_MODULES = 0
-_TEX_ENGINE_TEX_MODULES_MAX = 52
+_TEX_ENGINE_TEX_MODULES_MAX = 54
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:

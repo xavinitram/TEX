@@ -288,7 +288,8 @@ _NOT_A_CACHE = {
     "graphed._keepalive": "MEM-1 strong references that keep a captured graph's baked "
                           "addresses alive; an unkeyed liveness anchor",
     "graphed._last_capture_error": "a one-slot diagnostics box holding the last capture error",
-    "compiled._warnings_shown": "one-shot log de-duplication set (message text only)",
+    "compiled_exec_support._warnings_shown": "one-shot log de-duplication set (message text "
+                                             "only); SPLIT-47 moved this out of `compiled.py`",
     "compiled._bg_futures": "in-flight background-compile futures, owned by the single "
                             "max_workers=1 worker and drained, not looked up",
     # ── Observability: bounded rings and accumulators of MEASUREMENTS. ──
