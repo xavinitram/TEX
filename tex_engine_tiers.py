@@ -390,6 +390,30 @@ _TIER_METHOD = {
 def _run_tier(ctx, tier_id):
     """Dispatch a cook to the selected tier strategy and normalize its result to an
     output dict. Single home for the `tier method -> {name: tensor}` idiom used by
-    both run() and the C2 re-cook path (reuse review)."""
+    both run() and the C2 re-cook path (reuse review).
+
+    SCALE-47b: a scale-active cook (`ctx.scale is not None`) is routed to the plain
+    interpreter UNCONDITIONALLY, ahead of `tier_id` — bypassing every accelerated route
+    (`torch_compile`/`auto`/`cuda_graph`) AND the "default" tier's OWN internal codegen/
+    stencil/tiling shortcuts (`_run_default`'s UC-2 stencil route, M-4 tiling, ROI-5 halo
+    tiling). None of those currently thread a runtime scale multiplier through their emitted
+    or captured code, so teaching each one to decline individually would be the same
+    decision made N times; one guard here, at the single dispatch choke point, makes it
+    impossible for any of them to run instead. Recorded via `tier_trace`, exactly like every
+    other tier decline, so this is never a silent fallback (`tier_trace.last().tier ==
+    "interpreter"`, reason names scale). `ctx.scale is None` (every ComfyUI cook) never
+    reaches this branch at all — one `is not None` check, no behaviour change."""
+    if ctx.scale is not None:
+        from .tex_runtime import tier_trace
+        tier_trace.record("interpreter", fallback_from=tier_id,
+                          reason="scale is active (SCALE-47b runs on the interpreter tier only)")
+        interp = _tex_engine._get_interpreter()
+        out = interp.execute(ctx.program, ctx.bindings, ctx.type_map, device=ctx.device,
+                             source=("" if ctx.fused_chain else ctx.code),
+                             latent_channel_count=ctx.latent_channel_count,
+                             output_names=ctx.output_names, used_builtins=ctx.used_builtins,
+                             precision=ctx.eff_precision, time_context=ctx.time_context,
+                             cancel=ctx.cancel, on_progress=ctx.on_progress, scale=ctx.scale)
+        return out if isinstance(out, dict) else {ctx.output_names[0]: out}
     out = _TIER_METHOD[tier_id](ctx)
     return out if isinstance(out, dict) else {ctx.output_names[0]: out}

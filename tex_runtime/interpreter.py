@@ -279,6 +279,7 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         cancel=None,
         on_progress=None,
         _masked_flow: bool | None = None,
+        scale: float | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """
         Execute a TEX program.
@@ -335,7 +336,7 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                                        tile=tile, roi=roi, batch_slice=batch_slice,
                                        time_context=time_context,
                                        cancel=cancel, on_progress=on_progress,
-                                       _masked_flow=_masked_flow)
+                                       _masked_flow=_masked_flow, scale=scale)
 
 
 
@@ -367,6 +368,7 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         cancel=None,
         on_progress=None,
         _masked_flow: bool | None = None,
+        scale: float | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         # Canonicalize an index-less "cuda" so cache keys ("cuda" vs "cuda:0")
@@ -379,6 +381,11 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
         self.latent_channel_count = latent_channel_count
         self._dtype = self._PRECISION_DTYPES.get(precision, torch.float32)
         self.time_context = time_context   # ENG-7: host playhead for THIS cook (or None)
+        # SCALE-47b: the per-cook resolution-scale multiplier, or None (the default — untouched,
+        # zero cost). Set unconditionally every run, exactly like `time_context`/`cancel` above —
+        # the interpreter is a per-thread REUSED singleton, so a value left on `self` from a
+        # PRIOR cook would silently leak into this one.
+        self._scale = scale
         # SCHED-3: bind the cook's cancel token + progress callback for THIS execute. Set
         # unconditionally every run (the interpreter is a per-thread REUSED singleton — a
         # token left on self would abort a later, unrelated cook). Pure values, never keyed.
@@ -1131,6 +1138,37 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
             a0 = self._eval(node_args[0]); a1 = self._eval(node_args[1]); a2 = self._eval(node_args[2])
         else:
             arglist = [self._eval(arg) for arg in node_args]
+
+        # SCALE-47b: multiply every `pixel_args=`-tagged argument by the cook's resolution
+        # scale, as a RUNTIME VALUE at the call site (never an AST fold — see
+        # `stdlib_registry.StdlibEntry.pixel_args`'s docstring for why). `self._scale is None`
+        # (every ComfyUI cook, and every cook that never passes scale=) costs exactly one
+        # attribute read and one `is not None` check here: no import, no dict lookup, no
+        # multiply — invariant #7's "not even a *1.0" bar.
+        if self._scale is not None:
+            from .stdlib_registry import pixel_args_by_name
+            _pa = pixel_args_by_name().get(node.name)
+            if _pa:
+                _s = self._scale
+                if nargs == 1:
+                    if 0 in _pa:
+                        a0 = a0 * _s
+                elif nargs == 2:
+                    if 0 in _pa:
+                        a0 = a0 * _s
+                    if 1 in _pa:
+                        a1 = a1 * _s
+                elif nargs == 3:
+                    if 0 in _pa:
+                        a0 = a0 * _s
+                    if 1 in _pa:
+                        a1 = a1 * _s
+                    if 2 in _pa:
+                        a2 = a2 * _s
+                else:
+                    for _i in _pa:
+                        if _i < len(arglist):
+                            arglist[_i] = arglist[_i] * _s
         try:
             if nargs == 1:
                 result = fn(a0)
