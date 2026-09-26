@@ -35,6 +35,11 @@ request — no host or vendor named):
                              device time at every stride) or leaks into the correctness
                              bound (drained p95 growing with stride) on a given box. Run
                              with `--sweep`.
+  6. `interactive_supersede_sweep` -- PACE-47: the host's own acceptance shape verbatim --
+                             a small/interactive cook superseded a FIXED delay (default
+                             100ms) into its own run, not a random fraction of it -- submit
+                             -> drained p50/p95, per depth x stride. Run with `--sweep
+                             --sweep-interactive`.
 
 Measurement rules this file follows (docs/brief-conventions.md): a fresh CUDA cache
 directory per run (set `TEX_CACHE_DIR` before invoking), the first leg of any A/B always
@@ -112,10 +117,12 @@ class _UnpacedToken:
 
 class _TripToken:
     """Trips from a background timer thread, at `delay_s` -- the shape a real interrupt
-    arrives in, asynchronously, mid-cook."""
-    def __init__(self, delay_s, depth):
+    arrives in, asynchronously, mid-cook. `stride_ms=None` uses the module default."""
+    def __init__(self, delay_s, depth, stride_ms=None):
         self.pace = True
         self.pace_depth = depth
+        if stride_ms is not None:
+            self.pace_stride_ms = stride_ms
         self._tripped = threading.Event()
         self._timer = threading.Timer(delay_s, self._tripped.set)
         self._timer.daemon = True
@@ -495,6 +502,75 @@ def stride_depth_sweep(shape_names, depths, strides_ms, cost_trials, drain_trial
     return out
 
 
+# ── Experiment 6 (PACE-47): an interactive-shaped path -- a cook superseded ──────
+# ── by the next one a FIXED delay in, not a fraction of its own runtime ──────────
+#
+# The host's own acceptance criterion, verbatim: "a small cook superseded 100 ms in by
+# the next one: submit -> drained p95", since the host paces every cancellable cook, not
+# only long background renders. Unlike Experiments 2/5 (a trip at a random FRACTION of
+# the shape's own full runtime), this fixes the trip at an absolute wall-clock delay --
+# the shape a real edit-supersedes-edit interaction has (the second edit doesn't wait for
+# any particular fraction of the first to elapse, it lands at a roughly fixed latency
+# after the user's own action).
+
+def sweep_interactive_supersede(shape_name, depth, stride_ms, trials, delay_s, seed0=30000):
+    shapes = _sweep_shapes()
+    shp = shapes[shape_name]
+    code, size = shp["code"], shp["size"]
+    returns_ms, drained_ms = [], []
+    for i in range(trials):
+        tok = _TripToken(delay_s, depth, stride_ms)
+        bg_seed = seed0 + i
+        bg_done = threading.Event()
+
+        def _bg():
+            try:
+                tex_engine.cook(code, _sized_bindings(size, bg_seed), device_mode="cuda", cancel=tok)
+            except CookCancelled:
+                pass
+            finally:
+                bg_done.set()
+
+        th = threading.Thread(target=_bg)
+        th.start()
+        tok._tripped.wait(timeout=delay_s + 5)
+
+        t0 = time.perf_counter()
+        res = tex_engine.cook(_INTERACTIVE, _interactive_bindings(bg_seed), device_mode="cuda")
+        t1 = time.perf_counter()
+        if res.done is not None:
+            res.done.synchronize()
+        t2 = time.perf_counter()
+
+        returns_ms.append((t1 - t0) * 1000)
+        drained_ms.append((t2 - t0) * 1000)
+        th.join(timeout=delay_s + 5)
+        torch.cuda.synchronize()
+
+    return {
+        "return_p50_ms": _p(returns_ms, 0.50), "return_p95_ms": _p(returns_ms, 0.95),
+        "drained_p50_ms": _p(drained_ms, 0.50), "drained_p95_ms": _p(drained_ms, 0.95),
+    }
+
+
+def interactive_supersede_sweep(shape_name, depths, strides_ms, trials, delay_s, verbose=True):
+    out = {"shape": shape_name, "delay_ms": delay_s * 1000, "depths": depths,
+           "strides_ms": strides_ms, "cells": {}}
+    if verbose:
+        print(f"\n=== Experiment 6: interactive-shaped supersede ({shape_name}, "
+              f"delay={delay_s * 1000:.0f}ms, {trials} trials/cell) ===")
+    for depth in depths:
+        for stride_ms in strides_ms:
+            cell_key = f"depth{depth}_stride{stride_ms}"
+            row = sweep_interactive_supersede(shape_name, depth, stride_ms, trials, delay_s)
+            if verbose:
+                print(f"  depth={depth} stride={stride_ms:>4}ms  "
+                      f"return p50={row['return_p50_ms']:7.3f}ms p95={row['return_p95_ms']:7.3f}ms  "
+                      f"drained p50={row['drained_p50_ms']:7.3f}ms p95={row['drained_p95_ms']:7.3f}ms")
+            out["cells"][cell_key] = {"depth": depth, "stride_ms": stride_ms, **row}
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--depths", type=str, default="1,2,3,4,8")
@@ -511,6 +587,12 @@ def main():
     ap.add_argument("--sweep-strides-ms", type=str, default=_SWEEP_STRIDES_MS_DEFAULT)
     ap.add_argument("--sweep-cost-trials", type=int, default=30)
     ap.add_argument("--sweep-drain-trials", type=int, default=40)
+    ap.add_argument("--sweep-interactive", action="store_true",
+                     help="PACE-47: also run Experiment 6, an interactive-shaped cook "
+                          "superseded a fixed delay in (the host's own acceptance shape).")
+    ap.add_argument("--interactive-shape", type=str, default="medium")
+    ap.add_argument("--interactive-delay-ms", type=float, default=100.0)
+    ap.add_argument("--interactive-trials", type=int, default=40)
     a = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -528,8 +610,15 @@ def main():
               f"shapes={shape_names} depths={depths} strides_ms={strides_ms} ===")
         r5 = stride_depth_sweep(shape_names, depths, strides_ms,
                                  a.sweep_cost_trials, a.sweep_drain_trials)
+        r6 = None
+        if a.sweep_interactive:
+            r6 = interactive_supersede_sweep(a.interactive_shape, depths, strides_ms,
+                                              a.interactive_trials,
+                                              a.interactive_delay_ms / 1000.0)
         if a.save:
             out = {"box": box, **r5}
+            if r6 is not None:
+                out["interactive_supersede"] = r6
             path = a.save if os.path.isabs(a.save) else \
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), a.save)
             os.makedirs(os.path.dirname(path), exist_ok=True)
