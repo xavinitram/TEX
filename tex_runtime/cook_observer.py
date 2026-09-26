@@ -108,12 +108,21 @@ def _dispatch(entry: str) -> None:
         except Exception as exc:                     # a callback's bug is never the cook's
             if not _warned:
                 _warned = True
-                warnings.warn(
-                    f"TEX: a cook_observer callback raised ({type(exc).__name__}: {exc}); "
-                    "ignoring it for the rest of this process (the cook that triggered it "
-                    "is unaffected). Reported once per process, not once per callback or "
-                    "per cook.",
-                    RuntimeWarning, stacklevel=3)
+                # O1 (v0.46, FIX-OBSROUTE): `warnings.warn` itself RAISES under
+                # warnings-as-errors (`-W error`, `simplefilter("error")`, strict pytest) —
+                # a misbehaving callback would then take down the cook that was calling
+                # `enter()`, which is exactly the outcome this whole catch exists to prevent.
+                # The report is best-effort like the callback dispatch it is reporting on:
+                # swallow whatever raising it produces, one report per process.
+                try:
+                    warnings.warn(
+                        f"TEX: a cook_observer callback raised "
+                        f"({type(exc).__name__}: {exc}); ignoring it for the rest of this "
+                        "process (the cook that triggered it is unaffected). Reported once "
+                        "per process, not once per callback or per cook.",
+                        RuntimeWarning, stacklevel=3)
+                except Exception:
+                    pass
 
 
 def enter(entry: str) -> None:
@@ -123,13 +132,62 @@ def enter(entry: str) -> None:
     when nothing is registered). Notifies every registered callback with `entry` ONLY when
     this is the outermost call among the six on the current thread; a nested call
     increments the depth counter and returns without dispatching. Always pair with `leave()`
-    in a `finally`, so an exception out of the cook body still balances the depth."""
-    depth = getattr(_local, "depth", 0)
-    if depth == 0:
+    in a `finally`, so an exception out of the cook body still balances the depth.
+
+    O2 (v0.46, FIX-OBSROUTE): depth is incremented BEFORE dispatch, not after. A callback
+    that itself triggers a cook on the SAME thread (a reentrant observer) must see depth
+    already at 1 when its own nested `enter()` runs — otherwise the nested call reads the
+    still-zero depth `_dispatch` was called under and notifies a second time for what the
+    host's count-once contract considers one cook."""
+    depth = getattr(_local, "depth", 0) + 1
+    _local.depth = depth
+    if depth == 1:
         _dispatch(entry)
-    _local.depth = depth + 1
 
 
 def leave() -> None:
     """Pair every guarded `enter()` call, unconditionally, in a `finally`."""
     _local.depth -= 1
+
+
+class _Scope:
+    """The object `scope()` returns — see `scope()` for the contract. Not constructed
+    directly."""
+    __slots__ = ("_entry", "_active")
+
+    def __init__(self, entry: str) -> None:
+        self._entry = entry
+        self._active = False
+
+    def __enter__(self) -> "_Scope":
+        # O3: ONE snapshot of "is anything registered?" per outermost call, taken here
+        # rather than re-read by `__exit__` — the same race B4#3 named for the 6
+        # copy-pasted blocks (a register/unregister landing between a block's own enter
+        # guard and its leave guard) is closed the same way each of them closed it: read
+        # `_callbacks` once, act on that one answer for the whole scope.
+        self._active = bool(_callbacks)
+        if self._active:
+            enter(self._entry)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._active:
+            leave()
+        return False
+
+
+def scope(entry: str) -> "_Scope":
+    """A context manager replacing the 6 copy-pasted
+    `_obs_active = bool(_callbacks); if _obs_active: enter(name)` / `finally: if _obs_active:
+    leave()` blocks at `tex_engine.run`/`cook`, `tex_chain.cook_stage_list`/
+    `cook_fused_cached`/`boundary_lineage_key` and `tex_checkpoint.cook_checkpointed`:
+
+        with cook_observer.scope("run"):
+            ...cook body...
+
+    Same zero-added-notification-when-unregistered contract as the hand-rolled blocks
+    (`__enter__` reads `_callbacks` once and skips `enter()` entirely when it is empty), and
+    the same `enter()`-never-raises guarantee (O1) means `__enter__` cannot leave `_active`
+    set without having actually entered, so `__exit__`'s `leave()` always pairs correctly
+    even if a callback misbehaves."""
+    return _Scope(entry)

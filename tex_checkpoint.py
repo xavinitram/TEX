@@ -260,15 +260,12 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
     `cuts` may be supplied by a caller that already planned; otherwise placement runs here off
     PROF-1. Returns the interpreter's raw `{output: tensor}`, same as `cook_stage_list`.
     """
-    # OBSERVER-46: notify once for THIS entry point; every internal call below — `_full()`'s
-    # and the per-cut `tex_engine.cook_stage_list`/`tex_engine.boundary_lineage_key` calls
-    # (module lookups that reach the SAME underlying functions the observer already wraps at
-    # their own definitions) — shares this one notification rather than adding its own. See
-    # tex_runtime/cook_observer.py.
-    _obs_active = bool(_cook_observer._callbacks)
-    if _obs_active:
-        _cook_observer.enter("cook_checkpointed")
-    try:
+    # OBSERVER-46/O3: notify once for THIS entry point; every internal call below —
+    # `_full()`'s and the per-cut `tex_engine.cook_stage_list`/`tex_engine.boundary_lineage_key`
+    # calls (module lookups that reach the SAME underlying functions the observer already
+    # wraps at their own definitions) — shares this one notification rather than adding its
+    # own. See tex_runtime/cook_observer.py.
+    with _cook_observer.scope("cook_checkpointed"):
         from . import tex_engine
 
         def _full():
@@ -321,9 +318,6 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
                 out.setdefault(f"_tap_s{k - 1}", boundary)
             return out
         return _full()
-    finally:
-        if _obs_active:
-            _cook_observer.leave()
 
 
 # ── phase 2: the idle harvest ────────────────────────────────────────────────

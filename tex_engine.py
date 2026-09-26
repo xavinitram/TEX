@@ -1039,15 +1039,13 @@ def run(plan: CookPlan) -> CookResult:
     the debug overlays, enforce the cache budgets. Returns RAW outputs (no host egress
     formatting — that is ENG-3's profile, applied by the caller)."""
     ctx = plan.ctx
-    # OBSERVER-46: notify the cook-observer seam once for this entry point — `enter`/`leave`
-    # collapse to the outermost call on this thread (see tex_runtime/cook_observer.py), so a
-    # call arriving here via `cook()` (below) shares that single notification rather than
-    # adding a second one. `_obs_active` is read ONCE so the matching `leave()` fires iff the
-    # `enter()` did, even if a callback un/registers mid-cook.
-    _obs_active = bool(_cook_observer._callbacks)
-    if _obs_active:
-        _cook_observer.enter("run")
-    try:
+    # OBSERVER-46/O3 (v0.46): notify the cook-observer seam once for this entry point —
+    # `scope()` collapses to the outermost call on this thread (see
+    # tex_runtime/cook_observer.py), so a call arriving here via `cook()` (below) shares
+    # that single notification rather than adding a second one. `scope()` takes its own
+    # "is anything registered?" snapshot once per `with`, so the matching `leave()` fires
+    # iff the `enter()` did, even if a callback un/registers mid-cook.
+    with _cook_observer.scope("run"):
         _cancel_check(ctx.cancel)                         # SCHED-3 yield A: abort a stale cook up front
         _report_progress(ctx.on_progress, "tier", 0.0)
         if plan.want_noise_tiers:                         # opt-in; the import stays off the default path
@@ -1139,9 +1137,6 @@ def run(plan: CookPlan) -> CookResult:
             noise_tiers=tier_trace.take_noise_tiers(plan.tier_id) if plan.want_noise_tiers else None,
             done=_pace.cook_done_event(ctx.device),   # PACE-45 (Q3): None off CUDA, no sync
         )
-    finally:
-        if _obs_active:
-            _cook_observer.leave()
 
 
 def cook(code: str, bindings: dict, **kwargs) -> CookResult:
@@ -1158,14 +1153,8 @@ def cook(code: str, bindings: dict, **kwargs) -> CookResult:
     Accepts every keyword `prepare()` does. Returns a `CookResult` whose `outputs` are
     RAW (no clamp / alpha-drop / gray-expand — apply an egress profile for that; ENG-3).
     """
-    # OBSERVER-46: notify once for THIS entry point ("cook"); the nested `run()` call
+    # OBSERVER-46/O3: notify once for THIS entry point ("cook"); the nested `run()` call
     # below shares it rather than notifying a second time (see tex_runtime/cook_observer.py
     # and run()'s own comment, above).
-    _obs_active = bool(_cook_observer._callbacks)
-    if _obs_active:
-        _cook_observer.enter("cook")
-    try:
+    with _cook_observer.scope("cook"):
         return run(prepare(code, bindings, **kwargs))
-    finally:
-        if _obs_active:
-            _cook_observer.leave()
