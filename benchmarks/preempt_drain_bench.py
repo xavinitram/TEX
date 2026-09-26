@@ -276,7 +276,8 @@ def drain_on_preempt(depths, trials, full_runtime, seed0=3000):
             returns_ms.append((t1 - t0) * 1000)
             drained_ms.append((t2 - t0) * 1000)
             _reap_background_cook(th, full_runtime * 2 + 2,
-                                   f"drain_on_preempt depth={d} trial={i}")
+                                   f"drain_on_preempt depth={d} trial={i} "
+                                   f"delay_s={delay:.4f} full_runtime_s={full_runtime:.4f}")
             torch.cuda.synchronize()
 
         out[d] = {
@@ -491,7 +492,7 @@ def sweep_drain_on_preempt(code, size, depth, stride_ms, trials, full_runtime, s
         drained_ms.append((t2 - t0) * 1000)
         _reap_background_cook(th, full_runtime * 4 + 5,
                                f"sweep_drain_on_preempt depth={depth} stride_ms={stride_ms} "
-                               f"trial={i}")
+                               f"trial={i} trip_frac={frac:.4f}")
         torch.cuda.synchronize()
 
     return {
