@@ -57,6 +57,27 @@ New grammar is added **additively** (v0.23 added the optional parameter-metadata
 below) so old programs keep parsing. A genuinely breaking change is called out in the
 CHANGELOG with a migration and, where possible, an error that names the fix.
 
+**A second, independent magic comment (SCALE-47b) — not a language-version pragma.** A
+program may declare its own verdict on the engine's resolution-scale feature (an
+embedding-host mechanism; see `docs/resolution-scale.md`) with a leading comment, parsed
+the same way as `//!tex X.Y` above (an ordinary comment; it never becomes a token; only a
+LEADING occurrence, in the header run of blank/`//`-comment lines, counts):
+
+```tex
+//!tex scale: safe
+```
+or
+```tex
+//!tex scale: never
+```
+
+This does not bump `LANGUAGE_VERSION`, does not change the grammar, and is unrelated to the
+`//!tex X.Y` pragma above (a program may carry both, in either order, each recognized
+independently by its own leading-comment scan). It overrides the engine's own conservative
+scale-safety classifier (`tex_api.scale_verdict`) in the stated direction: `safe` vouches for
+a program the classifier could not prove safe on its own; `never` forces a program the
+classifier would otherwise accept to always decline a non-1.0 resolution-scale request.
+
 Two consequences worth stating outright:
 
 * **Fingerprints are not a stable identity.** A host must never persist a compile
