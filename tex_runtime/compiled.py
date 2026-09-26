@@ -1135,26 +1135,47 @@ def _codegen_with_params_on_device(cg_fn, program, bindings: dict, dev, latent_c
     return retry_bindings, ingest_event
 
 
-def _cuda_headroom_ok(device) -> bool:
+# C3 (v0.46 Phase C, R3#1 + B1#3): warm_call clones every binding at full resolution —
+# hundreds of MB at 4K — invisible to `_cuda_headroom_ok`, which ran BEFORE the clone and
+# checked only a flat 2 GB. A hard cap on top of folding the clone into the check below:
+# above this size the warm is skipped (the artifact still commits via an ordinary TRIAL).
+_WARM_CLONE_CAP_BYTES = 512 * 1024 * 1024  # 512 MB
+
+
+def _bindings_nbytes(bindings) -> int:
+    """Total byte size of every tensor binding — the projected cost of cloning ALL of
+    them at full resolution (C3), which is what `run_auto`'s warm path does."""
+    total = 0
+    for v in bindings.values():
+        if isinstance(v, torch.Tensor):
+            total += v.element_size() * v.nelement()
+    return total
+
+
+def _cuda_headroom_ok(device, extra_bytes: int = 0) -> bool:
     """Only submit a background CUDA compile with comfortable VRAM headroom, so
     a compile never allocates while another node's inference needs the memory.
     HW-2 (audit): query the COOK's device index, not a bare "cuda" (device 0) —
-    a cuda:1 cook mis-reads GPU 0's headroom otherwise. Single-GPU unaffected."""
+    a cuda:1 cook mis-reads GPU 0's headroom otherwise. Single-GPU unaffected.
+
+    `extra_bytes` (C3, default 0): a projected allocation about to be made (warm_call's
+    binding clone) that headroom must also cover."""
     dev = torch.device(device) if not isinstance(device, torch.device) else device
     if dev.type != "cuda":
         return True
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    need = 2 * 1024 * 1024 * 1024 + max(0, extra_bytes)  # >2 GB, plus any projected clone
     try:
         from .host import get_host_services  # PORT-1 seam
         free = get_host_services().get_free_memory(torch.device("cuda", idx))
         if free is None:
             raise RuntimeError("no host free-memory query")
-        return free > 2 * 1024 * 1024 * 1024  # >2 GB
+        return free > need
     except Exception:
         try:
             with torch.cuda.device(idx):
                 free, _total = torch.cuda.mem_get_info()
-            return free > 2 * 1024 * 1024 * 1024
+            return free > need
         except Exception:
             return True
 
@@ -1390,25 +1411,37 @@ def run_auto(program, bindings, type_map, device, fingerprint,
             # failed-compile tax, no trial. Reaches the same terminal outcome a real
             # failed compile already gets (record_trial(key, None) -> REJECTED), just
             # without ever entering _try_compile.
-            autotier.record_trial(key, None)
-        elif _cuda_headroom_ok(device) and not _capture_in_flight():
-            # CC-5: clone the REPRESENTATIVE bindings now, on the cook thread, so the
-            # background warm-up below (which runs later, off-thread) never races
-            # whatever the caller does to `bindings` after this cook returns (in-place
-            # `out=` reuse, a pooled tensor handed back to ComfyUI, ...).
-            warm_bindings = _contiguous_bindings(
-                {k: (v.clone() if isinstance(v, torch.Tensor) else v)
-                 for k, v in bindings.items()}, device_obj)
+            #
+            # C4 (B1#2): persist=False — a toolchain-absent REJECTED is a fact about
+            # THIS PROCESS (no Triton/MSVC found *so far*), not the program. Persisting
+            # it under a tag that never changes when the toolchain later appears would
+            # pin the program to codegen forever. Kept in-memory only for this process;
+            # a fresh process re-probes and gets a real trial once the toolchain shows up.
+            autotier.record_trial(key, None, persist=False)
+        elif not _capture_in_flight():
+            # C3 (R3#1 + B1#3): fold the projected clone size (every binding cloned at
+            # full resolution) into the headroom check BEFORE cloning, and cap it — above
+            # the cap the warm is skipped (the artifact still commits via a plain TRIAL).
+            warm_bytes = _bindings_nbytes(bindings)
+            if (warm_bytes <= _WARM_CLONE_CAP_BYTES
+                    and _cuda_headroom_ok(device, extra_bytes=warm_bytes)):
+                # CC-5: clone the REPRESENTATIVE bindings now, on the cook thread, so the
+                # background warm-up below (which runs later, off-thread) never races
+                # whatever the caller does to `bindings` after this cook returns (in-place
+                # `out=` reuse, a pooled tensor handed back to ComfyUI, ...).
+                warm_bindings = _contiguous_bindings(
+                    {k: (v.clone() if isinstance(v, torch.Tensor) else v)
+                     for k, v in bindings.items()}, device_obj)
 
-            def _warm_call(_key=cache_key, _wb=warm_bindings):
-                compiled_fn, _backend = _compiled_cache[_key]
-                compiled_fn(program, _wb, type_map, device,
-                           latent_channel_count, output_names)
+                def _warm_call(_key=cache_key, _wb=warm_bindings):
+                    compiled_fn, _backend = _compiled_cache[_key]
+                    compiled_fn(program, _wb, type_map, device,
+                               latent_channel_count, output_names)
 
-            if _submit_bg_compile(cache_key, program, type_map, device_type,
-                                  used_builtins, precision, fingerprint,
-                                  warm_call=_warm_call):
-                autotier.mark_submitted(key)
+                if _submit_bg_compile(cache_key, program, type_map, device_type,
+                                      used_builtins, precision, fingerprint,
+                                      warm_call=_warm_call):
+                    autotier.mark_submitted(key)
     elif state == autotier.COMPILING:
         st = _bg_status(cache_key)
         if st == "ready":

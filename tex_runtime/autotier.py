@@ -176,9 +176,18 @@ def mark_ready(key: tuple) -> None:
         st.state = TRIAL
 
 
-def record_trial(key: tuple, compiled_ms: float | None) -> str:
+def record_trial(key: tuple, compiled_ms: float | None, *, persist: bool = True) -> str:
     """Record a trial timing (or None on trial-fn crash → REJECTED) and decide.
-    Commit only when the compiled median is a clear win over the interpreter."""
+    Commit only when the compiled median is a clear win over the interpreter.
+
+    `persist` (C4, v0.46 Phase C; default True — every other caller is unaffected):
+    False skips writing this verdict to disk. A REJECTED caused only by a toolchain
+    that is absent THIS PROCESS (compiled.run_auto's CC-4 gate) is a fact about the
+    environment, not the program — persisting it under a tag that never changes when
+    Triton or MSVC is installed later would pin the program to codegen forever, across
+    every future session. The verdict still applies for the rest of THIS process
+    (`_STATE` is updated either way, so this key stays REJECTED here), it just never
+    fossilizes into `autotier.json`."""
     st = _get(key)
     if compiled_ms is None:
         st.state = REJECTED
@@ -188,7 +197,8 @@ def record_trial(key: tuple, compiled_ms: float | None) -> str:
         cm = _median(st.compiled_ms)
         # im == 0 (no interp samples) should not happen; be conservative.
         st.state = COMMITTED if (im > 0 and cm < _COMMIT_RATIO * im) else REJECTED
-    _persist()
+    if persist:
+        _persist()
     return st.state
 
 
