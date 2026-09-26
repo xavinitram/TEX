@@ -56,6 +56,14 @@ _STATE_MAX = 512          # bound the in-memory table
 # bounding the PER-KEY worst case to a small constant instead of the observed
 # multiplicative stall that scaled with how many other keys were ahead of it in the
 # same queue.
+#
+# C9 (v0.46 Phase C, optional — reviewed and KEPT fixed rather than derived): a bound of
+# max(30s, k * the last observed compile duration) was considered and declined. The fixed
+# 30s already covers the measured worst-case single round trip with margin (above), and a
+# bound that scales with an observed duration would need its OWN seed value before any
+# compile has ever finished on this key — reintroducing the same "haven't measured yet"
+# problem this constant exists to sidestep. Revisit only with a second reference-box
+# measurement that shows 30s is no longer comfortable.
 _CONVERGENCE_BOUND_S = 30.0
 
 
