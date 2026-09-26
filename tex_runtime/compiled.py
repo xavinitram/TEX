@@ -1625,7 +1625,7 @@ def _codegen_only_execute(
     # publishes the cook state (and resets pacing) via `set_cook_grid` — reset explicitly
     # so this poll never waits on a stale event left by an unrelated, already-returned
     # cook on this thread.
-    _pace.reset()
+    _pace.reset(cancel, device)   # O5: resolves "paced?" once, here
     _pace.paced_check(cancel, device)
 
     cg_fn = None

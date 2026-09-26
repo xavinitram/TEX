@@ -325,7 +325,9 @@ def set_cook_grid(grid, dtype=None, device=None, cancel=None):
     _cook_ctx.dtype = dtype
     _cook_ctx.device = device
     _cook_ctx.cancel = cancel
-    _pace.reset()   # PACE-45: a fresh cook starts with no pacing history to inherit
+    _pace.reset(cancel, device)   # PACE-45: a fresh cook starts with no pacing history to
+    #                                inherit; O5: resolves "paced?" once, here, from the
+    #                                token/device this seam already has in hand
     return token
 
 

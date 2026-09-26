@@ -70,14 +70,23 @@ def _is_cuda(device) -> bool:
     return d.type == "cuda" and torch.cuda.is_available()
 
 
-def reset() -> None:
+def reset(token=None, device=None) -> None:
     """Start a fresh poll sequence with no pacing history to inherit. Called once at the top
     of every cook via `stdlib_core.set_cook_grid` — the one seam every tier already uses to
     publish its own cook state — and once more at a route whose own first poll can fire
     before that seam does (the stencil route's entry check), so that poll never waits on a
-    stale event left over from an unrelated, already-returned cook on this thread. Cheap:
-    one attribute write."""
+    stale event left over from an unrelated, already-returned cook on this thread.
+
+    O5 (v0.46, FIX-OBSROUTE): also resolves "does THIS cook want pacing?" exactly once, here
+    — `wants_pacing(token) and _is_cuda(device)` — rather than re-deriving it at every single
+    `paced_check` poll point for the cook's whole duration. `token`/`device` default to
+    `None` (reads as "no pacing"), so a caller that predates O5 and still calls `reset()`
+    with no arguments gets the exact same answer `paced_check` used to compute fresh each
+    time on a bare/absent token. Both call sites in this tree (`stdlib_core.set_cook_grid`,
+    the stencil route's entry check in `compiled.py`) already have `cancel`/`device` in hand
+    at the point they call this."""
     _state.event = None
+    _state.paced = wants_pacing(token) and _is_cuda(device)
 
 
 def paced_check(token, device) -> None:
@@ -90,10 +99,14 @@ def paced_check(token, device) -> None:
     PREVIOUS call to `paced_check` in this cook to complete before returning (letting the
     caller queue further GPU work), polling the token in a short `event.query()` loop rather
     than blocking on `synchronize()` — so a trip mid-wait raises `CookCancelled` promptly.
-    Then records a fresh event for the NEXT poll point to wait on."""
+    Then records a fresh event for the NEXT poll point to wait on.
+
+    O5: "paced?" is read off `_state.paced` (resolved once by `reset()`, above) rather than
+    recomputed here every call — `getattr(..., False)` covers a poll reached without a prior
+    `reset()` on this thread (reads as unpaced, the old default)."""
     if token is None:
         return
-    if not wants_pacing(token) or not _is_cuda(device):
+    if not getattr(_state, "paced", False):
         token.check()
         return
     prev = getattr(_state, "event", None)
@@ -102,8 +115,14 @@ def paced_check(token, device) -> None:
             token.check()
             _time.sleep(_POLL_SLEEP_S)
     token.check()
-    new_event = torch.cuda.Event()
-    new_event.record()
+    # O4 (v0.46, FIX-OBSROUTE): record on the COOK's device, not whatever CUDA considers
+    # "current" on this thread (the ambient default, usually device 0) — the same
+    # `torch.cuda.device(...)` discipline `graphed.py:571` already uses to replay on the
+    # cook's own device. Without it, a cook running on a non-default CUDA device paces
+    # against an event recorded on the WRONG device, which can under- or over-wait.
+    with torch.cuda.device(device):
+        new_event = torch.cuda.Event()
+        new_event.record()
     _state.event = new_event
 
 
@@ -111,9 +130,13 @@ def cook_done_event(device) -> "torch.cuda.Event | None":
     """A "GPU work done" fence: a CUDA event recorded on *device*'s current stream, marking
     this cook's LAST launch so far — `None` off CUDA. Recording an event is itself just
     another stream-ordered enqueue (like any kernel launch), so this costs nothing unless a
-    caller later reads or synchronizes it."""
+    caller later reads or synchronizes it.
+
+    O4: recorded under `torch.cuda.device(device)` (see `paced_check`, above) so the event
+    actually marks *device*'s stream rather than whatever device happens to be ambient."""
     if not _is_cuda(device):
         return None
-    ev = torch.cuda.Event()
-    ev.record()
+    with torch.cuda.device(device):
+        ev = torch.cuda.Event()
+        ev.record()
     return ev
