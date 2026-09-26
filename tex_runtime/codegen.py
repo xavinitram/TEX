@@ -391,6 +391,28 @@ def _bp_co(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
 _ES_CO_MEMO: dict = {}
 
 
+def _get_es_co(device):
+    """C7 (v0.46 Phase C, B6#7): the per-device memoized `_es` co-location wrapper, using
+    `dict.setdefault` — a single, GIL-atomic operation — rather than a bare check-then-set
+    (`.get()` then `[key] = ...`). The compile-pool worker (warming one program) and the
+    cook thread (invoking an already-committed one) can call this for the SAME device
+    concurrently; under check-then-set, two threads can both observe `None`, each build
+    its OWN closure, and each keep using ITS OWN local object without ever reading back
+    what actually landed in the dict — handing torch.compile two different callable
+    identities for the same guarded argument on different cooks, which forces a spurious
+    recompile (the exact failure `_ES_CO_MEMO` exists to prevent). `setdefault` makes
+    whichever thread's call lands first the sole winner: every caller's `es`, including
+    the loser's, is rebound to the SAME object `setdefault` returns."""
+    es = _ES_CO_MEMO.get(device)
+    if es is None:
+        def _es(tensor, spatial_shape_arg, _dev=device):
+            if tensor.dim() == 0 and tensor.device != _dev:
+                tensor = tensor.to(_dev)
+            return _ensure_spatial(tensor, spatial_shape_arg)
+        es = _ES_CO_MEMO.setdefault(device, _es)
+    return es
+
+
 def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
                device: Any, spatial_shape: tuple | None, dtype=None,
                program: Any = None, cancel: Any = None,
@@ -469,13 +491,7 @@ def _invoke_cg(cg_fn: Any, env: dict, bindings: dict, stdlib_fns: dict,
         # function, stable forever; `_es_co` needs `device`, so it is memoized per device
         # (at most a couple of entries — the box's device set, not one per cook).
         bp = _bp_co
-        es = _ES_CO_MEMO.get(device)
-        if es is None:
-            def es(tensor, spatial_shape_arg, _dev=device):
-                if tensor.dim() == 0 and tensor.device != _dev:
-                    tensor = tensor.to(_dev)
-                return _ensure_spatial(tensor, spatial_shape_arg)
-            _ES_CO_MEMO[device] = es
+        es = _get_es_co(device)
     try:
         cg_fn(env, bindings, stdlib_fns, device, spatial_shape,
               torch, bp, es, torch.where,
