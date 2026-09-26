@@ -150,6 +150,18 @@ def measure_overlapped(frames, res, device, in_stall, out_stall, provider, looka
     elapsed = time.perf_counter() - t0
     stop.set()
     writes.put(None)
+    # BENCH-47 hygiene (both threads are already daemon, so neither can outlive the whole
+    # process the way a NON-daemon thread could -- but a still-alive thread after its own
+    # join timeout is a benchmark result nobody can trust, silently corrupting whatever
+    # measurement runs next in the SAME process, exactly the class of bug BENCH-47 found in
+    # a sibling file's non-daemon thread). Hard-fail rather than silently proceed.
+    tf.join(5.0)   # the fetcher has nothing left to do once `stop` is set; should be instant
+    if tw.is_alive() or tf.is_alive():
+        raise RuntimeError(
+            f"measure_overlapped: writer_alive={tw.is_alive()} fetcher_alive={tf.is_alive()} "
+            f"after their join timeouts -- a background thread failed to finish in bounded "
+            f"time; this result cannot be trusted and would otherwise silently corrupt "
+            f"whatever measurement runs next in this process.")
     q.close()
     return elapsed, q
 
