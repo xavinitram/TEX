@@ -609,6 +609,94 @@ def test_pace47_stride_skip_still_fires_once_device_catches_up(r):
                f"outstanding after2={outstanding_after_2} (expected 1/1/1)")
 
 
+# ── PACE-47b (R1): the query() peek itself is cached across an unchanged tail ─────
+#
+# PACE-47's own fix made every economizing poll pay for a real `event.query()` call --
+# measured to cost real cheap-chain overhead (cheap256's own cost regressed after the
+# PACE-47 fix landed, see the hand-back). Once a poll's peek confirms the tail event
+# complete, that answer cannot change until the event is `record()`ed again -- so a run of
+# further polls against the SAME unchanged tail (nothing recorded in between: precisely the
+# shape a long chain of cheap, fast-finishing statements produces) should pay for exactly
+# ONE real `query()` call, not one per poll.
+
+def test_pace47b_repeated_skip_reuses_one_query_call(r):
+    """10 further polls, all landing inside the same still-open 10ms stride window with
+    the tail event already confirmed complete, must make exactly ONE real `query()` call
+    total (the first poll's own peek) -- PACE-47b's cache. Pre-PACE-47b, this was RED:
+    every one of the 10 polls called `query()` again on the identical, unchanged event."""
+    print("\n--- PACE-47b: repeated economizing polls reuse one query() call ---")
+    clock = _FakeClock(0.0)
+    real_perf_counter = _pace._time.perf_counter
+    _pace._time.perf_counter = clock
+    query_calls = {"n": 0}
+    real_query = _FakeEvent.query
+
+    def _counting_query(self):
+        query_calls["n"] += 1
+        return real_query(self)
+
+    _FakeEvent.query = _counting_query
+    try:
+        with _DeviceSpy():
+            tok = _Token(pace=True, pace_depth=8)
+            tok.pace_stride_ms = 10.0
+            _pace.reset(tok, "cuda")
+            _pace.paced_check(tok, "cuda")   # t=0: first poll always records, no peek yet
+            for _ in range(10):
+                clock.advance(0.0001)         # still well inside the 10ms window
+                _pace.paced_check(tok, "cuda")
+    finally:
+        _pace._time.perf_counter = real_perf_counter
+        _FakeEvent.query = real_query
+
+    if query_calls["n"] == 1:
+        r.ok(f"10 consecutive economizing polls against an unchanged tail made exactly "
+             f"1 real query() call")
+    else:
+        r.fail("PACE-47b query cache", f"expected exactly 1 query() call, got "
+               f"{query_calls['n']}")
+
+
+def test_pace47b_query_cache_invalidates_on_a_real_record(r):
+    """The cache must NOT survive a real record: once the pool waits/records (past-stride,
+    or the device found behind), the next economizing poll's tail is a DIFFERENT (or
+    freshly re-armed) event and must be peeked again, not answered from the stale cache."""
+    print("\n--- PACE-47b: the query() cache is invalidated by a real record ---")
+    clock = _FakeClock(0.0)
+    real_perf_counter = _pace._time.perf_counter
+    _pace._time.perf_counter = clock
+    query_calls = {"n": 0}
+    real_query = _FakeEvent.query
+
+    def _counting_query(self):
+        query_calls["n"] += 1
+        return real_query(self)
+
+    _FakeEvent.query = _counting_query
+    try:
+        with _DeviceSpy():
+            tok = _Token(pace=True, pace_depth=8)
+            tok.pace_stride_ms = 10.0
+            _pace.reset(tok, "cuda")
+            _pace.paced_check(tok, "cuda")   # t=0: records (#1), no peek
+            clock.advance(0.0001)
+            _pace.paced_check(tok, "cuda")   # inside window: peek #1 (confirms #1 done)
+            clock.advance(20.0)              # PAST the 10ms window: records again, unconditional
+            _pace.paced_check(tok, "cuda")   # records (#2); cache cleared
+            clock.advance(0.0001)
+            _pace.paced_check(tok, "cuda")   # inside window again: must peek #2 fresh
+    finally:
+        _pace._time.perf_counter = real_perf_counter
+        _FakeEvent.query = real_query
+
+    if query_calls["n"] == 2:
+        r.ok("the cache was re-primed by a fresh peek after the intervening real record "
+             "(2 total real query() calls, one per distinct tail event)")
+    else:
+        r.fail("PACE-47b cache invalidation", f"expected 2 query() calls, got "
+               f"{query_calls['n']}")
+
+
 def test_pace_stride_ms_default_when_absent(r):
     print("\n--- PACE-462: pace_stride_ms absent resolves to the module default ---")
     tok = _Token(pace=True, pace_stride_ms=None)  # None -> no pace_stride_ms attribute at all

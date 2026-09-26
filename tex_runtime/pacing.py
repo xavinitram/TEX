@@ -352,6 +352,12 @@ def reset(token=None, device=None) -> None:
         pool["outstanding"].clear()
     _state.pool = pool
     _state.last_record_t = None
+    #: PACE-47b (R1, the query() cost this ask's own fix added): the event object last
+    #: CONFIRMED complete by a `query()` peek, so a run of consecutive economizing polls
+    #: against the SAME unchanged tail event pays for one real `query()` call, not one per
+    #: poll -- see `paced_check`'s own comment at the read site for why identity alone is
+    #: safe here (invalidated on every real record, never stale across a re-`record()`).
+    _state.last_confirmed_done = None
 
 
 def paced_check(token, device) -> None:
@@ -437,7 +443,22 @@ def paced_check(token, device) -> None:
             # stride gate for this poll -- fall through to the depth-gated record/wait
             # below exactly as stride=0 would, so the bound stays honest regardless of how
             # fast the host is dispatching relative to this stride.
-            if not outstanding or outstanding[-1].query():
+            #
+            # PACE-47b (R1): a real `query()` call is not free, and a chain of many CHEAP
+            # statements can land dozens of consecutive polls inside one window with the
+            # SAME tail event (nothing recorded => `outstanding[-1]` never changes) -- once
+            # that event is confirmed complete, it stays complete forever until it is
+            # `record()`ed again onto a new point, so re-querying the identical, unchanged
+            # tail on every one of those polls re-derives an answer that cannot have
+            # changed. `_state.last_confirmed_done` remembers WHICH event object the last
+            # real `query()` call confirmed, checked by identity (`is`, not equality) --
+            # cheap and exact, since a Python object identity can only match a prior
+            # confirmation if it is the literal same, still-unrecorded-since event. Every
+            # path that appends a freshly `record()`ed event clears this to `None` first,
+            # so the cache can never survive a re-arm and answer for the wrong recording.
+            tail = outstanding[-1] if outstanding else None
+            if tail is None or tail is _state.last_confirmed_done or tail.query():
+                _state.last_confirmed_done = tail
                 return  # device caught up: token already checked, nothing else to do
 
     if len(outstanding) >= depth:
@@ -453,6 +474,11 @@ def paced_check(token, device) -> None:
     ev = free.pop() if free else torch.cuda.Event(blocking=True)
     _record_on(ev, device, _state.is_current)
     outstanding.append(ev)
+    # PACE-47b: invalidate the query() cache -- this event was JUST re-armed onto a new
+    # point (or is brand new), so any earlier "confirmed done" answer (for this object or
+    # any other) no longer describes what `outstanding[-1]` is now. The next economizing
+    # poll must peek fresh.
+    _state.last_confirmed_done = None
 
     _state.last_record_t = _time.perf_counter()
 
