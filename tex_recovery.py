@@ -245,11 +245,23 @@ _MAC_TRAILER_LEN = len(_MAC_MAGIC) + _MAC_TAG_LEN
 _MAC_KEY_FILE = "cache_mac.key"
 _MAC_KEY_LEN = 32
 
-#: `load_verified`'s two non-object verdicts. UNVERIFIED = missing / unsigned / foreign /
-#: tampered / corrupt — a miss, and the file may be deleted. FUTURE_TRAILER = a newer `TEXm<n>`
-#: wrote it — a miss, but leave it on disk so a downgrade never destroys a readable frame.
+#: `load_verified`'s three non-object verdicts. UNVERIFIED = the file OPENED and READ, but its
+#: content is missing/unsigned/foreign/tampered/corrupt — a miss, and the caller may delete it,
+#: because there is no way to tell a genuine pre-integrity or crafted file from one that will
+#: never become valid. FUTURE_TRAILER = a newer `TEXm<n>` wrote it — a miss, but leave it on disk
+#: so a downgrade never destroys a readable frame. UNREADABLE = the file could not even be OPENED
+#: or READ (a transient OS-level failure — a Windows sharing violation from a real-time scanner or
+#: indexer, a momentary EMFILE, a flaky network/cloud-synced cache dir — the cause is unknowable
+#: from here and irrelevant): this says NOTHING about the file's content, so it is a miss that
+#: leaves the file untouched, exactly like FUTURE_TRAILER. Collapsing this into UNVERIFIED was
+#: the RESTORE-462 defect: a transient "could not open it right now" was indistinguishable from
+#: "opened fine and failed the MAC", so every caller deleted a perfectly valid, previously-spilled
+#: frame on a passing lock/scan/hiccup. The module already drew this line once, for the MAC key
+#: file itself (`_probe_key`'s "unreadable" branch, which never removes what it could not read) —
+#: this extends the same discipline to the content the key protects.
 _UNVERIFIED = object()
 _FUTURE_TRAILER = object()
+_UNREADABLE = object()
 
 _mac_key_cache: bytes | None = None
 _mac_key_lock = threading.Lock()
@@ -460,15 +472,17 @@ def load_verified(path):
     no second read a concurrent writer could swap under (the F1 TOCTOU). THE GATE: the only
     deserialiser for the on-disk pickle caches.
 
-    Returns the deserialised object, or `_UNVERIFIED` (missing / too short / unsigned / foreign /
-    tampered / corrupt — the caller treats it as a miss and may delete the file), or
-    `_FUTURE_TRAILER` (a newer `TEXm<n>` wrote it — decline WITHOUT deleting, so a downgrade never
-    destroys a frame the newer build can still read)."""
+    Returns the deserialised object, or `_UNVERIFIED` (the file opened and read, but is too short /
+    unsigned / foreign / tampered / corrupt — the caller treats it as a miss and may delete the
+    file), or `_FUTURE_TRAILER` (a newer `TEXm<n>` wrote it — decline WITHOUT deleting, so a
+    downgrade never destroys a frame the newer build can still read), or `_UNREADABLE` (the file
+    could not even be opened/read — a transient OS-level failure that says nothing about the
+    file's content — decline WITHOUT deleting, exactly like `_FUTURE_TRAILER`; RESTORE-462)."""
     try:
         with open(str(path), "rb") as f:
             buf = f.read()
     except OSError:
-        return _UNVERIFIED
+        return _UNREADABLE
     if len(buf) < _MAC_TRAILER_LEN:
         return _UNVERIFIED
     magic = buf[-_MAC_TRAILER_LEN:-_MAC_TAG_LEN]

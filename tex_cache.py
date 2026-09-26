@@ -689,7 +689,10 @@ class TEXCache:
             # valid trailer (a pre-integrity file, a foreign one, or a crafted one) is a MISS and
             # its `__reduce__` never runs, with no re-read a writer could swap under. The
             # version/epoch checks below are unchanged; the MAC is a gate in front, not a reorder.
-            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER
+            # RESTORE-462: UNREADABLE (open/read itself failed — transient) is not UNVERIFIED
+            # (opened fine, content bad) — it says nothing about the content, so it is a silent
+            # miss that recompiles THIS time, left on disk for a retry to find good, not deleted.
+            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER, _UNREADABLE
             data = load_verified(path)
             if data is _UNVERIFIED:
                 try:
@@ -697,8 +700,8 @@ class TEXCache:
                 except OSError:
                     pass                             # F6: an undeletable file is a silent miss
                 return None
-            if data is _FUTURE_TRAILER:
-                return None                          # a newer TEX's file — leave it, just miss
+            if data is _FUTURE_TRAILER or data is _UNREADABLE:
+                return None                          # leave it, just miss (never destroy on either)
 
             # Version check — stale entries are deleted (CACHE-4: AST epoch gates the .pkl)
             if data.get("version") != _AST_EPOCH:
@@ -873,7 +876,9 @@ class TEXCache:
             # marshal blob (and is attacker-recomputable), so it cannot stand in for this.
             # `load_verified` reads once, checks the MAC, and unpickles that one buffer (no
             # re-read window — F1).
-            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER
+            # RESTORE-462: UNREADABLE (open/read itself failed — transient) is not UNVERIFIED
+            # (opened fine, content bad) — a silent miss left on disk, never deleted.
+            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER, _UNREADABLE
             data = load_verified(path)
             if data is _UNVERIFIED:
                 try:
@@ -881,8 +886,8 @@ class TEXCache:
                 except OSError:
                     pass                             # F6: an undeletable file is a silent miss
                 return None
-            if data is _FUTURE_TRAILER:
-                return None                          # a newer TEX's sidecar — leave it, just miss
+            if data is _FUTURE_TRAILER or data is _UNREADABLE:
+                return None                          # leave it, just miss (never destroy on either)
             if (data.get("version") != _CODEGEN_EPOCH
                     or data.get("magic") != _BYTECODE_MAGIC):
                 path.unlink(missing_ok=True)

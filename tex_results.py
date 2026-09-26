@@ -1064,10 +1064,17 @@ class ResultCache(_ResultCacheResidency):
             # one (there is no way to tell a genuine pre-integrity frame from a hostile one, so
             # serving either is the hole); a FUTURE-trailer frame a newer TEX wrote is a miss but
             # is LEFT on disk (F7). The fmt/epoch checks below are untouched.
-            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER
+            #
+            # RESTORE-462: UNREADABLE (the open/read itself failed — a transient sharing
+            # violation, EMFILE, a network-drive hiccup) is NOT the same claim as UNVERIFIED (the
+            # bytes were read and are bad). It says nothing about the file's content, so it is a
+            # miss left on disk exactly like FUTURE_TRAILER — never a deletion. Collapsing the two
+            # deleted a perfectly valid, previously-spilled frame on a passing transient failure
+            # to even open it (an own spill intermittently rejected on restore, across processes).
+            from .tex_recovery import load_verified, _UNVERIFIED, _FUTURE_TRAILER, _UNREADABLE
             rec = load_verified(path)
-            if rec is _FUTURE_TRAILER:
-                return None, None, None            # a newer TEX's frame — leave it, just miss
+            if rec is _FUTURE_TRAILER or rec is _UNREADABLE:
+                return None, None, None            # leave it, just miss (never destroy on either)
             if rec is _UNVERIFIED:
                 try:
                     os.remove(path)

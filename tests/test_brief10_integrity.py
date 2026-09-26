@@ -329,3 +329,70 @@ def test_brief10_key_repair_spares_a_peers_republished_key(r: SubTestResult):
         shutil.rmtree(home, ignore_errors=True)
     except Exception as e:
         r.fail("BRIEF-10 N1 key repair", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+
+# ── RESTORE-462: a TRANSIENT open() failure must never be treated as "tampered" ─
+#
+# `load_verified` reads `path` with one `open(...).read()`. On the base tree, ANY `OSError` from
+# that open/read — a Windows sharing violation from a real-time scanner or indexer holding a
+# transient handle, a momentary EMFILE, a flaky network/cloud-synced cache dir, anything at all —
+# is caught by the SAME `except OSError: return _UNVERIFIED` that also covers "opened fine, but
+# the trailer/MAC/pickle is bad". Every caller (`_restore`, `_load_from_disk`,
+# `_load_codegen_from_disk`) treats `_UNVERIFIED` as license to delete the file. A transient
+# failure to even OPEN the file therefore destroys a perfectly valid, previously-spilled frame
+# that a retry moments later would have served — an own spill intermittently rejected on restore,
+# across processes, and never before this trailer existed. The module already knows this
+# distinction matters — see `_probe_key`'s "unreadable" branch, which never removes a key file it
+# could not read — but `load_verified` never got the same treatment.
+
+
+def test_restore462_transient_open_failure_is_a_miss_not_a_deletion(r: SubTestResult):
+    print("\n--- RESTORE-462: a transient open() OSError must not delete a valid .frame ---")
+    try:
+        d = Path(tempfile.mkdtemp())
+        c = tex_results.ResultCache(cache_dir=str(d), budget_mb=0)
+        f = _frame()
+        c.put("k", f)
+        c.put("evictor", f)                      # forces "k" out to a signed, valid .frame
+        path = c._disk_path("k")
+        if not os.path.exists(path):
+            r.fail("RESTORE-462 transient open error", "setup did not spill 'k'")
+            shutil.rmtree(d, ignore_errors=True)
+            return
+
+        import builtins
+        real_open = builtins.open
+        state = {"raised": False}
+        target = os.path.abspath(str(path))
+
+        def flaky_open(file, *a, **kw):
+            if not state["raised"] and os.path.abspath(os.fspath(file)) == target:
+                state["raised"] = True
+                raise PermissionError(
+                    13, "The process cannot access the file because it is being used "
+                        "by another process")
+            return real_open(file, *a, **kw)
+
+        with c._lock:
+            c._spilled = None                    # unknown -> _restore stats and finds the file
+        builtins.open = flaky_open
+        try:
+            frame1, _orig1, _fence1 = c._restore("k")
+        finally:
+            builtins.open = real_open
+
+        survived = os.path.exists(path)          # THE claim: a transient miss must not delete it
+        with c._lock:
+            c._spilled = None
+        frame2, _orig2, _fence2 = c._restore("k")   # an unobstructed retry must still serve it
+        retried_ok = frame2 is not None and float((frame2 - f).abs().max()) < 1e-6
+
+        ok = survived and retried_ok
+        r.ok("a transient open() failure is a miss; the frame survives and a retry serves it") \
+            if ok else r.fail(
+                "RESTORE-462 transient open error",
+                f"first_restore_hit={frame1 is not None} file_survived={survived} "
+                f"retry_hit={retried_ok}")
+        shutil.rmtree(d, ignore_errors=True)
+    except Exception as e:
+        r.fail("RESTORE-462 transient open error", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
