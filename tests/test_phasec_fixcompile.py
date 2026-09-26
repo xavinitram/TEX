@@ -1,7 +1,7 @@
 """
-FIX-COMPILE (v0.46 Phase C) — adversarial reproduction + regression tests for C1-C8 of
-`docs/worklog/v046/phaseC/CONSOLIDATED.md`'s FIX-COMPILE section (findings B1#1-4, R3#1,
-B6#6-7, R1#3). Each row below is written to be RED against the pre-fix code and GREEN
+FIX-COMPILE (v0.46 Phase C) — adversarial reproduction + regression tests for the
+v0.46 pre-release audit's compiled-tier findings C1-C8 (warm pool isolation, test
+isolation, headroom, toolchain verdicts, MSVC and memo races, probe reuse). Each row below is written to be RED against the pre-fix code and GREEN
 against the fix, so this file is itself the adversarial verification for every item.
 
 C9 (optional, "lane's call") is a documentation-only decision (kept the fixed 30s
