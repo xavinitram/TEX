@@ -103,6 +103,7 @@ Thread-local (mirrors `stdlib_core._cook_ctx`): a second cook on another thread 
 share, or wait on, this cook's event ring."""
 from __future__ import annotations
 
+import math as _math
 import threading as _threading
 import time as _time
 
@@ -142,30 +143,51 @@ def wants_pacing(token) -> bool:
     return bool(getattr(token, "pace", False))
 
 
+#: P4 (Phase C): the ceiling on `pace_depth`. Unbounded, an adversarial or misconfigured
+#: token grows the per-thread ring by that many `None` slots in one Python list expression
+#: BEFORE a single `torch.cuda.Event` is allocated — confirmed accepted and unbounded at
+#: `pace_depth=1_000_000_000` (several GB of pure list overhead). 64 is generous next to the
+#: K-sweep's own tried range (1-8) and the depth*stride pre-emption bound this ask exists to
+#: keep small — a real host has no reason to want look-ahead in the dozens, let alone more.
+_MAX_DEPTH = 64
+
+
+def _resolve_token_attr(token, name, default, types, minimum, maximum=None):
+    """Shared shape for validating one optional numeric token attribute (P4, R1#4/R2#4):
+    absent (`None`, or no such attribute) resolves to *default*; present, it must be one of
+    *types* — checked via the tree's own `isinstance(x, T) and not isinstance(x, bool)`
+    idiom (AGENTS.md), which rejects `bool` even though it is an `int` subclass — finite
+    (never NaN/inf; a NaN silently compares `False` to every bound check below it, so it
+    would otherwise sail through as though non-negative) and within `[minimum, maximum]`
+    (`maximum=None` means no ceiling)."""
+    val = getattr(token, name, None)
+    if val is None:
+        return default
+    if not isinstance(val, types) or isinstance(val, bool):
+        raise ValueError(f"{name} must be one of {types}, got {val!r}")
+    if isinstance(val, float) and not _math.isfinite(val):
+        raise ValueError(f"{name} must be finite, got {val!r}")
+    if val < minimum or (maximum is not None and val > maximum):
+        bound = f">= {minimum}" if maximum is None else f"in [{minimum}, {maximum}]"
+        raise ValueError(f"{name} must be {bound}, got {val!r}")
+    return val
+
+
 def _resolve_depth(token) -> int:
     """The look-ahead depth for this cook: `token.pace_depth` if the token names one
-    (validated: must be a plain positive `int` — deliberately `type(x) is int`, not
-    `isinstance`, so a `bool` (`True == 1`) is rejected rather than silently accepted as
-    depth 1), else `_DEFAULT_DEPTH`. Depth is never read out of `pace` itself."""
-    depth = getattr(token, "pace_depth", None)
-    if depth is None:
-        return _DEFAULT_DEPTH
-    if type(depth) is not int or depth < 1:
-        raise ValueError(f"pace_depth must be a positive int, got {depth!r}")
-    return depth
+    (a plain positive `int`, `bool` rejected, capped at `_MAX_DEPTH` — P4), else
+    `_DEFAULT_DEPTH`. Depth is never read out of `pace` itself."""
+    return _resolve_token_attr(token, "pace_depth", _DEFAULT_DEPTH, (int,), 1, _MAX_DEPTH)
 
 
 def _resolve_stride(token) -> float:
     """The stride, in SECONDS, for this cook: derived from `token.pace_stride_ms` if the
-    token names one (validated: a plain `int` or `float` — `type(x) in (int, float)`, not
-    `isinstance`, so a `bool` is rejected the same way `_resolve_depth` rejects one — and
-    non-negative; `0` disables striding outright, recording at every poll), else
-    `_DEFAULT_STRIDE_S`."""
-    stride_ms = getattr(token, "pace_stride_ms", None)
-    if stride_ms is None:
-        return _DEFAULT_STRIDE_S
-    if type(stride_ms) not in (int, float) or stride_ms < 0:
-        raise ValueError(f"pace_stride_ms must be a non-negative int or float, got {stride_ms!r}")
+    token names one (a plain, FINITE `int` or `float` — P4 rejects NaN/inf, which used to
+    pass the old `type(x) not in (...) or x < 0` guard silently, since a NaN compares
+    `False` to every bound — `bool` rejected, non-negative; `0` disables striding outright,
+    recording at every poll), else `_DEFAULT_STRIDE_S`."""
+    stride_ms = _resolve_token_attr(token, "pace_stride_ms", _DEFAULT_STRIDE_S * 1000.0,
+                                     (int, float), 0)
     return stride_ms / 1000.0
 
 

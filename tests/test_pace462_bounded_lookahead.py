@@ -293,6 +293,16 @@ def test_pace_depth_accepts_positive_int(r):
         r.fail("PACE-462 valid depth", f"expected 7, got {resolved}")
 
 
+def test_pace_depth_rejects_above_the_ceiling():
+    """P4 (Phase C, B1#5): `pace_depth` had no upper bound -- an oversized value (confirmed
+    accepted: `pace_depth=1_000_000_000`) grows the per-thread ring in one unbounded Python
+    list allocation, several GB before a single `torch.cuda.Event` is even built. Must now
+    raise rather than resolve cleanly."""
+    tok = _Token(pace=True, pace_depth=1_000_000_000)
+    with pytest.raises(ValueError):
+        _pace._resolve_depth(tok)  # noqa: SLF001
+
+
 def test_reset_raises_on_invalid_pace_depth(r):
     """The validation fires at `reset()` time (once per cook), not lazily inside the poll
     loop -- a bad `pace_depth` must fail fast, before any device work is queued."""
@@ -544,6 +554,19 @@ def test_pace_stride_ms_accepts_valid(good_stride, expected_s):
     tok.pace_stride_ms = good_stride
     resolved = _pace._resolve_stride(tok)  # noqa: SLF001
     assert abs(resolved - expected_s) < 1e-12
+
+
+@pytest.mark.parametrize("bad_stride", [float("nan"), float("inf"), float("-inf")])
+def test_pace_stride_ms_rejects_nonfinite(bad_stride):
+    """P4 (Phase C, B1#4): `float('nan')` passed the old guard (`type(x) not in (...) or
+    x < 0`) -- `type(nan) is float` and `nan < 0` is `False` (NaN compares False to
+    everything), so it silently resolved as 'striding disabled' instead of raising like
+    every other malformed value in this family. `inf`/`-inf` share the same non-finite
+    class."""
+    tok = _Token(pace=True)
+    tok.pace_stride_ms = bad_stride
+    with pytest.raises(ValueError):
+        _pace._resolve_stride(tok)  # noqa: SLF001
 
 
 # ── P1 (Phase C, B1#1): the ring is thread-local, not device-local ───────────────
