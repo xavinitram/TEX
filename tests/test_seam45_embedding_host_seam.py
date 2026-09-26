@@ -209,6 +209,10 @@ _TIER1_SPEC = {
     # landed, same posture as `ResultCache.spill`/`Program.time_reads` above.
     'tex_runtime.cook_observer:register': ('function', (('cb', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_runtime.cook_observer:unregister': ('function', (('handle', 'POSITIONAL_OR_KEYWORD', False),)),
+    # FIX-OBSROUTE (O3, v0.46): `scope(entry)`, the context manager the six cook entry
+    # points now use in place of their own hand-rolled enter/leave blocks — added the
+    # moment it landed, same posture as the two rows above it.
+    'tex_runtime.cook_observer:scope': ('function', (('entry', 'POSITIONAL_OR_KEYWORD', False),)),
     'tex_runtime.host:CookCancelled': ('class', None),
     'tex_runtime.host:NullHostServices': ('class', None),
     'tex_runtime.profile:enabled': ('function', ()),
