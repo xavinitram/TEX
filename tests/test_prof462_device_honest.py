@@ -289,3 +289,63 @@ def test_fixprof_f1_capture_does_not_pollute_outer_stage_sink(r: SubTestResult):
         r.fail("FIX-PROF F1",
                f"expected 0 stage boundaries from capture's nested execute() calls landing "
                f"in the outer sink, got {len(calls)}: {calls!r}")
+
+
+def test_fixprof_f2_failed_boundary_drops_stage_split_not_a_neighbour(r: SubTestResult):
+    """FIX-PROF F2: `record_stage_boundary`'s swallowed construction/`record()` failure used
+    to append nothing, so the sequential fold (`prev.elapsed_time(ev)`, walking `events` in
+    order) silently handed the failed stage's real cost to whichever stage closed NEXT --
+    wrong in a different way than "missing". A 3-stage sample where stage 1's boundary fails
+    must instead record its WHOLE-COOK time (already timed independently by the entry/exit
+    events) with NO per-stage split at all for that one sample, rather than a split where
+    stage 2's number silently contains stage 1's work too."""
+    P.reset()
+
+    class _FlakyEvent(_FakeEvent):
+        """A `_FakeEvent` whose `record()` raises on demand, to simulate the transient CUDA
+        event-creation/record failure `record_stage_boundary`'s docstring calls "vanishingly
+        rare... not impossible"."""
+        _fail_next = [False]
+
+        def record(self):
+            if _FlakyEvent._fail_next[0]:
+                _FlakyEvent._fail_next[0] = False
+                raise RuntimeError("simulated CUDA event failure")
+            super().record()
+
+    real_event, real_device, real_avail = torch.cuda.Event, torch.cuda.device, torch.cuda.is_available
+    try:
+        with armed_profiler() as Pmod:
+            torch.cuda.Event = _FlakyEvent
+            torch.cuda.device = _FakeDeviceCtx
+            torch.cuda.is_available = lambda: True
+            _FakeEvent.DONE = True
+            _FakeEvent._next_tick[0] = 0
+            _FlakyEvent._fail_next[0] = False
+
+            key = Pmod.make_key("fixprof-f2", "cuda", "fp32")
+            events = []
+            start = _FlakyEvent(True)
+            start.record()
+            Pmod.record_stage_boundary(events, 0, "cuda")     # stage 0: ok
+            _FlakyEvent._fail_next[0] = True
+            Pmod.record_stage_boundary(events, 1, "cuda")     # stage 1: FAILS mid-cook
+            Pmod.record_stage_boundary(events, 2, "cuda")     # stage 2: ok
+            end = _FlakyEvent(True)
+            end.record()
+            Pmod._queue_pending(key, 8 * 8, start, end, events)
+
+            whole = Pmod.predict(key, 8 * 8)
+            stages = Pmod.stage_costs(key, 8 * 8)
+    finally:
+        torch.cuda.Event, torch.cuda.device, torch.cuda.is_available = real_event, real_device, real_avail
+        P.reset()
+
+    ok = (whole is not None and whole > 0.0 and stages == {})
+    if ok:
+        r.ok(f"a failed mid-cook boundary recorded whole-cook ms={whole:.1f} and dropped "
+             f"the per-stage split entirely (stages={stages!r}), instead of silently "
+             f"folding stage 1's cost into stage 2's number")
+    else:
+        r.fail("FIX-PROF F2",
+               f"whole={whole!r} stages={stages!r} (expected whole > 0 and stages == {{}})")

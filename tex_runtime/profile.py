@@ -165,9 +165,15 @@ def record_stage_boundary(events: list, stage, device) -> None:
     a fresh timing-enabled CUDA event under `with torch.cuda.device(device):` (the O4
     discipline `measure._new_event` also follows, matching `pacing.cook_done_event`) and never
     blocking. Lives here, not inline in the interpreter, so `Interpreter._exec_stmts_profiled`
-    stays a few lines shorter — the only caller. Losing one boundary's attribution (a
-    construction/`record()` failure) never loses the cook: swallowed, like every other
-    profiler failure mode in this module."""
+    stays a few lines shorter — the only caller.
+
+    On failure this appends `(stage, None)` rather than nothing. The fold walks `events`
+    SEQUENTIALLY, using each entry as the previous one's boundary — silently dropping a failed
+    boundary (the old behaviour) does not lose just that stage's attribution, it hands stage
+    K's real cost to whichever stage happens to close next, which is wrong in a different way
+    than "missing". A `None` in the list tells the fold this sample's per-stage breakdown is
+    unreliable, so it can fall back to recording the sample's WHOLE-COOK time only — still
+    losing this one sample's stage split, never the cook, and never someone else's number."""
     try:
         import torch
         with torch.cuda.device(device):
@@ -175,7 +181,7 @@ def record_stage_boundary(events: list, stage, device) -> None:
             ev.record()
         events.append((stage, ev))
     except Exception:
-        pass
+        events.append((stage, None))
 
 
 def stage_event_sink() -> list | None:
@@ -376,12 +382,18 @@ def _drain_pending_locked() -> None:
             whole_ms = samp.start.elapsed_time(samp.end)
             record(samp.key, whole_ms, samp.spatial)
             if samp.stage_events:
-                prev = samp.start
-                stages = {}
-                for stage, ev in samp.stage_events:
-                    stages[stage] = prev.elapsed_time(ev)
-                    prev = ev
-                record_stages(samp.key, stages, samp.spatial)
+                # A `None` event (`record_stage_boundary`'s failure marker) means one of
+                # this sample's own boundaries never recorded — the sequential fold below
+                # cannot isolate that stage's interval, so it would silently hand its cost
+                # to a neighbour instead. Whole-cook time is already recorded above; drop
+                # the per-stage split for this ONE sample rather than corrupt a stage.
+                if not any(ev is None for _, ev in samp.stage_events):
+                    prev = samp.start
+                    stages = {}
+                    for stage, ev in samp.stage_events:
+                        stages[stage] = prev.elapsed_time(ev)
+                        prev = ev
+                    record_stages(samp.key, stages, samp.spatial)
         except Exception:
             pass            # a readback failure loses one sample; never raises to a caller
     _pending.clear()
