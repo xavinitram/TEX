@@ -20,8 +20,6 @@ previous event exists (an unconditional one-poll-interval wait, not a depth-gate
 so `_pace._resolve_depth` does not exist at all (AttributeError) and the ring/ construction-
 count assertions below have nothing matching to read.
 """
-import threading
-
 import pytest
 
 from TEX_Wrangle.tex_runtime import pacing as _pace
@@ -40,10 +38,21 @@ def _fresh_pacing_state():
 
 
 class _Token:
-    def __init__(self, pace=True, pace_depth=None):
+    """`pace_stride_ms=0` (stride DISABLED) by default: every depth/ring test in this file
+    predates the stride gate and asserts "every poll records" — mocked `_FakeEvent` calls
+    execute in nanoseconds of real wall-clock time, so with the module's nonzero default
+    stride, a mocked test's second-and-later polls would land inside the stride window and
+    never touch the ring at all, which is a real (and separately tested, see the STRIDE
+    section below) behaviour, but not what these depth/ring rows are about. The two rows
+    that ARE about striding construct their own `_Token` and override `pace_stride_ms`
+    explicitly."""
+
+    def __init__(self, pace=True, pace_depth=None, pace_stride_ms=0):
         self.pace = pace
         if pace_depth is not None:
             self.pace_depth = pace_depth
+        if pace_stride_ms is not None:      # pass None to get NO pace_stride_ms attribute
+            self.pace_stride_ms = pace_stride_ms
         self.checks = 0
 
     def check(self):
@@ -347,30 +356,6 @@ def _bindings(seed):
     return {"A": make_img(1, _SIZE, _SIZE, 4, seed=seed).cuda()}
 
 
-class _LiveToken:
-    def __init__(self, pace=True, pace_depth=None):
-        self.pace = pace
-        if pace_depth is not None:
-            self.pace_depth = pace_depth
-
-    def check(self):
-        pass
-
-
-class _ThreadTripToken:
-    def __init__(self, delay_s, pace_depth):
-        self.pace = True
-        self.pace_depth = pace_depth
-        self._tripped = threading.Event()
-        self._timer = threading.Timer(delay_s, self._tripped.set)
-        self._timer.daemon = True
-        self._timer.start()
-
-    def check(self):
-        if self._tripped.is_set():
-            raise CookCancelled("PACE-462 drained-bound repro: token tripped")
-
-
 def _measure_full_runtime():
     def once(seed):
         t0 = time.perf_counter()
@@ -380,6 +365,35 @@ def _measure_full_runtime():
 
     once(940)  # discard cold leg
     return min(once(941), once(942))
+
+
+class _StatementTripToken:
+    """PACE-462: trips deterministically once `trip_after` top-level statements have been
+    DISPATCHED, via the SAME `on_progress("stmt", ...)` callback the interpreter/codegen
+    tiers already report per statement -- immune to wall-clock/GPU-clock variance, unlike a
+    background `threading.Timer` calibrated against a separately-measured runtime (an
+    earlier version of this test used exactly that and was flaky on this box's laptop GPU,
+    which clock-ramps under load: a since-boosted paced cook's own host-return time could
+    legitimately land under a delay calibrated a few cooks earlier at a slower clock,
+    racing the trip to the finish before it ever fired). Pass as BOTH `cancel=` and
+    `on_progress=self.on_progress`."""
+    def __init__(self, trip_after, pace_depth=None):
+        self.pace = True
+        if pace_depth is not None:
+            self.pace_depth = pace_depth
+        self._trip_after = trip_after
+        self._count = 0
+        self._tripped = False
+
+    def on_progress(self, phase, frac):
+        if phase == "stmt":
+            self._count += 1
+            if self._count >= self._trip_after:
+                self._tripped = True
+
+    def check(self):
+        if self._tripped:
+            raise CookCancelled("PACE-462 drained-bound repro: statement-count trip fired")
 
 
 @pytest.mark.timing
@@ -396,13 +410,15 @@ def test_pace462_cuda_drained_bound(r):
     full = _measure_full_runtime()
     per_statement = full / _N_STATEMENTS
     depth = 2
-    delay = full * 0.25
-    tok = _ThreadTripToken(delay, pace_depth=depth)
+    trip_after = _N_STATEMENTS // 4
+    tok = _StatementTripToken(trip_after, pace_depth=depth)
 
     t_trip_seen = None
     try:
-        tex_engine.cook(_PROGRAM, _bindings(950), device_mode="cuda", cancel=tok)
-        r.fail("PACE-462 drained bound", "cook completed without raising")
+        tex_engine.cook(_PROGRAM, _bindings(950), device_mode="cuda", cancel=tok,
+                        on_progress=tok.on_progress)
+        r.fail("PACE-462 drained bound", f"cook completed without raising (tripped after "
+               f"statement {trip_after}/{_N_STATEMENTS})")
         return
     except CookCancelled:
         t_trip_seen = time.perf_counter()
@@ -421,3 +437,110 @@ def test_pace462_cuda_drained_bound(r):
     else:
         r.fail("PACE-462 drained bound", f"drain tail {drain_tail * 1000:.1f}ms exceeds bound "
                f"{max(bound, 0.05) * 1000:.1f}ms")
+
+
+# ── The STRIDE: polls inside the window record nothing; the first poll past it records ──
+#
+# Deterministic, no wall-clock: a fake `_pace._time.perf_counter` under direct control, so
+# "has `stride` seconds of HOST time passed since the ring last recorded" is provable
+# without ever actually sleeping.
+
+class _FakeClock:
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += dt
+
+
+def test_stride_gates_the_ring_not_the_token_check(r):
+    """With a stride of 10ms and a large depth (so the ring-full wait never fires in this
+    test), a poll 1ms after the ring last recorded must touch NEITHER the ring nor
+    `torch.cuda` beyond `token.check()`; a poll 20ms after must record."""
+    print("\n--- PACE-462 stride: polls inside the window record nothing ---")
+    clock = _FakeClock(0.0)
+    real_perf_counter = _pace._time.perf_counter
+    _pace._time.perf_counter = clock
+    try:
+        with _DeviceSpy() as spy:
+            tok = _Token(pace=True, pace_depth=8)
+            tok.pace_stride_ms = 10.0
+            _pace.reset(tok, "cuda")
+
+            _pace.paced_check(tok, "cuda")             # t=0.0: no prior record -> records
+            constructed_after_first = _FakeEvent._live
+            count_after_first = _pace._state.count  # noqa: SLF001
+
+            clock.advance(0.001)                        # t=0.001: 1ms since last record
+            _pace.paced_check(tok, "cuda")               # inside the 10ms stride -> skip
+            constructed_after_inside = _FakeEvent._live
+            count_after_inside = _pace._state.count  # noqa: SLF001
+
+            clock.advance(0.019)                         # t=0.020: 19ms since last record
+            _pace.paced_check(tok, "cuda")               # past the stride -> records
+            count_after_past = _pace._state.count  # noqa: SLF001
+    finally:
+        _pace._time.perf_counter = real_perf_counter
+
+    checks_total = tok.checks
+    ok = (count_after_first == 1 and constructed_after_first == 1
+          and count_after_inside == 1 and constructed_after_inside == 1
+          and count_after_past == 2
+          and checks_total == 3)
+    if ok:
+        r.ok(f"first poll recorded (count=1), the 1ms-later poll stayed inside the stride "
+             f"window (still count=1, 0 new events), the 19ms-later poll recorded (count=2); "
+             f"token.check() called {checks_total} times across all 3 polls")
+    else:
+        r.fail("PACE-462 stride gate",
+               f"counts: first={count_after_first} constructed={constructed_after_first}, "
+               f"inside={count_after_inside} constructed={constructed_after_inside}, "
+               f"past={count_after_past}, token.checks={checks_total}")
+
+
+def test_stride_zero_disables_the_gate(r):
+    """`pace_stride_ms=0` must record at EVERY poll, exactly as depth-only pacing (no
+    stride at all) did -- the explicit escape hatch back to the pre-stride mechanism."""
+    print("\n--- PACE-462 stride: pace_stride_ms=0 records every poll ---")
+    with _DeviceSpy():
+        tok = _Token(pace=True, pace_depth=8)
+        tok.pace_stride_ms = 0
+        _pace.reset(tok, "cuda")
+        for _ in range(5):
+            _pace.paced_check(tok, "cuda")
+        count = _pace._state.count  # noqa: SLF001
+    if count == 5:
+        r.ok("pace_stride_ms=0 recorded on all 5 polls (stride disabled)")
+    else:
+        r.fail("PACE-462 stride=0", f"expected count=5 (every poll recorded), got {count}")
+
+
+def test_pace_stride_ms_default_when_absent(r):
+    print("\n--- PACE-462: pace_stride_ms absent resolves to the module default ---")
+    tok = _Token(pace=True, pace_stride_ms=None)  # None -> no pace_stride_ms attribute at all
+    resolved = _pace._resolve_stride(tok)  # noqa: SLF001
+    if resolved == _pace._DEFAULT_STRIDE_S:  # noqa: SLF001
+        r.ok(f"resolved default stride {resolved}s")
+    else:
+        r.fail("PACE-462 default stride", f"expected {_pace._DEFAULT_STRIDE_S}, got {resolved}")
+
+
+@pytest.mark.parametrize("bad_stride", [-1, -0.5, "3", True, False])
+def test_pace_stride_ms_rejects_invalid(bad_stride):
+    """`pace_stride_ms` must be a plain non-negative `int` or `float` -- `bool` rejected
+    (`type(x) not in (int, float)`), negative rejected."""
+    tok = _Token(pace=True)
+    tok.pace_stride_ms = bad_stride
+    with pytest.raises(ValueError):
+        _pace._resolve_stride(tok)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("good_stride,expected_s", [(0, 0.0), (5, 0.005), (2.5, 0.0025)])
+def test_pace_stride_ms_accepts_valid(good_stride, expected_s):
+    tok = _Token(pace=True)
+    tok.pace_stride_ms = good_stride
+    resolved = _pace._resolve_stride(tok)  # noqa: SLF001
+    assert abs(resolved - expected_s) < 1e-12

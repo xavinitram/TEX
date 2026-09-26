@@ -151,6 +151,33 @@ class _ThreadTripToken:
             raise CookCancelled("PACE-45 repro: deadline token tripped")
 
 
+class _StatementTripToken:
+    """PACE-462: trips deterministically after `trip_after` top-level statements have been
+    DISPATCHED, via the SAME `on_progress("stmt", ...)` callback the interpreter/codegen
+    tiers already report on every statement (see `interpreter.py`'s statement loop) --
+    immune to wall-clock/GPU-clock variance entirely, unlike a background `threading.Timer`
+    racing a moving completion target. Pass as BOTH `cancel=` (this token) and
+    `on_progress=self.on_progress` to `tex_engine.cook`. This still exercises the real
+    regression this ask answers: the trip is observed by `paced_check`'s `token.check()` at
+    the NEXT poll point after it fires, exactly the yield-point mechanism under test -- it
+    is only the ARMING that is now deterministic, not the poll/raise path."""
+    def __init__(self, trip_after: int, pace: bool = True):
+        self.pace = pace
+        self._trip_after = trip_after
+        self._count = 0
+        self._tripped = False
+
+    def on_progress(self, phase, frac) -> None:
+        if phase == "stmt":
+            self._count += 1
+            if self._count >= self._trip_after:
+                self._tripped = True
+
+    def check(self) -> None:
+        if self._tripped:
+            raise CookCancelled("PACE-45 repro: statement-count trip fired")
+
+
 def _measure_full_runtime_cuda() -> float:
     """The TRUE uncancelled GPU completion time (drain included), independent of pacing --
     an explicit `torch.cuda.synchronize()` after `cook()` returns, mirroring how the finding
@@ -189,17 +216,21 @@ def test_pace45_cuda_pacing_bit_exact_and_repro(r: SubTestResult):
     else:
         r.fail("PACE-45 CUDA bit-exactness", f"maxdiff {md}")
 
-    # -- The repro itself: a token armed for pacing, tripped from another thread at 25% of
-    #    the uncancelled runtime, must raise well before that runtime elapses. At v0.45.1
-    #    this never raised at all (the whole queue -- 64 statements at 8K there -- was
-    #    already launched in ~15ms, long before a mid-cook trip had anything left to reach).
-    delay = full * 0.25
-    tok = _ThreadTripToken(delay, pace=True)
+    # -- The repro itself: a token armed for pacing, tripped after a quarter of the
+    #    statements have DISPATCHED (PACE-462: `_StatementTripToken` -- deterministic,
+    #    immune to the wall-clock/GPU-clock variance a `threading.Timer` calibrated against
+    #    a separately-measured `full` turned out to have on this box; see its docstring),
+    #    must raise well before the whole program finishes. At v0.45.1 this never raised at
+    #    all (the whole queue -- 64 statements at 8K there -- was already launched in
+    #    ~15ms, long before a mid-cook trip had anything left to reach).
+    tok = _StatementTripToken(trip_after=_N_STATEMENTS // 4, pace=True)
     t0 = time.perf_counter()
     try:
-        tex_engine.cook(_PROGRAM, _pace45_bindings(920), device_mode="cuda", cancel=tok)
+        tex_engine.cook(_PROGRAM, _pace45_bindings(920), device_mode="cuda", cancel=tok,
+                        on_progress=tok.on_progress)
         r.fail("PACE-45 repro", f"cook completed without raising (full={full * 1000:.0f}ms, "
-               f"trip delay={delay * 1000:.0f}ms) -- the regression is back")
+               f"trip after statement {tok._trip_after}/{_N_STATEMENTS}) -- the regression "
+               f"is back")
         return
     except CookCancelled:
         elapsed = time.perf_counter() - t0
@@ -207,7 +238,8 @@ def test_pace45_cuda_pacing_bit_exact_and_repro(r: SubTestResult):
 
     if elapsed < full:
         r.ok(f"paced cancel raised after {elapsed * 1000:.0f}ms, well inside the "
-             f"{full * 1000:.0f}ms uncancelled runtime (trip armed at {delay * 1000:.0f}ms)")
+             f"{full * 1000:.0f}ms uncancelled runtime (tripped after statement "
+             f"{tok._trip_after}/{_N_STATEMENTS})")
     else:
         r.fail("PACE-45 repro", f"raised, but only after {elapsed * 1000:.0f}ms -- not before "
                f"the {full * 1000:.0f}ms uncancelled runtime")
@@ -217,13 +249,23 @@ def test_pace45_cuda_pacing_bit_exact_and_repro(r: SubTestResult):
 def test_pace45_cuda_repro_latency(r: SubTestResult):
     """Timing half of the same repro: the bound is against the TRIP, not the whole runtime --
     how promptly the cancel actually lands once pacing is armed. CUDA, quiet-box
-    informational, deselected by default (`-m 'not timing'`); run alone with `-m timing`."""
+    informational, deselected by default (`-m 'not timing'`); run alone with `-m timing`.
+
+    Genuinely needs an ASYNCHRONOUS trip (a background thread, via `_ThreadTripToken`) --
+    the property under test is "does a trip landing WHILE the host is parked in a
+    `synchronize()` wait get caught promptly", which a same-thread progress callback
+    cannot exercise (there is no wait for it to land inside). PACE-462: the delay is scaled
+    to `per_statement` (this run's own measured per-statement share of `full`), not a
+    fraction of `full` itself, so it stays self-consistent under the same GPU clock-ramp
+    variance that made a `full`-fraction delay race the actual completion on this box --
+    both `per_statement` and the real per-statement pace move together with clock state."""
     if not torch.cuda.is_available():
         r.skip("PACE-45 CUDA repro latency", "no CUDA on this box")
         return
 
     full = _measure_full_runtime_cuda()
-    delay = full * 0.25
+    per_statement = full / _N_STATEMENTS
+    delay = per_statement * 1.5
     trials = 5
     latencies = []
     for i in range(trials):
@@ -231,7 +273,8 @@ def test_pace45_cuda_repro_latency(r: SubTestResult):
         t0 = time.perf_counter()
         try:
             tex_engine.cook(_PROGRAM, _pace45_bindings(930 + i), device_mode="cuda", cancel=tok)
-            r.fail("PACE-45 repro latency", "cook completed without raising")
+            r.fail("PACE-45 repro latency", f"cook completed without raising (per_statement="
+                   f"{per_statement * 1000:.2f}ms, trip delay={delay * 1000:.2f}ms)")
             return
         except CookCancelled:
             latencies.append(time.perf_counter() - t0 - delay)

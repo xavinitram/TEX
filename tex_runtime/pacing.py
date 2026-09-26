@@ -53,6 +53,31 @@ no allocation. `reset()` grows the ring if a later cook asks for a bigger `depth
 thread has ever needed, and never shrinks it, so warm-thread cost trends toward "event
 recording only" the way the ask's target names it.
 
+**The STRIDE, added after measuring that depth alone does not help every program shape.**
+Depth bounds LOOK-AHEAD in units of poll-intervals, but a "poll-interval" is not a fixed
+amount of device work — a chain of many CHEAP per-pixel statements puts a `torch.cuda.Event`
+record/wait at EVERY one of them, and a real `event.synchronize()` call has a fixed cost
+that is not free next to a kernel that itself takes only microseconds: measured 10-44%
+overhead on such a chain (200+ statements of trivial arithmetic, 256-1024 px) at every depth
+swept, with `stride` disabled. (A program shaped like an embedding host's own background
+render — a `gauss_blur` chain, real per-statement device work, not the cheap-arithmetic
+shape above — already read within noise WITHOUT striding at all; the cheap-chain risk is a
+defensive bound against a class of programs, not evidence that any specific host workload
+needs it. See the hand-back for the full (stride x depth) table across three shapes.) The
+fix is to stop treating every poll as a candidate to record: a poll only touches the ring
+(records/waits) once at least `stride` seconds of HOST time have passed since the ring last
+recorded; every poll in between is `token.check()` alone, no CUDA call at all. `stride`
+defaults to a module constant (`_DEFAULT_STRIDE_S`, chosen by measurement) and a token may
+override it with a `pace_stride_ms` attribute (non-negative int or float; `0` disables
+striding, recording at every poll exactly as depth-only pacing did). **The pre-emption bound
+becomes approximately `depth * max(stride, one statement's own device time)`**: a
+poll-interval is now a stride WINDOW, which may contain many cheap statements or, on a heavy
+chain where one statement alone exceeds `stride`, exactly one — either way the device is
+never more than `depth` such windows behind the host. The token is still polled
+(`token.check()`) at literally every poll point regardless of the stride gate, so
+cancellation latency is unaffected by striding; only the ring's record/wait bookkeeping is
+throttled.
+
 **OVERHEAD-462's default-path finding, and the second cut here.** Every CUDA cook —
 paced or not — pays `reset()` + `cook_done_event()`, and the attribution pass measured
 ~18us/cook on the default (unpaced) path, dominated by `with torch.cuda.device(device):`
@@ -79,6 +104,7 @@ share, or wait on, this cook's event ring."""
 from __future__ import annotations
 
 import threading as _threading
+import time as _time
 
 import torch
 
@@ -96,6 +122,17 @@ _state = _threading.local()
 #: heavy-chain target shape. See the hand-back for the full per-depth table and the sm_75 gap
 #: (unreachable this session).
 _DEFAULT_DEPTH = 2
+
+#: Minimum HOST time (seconds) that must pass since the ring last recorded before a poll
+#: point is allowed to touch it again. Chosen by measurement (laptop sm_120, quiet box)
+#: across four program shapes at depth 1-2: a heavy `gauss_blur` chain (this ask's own
+#: benchmark shape, cost within noise at every stride incl. 0); two chains of 220+ cheap
+#: per-pixel statements at 256^2 and 1024^2 (cost +40-44%/+1.7-10.5% with striding OFF,
+#: +/-3%/+/-5% at every nonzero stride tried); and a `gauss_blur(3.0)` chain calibrated to
+#: ~300ms at 1024^2 mirroring an embedding host's own background-render repro shape (already
+#: within noise, striding on or off). 0.5 ms keeps every shape within a few percent of
+#: unpaced. See the hand-back for the full (stride x depth) table.
+_DEFAULT_STRIDE_S = 0.0005
 
 
 def wants_pacing(token) -> bool:
@@ -116,6 +153,20 @@ def _resolve_depth(token) -> int:
     if type(depth) is not int or depth < 1:
         raise ValueError(f"pace_depth must be a positive int, got {depth!r}")
     return depth
+
+
+def _resolve_stride(token) -> float:
+    """The stride, in SECONDS, for this cook: derived from `token.pace_stride_ms` if the
+    token names one (validated: a plain `int` or `float` — `type(x) in (int, float)`, not
+    `isinstance`, so a `bool` is rejected the same way `_resolve_depth` rejects one — and
+    non-negative; `0` disables striding outright, recording at every poll), else
+    `_DEFAULT_STRIDE_S`."""
+    stride_ms = getattr(token, "pace_stride_ms", None)
+    if stride_ms is None:
+        return _DEFAULT_STRIDE_S
+    if type(stride_ms) not in (int, float) or stride_ms < 0:
+        raise ValueError(f"pace_stride_ms must be a non-negative int or float, got {stride_ms!r}")
+    return stride_ms / 1000.0
 
 
 def _is_cuda(device) -> bool:
@@ -195,7 +246,12 @@ def reset(token=None, device=None) -> None:
     outlives any one cook, grown (never shrunk, never recreated) only when a cook asks for a
     bigger depth than this thread has ever needed, so a thread's Nth cook pays for event
     allocation at most once per ring slot, not once per cook. Only the ring's head/count
-    (this cook's own poll sequence) start fresh."""
+    (this cook's own poll sequence) start fresh.
+
+    Also resolves this cook's `stride` once (the same way), and clears
+    `last_record_t` to `None` — a fresh cook has no prior record to measure a stride
+    against, so its FIRST paced poll always records/waits regardless of `stride`, exactly
+    as the first `depth` polls of a cook always record regardless of the ring being warm."""
     is_cuda, idx, is_current = _resolve_cuda_target(device)
     _state.is_cuda = is_cuda
     _state.device_index = idx
@@ -204,6 +260,7 @@ def reset(token=None, device=None) -> None:
     _state.paced = wants_pacing(token) and is_cuda
     if _state.paced:
         _state.depth = _resolve_depth(token)
+        _state.stride_s = _resolve_stride(token)
         ring = getattr(_state, "ring", None)
         if ring is None:
             ring = []
@@ -212,6 +269,7 @@ def reset(token=None, device=None) -> None:
         _state.ring = ring
     _state.head = 0
     _state.count = 0
+    _state.last_record_t = None
 
 
 def paced_check(token, device) -> None:
@@ -221,7 +279,15 @@ def paced_check(token, device) -> None:
     identical to before this ask plus one cheap attribute read.
 
     Paced (a CUDA cook, a token with a truthy `pace`): polls the token first (an
-    already-tripped token is caught before any device interaction), then, only if the
+    already-tripped token is caught before any device interaction) — ALWAYS, regardless of
+    what follows, so cancellation latency never depends on the stride gate below. Then, if
+    fewer than `stride` seconds of host time have passed since the ring last recorded, this
+    poll is DONE: no ring access, no CUDA call at all beyond the `token.check()` already
+    paid. That is the stride gate a chain of many cheap statements needs — recording a CUDA
+    event at every one of them costs more than the statements themselves, measured (see the
+    hand-back).
+
+    Past the stride, the poll behaves exactly as depth-only PACE-462 did: only if the
     look-ahead ring already holds `depth` outstanding events, blocks on the OLDEST one
     (`event.synchronize()`, a real blocking wait — not a busy `query()` loop) and polls the
     token again immediately after, so a trip that lands WHILE the host is parked in the wait
@@ -231,9 +297,10 @@ def paced_check(token, device) -> None:
     when this cook's device is already ambient-current (OVERHEAD-462, resolved once by
     `reset()` above).
 
-    `_state.paced`/`_state.depth` are read off state resolved once by `reset()` (above)
-    rather than recomputed here every call — `getattr(..., False)` covers a poll reached
-    without a prior `reset()` on this thread (reads as unpaced, the old default)."""
+    `_state.paced`/`_state.depth`/`_state.stride_s` are read off state resolved once by
+    `reset()` (above) rather than recomputed here every call — `getattr(..., False)` covers
+    a poll reached without a prior `reset()` on this thread (reads as unpaced, the old
+    default)."""
     if token is None:
         return
     if not getattr(_state, "paced", False):
@@ -241,6 +308,12 @@ def paced_check(token, device) -> None:
         return
 
     token.check()
+
+    stride = getattr(_state, "stride_s", _DEFAULT_STRIDE_S)
+    if stride > 0:
+        last = getattr(_state, "last_record_t", None)
+        if last is not None and (_time.perf_counter() - last) < stride:
+            return  # inside the stride window: token already checked, nothing else to do
 
     depth = getattr(_state, "depth", _DEFAULT_DEPTH)
     ring = getattr(_state, "ring", None)
@@ -272,6 +345,7 @@ def paced_check(token, device) -> None:
 
     _state.head = head
     _state.count = count + 1
+    _state.last_record_t = _time.perf_counter()
 
 
 def cook_done_event(device) -> "torch.cuda.Event | None":

@@ -34,7 +34,14 @@ class _NeverTrips:
 
 class _FakeEvent:
     """A stand-in for `torch.cuda.Event` that needs no real CUDA context: `record()` is a
-    no-op and `query()` always reports done, so `paced_check`'s wait loop never blocks."""
+    no-op and `query()` always reports done, so `paced_check`'s wait loop never blocks.
+    Accepts (and ignores) `blocking=` — PACE-462's ring creates its events with
+    `torch.cuda.Event(blocking=True)`, so a mock with no constructor args at all raises
+    `TypeError` the instant a real ring slot needs building, which is exactly what a
+    CI/canonical run caught here before this fix."""
+
+    def __init__(self, blocking=False):
+        self.blocking = blocking
 
     def record(self):
         pass
