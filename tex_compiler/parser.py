@@ -84,6 +84,32 @@ def language_pragma(source: str):
     return None
 
 
+# SCALE-47b: `//!tex scale: safe` / `//!tex scale: never` — an author override for the
+# scale-safety classifier (`tex_roi.scale_safe`), parsed by the SAME header-scan convention
+# as `_PRAGMA_RE`/`language_pragma` above (a leading run of blank/`//`-comment lines; one
+# buried after real code is ignored) rather than a new grammar rule — it never becomes a
+# token, exactly like the language pragma.
+_SCALE_PRAGMA_RE = _re.compile(r"//!tex\s+scale\s*:\s*(safe|never)\b")
+
+
+def scale_pragma(source: str):
+    """Return `"safe"`, `"never"`, or `None` (no override) from a LEADING `//!tex scale: …`
+    comment — the author's override of the conservative scale-safety classifier, in either
+    direction (AUTHOR DECISION, SCALE-47b). Same header-only recognition rule as
+    `language_pragma`: a pragma after real code or inside a block comment does not count."""
+    for raw in (source or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = _SCALE_PRAGMA_RE.match(line)
+        if m:
+            return m.group(1)
+        if line.startswith("//"):
+            continue
+        break
+    return None
+
+
 class ParseError(Exception):
     def __init__(self, message: str, loc: SourceLoc, *, source: str = "",
                  code: str = "E2000", hint: str = "", end_col: int | None = None):

@@ -317,6 +317,12 @@ from dataclasses import dataclass as _dataclass
 #: message beside it is free to be reworded, the code is not.
 REFUSE_OUT_OF_MEMORY = "out-of-memory"
 
+#: SCALE-47b (R3/R5): a cook asked for `scale` neither `None` nor `1.0` on a program
+#: `tex_roi.scale_safe` (or its `//!tex scale: never` override) declines to prove safe. The
+#: engine never silently substitutes full scale for a declined request — it refuses, and the
+#: host decides (retry at `scale=None`, or accept full-scale cost).
+REFUSE_SCALE_UNSAFE = "scale-unsafe"
+
 
 @_dataclass(frozen=True, slots=True)
 class EngineRefusal:

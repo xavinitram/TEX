@@ -1014,6 +1014,76 @@ def batch_sliceable(code: str, param_values: dict | None = None,
         return False
 
 
+# ── SCALE-47b: the conservative scale-safety classifier ───────────────────────
+# R3 (an embedding host's requirement, adopted): a program that reads pixel coordinates directly does
+# NOT look like "the same picture, downscaled" under a resolution change — `ix`/`iy` and
+# `img_width`/`img_height` are the ACTUAL canvas's pixel grid, and hand arithmetic on them
+# (or feeding them into `sdf_*`/`fbm`/`worley_*`, which take generic float coordinates with
+# no fixed unit contract) means a different answer at a different resolution. `fetch`/
+# `fetch_frame`'s OWN coordinate arguments, and the `@A[x,y]`/`@A(u,v)` sugar's, are the one
+# whitelisted exception: those already read the real (possibly host-shrunk) canvas by
+# construction, so `ix`/`iy` used ONLY there is not a hazard.
+#
+# Conservative by construction, same posture as `region_dependent`/ROI-1's footprint
+# derivation: a program this walk cannot prove safe is declared UNSAFE, never the reverse
+# — wrong only in the safe direction (a missed optimisation, never a wrong picture).
+_FETCH_COORD_ARGS = {
+    "fetch": (1, 2),           # fetch(image, px, py)
+    "fetch_frame": (2, 3),     # fetch_frame(image, frame, px, py)
+}
+_PIXEL_COORD_NAMES = ("ix", "iy")
+_PIXEL_DIM_NAMES = ("img_width", "img_height")
+
+
+def _scale_unsafe_walk(node, in_coord_arg: bool = False) -> bool:
+    """True if `node` (or anything under it) reads a pixel coordinate/dimension builtin
+    outside the whitelisted fetch/`@A[x,y]` coordinate position. `in_coord_arg` marks that
+    THIS node is itself one of those whitelisted positions — it suppresses the `ix`/`iy`
+    check for this subtree only; `img_width`/`img_height` are never whitelisted anywhere
+    (no stdlib call takes a frame dimension as a coordinate argument)."""
+    cls = node.__class__
+    if cls is Identifier:
+        if node.name in _PIXEL_DIM_NAMES:
+            return True
+        return node.name in _PIXEL_COORD_NAMES and not in_coord_arg
+    if cls is BindingIndexAccess or cls is BindingSampleAccess:
+        # `@A[ix,iy]` / `@A(u,v)` sugar — the args ARE the whitelisted coordinate position,
+        # on both a read and a scatter-write target (Assignment recurses into its target).
+        return any(_scale_unsafe_walk(a, in_coord_arg=True) for a in node.args)
+    if cls is FunctionCall:
+        coord_idx = _FETCH_COORD_ARGS.get(node.name)
+        for i, a in enumerate(node.args):
+            if _scale_unsafe_walk(a, in_coord_arg=(coord_idx is not None and i in coord_idx)):
+                return True
+        return False
+    return any(_scale_unsafe_walk(child) for child in iter_child_nodes(node))
+
+
+def scale_safe(code: str, param_values: dict | None = None) -> bool:
+    """Is this program safe to cook at a non-1.0 `scale`? An author override — a LEADING
+    `//!tex scale: safe` / `//!tex scale: never` comment (`tex_compiler.parser.scale_pragma`,
+    parsed the same way as the `//!tex X.Y` language pragma) — wins outright in either
+    direction; absent one, the conservative walk above decides. FAILS CLOSED: a parse
+    failure or any other exception answers `False` (unsafe) rather than silently permitting
+    a scale request the analysis could not actually verify.
+
+    `tex_engine.prepare()` consults this (and `tex_api.scale_verdict()` mirrors it) before
+    honouring a `scale` that is neither `None` nor `1.0` — R5: the engine never silently
+    picks full scale for a program this declines; it refuses, structured, and the host
+    decides whether to retry at `scale=None`."""
+    from .tex_compiler.parser import scale_pragma
+    override = scale_pragma(code)
+    if override == "safe":
+        return True
+    if override == "never":
+        return False
+    try:
+        program = _fold_program(code, param_values or {})
+        return not any(_scale_unsafe_walk(stmt) for stmt in program.statements)
+    except Exception:
+        return False
+
+
 def roi_exec_enabled(opt_in: bool | None = None) -> bool:
     """Whether the engine's auto-narrow ROI path may engage — v0.30's flip, **per cook**.
 

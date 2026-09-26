@@ -118,7 +118,8 @@ from .tex_marshalling import (
 from .tex_runtime.host import (get_host_services, CookCancelled,
                                _cancel_check, _report_progress,
                                _attach_refusal, EngineRefusal,  # v0.42 HOSTAUDIT-4a
-                               REFUSE_OUT_OF_MEMORY)             # noqa: F401 (re-export)
+                               REFUSE_OUT_OF_MEMORY,             # noqa: F401 (re-export)
+                               REFUSE_SCALE_UNSAFE)              # noqa: F401 (re-export, SCALE-47b)
 # PROF-1: the cost profiler. Disarmed by default — the default cook path's whole cost is the
 # one `enabled()` call in run(). See tex_runtime/profile.py's invariant-#7 note.
 from .tex_runtime import profile as _profile, pacing as _pace
@@ -579,6 +580,25 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     # The `auto`-resolved twin of this rule is in the precision block further down.
     if precision == "fp16" and compile_mode != "none":
         precision = "fp32"
+    # SCALE-47b (R3/R5): a genuinely coarse request (neither None nor the byte-identical
+    # 1.0 — invariant #7) on a program `tex_roi.scale_safe` cannot prove safe REFUSES rather
+    # than silently cooking at full scale (R5: the engine never picks a scale for the host)
+    # or silently cooking wrong (R1). Cheap: one memo-backed parse + AST walk, before any
+    # real compile/preflight work below. Scoped to `code` (the terminal stage's own source
+    # on a fused chain — see the ROI-3 gate's identical scoping note further down); a
+    # multi-stage fused chain's UPSTREAM stages are not walked by this check.
+    if scale is not None and scale != 1.0:
+        from . import tex_roi as _tex_roi
+        if not _tex_roi.scale_safe(code):
+            exc = RuntimeError(
+                f"scale={scale!r} refused: this program is not provably scale-safe "
+                f"(it reads a pixel coordinate/dimension builtin outside a whitelisted "
+                f"fetch call, or declares `//!tex scale: never`). Cook at scale=None (or "
+                f"1.0) for full resolution, or add `//!tex scale: safe` if you can vouch "
+                f"for it.")
+            exc.tex_refusal = EngineRefusal(REFUSE_SCALE_UNSAFE, None,
+                                            "this program is not provably scale-safe")
+            raise exc
     # CACHE-1: the interpreter reads the playhead by duck-typing (`time_context.get(name)`, any
     # Mapping), but the lineage keyer type-checks it — so a Mapping-but-not-dict playhead (a
     # MappingProxyType read-only view a host might hand out) would drive the pixels yet fall out
