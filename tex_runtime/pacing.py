@@ -223,61 +223,62 @@ def reset(token=None, device=None) -> None:
     before that seam does (the stencil route's entry check), so that poll never waits on a
     stale event left over from an unrelated, already-returned cook on this thread.
 
-    Resolves "does THIS cook want pacing?" exactly once, here — `wants_pacing(token) and
-    is_cuda` — rather than re-deriving it at every single `paced_check` poll point for the
-    cook's whole duration (O5, v0.46). `token`/`device` default to `None` (reads as "no
-    pacing"), so a caller that predates O5 and still calls `reset()` with no arguments gets
-    the exact same answer `paced_check` used to compute fresh each time on a bare/absent
-    token.
+    Resolves "does THIS cook want pacing?" exactly once, here, rather than re-deriving it at
+    every single `paced_check` poll point for the cook's whole duration (O5, v0.46).
+    `token`/`device` default to `None` (reads as "no pacing"), so a caller that predates O5
+    and still calls `reset()` with no arguments gets the exact same answer `paced_check` used
+    to compute fresh each time on a bare/absent token.
 
-    OVERHEAD-462: ALSO resolves, once, the answer `cook_done_event` and the event-record
-    step need regardless of pacing — is this CUDA, which index, and is that index already
-    ambient-current — and caches it (`_state.is_cuda`/`device_index`/`is_current`/
-    `resolved_device`) for both to reuse instead of re-deriving it. This runs unconditionally
-    (no longer short-circuited behind `wants_pacing`), because `cook_done_event` needs the
-    answer on EVERY CUDA cook whether or not that cook paces, and it previously computed it
-    itself from scratch every single time; resolving it here removes that duplicate work
-    rather than adding new work. On a CPU cook this is one cheap `torch.device()` construct-
-    and-compare (`_is_cuda`'s existing short-circuit — no `is_available()` call once the type
-    check alone answers `False`), the same cost `cook_done_event` used to pay alone.
+    P2 (Phase C): SHORT-CIRCUITS exactly like the pre-OVERHEAD-462 body —
+    `wants_pacing(token) and is_cuda`, Python's `and` — for an unpaced token: no
+    `_resolve_cuda_target` call, no CUDA/device touch of any kind, `_state.paced` set `False`
+    and nothing else written. OVERHEAD-462 had made this resolution run UNCONDITIONALLY (to
+    share it with `cook_done_event`), which measured 8.5x-30.7x SLOWER on the exact
+    default (unpaced) path invariant 7 protects — the device/CUDA resolution is not free, and
+    `cook_done_event` no longer needs anything this function resolves (it keeps its own
+    memo, see below), so there is nothing left to share it FOR. A CPU cook or a token with no
+    `pace` attribute (every caller before PACE-45) costs one `wants_pacing` attribute read,
+    nothing more — the same one-line body this function had before OVERHEAD-462.
 
-    PACE-462: also resolves this cook's look-ahead `depth` once, the same way `paced`
-    already was. The event RING itself is NOT reset here — it is a per-thread resource that
-    outlives any one cook, grown (never shrunk, never recreated) only when a cook asks for a
-    bigger depth than this thread has ever needed, so a thread's Nth cook pays for event
-    allocation at most once per ring slot, not once per cook. Only the ring's head/count
-    (this cook's own poll sequence) start fresh.
-
-    Also resolves this cook's `stride` once (the same way), and clears
-    `last_record_t` to `None` — a fresh cook has no prior record to measure a stride
-    against, so its FIRST paced poll always records/waits regardless of `stride`, exactly
-    as the first `depth` polls of a cook always record regardless of the ring being warm."""
+    Only when `wants_pacing(token)` is true does this resolve is-CUDA/index/is-current (once,
+    here — PACE-45's original short-circuit, restored), then, only if the device really is
+    CUDA, this cook's look-ahead `depth` and `stride`, and grows the per-(thread, device)
+    look-ahead ring if a bigger `depth` is asked for than this thread has ever needed for
+    THIS device index (P1: a different device index drops the ring rather than reusing a
+    foreign-device slot — see the comment at the drop below). The ring itself is a per-thread
+    resource that outlives any one cook — never shrunk, never recreated for the SAME device —
+    so a thread's Nth cook on a device it has already paced for pays for event allocation at
+    most once per ring slot, not once per cook. Only the ring's head/count (this cook's own
+    poll sequence) and `last_record_t` start fresh, so a fresh cook's first paced poll always
+    records/waits regardless of `stride`, exactly as its first `depth` polls always record
+    regardless of the ring being warm."""
+    if not wants_pacing(token):
+        _state.paced = False
+        return
     is_cuda, idx, is_current = _resolve_cuda_target(device)
-    _state.is_cuda = is_cuda
-    _state.device_index = idx
+    _state.paced = is_cuda
+    if not is_cuda:
+        return
     _state.is_current = is_current
-    _state.resolved_device = device
-    _state.paced = wants_pacing(token) and is_cuda
-    if _state.paced:
-        _state.depth = _resolve_depth(token)
-        _state.stride_s = _resolve_stride(token)
-        ring = getattr(_state, "ring", None)
-        ring_device_index = getattr(_state, "ring_device_index", None)
-        if ring is None or ring_device_index != idx:
-            # P1: the ring is thread-local, not (thread, device)-local. A warm slot holds an
-            # already-record()ed `torch.cuda.Event`, and a CUDA event binds to whichever
-            # device is ambient the first time it is recorded — re-record()ing it while a
-            # DIFFERENT device is ambient is a real `cudaEventRecord` device-mismatch crash,
-            # not a PyTorch-added restriction. A same-thread cook that targets a different
-            # CUDA device than the last paced cook on this thread must never reuse the old
-            # ring's slots, so drop it and start fresh — the overwhelmingly common
-            # single-GPU-host case takes this branch at most once (the thread's first paced
-            # cook), never again.
-            ring = []
-            _state.ring_device_index = idx
-        if len(ring) < _state.depth:
-            ring = ring + [None] * (_state.depth - len(ring))
-        _state.ring = ring
+    _state.depth = _resolve_depth(token)
+    _state.stride_s = _resolve_stride(token)
+    ring = getattr(_state, "ring", None)
+    ring_device_index = getattr(_state, "ring_device_index", None)
+    if ring is None or ring_device_index != idx:
+        # P1: the ring is thread-local, not (thread, device)-local. A warm slot holds an
+        # already-record()ed `torch.cuda.Event`, and a CUDA event binds to whichever
+        # device is ambient the first time it is recorded — re-record()ing it while a
+        # DIFFERENT device is ambient is a real `cudaEventRecord` device-mismatch crash,
+        # not a PyTorch-added restriction. A same-thread cook that targets a different
+        # CUDA device than the last paced cook on this thread must never reuse the old
+        # ring's slots, so drop it and start fresh — the overwhelmingly common
+        # single-GPU-host case takes this branch at most once (the thread's first paced
+        # cook), never again.
+        ring = []
+        _state.ring_device_index = idx
+    if len(ring) < _state.depth:
+        ring = ring + [None] * (_state.depth - len(ring))
+    _state.ring = ring
     _state.head = 0
     _state.count = 0
     _state.last_record_t = None
@@ -359,6 +360,9 @@ def paced_check(token, device) -> None:
     _state.last_record_t = _time.perf_counter()
 
 
+_UNSET = object()  #: cook_done_event's memo has never been written on this thread yet
+
+
 def cook_done_event(device) -> "torch.cuda.Event | None":
     """A "GPU work done" fence: a CUDA event recorded on *device*'s current stream, marking
     this cook's LAST launch so far — `None` off CUDA. Recording an event is itself just
@@ -367,21 +371,32 @@ def cook_done_event(device) -> "torch.cuda.Event | None":
     hold onto and synchronize `CookResult.done` well after this cook returns, so it is never
     drawn from `paced_check`'s reusable ring.
 
-    OVERHEAD-462: reuses `reset()`'s cached is-CUDA/index/is-current answer for *this exact*
-    `device` instead of re-deriving it (the duplicate-parse half of the fix), and
-    `_record_on` skips `torch.cuda.device(...)` when the cook's device is already
-    ambient-current (the context-manager-cost half — O4's non-current-device correctness is
-    unchanged, see `_record_on`). Falls back to a fresh `_resolve_cuda_target` call — exactly
-    what this function did before OVERHEAD-462 — when there is no cached answer for this
-    device on this thread (no `reset()` call reached this cook, or it targeted a different
-    device), so a caller that predates this cut, or a stale/foreign cache, still gets the
-    correct answer rather than a wrong cached one."""
-    if getattr(_state, "is_cuda", None) is not None and getattr(_state, "resolved_device", object()) == device:
-        is_cuda, is_current = _state.is_cuda, _state.is_current
+    P2 (Phase C): keeps its OWN tiny per-thread memo, keyed on the RAW *device* value this
+    function is actually called with — `tex_engine`'s `ctx.device`, always a plain `str`
+    (`resolve_device() -> str`). This is deliberately NOT `reset()`'s state: `reset()` is
+    resolved from a DIFFERENT raw value (whichever tier is executing canonicalizes its OWN
+    `device` argument to a `torch.device`, e.g. `interpreter.py`'s `self.device`), and
+    `torch.device(...) == "<same device>"` is `False` for every device, always — confirmed
+    directly against real `torch`. OVERHEAD-462's original fix compared those two raw values
+    and so never hit on its one real call site; this fix compares each of the two functions'
+    OWN raw values against themselves instead; `reset()` and `cook_done_event` no longer
+    share a cache at all; they share the underlying resolution helper. A host that cooks
+    repeatedly on the same device string (every single-GPU host, and every fixed-device
+    host) hits this memo from the SECOND cook onward. `is_current` is never cached — it is
+    re-derived every call from a fresh, cheap `torch.cuda.current_device()` read against the
+    memoized index, so a cache hit never goes stale about which device is ambient, only
+    about whether *device* itself names CUDA and which index it resolves to."""
+    cached_key = getattr(_state, "done_device_key", _UNSET)
+    if cached_key is not _UNSET and cached_key == device:
+        is_cuda, idx = _state.done_is_cuda, _state.done_idx
     else:
-        is_cuda, _idx, is_current = _resolve_cuda_target(device)
+        is_cuda, idx, _is_current_at_resolve = _resolve_cuda_target(device)
+        _state.done_device_key = device
+        _state.done_is_cuda = is_cuda
+        _state.done_idx = idx
     if not is_cuda:
         return None
+    is_current = idx == torch.cuda.current_device()
     ev = torch.cuda.Event()
     _record_on(ev, device, is_current)
     return ev

@@ -19,9 +19,23 @@ own tests can keep proving "still entered for a genuinely non-current device" (`
 mocked-current 0) without that assertion becoming vacuous, and a new pair of tests proves
 the skip fires when the cook's device IS mocked-current.
 """
+import pytest
 import torch
 
 from TEX_Wrangle.tex_runtime import pacing as _pace
+
+
+@pytest.fixture(autouse=True)
+def _fresh_pacing_state():
+    """`pacing._state` is thread-local and, by design, never clears itself between cooks on
+    one thread (the ring/memo persist to amortize allocation). Tests in this file run on the
+    SAME thread, one after another, so without this fixture one test's cached answer (P2:
+    `cook_done_event`'s own per-device-string memo) would leak into the next -- invisible
+    before P2 (the old cache never hit at all), a real cross-test pollution risk now that it
+    does. Mirrors `test_pace462_bounded_lookahead.py`'s identical fixture."""
+    _pace._state.__dict__.clear()
+    yield
+    _pace._state.__dict__.clear()
 
 
 class _NeverTrips:
@@ -246,6 +260,73 @@ def test_o5_paced_check_does_not_rederive_wants_pacing_per_poll(r):
     else:
         r.fail("FIX-OBSROUTE O5", f"wants_pacing was called {calls['n']} times for one "
                f"reset() + 10 paced_check polls (expected exactly 1)")
+
+
+# ── P2 (Phase C): reset() short-circuits again; cook_done_event owns its own memo ──
+
+def test_p2_reset_short_circuits_for_an_unpaced_token(r):
+    """P2: reset() must not touch `torch.cuda` AT ALL for an unpaced token -- the
+    pre-OVERHEAD-462 short-circuit (`wants_pacing(token) and is_cuda`, which never
+    evaluates the right operand when the left is False). OVERHEAD-462 had made the
+    CUDA/device resolution run unconditionally so it could share an answer with
+    `cook_done_event` -- measured 8.5x (CPU) / 30.7x (CUDA) slower on exactly this, the
+    DEFAULT unpaced path invariant 7 protects, for a cache that (see the next test) never
+    even hit on its one real caller."""
+    print("\n--- P2: reset() never touches torch.cuda for an unpaced token ---")
+    with _DeviceSpy(current=0) as spy:
+        real_available = torch.cuda.is_available
+        calls = {"n": 0}
+
+        def _counting_available():
+            calls["n"] += 1
+            return real_available()
+
+        torch.cuda.is_available = _counting_available
+        try:
+            _pace.reset(_NeverTrips(pace=False), "cuda:0")
+        finally:
+            torch.cuda.is_available = real_available
+    if calls["n"] == 0 and spy.calls == []:
+        r.ok("reset() with an unpaced token called torch.cuda.is_available() 0 times and "
+             "entered torch.cuda.device(...) 0 times")
+    else:
+        r.fail("P2 reset short-circuit", f"is_available calls={calls['n']}, "
+               f"device_calls={spy.calls}")
+
+
+def test_p2_cook_done_event_caches_on_its_own_raw_value_not_resets(r):
+    """P2: `cook_done_event`'s memo must key off ITS OWN raw `device` argument, never
+    `reset()`'s -- the real call shapes never match each other (`torch.device(...) ==
+    "<str>"` is `False` for every device, confirmed directly), so a cache keyed on comparing
+    the two raw values (OVERHEAD-462's original design) never hit on the one real call site.
+    `reset()` here is called with a `torch.device` (the interpreter's own canonicalized
+    shape); `cook_done_event` is called five times with a plain string (`tex_engine`'s
+    `ctx.device` shape) naming the SAME physical device. `torch.cuda.is_available()` must be
+    called exactly ONCE total -- reset()'s own short-circuit contributes zero (pace=False),
+    and cook_done_event's memo must hit on calls 2-5."""
+    print("\n--- P2: cook_done_event caches on its own raw value, mismatched vs reset() ---")
+    calls = {"n": 0}
+    with _DeviceSpy(current=0) as spy:
+        real_available = torch.cuda.is_available
+
+        def _counting_available():
+            calls["n"] += 1
+            return real_available()
+
+        torch.cuda.is_available = _counting_available
+        try:
+            _pace.reset(_NeverTrips(pace=False), torch.device("cuda", 0))  # interpreter shape
+            for _ in range(5):
+                _pace.cook_done_event("cuda:0")   # tex_engine's ctx.device shape
+        finally:
+            torch.cuda.is_available = real_available
+    if calls["n"] == 1:
+        r.ok("is_available() called exactly once across reset() (torch.device arg) + 5 "
+             "cook_done_event('cuda:0') calls (str arg), mismatched types")
+    else:
+        r.fail("P2 cook_done_event own memo", f"is_available called {calls['n']} times "
+               f"(expected 1)")
+    _ = spy
 
 
 def test_o5_reset_with_no_args_still_reads_as_unpaced(r):
