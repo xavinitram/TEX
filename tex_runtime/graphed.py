@@ -40,6 +40,7 @@ from ..tex_compiler.ast_nodes import (
 )
 from .interpreter import Interpreter, _collect_identifiers
 from . import tier_trace  # leaf module (imports only threading) — no cycle
+from . import profile as _profile  # thread-local stage-sink suspend around nested execute()
 
 logger = logging.getLogger("TEX.graphed")
 
@@ -505,16 +506,24 @@ class GraphedProgram:
         permanently the graph module's internal capture stream, invisible until some
         unrelated later caller reads pixels through it with no fence. Save/restore the
         stream here so every exit path — success, a caught capture failure, an
-        uncaught one — leaves the caller exactly where it found it (`_restoring_cuda_stream`)."""
+        uncaught one — leaves the caller exactly where it found it (`_restoring_cuda_stream`).
+
+        Suspends the calling thread's profiler stage-sink for the whole call
+        (`profile.suspend_stage_tracking`): `_capture_inner`'s warmup and graph-capture passes
+        each run a SEPARATE `Interpreter.execute()` on THIS thread, and an outer cook's own
+        `measure(stages=True)` may still be open around the statement that triggered this
+        capture — without suspending, those nested executions silently corrupt the outer
+        cook's per-stage sample."""
         global _CAPTURING
         _CAPTURING = True
         idx = _dev_index(device)
         try:
-            with _restoring_cuda_stream(idx):
-                with torch.cuda.device(idx):
-                    return self._capture_inner(program, bindings, type_map, device,
-                                               latent_channel_count, output_names,
-                                               precision, used_builtins)
+            with _profile.suspend_stage_tracking():
+                with _restoring_cuda_stream(idx):
+                    with torch.cuda.device(idx):
+                        return self._capture_inner(program, bindings, type_map, device,
+                                                   latent_channel_count, output_names,
+                                                   precision, used_builtins)
         finally:
             _CAPTURING = False
 

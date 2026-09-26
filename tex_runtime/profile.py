@@ -45,6 +45,7 @@ is its design doc's call; `snapshot()` is the seam it would persist through.
 """
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from collections import OrderedDict, deque
@@ -184,6 +185,36 @@ def stage_event_sink() -> list | None:
     `measure.__enter__` alongside `stage_sink`'s dict, on the same thread-local discipline
     (ENG-9: one interpreter per cook thread). PROF-462."""
     return getattr(_tls, "stage_events", None)
+
+
+@contextlib.contextmanager
+def suspend_stage_tracking():
+    """Suspend this THREAD's per-stage sink/event-list for the duration of a block, restoring
+    exactly what was there on exit.
+
+    `stage_sink()`/`stage_event_sink()` are scoped to the OS thread, not to whichever `measure`
+    call is logically "in progress" on it. `GraphedProgram.capture()` runs its warmup and
+    capture passes through a SEPARATE `Interpreter.execute()` call, on the SAME thread, while
+    the outer cook's own `measure(stages=True)` is still open — that nested `execute()` reads
+    the same ambient thread-local and (because the profiler has no idea it is not "the" cook
+    being measured) appends its own boundaries into the outer cook's sample, corrupting the
+    per-stage breakdown that seeds a new key's EWMA at full weight. Pre-existing: the same
+    thread-local aliasing already mixed a nested execute's boundaries into the outer sink
+    before this module grew CUDA-event recording, it just wrote wall-clock ms into a shared
+    dict instead of events into a shared list.
+
+    Call this around any nested `Interpreter.execute()` that is not itself part of the cook a
+    `measure` block is timing (today: capture's warmup + graph-capture passes). It is not on
+    any per-statement or per-cook hot path, so cost here is not a concern."""
+    prev_stages = getattr(_tls, "stages", None)
+    prev_events = getattr(_tls, "stage_events", None)
+    _tls.stages = None
+    _tls.stage_events = None
+    try:
+        yield
+    finally:
+        _tls.stages = prev_stages
+        _tls.stage_events = prev_events
 
 
 # ── keys ─────────────────────────────────────────────────────────────────────

@@ -229,3 +229,63 @@ def test_prof462_real_cuda_cook_resolves_device_ms(r: SubTestResult):
         r.ok(f"a sampled CUDA cook resolved to {ms:.3f} ms of device time via the lazy queue")
     else:
         r.fail("PROF-462 real CUDA cook", f"predict() never resolved within 2s (got {ms!r})")
+
+
+def test_fixprof_f1_capture_does_not_pollute_outer_stage_sink(r: SubTestResult):
+    """FIX-PROF F1: `GraphedProgram.capture()` runs its warmup (3x) and graph-capture (1x)
+    passes through separate `Interpreter.execute()` calls on the SAME thread as the outer
+    cook. If an outer `profile.measure(stages=True)` is open around the statement that
+    triggers capture (real shape: `tex_engine.run`'s dispatch, reproduced directly here via
+    `run_graphed` under a `measure` block with no outer statements of its own), those 4 nested
+    executions must record ZERO stage boundaries into the outer sample -- capture is not part
+    of the cook being timed. Before the fix each nested execute's own single-stage boundary
+    landed in the outer thread-local list (real GPU work, no mocks needed: the corruption is a
+    thread-local aliasing bug, not a timing artifact)."""
+    if not torch.cuda.is_available():
+        r.skip("FIX-PROF F1", "no CUDA on this box")
+        return
+    import TEX_Wrangle.tex_runtime.graphed as G
+    from TEX_Wrangle.tex_cache import parse_and_split
+
+    G.clear_graph_cache()
+    P.reset()
+    try:
+        with armed_profiler() as Pmod:
+            bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
+            code = "@OUT = vec4(sin(@A) * 0.5 + 0.5, 1.0);"
+            prog = parse_and_split(code, bt)
+            tm = TypeChecker(binding_types=bt, source=code).check(prog)
+            used = _collect_identifiers(prog)
+            img = torch.rand(1, 32, 32, 3, device="cuda")
+
+            calls = []
+            real_boundary = Pmod.record_stage_boundary
+
+            def _spy(events, stage, device):
+                calls.append(stage)
+                return real_boundary(events, stage, device)
+
+            Pmod.record_stage_boundary = _spy
+            try:
+                key = Pmod.make_key("fixprof-f1", "cuda", "fp32")
+                with Pmod.measure(key, 32 * 32, device="cuda", stages=True):
+                    out = G.run_graphed(prog, {"A": img}, tm, "cuda", "fixprof_f1_fp",
+                                        output_names=["OUT"], used_builtins=used)
+            finally:
+                Pmod.record_stage_boundary = real_boundary
+            torch.cuda.synchronize()   # invariant #6: settle the box before the next test times
+        assert out is not None, "program was not captured (capturability gate rejected it)"
+    except Exception as e:
+        r.fail("FIX-PROF F1", f"setup/capture raised: {e!r}")
+        return
+    finally:
+        G.clear_graph_cache()
+        P.reset()
+
+    if len(calls) == 0:
+        r.ok("capture's 3 warmup + 1 graph-capture passes recorded 0 stage boundaries into "
+             "the outer measure block (which itself ran no statements of its own)")
+    else:
+        r.fail("FIX-PROF F1",
+               f"expected 0 stage boundaries from capture's nested execute() calls landing "
+               f"in the outer sink, got {len(calls)}: {calls!r}")
