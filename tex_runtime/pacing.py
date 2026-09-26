@@ -117,10 +117,10 @@ _state = _threading.local()
 #: among them there -- the discriminator is the drained-p95 bound, which scales with depth
 #: (measured p50/p95 ms: depth1 8.9/10.8, depth2 14.1/18.6, depth4 23.7/29.6, depth8 45.3/50.6).
 #: Depth 2 keeps that bound tight (about 4-6% of the measured full runtime) while giving one
-#: level of look-ahead margin over depth 1, which read as the worst case (of depths tested) on
-#: an informal secondary check with many cheap per-statement kernels rather than this ask's
-#: heavy-chain target shape. See the hand-back for the full per-depth table and the sm_75 gap
-#: (unreachable this session).
+#: level of look-ahead margin over depth 1, which the later stride sweep (see
+#: `_DEFAULT_STRIDE_S` below) also read as the worst case among depths tried on cheap-statement
+#: program shapes. See the hand-back for the full per-depth table and the sm_75 gap (unreachable
+#: this session).
 _DEFAULT_DEPTH = 2
 
 #: Minimum HOST time (seconds) that must pass since the ring last recorded before a poll
