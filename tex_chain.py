@@ -151,7 +151,7 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
             out[name] = tex_results.lineage_key(
                 program_fp=program_fp, device=dev, precision=eff_precision,
                 params=params, upstream=plan.upstream_keys, time_context=tc,
-                canvas=canvas, flags=(*base_flags, f"out:{name}"))
+                canvas=canvas, flags=(*base_flags, f"out:{name}"), scale=ctx.scale)
         return out
     except Exception:
         return None
@@ -160,12 +160,17 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
 # ── CACHE-6: fusion ↔ caching reconciliation (the cook side) ──────────────────
 
 def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_count=0,
-                    time_context=None, cancel=None, on_progress=None) -> dict:
+                    time_context=None, cancel=None, on_progress=None, scale=None) -> dict:
     """Cook a raw fusion stage list (≥1) and return the interpreter's RAW {output: tensor}. One
     stage cooks as a plain program; ≥2 splice through `compile_fused`. It replicates prepare()'s
     param default-inject + widget-value conversion so a SUB-chain (a CACHE-6 prefix or suffix)
     cooks BIT-IDENTICALLY to those same stages inside the full fused program — the equivalence
-    the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does."""
+    the CACHE-6 oracle rests on. fp32 is forced under a LATENT (M-3), exactly as prepare does.
+
+    `scale` (SCALE-47b) rides straight through to `Interpreter.execute` — this stage-list family
+    is interpreter-only (it has no tier selection of its own), so there is no accelerated route
+    to bypass here the way `tex_engine.run` needs to. `None` (every caller before this ask) is
+    unaffected."""
     # OBSERVER-46/O3: notify once for THIS entry point; a call nested under
     # `cook_fused_cached` or `cook_checkpointed` (both call this internally, up to three
     # times per cook) shares their outer notification instead of adding one — see
@@ -220,7 +225,7 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
                               output_names=sorted(assigned.keys()), used_builtins=used_builtins,
                               precision=("fp32" if latent_channel_count else precision),
                               time_context=time_context,
-                              cancel=cancel, on_progress=on_progress)
+                              cancel=cancel, on_progress=on_progress, scale=scale)
 
 
 def _is_tensor_binding(v) -> bool:
@@ -265,7 +270,7 @@ def _binding_shape(v):
 
 
 def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context=None,
-                         canvas=None, latent_channel_count=0) -> str:
+                         canvas=None, latent_channel_count=0, scale=None) -> str:
     """CACHE-6: the lineage key a stage-(k-1) boundary tap is cached under — the upstream
     SUB-CHAIN fingerprint (`tex_fusion.prefix_fingerprint`) × the prefix stages' param VALUES ×
     the SOURCE identity `upstream` × device × precision × playhead × canvas, namespaced by the cut
@@ -289,7 +294,12 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
     entirely on the host's `upstream` string, which nothing documented as required to encode one.
     Defaulting HERE rather than at each call site is what closes it for `cook_fused_cached` and
     the CACHE-7 multi-tap path at once — the hole was in this function's contract, not in a
-    caller's diligence. An explicit `canvas=` still wins, for a caller that knows better."""
+    caller's diligence. An explicit `canvas=` still wins, for a caller that knows better.
+
+    `scale` (SCALE-47b): threaded straight to `lineage_key` (its own docstring says why this must
+    be explicit rather than folded into `fp`) — a coarse-scale checkpoint and a full-scale one
+    mint different keys, so `cook_checkpointed` can never serve one to the other. `None` (every
+    caller before this ask) is unaffected."""
     # OBSERVER-46/O3: notify once for THIS entry point; a call nested under
     # `cook_fused_cached` or `cook_checkpointed` (both call this internally, once per cut)
     # shares their outer notification instead of adding one — see
@@ -379,7 +389,7 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
             flags.append(f"ic:{int(latent_channel_count)}")
         return tex_results.lineage_key(program_fp=fp, device=str(device), precision=precision,
                                        params=params, upstream=tuple(upstream), time_context=time_context,
-                                       canvas=canvas, flags=flags)
+                                       canvas=canvas, flags=flags, scale=scale)
 
 
 def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32",

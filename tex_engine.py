@@ -312,11 +312,9 @@ class ExecContext:
     # TRK-25: the `{name: TEXType}` map this cook compiled against. The source alone cannot
     # say a wire holds a STRING, and a string merged per pixel is voted on over the region.
     binding_types: Any = None
-    # SCALE-47b: the per-cook resolution-scale multiplier for pixel-unit stdlib arguments
-    # (SCALE-47-design.md), or None (the default — untouched, zero cost, invariant #7). Unlike
-    # `time_context`/`roi`, this VALUE also rides the lineage/checkpoint key (phase 5) — it is a
-    # value on the ExecContext because it is threaded to the interpreter/codegen call sites the
-    # same way `time_context` is, not because it shares that field's never-keyed contract.
+    # SCALE-47b: the per-cook resolution-scale multiplier, or None (untouched, zero cost).
+    # Threaded to the interpreter call sites like `time_context`, but — unlike it — also
+    # rides the lineage/checkpoint key: it is not a never-keyed value.
     scale: Any = None
 
 
@@ -561,15 +559,9 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     all. So it is a parameter, and the caller — which is the only party that knows —
     decides.
 
-    `scale` (SCALE-47b): a per-cook resolution-scale multiplier for pixel-unit stdlib arguments
-    (`gauss_blur`'s sigma, `erode`/`dilate`'s radius, `bilateral_filter`'s spatial_sigma) and the
-    halo margin they derive — the enabler for "cook a cheap proxy, same picture, downscaled".
-    `None` (the default — no ComfyUI caller passes this) is untouched and zero-cost: no runtime
-    multiply is emitted or evaluated, the tier selection is unaffected, and ROI/lineage/checkpoint
-    keys are exactly as they were (invariant #7). Non-None forces the cook onto the interpreter
-    tier (the only tier that currently honours it) and declines an ROI window (not yet reconciled
-    with scale). Only the stdlib functions tagged `pixel_args=` scale; a program that reads pixel
-    coordinates directly is unaffected and will not look like "the same picture, downscaled".
+    `scale` (SCALE-47b): a per-cook resolution-scale multiplier for `pixel_args=`-tagged stdlib
+    arguments and the halo they derive. `None` (no ComfyUI caller passes this) is zero-cost
+    (invariant #7); non-None forces the interpreter tier and declines an ROI window.
 
     Pass False ONLY if you can prove your own egress already materializes. `tex_node` can:
     its clamp allocates a fresh tensor on the way out, which is the accident that kept the
@@ -834,10 +826,7 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     if roi is not None and tier_id == "default" and not fused_chain and not has_latent_input:
         from . import tex_roi as _tex_roi
         if scale is not None:
-            # SCALE-47b: ROI narrowing and a scale-active cook are not yet reconciled (the
-            # narrow-cook-crop machinery has no notion of a resolution multiplier) — declined
-            # the same way every other ROI ineligibility is, whole-frame at the requested
-            # scale, never a wrong-shaped window.
+            # SCALE-47b: not yet reconciled with narrow-cook-crop — decline, whole-frame.
             _roi_why = "roi declined: scale is active (not yet reconciled with ROI narrowing)"
         elif not _tex_roi.roi_exec_enabled(roi_exec):
             _roi_why = "roi not armed (pass roi_exec=True or set TEX_ROI_EXEC=1)"

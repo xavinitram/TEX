@@ -229,7 +229,7 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
                       threshold_ms: float | None = None,
                       profile_key: tuple | None = None, spatial=None,
                       latent_channel_count: int = 0, time_context=None,
-                      cancel=None, on_progress=None) -> dict:
+                      cancel=None, on_progress=None, scale=None) -> dict:
     """Cook a fused chain, splicing the suffix from the DEEPEST cached checkpoint.
 
     Deepest-first is the mechanism: it makes an edit's cost depend on the distance to the
@@ -259,6 +259,11 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
 
     `cuts` may be supplied by a caller that already planned; otherwise placement runs here off
     PROF-1. Returns the interpreter's raw `{output: tensor}`, same as `cook_stage_list`.
+
+    `scale` (SCALE-47b) rides through to both the checkpoint KEY (`boundary_lineage_key`) and the
+    cook itself (`cook_stage_list`) — a coarse-scale checkpoint mints a different key than a
+    full-scale one, so this never serves one to the other (there is no invalidation protocol
+    beyond the key differing). `None` (every caller before this ask) is unaffected.
     """
     # OBSERVER-46/O3: notify once for THIS entry point; every internal call below —
     # `_full()`'s and the per-cut `tex_engine.cook_stage_list`/`tex_engine.boundary_lineage_key`
@@ -272,7 +277,7 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
             return tex_engine.cook_stage_list(
                 stages, device=device, precision=precision,
                 latent_channel_count=latent_channel_count, time_context=time_context,
-                cancel=cancel, on_progress=on_progress)
+                cancel=cancel, on_progress=on_progress, scale=scale)
 
         cuts = _resolve_cuts(stages, result_cache, cuts,
                              latent_channel_count=latent_channel_count, upstream=upstream,
@@ -300,7 +305,7 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
                 continue
             key = tex_engine.boundary_lineage_key(
                 stages, k, device, precision, upstream=upstream, time_context=time_context,
-                latent_channel_count=latent_channel_count)
+                latent_channel_count=latent_channel_count, scale=scale)
             boundary = result_cache.get(key)
             if boundary is None:
                 continue
@@ -311,7 +316,7 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
             out = remap_suffix_taps(tex_engine.cook_stage_list(
                 suffix, device=device, precision=precision,
                 latent_channel_count=latent_channel_count, time_context=time_context,
-                cancel=cancel, on_progress=on_progress), k)
+                cancel=cancel, on_progress=on_progress, scale=scale), k)
             # The boundary IS stage k-1's output, so a tap there is served for free rather than
             # costing a refusal.
             if k >= 1 and stages[k - 1].get("tap"):
@@ -327,7 +332,7 @@ def materialize(stages: list[dict], result_cache, *, device="cpu", precision="fp
                 threshold_ms: float | None = None,
                 profile_key: tuple | None = None, spatial=None,
                 latent_channel_count: int = 0, time_context=None,
-                cancel=None, on_progress=None) -> list[int]:
+                cancel=None, on_progress=None, scale=None) -> list[int]:
     """Phase 2. Re-cook the chain ONCE with the planned stages tapped, and cache every
     boundary that falls out. Returns the cuts actually materialized.
 
@@ -359,7 +364,7 @@ def materialize(stages: list[dict], result_cache, *, device="cpu", precision="fp
         out = tex_engine.cook_stage_list(
             tapped, device=device, precision=precision,
             latent_channel_count=latent_channel_count, time_context=time_context,
-            cancel=cancel, on_progress=on_progress)
+            cancel=cancel, on_progress=on_progress, scale=scale)
         harvested = []
         for k in batch:
             b = out.get(f"_tap_s{k - 1}")
@@ -367,7 +372,7 @@ def materialize(stages: list[dict], result_cache, *, device="cpu", precision="fp
                 continue
             key = tex_engine.boundary_lineage_key(
                 stages, k, device, precision, upstream=upstream, time_context=time_context,
-                latent_channel_count=latent_channel_count)
+                latent_channel_count=latent_channel_count, scale=scale)
             result_cache.put(key, b, canvas={"shape": list(b.shape)})
             harvested.append(k)
         done.extend(harvested)

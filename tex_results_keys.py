@@ -98,7 +98,8 @@ def _canon_time(tc) -> str:
 
 
 def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
-                frame=None, time_context=None, quality=None, flags=(), canvas=None) -> str:
+                frame=None, time_context=None, quality=None, flags=(), canvas=None,
+                scale=None) -> str:
     """CACHE-1: the content-addressable identity of a cooked RESULT (a hex SHA-256).
 
     Composes H(program_fp × params × upstream × frame × device × precision/quality ×
@@ -120,6 +121,14 @@ def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
     flags        any extra keying flags (e.g. an output name for a per-output key).
     canvas       a canvas / ROI descriptor (W,H[,x0,y0,w,h]); two cooks at different canvas
                  sizes or ROIs are distinct results (keys carry it from day one).
+    scale        SCALE-47b: the cook's resolution-scale multiplier, or None (a full-scale/
+                 scale-unaware cook). Keyed by EXACT value, like `frame` — deliberately NOT
+                 folded into `program_fp` (a scale-carrying sigma is a runtime scalar, not an
+                 AST literal, so one compiled/interpreted program serves every scale), so a
+                 result cache that didn't add this explicitly could serve a coarse-scale frame
+                 to a full-scale request. `None` keys as `"n"`, matching every other optional
+                 component here — a caller that never mentions scale mints the same key as
+                 before SCALE-47b (invariant #7).
     """
     if program_fp is None:
         raise ValueError("lineage_key needs a program fingerprint (fp or fused_fp)")
@@ -147,4 +156,5 @@ def lineage_key(*, program_fp, device, precision, params=None, upstream=(),
     # legacy (W,H) tuple) — the engine keys each output by its produced-frame shape, so a
     # different batch/canvas/ROI mints a distinct key.
     feed("cnv", "n" if canvas is None else json.dumps(canvas, sort_keys=True, default=list))
+    feed("scl", "n" if scale is None else repr(float(scale)))
     return h.hexdigest()

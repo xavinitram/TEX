@@ -218,9 +218,12 @@ def _compile_and_check(code, bt):
 
 
 def _feed_stream(*, program_fp, device, precision, params, upstream, frame, time_context,
-                 quality, flags, canvas, env):
+                 quality, flags, canvas, env, scale=None):
     """Independent reimplementation of `tex_results_keys.lineage_key`'s documented byte-feed
-    sequence (fp/dev/prec/env/par/up/frm/tc/q/flg/cnv), with `env_epoch()` supplied directly
+    sequence (fp/dev/prec/env/par/up/frm/tc/q/flg/cnv/scl -- SCALE-47b appended `scl`, keyed
+    exactly like every other optional component here: exact value when supplied, `"n"` when
+    not, so a row that never mentions scale mints the same key it did before that ask), with
+    `env_epoch()` supplied directly
     rather than computed — env_epoch legitimately moves with ANY interpreter.py/codegen.py/
     stdlib*.py edit (it hashes those files' bytes, `tex_cache._CODEGEN_FILES`), including this
     ask's own, so a literal base-vs-head digest comparison would fail on that alone and prove
@@ -250,6 +253,7 @@ def _feed_stream(*, program_fp, device, precision, params, upstream, frame, time
     feed("q", "n" if quality is None else str(quality))
     feed("flg", json.dumps(sorted(str(f) for f in flags)))
     feed("cnv", "n" if canvas is None else json.dumps(canvas, sort_keys=True, default=list))
+    feed("scl", "n" if scale is None else repr(float(scale)))
     return h.hexdigest()
 
 
@@ -276,8 +280,9 @@ def test_noviewer_lineage_key_byte_format_pinned(r: SubTestResult):
                 f"lineage_key byte format moved for {row['program_fp']}: "
                 f"expected {expected}, got {got}")
         r.ok(f"{len(rows)} representative rows (plain, time-context, ROI-canvas) mint exactly "
-             f"the reimplemented fp/dev/prec/env/par/up/frm/tc/q/flg/cnv byte stream — no "
-             f"`view` component can be fed, and none of the others moved")
+             f"the reimplemented fp/dev/prec/env/par/up/frm/tc/q/flg/cnv/scl byte stream — no "
+             f"`view` component can be fed, and none of the others moved (SCALE-47b's `scl` "
+             f"is a new, additive component; every row here omits scale= and keys `scl=n`)")
     except Exception as e:
         r.fail("noviewer lineage_key byte format", f"{type(e).__name__}: {e}")
     finally:
