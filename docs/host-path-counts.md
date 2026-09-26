@@ -273,7 +273,7 @@ inner 13–17 µs of a 90–112 µs host call, which is why the seam is counted 
 driver (§6 item 6). PERF-6 took the tile planner's queries to **0** on every cooking scenario
 by sharing one live reading across a frame — and left `prewarm`'s **10** exactly where they
 were, because they are a DIFFERENT CALLER asking a different question:
-`tex_runtime/compiled.py::_cuda_headroom_ok` (`compiled.py:1112`), once per program, deciding
+`tex_runtime/compiled.py::_cuda_headroom_ok` (`compiled.py:1155`), once per program, deciding
 whether there is comfortable VRAM headroom (`free > 2 GB`) to submit a BACKGROUND compile. It
 wants a live reading precisely because it is about to start something that allocates, and a
 prewarm is a once-per-project cost rather than a per-frame one — so this row is 10 by design,
@@ -527,7 +527,7 @@ test before it starts, and cannot claim a win the instrument would not see.
    two tile plans (`tex_tiling._tile_plan:38` and `_halo_tile_plan:142`, both re-exported into
    `tex_engine` at `tex_engine.py:139`), `enforce_cache_budget` (`tex_memory.py:357`),
    `trim_reserved_pool` (`tex_memory.py:850`) and `_disown_inputs` (`tex_buffers.py:158`) —
-   all called from `tex_engine.run` (`tex_engine.py:1032`) — plus `fingerprint`, **once**
+   all called from `tex_engine.run` (`tex_engine.py:1037`) — plus `fingerprint`, **once**
    since the per-cook key became one string handed down from `prepare`.
 
    **Who buys the free-VRAM reading, corrected.** An earlier reading of this item attributed
@@ -565,7 +565,7 @@ test before it starts, and cannot claim a win the instrument would not see.
    96²/48², and at 1024²/512², dev laptop). (This is also the LAT-4 LRU the harness had to
    defeat to measure the row honestly; see §2.)
 8. **Two lexes for a never-seen program.** `TEXCache.fingerprint` (`tex_cache.py:344`) calls
-   `param_only_names` (`tex_marshalling.py:859`), which tokenizes; the compile then tokenizes
+   `param_only_names` (`tex_marshalling.py:879`), which tokenizes; the compile then tokenizes
    again. The counts track exactly — `param_only_names` equals `fingerprint` in every column of
    §4.1 — and `fingerprint` itself is called **twice per cook**.
    *Shows fixed as:* `TEXCache.fingerprint` and `param_only_names` both going **2 → 1** per

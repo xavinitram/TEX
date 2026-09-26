@@ -142,7 +142,17 @@ import sys
 # already named their symbols, so both anchored.
 # 20 → 19 (v0.45.1): the v0.45 tier-table and SECURITY.md edits anchored one more citation to
 # its symbol, so the tree reads 19. The budget follows the count down, never up.
-WARNING_BUDGET = 19
+# 19 → 0 (v0.46.0): several v0.46 lanes repointed a citation's LINE NUMBER after moving the
+# code it names, but several of those repairs computed the new line by offset rather than by
+# re-checking the symbol actually at it — landing inside a NEIGHBOURING function instead
+# (`tex_engine_tiers.py:129-146` moved to `_interp_fallback`'s span, not `select_tier`'s;
+# `compiled.py:1112`/`tex_marshalling.py:859`/`:897` similarly drifted). Auditing every warning
+# this release (not just the ones a diff touched) also caught a handful of much older,
+# unrelated drift (`docs/frame-providers.md`'s two `tex_roi.py` citations, `docs/async-io.md`'s
+# stale "silent FLOAT catch-all" claim superseded by a later deliberate-refusal refactor, and
+# `docs/roadmap.md`'s ENG-1 entry describing a problem resolved since v0.22) — all repointed or
+# corrected in the same release commit. The tree now reads 0; the budget follows it down.
+WARNING_BUDGET = 0
 
 # ── The document set (see "THE DOCUMENT SET" above). ──
 DOC_DIR_GLOB = "docs"

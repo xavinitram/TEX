@@ -11,9 +11,9 @@ KINDS (positional-or-keyword / keyword-only / var-positional / var-keyword) and 
 (never the default VALUE, which is not part of this contract), every symbol a 2026-09-25 census
 of the embedding-host seam found:
 
-  * **Tier 1** (`_TIER1_SPEC`, 118 rows: the census's 114 plus `ResultCache.spill` and
-    `Program.time_reads`, added the moment they landed on `main`, plus `cook_observer.register`
-    and `.unregister` (OBSERVER-46, v0.46) — see below) — symbols that
+  * **Tier 1** (`_TIER1_SPEC`, 120 rows: the census's 114 plus `ResultCache.spill` and
+    `Program.time_reads`, added the moment they landed on `main`, plus `cook_observer.register`,
+    `.unregister` and `.scope` (OBSERVER-46, v0.46) — see below) — symbols that
     host's own PRODUCT code calls or references. This is the harder promise: these are
     load-bearing for a running integration.
   * **Tier 2** (`_TIER2_SPEC`, 87 rows) — symbols reached ONLY from that host's own tests,

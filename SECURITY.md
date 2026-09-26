@@ -62,6 +62,7 @@ one atomic-write primitive (`tex_recovery.py:atomic_write`, temp + `os.replace`,
 | `<user_dir>/tex_wrangle/user_snippets.json` | `tex_snippets.py:save_user_snippets` | JSON, plain (`{name: code}`) | Host's `get_user_dir()` (`tex_runtime/host.py:ComfyHostServices.get_user_dir`), else `TEX_CACHE_DIR/user` | Yes, via the host's user-dir setting or `TEX_CACHE_DIR` |
 | `<user_dir>/tex_wrangle/tools/*.textool` | `tex_tool.py:write_tool` | JSON manifest (may carry inline TEX-DSL source in `code`/`terminal_code`) | Same as snippets (`tex_tool.py:tools_dir`) | Yes, same as above |
 | `tools/gate.py`'s verdict cache, `tests/known_reds.json` | `tools/gate.py:_cache_write`, hand-authored | JSON, plain | Dev-tooling only; cache lives outside the repo (`tools/gate.py:_cache_path`); excluded from the shipped archive by `.comfyignore` | N/A — never reaches a ComfyUI install |
+| `tools/gate.py`'s persistent per-leg Inductor kernel cache | `tools/gate.py:_inductor_cache_dir`, pruned oldest-first under a 2 GiB default cap by `_prune_inductor_cache_root` | Inductor's own on-disk compile-artifact format, not TEX's | Dev-tooling only; `_inductor_cache_root()`, overridable via `TEX_GATE_INDUCTOR_CACHE_CAP_BYTES`; excluded from the shipped archive by `.comfyignore` | N/A — never reaches a ComfyUI install |
 
 Deserialize sites, every one that reads bytes back off disk:
 

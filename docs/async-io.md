@@ -14,10 +14,16 @@ that are not:
 
 **(a) A value-less binding in an engine that derives identity from binding *values*.**
 `prepare()` builds `binding_types` by calling `infer_binding_type` on every value
-(`tex_engine.py:642`), and `infer_binding_type` ends in `return TEXType.FLOAT`
-(`tex_marshalling.py:689`) — a silent catch-all. A promise wired today does not fail; it
-types as FLOAT, mints a fingerprint for a program that does not exist, and compiles
-something wrong. Identity corruption, not an error.
+(`tex_engine.py:642`). At the time this was written, `infer_binding_type`'s own channel-count
+branch ended in a silent `return TEXType.FLOAT` catch-all; that branch is now
+`_spatial_channels_to_type` (`tex_marshalling.py:686`), whose out-of-range case is a
+DELIBERATE refusal (`raise ValueError`), not a silent FLOAT collapse — the specific premise
+below is historical, kept for the Promise-identity point it makes, not as a live claim about
+today's fallback. **The point stands regardless**: a value-less `Promise` still types via its
+own `declared_type` (`infer_binding_type`, `tex_marshalling.py:709`), not by inspecting pixels
+that do not exist yet. A promise wired today does not fail; it mints a fingerprint for a
+program whose real value is still pending, and compiles something wrong if the promise's
+declared type disagrees with what eventually lands. Identity corruption, not an error.
 
 **(b) Dependency-aware admission in a queue whose jobs are opaque closures.** A `Job` is
 `fn(cancel_token)`, eligible the moment it is submitted (`tex_cookqueue.py:288-314`). There
@@ -27,7 +33,8 @@ worker must never block on I/O — which means the *queue*, not the job, has to 
 job is not ready.
 
 Everything else — the speculative class, the shed policy, the refusals ledger, the
-`PREFETCH` reason constant reserved since v0.31 (`tex_cookqueue.py:735`) — already ships.
+`PREFETCH` reason constant reserved since v0.31, inside `CookQueue._run_one`
+(`tex_cookqueue.py:735`) — already ships.
 
 ---
 

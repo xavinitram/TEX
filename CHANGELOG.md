@@ -5,6 +5,174 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.0] - 2026-09-26 — "Compiled, predictably"
+
+A minor release, author-approved. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze is
+owed. **No ComfyUI pixel change**, with one narrow, proven exception: TRK-143's codegen/interpreter
+formula alignment (below) — pixel-identical on every real input, and unreachable from any input
+that was ever ingested differently in the first place.
+
+### Added
+
+- **`compile_capability()`** — a read-only, process-wide, cached probe of whether `torch.compile`'s
+  Inductor backend has its real prerequisite present: Triton for CUDA, a C compiler for CPU (the
+  existing MSVC `vcvarsall` search). It never compiles to find out, and it is consulted, not
+  measured, by everything below that used to guess.
+- **`cache_budget_status(device) -> dict`** — a read-only `{limit_bytes, usage_bytes}` query over
+  the budget-tracked stdlib caches, so a host can see the budget actually in force.
+- **A supported cook-observer seam**, `tex_runtime.cook_observer`: `register(cb) -> handle`,
+  `unregister(handle)`, and `scope(entry)` (a context manager). `cb(entry, thread)` fires once per
+  externally-initiated cook at each of six entry points (`tex_engine.run`/`cook`,
+  `tex_chain.cook_stage_list`/`cook_fused_cached`/`boundary_lineage_key`,
+  `tex_checkpoint.cook_checkpointed`) — nested/internal calls among the six share the outer
+  notification, never double-count. Zero function calls into the module when nothing is
+  registered. This replaces the per-name host wrap a re-export-plus-internal-call pattern can
+  silently defeat (named in the `v0.45.2` hand-back's §3); the same pattern's second, previously
+  unknown instance (`boundary_lineage_key`, alongside the already-known `cook_stage_list`) is fixed
+  by routing `tex_chain.cook_fused_cached`'s internal calls through the same attribute a host wrap
+  already sees.
+
+### Changed
+
+- **A toolchain-aware `"auto"`.** When `compile_capability()` reads no usable toolchain for the
+  cook's device, `"auto"` no longer attempts a compile at all — the verdict goes straight to
+  in-memory REJECTED (never persisted, so a later session with the toolchain installed is not
+  fossilized against it) instead of paying a failed-compile tax on every eligible cook, forever.
+- **A background compile trial can no longer stall the cook thread.** The lazy first-call cost of
+  a compiled callable (Dynamo trace + Inductor/Triton lowering) now runs entirely on a dedicated
+  background pool, before the key is ever marked ready — previously this cost landed synchronously
+  on the interactive cook thread the first time `"auto"` served a trial. Warm jobs no longer share
+  a worker with committed/trial compiles, so one program's slow warm can no longer queue behind
+  another's.
+- **Bounded trial convergence.** A key stuck in `"measuring"` now reaches a terminal verdict
+  (REJECTED) within a fixed 30-second bound from its first eligible tick, closing an unbounded
+  backlog a busy background-compile queue could otherwise produce.
+- **TRK-143: codegen and the interpreter now agree on the `0.23` spatial-`if`'s "is this pixel on"**
+  formula for every input, not only the ones an existing cast already protected. Both tiers now
+  call the one shared function (`masked_flow.cond_mask`) the language-`0.25` masked `if` already
+  used; nothing new was invented. **Pixel-neutrality, proven, not merely argued:** every way an
+  integer condition can reach either formula was enumerated and checked — an integer-dtype
+  image-like binding is already cast to float before either tier's old formula ever ran (both tiers'
+  real ingestion paths); a folded integer literal is not a distinct runtime type from a float in
+  this language; the one real gap was a local variable computed from integer arithmetic, which the
+  existing cast never covered — after this change it no longer matters whether that cast ran at
+  all, because both tiers call the identical function on whatever the value's dtype is. A
+  differential test disarms the old protective cast on both tiers and asserts equality where a
+  disagreement used to be pinned. **Codegen epoch moves once** (both touched files were already
+  watched); no default moved, no reserved name changed.
+- **The fused-CUDA device crash is fixed.** A `$param` binding stages on the CPU by design (a
+  sync-reading builtin's argument wants exactly that CPU scalar); two broadcast/materialize sites
+  could turn such a value into a real tensor without checking its device, crashing the very next
+  op with a cross-device error. This affected any program reaching either site under
+  `compile_mode="auto"`/`"torch_compile"` on CUDA — fused or not, so it is not fusion-specific —
+  and was previously silently caught by the codegen-defect fallback, meaning an opted-in host was
+  silently losing the compiled path's speed-up with no diagnostic on every affected cook until now.
+  Fixed by co-locating the about-to-be-materialized value on its partner's device only when the
+  devices actually differ (one comparison on the already-correct path, a one-element copy only on
+  a real mismatch — nothing that used to work gets slower).
+- **`tex_api.check()` — the pure-lint entry point — is now torch-free end to end**, closing the
+  last of the seams that pulled the whole tensor engine in behind a lint-only call: measured
+  before/after on a fresh process, first `check()` call fell from ~1.1 s (of which torch itself was
+  ~1.05 s) to ~13 ms, with `'torch' in sys.modules` staying `False` throughout — verified by a
+  fresh-subprocess ratchet, not merely timed once. A real cook still imports torch and still cooks
+  identical pixels; the engine's own cold-import module count is unchanged (this only stopped the
+  lint path from paying for the engine at all).
+- **Cancellation, observer and pacing hardening**, found by this release's own pre-handover audit
+  and fixed before shipping (none of these ever reached a prior release):
+  - a raising observer callback under warnings-as-errors could abort the cook entirely — the
+    report is now never-raising and the whole entry point is inside the protected region;
+  - a reentrant same-thread callback could double-notify one user-visible cook — depth now
+    increments before dispatch;
+  - pacing's CUDA event now records under the cook's own device, not the ambient current device;
+  - a circular import (`tex_engine_tiers` imported before `tex_engine`, in a fresh process) is
+    fixed with a lazy proxy, and covered by a new fresh-process import-order test parametrized over
+    every product module.
+- **The cache-mutation seam.** Every mutation of the five budget-tracked stdlib caches now goes
+  through one seam (`_CacheBudget`) that keeps a running byte total, so the per-cook budget check
+  is O(1) instead of a full walk of every entry — eviction order and every default-path behaviour
+  are unchanged, only where the byte count comes from moved. Measured uncontended cost: ~130 ns/op,
+  negligible next to a cook.
+
+### Fixed (pre-release audit, before any host ever saw them)
+
+- **A real crash under concurrent cache mutation** (`_CacheBudget` had no lock; two threads
+  mutating the same budget-tracked cache could produce a Windows access violation). Fixed with one
+  `RLock` per cache around every compound operation; a new AST census makes the seam load-bearing
+  going forward (a future direct mutation outside the class body fails a ratchet, not silently
+  reopens the hazard).
+- A toolchain-absent REJECTED verdict is never persisted to disk, so installing Triton/MSVC later
+  is no longer permanently ignored for programs already measured once.
+- A convergence-bound rejection now evicts its own cached artifact, instead of leaking a wasted
+  cache slot or risking eviction of a genuinely committed program's own artifact.
+- `_setup_msvc_env`'s "already configured" flag could be read true by a concurrent caller while the
+  real environment setup was still in flight (stale PATH/INCLUDE); now serialized under a lock, set
+  only after the real work completes.
+- A codegen-side per-device memo had an unlocked check-then-set that could hand two callers two
+  different callable identities for the same guarded key; now a single atomic `setdefault`.
+- `tex_doctor`'s CUDA-Inductor probe duplicated the compiled tier's own probe logic byte-for-byte;
+  it now delegates to the one implementation.
+
+### Measured findings (this box and the sm_75 reference box)
+
+- **A background `torch.compile` commonly cannot finish within a tick-bounded interactive run**
+  whose own ticks each cost well under a millisecond — the mechanism is confirmed sound; a
+  small/cheap program simply outruns a cold Inductor compile's own wall time.
+- **On the sm_75 reference box with no toolchain installed, `"auto"` behaves exactly like `"none"`
+  plus a one-time-per-program failed-compile cost** — the toolchain-aware fix above is what turns
+  that recurring tax into a one-time one.
+- **With Triton installed on that same box, `torch.compile`/Inductor genuinely works — and loses.**
+  Per-node compiles never reached a committed verdict at any measured resolution; a real,
+  fused-chain compile of the reference playback shape was measured directly (fix confirmed first:
+  an earlier tree recompiled on every warm tick from a fresh Python closure per cook, invalidated
+  before any number below was trusted) and **is 21-27% slower than the uncompiled path at every
+  resolution measured (1024² and 2048²; 3840² did not complete inside a 15-minute cap, most likely
+  from unbounded VRAM reservation growth during trial, not a hang)**, bit-identical output
+  throughout. `autotier`'s own commit rule (compiled must beat the measured median by ≥10%)
+  correctly rejects every one of these trials — **`"auto"` doing the right thing here is the
+  result, not a gap.**
+- **`compile_ahead` for playback was NOT built.** The plan's own condition for building it was a
+  fused-chain compile win on the reference box; it lost, clearly and consistently, so there is
+  nothing to compile ahead of yet. The host's own stated direction (compilation has real potential
+  for playback, per-node compiles and batch renders) is not in question — only this release's own
+  measured evidence that Inductor is not yet the mechanism that wins on today's per-pixel program
+  shapes at today's resolutions on the hardware measured.
+
+### Tooling and gates
+
+- The CI-shape gate leg now refuses, loudly, rather than silently degrading, whenever its resolved
+  interpreter can see the embedding host's own package — the exact condition that previously
+  produced false ComfyUI-adapter reds on a leg whose whole point is proving the suite passes
+  without the host.
+- `LINT-1` and the machine-path lint now see untracked-but-not-ignored files too, not only tracked
+  ones — closing a gap where an uncommitted new file naming the host could pass the cheap tier.
+- The gate's own verdict cache now folds in `CUDA_VISIBLE_DEVICES`, so switching devices between
+  runs can no longer return a stale cached verdict.
+- A new `--tier touched` gate mode runs the full test files for the areas a diff's own imports
+  touch — a middle tier between the cheap ratchets and a full whole-suite run.
+- The persistent Inductor cache directory the gate uses (introduced for the Windows kernel-block
+  class) is now pruned to a size cap, oldest first.
+
+### For anyone vendoring this tree
+
+**The embedding-host seam-freeze test moved additively only.** Diffed directly against `v0.45.2`:
+exactly three new pinned rows, all in `tex_runtime.cook_observer` — `register`, `unregister`,
+`scope` — and no existing row's name, kind or signature changed. **Named precisely, not glossed
+over: `compile_capability()` and `cache_budget_status()` are new public API this release, but
+neither is yet a row in the frozen census** — a host reading "additive only" should read that as
+"nothing already pinned moved," not as "every new symbol is now frozen." No newly reserved names;
+`LANGUAGE_VERSION` unmoved at `"0.25"`; no default moves; no new shipping module filenames beyond
+`tex_engine_tiers.py` (a mechanical split of `tex_engine.py`'s own tier-selection code, re-exported
+under the old names) and `tex_runtime/cook_observer.py` (above) — neither is itself a new public
+entry point beyond what is named above. **Cache cold-start**: this release edits several
+`_CODEGEN_FILES` members (`interpreter.py`, `codegen.py`, `interpreter_control_flow.py`,
+`stdlib_core.py`, `masked_flow.py`) and `_VERDICT_FILES` members (`autotier.py`, `compiled.py`), so
+the codegen and tier-verdict caches move once; `.pkl` stays warm (no `_AST_FILES` member is
+touched). A new per-tier bit-exactness table is added to `DEVELOPMENT.md` (interpreter is the
+oracle; codegen-without-compile is bit-exact within `1e-5`; Inductor/`torch.compile` is NOT
+bit-exact, a named tolerance bound, not export-safe without care; CUDA graphs are bit-exact against
+the interpreter they replay) — every cell traces to an existing test or is explicitly marked
+unenforced, none invented.
+
 ## [0.45.2] - 2026-09-25 — "Cancel means stop"
 
 A correctness patch under the patch-only regime. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no
@@ -768,7 +936,7 @@ freeze is owed.
 - **TRK-109 — the CHANGELOG's own dangling citation named its covering symbol.** The `roi=`/
   fused-chain sentence's citation named no enclosing symbol, so `tools/check_citations.py` had
   carried it as a standing warning since the citation tool shipped. Now reads
-  "`tex_engine.py:1283`, inside `run`"; the citation-warning budget re-pins 22→21.
+  "`tex_engine.py:1037`, inside `run`"; the citation-warning budget re-pins 22→21.
 
 ### Tooling (`benchmarks/`, `tests/` only — no `tex_*` production module touched)
 
@@ -3527,7 +3695,7 @@ is unlikely to get right:
   `frame_version` is a constant 0 for every frozen entry, and `put` always freezes.
 
 **Scope, decided in §1 of the note rather than deferred:** `roi=` is refused on a fused chain
-(`tex_engine.py:1283`, inside `run`), so CACHE-9 serves the *unfused* per-stage host and CACHE-7
+(`tex_engine.py:1037`, inside `run`), so CACHE-9 serves the *unfused* per-stage host and CACHE-7
 the fused one. They are complements, not layers.
 
 ### GOV-1 — memory/effort profiles on the governor (`tex_memory.py`)

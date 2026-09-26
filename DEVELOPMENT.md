@@ -635,8 +635,8 @@ session.close()                                     # then shed caches and host 
 ```
 
 Every call is real, not a sketch: `default_session` / `set_host` / `reset` / `close`
-(`tex_session.py:112-118`, `:65-68`, `:74-82`, `:100-106`), the process-wide profile setter
-(`tex_marshalling.py:710-720`), `NullHostServices` (`tex_runtime/host.py:125-137`), and
+(`tex_session.py:112-118`, `:65-68`, `:74-82`, `:100-106`), the process-wide profile setter,
+`set_egress_profile` (`tex_marshalling.py:957-965`), `NullHostServices` (`tex_runtime/host.py:125-137`), and
 `submit` / `result` / `close` (`tex_cookqueue.py:292-309`, `:215-224`, `:832-865`). The lifecycle op
 runs at COMMITTED because that class is never shed and pauses for INTERACTIVE rather than tripping
 it (`tex_cookqueue.py:17-34`); the submit is fenced through the queue because `reset()` must not run
@@ -657,16 +657,17 @@ throws away the memo, and a flip between cooks is not a shape any canary covers.
 
 **The queue's token, four rules** (`docs/cook-queue-scheduling.md` §3-§6 has the argument): a
 submitted cook must take the queue's OWN token — chained with a host's own reason to abort, never
-substituted for it (`examples/host_demo.py:61-73`, `:503-507`), because that token is the only
-channel preemption, shedding and `close()` travel down. Preempt returns a job to the HEAD of its
-class, transient and never reported to the host; shed is terminal
+substituted for it (the `_Chain` example, `examples/host_demo.py:61-73`, `:503-507`), because that
+token is the only channel preemption, shedding and `close()` travel down. Preempt returns a job to
+the HEAD of its class, transient and never reported to the host; shed is terminal
 (`tex_cookqueue.py:36-40`; `test_v031_sched4_priority_and_preemption`, `tests/test_v031_phase1.py:127`, `:390`). A cancellation the queue did not
 itself raise — a shed, a host's own supersede latch, a global Stop — is terminal by the same rule,
-never retried (`tex_cookqueue.py:703-707`). A cook that already returned is never discarded for a
+never retried, inside `CookQueue._run_one` (`tex_cookqueue.py:703-707`). A cook that already returned is never discarded for a
 flag raised while it ran (`tex_cookqueue.py:42-47`, `:754-760`).
 
 **Process-global, all of it** (one tenant per process today): host services
-(`tex_runtime/host.py:267-288`), the egress profile and ARRAY wires (`tex_marshalling.py:710-720`),
+(`tex_runtime/host.py:267-288`), the egress profile and ARRAY wires, read inside
+`infer_binding_type` (`tex_marshalling.py:710-720`),
 the program/codegen cache under `TEX_CACHE_DIR`, the CACHE-5 governor, and the per-thread interpreter
 pool (ENG-9 above). The tiered noise caches are the one exception to `reset()`'s reach: a key's
 compiled tier is promoted starting its 4th call (`tex_runtime/noise.py:423-425`) and STAYS promoted —
@@ -688,12 +689,14 @@ and everything below is a pointer, one sentence each, to what exists on this tre
 - `CookResult.done`, a `torch.cuda.Event | None` fenced after this cook's LAST launch (`None`
   off CUDA) — PACE-45. Additive and costs nothing unless a caller reads or synchronizes it;
   see `tex_runtime/pacing.py::cook_done_event` — Tier 1, the same row as `CookResult` itself.
-- `tex_doctor.capabilities()`, also `tex doctor --json`, is a read-only per-tier report: did this
+- `tex_doctor.capabilities()`, also `tex doctor --json` (the CLI's own `doctor_fn`), is a
+  read-only per-tier report: did this
   process's box actually run each execution tier, is it known unavailable and why, or simply
   unmeasured (`tex_doctor.py:284-310`, `tex_cli.py:303-318`) — Tier 2, its own row below.
 - `tex_fusion.collapse_linear(stages)` rewrites a DAG-shaped fused region to the legacy linear shape
   when the region genuinely is one, or returns `None` rather than force a mis-wired collapse
-  (`tex_fusion.py:1019-1039`); `tex_checkpoint.gate_refusal(...)` is the structured reason — a stable
+  (`tex_fusion.py:1019-1039`); `tex_checkpoint.gate_refusal(...)`, returning a `GateRefusal`,
+  is the structured reason — a stable
   code, the offending stage, a human message — that a checkpointed cook ran whole instead of
   incrementally (`tex_checkpoint.py:501`). Neither is a row below; both are `tex_fusion`
   internals, Tier 3, by the catch-all's own example. `tex_roi.region_advisory(...)` (CACHE-10,

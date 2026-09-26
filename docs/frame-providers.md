@@ -11,7 +11,7 @@ decisions it names, with the tension stated for each, and is the contract the te
 TEX can read any pixels a host hands it as a binding, and nothing else. Every temporal
 op in the language — `fetch_frame`, `sample_frame`, the 3-arg `@A[x,y,f]` sugar — indexes
 **inside the batch that was already marshalled**. ROI-6's `frame_window` analysis
-(`tex_roi.frame_window`, `tex_roi.py:939`) stops at the batch edge for exactly that reason:
+(`tex_roi.frame_window`, `tex_roi.py:945`) stops at the batch edge for exactly that reason:
 there is nothing past it to reach.
 
 Motion blur over a shutter, a temporal median over ±3 frames, a flow-warp from the
@@ -149,7 +149,7 @@ foreign call, and it would be baked once and replayed forever).
 
 **The correction.** Doc 41 §3.1 asks for `footprint=('frame', i)`-class descriptors, and
 `docs/roadmap.md` §9 hedges it as "(or `'image'` if unbounded)". `('frame', i)` is wrong
-here, and not merely imprecise: ROI-6's `_frame_ops` (`tex_roi.py:916`) reads argument `i`
+here, and not merely imprecise: ROI-6's `_frame_ops` (`tex_roi.py:922`) reads argument `i`
 of any `('frame', i)` call as a **batch index** and hands it to
 `_extract_pixel_offset(arg, "fi")`, so `fetch_time("plate", fi - 1, …)` would be recorded
 as "this program reads batch frame fi-1". It reads no batch frame at all. The window would

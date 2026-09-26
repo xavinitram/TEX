@@ -87,7 +87,7 @@ grammar alone, and rewrite `ChannelAccess(BindingRef)` into a dotted `BindingRef
 pre-typecheck pass. It is cheaper in the lexer and worse everywhere else, for one structural
 reason: **everything that matters is keyed on token value, not on AST shape.**
 
-* `sigil_names(code)` (`tex_marshalling.py:593`) lexes the source and returns every `@name`.
+* `sigil_names(code)` (`tex_marshalling.py:822`) lexes the source and returns every `@name`.
   Under (a) it returns `beauty.diffuse` — per-plane demand, for free, with no second scan.
   Under (b) it returns `beauty`, and demand-driven expansion (§3) needs a whole new mechanism.
   It has two consumers already (`param_only_names`, `tex_roi._referenced_at_bindings`) and its
@@ -95,11 +95,12 @@ reason: **everything that matters is keyed on token value, not on AST shape.**
 * The sampling sugar `@src.N(u, v)` and the fetch form `@src.N[x, y]` work under (a) because
   the postfix forms are gated on `BindingRef` — and under (a) `@src.N` *is* a `BindingRef`.
   Today `@src.N(u,v)` is a parse-time **E2002** ("This value can't be called like a function…
-  Only function names and @bindings can be followed by `(...)`", `parser.py:843-850`) — because
+  Only function names and @bindings can be followed by `(...)`", raised inside
+  `Parser.parse_postfix`, `parser.py:843-850`) — because
   the dot has already produced a `ChannelAccess`, which is not callable — and `@src.N[x,y]`
   parses as `ArrayIndexAccess` and dies in the TypeChecker. Both are unreachable as plane
   sugar under (b), and both fall out for free under (a).
-* `identity_binding_types` (`tex_marshalling.py:659`) and `TEXCache.fingerprint`
+* `identity_binding_types` (`tex_marshalling.py:906`) and `TEXCache.fingerprint`
   (`tex_cache.py:387`) hash `(name, type)` pairs. `("beauty.diffuse", "vec3")` is just another
   tuple; no identity machinery changes.
 
@@ -118,7 +119,7 @@ For an `AT_BINDING` token whose value contains a dot, split on the **last** dot 
 | `binding_types[base]` | rule |
 |---|---|
 | `PLANES` | a **plane read**. Keep the dotted `BindingRef("base.seg")`. If `seg` is not in the wire's declared plane set → **W7xxx** (§3). |
-| a vector type (`VEC2`/`VEC3`/`VEC4`) | **split back**: rewrite to `ChannelAccess(BindingRef(base), seg)`. `seg` must be in `CHANNEL_MAP` ∪ `VALID_SWIZZLES` (`types.py:128-131`, `:155-160`) — otherwise the existing unknown-channel error fires, unchanged. |
+| a vector type (`VEC2`/`VEC3`/`VEC4`) | **split back**: rewrite to `ChannelAccess(BindingRef(base), seg)`. `seg` must be in `CHANNEL_MAP` (`types.py:149-151`) ∪ `VALID_SWIZZLES` (`types.py:219-223`) — otherwise the existing unknown-channel error fires, unchanged. |
 | a non-vector type (`FLOAT`/`INT`/`MASK`/`STRING`/…) | split back as above; `base_is_vector` (`types.py:134`) already owns what `.r` means on a channel-less value, and that answer does not change. |
 | **absent** (untyped base) | **default to swizzle** — split back. This is the existing VEC4 fallback in the TypeChecker, and it is the safe default because it is what every program written before planes existed meant. |
 
@@ -156,8 +157,8 @@ fixture whose layer group is genuinely lowercase-swizzle-named.)*
 
 ## 2. The wire value: `PlanesValue`
 
-A dedicated wrapper class, following the `Promise` precedent (`tex_engine.py:586`'s
-`_resolve_promise_bindings` is the shape to mirror):
+A dedicated wrapper class, following the `Promise` precedent (inside `prepare`,
+`tex_engine.py:586`'s `_resolve_promise_bindings` is the shape to mirror):
 
 ```python
 class PlanesValue:
@@ -215,7 +216,7 @@ assigned binding `OUT.diffuse` on a `PLANES` output.
   both would make the output type depend on statement order, which is the class of bug phase 0
   spent its whole budget removing.
 * Egress grows the inverse repack into a `PlanesValue`, and `map_inferred_type`
-  (`tex_marshalling.py:897`) gains the PLANES arm.
+  (`tex_marshalling.py:917`) gains the PLANES arm.
 
 ---
 

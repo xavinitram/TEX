@@ -114,14 +114,14 @@ Four workstreams. Effort tags: S/M/L.
 
 - **FUS-0 (S, shipped v0.20.1).** Fused chains cannot reach `torch_compile`/`auto` in
   production: `select_tier` requires `fused_fp_present` (today `tex_engine.select_tier`,
-  defined in `tex_engine_tiers.py:129-146` and re-exported onto `tex_engine` — SPLIT-E) but
+  defined in `tex_engine_tiers.py:166-183` and re-exported onto `tex_engine` — SPLIT-E) but
   the node's `execute()` computed `fused_fp` only under `cuda_graph` (that computation now
   lives in `tex_engine.prepare`, `tex_engine.py:622-634`, and runs for every mode). One-line
   gate fix + a node-path regression test (the existing F-1 test bypasses the gate with a
   synthetic fingerprint).
 - **FUS-1 (M).** DAG-region fusion producer. The Q-3 splicer already accepts arbitrary
   DAG edges (`chain_inputs`), multi-output (`exports`), and observed intermediates
-  (`tap`) — but the only production producer emits linear chains
+  (`tap`) — but the only production producer, `compile_fused`, emits linear chains
   (tex_fusion.py:623-652), and the frontend detector breaks on any fan-out
   (js/tex_extension.js:2354-2390). Generalize detection to single-terminal fusable
   *regions* — and implement the detector **once, in pure Python**
@@ -143,8 +143,9 @@ Four workstreams. Effort tags: S/M/L.
 ### Workstream B — interactive latency (pillar 8)
 
 - **LAT-1 (L).** Compile-latency masking everywhere, in two halves. **(a, M)** forced
-  `torch_compile` currently blocks the cook on `future.result()` (~28 s cold —
-  compiled.py:655); route it through the background-compile machinery `auto` already
+  `torch_compile` currently blocks the cook on `future.result()`, inside
+  `execute_compiled` (~28 s cold — compiled.py:655); route it through the
+  background-compile machinery `auto` already
   uses (serve codegen/interpreter meanwhile, swap on ready), plus queue-time
   speculative warm: pre-materialize codegen fns and submit background compiles for
   every TEX program in the prompt. **(b, M, own mini-design)** asynchronous
@@ -166,14 +167,15 @@ Four workstreams. Effort tags: S/M/L.
 
 ### Workstream C — engine-seam hardening (pillars 2, 5, 7 + embedding)
 
-- **ENG-1 (L, flagship).** PORT-2b: extract the cook orchestrator out of
-  `tex_node.py` into `tex_engine.cook(program_or_chain, bindings, *, device,
-  compile_mode, precision, ...)`. Today the full engine (tier selection, fallbacks,
-  OOM ladder, tiling, precision-auto) is only reachable through a ComfyUI v3 node
-  classmethod — even `tex run` calls the node facade (tex_cli.py:101).
-  `tex_node.execute` becomes marshal-in → `engine.cook` → marshal-out. Mechanical
-  move (STR-2/3 already isolated the seams); gate: full suite + benchmark-neutral
-  (invariant #7).
+- **ENG-1 (L, flagship) — RESOLVED since v0.22, this pencil entry was simply never
+  removed.** PORT-2b's own goal (extract the cook orchestrator out of `tex_node.py`
+  into a host-agnostic `tex_engine.cook`) is already shipped: `tex_cli.py`'s own
+  module docstring (`tex_cli.py:7-9`) states plainly that before v0.22 `tex run`
+  called `TEXWrangleNode.execute`, a ComfyUI v3 node classmethod, and that this
+  changed — the CLI is now host-agnostic, with no node, schema or slot protocol in
+  its call path at all (`NullHostServices` serves it instead). Found while auditing
+  this citation for drift; corrected here rather than left to mislead the next
+  reader of this pencil into re-proposing already-shipped work.
 - **ENG-2 (M).** Standalone memory authority: `NullHostServices.get_free_memory`
   returns None so the Null host can neither tile nor retry — the same 8K cook that
   survives under ComfyUI just OOMs under tex_api. Use `torch.cuda.mem_get_info` in
@@ -801,7 +803,8 @@ touching the frontend. FUS-0 ships as **v0.20.1** (hotfix, in flight).
 vendoring host moves to `v0.45.1` — same frozen seam as `v0.45.0`, seam test unchanged. See
 `CHANGELOG.md` | v0.45.1 |
 | v0.45.2 | **Cancel means stop** — a correctness patch under the patch-only regime (SHIPPED) | On CUDA, a cancel token could no longer stop a GPU-heavy cook: host-side polling ran ahead of the device once `v0.41`–`v0.44` removed incidental syncs, so a cook could accept cancellation and still drain the GPU for seconds. Fixed with two additive mechanisms: opt-in paced cancellation (a token with `pace=True` keeps the host at most one poll-interval ahead of the device; measured 0/5 cancelled before, 5/5 after, ~11ms landing latency; a token without `pace`, and `cancel=None`, are byte-identical to before), and `CookResult.done`, a `torch.cuda.Event \| None` a host can use to gate admission on real GPU completion. No pixel change, no `LANGUAGE_VERSION` move, no default moved, no new reserved name. The embedding-host seam-freeze test moves additively only (one new frozen row, `tex_engine:CookResult`); nothing already pinned moves, and nothing currently pencilled for `v0.46.0` moves anything the freeze pins either. `tex_runtime/interpreter.py`/`stdlib_core.py` (`_CODEGEN_FILES`) and `compiled.py` (`_VERDICT_FILES`) are edited, so the codegen/verdict caches move once; `.pkl` stays warm. See `CHANGELOG.md` | v0.45.2 |
-| v0.46.0 | **HELD until the embedding host re-pins past v0.45.0.** **Batch honest** — headless throughput | SCHED-5 (the throughput profile: preemption off, Tier-B admission replaced by frame-pipeline lookahead, governor switched to write-and-evict — a scheduling profile on the same engine and queue, exactly as the report insists), BATCH-1 (L, design doc: time-invariance classification from `used_builtins` plus the host's animated-param set, so a frame-invariant stage's lineage key is frame-INDEPENDENT and CACHE-2 serves it across the whole range for free; the work is the classifier API, lifetime hints, and cost-aware skip). Moved one slot down from v0.44.0, which the author redirected to "The interactive path, measured" instead (approved 2026-09-25); nothing else after this row moves | — |
+| v0.46.0 | **Compiled, predictably** — author-approved minor: a toolchain-aware `auto`, bounded convergence, a supported cook-observer seam, TRK-143 parity, the fused-CUDA device fix, a torch-free `check()`, and the pre-release audit's own crash/hardening fixes (SHIPPED) | `compile_capability()` (read-only toolchain probe); `"auto"` makes no compile attempt with no toolchain (in-memory REJECTED, never fossilized); a background compile's lazy first-call cost no longer stalls the cook thread (dedicated warm pool); a stuck trial reaches a bounded (30s) terminal verdict; TRK-143 (codegen/interpreter spatial-`if` parity via the shared `masked_flow.cond_mask`, proven pixel-neutral); the fused/unfused CUDA `$param` device-mismatch crash, fixed; `tex_api.check()` torch-free end to end; `tex_runtime.cook_observer` (`register`/`unregister`/`scope`, additive-only in the seam-freeze); the cache-mutation seam (`_CacheBudget`, O(1) budget check) plus its own concurrent-mutation crash, found and fixed pre-release; `tex_engine.py` split into `tex_engine_tiers.py` (mechanical, re-exported). **Measured on the sm_75 reference box: per-node and fused Inductor compiles LOSE to the uncompiled path (21-27% slower fused, at every resolution measured) — `"auto"` correctly rejects every trial, and `compile_ahead` for playback was NOT built because the plan's own precondition (a fused-compile win) did not hold.** No `LANGUAGE_VERSION` move, no default moved, no new reserved name. No ComfyUI pixel change except TRK-143's proven-neutral formula alignment. See `CHANGELOG.md` | v0.46.0 |
+| v0.47.0 | **HELD until the embedding host re-pins past v0.45.0.** **Batch honest** — headless throughput | SCHED-5 (the throughput profile: preemption off, Tier-B admission replaced by frame-pipeline lookahead, governor switched to write-and-evict — a scheduling profile on the same engine and queue, exactly as the report insists), BATCH-1 (L, design doc: time-invariance classification from `used_builtins` plus the host's animated-param set, so a frame-invariant stage's lineage key is frame-INDEPENDENT and CACHE-2 serves it across the whole range for free; the work is the classifier API, lifetime hints, and cost-aware skip). Also carries v0.46's own Phase C "v0.47 candidates": decoupling `_bp_co` from the learned-once net (R4#3), and a supported substitution seam replacing the compiled tier's hand-enumerated routing (R4#4). Moved one slot down from v0.46.0, which the author redirected to "Compiled, predictably" instead (approved 2026-09-25); nothing else after this row moves | — |
 
 Per-release notes:
 
