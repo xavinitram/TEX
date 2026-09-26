@@ -58,9 +58,46 @@ logger = logging.getLogger("TEX")
 # _get_interpreter` / `from .tex_runtime.compiled import execute_compiled` / etc. — see the
 # module docstring. `tex_engine` is already in `sys.modules` (mid-import) the moment this
 # module is first imported (from inside `tex_engine.py`'s own top-level import statement),
-# so this binds the module object without re-running it; nothing here reads an attribute
-# off it until a cook actually runs, long after both modules have finished loading.
-from . import tex_engine as _tex_engine
+# so binding the module object costs nothing extra WHEN `tex_engine` is imported first — but
+# nothing here reads an attribute off it until a cook actually runs, long after both modules
+# have finished loading, in EITHER import order.
+#
+# R1 (v0.46, FIX-OBSROUTE): that "either order" half used to be false. Importing
+# `tex_engine_tiers` FIRST, in a fresh process, crashed with a circular ImportError: the
+# eager `from . import tex_engine as _tex_engine` below started `tex_engine.py`'s own body
+# running (it was not yet in `sys.modules`), which reaches `from .tex_engine_tiers import
+# (select_tier, ...)` (the SPLIT-E re-export) while THIS module's body is still stuck on its
+# own import line above — `tex_engine_tiers` is in `sys.modules` by then (added the moment
+# Python started running it) but none of its functions have been defined yet, so that
+# re-export raises ImportError. Binding eagerly needed `tex_engine`'s own import to finish;
+# `tex_engine.py` needed `tex_engine_tiers`'s import to have already finished — a genuine
+# cycle, not merely a name resolved too soon.
+#
+# The fix resolves `_tex_engine` LAZILY instead: nothing below imports `tex_engine` at
+# module scope, so importing `tex_engine_tiers` first no longer pulls it in at all. The
+# proxy's `__getattr__` performs the import on the first attribute read any `_run_*`
+# strategy makes — long after both modules have finished loading, whichever one was
+# imported first — and caches the result so every later attribute read is one dict lookup
+# plus one `getattr`, not a fresh import.
+class _LazyTexEngine:
+    """A stand-in for the `tex_engine` module object, resolved on first ATTRIBUTE access
+    rather than at import time. `_tex_engine.NAME` below reads exactly as it did when this
+    was an eager `from . import tex_engine as _tex_engine` — this class exists only to move
+    the *timing* of the import, not to change what any caller sees."""
+    __slots__ = ("_mod",)
+
+    def __init__(self):
+        self._mod = None
+
+    def __getattr__(self, name):
+        mod = self._mod
+        if mod is None:
+            from . import tex_engine as mod
+            self._mod = mod
+        return getattr(mod, name)
+
+
+_tex_engine = _LazyTexEngine()
 
 
 # ── Tier selection + the tier strategies ─────────────────────────────────────
