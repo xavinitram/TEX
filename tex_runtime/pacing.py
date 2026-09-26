@@ -73,10 +73,32 @@ passed since it last recorded; every poll in between is `token.check()` alone, n
 at all. `stride` defaults to a module constant (`_DEFAULT_STRIDE_S`, chosen by measurement)
 and a token may override it with a `pace_stride_ms` attribute (non-negative, FINITE int or
 float; `0` disables striding, recording at every poll exactly as depth-only pacing did).
-**The pre-emption bound becomes approximately `depth * max(stride, one statement's own
-device time)`** for the common case of many poll points per unit of device work. The token
-is still polled (`token.check()`) at literally every poll point regardless of the stride
-gate, so cancellation latency is unaffected by striding; only the pool's record/wait
+
+**PACE-47: a poll inside the stride window is a candidate to skip, never a guarantee.**
+The shape above — skip purely on HOST-elapsed time — was found to make `stride` leak into
+the correctness bound rather than staying a pure cost knob: measured (see the hand-back) that
+on a box whose host dispatch is fast relative to its own device compute (sm_75, paired with a
+fast desktop CPU), a chain of few,
+device-expensive statements (`medium`/`heavy`) can have SEVERAL statements' worth of host
+dispatch complete inside one stride window — so the window's one record covers several
+statements' worth of enqueued device work, and the pool's "outstanding" count under-counts
+what is really queued. `depth` then bounds something smaller than `depth` poll-intervals of
+device work, growing worse as `stride` grows (measured: heavy-chain drained p95 21.7ms at
+stride 0 -> 237.8ms at stride 1.0ms on sm_75). The fix: a poll inside the stride window
+peeks (non-blocking `event.query()`, never a wait) at the most recently recorded event
+before deciding to skip. Skipping is honoured only when that event has already completed —
+the device has drained past everything queued so far, so no backlog can be hiding — or when
+nothing is outstanding yet. The moment the peek finds the device still behind, the stride
+gate is NOT honoured for that poll: it falls through to the ordinary depth-gated
+record/wait exactly as `stride=0` would. **The pre-emption bound is therefore `depth`
+poll-intervals of real device work, independent of `stride`, at every stride value** — the
+device can only ever fall `stride`-window's-worth of HOST time behind at all if it is
+genuinely keeping up (in which case there is nothing to bound), because the instant it
+falls behind, the very next poll notices via the peek and resumes recording. `stride` is
+now purely how often the module is willing to pay `query()`'s own (small, non-blocking) cost
+while the device keeps up — a cost knob, never a correctness one. The token is still polled
+(`token.check()`) at literally every poll point regardless of the stride gate, so
+cancellation latency is unaffected by striding; only the pool's record/wait/peek
 bookkeeping is throttled.
 
 **The honest bound, stated plainly (Phase C, R4#3): look-ahead is counted in POLL POINTS,
@@ -84,14 +106,15 @@ not in device time directly.** All four cancel-poll-point families this module r
 interpreter's per-statement poll, the codegen tier's in-body polls, the stencil route's
 entry poll, and a multi-pass builtin's between-pass poll — named above) were placed to
 bound CANCELLATION latency, not queued device work, and those are different quantities — a
-"poll-interval" is not a fixed amount of device work. The `depth * max(stride, ...)` bound above holds well for a
-program with many poll points relative to its device work (the common shape this ask was
-measured against: an interpreted chain of many statements, or a multi-pass builtin that
-polls between its own passes). It is NOT a tight bound for a program with FEW, COARSE poll
-points relative to its device work — a single expensive builtin pass between two polls, or
-a codegen-tier cook compiled without `emit_cancel_polls` (whose only poll is at entry, before
-the whole compiled program's device work is even queued). For those shapes, the device can
-fall behind by however much work sits between two consecutive poll points, REGARDLESS of
+"poll-interval" is not a fixed amount of device work. The `depth`-poll-intervals bound
+above (independent of `stride`, since PACE-47) holds well for a program with many poll
+points relative to its device work (the common shape this ask was measured against: an
+interpreted chain of many statements, or a multi-pass builtin that polls between its own
+passes). It is NOT a tight bound for a program with FEW, COARSE poll points relative to its
+device work — a single expensive builtin pass between two polls, or a codegen-tier cook
+compiled without `emit_cancel_polls` (whose only poll is at entry, before the whole
+compiled program's device work is even queued). For those shapes, the device can fall
+behind by however much work sits between two consecutive poll points, REGARDLESS of
 `depth`/`stride` — the guarantee is only ever as tight as whichever poll-point family the
 running program actually hits, not a property of this module alone.
 
@@ -341,10 +364,28 @@ def paced_check(token, device) -> None:
     already-tripped token is caught before any device interaction) — ALWAYS, regardless of
     what follows, so cancellation latency never depends on the stride gate below. Then, if
     fewer than `stride` seconds of host time have passed since the pool last recorded, this
-    poll is DONE: no pool access, no CUDA call at all beyond the `token.check()` already
-    paid. That is the stride gate a chain of many cheap statements needs — recording a CUDA
-    event at every one of them costs more than the statements themselves, measured (see the
-    hand-back).
+    poll ECONOMIZES only while the device is genuinely keeping up: it peeks at the most
+    recently recorded event's own `query()` (non-blocking; never waits) and, if that event
+    has already completed, this poll is DONE — no pool access beyond the peek, no
+    `event.record()` — because the device has already drained past everything the host has
+    queued so far, so skipping the bookkeeping cannot hide a growing backlog (PACE-47). If
+    that event has NOT completed (the device is behind), the stride gate is not honoured
+    for this poll: falls through to the depth-gated record/wait below exactly as if
+    striding were off. **This is what makes `stride` a pure COST knob rather than a
+    correctness parameter** (PACE-47, the sm_75 finding): the original gate skipped
+    recording purely on HOST-elapsed time, so a host fast enough to dispatch several
+    statements inside one stride window could let the device fall arbitrarily far
+    behind `depth` poll-intervals without a single poll ever recording an event to notice
+    — the fast-host/slow-device combination measured on sm_75 (see the hand-back). Gating
+    the skip on the device's OWN completion state instead means striding
+    only ever economizes recording overhead when it is genuinely free to (the device has
+    nothing outstanding to fall behind on); the moment it is not, this poll behaves exactly
+    like stride=0 and the depth bound reasserts itself within one poll. That is the stride
+    gate a chain of many cheap statements needs — recording a CUDA event at every one of
+    them costs more than the statements themselves, measured (see the hand-back); the
+    `query()` peek itself is a non-blocking, already-cheap CUDA call (measured — see the
+    hand-back), paid only for the polls that land inside a stride window with something
+    still outstanding to peek at.
 
     Past the stride, the poll behaves exactly as depth-only PACE-462 did: only if this
     cook's device pool already holds `depth` OUTSTANDING events, blocks on the OLDEST one
@@ -378,15 +419,26 @@ def paced_check(token, device) -> None:
 
     token.check()
 
+    pool = _state.pool
+    outstanding, free = pool["outstanding"], pool["free"]
+    depth = _state.depth
+
     stride = _state.stride_s
     if stride > 0:
         last = _state.last_record_t
         if last is not None and (_time.perf_counter() - last) < stride:
-            return  # inside the stride window: token already checked, nothing else to do
-
-    pool = _state.pool
-    outstanding, free = pool["outstanding"], pool["free"]
-    depth = _state.depth
+            # Inside the stride window: this is a candidate to skip, but ONLY while the
+            # device is genuinely keeping up (PACE-47). Peek at the most recently recorded
+            # event (non-blocking `query()`, never a wait): if it has already completed,
+            # the device has drained past everything queued so far and skipping here
+            # cannot hide a backlog -- economize as before. If nothing is outstanding to
+            # peek at, there is nothing behind either, so the same skip is safe. If the
+            # peeked event has NOT completed, the device is behind: do not honour the
+            # stride gate for this poll -- fall through to the depth-gated record/wait
+            # below exactly as stride=0 would, so the bound stays honest regardless of how
+            # fast the host is dispatching relative to this stride.
+            if not outstanding or outstanding[-1].query():
+                return  # device caught up: token already checked, nothing else to do
 
     if len(outstanding) >= depth:
         # The pool already holds `depth` outstanding events: the device is up to `depth`

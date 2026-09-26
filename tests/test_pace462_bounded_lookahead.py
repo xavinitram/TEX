@@ -511,6 +511,104 @@ def test_stride_zero_disables_the_gate(r):
         r.fail("PACE-462 stride=0", f"expected count=5 (every poll recorded), got {count}")
 
 
+# ── PACE-47: the stride skip is honoured only while the device keeps up ──────────
+#
+# A finding measured on a box whose host dispatch is fast relative to its device (see the
+# hand-back): a fast host paired with a slower device can dispatch several statements
+# inside one stride window, and the
+# pre-PACE-47 gate skipped recording on host-elapsed time ALONE -- so the pool's outstanding
+# count silently under-counted a real, growing backlog. These rows drive the FakeCudaEvent
+# class-level `DONE` flag directly (query()'s only source of truth here) to prove the fix:
+# a poll inside the stride window must fall through to depth-gated record/wait the instant
+# the most recently recorded event has NOT completed, regardless of how little host time has
+# elapsed -- and must still economize (skip) once the device genuinely catches up.
+
+def test_pace47_stride_skip_falls_through_when_device_is_behind(r):
+    """Fast host + slow device, entirely inside one 10ms stride window (the clock never
+    reaches the stride boundary): with `FakeCudaEvent.DONE = False` (the device never
+    reports a recorded event as complete -- "always behind"), depth=2 must still be
+    enforced -- the 3rd poll must wait -- even though every poll lands well inside the
+    stride window. Pre-PACE-47, this was RED: the gate skipped purely on host-elapsed time,
+    so polls 2 and 3 would never touch the pool at all and no wait would ever fire."""
+    print("\n--- PACE-47: a poll inside the stride window still records/waits when the "
+          "device is behind ---")
+    clock = _FakeClock(0.0)
+    real_perf_counter = _pace._time.perf_counter
+    _pace._time.perf_counter = clock
+    try:
+        with _DeviceSpy():
+            _FakeEvent.DONE = False   # the device never finishes a recorded event: "behind"
+            tok = _Token(pace=True, pace_depth=2)
+            tok.pace_stride_ms = 10.0
+            _pace.reset(tok, "cuda")
+
+            _pace.paced_check(tok, "cuda")       # t=0.0: no prior record -> records (#1)
+            outstanding_after_1 = len(_pace._state.pool["outstanding"])  # noqa: SLF001
+            constructed_after_1 = _FakeEvent._live
+
+            clock.advance(0.001)                  # t=0.001: 1ms since last record (<< 10ms)
+            _pace.paced_check(tok, "cuda")         # device behind -> falls through -> records (#2)
+            outstanding_after_2 = len(_pace._state.pool["outstanding"])  # noqa: SLF001
+            constructed_after_2 = _FakeEvent._live
+
+            clock.advance(0.001)                  # t=0.002: still << the 10ms window
+            waits_before_3 = sum(ev.sync_calls for ev in _pool_events())
+            _pace.paced_check(tok, "cuda")         # pool full at depth 2 -> must wait on oldest
+            waits_after_3 = sum(ev.sync_calls for ev in _pool_events())
+    finally:
+        _pace._time.perf_counter = real_perf_counter
+        _FakeEvent.DONE = True
+
+    ok = (outstanding_after_1 == 1 and constructed_after_1 == 1
+          and outstanding_after_2 == 2 and constructed_after_2 == 2
+          and waits_after_3 - waits_before_3 == 1)
+    if ok:
+        r.ok("all 3 polls landed inside the 10ms stride window (elapsed 0/1/2ms); depth=2 "
+             "was still enforced -- poll 3 waited on the oldest event exactly as stride=0 "
+             "would have, because the device never reported catching up")
+    else:
+        r.fail("PACE-47 stride/device-behind",
+               f"outstanding: after1={outstanding_after_1} after2={outstanding_after_2}; "
+               f"constructed: after1={constructed_after_1} after2={constructed_after_2}; "
+               f"waits gained at poll 3={waits_after_3 - waits_before_3} (expected 1)")
+
+
+def test_pace47_stride_skip_still_fires_once_device_catches_up(r):
+    """The companion case: once the most recently recorded event genuinely completes
+    (`FakeCudaEvent.DONE = True`, the default -- "the device caught up"), a poll still well
+    inside the stride window economizes exactly as before PACE-47 -- no new event, no
+    device touch beyond the `query()` peek. Proves the fix does not simply disable striding;
+    it conditions the skip on the device's own state."""
+    print("\n--- PACE-47: the stride skip still fires once the device has caught up ---")
+    clock = _FakeClock(0.0)
+    real_perf_counter = _pace._time.perf_counter
+    _pace._time.perf_counter = clock
+    try:
+        with _DeviceSpy():
+            _FakeEvent.DONE = True    # the device always reports the last event done: "caught up"
+            tok = _Token(pace=True, pace_depth=2)
+            tok.pace_stride_ms = 10.0
+            _pace.reset(tok, "cuda")
+
+            _pace.paced_check(tok, "cuda")        # t=0.0: no prior record -> records (#1)
+            constructed_after_1 = _FakeEvent._live
+
+            clock.advance(0.001)                   # t=0.001: inside the 10ms window
+            _pace.paced_check(tok, "cuda")          # device caught up -> skip
+            constructed_after_2 = _FakeEvent._live
+            outstanding_after_2 = len(_pace._state.pool["outstanding"])  # noqa: SLF001
+    finally:
+        _pace._time.perf_counter = real_perf_counter
+
+    if constructed_after_1 == 1 and constructed_after_2 == 1 and outstanding_after_2 == 1:
+        r.ok("device-caught-up poll inside the stride window skipped: still 1 event "
+             "constructed, still 1 outstanding")
+    else:
+        r.fail("PACE-47 stride/device-caught-up",
+               f"constructed after1={constructed_after_1} after2={constructed_after_2}, "
+               f"outstanding after2={outstanding_after_2} (expected 1/1/1)")
+
+
 def test_pace_stride_ms_default_when_absent(r):
     print("\n--- PACE-462: pace_stride_ms absent resolves to the module default ---")
     tok = _Token(pace=True, pace_stride_ms=None)  # None -> no pace_stride_ms attribute at all
