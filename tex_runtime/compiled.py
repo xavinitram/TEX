@@ -1359,6 +1359,11 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     # the window before it can be forgotten.
     if autotier.enforce_convergence_bound(key):
         _bg_status(cache_key)
+        # C5 (B1#4): the bound may fire while an artifact already sits in the bounded
+        # 16-entry LRU (COMPILING, not yet promoted to TRIAL) — evict it, or it wastes a
+        # slot and risks evicting a genuinely COMMITTED program's artifact instead.
+        _compiled_cache.pop(cache_key, None)
+        _verify_state.pop(cache_key, None)
         return _codegen(bindings)
 
     # MEASURING or COMPILING (or TRIAL with a lost artifact): run the codegen
