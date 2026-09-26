@@ -23,6 +23,8 @@ against a silent fallback compares the interpreter with itself. Pixels are then 
 `torch.equal` (invariant 2, bit-exact on the same device). On a CPU-only runner the CPU legs
 pin that the CPU tier and the CPU output did not move (placement never runs on the CPU).
 """
+import threading
+
 from helpers import *
 from failure_harness import run_tier, simulate_restart
 
@@ -193,16 +195,30 @@ def test_codegen_param_placement_learned_once(r: SubTestResult):
             ("sharpen.tex", sharpen, {"amount": 1.0}, _assert_within_tol),
             ("f$gain probe", _GAIN, {"gain": 1.2}, _assert_equal)]
     real_place, real_invoke = C._params_on_device, C._invoke_cg
+    interactive_thread = threading.current_thread()
     for dev in _DEVICES:
         for name, code, params, same in rows:
             calls = {"placements": 0, "codegen calls": 0}
 
+            # C2 (v0.46 Phase C): count a call only when it comes from THIS (the
+            # interactive test) thread. The last cook of a row can submit a background
+            # warm job (CC-5); for a program with no real torch.compile cost (the
+            # codegen-only eager adapter) that job's own call into `_invoke_cg` can land
+            # within microseconds of submission, racing this row's own `finally` (or even
+            # a later drain point) with no reliable ordering. That call always runs on a
+            # background-pool worker thread, never on this one, so gating on thread
+            # identity is a timing-independent way to count "how many INTERACTIVE cooks
+            # reached codegen" — the only thing this row's `want` below describes —
+            # rather than hoping the race resolves a particular way. The real function is
+            # still invoked unconditionally either way; only the count is thread-gated.
             def place(*a, **k):
-                calls["placements"] += 1
+                if threading.current_thread() is interactive_thread:
+                    calls["placements"] += 1
                 return real_place(*a, **k)
 
             def invoke(*a, **k):
-                calls["codegen calls"] += 1
+                if threading.current_thread() is interactive_thread:
+                    calls["codegen calls"] += 1
                 return real_invoke(*a, **k)
 
             try:
@@ -217,15 +233,10 @@ def test_codegen_param_placement_learned_once(r: SubTestResult):
                                                   compile_mode="auto")
                             _served_by(f"[{dev}] {name} cook {i + 1}", "codegen")
                             same(ref, res.outputs["OUT"], f"[{dev}] {name} cook {i + 1}")
-                        # C2 (v0.46 Phase C): freeze the counted totals HERE, before anything
-                        # else. The last cook above may have submitted a background warm job
-                        # (CC-5); for a program with no real torch.compile cost (the
-                        # codegen-only eager adapter) that job can complete within
-                        # microseconds — possibly before `finally` below restores the real
-                        # `place`/`invoke` functions — so exactly WHEN it resolves must never
-                        # decide this assertion. Snapshot first, drain (flush this row's own
-                        # async work) second: the drain can still touch `calls` if it wins
-                        # that race, but `snapshot` no longer can.
+                        # Flush this row's own async work before moving to the next row
+                        # (or restoring the real functions) — belt and suspenders on top
+                        # of the thread gate above; see cold_engine_state's own drain for
+                        # the cross-block leak this closes (B5#1).
                         snapshot = dict(calls)
                         C._drain_bg_for_test()
                     finally:
