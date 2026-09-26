@@ -115,6 +115,23 @@ def language_pragma(source: str):
     return _parser_language_pragma(source)
 
 
+def scale_verdict(source: str, param_values: dict | None = None):
+    """SCALE-47b: the pre-cook query — is `source` safe to cook at a non-1.0 `scale`?
+    Returns a `tex_roi.ScaleVerdict(safe, code, source)`: `code` is the SAME stable reason
+    string (`"scale-unsafe"`) `tex_engine.prepare()`'s refusal attaches to a raised
+    exception's `.tex_refusal.code`, and `source` says whether the verdict came from the
+    conservative classifier or an author `//!tex scale: safe`/`never` override — engine
+    policy reads only `safe`/`code`, never `source`.
+
+    Memoized per `(source, $param values)` (`tex_roi.scale_verdict`'s own memo — this
+    delegates rather than re-deriving, so the two can never disagree): cheap enough for a
+    host to call on every drag tick after the program's first lookup. Delegates for the same
+    reason `language_pragma` does — one implementation, re-exported at the documented public
+    surface a host imports."""
+    from .tex_roi import scale_verdict as _roi_scale_verdict
+    return _roi_scale_verdict(source, param_values)
+
+
 def _ver_tuple(v: str) -> tuple:
     """Parse a dotted version string into a tuple of ints, one per `.`-separated component,
     for ordering comparisons (`>`/`<`/`min`/`max`) against another such tuple — never for

@@ -1059,29 +1059,77 @@ def _scale_unsafe_walk(node, in_coord_arg: bool = False) -> bool:
     return any(_scale_unsafe_walk(child) for child in iter_child_nodes(node))
 
 
-def scale_safe(code: str, param_values: dict | None = None) -> bool:
-    """Is this program safe to cook at a non-1.0 `scale`? An author override — a LEADING
-    `//!tex scale: safe` / `//!tex scale: never` comment (`tex_compiler.parser.scale_pragma`,
-    parsed the same way as the `//!tex X.Y` language pragma) — wins outright in either
-    direction; absent one, the conservative walk above decides. FAILS CLOSED: a parse
-    failure or any other exception answers `False` (unsafe) rather than silently permitting
-    a scale request the analysis could not actually verify.
+#: The stable reason code a `False` verdict carries — the SAME string
+#: `tex_runtime.host.REFUSE_SCALE_UNSAFE` raises with, so a host reading `ScaleVerdict.code`
+#: and a host reading `EngineRefusal.code` off a caught exception see one vocabulary.
+SCALE_UNSAFE_CODE = "scale-unsafe"
 
-    `tex_engine.prepare()` consults this (and `tex_api.scale_verdict()` mirrors it) before
-    honouring a `scale` that is neither `None` nor `1.0` — R5: the engine never silently
-    picks full scale for a program this declines; it refuses, structured, and the host
-    decides whether to retry at `scale=None`."""
+
+@dataclass(frozen=True)
+class ScaleVerdict:
+    """The SCALE-47b verdict for one program: is it safe to cook at a non-1.0 `scale`?
+    `code` is `SCALE_UNSAFE_CODE` when `safe` is False, else `None`. `source` says which of
+    the three answers produced it: `"classifier"` (the conservative walk decided),
+    `"pragma_safe"` / `"pragma_never"` (an author override decided, in that direction) —
+    purely informational; the engine's refusal reads only `safe`/`code`, never `source`, so a
+    host's own policy about trusting one `source` over another changes nothing engine-side."""
+    safe: bool
+    code: str | None
+    source: str
+
+
+_SCALE_VERDICT_MEMO_MAX = 256
+_scale_verdict_memo: "OrderedDict[tuple, ScaleVerdict]" = OrderedDict()
+
+
+def _scale_verdict_uncached(code: str, param_values: dict) -> ScaleVerdict:
     from .tex_compiler.parser import scale_pragma
     override = scale_pragma(code)
     if override == "safe":
-        return True
+        return ScaleVerdict(True, None, "pragma_safe")
     if override == "never":
-        return False
+        return ScaleVerdict(False, SCALE_UNSAFE_CODE, "pragma_never")
     try:
-        program = _fold_program(code, param_values or {})
-        return not any(_scale_unsafe_walk(stmt) for stmt in program.statements)
+        program = _fold_program(code, param_values)
+        unsafe = any(_scale_unsafe_walk(stmt) for stmt in program.statements)
     except Exception:
-        return False
+        unsafe = True                     # FAILS CLOSED: unanalysable -> unsafe
+    return ScaleVerdict(not unsafe, (SCALE_UNSAFE_CODE if unsafe else None), "classifier")
+
+
+def scale_verdict(code: str, param_values: dict | None = None) -> ScaleVerdict:
+    """The MEMOIZED SCALE-47b verdict for this program — cheap enough for a host to call on
+    every drag tick after the first. `scale_safe()` and `tex_engine.prepare()`'s cook-time
+    refusal both read this SAME function (never a parallel re-derivation), so a host's own
+    pre-cook query and the engine's refusal can never disagree.
+
+    Memoized per `(source, $param values)` — the same axes `scale_safe`'s analysis actually
+    depends on (binding TYPES don't enter this walk; only builtin-identifier usage does)."""
+    param_values = param_values or {}
+    try:
+        from .tex_cache import code_digest as _code_digest
+        key = (_code_digest(code), _param_key(param_values))
+    except Exception:
+        return _scale_verdict_uncached(code, param_values)
+    v = _scale_verdict_memo.get(key)
+    if v is None:
+        v = _scale_verdict_uncached(code, param_values)
+        _scale_verdict_memo[key] = v
+        while len(_scale_verdict_memo) > _SCALE_VERDICT_MEMO_MAX:
+            _scale_verdict_memo.popitem(last=False)
+    else:
+        _scale_verdict_memo.move_to_end(key)
+    return v
+
+
+def scale_safe(code: str, param_values: dict | None = None) -> bool:
+    """Is this program safe to cook at a non-1.0 `scale`? Thin wrapper over the memoized
+    `scale_verdict()` — see its docstring for the override/classifier/fail-closed rules.
+
+    `tex_engine.prepare()` consults this before honouring a `scale` that is neither `None`
+    nor `1.0` — R5: the engine never silently picks full scale for a program this declines;
+    it refuses, structured, and the host decides whether to retry at `scale=None`."""
+    return scale_verdict(code, param_values).safe
 
 
 def roi_exec_enabled(opt_in: bool | None = None) -> bool:

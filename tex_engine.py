@@ -589,14 +589,15 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     # multi-stage fused chain's UPSTREAM stages are not walked by this check.
     if scale is not None and scale != 1.0:
         from . import tex_roi as _tex_roi
-        if not _tex_roi.scale_safe(code):
+        _verdict = _tex_roi.scale_verdict(code)
+        if not _verdict.safe:
             exc = RuntimeError(
                 f"scale={scale!r} refused: this program is not provably scale-safe "
                 f"(it reads a pixel coordinate/dimension builtin outside a whitelisted "
                 f"fetch call, or declares `//!tex scale: never`). Cook at scale=None (or "
                 f"1.0) for full resolution, or add `//!tex scale: safe` if you can vouch "
                 f"for it.")
-            exc.tex_refusal = EngineRefusal(REFUSE_SCALE_UNSAFE, None,
+            exc.tex_refusal = EngineRefusal(_verdict.code or REFUSE_SCALE_UNSAFE, None,
                                             "this program is not provably scale-safe")
             raise exc
     # CACHE-1: the interpreter reads the playhead by duck-typing (`time_context.get(name)`, any
