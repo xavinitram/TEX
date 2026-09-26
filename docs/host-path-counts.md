@@ -543,7 +543,7 @@ test before it starts, and cannot claim a win the instrument would not see.
    two tile plans (`tex_tiling._tile_plan:38` and `_halo_tile_plan:142`, both re-exported into
    `tex_engine` at `tex_engine.py:139`), `enforce_cache_budget` (`tex_memory.py:384`),
    `trim_reserved_pool` (`tex_memory.py:877`) and `_disown_inputs` (`tex_buffers.py:158`) —
-   all called from `tex_engine.run` (`tex_engine.py:1037`) — plus `fingerprint`, **once**
+   all called from `tex_engine.run` (`tex_engine.py:1078`) — plus `fingerprint`, **once**
    since the per-cook key became one string handed down from `prepare`.
 
    **Who buys the free-VRAM reading, corrected.** An earlier reading of this item attributed
