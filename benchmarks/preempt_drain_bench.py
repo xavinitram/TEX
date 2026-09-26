@@ -144,6 +144,37 @@ def _p(xs, pct):
     return s[f] + (s[c] - s[f]) * (k - f)
 
 
+class BackgroundCookHungError(RuntimeError):
+    """Raised when a benchmark's own background cook thread is still alive after its join
+    timeout -- filed as a bug report (BENCH-47's finding on a shared box): a non-daemon
+    thread left running here previously kept the whole process (and the GPU) alive well
+    past the point the script had printed its results, silently contaminating whichever
+    measurement ran next on the same box, with no error, warning or nonzero exit code
+    anywhere to flag it. A background cook this benchmark spawns must finish, or raise
+    `CookCancelled`, in bounded time -- a thread still alive after twice the shape's own
+    calibrated runtime is a hard failure to surface, never a silent continue."""
+
+
+def _start_background_cook(fn):
+    """Start *fn* on a DAEMON thread (so a hang here can never keep the interpreter alive
+    at process shutdown -- the other half of the fix) and return the thread."""
+    th = threading.Thread(target=fn, daemon=True)
+    th.start()
+    return th
+
+
+def _reap_background_cook(th, timeout, context):
+    """Join *th* and raise `BackgroundCookHungError` if it is still alive afterward,
+    instead of the previous silent `continue` -- a hung background cook is a benchmark
+    result nobody can trust, not a trial to skip quietly."""
+    th.join(timeout=timeout)
+    if th.is_alive():
+        raise BackgroundCookHungError(
+            f"{context}: the background cook thread was still alive after a "
+            f"{timeout:.2f}s join timeout -- it neither finished nor raised "
+            f"CookCancelled in bounded time.")
+
+
 def _box_note():
     if not torch.cuda.is_available():
         return "no CUDA"
@@ -232,8 +263,7 @@ def drain_on_preempt(depths, trials, full_runtime, seed0=3000):
                 finally:
                     bg_done.set()
 
-            th = threading.Thread(target=_bg)
-            th.start()
+            th = _start_background_cook(_bg)
             tok._tripped.wait(timeout=full_runtime * 2 + 2)  # wait for the timer to trip
 
             t0 = time.perf_counter()
@@ -245,7 +275,8 @@ def drain_on_preempt(depths, trials, full_runtime, seed0=3000):
 
             returns_ms.append((t1 - t0) * 1000)
             drained_ms.append((t2 - t0) * 1000)
-            th.join(timeout=full_runtime * 2 + 2)
+            _reap_background_cook(th, full_runtime * 2 + 2,
+                                   f"drain_on_preempt depth={d} trial={i}")
             torch.cuda.synchronize()
 
         out[d] = {
@@ -302,8 +333,7 @@ def stream_priority(trials, full_runtime, seed0=5000):
             finally:
                 bg_done.set()
 
-        th = threading.Thread(target=_bg)
-        th.start()
+        th = _start_background_cook(_bg)
         tok._tripped.wait(timeout=full_runtime * 2 + 2)
 
         t0 = time.perf_counter()
@@ -317,7 +347,7 @@ def stream_priority(trials, full_runtime, seed0=5000):
             res.done.synchronize()
         t1 = time.perf_counter()
         results["high_priority_stream" if use_high else "default_stream"].append((t1 - t0) * 1000)
-        th.join(timeout=full_runtime * 2 + 2)
+        _reap_background_cook(th, full_runtime * 2 + 2, f"stream_priority trial={i}")
         torch.cuda.synchronize()
 
     out = {}
@@ -447,8 +477,7 @@ def sweep_drain_on_preempt(code, size, depth, stride_ms, trials, full_runtime, s
             finally:
                 bg_done.set()
 
-        th = threading.Thread(target=_bg)
-        th.start()
+        th = _start_background_cook(_bg)
         tok._tripped.wait(timeout=full_runtime * 4 + 5)
 
         t0 = time.perf_counter()
@@ -460,7 +489,9 @@ def sweep_drain_on_preempt(code, size, depth, stride_ms, trials, full_runtime, s
 
         returns_ms.append((t1 - t0) * 1000)
         drained_ms.append((t2 - t0) * 1000)
-        th.join(timeout=full_runtime * 4 + 5)
+        _reap_background_cook(th, full_runtime * 4 + 5,
+                               f"sweep_drain_on_preempt depth={depth} stride_ms={stride_ms} "
+                               f"trial={i}")
         torch.cuda.synchronize()
 
     return {
@@ -531,8 +562,7 @@ def sweep_interactive_supersede(shape_name, depth, stride_ms, trials, delay_s, s
             finally:
                 bg_done.set()
 
-        th = threading.Thread(target=_bg)
-        th.start()
+        th = _start_background_cook(_bg)
         tok._tripped.wait(timeout=delay_s + 5)
 
         t0 = time.perf_counter()
@@ -544,7 +574,9 @@ def sweep_interactive_supersede(shape_name, depth, stride_ms, trials, delay_s, s
 
         returns_ms.append((t1 - t0) * 1000)
         drained_ms.append((t2 - t0) * 1000)
-        th.join(timeout=delay_s + 5)
+        _reap_background_cook(th, delay_s + 5,
+                               f"sweep_interactive_supersede shape={shape_name} depth={depth} "
+                               f"stride_ms={stride_ms} trial={i}")
         torch.cuda.synchronize()
 
     return {
