@@ -318,9 +318,17 @@ def set_cook_grid(grid, dtype=None, device=None, cancel=None):
     opening a THIRD thread-local — is what lets `poll_cook_cancel` reach it from code with no
     `cancel` parameter of its own: a naturally multi-pass builtin (separable blur, a mip
     chain) or cancel-aware generated code. Never consulted, and costs one extra tuple slot
-    plus one attribute store, when a caller does not pass one."""
+    plus one attribute store, when a caller does not pass one.
+
+    P3 (Phase C, B1#2): the token ALSO carries a snapshot of `pacing`'s own per-thread state
+    (`_pace.save_state()`), for the same nesting reason the four `_cook_ctx` fields are
+    saved — `_pace.reset()` below unconditionally overwrites that state, and without a save
+    an inner cook's `set_cook_grid`/`paced_check` sequence would permanently clobber an
+    outer, still-in-progress paced cook's own bookkeeping. One dict-copy's cost, paid on
+    every cook whether or not pacing is even in play, same as the four fields above."""
     token = (getattr(_cook_ctx, "grid", None), getattr(_cook_ctx, "dtype", None),
-             getattr(_cook_ctx, "device", None), getattr(_cook_ctx, "cancel", None))
+             getattr(_cook_ctx, "device", None), getattr(_cook_ctx, "cancel", None),
+             _pace.save_state())
     _cook_ctx.grid = grid
     _cook_ctx.dtype = dtype
     _cook_ctx.device = device
@@ -332,8 +340,10 @@ def set_cook_grid(grid, dtype=None, device=None, cancel=None):
 
 
 def restore_cook_ctx(token) -> None:
-    """Undo one `set_cook_grid`."""
-    _cook_ctx.grid, _cook_ctx.dtype, _cook_ctx.device, _cook_ctx.cancel = token
+    """Undo one `set_cook_grid`, including pacing's own saved state (P3)."""
+    (_cook_ctx.grid, _cook_ctx.dtype, _cook_ctx.device, _cook_ctx.cancel,
+     _pace_snapshot) = token
+    _pace.restore_state(_pace_snapshot)
 
 
 def poll_cook_cancel() -> None:

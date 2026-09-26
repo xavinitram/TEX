@@ -642,6 +642,41 @@ class _CrossDeviceSpy:
         return False
 
 
+def test_p3_nested_set_cook_grid_restores_pacing_state(r):
+    """B1#2: `set_cook_grid`'s own docstring says cooks nest (a codegen invocation inside an
+    interpreted fallback, a tiled strip loop) -- `restore_cook_ctx` must give pacing's own
+    per-thread bookkeeping back too, not just the four `_cook_ctx` fields it always
+    restored. Outer resets with `pace_depth=4` and polls a few times; a NESTED
+    `set_cook_grid`/`paced_check`/`restore_cook_ctx` sequence with `pace_depth=1` must not
+    permanently overwrite the outer's depth once the inner cook's own restore runs."""
+    from TEX_Wrangle.tex_runtime import stdlib_core as _sc
+    print("\n--- P3: nested set_cook_grid restores pacing's own state ---")
+    with _DeviceSpy():
+        outer_tok = _Token(pace=True, pace_depth=4)
+        outer_grid_token = _sc.set_cook_grid((1, 8, 8), device="cuda", cancel=outer_tok)
+        _pace.paced_check(outer_tok, "cuda")
+        _pace.paced_check(outer_tok, "cuda")
+        _pace.paced_check(outer_tok, "cuda")
+        depth_before_nesting = _pace._state.depth  # noqa: SLF001 (white-box by design)
+
+        inner_tok = _Token(pace=True, pace_depth=1)
+        inner_grid_token = _sc.set_cook_grid((1, 4, 4), device="cuda", cancel=inner_tok)
+        _pace.paced_check(inner_tok, "cuda")
+        _sc.restore_cook_ctx(inner_grid_token)
+
+        depth_after_restore = _pace._state.depth  # noqa: SLF001
+        _sc.restore_cook_ctx(outer_grid_token)
+
+    if depth_after_restore == depth_before_nesting == 4:
+        r.ok(f"outer's pace_depth (4) survived a nested set_cook_grid/restore_cook_ctx pair "
+             f"(read back as {depth_after_restore} right after the inner cook's own restore)")
+    else:
+        r.fail("P3 nested pacing state", f"outer depth before nesting="
+               f"{depth_before_nesting}, after inner's restore={depth_after_restore} "
+               f"(expected 4 both times -- the inner cook's pace_depth=1 leaked into the "
+               f"outer's bookkeeping)")
+
+
 def test_p1_ring_is_not_reused_across_a_same_thread_device_switch(r):
     """B1#1: a cook on `cuda:0` that warms the ring, followed sequentially (same thread) by
     a cook on `cuda:1`, must never re-record() a device-0-bound event while device 1 is

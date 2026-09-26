@@ -400,3 +400,32 @@ def cook_done_event(device) -> "torch.cuda.Event | None":
     ev = torch.cuda.Event()
     _record_on(ev, device, is_current)
     return ev
+
+
+def save_state() -> dict:
+    """P3 (Phase C, B1#2): snapshot every per-thread pacing field, for a caller whose own
+    save/restore pair must NEST — `stdlib_core.set_cook_grid`/`restore_cook_ctx`, whose own
+    docstring says cooks nest (a codegen invocation inside an interpreted fallback, a tiled
+    strip loop) and which already saves/restores its OWN four `_cook_ctx` fields for exactly
+    that reason. Before this, `set_cook_grid` called `reset()` with no save at all: an inner
+    cook's `reset()` unconditionally overwrote `_state`'s `paced`/`depth`/`stride_s`/`ring`/
+    `head`/`count`, and `restore_cook_ctx` never knew pacing had state to give back — so a
+    real (opt-in, CUDA) outer cook that reached a second, nested `set_cook_grid` before its
+    own `finally: restore_cook_ctx` would permanently lose its own pacing bookkeeping to the
+    inner cook's.
+
+    A shallow copy of `_state.__dict__` is enough: every value here is a plain scalar or the
+    ring list/the per-device pool, and neither is ever mutated by REPLACING the object a
+    caller's earlier snapshot points at — `reset()` only ever rebinds `_state.ring` to a NEW
+    list when it grows, never mutates an old one a snapshot still references, so an outer's
+    saved reference stays exactly what it was even if an inner cook's own `reset()` runs
+    after this snapshot is taken."""
+    return dict(_state.__dict__)
+
+
+def restore_state(snapshot: dict) -> None:
+    """Undo one `save_state()` — puts every field back exactly as `save_state()` found it,
+    including a field an inner cook's `reset()` added that the outer never had (cleared
+    first, so nothing inner-only survives the restore)."""
+    _state.__dict__.clear()
+    _state.__dict__.update(snapshot)
