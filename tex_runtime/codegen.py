@@ -50,6 +50,7 @@ from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
                      set_cook_grid as _stdlib_set_cook_grid,
                      restore_cook_ctx as _stdlib_restore_cook_ctx,  # P0-D: cook grid
                      poll_cook_cancel as _stdlib_poll_cancel)  # CANCEL-44: Gap 2 in-body poll
+from .pacing_heavy import heavy_stmt_ids as _heavy_stmt_ids   # PACE-47d: registry-derived classification
 
 
 class _Unsupported(Exception):
@@ -1105,6 +1106,15 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                     continue
             idx += 1
 
+        # PACE-47d: emit the heavy flag as STATIC, per-poll-site text (`_CK(True)` vs
+        # `_CK()`), decided once here from each statement's OWN registry-derived
+        # classification — never a runtime branch inside the generated function, so no
+        # emitted program's source depends on anything but its own fixed AST (the
+        # fingerprint is unaffected: two builds of the same program always classify the
+        # same statements the same way). Computed only when this build will actually emit
+        # any `_CK` line at all — the default (non-cancel-aware) build's emitted source,
+        # and its cost, are both untouched.
+        _heavy_ids = _heavy_stmt_ids(stmts) if self._cancel_polls_on else frozenset()
         for i, stmt in enumerate(stmts):
             # Emit deferred stencils BEFORE the skip check: the combo index is
             # always in inline_skip.
@@ -1112,13 +1122,16 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
                 # CANCEL-44 (Gap 2): poll BEFORE this stencil pass, only for the
                 # cancel-aware variant (`_cancel_polls_on`) — the default build never
                 # emits this line, so its source is untouched.
+                # PACE-47d: an inlined conv2d stencil is, by construction, a fused
+                # halo-footprint pass (ROI-2's own inline-stencil detection only fires
+                # for `fetch()`-based spatial taps) — always heavy, not looked up.
                 if self._cancel_polls_on:
-                    self._emit("_CK()")
+                    self._emit("_CK(True)")
                 self._emit_conv2d_stencil(pending_stencils[i])
             if i in inline_skip:
                 continue
             if self._cancel_polls_on:
-                self._emit("_CK()")
+                self._emit("_CK(True)" if id(stmt) in _heavy_ids else "_CK()")
             self._emit_stmt(stmt)
 
         # No need to write locals back to _env: the caller only reads

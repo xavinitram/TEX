@@ -37,6 +37,7 @@ from .host import CookCancelled  # SCHED-3 seam (no cycle: host imports torch on
 from .stdlib import TEXStdlib, _tag_host_scalar
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 from . import pacing as _pace   # PACE-45: bounds queue-ahead when a token opts in
+from .pacing_heavy import program_has_any_heavy_stmt as _program_has_any_heavy_stmt  # PACE-47d
 # SPLIT-47 (TRK-210): re-exported so `compiled.NAME` and `from .compiled import NAME` keep
 # resolving unchanged for every external caller, and so this module's own bare-name calls
 # below (e.g. `_select_backend(...)`, `_timed(...)`, `_contiguous_bindings(...)`) still find
@@ -1360,7 +1361,12 @@ def _codegen_only_execute(
     # so this poll never waits on a stale event left by an unrelated, already-returned
     # cook on this thread.
     _pace.reset(cancel, device)   # O5: resolves "paced?" once, here
-    _pace.paced_check(cancel, device)
+    # PACE-47d: this route's own poll is per-COOK, not per-statement (it runs once,
+    # before ANY of the program's statements have executed) -- the coarse-but-safe
+    # equivalent of per-statement classification is "does this program contain ANY
+    # heavy statement at all", memoized the same way (see `pacing_heavy.py`).
+    _pace.paced_check(cancel, device, heavy=(cancel is not None
+                                              and _program_has_any_heavy_stmt(program)))
 
     cg_fn = None
     if cancel is not None:

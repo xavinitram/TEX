@@ -397,6 +397,12 @@ def _sweep_shapes():
     return {
         "cheap256": {"code": _sweep_cheap_code(_SWEEP_CHEAP_N), "size": 256, "n": _SWEEP_CHEAP_N},
         "cheap1024": {"code": _sweep_cheap_code(_SWEEP_CHEAP_N), "size": 1024, "n": _SWEEP_CHEAP_N},
+        # PACE-47e: a cheap (point-footprint) chain's own device time scales with PIXELS,
+        # not footprint -- cheap2048 is the same trivial-arithmetic code as cheap256/
+        # cheap1024, just at a resolution where each statement's device time alone
+        # (measured elsewhere: ~0.66ms at 1024^2, so ~2.6ms at 2048^2) is no longer
+        # negligible next to a multi-ms stride window.
+        "cheap2048": {"code": _sweep_cheap_code(_SWEEP_CHEAP_N), "size": 2048, "n": _SWEEP_CHEAP_N},
         "medium": {"code": _sweep_medium_code(_SWEEP_MEDIUM_N), "size": 1024, "n": _SWEEP_MEDIUM_N},
         "heavy": {"code": _HEAVY, "size": _SIZE, "n": _N_STATEMENTS},
     }

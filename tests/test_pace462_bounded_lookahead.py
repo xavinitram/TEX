@@ -795,6 +795,110 @@ def test_pace47c_heavy_true_forces_the_bound_regardless_of_the_tail(r):
                f"{outstanding_after} (expected 2)")
 
 
+# ── PACE-47e: resolution-driven heaviness -- a CHEAP statement at a large enough ─
+# ── cook resolution reopens the completed-tail blind spot PACE-47c/47d closed ────
+#
+# PACE-47d's `heavy` is footprint-derived (halo/halo_arg) -- correct for a device-EXPENSIVE
+# builtin at any resolution, blind to a `footprint='point'` statement whose own device time
+# scales with PIXELS. Confirmed by measurement (reproduce with
+# `benchmarks/preempt_drain_bench.py --sweep`): a 220-statement trivial
+# per-pixel chain at 1024^2/2048^2 blows its drain p95 up 9-16x at stride=4ms, the exact
+# defect PACE-47c closed for halo builtins, just triggered by resolution instead of a
+# builtin name. `reset()`'s new `spatial_shape` parameter resolves, once per cook, whether
+# the cook's own pixel count alone makes every poll heavy.
+
+def test_pace47e_reset_resolves_large_resolution_from_spatial_shape(r):
+    """A cook whose (B,H,W) pixel count is >= `_HEAVY_PIXEL_THRESHOLD` must set
+    `_state.large_resolution = True`; a smaller cook must leave it False. Pre-PACE-47e,
+    this is RED: `reset()` takes no `spatial_shape` parameter at all (TypeError)."""
+    print("\n--- PACE-47e: reset() resolves large_resolution from spatial_shape ---")
+    with _DeviceSpy():
+        tok_small = _Token(pace=True)
+        _pace.reset(tok_small, "cuda", spatial_shape=(1, 256, 256))
+        small_flag = _pace._state.large_resolution  # noqa: SLF001
+
+        tok_big = _Token(pace=True)
+        _pace.reset(tok_big, "cuda", spatial_shape=(1, 2048, 2048))
+        big_flag = _pace._state.large_resolution  # noqa: SLF001
+
+    if small_flag is False and big_flag is True:
+        r.ok(f"256^2 -> large_resolution={small_flag}, 2048^2 -> large_resolution={big_flag}")
+    else:
+        r.fail("PACE-47e resolution resolve",
+               f"256^2 -> {small_flag} (expected False), 2048^2 -> {big_flag} (expected True)")
+
+
+def test_pace47e_large_resolution_forces_record_despite_caller_heavy_false(r):
+    """The fix's mechanism, mirroring PACE-47c's own repro shape: depth=2, stride=10ms, a
+    LARGE spatial_shape; poll 1 records E1, E1 is marked complete, then 20 further polls
+    -- each passing `heavy=False`, exactly as PACE-47d's own per-statement classifier
+    would for a footprint='point' statement -- must NOT be able to skip indefinitely: the
+    depth bound must still be enforced from the cook's own resolution alone."""
+    print("\n--- PACE-47e: a large cook's resolution forces the bound even at heavy=False ---")
+    clock = _FakeClock(0.0)
+    real_perf_counter = _pace._time.perf_counter
+    _pace._time.perf_counter = clock
+    try:
+        with _DeviceSpy():
+            _FakeEvent.DONE = True
+            tok = _Token(pace=True, pace_depth=2)
+            tok.pace_stride_ms = 10.0
+            _pace.reset(tok, "cuda", spatial_shape=(1, 2048, 2048))
+            _pace.paced_check(tok, "cuda", heavy=False)      # poll 1: records E1 (1/2)
+            clock.advance(0.001)
+            _pace.paced_check(tok, "cuda", heavy=False)      # poll 2: E1 done, but large
+                                                              # resolution -> records anyway (2/2)
+            waits_before = sum(ev.sync_calls for ev in _pool_events())
+
+            for _ in range(20):
+                clock.advance(0.0001)
+                _pace.paced_check(tok, "cuda", heavy=False)  # every caller says cheap
+
+            waits_after = sum(ev.sync_calls for ev in _pool_events())
+            outstanding_after = len(_pace._state.pool["outstanding"])  # noqa: SLF001
+    finally:
+        _pace._time.perf_counter = real_perf_counter
+        _FakeEvent.DONE = True
+
+    if waits_before == 0 and waits_after - waits_before == 20 and outstanding_after == 2:
+        r.ok("20 heavy=False polls in a large-resolution cook produced exactly 20 waits, "
+             "outstanding held at depth (2) throughout")
+    else:
+        r.fail("PACE-47e large-resolution bound",
+               f"waits before burst={waits_before}, waits gained over 20 polls="
+               f"{waits_after - waits_before} (expected 20), outstanding after="
+               f"{outstanding_after} (expected 2)")
+
+
+def test_pace47e_small_resolution_still_economizes(r):
+    """Regression: a SMALL cook must still economize exactly as PACE-47b's own tests
+    proved -- the resolution check must not make every cook heavy by accident."""
+    print("\n--- PACE-47e: a small-resolution cook still economizes at heavy=False ---")
+    clock = _FakeClock(0.0)
+    real_perf_counter = _pace._time.perf_counter
+    _pace._time.perf_counter = clock
+    try:
+        with _DeviceSpy():
+            _FakeEvent.DONE = True
+            tok = _Token(pace=True, pace_depth=2)
+            tok.pace_stride_ms = 10.0
+            _pace.reset(tok, "cuda", spatial_shape=(1, 256, 256))
+            _pace.paced_check(tok, "cuda", heavy=False)
+            clock.advance(0.001)
+            _pace.paced_check(tok, "cuda", heavy=False)      # inside window, small res -> skip
+            constructed = _FakeEvent._live
+            outstanding = len(_pace._state.pool["outstanding"])  # noqa: SLF001
+    finally:
+        _pace._time.perf_counter = real_perf_counter
+
+    if constructed == 1 and outstanding == 1:
+        r.ok("small-resolution cook still skipped inside the stride window (1 event, "
+             "not 2)")
+    else:
+        r.fail("PACE-47e small-resolution regression",
+               f"constructed={constructed}, outstanding={outstanding} (expected 1/1)")
+
+
 def test_pace_stride_ms_default_when_absent(r):
     print("\n--- PACE-462: pace_stride_ms absent resolves to the module default ---")
     tok = _Token(pace=True, pace_stride_ms=None)  # None -> no pace_stride_ms attribute at all

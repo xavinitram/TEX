@@ -32,6 +32,7 @@ from ..tex_compiler.types import TEXType, CHANNEL_MAP, TYPE_NAME_MAP, base_is_ve
 from .host import _report_progress, CookCancelled   # SCHED-3 seam (no cycle: host imports torch only)
 from . import profile as _prof                      # PROF-1 seam (pure stdlib; disarmed by default)
 from . import pacing as _pace                        # PACE-45: bounds queue-ahead when a token opts in
+from .pacing_heavy import heavy_stmt_ids as _heavy_stmt_ids   # PACE-47d: registry-derived classification
 from .stdlib import (TEXStdlib, SAFE_EPSILON, ZERO_GUARD_EPS,
                      _scalar_from_tensor, _get_flat_batch_index, _tag_host_scalar)
 from . import stdlib as _stdlib_mod    # P0-D: publishes the cook grid for const-coord reads
@@ -518,13 +519,17 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                 # SCHED-3: cancel wired, no progress sink — the DEFAULT ComfyUI path now that the
                 # node passes an interrupt token. Poll cancel per statement, but skip the `(i+1)/n`
                 # progress arithmetic only a wired on_progress consumes (measured ~37 ns/stmt).
+                # PACE-47d: classify once per PROGRAM (memoized), not per statement/cook — a
+                # cache hit is a dict lookup, paid only on this already-paced path.
+                _heavy_ids = _heavy_stmt_ids(stmts)
                 for stmt in stmts:
-                    _pace.paced_check(cancel, dev)   # PACE-45: `dev` already resolved above
+                    _pace.paced_check(cancel, dev, heavy=id(stmt) in _heavy_ids)  # PACE-45/47d
                     self._exec_stmt(stmt)
             else:
                 n = len(stmts) or 1
+                _heavy_ids = _heavy_stmt_ids(stmts)   # PACE-47d: see the branch above
                 for i, stmt in enumerate(stmts):
-                    _pace.paced_check(cancel, dev)   # PACE-45: `dev` already resolved above
+                    _pace.paced_check(cancel, dev, heavy=id(stmt) in _heavy_ids)  # PACE-45/47d
                     self._exec_stmt(stmt)
                     _report_progress(on_progress, "stmt", (i + 1) / n)
         finally:
@@ -616,6 +621,9 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
 
         if events is None and cuda:
             torch.cuda.synchronize()
+        # PACE-47d: same classify-once-per-program-list discipline as the unprofiled loops;
+        # paid only when `cancel is not None` reaches the branch below, same as before.
+        _heavy_ids = _heavy_stmt_ids(stmts) if cancel is not None else None
         cur, t0, i = _MISSING, time.perf_counter(), 0
         for stmt in stmts:
             stage = stmt.loc.stage
@@ -624,7 +632,7 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                     t0 = close(cur, t0)
                 cur = stage
             if cancel is not None:
-                _pace.paced_check(cancel, dev)   # PACE-45
+                _pace.paced_check(cancel, dev, heavy=id(stmt) in _heavy_ids)   # PACE-45/47d
             self._exec_stmt(stmt)
             if on_progress is not None:
                 i += 1

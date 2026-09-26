@@ -32,6 +32,7 @@ from .stdlib_core import (
     _to_float,
     _to_tensor,
     _uniform_grid,
+    poll_cook_cancel,
 )
 
 # `TEXStdlib` is the class `stdlib.py` composes from every leaf. A leaf cannot import it at
@@ -66,6 +67,13 @@ class _StdlibSample:
         op = torch.amax if grow else torch.amin
         pad = torch.nn.functional.pad
         for _ in range(r):
+            # PACE-47d (Gap 1): `erode`/`dilate` are footprint=halo_arg (registry-derived
+            # heavy) and genuinely multi-pass at radius > 1 (one horizontal+vertical pass
+            # PER unit of radius, up to 256) -- the same "no internal poll opportunity"
+            # gap PACE-47c left open is closed here the same way gauss_blur's own is: a
+            # forced record between passes, so a cancel fired mid-loop can't leave more
+            # than one iteration's device work unbounded regardless of stride.
+            poll_cook_cancel(heavy=True)
             xp = pad(x, (1, 1, 0, 0), mode="replicate")               # horizontal
             x = op(torch.stack([xp[..., :-2], xp[..., 1:-1], xp[..., 2:]]), dim=0)
             xp = pad(x, (0, 0, 1, 1), mode="replicate")               # vertical
@@ -505,6 +513,12 @@ class _StdlibSample:
             sigma_s: float -- spatial sigma in pixels
             sigma_r: float -- range sigma (color similarity, 0.01-0.5 typical)
         """
+        # PACE-47d (Gap 1): footprint=halo, single-pass (no internal multi-pass loop to
+        # hang a between-pass poll on, unlike gauss_blur/erode/dilate) -- an entry poll is
+        # the closest equivalent: forces a record before this call's own (potentially
+        # large, window capped at 7x7 but still O(H*W*49)) unfold+weight compute is
+        # queued, rather than leaving it to whatever poll ran before this statement.
+        poll_cook_cancel(heavy=True)
         img = image if image.__class__ is torch.Tensor else _to_tensor(image)
         # Both sigmas size the window / the weights host-side; PERF-2 resolves them
         # from the minted host value where there is one, and reads back where there

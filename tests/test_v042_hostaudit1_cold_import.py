@@ -66,9 +66,15 @@ from helpers import run_python_kv   # G7/R1#4: the shared fresh-subprocess KV he
 # toolchain-capability probe (`compiled_capability.py`) and the per-cook execution support —
 # timing wrappers, binding preparation, one-time diagnostics (`compiled_exec_support.py`).
 # +1 per new module, nothing else moved.
+#
+# 54 -> 55, PACE-47d: one new eagerly-imported leaf module, `pacing_heavy.py` (registry-
+# derived heavy/cheap statement classification for the completed-tail blind spot fix),
+# imported at module scope by `interpreter.py`, `compiled.py` and `codegen.py` (all three
+# already in the closure; `pacing_heavy.py` itself is new). +1 for this one new module,
+# nothing else moved.
 _BARE_TOUCH_TEX_MODULES_MAX = 1
 _BARE_TOUCH_TORCH_MODULES = 0
-_TEX_ENGINE_TEX_MODULES_MAX = 54
+_TEX_ENGINE_TEX_MODULES_MAX = 55
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:

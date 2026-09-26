@@ -186,7 +186,7 @@ def test_cancel44_emitted_bytes_unchanged_by_default(r: SubTestResult):
                                     emit_cancel_polls=False)
     if fn_default is None or fn_explicit_false is None:
         r.fail("emitted bytes unchanged", "codegen declined to compile the box-blur program")
-    elif "_CK()" in fn_default._tex_src:
+    elif "_CK()" in fn_default._tex_src or "_CK(True)" in fn_default._tex_src:
         r.fail("emitted bytes unchanged", "the DEFAULT build emits a poll line")
     elif fn_default._tex_src != fn_explicit_false._tex_src:
         r.fail("emitted bytes unchanged", "emit_cancel_polls=False moved the emitted source")
@@ -204,14 +204,21 @@ def test_cancel44_cancel_aware_variant_emits_polls(r: SubTestResult):
     if fn_plain is None or fn_polled is None:
         r.fail("cancel-aware variant emits polls", "codegen declined to compile")
         return
-    stripped_lines = [l for l in fn_polled._tex_src.splitlines() if l.strip() != "_CK()"]
-    if "_CK()" not in fn_polled._tex_src:
-        r.fail("cancel-aware variant emits polls", "no _CK() line in the cancel-aware build")
+    # PACE-47d: a poll line is `_CK()` (cheap statement) OR `_CK(True)` (heavy — a
+    # registry-derived classification, or an inlined conv2d STENCIL pass, which is always
+    # heavy by construction). `_BOX_BLUR` inlines to exactly one such stencil pass, so its
+    # cancel-aware build's one poll line reads `_CK(True)`, not the bare form.
+    stripped_lines = [l for l in fn_polled._tex_src.splitlines()
+                       if l.strip() not in ("_CK()", "_CK(True)")]
+    has_poll_line = any(l.strip() in ("_CK()", "_CK(True)")
+                         for l in fn_polled._tex_src.splitlines())
+    if not has_poll_line:
+        r.fail("cancel-aware variant emits polls", "no _CK()/_CK(True) line in the cancel-aware build")
     elif stripped_lines != fn_plain._tex_src.splitlines():
         r.fail("cancel-aware variant emits polls",
-               "removing the _CK() lines does not recover the plain build's source")
+               "removing the poll lines does not recover the plain build's source")
     else:
-        r.ok("emit_cancel_polls=True adds ONLY _CK() lines to the plain build's source")
+        r.ok("emit_cancel_polls=True adds ONLY _CK()/_CK(True) lines to the plain build's source")
 
 
 # ── Gap 1: naturally multi-pass builtins poll between their own passes ──────

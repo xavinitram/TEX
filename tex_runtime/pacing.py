@@ -158,6 +158,47 @@ _DEFAULT_DEPTH = 2
 _DEFAULT_STRIDE_S = 0.0005
 
 
+#: **Re-chosen, PACE-47d.** Once every paced poll route honours `heavy` (PACE-47c/47d
+#: close the completed-tail blind spot on every route this tree has), the correctness
+#: bound stops depending on `stride` at all -- it is a pure cost knob -- so the choice
+#: above is a cost/latency-margin trade-off, not a safety one. Measured on the reference
+#: sm_75 card (RTX 2080 SUPER) at 0.5/1/2/4ms: heavy- and medium-chain drained p95 read
+#: FLAT across the whole range (no residual growth at any tested value, unlike the
+#: pre-47c/47d mechanism); a 220-statement cheap chain's own drain stays under ~1.1ms at
+#: every value tested -- around 14x margin under one 60Hz frame (~16ms) even at the
+#: widest stride tried -- while its own cost overhead keeps falling with diminishing
+#: returns (roughly +7.7% at 0.5ms down to +3.1% at 4ms, depth 2). 4ms (the largest value
+#: this round tested) is the new default: the safety margin was never the binding
+#: constraint in the range tested, so the largest tested-safe value is also the cheapest.
+#: Reproduce with `benchmarks/preempt_drain_bench.py --sweep`; the measured per-poll
+#: overhead FLOOR (~483ns/call once a poll is confirmed skippable) bounds how low any
+#: stride, however large, can ever push cheap256's own overhead. Overrides the module's
+#: original default above rather than editing it in place, so that measurement stays
+#: attributable to its own reading.
+_DEFAULT_STRIDE_S = 0.004
+
+#: PACE-47e: a cook whose own (B*H*W) pixel count is at or above this is treated as
+#: heavy on EVERY poll, regardless of what any single statement calls — closing the
+#: resolution-driven completed-tail blind spot PACE-47d's own footprint-only
+#: classification could not see. Chosen from a 3-point fit (the reference sm_75 card,
+#: RTX 2080 SUPER) of a cheap (`footprint='point'`) chain's own per-statement device-
+#: time-ish reading (full runtime / statement count: 90.2us @ 256^2, 667.8us @ 1024^2,
+#: 2652.7us @ 2048^2) against pixel count: time(us) ~= 34.5 + 623.1 x pixels_in_millions.
+#: The record cost this threshold is chosen against is `_record_on`'s own measured
+#: ~7.6us/call (heavy=True every poll, reproduce with
+#: `benchmarks/preempt_drain_bench.py --sweep`) -- "device time exceeds ~50x record cost,
+#: so recording every statement costs <=~2%" (the ask's own criterion) solves to a ~380us
+#: crossover, i.e. ~555,000 pixels (~745^2) on THIS box. 512x512 (262,144 px) is chosen
+#: instead of that exact crossover deliberately CONSERVATIVE (model: ~198us of device time
+#: at 512^2, still comfortably under the 380us line) -- a 3-point fit from one box is not
+#: precise enough to cut it close, and a faster box (the laptop, sm_120) would only ever
+#: raise its own true crossover (less device time per pixel), never lower it, so a
+#: threshold conservative on the slower box stays conservative, never becomes unsafe, on
+#: the faster one. Not re-tuned per-box: a single, hand-picked constant, like `_DEFAULT_
+#: DEPTH`/`_DEFAULT_STRIDE_S` above.
+_HEAVY_PIXEL_THRESHOLD = 512 * 512
+
+
 def wants_pacing(token) -> bool:
     """The opt-in gate: a token paces host-side queue-ahead only when it says so itself, via
     a truthy `pace` attribute. `getattr` on a token with no such attribute — every caller
@@ -282,12 +323,27 @@ def record_on(event, device) -> None:
     _record_on(event, device, is_current)
 
 
-def reset(token=None, device=None) -> None:
+def reset(token=None, device=None, spatial_shape=None) -> None:
     """Start a fresh poll sequence with no pacing history to inherit. Called once at the top
     of every cook via `stdlib_core.set_cook_grid` — the one seam every tier already uses to
     publish its own cook state — and once more at a route whose own first poll can fire
     before that seam does (the stencil route's entry check), so that poll never waits on a
     stale event left over from an unrelated, already-returned cook on this thread.
+
+    PACE-47e: `spatial_shape` (the cook's own `(B, H, W)`, when the caller has it in hand —
+    `set_cook_grid` always does) resolves, ONCE here, whether this cook's own PIXEL COUNT
+    alone makes every statement "heavy" regardless of what builtin it calls. PACE-47d's
+    `heavy` classification is footprint-derived (halo/halo_arg), which correctly bounds a
+    device-EXPENSIVE builtin at any resolution, but says nothing about a `footprint='point'`
+    statement's own device time, which scales with PIXELS, not footprint — a trivial
+    per-pixel op at 1024^2 or 2048^2 measures ~0.67ms / ~2.65ms of real device time per
+    statement on the reference sm_75 card (RTX 2080 SUPER), large enough that the
+    completed-tail blind spot reopens at exactly the wider strides PACE-47d's own
+    re-measurement picked as the new default: CONFIRMED (measured; reproduce with
+    `benchmarks/preempt_drain_bench.py --sweep`) drain p95 blowing up 9-16x at
+    `stride=4ms` for cheap1024/cheap2048, the same mechanism PACE-47c closed for HALO
+    builtins, just triggered by resolution instead. See `_HEAVY_PIXEL_THRESHOLD`'s own
+    comment for how the crossover was chosen.
 
     Resolves "does THIS cook want pacing?" exactly once, here, rather than re-deriving it at
     every single `paced_check` poll point for the cook's whole duration (O5, v0.46).
@@ -332,6 +388,20 @@ def reset(token=None, device=None) -> None:
     _state.is_current = is_current
     _state.depth = _resolve_depth(token)
     _state.stride_s = _resolve_stride(token)
+    # PACE-47e: resolved ONCE per cook, from whatever spatial_shape the caller has in
+    # hand (`set_cook_grid` always does; a caller with none, e.g. the stencil-only
+    # route's own pre-`_invoke_cg` entry poll, reads False here -- conservative in the
+    # sense of "no worse than before this ask", and `_invoke_cg`'s own `set_cook_grid`
+    # call resolves it correctly before that route's per-statement polls run).
+    pixels = 0
+    if spatial_shape is not None:
+        try:
+            pixels = 1
+            for dim in spatial_shape:
+                pixels *= int(dim)
+        except (TypeError, ValueError):
+            pixels = 0
+    _state.large_resolution = pixels >= _HEAVY_PIXEL_THRESHOLD
     pools = getattr(_state, "pools", None)
     if pools is None:
         pools = {}
@@ -455,7 +525,15 @@ def paced_check(token, device, heavy: bool = False) -> None:
     depth = _state.depth
 
     stride = _state.stride_s
-    if stride > 0 and not heavy:
+    # PACE-47e: `_state.large_resolution` (resolved once in `reset()`, from the cook's own
+    # pixel count) ORs into `heavy` here rather than at each call site: a compiled codegen
+    # function is built ONCE and reused across every cook that shares its fingerprint,
+    # potentially at DIFFERENT resolutions, so a per-statement heavy/cheap classification
+    # decided at BUILD time (PACE-47d's own `_CK(True)`/`_CK()` emission) could never be
+    # resolution-correct on its own -- only a per-COOK, run-time check can be. A statement
+    # a caller marked cheap (halo-derived `heavy=False`) still gets the depth-gated
+    # record/wait below when this cook's own resolution alone makes it expensive.
+    if stride > 0 and not heavy and not _state.large_resolution:
         last = _state.last_record_t
         if last is not None and (_time.perf_counter() - last) < stride:
             # Inside the stride window: this is a candidate to skip, but ONLY while the

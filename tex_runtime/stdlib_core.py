@@ -333,9 +333,11 @@ def set_cook_grid(grid, dtype=None, device=None, cancel=None):
     _cook_ctx.dtype = dtype
     _cook_ctx.device = device
     _cook_ctx.cancel = cancel
-    _pace.reset(cancel, device)   # PACE-45: a fresh cook starts with no pacing history to
-    #                                inherit; O5: resolves "paced?" once, here, from the
-    #                                token/device this seam already has in hand
+    _pace.reset(cancel, device, grid)   # PACE-45: a fresh cook starts with no pacing
+    #                                history to inherit; O5: resolves "paced?" once, here,
+    #                                from the token/device this seam already has in hand;
+    #                                PACE-47e: `grid` (this seam's OWN first argument)
+    #                                resolves the resolution-driven heavy check too
     return token
 
 
@@ -346,7 +348,7 @@ def restore_cook_ctx(token) -> None:
     _pace.restore_state(_pace_snapshot)
 
 
-def poll_cook_cancel() -> None:
+def poll_cook_cancel(heavy: bool = False) -> None:
     """CANCEL-44 (Gap 1 / Gap 2): best-effort poll of the ACTIVE cook's cancel token,
     published alongside the cook grid by `set_cook_grid` — the one seam every tier already
     uses to publish its cook state. Lets code with no `cancel` parameter of its own poll
@@ -354,7 +356,8 @@ def poll_cook_cancel() -> None:
     signature:
 
       - a naturally multi-pass stdlib builtin (`_gauss_blur_bchw`'s two separable conv2d
-        passes, `_build_mip_pyramid`'s per-level loop) — Gap 1;
+        passes, `_build_mip_pyramid`'s per-level loop, `_morph`'s and
+        `fn_bilateral_filter`'s own entry) — Gap 1;
       - cancel-aware generated code, emitted between top-level statements ONLY when the
         codegen tier compiled a cancel-aware variant (`codegen.try_compile(...,
         emit_cancel_polls=True)`) — Gap 2.
@@ -362,10 +365,20 @@ def poll_cook_cancel() -> None:
     A single attribute read when no cook published a token (the default path — `None` is
     the field's own default, same as `grid`/`dtype`/`device`). Raises `CookCancelled`
     exactly like `host._cancel_check`, which this mirrors for a caller with no explicit
-    token to check against."""
+    token to check against.
+
+    PACE-47c/d: `heavy` (default `False`, preserving every pre-existing call's behaviour
+    byte-for-byte) forwards straight to `_pace.paced_check`'s own `heavy` — bypassing the
+    stride economization entirely for this poll, closing the completed-tail blind spot
+    (a poll's peek only ever answers for the LAST recorded event, never for what is about
+    to run). Every Gap-1 call site here passes `heavy=True` (each is, by construction, a
+    stdlib builtin the registry's own footprint already marks device-expensive — see
+    `pacing_heavy.py`). Gap 2 (codegen's in-body `_CK`) passes whatever the EMITTED source
+    hard-codes per poll site (PACE-47d): a statically-known per-statement classification,
+    not a guess this function makes on its own."""
     tok = getattr(_cook_ctx, "cancel", None)
     if tok is not None:
-        _pace.paced_check(tok, getattr(_cook_ctx, "device", None))   # PACE-45
+        _pace.paced_check(tok, getattr(_cook_ctx, "device", None), heavy=heavy)   # PACE-45
 
 
 def poll_cook_cancel_heavy() -> None:
