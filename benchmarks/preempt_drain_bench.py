@@ -27,6 +27,14 @@ request — no host or vendor named):
                              high-priority CUDA stream (`torch.cuda.Stream(priority=-1)`)
                              cut drained latency versus the default stream? One small table;
                              a recommendation, not a code path.
+  5. `stride_depth_sweep` -- PACE-47: the same cost/drain pair as 1+2, but crossed over
+                             FOUR program shapes (a cheap per-pixel chain at two sizes, a
+                             mid gauss_blur chain, and the existing heavy chain) and BOTH
+                             `pace_depth` and `pace_stride_ms`, to answer whether striding
+                             stays a pure cost knob (drained p95 near one statement's own
+                             device time at every stride) or leaks into the correctness
+                             bound (drained p95 growing with stride) on a given box. Run
+                             with `--sweep`.
 
 Measurement rules this file follows (docs/brief-conventions.md): a fresh CUDA cache
 directory per run (set `TEX_CACHE_DIR` before invoking), the first leg of any A/B always
@@ -34,12 +42,14 @@ discarded, GPU state and box name recorded beside every number.
 
     python_embeded/python.exe -X utf8 benchmarks/preempt_drain_bench.py --depths 1,2,3,4,8
     python_embeded/python.exe -X utf8 benchmarks/preempt_drain_bench.py --trials 100 --save results/pace462.json
+    python_embeded/python.exe -X utf8 benchmarks/preempt_drain_bench.py --sweep --save results/pace47_sweep.json
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import random
 import statistics
 import sys
 import threading
@@ -67,6 +77,12 @@ def _heavy_bindings(seed):
     return {"A": img.cuda()}
 
 
+def _sized_bindings(size, seed):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    img = torch.rand(1, size, size, 4, generator=g)
+    return {"A": img.cuda()}
+
+
 def _interactive_bindings(seed):
     g = torch.Generator(device="cpu").manual_seed(seed)
     img = torch.rand(1, 64, 64, 4, generator=g)
@@ -74,11 +90,13 @@ def _interactive_bindings(seed):
 
 
 class _PacedToken:
-    """Never trips. `pace_depth=None` uses the module default."""
-    def __init__(self, depth=None):
+    """Never trips. `pace_depth=None`/`stride_ms=None` use the module defaults."""
+    def __init__(self, depth=None, stride_ms=None):
         self.pace = True
         if depth is not None:
             self.pace_depth = depth
+        if stride_ms is not None:
+            self.pace_stride_ms = stride_ms
 
     def check(self):
         pass
@@ -301,6 +319,182 @@ def stream_priority(trials, full_runtime, seed0=5000):
     return out
 
 
+# ── Experiment 5 (PACE-47): the shape x depth x stride sweep ─────────────────────
+#
+# Host-neutral replacement for a one-off scratch script this ask was measured with: four
+# program shapes (a cheap per-pixel chain at two sizes, a mid gauss_blur chain, and the
+# existing heavy chain) crossed with `pace_depth` x `pace_stride_ms`, each cell reporting
+# (a) unpre-empted cost (paced vs unpaced, interleaved) and (b) drained p50/p95 after a
+# pre-emption. Answers whether PACE-47's fix (the stride skip is honoured only while the
+# device has caught up) makes `stride` a pure cost knob: a correct mechanism should show
+# drained p95 staying near one statement's own device time at EVERY stride, not growing
+# with it, while the unpre-empted cost still falls as stride grows (the knob it is meant
+# to be).
+
+_SWEEP_CHEAP_N = 220
+_SWEEP_MEDIUM_N = 300
+
+_SWEEP_DEPTHS_DEFAULT = "1,2"
+_SWEEP_STRIDES_MS_DEFAULT = "0,0.1,0.25,0.5,1.0"
+
+
+def _sweep_cheap_code(n):
+    # Trivial per-pixel arithmetic -- no gauss_blur, no halo -- so device work per
+    # statement is as small as this language can make it: the class of program the
+    # stride gate exists to protect.
+    return ("vec4 x = @A;\n"
+            + "x = x * 1.0001 + vec4(0.00001, 0.00002, 0.00001, 0.0);\n" * n
+            + "@OUT = x;\n")
+
+
+def _sweep_medium_code(n):
+    return "vec4 x = @A;\n" + "x = gauss_blur(x, 3.0);\n" * n + "@OUT = x;\n"
+
+
+def _sweep_shapes():
+    """Built lazily (not at import time) so the module stays importable without ever
+    constructing the heavy chain's own strings twice; `_HEAVY`/`_SIZE`/`_N_STATEMENTS`
+    are reused verbatim so the sweep's "heavy" row is directly comparable to Experiments
+    1-3's own heavy-chain numbers."""
+    return {
+        "cheap256": {"code": _sweep_cheap_code(_SWEEP_CHEAP_N), "size": 256, "n": _SWEEP_CHEAP_N},
+        "cheap1024": {"code": _sweep_cheap_code(_SWEEP_CHEAP_N), "size": 1024, "n": _SWEEP_CHEAP_N},
+        "medium": {"code": _sweep_medium_code(_SWEEP_MEDIUM_N), "size": 1024, "n": _SWEEP_MEDIUM_N},
+        "heavy": {"code": _HEAVY, "size": _SIZE, "n": _N_STATEMENTS},
+    }
+
+
+class _SweepTripToken:
+    """Deterministic on_progress statement-FRACTION trip (not a wall-clock timer): immune
+    to a box's own clock ramp under load, unlike `_TripToken` above, which this sweep does
+    not reuse for exactly that reason (a shorter, cheaper-per-statement shape trips too
+    fast for a `delay_s` timer calibrated off a separately measured full runtime to stay
+    reliable). `on_progress` is a second callback threaded through `tex_engine.cook`,
+    called once per top-level interpreter statement -- NOT a method the cancel token
+    itself is polled for, so callers must pass `tok.on_progress` explicitly alongside
+    `cancel=tok`."""
+    def __init__(self, depth, stride_ms, target_frac):
+        self.pace = True
+        self.pace_depth = depth
+        self.pace_stride_ms = stride_ms
+        self._target_frac = target_frac
+        self._tripped = threading.Event()
+
+    def check(self):
+        if self._tripped.is_set():
+            raise CookCancelled("PACE-47 sweep: statement-fraction trip")
+
+    def on_progress(self, phase, frac):
+        if phase == "stmt" and frac >= self._target_frac:
+            self._tripped.set()
+
+
+def _sweep_calibrate(code, size, trials=2):
+    def once(seed):
+        t0 = time.perf_counter()
+        tex_engine.cook(code, _sized_bindings(size, seed), device_mode="cuda")
+        torch.cuda.synchronize()
+        return time.perf_counter() - t0
+    once(9000)  # discard the cold leg (docs/brief-conventions.md's measurement discipline)
+    return min(once(9001 + i) for i in range(trials))
+
+
+def sweep_cost_unpreempted(code, size, depth, stride_ms, trials, seed0):
+    """One cell's (a): median cost when nothing pre-empts, paced vs unpaced, interleaved
+    A/B/A/B so box drift cancels rather than compounds into a phantom regression."""
+    unpaced_t, paced_t = [], []
+    for i in range(trials):
+        seed = seed0 + i
+        a_first = i % 2 == 0
+        order = (("u", "p"), ("p", "u"))[0 if a_first else 1]
+        times = {}
+        for which in order:
+            tok = _UnpacedToken() if which == "u" else _PacedToken(depth, stride_ms)
+            t0 = time.perf_counter()
+            tex_engine.cook(code, _sized_bindings(size, seed), device_mode="cuda", cancel=tok)
+            torch.cuda.synchronize()
+            times[which] = time.perf_counter() - t0
+        unpaced_t.append(times["u"])
+        paced_t.append(times["p"])
+    med_u, med_p = statistics.median(unpaced_t), statistics.median(paced_t)
+    return {"unpaced_ms": med_u * 1000, "paced_ms": med_p * 1000,
+            "overhead_pct": (med_p / med_u - 1.0) * 100}
+
+
+def sweep_drain_on_preempt(code, size, depth, stride_ms, trials, full_runtime, seed0):
+    """One cell's (b): submit -> device-drained p50/p95 after a pre-emption trips at a
+    random point in [15%, 85%] of the shape's own uncancelled full runtime."""
+    returns_ms, drained_ms = [], []
+    for i in range(trials):
+        frac = random.uniform(0.15, 0.85)
+        tok = _SweepTripToken(depth, stride_ms, frac)
+        bg_seed = seed0 + i
+        bg_done = threading.Event()
+
+        def _bg():
+            try:
+                tex_engine.cook(code, _sized_bindings(size, bg_seed), device_mode="cuda",
+                                 cancel=tok, on_progress=tok.on_progress)
+            except CookCancelled:
+                pass
+            finally:
+                bg_done.set()
+
+        th = threading.Thread(target=_bg)
+        th.start()
+        tok._tripped.wait(timeout=full_runtime * 4 + 5)
+
+        t0 = time.perf_counter()
+        res = tex_engine.cook(_INTERACTIVE, _interactive_bindings(bg_seed), device_mode="cuda")
+        t1 = time.perf_counter()
+        if res.done is not None:
+            res.done.synchronize()
+        t2 = time.perf_counter()
+
+        returns_ms.append((t1 - t0) * 1000)
+        drained_ms.append((t2 - t0) * 1000)
+        th.join(timeout=full_runtime * 4 + 5)
+        torch.cuda.synchronize()
+
+    return {
+        "return_p50_ms": _p(returns_ms, 0.50), "return_p95_ms": _p(returns_ms, 0.95),
+        "drained_p50_ms": _p(drained_ms, 0.50), "drained_p95_ms": _p(drained_ms, 0.95),
+    }
+
+
+def stride_depth_sweep(shape_names, depths, strides_ms, cost_trials, drain_trials, verbose=True):
+    """The full grid, one dict keyed by shape -> cell (`depth{d}_stride{s}`) -> cost/drain,
+    plus each shape's own calibrated uncancelled full runtime."""
+    shapes = _sweep_shapes()
+    out = {"depths": depths, "strides_ms": strides_ms, "shapes": {}}
+    for shape_name in shape_names:
+        shp = shapes[shape_name]
+        code, size, n = shp["code"], shp["size"], shp["n"]
+        full = _sweep_calibrate(code, size)
+        if verbose:
+            print(f"\n=== shape={shape_name}  n_statements={n}  size={size}  "
+                  f"calibrated full={full * 1000:.2f} ms ===")
+        shape_out = {"n_statements": n, "size": size, "full_runtime_ms": full * 1000, "cells": {}}
+        for depth in depths:
+            for stride_ms in strides_ms:
+                cell_key = f"depth{depth}_stride{stride_ms}"
+                t0 = time.perf_counter()
+                cost = sweep_cost_unpreempted(code, size, depth, stride_ms, cost_trials, seed0=10000)
+                drain = sweep_drain_on_preempt(code, size, depth, stride_ms, drain_trials, full,
+                                               seed0=20000)
+                dt = time.perf_counter() - t0
+                if verbose:
+                    print(f"  depth={depth} stride={stride_ms:>4}ms  "
+                          f"unpaced={cost['unpaced_ms']:8.3f}ms paced={cost['paced_ms']:8.3f}ms "
+                          f"overhead={cost['overhead_pct']:+6.2f}%   "
+                          f"drain p50={drain['drained_p50_ms']:7.3f}ms "
+                          f"p95={drain['drained_p95_ms']:7.3f}ms  ({dt:.1f}s)")
+                shape_out["cells"][cell_key] = {"depth": depth, "stride_ms": stride_ms,
+                                                 "cost": cost, "drain": drain}
+        out["shapes"][shape_name] = shape_out
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--depths", type=str, default="1,2,3,4,8")
@@ -309,14 +503,42 @@ def main():
     ap.add_argument("--stream-trials", type=int, default=40)
     ap.add_argument("--skip-stream", action="store_true")
     ap.add_argument("--save", type=str, default=None)
+    ap.add_argument("--sweep", action="store_true",
+                     help="PACE-47: run the shape x depth x stride sweep (Experiment 5) "
+                          "instead of Experiments 1-4.")
+    ap.add_argument("--sweep-shapes", type=str, default="cheap256,cheap1024,medium,heavy")
+    ap.add_argument("--sweep-depths", type=str, default=_SWEEP_DEPTHS_DEFAULT)
+    ap.add_argument("--sweep-strides-ms", type=str, default=_SWEEP_STRIDES_MS_DEFAULT)
+    ap.add_argument("--sweep-cost-trials", type=int, default=30)
+    ap.add_argument("--sweep-drain-trials", type=int, default=40)
     a = ap.parse_args()
 
     if not torch.cuda.is_available():
         print("no CUDA on this box -- nothing to measure")
         return
 
-    depths = [int(x) for x in a.depths.split(",")]
     box = _box_note()
+
+    if a.sweep:
+        print(f"box: {box}")
+        shape_names = a.sweep_shapes.split(",")
+        depths = [int(x) for x in a.sweep_depths.split(",")]
+        strides_ms = [float(x) for x in a.sweep_strides_ms.split(",")]
+        print(f"=== Experiment 5 (PACE-47): shape x depth x stride sweep -- "
+              f"shapes={shape_names} depths={depths} strides_ms={strides_ms} ===")
+        r5 = stride_depth_sweep(shape_names, depths, strides_ms,
+                                 a.sweep_cost_trials, a.sweep_drain_trials)
+        if a.save:
+            out = {"box": box, **r5}
+            path = a.save if os.path.isabs(a.save) else \
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), a.save)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2)
+            print(f"\nsaved -> {path}")
+        return
+
+    depths = [int(x) for x in a.depths.split(",")]
     print(f"box: {box}")
     print(f"heavy chain: {_N_STATEMENTS} x gauss_blur(8.0) @ {_SIZE}^2")
 
