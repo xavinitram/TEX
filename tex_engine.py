@@ -600,6 +600,14 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             exc.tex_refusal = EngineRefusal(_verdict.code or REFUSE_SCALE_UNSAFE, None,
                                             "this program is not provably scale-safe")
             raise exc
+        # AUTHOR DECISION (R6): a coarse cook defaults to precision="auto" -- the EXISTING
+        # invariant #10 accuracy net already reasons about data amplification independent of
+        # canvas resolution, so "reduced precision under scale's envelope, never surfaced as
+        # a NEW decision" needs no new mechanism, only this default. Only the caller's own
+        # unspecified-vs-fp32-shaped default value is promoted — an EXPLICIT precision=
+        # (anything other than the literal default "fp32") is still honoured unchanged.
+        if precision == "fp32":
+            precision = "auto"
     # CACHE-1: the interpreter reads the playhead by duck-typing (`time_context.get(name)`, any
     # Mapping), but the lineage keyer type-checks it — so a Mapping-but-not-dict playhead (a
     # MappingProxyType read-only view a host might hand out) would drive the pixels yet fall out
