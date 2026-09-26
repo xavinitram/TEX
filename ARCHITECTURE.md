@@ -338,6 +338,7 @@ Bounds below are entry counts, and every store is process-lifetime unless stated
 | `tex_roi._walk_memo` | code-hash x fp32 param bits | the ROI-2 footprint walk `(reads, blocked, halo)`; keyed like `tex_lazy._memo` but a distinct analysis |
 | `tex_roi._parse_memo` | source x profile key | `tex_roi`'s own copy of the unfolded AST (the fold mutates its tree, so the memo is never handed out directly); 64 |
 | `tex_roi._region_dep_memo` | fingerprint x string-binding names | the region-dependence verdict the cook splitters gate on; 256. TRK-65 shares this store for a second, namespaced population: a synthetic `("trk65-unfolded", ...)` fingerprint memoizing the UNFOLDED program's verdict, which `_walk` consults to skip its own per-fold walk when it is safely False (see `tex_roi._unfolded_region_independent`) |
+| `tex_roi._scale_verdict_memo` | code-hash x fp32 param bits | SCALE-47b: the `ScaleVerdict(safe, code, source)` a non-1.0 `scale` request is gated on (`tex_roi.scale_verdict`, mirrored publicly as `tex_api.scale_verdict`) — keyed like `tex_lazy._memo`/`tex_roi._walk_memo` but a distinct analysis (builtin-identifier usage, not footprint reach); 256 |
 | `tex_marshalling._SIGIL_MEMO` | source | the names used only with the `$` sigil; 512 |
 | `tex_fusion._FUSED_MEMO` | chain key (every stage's source + wiring) | the spliced program |
 | `tex_fusion._FUSED_FP_MEMO` | the same chain key | the fused fingerprint, memoized because `prepare()` now asks for it on every cook; 256 |
