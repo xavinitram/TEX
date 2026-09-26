@@ -383,6 +383,13 @@ def _get_or_make_codegen_fn(program: Any, type_map: dict | None,
 # OS thread create/destroy on every frame of a batch/video workload.
 _COMPILE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
+# C1 (B1#1): a SEPARATE single-thread worker for any job carrying a `warm_call` (CC-5's
+# paid-in-the-background lazy first-call cost, 10-30s of real Dynamo trace + Inductor
+# lowering). `_run_cached_compiled`/`_compile_and_run` block on `_COMPILE_POOL` futures --
+# sharing ONE worker with a warm job stalled any other program's cook behind it, with no
+# timeout. A wrap-only job has nothing slow to isolate and keeps using `_COMPILE_POOL`.
+_WARM_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
 # Minimum tensor-op count for torch.compile to be worthwhile.
 # Below this threshold the fusion benefit cannot overcome tracing overhead.
 _COMPILE_OP_THRESHOLD = 8
@@ -1183,7 +1190,14 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
     if fingerprint in _compile_blacklist:
         return False
 
-    def _compile_only():
+    def _compile_and_maybe_warm():
+        """Wrap the program (fast) and, if given, pay the warm's slow lazy first-call
+        cost too — ONE task/thread hand-off, on whichever pool this job was submitted to
+        (below). A draft that chained warm onto wrap via a SEPARATE executor + done-
+        callback let a freshly-woken warm-pool worker beat the calling thread's very
+        next instructions for a fast (no real torch.compile) program, racing a test's
+        monkeypatch before its own `finally` restored it. One hand-off, the pre-split
+        shape, just on the pool the caller chose."""
         try:
             with _precompile_ctx(), torch.inference_mode():
                 if cache_key not in _compiled_cache:
@@ -1204,8 +1218,13 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
             _compiled_cache.pop(cache_key, None)   # never hand a proven-broken artifact on
             return "failed"
 
+    # C1 (B1#1): route to the DEDICATED `_WARM_POOL` whenever a `warm_call` is given —
+    # the only case with a potentially SLOW (10-30s) step — so it never shares a worker
+    # with `_run_cached_compiled`/`execute_compiled`'s blocking `_COMPILE_POOL` submits.
+    # A wrap-only job (`tex_api.prewarm`'s callerless case) keeps using `_COMPILE_POOL`.
+    pool = _WARM_POOL if warm_call is not None else _COMPILE_POOL
     try:
-        _bg_futures[cache_key] = _COMPILE_POOL.submit(_compile_only)
+        _bg_futures[cache_key] = pool.submit(_compile_and_maybe_warm)
         return True
     except Exception:
         return False
