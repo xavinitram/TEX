@@ -368,6 +368,26 @@ def poll_cook_cancel() -> None:
         _pace.paced_check(tok, getattr(_cook_ctx, "device", None))   # PACE-45
 
 
+def poll_cook_cancel_heavy() -> None:
+    """PACE-47c: the Gap-1 half of `poll_cook_cancel` (a naturally multi-pass builtin
+    polling BETWEEN its own internal passes), but marking that poll `heavy=True` --
+    NEVER for Gap 2 (codegen's in-body `_CK`, which polls at arbitrary points inside
+    compiled code the codegen tier cannot always classify, and must stay conservative
+    there rather than this lane guessing on its behalf; see the hand-back). A caller here
+    is, by construction, a stdlib builtin already known to be device-expensive enough to
+    need more than one pass (`_gauss_blur_bchw`'s two separable convolutions,
+    `_build_mip_pyramid`'s per-level loop) -- exactly the class PACE-47c's `heavy=True`
+    exists for: it forces `_pace.paced_check` to bypass the stride economization entirely
+    for this poll, closing the completed-tail blind spot (PACE-47/PACE-47b's peek only
+    ever answers for the LAST recorded event, never for what is about to run) for the
+    builtins that already had a mid-execution poll point to hang it on. Same cheap
+    default-path shape as `poll_cook_cancel`: one attribute read when no cook published a
+    token."""
+    tok = getattr(_cook_ctx, "cancel", None)
+    if tok is not None:
+        _pace.paced_check(tok, getattr(_cook_ctx, "device", None), heavy=True)
+
+
 def _uniform_grid():
     return getattr(_cook_ctx, "grid", None)
 
@@ -785,8 +805,10 @@ def _gauss_blur_bchw(
     # CANCEL-44 (Gap 1): between the two separable passes — the horizontal pass is the
     # half of a large blur (2048^2 measured at p95 130.5ms) a cancel fired mid-builtin
     # could not reach before. Off the default path (no cook has published a token) this
-    # is one attribute read.
-    poll_cook_cancel()
+    # is one attribute read. PACE-47c: `_heavy`, not the plain poll — a poll BEFORE this
+    # builtin started may have skipped recording (the completed-tail blind spot), so the
+    # pass that just ran must always be accounted for regardless of stride.
+    poll_cook_cancel_heavy()
     padded = torch.nn.functional.pad(result, (0, 0, radius, radius), mode='replicate')
     result = torch.nn.functional.conv2d(padded, kv, stride=(stride_h, 1), groups=C)
     return result
@@ -831,7 +853,8 @@ def _build_mip_pyramid(
     max_levels = min(_MIP_MAX_LEVELS, int(math.log2(max(min(H, W), 1))))
     for _ in range(max_levels):
         # CANCEL-44 (Gap 1): between mip levels — the other naturally multi-pass shape.
-        poll_cook_cancel()
+        # PACE-47c: `_heavy` for the same reason as `_gauss_blur_bchw`'s own call.
+        poll_cook_cancel_heavy()
         _, _, ch, cw = current.shape
         if ch <= 1 or cw <= 1:
             break

@@ -360,11 +360,36 @@ def reset(token=None, device=None) -> None:
     _state.last_confirmed_done = None
 
 
-def paced_check(token, device) -> None:
+def paced_check(token, device, heavy: bool = False) -> None:
     """One poll point. `token is None` is the untouched default path (a no-op, exactly
     `host._cancel_check`'s own body). A token that does not ask for pacing, or a cook that
     is not on CUDA, is the SAME body too — one `token.check()` — so the unpaced cost is
     identical to before this ask plus one cheap attribute read.
+
+    **PACE-47c — `heavy`: the completed-tail blind spot both PACE-47 and PACE-47b's cache
+    share, closed only where a caller can say so.** The peek (PACE-47) only ever answers
+    "has the LAST RECORDED event completed" — it says nothing about how much work has been
+    enqueued (or is ABOUT to be enqueued) SINCE that event was recorded. Once that answer is
+    "yes", every further poll inside the SAME stride window trusts it and skips, no matter
+    how many MORE statements get dispatched in between — a host fast enough (microseconds
+    per enqueue) can walk a whole RUN of heavy, real-device-time statements (each ~milliseconds
+    to tens-of-milliseconds of actual GPU work) past this poll while the tail happens to have
+    already finished, and NONE of them get an outstanding event to be bounded by `depth` —
+    exactly PACE-47's original defect, just gated behind "the tail must complete first",
+    which is why it is RARE (needs that lucky/unlucky timing) rather than constant, and why
+    only the tail (`drained_p95`) is affected, never the median. `heavy=True` closes this
+    the only way it CAN be closed without knowing the future: a caller that knows the
+    statement it is about to run is expensive (a halo/halo_arg-footprint or otherwise
+    non-cheap builtin) says so, and this poll bypasses the stride economization ENTIRELY for
+    that one call — falls straight through to the ordinary depth-gated record/wait below,
+    exactly as `stride=0` would, regardless of the tail's own state or how little host time
+    has passed. A HOST-TIME stride can never bound device work on its own (this defect is
+    exactly that failure mode) and neither can a poll-COUNT cap (it cannot tell a run of
+    cheap polls, which should keep economizing indefinitely, from a run that happens to
+    include a heavy one) — only information about what is ABOUT to run can. Default `False`
+    preserves every existing call site's behaviour byte-for-byte (this parameter is new;
+    nothing calls it yet — see the hand-back for which callers this lane could and could not
+    wire, and why).
 
     Paced (a CUDA cook, a token with a truthy `pace`): polls the token first (an
     already-tripped token is caught before any device interaction) — ALWAYS, regardless of
@@ -430,7 +455,7 @@ def paced_check(token, device) -> None:
     depth = _state.depth
 
     stride = _state.stride_s
-    if stride > 0:
+    if stride > 0 and not heavy:
         last = _state.last_record_t
         if last is not None and (_time.perf_counter() - last) < stride:
             # Inside the stride window: this is a candidate to skip, but ONLY while the

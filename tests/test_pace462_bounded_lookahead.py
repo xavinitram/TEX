@@ -697,6 +697,104 @@ def test_pace47b_query_cache_invalidates_on_a_real_record(r):
                f"{query_calls['n']}")
 
 
+# ── PACE-47c: the completed-tail blind spot -- PACE-47/47b share it ──────────────
+#
+# The peek only ever answers "has the LAST RECORDED event completed" -- once that answer
+# is yes, EVERY further poll inside the same stride window trusts it, no matter how many
+# MORE statements get dispatched in between. A fast host can walk a whole run of
+# device-expensive ("heavy") statements past this poll while the tail happens to have
+# already finished, and none of them get an outstanding event -- PACE-47's original
+# defect, just gated behind "the tail must complete first" (rarer, tail-only).
+
+def test_pace47c_completed_tail_blind_spot_is_real_without_heavy(r):
+    """Characterization, not a red-first fix test (there is nothing at the `paced_check`
+    level alone that can close this without caller cooperation): depth=2, stride=10ms;
+    poll 1 records E1; E1 is then marked complete; 20 FURTHER polls -- each one a stand-in
+    for a heavy top-level statement dispatched in the same still-open window -- must, on
+    the UNMODIFIED (`heavy` omitted, i.e. `False`) call shape, leave `outstanding` and the
+    live-event count completely untouched: none of the 20 is ever tracked or waited on,
+    proving the backlog these 20 represent is invisible to the depth bound."""
+    print("\n--- PACE-47c: the completed-tail blind spot is real without `heavy` ---")
+    clock = _FakeClock(0.0)
+    real_perf_counter = _pace._time.perf_counter
+    _pace._time.perf_counter = clock
+    try:
+        with _DeviceSpy():
+            _FakeEvent.DONE = True
+            tok = _Token(pace=True, pace_depth=2)
+            tok.pace_stride_ms = 10.0
+            _pace.reset(tok, "cuda")
+            _pace.paced_check(tok, "cuda")          # poll 1: records E1
+            clock.advance(0.001)
+            _pace.paced_check(tok, "cuda")           # poll 2: peek confirms E1 done -> skip
+            constructed_before = _FakeEvent._live
+            outstanding_before = len(_pace._state.pool["outstanding"])  # noqa: SLF001
+
+            for _ in range(20):                      # 20 "heavy" statements, same window
+                clock.advance(0.0001)
+                _pace.paced_check(tok, "cuda")        # heavy NOT passed -> old behaviour
+
+            constructed_after = _FakeEvent._live
+            outstanding_after = len(_pace._state.pool["outstanding"])  # noqa: SLF001
+    finally:
+        _pace._time.perf_counter = real_perf_counter
+        _FakeEvent.DONE = True
+
+    if (constructed_before == 1 and outstanding_before == 1
+            and constructed_after == 1 and outstanding_after == 1):
+        r.ok("confirmed: 20 further polls inside the same window, with the tail already "
+             "complete, constructed/tracked exactly 0 new events -- the blind spot is real")
+    else:
+        r.fail("PACE-47c blind spot characterization",
+               f"before: constructed={constructed_before} outstanding={outstanding_before}; "
+               f"after 20 more polls: constructed={constructed_after} "
+               f"outstanding={outstanding_after} (expected 1/1/1/1 -- if this changed, the "
+               f"blind spot this test documents may already be gone)")
+
+
+def test_pace47c_heavy_true_forces_the_bound_regardless_of_the_tail(r):
+    """The fix's mechanism: the SAME 20-poll burst, but each poll passes `heavy=True` (as
+    a caller that KNOWS it is about to dispatch a device-expensive statement would) --
+    every one of them must bypass the stride economization entirely and hit the ordinary
+    depth-gated record/wait, so `depth`'s bound is enforced regardless of the tail's own
+    completion state. Pre-`heavy`-parameter, this is RED: `paced_check()` takes no `heavy`
+    keyword at all (TypeError)."""
+    print("\n--- PACE-47c: heavy=True forces the depth bound regardless of the tail ---")
+    clock = _FakeClock(0.0)
+    real_perf_counter = _pace._time.perf_counter
+    _pace._time.perf_counter = clock
+    try:
+        with _DeviceSpy():
+            _FakeEvent.DONE = True
+            tok = _Token(pace=True, pace_depth=2)
+            tok.pace_stride_ms = 10.0
+            _pace.reset(tok, "cuda")
+            _pace.paced_check(tok, "cuda", heavy=True)      # poll 1: records E1 (depth 1/2)
+            clock.advance(0.001)
+            _pace.paced_check(tok, "cuda", heavy=True)      # poll 2: E1 done, but heavy=True
+                                                             # -> records anyway (depth 2/2)
+            waits_before = sum(ev.sync_calls for ev in _pool_events())
+
+            for _ in range(20):                              # 20 more heavy statements
+                clock.advance(0.0001)
+                _pace.paced_check(tok, "cuda", heavy=True)
+
+            waits_after = sum(ev.sync_calls for ev in _pool_events())
+            outstanding_after = len(_pace._state.pool["outstanding"])  # noqa: SLF001
+    finally:
+        _pace._time.perf_counter = real_perf_counter
+        _FakeEvent.DONE = True
+
+    if waits_before == 0 and waits_after - waits_before == 20 and outstanding_after == 2:
+        r.ok(f"20 heavy=True polls past a full pool produced exactly 20 waits (one per "
+             f"poll once the pool was full), outstanding held at depth (2) throughout")
+    else:
+        r.fail("PACE-47c heavy=True bound",
+               f"waits before burst={waits_before}, waits gained over 20 heavy polls="
+               f"{waits_after - waits_before} (expected 20), outstanding after="
+               f"{outstanding_after} (expected 2)")
+
+
 def test_pace_stride_ms_default_when_absent(r):
     print("\n--- PACE-462: pace_stride_ms absent resolves to the module default ---")
     tok = _Token(pace=True, pace_stride_ms=None)  # None -> no pace_stride_ms attribute at all
