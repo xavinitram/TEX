@@ -38,6 +38,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("TEX")
 
+# R3 (v0.46, MEASURE-44 follow-up): the torch module, resolved lazily on first
+# tensor-touching call and cached HERE — a module global, not a module-scope import (that
+# would put torch back on `tex_api.check()`'s import path, LINT-46's whole point, guarded
+# by `test_lint46_check_torch_free.py`) and not a per-call `import torch` either (LINT-46's
+# per-function imports cost one `IMPORT_NAME` + `sys.modules` lookup EVERY call, ~35ns,
+# measured — small, but every one of these functions is on the marshalling hot path, called
+# once per binding per cook). First tensor-touching call pays the one real import; every
+# later call in this process reads the cached module object straight off this global.
+_torch = None
+
+
+def _torch_mod():
+    """Return the torch module, importing it at most once per process. Never call this
+    from a pure-lint path (`check()`'s front end never does)."""
+    global _torch
+    if _torch is None:
+        import torch as _t
+        _torch = _t
+    return _torch
+
 
 # ── XPU: pinned egress + non-blocking ingestion (v0.20) ──────────────────────
 #
@@ -75,7 +95,7 @@ def _pin_worthwhile(t) -> bool:
     256MB), and CUDA exists to DMA to. Never raises (a wedged driver reads as
     no-CUDA)."""
     try:
-        import torch
+        torch = _torch_mod()
         nbytes = t.numel() * t.element_size() if isinstance(t, torch.Tensor) else 0
         return (isinstance(t, torch.Tensor)
                 and t.device.type == "cpu"
@@ -91,7 +111,7 @@ def _pinned_clamp01(raw: torch.Tensor) -> torch.Tensor:
     pressure — pinning is an optimization, never a requirement."""
     if _pin_worthwhile(raw):
         try:
-            import torch
+            torch = _torch_mod()
             out = torch.empty(raw.shape, dtype=raw.dtype, pin_memory=True)
             return torch.clamp(raw, 0.0, 1.0, out=out)
         except Exception:
@@ -107,7 +127,7 @@ def _pinned_contiguous(t: torch.Tensor) -> torch.Tensor:
         return t
     if _pin_worthwhile(t):
         try:
-            import torch
+            torch = _torch_mod()
             out = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
             out.copy_(t)
             return out
@@ -130,7 +150,7 @@ def to_fp32_if_int_image(t, device=None):
 
     Single source for both ingestion paths (the interpreter binding loop and
     codegen's `_contiguous_bindings`); guarded by the M5-INT bit-exactness test."""
-    import torch
+    torch = _torch_mod()
     if not isinstance(t, torch.Tensor):
         return t
     needs_cast = (t.dim() >= 3 and not t.is_floating_point()
@@ -169,7 +189,7 @@ def tensor_fingerprint(t: torch.Tensor) -> str:
     then reuse a stale cached result. numel + sum + mean over all elements catch
     those changes. (sum/mean add one batched GPU sync, ~0.07ms at 512x512.)
     """
-    import torch
+    torch = _torch_mod()
     flat = t.flatten()
     n = flat.numel()
     stride = max(1, n // 256)
@@ -198,7 +218,7 @@ def unwrap_latent(value: dict) -> tuple[torch.Tensor, dict]:
     Input:  {"samples": tensor [B,C,H,W], "noise_mask": ..., ...}
     Output: (tensor [B,H,W,C], {"noise_mask": ..., ...})
     """
-    import torch
+    torch = _torch_mod()
     samples = value["samples"]  # [B, C, H, W]
     if not isinstance(samples, torch.Tensor) or samples.dim() != 4:
         got = (f"a {samples.dim()}D tensor" if isinstance(samples, torch.Tensor)
@@ -434,7 +454,7 @@ class Promise:
         Shape and device are checked only when they were DECLARED: a host that knows the
         type but not the resolution says so by omitting them, and gets the type check alone.
         """
-        import torch
+        torch = _torch_mod()
         from .tex_runtime.interpreter import InterpreterError
         got = None
         if isinstance(value, torch.Tensor):
@@ -523,7 +543,7 @@ class PlanesValue:
     __slots__ = ("planes", "descs")
 
     def __init__(self, planes: dict, descs: dict | None = None):
-        import torch
+        torch = _torch_mod()
         if not planes_wires_enabled():
             raise ValueError(
                 "a PlanesValue needs the engine egress profile: call "
@@ -697,7 +717,7 @@ def infer_binding_type(value: Any) -> TEXType:
     and the E6003 "not connected" gate is what is supposed to report that, further down,
     with a message naming the slot.
     """
-    import torch
+    torch = _torch_mod()
     if value.__class__ is Promise:
         # The whole point: identity is computable before the pixels land.
         return value.declared_type
@@ -1026,7 +1046,7 @@ def _prepare_output_comfy(raw: torch.Tensor | str, output_type: str) -> Any:
     """The ComfyUI wire format: clamp to [0,1], drop alpha, expand gray -> RGB. Lossy by
     necessity — that IS the IMAGE contract every downstream node expects. Byte-identical
     to every version before v0.22 and canary-pinned (test_eng3_comfy_profile_canary)."""
-    import torch
+    torch = _torch_mod()
     if output_type == "STRING":
         if isinstance(raw, str):
             return raw
@@ -1131,7 +1151,7 @@ def _prepare_output_engine(raw: torch.Tensor | str, output_type: str) -> Any:
     view of `raw` (e.g. an already-fp32 IMAGE passes straight through). The guarantee that
     a cooked output does not alias an INPUT BINDING belongs one level up, in
     `tex_engine.run`, which is the only layer that knows what the bindings were."""
-    import torch
+    torch = _torch_mod()
     if output_type == "STRING":
         return _prepare_output_comfy(raw, "STRING")   # no range to preserve
     _reject_string_output(raw, output_type)
