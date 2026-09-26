@@ -1197,6 +1197,27 @@ class WholeFrameChainD3Scenario(WholeFrameChainScenario):
     _DIRTY = 3
 
 
+class WholeFrameChainD5Scenario(WholeFrameChainScenario):
+    """BENCH-47's midpoint: half the ten-stage chain dirty. D1/D3 alone leave the sweep's
+    only two points close together (10%/30% of N); a per-cook fixed-cost line drawn through
+    two nearby points cannot show whether the growth from D1 to D10 stays straight, only
+    that it moved. This row exists so wave 2's cut (TRK-211/TRK-212) has a THIRD point to fit
+    a line through, not just two to draw one between."""
+    name = "whole_frame_chain_d5"
+    _DIRTY = 5
+
+
+class WholeFrameChainD10Scenario(WholeFrameChainScenario):
+    """D=N: every stage dirty, the boundary the D1..D9 family approaches. `stage = N - D = 0`,
+    so `tick()` edits stage 0's own param and `RoiComp.cook(None, 0, use_cache=False)` walks
+    the WHOLE chain from the first stage — there is no clean prefix left to stand on `_src`,
+    unlike every `_DIRTY < N` row above. This is `_ALL_DIRTY`'s whole-frame (`roi=None`)
+    twin: same ten cooks, but through the no-ROI route `_ALL_DIRTY` never takes, which is the
+    axis `WholeFrameChainScenario`'s own class docstring names."""
+    name = "whole_frame_chain_d10"
+    _DIRTY = 10
+
+
 class HostTickExactScenario(Scenario):
     """COMPILE-M1 — pins the host's EXACT tick, host-neutral, per a real embedding host's own
     reported call sequence ("Q5", local hand-back only): every tick passes `time_context`,
@@ -1405,6 +1426,7 @@ SCENARIOS = (PrewarmScenario, SourceEditScenario, TerminalKnobScenario,
              MidGraphKnobScenario, PanScenario, AllDirtyScenario, LintScenario,
              NodeScrubScenario, CheckpointServeScenario, InterpChainScrubScenario,
              WholeFrameChainD1Scenario, WholeFrameChainD3Scenario,
+             WholeFrameChainD5Scenario, WholeFrameChainD10Scenario,
              HostTickExactD1Scenario, HostTickExactD3Scenario, PlaybackFramesScenario)
 SCENARIO_NAMES = tuple(s.name for s in SCENARIOS)
 
