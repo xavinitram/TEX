@@ -221,7 +221,14 @@ _SKIP_VOCAB = re.compile(
 #: (`test_scalecx49_execute_compiled_shares_one_artifact_across_a_scale_sweep`) already runs
 #: everywhere with no `r.skip` and proves the identical caching/threading logic, so this row's
 #: only job is the stronger, unmocked proof on a box that has a toolchain; one `r.skip` site.
-_SKIP_BUDGET = 125
+#: Re-pinned from 125 to 126 (FIX-ROI49 Q2): `test_join49_dag_windows.py::
+#: test_join49_pixel_identity_join_dag_cuda` used to report its no-CUDA/no-lease non-run
+#: through `r.ok` in skip-shaped words, invisible to both this file's own census arms (neither
+#: matched — B4#1's finding). It now reports through `r.skip`, gated on
+#: `torch.cuda.is_available()` alone, same reason every other CUDA-only row in this pin
+#: carries one — its CPU twin (`test_join49_pixel_identity_join_dag`) already proves the same
+#: pixel-identity claim with no device.
+_SKIP_BUDGET = 126
 
 
 def _literal(node) -> str:

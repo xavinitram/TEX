@@ -11,9 +11,11 @@ fed the synthesized linear stage list is BYTE-IDENTICAL to `chain_windows` (the 
 linear API is the inputs=(i-1,) special case" contract), the two NEW composition rules do what
 SS B.2 says, the divergent-validity refusal fires exactly when SS B.3 says it must, and every
 window this module allows for a real multi-input join is proven by PIXEL IDENTITY: a windowed
-cook (crop, run, patch) equals the whole-frame cook, on CPU always and on CUDA under a held
-lease. Negative controls (cases that MUST refuse) are pixel-proven too — the case is "this
-window is silently wrong", not merely "this window is smaller than the frame".
+cook (crop, run, patch) equals the whole-frame cook, on CPU always and on CUDA whenever a
+device is present (FIX-ROI49 Q2: gated on `torch.cuda.is_available()` alone, same as every
+other CUDA-only row in this tree — no lease/env-var vocabulary). Negative controls (cases that
+MUST refuse) are pixel-proven too — the case is "this window is silently wrong", not merely
+"this window is smaller than the frame".
 """
 from __future__ import annotations
 
@@ -383,16 +385,15 @@ def test_join49_pixel_identity_join_dag(r: SubTestResult):
 
 
 def test_join49_pixel_identity_join_dag_cuda(r: SubTestResult):
-    """Same proof, CUDA. Skips (not a pass) when CUDA is unavailable OR the laptop lease is
-    held by another lane — this lane never fabricates a GPU result it did not measure."""
-    print("\n--- JOIN-49: pixel-identity proof, 3-stage join DAG, CUDA (lease-gated) ---")
+    """Same proof, CUDA. Gates on a CUDA device ONLY — this file's own CPU witness
+    (`test_join49_pixel_identity_join_dag`, same construction, above) already proves the
+    same pixels, so this row needs nothing beyond the device the other CUDA-only rows in
+    this tree need (FIX-ROI49 Q2, B4#1/R2#1): a non-run reports through `r.skip`, so
+    SIMP-3's skip census counts it, instead of `r.ok` in skip-shaped words that dodge the
+    census vocabulary and read as a pass that measured nothing."""
+    print("\n--- JOIN-49: pixel-identity proof, 3-stage join DAG, CUDA ---")
     if not torch.cuda.is_available():
-        r.ok("JOIN-49 CUDA pixel identity: skipped, no CUDA device on this box")
-        return
-    lease = os.environ.get("TEX_JOIN49_LEASE_HELD") == "1"
-    if not lease:
-        r.ok("JOIN-49 CUDA pixel identity: skipped, no held laptop lease "
-             "(set TEX_JOIN49_LEASE_HELD=1 under a confirmed held lease to run it)")
+        r.skip("JOIN-49 CUDA pixel identity", "no CUDA on this box")
         return
     _run_pixel_identity(r, "cuda")
 
