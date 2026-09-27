@@ -72,34 +72,35 @@ def _prog():
 # `scale=`) against the NEW one.
 
 def test_scalecx49_capture_key_mismatch_before_fix(r: SubTestResult):
-    """Red-first: reconstruct the PRE-FIX key (the base-sha `_capture_key`, which took no
-    `scale` argument at all) for two cooks of the SAME program/canvas/precision/device but
-    DIFFERENT scale values, and show they collide -- the exact bug that would let a capture
-    taken at one scale replay for a request at another. Then show the FIXED `_capture_key`
-    (this file's own import) distinguishes them."""
-    import subprocess
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # TEX_Wrangle
-    base_src = subprocess.run(
-        ["git", "show", "7477a93:tex_runtime/graphed.py"],
-        cwd=repo_root, capture_output=True, text=True, check=True).stdout
-    ns = {"__name__": "old_graphed_probe"}
-    # Extract and exec ONLY the pre-fix `_capture_key` function body -- not the whole
-    # module (which imports `.host`/`.interpreter` by relative package syntax and cannot
-    # exec standalone). Isolates exactly the function this test is about.
-    start = base_src.index("def _capture_key(")
-    end = base_src.index("\n\n\n", start)
-    exec(compile("import torch\n" + base_src[start:end], "<old _capture_key>", "exec"), ns)
-    old_capture_key = ns["_capture_key"]
-
+    """Red-first, in-process (no git history, no `.git` needed -- a shallow CI checkout or
+    an archive install has neither): reconstruct the PRE-FIX key shape by wrapping the REAL,
+    current `_capture_key` in a scale-blind adapter that drops the `scale` kwarg entirely --
+    exactly what every call site did before this ask, and the same technique
+    `test_scalecx49_cuda_graph_capture_mismatch_before_fix_live` below uses to reproduce the
+    mismatch live on CUDA. Two cooks of the SAME program/canvas/precision/device but
+    DIFFERENT scale values then collide under that adapter -- the exact bug that would let a
+    capture taken at one scale replay for a request at another. Then show the FIXED
+    `_capture_key` (called directly, un-wrapped) distinguishes them; since this second half
+    calls the real function under test, it still reds if the scale component is ever removed
+    from `_capture_key` -- the fix's proof strength never depended on the git-history half."""
     bindings = {"A": make_img(1, 8, 8, 3, seed=1)}
-    old_key_half = old_capture_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0)
-    old_key_quarter = old_capture_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0)
+    real_key = _graphed._capture_key
+
+    def _scale_blind_key(fingerprint, device, precision, bindings, output_names,
+                         latent_channel_count, scale=None):
+        return real_key(fingerprint, device, precision, bindings, output_names,
+                        latent_channel_count)   # scale dropped -- the pre-fix shape
+
+    old_key_half = _scale_blind_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0,
+                                    scale=0.5)
+    old_key_quarter = _scale_blind_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0,
+                                       scale=0.25)
     if old_key_half == old_key_quarter:
-        r.ok("pre-fix _capture_key collides across scale values (no scale component at "
-             "all) -- confirmed reproducible at base sha 7477a93")
+        r.ok("pre-fix-shaped (scale-blind) _capture_key collides across scale values (no "
+             "scale component at all) -- reproduced in-process")
     else:
         r.fail("scalecx49 red-first premise",
-               "pre-fix _capture_key did not collide -- this test's premise is stale")
+               "scale-blind _capture_key did not collide -- this test's premise is stale")
 
     new_key_half = _graphed._capture_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0,
                                          scale=0.5)
