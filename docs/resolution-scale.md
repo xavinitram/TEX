@@ -106,8 +106,10 @@ only in the safe direction (a missed optimisation, never a wrong picture). Any a
 failure (a program the walk cannot parse or walk) also declares unsafe.
 
 An author who knows better can override the verdict in either direction with a leading
-comment, parsed the same header-scan way as the existing `//!tex X.Y` language pragma (never
-becomes a token):
+comment, parsed the same never-becomes-a-token way as the existing `//!tex X.Y` language
+pragma, but NOT the identical header-scan: a leading `/* ... */` block comment (a common
+file-header style) is skipped over here rather than ending the scan — only real code does,
+unlike the language pragma, which stops at a block comment on purpose (FIX-SCALE S5).
 
 ```
 //!tex scale: safe
@@ -120,7 +122,9 @@ walk doesn't follow, for instance).
 //!tex scale: never
 ```
 forces a program the classifier would otherwise accept to always refuse a non-trivial scale
-request.
+request. When a program's header declares BOTH directions, `never` wins regardless of which
+line comes first — the conservative, fail-closed direction takes precedence over the
+optimistic one, never a silent "whichever the scan saw first."
 
 ## The R1 promise: a measured envelope, not equality
 

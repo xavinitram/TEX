@@ -65,49 +65,81 @@ COMPOUND_ASSIGN_OPS = {
 _PRAGMA_RE = _re.compile(r"//!tex\s+(\d+)\.(\d+)\b")
 
 
+def _header_pragma_matches(source: str, pattern, *, skip_block_comments: bool):
+    """FIX-SCALE S5 (R2#3): the header-scan `language_pragma` and `scale_pragma` both need,
+    factored once instead of copied. Yields every `pattern` match found in the leading
+    header run — blank lines, `//` line comments, and, when `skip_block_comments`, `/* ... */`
+    block comments too (single- or multi-line: skipped to their closing `*/`, never ending
+    the scan) — in header order. Stops at the first line that is none of those: real code,
+    or (when `skip_block_comments` is False) a block comment.
+
+    `skip_block_comments` is per-caller, not a shared default, because the two pragmas want
+    DIFFERENT postures here on purpose: `language_pragma` stops at a block comment (avoids a
+    spurious W7004 on the language pragma dialect below it — unchanged by this fix), while
+    `scale_pragma` must not (a `//!tex scale: never` after a leading file-header `/* ... */`
+    block is a common style, and silently losing the author's override is the S5 defect)."""
+    lines = (source or "").splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue                      # blank line — keep scanning the header
+        m = pattern.match(line)
+        if m:
+            yield m
+            i += 1
+            continue                      # a pragma line is itself a comment — keep scanning
+        if line.startswith("//"):
+            i += 1
+            continue                      # an ordinary leading line comment — keep scanning
+        if skip_block_comments and line.startswith("/*"):
+            if "*/" in line[2:]:
+                i += 1                     # closes on the SAME line — still header, continue
+                continue
+            i += 1
+            while i < n and "*/" not in lines[i]:
+                i += 1                     # skip every line of the block body
+            i += 1                         # and the line holding its closing `*/`
+            continue
+        break                              # first real code (or, unless skipped, a block comment)
+
+
 def language_pragma(source: str):
     """Return the language version a program targets via a LEADING `//!tex X.Y` pragma (as
     the string 'X.Y'), or None. Only a pragma in the header run of blank / `//` line-comment
     lines is recognized — one buried after real code or inside a `/* … */` block comment is
     ignored (it would otherwise raise a spurious W7004). `Parser.parse` calls this directly
     to set `Program.language`; `tex_api.language_pragma` delegates to this same function."""
-    for raw in (source or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue                      # blank line — keep scanning the header
-        m = _PRAGMA_RE.match(line)
-        if m:
-            return f"{m.group(1)}.{m.group(2)}"
-        if line.startswith("//"):
-            continue                      # an ordinary leading line comment — keep scanning
-        break                             # first real code (or a block comment): no pragma
+    for m in _header_pragma_matches(source, _PRAGMA_RE, skip_block_comments=False):
+        return f"{m.group(1)}.{m.group(2)}"
     return None
 
 
 # SCALE-47b: `//!tex scale: safe` / `//!tex scale: never` — an author override for the
-# scale-safety classifier (`tex_roi.scale_safe`), parsed by the SAME header-scan convention
-# as `_PRAGMA_RE`/`language_pragma` above (a leading run of blank/`//`-comment lines; one
-# buried after real code is ignored) rather than a new grammar rule — it never becomes a
-# token, exactly like the language pragma.
+# scale-safety classifier (`tex_roi.scale_safe`), parsed by the SAME header-scan HELPER as
+# `_PRAGMA_RE`/`language_pragma` above rather than a new grammar rule — it never becomes a
+# token, exactly like the language pragma. It does NOT share `language_pragma`'s "a block
+# comment ends the header run" posture — see `_header_pragma_matches`'s docstring.
 _SCALE_PRAGMA_RE = _re.compile(r"//!tex\s+scale\s*:\s*(safe|never)\b")
 
 
 def scale_pragma(source: str):
     """Return `"safe"`, `"never"`, or `None` (no override) from a LEADING `//!tex scale: …`
     comment — the author's override of the conservative scale-safety classifier, in either
-    direction (AUTHOR DECISION, SCALE-47b). Same header-only recognition rule as
-    `language_pragma`: a pragma after real code or inside a block comment does not count."""
-    for raw in (source or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        m = _SCALE_PRAGMA_RE.match(line)
-        if m:
-            return m.group(1)
-        if line.startswith("//"):
-            continue
-        break
-    return None
+    direction (AUTHOR DECISION, SCALE-47b). Header-only, like `language_pragma`, but a
+    LEADING `/* ... */` block comment does NOT end the header run here (FIX-SCALE S5): only
+    real code does. `never` WINS when both directions appear in the header (documented,
+    rather than "whichever line comes first" silently deciding) — the conservative,
+    fail-closed direction takes precedence over the author's own optimistic override,
+    mirroring the classifier's own posture of erring toward refusal."""
+    verdict = None
+    for m in _header_pragma_matches(source, _SCALE_PRAGMA_RE, skip_block_comments=True):
+        value = m.group(1)
+        if value == "never":
+            return "never"
+        verdict = verdict or value
+    return verdict
 
 
 class ParseError(Exception):

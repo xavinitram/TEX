@@ -96,7 +96,7 @@ reason: **everything that matters is keyed on token value, not on AST shape.**
   the postfix forms are gated on `BindingRef` — and under (a) `@src.N` *is* a `BindingRef`.
   Today `@src.N(u,v)` is a parse-time **E2002** ("This value can't be called like a function…
   Only function names and @bindings can be followed by `(...)`", raised inside
-  `Parser.parse_postfix`, `parser.py:843-850`) — because
+  `Parser.parse_postfix`, `parser.py:936-940`) — because
   the dot has already produced a `ChannelAccess`, which is not callable — and `@src.N[x,y]`
   parses as `ArrayIndexAccess` and dies in the TypeChecker. Both are unreachable as plane
   sugar under (b), and both fall out for free under (a).

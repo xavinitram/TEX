@@ -61,7 +61,7 @@ CHANGELOG with a migration and, where possible, an error that names the fix.
 program may declare its own verdict on the engine's resolution-scale feature (an
 embedding-host mechanism; see `docs/resolution-scale.md`) with a leading comment, parsed
 the same way as `//!tex X.Y` above (an ordinary comment; it never becomes a token; only a
-LEADING occurrence, in the header run of blank/`//`-comment lines, counts):
+LEADING occurrence counts):
 
 ```tex
 //!tex scale: safe
@@ -77,6 +77,14 @@ independently by its own leading-comment scan). It overrides the engine's own co
 scale-safety classifier (`tex_api.scale_verdict`) in the stated direction: `safe` vouches for
 a program the classifier could not prove safe on its own; `never` forces a program the
 classifier would otherwise accept to always decline a non-1.0 resolution-scale request.
+
+Its header run is NOT identical to the language pragma's: a leading `/* ... */` block
+comment (a common file-header style) is skipped over rather than ending the scan — only real
+code does — so `//!tex scale: never` right after one is still recognized. (The language
+pragma above keeps its own, different posture: a block comment ends ITS header run, avoiding
+a spurious W7004 on the version it would otherwise see as unrecognized.) If a program
+declares both directions in its header, `never` wins, regardless of which line comes first —
+the conservative, fail-closed direction takes precedence over the optimistic one.
 
 Two consequences worth stating outright:
 
