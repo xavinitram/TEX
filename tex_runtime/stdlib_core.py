@@ -941,15 +941,27 @@ def _gauss_blur_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
     Only ever called for `sigma > GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA`; never touches
     the exact path below that (invariant 7 — this is purely additive on the new
     branch).
+
+    A3 (v0.50 Phase C, R1#3): the downsample and the final upsample are each a
+    single, potentially-heavy pass over the full-resolution image (a large `area`
+    reduction, then a bilinear expansion back to it) — CANCEL-44/PACE-47c's own
+    idiom polls BETWEEN passes on every other multi-pass shape in this codebase
+    (`_gauss_blur_bchw`'s two conv passes, `_build_mip_pyramid`'s per-level loop,
+    `_bilateral_detail_transfer_bchw`'s downsample/upsample pair); this function polls
+    the same way, once before the downsample and once before the upsample, so a
+    cancel fired mid-approximation is observed at the same grain those siblings
+    already give, not only after the whole call returns.
     """
     out_h, out_w = img.shape[-2], img.shape[-1]
     factor = 1
     while sigma / factor > GAUSS_BLUR_PYRAMID_QUALITY_CAP:
         factor *= 2
     reduced_h, reduced_w = max(1, round(out_h / factor)), max(1, round(out_w / factor))
+    poll_cook_cancel(heavy=True)
     reduced = torch.nn.functional.interpolate(img, size=(reduced_h, reduced_w), mode='area')
     residual = sigma / factor
     blurred = _gauss_blur_bchw(reduced, residual)
+    poll_cook_cancel(heavy=True)
     return torch.nn.functional.interpolate(
         blurred, size=(out_h, out_w), mode='bilinear', align_corners=False,
     )

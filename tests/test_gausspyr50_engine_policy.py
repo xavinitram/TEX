@@ -217,3 +217,52 @@ def test_gausspyr50_codegen_parity_both_paths(r: SubTestResult):
     ]
     for name, code in cases:
         assert_equiv(r, f"gausspyr50 {name}", code, {"A": img}, B=1, H=4, W=4)
+
+
+# ── A3 (v0.50 Phase C, R1#3): the pyramid path polls between its own passes ─
+
+def test_gausspyr50_a3_pyramid_polls_between_passes(r: SubTestResult):
+    print("\n--- A3: gauss_blur's pyramid path (sigma past threshold) polls for cancel "
+          "between its downsample/blur/upsample passes, not only at cook boundaries ---")
+    from TEX_Wrangle import tex_engine
+    from TEX_Wrangle.tex_runtime.host import CookCancelled
+
+    class _NeverToken:
+        def __init__(self):
+            self.calls = 0
+
+        def check(self):
+            self.calls += 1
+
+    class _TripToken:
+        def __init__(self, n):
+            self.n = n
+            self.calls = 0
+
+        def check(self):
+            self.calls += 1
+            if self.calls >= self.n:
+                raise CookCancelled("test: tripped")
+
+    code = f"@OUT = gauss_blur(@A, {THRESHOLD + 50.0});"
+    img = make_img(1, 32, 32, 4, seed=31)
+
+    never = _NeverToken()
+    tex_engine.cook(code, {"A": img.clone()}, device_mode="cpu", cancel=never)
+    total = never.calls
+    # Below this fix, the pyramid path made zero internal poll calls of its own (only
+    # `_gauss_blur_bchw`'s single between-conv-passes poll, itself only reached once,
+    # at the tiny residual sigma) -- expect strictly more now that the pyramid's own
+    # two new poll sites are live.
+    if total < 4:
+        r.fail("gausspyr50 a3 poll count", f"only {total} polls -- expected the pyramid's "
+               "own two new poll sites plus the residual blur's own between-pass poll")
+        return
+    r.ok(f"{total} total polls for one pyramid-path gauss_blur cook")
+
+    tok = _TripToken(total)
+    try:
+        tex_engine.cook(code, {"A": img.clone()}, device_mode="cpu", cancel=tok)
+        r.fail("gausspyr50 a3 mid-pyramid cancel", "did not raise on the last recorded poll")
+    except CookCancelled:
+        r.ok("a cancel fired mid-pyramid raises CookCancelled cleanly")
