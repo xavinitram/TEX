@@ -266,10 +266,12 @@ _COST_TABLE_MAX = 512
 #: thread-local, lock-free bookkeeping.
 _COST_TABLE: "_OrderedDict[tuple, list]" = _OrderedDict()
 
-#: Guards `_COST_TABLE` only. A plain `Lock`: every critical section here is a handful of
-#: dict operations (mirrors `profile.py`'s own `_LOCK` reasoning), and this lock is never
+#: Guards `_COST_TABLE`'s own STRUCTURAL mutations (`_cost_feed`'s `popitem`/insertion/
+#: `move_to_end`) only. A plain `Lock`: every critical section here is a handful of dict
+#: operations (mirrors `profile.py`'s own `_LOCK` reasoning), and this lock is never
 #: acquired while any OTHER lock in this tree is held, so there is no ordering cycle to
-#: deadlock on.
+#: deadlock on. FIX-PACE49 P4: the READ side (`_cost_lookup`, on the already-economized
+#: paced skip path) deliberately does NOT take this lock -- see its own docstring.
 _COST_LOCK = _threading.Lock()
 
 
@@ -331,13 +333,29 @@ def _cost_lookup(key: tuple, anchor=None):
     FIX-PACE49 P2: `anchor` is checked by identity against the entry's own stored anchor
     (see `_cost_feed`'s docstring) -- a mismatch (an aliased `id()`-derived key whose entry
     was fed by a DIFFERENT, since-freed object) reads back as `None`, never the stranger's
-    stale estimate."""
-    with _COST_LOCK:
-        entry = _COST_TABLE.get(key)
-        if entry is None or entry[2] is not anchor:
-            return None
-        _COST_TABLE.move_to_end(key)
-        return entry[0], entry[1]
+    stale estimate.
+
+    FIX-PACE49 P4 (R3-efficiency.md #4): deliberately LOCK-FREE -- this is the
+    already-economized "device caught up" SKIP path (`_pace49_cost_gate`'s own caller in
+    `paced_check`), the exact path PACE-47b's own P3 fix (v0.47) measured and removed a
+    lock/eager-resolution cost from ("~50-75% of the paced skip path's own per-poll
+    regression"); PACE-49 must not put a lock back onto it (measured: +145%, 105.2 ns/call
+    locked vs. 43.0 ns/call unlocked). A dict `.get()` plus two list-index reads is safe to
+    run WITHOUT `_COST_LOCK` under the GIL: no single Python attribute/item read can
+    observe a torn write (`_cost_feed`'s own mutations -- `entry[1] += 1`/`entry[0] = ...`
+    -- are each a separate, atomic single assignment), so the worst a concurrent writer can
+    hand this read is last cook's `(ewma_ms, samples)` OR the freshest one, never a
+    corrupted mix of unrelated fields -- the identical safety argument `paced_check`'s own
+    `last_confirmed_done` identity cache already relies on for ITS lock-free read. Skips
+    the LRU `move_to_end` touch this function used to do on every hit -- an eviction-order
+    nicety, not a correctness requirement, and doing it here would need the very lock this
+    fix removes; `_cost_feed` (the write side, still locked for its OWN structural
+    mutations -- `popitem`/insertion) already touches order on every real record, which is
+    the operation that actually matters for keeping a warm call site's entry alive."""
+    entry = _COST_TABLE.get(key)
+    if entry is None or entry[2] is not anchor:
+        return None
+    return entry[0], entry[1]
 
 
 def _resolve_budget_ms(token) -> float:
