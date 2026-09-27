@@ -173,14 +173,36 @@ def _persist_path() -> str | None:
 
 
 def _version_tag() -> str:
+    """HOUSE-50/H2 (TRK-225): `is_available()` ALONE used to gate the `get_device_name`
+    branch. Several tests in this suite monkeypatch `torch.cuda.is_available` (never
+    `device_count`) to exercise a CUDA-shaped code path on a CPU-only box, restoring it in
+    a `finally` — but `is_available` is a plain module attribute, not thread-local, so a
+    reader on another thread sees the patched value for as long as it is set. Trusting it
+    alone here made a leaked `is_available() == True` walk into `current_device()` with
+    ZERO real devices present, which raises and is swallowed by the `except` below into the
+    tag `"0"` — a DIFFERENT tag than any unpatched reader (a fresh child process, most
+    concretely `test_v031_recovery.py`'s `test_v031_eng13_kill_the_process`) computes on the
+    same box ("cpu_<torch-version>"), which makes `warm_state.load()`'s own version-tag
+    check reject a real, freshly-written verdict as foreign and adopt nothing. This is a
+    CONFIRMED, reproducible mechanism for TRK-225's own symptom ("lost the verdict;
+    memo={}") — patching only `torch.cuda.is_available` before calling `warm_state.load()`
+    reproduces it exactly, byte-for-byte, on this CPU-only box (see the regression test
+    beside `test_cache3_version_tag_guard` in `tests/test_v025_phase1.py`) — not a proof
+    that this is the only channel the suite's own reported flake ever takes, since no run
+    of the real full suite was caught in the act with this exact leak live, but a real,
+    closed gap either way. `device_count() > 0` corroborates a bare `is_available()` against
+    the one thing a
+    same-process leak of `is_available` alone does not also fake, so this reads "cpu"
+    exactly as an unpatched process would, closing that channel without weakening the
+    real-GPU case (where both agree)."""
     try:
         import torch
+        has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
         # Name the device the probe ACTUALLY measured on — _probe uses an index-less
         # torch.device("cuda"), which resolves to current_device(), not necessarily 0.
         # On a multi-GPU box, tagging with device 0 would let a model measured on GPU 1
         # be loaded for GPU 0 (or vice versa) when the names happen to match.
-        name = (torch.cuda.get_device_name(torch.cuda.current_device())
-                if torch.cuda.is_available() else "cpu")
+        name = torch.cuda.get_device_name(torch.cuda.current_device()) if has_cuda else "cpu"
         return f"{name}_{torch.__version__.split('+')[0]}"
     except Exception:
         return "0"

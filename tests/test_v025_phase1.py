@@ -461,6 +461,51 @@ def test_cache3_version_tag_guard(r: SubTestResult):
         graphed._capturable_memo.pop("fp_alien", None)
 
 
+def test_house50_h2_version_tag_survives_an_is_available_leak(r: SubTestResult):
+    """HOUSE-50/H2 (TRK-225): a leaked `torch.cuda.is_available` patch (several tests in
+    this suite set it to a lambda and restore it in a `finally`, e.g.
+    `test_prewarm481_gil_bound.py`) must not make a SAME-box, freshly-written verdict read
+    as foreign. Before the `xfer._version_tag` fix, `is_available()==True` with zero real
+    devices walked into `current_device()`, which raised and fell back to tag `"0"` --
+    different from the real "cpu_<torch-version>" tag an unpolluted reader (a fresh child
+    process, `test_v031_recovery.py`'s own `test_v031_eng13_kill_the_process`) computes on
+    the identical box, so `warm_state.load()`'s version check silently rejected the
+    verdict. This is the confirmed mechanism behind TRK-225's reported "lost the verdict;
+    memo={}" -- reproduced here directly against `xfer._version_tag`/`warm_state`, not
+    against a full-suite run, so it is a real, closed channel rather than a re-run of the
+    original (still only intermittently reproducible) flake."""
+    print("\n--- HOUSE-50/H2: a leaked torch.cuda.is_available() patch cannot orphan a "
+          "same-box verdict ---")
+    from TEX_Wrangle.tex_runtime import warm_state, graphed
+    real_is_available = torch.cuda.is_available
+    try:
+        p = warm_state._path()
+        assert p is not None
+        warm_state._reset_for_test()
+        true_tag = warm_state._tag()   # this box's REAL tag, computed unpolluted
+        import json as _json
+        with open(p, "w", encoding="utf-8") as f:
+            _json.dump({"version": true_tag, "capturable": {"fp_leak_probe": [True, 42]},
+                        "backend": {}, "compile_blacklist": []}, f)
+        warm_state._reset_for_test()   # drop the memoized tag so load() recomputes it
+        graphed._capturable_memo.pop("fp_leak_probe", None)
+
+        torch.cuda.is_available = lambda: True   # the leak this ask reproduces
+        warm_state.load()
+
+        assert graphed._capturable_memo.get("fp_leak_probe") == (True, 42), \
+            f"a same-box verdict was lost under a leaked is_available() patch: " \
+            f"memo={dict(graphed._capturable_memo)}"
+        r.ok("a same-box verdict survives load() even while is_available() is leaked True "
+             "(device_count() corroborates and this box has none)")
+    except Exception as e:
+        r.fail("HOUSE-50/H2 is_available leak", f"{type(e).__name__}: {e}")
+    finally:
+        torch.cuda.is_available = real_is_available
+        graphed._capturable_memo.pop("fp_leak_probe", None)
+        warm_state._reset_for_test()
+
+
 def test_cache3_prewarm(r: SubTestResult):
     print("\n--- CACHE-3: prewarm materializes codegen + seeds capturability ---")
     from TEX_Wrangle import tex_api
