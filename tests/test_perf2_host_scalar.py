@@ -39,6 +39,7 @@ from helpers import *
 
 from failure_harness import run_tier
 from TEX_Wrangle.tex_runtime import interpreter as _interp
+from TEX_Wrangle.tex_runtime import interpreter_values as _interp_values
 from TEX_Wrangle.tex_runtime import stdlib as _stdlib
 from TEX_Wrangle.tex_runtime import stdlib_core as _stdlib_core
 from TEX_Wrangle.tex_runtime import stdlib_registry as _registry
@@ -506,9 +507,12 @@ def test_trk68_array_index_and_loop_bound_cost_no_readback(r: SubTestResult):
     absolute-zero probe built on one would pass vacuously) via a small loop that itself
     costs a few unrelated device reads. The one this row is about is the DIFFERENCE
     `_host_scalar` being disabled makes, which must be a real, positive reduction —
-    interpreter.py imported `_host_scalar` BY NAME (same reason
-    `test_perf2_the_tag_carries_the_rounded_value` patches `_interp._tag_host_scalar`
-    rather than `_stdlib`'s copy of it), so the patch below targets that binding."""
+    `_host_index`/`_int_valued_scalar` now live in `interpreter_values.py` (a later split
+    moved them out of `interpreter.py`), which imports its OWN copy of `_host_scalar` by
+    name from `.stdlib` at that module's load time; `interpreter.py` no longer binds the
+    name at all, so the patch below targets `interpreter_values`'s own binding (same
+    reason `test_perf2_the_tag_carries_the_rounded_value` patches `_interp._tag_host_scalar`
+    rather than `_stdlib`'s copy of it)."""
     print("\n--- TRK-68: array index / loop bound $param costs no device readback ---")
     if not torch.cuda.is_available():
         r.skip("TRK-68 device readback",
@@ -540,13 +544,13 @@ def test_trk68_array_index_and_loop_bound_cost_no_readback(r: SubTestResult):
                 compile_and_run(code, extra, device="cuda")
             fixed_reads = fixed_probe.device_reads
 
-            orig = _interp._host_scalar
-            _interp._host_scalar = lambda x: None
+            orig = _interp_values._host_scalar
+            _interp_values._host_scalar = lambda x: None
             try:
                 with _count_all_item_calls() as base_probe:
                     compile_and_run(code, extra, device="cuda")
             finally:
-                _interp._host_scalar = orig
+                _interp_values._host_scalar = orig
             base_reads = base_probe.device_reads
 
             if base_reads <= fixed_reads:
