@@ -54,7 +54,15 @@ def materialize_codegen(blob: bytes, src: str, has_fn_calls: bool,
     # object references `_MF`, so a rematerialized one must find it or the sidecar would
     # be a NameError instead of a cook — and it must be the SAME module object, not a
     # re-import with its own state, which the function-local import here guarantees.
-    namespace: dict[str, Any] = {"_MF": _masked_flow_mod}
+    # SCALE-CG-48: `_SCM` (`_scale_pixel_arg`) is the analogous unconditional-per-call
+    # global — unlike `_CK` (only referenced when `emit_cancel_polls=True`, which this
+    # PC-3 disk-persisted default-route blob never sets, so it needs no entry here), any
+    # persisted program with a `pixel_args=` call references `_SCM` on EVERY call, cancel
+    # or not, so a rematerialized one needs it exactly as it needs `_MF`. Imported from
+    # `.stdlib` (a leaf), never `.codegen`, to keep this module's own "zero `_CodeGen`
+    # reference" contract (this file's own docstring) intact.
+    from .stdlib import _scale_pixel_arg
+    namespace: dict[str, Any] = {"_MF": _masked_flow_mod, "_SCM": _scale_pixel_arg}
     exec(code_obj, namespace)
     fn = namespace["_tex_fn"]
     fn._has_fn_calls = has_fn_calls

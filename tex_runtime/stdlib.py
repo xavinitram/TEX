@@ -63,6 +63,7 @@ from .stdlib_core import (  # noqa: F401
     _dtype_rounded,
     _tag_host_scalar,
     _host_scalar,
+    _scale_pixel_arg,
     _scalar_from_tensor,
     _get_bchw,
     _grid_sample_f32,

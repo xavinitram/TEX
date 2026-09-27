@@ -47,6 +47,7 @@ from .interpreter import (MAX_CALL_DEPTH, MAX_LOOP_ITERATIONS, _BUILTIN_NAMES,
 from . import masked_flow as _masked_flow_mod
 from .stdlib import (SAFE_EPSILON, _lerp_f32, _to_tensor,
                      _HOST_SCALAR_ATTR, _dtype_rounded, _tag_host_scalar,
+                     _scale_pixel_arg,   # SCALE-CG-48: seeded as `_SCM`, `build()` below
                      set_cook_grid as _stdlib_set_cook_grid,
                      restore_cook_ctx as _stdlib_restore_cook_ctx,  # P0-D: cook grid
                      poll_cook_cancel as _stdlib_poll_cancel)  # CANCEL-44: Gap 2 in-body poll
@@ -599,6 +600,22 @@ _SPATIAL_BUILTINS: frozenset[str] = frozenset(("u", "v", "ix", "iy", "fi"))
 # constant before the cluster-2 split removes the stencil/core coupling on it.
 from .stdlib_registry import spatial_names as _spatial_names
 _SPATIAL_STDLIB: frozenset[str] = _spatial_names()
+
+# SCALE-CG-48: {name: pixel_args} for every `pixel_args=`-tagged stdlib builtin
+# (today gauss_blur/erode/dilate/bilateral_filter), single-sourced from the REG-1
+# registry exactly like `_SPATIAL_STDLIB` above — same import-time-safe pattern,
+# same reason (the registry is fully populated by the time this module finishes
+# its own `from .stdlib import (...)` above, which pulls in every stdlib_*.py).
+from .stdlib_registry import pixel_args_by_name as _pixel_args_by_name
+_PIXEL_ARGS_STDLIB: dict = _pixel_args_by_name()
+
+# SCALE-CG-48: `_scale_pixel_arg` itself lives in `stdlib_core.py` (re-exported via
+# `.stdlib`, imported above as `_scale_pixel_arg`), NOT here — `codegen_persist.py`'s
+# `materialize_codegen` also needs to seed it into a rematerialized `.cg` sidecar's
+# namespace, and that module's own docstring requires "zero `_CodeGen` reference" to
+# stay a strict leaf. A leaf both modules can import from is the only shape that keeps
+# both `build()` (live compile) and `materialize_codegen` (persisted rematerialization)
+# seeding the exact SAME callable.
 
 
 # Shared memoized AST child-iterator lives in ast_nodes (CG-1); alias kept for
@@ -1186,7 +1203,14 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # the invariant-7 digest). Seeding costs one dict-store per BUILD and is dead
         # weight for every program `_cancel_polls_on` did not tell `emit_program` to poll
         # in — no byte of THEIR emitted source changed.
-        namespace: dict[str, Any] = {"_MF": _masked_flow_mod, "_CK": _stdlib_poll_cancel}
+        # SCALE-CG-48: `_SCM` (`_scale_pixel_arg`) is seeded the same way `_MF`/`_CK`
+        # are — a GLOBAL of the generated module, never a parameter (the `_tex_fn`
+        # signature is pinned by the invariant-7 digest acceptance). Only a program
+        # with a `pixel_args=` call ever emits a reference to it; every other program
+        # pays one unused dict-store per build, the same cost class `_MF`/`_CK` already
+        # pay for every program that doesn't mask or poll-cancel.
+        namespace: dict[str, Any] = {"_MF": _masked_flow_mod, "_CK": _stdlib_poll_cancel,
+                                     "_SCM": _scale_pixel_arg}
         code_obj = compile(func_src, filename, "exec")
         _register_codegen_linecache(filename, func_src)
         exec(code_obj, namespace)
@@ -3256,6 +3280,33 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
             depth_arg = ", _depth=_depth+1" if self._in_user_function else ""
             self._emit(f"{tmp} = _uf_{name}({args_str}{depth_arg})")
             return tmp
+
+        # SCALE-CG-48: a `pixel_args=`-tagged builtin's pixel-unit argument(s) are
+        # multiplied by the cook's resolution-scale multiplier as a RUNTIME VALUE at
+        # the call site -- a variable reference (`_env['__tex_scale']`), never a
+        # folded literal, exactly as SCALE-47a's own interpreter-tier multiply
+        # (`Interpreter._call_stdlib`, `a1 = a1 * _s`) is a runtime multiply and not
+        # an AST fold. This is why the SAME emitted text (and therefore the SAME
+        # cached codegen fn, keyed only by the program fingerprint -- `scale` is
+        # deliberately not a fingerprint input, see `tex_cache._CODEGEN_EPOCH`'s own
+        # docstring) serves every scale value without recompiling.
+        # `_build_codegen_env` always sets `_env['__tex_scale']` to 1.0 for a
+        # `scale=None` cook (the exact-identity multiply SCALE-47b's own doc names
+        # for `scale=1.0`), so a program with no `pixel_args=` call emits nothing new
+        # here at all -- byte-identical (invariant #7); a program that DOES call one
+        # of these four builtins gains the multiply unconditionally, regardless of
+        # whether THIS particular cook is scale-active, because the emitted text is
+        # fixed per fingerprint and cannot vary by a value the fingerprint excludes.
+        # Routed through `_SCM` (`_scale_pixel_arg`, a GLOBAL of the generated module,
+        # never a plain `*`) so a hoisted literal's PERF-2 host-scalar tag survives a
+        # `scale=1.0` cook UNCHANGED (same object) and is correctly re-derived for a
+        # genuine scale value -- a bare multiply silently drops that tag and forces a
+        # device readback `fn_gauss_blur`'s own sigma resolution does not expect.
+        _pixel_arg_idxs = _PIXEL_ARGS_STDLIB.get(name)
+        if _pixel_arg_idxs:
+            for _pai in _pixel_arg_idxs:
+                if _pai < len(args):
+                    args[_pai] = f"_SCM({args[_pai]}, _env['__tex_scale'])"
 
         # Scalar loop mode: use Python math module instead of torch
         if self._scalar_loop:

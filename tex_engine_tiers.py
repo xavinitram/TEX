@@ -392,19 +392,44 @@ def _run_tier(ctx, tier_id):
     output dict. Single home for the `tier method -> {name: tensor}` idiom used by
     both run() and the C2 re-cook path (reuse review).
 
-    SCALE-47b: a scale-active cook (`ctx.scale is not None`) is routed to the plain
-    interpreter UNCONDITIONALLY, ahead of `tier_id` — bypassing every accelerated route
-    (`torch_compile`/`auto`/`cuda_graph`) AND the "default" tier's OWN internal codegen/
-    stencil/tiling shortcuts (`_run_default`'s UC-2 stencil route, M-4 tiling, ROI-5 halo
-    tiling). None of those currently thread a runtime scale multiplier through their emitted
-    or captured code, so teaching each one to decline individually would be the same
-    decision made N times; one guard here, at the single dispatch choke point, makes it
-    impossible for any of them to run instead. Recorded via `tier_trace`, exactly like every
-    other tier decline, so this is never a silent fallback (`tier_trace.last().tier ==
-    "interpreter"`, reason names scale). `ctx.scale is None` (every ComfyUI cook) never
-    reaches this branch at all — one `is not None` check, no behaviour change."""
+    SCALE-47b/SCALE-CG-48: a scale-active cook (`ctx.scale is not None`) never reaches
+    `torch_compile`/`auto`/`cuda_graph` — those tiers do not thread a runtime scale
+    multiplier through their COMPILED/CAPTURED code at all (SCALE-COMPILED-48, deferred
+    past v0.48; `docs/resolution-scale.md`), so a scale-active cook whose `tier_id` names
+    one of them still forces the plain interpreter, unchanged from SCALE-47b.
+
+    What changed (SCALE-CG-48): when `tier_id == "default"`, this no longer forces the
+    interpreter unconditionally. The "default" tier's OWN internal codegen shortcut
+    (`_run_default`'s UC-2 stencil route, `_should_stencil_route`) now ALSO threads
+    `scale` through `_codegen_only_execute` — codegen's `pixel_args=`-tagged call sites
+    now emit `arg * _env['__tex_scale']` (`tex_runtime/codegen.py`), a runtime value, not
+    a folded literal, so the codegen route is scale-safe. This is "route to codegen when
+    the codegen tier would otherwise be chosen": `_should_stencil_route` is the ONLY
+    concrete "would codegen run here" test the default tier has today (ROI-codegen is a
+    separate, still-flagged-off lane — TIERQ-48/ROI-CG-48 — deliberately untouched here).
+    `_codegen_only_execute` self-falls-back to the interpreter (forwarding `scale`) on any
+    decline/failure, so this can never hard-fail or silently drop scale. M-4/ROI-5 tiling
+    and ROI narrowing stay OUT of scope exactly as before — a scale-active cook still
+    cooks whole-frame (SCALE-47b's own documented "declines the ROI window" posture,
+    unchanged: this branch never threads `ctx.roi`, matching what the unconditional
+    interpreter branch below already did before this ask).
+
+    Recorded via `tier_trace` on every path (`_codegen_only_execute` records "codegen" on
+    success, "interpreter" fallback_from="codegen" on decline; the branch below records
+    "interpreter" fallback_from=tier_id exactly as before) — never a silent fallback.
+    `ctx.scale is None` (every ComfyUI cook) never reaches this function's body at all —
+    one `is not None` check, no behaviour change on the default (`scale=None`) path."""
     if ctx.scale is not None:
         from .tex_runtime import tier_trace
+        if (tier_id == "default" and not ctx.fused_chain
+                and _tex_engine._should_stencil_route(ctx.fp, ctx.program)):
+            out = _tex_engine._codegen_only_execute(
+                ctx.program, ctx.bindings, ctx.type_map, ctx.device,
+                latent_channel_count=ctx.latent_channel_count,
+                output_names=ctx.output_names, used_builtins=ctx.used_builtins,
+                precision=ctx.eff_precision, fingerprint=ctx.fp,
+                time_context=ctx.time_context, cancel=ctx.cancel, scale=ctx.scale)
+            return out if isinstance(out, dict) else {ctx.output_names[0]: out}
         tier_trace.record("interpreter", fallback_from=tier_id,
                           reason="scale is active (SCALE-47b runs on the interpreter tier only)")
         interp = _tex_engine._get_interpreter()

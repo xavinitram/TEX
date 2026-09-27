@@ -138,6 +138,46 @@ def _host_scalar(x):
     return None
 
 
+def _scale_pixel_arg(value, scale):
+    """SCALE-CG-48: the runtime multiply behind every codegen-emitted `pixel_args=`-tagged
+    argument (`_CodeGen._emit_function_call`, `tex_runtime/codegen.py`), and the ONLY
+    global it needs beyond `_MF`/`_CK` — kept HERE (a leaf both `codegen.py` and
+    `codegen_persist.py` can import) rather than in `codegen.py` itself, because
+    `codegen_persist.py`'s own module docstring requires "zero `_CodeGen` reference" to
+    stay a strict leaf, and a persisted `.cg` sidecar's rematerialized namespace
+    (`materialize_codegen`) needs this name seeded exactly as `build()` seeds it live.
+
+    `scale == 1.0` (every `scale=None` cook, via `_build_codegen_env`'s own default of
+    1.0, and every literal `scale=1.0` cook — SCALE-47b's own documented exact-identity
+    case) returns `value` UNCHANGED: the SAME object, not merely an equal one. This is
+    more than a values match — a hoisted `NumberLiteral` constant (`_CodeGen._get_const`)
+    may carry a PERF-2 host-scalar tag (`_tag_host_scalar`, stamped once in a build's
+    preamble when the program calls a host-scalar-reading builtin like `gauss_blur`) that
+    a FRESH `value * scale` tensor would not inherit, forcing a real device round-trip
+    (`.item()`) on every later `_host_scalar()` read downstream (`fn_gauss_blur`'s own
+    sigma resolution) — measured as a PERF-2 regression on the CUDA/codegen route before
+    this early-return existed. Passing the identical object through means that tag (or
+    the total ABSENCE of one, for a genuinely device-computed value) survives untouched,
+    at whatever cost the ordinary `scale=None` path already pays — not a new cost this
+    ask introduces.
+
+    A genuine scale value (`scale != 1.0`) performs the multiply and, when `value` itself
+    carried a host reading (a literal or `$param`, never a value truly computed on the
+    device), re-tags the PRODUCT with that reading times `scale` — so a scale-active cook
+    of a literal-sigma program pays the SAME zero-readback cost the `scale=None` path
+    already does. A value with no host reading (`_host_scalar` returns `None`) is left
+    untagged, exactly the "only a genuinely device-computed value reads back" contract
+    `_host_scalar`'s own docstring already states."""
+    if scale == 1.0:
+        return value
+    out = value * scale
+    if out.__class__ is torch.Tensor:
+        hv = _host_scalar(value)
+        if hv is not None:
+            _tag_host_scalar(out, hv * scale)
+    return out
+
+
 def _host_int(x) -> int:
     """`int(x.item())` for a size/index/count argument, taking the host reading when `x`
     carries one (TRK-67) — the string/array family's own callers of `_host_scalar`. Every

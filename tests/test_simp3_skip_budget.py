@@ -191,7 +191,14 @@ _SKIP_VOCAB = re.compile(
 #: (`test_lint1_no_local_only_path_refs.py::test_lint1_g5_no_new_bare_word_leak`) needs a
 #: real git checkout to enumerate the tracked set (`tracked_paths()`), the same reason its
 #: sibling row two lines above it already carries an identical `r.skip` and no CPU witness.
-_SKIP_BUDGET = 120
+#: Re-pinned from 120 to 123 (SCALE-CG-48): three CUDA-parity rows in
+#: `test_scalecg48_codegen_scale.py` (`test_scalecg48_codegen_interp_parity_cuda_half`/
+#: `_quarter`/`_eighth`) each need a real CUDA device to compare the new codegen-tier scale
+#: route against the interpreter at ½/¼/⅛ — the CPU legs of the same comparison
+#: (`test_scalecg48_codegen_interp_parity_cpu_half`/`_quarter`/`_eighth`) already run with no
+#: `r.skip` and no environment dependency, so these three carry no CPU witness for the same
+#: reason every other CUDA-only row in this pin does not have one.
+_SKIP_BUDGET = 123
 
 
 def _literal(node) -> str:

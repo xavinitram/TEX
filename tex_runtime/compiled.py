@@ -781,7 +781,8 @@ def _params_on_device(cg_fn, program, bindings: dict, device: "torch.device") ->
 
 
 def _codegen_with_params_on_device(cg_fn, program, bindings: dict, dev, latent_channel_count,
-                                   used_builtins, precision, roi, stdlib_fns):
+                                   used_builtins, precision, roi, stdlib_fns, *,
+                                   scale: float | None = None):
     """An opt-in route's one-time placement decision, taken when a generated function's call
     has just raised on a non-CPU device (see `_codegen_only_execute`).
 
@@ -809,7 +810,8 @@ def _codegen_with_params_on_device(cg_fn, program, bindings: dict, dev, latent_c
     retry_bindings.update(placed)
     ingest_event = _record_ingest_event(bindings, dev)
     env, sp, _ = _build_codegen_env(program, retry_bindings, dev, latent_channel_count,
-                                    used_builtins=used_builtins, precision=precision, roi=roi)
+                                    used_builtins=used_builtins, precision=precision, roi=roi,
+                                    scale=scale)
     try:
         with torch.inference_mode():
             _invoke_cg(cg_fn, env, retry_bindings, stdlib_fns, dev, sp,
@@ -1108,6 +1110,7 @@ def _plain_execute(
     *,
     time_context: dict | None,
     roi: tuple[int, int, int, int, int, int] | None = None,
+    scale: float | None = None,
 ) -> torch.Tensor | dict:
     """Execute without torch.compile (standard tree-walking interpreter). Reuses ONE
     persistent interpreter (C6) so its coordinate-builtin LRU (LAT-4) actually persists
@@ -1137,7 +1140,13 @@ def _plain_execute(
     Requiring it moves the failure to the call, where it is a TypeError naming the
     parameter. v0.22 shipped a route (execute_compiled's deep-loop branch) that omitted
     it, past a suite that already had SEVEN routes pinned; pass `time_context=None`
-    explicitly to mean "no playhead"."""
+    explicitly to mean "no playhead".
+
+    `scale` (SCALE-CG-48) MUST be forwarded for the identical reason: this is where a
+    scale-active cook lands when codegen declines or fails (`_codegen_only_execute`'s
+    own fallback), and an omitted forward would silently cook UNSCALED here — a wrong
+    picture, not an error, exactly the `time_context` failure class this docstring
+    already names. `None` (every caller before this ask) is inert."""
     return _get_plain_interp().execute(
         program, bindings, type_map, device=device,
         latent_channel_count=latent_channel_count, output_names=output_names,
@@ -1146,7 +1155,7 @@ def _plain_execute(
         # and without the window the interpreter would derive coordinates from the narrowed
         # tensor's own shape (wrong pixels, silently). Same class of forgotten-forward bug as
         # `time_context` above, and the same reason it is spelled out here.
-        roi=roi)
+        roi=roi, scale=scale)
 
 
 # ENG-9: the persistent fallback interpreter is PER-THREAD, like the engine's cook
@@ -1197,6 +1206,7 @@ def _build_codegen_env(
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
     roi: tuple[int, int, int, int, int, int] | None = None,
+    scale: float | None = None,
 ) -> tuple[dict, tuple | None, set[str]]:
     """Build the environment dict and spatial shape for codegen execution.
 
@@ -1305,6 +1315,21 @@ def _build_codegen_env(
     # reads them (codegen.try_compile -> _Unsupported), so this env never needs to carry
     # a playhead. See the note in codegen for why; the short version is that both this
     # module's cached executor closure and _env_cached would freeze the value.
+
+    # SCALE-CG-48: `__tex_scale` is a plain Python float (never a tensor -- it only ever
+    # multiplies a `pixel_args=`-tagged SCALAR argument, the same class `frame`/`time`
+    # style 0-dim tensors do not need to be, and a raw float keeps the multiply routed
+    # through the exact same Python-float arithmetic the interpreter's own
+    # `Interpreter._call_stdlib` (`a1 = a1 * _s`, `self._scale: float`) already does --
+    # required for invariant #2 bit-parity). Set UNCONDITIONALLY (not gated on `used`,
+    # unlike PI/TAU/E): a program's *call sites*, not its *identifiers*, decide whether
+    # this is read, and `_collect_identifiers` does not walk function-call names. Costs
+    # one dict store on a route already far off the hot (interpreter, scale=None)
+    # default path. `scale is None` (every UC-2 stencil-route cook before this ask, and
+    # every codegen cook of a program with no `pixel_args=` call) reads back exactly
+    # 1.0 -- SCALE-47b's own documented exact-identity case for `scale=1.0` -- so this
+    # never changes a single existing codegen cook's VALUE, only a scale-active cook's.
+    env["__tex_scale"] = float(scale) if scale is not None else 1.0
     return env, sp, used
 
 
@@ -1323,6 +1348,7 @@ def _codegen_only_execute(
     roi: tuple[int, int, int, int, int, int] | None = None,
     place_params: bool = False,
     cancel: Any = None,
+    scale: float | None = None,
 ) -> torch.Tensor | dict:
     """Execute via codegen flat function WITHOUT torch.compile.
 
@@ -1392,7 +1418,7 @@ def _codegen_only_execute(
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision,
-                              time_context=time_context, roi=roi)
+                              time_context=time_context, roi=roi, scale=scale)
 
     dev = _canon_device(device)
     # The placement verdict recorded on this generated function: None until one of its calls
@@ -1408,7 +1434,8 @@ def _codegen_only_execute(
     ingest_event = _record_ingest_event(bindings, dev)
 
     env, sp, _ = _build_codegen_env(program, contiguous_bindings, dev, latent_channel_count,
-                                    used_builtins=used_builtins, precision=precision, roi=roi)
+                                    used_builtins=used_builtins, precision=precision, roi=roi,
+                                    scale=scale)
     stdlib_fns = TEXStdlib.get_functions()
 
     try:
@@ -1421,7 +1448,7 @@ def _codegen_only_execute(
     except Exception as e:
         served = (_codegen_with_params_on_device(cg_fn, program, bindings, dev,
                                                  latent_channel_count, used_builtins,
-                                                 precision, roi, stdlib_fns)
+                                                 precision, roi, stdlib_fns, scale=scale)
                   if placing is None else None)
         if served is None:
             _show_once(
@@ -1434,7 +1461,7 @@ def _codegen_only_execute(
                                   latent_channel_count, output_names,
                                   used_builtins=used_builtins, precision=precision,
                                   time_context=time_context,
-                                  roi=roi)   # ROI-3: see _plain_execute
+                                  roi=roi, scale=scale)   # ROI-3: see _plain_execute
         contiguous_bindings, ingest_event = served
 
     tier_trace.record("codegen")
