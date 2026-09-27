@@ -1,9 +1,9 @@
-"""FIX-PACE49 P4 (R3-efficiency.md #4) -- `_pace49_cost_gate` runs `_cost_lookup` (which
+"""FIX-PACE49 P4 -- `_pace49_cost_gate` runs `_cost_lookup` (which
 acquires `_COST_LOCK`) on *every* poll that reaches the already-economized "device caught
 up" skip path once a call site is warm. This is exactly the skip path PACE-47b's own P3 fix
 (v0.47) measured and removed a lock/eager-resolution cost from ("~50-75% of the paced skip
-path's own per-poll regression"); PACE-49 put a lock back onto it. Measured
-(R3-efficiency.md #4): a locked dict lookup costs 105.2 ns/call vs. 43.0 ns/call unlocked
+path's own per-poll regression"); PACE-49 put a lock back onto it. Measured:
+a locked dict lookup costs 105.2 ns/call vs. 43.0 ns/call unlocked
 (+145%) on this box.
 
 The fix: `_cost_lookup` becomes lock-free by design -- a dict `.get()` plus two list-index

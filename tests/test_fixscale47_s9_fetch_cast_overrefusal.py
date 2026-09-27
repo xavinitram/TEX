@@ -2,7 +2,7 @@
 `fetch(@A, int(ix), int(iy))` is classified unsafe even though it is a benign,
 canvas-relative whole-pixel fetch behind a defensive type cast.
 
-This is NOT a bug fix -- CONSOLIDATED.md's own instruction for this finding is "leave
+This is NOT a bug fix -- the ruling on this finding was "leave
 conservative; document." `_scale_unsafe_walk`'s `in_coord_arg` whitelist flag is set fresh at
 each FunctionCall/BindingIndexAccess node from that node's own identity, never inherited from
 the caller's -- so a defensive `int(...)`/`float(...)` cast around an otherwise-whitelisted

@@ -1,9 +1,9 @@
-"""FIX-PACE49 P1 (R3-efficiency.md #3, CONSOLIDATED.md's own P1) -- an unpaced cook must
+"""FIX-PACE49 P1 -- an unpaced cook must
 never compute `id(stmt)` at all, at any of the interpreter's three per-top-level-statement
 poll call sites (the two loops in `Interpreter._execute_inner` and `_exec_stmts_profiled`).
 
 Before this fix, `call_site_id=id(stmt))  # PACE-49` ran UNCONDITIONALLY on every statement
-dispatch, paced or not -- measured (R3-efficiency.md #3) +12.6 ns/call, 32% relative, on the
+dispatch, paced or not -- measured +12.6 ns/call, 32% relative, on the
 hottest of hot loops, for a value `paced_check` never reads once unpaced (it returns after
 `token.check()` before ever looking at `call_site_id`). `heavy=_heavy_ids is not None and
 id(stmt) in _heavy_ids` already short-circuits `id(stmt)` away when `_heavy_ids is None`

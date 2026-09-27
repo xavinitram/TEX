@@ -1,6 +1,6 @@
-"""FIX-PACE49 P2 (R3-efficiency.md #4, R4-altitude.md #1, B3-pacing.md #3, B4-tests-docs.md
-#4) -- PACE-49's `_COST_TABLE` is keyed by `id(stmt)` alone (`(call_site_id, device_index,
-px_bucket)`), a raw CPython memory address, and OUTLIVES the `Program` it was measured from
+"""FIX-PACE49 P2 -- PACE-49's `_COST_TABLE` is keyed by `id(stmt)` alone (`(call_site_id,
+device_index, px_bucket)`), a raw CPython memory address, and OUTLIVES the `Program` it was
+measured from
 (it is module-global, deliberately unbounded-by-Program-lifetime -- "a call site's own cost,
 once measured on one cook, informs every later cook of the SAME statement"). `tex_cache`'s
 128-entry Program LRU means a freed Program's statement objects can have their addresses
@@ -23,7 +23,7 @@ stored anchor does not `is`-match the caller's anchor is treated exactly like a 
 never-seen key: no stale EWMA is blended in or read back.
 
 This file exercises the mechanism directly and deterministically -- CPython's own allocator
-timing (confirmed allocator/timing-dependent by B3-pacing.md #3: "did not land a collision on
+timing (confirmed by running to be allocator/timing-dependent: "did not land a collision on
 this run") makes a REAL forced id() collision unreliable to assert on in CI; fabricating the
 identical key collision the id-reuse scenario would produce (same numeric `id()`-shaped key,
 two distinct Python objects) proves the identical mechanism without depending on allocator

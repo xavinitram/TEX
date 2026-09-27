@@ -534,7 +534,7 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                 _heavy_ids = _heavy_stmt_ids(stmts) if _pace.is_paced() else None
                 if on_progress is None:
                     for stmt in stmts:
-                        # FIX-PACE49 P1 (R3-efficiency.md #3): `id(stmt)` is resolved ONLY
+                        # FIX-PACE49 P1: `id(stmt)` is resolved ONLY
                         # when `_heavy_ids is not None` -- exactly the same "this cook is
                         # actually paced" gate `heavy` below already short-circuits on.
                         # Before this fix, `id(stmt)` ran unconditionally every statement,

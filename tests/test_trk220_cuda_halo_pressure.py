@@ -1,14 +1,14 @@
 """TRK-220 — the FIX-ROI O1 fp32-fold fix (v0.48.0 Phase C) reaches `tex_tiling.
 _halo_tile_plan`'s memory-pressure tiling path, confirmed on CUDA, not just by reading the CPU-
 only proof `test_fixroi_o1_fp32_branch_fold.py::test_o1_tiling_halo_plan_consumes_the_same_fix`
-already gives (the ROI bug hunt finding 1's own "not confirmed by running" note for this exact path;
-the tracker's TRK-220 row).
+already gives -- that CPU-only proof was itself not confirmed by running on CUDA for this
+exact path (the tracker's TRK-220 row).
 
 THE MECHANISM UNDER TEST. `_halo_tile_plan` (`tex_tiling.py`) is the planner that decides
 whether a CUDA cook of a bounded-halo op (blur/erode/dilate — the class `is_tile_safe` refuses)
 runs in horizontal strips under memory pressure or the TDR time cap; its halo radius comes
-straight from `tex_roi.roi_plan`, the exact call the ROI bug hunt finding 1 showed could silently
-under-report `halo=0` for a uniform (`$param`-only) `IfElse` condition built from an arithmetic
+straight from `tex_roi.roi_plan`, the exact call shown (by running) to silently under-report
+`halo=0` for a uniform (`$param`-only) `IfElse` condition built from an arithmetic
 combination of two or more params, whenever the true value sits within half an fp32 ulp of the
 comparison boundary — the double-precision fold and the runtime's own fp32 tensor evaluation
 then disagree about which arm executes. `_halo_tile_plan` is NOT gated behind `TEX_ROI_EXEC`
@@ -38,8 +38,8 @@ WHAT EACH TEST PROVES:
     the forced-pressure stub (drives `_run_default` into `run_tiled_halo`, confirmed by a call
     spy) and once with no stub at all (real free VRAM, whole-frame) -- and asserts
     `torch.equal` between the two. A wrong (under-sized) halo would show up here as a real pixel
-    divergence at every strip seam, exactly the ROI bug hunt's own measured signature (max diff
-    ~0.15) had the fix not been in place.
+    divergence at every strip seam, exactly the measured signature (max diff ~0.15) had the
+    fix not been in place.
 
 GPU discipline: this file buys no timing and asserts no wall-clock bound (PACE's law: only
 timing needs the bench lease); it still stays off the GPU test unless CUDA is actually free of
@@ -237,7 +237,7 @@ def test_trk220_cuda_end_to_end_tiled_equals_whole_frame(r: SubTestResult):
             mn = (tiled.float() - base.float()).abs().mean().item()
             r.fail("TRK-220 CUDA halo pressure",
                    f"tiled != whole-frame: max diff {md:.4e}, mean diff {mn:.4e} -- this is "
-                   f"exactly the ROI bug hunt's own measured under-halo signature (~0.15 max diff) "
+                   f"exactly the measured under-halo signature (~0.15 max diff) "
                    f"if the fp32-fold fix has regressed on this path")
     except Exception as e:
         r.fail("TRK-220 CUDA halo pressure", f"{type(e).__name__}: {e}")

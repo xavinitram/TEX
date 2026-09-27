@@ -295,7 +295,7 @@ def _cost_feed(key: tuple, ms: float, anchor=None) -> None:
     between two real, completed CUDA events should never produce one, but a mocked or
     exotic event implementation is not this function's contract to trust blindly.
 
-    FIX-PACE49 P2 (R3-efficiency.md #4, R4-altitude.md #1): *anchor*, when the caller has
+    FIX-PACE49 P2 (a freed Program's id() can be reused by tex_cache's LRU): *anchor*, when the caller has
     one, is the actual object *key*'s `id()`-derived component names (the interpreter's own
     `stmt`) -- checked by identity (`is`), the same "a recycled id belongs to a different
     object" guard `pacing_heavy._HEAVY_STMT_MEMO` already uses for the exact same class of
@@ -335,7 +335,7 @@ def _cost_lookup(key: tuple, anchor=None):
     was fed by a DIFFERENT, since-freed object) reads back as `None`, never the stranger's
     stale estimate.
 
-    FIX-PACE49 P4 (R3-efficiency.md #4): deliberately LOCK-FREE -- this is the
+    FIX-PACE49 P4: deliberately LOCK-FREE -- this is the
     already-economized "device caught up" SKIP path (`_pace49_cost_gate`'s own caller in
     `paced_check`), the exact path PACE-47b's own P3 fix (v0.47) measured and removed a
     lock/eager-resolution cost from ("~50-75% of the paced skip path's own per-poll
@@ -771,7 +771,8 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None,
     # resolved eagerly -- the peek itself needs `outstanding` to find the tail.
     pool = _state.pool
 
-    # FIX-PACE49 P5 (B3-pacing.md #4): `pace_budget_ms<=0`'s own docstring
+    # FIX-PACE49 P5 (confirmed by running: the measurement half kept running even at
+    # budget_ms<=0): `pace_budget_ms<=0`'s own docstring
     # (`_resolve_budget_ms`) promises "byte-for-byte pre-PACE-49 economizing" -- but only
     # `_pace49_cost_gate`'s DECISION half honoured `budget_ms<=0` before this fix; the
     # MEASUREMENT half (`_pace49_attribute`/`_cost_feed`, lock included) ran regardless.
@@ -1059,14 +1060,15 @@ def restore_state(snapshot: dict) -> None:
     # window clean costs at most one extra warm-estimate addition on the outer's very next
     # poll, never a wrong (too-permissive) budget decision.
     _state.running_cost_ms = 0.0
-    # FIX-PACE49 P3 (B3-pacing.md #2): the timing anchor (`pool["timed_prev"]`/
+    # FIX-PACE49 P3 (confirmed by running: a nested cook's own reset() overwrites this): the
+    # timing anchor (`pool["timed_prev"]`/
     # `pool["timed_site"]`/`pool["timed_anchor"]`) is exactly the same class of shared,
     # pool-resident state as `last_confirmed_done` above, for the identical reason -- it
     # lives on the SHARED pool dict, not in `_state.__dict__`, so a same-device nested
     # cook's own attribution cycle can have overwritten it with ITS OWN call site's
     # identity before this restore ever runs. Left verbatim, the outer's next real
     # interval would be credited to whatever call site the inner cook happened to leave
-    # behind (confirmed: B3-pacing.md's own repro). Clearing it costs at most one interval
+    # behind (confirmed by running). Clearing it costs at most one interval
     # of lost attribution on the outer's own next confirm (exactly like a fresh `reset()`'s
     # first poll never has a prior anchor either) -- never a wrong credit.
     pool = getattr(_state, "pool", None)

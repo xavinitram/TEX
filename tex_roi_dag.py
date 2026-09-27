@@ -85,7 +85,7 @@ class StageSpec:
     number, the same division of labour `halos[i]` already had. `stage_dag_arg_halos`
     (below) is JOINWIRE-50's answer to that CALLER's job.
 
-    KNOWN LIMIT (Q5): `arg_halo` is keyed by UPSTREAM STAGE INDEX only, one number
+    KNOWN LIMIT: `arg_halo` is keyed by UPSTREAM STAGE INDEX only, one number
     per index. A stage reading the SAME upstream index through TWO argument roles needing
     DIFFERENT margins (e.g. the same plate as both a zero-halo `bg` and a blurred `fg` needing
     one, with no intervening stage) would silently get the SMALLER one, under-serving whichever

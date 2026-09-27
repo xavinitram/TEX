@@ -1,4 +1,4 @@
-"""FIX-PACE49 P3 (B3-pacing.md #2) -- the timing anchor (`pool["timed_prev"]`/
+"""FIX-PACE49 P3 -- the timing anchor (`pool["timed_prev"]`/
 `pool["timed_site"]`/`pool["timed_anchor"]`) crosses a same-device NESTED cook boundary
 uncorrected, the v0.47 peek-cache ABA class (`test_fixpace_p1_nested_aba.py`) reopened for
 PACE-49's own new anchor.
@@ -14,7 +14,7 @@ to whatever call site the INNER cook happened to leave behind.
 
 RED at base `32f6917` (after FIX-PACE49 P1/P2 land): the outer's post-nesting real device
 interval is folded into the INNER call site's cost-table entry instead of being discarded (or
-credited to the outer) -- matching B3-pacing.md #2's own confirmed-by-running repro exactly
+credited to the outer) -- matching this fix's own confirmed-by-running repro exactly
 ("`OUTER_STMT_A`'s own entry never received anything" / the inner's entry absorbed the
 outer's real interval).
 """

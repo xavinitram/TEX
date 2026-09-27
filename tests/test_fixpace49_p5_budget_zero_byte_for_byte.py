@@ -1,10 +1,10 @@
-"""FIX-PACE49 P5 (B3-pacing.md #4) -- `pace_budget_ms=0`'s own docstring
+"""FIX-PACE49 P5 -- `pace_budget_ms=0`'s own docstring
 (`_resolve_budget_ms`, `pacing.py`) calls it "the ONLY way to recover byte-for-byte
 pre-PACE-49 economizing", but before this fix only the DECISION half honoured budget<=0
 (`_pace49_cost_gate`'s first line): the MEASUREMENT half (`_pace49_attribute`/`_cost_feed`,
 including acquiring `_COST_LOCK` and mutating `_COST_TABLE`) ran unconditionally whenever
 `call_site_id is not None` and a poll got a fresh tail confirmation, REGARDLESS of
-`budget_ms`. Confirmed by running (B3-pacing.md #4): with `_state.budget_ms=0.0`, two
+`budget_ms`. Confirmed by running: with `_state.budget_ms=0.0`, two
 attributed events still populated a fresh table entry.
 
 The fix: gate every PACE-49 attribution/anchor-bookkeeping branch in `paced_check` on

@@ -100,7 +100,7 @@ def test_q1_run_tiled_halo_records_its_own_tier(r: SubTestResult):
 
 
 def test_q1_tiled_after_codegen_run_is_never_stale(r: SubTestResult):
-    """B3's own run()-after-run() repro (B3-pacing.md finding 1), through the TILED path:
+    """B3's own run()-after-run() repro (confirmed by running), through the TILED path:
     `tex_engine.run(plan1)` on a stencil-routed program records `codegen`; a direct
     `run_tiled` call right afterwards, with NO `tier_trace.reset()` in between (the exact
     plan-reusing-caller shape `test_trk221_run_after_run_is_never_stale` already pins for the
