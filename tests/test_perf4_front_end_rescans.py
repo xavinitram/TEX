@@ -51,7 +51,7 @@ from helpers import *
 from TEX_Wrangle import tex_lazy, tex_roi
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.ast_nodes import (
-    Assignment, ForLoop, FunctionCall, FunctionDef, NumberLiteral, VarDecl, WhileLoop,
+    Assignment, ForLoop, FunctionCall, FunctionDef, IfElse, NumberLiteral, VarDecl, WhileLoop,
     iter_child_nodes,
 )
 from TEX_Wrangle.tex_compiler.optimizer import _fold_all, _propagate_literal_locals
@@ -458,12 +458,43 @@ def test_perf4_lazy_oracle_sensitive_rows(r: SubTestResult):
 
 # ── F4: the halo scan ────────────────────────────────────────────────────────
 
+def _has_resolved_ifelse(node) -> bool:
+    """ROI-48A: True if the folded tree contains an `IfElse` whose condition is already a
+    `NumberLiteral` — the exact, and only, proof `tex_roi._resolved_branch` accepts before it
+    prunes a branch. Used below to draw the boundary of ROI-48A's own, INTENTIONAL exception
+    to this file's identity oracle as narrowly as the fix itself: a checkable fact about the
+    tree, not a label on a row."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.__class__ is IfElse and n.condition.__class__ is NumberLiteral:
+            return True
+        stack.extend(iter_child_nodes(n))
+    return False
+
+
 @isolated_analysis
 def test_perf4_halo_answers_are_identical(r: SubTestResult):
-    """Every folded program answers what the pre-change two-pass scan answered."""
+    """Every folded program answers what the pre-change two-pass scan answered — WITH ONE
+    NAMED, NARROW, POST-ROI-48A EXCEPTION.
+
+    This oracle predates ROI-48A and pins that PERF-4's traversal-count refactor moved no
+    answer. ROI-48A later gave the LIVE `tex_roi._has_ungrounded_halo` (and `_accumulate`) a
+    genuinely NEW capability the frozen pre-change snapshot below can never have: pruning a
+    branch whose condition has already folded to a literal (`case2_in_if`'s `$k > 0.5` folds
+    to `False` at `k=0.0/0.5/-1.0/0.25/nan/1e-8`, exactly the values this row moves at), so
+    the untaken arm's case-2 name-boundary halo (`@T = gauss_blur(@A,2.0); @OUT =
+    gauss_blur(@T,2.0);`) never gets a chance to block a program that will never run it.
+    That is a semantic improvement, not a refactor artifact, and a real divergence from the
+    frozen snapshot is therefore EXPECTED here — but only in one direction (True -> False,
+    since pruning can only REMOVE a footprint the old two-pass walk over-counted, never add
+    one) and only on a folded program that genuinely contains a resolved `IfElse` (proof the
+    mechanism, not a coincidence, produced it). Any OTHER divergence — the wrong direction, or
+    one with no resolved condition anywhere in the tree — still fails this test exactly as it
+    always has."""
     print("\n--- PERF-4 F4: the single-traversal halo scan vs the pre-change one ---")
     rows = _corpus()
-    bad, checked = [], 0
+    bad, checked, roi48a_exceptions = [], 0, 0
     for label, code in rows:
         for params in _valuations_for(code):
             a, b = _folded(code, params), _folded(code, params)
@@ -472,12 +503,22 @@ def test_perf4_halo_answers_are_identical(r: SubTestResult):
             got, want = tex_roi._has_ungrounded_halo(a), _base_has_ungrounded_halo(b)
             checked += 1
             if got != want:
+                if got is False and want is True and _has_resolved_ifelse(a):
+                    roi48a_exceptions += 1
+                    continue
                 bad.append(f"{label} params={params}: {want} -> {got}")
     if bad:
         r.fail("PERF-4 halo identity",
                f"{len(bad)} of {checked} verdicts moved; first 3: {bad[:3]}")
+    elif roi48a_exceptions == 0:
+        r.fail("PERF-4 halo identity",
+              "expected the ROI-48A resolved-branch exception to fire at least once "
+              "(case2_in_if at a False-folding $k) and it never did — the exception carve-out "
+              "may itself have gone vacuous")
     else:
-        r.ok(f"{checked} halo verdicts over {len(rows)} sources are unchanged")
+        r.ok(f"{checked} halo verdicts over {len(rows)} sources unchanged, plus "
+             f"{roi48a_exceptions} named ROI-48A resolved-branch exceptions (True -> False, "
+             f"each on a folded program with a proven resolved IfElse)")
 
 
 @isolated_analysis
