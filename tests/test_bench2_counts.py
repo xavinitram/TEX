@@ -772,6 +772,17 @@ _CUDA_PINS = {
     # this box), so unlike `interp_chain_scrub` there is no window to change kernel count with.
     "whole_frame_chain_d1": (21,     0,            18),
     "whole_frame_chain_d3": (42,     0,            33),
+    # PACE-48: the two rows BENCH-47 deferred (its own lease never freed) — the D5/D10 far
+    # end of the same D-of-N sweep, measured on the laptop's sm_120 device (this table's own
+    # device) at the same shape (1024^2/512^2/4 ticks) via `_CUDA_REDERIVE`. Kernel count is
+    # linear in D and matches D1/D3's own per-stage-dirty slope: D1=21 (21.0/dirty-stage),
+    # D3=42 (14.0/stage — D3 crosses a blur-adjacent stage D1 doesn't), D5=67 (13.4/stage),
+    # D10=111 (11.1/stage) — falling per-stage average as D grows is expected here (the fixed
+    # per-cook kernel overhead each dirty stage also pays amortizes across more stages), not a
+    # regression; allocations follow the same shape (18/33/52/84). D2H stays 0 at every D, same
+    # reason as D1/D3 (no stage's sigma is device-computed on this comp).
+    "whole_frame_chain_d5": (67,     0,            52),
+    "whole_frame_chain_d10": (111,   0,            84),
 }
 # WHY THE D2H COLUMN IS NOW ZERO EVERYWHERE, AND WHAT WOULD MAKE IT NON-ZERO AGAIN.
 # `gauss_blur` needs a Python number for its kernel radius and used to get it with
