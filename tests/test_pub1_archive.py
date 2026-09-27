@@ -118,8 +118,12 @@ _FAMILIES = {
 # writing, so a new one is a new paragraph there, never a reflex here.
 # env_read 25→24 (PUB-3): SECURITY.md's read row had still quoted the matched spelling and the
 # registry flagged it on 0.36.4 (SECURITY.md:31); reworded to describe, pin re-measured.
+# env_read 24→25 (FIX-GATE G4, v0.47.0): `tex_runtime/noise.py::_can_inductor_compile` reads
+# `TEX_GATE_NO_INDUCTOR` -- a gate-only escape hatch `tools/gate.py::run_ci_shape` sets so its
+# own verdict does not depend on whether `--ci-python`'s box happens to have a C++ toolchain
+# on PATH; unset (the default, every real ComfyUI process) it changes nothing.
 _SURFACE_PINS = {
-    "env_read": 24,
+    "env_read": 25,
     "subprocess": 1,
     "os_system": 0,
     "exec": 11,
