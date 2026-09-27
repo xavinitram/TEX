@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from .tex_compiler.ast_nodes import (
     BindingRef, NumberLiteral, ChannelAccess, FunctionCall, Assignment, Identifier,
     BindingIndexAccess, BindingSampleAccess, ArrayIndexAccess, VarDecl, FunctionDef,
-    ForLoop, WhileLoop, clone_tree, iter_child_nodes,
+    ForLoop, WhileLoop, IfElse, clone_tree, iter_child_nodes,
 )
 from .tex_compiler.optimizer import _propagate_literal_locals, _fold_all
 from .tex_lazy import _substitute_params, _fp32, _param_key, _pristine_parse, _profile_key
@@ -246,6 +246,30 @@ def _scatter_target_base(tgt):
     return None
 
 
+def _resolved_branch(node: IfElse) -> list | None:
+    """ROI-48A: the single body an `IfElse` will actually run, or None when its condition is
+    still symbolic at the point this walk sees it.
+
+    `_walk` folds `code` through `_fold_program` before this ever runs: every `$param` is
+    substituted first, then the optimizer's constant folding (`_opt_expr`/`_fold_binop`)
+    reduces an expression built ONLY from literals/substituted params down to a bare
+    `NumberLiteral`. So `node.condition.__class__ is NumberLiteral` here is proof — not a
+    guess — that the condition depended only on UNIFORM values (the widget/`$param` values
+    this walk was given): folding has no rule that can reduce a per-pixel read (`u`, `v`,
+    `ix`, `iy`, an `@binding`), an unresolved `$param`, or any other unknown quantity to a
+    literal. Any doubt — a condition that is still an expression after folding — returns
+    None, which keeps today's conservative walk of the condition AND both bodies unchanged.
+
+    This is what lets a not-taken arm's wide/unbounded footprint (blur.tex's Exponential
+    mip taps, present in source but never reached when `$mode` picks Gaussian) stop blocking
+    reach: `_accumulate`/`_has_ungrounded_halo` never descend into a body this returns None
+    for skipping, or descend into the ONE body it names, and never both."""
+    cond = node.condition
+    if cond.__class__ is NumberLiteral:
+        return node.then_body if cond.value > 0.5 else node.else_body
+    return None
+
+
 def _accumulate(node, ctx_halo, reads: dict, state: dict) -> None:
     """Walk the AST, tallying each wire binding's read mode. `ctx_halo` is the accumulated
     symmetric narrowable-halo radius from enclosing blur/morphology ops, or the sentinel
@@ -262,6 +286,17 @@ def _accumulate(node, ctx_halo, reads: dict, state: dict) -> None:
     if cls is ChannelAccess:
         _accumulate(node.object, ctx_halo, reads, state)
         return
+
+    if cls is IfElse:
+        # ROI-48A: read only the branch that will actually run when the condition has
+        # already folded to a literal (see `_resolved_branch` — proof the condition depends
+        # only on UNIFORM values). A still-symbolic condition falls through unchanged to the
+        # generic walk below, which visits the condition AND both bodies exactly as before.
+        body = _resolved_branch(node)
+        if body is not None:
+            for s in body:
+                _accumulate(s, ctx_halo, reads, state)
+            return
 
     if cls is Assignment:
         # The target is a WRITE, not a read (mirrors codegen_stencil._collect_ident_refs).
@@ -674,6 +709,22 @@ def _has_ungrounded_halo(program) -> bool:
                     has = True
             if init_has:
                 halo_named.add(node.name)
+            return has
+        if cls is IfElse:
+            # ROI-48A: a resolved condition (see `_resolved_branch`) means only ONE body ever
+            # runs, so an ungrounded halo in the OTHER body must not be able to block this
+            # program — it is never reached. `ungrounded` passes through unchanged either way
+            # (an `if` body is not a case-(1) boundary — see the case-(2) comment below), so
+            # this changes only WHICH statements get visited, never how they are scored.
+            body = _resolved_branch(node)
+            if body is not None:
+                for ch in body:
+                    if _visit(ch, ungrounded, scanned):
+                        has = True
+                return has
+            for ch in iter_child_nodes(node):
+                if _visit(ch, ungrounded, scanned):
+                    has = True
             return has
         inner = True if cls in (FunctionDef, ForLoop, WhileLoop) else ungrounded
         if cls is Assignment:
