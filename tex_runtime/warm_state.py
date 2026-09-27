@@ -23,6 +23,7 @@ different GPU is ignored rather than replayed wrong.
 import atexit
 import json
 import os
+import threading
 import time
 
 _FILE = "warm_state.json"
@@ -32,6 +33,20 @@ _tag_cache: "str | None" = None
 _atexit_registered = False
 _last_persist = 0.0
 _PERSIST_THROTTLE_SEC = 5.0   # ordinary cooks accumulate warm state without a write per verdict
+
+# W3 (FIX-WARM, B3#3): `persist()`'s ordering invariant (ENG-13: snapshot the live table
+# BEFORE compacting the journal, and only if the snapshot succeeded) was enforced only by
+# there having been exactly one caller at a time -- incidentally, never by a lock. Every
+# `persist()` call in one process used to run on whatever single thread called `prewarm()`
+# or a cook; `prewarm_async` (AUTO-48) is the first path that puts a real, concurrent,
+# `force=True` caller into the same process as the cook thread's own
+# `note_update()`/`persist(force=False)` calls. This lock makes the invariant enforced, not
+# incidental: two concurrent callers now run the throttle-check-through-write body one at a
+# time instead of interleaving on the shared `_last_persist`/`_path_cache`/`_tag_cache`
+# globals and the snapshot/`drop_prefix` sequence. Held only across `persist()` itself (the
+# miss path for an ordinary single-threaded cook, which never contends) -- never around
+# `note_update`'s journal append, which stays lock-free and cheap on the hot per-verdict path.
+_persist_lock = threading.Lock()
 
 
 def _path(*, recheck: bool = False):
@@ -172,43 +187,51 @@ def persist(*, force: bool = False) -> None:
     ORDERING (ENG-13): snapshot FIRST, clear the journal SECOND, and only if the snapshot
     succeeded. A crash in between replays records the snapshot already holds, which is a no-op
     (a capturability verdict is a pure function of the AST + arch, so re-adopting it cannot
-    conflict); the reverse order would lose them outright."""
+    conflict); the reverse order would lose them outright.
+
+    W3 (FIX-WARM): the whole throttle-check-through-write body runs under `_persist_lock`, so
+    two concurrent callers (a cook thread's `note_update` and a `prewarm_async` background
+    job's `force=True`, the first same-process pairing this invariant ever had to survive)
+    serialize instead of interleaving on the shared globals and the snapshot/`drop_prefix`
+    sequence."""
     global _last_persist
-    # Throttle FIRST. `_path()` is memoized now, but the ordering is the point: the throttled
-    # call is the common one (every `note_update` inside the window) and it must do nothing.
-    now = time.time()
-    if not force and (now - _last_persist) < _PERSIST_THROTTLE_SEC:
-        return
-    p = _path()
-    if not p:
-        return
-    from ..tex_recovery import atomic_write_json
-    try:
-        # Count what this snapshot is about to supersede BEFORE taking it, and afterwards drop
-        # only that many records. A verdict learned WHILE the snapshot is being written appends
-        # to the journal but is not in the snapshot, so clearing wholesale loses it (reproduced
-        # 2/5). `drop_prefix` keeps the tail.
-        j = _journal()
-        superseded = j.count() if j is not None else 0
-        # RE-READ before writing. The snapshot is a whole-table overwrite and the journal is
-        # compacted by line count, so with two instances sharing a TEX_CACHE_DIR — the case
-        # `atomic_write` and `reattach` both name as a design driver — a persist here would
-        # erase verdicts a peer had already made durable (measured: two lost across an
-        # `os._exit` with nothing in flight). `load()` adopts by `setdefault`, so the local
-        # memo still wins for anything this session learned; the merge only ADDS.
-        load()
-        # The ONE caller that asks for durability: this is the snapshot the journal is
-        # compacted against, so losing it to a machine crash would lose the compaction too.
-        ok = atomic_write_json(p, _snapshot(), fsync=True)
-        if not ok:
-            p = _path(recheck=True) or p     # the cache dir may have been removed
+    with _persist_lock:
+        # Throttle FIRST. `_path()` is memoized now, but the ordering is the point: the
+        # throttled call is the common one (every `note_update` inside the window) and it
+        # must do nothing.
+        now = time.time()
+        if not force and (now - _last_persist) < _PERSIST_THROTTLE_SEC:
+            return
+        p = _path()
+        if not p:
+            return
+        from ..tex_recovery import atomic_write_json
+        try:
+            # Count what this snapshot is about to supersede BEFORE taking it, and afterwards
+            # drop only that many records. A verdict learned WHILE the snapshot is being
+            # written appends to the journal but is not in the snapshot, so clearing wholesale
+            # loses it (reproduced 2/5). `drop_prefix` keeps the tail.
+            j = _journal()
+            superseded = j.count() if j is not None else 0
+            # RE-READ before writing. The snapshot is a whole-table overwrite and the journal
+            # is compacted by line count, so with two instances sharing a TEX_CACHE_DIR — the
+            # case `atomic_write` and `reattach` both name as a design driver — a persist here
+            # would erase verdicts a peer had already made durable (measured: two lost across
+            # an `os._exit` with nothing in flight). `load()` adopts by `setdefault`, so the
+            # local memo still wins for anything this session learned; the merge only ADDS.
+            load()
+            # The ONE caller that asks for durability: this is the snapshot the journal is
+            # compacted against, so losing it to a machine crash would lose the compaction too.
             ok = atomic_write_json(p, _snapshot(), fsync=True)
-        if ok:
-            _last_persist = now
-            if j is not None:
-                j.drop_prefix(superseded)
-    except Exception:
-        pass
+            if not ok:
+                p = _path(recheck=True) or p     # the cache dir may have been removed
+                ok = atomic_write_json(p, _snapshot(), fsync=True)
+            if ok:
+                _last_persist = now
+                if j is not None:
+                    j.drop_prefix(superseded)
+        except Exception:
+            pass
 
 
 def note_update(fp: str | None = None) -> None:
