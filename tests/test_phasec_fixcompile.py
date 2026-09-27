@@ -211,7 +211,13 @@ def test_c3_headroom_folds_projected_clone_bytes(r: SubTestResult):
 
 
 def test_c3_warm_skipped_above_clone_cap(r: SubTestResult):
-    print("\n--- C3: a projected clone above the cap skips the warm submission entirely ---")
+    """K5 (v0.50.0 Phase C) corrected this row's own original assertion: the C3 comment
+    always said "above the cap the warm is skipped, the artifact still commits via a
+    plain TRIAL" -- but the pre-K5 code nested the WHOLE `_submit_bg_compile` call inside
+    the size check with no `else`, so exceeding the cap skipped the wrap submission too
+    (0 calls), contradicting the comment and silently denying such a program ANY compile
+    attempt, ever. Now the wrap submission still runs (1 call) with `warm_call=None`."""
+    print("\n--- C3: a projected clone above the cap skips only the warm, not the wrap ---")
     prog, tm, used = _tiny_program()
     img = make_img(1, 12, 12, 3, seed=21)
     fp = "c3_cap_fp"
@@ -222,10 +228,10 @@ def test_c3_warm_skipped_above_clone_cap(r: SubTestResult):
     orig_cap_bytes = C._WARM_CLONE_CAP_BYTES
     orig_cap_fn = C.compile_capability_async
     orig_submit = C._submit_bg_compile
-    submit_calls = {"n": 0}
+    submit_calls = []
 
     def spy_submit(*a, **kw):
-        submit_calls["n"] += 1
+        submit_calls.append(kw.get("warm_call"))
         return True
 
     C.compile_capability_async = lambda: {"cuda_inductor": True, "cpu_inductor": True, "reason": {}}
@@ -235,11 +241,14 @@ def test_c3_warm_skipped_above_clone_cap(r: SubTestResult):
     try:
         for _ in range(3):   # _MEASURE_COOKS
             C.run_auto(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"], used_builtins=used)
-        assert submit_calls["n"] == 0, (
-            f"expected 0 warm submissions above the clone cap, got {submit_calls['n']}")
-        r.ok("C3: a binding set whose clone exceeds the cap never reaches _submit_bg_compile")
+        assert len(submit_calls) == 1, (
+            f"expected exactly 1 wrap submission above the clone cap, got {len(submit_calls)}")
+        assert submit_calls[0] is None, (
+            f"expected warm_call=None above the clone cap, got {submit_calls[0]!r}")
+        r.ok("C3: a binding set whose clone exceeds the cap still reaches "
+             "_submit_bg_compile, with warm_call=None (K5)")
     except Exception as e:
-        r.fail("C3 clone cap skip", str(e))
+        r.fail("C3 clone cap skips only the warm", str(e))
     finally:
         C._WARM_CLONE_CAP_BYTES = orig_cap_bytes
         C.compile_capability_async = orig_cap_fn

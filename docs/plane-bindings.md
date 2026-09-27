@@ -57,9 +57,9 @@ This is the release's compat tripwire and the reason this phase gets its own ses
 
 **The constraint that decides it:** the parser provably never sees binding types.
 `TEXCache.compile_tex` reaches `Parser(tokens, source=source).parse()` through
-`parse_and_split` (`tex_cache.py:222`) and
+`parse_and_split` (`tex_cache.py:228`) and
 types enter one call later, at `TypeChecker(binding_types=..., source=source)`
-(`tex_cache.py:570`, inside the shared `TEXCache.compile_ast`). So doc 40's "`.name` means a plane *on a
+(`tex_cache.py:576`, inside the shared `TEXCache.compile_ast`). So doc 40's "`.name` means a plane *on a
 PLANES-typed wire*" cannot live in the grammar. Something upstream of types must tokenize the
 dot, and something downstream of types must decide what it meant.
 
@@ -258,7 +258,7 @@ does not reach all three, the R1/R2 lanes silently test *unexpanded* programs â€
 over a surface that is not the shipped one.
 
 **Decision: converge, and the seam already exists.** `TEXCache.compile_ast(program,
-binding_types, *, source)` (`tex_cache.py:496`) is STR-8's shared post-parse pipeline, already
+binding_types, *, source)` (`tex_cache.py:575`) is STR-8's shared post-parse pipeline, already
 used by both production entries (`compile_tex` and fusion's `compile_fused`). **Expansion lands
 inside `compile_ast`, ahead of the first `TypeChecker` call**, and the two test harnesses are
 migrated onto it.

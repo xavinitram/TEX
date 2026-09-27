@@ -482,6 +482,53 @@ _COMPILE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 # timeout. A wrap-only job has nothing slow to isolate and keeps using `_COMPILE_POOL`.
 _WARM_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
+# K5 (v0.50.0 Phase C, B3#4/B3#5): neither `_COMPILE_POOL` nor `_WARM_POOL` times out a
+# job, and each is `max_workers=1` -- a genuinely stuck one (a real compiler stall: an
+# MSVC subprocess, a Triton autotune spin) blocks every LATER submission to that SAME
+# pool forever, since a Python thread cannot be forcibly killed and `ThreadPoolExecutor`
+# has no "abandon the running job" operation. COMPILETRY-50's one-ever fall-through
+# attempt widened the population of programs that can reach this real-compile risk (a
+# `_has_fn_calls` program used to never attempt a real compile at all). Rather than try
+# to bound the stuck call itself (unsafe -- native code, a blocking subprocess), a
+# SUBMISSION finds a pool whose current job has run past `_POOL_STUCK_BOUND_S` and
+# ABANDONS that pool: a fresh replacement takes over for this and every later
+# submission, leaving the stuck worker thread orphaned (still running, but never handed
+# more work) instead of queuing every future fingerprint behind it forever. Bound
+# matches `autotier.enforce_convergence_bound`'s own 30s scale (the same "how long is
+# too long to wait on this box's own toolchain" question, one layer down).
+_POOL_STUCK_BOUND_S = 30.0
+_pool_busy_since: dict[str, float] = {}
+
+
+def _pool_for(name: str) -> "concurrent.futures.ThreadPoolExecutor":
+    """The live pool for `name` ("compile"/"warm"), replacing it with a fresh
+    `ThreadPoolExecutor(max_workers=1)` first if its current job has been running past
+    `_POOL_STUCK_BOUND_S` -- see the module comment above `_POOL_STUCK_BOUND_S`."""
+    global _COMPILE_POOL, _WARM_POOL
+    busy_since = _pool_busy_since.get(name)
+    if busy_since is not None and (_time.monotonic() - busy_since) > _POOL_STUCK_BOUND_S:
+        if name == "compile":
+            _COMPILE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        else:
+            _WARM_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        _pool_busy_since.pop(name, None)
+    return _COMPILE_POOL if name == "compile" else _WARM_POOL
+
+
+def _mark_pool_busy(name: str) -> None:
+    """Called from INSIDE a submitted job, as its first line -- records when the pool's
+    CURRENTLY EXECUTING job started. `setdefault`, not assignment: with `max_workers=1`,
+    jobs run strictly sequentially, so a second job's own start can only ever observe an
+    empty slot (the first already cleared it via `_mark_pool_free`) -- `setdefault` is
+    just the cheap, race-tolerant way to write that once."""
+    _pool_busy_since.setdefault(name, _time.monotonic())
+
+
+def _mark_pool_free(name: str) -> None:
+    """Called from a submitted job's own `finally` -- clears the busy marker so the NEXT
+    submission's `_pool_for` check reads 'no job running' rather than a stale timestamp."""
+    _pool_busy_since.pop(name, None)
+
 # Minimum tensor-op count for torch.compile to be worthwhile.
 # Below this threshold the fusion benefit cannot overcome tracing overhead.
 _COMPILE_OP_THRESHOLD = 8
@@ -988,6 +1035,9 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
         shape, just on the pool the caller chose."""
         # COMPILETRY-50: resolved against `fncalls_compile` in `finally` so a `warm_call`
         # crash below (a real failure, not just a wrap failure) settles the verdict too.
+        # K5: mark/clear this pool's busy-since window around the whole job, so a stuck
+        # attempt is what a LATER submission's `_pool_for` check actually measures.
+        _mark_pool_busy(pool_name)
         fnc_backend = None
         try:
             with _precompile_ctx(), torch.inference_mode():
@@ -1012,12 +1062,14 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
             return "failed"
         finally:
             fncalls_compile.resolve_attempt(fingerprint, device_type, precision, fnc_backend)
+            _mark_pool_free(pool_name)
 
     # C1 (B1#1): route to the DEDICATED `_WARM_POOL` whenever a `warm_call` is given —
     # the only case with a potentially SLOW (10-30s) step — so it never shares a worker
     # with `_run_cached_compiled`/`execute_compiled`'s blocking `_COMPILE_POOL` submits.
     # A wrap-only job (`tex_api.prewarm`'s callerless case) keeps using `_COMPILE_POOL`.
-    pool = _WARM_POOL if warm_call is not None else _COMPILE_POOL
+    pool_name = "warm" if warm_call is not None else "compile"
+    pool = _pool_for(pool_name)   # K5: abandons a stuck pool for a fresh one first
     try:
         _bg_futures[cache_key] = pool.submit(_compile_and_maybe_warm)
         return True
@@ -1271,8 +1323,14 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         elif not _capture_in_flight():
             # C3 (R3#1 + B1#3): fold the projected clone size (every binding cloned at
             # full resolution) into the headroom check BEFORE cloning, and cap it — above
-            # the cap the warm is skipped (the artifact still commits via a plain TRIAL).
+            # the cap the warm is skipped, but the wrap submission below still runs (K5,
+            # v0.50.0 Phase C, AUTOSAFE-50's own filed finding: the comment always said
+            # "the artifact still commits via a plain TRIAL", but the submission used to
+            # be nested INSIDE this size check with no `else`, so missing the cap skipped
+            # the WHOLE submission — no wrap, no artifact, no trial, ever, for that
+            # fingerprint's bindings shape, contradicting the comment).
             warm_bytes = _bindings_nbytes(bindings)
+            warm_call = None
             if (warm_bytes <= _WARM_CLONE_CAP_BYTES
                     and _cuda_headroom_ok(device, extra_bytes=warm_bytes)):
                 # CC-5: clone the REPRESENTATIVE bindings now, on the cook thread, so the
@@ -1283,15 +1341,15 @@ def run_auto(program, bindings, type_map, device, fingerprint,
                     {k: (v.clone() if isinstance(v, torch.Tensor) else v)
                      for k, v in bindings.items()}, device_obj)
 
-                def _warm_call(_key=cache_key, _wb=warm_bindings, _scale=scale):
+                def warm_call(_key=cache_key, _wb=warm_bindings, _scale=scale):
                     compiled_fn, _backend = _compiled_cache[_key]
                     compiled_fn(program, _wb, type_map, device,
                                latent_channel_count, output_names, scale=_scale)
 
-                if _submit_bg_compile(cache_key, program, type_map, device_type,
-                                      used_builtins, precision, fingerprint,
-                                      warm_call=_warm_call):
-                    autotier.mark_submitted(key)
+            if _submit_bg_compile(cache_key, program, type_map, device_type,
+                                  used_builtins, precision, fingerprint,
+                                  warm_call=warm_call):
+                autotier.mark_submitted(key)
     elif state == autotier.COMPILING:
         st = _bg_status(cache_key)
         if st == "ready":

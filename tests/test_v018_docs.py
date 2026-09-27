@@ -317,6 +317,12 @@ _NOT_A_CACHE = {
                                   "second caller waits instead of re-emitting, not a cache of "
                                   "any value (the codegen fn itself is TEXCache's job); empty "
                                   "in the ordinary single-threaded case",
+    "compiled._pool_busy_since": "K5 (v0.50.0 Phase C): per-pool ('compile'/'warm') "
+                                 "timestamp of the CURRENTLY EXECUTING job, bracketed by "
+                                 "_mark_pool_busy/_mark_pool_free around the job body -- "
+                                 "coordination state _pool_for reads to decide whether to "
+                                 "abandon a stuck pool for a fresh one, not a cache of any "
+                                 "value; empty whenever no job is in flight on either pool",
     # ── Observability: bounded rings and accumulators of MEASUREMENTS. ──
     "tier_trace._ring": "bounded tier-decision trace ring (diagnostics; oldest dropped)",
     "tier_trace._noise_ring": "bounded noise-tier trace ring (diagnostics)",

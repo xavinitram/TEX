@@ -371,3 +371,62 @@ def test_k4_begin_attempt_is_atomic_under_concurrent_callers(r: SubTestResult):
     finally:
         FC._pending = orig_pending
         FC.reset_for_test()
+
+
+# ── K5: a genuinely stuck job on `_COMPILE_POOL`/`_WARM_POOL` (max_workers=1, no
+# timeout) blocked every LATER submission to that pool forever. Fix: a submission that
+# finds the pool's current job older than `_POOL_STUCK_BOUND_S` abandons that pool for a
+# fresh one, rather than queuing behind the stuck job forever. ─────────────────────────
+
+def test_k5_a_stale_pool_is_replaced_not_queued_behind(r: SubTestResult):
+    """RED against the pre-K5 shape (no staleness tracking at all -- a second submission
+    to a busy pool just queues behind the first, however long the first takes): mark a
+    pool "busy" long enough ago to exceed the bound, then confirm `_pool_for` swaps in a
+    fresh pool object instead of returning the existing (stuck) one."""
+    print("\n--- K5: a pool whose current job exceeds the stuck bound is replaced ---")
+    saved_compile_pool = C._COMPILE_POOL
+    saved_busy = dict(C._pool_busy_since)
+    saved_bound = C._POOL_STUCK_BOUND_S
+    try:
+        C._POOL_STUCK_BOUND_S = 0.05
+        stuck_pool = C._COMPILE_POOL
+        C._mark_pool_busy("compile")
+        # Simulate the bound having elapsed without a real 50ms sleep in the test.
+        C._pool_busy_since["compile"] = C._time.monotonic() - 1.0
+        fresh = C._pool_for("compile")
+        assert fresh is not stuck_pool, (
+            "a pool whose current job has run past the stuck bound must be replaced, "
+            "not handed back unchanged")
+        assert "compile" not in C._pool_busy_since, (
+            "replacing a stale pool must also clear its busy marker")
+        assert C._pool_for("compile") is fresh, (
+            "a freshly-replaced, not-yet-busy pool must be returned unchanged on the "
+            "very next call")
+        r.ok("K5: a stale pool is abandoned for a fresh one; a fresh pool is not "
+             "replaced again until it, too, goes stale")
+    except Exception as e:
+        r.fail("K5 stale pool replacement", f"{type(e).__name__}: {e}")
+    finally:
+        C._COMPILE_POOL = saved_compile_pool
+        C._pool_busy_since.clear()
+        C._pool_busy_since.update(saved_busy)
+        C._POOL_STUCK_BOUND_S = saved_bound
+
+
+def test_k5_busy_then_free_clears_the_marker_for_a_fast_job(r: SubTestResult):
+    """GREEN companion: the ordinary (fast, not stuck) case -- busy then free within the
+    bound must leave no stale marker behind for the NEXT submission to misread."""
+    print("\n--- K5: an ordinary fast job's busy marker clears, no false staleness ---")
+    saved_busy = dict(C._pool_busy_since)
+    try:
+        C._mark_pool_busy("warm")
+        assert "warm" in C._pool_busy_since
+        C._mark_pool_free("warm")
+        assert "warm" not in C._pool_busy_since, (
+            "a completed job must clear its own busy marker")
+        r.ok("K5: busy/free bracket a job cleanly; no marker survives a normal completion")
+    except Exception as e:
+        r.fail("K5 busy/free bracket", f"{type(e).__name__}: {e}")
+    finally:
+        C._pool_busy_since.clear()
+        C._pool_busy_since.update(saved_busy)

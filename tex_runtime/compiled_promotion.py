@@ -97,21 +97,30 @@ def _submit_trial(cache_key, program, bindings, type_map, device,
     is a no-op that returns True without resubmitting."""
     if cache_key in _trial_futures:
         return True
-    from .compiled import _canon_device, _compiled_cache, _WARM_POOL
+    from .compiled import (_canon_device, _compiled_cache, _pool_for,
+                           _mark_pool_busy, _mark_pool_free)
     contiguous = _contiguous_bindings(bindings, _canon_device(device))
 
     def _worker():
-        with torch.inference_mode():
-            entry = _compiled_cache.get(cache_key)
-            if entry is None:
-                return None, None
-            compiled_fn, _b = entry
-            call = lambda: compiled_fn(program, contiguous, type_map, device,
-                                       latent_channel_count, output_names, scale=scale)
-            return _timed(call, device_type)
+        # K5 (v0.50.0 Phase C, B3#4): mark/clear this shared pool's busy window around
+        # the real invocation, the same way `_submit_bg_compile`'s job does -- a TRIAL
+        # invocation that never returns must not silently poison every OTHER
+        # fingerprint's future submissions to `_WARM_POOL` forever.
+        _mark_pool_busy("warm")
+        try:
+            with torch.inference_mode():
+                entry = _compiled_cache.get(cache_key)
+                if entry is None:
+                    return None, None
+                compiled_fn, _b = entry
+                call = lambda: compiled_fn(program, contiguous, type_map, device,
+                                           latent_channel_count, output_names, scale=scale)
+                return _timed(call, device_type)
+        finally:
+            _mark_pool_free("warm")
 
     try:
-        _trial_futures[cache_key] = _WARM_POOL.submit(_worker)
+        _trial_futures[cache_key] = _pool_for("warm").submit(_worker)
         return True
     except Exception:
         return False
