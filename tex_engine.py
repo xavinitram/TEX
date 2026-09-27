@@ -532,7 +532,7 @@ def scalar_lazy_params(bindings: dict) -> dict:
 
 def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
             device_mode: str = "auto", compile_mode: str = "none",
-            precision: str = "fp32", has_latent_input: bool = False,
+            precision: str | None = None, has_latent_input: bool = False,
             latent_channel_count: int = 0, forgive_dead_refs: bool = False,
             debug_nan_highlight: bool = False, time_context: dict | None = None,
             max_outputs: int = MAX_OUTPUTS, disown: bool = True,
@@ -571,7 +571,22 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     passthrough, +118% of egress, on the DEFAULT path, in a release whose whole claim is
     +1.3 us/cook. Invariant #7 is not a formality; neither is the guarantee, so the cost
     lands on whoever can prove they don't need it, not on everyone by default.
+
+    `precision=None` (FIX-SCALE S4) means "the caller didn't say" — resolved to `"fp32"`
+    immediately below, but REMEMBERED as unspecified so a genuinely coarse cook (see the
+    scale block further down) can promote only THAT case to `"auto"`, never a caller's own
+    explicit `precision="fp32"`. Before this existed, the literal default and an explicit
+    `"fp32"` were the same Python string and indistinguishable at the promotion site, so an
+    explicit request to KEEP fp32 under scale was silently downgraded exactly like an
+    unspecified one — the opposite of what the promotion's own comment there claims.
     """
+    # FIX-SCALE S4: resolve the sentinel FIRST, before any other precision-shaped check
+    # below reads `precision` as a string. `_precision_was_explicit` is the one bit those
+    # later checks (the fp16 clamp right below, and the "auto" promotion further down) need
+    # that the plain string never carried.
+    _precision_was_explicit = precision is not None
+    if precision is None:
+        precision = "fp32"
     # fp16 is an interpreter-only mode for now — the compile/graph paths bake precision
     # into their keys but aren't validated for fp16 yet. Which precisions a tier supports
     # is engine policy, so the clamp lives here rather than in each host (it sat in
@@ -606,9 +621,13 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
         # invariant #10 accuracy net already reasons about data amplification independent of
         # canvas resolution, so "reduced precision under scale's envelope, never surfaced as
         # a NEW decision" needs no new mechanism, only this default. Only the caller's own
-        # unspecified-vs-fp32-shaped default value is promoted — an EXPLICIT precision=
-        # (anything other than the literal default "fp32") is still honoured unchanged.
-        if precision == "fp32":
+        # UNSPECIFIED value is promoted — an EXPLICIT precision= (FIX-SCALE S4: tracked by
+        # `_precision_was_explicit`, not by comparing against the literal default string) is
+        # still honoured unchanged, INCLUDING an explicit `precision="fp32"` that happens to
+        # equal the default. Before this fix the two were the same Python string and this
+        # comparison promoted both alike, silently downgrading a caller who explicitly asked
+        # to KEEP fp32 under scale on any tier where "auto" resolves to fp16.
+        if not _precision_was_explicit:
             precision = "auto"
     # CACHE-1: the interpreter reads the playhead by duck-typing (`time_context.get(name)`, any
     # Mapping), but the lineage keyer type-checks it — so a Mapping-but-not-dict playhead (a
