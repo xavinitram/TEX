@@ -420,6 +420,55 @@ def _sweep_medium_code(n):
     return "vec4 x = @A;\n" + "x = gauss_blur(x, 3.0);\n" * n + "@OUT = x;\n"
 
 
+# PACE-49: two shapes deliberately built to defeat EVERY existing proxy (footprint/heavy
+# registry tag, `_HEAVY_PIXEL_THRESHOLD`) -- named as the acceptance
+# shape a MEASURED bound must close where a proxy cannot. Both sit below
+# `pacing._HEAVY_PIXEL_THRESHOLD` (512^2) at the sizes used here, and neither statement is
+# tagged heavy by the registry (a `for`-loop's own top-level statement carries no footprint
+# of its own; `fbm` IS registry-tagged `heavy=True`, but that tag is binary and says nothing
+# about how much a HIGH runtime `octaves` argument actually costs).
+
+_SWEEP_LOOP_TAPS = 48       # per-iteration `sample()` calls -- a manual multi-tap "blur"
+_SWEEP_LOOP_ITERS = 40      # bounded for-loop trip count (well under MAX_LOOP_ITERATIONS)
+
+
+def _sweep_loop_code():
+    """A user `for`-loop whose BODY is device-expensive (a multi-tap manual convolution,
+    written as user TEX source -- never a stdlib call, so no registry tag could ever apply
+    to it) at a resolution below `_HEAVY_PIXEL_THRESHOLD`. The one top-level statement this
+    cook polls (the `ForLoop` node itself, once, before any iteration runs) is exactly the
+    call site PACE-49's own `id(stmt)` keying measures -- a repeated cook of this SAME
+    program is where its real cost becomes knowable."""
+    taps = "\n".join(
+        f"    acc = acc + sample(@A, clamp(u + float(i) * 0.0015 + {k} * 0.0009, 0.0, 1.0), "
+        f"clamp(v - float(i) * 0.0011, 0.0, 1.0));"
+        for k in range(_SWEEP_LOOP_TAPS)
+    )
+    return (
+        "vec4 x = @A;\n"
+        "vec4 acc = vec4(0.0);\n"
+        f"for (int i = 0; i < {_SWEEP_LOOP_ITERS}; i = i + 1) {{\n"
+        f"{taps}\n"
+        "}\n"
+        f"@OUT = x + acc * (1.0 / {float(_SWEEP_LOOP_TAPS * _SWEEP_LOOP_ITERS)});\n"
+    )
+
+
+_SWEEP_FBM_OCTAVES = 16   # a HIGH runtime octave count -- `heavy=True` is binary, this is not
+
+
+def _sweep_fbm_code(n):
+    """`fbm` carries the registry's own `heavy=True` tag (FIX-PACE P4) -- already bypasses
+    stride economization entirely, by NAME. This shape exists to prove PACE-49's measured
+    bound is a strict ADDITION, never a regression, for a call site the existing proxy
+    already covers: the acceptance criterion is the SAME flat drained-p95 the pre-PACE-49
+    `heavy` tag already gave it, not an improvement -- see `stride_depth_sweep`'s own
+    reading for this shape."""
+    return ("vec4 x = @A;\n"
+            + f"x = x + vec4(fbm(u * 4.0, v * 4.0, {_SWEEP_FBM_OCTAVES}) * 0.01);\n" * n
+            + "@OUT = x;\n")
+
+
 def _sweep_shapes():
     """Built lazily (not at import time) so the module stays importable without ever
     constructing the heavy chain's own strings twice; `_HEAVY`/`_SIZE`/`_N_STATEMENTS`
@@ -436,6 +485,10 @@ def _sweep_shapes():
         "cheap2048": {"code": _sweep_cheap_code(_SWEEP_CHEAP_N), "size": 2048, "n": _SWEEP_CHEAP_N},
         "medium": {"code": _sweep_medium_code(_SWEEP_MEDIUM_N), "size": 1024, "n": _SWEEP_MEDIUM_N},
         "heavy": {"code": _HEAVY, "size": _SIZE, "n": _N_STATEMENTS},
+        # PACE-49's own two acceptance shapes:
+        "loopbody256": {"code": _sweep_loop_code(), "size": 256, "n": 1},
+        "fbmoctaves256": {"code": _sweep_fbm_code(_SWEEP_MEDIUM_N), "size": 256,
+                           "n": _SWEEP_MEDIUM_N},
     }
 
 
