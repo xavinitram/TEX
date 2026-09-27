@@ -51,16 +51,34 @@ def warm_in_subprocess(jobs, *, device: str, precision: str, compile_mode: str) 
                  for src, bt, fp in jobs],
         "device": device, "precision": precision, "compile_mode": compile_mode,
     }
-    # `-m TEX_Wrangle...` resolves only with the directory that CONTAINS `TEX_Wrangle` as the
-    # child's cwd -- a fresh interpreter does not inherit the PARENT's `sys.path`, so this
-    # cannot rely on however THIS process ended up able to import `TEX_Wrangle` (an embedding
-    # host's own loader, a test runner's cwd, ...).
-    # Derived from `__file__` rather than assumed, so it is correct regardless of the caller.
-    _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .../TEX_Wrangle
-    _parent_dir = os.path.dirname(_pkg_dir)                                  # .../custom_nodes
+    # FIX-481B: the root package's import NAME is whatever THIS process actually imported
+    # it as -- `TEX_Wrangle` under the standing worktree convention, but nothing guarantees
+    # that elsewhere. A ComfyUI install's custom_nodes folder (and therefore the only name
+    # a fresh interpreter can import it under) can be anything: the registry's
+    # `comfyui-tex-wrangle`, or a plain `TEX` with no junction (the main tree's own real
+    # folder name) -- hard-coding "TEX_Wrangle" made the child's `-m` import fail with
+    # `ModuleNotFoundError` on either shape. `__package__` is always correct here because
+    # this module is only ever reached through a relative import
+    # (`from .tex_runtime import prewarm_worker` / `from . import tex_runtime`, never run
+    # standalone), so it names the REAL top-level package regardless of what it is called.
+    _pkg_name = (__package__ or __name__.rsplit(".", 1)[0]).split(".")[0]
+    _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .../<pkg_name>
+    _parent_dir = os.path.dirname(_pkg_dir)                                  # its container
+    _child_module = _pkg_name + ".tex_runtime.prewarm_worker"
+    # The embedded ComfyUI interpreter's `._pth` ignores `PYTHONPATH` (AGENTS.md), and a
+    # fresh child interpreter never inherits the PARENT's in-memory `sys.path` either way --
+    # so the child must be told where the package's CONTAINER directory is from INSIDE the
+    # command line itself, never via an environment variable. `-c` (not `-m`) because the
+    # module to run is a runtime value (`_child_module`), not a literal `-m` can be given.
+    _child_src = (
+        "import sys, importlib\n"
+        f"sys.path.insert(0, {_parent_dir!r})\n"
+        f"_m = importlib.import_module({_child_module!r})\n"
+        "sys.exit(_m._run_worker_main())\n"
+    )
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "TEX_Wrangle.tex_runtime.prewarm_worker"],
+            [sys.executable, "-c", _child_src],
             input=json.dumps(payload), capture_output=True, text=True,
             timeout=_WORKER_TIMEOUT_S, env=os.environ.copy(), cwd=_parent_dir,
         )
@@ -76,10 +94,13 @@ def warm_in_subprocess(jobs, *, device: str, precision: str, compile_mode: str) 
 
 
 def _run_worker_main() -> int:
-    """`python -m TEX_Wrangle.tex_runtime.prewarm_worker`: read a job payload on stdin,
-    warm it via the ordinary `tex_api.prewarm()`, print exactly one JSON line to stdout. This
-    process itself never decides it is "the subprocess" for anything — it just runs `prewarm()`
-    the way any other embedding host would, which is the whole point."""
+    """Entry point for the child `warm_in_subprocess` spawns (via `-c` + `importlib`, under
+    whatever the real top-level package name is — FIX-481B — not necessarily `TEX_Wrangle`;
+    `-m <pkg>.tex_runtime.prewarm_worker` still reaches the same code below for manual/debug
+    invocation). Reads a job payload on stdin, warms it via the ordinary `tex_api.prewarm()`,
+    prints exactly one JSON line to stdout. This process itself never decides it is "the
+    subprocess" for anything — it just runs `prewarm()` the way any other embedding host
+    would, which is the whole point."""
     try:
         payload = json.loads(sys.stdin.read())
         from .. import tex_api

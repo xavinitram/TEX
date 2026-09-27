@@ -1413,7 +1413,14 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
     `compiled._compiled_cache` entry itself (not picklable, and not the point): a program warmed
     via `"subprocess"` still pays its own (comparatively cheap) Dynamo trace on this process's
     first real cook, same as `"thread"` mode's own cold-in-THIS-process case for a program the
-    warm never reached."""
+    warm never reached.
+
+    FIX-481B: if the child fails to launch, import or exit cleanly (a ComfyUI install whose
+    folder isn't named `TEX_Wrangle`, a missing interpreter, a timeout, ...), every job that
+    batch deferred falls back to being warmed the ORIGINAL `"thread"` way instead of being
+    silently dropped, and the returned summary carries `summary["subprocess_error"]` (a
+    string, present only when this happened) describing the failure — never present on a
+    clean run, and never raised, matching every other best-effort step here."""
     import torch
     from .tex_cache import get_cache
     from .tex_runtime import compiled, graphed, warm_state
@@ -1424,6 +1431,13 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
                "cancelled": 0}
     programs = list(programs)
     _subprocess_jobs: list = []   # PREWARM-481: (source, {name: value}, fingerprint) triples
+    # FIX-481B: kept ALONGSIDE `_subprocess_jobs` (same order, one entry per deferred job) so
+    # a child-launch/import failure can fall back to warming the SAME programs through the
+    # original in-process "thread" mechanism (`compiled._submit_bg_compile`) instead of the
+    # job just vanishing -- the wire-format tuple above deliberately drops everything
+    # `_submit_bg_compile` needs (the AST/type_map/used_builtins aren't JSON-serializable and
+    # aren't the point of the wire format), so the fallback needs its own copy.
+    _subprocess_fallback: list = []   # (fingerprint, ast, type_map, used_builtins) rows
     for i, (source, binding_types) in enumerate(programs):
         try:
             _cancel_check(cancel)   # HOSTAUDIT-2 yield: abort a stale prewarm between programs
@@ -1466,6 +1480,8 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
                             # completes (below) -- from the child's OWN report, not assumed
                             # here, so a job the child's process fails to warm is not
                             # double-counted as a success.
+                            _subprocess_fallback.append((fp, prog.ast, prog.type_map,
+                                                         prog.used_builtins))
                         else:
                             ck = (fp, dev_type, precision)
                             if compiled._submit_bg_compile(ck, prog.ast, prog.type_map, dev_type,
@@ -1489,16 +1505,41 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
         # direct `prewarm()` caller, on whatever thread that caller chose), and a blocking
         # blocking wait for a child process to exit releases the GIL for its whole duration,
         # unlike the in-process "thread" mechanism it replaces for these jobs. Best-effort,
-        # like every other step here: a child that crashes or
-        # times out counts as zero warmed, never raises.
+        # like every other step here -- BUT (FIX-481B) "best-effort" means the caller finds
+        # out and the deferred work still happens somehow, never that the batch silently
+        # warms nothing: a child that fails to launch/import, exits non-zero, times out or
+        # prints unparsable output falls back to warming every deferred job the ORIGINAL
+        # in-process "thread" way (exactly what would have run for it under
+        # `bg_compile_mode="thread"`), and the failure is surfaced on
+        # `summary["subprocess_error"]` (so `PrewarmHandle.wait()`/`.poll()` callers can see
+        # it) and logged once, rather than vanishing into a bare `except: pass`.
+        _subprocess_err = None
         try:
             from .tex_runtime import prewarm_worker
             result = prewarm_worker.warm_in_subprocess(
                 _subprocess_jobs, device=device, precision=precision,
                 compile_mode=compile_mode)
-            summary["bg_compile"] += min(result.get("bg_compile", 0), len(_subprocess_jobs))
-        except Exception:
-            pass
+            _subprocess_err = result.get("error")
+            if _subprocess_err is None:
+                summary["bg_compile"] += min(result.get("bg_compile", 0), len(_subprocess_jobs))
+        except Exception as exc:
+            _subprocess_err = repr(exc)
+        if _subprocess_err is not None:
+            summary["subprocess_error"] = _subprocess_err
+            compiled._show_once(
+                "prewarm481_subprocess_fail",
+                f"[TEX] prewarm()'s background-compile-warm subprocess failed "
+                f"({_subprocess_err}); falling back to the in-process warm for this batch",
+                level="warning",
+            )
+            for _fb_fp, _fb_ast, _fb_type_map, _fb_used_builtins in _subprocess_fallback:
+                try:
+                    _fb_ck = (_fb_fp, dev_type, precision)
+                    if compiled._submit_bg_compile(_fb_ck, _fb_ast, _fb_type_map, dev_type,
+                                                   _fb_used_builtins, precision, _fb_fp):
+                        summary["bg_compile"] += 1
+                except Exception:
+                    pass
     warm_state.persist(force=True)
     return summary
 
@@ -1617,6 +1658,12 @@ def prewarm_async(programs, shapes=None, *, device: str = "cuda", precision: str
     child process this now runs in shares no GIL with the caller at all; a slow/first-ever
     compile there costs this call nothing beyond the wait for that child to exit, which is a
     GIL-releasing wait like any other I/O wait.
+
+    FIX-481B: a child that fails to launch or import is not a silent no-op. `prewarm()`
+    falls back to warming the same jobs the original `"thread"` way and sets
+    `summary["subprocess_error"]`, so `PrewarmHandle.poll()`/`.wait()` (which just return
+    that same summary dict) let a caller notice and log it on their own terms, instead of
+    the batch quietly warming nothing with no trace anywhere.
 
     `programs`/`shapes`/`device`/`precision`/`compile_mode` are exactly `prewarm()`'s own
     parameters, forwarded unchanged. `cancel` is layered under an internal token
