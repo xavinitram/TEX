@@ -28,21 +28,19 @@ so this stays a claim about what the source can actually prove, not a forced opi
 """
 import collections
 import importlib.util
-import os
 import re
 from pathlib import Path
 
 from helpers import SubTestResult
 
-_PKG = Path(__file__).resolve().parent.parent
+# FIX-ROI49 Q6 (R1#2): the "what counts as product source" exclusion set and its os.walk
+# harvest are a single source of truth, not a second hand-kept copy — importing them is
+# exactly the drift this file's own docstring says the generator lacked one layer up
+# ("nothing checked the generator against the source it harvests codes FROM"); a second,
+# separately-maintained copy here would recreate that same bug class one level down.
+from test_simp6_error_codes import _NOT_PRODUCT, _product_files  # noqa: F401 (re-used below)
 
-# Same exclusion set test_simp6_error_codes.py uses for "product source" — this file's
-# harvest must see exactly what the product ships, not tests/tools/docs/generated pages.
-_NOT_PRODUCT = {
-    "tests", "benchmarks", "tools", "docs", "examples", "editor_build", "assets",
-    "results", "results_test", "stock", "wiki", "js",
-    ".git", ".github", ".tex_cache", "__pycache__",
-}
+_PKG = Path(__file__).resolve().parent.parent
 
 # A real *construction* site: `code="E1234"`, `code='E1234'`, or a dict literal's
 # `"code": "E1234"` — deliberately narrower than "the code's digits appear in this file",
@@ -72,21 +70,6 @@ _MODULE_KEYWORD = {
     "tex_api.py": "internal",
     "tex_compiler/diagnostics.py": "internal",
 }
-
-
-def _product_files():
-    out = []
-    for root, dirs, files in os.walk(_PKG):
-        rel = os.path.relpath(root, _PKG)
-        top = "" if rel == "." else rel.split(os.sep)[0]
-        if top in _NOT_PRODUCT:
-            dirs[:] = []
-            continue
-        for fn in files:
-            if fn.endswith(".py"):
-                p = os.path.join(root, fn)
-                out.append((p, os.path.relpath(p, _PKG).replace(os.sep, "/")))
-    return sorted(out, key=lambda t: t[1])
 
 
 def _plurality_keyword_by_family():
@@ -121,22 +104,29 @@ def _load_generator():
     return mod
 
 
-def _development_range_table(text):
-    """{'E4': 'Type checker — unrecognized construct (catch-all)', ...} from DEVELOPMENT.md's
-    '### Error Code Ranges' table (the `Phase` column, family prefix stripped to 2 chars)."""
-    section = text.split("### Error Code Ranges", 1)[-1].split("\n### ", 1)[0]
+# FIX-ROI49 Q6 (R2#5): DEVELOPMENT.md's and CONTRIBUTING.md's range tables differ only in
+# WHERE the table sits (the pair of split markers bounding the section); the parse itself —
+# split section, regex out `| \`E4xxx\` | description |` rows — was the same function typed
+# twice. One parametrized helper, called with each doc's own two literal markers.
+def _range_table(text, start_anchor, end_marker):
+    """{'E4': 'Type checker — unrecognized construct (catch-all)', ...} from the range table
+    between `start_anchor` and `end_marker` (the `Phase`/description column, family prefix
+    stripped to 2 chars)."""
+    section = text.split(start_anchor, 1)[-1].split(end_marker, 1)[0]
     out = {}
     for m in re.finditer(r'\|\s*`([EW]\d)xxx`\s*\|\s*([^|]+?)\s*\|', section):
         out[m.group(1)] = m.group(2)
     return out
+
+
+def _development_range_table(text):
+    """DEVELOPMENT.md's '### Error Code Ranges' table."""
+    return _range_table(text, "### Error Code Ranges", "\n### ")
 
 
 def _contributing_range_table(text):
-    section = text.split("Codes are grouped by stage:", 1)[-1].split("\n## ", 1)[0]
-    out = {}
-    for m in re.finditer(r'\|\s*`([EW]\d)xxx`\s*\|\s*([^|]+?)\s*\|', section):
-        out[m.group(1)] = m.group(2)
-    return out
+    """CONTRIBUTING.md's "Codes are grouped by stage:" table."""
+    return _range_table(text, "Codes are grouped by stage:", "\n## ")
 
 
 def test_docs49_range_heading_matches_emitting_phase(r: SubTestResult):

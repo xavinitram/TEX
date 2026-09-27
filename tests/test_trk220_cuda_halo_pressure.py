@@ -53,23 +53,15 @@ from TEX_Wrangle.tex_cache import get_cache
 from TEX_Wrangle.tex_marshalling import infer_binding_type
 from TEX_Wrangle.tex_runtime import host as host_mod
 
-# Both exact fp32 values, the identical B1/O1 repro: the Python-double sum is
-# 0.5000000111758709 (> 0.5 -- the WRONG, double-precision branch decision), while
-# torch.float32(a) + torch.float32(b) is exactly 0.5 (not > 0.5) -- the runtime actually
-# executes the `else` arm (the halo op), not the `then` arm (a plain, halo-0 copy).
-_A = 0.45405644178390503
-_B = 0.045943569391965866
-_PARAMS = {"a": _A, "b": _B}
-
-_BLUR_CODE = """
-f$a = 0.0;
-f$b = 0.0;
-if ($a + $b > 0.5) {
-    @OUT = @image;
-} else {
-    @OUT = gauss_blur(@image, 4.0);
-}
-"""
+# FIX-ROI49 Q6 (R1#3): the EXACT B1/O1 fp32-boundary repro -- the same load-bearing literal
+# floats and program text `test_fixroi_o1_fp32_branch_fold.py` defines, imported rather than
+# copied so the two files' repros are PINNED to stay byte-identical. Copying the literals
+# would let this file keep "confirming" a boundary case that no longer demonstrates the bug
+# if the O1 file's own repro ever moved to a different boundary-case pair. The Python-double
+# sum of _A + _B is 0.5000000111758709 (> 0.5 -- the WRONG, double-precision branch decision),
+# while torch.float32(_A) + torch.float32(_B) is exactly 0.5 (not > 0.5) -- the runtime
+# actually executes the `else` arm (the halo op), not the `then` arm (a plain, halo-0 copy).
+from test_fixroi_o1_fp32_branch_fold import _A, _B, _PARAMS, _BLUR_CODE
 
 _CANVAS = 256   # calibrated size: estimate_peak_bytes reads exactly 1 MiB here (verified by
                 # running against this exact program) -- see module docstring.
