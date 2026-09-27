@@ -1777,7 +1777,18 @@ class StageSpec:
     whichever builtin the join stage's own code runs — resolving that from source is the
     CALLER's job (a `roi_plan`/`binding_footprints`-shaped one), exactly as `stage_halo`
     already resolves the single-input case; this dataclass only carries the resolved
-    number, the same division of labour `halos[i]` already had."""
+    number, the same division of labour `halos[i]` already had.
+
+    KNOWN LIMIT (FIX-ROI49 Q5, B1-roi.md): `arg_halo` is keyed by UPSTREAM STAGE INDEX only,
+    one number per index. If a stage ever reads the SAME upstream index through TWO argument
+    roles that need DIFFERENT margins (e.g. a composite reading the same plate as both `bg`,
+    halo 0, and a blurred `fg`, halo > 0, with no intervening stage giving each role its own
+    index), this dict can only hold one number for that index — silently the SMALLER one,
+    under-serving whichever role actually needed more, unless the caller pre-maxes the roles
+    before building `arg_halo`. No caller does this today (`chain_windows_dag` has no
+    production caller at all yet — `tex_roi.py` and its own test file are the only
+    referencers); flagged here for whoever wires REACH-48's per-argument registry through
+    this dataclass, so the pre-max is done at that point rather than assumed."""
     halo: float
     inputs: tuple = ()
     arg_halo: "dict | None" = None
