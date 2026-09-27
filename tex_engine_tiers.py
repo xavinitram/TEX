@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 
 import torch
 
@@ -442,3 +443,126 @@ def _run_tier(ctx, tier_id):
         return out if isinstance(out, dict) else {ctx.output_names[0]: out}
     out = _TIER_METHOD[tier_id](ctx)
     return out if isinstance(out, dict) else {ctx.output_names[0]: out}
+
+
+# ── TIERQ-48: the declared-fallback query ────────────────────────────────────
+#
+# A public, side-effect-free query answering "which tier will a cook of THIS shape
+# run on, and why" — before a host cooks anything. It exists because scale/ROI are
+# SILENTLY interpreter-only past two separate choke points (`_run_tier`'s unconditional
+# `ctx.scale is not None` bypass above; `tex_engine.prepare`'s `roi is not None and
+# tier_id == "default"` gate), so a host previously had no way to learn that fact except
+# by timing a cook and noticing it was slow.
+#
+# Read-only over tier selection: this calls `select_tier` (this module, unchanged) and
+# the existing `tex_roi` predicates (`scale_safe`/`roi_exec_enabled`/`validate_roi`/
+# `canonical_roi`/`roi_plan`) in the SAME order `tex_engine.prepare()`'s own gate already
+# does, rather than re-deriving a parallel judgment — so the two answers can never
+# disagree by construction. `tests/test_tierq48_agreement.py` pins this against the real
+# cook path's own `CookPlan` for a matrix of inputs.
+#
+# STABLE REASON CODES — part of the public contract: a host may branch on these exact
+# strings, and they do not change shape across a release without a CHANGELOG entry.
+TIER_REASON_SCALE_UNSAFE = "scale-unsafe-refused"   # the cook itself would raise, not run
+TIER_REASON_SCALE_ACTIVE = "scale-active"           # non-None scale forces "interpreter"
+TIER_REASON_SELECTED = "tier-selected"              # plain select_tier verdict, scale inactive
+
+ROI_REASON_TIER_NOT_DEFAULT = "roi-declined-tier-not-default"
+ROI_REASON_FUSED_CHAIN = "roi-declined-fused-chain"
+ROI_REASON_LATENT = "roi-declined-latent-input"
+ROI_REASON_SCALE_ACTIVE = "roi-declined-scale-active"
+ROI_REASON_NOT_ARMED = "roi-declined-not-armed"
+ROI_REASON_MALFORMED = "roi-declined-malformed"
+ROI_REASON_WHOLE_FRAME = "roi-declined-whole-frame"
+ROI_REASON_NOT_EXECUTABLE = "roi-declined-not-executable"
+ROI_REASON_PRECISION = "roi-declined-precision-not-fp32"
+ROI_REASON_ARMED = "roi-armed"
+
+
+@dataclass(frozen=True)
+class TierVerdict:
+    """TIERQ-48's answer. `tier` is one of the five strings the real dispatch can
+    actually produce — `"torch_compile"` / `"auto"` / `"cuda_graph"` / `"default"` /
+    `"interpreter"` — or `None` when the cook itself would REFUSE
+    (`reason == TIER_REASON_SCALE_UNSAFE`): never a guess at what an exception-raising
+    cook "would have" run on. `roi_armed` is a SEPARATE question from `tier`: an
+    otherwise-eligible compiled/graphed tier still runs an ROI-requesting cook
+    whole-frame (see `ROI_REASON_TIER_NOT_DEFAULT`) — `tier` names what executes the
+    cook, `roi_armed` names whether IT narrows to the window."""
+    tier: str | None
+    reason: str
+    roi_armed: bool
+    roi_reason: str | None
+
+
+def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
+                 precision: str | None = None, roi: tuple | None = None,
+                 scale: float | None = None, param_values: dict | None = None,
+                 binding_types: dict | None = None, fused_chain: bool = False,
+                 fused_fp_present: bool = False, has_latent_input: bool = False,
+                 roi_exec: bool | None = None) -> TierVerdict:
+    """TIERQ-48: which tier a cook of `code` at `(compile_mode, device, roi, scale)`
+    WILL run on, and why — computed by
+    calling the exact same read-only predicates `tex_engine.prepare()` calls, in the
+    same order, rather than re-deriving a parallel judgment. Side-effect-free: no
+    compile, no cache write, no cook, no cache pollution.
+
+    `precision` is the cook's EFFECTIVE precision (`"fp32"` / `"fp16"`; `None` means
+    `"fp32"`, matching `prepare()`'s own default) — exactly what `prepare()` has already
+    resolved by the time its own ROI gate runs. This function does NOT resolve
+    `precision="auto"` itself: that resolution needs a real cook's bindings/resolution to
+    size the pixel-count gate (`tex_runtime.precision_policy.resolve_auto_precision`),
+    which a pre-cook, bindings-free query does not have in general. A caller predicting an
+    `"auto"` cook resolves it first, exactly as `prepare()` does before this same gate,
+    and passes the resolved string here.
+
+    `roi`, when given, is the 6-tuple `(x0, y0, w, h, full_w, full_h)` `tex_engine.cook`
+    takes. `param_values`/`binding_types` feed `tex_roi.roi_plan`'s reach analysis exactly
+    as a real cook's `_scalar_params(bindings)`/`binding_types` would; both default to
+    "not supplied", the conservative reading `roi_plan` itself documents.
+
+    Never raises: a malformed `roi` is reported as a declined reason
+    (`ROI_REASON_MALFORMED`), not a `TypeError`/`ValueError` — the same "over-approximate,
+    never blow up" posture every other `tex_roi` query in this module already takes.
+    """
+    from . import tex_roi as _tex_roi
+
+    if scale is not None and scale != 1.0 and not _tex_roi.scale_safe(code, param_values):
+        return TierVerdict(None, TIER_REASON_SCALE_UNSAFE, False, None)
+
+    eff_precision = "fp32" if precision is None else precision
+    tier_id = select_tier(compile_mode, device, fused_chain, fused_fp_present)
+
+    roi_armed = False
+    roi_reason = None
+    if roi is not None:
+        # Mirrors `tex_engine.prepare()`'s ROI gate verbatim, in the same order: the
+        # OUTER eligibility (tier/fused/latent) first, then scale, then the per-window
+        # checks `run_roi`'s own cheap validation performs ahead of the expensive ones.
+        if tier_id != "default":
+            roi_reason = ROI_REASON_TIER_NOT_DEFAULT
+        elif fused_chain:
+            roi_reason = ROI_REASON_FUSED_CHAIN
+        elif has_latent_input:
+            roi_reason = ROI_REASON_LATENT
+        elif scale is not None:
+            roi_reason = ROI_REASON_SCALE_ACTIVE
+        elif not _tex_roi.roi_exec_enabled(roi_exec):
+            roi_reason = ROI_REASON_NOT_ARMED
+        elif _tex_roi.validate_roi(roi) is not None:
+            roi_reason = ROI_REASON_MALFORMED
+        else:
+            _canon = _tex_roi.canonical_roi(roi)
+            if _canon[2:4] == _canon[4:6]:
+                roi_reason = ROI_REASON_WHOLE_FRAME
+            elif not _tex_roi.roi_plan(code, param_values, binding_types).executable:
+                roi_reason = ROI_REASON_NOT_EXECUTABLE
+            elif eff_precision != "fp32":
+                roi_reason = ROI_REASON_PRECISION
+            else:
+                roi_armed = True
+                roi_reason = ROI_REASON_ARMED
+
+    if scale is not None:
+        return TierVerdict("interpreter", TIER_REASON_SCALE_ACTIVE, roi_armed, roi_reason)
+    return TierVerdict(tier_id, TIER_REASON_SELECTED, roi_armed, roi_reason)

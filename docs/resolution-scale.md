@@ -95,6 +95,55 @@ not otherwise shrink with the canvas.
   Reported via `tier_trace` exactly like every other tier decline (`tier_trace.last().tier ==
   "interpreter"`, reason names scale) — never a silent fallback.
 
+## The declared-fallback query (TIERQ-48)
+
+Both gaps above — "only the interpreter tier honours `scale`" and ROI's own `tier_id ==
+"default"` requirement (`docs/roi-spatial-laziness.md`) — mean a host cannot learn, short
+of timing a cook and noticing it was slow, that a `torch_compile`/`auto`/`cuda_graph`-
+eligible program silently downgrades to the interpreter the moment `scale`/`roi` is
+requested. `tex_api.tier_verdict` (delegating to `tex_engine_tiers.tier_verdict`) makes
+that fact QUERYABLE instead of only documented in prose:
+
+    from TEX_Wrangle import tex_api
+    v = tex_api.tier_verdict(source, compile_mode="torch_compile", device="cuda:0",
+                             roi=(x0, y0, w, h, full_w, full_h), roi_exec=True)
+    # v.tier == "torch_compile"       (the coarse tier select_tier would pick)
+    # v.roi_armed == False            (that tier never threads roi — whole-frame)
+    # v.roi_reason == "roi-declined-tier-not-default"
+
+It returns a `TierVerdict(tier, reason, roi_armed, roi_reason)`:
+
+- `tier` is one of `"torch_compile"` / `"auto"` / `"cuda_graph"` / `"default"` /
+  `"interpreter"` — the same five strings the real dispatch (`tex_engine_tiers._run_tier`)
+  can actually produce — or `None` when the cook itself would REFUSE (a non-1.0 `scale`
+  the classifier cannot prove safe): the query never guesses what an exception-raising
+  cook "would have" run on.
+- `roi_armed`/`roi_reason` answer the SEPARATE question of whether a requested `roi`
+  window actually narrows the cook — `False` even on an eligible tier when that tier
+  never threads ROI at all, or on the `"default"` tier itself for any of the ordinary
+  reasons (`roi_exec` not armed, a malformed or whole-frame window, a non-ROI-executable
+  program, a non-fp32 effective precision).
+- Both `reason` and `roi_reason` are STABLE string constants
+  (`tex_engine_tiers.TIER_REASON_*` / `ROI_REASON_*`) a host may branch on; they do not
+  change shape across a release without a CHANGELOG entry.
+
+It is side-effect-free (no compile, no cache write, no cook) and read-only over tier
+selection: it calls the exact same `select_tier` plus the exact same `tex_roi` predicates
+(`scale_safe`/`roi_exec_enabled`/`validate_roi`/`canonical_roi`/`roi_plan`) `tex_engine.
+prepare()`'s own tier/ROI gates call, in the same order — so the query and a real cook's
+plan can never disagree by construction. `precision` must be the cook's already-resolved
+EFFECTIVE precision (`"fp32"`/`"fp16"`; `None` means `"fp32"`) — the query does not
+resolve `precision="auto"` itself, because that resolution needs a real cook's bindings/
+resolution to size the pixel-count gate; a caller predicting an `"auto"` cook resolves it
+first, exactly as `prepare()` does before this same gate runs.
+
+**Measured, not merely designed: whether codegen-ROI (`TEX_ROI_CODEGEN=1`) changes this
+query's answer.** The query reports `roi_armed`/`tier` for the tier a cook actually runs
+on; `TEX_ROI_CODEGEN` is an orthogonal, `"default"`-tier-internal routing choice (codegen
+vs. the tree-walking interpreter for an already-armed ROI window) that does not change
+which of the five `tier` values the query reports. See the codegen-ROI re-measurement
+below for whether that internal choice is worth flipping.
+
 ## The classifier and the override comment
 
 `tex_roi.scale_safe(code)` (memoized as `tex_roi.scale_verdict(code)`, mirrored publicly as

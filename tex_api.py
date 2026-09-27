@@ -132,6 +132,43 @@ def scale_verdict(source: str, param_values: dict | None = None):
     return _roi_scale_verdict(source, param_values)
 
 
+def tier_verdict(source: str, *, compile_mode: str = "none", device: str = "cpu",
+                 precision: str | None = None, roi: tuple | None = None,
+                 scale: float | None = None, param_values: dict | None = None,
+                 binding_types: dict | None = None, roi_exec: bool | None = None):
+    """TIERQ-48: the pre-cook, side-effect-free query — which tier will a cook of
+    `source` at `(compile_mode, device, roi, scale)` actually run on, and why, before a
+    host cooks anything. Generalizes `scale_verdict`'s "would this be refused" question
+    to the tier-selection question `docs/resolution-scale.md`'s "What is NOT covered"
+    section already documents in prose (only the interpreter tier honours `scale`; ROI
+    silently declines outside the `"default"` tier) — this makes that fact QUERYABLE
+    rather than only readable in a doc.
+
+    Returns a `tex_engine_tiers.TierVerdict(tier, reason, roi_armed, roi_reason)`:
+    `tier` is one of `"torch_compile"` / `"auto"` / `"cuda_graph"` / `"default"` /
+    `"interpreter"`, or `None` when the cook itself would REFUSE (an unsafe non-1.0
+    `scale`) rather than run at all. `roi_armed` answers the SEPARATE question of
+    whether a requested `roi` window actually narrows the cook (it can be `False` even
+    when `tier` is eligible, e.g. `torch_compile`/`auto`/`cuda_graph` never thread ROI).
+    Every reason is a STABLE string constant (`tex_engine_tiers.TIER_REASON_*` /
+    `ROI_REASON_*`) a host may branch on.
+
+    Delegates to `tex_engine_tiers.tier_verdict`, which calls the exact same read-only
+    `tex_roi` predicates `tex_engine.prepare()`'s own tier/ROI gates call, in the same
+    order — so this query and a real cook's `CookPlan` can never disagree by
+    construction (see that function's docstring; agreement is pinned by
+    `tests/test_tierq48_agreement.py`). Fused-chain and LATENT-input cooks are out of
+    this facade's scope (mirroring `execute()`'s own "single program" scope above) —
+    a host cooking a fused chain or a LATENT-typed program calls
+    `tex_engine_tiers.tier_verdict(..., fused_chain=True, ...)` /
+    `(..., has_latent_input=True)` directly."""
+    from .tex_engine_tiers import tier_verdict as _tier_verdict
+    return _tier_verdict(source, compile_mode=compile_mode, device=device,
+                        precision=precision, roi=roi, scale=scale,
+                        param_values=param_values, binding_types=binding_types,
+                        roi_exec=roi_exec)
+
+
 def check_proxy_scale(bindings: dict, full_hw: tuple, scale: float, tolerance_px: int = 1):
     """SCALE-47a §(b): offered, never enforced — a cheap arity check that a cook's bound
     proxy images agree with the `scale` the caller claims for them (`round(full_H*scale)` /
