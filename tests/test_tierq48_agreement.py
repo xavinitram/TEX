@@ -20,8 +20,10 @@ import torch
 
 from TEX_Wrangle import tex_engine
 from TEX_Wrangle import tex_roi as _tex_roi
+from TEX_Wrangle.tex_compiler.types import TEXType
 from TEX_Wrangle.tex_engine_tiers import (
     tier_verdict, select_tier, TIER_REASON_SCALE_UNSAFE, TIER_REASON_SCALE_ACTIVE,
+    TIER_REASON_SCALE_ACTIVE_CODEGEN,
     ROI_REASON_TIER_NOT_DEFAULT, ROI_REASON_NOT_ARMED, ROI_REASON_ARMED,
     ROI_REASON_WHOLE_FRAME, ROI_REASON_SCALE_ACTIVE,
 )
@@ -36,17 +38,48 @@ _PLAIN_CODE = "@OUT = @A * 2.0;\n"
 # unsafe class (docs/resolution-scale.md "The classifier and the override comment").
 _SCALE_UNSAFE_CODE = "@OUT = vec4(vec3(float(img_width()) * 0.001), 1.0);\n"
 
+# SCALE-CG-48's own precondition shape (tests/test_scalecg48_codegen_scale.py): an
+# exact-fetch box-blur stencil (UC-2 routes this to codegen) alongside an independent
+# gauss_blur output — `//!tex scale: safe` vouches for the hand-written ix/iy pixel
+# arithmetic the classifier over-approximates as unsafe (documented, sanctioned override).
+_STENCIL_PLUS_BLUR_CODE = """//!tex scale: safe
+i$radius = 2;
+vec3 acc = vec3(0.0);
+float cnt = 0.0;
+for (int dy = -$radius; dy <= $radius; dy = dy + 1) {
+    for (int dx = -$radius; dx <= $radius; dx = dx + 1) {
+        acc = acc + fetch(@A, ix + dx, iy + dy).rgb;
+        cnt = cnt + 1.0;
+    }
+}
+@STENCIL = vec4(acc / cnt, 1.0);
+@BLUR = gauss_blur(@A, 8.0);
+"""
+_STENCIL_PLUS_BLUR_BT = {"A": TEXType.VEC3, "radius": TEXType.INT,
+                        "STENCIL": TEXType.VEC4, "BLUR": TEXType.VEC4}
+
 
 def _real_plan(code, bindings, **kw):
     """Ground truth: what `tex_engine.prepare()` actually decided, read off its
-    `CookPlan` — never `tier_trace` (see module docstring)."""
+    `CookPlan` — never `tier_trace` for the NON-scale case (see module docstring: it
+    only records on fallback and can carry a stale prior-cook record)."""
     _tex_roi.clear_roi_memo()
     return tex_engine.prepare(code, dict(bindings), device_mode="cpu", **kw)
 
 
 def _real_tier_and_roi_armed(code, bindings, **kw):
     plan = _real_plan(code, bindings, **kw)
-    tier = "interpreter" if plan.ctx.scale is not None else plan.tier_id
+    if plan.ctx.scale is not None:
+        # SCALE-CG-48: codegen-vs-interpreter for a scale-active cook is decided INSIDE
+        # `_dispatch_tier` (the UC-2 stencil gate on the compiled program), not visible on
+        # `CookPlan` — actually run it and read `tier_trace`, which BOTH branches of that
+        # decision explicitly record for a scale-active cook (unlike the general
+        # "default tier succeeded quietly" gap this module's docstring names).
+        from TEX_Wrangle.tex_runtime import tier_trace as _tt
+        tex_engine._dispatch_tier(plan)
+        tier = _tt.last().tier
+    else:
+        tier = plan.tier_id
     return tier, plan.ctx.roi is not None
 
 
@@ -73,6 +106,34 @@ def test_tierq48_agrees_scale_1_0_still_forces_interpreter():
     real_tier, _ = _real_tier_and_roi_armed(_PLAIN_CODE, {"A": A}, scale=1.0)
     v = tier_verdict(_PLAIN_CODE, compile_mode="none", device="cpu", scale=1.0)
     assert v.tier == real_tier == "interpreter"
+
+
+def test_tierq48_agrees_scale_active_stencil_route_uses_codegen():
+    """SCALE-CG-48: a scale-active cook on the `"default"` tier routes to codegen
+    instead of the interpreter when the UC-2 stencil gate would already choose it —
+    the query must name `"codegen"` here, not fall back to the pre-SCALE-CG-48
+    `"interpreter"` answer."""
+    A = torch.rand(1, 32, 32, 3)
+    real_tier, real_roi_armed = _real_tier_and_roi_armed(
+        _STENCIL_PLUS_BLUR_CODE, {"A": A, "radius": 2}, scale=0.5)
+    v = tier_verdict(_STENCIL_PLUS_BLUR_CODE, compile_mode="none", device="cpu",
+                     scale=0.5, binding_types=_STENCIL_PLUS_BLUR_BT)
+    assert (v.tier, v.roi_armed) == (real_tier, real_roi_armed)
+    assert v.tier == "codegen" and v.reason == TIER_REASON_SCALE_ACTIVE_CODEGEN
+
+
+def test_tierq48_scale_active_codegen_route_falls_back_when_it_cannot_compile():
+    """When `code` cannot be compiled against the given (or omitted) `binding_types` —
+    here, a binding whose declared type disagrees with how it is used — the query
+    cannot check the UC-2 stencil gate and conservatively reports `"interpreter"`,
+    documented as a pessimistic-but-never-wrong-pixel gap: the tier this reports is a
+    tier that ALSO would have run correctly, just not necessarily the fastest one a
+    real (successfully-compiled) cook would pick."""
+    bad_bt = dict(_STENCIL_PLUS_BLUR_BT)
+    bad_bt["A"] = TEXType.FLOAT       # disagrees with `.rgb` channel access on @A
+    v = tier_verdict(_STENCIL_PLUS_BLUR_CODE, compile_mode="none", device="cpu",
+                     scale=0.5, binding_types=bad_bt)
+    assert v.tier == "interpreter" and v.reason == TIER_REASON_SCALE_ACTIVE
 
 
 def test_tierq48_agrees_scale_unsafe_refuses():

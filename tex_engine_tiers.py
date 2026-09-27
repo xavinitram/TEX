@@ -465,6 +465,7 @@ def _run_tier(ctx, tier_id):
 # strings, and they do not change shape across a release without a CHANGELOG entry.
 TIER_REASON_SCALE_UNSAFE = "scale-unsafe-refused"   # the cook itself would raise, not run
 TIER_REASON_SCALE_ACTIVE = "scale-active"           # non-None scale forces "interpreter"
+TIER_REASON_SCALE_ACTIVE_CODEGEN = "scale-active-codegen-stencil"  # SCALE-CG-48's UC-2 route
 TIER_REASON_SELECTED = "tier-selected"              # plain select_tier verdict, scale inactive
 
 ROI_REASON_TIER_NOT_DEFAULT = "roi-declined-tier-not-default"
@@ -481,18 +482,42 @@ ROI_REASON_ARMED = "roi-armed"
 
 @dataclass(frozen=True)
 class TierVerdict:
-    """TIERQ-48's answer. `tier` is one of the five strings the real dispatch can
+    """TIERQ-48's answer. `tier` is one of the six strings the real dispatch can
     actually produce — `"torch_compile"` / `"auto"` / `"cuda_graph"` / `"default"` /
-    `"interpreter"` — or `None` when the cook itself would REFUSE
-    (`reason == TIER_REASON_SCALE_UNSAFE`): never a guess at what an exception-raising
-    cook "would have" run on. `roi_armed` is a SEPARATE question from `tier`: an
-    otherwise-eligible compiled/graphed tier still runs an ROI-requesting cook
-    whole-frame (see `ROI_REASON_TIER_NOT_DEFAULT`) — `tier` names what executes the
-    cook, `roi_armed` names whether IT narrows to the window."""
+    `"interpreter"` / `"codegen"` (SCALE-CG-48: a scale-active cook on the `"default"`
+    tier that hits the UC-2 stencil route) — or `None` when the cook itself would
+    REFUSE (`reason == TIER_REASON_SCALE_UNSAFE`): never a guess at what an
+    exception-raising cook "would have" run on. `roi_armed` is a SEPARATE question from
+    `tier`: an otherwise-eligible compiled/graphed tier still runs an ROI-requesting
+    cook whole-frame (see `ROI_REASON_TIER_NOT_DEFAULT`), and the `"codegen"` scale
+    route never threads ROI either (`ROI_REASON_SCALE_ACTIVE`) — `tier` names what
+    executes the cook, `roi_armed` names whether IT narrows to the window."""
     tier: str | None
     reason: str
     roi_armed: bool
     roi_reason: str | None
+
+
+def _stencil_route_would_apply(code: str, binding_types: dict | None) -> bool | None:
+    """SCALE-CG-48 support: best-effort, read-only check of whether a scale-active,
+    `tier_id == "default"` cook would route to codegen (the UC-2 stencil gate,
+    `_should_stencil_route`) -- the one fact `tier_verdict` needs that a raw source
+    string alone cannot answer, because `_should_stencil_route` consults the COMPILED
+    program, not the text. Returns `True`/`False` when it could compile `code` (against
+    `binding_types`) and check, or `None` ("unknown, answer conservatively") on any
+    failure -- most commonly `binding_types` being `None` or incomplete, exactly the
+    same "supply it for a precise answer" contract `roi_plan`'s `binding_types`
+    parameter already documents above. Compiling here reads/writes the SAME program
+    cache a real cook already populates (`TEXCache`) -- no new cache, no cook-observer
+    event, no tensor allocation, no execution."""
+    try:
+        from .tex_cache import get_cache
+        bt = binding_types or {}
+        fp = get_cache().fingerprint(code, bt)
+        ast = _tex_engine._compile_or_raise(code, bt, fp=fp)[0]
+        return bool(_tex_engine._should_stencil_route(fp, ast))
+    except Exception:
+        return None
 
 
 def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
@@ -520,6 +545,16 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
     takes. `param_values`/`binding_types` feed `tex_roi.roi_plan`'s reach analysis exactly
     as a real cook's `_scalar_params(bindings)`/`binding_types` would; both default to
     "not supplied", the conservative reading `roi_plan` itself documents.
+
+    `binding_types` also decides how precisely this function can answer for a
+    scale-active cook on the `"default"` tier (SCALE-CG-48): that cook routes to
+    `"codegen"` instead of `"interpreter"` when the UC-2 stencil gate would already
+    choose codegen, and answering that precisely means compiling `code` against
+    `binding_types` (the same compile a real cook performs; no new cache, no
+    execution). Without `binding_types` (or with one that cannot compile `code`), this
+    conservatively reports `"interpreter"` — never wrong about there being NO wrong
+    pixel risk (that gate only picks a FASTER tier for the same bytes), only
+    potentially pessimistic about which tier is named.
 
     Never raises: a malformed `roi` is reported as a declined reason
     (`ROI_REASON_MALFORMED`), not a `TypeError`/`ValueError` — the same "over-approximate,
@@ -564,5 +599,15 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
                 roi_reason = ROI_REASON_ARMED
 
     if scale is not None:
+        # SCALE-CG-48: on the "default" tier only (never torch_compile/auto/cuda_graph —
+        # those stay forced to the interpreter, unchanged from SCALE-47b), a scale-active
+        # cook routes to codegen instead when the UC-2 stencil gate would already choose
+        # it. Mirrors `_run_tier`'s own new branch exactly (`tier_id == "default" and not
+        # fused_chain and _should_stencil_route(...)`).
+        if tier_id == "default" and not fused_chain:
+            stencil = _stencil_route_would_apply(code, binding_types)
+            if stencil:
+                return TierVerdict("codegen", TIER_REASON_SCALE_ACTIVE_CODEGEN,
+                                   roi_armed, roi_reason)
         return TierVerdict("interpreter", TIER_REASON_SCALE_ACTIVE, roi_armed, roi_reason)
     return TierVerdict(tier_id, TIER_REASON_SELECTED, roi_armed, roi_reason)

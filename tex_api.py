@@ -146,8 +146,11 @@ def tier_verdict(source: str, *, compile_mode: str = "none", device: str = "cpu"
 
     Returns a `tex_engine_tiers.TierVerdict(tier, reason, roi_armed, roi_reason)`:
     `tier` is one of `"torch_compile"` / `"auto"` / `"cuda_graph"` / `"default"` /
-    `"interpreter"`, or `None` when the cook itself would REFUSE (an unsafe non-1.0
-    `scale`) rather than run at all. `roi_armed` answers the SEPARATE question of
+    `"interpreter"` / `"codegen"` (a scale-active `"default"`-tier cook that hits the
+    UC-2 stencil route — precise only when `binding_types` lets this compile `source`;
+    see `tier_verdict`'s own docstring), or `None` when the cook itself would REFUSE (an
+    unsafe non-1.0 `scale`) rather than run at all. `roi_armed` answers the SEPARATE
+    question of
     whether a requested `roi` window actually narrows the cook (it can be `False` even
     when `tier` is eligible, e.g. `torch_compile`/`auto`/`cuda_graph` never thread ROI).
     Every reason is a STABLE string constant (`tex_engine_tiers.TIER_REASON_*` /

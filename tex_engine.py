@@ -177,6 +177,7 @@ from .tex_engine_tiers import (                   # noqa: F401  (re-export)
     _roi_codegen_enabled, _run_default, _TIER_METHOD, _run_tier,
     # TIERQ-48: the declared-fallback query (read-only; see that module's own docstring)
     tier_verdict, TierVerdict, TIER_REASON_SCALE_UNSAFE, TIER_REASON_SCALE_ACTIVE,
+    TIER_REASON_SCALE_ACTIVE_CODEGEN,
     TIER_REASON_SELECTED, ROI_REASON_TIER_NOT_DEFAULT, ROI_REASON_FUSED_CHAIN,
     ROI_REASON_LATENT, ROI_REASON_SCALE_ACTIVE, ROI_REASON_NOT_ARMED,
     ROI_REASON_MALFORMED, ROI_REASON_WHOLE_FRAME, ROI_REASON_NOT_EXECUTABLE,
