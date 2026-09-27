@@ -120,11 +120,15 @@ def _valid_footprint(fp) -> bool:
     'halo_arg' takes an OPTIONAL third element `mult` (>0) — the ROI-2 reach multiplier
     that turns the argument into a pixel reach (`gauss_blur`'s kernel radius is 3·sigma,
     not sigma; the descriptor carries `mult=3.0`). Default multiplier is 1.0 (erode/dilate,
-    whose radius argument already is the pixel reach). bool is rejected explicitly (it is an
-    int subclass, and True as a radius is a bug, not a radius)."""
+    whose radius argument already is the pixel reach). A1 (v0.50 Phase C): an OPTIONAL
+    fourth element `approx_above` (>0) — the RAW (pre-`mult`) argument value past which the
+    builtin itself switches to a downscale/resample approximation whose grid is anchored to
+    the crop, not the frame (`gauss_blur`'s pyramid, `bilateral_filter`'s detail-transfer);
+    `tex_roi._reach_of` declines to narrow past it (see its own comment). bool is rejected
+    explicitly (it is an int subclass, and True as a radius/threshold is a bug, not one)."""
     if fp == "point" or fp == "image":
         return True
-    if not isinstance(fp, tuple) or len(fp) not in (2, 3):
+    if not isinstance(fp, tuple) or len(fp) not in (2, 3, 4):
         return False
     kind, val = fp[0], fp[1]
     if isinstance(val, bool):
@@ -139,7 +143,13 @@ def _valid_footprint(fp) -> bool:
         if len(fp) == 2:
             return True
         mult = fp[2]
-        return isinstance(mult, (int, float)) and not isinstance(mult, bool) and mult > 0
+        if not (isinstance(mult, (int, float)) and not isinstance(mult, bool) and mult > 0):
+            return False
+        if len(fp) == 3:
+            return True
+        approx_above = fp[3]
+        return (isinstance(approx_above, (int, float)) and not isinstance(approx_above, bool)
+                and approx_above > 0)
     return False
 
 

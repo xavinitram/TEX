@@ -152,9 +152,12 @@ def _reach_of(fp, args: list):
     argument's own `arg_footprint` entry). Same grammar, same return contract:
       * None        — not a spatial op (pointwise fn / unregistered) — reads at ctx.
       * int         — a narrowable-halo direct-tensor op (blur/morphology) of this radius.
-      * 'unbounded' — a direct-tensor halo op whose radius is symbolic (a wired scalar): its
-                      output is input-shaped, so it cannot be narrowed to an unknown halo and
-                      blocks ROI (whole-frame fallback) UNLESS it sits inside a gather.
+      * 'unbounded' — a direct-tensor halo op whose radius is symbolic (a wired scalar), OR
+                      whose FOLDED value is large enough to route the builtin to a downscale
+                      approximation (`halo_arg`'s optional 4th element, `approx_above` — see
+                      below): either way, its output is input-shaped and cannot be narrowed to
+                      a known halo, so it blocks ROI (whole-frame fallback) UNLESS it sits
+                      inside a gather.
       * 'image'     — whole-image / temporal gather or reduction — reads the whole input.
     """
     if fp is None or fp == "point":
@@ -167,9 +170,25 @@ def _reach_of(fp, args: list):
     if kind == "halo_arg":
         i = fp[1]
         mult = fp[2] if len(fp) > 2 else 1.0            # the reach multiplier (gauss=3.0)
+        # A1 (v0.50 Phase C): a 4th descriptor element, `approx_above`, names the raw
+        # (pre-mult) argument value past which the builtin itself stops being a pure
+        # narrowable-halo op and switches to a downscale/resample approximation whose
+        # grid is anchored to the CROP's own edges, not the frame's absolute coordinates
+        # (gauss_blur's pyramid past sigma>threshold, bilateral_filter's detail-transfer
+        # past spatial_sigma>threshold — see stdlib_sample.py's footprint comments). A
+        # window that has not saturated to the whole frame then samples on a different
+        # phase than a whole-frame cook would, i.e. exactly invariant 5's "wrong only
+        # when tiled/ROI-narrowed" shape. There is no grid-alignment fix that generalizes
+        # (RADIUS-50a/R4 F1 — alignment would need the crop's absolute origin, which the
+        # coordinate system does not carry); the general fix is to decline the window
+        # here, in the ONE place every consumer (ROI, tiling/OOM strips, cook_stage_dag)
+        # already funnels through — the same answer a non-foldable argument gets below.
+        approx_above = fp[3] if len(fp) > 3 else None
         v = _static_number(args[i]) if i < len(args) else None
         if v is None:
             return "unbounded"                          # symbolic radius → blocks narrowing
+        if approx_above is not None and abs(v) > approx_above:
+            return "unbounded"                          # foldable, but past the approx threshold
         return int(math.ceil(mult * abs(v)))
     if kind == "frame":
         return "image"                                  # spatially whole (temporal: ROI-6)

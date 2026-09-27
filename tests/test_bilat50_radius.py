@@ -426,39 +426,37 @@ def test_bilat50_windowed_vs_whole_frame_below_today_window(r: SubTestResult):
         _R.clear_roi_memo()
 
 
-def test_bilat50_windowed_vs_whole_frame_detail_transfer_saturates(r: SubTestResult):
-    print("\n--- BILAT-50: detail-transfer regime -- a halo this large grows the INTERNAL "
-          "read region to the whole frame, so the windowed cook and the whole-frame cook "
-          "run the identical downscale/filter/upsample pass (the same honest answer an "
-          "8192-radius erode/dilate already gives under this codebase's halo model) ---")
-    # spatial_sigma=20 -> declared halo = ceil(8.0*20) = 160, far past this 48x40 canvas,
-    # so `_dag_grow`'s frame-clamp grows the crop bilateral_filter actually reads to the
-    # WHOLE frame before the detail-transfer path's own downscale phase ever runs -- its
-    # `factor`/`Hr`/`Wr` are then computed from the SAME (full) H,W in both the windowed
-    # and whole-frame cooks, side-stepping the phase-alignment hazard a genuinely narrowed
-    # (not fully saturated) crop would otherwise risk. The engine still returns only the
-    # requested output window (`cooked_roi` stays the caller's own roi), but its VALUES
-    # must match the whole-frame cook's crop exactly, because the full computation behind
-    # them was identical.
+def test_bilat50_windowed_vs_whole_frame_detail_transfer_declines(r: SubTestResult):
+    print("\n--- A1 (v0.50 Phase C): detail-transfer regime -- ANY spatial_sigma past the "
+          "approx threshold now declines ROI narrowing outright, not just when a large halo "
+          "happens to saturate to the whole frame ---")
+    # spatial_sigma=20 > _BILATERAL_APPROX_THRESHOLD_SS (8.0): `_reach_of` now answers
+    # 'unbounded' unconditionally for this call (A1's footprint fix), so the planner
+    # declines the window the same way a symbolic radius already did -- `cooked_roi` is
+    # None and the engine serves the whole frame. This used to narrow (returning only the
+    # caller's crop) whenever the declared halo happened to already saturate to the whole
+    # frame internally, which is true HERE, so the two behaviours are pixel-equal -- but a
+    # genuinely narrow (non-saturating) window at this same spatial_sigma would previously
+    # have diverged from a whole-frame cook (B1/B2's finding); this is the fix, verified on
+    # this specific (saturating) case: the values must still match a whole-frame cook.
     W, H = 48, 40
     roi = (10, 8, 16, 14, W, H)
     torch.manual_seed(79)
     image = torch.rand(1, H, W, 3)
-    code = "@OUT = bilateral_filter(@A, 20.0, 0.2);"  # detail-transfer tier
+    code = "@OUT = bilateral_filter(@A, 20.0, 0.2);"  # detail-transfer tier, past threshold
     try:
         cooked_roi, win, crop = _windowed_vs_whole(code, {}, image, roi)
-        if cooked_roi != roi:
-            r.fail("detail-transfer saturation", f"window declined: cooked_roi={cooked_roi}")
+        if cooked_roi is not None:
+            r.fail("detail-transfer decline", f"window narrowed unexpectedly: cooked_roi={cooked_roi}")
             return
-        if tuple(win.shape) == tuple(crop.shape) and torch.equal(win, crop):
-            r.ok("windowed cook torch.equal whole-frame crop (spatial_sigma=20, the "
-                 "detail-transfer tier saturated to a whole-frame read)")
+        full_shape = (1, H, W, 3)
+        if tuple(win.shape) == full_shape and torch.equal(win[:, roi[1]:roi[1]+roi[3], roi[0]:roi[0]+roi[2]], crop):
+            r.ok("window declines past the approx threshold (cooked_roi=None) and the served "
+                 "whole-frame output's own crop is torch.equal to an independent whole-frame cook's crop")
         else:
-            md = (win.float() - crop.float()).abs().max().item() \
-                if tuple(win.shape) == tuple(crop.shape) else float("nan")
-            r.fail("detail-transfer saturation",
-                   f"shape {tuple(win.shape)} vs {tuple(crop.shape)}, maxdiff {md:.4e}")
+            r.fail("detail-transfer decline",
+                   f"win shape {tuple(win.shape)}, expected {full_shape} (whole-frame decline)")
     except Exception as e:
-        r.fail("detail-transfer saturation", f"{type(e).__name__}: {e}")
+        r.fail("detail-transfer decline", f"{type(e).__name__}: {e}")
     finally:
         _R.clear_roi_memo()

@@ -13,6 +13,7 @@ import torch
 from .stdlib_registry import stdlib
 from .stdlib_core import (
     SAFE_EPSILON,
+    GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA,
     _build_sample_grid,
     _dtype_rounded,
     _expand_to_bhw,
@@ -573,7 +574,16 @@ class _StdlibSample:
         poll_cook_cancel(heavy=True)
         return _sample_mip_trilinear(image, u_coord, v_coord, lod, _get_mip_pyramid)
 
-    @stdlib("gauss_blur", sig='gauss_blur(img, sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0), pixel_args=(1,), doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.', ex='@OUT = gauss_blur(@A, 2.0);')
+    # A1 (v0.50 Phase C): the footprint's 4th element, `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA`,
+    # tells `tex_roi._reach_of` the exact point past which this builtin stops being a
+    # narrowable-halo op and switches to the downscale-pyramid approximation
+    # (`_gauss_blur_pyramid_approx`) — whose resample grid is anchored to a crop's own
+    # edges, not the frame's absolute coordinates, so a narrowed (non-saturating) window
+    # would otherwise silently diverge from a whole-frame cook (B1/B2's finding). Past the
+    # threshold, `_reach_of` answers 'unbounded' — the same decline a symbolic sigma
+    # already gets — so the planner (ROI, tiling/OOM strips, `cook_stage_dag`) falls back
+    # to a whole-frame cook instead of narrowing onto a wrong phase.
+    @stdlib("gauss_blur", sig='gauss_blur(img, sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0, GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA), pixel_args=(1,), doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.', ex='@OUT = gauss_blur(@A, 2.0);')
     @staticmethod
     def fn_gauss_blur(image, sigma) -> torch.Tensor:
         """Separable Gaussian blur.
@@ -618,6 +628,13 @@ class _StdlibSample:
     # here; past it the O(r^2) per-pixel tap count makes even a tiled exact pass too slow
     # for a builtin on the default path, and the detail-transfer path (O(image size),
     # independent of sigma) takes over.
+    # A1 (v0.50 Phase C): the `spatial_sigma` value past which `fn_bilateral_filter`
+    # itself switches to the detail-transfer downscale approximation (`radius =
+    # ceil(3*ss) > _BILATERAL_EXACT_RADIUS_MAX` <=> `ss > _BILATERAL_EXACT_RADIUS_MAX /
+    # 3.0`) -- named here so the footprint declaration below and the dispatch in
+    # `fn_bilateral_filter` read the same boundary from one place, not two matching
+    # literals. See the footprint's own comment for why this matters to the planner.
+    _BILATERAL_APPROX_THRESHOLD_SS = _BILATERAL_EXACT_RADIUS_MAX / 3.0
     _BILATERAL_TILE_BUDGET_ELEMS = 8_000_000  # ~32MB per fp32 intermediate tensor,
     # independent of image resolution: the row-tile height shrinks as `ksize` grows so
     # every per-tile intermediate (`patches`/`diff`/`w`, each [B,C,tile_h,W,ksize,ksize])
@@ -711,7 +728,16 @@ class _StdlibSample:
         detail = bchw - upsampled_plain
         return upsampled_filtered + detail
 
-    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 8.0), pixel_args=(1,), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Exact within a measured window; a bounded-cost downscale approximation runs past it.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
+    # A1 (v0.50 Phase C): the footprint's 4th element, `_BILATERAL_APPROX_THRESHOLD_SS`,
+    # tells `tex_roi._reach_of` the exact `spatial_sigma` past which this builtin
+    # switches to the detail-transfer downscale approximation
+    # (`_bilateral_detail_transfer_bchw`) -- whose resample grid is anchored to a crop's
+    # own edges, not the frame's absolute coordinates, so a narrowed (non-saturating)
+    # window would otherwise silently diverge from a whole-frame cook (B1/B2's finding,
+    # the larger of the two: up to 0.0265 maxdiff on a realistic image). Past the
+    # threshold, `_reach_of` answers 'unbounded' -- the same decline a symbolic
+    # spatial_sigma already gets -- so the planner falls back to a whole-frame cook.
+    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 8.0, _BILATERAL_APPROX_THRESHOLD_SS), pixel_args=(1,), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Exact within a measured window; a bounded-cost downscale approximation runs past it.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
     @staticmethod
     def fn_bilateral_filter(image, sigma_s, sigma_r) -> torch.Tensor:
         """Edge-preserving bilateral filter using Tensor.unfold.
