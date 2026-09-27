@@ -370,6 +370,19 @@ def should_stencil_route(fingerprint: str, program: Any) -> bool:
     return v
 
 
+# W1 (FIX-WARM, B3#1): per-fingerprint in-flight guard for `_get_or_make_codegen_fn`'s
+# emit-and-store step. Without this, a `prewarm_async()` job racing a live cook of the SAME
+# (unedited) program — the realistic case that ask exists for — is a bare check-then-act:
+# both callers read a cache miss and both independently pay the full emit (AST walk +
+# codegen build + marshal + sha256 + disk write) on a path whose entire purpose is to avoid
+# paying that cost inline. One `threading.Event` per fingerprint currently being emitted; a
+# second caller for that SAME fingerprint waits on it instead of redoing the work. Callers
+# with no fingerprint (fingerprint is None) have no cache entry to coordinate on and are
+# unaffected — they already re-emit every call, before and after this change.
+_codegen_inflight: dict[str, threading.Event] = {}
+_codegen_inflight_lock = threading.Lock()
+
+
 def _get_or_make_codegen_fn(program: Any, type_map: dict | None,
                             fingerprint: str | None):
     """Return the codegen flat fn for a program, or None if unsupported.
@@ -380,17 +393,51 @@ def _get_or_make_codegen_fn(program: Any, type_map: dict | None,
     (PC-3), so re-executions and process restarts skip emit+compile()+exec().
     cg_fn captures no device/precision/bindings (all passed per call), so the
     fingerprint alone is a sufficient key.
+
+    Single-flight per fingerprint (W1): the first caller to miss the cache for a given
+    fingerprint becomes that fingerprint's leader and emits; any other caller that misses
+    the SAME fingerprint while the leader is still working waits on the leader's result
+    instead of emitting a second time.
     """
     from ..tex_cache import get_cache, _CG_UNSUPPORTED
     cache = get_cache() if fingerprint is not None else None
     cg_fn = cache.get_codegen_fn(fingerprint) if cache is not None else None
     if cg_fn is None:  # not yet generated (or no fingerprint) — emit now
-        try:
-            cg_fn = _try_codegen(program, type_map, fingerprint)
-        except Exception:
-            cg_fn = None
-        if cache is not None:
-            cache.store_codegen_fn(fingerprint, cg_fn)
+        if cache is None:
+            # No fingerprint means no cache entry to coordinate on — nothing to single-
+            # flight against, so this call is its own (uncoordinated, as before).
+            try:
+                cg_fn = _try_codegen(program, type_map, fingerprint)
+            except Exception:
+                cg_fn = None
+            return None if cg_fn is _CG_UNSUPPORTED else cg_fn
+        with _codegen_inflight_lock:
+            event = _codegen_inflight.get(fingerprint)
+            is_leader = event is None
+            if is_leader:
+                event = threading.Event()
+                _codegen_inflight[fingerprint] = event
+        if is_leader:
+            try:
+                try:
+                    cg_fn = _try_codegen(program, type_map, fingerprint)
+                except Exception:
+                    cg_fn = None
+                cache.store_codegen_fn(fingerprint, cg_fn)
+            finally:
+                with _codegen_inflight_lock:
+                    _codegen_inflight.pop(fingerprint, None)
+                event.set()
+        else:
+            event.wait()
+            cg_fn = cache.get_codegen_fn(fingerprint)
+            if cg_fn is None:
+                # Should not normally happen (the leader always stores, even on failure) —
+                # a defensive fallback rather than hanging a follower forever.
+                try:
+                    cg_fn = _try_codegen(program, type_map, fingerprint)
+                except Exception:
+                    cg_fn = None
     return None if cg_fn is _CG_UNSUPPORTED else cg_fn
 
 # Persistent single-thread worker for the torch.compile lifecycle.
