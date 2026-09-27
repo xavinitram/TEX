@@ -55,7 +55,9 @@ from TEX_Wrangle.tex_compiler.ast_nodes import (
     clone_tree, iter_child_nodes,
 )
 from TEX_Wrangle.tex_compiler.optimizer import _fold_all, _propagate_literal_locals
-from TEX_Wrangle.tex_lazy import _fp32, _substitute_params
+from TEX_Wrangle.tex_lazy import (
+    _fp32, _substitute_params, _capture_pre_fold_conditions, _revert_unverified_folds,
+)
 from TEX_Wrangle.tex_marshalling import sigil_names
 
 # The isolation every oracle row in BOTH front-end files needs, defined once beside PERF-1's
@@ -290,9 +292,51 @@ def _folded(code: str, params: dict):
     """The folded program `_walk` hands `_has_ungrounded_halo`, or None if it will not parse.
 
     A FRESH fold per side of a comparison: the analysis does not mutate its input, but a
-    shared tree would make a mutation test's failure look like a shared-state bug."""
+    shared tree would make a mutation test's failure look like a shared-state bug.
+
+    TRK-219: `tex_roi._fold_program` now applies its own structural prune
+    (`tex_lazy._prune_static_flow`) before returning, so this — which deliberately DELEGATES to
+    the live, shipped `_fold_program` rather than freezing a copy, because F4 is about a LATER
+    stage of the same pipeline and wants `a`/`b` to track whatever the current fold produces —
+    now hands out the PRUNED tree, same as every other `_fold_program` consumer. That is
+    correct for the "got"/shipped side of every comparison below. It is NOT correct as an input
+    to `_base_has_ungrounded_halo` (the FROZEN, two-traversal, walks-both-arms-unconditionally
+    oracle this file exists to pin) — feeding it an already-pruned tree would silently start
+    comparing the shipped scan against ITSELF on any row a `$param` prunes, which is exactly
+    the vacuous-oracle failure mode `test_perf1_roi_walk_memo.py`'s own docstring warns about.
+    `_unpruned_folded` below is the one to use wherever a `_base_has_ungrounded_halo` call
+    needs the true "before ANY optimisation" tree."""
     try:
         return tex_roi._fold_program(code, params)
+    except Exception:
+        return None
+
+
+def _unpruned_folded(code: str, params: dict):
+    """`_folded`'s exact PRE-TRK-219 shape: the fp32-verified fold (ROI-48A/O1 —
+    `_capture_pre_fold_conditions`/`_revert_unverified_folds`, unchanged and still live), but
+    WITHOUT the fold-level structural prune TRK-219 added. Feeds `_base_has_ungrounded_halo`
+    (and anything else that needs "the tree with every `$param`-resolved branch still
+    present, both arms intact") so this oracle keeps meaning what it always meant, independent
+    of `_fold_program`'s own evolution. Mirrors `test_perf1_roi_walk_memo.py`'s
+    `_base_fold_program` in spirit (a self-contained copy of one exact pipeline stage) but at
+    THIS stage (post-O1, pre-TRK-219) rather than PERF-1's pre-O1 one."""
+    try:
+        program = clone_tree(tex_roi._pristine_program(code))
+        subs = {name: NumberLiteral(value=_fp32(v), is_int=isinstance(v, (bool, int)))
+                for name, v in params.items() if isinstance(v, (bool, int, float))}
+        stmts = program.statements
+        if subs:
+            for stmt in stmts:
+                _substitute_params(stmt, subs)
+            pre_fold_1 = _capture_pre_fold_conditions(stmts)
+            stmts = _fold_all(stmts)
+            stmts = _propagate_literal_locals(stmts)
+            pre_fold_2 = _capture_pre_fold_conditions(stmts)
+            stmts = _fold_all(stmts)
+            _revert_unverified_folds(stmts, pre_fold_1, pre_fold_2)
+            program.statements = stmts
+        return program
     except Exception:
         return None
 
@@ -458,23 +502,26 @@ def test_perf4_lazy_oracle_sensitive_rows(r: SubTestResult):
 
 # ── F4: the halo scan ────────────────────────────────────────────────────────
 
-def _pruning_fully_explains_divergence(a, got: bool, want: bool) -> bool:
+def _pruning_fully_explains_divergence(unpruned, got: bool, want: bool) -> bool:
     """FIX-ROI O3 (R2#7/B4#1): the ONLY thing this oracle is allowed to excuse is ROI-48A/O2's
-    own pruning -- proven by CAUSATION, not by "a resolved `IfElse` exists somewhere in the
-    tree" (the old `_has_resolved_ifelse` tree-presence check this replaces, which could not
-    tell a real pruning-caused divergence apart from an unrelated regression that happens to
-    land on a corpus row that ALSO contains some other resolved `IfElse` elsewhere).
+    (now TRK-219's fold-level) own pruning -- proven by CAUSATION, not by "a resolved `IfElse`
+    exists somewhere in the tree" (the old `_has_resolved_ifelse` tree-presence check this
+    replaces, which could not tell a real pruning-caused divergence apart from an unrelated
+    regression that happens to land on a corpus row that ALSO contains some other resolved
+    `IfElse` elsewhere).
 
     `got is False and want is True` is the direction pruning can move an answer (it only
-    REMOVES a footprint, never adds one). Given that direction, `tex_roi._has_ungrounded_halo`
-    on the UNPRUNED tree `a` walks every `IfElse`'s condition AND both bodies -- exactly what
-    `_base_has_ungrounded_halo` always has -- so if THAT already agrees with `want`, pruning
-    is the one and only variable that changed between the unpruned and the pruned call, and
-    it is what accounts for the whole gap. If the unpruned answer does NOT already agree with
-    `want`, some OTHER mechanism is responsible and this must not be excused."""
+    REMOVES a footprint, never adds one). Given that direction,
+    `tex_roi._has_ungrounded_halo` on the UNPRUNED tree (`unpruned` -- caller passes
+    `_unpruned_folded`'s result, TRK-219: NOT `_folded`'s, which is pruned by construction now)
+    walks every `IfElse`'s condition AND both bodies -- exactly what `_base_has_ungrounded_halo`
+    always has -- so if THAT already agrees with `want`, pruning is the one and only variable
+    that changed between the unpruned and the pruned call, and it is what accounts for the
+    whole gap. If the unpruned answer does NOT already agree with `want`, some OTHER mechanism
+    is responsible and this must not be excused."""
     if not (got is False and want is True):
         return False
-    return tex_roi._has_ungrounded_halo(a) == want
+    return tex_roi._has_ungrounded_halo(unpruned) == want
 
 
 @isolated_analysis
@@ -490,12 +537,15 @@ def test_perf4_halo_answers_are_identical(r: SubTestResult):
     arm's case-2 name-boundary halo (`@T = gauss_blur(@A,2.0); @OUT = gauss_blur(@T,2.0);`)
     never gets a chance to block a program that will never run it. FIX-ROI O2 moved that
     pruning from a per-node special case inside `_accumulate`/`_has_ungrounded_halo`
-    themselves to a structural, fold-level step (`tex_lazy._prune_static_flow`, applied to a
-    private clone the way `tex_roi._walk` applies it) — so calling `_has_ungrounded_halo`
-    directly on `_fold_program`'s own (never pruned) output, as this oracle always has, no
-    longer reflects what production cooking actually walks; `got` below applies that same
-    clone-then-prune step first, mirroring `_walk`. That is a semantic improvement, not a
-    refactor artifact, and a real divergence from the frozen snapshot is therefore EXPECTED
+    themselves to a structural, fold-level step (`tex_lazy._prune_static_flow`); TRK-219 moved
+    it again, from a private clone `_walk` alone applied to `tex_roi._fold_program` itself — so
+    calling `_has_ungrounded_halo` directly on `_fold_program`'s own output, as this oracle
+    always has, now reflects what production cooking actually walks WITHOUT any extra clone-
+    then-prune step of this test's own (`_folded`'s result, `a` below, IS the pruned tree; the
+    frozen `_base_has_ungrounded_halo` oracle instead reads `_unpruned_folded`'s result, `b`,
+    to keep meaning "before ANY optimisation" independent of where `tex_roi` currently applies
+    the prune). That is a semantic improvement, not a refactor artifact, and a real divergence
+    from the frozen snapshot is therefore EXPECTED
     here — but only in one direction (True -> False, since pruning can only REMOVE a
     footprint the old two-pass walk over-counted, never add one) and only on a folded
     program that genuinely contains a resolved `IfElse` (proof the mechanism, not a
@@ -511,15 +561,18 @@ def test_perf4_halo_answers_are_identical(r: SubTestResult):
     bad, checked, roi48a_exceptions = [], 0, 0
     for label, code in rows:
         for params in _valuations_for(code):
-            a, b = _folded(code, params), _folded(code, params)
+            # TRK-219: `a` (`_folded`, the live/shipped `_fold_program`) is now PRE-PRUNED by
+            # construction -- no separate clone-then-prune step needed here any more (`_walk`'s
+            # own no longer has one either, for the same reason). `b` must stay the TRUE
+            # unpruned tree for `_base_has_ungrounded_halo` to mean what it always meant.
+            a = _folded(code, params)
+            b = _unpruned_folded(code, params)
             if a is None or b is None:
                 continue
-            pruned_a = clone_tree(a)
-            pruned_a.statements = tex_lazy._prune_static_flow(pruned_a.statements)
-            got, want = tex_roi._has_ungrounded_halo(pruned_a), _base_has_ungrounded_halo(b)
+            got, want = tex_roi._has_ungrounded_halo(a), _base_has_ungrounded_halo(b)
             checked += 1
             if got != want:
-                if _pruning_fully_explains_divergence(a, got, want):
+                if _pruning_fully_explains_divergence(_unpruned_folded(code, params), got, want):
                     roi48a_exceptions += 1
                     continue
                 bad.append(f"{label} params={params}: {want} -> {got}")
@@ -626,7 +679,12 @@ def test_perf4_halo_mutants_are_caught(r: SubTestResult):
         caught = []
         for label, code in rows:
             for params in ({}, {"k": 0.75}):
-                a, b = _folded(code, params), _folded(code, params)
+                # TRK-219: `b` feeds the frozen `_base_has_ungrounded_halo` oracle, which must
+                # see the true unpruned tree — `_unpruned_folded`, not `_folded` (pre-pruned by
+                # construction now). Neither of this loop's two valuations folds a literal
+                # condition, so the two were interchangeable before TRK-219; kept correct by
+                # construction rather than by which values happen to be exercised here.
+                a, b = _folded(code, params), _unpruned_folded(code, params)
                 if a is None or b is None:
                     continue
                 if _mutant_has_ungrounded_halo(a, **{flag: True}) != \
@@ -641,7 +699,7 @@ def test_perf4_halo_mutants_are_caught(r: SubTestResult):
     bad = []
     for label, code in rows:
         for params in ({}, {"k": 0.75}):
-            a, b = _folded(code, params), _folded(code, params)
+            a, b = _folded(code, params), _unpruned_folded(code, params)
             if a is None or b is None:
                 continue
             if tex_roi._has_ungrounded_halo(a) != _base_has_ungrounded_halo(b):

@@ -55,8 +55,14 @@ def _old_tree_presence_guard(node) -> bool:
 def test_o3_gated_block_carries_a_resolved_ifelse_but_no_halo_gap(r: SubTestResult):
     print("\n--- FIX-ROI O3: gated_block resolves an IfElse but pruning changes nothing ---")
     try:
-        a = _p4._folded(_GATED_BLOCK, _PARAMS)
-        b = _p4._folded(_GATED_BLOCK, _PARAMS)
+        # TRK-219: `_p4._folded` now delegates to `tex_roi._fold_program`, which prunes a
+        # resolved IfElse away structurally — the exact "resolved IfElse still present in the
+        # tree" shape this test demonstrates the old guard mishandling no longer comes from
+        # `_folded` at all. `_unpruned_folded` is `_p4`'s own pre-TRK-219 shape (fp32-verified
+        # fold, no structural prune), which is what both the old AND the causally-tied new
+        # guard were always meant to be shown a resolved-but-irrelevant IfElse in.
+        a = _p4._unpruned_folded(_GATED_BLOCK, _PARAMS)
+        b = _p4._unpruned_folded(_GATED_BLOCK, _PARAMS)
         if a is None or b is None:
             r.fail("premise", "gated_block failed to fold")
             return
@@ -79,7 +85,9 @@ def test_o3_gated_block_carries_a_resolved_ifelse_but_no_halo_gap(r: SubTestResu
 def test_o3_synthetic_regression_on_gated_block_fails_the_new_check(r: SubTestResult):
     print("\n--- FIX-ROI O3: a synthetic regression on gated_block must fail the oracle ---")
     try:
-        a = _p4._folded(_GATED_BLOCK, _PARAMS)
+        # TRK-219: see the sibling test above — `_unpruned_folded`, not `_folded`, is what
+        # still carries the resolved-but-irrelevant IfElse this row needs.
+        a = _p4._unpruned_folded(_GATED_BLOCK, _PARAMS)
         if a is None:
             r.fail("premise", "gated_block failed to fold")
             return

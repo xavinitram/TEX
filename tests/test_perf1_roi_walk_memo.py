@@ -22,12 +22,27 @@ memoized parse itself) and requires the oracle to NOTICE — a test that cannot 
 test. `test_perf1_a_source_is_parsed_once` is the red-first half: it fails on the base sha,
 where N values cost N lexes.
 
+TRK-219 (fold-level pruning). `tex_roi._fold_program` now applies `tex_lazy._prune_static_flow`
+itself — every one of its four consumers (`_walk`, `frame_window`, `batch_sliceable`,
+`_scale_verdict_uncached`) sees the pruned program, where before only `_walk`'s own private
+clone was pruned (FIX-ROI/O2), leaving `region_dependent` and the other three consumers reading
+the UNPRUNED tree. `_base_walk` below still reproduces that PRE-TRK-219 shape exactly (it prunes
+its own private clone for `reads`/`blocked`/`halo`, but computes `region_dependent` from the
+UNPRUNED `_base_fold_program` result) — on purpose, so this identity oracle is exactly the
+diff surface TRK-219 touches, not a moving target. `test_perf1_walk_answers_are_identical`
+therefore now CLASSIFIES every moved row into one of two known-safe, characterized, one-way
+classes (`_trk219_characterize_move`) rather than either blanket re-pinning the oracle or
+leaving it red: any row whose move is NOT one of those two exact shapes still fails the test.
+See `test_prune49_fold_level_pruning.py` for the pixel-identity proofs that back both classes —
+each moved answer is a MORE PERMISSIVE one, never a wrong one.
+
 PORTABILITY: CPU, no ComfyUI, no CUDA, no compiler, no numpy, no timing assertion.
 """
 import functools
 import glob
 import math
 import os
+from collections import Counter
 
 from helpers import *
 
@@ -188,6 +203,36 @@ _SENSITIVE = {
     "gated_halo": "@OUT = ($k > 0.5) ? gauss_blur(@A, 2.0) : gauss_blur(@A, 8.0);",
     # A parameter reaching a radius through a local, so the fold must propagate to resolve it.
     "halo_via_local": "float r = $sigma * 2.0;\n@OUT = gauss_blur(@IN, r);",
+    # TRK-219 class 2: a REGION-DEPENDENT while loop that only exists inside a branch a $param
+    # folds to a literal-false — `region_dependent` on the pruned tree (what `_walk` now reads)
+    # must answer False; on the unpruned tree (what `_base_walk`, and every consumer before
+    # TRK-219, read) it answers True over the same values. Chosen so `_valuations_for`'s `k=1.0`
+    # row keeps the loop LIVE (region_dep True both ways — the branch is taken) and only `k=0.0`
+    # (dead branch) is where the two walks disagree; `_SENSITIVE`'s own non-vacuousness check
+    # (`test_perf1_oracle_sensitive_rows`) is satisfied by that same true/false split.
+    "region_dep_dead_branch": (
+        "f$k = 0.0;\n"
+        "if ($k > 0.5) {\n"
+        "    float x = 0.0;\n"
+        "    while (x < img_width(@A)) { x = x + 1.0; }\n"
+        "}\n"
+        "@OUT = @A;\n"
+    ),
+    # TRK-219 class 1: a top-level `if`/`else` where BOTH arms assign `@OUT` — folding the
+    # condition to a literal and splicing the taken arm's statements up to top level (what
+    # `_prune_static_flow` does for an IfElse) makes the surviving `@OUT = ...;` a TOP-LEVEL
+    # Assignment for the first time, which `_walk`'s (and `_base_walk`'s own, unpruned) `written`
+    # scan only ever looked at top-level statements for. Mirrors the shape of every real example
+    # this class fired on (`film_sharpen.tex`, `film_soften.tex`, `luminance_key.tex`,
+    # `premultiply.tex`): a param-gated top-level branch, both arms writing the same output name.
+    "erased_out_write_target": (
+        "f$k = 0.0;\n"
+        "if ($k > 0.5) {\n"
+        "    @OUT = @A;\n"
+        "} else {\n"
+        "    @OUT = @B;\n"
+        "}\n"
+    ),
 }
 
 #: The valuations every corpus source is walked under. Each one is a shape that has moved an
@@ -233,28 +278,103 @@ def _valuations_for(code: str):
 _STRING_WIRES = ({}, {"S": TEXType.STRING}, {"A": TEXType.STRING, "S": TEXType.STRING})
 
 
+# ── TRK-219: the two characterized, one-way divergence classes ───────────────
+
+def _all_assignment_targets(stmts) -> set:
+    """Every `Assignment` target name reachable ANYWHERE in `stmts` — top level, and nested
+    inside every `IfElse`/`WhileLoop`/`ForLoop`/`FunctionDef` body, dead code included. The
+    superset `_write_target_name`'s callers could ever find post-prune, used here only to
+    PROVE a name TRK-219's fold-level splice newly promotes to a top-level `written` entry
+    was already a write target pre-TRK-219 too — never to re-derive `written` itself."""
+    names: set = set()
+    stack = list(stmts)
+    while stack:
+        n = stack.pop()
+        if n.__class__ is Assignment:
+            tn = tex_roi._write_target_name(n.target, bindings_only=True)
+            if tn is not None:
+                names.add(tn)
+        stack.extend(ast_nodes.iter_child_nodes(n))
+    return names
+
+
+def _trk219_characterize_move(code, params, want, got) -> str | None:
+    """None when `(want, got)` is NOT one of TRK-219's two known-safe classes (the caller then
+    fails); else a short label naming which class it is, for the failure-free report.
+
+    CLASS 1 — `erased` (component 3) SHRINKS, never grows, and every name that disappeared is
+    an assignment target somewhere in the param-folded (but UNPRUNED) tree — a write-only wire
+    (`@OUT`, never read) that TRK-219's top-level splice now correctly counts in `written`,
+    where the old (unpruned, top-level-only) scan could not see it inside an un-spliced
+    `IfElse`. `roi_plan.narrow |= fold_erased` only ever matters for a name present in the
+    ENGINE's bindings dict, which a write-only wire never is (invariant #11: removing an
+    already-inert entry cannot change any cook's output) — confirmed by the pixel-identity
+    proof in `test_prune49_fold_level_pruning.py::test_class1_erased_out_write_target_is_inert`.
+    Every other component (`reads`, `blocked`, `halo`, `region_dep`) must be UNCHANGED for this
+    class — a `reads`/`halo` move alongside it would be a real footprint change, not this.
+
+    CLASS 2 — ONLY `region_dep` (component 4) moves, and only True (want, unpruned) -> False
+    (got, pruned): a region-dependent construct (a per-pixel-bound loop, a per-pixel string
+    merge) that exists ONLY inside a branch a `$param` folds to a verified literal-false is no
+    longer visible to `region_dependent` once `_fold_program` prunes it away — the construct
+    can never execute at these exact param values, so the ANSWER for these exact values can only
+    become MORE permissive (invariant #11), never wrong. The reverse direction (False -> True)
+    is NOT this class and fails below: pruning may only ever narrow what `region_dependent`
+    sees, never widen it. Backed by
+    `test_prune49_fold_level_pruning.py::test_class2_region_dependent_dead_branch_is_permissive`."""
+    if want == got:
+        return None
+    w_reads, w_blocked, w_halo, w_erased, w_region = want
+    g_reads, g_blocked, g_halo, g_erased, g_region = got
+    if (w_reads, w_blocked, w_halo) == (g_reads, g_blocked, g_halo):
+        if w_region == g_region:
+            w_e, g_e = set(w_erased), set(g_erased)
+            if g_e < w_e:                       # strictly shrank
+                removed = w_e - g_e
+                try:
+                    program = _base_fold_program(code, params)   # unpruned, this valuation
+                except Exception:
+                    return None
+                targets = _all_assignment_targets(program.statements)
+                if removed <= targets:
+                    return "class1-erased-write-target-shrink"
+        elif w_erased == g_erased and (w_region, g_region) == (True, False):
+            return "class2-region-dep-permissive"
+    return None
+
+
 # ── the rows ─────────────────────────────────────────────────────────────────
 
 @isolated_analysis
 def test_perf1_walk_answers_are_identical(r: SubTestResult):
-    """Every `(source, valuation, string-wire map)` answers what the pre-change walk answers."""
+    """Every `(source, valuation, string-wire map)` answers what the pre-change walk answers —
+    OR moves in exactly one of TRK-219's two characterized, one-way-safe classes
+    (`_trk219_characterize_move`). Any OTHER move still fails this row; this is a deliberate,
+    per-class allowance, not a blanket re-pin — see the module docstring."""
     print("\n--- PERF-1: the memoized-parse walk vs the pre-change walk ---")
     rows = _corpus()
-    bad, checked = [], 0
+    bad, classified, checked = [], Counter(), 0
     for label, code in rows:
         for params in _valuations_for(code):
             for types in _STRING_WIRES:
                 got = _canon(tex_roi._walk(code, params, types))
                 want = _canon(_base_walk(code, params, types))
                 checked += 1
-                if got != want:
+                if got == want:
+                    continue
+                cls = _trk219_characterize_move(code, params, want, got)
+                if cls is None:
                     bad.append(f"{label} params={params} types={sorted(types)}: "
                                f"{want!r} -> {got!r}")
+                else:
+                    classified[cls] += 1
     if bad:
         r.fail("PERF-1 walk identity",
-               f"{len(bad)} of {checked} answers moved; first 3: {bad[:3]}")
+               f"{len(bad)} of {checked} answers moved UNCHARACTERIZED; first 3: {bad[:3]}")
     else:
-        r.ok(f"{checked} walk answers over {len(rows)} sources are unchanged")
+        moved = sum(classified.values())
+        r.ok(f"{checked} walk answers over {len(rows)} sources: {moved} moved, every one "
+             f"TRK-219-characterized ({dict(classified)})")
 
 
 @isolated_analysis
@@ -345,6 +465,49 @@ def test_perf1_the_clone_is_load_bearing(r: SubTestResult):
     r.ok("with the copy restored the same three valuations agree with the oracle") \
         if fixed == want else \
         r.fail("PERF-1 mutation", f"restored walk still disagrees: {want!r} -> {fixed!r}")
+
+
+@isolated_analysis
+def test_perf1_trk219_characterization_rejects_wrong_direction(r: SubTestResult):
+    """MUTATION. `_trk219_characterize_move` must refuse every shape that is NOT one of the two
+    exact classes — a classifier a bad row can always satisfy is not a characterization."""
+    print("\n--- PERF-1/TRK-219: the classifier is not vacuous ---")
+    code = _SENSITIVE["erased_out_write_target"]
+    base_reads, base_erased, base_region = (), ("A", "OUT"), False
+
+    def row(erased=None, region=None, reads=None, halo=0, blocked=False):
+        return (reads if reads is not None else base_reads, blocked, halo,
+                erased if erased is not None else base_erased,
+                region if region is not None else base_region)
+
+    want = row(erased=("A", "OUT"))
+    cases = [
+        ("erased GREW instead of shrank",
+         want, row(erased=("A", "B", "OUT"))),
+        ("erased shrank, but the removed name is NOT a real assignment target anywhere",
+         row(erased=("A", "OUT", "NEVER_ASSIGNED")), row(erased=("A",))),
+        ("region_dep moved the WRONG way (False -> True, want False got True)",
+         row(region=False), row(region=True)),
+        ("region_dep moved right, but erased ALSO moved (not isolated)",
+         row(region=True), row(region=False, erased=("A",))),
+        ("reads changed alongside an erased shrink",
+         want, row(erased=("A",), reads=(("Z", 0, False, tex_roi.POINT, False),))),
+    ]
+    bad = []
+    for label, w, g in cases:
+        cls = _trk219_characterize_move(code, {"k": 0.0}, w, g)
+        if cls is not None:
+            bad.append(f"{label}: wrongly classified as {cls!r}")
+    if bad:
+        r.fail("PERF-1/TRK-219 classifier", f"{len(bad)} wrong-direction row(s) accepted: {bad}")
+    else:
+        r.ok(f"the classifier refused all {len(cases)} non-TRK-219 shapes")
+
+    # ... and the one legitimate class-1 shape it MUST accept, over this file's own corpus row.
+    got = row(erased=("A",))
+    cls = _trk219_characterize_move(code, {"k": 0.0}, want, got)
+    r.ok(f"the genuine class-1 shape is accepted ({cls!r})") if cls == "class1-erased-write-target-shrink" else \
+        r.fail("PERF-1/TRK-219 classifier", f"the genuine shape was rejected: {cls!r}")
 
 
 @isolated_analysis

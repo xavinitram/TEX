@@ -777,9 +777,28 @@ def _fold_program(code: str, param_values: dict):
     and again after `_propagate_literal_locals` but before the second `_fold_all` (the
     INDIRECT, behind-a-local-var case) — and reverts (`_revert_unverified_folds`) any literal
     the fold produced that a dedicated fp32-per-op re-evaluation cannot confirm from either
-    snapshot — so `_resolved_branch`/`_prune_static_flow` need no change of their own: by the
-    time either sees this tree, every surviving `NumberLiteral` condition is proof, not a
-    guess.
+    snapshot — so `_prune_static_flow` below needs no change of its own: by the time it sees
+    this tree, every surviving `NumberLiteral` condition is proof, not a guess.
+
+    TRK-219: the fold-level prune. FIX-ROI's O2 applied `_prune_static_flow` on a PRIVATE
+    clone inside `_walk` alone (scoped to `_accumulate`/`_has_ungrounded_halo`), leaving
+    `region_dependent` — and this function's other three callers, `frame_window`,
+    `batch_sliceable` and `_scale_verdict_uncached`, each of which walks `program.statements`
+    directly with no pruning step of their own — reading the UNPRUNED tree. A statically-dead
+    branch (`if ($k > 0.5) { <frame op / scale-unsafe read / region-dependent loop> }` with
+    `k` folded to a False literal) was therefore still visible to all four, forcing an
+    over-conservative answer (a wider frame window than the live code needs, `batch_sliceable`
+    refusing a program with no live frame op, `_scale_verdict_uncached` declaring a program
+    scale-unsafe over a read no live branch performs, `region_dependent` declaring iteration-
+    dependence over a loop that can never run). Applying `_prune_static_flow` HERE, once, on
+    the same tree every one of the four consumers already receives, is sound for exactly the
+    reason O2's own docstring gives: every surviving `NumberLiteral` condition is proof (the
+    fp32 verification above already reverted anything it is not), so splicing away the
+    not-taken arm structurally cannot discard a branch the runtime could actually pick — only
+    ever a MORE permissive answer (invariant #11), never a wrong one. Unconditional (not
+    gated on `subs`): a program whose OWN source (no `$param` involved at all) already writes
+    a literal condition — `if (1.0 > 0.5) { ... }` — is exactly as statically dead, and
+    `_walk`'s private-clone prune this replaces ran unconditionally too.
 
     DATA-6: through the one front end (`tex_cache.parse_and_split`) with NO binding types, on
     purpose: `_walk`'s memo is keyed on the source, the param values and the string wires, so
@@ -803,7 +822,8 @@ def _fold_program(code: str, param_values: dict):
         pre_fold_2 = _capture_pre_fold_conditions(stmts)
         stmts = _fold_all(stmts)
         _revert_unverified_folds(stmts, pre_fold_1, pre_fold_2)
-        program.statements = stmts
+    stmts = _prune_static_flow(stmts)
+    program.statements = stmts
     return program
 
 
@@ -877,23 +897,18 @@ def _walk(code: str, param_values: dict, binding_types: dict | None = None):
         program = _fold_program(code, param_values)
         reads: dict = {}
         state = {"blocked": False, "halo": 0}
-        # O2 (R4-altitude finding 2): `_accumulate`/`_has_ungrounded_halo` used to each
-        # re-derive "does this IfElse's condition resolve, and if so which body runs" via
+        # O2 (R4-altitude finding 2) / TRK-219: `_accumulate`/`_has_ungrounded_halo` used to
+        # each re-derive "does this IfElse's condition resolve, and if so which body runs" via
         # their own copy of the now-deleted `_resolved_branch` — one pruning step, shared,
-        # replaces both. Pruned on a PRIVATE clone (`tex_lazy._prune_static_flow` mutates
-        # surviving bodies in place) so `region_dependent` below still sees the un-pruned
-        # `program` it always has — this dedup is scoped to the two halo/reach walkers R4
-        # named, not a wider change to what every `_fold_program` consumer sees. Sound only
-        # because `_fold_program` already refuses (reverts) any condition its own fp32
-        # verification cannot confirm (O1) — a surviving `NumberLiteral` condition here IS
-        # proof, so pruning it structurally is exactly what the two walkers already did one
-        # `IfElse` at a time. Also picks up the WhileLoop(literal-false) case neither walker
-        # had an equivalent for, at no extra cost.
-        pruned = clone_tree(program)
-        pruned.statements = _prune_static_flow(pruned.statements)
-        for stmt in pruned.statements:
+        # replaces both. TRK-219 moved that pruning step INTO `_fold_program` itself (it used
+        # to run here, on a private clone, scoped to keep `region_dependent` below reading the
+        # un-pruned tree — deliberately widened once every one of `_fold_program`'s other three
+        # consumers turned out to need the exact same pruned tree), so `program` here IS the
+        # pruned tree already — no second clone-and-prune needed, and `region_dependent` below
+        # now sees the same pruned tree every other `_fold_program` consumer does.
+        for stmt in program.statements:
             _accumulate(stmt, 0, reads, state)
-        blocked = state["blocked"] or _has_ungrounded_halo(pruned)
+        blocked = state["blocked"] or _has_ungrounded_halo(program)
         # Bindings the $param-fold ERASED from `reads` but the engine still evaluates. Write
         # targets are excluded — `@OUT` is not an input and narrowing it means nothing. Computed
         # here so it rides the same memo as the walk instead of re-lexing on every cook.
