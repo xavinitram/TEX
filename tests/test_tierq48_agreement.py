@@ -16,6 +16,8 @@ calls, in the same order (see `tier_verdict`'s docstring) — so a disagreement 
 mean the query's mirror has drifted from the real gate, which is exactly the class of
 bug this test exists to catch before a host ever sees it.
 """
+import contextlib
+
 import torch
 
 from TEX_Wrangle import tex_engine
@@ -54,6 +56,24 @@ _PLAIN_CODE = "@OUT = @A * 2.0;\n"
 # Reads img_width() outside a whitelisted fetch call — the classifier's own documented
 # unsafe class (docs/resolution-scale.md "The classifier and the override comment").
 _SCALE_UNSAFE_CODE = "@OUT = vec4(vec3(float(img_width()) * 0.001), 1.0);\n"
+
+
+# H4 (FIX-HYGIENE, v0.50.0 Phase C, R2#2): one helper replacing five hand-inlined copies of
+# the identical "give this test a clean, pinned fncalls_compile verdict for one fingerprint"
+# shape below -- same underlying table `test_compiletry50_fncalls_gate.py`'s own autouse
+# fixture (`_isolated_fncalls_state`) resets/restores, sized here to pinning exactly one
+# fingerprint's memo entry rather than the whole table.
+@contextlib.contextmanager
+def _pinned_fncalls_verdict(fp, verdict: bool):
+    """Reset `fncalls_compile`'s memo, pin `fp` to `verdict` for the body, then reset again
+    on the way out (even on an assertion failure) -- so a test cannot leak its pin into the
+    next one regardless of how it exits."""
+    _fncalls_compile.reset_for_test()
+    _fncalls_compile._memo[fp] = verdict
+    try:
+        yield
+    finally:
+        _fncalls_compile.reset_for_test()
 
 
 def _real_plan(code, bindings, **kw):
@@ -217,16 +237,14 @@ def test_tierq48_agrees_a_non_default_tier_never_arms_roi():
     # duration of this loop, restored after (`tier_verdict` passes no `binding_types`
     # here, so the fingerprint is against an empty one, matching what it looks up).
     fp = _get_cache().fingerprint(_ROI_CODE, {})
-    _fncalls_compile.reset_for_test()
-    _fncalls_compile._memo[fp] = False
-    for compile_mode in ("torch_compile", "auto"):
-        tier_id = select_tier(compile_mode, "cpu", False, False)
-        assert tier_id == compile_mode
-        v = tier_verdict(_ROI_CODE, compile_mode=compile_mode, device="cpu", roi=roi,
-                         roi_exec=True, param_values={"amount": 0.4})
-        assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
-        assert not v.roi_armed and v.roi_reason == ROI_REASON_TIER_NOT_DEFAULT
-    _fncalls_compile.reset_for_test()
+    with _pinned_fncalls_verdict(fp, False):
+        for compile_mode in ("torch_compile", "auto"):
+            tier_id = select_tier(compile_mode, "cpu", False, False)
+            assert tier_id == compile_mode
+            v = tier_verdict(_ROI_CODE, compile_mode=compile_mode, device="cpu", roi=roi,
+                             roi_exec=True, param_values={"amount": 0.4})
+            assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+            assert not v.roi_armed and v.roi_reason == ROI_REASON_TIER_NOT_DEFAULT
     # cuda_graph: select_tier only string-checks the device (no real GPU required).
     tier_id = select_tier("cuda_graph", "cuda:0", False, False)
     assert tier_id == "cuda_graph"
@@ -317,14 +335,10 @@ def test_tierq48_torch_compile_predicts_graph_break_for_a_known_bad_fingerprint(
     resolves False), the query must keep predicting the codegen-only fallback -- it must
     not go stale the moment `_has_fn_calls` alone stops being the whole story."""
     fp = _gauss_blur_fingerprint()
-    _fncalls_compile.reset_for_test()
-    _fncalls_compile._memo[fp] = False
-    try:
+    with _pinned_fncalls_verdict(fp, False):
         v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu",
                          binding_types=_GAUSS_BLUR_BT)
         assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
-    finally:
-        _fncalls_compile.reset_for_test()
 
 
 def test_tierq48_torch_compile_reports_declared_tier_for_an_unresolved_fingerprint():
@@ -349,26 +363,18 @@ def test_tierq48_torch_compile_reports_declared_tier_for_a_known_good_fingerprin
     declared compiled tier, never "codegen" -- the truthfulness half item 3 names
     explicitly ("after a success, the compiled tier")."""
     fp = _gauss_blur_fingerprint()
-    _fncalls_compile.reset_for_test()
-    _fncalls_compile._memo[fp] = True
-    try:
+    with _pinned_fncalls_verdict(fp, True):
         v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu",
                          binding_types=_GAUSS_BLUR_BT)
         assert v.tier == "torch_compile" and v.reason == TIER_REASON_SELECTED
-    finally:
-        _fncalls_compile.reset_for_test()
 
 
 def test_tierq48_auto_predicts_graph_break_for_a_known_bad_fingerprint():
     fp = _gauss_blur_fingerprint()
-    _fncalls_compile.reset_for_test()
-    _fncalls_compile._memo[fp] = False
-    try:
+    with _pinned_fncalls_verdict(fp, False):
         v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="auto", device="cpu",
                          binding_types=_GAUSS_BLUR_BT)
         assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
-    finally:
-        _fncalls_compile.reset_for_test()
 
 
 def test_tierq48_cuda_graph_predicts_not_capturable_for_a_real_pixel_args_builtin():
@@ -387,14 +393,10 @@ def test_tierq48_scale_active_torch_compile_predicts_graph_break_for_a_known_bad
     fall-through memo is keyed the same regardless of scale (SCALECX-49: `scale` is not part
     of the compiled-callable cache key), so the same fingerprint applies."""
     fp = _gauss_blur_fingerprint()
-    _fncalls_compile.reset_for_test()
-    _fncalls_compile._memo[fp] = False
-    try:
+    with _pinned_fncalls_verdict(fp, False):
         v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu",
                          scale=0.5, binding_types=_GAUSS_BLUR_BT)
         assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
-    finally:
-        _fncalls_compile.reset_for_test()
 
 
 def test_tierq48_scale_active_cuda_graph_predicts_not_capturable_for_a_real_pixel_args_builtin():
