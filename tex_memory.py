@@ -1049,6 +1049,15 @@ def run_tiled(interp, program, bindings, type_map, device, latent_channel_count,
                 outputs[name] = strip_out  # scalar/string: any strip suffices
         if on_progress is not None:         # SCHED-3: report per-strip fraction
             _progress(on_progress, "strip", (k + 1) / n_strips)
+    # TRK-221 (Q1): a successful tiled cook must record ITS OWN tier. `_run_default` returns
+    # this function's result directly (`return run_tiled(...)`), so its own tail's
+    # `tier_trace.record` call is reached only on a DECLINE (an exception here) or when the
+    # tile plan was never taken — never on this, the actual tiled-success path. Left
+    # unrecorded, `tier_trace.last()` kept reading whatever tier a PRIOR, unrelated cook
+    # happened to leave behind (the same silently-stale class TRK-221 fixed for the plain
+    # default route, reopened here because this route never had its own record at all).
+    from .tex_runtime import tier_trace as _tier_trace
+    _tier_trace.record("tiled")
     return outputs
 
 
@@ -1409,6 +1418,13 @@ def run_tiled_halo(interp, program, bindings, type_map, device, latent_channel_c
                 outputs[name] = so              # scalar/string/broadcast: any strip suffices
         if on_progress is not None:
             _progress(on_progress, "strip", (k + 1) / n_strips)
+    # TRK-221 (Q1): same reasoning as `run_tiled`'s own tail above — a successful halo-tiled
+    # cook must record ITS OWN tier. Each strip's `run_roi` call above passes
+    # `record_trace=False` (deliberately: it must not leave a per-strip ROI rect on the
+    # trace), and that flag ONLY suppresses `record_roi`'s window bookkeeping, never this
+    # function's own tier tag — the two are different thread-local fields.
+    from .tex_runtime import tier_trace as _tier_trace
+    _tier_trace.record("halo_tiled")
     return outputs
 
 
