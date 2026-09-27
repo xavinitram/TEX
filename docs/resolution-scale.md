@@ -84,16 +84,23 @@ not otherwise shrink with the canvas.
 - **ROI narrowing and `scale` are not yet reconciled.** A cook that passes both `roi=` and a
   non-None `scale` declines the ROI window (cooks whole-frame at the requested scale) rather
   than risk the two interacting incorrectly.
-- **Only the interpreter tier honours `scale`.** A scale-active cook (`scale` not `None`) is
-  routed to the plain interpreter unconditionally, ahead of tier selection — bypassing
-  `torch_compile`/`auto`/`cuda_graph` and the default tier's own internal codegen/stencil/
-  tiling shortcuts. None of those tiers currently thread a runtime scale multiplier through
-  their emitted or captured code, so extending each one individually was deferred rather than
-  risk a silently wrong replay (a CUDA-graph capture taken at one scale must never replay under
-  another). This costs real acceleration for a scale-active cook today; it does not cost
-  correctness, and it does not touch the default (`scale=None`) path's tier selection at all.
-  Reported via `tier_trace` exactly like every other tier decline (`tier_trace.last().tier ==
-  "interpreter"`, reason names scale) — never a silent fallback.
+- **`torch_compile`/`auto`/`cuda_graph` never honour `scale`.** A scale-active cook
+  (`scale` not `None`) whose tier selection names one of those three still forces the plain
+  interpreter — none of the three thread a runtime scale multiplier through their
+  compiled/captured code (SCALE-COMPILED-48, deferred past v0.48: a CUDA-graph capture
+  taken at one scale must never replay under another). This costs real acceleration for a
+  scale-active cook on those tiers; it does not cost correctness, and it does not touch the
+  default (`scale=None`) path's tier selection at all.
+  **The `"default"` tier's own internal codegen shortcut DOES now honour `scale`**
+  (SCALE-CG-48): a scale-active cook that hits the UC-2 stencil route
+  (`_should_stencil_route`) runs on codegen instead of the interpreter — codegen's
+  `pixel_args=`-tagged call sites emit the scale multiplier as a runtime value read from
+  the cook's own environment, never a folded literal, so one cached codegen fn serves
+  every scale value without recompiling. M-4/ROI-5 *tiling* is still out of scope on
+  either route — a scale-active cook always cooks whole-frame (see the ROI bullet above).
+  Reported via `tier_trace` exactly like every other tier decision (`tier_trace.last().tier
+  == "interpreter"` or `== "codegen"`, reason names scale either way) — never a silent
+  fallback.
 
 ## The declared-fallback query (TIERQ-48)
 
@@ -114,10 +121,12 @@ that fact QUERYABLE instead of only documented in prose:
 It returns a `TierVerdict(tier, reason, roi_armed, roi_reason)`:
 
 - `tier` is one of `"torch_compile"` / `"auto"` / `"cuda_graph"` / `"default"` /
-  `"interpreter"` — the same five strings the real dispatch (`tex_engine_tiers._run_tier`)
-  can actually produce — or `None` when the cook itself would REFUSE (a non-1.0 `scale`
-  the classifier cannot prove safe): the query never guesses what an exception-raising
-  cook "would have" run on.
+  `"interpreter"` / `"codegen"` (SCALE-CG-48's UC-2 stencil route for a scale-active
+  `"default"`-tier cook — precise only when `binding_types` lets the query compile
+  `source`; see `tier_verdict`'s own docstring for the conservative fallback) — the same
+  six strings the real dispatch (`tex_engine_tiers._run_tier`) can actually produce — or
+  `None` when the cook itself would REFUSE (a non-1.0 `scale` the classifier cannot prove
+  safe): the query never guesses what an exception-raising cook "would have" run on.
 - `roi_armed`/`roi_reason` answer the SEPARATE question of whether a requested `roi`
   window actually narrows the cook — `False` even on an eligible tier when that tier
   never threads ROI at all, or on the `"default"` tier itself for any of the ordinary
@@ -141,8 +150,8 @@ first, exactly as `prepare()` does before this same gate runs.
 query's answer.** The query reports `roi_armed`/`tier` for the tier a cook actually runs
 on; `TEX_ROI_CODEGEN` is an orthogonal, `"default"`-tier-internal routing choice (codegen
 vs. the tree-walking interpreter for an already-armed ROI window) that does not change
-which of the five `tier` values the query reports. See the codegen-ROI re-measurement
-below for whether that internal choice is worth flipping.
+which `tier` value the query reports. See the codegen-ROI re-measurement below for
+whether that internal choice is worth flipping.
 
 ## The classifier and the override comment
 
