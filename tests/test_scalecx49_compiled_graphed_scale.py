@@ -294,7 +294,23 @@ def test_scalecx49_execute_compiled_real_backend_compiles_once_across_scale_swee
     builtin at all -- must compile through the REAL backend exactly ONCE across a sweep of
     distinct scale values, not once per value. `scale` reaching the callable is still proven
     the same way the mocked test above does; this test additionally proves the REAL
-    `torch.compile()` wrap itself is not repeated."""
+    `torch.compile()` wrap itself is not repeated.
+
+    FIX-SCALECX2 2 (real CUDA hardware, two independent full "not slow" suite reproductions):
+    under heavy accumulated session state -- thousands of prior compiles alive in the SAME
+    process, never reproduced in isolation or in any smaller slice tried -- `_try_compile` can
+    fire more than once even with X2's own cache-key fix landed and correct. In both captured
+    reproductions, every extra call was immediately preceded by
+    `[TEX] Cleared a stale torch.compile precompile entry; will recompile on the next run`
+    (`compiled.py:_clear_dynamo_precompile_store`, invoked from the `_is_precompile_attach_failure`
+    branch) -- PC-2's own pre-existing, scale-independent self-healing recovery for a stale
+    disk-persisted dynamo precompile entry, not a cache-key regression: `_compiled_cache.pop`
+    fires unconditionally on ANY `compile_error`, so a recovery this test does not control for
+    forces the NEXT call to redo `_try_compile` regardless of scale. Wrapping
+    `_clear_dynamo_precompile_store` the same way as `_try_compile` lets the assertion tell the
+    two apart: an extra real compile is tolerated only up to the number of recoveries observed,
+    so a genuine break of X2's cache-key sharing (extra compiles with NO recovery) still fails
+    this test."""
     if not _compiled.compile_capability().get(
             "cuda_inductor" if torch.cuda.is_available() else "cpu_inductor"):
         r.skip("scalecx49 X2 real-backend sweep", "no working torch.compile backend on this box")
@@ -309,27 +325,42 @@ def test_scalecx49_execute_compiled_real_backend_compiles_once_across_scale_swee
     tm = TypeChecker(binding_types=bt, source=code).check(prog)
     fp = "fp_scalecx49_real_sweep"
     real_try_compile = _compiled._try_compile
+    real_clear_precompile = _compiled._clear_dynamo_precompile_store
     compiles = {"n": 0}
+    recoveries = {"n": 0}
 
     def _counting_try_compile(*a, **kw):
         compiles["n"] += 1
         return real_try_compile(*a, **kw)
 
+    def _counting_clear_precompile(*a, **kw):
+        recoveries["n"] += 1
+        return real_clear_precompile(*a, **kw)
+
     _compiled._try_compile = _counting_try_compile
+    _compiled._clear_dynamo_precompile_store = _counting_clear_precompile
     try:
         for s in (0.5, 0.25, 0.5, 0.125, None):
             A = make_img(1, 16, 16, 4, seed=11)
             if device == "cuda":
                 A = A.cuda()
             _compiled.execute_compiled(prog, {"A": A}, tm, device, fp, scale=s)
-        if compiles["n"] == 1:
+        extra = compiles["n"] - 1
+        if extra <= 0:
             r.ok(f"5 calls over 4 distinct scale values -> {compiles['n']} real "
                  f"torch.compile() attempt (shared artifact, real backend)")
+        elif extra <= recoveries["n"]:
+            r.ok(f"5 calls over 4 distinct scale values -> {compiles['n']} real "
+                 f"torch.compile() attempts, {extra} paid for by a PC-2 stale-precompile "
+                 f"recovery ({recoveries['n']} observed; pre-existing, scale-independent) -- "
+                 f"shared artifact otherwise")
         else:
             r.fail("scalecx49 X2 real backend sweep",
-                  f"expected 1 real _try_compile call, got {compiles['n']}")
+                  f"expected 1 real _try_compile call (or N paired with a PC-2 recovery), got "
+                  f"{compiles['n']} calls and only {recoveries['n']} recoveries")
     finally:
         _compiled._try_compile = real_try_compile
+        _compiled._clear_dynamo_precompile_store = real_clear_precompile
         _clear_compiled_state()
 
 
