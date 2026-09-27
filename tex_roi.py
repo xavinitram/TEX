@@ -54,7 +54,10 @@ from .tex_compiler.ast_nodes import (
     ForLoop, WhileLoop, IfElse, clone_tree, iter_child_nodes,
 )
 from .tex_compiler.optimizer import _propagate_literal_locals, _fold_all
-from .tex_lazy import _substitute_params, _fp32, _param_key, _pristine_parse, _profile_key
+from .tex_lazy import (
+    _substitute_params, _fp32, _param_key, _pristine_parse, _profile_key,
+    _capture_pre_fold_conditions, _revert_unverified_folds,
+)
 from .tex_runtime import codegen_stencil as _st
 
 
@@ -805,6 +808,20 @@ def _fold_program(code: str, param_values: dict):
     copy of the memoized parse (`_pristine_program`), because the fold mutates its AST.
     Raises on a parse error (caller catches).
 
+    ROI-48A/B1#1: a folded `IfElse`/`WhileLoop` condition is trusted by `_resolved_branch`
+    (and `tex_lazy._prune_static_flow`) the moment it is a `NumberLiteral` — but the generic
+    fold below (`_fold_all`) evaluates every intermediate in plain Python DOUBLE precision,
+    while the runtime evaluates the same expression as fp32 tensors, so an arithmetic
+    combination of two or more `$param`s (`$a + $b > 0.5`) can fold to a literal the runtime
+    would never pick (repro: a=0.45405644178390503, b=0.045943569391965866). This snapshots
+    every condition TWICE — before the fold (`_capture_pre_fold_conditions`, the DIRECT case)
+    and again after `_propagate_literal_locals` but before the second `_fold_all` (the
+    INDIRECT, behind-a-local-var case) — and reverts (`_revert_unverified_folds`) any literal
+    the fold produced that a dedicated fp32-per-op re-evaluation cannot confirm from either
+    snapshot — so `_resolved_branch`/`_prune_static_flow` need no change of their own: by the
+    time either sees this tree, every surviving `NumberLiteral` condition is proof, not a
+    guess.
+
     DATA-6: through the one front end (`tex_cache.parse_and_split`) with NO binding types, on
     purpose: `_walk`'s memo is keyed on the source, the param values and the string wires, so
     the AST must be a function of the source alone. The untyped-base row splits every dotted
@@ -821,9 +838,12 @@ def _fold_program(code: str, param_values: dict):
     if subs:
         for stmt in stmts:
             _substitute_params(stmt, subs)
+        pre_fold_1 = _capture_pre_fold_conditions(stmts)
         stmts = _fold_all(stmts)
         stmts = _propagate_literal_locals(stmts)
+        pre_fold_2 = _capture_pre_fold_conditions(stmts)
         stmts = _fold_all(stmts)
+        _revert_unverified_folds(stmts, pre_fold_1, pre_fold_2)
         program.statements = stmts
     return program
 

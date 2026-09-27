@@ -42,12 +42,13 @@ shared by check_lazy_status and execute() so the per-cook cost is a dict hit.
 """
 from __future__ import annotations
 
+import math
 import struct
 from collections import OrderedDict
 
 from .tex_compiler.ast_nodes import (
     ASTNode, BindingRef, NumberLiteral, IfElse, WhileLoop, ForLoop,
-    FunctionDef, clone_tree, iter_child_nodes,
+    FunctionDef, BinOp, UnaryOp, clone_tree, iter_child_nodes,
 )
 from .tex_compiler.optimizer import _propagate_literal_locals, _fold_all
 from .tex_compiler.types import planes_wires_enabled
@@ -188,6 +189,132 @@ def _substitute_params(node: ASTNode, subs: dict[str, NumberLiteral]) -> None:
                     _substitute_params(item, subs)
 
 
+def _fp32_binop(op: str, a: float, b: float) -> float | None:
+    """The runtime's own fp32-PER-OP semantics for the same operator set
+    `tex_compiler.optimizer._eval_binop_const` folds in plain Python double precision
+    (ROI-48A/B1#1). `torch.float32(a) <op> torch.float32(b)` rounds the RESULT of every
+    single op to fp32 — a chain of ops (`$a + $b > 0.5`) rounds after the `+`, then compares
+    the ROUNDED sum — so an arithmetic combination of two fp32-exact leaves can disagree with
+    the identical expression folded end-to-end in double precision whenever the true value
+    sits within half an fp32 ulp of a boundary the comparison tests (repro:
+    a=0.45405644178390503, b=0.045943569391965866 — double sum > 0.5 is True, fp32 sum == 0.5
+    exactly). Rounding the result of every step here, not just the leaves, is what makes this
+    agree with the tensor evaluation. Mirrors `interpreter.py`'s `_eval_binop`/`_eval_unary`
+    operator set exactly. Returns None on anything `_eval_binop_const` itself would (an
+    unknown op, a zero divisor) — never guesses."""
+    try:
+        if op == "+": r = a + b
+        elif op == "-": r = a - b
+        elif op == "*": r = a * b
+        elif op == "/": r = a / b if b != 0 else None
+        elif op == "%": r = math.fmod(a, b) if b != 0 else None
+        elif op == "==": return 1.0 if a == b else 0.0
+        elif op == "!=": return 1.0 if a != b else 0.0
+        elif op == "<": return 1.0 if a < b else 0.0
+        elif op == ">": return 1.0 if a > b else 0.0
+        elif op == "<=": return 1.0 if a <= b else 0.0
+        elif op == ">=": return 1.0 if a >= b else 0.0
+        elif op == "&&": return 1.0 if (a > 0.5 and b > 0.5) else 0.0
+        elif op == "||": return 1.0 if (a > 0.5 or b > 0.5) else 0.0
+        else:
+            return None
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+    return None if r is None else _fp32(r)
+
+
+def _fp32_eval_expr(node) -> float | None:
+    """Recursively fp32-evaluate an expression built ONLY from literals/unary/binary ops — the
+    shape a $param-substituted condition has BEFORE the optimizer's own (double-precision)
+    constant fold ever touches it. Returns None (unknown, never a guess) the moment it meets
+    anything else: a spatial read, an unresolved identifier, a function call, a still-symbolic
+    $param. Used to prove-or-refuse a folded condition's literal (ROI-48A/B1#1) — see
+    `_fp32_binop`."""
+    cls = node.__class__
+    if cls is NumberLiteral:
+        return _fp32(node.value)
+    if cls is BinOp:
+        a = _fp32_eval_expr(node.left)
+        if a is None:
+            return None
+        b = _fp32_eval_expr(node.right)
+        if b is None:
+            return None
+        return _fp32_binop(node.op, a, b)
+    if cls is UnaryOp:
+        v = _fp32_eval_expr(node.operand)
+        if v is None:
+            return None
+        if node.op == "-":
+            return _fp32(-v)
+        if node.op == "!":
+            return 0.0 if v > 0.5 else 1.0
+    return None
+
+
+def _capture_pre_fold_conditions(stmts: list) -> dict:
+    """`id(IfElse|WhileLoop) -> (pre-fold condition clone, fp32-evaluated value or None)`,
+    snapshotted on the $param-substituted tree BEFORE the generic (double-precision) constant
+    fold reaches any condition (ROI-48A/B1#1). The IfElse/WhileLoop node OBJECTS the fold
+    walks are mutated in place — `.condition` is REASSIGNED, never replaced — so `id()` stays
+    stable across the fold, which is what lets `_revert_unverified_folds` match this snapshot
+    back up afterwards. See `_fp32_binop`'s docstring for why the double fold cannot be
+    trusted on its own."""
+    out: dict = {}
+    stack = list(stmts)
+    while stack:
+        node = stack.pop()
+        if node.__class__ in (IfElse, WhileLoop):
+            out[id(node)] = (clone_tree(node.condition), _fp32_eval_expr(node.condition))
+        stack.extend(iter_child_nodes(node))
+    return out
+
+
+def _revert_unverified_folds(stmts: list, pre_fold_1: dict, pre_fold_2: dict | None = None) -> None:
+    """After the generic (double-precision) fold: for every IfElse/WhileLoop whose condition
+    is now a `NumberLiteral`, restore the pre-fold expression (`pre_fold_1`'s clone) UNLESS an
+    independent fp32-correct re-evaluation agrees with the fold's own literal boolean sense.
+    'Could not be fp32-evaluated at all' (None) and 'disagrees' are treated identically — both
+    are doubt, and doubt must revert to the SYMBOLIC (non-NumberLiteral) pre-fold form. That is
+    exactly what makes `tex_roi._resolved_branch` and this module's own `_prune_static_flow` —
+    both of whose whole contract is `cond.__class__ is NumberLiteral` — fall back to their
+    pre-ROI-48A both-arms walk with NO change to either function: this runs before either ever
+    sees the tree (invariant #11: the lazy/ROI analyses may only over-approximate).
+
+    TWO snapshots, because a condition's genuinely-literal shape can only be SEEN at one of two
+    different pipeline points, depending on whether it is DIRECT or INDIRECT:
+      * DIRECT — an arithmetic combination of already-substituted `$param`s (`$a + $b > 0.5`)
+        — is fully present, literal-only, BEFORE any generic fold runs, so `pre_fold_1`
+        (captured there) verifies it independently of the fold that is about to run.
+      * INDIRECT — behind a local var (`float k = $a; if (k + $b > 0.5)`) — `k` is still a
+        symbolic `Identifier` at `pre_fold_1`'s point (verified is None there) and only
+        becomes a literal after `_propagate_literal_locals` inlines it; `pre_fold_2`
+        (captured after propagate, still before the SECOND `_fold_all` — the one that would
+        double-fold the now-exposed arithmetic) verifies THAT case, independently of that
+        fold too.
+    `pre_fold_1`'s verified value wins whenever it has one (it is always the more direct
+    proof — a value it produced could not itself already be a product of the generic fold);
+    `pre_fold_2` is consulted only where `pre_fold_1` could not evaluate at all. The pre-fold
+    CLONE to revert to on doubt always comes from `pre_fold_1` — any non-`NumberLiteral` form
+    reads as symbolic regardless of which snapshot proved the doubt. Mutates `stmts` in
+    place."""
+    pre_fold_2 = pre_fold_2 or {}
+    stack = list(stmts)
+    while stack:
+        node = stack.pop()
+        if node.__class__ in (IfElse, WhileLoop) and node.condition.__class__ is NumberLiteral:
+            entry1 = pre_fold_1.get(id(node))
+            if entry1 is not None:
+                orig_cond, verified = entry1
+                if verified is None:
+                    entry2 = pre_fold_2.get(id(node))
+                    if entry2 is not None:
+                        verified = entry2[1]
+                if verified is None or (verified > 0.5) != (node.condition.value > 0.5):
+                    node.condition = orig_cond
+        stack.extend(iter_child_nodes(node))
+
+
 def _prune_static_flow(stmts: list) -> list:
     """Remove statically-dead control flow after const-folding.
 
@@ -291,12 +418,26 @@ def lazy_required_bindings(code: str,
         if subs:
             for stmt in stmts:
                 _substitute_params(stmt, subs)
+        # ROI-48A/B1#1: snapshot every IfElse/WhileLoop condition here, BEFORE the generic
+        # double-precision fold below touches any of them (the DIRECT case — an arithmetic
+        # combination of already-substituted $params — so a literal the fold produces can be
+        # verified against the runtime's own fp32 semantics; see `_capture_pre_fold_conditions`
+        # / `_revert_unverified_folds`).
+        pre_fold_1 = _capture_pre_fold_conditions(stmts)
         # fold -> propagate -> fold: the first fold turns substituted-param
         # initializers into literals (`float k = $n * 2.0;`), propagation
         # spreads them, the second fold collapses the now-literal conditions.
         stmts = _fold_all(stmts)
         stmts = _propagate_literal_locals(stmts)
+        # A second snapshot: propagate can just have inlined a local var into a condition
+        # that is NOW a literal-only expression for the first time (the INDIRECT case), which
+        # `pre_fold_1` could not have seen (the local var was still a symbolic read then).
+        pre_fold_2 = _capture_pre_fold_conditions(stmts)
         stmts = _fold_all(stmts)
+        # Undo any fold neither snapshot can prove agrees with the runtime's fp32 evaluation —
+        # `_prune_static_flow` below trusts `NumberLiteral` unconditionally, so an
+        # unverifiable/disagreeing literal must be gone before it runs.
+        _revert_unverified_folds(stmts, pre_fold_1, pre_fold_2)
         stmts = _prune_static_flow(stmts)
         result: frozenset | None = _collect_binding_refs(stmts)
     except Exception:
