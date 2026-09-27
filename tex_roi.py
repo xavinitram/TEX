@@ -799,12 +799,8 @@ def _fold_program(code: str, param_values: dict):
     ever a MORE permissive answer (invariant #11), never a wrong one. Unconditional (not
     gated on `subs`): a program whose OWN source (no `$param` involved at all) already writes
     a literal condition — `if (1.0 > 0.5) { ... }` — is exactly as statically dead, and
-    `_walk`'s private-clone prune this replaces ran unconditionally too.
-
-    FIX-ROI49 Q4 (R3#2): the prune walk itself is now gated on `_has_prunable_flow(stmts)`, a
-    cheap pre-check for whether there is anything to prune AT ALL — still not gated on `subs`
-    (a hardcoded-literal source with no `$param` is caught the same way), just skipping the
-    rebuild-and-recurse walk on the common program with no dead branch to strip.
+    `_walk`'s private-clone prune this replaces ran unconditionally too. Q4: gated on
+    `_has_prunable_flow` below — same "not gated on `subs`" reach, just skips the rebuild.
 
     DATA-6: through the one front end (`tex_cache.parse_and_split`) with NO binding types, on
     purpose: `_walk`'s memo is keyed on the source, the param values and the string wires, so
@@ -828,13 +824,7 @@ def _fold_program(code: str, param_values: dict):
         pre_fold_2 = _capture_pre_fold_conditions(stmts)
         stmts = _fold_all(stmts)
         _revert_unverified_folds(stmts, pre_fold_1, pre_fold_2)
-    # FIX-ROI49 Q4 (R3#2): `_prune_static_flow` always paid a full rebuild-and-recurse walk,
-    # even on the common program with no dead branch to prune at all. `_has_prunable_flow` is
-    # the cheap (no-allocation) over-approximate pre-check: it can only say "nothing to prune"
-    # when that is actually true, so skipping the rebuild in that case changes no answer this
-    # function returns — `stmts` is passed through exactly as `_prune_static_flow` would have
-    # returned it (a no-op walk, structurally).
-    if _has_prunable_flow(stmts):
+    if _has_prunable_flow(stmts):   # Q4: skip the rebuild when there is nothing to prune
         stmts = _prune_static_flow(stmts)
     program.statements = stmts
     return program
@@ -1665,13 +1655,7 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
         return out
     out[n - 1] = canonical_roi(roi)
     start = max(0, dirty_from)
-    # Q3 (FIX-ROI49, R1#1/R2#2): grow-and-clamp via `_dag_grow` — the SAME helper
-    # `chain_windows_dag` below already uses for its own two call sites — instead of a third
-    # hand-copy of this arithmetic. `_dag_grow` is defined later in this module (the JOIN-49
-    # section below), which is fine: nothing calls `chain_windows` until the module has
-    # finished loading. The linear-equivalence oracle (`test_join49_dag_windows.py`) proves
-    # this produces byte-identical answers to the pre-Q3 inline arithmetic for every case in
-    # its named corpus plus its 300-case random sweep.
+    # Q3: grow-and-clamp via `_dag_grow` (below), the SAME helper `chain_windows_dag` uses.
     for i in range(n - 2, start - 1, -1):
         out[i] = _dag_grow(out[i + 1], halos[i + 1])
     if valid is not None and start > 0:
@@ -1703,34 +1687,28 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
 # `halos` is a flat per-stage list, so there is no way to even ASK "stage k reads stages i AND
 # j, and needs a DIFFERENT margin from each". `chain_windows_dag` below is the generalisation;
 # `chain_windows`'s SIGNATURE and every answer it returns are UNTOUCHED (proven by the
-# byte-identical oracle below) — every existing call site keeps calling the exact function it
-# always did, and the linear case's own trusted CONTROL FLOW (the P0-4a/P0-4b refusals, the
-# loop bounds) is not the surface this correctness-sensitive lane risks. As of FIX-ROI49 Q3,
-# `chain_windows`'s body no longer hand-copies the grow-and-clamp arithmetic itself, though:
-# both of its own internal sites now call `_dag_grow` (defined just below) — the SAME helper
-# `chain_windows_dag` already uses — instead of carrying a third independent copy of it (the
-# original JOIN-49 cut left `chain_windows` with two hand-written copies right next to a
-# helper built to eliminate exactly that duplication class — R1#1/R2#2 of the v0.49 Phase C
-# review).
+# byte-identical oracle below); its own trusted CONTROL FLOW (the P0-4a/P0-4b refusals, the
+# loop bounds) is not the surface this correctness-sensitive lane risks. As of Q3, its body no
+# longer hand-copies the grow-and-clamp arithmetic itself: both of its internal sites now call
+# `_dag_grow` (below), the SAME helper `chain_windows_dag` already uses, instead of carrying a
+# third independent copy of it (R1#1/R2#2 of the v0.49 Phase C review).
 #
 # The design doc's own recommendation is to make `chain_windows` a thin wrapper that calls the
 # DAG walker with `inputs=(i-1,)` synthesized. That refactor is still NOT taken — sharing only
 # the grow-and-clamp arithmetic, while leaving `chain_windows`'s own control flow byte-for-byte
-# as originally written, is preferred over routing the whole function through the DAG
-# machinery. The byte-identical PROOF (unaffected by Q3's arithmetic-sharing): `chain_windows_
-# dag` fed the synthesized linear stage list `[StageSpec(h, () if i == 0 else (i - 1,)) for i,
-# h in enumerate(halos)]` returns EXACTLY what `chain_windows(halos, ...)` returns, for every
-# call shape in the existing linear test corpus plus a randomized oracle sweep
-# (`tests/test_join49_dag_windows.py`) — which now also exercises `_dag_grow` from both sides.
+# as written, is preferred over routing the whole function through the DAG machinery. The
+# byte-identical PROOF (unaffected by Q3): `chain_windows_dag` fed the synthesized linear
+# stage list `[StageSpec(h, () if i == 0 else (i - 1,)) for i, h in enumerate(halos)]` returns
+# EXACTLY what `chain_windows(halos, ...)` returns, for every call shape in the existing
+# linear test corpus plus a randomized oracle sweep (`tests/test_join49_dag_windows.py`).
 
 def _dag_grow(window, pad: float):
     """`window ⊕ pad`, clamped to the frame — grow-and-clamp, the one piece of correctness-
-    sensitive arithmetic every window-composition rule in this module needs. As of FIX-ROI49
-    Q3, this is the ONE shared implementation for FOUR call sites: `chain_windows`'s own
-    backward step and its P0-4(b) boundary-validity check, and `chain_windows_dag`'s backward
-    step and its own divergent-validity check — not two independent copies (`chain_windows`'s
-    original two hand-written inlines) plus this as a third, the class of bug FIX-ROI's O2
-    finding was about (two per-node copies of one rule drifting apart)."""
+    sensitive arithmetic this module needs. As of Q3, the ONE shared implementation for FOUR
+    call sites: `chain_windows`'s own backward step and its P0-4(b) check, and
+    `chain_windows_dag`'s backward step and its own divergent-validity check — not two
+    independent copies plus this as a third (the class of bug FIX-ROI's O2 finding was
+    about: two per-node copies of one rule drifting apart)."""
     x0, y0, w, h, W, H = window
     pad = int(pad)
     nx0, ny0 = max(0, x0 - pad), max(0, y0 - pad)
@@ -1779,16 +1757,13 @@ class StageSpec:
     already resolves the single-input case; this dataclass only carries the resolved
     number, the same division of labour `halos[i]` already had.
 
-    KNOWN LIMIT (FIX-ROI49 Q5, B1-roi.md): `arg_halo` is keyed by UPSTREAM STAGE INDEX only,
-    one number per index. If a stage ever reads the SAME upstream index through TWO argument
-    roles that need DIFFERENT margins (e.g. a composite reading the same plate as both `bg`,
-    halo 0, and a blurred `fg`, halo > 0, with no intervening stage giving each role its own
-    index), this dict can only hold one number for that index — silently the SMALLER one,
-    under-serving whichever role actually needed more, unless the caller pre-maxes the roles
-    before building `arg_halo`. No caller does this today (`chain_windows_dag` has no
-    production caller at all yet — `tex_roi.py` and its own test file are the only
-    referencers); flagged here for whoever wires REACH-48's per-argument registry through
-    this dataclass, so the pre-max is done at that point rather than assumed."""
+    KNOWN LIMIT (Q5, B1-roi.md): `arg_halo` is keyed by UPSTREAM STAGE INDEX only, one number
+    per index. A stage reading the SAME upstream index through TWO argument roles needing
+    DIFFERENT margins (e.g. the same plate as both a zero-halo `bg` and a blurred `fg` needing
+    one, with no intervening stage) would silently get the SMALLER one, under-serving whichever
+    role needed more, unless the caller pre-maxes the roles first. No caller does this today
+    (`chain_windows_dag` has no production caller at all yet); flagged for whoever wires
+    REACH-48's per-argument registry through this dataclass."""
     halo: float
     inputs: tuple = ()
     arg_halo: "dict | None" = None
