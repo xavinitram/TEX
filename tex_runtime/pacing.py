@@ -206,6 +206,20 @@ def wants_pacing(token) -> bool:
     return bool(getattr(token, "pace", False))
 
 
+def is_paced() -> bool:
+    """P2 (Phase C, R3#1): whether THIS cook actually engaged pacing — `reset()` resolves
+    this once per cook (O5) into `_state.paced`; a caller with its own per-statement work
+    to do ONLY when a poll will actually read it (a heavy-builtin classification walk,
+    thrown away unread by `paced_check` below whenever this reads False) can check here
+    FIRST and skip that work entirely, rather than computing it and having `paced_check`
+    discard it. Cheaper than `paced_check`'s own `getattr(_state, "paced", False)` need
+    not be duplicated by a caller — reading `_state.paced` directly would raise on a
+    thread that never called `reset()`, so this keeps the same tolerant `getattr` default.
+    A CPU cook, an unwired cancel, or the real ComfyUI default (a token with no `pace`
+    attribute) all read False here, identically to how they read inside `paced_check`."""
+    return getattr(_state, "paced", False)
+
+
 #: P4 (Phase C): the ceiling on `pace_depth`. Unbounded, an adversarial or misconfigured
 #: token grows the per-thread ring by that many `None` slots in one Python list expression
 #: BEFORE a single `torch.cuda.Event` is allocated — confirmed accepted and unbounded at

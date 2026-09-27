@@ -521,17 +521,34 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                 # progress arithmetic only a wired on_progress consumes (measured ~37 ns/stmt).
                 # PACE-47d: classify once per PROGRAM (memoized), not per statement/cook — a
                 # cache hit is a dict lookup, paid only on this already-paced path.
-                _heavy_ids = _heavy_stmt_ids(stmts)
-                for stmt in stmts:
-                    _pace.paced_check(cancel, dev, heavy=id(stmt) in _heavy_ids)  # PACE-45/47d
-                    self._exec_stmt(stmt)
+                # P2 (Phase C, R3#1): a wired-but-UNPACED token (the real ComfyUI default —
+                # `wants_pacing` reads False for it) reaches this branch too; `paced_check`
+                # never reads `heavy` unless `_state.paced`, so classifying for it here would
+                # be work computed and thrown away on literally every default cook.
+                # `_pace.is_paced()` was resolved once already, by `reset()` at cook start.
+                if _pace.is_paced():
+                    _heavy_ids = _heavy_stmt_ids(stmts)
+                    for stmt in stmts:
+                        _pace.paced_check(cancel, dev, heavy=id(stmt) in _heavy_ids)  # PACE-45/47d
+                        self._exec_stmt(stmt)
+                else:
+                    for stmt in stmts:
+                        _pace.paced_check(cancel, dev)
+                        self._exec_stmt(stmt)
             else:
                 n = len(stmts) or 1
-                _heavy_ids = _heavy_stmt_ids(stmts)   # PACE-47d: see the branch above
-                for i, stmt in enumerate(stmts):
-                    _pace.paced_check(cancel, dev, heavy=id(stmt) in _heavy_ids)  # PACE-45/47d
-                    self._exec_stmt(stmt)
-                    _report_progress(on_progress, "stmt", (i + 1) / n)
+                # P2: same is_paced() gate as the branch above — see its comment.
+                if _pace.is_paced():
+                    _heavy_ids = _heavy_stmt_ids(stmts)   # PACE-47d: see the branch above
+                    for i, stmt in enumerate(stmts):
+                        _pace.paced_check(cancel, dev, heavy=id(stmt) in _heavy_ids)  # PACE-45/47d
+                        self._exec_stmt(stmt)
+                        _report_progress(on_progress, "stmt", (i + 1) / n)
+                else:
+                    for i, stmt in enumerate(stmts):
+                        _pace.paced_check(cancel, dev)
+                        self._exec_stmt(stmt)
+                        _report_progress(on_progress, "stmt", (i + 1) / n)
         finally:
             _stdlib_mod.restore_cook_ctx(_grid_token)
             if _mf_token is not None:
@@ -623,7 +640,10 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
             torch.cuda.synchronize()
         # PACE-47d: same classify-once-per-program-list discipline as the unprofiled loops;
         # paid only when `cancel is not None` reaches the branch below, same as before.
-        _heavy_ids = _heavy_stmt_ids(stmts) if cancel is not None else None
+        # P2 (Phase C, R3#1): also gated on `_pace.is_paced()` — a wired-but-unpaced token
+        # (the real ComfyUI default) reaches this branch with `cancel is not None` true,
+        # but `paced_check` below never reads `heavy` for it either.
+        _heavy_ids = _heavy_stmt_ids(stmts) if (cancel is not None and _pace.is_paced()) else None
         cur, t0, i = _MISSING, time.perf_counter(), 0
         for stmt in stmts:
             stage = stmt.loc.stage
@@ -632,7 +652,10 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                     t0 = close(cur, t0)
                 cur = stage
             if cancel is not None:
-                _pace.paced_check(cancel, dev, heavy=id(stmt) in _heavy_ids)   # PACE-45/47d
+                # P2: `_heavy_ids` is None whenever classification was skipped (unpaced) —
+                # `heavy=False` is the correct, cheap answer `paced_check` ignores anyway.
+                _pace.paced_check(cancel, dev,
+                                  heavy=_heavy_ids is not None and id(stmt) in _heavy_ids)   # PACE-45/47d
             self._exec_stmt(stmt)
             if on_progress is not None:
                 i += 1

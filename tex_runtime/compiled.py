@@ -1365,7 +1365,11 @@ def _codegen_only_execute(
     # before ANY of the program's statements have executed) -- the coarse-but-safe
     # equivalent of per-statement classification is "does this program contain ANY
     # heavy statement at all", memoized the same way (see `pacing_heavy.py`).
-    _pace.paced_check(cancel, device, heavy=(cancel is not None
+    # P2 (Phase C, R3#1): gated on `_pace.is_paced()`, not merely `cancel is not None` --
+    # `paced_check` never reads `heavy` for an unpaced cook (the real ComfyUI default: a
+    # wired-but-unpaced token), so walking the program for it was work computed and
+    # discarded on every such cook. `is_paced()` was already resolved above by `reset()`.
+    _pace.paced_check(cancel, device, heavy=(_pace.is_paced()
                                               and _program_has_any_heavy_stmt(program)))
 
     cg_fn = None
