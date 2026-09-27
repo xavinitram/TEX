@@ -1040,7 +1040,18 @@ def _scale_unsafe_walk(node, in_coord_arg: bool = False) -> bool:
     outside the whitelisted fetch/`@A[x,y]` coordinate position. `in_coord_arg` marks that
     THIS node is itself one of those whitelisted positions — it suppresses the `ix`/`iy`
     check for this subtree only; `img_width`/`img_height` are never whitelisted anywhere
-    (no stdlib call takes a frame dimension as a coordinate argument)."""
+    (no stdlib call takes a frame dimension as a coordinate argument).
+
+    FIX-SCALE S2: `img_width`/`img_height` are ordinary stdlib FUNCTION CALLS
+    (`img_width(@A)`), never bare identifiers — the parser has no grammar production that
+    emits a bare `Identifier("img_width")`. The `_PIXEL_DIM_NAMES` check below the
+    `Identifier` arm could therefore never fire on real source; `img_width(@A) * 0.001`
+    hit the generic `FunctionCall` arm instead, which only special-cases the FETCH
+    coordinate positions and let a call to either name through as safe. Checked by NAME
+    first, before the fetch-arg dispatch, so it fires regardless of whether the call also
+    happens to be `fetch`/`fetch_frame` (it never is — `_FETCH_COORD_ARGS` and
+    `_PIXEL_DIM_NAMES` name disjoint functions — but this ordering makes that true by
+    construction rather than by the two sets never colliding today)."""
     cls = node.__class__
     if cls is Identifier:
         if node.name in _PIXEL_DIM_NAMES:
@@ -1051,6 +1062,8 @@ def _scale_unsafe_walk(node, in_coord_arg: bool = False) -> bool:
         # on both a read and a scatter-write target (Assignment recurses into its target).
         return any(_scale_unsafe_walk(a, in_coord_arg=True) for a in node.args)
     if cls is FunctionCall:
+        if node.name in _PIXEL_DIM_NAMES:
+            return True
         coord_idx = _FETCH_COORD_ARGS.get(node.name)
         for i, a in enumerate(node.args):
             if _scale_unsafe_walk(a, in_coord_arg=(coord_idx is not None and i in coord_idx)):
