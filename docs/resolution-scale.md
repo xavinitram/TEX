@@ -138,6 +138,41 @@ band is a loud decision to re-measure and re-band, never a silently tightened or
 tolerance. `scale=1.0` on the SAME canvas remains the exact, non-approximate case (a bit-exact
 identity multiply).
 
+**The bands get worse at the coarser rungs, and the published numbers above (0.10 / 0.05 /
+0.05 / 0.08) hold at `scale=0.5` only** — the Bible's own ladder is `{½, ¼, ⅛}`, and this is
+the integer-radius/kernel discretization named above, not a canvas-size artifact (measured
+near-identical at 256² and 512²; size does not move these numbers, only scale does). Metric:
+maxdiff of a `scale=s` cook (upsampled) against a `scale=None` cook of the same program
+(downsampled to the same size), on TWO inputs — an adversarial 8-pixel-period checker (worst
+case for high-frequency content) and a realistic "smooth gradient plus a few hard-edged
+rectangles" image (most of a real comp is smooth; only isolated boundaries are sharp) — the
+band pins whichever measures WORSE, since neither input is reliably the worse one across
+every family (erode's `scale=0.125` divergence is worse on the smooth+edges image, 0.43–0.48,
+than on the checker, 0.25).
+
+| family | scale=½ (pinned, `test_scale47b_r1_envelope_*`) | scale=¼ | scale=⅛ |
+|---|---:|---:|---:|
+| `gauss_blur` | 0.10 | 0.20 | 0.40 |
+| `bilateral_filter` | 0.08 | 0.06 | 0.05 |
+| `erode` | 0.05 | 0.30 | **not recommended** — measured 0.25–0.48 |
+| `dilate` | 0.05 | 0.30 | **not recommended** — measured 0.53–0.75 |
+
+**`erode`/`dilate` are not recommended below `scale=¼`.** At `scale=⅛` the measured maxdiff
+(0.25–0.75, on a `[0,1]` channel range) is more than half the value range — past any band
+that could be called "the same picture, downscaled." The mechanism: `erode`/`dilate`'s scaled
+radius is truncated to an int downstream (`stdlib_sample._morph`), unlike `gauss_blur`'s
+continuous sigma (whose own `ceil` — `stdlib_core.py`'s `radius = int(math.ceil(3.0 *
+sigma))` — never reaches zero for a positive sigma); at `scale=0.125` a radius of `4.0`
+truncates to a scaled radius of `0`, a total no-op. Investigated whether switching `_morph`
+to `ceil` (matching `gauss_blur`'s own convention) helps: measured, it does NOT reliably — on
+the checker pattern the maxdiff is IDENTICAL either way (a radius-1 pass and a radius-0
+no-op are just two different discretizations of a true radius of 0.5, neither closer to it
+in general), and on the smooth+edges image `ceil` is worse for one family and better for the
+other. Left unchanged (`int()`, matching the pinned `scale=None`/`scale=1.0` default-path
+behaviour exactly either way — invariant #7) rather than trade one silently-worse case for
+another; a host choosing `¼`/`⅛` under memory or latency pressure should not select `⅛` for
+these two builtins.
+
 ## Precision under scale
 
 A coarse cook (`scale` neither `None` nor `1.0`) whose caller left `precision` at its literal
