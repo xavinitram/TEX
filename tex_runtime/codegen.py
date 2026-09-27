@@ -93,7 +93,7 @@ _CMP_OPS = {
 
 
 from .codegen_persist import (
-    _cg_filename, _register_codegen_linecache, materialize_codegen,
+    _cg_filename, _register_codegen_linecache, _codegen_exec_namespace, materialize_codegen,
 )
 
 
@@ -1209,10 +1209,16 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # with a `pixel_args=` call ever emits a reference to it; every other program
         # pays one unused dict-store per build, the same cost class `_MF`/`_CK` already
         # pay for every program that doesn't mask or poll-cancel.
-        namespace: dict[str, Any] = {"_MF": _masked_flow_mod, "_CK": _stdlib_poll_cancel,
-                                     "_SCM": _scale_pixel_arg}
+        # K1 (v0.50.0 Phase C, F2 + B3#1): a REAL module's own __dict__, registered in
+        # sys.modules and evicted alongside its linecache entry — see
+        # `_codegen_exec_namespace`'s own docstring for why a bare dict (no `__name__`)
+        # raised inside Dynamo's graph-break resume, and why the fix is a dedicated
+        # per-build module rather than a synthetic string or a shared live TEX module.
         code_obj = compile(func_src, filename, "exec")
         _register_codegen_linecache(filename, func_src)
+        namespace = _codegen_exec_namespace(
+            filename, {"_MF": _masked_flow_mod, "_CK": _stdlib_poll_cancel,
+                      "_SCM": _scale_pixel_arg})
         exec(code_obj, namespace)
         fn = namespace["_tex_fn"]
         # Stash the module code object + source for PC-3 marshal persistence.
