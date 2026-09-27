@@ -5,6 +5,93 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.0] - 2026-09-27 — "Per-argument, not per-function"
+
+A minor release, author-approved. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze
+is owed; no default moved, no ComfyUI pixel change.
+
+### Fixed
+
+- **`convolve`'s kernel argument was treated as pixel-local by the region planner, so a
+  windowed cook could crop the kernel instead of reading it whole — a real, silent-wrong-pixel
+  gap present in every release through `v0.47.0`.** The stdlib footprint registry gains a
+  per-argument reach declaration (`arg_footprint`, alongside the existing whole-function
+  `footprint`); `convolve`'s kernel argument is now declared `'image'` (read whole), and
+  `roi_plan`'s footprint walk resolves each multi-image argument through it instead of
+  defaulting a non-first argument to pointwise. A census of every registered stdlib builtin
+  found `convolve` to be the only one with a genuine second image argument; nothing else in
+  the registry needed the new declaration.
+- **A uniform-parameter branch in `roi_plan`'s footprint/halo walk could be folded using
+  double-precision arithmetic that disagreed with the runtime's own fp32 evaluation, so the
+  wrong arm's reach was sometimes counted — a halo-starved window and a wrong-pixel cook.**
+  A folded `if`/`while` condition is now accepted as resolved only when an fp32, per-op
+  re-evaluation (matching the runtime's own rounding) independently confirms the same literal
+  value; any condition the verification cannot confirm is walked both ways, exactly as before
+  this release. This also makes the engine's lazy input-pruning more conservative near an fp32
+  rounding boundary, for the same reason.
+
+### Added
+
+- **`roi_plan` (and the checkpoint-serving path) resolves a uniform-parameter branch before
+  judging reach**, so a program that guards a wide, unbounded call behind a condition built
+  only from `$param`s and literals — a quality-mode switch beside a full-image fallback arm,
+  the common shape of a blur/flow-warp/vector-blur node — can serve a narrow window when the
+  condition's taken arm never reaches that call, instead of declining on the untaken arm's
+  reach. `roi=`/`roi_exec=` is now accepted on `cook_stage_list` and `cook_checkpointed`, with
+  the same interpreter-tier/fp32/executable gating `tex_engine.cook(roi=...)` already applies;
+  a checkpoint's cached boundary itself is never windowed (it must still serve any future
+  request), only the suffix cook reading it can narrow.
+- **`tex_api.tier_verdict`**, a side-effect-free, read-only query: which tier a cook of a given
+  program/compile_mode/device/precision/roi/scale will actually run on, and why, before a host
+  cooks anything. It calls the exact same tier- and ROI-selection logic a real cook uses (now
+  consolidated into one shared eligibility function so the query and a real cook can never
+  disagree), returns a stable reason code, and answers separately whether a requested `roi`
+  window actually narrows the cook. It never writes to the codegen cache.
+- **`tex_api.prewarm_async()` and `PrewarmHandle`**, a non-blocking counterpart to the existing
+  `prewarm()`: submits the same warm-up work to its own dedicated background pool and returns
+  a handle (`.poll()`/`.wait()`/`.cancel()`/`.done`) instead of blocking the calling thread.
+  Warming a program only pre-populates the same codegen/compiled caches a later cook would
+  populate on its own; it never changes a cook's output. Concurrent emission of the same
+  program (a prewarm racing a real cook) is single-flight — the second caller waits on the
+  first's result instead of re-emitting.
+- **Resolution scale on the codegen tier, scoped to the hand-written stencil route.** A
+  scale-active cook of a program that already runs through the codegen tier's stencil shortcut
+  (gauss_blur/erode/dilate/bilateral_filter and similar hand-written stencil loops) now stays on
+  that tier instead of being forced to the interpreter; the scaled pixel-unit argument is
+  emitted as a runtime multiply, at zero cost when `scale == 1.0`. A plain call to one of those
+  same builtins that does NOT reach the stencil route, and every `torch_compile`/`auto`/
+  `cuda_graph` cook, still runs scale on the interpreter tier exactly as in `v0.47.0` —
+  `tier_verdict` reports this distinction directly rather than leaving it implicit.
+
+### Measured, and left as-is
+
+- **Codegen-backed ROI execution measured slower than the interpreter-tier ROI path on an
+  RTX 5070 Ti Laptop (sm_120), at both a realistic 1080p interactive-viewport window and a 4k
+  window, across two independent interleaved sittings** (+3.1% at 1080p, reproduced across
+  both sittings; +4.0%–6.7% at 4k). This reconfirms the original decision to keep it flagged
+  off, at shapes closer to a real interactive drag than the flag's original square-window
+  measurement used, on newer hardware. It stays opt-in and off by default.
+
+### Correction
+
+- **`v0.47.0`'s attribution of the `"auto"` tier's ~12 s cold-start reading to codegen emission
+  was incomplete.** Direct instrumentation of the real call path measured codegen emission
+  (parse, typecheck, emit, compile the emitted source, run it, disk persist) at ~13 ms total across 10
+  distinct programs, not seconds. The dominant cost in that reading is a one-time,
+  process-wide PyTorch module-import tax (`torch._dynamo`/`torch._inductor`-adjacent modules,
+  `sympy`, `torch.distributed.fsdp`) paid on a process's first cook regardless of compile
+  mode — the plain interpreter tier pays the identical cost on its own first cook. The
+  remainder of the originally-reported figure is not reproduced on this box and is left
+  unexplained rather than guessed at.
+
+### Not in this release
+
+Carried to `v0.49`: resolution scale threaded through the `torch_compile`/`cuda_graph` tiers
+(the codegen tier's coverage above is a first step, not the whole of it); windows across a
+multi-input join (`chain_windows` stays linear-chain-only; the design contract for the DAG
+generalisation is written but not built); a general measured-device-time pacing bound (design
+written, awaiting author decisions on its open questions).
+
 ## [0.47.0] - 2026-09-27 — "A cost knob, not a safety knob"
 
 A minor release, author-approved. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze
