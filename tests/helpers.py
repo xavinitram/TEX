@@ -484,3 +484,15 @@ def retry_on_os_policy_kernel_block(fn, *args, **kwargs):
             "freshly-loaded Inductor kernel twice in a row (retried once); this is an OS "
             "policy decision on this box, not a TEX defect"
         ) from e2
+
+
+def _crop(full, roi):
+    """Crop a `(B, H, W, C)` tensor to `roi = (x0, y0, w, h, W, H)`'s spatial rect — the same
+    three-line body `test_joinwire50_dag_cook.py` and `test_joinwire50b_checkpointed_dag_cook.py`
+    each wrote independently (FIX-DAG G3, the reuse review) before this move.
+
+    Deliberately NOT in `helpers.__all__` (checked against HOOK-4's pinned `_BASE_ALL` in
+    `test_hook4_testkit.py` before this was added) — a caller imports it by name, exactly
+    like `load_counts_harness`/`retry_on_os_policy_kernel_block` above."""
+    x0, y0, w, h, _W, _H = roi
+    return full[:, y0:y0 + h, x0:x0 + w]

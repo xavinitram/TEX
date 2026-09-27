@@ -496,3 +496,33 @@ of anything. Saying so beats printing 0.99× and letting it read as a speedup.
 *(Pre-fix, the same shapes measured 1.09–1.33× warm and 2.46× on a true first cook. The 2.46×
 was a 512²-scale cook against a prologue that then included a ~20 ms `torch.cuda.is_available()`
 per `ResultCache()` plus a lineage key and a disk probe per cut.)*
+
+---
+
+## 14. Which entry point: `cook_checkpointed` or `cook_stage_dag`? (FIX-DAG G3)
+
+Two cook entry points now both understand a checkpoint boundary (`result_cache=`), and a
+host picking between them wants the answer in one place rather than in either module's own
+docstring. The two are shaped for two genuinely different graphs, not for two tastes of the
+same one:
+
+- **`tex_checkpoint.cook_checkpointed`** — a LINEAR chain, fused. `suffix_stage_list`/
+  `compile_fused` splice the chain into one program below the cut, so a host with a straight
+  edit-node-after-edit-node graph (no join, no Merge with two upstream sources) gets this
+  one's tap-budget-aware placement (§3-§9 above) for free. It cannot serve a DAG: `cut_set`'s
+  own docstring documents the multi-edge-cut rewiring problem as DEFERRED, and
+  `gate_refusal`'s `REFUSE_NOT_LINEAR` refuses a non-linear stage list outright rather than
+  guess at it.
+- **`tex_chain.cook_stage_dag`** — a DAG, node-by-node, never fused. A host whose graph has
+  an actual join (a Merge/composite reading two or more upstream stages, `stages[i][
+  "chain_inputs"]` naming more than one earlier index anywhere in the graph) calls this one
+  instead. It windows end-to-end via `tex_roi.chain_windows_dag` and, since JOINWIRE-50b,
+  takes the SAME `result_cache=`/`upstream=` a host already holds for `cook_checkpointed`,
+  so switching entry points at a join does not mean adopting a second caching contract.
+
+A host with both shapes in one graph (a linear run of edits feeding into a Merge) calls each
+entry point for the sub-graph it actually shapes — `cook_checkpointed` has no join to refuse
+in a purely linear prefix, and `cook_stage_dag` degrades to the linear case exactly (a
+`StageSpec` with one input per stage, `inputs=(i - 1,)`, is `chain_windows_dag`'s own
+documented degenerate case). Picking the wrong one for a join-shaped graph is not silent:
+`cook_checkpointed` raises `REFUSE_NOT_LINEAR` rather than serve a wrong boundary.

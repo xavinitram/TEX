@@ -34,14 +34,10 @@ already covers the device axis for the underlying per-stage cook).
 from __future__ import annotations
 
 from helpers import *
+from helpers import _crop  # FIX-DAG G3 (R1#4): shared with test_joinwire50_dag_cook's own copy
 
 from TEX_Wrangle import tex_chain
 from TEX_Wrangle import tex_results
-
-
-def _crop(full, roi):
-    x0, y0, w, h, _W, _H = roi
-    return full[:, y0:y0 + h, x0:x0 + w]
 
 
 # A blur heavy enough that ANY partial roi, grown by its halo (3x sigma, invariant #5's

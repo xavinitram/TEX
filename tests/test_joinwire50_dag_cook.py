@@ -14,6 +14,7 @@ CPU always; a CUDA row mirrors JOIN-49's own gate (`torch.cuda.is_available()` a
 from __future__ import annotations
 
 from helpers import *
+from helpers import _crop  # FIX-DAG G3 (R1#4): shared with test_joinwire50b's own copy
 
 from TEX_Wrangle import tex_chain
 
@@ -61,11 +62,6 @@ def _feeds_two_joins_stages(A, B, C):
         {"code": "@OUT = (@p + @q) * 0.5;", "bindings": {},
          "chain_inputs": {"p": [2, "OUT"], "q": [4, "OUT"]}},                        # 5 (sink)
     ]
-
-
-def _crop(full, roi):
-    x0, y0, w, h, _W, _H = roi
-    return full[:, y0:y0 + h, x0:x0 + w]
 
 
 # ── Merge below an edit ───────────────────────────────────────────────────────────────────
