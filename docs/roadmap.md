@@ -114,7 +114,7 @@ Four workstreams. Effort tags: S/M/L.
 
 - **FUS-0 (S, shipped v0.20.1).** Fused chains cannot reach `torch_compile`/`auto` in
   production: `select_tier` requires `fused_fp_present` (today `tex_engine.select_tier`,
-  defined in `tex_engine_tiers.py:166-183` and re-exported onto `tex_engine` — SPLIT-E) but
+  defined in `tex_engine_tiers.py:select_tier` and re-exported onto `tex_engine` — SPLIT-E) but
   the node's `execute()` computed `fused_fp` only under `cuda_graph` (that computation now
   lives in `tex_engine.prepare`, `tex_engine.py:622-634`, and runs for every mode). One-line
   gate fix + a node-path regression test (the existing F-1 test bypasses the gate with a
