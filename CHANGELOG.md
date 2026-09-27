@@ -5,6 +5,35 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.2] - 2026-09-27 — "Once, not per arm"
+
+A patch release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved, no new reserved
+name, no ComfyUI pixel change. This affects any program — ComfyUI included — that compiles a
+long `if`/`else if` chain on a uniform parameter under the masked-control-flow pragma; no
+program's rendered pixels change.
+
+### Fixed
+
+- **Masked-control-flow codegen emitted each `if`'s branch body twice, and an `else if` chain
+  compounded that per arm, so emitted source grew `O(2^n)` instead of `O(n)`.** `_mf_emit_if_else`
+  reached a branch's statement list from two call sites — the uniform (0-dim) dispatch it emits
+  itself, and the per-pixel/spatial dispatch a sibling function runs — and both walked the same
+  statements independently. An `else if` chain nests the next arm inside the previous arm's
+  `else`, so the "walk each body twice" cost recursed into every level below it: a 12-arm chain on
+  a uniform parameter emitted 6,593,732 characters / 63,658 lines of generated Python, and
+  compiling that string cost ~10 seconds holding the GIL on the first cold cook of the
+  program — under `compile_mode="auto"`, and in any cold prewarm. Each branch is now emitted
+  exactly once, into a nested closure both dispatch sites call instead of re-walking the source
+  tree. Measured on a synthetic n-arm uniform-parameter chain (before → after, characters emitted
+  / compile time at head): 2 arms 3,932 → 2,874 chars, 0.44 ms; 4 arms 21,791 → 5,856 chars,
+  0.79 ms; 6 arms 109,579 → 9,462 chars, 1.09 ms; 8 arms 530,560 → 13,656 chars, 1.42 ms; 10 arms
+  2,479,869 → 18,422 chars, 2.01 ms; 12 arms (before-figure not run to completion; a real 12-arm
+  program independently measured 6,593,732 chars / 63,658 lines / 9.995 s to compile at the old
+  law) → 23,732 chars, 2.53 ms; 16 arms (before-figure infeasible to run) → 35,993 chars, 3.35 ms.
+  Interpreter and codegen results remain bit-identical per arm, confirmed on CPU and on CUDA. The
+  codegen epoch moves with this fix, so any already-cached codegen is re-emitted once, on its next
+  cook, after upgrading past this release.
+
 ## [0.49.1] - 2026-09-27 — "No history required"
 
 A patch release. `v0.49.0` ("The tier that actually runs") was tagged and pushed but never
