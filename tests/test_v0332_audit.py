@@ -220,6 +220,24 @@ def test_v0332_a3_clear_does_not_orphan_a_frame_spilled_during_its_walk(r):
         finally:
             resume.set()
             t.join(20)
+            # FIX-GATE G3 (B4#6): `clearer()` only restores the process-GLOBAL `os.listdir`
+            # in its OWN `finally`, and the join above was never checked -- if `c.clear()`
+            # ever takes longer than 20s on a loaded shared box (a normal condition on a box
+            # shared with other work), `t` is still alive here, its own restore has not run yet,
+            # and `os.listdir` stays patched at the process level for however much longer the
+            # straggler runs -- into whatever test pytest happens to schedule next in the same
+            # worker. Force the restore HERE, in the main thread, so the patch's lifetime is
+            # bounded by this test's own scope regardless of what the background thread does,
+            # and fail loudly (attributing the problem to THIS test) instead of silently
+            # letting a later, unrelated test inherit a monkeypatched `os.listdir`.
+            still_alive = t.is_alive()
+            os.listdir = real_listdir
+            if still_alive:
+                r.fail("A3 clearer thread hung",
+                       "the clearer thread was still alive after a 20s join -- os.listdir "
+                       "has been force-restored here so no other test inherits the patch, "
+                       "but this trial's own result is not to be trusted")
+                return
         got = c.get(K)
         r.ok("A3: a frame spilled during clear's unlink walk is still serveable") \
             if got is not None and float(got.float().mean()) == 3.0 else \
