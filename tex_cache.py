@@ -110,7 +110,14 @@ _VERDICT_FILES = [_R_DIR / "precision_policy.py", _R_DIR / "autotier.py",
                   # an edit to it can move a measured win/lose verdict exactly as the two
                   # SPLIT-47 siblings above already can (TRK-189 derives and enforces this
                   # from disk).
-                  _R_DIR / "compiled_promotion.py"]
+                  _R_DIR / "compiled_promotion.py",
+                  # VERDICTFILES-50: `fncalls_compile.py`'s own memo (`_memo`: a composite
+                  # fingerprint/device/precision key -> real-compile-succeeded bool) is
+                  # exactly such a measured win/lose verdict — persisted via
+                  # `warm_state.json` under this same epoch. It was never added here, so an
+                  # edit to its gating logic (what counts as `ok=True`) moved no epoch, and
+                  # a stale on-disk verdict from before the edit could be adopted after it.
+                  _R_DIR / "fncalls_compile.py"]
 
 
 # ── DATA-6: the plane seam ────────────────────────────────────────────────────
