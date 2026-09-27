@@ -534,9 +534,14 @@ def paced_check(token, device, heavy: bool = False) -> None:
 
     token.check()
 
+    # P3 (Phase C, R3#2): `pool["free"]`/`_state.depth` are resolved lazily now -- neither
+    # is read anywhere on the economize-and-skip path just below (only `pool["outstanding"]`
+    # is, for the tail peek), so a poll that skips must never pay for them. Measured ~50-75%
+    # of the paced skip path's own per-poll regression was exactly this: the pre-PACE-47
+    # ordering resolved `free`/`depth` unconditionally, before the stride gate had a chance
+    # to decide the poll needs neither. `pool` (and, inside the peek, `outstanding`) is still
+    # resolved eagerly -- the peek itself needs `outstanding` to find the tail.
     pool = _state.pool
-    outstanding, free = pool["outstanding"], pool["free"]
-    depth = _state.depth
 
     stride = _state.stride_s
     # PACE-47e: `_state.large_resolution` (resolved once in `reset()`, from the cook's own
@@ -573,10 +578,17 @@ def paced_check(token, device, heavy: bool = False) -> None:
             # confirmation if it is the literal same, still-unrecorded-since event. Every
             # path that appends a freshly `record()`ed event clears this to `None` first,
             # so the cache can never survive a re-arm and answer for the wrong recording.
+            outstanding = pool["outstanding"]
             tail = outstanding[-1] if outstanding else None
             if tail is None or tail is _state.last_confirmed_done or tail.query():
                 _state.last_confirmed_done = tail
                 return  # device caught up: token already checked, nothing else to do
+
+    # P3: reached only when the poll must actually record/wait (striding off, heavy,
+    # large-resolution, the stride window elapsed, or the peek found the device behind) --
+    # `outstanding` may already be resolved (the peek above), `free`/`depth` never are yet.
+    outstanding, free = pool["outstanding"], pool["free"]
+    depth = _state.depth
 
     if len(outstanding) >= depth:
         # The pool already holds `depth` outstanding events: the device is up to `depth`
