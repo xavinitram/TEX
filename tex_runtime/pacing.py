@@ -771,6 +771,15 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None,
     # resolved eagerly -- the peek itself needs `outstanding` to find the tail.
     pool = _state.pool
 
+    # FIX-PACE49 P5 (B3-pacing.md #4): `pace_budget_ms<=0`'s own docstring
+    # (`_resolve_budget_ms`) promises "byte-for-byte pre-PACE-49 economizing" -- but only
+    # `_pace49_cost_gate`'s DECISION half honoured `budget_ms<=0` before this fix; the
+    # MEASUREMENT half (`_pace49_attribute`/`_cost_feed`, lock included) ran regardless.
+    # Resolved once here (one cheap float compare) and used at all three PACE-49
+    # attribution/anchor sites below in place of a bare `call_site_id is not None`, so
+    # `pace_budget_ms=0` really does perform zero attribution work now.
+    _pace49_active = call_site_id is not None and _state.budget_ms > 0
+
     stride = _state.stride_s
     # PACE-47e / FIX-PACE P5 (R2#1): a large-resolution cook's own `stride_s` was already
     # forced to `0.0` by `reset()` above, so this gate needs only its original two
@@ -818,7 +827,7 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None,
                 # "moment an event's own elapsed device time becomes knowable for free" the
                 # module docstring describes -- attribute it before deciding whether to
                 # skip, so the budget check just below sees this call site's latest number.
-                if call_site_id is not None and tail is not None and not was_cached:
+                if _pace49_active and tail is not None and not was_cached:
                     _pace49_attribute(pool, tail, call_site_id, call_site_anchor)
                 _state.last_confirmed_done = tail
                 if call_site_id is None or _pace49_cost_gate(call_site_id, call_site_anchor):
@@ -846,7 +855,7 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None,
         # "free" moment the peek's `query()` is -- attribute from it too, so a cook that
         # never economizes (heavy/large-resolution/stride=0) still measures its own call
         # sites rather than only ever riding the cold-start guess.
-        if call_site_id is not None:
+        if _pace49_active:
             _pace49_attribute(pool, oldest, call_site_id, call_site_anchor)
 
     # `blocking=True` so a wait on this event (above, some FUTURE poll) releases the GIL.
@@ -867,7 +876,7 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None,
     # order they were recorded, so *ev* is guaranteed complete by the time any event
     # recorded strictly after it is confirmed complete -- the same in-order argument
     # `profile.py`'s own PROF-462 comment makes for its lazy fold.
-    if call_site_id is not None and pool.get("timed_prev") is None:
+    if _pace49_active and pool.get("timed_prev") is None:
         pool["timed_prev"] = ev
         pool["timed_site"] = call_site_id
         pool["timed_anchor"] = call_site_anchor  # FIX-PACE49 P2
