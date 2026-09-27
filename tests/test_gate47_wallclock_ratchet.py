@@ -84,6 +84,25 @@ _WALLCLOCK_SRC_RE = re.compile(
 
 _MARKER_RE = re.compile(r"mark\.timing|mark\.slow")
 
+#: HOUSE-50/H1 — a call to the engine's real per-pixel executor. Deliberately narrow (any
+#: `.cook(` attribute call): what distinguishes "a program actually ran and got timed" from
+#: "the profiler's table was SEEDED with a literal constant" (`P.record(key, 10.0, ...)`,
+#: this file's own `test_v031_prof1_predicts_an_unseen_resolution`; `test_v032_checkpoint.py`'s
+#: CACHE-7 fallback rows via `_profile.record_stages(...)`) is whether a real cook ran --
+#: seeding-and-reading-back is pure, deterministic arithmetic on a number the test itself
+#: chose, never a measurement of anything, and must stay green.
+_COOK_CALL_RE = re.compile(r"\.cook\(")
+
+#: A read of PROF-1's own recorded-cost table (`tex_runtime/profile.py`'s `snapshot`/
+#: `stage_snapshot`/`stage_costs`), populated by `profile.measure`'s own
+#: `time.perf_counter()` pair (`profile.py`: `self._t0 = time.perf_counter()` /
+#: `record(self.key, (time.perf_counter() - self._t0) * 1000.0, ...)`). That is an
+#: in-process wall-clock reading exactly like a bare `perf_counter()` call -- except the
+#: call site lives in a DIFFERENT module than the test file this scanner walks, so
+#: `_WALLCLOCK_SRC_RE` (a same-file textual scan) cannot see it. Paired with `_COOK_CALL_RE`
+#: above (see `scan_source`) rather than trusted alone, for the seeding reason given there.
+_PROFILER_READ_RE = re.compile(r"\.snapshot\(\)|\.stage_snapshot\(|\.stage_costs\(")
+
 #: Reviewed at GATE-47 (v0.47.0), against the tree at `b7a4e3d`. Keyed by
 #: `(tests-relative posix path, function name)`. An entry here is a decision made out loud —
 #: not the same as `@pytest.mark.timing`, which is the ask this ratchet is nudging toward.
@@ -137,6 +156,55 @@ def _is_guard_node(node: ast.AST, parents: dict) -> bool:
 
 
 _is_guard_compare = _is_guard_node   # pre-G1 name, same predicate widened to cover Call too
+
+
+def _is_ternary_guard_node(node: ast.AST, parents: dict) -> bool:
+    """HOUSE-50/H1 -- like `_is_guard_node`, but ALSO recognizes a ternary (`ast.IfExp`)
+    `test` as a guard position: `r.ok(...) if COND else r.fail(...)`, the `SubTestResult`
+    idiom this project's own test suite spells almost every assertion with, instead of an
+    `if`/`else` STATEMENT (`test_v031_prof1_per_stage_breakdown`'s own
+    `r.ok(...) if heavy == "1" and hms > 2.0 * sms else r.fail(...)` is exactly this shape).
+
+    Kept SEPARATE from `_is_guard_node` rather than folded into it: widening the GENERAL
+    scanner to walk into every ternary in the whole suite is a much bigger, unaudited change
+    (thousands of pre-existing, already-green ternary comparisons this ratchet has never
+    looked at) than teaching it the one concrete shape this ask names. Used only by the
+    profiler-stage-relative-comparison check in `scan_source`, which already narrows to the
+    handful of functions that both ran a real cook (`_COOK_CALL_RE`) and read the cost table
+    back (`_PROFILER_READ_RE`)."""
+    cur = node
+    while True:
+        p = parents.get(cur)
+        if p is None:
+            return False
+        if isinstance(p, ast.BoolOp) and cur in p.values:
+            cur = p
+            continue
+        if isinstance(p, ast.UnaryOp) and cur is p.operand:
+            cur = p
+            continue
+        if isinstance(p, (ast.If, ast.IfExp)) and cur is p.test:
+            return True
+        if isinstance(p, ast.Assert) and cur is p.test:
+            return True
+        return False
+
+
+def _has_literal_ratio(node: ast.AST) -> bool:
+    """HOUSE-50/H1 -- True if `node`'s own subtree contains a `Mult`/`Div` `BinOp` with a
+    numeric-literal operand on either side: the ">= Nx" shape of a "stood out by at least
+    this multiple" claim (`hms > 2.0 * sms`). Structural rather than textual/name-based
+    (unlike `_DURATION_RE`) because the two profiled quantities being compared -- one stage's
+    EWMA cost against another's -- have no reason to be NAMED `elapsed`/`_ms`/`ratio`/etc.;
+    what marks the comparison as magnitude-shaped is the literal multiplier itself, and it
+    can be spelled on either side of the operator."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.BinOp) and isinstance(sub.op, (ast.Mult, ast.Div)):
+            for side in (sub.left, sub.right):
+                if isinstance(side, ast.Constant) and isinstance(side.value, (int, float)) \
+                        and not isinstance(side.value, bool):
+                    return True
+    return False
 
 
 def _called_names(node: ast.AST) -> set:
@@ -195,7 +263,18 @@ def scan_source(source: str, filename: str = "<string>") -> list:
 
     Returns `[("<parse-error>", 0, str(e))]` on a file that does not parse, rather than
     raising -- a scan helper crashing the ratchet on a stray file is worse than one that
-    reports the file as its own finding."""
+    reports the file as its own finding.
+
+    HOUSE-50/H1 widened the wall-clock-SOURCE test past `_WALLCLOCK_SRC_RE` alone: a
+    PROFILER-STAGE relative comparison (`test_v031_prof1_per_stage_breakdown`'s
+    `hms > 2.0 * sms`) is timed by `tex_runtime/profile.py`'s own `measure()` context
+    manager, one module away from the test's own source text, so no literal
+    `perf_counter()`/`.time()`/etc. ever appears in this file for `_WALLCLOCK_SRC_RE` to
+    find. `has_profiled_cook` (`_COOK_CALL_RE` AND `_PROFILER_READ_RE` both present in the
+    reachable set) recognizes that shape instead, and -- ONLY within functions where it
+    holds -- additionally accepts a ternary guard (`_is_ternary_guard_node`) and a
+    structural ratio (`_has_literal_ratio`) as satisfying the guard/duration-shape tests,
+    since a profiled stage's cost variable has no reason to be NAMED `elapsed`/`_ms`/etc."""
     try:
         tree = ast.parse(source, filename)
     except Exception as e:
@@ -210,14 +289,20 @@ def scan_source(source: str, filename: str = "<string>") -> list:
         if _MARKER_RE.search(dec_text):
             continue
         reachable = _reachable(name, funcs)
-        if not any(_WALLCLOCK_SRC_RE.search(_seg(source, funcs[n])) for n in reachable):
+        reach_src = " ".join(_seg(source, funcs[n]) for n in reachable)
+        has_wallclock = bool(_WALLCLOCK_SRC_RE.search(reach_src))
+        has_profiled_cook = bool(_COOK_CALL_RE.search(reach_src) and
+                                  _PROFILER_READ_RE.search(reach_src))
+        if not (has_wallclock or has_profiled_cook):
             continue
         for fn_name in reachable:
             fn = funcs[fn_name]
             parents = _parent_map(fn)
             for sub in ast.walk(fn):
                 if isinstance(sub, ast.Compare):
-                    if not _is_guard_node(sub, parents):
+                    guarded = _is_guard_node(sub, parents) or \
+                        (has_profiled_cook and _is_ternary_guard_node(sub, parents))
+                    if not guarded:
                         continue
                     operands = [sub.left] + list(sub.comparators)
                 elif isinstance(sub, ast.Call):
@@ -232,13 +317,19 @@ def scan_source(source: str, filename: str = "<string>") -> list:
                     # otherwise self-flag (its generator argument's SOURCE TEXT contains the
                     # substring "duration", case-insensitively, purely because that is this
                     # scanner's own variable name) the moment this file scans itself.
-                    if not isinstance(sub.func, ast.Attribute) or not _is_guard_node(sub, parents):
+                    if not isinstance(sub.func, ast.Attribute):
+                        continue
+                    guarded = _is_guard_node(sub, parents) or \
+                        (has_profiled_cook and _is_ternary_guard_node(sub, parents))
+                    if not guarded:
                         continue
                     operands = list(sub.args) + [kw.value for kw in sub.keywords]
                 else:
                     continue
                 texts = [_seg(source, o) for o in operands]
-                if any(_DURATION_RE.search(t) or _WALLCLOCK_SRC_RE.search(t) for t in texts):
+                is_profiler_ratio = has_profiled_cook and _has_literal_ratio(sub)
+                if any(_DURATION_RE.search(t) or _WALLCLOCK_SRC_RE.search(t) for t in texts) \
+                        or is_profiler_ratio:
                     hits.append((name, sub.lineno, _seg(source, sub)))
     return hits
 
@@ -512,6 +603,80 @@ def test_g1_neighbour_bare_name_call_guard(r):
     else:
         r.ok(f"all {len(must_red)} confirmed blind-spot shapes now scan red; "
              f"{len(must_stay_green)} neighbours stay green")
+
+
+def test_gate47_catches_profiler_stage_relative_comparisons(r: SubTestResult):
+    """HOUSE-50/H1: `test_v031_prof1_per_stage_breakdown` (`tests/test_v031_phase2.py`)
+    compares two of PROF-1's own per-stage EWMA readings against each other
+    (`hms > 2.0 * sms`, inside a ternary `r.ok(...) if ... else r.fail(...)`) and flaked once
+    under box load -- a real wall-clock claim this scanner missed on TWO counts at once: the
+    `perf_counter()` call lives inside `tex_runtime/profile.py`'s `measure()`, a different
+    module `_WALLCLOCK_SRC_RE`'s same-file textual scan cannot see, and the guard is a
+    ternary (`ast.IfExp`), which `_is_guard_node` never climbed into. This is the literal
+    shape, reproduced in a scratch snippet (never touching the real test file, which is
+    fixed separately by marking it `@pytest.mark.timing`)."""
+    print("\n--- GATE-47 (HOUSE-50/H1): profiler-stage relative comparisons ---")
+
+    must_red = '''
+def test_synthetic_profiler_stage_ratio(r):
+    with _armed():
+        for _ in range(3):
+            tex_engine.cook(term, {"IN": A}, chain_payload=payload, device_mode="cpu")
+        snap = P.snapshot()
+        stages = {}
+        for buckets in snap.values():
+            for b in buckets.values():
+                if b["stages"]:
+                    stages = b["stages"]
+        ranked = sorted(stages.items(), key=lambda kv: -kv[1])
+        (heavy, hms), (_second, sms) = ranked[0], ranked[1]
+        r.ok(f"stage {heavy} stands out") if heavy == "1" and hms > 2.0 * sms else \\
+            r.fail("stage ratio", f"did not stand out: {stages}")
+'''
+
+    must_stay_green = {
+        "profiler seeded with a literal constant, no real cook (pure arithmetic)": '''
+def test_synthetic_profiler_seeded_not_measured(r):
+    P.record(key, 10.0, 256 * 256)
+    got = P.predict(key, 512 * 512)
+    r.ok(f"predicts {got:.1f} ms") if got is not None and abs(got - 40.0) < 1e-6 else \\
+        r.fail("PROF-1 scale", f"predicted {got!r}, expected 40.0")
+''',
+        "a real cook, profiler read back, but no ratio -- a plain count/threshold check": '''
+def test_synthetic_profiler_cook_but_no_ratio(r):
+    with _armed():
+        for _ in range(3):
+            tex_engine.cook(term, {"IN": A}, chain_payload=payload, device_mode="cpu")
+        snap = P.snapshot()
+        stages = snap
+        if len(stages) < 3:
+            r.fail("PROF-1 stages", f"expected a 3-stage breakdown, got {stages}")
+        else:
+            r.ok(f"a fused chain profiles per stage: {stages}")
+''',
+        "a real cook and a ratio compare, but never reads the profiler at all": '''
+def test_synthetic_cook_ratio_no_profiler_read(r):
+    with _armed():
+        out = tex_engine.cook(term, {"IN": A}, chain_payload=payload, device_mode="cpu")
+        brightness = out.mean().item()
+        baseline = 0.4
+        r.ok("brighter than baseline") if brightness > 2.0 * baseline else \\
+            r.fail("brightness ratio", f"{brightness} vs {baseline}")
+''',
+    }
+
+    missed = not scan_source(must_red, "<synthetic>")
+    tripped = [label for label, src in must_stay_green.items() if scan_source(src, "<synthetic>")]
+    if missed:
+        r.fail("GATE-47 HOUSE-50/H1 (inert)",
+               "did not fire on the profiler-stage relative comparison shape")
+    elif tripped:
+        r.fail("GATE-47 HOUSE-50/H1 (over-tight)",
+               "fired on a neighbour that should stay green: " + "; ".join(tripped))
+    else:
+        r.ok(f"fired on the profiler-stage relative comparison shape; "
+             f"{len(must_stay_green)} neighbours (seeded-not-measured, cook-without-ratio, "
+             f"ratio-without-profiler-read) stayed green")
 
 
 def test_gate47_ratchet_catches_the_v046_ci_failure_shape(r: SubTestResult):

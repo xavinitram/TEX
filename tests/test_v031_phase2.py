@@ -25,6 +25,8 @@ discipline), NEVER-SEVER ROWS for the shed order.
 import contextlib
 import threading
 
+import pytest
+
 from helpers import *
 
 from TEX_Wrangle import tex_engine, tex_cookqueue as Q
@@ -112,6 +114,7 @@ def test_v031_prof1_sampling_gate(r: SubTestResult):
             r.fail("PROF-1 gate", f"{hits} samples in {len(after)} cooks, expected 3")
 
 
+@pytest.mark.timing
 def test_v031_prof1_per_stage_breakdown(r: SubTestResult):
     """CACHE-7's input. A three-stage fused chain where stage 1 is four chained blurs and the
     other two are single pointwise ops: the breakdown has to FINGER STAGE 1, or 'effort-based
@@ -120,7 +123,14 @@ def test_v031_prof1_per_stage_breakdown(r: SubTestResult):
     What is asserted is that stage 1 is the clear maximum, not that it exceeds the sum of the
     others — a cut point is chosen by comparing boundaries to each other, and the two cheap
     stages carry a fixed per-cook floor (binding setup, the first statement's lazy init) that
-    a ratio test would keep tripping over at small resolutions."""
+    a ratio test would keep tripping over at small resolutions.
+
+    HOUSE-50/H1 (TRK-208 shape (a), GATE-47): this compares PROF-1's own per-stage EWMA
+    readings against each other -- a genuine wall-clock magnitude claim (`hms > 2.0 * sms`),
+    not a fakeable count or ordering, so there is no structural rewrite that preserves the
+    intent. Marked `timing` rather than restructured; GATE-47's scanner (`test_gate47_wallclock_
+    ratchet.py`) is taught this exact shape below so a FUTURE unmarked instance of it is
+    caught before it ships, the way `test_r3_microbenchmark_...` was in CI-461."""
     print("\n--- v0.31 PROF-1: per-stage cost in a fused chain ---")
     with _armed():
         A = make_img(1, 256, 256, 4, seed=31)
