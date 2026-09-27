@@ -30,6 +30,10 @@ A patch release, answering an embedding host's own re-pin finding against `v0.48
   unchanged either way, 51-80 ms. The trade: the child process itself costs on the order of 2 s
   of start-up inside the async job (never waited on by the caller), and holds roughly 380 MB of
   VRAM in its own separate CUDA context for as long as it runs.
+  The child finds the package by the name it was actually imported under, so the warm works
+  whatever the install's folder is called; if the child cannot start or import, the handle
+  reports the error, it is logged once, and the warm falls back to the previous in-process
+  mechanism instead of doing nothing.
 
 ### Correction
 
