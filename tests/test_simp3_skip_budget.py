@@ -233,7 +233,16 @@ _SKIP_VOCAB = re.compile(
 #: on `torch.cuda.is_available()` alone — same shape and same reason as the JOIN-49 row above;
 #: its CPU twin (`test_joinwire50_merge_below_edit_pixel_identity`) already proves the same
 #: pixel-identity claim with no device.
-_SKIP_BUDGET = 127
+#: Re-pinned from 127 to 128 (HOUSE-50/H4, TRK-227): one new row in
+#: `test_house50_h4_junctioned_collection.py`
+#: (`test_house50_h4_collection_from_a_junctioned_no_git_checkout`) reproduces TRK-227's own
+#: checkout shape (no `.git`, a differently-named real directory reached only through a
+#: `TEX_Wrangle` junction/symlink beside it) and needs the platform to be able to create
+#: one — reusing NEG-4's own `_make_link` helper and its same skip reason, "this platform
+#: could create neither a junction nor a symlink". No witness proves whole-suite collection
+#: survives this shape without actually building the shape, so raising the pin is the
+#: honest move, not inventing one.
+_SKIP_BUDGET = 128
 
 
 def _literal(node) -> str:
