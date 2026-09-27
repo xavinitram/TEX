@@ -118,6 +118,9 @@ def _select_backend(device_type: str) -> str | None:
 # entering `_try_compile` — the toolchain-aware "auto" gate (CC-4) has no other way to
 # tell "no compiler" from "haven't looked yet".
 _capability_cache: dict | None = None
+# A1 (FIX-GATE, B3#1): one extra attempt granted to a probe that raised, before its
+# negative answer is cached for good. See `compile_capability()`'s docstring.
+_capability_retry_remaining: int = 1
 
 
 def _probe_cuda_inductor() -> tuple:
@@ -170,28 +173,61 @@ def compile_capability() -> dict:
     A `True` reading means the PREREQUISITE holds, not that a compile will succeed or win a
     trial — `_backend_status` (measured, this process) and autotier's own verdict (measured,
     per program) can still say no afterward. This function only removes the one failure mode
-    that otherwise costs a real compile attempt to discover: no toolchain at all."""
-    global _capability_cache
+    that otherwise costs a real compile attempt to discover: no toolchain at all.
+
+    A1 (FIX-GATE, B3#1): neither probe is trusted not to raise (a partial/broken Triton
+    install can make `importlib.util.find_spec("triton")` raise instead of returning
+    `None`; `_probe_cpu_inductor`'s Windows vcvarsall glob can raise `OSError` on an ACL it
+    can't traverse) — an exception here used to propagate out of `compile_capability()`
+    uncaught, which is what let `compile_capability_async()` (below) get stuck forever: its
+    future finished "raised", and nothing ever re-submitted. A raising probe is now treated
+    as a definite-for-now False for that key, logged once, with exactly ONE retry granted
+    (`_capability_retry_remaining`) before the negative answer is cached for good — a
+    transient failure gets a second chance; a second consecutive one is a stable answer,
+    exactly like a real "no toolchain" reading, and stops costing anything further."""
+    global _capability_cache, _capability_retry_remaining
     if _capability_cache is None:
-        cuda_ok, cuda_why = _probe_cuda_inductor()
-        cpu_ok, cpu_why = _probe_cpu_inductor()
+        cuda_ok, cuda_why, cuda_exc = _probe_safely(_probe_cuda_inductor, "cuda_inductor")
+        cpu_ok, cpu_why, cpu_exc = _probe_safely(_probe_cpu_inductor, "cpu_inductor")
         reason = {}
         if not cuda_ok:
             reason["cuda_inductor"] = cuda_why
         if not cpu_ok:
             reason["cpu_inductor"] = cpu_why
-        _capability_cache = {"cuda_inductor": cuda_ok, "cpu_inductor": cpu_ok, "reason": reason}
+        result = {"cuda_inductor": cuda_ok, "cpu_inductor": cpu_ok, "reason": reason}
+        if (cuda_exc or cpu_exc) and _capability_retry_remaining > 0:
+            _capability_retry_remaining -= 1
+            return dict(result)   # transient: NOT cached, so the next call gets to retry
+        _capability_cache = result
     return {"cuda_inductor": _capability_cache["cuda_inductor"],
             "cpu_inductor": _capability_cache["cpu_inductor"],
             "reason": dict(_capability_cache["reason"])}
 
 
+def _probe_safely(probe_fn, key: str) -> tuple:
+    """(ok, reason, was_exceptional). Runs `probe_fn` and converts any exception into a
+    (False, reason) pair instead of letting it propagate — see A1's docstring above. Logs
+    the exception once per process via `_show_once` (never per-key: one broken toolchain
+    probe is one thing worth telling a user about, not two)."""
+    try:
+        ok, why = probe_fn()
+        return ok, why, False
+    except Exception as exc:
+        from .compiled_exec_support import _show_once
+        _show_once("compile_capability_probe_exception",
+                   f"[TEX] the {key} torch.compile toolchain probe raised {exc!r}; "
+                   f"treating it as unavailable for now (auto stays on the codegen/"
+                   f"interpreter tier).", level="warning")
+        return False, f"the probe raised {exc!r}", True
+
+
 def _reset_capability_cache_for_test() -> None:
     """Test hook: forget the memoized probe so a test can force a re-probe under a
     monkeypatched environment. Mirrors autotier's own `_reset_for_test` shape."""
-    global _capability_cache, _capability_future
+    global _capability_cache, _capability_future, _capability_retry_remaining
     _capability_cache = None
     _capability_future = None
+    _capability_retry_remaining = 1
 
 
 # ── AUTO-47: a non-blocking counterpart, for the cook thread alone ────────────────
@@ -235,7 +271,14 @@ def compile_capability_async() -> dict | None:
     was already in (`run_auto`'s key stays MEASURING, not yet submitted) — the same
     "try again next cook" shape a busy compile-pool or a failed VRAM-headroom check
     already produce for other reasons, so a probe that never resolves is bounded the same
-    way any other stuck key already is (`autotier.enforce_convergence_bound`, CC-6)."""
+    way any other stuck key already is (`autotier.enforce_convergence_bound`, CC-6).
+
+    A1 (FIX-GATE, B3#1): `compile_capability()` itself no longer raises (`_probe_safely`
+    catches), but a resolved call can still come back WITHOUT caching (a transient
+    exception with a retry still available) — in that case the future this call submitted
+    is spent and useless, so it is cleared here rather than left to answer `None` forever;
+    the NEXT call submits a fresh probe attempt instead of being stuck reading the same
+    exhausted future."""
     if _capability_cache is not None:
         return compile_capability()
     global _capability_future
@@ -251,4 +294,5 @@ def compile_capability_async() -> dict | None:
             pass
         if _capability_cache is not None:
             return compile_capability()
+        _capability_future = None   # transient failure, retry budget not yet spent: retry
     return None
