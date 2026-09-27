@@ -232,7 +232,8 @@ def test_cc5_lazy_first_call_never_stalls_the_cook_thread(r: SubTestResult):
 
     calls = {"n": 0}
 
-    def fake_compiled_fn(program, bindings, type_map, device, latent_channel_count, output_names):
+    def fake_compiled_fn(program, bindings, type_map, device, latent_channel_count,
+                         output_names, scale=None):
         calls["n"] += 1
         if calls["n"] == 1:
             time.sleep(2.0)   # stands in for torch.compile's lazy first-call trace
@@ -404,7 +405,8 @@ def test_cc6_wired_into_run_auto(r: SubTestResult):
     ref = Interpreter().execute(prog, {"A": img}, tm, device="cpu",
                                 output_names=["OUT"])["OUT"]
 
-    def fake_compiled_fn(program, bindings, type_map, device, latent_channel_count, output_names):
+    def fake_compiled_fn(program, bindings, type_map, device, latent_channel_count,
+                         output_names, scale=None):
         names = output_names or ["OUT"]
         return {name: bindings["A"] for name in names}
 

@@ -133,7 +133,10 @@ def _interp_fallback(ctx, *, reset_dynamo: bool, pass_precision: bool):
               latent_channel_count=ctx.latent_channel_count,
               output_names=ctx.output_names, used_builtins=ctx.used_builtins,
               time_context=ctx.time_context,
-              cancel=ctx.cancel, on_progress=ctx.on_progress)  # SCHED-3: token survives the fallback
+              cancel=ctx.cancel, on_progress=ctx.on_progress,  # SCHED-3: token survives the fallback
+              scale=ctx.scale)  # SCALECX-49: an omitted forward here is a silently-unscaled
+                                # picture, not an error — `ctx.scale` is `None` on every
+                                # ordinary ComfyUI cook (inert, byte-identical to before).
     if pass_precision:
         kw["precision"] = ctx.eff_precision
     return interp.execute(ctx.program, ctx.bindings, ctx.type_map,
@@ -196,7 +199,7 @@ def _run_torch_compile(ctx):
             ctx.program, ctx.bindings, ctx.type_map, ctx.device,
             _fp, latent_channel_count=ctx.latent_channel_count,
             output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-            time_context=ctx.time_context)
+            time_context=ctx.time_context, scale=ctx.scale)  # SCALECX-49
     except Exception as compile_exc:
         _record_codegen_defect_fallback("torch_compile", compile_exc)
         # Defense in depth: torch_compile must NEVER hard-fail the node.
@@ -213,7 +216,8 @@ def _run_auto(ctx):
         return run_auto(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
                         latent_channel_count=ctx.latent_channel_count,
                         output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                        precision=ctx.eff_precision, time_context=ctx.time_context)
+                        precision=ctx.eff_precision, time_context=ctx.time_context,
+                        scale=ctx.scale)  # SCALECX-49
     except Exception as auto_exc:
         _record_codegen_defect_fallback("auto", auto_exc)
         logger.warning("[TEX] auto tier failed (%s); using interpreter.", auto_exc)
@@ -230,7 +234,8 @@ def _run_cuda_graph(ctx):
     try:
         out = run_graphed(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
                           latent_channel_count=ctx.latent_channel_count,
-                          output_names=ctx.output_names, used_builtins=ctx.used_builtins)
+                          output_names=ctx.output_names, used_builtins=ctx.used_builtins,
+                          scale=ctx.scale)  # SCALECX-49
     except Exception as _g_exc:
         _record_codegen_defect_fallback("cuda_graph", _g_exc)
         logger.warning("[TEX] cuda_graph path failed (%s); using interpreter.", _g_exc)
@@ -445,46 +450,40 @@ def _run_tier(ctx, tier_id):
     output dict. Single home for the `tier method -> {name: tensor}` idiom used by
     both run() and the C2 re-cook path (reuse review).
 
-    A scale-active cook (`ctx.scale is not None`) never reaches `torch_compile`/`auto`/
-    `cuda_graph` — those tiers do not thread a runtime scale multiplier through their
-    COMPILED/CAPTURED code at all (SCALE-COMPILED-48 is a v0.49+ item;
-    `docs/resolution-scale.md`), so a scale-active cook whose `tier_id` names one of them
-    is forced onto the plain interpreter instead.
+    SCALECX-49: a scale-active cook (`ctx.scale is not None`) now reaches EVERY tier
+    (`torch_compile`/`auto`/`cuda_graph`/`default`) directly — before this ask, any
+    `tier_id != "default"` was bounced straight to the plain interpreter here,
+    unconditionally, because none of the three compiled/captured tiers threaded a runtime
+    scale multiplier through their compiled/captured code at all
+    (`docs/resolution-scale.md`'s old "What is NOT covered" bullet). Each of the four
+    `_run_*` strategies is now itself scale-aware end to end:
+      - `_run_torch_compile`/`_run_auto` forward `ctx.scale` into
+        `execute_compiled`/`run_auto`, which key their compiled-artifact cache by an
+        EXPLICIT trailing `scale` component (added only when `scale is not None` —
+        `scale=None` keys exactly as before, invariant 7) so a distinct scale value gets
+        its own compiled artifact, reused on every repeat of that value, never per call.
+      - `_run_cuda_graph` forwards `ctx.scale` into `run_graphed`, whose `_capture_key`
+        gains the identical trailing `scale` component for the identical reason — a
+        `pixel_args=`-tagged builtin's scaled radius is a SHAPE baked at capture time
+        (`graphed.GraphedProgram.capture`'s own docstring), so two different scale values
+        on the same canvas/precision genuinely need two different captures.
+      - `_run_default` is unchanged (FIX-TIER T3): it owns its own scale-aware UC-2
+        stencil-route decision (`_should_stencil_route`), and falls to the plain
+        interpreter itself when that shortcut does not apply.
+    Every one of the three compiled/captured strategies ALREADY self-falls-back to the
+    interpreter (via `_interp_fallback`, which now also forwards `ctx.scale` — an omitted
+    forward there would silently cook UNSCALED, not raise) on any decline/failure, so
+    routing a scale-active cook to them directly can never hard-fail or silently drop
+    scale — exactly the same safety net every OTHER exception these strategies already
+    catch relies on.
 
-    A scale-active cook whose `tier_id == "default"` is NOT forced to the interpreter
-    unconditionally: `_run_default` (this module) is itself scale-aware and owns the
-    ONE decision of whether this cook routes to codegen instead (`_should_stencil_route`,
-    the UC-2 exact-fetch stencil gate) — codegen's `pixel_args=`-tagged call sites emit
-    `arg * _env['__tex_scale']` as a runtime value, never a folded literal
-    (`tex_runtime/codegen.py`), so that route is scale-safe. `_should_stencil_route` is
-    the ONLY concrete "would codegen run here" test the default tier has today
-    (ROI-codegen is a separate, still-flagged-off lane, deliberately untouched here).
-    `_codegen_only_execute` self-falls-back to the interpreter (forwarding `scale`) on
-    any decline/failure, so this can never hard-fail or silently drop scale. Tiling and
-    ROI narrowing stay out of scope for a scale-active cook: it always cooks whole-frame
-    (`_run_default` never threads `ctx.roi` once `ctx.scale is not None`).
-
-    Recorded via `tier_trace` on every path (`_codegen_only_execute` records "codegen" on
-    success, "interpreter" fallback_from="codegen" on decline; `_run_default`'s own
-    scale-active interpreter branch records "interpreter" fallback_from="default";
-    the OTHER three tiers' unconditional bypass below records "interpreter"
-    fallback_from=tier_id) — never a silent fallback. `ctx.scale is None` (every ComfyUI
-    cook) never reaches either of `_run_default`'s scale-branches — one `is not None`
-    check, no behaviour change on the default (`scale=None`) path."""
-    if ctx.scale is not None and tier_id != "default":
-        from .tex_runtime import tier_trace
-        tier_trace.record("interpreter", fallback_from=tier_id,
-                          reason="scale is active (SCALE-47b runs on the interpreter tier only)")
-        interp = _tex_engine._get_interpreter()
-        out = interp.execute(ctx.program, ctx.bindings, ctx.type_map, device=ctx.device,
-                             source=("" if ctx.fused_chain else ctx.code),
-                             latent_channel_count=ctx.latent_channel_count,
-                             output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                             precision=ctx.eff_precision, time_context=ctx.time_context,
-                             cancel=ctx.cancel, on_progress=ctx.on_progress, scale=ctx.scale)
-        return out if isinstance(out, dict) else {ctx.output_names[0]: out}
-    # tier_id == "default" (scale active or not) dispatches here too: _run_default owns
-    # the scale-aware UC-2 stencil-route decision itself (FIX-TIER T3).
+    ROI stays entirely out of scope for a scale-active cook on every tier: `ctx.roi` is
+    never set alongside `ctx.scale` in the first place (`tex_roi.roi_eligibility` declines
+    ROI outright the moment `scale is not None`, independent of `tier_id` — TEST-covered by
+    `test_tierq48_agreement.py`), so this dispatch change cannot newly arm ROI on a
+    compiled/graphed tier. `ctx.scale is None` (every ordinary ComfyUI cook) takes exactly
+    the same path through this function as before this ask — one dict lookup, no new
+    branch on that path."""
     out = _TIER_METHOD[tier_id](ctx)
     return out if isinstance(out, dict) else {ctx.output_names[0]: out}
 
@@ -514,6 +513,15 @@ TIER_REASON_SCALE_ACTIVE_CODEGEN = "scale-active-codegen-stencil"
 # Named for the shortcut, not for "codegen now supports scale" in general: a plain
 # gauss_blur/erode/dilate/bilateral_filter call with no independent hand-written stencil
 # loop still reports TIER_REASON_SCALE_ACTIVE (interpreter) — see docs/resolution-scale.md.
+TIER_REASON_SCALE_ACTIVE_COMPILED = "scale-active-compiled"
+# ^ SCALECX-49: `tier_id` names `torch_compile`/`auto`/`cuda_graph` AND the cook is
+# scale-active — the real dispatch (`_run_tier`) now runs it ON that tier (its compiled
+# artifact / captured graph is keyed by an explicit `scale` component, so a distinct value
+# gets its own artifact/capture rather than replaying a stale one), not on the interpreter.
+# This replaces the pre-v0.49 posture (those three tiers were UNCONDITIONALLY forced to
+# `TIER_REASON_SCALE_ACTIVE`/"interpreter" the moment scale was active); the "default" tier's
+# own scale routing (`TIER_REASON_SCALE_ACTIVE_CODEGEN` / plain `TIER_REASON_SCALE_ACTIVE`)
+# is unchanged by this ask.
 TIER_REASON_SELECTED = "tier-selected"              # plain select_tier verdict, scale inactive
 
 # FIX-TIER T1: the DECISION LOGIC these name is single-sourced in `tex_roi.roi_eligibility`
@@ -639,6 +647,15 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
     pixel risk (that gate only picks a FASTER tier for the same bytes), only
     potentially pessimistic about which tier is named.
 
+    A scale-active cook whose `select_tier` verdict is `"torch_compile"`/`"auto"`/
+    `"cuda_graph"` (SCALECX-49) reports THAT tier with `TIER_REASON_SCALE_ACTIVE_COMPILED` —
+    those three tiers now run a scale-active cook directly (keyed by an explicit `scale`
+    component on their compiled artifact / captured graph), unlike the pre-v0.49 posture
+    where any tier other than `"default"` was unconditionally forced to `"interpreter"` the
+    moment scale was active. This needs no `binding_types` to answer precisely (unlike the
+    "default"-tier codegen-stencil case above): which of the three compiled/graphed tiers
+    a cook lands on is `select_tier`'s own decision, unaffected by whether scale is active.
+
     Never raises: a malformed `roi` is reported as a declined reason
     (`ROI_REASON_MALFORMED`), not a `TypeError`/`ValueError` — the same "over-approximate,
     never blow up" posture every other `tex_roi` query in this module already takes.
@@ -664,9 +681,8 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
         roi_armed, roi_reason = _elig.armed, _elig.reason
 
     if scale is not None:
-        # On the "default" tier only (never torch_compile/auto/cuda_graph — those stay
-        # forced to the interpreter), a scale-active cook routes to codegen instead when
-        # the UC-2 stencil gate would already choose it. Mirrors `_run_tier`'s own branch
+        # On the "default" tier, a scale-active cook routes to codegen instead when the
+        # UC-2 stencil gate would already choose it. Mirrors `_run_tier`'s own branch
         # exactly (`tier_id == "default" and not fused_chain and
         # _should_stencil_route(...)`), so the two can never disagree.
         if tier_id == "default" and not fused_chain:
@@ -674,5 +690,13 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
             if stencil:
                 return TierVerdict("codegen", TIER_REASON_SCALE_ACTIVE_CODEGEN,
                                    roi_armed, roi_reason)
+            return TierVerdict("interpreter", TIER_REASON_SCALE_ACTIVE, roi_armed, roi_reason)
+        # SCALECX-49: torch_compile/auto/cuda_graph now run a scale-active cook directly
+        # (`_run_tier` dispatches every tier_id to its strategy unconditionally; each of
+        # the three keys its compiled artifact / captured graph by an explicit `scale`
+        # component). Mirrors `_run_tier`'s own (lack of a) bypass exactly, so the two can
+        # never disagree.
+        if tier_id in ("torch_compile", "auto", "cuda_graph"):
+            return TierVerdict(tier_id, TIER_REASON_SCALE_ACTIVE_COMPILED, roi_armed, roi_reason)
         return TierVerdict("interpreter", TIER_REASON_SCALE_ACTIVE, roi_armed, roi_reason)
     return TierVerdict(tier_id, TIER_REASON_SELECTED, roi_armed, roi_reason)

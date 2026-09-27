@@ -7,16 +7,16 @@ sigma)` cook at `scale=0.5` must match a cook of the SAME program at `scale=None
 sigma argument pre-halved, within ordinary fp32 tolerance -- proving the multiplier is applied
 to the right argument, not merely that *something* changed.
 
-Also proves the tier-routing consequence: a scale-active cook forces the interpreter tier even
-when an accelerated `compile_mode` was requested (no tier currently threads scale through
-codegen/torch.compile/CUDA-graph capture), and that this is RECORDED (never a silent fallback) --
-and that `scale=None` is completely unaffected (invariant #7 -- byte-identical to a call that
-never mentions scale at all).
+Also proves the tier-routing consequence, UPDATED by SCALECX-49 (v0.49, `SCALE-COMPILED-48`):
+a scale-active cook now dispatches DIRECTLY to whichever tier `compile_mode` names, including
+`torch_compile`/`auto`/`cuda_graph` (each keys its compiled artifact / captured graph by an
+explicit `scale` component instead) -- it is no longer bounced to the interpreter
+unconditionally the way it was before this ask. `scale=None` remains completely unaffected
+(invariant #7 -- byte-identical to a call that never mentions scale at all).
 """
 from helpers import *
 from TEX_Wrangle import tex_engine
 from TEX_Wrangle import tex_engine_tiers as _tiers
-from TEX_Wrangle.tex_runtime import tier_trace as _tt
 
 
 def _mk(seed_val=0.3):
@@ -84,49 +84,64 @@ def test_scale47b_scale_none_is_byte_identical(r: SubTestResult):
 
 
 def test_scale47b_forces_interpreter_tier_and_records_it(r: SubTestResult):
-    print("\n--- SCALE-47b: a scale-active cook is routed to the interpreter, and it says so ---")
+    """SCALECX-49 (v0.49) built SCALE-COMPILED-48: `_run_tier` no longer bounces a
+    scale-active cook to the interpreter for `compile_mode='torch_compile'` -- it dispatches
+    straight to `_run_torch_compile` (which keys its compiled artifact by an explicit
+    `scale` component; `test_scalecx49_compiled_graphed_scale.py` owns this feature's own
+    tests). This box has no torch.compile backend, so `execute_compiled` self-declines to
+    the plain interpreter for an UNRELATED, pre-existing reason (no backend, not "scale is
+    active") -- `tier_trace` genuinely has no record either way for that self-decline
+    (compiled.py's own no-backend path never calls `tier_trace.record`, see
+    test_tierq48_agreement.py's `_real_tier_and_roi_armed` docstring), so this test now
+    checks the cook still produces a correct picture instead of asserting a stale tier."""
+    print("\n--- SCALECX-49 update: compile_mode='torch_compile' + scale=0.5 dispatches to "
+          "its own tier, not the interpreter unconditionally ---")
     A = make_img(1, 8, 8, 4)
     code = "@OUT = gauss_blur(@A, 2.0);"
-    _tt.reset()
-    plan = tex_engine.prepare(code, {"A": A}, device_mode="cpu",
-                              compile_mode="torch_compile", scale=0.5)
-    tex_engine.run(plan)
-    rec = _tt.last()
-    if rec is None or rec.tier != "interpreter":
-        r.fail("scale tier bypass", f"expected tier='interpreter', got {rec!r}")
-        return
-    if not rec.reason or "scale" not in rec.reason.lower():
-        r.fail("scale tier bypass reason", f"expected a reason naming scale, got {rec.reason!r}")
-        return
-    r.ok(f"compile_mode='torch_compile' + scale=0.5 recorded tier={rec.tier!r} "
-         f"reason={rec.reason!r} -- never a silent fallback")
+    out = tex_engine.cook(code, {"A": A.clone()}, device_mode="cpu",
+                          compile_mode="torch_compile", scale=0.5)
+    ref = tex_engine.cook(code, {"A": A.clone()}, device_mode="cpu",
+                         compile_mode="none", scale=0.5)
+    md = (out.outputs["OUT"].float() - ref.outputs["OUT"].float()).abs().max().item()
+    if md < 1e-5:
+        r.ok(f"compile_mode='torch_compile' + scale=0.5 cooks correctly (maxdiff {md:.2e}) "
+             f"-- SCALECX-49 (v0.49)")
+    else:
+        r.fail("scale tier bypass", f"maxdiff {md:.2e} >= 1e-5")
 
 
 def test_scale47b_never_dispatches_to_cuda_graph_tier(r: SubTestResult):
-    print("\n--- SCALE-47b: a scale-active cook never reaches the cuda_graph tier strategy ---")
-    # The plan's own acceptance test: "capture at 1.0, replay at 0.5 must not replay 1.0".
-    # A CUDA-graph capture/replay needs an actual GPU to exercise end-to-end; what is provable
-    # CPU-only, and what actually GUARANTEES the acceptance criterion regardless of device, is
-    # that `_run_tier` never even calls the cuda_graph strategy function for a scale-active
-    # cook -- so there is no captured graph for a later replay to reuse in the first place.
+    """SCALECX-49 (v0.49) built SCALE-COMPILED-48: `_run_tier` now DOES dispatch a
+    scale-active cook to the cuda_graph tier strategy (`run_graphed`), which keys its
+    captured graph by an explicit `scale` component so a capture at one scale can never
+    replay for a request at another (see test_scalecx49_compiled_graphed_scale.py's own
+    red-first capture-key mismatch test for the acceptance criterion this docstring used
+    to name -- "capture at 1.0, replay at 0.5 must not replay 1.0" is now proven at the
+    key-construction level, the mechanism that makes it impossible, rather than by
+    forbidding the strategy from running at all)."""
+    print("\n--- SCALECX-49 update: a scale-active cook DOES reach the cuda_graph tier "
+          "strategy now ---")
     A = make_img(1, 8, 8, 4)
     code = "@OUT = gauss_blur(@A, 2.0);"
     plan = tex_engine.prepare(code, {"A": A}, device_mode="cpu", scale=0.5)
 
-    def _boom(_ctx):
-        raise AssertionError("the cuda_graph tier strategy was called for a scale-active cook")
+    called = {"n": 0}
+
+    def _spy(ctx):
+        called["n"] += 1
+        return {"OUT": ctx.bindings["A"]}
 
     saved = _tiers._TIER_METHOD["cuda_graph"]
-    _tiers._TIER_METHOD["cuda_graph"] = _boom
+    _tiers._TIER_METHOD["cuda_graph"] = _spy
     try:
         out = _tiers._run_tier(plan.ctx, "cuda_graph")
-    except AssertionError as e:
-        r.fail("scale bypasses cuda_graph", str(e))
-        return
     finally:
         _tiers._TIER_METHOD["cuda_graph"] = saved
+    if called["n"] != 1:
+        r.fail("scale reaches cuda_graph", f"expected 1 call, got {called['n']}")
+        return
     if "OUT" not in out:
         r.fail("scale bypass output", f"expected an 'OUT' key, got {list(out.keys())!r}")
         return
-    r.ok("_run_tier(ctx, 'cuda_graph') with ctx.scale set never calls the cuda_graph "
-         "strategy -- it always runs the interpreter instead")
+    r.ok("_run_tier(ctx, 'cuda_graph') with ctx.scale set now calls the cuda_graph "
+         "strategy directly -- SCALECX-49 (v0.49)")

@@ -483,6 +483,7 @@ def execute_compiled(
     used_builtins: set[str] | None = None,
     precision: str = "fp32",
     time_context: dict | None = None,
+    scale: float | None = None,
 ) -> torch.Tensor | dict:
     """
     Execute a TEX program with optional torch.compile acceleration.
@@ -506,20 +507,32 @@ def execute_compiled(
         output_names:         List of named outputs for multi-output programs.
         used_builtins:        Set of coordinate builtins the program uses (env pruning).
         precision:            "fp32" (default) or "fp16" — see the M-3 fp16 contract.
+        scale:                SCALECX-49 resolution-scale multiplier (`None` = inactive,
+                              byte-identical to before this ask — invariant 7).
 
     Returns:
         The @OUT tensor result, or a dict of {name: tensor} for multi-output.
     """
     device_obj = _canon_device(device)
     device_type = device_obj.type  # "cpu" or "cuda"
-    cache_key = (fingerprint, device_type, precision)
+    # SCALECX-49: `scale` is an EXPLICIT, trailing cache-key component, appended only when
+    # it is not `None` — a `scale=None` cook keys exactly as before (invariant 7). A
+    # scale-active cook's `pixel_args=`-tagged builtins resolve a scaled radius that Inductor
+    # would otherwise trace/specialize on as a plain Python float closed over the compiled
+    # callable (a recompile per distinct value, the "noise dance" SCALE-47a already named and
+    # rejected) — keying the compiled ARTIFACT itself by `scale` instead makes that bounded and
+    # explicit: one compiled artifact per distinct scale value actually requested (like a
+    # distinct canvas shape already gets its own artifact today), reused on every repeat of
+    # that same value, never recompiled per call.
+    cache_key = ((fingerprint, device_type, precision) if scale is None
+                else (fingerprint, device_type, precision, scale))
 
     # ── Blacklist: skip programs that previously crashed torch.compile
     if fingerprint in _compile_blacklist:
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision,
-                              time_context=time_context)
+                              time_context=time_context, scale=scale)
 
     # ── Program analysis gates (only on first compile, not cached reruns).
     # op_count/loop_depth are memoized per fingerprint so routes that never
@@ -540,7 +553,7 @@ def execute_compiled(
             return _plain_execute(program, bindings, type_map, device,
                                   latent_channel_count, output_names,
                                   used_builtins=used_builtins, precision=precision,
-                                  time_context=time_context)
+                                  time_context=time_context, scale=scale)
         # Use codegen WITHOUT torch.compile for deeply nested loops
         # (graph breaks and recompilation make torch.compile slower)
         if loop_depth > _COMPILE_MAX_LOOP_DEPTH:
@@ -549,7 +562,8 @@ def execute_compiled(
                                          used_builtins=used_builtins, precision=precision,
                                          fingerprint=fingerprint,
                                          time_context=time_context,   # ENG-7
-                                         place_params=True)           # opt-in route
+                                         place_params=True,           # opt-in route
+                                         scale=scale)
         # Use plain interpreter for programs without spatial tensor context
         # (procedural noise, etc.) — codegen env setup overhead exceeds
         # benefit when all operations are on scalar tensors
@@ -559,7 +573,7 @@ def execute_compiled(
             return _plain_execute(program, bindings, type_map, device,
                                   latent_channel_count, output_names,
                                   used_builtins=used_builtins, precision=precision,
-                                  time_context=time_context)
+                                  time_context=time_context, scale=scale)
 
     # Ensure tensor bindings are contiguous — Inductor's codegen can
     # fail on non-contiguous strides (e.g. BHWC images loaded with
@@ -599,7 +613,7 @@ def execute_compiled(
                         return _plain_execute(program, contiguous_bindings, type_map,
                                               device, latent_channel_count, output_names,
                                               used_builtins=used_builtins, precision=precision,
-                                              time_context=time_context)
+                                              time_context=time_context, scale=scale)
                     _compiled_cache[cache_key] = entry
                     # G: arm post-commit verification for this fresh artifact
                     # (samples collect on the NEXT cooks — the commit cook itself
@@ -620,7 +634,7 @@ def execute_compiled(
                         _compiled_cache.popitem(last=False)
                     compiled_fn, _entry_backend = _compiled_cache[cache_key]
                     return compiled_fn(program, contiguous_bindings, type_map, device,
-                                       latent_channel_count, output_names)
+                                       latent_channel_count, output_names, scale=scale)
 
                 compiled_fn, _entry_backend = _compiled_cache[cache_key]
                 _compiled_cache.move_to_end(cache_key)
@@ -640,12 +654,12 @@ def execute_compiled(
                     # path is deferred.
                     out, ms = _timed(
                         lambda: compiled_fn(program, contiguous_bindings, type_map, device,
-                                            latent_channel_count, output_names),
+                                            latent_channel_count, output_names, scale=scale),
                         device_type)
                     verify["samples"].append(ms)
                     return out
                 return compiled_fn(program, contiguous_bindings, type_map, device,
-                                   latent_channel_count, output_names)
+                                   latent_channel_count, output_names, scale=scale)
         except Exception as e:
             compile_error = e
             return None
@@ -727,7 +741,7 @@ def execute_compiled(
         return _plain_execute(program, bindings, type_map, device,
                               latent_channel_count, output_names,
                               used_builtins=used_builtins, precision=precision,
-                              time_context=time_context)
+                              time_context=time_context, scale=scale)
 
     # G (v0.20): post-commit verification verdict. Once the window is full,
     # time ONE interpreter cook of the same program and demote the compiled
@@ -744,7 +758,7 @@ def execute_compiled(
                 lambda: _plain_execute(program, dict(bindings), type_map, device,
                                        latent_channel_count, output_names,
                                        used_builtins=used_builtins, precision=precision,
-                                       time_context=time_context),
+                                       time_context=time_context, scale=scale),
                 device_type)
             # min(), not median: the first post-commit cooks can include cudagraph
             # recording (reduce-overhead), which would overstate a good artifact.
@@ -970,19 +984,23 @@ def _drain_bg_for_test(timeout: float = 10.0) -> None:
 
 def _run_cached_compiled(cache_key, program, bindings, type_map, device,
                          latent_channel_count, output_names, device_type,
-                         timed):
+                         timed, scale: float | None = None):
     """Run the cached compiled fn on the worker thread (dynamo-TLS isolation is
     load-bearing even for an already-built artifact — a guard failure can retrace
     and corrupt the calling thread's TLS). Returns (result, ms) when *timed*, or
     (result, None) otherwise — the COMMITTED tier skips timing so it never forces
-    a per-cook CUDA sync. Returns (None, None) if the run crashed."""
+    a per-cook CUDA sync. Returns (None, None) if the run crashed.
+
+    `scale` (SCALECX-49): forwarded to the cached `compiled_fn` — `cache_key` already
+    partitions by scale (see `run_auto`), so this is always the SAME value the artifact at
+    `cache_key` was built/warmed for."""
     contiguous = _contiguous_bindings(bindings, _canon_device(device))
 
     def _worker():
         with torch.inference_mode():
             compiled_fn, _b = _compiled_cache[cache_key]
             call = lambda: compiled_fn(program, contiguous, type_map, device,
-                                       latent_channel_count, output_names)
+                                       latent_channel_count, output_names, scale=scale)
             return _timed(call, device_type) if timed else (call(), None)
 
     try:
@@ -1001,14 +1019,20 @@ def _run_cached_compiled(cache_key, program, bindings, type_map, device,
 def run_auto(program, bindings, type_map, device, fingerprint,
              latent_channel_count: int = 0, output_names=None,
              used_builtins=None, precision: str = "fp32",
-             time_context: dict | None = None):
+             time_context: dict | None = None, scale: float | None = None):
     """CC-2 entry: measure the always-safe codegen baseline, background-compile,
     trial the compiled fn, and commit only on a measured win. Never blocks on
-    the compile; never routes to a slower tier than codegen-only."""
+    the compile; never routes to a slower tier than codegen-only.
+
+    `scale` (SCALECX-49): `None` (every ordinary ComfyUI cook) keys and behaves exactly as
+    before this ask (invariant 7). A scale-active cook is filed under its own `cache_key`/
+    autotier `key` bucket (see `autotier.make_key`'s own docstring) so a scale-active trial
+    never contaminates — or gets demoted by — a differently-scaled cook of the same program."""
     from . import autotier
     device_obj = torch.device(device)
     device_type = device_obj.type
-    cache_key = (fingerprint, device_type, precision)
+    cache_key = ((fingerprint, device_type, precision) if scale is None
+                else (fingerprint, device_type, precision, scale))
 
     # CF-6: the tier verdict is filed under a resolution BUCKET, so it has to be the resolution
     # the cook actually grids. This site kept its own first-wins loop 200 lines below the one
@@ -1016,7 +1040,7 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     # the verdict under a one-row bucket, and swapping the two binding names changed the key of
     # a cache that persists to disk.
     sp = _consensus_extent(bindings, program)
-    key = autotier.make_key(fingerprint, device_type, precision, sp)
+    key = autotier.make_key(fingerprint, device_type, precision, sp, scale=scale)
     autotier.seed_from_disk(key)
     state = autotier.verdict(key)
 
@@ -1026,7 +1050,8 @@ def run_auto(program, bindings, type_map, device, fingerprint,
                                      used_builtins=used_builtins,
                                      precision=precision, fingerprint=fingerprint,
                                      time_context=time_context,   # ENG-7
-                                     place_params=True)           # opt-in route
+                                     place_params=True,           # opt-in route
+                                     scale=scale)
 
     # Terminal: rejected → always-safe codegen; committed → cached compiled.
     if state == autotier.REJECTED:
@@ -1035,7 +1060,8 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         # Terminal — skip timing (no per-cook CUDA sync; the verdict is frozen).
         res, _ = _run_cached_compiled(cache_key, program, bindings, type_map,
                                       device, latent_channel_count,
-                                      output_names, device_type, timed=False)
+                                      output_names, device_type, timed=False,
+                                      scale=scale)
         if res is None:
             autotier.record_trial(key, None)  # demote to rejected
             return _codegen(bindings)
@@ -1049,7 +1075,8 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     if state == autotier.TRIAL and cache_key in _compiled_cache:
         res, ms = _run_cached_compiled(cache_key, program, bindings, type_map,
                                        device, latent_channel_count,
-                                       output_names, device_type, timed=True)
+                                       output_names, device_type, timed=True,
+                                       scale=scale)
         if res is None:
             autotier.record_trial(key, None)
             return _codegen(bindings)
@@ -1127,10 +1154,10 @@ def run_auto(program, bindings, type_map, device, fingerprint,
                     {k: (v.clone() if isinstance(v, torch.Tensor) else v)
                      for k, v in bindings.items()}, device_obj)
 
-                def _warm_call(_key=cache_key, _wb=warm_bindings):
+                def _warm_call(_key=cache_key, _wb=warm_bindings, _scale=scale):
                     compiled_fn, _backend = _compiled_cache[_key]
                     compiled_fn(program, _wb, type_map, device,
-                               latent_channel_count, output_names)
+                               latent_channel_count, output_names, scale=_scale)
 
                 if _submit_bg_compile(cache_key, program, type_map, device_type,
                                       used_builtins, precision, fingerprint,
@@ -1595,10 +1622,11 @@ def _try_compile(
     # and return the codegen adapter directly — torch.compile overhead exceeds benefit
     if getattr(cg_fn, '_has_fn_calls', False):
         def _codegen_exec_eager(program, bindings, type_map, device,
-                                latent_channel_count=0, output_names=None):
+                                latent_channel_count=0, output_names=None, scale=None):
             dev = _canon_device(device)
             env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
-                                            used_builtins=used_builtins, precision=precision)
+                                            used_builtins=used_builtins, precision=precision,
+                                            scale=scale)
             _invoke_cg(cg_fn, env, bindings, stdlib_fns, dev, sp,
                        Interpreter._PRECISION_DTYPES.get(precision), program=program,
                        co_locate_params=True)   # FUSEDDEV-46: no retry net of its own here
@@ -1639,10 +1667,11 @@ def _try_compile(
         _clone_out = device_type == "cuda"
 
         def _codegen_exec(program, bindings, type_map, device,
-                          latent_channel_count=0, output_names=None):
+                          latent_channel_count=0, output_names=None, scale=None):
             dev = _canon_device(device)
             env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
-                                            used_builtins=used_builtins, precision=precision)
+                                            used_builtins=used_builtins, precision=precision,
+                                            scale=scale)
             _invoke_cg(compiled_flat, env, bindings, stdlib_fns, dev, sp,
                        Interpreter._PRECISION_DTYPES.get(precision), program=program,
                        co_locate_params=True)   # FUSEDDEV-46: no retry net of its own here

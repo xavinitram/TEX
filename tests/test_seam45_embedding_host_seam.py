@@ -305,7 +305,9 @@ _TIER2_SPEC = {
     'tex_runtime.compiled:__module_itself__': ('module', None),
     'tex_runtime.compiled:_try_codegen': ('function', (('program', 'POSITIONAL_OR_KEYWORD', False), ('type_map', 'POSITIONAL_OR_KEYWORD', False), ('fingerprint', 'POSITIONAL_OR_KEYWORD', True), ('_masked_flow', 'KEYWORD_ONLY', True), ('emit_cancel_polls', 'KEYWORD_ONLY', True))),
     'tex_runtime.graphed:__module_itself__': ('module', None),
-    'tex_runtime.graphed:GraphedProgram.capture': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('program', 'POSITIONAL_OR_KEYWORD', False), ('bindings', 'POSITIONAL_OR_KEYWORD', False), ('type_map', 'POSITIONAL_OR_KEYWORD', False), ('device', 'POSITIONAL_OR_KEYWORD', False), ('latent_channel_count', 'POSITIONAL_OR_KEYWORD', False), ('output_names', 'POSITIONAL_OR_KEYWORD', False), ('precision', 'POSITIONAL_OR_KEYWORD', False), ('used_builtins', 'POSITIONAL_OR_KEYWORD', False))),
+    # SCALECX-49 (v0.49): `scale` added, keyword-with-default, appended after `used_builtins`
+    # -- a purely additive signature change (SCALE-COMPILED-48's capture-time scale threading).
+    'tex_runtime.graphed:GraphedProgram.capture': ('function', (('self', 'POSITIONAL_OR_KEYWORD', False), ('program', 'POSITIONAL_OR_KEYWORD', False), ('bindings', 'POSITIONAL_OR_KEYWORD', False), ('type_map', 'POSITIONAL_OR_KEYWORD', False), ('device', 'POSITIONAL_OR_KEYWORD', False), ('latent_channel_count', 'POSITIONAL_OR_KEYWORD', False), ('output_names', 'POSITIONAL_OR_KEYWORD', False), ('precision', 'POSITIONAL_OR_KEYWORD', False), ('used_builtins', 'POSITIONAL_OR_KEYWORD', False), ('scale', 'POSITIONAL_OR_KEYWORD', True))),
     'tex_runtime.host:get_host_services': ('function', ()),
     'tex_runtime.interpreter:InterpreterError': ('class', None),
     'tex_runtime.profile:disable': ('function', ()),

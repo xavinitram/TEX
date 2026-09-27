@@ -91,7 +91,7 @@ def _median(xs) -> float:
 
 
 def make_key(fingerprint: str, device_type: str, precision: str,
-             spatial_shape) -> tuple:
+             spatial_shape, scale: float | None = None) -> tuple:
     """Verdicts are resolution-dependent (the win/lose boundary moves with
     pixel count), so bucket by (H*W).bit_length().
 
@@ -99,9 +99,17 @@ def make_key(fingerprint: str, device_type: str, precision: str,
     re-derived here. The two tables MUST agree: PRED-1 prices a program from PROF-1's
     bucket and the tier verdict is committed at autotier's, so an octave rule that
     changed in one place would have the cost table and the tier table describing
-    different cooks. Both modules are pure stdlib; no cycle."""
+    different cooks. Both modules are pure stdlib; no cycle.
+
+    `scale` (SCALECX-49): appended as an explicit, trailing component only when it is not
+    `None` — a `scale=None` cook (every ordinary ComfyUI cook) keys exactly as before this
+    ask, byte-for-byte (invariant 7). A scale-active verdict is filed under its OWN bucket so
+    a trial/commit measured at one scale never gets reused (or demoted) by a cook at a
+    DIFFERENT scale — the two are not the same workload, since scale changes the resolved
+    kernel size of every `pixel_args=`-tagged builtin the program calls."""
     from .profile import bucket_of
-    return (fingerprint, device_type, precision, bucket_of(spatial_shape)[0])
+    base = (fingerprint, device_type, precision, bucket_of(spatial_shape)[0])
+    return base if scale is None else base + (scale,)
 
 
 def _get(key: tuple) -> _KeyState:

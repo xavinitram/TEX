@@ -493,7 +493,7 @@ class GraphedProgram:
         return torch.tensor(float(value), dtype=dtype, device=device)
 
     def capture(self, program, bindings, type_map, device, latent_channel_count,
-                output_names, precision, used_builtins) -> bool:
+                output_names, precision, used_builtins, scale=None) -> bool:
         """Warm up, then capture. Returns True on success. HW-2: pin capture to the
         COOK's device — a cuda:1 cook must capture on cuda:1's stream, not whatever
         device happens to be current, else capture fails loudly and RNG-recovery runs
@@ -513,7 +513,18 @@ class GraphedProgram:
         each run a SEPARATE `Interpreter.execute()` on THIS thread, and an outer cook's own
         `measure(stages=True)` may still be open around the statement that triggered this
         capture — without suspending, those nested executions silently corrupt the outer
-        cook's per-stage sample."""
+        cook's per-stage sample.
+
+        `scale` (SCALECX-49): the cook's resolution-scale multiplier, forwarded verbatim to
+        `Interpreter.execute` for BOTH the warmup passes and the captured pass — the interpreter
+        resolves a `pixel_args=`-tagged argument's scaled value (`arg * scale`) as ordinary
+        Python/tensor arithmetic during the tree-walk, exactly as it does off the graphed tier
+        (SCALE-47b). Because that resolution can change a KERNEL'S SIZE (`gauss_blur`'s radius is
+        `ceil(3*sigma*scale)`, `erode`/`dilate`'s truncates to an int) — a shape-determining
+        quantity fixed at CAPTURE time, not a value a replay can vary — a capture taken at one
+        `scale` is only valid for cooks at that SAME `scale`; `_capture_key` (below) carries
+        `scale` as an explicit component so a different value can never replay against this
+        capture. `None` (every ordinary ComfyUI cook) is unchanged from before this ask."""
         global _CAPTURING
         _CAPTURING = True
         idx = _dev_index(device)
@@ -523,12 +534,12 @@ class GraphedProgram:
                     with torch.cuda.device(idx):
                         return self._capture_inner(program, bindings, type_map, device,
                                                    latent_channel_count, output_names,
-                                                   precision, used_builtins)
+                                                   precision, used_builtins, scale)
         finally:
             _CAPTURING = False
 
     def _capture_inner(self, program, bindings, type_map, device, latent_channel_count,
-                       output_names, precision, used_builtins) -> bool:
+                       output_names, precision, used_builtins, scale=None) -> bool:
         dtype = self.interp._PRECISION_DTYPES.get(precision, torch.float32) \
             if hasattr(self.interp, "_PRECISION_DTYPES") else torch.float32
         # Build static staging buffers for every binding.
@@ -545,7 +556,7 @@ class GraphedProgram:
                 program, self.static_bindings, type_map, device=device,
                 latent_channel_count=latent_channel_count,
                 output_names=output_names, precision=precision,
-                used_builtins=used_builtins)
+                used_builtins=used_builtins, scale=scale)
 
         # Warm up on a side stream (≥3 runs; UC-5 already gated fn_pow's probe).
         s = torch.cuda.Stream()
@@ -604,7 +615,18 @@ def _list_to_static(value, device, dtype):
 
 
 def _capture_key(fingerprint, device, precision, bindings, output_names,
-                 latent_channel_count) -> tuple:
+                 latent_channel_count, scale=None) -> tuple:
+    """SCALECX-49: `scale` is appended as an EXPLICIT, trailing key component only when it is
+    not `None` — a `scale=None` cook (every ordinary ComfyUI cook, and every cook this feature
+    predates) keys exactly as before, byte-for-byte (invariant 7). A scale-active cook's kernel-
+    building builtins (`gauss_blur`/`erode`/`dilate`/`bilateral_filter`) resolve a scaled radius
+    that is baked as a fixed SHAPE into the capture (see `capture`'s own docstring) — canvas
+    shape alone does not distinguish two different `scale` values on the SAME canvas, so without
+    this component a capture taken at one scale would be looked up and REPLAYED for a request at
+    a different scale, silently wrong (the bug `test_scalecx49_capture_mismatch_before_fix`
+    below proves). Bounded: the number of distinct captures grows with the number of DISTINCT
+    scale values a session actually requests (like a distinct canvas shape already does today),
+    never per call — a repeated request at an already-seen scale is a cache hit, not a recapture."""
     dev = torch.device(device)
     tensor_sig = []
     scalar_names = []
@@ -621,9 +643,10 @@ def _capture_key(fingerprint, device, precision, bindings, output_names,
             tensor_sig.append((name, tuple(v.shape), str(v.dtype)))
         else:
             scalar_names.append(name)
-    return (fingerprint, dev.index if dev.index is not None else torch.cuda.current_device(),
+    base = (fingerprint, dev.index if dev.index is not None else torch.cuda.current_device(),
             precision, tuple(sorted(tensor_sig)), tuple(sorted(scalar_names)),
             tuple(output_names) if output_names else (), latent_channel_count)
+    return base if scale is None else base + (float(scale),)
 
 
 def _dev_index(device) -> int:
@@ -656,9 +679,17 @@ def _under_memory_pressure(device=None) -> bool:
 
 def run_graphed(program, bindings, type_map, device, fingerprint,
                 latent_channel_count=0, output_names=None, precision="fp32",
-                used_builtins=None):
+                used_builtins=None, scale=None):
     """Execute via a cached CUDA graph, or return None to fall back to the
-    interpreter. cuda-only; every failure path returns None."""
+    interpreter. cuda-only; every failure path returns None.
+
+    `scale` (SCALECX-49, `float | None`): the cook's resolution-scale multiplier.
+    `None` (every ordinary ComfyUI cook) is unchanged from before this ask — same key shape,
+    same capture, same replay. A non-`None` scale is forwarded into the capture (`capture`'s
+    own docstring) and into `_capture_key` as an explicit component, so a distinct scale value
+    on an otherwise-identical program/canvas/precision gets its OWN capture rather than
+    replaying a stale one. ROI stays entirely out of scope here (this tier never threaded ROI
+    before this ask and does not now — `docs/resolution-scale.md`)."""
     global _graph_bytes
     if _graph_mode_disabled:
         return None
@@ -694,7 +725,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
         used_builtins = _collect_identifiers(program)
 
     key = _capture_key(fingerprint, dev, precision, bindings, output_names,
-                       latent_channel_count)
+                       latent_channel_count, scale=scale)
     if key in _blacklist:
         return None
 
@@ -722,7 +753,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
     gp = GraphedProgram(key)
     try:
         ok = gp.capture(program, bindings, type_map, dev, latent_channel_count,
-                        output_names, precision, used_builtins)
+                        output_names, precision, used_builtins, scale=scale)
     except Exception as e:
         ok = False
         logger.info("[TEX] CUDA-graph capture failed (%s); using interpreter.", e)

@@ -92,21 +92,30 @@ def test_scalecg48_scale_active_stencil_route_uses_codegen(r: SubTestResult):
          "(SCALE-CG-48: codegen, not forced interpreter)")
 
 
-def test_scalecg48_non_default_tier_still_forces_interpreter(r: SubTestResult):
-    print("\n--- SCALE-CG-48: compiled/graphed tiers are UNCHANGED -- still forced interpreter ---")
-    _tt.reset()
-    plan = tex_engine.prepare(_STENCIL_PLUS_BLUR, _bindings(24), device_mode="cpu",
-                              compile_mode="torch_compile", scale=0.5)
-    tex_engine.run(plan)
-    rec = _tt.last()
-    if rec is None or rec.tier != "interpreter":
-        r.fail("compiled tier scale bypass", f"expected tier='interpreter', got {rec!r}")
-        return
-    if not rec.reason or "scale" not in rec.reason.lower():
-        r.fail("compiled tier scale bypass reason", f"reason did not name scale: {rec.reason!r}")
-        return
-    r.ok(f"compile_mode='torch_compile' + scale=0.5 still forces tier={rec.tier!r} "
-         f"reason={rec.reason!r} -- SCALE-COMPILED-48 is a later ask, not this one")
+def test_scalecg48_non_default_tier_now_runs_on_its_own_tier(r: SubTestResult):
+    """SCALECX-49 (v0.49) built SCALE-COMPILED-48: `torch_compile`/`auto`/`cuda_graph` are no
+    longer bounced to the interpreter the instant scale is active -- `_run_tier` dispatches
+    a scale-active cook to `_run_torch_compile` directly, which keys its compiled artifact
+    by an explicit `scale` component (see `test_scalecx49_compiled_graphed_scale.py`, the
+    home of this feature's own tests). This box has no torch.compile backend (AGENTS.md's
+    workstation profile), so `execute_compiled` self-declines to the plain interpreter for
+    an entirely different, pre-existing reason (no backend, not "scale is active") -- the
+    cook still produces a correct, scale-active picture either way, which is what this test
+    checks; it no longer asserts WHICH internal tier produced it (see
+    test_scalecx49_compiled_graphed_scale.py for the dispatch-level proof)."""
+    print("\n--- SCALECX-49 update: compile_mode='torch_compile' + scale=0.5 no longer "
+          "bypasses to the interpreter unconditionally ---")
+    A = make_img(1, 24, 24, 3, seed=9)
+    out = tex_engine.cook(_STENCIL_PLUS_BLUR, dict(_bindings(24, seed=9), A=A.clone()),
+                         device_mode="cpu", compile_mode="torch_compile", scale=0.5)
+    ref = tex_engine.cook(_STENCIL_PLUS_BLUR, dict(_bindings(24, seed=9), A=A.clone()),
+                         device_mode="cpu", compile_mode="none", scale=0.5)
+    md = (out.outputs["BLUR"].float() - ref.outputs["BLUR"].float()).abs().max().item()
+    if md < 1e-5:
+        r.ok(f"compile_mode='torch_compile' + scale=0.5 cooks correctly (maxdiff {md:.2e} "
+             f"vs compile_mode='none' at the same scale) -- SCALECX-49 (v0.49)")
+    else:
+        r.fail("scalecx49 compiled-tier scale parity", f"maxdiff {md:.2e} >= 1e-5")
 
 
 def test_scalecg48_gauss_blur_sigma_scales_on_codegen_route(r: SubTestResult):

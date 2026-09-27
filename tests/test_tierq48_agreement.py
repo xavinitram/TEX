@@ -23,7 +23,7 @@ from TEX_Wrangle import tex_roi as _tex_roi
 from TEX_Wrangle.tex_compiler.types import TEXType
 from TEX_Wrangle.tex_engine_tiers import (
     tier_verdict, select_tier, TIER_REASON_SCALE_UNSAFE, TIER_REASON_SCALE_ACTIVE,
-    TIER_REASON_SCALE_ACTIVE_CODEGEN,
+    TIER_REASON_SCALE_ACTIVE_CODEGEN, TIER_REASON_SCALE_ACTIVE_COMPILED,
     ROI_REASON_TIER_NOT_DEFAULT, ROI_REASON_NOT_ARMED, ROI_REASON_ARMED,
     ROI_REASON_WHOLE_FRAME, ROI_REASON_SCALE_ACTIVE,
 )
@@ -57,7 +57,16 @@ def _real_plan(code, bindings, **kw):
 
 def _real_tier_and_roi_armed(code, bindings, **kw):
     plan = _real_plan(code, bindings, **kw)
-    if plan.ctx.scale is not None:
+    # SCALECX-49: the codegen-vs-interpreter peek below is SPECIFIC to the "default" tier's
+    # own internal UC-2 stencil decision, whose BOTH branches explicitly `tier_trace.record`
+    # (SCALE-CG-48). `torch_compile`/`auto` have no equivalent "both branches record"
+    # contract — a no-backend decline there falls to `_plain_execute` without ever calling
+    # `tier_trace.record`, so `tier_trace.last()` after one of THOSE cooks can be stale (a
+    # leftover from whatever this thread cooked last, or None). For those two (and
+    # `cuda_graph`), `plan.tier_id` IS the ground truth `tier_verdict` claims to predict —
+    # "which tier `_run_tier` dispatches to" — so only peek inside `tier_trace` for the
+    # "default" tier's own internal choice.
+    if plan.ctx.scale is not None and plan.tier_id == "default":
         # SCALE-CG-48: codegen-vs-interpreter for a scale-active cook is decided INSIDE
         # `_dispatch_tier` (the UC-2 stencil gate on the compiled program), not visible on
         # `CookPlan` — actually run it and read `tier_trace`, which BOTH branches of that
@@ -203,6 +212,61 @@ def test_tierq48_agrees_a_non_default_tier_never_arms_roi():
                      roi_exec=True, param_values={"amount": 0.4})
     assert v.tier == "cuda_graph"
     assert not v.roi_armed and v.roi_reason == ROI_REASON_TIER_NOT_DEFAULT
+
+
+# ── SCALECX-49: torch_compile/auto/cuda_graph now honour scale ──────────────────────
+#
+# Before this ask, a scale-active cook on ANY of these three tiers was unconditionally
+# forced to `"interpreter"` (`TIER_REASON_SCALE_ACTIVE`) by `_run_tier`'s own bypass — the
+# query already reported that correctly. Now `_run_tier` dispatches straight to each
+# tier's own strategy (`_run_torch_compile`/`_run_auto`/`_run_cuda_graph`, each keying its
+# compiled artifact / captured graph by an explicit `scale` component), so the query must
+# name THAT tier instead, with the new `TIER_REASON_SCALE_ACTIVE_COMPILED` reason.
+def test_tierq48_agrees_scale_active_compiled_tier_runs_on_torch_compile():
+    A = torch.rand(1, 8, 8, 4)
+    real_tier, real_roi_armed = _real_tier_and_roi_armed(
+        _PLAIN_CODE, {"A": A}, scale=0.5, compile_mode="torch_compile")
+    v = tier_verdict(_PLAIN_CODE, compile_mode="torch_compile", device="cpu", scale=0.5)
+    assert (v.tier, v.roi_armed) == (real_tier, real_roi_armed)
+    assert v.tier == "torch_compile" and v.reason == TIER_REASON_SCALE_ACTIVE_COMPILED
+
+
+def test_tierq48_agrees_scale_active_compiled_tier_runs_on_auto():
+    A = torch.rand(1, 8, 8, 4)
+    real_tier, real_roi_armed = _real_tier_and_roi_armed(
+        _PLAIN_CODE, {"A": A}, scale=0.25, compile_mode="auto")
+    v = tier_verdict(_PLAIN_CODE, compile_mode="auto", device="cpu", scale=0.25)
+    assert (v.tier, v.roi_armed) == (real_tier, real_roi_armed)
+    assert v.tier == "auto" and v.reason == TIER_REASON_SCALE_ACTIVE_COMPILED
+
+
+def test_tierq48_agrees_scale_active_cuda_graph_reported_without_real_gpu():
+    """`select_tier`'s `cuda_graph` branch is a pure device-string check (no real GPU
+    needed, same fact `test_tierq48_agrees_a_non_default_tier_never_arms_roi` already
+    leans on) — this only exercises the QUERY, not a live cook (a live `cuda_graph` cook
+    needs real CUDA hardware, covered separately, CUDA-gated, in
+    test_scalecx49_compiled_graphed_scale.py)."""
+    tier_id = select_tier("cuda_graph", "cuda:0", False, False)
+    assert tier_id == "cuda_graph"
+    v = tier_verdict(_PLAIN_CODE, compile_mode="cuda_graph", device="cuda:0", scale=0.125)
+    assert v.tier == "cuda_graph" and v.reason == TIER_REASON_SCALE_ACTIVE_COMPILED
+
+
+def test_tierq48_agrees_roi_still_declines_on_scale_active_compiled_tier():
+    """ROI must stay out of scope here too: a scale-active cook that ALSO requests `roi=`
+    on `torch_compile` declines ROI for the SAME pre-existing reason as before this ask
+    (`tier_id != "default"`) — SCALECX-49 makes the tier itself scale-aware, it does not
+    touch ROI eligibility at all."""
+    A = torch.rand(1, 8, 8, 4)
+    roi = (1, 1, 4, 4, 8, 8)
+    real_tier, real_roi_armed = _real_tier_and_roi_armed(
+        _PLAIN_CODE, {"A": A}, scale=0.5, roi=roi, roi_exec=True,
+        compile_mode="torch_compile")
+    v = tier_verdict(_PLAIN_CODE, compile_mode="torch_compile", device="cpu", scale=0.5,
+                     roi=roi, roi_exec=True)
+    assert (v.tier, v.roi_armed) == (real_tier, real_roi_armed)
+    assert v.tier == "torch_compile" and not v.roi_armed
+    assert v.roi_reason == ROI_REASON_TIER_NOT_DEFAULT
 
 
 def test_tierq48_never_raises_on_a_malformed_roi():

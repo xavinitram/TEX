@@ -206,7 +206,14 @@ _SKIP_VOCAB = re.compile(
 #: row cooks the memory-pressure halo-tiled path on a real CUDA device (tiled vs whole-frame,
 #: `torch.equal`); its CPU twin in the same file forces the same planner decision with no
 #: device and runs everywhere, so this one skip needs CUDA and nothing else.
-_SKIP_BUDGET = 122
+#: Re-pinned from 122 to 124 (SCALECX-49): two new rows in
+#: `test_scalecx49_compiled_graphed_scale.py` (`test_scalecx49_cuda_graph_capture_mismatch_
+#: before_fix_live`, `test_scalecx49_cuda_parity_live`) each need a real CUDA device — one to
+#: capture/replay a CUDA graph at two different scale values, one to compare the compiled and
+#: graphed tiers against the interpreter at scale 1/half/quarter/eighth — and carry no CPU
+#: witness for either (a CUDA-graph capture is CUDA-only by construction), one `r.skip` site
+#: each, same reason every other CUDA-only row in this pin has one.
+_SKIP_BUDGET = 124
 
 
 def _literal(node) -> str:
