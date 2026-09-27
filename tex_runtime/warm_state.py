@@ -126,6 +126,47 @@ def _journal():
     return Journal(p)
 
 
+def _persisted_stores():
+    """K6 (v0.50.0 Phase C, R1#2): the (json_key, adopt_fn, snapshot_fn) triple for every
+    memo this module's SNAPSHOT persists -- the ONE list `load()`'s snapshot-merge branch
+    and `_snapshot()`'s own write side both iterate over now, instead of a parallel
+    dict-comprehension / adopt-closure / `data.get(...)` loop hand-copied per store (the
+    module's own header used to read as a to-be-continued list of exactly this
+    duplication; a future third store is now one entry here).
+
+    The ENG-13 JOURNAL's per-record branches (`load()`, below) stay separate: each
+    store's journal record uses a DIFFERENT key name (`fp`/`cap`/`ops` vs `fnfp`/`ok`)
+    specifically so an old journal line can never be misread as the wrong store's shape,
+    and unifying that would change the on-disk journal FORMAT itself -- a bigger, riskier
+    lift than this ask's "reuse... parameterize" scope covers (R1#2 named the
+    snapshot/adopt duplication, not the journal schema). The adopt functions here ARE
+    reused by the journal branch, so there is exactly one `adopt`/`adopt_fnc` pair
+    defined anywhere in this module, not two."""
+    from . import graphed
+    from . import fncalls_compile as _fnc
+
+    def _adopt_cap(fp, val):
+        try:
+            graphed._capturable_memo.setdefault(fp, (bool(val[0]), int(val[1])))
+        except Exception:
+            pass
+
+    def _adopt_fnc(fp, ok):
+        try:
+            _fnc.adopt_persisted(fp, ok)
+        except Exception:
+            pass
+
+    def _snap_cap():
+        return {fp: [bool(v[0]), int(v[1])] for fp, v in graphed._capturable_memo.items()}
+
+    def _snap_fnc():
+        return {fp: bool(ok) for fp, ok in _fnc.snapshot_items().items()}
+
+    return [("capturable", _adopt_cap, _snap_cap),
+           ("fncalls_compile", _adopt_fnc, _snap_fnc)]
+
+
 def load() -> None:
     """Merge persisted verdicts into the live graphed/compiled tables, snapshot first and then
     the ENG-13 journal on top. `setdefault` so a verdict already learned this session (fresher)
@@ -136,30 +177,21 @@ def load() -> None:
     exactly the window a cold launch spends learning."""
     p = _path()
     tag = _tag()
-    from . import graphed
-    from . import fncalls_compile as _fnc
-
-    def adopt(fp, val):
-        try:
-            graphed._capturable_memo.setdefault(fp, (bool(val[0]), int(val[1])))
-        except Exception:
-            pass
-
-    def adopt_fnc(fp, ok):
-        try:
-            _fnc.adopt_persisted(fp, ok)
-        except Exception:
-            pass
+    stores = _persisted_stores()
+    # The journal's two record shapes ("fp"/"cap"/"ops" vs "fnfp"/"ok") correspond
+    # positionally to the two stores _persisted_stores() lists, in the same fixed order
+    # both this function and `_snapshot()` already rely on.
+    _cap_key, adopt_cap, _snap_cap = stores[0]
+    _fnc_key, adopt_fnc, _snap_fnc = stores[1]
 
     if p and os.path.exists(p):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if data.get("version") == tag:
-                for fp, val in (data.get("capturable") or {}).items():
-                    adopt(fp, val)
-                for fp, ok in (data.get("fncalls_compile") or {}).items():
-                    adopt_fnc(fp, ok)
+                for json_key, adopt_fn_i, _snap_fn_i in stores:
+                    for fp, val in (data.get(json_key) or {}).items():
+                        adopt_fn_i(fp, val)
         except Exception:
             pass
     j = _journal()
@@ -175,7 +207,7 @@ def load() -> None:
                 if not (isinstance(rec, dict) and rec.get("version") == tag):
                     continue
                 if rec.get("fp"):
-                    adopt(rec["fp"], (rec.get("cap"), rec.get("ops", 0)))
+                    adopt_cap(rec["fp"], (rec.get("cap"), rec.get("ops", 0)))
                 elif rec.get("fnfp"):
                     adopt_fnc(rec["fnfp"], rec.get("ok"))
         except Exception:
@@ -183,9 +215,10 @@ def load() -> None:
 
 
 def _snapshot() -> dict:
-    """What we persist — the graph-CAPTURABILITY verdict only, a pure function of the program AST +
-    arch (a while-loop is never capturable), so both True and False are stable to persist and skip
-    re-walking the AST gate next launch.
+    """What we persist — every terminal, cross-launch-stable verdict `_persisted_stores()`
+    lists (today: graph-CAPTURABILITY, a pure function of the program AST + arch; and
+    COMPILETRY-50's fn-calls-compile verdict) — see that function for the single list
+    both this and `load()` iterate over.
 
     NOT persisted, deliberately: (1) backend probes — `_select_backend` treats a known-True the
     same as an unknown (it only skips a known-False), so persisting positives is inert, and a
@@ -193,11 +226,10 @@ def _snapshot() -> dict:
     torch.compile blacklist and the runtime CUDA-graph capture blacklist — both mix a stable
     verdict with a transient runtime/OOM crash, which must not become a permanent cross-launch
     demotion (the transient-hygiene reason in DEVELOPMENT.md's rejected-decisions)."""
-    from . import graphed
-    from . import fncalls_compile as _fnc
-    cap = {fp: [bool(v[0]), int(v[1])] for fp, v in graphed._capturable_memo.items()}
-    fnc = {fp: bool(ok) for fp, ok in _fnc.snapshot_items().items()}
-    return {"version": _tag(), "capturable": cap, "fncalls_compile": fnc}
+    out = {"version": _tag()}
+    for json_key, _adopt_fn, snap_fn in _persisted_stores():
+        out[json_key] = snap_fn()
+    return out
 
 
 def persist(*, force: bool = False) -> None:

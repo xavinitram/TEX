@@ -144,12 +144,16 @@ def record(key: str, ok: bool) -> None:
     in ordinary operation (`resolve_attempt`'s `_pending` guard already prevents it), but a
     test or a race must never flip an already-settled verdict. `key` is the already-composed
     string from `_key()` (or an equivalent test-composed one) -- this function does not
-    itself take separate fp/device/precision components."""
+    itself take separate fp/device/precision components.
+
+    K6 (v0.50.0 Phase C, R1#2): shares `lru_util.lru_put` with `graphed._blacklist_add`/
+    `compiled._blacklist_add` -- this insert now calls `move_to_end` unconditionally, the
+    same as those two, closing the drift where a `record()`-ed-but-never-`verdict()`-read
+    key was a STRONGER eviction candidate than the equivalent case in either sibling."""
     if key in _memo:
         return
-    _memo[key] = bool(ok)
-    while len(_memo) > _MEMO_MAX:
-        _memo.popitem(last=False)
+    from .lru_util import lru_put
+    lru_put(_memo, key, bool(ok), _MEMO_MAX)
     try:
         from . import warm_state as _ws
         _ws.note_fncalls_update(key)

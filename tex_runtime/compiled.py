@@ -190,11 +190,12 @@ _BLACKLIST_MAX = 256
 def _blacklist_add(fp: str) -> None:
     """Record a fingerprint that crashed torch.compile, bounding total size. Session-scoped: the
     compile blacklist is deliberately NOT persisted (a transient runtime/OOM crash must not harden
-    into a permanent cross-launch demotion — see warm_state.py)."""
-    _compile_blacklist[fp] = None
-    _compile_blacklist.move_to_end(fp)
-    while len(_compile_blacklist) > _BLACKLIST_MAX:
-        _compile_blacklist.popitem(last=False)
+    into a permanent cross-launch demotion — see warm_state.py).
+
+    K6: the shared bounded-LRU idiom (`lru_util.lru_put`) -- see that module's own
+    docstring for why this used to be one of three independent hand-copies."""
+    from .lru_util import lru_put
+    lru_put(_compile_blacklist, fp, None, _BLACKLIST_MAX)
 
 # Track which (backend, device_type) pairs have been tested and whether they
 # work. Missing key = untested, True = works, False = failed/unavailable.

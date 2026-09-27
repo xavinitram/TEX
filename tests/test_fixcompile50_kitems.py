@@ -430,3 +430,88 @@ def test_k5_busy_then_free_clears_the_marker_for_a_fast_job(r: SubTestResult):
     finally:
         C._pool_busy_since.clear()
         C._pool_busy_since.update(saved_busy)
+
+
+# ── K6: three independent hand-copies of the bounded-LRU idiom existed
+# (graphed._blacklist_add, compiled._blacklist_add, fncalls_compile.record), and the
+# third had already drifted (no move_to_end on insert). Fix: one shared helper
+# (lru_util.lru_put), reused by all three; warm_state's snapshot/load also de-duplicated
+# over a small store table. ─────────────────────────────────────────────────────────
+
+def test_k6_fncalls_compile_record_shares_the_lru_helper(r: SubTestResult):
+    """RED against the pre-K6 shape: `record()`'s own insert used to be a hand-copy
+    (`_memo[key] = bool(ok); while len(_memo) > _MEMO_MAX: _memo.popitem(last=False)`)
+    with no `move_to_end` call at all -- unlike `graphed._blacklist_add`/
+    `compiled._blacklist_add`, which always `move_to_end` on insert. Structural,
+    read-the-real-body proof (not eviction-order timing, which is unobservably
+    identical for a store that only ever inserts each key ONCE -- R1#2's own finding
+    calls this drift "presently harmless", the point is closing the copy-by-hand risk
+    before a FUTURE change to the eviction policy has three places to land instead of
+    one): `record`'s compiled bytecode must reference `lru_put`, checked past the
+    docstring text (which itself mentions the helper's name in prose) by requiring the
+    call SHAPE `lru_put(`, not a bare substring match."""
+    print("\n--- K6: fncalls_compile.record() calls the shared lru_util.lru_put, not a "
+          "hand-copy ---")
+    import inspect
+    try:
+        src = inspect.getsource(FC.record)
+        assert "lru_put(" in src, (
+            "record() must call lru_util.lru_put(...) -- found no such call in its body "
+            "(a docstring mentioning the helper's name does not count)")
+        r.ok("K6: fncalls_compile.record() calls lru_util.lru_put(...)")
+    except Exception as e:
+        r.fail("K6 record shares the LRU helper", f"{type(e).__name__}: {e}")
+
+
+def test_k6_three_lru_stores_share_one_helper(r: SubTestResult):
+    """graphed._blacklist_add / compiled._blacklist_add / fncalls_compile.record all
+    reuse `lru_util.lru_put` now -- confirmed by reading each of the three source
+    bodies for the call SHAPE (`lru_put(`, never a bare substring that could also match
+    a docstring mentioning the helper's name), not by re-deriving the eviction
+    behaviour a third time."""
+    print("\n--- K6: all three LRU stores call the one shared helper ---")
+    import inspect
+    from TEX_Wrangle.tex_runtime import graphed as G
+    try:
+        sites = {
+            "graphed._blacklist_add": inspect.getsource(G._blacklist_add),
+            "compiled._blacklist_add": inspect.getsource(C._blacklist_add),
+            "fncalls_compile.record": inspect.getsource(FC.record),
+        }
+        missing = [name for name, src in sites.items() if "lru_put(" not in src]
+        assert not missing, f"these sites do not call lru_util.lru_put(...): {missing}"
+        r.ok(f"K6: {len(sites)} LRU sites all call lru_util.lru_put(...)")
+    except Exception as e:
+        r.fail("K6 shared LRU helper", f"{type(e).__name__}: {e}")
+
+
+def test_k6_warm_state_snapshot_and_load_round_trip_both_stores(r: SubTestResult):
+    """The de-duplicated `_persisted_stores()`-driven snapshot/load path must still
+    round-trip BOTH stores correctly -- this is the regression guard for the
+    parameterization itself, not a new behaviour."""
+    print("\n--- K6: warm_state's de-duplicated snapshot/load still round-trips both stores ---")
+    from TEX_Wrangle.tex_runtime import warm_state as WS
+    from TEX_Wrangle.tex_runtime import graphed as G
+    FC.reset_for_test()
+    saved_cap = dict(G._capturable_memo)
+    try:
+        G._capturable_memo.clear()
+        G._capturable_memo["k6-cap-fp"] = (True, 7)
+        FC.record(FC._key("k6-fnc-fp", "cpu", "fp32"), False)
+        snap = WS._snapshot()
+        assert snap["capturable"].get("k6-cap-fp") == [True, 7]
+        assert snap["fncalls_compile"].get(FC._key("k6-fnc-fp", "cpu", "fp32")) is False
+        G._capturable_memo.clear()
+        FC.reset_for_test()
+        for json_key, adopt_fn, _snap_fn in WS._persisted_stores():
+            for k, v in snap[json_key].items():
+                adopt_fn(k, v)
+        assert G._capturable_memo.get("k6-cap-fp") == (True, 7)
+        assert FC.verdict("k6-fnc-fp", "cpu", "fp32") is False
+        r.ok("K6: both stores round-trip through the shared _persisted_stores() list")
+    except Exception as e:
+        r.fail("K6 warm_state round-trip", f"{type(e).__name__}: {e}")
+    finally:
+        G._capturable_memo.clear()
+        G._capturable_memo.update(saved_cap)
+        FC.reset_for_test()

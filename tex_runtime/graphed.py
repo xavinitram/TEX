@@ -143,11 +143,12 @@ _BLACKLIST_MAX = 256
 
 
 def _blacklist_add(key: tuple) -> None:
-    """Record a capture/replay-failed key, bounding total size (FIX-SCALECX X5)."""
-    _blacklist[key] = None
-    _blacklist.move_to_end(key)
-    while len(_blacklist) > _BLACKLIST_MAX:
-        _blacklist.popitem(last=False)
+    """Record a capture/replay-failed key, bounding total size (FIX-SCALECX X5).
+
+    K6: the shared bounded-LRU idiom (`lru_util.lru_put`) -- see that module's own
+    docstring for why this used to be one of three independent hand-copies."""
+    from .lru_util import lru_put
+    lru_put(_blacklist, key, None, _BLACKLIST_MAX)
 # fingerprint -> static capturability (the AST gate is a full walk; memoize it so
 # cache-hit replays don't re-walk the program every cook).
 _capturable_memo: "dict[str, tuple[bool, int]]" = {}
