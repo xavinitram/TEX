@@ -293,6 +293,7 @@ and a warning is logged, so a typo can never turn a cache off silently.
 | `TEX_CODEGEN_NO_OUT_REUSE` | Disable codegen's `out=` buffer reuse — an A/B lever | Reuse is on |
 | `TEX_DOCS_LOCAL` | Point error-code links at the offline reference TEX serves from its own package instead of the GitHub wiki — for an air-gapped box or a standalone editor | Links point at the wiki |
 | `TORCHINDUCTOR_CACHE_DIR` | Honoured (not set) when TEX did not create the inductor cache itself | Torch's own default |
+| `TEX_GATE_NO_INDUCTOR` | Force `torch.compile`'s Inductor backend to read as unavailable, regardless of the box's own toolchain — a test/CI-only lever, never meant for a normal install | Off (the real toolchain probe answers) |
 
 ## Development
 
