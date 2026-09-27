@@ -117,8 +117,7 @@ def test_roi48a_uniform_branch_unlocks_window(r: SubTestResult):
     except Exception as e:
         r.fail("ROI-48A uniform-branch reach", f"{type(e).__name__}: {e}")
     finally:
-        from TEX_Wrangle import tex_roi as _R2
-        _R2.clear_roi_memo()
+        _R.clear_roi_memo()
 
 
 def test_roi48a_pixel_identity(r: SubTestResult):
@@ -156,8 +155,7 @@ def test_roi48a_pixel_identity(r: SubTestResult):
     except Exception as e:
         r.fail("ROI-48A pixel identity", f"{type(e).__name__}: {e}")
     finally:
-        from TEX_Wrangle import tex_roi as _R2
-        _R2.clear_roi_memo()
+        _R.clear_roi_memo()
 
 
 def test_roi48a_sound_on_doubt(r: SubTestResult):
@@ -196,5 +194,4 @@ def test_roi48a_sound_on_doubt(r: SubTestResult):
     except Exception as e:
         r.fail("ROI-48A soundness on doubt", f"{type(e).__name__}: {e}")
     finally:
-        from TEX_Wrangle import tex_roi as _R2
-        _R2.clear_roi_memo()
+        _R.clear_roi_memo()
