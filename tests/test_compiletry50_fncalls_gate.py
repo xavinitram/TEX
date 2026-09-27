@@ -72,31 +72,32 @@ def _isolated_fncalls_state(monkeypatch):
 # ── fncalls_compile: the pure memo, no torch.compile involved ──────────────────────────
 
 def test_verdict_none_until_recorded():
-    assert FC.verdict("fp-a") is None
-    FC.record("fp-a", True)
-    assert FC.verdict("fp-a") is True
+    assert FC.verdict("fp-a", "cpu", "fp32") is None
+    FC.record(FC._key("fp-a", "cpu", "fp32"), True)
+    assert FC.verdict("fp-a", "cpu", "fp32") is True
 
 
 def test_record_is_terminal_first_writer_wins():
-    FC.record("fp-b", False)
-    FC.record("fp-b", True)   # a later, contradicting write must not flip it
-    assert FC.verdict("fp-b") is False
+    key = FC._key("fp-b", "cpu", "fp32")
+    FC.record(key, False)
+    FC.record(key, True)   # a later, contradicting write must not flip it
+    assert FC.verdict("fp-b", "cpu", "fp32") is False
 
 
 def test_begin_attempt_granted_once_then_pending():
-    assert FC.begin_attempt("fp-c") is True
-    assert FC.begin_attempt("fp-c") is False   # already pending -- no second grant
-    FC.resolve_attempt("fp-c", "inductor")
-    assert FC.verdict("fp-c") is True
-    assert FC.begin_attempt("fp-c") is False   # already resolved -- no grant either
+    assert FC.begin_attempt("fp-c", "cpu", "fp32") is True
+    assert FC.begin_attempt("fp-c", "cpu", "fp32") is False   # already pending -- no second grant
+    FC.resolve_attempt("fp-c", "cpu", "fp32", "inductor")
+    assert FC.verdict("fp-c", "cpu", "fp32") is True
+    assert FC.begin_attempt("fp-c", "cpu", "fp32") is False   # already resolved -- no grant either
 
 
 def test_begin_attempt_none_fingerprint_never_granted():
     """A program with no fingerprint (e.g. an uncached probe) has no key to remember a
     verdict against -- it must keep taking the always-safe path, never the fall-through,
     exactly like every fingerprint-less call did before this ask."""
-    assert FC.begin_attempt(None) is False
-    assert FC.verdict(None) is None
+    assert FC.begin_attempt(None, "cpu", "fp32") is False
+    assert FC.verdict(None, "cpu", "fp32") is None
 
 
 def test_resolve_attempt_noop_for_a_fingerprint_never_granted():
@@ -104,34 +105,36 @@ def test_resolve_attempt_noop_for_a_fingerprint_never_granted():
     ordinary non-fn-calls program) must not be recorded by a stray `resolve_attempt` --
     every real caller calls it unconditionally after every `_try_compile`, so this is the
     guard that keeps that safe for the overwhelming majority of calls."""
-    FC.resolve_attempt("fp-never-pending", "inductor")
-    assert FC.verdict("fp-never-pending") is None
+    FC.resolve_attempt("fp-never-pending", "cpu", "fp32", "inductor")
+    assert FC.verdict("fp-never-pending", "cpu", "fp32") is None
 
 
 def test_persists_across_a_simulated_restart():
     """Record a verdict, forget it (simulating a fresh process's empty in-memory table),
     then load from disk -- the CACHE-3 pattern this ask reuses rather than a new store."""
-    FC.record("fp-restart", True)
+    key = FC._key("fp-restart", "cpu", "fp32")
+    FC.record(key, True)
     WS.persist(force=True)
     FC.reset_for_test()
     WS._reset_for_test()
-    assert "fp-restart" not in FC._memo   # nothing in memory yet (verdict() itself would
-                                          # auto-load on a miss -- checked directly here)
+    assert key not in FC._memo   # nothing in memory yet (verdict() itself would
+                                 # auto-load on a miss -- checked directly here)
     WS.load()
-    assert FC.verdict("fp-restart") is True   # adopted from the warm_state snapshot
+    assert FC.verdict("fp-restart", "cpu", "fp32") is True   # adopted from the warm_state snapshot
 
 
 def test_journal_recovers_a_verdict_never_snapshotted():
     """ENG-13's crash-tight half: `note_fncalls_update` journals immediately (no throttle),
     so a verdict learned less than `_PERSIST_THROTTLE_SEC` before a simulated crash (never
     reaching `persist(force=True)`) is still recovered from the journal alone."""
-    FC.record("fp-journal", False)
-    WS.note_fncalls_update("fp-journal")   # journals now; the throttled snapshot may not fire
+    key = FC._key("fp-journal", "cpu", "fp32")
+    FC.record(key, False)
+    WS.note_fncalls_update(key)   # journals now; the throttled snapshot may not fire
     FC.reset_for_test()
     WS._reset_for_test()
-    assert "fp-journal" not in FC._memo
+    assert key not in FC._memo
     WS.load()
-    assert FC.verdict("fp-journal") is False
+    assert FC.verdict("fp-journal", "cpu", "fp32") is False
 
 
 # ── _try_compile: the gate itself ───────────────────────────────────────────────────────
@@ -151,11 +154,12 @@ def test_first_attempt_falls_through_and_succeeds(monkeypatch):
     monkeypatch.setattr(C, "_get_or_make_codegen_fn", lambda *a, **k: _fake_cg_fn())
 
     entry = C._try_compile("cpu", program=object(), type_map={}, fingerprint="fp-ok")
-    C.fncalls_compile.resolve_attempt("fp-ok", entry[1] if entry is not None else None)
+    C.fncalls_compile.resolve_attempt("fp-ok", "cpu", "fp32",
+                                      entry[1] if entry is not None else None)
 
     assert entry is not None and entry[1] == "stand_in"
     assert calls["n"] == 1
-    assert FC.verdict("fp-ok") is True
+    assert FC.verdict("fp-ok", "cpu", "fp32") is True
 
 
 def test_second_call_same_fingerprint_never_recompiles(monkeypatch):
@@ -176,11 +180,12 @@ def test_second_call_same_fingerprint_never_recompiles(monkeypatch):
     monkeypatch.setattr(C.torch, "compile", _fake_torch_compile)
     monkeypatch.setattr(C, "_get_or_make_codegen_fn", lambda *a, **k: _fake_cg_fn())
 
-    FC.record("fp-warm", True)   # simulates a verdict adopted from an earlier process
+    key = FC._key("fp-warm", "cpu", "fp32")
+    FC.record(key, True)   # simulates a verdict adopted from an earlier process
     entry = C._try_compile("cpu", program=object(), type_map={}, fingerprint="fp-warm")
     assert entry is not None and entry[1] == "stand_in"
     assert calls["n"] == 1
-    assert "fp-warm" not in FC._pending   # never entered the fall-through bookkeeping
+    assert key not in FC._pending   # never entered the fall-through bookkeeping
 
 
 def test_failed_attempt_settles_false_and_falls_back(monkeypatch):
@@ -201,10 +206,11 @@ def test_failed_attempt_settles_false_and_falls_back(monkeypatch):
     monkeypatch.setattr(C, "_get_or_make_codegen_fn", lambda *a, **k: _fake_cg_fn())
 
     entry = C._try_compile("cpu", program=object(), type_map={}, fingerprint="fp-fail")
-    C.fncalls_compile.resolve_attempt("fp-fail", entry[1] if entry is not None else None)
+    C.fncalls_compile.resolve_attempt("fp-fail", "cpu", "fp32",
+                                      entry[1] if entry is not None else None)
 
     assert entry is None   # no backend at all -- the caller's own interpreter fallback
-    assert FC.verdict("fp-fail") is False
+    assert FC.verdict("fp-fail", "cpu", "fp32") is False
 
 
 def test_resolved_false_never_recompiles_and_stays_visible(monkeypatch):
@@ -218,14 +224,15 @@ def test_resolved_false_never_recompiles_and_stays_visible(monkeypatch):
     monkeypatch.setattr(C.torch, "compile", _never_call)
     monkeypatch.setattr(C, "_get_or_make_codegen_fn", lambda *a, **k: _fake_cg_fn())
 
-    FC.record("fp-known-bad", False)
+    key = FC._key("fp-known-bad", "cpu", "fp32")
+    FC.record(key, False)
     before_failed = C.promotion_stats()["failed"]
 
     entry = C._try_compile("cpu", program=object(), type_map={}, fingerprint="fp-known-bad")
 
     assert entry is not None and entry[1] is None
     assert C.promotion_stats()["failed"] == before_failed + 1   # still reported this cook
-    assert "fp-known-bad" not in FC._pending
+    assert key not in FC._pending
 
 
 def test_no_fn_calls_program_is_unaffected(monkeypatch):
@@ -246,4 +253,4 @@ def test_no_fn_calls_program_is_unaffected(monkeypatch):
 
     assert entry is not None and entry[1] == "stand_in"
     assert calls["n"] == 1
-    assert FC.verdict("fp-plain") is None   # never memoized -- this gate never ran
+    assert FC.verdict("fp-plain", "cpu", "fp32") is None   # never memoized -- this gate never ran

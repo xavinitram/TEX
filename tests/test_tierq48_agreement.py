@@ -69,7 +69,7 @@ def _pinned_fncalls_verdict(fp, verdict: bool):
     on the way out (even on an assertion failure) -- so a test cannot leak its pin into the
     next one regardless of how it exits."""
     _fncalls_compile.reset_for_test()
-    _fncalls_compile._memo[fp] = verdict
+    _fncalls_compile._memo[_fncalls_compile._key(fp, "cpu", "fp32")] = verdict
     try:
         yield
     finally:
@@ -351,7 +351,7 @@ def test_tierq48_torch_compile_reports_declared_tier_for_an_unresolved_fingerpri
     exact assertion this test's predecessor pinned) and GREEN at head."""
     fp = _gauss_blur_fingerprint()
     _fncalls_compile.reset_for_test()
-    assert _fncalls_compile.verdict(fp) is None   # never attempted -- the case under test
+    assert _fncalls_compile.verdict(fp, "cpu", "fp32") is None   # never attempted -- the case under test
     v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu",
                      binding_types=_GAUSS_BLUR_BT)
     assert v.tier == "torch_compile" and v.reason == TIER_REASON_SELECTED

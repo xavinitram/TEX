@@ -183,7 +183,8 @@ def test_k2_verdict_settles_false_when_the_first_real_call_fails(r: SubTestResul
     C._verify_state.pop(cache_key, None)
     C._route_memo.pop(fp, None)
     FC.reset_for_test()
-    FC._pending.add(fp)   # simulate _try_compile's own begin_attempt() having granted it
+    key = FC._key(fp, "cpu", "fp32")
+    FC._pending.add(key)   # simulate _try_compile's own begin_attempt() having granted it
 
     def _raising_compiled_fn(*a, **kw):
         raise RuntimeError("simulated real Dynamo trace/lower failure at first call")
@@ -193,13 +194,13 @@ def test_k2_verdict_settles_false_when_the_first_real_call_fails(r: SubTestResul
     try:
         C.execute_compiled(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"],
                            used_builtins=used)
-        verdict = FC.verdict(fp)
+        verdict = FC.verdict(fp, "cpu", "fp32")
         assert verdict is False, (
             f"expected the fncalls_compile verdict to settle False (the real "
             f"invocation raised), got {verdict!r} -- a wrap-time-only resolve would "
             f"have memoized True here, permanently, even though the artifact never "
             f"actually works")
-        assert fp not in FC._pending, "resolve_attempt must clear the pending marker"
+        assert key not in FC._pending, "resolve_attempt must clear the pending marker"
         r.ok("K2: the verdict settles False from the real invocation's failure, not "
              "True from the wrap's own success")
     except Exception as e:
@@ -224,7 +225,7 @@ def test_k2_verdict_settles_true_only_after_a_successful_real_call(r: SubTestRes
     C._verify_state.pop(cache_key, None)
     C._route_memo.pop(fp, None)
     FC.reset_for_test()
-    FC._pending.add(fp)
+    FC._pending.add(FC._key(fp, "cpu", "fp32"))
 
     calls = {"n": 0}
 
@@ -239,7 +240,7 @@ def test_k2_verdict_settles_true_only_after_a_successful_real_call(r: SubTestRes
         C.execute_compiled(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"],
                            used_builtins=used)
         assert calls["n"] == 1, f"expected the compiled callable invoked once, got {calls['n']}"
-        verdict = FC.verdict(fp)
+        verdict = FC.verdict(fp, "cpu", "fp32")
         assert verdict is True, f"expected the verdict to settle True, got {verdict!r}"
         r.ok("K2: a genuinely working artifact still settles True after its real call")
     except Exception as e:
@@ -249,4 +250,68 @@ def test_k2_verdict_settles_true_only_after_a_successful_real_call(r: SubTestRes
         C._compiled_cache.pop(cache_key, None)
         C._verify_state.pop(cache_key, None)
         C._route_memo.pop(fp, None)
+        FC.reset_for_test()
+
+
+# ── K3: fncalls_compile's memo was keyed by bare fingerprint alone -- but whether a real
+# compile succeeds is device/precision-dependent (a CPU-inductor-needs-MSVC-always-fails
+# fingerprint says nothing about the SAME program on CUDA). Fix: widen the key to
+# (fingerprint, device_type, precision), mirroring compiled.py's own cache_key. ──────────
+
+def test_k3_memo_key_distinguishes_device_and_precision(r: SubTestResult):
+    """RED against the pre-K3 bare-fingerprint key: a fingerprint resolved False on one
+    (device, precision) must NOT settle the verdict for the SAME fingerprint on a
+    different (device, precision) -- each combination gets its own real attempt."""
+    print("\n--- K3: the memo key distinguishes device_type/precision, not fingerprint alone ---")
+    fp = "k3_test_fp"
+    FC.reset_for_test()
+    try:
+        assert FC.begin_attempt(fp, "cpu", "fp32") is True, (
+            "the first attempt for (fp, cpu, fp32) must be granted")
+        FC.resolve_attempt(fp, "cpu", "fp32", None)   # settles (fp, cpu, fp32) -> False
+        assert FC.verdict(fp, "cpu", "fp32") is False
+        # A DIFFERENT device for the SAME fingerprint must be a fresh, unresolved key --
+        # not silently inheriting the cpu/fp32 verdict.
+        assert FC.verdict(fp, "cuda", "fp32") is None, (
+            "a (fp, cuda, fp32) query must not inherit (fp, cpu, fp32)'s settled verdict")
+        assert FC.begin_attempt(fp, "cuda", "fp32") is True, (
+            "(fp, cuda, fp32) must still be grantable -- it is a distinct key")
+        FC.resolve_attempt(fp, "cuda", "fp32", "inductor")   # settles True
+        assert FC.verdict(fp, "cuda", "fp32") is True
+        assert FC.verdict(fp, "cpu", "fp32") is False, (
+            "resolving the cuda/fp32 key must not disturb the already-settled cpu/fp32 one")
+        # Same device, different precision: also a distinct key.
+        assert FC.verdict(fp, "cpu", "fp16") is None
+        r.ok("K3: (fingerprint, device_type, precision) are three independently "
+             "resolvable keys for the same fingerprint")
+    except Exception as e:
+        r.fail("K3 memo key widened", f"{type(e).__name__}: {e}")
+    finally:
+        FC.reset_for_test()
+
+
+def test_k3_persistence_round_trips_the_composite_key(r: SubTestResult):
+    """The composite key must still round-trip through `snapshot_items()`/
+    `adopt_persisted()` (what `warm_state.py` reads/writes) as a flat string -> bool
+    map -- K3 must not turn this into a tuple that breaks JSON persistence."""
+    print("\n--- K3: the composite key persists as a flat string, not a tuple ---")
+    fp = "k3_persist_fp"
+    FC.reset_for_test()
+    try:
+        FC.begin_attempt(fp, "cpu", "fp32")
+        FC.resolve_attempt(fp, "cpu", "fp32", "inductor")
+        items = FC.snapshot_items()
+        assert all(isinstance(k, str) for k in items), (
+            f"snapshot_items() must yield string keys (JSON-safe), got {list(items)!r}")
+        key = FC._key(fp, "cpu", "fp32")
+        assert items.get(key) is True
+        FC.reset_for_test()
+        FC.adopt_persisted(key, True)
+        assert FC.verdict(fp, "cpu", "fp32") is True, (
+            "adopt_persisted() must restore the verdict under the same composite key "
+            "snapshot_items() emitted")
+        r.ok("K3: the composite key round-trips as a flat, JSON-safe string")
+    except Exception as e:
+        r.fail("K3 composite key persistence", f"{type(e).__name__}: {e}")
+    finally:
         FC.reset_for_test()

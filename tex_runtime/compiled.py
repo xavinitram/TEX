@@ -645,8 +645,8 @@ def execute_compiled(
                         # there is no real invocation to wait for; settle here.
                         # COMPILETRY-50: a no-op unless `fingerprint` was actually
                         # granted the one remembered fall-through attempt (see
-                        # `_try_compile`).
-                        fncalls_compile.resolve_attempt(fingerprint, None)
+                        # `_try_compile`). K3: the memo key also carries device/precision.
+                        fncalls_compile.resolve_attempt(fingerprint, device_type, precision, None)
                         # No backend available — run plain interpreter here
                         return _plain_execute(program, contiguous_bindings, type_map,
                                               device, latent_channel_count, output_names,
@@ -689,9 +689,10 @@ def execute_compiled(
                                              device, latent_channel_count, output_names,
                                              scale=scale)
                     except Exception:
-                        fncalls_compile.resolve_attempt(fingerprint, None)
+                        fncalls_compile.resolve_attempt(fingerprint, device_type, precision, None)
                         raise
-                    fncalls_compile.resolve_attempt(fingerprint, entry_backend)
+                    fncalls_compile.resolve_attempt(fingerprint, device_type, precision,
+                                                    entry_backend)
                     return result
 
                 compiled_fn, _entry_backend = _compiled_cache[cache_key]
@@ -1010,7 +1011,7 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
             fnc_backend = None   # a warm_call crash after a successful wrap is still a fail
             return "failed"
         finally:
-            fncalls_compile.resolve_attempt(fingerprint, fnc_backend)
+            fncalls_compile.resolve_attempt(fingerprint, device_type, precision, fnc_backend)
 
     # C1 (B1#1): route to the DEDICATED `_WARM_POOL` whenever a `warm_call` is given —
     # the only case with a potentially SLOW (10-30s) step — so it never shares a worker
@@ -1757,8 +1758,9 @@ def _try_compile(
     # fingerprint gets ONE real fall-through attempt, remembered + persisted (warm_state),
     # so a resolved-False/pending fingerprint still takes the same codegen-only path below.
     if getattr(cg_fn, '_has_fn_calls', False):
-        fnc_verdict = fncalls_compile.verdict(fingerprint)
-        attempting = fnc_verdict is not True and fncalls_compile.begin_attempt(fingerprint)
+        fnc_verdict = fncalls_compile.verdict(fingerprint, device_type, precision)
+        attempting = (fnc_verdict is not True
+                     and fncalls_compile.begin_attempt(fingerprint, device_type, precision))
         if fnc_verdict is not True and not attempting:
             if fnc_verdict is False:
                 tier_trace.record("codegen", fallback_from="torch_compile",

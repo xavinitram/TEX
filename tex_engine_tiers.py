@@ -654,7 +654,8 @@ def _stencil_route_would_apply(code: str, binding_types: dict | None) -> bool | 
         return None
 
 
-def _torch_compile_graph_break(code: str, binding_types: dict | None) -> bool | None:
+def _torch_compile_graph_break(code: str, binding_types: dict | None,
+                               device_type: str = "cpu", precision: str = "fp32") -> bool | None:
     """FIX-SCALECX X1 (B2#1), COMPILETRY-50 (D1): best-effort, read-only mirror of the
     gate `_try_compile` itself checks before attempting real Inductor tracing --
     "codegen has a non-inlined stdlib call" (`_has_fn_calls`,
@@ -679,7 +680,14 @@ def _torch_compile_graph_break(code: str, binding_types: dict | None) -> bool | 
     more accurate of the two guesses, not merely the safe one. A `False`/`None` answer is
     never wrong about pixel correctness -- only potentially optimistic about which tier is
     named, the same "supply binding_types for a precise answer" contract
-    `_stencil_route_would_apply` already documents."""
+    `_stencil_route_would_apply` already documents.
+
+    `device_type`/`precision` (K3, v0.50.0 Phase C, R4 F3): the memo this function mirrors
+    is keyed by (fingerprint, device_type, precision), not fingerprint alone -- whether a
+    real compile succeeds is exactly as device/precision-dependent as `compiled.py`'s own
+    cache key. Defaulting to `"cpu"`/`"fp32"` keeps every existing caller (none of which
+    passed these before K3) answering exactly as before for the common case; a caller that
+    wants a precise answer for a CUDA or fp16 query now passes them."""
     try:
         fp, ast, type_map = _compile_for_query(code, binding_types)
         from .tex_runtime.compiled import _get_or_make_codegen_fn
@@ -689,7 +697,7 @@ def _torch_compile_graph_break(code: str, binding_types: dict | None) -> bool | 
             return None  # codegen itself declines -- a different, unmodelled decline shape
         if not getattr(cg_fn, "_has_fn_calls", False):
             return False
-        verdict = _fncalls_compile.verdict(fp)
+        verdict = _fncalls_compile.verdict(fp, device_type, precision)
         if verdict is True:
             return False   # a prior attempt on THIS fingerprint proved it compiles for real
         if verdict is False:
@@ -724,17 +732,22 @@ def _cuda_graph_would_capture(code: str, binding_types: dict | None) -> bool | N
         return None
 
 
-def _real_compiled_dispatch(tier_id: str, code: str,
-                            binding_types: dict | None) -> tuple[str, str | None]:
+def _real_compiled_dispatch(tier_id: str, code: str, binding_types: dict | None,
+                            device_type: str = "cpu",
+                            precision: str = "fp32") -> tuple[str, str | None]:
     """FIX-SCALECX X1: corrects a SELECTED `torch_compile`/`auto`/`cuda_graph` `tier_id`
     to the tier the real dispatch (`_run_tier`) actually executes on, reusing the SAME
     predicates `_try_compile`/`run_graphed` themselves check (no parallel judgement) --
     the two helpers above. Called from BOTH of `tier_verdict`'s scale-active and
     scale-inactive branches, so the correction can never drift between them. Returns
     `(tier, reason)` when a correction applies, or `(tier_id, None)` when neither
-    predicate fires (the caller reports its own scale-appropriate reason unchanged)."""
+    predicate fires (the caller reports its own scale-appropriate reason unchanged).
+
+    `device_type`/`precision` (K3): forwarded to `_torch_compile_graph_break`'s own
+    composite-key query; `_cuda_graph_would_capture`'s gate is box/px-independent AST-only
+    (see its own docstring) and does not need them."""
     if tier_id in ("torch_compile", "auto"):
-        if _torch_compile_graph_break(code, binding_types):
+        if _torch_compile_graph_break(code, binding_types, device_type, precision):
             return "codegen", TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
     elif tier_id == "cuda_graph":
         if _cuda_graph_would_capture(code, binding_types) is False:
@@ -808,6 +821,7 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
         return TierVerdict(None, TIER_REASON_SCALE_UNSAFE, False, None)
 
     eff_precision = "fp32" if precision is None else precision
+    _device_type = torch.device(device).type  # K3: mirror compiled.py's own cache-key normalization
     tier_id = select_tier(compile_mode, device, fused_chain, fused_fp_present)
 
     roi_armed = False
@@ -841,7 +855,8 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
         # `select_tier`'s own choice (B2#1) -- `_real_compiled_dispatch` names the tier
         # that actually runs, not merely the one `select_tier` picked.
         if tier_id in ("torch_compile", "auto", "cuda_graph"):
-            real_tier, override_reason = _real_compiled_dispatch(tier_id, code, binding_types)
+            real_tier, override_reason = _real_compiled_dispatch(
+                tier_id, code, binding_types, _device_type, eff_precision)
             return TierVerdict(real_tier, override_reason or TIER_REASON_SCALE_ACTIVE_COMPILED,
                                roi_armed, roi_reason)
         return TierVerdict("interpreter", TIER_REASON_SCALE_ACTIVE, roi_armed, roi_reason)
@@ -849,6 +864,7 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
     # a plain (non-scale-active) cook selecting torch_compile/auto/cuda_graph is just as
     # mispredicted by tier_id alone. Route through the identical correction.
     if tier_id in ("torch_compile", "auto", "cuda_graph"):
-        real_tier, override_reason = _real_compiled_dispatch(tier_id, code, binding_types)
+        real_tier, override_reason = _real_compiled_dispatch(
+                tier_id, code, binding_types, _device_type, eff_precision)
         return TierVerdict(real_tier, override_reason or TIER_REASON_SELECTED, roi_armed, roi_reason)
     return TierVerdict(tier_id, TIER_REASON_SELECTED, roi_armed, roi_reason)
