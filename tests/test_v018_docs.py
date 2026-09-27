@@ -303,6 +303,13 @@ _NOT_A_CACHE = {
                                              "only); SPLIT-47 moved this out of `compiled.py`",
     "compiled._bg_futures": "in-flight background-compile futures, owned by the single "
                             "max_workers=1 worker and drained, not looked up",
+    "compiled._codegen_inflight": "W1 (FIX-WARM): a per-fingerprint IN-FLIGHT MARKER (a "
+                                  "threading.Event) that exists only while a codegen emission "
+                                  "for that fingerprint is actively running, popped the moment "
+                                  "the leader stores its result -- coordination state so a "
+                                  "second caller waits instead of re-emitting, not a cache of "
+                                  "any value (the codegen fn itself is TEXCache's job); empty "
+                                  "in the ordinary single-threaded case",
     # ── Observability: bounded rings and accumulators of MEASUREMENTS. ──
     "tier_trace._ring": "bounded tier-decision trace ring (diagnostics; oldest dropped)",
     "tier_trace._noise_ring": "bounded noise-tier trace ring (diagnostics)",
