@@ -5,6 +5,50 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.1] - 2026-09-27 — "Off the thread, off the GIL"
+
+A patch release, answering an embedding host's own re-pin finding against `v0.48.0`. No
+`LANGUAGE_VERSION` move, no default moved, no new reserved name, no ComfyUI pixel change.
+
+### Fixed
+
+- **`tex_api.prewarm_async()`'s background compile-warm step ran on a thread in the caller's
+  own process and held the GIL, so it did not actually keep a host's own thread free.**
+  `v0.48.0`'s `prewarm_async()` submitted `prewarm()`'s whole body to its background pool, but
+  that pool is a plain in-process daemon thread — the background `torch.compile` step it fires
+  shares this process's GIL with the caller regardless of which thread submitted it. Measured
+  (RTX 2080 SUPER, cold on-disk Triton/Inductor caches): a concurrent thread's longest gap
+  during that step was 135.8 ms — bounded by the mechanisms the step happens to call through
+  (subprocess waits inside a one-time MSVC toolchain probe, CUDA driver calls), not by any
+  guarantee. An embedding host reported roughly 11 s on a newer GPU generation under the same
+  mechanism; that figure is the host's own reading, not independently measured here.
+  `prewarm_async()` now runs that step in a dedicated child process (eligible programs only —
+  a plain `TEXType` binding map; every other `prewarm()` caller, and any ineligible program's
+  own warm, is unaffected and keeps the exact prior mechanism). The same measurement now shows
+  a longest gap of roughly 4.5 ms, bounded by the caller's own polling interval rather than by
+  anything inside the compile; a real cook of the same programs immediately after warming is
+  unchanged either way, 51-80 ms. The trade: the child process itself costs on the order of 2 s
+  of start-up inside the async job (never waited on by the caller), and holds roughly 380 MB of
+  VRAM in its own separate CUDA context for as long as it runs.
+
+### Correction
+
+- **`v0.48.0`'s own correction of the `"auto"` tier's cold-start reading was itself
+  incomplete.** Its "~13 ms total across 10 distinct programs" figure measured only
+  `prewarm()`'s parse/typecheck/emit/disk-persist loop, which is genuinely that cheap — it did
+  not measure the background `torch.compile` step's own execution, which runs asynchronously
+  and was never drained before that measurement concluded. That step is the one this release
+  fixes above.
+
+### Known — not fixed here
+
+- **`compile_mode="auto"` can still compile on the cook thread itself, not just on a
+  `prewarm`/`prewarm_async` warm-ahead call.** Once a program has been cooked enough times to
+  be promoted past its measuring stage and reaches a cache hit for a compiled tier, a real cook
+  can pay a synchronous, GIL-holding first invocation of the freshly-compiled callable — a
+  distinct mechanism from the one this release isolates, and one this release does not touch.
+  Planned for a later minor.
+
 ## [0.48.0] - 2026-09-27 — "Per-argument, not per-function"
 
 A minor release, author-approved. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no compat freeze
