@@ -1371,7 +1371,8 @@ def _is_string_type(t) -> bool:
 
 
 def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp32",
-            compile_mode: str = "auto", cancel: "CancelToken | None" = None) -> dict:
+            compile_mode: str = "auto", cancel: "CancelToken | None" = None,
+            bg_compile_mode: str = "thread") -> dict:
     """CACHE-3: warm the compile/codegen tiers for a set of programs so the first scrub after
     a project load / relaunch replays instead of trialling ("first scrub doesn't jank").
 
@@ -1392,7 +1393,27 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
     a cancelled prewarm never raises: every program already warmed keeps its (already-persisted)
     verdict, warming is pure best-effort optimization by contract, and the caller gets its usual
     summary dict back with `summary["cancelled"]` set to how many programs were skipped — never
-    `CookCancelled`, which would break every existing caller that does not expect one."""
+    `CookCancelled`, which would break every existing caller that does not expect one.
+
+    `bg_compile_mode` (PREWARM-481, keyword-only, default `"thread"`): how step 2's background
+    `torch.compile` warm-up runs. `"thread"` is the ORIGINAL, UNCHANGED mechanism —
+    `compiled._submit_bg_compile` fire-and-forgets onto `_COMPILE_POOL`, a plain in-process
+    daemon thread that shares this process's GIL with everything else, including a host's UI
+    thread. `"subprocess"` (used ONLY by `prewarm_async()`, below — never the default here, so
+    every OTHER existing caller of `prewarm()` keeps the exact `"thread"` behavior it always
+    had) instead batches every eligible program (one whose `binding_types` are all plain
+    `TEXType` values — anything else, e.g. an array type, falls back to `"thread"` for that one
+    program rather than teach this boundary a new serialization) and warms them in ONE child
+    process (`tex_runtime.prewarm_worker`) that shares no GIL with this process at all. The
+    child populates the SAME on-disk caches (`TEX_CACHE_DIR`'s `.cg` sidecar, `warm_state.json`,
+    and PyTorch/Triton's own on-disk kernel caches, all inherited via environment, never
+    special-cased here) a `"thread"`-mode warm would have — so a later real cook in THIS process
+    still finds a warm on-disk cache, byte-identical to an un-warmed cook's own output
+    (invariant 7). What does NOT cross the process boundary is the in-memory
+    `compiled._compiled_cache` entry itself (not picklable, and not the point): a program warmed
+    via `"subprocess"` still pays its own (comparatively cheap) Dynamo trace on this process's
+    first real cook, same as `"thread"` mode's own cold-in-THIS-process case for a program the
+    warm never reached."""
     import torch
     from .tex_cache import get_cache
     from .tex_runtime import compiled, graphed, warm_state
@@ -1402,6 +1423,7 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
     summary = {"programs": 0, "codegen": 0, "bg_compile": 0, "capturable": 0, "errors": 0,
                "cancelled": 0}
     programs = list(programs)
+    _subprocess_jobs: list = []   # PREWARM-481: (source, {name: value}, fingerprint) triples
     for i, (source, binding_types) in enumerate(programs):
         try:
             _cancel_check(cancel)   # HOSTAUDIT-2 yield: abort a stale prewarm between programs
@@ -1428,10 +1450,27 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
                     # and never during a CUDA-graph capture. A mid-session prewarm must not queue
                     # compiles that starve a live cook or collide with an in-flight capture.
                     if compiled._cuda_headroom_ok(device) and not compiled._capture_in_flight():
-                        ck = (fp, dev_type, precision)
-                        if compiled._submit_bg_compile(ck, prog.ast, prog.type_map, dev_type,
-                                                       prog.used_builtins, precision, fp):
-                            summary["bg_compile"] += 1
+                        # PREWARM-481: an eligible program (plain-TEXType bindings only) under
+                        # bg_compile_mode="subprocess" is queued for the ONE batched child-process
+                        # warm after this loop, instead of `_submit_bg_compile`'s in-process pool —
+                        # see the docstring above. Anything not eligible keeps the original
+                        # "thread" mechanism, unchanged, so this never trades a working warm for
+                        # a silently-skipped one.
+                        from .tex_compiler.types import TEXType as _TEXType
+                        eligible = (bg_compile_mode == "subprocess"
+                                    and all(isinstance(v, _TEXType) for v in binding_types.values()))
+                        if eligible:
+                            _subprocess_jobs.append((source, {k: v.value for k, v in
+                                                              binding_types.items()}, fp))
+                            # Counted into summary["bg_compile"] after the batched child
+                            # completes (below) -- from the child's OWN report, not assumed
+                            # here, so a job the child's process fails to warm is not
+                            # double-counted as a success.
+                        else:
+                            ck = (fp, dev_type, precision)
+                            if compiled._submit_bg_compile(ck, prog.ast, prog.type_map, dev_type,
+                                                           prog.used_builtins, precision, fp):
+                                summary["bg_compile"] += 1
                 except Exception:
                     pass
             if dev_type == "cuda":
@@ -1443,6 +1482,23 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
         except Exception:
             summary["errors"] += 1
             continue
+    if _subprocess_jobs:
+        # PREWARM-481: ONE batched child-process warm for every job the loop above deferred.
+        # This BLOCKS this call until the child exits -- fine here: `prewarm()` itself is only
+        # ever run off the calling thread via `prewarm_async()`'s dedicated pool (or, for a
+        # direct `prewarm()` caller, on whatever thread that caller chose), and a blocking
+        # blocking wait for a child process to exit releases the GIL for its whole duration,
+        # unlike the in-process "thread" mechanism it replaces for these jobs. Best-effort,
+        # like every other step here: a child that crashes or
+        # times out counts as zero warmed, never raises.
+        try:
+            from .tex_runtime import prewarm_worker
+            result = prewarm_worker.warm_in_subprocess(
+                _subprocess_jobs, device=device, precision=precision,
+                compile_mode=compile_mode)
+            summary["bg_compile"] += min(result.get("bg_compile", 0), len(_subprocess_jobs))
+        except Exception:
+            pass
     warm_state.persist(force=True)
     return summary
 
@@ -1550,6 +1606,18 @@ def prewarm_async(programs, shapes=None, *, device: str = "cuda", precision: str
     a host actually calling `prewarm_async()`, an opt-in path a default ComfyUI cook never
     reaches.
 
+    PREWARM-481: this call now passes `bg_compile_mode="subprocess"` into `prewarm()` --
+    `prewarm()`'s OWN default (`"thread"`) is UNCHANGED for every other caller (an embedding
+    host's own synchronous queue-prewarm included). Measured (RTX 2080 SUPER sm_75): the
+    "thread" mechanism's background `torch.compile` step
+    (`compiled._submit_bg_compile` -> `_COMPILE_POOL`) is a plain in-process daemon thread --
+    it shares this process's GIL with `prewarm_async()`'s CALLER, so a host UI thread that
+    ticks on its own timer stalls behind it exactly as if it had called the blocking
+    `prewarm()` itself, defeating the "off the cook thread" contract this hook exists for. The
+    child process this now runs in shares no GIL with the caller at all; a slow/first-ever
+    compile there costs this call nothing beyond the wait for that child to exit, which is a
+    GIL-releasing wait like any other I/O wait.
+
     `programs`/`shapes`/`device`/`precision`/`compile_mode` are exactly `prewarm()`'s own
     parameters, forwarded unchanged. `cancel` is layered under an internal token
     (`_CompositeCancelToken`) so `PrewarmHandle.cancel()` always has a lever, whether or
@@ -1559,5 +1627,5 @@ def prewarm_async(programs, shapes=None, *, device: str = "cuda", precision: str
     pool = _get_prewarm_pool()
     future = pool.submit(lambda: prewarm(programs, shapes, device=device,
                                         precision=precision, compile_mode=compile_mode,
-                                        cancel=token))
+                                        cancel=token, bg_compile_mode="subprocess"))
     return PrewarmHandle(future, token)

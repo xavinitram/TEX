@@ -103,7 +103,11 @@ _TIER1_SPEC = {
     'tex_api:compile': ('function', (('source', 'POSITIONAL_OR_KEYWORD', False), ('binding_types', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_api:check': ('function', (('source', 'POSITIONAL_OR_KEYWORD', False), ('binding_types', 'POSITIONAL_OR_KEYWORD', False))),
     'tex_api:color_advisories': ('function', (('source', 'POSITIONAL_OR_KEYWORD', False), ('param_values', 'POSITIONAL_OR_KEYWORD', False), ('binding_meta', 'POSITIONAL_OR_KEYWORD', False))),
-    'tex_api:prewarm': ('function', (('programs', 'POSITIONAL_OR_KEYWORD', False), ('shapes', 'POSITIONAL_OR_KEYWORD', True), ('device', 'KEYWORD_ONLY', True), ('precision', 'KEYWORD_ONLY', True), ('compile_mode', 'KEYWORD_ONLY', True), ('cancel', 'KEYWORD_ONLY', True))),
+    # PREWARM-481 (v0.48.1, post-census): `bg_compile_mode` added, keyword-only, WITH a
+    # default (`"thread"`) -- every existing call site keeps resolving unchanged, so this is
+    # an additive row edit, the same precedent as `ResultCache.spill`/`Program.time_reads`
+    # above.
+    'tex_api:prewarm': ('function', (('programs', 'POSITIONAL_OR_KEYWORD', False), ('shapes', 'POSITIONAL_OR_KEYWORD', True), ('device', 'KEYWORD_ONLY', True), ('precision', 'KEYWORD_ONLY', True), ('compile_mode', 'KEYWORD_ONLY', True), ('cancel', 'KEYWORD_ONLY', True), ('bg_compile_mode', 'KEYWORD_ONLY', True))),
     'tex_api:LANGUAGE_VERSION': ('str', None),
     'tex_api:Program.time_reads': ('frozenset', None),
     'tex_cache:get_cache': ('function', ()),
