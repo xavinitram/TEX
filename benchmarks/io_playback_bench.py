@@ -111,24 +111,40 @@ def measure_overlapped(frames, res, device, in_stall, out_stall, provider, looka
     promises = [Promise(f"f{i}", type=TEXType.VEC4) for i in range(frames)]
     writes = _queue.Queue()
     stop = threading.Event()
+    # G2 (FIX-GATE, B4#5): a genuine bug in `_write`/the fetch call must surface at the
+    # join point below, not vanish -- previously an exception here killed the thread almost
+    # immediately, `is_alive()` read False well within the join timeout, and the hard-fail
+    # check (which only detects a HUNG thread) found nothing wrong: `elapsed`/`hidden_frac`
+    # were then computed from a run that silently did not do what this function thinks it
+    # did, with no error, warning, or nonzero exit code anywhere.
+    writer_error: dict = {}
+    fetcher_error: dict = {}
 
     def fetcher():
-        for i in range(frames):
-            if stop.is_set():
-                return
-            try:
-                promises[i].land(tex_provider.materialize("plate", float(i), "fetch"))
-            except Exception as e:                        # a dead source fails its cook
-                promises[i].fail(e)
+        try:
+            for i in range(frames):
+                if stop.is_set():
+                    return
+                try:
+                    promises[i].land(tex_provider.materialize("plate", float(i), "fetch"))
+                except Exception as e:                        # a dead source fails its cook
+                    promises[i].fail(e)
+        except Exception as exc:
+            fetcher_error["exc"] = exc
+            stop.set()
 
     def writer():
         done = 0
-        while done < frames and not stop.is_set():
-            item = writes.get()
-            if item is None:
-                return
-            _write(item, out_stall)
-            done += 1
+        try:
+            while done < frames and not stop.is_set():
+                item = writes.get()
+                if item is None:
+                    return
+                _write(item, out_stall)
+                done += 1
+        except Exception as exc:
+            writer_error["exc"] = exc
+            stop.set()   # let the fetcher stop too rather than fetch frames nobody will write
 
     t0 = time.perf_counter()
     tf = threading.Thread(target=fetcher, daemon=True)
@@ -162,6 +178,12 @@ def measure_overlapped(frames, res, device, in_stall, out_stall, provider, looka
             f"after their join timeouts -- a background thread failed to finish in bounded "
             f"time; this result cannot be trusted and would otherwise silently corrupt "
             f"whatever measurement runs next in this process.")
+    if writer_error.get("exc") is not None or fetcher_error.get("exc") is not None:
+        exc = writer_error.get("exc") or fetcher_error.get("exc")
+        raise RuntimeError(
+            f"measure_overlapped: writer_error={writer_error.get('exc')!r} "
+            f"fetcher_error={fetcher_error.get('exc')!r} -- a background thread crashed "
+            f"instead of finishing normally; `elapsed` from this run cannot be trusted.") from exc
     q.close()
     return elapsed, q
 

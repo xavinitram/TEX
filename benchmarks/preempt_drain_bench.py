@@ -155,6 +155,18 @@ class BackgroundCookHungError(RuntimeError):
     calibrated runtime is a hard failure to surface, never a silent continue."""
 
 
+class BackgroundCookCrashedError(RuntimeError):
+    """FIX-GATE G2 (v0.47.0 Phase C, B4#5): raised when a benchmark's background cook
+    thread raised something OTHER than `CookCancelled` -- the sibling gap
+    `BackgroundCookHungError` above does not cover. A hang is caught by the join-timeout
+    check; a genuine bug in the cook path is not a hang at all -- the thread dies almost
+    immediately (Python prints "Exception in thread ..." to stderr and the thread simply
+    ends), so `is_alive()` reads `False` well within the timeout and, before this fix,
+    nothing downstream ever learned the trial did not do what the benchmark thinks it did.
+    Worse than a hang: a hang at least stops the run, this produced a plausible-looking but
+    corrupted number with no error, warning, or nonzero exit code anywhere."""
+
+
 def _start_background_cook(fn):
     """Start *fn* on a DAEMON thread (so a hang here can never keep the interpreter alive
     at process shutdown -- the other half of the fix) and return the thread."""
@@ -163,16 +175,28 @@ def _start_background_cook(fn):
     return th
 
 
-def _reap_background_cook(th, timeout, context):
+def _reap_background_cook(th, timeout, context, error_box=None):
     """Join *th* and raise `BackgroundCookHungError` if it is still alive afterward,
     instead of the previous silent `continue` -- a hung background cook is a benchmark
-    result nobody can trust, not a trial to skip quietly."""
+    result nobody can trust, not a trial to skip quietly.
+
+    G2 (FIX-GATE, B4#5): *error_box*, when given, is the SAME dict a `_bg()` closure's
+    `except Exception as exc: error_box["exc"] = exc` stores into -- checked AFTER the
+    hang check (a thread that is both still alive AND recorded an error reports the hang,
+    the more actionable of the two), and re-raised here as `BackgroundCookCrashedError`
+    so a genuine cook-path bug surfaces at the reap point instead of reading as a clean,
+    on-time finish."""
     th.join(timeout=timeout)
     if th.is_alive():
         raise BackgroundCookHungError(
             f"{context}: the background cook thread was still alive after a "
             f"{timeout:.2f}s join timeout -- it neither finished nor raised "
             f"CookCancelled in bounded time.")
+    if error_box is not None and error_box.get("exc") is not None:
+        exc = error_box["exc"]
+        raise BackgroundCookCrashedError(
+            f"{context}: the background cook thread raised {exc!r} instead of finishing "
+            f"or raising CookCancelled -- this trial's result cannot be trusted.") from exc
 
 
 def _box_note():
@@ -253,13 +277,15 @@ def drain_on_preempt(depths, trials, full_runtime, seed0=3000):
             tok = _TripToken(delay, d)
             bg_seed = seed0 + i
             bg_done = threading.Event()
-            bg_result = {}
+            bg_error: dict = {}   # G2 (FIX-GATE, B4#5): filled iff `_bg()` raises for real
 
             def _bg():
                 try:
                     tex_engine.cook(_HEAVY, _heavy_bindings(bg_seed), device_mode="cuda", cancel=tok)
                 except CookCancelled:
                     pass
+                except Exception as exc:
+                    bg_error["exc"] = exc
                 finally:
                     bg_done.set()
 
@@ -277,7 +303,8 @@ def drain_on_preempt(depths, trials, full_runtime, seed0=3000):
             drained_ms.append((t2 - t0) * 1000)
             _reap_background_cook(th, full_runtime * 2 + 2,
                                    f"drain_on_preempt depth={d} trial={i} "
-                                   f"delay_s={delay:.4f} full_runtime_s={full_runtime:.4f}")
+                                   f"delay_s={delay:.4f} full_runtime_s={full_runtime:.4f}",
+                                   error_box=bg_error)
             torch.cuda.synchronize()
 
         out[d] = {
@@ -325,12 +352,15 @@ def stream_priority(trials, full_runtime, seed0=5000):
         tok.pace = False  # this experiment is about UNPACED background cooks specifically
         seed = seed0 + i
         bg_done = threading.Event()
+        bg_error: dict = {}   # G2 (FIX-GATE, B4#5): filled iff `_bg()` raises for real
 
         def _bg():
             try:
                 tex_engine.cook(_HEAVY, _heavy_bindings(seed), device_mode="cuda", cancel=tok)
             except CookCancelled:
                 pass
+            except Exception as exc:
+                bg_error["exc"] = exc
             finally:
                 bg_done.set()
 
@@ -348,7 +378,8 @@ def stream_priority(trials, full_runtime, seed0=5000):
             res.done.synchronize()
         t1 = time.perf_counter()
         results["high_priority_stream" if use_high else "default_stream"].append((t1 - t0) * 1000)
-        _reap_background_cook(th, full_runtime * 2 + 2, f"stream_priority trial={i}")
+        _reap_background_cook(th, full_runtime * 2 + 2, f"stream_priority trial={i}",
+                              error_box=bg_error)
         torch.cuda.synchronize()
 
     out = {}
@@ -474,6 +505,7 @@ def sweep_drain_on_preempt(code, size, depth, stride_ms, trials, full_runtime, s
         tok = _SweepTripToken(depth, stride_ms, frac)
         bg_seed = seed0 + i
         bg_done = threading.Event()
+        bg_error: dict = {}   # G2 (FIX-GATE, B4#5): filled iff `_bg()` raises for real
 
         def _bg():
             try:
@@ -481,6 +513,8 @@ def sweep_drain_on_preempt(code, size, depth, stride_ms, trials, full_runtime, s
                                  cancel=tok, on_progress=tok.on_progress)
             except CookCancelled:
                 pass
+            except Exception as exc:
+                bg_error["exc"] = exc
             finally:
                 bg_done.set()
 
@@ -498,7 +532,8 @@ def sweep_drain_on_preempt(code, size, depth, stride_ms, trials, full_runtime, s
         drained_ms.append((t2 - t0) * 1000)
         _reap_background_cook(th, full_runtime * 4 + 5,
                                f"sweep_drain_on_preempt depth={depth} stride_ms={stride_ms} "
-                               f"trial={i} trip_frac={frac:.4f}")
+                               f"trial={i} trip_frac={frac:.4f}",
+                               error_box=bg_error)
         torch.cuda.synchronize()
 
     return {
@@ -560,12 +595,15 @@ def sweep_interactive_supersede(shape_name, depth, stride_ms, trials, delay_s, s
         tok = _TripToken(delay_s, depth, stride_ms)
         bg_seed = seed0 + i
         bg_done = threading.Event()
+        bg_error: dict = {}   # G2 (FIX-GATE, B4#5): filled iff `_bg()` raises for real
 
         def _bg():
             try:
                 tex_engine.cook(code, _sized_bindings(size, bg_seed), device_mode="cuda", cancel=tok)
             except CookCancelled:
                 pass
+            except Exception as exc:
+                bg_error["exc"] = exc
             finally:
                 bg_done.set()
 
@@ -583,7 +621,8 @@ def sweep_interactive_supersede(shape_name, depth, stride_ms, trials, delay_s, s
         drained_ms.append((t2 - t0) * 1000)
         _reap_background_cook(th, delay_s + 5,
                                f"sweep_interactive_supersede shape={shape_name} depth={depth} "
-                               f"stride_ms={stride_ms} trial={i}")
+                               f"stride_ms={stride_ms} trial={i}",
+                               error_box=bg_error)
         torch.cuda.synchronize()
 
     return {
