@@ -23,9 +23,26 @@ to the real attempt (`begin_attempt`) and records what its caller observed
 (`resolve_attempt`); it submits nothing itself.
 """
 from __future__ import annotations
+import threading
 from collections import OrderedDict
 
 _MEMO_MAX = 512
+
+# K4 (v0.50.0 Phase C, B3#3): `begin_attempt`'s check-then-add across `_memo`/`_pending`
+# is not atomic on its own -- two separate Python statements, no lock. The SAME
+# fingerprint/device/precision key can reach `_try_compile` from either
+# `execute_compiled`'s `_compile_and_run` (`compiled._COMPILE_POOL`) or
+# `_submit_bg_compile`'s `_compile_and_maybe_warm` (`compiled._WARM_POOL`) -- two
+# independent, genuinely concurrent single-worker pools -- if a workflow mixes
+# `compile_mode` across cooks of the same program, or two nodes share a fingerprint.
+# CPython can switch threads between the `in` check and the `.add()`, so both pools'
+# workers can observe "not yet pending", both add it, and both proceed to call
+# `torch.compile()`/run the real invocation for the SAME key concurrently -- the exact
+# hazard `execute_compiled`'s own comment names (dynamo's C++ TLS is corrupted by a
+# concurrent trace on two threads). Held only across the tiny check-and-set below, never
+# across `_try_compile` itself (that call already runs off this module, on whichever
+# pool's worker granted the attempt).
+_lock = threading.Lock()
 
 #: composite key (see `_key`, below) -> True (a real torch.compile backend was produced) |
 #: False (the whole backend cascade failed) -- terminal once set; never flipped (the
@@ -91,12 +108,19 @@ def begin_attempt(fp: str | None, device_type: str, precision: str) -> bool:
     for a key already resolved, already pending, or a `None` fingerprint -- a program with
     no fingerprint (e.g. an uncached probe call) has no key to remember a verdict against,
     so it keeps today's exact behaviour (the always-safe codegen-only adapter, never
-    attempted) rather than retrying forever with nothing to show for it."""
+    attempted) rather than retrying forever with nothing to show for it.
+
+    K4: the check-then-add is now atomic across every caller (held only across these two
+    lines, never across the caller's own `_try_compile` attempt) -- two pools racing the
+    SAME key can no longer both observe "not yet pending" and both proceed."""
     key = _key(fp, device_type, precision)
-    if key is None or key in _memo or key in _pending:
+    if key is None:
         return False
-    _pending.add(key)
-    return True
+    with _lock:
+        if key in _memo or key in _pending:
+            return False
+        _pending.add(key)
+        return True
 
 
 def resolve_attempt(fp: str | None, device_type: str, precision: str,

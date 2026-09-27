@@ -315,3 +315,59 @@ def test_k3_persistence_round_trips_the_composite_key(r: SubTestResult):
         r.fail("K3 composite key persistence", f"{type(e).__name__}: {e}")
     finally:
         FC.reset_for_test()
+
+
+# ── K4: `begin_attempt`'s check-then-add across `_memo`/`_pending` was two separate
+# statements with no lock -- two pools racing the SAME key could both observe "not yet
+# pending" and both proceed. Fix: hold a lock across the check-and-set. ────────────────
+
+def test_k4_begin_attempt_is_atomic_under_concurrent_callers(r: SubTestResult):
+    """Forces the exact interleaving B3#3 describes: thread A's check (`key in _pending`)
+    is made deliberately slow (standing in for a real thread switch mid-check, the same
+    technique `test_phasec_fixcompile.py`'s C7 row uses for `_ES_CO_MEMO`), and thread B
+    starts while A is still inside its own check. RED against the pre-K4 unlocked
+    check-then-add: both threads observe 'not yet pending' and both get True. GREEN once
+    the check-and-set is atomic: exactly one does."""
+    print("\n--- K4: begin_attempt's check-then-add is atomic across concurrent callers ---")
+    fp = "k4_race_fp"
+    FC.reset_for_test()
+
+    class _SlowContainsSet(set):
+        """A plain set's `__contains__` can't be monkeypatched (it's a read-only slot on
+        the builtin type), so force the race deterministically with a SUBCLASS instead,
+        mirroring test_phasec_fixcompile.py's C7 `_SlowGetDict` technique exactly."""
+
+        def __contains__(self, item):
+            result = set.__contains__(self, item)
+            time.sleep(0.05)   # stands in for a real thread switch mid-check
+            return result
+
+    orig_pending = FC._pending
+    FC._pending = _SlowContainsSet()
+    results = []
+    lock = threading.Lock()
+
+    def worker():
+        got = FC.begin_attempt(fp, "cpu", "fp32")
+        with lock:
+            results.append(got)
+
+    try:
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        time.sleep(0.01)   # ensure t1 is inside its own (slow) __contains__ check first
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        assert len(results) == 2, f"expected 2 results, got {len(results)}"
+        assert sorted(results) == [False, True], (
+            f"expected exactly ONE grant and one refusal, got {results!r} -- both threads "
+            f"observed 'not yet pending' and both were granted the fall-through")
+        r.ok("K4: exactly one of two concurrent callers is granted the fall-through "
+             f"attempt for the same key ({results!r})")
+    except Exception as e:
+        r.fail("K4 begin_attempt atomicity", f"{type(e).__name__}: {e}")
+    finally:
+        FC._pending = orig_pending
+        FC.reset_for_test()
