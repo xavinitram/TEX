@@ -88,6 +88,7 @@ class MaskedEmitMixin:
         self._mf_on = True
         self._mf_depth = 0
         self._mf_decl_depth = {}
+        self._mf_cont_counter = 0
         self._preamble.append(f"    {_STATE} = _MF.CgFlow()")
         self._stmt_dispatch = dict(self._stmt_dispatch)
         self._stmt_dispatch.update({
@@ -172,45 +173,81 @@ class MaskedEmitMixin:
         self._mf_emit_if_else(stmt)
         self._owned.clear()
 
+    def _mf_emit_shared_body(self, stmts, hoist_snap: dict) -> str:
+        """Emit *stmts* into a nested closure ONCE and return the closure's name.
+
+        `_mf_emit_if_else` reaches a branch's statement list from TWO call sites — the
+        uniform (0-dim) dispatch below and `_mf_emit_spatial_if`'s per-pixel dispatch —
+        and an `else if` chain nests the next arm inside `else_body`, so walking the list
+        with `_emit_stmt` at both call sites (the pre-CODEGENT6 shape) recurses into a 2x
+        multiplier PER ARM: an n-arm chain costs O(2^n) emitted text, not O(n) — measured
+        6,593,732 chars / 63,658 lines / 2,051 nested `if`/`else` (6,218 `_emit_stmt` calls)
+        for a twelve-arm uniform-`$param` dispatch (CO187-T6). Emitting the list once, into
+        a `def` both dispatch paths CALL, makes each arm contribute a constant amount of
+        text regardless of how many call sites reach it — the growth becomes O(n).
+
+        This changes nothing the two tiers disagree about: which of `then_body`/`else_body`
+        actually RUNS is still decided at the two call sites (the uniform Python `if`, or
+        the spatial merge's own live-mask narrowing) exactly as before — only the SOURCE
+        TEXT for a given body is now written once. Every read/write inside the closure
+        still routes through the same names as an inline emission would: `_bind`/`_env`
+        are dict mutations (free variables, no declaration needed at any nesting depth),
+        and a env var hoisted to a raw Python local (`self._local_vars`) needs `nonlocal`
+        to write through the closure boundary — see the docstring on
+        `_mf_emit_function_def`'s new pre-declaration for why that is always resolvable."""
+        self._mf_cont_counter += 1
+        fn_name = f"_mfc{self._mf_cont_counter}"
+        env_mods, _bind_mods = self._collect_modified_vars(stmts) if stmts else (set(), set())
+        nonlocal_pyvars = sorted({self._local_vars[n] for n in env_mods if n in self._local_vars})
+        self._emit(f"def {fn_name}():")
+        self._indent += 1
+        if nonlocal_pyvars:
+            self._emit("nonlocal " + ", ".join(nonlocal_pyvars))
+        self._hoisted_bchw = dict(hoist_snap)
+        if stmts:
+            for s in stmts:
+                self._emit_stmt(s)
+        else:
+            self._emit("pass")
+        self._indent -= 1
+        return fn_name
+
     def _mf_emit_if_else(self, stmt: IfElse):
         """A 0-dim condition short-circuits exactly as in `0.23`; a per-pixel condition
         keeps `0.23`'s both-branches-then-merge model and adds the branch live masks.
 
         Both paths are emitted because which one runs is a run-time property of the
-        condition's rank, which is how the `0.23` emitter already handles it."""
+        condition's rank, which is how the `0.23` emitter already handles it. Each body
+        is emitted once, ahead of both paths, via `_mf_emit_shared_body` (CODEGENT6)."""
         cond_expr = self._emit_expr(stmt.condition)
         cond_tmp = self._tmp()
         self._emit(f"{cond_tmp} = {cond_expr}")
         hoist_snap = dict(self._hoisted_bchw)
 
+        then_fn = self._mf_emit_shared_body(stmt.then_body, hoist_snap)
+        else_fn = self._mf_emit_shared_body(stmt.else_body, hoist_snap) if stmt.else_body else None
+
         self._emit(f"if not _torch.is_tensor({cond_tmp}) or {cond_tmp}.dim() == 0:")
         self._indent += 1
         self._emit(f"if float({cond_tmp}) > 0.5:")
         self._indent += 1
-        self._hoisted_bchw = dict(hoist_snap)
-        if stmt.then_body:
-            for s in stmt.then_body:
-                self._emit_stmt(s)
-        else:
-            self._emit("pass")
+        self._emit(f"{then_fn}()")
         self._indent -= 1
-        if stmt.else_body:
+        if else_fn is not None:
             self._emit("else:")
             self._indent += 1
-            self._hoisted_bchw = dict(hoist_snap)
-            for s in stmt.else_body:
-                self._emit_stmt(s)
+            self._emit(f"{else_fn}()")
             self._indent -= 1
         self._indent -= 1
 
         self._emit("else:")
         self._indent += 1
-        self._mf_emit_spatial_if(stmt, cond_tmp, hoist_snap)
+        self._mf_emit_spatial_if(stmt, cond_tmp, then_fn, else_fn)
         self._indent -= 1
         self._hoisted_bchw = hoist_snap
 
     def _mf_emit_spatial_if(self, stmt: IfElse, cond_var: str,
-                            hoist_snap: dict):
+                            then_fn: str, else_fn: str | None):
         saved = self._tmp()
         cm = self._tmp()
         self._emit(f"{saved} = {_STATE}.live")
@@ -237,11 +274,10 @@ class MaskedEmitMixin:
         self._emit(f"{snap_bind} = {{k: _bind[k].clone() if _torch.is_tensor(_bind[k]) "
                    f"else _bind[k] for k in {bind_repr} if k in _bind}}")
 
-        # then-branch, under `live & cond`
+        # then-branch, under `live & cond` — CALLS the closure `_mf_emit_if_else` already
+        # emitted once; the statements themselves are not re-walked here (CODEGENT6).
         self._emit(f"{_STATE}.live = _MF.m_and({saved}, {cm})")
-        self._hoisted_bchw = dict(hoist_snap)
-        for s in stmt.then_body:
-            self._emit_stmt(s)
+        self._emit(f"{then_fn}()")
         then_env = self._tmp()
         self._emit(f"{then_env} = {{" + ", ".join(
             f"{k!r}: {self._mf_read_ref(k, True)}" for k in env_keys) + "}")
@@ -253,13 +289,11 @@ class MaskedEmitMixin:
             self._emit(f"{self._var_target(k)} = {snap[k]}")
         self._emit(f"_bind.update({snap_bind})")
 
-        if stmt.else_body:
+        if else_fn is not None:
             # `m_sub(saved, dead_now())`: a transfer taken in the THEN arm has already
             # left the enclosing region, so those pixels are not offered to the else arm.
             self._emit(f"{_STATE}.live = _MF.m_and(_MF.m_sub({saved}, {_STATE}.dead_now()), ~{cm})")
-            self._hoisted_bchw = dict(hoist_snap)
-            for s in stmt.else_body:
-                self._emit_stmt(s)
+            self._emit(f"{else_fn}()")
             else_env = self._tmp()
             self._emit(f"{else_env} = {{" + ", ".join(
                 f"{k!r}: {self._mf_read_ref(k, True)}" for k in env_keys) + "}")
@@ -531,6 +565,22 @@ class MaskedEmitMixin:
         self._mf_depth = saved_depth + 1
         for _, pname in stmt.params:
             self._mf_decl_depth[pname] = self._mf_depth
+
+        # CODEGENT6: pre-bind every body-local hoisted name directly in THIS function's
+        # own scope (mirrors `emit_program`'s top-level preamble) so a shared continuation
+        # closure (`_mf_emit_shared_body`) nested inside the body — e.g. an `else if`
+        # chain written INSIDE a TEX function — can always `nonlocal` it, even when the
+        # name's only `VarDecl` in the source sits inside the one arm that closure moved
+        # into its own Python scope. Without this, a name Python sees assigned for the
+        # first time only inside that nested `def` cannot be declared `nonlocal` there at
+        # all ("no binding for nonlocal ... found", a SyntaxError) — this fix must not
+        # turn a chain inside a function into a hard compile failure. Harmless: TEX
+        # requires declare-before-use, so nothing ever reads this placeholder before the
+        # variable's own `VarDecl` runs.
+        param_names = {pname for _, pname in stmt.params}
+        for vname in sorted(body_vars):
+            if vname not in param_names:
+                self._emit(f"{self._local_vars[vname]} = None")
 
         frame = self._tmp()
         saved_live = self._tmp()
