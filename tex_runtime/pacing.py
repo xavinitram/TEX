@@ -672,6 +672,24 @@ def save_state() -> dict:
 def restore_state(snapshot: dict) -> None:
     """Undo one `save_state()` — puts every field back exactly as `save_state()` found it,
     including a field an inner cook's `reset()` added that the outer never had (cleared
-    first, so nothing inner-only survives the restore)."""
+    first, so nothing inner-only survives the restore).
+
+    P1 (Phase C, B1#1): `last_confirmed_done` is NEVER restored from the snapshot — it is
+    always cleared instead. `save_state()` copies `_state.__dict__` shallowly: `pool` is
+    the SAME dict object, not a copy, so a same-device NESTED cook (its own `reset()`
+    hands this pool's then-outstanding event to `free`; its own first poll can pop and
+    re-`record()` that very event onto a new point in the stream) can mutate the pool this
+    snapshot points at before this function ever runs. Restoring the snapshot's own
+    `last_confirmed_done` verbatim would then hand the outer cook a cache that still
+    identity-matches an event object whose recorded point has moved since the snapshot was
+    taken — the peek's `tail is _state.last_confirmed_done` check (`paced_check`) cannot
+    tell that apart from a genuine, still-valid confirmation, and would skip recording on
+    identity alone, without ever calling the real `query()` that would say the device has
+    NOT reached the tail's new point. A just-ended nested cook makes no promise it left
+    this pool's bookkeeping the way it found it, so nothing restored through it can be
+    trusted as a confirmation of the CURRENT state — the cache is exactly that, an
+    optimization: reading `None` here costs at most one extra `query()` call on the first
+    poll after a restore, never a wrong answer, whether or not a nested cook actually ran."""
     _state.__dict__.clear()
     _state.__dict__.update(snapshot)
+    _state.last_confirmed_done = None
