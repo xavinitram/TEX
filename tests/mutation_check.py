@@ -57,9 +57,13 @@ VENV = sys.executable
 # docstring: this column is the runner's import list, so it is load-bearing, not annotation.
 MUTATIONS = [
     ("chain_windows: compose FORWARD instead of backward", "tex_roi.py",
-     "    for i in range(n - 2, start - 1, -1):",
-     "    for i in range(start, n - 1):",
+     "    for i in range(n - 2, start - 1, -1):\n        x0, y0, w, h, W, H = out[i + 1]",
+     "    for i in range(start, n - 1):\n        x0, y0, w, h, W, H = out[i + 1]",
      ("test_v032_region",)),
+    ("chain_windows_dag: compose FORWARD instead of backward", "tex_roi.py",
+     "    for i in range(n - 2, start - 1, -1):\n        demand = None",
+     "    for i in range(start, n - 1):\n        demand = None",
+     ("test_join49_dag_windows",)),
     ("chain_windows: grow by the stage's OWN halo, not its consumer's", "tex_roi.py",
      "        pad = int(halos[i + 1])",
      "        pad = int(halos[i])",
