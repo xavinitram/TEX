@@ -376,6 +376,111 @@ def test_lint1_h1_tracker_id_lint_is_not_inert(r: SubTestResult):
              f"{len(must_stay_green)} neighbours stay green")
 
 
+#: I1 (LEAKNAMES-50, v0.50.0 Phase C): a tracked file must never cite the name of one of
+#: this project's own local-only REVIEW-NOTE files -- the per-round findings docs
+#: ("<letter><digit>-<slug>.md", letter R or B, round 1-4), the consolidated summary across
+#: rounds, or the orchestrator's own plural working notes. None of these ship in the
+#: published tree (same law LINT-1's other checks enforce), so a citation to one tells a
+#: public reader a document exists that they can never open -- discovered here the same way
+#: H1 was: a prior gate's grep caught only some of the shapes actually in use. A real regex
+#: for the numbered form, because the slug after the round number is open (any word this
+#: project's own reviews happened to name a round after) -- a hash set could not enumerate
+#: it. The two whole-name literals have no open slug to regex over, so they are matched as
+#: plain substrings, but -- exactly like the host name and bare words above -- assembled
+#: from pieces at call time, never written whole in this file's own source, which is what
+#: keeps this ratchet from firing on itself: a character class can never itself spell one of
+#: the round-note names it matches, and a piece-built literal is never contiguous here either.
+_REVIEW_ROUND_RE = re.compile(r"\b[RB][1-4]-[A-Za-z][A-Za-z0-9_-]*\.md\b")
+_REVIEW_WHOLE_NAMES = (_frag("CONSOLIDATED", ".md"), _frag("orchestrator", "-notes"))
+
+#: Down-only budget: zero, unconditionally, same reasoning as H1's -- every occurrence found
+#: at the moment this landed is a leak to remove, not a debt to grandfather. No concurrent
+#: fix in this same batch owns a file that carries one, so there is no by-name exception to
+#: record here (contrast `_TRACKER_ID_ALLOWLIST` above, which does have one).
+_REVIEW_NOTE_ALLOWLIST: set = set()
+
+
+def scan_review_notes(text: str) -> list:
+    """`[(lineno, token)]` for every review-note-file citation, either the open numbered
+    shape (by regex, since the slug space is open) or one of the two closed whole-name
+    literals (by substring, since neither has an open slug to regex over)."""
+    found = []
+    for n, line in enumerate(text.splitlines(), 1):
+        for m in _REVIEW_ROUND_RE.finditer(line):
+            found.append((n, m.group(0)))
+        for whole in _REVIEW_WHOLE_NAMES:
+            if whole in line:
+                found.append((n, whole))
+    return found
+
+
+def test_lint1_i1_no_tracked_file_names_a_review_note(r: SubTestResult):
+    print("\n--- LINT-1 (I1): no tracked file names a local-only review-note file "
+          "(down-only budget: zero) ---")
+    paths = tracked_paths()
+    if paths is None:
+        r.skip("LINT-1 I1 review-note lint",
+               "this tree is not a git checkout, so the tracked set cannot be enumerated")
+        return
+    hits, scanned = [], 0
+    for rel in paths:
+        if rel in _REVIEW_NOTE_ALLOWLIST:
+            continue
+        p = _PKG / rel
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        scanned += 1
+        found = scan_review_notes(text)
+        hits += [f"{rel}:{n}: names a local-only review-note file — {tok!r}"
+                 for n, tok in found]
+    if hits:
+        r.fail("LINT-1 I1 review-note lint",
+               f"{len(hits)} tracked line(s) name a local-only review-note file; the budget "
+               f"is zero:\n  " + "\n  ".join(hits[:40]))
+        return
+    r.ok(f"{scanned} tracked text file(s) name no local-only review-note file "
+         f"(allowlist: {len(_REVIEW_NOTE_ALLOWLIST)})")
+
+
+def test_lint1_i1_review_note_lint_is_not_inert(r: SubTestResult):
+    print("\n--- LINT-1 (I1): the review-note pattern fires on the real shape, and only on "
+          "it ---")
+    must_red = [
+        "measured this in " + _frag("R3-efficiency", ".md") + " last round.",
+        "the finding lives in " + _frag("B1-roi", ".md") + ", question 5.",
+        "see " + _frag("B4-tests-docs", ".md") + " for the full row.",
+        "check " + _frag("CONSOLIDATED", ".md") + " before touching this again.",
+        "grep the " + _frag("orchestrator", "-notes") + " directory for context.",
+    ]
+    must_stay_green = [
+        "FIX-PACE49 P1 measured a real number on this box.",   # an ask id, not a note file
+        "R3-efficiency was the internal codename, no file involved.",  # no ".md"
+        "B1-roi is a familiar prefix but names nothing here.",  # no ".md"
+        "R5-overflow.md is out of the 1-4 round range.",        # digit out of range
+        "B9-overflow.md is out of the 1-4 round range too.",    # digit out of range
+        "the orchestrator oversees the release end to end.",    # bare "orchestrator"
+        "a consolidated report helps everyone move faster.",    # wrong word, no ".md"
+    ]
+    missed = [w for w in must_red if not scan_review_notes(w)]
+    tripped = [f"{w}  ->  {scan_review_notes(w)[0][1]!r}"
+               for w in must_stay_green if scan_review_notes(w)]
+    if missed:
+        r.fail("LINT-1 I1 review-note witness (inert)",
+               "the review-note pattern did not fire on a real leaked shape:\n  "
+               + "\n  ".join(missed))
+    elif tripped:
+        r.fail("LINT-1 I1 review-note witness (over-tight)",
+               "the review-note pattern fired on an unrelated neighbour:\n  "
+               + "\n  ".join(tripped))
+    else:
+        r.ok(f"{len(must_red)} review-note shapes red, "
+             f"{len(must_stay_green)} neighbours stay green")
+
+
 def test_lint1_the_lint_is_not_inert(r: SubTestResult):
     """The patterns are only worth their runtime if they fire, and fire on the shape and not
     on a neighbour that merely shares some of its pieces. These witnesses are strings built
