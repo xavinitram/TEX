@@ -154,6 +154,131 @@ def test_lint1_no_tracked_file_names_a_local_only_path(r: SubTestResult):
          f"(allowlist: {len(_ALLOWLIST)})")
 
 
+#: G5 (FIX-GATE, v0.47.0 Phase C, R4#4): the leak class the path/host checks above cannot
+#: see is a bare WORD that names no path and no host but still tells a public reader a
+#: local-only process artifact exists (this project's own word for the document a lane
+#: writes back to the orchestrator, built from pieces in `_BAREWORD_HASHES` below and never
+#: spelled contiguously here) or names one of this project's own configured machines (drawn
+#: from the standing box-identity records). Neither is a path, so `_fragments()`'s substring
+#: scan cannot catch either, and `scan_host_name()`'s tokenizer (`\w+`) would itself SPLIT a
+#: hyphenated machine name into two ordinary words and either miss it or flag an innocuous
+#: one. Hashed, exact-case, same technique as the host name above.
+_BAREWORD_RE = re.compile(r"\w+(?:-\w+)*")   # hyphen-aware: a hyphenated compound is ONE token
+
+_BAREWORD_HASHES = frozenset(
+    hashlib.sha256(w.encode("utf-8")).hexdigest()
+    for w in (_frag("hand", "-back"), _frag("xavi", "-pc"), _frag("xavi", "_pc"))
+)
+
+
+def scan_bare_words(text: str) -> list:
+    """`[(lineno, token)]` for every EXACT-CASE word/hyphen-compound token whose sha256
+    lands in `_BAREWORD_HASHES`. `_BAREWORD_RE` (unlike `_WORD_RE` above) treats a
+    hyphen-joined compound as one token, which is what lets it match a hyphenated machine
+    name, or the local-only-artifact word above, as a whole instead of two unrelated
+    ordinary words."""
+    found = []
+    for n, line in enumerate(text.splitlines(), 1):
+        for tok in _BAREWORD_RE.findall(line):
+            if hashlib.sha256(tok.encode("utf-8")).hexdigest() in _BAREWORD_HASHES:
+                found.append((n, tok))
+    return found
+
+
+#: The down-only budget this ratchet INHERITS: every tracked *.py file that already carried
+#: the local-only-artifact word above at the moment this row landed (v0.47.0 Phase C,
+#: FIX-GATE), named explicitly rather than swept behind a blanket allowlist. A file's number
+#: may only move DOWN from here (FIX-PACE's own rewrite of `pacing.py`'s ten occurrences is
+#: exactly that kind of move) -- raising one, or a file absent from this table carrying any
+#: hit at all, is what reds. No machine name has a nonzero budget: none was found in a
+#: tracked *.py file when this landed, so any future one is a leak from day one, not a debt
+#: to inherit.
+_BAREWORD_BUDGET = {
+    "tex_runtime/pacing.py": 10,
+    "tests/test_pace462_bounded_lookahead.py": 2,
+    "tools/gate.py": 1,
+    "tex_runtime/stdlib_core.py": 1,
+    "tex_runtime/graphed.py": 1,
+    "tests/test_v044_cancel44.py": 1,
+    "tests/test_v043_rider_a_capture_pending.py": 1,
+    "tests/test_v040_phase1.py": 1,
+    "tests/test_simp3_skip_budget.py": 1,
+    "tests/test_simp3_consumer_registries.py": 1,
+    "tests/test_seam45_embedding_host_seam.py": 1,
+    "tests/test_pace45_pacing.py": 1,
+    "tests/test_ovh47_device_parse_memo.py": 1,
+    "tests/test_gate47_wallclock_ratchet.py": 1,
+    "tests/test_bench2_counts.py": 1,
+    "benchmarks/preempt_drain_bench.py": 1,
+    "benchmarks/host_path_counts.py": 1,
+    "benchmarks/artist_loops_bench.py": 1,
+}
+
+
+def test_lint1_g5_no_new_bare_word_leak(r: SubTestResult):
+    print("\n--- LINT-1 (G5): no tracked *.py file leaks a hashed bare word beyond its "
+          "inherited down-only budget ---")
+    paths = tracked_paths()
+    if paths is None:
+        r.skip("LINT-1 G5 bare-word budget",
+               "this tree is not a git checkout, so the tracked set cannot be enumerated")
+        return
+    overs, seen = [], 0
+    for rel in paths:
+        if not rel.endswith(".py"):
+            continue
+        p = _PKG / rel
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        hits = scan_bare_words(text)
+        if not hits:
+            continue
+        seen += 1
+        budget = _BAREWORD_BUDGET.get(rel, 0)
+        if len(hits) > budget:
+            lines = [n for n, _ in hits]
+            overs.append(f"{rel}: {len(hits)} occurrence(s) (budget {budget}, lines {lines})")
+    if overs:
+        r.fail("LINT-1 G5 bare-word budget",
+               f"{len(overs)} tracked .py file(s) exceed their down-only bare-word budget "
+               f"-- either a new leak, or a budget that must be lowered on purpose instead:\n  "
+               + "\n  ".join(overs))
+        return
+    r.ok(f"every tracked .py file naming a budgeted bare word stays at or under its budget "
+         f"({seen} file(s) carry one)")
+
+
+def test_lint1_g5_bare_word_lint_is_not_inert(r: SubTestResult):
+    print("\n--- LINT-1 (G5): the bare-word patterns fire on the real shape, and only on it ---")
+    must_red = [
+        "See the " + _frag("hand", "-back") + " for details.",
+        "measured overnight on " + _frag("xavi", "-pc") + ".",
+        "the key file " + _frag("xavi", "_pc") + " lives under ~/.ssh.",
+    ]
+    must_stay_green = [
+        "the courier will hand back the package tomorrow.",  # two ordinary words, no hyphen
+        "back to the drawing board.",                          # bare "back" alone
+        "a hand truck moves the crate.",                        # bare "hand" alone
+        _frag("xavi", "zzz") + " is one token.",               # the fragment is a substring, not a token
+        "the pc tower needs a new fan.",                        # bare "pc" alone
+    ]
+    missed = [w for w in must_red if not scan_bare_words(w)]
+    tripped = [f"{w}  ->  {scan_bare_words(w)[0][1]!r}"
+               for w in must_stay_green if scan_bare_words(w)]
+    if missed:
+        r.fail("LINT-1 G5 bare-word witness (inert)",
+               "the bare-word patterns did not fire on a real shape:\n  " + "\n  ".join(missed))
+    elif tripped:
+        r.fail("LINT-1 G5 bare-word witness (over-tight)",
+               "the bare-word patterns fired on an unrelated neighbour:\n  " + "\n  ".join(tripped))
+    else:
+        r.ok(f"{len(must_red)} bare-word shapes red, {len(must_stay_green)} neighbours stay green")
+
+
 def test_lint1_the_lint_is_not_inert(r: SubTestResult):
     """The patterns are only worth their runtime if they fire, and fire on the shape and not
     on a neighbour that merely shares some of its pieces. These witnesses are strings built

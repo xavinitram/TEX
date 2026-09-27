@@ -75,8 +75,8 @@ def _percentiles(ms: list) -> dict:
     """p50/p95/p99 (nearest-rank), reusing `compile_modes_bench._pctl` (G6, FIX-GATE) rather
     than a second copy of the same formula -- this file already loads that module's sibling
     `host_path_counts`/`preempt_drain_bench`/`io_playback_bench` by path via `_load()` for
-    exactly this reason (R1#3): a "p95" column in the same results table must mean the
-    same arithmetic everywhere it is quoted, not two formulas that happen to agree today."""
+    exactly this reason (R1#3): a "p95" column reported anywhere must mean the same
+    arithmetic everywhere it is quoted, not two formulas that happen to agree today."""
     if not ms:
         return {"p50_ms": None, "p95_ms": None, "p99_ms": None, "n": 0}
     xs = sorted(ms)

@@ -5,9 +5,8 @@ line-for-line reimplementation of `benchmarks/compile_modes_bench._pctl` (same n
 formula: `idx = round(p * (n - 1))`) in a file that already dynamically loads three OTHER
 sibling bench modules (`host_path_counts`, `preempt_drain_bench`, `io_playback_bench`) via
 its own `_load()` helper specifically to avoid re-deriving their logic. Two independent
-percentile formulas under one "p95" label in the same results table is a plausible source
-of a false regression/improvement read -- the exact comparison `artist_loops_bench` exists
-to enable. This pins that `_percentiles` now goes THROUGH `_load("compile_modes_bench", ...)`
+percentile formulas reported under one "p95" label is a plausible source of a false
+regression/improvement read -- the exact comparison `artist_loops_bench` exists to enable. This pins that `_percentiles` now goes THROUGH `_load("compile_modes_bench", ...)`
 and calls its `_pctl`, rather than recomputing the same arithmetic independently.
 """
 import importlib.util
