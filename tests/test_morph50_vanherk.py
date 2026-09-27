@@ -2,14 +2,14 @@
 
 The author's rule (RADIUS-50a-design.md, verbatim): "All blurs and erodes should support
 arbitrarily large radiuses, or if we do set a limit, it should be in the order of 8192px."
-Before this lane, `stdlib_sample._morph` silently substituted `radius=256` for anything
+Before MORPH-50, `stdlib_sample._morph` silently substituted `radius=256` for anything
 larger -- `erode(@mask, 300)` and `erode(@mask, 256)` produced the identical picture, with
 no error and no diagnostic. D1 (recorded 2026-09-27) chose the hybrid: `_MORPH_VANHERK_
 CROSSOVER` (a measured constant, pinned once a real timing sweep confirmed it on this
 implementation) keeps the ORIGINAL iterative 3-window loop, byte-for-byte, at or
 below the crossover -- so the common small-radius case costs exactly what it always did
 (invariant 7) -- and a van Herk/Gil-Werman separable running extremum takes over above it,
-unconditionally uncapped (no clamp of any kind survives this lane; the "or ~8192px" half of
+unconditionally uncapped (no clamp of any kind survives MORPH-50; the "or ~8192px" half of
 the author's rule was not the branch taken, because van Herk makes the unconditional half
 both correct and fast).
 

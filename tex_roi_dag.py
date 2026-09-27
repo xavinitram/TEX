@@ -5,8 +5,8 @@ per-stage reach resolver a real caller needs (JOINWIRE-50).
 Split out of `tex_roi.py` by SPLIT-47's own pattern (a pure move, re-exported at
 `tex_roi`'s own top level so `from .tex_roi import StageSpec`/`chain_windows_dag` and
 every existing test keep resolving unchanged) — `tex_roi.py` was AT its 2000-line hard
-budget (REG-2) before this lane's JOINWIRE-50 addition (`stage_dag_arg_halos`) would
-have pushed it over. `chain_windows`'s own body (in `tex_roi.py`) still calls
+budget (REG-2) before JOINWIRE-50's own `stage_dag_arg_halos` addition would have pushed
+it over. `chain_windows`'s own body (in `tex_roi.py`) still calls
 `_dag_grow` — the ONE shared grow-and-clamp implementation Q3 gave it — via a
 function-local import (the AGENTS.md "Trades to REFUSE" idiom for a load-bearing
 cross-module cycle: this module imports FROM `tex_roi` at its own top level, so
