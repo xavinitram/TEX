@@ -198,7 +198,11 @@ _SKIP_VOCAB = re.compile(
 #: (`test_scalecg48_codegen_interp_parity_cpu_half`/`_quarter`/`_eighth`) already run with no
 #: `r.skip` and no environment dependency, so these three carry no CPU witness for the same
 #: reason every other CUDA-only row in this pin does not have one.
-_SKIP_BUDGET = 123
+#: Re-pinned from 123 to 121 (FIX-TIER T6): the six single-purpose parity functions above
+#: (three CUDA `r.skip` sites) collapsed into one `test_scalecg48_codegen_interp_parity`
+#: looping over `(device, scale)`, with exactly ONE `r.skip` call covering the whole CUDA
+#: side of the loop instead of three separate ones — same coverage, three fewer skip sites.
+_SKIP_BUDGET = 121
 
 
 def _literal(node) -> str:

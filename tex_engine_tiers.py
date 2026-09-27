@@ -496,15 +496,29 @@ TIER_REASON_SCALE_ACTIVE_CODEGEN = "scale-active-codegen-stencil"
 # loop still reports TIER_REASON_SCALE_ACTIVE (interpreter) — see docs/resolution-scale.md.
 TIER_REASON_SELECTED = "tier-selected"              # plain select_tier verdict, scale inactive
 
-# FIX-TIER T1: single-sourced from `tex_roi.roi_eligibility` (the shared ladder), which
-# also computes them — re-exported here under their pre-existing names so every earlier
-# host/test import of `tex_engine_tiers.ROI_REASON_*` keeps resolving unchanged.
-from .tex_roi import (
-    ROI_REASON_TIER_NOT_DEFAULT, ROI_REASON_FUSED_CHAIN, ROI_REASON_LATENT,
-    ROI_REASON_SCALE_ACTIVE, ROI_REASON_NOT_ARMED, ROI_REASON_MALFORMED,
-    ROI_REASON_WHOLE_FRAME, ROI_REASON_NOT_EXECUTABLE, ROI_REASON_PRECISION,
-    ROI_REASON_ARMED,
-)
+# FIX-TIER T1: the DECISION LOGIC these name is single-sourced in `tex_roi.roi_eligibility`
+# (below, `tier_verdict` calls it directly) — but the literal STRING VALUES stay defined
+# here too, byte-identical to `tex_roi`'s own copies, rather than imported from there.
+# `tex_engine.py` re-exports every one of these names at ITS OWN module scope (`from
+# .tex_engine_tiers import ROI_REASON_ARMED, ...`, pre-existing, SPLIT-E's re-export
+# convention), so an eager `from .tex_roi import ROI_REASON_ARMED, ...` HERE would still
+# have pulled `tex_roi` (and its own import graph) into `tex_engine`'s cold-import
+# closure regardless of a lazy resolution at this module's own boundary — caught by
+# `test_hostaudit1_tex_engine_import_module_count_ratchet` (55 -> 56 TEX modules). A
+# plain string literal is not the load-bearing duplication R1/R2 flagged (that was the
+# branch ladder, now single-sourced); `tests/test_tierq48_agreement.py` and this file's
+# own `tier_verdict` both compare live `roi_eligibility(...)`-returned values against
+# these names, so a drift between the two copies would fail immediately, not silently.
+ROI_REASON_TIER_NOT_DEFAULT = "roi-declined-tier-not-default"
+ROI_REASON_FUSED_CHAIN = "roi-declined-fused-chain"
+ROI_REASON_LATENT = "roi-declined-latent-input"
+ROI_REASON_SCALE_ACTIVE = "roi-declined-scale-active"
+ROI_REASON_NOT_ARMED = "roi-declined-not-armed"
+ROI_REASON_MALFORMED = "roi-declined-malformed"
+ROI_REASON_WHOLE_FRAME = "roi-declined-whole-frame"
+ROI_REASON_NOT_EXECUTABLE = "roi-declined-not-executable"
+ROI_REASON_PRECISION = "roi-declined-precision-not-fp32"
+ROI_REASON_ARMED = "roi-armed"
 
 
 @dataclass(frozen=True)
