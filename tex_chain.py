@@ -160,7 +160,8 @@ def _compute_lineage(plan: CookPlan, ctx: ExecContext, eff_precision: str,
 # ── CACHE-6: fusion ↔ caching reconciliation (the cook side) ──────────────────
 
 def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_count=0,
-                    time_context=None, cancel=None, on_progress=None, scale=None) -> dict:
+                    time_context=None, cancel=None, on_progress=None, scale=None,
+                    roi: tuple | None = None, roi_exec: bool | None = None) -> dict:
     """Cook a raw fusion stage list (≥1) and return the interpreter's RAW {output: tensor}. One
     stage cooks as a plain program; ≥2 splice through `compile_fused`. It replicates prepare()'s
     param default-inject + widget-value conversion so a SUB-chain (a CACHE-6 prefix or suffix)
@@ -170,7 +171,26 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
     `scale` (SCALE-47b) rides straight through to `Interpreter.execute` — this stage-list family
     is interpreter-only (it has no tier selection of its own), so there is no accelerated route
     to bypass here the way `tex_engine.run` needs to. `None` (every caller before this ask) is
-    unaffected."""
+    unaffected.
+
+    `roi`/`roi_exec` (ROI-48A): the SAME per-cook window contract `tex_engine.cook(roi=...)`
+    exposes, applied here so `tex_checkpoint.cook_checkpointed`'s suffix cook — often exactly
+    one stage, the common shape right after a mid-graph edit near a checkpoint — can narrow
+    too. Interpreter-tier only (this family has no other tier) and SINGLE-STAGE only: a
+    fused chain (`len(stages) > 1`) declines a window for the identical reason
+    `tex_engine.prepare()`'s own gate does (`not fused_chain`) — `roi_plan` is scoped to one
+    program's source, and `run_roi`'s narrow-cook-crop crops one program's cook-region grid,
+    neither of which describes a spliced multi-stage chain. Every other clause mirrors
+    `prepare()`'s gate in the same order: LATENT narrows the wrong axis, an unarmed/malformed/
+    whole-frame window is a documented no-op, and only a program `roi_plan` proves executable
+    at fp32 gets a window — an `auto`/`fp16` cook (this family never resolves "auto" itself;
+    the interpreter cooks it as fp32, so `eff_precision` is what actually runs) is declined
+    for the same reason ROI is oracle-validated at fp32 only. Any doubt is a no-op: `roi=None`
+    (every caller before this ask) never reaches this block at all — invariant #7. Recorded
+    on `tier_trace` exactly like `tex_engine.cook` does, so a caller reads the same
+    `tier_trace.last_roi()` signal regardless of which entry point served the cook; never
+    raises — an ROI failure here falls back to the whole-frame cook below, exactly as
+    `tex_engine_tiers._run_default` does for its own `run_roi` call."""
     # OBSERVER-46/O3: notify once for THIS entry point; a call nested under
     # `cook_fused_cached` or `cook_checkpointed` (both call this internally, up to three
     # times per cook) shares their outer notification instead of adding one — see
@@ -229,11 +249,70 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
         for pname, pinfo in param_info.items():
             if pname in bindings:
                 bindings[pname] = _convert_param_value(bindings[pname], pinfo, pname)
+        output_names = sorted(assigned.keys())
+        eff_precision = "fp32" if latent_channel_count else precision
+
+        # ROI-48A: gate a per-cook window exactly like `tex_engine.prepare()` does, before
+        # dispatching to the interpreter. `roi_plan_obj`/`roi_out` stay None (a no-op) unless
+        # every clause admits.
+        roi_out = None
+        roi_plan_obj = None
+        if roi is not None:
+            _roi_why = None
+            if len(stages) != 1:
+                _roi_why = ("roi declined: cook_stage_list only windows a single "
+                            "(non-fused) stage")
+            elif latent_channel_count:
+                _roi_why = "roi declined: LATENT narrows the wrong axis and forces fp32 (M-3)"
+            elif scale is not None:
+                _roi_why = "roi declined: scale is active (not yet reconciled with ROI narrowing)"
+            elif not _tex_roi.roi_exec_enabled(roi_exec):
+                _roi_why = "roi not armed (pass roi_exec=True or set TEX_ROI_EXEC=1)"
+            elif (_bad := _tex_roi.validate_roi(roi)) is not None:
+                _roi_why = f"roi refused: {_bad}"
+            else:
+                _canon = _tex_roi.canonical_roi(roi)
+                if _canon[2:4] == _canon[4:6]:
+                    _roi_why = "roi covers the whole frame (nothing to narrow)"
+                elif eff_precision != "fp32":
+                    _roi_why = (f"roi declined: the cook is {eff_precision}, and ROI is only "
+                                "validated at fp32")
+                else:
+                    # `len(stages) == 1` here — the `_roi_why` branch above already caught
+                    # every other case — so `binding_types` (only bound on that path) is
+                    # always defined by the time this line runs.
+                    from .tex_tiling import _scalar_params
+                    _plan = _tex_roi.roi_plan(stages[0]["code"], _scalar_params(bindings),
+                                              binding_types)
+                    if _plan.executable:
+                        roi_out, roi_plan_obj = _canon, _plan
+                    else:
+                        _roi_why = ("roi declined: program is not ROI-executable "
+                                   "(whole-image gather / unbounded reach)")
+            from .tex_runtime import tier_trace as _tier_trace
+            _tier_trace.record_roi(None, _roi_why or ("roi armed" if roi_out is not None
+                                                       else None))
+
         interp = _get_interpreter()
+        if roi_out is not None:
+            from .tex_memory import run_roi
+            from .tex_runtime.host import CookCancelled as _CookCancelled
+            try:
+                return run_roi(interp, program, bindings, type_map, device,
+                               latent_channel_count, output_names, used_builtins,
+                               eff_precision, roi_out, roi_plan_obj.narrow, roi_plan_obj.halo,
+                               time_context, cancel=cancel, on_progress=on_progress)
+            except _CookCancelled:
+                raise           # SCHED-3: a cancel aborts — never fall back to whole-frame
+            except Exception as _roi_exc:
+                # Never hard-fail a cook over a window — the same posture
+                # `tex_engine_tiers._run_default` keeps for its own `run_roi` call.
+                from .tex_runtime import tier_trace as _tier_trace
+                _tier_trace.record_roi(None, f"roi cook failed: {_roi_exc}")
         return interp.execute(program, bindings, type_map, device=device,
                               latent_channel_count=latent_channel_count,
-                              output_names=sorted(assigned.keys()), used_builtins=used_builtins,
-                              precision=("fp32" if latent_channel_count else precision),
+                              output_names=output_names, used_builtins=used_builtins,
+                              precision=eff_precision,
                               time_context=time_context,
                               cancel=cancel, on_progress=on_progress, scale=scale)
 

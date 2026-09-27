@@ -229,7 +229,8 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
                       threshold_ms: float | None = None,
                       profile_key: tuple | None = None, spatial=None,
                       latent_channel_count: int = 0, time_context=None,
-                      cancel=None, on_progress=None, scale=None) -> dict:
+                      cancel=None, on_progress=None, scale=None,
+                      roi: tuple | None = None, roi_exec: bool | None = None) -> dict:
     """Cook a fused chain, splicing the suffix from the DEEPEST cached checkpoint.
 
     Deepest-first is the mechanism: it makes an edit's cost depend on the distance to the
@@ -264,6 +265,22 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
     cook itself (`cook_stage_list`) — a coarse-scale checkpoint mints a different key than a
     full-scale one, so this never serves one to the other (there is no invalidation protocol
     beyond the key differing). `None` (every caller before this ask) is unaffected.
+
+    `roi`/`roi_exec` (ROI-48A): the SAME per-cook window `tex_engine.cook(roi=...)` exposes,
+    passed straight through to every `cook_stage_list` call this function makes — the whole
+    chain (`_full()`, when nothing is cached) and each cut's SUFFIX (the deepest-first serve
+    loop below). `cook_stage_list` owns the actual gate (single-stage, fp32, `roi_plan`-
+    executable; see its own docstring) and NEVER touches the checkpoint KEY: a boundary tap is
+    always the PREFIX's full-frame output, materialized once by `materialize()` (which never
+    accepts `roi` — a checkpoint must serve ANY future window, not one baked to a single
+    request), so `boundary_lineage_key` needs no change here — only the SUFFIX cook that reads
+    a cached boundary (or the whole chain, when nothing is cached yet) can narrow. A cut whose
+    suffix is not exactly one stage declines the window at `cook_stage_list`'s own gate, the
+    same way a fused chain always does; the return value is then the ordinary, correctly-
+    smaller windowed tensor `run_roi` crops it to — never a whole frame mislabeled as one,
+    because a caller reads the window back off `tier_trace.last_roi()`, the same signal
+    `tex_engine.cook`'s `CookResult.cooked_roi` is built from. `roi=None` (every caller before
+    this ask) never reaches any of the new branches — invariant #7.
     """
     # OBSERVER-46/O3: notify once for THIS entry point; every internal call below —
     # `_full()`'s and the per-cut `tex_engine.cook_stage_list`/`tex_engine.boundary_lineage_key`
@@ -277,7 +294,8 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
             return tex_engine.cook_stage_list(
                 stages, device=device, precision=precision,
                 latent_channel_count=latent_channel_count, time_context=time_context,
-                cancel=cancel, on_progress=on_progress, scale=scale)
+                cancel=cancel, on_progress=on_progress, scale=scale,
+                roi=roi, roi_exec=roi_exec)
 
         cuts = _resolve_cuts(stages, result_cache, cuts,
                              latent_channel_count=latent_channel_count, upstream=upstream,
@@ -316,7 +334,8 @@ def cook_checkpointed(stages: list[dict], result_cache, *, device="cpu", precisi
             out = remap_suffix_taps(tex_engine.cook_stage_list(
                 suffix, device=device, precision=precision,
                 latent_channel_count=latent_channel_count, time_context=time_context,
-                cancel=cancel, on_progress=on_progress, scale=scale), k)
+                cancel=cancel, on_progress=on_progress, scale=scale,
+                roi=roi, roi_exec=roi_exec), k)
             # The boundary IS stage k-1's output, so a tap there is served for free rather than
             # costing a refusal.
             if k >= 1 and stages[k - 1].get("tap"):
