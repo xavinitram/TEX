@@ -1652,12 +1652,15 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
         return out
     out[n - 1] = canonical_roi(roi)
     start = max(0, dirty_from)
+    # Q3 (FIX-ROI49, R1#1/R2#2): grow-and-clamp via `_dag_grow` — the SAME helper
+    # `chain_windows_dag` below already uses for its own two call sites — instead of a third
+    # hand-copy of this arithmetic. `_dag_grow` is defined later in this module (the JOIN-49
+    # section below), which is fine: nothing calls `chain_windows` until the module has
+    # finished loading. The linear-equivalence oracle (`test_join49_dag_windows.py`) proves
+    # this produces byte-identical answers to the pre-Q3 inline arithmetic for every case in
+    # its named corpus plus its 300-case random sweep.
     for i in range(n - 2, start - 1, -1):
-        x0, y0, w, h, W, H = out[i + 1]
-        pad = int(halos[i + 1])
-        nx0, ny0 = max(0, x0 - pad), max(0, y0 - pad)
-        nx1, ny1 = min(W, x0 + w + pad), min(H, y0 + h + pad)
-        out[i] = (nx0, ny0, nx1 - nx0, ny1 - ny0, W, H)
+        out[i] = _dag_grow(out[i + 1], halos[i + 1])
     if valid is not None and start > 0:
         # P0-4(b): `start` can be past the end — a host may pass `dirty_from >= len(halos)` for
         # a chain whose dirty stage was removed, or for an empty suffix. Without `valid=` that
@@ -1672,10 +1675,7 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
         need = out[start]
         pad = int(halos[start]) if start < n else 0
         if need is not None:
-            x0, y0, w, h, W, H = need
-            grown = (max(0, x0 - pad), max(0, y0 - pad),
-                     min(W, x0 + w + pad) - max(0, x0 - pad),
-                     min(H, y0 + h + pad) - max(0, y0 - pad), W, H)
+            grown = _dag_grow(need, pad)
             upstream_valid = valid[start - 1] if start - 1 < len(valid) else None
             if not covers(upstream_valid, grown):
                 return None        # not serviceable — cook the whole chain from the source
@@ -1689,24 +1689,35 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
 # canvases — a composite, a blend, a multi-plate comp) has no representation in that model:
 # `halos` is a flat per-stage list, so there is no way to even ASK "stage k reads stages i AND
 # j, and needs a DIFFERENT margin from each". `chain_windows_dag` below is the generalisation;
-# `chain_windows` itself is UNTOUCHED (not one line of its body above this comment changed) —
-# every existing call site keeps calling the exact function it always did, and the linear
-# case's own trusted implementation is not the surface this correctness-sensitive lane risks.
+# `chain_windows`'s SIGNATURE and every answer it returns are UNTOUCHED (proven by the
+# byte-identical oracle below) — every existing call site keeps calling the exact function it
+# always did, and the linear case's own trusted CONTROL FLOW (the P0-4a/P0-4b refusals, the
+# loop bounds) is not the surface this correctness-sensitive lane risks. As of FIX-ROI49 Q3,
+# `chain_windows`'s body no longer hand-copies the grow-and-clamp arithmetic itself, though:
+# both of its own internal sites now call `_dag_grow` (defined just below) — the SAME helper
+# `chain_windows_dag` already uses — instead of carrying a third independent copy of it (the
+# original JOIN-49 cut left `chain_windows` with two hand-written copies right next to a
+# helper built to eliminate exactly that duplication class — R1#1/R2#2 of the v0.49 Phase C
+# review).
 #
 # The design doc's own recommendation is to make `chain_windows` a thin wrapper that calls the
-# DAG walker with `inputs=(i-1,)` synthesized. That refactor is deliberately NOT taken here —
-# a version that touches zero bytes of the trusted linear implementation is preferred over a
-# version that is merely provably equivalent to it. What IS delivered, verbatim per the
-# brief, is the byte-identical PROOF: `chain_windows_dag` fed the synthesized linear stage list
-# `[StageSpec(h, () if i == 0 else (i - 1,)) for i, h in enumerate(halos)]` returns EXACTLY
-# what `chain_windows(halos, ...)` returns, for every call shape in the existing linear test
-# corpus plus a randomized oracle sweep (`tests/test_join49_dag_windows.py`).
+# DAG walker with `inputs=(i-1,)` synthesized. That refactor is still NOT taken — sharing only
+# the grow-and-clamp arithmetic, while leaving `chain_windows`'s own control flow byte-for-byte
+# as originally written, is preferred over routing the whole function through the DAG
+# machinery. The byte-identical PROOF (unaffected by Q3's arithmetic-sharing): `chain_windows_
+# dag` fed the synthesized linear stage list `[StageSpec(h, () if i == 0 else (i - 1,)) for i,
+# h in enumerate(halos)]` returns EXACTLY what `chain_windows(halos, ...)` returns, for every
+# call shape in the existing linear test corpus plus a randomized oracle sweep
+# (`tests/test_join49_dag_windows.py`) — which now also exercises `_dag_grow` from both sides.
 
 def _dag_grow(window, pad: float):
-    """`window ⊕ pad`, clamped to the frame — the exact arithmetic `chain_windows`'s own
-    backward step performs inline; lifted here so the DAG walker and the boundary-validity
-    check share ONE implementation instead of two hand-copies drifting apart (the class of
-    bug FIX-ROI's O2 finding was about: two per-node copies of one rule)."""
+    """`window ⊕ pad`, clamped to the frame — grow-and-clamp, the one piece of correctness-
+    sensitive arithmetic every window-composition rule in this module needs. As of FIX-ROI49
+    Q3, this is the ONE shared implementation for FOUR call sites: `chain_windows`'s own
+    backward step and its P0-4(b) boundary-validity check, and `chain_windows_dag`'s backward
+    step and its own divergent-validity check — not two independent copies (`chain_windows`'s
+    original two hand-written inlines) plus this as a third, the class of bug FIX-ROI's O2
+    finding was about (two per-node copies of one rule drifting apart)."""
     x0, y0, w, h, W, H = window
     pad = int(pad)
     nx0, ny0 = max(0, x0 - pad), max(0, y0 - pad)

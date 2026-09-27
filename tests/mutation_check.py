@@ -56,17 +56,21 @@ VENV = sys.executable
 # `.py`, importable from tests/) — the suite(s) that claim to pin this bug. See the module
 # docstring: this column is the runner's import list, so it is load-bearing, not annotation.
 MUTATIONS = [
+    # FIX-ROI49 Q3: `chain_windows`'s backward loop now calls the shared `_dag_grow` helper
+    # instead of hand-copying the grow-and-clamp arithmetic (R1#1/R2#2) — same two real bugs,
+    # re-anchored to the new call-shaped line (the answers are byte-identical either way, per
+    # the oracle in test_join49_dag_windows.py).
     ("chain_windows: compose FORWARD instead of backward", "tex_roi.py",
-     "    for i in range(n - 2, start - 1, -1):\n        x0, y0, w, h, W, H = out[i + 1]",
-     "    for i in range(start, n - 1):\n        x0, y0, w, h, W, H = out[i + 1]",
+     "    for i in range(n - 2, start - 1, -1):\n        out[i] = _dag_grow(out[i + 1], halos[i + 1])",
+     "    for i in range(start, n - 1):\n        out[i] = _dag_grow(out[i + 1], halos[i + 1])",
      ("test_v032_region",)),
     ("chain_windows_dag: compose FORWARD instead of backward", "tex_roi.py",
      "    for i in range(n - 2, start - 1, -1):\n        demand = None",
      "    for i in range(start, n - 1):\n        demand = None",
      ("test_join49_dag_windows",)),
     ("chain_windows: grow by the stage's OWN halo, not its consumer's", "tex_roi.py",
-     "        pad = int(halos[i + 1])",
-     "        pad = int(halos[i])",
+     "        out[i] = _dag_grow(out[i + 1], halos[i + 1])",
+     "        out[i] = _dag_grow(out[i + 1], halos[i])",
      ("test_v032_region",)),
     ("chain_windows: drop the `valid` guard", "tex_roi.py",
      "            if not covers(upstream_valid, grown):",
