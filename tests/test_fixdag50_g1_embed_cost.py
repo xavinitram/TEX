@@ -12,7 +12,7 @@ never assigned into `stage_outputs`), and `stage_outputs[1]["OUT"]` stays the ba
 
 CPU here (matches this repository's own CPU-only test convention for non-timing rows); a
 per-tick wall-clock measurement (before/after, named by box+GPU) lives in this ask's
-landing record, not in the suite, per AGENTS.md's "Timing tests are the orchestrator's landing
+own record, not in the suite, per AGENTS.md's "Timing tests are the orchestrator's landing
 ceremony" convention — this file asserts the ALLOCATION SHAPE, not a wall-clock number.
 """
 from __future__ import annotations
