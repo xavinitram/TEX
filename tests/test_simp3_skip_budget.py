@@ -255,7 +255,11 @@ _SKIP_VOCAB = re.compile(
 #: the identical guard, and identical reason, its two sibling scans in the same file
 #: (`test_lint1_no_tracked_file_names_a_local_only_path`, `test_lint1_g5_no_new_bare_word_leak`)
 #: already carry, each with its own row already counted in this pin.
-_SKIP_BUDGET = 130
+#: Re-pinned from 130 to 131 (LEAKNAMES-50 I1): one new row,
+#: `test_lint1_no_local_only_path_refs.py::test_lint1_i1_no_tracked_file_names_a_review_note`,
+#: skips for the identical reason and under the identical guard as its four siblings in the
+#: same file, each with its own row already counted in this pin.
+_SKIP_BUDGET = 131
 
 
 def _literal(node) -> str:
