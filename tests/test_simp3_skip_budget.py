@@ -187,7 +187,11 @@ _SKIP_VOCAB = re.compile(
 #: device at all and carry no `r.skip`), and there is no CPU witness for "a sampled cook's
 #: device time resolves via a real CUDA event", the same reason every other CUDA-only row in
 #: this pin carries.
-_SKIP_BUDGET = 119
+#: Re-pinned from 119 to 120 (FIX-GATE G5, v0.47.0): LINT-1's new bare-word budget row
+#: (`test_lint1_no_local_only_path_refs.py::test_lint1_g5_no_new_bare_word_leak`) needs a
+#: real git checkout to enumerate the tracked set (`tracked_paths()`), the same reason its
+#: sibling row two lines above it already carries an identical `r.skip` and no CPU witness.
+_SKIP_BUDGET = 120
 
 
 def _literal(node) -> str:
