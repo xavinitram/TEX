@@ -719,7 +719,7 @@
         {
           "name": "gauss_blur",
           "sig": "gauss_blur(img, sigma) → vec",
-          "desc": "Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.",
+          "desc": "Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding. Exact within a measured sigma; a bounded-cost downscale approximation runs past it.",
           "example": "@OUT = gauss_blur(@A, 2.0);",
           "tags": [
             "spatial",

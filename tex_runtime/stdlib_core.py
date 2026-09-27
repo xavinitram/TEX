@@ -885,7 +885,8 @@ def _gauss_blur_bchw(
 # calls `_gauss_blur_bchw` exactly, UNCONDITIONALLY — the same call, same kernel, same
 # conv, bit-identical to every release before this constant existed (proven by
 # `torch.equal` across a sigma sweep from 0 up to the threshold in
-# `tests/test_gausspyr50_bitexact.py`, CPU and CUDA). Above it, `_gauss_blur_pyramid_
+# `tests/test_gausspyr50_engine_policy.py::test_gausspyr50_bitexact_below_threshold_
+# {cpu,cuda}`, CPU and CUDA). Above it, `_gauss_blur_pyramid_
 # approx` runs: an O(image size) downscale-pyramid approximation ("Nuke quality") whose
 # cost stays flat regardless of sigma. Both constants were picked by measurement (a
 # fuzzer sweep over a checker and a smooth-gradient-plus-hard-edges corpus, at 1080p and
@@ -1229,3 +1230,29 @@ def _is_scalar(x) -> bool:
     if isinstance(x, torch.Tensor):
         return x.dim() == 0
     return False
+
+
+def _require_finite_arg(fn_name: str, arg_name: str, value: float) -> None:
+    """A7 (v0.50 Phase C, B4#4): `gauss_blur`/`erode`/`dilate`/`bilateral_filter` each
+    resolve a host-side radius/sigma via `int(math.ceil(...))`, which raises a raw
+    `ValueError`/`OverflowError` ("cannot convert float NaN/infinity to integer") on a
+    NaN or Inf argument -- a Python-internal message, not a TEX Voice-and-Tone
+    diagnostic. Called BEFORE that conversion, this raises a friendly `InterpreterError`
+    (E6052) instead. A function-LOCAL import (not top-level) — `interpreter.py` imports
+    `stdlib` at module scope, so a top-level import here would be the exact circular-
+    import "trade to refuse" AGENTS.md already names; every other stdlib helper that
+    needs an interpreter-side name (`stdlib_math.py`'s `_tensor_where`) imports it the
+    same way, inside the function body. No `loc` is passed (P0-I's established pattern
+    for a below-the-AST raise, e.g. the DATA-7 provider seam): `_eval_function_call`'s
+    existing `except InterpreterError` branch adopts the call site's own location, so
+    the diagnostic still carries a caret despite originating inside a stdlib helper
+    with no AST node of its own."""
+    if math.isfinite(value):
+        return
+    from .interpreter import InterpreterError
+    raise InterpreterError(
+        f"{fn_name}(): {arg_name} must be a finite number, got {value!r}.",
+        code="E6052",
+        hint=f"Check what is feeding {fn_name}()'s {arg_name} argument -- a NaN or "
+             "infinite value cannot be used as a pixel radius or sigma.",
+    )

@@ -326,6 +326,10 @@ Runtime / node. See the message shown with the code for the specific cause and f
 
 Runtime / node. See the message shown with the code for the specific cause and fix; the class is described above.
 
+### E6052
+
+Runtime / node. See the message shown with the code for the specific cause and fix; the class is described above.
+
 ### E6060
 
 Runtime / node. See the message shown with the code for the specific cause and fix; the class is described above.

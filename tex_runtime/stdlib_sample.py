@@ -19,6 +19,7 @@ from .stdlib_core import (
     _expand_to_bhw,
     _gauss_blur_bchw,
     _gauss_blur_auto,
+    _require_finite_arg,
     _get_batch_index,
     _get_bchw,
     _get_grid_buf,
@@ -76,7 +77,9 @@ class _StdlibSample:
     @staticmethod
     def _morph(image, radius, grow: bool):
         img = _to_tensor(image)
-        r = max(0, int(_to_float(radius)))
+        radius_val = _to_float(radius)
+        _require_finite_arg("erode" if not grow else "dilate", "radius", radius_val)  # A7
+        r = max(0, int(radius_val))
         if r == 0:
             return img
         squeeze = img.dim() == 3          # [B,H,W] mask -> add a channel
@@ -583,7 +586,13 @@ class _StdlibSample:
     # threshold, `_reach_of` answers 'unbounded' — the same decline a symbolic sigma
     # already gets — so the planner (ROI, tiling/OOM strips, `cook_stage_dag`) falls back
     # to a whole-frame cook instead of narrowing onto a wrong phase.
-    @stdlib("gauss_blur", sig='gauss_blur(img, sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0, GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA), pixel_args=(1,), doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.', ex='@OUT = gauss_blur(@A, 2.0);')
+    # A7 (v0.50 Phase C, B4#4): the doc= string below now discloses the pyramid
+    # approximation past `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA` -- this is the single
+    # source for Function-Reference.md, tex_help.json, and js/tex_extension.js's
+    # TEX_HELP_DATA (all three regenerated from it), so a TEX author reading in-editor
+    # help or the generated reference can now learn this the same way bilateral_
+    # filter's own doc= already discloses its detail-transfer approximation.
+    @stdlib("gauss_blur", sig='gauss_blur(img, sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0, GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA), pixel_args=(1,), doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding. Exact within a measured sigma; a bounded-cost downscale approximation runs past it.', ex='@OUT = gauss_blur(@A, 2.0);')
     @staticmethod
     def fn_gauss_blur(image, sigma) -> torch.Tensor:
         """Separable Gaussian blur.
@@ -603,6 +612,7 @@ class _StdlibSample:
         if sigma_val is None:
             sigma_t = sigma if sigma.__class__ is torch.Tensor else _to_tensor(sigma)
             sigma_val = sigma_t.item()
+        _require_finite_arg("gauss_blur", "sigma", sigma_val)  # A7: friendly diagnostic, not a raw int() crash
         sigma_val = max(sigma_val, 0.0)
         if sigma_val < 0.3 or img.dim() < 4:
             return img
@@ -796,6 +806,7 @@ class _StdlibSample:
                 rounded = _dtype_rounded(raw, torch.float32)
                 sr = raw if rounded is None else rounded
 
+        _require_finite_arg("bilateral_filter", "spatial_sigma", ss)  # A7: friendly diagnostic
         if img.dim() < 4 or ss < 0.3:
             return img
 
