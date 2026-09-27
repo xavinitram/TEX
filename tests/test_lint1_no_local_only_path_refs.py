@@ -295,12 +295,7 @@ _TRACKER_ID_RE = re.compile(r"\b" + _TRACKER_PREFIX + r"-?\d{2,4}(?:-T\d{1,3})?\
 #: this fix does not itself edit (a concurrent fix removes its one id in the same release);
 #: it is named here, not budgeted, so the reason travels with the code instead of a bare
 #: number.
-_TRACKER_ID_ALLOWLIST = {
-    # tex_runtime/compiled.py: removed there in the same release by the fix that owns
-    # that module. Allowed here, once, by name, so this ratchet does not red on a removal
-    # already in flight elsewhere in the same v0.50.0 Phase C batch.
-    "tex_runtime/compiled.py",
-}
+_TRACKER_ID_ALLOWLIST: set = set()
 
 
 def scan_tracker_ids(text: str) -> list:
