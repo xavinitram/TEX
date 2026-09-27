@@ -24,6 +24,8 @@ from TEX_Wrangle.tex_compiler.types import TEXType
 from TEX_Wrangle.tex_engine_tiers import (
     tier_verdict, select_tier, TIER_REASON_SCALE_UNSAFE, TIER_REASON_SCALE_ACTIVE,
     TIER_REASON_SCALE_ACTIVE_CODEGEN, TIER_REASON_SCALE_ACTIVE_COMPILED,
+    TIER_REASON_SELECTED, TIER_REASON_TORCH_COMPILE_GRAPH_BREAK,
+    TIER_REASON_CUDA_GRAPH_NOT_CAPTURABLE,
     ROI_REASON_TIER_NOT_DEFAULT, ROI_REASON_NOT_ARMED, ROI_REASON_ARMED,
     ROI_REASON_WHOLE_FRAME, ROI_REASON_SCALE_ACTIVE,
 )
@@ -196,21 +198,25 @@ def test_tierq48_agrees_roi_declines_when_scale_also_active():
 def test_tierq48_agrees_a_non_default_tier_never_arms_roi():
     """`select_tier` alone decides eligibility for torch_compile/auto/cuda_graph — no
     real device is needed to prove ROI never arms there (CPU-testable, per
-    `select_tier`'s own docstring)."""
+    `select_tier`'s own docstring). ROI armament (this test's actual subject) is
+    unaffected by FIX-SCALECX X1's correction of WHICH tier the query names for the
+    non-ROI question — `_ROI_CODE` itself calls `gauss_blur`, so `select_tier`'s
+    `torch_compile`/`auto`/`cuda_graph` choice is each corrected exactly per X1's
+    dedicated tests above; `roi_armed`/`roi_reason` are the invariant this test pins."""
     roi = (10, 10, 256, 256, 1024, 1024)
     for compile_mode in ("torch_compile", "auto"):
         tier_id = select_tier(compile_mode, "cpu", False, False)
         assert tier_id == compile_mode
         v = tier_verdict(_ROI_CODE, compile_mode=compile_mode, device="cpu", roi=roi,
                          roi_exec=True, param_values={"amount": 0.4})
-        assert v.tier == compile_mode
+        assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
         assert not v.roi_armed and v.roi_reason == ROI_REASON_TIER_NOT_DEFAULT
     # cuda_graph: select_tier only string-checks the device (no real GPU required).
     tier_id = select_tier("cuda_graph", "cuda:0", False, False)
     assert tier_id == "cuda_graph"
     v = tier_verdict(_ROI_CODE, compile_mode="cuda_graph", device="cuda:0", roi=roi,
                      roi_exec=True, param_values={"amount": 0.4})
-    assert v.tier == "cuda_graph"
+    assert v.tier == "interpreter" and v.reason == TIER_REASON_CUDA_GRAPH_NOT_CAPTURABLE
     assert not v.roi_armed and v.roi_reason == ROI_REASON_TIER_NOT_DEFAULT
 
 
@@ -267,6 +273,80 @@ def test_tierq48_agrees_roi_still_declines_on_scale_active_compiled_tier():
     assert (v.tier, v.roi_armed) == (real_tier, real_roi_armed)
     assert v.tier == "torch_compile" and not v.roi_armed
     assert v.roi_reason == ROI_REASON_TIER_NOT_DEFAULT
+
+
+# ── FIX-SCALECX X1 (B2#1): tier_verdict must predict the tier that ACTUALLY runs ────
+#
+# `select_tier`'s choice is not the end of the story for torch_compile/auto/cuda_graph: each
+# can itself self-decline past that point (a graph-break -> no real Inductor backend for
+# torch_compile/auto; a not-capturable program for cuda_graph) -- a decline `_run_tier` never
+# sees as an exception, so the pre-fix query named a tier that never actually ran. Every one
+# of today's four registered `pixel_args=` builtins (gauss_blur/erode/dilate/bilateral_filter)
+# hits ONE of these two declines unconditionally, on ANY box, scale-active or not -- this is
+# not a scale-specific bug, the SCALECX-49 audit (B2) just happened to be what found it.
+_GAUSS_BLUR_CODE = "@OUT = gauss_blur(@A, 6.0);\n"
+_GAUSS_BLUR_BT = {"A": TEXType.VEC4}
+
+
+def test_tierq48_torch_compile_predicts_graph_break_for_a_real_pixel_args_builtin():
+    """Red at 32f6917: the query said "torch_compile" here; gauss_blur never inlines in
+    codegen, so `_has_fn_calls` is always True and `_try_compile` returns the codegen-only
+    eager adapter, backend=None -- real Inductor tracing is never reached."""
+    v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu",
+                     binding_types=_GAUSS_BLUR_BT)
+    assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+
+
+def test_tierq48_auto_predicts_graph_break_for_a_real_pixel_args_builtin():
+    v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="auto", device="cpu",
+                     binding_types=_GAUSS_BLUR_BT)
+    assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+
+
+def test_tierq48_cuda_graph_predicts_not_capturable_for_a_real_pixel_args_builtin():
+    """Red at 32f6917: the query said "cuda_graph" here; gauss_blur is `sync=True` in
+    `graphed._SYNC_STDLIB`, so `_capturable` always declines it -- CPU-provable (`_capturable`
+    is a pure AST walk, no real CUDA device needed, same fact
+    `test_tierq48_agrees_scale_active_cuda_graph_reported_without_real_gpu` already leans on)."""
+    v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="cuda_graph", device="cuda:0",
+                     binding_types=_GAUSS_BLUR_BT)
+    assert v.tier == "interpreter" and v.reason == TIER_REASON_CUDA_GRAPH_NOT_CAPTURABLE
+
+
+def test_tierq48_scale_active_torch_compile_predicts_graph_break_for_a_real_pixel_args_builtin():
+    """Same correction applies in the SCALE-ACTIVE branch too -- it must not drift from the
+    scale-inactive branch above (`_real_compiled_dispatch` is the one shared call site)."""
+    v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu", scale=0.5,
+                     binding_types=_GAUSS_BLUR_BT)
+    assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+
+
+def test_tierq48_scale_active_cuda_graph_predicts_not_capturable_for_a_real_pixel_args_builtin():
+    v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="cuda_graph", device="cuda:0", scale=0.5,
+                     binding_types=_GAUSS_BLUR_BT)
+    assert v.tier == "interpreter" and v.reason == TIER_REASON_CUDA_GRAPH_NOT_CAPTURABLE
+
+
+_GAUSS_BLUR_CODE_UNCOMPILABLE_AGAINST_BAD_BT = "@OUT = gauss_blur(@A.rgb, 6.0);\n"
+_BAD_BT = {"A": TEXType.FLOAT}   # FLOAT has no `.rgb` swizzle -- fails to compile
+
+
+def test_tierq48_torch_compile_reports_declared_tier_when_it_cannot_compile():
+    """When `code` cannot be compiled against the given `binding_types` (here, a binding
+    whose declared type disagrees with how it is used -- the same shape
+    `test_tierq48_scale_active_codegen_route_falls_back_when_it_cannot_compile` uses above),
+    the query cannot check the graph-break predicate and conservatively reports the
+    DECLARED tier unchanged: never wrong about pixel correctness, only potentially
+    optimistic about which tier is named."""
+    v = tier_verdict(_GAUSS_BLUR_CODE_UNCOMPILABLE_AGAINST_BAD_BT,
+                     compile_mode="torch_compile", device="cpu", binding_types=_BAD_BT)
+    assert v.tier == "torch_compile" and v.reason == TIER_REASON_SELECTED
+
+
+def test_tierq48_cuda_graph_reports_declared_tier_when_it_cannot_compile():
+    v = tier_verdict(_GAUSS_BLUR_CODE_UNCOMPILABLE_AGAINST_BAD_BT,
+                     compile_mode="cuda_graph", device="cuda:0", binding_types=_BAD_BT)
+    assert v.tier == "cuda_graph" and v.reason == TIER_REASON_SELECTED
 
 
 def test_tierq48_never_raises_on_a_malformed_roi():

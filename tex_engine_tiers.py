@@ -523,6 +523,26 @@ TIER_REASON_SCALE_ACTIVE_COMPILED = "scale-active-compiled"
 # own scale routing (`TIER_REASON_SCALE_ACTIVE_CODEGEN` / plain `TIER_REASON_SCALE_ACTIVE`)
 # is unchanged by this ask.
 TIER_REASON_SELECTED = "tier-selected"              # plain select_tier verdict, scale inactive
+# FIX-SCALECX X1: `torch_compile`/`auto`/`cuda_graph` can each SELF-DECLINE past the point
+# `select_tier` names them -- `_run_tier` never sees an exception in that case (it is an
+# internal routing choice inside `execute_compiled`/`run_graphed`, not a caught failure), so
+# `tier_id` alone (what §TIER_REASON_SCALE_ACTIVE_COMPILED/TIER_REASON_SELECTED used to report
+# unconditionally) can name a tier that never actually runs. These two reasons correct that --
+# see `_real_compiled_dispatch` below, which every `tier_verdict` call for those three tier ids
+# now routes through, scale-active or not (B2#1: the misprediction is not scale-specific at all,
+# it just happens to be the SCALECX-49 audit that found it).
+TIER_REASON_TORCH_COMPILE_GRAPH_BREAK = "torch-compile-graph-break"
+# ^ `torch_compile`/`auto` selected, but the program's codegen has a non-inlined stdlib call
+# (`_has_fn_calls`) -- `_try_compile` returns the codegen-only eager adapter, backend=None,
+# never real Inductor tracing (`compiled.py:1623-1639`). Every one of today's four registered
+# `pixel_args=` builtins hits this unconditionally (none inlines in codegen) -- reported tier is
+# `"codegen"`, matching what actually executes.
+TIER_REASON_CUDA_GRAPH_NOT_CAPTURABLE = "cuda-graph-not-capturable"
+# ^ `cuda_graph` selected, but `graphed._capturable()` declines the program before a
+# `_capture_key` is ever computed (a sync-bearing stdlib call, a non-static loop, ...) --
+# `run_graphed` then always returns `None` and `_run_cuda_graph` falls to the plain interpreter.
+# Every one of today's four registered `pixel_args=` builtins hits this too (each is
+# `sync=True` in `graphed._SYNC_STDLIB`) -- reported tier is `"interpreter"`.
 
 # FIX-TIER T1: the DECISION LOGIC these name is single-sourced in `tex_roi.roi_eligibility`
 # (below, `tier_verdict` calls it directly) — but the literal STRING VALUES stay defined
@@ -572,6 +592,37 @@ class TierVerdict:
     roi_reason: str | None
 
 
+def _compile_for_query(code: str, binding_types: dict | None):
+    """FIX-SCALECX X1: factored out of `_stencil_route_would_apply` (SCALE-CG-48) so every
+    speculative-compile predicate `tier_verdict` calls (`_stencil_route_would_apply`,
+    `_torch_compile_graph_break`, `_cuda_graph_would_capture`) shares ONE copy of the
+    "read the ordinary program cache, but never write it" contract -- a cache HIT is served
+    normally (`TEXCache.get`, no store), and a MISS compiles through the same front end
+    (`parse_and_split` + `TEXCache.compile_ast`) `compile_tex` itself uses, WITHOUT calling
+    `.put()`. `tier_verdict`'s own docstring promises "no compile, no cache write, no cache
+    pollution" (matching `scale_verdict`'s genuine side-effect-freedom); going through
+    `_compile_or_raise`/`compile_tex` broke that promise for the branches that reach this,
+    because a cache miss there unconditionally persists the result (memory AND disk,
+    `TEXCache.put` -> `_save_to_disk`) -- exactly the "compiles and populates the ordinary
+    program cache" behavior B2#1 caught by running it against a fresh `TEX_CACHE_DIR`. A
+    speculative, pre-cook query must not seed a `.pkl` (or a fresh in-memory slot) for a
+    program nobody has actually cooked.
+
+    Returns `(fingerprint, ast, type_map)`; RAISES on any compile failure (most commonly
+    `binding_types` being `None` or incomplete) -- every caller catches and treats that as
+    "unknown, answer conservatively", per each caller's own docstring."""
+    from .tex_cache import get_cache, parse_and_split
+    bt = binding_types or {}
+    cache = get_cache()
+    fp = cache.fingerprint(code, bt)
+    cached = cache.get(code, bt, fp=fp)
+    if cached is not None:
+        return fp, cached[0], cached[1]
+    program = parse_and_split(code, bt)
+    ast, type_map = cache.compile_ast(program, bt, source=code)[:2]
+    return fp, ast, type_map
+
+
 def _stencil_route_would_apply(code: str, binding_types: dict | None) -> bool | None:
     """SCALE-CG-48 support: best-effort, read-only check of whether a scale-active,
     `tier_id == "default"` cook would route to codegen (the UC-2 stencil gate,
@@ -581,34 +632,87 @@ def _stencil_route_would_apply(code: str, binding_types: dict | None) -> bool | 
     `binding_types`) and check, or `None` ("unknown, answer conservatively") on any
     failure -- most commonly `binding_types` being `None` or incomplete, exactly the
     same "supply it for a precise answer" contract `roi_plan`'s `binding_types`
-    parameter already documents above.
-
-    FIX-TIER T2: this reads the SAME program cache a real cook would populate, but never
-    WRITES to it -- a cache HIT is served normally (`TEXCache.get`, no store), and a MISS
-    compiles through the same front end (`parse_and_split` + `TEXCache.compile_ast`)
-    `compile_tex` itself uses, WITHOUT calling `.put()`. `tier_verdict`'s own docstring
-    promises "no compile, no cache write, no cache pollution" (matching `scale_verdict`'s
-    genuine side-effect-freedom); going through `_compile_or_raise`/`compile_tex` broke
-    that promise for the one branch that reaches this function, because a cache miss
-    there unconditionally persists the result (memory AND disk, `TEXCache.put` ->
-    `_save_to_disk`) -- exactly the "compiles and populates the ordinary program cache"
-    behavior B2#1 caught by running it against a fresh `TEX_CACHE_DIR`. A speculative,
-    pre-cook query must not seed a `.pkl` (or a fresh in-memory slot) for a program nobody
-    has actually cooked."""
+    parameter already documents above."""
     try:
-        from .tex_cache import get_cache, parse_and_split
-        bt = binding_types or {}
-        cache = get_cache()
-        fp = cache.fingerprint(code, bt)
-        cached = cache.get(code, bt, fp=fp)
-        if cached is not None:
-            ast = cached[0]
-        else:
-            program = parse_and_split(code, bt)
-            ast = cache.compile_ast(program, bt, source=code)[0]
+        fp, ast, _type_map = _compile_for_query(code, binding_types)
         return bool(_tex_engine._should_stencil_route(fp, ast))
     except Exception:
         return None
+
+
+def _torch_compile_graph_break(code: str, binding_types: dict | None) -> bool | None:
+    """FIX-SCALECX X1 (B2#1): best-effort, read-only mirror of the ONE deterministic,
+    box-independent gate `_try_compile` itself checks before ever attempting real
+    Inductor tracing -- "codegen has a non-inlined stdlib call, so torch.compile overhead
+    exceeds benefit; return the codegen-only eager adapter instead" (`_has_fn_calls`,
+    `tex_runtime/compiled.py:1623-1639`). Every one of today's four registered
+    `pixel_args=` builtins (`gauss_blur`/`erode`/`dilate`/`bilateral_filter`) hits this
+    unconditionally -- none inlines in codegen -- so `torch_compile`/`auto` never reach
+    Inductor for a plain call to one, on ANY box, scale-active or not (B2's finding: this
+    was not scale-specific, the SCALECX-49 audit just happened to be what found it).
+
+    Returns `True` (graph-break -- the codegen-only adapter runs, backend stays unreached),
+    `False` (no graph-break detected here -- may still fail to reach Inductor for an
+    unrelated reason this function does not model: `_select_backend` availability,
+    `op_count`/`loop_depth`/`has_spatial` routing, all of which need bindings this pre-cook
+    query does not have), or `None` ("unknown, answer conservatively" -- i.e. the caller
+    reports the DECLARED tier unchanged) when `code` cannot be compiled against the given
+    (or omitted) `binding_types`. A `False`/`None` answer is never wrong about pixel
+    correctness -- only potentially optimistic about which tier is named, the same
+    "supply binding_types for a precise answer" contract `_stencil_route_would_apply`
+    already documents."""
+    try:
+        fp, ast, type_map = _compile_for_query(code, binding_types)
+        from .tex_runtime.compiled import _get_or_make_codegen_fn
+        cg_fn = _get_or_make_codegen_fn(ast, type_map, fp)
+        if cg_fn is None:
+            return None  # codegen itself declines -- a different, unmodelled decline shape
+        return bool(getattr(cg_fn, "_has_fn_calls", False))
+    except Exception:
+        return None
+
+
+def _cuda_graph_would_capture(code: str, binding_types: dict | None) -> bool | None:
+    """FIX-SCALECX X1 (B2#1): best-effort, read-only mirror of `graphed._capturable` --
+    the exact predicate `run_graphed` itself checks before ever computing a
+    `_capture_key` (a pure AST walk, `graphed.py:285-333`, needing no bindings). Every
+    one of today's four registered `pixel_args=` builtins is `sync=True` in
+    `graphed._SYNC_STDLIB`, so `_capturable` always declines a program calling one,
+    deterministically, on any box (CPU or CUDA) -- `run_graphed` then always returns
+    `None` and `_run_cuda_graph` falls straight to the plain interpreter
+    (`_interp_fallback`).
+
+    Returns `True`/`False` when `code` compiles against `binding_types` (or without any,
+    when `code` needs none), or `None` ("unknown, answer conservatively" -- report the
+    declared tier unchanged) on any failure, the same contract
+    `_torch_compile_graph_break` documents above. This does NOT also predict
+    `_graph_capture_worthwhile`'s px-dependent upper bound (needs real bindings to size
+    the canvas) -- only the box/px-independent `_capturable` gate B2 named."""
+    try:
+        _fp, ast, _type_map = _compile_for_query(code, binding_types)
+        from .tex_runtime.graphed import _capturable
+        capturable, _ops = _capturable(ast)
+        return bool(capturable)
+    except Exception:
+        return None
+
+
+def _real_compiled_dispatch(tier_id: str, code: str,
+                            binding_types: dict | None) -> tuple[str, str | None]:
+    """FIX-SCALECX X1: corrects a SELECTED `torch_compile`/`auto`/`cuda_graph` `tier_id`
+    to the tier the real dispatch (`_run_tier`) actually executes on, reusing the SAME
+    predicates `_try_compile`/`run_graphed` themselves check (no parallel judgement) --
+    the two helpers above. Called from BOTH of `tier_verdict`'s scale-active and
+    scale-inactive branches, so the correction can never drift between them. Returns
+    `(tier, reason)` when a correction applies, or `(tier_id, None)` when neither
+    predicate fires (the caller reports its own scale-appropriate reason unchanged)."""
+    if tier_id in ("torch_compile", "auto"):
+        if _torch_compile_graph_break(code, binding_types):
+            return "codegen", TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+    elif tier_id == "cuda_graph":
+        if _cuda_graph_would_capture(code, binding_types) is False:
+            return "interpreter", TIER_REASON_CUDA_GRAPH_NOT_CAPTURABLE
+    return tier_id, None
 
 
 def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
@@ -647,14 +751,25 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
     pixel risk (that gate only picks a FASTER tier for the same bytes), only
     potentially pessimistic about which tier is named.
 
-    A scale-active cook whose `select_tier` verdict is `"torch_compile"`/`"auto"`/
-    `"cuda_graph"` (SCALECX-49) reports THAT tier with `TIER_REASON_SCALE_ACTIVE_COMPILED` —
-    those three tiers now run a scale-active cook directly (keyed by an explicit `scale`
-    component on their compiled artifact / captured graph), unlike the pre-v0.49 posture
-    where any tier other than `"default"` was unconditionally forced to `"interpreter"` the
-    moment scale was active. This needs no `binding_types` to answer precisely (unlike the
-    "default"-tier codegen-stencil case above): which of the three compiled/graphed tiers
-    a cook lands on is `select_tier`'s own decision, unaffected by whether scale is active.
+    A cook whose `select_tier` verdict is `"torch_compile"`/`"auto"`/`"cuda_graph"`
+    (SCALECX-49) reports THAT tier with `TIER_REASON_SCALE_ACTIVE_COMPILED` when scale is
+    active, or `TIER_REASON_SELECTED` when it isn't — those three tiers run a cook directly
+    (keyed by an explicit `scale` component on their compiled artifact / captured graph when
+    scale is active), unlike the pre-v0.49 posture where any tier other than `"default"` was
+    unconditionally forced to `"interpreter"` the moment scale was active.
+
+    FIX-SCALECX X1: `select_tier`'s choice is not the end of the story for these three —
+    `torch_compile`/`auto` can themselves decline real Inductor tracing for a graph-breaking
+    program (running the codegen-only eager adapter instead — reported as `"codegen"`,
+    `TIER_REASON_TORCH_COMPILE_GRAPH_BREAK`), and `cuda_graph` can decline to capture at all
+    (falling to the plain interpreter — reported as `"interpreter"`,
+    `TIER_REASON_CUDA_GRAPH_NOT_CAPTURABLE`). Every one of today's four registered
+    `pixel_args=` builtins hits ONE of these two declines unconditionally (B2#1) — this is
+    not scale-specific, it just happens to be the SCALECX-49 audit that found it. Precisely
+    predicting either decline needs `binding_types` (same "supply it for a precise answer"
+    contract as the codegen-stencil case above); without it (or with one that cannot compile
+    `code`), this reports the tier `select_tier` named, unchanged — never wrong about pixel
+    correctness, only potentially optimistic about which tier actually runs.
 
     Never raises: a malformed `roi` is reported as a declined reason
     (`ROI_REASON_MALFORMED`), not a `TypeError`/`ValueError` — the same "over-approximate,
@@ -695,8 +810,18 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
         # (`_run_tier` dispatches every tier_id to its strategy unconditionally; each of
         # the three keys its compiled artifact / captured graph by an explicit `scale`
         # component). Mirrors `_run_tier`'s own (lack of a) bypass exactly, so the two can
-        # never disagree.
+        # never disagree. FIX-SCALECX X1: that dispatch can itself self-decline past
+        # `select_tier`'s own choice (B2#1) -- `_real_compiled_dispatch` names the tier
+        # that actually runs, not merely the one `select_tier` picked.
         if tier_id in ("torch_compile", "auto", "cuda_graph"):
-            return TierVerdict(tier_id, TIER_REASON_SCALE_ACTIVE_COMPILED, roi_armed, roi_reason)
+            real_tier, override_reason = _real_compiled_dispatch(tier_id, code, binding_types)
+            return TierVerdict(real_tier, override_reason or TIER_REASON_SCALE_ACTIVE_COMPILED,
+                               roi_armed, roi_reason)
         return TierVerdict("interpreter", TIER_REASON_SCALE_ACTIVE, roi_armed, roi_reason)
+    # FIX-SCALECX X1: the SAME self-decline is unconditional, not scale-specific (B2#1) --
+    # a plain (non-scale-active) cook selecting torch_compile/auto/cuda_graph is just as
+    # mispredicted by tier_id alone. Route through the identical correction.
+    if tier_id in ("torch_compile", "auto", "cuda_graph"):
+        real_tier, override_reason = _real_compiled_dispatch(tier_id, code, binding_types)
+        return TierVerdict(real_tier, override_reason or TIER_REASON_SELECTED, roi_armed, roi_reason)
     return TierVerdict(tier_id, TIER_REASON_SELECTED, roi_armed, roi_reason)
