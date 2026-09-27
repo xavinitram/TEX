@@ -150,8 +150,11 @@ first, exactly as `prepare()` does before this same gate runs.
 query's answer.** The query reports `roi_armed`/`tier` for the tier a cook actually runs
 on; `TEX_ROI_CODEGEN` is an orthogonal, `"default"`-tier-internal routing choice (codegen
 vs. the tree-walking interpreter for an already-armed ROI window) that does not change
-which `tier` value the query reports. See the codegen-ROI re-measurement below for
-whether that internal choice is worth flipping.
+which `tier` value the query reports. Re-measured at realistic interactive-viewport shapes
+(a small window against a 1920x1080 canvas, and against a 3840x2160/"4k" canvas) on a
+current box: codegen is measurably SLOWER than the interpreter at both shapes (reproduced
+across two independent, interleaved A/B sittings), so `TEX_ROI_CODEGEN` stays flagged OFF
+by default — this internal choice is not worth flipping today.
 
 ## The classifier and the override comment
 
