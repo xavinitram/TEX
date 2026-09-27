@@ -140,6 +140,35 @@ def test_scalecx49_capture_key_scale_1_0_normalises_to_none(r: SubTestResult):
         r.fail("scalecx49 X2 normalise-1.0", f"scale=None {k_none} != scale=1.0 {k_one}")
 
 
+def test_scalecx49_blacklist_bounded_across_many_distinct_scale_values(r: SubTestResult):
+    """FIX-SCALECX X5 (B4#5): `graphed._blacklist` is a bounded LRU (mirroring compiled.py's
+    own `_compile_blacklist`), not a plain unbounded `set` -- SCALECX-49's `scale` component
+    widened this key's growth axis (a capturable-but-declining scale-active program now mints
+    ONE blacklist entry per DISTINCT scale value seen, not one total), so a long session that
+    sweeps many distinct values (a slider drag, a per-frame procedural ramp) must not grow this
+    set without limit. Red at 32f6917: `_blacklist` was a plain `set`, `_BLACKLIST_MAX` did not
+    exist, and nothing bounded it."""
+    real_blacklist = dict(_graphed._blacklist)
+    _graphed._blacklist.clear()
+    try:
+        n = _graphed._BLACKLIST_MAX + 50
+        for i in range(n):
+            _graphed._blacklist_add(("fp", 0, "fp32", (), (), (), 0, float(i)))
+        size = len(_graphed._blacklist)
+        oldest_evicted = ("fp", 0, "fp32", (), (), (), 0, 0.0) not in _graphed._blacklist
+        newest_kept = ("fp", 0, "fp32", (), (), (), 0, float(n - 1)) in _graphed._blacklist
+        if size == _graphed._BLACKLIST_MAX and oldest_evicted and newest_kept:
+            r.ok(f"{n} distinct scale-keyed blacklist entries -> bounded at "
+                 f"{_graphed._BLACKLIST_MAX} (oldest evicted, newest kept)")
+        else:
+            r.fail("scalecx49 X5 bounded blacklist",
+                  f"size={size} (want {_graphed._BLACKLIST_MAX}), oldest_evicted="
+                  f"{oldest_evicted}, newest_kept={newest_kept}")
+    finally:
+        _graphed._blacklist.clear()
+        _graphed._blacklist.update(real_blacklist)
+
+
 def test_scalecx49_capture_key_bounded_by_distinct_scale_values(r: SubTestResult):
     """Bounded, not per-call: repeated requests at the SAME scale value produce the SAME
     key (a cache hit, not a new capture); only a genuinely different value produces a

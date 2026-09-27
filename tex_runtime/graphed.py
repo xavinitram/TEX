@@ -128,8 +128,26 @@ _SYNC_STDLIB = frozenset({
 
 # fingerprint-signature -> GraphedProgram (LRU, bytes-aware).
 _graph_cache: "OrderedDict[tuple, GraphedProgram]" = OrderedDict()
-# Signatures that failed capture — never retried this session.
-_blacklist: set[tuple] = set()
+# Signatures that failed capture — never retried this session. FIX-SCALECX X5 (B4#5):
+# bounded LRU (OrderedDict used as an ordered set), mirroring compiled.py's own
+# `_compile_blacklist`/`_blacklist_add` — SCALECX-49's `scale` component widened this key's
+# growth axis (a capturable-but-declining scale-active program now mints one entry per
+# DISTINCT scale value seen, not one total), and a plain unbounded `set` would grow without
+# limit over a long session (a resolution-scale slider drag, or a per-frame procedural
+# ramp, easily emits far more than a few distinct values). No real `pixel_args=` builtin
+# reaches this path today (each is `_SYNC_STDLIB`-gated before `_capture_key` is ever
+# computed — see `docs/resolution-scale.md`), so this is a bound for the mechanism's own
+# future use, not a fix for a currently-live leak.
+_blacklist: "OrderedDict[tuple, None]" = OrderedDict()
+_BLACKLIST_MAX = 256
+
+
+def _blacklist_add(key: tuple) -> None:
+    """Record a capture/replay-failed key, bounding total size (FIX-SCALECX X5)."""
+    _blacklist[key] = None
+    _blacklist.move_to_end(key)
+    while len(_blacklist) > _BLACKLIST_MAX:
+        _blacklist.popitem(last=False)
 # fingerprint -> static capturability (the AST gate is a full walk; memoize it so
 # cache-hit replays don't re-walk the program every cook).
 _capturable_memo: "dict[str, tuple[bool, int]]" = {}
@@ -756,7 +774,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
             logger.warning("[TEX] graph replay failed (%s); disabling this key.", e)
             if _graph_cache.pop(key, None) is not None:
                 _graph_bytes -= gp.bytes  # keep the byte budget honest on eviction
-            _blacklist.add(key)
+            _blacklist_add(key)
             return None
 
     # First sight of this key: check pressure, then attempt capture. HW-2: all device-
@@ -776,7 +794,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
         if not _recover_from_capture_failure(dev_index):
             _disable_graph_mode()
     if not ok:
-        _blacklist.add(key)
+        _blacklist_add(key)
         return None
 
     _graph_cache[key] = gp
@@ -803,7 +821,7 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
         logger.warning("[TEX] first graph replay failed (%s); using interpreter.", e)
         if _graph_cache.pop(key, None) is not None:
             _graph_bytes -= gp.bytes  # undo the += above so the budget stays honest
-        _blacklist.add(key)
+        _blacklist_add(key)
         return None
 
 
