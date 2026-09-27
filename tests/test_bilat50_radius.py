@@ -482,3 +482,38 @@ def test_bilat50_windowed_vs_whole_frame_detail_transfer_declines(r: SubTestResu
         r.fail("detail-transfer decline", f"{type(e).__name__}: {e}")
     finally:
         _R.clear_roi_memo()
+
+
+# ── A5 (v0.50 Phase C, R2#1): the radius<=3 inline regime duplicates
+# `_bilateral_exact_bchw` -- prove bit-identity AND cost-equality before collapsing it ──
+
+def test_bilat50_a5_exact_bchw_matches_inline_and_degenerates_to_one_tile(r: SubTestResult):
+    print("\n--- A5: _bilateral_exact_bchw is bit-identical to the radius<=3 inline math, "
+          "AND degenerates to a single untiled pass there (cost-equal) -- proof before "
+          "collapsing the dead middle regime ---")
+    torch.manual_seed(83)
+    img = make_img(1, 20, 24, 3, seed=83)
+    bchw = _get_bchw(img)
+    for ss, sr in ((0.3, 0.1), (0.5, 0.2), (0.75, 0.4), (1.0, 0.2)):
+        radius = int(math.ceil(3.0 * ss))
+        if radius > 3:
+            r.fail("a5 precondition", f"ss={ss} gave radius={radius} > 3 -- wrong test row")
+            return
+        via_fn = TEXStdlib.fn_bilateral_filter(img.clone(), ss, sr)  # today's inline branch
+        direct = TEXStdlib._bilateral_exact_bchw(bchw.clone(), ss, sr, radius).permute(0, 2, 3, 1)
+        if not torch.equal(via_fn, direct):
+            r.fail(f"a5 bit-identity ss={ss}", "fn_bilateral_filter's inline regime-1 output "
+                   "is not torch.equal to _bilateral_exact_bchw at the same radius")
+            return
+        # Cost-equality (structural, not wall-clock): at this radius, ksize=2*radius+1 is
+        # tiny, so `_BILATERAL_TILE_BUDGET_ELEMS` (~8M) covers the whole image in one tile
+        # -- `_bilateral_exact_bchw` degenerates to a single untiled pass, the same shape
+        # the inline branch always was.
+        H = bchw.shape[-2]
+        tile_h = max(1, TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS // max(1, bchw.shape[-1] * (2 * radius + 1) ** 2))
+        if tile_h < H:
+            r.fail(f"a5 cost-equality ss={ss}", f"tile_h={tile_h} < H={H} -- would tile, not "
+                   "degenerate to one pass")
+            return
+    r.ok("_bilateral_exact_bchw is bit-identical to the inline radius<=3 math and runs as a "
+         "single untiled pass there -- the two regimes are provably one regime under two names")

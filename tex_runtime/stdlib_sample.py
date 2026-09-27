@@ -803,28 +803,15 @@ class _StdlibSample:
         radius = int(math.ceil(3.0 * ss))  # BILAT-50: no clamp -- the true window
         bchw = _get_bchw(img)
 
-        if radius <= 3:
-            # At or below today's original 7x7 window: the UNCHANGED original math,
-            # untouched by this ask, byte-for-byte -- BILAT-50's own bit-identity
-            # requirement (torch.equal, CPU and CUDA; tests/test_bilat50_*.py).
-            ksize = 2 * radius + 1
-            padded = torch.nn.functional.pad(bchw, (radius, radius, radius, radius), mode='replicate')
-            patches = padded.unfold(2, ksize, 1).unfold(3, ksize, 1)
-            center = bchw.unsqueeze(-1).unsqueeze(-1)
-            inv_2ss = -0.5 / max(ss * ss, 1e-10)
-            dy = torch.arange(ksize, device=img.device, dtype=torch.float32) - radius
-            dx = dy.clone()
-            d2 = dy.view(-1, 1) ** 2 + dx.view(1, -1) ** 2  # [kH, kW]
-            w_spatial = torch.exp(d2 * inv_2ss).view(1, 1, 1, 1, ksize, ksize)
-            diff = patches - center
-            inv_2sr = -0.5 / max(sr * sr, 1e-10)
-            cd2 = (diff * diff).sum(dim=1, keepdim=True)
-            w_range = torch.exp(cd2 * inv_2sr)
-            w = w_spatial * w_range
-            numerator = (patches * w).sum(dim=(-2, -1))
-            denominator = w.sum(dim=(-2, -1))
-            result = numerator / denominator.clamp(min=1e-10)
-        elif radius <= TEXStdlib._BILATERAL_EXACT_RADIUS_MAX:
+        # A5 (v0.50 Phase C, R2#1): `_bilateral_exact_bchw`'s row-tiling degenerates to a
+        # single untiled pass whenever `tile_h >= H`, which is always true at a small
+        # `ksize` (small radius) -- so it is correct, and bit-identical (proven,
+        # `tests/test_bilat50_radius.py::test_bilat50_a5_exact_bchw_matches_inline_and_
+        # degenerates_to_one_tile`), for `radius<=3` too. The old third regime hand-
+        # inlined the identical spatial-weight/weighted-average formula a second time,
+        # reachable only for `radius<=3` -- two regimes now (exact / detail-transfer),
+        # matching `_gauss_blur_auto`'s own two-regime dispatch.
+        if radius <= TEXStdlib._BILATERAL_EXACT_RADIUS_MAX:
             result = TEXStdlib._bilateral_exact_bchw(bchw, ss, sr, radius)
         else:
             result = TEXStdlib._bilateral_detail_transfer_bchw(bchw, ss, sr)
