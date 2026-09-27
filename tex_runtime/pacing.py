@@ -1032,3 +1032,18 @@ def restore_state(snapshot: dict) -> None:
     # window clean costs at most one extra warm-estimate addition on the outer's very next
     # poll, never a wrong (too-permissive) budget decision.
     _state.running_cost_ms = 0.0
+    # FIX-PACE49 P3 (B3-pacing.md #2): the timing anchor (`pool["timed_prev"]`/
+    # `pool["timed_site"]`/`pool["timed_anchor"]`) is exactly the same class of shared,
+    # pool-resident state as `last_confirmed_done` above, for the identical reason -- it
+    # lives on the SHARED pool dict, not in `_state.__dict__`, so a same-device nested
+    # cook's own attribution cycle can have overwritten it with ITS OWN call site's
+    # identity before this restore ever runs. Left verbatim, the outer's next real
+    # interval would be credited to whatever call site the inner cook happened to leave
+    # behind (confirmed: B3-pacing.md's own repro). Clearing it costs at most one interval
+    # of lost attribution on the outer's own next confirm (exactly like a fresh `reset()`'s
+    # first poll never has a prior anchor either) -- never a wrong credit.
+    pool = getattr(_state, "pool", None)
+    if pool is not None:
+        pool["timed_prev"] = None
+        pool["timed_site"] = None
+        pool["timed_anchor"] = None
