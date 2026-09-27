@@ -16,6 +16,13 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.dirname(ROOT))  # custom_nodes on path
 
 from TEX_Wrangle.tex_runtime import stdlib_registry as R  # noqa: E402
+# H3: `stdlib_registry.REGISTRY` is populated as a SIDE EFFECT of importing
+# `tex_runtime.stdlib` (its own top-level imports pull in `stdlib_core`/`stdlib_sample`/etc.,
+# whose `@stdlib(...)` decorators run at class-body time). Importing only `stdlib_registry`
+# itself, as above, leaves the registry empty in a fresh process where nothing else has
+# already imported `stdlib` first (pytest's own collection happens to do that, which is why
+# this was invisible in-suite) -- trigger the same side effect here explicitly.
+from TEX_Wrangle.tex_runtime import stdlib as _stdlib  # noqa: E402,F401
 from TEX_Wrangle.tex_compiler.stdlib_signatures import FUNCTION_SIGNATURES  # noqa: E402
 
 _FIELD = lambda k, line: (re.search(rf'\b{k}:\s*"((?:[^"\\]|\\.)*)"', line) or [None, None])[1]
