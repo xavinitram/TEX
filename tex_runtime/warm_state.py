@@ -189,16 +189,26 @@ def persist(*, force: bool = False) -> None:
     (a capturability verdict is a pure function of the AST + arch, so re-adopting it cannot
     conflict); the reverse order would lose them outright.
 
-    W3 (FIX-WARM): the whole throttle-check-through-write body runs under `_persist_lock`, so
-    two concurrent callers (a cook thread's `note_update` and a `prewarm_async` background
-    job's `force=True`, the first same-process pairing this invariant ever had to survive)
-    serialize instead of interleaving on the shared globals and the snapshot/`drop_prefix`
-    sequence."""
+    W3 (FIX-WARM): a THROTTLED call (the common `note_update` case — every verdict inside the
+    window) still returns lock-free, exactly as before, so an ordinary single-threaded cook
+    pays nothing new. Only a call that is actually about to write (a genuine `force=True`, or
+    a `force=False` call whose throttle window has elapsed) takes `_persist_lock`, re-checks
+    the throttle INSIDE the lock (a second caller that lost the race to the first may now
+    find the window has just been refreshed and bail out too, rather than duplicate the
+    write), and only then runs the snapshot-through-`drop_prefix` body — so two concurrent
+    callers (a cook thread's `note_update` and a `prewarm_async` background job's
+    `force=True`, the first same-process pairing this invariant ever had to survive)
+    serialize instead of interleaving on the shared globals and that sequence."""
     global _last_persist
+    # Unlocked fast path FIRST: the throttled call is the overwhelmingly common one and it
+    # must cost nothing beyond what it already did (invariant 7 — no lock on this path).
+    now = time.time()
+    if not force and (now - _last_persist) < _PERSIST_THROTTLE_SEC:
+        return
     with _persist_lock:
-        # Throttle FIRST. `_path()` is memoized now, but the ordering is the point: the
-        # throttled call is the common one (every `note_update` inside the window) and it
-        # must do nothing.
+        # Re-check inside the lock: a caller that lost the race to acquire it may find
+        # another thread already refreshed `_last_persist` while it waited, in which case
+        # this (non-forced) call is now stale and must not duplicate the write.
         now = time.time()
         if not force and (now - _last_persist) < _PERSIST_THROTTLE_SEC:
             return
