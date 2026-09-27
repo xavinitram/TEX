@@ -536,14 +536,16 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                     for stmt in stmts:
                         _pace.paced_check(
                             cancel, dev,
-                            heavy=_heavy_ids is not None and id(stmt) in _heavy_ids)  # PACE-45/47d
+                            heavy=_heavy_ids is not None and id(stmt) in _heavy_ids,  # PACE-45/47d
+                            call_site_id=id(stmt))  # PACE-49
                         self._exec_stmt(stmt)
                 else:
                     n = len(stmts) or 1
                     for i, stmt in enumerate(stmts):
                         _pace.paced_check(
                             cancel, dev,
-                            heavy=_heavy_ids is not None and id(stmt) in _heavy_ids)  # PACE-45/47d
+                            heavy=_heavy_ids is not None and id(stmt) in _heavy_ids,  # PACE-45/47d
+                            call_site_id=id(stmt))  # PACE-49
                         self._exec_stmt(stmt)
                         _report_progress(on_progress, "stmt", (i + 1) / n)
         finally:
@@ -652,7 +654,8 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                 # P2: `_heavy_ids` is None whenever classification was skipped (unpaced) —
                 # `heavy=False` is the correct, cheap answer `paced_check` ignores anyway.
                 _pace.paced_check(cancel, dev,
-                                  heavy=_heavy_ids is not None and id(stmt) in _heavy_ids)   # PACE-45/47d
+                                  heavy=_heavy_ids is not None and id(stmt) in _heavy_ids,  # PACE-45/47d
+                                  call_site_id=id(stmt))  # PACE-49
             self._exec_stmt(stmt)
             if on_progress is not None:
                 i += 1

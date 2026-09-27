@@ -280,7 +280,7 @@ the raw fp16 win (~1.35–1.45×) is available, without the safety net, via expe
 (`img_*`, `arr_*`) accumulate in fp32 (an fp16 sum overflows to inf at ≥1024²); an
 out-of-fp16-range literal / a large-value `vec()` also stays fp32 (interp==codegen).
 
-## The 46-cache architecture
+## The 47-cache architecture
 
 Non-redundant by design — each store keys on a different thing (source-hash vs
 `id()`-type_map vs device/precision tuple vs AST-fingerprint vs resolution-bucket)
@@ -344,6 +344,7 @@ Bounds below are entry counts, and every store is process-lifetime unless stated
 | `tex_fusion._FUSED_FP_MEMO` | the same chain key | the fused fingerprint, memoized because `prepare()` now asks for it on every cook; 256 |
 | `interpreter_analysis._READS_MEMO` | `id(program)`, re-checked with `is` | the binding names a program reads, PLUS (COLOR-1, v0.40 simplify) the subset bound at a registered non-spatial argument position (e.g. `apply_lut3d`'s LUT arg) that `_consensus_extent`'s (B,H,W) shape scan and `graphed._spatial_px` both exclude — one walk, one memo entry per program; holding the program pins the AST alive; 128 (SPLIT-47 moved this out of `interpreter.py`; `_consensus_extent` itself stays there and reaches it via the re-export) |
 | `pacing_heavy._HEAVY_STMT_MEMO` | `id(program.statements)`, re-checked with `is` | PACE-47d: which of a program's top-level statements call a registry-derived "heavy" (halo/halo_arg-footprint) builtin — one walk, one memo entry per program's statement list; holding the list pins it alive, same shape and reason as `_READS_MEMO` above; 128 |
+| `pacing._COST_TABLE` | `(call_site_id, device_index, px_bucket)` | PACE-49: bounded per-call-site EWMA of REAL device time, fed only from a `paced_check` peek/wait that already made the CUDA call whose completion made an `elapsed_time()` reading free — never a new device call; module-global (not thread-local, unlike this module's own `_state`), because a call site's cost is a property of the (program, device, resolution) triple, not of which cook thread polled it; 512 |
 | `tex_engine._AUTO_DECISION` | fingerprint x resolution bucket x device | the `precision="auto"` fp16/fp32 gate DECISION; cleared at 512 |
 | `compiled._compiled_cache` | fingerprint x device x precision | compiled callable + backend; 16, because each entry can hold 30-60 MB of kernels |
 | `compiled._compile_blacklist` | fingerprint | programs that crashed `torch.compile`; session-scoped on purpose (never persisted); 256 |

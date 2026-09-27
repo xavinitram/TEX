@@ -127,12 +127,56 @@ with `reset()`'s differently-shaped raw value.
 
 Thread-local (mirrors `stdlib_core._cook_ctx`): a second cook on another thread must not
 share, or wait on, this cook's event pools. `stdlib_core.set_cook_grid`/`restore_cook_ctx`
-save/restore this module's own state across a NESTED cook on the same thread (P3)."""
+save/restore this module's own state across a NESTED cook on the same thread (P3).
+
+PACE-49: a MEASURED per-call-site device-time budget, additive to `depth`. Every iteration
+through PACE-47e answered "is the statement about to run expensive enough to skip the
+completed-tail peek's own blind spot" with a NAME (a registry footprint/`heavy` tag) or a
+CONSTANT (`_HEAVY_PIXEL_THRESHOLD`) -- both proxies, and R4-altitude (v0.47 Phase C) named
+two real shapes neither proxy covers: a user `for`-loop whose body is per-iteration
+expensive but below the pixel threshold (a loop's own top-level statement carries no
+footprint of its own -- the tag lives on whatever it CALLS, if anything), and a noise
+builtin (`fbm`/etc.) whose runtime `octaves` argument makes ONE call far more expensive
+than its binary `heavy` tag communicates. This module already does exactly two CUDA calls
+at a poll point -- a non-blocking `query()` peek or a blocking `synchronize()` wait -- and
+the moment either one confirms an event complete is exactly the moment that event's own
+elapsed device time becomes knowable for free via `elapsed_time()` (a host-side read of two
+already-recorded timestamps, never a new device call). PACE-49 reads it there and folds it
+into a small, bounded, per-call-site EWMA table (`_COST_TABLE` below -- module-global, not
+thread-local, mirroring `profile.py`'s own `_blend`/`_STATE` shape, AUTHOR DECISION 1(a): a
+tiny, self-contained duplicate rather than a shared leaf module or an inverted import,
+because `profile.py` already imports `pacing` (F5) and the reverse would be circular).
+
+Cold start (AUTHOR DECISION 4(a)): today's registry rule is the seed. A call site with no
+estimate yet (unmeasured, or still under `_COST_WARMUP_SAMPLES`) never enters the ms-budget
+decision at all -- it rides the EXISTING `heavy`/`stride_s==0` gate exactly as every prior
+PACE-4x release did, so tick one of a program this mechanism has never seen is provably no
+worse than today. Only once a call site is WARM does its measured `ewma_ms` get summed
+against `pace_budget_ms` (a token attribute alongside `pace_depth`/`pace_stride_ms`, `0`
+disabling the dimension -- the same escape-hatch shape `stride` already uses) to decide
+whether the running total of estimated queued work since the pool's last REAL record has
+grown too large to keep economizing, REGARDLESS of what the tail's own peek says -- closing
+exactly the gap a MEASUREMENT can close and a proxy cannot (AUTHOR DECISION 3(a): additive
+to `depth`, never replacing it).
+
+Opted in per call site (AUTHOR DECISION 2(a)): the `call_site_id` keyword. A caller that
+omits it (every pre-PACE-49 call site: the codegen tier's in-body `_CK` polls, a multi-pass
+builtin's between-pass poll) pays NOTHING new -- no lock, no dict lookup, no attribution --
+byte-for-byte the pre-PACE-49 behaviour. Only the interpreter's own per-top-level-statement
+poll (both the plain and the profiled loop) passes one, using `id(stmt)` -- the exact
+identity `pacing_heavy.heavy_stmt_ids` already keys its own memo on -- because that
+already-computed identity is what makes the design's own for-loop and high-octave-noise
+counter-examples resolvable: an interpreted TOP-LEVEL statement gets exactly one poll before
+it runs, in a Program object this tree already caches and re-cooks repeatedly (an
+interactive host's slider drag, a background preview) -- so a call site's OWN cost, once
+measured on one cook, informs every later cook of the SAME statement, regardless of what it
+calls or how many pixels it touches."""
 from __future__ import annotations
 
 import math as _math
 import threading as _threading
 import time as _time
+from collections import OrderedDict as _OrderedDict
 from collections import deque as _deque
 
 import torch
@@ -178,6 +222,109 @@ _DEFAULT_STRIDE_S = 0.004
 #: everywhere. Not re-tuned per-box: a single, hand-picked constant, like `_DEFAULT_DEPTH`/
 #: `_DEFAULT_STRIDE_S` above.
 _HEAVY_PIXEL_THRESHOLD = 512 * 512
+
+
+#: PACE-49: the default per-poll millisecond budget (see the module docstring's own
+#: section). Chosen to sit clearly ABOVE a genuinely cheap point-footprint statement's own
+#: measured device cost at a sub-`_HEAVY_PIXEL_THRESHOLD` resolution (this file's own
+#: `_HEAVY_PIXEL_THRESHOLD` comment cites ~0.67ms/2.65ms at 1024^2/2048^2 on the reference
+#: sm_75 card -- already caught by the pixel threshold, so the budget only has to matter
+#: BELOW it) and clearly BELOW the drain-p95 blow-up PACE-47e measured for the class of bug
+#: this ask closes (tens of ms). Re-measure with `benchmarks/preempt_drain_bench.py --sweep`
+#: before changing; `pace_budget_ms=0` disables the dimension entirely (mirrors `stride`'s
+#: own escape hatch), which is the ONLY way to recover byte-for-byte pre-PACE-49 economizing
+#: for a token that already sets `pace_stride_ms` explicitly.
+_DEFAULT_BUDGET_MS = 8.0
+
+#: PACE-49: measure every call site until it has this many real device-time samples before
+#: its estimate is trusted over the registry-derived cold-start guess (AUTHOR DECISION
+#: 4(a)) -- mirrors `profile.py`'s own `_WARMUP_SAMPLES` shape and reasoning (a cold
+#: estimate is unrepresentative; a few real samples settle it).
+_COST_WARMUP_SAMPLES = 3
+
+#: PACE-49: the EWMA blend weight, identical to `profile.py`'s own `_ALPHA` -- duplicated,
+#: not imported (AUTHOR DECISION 1(a): `profile.py` already imports this module, so the
+#: reverse would be circular).
+_COST_ALPHA = 0.35
+
+#: PACE-49: bound on the per-call-site table's size (an LRU, oldest-evicted-first), the same
+#: shape and order of magnitude as `profile.py`'s own `_STATE_MAX` -- a long session must
+#: never grow this table without bound just because it keeps seeing new call sites (a
+#: program edited/reloaded many times, or many distinct programs cooked in one process).
+_COST_TABLE_MAX = 512
+
+#: PACE-49: {(call_site_id, device_index, px_bucket): [ewma_ms, samples]}. Module-global
+#: (NOT thread-local, unlike the rest of this module's `_state`): a call site's own device
+#: cost is a property of the (program, device, resolution) triple, not of which worker
+#: thread happened to poll it, so a program cooked across several threads (ENG-9's per-cook-
+#: thread interpreters) shares one measured history rather than each thread relearning it
+#: from cold. Guarded by `_COST_LOCK` below, entirely independent of `_state`'s own
+#: thread-local, lock-free bookkeeping.
+_COST_TABLE: "_OrderedDict[tuple, list]" = _OrderedDict()
+
+#: Guards `_COST_TABLE` only. A plain `Lock`: every critical section here is a handful of
+#: dict operations (mirrors `profile.py`'s own `_LOCK` reasoning), and this lock is never
+#: acquired while any OTHER lock in this tree is held, so there is no ordering cycle to
+#: deadlock on.
+_COST_LOCK = _threading.Lock()
+
+
+def _cost_blend(prev: float, ms: float, n: int) -> float:
+    """PACE-49: identical rule to `profile.py:_blend` (duplicated, not imported -- see the
+    module docstring). A mean while the key is young (sample 2 is worth half, sample 3 a
+    third...), an EWMA once `_COST_ALPHA` takes over -- sheds a cold first-sample outlier
+    fast without needing dozens of samples to dilute it."""
+    if n <= 1:
+        return ms
+    a = max(_COST_ALPHA, 1.0 / n)
+    return a * ms + (1.0 - a) * prev
+
+
+def _cost_feed(key: tuple, ms: float) -> None:
+    """PACE-49: fold one real, retrospectively-attributed device-time reading for *key* into
+    the table -- called only from a poll that has ALREADY paid for the CUDA call whose
+    completion made *ms* knowable (see `_pace49_attribute`'s own docstring); never a new
+    CUDA call itself. Negative/non-finite readings are dropped rather than poisoning the
+    EWMA (mirrors `profile.record`'s own `ms is None or ms < 0` guard); `elapsed_time`
+    between two real, completed CUDA events should never produce one, but a mocked or
+    exotic event implementation is not this function's contract to trust blindly."""
+    if ms is None or not _math.isfinite(ms) or ms < 0:
+        return
+    with _COST_LOCK:
+        entry = _COST_TABLE.get(key)
+        if entry is None:
+            entry = [0.0, 0]
+            _COST_TABLE[key] = entry
+            while len(_COST_TABLE) > _COST_TABLE_MAX:
+                _COST_TABLE.popitem(last=False)
+        else:
+            _COST_TABLE.move_to_end(key)
+        entry[1] += 1
+        entry[0] = _cost_blend(entry[0], ms, entry[1])
+
+
+def _cost_lookup(key: tuple):
+    """PACE-49: `(ewma_ms, samples)` for *key*, or `None` if this call site has never been
+    fed a real reading -- the caller (`_pace49_cost_gate`) treats `None` and
+    "not yet warm" (`samples < _COST_WARMUP_SAMPLES`) identically: ride the registry-derived
+    cold-start rule, never this table, until there is enough real evidence to trust it
+    (AUTHOR DECISION 4(a))."""
+    with _COST_LOCK:
+        entry = _COST_TABLE.get(key)
+        if entry is None:
+            return None
+        _COST_TABLE.move_to_end(key)
+        return entry[0], entry[1]
+
+
+def _resolve_budget_ms(token) -> float:
+    """PACE-49: the additive millisecond budget for this cook: `token.pace_budget_ms` if the
+    token names one (a plain, FINITE, non-negative `int`/`float` -- `bool` rejected, the same
+    `_resolve_token_attr` shape every other pacing knob uses), else `_DEFAULT_BUDGET_MS`. `0`
+    disables the dimension outright -- this cook's polls fall back to depth/stride/heavy
+    exactly as pre-PACE-49, the same escape hatch `pace_stride_ms=0` already offers for
+    striding."""
+    return _resolve_token_attr(token, "pace_budget_ms", _DEFAULT_BUDGET_MS, (int, float), 0)
 
 
 def wants_pacing(token) -> bool:
@@ -383,6 +530,14 @@ def reset(token=None, device=None, spatial_shape=None) -> None:
     _state.is_current = is_current
     _state.depth = _resolve_depth(token)
     _state.stride_s = _resolve_stride(token)
+    # PACE-49: resolved once per cook, same shape as depth/stride above. `device_idx`/
+    # `px_bucket` complete this cook's own cost-table KEY (with a caller's `call_site_id`);
+    # `running_cost_ms` is the ms-budget's own running total, always fresh per cook (never
+    # inherited from a prior cook on this pool -- a stale carry-over could force a
+    # fall-through this cook's own first poll never earned).
+    _state.budget_ms = _resolve_budget_ms(token)
+    _state.running_cost_ms = 0.0
+    _state.device_idx = idx
     # PACE-47e / FIX-PACE P5 (R2#1): resolved ONCE per cook, from whatever spatial_shape
     # the caller has in hand (`set_cook_grid` always does; a caller with none, e.g. the
     # stencil-only route's own pre-`_invoke_cg` entry poll, resolves 0 pixels here --
@@ -404,6 +559,10 @@ def reset(token=None, device=None, spatial_shape=None) -> None:
             pixels = 0
     if pixels >= _HEAVY_PIXEL_THRESHOLD:
         _state.stride_s = 0.0
+    # PACE-49: the cost table's own resolution axis, bucketed exactly like `profile.
+    # bucket_of` (`px.bit_length()`) so a session drifting within one octave of resolution
+    # keeps landing in the same bucket rather than never accumulating samples.
+    _state.px_bucket = pixels.bit_length()
     pools = getattr(_state, "pools", None)
     if pools is None:
         pools = {}
@@ -430,9 +589,18 @@ def reset(token=None, device=None, spatial_shape=None) -> None:
     #: poll -- see `paced_check`'s own comment at the read site for why identity alone is
     #: safe here (invalidated on every real record, never stale across a re-`record()`).
     _state.last_confirmed_done = None
+    # PACE-49: the pool's own timing anchor (the last event this mechanism has already
+    # attributed FROM, and which call site's poll set it) is cleared on every reset, never
+    # inherited across a cook boundary — mirroring `last_confirmed_done` just above and for
+    # the identical reason (P1, `restore_state`'s own docstring): the pool object itself
+    # persists and is shared with a same-device NESTED cook, whose own poll sequence can
+    # pop/re-record the very event this anchor points at before this cook's next poll runs,
+    # so a carried-over anchor could attribute a stale interval to the wrong call site.
+    pool["timed_prev"] = None
+    pool["timed_site"] = None
 
 
-def paced_check(token, device, heavy: bool = False) -> None:
+def paced_check(token, device, heavy: bool = False, call_site_id=None) -> None:
     """One poll point. `token is None` is the untouched default path (a no-op, exactly
     `host._cancel_check`'s own body). A token that does not ask for pacing, or a cook that
     is not on CUDA, is the SAME body too — one `token.check()` — so the unpaced cost is
@@ -463,6 +631,23 @@ def paced_check(token, device, heavy: bool = False) -> None:
     not every call site can pass it yet — a stdlib builtin's own internal poll can, since it
     knows what it is about to run; codegen's in-body `_CK` passes whatever the emitted
     source hard-codes per poll site instead, see PACE-47d).
+
+    **PACE-49 — `call_site_id`: a MEASURED additive ms-budget, opted in per caller.** `None`
+    (every call site before this ask, and codegen's/a multi-pass builtin's own poll today)
+    means this whole mechanism is inert for this call — no lock, no table lookup, no
+    attribution — byte-for-byte the pre-PACE-49 body. When a caller passes an identity (the
+    interpreter's per-statement poll passes `id(stmt)`), two things change: (1) at a peek
+    that FRESHLY confirms the tail complete (never from the PACE-47b cache — that interval is
+    already banked), the real elapsed device time since this mechanism's own last attribution
+    point is folded into *this call site's* bounded EWMA table entry (see the module
+    docstring); (2) once that entry is WARM, its estimate is summed into this cook's own
+    running "estimated ms queued since the last real record" and compared against
+    `pace_budget_ms` — if the sum would exceed budget, the stride/peek economization is NOT
+    honoured for this poll, regardless of what the tail's own peek said, and the poll falls
+    through to the ordinary depth-gated record/wait exactly as `heavy=True` would. A cold or
+    not-yet-warm call site never contributes to that sum and never itself forces a
+    fall-through — it rides the SAME `heavy`/large-resolution rule this function already had
+    (AUTHOR DECISION 4(a): cold start is today's behaviour, never worse).
 
     Paced (a CUDA cook, a token with a truthy `pace`): polls the token first (an
     already-tripped token is caught before any device interaction) — ALWAYS, regardless of
@@ -572,9 +757,22 @@ def paced_check(token, device, heavy: bool = False) -> None:
             # so the cache can never survive a re-arm and answer for the wrong recording.
             outstanding = pool["outstanding"]
             tail = outstanding[-1] if outstanding else None
-            if tail is None or tail is _state.last_confirmed_done or tail.query():
+            was_cached = tail is not None and tail is _state.last_confirmed_done
+            if tail is None or was_cached or tail.query():
+                # PACE-49: a FRESH confirmation (never one served from the PACE-47b cache,
+                # which answers for an interval this mechanism has already banked) is the
+                # "moment an event's own elapsed device time becomes knowable for free" the
+                # module docstring describes -- attribute it before deciding whether to
+                # skip, so the budget check just below sees this call site's latest number.
+                if call_site_id is not None and tail is not None and not was_cached:
+                    _pace49_attribute(pool, tail, call_site_id)
                 _state.last_confirmed_done = tail
-                return  # device caught up: token already checked, nothing else to do
+                if call_site_id is None or _pace49_cost_gate(call_site_id):
+                    return  # device caught up (and, if measured, within budget)
+                # else: a warm call site's own measured cost pushed the running estimate
+                # past `pace_budget_ms` -- do not honour the stride/peek skip for this poll;
+                # fall through to the ordinary depth-gated record/wait below, exactly as
+                # `heavy=True` would.
 
     # P3: reached only when the poll must actually record/wait (striding off, heavy,
     # large-resolution, the stride window elapsed, or the peek found the device behind) --
@@ -590,18 +788,103 @@ def paced_check(token, device, heavy: bool = False) -> None:
         oldest.synchronize()
         token.check()
         free.append(oldest)
+        # PACE-49: `synchronize()` above is itself a fresh completion confirmation, the same
+        # "free" moment the peek's `query()` is -- attribute from it too, so a cook that
+        # never economizes (heavy/large-resolution/stride=0) still measures its own call
+        # sites rather than only ever riding the cold-start guess.
+        if call_site_id is not None:
+            _pace49_attribute(pool, oldest, call_site_id)
 
     # `blocking=True` so a wait on this event (above, some FUTURE poll) releases the GIL.
-    ev = free.pop() if free else torch.cuda.Event(blocking=True)
+    # PACE-49: `enable_timing=True` too -- every pool event is now timing-capable, so an
+    # `elapsed_time()` read is always available at whichever peek/wait next confirms it
+    # complete, at no cost beyond the flag itself (only a PACED cook's own events; the
+    # unpaced default path never constructs one).
+    ev = free.pop() if free else torch.cuda.Event(blocking=True, enable_timing=True)
     _record_on(ev, device, _state.is_current)
     outstanding.append(ev)
+    # PACE-49: seed the timing anchor from THIS record, but ONLY when there is none yet
+    # (`reset()` cleared it, and no peek/wait has confirmed anything since) -- never
+    # overwrite an EXISTING anchor here: this event has not itself completed yet, so
+    # nothing can be attributed FROM it until some LATER poll confirms it (as `tail`,
+    # through `_pace49_attribute`); overwriting the anchor now, unconfirmed, would only
+    # throw away whatever interval the OLD anchor was still waiting to be diffed against.
+    # Safe even though *ev* has not completed: CUDA completes events on one stream in the
+    # order they were recorded, so *ev* is guaranteed complete by the time any event
+    # recorded strictly after it is confirmed complete -- the same in-order argument
+    # `profile.py`'s own PROF-462 comment makes for its lazy fold.
+    if call_site_id is not None and pool.get("timed_prev") is None:
+        pool["timed_prev"] = ev
+        pool["timed_site"] = call_site_id
     # PACE-47b: invalidate the query() cache -- this event was JUST re-armed onto a new
     # point (or is brand new), so any earlier "confirmed done" answer (for this object or
     # any other) no longer describes what `outstanding[-1]` is now. The next economizing
     # poll must peek fresh.
     _state.last_confirmed_done = None
+    # PACE-49: a real record just happened -- whatever was accumulating toward the budget
+    # since the last one is now moot; the next window starts clean.
+    _state.running_cost_ms = 0.0
 
     _state.last_record_t = _time.perf_counter()
+
+
+def _pace49_attribute(pool: dict, tail, call_site_id) -> None:
+    """PACE-49: fold the real device-time interval between `pool["timed_prev"]` (this
+    mechanism's own last attribution anchor) and *tail* (an event JUST confirmed complete by
+    a peek's `query()` or a wait's `synchronize()` -- never called otherwise, so
+    `elapsed_time()` is always safe to read here) into `pool["timed_site"]`'s cost-table
+    entry, then advances the anchor to *tail*/`call_site_id` for the NEXT interval. Credits
+    the WHOLE interval to `timed_site` alone (the call site whose own poll started it) rather
+    than trying to split it among several call sites that may have run in between -- the
+    simplest attribution that is never wrong in the case this ask's own acceptance shapes
+    exercise (one call site polls repeatedly; nothing else's poll intervenes), and merely
+    coarse, not incorrect, if something else did (that other call site's own polls get their
+    own, later, correctly-anchored intervals once IT triggers a real record).
+
+    Silently skipped (never raises) if there is no anchor yet (`timed_prev is None`, the
+    pool's first attribution point since the last `reset()`), the anchor IS *tail* itself
+    (nothing elapsed to attribute, `depth<=1` can hand the same event to both roles), or
+    `elapsed_time()` raises (an exotic event backend) -- losing one interval's reading is the
+    honest choice `profile._drain_pending` already makes for the same class of failure,
+    never a reason to raise out of a poll point."""
+    prev, prev_site = pool.get("timed_prev"), pool.get("timed_site")
+    if prev is not None and prev is not tail and prev_site is not None:
+        try:
+            ms = prev.elapsed_time(tail)
+        except Exception:
+            ms = None
+        if ms is not None:
+            _cost_feed((prev_site, _state.device_idx, _state.px_bucket), ms)
+    pool["timed_prev"] = tail
+    pool["timed_site"] = call_site_id
+
+
+def _pace49_cost_gate(call_site_id) -> bool:
+    """PACE-49: `True` while it is still safe to honour the stride/peek skip for this poll --
+    either because the ms-budget dimension is disabled (`pace_budget_ms<=0`, the escape
+    hatch), this call site has no estimate yet or is not yet WARM (`samples <
+    _COST_WARMUP_SAMPLES` -- rides the registry-derived `heavy`/large-resolution rule
+    instead, AUTHOR DECISION 4(a)), or its warm estimate, added to this cook's own running
+    total since the pool's last real record, still fits under `pace_budget_ms`. Mutates
+    `_state.running_cost_ms` as a side effect exactly when it returns `True` on a warm
+    estimate -- the accumulation IS the point (several distinct cheap-alone call sites can
+    still sum past budget before any one of them would trip it alone); `False` means the
+    caller must fall through to a real record, which itself resets the running total to
+    zero (see `paced_check`)."""
+    budget = _state.budget_ms
+    if budget <= 0:
+        return True
+    est = _cost_lookup((call_site_id, _state.device_idx, _state.px_bucket))
+    if est is None:
+        return True
+    ewma_ms, samples = est
+    if samples < _COST_WARMUP_SAMPLES:
+        return True
+    total = _state.running_cost_ms + ewma_ms
+    if total > budget:
+        return False
+    _state.running_cost_ms = total
+    return True
 
 
 _UNSET = object()  #: cook_done_event's memo has never been written on this thread yet
@@ -697,3 +980,10 @@ def restore_state(snapshot: dict) -> None:
     _state.__dict__.clear()
     _state.__dict__.update(snapshot)
     _state.last_confirmed_done = None
+    # PACE-49: same reasoning as `last_confirmed_done` just above -- a same-device nested
+    # cook may have done its own real records against this SHARED pool in between, real
+    # queued device work the outer's own pre-nesting running total knows nothing about.
+    # Restoring it verbatim could UNDER-count what is really outstanding; starting the
+    # window clean costs at most one extra warm-estimate addition on the outer's very next
+    # poll, never a wrong (too-permissive) budget decision.
+    _state.running_cost_ms = 0.0
