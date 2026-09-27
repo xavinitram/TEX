@@ -290,9 +290,21 @@ def test_joinwire50b_negative_control_windowed_output_would_corrupt_if_cached(r:
                "boundary -- exactly the bug this rule exists to prevent")
         return
 
-    # Now show WHY that rule matters: manually put stage 2's windowed (cropped+re-embedded)
-    # output under that same key, and use it as a "clean" boundary for a DIFFERENT window.
-    windowed_embedded = win["stage_outputs"][2]["OUT"]     # full-size, but only `roi` is real
+    # FIX-DAG G1: `stage_outputs[2]["OUT"]` is now the bare CROP `cook_stage_list` itself
+    # returned — the public surface no longer carries a padded, mostly-garbage full canvas
+    # at all (that used to be exactly this attack's own setup). Confirm the crop really is
+    # small (not accidentally full-size, which would silently defang this test), then
+    # reconstruct the OLD full-size, only-`roi`-real shape by hand via `_embed_window` — the
+    # one place that re-embed still exists — to show WHY the rule matters: manually put that
+    # reconstructed value under the boundary key, and use it as a "clean" boundary for a
+    # DIFFERENT window.
+    stage2_crop = win["stage_outputs"][2]["OUT"]
+    if list(stage2_crop.shape[1:3]) == [H, W]:
+        r.fail("JOINWIRE-50b negative control setup",
+               "stage 2's stage_outputs entry is already full-size -- the crop-vs-embed "
+               "distinction this attack needs is gone")
+        return
+    windowed_embedded = tex_chain._embed_window(stage2_crop, win["stage_windows"][2])
     rc_poisoned = tex_results.ResultCache()
     rc_poisoned.put(key, windowed_embedded, canvas={"shape": list(windowed_embedded.shape)})
 

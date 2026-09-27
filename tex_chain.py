@@ -316,19 +316,52 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
 # stage's CROPPED output to its downstream consumer(s) as a full-size tensor, which
 # `run_roi`'s own per-cook narrowing step (`tex_memory.run_roi`) requires of every spatial
 # binding.
+#
+# FIX-DAG G1 (R3#1): a non-sink windowed stage's crop used to be re-embedded into a fresh
+# ZERO-FILLED full canvas the moment it was cooked, and THAT embedded (mostly-zero) tensor
+# was what `stage_outputs` reported back to a caller — measured ~3.65 ms / 126.56 MiB at 4K,
+# almost entirely the zero-fill (an `empty` allocation of the identical shape measured
+# ~0.004 ms, a ~750x gap), above the host's own 2.0 ms windowed-tick budget from a SINGLE
+# such stage. The efficiency review's own read of the brief's pooled-canvas idea REFUTED it on two
+# grounds: `stage_outputs` is a documented "peek an intermediate" surface a caller (or a real
+# test, `test_joinwire50b_checkpointed_dag_cook.py`'s own negative control) may read directly,
+# so a pool recycled across calls could hand back another cook's real pixels or poison; and
+# `stage_outputs[idx]` is memoized and can be read by more than one consumer within ONE call
+# (a diamond), so a buffer keyed only on (shape, dtype, device) risks aliasing a still-live
+# value. Both hazards are about the FULL-SIZE embedded buffer existing at all outside the
+# ephemeral moment it feeds a downstream `run_roi` call — so the fix removes that buffer from
+# the public surface instead of trying to pool it: `stage_outputs[idx]` now holds the RAW
+# CROP (the same tensor `cook_stage_list` returned, never padded), and a sibling return key,
+# `stage_windows`, names which entries are crops and at what absolute window — a caller that
+# wants to peek gets the honest, small tensor plus its offset, never a mostly-garbage
+# full-size one. The full-size re-embed still happens, but only ephemerally, in-memory, at
+# the one point that still needs run_roi's full-extent contract (feeding a downstream
+# consumer's own cook) — and it is cheap now (`new_empty`, not `new_zeros`) because the SAME
+# poisoned-fill proof this module already had (`test_joinwire50_merge_below_edit_poisoned_
+# fill_is_never_read`, unedited by this fix) already showed the padded region is provably
+# never read by anything a downstream cook does, whatever it contains — closing exactly the
+# gap that made a POOLED (recycled) uninitialised buffer unsafe, without recycling anything.
 
 def _embed_window(val, window):
-    """Patch a windowed stage's CROPPED output back into a fresh full-size `(W, H)` canvas
-    at its window's offset, so a downstream stage's OWN `run_roi` narrowing step (which
-    requires every spatial binding at the FULL size the window declares — `tex_memory.
-    run_roi`'s own extent check) can read it. The region OUTSIDE the window is left at
-    whatever `new_zeros` gives it and is NEVER READ by anything this cook does: JOIN-49's
-    `chain_windows_dag` only ever grows a stage's window BY a downstream consumer's own
-    demand on it (`StageSpec.halo_for`, unioned across every dirty consumer) — so `window`
+    """Patch a windowed stage's CROPPED output into a FRESH, ephemeral full-size `(W, H)`
+    canvas at its window's offset, so a downstream stage's OWN `run_roi` narrowing step
+    (which requires every spatial binding at the FULL size the window declares — `tex_memory.
+    run_roi`'s own extent check) can read it. THIS FUNCTION'S RETURN VALUE MUST NEVER BE
+    STORED INTO `stage_outputs` (FIX-DAG G1) — it exists only to feed one downstream cook
+    call; the public record of what a windowed stage produced is its raw, un-padded crop
+    (`stage_outputs[idx]`) plus its window (`stage_windows[idx]`), never this buffer.
+
+    The region OUTSIDE the window is left at whatever `new_empty` (UNINITIALISED — deliberately
+    not zero-filled, FIX-DAG G1) gives it and is NEVER READ by anything this cook does:
+    JOIN-49's `chain_windows_dag` only ever grows a stage's window BY a downstream consumer's
+    own demand on it (`StageSpec.halo_for`, unioned across every dirty consumer) — so `window`
     already covers every region any consumer cooked THIS tick will actually narrow into.
-    Not merely argued: `test_joinwire50_dag_windows.py` poisons this fill with a distinctive
-    non-zero sentinel instead of zeros and still gets pixel-identical results, which is the
-    only way to show unread garbage is truly unread rather than coincidentally zero.
+    Not merely argued: `test_joinwire50_merge_below_edit_poisoned_fill_is_never_read` poisons
+    this fill with a distinctive non-finite sentinel instead of zeros and still gets
+    pixel-identical results — the only way to show unread garbage is truly unread rather than
+    coincidentally zero, and the same proof that makes skipping the zero-fill safe here: an
+    uninitialised region is just a different kind of unread garbage, and this call site is the
+    ONE place (never `stage_outputs`) where "unread" is actually guaranteed.
 
     Scalar/string outputs (rank < 3 — no spatial dims at all) pass through unchanged:
     `run_roi`'s own crop-back only ever narrows the two spatial dims of a rank>=3 tensor, so
@@ -336,7 +369,7 @@ def _embed_window(val, window):
     if not isinstance(val, torch.Tensor) or val.dim() < 3:
         return val
     x0, y0, w, h, W, H = window
-    full = val.new_zeros((val.shape[0], H, W, *val.shape[3:]))
+    full = val.new_empty((val.shape[0], H, W, *val.shape[3:]))
     full[:, y0:y0 + h, x0:x0 + w] = val
     return full
 
@@ -412,13 +445,25 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
     can never collide with each other, and neither can serve the other's shape back mislabeled.
     `result_cache=None` (every caller before this ask) never reaches any of these branches.
 
-    Returns `{"result": {name: tensor}, "stage_outputs": {idx: {name: tensor}}, "windows":
-    windows_or_None, "stages_windowed": int, "stages_whole": int}`. `result` is the sink's
-    own raw output (a crop when windowed — the same contract every other windowed cook in
-    this codebase already has); `stage_outputs` carries every OTHER cooked stage's raw
-    output too (full-size, re-embedded when it was windowed), for a caller or test that
-    wants to inspect an intermediate. `windows` is `None` when nothing was planned (no `roi=`,
-    or `chain_windows_dag` refused the whole plan) or a `chain_windows_dag`-shaped list."""
+    Returns `{"result": {name: tensor}, "stage_outputs": {idx: {name: tensor}}, "stage_
+    windows": {idx: window}, "windows": windows_or_None, "stages_windowed": int,
+    "stages_whole": int}`. `result` is the sink's own raw output (a crop when windowed — the
+    same contract every other windowed cook in this codebase already has); `stage_outputs`
+    carries every OTHER cooked stage's raw output too, for a caller or test that wants to
+    inspect an intermediate.
+
+    FIX-DAG G1: `stage_outputs[idx]` is ALWAYS the RAW value a stage's own cook produced — a
+    genuinely windowed, non-sink stage's entry is its bare CROP, never padded back out to a
+    full canvas, so a caller inspecting it never sees a mostly-unwritten buffer. `stage_
+    windows` names exactly which `stage_outputs` entries are crops and at what absolute
+    `(x0, y0, w, h, W, H)` — an entry absent from `stage_windows` is already full-size
+    (a whole-frame cook, or a `known_outputs`/`result_cache`-supplied clean value, both of
+    which are full-frame by contract). The full-size re-embed a downstream consumer's own
+    `run_roi` step still needs happens ephemerally, in-memory, only at the point a stage is
+    actually fed as another stage's `chain_inputs` binding (see `_materialize_input` below) —
+    it is never what `stage_outputs` reports back. `windows` is `None` when nothing was
+    planned (no `roi=`, or `chain_windows_dag` refused the whole plan) or a
+    `chain_windows_dag`-shaped list (unchanged)."""
     with _cook_observer.scope("cook_stage_dag"):
         from . import tex_roi as _tex_roi
         from .tex_runtime import tier_trace as _tier_trace_mod
@@ -479,7 +524,9 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
 
         def _clean_lookup(idx: int):
             """A clean stage's already-valid value: `known_outputs` first, then
-            `result_cache` (JOINWIRE-50b) — `None` when neither has it."""
+            `result_cache` (JOINWIRE-50b) — `None` when neither has it. Always full-frame by
+            contract (a `known_outputs` value is documented as such; a `result_cache` hit is
+            `put` only off `served_roi is None`, below) — never a `stage_windows` entry."""
             v = known_outputs.get(idx)
             if v is not None:
                 return v
@@ -488,6 +535,30 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
                 if cached is not None:
                     return {"OUT": cached}
             return None
+
+        # FIX-DAG G1 (R3#1): `stage_windows[idx]` names which `stage_outputs[idx]` entries
+        # are bare CROPS (a genuinely windowed stage's own cook) rather than already
+        # full-size — the public record `stage_outputs` returns never carries a padded
+        # buffer (see `cook_stage_dag`'s own docstring and `_embed_window`'s). `_embedded`
+        # memoizes the one ephemeral full-size re-embed a crop needs PER CALL, so a stage
+        # read by more than one consumer this tick (a diamond) re-embeds once, not once per
+        # consumer, without storing the result anywhere `stage_outputs` exposes.
+        stage_windows: dict = {}
+        _embedded: dict = {}
+
+        def _materialize_input(idx: int, src: dict) -> dict:
+            """`src` (a `stage_outputs`/`_clean_lookup` value for upstream stage `idx`) as a
+            downstream stage's own `run_roi` step needs it: unchanged when `idx` is already
+            full-size, else an ephemeral, memoized full-size re-embed of its crop — the ONLY
+            place that re-embed exists; it is never assigned back into `stage_outputs`."""
+            window = stage_windows.get(idx)
+            if window is None:
+                return src
+            cached = _embedded.get(idx)
+            if cached is None:
+                cached = _embedded[idx] = {name: _embed_window(val, window)
+                                           for name, val in src.items()}
+            return cached
 
         # 3. Cook, stage by stage. `chain_inputs` only ever names an EARLIER index (checked
         #    above), so index order IS topological order — no separate sort needed.
@@ -515,7 +586,7 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
                 stage_outputs.setdefault(idx, src)  # memoize a known_outputs/cache hit for a
                 #                                      second consumer (a diamond) or for the
                 #                                      caller's own `stage_outputs` inspection
-                bindings[b] = src[out]
+                bindings[b] = _materialize_input(idx, src)[out]
 
             stage_roi = None
             if windows is not None and windows[i] is not None:
@@ -543,21 +614,22 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
             # `last_roi()` would otherwise still read whatever an EARLIER, unrelated cook on
             # this thread last recorded — a stale-read bug, not a stale-window one.
             served_roi = None if stage_roi is None else _tier_trace_mod.last_roi()[0]
-            if served_roi is not None and i != n - 1:
-                # Every OTHER (non-sink) windowed stage's crop must reach its consumer(s) as
-                # a full-size tensor — see `_embed_window`'s own docstring for why the
-                # unwritten region is provably never read.
-                out = {name: _embed_window(val, served_roi) for name, val in out.items()}
+            if served_roi is not None:
+                # FIX-DAG G1: `out` stays the bare crop `cook_stage_list` returned — no
+                # eager re-embed here, sink or not. `stage_windows[i]` records the window so
+                # `_materialize_input` can produce the ephemeral full-size feed ONLY if and
+                # when a downstream consumer actually reads this stage (`i != n - 1`; the
+                # sink has no consumer within this call by construction).
+                stage_windows[i] = served_roi
                 stages_windowed += 1
-            elif served_roi is not None:
-                stages_windowed += 1        # the sink itself, windowed
             else:
                 stages_whole += 1
                 # JOINWIRE-50b: `result_cache` is populated ONLY here — `served_roi is None`
                 # is `tier_trace`'s own record of what THIS cook actually served, so a
-                # windowed/re-embedded output (the two branches above) never reaches this
-                # line and can never be stored as a boundary a later tick's clean lookup
-                # could read back as if it were whole-frame. `windows is not None` is its
+                # genuinely windowed output (the branch above, whose crop `stage_windows`
+                # now names instead of eagerly re-embedding) never reaches this line and can
+                # never be stored as a boundary a later tick's clean lookup could read back
+                # as if it were whole-frame. `windows is not None` is its
                 # own separate guard (every stage lands in THIS branch when `windows is
                 # None` too — a plain, unwindowed roi=None cook — so without it a host that
                 # merely passed `result_cache` with no `roi=` at all would start paying
@@ -575,8 +647,8 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
             stage_outputs[i] = out
 
         return {"result": stage_outputs.get(n - 1, {}), "stage_outputs": stage_outputs,
-                "windows": windows, "stages_windowed": stages_windowed,
-                "stages_whole": stages_whole}
+                "stage_windows": stage_windows, "windows": windows,
+                "stages_windowed": stages_windowed, "stages_whole": stages_whole}
 
 
 def _is_tensor_binding(v) -> bool:
