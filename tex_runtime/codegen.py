@@ -3302,11 +3302,21 @@ class _CodeGen(_EmitStdFnsMixin, MaskedEmitMixin):
         # `scale=1.0` cook UNCHANGED (same object) and is correctly re-derived for a
         # genuine scale value -- a bare multiply silently drops that tag and forces a
         # device readback `fn_gauss_blur`'s own sigma resolution does not expect.
+        # FIX-TIER T4 (R3#2): the `scale==1.0` check moves to the EMITTED call site
+        # itself, as an inline ternary, instead of living only inside `_scale_pixel_arg`
+        # (`_SCM`). `_SCM` already early-returns the identical object at `scale==1.0`
+        # (measured ~8.8 ns/call overhead vs. a direct pass-through, R3#2) -- this keeps
+        # that exact value/identity contract (the ternary's `if` branch IS the pass-
+        # through) while skipping the Python function-call frame entirely on the common
+        # `scale==1.0` path (every `scale=None` cook, via `_build_codegen_env`'s own
+        # default, and any literal `scale=1.0` cook). `_SCM` is only ever actually
+        # invoked once a genuine `scale != 1.0` reaches this call site.
         _pixel_arg_idxs = _PIXEL_ARGS_STDLIB.get(name)
         if _pixel_arg_idxs:
             for _pai in _pixel_arg_idxs:
                 if _pai < len(args):
-                    args[_pai] = f"_SCM({args[_pai]}, _env['__tex_scale'])"
+                    args[_pai] = (f"({args[_pai]} if _env['__tex_scale'] == 1.0 else "
+                                  f"_SCM({args[_pai]}, _env['__tex_scale']))")
 
         # Scalar loop mode: use Python math module instead of torch
         if self._scalar_loop:
