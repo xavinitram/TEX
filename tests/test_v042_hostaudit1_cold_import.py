@@ -72,9 +72,20 @@ from helpers import run_python_kv   # G7/R1#4: the shared fresh-subprocess KV he
 # imported at module scope by `interpreter.py`, `compiled.py` and `codegen.py` (all three
 # already in the closure; `pacing_heavy.py` itself is new). +1 for this one new module,
 # nothing else moved.
+#
+# 55 -> 56 (found stale here, not from this ask's own change): COMPILETRY-50 (base e3ba26b)
+# added `tex_runtime/fncalls_compile.py`, eagerly imported at `compiled.py` module scope
+# (`from . import fncalls_compile`), but never bumped this ratchet -- measured directly, the
+# base commit this ask starts from already imports 56 TEX modules, one over the stated 55.
+# Corrected here rather than filed separately, since K0 touches this exact line anyway.
+#
+# 56 -> 57, K0 (v0.50.0 Phase C split, R2#3): `compiled.py` was again near the 2000-line
+# hard budget. One more new eagerly-imported leaf module split out of it, the same SPLIT-47
+# shape: the AUTOSAFE-50 promotion-TRIAL domain (`compiled_promotion.py`). +1 for this one
+# new module, nothing else moved.
 _BARE_TOUCH_TEX_MODULES_MAX = 1
 _BARE_TOUCH_TORCH_MODULES = 0
-_TEX_ENGINE_TEX_MODULES_MAX = 55
+_TEX_ENGINE_TEX_MODULES_MAX = 57
 
 
 def _measure(import_stmt: str, custom_nodes: str) -> dict:

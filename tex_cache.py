@@ -104,7 +104,13 @@ _VERDICT_FILES = [_R_DIR / "precision_policy.py", _R_DIR / "autotier.py",
                   # moves out of `compiled.py`, so an edit to either can move a measured
                   # win/lose verdict exactly as a `compiled.py` edit could (TRK-189 derives
                   # and enforces this from disk).
-                  _R_DIR / "compiled_capability.py", _R_DIR / "compiled_exec_support.py"]
+                  _R_DIR / "compiled_capability.py", _R_DIR / "compiled_exec_support.py",
+                  # K0 (v0.50.0 Phase C split, R2#3): `compiled.py`'s promotion-TRIAL domain
+                  # (`compiled_promotion.py`) is a third pure move out of `compiled.py`, so
+                  # an edit to it can move a measured win/lose verdict exactly as the two
+                  # SPLIT-47 siblings above already can (TRK-189 derives and enforces this
+                  # from disk).
+                  _R_DIR / "compiled_promotion.py"]
 
 
 # ── DATA-6: the plane seam ────────────────────────────────────────────────────

@@ -303,11 +303,13 @@ _NOT_A_CACHE = {
                                              "only); SPLIT-47 moved this out of `compiled.py`",
     "compiled._bg_futures": "in-flight background-compile futures, owned by the single "
                             "max_workers=1 worker and drained, not looked up",
-    "compiled._trial_futures": "AUTOSAFE-50: in-flight TRIAL-promotion-invocation futures, "
-                               "the exact same shape as _bg_futures above (owned by "
-                               "_WARM_POOL's single worker, drained by _drain_bg_for_test, "
-                               "polled by _await_trial -- never looked up by a cache key a "
-                               "cook wants to READ a value back from)",
+    "compiled_promotion._trial_futures": "AUTOSAFE-50: in-flight TRIAL-promotion-invocation "
+                               "futures, the exact same shape as compiled._bg_futures above "
+                               "(owned by _WARM_POOL's single worker, drained by "
+                               "compiled._drain_bg_for_test, polled by _await_trial -- never "
+                               "looked up by a cache key a cook wants to READ a value back "
+                               "from); K0 (v0.50.0 Phase C split) moved this out of "
+                               "`compiled.py`",
     "compiled._codegen_inflight": "W1 (FIX-WARM): a per-fingerprint IN-FLIGHT MARKER (a "
                                   "threading.Event) that exists only while a codegen emission "
                                   "for that fingerprint is actively running, popped the moment "
@@ -325,12 +327,13 @@ _NOT_A_CACHE = {
                         "each entry a sample awaiting a non-blocking readback rather than a "
                         "lookup; a dropped entry loses one sample's attribution, never a "
                         "wrong number",
-    "compiled._promotion_stats": "AUTOSAFE-50: a fixed two-key cumulative counter "
+    "compiled_promotion._promotion_stats": "AUTOSAFE-50: a fixed two-key cumulative counter "
                                  "({'bounded', 'failed'}), the exact same 'Observability' "
                                  "shape as tier_trace's rings above -- a diagnostic count, "
                                  "never a per-program/per-key cache a cook looks anything up "
                                  "in; read via promotion_stats(), reset via "
-                                 "_reset_promotion_stats_for_test()",
+                                 "_reset_promotion_stats_for_test(); K0 (v0.50.0 Phase C "
+                                 "split) moved this out of `compiled.py`",
     "fncalls_compile._pending": "COMPILETRY-50: an IN-FLIGHT MARKER set, the exact same shape "
                                 "as compiled._codegen_inflight above (a fingerprint sits here "
                                 "only while its ONE remembered torch.compile fall-through "
