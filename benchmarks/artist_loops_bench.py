@@ -72,14 +72,17 @@ def _sync(device: str) -> None:
 
 
 def _percentiles(ms: list) -> dict:
+    """p50/p95/p99 (nearest-rank), reusing `compile_modes_bench._pctl` (G6, FIX-GATE) rather
+    than a second copy of the same formula -- this file already loads that module's sibling
+    `host_path_counts`/`preempt_drain_bench`/`io_playback_bench` by path via `_load()` for
+    exactly this reason (R1#3): a "p95" column in the same results table must mean the
+    same arithmetic everywhere it is quoted, not two formulas that happen to agree today."""
     if not ms:
         return {"p50_ms": None, "p95_ms": None, "p99_ms": None, "n": 0}
     xs = sorted(ms)
-
-    def pct(p):
-        idx = min(len(xs) - 1, max(0, int(round(p * (len(xs) - 1)))))
-        return round(xs[idx], 4)
-    return {"p50_ms": pct(0.50), "p95_ms": pct(0.95), "p99_ms": pct(0.99),
+    cmb = _load("compile_modes_bench", "compile_modes_bench.py")
+    return {"p50_ms": round(cmb._pctl(xs, 0.50), 4), "p95_ms": round(cmb._pctl(xs, 0.95), 4),
+            "p99_ms": round(cmb._pctl(xs, 0.99), 4),
             "median_ms": round(statistics.median(xs), 4), "n": len(xs)}
 
 
