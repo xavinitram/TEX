@@ -19,6 +19,7 @@ Noise types:
 """
 from __future__ import annotations
 import math
+import os
 import threading
 import torch
 
@@ -819,7 +820,21 @@ def _can_inductor_compile(device=None) -> bool:
     C++ compiler (MSVC on Windows). Gating on the wrong one caches a compiled
     callable that raises at its first real call (bit fbm/ridged/billow/
     turbulence on Triton-less CUDA boxes).
-    """
+
+    G4 (FIX-GATE, v0.47.0 Phase C, B4#2): `TEX_GATE_NO_INDUCTOR=1` forces this to answer
+    False for every device, unconditionally, before any probe -- an escape hatch
+    `tools/gate.py`'s `run_ci_shape`/`run_ci_exact` set in their subprocess environment so
+    the CI-shape leg's own VERDICT is deterministic regardless of which interpreter
+    `--ci-python` names and what toolchain that interpreter's box happens to have on PATH.
+    Confirmed (B4#2, by running): a `--ci-python` venv whose box DOES find MSVC (unlike the
+    embedding host's usual embedded interpreter, which never does) reaches a real
+    torch.compile path this project has not characterized for stability under a
+    coverage-tracing pytest run -- three otherwise-identical runs on that interpreter
+    produced three different outcomes (a clean pass, a stuck-eager tier, and a
+    child-process crash). Never set by ComfyUI or any production code path; only a gate
+    invocation sets it, and only for that one subprocess's own environment."""
+    if os.environ.get("TEX_GATE_NO_INDUCTOR") == "1":
+        return False
     dev_type = device.type if isinstance(device, torch.device) else ("cuda" if device == "cuda" else "cpu")
     cached = _inductor_available.get(dev_type)
     if cached is not None:

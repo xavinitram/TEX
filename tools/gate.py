@@ -912,7 +912,13 @@ def run_ci_shape(ci_python: str, scratch: str, verbose: bool, source: str = "--c
         return leg
     base = [ci_python, "-m", "pytest", "tests/"]
     argv = [*base, "-q", "-m", "not slow and not timing", "-p", "no:cacheprovider"]
-    env_extra = {"CUDA_VISIBLE_DEVICES": "-1"}
+    # G4 (FIX-GATE, B4#2): this leg's own verdict must not depend on whether --ci-python's
+    # box happens to have a C++/MSVC toolchain on PATH -- a venv that DOES find one reaches
+    # a real torch.compile path (tex_runtime.noise's tiered-noise promotion) this project has
+    # not characterized for stability under coverage tracing, and it produced three different
+    # outcomes across three otherwise-identical runs (confirmed by running). Force the
+    # deterministic, toolchain-independent answer for THIS subprocess only.
+    env_extra = {"CUDA_VISIBLE_DEVICES": "-1", "TEX_GATE_NO_INDUCTOR": "1"}
     _run(leg, argv, _PKG, env_extra, scratch, verbose)
     leg.timing_deselected = _count_timing(base, _PKG, env_extra)
     return leg
