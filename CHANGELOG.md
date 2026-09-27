@@ -5,6 +5,135 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.0] - 2026-09-28 — "The stage, not the splice"
+
+A minor release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved, no new reserved
+name. Three items change VISIBLE output for a program that was already, deliberately or not,
+relying on an undocumented ceiling — see "Changed" below; every other item is additive or
+internal.
+
+### Added — joins
+
+- `tex_chain.cook_stage_dag(stages, ..., roi=, roi_exec=, dirty_from=, valid=, declined=,
+  known_outputs=, result_cache=, upstream=)`: cooks a multi-input DAG (a Merge/join reading more
+  than one upstream stage) node-by-node, with a real per-stage window plan via
+  `tex_roi_dag.chain_windows_dag` — the DAG generalisation of `chain_windows` `v0.49.0` shipped as
+  a building block only. Checkpoint semantics (persisting a clean stage's whole-frame output
+  across ticks, and reusing it on a later tick) are available via the new `result_cache`/
+  `upstream` parameters, keyed the same way `tex_checkpoint.cook_checkpointed` already keys its
+  own boundaries (`boundary_lineage_key`) — a windowed (cropped) stage output is never written to
+  `result_cache`; only a stage that served whole-frame this tick is. `stage_outputs` holds each
+  stage's own cook result (a genuinely windowed stage's entry is its bare crop); `stage_windows`
+  names which `stage_outputs` entries are crops and their absolute offset
+  (`{idx: (x0,y0,w,h,W,H)}`), so a caller peeking an intermediate never mistakes a crop for a
+  full-frame tensor. Use `cook_stage_dag` for a graph with a join; `cook_checkpointed` remains the
+  entry point for a purely linear chain (its own fused-splice mechanism is not DAG-shaped and
+  reopening that is unscoped). `roi=None` is a byte-for-byte no-op on every path, matching every
+  other `roi=`-gated entry point.
+
+  Measured, Merge-below-edit (an edit stage, a `gauss_blur` stage reading a second source, and a
+  Merge reading both), 4K (3840x2160x4 fp32), per-tick, before vs. after removing a wasted
+  zero-fill from the non-sink windowed re-embed step (median of 25 warm calls): **71.4 -> 0.80 ms
+  (RTX 5070 Ti Laptop, CPU)**, **13.0 -> 1.45 ms (RTX 2080 SUPER)**.
+
+### Changed — no silently clamped radius
+
+`erode`/`dilate`, `bilateral_filter` and `gauss_blur` each had an undocumented ceiling past which
+the requested radius/sigma was silently reduced to whatever the ceiling allowed — a genuine
+correctness bug, not a design choice, and every one of the three is now gone. **A program calling
+any of the three inside the value below is bit-for-bit unaffected. A program that asked for a
+value past it — which silently got a smaller, wrong-looking-only-in-hindsight result before this
+release — now gets the picture it actually asked for, which is a visible output change for a
+program that relied, deliberately or not, on the old ceiling. This is the bug being fixed, not a
+regression.**
+
+- **`erode`/`dilate`**: no limit at any radius (previously silently clamped to 256). `radius <=
+  10` runs today's original iterative loop, byte-for-byte, so the default path's cost is
+  unchanged. Above it, a van Herk/Gil-Werman separable running-extremum pass runs instead, `O(N)`
+  per line regardless of radius — bit-exact against an independent brute-force oracle for every
+  radius tested (0-300, plus 1024 and 8192), CPU and CUDA. Measured: unchanged at radius <= 10;
+  9-91x faster at radius 64-256 (bit-exact with the old, correct-at-that-range answer); at radius
+  1024/8192 (past the old silent clamp) the new result is both correct and 20-900x faster than
+  computing the old (wrong, clamped) answer honestly would have cost — e.g. 1712 ms for the old
+  clamped answer at radius 8192, 4K, CUDA, vs. 1.81 ms for the new, correct one.
+- **`bilateral_filter`**: the silent 7x7-window cap (anything past `spatial_sigma ~1.0` clamped to
+  a 7x7 window) is gone; exact to `spatial_sigma` up to ~8.0 (`radius <= 24`, memory-bounded
+  internally via row-tiling, proven bit-identical to an untiled pass), a bounded-cost downscale +
+  detail-transfer approximation past that (cost independent of `spatial_sigma`). A windowed,
+  tiled, or DAG-joined cook of either approximate builtin past its own threshold is now served
+  whole-frame instead of silently diverging from a whole-frame cook by up to ~0.03 on a [0,1]
+  channel range — a correctness fix, not a new limitation; a call that takes either approximate
+  path always declines a narrowed window (pixel identity kept).
+- **`gauss_blur`**: exact to sigma 256 (unconditional, bit-identical to every prior release), an
+  automatic downscale-pyramid approximation above it whose cost no longer reverts to
+  `O(sigma)` past a fixed multiple of the image's own size (previously flat only to ~1e6 on a
+  1080p image; now flat through 1e9).
+- **Perceptual bands** (SSIMULACRA2 + max-abs, 1080p, sRGB, a shared checker/smooth-edges/
+  realistic-plate corpus — table and methodology in `docs/resolution-scale.md`): honestly,
+  `bilateral_filter`'s detail-transfer approximation is visibly different from a true large
+  bilateral filter on realistic images (SSIMULACRA2 ~43-56) while still being far closer to one
+  than the old 7x7-clamped answer ever was; `gauss_blur`'s pyramid approximation stays in the 80s
+  on realistic images (SSIMULACRA2 ~85) regardless of how far past its threshold sigma goes, only
+  degrading on adversarial checker patterns at very large sigma.
+- NaN/Inf radius/sigma on any of the four builtins now raises a clear diagnostic (`E6052`)
+  instead of a raw Python `ValueError`/`OverflowError`. `gauss_blur`'s in-editor help now
+  discloses its approximation past sigma=256, matching `bilateral_filter`'s own existing
+  disclosure. `bilateral_filter`'s declared ROI/tiling footprint no longer over-pads its
+  unchanged small-`spatial_sigma` regime by ~2.67x.
+
+### Changed — compile modes
+
+- `"auto"` promotion (the step where a repeatedly-cooked program's freshly-compiled callable is
+  first actually invoked) now runs bounded and off the cook thread's critical path: a background
+  submission polled with a small bounded wait, never an unbounded `.result()` on the cook thread
+  itself. A failed or still-pending attempt always falls back to the already-working tier for
+  that cook; a resolved failure is now visible in `tier_trace` and a counter, where before it was
+  silent. A program calling `erode`/`dilate`/`bilateral_filter`/`gauss_blur` gets ONE remembered
+  background compile attempt per `(program, device, precision)` — resolved only after that
+  attempt's first real invocation completes or raises, not merely after the wrap succeeds —
+  instead of being handed the codegen-only fallback unconditionally, on the AST alone, with no
+  attempt ever made. Codegen now executes inside a real, per-build module registered in
+  `sys.modules` (rather than a bare namespace dict with no `__name__`), so a compiler that needs
+  to resume after a graph break can do so instead of raising a `KeyError` out of the compile step.
+- On the RTX 2080 SUPER, `erode(gauss_blur(@A,2),3)` at 1080p: the background attempt now
+  succeeds where it previously crashed on the missing-module-identity defect above — every cook
+  completed and returned a valid tensor under `"auto"` across two interleaved passes. Steady-state
+  cook time under `"auto"` reads within ~1-2% of `"none"` for this specific program: **no speedup
+  measured for this program on this box.** (This program's own codegen'd function does not carry
+  the shape the background-compile gate exists for on this box/build, so its real `torch.compile`
+  succeeds through the ordinary tier path rather than exercising the new fall-through mechanism
+  directly — reported as observed, not forced to fit.)
+
+### Fixed
+
+- NaN/Inf radius/sigma (see above) now raises `E6052` instead of a raw exception.
+- `tier_trace` now records a tiled/windowed cook and every default-path route that used to leave
+  no trace of which tier actually ran.
+- `tools/gen_function_reference.py` no longer wipes `Function-Reference.md`'s body when run
+  standalone (outside a process that had already imported the stdlib facade for some other
+  reason) — it now imports it itself first.
+- A hung background compile attempt on one program no longer starves every later submission to
+  its pool forever (a stuck-pool timeout replaces an unbounded, single-worker wait).
+- A background-compile memo now keys by device and precision as well as by program fingerprint,
+  and its check-then-add race across two compile pools is now atomic.
+- Others: a stale line citation two docs carried after an insertion shifted later lines
+  (repointed, not widened); a `compiled.py` headroom-cap comment/behaviour mismatch that skipped
+  an entire submission instead of only its warm-ahead half (now matches the documented contract).
+
+### Removed from comments
+
+- Internal tracker ids and local review-note file names removed from tracked-file comments and
+  test prose (a lint rule now catches both spellings and any local-only review-note citation
+  shape going forward). No behaviour change.
+
+### Not in this release -> v0.51
+
+- A true joint bilateral upsample for `bilateral_filter`'s large-radius approximation (the
+  current detail-transfer stand-in's realistic-image quality gap, named above, stays open).
+- Per-builtin approximation thresholds promoted into a stdlib registry field.
+- Out-of-process compilation for a program too large to compile inline.
+- `cuda_graph` capture for `gauss_blur`/`erode`/`dilate`/`bilateral_filter`.
+
 ## [0.49.2] - 2026-09-27 — "Once, not per arm"
 
 A patch release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved, no new reserved
