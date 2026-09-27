@@ -132,20 +132,34 @@ def _base_fold_program(code: str, param_values: dict):
 
 
 def _base_walk(code: str, param_values: dict, binding_types=None):
-    """`tex_roi._walk`'s body at the base sha, UNMEMOIZED, over `_base_fold_program`."""
+    """`tex_roi._walk`'s body at the base sha, UNMEMOIZED, over `_base_fold_program`.
+
+    FIX-ROI O2: `tex_roi._accumulate`/`_has_ungrounded_halo` no longer prune a resolved
+    (literal-condition) `IfElse`/`WhileLoop` themselves — ROI-48A's per-node special case
+    (`_resolved_branch`) moved to a structural, fold-level step
+    (`tex_lazy._prune_static_flow`), applied on the same PRIVATE clone `tex_roi._walk` itself
+    uses, never on the `program` object `region_dependent` reads. This oracle calls those two
+    functions directly (not through `_walk`), so it must apply that same step itself, on its
+    own equivalent clone, or it would silently lose the pruning capability it always
+    incidentally inherited for free from the shared functions before O2 moved it out — a test
+    artifact, not a real divergence. `written`/`region_dependent` are computed first, from the
+    UNPRUNED `program`, exactly matching what `tex_roi._walk` reads them from."""
     try:
         program = _base_fold_program(code, param_values)
-        reads: dict = {}
-        state = {"blocked": False, "halo": 0}
-        for stmt in program.statements:
-            tex_roi._accumulate(stmt, 0, reads, state)
-        blocked = state["blocked"] or tex_roi._has_ungrounded_halo(program)
         written = {n for n in (tex_roi._write_target_name(s.target, bindings_only=True)
                                for s in program.statements if isinstance(s, Assignment))
                    if n is not None}
+        region_dep = tex_roi.region_dependent(program, binding_types, code)
+        pruned = ast_nodes.clone_tree(program)
+        pruned.statements = tex_lazy._prune_static_flow(pruned.statements)
+        reads: dict = {}
+        state = {"blocked": False, "halo": 0}
+        for stmt in pruned.statements:
+            tex_roi._accumulate(stmt, 0, reads, state)
+        blocked = state["blocked"] or tex_roi._has_ungrounded_halo(pruned)
         return (reads, blocked, state["halo"],
                 tex_roi._referenced_at_bindings(code) - written - set(reads),
-                tex_roi.region_dependent(program, binding_types, code))
+                region_dep)
     except Exception:
         return None
 

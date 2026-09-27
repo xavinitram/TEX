@@ -56,7 +56,7 @@ from .tex_compiler.ast_nodes import (
 from .tex_compiler.optimizer import _propagate_literal_locals, _fold_all
 from .tex_lazy import (
     _substitute_params, _fp32, _param_key, _pristine_parse, _profile_key,
-    _capture_pre_fold_conditions, _revert_unverified_folds,
+    _capture_pre_fold_conditions, _revert_unverified_folds, _prune_static_flow,
 )
 from .tex_runtime import codegen_stencil as _st
 
@@ -249,30 +249,6 @@ def _scatter_target_base(tgt):
     return None
 
 
-def _resolved_branch(node: IfElse) -> list | None:
-    """ROI-48A: the single body an `IfElse` will actually run, or None when its condition is
-    still symbolic at the point this walk sees it.
-
-    `_walk` folds `code` through `_fold_program` before this ever runs: every `$param` is
-    substituted first, then the optimizer's constant folding (`_opt_expr`/`_fold_binop`)
-    reduces an expression built ONLY from literals/substituted params down to a bare
-    `NumberLiteral`. So `node.condition.__class__ is NumberLiteral` here is proof — not a
-    guess — that the condition depended only on UNIFORM values (the widget/`$param` values
-    this walk was given): folding has no rule that can reduce a per-pixel read (`u`, `v`,
-    `ix`, `iy`, an `@binding`), an unresolved `$param`, or any other unknown quantity to a
-    literal. Any doubt — a condition that is still an expression after folding — returns
-    None, which keeps today's conservative walk of the condition AND both bodies unchanged.
-
-    This is what lets a not-taken arm's wide/unbounded footprint (blur.tex's Exponential
-    mip taps, present in source but never reached when `$mode` picks Gaussian) stop blocking
-    reach: `_accumulate`/`_has_ungrounded_halo` never descend into a body this returns None
-    for skipping, or descend into the ONE body it names, and never both."""
-    cond = node.condition
-    if cond.__class__ is NumberLiteral:
-        return node.then_body if cond.value > 0.5 else node.else_body
-    return None
-
-
 def _accumulate(node, ctx_halo, reads: dict, state: dict) -> None:
     """Walk the AST, tallying each wire binding's read mode. `ctx_halo` is the accumulated
     symmetric narrowable-halo radius from enclosing blur/morphology ops, or the sentinel
@@ -289,17 +265,6 @@ def _accumulate(node, ctx_halo, reads: dict, state: dict) -> None:
     if cls is ChannelAccess:
         _accumulate(node.object, ctx_halo, reads, state)
         return
-
-    if cls is IfElse:
-        # ROI-48A: read only the branch that will actually run when the condition has
-        # already folded to a literal (see `_resolved_branch` — proof the condition depends
-        # only on UNIFORM values). A still-symbolic condition falls through unchanged to the
-        # generic walk below, which visits the condition AND both bodies exactly as before.
-        body = _resolved_branch(node)
-        if body is not None:
-            for s in body:
-                _accumulate(s, ctx_halo, reads, state)
-            return
 
     if cls is Assignment:
         # The target is a WRITE, not a read (mirrors codegen_stencil._collect_ident_refs).
@@ -714,17 +679,11 @@ def _has_ungrounded_halo(program) -> bool:
                 halo_named.add(node.name)
             return has
         if cls is IfElse:
-            # ROI-48A: a resolved condition (see `_resolved_branch`) means only ONE body ever
-            # runs, so an ungrounded halo in the OTHER body must not be able to block this
-            # program — it is never reached. `ungrounded` passes through unchanged either way
-            # (an `if` body is not a case-(1) boundary — see the case-(2) comment below), so
-            # this changes only WHICH statements get visited, never how they are scored.
-            body = _resolved_branch(node)
-            if body is not None:
-                for ch in body:
-                    if _visit(ch, ungrounded, scanned):
-                        has = True
-                return has
+            # ROI-48A/O2: a resolved (literal-condition) IfElse cannot reach this walk at all —
+            # `_fold_program` prunes it away structurally (`tex_lazy._prune_static_flow`,
+            # spliced into the surviving statement list) before `_has_ungrounded_halo` ever
+            # runs, so every IfElse seen here is genuinely symbolic and both bodies are walked,
+            # same as any other construct with no case-(1) boundary of its own.
             for ch in iter_child_nodes(node):
                 if _visit(ch, ungrounded, scanned):
                     has = True
@@ -918,9 +877,23 @@ def _walk(code: str, param_values: dict, binding_types: dict | None = None):
         program = _fold_program(code, param_values)
         reads: dict = {}
         state = {"blocked": False, "halo": 0}
-        for stmt in program.statements:
+        # O2 (R4-altitude finding 2): `_accumulate`/`_has_ungrounded_halo` used to each
+        # re-derive "does this IfElse's condition resolve, and if so which body runs" via
+        # their own copy of the now-deleted `_resolved_branch` — one pruning step, shared,
+        # replaces both. Pruned on a PRIVATE clone (`tex_lazy._prune_static_flow` mutates
+        # surviving bodies in place) so `region_dependent` below still sees the un-pruned
+        # `program` it always has — this dedup is scoped to the two halo/reach walkers R4
+        # named, not a wider change to what every `_fold_program` consumer sees. Sound only
+        # because `_fold_program` already refuses (reverts) any condition its own fp32
+        # verification cannot confirm (O1) — a surviving `NumberLiteral` condition here IS
+        # proof, so pruning it structurally is exactly what the two walkers already did one
+        # `IfElse` at a time. Also picks up the WhileLoop(literal-false) case neither walker
+        # had an equivalent for, at no extra cost.
+        pruned = clone_tree(program)
+        pruned.statements = _prune_static_flow(pruned.statements)
+        for stmt in pruned.statements:
             _accumulate(stmt, 0, reads, state)
-        blocked = state["blocked"] or _has_ungrounded_halo(program)
+        blocked = state["blocked"] or _has_ungrounded_halo(pruned)
         # Bindings the $param-fold ERASED from `reads` but the engine still evaluates. Write
         # targets are excluded — `@OUT` is not an input and narrowing it means nothing. Computed
         # here so it rides the same memo as the walk instead of re-lexing on every cook.
