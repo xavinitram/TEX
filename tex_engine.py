@@ -591,8 +591,17 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
         # FIX-SCALE S1: the refusal itself now lives in ONE place, `tex_roi.require_scale_safe`
         # — every scale-accepting entry point (this one, plus the CACHE-6/7 stage-list family)
         # calls it instead of each re-deriving the same verdict-then-raise.
+        # FIX-SCALE S3: pass the caller's REAL scalar/bool/int params (the same extraction
+        # `_scalar_params` already gives `roi_plan` below) rather than an implicit `{}`.
+        # `tex_api.scale_verdict(code, param_values)` is documented to read the exact same
+        # memoized answer this refusal uses -- which was only true when a caller happened
+        # to query with no param values, because this call always folded on an empty dict
+        # regardless of what `bindings` actually carried. A conditional gated on a scalar
+        # `$param` (`($mode > 0.5) ? safe_arm : unsafe_arm`) folds away its unsafe arm under
+        # the REAL value but never did here, so the pre-cook query and this refusal could
+        # disagree for the exact same effective cook.
         from . import tex_roi as _tex_roi
-        _tex_roi.require_scale_safe(code, scale)
+        _tex_roi.require_scale_safe(code, scale, _scalar_params(bindings))
         # AUTHOR DECISION (R6): a coarse cook defaults to precision="auto" -- the EXISTING
         # invariant #10 accuracy net already reasons about data amplification independent of
         # canvas resolution, so "reduced precision under scale's envelope, never surfaced as
