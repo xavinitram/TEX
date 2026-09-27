@@ -242,29 +242,29 @@ Type checker. See the message shown with the code for the specific cause and fix
 
 **Reachable only through the API-level AST, not from TEX source.** "array literal outside a declaration" — `{...}` is parsed only as an array declaration's initializer, so parsed source can never produce a standalone array literal for this branch to see.
 
-## Optimizer (`E4xxx`)
+## Type checker — unrecognized construct (`E4xxx`)
 
-Errors surfaced while optimizing the checked AST (rare; usually indicates an internal invariant — please file an issue with the program).
+Errors from the type checker's catch-all branch — a construct the type checker doesn't recognize (rare; usually indicates an internal invariant — please file an issue with the program).
 
 ### E4000
 
-Optimizer. See the message shown with the code for the specific cause and fix; the class is described above.
+Type checker — unrecognized construct. See the message shown with the code for the specific cause and fix; the class is described above.
 
-## Compile / cache (`E5xxx`)
+## Type checker — function signatures (`E5xxx`)
 
-Errors from the compile and artifact-cache layer — a program that could not be compiled for the requested tier, a cached artifact that was rejected as unusable (wrong epoch, corrupt, or built by a different code version), or a compile-time argument a pass could not resolve. A codegen tier FALLING BACK is not one of these: that is a routing decision the engine makes silently and reports through the tier trace, not an error.
+Errors from the type checker while validating a function call's signature — wrong argument count, an argument of the wrong type, or a call the checker could not resolve.
 
 ### E5001
 
-Compile / cache. See the message shown with the code for the specific cause and fix; the class is described above.
+Type checker — function signatures. See the message shown with the code for the specific cause and fix; the class is described above.
 
 ### E5002
 
-Compile / cache. See the message shown with the code for the specific cause and fix; the class is described above.
+Type checker — function signatures. See the message shown with the code for the specific cause and fix; the class is described above.
 
 ### E5003
 
-Compile / cache. See the message shown with the code for the specific cause and fix; the class is described above.
+Type checker — function signatures. See the message shown with the code for the specific cause and fix; the class is described above.
 
 ## Runtime / node (`E6xxx`)
 

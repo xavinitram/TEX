@@ -440,13 +440,22 @@ TEX uses structured diagnostics (`tex_compiler/diagnostics.py`) to produce clear
 
 | Range | Phase | Examples |
 |-------|-------|----------|
+| `E0xxx` | Internal | A compiler phase raised without a structured diagnostic; TEX synthesized a fallback (`E0000`) rather than surface a bare message |
 | `E1xxx` | Lexer | Unterminated strings, invalid characters, malformed numbers |
 | `E2xxx` | Parser | Unexpected tokens, missing semicolons, foreign keywords |
 | `E3xxx` | Type checker — names, scope, types & coercions | Undefined variables, duplicate declarations, type mismatches, failed promotions |
 | `E4xxx` | Type checker — unrecognized construct (catch-all) | A construct the type checker doesn't recognize |
 | `E5xxx` | Type checker — function signatures | Wrong argument count, argument type errors |
 | `E6xxx` | Runtime (interpreter) | Loop limit, division by zero, out-of-bounds; `E6050` unknown function, `E6051` a function's runtime failure |
+| `E7xxx` | Host I/O | A host `FrameProvider` binding TEX cannot type: no provider registered, a provider that raised, a time that varies per pixel, a frame of the wrong shape, a promised binding that has not landed |
+| `E9xxx` | Tools | Building or preflighting a `.textool` bundle failed — a fused-tool graphspec is malformed, or its stages don't compile together |
 | `W7xxx` | Warnings (reserved range) | Non-fatal advisories |
+
+`tools/gen_error_codes.py` renders this same range set into `Error-Codes.md`, and
+`CONTRIBUTING.md` carries its own copy for a contributor who never opens this file; the three are
+required to agree (`tests/test_docs49_error_phase_ranges.py`), because a doc that names a code's
+phase and its generator's own copy of that phase are two different places for the same fact to
+drift apart in.
 
 ### Voice and Tone
 
@@ -549,6 +558,62 @@ When testing that the compiler produces the right error for bad input:
 If you encounter an error message that is confusing, unhelpful, or missing a hint, please file an issue: https://github.com/xavinitram/TEX/issues
 
 ---
+
+## Log Lines
+
+This is a guideline for the messages TEX writes through Python's `logging` module (`logger` in
+this tree) — not the diagnostics covered above. It is a convention shared with an embedding
+host, adopted so a developer reading a trace from either side sees one style. **Essential for
+new lines; an existing line is brought into line the next time it is touched, never by a sweep.**
+
+The two guides differ on purpose, not on values: an error message (above) is written for the
+person who wrote the `.tex` program, in the first person, because a part of TEX is speaking
+to them directly. A log line is written for a developer holding a trace with no reproduction,
+and it is read after the fact, often with lines from a dozen modules interleaved — there is no
+single "I" a log line could mean, so it never uses one. Everything else below carries over from
+the error guidelines unchanged: no blame words, say when the cause is unknown, one event per
+line (a traceback goes through `exc_info=True`, never pasted into the message).
+
+**Shape.** Subject, then event, then consequence, then values, in that order:
+
+```
+[TEX] disk cache: write failed for %s (%s); the cook continues uncached
+[TEX] codegen: cache artifact for %s rejected (%s); recompiling
+```
+
+* **`[TEX] `** always leads, in front of the subject — TEX's library-wide version of "only the
+  origin speaks" (see *Only the origin logs*, below); the subject after it is the module or
+  subsystem the line is about, followed by a colon.
+* **The event** in plain words: past tense for something that happened, present tense for a
+  standing condition.
+* **The consequence** — what TEX did about it. This is the half a line is easiest to skip, and
+  the one that tells a reader whether the line matters: *the cook continues uncached*,
+  *recompiling*, *using the shipped default*.
+* **Values last** — paths, ids, counts, durations with units — as lazy `%`-style arguments
+  (`logger.warning("... %s", value)`), never an f-string, so a line below the active level costs
+  nothing to build when it is skipped.
+
+**Levels.**
+
+| Level | Means |
+|---|---|
+| `DEBUG` | Useful only while investigating; off by default |
+| `INFO` | A milestone worth seeing in every run |
+| `WARNING` | Something went wrong and TEX carried on; the line says how |
+| `ERROR` / `exception` | Something the caller will notice went wrong |
+
+**Only the origin logs.** When one cause fails several things, the first site to catch it logs
+it once (with `exc_info` if it is an exception); everything downstream that also fails from the
+same cause logs nothing, or a one-line `DEBUG` cross-reference. Twenty tracebacks for one cause
+bury the cause.
+
+**Nothing logs from a hot path at `INFO` or above.** A per-pixel, per-frame or per-cook line
+belongs at `DEBUG`, or in a counter, never narrated at a level a default run prints.
+
+**Privacy.** A log line is held to the same rule as anything else that can leave the machine in
+a bug report: no pixel data, no typed text, no secret or token, at any level; a path or a name
+goes in as a value, never folded into prose, so a redaction pass can still find it. An error
+code (`E2104` and the like) is not confidential and is the most useful field in the line.
 
 ## Snippet System
 

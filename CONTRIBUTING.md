@@ -40,15 +40,25 @@ User-facing errors flow through `tex_compiler/diagnostics.py` and render as: mes
 
 | Range | Stage |
 |-------|-------|
+| `E0xxx` | Internal (a phase raised without a structured diagnostic) |
 | `E1xxx` | Lexer |
 | `E2xxx` | Parser |
 | `E3xxx` | Type checker (names, scope, types & coercions) |
-| `E4xxx` | Unrecognized construct (catch-all) |
-| `E5xxx` | Stdlib signatures |
+| `E4xxx` | Type checker — unrecognized construct (catch-all) |
+| `E5xxx` | Type checker — function signatures |
 | `E6xxx` | Runtime / interpreter (e.g. `E6050` unknown function, `E6051` a function's runtime failure) |
+| `E7xxx` | Host I/O (a host `FrameProvider` binding TEX cannot type) |
+| `E9xxx` | Tools (building or preflighting a `.textool` bundle) |
 | `W7xxx` | Warnings |
 
-Assign a **new** code for a new condition rather than reusing one — codes are stable anchors that map to documentation, so never renumber an existing one.
+Assign a **new** code for a new condition rather than reusing one — codes are stable anchors that map to documentation, so never renumber an existing one. This table, `DEVELOPMENT.md`'s
+own copy and `tools/gen_error_codes.py`'s family list are required to agree.
+
+## Log Lines
+
+Python `logging` calls (as opposed to the user-facing diagnostics above) follow their own
+guideline — subject, event, consequence, values, no first person — in `DEVELOPMENT.md`
+§"Log Lines".
 
 ## Editor Build
 
