@@ -404,7 +404,7 @@ def boundary_lineage_key(stages, k, device, precision, *, upstream, time_context
 
 def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32",
                       time_context=None, latent_channel_count=0, upstream=(), cancel=None,
-                      on_progress=None) -> dict:
+                      on_progress=None, scale=None) -> dict:
     """CACHE-6: cook a fused chain with a stage-(k-1) boundary TAP + SUFFIX SPLICE. On a cache
     HIT (the hot downstream param didn't touch the prefix) only stages k..N recook, reading the
     cached fp32 boundary; on a MISS the prefix is materialized, cached, and the suffix cooked.
@@ -415,7 +415,13 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
     back to a whole-chain cook when the gate isn't met — non-fp32 (the boundary would be fp16, NOT
     the exact handoff), a LATENT, a DAG chain, a cut-point out of range, no cache, or NO `upstream`
     source key (without a content-sensitive source identity a cached boundary could be served for a
-    different image — the safe default is a correct-but-not-incremental full cook)."""
+    different image — the safe default is a correct-but-not-incremental full cook).
+
+    `scale` (FIX-SCALE S7): rides through to every internal `cook_stage_list` call (each of
+    which applies the S1 scale-safety refusal on its own terminal stage) and to
+    `boundary_lineage_key`, so a coarse-scale boundary never collides with a full-scale one —
+    the SAME pattern `cook_checkpointed`/`materialize` already established for the CACHE-7
+    sibling. `None` (every caller before this ask) is unaffected."""
     # OBSERVER-46/O3: notify once for THIS entry point; every internal call below —
     # `_full()`'s and the hit/miss paths' `cook_stage_list`, and `boundary_lineage_key` —
     # shares this one notification rather than adding its own (see
@@ -436,7 +442,8 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
         def _full():
             return _tex_engine.cook_stage_list(stages, device=device, precision=precision,
                                    latent_channel_count=latent_channel_count,
-                                   time_context=time_context, cancel=cancel, on_progress=on_progress)
+                                   time_context=time_context, cancel=cancel, on_progress=on_progress,
+                                   scale=scale)
 
         # `upstream` must key EVERY tensor input of the prefix — the source, and any EXTRA image a
         # prefix stage reads — not just be non-empty (a partial cover could stale-serve when only an
@@ -471,11 +478,12 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
         if unservable_prefix_taps(stages, k):
             return _full()
         key = _tex_engine.boundary_lineage_key(stages, k, device, "fp32", time_context=time_context,
-                                   latent_channel_count=latent_channel_count, upstream=upstream)
+                                   latent_channel_count=latent_channel_count, upstream=upstream,
+                                   scale=scale)
         boundary = result_cache.get(key)
         if boundary is None:
             b = _tex_engine.cook_stage_list(stages[:k], device=device, precision="fp32",
-                                time_context=time_context, cancel=cancel).get("OUT")
+                                time_context=time_context, cancel=cancel, scale=scale).get("OUT")
             if b is None:            # a chain always assigns @OUT; if not, cook whole (correct)
                 return _full()
             result_cache.put(key, b, canvas={"shape": list(b.shape)})
@@ -490,7 +498,7 @@ def cook_fused_cached(stages, k, result_cache, *, device="cpu", precision="fp32"
         # this single return.
         out = remap_suffix_taps(
             _tex_engine.cook_stage_list(suffix, device=device, precision="fp32", time_context=time_context,
-                            cancel=cancel, on_progress=on_progress), k)
+                            cancel=cancel, on_progress=on_progress, scale=scale), k)
         if stages[k - 1].get("tap"):
             out.setdefault(f"_tap_s{k - 1}", boundary)   # the boundary IS that stage's output
         return out

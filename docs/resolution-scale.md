@@ -8,8 +8,8 @@ internal-design layer (DOC-6).*
 ## What `scale` is
 
 A per-cook resolution multiplier a host passes to `tex_engine.prepare()`/`cook()` (and to the
-CACHE-6/7 stage-list family: `cook_stage_list`, `cook_checkpointed`, `materialize`,
-`boundary_lineage_key`). It multiplies every pixel-unit argument of a tagged stdlib builtin
+CACHE-6/7 stage-list family: `cook_stage_list`, `cook_fused_cached`, `cook_checkpointed`,
+`materialize`, `boundary_lineage_key`). It multiplies every pixel-unit argument of a tagged stdlib builtin
 (`gauss_blur`'s sigma, `erode`/`dilate`'s radius, `bilateral_filter`'s spatial_sigma) and the
 halo margin those builtins derive, so a program cooked on a smaller canvas produces
 proportionally smaller blur/morphology kernels instead of over-blurring relative to a
@@ -31,6 +31,7 @@ pixel-unit magnitudes — correct.
 
 - `tex_engine.prepare(code, bindings, ..., scale=0.5)` / `tex_engine.cook(..., scale=0.5)`.
 - `tex_engine.cook_stage_list(stages, ..., scale=0.5)`,
+  `tex_chain.cook_fused_cached(stages, k, cache, ..., scale=0.5)`,
   `tex_checkpoint.cook_checkpointed(stages, cache, ..., scale=0.5)`,
   `tex_checkpoint.materialize(stages, cache, ..., scale=0.5)`.
 - `tex_engine.boundary_lineage_key(...)` / `tex_results.lineage_key(...)` accept `scale=` too,
