@@ -51,8 +51,8 @@ from helpers import *
 from TEX_Wrangle import tex_lazy, tex_roi
 from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_compiler.ast_nodes import (
-    Assignment, ForLoop, FunctionCall, FunctionDef, IfElse, NumberLiteral, VarDecl, WhileLoop,
-    iter_child_nodes,
+    Assignment, ForLoop, FunctionCall, FunctionDef, NumberLiteral, VarDecl, WhileLoop,
+    clone_tree, iter_child_nodes,
 )
 from TEX_Wrangle.tex_compiler.optimizer import _fold_all, _propagate_literal_locals
 from TEX_Wrangle.tex_lazy import _fp32, _substitute_params
@@ -458,19 +458,23 @@ def test_perf4_lazy_oracle_sensitive_rows(r: SubTestResult):
 
 # ── F4: the halo scan ────────────────────────────────────────────────────────
 
-def _has_resolved_ifelse(node) -> bool:
-    """ROI-48A: True if the folded tree contains an `IfElse` whose condition is already a
-    `NumberLiteral` — the exact, and only, proof `tex_roi._resolved_branch` accepts before it
-    prunes a branch. Used below to draw the boundary of ROI-48A's own, INTENTIONAL exception
-    to this file's identity oracle as narrowly as the fix itself: a checkable fact about the
-    tree, not a label on a row."""
-    stack = [node]
-    while stack:
-        n = stack.pop()
-        if n.__class__ is IfElse and n.condition.__class__ is NumberLiteral:
-            return True
-        stack.extend(iter_child_nodes(n))
-    return False
+def _pruning_fully_explains_divergence(a, got: bool, want: bool) -> bool:
+    """FIX-ROI O3 (R2#7/B4#1): the ONLY thing this oracle is allowed to excuse is ROI-48A/O2's
+    own pruning -- proven by CAUSATION, not by "a resolved `IfElse` exists somewhere in the
+    tree" (the old `_has_resolved_ifelse` tree-presence check this replaces, which could not
+    tell a real pruning-caused divergence apart from an unrelated regression that happens to
+    land on a corpus row that ALSO contains some other resolved `IfElse` elsewhere).
+
+    `got is False and want is True` is the direction pruning can move an answer (it only
+    REMOVES a footprint, never adds one). Given that direction, `tex_roi._has_ungrounded_halo`
+    on the UNPRUNED tree `a` walks every `IfElse`'s condition AND both bodies -- exactly what
+    `_base_has_ungrounded_halo` always has -- so if THAT already agrees with `want`, pruning
+    is the one and only variable that changed between the unpruned and the pruned call, and
+    it is what accounts for the whole gap. If the unpruned answer does NOT already agree with
+    `want`, some OTHER mechanism is responsible and this must not be excused."""
+    if not (got is False and want is True):
+        return False
+    return tex_roi._has_ungrounded_halo(a) == want
 
 
 @isolated_analysis
@@ -479,19 +483,29 @@ def test_perf4_halo_answers_are_identical(r: SubTestResult):
     NAMED, NARROW, POST-ROI-48A EXCEPTION.
 
     This oracle predates ROI-48A and pins that PERF-4's traversal-count refactor moved no
-    answer. ROI-48A later gave the LIVE `tex_roi._has_ungrounded_halo` (and `_accumulate`) a
-    genuinely NEW capability the frozen pre-change snapshot below can never have: pruning a
-    branch whose condition has already folded to a literal (`case2_in_if`'s `$k > 0.5` folds
-    to `False` at `k=0.0/0.5/-1.0/0.25/nan/1e-8`, exactly the values this row moves at), so
-    the untaken arm's case-2 name-boundary halo (`@T = gauss_blur(@A,2.0); @OUT =
-    gauss_blur(@T,2.0);`) never gets a chance to block a program that will never run it.
-    That is a semantic improvement, not a refactor artifact, and a real divergence from the
-    frozen snapshot is therefore EXPECTED here — but only in one direction (True -> False,
-    since pruning can only REMOVE a footprint the old two-pass walk over-counted, never add
-    one) and only on a folded program that genuinely contains a resolved `IfElse` (proof the
-    mechanism, not a coincidence, produced it). Any OTHER divergence — the wrong direction, or
-    one with no resolved condition anywhere in the tree — still fails this test exactly as it
-    always has."""
+    answer. ROI-48A gave `tex_roi`'s ROI walkers a genuinely NEW capability the frozen
+    pre-change snapshot below can never have: pruning a branch whose condition has already
+    folded to a literal (`case2_in_if`'s `$k > 0.5` folds to `False` at
+    `k=0.0/0.5/-1.0/0.25/nan/1e-8`, exactly the values this row moves at), so the untaken
+    arm's case-2 name-boundary halo (`@T = gauss_blur(@A,2.0); @OUT = gauss_blur(@T,2.0);`)
+    never gets a chance to block a program that will never run it. FIX-ROI O2 moved that
+    pruning from a per-node special case inside `_accumulate`/`_has_ungrounded_halo`
+    themselves to a structural, fold-level step (`tex_lazy._prune_static_flow`, applied to a
+    private clone the way `tex_roi._walk` applies it) — so calling `_has_ungrounded_halo`
+    directly on `_fold_program`'s own (never pruned) output, as this oracle always has, no
+    longer reflects what production cooking actually walks; `got` below applies that same
+    clone-then-prune step first, mirroring `_walk`. That is a semantic improvement, not a
+    refactor artifact, and a real divergence from the frozen snapshot is therefore EXPECTED
+    here — but only in one direction (True -> False, since pruning can only REMOVE a
+    footprint the old two-pass walk over-counted, never add one) and only on a folded
+    program that genuinely contains a resolved `IfElse` (proof the mechanism, not a
+    coincidence, produced it). Any OTHER divergence — the wrong direction, or one with no
+    resolved condition anywhere in the tree — still fails this test exactly as it always
+    has. FIX-ROI O3 ties the exception to CAUSATION (`_pruning_fully_explains_divergence`),
+    not to "a resolved `IfElse` exists somewhere in the folded tree" — the latter would also
+    have forgiven an unrelated regression landing on any row that happens to fold one, which
+    `test_o3_synthetic_regression_on_gated_block_fails_the_oracle` (a sibling test file)
+    pins directly."""
     print("\n--- PERF-4 F4: the single-traversal halo scan vs the pre-change one ---")
     rows = _corpus()
     bad, checked, roi48a_exceptions = [], 0, 0
@@ -500,10 +514,12 @@ def test_perf4_halo_answers_are_identical(r: SubTestResult):
             a, b = _folded(code, params), _folded(code, params)
             if a is None or b is None:
                 continue
-            got, want = tex_roi._has_ungrounded_halo(a), _base_has_ungrounded_halo(b)
+            pruned_a = clone_tree(a)
+            pruned_a.statements = tex_lazy._prune_static_flow(pruned_a.statements)
+            got, want = tex_roi._has_ungrounded_halo(pruned_a), _base_has_ungrounded_halo(b)
             checked += 1
             if got != want:
-                if got is False and want is True and _has_resolved_ifelse(a):
+                if _pruning_fully_explains_divergence(a, got, want):
                     roi48a_exceptions += 1
                     continue
                 bad.append(f"{label} params={params}: {want} -> {got}")
