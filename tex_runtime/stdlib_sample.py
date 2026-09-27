@@ -49,38 +49,128 @@ class _StdlibSample:
     """sampling, fetching and neighbourhood-filter builtins: the `fn_*` methods `stdlib.py` mixes into `TEXStdlib`."""
 
     # -- Morphology (SL-4): erode / dilate ------------------------------
-    # Iterative separable 3-window min/max, `radius` times. A square structuring
-    # element is separable, and iterating a 3-window r times == a (2r+1)-window,
-    # so this is O(1) extra memory in the radius (a 3-tensor transient per pass) —
-    # avoiding the O((2r+1)^2) unfold blow-up at large radius/resolution. Replaces
-    # the hand-rolled interpreted double loop that was radius-capped by the
-    # 1024-iteration limit. Non-local (reads neighbours): excluded from tiling and
-    # from CUDA-graph capture (the radius resolves via .item()).
+    # RADIUS-50a/MORPH-50: no clamp — the author's rule ("all blurs and erodes should
+    # support arbitrarily large radiuses") ruled a silent `min(r, 256)` a bug, not a
+    # safety valve. Hybrid dispatch (RADIUS-50a-design.md D1, option 1, recorded
+    # 2026-09-27): `r` at or below `_MORPH_VANHERK_CROSSOVER` runs the ORIGINAL
+    # iterative separable 3-window loop below, byte-for-byte, so the default path's
+    # cost is unchanged (invariant 7 — this is the radius band every existing program
+    # actually uses). Above the crossover, `_morph_vanherk` below runs a van
+    # Herk/Gil-Werman separable running extremum: `O(N)` per line, independent of `r`,
+    # with a whole-line reduction shortcut once the window already reaches every
+    # pixel on that line (see `_running_extreme_1d`) — so an absurd `r` (millions)
+    # costs no more than `r == 8192` does: the shortcut fires long before either
+    # dimension's block machinery would grow past `O(image size)`. That is also why no
+    # limit is kept at all (the author's fallback, "or a limit ~8192px", is the OTHER
+    # branch of the ruling — this lane took the unconditional one because van Herk
+    # makes it both correct and fast, per RADIUS-50a-design.md §1's AUTHOR DECISIONS).
+    # min is exact via `torch.cummin`, not `-max(-x)` — one fewer negate per pass, same
+    # bit pattern (both are plain comparison reductions; there is no summation order to
+    # diverge on either way, which is the same reasoning gauss_blur's own bit-exactness
+    # note already gives). A square structuring element is separable either way.
+    # Non-local (reads neighbours): excluded from tiling and from CUDA-graph capture
+    # (the radius resolves via .item()) — `footprint=('halo_arg', 1)` is unchanged.
+    _MORPH_VANHERK_CROSSOVER = 10  # measured crossover, this implementation and box.
 
     @staticmethod
     def _morph(image, radius, grow: bool):
         img = _to_tensor(image)
-        r = max(0, min(int(_to_float(radius)), 256))
+        r = max(0, int(_to_float(radius)))
         if r == 0:
             return img
         squeeze = img.dim() == 3          # [B,H,W] mask -> add a channel
         x = (img.unsqueeze(-1) if squeeze else img).permute(0, 3, 1, 2)  # [B,C,H,W]
+        if r <= TEXStdlib._MORPH_VANHERK_CROSSOVER:
+            x = TEXStdlib._morph_iterative(x, r, grow)
+        else:
+            x = TEXStdlib._morph_vanherk(x, r, grow)
+        x = x.permute(0, 2, 3, 1)         # [B,H,W,C]
+        return x.squeeze(-1) if squeeze else x
+
+    @staticmethod
+    def _morph_iterative(x, r: int, grow: bool):
+        """The original small-`r` path, unmodified: iterating a 3-window `r` times
+        equals a single (2r+1)-window (dilation/erosion by a flat SE is associative),
+        so this stays `O(1)` extra memory in `r` — a 3-tensor transient per pass."""
         op = torch.amax if grow else torch.amin
         pad = torch.nn.functional.pad
         for _ in range(r):
             # PACE-47d (Gap 1): `erode`/`dilate` are footprint=halo_arg (registry-derived
             # heavy) and genuinely multi-pass at radius > 1 (one horizontal+vertical pass
-            # PER unit of radius, up to 256) -- the same "no internal poll opportunity"
-            # gap PACE-47c left open is closed here the same way gauss_blur's own is: a
-            # forced record between passes, so a cancel fired mid-loop can't leave more
-            # than one iteration's device work unbounded regardless of stride.
+            # per unit of radius, up to the crossover) -- the same "no internal poll
+            # opportunity" gap PACE-47c left open is closed here the same way gauss_blur's
+            # own is: a forced record between passes, so a cancel fired mid-loop can't
+            # leave more than one iteration's device work unbounded regardless of stride.
             poll_cook_cancel(heavy=True)
             xp = pad(x, (1, 1, 0, 0), mode="replicate")               # horizontal
             x = op(torch.stack([xp[..., :-2], xp[..., 1:-1], xp[..., 2:]]), dim=0)
             xp = pad(x, (0, 0, 1, 1), mode="replicate")               # vertical
             x = op(torch.stack([xp[..., :-2, :], xp[..., 1:-1, :], xp[..., 2:, :]]), dim=0)
-        x = x.permute(0, 2, 3, 1)         # [B,H,W,C]
-        return x.squeeze(-1) if squeeze else x
+        return x
+
+    @staticmethod
+    def _morph_vanherk(x, r: int, grow: bool):
+        """The large-`r` path: two separable 1-D running-extremum passes (van
+        Herk/Gil-Werman), width then height. Each pass is `O(N)` in that dimension's
+        length, independent of `r` — see `_running_extreme_1d`."""
+        poll_cook_cancel(heavy=True)
+        x = TEXStdlib._running_extreme_1d(x, r, dim=-1, grow=grow)    # horizontal (W)
+        poll_cook_cancel(heavy=True)
+        x = TEXStdlib._running_extreme_1d(x, r, dim=-2, grow=grow)    # vertical (H)
+        return x
+
+    @staticmethod
+    def _running_extreme_1d(x: torch.Tensor, r: int, dim: int, grow: bool) -> torch.Tensor:
+        """Sliding-window max (`grow=True`) or min over a `(2r+1)`-wide window along
+        `dim`, replicate-boundary, exact for every `r >= 1` — the van Herk/Gil-Werman
+        algorithm: pad by `r` (replicate), split into blocks of width `w = 2r+1`,
+        take a forward-cumulative extremum `g` and a backward-cumulative extremum `h`
+        within each block, then `out[i] = combine(h[i], g[i+w-1])` — because a
+        `w`-wide window starting at padded index `i` spans at most two `w`-sized
+        blocks. `O(N)` total work, independent of `w`.
+
+        Whole-line shortcut: once `r >= N - 1`, EVERY output position's window
+        already reaches both ends of the (replicate-padded) line, so the honest
+        answer is the line's own extremum, broadcast — no block machinery, no
+        growing-with-`r` memory. This is what keeps an arbitrarily large `r` bounded
+        to `O(image size)`: the block algorithm below is only ever asked to build
+        blocks up to about `4r` wide when `r < N - 1`, i.e. never past `O(N)`.
+        """
+        N = x.shape[dim]
+        if r >= N - 1:
+            reduced = x.amax(dim=dim, keepdim=True) if grow else x.amin(dim=dim, keepdim=True)
+            return reduced.expand(x.shape).contiguous()
+
+        w = 2 * r + 1
+        pad = torch.nn.functional.pad
+        x_last = x.movedim(dim, -1).contiguous()
+        lead_shape = x_last.shape[:-1]
+
+        # `F.pad(..., mode="replicate")` on a 4D input pads the LAST TWO dims only
+        # (a torch constraint, not a choice here) -- `x_last` is still 4D after
+        # `movedim` (it only permutes axes), so pad with an explicit 4-tuple and
+        # leave the second-to-last dim's pair at 0.
+        xp = pad(x_last, (r, r, 0, 0), mode="replicate")      # length N + 2r
+        padded_len = N + 2 * r
+        nblocks = -(-padded_len // w)                         # ceil div
+        tail = nblocks * w - padded_len
+        if tail:
+            xp = pad(xp, (0, tail, 0, 0), mode="replicate")
+
+        blocks = xp.reshape(*lead_shape, nblocks, w)
+        if grow:
+            g = torch.cummax(blocks, dim=-1).values
+            h = torch.cummax(blocks.flip(-1), dim=-1).values.flip(-1)
+        else:
+            g = torch.cummin(blocks, dim=-1).values
+            h = torch.cummin(blocks.flip(-1), dim=-1).values.flip(-1)
+
+        g_flat = g.reshape(*lead_shape, nblocks * w)
+        h_flat = h.reshape(*lead_shape, nblocks * w)
+        h_slice = h_flat[..., :N]
+        g_slice = g_flat[..., w - 1:w - 1 + N]
+        out = torch.maximum(h_slice, g_slice) if grow else torch.minimum(h_slice, g_slice)
+        return out.movedim(-1, dim)
 
     @stdlib("erode", sig='erode(img, radius) \\u2192 vec', category='Sampling', sync=True, footprint=('halo_arg', 1), pixel_args=(1,), doc='Morphological erosion (local min over a (2r+1)² square). Shrinks bright regions.', ex='@OUT = erode(@mask, 3);')
     @staticmethod
