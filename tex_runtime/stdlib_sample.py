@@ -737,7 +737,14 @@ class _StdlibSample:
     # the larger of the two: up to 0.0265 maxdiff on a realistic image). Past the
     # threshold, `_reach_of` answers 'unbounded' -- the same decline a symbolic
     # spatial_sigma already gets -- so the planner falls back to a whole-frame cook.
-    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 8.0, _BILATERAL_APPROX_THRESHOLD_SS), pixel_args=(1,), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Exact within a measured window; a bounded-cost downscale approximation runs past it.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
+    # A4 (v0.50 Phase C, R3#5): the reach multiplier is 3.0, matching the exact/tiled-
+    # exact tiers' own true reach (`radius = ceil(3*ss)`) -- the mult used to be 8.0,
+    # picked to conservatively cover the detail-transfer tier's chain reach too from one
+    # static number, but A1's `approx_above` decline now handles that tier by refusing to
+    # narrow at all, so this mult only ever needs to describe the (unchanged) exact
+    # tiers' real reach. The old 8.0 over-padded every ROI-narrowed or tiled cook below
+    # the threshold by ~2.67x more halo than the math needs (R3#5's own measurement).
+    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0, _BILATERAL_APPROX_THRESHOLD_SS), pixel_args=(1,), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Exact within a measured window; a bounded-cost downscale approximation runs past it.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
     @staticmethod
     def fn_bilateral_filter(image, sigma_s, sigma_r) -> torch.Tensor:
         """Edge-preserving bilateral filter using Tensor.unfold.

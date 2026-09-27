@@ -360,6 +360,28 @@ def test_bilat50_footprint_is_halo_arg_tied_to_spatial_sigma(r: SubTestResult):
          "(3*spatial_sigma) reach, at every tested spatial_sigma")
 
 
+def test_bilat50_a4_footprint_does_not_overpad_the_unchanged_regime(r: SubTestResult):
+    print("\n--- A4 (v0.50 Phase C, R3#5): the declared halo matches the exact/tiled-"
+          "exact tiers' own true reach EXACTLY, not a conservative multiple of it ---")
+    # Below the approx threshold, the true reach is always ceil(3*ss) (the exact and
+    # tiled-exact tiers share the identical weighted-average math -- A5's own finding).
+    # A4's fix is the mult itself: it used to be 8.0 (picked to cover the detail-
+    # transfer tier's own reach too, from a single static number), over-padding this
+    # regime's real halo by ~2.67x on any ROI-narrowed or tiled cook. A1's own
+    # approx_above decline now handles the detail-transfer tier by refusing to narrow
+    # at all, so nothing needs the conservative 8.0 here any more.
+    for ss in (0.3, 0.5, 1.5, 4.0, 6.0, 8.0):
+        declared = _R._call_reach("bilateral_filter", [None, NumberLiteral(value=ss)])
+        true_reach = int(math.ceil(3.0 * ss))
+        if declared != true_reach:
+            r.fail(f"a4 overpad ss={ss}",
+                   f"declared reach {declared} != the true reach {true_reach} "
+                   f"(ratio {declared / true_reach:.2f}x)")
+            return
+    r.ok("declared halo_arg reach == 3*spatial_sigma exactly, for every spatial_sigma "
+         "at or below the approx threshold (no over-padding)")
+
+
 # ── 7. Windowed-vs-whole-frame pixel identity ────────────────────────────────────────────────
 
 def _windowed_vs_whole(code, params, image, roi):
