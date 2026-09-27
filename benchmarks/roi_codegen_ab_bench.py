@@ -107,18 +107,26 @@ def _null_spread(xs: list) -> tuple:
     return ma, mb, (ma / mb if mb else float("nan"))
 
 
-def run_shape(roi_side: int, res: int, device: str, cache_root: str, tag: str,
-             n_rounds: int) -> dict:
+def run_shape_rect(roi_w: int, roi_h: int, canvas_w: int, canvas_h: int, device: str,
+                   cache_root: str, tag: str, n_rounds: int) -> dict:
+    """TIERQ-48: the general (rectangular) form of `run_shape` — a realistic
+    interactive-viewport window is not square (a small viewport is "~6% of a
+    1920x1080 canvas", not a square fraction of a square canvas). `run_shape` below is
+    now a thin square-case wrapper over this, so the TRK-133-pinned `SHAPES` table and
+    its call shape are unchanged (invariant: a rectangular canvas/window is additive,
+    not a replacement)."""
     torch.manual_seed(11)
-    A = torch.rand(1, res, res, 4, device=device)
-    x0 = y0 = max(0, (res - roi_side) // 2)
-    roi = (x0, y0, roi_side, roi_side, res, res)
+    A = torch.rand(1, canvas_h, canvas_w, 4, device=device)
+    x0 = max(0, (canvas_w - roi_w) // 2)
+    y0 = max(0, (canvas_h - roi_h) // 2)
+    roi = (x0, y0, roi_w, roi_h, canvas_w, canvas_h)
 
     # Separate cache dirs per flag (measurement rule 1); tag-qualified so each
     # independent sitting (a fresh process invocation) gets a genuinely empty pair,
     # never one left warm by a prior sitting.
-    dir0, empty0 = _set_cache_dir(cache_root, f"{tag}_{res}_{roi_side}_interp")
-    dir1, empty1 = _set_cache_dir(cache_root, f"{tag}_{res}_{roi_side}_codegen")
+    shape_tag = f"{canvas_w}x{canvas_h}_{roi_w}x{roi_h}"
+    dir0, empty0 = _set_cache_dir(cache_root, f"{tag}_{shape_tag}_interp")
+    dir1, empty1 = _set_cache_dir(cache_root, f"{tag}_{shape_tag}_codegen")
 
     def cook(flag: str, amount: float):
         os.environ["TEX_ROI_CODEGEN"] = flag
@@ -152,7 +160,8 @@ def run_shape(roi_side: int, res: int, device: str, cache_root: str, tag: str,
     n1a, n1b, n1r = _null_spread(samples["1"])
 
     return {
-        "device": device, "roi": roi_side, "resolution": res,
+        "device": device, "roi_w": roi_w, "roi_h": roi_h,
+        "canvas_w": canvas_w, "canvas_h": canvas_h,
         "cache_dir_interp": dir0, "cache_dir_interp_started_empty": empty0,
         "cache_dir_codegen": dir1, "cache_dir_codegen_started_empty": empty1,
         "n_timed_rounds": n_rounds - 1,
@@ -166,6 +175,53 @@ def run_shape(roi_side: int, res: int, device: str, cache_root: str, tag: str,
     }
 
 
+def run_shape(roi_side: int, res: int, device: str, cache_root: str, tag: str,
+             n_rounds: int) -> dict:
+    """The square case (`SHAPES`'s own shape) — a thin wrapper over `run_shape_rect`,
+    kept so the TRK-133-pinned call shape and its `"roi"`/`"resolution"` keys survive
+    unchanged for any existing caller."""
+    row = run_shape_rect(roi_side, roi_side, res, res, device, cache_root, tag, n_rounds)
+    row["roi"], row["resolution"] = roi_side, res
+    return row
+
+
+#: Realistic interactive-viewport scenarios (TIERQ-48's re-measurement ask): a small
+#: window sized ~6% of the area of a 1920x1080 / 3840x2160 (4k) canvas, at the SAME
+#: 16:9 aspect as the canvas — the shape an artist's drag/scrub viewport actually is,
+#: not a square crop of a square canvas. `SHAPES` above stays the TRK-133-pinned table;
+#: this is an ADDITIVE second table, not a replacement.
+INTERACTIVE_SCENARIOS = {
+    # name: (roi_w, roi_h, canvas_w, canvas_h)
+    "interactive1080p": (470, 264, 1920, 1080),   # ~5.99% of 1920x1080
+    "4k": (940, 529, 3840, 2160),                 # ~5.995% of 3840x2160, same aspect
+}
+
+
+def _print_row(row: dict, box: str) -> None:
+    print(f"  interp  median  {row['interp_ms_median']:9.4f} ms  "
+          f"(null split-half ratio {row['null_interp_ratio']:.3f})")
+    print(f"  codegen median  {row['codegen_ms_median']:9.4f} ms  "
+          f"(null split-half ratio {row['null_codegen_ratio']:.3f})")
+    if row["codegen_vs_interp"] is not None:
+        print(f"  codegen/interp  {row['codegen_vs_interp']:.3f}x   "
+              f"(interp/codegen = {row['interp_vs_codegen_speedup']:.3f}x)")
+        null_spread = max(abs(row["null_interp_ratio"] - 1.0),
+                          abs(row["null_codegen_ratio"] - 1.0))
+        real_effect = abs(row["codegen_vs_interp"] - 1.0)
+        verdict = "ABOVE null spread (real)" if real_effect > null_spread else \
+                  "WITHIN null spread (not distinguishable from noise)"
+        print(f"  null spread (|ratio-1|) = {null_spread:.3f}  vs  effect = "
+              f"{real_effect:.3f}  (box: {box})  ->  {verdict}")
+
+
+def _save(out: dict, save_arg: str) -> None:
+    path = save_arg if os.path.isabs(save_arg) else os.path.join(_HERE, save_arg)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+    print(f"\nSaved {path}  (box: {out.get('box')})")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="TEX ROI codegen-vs-interpreter A/B benchmark")
     ap.add_argument("--device", default=None, help="cpu|cuda (default: cuda if available)")
@@ -177,6 +233,11 @@ def main(argv=None) -> int:
                     help="parent dir for this run's per-flag cache dirs "
                          "(default: a subfolder under the system temp dir)")
     ap.add_argument("--save", default=None, help="write the sitting's numbers as JSON")
+    ap.add_argument("--scenario", choices=("square", "interactive1080p", "4k", "all"),
+                    default="square",
+                    help="'square' (default) runs the TRK-133-pinned SHAPES table; "
+                         "'interactive1080p'/'4k'/'all' run TIERQ-48's realistic "
+                         "16:9 viewport-shaped scenarios (INTERACTIVE_SCENARIOS) instead")
     args = ap.parse_args(argv)
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,31 +246,30 @@ def main(argv=None) -> int:
     print(f"BOX: {box}  device={device}  torch={torch.__version__}")
 
     out = {"box": box, "device": device, "shapes": []}
+
+    if args.scenario != "square":
+        names = list(INTERACTIVE_SCENARIOS) if args.scenario == "all" else [args.scenario]
+        for name in names:
+            roi_w, roi_h, canvas_w, canvas_h = INTERACTIVE_SCENARIOS[name]
+            print(f"\n=== {name}: {roi_w}x{roi_h} roi of {canvas_w}x{canvas_h} canvas "
+                  f"(box: {box}) ===")
+            row = run_shape_rect(roi_w, roi_h, canvas_w, canvas_h, device, cache_root,
+                                 args.tag, args.rounds)
+            row["scenario"] = name
+            out["shapes"].append(row)
+            _print_row(row, box)
+        if args.save:
+            _save(out, args.save)
+        return 0
+
     for roi_side, res in SHAPES:
         print(f"\n=== {roi_side}^2-of-{res}^2  (box: {box}) ===")
         row = run_shape(roi_side, res, device, cache_root, args.tag, args.rounds)
         out["shapes"].append(row)
-        print(f"  interp  median  {row['interp_ms_median']:9.4f} ms  "
-              f"(null split-half ratio {row['null_interp_ratio']:.3f})")
-        print(f"  codegen median  {row['codegen_ms_median']:9.4f} ms  "
-              f"(null split-half ratio {row['null_codegen_ratio']:.3f})")
-        if row["codegen_vs_interp"] is not None:
-            print(f"  codegen/interp  {row['codegen_vs_interp']:.3f}x   "
-                  f"(interp/codegen = {row['interp_vs_codegen_speedup']:.3f}x)")
-            null_spread = max(abs(row["null_interp_ratio"] - 1.0),
-                              abs(row["null_codegen_ratio"] - 1.0))
-            real_effect = abs(row["codegen_vs_interp"] - 1.0)
-            verdict = "ABOVE null spread (real)" if real_effect > null_spread else \
-                      "WITHIN null spread (not distinguishable from noise)"
-            print(f"  null spread (|ratio-1|) = {null_spread:.3f}  vs  effect = "
-                  f"{real_effect:.3f}  (box: {box})  ->  {verdict}")
+        _print_row(row, box)
 
     if args.save:
-        path = args.save if os.path.isabs(args.save) else os.path.join(_HERE, args.save)
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(out, f, indent=2)
-        print(f"\nSaved {path}  (box: {box})")
+        _save(out, args.save)
     return 0
 
 
