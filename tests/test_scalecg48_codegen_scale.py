@@ -195,43 +195,18 @@ def _codegen_interp_scale_parity(r: SubTestResult, device_mode: str, scale: floa
                f"BLUR maxdiff {md_blur:.2e}, STENCIL maxdiff {md_stencil:.2e} (want < 1e-5)")
 
 
-def test_scalecg48_codegen_interp_parity_cpu_half(r: SubTestResult):
-    print("\n--- SCALE-CG-48 (b): codegen == interpreter at scale=0.5, CPU ---")
-    _codegen_interp_scale_parity(r, "cpu", 0.5, "cpu")
-
-
-def test_scalecg48_codegen_interp_parity_cpu_quarter(r: SubTestResult):
-    print("\n--- SCALE-CG-48 (b): codegen == interpreter at scale=0.25, CPU ---")
-    _codegen_interp_scale_parity(r, "cpu", 0.25, "cpu")
-
-
-def test_scalecg48_codegen_interp_parity_cpu_eighth(r: SubTestResult):
-    print("\n--- SCALE-CG-48 (b): codegen == interpreter at scale=0.125, CPU ---")
-    _codegen_interp_scale_parity(r, "cpu", 0.125, "cpu")
-
-
-def test_scalecg48_codegen_interp_parity_cuda_half(r: SubTestResult):
-    print("\n--- SCALE-CG-48 (b): codegen == interpreter at scale=0.5, CUDA (if available) ---")
-    if not torch.cuda.is_available():
+def test_scalecg48_codegen_interp_parity(r: SubTestResult):
+    """FIX-TIER T6 (R2#3): one parametrised loop over (device, scale) replacing six
+    near-identical 3-line wrappers that differed only in that pair -- `r.ok`/`r.fail`
+    already carry the per-case `[tag] scale=...` label, so nothing about per-case
+    reporting is lost by looping instead of repeating the call six times."""
+    print("\n--- SCALE-CG-48 (b): codegen == interpreter, CPU + CUDA, at three scales ---")
+    devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+    if "cuda" not in devices:
         r.skip("cuda parity", "CUDA not available on this box -- covered on the laptop lease")
-        return
-    _codegen_interp_scale_parity(r, "cuda", 0.5, "cuda")
-
-
-def test_scalecg48_codegen_interp_parity_cuda_quarter(r: SubTestResult):
-    print("\n--- SCALE-CG-48 (b): codegen == interpreter at scale=0.25, CUDA (if available) ---")
-    if not torch.cuda.is_available():
-        r.skip("cuda parity", "CUDA not available on this box -- covered on the laptop lease")
-        return
-    _codegen_interp_scale_parity(r, "cuda", 0.25, "cuda")
-
-
-def test_scalecg48_codegen_interp_parity_cuda_eighth(r: SubTestResult):
-    print("\n--- SCALE-CG-48 (b): codegen == interpreter at scale=0.125, CUDA (if available) ---")
-    if not torch.cuda.is_available():
-        r.skip("cuda parity", "CUDA not available on this box -- covered on the laptop lease")
-        return
-    _codegen_interp_scale_parity(r, "cuda", 0.125, "cuda")
+    for device in devices:
+        for scale in (0.5, 0.25, 0.125):
+            _codegen_interp_scale_parity(r, device, scale, device)
 
 
 def test_scalecg48_scale_none_emits_no_new_bytes_without_pixel_args(r: SubTestResult):

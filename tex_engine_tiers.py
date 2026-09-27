@@ -393,31 +393,28 @@ def _run_tier(ctx, tier_id):
     output dict. Single home for the `tier method -> {name: tensor}` idiom used by
     both run() and the C2 re-cook path (reuse review).
 
-    SCALE-47b/SCALE-CG-48: a scale-active cook (`ctx.scale is not None`) never reaches
-    `torch_compile`/`auto`/`cuda_graph` — those tiers do not thread a runtime scale
-    multiplier through their COMPILED/CAPTURED code at all (SCALE-COMPILED-48, deferred
-    past v0.48; `docs/resolution-scale.md`), so a scale-active cook whose `tier_id` names
-    one of them still forces the plain interpreter, unchanged from SCALE-47b.
+    A scale-active cook (`ctx.scale is not None`) never reaches `torch_compile`/`auto`/
+    `cuda_graph` — those tiers do not thread a runtime scale multiplier through their
+    COMPILED/CAPTURED code at all (SCALE-COMPILED-48 is a v0.49+ item;
+    `docs/resolution-scale.md`), so a scale-active cook whose `tier_id` names one of them
+    is forced onto the plain interpreter instead.
 
-    What changed (SCALE-CG-48): when `tier_id == "default"`, this no longer forces the
-    interpreter unconditionally. The "default" tier's OWN internal codegen shortcut
-    (`_run_default`'s UC-2 stencil route, `_should_stencil_route`) now ALSO threads
-    `scale` through `_codegen_only_execute` — codegen's `pixel_args=`-tagged call sites
-    now emit `arg * _env['__tex_scale']` (`tex_runtime/codegen.py`), a runtime value, not
-    a folded literal, so the codegen route is scale-safe. This is "route to codegen when
-    the codegen tier would otherwise be chosen": `_should_stencil_route` is the ONLY
-    concrete "would codegen run here" test the default tier has today (ROI-codegen is a
-    separate, still-flagged-off lane — TIERQ-48/ROI-CG-48 — deliberately untouched here).
-    `_codegen_only_execute` self-falls-back to the interpreter (forwarding `scale`) on any
-    decline/failure, so this can never hard-fail or silently drop scale. M-4/ROI-5 tiling
-    and ROI narrowing stay OUT of scope exactly as before — a scale-active cook still
-    cooks whole-frame (SCALE-47b's own documented "declines the ROI window" posture,
-    unchanged: this branch never threads `ctx.roi`, matching what the unconditional
-    interpreter branch below already did before this ask).
+    A scale-active cook whose `tier_id == "default"` is NOT forced to the interpreter
+    unconditionally: it routes to codegen instead whenever the "default" tier's own
+    internal codegen shortcut would already fire (`_should_stencil_route`, the UC-2
+    exact-fetch stencil gate) — codegen's `pixel_args=`-tagged call sites emit
+    `arg * _env['__tex_scale']` as a runtime value, never a folded literal
+    (`tex_runtime/codegen.py`), so that route is scale-safe. `_should_stencil_route` is
+    the ONLY concrete "would codegen run here" test the default tier has today
+    (ROI-codegen is a separate, still-flagged-off lane, deliberately untouched here).
+    `_codegen_only_execute` self-falls-back to the interpreter (forwarding `scale`) on
+    any decline/failure, so this can never hard-fail or silently drop scale. Tiling and
+    ROI narrowing stay out of scope for a scale-active cook: it always cooks whole-frame
+    (this branch never threads `ctx.roi`).
 
     Recorded via `tier_trace` on every path (`_codegen_only_execute` records "codegen" on
-    success, "interpreter" fallback_from="codegen" on decline; the branch below records
-    "interpreter" fallback_from=tier_id exactly as before) — never a silent fallback.
+    success, "interpreter" fallback_from="codegen" on decline; the plain interpreter
+    branch below records "interpreter" fallback_from=tier_id) — never a silent fallback.
     `ctx.scale is None` (every ComfyUI cook) never reaches this function's body at all —
     one `is not None` check, no behaviour change on the default (`scale=None`) path."""
     if ctx.scale is not None:
@@ -616,11 +613,11 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
                 roi_reason = ROI_REASON_ARMED
 
     if scale is not None:
-        # SCALE-CG-48: on the "default" tier only (never torch_compile/auto/cuda_graph —
-        # those stay forced to the interpreter, unchanged from SCALE-47b), a scale-active
-        # cook routes to codegen instead when the UC-2 stencil gate would already choose
-        # it. Mirrors `_run_tier`'s own new branch exactly (`tier_id == "default" and not
-        # fused_chain and _should_stencil_route(...)`).
+        # On the "default" tier only (never torch_compile/auto/cuda_graph — those stay
+        # forced to the interpreter), a scale-active cook routes to codegen instead when
+        # the UC-2 stencil gate would already choose it. Mirrors `_run_tier`'s own branch
+        # exactly (`tier_id == "default" and not fused_chain and
+        # _should_stencil_route(...)`), so the two can never disagree.
         if tier_id == "default" and not fused_chain:
             stencil = _stencil_route_would_apply(code, binding_types)
             if stencil:

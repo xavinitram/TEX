@@ -27,6 +27,14 @@ from TEX_Wrangle.tex_engine_tiers import (
     ROI_REASON_TIER_NOT_DEFAULT, ROI_REASON_NOT_ARMED, ROI_REASON_ARMED,
     ROI_REASON_WHOLE_FRAME, ROI_REASON_SCALE_ACTIVE,
 )
+# FIX-TIER T6 (R2#5): single-sourced from test_scalecg48_codegen_scale.py rather than a
+# verbatim second copy -- same TEX source, same binding-types dict, kept in one file so a
+# future edit to the shape (e.g. widening the stencil radius default) only has one place
+# to happen.
+from test_scalecg48_codegen_scale import (
+    _STENCIL_PLUS_BLUR as _STENCIL_PLUS_BLUR_CODE,
+    _STENCIL_PLUS_BLUR_BT,
+)
 
 # An ROI-executable program (pointwise + one inline gauss_blur reading a $param) — the
 # same shape `benchmarks/roi_scrub_bench.py`/`roi_codegen_ab_bench.py` already use, kept
@@ -37,26 +45,6 @@ _PLAIN_CODE = "@OUT = @A * 2.0;\n"
 # Reads img_width() outside a whitelisted fetch call — the classifier's own documented
 # unsafe class (docs/resolution-scale.md "The classifier and the override comment").
 _SCALE_UNSAFE_CODE = "@OUT = vec4(vec3(float(img_width()) * 0.001), 1.0);\n"
-
-# SCALE-CG-48's own precondition shape (tests/test_scalecg48_codegen_scale.py): an
-# exact-fetch box-blur stencil (UC-2 routes this to codegen) alongside an independent
-# gauss_blur output — `//!tex scale: safe` vouches for the hand-written ix/iy pixel
-# arithmetic the classifier over-approximates as unsafe (documented, sanctioned override).
-_STENCIL_PLUS_BLUR_CODE = """//!tex scale: safe
-i$radius = 2;
-vec3 acc = vec3(0.0);
-float cnt = 0.0;
-for (int dy = -$radius; dy <= $radius; dy = dy + 1) {
-    for (int dx = -$radius; dx <= $radius; dx = dx + 1) {
-        acc = acc + fetch(@A, ix + dx, iy + dy).rgb;
-        cnt = cnt + 1.0;
-    }
-}
-@STENCIL = vec4(acc / cnt, 1.0);
-@BLUR = gauss_blur(@A, 8.0);
-"""
-_STENCIL_PLUS_BLUR_BT = {"A": TEXType.VEC3, "radius": TEXType.INT,
-                        "STENCIL": TEXType.VEC4, "BLUR": TEXType.VEC4}
 
 
 def _real_plan(code, bindings, **kw):
