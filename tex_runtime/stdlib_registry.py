@@ -77,6 +77,20 @@ class StdlibEntry:
     # bypass of stride economization). Default `False` for every function with no runtime-
     # variable or otherwise underestimated cost — this tag is additive, never a downgrade.
     heavy: bool = False
+    # REACH-48 (TIERS-48-design.md SS B.2 point 2): per-argument reach for a builtin with
+    # SEVERAL image arguments. `footprint` describes arg 0's (the image's) reach; a function
+    # like `convolve(image, kernel, normalize)` reads a SECOND argument (`kernel`) as its own
+    # full image/array binding, whose reach is independent of arg 0's and of `pixel_args`/
+    # `non_spatial_args` (which both describe a NON-image scalar or resource, the opposite
+    # question). `arg_footprint` is a tuple of `(index, descriptor)` pairs — a tuple, not a
+    # dict, for the same reason `pixel_args`/`non_spatial_args` are tuples: `StdlibEntry` is
+    # frozen and hashable-by-value, so every field must stay hashable. `index` is always >= 1
+    # (arg 0's reach is `footprint`'s job — declaring it here too would be a contradiction,
+    # not a description); `descriptor` is validated exactly like a whole-function `footprint`
+    # (`_valid_footprint`), so a malformed per-arg descriptor fails loud at import, same as a
+    # malformed `footprint` does. Empty (the default) for every function with only one image
+    # argument — this tag is additive, and every existing registration is unaffected.
+    arg_footprint: tuple = ()
 
     @property
     def names(self) -> tuple:
@@ -143,9 +157,31 @@ def _valid_pixel_args(pixel_args, footprint) -> bool:
     return True
 
 
+def _valid_arg_footprint(arg_footprint) -> bool:
+    """REACH-48: `arg_footprint` well-formedness, the same discipline `_valid_footprint`
+    already applies to the whole-function descriptor. Each item must be an `(index,
+    descriptor)` pair, `index` a non-negative-excluding-zero int (arg 0's reach is
+    `footprint`'s job, not this one's — index 0 here is a contradiction, not a typo, so it
+    is rejected the same way a bool radius is), no index repeated (one declaration per
+    argument), and `descriptor` a valid `_valid_footprint` value."""
+    seen = set()
+    for item in arg_footprint:
+        if not (isinstance(item, tuple) and len(item) == 2):
+            return False
+        idx, fp = item
+        if not isinstance(idx, int) or isinstance(idx, bool) or idx < 1:
+            return False
+        if idx in seen:
+            return False
+        seen.add(idx)
+        if not _valid_footprint(fp):
+            return False
+    return True
+
+
 def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
            doc="", ex="", sig="", category="", non_spatial_args=(), pixel_args=(),
-           heavy=False):
+           heavy=False, arg_footprint=()):
     """Record one StdlibEntry and return the decorated object UNCHANGED (so an
     inner `@staticmethod` still applies). Pure data attachment — the name is
     explicit; nothing is inferred or discovered. `footprint` (ROI-1) is validated
@@ -156,7 +192,9 @@ def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
     `pixel_args` (SCALE-47b) names which 0-based argument positions are a pixel-unit
     magnitude a cook's `scale=` must multiply — see `StdlibEntry.pixel_args`.
     `heavy` (FIX-PACE P4) marks a function device-expensive independent of its
-    footprint — see `StdlibEntry.heavy`."""
+    footprint — see `StdlibEntry.heavy`. `arg_footprint` (REACH-48) names the
+    independent reach of any OTHER (index >= 1) argument that is itself a full image/
+    array binding — see `StdlibEntry.arg_footprint`."""
     if not _valid_footprint(footprint):
         raise ValueError(
             f"stdlib({name!r}): invalid footprint {footprint!r}. Expected 'point', "
@@ -168,20 +206,27 @@ def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
             f"include a 'halo_arg' footprint's own index when one is declared.")
     if not isinstance(heavy, bool):
         raise ValueError(f"stdlib({name!r}): heavy must be a bool, got {heavy!r}.")
+    if not _valid_arg_footprint(arg_footprint):
+        raise ValueError(
+            f"stdlib({name!r}): invalid arg_footprint {arg_footprint!r}. Expected a tuple "
+            f"of (index>=1, descriptor) pairs, each descriptor valid per `_valid_footprint`, "
+            f"no index repeated.")
 
     def deco(obj):
         fn = obj.__func__ if isinstance(obj, staticmethod) else obj
         REGISTRY.append(StdlibEntry(name, fn, tuple(aliases), spatial, sync,
                                     footprint, doc, ex, sig, category,
-                                    tuple(non_spatial_args), tuple(pixel_args), heavy))
-        # REG-1c: a registration changes what `non_spatial_args_by_name()`/`pixel_args_by_name()`
-        # must answer, so their caches (below) are invalidated here — the ONLY place `REGISTRY`
-        # grows. This also covers late registration (a decorator running after the first
-        # lookup): the next call rebuilds from the now-longer `REGISTRY` instead of answering
-        # from a stale snapshot.
-        global _NON_SPATIAL_CACHE_READY, _PIXEL_ARGS_CACHE_READY
+                                    tuple(non_spatial_args), tuple(pixel_args), heavy,
+                                    tuple(arg_footprint)))
+        # REG-1c: a registration changes what `non_spatial_args_by_name()`/`pixel_args_by_name()`/
+        # `arg_footprint_by_name()` must answer, so their caches (below) are invalidated here —
+        # the ONLY place `REGISTRY` grows. This also covers late registration (a decorator
+        # running after the first lookup): the next call rebuilds from the now-longer
+        # `REGISTRY` instead of answering from a stale snapshot.
+        global _NON_SPATIAL_CACHE_READY, _PIXEL_ARGS_CACHE_READY, _ARG_FOOTPRINT_CACHE_READY
         _NON_SPATIAL_CACHE_READY = False
         _PIXEL_ARGS_CACHE_READY = False
+        _ARG_FOOTPRINT_CACHE_READY = False
         return obj
     return deco
 
@@ -233,6 +278,66 @@ def pixel_args_by_name() -> dict:
             (n, e.pixel_args) for e in REGISTRY if e.pixel_args for n in e.names)
         _PIXEL_ARGS_CACHE_READY = True
     return _PIXEL_ARGS_CACHE
+
+
+# REACH-48: the mirror of REG-1c's caches, same build-once-invalidate-on-register discipline.
+_ARG_FOOTPRINT_CACHE: dict = {}
+_ARG_FOOTPRINT_CACHE_READY = False
+
+
+def arg_footprint_by_name() -> dict:
+    """{name: {index: descriptor}} for every registered name (aliases expanded) whose
+    `arg_footprint` is non-empty — the single source `tex_roi._call_reach`/`_accumulate`
+    read to resolve a multi-image-argument builtin's OTHER argument(s) to their own,
+    independently-declared reach (TIERS-48-design.md SS B.2 point 2). Same cache shape and
+    invalidation rule as `non_spatial_args_by_name()`/`pixel_args_by_name()`."""
+    global _ARG_FOOTPRINT_CACHE_READY
+    if not _ARG_FOOTPRINT_CACHE_READY:
+        _ARG_FOOTPRINT_CACHE.clear()
+        _ARG_FOOTPRINT_CACHE.update(
+            (n, dict(e.arg_footprint)) for e in REGISTRY if e.arg_footprint for n in e.names)
+        _ARG_FOOTPRINT_CACHE_READY = True
+    return _ARG_FOOTPRINT_CACHE
+
+
+def unclassified_image_arg_candidates() -> list:
+    """REACH-48 loud guard (TIERS-48-design.md SS B.2 point 2, mirroring
+    `unclassified_fragile_candidates()`'s own structural-marker shape): a registered fn
+    whose impl resolves a non-first, non-`pixel_args`, non-`non_spatial_args`, non-own-
+    `halo_arg`-index argument through the SAME idiom `convolve`'s `kernel` uses —
+    `<local> = <name> if <name>.__class__ is torch.Tensor else _to_tensor(<name>)` (or a
+    bare `_to_tensor(<name>)`) followed by a rank check on the resulting local (`.dim(`) —
+    but where that argument position is not already covered by an `arg_footprint`
+    declaration. This is the signal that distinguishes a SECOND IMAGE/ARRAY binding (read
+    as a whole tensor with its own shape contract) from a plain scalar resolved via
+    `_host_scalar`/`_uniform_scalar_or_raise`/`.item()` (neither of which is rank-checked).
+    Structural, not exhaustive — like its fp16 sibling, it reduces the drift risk for a NEW
+    multi-image-argument builtin added without a per-argument reach declaration; it does
+    not replace reviewing a new registration by hand."""
+    import inspect
+    out = []
+    for e in REGISTRY:
+        try:
+            params = list(inspect.signature(e.fn).parameters.keys())
+        except (TypeError, ValueError):
+            continue
+        accounted = {0, *e.pixel_args, *e.non_spatial_args, *(i for i, _ in e.arg_footprint)}
+        fp = e.footprint
+        if isinstance(fp, tuple) and fp and fp[0] == "halo_arg":
+            accounted.add(fp[1])
+        body = _fn_body_src(e.fn)
+        for i, pname in enumerate(params):
+            if i in accounted:
+                continue
+            esc = _re.escape(pname)
+            m = _re.search(rf"(\w+)\s*=\s*{esc}\b[^\n]*?_to_tensor\({esc}\)", body)
+            local = m.group(1) if m else pname
+            if _re.search(rf"_to_tensor\({esc}\)", body) and (
+                    _re.search(rf"\b{_re.escape(local)}\.dim\(", body)
+                    or _re.search(rf"\b{esc}\.dim\(", body)):
+                out.append(e.name)
+                break
+    return sorted(set(out))
 
 
 def functions() -> dict:

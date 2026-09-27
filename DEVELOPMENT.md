@@ -1443,6 +1443,17 @@ Recorded by v0.25 "Remember frames" (`docs/results-caching.md` is the provenance
   whole, which is what the machinery already means. Reopens with a "this argument is read
   whole" descriptor in `tex_roi` (a fourth footprint field), as its own item: it widens
   invariant #5's vocabulary, so `_valid_footprint`, TST-3 and ROI-4's reach pinning move with it.
+  *Gate:* **superseded in part — see REACH-48 (v0.48, TIERS-48-design.md §B.2 point 2)**, which
+  built exactly the reopening condition named above: `stdlib_registry.StdlibEntry.arg_footprint`
+  (a tuple of `(index, descriptor)` pairs, validated like `footprint`) lets a builtin declare a
+  NON-arg-0 argument's own reach independent of arg 0's — `convolve` now carries
+  `arg_footprint=((1, 'image'),)` for its kernel, and `tex_roi._accumulate`'s `rest`-argument
+  walk consults it (`_call_arg_reach`) instead of reading every non-image argument at the outer
+  ctx_halo. `footprint='image'` (arg 0's own descriptor) is UNCHANGED — `convolve` still blocks
+  ROI narrowing on arg 0's whole-image reach alone, so this closes the SUBSTRATE gap
+  (`binding_footprints` no longer under-reports `@kernel`'s reach as `'point'`) without changing
+  `roi_plan`'s executability for any existing program. Still open: a DAG-shaped join
+  (`chain_windows` reading a multi-input map) is deferred to v0.49 (TIERS-48-design.md §C.3).
 - **`patch_dist` declaring a `halo_arg` footprint (ASK-13, v0.35)** — rejected; it ships
   `footprint='image'`. The true reach is `radius + max(|dx|, |dy|)`, which spans two arguments,
   and the descriptor reads one: `('halo_arg', radius)` declares the radius alone and under-pads

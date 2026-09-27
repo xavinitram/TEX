@@ -606,14 +606,18 @@ class _StdlibSample:
     # ASK-1: native convolution. `kernel` is a second IMAGE/MASK BINDING, read whole —
     # not an ARRAY literal (an array is expanded to one full frame per tap by the
     # interpreter, `interpreter.py:1611-1617`) and not a mat3/mat4 (capped at 4x4,
-    # `DEVELOPMENT.md:165`). footprint='image', because `('halo_arg', kernel)` cannot be
-    # built here: `tex_roi._call_reach` resolves a halo_arg only from a folded
-    # NumberLiteral, so a kernel BINDING can only ever resolve 'unbounded' — never a
-    # narrowable radius — and the variant that WOULD resolve accumulates the kernel into
-    # the outer halo ctx, so a narrowed ROI slices the kernel binding itself (wrong pixels
-    # the moment ROI narrows). Recorded in DEVELOPMENT.md §"Rejected design decisions".
+    # `DEVELOPMENT.md:165`). footprint='image' (arg 0, the image itself), because
+    # `('halo_arg', kernel)` cannot be built here: `tex_roi._call_reach` resolves a
+    # halo_arg only from a folded NumberLiteral, so a kernel BINDING can only ever resolve
+    # 'unbounded' — never a narrowable radius. REACH-48 (TIERS-48-design.md SS B.2 point 2)
+    # closes the OTHER half of the DEVELOPMENT.md rejected-decision entry this cites: the
+    # kernel argument is now given its OWN declared reach, `arg_footprint=((1, 'image'),)`
+    # — "this argument is read whole", the exact vocabulary widening that entry named as
+    # its reopening condition — so `tex_roi`'s per-binding footprint (and any future
+    # per-argument consumer, e.g. a join-shaped `chain_windows` walk) reports @kernel as
+    # 'image' instead of silently defaulting it to the outer/pointwise context.
     @stdlib("convolve", sig='convolve(img, kernel[, normalize]) \\u2192 vec', category='Sampling',
-            spatial=True, sync=True, footprint='image',
+            spatial=True, sync=True, footprint='image', arg_footprint=((1, 'image'),),
             doc='General image-kernel convolution (the kernel is flipped, not correlated). '
                 'kernel is a second IMAGE/MASK binding, read whole; kernel size in [1,257]. Its '
                 'channel count broadcasts (1 plane -> every image channel) or weights per '

@@ -107,6 +107,10 @@ def _lub(a: Footprint, b: Footprint) -> Footprint:
 # ── The reach model (per-function pixel reach from the ROI-1 descriptor) ───────
 
 _FOOTMAP_CACHE: "dict | None" = None
+# REACH-48 (TIERS-48-design.md SS B.2 point 2): the per-argument reach map, `{fn_name:
+# {index: descriptor}}`, separate from `_FOOTMAP_CACHE` above (arg 0's reach) exactly as
+# the registry keeps `footprint` and `arg_footprint` as two fields, not one.
+_ARG_FOOTMAP_CACHE: "dict | None" = None
 
 
 def _footmap() -> dict:
@@ -120,13 +124,28 @@ def _footmap() -> dict:
     return _FOOTMAP_CACHE
 
 
+def _arg_footmap() -> dict:
+    """REACH-48: `{fn_name: {index: descriptor}}` from the stdlib registry's
+    `arg_footprint` field — the independent reach of a builtin's OTHER (index >= 1) image
+    argument (`convolve`'s `kernel` is the first case). Lazy, same population discipline
+    as `_footmap()`. A name absent here has no per-argument declaration at all — every
+    existing single-image-argument builtin, unaffected."""
+    global _ARG_FOOTMAP_CACHE
+    if _ARG_FOOTMAP_CACHE is None:
+        from .tex_runtime.stdlib_registry import arg_footprint_by_name
+        _ARG_FOOTMAP_CACHE = arg_footprint_by_name()
+    return _ARG_FOOTMAP_CACHE
+
+
 def _static_number(node) -> float | None:
     """The literal value of a (folded) NumberLiteral, else None."""
     return node.value if node.__class__ is NumberLiteral else None
 
 
-def _call_reach(name: str, args: list):
-    """Resolve a call's pixel reach from its ROI-1 footprint + arguments. Returns:
+def _reach_of(fp, args: list):
+    """Resolve ONE footprint descriptor against a call's arguments — the shared engine
+    behind `_call_reach` (arg 0's `footprint`) and `_call_arg_reach` (REACH-48: another
+    argument's own `arg_footprint` entry). Same grammar, same return contract:
       * None        — not a spatial op (pointwise fn / unregistered) — reads at ctx.
       * int         — a narrowable-halo direct-tensor op (blur/morphology) of this radius.
       * 'unbounded' — a direct-tensor halo op whose radius is symbolic (a wired scalar): its
@@ -134,7 +153,6 @@ def _call_reach(name: str, args: list):
                       blocks ROI (whole-frame fallback) UNLESS it sits inside a gather.
       * 'image'     — whole-image / temporal gather or reduction — reads the whole input.
     """
-    fp = _footmap().get(name)
     if fp is None or fp == "point":
         return None
     if fp == "image":
@@ -152,6 +170,24 @@ def _call_reach(name: str, args: list):
     if kind == "frame":
         return "image"                                  # spatially whole (temporal: ROI-6)
     return "image"
+
+
+def _call_reach(name: str, args: list):
+    """Resolve a call's pixel reach from arg 0's ROI-1 `footprint` + arguments — see
+    `_reach_of` for the return contract."""
+    return _reach_of(_footmap().get(name), args)
+
+
+def _call_arg_reach(name: str, idx: int, args: list):
+    """REACH-48 (TIERS-48-design.md SS B.2 point 2): the SAME resolution `_call_reach`
+    performs for arg 0, applied to argument `idx`'s own `arg_footprint` declaration.
+    Returns None when `name`/`idx` has no per-argument declaration at all — every
+    function that doesn't declare one keeps its existing "read at the outer ctx_halo"
+    treatment in `_accumulate`, so this is purely additive."""
+    per_arg = _arg_footmap().get(name)
+    if not per_arg or idx not in per_arg:
+        return None
+    return _reach_of(per_arg[idx], args)
 
 
 # ── Per-binding footprint accumulation ────────────────────────────────────────
@@ -275,8 +311,24 @@ def _accumulate(node, ctx_halo, reads: dict, state: dict) -> None:
                 # values computed only over the cook region, so the region must still grow.
                 state["halo"] = new_ctx
             _accumulate(img, new_ctx, reads, state)
-        for a in rest:                                  # radius/coord args read at the outer ctx
-            _accumulate(a, ctx_halo, reads, state)
+        # REACH-48 (TIERS-48-design.md SS B.2 point 2): a `rest` argument reads at the
+        # outer ctx (a radius/coord/flag scalar) UNLESS this function DECLARES it its own,
+        # independent reach (`convolve`'s `kernel` is the first case) — a plain
+        # `_accumulate(a, ctx_halo, ...)` for every rest arg would silently under-report a
+        # second image argument's true footprint (it would read 'point' where the truth is
+        # 'image'), exactly the silent-wrong-window class invariant #5 exists to close.
+        for j, a in enumerate(rest, start=1):
+            ar = _call_arg_reach(node.name, j, node.args)
+            if ar is None:
+                _accumulate(a, ctx_halo, reads, state)
+            elif isinstance(ar, int):                   # a narrowable halo on THIS argument
+                new_ctx = "image" if ctx_halo == "image" else ctx_halo + ar
+                if new_ctx != "image" and new_ctx > state["halo"]:
+                    state["halo"] = new_ctx
+                _accumulate(a, new_ctx, reads, state)
+            else:                                        # 'image' / 'unbounded' — read whole
+                state["blocked"] = True
+                _mark_whole(reads, a, node, state)
         return
 
     if cls is BindingIndexAccess or cls is BindingSampleAccess:   # @A[..] / @A(..) gather

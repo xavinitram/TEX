@@ -267,6 +267,12 @@ _NOT_A_CACHE = {
                                          "derived from REGISTRY, not an independent per-key "
                                          "store), invalidated by the same stdlib() deco -- a "
                                          "second derived view alongside it, not a second cache",
+    "stdlib_registry._ARG_FOOTPRINT_CACHE": "REACH-48: the exact same shape as "
+                                            "_NON_SPATIAL_CACHE/_PIXEL_ARGS_CACHE above (a "
+                                            "single memoized VIEW derived from REGISTRY's "
+                                            "arg_footprint field, not an independent per-key "
+                                            "store), invalidated by the same stdlib() deco -- a "
+                                            "third derived view alongside them, not a third cache",
     "codegen._ES_CO_MEMO": "FUSEDDEV-46: one wrapper-closure PER DEVICE (the box's cpu/cuda "
                            "set, not a cook-time or program-derived key), memoized only so "
                            "torch.compile sees a STABLE callable identity across cooks -- a "
