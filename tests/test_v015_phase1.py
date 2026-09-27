@@ -147,6 +147,47 @@ def test_pc2_precompile_safety(r: SubTestResult):
         r.fail("inductor cache dir is version-scoped", str(e))
 
 
+def test_pc2_precompile_recovery_wipes_the_whole_store(r: SubTestResult):
+    """HOUSE-50/H3 (TRK-226): `_clear_dynamo_precompile_store`'s recovery scope is the
+    WHOLE `dynamo/` subdir, not just the fingerprint whose attach failed -- confirmed here
+    with two independent fake per-fingerprint entries, neither of which torch actually
+    wrote (no real compile needed to pin the SCOPE of the delete). This is documented,
+    intentional behaviour (see the function's own docstring and DEVELOPMENT.md's rejected-
+    decisions register for why a narrower delete is not safely implementable against
+    torch 2.12's `caching_precompile`), not a defect this test guards against reopening by
+    accident: a future narrower rewrite should have to explain itself against this pin,
+    not silently start leaving unrelated stale entries behind."""
+    print("\n--- PC-2 (HOUSE-50/H3): precompile recovery scope is whole-store, by design ---")
+    import os
+    with cold_engine_state(warm=False):
+        owned = get_cache().torch_compile_cache_dir
+        prev = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(owned)
+        try:
+            dynamo_dir = owned / "dynamo"
+            fp1 = dynamo_dir / "fingerprint-one"
+            fp2 = dynamo_dir / "fingerprint-two"
+            fp1.mkdir(parents=True, exist_ok=True)
+            fp2.mkdir(parents=True, exist_ok=True)
+            (fp1 / "entry.bin").write_text("stale", encoding="utf-8")
+            (fp2 / "entry.bin").write_text("perfectly valid, unrelated", encoding="utf-8")
+
+            _C._clear_dynamo_precompile_store()
+
+            r.ok("recovering fingerprint-one's stale attach also cleared fingerprint-two, "
+                 "an unrelated entry that was never stale -- the confirmed, documented "
+                 "collateral scope") \
+                if not dynamo_dir.exists() else \
+                r.fail("PC-2 recovery scope",
+                       f"expected the whole dynamo/ dir gone, found: "
+                       f"{list(dynamo_dir.iterdir()) if dynamo_dir.exists() else '(gone)'}")
+        finally:
+            if prev is None:
+                os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
+            else:
+                os.environ["TORCHINDUCTOR_CACHE_DIR"] = prev
+
+
 def test_ct1_fused_disk_persistence(r: SubTestResult):
     print("\n--- CT-1: fused-chain disk persistence ---")
     cache = get_cache()

@@ -322,7 +322,27 @@ def _is_precompile_attach_failure(e: Exception) -> bool:
 
 def _clear_dynamo_precompile_store() -> None:
     """Delete the persisted dynamo precompile subdir so a poisoned/stale entry
-    can't crash every later session (PC-2 recovery)."""
+    can't crash every later session (PC-2 recovery).
+
+    HOUSE-50/H3 (TRK-226): this wipes the WHOLE `dynamo/` subdir, not just the one
+    fingerprint whose attach just failed — deliberately, confirmed by
+    `tests/test_v015_phase1.py::test_pc2_precompile_safety`'s own scope check. Dynamo's
+    `caching_precompile` (2.12) exposes no documented per-entry invalidation call and no
+    stable, version-independent way to map a TEX cache_key back to the on-disk path it wrote
+    under `dynamo/` — guessing at that internal layout risks leaving the ACTUAL poisoned
+    entry behind (the failure this function exists to clear would then repeat forever)
+    for the sake of sparing entries this function cannot safely identify as unrelated.
+    TRK-226 confirmed the resulting cost: under one process that has accumulated many
+    OTHER fingerprints' valid, non-stale precompile entries in the SAME shared store, one
+    program's genuine stale-attach failure collaterally evicts every one of them, so each
+    pays one real recompile on its own next call (measured on real hardware: 5 real
+    compiles where 1 was expected, TRK-226's own tracker row). That
+    cost is real but BOUNDED and SELF-CORRECTING — every fresh compile after the wipe
+    writes a clean entry, so the SAME fingerprint cannot re-trigger this path for the same
+    reason twice — and it trades a bounded, one-time-per-fingerprint slow patch for the
+    only correctness guarantee available without deeper torch-internals knowledge this
+    project does not have today. See DEVELOPMENT.md's "Rejected design decisions" for the
+    per-fingerprint-scoped alternative this rejects, and why."""
     try:
         import shutil
         from pathlib import Path

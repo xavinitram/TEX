@@ -991,6 +991,31 @@ against the slow leaks a days-long compositor process would otherwise hide.
 ## Rejected design decisions (don't re-propose)
 
 Settled calls, kept here so they're not re-derived:
+- **A per-fingerprint-scoped `_clear_dynamo_precompile_store` (HOUSE-50/H3, TRK-226)** —
+  NOT built, for lack of a safe way to do it, not for lack of a measured cost. The recovery
+  path fires when a persisted `caching_precompile` entry fails to ATTACH (stale/corrupt/
+  version-mismatched); today it deletes the WHOLE `dynamo/` subdir under
+  `TORCHINDUCTOR_CACHE_DIR`, confirmed by `tests/test_v015_phase1.py::
+  test_pc2_precompile_recovery_wipes_the_whole_store` to also destroy an unrelated,
+  perfectly-valid entry sitting beside the stale one. Under a process that has accumulated
+  many other fingerprints' valid entries in that same shared store, TRK-226 measured the
+  real cost of that collateral scope on real hardware: 5 real recompiles where 1 was
+  expected, TRK-226's own tracker row — a program whose compiled
+  artifact would otherwise be shared across every call instead pays for `_try_compile`
+  again, once, the next time it is cooked after someone else's stale entry got cleared.
+  A narrower delete (evict only the failing fingerprint's own on-disk entry) was considered
+  and not attempted: torch 2.12's `caching_precompile` exposes no documented per-entry
+  invalidation call and no stable, version-independent way to map a TEX `cache_key` back to
+  whatever internal path dynamo wrote it under inside `dynamo/`. Guessing at that layout
+  risks the failure mode this function exists to prevent — leaving the ACTUAL poisoned
+  entry in place because the guess targeted the wrong path, so the same program keeps
+  failing to attach forever instead of self-healing once. The whole-directory wipe is
+  blunt but PROVEN correct (it cannot miss the poisoned entry) and the cost it trades in is
+  bounded and self-correcting: every fresh compile after a wipe writes a clean entry, so
+  the same fingerprint cannot re-trigger this path for the same reason twice. Reopen only
+  with a documented, version-checked way to resolve a TEX cache_key to its own
+  `caching_precompile` on-disk path — a real API, not a guessed directory-naming scheme —
+  so a narrower clear cannot silently start leaving a genuinely stale entry behind.
 - **Narrowing the emitter's `id()`-keyed type map by an AST walk ALONE (CG-1)** — rejected on
   measurement. The walk-only shape ("keep the entries whose id the walk reached") was the
   cheapest fix proposed for the cross-process emitted-source drift, and it was tried first:
