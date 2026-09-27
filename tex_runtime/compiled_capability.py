@@ -28,9 +28,10 @@ fresh process must not reach `compiled.py`'s own body mid-import).
 """
 from __future__ import annotations
 
+import queue
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from typing import Any
 
 import torch
@@ -240,8 +241,47 @@ def _reset_capability_cache_for_test() -> None:
 # `tex doctor`) wants a definite answer now and may block for it, exactly as before;
 # `compile_capability()` itself is UNCHANGED. Only `run_auto`'s cook-thread call site
 # below switches to this.
-_capability_future: "object | None" = None
-_capability_pool: "ThreadPoolExecutor | None" = None
+_capability_future: "Future | None" = None
+
+
+class _DaemonProbePool:
+    """A single-worker background pool whose thread is DAEMONIC — unlike
+    `concurrent.futures.ThreadPoolExecutor` (A2, FIX-GATE, B3#2): CPython's own
+    `concurrent.futures.thread` module registers an `atexit` hook that unconditionally
+    `join()`s every ThreadPoolExecutor worker thread, in-flight work or not, and (as of
+    this interpreter's Python) there is no public way to make that worker daemonic.
+    Confirmed by B3#2's repro: a 5s stand-in probe submitted through a ThreadPoolExecutor
+    delayed a script's process exit by ~7s. A plain daemon `threading.Thread` exits with
+    the process regardless of what it is doing, which is the right contract here: unlike
+    `_WARM_POOL` (`compiled.py`, deliberately NOT reused for this) — whose whole point is
+    to let a slow warm-call finish and be cached, so blocking exit on it is intentional —
+    a capability probe's answer is disposable (recomputed fresh next process) and gates
+    nothing durable, so nothing should ever wait on it."""
+
+    def __init__(self, thread_name: str) -> None:
+        self._q: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, name=thread_name, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            fut, fn = self._q.get()
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                result = fn()
+            except BaseException as exc:   # propagate to the future, never crash the worker
+                fut.set_exception(exc)
+            else:
+                fut.set_result(result)
+
+    def submit(self, fn) -> Future:
+        fut: Future = Future()
+        self._q.put((fut, fn))
+        return fut
+
+
+_capability_pool: "_DaemonProbePool | None" = None
 # A plain Lock (not RLock): _get_capability_pool() takes this lock ITSELF to create the
 # pool, so compile_capability_async() below must never still be holding it when it calls
 # that function -- get the pool first, outside any `with`, THEN take the lock for the
@@ -251,13 +291,12 @@ _capability_pool: "ThreadPoolExecutor | None" = None
 _capability_pool_lock = threading.Lock()
 
 
-def _get_capability_pool() -> ThreadPoolExecutor:
+def _get_capability_pool() -> _DaemonProbePool:
     global _capability_pool
     if _capability_pool is None:
         with _capability_pool_lock:
             if _capability_pool is None:
-                _capability_pool = ThreadPoolExecutor(max_workers=1,
-                                                      thread_name_prefix="tex-cc-probe")
+                _capability_pool = _DaemonProbePool("tex-cc-probe")
     return _capability_pool
 
 
