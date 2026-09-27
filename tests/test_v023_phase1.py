@@ -117,7 +117,9 @@ def test_roi1_footprints_wellformed_and_classified(r: SubTestResult):
         "fetch": "image",
         "fetch_frame": "frame", "sample_frame": "frame",
         "erode": "halo_arg", "dilate": "halo_arg", "gauss_blur": "halo_arg",
-        "bilateral_filter": "halo",
+        # BILAT-50: bilateral_filter's window now grows with spatial_sigma (no more fixed
+        # 7x7 clamp), so its reach is a `halo_arg` like the other three -- not a fixed `halo`.
+        "bilateral_filter": "halo_arg",
     }
     try:
         by_name = {n: e for e in R.REGISTRY for n in e.names}

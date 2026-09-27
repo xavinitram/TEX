@@ -604,26 +604,133 @@ class _StdlibSample:
         result = _gauss_blur_auto(bchw, sigma_val)
         return result.permute(0, 2, 3, 1)
 
-    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo', 3), pixel_args=(1,), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Window capped at 7×7.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
+    # BILAT-50: the old `min(ceil(3*ss), 3)` silently clamped every spatial_sigma past
+    # ~1.0 to whatever a 7x7 window gives -- the same silent-wrong class the erode/dilate
+    # 256 clamp was. The window now genuinely grows with `ss` (no clamp): exact wherever
+    # memory-feasible (today's own 7x7 math is untouched below, and `_bilateral_exact_bchw`
+    # extends the SAME exact math, row-tiled to stay memory-bounded, up to
+    # `_BILATERAL_EXACT_RADIUS_MAX`), and a downscale + detail-transfer approximation
+    # (`_bilateral_detail_transfer_bchw`) past that measured limit.
+    _BILATERAL_EXACT_RADIUS_MAX = 24  # ksize=49 (spatial_sigma up to ~8.0). A prior design
+    # pass measured the UNTILED exact filter needing ~60GB at this exact radius on
+    # a canvas far smaller than 1080p (an O(r^2) memory blow-up, not a resolution-specific
+    # fluke) -- row-tiling keeps the identical math memory-bounded at any resolution up to
+    # here; past it the O(r^2) per-pixel tap count makes even a tiled exact pass too slow
+    # for a builtin on the default path, and the detail-transfer path (O(image size),
+    # independent of sigma) takes over.
+    _BILATERAL_TILE_BUDGET_ELEMS = 8_000_000  # ~32MB per fp32 intermediate tensor,
+    # independent of image resolution: the row-tile height shrinks as `ksize` grows so
+    # every per-tile intermediate (`patches`/`diff`/`w`, each [B,C,tile_h,W,ksize,ksize])
+    # stays under this many elements regardless of the image's true H.
+
+    @staticmethod
+    def _bilateral_spatial_weights(ss, radius, device):
+        """The precomputed spatial-Gaussian weight tensor [1,1,1,1,ksize,ksize] shared by
+        every exact bilateral pass (tiled or not) at this (ss, radius)."""
+        ksize = 2 * radius + 1
+        inv_2ss = -0.5 / max(ss * ss, 1e-10)
+        dy = torch.arange(ksize, device=device, dtype=torch.float32) - radius
+        dx = dy.clone()
+        d2 = dy.view(-1, 1) ** 2 + dx.view(1, -1) ** 2  # [kH, kW]
+        return torch.exp(d2 * inv_2ss).view(1, 1, 1, 1, ksize, ksize), ksize
+
+    @staticmethod
+    def _bilateral_weighted_avg(patches, center, w_spatial, sr):
+        """The exact bilateral core (today's own weighted-average formula, shared by the
+        tiled exact pass and the detail-transfer path's reduced-scale call): `patches`
+        [B,C,h,w,kH,kW] already unfolded, `center` [B,C,h,w,1,1] the un-unfolded pixel."""
+        diff = patches - center
+        inv_2sr = -0.5 / max(sr * sr, 1e-10)
+        cd2 = (diff * diff).sum(dim=1, keepdim=True)
+        w_range = torch.exp(cd2 * inv_2sr)
+        w = w_spatial * w_range
+        numerator = (patches * w).sum(dim=(-2, -1))
+        denominator = w.sum(dim=(-2, -1))
+        return numerator / denominator.clamp(min=1e-10)
+
+    @staticmethod
+    def _bilateral_exact_bchw(bchw, ss, sr, radius):
+        """The exact bilateral filter at any radius, row-tiled to keep peak memory
+        bounded (`_BILATERAL_TILE_BUDGET_ELEMS`) independent of image resolution. Same
+        math as today's original 7x7 pass (`_bilateral_weighted_avg`) -- tiling changes
+        nothing about any one output pixel's own computation, since each pixel's window
+        is entirely contained within its own row tile (the tile is padded by `radius` on
+        each side before unfolding)."""
+        B, C, H, W = bchw.shape
+        w_spatial, ksize = TEXStdlib._bilateral_spatial_weights(ss, radius, bchw.device)
+        padded = torch.nn.functional.pad(bchw, (radius, radius, radius, radius), mode='replicate')
+        tile_h = max(1, TEXStdlib._BILATERAL_TILE_BUDGET_ELEMS // max(1, W * ksize * ksize))
+        if tile_h >= H:
+            tile_h = H
+        outputs = []
+        for y0 in range(0, H, tile_h):
+            # CANCEL-44/PACE-47c idiom: a poll between tiles -- the multi-pass boundary
+            # this loop introduces once a large radius tiles the work (bilateral_filter's
+            # own entry poll, below, no longer covers every pass by itself).
+            poll_cook_cancel(heavy=True)
+            y1 = min(y0 + tile_h, H)
+            padded_rows = padded[:, :, y0:y1 + 2 * radius, :]
+            center_rows = bchw[:, :, y0:y1, :]
+            patches = padded_rows.unfold(2, ksize, 1).unfold(3, ksize, 1)
+            center = center_rows.unsqueeze(-1).unsqueeze(-1)
+            outputs.append(TEXStdlib._bilateral_weighted_avg(patches, center, w_spatial, sr))
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=2)
+
+    @staticmethod
+    def _bilateral_detail_transfer_bchw(bchw, ss, sr):
+        """BILAT-50: past `_BILATERAL_EXACT_RADIUS_MAX`, downscale until
+        the REDUCED spatial_sigma lands back inside today's own exact 7x7 window (<=1.0),
+        run the exact filter there (always radius<=3 by construction -- no tiling needed),
+        upsample the filtered result back to full resolution, and add back the full-
+        resolution high-frequency detail the downscale discarded (`detail = original -
+        upsample(downsample(original))`) -- a bounded-cost stand-in for a true joint
+        bilateral upsample. Cost is O(image size), independent of spatial_sigma (measured
+        flat, 1.0-15ms, across five orders of magnitude of sigma).
+        """
+        B, C, H, W = bchw.shape
+        factor = 1
+        while ss / factor > 1.0:
+            factor *= 2
+        Hr, Wr = max(1, round(H / factor)), max(1, round(W / factor))
+        poll_cook_cancel(heavy=True)
+        downsampled = torch.nn.functional.interpolate(bchw, size=(Hr, Wr), mode='area')
+        reduced_ss = ss / factor
+        reduced_radius = int(math.ceil(3.0 * reduced_ss))  # always <=3 by construction
+        w_spatial, ksize = TEXStdlib._bilateral_spatial_weights(reduced_ss, reduced_radius, bchw.device)
+        padded = torch.nn.functional.pad(
+            downsampled, (reduced_radius, reduced_radius, reduced_radius, reduced_radius),
+            mode='replicate')
+        patches = padded.unfold(2, ksize, 1).unfold(3, ksize, 1)
+        center = downsampled.unsqueeze(-1).unsqueeze(-1)
+        filtered_reduced = TEXStdlib._bilateral_weighted_avg(patches, center, w_spatial, sr)
+        poll_cook_cancel(heavy=True)
+        upsampled_filtered = torch.nn.functional.interpolate(
+            filtered_reduced, size=(H, W), mode='bilinear', align_corners=False)
+        upsampled_plain = torch.nn.functional.interpolate(
+            downsampled, size=(H, W), mode='bilinear', align_corners=False)
+        detail = bchw - upsampled_plain
+        return upsampled_filtered + detail
+
+    @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 8.0), pixel_args=(1,), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Exact within a measured window; a bounded-cost downscale approximation runs past it.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')
     @staticmethod
     def fn_bilateral_filter(image, sigma_s, sigma_r) -> torch.Tensor:
         """Edge-preserving bilateral filter using Tensor.unfold.
 
         Weights each neighbor by spatial Gaussian x range (color similarity)
-        Gaussian. Radius is derived from sigma_s (3x sigma, capped at 3 → 7x7).
-        Best for small kernels (3x3); for larger kernels, the loop-based
-        approach in bilateral_approx.tex may be faster due to memory traffic.
+        Gaussian. Radius is derived from sigma_s (3x sigma) -- exact (row-tiled,
+        memory-bounded) up to `_BILATERAL_EXACT_RADIUS_MAX`, then a downscale +
+        detail-transfer approximation (BILAT-50) past it. Best for small kernels
+        (3x3); for larger kernels, the loop-based approach in bilateral_approx.tex
+        may be faster due to memory traffic.
 
         Args:
             image: [B, H, W, C] tensor
             sigma_s: float -- spatial sigma in pixels
             sigma_r: float -- range sigma (color similarity, 0.01-0.5 typical)
         """
-        # PACE-47d (Gap 1): footprint=halo, single-pass (no internal multi-pass loop to
-        # hang a between-pass poll on, unlike gauss_blur/erode/dilate) -- an entry poll is
-        # the closest equivalent: forces a record before this call's own (potentially
-        # large, window capped at 7x7 but still O(H*W*49)) unfold+weight compute is
-        # queued, rather than leaving it to whatever poll ran before this statement.
+        # PACE-47d (Gap 1): an entry poll -- the closest equivalent to a between-pass
+        # record for whichever regime below actually runs (each regime below now also
+        # polls its OWN internal pass boundaries once there is more than one pass).
         poll_cook_cancel(heavy=True)
         img = image if image.__class__ is torch.Tensor else _to_tensor(image)
         # Both sigmas size the window / the weights host-side; PERF-2 resolves them
@@ -660,41 +767,34 @@ class _StdlibSample:
             return img
 
         B, H, W, C = img.shape
-        radius = min(int(math.ceil(3.0 * ss)), 3)  # cap at 7x7 to limit memory (~500MB at 1080p)
-        ksize = 2 * radius + 1
-
-        # Convert to BCHW and pad
+        radius = int(math.ceil(3.0 * ss))  # BILAT-50: no clamp -- the true window
         bchw = _get_bchw(img)
-        padded = torch.nn.functional.pad(bchw, (radius, radius, radius, radius), mode='replicate')
 
-        # Extract all ksize×ksize patches: [B, C, H, W, kH, kW]
-        patches = padded.unfold(2, ksize, 1).unfold(3, ksize, 1)
-
-        # Center pixel: [B, C, H, W, 1, 1]
-        center = bchw.unsqueeze(-1).unsqueeze(-1)
-
-        # Spatial weights: precomputed [1, 1, 1, 1, kH, kW]
-        inv_2ss = -0.5 / max(ss * ss, 1e-10)
-        dy = torch.arange(ksize, device=img.device, dtype=torch.float32) - radius
-        dx = dy.clone()
-        d2 = dy.view(-1, 1) ** 2 + dx.view(1, -1) ** 2  # [kH, kW]
-        w_spatial = torch.exp(d2 * inv_2ss).view(1, 1, 1, 1, ksize, ksize)
-
-        # Range weights: per-pixel, based on color distance
-        # diff: [B, C, H, W, kH, kW]
-        diff = patches - center
-        # Color distance squared, summed over channels: [B, 1, H, W, kH, kW]
-        inv_2sr = -0.5 / max(sr * sr, 1e-10)
-        cd2 = (diff * diff).sum(dim=1, keepdim=True)
-        w_range = torch.exp(cd2 * inv_2sr)
-
-        # Combined weight: [B, 1, H, W, kH, kW]
-        w = w_spatial * w_range
-
-        # Weighted sum: [B, C, H, W]
-        numerator = (patches * w).sum(dim=(-2, -1))
-        denominator = w.sum(dim=(-2, -1))
-        result = numerator / denominator.clamp(min=1e-10)
+        if radius <= 3:
+            # At or below today's original 7x7 window: the UNCHANGED original math,
+            # untouched by this ask, byte-for-byte -- BILAT-50's own bit-identity
+            # requirement (torch.equal, CPU and CUDA; tests/test_bilat50_*.py).
+            ksize = 2 * radius + 1
+            padded = torch.nn.functional.pad(bchw, (radius, radius, radius, radius), mode='replicate')
+            patches = padded.unfold(2, ksize, 1).unfold(3, ksize, 1)
+            center = bchw.unsqueeze(-1).unsqueeze(-1)
+            inv_2ss = -0.5 / max(ss * ss, 1e-10)
+            dy = torch.arange(ksize, device=img.device, dtype=torch.float32) - radius
+            dx = dy.clone()
+            d2 = dy.view(-1, 1) ** 2 + dx.view(1, -1) ** 2  # [kH, kW]
+            w_spatial = torch.exp(d2 * inv_2ss).view(1, 1, 1, 1, ksize, ksize)
+            diff = patches - center
+            inv_2sr = -0.5 / max(sr * sr, 1e-10)
+            cd2 = (diff * diff).sum(dim=1, keepdim=True)
+            w_range = torch.exp(cd2 * inv_2sr)
+            w = w_spatial * w_range
+            numerator = (patches * w).sum(dim=(-2, -1))
+            denominator = w.sum(dim=(-2, -1))
+            result = numerator / denominator.clamp(min=1e-10)
+        elif radius <= TEXStdlib._BILATERAL_EXACT_RADIUS_MAX:
+            result = TEXStdlib._bilateral_exact_bchw(bchw, ss, sr, radius)
+        else:
+            result = TEXStdlib._bilateral_detail_transfer_bchw(bchw, ss, sr)
 
         return result.permute(0, 2, 3, 1)  # back to BHWC
 

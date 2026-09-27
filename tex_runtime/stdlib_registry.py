@@ -57,14 +57,16 @@ class StdlibEntry:
     # (`gauss_blur`'s sigma, `erode`/`dilate`'s radius, `bilateral_filter`'s spatial_sigma) —
     # a NEW, independent tag rather than reusing `footprint`'s `mult` (SCALE-47-design.md §3):
     # `mult` answers "how far does this arg reach for ROI halo purposes", not "should this
-    # arg's VALUE scale with the cook's resolution" — `bilateral_filter` forces the split,
-    # since its footprint is a fixed `('halo', 3)` with no `halo_arg` at all, yet its
-    # spatial_sigma still needs scaling. Empty (the default) for every function with no
-    # pixel-unit argument. A cook's `scale=` multiplies the RESOLVED value at each of these
-    # positions before the call (interpreter) / references a runtime scalar at the same
-    # positions in the emitted call (codegen) — never an AST-level fold, so the emitted
-    # source stays identical across scale values (one compiled artifact per program, not
-    # one per scale).
+    # arg's VALUE scale with the cook's resolution" — two different questions about the same
+    # argument that happen to share one answer for every builtin registered today (each of
+    # the four `pixel_args=` builtins is also `halo_arg`-tagged on that same index; BILAT-50
+    # removed the one case, `bilateral_filter`'s old fixed `('halo', 3)`, that used to force
+    # the two tags apart — see `_valid_pixel_args` below for the check that still holds
+    # either way). Empty (the default) for every function with no pixel-unit argument. A
+    # cook's `scale=` multiplies the RESOLVED value at each of these positions before the
+    # call (interpreter) / references a runtime scalar at the same positions in the emitted
+    # call (codegen) — never an AST-level fold, so the emitted source stays identical across
+    # scale values (one compiled artifact per program, not one per scale).
     pixel_args: tuple = ()
     # FIX-PACE P4 (Phase C): a builtin whose device cost is genuinely expensive but whose
     # ACCESS footprint is still 'point' (it reads only its own coordinate args, so ROI/tiling
@@ -146,9 +148,12 @@ def _valid_pixel_args(pixel_args, footprint) -> bool:
     pixel-magnitude argument, and — the TST-3-style derivation check AGENTS.md invariant #5
     asks for — a `halo_arg` footprint's OWN index is always itself a scalable magnitude (the
     two tags describe the same argument for different questions), so declaring `pixel_args`
-    without it would silently under-scale that footprint's own halo derivation. `bilateral_filter`
-    is exactly the case that must NOT be forced this way (its footprint is `('halo', 3)`, no
-    `halo_arg`), so the rule only fires when a `halo_arg` footprint is actually present."""
+    without it would silently under-scale that footprint's own halo derivation. The rule only
+    FIRES when a `halo_arg` footprint is actually present — a function could in principle
+    still declare `pixel_args` against a fixed (non-`halo_arg`) footprint, or no footprint at
+    all (`bilateral_filter` used to be exactly that case, before BILAT-50 gave its window its
+    own `halo_arg`; nothing registered today exercises the non-`halo_arg` branch any more, but
+    the check stays permissive for whatever the next one is)."""
     if any((not isinstance(i, int)) or isinstance(i, bool) or i < 1 for i in pixel_args):
         return False
     if isinstance(footprint, tuple) and footprint and footprint[0] == "halo_arg":

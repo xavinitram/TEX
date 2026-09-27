@@ -56,7 +56,7 @@ Only the stdlib functions carrying the registry's `pixel_args=` tag:
 | `gauss_blur(img, sigma)` | `sigma` (arg 1) | `('halo_arg', 1, 3.0)` |
 | `erode(img, radius)` | `radius` (arg 1) | `('halo_arg', 1)` |
 | `dilate(img, radius)` | `radius` (arg 1) | `('halo_arg', 1)` |
-| `bilateral_filter(img, spatial_sigma, range_sigma)` | `spatial_sigma` (arg 1) ONLY | `('halo', 3)` |
+| `bilateral_filter(img, spatial_sigma, range_sigma)` | `spatial_sigma` (arg 1) ONLY | `('halo_arg', 1, 8.0)` |
 
 `bilateral_filter`'s `range_sigma` (a colour-similarity threshold, not a pixel distance) is
 deliberately NOT scaled. The halo margin `stage_halo`/`roi_plan`/`chain_windows` derive from

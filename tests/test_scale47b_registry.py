@@ -3,8 +3,12 @@
 `SCALE-47-design.md` §1/§3 (AUTHOR DECISIONS #1): a pixel-unit stdlib argument needs its own
 registry tag, separate from `footprint`'s `mult` (a `('halo_arg', i, mult)` reach multiplier
 answers "how far does this arg reach in pixels", not "should this arg's VALUE scale with the
-cook's resolution" — `bilateral_filter` is the case that forces the split: its footprint is a
-FIXED `('halo', 3)` with no `halo_arg`, yet `spatial_sigma` still needs scaling.
+cook's resolution". Before BILAT-50, `bilateral_filter` was the case that forced the split:
+its footprint was a FIXED `('halo', 3)` with no `halo_arg`, yet `spatial_sigma` still needed
+scaling. BILAT-50 removed the window's own fixed cap, so its footprint is now
+`('halo_arg', 1, 8.0)` like the other three -- the two tags
+happen to agree on every builtin registered today, though they still answer different
+questions (see `stdlib_registry.py`'s own field comment).
 
 This file proves the tag exists, is validated the same loud way `footprint` is (AGENTS.md
 invariant #5 — a malformed descriptor must fail at import, never silently mis-tag), and is
