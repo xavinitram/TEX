@@ -106,6 +106,15 @@ design: a program it cannot prove safe is declared unsafe, never the reverse, so
 only in the safe direction (a missed optimisation, never a wrong picture). Any analysis
 failure (a program the walk cannot parse or walk) also declares unsafe.
 
+**Known over-refusal, left as-is (FIX-SCALE S9):** the whitelist does not survive nesting —
+`fetch(@A, int(ix), int(iy))` (a benign, canvas-relative whole-pixel fetch behind a
+defensive type cast) is declared unsafe, because walking into the `int(...)` cast loses the
+whitelist the outer `fetch` call granted. This can only ever LOSE the whitelist, never wrongly
+grant one, so it is over-refusal only (a missed optimisation), never a wrong picture — but it
+does needlessly decline a plausible idiom. Left conservative rather than threading the
+whitelist through every intervening node; `//!tex scale: safe` is the documented workaround
+for a program that hits this.
+
 An author who knows better can override the verdict in either direction with a leading
 comment, parsed the same never-becomes-a-token way as the existing `//!tex X.Y` language
 pragma, but NOT the identical header-scan: a leading `/* ... */` block comment (a common

@@ -1051,7 +1051,21 @@ def _scale_unsafe_walk(node, in_coord_arg: bool = False) -> bool:
     first, before the fetch-arg dispatch, so it fires regardless of whether the call also
     happens to be `fetch`/`fetch_frame` (it never is — `_FETCH_COORD_ARGS` and
     `_PIXEL_DIM_NAMES` name disjoint functions — but this ordering makes that true by
-    construction rather than by the two sets never colliding today)."""
+    construction rather than by the two sets never colliding today).
+
+    FIX-SCALE S9 (KNOWN, LEFT AS-IS — do not "fix" this without re-reading the finding it
+    closed): `in_coord_arg` is set FRESH at each `FunctionCall`/`BindingIndexAccess` node
+    from that node's OWN identity — it is never inherited from the caller's own
+    `in_coord_arg`. So `fetch(@A, int(ix), int(iy))` — a benign, canvas-relative whole-pixel
+    fetch behind a defensive type cast — is declared UNSAFE: walking into `int(ix)`
+    recomputes `in_coord_arg` for `"int"` (not in `_FETCH_COORD_ARGS`) and gets `False`,
+    losing the whitelist the outer `fetch` call granted. This can only ever LOSE the flag,
+    never wrongly gain it (confirmed by reading every call site: a nested `FunctionCall`
+    always computes its OWN `in_coord_arg` from scratch, never ORs in the caller's), so it
+    cannot produce a false-SAFE — over-refusal only, never a wrong picture. Left conservative
+    on purpose rather than threading `in_coord_arg` through every intervening node (a bigger,
+    riskier change for a low-severity idiom); `//!tex scale: safe` is the documented
+    workaround for an author who knows the cast is harmless."""
     cls = node.__class__
     if cls is Identifier:
         if node.name in _PIXEL_DIM_NAMES:
