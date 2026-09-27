@@ -716,6 +716,14 @@ def run_graphed(program, bindings, type_map, device, fingerprint,
     """Execute via a cached CUDA graph, or return None to fall back to the
     interpreter. cuda-only; every failure path returns None.
 
+    Return shape mirrors `Interpreter.execute`'s own documented contract exactly (this tier's
+    replay is nothing but a captured `Interpreter.execute` call, per `capture`'s docstring):
+    a bare tensor when `output_names` is `None`, a `dict[name, value]` when it is provided —
+    even for a single-name list. A caller passing `output_names=["OUT"]` gets `{"OUT": ...}`
+    back, not the tensor; index it the same way every other `run_graphed` caller does
+    (`tex_engine_tiers.py`'s `_run_cuda_graph` forwards this value through unchanged, exactly
+    as `_run_torch_compile`/`_run_auto` do for their own compiled callables).
+
     `scale` (SCALECX-49, `float | None`): the cook's resolution-scale multiplier.
     `None` (every ordinary ComfyUI cook) is unchanged from before this ask — same key shape,
     same capture, same replay. A non-`None` scale is forwarded into the capture (`capture`'s

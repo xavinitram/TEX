@@ -586,6 +586,13 @@ def test_scalecx49_cuda_graph_capture_mismatch_before_fix_live(r: SubTestResult)
                   "the mismatch this test proves")
             return
         ref_quarter = _ref(0.25)
+        # run_graphed mirrors Interpreter.execute's own documented contract (interpreter.py:
+        # "If output_names is provided: dict mapping name -> value for each output") --
+        # output_names=["OUT"] was passed above, so this is a dict, exactly like `_ref`'s own
+        # ["OUT"] unwrap two lines up. Every other run_graphed caller (tex_engine_tiers.py's
+        # _run_cuda_graph) forwards this same value through unchanged; the mismatch was this
+        # test forgetting its own unwrap, not a run_graphed defect.
+        out_second_blind = out_second_blind["OUT"]
         md_blind = (out_second_blind.float() - ref_quarter.float()).abs().max().item()
         if md_blind > 1e-3:
             r.ok(f"pre-fix (scale-blind) key: a capture taken at scale=0.75 wrongly served "
@@ -607,6 +614,9 @@ def test_scalecx49_cuda_graph_capture_mismatch_before_fix_live(r: SubTestResult)
             r.fail("scalecx49 capture fix", "run_graphed declined after the fix")
             return
         ref_half = _ref(0.75)
+        # Same unwrap as above -- output_names=["OUT"] makes run_graphed return a dict.
+        out_half = out_half["OUT"]
+        out_quarter = out_quarter["OUT"]
         md_half = (out_half.float() - ref_half.float()).abs().max().item()
         md_quarter = (out_quarter.float() - ref_quarter.float()).abs().max().item()
         if md_half < 1e-5 and md_quarter < 1e-5:
@@ -666,6 +676,9 @@ def test_scalecx49_cuda_parity_live(r: SubTestResult):
             if out is None:
                 r.fail("scalecx49 cuda parity", f"cuda_graph scale={s} declined")
                 continue
+            # Same unwrap as the mismatch test above -- output_names=["OUT"] makes
+            # run_graphed return a dict, mirroring Interpreter.execute's own contract.
+            out = out["OUT"]
             md = (out.float() - ref.float()).abs().max().item()
             if md < 1e-5:
                 r.ok(f"[cuda] cuda_graph(scale={s}) matches interpreter, maxdiff={md:.2e}")
