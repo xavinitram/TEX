@@ -182,7 +182,7 @@ class MaskedEmitMixin:
         with `_emit_stmt` at both call sites (the pre-CODEGENT6 shape) recurses into a 2x
         multiplier PER ARM: an n-arm chain costs O(2^n) emitted text, not O(n) — measured
         6,593,732 chars / 63,658 lines / 2,051 nested `if`/`else` (6,218 `_emit_stmt` calls)
-        for a twelve-arm uniform-`$param` dispatch (CO187-T6). Emitting the list once, into
+        for a twelve-arm uniform-`$param` dispatch. Emitting the list once, into
         a `def` both dispatch paths CALL, makes each arm contribute a constant amount of
         text regardless of how many call sites reach it — the growth becomes O(n).
 

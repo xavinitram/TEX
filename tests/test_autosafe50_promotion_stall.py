@@ -23,8 +23,8 @@ attempts a deterministic forced repro (a compile stand-in that RAISES at each st
 compile can fail at) and a second attempt with a stand-in that NEVER RETURNS (the general
 shape of "one job on a single-worker pool hangs, so every later submission to the SAME pool
 queues behind it forever" — a real, general mechanism this file confirms independently of
-the reported hang's own exact trigger). See the docstring on that test for the verdict: NOT CONFIRMED
-against the exact trigger the reported hang describes (a genuinely failed, not hung, background
+TRK-231's own exact trigger). See the docstring on that test for the verdict: NOT CONFIRMED
+against the exact trigger TRK-231 describes (a genuinely failed, not hung, background
 job), but the general single-worker-pool-starvation shape IS real and IS what this ask's
 fix (routing the TRIAL invocation onto its own bounded, polled future rather than a
 synchronous `.result()`) also closes off for the promotion step specifically.
@@ -236,12 +236,12 @@ def test_t3_failed_compile_never_hangs_the_next_cook(r: SubTestResult):
        mechanism: a stuck warm job on `_WARM_POOL` starves any OTHER key's own TRIAL
        invocation (which, before this ask, shared `_run_cached_compiled`'s call onto
        `_COMPILE_POOL`, not `_WARM_POOL`, so a stuck WARM job did not starve a TRIAL cook at
-       base either) -- confirming the SHAPE the reported hang describes (a stuck job starving a later
-       cook) without confirming the reported hang's own exact trigger (a job that FAILED, not hung).
+       base either) -- confirming the SHAPE TRK-231 describes (a stuck job starving a later
+       cook) without confirming TRK-231's own exact trigger (a job that FAILED, not hung).
        Verdict: NOT CONFIRMED for the exact reported trigger; the general single-worker-pool
        starvation shape is real but pre-dates this ask and is orthogonal to the promotion
        fix's own bounded-wait mechanism (which bounds the COOK's own wait, not the pool)."""
-    print("\n--- AUTOSAFE-50 / TRK-231 / the reported hang: failed-compile hang, forced repro "
+    print("\n--- AUTOSAFE-50 / TRK-231: failed-compile hang, forced repro "
           "attempts (bounded so this test cannot itself hang) ---")
     with cold_engine_state():
         AT.reset()
@@ -316,5 +316,5 @@ def test_t3_failed_compile_never_hangs_the_next_cook(r: SubTestResult):
                  "hang -- run_auto's own MEASURING/COMPILING branches never block on the "
                  "background future's result (they poll .done()), so a stuck background job "
                  "starves later submissions to the SAME pool, never the calling cook thread "
-                 "directly. the reported hang remains unreproduced against this tree; see the "
+                 "directly. TRK-231 remains unreproduced against this tree; see the "
                  "writeup accompanying this ask for details.")

@@ -275,6 +275,107 @@ def test_lint1_g5_bare_word_lint_is_not_inert(r: SubTestResult):
         r.ok(f"{len(must_red)} bare-word shapes red, {len(must_stay_green)} neighbours stay green")
 
 
+#: H1 (FIX-HYGIENE, v0.50.0 Phase C, B4#1): a host tracker id must never sit in any tracked
+#: file, in EITHER spelling this tree has actually leaked: a hyphen right after the
+#: two-letter prefix with no arm suffix, or no hyphen after the prefix but a "-T<digits>"
+#: arm suffix glued straight onto the digits. A prior gate (AUTOSAFE-50's own #8) grepped
+#: only the hyphenated shape, so the hyphen-less spelling sailed straight past it -- the
+#: bug this ratchet exists to close. A real regex, not a hash set, because the id space is
+#: open (any digit run of 2-4 digits, matching every id this tree has ever used); the
+#: digit-length floor of 2 keeps an unrelated two-letter+single-digit token (a chemical
+#: formula, say) from ever matching. The two spellings are only ever assembled from pieces
+#: at call time (see the witness test below), never written whole in this file's own
+#: source, so this ratchet cannot fire on itself.
+_TRACKER_PREFIX = _frag("C", "O")
+_TRACKER_ID_RE = re.compile(r"\b" + _TRACKER_PREFIX + r"-?\d{2,4}(?:-T\d{1,3})?\b")
+
+#: Down-only budget: zero, unconditionally. Unlike G5's per-file table above, there is no
+#: inherited allowance to preserve -- every occurrence found at the moment this landed is a
+#: leak to remove, not a debt to grandfather. The one exception is a single tracked file
+#: this fix does not itself edit (a concurrent fix removes its one id in the same release);
+#: it is named here, not budgeted, so the reason travels with the code instead of a bare
+#: number.
+_TRACKER_ID_ALLOWLIST = {
+    # tex_runtime/compiled.py: removed there in the same release by the fix that owns
+    # that module. Allowed here, once, by name, so this ratchet does not red on a removal
+    # already in flight elsewhere in the same v0.50.0 Phase C batch.
+    "tex_runtime/compiled.py",
+}
+
+
+def scan_tracker_ids(text: str) -> list:
+    """`[(lineno, token)]` for every host tracker id, either spelling, found by regex --
+    unlike `scan_host_name`/`scan_bare_words` above, the id space is open (any digit run),
+    so a fixed hash set cannot enumerate it."""
+    found = []
+    for n, line in enumerate(text.splitlines(), 1):
+        for m in _TRACKER_ID_RE.finditer(line):
+            found.append((n, m.group(0)))
+    return found
+
+
+def test_lint1_h1_no_tracked_file_names_a_host_tracker_id(r: SubTestResult):
+    print("\n--- LINT-1 (H1): no tracked file names a host tracker id, either spelling "
+          "(down-only budget: zero) ---")
+    paths = tracked_paths()
+    if paths is None:
+        r.skip("LINT-1 H1 tracker-id lint",
+               "this tree is not a git checkout, so the tracked set cannot be enumerated")
+        return
+    hits, scanned = [], 0
+    for rel in paths:
+        if rel in _TRACKER_ID_ALLOWLIST:
+            continue
+        p = _PKG / rel
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        scanned += 1
+        found = scan_tracker_ids(text)
+        hits += [f"{rel}:{n}: names a host tracker id — {tok!r}" for n, tok in found]
+    if hits:
+        r.fail("LINT-1 H1 tracker-id lint",
+               f"{len(hits)} tracked line(s) name a host tracker id; the budget is zero:\n  "
+               + "\n  ".join(hits[:40]))
+        return
+    r.ok(f"{scanned} tracked text file(s) name no host tracker id "
+         f"(allowlist: {len(_TRACKER_ID_ALLOWLIST)})")
+
+
+def test_lint1_h1_tracker_id_lint_is_not_inert(r: SubTestResult):
+    print("\n--- LINT-1 (H1): the tracker-id pattern fires on both spellings, and only on "
+          "them ---")
+    must_red = [
+        "tracked under " + _frag("C", "O") + "-187 upstream.",           # hyphen, no arm
+        "confirmed against " + _frag("C", "O") + "187-T3 directly.",     # no hyphen, with arm
+        "closed as " + _frag("C", "O") + "-42 last week.",               # hyphen, 2 digits
+    ]
+    must_stay_green = [
+        "the company picked up the contract.",        # "co" inside a longer word
+        "a coordinate frame, not a ticket.",           # "co" inside a longer word
+        _frag("C", "O") + "2 emissions were measured.",  # single digit, below the floor
+        "the budget item " + _frag("C", "O") + "-### is a placeholder.",  # literal hashes, no digits
+        "the co-op meets Tuesdays.",                   # hyphen but no digits at all
+    ]
+    missed = [w for w in must_red if not scan_tracker_ids(w)]
+    tripped = [f"{w}  ->  {scan_tracker_ids(w)[0][1]!r}"
+               for w in must_stay_green if scan_tracker_ids(w)]
+    if missed:
+        r.fail("LINT-1 H1 tracker-id witness (inert)",
+               "the tracker-id pattern did not fire on a real leaked shape:\n  "
+               + "\n  ".join(missed))
+    elif tripped:
+        r.fail("LINT-1 H1 tracker-id witness (over-tight)",
+               "the tracker-id pattern fired on an unrelated neighbour:\n  "
+               + "\n  ".join(tripped))
+    else:
+        r.ok(f"{len(must_red)} tracker-id shapes (both spellings) red, "
+             f"{len(must_stay_green)} neighbours stay green")
+
+
 def test_lint1_the_lint_is_not_inert(r: SubTestResult):
     """The patterns are only worth their runtime if they fire, and fire on the shape and not
     on a neighbour that merely shares some of its pieces. These witnesses are strings built

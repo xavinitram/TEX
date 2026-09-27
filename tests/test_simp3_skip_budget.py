@@ -249,7 +249,13 @@ _SKIP_VOCAB = re.compile(
 #: torch.equal on the CUDA device specifically. Its CPU twin
 #: (``test_gausspyr50_bitexact_below_threshold_cpu``) already proves the identical claim with
 #: no device and carries no r.skip.
-_SKIP_BUDGET = 129
+#: Re-pinned from 129 to 130 (FIX-HYGIENE H1): one new row,
+#: `test_lint1_no_local_only_path_refs.py::test_lint1_h1_no_tracked_file_names_a_host_tracker_id`,
+#: skips only when the tree is not a git checkout at all (`tracked_paths()` returns `None`) --
+#: the identical guard, and identical reason, its two sibling scans in the same file
+#: (`test_lint1_no_tracked_file_names_a_local_only_path`, `test_lint1_g5_no_new_bare_word_leak`)
+#: already carry, each with its own row already counted in this pin.
+_SKIP_BUDGET = 130
 
 
 def _literal(node) -> str:

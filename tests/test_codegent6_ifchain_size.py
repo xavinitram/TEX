@@ -139,7 +139,8 @@ def test_emitted_lines_grow_linearly_not_exponentially():
 @pytest.mark.timing
 def test_compile_of_the_16_arm_chain_is_fast():
     """Not the acceptance row (timing lives under this marker per project convention), but
-    the number CO187-T6 actually cared about: `builtins.compile` of the emitted source.
+    the number the underlying report actually cared about: `builtins.compile` of the
+    emitted source.
     Pre-fix, a chain this size would not even finish emitting in reasonable time; post-fix
     it is milliseconds."""
     text = _emit(_make_chain(16), {})
