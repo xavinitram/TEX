@@ -300,6 +300,35 @@ def _get_capability_pool() -> _DaemonProbePool:
     return _capability_pool
 
 
+# W2 (FIX-WARM, B3#2): a SEPARATE single-worker daemon pool for `tex_api.prewarm_async()`'s
+# warm-ahead jobs, so a large `programs` batch never sits in the SAME queue as a capability
+# probe. AUTO-48 originally reused `_get_capability_pool()` for both producers ("per the
+# standing rule against growing the number of background workers", its own docstring) --
+# but `prewarm()` processes its whole `programs` list in ONE call before returning (its only
+# yield point is between programs, not a queue re-submission), so sharing one single-worker
+# FIFO queue meant a probe queued behind an N-program warm-ahead job waited for the ENTIRE
+# batch, not "a probe's worth" as the sharing was costed. `compile_capability_async()`'s own
+# contract (a fast, bounded, cheap-to-repeat toolchain check `run_auto` polls every cook) is
+# a different shape from a possibly-large, best-effort warm-ahead batch, and now that there
+# are two independent producers for a pool AUTO-47 sized for one, giving warm-ahead jobs
+# their OWN worker is the fix: the two producers no longer contend at all, and this
+# dedicated pool is only ever spawned by `prewarm_async()` itself -- an opt-in host path, not
+# the default cook (invariant 7: a single-threaded ComfyUI cook never calls `prewarm_async`,
+# so it never creates this thread). Same daemonic contract as `_DaemonProbePool` (never
+# blocks process exit).
+_prewarm_pool: "_DaemonProbePool | None" = None
+_prewarm_pool_lock = threading.Lock()
+
+
+def _get_prewarm_pool() -> _DaemonProbePool:
+    global _prewarm_pool
+    if _prewarm_pool is None:
+        with _prewarm_pool_lock:
+            if _prewarm_pool is None:
+                _prewarm_pool = _DaemonProbePool("tex-prewarm")
+    return _prewarm_pool
+
+
 def compile_capability_async() -> dict | None:
     """Non-blocking counterpart to `compile_capability()`. Returns the same dict once the
     probe has actually completed (by ANY caller, sync or async — one shared cache), else

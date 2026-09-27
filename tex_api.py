@@ -1539,23 +1539,24 @@ def prewarm_async(programs, shapes=None, *, device: str = "cuda", precision: str
     changes nothing a default ComfyUI cook does or costs; it is purely additive, and
     nothing calls it unless a host chooses to).
 
-    Runs on the SAME single-worker daemon pool `compile_capability_async()` already uses
-    (`tex_runtime.compiled_capability._get_capability_pool()`) rather than a new one, per
-    the standing rule against growing the number of background workers. The trade this
-    makes explicit: a large warm-ahead job and a capability probe share one queue, so
-    either can queue behind the other. Both sides already tolerate that kind of delay by
-    design -- a capability probe queued behind a warm job just answers `None` a little
-    longer (`run_auto`'s CC-6 convergence bound already covers a capability answer that is
-    slow to arrive), and a warm job queued behind a probe finishes a probe's-worth later.
-    Neither can block a COOK either way, which is the property this ask asks for.
+    Runs on its OWN single-worker daemon pool (`tex_runtime.compiled_capability
+    ._get_prewarm_pool()`) -- W2 (FIX-WARM, B3#2): this job originally shared
+    `compile_capability_async()`'s pool, but `prewarm()` processes its whole `programs`
+    list in ONE call before returning, so a large warm-ahead batch held that single worker
+    for the ENTIRE batch and starved the capability probe for the same duration, not "a
+    probe's worth" as sharing was costed. The two producers now never contend: a warm-
+    ahead job can never delay a capability probe (or vice versa). This is still not a NEW
+    background worker on the default path -- `_get_prewarm_pool()` is only ever created by
+    a host actually calling `prewarm_async()`, an opt-in path a default ComfyUI cook never
+    reaches.
 
     `programs`/`shapes`/`device`/`precision`/`compile_mode` are exactly `prewarm()`'s own
     parameters, forwarded unchanged. `cancel` is layered under an internal token
     (`_CompositeCancelToken`) so `PrewarmHandle.cancel()` always has a lever, whether or
     not the caller supplied one of its own."""
-    from .tex_runtime.compiled_capability import _get_capability_pool
+    from .tex_runtime.compiled_capability import _get_prewarm_pool
     token = _CompositeCancelToken(cancel)
-    pool = _get_capability_pool()
+    pool = _get_prewarm_pool()
     future = pool.submit(lambda: prewarm(programs, shapes, device=device,
                                         precision=precision, compile_mode=compile_mode,
                                         cancel=token))
