@@ -479,12 +479,31 @@ def _tag_pixel_arg(name: str, arg_index: int):
 
 
 def _mix_scale_program():
-    """`@OUT = mix(@A, @B, 0.5);` -- with `_tag_pixel_arg("mix", 2)` active, arg 2 (`t`)
-    is multiplied by `scale` at the call site, so `@OUT` becomes `lerp(A, B, 0.5 * scale)`.
-    Capturable (no sync-gated call, no loop); A=0, B=1 makes the expected output exactly
-    `0.5 * scale` at every pixel, so a wrong replay is trivial to detect precisely."""
+    """`@TMP = mix(@A, @B, 0.5); @OUT = mix(@TMP, @B, 0.5);` -- TWO chained `mix()` calls.
+
+    FIX-SCALECX X3: the ORIGINAL one-call version
+    (`@OUT = mix(@A, @B, 0.5);`) has exactly one `FunctionCall` op, so
+    `graphed._capturable`'s own static op count is 1 -- BELOW `_GRAPH_MIN_OPS = 2`
+    (PF-2, a deliberate, pre-existing, unrelated-to-this-ask floor: "0/1-op programs
+    capture an ~empty graph -> pure loss"). `_graph_capture_worthwhile` declines any
+    1-op program before `run_graphed` ever computes a `_capture_key` or attempts a
+    capture -- confirmed live on real CUDA hardware (sm_75): both of this file's
+    CUDA-gated tests FAILED with "run_graphed declined the capturable mix() program",
+    never reaching the mismatch/parity they exist to prove. This was a
+    bug in THIS TEST's own synthetic program, not in `graphed.py` or in SCALECX-49's
+    fix. Chaining a second tagged call raises
+    the static op count to 2, clearing `_GRAPH_MIN_OPS` with no other change to the
+    mechanism under test.
+
+    With `_tag_pixel_arg("mix", 2)` active, arg 2 (`t`) of EVERY `mix()` call is
+    multiplied by `scale`, so `@TMP` becomes `lerp(A, B, 0.5 * scale)` and `@OUT`
+    becomes `lerp(TMP, B, 0.5 * scale)`. Still capturable (no sync-gated call, no
+    loop) and still exactly reproducible: the tests below compute their expected
+    value by running the SAME program through the real, unmodified interpreter
+    (`_ref`), never by hand-deriving the two-call arithmetic -- correct regardless of
+    how many `mix()` calls the chain has."""
     bt = {"A": TEXType.VEC4, "B": TEXType.VEC4, "OUT": TEXType.VEC4}
-    code = "@OUT = mix(@A, @B, 0.5);\n"
+    code = "@TMP = mix(@A, @B, 0.5);\n@OUT = mix(@TMP, @B, 0.5);\n"
     prog = parse_and_split(code, bt)
     tm = TypeChecker(binding_types=bt, source=code).check(prog)
     used = _collect_identifiers(prog)
