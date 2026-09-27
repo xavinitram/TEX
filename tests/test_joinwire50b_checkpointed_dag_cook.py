@@ -3,7 +3,7 @@
 JOINWIRE-50 (v0.50 wave 1) shipped `cook_stage_dag` — a DAG-shaped, node-by-node, windowed
 join cook — but its own design record named what it did NOT ship: no way for a host that uses
 checkpoint boundaries (a `ResultCache`, the same object `tex_checkpoint.cook_checkpointed`
-already takes) to get the same windowed-join win. This file proves the answer this lane
+already takes) to get the same windowed-join win. This file proves the answer this ask
 picked: teach `cook_stage_dag` ITSELF the checkpoint semantics (`result_cache=`, `upstream=`),
 rather than teaching `cook_checkpointed` the DAG shape.
 
