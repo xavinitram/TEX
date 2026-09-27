@@ -1405,3 +1405,118 @@ def prewarm(programs, shapes=None, *, device: str = "cuda", precision: str = "fp
             continue
     warm_state.persist(force=True)
     return summary
+
+
+class _CompositeCancelToken:
+    """AUTO-48: ORs an internal cancel flag (set by `PrewarmHandle.cancel()`) with the
+    caller's own token, if any. `prewarm()`'s existing per-program yield point
+    (HOSTAUDIT-2, `_cancel_check`) already stops a warm-ahead job between programs on
+    any `CookCancelled` — this just gives `PrewarmHandle.cancel()` a lever to pull that
+    check even when the caller supplied no token of its own."""
+    def __init__(self, inner: "CancelToken | None"):
+        self._inner = inner
+        import threading
+        self._flag = threading.Event()
+
+    def check(self) -> None:
+        if self._flag.is_set():
+            raise CookCancelled("prewarm_async: cancelled via PrewarmHandle.cancel()")
+        if self._inner is not None:
+            self._inner.check()
+
+    def set(self) -> None:
+        self._flag.set()
+
+
+class PrewarmHandle:
+    """A handle onto one `prewarm_async()` job: poll it, wait on it, or cancel it.
+
+    Never raises `CookCancelled` -- that exception is `prewarm()`'s own internal yield
+    signal (HOSTAUDIT-2) and never escapes it; a cancelled job still resolves to a normal
+    summary dict with `summary["cancelled"]` set. `poll()`/`wait()` DO re-raise if the
+    background job itself broke (a bug, not a bad program -- `prewarm()` already isolates
+    a bad program per-entry and counts it in `summary["errors"]`)."""
+
+    def __init__(self, future: "Future", token: _CompositeCancelToken):
+        self._future = future
+        self._token = token
+
+    def poll(self) -> "dict | None":
+        """Return the warm-ahead summary once the job has actually finished, else `None`,
+        immediately -- NEVER blocks. Mirrors `compile_capability_async()`'s own contract
+        (`tex_runtime/compiled_capability.py`): a caller on a cook thread may poll this
+        every tick for free."""
+        if not self._future.done():
+            return None
+        return self._resolve()
+
+    def wait(self, timeout: "float | None" = None) -> dict:
+        """Block the CALLING thread until the job finishes or *timeout* seconds elapse
+        (raises `concurrent.futures.TimeoutError` on expiry, `Future.result`'s own
+        contract). For a host's own explicit "wait for warm-up" moment (project load,
+        a settings dialog) -- never call this from a cook thread; that would defeat the
+        entire point of `prewarm_async()`, which is that a cook thread never blocks on it."""
+        self._future.result(timeout=timeout)
+        return self._resolve()
+
+    def _resolve(self) -> dict:
+        exc = self._future.exception()
+        if exc is not None:
+            # The background pool thread survives regardless (mirrors
+            # `_DaemonProbePool._run`'s "propagate to the future, never crash the worker"
+            # contract, `tex_runtime/compiled_capability.py`) -- a later `prewarm_async()`
+            # call is unaffected by this one's failure.
+            raise exc
+        return self._future.result()
+
+    def cancel(self) -> bool:
+        """Best-effort: ask an in-flight job to stop at its next per-program yield point.
+        Returns True if the job was still running when asked (its eventual summary will
+        report a nonzero `"cancelled"` count); False if it had already finished (nothing
+        to cancel -- the summary is already final)."""
+        if self._future.done():
+            return False
+        self._token.set()
+        return True
+
+    @property
+    def done(self) -> bool:
+        return self._future.done()
+
+
+def prewarm_async(programs, shapes=None, *, device: str = "cuda", precision: str = "fp32",
+                  compile_mode: str = "auto", cancel: "CancelToken | None" = None
+                  ) -> PrewarmHandle:
+    """AUTO-48 HOOK: `prewarm()`, off the cook thread. Mechanism only -- the host decides
+    WHEN to call this (a project load, an idle tick, a settings change); TEX supplies the
+    non-blocking submit + a pollable/waitable/cancellable handle back.
+
+    Returns IMMEDIATELY: this function itself never blocks, and the job it starts changes
+    no cook's result -- it only warms the codegen/compiled-tier caches `prewarm()` already
+    populates (the `.cg` disk sidecar, a background `torch.compile` submission, the
+    graph-capturability verdict), so a later real cook of an already-warmed program is a
+    cache hit, byte-identical to what it would have produced un-warmed (invariant 7: this
+    changes nothing a default ComfyUI cook does or costs; it is purely additive, and
+    nothing calls it unless a host chooses to).
+
+    Runs on the SAME single-worker daemon pool `compile_capability_async()` already uses
+    (`tex_runtime.compiled_capability._get_capability_pool()`) rather than a new one, per
+    the standing rule against growing the number of background workers. The trade this
+    makes explicit: a large warm-ahead job and a capability probe share one queue, so
+    either can queue behind the other. Both sides already tolerate that kind of delay by
+    design -- a capability probe queued behind a warm job just answers `None` a little
+    longer (`run_auto`'s CC-6 convergence bound already covers a capability answer that is
+    slow to arrive), and a warm job queued behind a probe finishes a probe's-worth later.
+    Neither can block a COOK either way, which is the property this ask asks for.
+
+    `programs`/`shapes`/`device`/`precision`/`compile_mode` are exactly `prewarm()`'s own
+    parameters, forwarded unchanged. `cancel` is layered under an internal token
+    (`_CompositeCancelToken`) so `PrewarmHandle.cancel()` always has a lever, whether or
+    not the caller supplied one of its own."""
+    from .tex_runtime.compiled_capability import _get_capability_pool
+    token = _CompositeCancelToken(cancel)
+    pool = _get_capability_pool()
+    future = pool.submit(lambda: prewarm(programs, shapes, device=device,
+                                        precision=precision, compile_mode=compile_mode,
+                                        cancel=token))
+    return PrewarmHandle(future, token)
