@@ -1573,7 +1573,15 @@ def region_advisory(halos, roi, dirty_from: int = 0, *, costs, px: int, device: 
 
 
 def clear_roi_memo() -> None:
-    """Test hook (mirrors tex_lazy.clear_lazy_memo)."""
+    """Test hook (mirrors tex_lazy.clear_lazy_memo).
+
+    FIX-SCALE S8: `_scale_verdict_memo` (SCALE-47b) is registered here too. Before this fix
+    it was the one bounded-LRU store in this file this function's own docstring/callers
+    assumed it emptied (40+ call sites across `tests/`/`benchmarks/` treat `clear_roi_memo()`
+    as THE single reset point for every ROI-module cache) but did not — a stale
+    `scale_verdict()` answer survived a `clear_roi_memo()` call, for a predicate that gates
+    whether a cook is allowed to run at a non-1.0 `scale` at all."""
     _walk_memo.clear()
     _region_dep_memo.clear()
     _parse_memo.clear()
+    _scale_verdict_memo.clear()
