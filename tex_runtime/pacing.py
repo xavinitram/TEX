@@ -253,7 +253,11 @@ _COST_ALPHA = 0.35
 #: program edited/reloaded many times, or many distinct programs cooked in one process).
 _COST_TABLE_MAX = 512
 
-#: PACE-49: {(call_site_id, device_index, px_bucket): [ewma_ms, samples]}. Module-global
+#: PACE-49: {(call_site_id, device_index, px_bucket): [ewma_ms, samples, anchor]}. `anchor`
+#: (FIX-PACE49 P2) is the actual object `call_site_id`'s `id()` was taken from, held by a
+#: strong reference and checked by identity on every read/write -- see `_cost_feed`'s own
+#: docstring for why (this table's own `id()`-derived key can otherwise alias an unrelated,
+#: later object once the original is freed and its address reused). Module-global
 #: (NOT thread-local, unlike the rest of this module's `_state`): a call site's own device
 #: cost is a property of the (program, device, resolution) triple, not of which worker
 #: thread happened to poll it, so a program cooked across several threads (ENG-9's per-cook-
@@ -280,38 +284,57 @@ def _cost_blend(prev: float, ms: float, n: int) -> float:
     return a * ms + (1.0 - a) * prev
 
 
-def _cost_feed(key: tuple, ms: float) -> None:
+def _cost_feed(key: tuple, ms: float, anchor=None) -> None:
     """PACE-49: fold one real, retrospectively-attributed device-time reading for *key* into
     the table -- called only from a poll that has ALREADY paid for the CUDA call whose
     completion made *ms* knowable (see `_pace49_attribute`'s own docstring); never a new
     CUDA call itself. Negative/non-finite readings are dropped rather than poisoning the
     EWMA (mirrors `profile.record`'s own `ms is None or ms < 0` guard); `elapsed_time`
     between two real, completed CUDA events should never produce one, but a mocked or
-    exotic event implementation is not this function's contract to trust blindly."""
+    exotic event implementation is not this function's contract to trust blindly.
+
+    FIX-PACE49 P2 (R3-efficiency.md #4, R4-altitude.md #1): *anchor*, when the caller has
+    one, is the actual object *key*'s `id()`-derived component names (the interpreter's own
+    `stmt`) -- checked by identity (`is`), the same "a recycled id belongs to a different
+    object" guard `pacing_heavy._HEAVY_STMT_MEMO` already uses for the exact same class of
+    object. `_COST_TABLE` is module-global and deliberately outlives any one `Program`
+    (that is the whole point of the table), but `tex_cache`'s 128-entry Program LRU means a
+    freed Program's own statements' addresses CAN be reused by an unrelated, later
+    Program's statements -- without this check, that reused address would silently inherit
+    a stale EWMA measured on a completely different statement. A caller that omits *anchor*
+    (every direct table-seeding call in this tree's own tests, and any future non-AST-keyed
+    caller) gets exactly today's key-only behaviour unchanged: two omitted (`None`) anchors
+    never mismatch each other, so no bug is introduced for that caller. A mismatch is
+    treated exactly like a brand-new key -- reseed fresh, discard whatever the stranger's
+    entry held; the stale EWMA is simply never read back and never blended into again."""
     if ms is None or not _math.isfinite(ms) or ms < 0:
         return
     with _COST_LOCK:
         entry = _COST_TABLE.get(key)
-        if entry is None:
-            entry = [0.0, 0]
+        if entry is None or entry[2] is not anchor:
+            entry = [0.0, 0, anchor]
             _COST_TABLE[key] = entry
             while len(_COST_TABLE) > _COST_TABLE_MAX:
                 _COST_TABLE.popitem(last=False)
-        else:
-            _COST_TABLE.move_to_end(key)
+        _COST_TABLE.move_to_end(key)
         entry[1] += 1
         entry[0] = _cost_blend(entry[0], ms, entry[1])
 
 
-def _cost_lookup(key: tuple):
+def _cost_lookup(key: tuple, anchor=None):
     """PACE-49: `(ewma_ms, samples)` for *key*, or `None` if this call site has never been
     fed a real reading -- the caller (`_pace49_cost_gate`) treats `None` and
     "not yet warm" (`samples < _COST_WARMUP_SAMPLES`) identically: ride the registry-derived
     cold-start rule, never this table, until there is enough real evidence to trust it
-    (AUTHOR DECISION 4(a))."""
+    (AUTHOR DECISION 4(a)).
+
+    FIX-PACE49 P2: `anchor` is checked by identity against the entry's own stored anchor
+    (see `_cost_feed`'s docstring) -- a mismatch (an aliased `id()`-derived key whose entry
+    was fed by a DIFFERENT, since-freed object) reads back as `None`, never the stranger's
+    stale estimate."""
     with _COST_LOCK:
         entry = _COST_TABLE.get(key)
-        if entry is None:
+        if entry is None or entry[2] is not anchor:
             return None
         _COST_TABLE.move_to_end(key)
         return entry[0], entry[1]
@@ -598,9 +621,11 @@ def reset(token=None, device=None, spatial_shape=None) -> None:
     # so a carried-over anchor could attribute a stale interval to the wrong call site.
     pool["timed_prev"] = None
     pool["timed_site"] = None
+    pool["timed_anchor"] = None  # FIX-PACE49 P2
 
 
-def paced_check(token, device, heavy: bool = False, call_site_id=None) -> None:
+def paced_check(token, device, heavy: bool = False, call_site_id=None,
+                 call_site_anchor=None) -> None:
     """One poll point. `token is None` is the untouched default path (a no-op, exactly
     `host._cancel_check`'s own body). A token that does not ask for pacing, or a cook that
     is not on CUDA, is the SAME body too — one `token.check()` — so the unpaced cost is
@@ -648,6 +673,17 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None) -> None:
     not-yet-warm call site never contributes to that sum and never itself forces a
     fall-through — it rides the SAME `heavy`/large-resolution rule this function already had
     (AUTHOR DECISION 4(a): cold start is today's behaviour, never worse).
+
+    **FIX-PACE49 P2 — `call_site_anchor`: the object `call_site_id` actually names, kept
+    alongside it for an identity check.** `_COST_TABLE` is module-global and deliberately
+    outlives any one `Program` (the whole point of the table), but a freed Program's
+    statement can have its `id()` reused by an unrelated, later Program's own statement
+    (`tex_cache`'s bounded Program LRU) — without an anchor, that reused id would silently
+    read back (and blend into) a stale EWMA measured on a completely different statement.
+    The interpreter passes the actual `stmt` object here (only when already paced, per P1's
+    own gate); every other caller (every one before this ask) omits it, and two omitted
+    (`None`) anchors never mismatch each other, so nothing about an existing caller's
+    behaviour changes. See `_cost_feed`'s own docstring for the mismatch-reseeds-fresh rule.
 
     Paced (a CUDA cook, a token with a truthy `pace`): polls the token first (an
     already-tripped token is caught before any device interaction) — ALWAYS, regardless of
@@ -765,9 +801,9 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None) -> None:
                 # module docstring describes -- attribute it before deciding whether to
                 # skip, so the budget check just below sees this call site's latest number.
                 if call_site_id is not None and tail is not None and not was_cached:
-                    _pace49_attribute(pool, tail, call_site_id)
+                    _pace49_attribute(pool, tail, call_site_id, call_site_anchor)
                 _state.last_confirmed_done = tail
-                if call_site_id is None or _pace49_cost_gate(call_site_id):
+                if call_site_id is None or _pace49_cost_gate(call_site_id, call_site_anchor):
                     return  # device caught up (and, if measured, within budget)
                 # else: a warm call site's own measured cost pushed the running estimate
                 # past `pace_budget_ms` -- do not honour the stride/peek skip for this poll;
@@ -793,7 +829,7 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None) -> None:
         # never economizes (heavy/large-resolution/stride=0) still measures its own call
         # sites rather than only ever riding the cold-start guess.
         if call_site_id is not None:
-            _pace49_attribute(pool, oldest, call_site_id)
+            _pace49_attribute(pool, oldest, call_site_id, call_site_anchor)
 
     # `blocking=True` so a wait on this event (above, some FUTURE poll) releases the GIL.
     # PACE-49: `enable_timing=True` too -- every pool event is now timing-capable, so an
@@ -816,6 +852,7 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None) -> None:
     if call_site_id is not None and pool.get("timed_prev") is None:
         pool["timed_prev"] = ev
         pool["timed_site"] = call_site_id
+        pool["timed_anchor"] = call_site_anchor  # FIX-PACE49 P2
     # PACE-47b: invalidate the query() cache -- this event was JUST re-armed onto a new
     # point (or is brand new), so any earlier "confirmed done" answer (for this object or
     # any other) no longer describes what `outstanding[-1]` is now. The next economizing
@@ -828,7 +865,7 @@ def paced_check(token, device, heavy: bool = False, call_site_id=None) -> None:
     _state.last_record_t = _time.perf_counter()
 
 
-def _pace49_attribute(pool: dict, tail, call_site_id) -> None:
+def _pace49_attribute(pool: dict, tail, call_site_id, call_site_anchor=None) -> None:
     """PACE-49: fold the real device-time interval between `pool["timed_prev"]` (this
     mechanism's own last attribution anchor) and *tail* (an event JUST confirmed complete by
     a peek's `query()` or a wait's `synchronize()` -- never called otherwise, so
@@ -841,25 +878,33 @@ def _pace49_attribute(pool: dict, tail, call_site_id) -> None:
     coarse, not incorrect, if something else did (that other call site's own polls get their
     own, later, correctly-anchored intervals once IT triggers a real record).
 
+    FIX-PACE49 P2: `call_site_anchor` is threaded straight through to `_cost_feed` as the
+    identity-check anchor (see its own docstring) — `pool["timed_anchor"]` remembers WHICH
+    object `pool["timed_site"]` (the id()-derived key component) actually names, exactly
+    like `timed_site` itself is remembered, so the credit below is anchored to the right
+    object even if `call_site_id`'s own raw value has since been reused by something else.
+
     Silently skipped (never raises) if there is no anchor yet (`timed_prev is None`, the
     pool's first attribution point since the last `reset()`), the anchor IS *tail* itself
     (nothing elapsed to attribute, `depth<=1` can hand the same event to both roles), or
     `elapsed_time()` raises (an exotic event backend) -- losing one interval's reading is the
     honest choice `profile._drain_pending` already makes for the same class of failure,
     never a reason to raise out of a poll point."""
-    prev, prev_site = pool.get("timed_prev"), pool.get("timed_site")
+    prev, prev_site, prev_anchor = (pool.get("timed_prev"), pool.get("timed_site"),
+                                    pool.get("timed_anchor"))
     if prev is not None and prev is not tail and prev_site is not None:
         try:
             ms = prev.elapsed_time(tail)
         except Exception:
             ms = None
         if ms is not None:
-            _cost_feed((prev_site, _state.device_idx, _state.px_bucket), ms)
+            _cost_feed((prev_site, _state.device_idx, _state.px_bucket), ms, prev_anchor)
     pool["timed_prev"] = tail
     pool["timed_site"] = call_site_id
+    pool["timed_anchor"] = call_site_anchor
 
 
-def _pace49_cost_gate(call_site_id) -> bool:
+def _pace49_cost_gate(call_site_id, call_site_anchor=None) -> bool:
     """PACE-49: `True` while it is still safe to honour the stride/peek skip for this poll --
     either because the ms-budget dimension is disabled (`pace_budget_ms<=0`, the escape
     hatch), this call site has no estimate yet or is not yet WARM (`samples <
@@ -874,7 +919,7 @@ def _pace49_cost_gate(call_site_id) -> bool:
     budget = _state.budget_ms
     if budget <= 0:
         return True
-    est = _cost_lookup((call_site_id, _state.device_idx, _state.px_bucket))
+    est = _cost_lookup((call_site_id, _state.device_idx, _state.px_bucket), call_site_anchor)
     if est is None:
         return True
     ewma_ms, samples = est

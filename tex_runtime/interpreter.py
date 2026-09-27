@@ -544,7 +544,10 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                         _pace.paced_check(
                             cancel, dev,
                             heavy=_heavy_ids is not None and _stmt_id in _heavy_ids,  # PACE-45/47d
-                            call_site_id=_stmt_id)  # PACE-49
+                            call_site_id=_stmt_id,  # PACE-49
+                            # FIX-PACE49 P2: the actual stmt object anchors the id()-derived
+                            # key above against a later, unrelated statement reusing it.
+                            call_site_anchor=(stmt if _stmt_id is not None else None))
                         self._exec_stmt(stmt)
                 else:
                     n = len(stmts) or 1
@@ -553,7 +556,8 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                         _pace.paced_check(
                             cancel, dev,
                             heavy=_heavy_ids is not None and _stmt_id in _heavy_ids,  # PACE-45/47d
-                            call_site_id=_stmt_id)  # PACE-49
+                            call_site_id=_stmt_id,  # PACE-49
+                            call_site_anchor=(stmt if _stmt_id is not None else None))  # P2
                         self._exec_stmt(stmt)
                         _report_progress(on_progress, "stmt", (i + 1) / n)
         finally:
@@ -665,7 +669,8 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
                 _stmt_id = id(stmt) if _heavy_ids is not None else None
                 _pace.paced_check(cancel, dev,
                                   heavy=_heavy_ids is not None and _stmt_id in _heavy_ids,  # PACE-45/47d
-                                  call_site_id=_stmt_id)  # PACE-49
+                                  call_site_id=_stmt_id,  # PACE-49
+                                  call_site_anchor=(stmt if _stmt_id is not None else None))  # P2
             self._exec_stmt(stmt)
             if on_progress is not None:
                 i += 1
