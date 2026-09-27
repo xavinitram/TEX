@@ -242,7 +242,14 @@ _SKIP_VOCAB = re.compile(
 #: could create neither a junction nor a symlink". No witness proves whole-suite collection
 #: survives this shape without actually building the shape, so raising the pin is the
 #: honest move, not inventing one.
-_SKIP_BUDGET = 128
+#: Re-pinned from 128 to 129 (GAUSSPYR-50): one new row,
+#: ``test_gausspyr50_engine_policy.py::test_gausspyr50_bitexact_below_threshold_cuda``, needs a
+#: real CUDA device -- same reason every other CUDA-only bit-exactness row in this pin already
+#: carries: there is no CPU stand-in for proving the exact-below-threshold path is
+#: torch.equal on the CUDA device specifically. Its CPU twin
+#: (``test_gausspyr50_bitexact_below_threshold_cpu``) already proves the identical claim with
+#: no device and carries no r.skip.
+_SKIP_BUDGET = 129
 
 
 def _literal(node) -> str:

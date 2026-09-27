@@ -847,6 +847,85 @@ def _gauss_blur_bchw(
     return result
 
 
+# GAUSSPYR-50 (v0.50, RADIUS-50a D2): an ENGINE POLICY, not a new language argument —
+# `gauss_blur`'s signature/registry entry are unchanged. `_gauss_blur_bchw`'s exact
+# separable-conv cost above grows with sigma (O(sigma) work: the kernel is
+# `2*ceil(3*sigma)+1` taps wide), which is honest but unusably slow once sigma runs
+# into the hundreds-to-thousands range the "arbitrarily large radius" rule targets
+# (measured: a 4k exact blur already costs >1s past sigma≈256, and the RADIUS-50a
+# design pass's own extrapolation put an r=8192 exact call at tens of seconds).
+# `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA` is the line: at or below it, `_gauss_blur_auto`
+# calls `_gauss_blur_bchw` exactly, UNCONDITIONALLY — the same call, same kernel, same
+# conv, bit-identical to every release before this constant existed (proven by
+# `torch.equal` across a sigma sweep from 0 up to the threshold in
+# `tests/test_gausspyr50_bitexact.py`, CPU and CUDA). Above it, `_gauss_blur_pyramid_
+# approx` runs: an O(image size) downscale-pyramid approximation ("Nuke quality") whose
+# cost stays flat regardless of sigma. Both constants were picked by measurement (a
+# fuzzer sweep over a checker and a smooth-gradient-plus-hard-edges corpus, at 1080p and
+# 4k, CPU, this box) — see docs/resolution-scale.md's "gauss_blur past the exact
+# threshold" section for the measured bands. Do not raise the threshold to "fix" a slow
+# call: the pyramid path exists precisely because raising it further only delays,
+# rather than removes, the same unbounded-time problem (RADIUS-50a-design.md D2 option 3,
+# rejected).
+GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA = 256.0
+
+# The pyramid path's own accuracy/speed knob (not source-visible — an internal detail
+# of the approximation, never a `gauss_blur(...)` argument). Picked by measurement:
+# quality_cap=8.0 keeps the worst-measured maxdiff on a realistic (smooth-gradient +
+# hard-edged rectangles) corpus image at <=0.09 across sigma=16..512 — inside the same
+# 0.05-0.10 band `docs/resolution-scale.md`'s own `scale=` R1 envelope already accepts
+# for this same builtin family — at no measured speed cost over a more aggressive cap
+# (both stay flat, ~20-40ms at 4k regardless of sigma). A pure-checker corpus (8px
+# period) saturates to ~0.12-0.13 maxdiff regardless of quality_cap once sigma exceeds
+# roughly its own period — the same "checker isn't reliably the worse case" effect
+# `docs/resolution-scale.md` already documents for `scale=`; the realistic-image number
+# is the one this constant was tuned against.
+GAUSS_BLUR_PYRAMID_QUALITY_CAP = 8.0
+
+
+def _gauss_blur_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Downscale-pyramid Gaussian blur approximation for sigma past
+    `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA` (D2's automatic "Nuke quality" path).
+
+    Halves the image via plain `avg_pool2d` (a cheap box-filter downsample, no
+    Gaussian kernel — the per-level cost the fuzzer sweep found both faster AND more
+    accurate than re-blurring at each level) until the RESIDUAL sigma at that level
+    (`sigma` scaled down by the same halving factor) is at or below
+    `GAUSS_BLUR_PYRAMID_QUALITY_CAP`; blurs EXACTLY at that small residual sigma via
+    the same `_gauss_blur_bchw` used everywhere else (so the one real blur this
+    function does is bit-identical machinery, not a second approximation); then
+    upsamples back to the original size with a single bilinear pass. Cost is
+    O(image size) once — flat regardless of sigma, unlike the exact conv's O(sigma)
+    — because the number of halvings is O(log2(sigma)) and each level's image is a
+    quarter the pixels of the one before it (a geometric series bounded by ~4/3x the
+    full-res image, dominated by the flat bilinear upsample at the end).
+
+    Only ever called for `sigma > GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA`; never touches
+    the exact path below that (invariant 7 — this is purely additive on the new
+    branch).
+    """
+    current = img
+    residual = sigma
+    while residual > GAUSS_BLUR_PYRAMID_QUALITY_CAP and min(current.shape[-2], current.shape[-1]) > 1:
+        current = torch.nn.functional.avg_pool2d(current, kernel_size=2, stride=2)
+        residual *= 0.5
+    current = _gauss_blur_bchw(current, residual)
+    out_h, out_w = img.shape[-2], img.shape[-1]
+    return torch.nn.functional.interpolate(
+        current, size=(out_h, out_w), mode='bilinear', align_corners=False,
+    )
+
+
+def _gauss_blur_auto(img: torch.Tensor, sigma: float) -> torch.Tensor:
+    """`gauss_blur`'s single call site (D2): dispatches between the exact separable
+    conv (`_gauss_blur_bchw`, unchanged) and the downscale-pyramid approximation
+    (`_gauss_blur_pyramid_approx`) purely on `sigma`, no new argument. See
+    `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA`'s own comment for the measured basis."""
+    if sigma <= GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA:
+        return _gauss_blur_bchw(img, sigma)
+    return _gauss_blur_pyramid_approx(img, sigma)
+
+
 # -- Mipmap helpers (module-level) -----------------------------------------
 
 def _build_mip_pyramid(

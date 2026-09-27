@@ -214,7 +214,13 @@ def run_both(code, bindings, B=1, H=4, W=4):
 
     stdlib_fns = _STDLIB_FNS
     dev = _CPU_DEVICE
-    env = {}
+    # GAUSSPYR-50: `compiled.py`'s `_build_codegen_env` always sets `__tex_scale` to
+    # 1.0 for a scale=None cook (SCALE-CG-48) -- a `pixel_args=`-tagged builtin
+    # (gauss_blur/erode/dilate/bilateral_filter) reads it unconditionally at the emit
+    # site (codegen.py's `_emit_function_call`), so this harness needs the same default
+    # every real cook gets, or codegen for any of those four raises KeyError here before
+    # this line existed.
+    env = {"__tex_scale": 1.0}
     # CF-6: the SAME derivation production uses. This helper kept a private first-wins loop —
     # a THIRD copy of the grid rule, in the very oracle that exists to catch the two tiers
     # disagreeing. An oracle that derives the grid its own way cannot see a grid bug.

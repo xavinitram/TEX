@@ -17,6 +17,7 @@ from .stdlib_core import (
     _dtype_rounded,
     _expand_to_bhw,
     _gauss_blur_bchw,
+    _gauss_blur_auto,
     _get_batch_index,
     _get_bchw,
     _get_grid_buf,
@@ -506,7 +507,11 @@ class _StdlibSample:
         if sigma_val < 0.3 or img.dim() < 4:
             return img
         bchw = _get_bchw(img)
-        result = _gauss_blur_bchw(bchw, sigma_val)
+        # GAUSSPYR-50: `_gauss_blur_auto` dispatches on sigma alone (an engine policy,
+        # not a new argument) — exact and bit-identical at/below
+        # GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA, an O(image size) downscale-pyramid
+        # approximation above it. See stdlib_core.py's own comment on the constant.
+        result = _gauss_blur_auto(bchw, sigma_val)
         return result.permute(0, 2, 3, 1)
 
     @stdlib("bilateral_filter", sig='bilateral_filter(img, spatial_sigma, range_sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo', 3), pixel_args=(1,), doc='Edge-preserving smoothing: blurs within regions but keeps edges. Window capped at 7×7.', ex='@OUT = bilateral_filter(@A, 1.5, 0.2);')

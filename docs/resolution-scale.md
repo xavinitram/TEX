@@ -284,6 +284,56 @@ behaviour exactly either way — invariant #7) rather than trade one silently-wo
 another; a host choosing `¼`/`⅛` under memory or latency pressure should not select `⅛` for
 these two builtins.
 
+## `gauss_blur` past the exact threshold (GAUSSPYR-50)
+
+`gauss_blur(img, sigma)`'s signature and registry entry are unchanged — this is an ENGINE
+POLICY, not a new argument, in the same shape `precision="auto"`'s own gate already is
+(invariant #10): an internal, automatic, measured-safe decision the engine makes, never a
+knob a TEX author writes.
+
+**Below `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA` (256.0), nothing changed: `gauss_blur` runs
+today's exact separable convolution, unconditionally.** Proven with `torch.equal` (not a
+tolerance) across a sigma sweep from 0 up to the threshold, CPU and CUDA
+(`tests/test_gausspyr50_engine_policy.py`) — the same call, the same kernel, the same
+padding and conv passes as every release before this policy existed.
+
+**Above the threshold, an automatic downscale-pyramid approximation runs instead** ("Nuke
+quality": halve the image via a box-filter downsample until the residual sigma at that level
+is at or below `GAUSS_BLUR_PYRAMID_QUALITY_CAP` (8.0), blur EXACTLY at that small residual
+sigma via the same exact code path used below the threshold, upsample back bilinear). This
+exists because the exact convolution's cost grows with sigma (kernel width is
+`2*ceil(3*sigma)+1`) without bound, to the point of being unusable at the radii an
+"arbitrarily large blur" request implies — a single 4k call already costs over a second past
+sigma≈256 on a measured box, and grows into the tens of seconds by the low thousands. The
+pyramid path's cost is flat instead: `O(image size)` once, independent of sigma, because the
+number of halvings is `O(log2(sigma))` and each level is a quarter the pixels of the one
+before it.
+
+**Both constants were picked by measurement** (a fuzzer sweep over an 8-pixel-period checker
+and a smooth-gradient-plus-hard-edged-rectangles corpus — the same two-input protocol this
+document's own R1 promise below uses — at 1080p and 4k, CPU): the threshold is set well above
+any sigma that still runs in a bounded, tolerable time exactly, and `quality_cap=8.0` keeps
+the worst-measured maxdiff on the realistic (smooth+edges) corpus image at or under ~0.09 for
+sigma up to the low thousands, and under ~0.13 on the adversarial checker (which saturates to
+a near-flat 0.5 under either method once sigma exceeds its own period — the checker is not
+reliably the worse case, the same finding this document's R1 table below already records for
+`erode`/`dilate` under `scale`). Both sit inside the 0.05–0.10 band this document's own R1
+promise already accepts for this same builtin family.
+
+**No accuracy claim below the threshold, and no correctness claim changes past it either**: a
+program that asked for `sigma > 256` before this policy existed got the exact answer, just
+slowly (never silently wrong, unlike `erode`/`dilate`'s pre-existing 256-radius clamp or
+`bilateral_filter`'s pre-existing 7×7 window cap, which are silently WRONG past their own
+caps). Past the threshold, a call that used to be exact but slow now returns a close,
+measured-bounded approximation quickly — a performance trade with a disclosed accuracy cost
+at the extreme end, not a bug fix.
+
+**Scale composes for free.** `scale=` (above) multiplies `gauss_blur`'s sigma BEFORE this
+policy's threshold check ever runs (the same call-site multiply described under "What is
+covered"), so a coarse-scale cook simply tends to land in the cheap/exact regime more often —
+no new scale-awareness was needed in this policy, and nothing here changes `scale=`'s own R1
+bands or its ROI/tier-decline behaviour.
+
 ## Precision under scale
 
 A coarse cook (`scale` neither `None` nor `1.0`) whose caller left `precision` at its literal
