@@ -469,6 +469,17 @@ class _StdlibSample:
         between levels (trilinear). Fast path when LOD is a uniform integer:
         samples a single level with no interpolation.
         """
+        # FIX-PACE P4: an entry poll, unconditionally -- `_build_mip_pyramid`'s own
+        # internal per-level poll (PACE-47c) sits INSIDE its build loop, which a WARM
+        # cache hit returns before ever reaching (a live "drag a param on a static image"
+        # session hits the warm cache every tick). Without this, a warm sample_mip call
+        # touches the pacing pool not at all, even though this builtin's own registry
+        # entry stays deliberately excluded from footprint-derived heaviness (it is
+        # multi-pass, not halo-shaped) — see `pacing_heavy.py`'s docstring. `heavy=True`:
+        # this call is device-expensive on both the cold AND warm path (a grid_sample per
+        # mip level either way), so it must bypass stride economization like the other
+        # Gap-1 builtins, not just get a plain poll.
+        poll_cook_cancel(heavy=True)
         return _sample_mip_trilinear(image, u_coord, v_coord, lod, _get_mip_pyramid)
 
     @stdlib("gauss_blur", sig='gauss_blur(img, sigma) \\u2192 vec', category='Sampling', spatial=True, sync=True, footprint=('halo_arg', 1, 3.0), pixel_args=(1,), doc='Separable Gaussian blur. Kernel radius ≈ 3×sigma pixels. Replicate border padding.', ex='@OUT = gauss_blur(@A, 2.0);')
@@ -796,4 +807,6 @@ class _StdlibSample:
         2x downsample, producing SIGMA_C ≈ 0.825. This gives ~5 dB better
         accuracy for exponential blur reconstruction vs the area-downsample pyramid.
         """
+        # FIX-PACE P4: same warm-cache entry poll as fn_sample_mip above -- see its comment.
+        poll_cook_cancel(heavy=True)
         return _sample_mip_trilinear(image, u_coord, v_coord, lod, _get_mip_pyramid_gauss)

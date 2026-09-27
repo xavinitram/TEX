@@ -66,6 +66,17 @@ class StdlibEntry:
     # source stays identical across scale values (one compiled artifact per program, not
     # one per scale).
     pixel_args: tuple = ()
+    # FIX-PACE P4 (Phase C): a builtin whose device cost is genuinely expensive but whose
+    # ACCESS footprint is still 'point' (it reads only its own coordinate args, so ROI/tiling
+    # need not know about it) -- footprint answers "which pixels does this read", not "how
+    # expensive is this to run", and a runtime-variable-cost builtin (octave count) or a
+    # per-pixel search (cellular/Worley) can be both 'point'-footprint AND heavy. A SEPARATE
+    # tag from `footprint` (never folded into it): tagging a 'point' builtin `heavy=True`
+    # must never change its ROI/tiling treatment, only `pacing_heavy.heavy_builtin_names()`'s
+    # per-statement cost classification (`tex_runtime/pacing.py:paced_check`'s own `heavy=`
+    # bypass of stride economization). Default `False` for every function with no runtime-
+    # variable or otherwise underestimated cost — this tag is additive, never a downgrade.
+    heavy: bool = False
 
     @property
     def names(self) -> tuple:
@@ -133,7 +144,8 @@ def _valid_pixel_args(pixel_args, footprint) -> bool:
 
 
 def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
-           doc="", ex="", sig="", category="", non_spatial_args=(), pixel_args=()):
+           doc="", ex="", sig="", category="", non_spatial_args=(), pixel_args=(),
+           heavy=False):
     """Record one StdlibEntry and return the decorated object UNCHANGED (so an
     inner `@staticmethod` still applies). Pure data attachment — the name is
     explicit; nothing is inferred or discovered. `footprint` (ROI-1) is validated
@@ -142,7 +154,9 @@ def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
     (COLOR-1) names which 0-based argument positions are a non-spatial resource, not
     an ordinary image/coordinate argument — see `StdlibEntry.non_spatial_args`.
     `pixel_args` (SCALE-47b) names which 0-based argument positions are a pixel-unit
-    magnitude a cook's `scale=` must multiply — see `StdlibEntry.pixel_args`."""
+    magnitude a cook's `scale=` must multiply — see `StdlibEntry.pixel_args`.
+    `heavy` (FIX-PACE P4) marks a function device-expensive independent of its
+    footprint — see `StdlibEntry.heavy`."""
     if not _valid_footprint(footprint):
         raise ValueError(
             f"stdlib({name!r}): invalid footprint {footprint!r}. Expected 'point', "
@@ -152,12 +166,14 @@ def stdlib(name, *, aliases=(), spatial=False, sync=False, footprint="point",
             f"stdlib({name!r}): invalid pixel_args {pixel_args!r}. Expected a tuple of "
             f"positive ints (arg 0, the image, is never a pixel magnitude), and it must "
             f"include a 'halo_arg' footprint's own index when one is declared.")
+    if not isinstance(heavy, bool):
+        raise ValueError(f"stdlib({name!r}): heavy must be a bool, got {heavy!r}.")
 
     def deco(obj):
         fn = obj.__func__ if isinstance(obj, staticmethod) else obj
         REGISTRY.append(StdlibEntry(name, fn, tuple(aliases), spatial, sync,
                                     footprint, doc, ex, sig, category,
-                                    tuple(non_spatial_args), tuple(pixel_args)))
+                                    tuple(non_spatial_args), tuple(pixel_args), heavy))
         # REG-1c: a registration changes what `non_spatial_args_by_name()`/`pixel_args_by_name()`
         # must answer, so their caches (below) are invalidated here — the ONLY place `REGISTRY`
         # grows. This also covers late registration (a decorator running after the first

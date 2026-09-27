@@ -41,15 +41,21 @@ def _compute_heavy_builtin_names() -> frozenset[str]:
     names: set[str] = set()
     for entry in REGISTRY:
         fp = entry.footprint
-        if isinstance(fp, tuple) and fp[0] in ("halo", "halo_arg"):
+        # FIX-PACE P4: heaviness is now TWO independent registry signals, OR'd together --
+        # a halo-shaped footprint (device-expensive because it reads beyond one pixel), OR
+        # the entry's own `heavy` tag (device-expensive for a reason footprint cannot
+        # express: a runtime-variable octave count, a per-pixel cellular search — still
+        # 'point'-footprint, so ROI/tiling need not change). Neither implies the other.
+        if (isinstance(fp, tuple) and fp[0] in ("halo", "halo_arg")) or entry.heavy:
             names.update(entry.names)
     return frozenset(names)
 
 
 def heavy_builtin_names() -> frozenset[str]:
-    """Every registered name (aliases expanded) whose footprint is halo-shaped — cached
-    process-wide (the registry does not change after import; `stdlib()`'s own `deco`
-    only ever APPENDS during module load, never after)."""
+    """Every registered name (aliases expanded) whose footprint is halo-shaped OR whose
+    own `heavy` registry tag is set (FIX-PACE P4) — cached process-wide (the registry does
+    not change after import; `stdlib()`'s own `deco` only ever APPENDS during module load,
+    never after)."""
     global _HEAVY_NAMES_CACHE
     if _HEAVY_NAMES_CACHE is None:
         _HEAVY_NAMES_CACHE = _compute_heavy_builtin_names()
