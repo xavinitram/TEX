@@ -71,8 +71,14 @@ _DURATION_RE = re.compile(
 )
 
 #: A wall-clock reading taken IN THIS PROCESS. Never `.sleep(` (a delay, not a measurement).
+#: FIX-GATE G1 (B4#3) widened this past the two `timeit.*` spellings the module docstring
+#: already claimed but the pattern did not actually cover: `timeit.repeat(...)` (a second,
+#: equally-common entry point) and `Timer(...).timeit(...)` (a bound method call, where the
+#: literal substring "timeit." never appears before ".timeit(" because the `Timer` instance
+#: sits in a local variable) -- the bare `.timeit(` alone closes that one.
 _WALLCLOCK_SRC_RE = re.compile(
     r"perf_counter\(\)|time\.time\(\)|timeit\.default_timer\(\)|timeit\.timeit\(|"
+    r"timeit\.repeat\(|timeit\.Timer\(|\.timeit\(|"
     r"\.monotonic\(\)|\.process_time\(\)"
 )
 
@@ -105,11 +111,13 @@ def _parent_map(tree: ast.AST) -> dict:
     return parents
 
 
-def _is_guard_compare(node: ast.Compare, parents: dict) -> bool:
-    """True when `node` is (or sits under, through any chain of `and`/`or`/`not`) the `test`
-    of an `if` or an `assert` -- the two shapes that decide pass/fail. A `while`/`for` test
-    walks up to a node type this never returns True for, so a poll-until-deadline loop is
-    excluded by construction, not by a special case."""
+def _is_guard_node(node: ast.AST, parents: dict) -> bool:
+    """True when `node` (a `Compare` OR a bare `Call`, FIX-GATE G1/B4#4) is, or sits under,
+    through any chain of `and`/`or`/`not`, the `test` of an `if` or an `assert` -- the two
+    shapes that decide pass/fail. A `while`/`for` test walks up to a node type this never
+    returns True for, so a poll-until-deadline loop is excluded by construction, not by a
+    special case. (Named `_is_guard_compare` before G1 widened it past `Compare` alone;
+    kept as an alias below for anything that still spells the old name.)"""
     cur = node
     while True:
         p = parents.get(cur)
@@ -128,6 +136,40 @@ def _is_guard_compare(node: ast.Compare, parents: dict) -> bool:
         return False
 
 
+_is_guard_compare = _is_guard_node   # pre-G1 name, same predicate widened to cover Call too
+
+
+def _called_names(node: ast.AST) -> set:
+    """Every bare-name call target inside `node` -- `foo(...)`, not `obj.foo(...)` (an
+    attribute call is out of this scanner's same-file call-graph scope by construction)."""
+    names = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+            names.add(sub.func.id)
+    return names
+
+
+def _reachable(start: str, funcs: dict) -> set:
+    """FIX-GATE G1 (B4#1): the set of top-level functions `start` can reach through
+    same-file bare-name calls, `start` included -- a BFS over the module's own tiny call
+    graph, capped implicitly by `funcs`'s size (no external/attribute call is ever
+    followed). This is what lets a guard living in a SIBLING helper (`_assert_fast_enough`)
+    or a wall-clock reading living in one (`_measure`) still get attributed to the test that
+    calls it, instead of only ever looking inside the `test_*` function's own AST subtree."""
+    seen = {start}
+    stack = [start]
+    while stack:
+        cur = stack.pop()
+        fn = funcs.get(cur)
+        if fn is None:
+            continue
+        for callee in _called_names(fn):
+            if callee in funcs and callee not in seen:
+                seen.add(callee)
+                stack.append(callee)
+    return seen
+
+
 def _seg(source: str, node: ast.AST) -> str:
     try:
         return ast.get_source_segment(source, node) or ""
@@ -136,34 +178,68 @@ def _seg(source: str, node: ast.AST) -> str:
 
 
 def scan_source(source: str, filename: str = "<string>") -> list:
-    """Every `(func_name, lineno, compare_text)` this scanner flags in one file's source --
-    a top-level `def test_*` NOT decorated `@pytest.mark.timing`/`@pytest.mark.slow`, whose
-    own body reads a wall-clock value AND contains a guard `Compare` (see `_is_guard_compare`)
-    with a duration-shaped operand. Returns `[("<parse-error>", 0, str(e))]` on a file that
-    does not parse, rather than raising -- a scan helper crashing the ratchet on a stray file
-    is worse than one that reports the file as its own finding."""
+    """Every `(func_name, lineno, guard_text)` this scanner flags in one file's source -- a
+    top-level `def test_*` NOT decorated `@pytest.mark.timing`/`@pytest.mark.slow`, that can
+    REACH (itself, or through same-file bare-name calls, `_reachable`) a wall-clock reading
+    AND a guard -- a `Compare`, or a bare `Call` used directly as a boolean test (FIX-GATE
+    G1/B4#4: `assert math.isclose(...)` has no `Compare` node at all) -- with a
+    duration-shaped operand.
+
+    FIX-GATE G1 widened this past a single function's own AST subtree (B4#1): the guard and
+    the wall-clock reading can each live in a DIFFERENT top-level function from the test
+    (a shared `_assert_fast_enough(r, elapsed, bound)` helper; a `_measure()` helper that
+    times something and hands back only a float) -- `_reachable(test_name, funcs)` computes
+    the set of same-file functions the test can reach by a plain `name(...)` call, and both
+    conditions (a wall-clock source somewhere in that reachable set; a guard, anywhere in
+    it) are now checked over the WHOLE set, not just the test's own body.
+
+    Returns `[("<parse-error>", 0, str(e))]` on a file that does not parse, rather than
+    raising -- a scan helper crashing the ratchet on a stray file is worse than one that
+    reports the file as its own finding."""
     try:
         tree = ast.parse(source, filename)
     except Exception as e:
         return [("<parse-error>", 0, str(e))]
-    parents = _parent_map(tree)
+
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
     hits = []
-    for node in tree.body:
-        if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+    for name, node in funcs.items():
+        if not name.startswith("test_"):
             continue
         dec_text = " ".join(_seg(source, d) for d in node.decorator_list)
         if _MARKER_RE.search(dec_text):
             continue
-        func_text = _seg(source, node)
-        if not _WALLCLOCK_SRC_RE.search(func_text):
+        reachable = _reachable(name, funcs)
+        if not any(_WALLCLOCK_SRC_RE.search(_seg(source, funcs[n])) for n in reachable):
             continue
-        for sub in ast.walk(node):
-            if not isinstance(sub, ast.Compare) or not _is_guard_compare(sub, parents):
-                continue
-            operands = [sub.left] + list(sub.comparators)
-            texts = [_seg(source, o) for o in operands]
-            if any(_DURATION_RE.search(t) or _WALLCLOCK_SRC_RE.search(t) for t in texts):
-                hits.append((node.name, sub.lineno, _seg(source, sub)))
+        for fn_name in reachable:
+            fn = funcs[fn_name]
+            parents = _parent_map(fn)
+            for sub in ast.walk(fn):
+                if isinstance(sub, ast.Compare):
+                    if not _is_guard_node(sub, parents):
+                        continue
+                    operands = [sub.left] + list(sub.comparators)
+                elif isinstance(sub, ast.Call):
+                    # ATTRIBUTE calls only (`math.isclose(...)`, `self.assertAlmostEqual(...)`,
+                    # a `.timeit(...)` bound method): every real B4#4 shape is a named method
+                    # on something, never a bare builtin. Excluding a bare-Name call (`any(...)`,
+                    # `all(...)`, `len(...)`, `isinstance(...)`) is deliberate, not an oversight:
+                    # those are generic aggregation/introspection over an ALREADY-computed
+                    # boolean/value, structurally different from a call that IS the magnitude
+                    # comparison -- and, concretely, `scan_source`'s own
+                    # `if any(_DURATION_RE.search(t) or ... for t in texts):` line would
+                    # otherwise self-flag (its generator argument's SOURCE TEXT contains the
+                    # substring "duration", case-insensitively, purely because that is this
+                    # scanner's own variable name) the moment this file scans itself.
+                    if not isinstance(sub.func, ast.Attribute) or not _is_guard_node(sub, parents):
+                        continue
+                    operands = list(sub.args) + [kw.value for kw in sub.keywords]
+                else:
+                    continue
+                texts = [_seg(source, o) for o in operands]
+                if any(_DURATION_RE.search(t) or _WALLCLOCK_SRC_RE.search(t) for t in texts):
+                    hits.append((name, sub.lineno, _seg(source, sub)))
     return hits
 
 
@@ -314,6 +390,128 @@ def test_synthetic_unrelated_ratio(r):
                "fired on a neighbour that should stay green: " + "; ".join(tripped))
     else:
         r.ok(f"fired on both real shapes, stayed green on {len(must_stay_green)} neighbours")
+
+
+def test_gate47_g1_closes_four_confirmed_blind_spots(r: SubTestResult):
+    """FIX-GATE G1 (B4 findings #1 and #3 and #4): each confirmed blind-spot shape,
+    reproduced exactly as the finding described it, must now scan red; a neighbour that
+    merely shares some of the same pieces must stay green. (B4#2, the Call-vs-Compare gap
+    for `pytest.approx` used the idiomatic way, was already reported NOT a defect -- `assert
+    x == pytest.approx(y)` is still a `Compare` and was already caught; nothing to widen
+    there.)"""
+    print("\n--- GATE-47 (G1): the confirmed scanner blind spots are closed ---")
+
+    must_red = {
+        "B4#1a: a guard living in a sibling top-level helper": '''
+def _assert_fast_enough(r, elapsed, bound):
+    if elapsed <= bound:
+        r.ok("fast enough")
+    else:
+        r.fail("too slow", "nope")
+
+
+def test_g1_sibling_helper_guard(r):
+    import time
+    t0 = time.perf_counter()
+    do_thing()
+    cached_elapsed = time.perf_counter() - t0
+    _assert_fast_enough(r, cached_elapsed, 1.0)
+''',
+        "B4#1b: a helper that times something and hands back only a float": '''
+def _measure():
+    import time
+    t0 = time.perf_counter()
+    do_thing()
+    return time.perf_counter() - t0
+
+
+def test_g1_helper_returns_float(r):
+    cached_elapsed = _measure()
+    if cached_elapsed <= 1.0:
+        r.ok("fast enough")
+    else:
+        r.fail("too slow", "nope")
+''',
+        "B4#3a: timeit.repeat(...)": '''
+def test_g1_timeit_repeat(r):
+    import timeit
+    times = timeit.repeat(lambda: do_thing(), number=100, repeat=3)
+    fastest_ms = min(times) * 1000
+    if fastest_ms < 50.0:
+        r.ok("fast enough")
+    else:
+        r.fail("too slow", "nope")
+''',
+        "B4#3b: Timer(...).timeit(...)": '''
+def test_g1_timer_dot_timeit(r):
+    import timeit
+    t = timeit.Timer(lambda: do_thing())
+    elapsed = t.timeit(number=100)
+    if elapsed < 1.0:
+        r.ok("fast enough")
+    else:
+        r.fail("too slow", "nope")
+''',
+        "B4#4: a bare Call (math.isclose) used directly as an assert's test": '''
+def test_g1_call_shaped_guard(r):
+    import time, math
+    t0 = time.perf_counter()
+    do_thing()
+    cached_elapsed = time.perf_counter() - t0
+    bound = 1.0
+    assert math.isclose(cached_elapsed, bound, rel_tol=0.2)
+    r.ok("close enough")
+''',
+    }
+
+    must_stay_green = {
+        "a sibling helper that is never called (unreachable, not a false negative)": '''
+def _unused_helper(r, elapsed, bound):
+    if elapsed <= bound:
+        r.ok("fast enough")
+    else:
+        r.fail("too slow", "nope")
+
+
+def test_g1_neighbour_unused_helper(r):
+    result = compute_ratio()
+    if result > 2.0:
+        r.ok("good ratio")
+    else:
+        r.fail("bad ratio", "nope")
+''',
+        "a Call-shaped guard whose arguments are not duration-shaped": '''
+def test_g1_neighbour_call_guard_no_duration(r):
+    import time, math
+    t0 = time.perf_counter()
+    do_thing()
+    _ = time.perf_counter() - t0
+    assert math.isclose(pixel_count(), 2.0, rel_tol=0.1)
+    r.ok("close enough")
+''',
+        "a bare-Name Call (any/all) used as a guard, not an attribute call": '''
+def test_g1_neighbour_bare_name_call_guard(r):
+    import time
+    t0 = time.perf_counter()
+    do_thing()
+    elapsed_flags = [True, False]
+    if any(elapsed_flags):
+        r.ok("at least one flag")
+    else:
+        r.fail("no flags", "nope")
+''',
+    }
+
+    missed = [label for label, src in must_red.items() if not scan_source(src, "<synthetic>")]
+    tripped = [label for label, src in must_stay_green.items() if scan_source(src, "<synthetic>")]
+    if missed:
+        r.fail("GATE-47 G1 blind spots (still inert)", "did not fire on: " + "; ".join(missed))
+    elif tripped:
+        r.fail("GATE-47 G1 blind spots (over-tight)",
+               "fired on a neighbour that should stay green: " + "; ".join(tripped))
+    else:
+        r.ok(f"all {len(must_red)} confirmed blind-spot shapes now scan red; "
+             f"{len(must_stay_green)} neighbours stay green")
 
 
 def test_gate47_ratchet_catches_the_v046_ci_failure_shape(r: SubTestResult):
