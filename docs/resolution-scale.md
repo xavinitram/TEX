@@ -298,16 +298,28 @@ tolerance) across a sigma sweep from 0 up to the threshold, CPU and CUDA
 padding and conv passes as every release before this policy existed.
 
 **Above the threshold, an automatic downscale-pyramid approximation runs instead** ("Nuke
-quality": halve the image via a box-filter downsample until the residual sigma at that level
-is at or below `GAUSS_BLUR_PYRAMID_QUALITY_CAP` (8.0), blur EXACTLY at that small residual
-sigma via the same exact code path used below the threshold, upsample back bilinear). This
-exists because the exact convolution's cost grows with sigma (kernel width is
-`2*ceil(3*sigma)+1`) without bound, to the point of being unusable at the radii an
-"arbitrarily large blur" request implies — a single 4k call already costs over a second past
-sigma≈256 on a measured box, and grows into the tens of seconds by the low thousands. The
-pyramid path's cost is flat instead: `O(image size)` once, independent of sigma, because the
-number of halvings is `O(log2(sigma))` and each level is a quarter the pixels of the one
-before it.
+quality": reduce the image in ONE `interpolate(mode='area')` call to a size sized by a
+downsample `factor` computed from `sigma`/`GAUSS_BLUR_PYRAMID_QUALITY_CAP` alone — never from
+the image's own dimensions, fixed by FIX-APPROX A2 after B2's bug hunt found the original
+per-level `avg_pool2d` cascade's stopping condition could revert to `O(sigma)` cost on a fixed
+image size — blur EXACTLY at that residual sigma via the same exact code path used below the
+threshold, upsample back bilinear). This exists because the exact convolution's cost grows
+with sigma (kernel width is `2*ceil(3*sigma)+1`) without bound, to the point of being unusable
+at the radii an "arbitrarily large blur" request implies — a single 4k call already costs over
+a second past sigma≈256 on a measured box, and grows into the tens of seconds by the low
+thousands. The pyramid path's cost is flat instead: `O(image size)` once, independent of
+sigma, confirmed flat from sigma=1e4 to sigma=1e9 on a 1080p image after A2's fix (~2ms
+throughout; the pre-A2 shape rose to 707.5ms at sigma=1e9).
+
+**A windowed, tiled, or DAG-joined cook of a call past the threshold is served whole-frame,
+never narrowed (FIX-APPROX A1).** The pyramid's resample grid is anchored to whatever crop it
+is handed, not the frame's absolute coordinates, so a window that has not grown to the whole
+frame would sample on a different phase than a whole-frame cook of the same program — a
+genuine, silently-wrong divergence (measured up to ~8e-5 maxdiff), not a rounding footnote.
+`gauss_blur`'s footprint declares this threshold to the ROI/tiling/`cook_stage_dag` planner
+(`tex_roi._reach_of`'s `approx_above`), which declines to narrow past it — the identical
+decline a symbolic (non-foldable) sigma already got. Below the threshold this is unaffected:
+the window still narrows and still matches a whole-frame crop exactly.
 
 **Both constants were picked by measurement** (a fuzzer sweep over an 8-pixel-period checker
 and a smooth-gradient-plus-hard-edged-rectangles corpus — the same two-input protocol this
@@ -333,6 +345,81 @@ policy's threshold check ever runs (the same call-site multiply described under 
 covered"), so a coarse-scale cook simply tends to land in the cheap/exact regime more often —
 no new scale-awareness was needed in this policy, and nothing here changes `scale=`'s own R1
 bands or its ROI/tier-decline behaviour.
+
+## `bilateral_filter` past the exact window (BILAT-50)
+
+`bilateral_filter(img, spatial_sigma, range_sigma)`'s signature and registry entry are
+unchanged. The old `radius = min(ceil(3·spatial_sigma), 3)` silently clamped every
+`spatial_sigma` past ~1.0 to whatever a 7×7 window gives; the clamp is gone.
+
+**At or below `spatial_sigma ≈ 1.0` (radius ≤ 3), nothing changed: byte-for-byte the same
+math as every release before this ask.** From radius 4 up to `_BILATERAL_EXACT_RADIUS_MAX`
+(24, i.e. `spatial_sigma` up to ~8.0) the filter runs the SAME exact weighted-average formula,
+row-tiled to keep peak memory bounded independent of resolution (proven bit-identical to an
+untiled pass at any tile size). Past that — the exact filter's own `O(radius²)` memory blowup
+makes even a tiled exact pass too slow — a downscale + detail-transfer approximation takes
+over: reduce until the residual `spatial_sigma` lands back inside the ORIGINAL exact 7×7
+window, filter there exactly, upsample, and add back the full-resolution high-frequency detail
+the downscale discarded.
+
+**A windowed, tiled, or DAG-joined cook past the detail-transfer threshold is served
+whole-frame, never narrowed (FIX-APPROX A1)** — the identical mechanism and the identical
+reason as `gauss_blur`'s own decline above: the detail-transfer resample grid is anchored to
+whatever crop it is handed, so a non-saturating window would otherwise sample on a different
+phase than a whole-frame cook (measured up to 0.0265 maxdiff — the larger of the two builtins'
+divergences). Below the threshold this is unaffected.
+
+**The declared footprint matches the exact tiers' own true reach exactly (FIX-APPROX A4)**:
+the reach multiplier is `3.0` (`radius = ceil(3·spatial_sigma)`), not a larger number picked to
+conservatively cover the approximate tier too — A1's decline already handles that tier by
+refusing to narrow at all, so nothing needs a conservative cover here.
+
+## Perceptual accuracy past the approximation thresholds (SSIMULACRA2, FIX-APPROX A6)
+
+The R1 promise above and GAUSSPYR-50/BILAT-50's own bands are all max-abs on a `[0,1]` channel
+range — a mathematically precise but perceptually opaque number. This table adds
+[SSIMULACRA2](https://github.com/cloudinary/ssimulacra2) (0–100, higher is better; ~90 is
+"visually lossless," ~70 is "hard to notice artifacts without comparison to the original"),
+measured on ONE shared corpus for both approximations (unifying GAUSSPYR-50's and BILAT-50's
+previously independent checker/smooth+edges helpers, R1#4): an 8-pixel-period checker
+(adversarial), a smooth-gradient-plus-hard-edged-rectangles image, and a new "realistic" plate
+(a sinusoidal+linear gradient base, six hard-edged rectangles, and band-limited synthetic
+noise — closer to a real comp's natural-statistics content than either of the other two). All
+three are sRGB-gamma-encoded to 8-bit PNG before scoring (SSIMULACRA2 expects display-referred
+input); the approximation is compared against the best available exact reference — the exact
+convolution below `gauss_blur`'s own threshold, the exact tier's own boundary filter
+(radius=24) for `bilateral_filter` past its threshold, since a true exact reference is not
+computable there at all (§ above). 1080p (1080×1080), CPU, this box.
+
+| builtin | corpus | magnitude | max-abs | SSIMULACRA2 |
+|---|---|---:|---:|---:|
+| `gauss_blur` | checker | sigma=260 (just past) | 0.128 | 77.6 |
+| `gauss_blur` | checker | sigma=1024 (well past) | 0.209 | 39.0 |
+| `gauss_blur` | smooth+edges | sigma=260 | 0.034 | 87.2 |
+| `gauss_blur` | smooth+edges | sigma=1024 | 0.049 | 84.9 |
+| `gauss_blur` | realistic | sigma=260 | 0.036 | 85.6 |
+| `gauss_blur` | realistic | sigma=1024 | 0.041 | 84.9 |
+| `bilateral_filter` | checker | ss=8.5 (just past) | 0.0004 | 97.7 |
+| `bilateral_filter` | checker | ss=64 (well past) | 0.0001 | 100.0 |
+| `bilateral_filter` | smooth+edges | ss=8.5 | 0.078 | 56.2 |
+| `bilateral_filter` | smooth+edges | ss=64 | 0.083 | 50.4 |
+| `bilateral_filter` | realistic | ss=8.5 | 0.087 | 43.4 |
+| `bilateral_filter` | realistic | ss=64 | 0.110 | 25.0 |
+
+**Reading the table**: `gauss_blur`'s pyramid holds up well on both realistic corpora
+(smooth+edges and realistic both stay in the "high quality" 80s regardless of how far past the
+threshold sigma goes) and only degrades on the adversarial checker at a very large sigma — the
+same "checker isn't reliably the worse case until it is" pattern this document's R1 table
+already records elsewhere. `bilateral_filter`'s detail-transfer path scores much lower on both
+realistic corpora (40s-50s, "low-to-medium quality") than its own max-abs band alone would
+suggest — the max-abs number (0.08-0.11) sits inside BILAT-50's own accepted band, but the
+edge-preserving filter's whole PURPOSE is to keep hard boundaries crisp, and SSIMULACRA2 is
+more sensitive to boundary/detail mismatches than a uniform per-pixel max-abs is. This is a
+real, disclosed quality gap on top of BILAT-50's own numbers, not a new bug: the mechanism
+(add back the full-resolution detail a downscale discarded) is a bounded-cost STAND-IN for a
+true joint bilateral upsample (RADIUS-50a-design.md D3, option 2 — not built, no evidence yet
+that a real workflow needs it), and this table is the disclosure that stand-in owes past its
+own max-abs band.
 
 ## Precision under scale
 
