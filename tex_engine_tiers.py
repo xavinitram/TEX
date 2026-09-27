@@ -306,21 +306,53 @@ def _run_default(ctx):
     # UC-2: default-route an exact (fetch/conv) stencil through the codegen tier
     # (avg_pool2d/conv2d/unfold). _codegen_only_execute self-falls-back; the outer
     # guard covers env-build edge cases so this can never hard-fail the node.
+    #
+    # FIX-TIER T3 (R4#3): this is the ONE call site for "does this default-tier cook use
+    # the UC-2 stencil route" — scale-active or not. Before this fix `_run_tier` carried a
+    # SECOND, independently-maintained copy of this exact decision (same
+    # `_should_stencil_route` + `_codegen_only_execute` pair) reached only when
+    # `ctx.scale is not None`, unwrapped in any try/except of its own. `ctx.scale` is
+    # `None` on every ordinary ComfyUI cook, so `scale=ctx.scale` below is a no-op there
+    # (`_codegen_only_execute`'s own default), and `precision` is passed only when scale
+    # is active — matching the two call sites' PRE-EXISTING behavior exactly (the
+    # scale=None route has never pinned a precision here, relying on
+    # `_codegen_only_execute`'s own `"fp32"` default; only the scale-active route ever
+    # passed `ctx.eff_precision`), so merging them changes no byte on either path.
     if not ctx.fused_chain:
         try:
             if _tex_engine._should_stencil_route(ctx.fp, ctx.program):
-                return _tex_engine._codegen_only_execute(
-                    ctx.program, ctx.bindings, ctx.type_map, ctx.device,
+                _cg_kwargs = dict(
                     latent_channel_count=ctx.latent_channel_count,
                     output_names=ctx.output_names,
                     used_builtins=ctx.used_builtins, fingerprint=ctx.fp,
                     time_context=ctx.time_context,
-                    cancel=ctx.cancel)  # CANCEL-44 (Gap 2): this route had no yield point
+                    cancel=ctx.cancel, scale=ctx.scale)  # CANCEL-44 (Gap 2): had no yield point
+                if ctx.scale is not None:
+                    _cg_kwargs["precision"] = ctx.eff_precision
+                return _tex_engine._codegen_only_execute(
+                    ctx.program, ctx.bindings, ctx.type_map, ctx.device, **_cg_kwargs)
         except _tex_engine.CookCancelled:
             raise                       # SCHED-3: a cancel aborts — never fall back to interp
         except Exception as _stencil_exc:
             logger.warning("[TEX] stencil codegen route failed (%s); using "
                            "interpreter.", _stencil_exc)
+    if ctx.scale is not None:
+        # SCALE-47b/SCALE-CG-48: the stencil route above already gave a scale-active cook
+        # every chance to run on codegen; once it declines, tiling/ROI narrowing stay OUT
+        # of scope for scale (SCALE-COMPILED-48 and the tiling generalization are both
+        # deferred past v0.48) — cook whole-frame on the plain interpreter rather than
+        # falling into the tiling ladder below, which has never threaded a scale
+        # multiplier and was never exercised by a scale-active cook before this ask.
+        from .tex_runtime import tier_trace
+        tier_trace.record("interpreter", fallback_from="default",
+                          reason="scale is active (SCALE-47b runs on the interpreter tier only)")
+        interp = _tex_engine._get_interpreter()
+        return interp.execute(ctx.program, ctx.bindings, ctx.type_map, device=ctx.device,
+                              source=("" if ctx.fused_chain else ctx.code),
+                              latent_channel_count=ctx.latent_channel_count,
+                              output_names=ctx.output_names, used_builtins=ctx.used_builtins,
+                              precision=ctx.eff_precision, time_context=ctx.time_context,
+                              cancel=ctx.cancel, on_progress=ctx.on_progress, scale=ctx.scale)
     interp = _tex_engine._get_interpreter()
     # M-4: under GPU memory pressure, run a tile-safe program in horizontal strips
     # (peak transient ~1/n). Falls back to the whole-image cook on any strip error.
@@ -400,9 +432,9 @@ def _run_tier(ctx, tier_id):
     is forced onto the plain interpreter instead.
 
     A scale-active cook whose `tier_id == "default"` is NOT forced to the interpreter
-    unconditionally: it routes to codegen instead whenever the "default" tier's own
-    internal codegen shortcut would already fire (`_should_stencil_route`, the UC-2
-    exact-fetch stencil gate) — codegen's `pixel_args=`-tagged call sites emit
+    unconditionally: `_run_default` (this module) is itself scale-aware and owns the
+    ONE decision of whether this cook routes to codegen instead (`_should_stencil_route`,
+    the UC-2 exact-fetch stencil gate) — codegen's `pixel_args=`-tagged call sites emit
     `arg * _env['__tex_scale']` as a runtime value, never a folded literal
     (`tex_runtime/codegen.py`), so that route is scale-safe. `_should_stencil_route` is
     the ONLY concrete "would codegen run here" test the default tier has today
@@ -410,24 +442,17 @@ def _run_tier(ctx, tier_id):
     `_codegen_only_execute` self-falls-back to the interpreter (forwarding `scale`) on
     any decline/failure, so this can never hard-fail or silently drop scale. Tiling and
     ROI narrowing stay out of scope for a scale-active cook: it always cooks whole-frame
-    (this branch never threads `ctx.roi`).
+    (`_run_default` never threads `ctx.roi` once `ctx.scale is not None`).
 
     Recorded via `tier_trace` on every path (`_codegen_only_execute` records "codegen" on
-    success, "interpreter" fallback_from="codegen" on decline; the plain interpreter
-    branch below records "interpreter" fallback_from=tier_id) — never a silent fallback.
-    `ctx.scale is None` (every ComfyUI cook) never reaches this function's body at all —
-    one `is not None` check, no behaviour change on the default (`scale=None`) path."""
-    if ctx.scale is not None:
+    success, "interpreter" fallback_from="codegen" on decline; `_run_default`'s own
+    scale-active interpreter branch records "interpreter" fallback_from="default";
+    the OTHER three tiers' unconditional bypass below records "interpreter"
+    fallback_from=tier_id) — never a silent fallback. `ctx.scale is None` (every ComfyUI
+    cook) never reaches either of `_run_default`'s scale-branches — one `is not None`
+    check, no behaviour change on the default (`scale=None`) path."""
+    if ctx.scale is not None and tier_id != "default":
         from .tex_runtime import tier_trace
-        if (tier_id == "default" and not ctx.fused_chain
-                and _tex_engine._should_stencil_route(ctx.fp, ctx.program)):
-            out = _tex_engine._codegen_only_execute(
-                ctx.program, ctx.bindings, ctx.type_map, ctx.device,
-                latent_channel_count=ctx.latent_channel_count,
-                output_names=ctx.output_names, used_builtins=ctx.used_builtins,
-                precision=ctx.eff_precision, fingerprint=ctx.fp,
-                time_context=ctx.time_context, cancel=ctx.cancel, scale=ctx.scale)
-            return out if isinstance(out, dict) else {ctx.output_names[0]: out}
         tier_trace.record("interpreter", fallback_from=tier_id,
                           reason="scale is active (SCALE-47b runs on the interpreter tier only)")
         interp = _tex_engine._get_interpreter()
@@ -438,6 +463,8 @@ def _run_tier(ctx, tier_id):
                              precision=ctx.eff_precision, time_context=ctx.time_context,
                              cancel=ctx.cancel, on_progress=ctx.on_progress, scale=ctx.scale)
         return out if isinstance(out, dict) else {ctx.output_names[0]: out}
+    # tier_id == "default" (scale active or not) dispatches here too: _run_default owns
+    # the scale-aware UC-2 stencil-route decision itself (FIX-TIER T3).
     out = _TIER_METHOD[tier_id](ctx)
     return out if isinstance(out, dict) else {ctx.output_names[0]: out}
 
