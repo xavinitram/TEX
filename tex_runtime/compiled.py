@@ -515,17 +515,20 @@ def execute_compiled(
     """
     device_obj = _canon_device(device)
     device_type = device_obj.type  # "cpu" or "cuda"
-    # SCALECX-49: `scale` is an EXPLICIT, trailing cache-key component, appended only when
-    # it is not `None` — a `scale=None` cook keys exactly as before (invariant 7). A
-    # scale-active cook's `pixel_args=`-tagged builtins resolve a scaled radius that Inductor
-    # would otherwise trace/specialize on as a plain Python float closed over the compiled
-    # callable (a recompile per distinct value, the "noise dance" SCALE-47a already named and
-    # rejected) — keying the compiled ARTIFACT itself by `scale` instead makes that bounded and
-    # explicit: one compiled artifact per distinct scale value actually requested (like a
-    # distinct canvas shape already gets its own artifact today), reused on every repeat of
-    # that same value, never recompiled per call.
-    cache_key = ((fingerprint, device_type, precision) if scale is None
-                else (fingerprint, device_type, precision, scale))
+    # FIX-SCALECX X2 (R3#1, R4#4): `scale` is a RUNTIME input to the compiled callable, not
+    # a cache-key component — the pre-fix key (`(fingerprint, device_type, precision,
+    # scale)`) made a compiled ARTIFACT per distinct scale value, so a sweep of N distinct
+    # values paid a real `torch.compile()` wrap + trace N times (measured 2.9x-5.5x slower
+    # than a single shared artifact, R3#1) — the exact "recompile per distinct value" trap
+    # SCALE-47a already named and rejected for the interpreter/codegen path, reopened here by
+    # SCALECX-49's own cache-key choice. `scale` never needs to be part of this identity: the
+    # compiled callable (`_codegen_exec`/`_codegen_exec_eager`) takes `scale` as an ordinary
+    # call ARGUMENT and rebuilds its codegen env fresh on every call (`_build_codegen_env(...,
+    # scale=scale)`, unlike a CUDA-graph capture, which bakes a value permanently into a
+    # replayed buffer/shape) — sharing ONE artifact across every scale value a session
+    # requests is correct, not merely convenient. `scale=None`/`scale=1.0` key identically to
+    # every other value now (there is no separate branch to normalise — B2#3 is moot here).
+    cache_key = (fingerprint, device_type, precision)
 
     # ── Blacklist: skip programs that previously crashed torch.compile
     if fingerprint in _compile_blacklist:
@@ -1024,15 +1027,21 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     trial the compiled fn, and commit only on a measured win. Never blocks on
     the compile; never routes to a slower tier than codegen-only.
 
-    `scale` (SCALECX-49): `None` (every ordinary ComfyUI cook) keys and behaves exactly as
-    before this ask (invariant 7). A scale-active cook is filed under its own `cache_key`/
-    autotier `key` bucket (see `autotier.make_key`'s own docstring) so a scale-active trial
-    never contaminates — or gets demoted by — a differently-scaled cook of the same program."""
+    `scale` (SCALECX-49, cache-key threading corrected by FIX-SCALECX X2): `None` (every
+    ordinary ComfyUI cook) behaves exactly as before this ask (invariant 7). The COMPILED
+    ARTIFACT (`cache_key`, below) is shared across every scale value for the identical reason
+    `execute_compiled` shares one — `scale` is a runtime call argument the compiled callable
+    re-reads every cook, never baked into the artifact's identity. Only the autotier
+    PERFORMANCE-VERDICT bucket (`key`, via `autotier.make_key`) still files a scale-active
+    trial separately, deliberately: `autotier.make_key`'s own docstring explains why a
+    trial/commit measured at one scale must never contaminate — or be demoted by — a
+    differently-scaled cook's OWN measured timing."""
     from . import autotier
     device_obj = torch.device(device)
     device_type = device_obj.type
-    cache_key = ((fingerprint, device_type, precision) if scale is None
-                else (fingerprint, device_type, precision, scale))
+    # FIX-SCALECX X2 (R3#1): see execute_compiled's identical fix -- the compiled artifact
+    # itself needs no scale component; only autotier's own verdict bucket (`key`, below) does.
+    cache_key = (fingerprint, device_type, precision)
 
     # CF-6: the tier verdict is filed under a resolution BUCKET, so it has to be the resolution
     # the cook actually grids. This site kept its own first-wins loop 200 lines below the one

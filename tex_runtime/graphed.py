@@ -626,7 +626,22 @@ def _capture_key(fingerprint, device, precision, bindings, output_names,
     a different scale, silently wrong (the bug `test_scalecx49_capture_mismatch_before_fix`
     below proves). Bounded: the number of distinct captures grows with the number of DISTINCT
     scale values a session actually requests (like a distinct canvas shape already does today),
-    never per call — a repeated request at an already-seen scale is a cache hit, not a recapture."""
+    never per call — a repeated request at an already-seen scale is a cache hit, not a recapture.
+
+    FIX-SCALECX X2 (R3#1/R4#3, B2#3): `scale=1.0` normalises to the byte-identical `scale=None`
+    case (same "invariant 7 no-op" language every other scale site uses) — but UNLIKE
+    `execute_compiled`/`run_auto` (FIX-SCALECX X2's companion fix), any OTHER active value keeps
+    its own key component here rather than becoming a pure runtime input: a CUDA-graph capture
+    REPLAYS a fixed sequence of kernel launches against fixed buffer shapes recorded once at
+    capture time, so a radius baked in as a SHAPE cannot be re-read from a later, differently-
+    scaled call the way `execute_compiled`'s codegen env is rebuilt fresh every cook — this tier
+    genuinely cannot take a shape-determining `scale` as a pure runtime input without capturing a
+    NEW graph per distinct radius regardless (`docs/resolution-scale.md` says so plainly). The key
+    space this produces is bounded by VRAM, not by an unbounded count: `_graph_cache`'s own
+    byte-budget eviction (`_GRAPH_BYTES_BUDGET`, below) already reclaims the OLDEST entry once
+    total captured memory crosses the budget, the same bound every other distinct canvas shape
+    already lives under — a scale sweep is not a new unbounded-growth axis, it is more values
+    sharing the SAME existing bound."""
     dev = torch.device(device)
     tensor_sig = []
     scalar_names = []
@@ -646,7 +661,7 @@ def _capture_key(fingerprint, device, precision, bindings, output_names,
     base = (fingerprint, dev.index if dev.index is not None else torch.cuda.current_device(),
             precision, tuple(sorted(tensor_sig)), tuple(sorted(scalar_names)),
             tuple(output_names) if output_names else (), latent_channel_count)
-    return base if scale is None else base + (float(scale),)
+    return base if scale is None or scale == 1.0 else base + (float(scale),)
 
 
 def _dev_index(device) -> int:

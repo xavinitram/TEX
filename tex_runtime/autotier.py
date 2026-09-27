@@ -106,10 +106,15 @@ def make_key(fingerprint: str, device_type: str, precision: str,
     ask, byte-for-byte (invariant 7). A scale-active verdict is filed under its OWN bucket so
     a trial/commit measured at one scale never gets reused (or demoted) by a cook at a
     DIFFERENT scale — the two are not the same workload, since scale changes the resolved
-    kernel size of every `pixel_args=`-tagged builtin the program calls."""
+    kernel size of every `pixel_args=`-tagged builtin the program calls.
+
+    FIX-SCALECX X2 (B2#3): `scale=1.0` normalises to the SAME bucket as `scale=None` — both
+    are the documented byte-identical no-op (invariant 7's own language,
+    `docs/resolution-scale.md`), so `1.0` must not mint its own bucket distinct from the
+    scale-inactive one."""
     from .profile import bucket_of
     base = (fingerprint, device_type, precision, bucket_of(spatial_shape)[0])
-    return base if scale is None else base + (scale,)
+    return base if scale is None or scale == 1.0 else base + (scale,)
 
 
 def _get(key: tuple) -> _KeyState:

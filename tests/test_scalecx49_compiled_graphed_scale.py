@@ -125,6 +125,21 @@ def test_scalecx49_capture_key_scale_none_byte_identical(r: SubTestResult):
         r.fail("scalecx49 invariant 7", f"{k_omitted} != {k_explicit_none}")
 
 
+def test_scalecx49_capture_key_scale_1_0_normalises_to_none(r: SubTestResult):
+    """FIX-SCALECX X2 (B2#3): `scale=1.0` is the documented byte-identical-VALUE case
+    (invariant 7's own language) -- unlike a genuinely active value, it must key IDENTICALLY
+    to `scale=None`/omitted, not mint its own 8-tuple bucket. Red at 32f6917: `_capture_key`
+    treated `scale is not None` (true for 1.0) as sufficient to append a component."""
+    bindings = {"A": make_img(1, 8, 8, 3, seed=10)}
+    k_none = _graphed._capture_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0)
+    k_one = _graphed._capture_key("fp", torch.device("cuda:0"), "fp32", bindings, None, 0,
+                                  scale=1.0)
+    if k_none == k_one and len(k_one) == 7:
+        r.ok(f"scale=1.0 keys identically to scale=None (7-tuple): {k_one}")
+    else:
+        r.fail("scalecx49 X2 normalise-1.0", f"scale=None {k_none} != scale=1.0 {k_one}")
+
+
 def test_scalecx49_capture_key_bounded_by_distinct_scale_values(r: SubTestResult):
     """Bounded, not per-call: repeated requests at the SAME scale value produce the SAME
     key (a cache hit, not a new capture); only a genuinely different value produces a
@@ -185,12 +200,16 @@ def test_scalecx49_execute_compiled_cache_key_scale_none_unchanged(r: SubTestRes
         _clear_compiled_state()
 
 
-def test_scalecx49_execute_compiled_bounded_artifacts_across_scale_sweep(r: SubTestResult):
-    """The brief's own requirement, proven with an actual count: sweeping a REPEATED set of
-    scale values through `execute_compiled` must not compile once per CALL -- only once per
-    DISTINCT value. `_try_compile` is mocked (this box has no torch.compile backend --
-    AGENTS.md's workstation profile) so this isolates exactly the caching/threading change
-    this ask makes, not Inductor's own behaviour."""
+def test_scalecx49_execute_compiled_shares_one_artifact_across_a_scale_sweep(r: SubTestResult):
+    """FIX-SCALECX X2 (R3#1, R4#4): `scale` is a RUNTIME INPUT, not a cache-key component --
+    a sweep of DISTINCT scale values must compile ONCE (one shared artifact), never once per
+    distinct value. Red at 32f6917: this same sweep produced 3 compiles/3 cache entries for
+    3 distinct values (0.5, 0.25, None) -- R3#1's own measurement showed that costs a real
+    `torch.compile()` wrap+trace per value, 2.9x-5.5x slower than sharing one artifact.
+    `_try_compile` is mocked (this box has no reliable torch.compile backend for every CI
+    config -- AGENTS.md's workstation profile) so this isolates exactly the caching/threading
+    change this ask makes, not Inductor's own behaviour; the real-backend proof is the next
+    test below, unmocked."""
     _clear_compiled_state()
     program = _prog()
     calls = []
@@ -214,20 +233,21 @@ def test_scalecx49_execute_compiled_bounded_artifacts_across_scale_sweep(r: SubT
     _compiled._max_loop_depth = lambda p: 0
     try:
         fp = "fp_scalecx49_sweep"
-        for s in (0.5, 0.25, 0.5, 0.25, 0.5, None):
+        for s in (0.5, 0.25, 0.5, 0.25, 0.5, None, 1.0):
             bindings = {"A": make_img(1, 8, 8, 3, seed=5)}
             _compiled.execute_compiled(program, bindings, {}, "cpu", fp, scale=s)
         n_compiles = len(calls)
         n_cache_entries = len(_compiled._compiled_cache)
-        if n_compiles == 3 and n_cache_entries == 3:
-            r.ok(f"6 calls over 3 distinct scale values (0.5, 0.25, None) -> "
-                 f"{n_compiles} compiles, {n_cache_entries} cached artifacts (bounded)")
+        if n_compiles == 1 and n_cache_entries == 1:
+            r.ok(f"7 calls over 4 distinct scale values (0.5, 0.25, None, 1.0) -> "
+                 f"{n_compiles} compile, {n_cache_entries} cached artifact (shared, not "
+                 f"per-value)")
         else:
-            r.fail("scalecx49 bounded recompiles",
-                  f"expected 3 compiles/3 cache entries, got {n_compiles}/{n_cache_entries} "
+            r.fail("scalecx49 X2 shared artifact",
+                  f"expected 1 compile/1 cache entry, got {n_compiles}/{n_cache_entries} "
                   f"(calls={calls})")
-        if seen_scales == [0.5, 0.25, 0.5, 0.25, 0.5, None]:
-            r.ok("scale forwarded correctly to the compiled callable on every call "
+        if seen_scales == [0.5, 0.25, 0.5, 0.25, 0.5, None, 1.0]:
+            r.ok("scale forwarded correctly to the SHARED compiled callable on every call "
                  "(never dropped, never stale from a cached closure)")
         else:
             r.fail("scalecx49 scale threading", f"compiled callable saw {seen_scales}")
@@ -235,6 +255,52 @@ def test_scalecx49_execute_compiled_bounded_artifacts_across_scale_sweep(r: SubT
         _compiled._try_compile = real_try_compile
         _compiled._count_tensor_ops = real_count_ops
         _compiled._max_loop_depth = real_max_depth
+        _clear_compiled_state()
+
+
+def test_scalecx49_execute_compiled_real_backend_compiles_once_across_scale_sweep(r: SubTestResult):
+    """FIX-SCALECX X2's own requirement, unmocked: a program ABOVE `_COMPILE_OP_THRESHOLD`
+    that has no non-inlined stdlib call (so `_has_fn_calls` is False and real Inductor
+    tracing is actually reached, per FIX-SCALECX X1) -- pure arithmetic, no `pixel_args=`
+    builtin at all -- must compile through the REAL backend exactly ONCE across a sweep of
+    distinct scale values, not once per value. `scale` reaching the callable is still proven
+    the same way the mocked test above does; this test additionally proves the REAL
+    `torch.compile()` wrap itself is not repeated."""
+    if not _compiled.compile_capability().get(
+            "cuda_inductor" if torch.cuda.is_available() else "cpu_inductor"):
+        r.skip("scalecx49 X2 real-backend sweep", "no working torch.compile backend on this box")
+        return
+    _clear_compiled_state()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 20 chained additions: comfortably above _COMPILE_OP_THRESHOLD (8), no stdlib call at
+    # all (no _has_fn_calls graph-break), so this reaches real Inductor tracing.
+    code = "@OUT = @A" + " + 0.001" * 20 + ";\n"
+    bt = {"A": TEXType.VEC4}
+    prog = parse_and_split(code, bt)
+    tm = TypeChecker(binding_types=bt, source=code).check(prog)
+    fp = "fp_scalecx49_real_sweep"
+    real_try_compile = _compiled._try_compile
+    compiles = {"n": 0}
+
+    def _counting_try_compile(*a, **kw):
+        compiles["n"] += 1
+        return real_try_compile(*a, **kw)
+
+    _compiled._try_compile = _counting_try_compile
+    try:
+        for s in (0.5, 0.25, 0.5, 0.125, None):
+            A = make_img(1, 16, 16, 4, seed=11)
+            if device == "cuda":
+                A = A.cuda()
+            _compiled.execute_compiled(prog, {"A": A}, tm, device, fp, scale=s)
+        if compiles["n"] == 1:
+            r.ok(f"5 calls over 4 distinct scale values -> {compiles['n']} real "
+                 f"torch.compile() attempt (shared artifact, real backend)")
+        else:
+            r.fail("scalecx49 X2 real backend sweep",
+                  f"expected 1 real _try_compile call, got {compiles['n']}")
+    finally:
+        _compiled._try_compile = real_try_compile
         _clear_compiled_state()
 
 
@@ -275,6 +341,18 @@ def test_scalecx49_autotier_make_key_scale_none_unchanged(r: SubTestResult):
         r.ok(f"autotier key gains a trailing scale component when active: {k_active}")
     else:
         r.fail("scalecx49 autotier bucketing", f"{k_active} did not extend {k_old}")
+
+
+def test_scalecx49_autotier_make_key_scale_1_0_normalises_to_none(r: SubTestResult):
+    """FIX-SCALECX X2 (B2#3): `scale=1.0` must bucket identically to `scale=None` -- the
+    documented byte-identical no-op, not its own distinct 5-tuple bucket."""
+    from TEX_Wrangle.tex_runtime import autotier
+    k_none = autotier.make_key("fp", "cpu", "fp32", (1, 8, 8, 3))
+    k_one = autotier.make_key("fp", "cpu", "fp32", (1, 8, 8, 3), scale=1.0)
+    if k_none == k_one and len(k_one) == 4:
+        r.ok(f"scale=1.0 buckets identically to scale=None (4-tuple): {k_one}")
+    else:
+        r.fail("scalecx49 X2 autotier normalise-1.0", f"scale=None {k_none} != scale=1.0 {k_one}")
 
 
 # ── tier_verdict / _run_tier dispatch agreement (CPU-provable: no real GPU/compile

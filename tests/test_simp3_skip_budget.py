@@ -213,7 +213,15 @@ _SKIP_VOCAB = re.compile(
 #: graphed tiers against the interpreter at scale 1/half/quarter/eighth — and carry no CPU
 #: witness for either (a CUDA-graph capture is CUDA-only by construction), one `r.skip` site
 #: each, same reason every other CUDA-only row in this pin has one.
-_SKIP_BUDGET = 124
+#: Re-pinned from 124 to 125 (FIX-SCALECX X2): one new row in
+#: `test_scalecx49_compiled_graphed_scale.py`
+#: (`test_scalecx49_execute_compiled_real_backend_compiles_once_across_scale_sweep`) needs a
+#: working `torch.compile` backend (CPU or CUDA inductor) to prove the shared-artifact fix
+#: against a REAL compile, not a mock — its own mocked twin
+#: (`test_scalecx49_execute_compiled_shares_one_artifact_across_a_scale_sweep`) already runs
+#: everywhere with no `r.skip` and proves the identical caching/threading logic, so this row's
+#: only job is the stronger, unmocked proof on a box that has a toolchain; one `r.skip` site.
+_SKIP_BUDGET = 125
 
 
 def _literal(node) -> str:
