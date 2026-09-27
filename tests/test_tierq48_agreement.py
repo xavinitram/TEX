@@ -37,6 +37,13 @@ from test_scalecg48_codegen_scale import (
     _STENCIL_PLUS_BLUR as _STENCIL_PLUS_BLUR_CODE,
     _STENCIL_PLUS_BLUR_BT,
 )
+# COMPILETRY-50 (D1): `_torch_compile_graph_break` now consults the per-fingerprint
+# fall-through memo instead of predicting a graph-break unconditionally for every
+# `_has_fn_calls` program -- the tests near `_GAUSS_BLUR_CODE` below drive that memo
+# directly (via `TEXCache.fingerprint`, the same call `tier_verdict` makes internally)
+# to cover all three verdict states truthfully.
+from TEX_Wrangle.tex_cache import get_cache as _get_cache
+from TEX_Wrangle.tex_runtime import fncalls_compile as _fncalls_compile
 
 # An ROI-executable program (pointwise + one inline gauss_blur reading a $param) — the
 # same shape `benchmarks/roi_scrub_bench.py`/`roi_codegen_ab_bench.py` already use, kept
@@ -204,6 +211,14 @@ def test_tierq48_agrees_a_non_default_tier_never_arms_roi():
     `torch_compile`/`auto`/`cuda_graph` choice is each corrected exactly per X1's
     dedicated tests above; `roi_armed`/`roi_reason` are the invariant this test pins."""
     roi = (10, 10, 256, 256, 1024, 1024)
+    # COMPILETRY-50 (D1): the tier/reason this test's OWN docstring says is not its
+    # subject still needs a settled (known-bad) fall-through verdict to keep predicting
+    # "codegen" here, exactly like the dedicated tests above -- pinned False for the
+    # duration of this loop, restored after (`tier_verdict` passes no `binding_types`
+    # here, so the fingerprint is against an empty one, matching what it looks up).
+    fp = _get_cache().fingerprint(_ROI_CODE, {})
+    _fncalls_compile.reset_for_test()
+    _fncalls_compile._memo[fp] = False
     for compile_mode in ("torch_compile", "auto"):
         tier_id = select_tier(compile_mode, "cpu", False, False)
         assert tier_id == compile_mode
@@ -211,6 +226,7 @@ def test_tierq48_agrees_a_non_default_tier_never_arms_roi():
                          roi_exec=True, param_values={"amount": 0.4})
         assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
         assert not v.roi_armed and v.roi_reason == ROI_REASON_TIER_NOT_DEFAULT
+    _fncalls_compile.reset_for_test()
     # cuda_graph: select_tier only string-checks the device (no real GPU required).
     tier_id = select_tier("cuda_graph", "cuda:0", False, False)
     assert tier_id == "cuda_graph"
@@ -288,19 +304,71 @@ _GAUSS_BLUR_CODE = "@OUT = gauss_blur(@A, 6.0);\n"
 _GAUSS_BLUR_BT = {"A": TEXType.VEC4}
 
 
-def test_tierq48_torch_compile_predicts_graph_break_for_a_real_pixel_args_builtin():
-    """Red at 32f6917: the query said "torch_compile" here; gauss_blur never inlines in
-    codegen, so `_has_fn_calls` is always True and `_try_compile` returns the codegen-only
-    eager adapter, backend=None -- real Inductor tracing is never reached."""
+def _gauss_blur_fingerprint():
+    """The exact fingerprint `tier_verdict`'s own `_compile_for_query` derives for
+    `_GAUSS_BLUR_CODE`/`_GAUSS_BLUR_BT` -- so a test can drive `fncalls_compile`'s memo
+    for precisely the fingerprint the query itself will look up."""
+    return _get_cache().fingerprint(_GAUSS_BLUR_CODE, _GAUSS_BLUR_BT)
+
+
+def test_tierq48_torch_compile_predicts_graph_break_for_a_known_bad_fingerprint():
+    """COMPILETRY-50 (D1, item 3): once a REAL cook's one remembered fall-through attempt
+    has exhausted every backend for this exact fingerprint (`fncalls_compile.verdict`
+    resolves False), the query must keep predicting the codegen-only fallback -- it must
+    not go stale the moment `_has_fn_calls` alone stops being the whole story."""
+    fp = _gauss_blur_fingerprint()
+    _fncalls_compile.reset_for_test()
+    _fncalls_compile._memo[fp] = False
+    try:
+        v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu",
+                         binding_types=_GAUSS_BLUR_BT)
+        assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+    finally:
+        _fncalls_compile.reset_for_test()
+
+
+def test_tierq48_torch_compile_reports_declared_tier_for_an_unresolved_fingerprint():
+    """COMPILETRY-50 (D1, item 3): a fingerprint that has never been through
+    `_try_compile` (the common case -- `tier_verdict` itself never triggers an attempt,
+    it only reads the memo) is UNKNOWN, not a known break -- gauss_blur/erode/dilate
+    already measured clean by `torch.compile` on this box's own evidence, so reporting
+    the declared tier unchanged is the more accurate of the two guesses. This is RED
+    against the pre-COMPILETRY-50 code (which predicted "codegen" unconditionally, the
+    exact assertion this test's predecessor pinned) and GREEN at head."""
+    fp = _gauss_blur_fingerprint()
+    _fncalls_compile.reset_for_test()
+    assert _fncalls_compile.verdict(fp) is None   # never attempted -- the case under test
     v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu",
                      binding_types=_GAUSS_BLUR_BT)
-    assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+    assert v.tier == "torch_compile" and v.reason == TIER_REASON_SELECTED
 
 
-def test_tierq48_auto_predicts_graph_break_for_a_real_pixel_args_builtin():
-    v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="auto", device="cpu",
-                     binding_types=_GAUSS_BLUR_BT)
-    assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+def test_tierq48_torch_compile_reports_declared_tier_for_a_known_good_fingerprint():
+    """COMPILETRY-50 (D1, item 3): once a real cook's one remembered attempt has PROVED
+    this fingerprint compiles for real (`verdict is True`), the query must report the
+    declared compiled tier, never "codegen" -- the truthfulness half item 3 names
+    explicitly ("after a success, the compiled tier")."""
+    fp = _gauss_blur_fingerprint()
+    _fncalls_compile.reset_for_test()
+    _fncalls_compile._memo[fp] = True
+    try:
+        v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu",
+                         binding_types=_GAUSS_BLUR_BT)
+        assert v.tier == "torch_compile" and v.reason == TIER_REASON_SELECTED
+    finally:
+        _fncalls_compile.reset_for_test()
+
+
+def test_tierq48_auto_predicts_graph_break_for_a_known_bad_fingerprint():
+    fp = _gauss_blur_fingerprint()
+    _fncalls_compile.reset_for_test()
+    _fncalls_compile._memo[fp] = False
+    try:
+        v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="auto", device="cpu",
+                         binding_types=_GAUSS_BLUR_BT)
+        assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+    finally:
+        _fncalls_compile.reset_for_test()
 
 
 def test_tierq48_cuda_graph_predicts_not_capturable_for_a_real_pixel_args_builtin():
@@ -313,12 +381,20 @@ def test_tierq48_cuda_graph_predicts_not_capturable_for_a_real_pixel_args_builti
     assert v.tier == "interpreter" and v.reason == TIER_REASON_CUDA_GRAPH_NOT_CAPTURABLE
 
 
-def test_tierq48_scale_active_torch_compile_predicts_graph_break_for_a_real_pixel_args_builtin():
+def test_tierq48_scale_active_torch_compile_predicts_graph_break_for_a_known_bad_fingerprint():
     """Same correction applies in the SCALE-ACTIVE branch too -- it must not drift from the
-    scale-inactive branch above (`_real_compiled_dispatch` is the one shared call site)."""
-    v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu", scale=0.5,
-                     binding_types=_GAUSS_BLUR_BT)
-    assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+    scale-inactive branch above (`_real_compiled_dispatch` is the one shared call site). The
+    fall-through memo is keyed the same regardless of scale (SCALECX-49: `scale` is not part
+    of the compiled-callable cache key), so the same fingerprint applies."""
+    fp = _gauss_blur_fingerprint()
+    _fncalls_compile.reset_for_test()
+    _fncalls_compile._memo[fp] = False
+    try:
+        v = tier_verdict(_GAUSS_BLUR_CODE, compile_mode="torch_compile", device="cpu",
+                         scale=0.5, binding_types=_GAUSS_BLUR_BT)
+        assert v.tier == "codegen" and v.reason == TIER_REASON_TORCH_COMPILE_GRAPH_BREAK
+    finally:
+        _fncalls_compile.reset_for_test()
 
 
 def test_tierq48_scale_active_cuda_graph_predicts_not_capturable_for_a_real_pixel_args_builtin():

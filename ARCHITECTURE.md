@@ -358,6 +358,7 @@ Bounds below are entry counts, and every store is process-lifetime unless stated
 | `graphed._graph_cache` | fingerprint-signature | `GraphedProgram`; LRU, bytes-aware, pin-and-skip on eviction |
 | `graphed._blacklist` | signature | captures that failed; never retried this session |
 | `graphed._capturable_memo` | fingerprint | static capturability + op count, so a cache-hit replay does not re-walk the program |
+| `fncalls_compile._memo` | fingerprint | COMPILETRY-50 (D1): whether a program calling a non-inlined stdlib builtin was worth handing to `torch.compile` for real, replacing `compiled._try_compile`'s old blanket `_has_fn_calls` gate; persisted via `warm_state.py` (the same file as `graphed._capturable_memo` above); 512 |
 | `autotier._STATE` | program x device x precision | the measuring/committed tier state machine (mutated in place; single-cook-thread) |
 | `noise._inductor_available` | device type | whether TorchInductor can compile there |
 | `noise._worley_offsets_cache` | device x dtype | the 2D Worley cell offsets |

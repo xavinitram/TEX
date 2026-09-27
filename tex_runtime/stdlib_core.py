@@ -746,6 +746,30 @@ def _lanczos3(x: torch.Tensor) -> torch.Tensor:
 
 # -- Gaussian blur helpers (module-level) -----------------------------------
 
+# COMPILETRY-50 (D1, BUILTINS-50a §1): `_get_gauss_kernels` is reached from `_gauss_blur_bchw`
+# with no boundary in between, so a program compiled via `torch.compile` traces INTO this
+# function's body -- and `_gauss_kernel_cache_budget`'s `touch`/`put` (below) each open a
+# `threading.RLock` as a context manager, which Dynamo cannot trace ("Unsupported context
+# manager", BUILTINS-50a-design.md's own measurement: 3 graph breaks for `fn_gauss_blur`,
+# `torch._dynamo.explain`, CPU). `@torch._dynamo.disable()` takes the WHOLE function (lock,
+# cache dict, kernel build) off the traced path: Dynamo calls it eagerly, exactly as the plain
+# interpreter always has, and folds its two return tensors in as ordinary values rather than
+# tracing their construction. Measured (CPU, `torch._dynamo.explain`, same box):
+# `_gauss_blur_bchw` -- the function that both fetches the kernel AND applies it (the two
+# pad+conv2d passes) -- now traces as ONE graph with 0 breaks, 4 ops (pad, conv2d, pad, conv2d):
+# every graph-break-worthy construct this builtin's OWN computation touches is gone. The
+# outer `fn_gauss_blur(img, sigma)` wrapper's own sigma-resolution prefix (`_host_scalar`, an
+# unrelated, pre-existing branch/retry pattern present at base too) still shows the disable()
+# call itself as a boundary event when probed directly with a raw, untagged tensor -- an
+# intentional, controlled skip, not a failure, and not this lock; fixing that prefix is out of
+# this ask's scope (only the kernel-cache lock). Nothing about `_get_gauss_kernels` ITSELF
+# changes -- same lock, same cache dict, same kernel math, called the same way -- so the plain
+# interpreter (which never traces this module at all) and every other caller are byte-for-byte
+# unaffected; the decorator is a Dynamo-only annotation with a measured ~0.2us/call eager-mode
+# overhead (`torch._dynamo.disable` wraps every call with a cheap tracing-state check),
+# negligible next to the O(H*W*radius) conv2d passes this feeds (invariant 7: no default-path
+# behaviour or perf change).
+@torch._dynamo.disable()
 def _get_gauss_kernels(sigma: float, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """Get or create cached horizontal and vertical 1D Gaussian kernels.
 
@@ -759,6 +783,9 @@ def _get_gauss_kernels(sigma: float, device: torch.device) -> tuple[torch.Tensor
     with the same bindings depend on what the process had blurred earlier. Quantising
     before the build agrees with itself too, but moves every un-quantised sigma's
     output; keying exactly moves none. The LRU below still bounds the entries.
+
+    COMPILETRY-50: `@torch._dynamo.disable()` above keeps this function's lock-guarded
+    cache off any `torch.compile` trace (see the module comment above the decorator).
     """
     key = (sigma, device)
     cached = _gauss_kernel_cache.get(key)

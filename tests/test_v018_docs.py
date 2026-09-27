@@ -331,6 +331,13 @@ _NOT_A_CACHE = {
                                  "never a per-program/per-key cache a cook looks anything up "
                                  "in; read via promotion_stats(), reset via "
                                  "_reset_promotion_stats_for_test()",
+    "fncalls_compile._pending": "COMPILETRY-50: an IN-FLIGHT MARKER set, the exact same shape "
+                                "as compiled._codegen_inflight above (a fingerprint sits here "
+                                "only while its ONE remembered torch.compile fall-through "
+                                "attempt is unresolved, popped by resolve_attempt the moment "
+                                "it settles) -- coordination state so a fingerprint is never "
+                                "granted a second fall-through, not a cache of any value "
+                                "(the verdict itself lives in the registered _memo above)",
 }
 
 

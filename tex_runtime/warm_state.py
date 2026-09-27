@@ -7,6 +7,12 @@ process exit and force a relaunch to re-discover everything from scratch —
     the result of the static AST capture-gate walk, a deterministic function of the program AST
     and the arch (both True and False persist), so a relaunch skips re-walking the gate.
 
+  * COMPILETRY-50 (D1): the fn-calls-compile verdict (`fncalls_compile._memo`: fp -> bool) —
+    whether a program whose codegen'd fn calls a non-inlined stdlib builtin was worth handing
+    to `torch.compile` for real, replacing `compiled._try_compile`'s old blanket
+    `_has_fn_calls` gate. Paid once per fingerprint per this file's whole design; both True
+    and False persist for the same reason the capturability verdict does.
+
 CUDA graphs themselves cannot serialize — we persist the DECISION, re-capture off the hot path
 (LAT-1b's lesson). Deliberately NOT persisted: backend probes (`compiled._backend_status` — a
 persisted positive is inert since `_select_backend` only skips a known-FALSE, and a persisted
@@ -131,10 +137,17 @@ def load() -> None:
     p = _path()
     tag = _tag()
     from . import graphed
+    from . import fncalls_compile as _fnc
 
     def adopt(fp, val):
         try:
             graphed._capturable_memo.setdefault(fp, (bool(val[0]), int(val[1])))
+        except Exception:
+            pass
+
+    def adopt_fnc(fp, ok):
+        try:
+            _fnc.adopt_persisted(fp, ok)
         except Exception:
             pass
 
@@ -145,6 +158,8 @@ def load() -> None:
             if data.get("version") == tag:
                 for fp, val in (data.get("capturable") or {}).items():
                     adopt(fp, val)
+                for fp, ok in (data.get("fncalls_compile") or {}).items():
+                    adopt_fnc(fp, ok)
         except Exception:
             pass
     j = _journal()
@@ -157,8 +172,12 @@ def load() -> None:
         # `replay()`'s own `errors="replace"` exists to prevent.
         try:
             for rec in j.replay():
-                if isinstance(rec, dict) and rec.get("version") == tag and rec.get("fp"):
+                if not (isinstance(rec, dict) and rec.get("version") == tag):
+                    continue
+                if rec.get("fp"):
                     adopt(rec["fp"], (rec.get("cap"), rec.get("ops", 0)))
+                elif rec.get("fnfp"):
+                    adopt_fnc(rec["fnfp"], rec.get("ok"))
         except Exception:
             pass
 
@@ -175,8 +194,10 @@ def _snapshot() -> dict:
     verdict with a transient runtime/OOM crash, which must not become a permanent cross-launch
     demotion (the transient-hygiene reason in DEVELOPMENT.md's rejected-decisions)."""
     from . import graphed
+    from . import fncalls_compile as _fnc
     cap = {fp: [bool(v[0]), int(v[1])] for fp, v in graphed._capturable_memo.items()}
-    return {"version": _tag(), "capturable": cap}
+    fnc = {fp: bool(ok) for fp, ok in _fnc.snapshot_items().items()}
+    return {"version": _tag(), "capturable": cap, "fncalls_compile": fnc}
 
 
 def persist(*, force: bool = False) -> None:
@@ -266,16 +287,35 @@ def note_update(fp: str | None = None) -> None:
     persist(force=False)
 
 
+def note_fncalls_update(fp: str | None = None) -> None:
+    """COMPILETRY-50: `note_update`'s counterpart for the fn-calls-compile verdict
+    (`fncalls_compile._memo`) -- same journal-then-throttled-snapshot shape, a distinct
+    record key (`fnfp`/`ok` instead of `fp`/`cap`/`ops`) so `load()`'s replay can tell the
+    two record kinds apart in one journal file."""
+    if fp is not None:
+        j = _journal()
+        if j is not None:
+            from . import fncalls_compile as _fnc
+            ok = _fnc._memo.get(fp)
+            if ok is not None:
+                j.append({"version": _tag(), "fnfp": fp, "ok": bool(ok)})
+    persist(force=False)
+
+
 def reload() -> int:
     """ENG-13: drop the load latch and re-merge the snapshot + journal, returning how many NEW
-    capturability verdicts arrived. The counterpart to `autotier.reload` and
-    `ResultCache.reindex_disk`, so `tex_recovery.reattach` never touches `_loaded` or the memo."""
+    verdicts arrived across BOTH memos this file persists (capturability + COMPILETRY-50's
+    fn-calls-compile verdict). The counterpart to `autotier.reload` and
+    `ResultCache.reindex_disk`, so `tex_recovery.reattach` never touches `_loaded` or either
+    memo directly."""
     global _loaded
     from . import graphed
+    from . import fncalls_compile as _fnc
     _loaded = False
-    before = len(graphed._capturable_memo)
+    before = len(graphed._capturable_memo) + len(_fnc._memo)
     load()
-    return max(0, len(graphed._capturable_memo) - before)
+    after = len(graphed._capturable_memo) + len(_fnc._memo)
+    return max(0, after - before)
 
 
 def _reset_for_test() -> None:

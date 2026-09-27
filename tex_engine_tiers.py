@@ -655,15 +655,17 @@ def _stencil_route_would_apply(code: str, binding_types: dict | None) -> bool | 
 
 
 def _torch_compile_graph_break(code: str, binding_types: dict | None) -> bool | None:
-    """FIX-SCALECX X1 (B2#1): best-effort, read-only mirror of the ONE deterministic,
-    box-independent gate `_try_compile` itself checks before ever attempting real
-    Inductor tracing -- "codegen has a non-inlined stdlib call, so torch.compile overhead
-    exceeds benefit; return the codegen-only eager adapter instead" (`_has_fn_calls`,
-    `tex_runtime/compiled.py:1623-1639`). Every one of today's four registered
-    `pixel_args=` builtins (`gauss_blur`/`erode`/`dilate`/`bilateral_filter`) hits this
-    unconditionally -- none inlines in codegen -- so `torch_compile`/`auto` never reach
-    Inductor for a plain call to one, on ANY box, scale-active or not (B2's finding: this
-    was not scale-specific, the SCALECX-49 audit just happened to be what found it).
+    """FIX-SCALECX X1 (B2#1), COMPILETRY-50 (D1): best-effort, read-only mirror of the
+    gate `_try_compile` itself checks before attempting real Inductor tracing --
+    "codegen has a non-inlined stdlib call" (`_has_fn_calls`,
+    `tex_runtime/compiled.py`). Before COMPILETRY-50 this was unconditional (every
+    `pixel_args=` builtin hit it, always). Since COMPILETRY-50, `_try_compile` instead
+    grants each fingerprint ONE remembered fall-through attempt
+    (`tex_runtime.fncalls_compile`), so this mirror must consult the SAME memo or it goes
+    stale the moment a fingerprint's attempt settles: a program a prior cook proved
+    compiles for real (`verdict is True`) must predict `False` here (the real cook runs
+    `torch_compile`/`auto` for real), and one a prior attempt exhausted
+    (`verdict is False`) must keep predicting `True` (the eager codegen-only adapter).
 
     Returns `True` (graph-break -- the codegen-only adapter runs, backend stays unreached),
     `False` (no graph-break detected here -- may still fail to reach Inductor for an
@@ -671,17 +673,28 @@ def _torch_compile_graph_break(code: str, binding_types: dict | None) -> bool | 
     `op_count`/`loop_depth`/`has_spatial` routing, all of which need bindings this pre-cook
     query does not have), or `None` ("unknown, answer conservatively" -- i.e. the caller
     reports the DECLARED tier unchanged) when `code` cannot be compiled against the given
-    (or omitted) `binding_types`. A `False`/`None` answer is never wrong about pixel
-    correctness -- only potentially optimistic about which tier is named, the same
-    "supply binding_types for a precise answer" contract `_stencil_route_would_apply`
-    already documents."""
+    (or omitted) `binding_types`, OR when this exact fingerprint has never been through
+    `_try_compile` yet -- a real first cook falls through and, on this box's evidence,
+    usually reaches Inductor for real, so reporting the declared tier unchanged is the
+    more accurate of the two guesses, not merely the safe one. A `False`/`None` answer is
+    never wrong about pixel correctness -- only potentially optimistic about which tier is
+    named, the same "supply binding_types for a precise answer" contract
+    `_stencil_route_would_apply` already documents."""
     try:
         fp, ast, type_map = _compile_for_query(code, binding_types)
         from .tex_runtime.compiled import _get_or_make_codegen_fn
+        from .tex_runtime import fncalls_compile as _fncalls_compile
         cg_fn = _get_or_make_codegen_fn(ast, type_map, fp)
         if cg_fn is None:
             return None  # codegen itself declines -- a different, unmodelled decline shape
-        return bool(getattr(cg_fn, "_has_fn_calls", False))
+        if not getattr(cg_fn, "_has_fn_calls", False):
+            return False
+        verdict = _fncalls_compile.verdict(fp)
+        if verdict is True:
+            return False   # a prior attempt on THIS fingerprint proved it compiles for real
+        if verdict is False:
+            return True    # a prior attempt exhausted every backend -- still the eager adapter
+        return None        # never attempted -- unknown; report the declared tier unchanged
     except Exception:
         return None
 

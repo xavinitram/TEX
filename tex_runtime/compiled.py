@@ -37,6 +37,7 @@ from .codegen import (try_compile as _try_codegen, _invoke_cg,
 from .host import CookCancelled, _cancel_check  # SCHED-3 seam (no cycle: host imports torch only)
 from .stdlib import TEXStdlib, _tag_host_scalar
 from . import tier_trace  # leaf module (imports only threading) — no cycle
+from . import fncalls_compile  # COMPILETRY-50: leaf module (lazy-imports warm_state) — no cycle
 from . import pacing as _pace   # PACE-45: bounds queue-ahead when a token opts in
 from .pacing_heavy import program_has_any_heavy_stmt as _program_has_any_heavy_stmt  # PACE-47d
 # SPLIT-47 (TRK-210): re-exported so `compiled.NAME` and `from .compiled import NAME` keep
@@ -632,6 +633,10 @@ def execute_compiled(
                     entry = _try_compile(device_type, program, type_map,
                                          used_builtins=used_builtins, precision=precision,
                                          fingerprint=fingerprint)
+                    # COMPILETRY-50: a no-op unless `fingerprint` was actually granted the
+                    # one remembered fall-through attempt above (see `_try_compile`).
+                    fncalls_compile.resolve_attempt(
+                        fingerprint, entry[1] if entry is not None else None)
                     if entry is None:
                         # No backend available — run plain interpreter here
                         return _plain_execute(program, contiguous_bindings, type_map,
@@ -982,6 +987,9 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
         next instructions for a fast (no real torch.compile) program, racing a test's
         monkeypatch before its own `finally` restored it. One hand-off, the pre-split
         shape, just on the pool the caller chose."""
+        # COMPILETRY-50: resolved against `fncalls_compile` in `finally` so a `warm_call`
+        # crash below (a real failure, not just a wrap failure) settles the verdict too.
+        fnc_backend = None
         try:
             with _precompile_ctx(), torch.inference_mode():
                 if cache_key not in _compiled_cache:
@@ -990,6 +998,7 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
                                          precision=precision, fingerprint=fingerprint)
                     if entry is None:
                         return "no_backend"
+                    fnc_backend = entry[1]
                     _compiled_cache[cache_key] = entry
                     if len(_compiled_cache) > _COMPILED_CACHE_MAX:
                         _compiled_cache.popitem(last=False)
@@ -1000,7 +1009,10 @@ def _submit_bg_compile(cache_key, program, type_map, device_type,
             return "ok"
         except Exception:
             _compiled_cache.pop(cache_key, None)   # never hand a proven-broken artifact on
+            fnc_backend = None   # a warm_call crash after a successful wrap is still a fail
             return "failed"
+        finally:
+            fncalls_compile.resolve_attempt(fingerprint, fnc_backend)
 
     # C1 (B1#1): route to the DEDICATED `_WARM_POOL` whenever a `warm_call` is given —
     # the only case with a potentially SLOW (10-30s) step — so it never shares a worker
@@ -1824,25 +1836,36 @@ def _try_compile(
     # but delegates to the codegen-generated flat function.
     stdlib_fns = TEXStdlib.get_functions()
 
-    # If codegen has stdlib function calls (graph breaks), skip torch.compile
-    # and return the codegen adapter directly — torch.compile overhead exceeds benefit
+    # COMPILETRY-50 (D1): was a blanket, AST-only bail for ANY stdlib call -- now each
+    # fingerprint gets ONE real fall-through attempt, remembered + persisted (warm_state),
+    # so a resolved-False/pending fingerprint still takes the same codegen-only path below.
     if getattr(cg_fn, '_has_fn_calls', False):
-        def _codegen_exec_eager(program, bindings, type_map, device,
-                                latent_channel_count=0, output_names=None, scale=None):
-            dev = _canon_device(device)
-            env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
-                                            used_builtins=used_builtins, precision=precision,
-                                            scale=scale)
-            _invoke_cg(cg_fn, env, bindings, stdlib_fns, dev, sp,
-                       Interpreter._PRECISION_DTYPES.get(precision), program=program,
-                       co_locate_params=True)   # FUSEDDEV-46: no retry net of its own here
-            if output_names is not None:
-                return {name: bindings[name] for name in output_names}
-            return bindings.get("OUT")
+        fnc_verdict = fncalls_compile.verdict(fingerprint)
+        attempting = fnc_verdict is not True and fncalls_compile.begin_attempt(fingerprint)
+        if fnc_verdict is not True and not attempting:
+            if fnc_verdict is False:
+                tier_trace.record("codegen", fallback_from="torch_compile",
+                                  reason="stdlib calls: a prior compile attempt found no "
+                                         "working backend (COMPILETRY-50)")
+                _promotion_stats["failed"] += 1
 
-        _show_once("codegen_only_fn_calls",
-                   "[TEX] Codegen has stdlib calls — using codegen-only (no torch.compile)")
-        return _codegen_exec_eager, None
+            def _codegen_exec_eager(program, bindings, type_map, device,
+                                    latent_channel_count=0, output_names=None, scale=None):
+                dev = _canon_device(device)
+                env, sp, _ = _build_codegen_env(program, bindings, dev, latent_channel_count,
+                                                used_builtins=used_builtins, precision=precision,
+                                                scale=scale)
+                _invoke_cg(cg_fn, env, bindings, stdlib_fns, dev, sp,
+                           Interpreter._PRECISION_DTYPES.get(precision), program=program,
+                           co_locate_params=True)   # FUSEDDEV-46: no retry net of its own here
+                if output_names is not None:
+                    return {name: bindings[name] for name in output_names}
+                return bindings.get("OUT")
+
+            _show_once("codegen_only_fn_calls",
+                       "[TEX] Codegen has stdlib calls — using codegen-only (no torch.compile)")
+            return _codegen_exec_eager, None
+        # else: proven True, or `attempting` (the one remembered attempt) -- fall through.
 
     try:
         # Point inductor's disk cache at TEX's owned, evictable location so
@@ -1940,6 +1963,7 @@ def clear_compiled_cache():
     _backend_status.clear()
     _route_memo.clear()
     _stencil_route_memo.clear()
+    fncalls_compile.reset_for_test()   # COMPILETRY-50: test isolation, mirrors the memos above
     _warnings_shown.clear()
     try:  # P4: the is_tile_safe fingerprint memo (mirror of _stencil_route_memo)
         from ..tex_memory import _tile_safe_memo
