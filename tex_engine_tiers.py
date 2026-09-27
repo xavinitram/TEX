@@ -462,7 +462,11 @@ def _run_tier(ctx, tier_id):
 # strings, and they do not change shape across a release without a CHANGELOG entry.
 TIER_REASON_SCALE_UNSAFE = "scale-unsafe-refused"   # the cook itself would raise, not run
 TIER_REASON_SCALE_ACTIVE = "scale-active"           # non-None scale forces "interpreter"
-TIER_REASON_SCALE_ACTIVE_CODEGEN = "scale-active-codegen-stencil"  # SCALE-CG-48's UC-2 route
+TIER_REASON_SCALE_ACTIVE_CODEGEN = "scale-active-codegen-stencil"
+# ^ the "default" tier's own UC-2 exact-fetch-stencil shortcut fired for THIS program.
+# Named for the shortcut, not for "codegen now supports scale" in general: a plain
+# gauss_blur/erode/dilate/bilateral_filter call with no independent hand-written stencil
+# loop still reports TIER_REASON_SCALE_ACTIVE (interpreter) — see docs/resolution-scale.md.
 TIER_REASON_SELECTED = "tier-selected"              # plain select_tier verdict, scale inactive
 
 ROI_REASON_TIER_NOT_DEFAULT = "roi-declined-tier-not-default"
@@ -481,14 +485,19 @@ ROI_REASON_ARMED = "roi-armed"
 class TierVerdict:
     """TIERQ-48's answer. `tier` is one of the six strings the real dispatch can
     actually produce — `"torch_compile"` / `"auto"` / `"cuda_graph"` / `"default"` /
-    `"interpreter"` / `"codegen"` (SCALE-CG-48: a scale-active cook on the `"default"`
-    tier that hits the UC-2 stencil route) — or `None` when the cook itself would
-    REFUSE (`reason == TIER_REASON_SCALE_UNSAFE`): never a guess at what an
-    exception-raising cook "would have" run on. `roi_armed` is a SEPARATE question from
-    `tier`: an otherwise-eligible compiled/graphed tier still runs an ROI-requesting
-    cook whole-frame (see `ROI_REASON_TIER_NOT_DEFAULT`), and the `"codegen"` scale
-    route never threads ROI either (`ROI_REASON_SCALE_ACTIVE`) — `tier` names what
-    executes the cook, `roi_armed` names whether IT narrows to the window."""
+    `"interpreter"` / `"codegen"` — or `None` when the cook itself would REFUSE
+    (`reason == TIER_REASON_SCALE_UNSAFE`): never a guess at what an exception-raising
+    cook "would have" run on. `"codegen"` (`reason == TIER_REASON_SCALE_ACTIVE_CODEGEN`)
+    means a scale-active cook on the `"default"` tier whose PROGRAM independently
+    contains the UC-2 exact-fetch stencil shape (`_should_stencil_route`) — this is
+    narrower than "the program calls a `pixel_args=` builtin": a plain
+    `gauss_blur`/`erode`/`dilate`/`bilateral_filter` call with no such stencil loop still
+    reports `"interpreter"` (`TIER_REASON_SCALE_ACTIVE`); see `docs/resolution-scale.md`.
+    `roi_armed` is a SEPARATE question from `tier`: an otherwise-eligible
+    compiled/graphed tier still runs an ROI-requesting cook whole-frame (see
+    `ROI_REASON_TIER_NOT_DEFAULT`), and the `"codegen"` scale route never threads ROI
+    either (`ROI_REASON_SCALE_ACTIVE`) — `tier` names what executes the cook, `roi_armed`
+    names whether IT narrows to the window."""
     tier: str | None
     reason: str
     roi_armed: bool

@@ -91,16 +91,27 @@ not otherwise shrink with the canvas.
   taken at one scale must never replay under another). This costs real acceleration for a
   scale-active cook on those tiers; it does not cost correctness, and it does not touch the
   default (`scale=None`) path's tier selection at all.
-  **The `"default"` tier's own internal codegen shortcut DOES now honour `scale`**
-  (SCALE-CG-48): a scale-active cook that hits the UC-2 stencil route
-  (`_should_stencil_route`) runs on codegen instead of the interpreter — codegen's
-  `pixel_args=`-tagged call sites emit the scale multiplier as a runtime value read from
-  the cook's own environment, never a folded literal, so one cached codegen fn serves
-  every scale value without recompiling. M-4/ROI-5 *tiling* is still out of scope on
-  either route — a scale-active cook always cooks whole-frame (see the ROI bullet above).
-  Reported via `tier_trace` exactly like every other tier decision (`tier_trace.last().tier
-  == "interpreter"` or `== "codegen"`, reason names scale either way) — never a silent
-  fallback.
+  **The `"default"` tier's own internal codegen shortcut honours `scale` — but only for
+  the narrow class of program that shortcut already accelerates.** `_should_stencil_route`
+  recognizes exactly one shape: a *hand-written*, nested-loop, exact-fetch stencil (the
+  UC-2 pattern, `fetch(@A, ix + dx, iy + dy)` inside a fixed-radius loop) written directly
+  in the TEX source. It has nothing to do with whether the program calls a
+  `pixel_args=`-tagged builtin. A scale-active cook whose program is a *plain*
+  `gauss_blur`/`erode`/`dilate`/`bilateral_filter` call with no coincidental hand-written
+  stencil loop still runs on the plain interpreter, exactly as before this ask — the
+  single most common program shape the `pixel_args=` mechanism exists for is **not**
+  sped up by this route. Only a program that independently contains the UC-2 stencil
+  shape gets routed to codegen, and that routing carries any `pixel_args=` call sites in
+  the SAME program along for the ride (their scale multiplier is emitted as a runtime
+  value read from the cook's own environment, never a folded literal, so one cached
+  codegen fn serves every scale value without recompiling). M-4/ROI-5 *tiling* is still
+  out of scope on either route — a scale-active cook always cooks whole-frame (see the
+  ROI bullet above). Reported via `tier_trace` exactly like every other tier decision
+  (`tier_trace.last().tier == "interpreter"` or `== "codegen"`, reason names scale either
+  way) — never a silent fallback. `tier_verdict`'s own `TIER_REASON_SCALE_ACTIVE_CODEGEN`
+  reason code names this precisely: it is returned only when `_should_stencil_route`
+  itself says yes for THIS program, never as a general "codegen now supports scale"
+  signal.
 
 ## The declared-fallback query (TIERQ-48)
 
