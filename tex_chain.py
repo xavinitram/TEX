@@ -345,7 +345,8 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
                    time_context=None, cancel=None, on_progress=None, scale=None,
                    roi: tuple | None = None, roi_exec: bool | None = None,
                    dirty_from: int = 0, valid=None, declined=(),
-                   known_outputs: dict | None = None) -> dict:
+                   known_outputs: dict | None = None,
+                   result_cache=None, upstream=()) -> dict:
     """JOINWIRE-50 (host item 1): cook a DAG-shaped stage list — a join such as a Merge
     reading two upstream stages, below an edit — node-by-node, windowed end-to-end via
     `tex_roi.chain_windows_dag`, when the sink (the last stage) is asked for a sub-window.
@@ -368,13 +369,48 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
     not merely assumed to be). A missing clean value that a dirty stage genuinely needs
     raises `ValueError` rather than fabricate one.
 
-    Never caches anything of its own: every per-stage cook goes through the EXISTING
-    `cook_stage_list`, so `tier_trace`/lineage behave exactly as they already do for a single
-    windowed cook (a windowed result is keyed by its window the same way any other
-    `roi=`-cooked frame already is — this function adds no NEW keying scheme for the "a
-    windowed result must never be served as whole-frame" contract to get wrong). A host
-    wanting checkpoint-style reuse across ticks supplies its own keying via
-    `known_outputs`/`valid`/`dirty_from`, same as it already must for `chain_windows`.
+    Every per-stage cook goes through the EXISTING `cook_stage_list`, so `tier_trace`/lineage
+    behave exactly as they already do for a single windowed cook (a windowed result is keyed
+    by its window the same way any other `roi=`-cooked frame already is — this function adds
+    no NEW keying scheme for the "a windowed result must never be served as whole-frame"
+    contract to get wrong). A host wanting checkpoint-style reuse across ticks supplies its
+    own keying via `known_outputs`/`valid`/`dirty_from`, same as it already must for
+    `chain_windows` — OR, JOINWIRE-50b, hands a `result_cache` (a `ResultCache`, same object
+    `cook_checkpointed` takes) plus `upstream` (its CACHE-1 source keys, same contract as
+    `boundary_lineage_key`'s own `upstream`), and this function does the `known_outputs`
+    bookkeeping FOR it:
+
+      * a CLEAN stage (`i < dirty_from`) that a dirty consumer needs, or that the caller
+        wants reported in `stage_outputs`, and that is not already in `known_outputs`, is
+        looked up in `result_cache` under `boundary_lineage_key(stages, i + 1, ...)` — the
+        SAME function and key shape `cook_checkpointed` already uses for a linear boundary.
+        `_fused_memo_key`'s topology tuple (Q-3) already folds a DAG's `chain_inputs` edges
+        into the program fingerprint half of that key, and the shape/param halves are read
+        off the stages that carry the actual tensor/param `bindings` (a `chain_inputs`-fed
+        name carries none — it is a rewiring, not a second source), so no new canvas
+        resolver is needed: `boundary_lineage_key`'s own default already answers this
+        correctly for a DAG stage list, not only a linear one.
+      * a DIRTY stage's (`i >= dirty_from`) own cook this tick is `put` into `result_cache`
+        under that SAME key, but ONLY when `tier_trace.last_roi()` says THIS stage's cook
+        actually served whole-frame (`served_roi is None` below) — a windowed, re-embedded
+        output carries an unread-garbage region outside its window and MUST NEVER be stored
+        as a boundary a later, differently-windowed tick could read back as if it were
+        whole-frame. This is the one load-bearing safety rule of this whole addition: the
+        cache is populated from `served_roi`, the same signal that already gates re-embed
+        vs. pass-through above, never from `stage_roi` (the REQUEST) or from "no window was
+        planned for this stage" alone.
+      * Both only ever run when `windows is not None` (i.e. only under an active `roi=` —
+        `dirty_from`/`known_outputs`/`result_cache` are otherwise inert here exactly as they
+        already were before this ask, so `roi=None` keeps its existing behaviour and count
+        (invariant 7): a stage is never skipped, `result_cache` is never consulted, and every
+        stage cooks exactly as a bare `cook_stage_list` call would.
+
+    Mints no new key scheme and adds no cache of its own beyond reusing `boundary_lineage_key`
+    verbatim — a windowed result stays keyed by its window (unchanged, above), and a
+    checkpoint boundary stays keyed by `boundary_lineage_key`'s own program+param+upstream+
+    canvas tuple (unchanged, `cook_checkpointed`'s existing contract) — so the two schemes
+    can never collide with each other, and neither can serve the other's shape back mislabeled.
+    `result_cache=None` (every caller before this ask) never reaches any of these branches.
 
     Returns `{"result": {name: tensor}, "stage_outputs": {idx: {name: tensor}}, "windows":
     windows_or_None, "stages_windowed": int, "stages_whole": int}`. `result` is the sink's
@@ -430,6 +466,29 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
                 windows = _tex_roi.chain_windows_dag(
                     specs, canon, dirty_from=dirty_from, valid=valid, declined=declined)
 
+        # JOINWIRE-50b: the ONE key function for every clean-stage boundary this call either
+        # reads or writes — `boundary_lineage_key` itself, unmodified (see the docstring
+        # above for why its default canvas already answers a DAG stage list correctly). A
+        # closure so both the skip branch and the consumer-resolution branch below share one
+        # spelling rather than two that could drift apart.
+        def _checkpoint_key(idx: int) -> str:
+            return boundary_lineage_key(
+                stages, idx + 1, device, precision, upstream=upstream,
+                time_context=time_context, latent_channel_count=latent_channel_count,
+                scale=scale)
+
+        def _clean_lookup(idx: int):
+            """A clean stage's already-valid value: `known_outputs` first, then
+            `result_cache` (JOINWIRE-50b) — `None` when neither has it."""
+            v = known_outputs.get(idx)
+            if v is not None:
+                return v
+            if result_cache is not None:
+                cached = result_cache.get(_checkpoint_key(idx))
+                if cached is not None:
+                    return {"OUT": cached}
+            return None
+
         # 3. Cook, stage by stage. `chain_inputs` only ever names an EARLIER index (checked
         #    above), so index order IS topological order — no separate sort needed.
         stage_outputs: dict = {}
@@ -437,17 +496,25 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
         stages_whole = 0
         for i, st in enumerate(stages):
             if windows is not None and windows[i] is None:
-                if i < dirty_from and i in known_outputs:
-                    stage_outputs[i] = known_outputs[i]
+                if i < dirty_from:
+                    v = _clean_lookup(i)
+                    if v is not None:
+                        stage_outputs[i] = v
                 continue           # clean-and-undemanded, or dirty-but-undemanded (JOIN-49)
 
             bindings = dict(st.get("bindings") or {})
             for b, (idx, out) in chain_map[i].items():
-                src = stage_outputs.get(idx, known_outputs.get(idx))
+                src = stage_outputs.get(idx)
+                if src is None:
+                    src = _clean_lookup(idx)
                 if src is None or out not in src:
                     raise ValueError(
                         f"cook_stage_dag: stage {i} needs stage {idx}'s output {out!r}, "
-                        f"which was never cooked and is not in known_outputs")
+                        f"which was never cooked and is not in known_outputs"
+                        + (" or result_cache" if result_cache is not None else ""))
+                stage_outputs.setdefault(idx, src)  # memoize a known_outputs/cache hit for a
+                #                                      second consumer (a diamond) or for the
+                #                                      caller's own `stage_outputs` inspection
                 bindings[b] = src[out]
 
             stage_roi = None
@@ -486,6 +553,25 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
                 stages_windowed += 1        # the sink itself, windowed
             else:
                 stages_whole += 1
+                # JOINWIRE-50b: `result_cache` is populated ONLY here — `served_roi is None`
+                # is `tier_trace`'s own record of what THIS cook actually served, so a
+                # windowed/re-embedded output (the two branches above) never reaches this
+                # line and can never be stored as a boundary a later tick's clean lookup
+                # could read back as if it were whole-frame. `windows is not None` is its
+                # own separate guard (every stage lands in THIS branch when `windows is
+                # None` too — a plain, unwindowed roi=None cook — so without it a host that
+                # merely passed `result_cache` with no `roi=` at all would start paying
+                # `put`s invariant 7 promises it will not): checkpointing only ever engages
+                # under an active window plan, matching `_clean_lookup`'s own gating above.
+                # `i != n - 1`: the SINK has no suffix, so `boundary_lineage_key`/
+                # `prefix_fingerprint`'s own `1 <= k < len(stages)` range contract (a
+                # boundary is always "AFTER stage k-1", which needs a stage AT k to exist)
+                # has no valid key for it — there is nothing downstream of the sink for a
+                # cached boundary to ever serve anyway.
+                if (result_cache is not None and windows is not None and i != n - 1
+                        and "OUT" in out):
+                    result_cache.put(_checkpoint_key(i), out["OUT"],
+                                     canvas={"shape": list(out["OUT"].shape)})
             stage_outputs[i] = out
 
         return {"result": stage_outputs.get(n - 1, {}), "stage_outputs": stage_outputs,
