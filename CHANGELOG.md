@@ -5,6 +5,99 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.0] - 2026-09-27 — "The tier that actually runs"
+
+A minor release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved, no new reserved
+name, no ComfyUI pixel change.
+
+### Added
+
+- **`tex_roi.chain_windows_dag`/`StageSpec`: a DAG generalisation of `chain_windows` for
+  multi-input joins.** A per-stage input map (`inputs: tuple[int, ...]`; a linear chain is the
+  degenerate `inputs=(i-1,)` case, so `chain_windows` itself is untouched) replaces the flat
+  `halos` list; same-input windows union across every consumer, a join stage's demand on each
+  input projects backward independently, and a divergent-validity edge refuses the same
+  fail-closed way a declined stage already does. Proven byte-identical to `chain_windows` on
+  every linear shape (a 13-row named corpus plus a 300-case seeded sweep) and correct on
+  genuine DAG shapes (a double-diamond, a per-argument join two hops from its source, a
+  mid-DAG dirty/valid boundary) against an independently-built reference. CUDA pixel identity
+  confirmed: a windowed 3-stage join DAG cook matches a whole-frame crop, `torch.equal`. **No
+  TEX cook path calls it yet** — `cook_stage_list`/`cook_fused_cached`/`cook_checkpointed` stay
+  list-shaped; this is a host-callable building block, not wired into this engine's own cooks.
+- **`pace_budget_ms`: a measured, per-call-site device-time budget, additive to `pace_depth`.**
+  A bounded (512-entry) per-call-site EWMA of real device time, fed only at the two points the
+  pacing mechanism already touches the device (a peek's confirming query, a depth-gated wait) —
+  never a new CUDA call. A warm call site (3+ real samples) whose running cost since the last
+  real wait would exceed the budget forces the ordinary wait early, regardless of what the
+  existing stride/peek economization would otherwise decide; a cold call site rides the
+  existing registry `heavy` rule unchanged. Default `8.0` ms, `0` disables it. Measured on an
+  RTX 2080 SUPER against two shapes built to defeat the registry's pixel-count proxy (a
+  sub-threshold `for`-loop body, a high-octave `fbm` call): drained p50/p95 stay in a
+  ~0.7-2.0 ms band across every budget value tried (0/4/8/16), with no monotonic growth as the
+  budget rises — the shipped default is not the worst case (p95 1.36 ms at budget=8 vs.
+  2.01 ms at budget=0 for the loop shape). Unpre-empted cost is flat across every budget value
+  on both shapes (noise-level spread). Single-box, single-run reading, not a swept statistical
+  claim.
+- `DEVELOPMENT.md` gains a "Log Lines" section: the convention this project's own `logging`
+  calls follow (subject/event/consequence/values, lazy `%`-formatting, no first person, level
+  meanings, only the origin logs, nothing at INFO-or-above on a hot path, the redaction rule) —
+  distinct from, and stated as distinct from, the first-person diagnostics a user-facing error
+  already uses. Existing log lines are corrected when next touched, not swept.
+
+### Fixed
+
+- **`tier_verdict` could name a tier a cook would not actually take.** For `torch_compile`/
+  `auto`, a program that would graph-break before ever reaching the backend was still reported
+  as that tier; for `cuda_graph`, a program `_capturable()`/`_graph_capture_worthwhile` would
+  decline was still reported as `cuda_graph`. `tier_verdict` now shares the exact predicates the
+  run path itself uses, so it can no longer disagree by construction with what actually runs.
+- **Resolution scale now reaches `torch_compile`/`auto`/`cuda_graph` — stated plainly: no
+  registered builtin is any faster there today.** The mechanism exists and is correct: `scale`
+  is a runtime input to `torch_compile`/`auto` rather than a compiled-artifact cache-key
+  component, so a sweep of scale values compiles once, not once per value, proven against a
+  real, unmocked backend; `cuda_graph`'s own capture key keeps a scale component (a capture
+  bakes a scaled radius in as a fixed shape and cannot take a new scale as a runtime input),
+  now bounded by the existing VRAM-budget eviction rather than left unbounded. But every one of
+  today's four registered `pixel_args=` builtins (`gauss_blur`/`erode`/`dilate`/
+  `bilateral_filter`) is separately excluded from `cuda_graph` capture (each resolves its
+  scaled argument via a capture-illegal device-to-host read) and never reaches real Inductor
+  tracing on `torch_compile`/`auto` (each self-declines to the codegen-only eager path before
+  the compile-op threshold) — both declines unconditional and box-independent. `tier_verdict`
+  reports the tier that actually runs (`"codegen"` for the `torch_compile`/`auto` decline,
+  `"interpreter"` for the `cuda_graph` decline), so a caller of the query is never told to
+  expect a speedup that will not materialize. The mechanism itself is proven correct end to end
+  against a synthetic `pixel_args`-tagged builtin, ready for the day a real one ships without
+  today's sync/graph-break gap.
+- **Fold-level verified pruning (TRK-219).** `tex_roi._fold_program` now applies the existing
+  static-flow prune itself, unconditionally, right after its own fp32-verified branch fold —
+  every one of its four callers (`_walk`, `frame_window`, `batch_sliceable`,
+  `_scale_verdict_uncached`) now sees the same pruned tree, where previously only one caller's
+  own narrower, walk-scoped step did. This makes more programs correctly recognised as
+  region-eligible; it can never change a served pixel (invariant 11: a static analysis that
+  sees less dead code can only become more permissive, never wrong).
+- **TRK-220 confirmed on CUDA.** The fp32-fold fix (shipped in `v0.48.0`) reaches
+  `tex_tiling._halo_tile_plan` under real GPU memory pressure, not only under the CPU-forced
+  planner twin that stood in for it before: a halo-tiled cook under real memory pressure on an
+  RTX 2080 SUPER matches a whole-frame cook, `torch.equal`.
+- **TRK-221: a plain default-tier cook now records its own tier.** `_run_default`'s ordinary
+  fall-through to the interpreter never called into the tier trace, unlike every other route
+  through that function — so a plan reused across two `run()` calls with no intervening
+  `prepare()` could read a prior cook's tier as if it were the current one. Every tiled/
+  halo-tiled cook, and the plain default fall-through, now records its own tier at the point it
+  actually runs.
+- `Error-Codes.md`'s generator described the `E4`/`E5` families as "Optimizer" and "Compile /
+  cache" — neither is raised from any such module; both are raised only from the type checker's
+  construct/signature checks. Corrected, and the `E0`/`E7`/`E9` rows the generator already
+  carried are now in `DEVELOPMENT.md`'s and `CONTRIBUTING.md`'s own range tables too.
+
+### Not in this release → v0.50
+
+- Making `gauss_blur`/`erode`/`dilate`/`bilateral_filter` actually compile under
+  `torch_compile` or capture under `cuda_graph` — the exact gap the "Fixed" item above states.
+- Wiring `chain_windows_dag` into this engine's own cook paths — today it has no TEX-internal
+  caller; every existing production caller stays list-shaped.
+- The `compile_mode="auto"` promoted-cook stall named in `v0.48.1` (`TRK-223`) — unchanged.
+
 ## [0.48.1] - 2026-09-27 — "Off the thread, off the GIL"
 
 A patch release, answering an embedding host's own re-pin finding against `v0.48.0`. No
