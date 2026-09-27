@@ -58,9 +58,11 @@ def test_roi2_footprints(r: SubTestResult):
         ("@OUT = erode(@A, 3.0);", {}, "A", "halo", 3),               # radius=pixels
         ("@OUT = gauss_blur(gauss_blur(@A, 2.0), 2.0);", {}, "A", "halo", 12),  # additive
         ("@OUT = @A + gauss_blur(@A, 2.0);", {}, "A", "halo", 6),     # LUB over reads
-        # BILAT-50: footprint is now ('halo_arg', 1, 8.0) -- reach = ceil(8.0*1.5) = 12,
-        # not the old fixed 3 (the removed 7x7 clamp).
-        ("@OUT = bilateral_filter(@A, 1.5, 0.2);", {}, "A", "halo", 12),
+        # BILAT-50/A4 (v0.50 Phase C, R3#5): footprint is ('halo_arg', 1, 3.0, ...) --
+        # reach = ceil(3.0*1.5) = 5, the exact-tier's own true reach (not the old fixed 3
+        # 7x7 clamp, and not a conservative 8.0x cover of the approximate tier -- A1's
+        # approx_above decline now handles that tier by refusing to narrow at all).
+        ("@OUT = bilateral_filter(@A, 1.5, 0.2);", {}, "A", "halo", 5),
         ("@OUT = sample(@A, u * 0.5, v);", {}, "A", "image", 0),      # gather
         ("@OUT = @A / img_max(@A);", {}, "A", "image", 0),            # reduction
         # ASK-1: convolve's footprint is 'image' — arg 0 (the image) is
@@ -356,9 +358,9 @@ def _gen_expr(rng, depth):
         return f"erode({a}, {rng.randint(1, 3)}.0)"
     if pick < 0.94:
         return f"dilate({a}, {rng.randint(1, 3)}.0)"
-    # bilateral_filter: the 4th whitelist op, footprint ('halo_arg', 1, 8.0) since BILAT-50
-    # (previously a fixed ('halo', 3)). Named in the oracle's 'conv/bilateral ~1 ulp'
-    # tolerance calibration but previously never generated.
+    # bilateral_filter: the 4th whitelist op, footprint ('halo_arg', 1, 3.0, ...) since
+    # BILAT-50/A4 (previously a fixed ('halo', 3)). Named in the oracle's 'conv/bilateral
+    # ~1 ulp' tolerance calibration but previously never generated.
     return f"bilateral_filter({a}, {round(rng.uniform(0.4, 1.4), 3)}, {round(rng.uniform(0.1, 0.4), 3)})"
 
 
