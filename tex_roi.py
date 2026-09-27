@@ -1169,6 +1169,37 @@ def scale_safe(code: str, param_values: dict | None = None) -> bool:
     return scale_verdict(code, param_values).safe
 
 
+def require_scale_safe(code: str, scale: float | None, param_values: dict | None = None) -> None:
+    """FIX-SCALE S1: the ONE choke point every scale-accepting entry point calls to enforce
+    R3/R5 — a program `scale_verdict` cannot prove safe REFUSES rather than silently cooking
+    coarse. Before this, the check lived inline in `tex_engine.prepare()` only; the CACHE-6/7
+    stage-list family (`tex_chain.cook_stage_list`, `tex_checkpoint.cook_checkpointed`,
+    `materialize`) accepted `scale=` and threaded it straight to the interpreter with no gate
+    at all — an unsafe program cooked coarse, silently, through any of the three. Every one of
+    them (and `prepare()`) now calls this single function instead of re-deriving the check.
+
+    A no-op — no parse, no walk, nothing raised — when `scale` is `None` or the byte-identical
+    `1.0` (invariant #7: the default, scale-free path pays nothing). Raises a `RuntimeError`
+    carrying a `.tex_refusal` `EngineRefusal` (code `SCALE_UNSAFE_CODE`, mirrored as
+    `tex_runtime.host.REFUSE_SCALE_UNSAFE`) otherwise, exactly as `prepare()` raised before this
+    existed — moving the raise here changes no caller's exception shape."""
+    if scale is None or scale == 1.0:
+        return
+    verdict = scale_verdict(code, param_values)
+    if verdict.safe:
+        return
+    from .tex_runtime.host import EngineRefusal, REFUSE_SCALE_UNSAFE
+    exc = RuntimeError(
+        f"scale={scale!r} refused: this program is not provably scale-safe "
+        f"(it reads a pixel coordinate/dimension builtin outside a whitelisted "
+        f"fetch call, or declares `//!tex scale: never`). Cook at scale=None (or "
+        f"1.0) for full resolution, or add `//!tex scale: safe` if you can vouch "
+        f"for it.")
+    exc.tex_refusal = EngineRefusal(verdict.code or REFUSE_SCALE_UNSAFE, None,
+                                    "this program is not provably scale-safe")
+    raise exc
+
+
 def roi_exec_enabled(opt_in: bool | None = None) -> bool:
     """Whether the engine's auto-narrow ROI path may engage — v0.30's flip, **per cook**.
 

@@ -176,6 +176,16 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
     # times per cook) shares their outer notification instead of adding one — see
     # tex_runtime/cook_observer.py.
     with _cook_observer.scope("cook_stage_list"):
+        # FIX-SCALE S1: this stage-list family is a public engine entry point in its own
+        # right (not only reached via `tex_engine.prepare()`), so it must apply the SAME
+        # scale-safety refusal `prepare()` applies — before this fix, none of the three
+        # CACHE-6/7 entries (this one, `cook_checkpointed`, `materialize`; the latter two
+        # both cook by calling this function) ever consulted it, so an unsafe program cooked
+        # coarse, silently, through any of them. Scoped to the TERMINAL stage's own source,
+        # the same scoping `prepare()`'s check already uses for a fused chain (an upstream
+        # stage is not walked). A no-op when `scale` is `None`/`1.0` (invariant #7).
+        from . import tex_roi as _tex_roi
+        _tex_roi.require_scale_safe(stages[-1]["code"], scale)
         # P0-H: the stage-list family is a public engine entry point that never learned about
         # promises — a Promise in a stage's bindings produced a raw TypeError out of the
         # marshalling seam whether or not it had landed. Resolving here (and refusing an unlanded
