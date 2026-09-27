@@ -354,6 +354,16 @@ def _run_default(ctx):
                               precision=ctx.eff_precision, time_context=ctx.time_context,
                               cancel=ctx.cancel, on_progress=ctx.on_progress, scale=ctx.scale)
     interp = _tex_engine._get_interpreter()
+    # TRK-221: every branch below that reaches the plain `interp.execute` at the end of this
+    # function used to leave WITHOUT a `tier_trace.record` call — a stale (or, via `run()`
+    # called directly on a prepared plan without an intervening `prepare()`/`tier_trace.reset()`,
+    # a genuinely PRIOR cook's) record read back as "this cook's own tier", indistinguishable
+    # from "no fallback happened". `_default_fallback`/`_default_fallback_reason` carry what (if
+    # anything) was tried and declined before falling through, so the single record below is
+    # accurate for every one of this function's return-here paths, not just the never-attempted
+    # one.
+    _default_fallback = None
+    _default_fallback_reason = None
     # M-4: under GPU memory pressure, run a tile-safe program in horizontal strips
     # (peak transient ~1/n). Falls back to the whole-image cook on any strip error.
     n_strips = (_tex_engine._tile_plan(ctx.program, ctx.bindings, ctx.device, ctx.latent_channel_count,
@@ -371,6 +381,7 @@ def _run_default(ctx):
             raise                       # SCHED-3: a cancel aborts — never fall back to untiled
         except Exception as _tile_exc:
             logger.warning("[TEX] tiled cook failed (%s); running untiled.", _tile_exc)
+            _default_fallback, _default_fallback_reason = "tiled", str(_tile_exc)
     elif not ctx.fused_chain:
         # ROI-5: `_tile_plan` refused (a non-pixel-local program — a blur/morphology), but a
         # BOUNDED-halo op can still tile with a grown strip. Under memory pressure OR the TDR
@@ -401,6 +412,15 @@ def _run_default(ctx):
                 raise                   # SCHED-3: a cancel aborts — never fall back to untiled
             except Exception as _halo_exc:
                 logger.warning("[TEX] halo-tiled cook failed (%s); running untiled.", _halo_exc)
+                _default_fallback, _default_fallback_reason = "halo_tiled", str(_halo_exc)
+    # TRK-221: record the tier THIS cook actually ran on before falling into the interpreter —
+    # every earlier return in this function already ran through a strategy that records its own
+    # decision (codegen/tiled/halo_tiled); this is the one path that previously fell through in
+    # silence. `fallback_from` is None on the ordinary (never-attempted) plain-default route,
+    # and names which tiled attempt was tried and declined otherwise.
+    from .tex_runtime import tier_trace
+    tier_trace.record("interpreter", fallback_from=_default_fallback,
+                      reason=_default_fallback_reason)
     # Pass source so runtime (E6xxx) errors render a source-line caret. Fused chains
     # splice many sources, so leave source empty there (errors stay message-only).
     return interp.execute(ctx.program, ctx.bindings, ctx.type_map, device=ctx.device,
