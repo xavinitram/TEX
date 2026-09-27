@@ -70,14 +70,16 @@ def test_fixgate_g4_env_knob_forces_no_inductor_regardless_of_toolchain(r: SubTe
             os.environ["TEX_GATE_NO_INDUCTOR"] = orig_env
 
 
-def test_fixgate_g4_knob_is_off_by_default(r: SubTestResult):
+def test_fixgate_g4_knob_is_off_by_default(r: SubTestResult, monkeypatch):
     """ComfyUI-invisible: with the env var absent (the default, every real ComfyUI process),
     behaviour is byte-identical to before this ask -- the knob only ever activates when
-    something explicitly sets it."""
+    something explicitly sets it. This test controls its own env (rather than asserting on
+    the ambient process environment) because a suite run under `run_ci_shape` itself sets
+    the knob for its whole subprocess -- this row proves the ABSENT-knob behaviour, not
+    which process it happens to run inside."""
     print("\n--- G4(b): with no env var set, behaviour is unchanged ---")
     try:
-        assert "TEX_GATE_NO_INDUCTOR" not in os.environ, (
-            "this test assumes the knob is not already set in this process's environment")
+        monkeypatch.delenv("TEX_GATE_NO_INDUCTOR", raising=False)
         orig_cache = dict(noise._inductor_available)
         try:
             noise._inductor_available.clear()

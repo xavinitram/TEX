@@ -821,20 +821,26 @@ def _can_inductor_compile(device=None) -> bool:
     callable that raises at its first real call (bit fbm/ridged/billow/
     turbulence on Triton-less CUDA boxes).
 
-    G4 (FIX-GATE, v0.47.0 Phase C, B4#2): `TEX_GATE_NO_INDUCTOR=1` forces this to answer
-    False for every device, unconditionally, before any probe -- an escape hatch
-    `tools/gate.py`'s `run_ci_shape`/`run_ci_exact` set in their subprocess environment so
-    the CI-shape leg's own VERDICT is deterministic regardless of which interpreter
-    `--ci-python` names and what toolchain that interpreter's box happens to have on PATH.
-    Confirmed (B4#2, by running): a `--ci-python` venv whose box DOES find MSVC (unlike the
-    embedding host's usual embedded interpreter, which never does) reaches a real
-    torch.compile path this project has not characterized for stability under a
-    coverage-tracing pytest run -- three otherwise-identical runs on that interpreter
-    produced three different outcomes (a clean pass, a stuck-eager tier, and a
-    child-process crash). Never set by ComfyUI or any production code path; only a gate
-    invocation sets it, and only for that one subprocess's own environment."""
-    if os.environ.get("TEX_GATE_NO_INDUCTOR") == "1":
-        return False
+    G4 (FIX-GATE, v0.47.0 Phase C, B4#2; reshaped Phase C FIX-FULL F1): `TEX_GATE_NO_INDUCTOR=1`
+    is an escape hatch `tools/gate.py`'s `run_ci_shape` sets in its subprocess environment so
+    that leg's own VERDICT is deterministic regardless of which interpreter `--ci-python`
+    names and what toolchain that interpreter's box happens to have on PATH. Confirmed (B4#2,
+    by running): a `--ci-python` venv whose box DOES find MSVC (unlike the embedding host's
+    usual embedded interpreter, which never does) reaches a real torch.compile path this
+    project has not characterized for stability under a coverage-tracing pytest run -- three
+    otherwise-identical runs on that interpreter produced three different outcomes (a clean
+    pass, a stuck-eager tier, and a child-process crash). Never set by ComfyUI or any
+    production code path; only a gate invocation sets it, and only for that one subprocess's
+    own environment.
+
+    The knob stands for "this box has no host C++ toolchain" -- it answers only the CPU
+    probe (the `cl`/MSVC lookup below) and only when that probe is actually reached: an
+    already-cached answer (a real prior probe, or a test that seeded `_inductor_available`
+    to exercise a promotion/fallback path) wins over the knob, and the CUDA/Triton probe is
+    never touched by it -- a box with no C++ compiler can still have Triton on PATH. This
+    keeps the knob usable by tests that seed the cache or patch the CPU probe directly to
+    simulate a toolchain (`test_v031_noise_tiers.py`, `test_aliasing_cow.py`), while still
+    giving `run_ci_shape` a deterministic "no compiler" CPU answer regardless of the box."""
     dev_type = device.type if isinstance(device, torch.device) else ("cuda" if device == "cuda" else "cpu")
     cached = _inductor_available.get(dev_type)
     if cached is not None:
@@ -843,18 +849,21 @@ def _can_inductor_compile(device=None) -> bool:
         import importlib.util as _ilu
         ok = _ilu.find_spec("triton") is not None
     else:
-        import shutil
-        import sys
-        if sys.platform != 'win32':
-            ok = True  # Linux/macOS have gcc/clang by default
+        if os.environ.get("TEX_GATE_NO_INDUCTOR") == "1":
+            ok = False
         else:
-            # Try the robust MSVC setup from compiled.py
-            try:
-                from .compiled import _setup_msvc_env as _setup_compiled_msvc
-                _setup_compiled_msvc()
-            except Exception:
-                pass
-            ok = shutil.which('cl') is not None
+            import shutil
+            import sys
+            if sys.platform != 'win32':
+                ok = True  # Linux/macOS have gcc/clang by default
+            else:
+                # Try the robust MSVC setup from compiled.py
+                try:
+                    from .compiled import _setup_msvc_env as _setup_compiled_msvc
+                    _setup_compiled_msvc()
+                except Exception:
+                    pass
+                ok = shutil.which('cl') is not None
     if ok:
         # Persist compiled kernels across restarts: point inductor's disk cache
         # at TEX's owned dir (shared helper — the TORCHINDUCTOR_CACHE_DIR env var,
