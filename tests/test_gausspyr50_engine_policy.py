@@ -148,31 +148,28 @@ def test_gausspyr50_pyramid_upsamples_to_input_size(r: SubTestResult):
 # ── D2: bounded time/memory at huge sigma (counts, not wall-clock) ──────────
 
 def test_gausspyr50_huge_sigma_bounded_levels(r: SubTestResult):
-    """A radius-2000-to-1e6 blur must not cost O(sigma) work. Asserted STRUCTURALLY,
-    not by wall-clock (CI's coverage tracer can invert a wall-clock comparison,
-    GATE-47/TRK-208):
+    """A2 (v0.50 Phase C, B2#1): a radius-2000-to-1e9 blur must not revert to O(sigma)
+    work. Asserted STRUCTURALLY, not by wall-clock (CI's coverage tracer can invert a
+    wall-clock comparison, GATE-47/TRK-208):
 
-    1. The number of halving (avg_pool2d) passes is bounded by the image size ALONE
-       (`floor(log2(min(H,W)))`) -- never by sigma. This is the actual "not O(sigma)"
-       claim: the same small bound holds whether sigma is 2000 or 1e6.
-    2. On an image big enough for the cascade to reach `quality_cap` before the
-       1-pixel floor (true for sigma=2000/8192 at the 4096x4096 size used below), the
-       ONE real Gaussian blur the pyramid path performs always runs at a kernel-bounded
-       sigma <= quality_cap -- the same tiny kernel regardless of the caller's sigma.
-       For sigma so large relative to the image that the 1-pixel floor binds FIRST
-       (sigma=1e6 here), the residual is bounded instead by `sigma / 2**levels_used`
-       (a fixed, image-size-determined divisor) -- still a bound independent of any
-       further growth in sigma, just a looser one; this row checks that weaker bound
-       instead of a fixed constant.
+    The prior version of this test asserted a bound on the number of `avg_pool2d`
+    halving passes and a "final kernel sigma <= quality_cap, OR the 1-pixel-floor
+    bound sigma/2**levels_used when the image floor binds first" -- but for a FIXED
+    image size, `levels_used` is itself a constant once the 1-pixel floor binds, so
+    that second branch of the old bound was directly proportional to sigma, not
+    independent of its growth at all (confirmed by B2#1: measured ~5ms flat up to
+    sigma=1e6, then 12.7/72.4/707.5ms at 1e7/1e8/1e9 on a 1080p image -- the exact
+    O(sigma) blowup the pyramid exists to remove). The rewritten
+    `_gauss_blur_pyramid_approx` (A2) computes its downsample `factor` from
+    `sigma`/`quality_cap` ALONE, in a plain Python loop that never touches the
+    image -- there is no cascade of per-level ops left whose count the image's own
+    size could cap early, so the ONE real Gaussian blur it performs always runs at a
+    kernel-bounded `sigma / factor <= quality_cap`, for ANY sigma, on ANY image size.
+    This row checks exactly that (a single, sigma-independent bound), by capturing
+    the sigma the one real blur call receives.
     """
-    print("\n--- GAUSSPYR-50: huge sigma stays bounded (level count + final kernel sigma) ---")
-    pool_calls = {"n": 0}
-    real_avg_pool2d = torch.nn.functional.avg_pool2d
-
-    def _counting_avg_pool2d(*args, **kwargs):
-        pool_calls["n"] += 1
-        return real_avg_pool2d(*args, **kwargs)
-
+    print("\n--- GAUSSPYR-50/A2: huge sigma stays bounded (final kernel sigma), never "
+          "reverting to O(sigma) ---")
     final_sigma_seen = {"v": None}
     real_gauss_blur_bchw = _sc._gauss_blur_bchw
 
@@ -183,37 +180,27 @@ def test_gausspyr50_huge_sigma_bounded_levels(r: SubTestResult):
 
     h = w = 4096
     img = torch.rand(1, 1, h, w)  # single channel: this is a structural/counts probe, not accuracy
-    max_levels = math.floor(math.log2(min(h, w))) + 1  # image-size-only bound, independent of sigma
+    allowed = QUALITY_CAP + 1e-6  # the ONLY bound now: independent of sigma, image size
 
-    for sigma in (2000.0, 8192.0, 1_000_000.0):
-        pool_calls["n"] = 0
+    for sigma in (2000.0, 8192.0, 1_000_000.0, 1e8, 1e9):
         final_sigma_seen["v"] = None
-        torch.nn.functional.avg_pool2d = _counting_avg_pool2d
         _sc._gauss_blur_bchw = _capturing_gauss_blur_bchw
         try:
             out = _gauss_blur_pyramid_approx(img, sigma)
         finally:
-            torch.nn.functional.avg_pool2d = real_avg_pool2d
             _sc._gauss_blur_bchw = real_gauss_blur_bchw
 
-        if pool_calls["n"] > max_levels:
-            r.fail(f"gausspyr50 level bound sigma={sigma}",
-                   f"{pool_calls['n']} halving passes, expected <= {max_levels} "
-                   f"(bounded by image size alone, never by sigma)")
-            return
-        floor_bound = sigma / (2.0 ** pool_calls["n"])
-        allowed = max(QUALITY_CAP, floor_bound) + 1e-6
         if final_sigma_seen["v"] is None or final_sigma_seen["v"] > allowed:
             r.fail(f"gausspyr50 final kernel bound sigma={sigma}",
                    f"the one real blur ran at sigma={final_sigma_seen['v']!r}, "
-                   f"expected <= {allowed:.4f} (quality_cap, or the 1-pixel-floor bound "
-                   f"sigma/2**{pool_calls['n']} when the image floor binds first)")
+                   f"expected <= {allowed:.4f} (quality_cap -- the bound no longer loosens "
+                   f"with sigma or image size at all)")
             return
         if not torch.isfinite(out).all():
             r.fail(f"gausspyr50 finite sigma={sigma}", "non-finite output")
             return
-    r.ok(f"halving-pass count stays <= {max_levels} (image-size bound, never sigma-dependent) "
-         f"and the one exact blur's kernel stays bounded, for sigma up to 1e6")
+    r.ok(f"the one real blur's kernel stays bounded at <= quality_cap ({QUALITY_CAP}) for "
+         f"sigma up to 1e9 -- no O(sigma) reversion at any tested magnitude")
 
 
 # ── Invariant 2: interp/codegen parity, both paths ──────────────────────────

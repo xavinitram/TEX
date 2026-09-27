@@ -914,32 +914,44 @@ def _gauss_blur_pyramid_approx(img: torch.Tensor, sigma: float) -> torch.Tensor:
     """Downscale-pyramid Gaussian blur approximation for sigma past
     `GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA` (D2's automatic "Nuke quality" path).
 
-    Halves the image via plain `avg_pool2d` (a cheap box-filter downsample, no
-    Gaussian kernel — the per-level cost the fuzzer sweep found both faster AND more
-    accurate than re-blurring at each level) until the RESIDUAL sigma at that level
-    (`sigma` scaled down by the same halving factor) is at or below
-    `GAUSS_BLUR_PYRAMID_QUALITY_CAP`; blurs EXACTLY at that small residual sigma via
-    the same `_gauss_blur_bchw` used everywhere else (so the one real blur this
-    function does is bit-identical machinery, not a second approximation); then
-    upsamples back to the original size with a single bilinear pass. Cost is
-    O(image size) once — flat regardless of sigma, unlike the exact conv's O(sigma)
-    — because the number of halvings is O(log2(sigma)) and each level's image is a
-    quarter the pixels of the one before it (a geometric series bounded by ~4/3x the
-    full-res image, dominated by the flat bilinear upsample at the end).
+    A2 (v0.50 Phase C, B2#1): the downsample factor is computed purely from
+    `sigma`/`GAUSS_BLUR_PYRAMID_QUALITY_CAP` — the SAME shape
+    `_bilateral_detail_transfer_bchw`'s own `factor` loop already uses
+    (`stdlib_sample.py`, `while ss / factor > 1.0: factor *= 2`) — never from the
+    image's own dimensions. The prior version cascaded `avg_pool2d` one halving at a
+    time and stopped EITHER on `residual <= quality_cap` OR on `min(H, W) <= 1`,
+    whichever came first; for a large enough sigma on a fixed-size image, the second
+    condition won BEFORE the first, silently reopening `_gauss_blur_bchw`'s own
+    O(sigma) cost at whatever residual was left over — the exact "raise the cap, keep
+    the O(r) loop" shape RADIUS-50a-design.md's D2 option 3 rejected, except nobody
+    chose it; it fell out of the stopping condition. Computing `factor` from `sigma`
+    alone (never touching the image) and reducing to the target size in ONE
+    `interpolate(mode='area')` call — rather than a cascade of per-level halvings —
+    removes the second stopping condition entirely: there is no loop left for the
+    image's own size to prematurely end.
+
+    Blurs EXACTLY at the residual sigma (`sigma / factor`, always <=
+    `GAUSS_BLUR_PYRAMID_QUALITY_CAP`) via the same `_gauss_blur_bchw` used everywhere
+    else (so the one real blur this function does is bit-identical machinery, not a
+    second approximation), then upsamples back to the original size with a single
+    bilinear pass. Cost is O(image size) once — flat regardless of sigma — because
+    `factor` only ever governs the OUTPUT size of one resample call, never a loop
+    whose iteration count could itself grow with sigma.
 
     Only ever called for `sigma > GAUSS_BLUR_PYRAMID_THRESHOLD_SIGMA`; never touches
     the exact path below that (invariant 7 — this is purely additive on the new
     branch).
     """
-    current = img
-    residual = sigma
-    while residual > GAUSS_BLUR_PYRAMID_QUALITY_CAP and min(current.shape[-2], current.shape[-1]) > 1:
-        current = torch.nn.functional.avg_pool2d(current, kernel_size=2, stride=2)
-        residual *= 0.5
-    current = _gauss_blur_bchw(current, residual)
     out_h, out_w = img.shape[-2], img.shape[-1]
+    factor = 1
+    while sigma / factor > GAUSS_BLUR_PYRAMID_QUALITY_CAP:
+        factor *= 2
+    reduced_h, reduced_w = max(1, round(out_h / factor)), max(1, round(out_w / factor))
+    reduced = torch.nn.functional.interpolate(img, size=(reduced_h, reduced_w), mode='area')
+    residual = sigma / factor
+    blurred = _gauss_blur_bchw(reduced, residual)
     return torch.nn.functional.interpolate(
-        current, size=(out_h, out_w), mode='bilinear', align_corners=False,
+        blurred, size=(out_h, out_w), mode='bilinear', align_corners=False,
     )
 
 
