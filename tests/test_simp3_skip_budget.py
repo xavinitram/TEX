@@ -202,7 +202,11 @@ _SKIP_VOCAB = re.compile(
 #: (three CUDA `r.skip` sites) collapsed into one `test_scalecg48_codegen_interp_parity`
 #: looping over `(device, scale)`, with exactly ONE `r.skip` call covering the whole CUDA
 #: side of the loop instead of three separate ones — same coverage, three fewer skip sites.
-_SKIP_BUDGET = 121
+#: Re-pinned from 121 to 122 (TRK-49, TRK-220): `test_trk220_cuda_halo_pressure.py`'s end-to-end
+#: row cooks the memory-pressure halo-tiled path on a real CUDA device (tiled vs whole-frame,
+#: `torch.equal`); its CPU twin in the same file forces the same planner decision with no
+#: device and runs everywhere, so this one skip needs CUDA and nothing else.
+_SKIP_BUDGET = 122
 
 
 def _literal(node) -> str:
