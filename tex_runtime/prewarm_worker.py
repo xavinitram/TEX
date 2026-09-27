@@ -21,7 +21,24 @@ entry (not picklable, and not the point of this module) or `graphed._capturable_
 disk-backed). A program warmed this way still pays its own comparatively-cheap Dynamo trace and
 capturability probe on this process's first real cook — the same as `"thread"` mode's own
 cold-in-THIS-process case for any program the warm never reached at all.
-"""
+
+HOUSE-50/H6 (TRK-232, doc-only — no behaviour below changed): an embedding host's own
+tooling asked whether this child's VRAM footprint is observable per-process. It is NOT,
+from OUTSIDE this process, on every GPU/driver: an external `nvidia-smi`-style query
+attributes VRAM to a PID, and that attribution is a driver/OS feature that is not
+guaranteed everywhere (WDDM-shared or virtualized/MIG contexts can under- or
+mis-attribute), and by the time `warm_in_subprocess` returns, this child process has
+already exited (this module's own subprocess call blocks until it does), so there is
+nothing left for a host to query even where attribution works. The only point that can
+ever answer this reliably is the
+child itself, self-reporting BEFORE it exits — `torch.cuda.memory_allocated()`/
+`memory_reserved()`/`max_memory_allocated()` on the device it just compiled for, already
+available with NO new dependency (`torch` is imported here regardless, via
+`tex_api.prewarm()`). This module does not currently thread any such figure into the JSON
+summary `_run_worker_main` prints — a real, ADDITIVE field a future ask could add there,
+never a fix to what runs today. Recorded here, beside the code it concerns, rather than
+only in an orchestration document this repository never ships, so the next reader who
+reaches for this exact answer finds it."""
 from __future__ import annotations
 
 import json
