@@ -640,11 +640,13 @@ def execute_compiled(
                     entry = _try_compile(device_type, program, type_map,
                                          used_builtins=used_builtins, precision=precision,
                                          fingerprint=fingerprint)
-                    # COMPILETRY-50: a no-op unless `fingerprint` was actually granted the
-                    # one remembered fall-through attempt above (see `_try_compile`).
-                    fncalls_compile.resolve_attempt(
-                        fingerprint, entry[1] if entry is not None else None)
                     if entry is None:
+                        # No backend available at all — nothing was ever wrapped, so
+                        # there is no real invocation to wait for; settle here.
+                        # COMPILETRY-50: a no-op unless `fingerprint` was actually
+                        # granted the one remembered fall-through attempt (see
+                        # `_try_compile`).
+                        fncalls_compile.resolve_attempt(fingerprint, None)
                         # No backend available — run plain interpreter here
                         return _plain_execute(program, contiguous_bindings, type_map,
                                               device, latent_channel_count, output_names,
@@ -668,9 +670,29 @@ def execute_compiled(
                         # very thread that invokes compiled_fn just below (and the
                         # calling thread). The bounded cache already caps growth.
                         _compiled_cache.popitem(last=False)
-                    compiled_fn, _entry_backend = _compiled_cache[cache_key]
-                    return compiled_fn(program, contiguous_bindings, type_map, device,
-                                       latent_channel_count, output_names, scale=scale)
+                    compiled_fn, entry_backend = _compiled_cache[cache_key]
+                    # K2 (v0.50.0 Phase C, B3#2): resolve the fncalls_compile verdict
+                    # only AFTER this compiled callable's FIRST REAL INVOCATION
+                    # completes (or raises) -- never right after torch.compile()
+                    # merely WRAPS it (`_try_compile` only wraps; nothing traces or
+                    # lowers until the wrapped callable is first invoked, exactly
+                    # the CC-5 lazy-first-call fact `_submit_bg_compile`'s own
+                    # `warm_call` already exists to force off the interactive path).
+                    # Wrap can succeed while the real Dynamo trace still fails at
+                    # first call, and settling the verdict at wrap-time would
+                    # memoize a permanent, false "compiles" for a fingerprint whose
+                    # every real cook actually still falls back to codegen (B3#2).
+                    # Mirrors `_submit_bg_compile`'s own `finally`-after-`warm_call()`
+                    # ordering, which this site did not follow before this fix.
+                    try:
+                        result = compiled_fn(program, contiguous_bindings, type_map,
+                                             device, latent_channel_count, output_names,
+                                             scale=scale)
+                    except Exception:
+                        fncalls_compile.resolve_attempt(fingerprint, None)
+                        raise
+                    fncalls_compile.resolve_attempt(fingerprint, entry_backend)
+                    return result
 
                 compiled_fn, _entry_backend = _compiled_cache[cache_key]
                 _compiled_cache.move_to_end(cache_key)

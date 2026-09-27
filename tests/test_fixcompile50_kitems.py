@@ -16,9 +16,23 @@ import torch
 import torch._dynamo.config as _dynamo_config
 
 from helpers import *  # noqa: F401,F403
+from TEX_Wrangle.tex_cache import parse_and_split
 from TEX_Wrangle.tex_runtime import codegen_persist as CP
 from TEX_Wrangle.tex_runtime import fncalls_compile as FC
 from TEX_Wrangle.tex_runtime import compiled as C
+
+
+def _spatial_program():
+    """A program with enough tensor ops / spatial context to clear
+    `execute_compiled`'s own early gates (op_count>=8, loop_depth<=2, has_spatial)."""
+    code = ("vec3 c=@A.rgb; c = c*1.3 - 0.1; c = c + 0.05; c = c*0.9; "
+           "c = clamp(c, 0.0, 1.0); c = pow(c, 1.1); c = c*c; "
+           "@OUT=vec4(c,1.0);")
+    bt = {"A": TEXType.VEC3, "OUT": TEXType.VEC4}
+    prog = parse_and_split(code, bt)
+    tm = TypeChecker(binding_types=bt, source=code).check(prog)
+    used = _collect_identifiers(prog)
+    return prog, tm, used
 
 
 # ── K1: codegen's exec-globals lacked __name__ -> Dynamo KeyError on a graph-break
@@ -148,3 +162,91 @@ def test_k1_module_is_bounded_and_evicted_with_its_linecache_entry(r: SubTestRes
         CP._LINECACHE_MAX = saved_max
         CP._LINECACHE_KEYS.clear()
         CP._LINECACHE_KEYS.extend(saved_keys)
+
+
+# ── K2: `execute_compiled` resolved the fncalls_compile verdict right after wrap,
+# before the compiled callable's first REAL invocation ran -- poisoning it True even
+# when the real invocation always fails. Fix: resolve only after that first call
+# completes or raises. ──────────────────────────────────────────────────────────────
+
+def test_k2_verdict_settles_false_when_the_first_real_call_fails(r: SubTestResult):
+    """RED against the pre-fix ordering: a wrap that succeeds (`entry[1]` is a real
+    backend name) but whose compiled callable raises on its very first real invocation
+    must settle the fncalls_compile verdict FALSE, not TRUE. Constructed the same way
+    B3#2 diagnosed it -- by reading the exact call ordering in `_compile_and_run`."""
+    print("\n--- K2: a wrap-succeeds/first-call-fails fingerprint settles False, not True ---")
+    prog, tm, used = _spatial_program()
+    img = make_img(1, 16, 16, 3, seed=41)
+    fp = "k2_test_fp"
+    cache_key = (fp, "cpu", "fp32")
+    C._compiled_cache.pop(cache_key, None)
+    C._verify_state.pop(cache_key, None)
+    C._route_memo.pop(fp, None)
+    FC.reset_for_test()
+    FC._pending.add(fp)   # simulate _try_compile's own begin_attempt() having granted it
+
+    def _raising_compiled_fn(*a, **kw):
+        raise RuntimeError("simulated real Dynamo trace/lower failure at first call")
+
+    orig_try_compile = C._try_compile
+    C._try_compile = lambda *a, **kw: (_raising_compiled_fn, "inductor")
+    try:
+        C.execute_compiled(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"],
+                           used_builtins=used)
+        verdict = FC.verdict(fp)
+        assert verdict is False, (
+            f"expected the fncalls_compile verdict to settle False (the real "
+            f"invocation raised), got {verdict!r} -- a wrap-time-only resolve would "
+            f"have memoized True here, permanently, even though the artifact never "
+            f"actually works")
+        assert fp not in FC._pending, "resolve_attempt must clear the pending marker"
+        r.ok("K2: the verdict settles False from the real invocation's failure, not "
+             "True from the wrap's own success")
+    except Exception as e:
+        r.fail("K2 verdict settles after real invocation", f"{type(e).__name__}: {e}")
+    finally:
+        C._try_compile = orig_try_compile
+        C._compiled_cache.pop(cache_key, None)
+        C._verify_state.pop(cache_key, None)
+        C._route_memo.pop(fp, None)
+        FC.reset_for_test()
+
+
+def test_k2_verdict_settles_true_only_after_a_successful_real_call(r: SubTestResult):
+    """GREEN companion: when the first real invocation actually succeeds, the verdict
+    still settles True (K2 must not turn every compile permanently False)."""
+    print("\n--- K2: a wrap-succeeds/first-call-succeeds fingerprint settles True ---")
+    prog, tm, used = _spatial_program()
+    img = make_img(1, 16, 16, 3, seed=42)
+    fp = "k2_test_fp_ok"
+    cache_key = (fp, "cpu", "fp32")
+    C._compiled_cache.pop(cache_key, None)
+    C._verify_state.pop(cache_key, None)
+    C._route_memo.pop(fp, None)
+    FC.reset_for_test()
+    FC._pending.add(fp)
+
+    calls = {"n": 0}
+
+    def _ok_compiled_fn(program, bindings, type_map, device, latent_channel_count=0,
+                        output_names=None, scale=None):
+        calls["n"] += 1
+        return bindings["A"]
+
+    orig_try_compile = C._try_compile
+    C._try_compile = lambda *a, **kw: (_ok_compiled_fn, "inductor")
+    try:
+        C.execute_compiled(prog, {"A": img}, tm, "cpu", fp, output_names=["OUT"],
+                           used_builtins=used)
+        assert calls["n"] == 1, f"expected the compiled callable invoked once, got {calls['n']}"
+        verdict = FC.verdict(fp)
+        assert verdict is True, f"expected the verdict to settle True, got {verdict!r}"
+        r.ok("K2: a genuinely working artifact still settles True after its real call")
+    except Exception as e:
+        r.fail("K2 verdict settles true on success", f"{type(e).__name__}: {e}")
+    finally:
+        C._try_compile = orig_try_compile
+        C._compiled_cache.pop(cache_key, None)
+        C._verify_state.pop(cache_key, None)
+        C._route_memo.pop(fp, None)
+        FC.reset_for_test()
