@@ -507,14 +507,31 @@ def _stencil_route_would_apply(code: str, binding_types: dict | None) -> bool | 
     `binding_types`) and check, or `None` ("unknown, answer conservatively") on any
     failure -- most commonly `binding_types` being `None` or incomplete, exactly the
     same "supply it for a precise answer" contract `roi_plan`'s `binding_types`
-    parameter already documents above. Compiling here reads/writes the SAME program
-    cache a real cook already populates (`TEXCache`) -- no new cache, no cook-observer
-    event, no tensor allocation, no execution."""
+    parameter already documents above.
+
+    FIX-TIER T2: this reads the SAME program cache a real cook would populate, but never
+    WRITES to it -- a cache HIT is served normally (`TEXCache.get`, no store), and a MISS
+    compiles through the same front end (`parse_and_split` + `TEXCache.compile_ast`)
+    `compile_tex` itself uses, WITHOUT calling `.put()`. `tier_verdict`'s own docstring
+    promises "no compile, no cache write, no cache pollution" (matching `scale_verdict`'s
+    genuine side-effect-freedom); going through `_compile_or_raise`/`compile_tex` broke
+    that promise for the one branch that reaches this function, because a cache miss
+    there unconditionally persists the result (memory AND disk, `TEXCache.put` ->
+    `_save_to_disk`) -- exactly the "compiles and populates the ordinary program cache"
+    behavior B2#1 caught by running it against a fresh `TEX_CACHE_DIR`. A speculative,
+    pre-cook query must not seed a `.pkl` (or a fresh in-memory slot) for a program nobody
+    has actually cooked."""
     try:
-        from .tex_cache import get_cache
+        from .tex_cache import get_cache, parse_and_split
         bt = binding_types or {}
-        fp = get_cache().fingerprint(code, bt)
-        ast = _tex_engine._compile_or_raise(code, bt, fp=fp)[0]
+        cache = get_cache()
+        fp = cache.fingerprint(code, bt)
+        cached = cache.get(code, bt, fp=fp)
+        if cached is not None:
+            ast = cached[0]
+        else:
+            program = parse_and_split(code, bt)
+            ast = cache.compile_ast(program, bt, source=code)[0]
         return bool(_tex_engine._should_stencil_route(fp, ast))
     except Exception:
         return None
