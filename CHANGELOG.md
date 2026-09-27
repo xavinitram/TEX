@@ -5,6 +5,32 @@ All notable changes to TEX Wrangle will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.1] - 2026-09-27 — "No history required"
+
+A patch release. `v0.49.0` ("The tier that actually runs") was tagged and pushed but never
+reached the Comfy registry: CI's test step failed on the shallow, single-commit checkout the
+Linux runner uses, so the release gate refused the publish and the registry kept serving the
+previous release. `v0.49.1` is `v0.49.0` plus the fix for that one failure — no other change,
+and no product file touched at all — and it is the tag whose publish workflow actually runs.
+**A registry user upgrading gets everything in `[0.49.0]` too, and should read that entry in
+full; it is not re-argued here.** `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved,
+no new reserved name, no ComfyUI pixel change.
+
+### Fixed
+
+- **A test resolved a past file version via `git show <rev>:<path>` (test-only).**
+  `test_scalecx49_capture_key_mismatch_before_fix` shelled out to read a pre-fix blob of
+  `tex_runtime/graphed.py` out of git history, to reconstruct the OLD `_capture_key` key shape
+  it needed for its repro — a shallow checkout (or any archive/zip install) carries no such
+  history, so `git show` exits `128` and the test errors before it can even run. It now
+  reconstructs the same pre-fix key shape in-process instead: a thin adapter wraps the REAL,
+  current `_capture_key` and calls it without forwarding the `scale` kwarg — exactly what every
+  call site did before that behaviour shipped, and the identical technique a sibling test in the
+  same file already uses to reproduce the live CUDA case. Proof strength is unchanged (a
+  deliberate revert of the fix, in a disposable copy of the tree, still reds this test); a
+  repo-wide sweep found no other test that needs commits beyond `HEAD`, or a `.git` directory at
+  all, to pass.
+
 ## [0.49.0] - 2026-09-27 — "The tier that actually runs"
 
 A minor release. `tex_api.LANGUAGE_VERSION` stays `"0.25"`; no default moved, no new reserved
