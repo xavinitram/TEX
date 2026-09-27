@@ -345,16 +345,14 @@ def test_pace_budget_ms_default_when_absent(r):
         r.fail("PACE-49 default budget", f"expected {_pace._DEFAULT_BUDGET_MS}, got {resolved}")
 
 
-@pytest.mark.parametrize("bad_budget", [-1, -0.5, "3", True, False])
+@pytest.mark.parametrize("bad_budget", [
+    -1, -0.5, "3", True, False,                       # FIX-PACE49 P6 (R2-simplification.md
+    float("nan"), float("inf"), float("-inf"),        # #4): merged with the former
+])                                                     # test_pace_budget_ms_rejects_nonfinite
 def test_pace_budget_ms_rejects_invalid(bad_budget):
-    tok = _Token(pace=True)
-    tok.pace_budget_ms = bad_budget
-    with pytest.raises(ValueError):
-        _pace._resolve_budget_ms(tok)  # noqa: SLF001
-
-
-@pytest.mark.parametrize("bad_budget", [float("nan"), float("inf"), float("-inf")])
-def test_pace_budget_ms_rejects_nonfinite(bad_budget):
+    """Invalid type/sign and non-finite are the same three-line assertion against the same
+    function, split into two tests for no reason found on reading (R2-simplification.md
+    #4) -- one parametrize list covers both shapes."""
     tok = _Token(pace=True)
     tok.pace_budget_ms = bad_budget
     with pytest.raises(ValueError):
