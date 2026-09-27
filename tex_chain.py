@@ -498,18 +498,31 @@ def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_cou
             specs.append(_tex_roi.StageSpec(
                 halo, tuple(sorted(set(name_to_upstream.values()))), arg_halo or None))
 
-        # 2. Plan windows — only when eligible. Mirrors `roi_eligibility`'s own outer gate:
-        #    a scale-active, LATENT or non-fp32 cook never windows here either (the linear
-        #    family refuses these for the identical reason — ROI is oracle-validated at
-        #    fp32 only, and scale/ROI narrowing is not yet reconciled).
+        # 2. Plan windows — only when eligible. FIX-DAG G2 (R1#1): call the SAME shared
+        #    ladder `cook_stage_list` above already calls (`tex_roi.roi_eligibility`)
+        #    instead of hand-copying its arithmetic a second time, so a future edit to that
+        #    ladder (a new ROI_REASON_*, a scale/precision bugfix) reaches this gate the way
+        #    the comment two hundred lines up already promises for `cook_stage_list` — never
+        #    only by someone remembering to hand-port it here too. This gate's own
+        #    `tier_id`/`fused_chain`/`executable` legs are legitimately answered elsewhere —
+        #    per-stage, via `StageSpec`/`stage_dag_arg_halos` in step 1 above, never by one
+        #    program's source — so the call passes a neutral `code=""`/`fused_chain=False`
+        #    to satisfy those three legs trivially (an empty program is always
+        #    `tier_id="default"`, is never fused, and is always ROI-3-executable with
+        #    `halo=0` — `roi_plan("", ...)` walks no statements at all), leaving only the
+        #    five conditions this gate actually decides (scale, latent, precision, armed,
+        #    malformed) live behind the one function every other caller already uses.
         windows = None
-        if (roi is not None and scale is None and not latent_channel_count
-                and eff_precision == "fp32" and _tex_roi.roi_exec_enabled(roi_exec)
-                and _tex_roi.validate_roi(roi) is None):
-            canon = _tex_roi.canonical_roi(roi)
-            if canon[2:4] != canon[4:6]:          # not already whole-frame
+        if roi is not None:
+            _elig = _tex_roi.roi_eligibility(
+                "", tier_id="default", fused_chain=False,
+                has_latent_input=bool(latent_channel_count), scale=scale, roi=roi,
+                roi_exec=roi_exec, param_values={}, binding_types=None,
+                eff_precision=eff_precision)
+            if _elig.armed:
                 windows = _tex_roi.chain_windows_dag(
-                    specs, canon, dirty_from=dirty_from, valid=valid, declined=declined)
+                    specs, _elig.canonical, dirty_from=dirty_from, valid=valid,
+                    declined=declined)
 
         # JOINWIRE-50b: the ONE key function for every clean-stage boundary this call either
         # reads or writes — `boundary_lineage_key` itself, unmodified (see the docstring
