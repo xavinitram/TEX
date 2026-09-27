@@ -84,13 +84,19 @@ not otherwise shrink with the canvas.
 - **ROI narrowing and `scale` are not yet reconciled.** A cook that passes both `roi=` and a
   non-None `scale` declines the ROI window (cooks whole-frame at the requested scale) rather
   than risk the two interacting incorrectly.
-- **`torch_compile`/`auto`/`cuda_graph` never honour `scale`.** A scale-active cook
-  (`scale` not `None`) whose tier selection names one of those three still forces the plain
-  interpreter — none of the three thread a runtime scale multiplier through their
-  compiled/captured code (SCALE-COMPILED-48, deferred past v0.48: a CUDA-graph capture
-  taken at one scale must never replay under another). This costs real acceleration for a
-  scale-active cook on those tiers; it does not cost correctness, and it does not touch the
-  default (`scale=None`) path's tier selection at all.
+- **`torch_compile`/`auto`/`cuda_graph` now honour `scale` (SCALECX-49, v0.49)**. A
+  scale-active cook (`scale` not `None`) whose tier selection names one of those three
+  is dispatched to that tier directly instead of being forced onto the plain interpreter.
+  `execute_compiled`/`run_auto` key their compiled-artifact cache (`_compiled_cache`, and
+  `autotier.make_key`'s own verdict bucket) by an explicit, trailing `scale` component;
+  `run_graphed`'s `_capture_key` gains the identical component — appended only when `scale`
+  is not `None`, so a `scale=None` cook keys exactly as before this ask (default-path
+  invariant unaffected). A distinct scale value gets its own compiled artifact / captured
+  graph (a capture at one scale can never replay under another — the acceptance criterion
+  this line used to name as unmet), reused on every repeat of that same value, never
+  recompiled/recaptured per call. `tier_verdict`'s `TIER_REASON_SCALE_ACTIVE_COMPILED`
+  reason code names this route. ROI stays out of scope on every tier regardless (the
+  bullet above) — this ask does not touch ROI eligibility at all.
   **The `"default"` tier's own internal codegen shortcut honours `scale` — but only for
   the narrow class of program that shortcut already accelerates.** `_should_stencil_route`
   recognizes exactly one shape: a *hand-written*, nested-loop, exact-fetch stencil (the
@@ -115,12 +121,13 @@ not otherwise shrink with the canvas.
 
 ## The declared-fallback query (TIERQ-48)
 
-Both gaps above — "only the interpreter tier honours `scale`" and ROI's own `tier_id ==
-"default"` requirement (`docs/roi-spatial-laziness.md`) — mean a host cannot learn, short
-of timing a cook and noticing it was slow, that a `torch_compile`/`auto`/`cuda_graph`-
-eligible program silently downgrades to the interpreter the moment `scale`/`roi` is
-requested. `tex_api.tier_verdict` (delegating to `tex_engine_tiers.tier_verdict`) makes
-that fact QUERYABLE instead of only documented in prose:
+ROI's own `tier_id == "default"` requirement (`docs/roi-spatial-laziness.md`) means a host
+cannot learn, short of timing a cook and noticing it was slow, that a `torch_compile`/
+`auto`/`cuda_graph`-eligible program silently cooks whole-frame the moment `roi` is
+requested (SCALECX-49, v0.49, closed the equivalent gap for `scale` itself — those three
+tiers now honour it directly, see above). `tex_api.tier_verdict` (delegating to
+`tex_engine_tiers.tier_verdict`) makes both facts QUERYABLE instead of only documented in
+prose:
 
     from TEX_Wrangle import tex_api
     v = tex_api.tier_verdict(source, compile_mode="torch_compile", device="cuda:0",
