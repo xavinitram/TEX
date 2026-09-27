@@ -490,6 +490,11 @@ _NOT_AN_ESCAPE_HATCH = {
                     "the real arm, and the path is documented in docs/roi-spatial-laziness.md",
     "TEX_ROI_CODEGEN": "an A/B lever for routing an ROI cook through the codegen tier, "
                        "documented with the ROI notes rather than as a host-facing hatch",
+    "TEX_GATE_NO_INDUCTOR": "a gate/CI-only lever (`tools/gate.py::run_ci_shape` sets it) "
+                            "that forces the Inductor toolchain probe to read unavailable; "
+                            "no ComfyUI user or embedding host has a reason to set it, so it "
+                            "is documented for completeness (every product-read switch must "
+                            "be, per NEG-3) rather than registered as a host-facing hatch",
 }
 
 
