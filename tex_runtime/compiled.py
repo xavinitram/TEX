@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time as _time
 from collections import OrderedDict as _OrderedDict
 from typing import Any, Callable
 
@@ -33,7 +34,7 @@ from .interpreter import (Interpreter, _collect_identifiers, _consensus_extent,
                           _SCALAR_BUILTIN_DEFAULTS, _record_ingest_event)
 from .codegen import (try_compile as _try_codegen, _invoke_cg,
                       _iter_child_nodes, is_vec_param_list)
-from .host import CookCancelled  # SCHED-3 seam (no cycle: host imports torch only)
+from .host import CookCancelled, _cancel_check  # SCHED-3 seam (no cycle: host imports torch only)
 from .stdlib import TEXStdlib, _tag_host_scalar
 from . import tier_trace  # leaf module (imports only threading) — no cycle
 from . import pacing as _pace   # PACE-45: bounds queue-ahead when a token opts in
@@ -800,6 +801,45 @@ def execute_compiled(
 # same TLS-isolated worker; the cook never blocks on future.result().
 _bg_futures: dict = {}
 
+# AUTOSAFE-50 (TRK-223): the TRIAL tier's first REAL invocation of a freshly-promoted
+# compiled callable, in flight, keyed by cache_key -- the counterpart to `_bg_futures`
+# for the *promotion* step rather than the compile-wrap/warm step. See `_submit_trial`/
+# `_await_trial` below.
+_trial_futures: dict = {}
+
+# AUTOSAFE-50: visible, best-effort counters for the promotion path (tier_trace already
+# carries a per-cook reason string; this is the cumulative-count counterpart a host or a
+# test can read without scraping `tier_trace.recent()`). Never gates behaviour.
+_promotion_stats = {"bounded": 0, "failed": 0}
+
+
+def promotion_stats() -> dict:
+    """AUTOSAFE-50: a copy of the cumulative promotion counters -- how many cooks
+    deferred an in-flight TRIAL invocation past the bounded wait ("bounded"), and how
+    many times a background compile or a TRIAL invocation ended in failure ("failed").
+    Read-only for hosts/tests; `_reset_capability_cache_for_test`-style callers reset via
+    `_reset_promotion_stats_for_test`."""
+    return dict(_promotion_stats)
+
+
+def _reset_promotion_stats_for_test() -> None:
+    _promotion_stats["bounded"] = 0
+    _promotion_stats["failed"] = 0
+
+
+# AUTOSAFE-50: the cook thread's own budget for waiting on an in-flight TRIAL job before
+# giving up FOR THIS COOK and returning the safe (codegen) tier instead -- never the
+# promotion's own deadline (the background job keeps running regardless; a later cook's
+# poll is near-free once it is done). Small on purpose: the common case (an artifact the
+# background warm already exercised) resolves inside one or two slices, and a genuinely
+# slow real invocation (TRK-223) then costs this bound, not its own full duration, on the
+# cook thread. Chosen in the same family as AUTO-47's probe bound (500 ms) and
+# PREWARM-481's measured heartbeat bound (~120 ms) -- an order of magnitude tighter than
+# either, because this wait sits on the INTERACTIVE cook path itself, not a one-time
+# background warm.
+_TRIAL_WAIT_BUDGET_S = 0.02
+_TRIAL_POLL_SLICE_S = 0.005
+
 
 # SPLIT-47 (TRK-210): `_timed` / `_timed_deferred` (+ `_deferred_ev`/`_DEFERRED_EV_MAX`) /
 # `_contiguous_bindings` moved to `compiled_exec_support.py` and are re-exported above.
@@ -976,13 +1016,23 @@ def _drain_bg_for_test(timeout: float = 10.0) -> None:
     compile/warm job, so a job started by an EARLIER `cold_engine_state` block cannot
     reach a monkeypatched module-level seam (`_invoke_cg`/`_params_on_device`) during a
     LATER block and inflate that block's own spy counts (B5#1). Never raises: a job that
-    errors or times out is still forgotten, leaving no artifact behind."""
+    errors or times out is still forgotten, leaving no artifact behind.
+
+    AUTOSAFE-50: also drains `_trial_futures` — the promotion step's own in-flight jobs
+    are exactly the same cross-block leak class this function already exists to close,
+    just for the TRIAL invocation instead of the wrap/warm step."""
     for cache_key, fut in list(_bg_futures.items()):
         try:
             fut.result(timeout=timeout)
         except Exception:
             pass
         _bg_futures.pop(cache_key, None)
+    for cache_key, fut in list(_trial_futures.items()):
+        try:
+            fut.result(timeout=timeout)
+        except Exception:
+            pass
+        _trial_futures.pop(cache_key, None)
 
 
 def _run_cached_compiled(cache_key, program, bindings, type_map, device,
@@ -1019,10 +1069,97 @@ def _run_cached_compiled(cache_key, program, bindings, type_map, device,
         return None, None
 
 
+def _submit_trial(cache_key, program, bindings, type_map, device,
+                  latent_channel_count, output_names, device_type,
+                  scale: float | None = None) -> bool:
+    """AUTOSAFE-50 (TRK-223): submit the TRIAL tier's first REAL invocation of a
+    freshly-promoted compiled callable as a background job instead of running it
+    synchronously on the cook thread. A program that reaches TRIAL and gets a cache hit
+    can still pay a slow, GIL-holding first invocation of the freshly-compiled callable
+    (this ask's own repro: a deterministic stand-in; a real box may pay this from a
+    fresh CUDA-graph capture at the real cook's own tensor addresses, a guard mismatch
+    against the warm clone, or anything else `_try_compile`'s lazy wrap did not force) --
+    exactly the class `_submit_bg_compile`'s `warm_call` already backgrounds for the
+    WRAP step; this backgrounds the TRIAL step the same way, on the SAME dedicated
+    `_WARM_POOL` (C1's isolation: never share a worker with a plain wrap-only submit on
+    `_COMPILE_POOL`, and never spin up a new pool for this).
+
+    Returns True once a job is in flight (submitting now, or already was) -- the caller
+    (`run_auto`) polls it with `_await_trial`, bounded, never blocking the cook thread past
+    a small budget. Idempotent per cache_key: a second call while one is already running
+    is a no-op that returns True without resubmitting."""
+    if cache_key in _trial_futures:
+        return True
+    contiguous = _contiguous_bindings(bindings, _canon_device(device))
+
+    def _worker():
+        with torch.inference_mode():
+            entry = _compiled_cache.get(cache_key)
+            if entry is None:
+                return None, None
+            compiled_fn, _b = entry
+            call = lambda: compiled_fn(program, contiguous, type_map, device,
+                                       latent_channel_count, output_names, scale=scale)
+            return _timed(call, device_type)
+
+    try:
+        _trial_futures[cache_key] = _WARM_POOL.submit(_worker)
+        return True
+    except Exception:
+        return False
+
+
+def _await_trial(cache_key, cancel=None):
+    """AUTOSAFE-50: bounded, cancellable poll of the in-flight TRIAL job `_submit_trial`
+    started for `cache_key`. Returns one of:
+      ("ready", (res, ms))  the invocation finished; `res` is the compiled tier's output.
+      ("failed", None)      it finished by raising, or produced no artifact to run.
+      ("pending", None)     still running after `_TRIAL_WAIT_BUDGET_S` -- unchanged, still
+                            in `_trial_futures`; a LATER cook polls again (near-zero cost
+                            once it is actually done: `Future.result(timeout=~0)`).
+      ("absent", None)     no job was ever submitted for this key (caller bug/race).
+
+    Waits in short slices (`_TRIAL_POLL_SLICE_S`) rather than one call so a supplied
+    `cancel` token is checked promptly (SCHED-3: a cancel aborts and is never swallowed —
+    `_cancel_check` raises `CookCancelled`, left to propagate) instead of only after the
+    whole budget elapses, and so a job that is already done (the common case: the
+    background warm already exercised this exact call) is picked up on the very first,
+    near-instant slice — the same cook it was submitted on, same as the synchronous call
+    this replaces used to do for a fast artifact."""
+    fut = _trial_futures.get(cache_key)
+    if fut is None:
+        return "absent", None
+    deadline = _time.monotonic() + _TRIAL_WAIT_BUDGET_S
+    while True:
+        _cancel_check(cancel)   # SCHED-3: propagate CookCancelled, never swallowed
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return "pending", None
+        try:
+            result = fut.result(timeout=min(_TRIAL_POLL_SLICE_S, remaining))
+        except concurrent.futures.TimeoutError:
+            continue
+        except Exception:
+            _trial_futures.pop(cache_key, None)
+            # Mirrors _run_cached_compiled's own crash handling: demote, reset dynamo on
+            # THIS (the calling) thread — dynamo state is process-global (DO-NOT-TOUCH).
+            _compiled_cache.pop(cache_key, None)
+            try:
+                torch._dynamo.reset()
+            except Exception:
+                pass
+            return "failed", None
+        _trial_futures.pop(cache_key, None)
+        if result is None or result[0] is None:
+            return "failed", None
+        return "ready", result
+
+
 def run_auto(program, bindings, type_map, device, fingerprint,
              latent_channel_count: int = 0, output_names=None,
              used_builtins=None, precision: str = "fp32",
-             time_context: dict | None = None, scale: float | None = None):
+             time_context: dict | None = None, scale: float | None = None,
+             cancel=None):
     """CC-2 entry: measure the always-safe codegen baseline, background-compile,
     trial the compiled fn, and commit only on a measured win. Never blocks on
     the compile; never routes to a slower tier than codegen-only.
@@ -1035,7 +1172,15 @@ def run_auto(program, bindings, type_map, device, fingerprint,
     PERFORMANCE-VERDICT bucket (`key`, via `autotier.make_key`) still files a scale-active
     trial separately, deliberately: `autotier.make_key`'s own docstring explains why a
     trial/commit measured at one scale must never contaminate — or be demoted by — a
-    differently-scaled cook's OWN measured timing."""
+    differently-scaled cook's OWN measured timing.
+
+    `cancel` (AUTOSAFE-50, default None — every caller before this ask, and every caller
+    that does not opt in, is byte-identical): the host's `CancelToken`, checked ONLY inside
+    the bounded TRIAL-promotion wait below (`_await_trial`) — nowhere else in this function
+    gains a new yield point. A cancel that trips while this cook is waiting on its own
+    freshly-promoted artifact's first real invocation raises `CookCancelled` and aborts the
+    cook immediately (SCHED-3: never mistaken for a compile defect), the same posture every
+    other cancel-aware yield point in this codebase already takes."""
     from . import autotier
     device_obj = torch.device(device)
     device_type = device_obj.type
@@ -1082,13 +1227,38 @@ def run_auto(program, bindings, type_map, device, fingerprint,
         state = autotier.TRIAL
 
     if state == autotier.TRIAL and cache_key in _compiled_cache:
-        res, ms = _run_cached_compiled(cache_key, program, bindings, type_map,
-                                       device, latent_channel_count,
-                                       output_names, device_type, timed=True,
-                                       scale=scale)
-        if res is None:
+        # AUTOSAFE-50 (TRK-223): the TRIAL tier's first REAL invocation used to run
+        # synchronously here (`_run_cached_compiled(...).result()`, no timeout) — a program
+        # that reaches TRIAL and gets a cache hit could still pay a slow, GIL-holding first
+        # invocation of the freshly-compiled callable ON THE COOK THREAD ITSELF, unbounded.
+        # Now it is submitted once (idempotent) and polled with a small bounded budget: the
+        # common case (the background warm already exercised this exact call) still resolves
+        # THIS cook, same as before; a genuinely slow one costs the bound, not its own full
+        # duration, and a later cook's near-free poll picks up the result once it lands —
+        # the cook keeps running on the safe (codegen) tier meanwhile, never idle and never
+        # stalled waiting for the promotion.
+        if not _submit_trial(cache_key, program, bindings, type_map, device,
+                             latent_channel_count, output_names, device_type, scale=scale):
             autotier.record_trial(key, None)
+            _promotion_stats["failed"] += 1
+            tier_trace.record("codegen", fallback_from="torch_compile",
+                              reason="promotion trial could not be submitted")
             return _codegen(bindings)
+        status, payload = _await_trial(cache_key, cancel)
+        if status == "pending":
+            _promotion_stats["bounded"] += 1
+            res = _codegen(bindings)
+            tier_trace.record("codegen", fallback_from="torch_compile",
+                              reason="promotion trial pending (bounded off the cook thread)")
+            return res
+        if status == "failed" or status == "absent":
+            autotier.record_trial(key, None)
+            _promotion_stats["failed"] += 1
+            res = _codegen(bindings)
+            tier_trace.record("codegen", fallback_from="torch_compile",
+                              reason="promotion trial failed; fell back cleanly")
+            return res
+        res, ms = payload
         autotier.record_trial(key, ms)
         return res
 
@@ -1178,6 +1348,13 @@ def run_auto(program, bindings, type_map, device, fingerprint,
             autotier.mark_ready(key)
         elif st in ("failed", "absent"):
             autotier.record_trial(key, None)  # compile failed → reject, stay on codegen
+            # AUTOSAFE-50 (TRK-231): a failed background compile must always be
+            # VISIBLE, not just silently rejected — `res` above already served this cook
+            # from codegen (the `_timed_deferred` call earlier in this branch), so this
+            # only overwrites tier_trace's own generic "codegen" record with the reason.
+            _promotion_stats["failed"] += 1
+            tier_trace.record("codegen", fallback_from="torch_compile",
+                              reason="background compile failed; fell back cleanly")
     return res
 
 

@@ -213,11 +213,25 @@ def _run_auto(ctx):
     _fp = ctx.fused_fp if ctx.fused_chain else ctx.fp
     try:
         from .tex_runtime.compiled import run_auto
+        # AUTOSAFE-50: `cancel` is forwarded so a TRIAL promotion's own bounded wait
+        # (`run_auto`'s only new yield point) can honour a cancel that trips while this
+        # cook is waiting on its freshly-promoted artifact's first real invocation --
+        # every other part of the "auto" tier still has no internal yield point (unchanged
+        # from the posture `_roi_codegen_exec`'s own docstring describes for the compiled
+        # tiers generally: a cancel is honoured between region cooks, plus now also during
+        # this one bounded promotion wait).
         return run_auto(ctx.program, ctx.bindings, ctx.type_map, ctx.device, _fp,
                         latent_channel_count=ctx.latent_channel_count,
                         output_names=ctx.output_names, used_builtins=ctx.used_builtins,
                         precision=ctx.eff_precision, time_context=ctx.time_context,
-                        scale=ctx.scale)  # SCALECX-49
+                        scale=ctx.scale, cancel=ctx.cancel)  # SCALECX-49 / AUTOSAFE-50
+    except _tex_engine.CookCancelled:
+        # AUTOSAFE-50/SCHED-3: a cancel aborts — never mistaken for a codegen/compile
+        # defect and silently swallowed into an interpreter fallback (the generic
+        # `except Exception` below predates `run_auto` ever having a yield point at all;
+        # now that its bounded TRIAL-promotion wait can raise this, it must be re-raised
+        # BEFORE that catch-all, matching every other cancel-aware call site in this file).
+        raise
     except Exception as auto_exc:
         _record_codegen_defect_fallback("auto", auto_exc)
         logger.warning("[TEX] auto tier failed (%s); using interpreter.", auto_exc)

@@ -150,7 +150,7 @@ def test_o1_tiling_halo_plan_consumes_the_same_fix(r: SubTestResult):
     # CPU-only window), so this calls the EXACT function it delegates the halo decision to
     # (`tex_roi.roi_plan(code, _scalar_params(bindings), binding_types)`, tex_tiling.py:373)
     # with the identical argument shape, proving the fix reaches this call site too. A CUDA
-    # memory-pressure/TDR confirmation is deferred to a lease-holding follow-up, per B1-roi.md
+    # memory-pressure/TDR confirmation is deferred to a lease-holding follow-up, per the ROI bug hunt
     # finding 1's own "not confirmed by running" note for this exact path.
     try:
         from TEX_Wrangle import tex_tiling as _T

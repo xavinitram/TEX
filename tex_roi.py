@@ -1757,7 +1757,7 @@ class StageSpec:
     already resolves the single-input case; this dataclass only carries the resolved
     number, the same division of labour `halos[i]` already had.
 
-    KNOWN LIMIT (Q5, B1-roi.md): `arg_halo` is keyed by UPSTREAM STAGE INDEX only, one number
+    KNOWN LIMIT (Q5): `arg_halo` is keyed by UPSTREAM STAGE INDEX only, one number
     per index. A stage reading the SAME upstream index through TWO argument roles needing
     DIFFERENT margins (e.g. the same plate as both a zero-halo `bg` and a blurred `fg` needing
     one, with no intervening stage) would silently get the SMALLER one, under-serving whichever
