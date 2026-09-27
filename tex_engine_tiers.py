@@ -496,16 +496,15 @@ TIER_REASON_SCALE_ACTIVE_CODEGEN = "scale-active-codegen-stencil"
 # loop still reports TIER_REASON_SCALE_ACTIVE (interpreter) — see docs/resolution-scale.md.
 TIER_REASON_SELECTED = "tier-selected"              # plain select_tier verdict, scale inactive
 
-ROI_REASON_TIER_NOT_DEFAULT = "roi-declined-tier-not-default"
-ROI_REASON_FUSED_CHAIN = "roi-declined-fused-chain"
-ROI_REASON_LATENT = "roi-declined-latent-input"
-ROI_REASON_SCALE_ACTIVE = "roi-declined-scale-active"
-ROI_REASON_NOT_ARMED = "roi-declined-not-armed"
-ROI_REASON_MALFORMED = "roi-declined-malformed"
-ROI_REASON_WHOLE_FRAME = "roi-declined-whole-frame"
-ROI_REASON_NOT_EXECUTABLE = "roi-declined-not-executable"
-ROI_REASON_PRECISION = "roi-declined-precision-not-fp32"
-ROI_REASON_ARMED = "roi-armed"
+# FIX-TIER T1: single-sourced from `tex_roi.roi_eligibility` (the shared ladder), which
+# also computes them — re-exported here under their pre-existing names so every earlier
+# host/test import of `tex_engine_tiers.ROI_REASON_*` keeps resolving unchanged.
+from .tex_roi import (
+    ROI_REASON_TIER_NOT_DEFAULT, ROI_REASON_FUSED_CHAIN, ROI_REASON_LATENT,
+    ROI_REASON_SCALE_ACTIVE, ROI_REASON_NOT_ARMED, ROI_REASON_MALFORMED,
+    ROI_REASON_WHOLE_FRAME, ROI_REASON_NOT_EXECUTABLE, ROI_REASON_PRECISION,
+    ROI_REASON_ARMED,
+)
 
 
 @dataclass(frozen=True)
@@ -621,32 +620,14 @@ def tier_verdict(code: str, *, compile_mode: str = "none", device: str = "cpu",
     roi_armed = False
     roi_reason = None
     if roi is not None:
-        # Mirrors `tex_engine.prepare()`'s ROI gate verbatim, in the same order: the
-        # OUTER eligibility (tier/fused/latent) first, then scale, then the per-window
-        # checks `run_roi`'s own cheap validation performs ahead of the expensive ones.
-        if tier_id != "default":
-            roi_reason = ROI_REASON_TIER_NOT_DEFAULT
-        elif fused_chain:
-            roi_reason = ROI_REASON_FUSED_CHAIN
-        elif has_latent_input:
-            roi_reason = ROI_REASON_LATENT
-        elif scale is not None:
-            roi_reason = ROI_REASON_SCALE_ACTIVE
-        elif not _tex_roi.roi_exec_enabled(roi_exec):
-            roi_reason = ROI_REASON_NOT_ARMED
-        elif _tex_roi.validate_roi(roi) is not None:
-            roi_reason = ROI_REASON_MALFORMED
-        else:
-            _canon = _tex_roi.canonical_roi(roi)
-            if _canon[2:4] == _canon[4:6]:
-                roi_reason = ROI_REASON_WHOLE_FRAME
-            elif not _tex_roi.roi_plan(code, param_values, binding_types).executable:
-                roi_reason = ROI_REASON_NOT_EXECUTABLE
-            elif eff_precision != "fp32":
-                roi_reason = ROI_REASON_PRECISION
-            else:
-                roi_armed = True
-                roi_reason = ROI_REASON_ARMED
+        # FIX-TIER T1: the shared ladder (`tex_roi.roi_eligibility`) — the SAME function
+        # `tex_engine.prepare()` and `tex_chain.cook_stage_list` call, so this can never
+        # drift from either by a forgotten hand-edit.
+        _elig = _tex_roi.roi_eligibility(
+            code, tier_id=tier_id, fused_chain=fused_chain, has_latent_input=has_latent_input,
+            scale=scale, roi=roi, roi_exec=roi_exec, param_values=param_values,
+            binding_types=binding_types, eff_precision=eff_precision)
+        roi_armed, roi_reason = _elig.armed, _elig.reason
 
     if scale is not None:
         # On the "default" tier only (never torch_compile/auto/cuda_graph — those stay

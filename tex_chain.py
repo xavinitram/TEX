@@ -252,43 +252,28 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
         output_names = sorted(assigned.keys())
         eff_precision = "fp32" if latent_channel_count else precision
 
-        # ROI-48A: gate a per-cook window exactly like `tex_engine.prepare()` does, before
-        # dispatching to the interpreter. `roi_plan_obj`/`roi_out` stay None (a no-op) unless
-        # every clause admits.
+        # FIX-TIER T1 (R1/R2#1-2): the shared ladder (`tex_roi.roi_eligibility`) — the SAME
+        # function `tex_engine.prepare()` and `tex_engine_tiers.tier_verdict` call, so this
+        # gate can never silently drift from theirs. `cook_stage_list` has no tier_id of
+        # its own to select (it always runs the interpreter directly, single-stage-only for
+        # a window) — `tier_id="default"` names the one tier this family ever windows, and
+        # `fused_chain=len(stages) != 1` is this family's own "is this actually windowable"
+        # proxy (a multi-stage chain is never a single program the ladder's `roi_plan` call
+        # could analyze).
         roi_out = None
         roi_plan_obj = None
         if roi is not None:
-            _roi_why = None
-            if len(stages) != 1:
-                _roi_why = ("roi declined: cook_stage_list only windows a single "
-                            "(non-fused) stage")
-            elif latent_channel_count:
-                _roi_why = "roi declined: LATENT narrows the wrong axis and forces fp32 (M-3)"
-            elif scale is not None:
-                _roi_why = "roi declined: scale is active (not yet reconciled with ROI narrowing)"
-            elif not _tex_roi.roi_exec_enabled(roi_exec):
-                _roi_why = "roi not armed (pass roi_exec=True or set TEX_ROI_EXEC=1)"
-            elif (_bad := _tex_roi.validate_roi(roi)) is not None:
-                _roi_why = f"roi refused: {_bad}"
-            else:
-                _canon = _tex_roi.canonical_roi(roi)
-                if _canon[2:4] == _canon[4:6]:
-                    _roi_why = "roi covers the whole frame (nothing to narrow)"
-                elif eff_precision != "fp32":
-                    _roi_why = (f"roi declined: the cook is {eff_precision}, and ROI is only "
-                                "validated at fp32")
-                else:
-                    # `len(stages) == 1` here — the `_roi_why` branch above already caught
-                    # every other case — so `binding_types` (only bound on that path) is
-                    # always defined by the time this line runs.
-                    from .tex_tiling import _scalar_params
-                    _plan = _tex_roi.roi_plan(stages[0]["code"], _scalar_params(bindings),
-                                              binding_types)
-                    if _plan.executable:
-                        roi_out, roi_plan_obj = _canon, _plan
-                    else:
-                        _roi_why = ("roi declined: program is not ROI-executable "
-                                   "(whole-image gather / unbounded reach)")
+            from .tex_tiling import _scalar_params
+            _elig = _tex_roi.roi_eligibility(
+                stages[0]["code"] if len(stages) == 1 else "",
+                tier_id="default", fused_chain=len(stages) != 1,
+                has_latent_input=bool(latent_channel_count), scale=scale, roi=roi,
+                roi_exec=roi_exec, param_values=_scalar_params(bindings),
+                binding_types=binding_types if len(stages) == 1 else None,
+                eff_precision=eff_precision)
+            _roi_why = _elig.message
+            if _elig.armed:
+                roi_out, roi_plan_obj = _elig.canonical, _elig.plan
             from .tex_runtime import tier_trace as _tier_trace
             _tier_trace.record_roi(None, _roi_why or ("roi armed" if roi_out is not None
                                                        else None))

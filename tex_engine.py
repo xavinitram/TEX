@@ -878,60 +878,32 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
     # ROI-3: gate the sub-window cook. Flagged OFF (TEX_ROI_EXEC) and interpreter-tier only —
     # compiled tiers don't thread roi, so a would-be ROI cook that resolved to a compiled tier
     # simply runs whole-frame (same posture as tiling). Non-fused, non-latent, executable.
+    # FIX-TIER T1 (R1/R2/R4#1): the shared ladder (`tex_roi.roi_eligibility`) — the SAME
+    # function `tex_engine_tiers.tier_verdict` and `tex_chain.cook_stage_list` call, so
+    # this gate and theirs can never drift apart by a forgotten hand-edit. The three-way
+    # outer eligibility (tier/fused/latent) is folded into the ladder itself now, rather
+    # than gating whether this block even runs — an eligible-by-outer-conditions-but-
+    # otherwise-declined case still gets a real `ROI_REASON_*`/plan out of the one call,
+    # even though (matching this function's pre-existing behavior) no message is recorded
+    # on the trace for the three outer-eligibility declines.
     roi_out = roi_plan_obj = None
     _roi_why = None
-    if roi is not None and tier_id == "default" and not fused_chain and not has_latent_input:
+    if roi is not None:
         from . import tex_roi as _tex_roi
-        if scale is not None:
-            # SCALE-47b: not yet reconciled with narrow-cook-crop — decline, whole-frame.
-            _roi_why = "roi declined: scale is active (not yet reconciled with ROI narrowing)"
-        elif not _tex_roi.roi_exec_enabled(roi_exec):
-            _roi_why = "roi not armed (pass roi_exec=True or set TEX_ROI_EXEC=1)"
-        else:
-            # Cheap ARITHMETIC validation only (no `image_wh`, so no binding scan): it rejects a
-            # malformed or whole-frame window before this cook pays for `roi_plan` and, more
-            # importantly, before the ROI fp32 clamp below drops an fp16-eligible cook out of
-            # fp16 for nothing. The EXTENT check (does (W,H) match the bindings?) needs the
-            # binding scans, so it lives in `run_roi` — which owns the crop arithmetic the
-            # check protects and is also reachable without this gate (the ROI-4 oracle calls
-            # it directly). One cheap check here, the authoritative one there.
-            if (_bad := _tex_roi.validate_roi(roi)):
-                _roi_why = f"roi refused: {_bad}"
-            # Rebind `roi` to a plain-int COPY the moment it is known good, so everything after
-            # this line — including the `cooked_roi` the host is handed — is the engine's own
-            # object. A viewport that recycles one mutable rect buffer per frame could otherwise
-            # mutate the window it just cooked, leaving `cooked_roi` naming a different rect
-            # than the patch covers; and a list in yielded a list out of a documented 6-tuple.
-            elif (roi := _tex_roi.canonical_roi(roi))[2:4] == roi[4:6]:
-                # POLICY, not validity, so it lives here rather than in the validator: a window
-                # covering the whole frame narrows nothing, yet arming it would still pay the
-                # plan, the narrow-cook-crop round trip and — the expensive part — the ROI fp32
-                # clamp below, dropping an fp16-eligible cook out of fp16 for byte-identical
-                # output. A zoom-to-fit viewport frame hits this every time.
-                _roi_why = "roi covers the whole frame (nothing to narrow)"
-            elif (_plan := _tex_roi.roi_plan(code, _scalar_params(bindings), binding_types)).executable:
-                roi_out, roi_plan_obj = roi, _plan
-                # An fp16 cook does not get a window. ROI is oracle-validated at fp32 ONLY, and
-                # the ~1-ulp conv slack narrow-cook-crop leaves would scale up at fp16 — so the
-                # window cannot be cooked at fp16. This used to clamp it to fp32 instead, which
-                # is conservative when it applies to a WHOLE cook (the compiled-tier / LATENT
-                # forces) but not here, because an ROI patch is half of a pair that has to
-                # match: the canvas it gets composited into came from a whole-frame cook that
-                # stayed fp16, so the two disagreed by an fp16 ulp — measured 1.05e-03 max, 47%
-                # of pixels past 1e-4, on the exact use case v0.30 exists for. Neither
-                # precision is safe, so decline the window and cook whole-frame at the
-                # precision that was asked for: one consistent answer, identical to v0.29.
-                # That is the whitelist posture — a missed optimisation, never a wrong pixel.
-                # A host that wants the ROI speedup asks for fp32 (what the viewport already
-                # does; PM-6 and the ROI benchmarks are fp32 rows).
-                if eff_precision != "fp32":
-                    roi_out = roi_plan_obj = None
-                    _roi_why = (f"roi declined: the cook is {eff_precision}"
-                                + (" (auto)" if auto_fp16 else "")
-                                + ", and ROI is only validated at fp32")
-            else:
-                _roi_why = ("roi declined: program is not ROI-executable "
-                            "(whole-image gather / unbounded reach)")
+        _elig = _tex_roi.roi_eligibility(
+            code, tier_id=tier_id, fused_chain=fused_chain, has_latent_input=has_latent_input,
+            scale=scale, roi=roi, roi_exec=roi_exec,
+            param_values=_scalar_params(bindings), binding_types=binding_types,
+            eff_precision=eff_precision, auto_fp16=auto_fp16)
+        _roi_why = _elig.message
+        if _elig.armed:
+            # Rebind `roi` to the engine's own canonical-int copy — everything after this
+            # line, including the `cooked_roi` the host is handed, must be OURS: a viewport
+            # that recycles one mutable rect buffer per frame could otherwise mutate the
+            # rect it just cooked, leaving `cooked_roi` naming a different window than the
+            # patch covers.
+            roi = _elig.canonical
+            roi_out, roi_plan_obj = roi, _elig.plan
     if roi is not None:
         # `roi`, not a "was it still eligible" flag: a MALFORMED window used to null `roi` out
         # here and so skipped this record entirely, leaving a host that sent a bad rect with no

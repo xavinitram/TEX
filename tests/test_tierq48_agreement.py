@@ -213,3 +213,108 @@ def test_tierq48_never_raises_on_a_malformed_roi():
     assert v.tier == "default"
     assert not v.roi_armed
     assert v.roi_reason is not None and v.roi_reason.startswith("roi-declined")
+
+
+# ── FIX-TIER T1: extend the agreement test to the THIRD former copy ──────────
+#
+# `tex_chain.cook_stage_list`'s own ROI gate used to be a third, independently-maintained
+# hand-copy of this exact ladder (R1 finding 1) with its own ad hoc reason strings (R2
+# finding 2), pinned against neither `prepare()` nor `tier_verdict`. Both now call the
+# same `tex_roi.roi_eligibility` `tier_verdict` calls, so this row closes the actual gap
+# the two findings named: nothing previously cross-checked `cook_stage_list`'s verdict
+# against either of the other two.
+def _cook_stage_list_roi_armed(code, bindings, *, roi, roi_exec=None, scale=None,
+                              latent_channel_count=0):
+    """Whether `cook_stage_list` actually narrowed to the window: observed by counting
+    calls into `tex_memory.run_roi` (the only place a window is ever actually cooked),
+    the same "did the real mechanism fire" signal `_real_tier_and_roi_armed` reads off
+    `tier_trace` for the `tex_engine.prepare()` path — `cook_stage_list`'s own
+    `tier_trace.record_roi` call always passes `cooked_roi=None` regardless of arming
+    (a pre-existing quirk, unrelated to and unchanged by this ask), so that signal alone
+    cannot distinguish armed from declined here."""
+    from TEX_Wrangle import tex_chain as _tex_chain
+    from TEX_Wrangle import tex_memory as _tex_memory
+    _tex_roi.clear_roi_memo()
+    calls = {"n": 0}
+    real_run_roi = _tex_memory.run_roi
+
+    def _counting_run_roi(*a, **kw):
+        calls["n"] += 1
+        return real_run_roi(*a, **kw)
+
+    _tex_memory.run_roi = _counting_run_roi
+    try:
+        _tex_chain.cook_stage_list(
+            [{"code": code, "bindings": dict(bindings)}], device="cpu", roi=roi,
+            roi_exec=roi_exec, scale=scale, latent_channel_count=latent_channel_count)
+    finally:
+        _tex_memory.run_roi = real_run_roi
+    return calls["n"] > 0
+
+
+def test_tierq48_cook_stage_list_roi_armed_agrees_with_tier_verdict():
+    A = torch.rand(1, 1024, 1024, 4)
+    roi = (10, 10, 256, 256, 1024, 1024)
+    real_armed = _cook_stage_list_roi_armed(_ROI_CODE, {"A": A, "amount": 0.4},
+                                            roi=roi, roi_exec=True)
+    v = tier_verdict(_ROI_CODE, compile_mode="none", device="cpu", roi=roi,
+                     roi_exec=True, param_values={"amount": 0.4})
+    assert v.roi_armed == real_armed
+    assert real_armed and v.roi_reason == ROI_REASON_ARMED
+
+
+def test_tierq48_cook_stage_list_roi_declines_when_not_armed_agrees_with_tier_verdict():
+    A = torch.rand(1, 1024, 1024, 4)
+    roi = (10, 10, 256, 256, 1024, 1024)
+    real_armed = _cook_stage_list_roi_armed(_ROI_CODE, {"A": A, "amount": 0.4},
+                                            roi=roi, roi_exec=False)
+    v = tier_verdict(_ROI_CODE, compile_mode="none", device="cpu", roi=roi,
+                     roi_exec=False, param_values={"amount": 0.4})
+    assert v.roi_armed == real_armed == False
+    assert v.roi_reason == ROI_REASON_NOT_ARMED
+
+
+def test_tierq48_cook_stage_list_roi_reason_agrees_when_precision_and_executability_both_fail():
+    """Red-first at `5ae6288`: `cook_stage_list`'s OLD ROI ladder checked
+    `eff_precision != "fp32"` BEFORE ever computing `roi_plan(...).executable` —
+    `tex_engine.prepare()`/`tier_verdict` check `roi_plan` first and only consult
+    precision once the program is confirmed executable. Both orderings decline the SAME
+    window (never a wrong-pixel divergence — `roi_armed` is `False` either way), but for
+    a program that is BOTH non-fp32 AND not ROI-executable, the OLD `cook_stage_list`
+    reported a precision-flavored reason while `tier_verdict` reported
+    `ROI_REASON_NOT_EXECUTABLE` for the identical inputs — exactly the "third copy can
+    silently disagree" risk R1/R2 named. `@A(u, v)` (`BindingSampleAccess`, a whole-image
+    sample) is not ROI-executable regardless of precision."""
+    import torch as _torch
+    from TEX_Wrangle import tex_chain as _tex_chain
+    from TEX_Wrangle.tex_runtime import tier_trace as _tt
+    code = "@OUT = vec4(@A(u, v).rgb, 1.0);\n"
+    A = _torch.rand(1, 64, 64, 4)
+    roi = (5, 5, 20, 20, 64, 64)
+    _tex_roi.clear_roi_memo()
+    _tt.reset()
+    _tex_chain.cook_stage_list([{"code": code, "bindings": {"A": A}}], device="cpu",
+                              precision="fp16", roi=roi, roi_exec=True)
+    _, real_reason_text = _tt.last_roi()
+    v = tier_verdict(code, compile_mode="none", device="cpu", roi=roi, roi_exec=True,
+                     precision="fp16")
+    from TEX_Wrangle.tex_engine_tiers import ROI_REASON_NOT_EXECUTABLE
+    assert v.roi_reason == ROI_REASON_NOT_EXECUTABLE
+    assert real_reason_text is not None and "not ROI-executable" in real_reason_text, (
+        f"cook_stage_list reported {real_reason_text!r} -- expected a not-executable "
+        f"reason agreeing with tier_verdict's {v.roi_reason!r}, not a precision-flavored "
+        "one (the pre-fix reason-ordering bug)")
+
+
+def test_tierq48_cook_stage_list_roi_declines_on_latent_agrees_with_tier_verdict():
+    """`cook_stage_list`'s `has_latent_input` proxy is `bool(latent_channel_count)` —
+    `tier_verdict`'s own `has_latent_input=True` names the same condition."""
+    A = torch.rand(1, 1024, 1024, 4)
+    roi = (10, 10, 256, 256, 1024, 1024)
+    real_armed = _cook_stage_list_roi_armed(_ROI_CODE, {"A": A, "amount": 0.4}, roi=roi,
+                                            roi_exec=True, latent_channel_count=4)
+    v = tier_verdict(_ROI_CODE, compile_mode="none", device="cpu", roi=roi,
+                     roi_exec=True, param_values={"amount": 0.4}, has_latent_input=True)
+    assert v.roi_armed == real_armed == False
+    from TEX_Wrangle.tex_engine_tiers import ROI_REASON_LATENT
+    assert v.roi_reason == ROI_REASON_LATENT

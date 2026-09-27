@@ -1433,6 +1433,93 @@ def validate_roi(roi) -> str | None:
     return None
 
 
+# ── FIX-TIER T1 (R1/R2/R4#1): the ONE "does this roi= request actually narrow this
+# cook" predicate ─────────────────────────────────────────────────────────────
+#
+# Before this, the identical ordered ladder (tier/fused-chain, LATENT, scale-active,
+# `roi_exec_enabled`, `validate_roi`, whole-frame, `roi_plan(...).executable`, fp32-only)
+# existed as three independent hand-written copies: `tex_engine.prepare()`'s own gate,
+# `tex_engine_tiers.tier_verdict` (which mirrored it BY COMMENT, not by construction), and
+# `tex_chain.cook_stage_list`'s ROI-48A block (a THIRD hand-copy with its own ad hoc
+# reason strings, and — the concrete divergence risk — the fp32-precision check ordered
+# BEFORE the executable check instead of after; that reordering never changes the ARMED
+# verdict, since a precision decline and a not-executable decline are both "not armed",
+# but it means the two disagree about WHY, exactly the drift R1 flags). `roi_eligibility`
+# is now the single ladder; all three call sites consume it, so they cannot disagree by
+# construction rather than by author discipline.
+ROI_REASON_TIER_NOT_DEFAULT = "roi-declined-tier-not-default"
+ROI_REASON_FUSED_CHAIN = "roi-declined-fused-chain"
+ROI_REASON_LATENT = "roi-declined-latent-input"
+ROI_REASON_SCALE_ACTIVE = "roi-declined-scale-active"
+ROI_REASON_NOT_ARMED = "roi-declined-not-armed"
+ROI_REASON_MALFORMED = "roi-declined-malformed"
+ROI_REASON_WHOLE_FRAME = "roi-declined-whole-frame"
+ROI_REASON_NOT_EXECUTABLE = "roi-declined-not-executable"
+ROI_REASON_PRECISION = "roi-declined-precision-not-fp32"
+ROI_REASON_ARMED = "roi-armed"
+
+
+@dataclass(frozen=True)
+class RoiEligibility:
+    """`roi_eligibility`'s answer. `armed` is the actual verdict every call site branches
+    on; `canonical` is the `canonical_roi(roi)` result once `roi` has been shown
+    well-formed (`None` before that point — a malformed window is never canonicalized).
+    `plan` is the `RoiPlan` once computed (`None` when the ladder declined before ever
+    reaching `roi_plan`). `reason` is always one of the stable `ROI_REASON_*` constants
+    above — the public, host-branchable contract `tier_verdict` already documented.
+    `message` is the free-text form `tex_engine.prepare()`'s `tier_trace` record has
+    always carried for the cases it has ALWAYS surfaced text for; it is `None` for the
+    three outer-eligibility declines (`TIER_NOT_DEFAULT`/`FUSED_CHAIN`/`LATENT`) exactly as
+    `prepare()`'s pre-existing behavior already was (that outer condition used to gate
+    whether `prepare()` even entered its own ladder, so no message was ever produced for
+    those three cases)."""
+    armed: bool
+    canonical: tuple | None
+    plan: "RoiPlan | None"
+    reason: str
+    message: str | None
+
+
+def roi_eligibility(code: str, *, tier_id: str, fused_chain: bool, has_latent_input: bool,
+                    scale: float | None, roi: tuple, roi_exec: bool | None,
+                    param_values: dict | None, binding_types: dict | None,
+                    eff_precision: str, auto_fp16: bool = False) -> RoiEligibility:
+    """The shared ladder (see the module note above). `roi` must not be `None` — every
+    call site already gates on `roi is not None` before calling this (this function
+    answers "is THIS window eligible", not "was one requested")."""
+    if tier_id != "default":
+        return RoiEligibility(False, None, None, ROI_REASON_TIER_NOT_DEFAULT, None)
+    if fused_chain:
+        return RoiEligibility(False, None, None, ROI_REASON_FUSED_CHAIN, None)
+    if has_latent_input:
+        return RoiEligibility(False, None, None, ROI_REASON_LATENT, None)
+    if scale is not None:
+        return RoiEligibility(False, None, None, ROI_REASON_SCALE_ACTIVE,
+                              "roi declined: scale is active (not yet reconciled with "
+                              "ROI narrowing)")
+    if not roi_exec_enabled(roi_exec):
+        return RoiEligibility(False, None, None, ROI_REASON_NOT_ARMED,
+                              "roi not armed (pass roi_exec=True or set TEX_ROI_EXEC=1)")
+    bad = validate_roi(roi)
+    if bad is not None:
+        return RoiEligibility(False, None, None, ROI_REASON_MALFORMED, f"roi refused: {bad}")
+    canon = canonical_roi(roi)
+    if canon[2:4] == canon[4:6]:
+        return RoiEligibility(False, canon, None, ROI_REASON_WHOLE_FRAME,
+                              "roi covers the whole frame (nothing to narrow)")
+    plan = roi_plan(code, param_values, binding_types)
+    if not plan.executable:
+        return RoiEligibility(False, canon, None, ROI_REASON_NOT_EXECUTABLE,
+                              "roi declined: program is not ROI-executable "
+                              "(whole-image gather / unbounded reach)")
+    if eff_precision != "fp32":
+        return RoiEligibility(False, canon, plan, ROI_REASON_PRECISION,
+                              f"roi declined: the cook is {eff_precision}"
+                              + (" (auto)" if auto_fp16 else "")
+                              + ", and ROI is only validated at fp32")
+    return RoiEligibility(True, canon, plan, ROI_REASON_ARMED, None)
+
+
 # ── CACHE-9: chain-level window composition ───────────────────────────────────
 # `roi_plan` answers "what margin does THIS program need". A host recooking a region through a
 # CHAIN of stages needs the composition of those margins, and getting it wrong is silent: patch
