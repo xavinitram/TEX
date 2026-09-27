@@ -84,19 +84,40 @@ not otherwise shrink with the canvas.
 - **ROI narrowing and `scale` are not yet reconciled.** A cook that passes both `roi=` and a
   non-None `scale` declines the ROI window (cooks whole-frame at the requested scale) rather
   than risk the two interacting incorrectly.
-- **`torch_compile`/`auto`/`cuda_graph` now honour `scale` (SCALECX-49, v0.49)**. A
-  scale-active cook (`scale` not `None`) whose tier selection names one of those three
-  is dispatched to that tier directly instead of being forced onto the plain interpreter.
-  `execute_compiled`/`run_auto` key their compiled-artifact cache (`_compiled_cache`, and
-  `autotier.make_key`'s own verdict bucket) by an explicit, trailing `scale` component;
-  `run_graphed`'s `_capture_key` gains the identical component — appended only when `scale`
-  is not `None`, so a `scale=None` cook keys exactly as before this ask (default-path
-  invariant unaffected). A distinct scale value gets its own compiled artifact / captured
-  graph (a capture at one scale can never replay under another — the acceptance criterion
-  this line used to name as unmet), reused on every repeat of that same value, never
-  recompiled/recaptured per call. `tier_verdict`'s `TIER_REASON_SCALE_ACTIVE_COMPILED`
-  reason code names this route. ROI stays out of scope on every tier regardless (the
-  bullet above) — this ask does not touch ROI eligibility at all.
+- **`torch_compile`/`auto`/`cuda_graph` are scale-aware mechanisms with, as of this writing,
+  NO real-builtin speedup to show for it.** A scale-active cook whose tier selection names
+  one of those three is dispatched to that tier directly instead of being forced onto the
+  plain interpreter, and `scale` genuinely reaches each tier's own execution path. But every
+  one of today's four registered `pixel_args=` builtins (`gauss_blur`/`erode`/`dilate`/
+  `bilateral_filter`) is ALSO registered `sync=True` in `graphed._SYNC_STDLIB` (its pixel-unit
+  argument resolves via a capture-illegal `.item()`), so **`cuda_graph` never captures a real
+  scale-active program calling one — `_capturable()` declines it before a `_capture_key` is
+  ever computed, on any box, CPU or CUDA.** And none of the four inlines in codegen, so
+  **`torch_compile`/`auto` never reach real Inductor tracing for one either — `_try_compile`
+  returns the codegen-only eager adapter (backend unreached), not a compiled kernel.** Both
+  declines are unconditional and box-independent, not a quirk of any particular hardware.
+  `tier_verdict` (see below) reports the tier that ACTUALLY runs — `"codegen"` for the
+  `torch_compile`/`auto` decline, `"interpreter"` for the `cuda_graph` decline — rather than
+  the tier `select_tier` merely selected, so a host reading the query never expects a speedup
+  that will not materialize. The mechanism is kept, not removed: it is exercised end-to-end
+  by a synthetic, non-sync-gated builtin (`mix`, tagged as `pixel_args=` for the test's own
+  scope only) proving the underlying dispatch and cache-key logic are correct, ready for the
+  day a `pixel_args=` builtin ships without a capture-illegal sync or a codegen graph-break.
+  Making one of the four builtins reach a real compiled/captured tier is future work, not
+  shipped here.
+
+  When a future builtin DOES reach one of these tiers: `execute_compiled`/`run_auto` share
+  ONE compiled artifact across every scale value (`scale` is a runtime call argument, never
+  a cache-key component — the callable rebuilds its codegen environment fresh every cook, so
+  there is nothing stale to key against). `run_graphed`'s `_capture_key` is the one exception:
+  a captured graph replays a fixed sequence of kernel launches against fixed buffer shapes
+  recorded once at capture time, and a `pixel_args=` builtin's scaled radius is baked in as
+  exactly such a shape — so `_capture_key` keeps an explicit, trailing `scale` component (a
+  distinct scale value gets its own capture, reused on every repeat of that value, bounded by
+  the same VRAM budget that already bounds every other distinct canvas shape). `scale=1.0`
+  keys/buckets identically to `scale=None` everywhere (the documented byte-identical no-op).
+  ROI stays out of scope on every tier regardless (the bullet above).
+
   **The `"default"` tier's own internal codegen shortcut honours `scale` — but only for
   the narrow class of program that shortcut already accelerates.** `_should_stencil_route`
   recognizes exactly one shape: a *hand-written*, nested-loop, exact-fetch stencil (the
@@ -104,30 +125,31 @@ not otherwise shrink with the canvas.
   in the TEX source. It has nothing to do with whether the program calls a
   `pixel_args=`-tagged builtin. A scale-active cook whose program is a *plain*
   `gauss_blur`/`erode`/`dilate`/`bilateral_filter` call with no coincidental hand-written
-  stencil loop still runs on the plain interpreter, exactly as before this ask — the
-  single most common program shape the `pixel_args=` mechanism exists for is **not**
-  sped up by this route. Only a program that independently contains the UC-2 stencil
-  shape gets routed to codegen, and that routing carries any `pixel_args=` call sites in
-  the SAME program along for the ride (their scale multiplier is emitted as a runtime
-  value read from the cook's own environment, never a folded literal, so one cached
-  codegen fn serves every scale value without recompiling). M-4/ROI-5 *tiling* is still
-  out of scope on either route — a scale-active cook always cooks whole-frame (see the
-  ROI bullet above). Reported via `tier_trace` exactly like every other tier decision
-  (`tier_trace.last().tier == "interpreter"` or `== "codegen"`, reason names scale either
-  way) — never a silent fallback. `tier_verdict`'s own `TIER_REASON_SCALE_ACTIVE_CODEGEN`
-  reason code names this precisely: it is returned only when `_should_stencil_route`
-  itself says yes for THIS program, never as a general "codegen now supports scale"
-  signal.
+  stencil loop still runs on the plain interpreter — the single most common program shape
+  the `pixel_args=` mechanism exists for is **not** sped up by this route either. Only a
+  program that independently contains the UC-2 stencil shape gets routed to codegen, and
+  that routing carries any `pixel_args=` call sites in the SAME program along for the ride
+  (their scale multiplier is emitted as a runtime value read from the cook's own
+  environment, never a folded literal, so one cached codegen fn serves every scale value
+  without recompiling). M-4/ROI-5 *tiling* is still out of scope on either route — a
+  scale-active cook always cooks whole-frame (see the ROI bullet above). Reported via
+  `tier_trace` exactly like every other tier decision (`tier_trace.last().tier ==
+  "interpreter"` or `== "codegen"`, reason names scale either way) — never a silent
+  fallback. `tier_verdict`'s own `TIER_REASON_SCALE_ACTIVE_CODEGEN` reason code names this
+  precisely: it is returned only when `_should_stencil_route` itself says yes for THIS
+  program, never as a general "codegen now supports scale" signal.
 
 ## The declared-fallback query (TIERQ-48)
 
 ROI's own `tier_id == "default"` requirement (`docs/roi-spatial-laziness.md`) means a host
 cannot learn, short of timing a cook and noticing it was slow, that a `torch_compile`/
 `auto`/`cuda_graph`-eligible program silently cooks whole-frame the moment `roi` is
-requested (SCALECX-49, v0.49, closed the equivalent gap for `scale` itself — those three
-tiers now honour it directly, see above). `tex_api.tier_verdict` (delegating to
-`tex_engine_tiers.tier_verdict`) makes both facts QUERYABLE instead of only documented in
-prose:
+requested. `scale` has the analogous gap, one level deeper: even where a tier is dispatched
+directly (see above), the tier can itself self-decline past that point for a program the
+`pixel_args=` mechanism actually targets. `tex_api.tier_verdict` (delegating to
+`tex_engine_tiers.tier_verdict`) makes every one of these facts QUERYABLE instead of only
+documented in prose — including the self-decline, by reusing the SAME predicates the real
+dispatch checks (`graphed._capturable`, codegen's `_has_fn_calls`), never a parallel guess:
 
     from TEX_Wrangle import tex_api
     v = tex_api.tier_verdict(source, compile_mode="torch_compile", device="cuda:0",

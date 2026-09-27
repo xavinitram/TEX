@@ -569,7 +569,15 @@ def prepare(code: str, bindings: dict, *, chain_payload: Any = None,
 
     `scale` (SCALE-47b): a per-cook resolution-scale multiplier for `pixel_args=`-tagged stdlib
     arguments and the halo they derive. `None` (no ComfyUI caller passes this) is zero-cost
-    (invariant #7); non-None forces the interpreter tier and declines an ROI window.
+    (invariant #7); non-None always declines an ROI window (unchanged), but no longer always
+    forces the interpreter tier — `torch_compile`/`auto`/`cuda_graph` (SCALECX-49, FIX-SCALECX
+    X1/X2) run a scale-active cook directly when `select_tier` names one of them, keyed by an
+    explicit `scale` component on `cuda_graph`'s own captured graph (a shape-determining value
+    a replay cannot re-read) and threaded as a runtime call argument, never a cache-key
+    component, on the other two. See `docs/resolution-scale.md` for which programs this
+    actually speeds up today (as of v0.49: none of the four registered `pixel_args=` builtins
+    on any of the three tiers — each self-declines past `select_tier`'s own choice, reported
+    honestly by `tier_verdict` rather than silently).
 
     Pass False ONLY if you can prove your own egress already materializes. `tex_node` can:
     its clamp allocates a fresh tensor on the way out, which is the accident that kept the
