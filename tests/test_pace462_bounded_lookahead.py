@@ -966,8 +966,9 @@ class _CrossDeviceEvent:
     the FIRST time it is `.record()`ed; recording it again while a DIFFERENT device is
     ambient raises, exactly as real `cudaEventRecord` does (not a PyTorch-added check)."""
 
-    def __init__(self, blocking=False, registry=None):
+    def __init__(self, blocking=False, registry=None, enable_timing=False):
         self.blocking = blocking
+        self.enable_timing = enable_timing  # PACE-49: pacing's own pool now passes this too
         self._registry = registry
         self._bound_device = None
         self.record_calls = 0
@@ -1021,8 +1022,8 @@ class _CrossDeviceSpy:
                 reg.ambient = self._prev
                 return False
 
-        def _fake_event(blocking=False):
-            return _CrossDeviceEvent(blocking=blocking, registry=reg)
+        def _fake_event(blocking=False, enable_timing=False):
+            return _CrossDeviceEvent(blocking=blocking, registry=reg, enable_timing=enable_timing)
 
         self._real_available = torch.cuda.is_available
         self._real_device_ctx = torch.cuda.device

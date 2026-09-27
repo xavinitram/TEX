@@ -124,9 +124,11 @@ def test_interpreter_poll_passes_heavy_true_for_the_gauss_blur_statement(r):
     calls = []
     real_paced_check = _pace.paced_check
 
-    def _spy_paced_check(token, device, heavy=False):
+    def _spy_paced_check(token, device, heavy=False, **kwargs):
+        # PACE-49: the interpreter's real call site also passes `call_site_id` now -- this
+        # spy only cares about `heavy`, so it accepts (and forwards) whatever else arrives.
         calls.append(heavy)
-        return real_paced_check(token, device, heavy=heavy)
+        return real_paced_check(token, device, heavy=heavy, **kwargs)
 
     class _NeverTripToken:
         pace = True
