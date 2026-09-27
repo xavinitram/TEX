@@ -302,6 +302,197 @@ def cook_stage_list(stages, *, device="cpu", precision="fp32", latent_channel_co
                               cancel=cancel, on_progress=on_progress, scale=scale)
 
 
+# ── JOINWIRE-50: a DAG-shaped stage list, cooked node-by-node, windowed end-to-end ────
+#
+# `cook_stage_list` above is windowed only for a SINGLE stage — a fused (`len(stages)>1`)
+# chain declines `roi=` outright (`fused_chain` in the ladder), because a spliced program's
+# `roi_plan` describes the WHOLE fused source, not any one original stage. `cook_stage_dag`
+# below does not fuse at all: every stage stays its own program, cooked through
+# `cook_stage_list`'s existing single-stage `roi=` path, exactly the way a host's own
+# node-by-node tick already cooks a LINEAR chain today (one `tex_engine.cook`/
+# `cook_stage_list` call per node). The only genuinely new mechanism is planning ONE window
+# per stage — via `tex_roi.chain_windows_dag`, fed per-stage reach `tex_roi.
+# stage_dag_arg_halos` resolves from each stage's own source — and threading a windowed
+# stage's CROPPED output to its downstream consumer(s) as a full-size tensor, which
+# `run_roi`'s own per-cook narrowing step (`tex_memory.run_roi`) requires of every spatial
+# binding.
+
+def _embed_window(val, window):
+    """Patch a windowed stage's CROPPED output back into a fresh full-size `(W, H)` canvas
+    at its window's offset, so a downstream stage's OWN `run_roi` narrowing step (which
+    requires every spatial binding at the FULL size the window declares — `tex_memory.
+    run_roi`'s own extent check) can read it. The region OUTSIDE the window is left at
+    whatever `new_zeros` gives it and is NEVER READ by anything this cook does: JOIN-49's
+    `chain_windows_dag` only ever grows a stage's window BY a downstream consumer's own
+    demand on it (`StageSpec.halo_for`, unioned across every dirty consumer) — so `window`
+    already covers every region any consumer cooked THIS tick will actually narrow into.
+    Not merely argued: `test_joinwire50_dag_windows.py` poisons this fill with a distinctive
+    non-zero sentinel instead of zeros and still gets pixel-identical results, which is the
+    only way to show unread garbage is truly unread rather than coincidentally zero.
+
+    Scalar/string outputs (rank < 3 — no spatial dims at all) pass through unchanged:
+    `run_roi`'s own crop-back only ever narrows the two spatial dims of a rank>=3 tensor, so
+    a non-spatial output was never cropped and has no window to re-embed."""
+    if not isinstance(val, torch.Tensor) or val.dim() < 3:
+        return val
+    x0, y0, w, h, W, H = window
+    full = val.new_zeros((val.shape[0], H, W, *val.shape[3:]))
+    full[:, y0:y0 + h, x0:x0 + w] = val
+    return full
+
+
+def cook_stage_dag(stages, *, device="cpu", precision="fp32", latent_channel_count=0,
+                   time_context=None, cancel=None, on_progress=None, scale=None,
+                   roi: tuple | None = None, roi_exec: bool | None = None,
+                   dirty_from: int = 0, valid=None, declined=(),
+                   known_outputs: dict | None = None) -> dict:
+    """JOINWIRE-50 (host item 1): cook a DAG-shaped stage list — a join such as a Merge
+    reading two upstream stages, below an edit — node-by-node, windowed end-to-end via
+    `tex_roi.chain_windows_dag`, when the sink (the last stage) is asked for a sub-window.
+
+    `stages[i]["chain_inputs"]` is the SAME DAG payload `tex_fusion.compile_fused` already
+    reads (`{binding_name: [src_stage_idx, "OUT"]}`) — every other binding is a plain value
+    exactly as `cook_stage_list` already takes it. Stage indices must be topologically
+    ordered (every `chain_inputs` index `< i`, else `ValueError` — a defect in the CALLER's
+    graph construction, mirroring `chain_windows_dag`'s own guard); the SINK is always the
+    last stage. `roi`/`dirty_from`/`valid`/`declined` are `chain_windows_dag`'s own
+    parameters, unchanged; `scale` is `cook_stage_list`'s (a scale-active cook never windows
+    here either, mirroring `roi_eligibility`'s existing `ROI_REASON_SCALE_ACTIVE` gate).
+
+    `known_outputs` (`{stage_index: {name: tensor}}`) supplies a CLEAN stage's (`i <
+    dirty_from`, not being recomputed) already-valid full-frame output, when a dirty
+    downstream stage reads it — the same thing a linear host already holds for
+    `chain_windows`'s own `valid`/`dirty_from` contract. A DIRTY stage that gets windowed
+    needs no such value even when it is itself referenced downstream: `_embed_window`'s own
+    docstring is the reason (the un-read region outside a fresh window is provably inert,
+    not merely assumed to be). A missing clean value that a dirty stage genuinely needs
+    raises `ValueError` rather than fabricate one.
+
+    Never caches anything of its own: every per-stage cook goes through the EXISTING
+    `cook_stage_list`, so `tier_trace`/lineage behave exactly as they already do for a single
+    windowed cook (a windowed result is keyed by its window the same way any other
+    `roi=`-cooked frame already is — this function adds no NEW keying scheme for the "a
+    windowed result must never be served as whole-frame" contract to get wrong). A host
+    wanting checkpoint-style reuse across ticks supplies its own keying via
+    `known_outputs`/`valid`/`dirty_from`, same as it already must for `chain_windows`.
+
+    Returns `{"result": {name: tensor}, "stage_outputs": {idx: {name: tensor}}, "windows":
+    windows_or_None, "stages_windowed": int, "stages_whole": int}`. `result` is the sink's
+    own raw output (a crop when windowed — the same contract every other windowed cook in
+    this codebase already has); `stage_outputs` carries every OTHER cooked stage's raw
+    output too (full-size, re-embedded when it was windowed), for a caller or test that
+    wants to inspect an intermediate. `windows` is `None` when nothing was planned (no `roi=`,
+    or `chain_windows_dag` refused the whole plan) or a `chain_windows_dag`-shaped list."""
+    with _cook_observer.scope("cook_stage_dag"):
+        from . import tex_roi as _tex_roi
+        from .tex_runtime import tier_trace as _tier_trace_mod
+        n = len(stages)
+        known_outputs = known_outputs or {}
+        eff_precision = "fp32" if latent_channel_count else precision
+
+        # 1. One StageSpec per stage, resolved from EACH stage's own source alone (no
+        #    cross-stage knowledge needed for this step — `stage_dag_arg_halos` reads one
+        #    program at a time, exactly as `stage_halo` already does for the linear family).
+        chain_map = []             # [{binding_name: (src_idx, out_name)}, ...] per stage
+        specs = []
+        for i, st in enumerate(stages):
+            ci = {}
+            for b, edge in (st.get("chain_inputs") or {}).items():
+                idx = int(edge[0])
+                if not (0 <= idx < i):
+                    raise ValueError(
+                        f"cook_stage_dag: stage {i} chain_inputs[{b!r}] names stage {idx}, "
+                        f"not an earlier stage index (< {i}) — inputs must be topologically "
+                        f"ordered")
+                ci[b] = (idx, edge[1])
+            chain_map.append(ci)
+            bindings = dict(st.get("bindings") or {})
+            name_to_upstream = {b: idx for b, (idx, _out) in ci.items()}
+            binding_types = {name: _infer_binding_type(v) for name, v in bindings.items()
+                             if name not in ci} or None
+            from .tex_tiling import _scalar_params
+            halo, arg_halo = _tex_roi.stage_dag_arg_halos(
+                st["code"], name_to_upstream, param_values=_scalar_params(bindings),
+                binding_types=binding_types)
+            specs.append(_tex_roi.StageSpec(
+                halo, tuple(sorted(set(name_to_upstream.values()))), arg_halo or None))
+
+        # 2. Plan windows — only when eligible. Mirrors `roi_eligibility`'s own outer gate:
+        #    a scale-active, LATENT or non-fp32 cook never windows here either (the linear
+        #    family refuses these for the identical reason — ROI is oracle-validated at
+        #    fp32 only, and scale/ROI narrowing is not yet reconciled).
+        windows = None
+        if (roi is not None and scale is None and not latent_channel_count
+                and eff_precision == "fp32" and _tex_roi.roi_exec_enabled(roi_exec)
+                and _tex_roi.validate_roi(roi) is None):
+            canon = _tex_roi.canonical_roi(roi)
+            if canon[2:4] != canon[4:6]:          # not already whole-frame
+                windows = _tex_roi.chain_windows_dag(
+                    specs, canon, dirty_from=dirty_from, valid=valid, declined=declined)
+
+        # 3. Cook, stage by stage. `chain_inputs` only ever names an EARLIER index (checked
+        #    above), so index order IS topological order — no separate sort needed.
+        stage_outputs: dict = {}
+        stages_windowed = 0
+        stages_whole = 0
+        for i, st in enumerate(stages):
+            if windows is not None and windows[i] is None:
+                if i < dirty_from and i in known_outputs:
+                    stage_outputs[i] = known_outputs[i]
+                continue           # clean-and-undemanded, or dirty-but-undemanded (JOIN-49)
+
+            bindings = dict(st.get("bindings") or {})
+            for b, (idx, out) in chain_map[i].items():
+                src = stage_outputs.get(idx, known_outputs.get(idx))
+                if src is None or out not in src:
+                    raise ValueError(
+                        f"cook_stage_dag: stage {i} needs stage {idx}'s output {out!r}, "
+                        f"which was never cooked and is not in known_outputs")
+                bindings[b] = src[out]
+
+            stage_roi = None
+            if windows is not None and windows[i] is not None:
+                w = windows[i]
+                if w[2:4] != w[4:6]:
+                    stage_roi = w
+
+            out = cook_stage_list(
+                [dict(st, bindings=bindings)], device=device, precision=precision,
+                latent_channel_count=latent_channel_count, time_context=time_context,
+                cancel=cancel, on_progress=on_progress, scale=scale,
+                roi=stage_roi, roi_exec=True if stage_roi is not None else None)
+
+            # Count (and decide whether to re-embed) off what THIS stage's own cook actually
+            # served, per `tier_trace.last_roi()` — not off `stage_roi` alone. A stage this
+            # function planned to window can still decline internally (its own `roi_plan`
+            # disagreeing, e.g. `convolve`'s footprint making the WHOLE program
+            # non-executable) and fall back to whole-frame; trusting the REQUEST rather than
+            # the SERVED window would both mis-report the count and try to re-embed a
+            # full-size output into a too-small window (a shape-mismatched, silently wrong
+            # patch) — the exact class of bug `_embed_window`'s postcondition must not permit.
+            # `stage_roi is None` (this stage was never asked to window) short-circuits
+            # WITHOUT consulting `tier_trace`: `cook_stage_list` skips its whole `roi`
+            # block whenever `roi=None`, so it never calls `record_roi` for THIS cook, and
+            # `last_roi()` would otherwise still read whatever an EARLIER, unrelated cook on
+            # this thread last recorded — a stale-read bug, not a stale-window one.
+            served_roi = None if stage_roi is None else _tier_trace_mod.last_roi()[0]
+            if served_roi is not None and i != n - 1:
+                # Every OTHER (non-sink) windowed stage's crop must reach its consumer(s) as
+                # a full-size tensor — see `_embed_window`'s own docstring for why the
+                # unwritten region is provably never read.
+                out = {name: _embed_window(val, served_roi) for name, val in out.items()}
+                stages_windowed += 1
+            elif served_roi is not None:
+                stages_windowed += 1        # the sink itself, windowed
+            else:
+                stages_whole += 1
+            stage_outputs[i] = out
+
+        return {"result": stage_outputs.get(n - 1, {}), "stage_outputs": stage_outputs,
+                "windows": windows, "stages_windowed": stages_windowed,
+                "stages_whole": stages_whole}
+
+
 def _is_tensor_binding(v) -> bool:
     """True for a binding that carries PIXELS — a tensor, or a Promise of one (P0-H).
 

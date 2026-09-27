@@ -1640,6 +1640,11 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
     Pure arithmetic — this module stays torch-free."""
     if scale <= 0:
         raise ValueError(f"chain_windows: scale must be > 0, got {scale!r}")
+    # `_dag_grow` now lives in `tex_roi_dag` (moved by JOINWIRE-50's REG-2 split, see the
+    # module note above this function) — a function-local import, because `tex_roi_dag`
+    # imports FROM this module at its own top level and this module must not import it back
+    # at load time.
+    from .tex_roi_dag import _dag_grow
     n = len(halos)
     # P0-4a: a stage that DECLINED its window cooked whole-frame from a possibly-stale input, so
     # its "valid everywhere" record is only true if its input really was whole-frame valid. Any
@@ -1679,204 +1684,17 @@ def chain_windows(halos, roi, dirty_from: int = 0, valid=None,
     return out
 
 
-# ── JOIN-49: windows across multi-input joins (host ask 3, TIERS-48-design.md SS B) ──────────
-#
-# `chain_windows` above answers the question for a LINEAR chain: stage i has exactly one
-# consumer (i+1) and exactly one producer (i-1). A join (a stage reading TWO OR MORE upstream
-# canvases — a composite, a blend, a multi-plate comp) has no representation in that model:
-# `halos` is a flat per-stage list, so there is no way to even ASK "stage k reads stages i AND
-# j, and needs a DIFFERENT margin from each". `chain_windows_dag` below is the generalisation;
-# `chain_windows`'s SIGNATURE and every answer it returns are UNTOUCHED (proven by the
-# byte-identical oracle below); its own trusted CONTROL FLOW (the P0-4a/P0-4b refusals, the
-# loop bounds) is not the surface this correctness-sensitive lane risks. As of Q3, its body no
-# longer hand-copies the grow-and-clamp arithmetic itself: both of its internal sites now call
-# `_dag_grow` (below), the SAME helper `chain_windows_dag` already uses, instead of carrying a
-# third independent copy of it (R1#1/R2#2 of the v0.49 Phase C review).
-#
-# The design doc's own recommendation is to make `chain_windows` a thin wrapper that calls the
-# DAG walker with `inputs=(i-1,)` synthesized. That refactor is still NOT taken — sharing only
-# the grow-and-clamp arithmetic, while leaving `chain_windows`'s own control flow byte-for-byte
-# as written, is preferred over routing the whole function through the DAG machinery. The
-# byte-identical PROOF (unaffected by Q3): `chain_windows_dag` fed the synthesized linear
-# stage list `[StageSpec(h, () if i == 0 else (i - 1,)) for i, h in enumerate(halos)]` returns
-# EXACTLY what `chain_windows(halos, ...)` returns, for every call shape in the existing
-# linear test corpus plus a randomized oracle sweep (`tests/test_join49_dag_windows.py`).
-
-def _dag_grow(window, pad: float):
-    """`window ⊕ pad`, clamped to the frame — grow-and-clamp, the one piece of correctness-
-    sensitive arithmetic this module needs. As of Q3, the ONE shared implementation for FOUR
-    call sites: `chain_windows`'s own backward step and its P0-4(b) check, and
-    `chain_windows_dag`'s backward step and its own divergent-validity check — not two
-    independent copies plus this as a third (the class of bug FIX-ROI's O2 finding was
-    about: two per-node copies of one rule drifting apart)."""
-    x0, y0, w, h, W, H = window
-    pad = int(pad)
-    nx0, ny0 = max(0, x0 - pad), max(0, y0 - pad)
-    nx1, ny1 = min(W, x0 + w + pad), min(H, y0 + h + pad)
-    return (nx0, ny0, nx1 - nx0, ny1 - ny0, W, H)
-
-
-def _dag_union(a, b):
-    """Bounding-box union of two windows over the SAME frame — composition rule 1
-    (TIERS-48-design.md SS B.2): a canvas read by two consumers (a diamond, not a join —
-    one input, two consumers) needs the union of what each separately demands. Same
-    min/max-per-axis arithmetic `canonical_roi`'s own frame clamp already performs, lifted
-    from "a window against the frame boundary" to "two windows against each other". `None`
-    is the identity (no demand yet)."""
-    if a is None:
-        return b
-    if b is None:
-        return a
-    ax0, ay0, aw, ah, W, H = a
-    bx0, by0, bw, bh, _, _ = b
-    x0 = min(ax0, bx0)
-    y0 = min(ay0, by0)
-    x1 = max(ax0 + aw, bx0 + bw)
-    y1 = max(ay0 + ah, by0 + bh)
-    return (x0, y0, x1 - x0, y1 - y0, W, H)
-
-
-@dataclass(frozen=True)
-class StageSpec:
-    """One stage of a `chain_windows_dag` walk. `halo` is this stage's OWN reach into its
-    input(s) — the same per-stage number `chain_windows`'s flat `halos` list already
-    carries, applied UNIFORMLY to every input this stage reads UNLESS `arg_halo` overrides
-    a SPECIFIC upstream index with its own reach. `inputs` names the upstream stage indices
-    this stage reads (`()` for a source stage). The linear chain is the degenerate case
-    `inputs=(i - 1,)` for every `i > 0`, `()` for `i == 0` — exactly `chain_windows`'s own
-    model, so a stage with one input and no `arg_halo` behaves identically to a `halos[i]`
-    entry.
-
-    `arg_halo`, when given, is composition rule 2 (TIERS-48-design.md SS B.2 point 2): a
-    join stage's demand on EACH of its inputs is independent — a composite's background
-    argument may need no margin at all while its mask argument needs a blur-sized halo for
-    feathering. The intended source of these per-argument numbers is REACH-48's registry
-    (`tex_runtime.stdlib_registry.arg_footprint_by_name` / `tex_roi._call_arg_reach`) for
-    whichever builtin the join stage's own code runs — resolving that from source is the
-    CALLER's job (a `roi_plan`/`binding_footprints`-shaped one), exactly as `stage_halo`
-    already resolves the single-input case; this dataclass only carries the resolved
-    number, the same division of labour `halos[i]` already had.
-
-    KNOWN LIMIT (Q5): `arg_halo` is keyed by UPSTREAM STAGE INDEX only, one number
-    per index. A stage reading the SAME upstream index through TWO argument roles needing
-    DIFFERENT margins (e.g. the same plate as both a zero-halo `bg` and a blurred `fg` needing
-    one, with no intervening stage) would silently get the SMALLER one, under-serving whichever
-    role needed more, unless the caller pre-maxes the roles first. No caller does this today
-    (`chain_windows_dag` has no production caller at all yet); flagged for whoever wires
-    REACH-48's per-argument registry through this dataclass."""
-    halo: float
-    inputs: tuple = ()
-    arg_halo: "dict | None" = None
-
-    def halo_for(self, upstream: int) -> float:
-        """This stage's own reach into ONE SPECIFIC upstream input: `arg_halo[upstream]`
-        if declared, else the uniform `halo` — matches the linear model exactly whenever no
-        per-argument override exists (`arg_halo=None`, or `upstream` absent from it)."""
-        if self.arg_halo is not None and upstream in self.arg_halo:
-            return self.arg_halo[upstream]
-        return self.halo
-
-
-def chain_windows_dag(stages, roi, dirty_from: int = 0, valid=None, declined=(),
-                      scale: float = 1.0) -> "list | None":
-    """`chain_windows`, generalised from a linear chain to a DAG (JOIN-49). `stages[i]` is
-    a `StageSpec` (a plain `(halo, inputs)` pair is coerced). Constraints inherited from
-    the model this generalises, not new: stage indices are already topologically ordered
-    — `stages[j].inputs` names only indices `< j` (raises `ValueError` otherwise, a defect
-    in the CALLER's graph construction, not a case this function can serve any answer for)
-    — and the SINK is always the last stage, `n - 1`; `roi` is the window wanted out of it.
-    A DAG with more than one true sink has no representation here, same as `chain_windows`
-    never had one for a linear chain with a branch off the end.
-
-    **Same-input, multiple-consumer union** (rule 1): when two consumers `j1`, `j2` both
-    read stage `i`, `i`'s required window is `_dag_union` of what each separately demands.
-
-    **Multi-input join, single consumer** (rule 2): a join stage `k` reading BOTH `i` and
-    `i'` projects its OWN outgoing window backward through EACH input independently, using
-    THAT input's own `halo_for` — see `StageSpec.arg_halo`.
-
-    **Refusal — divergent-validity join** (SS B.3's new case beyond the three the linear
-    walk already has): for every edge from a stage `i` that is NOT being recomputed
-    (`i < dirty_from`, so `valid[i]` is its recorded truth) into a dirty consumer, the
-    consumer's demand on `i` must be covered by `valid[i]` — checked for EVERY such edge,
-    not only the single boundary edge the linear walk has, because a join can cross the
-    dirty/clean boundary on more than one input at once, and each is an independent
-    correctness question ("do I still have what I need from EACH clean input"). Failing
-    ANY one edge refuses the WHOLE plan (`None`) — the same fail-closed posture the linear
-    walk's own boundary check already takes, generalised from one edge to all of them.
-
-    **Declined-stage poisoning** (P0-4a, generalised): a stage that declined its window
-    cooked whole-frame from ITS OWN inputs, which is only "valid everywhere" if every ONE
-    of those inputs was ALSO whole-frame valid — checked over `stages[i].inputs`, not only
-    `i - 1`.
-
-    Returns one window per stage (`None` for a stage neither dirty nor demanded by anyone
-    dirty — mirrors the linear walk's "clean prefix" `None`s), or `None` when the plan
-    cannot be served incrementally at all (cook the whole graph from the source; widening
-    the returned windows never repairs a stale upstream, per `chain_windows`'s own central
-    argument, unchanged here).
-
-    Pure arithmetic — this module stays torch-free, same as `chain_windows`."""
-    if scale <= 0:
-        raise ValueError(f"chain_windows_dag: scale must be > 0, got {scale!r}")
-    specs = [s if isinstance(s, StageSpec) else StageSpec(s[0], tuple(s[1]))
-             for s in stages]
-    n = len(specs)
-    for j, s in enumerate(specs):
-        for i in s.inputs:
-            if not (0 <= i < j):
-                raise ValueError(
-                    f"chain_windows_dag: stage {j} names input {i}, which is not an "
-                    f"earlier stage index (< {j}) — inputs must be topologically ordered")
-
-    # P0-4a, generalised: a decliner's whole-frame output is only as good as ALL of its
-    # inputs being whole-frame valid, not just one. No bounds guard on `valid[m]` — matches
-    # `chain_windows`'s own unguarded `valid[i - 1]` in this same check exactly; both assume
-    # a `valid` list sized to match `stages`/`halos`, per the shared contract.
-    if declined and valid is not None:
-        for i in sorted(set(declined)):
-            if 0 <= i < n:
-                for m in specs[i].inputs:
-                    if valid[m] is not None:
-                        return None
-
-    out = [None] * n
-    if n == 0:
-        return out
-    out[n - 1] = canonical_roi(roi)
-    start = max(0, dirty_from)
-
-    if valid is not None and start >= n:
-        # P0-4b's own past-the-end guard, lifted unchanged: `dirty_from` past the end of the
-        # stage list is unconditionally not serviceable whenever validity is being tracked
-        # at all — mirrors `chain_windows`'s exact `if start >= n: return None` inside its
-        # own `valid is not None` branch.
-        return None
-
-    # Reverse adjacency: consumers[i] = [j, ...] such that i in specs[j].inputs.
-    consumers: dict = {}
-    for j, s in enumerate(specs):
-        for i in s.inputs:
-            consumers.setdefault(i, []).append(j)
-
-    for i in range(n - 2, start - 1, -1):
-        demand = None
-        for j in consumers.get(i, ()):
-            if j < start or out[j] is None:
-                continue          # a clean (non-recomputed) consumer demands nothing here
-            demand = _dag_union(demand, _dag_grow(out[j], specs[j].halo_for(i)))
-        out[i] = demand
-
-    if valid is not None:
-        for i in range(0, start):
-            for j in consumers.get(i, ()):
-                if j < start or out[j] is None:
-                    continue
-                demand = _dag_grow(out[j], specs[j].halo_for(i))
-                upstream_valid = valid[i] if i < len(valid) else None
-                if not covers(upstream_valid, demand):
-                    return None   # divergent-validity join — not serviceable
-    return out
+# ── JOIN-49 / JOINWIRE-50: windows across multi-input joins (host ask 3,
+# TIERS-48-design.md SS B) now live in `tex_roi_dag.py` — `StageSpec`, `chain_windows_dag`,
+# `stage_dag_arg_halos` and their shared `_dag_grow`/`_dag_union` arithmetic. Moved out
+# (SPLIT-47's pattern: a pure move, re-exported below at this module's own top level) once
+# `tex_roi.py` reached its 2000-line hard budget (REG-2) and JOINWIRE-50's own addition
+# needed room; nothing behavioural changed (`tests/test_join49_dag_windows.py` proves it by
+# continuing to pass against the re-exported names). `chain_windows` below still calls
+# `_dag_grow` via a function-local import — `tex_roi_dag` imports FROM this module at ITS
+# top level, so this module must never import `tex_roi_dag` at ITS top level (the AGENTS.md
+# "Trades to REFUSE" cross-module-cycle idiom: a load-bearing cycle stays broken by one
+# side's import being function-local, not by hoisting either side).
 
 
 # ── CACHE-10: is a region recook worth it? ────────────────────────────────────
@@ -1994,3 +1812,16 @@ def clear_roi_memo() -> None:
     _region_dep_memo.clear()
     _parse_memo.clear()
     _scale_verdict_memo.clear()
+
+
+# ── JOIN-49 / JOINWIRE-50 re-export (SPLIT-47's pattern) ──────────────────────
+# `StageSpec`/`chain_windows_dag`/`stage_dag_arg_halos` (and the `_dag_grow`/`_dag_union`
+# arithmetic they share with `chain_windows` above) now live in `tex_roi_dag.py` — see the
+# module note ahead of the old JOIN-49 section for why. This import runs at THIS module's
+# load time, after every name `tex_roi_dag` itself imports FROM `tex_roi` (`roi_plan`,
+# `binding_footprints`, `POINT`, `WHOLE_FRAME`, `canonical_roi`, `covers`, `_scale_halo`) is
+# already bound above — so `from .tex_roi import StageSpec` / `chain_windows_dag` and every
+# existing caller/test keep resolving exactly as before the split (ROUTE-45's shape).
+from .tex_roi_dag import (        # noqa: E402
+    StageSpec, chain_windows_dag, stage_dag_arg_halos, _dag_grow, _dag_union,
+)

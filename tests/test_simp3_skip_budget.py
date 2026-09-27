@@ -228,7 +228,12 @@ _SKIP_VOCAB = re.compile(
 #: `torch.cuda.is_available()` alone, same reason every other CUDA-only row in this pin
 #: carries one — its CPU twin (`test_join49_pixel_identity_join_dag`) already proves the same
 #: pixel-identity claim with no device.
-_SKIP_BUDGET = 126
+#: Re-pinned from 126 to 127 (JOINWIRE-50): one new row,
+#: `test_joinwire50_dag_cook.py::test_joinwire50_merge_below_edit_pixel_identity_cuda`, gated
+#: on `torch.cuda.is_available()` alone — same shape and same reason as the JOIN-49 row above;
+#: its CPU twin (`test_joinwire50_merge_below_edit_pixel_identity`) already proves the same
+#: pixel-identity claim with no device.
+_SKIP_BUDGET = 127
 
 
 def _literal(node) -> str:

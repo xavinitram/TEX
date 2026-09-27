@@ -64,7 +64,10 @@ MUTATIONS = [
      "    for i in range(n - 2, start - 1, -1):\n        out[i] = _dag_grow(out[i + 1], halos[i + 1])",
      "    for i in range(start, n - 1):\n        out[i] = _dag_grow(out[i + 1], halos[i + 1])",
      ("test_v032_region",)),
-    ("chain_windows_dag: compose FORWARD instead of backward", "tex_roi.py",
+    # JOINWIRE-50: `chain_windows_dag` moved to `tex_roi_dag.py` (a pure move, re-exported at
+    # `tex_roi`'s own top level — REG-2's split, since `tex_roi.py` was at its 2000-line hard
+    # budget) — re-anchored to the new file, same unchanged line.
+    ("chain_windows_dag: compose FORWARD instead of backward", "tex_roi_dag.py",
      "    for i in range(n - 2, start - 1, -1):\n        demand = None",
      "    for i in range(start, n - 1):\n        demand = None",
      ("test_join49_dag_windows",)),
