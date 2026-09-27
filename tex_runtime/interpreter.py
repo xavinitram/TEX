@@ -515,38 +515,35 @@ class Interpreter(MaskedFlowMixin, _SpatialContextMixin, _ControlFlowMixin, _Bin
             elif cancel is None and on_progress is None:
                 for stmt in stmts:
                     self._exec_stmt(stmt)
-            elif on_progress is None:
-                # SCHED-3: cancel wired, no progress sink — the DEFAULT ComfyUI path now that the
-                # node passes an interrupt token. Poll cancel per statement, but skip the `(i+1)/n`
-                # progress arithmetic only a wired on_progress consumes (measured ~37 ns/stmt).
-                # PACE-47d: classify once per PROGRAM (memoized), not per statement/cook — a
-                # cache hit is a dict lookup, paid only on this already-paced path.
-                # P2 (Phase C, R3#1): a wired-but-UNPACED token (the real ComfyUI default —
-                # `wants_pacing` reads False for it) reaches this branch too; `paced_check`
-                # never reads `heavy` unless `_state.paced`, so classifying for it here would
-                # be work computed and thrown away on literally every default cook.
-                # `_pace.is_paced()` was resolved once already, by `reset()` at cook start.
-                if _pace.is_paced():
-                    _heavy_ids = _heavy_stmt_ids(stmts)
-                    for stmt in stmts:
-                        _pace.paced_check(cancel, dev, heavy=id(stmt) in _heavy_ids)  # PACE-45/47d
-                        self._exec_stmt(stmt)
-                else:
-                    for stmt in stmts:
-                        _pace.paced_check(cancel, dev)
-                        self._exec_stmt(stmt)
             else:
-                n = len(stmts) or 1
-                # P2: same is_paced() gate as the branch above — see its comment.
-                if _pace.is_paced():
-                    _heavy_ids = _heavy_stmt_ids(stmts)   # PACE-47d: see the branch above
-                    for i, stmt in enumerate(stmts):
-                        _pace.paced_check(cancel, dev, heavy=id(stmt) in _heavy_ids)  # PACE-45/47d
+                # SCHED-3: cancel wired — the DEFAULT ComfyUI path now that the node passes
+                # an interrupt token. `on_progress is None` skips the `(i+1)/n` progress
+                # arithmetic only a wired on_progress consumes (measured ~37 ns/stmt); both
+                # shapes otherwise share one classify-and-poll discipline (FIX-PACE P5,
+                # R2#4 — hoisted to ONE site, matching `_exec_stmts_profiled`'s own pattern
+                # below, instead of being recomputed identically in each branch).
+                # PACE-47d: classify once per PROGRAM (memoized), not per statement/cook —
+                # a cache hit is a dict lookup. P2 (Phase C, R3#1): gated on `_pace.
+                # is_paced()`, resolved once already by `reset()` at cook start — a wired-
+                # but-UNPACED token (the real ComfyUI default: `wants_pacing` reads False
+                # for it) never reaches `paced_check` with `heavy` read at all, so
+                # classifying for it would be work computed and thrown away on literally
+                # every default cook. `None` when unpaced; `heavy` then reads `False` for
+                # every statement, the cheap and correct answer `paced_check` ignores
+                # anyway.
+                _heavy_ids = _heavy_stmt_ids(stmts) if _pace.is_paced() else None
+                if on_progress is None:
+                    for stmt in stmts:
+                        _pace.paced_check(
+                            cancel, dev,
+                            heavy=_heavy_ids is not None and id(stmt) in _heavy_ids)  # PACE-45/47d
                         self._exec_stmt(stmt)
-                        _report_progress(on_progress, "stmt", (i + 1) / n)
                 else:
+                    n = len(stmts) or 1
                     for i, stmt in enumerate(stmts):
-                        _pace.paced_check(cancel, dev)
+                        _pace.paced_check(
+                            cancel, dev,
+                            heavy=_heavy_ids is not None and id(stmt) in _heavy_ids)  # PACE-45/47d
                         self._exec_stmt(stmt)
                         _report_progress(on_progress, "stmt", (i + 1) / n)
         finally:

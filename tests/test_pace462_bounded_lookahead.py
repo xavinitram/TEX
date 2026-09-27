@@ -807,25 +807,32 @@ def test_pace47c_heavy_true_forces_the_bound_regardless_of_the_tail(r):
 # builtin name. `reset()`'s new `spatial_shape` parameter resolves, once per cook, whether
 # the cook's own pixel count alone makes every poll heavy.
 
-def test_pace47e_reset_resolves_large_resolution_from_spatial_shape(r):
-    """A cook whose (B,H,W) pixel count is >= `_HEAVY_PIXEL_THRESHOLD` must set
-    `_state.large_resolution = True`; a smaller cook must leave it False. Pre-PACE-47e,
-    this is RED: `reset()` takes no `spatial_shape` parameter at all (TypeError)."""
-    print("\n--- PACE-47e: reset() resolves large_resolution from spatial_shape ---")
+def test_pace47e_reset_forces_stride_zero_from_spatial_shape(r):
+    """FIX-PACE P5 (R2#1): a cook whose (B,H,W) pixel count is >= `_HEAVY_PIXEL_THRESHOLD`
+    reuses the module's OWN existing "never economize" rule -- `stride_s == 0.0` -- rather
+    than a second, parallel field: `reset()` forces `_state.stride_s` to `0.0` for such a
+    cook regardless of what the token asked for; a smaller cook keeps its own resolved
+    stride untouched. `_state.large_resolution` no longer exists at all (collapsed into
+    this)."""
+    print("\n--- FIX-PACE P5 (R2#1): reset() collapses large-resolution into stride=0 ---")
     with _DeviceSpy():
-        tok_small = _Token(pace=True)
+        tok_small = _Token(pace=True, pace_stride_ms=8.0)
         _pace.reset(tok_small, "cuda", spatial_shape=(1, 256, 256))
-        small_flag = _pace._state.large_resolution  # noqa: SLF001
+        small_stride = _pace._state.stride_s  # noqa: SLF001
 
-        tok_big = _Token(pace=True)
+        tok_big = _Token(pace=True, pace_stride_ms=8.0)
         _pace.reset(tok_big, "cuda", spatial_shape=(1, 2048, 2048))
-        big_flag = _pace._state.large_resolution  # noqa: SLF001
+        big_stride = _pace._state.stride_s  # noqa: SLF001
 
-    if small_flag is False and big_flag is True:
-        r.ok(f"256^2 -> large_resolution={small_flag}, 2048^2 -> large_resolution={big_flag}")
+    no_field = not hasattr(_pace._state, "large_resolution")
+    if small_stride == 0.008 and big_stride == 0.0 and no_field:
+        r.ok(f"256^2 -> stride_s={small_stride} (the token's own 8ms), 2048^2 -> "
+             f"stride_s={big_stride} (forced to 0.0); large_resolution field is gone")
     else:
-        r.fail("PACE-47e resolution resolve",
-               f"256^2 -> {small_flag} (expected False), 2048^2 -> {big_flag} (expected True)")
+        r.fail("PACE-47e/P5 resolution resolve",
+               f"256^2 -> stride_s={small_stride} (expected 0.008), 2048^2 -> "
+               f"stride_s={big_stride} (expected 0.0), large_resolution field present="
+               f"{not no_field} (expected gone)")
 
 
 def test_pace47e_large_resolution_forces_record_despite_caller_heavy_false(r):

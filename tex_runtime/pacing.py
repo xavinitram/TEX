@@ -38,7 +38,7 @@ silently pin every caller to depth 1 the moment it opted in.
 
 The wait, when `depth` events are already outstanding, is a real blocking
 `event.synchronize()` on an event created with `blocking=True` — chosen over the original
-`event.query()` + sleep loop by measurement (see the hand-back): a blocking wait releases
+`event.query()` + sleep loop, chosen by measurement: a blocking wait releases
 the GIL while parked (another Python thread keeps making progress) and costs nothing beyond
 the wait itself, where the poll loop paid a fixed sleep on every single poll regardless of
 whether the device was actually behind. `token.check()` is still called once per poll point
@@ -66,8 +66,8 @@ that is not free next to a kernel that itself takes only microseconds. (A progra
 like an embedding host's own background render — a `gauss_blur` chain, real per-statement
 device work, not a cheap-arithmetic chain — already read within noise WITHOUT striding at
 all; the cheap-chain risk is a defensive bound against a class of programs, not evidence
-that any specific host workload needs it. See the hand-back for the full measured
-table across shapes.) The fix is to stop treating every poll as a candidate to record: a
+that any specific host workload needs it — reproduce the per-shape reading with
+`benchmarks/preempt_drain_bench.py --sweep`.) The fix is to stop treating every poll as a candidate to record: a
 poll only touches the pool (records/waits) once at least `stride` seconds of HOST time have
 passed since it last recorded; every poll in between is `token.check()` alone, no CUDA call
 at all. `stride` defaults to a module constant (`_DEFAULT_STRIDE_S`, chosen by measurement)
@@ -76,8 +76,8 @@ float; `0` disables striding, recording at every poll exactly as depth-only paci
 
 **PACE-47: a poll inside the stride window is a candidate to skip, never a guarantee.**
 The shape above — skip purely on HOST-elapsed time — was found to make `stride` leak into
-the correctness bound rather than staying a pure cost knob: measured (see the hand-back) that
-on a box whose host dispatch is fast relative to its own device compute (sm_75, paired with a
+the correctness bound rather than staying a pure cost knob: measured, on a box whose host
+dispatch is fast relative to its own device compute (sm_75, paired with a
 fast desktop CPU), a chain of few, device-expensive statements (`medium`/`heavy`) can have
 SEVERAL statements' worth of host
 dispatch complete inside one stride window — so the window's one record covers several
@@ -122,7 +122,7 @@ running program actually hits, not a property of this module alone.
 `reset()` short-circuits on `wants_pacing(token)` before touching CUDA/device state at all,
 restoring the original PACE-45 shape Python's `and` gave for free; `cook_done_event` keeps
 its OWN tiny per-thread memo, keyed on the raw `device` value IT is actually called with,
-rather than trying (and, before this fix, failing — see the hand-back) to share a cache
+rather than trying (and, before this fix, failing) to share a cache
 with `reset()`'s differently-shaped raw value.
 
 Thread-local (mirrors `stdlib_core._cook_ctx`): a second cook on another thread must not
@@ -140,62 +140,43 @@ import torch
 _state = _threading.local()
 
 #: Bounded look-ahead depth used when a token opts into pacing (`pace=True`) without naming
-#: its own `pace_depth`. Chosen by the PACE-462 K-sweep (`benchmarks/preempt_drain_bench.py`,
-#: laptop sm_120, quiet box): depths 1-8 all read within noise of unpaced, so cost does not
-#: discriminate among them there — the discriminator is the drained-p95 bound, which scales
-#: with depth. Depth 2 keeps that bound tight while giving one level of look-ahead margin
-#: over depth 1. See the hand-back for the full measured per-depth table and the sm_75
-#: reading (DOC-6: a dated measurement table belongs in an evidence document, not in a
-#: module docstring a reader opens just for the contract — R2#7).
+#: its own `pace_depth`. Chosen by measurement (`benchmarks/preempt_drain_bench.py`, its own
+#: K-sweep): depth 2 keeps the drained-p95 bound tight while giving one level of look-ahead
+#: margin over depth 1, at a cost within noise of unpaced across the depths tried. A build
+#: that wants to change this is a decision to re-measure with that benchmark, not a
+#: tolerance to widen by feel.
 _DEFAULT_DEPTH = 2
 
 #: Minimum HOST time (seconds) that must pass since the pool last recorded before a poll
-#: point is allowed to touch it again. Chosen by measurement (laptop sm_120, quiet box)
-#: across several program shapes at depth 1-2, from a heavy real-device-work chain (cost
-#: within noise at every stride including 0) to chains of 200+ cheap per-pixel statements
-#: (cost +40-44% with striding OFF, within a few percent at every nonzero stride tried).
-#: See the hand-back for the full (stride x depth) table across shapes (R2#7).
+#: point is allowed to touch it again -- see `paced_check`'s own docstring for what this
+#: buys and what PACE-47's `heavy=`/peek mechanism guarantees regardless of its value.
+#: **Superseded by `_DEFAULT_STRIDE_S` below**, kept only as the value every stride/depth
+#: combination was FIRST measured against; the override below is the one actually in
+#: effect. Chosen by measurement (`benchmarks/preempt_drain_bench.py --sweep`).
 _DEFAULT_STRIDE_S = 0.0005
 
 
-#: **Re-chosen, PACE-47d.** Once every paced poll route honours `heavy` (PACE-47c/47d
-#: close the completed-tail blind spot on every route this tree has), the correctness
-#: bound stops depending on `stride` at all -- it is a pure cost knob -- so the choice
-#: above is a cost/latency-margin trade-off, not a safety one. Measured on the reference
-#: sm_75 card (RTX 2080 SUPER) at 0.5/1/2/4ms: heavy- and medium-chain drained p95 read
-#: FLAT across the whole range (no residual growth at any tested value, unlike the
-#: pre-47c/47d mechanism); a 220-statement cheap chain's own drain stays under ~1.1ms at
-#: every value tested -- around 14x margin under one 60Hz frame (~16ms) even at the
-#: widest stride tried -- while its own cost overhead keeps falling with diminishing
-#: returns (roughly +7.7% at 0.5ms down to +3.1% at 4ms, depth 2). 4ms (the largest value
-#: this round tested) is the new default: the safety margin was never the binding
-#: constraint in the range tested, so the largest tested-safe value is also the cheapest.
-#: Reproduce with `benchmarks/preempt_drain_bench.py --sweep`; the measured per-poll
-#: overhead FLOOR (~483ns/call once a poll is confirmed skippable) bounds how low any
-#: stride, however large, can ever push cheap256's own overhead. Overrides the module's
-#: original default above rather than editing it in place, so that measurement stays
-#: attributable to its own reading.
+#: **Re-chosen, PACE-47d.** Once every paced poll route honours `heavy` (PACE-47c/47d close
+#: the completed-tail blind spot on every route this tree has), `stride` is a pure cost
+#: knob, never a correctness bound (see `paced_check`'s own docstring) -- this choice is a
+#: latency-margin/cost trade-off, not a safety one. Chosen by measurement
+#: (`benchmarks/preempt_drain_bench.py --sweep`, swept across stride x depth x program
+#: shape): the largest tested-safe value was also the cheapest, so it is the new default.
+#: Overrides the module's original default above rather than editing it in place, so a
+#: build that re-measures can tell which reading it is replacing.
 _DEFAULT_STRIDE_S = 0.004
 
-#: PACE-47e: a cook whose own (B*H*W) pixel count is at or above this is treated as
-#: heavy on EVERY poll, regardless of what any single statement calls — closing the
-#: resolution-driven completed-tail blind spot PACE-47d's own footprint-only
-#: classification could not see. Chosen from a 3-point fit (the reference sm_75 card,
-#: RTX 2080 SUPER) of a cheap (`footprint='point'`) chain's own per-statement device-
-#: time-ish reading (full runtime / statement count: 90.2us @ 256^2, 667.8us @ 1024^2,
-#: 2652.7us @ 2048^2) against pixel count: time(us) ~= 34.5 + 623.1 x pixels_in_millions.
-#: The record cost this threshold is chosen against is `_record_on`'s own measured
-#: ~7.6us/call (heavy=True every poll, reproduce with
-#: `benchmarks/preempt_drain_bench.py --sweep`) -- "device time exceeds ~50x record cost,
-#: so recording every statement costs <=~2%" (the ask's own criterion) solves to a ~380us
-#: crossover, i.e. ~555,000 pixels (~745^2) on THIS box. 512x512 (262,144 px) is chosen
-#: instead of that exact crossover deliberately CONSERVATIVE (model: ~198us of device time
-#: at 512^2, still comfortably under the 380us line) -- a 3-point fit from one box is not
-#: precise enough to cut it close, and a faster box (the laptop, sm_120) would only ever
-#: raise its own true crossover (less device time per pixel), never lower it, so a
-#: threshold conservative on the slower box stays conservative, never becomes unsafe, on
-#: the faster one. Not re-tuned per-box: a single, hand-picked constant, like `_DEFAULT_
-#: DEPTH`/`_DEFAULT_STRIDE_S` above.
+#: PACE-47e: a cook whose own (B*H*W) pixel count is at or above this is treated as heavy
+#: on EVERY poll, regardless of what any single statement calls — closing the resolution-
+#: driven completed-tail blind spot PACE-47d's own footprint-only classification could not
+#: see (a `footprint='point'` statement's own device time scales with pixel count, not
+#: footprint). Chosen by measurement (`benchmarks/preempt_drain_bench.py --sweep`) against
+#: the criterion "device time exceeds the poll's own record cost by a wide enough margin
+#: that recording every statement is cheap", deliberately conservative rather than cut
+#: close to that crossover: a faster device only ever raises its own true crossover, never
+#: lowers it, so a threshold conservative on a slower reference device stays conservative
+#: everywhere. Not re-tuned per-box: a single, hand-picked constant, like `_DEFAULT_DEPTH`/
+#: `_DEFAULT_STRIDE_S` above.
 _HEAVY_PIXEL_THRESHOLD = 512 * 512
 
 
@@ -402,11 +383,17 @@ def reset(token=None, device=None, spatial_shape=None) -> None:
     _state.is_current = is_current
     _state.depth = _resolve_depth(token)
     _state.stride_s = _resolve_stride(token)
-    # PACE-47e: resolved ONCE per cook, from whatever spatial_shape the caller has in
-    # hand (`set_cook_grid` always does; a caller with none, e.g. the stencil-only
-    # route's own pre-`_invoke_cg` entry poll, reads False here -- conservative in the
-    # sense of "no worse than before this ask", and `_invoke_cg`'s own `set_cook_grid`
-    # call resolves it correctly before that route's per-statement polls run).
+    # PACE-47e / FIX-PACE P5 (R2#1): resolved ONCE per cook, from whatever spatial_shape
+    # the caller has in hand (`set_cook_grid` always does; a caller with none, e.g. the
+    # stencil-only route's own pre-`_invoke_cg` entry poll, resolves 0 pixels here --
+    # conservative in the sense of "no worse than before this ask", and `_invoke_cg`'s own
+    # `set_cook_grid` call resolves it correctly before that route's per-statement polls
+    # run). A cook at or above `_HEAVY_PIXEL_THRESHOLD` reuses the module's OWN existing
+    # "never economize" rule instead of a second, parallel field: `stride_s == 0.0`
+    # already means "record/wait at every poll" (see its own docstring above) to every
+    # consumer of `stride`, so a large-resolution cook simply FORCES that value here,
+    # overriding whatever the token itself asked for -- one condition at the read site
+    # (`paced_check`'s `if stride > 0 and not heavy:`) instead of two ANDed together.
     pixels = 0
     if spatial_shape is not None:
         try:
@@ -415,7 +402,8 @@ def reset(token=None, device=None, spatial_shape=None) -> None:
                 pixels *= int(dim)
         except (TypeError, ValueError):
             pixels = 0
-    _state.large_resolution = pixels >= _HEAVY_PIXEL_THRESHOLD
+    if pixels >= _HEAVY_PIXEL_THRESHOLD:
+        _state.stride_s = 0.0
     pools = getattr(_state, "pools", None)
     if pools is None:
         pools = {}
@@ -472,8 +460,9 @@ def paced_check(token, device, heavy: bool = False) -> None:
     cheap polls, which should keep economizing indefinitely, from a run that happens to
     include a heavy one) — only information about what is ABOUT to run can. Default `False`
     preserves every existing call site's behaviour byte-for-byte (this parameter is new;
-    nothing calls it yet — see the hand-back for which callers this lane could and could not
-    wire, and why).
+    not every call site can pass it yet — a stdlib builtin's own internal poll can, since it
+    knows what it is about to run; codegen's in-body `_CK` passes whatever the emitted
+    source hard-codes per poll site instead, see PACE-47d).
 
     Paced (a CUDA cook, a token with a truthy `pace`): polls the token first (an
     already-tripped token is caught before any device interaction) — ALWAYS, regardless of
@@ -491,16 +480,16 @@ def paced_check(token, device, heavy: bool = False) -> None:
     recording purely on HOST-elapsed time, so a host fast enough to dispatch several
     statements inside one stride window could let the device fall arbitrarily far
     behind `depth` poll-intervals without a single poll ever recording an event to notice
-    — the fast-host/slow-device combination measured on sm_75 (see the hand-back). Gating
+    — a fast-host/slow-device combination, measured (reproduce with
+    `benchmarks/preempt_drain_bench.py --sweep`). Gating
     the skip on the device's OWN completion state instead means striding
     only ever economizes recording overhead when it is genuinely free to (the device has
     nothing outstanding to fall behind on); the moment it is not, this poll behaves exactly
     like stride=0 and the depth bound reasserts itself within one poll. That is the stride
     gate a chain of many cheap statements needs — recording a CUDA event at every one of
-    them costs more than the statements themselves, measured (see the hand-back); the
-    `query()` peek itself is a non-blocking, already-cheap CUDA call (measured — see the
-    hand-back), paid only for the polls that land inside a stride window with something
-    still outstanding to peek at.
+    them costs more than the statements themselves, measured; the
+    `query()` peek itself is a non-blocking, already-cheap CUDA call, paid only for the
+    polls that land inside a stride window with something still outstanding to peek at.
 
     Past the stride, the poll behaves exactly as depth-only PACE-462 did: only if this
     cook's device pool already holds `depth` OUTSTANDING events, blocks on the OLDEST one
@@ -544,15 +533,18 @@ def paced_check(token, device, heavy: bool = False) -> None:
     pool = _state.pool
 
     stride = _state.stride_s
-    # PACE-47e: `_state.large_resolution` (resolved once in `reset()`, from the cook's own
-    # pixel count) ORs into `heavy` here rather than at each call site: a compiled codegen
-    # function is built ONCE and reused across every cook that shares its fingerprint,
-    # potentially at DIFFERENT resolutions, so a per-statement heavy/cheap classification
-    # decided at BUILD time (PACE-47d's own `_CK(True)`/`_CK()` emission) could never be
-    # resolution-correct on its own -- only a per-COOK, run-time check can be. A statement
-    # a caller marked cheap (halo-derived `heavy=False`) still gets the depth-gated
-    # record/wait below when this cook's own resolution alone makes it expensive.
-    if stride > 0 and not heavy and not _state.large_resolution:
+    # PACE-47e / FIX-PACE P5 (R2#1): a large-resolution cook's own `stride_s` was already
+    # forced to `0.0` by `reset()` above, so this gate needs only its original two
+    # conditions -- `stride > 0` alone now also means "this cook's own resolution keeps it
+    # out of economization", with no second, parallel field to AND in here. A compiled
+    # codegen function is built ONCE and reused across every cook that shares its
+    # fingerprint, potentially at DIFFERENT resolutions, so a per-statement heavy/cheap
+    # classification decided at BUILD time (PACE-47d's own `_CK(True)`/`_CK()` emission)
+    # could never be resolution-correct on its own -- only this per-COOK, run-time
+    # `stride_s` resolution can be. A statement a caller marked cheap (halo-derived
+    # `heavy=False`) still gets the depth-gated record/wait below when this cook's own
+    # resolution alone makes it expensive, because `stride` reads `0` for it.
+    if stride > 0 and not heavy:
         last = _state.last_record_t
         if last is not None and (_time.perf_counter() - last) < stride:
             # Inside the stride window: this is a candidate to skip, but ONLY while the
