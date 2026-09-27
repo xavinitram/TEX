@@ -57,6 +57,7 @@ from .tex_compiler.optimizer import _propagate_literal_locals, _fold_all
 from .tex_lazy import (
     _substitute_params, _fp32, _param_key, _pristine_parse, _profile_key,
     _capture_pre_fold_conditions, _revert_unverified_folds, _prune_static_flow,
+    _has_prunable_flow,
 )
 from .tex_runtime import codegen_stencil as _st
 
@@ -800,6 +801,11 @@ def _fold_program(code: str, param_values: dict):
     a literal condition — `if (1.0 > 0.5) { ... }` — is exactly as statically dead, and
     `_walk`'s private-clone prune this replaces ran unconditionally too.
 
+    FIX-ROI49 Q4 (R3#2): the prune walk itself is now gated on `_has_prunable_flow(stmts)`, a
+    cheap pre-check for whether there is anything to prune AT ALL — still not gated on `subs`
+    (a hardcoded-literal source with no `$param` is caught the same way), just skipping the
+    rebuild-and-recurse walk on the common program with no dead branch to strip.
+
     DATA-6: through the one front end (`tex_cache.parse_and_split`) with NO binding types, on
     purpose: `_walk`'s memo is keyed on the source, the param values and the string wires, so
     the AST must be a function of the source alone. The untyped-base row splits every dotted
@@ -822,7 +828,14 @@ def _fold_program(code: str, param_values: dict):
         pre_fold_2 = _capture_pre_fold_conditions(stmts)
         stmts = _fold_all(stmts)
         _revert_unverified_folds(stmts, pre_fold_1, pre_fold_2)
-    stmts = _prune_static_flow(stmts)
+    # FIX-ROI49 Q4 (R3#2): `_prune_static_flow` always paid a full rebuild-and-recurse walk,
+    # even on the common program with no dead branch to prune at all. `_has_prunable_flow` is
+    # the cheap (no-allocation) over-approximate pre-check: it can only say "nothing to prune"
+    # when that is actually true, so skipping the rebuild in that case changes no answer this
+    # function returns — `stmts` is passed through exactly as `_prune_static_flow` would have
+    # returned it (a no-op walk, structurally).
+    if _has_prunable_flow(stmts):
+        stmts = _prune_static_flow(stmts)
     program.statements = stmts
     return program
 

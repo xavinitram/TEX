@@ -315,6 +315,38 @@ def _revert_unverified_folds(stmts: list, pre_fold_1: dict, pre_fold_2: dict | N
         stack.extend(iter_child_nodes(node))
 
 
+def _has_prunable_flow(stmts: list) -> bool:
+    """FIX-ROI49 Q4 (R3#2): cheap pre-check for whether `_prune_static_flow(stmts)` would
+    actually splice or drop anything — an `IfElse` whose condition is ALREADY a
+    `NumberLiteral` (either arm — the taken one is spliced regardless of true/false), or a
+    `WhileLoop` whose condition is a literal-false `NumberLiteral` (dropped). No list
+    allocation, no splicing, no recursing into a NEW body — just a stack walk reading the
+    SAME nodes `_prune_static_flow` would (`IfElse` both bodies, `WhileLoop`/`ForLoop`/
+    `FunctionDef` body), so it can never say False where pruning would actually happen
+    (invariant #11's own direction: an analysis may only over-approximate, and 'nothing to
+    prune' is the one over-approximation-proof answer this function is allowed to give).
+
+    `_fold_program` paid `_prune_static_flow`'s full clone-free-but-still-rebuilding walk on
+    EVERY call, dead branches or not — measured 9-20% of its own cost on an 8-statement,
+    no-dead-branch program (R3#2). This lets the common no-literal-condition case skip the
+    rebuild entirely and return the ORIGINAL list unchanged."""
+    stack = list(stmts)
+    while stack:
+        node = stack.pop()
+        cls = node.__class__
+        if cls is IfElse and isinstance(node.condition, NumberLiteral):
+            return True
+        if cls is WhileLoop and isinstance(node.condition, NumberLiteral) \
+                and not node.condition.value > 0.5:
+            return True
+        if cls is IfElse:
+            stack.extend(node.then_body or [])
+            stack.extend(node.else_body or [])
+        elif cls in (WhileLoop, ForLoop, FunctionDef):
+            stack.extend(node.body or [])
+    return False
+
+
 def _prune_static_flow(stmts: list) -> list:
     """Remove statically-dead control flow after const-folding.
 
